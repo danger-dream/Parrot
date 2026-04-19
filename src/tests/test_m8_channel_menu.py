@@ -258,6 +258,10 @@ def test_add_wizard_happy_path_save_ok(m):
     assert m["states"].get_state(42)["action"] == "ch_wiz_url"
 
     cm.wiz_on_url_input(42, "https://coding.zhipu.com/anthropic")
+    assert m["states"].get_state(42)["action"] == "ch_wiz_protocol"
+
+    # 新增：选择协议步骤（MS-1 引入），默认 anthropic 走原来的 CC 伪装路径
+    cm.wiz_on_protocol_select(42, 100, "cb", "anthropic")
     assert m["states"].get_state(42)["action"] == "ch_wiz_key"
 
     cm.wiz_on_key_input(42, "sk-testkey-longenough")
@@ -389,6 +393,8 @@ def test_add_wizard_input_validation(m):
     cm.wiz_on_url_input(42, "ftp://bad")
     assert m["states"].get_state(42)["action"] == "ch_wiz_url"
     cm.wiz_on_url_input(42, "https://ok.example.com")
+    # 协议选择（MS-1 引入）：默认 anthropic
+    cm.wiz_on_protocol_select(42, 100, "cb", "anthropic")
     # Key 校验
     cm.wiz_on_key_input(42, "x")
     assert m["states"].get_state(42)["action"] == "ch_wiz_key"

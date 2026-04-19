@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, config, cooldown, log_db, scorer, state_db
+from ... import affinity, config, cooldown, log_db, oauth_manager, scorer, state_db
 from ...channel import registry
 from .. import ui
 
@@ -146,6 +146,12 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
     """OAuth 账户用量 >= threshold 的告警条目。"""
     out: list[str] = []
     cfg = config.get()
+    emails = [
+        a.get("email") for a in cfg.get("oauthAccounts", [])
+        if a.get("email") and not a.get("disabled_reason")
+    ]
+    if emails:
+        oauth_manager.ensure_quota_fresh_sync(emails)
     for acc in cfg.get("oauthAccounts", []):
         email = acc.get("email")
         if not email:
@@ -165,7 +171,8 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
         hot = [(k, v) for k, v in utils.items() if v is not None and v >= threshold_pct]
         if hot:
             parts = " | ".join(f"{k} {v:.0f}%" for k, v in hot)
-            out.append(f"⚠ <code>{ui.escape_html(email)}</code> — {parts}")
+            prov_tag = " 🅾" if oauth_manager.provider_of(acc) == "openai" else ""
+            out.append(f"⚠ <code>{ui.escape_html(email)}</code>{prov_tag} — {parts}")
     return out
 
 

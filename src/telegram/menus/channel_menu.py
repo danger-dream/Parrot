@@ -3,10 +3,12 @@
 callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）
 
 状态机 action（添加向导）：
-  - `ch_wiz_name`   步骤 1：输入名称
-  - `ch_wiz_url`    步骤 2：输入 Base URL
-  - `ch_wiz_key`    步骤 3：输入 API Key
-  - `ch_wiz_models` 步骤 4：输入模型列表（支持 `real:alias, ...`）
+  - `ch_wiz_name`     步骤 1/5：输入名称
+  - `ch_wiz_url`      步骤 2/5：输入 Base URL
+  - `ch_wiz_protocol` 步骤 3/5：选择上游协议（按钮）
+  - `ch_wiz_key`      步骤 4/5：输入 API Key
+  - `ch_wiz_models`   步骤 5/5：输入模型列表（支持 `real:alias, ...`）
+  - `ch_wiz_test`     最后：测试面板（所有协议统一走 probe）
 
 状态机 action（编辑）：
   - `ch_edit_name:<short>`
@@ -27,6 +29,20 @@ from ... import affinity, config, cooldown, log_db, probe, scorer, state_db
 from ...channel import api_channel, registry
 from .. import states, ui
 from . import main as main_menu
+
+
+# 渠道协议取值与展示标签。新增 openai 家族时在此集中维护。
+PROTOCOL_CHOICES: list[tuple[str, str]] = [
+    ("anthropic",        "🅰 Anthropic (/v1/messages)"),
+    ("openai-chat",      "🅞 OpenAI Chat (/v1/chat/completions)"),
+    ("openai-responses", "🅞 OpenAI Responses (/v1/responses)"),
+]
+
+_PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
+
+
+def _protocol_of(ch) -> str:
+    return getattr(ch, "protocol", "anthropic")
 
 
 _BJT = timezone(timedelta(hours=8))
@@ -313,12 +329,18 @@ def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
 
     icon, status = _channel_health(ch)
     enabled = ch.enabled and not ch.disabled_reason
+    protocol = _protocol_of(ch)
 
     lines = [
         f"{icon} <b>{ui.escape_html(ch.display_name)}</b>",
         "",
         f"🔗 URL: <code>{ui.escape_html(ch.base_url)}</code>",
         f"🔑 Key: <code>{ui.escape_html(_mask_key(ch.api_key))}</code>",
+    ]
+    # 只在非 anthropic 时显示协议行，避免对现有 anthropic 渠道造成视觉噪声
+    if protocol != "anthropic":
+        lines.append(f"🔌 协议: <code>{ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))}</code>")
+    lines += [
         f"🎭 CC 伪装: <code>{'开启' if ch.cc_mimicry else '关闭'}</code>",
         f"{'✅' if enabled else '⬛'} 状态: <code>{'enabled' if enabled else (ch.disabled_reason or 'disabled')}</code>",
         "",
@@ -463,7 +485,7 @@ def wiz_start(chat_id: int, message_id: int, cb_id: str) -> None:
     states.set_state(chat_id, "ch_wiz_name", {})
     ui.edit(
         chat_id, message_id,
-        "➕ <b>添加渠道（1/4）</b>\n\n请输入渠道名称（将显示在列表中；空格、中文均可）：",
+        "➕ <b>添加渠道（1/5）</b>\n\n请输入渠道名称（将显示在列表中；空格、中文均可）：",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
 
@@ -491,8 +513,13 @@ def wiz_on_name_input(chat_id: int, text: str) -> None:
     ui.send(
         chat_id,
         "✅ 名称已设置\n\n"
-        "➕ <b>添加渠道（2/4）</b>\n\n"
-        "请输入 Base URL（需 http:// 或 https:// 开头；代理会在此之后追加 <code>/v1/messages</code>）：",
+        "➕ <b>添加渠道（2/5）</b>\n\n"
+        "请输入上游 <b>Base URL</b>（需以 <code>http://</code> 或 <code>https://</code> 开头）\n\n"
+        "<i>只需填上游域名或 API 根路径，代理会根据下一步所选协议自动追加对应子路径：</i>\n"
+        "• Anthropic → <code>/v1/messages</code>\n"
+        "• OpenAI Chat → <code>/v1/chat/completions</code>\n"
+        "• OpenAI Responses → <code>/v1/responses</code>\n\n"
+        "示例：<code>https://api.example.com</code>",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
 
@@ -508,11 +535,41 @@ def wiz_on_url_input(chat_id: int, text: str) -> None:
         return
     data = state["data"]
     data["baseUrl"] = url
-    states.set_state(chat_id, "ch_wiz_key", data)
+    states.set_state(chat_id, "ch_wiz_protocol", data)
+    _wiz_send_protocol_panel(chat_id)
+
+
+def _wiz_send_protocol_panel(chat_id: int) -> None:
+    rows = [[ui.btn(label, f"chw:proto:{proto}")] for proto, label in PROTOCOL_CHOICES]
+    rows.append(_WIZ_NAV)
     ui.send(
         chat_id,
         "✅ URL 已设置\n\n"
-        "➕ <b>添加渠道（3/4）</b>\n\n请输入该渠道的 API Key：",
+        "➕ <b>添加渠道（3/5）</b>\n\n"
+        "请选择该渠道的上游协议：\n\n"
+        "• <b>Anthropic</b> — 对接 Claude 风格 <code>/v1/messages</code>，支持 CC 伪装（默认）\n"
+        "• <b>OpenAI Chat</b> — 对接 <code>/v1/chat/completions</code> 兼容上游（DeepSeek、智谱等）\n"
+        "• <b>OpenAI Responses</b> — 对接 <code>/v1/responses</code>（gpt-5 / o 系列 / 新 Responses API）",
+        reply_markup=ui.inline_kb(rows),
+    )
+
+
+def wiz_on_protocol_select(chat_id: int, message_id: int, cb_id: str, protocol: str) -> None:
+    if protocol not in _PROTOCOL_LABEL:
+        ui.answer_cb(cb_id, "无效协议")
+        return
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_wiz_protocol":
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    data = state["data"]
+    data["protocol"] = protocol
+    states.set_state(chat_id, "ch_wiz_key", data)
+    ui.answer_cb(cb_id, _PROTOCOL_LABEL[protocol])
+    ui.edit(
+        chat_id, message_id,
+        f"✅ 协议：<code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n\n"
+        "➕ <b>添加渠道（4/5）</b>\n\n请输入该渠道的 API Key：",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
 
@@ -532,7 +589,7 @@ def wiz_on_key_input(chat_id: int, text: str) -> None:
     ui.send(
         chat_id,
         "✅ API Key 已设置\n\n"
-        "➕ <b>添加渠道（4/4）</b>\n\n"
+        "➕ <b>添加渠道（5/5）</b>\n\n"
         "请输入模型列表。格式 <code>真实名[:别名]</code>，以 ,/，/;/； 分隔。\n\n"
         "示例：\n"
         "<code>GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo</code>\n"
@@ -801,13 +858,15 @@ def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
     if not state:
         return
     data = state["data"]
+    protocol = data.get("protocol") or "anthropic"
     try:
         registry.add_api_channel({
             "name": data["name"],
             "baseUrl": data["baseUrl"],
             "apiKey": data["apiKey"],
+            "protocol": protocol,
             "models": data["models"],
-            "cc_mimicry": True,
+            "cc_mimicry": protocol == "anthropic",
             "enabled": True,
         })
     except Exception as exc:
@@ -818,6 +877,7 @@ def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
         chat_id, message_id,
         f"✅ <b>渠道已保存（跳过测试）</b>\n\n"
         f"名称: <code>{ui.escape_html(data['name'])}</code>\n"
+        f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
         "所有模型标记为「可用」，后台 probe 会持续验证真实可用性。",
         reply_markup=ui.inline_kb([
             [ui.btn("◀ 返回渠道列表", "menu:channel"),
@@ -832,6 +892,7 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id, "会话过期")
         return
     data = state["data"]
+    protocol = data.get("protocol") or "anthropic"
     results = data.get("test_results") or {}
     any_ok = any(v[0] for v in results.values())
     if not any_ok:
@@ -842,8 +903,9 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
             "name": data["name"],
             "baseUrl": data["baseUrl"],
             "apiKey": data["apiKey"],
+            "protocol": protocol,
             "models": data["models"],
-            "cc_mimicry": True,
+            "cc_mimicry": protocol == "anthropic",
             "enabled": True,
         })
     except Exception as exc:
@@ -867,6 +929,7 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
     fail_display = ", ".join(ui.escape_html(n) for n in fail_names)
     summary = (
         f"✅ <b>渠道已保存</b>: <code>{ui.escape_html(data['name'])}</code>\n\n"
+        f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
         f"可用模型 ({len(ok_names)}): {ok_display}\n"
     )
     if fail_names:
@@ -986,18 +1049,64 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     if ch is None:
         return
     cc_label = "🎭 切换 CC 伪装（当前: 开）" if ch.cc_mimicry else "🎭 切换 CC 伪装（当前: 关）"
+    protocol = _protocol_of(ch)
+    rows = [
+        [ui.btn("✏ 名称",   f"ch:ename:{short}"),
+         ui.btn("✏ URL",    f"ch:eurl:{short}")],
+        [ui.btn("✏ API Key", f"ch:ekey:{short}"),
+         ui.btn("✏ 模型列表", f"ch:emodels:{short}")],
+        [ui.btn(f"🔌 切换协议（当前: {_PROTOCOL_LABEL.get(protocol, protocol)}）",
+                f"ch:eproto:{short}")],
+    ]
+    # openai-* 家族下 CC 伪装按钮无效（内部强制 False），隐藏以减少困惑
+    if protocol == "anthropic":
+        rows.append([ui.btn(cc_label, f"ch:ecc:{short}")])
+    rows.append([ui.btn("◀ 返回详情", f"ch:view:{short}")])
     ui.edit(
         chat_id, message_id,
         f"✏ <b>编辑 [{ui.escape_html(ch.display_name)}]</b>\n\n选择要修改的字段：",
-        reply_markup=ui.inline_kb([
-            [ui.btn("✏ 名称",   f"ch:ename:{short}"),
-             ui.btn("✏ URL",    f"ch:eurl:{short}")],
-            [ui.btn("✏ API Key", f"ch:ekey:{short}"),
-             ui.btn("✏ 模型列表", f"ch:emodels:{short}")],
-            [ui.btn(cc_label, f"ch:ecc:{short}")],
-            [ui.btn("◀ 返回详情", f"ch:view:{short}")],
-        ]),
+        reply_markup=ui.inline_kb(rows),
     )
+
+
+def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        return
+    current = _protocol_of(ch)
+    rows: list[list[dict]] = []
+    for proto, label in PROTOCOL_CHOICES:
+        marker = "● " if proto == current else ""
+        rows.append([ui.btn(f"{marker}{label}", f"ch:seproto:{short}:{proto}")])
+    rows.append([ui.btn("◀ 返回编辑", f"ch:edit:{short}")])
+    ui.edit(
+        chat_id, message_id,
+        f"🔌 <b>切换协议 [{ui.escape_html(ch.display_name)}]</b>\n\n"
+        f"当前：<code>{ui.escape_html(_PROTOCOL_LABEL.get(current, current))}</code>\n\n"
+        "<i>切换到 OpenAI 家族会自动关闭 CC 伪装；切回 Anthropic 将恢复。\n"
+        "注意：切换协议不自动更新 Base URL / API Key / 模型列表，请按需要另行修改。</i>",
+        reply_markup=ui.inline_kb(rows),
+    )
+
+
+def on_set_protocol(chat_id: int, message_id: int, cb_id: str, short: str, protocol: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    if protocol not in _PROTOCOL_LABEL:
+        ui.answer_cb(cb_id, "无效协议")
+        return
+    try:
+        registry.update_api_channel(name, {"protocol": protocol})
+    except Exception as exc:
+        ui.answer_cb(cb_id, "切换失败")
+        ui.send(chat_id, f"❌ 切换失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    ui.answer_cb(cb_id, f"已切换至 {_PROTOCOL_LABEL[protocol]}")
+    on_edit_menu(chat_id, message_id, "-", short)
 
 
 def _edit_prompt(chat_id: int, message_id: int, short: str, field: str, prompt: str) -> None:
@@ -1149,6 +1258,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "chw:save":   wiz_save(chat_id, message_id, cb_id); return True
     if data.startswith("chw:test:"):
         wiz_test_single(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("chw:proto:"):
+        wiz_on_protocol_select(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
 
     # 渠道详情相关
     if data.startswith("ch:view:"):
@@ -1187,6 +1298,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_edit_models(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:ecc:"):
         on_edit_cc_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:eproto:"):
+        on_edit_protocol(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:seproto:"):
+        parts = data.split(":")
+        if len(parts) >= 4:
+            on_set_protocol(chat_id, message_id, cb_id, parts[2], parts[3]); return True
 
     return False
 

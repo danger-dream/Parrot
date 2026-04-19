@@ -62,6 +62,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "intervalSeconds": 60,
         "disableThresholdPercent": 95,
         "resumeThresholdPercent": 95,
+        # 按访问节流刷新 usage：quotaMonitor.enabled=False 时，TG bot 每次打开
+        # 主菜单 / 状态总览 / OAuth 面板 / 详情，若 oauth_quota_cache 已超过该
+        # 秒数没刷新，会同步触发一次 fetch_usage（真实 HTTP 限 5s 超时，失败读旧值）。
+        # enabled=True 时此节流忽略，刷新由 intervalSeconds 后台循环负责。
+        "accessRefreshThrottleSeconds": 180,
     },
     "contentBlacklist": {
         "default": [],
@@ -80,6 +85,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "oauth_refreshed": True,      # OAuth Token 自动刷新成功
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
             "no_channels": True,          # 无可用渠道（503）
+            "openai_store_save_failed": True,  # OpenAI previous_response_id Store 写入失败
         },
     },
     "cchMode": "disabled",
@@ -103,10 +109,54 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "oauth": {
         "mockMode": False,
+        # provider 专属设置（claude 无配置项;openai 在此登记）
+        "providers": {
+            "openai": {
+                # 是否强制把上游请求的 User-Agent 伪装成 Codex CLI
+                # 官方 UA。默认 True（与 sub2api 一致）。关掉则不设置 UA,
+                # 交给 httpx 默认（可能触发上游风控，不建议）。
+                "forceCodexCLI": True,
+                # TLS 指纹伪装开关。默认 False——httpx 直连 chatgpt.com/backend-api/codex
+                # 在当前 cloudfront 策略下可通过；若被拦再手动开启。
+                # 真正实装（引入 curl_cffi）在需要时单独 commit。
+                "enableTLSFingerprint": False,
+                # session_id / conversation_id 隔离：把下游 api_key_name 混进派生
+                # 出的 session 标识，防止不同 API Key 之间会话粘性交叉污染。
+                # 默认 True，基于 prompt_cache_key 派生。
+                "isolateSessionId": True,
+                # 账户未手填 models 时的默认模型列表。下游客户端发其中任何一个
+                # 都能命中调度；发列表外的 codex 家族别名会被 scheduler 跳过
+                # （需要账户手动补入 models）。transform 会把别名规范化到
+                # gpt-5.1 / gpt-5.1-codex 等上游 canonical 名再发出。
+                "defaultModels": [
+                    "gpt-5.2",
+                    "gpt-5.2-codex",
+                    "gpt-5.3-codex",
+                    "gpt-5.4",
+                ],
+            },
+        },
     },
     "channelSelection": "smart",  # "smart" | "order"
     "logDir": "logs",
     "stateDbPath": "state.db",
+    # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）
+    "openai": {
+        # previous_response_id 本地 store（跨变体 chat↔responses 必需，同协议可选）
+        "store": {
+            "enabled": True,
+            "ttlMinutes": 60,
+            "cleanupIntervalSeconds": 300,
+        },
+        # reasoning 跨协议桥接："passthrough" = 通过非官方字段 reasoning_content 双向映射；"drop" = 丢弃
+        "reasoningBridge": "passthrough",
+        # 跨变体翻译能力开关
+        "translation": {
+            "enabled": True,
+            "rejectOnBuiltinTools": True,
+            "rejectOnMultiCandidate": True,
+        },
+    },
 }
 
 

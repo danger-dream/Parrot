@@ -6,6 +6,8 @@
 """
 
 import json
+from typing import Optional
+
 from fastapi.responses import JSONResponse
 
 
@@ -36,6 +38,86 @@ def sse_error_line(err_type: str, message: str) -> bytes:
     """生成一条符合 Anthropic SSE 规范的 error event（含结尾空行）。"""
     payload = json.dumps(build_error_payload(err_type, message), ensure_ascii=False)
     return f"event: error\ndata: {payload}\n\n".encode("utf-8")
+
+
+# ─── OpenAI 家族错误格式（追加，不与 anthropic 共用） ────────────────
+#
+# Chat Completions 与 Responses 两种入口共用一套 JSON 错误 body
+# {"error": {"message":..., "type":..., "code":..., "param":...}}，
+# 但 SSE 里收尾错误 **结构不同**：Chat 用裸 `data: {...}` 单帧；
+# Responses 用 `event: error\ndata: {...}`（带 sequence_number）。
+
+
+class ErrTypeOpenAI:
+    """OpenAI 家族错误 type 值。对应 HTTP 状态码并非 1:1，由调用方选 status。"""
+    INVALID_REQUEST = "invalid_request_error"
+    AUTH = "authentication_error"
+    PERMISSION = "permission_error"
+    NOT_FOUND = "not_found_error"
+    RATE_LIMIT = "rate_limit_exceeded"
+    TIMEOUT = "timeout_error"
+    SERVER = "server_error"
+    API = "api_error"  # 预留；大多数场景会选更具体的类型
+
+
+def _openai_error_body(err_type: str, message: str, *, param: Optional[str] = None,
+                       code: Optional[str] = None) -> dict:
+    return {"error": {"message": message, "type": err_type, "code": code, "param": param}}
+
+
+def json_error_openai(status: int, err_type: str, message: str,
+                      *, param: Optional[str] = None, code: Optional[str] = None) -> JSONResponse:
+    """OpenAI 风格的 HTTP JSON 错误响应（未发首包时用）。"""
+    return JSONResponse(
+        status_code=status,
+        content=_openai_error_body(err_type, message, param=param, code=code),
+    )
+
+
+def sse_error_line_chat(err_type: str, message: str) -> bytes:
+    """Chat Completions 流内错误：用一条 `data: {error:...}` 帧收尾，之后 [DONE]。"""
+    payload = json.dumps(
+        _openai_error_body(err_type, message), ensure_ascii=False,
+    )
+    return f"data: {payload}\n\n".encode("utf-8")
+
+
+def sse_error_line_responses(err_type: str, message: str,
+                             *, sequence_number: int = 0) -> bytes:
+    """Responses 流内错误：用 `event: error\\ndata: {...}` 帧。"""
+    payload = json.dumps(
+        {
+            "type": "error",
+            "code": None,
+            "message": message,
+            "param": None,
+            "sequence_number": int(sequence_number),
+            "error_type": err_type,
+        },
+        ensure_ascii=False,
+    )
+    return f"event: error\ndata: {payload}\n\n".encode("utf-8")
+
+
+def classify_http_status_openai(status: int) -> str:
+    """把上游 HTTP 状态码归类到 OpenAI 错误 type。语义与 anthropic 版对应。"""
+    if status == 400:
+        return ErrTypeOpenAI.INVALID_REQUEST
+    if status == 401:
+        return ErrTypeOpenAI.AUTH
+    if status == 403:
+        return ErrTypeOpenAI.PERMISSION
+    if status == 404:
+        return ErrTypeOpenAI.NOT_FOUND
+    if status in (408, 504):
+        return ErrTypeOpenAI.TIMEOUT
+    if status == 429:
+        return ErrTypeOpenAI.RATE_LIMIT
+    if status >= 500:
+        return ErrTypeOpenAI.SERVER
+    if status >= 400:
+        return ErrTypeOpenAI.INVALID_REQUEST
+    return ErrTypeOpenAI.API
 
 
 def classify_http_status(status: int) -> str:

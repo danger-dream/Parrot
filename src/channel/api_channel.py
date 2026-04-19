@@ -63,6 +63,14 @@ class ApiChannel(Channel):
         self.cc_mimicry = bool(entry.get("cc_mimicry", True))
         self.enabled = bool(entry.get("enabled", True))
         self.disabled_reason = entry.get("disabled_reason")
+        # ApiChannel 只处理 anthropic 协议；openai-* 会被 registry factory 分派到
+        # src/openai/channel/api_channel.py::OpenAIApiChannel。这里做防御性 assert
+        # 保证配置中的 protocol 与实际类一致，避免误配置造成难查 bug。
+        self.protocol = entry.get("protocol", "anthropic")
+        assert self.protocol == "anthropic", (
+            f"ApiChannel expects protocol='anthropic', got {self.protocol!r} "
+            f"(should be dispatched to OpenAIApiChannel by registry factory)"
+        )
 
     # ─── 模型匹配 ─────────────────────────────────────────────────
 
@@ -78,8 +86,11 @@ class ApiChannel(Channel):
     # ─── 请求构造 ─────────────────────────────────────────────────
 
     async def build_upstream_request(
-        self, requested_body: dict, resolved_model: str
+        self, requested_body: dict, resolved_model: str,
+        *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
+        # ingress_protocol 对 anthropic 渠道无意义：本类只服务 /v1/messages 入口。
+        _ = ingress_protocol
         body_with_model = {**requested_body, "model": resolved_model}
 
         dynamic_map: Optional[dict] = None

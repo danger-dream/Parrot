@@ -143,9 +143,10 @@ def test_list_empty_and_populated(m):
 def test_view_detail_with_quota_cache(m):
     _setup(m)
     _add_fake_account(m, "alice@x.com")
-    # 写入 quota 缓存
+    # 写入 quota 缓存（fetched_at 用当前时间，避免被 ensure_quota_fresh 节流判定为 stale
+    # 从而触发 mock fetch 覆盖掉这里的断言值）
     m["state_db"].quota_save("alice@x.com", {
-        "fetched_at": 1776510000000,
+        "fetched_at": m["state_db"].now_ms(),
         "five_hour_util": 12.0, "five_hour_reset": "2026-04-18T14:00:00Z",
         "seven_day_util": 45.0, "seven_day_reset": "2026-04-24T00:00:00Z",
         "sonnet_util": None, "opus_util": None,
@@ -251,9 +252,9 @@ def test_refresh_all_usage(m):
     # 两个都应有缓存
     assert m["state_db"].quota_load("u1@x.com") is not None
     assert m["state_db"].quota_load("u2@x.com") is not None
-    # UI 反馈含"刷新完成"
+    # UI 反馈摘要：新版按 provider 拆成两段；纯 claude 账户只会出 "Claude 用量: 成功 X / 失败 Y"
     sent = [d["text"] for _, d in rec.calls if "text" in d]
-    assert any("刷新完成" in t for t in sent)
+    assert any("Claude 用量: 成功 2" in t for t in sent), sent
     print("  [PASS] refresh_all 两个账户都写入了 quota 缓存")
 
 

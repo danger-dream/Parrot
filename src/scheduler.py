@@ -28,12 +28,22 @@ class ScheduleResult:
 
 # ─── 筛选 ─────────────────────────────────────────────────────────
 
-def _filter_candidates(requested_model: str) -> list[tuple[Channel, str]]:
+def _family(proto: str) -> str:
+    """协议到家族的映射。跨家族互转不做，scheduler 用这个过滤候选。"""
+    return "anthropic" if proto == "anthropic" else "openai"
+
+
+def _filter_candidates(requested_model: str,
+                       ingress_protocol: str = "anthropic") -> list[tuple[Channel, str]]:
+    ingress_family = _family(ingress_protocol)
     out: list[tuple[Channel, str]] = []
     for ch in registry.all_channels():
         if not ch.enabled:
             continue
         if ch.disabled_reason:
+            continue
+        ch_protocol = getattr(ch, "protocol", "anthropic")
+        if _family(ch_protocol) != ingress_family:
             continue
         resolved = ch.supports_model(requested_model)
         if resolved is None:
@@ -99,19 +109,27 @@ def _best_score(candidates: list[tuple[Channel, str]]) -> float:
 
 # ─── 主入口 ───────────────────────────────────────────────────────
 
-def schedule(body: dict, api_key_name: str, client_ip: str) -> ScheduleResult:
-    """对下游请求做调度，返回候选尝试顺序。"""
+def schedule(body: dict, api_key_name: str, client_ip: str,
+             ingress_protocol: str = "anthropic",
+             fp_query: Optional[str] = None) -> ScheduleResult:
+    """对下游请求做调度，返回候选尝试顺序。
+
+    `ingress_protocol`（anthropic/chat/responses）决定筛候选时的家族过滤。
+    `fp_query` 允许调用方提供已算好的亲和查询指纹；未提供时对 anthropic 入口
+    按原逻辑用 messages 列表计算；其他入口本版本不算（MS-7 接入）。
+    """
     requested_model = body.get("model")
     if not requested_model:
         return ScheduleResult([], None, False)
 
-    candidates = _filter_candidates(requested_model)
+    candidates = _filter_candidates(requested_model, ingress_protocol)
     if not candidates:
         return ScheduleResult([], None, False)
 
-    fp_query = fingerprint.fingerprint_query(
-        api_key_name, client_ip, body.get("messages") or []
-    )
+    if fp_query is None and ingress_protocol == "anthropic":
+        fp_query = fingerprint.fingerprint_query(
+            api_key_name, client_ip, body.get("messages") or []
+        )
 
     cfg = config.get()
     mode = (cfg.get("channelSelection") or "smart").lower()

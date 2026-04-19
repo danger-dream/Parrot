@@ -19,12 +19,250 @@ from typing import Optional
 import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import threading
+
 from . import (
     affinity, blacklist, config, cooldown, errors, fingerprint, log_db,
-    notifier, oauth_manager, scorer, upstream,
+    notifier, oauth_manager, scorer, state_db, upstream,
 )
 from .channel.base import Channel
+from .channel.openai_oauth_channel import OpenAIOAuthChannel
+from .oauth import openai as openai_provider
 from .scheduler import ScheduleResult
+
+
+# ─── OpenAI Codex 响应头 snapshot 节流 ───────────────────────────
+#
+# ChatGPT internal API 把 rate-limit 放在每次请求的 response header 里，没有
+# 独立 usage 端点。为避免每次请求都写一次 state_db，按 email 30s 节流（与
+# sub2api openAICodexSnapshotPersistMinInterval 对齐）。吞掉所有异常，不影响主链路。
+
+_CODEX_SNAPSHOT_WRITE_INTERVAL_S = 30.0
+_codex_snapshot_last: dict[str, float] = {}
+_codex_snapshot_lock = threading.Lock()
+
+
+def _maybe_record_codex_snapshot(ch: Channel, resp: httpx.Response) -> None:
+    if not isinstance(ch, OpenAIOAuthChannel):
+        return
+    try:
+        snap = openai_provider.parse_rate_limit_headers(dict(resp.headers))
+        if not snap:
+            return
+        email = ch.email
+        now = time.time()
+        with _codex_snapshot_lock:
+            last = _codex_snapshot_last.get(email, 0.0)
+            if now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S:
+                return
+            _codex_snapshot_last[email] = now
+        normalized = openai_provider.normalize_codex_snapshot(snap)
+        state_db.quota_save_openai_snapshot(email, snap, normalized)
+    except Exception as exc:
+        print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+
+
+def forget_codex_snapshot(email: str) -> None:
+    """账户删除时清本地节流桶，避免内存无限累积。
+
+    对外公开；调用方：oauth_manager.delete_account。
+    """
+    if not email:
+        return
+    with _codex_snapshot_lock:
+        _codex_snapshot_last.pop(email, None)
+
+
+# ─── 协议相关工具集分派 ──────────────────────────────────────────
+#
+# 每个上游协议对应一组 (stream tracker 类, stream builder 类, first-event 解析器,
+# 非流式 usage 提取函数, 非流式错误 JSON 识别器)。failover 按 ch.protocol 查表
+# 选一组使用，避免在主流程里散落多处 `if protocol == ...`。
+
+def _is_anthropic_error_json(obj: dict) -> bool:
+    # anthropic 非流式响应格式：{"type":"error","error":{...}} 或嵌顶层 {"error":{...}}
+    return obj.get("type") == "error" or isinstance(obj.get("error"), dict)
+
+
+def _is_openai_error_json(obj: dict) -> bool:
+    # OpenAI 家族错误格式：顶层 {"error":{"message":...,"type":...,...}}
+    return isinstance(obj.get("error"), dict)
+
+
+_UPSTREAM_TOOLKIT = {
+    "anthropic": {
+        "stream_tracker": upstream.SSEUsageTracker,
+        "stream_builder": upstream.SSEAssistantBuilder,
+        "first_event_parser": upstream.parse_first_sse_event,
+        "extract_usage_json": upstream.extract_usage_from_json,
+        "is_upstream_error_json": _is_anthropic_error_json,
+    },
+    "openai-chat": {
+        "stream_tracker": upstream.ChatSSEUsageTracker,
+        "stream_builder": upstream.ChatSSEAssistantBuilder,
+        "first_event_parser": upstream.parse_first_chat_sse_event,
+        "extract_usage_json": upstream.extract_usage_chat_json,
+        "is_upstream_error_json": _is_openai_error_json,
+    },
+    "openai-responses": {
+        "stream_tracker": upstream.ResponsesSSEUsageTracker,
+        "stream_builder": upstream.ResponsesSSEAssistantBuilder,
+        "first_event_parser": upstream.parse_first_responses_sse_event,
+        "extract_usage_json": upstream.extract_usage_responses_json,
+        "is_upstream_error_json": _is_openai_error_json,
+    },
+}
+
+
+def _toolkit_for(ch: Channel) -> dict:
+    proto = getattr(ch, "protocol", "anthropic")
+    tk = _UPSTREAM_TOOLKIT.get(proto)
+    if tk is None:
+        # 未登记的 protocol 走哪套解析器都是错——宁可在日志里爆出来也不静默回退到
+        # anthropic（曾遇到过的坑：回退后 SSE 解析 / 错误识别全部错位）。
+        raise ValueError(
+            f"no upstream toolkit registered for protocol {proto!r} "
+            f"(channel={getattr(ch, 'key', '?')})"
+        )
+    return tk
+
+
+# 错误 type：failover 内部统一用 anthropic 风味（errors.ErrType.*）。
+# 在 emit 到下游之前，按 ingress_protocol 翻译成对应家族的 type。
+_ERR_TYPE_ANTHROPIC_TO_OPENAI = {
+    errors.ErrType.API: errors.ErrTypeOpenAI.SERVER,
+    errors.ErrType.TIMEOUT: errors.ErrTypeOpenAI.TIMEOUT,
+    errors.ErrType.RATE_LIMIT: errors.ErrTypeOpenAI.RATE_LIMIT,
+    errors.ErrType.INVALID_REQUEST: errors.ErrTypeOpenAI.INVALID_REQUEST,
+    errors.ErrType.AUTH: errors.ErrTypeOpenAI.AUTH,
+    errors.ErrType.PERMISSION: errors.ErrTypeOpenAI.PERMISSION,
+    errors.ErrType.NOT_FOUND: errors.ErrTypeOpenAI.NOT_FOUND,
+    errors.ErrType.OVERLOADED: errors.ErrTypeOpenAI.SERVER,
+    errors.ErrType.REQUEST_TOO_LARGE: errors.ErrTypeOpenAI.INVALID_REQUEST,
+}
+
+
+def _write_affinity_non_stream(
+    ingress_protocol: str,
+    api_key_name: Optional[str],
+    client_ip: str,
+    messages: list,
+    assistant_msg_anthropic: dict,
+    body: Optional[dict],
+    out_obj: dict,
+    channel_key: str,
+    resolved_model: str,
+) -> None:
+    """成功完成非流式请求后按 ingress 走对应家族的 fingerprint_write。"""
+    fp_write: Optional[str] = None
+    if ingress_protocol == "anthropic":
+        fp_write = fingerprint.fingerprint_write(
+            api_key_name or "", client_ip or "", messages, assistant_msg_anthropic,
+        )
+    elif ingress_protocol == "chat":
+        ds_choice = (out_obj.get("choices") or [{}])[0] if isinstance(out_obj, dict) else {}
+        ds_msg = (ds_choice or {}).get("message") or {}
+        fp_write = fingerprint.fingerprint_write_chat(
+            api_key_name or "", client_ip or "",
+            (body or {}).get("messages") or [], ds_msg,
+        )
+    elif ingress_protocol == "responses":
+        ds_output = out_obj.get("output") or [] if isinstance(out_obj, dict) else []
+        cur_input = _responses_current_input_items(body or {})
+        fp_write = fingerprint.fingerprint_write_responses(
+            api_key_name or "", client_ip or "", cur_input, ds_output,
+        )
+    if fp_write:
+        affinity.upsert(fp_write, channel_key, resolved_model)
+
+
+def _responses_current_input_items(body: dict) -> list:
+    """延迟 import 的 responses_to_chat.resolve_current_input_items 代理，避免模块顶层循环。"""
+    try:
+        from .openai.transform.responses_to_chat import resolve_current_input_items
+        return resolve_current_input_items(body)
+    except Exception:
+        return []
+
+
+def _make_stream_translator(translator_ctx: Optional[dict]):
+    """根据 translator_ctx 实例化跨变体流翻译器；非跨变体返回 None。
+
+    translator_ctx 由 OpenAIApiChannel.build_upstream_request 填入。
+    - response_translator=="chat_to_responses"：下游期待 chat，上游发 responses
+      → 用 stream_r2c（responses SSE → chat SSE）
+    - response_translator=="responses_to_chat"：下游期待 responses，上游发 chat
+      → 用 stream_c2r（chat SSE → responses SSE）；translator 在 close() 时
+      把翻译后的 response 写入 openai.store（Store 开启 + api_key_name 非空时）
+    """
+    if not isinstance(translator_ctx, dict):
+        return None
+    name = translator_ctx.get("response_translator")
+    model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_to_responses":
+        from .openai.transform.stream_r2c import StreamTranslator as _R2C
+        return _R2C(model=model,
+                    include_usage=bool(translator_ctx.get("include_usage", False)))
+    if name == "responses_to_chat":
+        from .openai.transform.stream_c2r import StreamTranslator as _C2R
+        return _C2R(
+            model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
+    return None
+
+
+def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dict:
+    """跨变体非流式响应反向：对下游 JSON 做格式转换。
+
+    `translator_ctx` 由 OpenAIApiChannel.build_upstream_request 填入；
+    目前两个合法值：
+      - "chat_to_responses"：上游 responses JSON → 下游 chat.completion JSON
+      - "responses_to_chat"：上游 chat.completion JSON → 下游 responses JSON
+    其他值原样返回。
+    """
+    if not isinstance(translator_ctx, dict):
+        return obj
+    name = translator_ctx.get("response_translator")
+    model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_to_responses":
+        from .openai.transform.chat_to_responses import translate_response as _t
+        return _t(obj, model=model)
+    if name == "responses_to_chat":
+        from .openai.transform.responses_to_chat import translate_response as _t2
+        return _t2(
+            obj, model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
+    return obj
+
+
+def _translate_err_type(anth_type: str, ingress: str) -> str:
+    if ingress == "anthropic":
+        return anth_type
+    return _ERR_TYPE_ANTHROPIC_TO_OPENAI.get(anth_type, errors.ErrTypeOpenAI.API)
+
+
+def _sse_error_for_ingress(ingress: str, anth_err_type: str, message: str) -> bytes:
+    if ingress == "anthropic":
+        return errors.sse_error_line(anth_err_type, message)
+    mapped = _translate_err_type(anth_err_type, ingress)
+    if ingress == "chat":
+        return errors.sse_error_line_chat(mapped, message)
+    return errors.sse_error_line_responses(mapped, message)
+
+
+def _json_error_for_ingress(ingress: str, status: int, anth_err_type: str, message: str):
+    if ingress == "anthropic":
+        return errors.json_error_response(status, anth_err_type, message)
+    mapped = _translate_err_type(anth_err_type, ingress)
+    return errors.json_error_openai(status, mapped, message)
 
 
 # ─── 结果结构 ─────────────────────────────────────────────────────
@@ -49,6 +287,7 @@ _OUTCOMES_NO_COOLDOWN = {
     "success",
     "http_auth_error",   # 先刷 token 再判
     "transform_error",   # 代理自己 bug，和上游无关
+    "guard_error",       # 请求级 4xx：跨变体 guard 拒绝，与 ch 无关
 }
 
 
@@ -91,6 +330,7 @@ async def run_failover(
     client_ip: str,
     is_stream: bool,
     start_time: float,
+    ingress_protocol: str = "anthropic",
 ) -> Response:
     """执行调度候选的顺序重试。返回 FastAPI Response。
 
@@ -116,6 +356,7 @@ async def run_failover(
     last_ch_key: Optional[str] = None
     last_ch_type: Optional[str] = None
     last_model: Optional[str] = None
+    last_ch_protocol: Optional[str] = None
 
     # 把 candidates 改成可扩展的 list（OAuth 刷 token 后重试同渠道）
     pending = list(candidates)  # 仍从首位取
@@ -126,6 +367,7 @@ async def run_failover(
         ch, resolved_model = pending[idx]
         attempt_order += 1
         last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
+        last_ch_protocol = getattr(ch, "protocol", "anthropic")
 
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
@@ -135,6 +377,7 @@ async def run_failover(
             ch, resolved_model, body, is_stream, deadline_ts, start_time,
             fp_query, body.get("messages") or [], api_key_name, client_ip,
             request_id, retry_count, affinity_hit,
+            ingress_protocol=ingress_protocol,
         )
         last_result = result
 
@@ -149,6 +392,22 @@ async def run_failover(
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             return result.response
+
+        # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
+        if result.outcome == "guard_error":
+            status = int(result.http_status or 400)
+            msg = result.error_detail or "request rejected by guard"
+            # err_type 直接从 status 反推（保持与 classify_http_status 一致）
+            anth_err_type = errors.classify_http_status(status)
+            total_ms = int((time.time() - start_time) * 1000)
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg[:4000], retry_count,
+                final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+                connect_ms=None, first_token_ms=None, total_ms=total_ms,
+                http_status=status, affinity_hit=affinity_hit,
+                upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            )
+            return _json_error_for_ingress(ingress_protocol, status, anth_err_type, msg)
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
@@ -216,8 +475,9 @@ async def run_failover(
         connect_ms=(last_result.connect_ms if last_result else None),
         first_token_ms=(last_result.first_byte_ms if last_result else None),
         total_ms=total_ms, http_status=status, affinity_hit=affinity_hit,
+        upstream_protocol=last_ch_protocol,
     )
-    return errors.json_error_response(status, err_type, msg)
+    return _json_error_for_ingress(ingress_protocol, status, err_type, msg)
 
 
 # ─── 单渠道尝试 ──────────────────────────────────────────────────
@@ -228,6 +488,7 @@ async def _try_channel(
     fp_query: Optional[str], messages: list,
     api_key_name: Optional[str], client_ip: str,
     request_id: str, retry_count_so_far: int, affinity_hit: int,
+    *, ingress_protocol: str = "anthropic",
 ) -> AttemptResult:
     cfg = config.get()
     timeouts = cfg.get("timeouts") or {}
@@ -237,8 +498,19 @@ async def _try_channel(
 
     # 1. 构造上游请求
     try:
-        upstream_req = await ch.build_upstream_request(body, resolved_model)
+        upstream_req = await ch.build_upstream_request(
+            body, resolved_model, ingress_protocol=ingress_protocol,
+        )
     except Exception as exc:
+        # GuardError（OpenAI 跨变体死角）带 .status / .err_type / .message 属性；
+        # 视为"请求在当前 ch 不可服务"，短路到客户端的 4xx，不再切下一候选
+        # （所有 openai 候选的 guard 语义一致；切了也同样失败）。
+        if hasattr(exc, "status") and hasattr(exc, "err_type") and hasattr(exc, "message"):
+            return AttemptResult(
+                outcome="guard_error",
+                error_detail=str(getattr(exc, "message", exc))[:2000],
+                http_status=int(getattr(exc, "status", 400)),
+            )
         traceback.print_exc()
         return AttemptResult(
             outcome="transform_error",
@@ -304,6 +576,9 @@ async def _try_channel(
 
         connect_ms = int((time.time() - t_send) * 1000)
 
+        # 1.5 OpenAI Codex 响应头 snapshot：成功/失败分支前都先记一次
+        _maybe_record_codex_snapshot(ch, upstream_resp)
+
         # 2. HTTP 状态码检查
         if upstream_resp.status_code >= 400:
             # 读错误 body：用剩余总时间作为硬超时，防止上游慢慢吐字节吃完总时长
@@ -346,6 +621,9 @@ async def _try_channel(
                 connect_ms, start_time, request_id,
                 messages, api_key_name, client_ip,
                 fp_query, retry_count_so_far, affinity_hit,
+                ingress_protocol=ingress_protocol,
+                translator_ctx=upstream_req.translator_ctx,
+                body=body,
             )
 
         # 4. 流式分支
@@ -355,6 +633,9 @@ async def _try_channel(
             first_byte_timeout, idle_timeout,
             request_id, messages, api_key_name, client_ip,
             fp_query, retry_count_so_far, affinity_hit,
+            ingress_protocol=ingress_protocol,
+            translator_ctx=upstream_req.translator_ctx,
+            body=body,
         )
     except Exception as exc:
         traceback.print_exc()
@@ -383,6 +664,9 @@ async def _consume_non_stream(
     connect_ms: int, start_time: float, request_id: str,
     messages: list, api_key_name: Optional[str], client_ip: str,
     fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
+    *, ingress_protocol: str = "anthropic",
+    translator_ctx: Optional[dict] = None,
+    body: Optional[dict] = None,
 ) -> AttemptResult:
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
     cfg = config.get()
@@ -431,8 +715,10 @@ async def _consume_non_stream(
             error_detail=f"non-JSON response: {exc}",
         )
 
-    # 上游 error
-    if obj.get("type") == "error" or ("error" in obj and isinstance(obj.get("error"), dict)):
+    toolkit = _toolkit_for(ch)
+
+    # 上游 error（按 ch.protocol 选识别器）
+    if toolkit["is_upstream_error_json"](obj):
         return AttemptResult(
             outcome="upstream_error_json",
             connect_ms=connect_ms,
@@ -451,7 +737,9 @@ async def _consume_non_stream(
         )
 
     # 成功：记录并构造响应
-    usage = upstream.extract_usage_from_json(obj)
+    usage = toolkit["extract_usage_json"](obj)
+    # assistant_msg 仅给亲和 fingerprint_write 用，且目前 fingerprint_write 只支持
+    # anthropic 家族；openai 的亲和由 MS-7 补上。这里保持 anthropic 形状即可。
     assistant_msg = {"role": obj.get("role", "assistant"), "content": obj.get("content") or []}
 
     scorer.record_success(
@@ -460,14 +748,7 @@ async def _consume_non_stream(
     )
     cooldown.clear(ch.key, resolved_model)
 
-    # 亲和写入
-    fp_write = fingerprint.fingerprint_write(
-        api_key_name or "", client_ip or "", messages, assistant_msg,
-    )
-    if fp_write:
-        affinity.upsert(fp_write, ch.key, resolved_model)
-
-    # 落库
+    # 落库（用**上游原始响应体**，方便排错；翻译后的下游响应体由 JSONResponse 现场构造）
     await asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
         input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],
@@ -476,10 +757,19 @@ async def _consume_non_stream(
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
         response_body=restored.decode("utf-8", errors="replace") if isinstance(restored, bytes) else str(restored),
         http_status=upstream_resp.status_code,
+        upstream_protocol=getattr(ch, "protocol", "anthropic"),
     )
 
+    # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
+    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
+
+    # 亲和写入（按 ingress 选 fingerprint_write 的参数空间与函数）
+    _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
+                                messages, assistant_msg, body, out_obj,
+                                ch.key, resolved_model)
+
     response = JSONResponse(
-        content=obj,
+        content=out_obj,
         status_code=upstream_resp.status_code,
         headers=resp_headers,
     )
@@ -500,6 +790,9 @@ async def _consume_stream(
     first_byte_timeout: int, idle_timeout: int,
     request_id: str, messages: list, api_key_name: Optional[str], client_ip: str,
     fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
+    *, ingress_protocol: str = "anthropic",
+    translator_ctx: Optional[dict] = None,
+    body: Optional[dict] = None,
 ) -> AttemptResult:
     aiter = upstream_resp.aiter_bytes()
 
@@ -547,11 +840,14 @@ async def _consume_stream(
     # 2. 首包还原 + 安全检查
     first_chunk_restored = await ch.restore_response(first_chunk, dynamic_map=dynamic_map)
 
-    # 2a) 首个 SSE event 是 error？
-    first_event = upstream.parse_first_sse_event(first_chunk_restored)
+    toolkit = _toolkit_for(ch)
+
+    # 2a) 首个 SSE event 是 error？（按 ch.protocol 选解析器 + 识别器）
+    first_event = toolkit["first_event_parser"](first_chunk_restored)
     if first_event and (
         first_event.get("type") == "error"
-        or (isinstance(first_event.get("error"), dict))
+        or isinstance(first_event.get("error"), dict)
+        or first_event.get("_event_name") == "error"
     ):
         await _safe_exit(ctx)
         return AttemptResult(
@@ -572,10 +868,12 @@ async def _consume_stream(
 
     # 3. 通过检查 → 开始向下游发 ★
     resp_headers = _pick_upstream_headers(upstream_resp)
-    tracker = upstream.SSEUsageTracker()
-    builder = upstream.SSEAssistantBuilder()
+    tracker = toolkit["stream_tracker"]()
+    builder = toolkit["stream_builder"]()
     tracker.feed(first_chunk_restored)
     builder.feed(first_chunk_restored)
+    # 跨变体：上游字节 → translator.feed → 下游字节；同协议 translator=None 原样 yield
+    stream_translator = _make_stream_translator(translator_ctx)
     upstream_status = upstream_resp.status_code
 
     state: dict = {"total_ms": None, "finalized": False}
@@ -592,14 +890,57 @@ async def _consume_stream(
         )
         cooldown.clear(ch.key, resolved_model)
 
-        assistant_msg = builder.get_assistant()
-        fp_write = fingerprint.fingerprint_write(
-            api_key_name or "", client_ip or "", messages, assistant_msg,
-        )
+        # 亲和写入：按 ingress 走对应家族的 fingerprint_write。
+        # 4 种组合都覆盖：anthropic / 同协议 chat-chat / 同协议 resp-resp /
+        # 跨变体 resp→chat / 跨变体 chat→resp。跨变体用对应 translator 累积的
+        # 下游形状做 fingerprint_write，保证与下次请求的 fingerprint_query 同形。
+        ch_proto = getattr(ch, "protocol", "anthropic")
+        fp_write: Optional[str] = None
+        if ingress_protocol == "anthropic":
+            assistant_msg = builder.get_assistant()
+            fp_write = fingerprint.fingerprint_write(
+                api_key_name or "", client_ip or "", messages, assistant_msg,
+            )
+        elif ingress_protocol == "chat" and ch_proto == "openai-chat":
+            assistant_msg = builder.get_assistant()
+            fp_write = fingerprint.fingerprint_write_chat(
+                api_key_name or "", client_ip or "",
+                (body or {}).get("messages") or [], assistant_msg,
+            )
+        elif ingress_protocol == "chat" and ch_proto == "openai-responses":
+            # stream_r2c translator 累积的下游 chat assistant 形状
+            try:
+                assistant_msg = (stream_translator.get_downstream_chat_assistant()
+                                 if stream_translator else {"role": "assistant", "content": None})
+            except Exception:
+                assistant_msg = {"role": "assistant", "content": None}
+            fp_write = fingerprint.fingerprint_write_chat(
+                api_key_name or "", client_ip or "",
+                (body or {}).get("messages") or [], assistant_msg,
+            )
+        elif ingress_protocol == "responses" and ch_proto == "openai-responses":
+            # builder 是 ResponsesSSEAssistantBuilder
+            output_items = builder.get_output_items() if hasattr(builder, "get_output_items") else []
+            cur_input = _responses_current_input_items(body or {})
+            fp_write = fingerprint.fingerprint_write_responses(
+                api_key_name or "", client_ip or "", cur_input, output_items,
+            )
+        elif ingress_protocol == "responses" and ch_proto == "openai-chat":
+            # stream_c2r translator._collect_output_items() 给出翻译后的下游 output items
+            try:
+                output_items = stream_translator._collect_output_items() if stream_translator else []
+            except Exception:
+                output_items = []
+            cur_input = _responses_current_input_items(body or {})
+            fp_write = fingerprint.fingerprint_write_responses(
+                api_key_name or "", client_ip or "", cur_input, output_items,
+            )
         if fp_write:
             affinity.upsert(fp_write, ch.key, resolved_model)
 
-        await asyncio.to_thread(
+        # shield：客户端断开导致的 CancelledError 不应中断 DB 写入，否则
+        # 日志会残留 pending。(参见 _finalize_client_cancelled 早退守卫)
+        await asyncio.shield(asyncio.to_thread(
             log_db.finish_success,
             request_id, ch.key, ch.type, resolved_model,
             input_tokens=tracker.usage["input_tokens"],
@@ -610,7 +951,8 @@ async def _consume_stream(
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             http_status=upstream_status,
-        )
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        ))
 
     async def _emit_error_and_finalize(err_type: str, message: str, outcome: str):
         if state["finalized"]:
@@ -623,29 +965,39 @@ async def _consume_stream(
             cooldown.record_error(ch.key, resolved_model, message)
         scorer.record_failure(ch.key, resolved_model, connect_ms=connect_ms)
 
-        await asyncio.to_thread(
+        await asyncio.shield(asyncio.to_thread(
             log_db.finish_error,
             request_id, message, retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
             connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
             http_status=upstream_status, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
-        )
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        ))
 
     async def _finalize_client_cancelled():
-        """客户端断开：不计 cooldown/scorer，仅记日志便于审计。"""
+        """客户端断开：不计 cooldown/scorer，仅记日志便于审计。
+
+        tracker.saw_stream_end=True 表示上游已送达收尾事件
+        （anthropic message_stop / chat [DONE] or finish_reason / responses completed 等）。
+        这种情况服务端视角已成功完成，client 只是没收完最后几帧就断，归 success。
+        """
         if state["finalized"]:
+            return
+        if getattr(tracker, "saw_stream_end", False):
+            await _finalize_success()
             return
         state["finalized"] = True
         total_ms = int((time.time() - start_time) * 1000)
-        await asyncio.to_thread(
+        await asyncio.shield(asyncio.to_thread(
             log_db.finish_error,
             request_id, "client disconnected", retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
             connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
             http_status=upstream_status, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
-        )
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        ))
 
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""
@@ -653,7 +1005,11 @@ async def _consume_stream(
             return
         try:
             # 首包
-            yield first_chunk_restored
+            if stream_translator is not None:
+                for out in stream_translator.feed(first_chunk_restored):
+                    yield out
+            else:
+                yield first_chunk_restored
 
             # 后续 chunk，带 idle / total 超时
             while True:
@@ -663,7 +1019,7 @@ async def _consume_stream(
                         "api_error", f"upstream total timeout > {int((deadline_ts - start_time))}s",
                         outcome="total_timeout",
                     )
-                    yield errors.sse_error_line(errors.ErrType.API, f"upstream total timeout")
+                    yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, "upstream total timeout")
                     return
                 wait_sec = min(idle_timeout, max(1, remaining / 1000))
                 try:
@@ -674,13 +1030,14 @@ async def _consume_stream(
                             "api_error", f"upstream total timeout",
                             outcome="total_timeout",
                         )
-                        yield errors.sse_error_line(errors.ErrType.API, "upstream total timeout")
+                        yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, "upstream total timeout")
                         return
                     await _emit_error_and_finalize(
                         "api_error", f"upstream idle timeout > {idle_timeout}s",
                         outcome="idle_timeout",
                     )
-                    yield errors.sse_error_line(errors.ErrType.API, f"upstream idle timeout > {idle_timeout}s")
+                    yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API,
+                                                 f"upstream idle timeout > {idle_timeout}s")
                     return
                 except StopAsyncIteration:
                     break
@@ -689,7 +1046,8 @@ async def _consume_stream(
                         "api_error", f"stream transport error: {exc}",
                         outcome="transport_error",
                     )
-                    yield errors.sse_error_line(errors.ErrType.API, f"stream transport error: {exc}")
+                    yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API,
+                                                 f"stream transport error: {exc}")
                     return
 
                 if not chunk:
@@ -697,10 +1055,19 @@ async def _consume_stream(
                 restored = await ch.restore_response(chunk, dynamic_map=dynamic_map)
                 tracker.feed(restored)
                 builder.feed(restored)
-                yield restored
+                if stream_translator is not None:
+                    for out in stream_translator.feed(restored):
+                        yield out
+                else:
+                    yield restored
 
-            # 正常完成
+            # 上游已正常收尾 → 先落库成功，再 yield 翻译器收尾帧。
+            # 若放到后面，客户端在 yield 期间断开会让 CancelledError 抢先触发
+            # _finalize_client_cancelled，日志被错误地标记为 "client disconnected"。
             await _finalize_success()
+            if stream_translator is not None:
+                for out in stream_translator.close():
+                    yield out
         except asyncio.CancelledError:
             # 客户端断开（或上层取消）：不归咎上游，不记 cooldown/scorer
             await _finalize_client_cancelled()

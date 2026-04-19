@@ -27,6 +27,12 @@ from typing import Any
 import httpx
 
 from . import config, notifier, state_db
+from .oauth import (
+    DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
+    VALID_PROVIDERS as _VALID_PROVIDERS,
+    normalize_provider as _normalize_provider,
+)
+from .oauth import openai as openai_provider
 from .transform.cc_mimicry import CLI_USER_AGENT
 
 
@@ -96,6 +102,18 @@ def _parse_iso(s: str | None) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def provider_of(email_or_account: str | dict) -> str:
+    """按账户拿到 provider（"claude" / "openai"）。老数据无字段时回落 claude。"""
+    acc: dict | None
+    if isinstance(email_or_account, dict):
+        acc = email_or_account
+    else:
+        acc = get_account(email_or_account)
+    if acc is None:
+        return _DEFAULT_PROVIDER
+    return _normalize_provider(acc.get("provider"))
 
 
 def _format_utc(dt: datetime) -> str:
@@ -191,7 +209,12 @@ def _refresh_sync_locked(email: str, force: bool) -> str:
             if expired and (expired - datetime.now(timezone.utc)).total_seconds() >= 300:
                 return acc["access_token"]
 
-        if mock_mode_enabled():
+        provider = provider_of(acc)
+        if provider == "openai":
+            data = openai_provider.refresh_sync(
+                acc["refresh_token"], email=email,
+            )
+        elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
         else:
             data = _do_refresh_http(acc["refresh_token"])
@@ -206,6 +229,20 @@ def _refresh_sync_locked(email: str, force: bool) -> str:
         }
         if "refresh_token" in data and data["refresh_token"]:
             new_fields["refresh_token"] = data["refresh_token"]
+        # OpenAI: 刷新响应若带 id_token 同步更新；解码拿出最新 metadata
+        # （plan_type / chatgpt_account_id / organization_id 都可能随账户升级
+        # 或换组织而变）。email 理论上不变，不覆盖以免生成孤儿 entry。
+        if provider == "openai" and data.get("id_token"):
+            new_fields["id_token"] = data["id_token"]
+            try:
+                claims = openai_provider.decode_id_token(data["id_token"])
+                info = openai_provider.extract_user_info(claims)
+                for k in ("chatgpt_account_id", "organization_id", "plan_type"):
+                    v = info.get(k)
+                    if v:   # 空值不覆盖已有字段
+                        new_fields[k] = v
+            except Exception as exc:
+                print(f"[oauth] openai refresh: id_token decode failed for {email}: {exc}")
 
         _save_token_fields(email, new_fields)
         return new_fields["access_token"]
@@ -287,9 +324,129 @@ async def fetch_profile(access_token: str) -> dict:
     return await asyncio.to_thread(_profile_sync, access_token)
 
 
+class QuotaNotSupported(Exception):
+    """provider 不支持独立 usage 端点（例如 OpenAI 只能通过响应头拿用量）。"""
+
+
 async def fetch_usage(email: str) -> dict:
+    """拉 usage（Anthropic 独立端点）。
+
+    provider="openai" 的账户没有独立端点：Codex 用量随响应头返回，由 channel
+    层解析并写入 oauth_quota_cache。这里直接抛 QuotaNotSupported，上游可选
+    择 try/except 跳过（quotaMonitor 循环与 TG bot 的访问节流路径都会用到）。
+    """
+    provider = provider_of(email)
+    if provider == "openai":
+        raise QuotaNotSupported(
+            f"openai provider for {email} does not expose a standalone usage endpoint"
+        )
     access_token = await ensure_valid_token(email)
     return await asyncio.to_thread(_usage_sync, access_token)
+
+
+# ─── 按访问节流刷新 usage ────────────────────────────────────────
+#
+# 场景：quotaMonitor.enabled=False 时，后台轮询不跑，UI 读到的都是旧缓存。
+# 打开状态总览 / OAuth 面板 / 详情时按需刷一次，同一 email 节流窗口内跳过。
+# 真实 HTTP 限 5 秒；超时/出错不抛，调用方照常读旧缓存。
+
+_QUOTA_REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _quota_refresh_lock(email: str) -> asyncio.Lock:
+    lk = _QUOTA_REFRESH_LOCKS.get(email)
+    if lk is None:
+        lk = asyncio.Lock()
+        _QUOTA_REFRESH_LOCKS[email] = lk
+    return lk
+
+
+def _access_refresh_throttle_seconds() -> int:
+    qm = config.get().get("quotaMonitor") or {}
+    try:
+        return int(qm.get("accessRefreshThrottleSeconds", 180))
+    except Exception:
+        return 180
+
+
+def _should_skip_access_refresh() -> bool:
+    """quotaMonitor.enabled=True 时由后台循环负责刷新，按访问节流路径直接跳过。"""
+    qm = config.get().get("quotaMonitor") or {}
+    return bool(qm.get("enabled", False))
+
+
+async def ensure_quota_fresh(email: str, *, timeout_s: float = 5.0) -> bool:
+    """若 email 的配额缓存已过节流窗口，触发一次真实 fetch_usage 并回写。
+
+    返回 True 表示本次触发了真实刷新；False 表示被节流/超时/失败/provider 不支持。
+    任何异常都被吞掉（日志打印），调用方读旧缓存即可。
+    """
+    if not email:
+        return False
+    if _should_skip_access_refresh():
+        return False
+    # OpenAI 没有独立 usage 端点，用量从 per-request 响应头更新，这里直接跳过。
+    if provider_of(email) == "openai":
+        return False
+
+    throttle_s = _access_refresh_throttle_seconds()
+    row = state_db.quota_load(email)
+    if row:
+        fetched_at_ms = int(row.get("fetched_at") or 0)
+        if fetched_at_ms > 0:
+            age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
+            if age_s < throttle_s:
+                return False
+
+    lock = _quota_refresh_lock(email)
+    async with lock:
+        # 拿锁后再读一次；另一个并发请求可能已经刷好了
+        row = state_db.quota_load(email)
+        if row:
+            fetched_at_ms = int(row.get("fetched_at") or 0)
+            if fetched_at_ms > 0:
+                age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
+                if age_s < throttle_s:
+                    return False
+        try:
+            usage = await asyncio.wait_for(fetch_usage(email), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            print(f"[oauth] ensure_quota_fresh timeout ({timeout_s}s): {email}")
+            return False
+        except Exception as exc:
+            print(f"[oauth] ensure_quota_fresh failed for {email}: {exc}")
+            return False
+        try:
+            state_db.quota_save(email, flatten_usage(usage))
+        except Exception as exc:
+            print(f"[oauth] ensure_quota_fresh save failed for {email}: {exc}")
+            return False
+    return True
+
+
+async def ensure_quota_fresh_many(emails: list[str], *,
+                                  timeout_s: float = 5.0) -> dict[str, bool]:
+    """并发对多个 email 触发节流刷新。单个超时/失败不影响其他。"""
+    if not emails:
+        return {}
+    coros = [ensure_quota_fresh(e, timeout_s=timeout_s) for e in emails]
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    out: dict[str, bool] = {}
+    for email, res in zip(emails, results):
+        out[email] = bool(res) if not isinstance(res, Exception) else False
+    return out
+
+
+def ensure_quota_fresh_sync(emails: list[str] | str, *,
+                            timeout_s: float = 5.0) -> None:
+    """同步包装：TG bot polling 线程用。吞所有异常，不抛给调用方。"""
+    try:
+        if isinstance(emails, str):
+            asyncio.run(ensure_quota_fresh(emails, timeout_s=timeout_s))
+        else:
+            asyncio.run(ensure_quota_fresh_many(emails, timeout_s=timeout_s))
+    except Exception as exc:
+        print(f"[oauth] ensure_quota_fresh_sync error: {exc}")
 
 
 # ─── 配额缓存辅助 ─────────────────────────────────────────────────
@@ -355,14 +512,47 @@ def latest_reset_iso(usage: dict) -> str | None:
 
 # ─── 账户增删改 ───────────────────────────────────────────────────
 
+def migrate_provider_field() -> int:
+    """给所有没有 provider 字段的账户回填默认值（claude）。
+
+    幂等：已填过的账户不动；无变更时不触发 config.update（避免对磁盘做无
+    意义的 rewrite，也不会触发 registry 的 reload callback 重建 channels）。
+    启动时调用一次即可。返回本次回填数量。
+    """
+    cfg = config.get()
+    pending: list[int] = [
+        i for i, acc in enumerate(cfg.get("oauthAccounts", []))
+        if not acc.get("provider")
+    ]
+    if not pending:
+        return 0
+
+    def mutate(c):
+        accounts = c.get("oauthAccounts", [])
+        for i in pending:
+            if 0 <= i < len(accounts) and not accounts[i].get("provider"):
+                accounts[i]["provider"] = _DEFAULT_PROVIDER
+
+    config.update(mutate)
+    return len(pending)
+
+
 def add_account(entry: dict) -> None:
-    """entry 需至少含 email / access_token / refresh_token。"""
+    """entry 需至少含 email / access_token / refresh_token。
+
+    支持可选字段：
+      - provider: "claude" (默认) / "openai"
+      - id_token / chatgpt_account_id / organization_id / plan_type  (OpenAI 专属)
+    """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
 
     email = entry["email"]
+    provider = _normalize_provider(entry.get("provider"))
+    if provider not in _VALID_PROVIDERS:
+        raise ValueError(f"unsupported provider: {entry.get('provider')!r}")
 
     def mutate(cfg):
         accounts = cfg.setdefault("oauthAccounts", [])
@@ -371,6 +561,7 @@ def add_account(entry: dict) -> None:
         # 规范化字段
         normalized = {
             "email": email,
+            "provider": provider,
             "access_token": entry["access_token"],
             "refresh_token": entry["refresh_token"],
             "expired": entry.get("expired", ""),
@@ -381,6 +572,12 @@ def add_account(entry: dict) -> None:
             "disabled_until": entry.get("disabled_until"),
             "models": entry.get("models") or [],
         }
+        # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
+        if provider == "openai":
+            normalized["id_token"] = entry.get("id_token", "") or ""
+            normalized["chatgpt_account_id"] = entry.get("chatgpt_account_id", "") or ""
+            normalized["organization_id"] = entry.get("organization_id", "") or ""
+            normalized["plan_type"] = entry.get("plan_type", "") or ""
         accounts.append(normalized)
 
     config.update(mutate)
@@ -398,6 +595,14 @@ def delete_account(email: str) -> None:
     state_db.error_delete(key)
     state_db.affinity_delete_by_channel(key)
     state_db.quota_delete(email)
+
+    # failover 的 Codex 节流桶（仅 OpenAI 账户有记录；claude 账户无副作用）
+    try:
+        from . import failover
+        failover.forget_codex_snapshot(email)
+    except Exception:
+        # 启动早期 failover 可能尚未 import；无记录时忽略
+        pass
 
 
 def set_enabled(email: str, enabled: bool, reason: str | None = None,
@@ -493,7 +698,10 @@ def _build_refresh_notice(email: str, usage_flat: dict | None) -> str:
         f" (剩 {_remaining_str(new_exp)})",
     ]
     # 用量
-    if usage_flat:
+    if provider_of(email) == "openai":
+        # OpenAI 没有独立 usage 端点，per-request 响应头更新。这里不是"失败"。
+        parts.append("📊 用量: <i>由响应头更新（无独立端点）</i>")
+    elif usage_flat:
         fh_util = usage_flat.get("five_hour_util")
         sd_util = usage_flat.get("seven_day_util")
         if fh_util is not None:
@@ -574,12 +782,15 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         try:
             await force_refresh(email)
             out[email] = "refreshed"
-            # 顺便刷一次用量（失败不影响）
+            # 顺便刷一次用量（失败不影响）。provider=openai 没有独立 usage
+            # 端点，QuotaNotSupported 是正常路径，不算错误。
             usage_flat: dict | None = None
             try:
                 usage = await fetch_usage(email)
                 usage_flat = flatten_usage(usage)
                 state_db.quota_save(email, usage_flat)
+            except QuotaNotSupported:
+                pass
             except Exception as exc:
                 print(f"[oauth] usage fetch after refresh failed for {email}: {exc}")
 
@@ -628,9 +839,17 @@ async def quota_monitor_once() -> dict:
         if acc.get("disabled_reason") in ("user", "auth_error"):
             out[email] = f"skipped:{acc['disabled_reason']}"
             continue
+        # OpenAI 没有独立 usage 端点；由 channel 层解析响应头更新 quota_cache，
+        # 禁用/恢复决策（channel 层触发，见 Commit 3）不走这个 loop。
+        if provider_of(acc) == "openai":
+            out[email] = "skipped:openai_uses_headers"
+            continue
 
         try:
             usage = await fetch_usage(email)
+        except QuotaNotSupported:
+            out[email] = "skipped:quota_not_supported"
+            continue
         except Exception as exc:
             out[email] = f"fetch_failed:{exc}"
             continue

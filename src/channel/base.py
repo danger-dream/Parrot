@@ -16,6 +16,10 @@ class UpstreamRequest:
 
     `dynamic_tool_map` 随请求一起返回，避免存到 Channel 实例属性导致并发请求互相覆盖：
     每次 `build_upstream_request` 产生独立的 map，`restore_response` 用对应 map 还原。
+
+    `translator_ctx` 仅在 OpenAI 家族的跨变体（chat↔responses）请求上使用：
+    build_upstream_request 把"翻译前的 input_items"等上下文附带回去，供 failover 里的
+    SSE translator / Store 写入使用。anthropic 渠道永远保持 None。
     """
 
     url: str
@@ -23,6 +27,7 @@ class UpstreamRequest:
     body: bytes
     method: str = "POST"
     dynamic_tool_map: Optional[dict] = None
+    translator_ctx: Optional[dict] = None
 
 
 @dataclass
@@ -55,6 +60,9 @@ class Channel(ABC):
     enabled: bool
     disabled_reason: Optional[str]
     cc_mimicry: bool
+    # 渠道的上游协议。默认 "anthropic"（现状），OpenAI 家族子类会覆盖为
+    # "openai-chat" 或 "openai-responses"。scheduler / failover / probe 都依据它分派行为。
+    protocol: str = "anthropic"
 
     @abstractmethod
     def supports_model(self, requested_model: str) -> Optional[str]:
@@ -66,9 +74,14 @@ class Channel(ABC):
 
     @abstractmethod
     async def build_upstream_request(
-        self, requested_body: dict, resolved_model: str
+        self, requested_body: dict, resolved_model: str,
+        *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
-        """把下游请求体转换为对本渠道上游的请求。"""
+        """把下游请求体转换为对本渠道上游的请求。
+
+        `ingress_protocol` 表示下游入口协议（"anthropic"/"chat"/"responses"），
+        anthropic 家族子类忽略此参数，OpenAI 家族子类据此选择是否做跨变体翻译。
+        """
 
     @abstractmethod
     async def restore_response(self, chunk: bytes,

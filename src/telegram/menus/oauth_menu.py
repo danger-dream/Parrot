@@ -2,23 +2,29 @@
 
 callback_data 前缀：`oa:...`
 
-状态机 action：
+状态机 action（Claude）：
   - `oa_login_code`：等待用户粘贴 PKCE 登录页返回的 code#state
-  - `oa_set_json`：等待用户粘贴 OAuth JSON（access_token/refresh_token/...）
+  - `oa_set_json` ：等待用户粘贴 OAuth JSON（access_token/refresh_token/...）
+状态机 action（OpenAI）：
+  - `oa_openai_code`：等待用户粘贴 Codex CLI 登录后的回调 URL
+  - `oa_openai_rt`  ：等待用户粘贴 refresh_token 字符串
 
-注意：本模块所有与 api.anthropic.com 的交互都通过 `oauth_manager` 中已 mockMode 保护
-的入口。开发期请开 `config.oauth.mockMode=true` 避免触发风控。
+注意：本模块所有 OAuth 远端交互都走 `oauth_manager` / `src.oauth.*`，已经有
+mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CALLS=1）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from ... import affinity, config, cooldown, log_db, oauth_manager, state_db
+from ...oauth import openai as openai_provider
 from .. import states, ui
 from . import main as main_menu
 
@@ -111,7 +117,14 @@ def _format_account_block(acc: dict) -> str:
     elif reason == "auth_error":
         tag = " [认证失败]"
 
-    lines = [f"{icon} <code>{ui.escape_html(email)}</code>{tag}"]
+    # provider 图标：claude 不显示（默认），openai 加 🅾 + plan
+    prov = oauth_manager.provider_of(acc)
+    provider_tag = ""
+    if prov == "openai":
+        plan = acc.get("plan_type") or ""
+        provider_tag = f" 🅾 OpenAI{' · ' + ui.escape_html(plan) if plan else ''}"
+
+    lines = [f"{icon} <code>{ui.escape_html(email)}</code>{provider_tag}{tag}"]
 
     # Token 过期时间（绝对 + 倒计时）
     expired = acc.get("expired")
@@ -141,6 +154,8 @@ def _format_account_block(acc: dict) -> str:
         if fh_util is None and sd_util is None:
             lines.append("  📊 用量: <i>尚未获取</i>")
     else:
+        # OpenAI / Claude 都走同一条路径：点账户详情的"刷新用量"按钮。
+        # 对 openai 来说，按钮会发一条最小 codex 探测请求拉响应头。
         lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
 
     # 月度统计（本月 log_db 聚合）
@@ -190,6 +205,20 @@ def _format_usage_block(email: str) -> str:
         if line:
             out.append(line)
 
+    # OpenAI Codex 原始 primary/secondary 窗口（用于排查，按需显示）
+    codex_primary_pct = row.get("codex_primary_used_pct")
+    codex_primary_win = row.get("codex_primary_window_min")
+    codex_secondary_pct = row.get("codex_secondary_used_pct")
+    codex_secondary_win = row.get("codex_secondary_window_min")
+    if codex_primary_pct is not None or codex_secondary_pct is not None:
+        out.append("<i>── Codex 原始窗口 ──</i>")
+        if codex_primary_pct is not None:
+            win = f"{codex_primary_win}min" if codex_primary_win else "?"
+            out.append(f"primary ({win}): {codex_primary_pct:.0f}%")
+        if codex_secondary_pct is not None:
+            win = f"{codex_secondary_win}min" if codex_secondary_win else "?"
+            out.append(f"secondary ({win}): {codex_secondary_pct:.0f}%")
+
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
     ex_util = row.get("extra_util")
@@ -207,6 +236,13 @@ def _format_usage_block(email: str) -> str:
 
 def _list_text_and_kb() -> tuple[str, dict]:
     accounts = oauth_manager.list_accounts()
+    # 按访问节流刷新所有账户的 usage（quotaMonitor.enabled=True 时内部跳过）
+    emails = [
+        a.get("email") for a in accounts
+        if a.get("email") and not a.get("disabled_reason")
+    ]
+    if emails:
+        oauth_manager.ensure_quota_fresh_sync(emails)
     total = len(accounts)
     normal = sum(1 for a in accounts if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "quota")
@@ -318,11 +354,25 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
     if acc is None:
         return None, None
 
+    # 详情页按访问节流刷新 usage（quotaMonitor.enabled=True 时内部跳过）
+    if not acc.get("disabled_reason"):
+        oauth_manager.ensure_quota_fresh_sync(email)
+
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
+    prov = oauth_manager.provider_of(acc)
+    provider_line = ""
+    if prov == "openai":
+        plan = acc.get("plan_type") or "?"
+        acct_id = acc.get("chatgpt_account_id") or "?"
+        provider_line = (
+            f"Provider: <code>🅾 OpenAI (Codex)</code> · plan: <code>{ui.escape_html(plan)}</code>\n"
+            f"Account ID: <code>{ui.escape_html(acct_id)}</code>\n"
+        )
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b>\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
+        f"{provider_line}"
         f"过期: <code>{_format_bjt(acc.get('expired'))}</code> ({_format_remaining(acc.get('expired'))})\n"
         f"上次刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
         f"<b>📊 使用量</b>\n{_format_usage_block(email)}"
@@ -393,10 +443,11 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str) -> N
         ui.send(chat_id, f"❌ 刷新失败: <code>{ui.escape_html(str(result))}</code>")
         return
 
-    # 顺便刷新用量写入缓存
-    usage_result = _run_sync(oauth_manager.fetch_usage(email))
-    if not isinstance(usage_result, Exception):
-        state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
+    # 顺便刷新用量写入缓存。OpenAI 没有独立 usage 端点（响应头路径），跳过。
+    if oauth_manager.provider_of(email) != "openai":
+        usage_result = _run_sync(oauth_manager.fetch_usage(email))
+        if not isinstance(usage_result, Exception):
+            state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
 
     # 重渲染详情
     text, kb = _detail_text_and_kb(email)
@@ -412,6 +463,42 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     email = ui.resolve_code(short)
     if email is None:
         ui.answer_cb(cb_id, "短码已失效")
+        return
+    # OpenAI 没有独立 usage 端点，改为主动发一条最小 codex 探测请求：
+    #   1) force_refresh 先强制刷一次 token（更新 expired / last_refresh /
+    #      id_token 里的 plan_type / chatgpt_account_id / organization_id）
+    #   2) OpenAIOAuthChannel.probe_usage 发最小 codex 请求，读响应头的
+    #      x-codex-* 字段 → quota_save_openai_snapshot
+    # 探测会消耗少量 codex token（几到几十 output token），用户主动点。
+    if oauth_manager.provider_of(email) == "openai":
+        from ...channel import registry
+        from ...channel.openai_oauth_channel import OpenAIOAuthChannel
+
+        ui.answer_cb(cb_id, "刷新 Token 并发送探测请求...")
+        # Step 1: force_refresh
+        tr = _run_sync(oauth_manager.force_refresh(email))
+        if isinstance(tr, Exception):
+            ui.send(chat_id,
+                    f"❌ 刷新 Token 失败: <code>{ui.escape_html(str(tr))}</code>")
+            return
+        # Step 2: probe
+        ch = registry.get_channel(f"oauth:{email}")
+        if not isinstance(ch, OpenAIOAuthChannel):
+            ui.send(chat_id, "❌ 账户未注册为 OpenAI OAuth 渠道")
+            return
+        pr = _run_sync(ch.probe_usage())
+        if isinstance(pr, Exception):
+            ui.send(chat_id, f"❌ 探测失败: <code>{ui.escape_html(str(pr))}</code>")
+            return
+        text, kb = _detail_text_and_kb(email)
+        if pr.get("ok"):
+            head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
+        else:
+            reason = pr.get("reason", "?")
+            head = ("⚠ Token 已刷新，但用量探测未成功: "
+                    f"<code>{ui.escape_html(str(reason))[:200]}</code>")
+        if text:
+            ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
         return
     ui.answer_cb(cb_id, "拉取中...")
 
@@ -518,12 +605,34 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
 
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "拉取中...")
+    from ...channel import registry
+    from ...channel.openai_oauth_channel import OpenAIOAuthChannel
+
     accounts = oauth_manager.list_accounts()
     ok = 0
     fail = 0
+    openai_ok = 0       # OpenAI 账户：force_refresh + probe_usage 都成功
+    openai_fail = 0
     for acc in accounts:
         email = acc.get("email")
         if not email:
+            continue
+        if oauth_manager.provider_of(acc) == "openai":
+            # 1) 强制刷 token，更新 expired / last_refresh / id_token metadata
+            tr = _run_sync(oauth_manager.force_refresh(email))
+            if isinstance(tr, Exception):
+                openai_fail += 1
+                continue
+            # 2) 发探测请求拉响应头 → 更新 quota_cache
+            ch = registry.get_channel(f"oauth:{email}")
+            if not isinstance(ch, OpenAIOAuthChannel):
+                openai_fail += 1
+                continue
+            pr = _run_sync(ch.probe_usage())
+            if isinstance(pr, Exception) or not pr.get("ok"):
+                openai_fail += 1
+            else:
+                openai_ok += 1
             continue
         result = _run_sync(oauth_manager.fetch_usage(email))
         if isinstance(result, Exception):
@@ -532,20 +641,60 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
         state_db.quota_save(email, oauth_manager.flatten_usage(result))
         ok += 1
     show(chat_id, message_id)
-    ui.send(chat_id, f"✅ 刷新完成：成功 {ok}，失败 {fail}")
+    parts = []
+    if ok or fail:
+        parts.append(f"Claude 用量: 成功 {ok} / 失败 {fail}")
+    if openai_ok or openai_fail:
+        parts.append(f"OpenAI 探测: 成功 {openai_ok} / 失败 {openai_fail}")
+    if not parts:
+        parts.append("无可刷新账户")
+    ui.send(chat_id, "✅ " + "；".join(parts))
 
 
 # ─── 新增账户：入口 ──────────────────────────────────────────────
 
 def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
+    """第一步：选 provider。"""
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        "<b>新增 OAuth 账户</b>\n请选择方式：",
+        "<b>新增 OAuth 账户</b>\n请选择类型：",
+        reply_markup=ui.inline_kb([
+            [ui.btn("🅰 Claude (Anthropic)",   "oa:add:claude")],
+            [ui.btn("🅾 OpenAI (Codex / ChatGPT)", "oa:add:openai")],
+            [ui.btn("◀ 返回列表", "menu:oauth")],
+        ]),
+    )
+
+
+def on_add_claude(chat_id: int, message_id: int, cb_id: str) -> None:
+    """Claude 子菜单（原 on_add_menu 内容）。"""
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id, message_id,
+        "<b>新增 Claude OAuth 账户</b>\n请选择方式：",
         reply_markup=ui.inline_kb([
             [ui.btn("🌐 登录获取 Token", "oa:login")],
             [ui.btn("📝 手动设置 JSON",  "oa:set_json")],
-            [ui.btn("◀ 返回列表", "menu:oauth")],
+            [ui.btn("◀ 上一步", "oa:add")],
+        ]),
+    )
+
+
+def on_add_openai(chat_id: int, message_id: int, cb_id: str) -> None:
+    """OpenAI 子菜单。"""
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id, message_id,
+        "<b>新增 OpenAI OAuth 账户</b>\n请选择方式：\n\n"
+        "<i>登录获取：浏览器打开 Codex CLI 授权页，登录后页面会重定向到一个"
+        "本地 URL（通常显示「无法访问此网站」），把地址栏里整段 URL 复制回来即可。</i>\n"
+        "<i>手动粘 RT：已经有 refresh_token 时直接粘字符串，代理会自动刷新"
+        "并从 id_token 解出 email 等账户信息。</i>",
+        reply_markup=ui.inline_kb([
+            [ui.btn("🌐 登录获取 Token", "oa:login:openai")],
+            [ui.btn("📝 粘贴 refresh_token", "oa:set_rt:openai")],
+            [ui.btn("◀ 上一步", "oa:add")],
         ]),
     )
 
@@ -703,6 +852,224 @@ def on_set_json_input(chat_id: int, text: str) -> None:
     ui.send_result(chat_id, f"✅ 已添加 <code>{ui.escape_html(data['email'])}</code>", **nav)
 
 
+# ─── OpenAI PKCE 登录 ──────────────────────────────────────────────
+#
+# 与 Claude 的 on_login_start 区别：
+#   1. code_verifier 是 hex(64 随机字节)，非 base64url（OpenAI 特殊要求）
+#   2. 登录 URL 必须带 id_token_add_organizations / codex_cli_simplified_flow
+#   3. 回调 URL 是 http://localhost:1455/auth/callback?code=...&state=...；
+#      这个端口我们不会监听，浏览器会显示"无法访问此网站"，用户把地址栏
+#      的 URL 整段复制回来即可。我们正则抽 code 和 state。
+#   4. 拿到 token 后解 id_token 得到 email / chatgpt_account_id / plan_type。
+
+
+_OA_NAV_OPENAI = {"back_label": "◀ 返回 OAuth 列表", "back_callback": "menu:oauth"}
+
+
+def on_login_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    verifier, challenge = openai_provider.pkce_generate()
+    state = secrets.token_urlsafe(32)
+    url = openai_provider.build_login_url(challenge, state)
+
+    states.set_state(chat_id, "oa_openai_code", {
+        "code_verifier": verifier, "state": state,
+    })
+
+    ui.edit(
+        chat_id, message_id,
+        "请在浏览器打开以下链接登录 OpenAI / ChatGPT 账号：\n\n"
+        f"<a href=\"{ui.escape_html(url)}\">点此打开登录页</a>\n\n"
+        "登录后浏览器会跳到 <code>http://localhost:1455/auth/callback?code=...&amp;state=...</code>"
+        "（页面显示「无法访问此网站」属正常，代理不会监听这个端口）。\n"
+        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
+        "<i>（登录会话 30 分钟内有效）</i>",
+    )
+
+
+def _extract_openai_code_and_state(text: str) -> tuple[str, str]:
+    """从用户粘贴的内容里抽 code/state。
+
+    支持三种形式：
+      - 完整 URL：http://localhost:1455/auth/callback?code=xxx&state=yyy
+      - 纯查询串：code=xxx&state=yyy
+      - 单独 code#state（兼容 Claude 那条路径的习惯）
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "", ""
+    # 情况 1: URL
+    if raw.startswith("http://") or raw.startswith("https://"):
+        try:
+            parsed = urlparse(raw)
+            q = parse_qs(parsed.query)
+            return (q.get("code", [""])[0].strip(),
+                    q.get("state", [""])[0].strip())
+        except Exception:
+            return "", ""
+    # 情况 2: 查询串
+    if "=" in raw and "code" in raw:
+        q = parse_qs(raw.lstrip("?"))
+        code = q.get("code", [""])[0].strip()
+        st = q.get("state", [""])[0].strip()
+        if code:
+            return code, st
+    # 情况 3: code#state
+    if "#" in raw:
+        code, _, st = raw.partition("#")
+        return code.strip(), st.strip()
+    # 情况 4: 只有 code
+    return raw, ""
+
+
+def on_login_openai_code_input(chat_id: int, text: str) -> None:
+    state = states.pop_state(chat_id)
+    if not state or state.get("action") != "oa_openai_code":
+        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。",
+                       **_OA_NAV_OPENAI)
+        return
+    data = state.get("data") or {}
+
+    code, recv_state = _extract_openai_code_and_state(text)
+    if not code:
+        ui.send_result(chat_id, "❌ 没有抽到 code，请重新发起登录流程。",
+                       **_OA_NAV_OPENAI)
+        return
+    # state 一致性校验（粘整段 URL 才能拿到；少数客户端不回显 state，放行警告）
+    orig_state = data.get("state", "")
+    if recv_state and orig_state and recv_state != orig_state:
+        ui.send_result(
+            chat_id,
+            f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
+            f"期望 <code>{ui.escape_html(orig_state[:16])}...</code>。"
+            "可能是会话错乱，请重新发起登录流程。",
+            **_OA_NAV_OPENAI,
+        )
+        return
+
+    verifier = data.get("code_verifier", "")
+    try:
+        tok = openai_provider.exchange_code_sync(code, verifier)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ Token 换取失败: <code>{ui.escape_html(str(exc))[:300]}</code>",
+            **_OA_NAV_OPENAI,
+        )
+        return
+
+    _finish_openai_add(chat_id, tok, source="login")
+
+
+def on_set_rt_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_openai_rt")
+    ui.edit(
+        chat_id, message_id,
+        "请粘贴 <b>refresh_token</b>（纯字符串即可，代理会立即用它刷新一次 "
+        "token 并从 id_token 解出 email 等账户信息）：",
+    )
+
+
+def on_set_rt_openai_input(chat_id: int, text: str) -> None:
+    states.pop_state(chat_id)
+    rt = (text or "").strip()
+    # 宽松清洗：用户可能贴了 "refresh_token: xxx" 这类前缀
+    m = re.search(r"([A-Za-z0-9_\-\.]{20,})", rt)
+    rt_clean = m.group(1) if m else rt
+    if not rt_clean or len(rt_clean) < 20:
+        ui.send_result(chat_id,
+                       "❌ refresh_token 过短或无法识别，请重新粘贴。",
+                       **_OA_NAV_OPENAI)
+        return
+    try:
+        tok = openai_provider.refresh_sync(rt_clean)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 刷新失败，refresh_token 可能无效: "
+            f"<code>{ui.escape_html(str(exc))[:300]}</code>",
+            **_OA_NAV_OPENAI,
+        )
+        return
+    # refresh 响应里可能不带新的 refresh_token，回填用户输入的原 RT
+    if not tok.get("refresh_token"):
+        tok["refresh_token"] = rt_clean
+
+    _finish_openai_add(chat_id, tok, source="rt")
+
+
+def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
+    """共用保存路径：从 id_token 解 email 等 → add_account → 回报。"""
+    id_token = tok.get("id_token", "") or ""
+    if not id_token:
+        ui.send_result(
+            chat_id,
+            "❌ token 响应缺少 <code>id_token</code>，无法识别账户。"
+            "请检查授权是否带了 <code>openid</code> scope（默认即带）。",
+            **_OA_NAV_OPENAI,
+        )
+        return
+    try:
+        claims = openai_provider.decode_id_token(id_token)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ id_token 解码失败: <code>{ui.escape_html(str(exc))[:300]}</code>",
+            **_OA_NAV_OPENAI,
+        )
+        return
+
+    info = openai_provider.extract_user_info(claims)
+    email = info.get("email") or ""
+    if not email:
+        # 兜底唯一名，避免 email 冲突（与 Claude 路径一致）
+        email = f"unnamed-openai-{int(datetime.now().timestamp())}@local"
+
+    expires_in = int(tok.get("expires_in", 28800))
+    new_expired = (
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    entry = {
+        "email": email,
+        "provider": "openai",
+        "access_token": tok.get("access_token", ""),
+        "refresh_token": tok.get("refresh_token", ""),
+        "expired": new_expired,
+        "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "openai",
+        "enabled": True,
+        "disabled_reason": None,
+        "disabled_until": None,
+        "models": [],
+        # OpenAI 专属 metadata
+        "id_token": id_token,
+        "chatgpt_account_id": info.get("chatgpt_account_id", ""),
+        "organization_id": info.get("organization_id", ""),
+        "plan_type": info.get("plan_type", ""),
+    }
+    try:
+        oauth_manager.add_account(entry)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
+            **_OA_NAV_OPENAI,
+        )
+        return
+
+    plan_tag = f" · plan: <code>{ui.escape_html(info.get('plan_type') or '?')}</code>"
+    ui.send_result(
+        chat_id,
+        "✅ <b>OpenAI OAuth 账户已添加</b>\n\n"
+        f"Email: <code>{ui.escape_html(email)}</code>{plan_tag}\n"
+        f"过期: <code>{_format_bjt(new_expired)}</code>\n"
+        f"来源: <code>{source}</code>",
+        **_OA_NAV_OPENAI,
+    )
+
+
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
@@ -715,11 +1082,23 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "oa:add":
         on_add_menu(chat_id, message_id, cb_id)
         return True
+    if data == "oa:add:claude":
+        on_add_claude(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:add:openai":
+        on_add_openai(chat_id, message_id, cb_id)
+        return True
     if data == "oa:login":
         on_login_start(chat_id, message_id, cb_id)
         return True
     if data == "oa:set_json":
         on_set_json_start(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:login:openai":
+        on_login_openai_start(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:set_rt:openai":
+        on_set_rt_openai_start(chat_id, message_id, cb_id)
         return True
 
     if data.startswith("oa:view:"):
@@ -755,5 +1134,11 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         return True
     if action == "oa_set_json":
         on_set_json_input(chat_id, text)
+        return True
+    if action == "oa_openai_code":
+        on_login_openai_code_input(chat_id, text)
+        return True
+    if action == "oa_openai_rt":
+        on_set_rt_openai_input(chat_id, text)
         return True
     return False

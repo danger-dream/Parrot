@@ -101,9 +101,38 @@ def init() -> None:
     conn = _get_conn()
     with _write_lock:
         conn.executescript(_schema_sql())
+        _migrate_oauth_quota_cache_openai_cols(conn)
         conn.commit()
     _initialized = True
     print(f"[state_db] Using {_db_path}")
+
+
+# 自 MS-OpenAI OAuth 接入起，oauth_quota_cache 新增了 Codex 原始/归一化用量字段。
+# 老库没有这些列 → 此函数在 init() 时幂等补齐。SQLite `ADD COLUMN` 不支持
+# IF NOT EXISTS，改用 PRAGMA table_info 比对再决定是否加，重复启动无副作用。
+_OPENAI_EXTRA_COLUMNS: list[tuple[str, str]] = [
+    # 原始 primary/secondary（便于排查问题）
+    ("codex_primary_used_pct",          "REAL"),
+    ("codex_primary_reset_sec",         "INTEGER"),
+    ("codex_primary_window_min",        "INTEGER"),
+    ("codex_secondary_used_pct",        "REAL"),
+    ("codex_secondary_reset_sec",       "INTEGER"),
+    ("codex_secondary_window_min",      "INTEGER"),
+    ("codex_primary_over_secondary_pct", "REAL"),
+]
+
+
+def _migrate_oauth_quota_cache_openai_cols(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
+    for col, col_type in _OPENAI_EXTRA_COLUMNS:
+        if col in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE oauth_quota_cache ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError as exc:
+            # 并发启动下可能被另一进程抢跑；忽略 "duplicate column name"
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -416,5 +445,69 @@ def quota_delete(email: str) -> None:
         _get_conn().execute(
             "DELETE FROM oauth_quota_cache WHERE email=?",
             (email,),
+        )
+        _get_conn().commit()
+
+
+def quota_save_openai_snapshot(email: str, snap: dict,
+                               normalized: dict | None = None) -> None:
+    """OpenAI (Codex) 专用：保存从响应头解析出的限额 snapshot。
+
+    snap: src.oauth.openai.parse_rate_limit_headers 的返回值
+      {primary_used_pct / primary_reset_sec / primary_window_min /
+       secondary_* / primary_over_secondary_pct / fetched_at (ms)}
+    normalized: src.oauth.openai.normalize_codex_snapshot 的返回值
+      {five_hour_util / five_hour_reset_sec / seven_day_util / seven_day_reset_sec}
+      None 时自动 normalize（便于调用方省事）。
+
+    复用现有 five_hour_util / seven_day_util 列：status_menu 的配额预警与
+    主菜单热账户计数无需区分 provider，直接读这两个字段即可。
+    """
+    # 容错：调用方可能只给 snap，normalized 由本函数补
+    if normalized is None:
+        from .oauth import openai as _openai_provider
+        normalized = _openai_provider.normalize_codex_snapshot(snap)
+
+    now = int(time.time())
+    fetched_at = int(snap.get("fetched_at") or now_ms())
+
+    def _reset_iso(sec: int | None) -> str | None:
+        if sec is None:
+            return None
+        ts = now + max(0, int(sec))
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+    with _write_lock:
+        _get_conn().execute(
+            """INSERT OR REPLACE INTO oauth_quota_cache
+               (email, fetched_at,
+                five_hour_util, five_hour_reset,
+                seven_day_util, seven_day_reset,
+                sonnet_util, sonnet_reset,
+                opus_util, opus_reset,
+                extra_used, extra_limit, extra_util, raw_data,
+                codex_primary_used_pct, codex_primary_reset_sec, codex_primary_window_min,
+                codex_secondary_used_pct, codex_secondary_reset_sec, codex_secondary_window_min,
+                codex_primary_over_secondary_pct)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                       ?,?,?,?,?,?,?)""",
+            (
+                email, fetched_at,
+                normalized.get("five_hour_util"),
+                _reset_iso(normalized.get("five_hour_reset_sec")),
+                normalized.get("seven_day_util"),
+                _reset_iso(normalized.get("seven_day_reset_sec")),
+                None, None,            # sonnet —— OpenAI 无此维度
+                None, None,            # opus   —— 同上
+                None, None, None,      # extra_* —— Claude 专属
+                None,                  # raw_data（响应头体积较小，不存）
+                snap.get("primary_used_pct"),
+                snap.get("primary_reset_sec"),
+                snap.get("primary_window_min"),
+                snap.get("secondary_used_pct"),
+                snap.get("secondary_reset_sec"),
+                snap.get("secondary_window_min"),
+                snap.get("primary_over_secondary_pct"),
+            ),
         )
         _get_conn().commit()

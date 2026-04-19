@@ -28,14 +28,50 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 
 # ─── 单次 probe ──────────────────────────────────────────────────
 
+def _probe_payload_for(ch: Channel, *, max_tokens: int, user_message: str) -> tuple[dict, str]:
+    """按 ch.protocol 构造探测 body + 推导 ingress_protocol。
+
+    返回的 body 直接喂给 ch.build_upstream_request(body, model, ingress_protocol=...)，
+    同协议透传路径会把它原样（白名单过滤后）发给上游。
+    """
+    proto = getattr(ch, "protocol", "anthropic")
+    if proto == "openai-responses":
+        body = {
+            "model": "",
+            "input": user_message,
+            "max_output_tokens": max_tokens,
+            "stream": False,
+        }
+        return body, "responses"
+    if proto == "openai-chat":
+        body = {
+            "model": "",
+            "messages": [{"role": "user", "content": user_message}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "stream": False,
+        }
+        return body, "chat"
+    # anthropic（默认）
+    body = {
+        "model": "",
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": False,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    return body, "anthropic"
+
+
 async def probe_channel_model(
     ch: Channel, model: str, timeout_s: Optional[float] = None,
 ) -> tuple[bool, int, Optional[str]]:
     """对 (channel, model) 做一次探测请求。
 
     返回 (ok, elapsed_ms, reason)。reason 仅在失败时有值。
-    - 仅支持 ApiChannel；传入 OAuthChannel 直接返回 (False, 0, "oauth not probable")
-    - 构造最小探测请求，stream=False
+    - 仅支持 ApiChannel（含 OpenAIApiChannel）；OAuthChannel 直接返回
+      (False, 0, "oauth not probable")
+    - 按 ch.protocol 自动构造 anthropic / openai-chat / openai-responses 三种 payload
     - 超时由 timeout_s 参数或 config.probe.timeoutSeconds 决定
     """
     if ch.type != "api":
@@ -47,17 +83,12 @@ async def probe_channel_model(
     max_tokens = int(probe_cfg.get("maxTokens", 50))
     user_message = str(probe_cfg.get("userMessage", "1+1=?"))
 
-    body = {
-        "model": model,  # 会由 build_upstream_request 替换为 resolved_model
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "stream": False,
-        "messages": [{"role": "user", "content": user_message}],
-    }
+    body, ingress = _probe_payload_for(ch, max_tokens=max_tokens, user_message=user_message)
+    body["model"] = model  # 会由 build_upstream_request 替换为 resolved_model
 
     t0 = time.time()
     try:
-        upstream_req = await ch.build_upstream_request(body, model)
+        upstream_req = await ch.build_upstream_request(body, model, ingress_protocol=ingress)
     except Exception as exc:
         return False, 0, f"transform error: {exc}"
 

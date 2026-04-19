@@ -126,6 +126,55 @@ def notify_event(event_key: str, text: str,
     notify(text, auto_delete_seconds=auto_delete_seconds)
 
 
+# ─── 异步节流通知（同 event_key N 秒内仅触发一次） ─────────────────
+#
+# 用于像 "no_channels:<model>" 这种"频繁重复但不需要每次都通知"的场景。
+# 与 notify_event 正交：先节流判断，再走 notify_event。
+
+import asyncio as _asyncio
+import time as _t
+
+# 节流桶由 sync 与 async 两个入口共享，用普通 threading.Lock 保证两边安全。
+_throttle_last_sent: dict[str, float] = {}
+_throttle_lock_sync = threading.Lock()
+_throttle_lock = _asyncio.Lock()   # 兼容旧调用（async）
+_THROTTLE_DEFAULT_SEC = 300
+
+
+def _throttle_should_emit(alert_key: str, cooldown_seconds: int) -> bool:
+    """线程安全：判断是否已过冷却；若是则更新时间戳并返回 True。"""
+    with _throttle_lock_sync:
+        now = _t.time()
+        last = _throttle_last_sent.get(alert_key, 0)
+        if now - last < cooldown_seconds:
+            return False
+        _throttle_last_sent[alert_key] = now
+        return True
+
+
+async def throttled_notify_event(event_key: str, alert_key: str, text: str,
+                                 *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC) -> None:
+    """节流版事件通知（async 版本）。
+
+    `event_key` 决定 notify_event 的开关；`alert_key` 决定节流桶
+    （同 alert_key 在 cooldown_seconds 内只发一次，哪怕 text 不同）。
+    """
+    if not _throttle_should_emit(alert_key, cooldown_seconds):
+        return
+    notify_event(event_key, text)
+
+
+def throttled_notify_event_sync(event_key: str, alert_key: str, text: str,
+                                *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC) -> None:
+    """同 throttled_notify_event，但可从同步上下文调用。
+
+    用在那些没法 await 的场景（如 sync 翻译器收尾、sync 的 Store save 回调）。
+    """
+    if not _throttle_should_emit(alert_key, cooldown_seconds):
+        return
+    notify_event(event_key, text)
+
+
 def wait_drain(timeout: float = 5.0) -> bool:
     """等待 queue 中所有消息被 worker 处理完毕。仅供测试 / 关停场景使用。
 

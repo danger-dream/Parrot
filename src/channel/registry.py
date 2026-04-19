@@ -9,13 +9,26 @@ import threading
 from typing import Optional
 
 from .. import config, state_db
+from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
 from .oauth_channel import OAuthChannel
+from .openai_oauth_channel import OpenAIOAuthChannel
 
 
 _lock = threading.Lock()
 _channels: dict[str, Channel] = {}
+
+# 按 protocol 名分派到 Channel 子类的 factory。未注册的 protocol 回落到 ApiChannel
+# （保持 anthropic 现状 —— 老配置 / 未设 protocol 的 entry 继续走 ApiChannel）。
+# OpenAI 家族在 server.py 的 lifespan 启动时通过 src/openai/channel/registration.py
+# 注入两条：openai-chat / openai-responses → OpenAIApiChannel。
+_channel_factories: dict[str, type[Channel]] = {}
+
+
+def register_channel_factory(protocol: str, cls: type[Channel]) -> None:
+    """注册一个 protocol → Channel 子类的 factory。重复注册会覆盖。"""
+    _channel_factories[protocol] = cls
 
 
 def rebuild_from_config() -> None:
@@ -26,18 +39,24 @@ def rebuild_from_config() -> None:
     new: dict[str, Channel] = {}
 
     for acc in cfg.get("oauthAccounts", []):
+        provider = _normalize_provider(acc.get("provider"))
         try:
-            ch = OAuthChannel(acc, default_models)
+            if provider == "openai":
+                ch = OpenAIOAuthChannel(acc)
+            else:
+                ch = OAuthChannel(acc, default_models)
             new[ch.key] = ch
         except Exception as exc:
-            print(f"[registry] skip invalid OAuth account: {exc}")
+            print(f"[registry] skip invalid OAuth account (provider={provider}): {exc}")
 
     for entry in cfg.get("channels", []):
+        proto = entry.get("protocol", "anthropic")
+        cls = _channel_factories.get(proto, ApiChannel)
         try:
-            ch = ApiChannel(entry)
+            ch = cls(entry)
             new[ch.key] = ch
         except Exception as exc:
-            print(f"[registry] skip invalid API channel: {exc}")
+            print(f"[registry] skip invalid API channel (protocol={proto}): {exc}")
 
     with _lock:
         global _channels
@@ -95,12 +114,26 @@ def available_models() -> list[str]:
 
     用于 `/v1/models` 列表。OAuth 渠道返回真实模型名，API 渠道返回 alias。
     """
+    return available_models_for_families(None)
+
+
+def available_models_for_families(families: Optional[set[str]]) -> list[str]:
+    """按家族集合过滤后的可见模型列表。
+
+    `families=None` 或空集 → 不过滤，返回所有（等价于 available_models()）。
+    家族名从 Channel.protocol 推导：`anthropic` → "anthropic"，其他 → "openai"。
+    """
     models: set[str] = set()
     with _lock:
         channels = list(_channels.values())
     for ch in channels:
         if not ch.enabled or ch.disabled_reason:
             continue
+        if families:
+            proto = getattr(ch, "protocol", "anthropic")
+            fam = "anthropic" if proto == "anthropic" else "openai"
+            if fam not in families:
+                continue
         for m in ch.list_client_models():
             if m:
                 models.add(m)
@@ -126,6 +159,10 @@ def add_api_channel(entry: dict) -> dict:
     if not name:
         raise ValueError("channel name is required")
 
+    protocol = entry.get("protocol") or "anthropic"
+    # openai-* 渠道不走 Claude Code 伪装，强制 False
+    default_cc = True if protocol == "anthropic" else False
+
     def _mutate(cfg):
         channels = cfg.setdefault("channels", [])
         if any(c.get("name") == name for c in channels):
@@ -135,8 +172,9 @@ def add_api_channel(entry: dict) -> dict:
             "type": "api",
             "baseUrl": (entry.get("baseUrl") or "").rstrip("/"),
             "apiKey": entry.get("apiKey", ""),
+            "protocol": protocol,
             "models": list(entry.get("models") or []),
-            "cc_mimicry": bool(entry.get("cc_mimicry", True)),
+            "cc_mimicry": bool(entry.get("cc_mimicry", default_cc)),
             "enabled": bool(entry.get("enabled", True)),
             "disabled_reason": None,
         }
@@ -177,6 +215,16 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
             target["models"] = list(patch["models"] or [])
         if "cc_mimicry" in patch:
             target["cc_mimicry"] = bool(patch["cc_mimicry"])
+        if "protocol" in patch:
+            new_proto = patch["protocol"] or "anthropic"
+            if new_proto not in ("anthropic", "openai-chat", "openai-responses"):
+                raise ValueError(f"unsupported protocol: {new_proto}")
+            target["protocol"] = new_proto
+            # 切换到 openai-* 时强制关闭 CC 伪装；切回 anthropic 保留用户原设置（若无则 True）
+            if new_proto != "anthropic":
+                target["cc_mimicry"] = False
+            elif "cc_mimicry" not in target:
+                target["cc_mimicry"] = True
         if "enabled" in patch:
             target["enabled"] = bool(patch["enabled"])
             target["disabled_reason"] = None if patch["enabled"] else "user"

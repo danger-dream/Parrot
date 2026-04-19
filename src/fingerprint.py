@@ -133,3 +133,201 @@ def fingerprint_write(api_key_name: str, client_ip: str,
         return None
     last_two = full[-2:]
     return _make_hash(api_key_name, client_ip, last_two[0], last_two[1])
+
+
+# ═══════════════════════════════════════════════════════════════
+# OpenAI 家族（chat / responses）两套 fingerprint
+# ═══════════════════════════════════════════════════════════════
+#
+# 命名空间前缀隔离 hash 空间：
+#   - "openai-chat"   chat ingress（messages[] 形状）
+#   - "openai-resp"   responses ingress（input items[] 形状）
+#
+# 与 anthropic 的 `fingerprint_query` / `fingerprint_write` 同理：Nth 请求
+# 到达时 `query` 去掉当前 user turn 取倒数两条；(N-1) 完成时 `write` 追加
+# assistant 回复取倒数两条 → 两端同形 → hash 相等。
+
+
+# ─── Chat 归一化 ──────────────────────────────────────────────────
+
+# chat message 顶层：仅保留稳定字段
+_CHAT_MSG_FIELDS: tuple[str, ...] = ("role", "content", "tool_calls", "tool_call_id")
+
+# parts 按类型白名单剥离
+_CHAT_PART_FIELDS: dict[str, tuple[str, ...]] = {
+    "text":        ("type", "text"),
+    "image_url":   ("type", "image_url"),
+    "input_audio": ("type", "input_audio"),
+    "file":        ("type", "file"),
+}
+
+
+def _normalize_chat_part(part):
+    if not isinstance(part, dict):
+        return part
+    ptype = part.get("type")
+    wl = _CHAT_PART_FIELDS.get(ptype)
+    if wl is None:
+        return {k: v for k, v in part.items() if k != "cache_control"}
+    return {k: part[k] for k in wl if k in part}
+
+
+def _normalize_chat_tool_call(tc):
+    if not isinstance(tc, dict):
+        return tc
+    out: dict = {}
+    for k in ("id", "type"):
+        if k in tc:
+            out[k] = tc[k]
+    fn = tc.get("function")
+    if isinstance(fn, dict):
+        out["function"] = {k: fn[k] for k in ("name", "arguments") if k in fn}
+    return out
+
+
+def _normalize_chat_msg(msg):
+    if not isinstance(msg, dict):
+        return msg
+    out: dict = {}
+    for k in _CHAT_MSG_FIELDS:
+        if k not in msg:
+            continue
+        v = msg[k]
+        if k == "content" and isinstance(v, list):
+            v = [_normalize_chat_part(p) for p in v]
+        elif k == "tool_calls" and isinstance(v, list):
+            v = [_normalize_chat_tool_call(t) for t in v]
+        out[k] = v
+    return out
+
+
+def _canon_chat(msg) -> str:
+    return json.dumps(_normalize_chat_msg(msg),
+                      sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+# ─── Responses 归一化 ────────────────────────────────────────────
+
+_RESP_PART_FIELDS: dict[str, tuple[str, ...]] = {
+    "input_text":   ("type", "text"),
+    "output_text":  ("type", "text"),
+    "input_image":  ("type", "image_url", "detail"),
+    "input_file":   ("type", "file_id", "file_data", "filename"),
+    "input_audio":  ("type", "input_audio"),
+    "refusal":      ("type", "refusal"),
+}
+
+
+def _normalize_resp_part(p):
+    if not isinstance(p, dict):
+        return p
+    ptype = p.get("type")
+    wl = _RESP_PART_FIELDS.get(ptype)
+    if wl is None:
+        return {k: v for k, v in p.items() if k != "cache_control"}
+    return {k: p[k] for k in wl if k in p}
+
+
+def _normalize_resp_item(it):
+    """把一个 Responses input item 归一化；返回 None 表示该 item 不稳定不参与 hash。"""
+    if not isinstance(it, dict):
+        return None
+    t = it.get("type")
+    if t == "message":
+        out: dict = {}
+        for k in ("type", "role", "content"):
+            if k in it:
+                out[k] = it[k]
+        content = out.get("content")
+        if isinstance(content, list):
+            out["content"] = [_normalize_resp_part(p) for p in content]
+        return out
+    if t == "function_call":
+        return {k: it[k] for k in ("type", "call_id", "name", "arguments") if k in it}
+    if t == "function_call_output":
+        return {k: it[k] for k in ("type", "call_id", "output") if k in it}
+    # reasoning / built-in call items / item_reference 等：不参与 hash
+    return None
+
+
+def _canon_resp(item) -> str:
+    n = _normalize_resp_item(item)
+    if n is None:
+        return ""
+    return json.dumps(n, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+# ─── 通用 hash（带 namespace 前缀） ──────────────────────────────
+
+
+def _make_hash_canon(ns: str, api_key_name: str, client_ip: str,
+                     a, b, *, canon) -> str:
+    raw = f"{ns}|{api_key_name or ''}|{client_ip or ''}|{canon(a)}|{canon(b)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+# ─── Chat 入口 ───────────────────────────────────────────────────
+
+
+def fingerprint_query_chat(api_key_name: str, client_ip: str,
+                            messages: list) -> Optional[str]:
+    """Chat ingress 请求到达时查询用。要求至少 3 条消息。"""
+    if not messages or len(messages) < 3:
+        return None
+    truncated = messages[:-1]
+    last_two = truncated[-2:]
+    return _make_hash_canon("openai-chat", api_key_name, client_ip,
+                            last_two[0], last_two[1], canon=_canon_chat)
+
+
+def fingerprint_write_chat(api_key_name: str, client_ip: str,
+                            messages: list, assistant_response: dict) -> Optional[str]:
+    """Chat ingress 响应完成时写入用。追加 assistant 回复后取倒数两条。"""
+    if not messages:
+        return None
+    full = list(messages) + [assistant_response]
+    if len(full) < 2:
+        return None
+    last_two = full[-2:]
+    return _make_hash_canon("openai-chat", api_key_name, client_ip,
+                            last_two[0], last_two[1], canon=_canon_chat)
+
+
+# ─── Responses 入口 ──────────────────────────────────────────────
+
+
+def _responses_relevant(items: list) -> list:
+    """过滤掉 Responses input 中不稳定 item（reasoning / 内置工具 call 等）。"""
+    return [it for it in (items or [])
+            if isinstance(it, dict)
+            and it.get("type") in ("message", "function_call", "function_call_output")]
+
+
+def fingerprint_query_responses(api_key_name: str, client_ip: str,
+                                 input_items: list) -> Optional[str]:
+    """Responses ingress 请求到达时查询用。要求稳定 items 至少 3 条。"""
+    rel = _responses_relevant(input_items)
+    if len(rel) < 3:
+        return None
+    truncated = rel[:-1]
+    last_two = truncated[-2:]
+    return _make_hash_canon("openai-resp", api_key_name, client_ip,
+                            last_two[0], last_two[1], canon=_canon_resp)
+
+
+def fingerprint_write_responses(api_key_name: str, client_ip: str,
+                                 input_items: list, output_items: list) -> Optional[str]:
+    """Responses ingress 响应完成时写入用。
+
+    把本次 input 中稳定 items 与本次 output 中 message / function_call items
+    拼起来，取倒数两条 → hash。
+    """
+    rel = _responses_relevant(input_items)
+    for it in (output_items or []):
+        if isinstance(it, dict) and it.get("type") in ("message", "function_call"):
+            rel.append(it)
+    if len(rel) < 2:
+        return None
+    last_two = rel[-2:]
+    return _make_hash_canon("openai-resp", api_key_name, client_ip,
+                            last_two[0], last_two[1], canon=_canon_resp)

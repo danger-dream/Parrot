@@ -10,6 +10,11 @@ callback_data 前缀：`ak:...`
        │    ├─ 清空（=不限制） ak:pclr:<short>
        │    ├─ 保存           ak:psave:<short>
        │    └─ 取消           ak:pcancel:<short>
+       ├─ 编辑允许协议       ak:proto:<short>
+       │    ├─ 切换单个       ak:ptp:<short>:<proto>
+       │    ├─ 清空（=不限制） ak:ptpclr:<short>
+       │    ├─ 保存           ak:ptpsave:<short>
+       │    └─ 取消           ak:ptpcancel:<short>
        ├─ 删除确认           ak:del:<short>
        │    └─ 执行删除       ak:del_exec:<short>
        └─ 返回列表
@@ -85,6 +90,25 @@ def _fmt_allowed(allowed: list[str]) -> str:
     return f"🎯 允许: <b>{len(allowed)}</b> 个模型"
 
 
+# ─── 允许协议相关常量 ─────────────────────────────────────────────
+
+# 展示顺序固定，idx 在按钮 callback 中用 proto 原值（稳定、直观）
+PROTOCOL_CHOICES: list[tuple[str, str]] = [
+    ("anthropic", "🅰 Anthropic (/v1/messages)"),
+    ("chat",      "🅞 OpenAI Chat (/v1/chat/completions)"),
+    ("responses", "🅞 OpenAI Responses (/v1/responses)"),
+]
+
+_PROTOCOL_SET = {p for p, _ in PROTOCOL_CHOICES}
+_PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
+
+
+def _fmt_allowed_protocols(protos: list[str]) -> str:
+    if not protos:
+        return "🔌 允许协议: <b>全部入口</b>（无限制）"
+    return "🔌 允许协议: " + " · ".join(f"<b>{_PROTOCOL_LABEL.get(p, p)}</b>" for p in protos)
+
+
 # ─── 列表视图 ─────────────────────────────────────────────────────
 
 def _render_list() -> tuple[str, dict]:
@@ -157,6 +181,7 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
         return None, None
     key_str = entry.get("key", "")
     allowed = list(entry.get("allowedModels") or [])
+    allowed_protos = list(entry.get("allowedProtocols") or [])
     lines = [
         f"🔑 <b>{ui.escape_html(name)}</b>",
         "",
@@ -169,6 +194,10 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
             lines.append(f"  • <code>{ui.escape_html(m)}</code>")
     else:
         lines.append("  <i>（未设白名单时，该 Key 可调用任意渠道支持的模型）</i>")
+    lines.append("")
+    lines.append(_fmt_allowed_protocols(allowed_protos))
+    if not allowed_protos:
+        lines.append("  <i>（未限制时，该 Key 可同时用于 /v1/messages、/v1/chat/completions、/v1/responses）</i>")
 
     # 本月使用统计
     ms = _key_month_stats(name)
@@ -193,6 +222,7 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
     short = _short_of(name)
     rows = [
         [ui.btn("🎯 编辑允许模型", f"ak:perm:{short}")],
+        [ui.btn("🔌 编辑允许协议", f"ak:proto:{short}")],
         [ui.btn("🗑 删除", f"ak:del:{short}")],
         [ui.btn("◀ 返回列表", "menu:apikey")],
     ]
@@ -455,6 +485,141 @@ def on_perm_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
+# ─── 允许协议多选 ────────────────────────────────────────────────
+
+_PROTO_STATE = "ak_proto_editing"
+
+
+def _render_proto_edit(name: str, checked: set[str]) -> tuple[str, dict]:
+    lines = [
+        f"🔌 <b>编辑允许协议</b>: {ui.escape_html(name)}",
+        "",
+        "点击下方入口切换勾选。清空 → 视为无限制（所有入口都放行）。",
+        "同一 Key 可同时勾选多个；如只想让该 Key 走 OpenAI 入口，就只勾 chat / responses。",
+        "",
+        f"当前已选: <b>{len(checked)}</b>" + ("（= 不限制）" if not checked else " 个"),
+    ]
+    short = _short_of(name)
+    rows: list[list[dict]] = []
+    for proto, label in PROTOCOL_CHOICES:
+        mark = "☑" if proto in checked else "☐"
+        rows.append([ui.btn(f"{mark} {label}", f"ak:ptp:{short}:{proto}")])
+    save_label = f"✅ 保存（{len(checked)} 个）" if checked else "✅ 保存（不限制）"
+    rows.append([
+        ui.btn(save_label, f"ak:ptpsave:{short}"),
+        ui.btn("🚫 清空(=不限制)", f"ak:ptpclr:{short}"),
+    ])
+    rows.append([ui.btn("❌ 取消", f"ak:ptpcancel:{short}")])
+    return "\n".join(lines), ui.inline_kb(rows)
+
+
+def on_proto_enter(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        show(chat_id, message_id)
+        return
+    current = set(entry.get("allowedProtocols") or [])
+    checked = {p for p in current if p in _PROTOCOL_SET}
+    states.set_state(chat_id, _PROTO_STATE, {
+        "name": name,
+        "checked": list(checked),
+    })
+    text, kb = _render_proto_edit(name, checked)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_proto_toggle(chat_id: int, message_id: int, cb_id: str, short: str, proto: str) -> None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != _PROTO_STATE:
+        ui.answer_cb(cb_id, "会话已过期")
+        show(chat_id, message_id)
+        return
+    data = state["data"]
+    if _name_of(short) != data.get("name"):
+        ui.answer_cb(cb_id, "短码不匹配")
+        return
+    if proto not in _PROTOCOL_SET:
+        ui.answer_cb(cb_id, "未知协议")
+        return
+    checked = set(data.get("checked") or [])
+    if proto in checked:
+        checked.remove(proto)
+    else:
+        checked.add(proto)
+    data["checked"] = list(checked)
+    states.set_state(chat_id, _PROTO_STATE, data)
+
+    ui.answer_cb(cb_id)
+    text, kb = _render_proto_edit(data["name"], checked)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_proto_clear(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != _PROTO_STATE:
+        ui.answer_cb(cb_id, "会话已过期")
+        show(chat_id, message_id)
+        return
+    data = state["data"]
+    if _name_of(short) != data.get("name"):
+        ui.answer_cb(cb_id, "短码不匹配")
+        return
+    data["checked"] = []
+    states.set_state(chat_id, _PROTO_STATE, data)
+    ui.answer_cb(cb_id, "已清空（= 不限制）")
+    text, kb = _render_proto_edit(data["name"], set())
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_proto_save(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != _PROTO_STATE:
+        ui.answer_cb(cb_id, "会话已过期")
+        show(chat_id, message_id)
+        return
+    data = state["data"]
+    name = data["name"]
+    if _name_of(short) != name:
+        ui.answer_cb(cb_id, "短码不匹配")
+        return
+    checked = [p for p, _ in PROTOCOL_CHOICES if p in (data.get("checked") or [])]  # 保稳定顺序
+
+    def _mutate(cfg):
+        keys = cfg.setdefault("apiKeys", {})
+        entry = keys.get(name)
+        if isinstance(entry, str):
+            entry = {"key": entry, "allowedModels": []}
+            keys[name] = entry
+        if not isinstance(entry, dict):
+            return
+        if checked:
+            entry["allowedProtocols"] = checked
+        else:
+            # 清空 = 不限制 → 直接删字段，避免 config 里堆积空数组
+            entry.pop("allowedProtocols", None)
+    config.update(_mutate)
+    states.pop_state(chat_id)
+
+    ui.answer_cb(cb_id, "已保存")
+    text, kb = _render_detail(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_proto_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已取消")
+    name = _name_of(short)
+    if not name:
+        show(chat_id, message_id)
+        return
+    text, kb = _render_detail(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
@@ -491,6 +656,25 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data.startswith("ak:pcancel:"):
         on_perm_cancel(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+
+    # 允许协议多选
+    if data.startswith("ak:proto:"):
+        on_proto_enter(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:ptp:"):
+        parts = data.split(":")
+        if len(parts) >= 4:
+            on_proto_toggle(chat_id, message_id, cb_id, parts[2], parts[3])
+            return True
+    if data.startswith("ak:ptpclr:"):
+        on_proto_clear(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:ptpsave:"):
+        on_proto_save(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:ptpcancel:"):
+        on_proto_cancel(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
     return False
 

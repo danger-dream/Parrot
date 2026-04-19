@@ -20,9 +20,17 @@ _LIST_LIMIT = 15
 
 _STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
 
+# 入口协议 → 简短标签（anthropic 是默认，不加标签以避免每条日志都冗余显示）
+_INGRESS_TAG = {"chat": "[chat]", "responses": "[rsp]"}
+
 
 def _status_icon(row: dict) -> str:
     return _STATUS_ICON.get(row.get("status"), "?")
+
+
+def _ingress_tag(row: dict) -> str:
+    """若入口非 anthropic 则返回 `[chat]`/`[rsp]`，否则空串。"""
+    return _INGRESS_TAG.get(row.get("ingress_protocol") or "", "")
 
 
 def _render_list(rows: list[dict]) -> str:
@@ -35,7 +43,10 @@ def _render_list(rows: list[dict]) -> str:
         icon = _status_icon(r)
         model = ui.escape_html(r.get("requested_model") or "?")
         key = ui.escape_html(r.get("api_key_name") or "?")
+        ing_tag = _ingress_tag(r)
         line = f"\n<b>#{idx}</b> <code>{ts}</code> {icon} <b>{key}</b> → {model}"
+        if ing_tag:
+            line += f" <code>{ing_tag}</code>"
 
         # 通道 + 重试数
         if r.get("final_channel_key"):
@@ -171,6 +182,14 @@ def _render_detail(detail: dict) -> str:
         lines.append(
             f"最终渠道: <code>{ui.escape_html(log['final_channel_key'])}</code>"
             f" / <code>{ui.escape_html(log.get('final_model') or '?')}</code>"
+        )
+    # 协议（入口 + 上游）：老日志可能为空，非空才显示避免噪音
+    ingress = log.get("ingress_protocol")
+    upstream_proto = log.get("upstream_protocol")
+    if ingress or upstream_proto:
+        lines.append(
+            f"协议: 入口 <code>{ui.escape_html(ingress or '?')}</code>"
+            f" → 上游 <code>{ui.escape_html(upstream_proto or '?')}</code>"
         )
     flags = []
     if log.get("is_stream"):

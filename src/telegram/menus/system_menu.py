@@ -535,6 +535,7 @@ _NOTIF_EVENTS = [
     ("oauth_refreshed",       "🔄 OAuth Token 刷新成功"),
     ("oauth_refresh_failed",  "❌ OAuth Token 刷新失败"),
     ("no_channels",           "🚨 无可用渠道告警"),
+    ("openai_store_save_failed", "❌ OpenAI Store 写入失败"),
 ]
 
 

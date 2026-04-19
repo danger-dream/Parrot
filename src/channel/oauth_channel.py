@@ -14,6 +14,7 @@ class OAuthChannel(Channel):
 
     type = "oauth"
     cc_mimicry = True  # OAuth 强制，不从 config 读
+    protocol = "anthropic"  # OAuth 永远是 anthropic 家族，显式声明
 
     def __init__(self, account: dict, default_models: list[str]):
         self.email = account["email"]
@@ -32,8 +33,10 @@ class OAuthChannel(Channel):
         return list(self.models)
 
     async def build_upstream_request(
-        self, requested_body: dict, resolved_model: str
+        self, requested_body: dict, resolved_model: str,
+        *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
+        _ = ingress_protocol  # OAuth 只服务 /v1/messages，忽略
         # OAuth：确保 token 有效 → 走完整 CC 伪装 → 拼 OAuth headers
         access_token = await oauth_manager.ensure_valid_token(self.email)
 

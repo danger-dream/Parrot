@@ -110,10 +110,27 @@ async def lifespan(app: FastAPI):
     log_db.init()
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
 
+    # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
+    try:
+        migrated = oauth_manager.migrate_provider_field()
+        if migrated:
+            print(f"[oauth] migrated provider='claude' for {migrated} legacy account(s)")
+    except Exception as exc:
+        print(f"[oauth] provider field migration failed: {exc}")
+
     # 内存表从 state.db 恢复
     affinity.init()
     cooldown.init()
     scorer.init()
+
+    # OpenAI 家族 factory 注入（必须在 rebuild_from_config 之前，否则带 protocol=openai-*
+    # 的 channel entry 会回落到 ApiChannel 并被 assert 拒绝）
+    from src.openai.channel.registration import register_factories as _openai_register_factories
+    _openai_register_factories()
+
+    # OpenAI previous_response_id Store（挂在同一张 state.db，独立表）
+    from src.openai import store as openai_store
+    openai_store.init()
 
     # 渠道注册表 + 热加载钩子
     registry.rebuild_from_config()
@@ -151,6 +168,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
     _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
+    _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
 
     try:
         yield
@@ -245,14 +263,22 @@ async def list_models(request: Request):
     """Anthropic 标准 /v1/models：返回当前代理可见的模型清单。
 
     - 需要 API Key 验证（和 /v1/messages 一致）
-    - 若 Key 有 allowedModels 白名单，仅返回该集合与全渠道可用模型的交集
+    - 若 Key 有 allowedProtocols，按家族过滤（解决两家族同名模型冲突，例：
+      openai 与 anthropic 都叫 claude-3.5）
+    - 若 Key 有 allowedModels 白名单，再和家族结果取交集
     - 否则返回所有启用渠道聚合的去重模型列表
     """
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    all_models = registry.available_models()
+    # 按 Key 的 allowedProtocols 推断家族。空/未设 = 全部家族。
+    allowed_protos = auth.get_allowed_protocols(key_name)
+    if allowed_protos:
+        families = {"anthropic" if p == "anthropic" else "openai" for p in allowed_protos}
+        all_models = registry.available_models_for_families(families)
+    else:
+        all_models = registry.available_models()
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
@@ -274,6 +300,20 @@ async def list_models(request: Request):
         "last_id": data[-1]["id"] if data else None,
         "has_more": False,
     }
+
+
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    """OpenAI Chat Completions 入口。详细流程在 src/openai/handler.py。"""
+    from src.openai.handler import handle
+    return await handle(request, ingress_protocol="chat")
+
+
+@app.post("/v1/responses")
+async def proxy_responses(request: Request):
+    """OpenAI Responses 入口。详细流程在 src/openai/handler.py。"""
+    from src.openai.handler import handle
+    return await handle(request, ingress_protocol="responses")
 
 
 @app.post("/v1/messages")
@@ -325,6 +365,7 @@ async def proxy_messages(request: Request):
         len(messages), len(tools),
         req_headers, body,
         fingerprint=fp_query,
+        ingress_protocol="anthropic",
     )
 
     # 5. 调度
