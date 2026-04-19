@@ -2,6 +2,7 @@
 
 [![Docker Image](https://img.shields.io/badge/ghcr.io-anthropicproxy-blue?logo=docker)](https://github.com/danger-dream/AnthropicProxy/pkgs/container/anthropicproxy)
 [![Build](https://github.com/danger-dream/AnthropicProxy/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/danger-dream/AnthropicProxy/actions/workflows/docker-publish.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **多渠道、智能调度、故障转移的 Anthropic 协议代理**
 
