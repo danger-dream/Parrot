@@ -154,13 +154,9 @@ def _format_account_block(acc: dict) -> str:
         if fh_util is None and sd_util is None:
             lines.append("  📊 用量: <i>尚未获取</i>")
     else:
-        # OpenAI 账户没有独立 usage 端点；只有实际 codex 请求经过才会写响应头
-        # snapshot 到 quota_cache。这里区别提示，避免误导用户"手动刷新"按钮能拉
-        # 回用量（它不能，只能刷 Token）。
-        if oauth_manager.provider_of(acc) == "openai":
-            lines.append("  📊 用量: <i>由响应头更新（需发一次 codex 请求）</i>")
-        else:
-            lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
+        # OpenAI / Claude 都走同一条路径：点账户详情的"刷新用量"按钮。
+        # 对 openai 来说，按钮会发一条最小 codex 探测请求拉响应头。
+        lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
 
     # 月度统计（本月 log_db 聚合）
     try:
@@ -468,25 +464,41 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     if email is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    # OpenAI 没有独立 usage 端点。把按钮退化为 force_refresh：
-    # 刷一次 token 顺带更新 last_refresh / expired，并解新 id_token 里
-    # 可能轮换的 plan_type / chatgpt_account_id / organization_id。实际的
-    # 使用量 (5h / 7d) 仍然只能在真实 codex 请求经过时由响应头写入。
+    # OpenAI 没有独立 usage 端点，改为主动发一条最小 codex 探测请求：
+    #   1) force_refresh 先强制刷一次 token（更新 expired / last_refresh /
+    #      id_token 里的 plan_type / chatgpt_account_id / organization_id）
+    #   2) OpenAIOAuthChannel.probe_usage 发最小 codex 请求，读响应头的
+    #      x-codex-* 字段 → quota_save_openai_snapshot
+    # 探测会消耗少量 codex token（几到几十 output token），用户主动点。
     if oauth_manager.provider_of(email) == "openai":
-        ui.answer_cb(cb_id, "刷新 Token 中...")
-        result = _run_sync(oauth_manager.force_refresh(email))
-        if isinstance(result, Exception):
+        from ...channel import registry
+        from ...channel.openai_oauth_channel import OpenAIOAuthChannel
+
+        ui.answer_cb(cb_id, "刷新 Token 并发送探测请求...")
+        # Step 1: force_refresh
+        tr = _run_sync(oauth_manager.force_refresh(email))
+        if isinstance(tr, Exception):
             ui.send(chat_id,
-                    f"❌ 刷新失败: <code>{ui.escape_html(str(result))}</code>")
+                    f"❌ 刷新 Token 失败: <code>{ui.escape_html(str(tr))}</code>")
+            return
+        # Step 2: probe
+        ch = registry.get_channel(f"oauth:{email}")
+        if not isinstance(ch, OpenAIOAuthChannel):
+            ui.send(chat_id, "❌ 账户未注册为 OpenAI OAuth 渠道")
+            return
+        pr = _run_sync(ch.probe_usage())
+        if isinstance(pr, Exception):
+            ui.send(chat_id, f"❌ 探测失败: <code>{ui.escape_html(str(pr))}</code>")
             return
         text, kb = _detail_text_and_kb(email)
+        if pr.get("ok"):
+            head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
+        else:
+            reason = pr.get("reason", "?")
+            head = ("⚠ Token 已刷新，但用量探测未成功: "
+                    f"<code>{ui.escape_html(str(reason))[:200]}</code>")
         if text:
-            ui.edit(
-                chat_id, message_id,
-                "✅ <i>OpenAI 无独立 usage 端点；已刷新 Token 与账户元信息。"
-                "真实用量由后续 codex 请求的响应头更新。</i>\n\n" + text,
-                reply_markup=kb,
-            )
+            ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
         return
     ui.answer_cb(cb_id, "拉取中...")
 
@@ -593,21 +605,31 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
 
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "拉取中...")
+    from ...channel import registry
+    from ...channel.openai_oauth_channel import OpenAIOAuthChannel
+
     accounts = oauth_manager.list_accounts()
     ok = 0
     fail = 0
-    openai_ok = 0       # OpenAI 账户：没有独立 usage，退化为 force_refresh token
+    openai_ok = 0       # OpenAI 账户：force_refresh + probe_usage 都成功
     openai_fail = 0
     for acc in accounts:
         email = acc.get("email")
         if not email:
             continue
         if oauth_manager.provider_of(acc) == "openai":
-            # 没有独立 usage 端点，点"刷新全部"对 openai 意为"批量刷新 Token"
-            # （顺带更新 expired / last_refresh / id_token metadata）。真实用量
-            # 由后续 codex 请求响应头更新，这里不动 quota_cache。
-            res = _run_sync(oauth_manager.force_refresh(email))
-            if isinstance(res, Exception):
+            # 1) 强制刷 token，更新 expired / last_refresh / id_token metadata
+            tr = _run_sync(oauth_manager.force_refresh(email))
+            if isinstance(tr, Exception):
+                openai_fail += 1
+                continue
+            # 2) 发探测请求拉响应头 → 更新 quota_cache
+            ch = registry.get_channel(f"oauth:{email}")
+            if not isinstance(ch, OpenAIOAuthChannel):
+                openai_fail += 1
+                continue
+            pr = _run_sync(ch.probe_usage())
+            if isinstance(pr, Exception) or not pr.get("ok"):
                 openai_fail += 1
             else:
                 openai_ok += 1
@@ -623,7 +645,7 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
     if ok or fail:
         parts.append(f"Claude 用量: 成功 {ok} / 失败 {fail}")
     if openai_ok or openai_fail:
-        parts.append(f"OpenAI Token 刷新: 成功 {openai_ok} / 失败 {openai_fail}")
+        parts.append(f"OpenAI 探测: 成功 {openai_ok} / 失败 {openai_fail}")
     if not parts:
         parts.append("无可刷新账户")
     ui.send(chat_id, "✅ " + "；".join(parts))

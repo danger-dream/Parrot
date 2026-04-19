@@ -261,12 +261,13 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     print("  [PASS] oauth_menu detail: provider tag + plan + codex usage")
 
 
-def test_oauth_menu_refresh_usage_openai_force_refreshes_token(m):
-    """OpenAI 账户点'刷新用量'退化为 force_refresh：更新 last_refresh/expired/id_token"""
+def test_oauth_menu_refresh_usage_openai_probe(m):
+    """OpenAI 账户点'刷新用量' → force_refresh + probe_usage（mockMode 合成 snapshot）。"""
     _setup(m)
     _add_openai(m, "ru@openai.test")
+    m["registry"].rebuild_from_config()
 
-    # 写一个旧的 access_token / expired 便于观察更新
+    # 写一个旧 token / expired 便于观察更新
     def _stamp(c):
         for a in c["oauthAccounts"]:
             if a["email"] == "ru@openai.test":
@@ -274,50 +275,81 @@ def test_oauth_menu_refresh_usage_openai_force_refreshes_token(m):
                 a["expired"] = "2026-01-01T00:00:00Z"
                 a["last_refresh"] = "2026-01-01T00:00:00Z"
     m["config"].update(_stamp)
+    # rebuild 之后 channel 引用的是新配置
+    m["registry"].rebuild_from_config()
 
     rec = _UiRecorder()
     m["ui"].api = rec
     short = m["ui"].register_code("ru@openai.test")
     m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
 
-    # access_token / expired / last_refresh 都应已更新
+    # Step 1 结果：force_refresh 更新了 token 三字段
     acc = m["oauth_manager"].get_account("ru@openai.test")
     assert acc["access_token"] != "OLD-AT"
     assert acc["expired"] != "2026-01-01T00:00:00Z"
     assert acc["last_refresh"] != "2026-01-01T00:00:00Z"
-    # 详情已重渲染（edit 带提示文字）
+    # Step 2 结果：probe_usage mockMode 写入 snapshot
+    row = m["state_db"].quota_load("ru@openai.test")
+    assert row is not None, "probe should have written quota snapshot"
+    # mockMode 合成 primary=3% / secondary=1% → normalize 后 7d=3 / 5h=1
+    assert row["seven_day_util"] == 3.0
+    assert row["five_hour_util"] == 1.0
+    # 详情已重渲染 + 头部"已刷新 Token 并更新用量"提示
     last = rec.last("editMessageText")
-    assert last and ("已刷新 Token" in last["text"] or "OpenAI" in last["text"])
-    print("  [PASS] oauth_menu refresh_usage: openai → force_refresh + re-render")
+    assert last and "探测请求成功" in last["text"], last.get("text", "")[:200]
+    print("  [PASS] oauth_menu refresh_usage: openai → force_refresh + probe_usage + re-render")
 
 
-def test_oauth_menu_refresh_all_refreshes_openai_tokens(m):
-    """OpenAI 账户参与 refresh_all，调 force_refresh 更新 Token 字段"""
+def test_oauth_menu_refresh_all_probes_openai(m):
+    """refresh_all 对 openai：force_refresh + probe_usage 成功计入 'OpenAI 探测'。"""
     _setup(m)
     m["oauth_manager"].add_account({
         "email": "c@claude.test", "provider": "claude",
         "access_token": "x", "refresh_token": "x",
     })
     _add_openai(m, "o@openai.test")
-    # 记旧 token 以便对比
+    m["registry"].rebuild_from_config()
+
     def _stamp(c):
         for a in c["oauthAccounts"]:
             if a["email"] == "o@openai.test":
                 a["access_token"] = "OLD-OPENAI-AT"
     m["config"].update(_stamp)
+    m["registry"].rebuild_from_config()
 
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].on_refresh_all(42, 100, "cb")
     send = rec.last("sendMessage")
     assert send, "expected send summary"
-    # 新摘要语义："OpenAI Token 刷新: 成功 1 / 失败 0"
-    assert "OpenAI Token 刷新" in send["text"], send["text"]
+    # 新摘要："OpenAI 探测: 成功 1 / 失败 0"
+    assert "OpenAI 探测" in send["text"], send["text"]
     assert "成功 1" in send["text"]
-    # openai 账户 access_token 确实被换了
+    # openai 账户 token 刷过；quota snapshot 也写入
     acc = m["oauth_manager"].get_account("o@openai.test")
     assert acc["access_token"] != "OLD-OPENAI-AT"
-    print("  [PASS] oauth_menu refresh_all: openai accounts get token refreshed")
+    row = m["state_db"].quota_load("o@openai.test")
+    assert row is not None and row["seven_day_util"] == 3.0
+    print("  [PASS] oauth_menu refresh_all: openai force_refresh + probe both ran")
+
+
+def test_probe_usage_writes_snapshot_in_mock_mode(m):
+    """OpenAIOAuthChannel.probe_usage mockMode 下合成 snapshot 写库，不发 HTTP。"""
+    _setup(m)
+    _add_openai(m, "probe@openai.test")
+    m["registry"].rebuild_from_config()
+    ch = m["registry"].get_channel("oauth:probe@openai.test")
+    import asyncio
+    res = asyncio.run(ch.probe_usage())
+    assert res["ok"] is True, res
+    assert res.get("reason") == "mock"
+    row = m["state_db"].quota_load("probe@openai.test")
+    assert row is not None
+    assert row["codex_primary_used_pct"] == 3.0
+    assert row["codex_secondary_used_pct"] == 1.0
+    assert row["seven_day_util"] == 3.0     # primary window=10080 → 7d
+    assert row["five_hour_util"] == 1.0     # secondary window=300 → 5h
+    print("  [PASS] probe_usage(mockMode): synthesized snapshot, no real HTTP")
 
 
 def test_delete_account_clears_codex_snapshot_throttle(m):
@@ -402,8 +434,9 @@ def main():
         test_record_skip_non_openai_channel,
         test_record_skip_no_codex_headers,
         test_oauth_menu_detail_openai_shows_provider_and_codex_usage,
-        test_oauth_menu_refresh_usage_openai_force_refreshes_token,
-        test_oauth_menu_refresh_all_refreshes_openai_tokens,
+        test_oauth_menu_refresh_usage_openai_probe,
+        test_oauth_menu_refresh_all_probes_openai,
+        test_probe_usage_writes_snapshot_in_mock_mode,
         test_delete_account_clears_codex_snapshot_throttle,
         test_on_refresh_token_openai_skips_fetch_usage,
         test_status_menu_quota_warnings_tags_openai,

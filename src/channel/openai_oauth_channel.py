@@ -183,6 +183,96 @@ class OpenAIOAuthChannel(Channel):
         # OpenAI 家族不做工具名还原
         return chunk
 
+    # ─── 主动探测：拉 Codex 用量 snapshot ────────────────────────
+
+    async def probe_usage(self, *, timeout_s: float = 20.0) -> dict:
+        """主动发一条最小 codex 请求，读响应头更新 Codex 用量 snapshot。
+
+        对齐 sub2api account_test_service 的做法：构造一个"hi" 级别的小请求，
+        拿到响应头即可 close 流，不等完整回复。响应头里的 x-codex-* 字段喂给
+        state_db.quota_save_openai_snapshot，相当于"显式刷新一次用量"。
+
+        用户在 TG bot 主动点按钮时调用；不触发 failover 节流桶（那个只在请求
+        链路里生效），这里直接写库。
+
+        返回 {"ok": bool, "reason": str (错误时)}。
+        副作用：成功时更新 oauth_quota_cache。
+
+        成本提示：上游会产生少量 output token（几到几十），计入 Codex 配额；
+        用户主动触发，知情同意。
+        """
+        # 延迟 import 以免循环依赖
+        from .. import oauth_manager, state_db
+        from ..oauth import openai as openai_provider
+
+        # mockMode 短路：不发真实 HTTP，合成一组 snapshot 写库便于测试
+        if oauth_manager.mock_mode_enabled():
+            mock_headers = {
+                "x-codex-primary-used-percent": "3",
+                "x-codex-primary-reset-after-seconds": "3600",
+                "x-codex-primary-window-minutes": "10080",
+                "x-codex-secondary-used-percent": "1",
+                "x-codex-secondary-reset-after-seconds": "180",
+                "x-codex-secondary-window-minutes": "300",
+            }
+            snap = openai_provider.parse_rate_limit_headers(mock_headers)
+            if snap:
+                normalized = openai_provider.normalize_codex_snapshot(snap)
+                state_db.quota_save_openai_snapshot(self.email, snap, normalized)
+            return {"ok": True, "reason": "mock"}
+
+        if not self.chatgpt_account_id:
+            return {"ok": False, "reason": "missing chatgpt_account_id"}
+
+        # 构造最小探测请求体。走 build_upstream_request 能顺带用到 codex
+        # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）
+        probe_model = self.models[0] if self.models else "gpt-5.2"
+        test_body = {
+            "model": probe_model,
+            "input": "1",
+            # 极短 instructions，减少 input token
+            "instructions": "reply ok",
+            # 不设 stream 让 transform 强制 stream=true
+        }
+        try:
+            req = await self.build_upstream_request(
+                test_body, probe_model, ingress_protocol="responses",
+            )
+        except Exception as exc:
+            return {"ok": False, "reason": f"build upstream request: {exc}"}
+
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                # stream 模式：拿到响应头即可，不消费 body 直接关流
+                # （上游会继续生成一小段 token 直到发现连接关闭，算作探测成本）
+                async with client.stream(
+                    "POST", req.url,
+                    headers=req.headers, content=req.body,
+                ) as resp:
+                    status = resp.status_code
+                    headers_snapshot = dict(resp.headers)
+        except httpx.TimeoutException:
+            return {"ok": False, "reason": f"timeout > {timeout_s}s"}
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)[:200]}
+
+        # 即使非 200，codex 也可能在头里带速率限制信息；能写就写
+        snap = openai_provider.parse_rate_limit_headers(headers_snapshot)
+        if snap:
+            normalized = openai_provider.normalize_codex_snapshot(snap)
+            try:
+                state_db.quota_save_openai_snapshot(self.email, snap, normalized)
+            except Exception as exc:
+                return {"ok": False, "reason": f"quota write: {exc}"}
+
+        if status != 200:
+            return {"ok": False, "reason": f"HTTP {status}"}
+        if not snap:
+            return {"ok": False,
+                    "reason": "upstream 200 but no x-codex-* headers"}
+        return {"ok": True, "reason": "probed"}
+
     # ─── UI ──────────────────────────────────────────────────
 
     def display(self) -> ChannelDisplay:
