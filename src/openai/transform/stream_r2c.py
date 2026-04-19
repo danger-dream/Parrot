@@ -45,6 +45,10 @@ class R2CState:
     fc_name_by_tc_index: dict[int, str] = field(default_factory=dict)
     fc_call_id_by_tc_index: dict[int, str] = field(default_factory=dict)
     next_tc_index: int = 0
+    # 下游 chat assistant 累积（供 MS-7 亲和 fingerprint_write_chat 使用）
+    chat_text_parts: list = field(default_factory=list)
+    chat_refusal_parts: list = field(default_factory=list)
+    fc_args_by_tc_index: dict[int, str] = field(default_factory=dict)
     # 累积
     usage: Optional[dict] = None
     finish_reason: Optional[str] = None
@@ -232,6 +236,7 @@ class StreamTranslator:
         text = data.get("delta")
         if not isinstance(text, str) or not text:
             return
+        self.state.chat_text_parts.append(text)
         yield from self._ensure_role_sent()
         yield _mk_chunk(self.state, delta={"content": text})
 
@@ -239,6 +244,7 @@ class StreamTranslator:
         text = data.get("delta")
         if not isinstance(text, str) or not text:
             return
+        self.state.chat_refusal_parts.append(text)
         yield from self._ensure_role_sent()
         yield _mk_chunk(self.state, delta={"refusal": text})
 
@@ -262,6 +268,9 @@ class StreamTranslator:
         text = data.get("delta")
         if not isinstance(text, str):
             return
+        self.state.fc_args_by_tc_index[tc_index] = (
+            self.state.fc_args_by_tc_index.get(tc_index, "") + text
+        )
         yield _mk_chunk(self.state, delta={
             "tool_calls": [{
                 "index": tc_index,
@@ -292,6 +301,33 @@ class StreamTranslator:
             self.state.finish_reason = "stop"
         return
         yield
+
+    def get_downstream_chat_assistant(self) -> dict:
+        """累积至今的下游 chat `assistant` message 快照。
+
+        形状与 `upstream.ChatSSEAssistantBuilder.get_assistant` 对齐，供
+        failover 里的 fingerprint_write_chat 做亲和写入使用。本身不带状态
+        副作用；流未结束时调用给出的是"到目前为止"的快照。
+        """
+        msg: dict = {"role": "assistant"}
+        content = "".join(self.state.chat_text_parts)
+        msg["content"] = content if content else None
+        if self.state.chat_refusal_parts:
+            msg["refusal"] = "".join(self.state.chat_refusal_parts)
+        if self.state.fc_output_index_to_tc_index:
+            tcs: list[dict] = []
+            for tc_index in sorted(set(self.state.fc_output_index_to_tc_index.values())):
+                tcs.append({
+                    "id": self.state.fc_call_id_by_tc_index.get(tc_index, ""),
+                    "type": "function",
+                    "function": {
+                        "name": self.state.fc_name_by_tc_index.get(tc_index, ""),
+                        "arguments": self.state.fc_args_by_tc_index.get(tc_index, ""),
+                    },
+                })
+            if tcs:
+                msg["tool_calls"] = tcs
+        return msg
 
     def _on_error(self, event_name: str, data: dict) -> Iterator[bytes]:
         # response.failed 的 payload 里 response.error.{message,code,...}

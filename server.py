@@ -357,6 +357,7 @@ async def proxy_messages(request: Request):
         len(messages), len(tools),
         req_headers, body,
         fingerprint=fp_query,
+        ingress_protocol="anthropic",
     )
 
     # 5. 调度

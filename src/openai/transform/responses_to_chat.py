@@ -180,9 +180,12 @@ def _input_items_to_messages(items: list) -> list:
                             refusal_texts.append(r)
                     else:
                         non_refusal_parts.append(p)
+                # 纯 refusal（无文本/图片 parts）→ content 必须是 null，
+                # 否则严格上游（如官方 gpt-*）会因 assistant.content 为空列表而 400
                 msg_out: dict = {
                     "role": role,
-                    "content": _content_responses_to_chat(non_refusal_parts),
+                    "content": (_content_responses_to_chat(non_refusal_parts)
+                                if non_refusal_parts else None),
                 }
                 if refusal_texts:
                     msg_out["refusal"] = "\n".join(refusal_texts)
@@ -377,7 +380,8 @@ def translate_response(chat: dict, *, model: str,
     }
 
     # 写 Store：只在 responses 入口 + chat 上游 + 有 api_key_name 时触发。
-    # 为了避免沉默吞错，Store 失败打 warning 但不影响主响应返回。
+    # Store 失败不中断主响应（客户端已拿到结果），但要走节流告警：
+    # 下一次带 previous_response_id 的请求会 404，必须让运维能及时看到。
     if current_input_items is not None and api_key_name:
         try:
             from .. import store as _store
@@ -392,7 +396,21 @@ def translate_response(chat: dict, *, model: str,
                     output_items=output_items,
                 )
         except Exception as exc:
-            print(f"[openai_store] save failed (resp_id={resp_id}): {exc}")
+            import traceback as _tb
+            _tb.print_exc()
+            from ... import notifier as _notifier
+            ek = _notifier.escape_html
+            _notifier.throttled_notify_event_sync(
+                "openai_store_save_failed",
+                f"openai_store_save_failed:{api_key_name}",
+                "❌ <b>OpenAI Store 写入失败</b>（非流式）\n"
+                f"API Key: <code>{ek(api_key_name)}</code>\n"
+                f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(channel_key or '?')}</code>\n"
+                f"resp_id: <code>{ek(resp_id)}</code>\n"
+                f"原因: <code>{ek(str(exc))[:300]}</code>\n"
+                "⚠ 下一次带该 previous_response_id 的请求会 404；"
+                "请检查 state.db 读写权限与磁盘空间。",
+            )
 
     return resp
 

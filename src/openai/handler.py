@@ -164,6 +164,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         log_db.insert_pending,
         request_id, client_ip, key_name, model, is_stream, msg_count, tool_count,
         req_headers, log_body, fingerprint=fp_query,
+        ingress_protocol=ingress_protocol,
     )
 
     # 7. 调度（ingress_protocol 决定家族过滤；fp_query 决定亲和命中）

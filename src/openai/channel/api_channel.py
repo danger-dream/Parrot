@@ -57,7 +57,7 @@ class OpenAIApiChannel(Channel):
 
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,
-        *, ingress_protocol: str = "chat",
+        *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
         """按 (ingress_protocol, self.protocol) 分派。
 

@@ -8,7 +8,7 @@ callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）
   - `ch_wiz_protocol` 步骤 3/5：选择上游协议（按钮）
   - `ch_wiz_key`      步骤 4/5：输入 API Key
   - `ch_wiz_models`   步骤 5/5：输入模型列表（支持 `real:alias, ...`）
-  - `ch_wiz_test`     最后：测试面板（anthropic）/ 确认面板（openai-*）
+  - `ch_wiz_test`     最后：测试面板（所有协议统一走 probe）
 
 状态机 action（编辑）：
   - `ch_edit_name:<short>`
@@ -43,10 +43,6 @@ _PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
 
 def _protocol_of(ch) -> str:
     return getattr(ch, "protocol", "anthropic")
-
-
-def _is_openai(protocol: str) -> bool:
-    return protocol in ("openai-chat", "openai-responses")
 
 
 _BJT = timezone(timedelta(hours=8))
@@ -518,8 +514,12 @@ def wiz_on_name_input(chat_id: int, text: str) -> None:
         chat_id,
         "✅ 名称已设置\n\n"
         "➕ <b>添加渠道（2/5）</b>\n\n"
-        "请输入 Base URL（需 http:// 或 https:// 开头；代理会根据"
-        "下一步所选协议追加 <code>/v1/messages</code> 或 <code>/v1/chat/completions</code> 等路径）：",
+        "请输入上游 <b>Base URL</b>（需以 <code>http://</code> 或 <code>https://</code> 开头）\n\n"
+        "<i>只需填上游域名或 API 根路径，代理会根据下一步所选协议自动追加对应子路径：</i>\n"
+        "• Anthropic → <code>/v1/messages</code>\n"
+        "• OpenAI Chat → <code>/v1/chat/completions</code>\n"
+        "• OpenAI Responses → <code>/v1/responses</code>\n\n"
+        "示例：<code>https://api.example.com</code>",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
 
@@ -617,15 +617,6 @@ def wiz_on_models_input(chat_id: int, text: str) -> None:
 
 
 def _wiz_test_kb(data: dict) -> dict:
-    protocol = data.get("protocol") or "anthropic"
-    # OpenAI 家族暂不支持联通性测试（probe 分派在 MS-2 落地），直接给确认面板。
-    if _is_openai(protocol):
-        return ui.inline_kb([
-            [ui.btn("💾 保存渠道", "chw:save")],
-            [ui.btn("◀ 返回上一步", "chw:back"),
-             ui.btn("❌ 取消", "chw:cancel")],
-        ])
-
     rows: list[list[dict]] = []
     # 每行放 1-2 个模型按钮
     current: list[dict] = []
@@ -661,18 +652,6 @@ def _wiz_test_kb(data: dict) -> dict:
 
 
 def _wiz_test_intro(data: dict) -> str:
-    protocol = data.get("protocol") or "anthropic"
-    if _is_openai(protocol):
-        return (
-            "✅ <b>信息已录入</b>\n\n"
-            f"渠道: <code>{ui.escape_html(data['name'])}</code>\n"
-            f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
-            f"URL: <code>{ui.escape_html(data['baseUrl'])}</code>\n"
-            f"模型: {len(data['models'])} 个\n\n"
-            "<i>OpenAI 家族暂未接入联通性测试（MS-2 将补齐），可直接保存，"
-            "后续 probe 会持续探测真实可用性。</i>"
-        )
-
     header = (
         "🧪 <b>渠道测试</b>\n\n"
         f"渠道: <code>{ui.escape_html(data['name'])}</code>\n"
@@ -915,12 +894,10 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
     data = state["data"]
     protocol = data.get("protocol") or "anthropic"
     results = data.get("test_results") or {}
-    # OpenAI 家族 MS-1 不做联通性测试，直接允许保存；anthropic 仍要求至少一个模型成功
-    if protocol == "anthropic":
-        any_ok = any(v[0] for v in results.values())
-        if not any_ok:
-            ui.answer_cb(cb_id, "需要至少一个模型测试成功", show_alert=True)
-            return
+    any_ok = any(v[0] for v in results.values())
+    if not any_ok:
+        ui.answer_cb(cb_id, "需要至少一个模型测试成功", show_alert=True)
+        return
     try:
         registry.add_api_channel({
             "name": data["name"],
@@ -946,26 +923,17 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
 
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
-    if protocol == "anthropic":
-        ok_names = [m["alias"] for m in data["models"] if (results.get(m["real"]) or (False,))[0]]
-        fail_names = [m["alias"] for m in data["models"] if not (results.get(m["real"]) or (False,))[0]]
-        ok_display = ", ".join(ui.escape_html(n) for n in ok_names) or "-"
-        fail_display = ", ".join(ui.escape_html(n) for n in fail_names)
-        summary = (
-            f"✅ <b>渠道已保存</b>: <code>{ui.escape_html(data['name'])}</code>\n\n"
-            f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
-            f"可用模型 ({len(ok_names)}): {ok_display}\n"
-        )
-        if fail_names:
-            summary += f"不可用（已加入冷却） ({len(fail_names)}): {fail_display}"
-    else:
-        all_names = ", ".join(ui.escape_html(m["alias"]) for m in data["models"])
-        summary = (
-            f"✅ <b>渠道已保存（未测试）</b>: <code>{ui.escape_html(data['name'])}</code>\n\n"
-            f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
-            f"模型: {all_names}\n"
-            "<i>MS-1 阶段 OpenAI 家族暂不做联通性测试，请在 MS-2 完成后再次验证。</i>"
-        )
+    ok_names = [m["alias"] for m in data["models"] if (results.get(m["real"]) or (False,))[0]]
+    fail_names = [m["alias"] for m in data["models"] if not (results.get(m["real"]) or (False,))[0]]
+    ok_display = ", ".join(ui.escape_html(n) for n in ok_names) or "-"
+    fail_display = ", ".join(ui.escape_html(n) for n in fail_names)
+    summary = (
+        f"✅ <b>渠道已保存</b>: <code>{ui.escape_html(data['name'])}</code>\n\n"
+        f"协议: <code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n"
+        f"可用模型 ({len(ok_names)}): {ok_display}\n"
+    )
+    if fail_names:
+        summary += f"不可用（已加入冷却） ({len(fail_names)}): {fail_display}"
     # edit 同一消息显示结果 + 导航；用户点击按钮返回列表，避免双消息
     ui.edit(chat_id, message_id, summary, reply_markup=ui.inline_kb([
         [ui.btn("◀ 返回渠道列表", "menu:channel"),
