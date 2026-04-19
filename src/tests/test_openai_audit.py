@@ -321,6 +321,63 @@ async def test_handler_sanitizes_internal_body_fields(m):
 # ─── P2.2：guard conversation null 应放行 ──────────────────────
 
 
+def test_reasoning_content_read_from_reasoning_text(m):
+    """reasoning item 的 content[].reasoning_text 也应被读取，不只是 summary_text。"""
+    c2r = m["chat_to_responses"]
+    resp = {
+        "id": "resp_1", "status": "completed", "created_at": 1, "model": "x",
+        "output": [
+            {"type": "reasoning", "id": "rs_1",
+             # 只给 content 不给 summary，模拟部分模型的输出
+             "content": [{"type": "reasoning_text", "text": "raw step-1 raw step-2"}]},
+            {"type": "message", "id": "m", "role": "assistant",
+             "content": [{"type": "output_text", "text": "ans", "annotations": []}]},
+        ],
+        "output_text": "ans",
+        "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+    }
+    out = c2r.translate_response(resp, model="x")
+    msg = out["choices"][0]["message"]
+    assert msg.get("reasoning_content") == "raw step-1 raw step-2", (
+        f"content[].reasoning_text 应被收集：{msg}"
+    )
+    print("  [PASS] c2r: reasoning.content[].reasoning_text 也能被 gather")
+
+
+def test_legacy_function_call_passthrough(m):
+    """Chat 请求白名单保留 legacy `functions` / `function_call` 字段（SDK 仍接受）。"""
+    from src.openai.transform.common import filter_chat_passthrough, CHAT_REQ_ALLOWED
+    assert "functions" in CHAT_REQ_ALLOWED
+    assert "function_call" in CHAT_REQ_ALLOWED
+    body = {
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "functions": [{"name": "f", "parameters": {}}],
+        "function_call": "auto",
+        "some_unknown": "should drop",
+    }
+    filtered = filter_chat_passthrough(body)
+    assert "functions" in filtered
+    assert "function_call" in filtered
+    assert "some_unknown" not in filtered
+    print("  [PASS] chat 请求白名单：legacy functions/function_call 透传")
+
+
+def test_cancelled_status_maps_to_stop(m):
+    """Response.status=cancelled/queued → chat finish_reason=stop（保守）。"""
+    c2r = m["chat_to_responses"]
+    for status in ("cancelled", "queued", "in_progress"):
+        resp = {
+            "id": "r", "status": status, "created_at": 1, "model": "x",
+            "output": [], "output_text": "",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        }
+        out = c2r.translate_response(resp, model="x")
+        fr = out["choices"][0]["finish_reason"]
+        assert fr == "stop", f"status={status} 期望 finish_reason=stop，得到 {fr}"
+    print("  [PASS] c2r: cancelled/queued/in_progress status → finish_reason=stop")
+
+
 def test_guard_conversation_null_allowed(m):
     """conversation=null / 空 dict：不应触发 guard 拒绝；只有非空 conv id 才拒。"""
     g = m["guard"]
@@ -370,6 +427,9 @@ def main() -> int:
         test_c2r_only_close_after_error_before_done,
         test_historic_reasoning_passthrough,
         test_historic_reasoning_drop,
+        test_reasoning_content_read_from_reasoning_text,
+        test_legacy_function_call_passthrough,
+        test_cancelled_status_maps_to_stop,
         _async(test_handler_sanitizes_internal_body_fields),
         test_guard_conversation_null_allowed,
     ]

@@ -334,6 +334,8 @@ def _finish_reason_for_responses(resp: dict, *, fallback: str) -> str:
                 if isinstance(it, dict) and it.get("type") == "function_call":
                     return "tool_calls"
         return "stop"
+    if status in ("failed", "cancelled"):
+        return fallback
     return fallback
 
 

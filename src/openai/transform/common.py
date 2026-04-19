@@ -22,6 +22,9 @@ CHAT_REQ_ALLOWED: frozenset[str] = frozenset({
     "frequency_penalty", "presence_penalty",
     "logprobs", "top_logprobs", "logit_bias",
     "tools", "tool_choice", "parallel_tool_calls",
+    # 已弃用但 openai-python SDK 仍保留的 legacy 字段；
+    # 老客户端直接透传以保持语义，跨变体翻译不处理（反正 deprecated）
+    "functions", "function_call",
     "response_format", "modalities", "audio",
     "store", "metadata", "seed", "prediction",
     "reasoning_effort", "verbosity", "web_search_options",

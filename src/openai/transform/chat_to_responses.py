@@ -341,10 +341,15 @@ def _gather_refusal(output: list) -> Optional[str]:
 
 
 def _gather_reasoning_summary(output: list) -> Optional[str]:
-    """从 reasoning items 的 summary_text 聚合文本。
+    """从 reasoning items 聚合推理文本。
 
-    当 `openai.reasoningBridge == "drop"` 时直接返回 None（usage.reasoning_tokens
-    不受影响，仍由 _usage_resps_to_chat 透传）。encrypted_content 不处理。
+    一个 reasoning item 官方结构：
+      - `summary[]`：summary_text（精简摘要，大多数模型仅输出这个）
+      - `content[]`：reasoning_text（原文推理，部分模型独立产出）
+      - `encrypted_content`：加密原文，chat 侧没有对应字段 → 不处理
+
+    两处都尝试读，按 item 顺序合并；当 `openai.reasoningBridge == "drop"`
+    时直接返回 None（usage.reasoning_tokens 不受影响，仍由 _usage_resps_to_chat 透传）。
     """
     from .common import reasoning_passthrough_enabled
     if not reasoning_passthrough_enabled():
@@ -358,10 +363,21 @@ def _gather_reasoning_summary(output: list) -> Optional[str]:
                 t = s.get("text")
                 if isinstance(t, str) and t:
                     parts.append(t)
+        for c in item.get("content") or []:
+            if isinstance(c, dict) and c.get("type") == "reasoning_text":
+                t = c.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
     return "\n\n".join(parts) if parts else None
 
 
 def _status_to_finish_reason(resp: dict, *, has_tool_calls: bool) -> str:
+    """Responses status → Chat finish_reason。
+
+    官方 ResponseStatus 取值：in_progress / queued / completed / failed
+    / incomplete / cancelled。其中 queued / in_progress 理论上不会出现在
+    非流式完整响应里（它们是流式中间态）；cancelled 映射到 stop。
+    """
     status = resp.get("status")
     incomplete = resp.get("incomplete_details") or {}
     if status == "completed":
@@ -373,9 +389,9 @@ def _status_to_finish_reason(resp: dict, *, has_tool_calls: bool) -> str:
         if reason == "content_filter":
             return "content_filter"
         return "stop"
-    if status == "failed":
+    if status in ("failed", "cancelled"):
         return "stop"
-    # in_progress / unknown → 保守用 stop
+    # in_progress / queued / 未知 → 保守用 stop（若有 tool_calls 则 tool_calls）
     return "tool_calls" if has_tool_calls else "stop"
 
 
