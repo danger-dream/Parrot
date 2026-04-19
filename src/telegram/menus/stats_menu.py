@@ -125,8 +125,37 @@ def _strip_unknown(groups: list[dict]) -> list[dict]:
     return [g for g in groups if (g.get("key") or "?") != "?"]
 
 
-def _summary_dim_block(title: str, groups: list[dict], render_key) -> str:
-    """汇总视图里某个维度的 Top 块（紧凑两行/条）。"""
+def _channel_type_label(ch_type: str) -> str:
+    """渠道类型短标签：api / oauth / ?。"""
+    if ch_type in ("api", "oauth"):
+        return ch_type
+    return "?"
+
+
+def _render_model_channels(items: list[dict], limit: int = 3) -> str:
+    """把 channels_by_requested_model 返回的单个模型 items 渲染成一行"所属"。"""
+    if not items:
+        return ""
+    parts: list[str] = []
+    for it in items[:limit]:
+        short = _ch_short_name(it.get("key") or "?")
+        icon = _channel_icon(it.get("key") or "?")
+        typ = _channel_type_label(it.get("type") or "?")
+        parts.append(
+            f"{icon} <code>{ui.escape_html(short)}</code>({typ})·{it.get('count', 0)}"
+        )
+    line = " · ".join(parts)
+    if len(items) > limit:
+        line += f" · 等 {len(items)} 个"
+    return line
+
+
+def _summary_dim_block(title: str, groups: list[dict], render_key,
+                       extra_line=None) -> str:
+    """汇总视图里某个维度的 Top 块（紧凑两行/条）。
+
+    extra_line: 可选 callable(key) -> str；非空时追加为第三行（带 2 空格缩进）。
+    """
     if not groups:
         return ""
     out = [f"<b>{title}:</b>"]
@@ -142,11 +171,19 @@ def _summary_dim_block(title: str, groups: list[dict], render_key) -> str:
             f"  {total} 次 ({ui.fmt_rate(succ, total)}) · "
             f"命中 {ui.fmt_rate(hit, succ)} · ↑{ui.fmt_tokens(prompt)}"
         )
+        if extra_line is not None:
+            extra = extra_line(g["key"])
+            if extra:
+                out.append(f"  {extra}")
     return "\n".join(out)
 
 
-def _expanded_dim_block(title: str, groups: list[dict], render_key) -> str:
-    """专题视图（按某个维度展开）：每条 4 行详细信息。"""
+def _expanded_dim_block(title: str, groups: list[dict], render_key,
+                        extra_line=None) -> str:
+    """专题视图（按某个维度展开）：每条 4 行详细信息。
+
+    extra_line: 可选 callable(key) -> str；非空时紧跟在 key 行之后。
+    """
     if not groups:
         return f"<b>{title}</b>\n\n暂无数据"
     out = [f"<b>{title}</b>"]
@@ -169,6 +206,10 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key) -> str:
         min_tps = m.get("min_tps")
 
         out.append(f"\n{key}")
+        if extra_line is not None:
+            extra = extra_line(g["key"])
+            if extra:
+                out.append(f"  {extra}")
         out.append(f"  请求 {total} | ✅ {succ} ({ui.fmt_rate(succ, total)}) | ❌ {err}")
         out.append(
             f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)} · "
@@ -251,7 +292,8 @@ def _section_recent_calls(calls: list[dict]) -> str:
 
 # ─── 组装：汇总 / 专题 ───────────────────────────────────────────
 
-def _render_overall(result: dict, period: str) -> str:
+def _render_overall(result: dict, period: str,
+                    model_channels: dict[str, list[dict]] | None = None) -> str:
     """汇总视图：cc-proxy 风格 + 三维度 Top 3 + 未命中样本 + 最近调用。"""
     sep = "─" * 18
     sections = [
@@ -272,9 +314,14 @@ def _render_overall(result: dict, period: str) -> str:
 
     by_model = _strip_unknown(result.get("by_model") or [])
     if by_model:
+        mc = model_channels or {}
         block = _summary_dim_block(
             "按模型 Top", by_model,
             lambda k: f"<code>{ui.escape_html(k)}</code>",
+            extra_line=lambda k: (
+                "所属: " + _render_model_channels(mc.get(k) or [])
+                if mc.get(k) else ""
+            ),
         )
         sections.append("")
         sections.append(block)
@@ -301,7 +348,8 @@ def _render_overall(result: dict, period: str) -> str:
     return "\n".join(sections)
 
 
-def _render_expanded(result: dict, period: str, dim: str) -> str:
+def _render_expanded(result: dict, period: str, dim: str,
+                     model_channels: dict[str, list[dict]] | None = None) -> str:
     """专题视图：把指定维度展开到 Top 10。"""
     label = _DIM_LABELS.get(dim, dim)
     sep = "─" * 18
@@ -320,10 +368,15 @@ def _render_expanded(result: dict, period: str, dim: str) -> str:
         )
     elif dim == "model":
         groups = _strip_unknown(result.get("by_model") or [])
+        mc = model_channels or {}
         block = _expanded_dim_block(
             f"按模型（Top {len(groups)}）",
             groups,
             lambda k: f"<code>{ui.escape_html(k)}</code>",
+            extra_line=lambda k: (
+                "所属: " + _render_model_channels(mc.get(k) or [], limit=5)
+                if mc.get(k) else ""
+            ),
         )
     elif dim == "apikey":
         groups = _strip_unknown(result.get("by_apikey") or [])
@@ -387,7 +440,18 @@ def _compose(period: str, dim: str) -> tuple[str, dict]:
             f"❌ 统计查询失败: <code>{ui.escape_html(str(exc))}</code>",
             ui.inline_kb([ui.back_to_main_row()]),
         )
-    text = _render_overall(result, period) if dim == "all" else _render_expanded(result, period, dim)
+    # "按模型 Top"/专题需要补 model → 渠道列表
+    model_channels: dict[str, list[dict]] = {}
+    if dim in ("all", "model"):
+        try:
+            model_channels = log_db.channels_by_requested_model(since)
+        except Exception as exc:
+            print(f"[stats] channels_by_requested_model failed: {exc}")
+            model_channels = {}
+    text = (
+        _render_overall(result, period, model_channels) if dim == "all"
+        else _render_expanded(result, period, dim, model_channels)
+    )
     return ui.truncate(text), _kb(period, dim)
 
 

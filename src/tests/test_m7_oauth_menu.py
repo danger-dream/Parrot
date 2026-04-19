@@ -143,9 +143,10 @@ def test_list_empty_and_populated(m):
 def test_view_detail_with_quota_cache(m):
     _setup(m)
     _add_fake_account(m, "alice@x.com")
-    # 写入 quota 缓存
+    # 写入 quota 缓存（fetched_at 用当前时间，避免被 ensure_quota_fresh 节流判定为 stale
+    # 从而触发 mock fetch 覆盖掉这里的断言值）
     m["state_db"].quota_save("alice@x.com", {
-        "fetched_at": 1776510000000,
+        "fetched_at": m["state_db"].now_ms(),
         "five_hour_util": 12.0, "five_hour_reset": "2026-04-18T14:00:00Z",
         "seven_day_util": 45.0, "seven_day_reset": "2026-04-24T00:00:00Z",
         "sonnet_util": None, "opus_util": None,

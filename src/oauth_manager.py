@@ -292,6 +292,108 @@ async def fetch_usage(email: str) -> dict:
     return await asyncio.to_thread(_usage_sync, access_token)
 
 
+# ─── 按访问节流刷新 usage ────────────────────────────────────────
+#
+# 场景：quotaMonitor.enabled=False 时，后台轮询不跑，UI 读到的都是旧缓存。
+# 打开状态总览 / OAuth 面板 / 详情时按需刷一次，同一 email 节流窗口内跳过。
+# 真实 HTTP 限 5 秒；超时/出错不抛，调用方照常读旧缓存。
+
+_QUOTA_REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _quota_refresh_lock(email: str) -> asyncio.Lock:
+    lk = _QUOTA_REFRESH_LOCKS.get(email)
+    if lk is None:
+        lk = asyncio.Lock()
+        _QUOTA_REFRESH_LOCKS[email] = lk
+    return lk
+
+
+def _access_refresh_throttle_seconds() -> int:
+    qm = config.get().get("quotaMonitor") or {}
+    try:
+        return int(qm.get("accessRefreshThrottleSeconds", 180))
+    except Exception:
+        return 180
+
+
+def _should_skip_access_refresh() -> bool:
+    """quotaMonitor.enabled=True 时由后台循环负责刷新，按访问节流路径直接跳过。"""
+    qm = config.get().get("quotaMonitor") or {}
+    return bool(qm.get("enabled", False))
+
+
+async def ensure_quota_fresh(email: str, *, timeout_s: float = 5.0) -> bool:
+    """若 email 的配额缓存已过节流窗口，触发一次真实 fetch_usage 并回写。
+
+    返回 True 表示本次触发了真实刷新；False 表示被节流/超时/失败跳过。
+    任何异常都被吞掉（日志打印），调用方读旧缓存即可。
+    """
+    if not email:
+        return False
+    if _should_skip_access_refresh():
+        return False
+
+    throttle_s = _access_refresh_throttle_seconds()
+    row = state_db.quota_load(email)
+    if row:
+        fetched_at_ms = int(row.get("fetched_at") or 0)
+        if fetched_at_ms > 0:
+            age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
+            if age_s < throttle_s:
+                return False
+
+    lock = _quota_refresh_lock(email)
+    async with lock:
+        # 拿锁后再读一次；另一个并发请求可能已经刷好了
+        row = state_db.quota_load(email)
+        if row:
+            fetched_at_ms = int(row.get("fetched_at") or 0)
+            if fetched_at_ms > 0:
+                age_s = (state_db.now_ms() - fetched_at_ms) / 1000.0
+                if age_s < throttle_s:
+                    return False
+        try:
+            usage = await asyncio.wait_for(fetch_usage(email), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            print(f"[oauth] ensure_quota_fresh timeout ({timeout_s}s): {email}")
+            return False
+        except Exception as exc:
+            print(f"[oauth] ensure_quota_fresh failed for {email}: {exc}")
+            return False
+        try:
+            state_db.quota_save(email, flatten_usage(usage))
+        except Exception as exc:
+            print(f"[oauth] ensure_quota_fresh save failed for {email}: {exc}")
+            return False
+    return True
+
+
+async def ensure_quota_fresh_many(emails: list[str], *,
+                                  timeout_s: float = 5.0) -> dict[str, bool]:
+    """并发对多个 email 触发节流刷新。单个超时/失败不影响其他。"""
+    if not emails:
+        return {}
+    coros = [ensure_quota_fresh(e, timeout_s=timeout_s) for e in emails]
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    out: dict[str, bool] = {}
+    for email, res in zip(emails, results):
+        out[email] = bool(res) if not isinstance(res, Exception) else False
+    return out
+
+
+def ensure_quota_fresh_sync(emails: list[str] | str, *,
+                            timeout_s: float = 5.0) -> None:
+    """同步包装：TG bot polling 线程用。吞所有异常，不抛给调用方。"""
+    try:
+        if isinstance(emails, str):
+            asyncio.run(ensure_quota_fresh(emails, timeout_s=timeout_s))
+        else:
+            asyncio.run(ensure_quota_fresh_many(emails, timeout_s=timeout_s))
+    except Exception as exc:
+        print(f"[oauth] ensure_quota_fresh_sync error: {exc}")
+
+
 # ─── 配额缓存辅助 ─────────────────────────────────────────────────
 
 def flatten_usage(usage: dict) -> dict:

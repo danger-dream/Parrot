@@ -207,6 +207,13 @@ def _format_usage_block(email: str) -> str:
 
 def _list_text_and_kb() -> tuple[str, dict]:
     accounts = oauth_manager.list_accounts()
+    # 按访问节流刷新所有账户的 usage（quotaMonitor.enabled=True 时内部跳过）
+    emails = [
+        a.get("email") for a in accounts
+        if a.get("email") and not a.get("disabled_reason")
+    ]
+    if emails:
+        oauth_manager.ensure_quota_fresh_sync(emails)
     total = len(accounts)
     normal = sum(1 for a in accounts if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "quota")
@@ -317,6 +324,10 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_manager.get_account(email)
     if acc is None:
         return None, None
+
+    # 详情页按访问节流刷新 usage（quotaMonitor.enabled=True 时内部跳过）
+    if not acc.get("disabled_reason"):
+        oauth_manager.ensure_quota_fresh_sync(email)
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from ... import affinity, config, log_db, public_ip, state_db
+from ... import affinity, config, log_db, oauth_manager, public_ip, state_db
 from ...channel import registry
 from .. import ui
 
@@ -30,6 +30,13 @@ def _kb() -> dict:
 def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     """返回当前用量 >= threshold 的 OAuth 账户数量（不含已禁用）。"""
     cfg = config.get()
+    # 按访问节流刷新 usage（quotaMonitor.enabled=True 时此调用内部自动跳过）
+    emails = [
+        a.get("email") for a in cfg.get("oauthAccounts", [])
+        if a.get("email") and not a.get("disabled_reason")
+    ]
+    if emails:
+        oauth_manager.ensure_quota_fresh_sync(emails)
     n = 0
     for acc in cfg.get("oauthAccounts", []):
         if acc.get("disabled_reason"):
@@ -129,10 +136,23 @@ def _address_block(port: int) -> list[str]:
     out += [
         "",
         "📍 <b>接口地址</b> (POST)",
-        f"  本地 <code>http://127.0.0.1:{port}/v1/messages</code>",
+        "  <b>Anthropic</b>",
+        f"    本地 <code>http://127.0.0.1:{port}/v1/messages</code>",
     ]
     if pub:
-        out.append(f"  公网 <code>http://{pub}:{port}/v1/messages</code>")
+        out.append(f"    公网 <code>http://{pub}:{port}/v1/messages</code>")
+    out += [
+        "  <b>OpenAI Chat</b>",
+        f"    本地 <code>http://127.0.0.1:{port}/v1/chat/completions</code>",
+    ]
+    if pub:
+        out.append(f"    公网 <code>http://{pub}:{port}/v1/chat/completions</code>")
+    out += [
+        "  <b>OpenAI Responses</b>",
+        f"    本地 <code>http://127.0.0.1:{port}/v1/responses</code>",
+    ]
+    if pub:
+        out.append(f"    公网 <code>http://{pub}:{port}/v1/responses</code>")
     out.append("<i>单击地址即可复制（不会跳转）。</i>")
     return out
 

@@ -70,7 +70,15 @@ _UPSTREAM_TOOLKIT = {
 
 def _toolkit_for(ch: Channel) -> dict:
     proto = getattr(ch, "protocol", "anthropic")
-    return _UPSTREAM_TOOLKIT.get(proto, _UPSTREAM_TOOLKIT["anthropic"])
+    tk = _UPSTREAM_TOOLKIT.get(proto)
+    if tk is None:
+        # 未登记的 protocol 走哪套解析器都是错——宁可在日志里爆出来也不静默回退到
+        # anthropic（曾遇到过的坑：回退后 SSE 解析 / 错误识别全部错位）。
+        raise ValueError(
+            f"no upstream toolkit registered for protocol {proto!r} "
+            f"(channel={getattr(ch, 'key', '?')})"
+        )
+    return tk
 
 
 # 错误 type：failover 内部统一用 anthropic 风味（errors.ErrType.*）。
@@ -302,6 +310,7 @@ async def run_failover(
     last_ch_key: Optional[str] = None
     last_ch_type: Optional[str] = None
     last_model: Optional[str] = None
+    last_ch_protocol: Optional[str] = None
 
     # 把 candidates 改成可扩展的 list（OAuth 刷 token 后重试同渠道）
     pending = list(candidates)  # 仍从首位取
@@ -312,6 +321,7 @@ async def run_failover(
         ch, resolved_model = pending[idx]
         attempt_order += 1
         last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
+        last_ch_protocol = getattr(ch, "protocol", "anthropic")
 
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
@@ -349,6 +359,7 @@ async def run_failover(
                 final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
                 connect_ms=None, first_token_ms=None, total_ms=total_ms,
                 http_status=status, affinity_hit=affinity_hit,
+                upstream_protocol=getattr(ch, "protocol", "anthropic"),
             )
             return _json_error_for_ingress(ingress_protocol, status, anth_err_type, msg)
 
@@ -418,6 +429,7 @@ async def run_failover(
         connect_ms=(last_result.connect_ms if last_result else None),
         first_token_ms=(last_result.first_byte_ms if last_result else None),
         total_ms=total_ms, http_status=status, affinity_hit=affinity_hit,
+        upstream_protocol=last_ch_protocol,
     )
     return _json_error_for_ingress(ingress_protocol, status, err_type, msg)
 
@@ -696,6 +708,7 @@ async def _consume_non_stream(
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
         response_body=restored.decode("utf-8", errors="replace") if isinstance(restored, bytes) else str(restored),
         http_status=upstream_resp.status_code,
+        upstream_protocol=getattr(ch, "protocol", "anthropic"),
     )
 
     # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
@@ -829,9 +842,9 @@ async def _consume_stream(
         cooldown.clear(ch.key, resolved_model)
 
         # 亲和写入：按 ingress 走对应家族的 fingerprint_write。
-        # 跨变体 chat→openai-responses（stream_r2c）当前没有累积下游 chat
-        # assistant 文本的 accessor，MS-7 跳过；其它 3 组合（anthropic / 同协议
-        # chat-chat / 同协议 resp-resp / 跨变体 resp→chat）正常写入。
+        # 4 种组合都覆盖：anthropic / 同协议 chat-chat / 同协议 resp-resp /
+        # 跨变体 resp→chat / 跨变体 chat→resp。跨变体用对应 translator 累积的
+        # 下游形状做 fingerprint_write，保证与下次请求的 fingerprint_query 同形。
         ch_proto = getattr(ch, "protocol", "anthropic")
         fp_write: Optional[str] = None
         if ingress_protocol == "anthropic":
@@ -841,6 +854,17 @@ async def _consume_stream(
             )
         elif ingress_protocol == "chat" and ch_proto == "openai-chat":
             assistant_msg = builder.get_assistant()
+            fp_write = fingerprint.fingerprint_write_chat(
+                api_key_name or "", client_ip or "",
+                (body or {}).get("messages") or [], assistant_msg,
+            )
+        elif ingress_protocol == "chat" and ch_proto == "openai-responses":
+            # stream_r2c translator 累积的下游 chat assistant 形状
+            try:
+                assistant_msg = (stream_translator.get_downstream_chat_assistant()
+                                 if stream_translator else {"role": "assistant", "content": None})
+            except Exception:
+                assistant_msg = {"role": "assistant", "content": None}
             fp_write = fingerprint.fingerprint_write_chat(
                 api_key_name or "", client_ip or "",
                 (body or {}).get("messages") or [], assistant_msg,
@@ -865,7 +889,9 @@ async def _consume_stream(
         if fp_write:
             affinity.upsert(fp_write, ch.key, resolved_model)
 
-        await asyncio.to_thread(
+        # shield：客户端断开导致的 CancelledError 不应中断 DB 写入，否则
+        # 日志会残留 pending。(参见 _finalize_client_cancelled 早退守卫)
+        await asyncio.shield(asyncio.to_thread(
             log_db.finish_success,
             request_id, ch.key, ch.type, resolved_model,
             input_tokens=tracker.usage["input_tokens"],
@@ -876,7 +902,8 @@ async def _consume_stream(
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             http_status=upstream_status,
-        )
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        ))
 
     async def _emit_error_and_finalize(err_type: str, message: str, outcome: str):
         if state["finalized"]:
@@ -889,29 +916,39 @@ async def _consume_stream(
             cooldown.record_error(ch.key, resolved_model, message)
         scorer.record_failure(ch.key, resolved_model, connect_ms=connect_ms)
 
-        await asyncio.to_thread(
+        await asyncio.shield(asyncio.to_thread(
             log_db.finish_error,
             request_id, message, retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
             connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
             http_status=upstream_status, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
-        )
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        ))
 
     async def _finalize_client_cancelled():
-        """客户端断开：不计 cooldown/scorer，仅记日志便于审计。"""
+        """客户端断开：不计 cooldown/scorer，仅记日志便于审计。
+
+        tracker.saw_stream_end=True 表示上游已送达收尾事件
+        （anthropic message_stop / chat [DONE] or finish_reason / responses completed 等）。
+        这种情况服务端视角已成功完成，client 只是没收完最后几帧就断，归 success。
+        """
         if state["finalized"]:
+            return
+        if getattr(tracker, "saw_stream_end", False):
+            await _finalize_success()
             return
         state["finalized"] = True
         total_ms = int((time.time() - start_time) * 1000)
-        await asyncio.to_thread(
+        await asyncio.shield(asyncio.to_thread(
             log_db.finish_error,
             request_id, "client disconnected", retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
             connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
             http_status=upstream_status, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
-        )
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        ))
 
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""
@@ -975,11 +1012,13 @@ async def _consume_stream(
                 else:
                     yield restored
 
-            # 正常完成：若有翻译器，先 emit 收尾帧（response.completed / [DONE] 等）
+            # 上游已正常收尾 → 先落库成功，再 yield 翻译器收尾帧。
+            # 若放到后面，客户端在 yield 期间断开会让 CancelledError 抢先触发
+            # _finalize_client_cancelled，日志被错误地标记为 "client disconnected"。
+            await _finalize_success()
             if stream_translator is not None:
                 for out in stream_translator.close():
                     yield out
-            await _finalize_success()
         except asyncio.CancelledError:
             # 客户端断开（或上层取消）：不归咎上游，不记 cooldown/scorer
             await _finalize_client_cancelled()

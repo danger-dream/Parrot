@@ -62,6 +62,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "intervalSeconds": 60,
         "disableThresholdPercent": 95,
         "resumeThresholdPercent": 95,
+        # 按访问节流刷新 usage：quotaMonitor.enabled=False 时，TG bot 每次打开
+        # 主菜单 / 状态总览 / OAuth 面板 / 详情，若 oauth_quota_cache 已超过该
+        # 秒数没刷新，会同步触发一次 fetch_usage（真实 HTTP 限 5s 超时，失败读旧值）。
+        # enabled=True 时此节流忽略，刷新由 intervalSeconds 后台循环负责。
+        "accessRefreshThrottleSeconds": 180,
     },
     "contentBlacklist": {
         "default": [],
@@ -80,6 +85,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "oauth_refreshed": True,      # OAuth Token 自动刷新成功
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
             "no_channels": True,          # 无可用渠道（503）
+            "openai_store_save_failed": True,  # OpenAI previous_response_id Store 写入失败
         },
     },
     "cchMode": "disabled",

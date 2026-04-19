@@ -104,6 +104,9 @@ class SSEUsageTracker:
         self.usage = _zero_usage()
         self._chunks: list[bytes] = []
         self._buf = b""
+        # 是否已见到上游流的"收尾事件"。Anthropic: message_stop。见后判定
+        # 即使 client 之后断开，服务端视角也已拿到完整响应，日志应归 success。
+        self.saw_stream_end = False
 
     def feed(self, chunk_bytes: bytes) -> None:
         if not chunk_bytes:
@@ -132,6 +135,8 @@ class SSEUsageTracker:
                 u = evt.get("usage") or {}
                 if "output_tokens" in u:
                     self.usage["output_tokens"] = int(u.get("output_tokens", 0) or 0)
+            elif t == "message_stop":
+                self.saw_stream_end = True
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")
@@ -341,6 +346,9 @@ class ChatSSEUsageTracker:
         self.usage = _zero_usage()
         self._chunks: list[bytes] = []
         self._buf = b""
+        # Chat 流的收尾标记：[DONE] 或任一 choice 带 finish_reason。
+        # 两者都足以说明上游完成了本次生成；若 client 之后断开日志归 success。
+        self.saw_stream_end = False
 
     def feed(self, chunk_bytes: bytes) -> None:
         if not chunk_bytes:
@@ -349,19 +357,29 @@ class ChatSSEUsageTracker:
         self._buf += chunk_bytes
         self._buf, lines = _iter_sse_data_lines(self._buf)
         for data in lines:
-            if not data or data == "[DONE]":
+            if not data:
+                continue
+            if data == "[DONE]":
+                self.saw_stream_end = True
                 continue
             try:
                 evt = json.loads(data)
             except Exception:
                 continue
-            u = evt.get("usage") if isinstance(evt, dict) else None
-            if isinstance(u, dict):
-                details = u.get("prompt_tokens_details") or {}
-                self.usage["input_tokens"] = int(u.get("prompt_tokens", 0) or 0)
-                self.usage["output_tokens"] = int(u.get("completion_tokens", 0) or 0)
-                self.usage["cache_read"] = int(details.get("cached_tokens", 0) or 0)
-                # cache_creation 在 OpenAI 里没有对应概念，保持 0
+            if isinstance(evt, dict):
+                choices = evt.get("choices")
+                if isinstance(choices, list):
+                    for ch in choices:
+                        if isinstance(ch, dict) and ch.get("finish_reason"):
+                            self.saw_stream_end = True
+                            break
+                u = evt.get("usage")
+                if isinstance(u, dict):
+                    details = u.get("prompt_tokens_details") or {}
+                    self.usage["input_tokens"] = int(u.get("prompt_tokens", 0) or 0)
+                    self.usage["output_tokens"] = int(u.get("completion_tokens", 0) or 0)
+                    self.usage["cache_read"] = int(details.get("cached_tokens", 0) or 0)
+                    # cache_creation 在 OpenAI 里没有对应概念，保持 0
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")
@@ -512,6 +530,9 @@ class ResponsesSSEUsageTracker:
         self.usage = _zero_usage()
         self._chunks: list[bytes] = []
         self._buf = b""
+        # Responses 流的收尾事件：completed / failed / incomplete 之一。
+        # 收到即视为上游已完成本次生成，client 后续断开不影响日志归 success。
+        self.saw_stream_end = False
 
     def feed(self, chunk_bytes: bytes) -> None:
         if not chunk_bytes:
@@ -524,6 +545,7 @@ class ResponsesSSEUsageTracker:
             if data is None:
                 continue
             if event_name in ("response.completed", "response.failed", "response.incomplete"):
+                self.saw_stream_end = True
                 resp = data.get("response") if isinstance(data, dict) else None
                 if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
                     u = resp["usage"]

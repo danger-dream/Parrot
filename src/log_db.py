@@ -65,7 +65,11 @@ def _schema_sql() -> str:
       total_time_ms         INTEGER,
       retry_count           INTEGER DEFAULT 0,
       affinity_hit          INTEGER DEFAULT 0,
-      fingerprint           TEXT
+      fingerprint           TEXT,
+      -- 入口协议：anthropic（/v1/messages）/ chat / responses。insert_pending 阶段确定。
+      ingress_protocol      TEXT,
+      -- 选中渠道的上游协议：anthropic / openai-chat / openai-responses。finish_* 阶段确定。
+      upstream_protocol     TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_log_created ON request_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_log_status ON request_log(status);
@@ -117,6 +121,24 @@ def _current_db_path() -> tuple[str, str]:
     return os.path.join(_log_dir, f"{month}.db"), month
 
 
+def _ensure_migrations(conn: sqlite3.Connection) -> None:
+    """对已存在的 request_log 表按需追加新列（老月份 DB 升级入口）。
+
+    SQLite ADD COLUMN 无 IF NOT EXISTS 语法，需要先查 PRAGMA table_info。
+    本函数调用方必须在持 `_write_lock` 的前提下调用；幂等，老列齐全时零开销。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    changed = False
+    if "ingress_protocol" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN ingress_protocol TEXT")
+        changed = True
+    if "upstream_protocol" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN upstream_protocol TEXT")
+        changed = True
+    if changed:
+        conn.commit()
+
+
 def _get_conn() -> sqlite3.Connection:
     """按月切换 thread-local 连接；跨月时关闭旧连接建立新连接。"""
     if _log_dir is None:
@@ -140,6 +162,7 @@ def _get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA busy_timeout=5000")
         with _write_lock:
             conn.executescript(_schema_sql())
+            _ensure_migrations(conn)
             conn.commit()
         _local.conn = conn
         _local.month = month
@@ -147,15 +170,21 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _get_conn_for_month(month: str) -> sqlite3.Connection | None:
-    """只读方式打开指定月份的 DB。若文件不存在返回 None。"""
+    """打开指定月份的 DB 用于只读查询；不存在返回 None。
+
+    打开方式改为读写（非 `?mode=ro`）以便 `_ensure_migrations` 能为老 DB
+    追加新列。查询层仍按只读使用，没有 INSERT/UPDATE 路径进入。
+    """
     if _log_dir is None:
         return None
     path = os.path.join(_log_dir, f"{month}.db")
     if not os.path.exists(path):
         return None
-    uri = f"file:{path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=10)
+    conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    with _write_lock:
+        _ensure_migrations(conn)
     return conn
 
 
@@ -179,20 +208,23 @@ def insert_pending(
     request_headers: dict | None,
     request_body: dict | None,
     fingerprint: str | None = None,
+    ingress_protocol: str = "anthropic",
 ) -> None:
     with _write_lock:
         conn = _get_conn()
         conn.execute(
             """INSERT INTO request_log
                (request_id, created_at, client_ip, api_key_name, requested_model,
-                status, is_stream, msg_count, tool_count, fingerprint)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                status, is_stream, msg_count, tool_count, fingerprint,
+                ingress_protocol)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 request_id, time.time(), client_ip, api_key_name, requested_model,
                 "pending", 1 if is_stream else 0, msg_count, tool_count,
                 # log 表只存 16 字符（节省空间）；它是 affinity 表 32 字符指纹的前缀，
                 # 排查时可用 `log.fingerprint || '%'` 做前缀匹配反查 cache_affinities。
                 fingerprint[:16] if fingerprint else None,
+                ingress_protocol or "anthropic",
             ),
         )
         conn.execute(
@@ -298,6 +330,7 @@ def finish_success(
     affinity_hit: int = 0,
     response_body: str | None = None,
     http_status: int = 200,
+    upstream_protocol: str | None = None,
 ) -> None:
     with _write_lock:
         conn = _get_conn()
@@ -308,7 +341,7 @@ def finish_success(
                  input_tokens=?, output_tokens=?,
                  cache_creation_tokens=?, cache_read_tokens=?,
                  connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
-                 retry_count=?, affinity_hit=?
+                 retry_count=?, affinity_hit=?, upstream_protocol=?
                WHERE request_id=?""",
             (
                 time.time(), http_status,
@@ -316,7 +349,7 @@ def finish_success(
                 input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens,
                 connect_ms, first_token_ms, total_ms,
-                retry_count, affinity_hit,
+                retry_count, affinity_hit, upstream_protocol,
                 request_id,
             ),
         )
@@ -341,6 +374,7 @@ def finish_error(
     http_status: int | None = None,
     response_body: str | None = None,
     affinity_hit: int = 0,
+    upstream_protocol: str | None = None,
 ) -> None:
     with _write_lock:
         conn = _get_conn()
@@ -349,13 +383,13 @@ def finish_error(
                  status='error', finished_at=?, error_message=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
-                 retry_count=?, affinity_hit=?
+                 retry_count=?, affinity_hit=?, upstream_protocol=?
                WHERE request_id=?""",
             (
                 time.time(), error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
                 connect_ms, first_token_ms, total_ms,
-                retry_count, affinity_hit,
+                retry_count, affinity_hit, upstream_protocol,
                 request_id,
             ),
         )
@@ -575,6 +609,49 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
     return out
 
 
+def channels_by_requested_model(since_ts: float) -> dict[str, list[dict]]:
+    """跨月按 requested_model 分组，汇总每个模型实际落到的 (渠道, 渠道类型) 列表。
+
+    返回 {requested_model: [{"key": "...", "type": "api|oauth", "count": n}, ...]}，
+    内部按 count 降序。用于「按模型 Top」展示"所属渠道"。
+    """
+    acc: dict[str, dict[tuple[str, str], int]] = {}
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return {}
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            rows = conn.execute(
+                """SELECT COALESCE(requested_model, '?') AS model,
+                          COALESCE(final_channel_key, '?') AS ck,
+                          COALESCE(final_channel_type, '?') AS ct,
+                          COUNT(*) AS cnt
+                     FROM request_log
+                    WHERE created_at >= ?
+                      AND final_channel_key IS NOT NULL
+                    GROUP BY model, ck, ct""",
+                (since_ts,),
+            ).fetchall()
+            for r in rows:
+                model = r["model"]
+                bucket = acc.setdefault(model, {})
+                k = (r["ck"], r["ct"])
+                bucket[k] = bucket.get(k, 0) + int(r["cnt"] or 0)
+        except Exception as exc:
+            print(f"[log_db] channels_by_requested_model: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    out: dict[str, list[dict]] = {}
+    for model, mapping in acc.items():
+        items = [{"key": k, "type": t, "count": n} for (k, t), n in mapping.items()]
+        items.sort(key=lambda x: x["count"], reverse=True)
+        out[model] = items
+    return out
+
+
 def tps_by_channel_model(since_ts: float) -> dict[tuple[str, str], float]:
     """跨月聚合 {(channel_key, model): avg_tps}，用于"最快渠道"区 lookup。"""
     acc: dict[tuple[str, str], dict] = {}
@@ -635,8 +712,13 @@ def _iter_month_conns_all(since_ts: float):
             yield _get_conn(), lambda: None
         elif os.path.exists(path):
             try:
-                c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+                # 打开为读写：读路径不会 INSERT/UPDATE，但 _ensure_migrations 需要
+                # ALTER TABLE 能力给老月份 DB 补列（如新增 ingress_protocol）。
+                c = sqlite3.connect(path, timeout=10)
                 c.row_factory = sqlite3.Row
+                c.execute("PRAGMA busy_timeout=5000")
+                with _write_lock:
+                    _ensure_migrations(c)
                 yield c, c.close
             except Exception:
                 pass
@@ -669,7 +751,8 @@ _RECENT_COLS = (
     "status, http_status, error_message, is_stream, "
     "input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, "
     "connect_time_ms, first_token_time_ms, total_time_ms, "
-    "retry_count, affinity_hit"
+    "retry_count, affinity_hit, "
+    "ingress_protocol, upstream_protocol"
 )
 
 
