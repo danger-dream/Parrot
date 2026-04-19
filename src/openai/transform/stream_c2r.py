@@ -146,6 +146,10 @@ class StreamTranslator:
             return
         self.state.terminal_emitted = True
 
+        # 防御：即使上游一个 chunk 都没发就关闭（空流或立即 [DONE]），
+        # 也要保证下游看到合法的事件序列 response.created → in_progress → ...
+        yield from self._ensure_created()
+
         if self.state.terminal_error is not None:
             yield from self._emit_failed(self.state.terminal_error)
             # 失败态不写 Store（不想污染后续 prev_id 链）

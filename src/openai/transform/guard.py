@@ -76,7 +76,8 @@ def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
               "background responses are not supported by this proxy",
               param="background")
 
-    if "conversation" in body:
+    # 只在实际提供了 conversation 值时拒绝；显式 null 占位（某些客户端默认带）应放行
+    if body.get("conversation"):
         _fail(400, "invalid_request_error",
               "conversation resource is not yet supported; use previous_response_id instead",
               param="conversation")
@@ -191,8 +192,8 @@ def guard_responses_to_chat(body: dict,
               "previous_response_id requires openai.store.enabled=true",
               param="previous_response_id")
 
-    # conversation：显式再查一次，避免依赖调用顺序
-    if "conversation" in body:
+    # conversation：显式再查一次，避免依赖调用顺序；null 占位放行
+    if body.get("conversation"):
         _fail(400, "invalid_request_error",
               "conversation resource is not supported when routing to chat upstream",
               param="conversation")

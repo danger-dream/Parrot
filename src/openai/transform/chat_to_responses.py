@@ -97,6 +97,17 @@ def _messages_to_input_items(messages: list) -> list:
             })
             continue
         if role == "assistant":
+            # 非官方 reasoning_content（DeepSeek 等 chat 生态）→ reasoning item，
+            # 保持与上游产出时同构，避免历史 reasoning 丢失。drop 模式不映射。
+            from .common import reasoning_passthrough_enabled
+            reasoning_text = msg.get("reasoning_content")
+            if (isinstance(reasoning_text, str) and reasoning_text
+                    and reasoning_passthrough_enabled()):
+                items.append({
+                    "type": "reasoning",
+                    "id": _gen_id("rs_"),
+                    "summary": [{"type": "summary_text", "text": reasoning_text}],
+                })
             # 可能同时有 content 和 tool_calls；refusal 罕见但处理
             content = msg.get("content")
             if isinstance(content, str) and content:
