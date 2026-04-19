@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+logs/
+.anthropic_proxy_ids.json
+
+# 运行时配置（含 bot token / API Key / OAuth refresh_token 等敏感信息）
+# 首次启动 server.py 会自动生成默认模板
+config.json
+config.json.tmp
+config.json.bak*
+
+*.log
+.DS_Store
