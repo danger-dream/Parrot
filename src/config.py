@@ -109,6 +109,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "oauth": {
         "mockMode": False,
+        # provider 专属设置（claude 无配置项；openai 在此登记）
+        "providers": {
+            "openai": {
+                # 是否强制把上游请求的 User-Agent 伪装成 Codex CLI
+                # 官方 UA。默认 True（与 sub2api 一致）。关掉则不设置 UA,
+                # 交给 httpx 默认（可能触发上游风控，不建议）。
+                "forceCodexCLI": True,
+                # TLS 指纹伪装开关。默认 False——httpx 直连 chatgpt.com/backend-api/codex
+                # 在当前 cloudfront 策略下可通过；若被拦再手动开启。
+                # 真正实装（引入 curl_cffi）在需要时单独 commit。
+                "enableTLSFingerprint": False,
+                # session_id / conversation_id 隔离：把下游 api_key_name 混进派生
+                # 出的 session 标识，防止不同 API Key 之间会话粘性交叉污染。
+                # 默认 True，基于 prompt_cache_key 派生。
+                "isolateSessionId": True,
+            },
+        },
     },
     "channelSelection": "smart",  # "smart" | "order"
     "logDir": "logs",

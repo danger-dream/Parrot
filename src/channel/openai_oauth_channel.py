@@ -23,10 +23,11 @@ src.oauth.openai.parse_rate_limit_headers 解析头并落库（Commit 3）。
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Optional
 
-from .. import oauth_manager
+from .. import config, oauth_manager
 from ..openai.transform import (
     chat_to_responses,
     codex_oauth_transform,
@@ -34,6 +35,24 @@ from ..openai.transform import (
     guard,
 )
 from .base import Channel, ChannelDisplay, UpstreamRequest
+
+
+def _provider_cfg() -> dict:
+    """读取 config.oauth.providers.openai（缺省字段回退默认值）。"""
+    cfg = (config.get().get("oauth") or {}).get("providers") or {}
+    return cfg.get("openai") or {}
+
+
+def _isolate_session_id(api_key_name: str, raw: str) -> str:
+    """把 api_key_name 混入 raw，防止不同 API Key 的会话粘性交叉污染。
+
+    与 sub2api isolateOpenAISessionID 语义等价：前缀 "k<key>:" + raw，
+    做 sha256 取前 16 hex 字符。我们用 sha256 而非 xxhash（无新依赖）。
+    """
+    if not raw:
+        return ""
+    material = f"k{api_key_name or '-'}:{raw}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:16]
 
 
 # ─── 常量 ────────────────────────────────────────────────────────
@@ -129,6 +148,17 @@ class OpenAIOAuthChannel(Channel):
         access_token = await oauth_manager.ensure_valid_token(self.email)
 
         headers = self._build_headers(access_token)
+        # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
+        # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
+        prov_cfg = _provider_cfg()
+        if prov_cfg.get("isolateSessionId", True):
+            api_key_name = str(requested_body.get("_api_key_name") or "")
+            prompt_cache_key = str(payload.get("prompt_cache_key") or "").strip()
+            if api_key_name and prompt_cache_key:
+                iso = _isolate_session_id(api_key_name, prompt_cache_key)
+                if iso:
+                    headers["session_id"] = iso
+                    headers["conversation_id"] = iso
 
         return UpstreamRequest(
             url=CODEX_UPSTREAM_URL,
@@ -160,7 +190,8 @@ class OpenAIOAuthChannel(Channel):
     # ─── 内部 ─────────────────────────────────────────────────
 
     def _build_headers(self, access_token: str) -> dict[str, str]:
-        return {
+        prov_cfg = _provider_cfg()
+        headers = {
             # Host 头：httpx 通常会按 URL 自动设置，这里显式兜底保险
             "host": "chatgpt.com",
             "authorization": f"Bearer {access_token}",
@@ -168,6 +199,9 @@ class OpenAIOAuthChannel(Channel):
             "openai-beta": "responses=experimental",
             "originator": "codex_cli_rs",
             "accept": "text/event-stream",
-            "user-agent": CODEX_CLI_USER_AGENT,
             "content-type": "application/json",
         }
+        # forceCodexCLI=True（默认）→ 强制伪装 UA；False 则不设，交给 httpx 默认
+        if prov_cfg.get("forceCodexCLI", True):
+            headers["user-agent"] = CODEX_CLI_USER_AGENT
+        return headers

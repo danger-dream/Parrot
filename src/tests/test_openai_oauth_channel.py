@@ -338,6 +338,87 @@ def test_registry_dispatches_by_provider(m):
     print("  [PASS] registry: dispatches OAuth by provider field")
 
 
+def test_session_id_isolation_with_prompt_cache_key(m):
+    """Commit 4: 下游 prompt_cache_key + api_key_name 派生上游 session_id。"""
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("o@openai.test"))
+    body_a = {
+        "model": "gpt-5.1",
+        "input": "hi",
+        "prompt_cache_key": "chat-abc",
+        "_api_key_name": "user_alice",
+    }
+    body_b = {
+        "model": "gpt-5.1",
+        "input": "hi",
+        "prompt_cache_key": "chat-abc",   # 同一个 cache_key
+        "_api_key_name": "user_bob",       # 不同 api_key_name
+    }
+    req_a = asyncio.run(ch.build_upstream_request(body_a, "gpt-5.1", ingress_protocol="responses"))
+    req_b = asyncio.run(ch.build_upstream_request(body_b, "gpt-5.1", ingress_protocol="responses"))
+    sid_a = req_a.headers.get("session_id")
+    sid_b = req_b.headers.get("session_id")
+    assert sid_a and sid_b
+    assert sid_a != sid_b, "相同 prompt_cache_key 的不同 api_key 不应共享 session_id"
+    # conversation_id 与 session_id 一致
+    assert req_a.headers.get("conversation_id") == sid_a
+    # 长度 16 hex
+    assert len(sid_a) == 16 and all(ch_ in "0123456789abcdef" for ch_ in sid_a)
+    print("  [PASS] session_id: api_key_name-based isolation, conversation_id aligned")
+
+
+def test_session_id_isolation_disabled(m):
+    """isolateSessionId=False 时不写 session_id / conversation_id 头。"""
+    _setup(m)
+    _add_openai_acc(m)
+    def _off(c):
+        c.setdefault("oauth", {}).setdefault("providers", {}).setdefault(
+            "openai", {})["isolateSessionId"] = False
+    m["config"].update(_off)
+
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("o@openai.test"))
+    body = {
+        "model": "gpt-5.1", "input": "hi",
+        "prompt_cache_key": "chat-abc", "_api_key_name": "alice",
+    }
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
+    assert "session_id" not in req.headers
+    assert "conversation_id" not in req.headers
+
+    # 恢复默认
+    def _on(c):
+        c["oauth"]["providers"]["openai"]["isolateSessionId"] = True
+    m["config"].update(_on)
+    print("  [PASS] session_id: isolateSessionId=false disables header injection")
+
+
+def test_force_codex_cli_switch(m):
+    """forceCodexCLI=True（默认）写死 codex UA；=False 则不设 UA。"""
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("o@openai.test"))
+
+    # 默认 True
+    body = {"model": "gpt-5.1", "input": "hi"}
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
+    assert req.headers.get("user-agent") == m["CODEX_CLI_USER_AGENT"]
+
+    # 关掉
+    def _off(c):
+        c.setdefault("oauth", {}).setdefault("providers", {}).setdefault(
+            "openai", {})["forceCodexCLI"] = False
+    m["config"].update(_off)
+    req2 = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
+    assert "user-agent" not in req2.headers
+
+    # 恢复
+    def _on(c):
+        c["oauth"]["providers"]["openai"]["forceCodexCLI"] = True
+    m["config"].update(_on)
+    print("  [PASS] forceCodexCLI switch: True injects UA, False omits it")
+
+
 def test_registry_legacy_account_defaults_to_claude(m):
     _setup(m)
     # 模拟老账户：直接通过 config 写（不走 add_account，不带 provider 字段）
@@ -379,6 +460,9 @@ def main():
         test_channel_anthropic_ingress_rejected,
         test_channel_missing_chatgpt_account_id,
         test_registry_dispatches_by_provider,
+        test_session_id_isolation_with_prompt_cache_key,
+        test_session_id_isolation_disabled,
+        test_force_codex_cli_switch,
         test_registry_legacy_account_defaults_to_claude,
     ]
 
