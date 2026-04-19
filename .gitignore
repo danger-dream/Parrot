@@ -1,0 +1,31 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 运行时数据（用 docker compose 时全部在 ./data/ 下）
+data/
+state.db
+state.db-wal
+state.db-shm
+logs/
+.anthropic_proxy_ids.json
+
+# 配置（含 bot token / API Key / OAuth refresh_token）
+config.json
+config.json.tmp
+config.json.bak*
+
+# 杂项
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 测试产物
+.pytest_cache/
+.coverage
+htmlcov/

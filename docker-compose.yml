@@ -1,0 +1,30 @@
+# AnthropicProxy 默认 compose 编排
+# 一键脚本和手动部署都用这份。
+#
+# - 默认拉取已构建好的多架构镜像（GHCR）。本地开发改成 `build: .` 即可。
+# - 全部持久化数据集中在 ./data 一个挂载点（config.json / state.db / logs/ / .anthropic_proxy_ids.json）。
+# - 端口 22122 直接暴露给宿主机；如需 127.0.0.1 only，把 ports 改成 "127.0.0.1:22122:22122"。
+
+services:
+  anthropic-proxy:
+    image: ghcr.io/danger-dream/anthropicproxy:latest
+    container_name: anthropic-proxy
+    restart: unless-stopped
+    ports:
+      - "22122:22122"
+    environment:
+      - TZ=Asia/Shanghai
+      - ANTHROPIC_PROXY_DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:22122/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

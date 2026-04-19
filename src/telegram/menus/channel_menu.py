@@ -1,0 +1,1171 @@
+"""渠道管理菜单（沿用 openai-proxy 的风格：健康图标 + 详情排版）。
+
+callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）
+
+状态机 action（添加向导）：
+  - `ch_wiz_name`   步骤 1：输入名称
+  - `ch_wiz_url`    步骤 2：输入 Base URL
+  - `ch_wiz_key`    步骤 3：输入 API Key
+  - `ch_wiz_models` 步骤 4：输入模型列表（支持 `real:alias, ...`）
+
+状态机 action（编辑）：
+  - `ch_edit_name:<short>`
+  - `ch_edit_url:<short>`
+  - `ch_edit_key:<short>`
+  - `ch_edit_models:<short>`
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from typing import Any, Optional
+
+from ... import affinity, config, cooldown, log_db, probe, scorer, state_db
+from ...channel import api_channel, registry
+from .. import states, ui
+from . import main as main_menu
+
+
+# ─── 异步同步桥 ──────────────────────────────────────────────────
+
+def _run_sync(coro):
+    """在当前线程内阻塞跑 async；返回结果或异常对象。
+
+    用在不需要异步并发的辅助路径（如 OAuth refresh 内部）。
+    长时间阻塞的任务（比如 probe）请用 _spawn_async_task。
+    """
+    try:
+        return asyncio.run(coro)
+    except Exception as exc:
+        return exc
+
+
+# 测试可以把 _SYNC_SPAWN 设为 True，让 _spawn_async_task 改为同步执行（便于断言）
+_SYNC_SPAWN = False
+
+
+_AUTO_DELETE_OK_AFTER_SECONDS = 8       # 测试成功：消息 8 秒后删，留点时间让用户瞥一眼
+_AUTO_DELETE_FAIL_AFTER_SECONDS = 30    # 测试失败：30 秒后删，让用户看完错误原因
+
+
+async def _schedule_delete_after(chat_id: int, message_id: int,
+                                 delay: float = _AUTO_DELETE_OK_AFTER_SECONDS) -> None:
+    """延迟 delay 秒后删除一条消息（清理测试进度消息用）。
+
+    删除失败（消息已被用户删 / 超过 TG 48h 限制）静默忽略。
+    """
+    await asyncio.sleep(delay)
+    try:
+        ui.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+def _delete_delay(ok: bool) -> float:
+    return _AUTO_DELETE_OK_AFTER_SECONDS if ok else _AUTO_DELETE_FAIL_AFTER_SECONDS
+
+
+async def _finalize_and_delete(chat_id: int, message_id: int,
+                               final_text: str, ok: bool) -> None:
+    """测试结束后：追加"将自动删除"提示 → 延迟 → 删除。
+
+    追加一行斜体说明让用户知道这条消息会自动消失，而不是"留在那里碍事"。
+    """
+    delay = _delete_delay(ok)
+    reminder = f"\n\n<i>⏱ 本消息将在 {int(delay)} 秒后自动删除</i>"
+    try:
+        ui.edit(chat_id, message_id, final_text + reminder)
+    except Exception:
+        pass
+    await _schedule_delete_after(chat_id, message_id, delay=delay)
+
+
+def _spawn_async_task(coro_factory, name: str = "tg-task") -> None:
+    """把一个 async 任务丢到独立 daemon 线程执行，不阻塞 polling 主循环。
+
+    coro_factory 是返回 coroutine 的零参函数（不能直接传 coroutine，
+    因为它会在新线程里被 asyncio.run 消费）。
+
+    用例：probe 模型测试，最长 60s，期间不应让 TG bot 失去响应。
+
+    测试场景：把 channel_menu._SYNC_SPAWN = True 让任务在当前线程内同步跑完，
+    便于直接断言后续状态。
+    """
+    if _SYNC_SPAWN:
+        try:
+            asyncio.run(coro_factory())
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        return
+    def _runner():
+        try:
+            asyncio.run(coro_factory())
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    t = threading.Thread(target=_runner, daemon=True, name=name)
+    t.start()
+
+
+# ─── 健康图标（风格同 openai-proxy） ─────────────────────────────
+
+def _channel_health(ch) -> tuple[str, str]:
+    """返回 (icon, short_status_text)。"""
+    if not ch.enabled:
+        return "⬛", "已禁用"
+
+    key = ch.key
+    # 冷却中？
+    cd_entries = cooldown.active_entries()
+    perm = [e for e in cd_entries if e["channel_key"] == key and e["cooldown_until"] == -1]
+    temp = [e for e in cd_entries if e["channel_key"] == key and e["cooldown_until"] != -1]
+    if perm:
+        return "🔴", f"永久冷却 ({len(perm)}模型)"
+    if temp:
+        return "🟠", f"冷却中 ({len(temp)}模型)"
+
+    # 看最近成功率
+    worst = None
+    for stat in scorer.snapshot():
+        if stat["channel_key"] != key:
+            continue
+        recent = stat["recent_requests"]
+        if recent <= 0:
+            continue
+        rate = (stat["recent_success_count"] / recent) * 100
+        if worst is None or rate < worst:
+            worst = rate
+
+    if worst is None:
+        return "⚪", "暂无数据"
+    if worst >= 80:
+        return "🟢", f"近期 {worst:.0f}%"
+    if worst >= 50:
+        return "🟡", f"近期 {worst:.0f}%"
+    return "🔴", f"近期 {worst:.0f}%"
+
+
+def _summary_text(ch) -> str:
+    """列表行上的简短摘要（sum_requests · avg_first_byte · success_rate）。"""
+    key = ch.key
+    total_req = 0
+    avg_fb: list[float] = []
+    rate_str = "—"
+    best = 0
+    for stat in scorer.snapshot():
+        if stat["channel_key"] != key:
+            continue
+        total_req += stat["total_requests"]
+        if stat["avg_first_byte_ms"]:
+            avg_fb.append(stat["avg_first_byte_ms"])
+        if stat["recent_requests"] > 0:
+            rate = (stat["recent_success_count"] / stat["recent_requests"]) * 100
+            if rate > best:
+                best = rate
+                rate_str = f"{rate:.0f}%"
+    fb_str = f"{int(sum(avg_fb) / len(avg_fb))}ms" if avg_fb else "—"
+    return f"{rate_str} · {fb_str} · {total_req} 次"
+
+
+def _mask_key(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 10:
+        return key[0] + "***"
+    return key[:6] + "***" + key[-4:]
+
+
+# ─── 渠道列表 ─────────────────────────────────────────────────────
+
+def _list_text_and_kb() -> tuple[str, dict]:
+    chans = [ch for ch in registry.all_channels() if ch.type == "api"]
+    total = len(chans)
+
+    lines = [f"🔀 <b>渠道管理</b>", f"共 {total} 个"]
+    if total == 0:
+        lines.append("\n暂无渠道，点「➕ 添加渠道」创建。")
+
+    rows: list[list[dict]] = []
+    current: list[dict] = []
+    for ch in chans:
+        icon, status = _channel_health(ch)
+        summary = _summary_text(ch)
+        lines.append("")
+        lines.append(f"{icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
+        lines.append(f"  模型: {len(ch.models)} 个 · {ui.escape_html(summary)}")
+        short = ui.register_code(ch.display_name)
+        current.append(ui.btn(f"{icon} {ch.display_name}", f"ch:view:{short}"))
+        if len(current) >= 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+
+    rows.append([
+        ui.btn("➕ 添加渠道", "chw:start"),
+        ui.btn("🧹 清全部错误", "ch:clear_errors_all"),
+    ])
+    rows.append([
+        ui.btn("🔗 清全部亲和", "ch:clear_affinity_all"),
+    ])
+    rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
+
+    text = ui.truncate("\n".join(lines))
+    return text, ui.inline_kb(rows)
+
+
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, kb = _list_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def send_new(chat_id: int) -> None:
+    text, kb = _list_text_and_kb()
+    ui.send(chat_id, text, reply_markup=kb)
+
+
+# ─── 渠道详情 ─────────────────────────────────────────────────────
+
+def _channel_model_lines(ch) -> list[str]:
+    lines = []
+    now = int(time.time() * 1000)
+    perfs = {s["model"]: s for s in scorer.snapshot() if s["channel_key"] == ch.key}
+    cd_map = {e["model"]: e for e in cooldown.active_entries() if e["channel_key"] == ch.key}
+
+    for m in ch.models:
+        alias = m.get("alias")
+        real = m.get("real")
+        line = f"  • <code>{ui.escape_html(alias)}</code>"
+        if real != alias:
+            line += f" → <code>{ui.escape_html(real)}</code>"
+        perf = perfs.get(real)
+        cd = cd_map.get(real)
+
+        if cd:
+            if cd["cooldown_until"] == -1:
+                line += " 🔴 <b>永久冷却</b>"
+            else:
+                remaining = max(0, (cd["cooldown_until"] - now) // 1000)
+                line += f" 🟠 冷却 {remaining}s"
+        else:
+            if perf and perf["recent_requests"] > 0:
+                rate = (perf["recent_success_count"] / perf["recent_requests"]) * 100
+                icon = "🟢" if rate >= 80 else ("🟡" if rate >= 50 else "🔴")
+                line += f" {icon} {rate:.0f}%"
+            else:
+                line += " ⚪ 暂无数据"
+        lines.append(line)
+
+        if perf and perf["total_requests"] > 0:
+            stats_line = (
+                f"    请求 {perf['total_requests']} · "
+                f"连接 {perf['avg_connect_ms']}ms · "
+                f"首字 {perf['avg_first_byte_ms']}ms · "
+                f"score {perf['score']}"
+            )
+            lines.append(stats_line)
+    return lines
+
+
+def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
+    ch = registry.get_channel(f"api:{name}")
+    if ch is None or ch.type != "api":
+        return None, None
+
+    icon, status = _channel_health(ch)
+    enabled = ch.enabled and not ch.disabled_reason
+
+    lines = [
+        f"{icon} <b>{ui.escape_html(ch.display_name)}</b>",
+        "",
+        f"🔗 URL: <code>{ui.escape_html(ch.base_url)}</code>",
+        f"🔑 Key: <code>{ui.escape_html(_mask_key(ch.api_key))}</code>",
+        f"🎭 CC 伪装: <code>{'开启' if ch.cc_mimicry else '关闭'}</code>",
+        f"{'✅' if enabled else '⬛'} 状态: <code>{'enabled' if enabled else (ch.disabled_reason or 'disabled')}</code>",
+        "",
+        f"<b>📋 模型 ({len(ch.models)} 个)</b>",
+    ]
+    lines.extend(_channel_model_lines(ch))
+
+    # 亲和绑定数
+    bound = sum(1 for v in affinity.snapshot().values() if v["channel_key"] == ch.key)
+    lines.append("")
+    lines.append(f"🔗 亲和绑定: {bound} 个会话")
+
+    short = ui.register_code(ch.display_name)
+    toggle_label = "⬛ 禁用" if enabled else "✅ 启用"
+    rows = [
+        [ui.btn("🧪 测试模型", f"ch:test:{short}"), ui.btn("✏ 编辑", f"ch:edit:{short}")],
+        [ui.btn("🧹 清错误", f"ch:clear_errors:{short}"),
+         ui.btn("🔗 清亲和", f"ch:clear_affinity:{short}")],
+        [ui.btn(toggle_label, f"ch:toggle:{short}"),
+         ui.btn("🗑 删除", f"ch:del:{short}")],
+        [ui.btn("◀ 返回列表", "menu:channel")],
+    ]
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def on_view(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        show(chat_id, message_id)
+        return
+    ui.answer_cb(cb_id)
+    text, kb = _detail_text_and_kb(name)
+    if text is None:
+        ui.edit(chat_id, message_id, f"⚠ 渠道 <code>{ui.escape_html(name)}</code> 不存在",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:channel")]]))
+        return
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+# ─── 启停 / 清错误 / 清亲和 / 删除 ───────────────────────────────
+
+def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    ch = registry.get_channel(f"api:{name}")
+    if ch is None:
+        ui.answer_cb(cb_id, "渠道不存在")
+        return
+    new_enabled = not (ch.enabled and not ch.disabled_reason)
+    registry.update_api_channel(name, {"enabled": new_enabled})
+    ui.answer_cb(cb_id, "已启用" if new_enabled else "已禁用")
+    text, kb = _detail_text_and_kb(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    cooldown.clear(f"api:{name}", model=None)
+    ui.answer_cb(cb_id, "已清除")
+    text, kb = _detail_text_and_kb(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    affinity.delete_by_channel(f"api:{name}")
+    ui.answer_cb(cb_id, "已清空亲和")
+    text, kb = _detail_text_and_kb(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_clear_errors_all(chat_id: int, message_id: int, cb_id: str) -> None:
+    cooldown.clear_all()
+    ui.answer_cb(cb_id, "已全部清除")
+    show(chat_id, message_id)
+
+
+def on_clear_affinity_all(chat_id: int, message_id: int, cb_id: str) -> None:
+    affinity.delete_all()
+    ui.answer_cb(cb_id, "已全部清空")
+    show(chat_id, message_id)
+
+
+def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    ch = registry.get_channel(f"api:{name}")
+    if ch is None:
+        ui.answer_cb(cb_id, "渠道不存在")
+        return
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id, message_id,
+        "⚠ <b>确认删除渠道？</b>\n\n"
+        f"• 名称: <code>{ui.escape_html(ch.display_name)}</code>\n"
+        f"• URL: <code>{ui.escape_html(ch.base_url)}</code>\n"
+        f"• 模型: {len(ch.models)} 个\n\n"
+        "此操作会同时清除该渠道所有统计、冷却、亲和数据，不可恢复。",
+        reply_markup=ui.inline_kb([[
+            ui.btn("✅ 确认删除", f"ch:del_exec:{short}"),
+            ui.btn("❌ 取消",     f"ch:view:{short}"),
+        ]]),
+    )
+
+
+def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        show(chat_id, message_id)
+        return
+    ok = registry.delete_api_channel(name)
+    if ok:
+        ui.answer_cb(cb_id, "已删除")
+        ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(name)}</code>")
+        show(chat_id, message_id)
+    else:
+        ui.answer_cb(cb_id, "删除失败")
+
+
+# ─── 添加向导 ─────────────────────────────────────────────────────
+
+_WIZ_NAV = [ui.btn("❌ 取消", "chw:cancel")]
+
+
+def wiz_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "ch_wiz_name", {})
+    ui.edit(
+        chat_id, message_id,
+        "➕ <b>添加渠道（1/4）</b>\n\n请输入渠道名称（将显示在列表中；空格、中文均可）：",
+        reply_markup=ui.inline_kb([_WIZ_NAV]),
+    )
+
+
+def wiz_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id, "已取消")
+    states.pop_state(chat_id)
+    show(chat_id, message_id)
+
+
+def wiz_on_name_input(chat_id: int, text: str) -> None:
+    name = (text or "").strip()
+    if not name:
+        ui.send(chat_id, "❌ 名称不能为空，请重新输入：")
+        return
+    if len(name) > 64:
+        ui.send(chat_id, "❌ 名称过长（上限 64 字符），请重新输入：")
+        return
+    cfg = config.get()
+    if any(c.get("name") == name for c in cfg.get("channels", [])):
+        ui.send(chat_id, f"❌ 渠道名称 <code>{ui.escape_html(name)}</code> 已存在，请换一个：")
+        return
+
+    states.set_state(chat_id, "ch_wiz_url", {"name": name})
+    ui.send(
+        chat_id,
+        "✅ 名称已设置\n\n"
+        "➕ <b>添加渠道（2/4）</b>\n\n"
+        "请输入 Base URL（需 http:// 或 https:// 开头；代理会在此之后追加 <code>/v1/messages</code>）：",
+        reply_markup=ui.inline_kb([_WIZ_NAV]),
+    )
+
+
+def wiz_on_url_input(chat_id: int, text: str) -> None:
+    url = (text or "").strip().rstrip("/")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        ui.send(chat_id, "❌ URL 需以 http:// 或 https:// 开头，请重新输入：")
+        return
+    state = states.get_state(chat_id)
+    if not state:
+        ui.send(chat_id, "❌ 会话过期，请重新添加")
+        return
+    data = state["data"]
+    data["baseUrl"] = url
+    states.set_state(chat_id, "ch_wiz_key", data)
+    ui.send(
+        chat_id,
+        "✅ URL 已设置\n\n"
+        "➕ <b>添加渠道（3/4）</b>\n\n请输入该渠道的 API Key：",
+        reply_markup=ui.inline_kb([_WIZ_NAV]),
+    )
+
+
+def wiz_on_key_input(chat_id: int, text: str) -> None:
+    key = (text or "").strip()
+    if len(key) < 5:
+        ui.send(chat_id, "❌ API Key 过短，请重新输入：")
+        return
+    state = states.get_state(chat_id)
+    if not state:
+        ui.send(chat_id, "❌ 会话过期，请重新添加")
+        return
+    data = state["data"]
+    data["apiKey"] = key
+    states.set_state(chat_id, "ch_wiz_models", data)
+    ui.send(
+        chat_id,
+        "✅ API Key 已设置\n\n"
+        "➕ <b>添加渠道（4/4）</b>\n\n"
+        "请输入模型列表。格式 <code>真实名[:别名]</code>，以 ,/，/;/； 分隔。\n\n"
+        "示例：\n"
+        "<code>GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo</code>\n"
+        "<code>gpt-5.4; gpt-5.3-codex:codex</code>\n\n"
+        "不写别名则别名=真实名；别名不可重复。",
+        reply_markup=ui.inline_kb([_WIZ_NAV]),
+    )
+
+
+def wiz_on_models_input(chat_id: int, text: str) -> None:
+    try:
+        models = api_channel.parse_models_input(text or "")
+    except ValueError as exc:
+        ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n请重新输入：")
+        return
+    state = states.get_state(chat_id)
+    if not state:
+        ui.send(chat_id, "❌ 会话过期，请重新添加")
+        return
+    data = state["data"]
+    data["models"] = models
+    data["test_results"] = {}   # real_model → (ok, elapsed_ms, reason)
+    states.set_state(chat_id, "ch_wiz_test", data)
+    _wiz_send_test_panel(chat_id, data)
+
+
+def _wiz_test_kb(data: dict) -> dict:
+    rows: list[list[dict]] = []
+    # 每行放 1-2 个模型按钮
+    current: list[dict] = []
+    for i, m in enumerate(data["models"]):
+        real = m["real"]
+        status = data.get("test_results", {}).get(real)
+        label = m["alias"] if m["alias"] == real else f"{m['alias']}({real})"
+        if status is None:
+            prefix = "🧪 "
+        elif status[0]:
+            prefix = "✅ "
+        else:
+            prefix = "❌ "
+        current.append(ui.btn(f"{prefix}{label}", f"chw:test:{i}"))
+        if len(current) >= 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([
+        ui.btn("🧪 测试全部模型", "chw:test_all"),
+        ui.btn("⏭ 跳过测试", "chw:skip_test"),
+    ])
+    # 至少一个测试成功才允许保存
+    any_ok = any(r[0] for r in data.get("test_results", {}).values())
+    save_row = []
+    if any_ok:
+        save_row.append(ui.btn("💾 保存渠道", "chw:save"))
+    save_row.append(ui.btn("◀ 返回上一步", "chw:back"))
+    rows.append(save_row)
+    rows.append([ui.btn("❌ 取消", "chw:cancel")])
+    return ui.inline_kb(rows)
+
+
+def _wiz_test_intro(data: dict) -> str:
+    header = (
+        "🧪 <b>渠道测试</b>\n\n"
+        f"渠道: <code>{ui.escape_html(data['name'])}</code>\n"
+        f"模型: {len(data['models'])} 个\n\n"
+        "请选择模型进行联通性测试。至少有一个模型测试成功才能保存渠道。\n"
+        "<i>（若跳过测试，全部模型默认标记为可用，由后台探测机制处理后续）</i>"
+    )
+    results = data.get("test_results") or {}
+    if results:
+        header += "\n\n<b>测试结果</b>:"
+        for m in data["models"]:
+            real = m["real"]
+            r = results.get(real)
+            if r is None:
+                continue
+            ok, elapsed, reason = r
+            name = m["alias"]
+            if ok:
+                header += f"\n  ✅ <code>{ui.escape_html(name)}</code> — 耗时 {elapsed}ms"
+            else:
+                header += f"\n  ❌ <code>{ui.escape_html(name)}</code> — {ui.escape_html((reason or '')[:80])}"
+    return header
+
+
+def _wiz_send_test_panel(chat_id: int, data: dict) -> None:
+    ui.send(chat_id, _wiz_test_intro(data), reply_markup=_wiz_test_kb(data))
+
+
+def _wiz_refresh_test_panel(chat_id: int, msg_id: int, data: dict) -> None:
+    ui.edit(chat_id, msg_id, _wiz_test_intro(data), reply_markup=_wiz_test_kb(data))
+
+
+def wiz_back_to_models(chat_id: int, message_id: int, cb_id: str) -> None:
+    """返回到步骤 4（重新输入模型列表）。"""
+    ui.answer_cb(cb_id)
+    state = states.get_state(chat_id)
+    if not state or "data" not in state:
+        wiz_cancel(chat_id, message_id, cb_id)
+        return
+    data = state["data"]
+    # 清除测试结果
+    data.pop("test_results", None)
+    states.set_state(chat_id, "ch_wiz_models", data)
+    ui.edit(
+        chat_id, message_id,
+        "请重新输入模型列表（格式同上）：",
+        reply_markup=ui.inline_kb([_WIZ_NAV]),
+    )
+
+
+# ─── 测试：单个模型 / 全部 / 跳过 ─────────────────────────────────
+
+def _make_temp_channel(data: dict):
+    return api_channel.ApiChannel({
+        "name": data["name"] + "__wiz",
+        "type": "api",
+        "baseUrl": data["baseUrl"],
+        "apiKey": data["apiKey"],
+        "models": data["models"],
+        "cc_mimicry": True,
+        "enabled": True,
+    })
+
+
+async def _probe_with_progress_async(chat_id: int, msg_id: int, header: str,
+                                     ch, real_model: str) -> tuple[bool, int, Optional[str], str]:
+    """在 async 上下文中跑 probe + 进度更新。
+
+    完成后 edit 同一条消息显示结果。返回 (ok, elapsed_ms, reason, final_text)。
+    final_text 供调用方在此基础上追加"将自动删除"提示。
+    """
+    state = {"text": header}
+
+    async def progress_cb(line: str) -> None:
+        state["text"] += f"\n{line}"
+        ui.edit(chat_id, msg_id, state["text"])
+
+    try:
+        ok, elapsed, reason = await probe.probe_with_progress(
+            ch, real_model,
+            progress_cb=progress_cb,
+            timeout_s=None,
+            progress_interval=10,
+        )
+    except Exception as exc:
+        state["text"] += f"\n[×] 测试异常：{ui.escape_html(str(exc))}"
+        ui.edit(chat_id, msg_id, state["text"])
+        return False, 0, str(exc), state["text"]
+
+    if ok:
+        state["text"] += f"\n[√] 模型测试成功，耗时: {elapsed}ms"
+    else:
+        state["text"] += f"\n[×] 模型测试失败，失败原因: {ui.escape_html(reason or '未知错误')}"
+    ui.edit(chat_id, msg_id, state["text"])
+    return ok, elapsed, reason, state["text"]
+
+
+def _run_test_with_progress(chat_id: int, msg_id: int, header: str,
+                            ch, real_model: str) -> tuple[bool, int, Optional[str]]:
+    """同步包装：仅在添加向导的"逐个测试"路径中使用，因为后续要更新 test_results。
+
+    长时间阻塞的"全部测试"和"已存在渠道测试全部"已改为后台线程模式，
+    不再走这里。
+    """
+    return _run_sync(
+        _probe_with_progress_async(chat_id, msg_id, header, ch, real_model)
+    )
+
+
+def wiz_test_single(chat_id: int, message_id: int, cb_id: str, idx_str: str) -> None:
+    """后台线程跑单模型测试，TG polling 不阻塞。"""
+    ui.answer_cb(cb_id, "测试已开始")
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_wiz_test":
+        ui.send(chat_id, "❌ 会话已过期，请重新添加")
+        return
+    data = state["data"]
+    try:
+        idx = int(idx_str)
+        m = data["models"][idx]
+    except (ValueError, IndexError):
+        return
+
+    ch = _make_temp_channel(data)
+    real, alias = m["real"], m["alias"]
+
+    header = (
+        f"🧪 正在测试 [{ui.escape_html(data['name'])}] 渠道 "
+        f"{ui.escape_html(alias)} 模型…\n（最长 60s，期间可继续操作）"
+    )
+    msg = ui.send(chat_id, header)
+    if not msg or not msg.get("ok"):
+        return
+    progress_msg_id = msg["result"]["message_id"]
+
+    async def _run():
+        ok, elapsed, reason, final_text = await _probe_with_progress_async(
+            chat_id, progress_msg_id, header, ch, real,
+        )
+        cur = states.get_state(chat_id)
+        if cur and cur.get("action") == "ch_wiz_test":
+            cur_data = cur["data"]
+            cur_data.setdefault("test_results", {})[real] = (ok, elapsed, reason)
+            states.set_state(chat_id, "ch_wiz_test", cur_data)
+            _wiz_refresh_test_panel(chat_id, message_id, cur_data)
+        await _finalize_and_delete(chat_id, progress_msg_id, final_text, ok)
+
+    _spawn_async_task(_run, name=f"wiz-test-{chat_id}-{idx}")
+
+
+def wiz_test_all(chat_id: int, message_id: int, cb_id: str) -> None:
+    """后台线程批量测试所有模型，TG polling 不阻塞。"""
+    ui.answer_cb(cb_id, "测试已开始")
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_wiz_test":
+        ui.send(chat_id, "❌ 会话已过期，请重新添加")
+        return
+    data = state["data"]
+    ch = _make_temp_channel(data)
+
+    msg = ui.send(
+        chat_id,
+        f"🧪 开始测试 [{ui.escape_html(data['name'])}] 全部 {len(data['models'])} 个模型…\n"
+        "（每个模型最长 60s，期间可继续操作其他菜单）"
+    )
+    if not msg or not msg.get("ok"):
+        return
+    progress_msg_id = msg["result"]["message_id"]
+
+    async def _run_all():
+        accumulated = ""
+        results: dict[str, tuple[bool, int, Optional[str]]] = {}
+        for m in data["models"]:
+            real, alias = m["real"], m["alias"]
+            header_line = (f"{accumulated}\n\n" if accumulated else "") + (
+                f"🧪 正在测试 [{ui.escape_html(data['name'])}] 渠道 "
+                f"{ui.escape_html(alias)} 模型…"
+            )
+            ok, elapsed, reason, _ = await _probe_with_progress_async(
+                chat_id, progress_msg_id, header_line, ch, real,
+            )
+            results[real] = (ok, elapsed, reason)
+            accumulated = header_line + (
+                f"\n[√] 模型测试成功，耗时: {elapsed}ms" if ok
+                else f"\n[×] 模型测试失败，失败原因: {ui.escape_html(reason or '未知错误')}"
+            )
+        # 测试完成后回写状态机 + 刷新原测试面板
+        cur = states.get_state(chat_id)
+        if cur and cur.get("action") == "ch_wiz_test":
+            cur_data = cur["data"]
+            cur_data.setdefault("test_results", {}).update(results)
+            states.set_state(chat_id, "ch_wiz_test", cur_data)
+            _wiz_refresh_test_panel(chat_id, message_id, cur_data)
+        if results:
+            all_ok = all(v[0] for v in results.values())
+            await _finalize_and_delete(chat_id, progress_msg_id, accumulated, all_ok)
+
+    _spawn_async_task(_run_all, name=f"wiz-test-all-{chat_id}")
+
+
+def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id, "跳过测试，已保存")
+    state = states.get_state(chat_id)
+    if not state:
+        return
+    data = state["data"]
+    try:
+        registry.add_api_channel({
+            "name": data["name"],
+            "baseUrl": data["baseUrl"],
+            "apiKey": data["apiKey"],
+            "models": data["models"],
+            "cc_mimicry": True,
+            "enabled": True,
+        })
+    except Exception as exc:
+        ui.send(chat_id, f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    states.pop_state(chat_id)
+    ui.edit(
+        chat_id, message_id,
+        f"✅ <b>渠道已保存（跳过测试）</b>\n\n"
+        f"名称: <code>{ui.escape_html(data['name'])}</code>\n"
+        "所有模型标记为「可用」，后台 probe 会持续验证真实可用性。",
+        reply_markup=ui.inline_kb([
+            [ui.btn("◀ 返回渠道列表", "menu:channel"),
+             ui.btn("🏠 主菜单", "menu:main")],
+        ]),
+    )
+
+
+def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
+    state = states.get_state(chat_id)
+    if not state:
+        ui.answer_cb(cb_id, "会话过期")
+        return
+    data = state["data"]
+    results = data.get("test_results") or {}
+    any_ok = any(v[0] for v in results.values())
+    if not any_ok:
+        ui.answer_cb(cb_id, "需要至少一个模型测试成功", show_alert=True)
+        return
+    try:
+        registry.add_api_channel({
+            "name": data["name"],
+            "baseUrl": data["baseUrl"],
+            "apiKey": data["apiKey"],
+            "models": data["models"],
+            "cc_mimicry": True,
+            "enabled": True,
+        })
+    except Exception as exc:
+        ui.send(chat_id, f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>")
+        ui.answer_cb(cb_id, "失败")
+        return
+
+    # 失败的模型：记入初始冷却（errorWindows[0]，默认 1 分钟）
+    # 避免启用即被调度到；冷却期到后 probe 会自动重测
+    for m in data["models"]:
+        real = m["real"]
+        r = results.get(real)
+        if r and not r[0]:
+            cooldown.record_error(f"api:{data['name']}", real, f"initial probe failed: {r[2]}")
+
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已保存")
+    ok_names = [m["alias"] for m in data["models"] if (results.get(m["real"]) or (False,))[0]]
+    fail_names = [m["alias"] for m in data["models"] if not (results.get(m["real"]) or (False,))[0]]
+    ok_display = ", ".join(ui.escape_html(n) for n in ok_names) or "-"
+    fail_display = ", ".join(ui.escape_html(n) for n in fail_names)
+    summary = (
+        f"✅ <b>渠道已保存</b>: <code>{ui.escape_html(data['name'])}</code>\n\n"
+        f"可用模型 ({len(ok_names)}): {ok_display}\n"
+    )
+    if fail_names:
+        summary += f"不可用（已加入冷却） ({len(fail_names)}): {fail_display}"
+    # edit 同一消息显示结果 + 导航；用户点击按钮返回列表，避免双消息
+    ui.edit(chat_id, message_id, summary, reply_markup=ui.inline_kb([
+        [ui.btn("◀ 返回渠道列表", "menu:channel"),
+         ui.btn("🏠 主菜单", "menu:main")],
+    ]))
+
+
+# ─── 测试面板（已存在渠道；不影响 cooldown） ────────────────────
+
+def on_test_panel(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        ui.edit(chat_id, message_id, "⚠ 渠道不存在",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回", "menu:channel")]]))
+        return
+    rows: list[list[dict]] = []
+    current: list[dict] = []
+    for i, m in enumerate(ch.models):
+        label = m["alias"] if m["alias"] == m["real"] else f"{m['alias']}({m['real']})"
+        current.append(ui.btn(f"🧪 {label}", f"ch:t1:{short}:{i}"))
+        if len(current) >= 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([ui.btn("🧪 测试全部", f"ch:tall:{short}")])
+    rows.append([ui.btn("◀ 返回详情", f"ch:view:{short}")])
+    ui.edit(
+        chat_id, message_id,
+        f"🧪 <b>测试 [{ui.escape_html(ch.display_name)}]</b>\n\n"
+        f"模型: {len(ch.models)} 个\n<i>本次测试不会修改冷却状态，只反映联通性。</i>",
+        reply_markup=ui.inline_kb(rows),
+    )
+
+
+def on_test_single(chat_id: int, message_id: int, cb_id: str, short: str, idx_str: str) -> None:
+    """后台线程测单个模型，不阻塞 polling。"""
+    ui.answer_cb(cb_id, "测试已开始")
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        return
+    try:
+        idx = int(idx_str)
+        m = ch.models[idx]
+    except (ValueError, IndexError):
+        return
+    header = (
+        f"🧪 正在测试 [{ui.escape_html(ch.display_name)}] 渠道 "
+        f"{ui.escape_html(m['alias'])} 模型…\n（最长 60s，期间可继续操作）"
+    )
+    sent = ui.send(chat_id, header)
+    if not sent or not sent.get("ok"):
+        return
+    progress_msg_id = sent["result"]["message_id"]
+
+    async def _run():
+        ok, _, _, final_text = await _probe_with_progress_async(
+            chat_id, progress_msg_id, header, ch, m["real"],
+        )
+        await _finalize_and_delete(chat_id, progress_msg_id, final_text, ok)
+
+    _spawn_async_task(_run, name=f"chtest-{chat_id}-{idx}")
+
+
+def on_test_all(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    """后台线程批量测试已存在渠道的所有模型，不阻塞 polling。"""
+    ui.answer_cb(cb_id, "测试已开始")
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        return
+    sent = ui.send(
+        chat_id,
+        f"🧪 开始测试 [{ui.escape_html(ch.display_name)}] 全部 {len(ch.models)} 个模型…\n"
+        "（每个模型最长 60s，期间可继续操作其他菜单）"
+    )
+    if not sent or not sent.get("ok"):
+        return
+    progress_msg_id = sent["result"]["message_id"]
+
+    async def _run_all():
+        accumulated = ""
+        all_ok = True
+        for m in ch.models:
+            header = (accumulated + "\n\n" if accumulated else "") + (
+                f"🧪 正在测试 [{ui.escape_html(ch.display_name)}] 渠道 "
+                f"{ui.escape_html(m['alias'])} 模型…"
+            )
+            ok, elapsed, reason, _ = await _probe_with_progress_async(
+                chat_id, progress_msg_id, header, ch, m["real"],
+            )
+            if not ok:
+                all_ok = False
+            accumulated = header + (
+                f"\n[√] 模型测试成功，耗时: {elapsed}ms" if ok
+                else f"\n[×] 模型测试失败，失败原因: {ui.escape_html(reason or '未知错误')}"
+            )
+        if ch.models:
+            await _finalize_and_delete(chat_id, progress_msg_id, accumulated, all_ok)
+
+    _spawn_async_task(_run_all, name=f"chtest-all-{chat_id}")
+
+
+# ─── 编辑（文本输入） ─────────────────────────────────────────────
+
+def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        return
+    cc_label = "🎭 切换 CC 伪装（当前: 开）" if ch.cc_mimicry else "🎭 切换 CC 伪装（当前: 关）"
+    ui.edit(
+        chat_id, message_id,
+        f"✏ <b>编辑 [{ui.escape_html(ch.display_name)}]</b>\n\n选择要修改的字段：",
+        reply_markup=ui.inline_kb([
+            [ui.btn("✏ 名称",   f"ch:ename:{short}"),
+             ui.btn("✏ URL",    f"ch:eurl:{short}")],
+            [ui.btn("✏ API Key", f"ch:ekey:{short}"),
+             ui.btn("✏ 模型列表", f"ch:emodels:{short}")],
+            [ui.btn(cc_label, f"ch:ecc:{short}")],
+            [ui.btn("◀ 返回详情", f"ch:view:{short}")],
+        ]),
+    )
+
+
+def _edit_prompt(chat_id: int, message_id: int, short: str, field: str, prompt: str) -> None:
+    states.set_state(chat_id, f"ch_edit_{field}", {"short": short})
+    ui.edit(chat_id, message_id, prompt,
+            reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"ch:view:{short}")]]))
+
+
+def on_edit_name(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    _edit_prompt(chat_id, message_id, short, "name", "请输入新的渠道名称：")
+
+
+def on_edit_url(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    _edit_prompt(chat_id, message_id, short, "url", "请输入新的 Base URL（http:// 或 https://）：")
+
+
+def on_edit_key(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    _edit_prompt(chat_id, message_id, short, "key", "请输入新的 API Key：")
+
+
+def on_edit_models(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    _edit_prompt(chat_id, message_id, short, "models",
+                 "请输入新的模型列表（格式 <code>真实名[:别名]</code>，逗号/分号分隔）：")
+
+
+def on_edit_cc_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        ui.answer_cb(cb_id, "渠道不存在")
+        return
+    try:
+        registry.update_api_channel(name, {"cc_mimicry": not ch.cc_mimicry})
+    except Exception as exc:
+        ui.answer_cb(cb_id, "切换失败")
+        ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
+        return
+    ui.answer_cb(cb_id, "已切换")
+    on_edit_menu(chat_id, message_id, "-", short)
+
+
+def _do_edit(chat_id: int, short: str, field: str, value: Any) -> tuple[bool, str]:
+    name = ui.resolve_code(short)
+    if not name:
+        return False, "短码已失效"
+    try:
+        patch = {field: value}
+        if field == "name":
+            patch = {"name": value}
+        elif field == "baseUrl":
+            patch = {"baseUrl": value}
+        elif field == "apiKey":
+            patch = {"apiKey": value}
+        elif field == "models":
+            patch = {"models": value}
+        registry.update_api_channel(name, patch)
+    except Exception as exc:
+        return False, str(exc)
+    return True, patch.get("name", name) if field == "name" else name
+
+
+def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
+    state = states.get_state(chat_id)
+    if state is None:
+        return False
+    short = (state.get("data") or {}).get("short", "")
+
+    def _ok_result(msg: str, target_short: str) -> None:
+        ui.send_result(
+            chat_id, msg,
+            extra_rows=[[ui.btn("◀ 返回该渠道详情", f"ch:view:{target_short}")]],
+            back_label="🏠 主菜单", back_callback="menu:main",
+        )
+
+    if action == "ch_edit_name":
+        new_name = (text or "").strip()
+        if not new_name:
+            ui.send(chat_id, "❌ 名称不能为空，请重新输入：")
+            return True
+        ok, result = _do_edit(chat_id, short, "name", new_name)
+        if not ok:
+            ui.send(chat_id, f"❌ {ui.escape_html(result)}")
+            return True
+        states.pop_state(chat_id)
+        new_short = ui.register_code(new_name)   # 旧短码失效，新短码生成
+        _ok_result(f"✅ 名称已改为 <code>{ui.escape_html(new_name)}</code>", new_short)
+        return True
+    if action == "ch_edit_url":
+        url = (text or "").strip().rstrip("/")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            ui.send(chat_id, "❌ URL 需以 http:// 或 https:// 开头，请重新输入：")
+            return True
+        ok, result = _do_edit(chat_id, short, "baseUrl", url)
+        if not ok:
+            ui.send(chat_id, f"❌ {ui.escape_html(result)}")
+            return True
+        states.pop_state(chat_id)
+        _ok_result("✅ URL 已更新", short)
+        return True
+    if action == "ch_edit_key":
+        key = (text or "").strip()
+        if len(key) < 5:
+            ui.send(chat_id, "❌ API Key 过短，请重新输入：")
+            return True
+        ok, result = _do_edit(chat_id, short, "apiKey", key)
+        if not ok:
+            ui.send(chat_id, f"❌ {ui.escape_html(result)}")
+            return True
+        states.pop_state(chat_id)
+        _ok_result("✅ API Key 已更新", short)
+        return True
+    if action == "ch_edit_models":
+        try:
+            models = api_channel.parse_models_input(text or "")
+        except ValueError as exc:
+            ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n请重新输入：")
+            return True
+        ok, result = _do_edit(chat_id, short, "models", models)
+        if not ok:
+            ui.send(chat_id, f"❌ {ui.escape_html(result)}")
+            return True
+        states.pop_state(chat_id)
+        _ok_result(f"✅ 模型列表已更新（{len(models)} 个）", short)
+        return True
+    return False
+
+
+# ─── 路由分发 ─────────────────────────────────────────────────────
+
+def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    if data == "menu:channel":
+        show(chat_id, message_id, cb_id)
+        return True
+    if data == "ch:clear_errors_all":
+        on_clear_errors_all(chat_id, message_id, cb_id); return True
+    if data == "ch:clear_affinity_all":
+        on_clear_affinity_all(chat_id, message_id, cb_id); return True
+
+    # 向导
+    if data == "chw:start":  wiz_start(chat_id, message_id, cb_id); return True
+    if data == "chw:cancel": wiz_cancel(chat_id, message_id, cb_id); return True
+    if data == "chw:back":   wiz_back_to_models(chat_id, message_id, cb_id); return True
+    if data == "chw:test_all": wiz_test_all(chat_id, message_id, cb_id); return True
+    if data == "chw:skip_test": wiz_skip_test(chat_id, message_id, cb_id); return True
+    if data == "chw:save":   wiz_save(chat_id, message_id, cb_id); return True
+    if data.startswith("chw:test:"):
+        wiz_test_single(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+
+    # 渠道详情相关
+    if data.startswith("ch:view:"):
+        on_view(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:toggle:"):
+        on_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:clear_errors:"):
+        on_clear_errors(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:clear_affinity:"):
+        on_clear_affinity(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:del_exec:"):
+        on_delete_exec(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:del:"):
+        on_delete_ask(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+
+    # 测试（已存在渠道）
+    if data.startswith("ch:test:"):
+        on_test_panel(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:t1:"):
+        parts = data.split(":")
+        if len(parts) >= 4:
+            on_test_single(chat_id, message_id, cb_id, parts[2], parts[3]); return True
+    if data.startswith("ch:tall:"):
+        on_test_all(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+
+    # 编辑
+    if data.startswith("ch:edit:"):
+        on_edit_menu(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:ename:"):
+        on_edit_name(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:eurl:"):
+        on_edit_url(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:ekey:"):
+        on_edit_key(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:emodels:"):
+        on_edit_models(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:ecc:"):
+        on_edit_cc_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+
+    return False
+
+
+def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if action == "ch_wiz_name":
+        wiz_on_name_input(chat_id, text); return True
+    if action == "ch_wiz_url":
+        wiz_on_url_input(chat_id, text); return True
+    if action == "ch_wiz_key":
+        wiz_on_key_input(chat_id, text); return True
+    if action == "ch_wiz_models":
+        wiz_on_models_input(chat_id, text); return True
+    if action.startswith("ch_edit_"):
+        return handle_edit_text(chat_id, action, text)
+    return False

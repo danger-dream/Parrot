@@ -1,0 +1,28 @@
+.git
+.github
+*.md
+!README.md
+docs/
+deploy.sh
+docker-compose.yml
+.dockerignore
+.gitignore
+
+# 运行时
+data/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+logs/
+config.json
+config.json.bak*
+config.json.tmp
+.anthropic_proxy_ids.json
+*.log
+.DS_Store
+
+# 测试
+src/tests/
