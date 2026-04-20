@@ -2,7 +2,7 @@
 
 MS-2 只实现"同 ingress 自检"与"跨变体未实现"的拒绝路径：
   - Chat ingress：拒绝 `n>1` / `audio` 输出（本版本不支持，暂 400）
-  - Responses ingress：拒绝 `background:true` / `conversation` 对象（首版不做）
+  - Responses ingress：`background:true` 静默降级为同步模式（透明兼容），拒绝 `conversation` 对象（首版不做）
   - 当需要跨变体翻译但 `openai.translation.enabled=false` 时，handler 在调度阶段
     自然得到空候选，返回 503 —— 不在此处干预。
 
@@ -61,7 +61,9 @@ def guard_chat_ingress(body: dict) -> None:
 def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
     """Responses 入口自检。
 
-    - background:true → 400（首版不支持异步模式）
+    - background:true → 静默剥除（透明兼容）：代理无状态，不维护 response store 的
+      pending → completed 状态机；客户端 (Codex CLI / OpenAI SDK) 在 background:true
+      下通常也直接读 SSE 流，剥除该字段后走同步路径行为等价。
     - conversation 对象 → 400（首版不支持 conversation 资源，仅 previous_response_id）
     - previous_response_id 带了但 Store 关闭 → 400
 
@@ -71,10 +73,20 @@ def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
 
-    if body.get("background") is True:
-        _fail(400, "invalid_request_error",
-              "background responses are not supported by this proxy",
-              param="background")
+    # background 字段静默剥除（无论 true/false）：
+    # Codex OAuth 上游 /backend-api/codex/responses 不接受 background 参数，
+    # 即使传 false 也会返回 HTTP 400 "Unsupported parameter: background"。
+    # 代理无状态，不实现 background 异步模式；客户端行为等价于同步/流式调用。
+    if "background" in body:
+        had_true = body.get("background") is True
+        body.pop("background", None)
+        try:
+            import logging
+            logging.getLogger("parrot.openai").info(
+                "[guard] background field stripped (compat, had_true=%s)", had_true
+            )
+        except Exception:
+            pass
 
     # 只在实际提供了 conversation 值时拒绝；显式 null 占位（某些客户端默认带）应放行
     if body.get("conversation"):
