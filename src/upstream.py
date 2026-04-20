@@ -467,6 +467,28 @@ class ChatSSEAssistantBuilder:
     def finish_reason(self) -> Optional[str]:
         return self._finish_reason
 
+    def to_full_json(self, *, id: str, model: str, created: int,
+                     system_fingerprint: Optional[str] = None,
+                     usage: Optional[dict] = None) -> dict:
+        """把累积的 SSE 聚合成完整的 chat.completion 响应 JSON（非流式格式）。"""
+        out: dict = {
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": self.get_assistant(),
+                "finish_reason": self._finish_reason or "stop",
+                "logprobs": None,
+            }],
+        }
+        if system_fingerprint:
+            out["system_fingerprint"] = system_fingerprint
+        if usage:
+            out["usage"] = usage
+        return out
+
 
 # ─── OpenAI Responses SSE 工具 ────────────────────────────────────────
 
@@ -573,6 +595,8 @@ class ResponsesSSEAssistantBuilder:
         self._fc_args: dict[int, str] = {}            # output_index → arguments buf
         self._msg_text: dict[tuple, str] = {}         # (output_index, content_index) → text
         self._got_any = False
+        # response 顶层 metadata（由 response.created / response.completed 事件携带）
+        self._response_obj: Optional[dict] = None
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
@@ -584,6 +608,12 @@ class ResponsesSSEAssistantBuilder:
             if event_name is None or data is None:
                 continue
             self._got_any = True
+            # response.created / response.completed 里的 response 对象是顶层 metadata 来源
+            if event_name in ("response.created", "response.in_progress",
+                              "response.completed", "response.failed"):
+                resp = data.get("response")
+                if isinstance(resp, dict):
+                    self._response_obj = resp
             if event_name == "response.output_item.added":
                 idx = int(data.get("output_index", 0))
                 item = dict(data.get("item") or {})
@@ -638,3 +668,20 @@ class ResponsesSSEAssistantBuilder:
     @property
     def has_any_event(self) -> bool:
         return self._got_any
+
+    def to_full_json(self, *, fallback_model: str = "") -> dict:
+        """把累积的 SSE 聚合成完整的 /v1/responses 响应 JSON。
+
+        优先使用 response.completed 事件里的 response 对象做骨架；
+        若骨架缺失，用 fallback_model 兜底并现场组装 output。
+        """
+        base: dict = {}
+        if isinstance(self._response_obj, dict):
+            base = dict(self._response_obj)
+        # 无论 base 有没有 output，都用 builder 内部聚合的 items 覆盖（更可靠）
+        base["output"] = self.get_output_items()
+        base.setdefault("object", "response")
+        base.setdefault("status", "completed")
+        if not base.get("model"):
+            base["model"] = fallback_model
+        return base

@@ -63,6 +63,10 @@ class Channel(ABC):
     # 渠道的上游协议。默认 "anthropic"（现状），OpenAI 家族子类会覆盖为
     # "openai-chat" 或 "openai-responses"。scheduler / failover / probe 都依据它分派行为。
     protocol: str = "anthropic"
+    # 上游是否仅支持流式响应（True 例：OpenAI Codex OAuth chatgpt.com backend）
+    # 为 True 时，即使下游 is_stream=False，failover 也会用流式方式读取 SSE，
+    # 再用 SSEAssistantBuilder 聚合成完整 JSON 返回给下游，避免 json.loads 空串。
+    upstream_stream_only: bool = False
 
     @abstractmethod
     def supports_model(self, requested_model: str) -> Optional[str]:

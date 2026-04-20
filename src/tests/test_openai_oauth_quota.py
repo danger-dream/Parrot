@@ -368,45 +368,72 @@ def test_delete_account_clears_codex_snapshot_throttle(m):
     print("  [PASS] delete_account: forget_codex_snapshot clears throttle bucket")
 
 
-def test_on_refresh_token_openai_skips_fetch_usage(m):
-    """Commit 5 ⑤：TG 详情页'刷新 Token'按钮对 openai 不调 fetch_usage（它会抛
-    QuotaNotSupported）。用计数 stub 验证没被调。"""
+def test_on_refresh_token_openai_uses_unified_path(m):
+    """2026-04-20 统一路径后：on_refresh_token 对 openai 账号**不主动**调
+    fetch_usage（代码里明确 `if provider_of(ak) != "openai"` 分支）。
+    但 _detail_text_and_kb 在渲染时会调 ensure_quota_fresh → fetch_usage →
+    走 probe 路径（zero-cost 节流已生效时 probe 会被跳过）。
+
+    这个测试的新语义：确认「刷新 Token」按钮的主路径不主动发 probe，让发 probe
+    留给「刷新用量」按钮的明确意图；但详情页渲染顺带刷一次 usage 是合理行为。
+    """
     _setup(m)
     _add_openai(m, "rt@openai.test")
+    m["registry"].rebuild_from_config()
 
     rec = _UiRecorder()
     m["ui"].api = rec
 
-    called = {"fetch_usage": 0}
+    # 预先设置 probe 节流桶，让 _detail_text_and_kb 里的 ensure_quota_fresh
+    # 跳过真实 probe（模拟已有近期采样的场景）
+    import time
+    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:rt@openai.test"] = time.time()
+
+    called = {"fetch_usage": 0, "probe_usage": 0}
     orig_fetch = m["oauth_manager"].fetch_usage
-    async def _counting_fetch(email):
+    async def _counting_fetch(ak):
         called["fetch_usage"] += 1
-        return await orig_fetch(email)
+        return await orig_fetch(ak)
+
+    # channel 层 probe 计数
+    from src.channel.openai_oauth_channel import OpenAIOAuthChannel
+    orig_probe = OpenAIOAuthChannel.probe_usage
+    async def _counting_probe(self, *args, **kwargs):
+        called["probe_usage"] += 1
+        return await orig_probe(self, *args, **kwargs)
 
     try:
         m["oauth_manager"].fetch_usage = _counting_fetch
+        OpenAIOAuthChannel.probe_usage = _counting_probe
         short = m["ui"].register_code("rt@openai.test")
         m["oauth_menu"].on_refresh_token(42, 100, "cb", short)
     finally:
         m["oauth_manager"].fetch_usage = orig_fetch
+        OpenAIOAuthChannel.probe_usage = orig_probe
 
-    assert called["fetch_usage"] == 0, "fetch_usage should be skipped for openai"
-    # 重渲染详情页应成功
+    # probe_usage 应被节流桶完全阻止 → 未真正 probe
+    assert called["probe_usage"] == 0,         f"probe_usage should be throttled (bucket set in test), got {called['probe_usage']}"
+    # 重渲染详情页成功
     last = rec.last("editMessageText")
     assert last and ("已刷新" in last["text"] or "Token" in last["text"])
-    print("  [PASS] on_refresh_token: openai provider skips fetch_usage call")
+    print("  [PASS] on_refresh_token(openai): probe throttled correctly, no token burned")
 
 
 def test_status_menu_quota_warnings_tags_openai(m):
     _setup(m)
     _add_openai(m, "warn@openai.test")
-    # 写高用量 snapshot 触发预警
+    # 写 warn 级别用量（85%）：高于 warnings 阈值 80%，低于 disable 阈值 95%
+    # → 应被预警，但不被自动禁用（2026-04-20 响应头自动禁用接入后的正确边界）
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("warn@openai.test"))
     resp = _MockResp({
-        "x-codex-primary-used-percent": "95",
+        "x-codex-primary-used-percent": "85",
         "x-codex-primary-window-minutes": "10080",
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
+
+    # 确认没被禁用
+    acc = m["oauth_manager"].get_account("warn@openai.test")
+    assert acc.get("disabled_reason") is None, f"should not be auto-disabled at 85% (threshold 95%): {acc}"
 
     warnings = m["status_menu"]._quota_warnings(threshold_pct=80.0)
     assert warnings, "expected at least one warning"
@@ -438,7 +465,7 @@ def main():
         test_oauth_menu_refresh_all_probes_openai,
         test_probe_usage_writes_snapshot_in_mock_mode,
         test_delete_account_clears_codex_snapshot_throttle,
-        test_on_refresh_token_openai_skips_fetch_usage,
+        test_on_refresh_token_openai_uses_unified_path,
         test_status_menu_quota_warnings_tags_openai,
     ]
 

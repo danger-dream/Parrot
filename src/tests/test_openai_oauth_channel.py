@@ -285,7 +285,8 @@ def test_channel_basic(m):
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("o@openai.test"))
-    assert ch.key == "oauth:o@openai.test"
+    assert ch.key == "oauth:openai:o@openai.test"
+    assert ch.account_key == "openai:o@openai.test"
     assert ch.type == "oauth"
     assert ch.protocol == "openai-responses"
     assert ch.cc_mimicry is False
@@ -419,8 +420,8 @@ def test_registry_dispatches_by_provider(m):
 
     m["registry"].rebuild_from_config()
     chs = {ch.key: ch for ch in m["registry"].all_channels()}
-    claude = chs["oauth:c@claude.test"]
-    openai = chs["oauth:o@openai.test"]
+    claude = chs["oauth:claude:c@claude.test"]
+    openai = chs["oauth:openai:o@openai.test"]
     assert isinstance(claude, m["OAuthChannel"]), type(claude).__name__
     assert isinstance(openai, m["OpenAIOAuthChannel"]), type(openai).__name__
     assert claude.protocol == "anthropic"

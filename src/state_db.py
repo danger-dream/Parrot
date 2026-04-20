@@ -72,9 +72,16 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_affinity_used ON cache_affinities(last_used);
     CREATE INDEX IF NOT EXISTS idx_affinity_channel ON cache_affinities(channel_key);
 
+    CREATE TABLE IF NOT EXISTS schema_meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS oauth_quota_cache (
-      email            TEXT PRIMARY KEY,
+      account_key      TEXT PRIMARY KEY,
+      email            TEXT NOT NULL,
       fetched_at       INTEGER NOT NULL,
+      last_passive_update_at INTEGER,
       five_hour_util   REAL,
       five_hour_reset  TEXT,
       seven_day_util   REAL,
@@ -107,10 +114,155 @@ def init() -> None:
     print(f"[state_db] Using {_db_path}")
 
 
+# ================================================================
+# schema_meta 读写 —— 保存线上迁移版本号 / 一次性 flag 等
+# ================================================================
+
+def schema_meta_get(key: str) -> str | None:
+    row = _get_conn().execute(
+        "SELECT value FROM schema_meta WHERE key=?", (key,),
+    ).fetchone()
+    return row["value"] if row else None
+
+
+def schema_meta_set(key: str, value: str) -> None:
+    with _write_lock:
+        _get_conn().execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        _get_conn().commit()
+
+
+# ================================================================
+# 幂等迁移：将 oauth 相关主键从 email 升级为 account_key = provider:email
+# 调用方：oauth_manager.bootstrap_composite_key_migration()（启动时）
+# ================================================================
+
+COMPOSITE_KEY_VERSION = "1"
+COMPOSITE_KEY_FLAG = "oauth_composite_key_version"
+
+
+def composite_key_migration_done() -> bool:
+    return schema_meta_get(COMPOSITE_KEY_FLAG) == COMPOSITE_KEY_VERSION
+
+
+def _oauth_quota_has_account_key_col(conn: sqlite3.Connection) -> bool:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
+    return "account_key" in cols
+
+
+def run_composite_key_migration(email_to_key: dict[str, str]) -> dict:
+    """幂等执行一次主键迁移。
+
+    返回统计 dict：
+      {"migrated_quota_rows", "migrated_channel_rows", "skipped", "reason"}
+    """
+    stats = {
+        "migrated_quota_rows": 0,
+        "migrated_channel_rows": 0,
+        "skipped": False,
+        "reason": "",
+    }
+    conn = _get_conn()
+    if composite_key_migration_done():
+        stats["skipped"] = True
+        stats["reason"] = "flag already set"
+        return stats
+
+    with _write_lock:
+        # 之前迁移过但 flag 丢失：直接补标记
+        if _oauth_quota_has_account_key_col(conn):
+            schema_meta_set(COMPOSITE_KEY_FLAG, COMPOSITE_KEY_VERSION)
+            stats["skipped"] = True
+            stats["reason"] = "account_key column already exists; flag backfilled"
+            return stats
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            # 重建 oauth_quota_cache：保留所有旧列 + 新增 account_key PK
+            old_cols = [
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")
+            ]
+            conn.execute("ALTER TABLE oauth_quota_cache RENAME TO oauth_quota_cache_old")
+            other_cols = [c for c in old_cols if c != "email"]
+            new_col_defs = ["account_key TEXT PRIMARY KEY", "email TEXT NOT NULL"]
+            old_types = {
+                r["name"]: r["type"]
+                for r in conn.execute("PRAGMA table_info(oauth_quota_cache_old)")
+            }
+            for c in other_cols:
+                new_col_defs.append(f"{c} {old_types.get(c, 'TEXT')}")
+            conn.execute(
+                f"CREATE TABLE oauth_quota_cache ({', '.join(new_col_defs)})"
+            )
+
+            # 迁数据
+            moved = 0
+            cursor = conn.execute("SELECT * FROM oauth_quota_cache_old")
+            for row in cursor.fetchall():
+                old_email = row["email"]
+                ak = email_to_key.get(old_email)
+                if not ak:
+                    continue
+                insert_cols = ["account_key", "email"] + other_cols
+                placeholders = ",".join(["?"] * len(insert_cols))
+                values = [ak, old_email] + [row[c] for c in other_cols]
+                conn.execute(
+                    f"INSERT OR REPLACE INTO oauth_quota_cache ({','.join(insert_cols)}) "
+                    f"VALUES ({placeholders})",
+                    values,
+                )
+                moved += 1
+            stats["migrated_quota_rows"] = moved
+            conn.execute("DROP TABLE oauth_quota_cache_old")
+
+            # UPDATE channel_key：oauth:<email> → oauth:<provider>:<email>
+            ch_migrated = 0
+            for old_email, ak in email_to_key.items():
+                old_ck = f"oauth:{old_email}"
+                new_ck = f"oauth:{ak}"
+                if old_ck == new_ck:
+                    continue
+                r1 = conn.execute(
+                    "UPDATE performance_stats SET channel_key=? WHERE channel_key=?",
+                    (new_ck, old_ck),
+                )
+                r2 = conn.execute(
+                    "UPDATE channel_errors SET channel_key=? WHERE channel_key=?",
+                    (new_ck, old_ck),
+                )
+                r3 = conn.execute(
+                    "UPDATE cache_affinities SET channel_key=? WHERE channel_key=?",
+                    (new_ck, old_ck),
+                )
+                ch_migrated += r1.rowcount + r2.rowcount + r3.rowcount
+            stats["migrated_channel_rows"] = ch_migrated
+
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                (COMPOSITE_KEY_FLAG, COMPOSITE_KEY_VERSION),
+            )
+            conn.execute("COMMIT")
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise RuntimeError(f"composite key migration failed: {exc}") from exc
+
+    return stats
+
+
+
 # 自 MS-OpenAI OAuth 接入起，oauth_quota_cache 新增了 Codex 原始/归一化用量字段。
 # 老库没有这些列 → 此函数在 init() 时幂等补齐。SQLite `ADD COLUMN` 不支持
 # IF NOT EXISTS，改用 PRAGMA table_info 比对再决定是否加，重复启动无副作用。
 _OPENAI_EXTRA_COLUMNS: list[tuple[str, str]] = [
+    # 2026-04-20: Anthropic 被动采样写入时间戳（ms）
+    ("last_passive_update_at",          "INTEGER"),
     # 原始 primary/secondary（便于排查问题）
     ("codex_primary_used_pct",          "REAL"),
     ("codex_primary_reset_sec",         "INTEGER"),
@@ -142,7 +294,9 @@ def _get_conn() -> sqlite3.Connection:
         conn = sqlite3.connect(_db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
+        conn.execute("PRAGMA journal_size_limit=1048576")
         conn.execute("PRAGMA busy_timeout=5000")
         _local.conn = conn
     return _local.conn
@@ -395,19 +549,27 @@ def affinity_cleanup(ttl_ms: int) -> int:
 
 # ─── oauth_quota_cache ────────────────────────────────────────────
 
-def quota_save(email: str, data: dict[str, Any]) -> None:
+def quota_save(account_key: str, data: dict[str, Any],
+               *, email: str | None = None) -> None:
+    """按 account_key=f"{provider}:{email}" 写入 quota。
+
+    若调用方未显式提供 email，则按 "provider:email" 拆出 email 作显示列兜底。
+    """
+    if email is None:
+        email = account_key.split(":", 1)[1] if ":" in account_key else account_key
     with _write_lock:
         _get_conn().execute(
             """INSERT OR REPLACE INTO oauth_quota_cache
-               (email, fetched_at,
+               (account_key, email, fetched_at,
                 five_hour_util, five_hour_reset,
                 seven_day_util, seven_day_reset,
                 sonnet_util, sonnet_reset,
                 opus_util, opus_reset,
                 extra_used, extra_limit, extra_util,
                 raw_data)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
+                account_key,
                 email,
                 int(data.get("fetched_at", now_ms())),
                 data.get("five_hour_util"),
@@ -427,11 +589,29 @@ def quota_save(email: str, data: dict[str, Any]) -> None:
         _get_conn().commit()
 
 
-def quota_load(email: str) -> dict | None:
-    row = _get_conn().execute(
-        "SELECT * FROM oauth_quota_cache WHERE email=?",
-        (email,),
-    ).fetchone()
+def quota_load(account_key_or_email: str) -> dict | None:
+    """按 account_key 精确匹配；若入参不含 ":" 则回退到 email 列查找（兼容）。
+
+    若三段式 account_key 没命中（例如调用方早期写入时用了裸 email 作 PK），再兜底
+    用拆出的 email 按 email 列查一次，最大程度向后兼容。
+    """
+    if ":" in account_key_or_email:
+        row = _get_conn().execute(
+            "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+            (account_key_or_email,),
+        ).fetchone()
+        if row is None:
+            # 兜底：老数据可能以裸 email 作 PK 写入
+            email = account_key_or_email.split(":", 1)[1]
+            row = _get_conn().execute(
+                "SELECT * FROM oauth_quota_cache WHERE email=? LIMIT 1",
+                (email,),
+            ).fetchone()
+    else:
+        row = _get_conn().execute(
+            "SELECT * FROM oauth_quota_cache WHERE email=? LIMIT 1",
+            (account_key_or_email,),
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -440,17 +620,79 @@ def quota_load_all() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def quota_delete(email: str) -> None:
+def quota_delete(account_key_or_email: str) -> None:
     with _write_lock:
-        _get_conn().execute(
-            "DELETE FROM oauth_quota_cache WHERE email=?",
-            (email,),
-        )
+        if ":" in account_key_or_email:
+            _get_conn().execute(
+                "DELETE FROM oauth_quota_cache WHERE account_key=?",
+                (account_key_or_email,),
+            )
+        else:
+            _get_conn().execute(
+                "DELETE FROM oauth_quota_cache WHERE email=?",
+                (account_key_or_email,),
+            )
         _get_conn().commit()
 
 
-def quota_save_openai_snapshot(email: str, snap: dict,
-                               normalized: dict | None = None) -> None:
+def quota_patch_passive(account_key: str, patch: dict,
+                        *, email: str | None = None) -> None:
+    """从 Anthropic 响应头采集到的 5h/7d 字段，只更新自己那段。
+
+    与 `quota_save` 的区别：
+      - quota_save 走 INSERT OR REPLACE，写全字段（主动拉 /api/oauth/usage）
+      - quota_patch_passive 走 UPDATE（或 INSERT 兜底），**只动 patch 里列出的列**
+        ；绝不覆盖 sonnet/opus/extra/raw_data（那些响应头没有，保留主动拉的值）
+
+    patch 的 key 必须在白名单内：
+      five_hour_util / five_hour_reset / seven_day_util / seven_day_reset
+    其他 key 会被忽略（保护主动拉写入的字段）。
+
+    若 account_key 行不存在（新账号从未主动拉过），插入一条**只含白名单字段**
+    的行，其余字段全为 NULL，fetched_at=0 作为"未主动同步过"的哨兵值。
+    """
+    ALLOWED = {"five_hour_util", "five_hour_reset",
+               "seven_day_util", "seven_day_reset"}
+    safe = {k: v for k, v in patch.items() if k in ALLOWED}
+    if not safe:
+        return
+    if email is None:
+        email = account_key.split(":", 1)[1] if ":" in account_key else account_key
+    now_ms_val = now_ms()
+
+    with _write_lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            # 不存在 → INSERT 一条，只带白名单字段，其他 NULL
+            cols = ["account_key", "email", "fetched_at", "last_passive_update_at"]
+            vals = [account_key, email, 0, now_ms_val]
+            for k, v in safe.items():
+                cols.append(k)
+                vals.append(v)
+            placeholders = ",".join(["?"] * len(cols))
+            conn.execute(
+                f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
+                vals,
+            )
+        else:
+            # 存在 → UPDATE 白名单字段 + last_passive_update_at
+            set_parts = [f"{k}=?" for k in safe.keys()]
+            set_parts.append("last_passive_update_at=?")
+            vals = list(safe.values()) + [now_ms_val, account_key]
+            conn.execute(
+                f"UPDATE oauth_quota_cache SET {', '.join(set_parts)} WHERE account_key=?",
+                vals,
+            )
+        conn.commit()
+
+
+def quota_save_openai_snapshot(account_key: str, snap: dict,
+                               normalized: dict | None = None,
+                               *, email: str | None = None) -> None:
     """OpenAI (Codex) 专用：保存从响应头解析出的限额 snapshot。
 
     snap: src.oauth.openai.parse_rate_limit_headers 的返回值
@@ -477,10 +719,12 @@ def quota_save_openai_snapshot(email: str, snap: dict,
         ts = now + max(0, int(sec))
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
+    if email is None:
+        email = account_key.split(":", 1)[1] if ":" in account_key else account_key
     with _write_lock:
         _get_conn().execute(
             """INSERT OR REPLACE INTO oauth_quota_cache
-               (email, fetched_at,
+               (account_key, email, fetched_at,
                 five_hour_util, five_hour_reset,
                 seven_day_util, seven_day_reset,
                 sonnet_util, sonnet_reset,
@@ -489,10 +733,10 @@ def quota_save_openai_snapshot(email: str, snap: dict,
                 codex_primary_used_pct, codex_primary_reset_sec, codex_primary_window_min,
                 codex_secondary_used_pct, codex_secondary_reset_sec, codex_secondary_window_min,
                 codex_primary_over_secondary_pct)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                        ?,?,?,?,?,?,?)""",
             (
-                email, fetched_at,
+                account_key, email, fetched_at,
                 normalized.get("five_hour_util"),
                 _reset_iso(normalized.get("five_hour_reset_sec")),
                 normalized.get("seven_day_util"),

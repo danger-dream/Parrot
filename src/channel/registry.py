@@ -88,7 +88,16 @@ def all_channels() -> list[Channel]:
 
 def get_channel(key: str) -> Optional[Channel]:
     with _lock:
-        return _channels.get(key)
+        ch = _channels.get(key)
+        if ch is not None:
+            return ch
+        # 兼容：调用方可能还在传老格式 "oauth:<email>"（不含 provider 段）
+        if key.startswith("oauth:") and key.count(":") == 1:
+            email = key[len("oauth:"):]
+            for c in _channels.values():
+                if getattr(c, "email", None) == email and c.type == "oauth":
+                    return c
+        return None
 
 
 def enabled_channels() -> list[Channel]:

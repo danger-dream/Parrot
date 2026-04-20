@@ -62,15 +62,22 @@ CODEX_CLI_USER_AGENT = "codex_cli_rs/0.104.0"
 
 
 class OpenAIOAuthChannel(Channel):
-    """provider="openai" 的 OAuth 账户。protocol 声明为 openai-responses。"""
+    """provider="openai" 的 OAuth 账户。protocol 声明为 openai-responses。
+
+    上游 chatgpt.com/backend-api/codex/responses 仅支持 SSE 流式，因此
+    upstream_stream_only=True；failover 遇到非流式下游请求会走 SSE 聚合路径。
+    """
 
     type = "oauth"
     cc_mimicry = False                     # 不走 Anthropic CC 伪装
     protocol = "openai-responses"          # 上游走 codex responses
+    upstream_stream_only = True            # chatgpt.com codex 只支持 stream=true
 
     def __init__(self, account: dict, default_models: list[str] | None = None):
+        from ..oauth_ids import account_key as _account_key
         self.email = account["email"]
-        self.key = f"oauth:{self.email}"
+        self.account_key = _account_key(account)   # provider:email
+        self.key = f"oauth:{self.account_key}"
         self.display_name = self.email
         self.enabled = bool(account.get("enabled", True))
         self.disabled_reason = account.get("disabled_reason")
@@ -95,12 +102,23 @@ class OpenAIOAuthChannel(Channel):
 
     # ─── 模型查询 ─────────────────────────────────────────────
 
+    # Codex 模型在不同 plan_type 下的可用性限制。来自上游 400 错误：
+    #   "The 'gpt-5.2-codex' model is not supported when using Codex with a ChatGPT account."
+    # Plus / Pro / Enterprise 的 ChatGPT 账号都算 "ChatGPT account"；只有 API
+    # 账号可以调老 codex 系列。这里硬过滤，避免 scheduler 选中后浪费重试。
+    _CHATGPT_UNSUPPORTED_MODELS = frozenset({"gpt-5.2-codex"})
+
     def supports_model(self, requested_model: str) -> Optional[str]:
         """OpenAI OAuth 账户里 models 列表直接是"真实名"列表（不做 alias 映射）。
 
         codex 规范化放在 build_upstream_request 的 transform 步骤里做。
         """
-        return requested_model if requested_model in self.models else None
+        if requested_model not in self.models:
+            return None
+        # ChatGPT 账号（plan_type 非空）不能调 _CHATGPT_UNSUPPORTED_MODELS 里的模型
+        if self.plan_type and requested_model in self._CHATGPT_UNSUPPORTED_MODELS:
+            return None
+        return requested_model
 
     def list_client_models(self) -> list[str]:
         return list(self.models)
@@ -153,7 +171,7 @@ class OpenAIOAuthChannel(Channel):
         )
 
         # Step C: 拿 access_token（会在此触发 refresh if 过期）
-        access_token = await oauth_manager.ensure_valid_token(self.email)
+        access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
         headers = self._build_headers(access_token)
         # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
@@ -218,7 +236,7 @@ class OpenAIOAuthChannel(Channel):
             snap = openai_provider.parse_rate_limit_headers(mock_headers)
             if snap:
                 normalized = openai_provider.normalize_codex_snapshot(snap)
-                state_db.quota_save_openai_snapshot(self.email, snap, normalized)
+                state_db.quota_save_openai_snapshot(self.account_key, snap, normalized, email=self.email)
             return {"ok": True, "reason": "mock"}
 
         if not self.chatgpt_account_id:
@@ -262,7 +280,7 @@ class OpenAIOAuthChannel(Channel):
         if snap:
             normalized = openai_provider.normalize_codex_snapshot(snap)
             try:
-                state_db.quota_save_openai_snapshot(self.email, snap, normalized)
+                state_db.quota_save_openai_snapshot(self.account_key, snap, normalized, email=self.email)
             except Exception as exc:
                 return {"ok": False, "reason": f"quota write: {exc}"}
 

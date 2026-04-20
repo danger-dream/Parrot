@@ -24,6 +24,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ... import affinity, config, cooldown, log_db, oauth_manager, state_db
+from ...oauth_ids import account_key as _account_key, split_account_key as _split_ak
 from ...oauth import openai as openai_provider
 from .. import states, ui
 from . import main as main_menu
@@ -31,6 +32,20 @@ from . import main as main_menu
 
 _BJT = timezone(timedelta(hours=8))
 
+
+
+
+def _resolve_to_account_key(resolved):
+    """short code 解析后可能是 account_key 或纯 email（历史/测试遗留）。
+    纯 email 时回查 config 自动补 provider。"""
+    if resolved is None:
+        return None
+    if ":" in resolved:
+        return resolved
+    for acc in oauth_manager.list_accounts():
+        if acc.get("email") == resolved:
+            return _account_key(acc)
+    return resolved
 
 # ─── 辅助：异步调用在线程里运行 ───────────────────────────────────
 
@@ -106,6 +121,7 @@ def _format_account_block(acc: dict) -> str:
           💎 月度统计: ↑ 104.71M ↓ 1.78M · 缓存率 95.71%
     """
     email = acc.get("email", "?")
+    ak = _account_key(acc)
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason")
     tag = ""
@@ -135,7 +151,7 @@ def _format_account_block(acc: dict) -> str:
         )
 
     # 用量（5h / 7d，列成两行，各带绝对重置时间）
-    row = state_db.quota_load(email)
+    row = state_db.quota_load(ak)
     if row:
         fh_util = row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
@@ -161,7 +177,7 @@ def _format_account_block(acc: dict) -> str:
     # 月度统计（本月 log_db 聚合）
     try:
         since_ts = _this_month_start_ts()
-        ts = log_db.tokens_for_channel(f"oauth:{email}", since_ts=since_ts)
+        ts = log_db.tokens_for_channel(f"oauth:{ak}", since_ts=since_ts)
     except Exception:
         ts = None
     if ts and ts["total"] > 0:
@@ -178,11 +194,25 @@ def _format_account_block(acc: dict) -> str:
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
 
+    # 冷却状态（该账号下所有模型聚合）：简短提示；详情在详情页展开
+    from ... import cooldown as _cd
+    ck = f"oauth:{ak}"
+    cds = [e for e in _cd.active_entries() if e.get("channel_key") == ck]
+    if cds:
+        perm_n = sum(1 for e in cds if e.get("cooldown_until") == -1)
+        cool_n = len(cds) - perm_n
+        parts = []
+        if perm_n:
+            parts.append(f"🔴 永久冻结 {perm_n} 个模型")
+        if cool_n:
+            parts.append(f"🟠 冷却 {cool_n} 个模型")
+        lines.append("  ⚠ " + " · ".join(parts))
+
     return "\n".join(lines)
 
 
-def _format_usage_block(email: str) -> str:
-    row = state_db.quota_load(email)
+def _format_usage_block(account_key: str) -> str:
+    row = state_db.quota_load(account_key)
     if not row:
         return "尚未获取用量（点「刷新用量」试试）"
 
@@ -205,19 +235,19 @@ def _format_usage_block(email: str) -> str:
         if line:
             out.append(line)
 
-    # OpenAI Codex 原始 primary/secondary 窗口（用于排查，按需显示）
+    # OpenAI Codex 原始窗口（primary/secondary）：用量值与上方 5h/7d 一致，但展示
+    # 原始窗口时长（分钟）让 admin 能看到源数据（例如 primary=10080min=7d，secondary=300min=5h）。
     codex_primary_pct = row.get("codex_primary_used_pct")
     codex_primary_win = row.get("codex_primary_window_min")
     codex_secondary_pct = row.get("codex_secondary_used_pct")
     codex_secondary_win = row.get("codex_secondary_window_min")
     if codex_primary_pct is not None or codex_secondary_pct is not None:
-        out.append("<i>── Codex 原始窗口 ──</i>")
-        if codex_primary_pct is not None:
-            win = f"{codex_primary_win}min" if codex_primary_win else "?"
-            out.append(f"primary ({win}): {codex_primary_pct:.0f}%")
-        if codex_secondary_pct is not None:
-            win = f"{codex_secondary_win}min" if codex_secondary_win else "?"
-            out.append(f"secondary ({win}): {codex_secondary_pct:.0f}%")
+        out.append("")
+        out.append("Codex 原始窗口:")
+        if codex_primary_pct is not None and codex_primary_win:
+            out.append(f"  primary ({codex_primary_win}min): {codex_primary_pct:.0f}%")
+        if codex_secondary_pct is not None and codex_secondary_win:
+            out.append(f"  secondary ({codex_secondary_win}min): {codex_secondary_pct:.0f}%")
 
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
@@ -237,17 +267,31 @@ def _format_usage_block(email: str) -> str:
 def _list_text_and_kb() -> tuple[str, dict]:
     accounts = oauth_manager.list_accounts()
     # 按访问节流刷新所有账户的 usage（quotaMonitor.enabled=True 时内部跳过）
-    emails = [
-        a.get("email") for a in accounts
+    account_keys = [
+        _account_key(a) for a in accounts
         if a.get("email") and not a.get("disabled_reason")
     ]
-    if emails:
-        oauth_manager.ensure_quota_fresh_sync(emails)
+    if account_keys:
+        oauth_manager.ensure_quota_fresh_sync(account_keys)
     total = len(accounts)
     normal = sum(1 for a in accounts if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "quota")
     user_disabled = sum(1 for a in accounts if a.get("disabled_reason") == "user")
     auth_err = sum(1 for a in accounts if a.get("disabled_reason") == "auth_error")
+
+    # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
+    from ... import cooldown as _cd
+    cd_keys_any: set[str] = set()
+    cd_keys_perm: set[str] = set()
+    for e in _cd.active_entries():
+        ck = e.get("channel_key", "")
+        if not ck.startswith("oauth:"):
+            continue
+        cd_keys_any.add(ck)
+        if e.get("cooldown_until") == -1:
+            cd_keys_perm.add(ck)
+    cooling_only = len(cd_keys_any - cd_keys_perm)
+    permanent = len(cd_keys_perm)
 
     summary = (
         f"🔐 <b>OAuth 账户管理</b>\n"
@@ -255,6 +299,8 @@ def _list_text_and_kb() -> tuple[str, dict]:
         + (f" | 配额 {quota_disabled}" if quota_disabled else "")
         + (f" | 用户禁用 {user_disabled}" if user_disabled else "")
         + (f" | 认证失败 {auth_err}" if auth_err else "")
+        + (f" | ⚠ 冷却 {cooling_only}" if cooling_only else "")
+        + (f" | 🔴 永久 {permanent}" if permanent else "")
     )
 
     if not accounts:
@@ -274,12 +320,19 @@ def _list_text_and_kb() -> tuple[str, dict]:
     rows: list[list[dict]] = []
     for acc in accounts:
         email = acc.get("email", "?")
-        short = ui.register_code(email)
-        rows.append([ui.btn(f"  {email}  ", f"oa:view:{short}")])
+        ak = _account_key(acc)
+        short = ui.register_code(ak)
+        # 按钮文本仍用 email（+ provider tag 让同邮箱双账号可区分）
+        prov = oauth_manager.provider_of(acc)
+        tag = " 🅾" if prov == "openai" else (" 🅰" if prov == "claude" else "")
+        rows.append([ui.btn(f"  {email}{tag}  ", f"oa:view:{short}")])
     rows.append([
         ui.btn("➕ 新增账户", "oa:add"),
         ui.btn("🔄 刷新全部用量", "oa:refresh_all"),
     ])
+    # 只有存在 OAuth 账号的冷却条目时才显示"清除所有错误"（避免空操作按钮）
+    if cd_keys_any:
+        rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", "oa:clear_all_errors")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.truncate(text), ui.inline_kb(rows)
 
@@ -298,9 +351,9 @@ def send_new(chat_id: int) -> None:
 
 # ─── 账户详情 ─────────────────────────────────────────────────────
 
-def _format_month_stats_block(email: str) -> str:
+def _format_month_stats_block(account_key: str) -> str:
     """本月使用统计：总体 + 按模型展开。无数据时返回空字符串。"""
-    ck = f"oauth:{email}"
+    ck = f"oauth:{account_key}"
     since_ts = _this_month_start_ts()
     try:
         overall = log_db.tokens_for_channel(ck, since_ts=since_ts)
@@ -349,14 +402,14 @@ def _format_month_stats_block(email: str) -> str:
     return "\n".join(lines)
 
 
-def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
-    acc = oauth_manager.get_account(email)
+def _detail_text_and_kb(account_key: str) -> tuple[Optional[str], Optional[dict]]:
+    acc = oauth_manager.get_account(account_key)
     if acc is None:
         return None, None
+    email = acc.get("email", "?")
 
-    # 详情页按访问节流刷新 usage（quotaMonitor.enabled=True 时内部跳过）
     if not acc.get("disabled_reason"):
-        oauth_manager.ensure_quota_fresh_sync(email)
+        oauth_manager.ensure_quota_fresh_sync(account_key)
 
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason") or "—"
@@ -364,29 +417,29 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
     provider_line = ""
     if prov == "openai":
         plan = acc.get("plan_type") or "?"
-        acct_id = acc.get("chatgpt_account_id") or "?"
         provider_line = (
-            f"Provider: <code>🅾 OpenAI (Codex)</code> · plan: <code>{ui.escape_html(plan)}</code>\n"
-            f"Account ID: <code>{ui.escape_html(acct_id)}</code>\n"
+            f"提供者: <code>🅾 OpenAI (Codex)</code> · 计划: <code>{ui.escape_html(plan)}</code>\n"
         )
+    elif prov == "claude":
+        provider_line = f"提供者: <code>🅰 Anthropic (Claude)</code>\n"
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b>\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
         f"{provider_line}"
         f"过期: <code>{_format_bjt(acc.get('expired'))}</code> ({_format_remaining(acc.get('expired'))})\n"
         f"上次刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
-        f"<b>📊 使用量</b>\n{_format_usage_block(email)}"
+        f"<b>📊 使用量</b>\n{_format_usage_block(account_key)}"
     )
-    month_block = _format_month_stats_block(email)
+    month_block = _format_month_stats_block(account_key)
     if month_block:
         text += "\n" + month_block
 
-    short = ui.register_code(email)
+    short = ui.register_code(account_key)
     enabled = acc.get("enabled", True) and not acc.get("disabled_reason")
     toggle_label = "🚫 禁用" if enabled else "✅ 启用"
 
-    # 显示当前模型的冷却状态（让 admin 直观判断需不需要清错误）
-    ck = f"oauth:{email}"
+    # 显示当前模型的冷却状态
+    ck = f"oauth:{account_key}"
     cd_models = [e for e in cooldown.active_entries() if e["channel_key"] == ck]
     if cd_models:
         text += "\n\n<b>⚠ 冷却中的模型：</b>\n"
@@ -414,14 +467,15 @@ def _detail_text_and_kb(email: str) -> tuple[Optional[str], Optional[dict]]:
 
 
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效，请返回重试")
         show(chat_id, message_id)
         return
     ui.answer_cb(cb_id)
-    text, kb = _detail_text_and_kb(email)
+    text, kb = _detail_text_and_kb(ak)
     if text is None:
+        _, email = _split_ak(ak)
         ui.edit(chat_id, message_id,
                 f"⚠ 账户 <code>{ui.escape_html(email)}</code> 已不存在",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:oauth")]]))
@@ -432,25 +486,24 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 # ─── 刷新 Token ──────────────────────────────────────────────────
 
 def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
     ui.answer_cb(cb_id, "刷新中...")
 
-    result = _run_sync(oauth_manager.force_refresh(email))
+    result = _run_sync(oauth_manager.force_refresh(ak))
     if isinstance(result, Exception):
         ui.send(chat_id, f"❌ 刷新失败: <code>{ui.escape_html(str(result))}</code>")
         return
 
-    # 顺便刷新用量写入缓存。OpenAI 没有独立 usage 端点（响应头路径），跳过。
-    if oauth_manager.provider_of(email) != "openai":
-        usage_result = _run_sync(oauth_manager.fetch_usage(email))
+    _, email = _split_ak(ak)
+    if oauth_manager.provider_of(ak) != "openai":
+        usage_result = _run_sync(oauth_manager.fetch_usage(ak))
         if not isinstance(usage_result, Exception):
-            state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
+            state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
 
-    # 重渲染详情
-    text, kb = _detail_text_and_kb(email)
+    text, kb = _detail_text_and_kb(ak)
     if text:
         ui.edit(chat_id, message_id,
                 "✅ Token 已刷新\n\n" + text,
@@ -460,29 +513,22 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str) -> N
 # ─── 刷新用量 ─────────────────────────────────────────────────────
 
 def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    # OpenAI 没有独立 usage 端点，改为主动发一条最小 codex 探测请求：
-    #   1) force_refresh 先强制刷一次 token（更新 expired / last_refresh /
-    #      id_token 里的 plan_type / chatgpt_account_id / organization_id）
-    #   2) OpenAIOAuthChannel.probe_usage 发最小 codex 请求，读响应头的
-    #      x-codex-* 字段 → quota_save_openai_snapshot
-    # 探测会消耗少量 codex token（几到几十 output token），用户主动点。
-    if oauth_manager.provider_of(email) == "openai":
+    _, email = _split_ak(ak)
+    if oauth_manager.provider_of(ak) == "openai":
         from ...channel import registry
         from ...channel.openai_oauth_channel import OpenAIOAuthChannel
 
         ui.answer_cb(cb_id, "刷新 Token 并发送探测请求...")
-        # Step 1: force_refresh
-        tr = _run_sync(oauth_manager.force_refresh(email))
+        tr = _run_sync(oauth_manager.force_refresh(ak))
         if isinstance(tr, Exception):
             ui.send(chat_id,
                     f"❌ 刷新 Token 失败: <code>{ui.escape_html(str(tr))}</code>")
             return
-        # Step 2: probe
-        ch = registry.get_channel(f"oauth:{email}")
+        ch = registry.get_channel(f"oauth:{ak}")
         if not isinstance(ch, OpenAIOAuthChannel):
             ui.send(chat_id, "❌ 账户未注册为 OpenAI OAuth 渠道")
             return
@@ -490,7 +536,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
         if isinstance(pr, Exception):
             ui.send(chat_id, f"❌ 探测失败: <code>{ui.escape_html(str(pr))}</code>")
             return
-        text, kb = _detail_text_and_kb(email)
+        text, kb = _detail_text_and_kb(ak)
         if pr.get("ok"):
             head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
         else:
@@ -502,13 +548,13 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
         return
     ui.answer_cb(cb_id, "拉取中...")
 
-    usage_result = _run_sync(oauth_manager.fetch_usage(email))
+    usage_result = _run_sync(oauth_manager.fetch_usage(ak))
     if isinstance(usage_result, Exception):
         ui.send(chat_id, f"❌ 获取用量失败: <code>{ui.escape_html(str(usage_result))}</code>")
         return
-    state_db.quota_save(email, oauth_manager.flatten_usage(usage_result))
+    state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
 
-    text, kb = _detail_text_and_kb(email)
+    text, kb = _detail_text_and_kb(ak)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -516,25 +562,25 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str) -> N
 # ─── 清错误 / 清亲和 ─────────────────────────────────────────────
 
 def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    cooldown.clear(f"oauth:{email}", model=None)
+    cooldown.clear(f"oauth:{ak}", model=None)
     ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
-    text, kb = _detail_text_and_kb(email)
+    text, kb = _detail_text_and_kb(ak)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    affinity.delete_by_channel(f"oauth:{email}")
+    affinity.delete_by_channel(f"oauth:{ak}")
     ui.answer_cb(cb_id, "已清亲和")
-    text, kb = _detail_text_and_kb(email)
+    text, kb = _detail_text_and_kb(ak)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -542,11 +588,11 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str) -> 
 # ─── 启用 / 禁用 ──────────────────────────────────────────────────
 
 def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    acc = oauth_manager.get_account(email)
+    acc = oauth_manager.get_account(ak)
     if acc is None:
         ui.answer_cb(cb_id, "账户不存在")
         show(chat_id, message_id)
@@ -554,13 +600,13 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 
     enabled = acc.get("enabled", True) and not acc.get("disabled_reason")
     if enabled:
-        oauth_manager.set_enabled(email, False, reason="user")
+        oauth_manager.set_enabled(ak, False, reason="user")
         ui.answer_cb(cb_id, "已禁用")
     else:
-        oauth_manager.set_enabled(email, True)
+        oauth_manager.set_enabled(ak, True)
         ui.answer_cb(cb_id, "已启用")
 
-    text, kb = _detail_text_and_kb(email)
+    text, kb = _detail_text_and_kb(ak)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -568,14 +614,17 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 # ─── 删除（二次确认） ─────────────────────────────────────────────
 
 def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
+    _, email = _split_ak(ak)
+    prov = oauth_manager.provider_of(ak)
+    prov_tag = "🅾 OpenAI" if prov == "openai" else "🅰 Claude"
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        f"确认删除账户 <code>{ui.escape_html(email)}</code>？\n"
+        f"确认删除账户 <code>{ui.escape_html(email)}</code>（{prov_tag}）？\n"
         f"⚠ 该操作将清除此账户的所有统计与亲和绑定数据。",
         reply_markup=ui.inline_kb([[
             ui.btn("✅ 确认删除", f"oa:delete_exec:{short}"),
@@ -585,13 +634,14 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str) -> None
 
 
 def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    email = ui.resolve_code(short)
-    if email is None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id)
         return
+    _, email = _split_ak(ak)
     try:
-        oauth_manager.delete_account(email)
+        oauth_manager.delete_account(ak)
     except Exception as exc:
         ui.answer_cb(cb_id, "删除失败")
         ui.send(chat_id, f"❌ 删除失败: <code>{ui.escape_html(str(exc))}</code>")
@@ -617,14 +667,13 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
         email = acc.get("email")
         if not email:
             continue
+        ak = _account_key(acc)
         if oauth_manager.provider_of(acc) == "openai":
-            # 1) 强制刷 token，更新 expired / last_refresh / id_token metadata
-            tr = _run_sync(oauth_manager.force_refresh(email))
+            tr = _run_sync(oauth_manager.force_refresh(ak))
             if isinstance(tr, Exception):
                 openai_fail += 1
                 continue
-            # 2) 发探测请求拉响应头 → 更新 quota_cache
-            ch = registry.get_channel(f"oauth:{email}")
+            ch = registry.get_channel(f"oauth:{ak}")
             if not isinstance(ch, OpenAIOAuthChannel):
                 openai_fail += 1
                 continue
@@ -634,11 +683,11 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
             else:
                 openai_ok += 1
             continue
-        result = _run_sync(oauth_manager.fetch_usage(email))
+        result = _run_sync(oauth_manager.fetch_usage(ak))
         if isinstance(result, Exception):
             fail += 1
             continue
-        state_db.quota_save(email, oauth_manager.flatten_usage(result))
+        state_db.quota_save(ak, oauth_manager.flatten_usage(result), email=email)
         ok += 1
     show(chat_id, message_id)
     parts = []
@@ -1072,12 +1121,30 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
 
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
+def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str) -> None:
+    """清除所有 OAuth 账户的模型冷却（按 oauth: 前缀批量 clear）。"""
+    from ... import cooldown as _cd
+    cd_keys = sorted({
+        e["channel_key"] for e in _cd.active_entries()
+        if e.get("channel_key", "").startswith("oauth:")
+    })
+    cleared = 0
+    for ck in cd_keys:
+        _cd.clear(ck, model=None)
+        cleared += 1
+    ui.answer_cb(cb_id, f"已清除 {cleared} 个账户的冷却")
+    show(chat_id, message_id)
+
+
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
     if data == "menu:oauth":
         show(chat_id, message_id, cb_id)
         return True
     if data == "oa:refresh_all":
         on_refresh_all(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:clear_all_errors":
+        on_clear_all_errors(chat_id, message_id, cb_id)
         return True
     if data == "oa:add":
         on_add_menu(chat_id, message_id, cb_id)

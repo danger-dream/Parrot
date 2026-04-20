@@ -745,6 +745,29 @@ def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
 
 # ─── 查询 ──────────────────────────────────────────────────────────
 
+
+# 家族过滤 SQL 片段：当 family 指定时返回 `AND upstream_protocol IN (...)`，否则空串。
+# upstream_protocol 由 finish_success / finish_error 写入；pending / 未落盘的请求
+# 归类会缺失（它们也确实没真正产生流量），因此家族聚合的 total 会比不过滤时略小。
+_FAMILY_UPSTREAM: dict[str, tuple[str, ...]] = {
+    "anthropic": ("anthropic",),
+    "openai":    ("openai-chat", "openai-responses"),
+}
+
+
+def _family_where(family: str | None) -> str:
+    if not family or family not in _FAMILY_UPSTREAM:
+        return ""
+    protos = _FAMILY_UPSTREAM[family]
+    placeholders = ",".join("?" * len(protos))
+    return f" AND upstream_protocol IN ({placeholders})"
+
+
+def _family_params(family: str | None) -> tuple:
+    if not family or family not in _FAMILY_UPSTREAM:
+        return ()
+    return _FAMILY_UPSTREAM[family]
+
 _RECENT_COLS = (
     "request_id, created_at, api_key_name, requested_model, "
     "final_channel_key, final_channel_type, final_model, "
@@ -888,6 +911,7 @@ def stats_summary(
     group_by: str | None = None,
     summary_top_limit: int = 3,
     group_limit: int = 10,
+    family: str | None = None,
 ) -> dict:
     """跨月统计聚合。
 
@@ -931,9 +955,9 @@ def stats_summary(
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
                  {_tps_agg_sql()}
-               FROM request_log WHERE created_at >= ?
+               FROM request_log WHERE created_at >= ?{_family_where(family)}
                GROUP BY grp_key""",
-            (since_ts,),
+            (since_ts, *_family_params(family)),
         ).fetchall()
         for r in rows:
             k = r["grp_key"] or "?"
@@ -965,8 +989,8 @@ def stats_summary(
                      SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
                      SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total,
                      {_tps_agg_sql()}
-                   FROM request_log WHERE created_at >= ?""",
-                (since_ts,),
+                   FROM request_log WHERE created_at >= ?{_family_where(family)}""",
+                (since_ts, *_family_params(family)),
             ).fetchone()
             _accumulate(overall_agg, row)
             _merge_tps(overall_agg, row)
@@ -978,18 +1002,19 @@ def stats_summary(
 
             for r in conn.execute(
                 """SELECT created_at, api_key_name, requested_model,
-                          final_channel_key, error_message
-                   FROM request_log WHERE status='error' AND created_at >= ?
-                   ORDER BY created_at DESC LIMIT 5""",
-                (since_ts,),
+                          final_channel_key, error_message,
+                          ingress_protocol, upstream_protocol
+                   FROM request_log WHERE status='error' AND created_at >= ?{_family_where_sql}
+                   ORDER BY created_at DESC LIMIT 5""".format(_family_where_sql=_family_where(family)),
+                (since_ts, *_family_params(family)),
             ).fetchall():
                 recent_errors.append(dict(r))
 
             for r in conn.execute(
                 f"""SELECT {_RECENT_COLS}
-                   FROM request_log WHERE created_at >= ?
+                   FROM request_log WHERE created_at >= ?{_family_where(family)}
                    ORDER BY created_at DESC LIMIT 3""",
-                (since_ts,),
+                (since_ts, *_family_params(family)),
             ).fetchall():
                 recent_calls.append(dict(r))
 
@@ -1002,9 +1027,9 @@ def stats_summary(
                           connect_time_ms, first_token_time_ms, total_time_ms,
                           retry_count, affinity_hit
                    FROM request_log
-                   WHERE created_at >= ? AND status='success' AND cache_read_tokens=0
-                   ORDER BY created_at DESC LIMIT 3""",
-                (since_ts,),
+                   WHERE created_at >= ?{_family_where_sql} AND status='success' AND cache_read_tokens=0
+                   ORDER BY created_at DESC LIMIT 3""".format(_family_where_sql=_family_where(family)),
+                (since_ts, *_family_params(family)),
             ).fetchall():
                 recent_cache_misses.append(dict(r))
     finally:

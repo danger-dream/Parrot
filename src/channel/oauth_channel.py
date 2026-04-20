@@ -17,8 +17,10 @@ class OAuthChannel(Channel):
     protocol = "anthropic"  # OAuth 永远是 anthropic 家族，显式声明
 
     def __init__(self, account: dict, default_models: list[str]):
+        from ..oauth_ids import account_key as _account_key
         self.email = account["email"]
-        self.key = f"oauth:{self.email}"
+        self.account_key = _account_key(account)   # provider:email
+        self.key = f"oauth:{self.account_key}"
         self.display_name = self.email
         self.enabled = bool(account.get("enabled", True))
         self.disabled_reason = account.get("disabled_reason")
@@ -38,7 +40,7 @@ class OAuthChannel(Channel):
     ) -> UpstreamRequest:
         _ = ingress_protocol  # OAuth 只服务 /v1/messages，忽略
         # OAuth：确保 token 有效 → 走完整 CC 伪装 → 拼 OAuth headers
-        access_token = await oauth_manager.ensure_valid_token(self.email)
+        access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
         body_with_model = {**requested_body, "model": resolved_model}
         payload, dynamic_map = cc_mimicry.transform_request(body_with_model, email=self.email)

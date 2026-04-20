@@ -1,4 +1,4 @@
-"""anthropic-proxy 主入口（M4：调度 + 故障转移接入完成）。
+"""Parrot 主入口（多家族 AI 协议代理）。
 
 启动时：
   - 加载配置、state.db、logs/YYYY-MM.db
@@ -118,6 +118,30 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[oauth] provider field migration failed: {exc}")
 
+    # 联合主键迁移：email → account_key (=f"{provider}:{email}")。幂等，已迁移过直接跳过。
+    try:
+        # 迁移前备份 state.db 做保险（已存在备份则不覆盖）
+        import os as _os, shutil as _shutil
+        _src = state_db._db_path
+        _bak = (_src or "") + ".pre_composite_key.bak"
+        if _src and _os.path.exists(_src) and not _os.path.exists(_bak):
+            try:
+                _shutil.copy2(_src, _bak)
+                print(f"[state_db] backup created: {_bak}")
+            except Exception as _exc:
+                print(f"[state_db] backup failed (continuing): {_exc}")
+        _ck_result = oauth_manager.bootstrap_composite_key_migration()
+        if _ck_result.get("skipped"):
+            print(f"[oauth] composite-key migration: skipped ({_ck_result.get('reason')})")
+        else:
+            print(
+                f"[oauth] composite-key migration: quota_rows={_ck_result['migrated_quota_rows']},"
+                f" channel_rows={_ck_result['migrated_channel_rows']}"
+            )
+    except Exception as _exc:
+        print(f"[oauth] composite-key migration FAILED: {_exc}")
+        raise
+
     # 内存表从 state.db 恢复
     affinity.init()
     cooldown.init()
@@ -150,7 +174,7 @@ async def lifespan(app: FastAPI):
         tgbot.init(tg_token, tg_admins)
         tgbot.start()
 
-    print("anthropic-proxy (M10: all menus ready)")
+    print("Parrot 🦜 (multi-family AI protocol proxy) ready")
     print(f"  device_id: {DEVICE_ID[:16]}...")
     print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
     print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
@@ -254,7 +278,7 @@ async def health():
         },
         "affinity_bound": affinity.count(),
         "device_id": DEVICE_ID[:16] + "...",
-        "version": "anthropic-proxy",
+        "version": "parrot",
     }
 
 

@@ -425,6 +425,35 @@ def fmt_bjt_ts(ts: float, pattern: str = "%m-%d %H:%M:%S") -> str:
     return datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime(pattern)
 
 
+# ─── 家族识别 / 展示 ─────────────────────────────────────────────
+# upstream_protocol / channel.protocol → 家族（"anthropic" / "openai" / None）
+# 用于状态总览 / 统计汇总的家族分段展示。
+
+ANTHROPIC_PROTOCOLS = frozenset({"anthropic"})
+OPENAI_PROTOCOLS = frozenset({"openai-chat", "openai-responses"})
+
+
+def family_of(protocol: Optional[str]) -> Optional[str]:
+    if not protocol:
+        return None
+    if protocol in ANTHROPIC_PROTOCOLS:
+        return "anthropic"
+    if protocol in OPENAI_PROTOCOLS:
+        return "openai"
+    return None
+
+
+FAMILY_ICON = {"anthropic": "🅰", "openai": "🅾"}
+FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI"}
+
+
+def family_tag(family: Optional[str]) -> str:
+    """统一的家族前缀标签，格式：🅰 Anthropic"""
+    if not family:
+        return ""
+    return f"{FAMILY_ICON.get(family, '?')} {FAMILY_LABEL.get(family, family)}"
+
+
 # ─── 通知钩子：把 notifier.notify 转发到管理员 ──────────────────
 
 def install_notify_handler() -> None:

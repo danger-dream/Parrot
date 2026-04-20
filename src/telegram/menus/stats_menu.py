@@ -52,7 +52,14 @@ def _channel_icon(key: str) -> str:
 
 
 def _ch_short_name(key: str) -> str:
-    """oauth:foo@bar → foo@bar；api:智谱 → 智谱。"""
+    """oauth:claude:foo@bar → foo@bar 🅰；oauth:openai:foo@bar → foo@bar 🅾；api:智谱 → 智谱。"""
+    if key.startswith("oauth:"):
+        body = key[len("oauth:"):]
+        if ":" in body:
+            prov, email = body.split(":", 1)
+            tag = " 🅾" if prov == "openai" else (" 🅰" if prov == "claude" else "")
+            return f"{email}{tag}"
+        return body  # 兜底：老格式 oauth:<email>
     if ":" in key:
         return key.split(":", 1)[1]
     return key
@@ -260,7 +267,9 @@ def _section_recent_calls(calls: list[dict]) -> str:
         ts = ui.fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
         icon = {"success": "✅", "error": "❌", "pending": "⏳"}.get(r.get("status"), "?")
         model = ui.escape_html(r.get("requested_model") or "?")
-        out.append(f"\n<code>[{ts}]</code> {icon} {model}")
+        fam_icon = _protocol_icon(r.get("upstream_protocol"))
+        fam_suffix = f" {fam_icon}" if fam_icon else ""
+        out.append(f"\n<code>[{ts}]</code> {icon} {model}{fam_suffix}")
         if r.get("final_channel_key"):
             out.append(f"  渠道: <code>{ui.escape_html(_ch_short_name(r['final_channel_key']))}</code>")
         if r.get("status") == "success":
@@ -290,51 +299,189 @@ def _section_recent_calls(calls: list[dict]) -> str:
     return "\n".join(out)
 
 
-# ─── 组装：汇总 / 专题 ───────────────────────────────────────────
+# ─── 家族分段（新）────────────────────────────────────────────────
 
-def _render_overall(result: dict, period: str,
-                    model_channels: dict[str, list[dict]] | None = None) -> str:
-    """汇总视图：cc-proxy 风格 + 三维度 Top 3 + 未命中样本 + 最近调用。"""
-    sep = "─" * 18
-    sections = [
-        f"📊 <b>统计 — {_PERIOD_LABELS.get(period, period)}</b>",
-        sep,
-        _section_overall(result.get("overall") or {}),
+def _protocol_icon(proto: str | None) -> str:
+    """根据 upstream_protocol 返回家族图标（recent_calls / recent_errors 末尾展示）。"""
+    fam = ui.family_of(proto)
+    if not fam:
+        return ""
+    return ui.FAMILY_ICON.get(fam, "")
+
+
+def _section_overall_compact(overall: dict) -> str:
+    """家族段内的精简 overall：单家族数据精炼到 5 行以内。
+
+    与 _section_overall 区别：
+      - 省略单独的 Tokens 段（合并到请求行）
+      - 省略缓存详细段（仅保留命中率）
+      - 保留重试 / 亲和（两家族对称）
+    """
+    total = int(overall.get("total") or 0)
+    succ = int(overall.get("success_count") or 0)
+    err = int(overall.get("error_count") or 0)
+    pend = int(overall.get("pending_count") or 0)
+    raw_inp = int(overall.get("total_input_tokens") or 0)
+    raw_out = int(overall.get("total_output_tokens") or 0)
+    raw_cc = int(overall.get("total_cache_creation") or 0)
+    raw_cr = int(overall.get("total_cache_read") or 0)
+    total_inp = raw_inp + raw_cc + raw_cr
+
+    total_retries = int(overall.get("total_retries") or 0)
+    retried = int(overall.get("retried_requests") or 0)
+    affinity_hits = int(overall.get("affinity_hits") or 0)
+    succ_hit = int(overall.get("success_with_cache_hit") or 0)
+
+    avg_first = overall.get("avg_first_token_ms")
+    avg_total = overall.get("avg_total_ms")
+    avg_tps = overall.get("avg_tps")
+
+    # 请求行 + 成功率
+    lines = [
+        f"请求 {total} · ✅ {succ} · ❌ {err}"
+        + (f" · ⏳ {pend}" if pend else "")
+        + f" · 成功率 {ui.fmt_rate(succ, total)}",
     ]
+    # Tokens 行
+    lines.append(
+        f"↑ {ui.fmt_tokens(total_inp)} · ↓ {ui.fmt_tokens(raw_out)}"
+        + (f" · cache {ui.fmt_tokens(raw_cr)} ({ui.fmt_rate(raw_cr, total_inp)})" if raw_cr else "")
+    )
+    # 耗时 / 速度
+    timing_bits = []
+    if avg_first is not None:
+        timing_bits.append(f"首字 {ui.fmt_ms(avg_first)}")
+    if avg_total is not None:
+        timing_bits.append(f"总 {ui.fmt_ms(avg_total)}")
+    if avg_tps is not None:
+        timing_bits.append(f"⚡ {ui.fmt_tps(avg_tps)}")
+    if timing_bits:
+        lines.append(" · ".join(timing_bits))
+    # 缓存命中 + 重试 + 亲和（两家族对称；值为 0 也展示，保持对照）
+    if total > 0:
+        extras = [f"缓存 {ui.fmt_rate(succ_hit, succ)}"]
+        if total_retries > 0:
+            extras.append(f"重试 {total_retries} 次 ({retried}/{total})")
+        else:
+            extras.append("重试 0")
+        extras.append(f"亲和 {ui.fmt_rate(affinity_hits, total)}")
+        lines.append(" · ".join(extras))
+    return "\n".join(lines)
+
+
+def _section_family(family: str, result: dict,
+                    model_channels: dict[str, list[dict]] | None = None) -> str:
+    """单个家族完整段：overall + by_channel Top3 + by_model Top3。"""
+    overall = result.get("overall") or {}
+    if int(overall.get("total") or 0) == 0:
+        return ""  # 没流量不展示
+
+    tag = ui.family_tag(family)
+    parts = [f"<b>{tag}</b>", _section_overall_compact(overall)]
 
     by_channel = _strip_unknown(result.get("by_channel") or [])
     if by_channel:
         block = _summary_dim_block(
             "按渠道 Top",
-            by_channel,
+            by_channel[:3],
             lambda k: f"{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
         )
-        sections.append("")
-        sections.append(block)
+        parts.append("")
+        parts.append(block)
 
     by_model = _strip_unknown(result.get("by_model") or [])
     if by_model:
         mc = model_channels or {}
         block = _summary_dim_block(
-            "按模型 Top", by_model,
+            "按模型 Top",
+            by_model[:3],
             lambda k: f"<code>{ui.escape_html(k)}</code>",
             extra_line=lambda k: (
                 "所属: " + _render_model_channels(mc.get(k) or [])
                 if mc.get(k) else ""
             ),
         )
-        sections.append("")
-        sections.append(block)
+        parts.append("")
+        parts.append(block)
 
+    return "\n".join(parts)
+
+
+def _render_key_family_split(apikey: str, anth_total: int, oai_total: int) -> str:
+    """按 Key Top 每条的家族细分小字：🅰 X 次 · 🅾 Y 次"""
+    bits = []
+    if anth_total > 0:
+        bits.append(f"🅰 {anth_total} 次")
+    if oai_total > 0:
+        bits.append(f"🅾 {oai_total} 次")
+    return " · ".join(bits)
+
+
+# ─── 组装：汇总 / 专题 ───────────────────────────────────────────
+
+def _render_overall(result: dict, period: str,
+                    model_channels: dict[str, list[dict]] | None = None,
+                    family_results: dict | None = None,
+                    key_family_split: dict | None = None) -> str:
+    """汇总视图：两家族分段 + 跨家族 Key Top + 最近调用 / 未命中样本。
+
+    布局：
+      📊 统计 — 今天
+      ──────────────
+      🅰 Anthropic            ← 家族段（overall 精简 + by_channel/by_model Top3）
+      ...
+      ──────────────
+      🅾 OpenAI               ← 家族段（同上）
+      ...
+      ──────────────
+      按 Key Top              ← 跨家族，每条带 🅰/🅾 拆分小字
+      最近未命中样本 / 最近调用（跨家族，每条带家族图标）
+    """
+    sep = "─" * 18
+    header = f"📊 <b>统计 — {_PERIOD_LABELS.get(period, period)}</b>"
+
+    sections: list[str] = [header]
+
+    # 家族段：按固定顺序 anthropic → openai
+    family_results = family_results or {}
+    rendered_any_family = False
+    for fam in ("anthropic", "openai"):
+        fr = family_results.get(fam)
+        if not fr:
+            continue
+        block = _section_family(fam, fr, model_channels)
+        if block:
+            sections.append(sep)
+            sections.append(block)
+            rendered_any_family = True
+
+    # 如果没流量（或无家族数据），fallback 到旧的全家族 overall
+    if not rendered_any_family:
+        sections.append(sep)
+        sections.append(_section_overall(result.get("overall") or {}))
+
+    # 跨家族 Key Top
     by_apikey = _strip_unknown(result.get("by_apikey") or [])
     if by_apikey:
+        sections.append(sep)
+        kfs = key_family_split or {}
+
+        def _render_key(k: str) -> str:
+            return f"🔑 <code>{ui.escape_html(k)}</code>"
+
+        def _extra_key(k: str) -> str:
+            split = kfs.get(k) or (0, 0)
+            s = _render_key_family_split(k, split[0], split[1])
+            return s
+
         block = _summary_dim_block(
             "按 Key Top", by_apikey,
-            lambda k: f"<code>{ui.escape_html(k)}</code>",
+            _render_key,
+            extra_line=_extra_key,
         )
-        sections.append("")
         sections.append(block)
 
+    # 未命中样本 / 最近调用（跨家族，带家族标签）
     misses = _section_cache_misses(result.get("recent_cache_misses") or [])
     if misses:
         sections.append("")
@@ -348,9 +495,36 @@ def _render_overall(result: dict, period: str,
     return "\n".join(sections)
 
 
+def _channel_family_icon(channel_key: str) -> str:
+    """用 registry 查出渠道的上游协议，转成家族图标（🅰/🅾）。查不到返回空串。"""
+    try:
+        from ...channel import registry
+        ch = registry.get_channel(channel_key)
+        if ch is not None:
+            fam = ui.family_of(getattr(ch, "protocol", None))
+            if fam:
+                return ui.FAMILY_ICON.get(fam, "")
+    except Exception:
+        pass
+    return ""
+
+
+def _model_family_icon(model: str,
+                       model_channels: dict[str, list[dict]] | None) -> str:
+    """由 model 反查到它主要打的渠道，再由渠道判断家族。"""
+    if not model_channels:
+        return ""
+    chans = model_channels.get(model) or []
+    for it in chans:
+        icon = _channel_family_icon(it.get("key") or "")
+        if icon:
+            return icon
+    return ""
+
+
 def _render_expanded(result: dict, period: str, dim: str,
                      model_channels: dict[str, list[dict]] | None = None) -> str:
-    """专题视图：把指定维度展开到 Top 10。"""
+    """专题视图：把指定维度展开到 Top 10，每条带家族图标。"""
     label = _DIM_LABELS.get(dim, dim)
     sep = "─" * 18
     sections = [
@@ -361,18 +535,26 @@ def _render_expanded(result: dict, period: str, dim: str,
     ]
     if dim == "channel":
         groups = _strip_unknown(result.get("by_channel") or [])
+
+        def _rk_ch(k: str) -> str:
+            fam_i = _channel_family_icon(k)
+            fam_prefix = f"{fam_i} " if fam_i else ""
+            return f"{fam_prefix}{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>"
+
         block = _expanded_dim_block(
-            f"按渠道（Top {len(groups)}）",
-            groups,
-            lambda k: f"{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
+            f"按渠道（Top {len(groups)}）", groups, _rk_ch,
         )
     elif dim == "model":
         groups = _strip_unknown(result.get("by_model") or [])
         mc = model_channels or {}
+
+        def _rk_m(k: str) -> str:
+            fam_i = _model_family_icon(k, mc)
+            fam_prefix = f"{fam_i} " if fam_i else ""
+            return f"{fam_prefix}<code>{ui.escape_html(k)}</code>"
+
         block = _expanded_dim_block(
-            f"按模型（Top {len(groups)}）",
-            groups,
-            lambda k: f"<code>{ui.escape_html(k)}</code>",
+            f"按模型（Top {len(groups)}）", groups, _rk_m,
             extra_line=lambda k: (
                 "所属: " + _render_model_channels(mc.get(k) or [], limit=5)
                 if mc.get(k) else ""
@@ -383,7 +565,7 @@ def _render_expanded(result: dict, period: str, dim: str,
         block = _expanded_dim_block(
             f"按 Key（Top {len(groups)}）",
             groups,
-            lambda k: f"<code>{ui.escape_html(k)}</code>",
+            lambda k: f"🔑 <code>{ui.escape_html(k)}</code>",
         )
     else:
         block = ""
@@ -448,8 +630,34 @@ def _compose(period: str, dim: str) -> tuple[str, dict]:
         except Exception as exc:
             print(f"[stats] channels_by_requested_model failed: {exc}")
             model_channels = {}
+
+    # 汇总视图：额外跑两次 family 聚合（含完整 overall / by_channel / by_model），
+    # 同时算出每个 api_key 在两家族的次数拆分，供 Key Top 展示小字。
+    family_results: dict = {}
+    key_family_split: dict = {}
+    if dim == "all":
+        for fam in ("anthropic", "openai"):
+            try:
+                family_results[fam] = log_db.stats_summary(
+                    since_ts=since, family=fam, summary_top_limit=3,
+                )
+            except Exception as exc:
+                print(f"[stats] family={fam} failed: {exc}")
+                family_results[fam] = None
+        # 计算每个 Key 在两家族的请求数
+        for fam in ("anthropic", "openai"):
+            fr = family_results.get(fam) or {}
+            for g in (fr.get("by_apikey") or []):
+                k = g.get("key") or "?"
+                if k == "?":
+                    continue
+                cur = key_family_split.setdefault(k, [0, 0])  # [anthropic, openai]
+                cur[0 if fam == "anthropic" else 1] = int((g.get("metrics") or {}).get("total") or 0)
+
     text = (
-        _render_overall(result, period, model_channels) if dim == "all"
+        _render_overall(result, period, model_channels,
+                        family_results=family_results,
+                        key_family_split=key_family_split) if dim == "all"
         else _render_expanded(result, period, dim, model_channels)
     )
     return ui.truncate(text), _kb(period, dim)

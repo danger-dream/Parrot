@@ -49,7 +49,10 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: httpx.Response) -> None:
         snap = openai_provider.parse_rate_limit_headers(dict(resp.headers))
         if not snap:
             return
+        account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
+        # throttle bucket 用 email 作 key（同一邮箱下 OpenAI 最多一个账号，不会冲突；
+        # 同时保留 forget_codex_snapshot(email) / forget_codex_snapshot(account_key) 两种语义）
         now = time.time()
         with _codex_snapshot_lock:
             last = _codex_snapshot_last.get(email, 0.0)
@@ -57,20 +60,226 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: httpx.Response) -> None:
                 return
             _codex_snapshot_last[email] = now
         normalized = openai_provider.normalize_codex_snapshot(snap)
-        state_db.quota_save_openai_snapshot(email, snap, normalized)
+        state_db.quota_save_openai_snapshot(account_key, snap, normalized, email=email)
+
+        # 🚨 响应头超限自动禁用（2026-04-20 新增）
+        # Codex 无 surpassed-threshold，但有 primary/secondary used percent；
+        # 判断任一 ≥ disableThresholdPercent 则触发（与 quota_monitor_once 语义一致）
+        _maybe_auto_disable_by_codex_snapshot(account_key, email, snap)
     except Exception as exc:
         print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
 
 
-def forget_codex_snapshot(email: str) -> None:
+# ─── Anthropic 响应头被动采样 snapshot 节流 ──────────────────────
+#
+# 参考 sub2api ratelimit_service.go::UpdateSessionWindow。Anthropic 在每次
+# 成功响应的响应头里带 5h/7d rate-limit utilization，比主动拉 /api/oauth/usage
+# 新鲜得多且无 rate-limit 成本。与 Codex 节流机制对称：按 account_key 30s
+# 节流，避免每次请求都写 state_db。
+#
+# 注意：这条路径**只更新 five_hour_* / seven_day_* 四个字段**，不碰主动拉
+# 才有的 sonnet/opus/extra 维度；详见 state_db.quota_patch_passive。
+
+_ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S = 30.0
+_anthropic_snapshot_last: dict[str, float] = {}
+_anthropic_snapshot_lock = threading.Lock()
+
+
+def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
+    # 延迟 import 避免循环依赖
+    from .channel.oauth_channel import OAuthChannel
+    from .anthropic.rate_limit_headers import parse_rate_limit_headers
+
+    if not isinstance(ch, OAuthChannel):
+        return
+    try:
+        patch = parse_rate_limit_headers(dict(resp.headers))
+        if not patch:
+            return
+        account_key = getattr(ch, "account_key", None) or ch.email
+        email = ch.email
+        now = time.time()
+        with _anthropic_snapshot_lock:
+            last = _anthropic_snapshot_last.get(account_key, 0.0)
+            if now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S:
+                return
+            _anthropic_snapshot_last[account_key] = now
+        state_db.quota_patch_passive(account_key, patch, email=email)
+
+        # 🚨 响应头超限自动禁用（2026-04-20 新增）
+        # 5h/7d 任一超限且账号当前未被禁用 → 立即置为 quota disabled
+        # 这比 quota_monitor_loop 的轮询快得多（下一次请求前就禁用，不用等 30min）
+        _maybe_auto_disable_by_headers(
+            account_key, ch.email, dict(resp.headers),
+            provider="claude",
+        )
+    except Exception as exc:
+        print(f"[failover] anthropic snapshot record failed for "
+              f"{getattr(ch, 'email', '?')}: {exc}")
+
+
+def forget_anthropic_snapshot(account_key_or_email: str) -> None:
+    """账户删除时清 Anthropic 节流桶，避免内存无限累积。
+
+    与 forget_codex_snapshot 对称：同时按 account_key 与拆出的 email 两个 key
+    清理（兼容性保险）。
+    """
+    if not account_key_or_email:
+        return
+    key = account_key_or_email
+    email = key.split(":", 1)[1] if ":" in key else key
+    with _anthropic_snapshot_lock:
+        _anthropic_snapshot_last.pop(email, None)
+        _anthropic_snapshot_last.pop(key, None)
+
+
+# ─── 响应头超限自动禁用（2026-04-20 新增） ───────────────────────
+#
+# 两家 OAuth 都在每次请求时从响应头解析出 rate-limit 状态。与 `quota_monitor_loop`
+# 的轮询判断相比，响应头判断是**实时**的——一旦某次请求返回已超限的头，就可以
+# 立即把账号标 quota disabled，避免下一次请求再打过去被 429。
+#
+# 触发条件：
+#   - Anthropic: surpassed-threshold=true OR utilization>=1.0（任一窗口）
+#   - OpenAI  : primary/secondary used_percent ≥ disableThresholdPercent (default 95)
+#
+# 幂等：账号已是 disabled_reason="quota" 时不重复置位。
+# auth_error / user 禁用的账号不碰（保留原始禁用原因）。
+
+
+def _get_quota_disable_threshold_pct() -> float:
+    cfg = config.get()
+    qm = cfg.get("quotaMonitor") or {}
+    try:
+        return float(qm.get("disableThresholdPercent", 95))
+    except Exception:
+        return 95.0
+
+
+def _maybe_auto_disable_by_headers(account_key: str, email: str,
+                                   headers: dict, *, provider: str) -> None:
+    """Anthropic 路径：用 is_window_exceeded 判断 + set_disabled_by_quota 触发。"""
+    from . import oauth_manager
+    from .anthropic.rate_limit_headers import (
+        is_window_exceeded, _parse_reset_iso, H_5H_RESET, H_7D_RESET,
+    )
+
+    acc = oauth_manager.get_account(account_key)
+    if acc is None:
+        return
+    # 已被禁用 → 不动（避免重复通知 / 覆盖已有 disabled_until）
+    if acc.get("disabled_reason"):
+        return
+
+    hit_5h = is_window_exceeded(headers, "5h")
+    hit_7d = is_window_exceeded(headers, "7d")
+    if not (hit_5h or hit_7d):
+        return
+
+    # 选择较晚的 reset 作为 disabled_until（保守：等所有窗口都过去才恢复）
+    reset_5h = _parse_reset_iso(headers.get(H_5H_RESET)) if hit_5h else None
+    reset_7d = _parse_reset_iso(headers.get(H_7D_RESET)) if hit_7d else None
+    latest = reset_5h
+    if reset_7d and (latest is None or reset_7d > latest):
+        latest = reset_7d
+
+    try:
+        oauth_manager.set_disabled_by_quota(account_key, latest)
+    except Exception as exc:
+        print(f"[failover] auto-disable failed for {account_key}: {exc}")
+        return
+
+    # 发通知
+    try:
+        ek = notifier.escape_html
+        windows = []
+        if hit_5h: windows.append("5h")
+        if hit_7d: windows.append("7d")
+        notifier.notify_event(
+            "quota_disabled",
+            "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
+            f"账号: <code>{ek(email)}</code> · 🅰 Claude\n"
+            f"超限窗口: <code>{' / '.join(windows)}</code>\n"
+            f"恢复时间: <code>{latest or 'unknown'}</code>\n"
+            "达到该时间后由 quota_monitor 自动恢复。"
+        )
+    except Exception:
+        pass
+
+
+def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
+                                          snap: dict) -> None:
+    """OpenAI 路径：primary/secondary used_percent 任一 ≥ 阈值 → 禁用。"""
+    from . import oauth_manager
+
+    acc = oauth_manager.get_account(account_key)
+    if acc is None or acc.get("disabled_reason"):
+        return
+
+    threshold = _get_quota_disable_threshold_pct()
+    primary_pct = snap.get("primary_used_pct")
+    secondary_pct = snap.get("secondary_used_pct")
+    over_threshold = False
+    over_windows = []
+    if primary_pct is not None and primary_pct >= threshold:
+        over_threshold = True
+        over_windows.append(f"primary {primary_pct:.0f}%")
+    if secondary_pct is not None and secondary_pct >= threshold:
+        over_threshold = True
+        over_windows.append(f"secondary {secondary_pct:.0f}%")
+    if not over_threshold:
+        return
+
+    # 计算 reset：选 primary/secondary 里最晚的 reset_sec → ISO
+    from datetime import datetime, timezone, timedelta
+    reset_candidates = []
+    for key in ("primary_reset_sec", "secondary_reset_sec"):
+        sec = snap.get(key)
+        if sec is not None:
+            try:
+                reset_candidates.append(
+                    datetime.now(timezone.utc) + timedelta(seconds=int(sec))
+                )
+            except Exception:
+                pass
+    latest_iso = None
+    if reset_candidates:
+        latest = max(reset_candidates)
+        latest_iso = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        oauth_manager.set_disabled_by_quota(account_key, latest_iso)
+    except Exception as exc:
+        print(f"[failover] auto-disable (codex) failed for {account_key}: {exc}")
+        return
+
+    try:
+        ek = notifier.escape_html
+        notifier.notify_event(
+            "quota_disabled",
+            "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
+            f"账号: <code>{ek(email)}</code> · 🅾 OpenAI\n"
+            f"超限窗口: <code>{' / '.join(over_windows)}</code> "
+            f"(阈值 {threshold:.0f}%)\n"
+            f"恢复时间: <code>{latest_iso or 'unknown'}</code>"
+        )
+    except Exception:
+        pass
+
+
+def forget_codex_snapshot(account_key_or_email: str) -> None:
     """账户删除时清本地节流桶，避免内存无限累积。
 
-    对外公开；调用方：oauth_manager.delete_account。
+    入参既接受 account_key (=provider:email)，也接受纯 email（兼容老调用）。
+    统一把 account_key 里的 email 段拆出来清。
     """
-    if not email:
+    if not account_key_or_email:
         return
+    key = account_key_or_email
+    email = key.split(":", 1)[1] if ":" in key else key
     with _codex_snapshot_lock:
         _codex_snapshot_last.pop(email, None)
+        _codex_snapshot_last.pop(key, None)
 
 
 # ─── 协议相关工具集分派 ──────────────────────────────────────────
@@ -416,19 +625,19 @@ async def run_failover(
             and ch.key not in refreshed_once
         ):
             refreshed_once.add(ch.key)
+            ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
             try:
-                await oauth_manager.force_refresh(getattr(ch, "email"))
+                await oauth_manager.force_refresh(ak)
                 print(f"[failover] OAuth 401/403 on {ch.key}, refreshed; retrying same channel")
                 retry_count += 1
-                continue  # 不 idx++，重试同 ch
+                continue
             except Exception as exc:
                 print(f"[failover] OAuth refresh failed for {ch.key}: {exc}")
                 email = getattr(ch, "email", "?")
                 try:
-                    oauth_manager.set_enabled(email, False, reason="auth_error")
+                    oauth_manager.set_enabled(ak, False, reason="auth_error")
                 except Exception:
                     pass
-                # 通知 admin（与 proactive_refresh_loop 行为对齐）
                 try:
                     ek = notifier.escape_html
                     notifier.notify_event(
@@ -576,8 +785,9 @@ async def _try_channel(
 
         connect_ms = int((time.time() - t_send) * 1000)
 
-        # 1.5 OpenAI Codex 响应头 snapshot：成功/失败分支前都先记一次
+        # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次
         _maybe_record_codex_snapshot(ch, upstream_resp)
+        _maybe_record_anthropic_snapshot(ch, upstream_resp)
 
         # 2. HTTP 状态码检查
         if upstream_resp.status_code >= 400:
@@ -668,6 +878,19 @@ async def _consume_non_stream(
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
 ) -> AttemptResult:
+    # stream-only 上游分流：OpenAI OAuth (chatgpt.com/backend-api/codex) 只返回 SSE，
+    # 下游若请求非流式，这里把 SSE 聚合成完整 JSON 再走原有 translator / 落库链路。
+    if getattr(ch, "upstream_stream_only", False):
+        return await _consume_stream_as_non_stream(
+            ctx, upstream_resp, ch, resolved_model, dynamic_map,
+            connect_ms, start_time, request_id,
+            messages, api_key_name, client_ip,
+            fp_query, retry_count_so_far, affinity_hit,
+            ingress_protocol=ingress_protocol,
+            translator_ctx=translator_ctx,
+            body=body,
+        )
+
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
     cfg = config.get()
     total_timeout = int((cfg.get("timeouts") or {}).get("total", 600))
@@ -778,6 +1001,205 @@ async def _consume_non_stream(
         connect_ms=connect_ms, total_ms=total_ms, http_status=upstream_resp.status_code,
         usage=usage, assistant_response=assistant_msg,
         full_response_text=restored.decode("utf-8", errors="replace") if isinstance(restored, bytes) else str(restored),
+    )
+
+
+
+# ─── Stream-only 上游 → 非流式聚合 ─────────────────────────────────
+
+async def _consume_stream_as_non_stream(
+    ctx, upstream_resp: httpx.Response, ch: Channel, resolved_model: str,
+    dynamic_map: Optional[dict],
+    connect_ms: int, start_time: float, request_id: str,
+    messages: list, api_key_name: Optional[str], client_ip: str,
+    fp_query: Optional[str], retry_count_so_far: int, affinity_hit: int,
+    *, ingress_protocol: str = "anthropic",
+    translator_ctx: Optional[dict] = None,
+    body: Optional[dict] = None,
+) -> AttemptResult:
+    """处理 upstream_stream_only=True 渠道的非流式下游请求。
+
+    读取上游 SSE → 用 ResponsesSSEAssistantBuilder 聚合 → 构造成完整 /v1/responses
+    JSON → 走与 _consume_non_stream 一致的 translator / 黑名单 / 落库 / 亲和链路。
+    """
+    cfg = config.get()
+    timeouts = cfg.get("timeouts") or {}
+    total_timeout = int(timeouts.get("total", 600))
+    first_byte_timeout = int(timeouts.get("firstByte", 30))
+    idle_timeout = int(timeouts.get("idle", 30))
+    deadline_ts = start_time + total_timeout
+
+    # 上游是 openai-responses SSE（目前唯一 stream-only 渠道是 OpenAIOAuthChannel，
+    # 其 protocol 固定为 "openai-responses"）
+    assert getattr(ch, "protocol", "") == "openai-responses", \
+        f"_consume_stream_as_non_stream only supports openai-responses upstream, got {getattr(ch, 'protocol', None)!r}"
+
+    raw_buf = bytearray()
+    aiter = upstream_resp.aiter_bytes()
+
+    # 1) 首字节
+    first_wait = min(first_byte_timeout, max(1, int(deadline_ts - time.time())))
+    try:
+        first_chunk = await asyncio.wait_for(aiter.__anext__(), timeout=first_wait)
+    except asyncio.TimeoutError:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="first_byte_timeout", connect_ms=connect_ms,
+            error_detail=f"first byte timeout (> {first_wait}s) [stream-only→non-stream]",
+        )
+    except StopAsyncIteration:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="closed_before_first_byte", connect_ms=connect_ms,
+            error_detail="upstream closed stream before first byte [stream-only→non-stream]",
+        )
+    except Exception as exc:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="transport_error", connect_ms=connect_ms,
+            error_detail=f"first byte transport: {exc} [stream-only→non-stream]",
+        )
+
+    first_byte_ms = int((time.time() - start_time) * 1000)
+    if not first_chunk:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="closed_before_first_byte", connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail="upstream sent empty first chunk [stream-only→non-stream]",
+        )
+
+    # 2) 首包还原 + 错误检查（复用流式路径的 toolkit）
+    first_chunk_restored = await ch.restore_response(first_chunk, dynamic_map=dynamic_map)
+    toolkit = _toolkit_for(ch)
+
+    first_event = toolkit["first_event_parser"](first_chunk_restored)
+    if first_event and (
+        first_event.get("type") == "error"
+        or isinstance(first_event.get("error"), dict)
+        or first_event.get("_event_name") == "error"
+    ):
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="upstream_error_json",
+            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail=json.dumps(first_event.get("error", first_event), ensure_ascii=False)[:2000],
+        )
+
+    bl_hit = blacklist.match(first_chunk_restored, ch.key)
+    if bl_hit:
+        await _safe_exit(ctx)
+        return AttemptResult(
+            outcome="blacklist_hit",
+            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail=f"blacklist: {bl_hit}",
+        )
+
+    # 3) 读完剩余 chunk + 聚合
+    builder = toolkit["stream_builder"]()  # ResponsesSSEAssistantBuilder
+    tracker = toolkit["stream_tracker"]()  # Usage / 状态追踪
+    builder.feed(first_chunk_restored)
+    tracker.feed(first_chunk_restored)
+    raw_buf.extend(first_chunk_restored if isinstance(first_chunk_restored, (bytes, bytearray)) else first_chunk_restored.encode("utf-8", errors="replace"))
+
+    while True:
+        now = time.time()
+        if now >= deadline_ts:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="total_timeout",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"total timeout reading SSE (> {total_timeout}s) [stream-only→non-stream]",
+            )
+        wait_s = max(1, min(idle_timeout, int(deadline_ts - now)))
+        try:
+            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_s)
+        except asyncio.TimeoutError:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="idle_timeout",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"idle timeout (> {idle_timeout}s) [stream-only→non-stream]",
+            )
+        except StopAsyncIteration:
+            break
+        except Exception as exc:
+            await _safe_exit(ctx)
+            return AttemptResult(
+                outcome="transport_error",
+                connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+                error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
+            )
+        if not chunk:
+            continue
+        restored_chunk = await ch.restore_response(chunk, dynamic_map=dynamic_map)
+        builder.feed(restored_chunk)
+        tracker.feed(restored_chunk)
+        raw_buf.extend(restored_chunk if isinstance(restored_chunk, (bytes, bytearray)) else restored_chunk.encode("utf-8", errors="replace"))
+
+    resp_headers = _pick_upstream_headers(upstream_resp)
+    await _safe_exit(ctx)
+
+    if not builder.has_any_event:
+        return AttemptResult(
+            outcome="upstream_malformed",
+            connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+            error_detail="stream ended without any SSE event [stream-only→non-stream]",
+        )
+
+    # 4) 聚合成完整 /v1/responses JSON
+    obj = builder.to_full_json(fallback_model=resolved_model)
+
+    # 把 tracker 收集到的 usage 合并进去（tracker 负责 responses.completed 的 usage 解析）
+    try:
+        usage_from_tracker = tracker.usage if hasattr(tracker, "usage") else None
+        if usage_from_tracker:
+            obj.setdefault("usage", usage_from_tracker)
+    except Exception:
+        pass
+
+    total_ms = int((time.time() - start_time) * 1000)
+
+    # 5) 用标准 extract_usage 抽 usage（对齐现有落库口径）
+    usage = toolkit["extract_usage_json"](obj)
+    assistant_msg = {"role": "assistant", "content": obj.get("output") or []}
+
+    scorer.record_success(
+        ch.key, resolved_model,
+        connect_ms=connect_ms, first_byte_ms=first_byte_ms, total_ms=total_ms,
+    )
+    cooldown.clear(ch.key, resolved_model)
+
+    response_body_text = bytes(raw_buf).decode("utf-8", errors="replace")
+    await asyncio.to_thread(
+        log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
+        input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],
+        cache_creation_tokens=usage["cache_creation"], cache_read_tokens=usage["cache_read"],
+        connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
+        retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+        response_body=response_body_text,
+        http_status=upstream_resp.status_code,
+        upstream_protocol=getattr(ch, "protocol", "anthropic"),
+    )
+
+    # 6) 走跨变体 translator（如果 ingress 是 chat，上游 responses JSON 要翻译成 chat.completion JSON）
+    out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
+
+    # 亲和写入（与 _consume_non_stream 一致）
+    _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
+                                messages, assistant_msg, body, out_obj,
+                                ch.key, resolved_model)
+
+    response = JSONResponse(
+        content=out_obj,
+        status_code=upstream_resp.status_code,
+        headers=resp_headers,
+    )
+    return AttemptResult(
+        outcome="success", success=True, response=response,
+        connect_ms=connect_ms, first_byte_ms=first_byte_ms, total_ms=total_ms,
+        http_status=upstream_resp.status_code,
+        usage=usage, assistant_response=assistant_msg,
+        full_response_text=response_body_text,
     )
 
 

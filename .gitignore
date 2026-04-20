@@ -1,5 +1,10 @@
 venv/
 __pycache__/
+bak/
+state.db
+state.db-shm
+state.db-wal
+state.db.pre_composite_key.bak
 *.pyc
 *.db
 *.db-wal

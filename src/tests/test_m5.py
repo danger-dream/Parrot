@@ -308,14 +308,18 @@ async def test_proactive_refresh_failure_marks_auth_error(m):
 # ─── OAuth 配额监控 ──────────────────────────────────────────────
 
 def _fake_usage(util_percent: float, resets_at_future_seconds: int = 3600):
-    """构造一个 Anthropic /oauth/usage 响应，所有窗口利用率相同。"""
+    """构造一个 Anthropic /oauth/usage 响应，所有窗口利用率相同。
+
+    2026-04-20: Anthropic /api/oauth/usage JSON body 的 utilization 就是 0..100
+    百分比（对齐 sub2api 产线实现），直接传入 util_percent 即可，不再除 100。
+    """
     reset = (datetime.now(timezone.utc) + timedelta(seconds=resets_at_future_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    util01 = util_percent / 100.0  # Anthropic 返回 0..1 时会被自动 × 100
+    util = float(util_percent)  # 直接透传 0..100 百分比
     return {
-        "five_hour": {"utilization": util01, "resets_at": reset},
-        "seven_day": {"utilization": util01, "resets_at": reset},
-        "seven_day_sonnet": {"utilization": util01, "resets_at": reset},
-        "seven_day_opus": {"utilization": util01, "resets_at": reset},
+        "five_hour": {"utilization": util, "resets_at": reset},
+        "seven_day": {"utilization": util, "resets_at": reset},
+        "seven_day_sonnet": {"utilization": util, "resets_at": reset},
+        "seven_day_opus": {"utilization": util, "resets_at": reset},
         "extra_usage": {"is_enabled": False},
     }
 
