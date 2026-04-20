@@ -135,6 +135,13 @@ class SSEUsageTracker:
                 u = evt.get("usage") or {}
                 if "output_tokens" in u:
                     self.usage["output_tokens"] = int(u.get("output_tokens", 0) or 0)
+                # 智谱等上游在 message_delta 补发 input_tokens（message_start 为 0）
+                if "input_tokens" in u:
+                    self.usage["input_tokens"] = int(u.get("input_tokens", 0) or 0)
+                if "cache_read_input_tokens" in u:
+                    v = int(u.get("cache_read_input_tokens", 0) or 0)
+                    if v > self.usage["cache_read"]:
+                        self.usage["cache_read"] = v
             elif t == "message_stop":
                 self.saw_stream_end = True
 

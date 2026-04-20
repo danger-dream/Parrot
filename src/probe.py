@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable, Optional
 
 import httpx
@@ -24,6 +26,59 @@ from .channel.base import Channel
 
 
 ProgressCallback = Callable[[str], Awaitable[None]]
+
+# 智谱 429 错误消息中的重置时间格式
+_RESET_AT_RE = re.compile(
+    r"reset\s+at\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+    re.IGNORECASE,
+)
+
+# 智谱 5h / 7d 窗口名到 timedelta 的映射
+_WINDOW_MAP = {
+    "5 hour": timedelta(hours=5),
+    "5h": timedelta(hours=5),
+    "7 day": timedelta(days=7),
+    "7d": timedelta(days=7),
+    "24 hour": timedelta(hours=24),
+    "24h": timedelta(hours=24),
+}
+
+_WINDOW_NAME_RE = re.compile(
+    r"Usage limit reached for\s+(5 hour|5h|7 day|7d|24 hour|24h)\.",
+    re.IGNORECASE,
+)
+
+
+def _parse_429_reset_time(reason: str) -> Optional[int]:
+    """从 429 错误消息中尝试解析重置时间。
+
+    支持两种格式：
+    1. 绝对时间: "Your limit will reset at 2026-04-20 22:43:35"
+       → 返回对应 UTC+8 的毫秒时间戳
+    2. 相对窗口: "Usage limit reached for 5 hour."
+       → 返回 now + 窗口时长的毫秒时间戳
+    """
+    # 1. 尝试绝对时间
+    m = _RESET_AT_RE.search(reason)
+    if m:
+        try:
+            dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            # 智谱返回的是北京时间
+            from datetime import timezone, timedelta
+            bjt = timezone(timedelta(hours=8))
+            dt = dt.replace(tzinfo=bjt)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+
+    # 2. 尝试相对窗口
+    m = _WINDOW_NAME_RE.search(reason)
+    if m:
+        window = _WINDOW_MAP.get(m.group(1).lower())
+        if window:
+            return int((time.time() + window.total_seconds()) * 1000)
+
+    return None
 
 
 # ─── 单次 probe ──────────────────────────────────────────────────
@@ -179,6 +234,8 @@ async def recovery_run_once() -> int:
     """遍历所有冷却中的 (ch, model)，对 API 渠道做 probe，成功则清除。
 
     返回清除的条数。
+
+    429 优化：解析错误消息中的重置时间，在那之前跳过 probe 避免刷屏。
     """
     cfg = config.get()
     recovery_cfg = cfg.get("cooldownRecovery") or {}
@@ -187,17 +244,42 @@ async def recovery_run_once() -> int:
     timeout_s = float(recovery_cfg.get("timeoutSeconds", 15))
 
     cleared = 0
+    now_ms = int(time.time() * 1000)
     for entry in cooldown.active_entries():
         ch = registry.get_channel(entry["channel_key"])
         if ch is None or ch.type != "api" or not ch.enabled:
             continue
+
+        # 如果 cooldown_until 在未来且是 429 类型，尝试解析重置时间
+        cu = entry.get("cooldown_until")
+        if cu is not None and cu > now_ms:
+            last_msg = entry.get("last_error_message", "")
+            if "429" in last_msg or "rate" in last_msg.lower() or "limit" in last_msg.lower():
+                reset_ms = _parse_429_reset_time(last_msg)
+                if reset_ms is not None and reset_ms > now_ms:
+                    # 还有较长时间才重置，跳过 probe
+                    remain_min = (reset_ms - now_ms) / 60000
+                    if remain_min > 5:
+                        continue
+
         ok, elapsed_ms, reason = await probe_channel_model(ch, entry["model"], timeout_s=timeout_s)
         if ok:
             cooldown.clear(ch.key, entry["model"])
             cleared += 1
             print(f"[probe] cleared cooldown for {ch.key}:{entry['model']} ({elapsed_ms}ms)")
         else:
-            # 探测失败不额外记 cooldown（本身就在 cooldown 中），只打日志
+            # 429：解析重置时间并更新 cooldown_until
+            if reason and "HTTP 429" in reason:
+                reset_ms = _parse_429_reset_time(reason)
+                if reset_ms is not None and reset_ms > now_ms:
+                    remain_min = (reset_ms - now_ms) / 60000
+                    bjt = timezone(timedelta(hours=8))
+                    reset_str = datetime.fromtimestamp(reset_ms / 1000, tz=bjt).strftime("%H:%M:%S")
+                    print(f"[probe] rate-limited {ch.key}:{entry['model']} — reset at {reset_str} (≈{remain_min:.0f}m)")
+                    cooldown.record_error(ch.key, entry["model"], reason, cooldown_until=reset_ms)
+                    continue
+
+            # 其他失败：只打日志，不额外记 cooldown（本身就在 cooldown 中）
             print(f"[probe] still failing {ch.key}:{entry['model']} — {reason}")
     return cleared
 

@@ -82,7 +82,8 @@ def is_blocked(channel_key: str, model: str) -> bool:
     return cd > _now_ms()
 
 
-def record_error(channel_key: str, model: str, message: str | None = None) -> dict:
+def record_error(channel_key: str, model: str, message: str | None = None,
+               *, cooldown_until: int | None = None) -> dict:
     """记一次失败，按阶梯推进 cooldown_until。返回更新后的状态。
 
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
@@ -106,12 +107,14 @@ def record_error(channel_key: str, model: str, message: str | None = None) -> di
             cooldown_until = None
         else:
             # 已超出宽容期：用扣除 grace 后的次数索引 errorWindows
-            ladder_idx = min(new_count - 1 - grace, len(windows) - 1)
-            minutes = windows[ladder_idx]
-            if minutes == 0:
-                cooldown_until = _INF
-            else:
-                cooldown_until = _now_ms() + minutes * 60 * 1000
+            # 调用方显式指定 cooldown_until 时（如 429 解析出重置时间），直接使用
+            if cooldown_until is None:
+                ladder_idx = min(new_count - 1 - grace, len(windows) - 1)
+                minutes = windows[ladder_idx]
+                if minutes == 0:
+                    cooldown_until = _INF
+                else:
+                    cooldown_until = _now_ms() + minutes * 60 * 1000
 
         # 检测"首次进入永久"
         if cooldown_until == _INF and prev_cd != _INF:
