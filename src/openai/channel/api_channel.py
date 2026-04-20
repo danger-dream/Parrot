@@ -22,7 +22,7 @@ from ..transform import (
 
 # User-Agent 故意不伪装成官方 SDK：上游看到 proxy 身份便于排错，也避免与
 # anthropic 家族的 CC 伪装语义混淆。
-_UA = "anthropic-proxy/openai-adapter"
+_UA = "parrot/openai-adapter"
 
 
 class OpenAIApiChannel(Channel):

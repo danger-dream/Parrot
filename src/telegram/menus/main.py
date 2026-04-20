@@ -98,7 +98,7 @@ def _overview() -> str:
     quota_hot = _quota_hot_count(80.0)
 
     lines = [
-        "🤖 <b>Anthropic 协议 TG 管理面板</b>",
+        "🦜 <b>Parrot · TG 管理面板</b>",
         "",
         f"📡 监听 <code>:{port}</code> · 调度 <code>{mode}</code> · CCH <code>{cch}</code>",
         f"🔐 OAuth: {oauth_enabled}/{len(oauth_accounts)} 可用"
@@ -203,7 +203,7 @@ def welcome(chat_id: int) -> None:
     避免出现欢迎语 + 主菜单标题双重出现，以及"服务地址"重复。
     """
     text = (
-        "👋 <b>欢迎使用 Anthropic 协议 TG 管理面板</b>\n\n"
+        "👋 <b>欢迎使用 Parrot · 多家族 AI 协议代理</b>\n\n"
         "<b>快速开始：</b>\n"
         "1️⃣ 「🔐 管理 OAuth」→「➕ 新增账户」添加 Claude OAuth\n"
         "2️⃣ 「🔀 渠道管理」→「➕ 添加渠道」接入第三方云平台\n"

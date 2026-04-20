@@ -8,16 +8,20 @@ from .. import ui
 
 
 _HELP_TEXT = (
-    "❓ <b>帮助</b>\n"
+    "❓ <b>Parrot 帮助</b> 🦜\n"
     "─────────\n\n"
     "<b>主要菜单</b>\n"
-    "📊 状态总览 — 一眼看服务健康度（运行时长 / 渠道 / 配额 / 问题）\n"
-    "📈 统计汇总 — 按时间×维度查看 token 用量、缓存命中、调用样本\n"
+    "📊 状态总览 — 一眼看服务健康度（运行时长 / 渠道 / 配额 / 问题），两家族分段展示\n"
+    "📈 统计汇总 — 按时间×维度查看 token 用量、缓存、重试、亲和；汇总页两家族分段\n"
     "📋 最近日志 — 最新 15 条请求；详情可看重试链 + 完整 body\n"
     "🔀 渠道管理 — 第三方 API 渠道增删改、测试、清错误/亲和\n"
-    "🔐 管理 OAuth — Anthropic OAuth 账户登录、刷新、配额查看\n"
+    "🔐 管理 OAuth — OAuth 账户登录、刷新、配额查看（Anthropic + OpenAI）\n"
     "🔑 管理 API Key — 下游客户端使用的代理 Key\n"
     "⚙ 系统设置 — 超时 / 错误阶梯 / 评分 / 亲和 / CCH / 黑名单\n\n"
+
+    "<b>家族图标</b>\n"
+    "🅰 Anthropic：claude-opus / claude-sonnet 等 Claude 家族；入口 /v1/messages\n"
+    "🅾 OpenAI：gpt-5.x / gpt-5.x-codex 等 GPT 家族；入口 /v1/chat/completions 或 /v1/responses\n\n"
 
     "<b>渠道状态图标</b>\n"
     "✅ 可用 · ⬛ 已禁用 · 🟢 健康 · 🟡 一般 · 🔴 异常\n"

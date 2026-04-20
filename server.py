@@ -1,4 +1,4 @@
-"""anthropic-proxy 主入口（M4：调度 + 故障转移接入完成）。
+"""Parrot 主入口（多家族 AI 协议代理）。
 
 启动时：
   - 加载配置、state.db、logs/YYYY-MM.db
@@ -150,7 +150,7 @@ async def lifespan(app: FastAPI):
         tgbot.init(tg_token, tg_admins)
         tgbot.start()
 
-    print("anthropic-proxy (M10: all menus ready)")
+    print("Parrot 🦜 (multi-family AI protocol proxy) ready")
     print(f"  device_id: {DEVICE_ID[:16]}...")
     print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
     print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
@@ -254,7 +254,7 @@ async def health():
         },
         "affinity_bound": affinity.count(),
         "device_id": DEVICE_ID[:16] + "...",
-        "version": "anthropic-proxy",
+        "version": "parrot",
     }
 
 
