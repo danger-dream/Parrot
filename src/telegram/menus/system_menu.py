@@ -136,20 +136,87 @@ def _show_errwin(chat_id: int, message_id: int, cb_id: str) -> None:
     cfg = config.get()
     win = cfg.get("errorWindows") or []
     grace = int(cfg.get("oauthGraceCount", 3))
+    ladder_interval = int(cfg.get("cooldownLadderMinIntervalSeconds", 30))
+    perm_min_age = int(cfg.get("cooldownPermanentMinAgeSeconds", 300))
     text = (
         "⛔ <b>错误冷却阶梯</b>\n\n"
         f"阶梯（分钟）: <code>{','.join(str(x) for x in win)}</code>\n"
-        f"OAuth 宽容次数: <code>{grace}</code>\n\n"
+        f"OAuth 宽容次数: <code>{grace}</code>\n"
+        f"阶梯推进最小间隔: <code>{ladder_interval}s</code>\n"
+        f"永久冷却最小累计: <code>{perm_min_age}s</code>\n\n"
         "<i>说明：</i>\n"
         "<i>• 每个 (渠道, 模型) 连续失败递进到下一阶梯；末位为 0 表示永久拉黑</i>\n"
         "<i>• 成功一次立即重置失败计数</i>\n"
-        f"<i>• OAuth 渠道前 <b>{grace}</b> 次失败仅累计计数、不冷却（避免单账号偶发故障导致全部 Claude 模型不可用）</i>"
+        f"<i>• OAuth 渠道前 <b>{grace}</b> 次失败仅累计计数、不冷却（避免单账号偶发故障导致全部 Claude 模型不可用）</i>\n"
+        f"<i>• 两次阶梯推进至少间隔 <b>{ladder_interval}s</b>（挡住客户端秒级重试把渠道打穿）</i>\n"
+        f"<i>• 从首次失败起持续 &lt; <b>{perm_min_age}s</b> 时，即使推到末位档也不进永久，回退到倒数第二档（挡住短时爆发式失败）</i>"
     )
     ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
         [ui.btn("✏ 修改阶梯", "sys:edit:errwin"),
          ui.btn("✏ OAuth 宽容次数", "sys:edit:oauth_grace")],
+        [ui.btn("✏ 推进最小间隔", "sys:edit:ladder_interval"),
+         ui.btn("✏ 永久最小累计", "sys:edit:perm_min_age")],
         [ui.btn("◀ 返回设置", "menu:settings")],
     ]))
+
+
+def _edit_ladder_interval(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "sys_ladder_interval")
+    ui.edit(
+        chat_id, message_id,
+        "请输入阶梯推进最小间隔（秒，非负整数）：\n\n"
+        "<i>两次阶梯推进（cooldown_until 前进一格）必须间隔 ≥ 该秒数；期间的失败仅累计计数、不推进。</i>\n"
+        "<i>推荐 30；设 0 关闭该保护。</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:errwin")]]),
+    )
+
+
+def _on_ladder_interval_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入：")
+        return
+    if v < 0 or v > 3600:
+        ui.send(chat_id, "❌ 范围 0-3600，请重新输入：")
+        return
+    config.update(lambda c: c.__setitem__("cooldownLadderMinIntervalSeconds", v))
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id, f"✅ 阶梯推进最小间隔已更新为 <code>{v}s</code>",
+        back_label="◀ 返回错误阶梯", back_callback="sys:show:errwin",
+    )
+
+
+def _edit_perm_min_age(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "sys_perm_min_age")
+    ui.edit(
+        chat_id, message_id,
+        "请输入进入永久冷却所需的最小累计失败时长（秒，非负整数）：\n\n"
+        "<i>从首次失败起持续 &lt; 该秒数时，即使阶梯推到末位 0 也不进永久，</i>"
+        "<i>回退到倒数第二档（默认 errorWindows 末位前一个 = 15min）。</i>\n"
+        "<i>推荐 300；设 0 关闭该保护。</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:errwin")]]),
+    )
+
+
+def _on_perm_min_age_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入：")
+        return
+    if v < 0 or v > 86400:
+        ui.send(chat_id, "❌ 范围 0-86400，请重新输入：")
+        return
+    config.update(lambda c: c.__setitem__("cooldownPermanentMinAgeSeconds", v))
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id, f"✅ 永久冷却最小累计已更新为 <code>{v}s</code>",
+        back_label="◀ 返回错误阶梯", back_callback="sys:show:errwin",
+    )
 
 
 def _edit_errwin(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -742,6 +809,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:show:errwin":    _show_errwin(chat_id, message_id, cb_id); return True
     if data == "sys:edit:errwin":    _edit_errwin(chat_id, message_id, cb_id); return True
     if data == "sys:edit:oauth_grace": _edit_oauth_grace(chat_id, message_id, cb_id); return True
+    if data == "sys:edit:ladder_interval": _edit_ladder_interval(chat_id, message_id, cb_id); return True
+    if data == "sys:edit:perm_min_age": _edit_perm_min_age(chat_id, message_id, cb_id); return True
     if data == "sys:show:scoring":   _show_scoring(chat_id, message_id, cb_id); return True
     if data.startswith("sys:edit:scoring:"):
         _edit_scoring(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
@@ -786,6 +855,10 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         _on_errwin_input(chat_id, text); return True
     if action == "sys_oauth_grace":
         _on_oauth_grace_input(chat_id, text); return True
+    if action == "sys_ladder_interval":
+        _on_ladder_interval_input(chat_id, text); return True
+    if action == "sys_perm_min_age":
+        _on_perm_min_age_input(chat_id, text); return True
     if action.startswith("sys_scoring:"):
         _on_scoring_input(chat_id, action, text); return True
     if action.startswith("sys_affinity:"):

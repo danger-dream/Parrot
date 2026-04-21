@@ -37,6 +37,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
     # 因偶发 timeout 立即冷却导致所有 Claude 模型不可用。
     "oauthGraceCount": 3,
+    # Ladder throttle（2026-04-21 新增，防客户端/并发爆发把渠道打穿）：
+    # 两次阶梯推进最少间隔 N 秒，期间失败仅累计计数、不推进 cooldown_until。
+    # 设 0 关闭该保护。默认 30 秒足够挡住客户端秒级重试。
+    "cooldownLadderMinIntervalSeconds": 30,
+    # 永久冷却门槛：从首次失败（first_error_at）起，至少持续 N 秒仍在失败
+    # 才允许进入永久档；不够时回退到倒数第二档。避免短时爆发误判为永久。
+    # 与默认 errorWindows=[1,3,5,10,15,0] 配合：正常爬到永久需 1+3+5+10+15=34min，
+    # 默认 300s=5min 几乎不影响正常路径，只挡爆发式失败。设 0 关闭该保护。
+    "cooldownPermanentMinAgeSeconds": 300,
     "affinity": {
         "ttlMinutes": 30,
         "threshold": 3.0,

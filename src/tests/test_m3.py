@@ -279,16 +279,32 @@ def test_scorer_stale_decay(m):
 
 
 def test_cooldown_ladder(m):
-    """错误阶梯 [1,3,5,10,15,0] 中 0 = 永久；连续失败递进；成功清零。"""
+    """错误阶梯 [1,3,5,10,15,0] 中 0 = 永久；连续失败递进；成功清零。
+
+    2026-04-21 新保护（already_cooling / ladder throttle / permanent_min_age）默认
+    会挡住"同一毫秒内连打 6 次"这种人造场景，所以这里：
+      • 关掉 ladder throttle 和 permanent_min_age（让旧阶梯节奏可验证）
+      • 在每次 record_error 之后手动把 cooldown_until 抹掉（模拟冷却过期后再失败）
+    目的：验证纯阶梯逻辑在真实"失败→冷却过期→再失败"场景下的递进。
+    """
     _reset_all_state(m)
     cd = m["cooldown"]
     cfg = m["config"]
 
     def _set(c):
         c["errorWindows"] = [1, 3, 5, 10, 15, 0]
+        c["cooldownLadderMinIntervalSeconds"] = 0  # 关闭推进最小间隔
+        c["cooldownPermanentMinAgeSeconds"] = 0    # 关闭永久最小累计
     cfg.update(_set)
 
     ck, mo = "api:chC", "m1"
+
+    def _expire_cooldown():
+        """把当前 cooldown_until 置为过去时间，模拟冷却自然过期后再次失败。"""
+        with cd._lock:
+            e = cd._entries.get((ck, mo))
+            if e and e.get("cooldown_until") not in (None, -1):
+                e["cooldown_until"] = 1  # 任何 < now 的值即可
 
     # 第 1 次失败 → 1 分钟
     cd.record_error(ck, mo, "err1")
@@ -296,12 +312,14 @@ def test_cooldown_ladder(m):
     s = cd.get_state(ck, mo)
     assert s["error_count"] == 1
 
-    # 第 2~5 次失败：递进阶梯
+    # 第 2~5 次失败：递进阶梯（每次前把前一次的冷却设为过期）
     for expected_count in (2, 3, 4, 5):
+        _expire_cooldown()
         cd.record_error(ck, mo, f"err{expected_count}")
         assert cd.get_state(ck, mo)["error_count"] == expected_count
 
     # 第 6 次失败：走到阶梯最后一格 0 → 永久（cooldown_until = -1）
+    _expire_cooldown()
     cd.record_error(ck, mo, "err6")
     s = cd.get_state(ck, mo)
     assert s["cooldown_until"] == -1, f"expected permanent, got {s}"
@@ -318,6 +336,108 @@ def test_cooldown_ladder(m):
     assert not cd.is_blocked(ck, mo)
 
     print("  [PASS] cooldown ladder + clear")
+
+
+def test_cooldown_ladder_throttle_blocks_burst(m):
+    """2026-04-21 新增：两次推进 < cooldownLadderMinIntervalSeconds 时不推进阶梯。"""
+    _reset_all_state(m)
+    cd = m["cooldown"]
+    cfg = m["config"]
+
+    def _set(c):
+        c["errorWindows"] = [1, 3, 5, 10, 15, 0]
+        c["cooldownLadderMinIntervalSeconds"] = 30
+        c["cooldownPermanentMinAgeSeconds"] = 0  # 不考虑永久门槛
+        c["oauthGraceCount"] = 0
+    cfg.update(_set)
+
+    ck, mo = "api:burst", "m1"
+
+    # 瞬间 10 次失败
+    for i in range(10):
+        cd.record_error(ck, mo, f"err{i}")
+
+    s = cd.get_state(ck, mo)
+    assert s["error_count"] == 10, s   # 计数照常累计
+    # cooldown_until 只由第一次推进决定（1 分钟），应该不是永久
+    assert s["cooldown_until"] != -1, f"burst 打穿永久: {s}"
+    # cooldown_until 应该在 (now, now + 1 分钟 + 5s)
+    now = cd._now_ms()
+    assert now < s["cooldown_until"] <= now + 65_000, s
+    print("  [PASS] ladder throttle 挡住 burst")
+
+
+def test_cooldown_permanent_min_age_fallback(m):
+    """2026-04-21 新增：first_error_at 距今 < permanent_min_age 时不进永久。
+
+    每次失败前把 cooldown 置为过期（绕过 already_cooling 分支）；interval=0 + min_age=300
+    共同作用，6 次失败应该到末位档但回退到 15min。
+    """
+    _reset_all_state(m)
+    cd = m["cooldown"]
+    cfg = m["config"]
+
+    def _set(c):
+        c["errorWindows"] = [1, 3, 5, 10, 15, 0]
+        c["cooldownLadderMinIntervalSeconds"] = 0    # 让阶梯自由推进
+        c["cooldownPermanentMinAgeSeconds"] = 300    # 5 分钟
+        c["oauthGraceCount"] = 0
+    cfg.update(_set)
+
+    ck, mo = "api:permage", "m1"
+
+    def _expire_cooldown():
+        with cd._lock:
+            e = cd._entries.get((ck, mo))
+            if e and e.get("cooldown_until") not in (None, -1):
+                e["cooldown_until"] = 1
+
+    # 连续 6 次失败（每次前 expire 让阶梯真的前进），但 first_error_at → now
+    # 间隔 < 300s，末位档应该回退到 15min
+    cd.record_error(ck, mo, "err0")
+    for i in range(1, 6):
+        _expire_cooldown()
+        cd.record_error(ck, mo, f"err{i}")
+
+    s = cd.get_state(ck, mo)
+    assert s["cooldown_until"] != -1, f"min_age 保护失效: {s}"
+    # 应该是 15 分钟档（倒数第二档）
+    now = cd._now_ms()
+    delta_ms = s["cooldown_until"] - now
+    assert 14 * 60_000 <= delta_ms <= 16 * 60_000, f"应该是 15min 回退: {delta_ms}ms"
+    print("  [PASS] permanent min age 回退到倒数第二档")
+
+
+def test_cooldown_in_cooldown_no_advance(m):
+    """2026-04-21 新增：已处于冷却期（非永久）时，新失败不推进阶梯。"""
+    _reset_all_state(m)
+    cd = m["cooldown"]
+    cfg = m["config"]
+
+    def _set(c):
+        c["errorWindows"] = [1, 3, 5, 10, 15, 0]
+        c["cooldownLadderMinIntervalSeconds"] = 0
+        c["cooldownPermanentMinAgeSeconds"] = 0
+        c["oauthGraceCount"] = 0
+    cfg.update(_set)
+
+    ck, mo = "api:incool", "m1"
+
+    # 第 1 次失败 → 冷却 1min
+    cd.record_error(ck, mo, "err1")
+    s1 = cd.get_state(ck, mo)
+    cd1 = s1["cooldown_until"]
+
+    # 再失败 3 次（没过 ladder_interval；但这里 interval=0，所以主要靠 "已冷却" 分支）
+    # 因为 interval=0 不会走 too_soon，走 already_cooling：prev_cd 未到期且非永久
+    for i in range(3):
+        cd.record_error(ck, mo, f"burst{i}")
+
+    s2 = cd.get_state(ck, mo)
+    assert s2["error_count"] == 4
+    # cooldown_until 不应变化（保留 prev_cd）
+    assert s2["cooldown_until"] == cd1, f"冷却期内不该推进: {cd1} -> {s2['cooldown_until']}"
+    print("  [PASS] 冷却期内新失败不推进阶梯")
 
 
 def test_affinity_ttl_and_delete(m):

@@ -743,6 +743,20 @@ async def _probe_with_progress_async(chat_id: int, msg_id: int, header: str,
 
     if ok:
         state["text"] += f"\n[√] 模型测试成功，耗时: {elapsed}ms"
+        # 手动测试成功 → 自动清除该 (渠道, 模型) 的冷却 / 永久禁用状态
+        # 复用 probe recovery loop 的 cooldown.clear 路径，避免用户还要手动点"清错误"
+        try:
+            prev = cooldown.get_state(ch.key, real_model)
+            if prev and (prev.get("cooldown_until") is not None
+                         or int(prev.get("error_count", 0)) > 0):
+                was_permanent = prev.get("cooldown_until") == -1
+                cooldown.clear(ch.key, real_model)
+                if was_permanent:
+                    state["text"] += "\n[✓] 已自动解除永久冷却"
+                else:
+                    state["text"] += "\n[✓] 已自动清除冷却与失败计数"
+        except Exception as exc:
+            print(f"[channel_menu] auto-clear cooldown on test success failed: {exc}")
     else:
         state["text"] += f"\n[×] 模型测试失败，失败原因: {ui.escape_html(reason or '未知错误')}"
     ui.edit(chat_id, msg_id, state["text"])

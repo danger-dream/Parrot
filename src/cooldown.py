@@ -82,39 +82,100 @@ def is_blocked(channel_key: str, model: str) -> bool:
     return cd > _now_ms()
 
 
+def _ladder_min_interval_ms() -> int:
+    try:
+        return int(config.get().get("cooldownLadderMinIntervalSeconds", 30)) * 1000
+    except Exception:
+        return 30_000
+
+
+def _permanent_min_age_ms() -> int:
+    try:
+        return int(config.get().get("cooldownPermanentMinAgeSeconds", 300)) * 1000
+    except Exception:
+        return 300_000
+
+
 def record_error(channel_key: str, model: str, message: str | None = None,
                *, cooldown_until: int | None = None) -> dict:
     """记一次失败，按阶梯推进 cooldown_until。返回更新后的状态。
+
+    防爆发式冷却三道闸（2026-04-21 新增）：
+      1. 已处于冷却期（非永久）：不推进阶梯，仅更新 last_error_message 和 count
+         → 客户端在冷却期内重试不会把阶梯打穿
+      2. 距上次 ladder 推进 < cooldownLadderMinIntervalSeconds：不推进
+         → 并发 in-flight 请求一批次失败不会连推多档
+      3. 首次推进到永久档时，若 first_error_at 距今 < cooldownPermanentMinAgeSeconds：
+         回退到倒数第二档（而非永久） → 短时爆发式失败不会变永久；
+         真正持续故障（跨越 5 分钟仍失败）才会永久
+
+    调用方显式传 `cooldown_until`（如 429 解析出 reset ms）时，绕过三道闸直接落盘。
 
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
     """
     windows = _windows()
     grace = _grace_count(channel_key)
+    ladder_min_interval = _ladder_min_interval_ms()
+    permanent_min_age = _permanent_min_age_ms()
+    explicit_cooldown = cooldown_until
     just_became_permanent = False
+    now = _now_ms()
+
     with _lock:
         state = _entries.get((channel_key, model)) or {
             "error_count": 0,
             "cooldown_until": None,
             "last_error_message": None,
+            "first_error_at": None,
+            "last_advance_at": 0,
         }
         prev_cd = state.get("cooldown_until")
         prev_count = int(state.get("error_count", 0))
         new_count = prev_count + 1
 
-        cooldown_until: Optional[int]
-        if new_count <= grace:
+        # first_error_at：第一次失败时落地，之后只在成功清零后重置（由 clear 负责）
+        first_error_at = state.get("first_error_at") or now
+        last_advance_at = int(state.get("last_advance_at") or 0)
+
+        # 已处于冷却期（非永久）
+        already_cooling = (prev_cd is not None
+                          and prev_cd != _INF
+                          and prev_cd > now
+                          and explicit_cooldown is None)
+        # 距上次推进太近
+        too_soon = (explicit_cooldown is None
+                    and last_advance_at > 0
+                    and (now - last_advance_at) < ladder_min_interval)
+
+        if explicit_cooldown is not None:
+            # 显式指定（429 reset）：直接使用，算一次推进
+            cooldown_until = explicit_cooldown
+            last_advance_at = now
+        elif already_cooling or too_soon:
+            # 不推进阶梯，保留原 cooldown_until
+            cooldown_until = prev_cd
+        elif new_count <= grace:
             # 仍在宽容期：只累计 error_count，不进冷却（也不发通知）
             cooldown_until = None
         else:
             # 已超出宽容期：用扣除 grace 后的次数索引 errorWindows
-            # 调用方显式指定 cooldown_until 时（如 429 解析出重置时间），直接使用
-            if cooldown_until is None:
-                ladder_idx = min(new_count - 1 - grace, len(windows) - 1)
-                minutes = windows[ladder_idx]
-                if minutes == 0:
-                    cooldown_until = _INF
+            ladder_idx = min(new_count - 1 - grace, len(windows) - 1)
+            minutes = windows[ladder_idx]
+            if minutes == 0:
+                # 准备进永久：检查 first_error_at 年龄
+                age_ms = now - first_error_at
+                if age_ms < permanent_min_age:
+                    # 时间窗不够长，回退到倒数第二档（若末位是 0 且只有这一档，用 15）
+                    fallback_idx = len(windows) - 2 if len(windows) >= 2 else -1
+                    fallback_min = windows[fallback_idx] if fallback_idx >= 0 else 0
+                    if fallback_min <= 0:
+                        fallback_min = 15  # 兜底
+                    cooldown_until = now + fallback_min * 60 * 1000
                 else:
-                    cooldown_until = _now_ms() + minutes * 60 * 1000
+                    cooldown_until = _INF
+            else:
+                cooldown_until = now + minutes * 60 * 1000
+            last_advance_at = now
 
         # 检测"首次进入永久"
         if cooldown_until == _INF and prev_cd != _INF:
@@ -122,6 +183,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         state["error_count"] = new_count
         state["cooldown_until"] = cooldown_until
         state["last_error_message"] = message
+        state["first_error_at"] = first_error_at
+        state["last_advance_at"] = last_advance_at
         _entries[(channel_key, model)] = state
         result = dict(state)
 
