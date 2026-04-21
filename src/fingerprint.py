@@ -233,9 +233,10 @@ def _normalize_resp_item(it):
     if not isinstance(it, dict):
         return None
     t = it.get("type")
-    if t == "message":
+    if t == "message" or (t is None and "role" in it):
+        # 兼容无 type 字段的裸 message（OpenCode / Codex CLI 等客户端）
         out: dict = {}
-        for k in ("type", "role", "content"):
+        for k in ("role", "content"):
             if k in it:
                 out[k] = it[k]
         content = out.get("content")
@@ -297,10 +298,22 @@ def fingerprint_write_chat(api_key_name: str, client_ip: str,
 
 
 def _responses_relevant(items: list) -> list:
-    """过滤掉 Responses input 中不稳定 item（reasoning / 内置工具 call 等）。"""
-    return [it for it in (items or [])
-            if isinstance(it, dict)
-            and it.get("type") in ("message", "function_call", "function_call_output")]
+    """过滤掉 Responses input 中不稳定 item（reasoning / 内置工具 call 等）。
+
+    注意：某些客户端（如 OpenCode / Codex CLI）发来的 message items 可能不带
+    ``type`` 字段，只有 ``role`` + ``content``。这些同样是稳定 message，需要保留。
+    """
+    out: list = []
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        t = it.get("type")
+        if t in ("message", "function_call", "function_call_output"):
+            out.append(it)
+        elif t is None and "role" in it:
+            # 无 type 但有 role 的裸 message（兼容 OpenCode 等客户端）
+            out.append(it)
+    return out
 
 
 def fingerprint_query_responses(api_key_name: str, client_ip: str,

@@ -359,7 +359,7 @@ def _section_overall_compact(overall: dict) -> str:
         lines.append(" · ".join(timing_bits))
     # 缓存命中 + 重试 + 亲和（两家族对称；值为 0 也展示，保持对照）
     if total > 0:
-        extras = [f"缓存 {ui.fmt_rate(succ_hit, succ)}"]
+        extras = [f"请求命中 {succ_hit}/{succ}"]
         if total_retries > 0:
             extras.append(f"重试 {total_retries} 次 ({retried}/{total})")
         else:
