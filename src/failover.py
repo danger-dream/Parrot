@@ -176,7 +176,8 @@ def _maybe_auto_disable_by_headers(account_key: str, email: str,
     if not (hit_5h or hit_7d):
         return
 
-    # 选择较晚的 reset 作为 disabled_until（保守：等所有窗口都过去才恢复）
+    # 撞哪个窗口锁哪个窗口：只在撞到的窗口里取 reset；两个都撞则取 max。
+    # 不会出现「只 5h 撞了却用 7d reset 锁 7 天」的不合理情况。
     reset_5h = _parse_reset_iso(headers.get(H_5H_RESET)) if hit_5h else None
     reset_7d = _parse_reset_iso(headers.get(H_7D_RESET)) if hit_7d else None
     latest = reset_5h
@@ -230,18 +231,27 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
     if not over_threshold:
         return
 
-    # 计算 reset：选 primary/secondary 里最晚的 reset_sec → ISO
+    # 撞哪个窗口锁哪个窗口：只在实际超阈的窗口里取 reset_sec。
+    # 不会出现「只 primary 撞了却用 secondary reset 锁到周末」的不合理情况。
     from datetime import datetime, timezone, timedelta
     reset_candidates = []
-    for key in ("primary_reset_sec", "secondary_reset_sec"):
-        sec = snap.get(key)
-        if sec is not None:
-            try:
-                reset_candidates.append(
-                    datetime.now(timezone.utc) + timedelta(seconds=int(sec))
-                )
-            except Exception:
-                pass
+    _window_map = {
+        "primary":   ("primary_used_pct",   "primary_reset_sec"),
+        "secondary": ("secondary_used_pct", "secondary_reset_sec"),
+    }
+    for _name, (_pct_key, _sec_key) in _window_map.items():
+        _pct = snap.get(_pct_key)
+        if _pct is None or _pct < threshold:
+            continue
+        _sec = snap.get(_sec_key)
+        if _sec is None:
+            continue
+        try:
+            reset_candidates.append(
+                datetime.now(timezone.utc) + timedelta(seconds=int(_sec))
+            )
+        except Exception:
+            pass
     latest_iso = None
     if reset_candidates:
         latest = max(reset_candidates)

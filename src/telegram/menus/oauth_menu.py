@@ -656,52 +656,158 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
 
 
 # ─── 刷新全部用量 ─────────────────────────────────────────────────
+#
+# 交互：不覆盖原 OAuth 面板，而是新发一条「进度消息」追加式展示：
+#   ⌛ 正在刷新 xxx 账户用量...
+#   ✅ 刷新成功: 5h 12% / 7d 45%
+#   🔒 触发自动禁用（超限窗口: 5h）
+#   ...
+#   📢 用量刷新完成，本消息 5 分钟后自动销毁。
+#
+# 副作用：每账户拉完 usage 后调 `evaluate_and_toggle_by_usage`：
+#   • 任一窗口 util ≥ 阈值 → 按「撞哪个窗口锁哪个窗口」触发/维持 quota 禁用
+#   • 全部窗口可用 & 当前是 quota 禁用 → 自动解除（因额度触发的禁用才解）
+#   • user/auth_error 禁用 → 永远不动
+#
+# 5 分钟后后台 Timer 删除进度消息（失败静默）。
 
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
-    ui.answer_cb(cb_id, "拉取中...")
+    ui.answer_cb(cb_id, "开始刷新...")
     from ...channel import registry
     from ...channel.openai_oauth_channel import OpenAIOAuthChannel
 
     accounts = oauth_manager.list_accounts()
-    ok = 0
-    fail = 0
-    openai_ok = 0       # OpenAI 账户：force_refresh + probe_usage 都成功
-    openai_fail = 0
-    for acc in accounts:
+    if not accounts:
+        ui.send(chat_id, "❌ 当前无 OAuth 账户可刷新")
+        return
+
+    lines: list[str] = ["🔄 <b>批量刷新 OAuth 用量</b>", ""]
+    resp = ui.send(chat_id, "\n".join(lines + ["⌛ 初始化..."]))
+    if not resp or not resp.get("ok"):
+        ui.send(chat_id, "❌ 无法创建进度消息")
+        return
+    progress_mid = (resp.get("result") or {}).get("message_id")
+    if progress_mid is None:
+        # 测试 / 无真实 TG 响应时走纯 send 摘要模式（不 edit、不自删）
+        progress_mid = -1
+
+    def _flush() -> None:
+        if progress_mid == -1:
+            return  # 无真实消息 id，不做中间态刷新（避免测试里刷屏）
+        try:
+            ui.edit(chat_id, progress_mid, "\n".join(lines))
+        except Exception:
+            pass
+
+    def _labels_for(usage: dict) -> str:
+        utils = oauth_manager.extract_utils_percent(usage)
+        tags = ["5h", "7d", "sonnet", "opus"]
+        parts = [f"{t} {u:.0f}%" for t, u in zip(tags, utils) if u is not None]
+        return " / ".join(parts) if parts else "无数据"
+
+    for idx, acc in enumerate(accounts, 1):
         email = acc.get("email")
         if not email:
             continue
         ak = _account_key(acc)
-        if oauth_manager.provider_of(acc) == "openai":
+        prov = oauth_manager.provider_of(acc)
+        prov_tag = "🅾 OpenAI" if prov == "openai" else "🅰 Claude"
+        ek = ui.escape_html(email)
+
+        lines.append(f"<b>{idx}. {ek}</b> · {prov_tag}")
+        lines.append(f"  ⌛ 正在刷新用量...")
+        _flush()
+
+        usage = None
+        # ─ 拉 usage ─
+        if prov == "openai":
             tr = _run_sync(oauth_manager.force_refresh(ak))
             if isinstance(tr, Exception):
-                openai_fail += 1
+                lines[-1] = f"  ❌ Token 刷新失败: <code>{ui.escape_html(str(tr))[:120]}</code>"
+                lines.append("")
+                _flush()
                 continue
             ch = registry.get_channel(f"oauth:{ak}")
             if not isinstance(ch, OpenAIOAuthChannel):
-                openai_fail += 1
+                lines[-1] = "  ❌ 渠道未注册（需重启或重新加载）"
+                lines.append("")
+                _flush()
                 continue
             pr = _run_sync(ch.probe_usage())
-            if isinstance(pr, Exception) or not pr.get("ok"):
-                openai_fail += 1
-            else:
-                openai_ok += 1
+            if isinstance(pr, Exception):
+                lines[-1] = f"  ❌ 探测异常: <code>{ui.escape_html(str(pr))[:120]}</code>"
+                lines.append("")
+                _flush()
+                continue
+            if not pr.get("ok"):
+                reason = pr.get("reason", "?")
+                lines[-1] = f"  ❌ 探测失败: <code>{ui.escape_html(str(reason))[:120]}</code>"
+                lines.append("")
+                _flush()
+                continue
+            row = state_db.quota_load(ak) or {}
+            usage = oauth_manager._synthesize_openai_usage_from_row(row)
+        else:
+            result = _run_sync(oauth_manager.fetch_usage(ak))
+            if isinstance(result, Exception):
+                lines[-1] = f"  ❌ 获取失败: <code>{ui.escape_html(str(result))[:120]}</code>"
+                lines.append("")
+                _flush()
+                continue
+            usage = result
+            try:
+                state_db.quota_save(ak, oauth_manager.flatten_usage(usage), email=email)
+            except Exception as exc:
+                print(f"[oauth_menu] quota_save failed for {ak}: {exc}")
+
+        # ─ 写入进度 + 评估禁用/恢复 ─
+        usage_str = _labels_for(usage)
+        lines[-1] = f"  ✅ 刷新成功: {usage_str}"
+
+        try:
+            res = oauth_manager.evaluate_and_toggle_by_usage(ak, usage)
+        except Exception as exc:
+            lines.append(f"  ⚠ 状态评估异常: <code>{ui.escape_html(str(exc))[:120]}</code>")
+            lines.append("")
+            _flush()
             continue
-        result = _run_sync(oauth_manager.fetch_usage(ak))
-        if isinstance(result, Exception):
-            fail += 1
-            continue
-        state_db.quota_save(ak, oauth_manager.flatten_usage(result), email=email)
-        ok += 1
-    show(chat_id, message_id)
-    parts = []
-    if ok or fail:
-        parts.append(f"Claude 用量: 成功 {ok} / 失败 {fail}")
-    if openai_ok or openai_fail:
-        parts.append(f"OpenAI 探测: 成功 {openai_ok} / 失败 {openai_fail}")
-    if not parts:
-        parts.append("无可刷新账户")
-    ui.send(chat_id, "✅ " + "；".join(parts))
+
+        action = res.get("action")
+        if action == "disabled":
+            hit = " / ".join(res.get("hit_windows") or []) or "?"
+            lines.append(f"  🔒 触发自动禁用（超限窗口: <code>{hit}</code>）")
+        elif action == "still_over_quota":
+            hit = " / ".join(res.get("hit_windows") or []) or "?"
+            lines.append(f"  ⚠ 仍未恢复，维持禁用（超限: <code>{hit}</code>）")
+        elif action == "resumed":
+            lines.append("  ♻ 额度已恢复，已自动解除禁用")
+        elif action == "noop_user":
+            lines.append("  🚫 手动禁用中（不自动恢复）")
+        elif action == "noop_auth_error":
+            lines.append("  ⚠ auth_error（不自动恢复，需重新登录）")
+        elif action == "disable_failed":
+            lines.append("  ❌ 自动禁用写入失败，见 systemd 日志")
+        elif action == "resume_failed":
+            lines.append("  ❌ 自动解禁写入失败，见 systemd 日志")
+        # "kept_enabled" / "noop_missing" 不追加额外行
+
+        lines.append("")
+        _flush()
+
+    lines.append("📢 用量刷新完成，本消息 5 分钟后自动销毁。")
+    _flush()
+
+    if progress_mid != -1:
+        import threading as _t
+        def _delete_later():
+            try:
+                ui.delete_message(chat_id, progress_mid)
+            except Exception:
+                pass
+        _t.Timer(300.0, _delete_later).start()
+    else:
+        # 降级路径：无法 edit 时用一条摘要消息兜底（保留老测试可见性）
+        ui.send(chat_id, "\n".join(lines))
 
 
 # ─── 新增账户：入口 ──────────────────────────────────────────────

@@ -320,11 +320,17 @@ def test_oauth_menu_refresh_all_probes_openai(m):
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].on_refresh_all(42, 100, "cb")
-    send = rec.last("sendMessage")
-    assert send, "expected send summary"
-    # 新摘要："OpenAI 探测: 成功 1 / 失败 0"
-    assert "OpenAI 探测" in send["text"], send["text"]
-    assert "成功 1" in send["text"]
+    # 新 UI：至少 2 条 sendMessage（初始进度条 + 结束摘要兜底/降级摘要）
+    sends = [d for mth, d in rec.calls if mth == "sendMessage"]
+    assert sends, "expected progress messages"
+    final_text = sends[-1]["text"]
+    # 兜底摘要里应包含两账户的 email 作为节标题
+    assert "c@claude.test" in final_text, final_text[:500]
+    assert "o@openai.test" in final_text, final_text[:500]
+    # 至少有一条"刷新成功"行
+    assert "刷新成功" in final_text, final_text[:500]
+    # 完成标识
+    assert "用量刷新完成" in final_text
     # openai 账户 token 刷过；quota snapshot 也写入
     acc = m["oauth_manager"].get_account("o@openai.test")
     assert acc["access_token"] != "OLD-OPENAI-AT"

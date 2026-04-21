@@ -673,7 +673,12 @@ def extract_utils_percent(usage: dict) -> list[float | None]:
 
 
 def latest_reset_iso(usage: dict) -> str | None:
-    """各时间窗 resets_at 中最大的那个（作为 disabled_until 的保守值）。"""
+    """各时间窗 resets_at 中最大的那个（向后兼容旧调用方）。
+
+    ⚠ 建议新代码使用 `reset_iso_for_hit_windows(usage, threshold)`，它只
+    考虑**实际撞到限额的窗口**的 reset 时间，避免「只有 5h 撞了却锁到 7d」的
+    不合理情况。
+    """
     candidates: list[datetime] = []
     for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
         obj = usage.get(key) or {}
@@ -684,6 +689,112 @@ def latest_reset_iso(usage: dict) -> str | None:
         return None
     latest = max(candidates)
     return _format_utc(latest.astimezone(timezone.utc))
+
+
+def reset_iso_for_hit_windows(usage: dict, threshold: float) -> str | None:
+    """按「撞哪个窗口锁哪个窗口」的原则计算 disabled_until。
+
+    只在 util >= threshold 的窗口里取 resets_at，然后取 max（保守：等所有
+    撞到的窗口都过去才恢复；但**不会**因为 5h 撞了而锁到 7d）。
+
+    入参 usage：Anthropic 风格 JSON（`flatten_usage` 消费的那种），对 OpenAI
+    合成结构（只有 five_hour / seven_day）同样适用。
+    """
+    candidates: list[datetime] = []
+    for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
+        obj = usage.get(key) or {}
+        util = obj.get("utilization")
+        if util is None:
+            continue
+        try:
+            if float(util) < threshold:
+                continue
+        except (TypeError, ValueError):
+            continue
+        dt = _parse_iso(obj.get("resets_at"))
+        if dt is not None:
+            candidates.append(dt)
+    if not candidates:
+        return None
+    latest = max(candidates)
+    return _format_utc(latest.astimezone(timezone.utc))
+
+
+def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
+                                 *, threshold: float | None = None) -> dict:
+    """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
+
+    规则：
+      • disabled_reason in ("user", "auth_error") → 完全不碰（手动禁用永远不自动恢复）
+      • 任一窗口 util ≥ threshold → 需要禁用
+          - 账号已是 quota 禁用：保持不动（不刷新 disabled_until，避免目标移动）
+          - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
+      • 所有窗口 util < threshold → 可用
+          - 账号是 quota 禁用：set_enabled(True) 自动恢复（忽略 disabled_until，
+            因为 usage 本身已是真实状态）
+          - 账号未禁用：无事发生
+
+    返回: {
+      "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
+                "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
+      "utils": [5h, 7d, sonnet, opus],   # None 表示该指标缺失
+      "any_over": bool,
+      "hit_windows": ["5h", "7d", ...],   # util ≥ threshold 的窗口标签
+      "disabled_until": str|None,
+    }
+    """
+    if threshold is None:
+        qm = config.get().get("quotaMonitor") or {}
+        try:
+            threshold = float(qm.get("disableThresholdPercent", 95))
+        except Exception:
+            threshold = 95.0
+
+    utils = extract_utils_percent(usage)
+    window_labels = ["5h", "7d", "sonnet", "opus"]
+    hit_windows = [lbl for lbl, u in zip(window_labels, utils)
+                   if u is not None and u >= threshold]
+    any_over = bool(hit_windows)
+
+    acc = get_account(account_key)
+    if acc is None:
+        return {"action": "noop_missing", "utils": utils, "any_over": any_over,
+                "hit_windows": hit_windows, "disabled_until": None}
+    reason = acc.get("disabled_reason")
+    if reason in ("user", "auth_error"):
+        return {"action": f"noop_{reason}", "utils": utils, "any_over": any_over,
+                "hit_windows": hit_windows,
+                "disabled_until": acc.get("disabled_until")}
+
+    if any_over:
+        if reason == "quota":
+            return {"action": "still_over_quota", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": acc.get("disabled_until")}
+        latest_reset = reset_iso_for_hit_windows(usage, threshold)
+        try:
+            set_disabled_by_quota(account_key, latest_reset)
+        except Exception as exc:
+            print(f"[oauth] evaluate set_disabled_by_quota failed for {account_key}: {exc}")
+            return {"action": "disable_failed", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": None}
+        return {"action": "disabled", "utils": utils, "any_over": True,
+                "hit_windows": hit_windows, "disabled_until": latest_reset}
+
+    # 全部窗口都可用
+    if reason == "quota":
+        try:
+            set_enabled(account_key, True)
+        except Exception as exc:
+            print(f"[oauth] evaluate set_enabled failed for {account_key}: {exc}")
+            return {"action": "resume_failed", "utils": utils,
+                    "any_over": False, "hit_windows": [],
+                    "disabled_until": acc.get("disabled_until")}
+        return {"action": "resumed", "utils": utils, "any_over": False,
+                "hit_windows": [], "disabled_until": None}
+    return {"action": "kept_enabled", "utils": utils, "any_over": False,
+            "hit_windows": [], "disabled_until": None}
 
 
 # ─── 账户增删改 ───────────────────────────────────────────────────
@@ -1079,39 +1190,36 @@ async def quota_monitor_once() -> dict:
 
         state_db.quota_save(ak, flatten_usage(usage), email=email)
 
-        utils = extract_utils_percent(usage)
-        any_over = any(u is not None and u >= threshold for u in utils)
+        result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold)
+        utils = result["utils"]
+        action = result["action"]
 
-        if any_over:
-            if acc.get("disabled_reason") == "quota":
-                out[email] = "still_over_quota"
-                continue
-            latest_reset = latest_reset_iso(usage)
-            set_disabled_by_quota(ak, latest_reset)
+        if action == "disabled":
+            latest_reset = result["disabled_until"]
+            hit = " / ".join(result["hit_windows"]) or "?"
             out[email] = f"disabled_quota:{latest_reset}"
             notifier.notify_event(
                 "quota_disabled",
                 "⚠ <b>OAuth 配额已用尽，账号被自动禁用</b>\n"
                 f"账号: <code>{notifier.escape_html(email)}</code>\n"
+                f"撞到窗口: <code>{hit}</code>\n"
                 f"重置时间: <code>{_to_bjt(latest_reset) if latest_reset else 'unknown'}</code>\n"
-                "达到该时间且各项指标 &lt; 阈值后会自动恢复。"
+                "所有撞到窗口恢复后即可自动解禁。"
             )
+        elif action == "still_over_quota":
+            out[email] = "still_over_quota"
+        elif action == "resumed":
+            out[email] = "resumed"
+            notifier.notify_event(
+                "quota_resumed",
+                "✅ <b>OAuth 配额已恢复，账号重新启用</b>\n"
+                f"账号: <code>{notifier.escape_html(email)}</code>",
+            )
+        elif action == "kept_enabled":
+            parts = [f"{u:.0f}%" if u is not None else "-" for u in utils]
+            out[email] = f"ok:{','.join(parts)}"
         else:
-            if acc.get("disabled_reason") == "quota":
-                du = _parse_iso(acc.get("disabled_until"))
-                if du is not None and du > datetime.now(timezone.utc):
-                    out[email] = "quota_pending_reset"
-                    continue
-                set_enabled(ak, True)
-                out[email] = "resumed"
-                notifier.notify_event(
-                    "quota_resumed",
-                    "✅ <b>OAuth 配额已恢复，账号重新启用</b>\n"
-                    f"账号: <code>{notifier.escape_html(email)}</code>",
-                )
-            else:
-                parts = [f"{u:.0f}%" if u is not None else "-" for u in utils]
-                out[email] = f"ok:{','.join(parts)}"
+            out[email] = action
     return out
 
 
