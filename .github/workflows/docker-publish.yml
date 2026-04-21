@@ -14,7 +14,40 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/parrot
 
 jobs:
+  # ── 版本号变更检测 ──────────────────────────────────────────────
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check version change
+        id: diff
+        run: |
+          # tag 推送 / 手动触发 → 始终构建
+          if [[ "${{ github.ref }}" == refs/tags/* ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # push main → 对比前后 commit 的 __version__
+          NEW_VER=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/__init__.py || echo '')
+          OLD_VER=$(git show HEAD~1:src/__init__.py 2>/dev/null | grep -oP '__version__\s*=\s*"\K[^"]+' || echo '')
+          if [[ "$NEW_VER" != "$OLD_VER" ]]; then
+            echo "Version changed: $OLD_VER → $NEW_VER"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged ($NEW_VER), skipping build"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 构建 & 推送 ─────────────────────────────────────────────────
   build-and-push:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
