@@ -161,6 +161,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "gpt-5.2-codex",
                     "gpt-5.3-codex",
                     "gpt-5.4",
+                    "gpt-5.5",
                 ],
             },
         },
