@@ -27,8 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
-    fingerprint, log_db, notifier, oauth_manager, probe, public_ip,
-    scheduler, scorer, state_db, upstream,
+    fingerprint, log_db, model_mapping, notifier, oauth_manager, probe,
+    public_ip, scheduler, scorer, state_db, upstream,
 )
 from src.channel import registry
 from datetime import datetime, timezone
@@ -363,6 +363,13 @@ async def proxy_messages(request: Request):
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, f"invalid json: {e}"
         )
+
+    # 2.1 模型映射 / 入口默认模型：
+    #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
+    #     - body.model 命中别名 → 改写成真实名（只解一层）
+    #     后续白名单/调度/channel 全按真实名走。
+    model_mapping.apply_default(body, "anthropic")
+    model_mapping.apply_mapping(body, "anthropic")
 
     model = body.get("model")
     if not model:

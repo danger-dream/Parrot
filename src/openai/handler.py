@@ -30,7 +30,10 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import Response
 
-from .. import auth, config, errors, failover, fingerprint, log_db, notifier, scheduler
+from .. import (
+    auth, config, errors, failover, fingerprint, log_db, model_mapping,
+    notifier, scheduler,
+)
 from ..channel import registry
 from .transform.guard import GuardError, guard_chat_ingress, guard_responses_ingress
 from .transform.responses_to_chat import resolve_current_input_items
@@ -116,6 +119,18 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "request body must be a JSON object",
         )
+
+    # 2.1 模型映射 / 入口默认模型：
+    #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
+    #     - body.model 命中别名 → 改写成真实名（只解一层）
+    #     后续白名单/调度/channel 全按真实名走。
+    #     ingress_protocol 这里是 "chat"/"responses"，需要转成配置里的
+    #     完整 ingress line 名。
+    _ingress_line = (
+        "openai-chat" if ingress_protocol == "chat" else "openai-responses"
+    )
+    model_mapping.apply_default(body, _ingress_line)
+    model_mapping.apply_mapping(body, _ingress_line)
 
     # 3. model 白名单
     model = body.get("model")
