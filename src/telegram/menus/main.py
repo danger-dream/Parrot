@@ -135,7 +135,7 @@ def _overview() -> str:
     # 配额预警提示
     if quota_hot > 0:
         lines.append("")
-        lines.append(f"⚠ <b>{quota_hot} 个 OAuth 账号用量 ≥80%</b>，请在「📊 状态总览」查看详情。")
+        lines.append(f"⚠ <b>{quota_hot} 个 OAuth 账号用量 ≥80%</b>，请在「🔐 管理 OAuth」查看详情。")
 
     # ─── 底部固定信息块（每次进入主菜单都重新生成） ───
     lines.append("")
