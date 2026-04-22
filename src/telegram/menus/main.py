@@ -24,7 +24,8 @@ def _kb() -> dict:
         [ui.btn("🔐 管理 OAuth", "menu:oauth"),
          ui.btn("🔑 管理 API Key", "menu:apikey")],
         [ui.btn("🔁 模型映射", "map:show"),
-         ui.btn("⚙ 系统设置", "menu:settings"),
+         ui.btn("🧩 OAuth 默认", "odm:show")],
+        [ui.btn("⚙ 系统设置", "menu:settings"),
          ui.btn("❓ 帮助", "menu:help")],
     ])
 

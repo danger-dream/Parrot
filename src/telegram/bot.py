@@ -22,7 +22,7 @@ from typing import Optional
 from . import states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, logs_menu, mapping_menu,
-    oauth_menu, stats_menu, status_menu, system_menu,
+    oauth_defaults_menu, oauth_menu, stats_menu, status_menu, system_menu,
 )
 from .menus import main as main_menu
 
@@ -96,6 +96,7 @@ def start() -> None:
         {"command": "keys",     "description": "管理 API Key"},
         {"command": "settings", "description": "系统设置"},
         {"command": "mapping",  "description": "模型映射 / 默认模型"},
+        {"command": "oauth_defaults", "description": "OAuth 默认模型"},
         {"command": "help",     "description": "帮助"},
     ])
 
@@ -261,6 +262,10 @@ def _handle_callback(cb: dict) -> None:
     if mapping_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
+    # OAuth 默认模型菜单
+    if oauth_defaults_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
     # 未知 callback
     ui.answer_cb(cb_id, "未知操作")
 
@@ -298,6 +303,9 @@ def _handle_message(msg: dict) -> None:
         if mapping_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by mapping_menu (action={action})")
             return
+        if oauth_defaults_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by oauth_defaults_menu (action={action})")
+            return
         print(f"[tg] state action={action!r} not consumed by any menu")  # DEBUG
         # 未来其他菜单也在此分派
 
@@ -322,6 +330,8 @@ def _handle_message(msg: dict) -> None:
         system_menu.send_new(chat_id); return
     if text.startswith("/mapping"):
         mapping_menu.send_new(chat_id); return
+    if text.startswith("/oauth_defaults"):
+        oauth_defaults_menu.send_new(chat_id); return
     if text.startswith("/help"):
         help_menu.send_new(chat_id); return
 
