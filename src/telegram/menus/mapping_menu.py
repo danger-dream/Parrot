@@ -148,13 +148,13 @@ def _line_kb(line: str) -> dict:
     # 新增映射
     rows.append([ui.btn("➕ 新增映射", f"map:add:{lc}")])
 
-    # 每条映射一个删除按钮
+    # 每条映射一个按钮 → 点进去看详情/改/删
     mp = model_mapping.get_ingress_map(line)
     for alias, real in sorted(mp.items()):
         # alias 可能带符号, 用短码
         ac = ui.register_code(f"map:alias:{line}:{alias}")
-        btn_label = f"🗑 {alias} → {real}"
-        rows.append([ui.btn(btn_label, f"map:rm:{lc}:{ac}")])
+        btn_label = f"{alias} → {real}"
+        rows.append([ui.btn(btn_label, f"map:item:{lc}:{ac}")])
 
     rows.append([ui.btn("◀ 返回映射总览", "map:show")])
     return ui.inline_kb(rows)
@@ -163,6 +163,235 @@ def _line_kb(line: str) -> dict:
 def _show_line(chat_id: int, message_id: int, cb_id: str, line: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(chat_id, message_id, _line_text(line), reply_markup=_line_kb(line))
+
+# ─── Level 3d 条目详情页 (点某条映射时弹出) ──────────────────────
+
+def _show_item(
+    chat_id: int, message_id: int, cb_id: str,
+    line: str, alias_code: str,
+) -> None:
+    alias_tag = ui.resolve_code(alias_code)
+    if not alias_tag:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    try:
+        _, _, at_line, alias = alias_tag.split(":", 3)
+    except ValueError:
+        ui.answer_cb(cb_id, "会话异常"); return
+    if at_line != line:
+        ui.answer_cb(cb_id, "会话异常"); return
+
+    mp = model_mapping.get_ingress_map(line)
+    real = mp.get(alias)
+    if real is None:
+        ui.answer_cb(cb_id, "该映射已不存在")
+        _show_line(chat_id, message_id, "-", line)
+        return
+
+    ui.answer_cb(cb_id)
+    lc = _code_of_line(line)
+    text = (
+        f"{_LINE_ICON[line]} <b>映射条目 · "
+        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"别名: <code>{ui.escape_html(alias)}</code>\n"
+        f"真实: <code>{ui.escape_html(real)}</code>\n\n"
+        "请选择操作:"
+    )
+    kb = ui.inline_kb([
+        [ui.btn("🏷 修改别名", f"map:edit_alias:{lc}:{alias_code}"),
+         ui.btn("🎯 修改真实", f"map:edit_real:{lc}:{alias_code}")],
+        [ui.btn("🗑 删除本条", f"map:rm:{lc}:{alias_code}")],
+        [ui.btn("◀ 返回", f"map:line:{lc}")],
+    ])
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _start_edit_alias(
+    chat_id: int, message_id: int, cb_id: str,
+    line: str, alias_code: str,
+) -> None:
+    """修改别名: 提示输入新别名, 用 `map_alias_edit:<line>:<old_alias_code>` 状态."""
+    alias_tag = ui.resolve_code(alias_code)
+    if not alias_tag:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    try:
+        _, _, at_line, alias = alias_tag.split(":", 3)
+    except ValueError:
+        ui.answer_cb(cb_id, "会话异常"); return
+    if at_line != line:
+        ui.answer_cb(cb_id, "会话异常"); return
+    mp = model_mapping.get_ingress_map(line)
+    if alias not in mp:
+        ui.answer_cb(cb_id, "该映射已不存在")
+        _show_line(chat_id, message_id, "-", line); return
+
+    ui.answer_cb(cb_id)
+    lc = _code_of_line(line)
+    states.set_state(chat_id, f"map_alias_edit:{lc}:{alias_code}")
+    ui.edit(
+        chat_id, message_id,
+        f"{_LINE_ICON[line]} <b>修改别名 · "
+        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"当前别名: <code>{ui.escape_html(alias)}</code> → "
+        f"<code>{ui.escape_html(mp[alias])}</code>\n\n"
+        "请输入<b>新别名</b>(保持真实模型不变):",
+        reply_markup=ui.inline_kb([
+            [ui.btn("❌ 取消", f"map:item:{lc}:{alias_code}")],
+        ]),
+    )
+
+
+def _on_alias_edit(chat_id: int, action: str, text: str) -> None:
+    """状态机回调: 用户发来新别名。action = map_alias_edit:<lc>:<alias_code>"""
+    parts = action.split(":")
+    if len(parts) < 3:
+        states.pop_state(chat_id); return
+    lc, alias_code = parts[1], parts[2]
+    line = _line_of_code(lc)
+    if not line:
+        states.pop_state(chat_id)
+        ui.send(chat_id, "❌ 会话异常"); return
+    alias_tag = ui.resolve_code(alias_code)
+    if not alias_tag:
+        states.pop_state(chat_id)
+        ui.send(chat_id, "❌ 会话已过期, 请重新操作"); return
+    try:
+        _, _, at_line, old_alias = alias_tag.split(":", 3)
+    except ValueError:
+        states.pop_state(chat_id)
+        ui.send(chat_id, "❌ 会话异常"); return
+    if at_line != line:
+        states.pop_state(chat_id)
+        ui.send(chat_id, "❌ 会话异常"); return
+
+    new_alias = (text or "").strip()
+    if not new_alias:
+        ui.send(chat_id, "❌ 别名不能为空, 请重新输入:"); return
+    if any(c.isspace() for c in new_alias):
+        ui.send(chat_id, "❌ 别名不能包含空白, 请重新输入:"); return
+    if new_alias == old_alias:
+        # 没变, 直接当取消处理
+        states.pop_state(chat_id)
+        ui.send(chat_id, "ℹ 新别名与原别名一致, 未做更改。")
+        return
+    real_models = model_mapping.list_available_models_for(line)
+    if new_alias in real_models:
+        ui.send(
+            chat_id,
+            f"❌ 新别名 <code>{ui.escape_html(new_alias)}</code> 已经是真实模型名。请换一个:",
+        ); return
+    existing = model_mapping.get_ingress_map(line)
+    if new_alias in existing:
+        ui.send(
+            chat_id,
+            f"❌ 新别名 <code>{ui.escape_html(new_alias)}</code> 在该入口已被占用 "
+            f"(当前指向 <code>{ui.escape_html(existing[new_alias])}</code>)。请换一个:",
+        ); return
+    if old_alias not in existing:
+        states.pop_state(chat_id)
+        ui.send(chat_id, "❌ 原映射已不存在 (可能被另一处删除)"); return
+
+    real = existing[old_alias]
+    # 原子替换: 先加新的, 再删旧的 (中间状态下两条都存在, 不影响可用性)
+    model_mapping.set_mapping(line, new_alias, real)
+    model_mapping.remove_mapping(line, old_alias)
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id,
+        f"✅ 已修改别名\n"
+        f"{_LINE_ICON[line]} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}\n"
+        f"<code>{ui.escape_html(old_alias)}</code> → "
+        f"<code>{ui.escape_html(new_alias)}</code> (真实: <code>{ui.escape_html(real)}</code>)",
+        back_label="◀ 返回该入口",
+        back_callback=f"map:line:{_code_of_line(line)}",
+    )
+
+
+def _start_edit_real(
+    chat_id: int, message_id: int, cb_id: str,
+    line: str, alias_code: str,
+) -> None:
+    """修改真实模型: 直接弹 picker, 保持别名不变."""
+    alias_tag = ui.resolve_code(alias_code)
+    if not alias_tag:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    try:
+        _, _, at_line, alias = alias_tag.split(":", 3)
+    except ValueError:
+        ui.answer_cb(cb_id, "会话异常"); return
+    if at_line != line:
+        ui.answer_cb(cb_id, "会话异常"); return
+    mp = model_mapping.get_ingress_map(line)
+    if alias not in mp:
+        ui.answer_cb(cb_id, "该映射已不存在")
+        _show_line(chat_id, message_id, "-", line); return
+    if not model_mapping.list_available_models_for(line):
+        ui.answer_cb(cb_id, "无可用真实模型")
+        return
+    ui.answer_cb(cb_id)
+    _edit_edit_real_picker(chat_id, message_id, line, alias_code, page=0)
+
+
+def _edit_edit_real_picker(
+    chat_id: int, message_id: int, line: str, alias_code: str, page: int,
+) -> None:
+    alias_tag = ui.resolve_code(alias_code) or ""
+    alias = alias_tag.split(":", 3)[-1] if alias_tag else "?"
+    mp = model_mapping.get_ingress_map(line)
+    current = mp.get(alias, "?")
+
+    models = model_mapping.list_available_models_for(line)
+    total = len(models)
+    total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    text = (
+        f"{_LINE_ICON[line]} <b>修改真实模型 · "
+        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"别名: <code>{ui.escape_html(alias)}</code>\n"
+        f"当前真实: <code>{ui.escape_html(current)}</code>\n\n"
+        "请选择新的真实模型:\n"
+        f"<i>第 {page + 1}/{total_pages} 页, 共 {total} 个可选模型。</i>"
+    )
+    kb = _picker_kb(
+        models, page,
+        make_row_callback=lambda mc, p: (
+            f"map:pick_edit_real:{_code_of_line(line)}:{alias_code}:{mc}:{p}"
+        ),
+        make_nav_callback=lambda p: (
+            f"map:page_edit_real:{_code_of_line(line)}:{alias_code}:{p}"
+        ),
+        cancel_callback=f"map:item:{_code_of_line(line)}:{alias_code}",
+    )
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _on_pick_edit_real(
+    chat_id: int, message_id: int, cb_id: str,
+    line: str, alias_code: str, model_code: str,
+) -> None:
+    alias_tag = ui.resolve_code(alias_code)
+    model_tag = ui.resolve_code(model_code)
+    if not alias_tag or not model_tag:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    try:
+        _, _, at_line, alias = alias_tag.split(":", 3)
+    except ValueError:
+        ui.answer_cb(cb_id, "会话异常"); return
+    if at_line != line:
+        ui.answer_cb(cb_id, "会话异常"); return
+    try:
+        _, _, real = model_tag.split(":", 2)
+    except ValueError:
+        ui.answer_cb(cb_id, "会话异常"); return
+    mp = model_mapping.get_ingress_map(line)
+    if alias not in mp:
+        ui.answer_cb(cb_id, "该映射已不存在")
+        _show_line(chat_id, message_id, "-", line); return
+    try:
+        model_mapping.set_mapping(line, alias, real)
+    except ValueError as exc:
+        ui.answer_cb(cb_id, str(exc)); return
+    ui.answer_cb(cb_id, "✅ 已更新")
+    _show_item(chat_id, message_id, "-", line, alias_code)
+
 
 
 # ─── Level 3a 新增映射: Step 1 输入别名 ──────────────────────────
@@ -584,6 +813,42 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str,
         model_code = parts[4]
         _on_pick_real(chat_id, message_id, cb_id, line, alias_code, model_code)
         return True
+    if action == "item":
+        if len(parts) < 4:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        alias_code = parts[3]
+        _show_item(chat_id, message_id, cb_id, line, alias_code)
+        return True
+    if action == "edit_alias":
+        if len(parts) < 4:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        alias_code = parts[3]
+        _start_edit_alias(chat_id, message_id, cb_id, line, alias_code)
+        return True
+    if action == "edit_real":
+        if len(parts) < 4:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        alias_code = parts[3]
+        _start_edit_real(chat_id, message_id, cb_id, line, alias_code)
+        return True
+    if action == "pick_edit_real":
+        if len(parts) < 5:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        alias_code = parts[3]
+        model_code = parts[4]
+        _on_pick_edit_real(chat_id, message_id, cb_id, line, alias_code, model_code)
+        return True
+    if action == "page_edit_real":
+        if len(parts) < 5:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        alias_code = parts[3]
+        try:
+            page = int(parts[4])
+        except ValueError:
+            page = 0
+        ui.answer_cb(cb_id)
+        _edit_edit_real_picker(chat_id, message_id, line, alias_code, page)
+        return True
     if action == "rm":
         if len(parts) < 4:
             ui.answer_cb(cb_id, "会话异常"); return True
@@ -602,7 +867,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str,
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
-    if not action.startswith("map_alias_input:"):
-        return False
-    _on_alias_input(chat_id, action, text)
-    return True
+    if action.startswith("map_alias_input:"):
+        _on_alias_input(chat_id, action, text)
+        return True
+    if action.startswith("map_alias_edit:"):
+        _on_alias_edit(chat_id, action, text)
+        return True
+    return False

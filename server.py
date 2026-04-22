@@ -307,11 +307,36 @@ async def list_models(request: Request):
         all_models = registry.available_models_for_families(families)
     else:
         all_models = registry.available_models()
+        families = None
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
     else:
         visible = all_models
+
+    # 把 modelMapping 里的别名也当成可用模型暴露出去:
+    # 条件 = 别名所属 ingress line 的家族对该 Key 放行, 且别名指向的真实模型
+    # 也在 visible 集合里 (否则客户端调不通, 暴露就是坑)。
+    allowed_families = families  # None = 全放行
+    visible_set = set(visible)
+    alias_seen: set[str] = set()
+    for _line in model_mapping.INGRESS_LINES:
+        _fam = model_mapping.INGRESS_FAMILY[_line]
+        if allowed_families is not None and _fam not in allowed_families:
+            continue
+        _mp = model_mapping.get_ingress_map(_line)
+        for _alias, _real in _mp.items():
+            if _alias in visible_set or _alias in alias_seen:
+                continue
+            if _real not in visible_set:
+                continue
+            # Key 有白名单时, 别名必须显式授权 (白名单按真名语义, 但下游看到的
+            # 是别名, 这里做 strict 检查: 白名单里如果没别名就不暴露)
+            if allowed_models and _alias not in set(allowed_models):
+                continue
+            alias_seen.add(_alias)
+    if alias_seen:
+        visible = sorted(visible_set | alias_seen)
 
     # Anthropic 的 created_at 字段有真实的模型发布时间，我们没有，用启动后
     # 的一个稳定占位符（保持响应结构兼容，字段不为 null）。
