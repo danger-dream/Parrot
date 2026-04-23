@@ -32,18 +32,17 @@ def _kb() -> dict:
 
 def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     """返回当前用量 >= threshold 的 OAuth 账户数量（不含已禁用）。"""
-    cfg = config.get()
-    # 按访问节流刷新 usage（quotaMonitor.enabled=True 时此调用内部自动跳过）
+    # 使用 oauth_manager.list_accounts() 作为唯一数据源，
+    # 覆盖所有 provider（Claude + OpenAI），而非仅 cfg.oauthAccounts。
+    accounts = oauth_manager.list_accounts()
     account_keys = [
-        _account_key(a) for a in cfg.get("oauthAccounts", [])
+        _account_key(a) for a in accounts
         if a.get("email") and not a.get("disabled_reason")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
     n = 0
-    for acc in cfg.get("oauthAccounts", []):
-        if acc.get("disabled_reason"):
-            continue
+    for acc in accounts:
         email = acc.get("email")
         if not email:
             continue

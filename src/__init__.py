@@ -8,4 +8,4 @@ GitHub Release tag）都应从这里读取或与此保持同步。
 构建流程同步。
 """
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"

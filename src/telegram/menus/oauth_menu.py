@@ -268,7 +268,61 @@ def _format_usage_block(account_key: str) -> str:
 
 # ─── 列表视图 ─────────────────────────────────────────────────────
 
-def _list_text_and_kb() -> tuple[str, dict]:
+_PAGE_SIZE = 4  # 每页显示账户数
+
+
+def _build_pagination_row(current: int, total_pages: int) -> list[dict]:
+    """构建翻页按钮行。
+
+    • 总页数 ≤ 10：⬅ 上一页 / ➡ 下一页
+    • 总页数 > 10：页码按钮组，当前页加 [] 标记
+    """
+    if total_pages <= 1:
+        return []
+
+    if total_pages <= 10:
+        # 上一页 / 下一页 样式（首末页按钮保留但显示为禁用态）
+        btns: list[dict] = []
+        if current > 1:
+            btns.append(ui.btn("⬅ 上一页", f"oa:page:{current - 1}"))
+        else:
+            btns.append(ui.btn("◁ 上一页", "oa:page:noop"))
+        btns.append(ui.btn(f"{current}/{total_pages}", "oa:page:noop"))
+        if current < total_pages:
+            btns.append(ui.btn("➡ 下一页", f"oa:page:{current + 1}"))
+        else:
+            btns.append(ui.btn("下一页 ▷", "oa:page:noop"))
+        return btns
+
+    # 页码按钮组：显示当前页附近的窗口（最多 5 个）
+    window = 2
+    lo = max(1, current - window)
+    hi = min(total_pages, current + window)
+    # 补齐到至少 5 个
+    if hi - lo + 1 < 5:
+        if lo == 1:
+            hi = min(total_pages, lo + 4)
+        else:
+            lo = max(1, hi - 4)
+
+    page_btns: list[dict] = []
+    if lo > 1:
+        page_btns.append(ui.btn("1", "oa:page:1"))
+        if lo > 2:
+            page_btns.append(ui.btn("…", "oa:page:noop"))
+    for p in range(lo, hi + 1):
+        if p == current:
+            page_btns.append(ui.btn(f"[{p}]", "oa:page:noop"))
+        else:
+            page_btns.append(ui.btn(str(p), f"oa:page:{p}"))
+    if hi < total_pages:
+        if hi < total_pages - 1:
+            page_btns.append(ui.btn("…", "oa:page:noop"))
+        page_btns.append(ui.btn(str(total_pages), f"oa:page:{total_pages}"))
+    return page_btns
+
+
+def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
     accounts = oauth_manager.list_accounts()
     # 按访问节流刷新所有账户的 usage（quotaMonitor.enabled=True 时内部跳过）
     account_keys = [
@@ -297,6 +351,11 @@ def _list_text_and_kb() -> tuple[str, dict]:
     cooling_only = len(cd_keys_any - cd_keys_perm)
     permanent = len(cd_keys_perm)
 
+    import math
+    total_pages = max(1, math.ceil(total / _PAGE_SIZE)) if total else 1
+    page = max(1, min(page, total_pages))
+    page_info = f" | 第 {page}/{total_pages} 页" if total_pages > 1 else ""
+
     summary = (
         f"🔐 <b>OAuth 账户管理</b>\n"
         f"共 {total} 个账户 | 正常 {normal}"
@@ -305,13 +364,17 @@ def _list_text_and_kb() -> tuple[str, dict]:
         + (f" | 认证失败 {auth_err}" if auth_err else "")
         + (f" | ⚠ 冷却 {cooling_only}" if cooling_only else "")
         + (f" | 🔴 永久 {permanent}" if permanent else "")
+        + page_info
     )
 
     if not accounts:
         text = summary + "\n\n暂无账户，点击下方「➕ 新增账户」添加。"
     else:
+        start = (page - 1) * _PAGE_SIZE
+        end = min(start + _PAGE_SIZE, total)
+        page_accounts = accounts[start:end]
         lines = [summary, ""]
-        for i, acc in enumerate(accounts, 1):
+        for i, acc in enumerate(page_accounts, start=start + 1):
             # 序号 + 账号多行块；序号前缀追加到块的第一行
             block = _format_account_block(acc)
             first, _, rest = block.partition("\n")
@@ -321,15 +384,30 @@ def _list_text_and_kb() -> tuple[str, dict]:
             lines.append("")
         text = "\n".join(lines).rstrip()
 
+    # ── 按钮区 ──
     rows: list[list[dict]] = []
-    for acc in accounts:
-        email = acc.get("email", "?")
-        ak = _account_key(acc)
-        short = ui.register_code(ak)
-        # 按钮文本仍用 email（+ provider tag 让同邮箱双账号可区分）
-        prov = oauth_manager.provider_of(acc)
-        tag = " 🅾" if prov == "openai" else (" 🅰" if prov == "claude" else "")
-        rows.append([ui.btn(f"  {email}{tag}  ", f"oa:view:{short}")])
+
+    # 当前页账户按钮（每行 2 个，图标在邮箱前面）
+    start = (page - 1) * _PAGE_SIZE
+    end = min(start + _PAGE_SIZE, total)
+    page_accs = accounts[start:end]
+    for idx in range(0, len(page_accs), 2):
+        row_btns: list[dict] = []
+        for acc in page_accs[idx:idx + 2]:
+            email = acc.get("email", "?")
+            ak = _account_key(acc)
+            short = ui.register_code(ak)
+            prov = oauth_manager.provider_of(acc)
+            tag = "🅾" if prov == "openai" else ("🅰" if prov == "claude" else "✉")
+            row_btns.append(ui.btn(f"{tag} {email}", f"oa:view:{short}"))
+        rows.append(row_btns)
+
+    # 翻页
+    pag_row = _build_pagination_row(page, total_pages)
+    if pag_row:
+        rows.append(pag_row)
+
+    # 操作按钮（每页都有）
     rows.append([
         ui.btn("➕ 新增账户", "oa:add"),
         ui.btn("🔄 刷新全部用量", "oa:refresh_all"),
@@ -341,15 +419,15 @@ def _list_text_and_kb() -> tuple[str, dict]:
     return ui.truncate(text), ui.inline_kb(rows)
 
 
-def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    text, kb = _list_text_and_kb()
+    text, kb = _list_text_and_kb(page=page)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def send_new(chat_id: int) -> None:
-    text, kb = _list_text_and_kb()
+def send_new(chat_id: int, page: int = 1) -> None:
+    text, kb = _list_text_and_kb(page=page)
     ui.send(chat_id, text, reply_markup=kb)
 
 
@@ -801,6 +879,14 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str) -> None:
     lines.append("📢 用量刷新完成，本消息 5 分钟后自动销毁。")
     _flush()
 
+    # ─ 刷新原始 OAuth 列表面板，让用户无需离开再进来 ─
+    try:
+        list_text, list_kb = _list_text_and_kb()
+        if list_text:
+            ui.edit(chat_id, message_id, list_text, reply_markup=list_kb)
+    except Exception:
+        pass
+
     if progress_mid != -1:
         import threading as _t
         def _delete_later():
@@ -1029,6 +1115,25 @@ def on_set_json_input(chat_id: int, text: str) -> None:
 _OA_NAV_OPENAI = {"back_label": "◀ 返回 OAuth 列表", "back_callback": "menu:oauth"}
 
 
+def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
+    """构建 OpenAI 登录页的文本和键盘（复用于首次生成和重新生成）。"""
+    text = (
+        "请在浏览器打开以下链接登录 OpenAI / ChatGPT 账号：\n\n"
+        f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
+        "👇 长按下方地址可复制（推荐用隐私浏览器打开）：\n"
+        f"<code>{ui.escape_html(url)}</code>\n\n"
+        "登录后浏览器会跳到 <code>http://localhost:1455/auth/callback?code=...&amp;state=...</code>"
+        "（页面显示「无法访问此网站」属正常，代理不会监听这个端口）。\n"
+        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
+        "<i>（登录会话 30 分钟内有效）</i>"
+    )
+    kb = ui.inline_kb([
+        [ui.btn("🔄 重新生成登录地址", "oa:login:openai:regen")],
+        [ui.btn("❌ 取消", "menu:oauth")],
+    ])
+    return text, kb
+
+
 def on_login_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     verifier, challenge = openai_provider.pkce_generate()
@@ -1039,15 +1144,13 @@ def on_login_openai_start(chat_id: int, message_id: int, cb_id: str) -> None:
         "code_verifier": verifier, "state": state,
     })
 
-    ui.edit(
-        chat_id, message_id,
-        "请在浏览器打开以下链接登录 OpenAI / ChatGPT 账号：\n\n"
-        f"<a href=\"{ui.escape_html(url)}\">点此打开登录页</a>\n\n"
-        "登录后浏览器会跳到 <code>http://localhost:1455/auth/callback?code=...&amp;state=...</code>"
-        "（页面显示「无法访问此网站」属正常，代理不会监听这个端口）。\n"
-        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
-        "<i>（登录会话 30 分钟内有效）</i>",
-    )
+    text, kb = _build_openai_login_text_and_kb(url)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_login_openai_regen(chat_id: int, message_id: int, cb_id: str) -> None:
+    """重新生成 PKCE + 登录 URL，覆盖旧状态。"""
+    on_login_openai_start(chat_id, message_id, cb_id)
 
 
 def _extract_openai_code_and_state(text: str) -> tuple[str, str]:
@@ -1257,6 +1360,17 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "oa:refresh_all":
         on_refresh_all(chat_id, message_id, cb_id)
         return True
+    if data.startswith("oa:page:"):
+        page_str = data.split(":", 2)[2]
+        if page_str == "noop":
+            ui.answer_cb(cb_id, "当前页")
+            return True
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 1
+        show(chat_id, message_id, cb_id, page=page)
+        return True
     if data == "oa:clear_all_errors":
         on_clear_all_errors(chat_id, message_id, cb_id)
         return True
@@ -1277,6 +1391,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data == "oa:login:openai":
         on_login_openai_start(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:login:openai:regen":
+        on_login_openai_regen(chat_id, message_id, cb_id)
         return True
     if data == "oa:set_rt:openai":
         on_set_rt_openai_start(chat_id, message_id, cb_id)
