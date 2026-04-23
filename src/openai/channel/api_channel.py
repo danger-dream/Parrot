@@ -15,6 +15,7 @@ import json
 from typing import Optional
 
 from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
+from ...channel.url_utils import resolve_upstream_url
 from ..transform import (
     chat_to_responses, common, guard, responses_to_chat,
 )
@@ -36,6 +37,9 @@ class OpenAIApiChannel(Channel):
         self.key = f"api:{self.name}"
         self.display_name = self.name
         self.base_url = (entry.get("baseUrl") or "").rstrip("/")
+        # apiPath：若用户把完整调用路径填到 baseUrl，registry 会把末段识别为协议后缀
+        # 并拆分存到这里。运行期非空 → `base_url + api_path`；否则走 default `/v1/xxx`。
+        self.api_path = entry.get("apiPath") or None
         self.api_key = entry.get("apiKey", "")
         self.models: list[dict] = list(entry.get("models") or [])
         self.enabled = bool(entry.get("enabled", True))
@@ -91,7 +95,7 @@ class OpenAIApiChannel(Channel):
         payload = common.filter_chat_passthrough(body)
         payload["model"] = resolved_model
         return UpstreamRequest(
-            url=f"{self.base_url}/v1/chat/completions",
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
@@ -102,7 +106,7 @@ class OpenAIApiChannel(Channel):
         payload = common.filter_responses_passthrough(body)
         payload["model"] = resolved_model
         return UpstreamRequest(
-            url=f"{self.base_url}/v1/responses",
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
@@ -120,7 +124,7 @@ class OpenAIApiChannel(Channel):
         stream_opts = body.get("stream_options") or {}
         include_usage = bool(stream_opts.get("include_usage")) if isinstance(stream_opts, dict) else False
         return UpstreamRequest(
-            url=f"{self.base_url}/v1/responses",
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
@@ -148,7 +152,7 @@ class OpenAIApiChannel(Channel):
         payload = responses_to_chat.translate_request(body, api_key_name=api_key_name)
         payload["model"] = resolved_model
         return UpstreamRequest(
-            url=f"{self.base_url}/v1/chat/completions",
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,

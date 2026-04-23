@@ -14,6 +14,11 @@ from .api_channel import ApiChannel
 from .base import Channel
 from .oauth_channel import OAuthChannel
 from .openai_oauth_channel import OpenAIOAuthChannel
+from .url_utils import (
+    normalize_api_path,
+    split_base_url,
+    validate_api_path_for_protocol,
+)
 
 
 _lock = threading.Lock()
@@ -162,7 +167,14 @@ def install_config_reload_hook() -> None:
 def add_api_channel(entry: dict) -> dict:
     """
     添加一个 API 渠道（type="api"），写入 config 并触发重建。
-    entry 需含 name/baseUrl/apiKey/models；可含 cc_mimicry/enabled。
+    entry 需含 name/baseUrl/apiKey/models；可含 cc_mimicry/enabled/apiPath。
+
+    apiPath 语义（拆分完整调用路径）：
+    - 如果用户在 baseUrl 里直接写了完整路径（末段命中 messages / completions /
+      responses 白名单），自动拆分：`baseUrl` 只留主机，`apiPath` 放完整路径。
+    - 运行期 api_channel.py 看到 apiPath 非空 → 直接拼接 `baseUrl + apiPath`。
+    - 如果 entry 里显式带了 apiPath 字段，优先用它且不再对 baseUrl 自动拆分。
+
     重名则抛 ValueError。
     """
     name = entry.get("name")
@@ -173,6 +185,25 @@ def add_api_channel(entry: dict) -> dict:
     # openai-* 渠道不走 Claude Code 伪装，强制 False
     default_cc = True if protocol == "anthropic" else False
 
+    raw_base = (entry.get("baseUrl") or "").rstrip("/")
+    explicit_api_path = entry.get("apiPath")
+    if explicit_api_path:
+        # UI 已经拆好，只做归一化 + 协议校验
+        split_base = raw_base
+        split_path = normalize_api_path(explicit_api_path)
+    else:
+        # 自动拆分：末段在白名单则拆，否则 (raw_base, None)
+        try:
+            split_base, split_path = split_base_url(raw_base)
+        except ValueError as exc:
+            raise ValueError(f"invalid baseUrl: {exc}")
+        split_path = normalize_api_path(split_path)
+
+    # 协议校验：apiPath 非空 → 末段必须与 protocol 匹配
+    err = validate_api_path_for_protocol(split_path, protocol)
+    if err:
+        raise ValueError(err)
+
     def _mutate(cfg):
         channels = cfg.setdefault("channels", [])
         if any(c.get("name") == name for c in channels):
@@ -180,7 +211,7 @@ def add_api_channel(entry: dict) -> dict:
         normalized = {
             "name": name,
             "type": "api",
-            "baseUrl": (entry.get("baseUrl") or "").rstrip("/"),
+            "baseUrl": split_base,
             "apiKey": entry.get("apiKey", ""),
             "protocol": protocol,
             "models": list(entry.get("models") or []),
@@ -189,6 +220,8 @@ def add_api_channel(entry: dict) -> dict:
             "enabled": bool(entry.get("enabled", True)),
             "disabled_reason": None,
         }
+        if split_path:
+            normalized["apiPath"] = split_path
         channels.append(normalized)
     config.update(_mutate)
     rebuild_from_config()
@@ -197,9 +230,16 @@ def add_api_channel(entry: dict) -> dict:
 
 def update_api_channel(name: str, patch: dict) -> dict | None:
     """
-    编辑渠道。patch 可含 name/baseUrl/apiKey/models/cc_mimicry/enabled。
+    编辑渠道。patch 可含 name/baseUrl/apiKey/models/cc_mimicry/enabled/apiPath/protocol。
     改名时自动在 state.db / scorer / affinity 上级联。
     返回更新后的 entry；若渠道不存在返回 None。
+
+    baseUrl / apiPath / protocol 联动规则：
+    - patch 显式带 `apiPath`（含空串 / None） → 以 patch 为准。
+    - 否则 patch 只带 `baseUrl` → 对新 baseUrl 尝试 split_base_url，
+      命中白名单则拆分（baseUrl + apiPath），未命中则清空旧的 apiPath。
+    - protocol 切换后如果当前 apiPath 与新 protocol 不匹配，抛错。
+    - patch 同时指定 baseUrl + apiPath 时以显式值为准。
     """
     old_key = f"api:{name}"
 
@@ -218,8 +258,49 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
             if any(c.get("name") == patch["name"] for c in channels):
                 raise ValueError(f"channel name already exists: {patch['name']}")
 
+        # 先算出本次更新后的 protocol / baseUrl / apiPath，再统一校验 + 写回
+        new_proto = target.get("protocol", "anthropic")
+        if "protocol" in patch:
+            np = patch["protocol"] or "anthropic"
+            if np not in ("anthropic", "openai-chat", "openai-responses"):
+                raise ValueError(f"unsupported protocol: {np}")
+            new_proto = np
+
+        new_base = target.get("baseUrl", "")
+        # apiPath 目标值的三种来源（优先级由高到低）：
+        # 1) patch 显式带 apiPath
+        # 2) patch 带 baseUrl 但无 apiPath → 用 baseUrl 末段判断是否拆分
+        # 3) 都没→保留原值
+        explicit_api_path_given = "apiPath" in patch
         if "baseUrl" in patch:
-            target["baseUrl"] = (patch["baseUrl"] or "").rstrip("/")
+            raw = (patch["baseUrl"] or "").rstrip("/")
+            if explicit_api_path_given:
+                new_base = raw
+            else:
+                # 根据新 baseUrl 重新判断是否拆分
+                try:
+                    split_base, split_path = split_base_url(raw)
+                except ValueError as exc:
+                    raise ValueError(f"invalid baseUrl: {exc}")
+                new_base = split_base
+                # 用自动拆分的结果覆盖原 apiPath（包括置空）
+                target["apiPath"] = normalize_api_path(split_path)
+
+        if explicit_api_path_given:
+            target["apiPath"] = normalize_api_path(patch.get("apiPath"))
+
+        # 空值 / None 同等看待：从 dict 删掉以避免进入序列化
+        if not target.get("apiPath"):
+            target.pop("apiPath", None)
+
+        # 校验 apiPath 与 new_proto 匹配
+        err = validate_api_path_for_protocol(target.get("apiPath"), new_proto)
+        if err:
+            raise ValueError(err)
+
+        # 写回 baseUrl
+        target["baseUrl"] = new_base
+
         if "apiKey" in patch:
             target["apiKey"] = patch["apiKey"]
         if "models" in patch:
@@ -227,9 +308,6 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         if "cc_mimicry" in patch:
             target["cc_mimicry"] = bool(patch["cc_mimicry"])
         if "protocol" in patch:
-            new_proto = patch["protocol"] or "anthropic"
-            if new_proto not in ("anthropic", "openai-chat", "openai-responses"):
-                raise ValueError(f"unsupported protocol: {new_proto}")
             target["protocol"] = new_proto
             # 切换到 openai-* 时强制关闭 CC 伪装；切回 anthropic 保留用户原设置（若无则 True）
             if new_proto != "anthropic":

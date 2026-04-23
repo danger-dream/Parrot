@@ -27,6 +27,11 @@ from typing import Any, Optional
 
 from ... import affinity, config, cooldown, log_db, probe, scorer, state_db
 from ...channel import api_channel, registry
+from ...channel.url_utils import (
+    detect_suffix_protocol,
+    split_base_url,
+    validate_api_path_for_protocol,
+)
 from .. import states, ui
 from . import main as main_menu
 
@@ -331,10 +336,13 @@ def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
     enabled = ch.enabled and not ch.disabled_reason
     protocol = _protocol_of(ch)
 
+    api_path = getattr(ch, "api_path", None)
+    # 展示完整 URL：apiPath 非空时拼完整，否则只给 baseUrl
+    url_display = ch.base_url + api_path if api_path else ch.base_url
     lines = [
         f"{icon} <b>{ui.escape_html(ch.display_name)}</b>",
         "",
-        f"🔗 URL: <code>{ui.escape_html(ch.base_url)}</code>",
+        f"🔗 URL: <code>{ui.escape_html(url_display)}</code>",
         f"🔑 Key: <code>{ui.escape_html(_mask_key(ch.api_key))}</code>",
     ]
     # 只在非 anthropic 时显示协议行，避免对现有 anthropic 渠道造成视觉噪声
@@ -451,7 +459,7 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str) -> None
         chat_id, message_id,
         "⚠ <b>确认删除渠道？</b>\n\n"
         f"• 名称: <code>{ui.escape_html(ch.display_name)}</code>\n"
-        f"• URL: <code>{ui.escape_html(ch.base_url)}</code>\n"
+        f"• URL: <code>{ui.escape_html((ch.base_url + getattr(ch, 'api_path', '')) if getattr(ch, 'api_path', None) else ch.base_url)}</code>\n"
         f"• 模型: {len(ch.models)} 个\n\n"
         "此操作会同时清除该渠道所有统计、冷却、亲和数据，不可恢复。",
         reply_markup=ui.inline_kb([[
@@ -520,6 +528,9 @@ def wiz_on_name_input(chat_id: int, text: str) -> None:
         "• Anthropic → <code>/v1/messages</code>\n"
         "• OpenAI Chat → <code>/v1/chat/completions</code>\n"
         "• OpenAI Responses → <code>/v1/responses</code>\n\n"
+        "<i>如果上游接口路径非标准（比如智谱 Coding Plan 的 "
+        "<code>/api/coding/paas/v4/chat/completions</code>），"
+        "直接把<b>完整调用路径</b>贴进来即可，系统会自动识别并拆分。</i>\n\n"
         "示例：<code>https://api.example.com</code>",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
@@ -535,7 +546,17 @@ def wiz_on_url_input(chat_id: int, text: str) -> None:
         ui.send(chat_id, "❌ 会话过期，请重新添加")
         return
     data = state["data"]
-    data["baseUrl"] = url
+    # 自动识别完整路径：末段命中 messages/completions/responses 则拆分
+    try:
+        split_base, split_path = split_base_url(url)
+    except ValueError as exc:
+        ui.send(chat_id, f"❌ URL 无效：{ui.escape_html(str(exc))}")
+        return
+    data["baseUrl"] = split_base
+    if split_path:
+        data["apiPath"] = split_path
+    else:
+        data.pop("apiPath", None)
     states.set_state(chat_id, "ch_wiz_protocol", data)
     _wiz_send_protocol_panel(chat_id)
 
@@ -543,15 +564,41 @@ def wiz_on_url_input(chat_id: int, text: str) -> None:
 def _wiz_send_protocol_panel(chat_id: int) -> None:
     rows = [[ui.btn(label, f"chw:proto:{proto}")] for proto, label in PROTOCOL_CHOICES]
     rows.append(_WIZ_NAV)
+    state = states.get_state(chat_id) or {}
+    data = state.get("data") or {}
+    api_path = data.get("apiPath")
+    head = "✅ URL 已设置\n\n"
+    if api_path:
+        # 提示已自动拆分，建议用户按 apiPath 末段对应的协议选
+        detected = detect_suffix_protocol(api_path)
+        detected_label = _PROTOCOL_LABEL.get(detected, "?") if detected else "?"
+        head = (
+            "✅ URL 已设置（检测到完整路径，已自动拆分）\n"
+            f"     • baseUrl: <code>{ui.escape_html(data.get('baseUrl',''))}</code>\n"
+            f"     • apiPath: <code>{ui.escape_html(api_path)}</code>\n"
+            f"     • 建议协议: <b>{ui.escape_html(detected_label)}</b>\n\n"
+        )
     ui.send(
         chat_id,
-        "✅ URL 已设置\n\n"
+        head +
         "➕ <b>添加渠道（3/5）</b>\n\n"
         "请选择该渠道的上游协议：\n\n"
         "• <b>Anthropic</b> — 对接 Claude 风格 <code>/v1/messages</code>，支持 CC 伪装（默认）\n"
         "• <b>OpenAI Chat</b> — 对接 <code>/v1/chat/completions</code> 兼容上游（DeepSeek、智谱等）\n"
         "• <b>OpenAI Responses</b> — 对接 <code>/v1/responses</code>（gpt-5 / o 系列 / 新 Responses API）",
         reply_markup=ui.inline_kb(rows),
+    )
+
+
+def _wiz_proceed_to_key_step(chat_id: int, message_id: int, data: dict, protocol: str) -> None:
+    """进入步骤 4（输入 API Key），公共逻辑。"""
+    data["protocol"] = protocol
+    states.set_state(chat_id, "ch_wiz_key", data)
+    ui.edit(
+        chat_id, message_id,
+        f"✅ 协议：<code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n\n"
+        "➕ <b>添加渠道（4/5）</b>\n\n请输入该渠道的 API Key：",
+        reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
 
 
@@ -564,13 +611,72 @@ def wiz_on_protocol_select(chat_id: int, message_id: int, cb_id: str, protocol: 
         ui.answer_cb(cb_id, "会话已过期")
         return
     data = state["data"]
-    data["protocol"] = protocol
-    states.set_state(chat_id, "ch_wiz_key", data)
+    api_path = data.get("apiPath")
+    detected = detect_suffix_protocol(api_path) if api_path else None
+    # apiPath 识别的协议 != 用户选的协议 → 弹确认面板
+    if api_path and detected and detected != protocol:
+        ui.answer_cb(cb_id)
+        detected_label = _PROTOCOL_LABEL.get(detected, detected)
+        chosen_label = _PROTOCOL_LABEL.get(protocol, protocol)
+        ui.edit(
+            chat_id, message_id,
+            "⚠ <b>协议与路径不匹配</b>\n\n"
+            f"您选择的协议：<code>{ui.escape_html(chosen_label)}</code>\n"
+            f"识别到的路径：<code>{ui.escape_html(api_path)}</code>\n"
+            f"路径对应协议：<b>{ui.escape_html(detected_label)}</b>\n\n"
+            "如何处理？",
+            reply_markup=ui.inline_kb([
+                [ui.btn(f"✅ 使用 {detected_label}（推荐）", f"chw:proto_adopt:{detected}")],
+                [ui.btn(f"⚠ 坚持 {chosen_label}，清空自定义路径", f"chw:proto_force:{protocol}")],
+                [ui.btn("◀ 返回修改 URL", "chw:back_to_url")],
+            ]),
+        )
+        return
     ui.answer_cb(cb_id, _PROTOCOL_LABEL[protocol])
+    _wiz_proceed_to_key_step(chat_id, message_id, data, protocol)
+
+
+def wiz_proto_adopt(chat_id: int, message_id: int, cb_id: str, protocol: str) -> None:
+    """冲突解决：采用 apiPath 对应的协议。"""
+    if protocol not in _PROTOCOL_LABEL:
+        ui.answer_cb(cb_id, "无效协议")
+        return
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_wiz_protocol":
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    ui.answer_cb(cb_id, f"已采用 {_PROTOCOL_LABEL[protocol]}")
+    _wiz_proceed_to_key_step(chat_id, message_id, state["data"], protocol)
+
+
+def wiz_proto_force(chat_id: int, message_id: int, cb_id: str, protocol: str) -> None:
+    """冲突解决：坚持用户选的协议，清空自动拆分的 apiPath。"""
+    if protocol not in _PROTOCOL_LABEL:
+        ui.answer_cb(cb_id, "无效协议")
+        return
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_wiz_protocol":
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    data = state["data"]
+    data.pop("apiPath", None)
+    ui.answer_cb(cb_id, "已清空自定义路径")
+    _wiz_proceed_to_key_step(chat_id, message_id, data, protocol)
+
+
+def wiz_back_to_url(chat_id: int, message_id: int, cb_id: str) -> None:
+    """冲突解决：返回步骤 2 重新输入 URL。"""
+    ui.answer_cb(cb_id)
+    state = states.get_state(chat_id)
+    if not state:
+        return
+    data = state["data"]
+    data.pop("baseUrl", None)
+    data.pop("apiPath", None)
+    states.set_state(chat_id, "ch_wiz_url", data)
     ui.edit(
         chat_id, message_id,
-        f"✅ 协议：<code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n\n"
-        "➕ <b>添加渠道（4/5）</b>\n\n请输入该渠道的 API Key：",
+        "请重新输入 <b>Base URL</b>（需以 <code>http://</code> 或 <code>https://</code> 开头）：",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
 
@@ -706,15 +812,24 @@ def wiz_back_to_models(chat_id: int, message_id: int, cb_id: str) -> None:
 # ─── 测试：单个模型 / 全部 / 跳过 ─────────────────────────────────
 
 def _make_temp_channel(data: dict):
-    return api_channel.ApiChannel({
+    protocol = data.get("protocol") or "anthropic"
+    entry = {
         "name": data["name"] + "__wiz",
         "type": "api",
         "baseUrl": data["baseUrl"],
         "apiKey": data["apiKey"],
+        "protocol": protocol,
         "models": data["models"],
-        "cc_mimicry": True,
+        "cc_mimicry": protocol == "anthropic",
         "enabled": True,
-    })
+    }
+    if data.get("apiPath"):
+        entry["apiPath"] = data["apiPath"]
+    # openai-* 协议走 OpenAIApiChannel；anthropic 走 ApiChannel
+    if protocol == "anthropic":
+        return api_channel.ApiChannel(entry)
+    from ...openai.channel.api_channel import OpenAIApiChannel
+    return OpenAIApiChannel(entry)
 
 
 async def _probe_with_progress_async(chat_id: int, msg_id: int, header: str,
@@ -878,6 +993,7 @@ def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
         registry.add_api_channel({
             "name": data["name"],
             "baseUrl": data["baseUrl"],
+            "apiPath": data.get("apiPath"),
             "apiKey": data["apiKey"],
             "protocol": protocol,
             "models": data["models"],
@@ -917,6 +1033,7 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
         registry.add_api_channel({
             "name": data["name"],
             "baseUrl": data["baseUrl"],
+            "apiPath": data.get("apiPath"),
             "apiKey": data["apiKey"],
             "protocol": protocol,
             "models": data["models"],
@@ -1093,18 +1210,100 @@ def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     if ch is None:
         return
     current = _protocol_of(ch)
+    api_path = getattr(ch, "api_path", None)
     rows: list[list[dict]] = []
     for proto, label in PROTOCOL_CHOICES:
         marker = "● " if proto == current else ""
         rows.append([ui.btn(f"{marker}{label}", f"ch:seproto:{short}:{proto}")])
     rows.append([ui.btn("◀ 返回编辑", f"ch:edit:{short}")])
+    extra = ""
+    if api_path:
+        extra = (
+            f"\n<i>⚠ 当前渠道带有自定义 apiPath: <code>{ui.escape_html(api_path)}</code>。"
+            "若切换到与该路径末段不匹配的协议，系统会拒绝保存；"
+            "可在「✏ URL」里先把 baseUrl 改成无后缀的形式，再来切换协议。</i>"
+        )
     ui.edit(
         chat_id, message_id,
         f"🔌 <b>切换协议 [{ui.escape_html(ch.display_name)}]</b>\n\n"
         f"当前：<code>{ui.escape_html(_PROTOCOL_LABEL.get(current, current))}</code>\n\n"
         "<i>切换到 OpenAI 家族会自动关闭 CC 伪装；切回 Anthropic 将恢复。\n"
-        "注意：切换协议不自动更新 Base URL / API Key / 模型列表，请按需要另行修改。</i>",
+        "注意：切换协议不自动更新 Base URL / API Key / 模型列表，请按需要另行修改。</i>"
+        + extra,
         reply_markup=ui.inline_kb(rows),
+    )
+
+
+def on_edit_url_switch(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    """冲突解决：用新 URL + 切换协议。"""
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_edit_url_confirm":
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    data = state["data"]
+    if data.get("short") != short:
+        ui.answer_cb(cb_id, "短码不匹配")
+        return
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    try:
+        # 同时更新 baseUrl + apiPath + protocol；显式带 apiPath 让 registry 信任 UI
+        registry.update_api_channel(name, {
+            "baseUrl": data["new_base"],
+            "apiPath": data["new_path"],
+            "protocol": data["detected"],
+        })
+    except Exception as exc:
+        ui.answer_cb(cb_id, "失败")
+        ui.send(chat_id, f"❌ 更新失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已更新并切换协议")
+    ui.send_result(
+        chat_id, "✅ URL 已更新，协议已自动切换",
+        extra_rows=[
+            [ui.btn("◀ 返回渠道详情", f"ch:view:{short}")],
+            [ui.btn("📋 返回渠道列表", "menu:channel")],
+        ],
+        back_label="🏠 返回主菜单", back_callback="menu:main",
+    )
+
+
+def on_edit_url_basesonly(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    """冲突解决：只用 baseUrl，清空 apiPath 以适配当前协议。"""
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "ch_edit_url_confirm":
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    data = state["data"]
+    if data.get("short") != short:
+        ui.answer_cb(cb_id, "短码不匹配")
+        return
+    name = ui.resolve_code(short)
+    if not name:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    try:
+        # 只留 baseUrl，清空 apiPath（显式传 None）
+        registry.update_api_channel(name, {
+            "baseUrl": data["new_base"],
+            "apiPath": None,
+        })
+    except Exception as exc:
+        ui.answer_cb(cb_id, "失败")
+        ui.send(chat_id, f"❌ 更新失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已保留协议，清空自定义路径")
+    ui.send_result(
+        chat_id, "✅ URL 已更新（只使用 baseUrl，协议未变）",
+        extra_rows=[
+            [ui.btn("◀ 返回渠道详情", f"ch:view:{short}")],
+            [ui.btn("📋 返回渠道列表", "menu:channel")],
+        ],
+        back_label="🏠 返回主菜单", back_callback="menu:main",
     )
 
 
@@ -1139,7 +1338,14 @@ def on_edit_name(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 
 def on_edit_url(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     ui.answer_cb(cb_id)
-    _edit_prompt(chat_id, message_id, short, "url", "请输入新的 Base URL（http:// 或 https://）：")
+    _edit_prompt(
+        chat_id, message_id, short, "url",
+        "请输入新的 Base URL（http:// 或 https://）：\n\n"
+        "<i>如果上游接口路径非标准（比如智谱 Coding Plan 的 "
+        "<code>/api/coding/paas/v4/chat/completions</code>），"
+        "直接贴完整调用路径即可，系统会自动识别并拆分；"
+        "否则系统会根据协议自动追加 <code>/v1/xxx</code>。</i>",
+    )
 
 
 def on_edit_key(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
@@ -1236,6 +1442,44 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
         if not (url.startswith("http://") or url.startswith("https://")):
             ui.send(chat_id, "❌ URL 需以 http:// 或 https:// 开头，请重新输入：")
             return True
+        # 先判断是否需要进入冲突解决：先 split，看识别出的协议与当前 channel 协议
+        try:
+            split_base, split_path = split_base_url(url)
+        except ValueError as exc:
+            ui.send(chat_id, f"❌ URL 无效：{ui.escape_html(str(exc))}")
+            return True
+        ch = registry.get_channel(f"api:{ui.resolve_code(short) or ''}")
+        current_proto = _protocol_of(ch) if ch else "anthropic"
+        detected = detect_suffix_protocol(split_path) if split_path else None
+        if split_path and detected and detected != current_proto:
+            # 冲突：记下候选 url + 两个分支信息，让用户按钮选
+            states.set_state(chat_id, "ch_edit_url_confirm", {
+                "short": short,
+                "url": url,
+                "new_base": split_base,
+                "new_path": split_path,
+                "detected": detected,
+                "current_proto": current_proto,
+            })
+            current_label = _PROTOCOL_LABEL.get(current_proto, current_proto)
+            detected_label = _PROTOCOL_LABEL.get(detected, detected)
+            ui.send(
+                chat_id,
+                "⚠ <b>协议与新 URL 路径不匹配</b>\n\n"
+                f"新 URL 路径：<code>{ui.escape_html(split_path)}</code>\n"
+                f"路径对应协议：<b>{ui.escape_html(detected_label)}</b>\n"
+                f"当前渠道协议：<code>{ui.escape_html(current_label)}</code>\n\n"
+                "如何处理？",
+                reply_markup=ui.inline_kb([
+                    [ui.btn(f"✅ 更新 URL 并切换协议为 {detected_label}",
+                            f"ch:eurl_switch:{short}")],
+                    [ui.btn(f"⚠ 保持 {current_label}，只保留 baseUrl（清空路径）",
+                            f"ch:eurl_basesonly:{short}")],
+                    [ui.btn("❌ 取消", f"ch:edit:{short}")],
+                ]),
+            )
+            return True
+        # 无冲突：直接交给 registry（它会自动联动 apiPath）
         ok, result = _do_edit(chat_id, short, "baseUrl", url)
         if not ok:
             ui.send(chat_id, f"❌ {ui.escape_html(result)}")
@@ -1307,6 +1551,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "chw:save":   wiz_save(chat_id, message_id, cb_id); return True
     if data.startswith("chw:test:"):
         wiz_test_single(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("chw:proto_adopt:"):
+        wiz_proto_adopt(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("chw:proto_force:"):
+        wiz_proto_force(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data == "chw:back_to_url":
+        wiz_back_to_url(chat_id, message_id, cb_id); return True
     if data.startswith("chw:proto:"):
         wiz_on_protocol_select(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
 
@@ -1339,6 +1589,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_edit_menu(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:ename:"):
         on_edit_name(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:eurl_switch:"):
+        on_edit_url_switch(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:eurl_basesonly:"):
+        on_edit_url_basesonly(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:eurl:"):
         on_edit_url(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:ekey:"):

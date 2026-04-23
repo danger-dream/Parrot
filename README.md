@@ -269,6 +269,8 @@ curl http://<server>:22122/v1/responses \
 ### 🔀 渠道管理
 添加向导（4 步 + 测试面板）、渠道详情、编辑、测试模型（单/全部）。
 
+> **Base URL 自适应**（v0.5.0+）：默认填上游域名即可，代理按协议追加 `/v1/messages`、`/v1/chat/completions`、`/v1/responses`。若上游接口挂在非标准路径（如智谱 Coding Plan 的 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），直接把**完整调用路径**贴进来，向导会自动拆分为 `baseUrl + apiPath` 存储，协议不匹配时给出交互式选择（采用识别到的协议 / 坚持当前协议清空路径 / 返回修改）。
+
 ### 🔐 管理 OAuth（支持两家族）
 - ➕ 新增账户：第一步选 Claude / OpenAI；Claude 支持 PKCE 登录 + 粘贴 JSON；OpenAI 粘贴 refresh_token
 - 每条账户显示：状态图标 / 过期时间 / 5h 7d 用量 / 月度统计 / 冷却中的模型
@@ -328,7 +330,9 @@ curl http://<server>:22122/v1/responses \
   ],
   "channels": [
     { "name": "智谱 Max", "type": "api", "protocol": "anthropic", "baseUrl": "https://...", "apiKey": "...", "models": [{"real": "GLM-5", "alias": "glm-5"}], "cc_mimicry": true, "enabled": true },
-    { "name": "OpenAI 3P", "type": "api", "protocol": "openai-responses", "baseUrl": "https://...", "apiKey": "...", "models": [...], "enabled": true }
+    { "name": "OpenAI 3P", "type": "api", "protocol": "openai-responses", "baseUrl": "https://...", "apiKey": "...", "models": [...], "enabled": true },
+    // 非标准路径上游：baseUrl 只留主机，apiPath 放完整调用路径，运行时 = baseUrl + apiPath
+    { "name": "智谱 Coding", "type": "api", "protocol": "openai-chat", "baseUrl": "https://open.bigmodel.cn", "apiPath": "/api/coding/paas/v4/chat/completions", "apiKey": "...", "models": [...], "enabled": true }
   ],
   "timeouts":      { "connect": 10, "firstByte": 30, "idle": 120, "total": 600 },
   "concurrency":   { "enabled": true, "queueWaitSeconds": 30, "defaultMaxConcurrent": 0 },

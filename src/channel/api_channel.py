@@ -7,6 +7,7 @@ from typing import Optional
 
 from ..transform import cc_mimicry, standard
 from .base import Channel, ChannelDisplay, UpstreamRequest
+from .url_utils import resolve_upstream_url
 
 
 # ─── 模型别名解析 ─────────────────────────────────────────────────
@@ -58,6 +59,10 @@ class ApiChannel(Channel):
         self.key = f"api:{self.name}"
         self.display_name = self.name
         self.base_url = (entry.get("baseUrl") or "").rstrip("/")
+        # apiPath：若用户把完整路径（形如 `/api/coding/paas/v4/chat/completions`）填到
+        # baseUrl，registry.add/update_api_channel 会把末段识别为协议后缀并拆分存到这里。
+        # 运行期若非空 → 直接 `base_url + api_path`；否则走 default `/v1/xxx` 拼接。
+        self.api_path = entry.get("apiPath") or None
         self.api_key = entry.get("apiKey", "")
         self.models: list[dict] = list(entry.get("models") or [])
         self.cc_mimicry = bool(entry.get("cc_mimicry", True))
@@ -119,7 +124,7 @@ class ApiChannel(Channel):
             }
 
         return UpstreamRequest(
-            url=f"{self.base_url}/v1/messages",
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/messages"),
             headers=headers,
             body=signed,
             dynamic_tool_map=dynamic_map,
