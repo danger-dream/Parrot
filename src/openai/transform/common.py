@@ -169,6 +169,50 @@ def build_chat_usage(*, prompt_tokens: int = 0, completion_tokens: int = 0,
     }
 
 
+# ─── Response skeleton builder ──────────────────────────────────
+#
+# spec: Response required: id, object, created_at, error, incomplete_details,
+#   instructions, model, tools, output, parallel_tool_calls, metadata,
+#   tool_choice, temperature, top_p
+# 02-bug-findings #13: 之前 stream_c2r._response_skeleton 只塞 9 个字段。
+
+def build_response_skeleton(*, resp_id: str, model: str, created_at: int,
+                             status: str,
+                             previous_response_id: str | None = None,
+                             request_body: dict | None = None) -> dict:
+    """构造 spec-compliant Response 骨架（response.created/in_progress 携带）。
+
+    透传 request_body 中的 tools/tool_choice/temperature/top_p/metadata/
+    parallel_tool_calls/instructions/reasoning/text/truncation/store/prompt
+    等字段；缺失时使用 spec 推荐默认值。
+    """
+    rb = request_body or {}
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": rb.get("instructions"),
+        "model": model,
+        "tools": rb.get("tools") or [],
+        "output": [],
+        "parallel_tool_calls": rb.get("parallel_tool_calls", True),
+        "metadata": rb.get("metadata") or {},
+        "tool_choice": rb.get("tool_choice", "auto"),
+        "temperature": rb.get("temperature", 1),
+        "top_p": rb.get("top_p", 1),
+        "reasoning": rb.get("reasoning") or {"effort": None, "summary": None},
+        "text": rb.get("text") or {"format": {"type": "text"}},
+        "truncation": rb.get("truncation", "disabled"),
+        "store": rb.get("store"),
+        "previous_response_id": previous_response_id,
+        "output_text": "",
+        "usage": None,
+    }
+
+
 def reasoning_bridge_mode() -> str:
     """返回当前 reasoning 桥接模式。未设/非法值均回落 'passthrough'。"""
     try:

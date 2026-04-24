@@ -86,7 +86,8 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
 def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
               finish_reason: Optional[str] = None,
               usage: Optional[dict] = None,
-              include_choice: bool = True) -> bytes:
+              include_choice: bool = True,
+              is_final_usage_chunk: bool = False) -> bytes:
     obj: dict[str, Any] = {
         "id": state.chunk_id,
         "object": "chat.completion.chunk",
@@ -101,8 +102,13 @@ def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
             "finish_reason": finish_reason,
             "logprobs": None,
         }]
+    # 02-bug-findings #43: include_usage=true 时 OpenAI chat 协议要求每个 chunk
+    # 都带 usage 字段，中间 chunk 为 null，最后一帧才是真值。某些 SDK
+    # （如 LangChain）会基于此做存在性判断。
     if usage is not None:
         obj["usage"] = usage
+    elif state.include_usage and not is_final_usage_chunk:
+        obj["usage"] = None
     return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
 

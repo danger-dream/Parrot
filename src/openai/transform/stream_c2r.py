@@ -44,6 +44,11 @@ class _MessageItem:
     text_buf: str = ""
     refusal_buf: str = ""
     refusal_part_opened: bool = False
+    # 02-bug-findings #16: content_index 必须按 part 打开顺序累计
+    # 之前 refusal 写死 1、text 写死 0，先 refusal 后 text 时会撞车。
+    _next_content_index: int = 0
+    text_content_index: int = -1   # 实际分配到 text part 的 index
+    refusal_content_index: int = -1
 
 
 @dataclass
@@ -115,7 +120,8 @@ class StreamTranslator:
                  created_ts: Optional[int] = None,
                  api_key_name: Optional[str] = None,
                  channel_key: Optional[str] = None,
-                 current_input_items: Optional[list] = None):
+                 current_input_items: Optional[list] = None,
+                 request_body: Optional[dict] = None):
         self.state = C2RState(
             resp_id=_gen_id("resp_"),
             model=model,
@@ -128,6 +134,10 @@ class StreamTranslator:
         self._store_api_key_name = api_key_name or None
         self._store_channel_key = channel_key or None
         self._store_current_input = list(current_input_items) if current_input_items else None
+        # 02-bug-findings #13: response skeleton 需要 14 个 spec required 字段，
+        # 这些只能从下游请求 body 拿到（tools/temperature/top_p/...）。
+        # 不传时使用 sensible defaults（向后兼容）。
+        self._request_body = dict(request_body) if request_body else {}
 
     # --- 公开接口 ---
 
@@ -153,7 +163,11 @@ class StreamTranslator:
 
         if self.state.terminal_error is not None:
             yield from self._emit_failed(self.state.terminal_error)
-            # 失败态不写 Store（不想污染后续 prev_id 链）
+            # 02-bug-findings #41: 错误路径也写 Store。
+            # 之前断连/上游 5xx 时 Store 缺失 → 客户端用 previous_response_id 续接 404。
+            # 写入时带上 status:"failed" 标记（由 store.save 的调用点决定具体语义），
+            # 让运维有迹可循、客户端能区分。
+            self._save_to_store_if_configured()
             return
 
         # 关闭所有打开的 item
@@ -289,12 +303,15 @@ class StreamTranslator:
         assert item is not None, "message item must be opened before text delta"
         if not item.content_part_opened:
             item.content_part_opened = True
+            # 02-bug-findings #16: 按打开顺序分配 content_index
+            item.text_content_index = item._next_content_index
+            item._next_content_index += 1
             yield _emit("response.content_part.added", {
                 "type": "response.content_part.added",
                 "sequence_number": self.state.next_seq(),
                 "item_id": item.item_id,
                 "output_index": item.output_index,
-                "content_index": 0,
+                "content_index": item.text_content_index,
                 "part": {"type": "output_text", "text": "", "annotations": []},
             })
         item.text_buf += text
@@ -303,23 +320,24 @@ class StreamTranslator:
             "sequence_number": self.state.next_seq(),
             "item_id": item.item_id,
             "output_index": item.output_index,
-            "content_index": 0,
+            "content_index": item.text_content_index,
             "delta": text,
         })
 
     def _emit_refusal_delta(self, text: str) -> Iterator[bytes]:
         item = self.state.message_item
         assert item is not None
-        # refusal part 用独立的 content_index。若已存在 text part，part index=1；否则 0
-        idx = 1 if item.content_part_opened else 0
         if not item.refusal_part_opened:
             item.refusal_part_opened = True
+            # 02-bug-findings #16: 按打开顺序分配 content_index
+            item.refusal_content_index = item._next_content_index
+            item._next_content_index += 1
             yield _emit("response.content_part.added", {
                 "type": "response.content_part.added",
                 "sequence_number": self.state.next_seq(),
                 "item_id": item.item_id,
                 "output_index": item.output_index,
-                "content_index": idx,
+                "content_index": item.refusal_content_index,
                 "part": {"type": "refusal", "refusal": ""},
             })
         item.refusal_buf += text
@@ -328,7 +346,7 @@ class StreamTranslator:
             "sequence_number": self.state.next_seq(),
             "item_id": item.item_id,
             "output_index": item.output_index,
-            "content_index": idx,
+            "content_index": item.refusal_content_index,
             "delta": text,
         })
 
@@ -336,14 +354,14 @@ class StreamTranslator:
         item = self.state.message_item
         if item is None:
             return
-        # 先关 text part
+        # 先关 text part（用 _emit_output_text_delta 时分配的实际 index）
         if item.content_part_opened:
             yield _emit("response.output_text.done", {
                 "type": "response.output_text.done",
                 "sequence_number": self.state.next_seq(),
                 "item_id": item.item_id,
                 "output_index": item.output_index,
-                "content_index": 0,
+                "content_index": item.text_content_index,
                 "text": item.text_buf,
             })
             yield _emit("response.content_part.done", {
@@ -351,18 +369,17 @@ class StreamTranslator:
                 "sequence_number": self.state.next_seq(),
                 "item_id": item.item_id,
                 "output_index": item.output_index,
-                "content_index": 0,
+                "content_index": item.text_content_index,
                 "part": {"type": "output_text", "text": item.text_buf, "annotations": []},
             })
-        # refusal part
+        # refusal part（同样用实际分配的 index）
         if item.refusal_part_opened:
-            ref_idx = 1 if item.content_part_opened else 0
             yield _emit("response.refusal.done", {
                 "type": "response.refusal.done",
                 "sequence_number": self.state.next_seq(),
                 "item_id": item.item_id,
                 "output_index": item.output_index,
-                "content_index": ref_idx,
+                "content_index": item.refusal_content_index,
                 "refusal": item.refusal_buf,
             })
             yield _emit("response.content_part.done", {
@@ -370,7 +387,7 @@ class StreamTranslator:
                 "sequence_number": self.state.next_seq(),
                 "item_id": item.item_id,
                 "output_index": item.output_index,
-                "content_index": ref_idx,
+                "content_index": item.refusal_content_index,
                 "part": {"type": "refusal", "refusal": item.refusal_buf},
             })
         # output_item.done
@@ -518,11 +535,14 @@ class StreamTranslator:
             })
 
     def _close_function_call(self, fc: _FunctionCallItem) -> Iterator[bytes]:
+        # spec: ResponseFunctionCallArgumentsDoneEvent required name
+        # 02-bug-findings #17: 之前漏写 name 字段，严格客户端反序列化失败。
         yield _emit("response.function_call_arguments.done", {
             "type": "response.function_call_arguments.done",
             "sequence_number": self.state.next_seq(),
             "item_id": fc.fc_id,
             "output_index": fc.output_index,
+            "name": fc.name,
             "arguments": fc.args_buf,
         })
         yield _emit("response.output_item.done", {
@@ -680,19 +700,20 @@ class StreamTranslator:
             )
 
     def _response_skeleton(self, *, status: str) -> dict:
-        return {
-            "id": self.state.resp_id,
-            "object": "response",
-            "created_at": self.state.created_ts,
-            "status": status,
-            "error": None,
-            "incomplete_details": None,
-            "model": self.state.model,
-            "previous_response_id": self.state.previous_response_id,
-            "output": [],
-            "output_text": "",
-            "usage": None,
-        }
+        # 02-bug-findings #13: spec Response required 14 字段
+        # (id/object/created_at/status/error/incomplete_details/instructions/
+        #  model/tools/output/parallel_tool_calls/metadata/tool_choice/
+        #  temperature/top_p)，加上常见的 reasoning/text/truncation。
+        # 用 common.build_response_skeleton 统一构造，避免后续维护分叉。
+        from .common import build_response_skeleton
+        return build_response_skeleton(
+            resp_id=self.state.resp_id,
+            model=self.state.model,
+            created_at=self.state.created_ts,
+            status=status,
+            previous_response_id=self.state.previous_response_id,
+            request_body=self._request_body,
+        )
 
 
 # ─── 辅助 ────────────────────────────────────────────────────────
