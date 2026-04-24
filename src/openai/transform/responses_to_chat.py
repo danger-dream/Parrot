@@ -223,8 +223,19 @@ def _input_items_to_messages(items: list) -> list:
                 }
                 if refusal_texts:
                     msg_out["refusal"] = "\n".join(refusal_texts)
+                # 02-bug-findings #10: assistant 全空（无 text/refusal/reasoning）→ skip
+                # 避免向严格上游发出 content=None && tool_calls 缺失的 assistant message。
+                # （pending_assistant 路径有 tool_calls 由 _flush 处理；这里只管直接走
+                #  message 分支的情况）
+                bridge_text = _pop_reasoning() if bridge else None
+                has_content = msg_out["content"] is not None
+                has_refusal = bool(refusal_texts)
+                has_reasoning = bool(bridge_text)
+                if not (has_content or has_refusal or has_reasoning):
+                    # 完全空 → skip
+                    continue
                 if bridge:
-                    msg_out["reasoning_content"] = _pop_reasoning()
+                    msg_out["reasoning_content"] = bridge_text or ""
                 messages.append(msg_out)
             else:
                 # 非 assistant 的 message（user/system/tool）跳轮新上下文，

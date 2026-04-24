@@ -252,7 +252,20 @@ class StreamTranslator:
             if isinstance(tc, dict):
                 yield from self._handle_tool_call_delta(tc)
 
+        # 02-bug-findings #18: chat 老协议 delta.function_call (LiteLLM 旧版/某些代理)
+        # 把 legacy function_call 视作 tool_calls[0] 等价处理。
+        legacy_fn = delta.get("function_call")
+        if isinstance(legacy_fn, dict):
+            # 复用 tool_call 状态机，固定 index=0
+            tc_legacy = {
+                "index": 0,
+                "type": "function",
+                "function": legacy_fn,
+            }
+            yield from self._handle_tool_call_delta(tc_legacy)
+
         if fr:
+            # 老协议 finish_reason="function_call" 等价于 "tool_calls"
             self.state.finish_reason = fr
 
     # --- 活动 item 切换 ---
@@ -713,6 +726,7 @@ class StreamTranslator:
         })
 
     def _emit_failed(self, err: dict) -> Iterator[bytes]:
+        from .common import map_response_error_code as _map_response_error_code
         # 已打开的 items 先关
         yield from self._close_text_item()
         yield from self._close_all_function_calls()
@@ -722,8 +736,13 @@ class StreamTranslator:
             "object": "response",
             "created_at": self.state.created_ts,
             "status": "failed",
-            "error": {"message": str(err.get("message") or "upstream error"),
-                      "type": err.get("type") or "server_error"},
+            # spec: ResponseError {message, code} (无 type 字段)
+            # 02-bug-findings #8: chat 端 error.type 不在 ResponseError.code enum 内，
+            # 用 map_response_error_code 做合规映射；message 直接透。
+            "error": {
+                "message": str(err.get("message") or "upstream error"),
+                "code": _map_response_error_code(err.get("code"), err.get("type")),
+            },
             "incomplete_details": None,
             "model": self.state.model,
             "previous_response_id": self.state.previous_response_id,

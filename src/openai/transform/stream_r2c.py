@@ -117,9 +117,13 @@ def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
 _DONE = b"data: [DONE]\n\n"
 
 
-def _mk_error_chunk(state: R2CState, *, message: str, err_type: str = "server_error") -> bytes:
-    """Chat 流内错误：一条裸的 error 帧（非 chat.completion.chunk）。"""
-    obj = {"error": {"message": message, "type": err_type, "code": None, "param": None}}
+def _mk_error_chunk(state: R2CState, *, message: str, err_type: str = "server_error",
+                    code: Optional[str] = None, param: Optional[str] = None) -> bytes:
+    """Chat 流内错误：一条裸的 error 帧（非 chat.completion.chunk）。
+
+    02-bug-findings #7: code/param/type 全部透传，OpenAI 客户端会按 code 做分支处理。
+    """
+    obj = {"error": {"message": message, "type": err_type, "code": code, "param": param}}
     return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
 
@@ -161,9 +165,16 @@ class StreamTranslator:
         if self.state.terminal_status in ("failed", "error"):
             # 已在 feed 过程中发了 error + [DONE]，这里不重复；兜底：若未发则补一次
             err_msg = "upstream failure"
+            err_detail: dict = {}
             if isinstance(self.state.terminal_error, dict):
                 err_msg = str(self.state.terminal_error.get("message") or err_msg)
-            yield _mk_error_chunk(self.state, message=err_msg)
+                err_detail = self.state.terminal_error.get("detail") or {}
+            yield _mk_error_chunk(
+                self.state, message=err_msg,
+                err_type=(err_detail.get("type") if isinstance(err_detail, dict) else None) or "server_error",
+                code=err_detail.get("code") if isinstance(err_detail, dict) else None,
+                param=err_detail.get("param") if isinstance(err_detail, dict) else None,
+            )
             yield _DONE
             return
 
@@ -373,9 +384,17 @@ class StreamTranslator:
         self.state.terminal_status = "failed" if event_name == "response.failed" else "error"
         self.state.terminal_error = {"message": msg, "detail": err_body}
 
+        # 02-bug-findings #7: 透传 code/param/type
+        err_type_raw = err_body.get("type") if isinstance(err_body, dict) else None
+        err_code = err_body.get("code") if isinstance(err_body, dict) else None
+        err_param = err_body.get("param") if isinstance(err_body, dict) else None
         # 立即 emit error + [DONE]，并锁 terminal_emitted 防止 close() 重复
         self.state.terminal_emitted = True
-        yield _mk_error_chunk(self.state, message=msg, err_type="server_error")
+        yield _mk_error_chunk(
+            self.state, message=msg,
+            err_type=err_type_raw or "server_error",
+            code=err_code, param=err_param,
+        )
         yield _DONE
 
 

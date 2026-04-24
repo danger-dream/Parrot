@@ -213,6 +213,59 @@ def build_response_skeleton(*, resp_id: str, model: str, created_at: int,
     }
 
 
+# ─── ResponseError code mapping ─────────────────────────────────
+#
+# spec: ResponseError.code enum (从 schemas_registry: ResponseError):
+#   server_error, rate_limit_exceeded, invalid_prompt,
+#   vector_store_timeout, invalid_image, invalid_image_format,
+#   invalid_base64_image, invalid_image_url, image_too_large,
+#   image_too_small, image_parse_error, image_content_policy_violation,
+#   invalid_image_mode, image_file_too_large,
+#   unsupported_image_media_type, empty_image_file,
+#   failed_to_download_image, image_file_not_found
+# 02-bug-findings #8: chat 上游的 error.type 是 invalid_request_error /
+# api_error / rate_limit_error 等完全不同 enum，必须做映射，
+# 否则 ResponseError.code 落到非 enum 值时严格客户端反序列化失败。
+
+RESPONSE_ERROR_CODES: frozenset[str] = frozenset({
+    "server_error", "rate_limit_exceeded", "invalid_prompt",
+    "vector_store_timeout", "invalid_image", "invalid_image_format",
+    "invalid_base64_image", "invalid_image_url", "image_too_large",
+    "image_too_small", "image_parse_error",
+    "image_content_policy_violation", "invalid_image_mode",
+    "image_file_too_large", "unsupported_image_media_type",
+    "empty_image_file", "failed_to_download_image", "image_file_not_found",
+})
+
+_CHAT_TYPE_TO_RESP_CODE: dict[str, str] = {
+    "rate_limit_error": "rate_limit_exceeded",
+    "rate_limit_exceeded": "rate_limit_exceeded",
+    "invalid_request_error": "invalid_prompt",
+    "tokens_exceeded_error": "invalid_prompt",
+    "context_length_exceeded": "invalid_prompt",
+    "permission_error": "server_error",
+    "authentication_error": "server_error",
+    "api_error": "server_error",
+    "server_error": "server_error",
+    "overloaded_error": "server_error",
+    "internal_server_error": "server_error",
+}
+
+
+def map_response_error_code(code: str | None, type_: str | None) -> str:
+    """把 chat 风格的 error.code/type 映射到 spec ResponseError.code enum。
+
+    优先 code（若已在 enum 中），其次按 type 映射，最后兜底 server_error。
+    """
+    if isinstance(code, str) and code in RESPONSE_ERROR_CODES:
+        return code
+    if isinstance(type_, str):
+        mapped = _CHAT_TYPE_TO_RESP_CODE.get(type_)
+        if mapped:
+            return mapped
+    return "server_error"
+
+
 def reasoning_bridge_mode() -> str:
     """返回当前 reasoning 桥接模式。未设/非法值均回落 'passthrough'。"""
     try:
