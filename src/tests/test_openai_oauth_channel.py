@@ -5,7 +5,7 @@
     store=false / stream=true / 不支持字段剥离 / 模型名规范化 / input 字符串
     包成消息数组 / input 里 system 提 instructions / instructions 兜底 /
     legacy functions-function_call 转换
-  - normalize_codex_model 的映射表 + 通配兜底
+  - 模型名直接透传（v0.6+ 移除别名映射）
   - registry.rebuild_from_config 按 provider 分派 OAuth 渠道
   - OpenAIOAuthChannel.build_upstream_request：
       * responses ingress 透传 + 强制改造 + 完整 headers
@@ -99,7 +99,7 @@ def test_transform_basic(m):
         "store": True,
     }
     out = t.apply_codex_oauth_transform(body)
-    assert out["model"] == "gpt-5.1"               # 别名 → 规范名
+    assert out["model"] == "gpt-5"                 # 直接透传（不再做别名映射）
     assert out["store"] is False                   # 强制
     assert out["stream"] is True                   # 强制
     for k in ("temperature", "top_p", "max_output_tokens",
@@ -112,18 +112,18 @@ def test_transform_basic(m):
 
 def test_transform_keeps_resolved_model(m):
     t = m["transform"]
-    # 传了 resolved_model 但 body 有 model → 仍规范化 body.model
+    # 传了 resolved_model → 用它覆盖 body.model（不做别名映射）
     out = t.apply_codex_oauth_transform(
-        {"model": "gpt-5-codex", "input": []},
+        {"model": "anything-else", "input": []},
         resolved_model="gpt-5-codex",
     )
-    assert out["model"] == "gpt-5.1-codex"
+    assert out["model"] == "gpt-5-codex"
     # body 无 model → 用 resolved_model
     out2 = t.apply_codex_oauth_transform(
         {"input": []}, resolved_model="gpt-5-codex",
     )
-    assert out2["model"] == "gpt-5.1-codex"
-    print("  [PASS] transform: resolved_model fallback + normalize both ways")
+    assert out2["model"] == "gpt-5-codex"
+    print("  [PASS] transform: resolved_model overrides body.model; no mapping")
 
 
 def test_transform_extracts_system(m):
@@ -230,53 +230,57 @@ def test_transform_normalizes_chat_style_tools(m):
     print("  [PASS] transform: chat-style tools flattened; invalid dropped; non-function preserved")
 
 
-def test_channel_accepts_any_alias_when_account_models_set(m):
-    """账户手动填的 models 列表可包含任意 codex 家族别名；transform 层规范化上游"""
+def test_channel_model_passthrough(m):
+    """v0.6.x 起：账号 models 列表中的名字原样透传给上游，transform 不做别名映射。"""
     _setup(m)
     m["oauth_manager"].add_account({
         "email": "alias@openai.test", "provider": "openai",
         "access_token": "x", "refresh_token": "r",
         "chatgpt_account_id": "acct-alias",
-        # 用户手填了老别名 + 变体后缀
-        "models": ["gpt-5", "gpt-5-codex", "gpt-5.1-codex-max-xhigh",
-                   "codex-mini-latest"],
+        # 新版语义：配什么名字上游就收什么名字；账号调度白名单 = 上游请求体 model。
+        # 包含：新模型 (gpt-5.5) / codex 变体 / 带 reasoning 后缀的别名
+        "models": ["gpt-5.5", "gpt-5.1-codex", "gpt-5.4-high"],
     })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("alias@openai.test"))
-    for alias in ("gpt-5", "gpt-5-codex", "gpt-5.1-codex-max-xhigh",
-                  "codex-mini-latest"):
-        assert ch.supports_model(alias) == alias, f"{alias} should be supported"
+    for name in ("gpt-5.5", "gpt-5.1-codex", "gpt-5.4-high"):
+        assert ch.supports_model(name) == name, f"{name} should be supported"
     # 不在账户列表里的仍然拒绝
     assert ch.supports_model("gpt-5.2") is None
     assert ch.supports_model("gpt-4o") is None
-    # 通过 build_upstream_request 验证发给上游时会规范化
+    # 重点：build_upstream_request 后上游 body 的 model 完全透传，不被翻译
     import asyncio, json
-    req = asyncio.run(ch.build_upstream_request(
-        {"model": "gpt-5-codex", "input": "hi"}, "gpt-5-codex",
-        ingress_protocol="responses",
-    ))
-    payload = json.loads(req.body)
-    assert payload["model"] == "gpt-5.1-codex"   # 规范化到上游认的 canonical
-    print("  [PASS] channel: account.models can carry aliases; transform normalizes upstream")
+    for name in ("gpt-5.5", "gpt-5.1-codex", "gpt-5.4-high"):
+        req = asyncio.run(ch.build_upstream_request(
+            {"model": name, "input": "hi"}, name,
+            ingress_protocol="responses",
+        ))
+        payload = json.loads(req.body)
+        assert payload["model"] == name, (
+            f"model should passthrough unchanged: got {payload['model']!r}, want {name!r}"
+        )
+    print("  [PASS] channel: account.models passthrough to upstream unchanged")
 
 
-def test_transform_model_map(m):
+def test_transform_model_passthrough(m):
+    """transform 层对 model 字段的处理：resolved_model 直接透传。"""
     t = m["transform"]
-    cases = [
-        ("gpt-5", "gpt-5.1"),
-        ("gpt-5-codex", "gpt-5.1-codex"),
-        ("gpt-5.3-xhigh", "gpt-5.3-codex"),
-        ("gpt-5.1-codex-max-xhigh", "gpt-5.1-codex-max"),
-        ("openai/gpt-5-mini", "gpt-5.1"),
-        ("gpt-4o-mini", "gpt-5.1"),                # 通配兜底
-        ("something-codex", "gpt-5.1-codex"),      # 通配 codex
-        ("", "gpt-5.1"),                           # 空
-    ]
-    for src, expect in cases:
-        got = t.normalize_codex_model(src)
-        assert got == expect, f"{src!r} → {got!r}, expected {expect!r}"
-    # 至少覆盖 12 条 model ID
-    assert len(t.codex_model_ids()) >= 10
-    print(f"  [PASS] transform: normalize_codex_model × {len(cases)} + codex_model_ids()")
+    # resolved_model 传啥就写啥
+    for name in ("gpt-5.5", "gpt-5.1-codex", "gpt-5.4-high",
+                 "gpt-6-future", "some-random-name"):
+        body = {"model": "anything-else", "input": "hi"}
+        t.apply_codex_oauth_transform(body, resolved_model=name)
+        assert body["model"] == name, (
+            f"resolved_model should win unchanged: got {body['model']!r}, want {name!r}"
+        )
+    # resolved_model 缺失时保留 body 里的 model
+    body = {"model": "gpt-5.5", "input": "hi"}
+    t.apply_codex_oauth_transform(body, resolved_model=None)
+    assert body["model"] == "gpt-5.5"
+    # 极端兜底：两者都缺→保守默认 gpt-5
+    body = {"input": "hi"}
+    t.apply_codex_oauth_transform(body, resolved_model=None)
+    assert body["model"] == "gpt-5"
+    print("  [PASS] transform: resolved_model passthrough; no alias mapping")
 
 
 # ─── Channel 构造与路由 ──────────────────────────────────────────
@@ -312,15 +316,16 @@ def test_channel_default_models_fallback(m):
     })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("no-models@x"))
     models = ch.list_client_models()
-    # 默认 4 个：gpt-5.2 / gpt-5.2-codex / gpt-5.3-codex / gpt-5.4
-    assert set(models) == {"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4"}, models
+    # 默认 5 个：gpt-5.2 / gpt-5.2-codex / gpt-5.3-codex / gpt-5.4 / gpt-5.5
+    expected = {"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"}
+    assert set(models) == expected, models
     # supports_model 命中
-    for m_id in ["gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4"]:
+    for m_id in expected:
         assert ch.supports_model(m_id) == m_id
     # 不在默认列表的别名不会命中（需用户手动补 models）
     assert ch.supports_model("gpt-5") is None
     assert ch.supports_model("gpt-5.1") is None
-    print("  [PASS] channel: default 4 models from config.providers.openai.defaultModels")
+    print("  [PASS] channel: default models from config.providers.openai.defaultModels")
 
 
 def test_channel_responses_ingress(m):
@@ -544,8 +549,8 @@ def main():
         test_transform_system_appended_to_existing_instructions,
         test_transform_legacy_functions,
         test_transform_normalizes_chat_style_tools,
-        test_channel_accepts_any_alias_when_account_models_set,
-        test_transform_model_map,
+        test_channel_model_passthrough,
+        test_transform_model_passthrough,
         test_channel_basic,
         test_channel_default_models_fallback,
         test_channel_responses_ingress,

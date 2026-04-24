@@ -1,4 +1,4 @@
-"""OAuth→Codex 上游请求体强制改造（移植自 sub2api 的 applyCodexOAuthTransform）。
+"""OAuth→Codex 上游请求体强制改造。
 
 调用位置：
   `OpenAIOAuthChannel.build_upstream_request` 里，输入已经是 Responses API
@@ -11,10 +11,12 @@
   - 删除 Responses API 里上游不支持的字段：max_output_tokens /
     max_completion_tokens / temperature / top_p / frequency_penalty /
     presence_penalty / prompt_cache_retention
-  - 模型名规范化为 codex CLI 所认字面：gpt-5 → gpt-5.1 等（映射表下方）
+  - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
+    账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
+    校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
+    gpt-5.6，都原样发出去。新家族只需在 TG 面板或
+    `config.oauth.providers.openai.defaultModels` 加一行，代码零改动。
   - `instructions` 空 → 注入默认 "You are a helpful coding assistant."
-    （Codex CLI 官方也如此做；完整 117 行 DefaultInstructions 只用于 sub2api
-    自测探针，不走代理请求）
   - legacy `functions` / `function_call` → `tools` / `tool_choice`
   - `input` 是字符串 → 包成 [{type:"message", role:"user", content:<str>}]
   - `input[]` 里的 role=system 消息提取到 `instructions`（上游 input 不接受
@@ -24,152 +26,20 @@
 为 function call 恢复 call_id 上下文做的兼容层，需要 state_store 保存。Commit 2
 目标是跑通单轮请求；续链支持放后续。对应未续链场景，sub2api 也会正常删除
 item_reference，等效于我们这里的实现。
+
+历史：早期版本（v0.4.x ~ v0.5.x）从 sub2api 移植了一张 _CODEX_MODEL_MAP 翻译表，
+把各种别名（gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等）映射到上游规范名，
+并带了"未识别名字 → 降级成 gpt-5.1"的兜底。v0.6.x 起移除：
+  1) Parrot 的 channel 层已经用账号 `models` + `defaultModels` 做了白名单，
+     进到 transform 的模型名本就是合法的；再翻译纯属画蛇添足。
+  2) 兜底降级坑惨——新模型（如 gpt-5.5）未登记就被降成 gpt-5.1，
+     导致所有账号都被上游拒绝（gpt-5.1 早就下架）。
+移除 commit：见 git log；想回溯旧映射表完整内容也可以去 git history 里查。
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
-
-
-# ─── codex 模型映射表（完整移植自 sub2api openai_codex_transform.go）─
-
-# 完整表。key 是下游可能发上来的任意 codex 家族别名，value 是上游认识的规范名。
-_CODEX_MODEL_MAP: dict[str, str] = {
-    # gpt-5.4 家族
-    "gpt-5.4":                    "gpt-5.4",
-    "gpt-5.4-mini":               "gpt-5.4-mini",
-    "gpt-5.4-nano":               "gpt-5.4-nano",
-    "gpt-5.4-none":               "gpt-5.4",
-    "gpt-5.4-low":                "gpt-5.4",
-    "gpt-5.4-medium":             "gpt-5.4",
-    "gpt-5.4-high":               "gpt-5.4",
-    "gpt-5.4-xhigh":              "gpt-5.4",
-    "gpt-5.4-chat-latest":        "gpt-5.4",
-    # gpt-5.3 家族（全部映到 codex）
-    "gpt-5.3":                    "gpt-5.3-codex",
-    "gpt-5.3-none":               "gpt-5.3-codex",
-    "gpt-5.3-low":                "gpt-5.3-codex",
-    "gpt-5.3-medium":             "gpt-5.3-codex",
-    "gpt-5.3-high":               "gpt-5.3-codex",
-    "gpt-5.3-xhigh":              "gpt-5.3-codex",
-    "gpt-5.3-codex":              "gpt-5.3-codex",
-    "gpt-5.3-codex-spark":        "gpt-5.3-codex",
-    "gpt-5.3-codex-spark-low":    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark-medium": "gpt-5.3-codex",
-    "gpt-5.3-codex-spark-high":   "gpt-5.3-codex",
-    "gpt-5.3-codex-spark-xhigh":  "gpt-5.3-codex",
-    "gpt-5.3-codex-low":          "gpt-5.3-codex",
-    "gpt-5.3-codex-medium":       "gpt-5.3-codex",
-    "gpt-5.3-codex-high":         "gpt-5.3-codex",
-    "gpt-5.3-codex-xhigh":        "gpt-5.3-codex",
-    # gpt-5.1 codex 家族
-    "gpt-5.1-codex":              "gpt-5.1-codex",
-    "gpt-5.1-codex-low":          "gpt-5.1-codex",
-    "gpt-5.1-codex-medium":       "gpt-5.1-codex",
-    "gpt-5.1-codex-high":         "gpt-5.1-codex",
-    "gpt-5.1-codex-max":          "gpt-5.1-codex-max",
-    "gpt-5.1-codex-max-low":      "gpt-5.1-codex-max",
-    "gpt-5.1-codex-max-medium":   "gpt-5.1-codex-max",
-    "gpt-5.1-codex-max-high":     "gpt-5.1-codex-max",
-    "gpt-5.1-codex-max-xhigh":    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini":         "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-mini-medium":  "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-mini-high":    "gpt-5.1-codex-mini",
-    # gpt-5.2 家族
-    "gpt-5.2":                    "gpt-5.2",
-    "gpt-5.2-none":               "gpt-5.2",
-    "gpt-5.2-low":                "gpt-5.2",
-    "gpt-5.2-medium":             "gpt-5.2",
-    "gpt-5.2-high":               "gpt-5.2",
-    "gpt-5.2-xhigh":              "gpt-5.2",
-    "gpt-5.2-codex":              "gpt-5.2-codex",
-    "gpt-5.2-codex-low":          "gpt-5.2-codex",
-    "gpt-5.2-codex-medium":       "gpt-5.2-codex",
-    "gpt-5.2-codex-high":         "gpt-5.2-codex",
-    "gpt-5.2-codex-xhigh":        "gpt-5.2-codex",
-    # gpt-5.1 家族
-    "gpt-5.1":                    "gpt-5.1",
-    "gpt-5.1-none":               "gpt-5.1",
-    "gpt-5.1-low":                "gpt-5.1",
-    "gpt-5.1-medium":             "gpt-5.1",
-    "gpt-5.1-high":               "gpt-5.1",
-    "gpt-5.1-chat-latest":        "gpt-5.1",
-    # 旧别名
-    "gpt-5-codex":                "gpt-5.1-codex",
-    "codex-mini-latest":          "gpt-5.1-codex-mini",
-    "gpt-5-codex-mini":           "gpt-5.1-codex-mini",
-    "gpt-5-codex-mini-medium":    "gpt-5.1-codex-mini",
-    "gpt-5-codex-mini-high":      "gpt-5.1-codex-mini",
-    "gpt-5":                      "gpt-5.1",
-    "gpt-5-mini":                 "gpt-5.1",
-    "gpt-5-nano":                 "gpt-5.1",
-}
-
-
-def normalize_codex_model(model: str) -> str:
-    """下游的任意 codex 家族名 → 上游认识的规范名。"""
-    if not model:
-        return "gpt-5.1"
-    # 去掉 provider 前缀（如 "openai/gpt-5"）
-    mid = model.split("/")[-1] if "/" in model else model
-
-    mapped = _CODEX_MODEL_MAP.get(mid)
-    if mapped:
-        return mapped
-
-    low = mid.lower()
-    # 通配兜底，覆盖带变体后缀的未登记模型
-    if "gpt-5.4-mini" in low or "gpt 5.4 mini" in low:
-        return "gpt-5.4-mini"
-    if "gpt-5.4-nano" in low or "gpt 5.4 nano" in low:
-        return "gpt-5.4-nano"
-    if "gpt-5.4" in low or "gpt 5.4" in low:
-        return "gpt-5.4"
-    if "gpt-5.2-codex" in low or "gpt 5.2 codex" in low:
-        return "gpt-5.2-codex"
-    if "gpt-5.2" in low or "gpt 5.2" in low:
-        return "gpt-5.2"
-    if "gpt-5.3-codex" in low or "gpt 5.3 codex" in low:
-        return "gpt-5.3-codex"
-    if "gpt-5.3" in low or "gpt 5.3" in low:
-        return "gpt-5.3-codex"
-    if "gpt-5.1-codex-max" in low or "gpt 5.1 codex max" in low:
-        return "gpt-5.1-codex-max"
-    if "gpt-5.1-codex-mini" in low or "gpt 5.1 codex mini" in low:
-        return "gpt-5.1-codex-mini"
-    if ("codex-mini-latest" in low or "gpt-5-codex-mini" in low
-            or "gpt 5 codex mini" in low):
-        return "codex-mini-latest"
-    if "gpt-5.1-codex" in low or "gpt 5.1 codex" in low:
-        return "gpt-5.1-codex"
-    if "gpt-5.1" in low or "gpt 5.1" in low:
-        return "gpt-5.1"
-    if "codex" in low:
-        return "gpt-5.1-codex"
-    if "gpt-5" in low or "gpt 5" in low:
-        return "gpt-5.1"
-    return "gpt-5.1"
-
-
-def codex_model_ids() -> list[str]:
-    """导出所有 codex 家族**规范**模型名（_CODEX_MODEL_MAP 的 value 集合）。
-
-    只有 ~12 条：gpt-5.1 / gpt-5.1-codex / gpt-5.1-codex-max / ...。
-    上游 codex endpoint 最终只认这些规范名，transform 会把别名 normalize 过去。
-    """
-    return sorted({v for v in _CODEX_MODEL_MAP.values()})
-
-
-def codex_known_aliases() -> list[str]:
-    """导出所有已登记的 codex 模型别名集合（_CODEX_MODEL_MAP 的 key 集合）。
-
-    70+ 条：gpt-5 / gpt-5-codex / gpt-5-codex-mini / gpt-5.3-xhigh / ...。
-    给 Channel.list_client_models / supports_model 用，让客户端用任何已知别名
-    请求都能命中；真正发给上游时由 transform 的 normalize_codex_model 映射
-    到规范名。
-    """
-    return sorted(_CODEX_MODEL_MAP.keys())
 
 
 # ─── 默认 instructions（仅一行，与 sub2api applyInstructions 对齐）──
@@ -356,16 +226,18 @@ def apply_codex_oauth_transform(
 
     参数:
       body: Responses API shape（字符串 input 也容忍；见上）
-      resolved_model: 调度层已对齐后的模型名（别名→真实名）；调用方
-        （Channel）一般会在此之后再调 `normalize_codex_model` 映射到 codex
-        规范名并 body["model"] 覆写。为了 transform 独立可测，我们也在这里
-        兜底：如果传了 resolved_model 且 body 未设 model，就写进去。
+      resolved_model: 调度层已对齐后的模型名（账号白名单已校验过的合法名字）；
+        transform **原样透传**给上游，不做任何别名映射。
     """
-    # 1) 模型名：codex endpoint 识别 gpt-5.1 / gpt-5.1-codex 这类规范名
-    if resolved_model and _is_empty_str(body.get("model")):
+    # 1) 模型名：**直接透传**。resolved_model 已由账号 supports_model 把关；
+    #    不做任何别名/兜底映射，避免新模型未登记被错误降级。
+    if resolved_model:
         body["model"] = resolved_model
-    if isinstance(body.get("model"), str):
-        body["model"] = normalize_codex_model(body["model"])
+    elif _is_empty_str(body.get("model")):
+        # 极端兜底：resolved_model 缺失且 body 里也没 model。正常调用路径
+        # （Channel.build_upstream_request）不会走到这里；测试或误用时
+        # 给个最保守默认避免上游报缺参，上游会按自己白名单决定是否接受。
+        body["model"] = "gpt-5"
 
     # 2) store / stream 强制
     body["store"] = False
