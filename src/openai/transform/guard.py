@@ -165,9 +165,27 @@ def guard_chat_to_responses(body: dict,
 
 # Responses 的 tools 中非 function 类型枚举（官方 built-in）。
 # 遇到这些工具时，chat 上游没有等价实现 → 400。
+# 02-bug-findings #21: 名单需补全到 spec 全部 built-in tool type，
+# 否则未知 type 会被兜底拒绝、错误信息看着像 bug 报告而不是预期拒绝。
 _BUILTIN_TOOL_TYPES = {
+    # 经典 built-in
     "web_search_preview", "file_search", "computer_use_preview",
     "code_interpreter", "image_generation", "mcp", "local_shell",
+    # 新版本/别名（spec 中 oneOf 各分支）
+    "web_search", "web_search_2025_08_26", "web_search_preview_2025_03_11",
+    "computer", "computer_use",
+    "apply_patch", "function_shell",
+}
+
+# tool_choice 中允许的 hosted/MCP/custom/allowed_tools 形态
+# 02-bug-findings #25: 这些 tool_choice 直接发到 chat 上游会 400，提前拦。
+_NON_CHAT_TOOL_CHOICE_TYPES = {
+    "file_search", "web_search_preview", "web_search",
+    "web_search_2025_08_26", "web_search_preview_2025_03_11",
+    "computer_use_preview", "computer", "computer_use",
+    "code_interpreter", "image_generation",
+    "mcp",
+    "apply_patch", "function_shell",
 }
 
 
@@ -200,21 +218,34 @@ def guard_responses_to_chat(body: dict,
         _fail(400, "invalid_request_error", "request body must be a JSON object")
 
     # tools 检查
+    # 02-bug-findings #21: built-in 名单已补全；custom 工具属于用户定义但 chat 端
+    # 结构不同，由 translate 层负责转换、不在这里拦。
     tools = body.get("tools") or []
     if isinstance(tools, list) and reject_on_builtin_tools:
         for t in tools:
             if not isinstance(t, dict):
                 continue
             ttype = t.get("type")
-            if ttype and ttype != "function" and ttype in _BUILTIN_TOOL_TYPES:
+            if not ttype or ttype == "function" or ttype == "custom":
+                continue
+            if ttype in _BUILTIN_TOOL_TYPES:
                 _fail(400, "invalid_request_error",
                       f"built-in tool '{ttype}' is not supported when routing to chat upstream",
                       param="tools")
-            if ttype and ttype != "function" and ttype not in _BUILTIN_TOOL_TYPES:
-                # 未知 type 但明显不是 function：保守拒绝
-                _fail(400, "invalid_request_error",
-                      f"unsupported tool type '{ttype}' when routing to chat upstream",
-                      param="tools")
+            # 未知 type：保守拒绝（消息保持 not supported 风格便于客户端识别）
+            _fail(400, "invalid_request_error",
+                  f"tool type '{ttype}' is not supported when routing to chat upstream",
+                  param="tools")
+
+    # tool_choice 形态 hosted/MCP/... 预拦
+    # 02-bug-findings #25: 这些 tool_choice 透传到 chat 上游会 400，提前给清晰错误。
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        tc_type = tc.get("type")
+        if tc_type in _NON_CHAT_TOOL_CHOICE_TYPES:
+            _fail(400, "invalid_request_error",
+                  f"tool_choice type '{tc_type}' is not supported when routing to chat upstream",
+                  param="tool_choice")
 
     # input items 检查
     inp = body.get("input")

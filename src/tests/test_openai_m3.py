@@ -182,8 +182,9 @@ def test_c2r_translate_request_basics(m):
     assert out["max_output_tokens"] == 100
     assert out["reasoning"]["effort"] == "medium"
     assert out["text"]["format"] == {"type": "json_object"}
+    # Patch 3 / #30: FunctionTool.strict 必填补默认 False
     assert out["tools"] == [{"type": "function", "name": "get_w",
-                             "parameters": {"type": "object"}}]
+                             "parameters": {"type": "object"}, "strict": False}]
     assert out["tool_choice"] == {"type": "function", "name": "get_w"}
     items = out["input"]
     # 期望：developer message + user message + function_call item + function_call_output item
@@ -404,8 +405,9 @@ async def test_chat_to_responses_function_tool(m):
 
     # 上游 tools 已扁平化
     up = _captured_upstream_body(router)
+    # Patch 3 / #30: FunctionTool.strict 必填补默认 False
     assert up["tools"] == [{"type": "function", "name": "get_w",
-                             "parameters": {"type": "object"}}]
+                             "parameters": {"type": "object"}, "strict": False}]
     # 下游拿到 tool_calls + finish_reason=tool_calls
     out = json.loads(resp.body)
     msg = out["choices"][0]["message"]

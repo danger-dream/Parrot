@@ -138,8 +138,22 @@ def _messages_to_input_items(messages: list) -> list:
             for tc in msg.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
-                fn = tc.get("function") or {}
                 call_id = tc.get("id") or _gen_id("call_")
+                # 02-bug-findings #27: type=custom 的 tool_call 翻译为
+                # responses CustomToolCall {type:custom_tool_call, name, input}
+                # 之前一律当 function 处理，导致 responses 上游 schema 不对。
+                if tc.get("type") == "custom":
+                    c = tc.get("custom") or {}
+                    items.append({
+                        "type": "custom_tool_call",
+                        "id": f"ctc_{call_id}",
+                        "call_id": call_id,
+                        "name": c.get("name") or "",
+                        "input": c.get("input") or "",
+                        "status": "completed",
+                    })
+                    continue
+                fn = tc.get("function") or {}
                 items.append({
                     "type": "function_call",
                     "id": f"fc_{call_id}",   # 合成稳定 fc_ 前缀 id
@@ -236,7 +250,10 @@ def _stringify_tool_content(content) -> str:
 
 
 def _flatten_tool(t: dict) -> dict:
-    """chat-style function tool → responses-style flat tool。"""
+    """chat-style tool → responses-style flat tool。
+
+    支持 type=function 与 type=custom；其他 type 保守返回原 dict。
+    """
     if not isinstance(t, dict):
         return t
     if t.get("type") == "function":
@@ -245,18 +262,62 @@ def _flatten_tool(t: dict) -> dict:
         for k in ("name", "description", "parameters", "strict"):
             if k in fn:
                 out[k] = fn[k]
+        # 02-bug-findings #30: spec FunctionTool required: type, name, strict, parameters
+        # 上游不传 strict / parameters 时本代码以前不写，responses 上游会 400。
+        out.setdefault("strict", False)
+        out.setdefault("parameters", {})
         return out
-    # 非 function 工具：保守返回原 dict（guard 已拦非 function）
+    if t.get("type") == "custom":
+        # 02-bug-findings #26: chat 侧 CustomToolChatCompletions
+        # {type:custom, custom:{name, description?, format?}}
+        # 展开为 responses 侧 CustomTool {type:custom, name, description?, format?}
+        c = t.get("custom") or {}
+        out_c: dict = {"type": "custom"}
+        for k in ("name", "description", "format"):
+            if k in c:
+                out_c[k] = c[k]
+        return out_c
+    # 其他 type：保守返回原 dict（guard 已拦非 function/custom 的 built-in）
     return dict(t)
 
 
 def _translate_tool_choice_c2r(tc):
-    """chat tool_choice → responses tool_choice。"""
+    """chat tool_choice → responses tool_choice。
+
+    支持的形态：
+      - string ("auto" / "none" / "required")
+      - {type:function, function:{name}} → {type:function, name}
+      - 02-bug-findings #23: {type:custom, custom:{name}} → {type:custom, name}
+      - 02-bug-findings #24: {type:allowed_tools, allowed_tools:{mode, tools}}
+        → {type:allowed_tools, mode, tools}
+    """
     if isinstance(tc, str):
-        return tc  # "auto" / "none" / "required"
-    if isinstance(tc, dict) and tc.get("type") == "function":
-        fn = tc.get("function") or {}
-        return {"type": "function", "name": fn.get("name", "")}
+        return tc
+    if isinstance(tc, dict):
+        ttype = tc.get("type")
+        if ttype == "function":
+            fn = tc.get("function") or {}
+            return {"type": "function", "name": fn.get("name", "")}
+        if ttype == "custom":
+            c = tc.get("custom") or {}
+            out = {"type": "custom"}
+            if "name" in c:
+                out["name"] = c["name"]
+            elif "name" in tc:  # 容忍已经是 flat 形态
+                out["name"] = tc["name"]
+            return out
+        if ttype == "allowed_tools":
+            nested = tc.get("allowed_tools") or {}
+            out2 = {"type": "allowed_tools"}
+            mode = nested.get("mode") or tc.get("mode")
+            if mode is not None:
+                out2["mode"] = mode
+            tools = nested.get("tools") or tc.get("tools")
+            if tools is not None:
+                # tools 内每项也按 _flatten_tool 拍平
+                out2["tools"] = [_flatten_tool(x) if isinstance(x, dict) else x
+                                 for x in tools]
+            return out2
     return tc
 
 

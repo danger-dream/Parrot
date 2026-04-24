@@ -69,6 +69,18 @@ class _FunctionCallItem:
 
 
 @dataclass
+class _CustomToolCallItem:
+    """02-bug-findings #27 (streaming part): chat 上游 type=custom 的 tool_call
+    在 responses 端是 CustomToolCall，事件名 response.custom_tool_call_input.*。
+    """
+    output_index: int
+    ctc_id: str
+    call_id: str
+    name: str = ""
+    input_buf: str = ""
+
+
+@dataclass
 class C2RState:
     resp_id: str
     model: str
@@ -84,6 +96,7 @@ class C2RState:
     message_item: Optional[_MessageItem] = None
     reasoning_item: Optional[_ReasoningItem] = None
     fc_by_chat_index: dict[int, _FunctionCallItem] = field(default_factory=dict)
+    ctc_by_chat_index: dict[int, _CustomToolCallItem] = field(default_factory=dict)
     closed_items: list[tuple[int, dict]] = field(default_factory=list)
 
     finish_reason: Optional[str] = None          # chat 的值：stop/length/tool_calls/content_filter/function_call
@@ -488,6 +501,15 @@ class StreamTranslator:
 
     def _handle_tool_call_delta(self, tc: dict) -> Iterator[bytes]:
         idx = int(tc.get("index", 0))
+        # 02-bug-findings #27 (streaming part):
+        # type=custom 走 custom_tool_call 状态机；type=function 或缺省走 function_call。
+        # 若同 index 之前已注册为 custom 或 function，按已有的走（首包 type 决定）。
+        is_custom = (tc.get("type") == "custom"
+                     or idx in self.state.ctc_by_chat_index)
+        if is_custom:
+            yield from self._handle_custom_tool_call_delta(idx, tc)
+            return
+
         fc = self.state.fc_by_chat_index.get(idx)
         if fc is None:
             # 首包：本 tool_call 刚刚出现
@@ -534,6 +556,52 @@ class StreamTranslator:
                 "delta": args_delta,
             })
 
+    def _handle_custom_tool_call_delta(self, idx: int, tc: dict) -> Iterator[bytes]:
+        ctc = self.state.ctc_by_chat_index.get(idx)
+        if ctc is None:
+            yield from self._close_text_item()
+            c = tc.get("custom") or {}
+            call_id = tc.get("id") or _gen_id("call_")
+            ctc = _CustomToolCallItem(
+                output_index=self.state.allocate_output_index(),
+                ctc_id=_gen_id("ctc_"),
+                call_id=call_id,
+                name=c.get("name") or "",
+            )
+            self.state.ctc_by_chat_index[idx] = ctc
+            # spec: ResponseCustomToolCall: {type:custom_tool_call, id, call_id, name, input}
+            yield _emit("response.output_item.added", {
+                "type": "response.output_item.added",
+                "sequence_number": self.state.next_seq(),
+                "output_index": ctc.output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": ctc.ctc_id,
+                    "call_id": ctc.call_id,
+                    "name": ctc.name,
+                    "input": "",
+                    "status": "in_progress",
+                },
+            })
+        else:
+            # 续包补 name
+            c = tc.get("custom") or {}
+            if c.get("name") and not ctc.name:
+                ctc.name = c["name"]
+
+        c = tc.get("custom") or {}
+        input_delta = c.get("input")
+        if isinstance(input_delta, str) and input_delta:
+            ctc.input_buf += input_delta
+            # spec: ResponseCustomToolCallInputDeltaEvent
+            yield _emit("response.custom_tool_call_input.delta", {
+                "type": "response.custom_tool_call_input.delta",
+                "sequence_number": self.state.next_seq(),
+                "item_id": ctc.ctc_id,
+                "output_index": ctc.output_index,
+                "delta": input_delta,
+            })
+
     def _close_function_call(self, fc: _FunctionCallItem) -> Iterator[bytes]:
         # spec: ResponseFunctionCallArgumentsDoneEvent required name
         # 02-bug-findings #17: 之前漏写 name 字段，严格客户端反序列化失败。
@@ -559,17 +627,51 @@ class StreamTranslator:
             },
         })
 
+    def _close_custom_tool_call(self, ctc: _CustomToolCallItem) -> Iterator[bytes]:
+        # spec: ResponseCustomToolCallInputDoneEvent required: name, input, item_id, output_index
+        yield _emit("response.custom_tool_call_input.done", {
+            "type": "response.custom_tool_call_input.done",
+            "sequence_number": self.state.next_seq(),
+            "item_id": ctc.ctc_id,
+            "output_index": ctc.output_index,
+            "name": ctc.name,
+            "input": ctc.input_buf,
+        })
+        yield _emit("response.output_item.done", {
+            "type": "response.output_item.done",
+            "sequence_number": self.state.next_seq(),
+            "output_index": ctc.output_index,
+            "item": {
+                "type": "custom_tool_call",
+                "id": ctc.ctc_id,
+                "call_id": ctc.call_id,
+                "name": ctc.name,
+                "input": ctc.input_buf,
+                "status": "completed",
+            },
+        })
+
     def _close_all_function_calls(self) -> Iterator[bytes]:
-        # 按 output_index 顺序关闭
-        for fc in sorted(self.state.fc_by_chat_index.values(), key=lambda x: x.output_index):
-            yield from self._close_function_call(fc)
+        # 按 output_index 顺序关闭（function + custom 一起，按 index）
+        all_calls: list = []
+        for fc in self.state.fc_by_chat_index.values():
+            all_calls.append((fc.output_index, "fc", fc))
+        for ctc in self.state.ctc_by_chat_index.values():
+            all_calls.append((ctc.output_index, "ctc", ctc))
+        all_calls.sort(key=lambda x: x[0])
+        for _, kind, item in all_calls:
+            if kind == "fc":
+                yield from self._close_function_call(item)
+            else:
+                yield from self._close_custom_tool_call(item)
 
     # --- 终态 ---
 
     def _emit_terminal(self) -> Iterator[bytes]:
         status, incomplete = _finish_reason_to_status(
             self.state.finish_reason,
-            has_tool_calls=bool(self.state.fc_by_chat_index),
+            has_tool_calls=bool(self.state.fc_by_chat_index
+                                 or self.state.ctc_by_chat_index),
         )
         output_items = self._collect_output_items()
         output_text = "".join(
@@ -657,6 +759,15 @@ class StreamTranslator:
                 "call_id": fc.call_id,
                 "name": fc.name,
                 "arguments": fc.args_buf,
+                "status": "completed",
+            }))
+        for ctc in self.state.ctc_by_chat_index.values():
+            items.append((ctc.output_index, {
+                "type": "custom_tool_call",
+                "id": ctc.ctc_id,
+                "call_id": ctc.call_id,
+                "name": ctc.name,
+                "input": ctc.input_buf,
                 "status": "completed",
             }))
         items.sort(key=lambda x: x[0])

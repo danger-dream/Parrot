@@ -247,6 +247,29 @@ def _input_items_to_messages(items: list) -> list:
                 "content": item.get("output") or "",
             })
 
+        elif t == "custom_tool_call":
+            # 02-bug-findings #27 反向：responses CustomToolCall
+            # → chat assistant.tool_calls type=custom
+            if pending_assistant is None:
+                pending_assistant = {"role": "assistant", "content": None, "tool_calls": []}
+            pending_assistant.setdefault("tool_calls", []).append({
+                "id": item.get("call_id") or _gen_id("call_"),
+                "type": "custom",
+                "custom": {
+                    "name": item.get("name") or "",
+                    "input": item.get("input") or "",
+                },
+            })
+
+        elif t == "custom_tool_call_output":
+            # CustomToolCallOutput 与 function_call_output 在 chat 端落到同一种 tool message
+            _flush()
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id") or "",
+                "content": item.get("output") or "",
+            })
+
         elif t == "reasoning":
             # passthrough 模式：聚合 summary_text / reasoning_text 给下一条 assistant 用
             # drop 模式：全部忽略
@@ -318,14 +341,37 @@ def _nest_tool(t: dict) -> dict:
             if k in t:
                 fn[k] = t[k]
         return {"type": "function", "function": fn}
+    if t.get("type") == "custom":
+        # 02-bug-findings #26 反向：responses CustomTool {type:custom, name, ...}
+        # → chat CustomToolChatCompletions {type:custom, custom:{name, ...}}
+        nested = {}
+        for k in ("name", "description", "format"):
+            if k in t:
+                nested[k] = t[k]
+        return {"type": "custom", "custom": nested}
     return dict(t)
 
 
 def _translate_tool_choice_r2c(tc):
     if isinstance(tc, str):
         return tc
-    if isinstance(tc, dict) and tc.get("type") == "function":
-        return {"type": "function", "function": {"name": tc.get("name", "")}}
+    if isinstance(tc, dict):
+        ttype = tc.get("type")
+        if ttype == "function":
+            return {"type": "function", "function": {"name": tc.get("name", "")}}
+        if ttype == "custom":
+            # 02-bug-findings #23: responses {type:custom, name} → chat {type:custom, custom:{name}}
+            return {"type": "custom", "custom": {"name": tc.get("name", "")}}
+        if ttype == "allowed_tools":
+            # 02-bug-findings #24: responses {type:allowed_tools, mode, tools}
+            # → chat {type:allowed_tools, allowed_tools:{mode, tools}}
+            nested: dict = {}
+            if "mode" in tc:
+                nested["mode"] = tc["mode"]
+            if "tools" in tc:
+                nested["tools"] = [_nest_tool(x) if isinstance(x, dict) else x
+                                   for x in (tc["tools"] or [])]
+            return {"type": "allowed_tools", "allowed_tools": nested}
     return tc
 
 
