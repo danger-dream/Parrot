@@ -63,6 +63,13 @@ def translate_request(body: dict) -> dict:
     # reasoning_effort → reasoning.effort
     if "reasoning_effort" in body:
         payload.setdefault("reasoning", {})["effort"] = body["reasoning_effort"]
+    # 02-bug-findings #12: reasoning_summary（非官方 chat 字段，DeepSeek 等生态使用）
+    # → reasoning.summary（spec ReasoningParam.summary 取值 auto/concise/detailed）
+    if "reasoning_summary" in body:
+        payload.setdefault("reasoning", {})["summary"] = body["reasoning_summary"]
+    # 02-bug-findings #11: chat verbosity ↔ responses text.verbosity（同 enum low/medium/high）
+    if "verbosity" in body:
+        payload.setdefault("text", {})["verbosity"] = body["verbosity"]
 
     # tools 扁平化
     if body.get("tools"):
@@ -211,7 +218,8 @@ def _content_chat_to_responses(content) -> list:
         elif t == "file":
             f = p.get("file") or {}
             entry: dict = {"type": "input_file"}
-            for k in ("file_id", "file_data", "filename"):
+            # 02-bug-findings #5: file_url + detail 双向透传
+            for k in ("file_id", "file_data", "filename", "file_url", "detail"):
                 if k in f:
                     entry[k] = f[k]
             out.append(entry)
@@ -336,6 +344,10 @@ def translate_response(resp: dict, *, model: str) -> dict:
     tool_calls = _gather_function_calls(output)
     refusal = _gather_refusal(output)
     reasoning_text = _gather_reasoning_summary(output)
+    # 02-bug-findings #28: 把 output_text.annotations 累计回填到 chat
+    # message.annotations（chat ResponseMessage.annotations 与 responses
+    # OutputTextContent.annotations 是 1:1 url_citation 等结构，spec-compliant）
+    annotations = _gather_annotations(output)
 
     message: dict[str, Any] = {"role": "assistant", "content": content_text or None}
     if tool_calls:
@@ -345,6 +357,8 @@ def translate_response(resp: dict, *, model: str) -> dict:
     if reasoning_text is not None:
         # 非官方字段：DeepSeek 等生态使用，兼容客户端会忽略
         message["reasoning_content"] = reasoning_text
+    if annotations:
+        message["annotations"] = annotations
 
     finish_reason = _status_to_finish_reason(resp, has_tool_calls=bool(tool_calls))
 
@@ -381,6 +395,20 @@ def _gather_output_text(output: list) -> str:
                 if isinstance(t, str):
                     parts.append(t)
     return "".join(parts)
+
+
+def _gather_annotations(output: list) -> list[dict]:
+    """02-bug-findings #28: 收集 output items 中所有 output_text.annotations。"""
+    out: list[dict] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for c in item.get("content") or []:
+            if isinstance(c, dict) and c.get("type") == "output_text":
+                ann = c.get("annotations")
+                if isinstance(ann, list):
+                    out.extend(a for a in ann if isinstance(a, dict))
+    return out
 
 
 def _gather_function_calls(output: list) -> list[dict]:

@@ -328,6 +328,8 @@ class StreamTranslator:
                 "part": {"type": "output_text", "text": "", "annotations": []},
             })
         item.text_buf += text
+        # spec: ResponseTextDeltaEvent.logprobs required
+        # 02-bug-findings #29: 始终带 logprobs:[]（本 proxy 不传播 logprobs）
         yield _emit("response.output_text.delta", {
             "type": "response.output_text.delta",
             "sequence_number": self.state.next_seq(),
@@ -335,6 +337,7 @@ class StreamTranslator:
             "output_index": item.output_index,
             "content_index": item.text_content_index,
             "delta": text,
+            "logprobs": [],
         })
 
     def _emit_refusal_delta(self, text: str) -> Iterator[bytes]:
@@ -369,6 +372,8 @@ class StreamTranslator:
             return
         # 先关 text part（用 _emit_output_text_delta 时分配的实际 index）
         if item.content_part_opened:
+            # spec: ResponseTextDoneEvent.logprobs required
+            # 02-bug-findings #29: 始终带 logprobs:[]
             yield _emit("response.output_text.done", {
                 "type": "response.output_text.done",
                 "sequence_number": self.state.next_seq(),
@@ -376,6 +381,7 @@ class StreamTranslator:
                 "output_index": item.output_index,
                 "content_index": item.text_content_index,
                 "text": item.text_buf,
+                "logprobs": [],
             })
             yield _emit("response.content_part.done", {
                 "type": "response.content_part.done",

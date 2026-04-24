@@ -49,6 +49,8 @@ class R2CState:
     chat_text_parts: list = field(default_factory=list)
     chat_refusal_parts: list = field(default_factory=list)
     fc_args_by_tc_index: dict[int, str] = field(default_factory=dict)
+    # 02-bug-findings #35: 累积 annotation.added 事件
+    annotations: list = field(default_factory=list)
     # 累积
     usage: Optional[dict] = None
     finish_reason: Optional[str] = None
@@ -202,6 +204,8 @@ class StreamTranslator:
             yield from self._on_reasoning_delta(data or {})
         elif event_name == "response.function_call_arguments.delta":
             yield from self._on_fc_args_delta(data or {})
+        elif event_name == "response.output_text.annotation.added":
+            yield from self._on_annotation_added(data or {})
         elif event_name == "response.completed":
             yield from self._on_completed(data or {})
         elif event_name == "response.incomplete":
@@ -289,6 +293,18 @@ class StreamTranslator:
             }],
         })
 
+    def _on_annotation_added(self, data: dict) -> Iterator[bytes]:
+        """02-bug-findings #35: 累积 annotation 到 state；chat 流没有
+        annotation 增量事件，annotation 在 close() 之前由 get_downstream_chat_assistant
+        汇总到 message.annotations（供下游 buf 用，例如 failover fingerprint_write_chat）。
+        chat SSE 协议无对应增量事件，此处不主动 yield。
+        """
+        ann = data.get("annotation")
+        if isinstance(ann, dict):
+            self.state.annotations.append(ann)
+        return
+        yield  # noqa: keep generator
+
     def _on_completed(self, data: dict) -> Iterator[bytes]:
         resp = data.get("response") or {}
         self.state.terminal_status = "completed"
@@ -325,6 +341,8 @@ class StreamTranslator:
         msg["content"] = content if content else None
         if self.state.chat_refusal_parts:
             msg["refusal"] = "".join(self.state.chat_refusal_parts)
+        if self.state.annotations:
+            msg["annotations"] = list(self.state.annotations)
         if self.state.fc_output_index_to_tc_index:
             tcs: list[dict] = []
             for tc_index in sorted(set(self.state.fc_output_index_to_tc_index.values())):

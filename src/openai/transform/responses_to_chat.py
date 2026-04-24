@@ -62,6 +62,14 @@ def translate_request(body: dict, *, api_key_name: str = "") -> dict:
     eff = reasoning.get("effort") if isinstance(reasoning, dict) else None
     if eff:
         payload["reasoning_effort"] = eff
+    # 02-bug-findings #12: reasoning.summary → 非官方 chat 字段 reasoning_summary
+    summary = reasoning.get("summary") if isinstance(reasoning, dict) else None
+    if summary:
+        payload["reasoning_summary"] = summary
+
+    # 02-bug-findings #11: text.verbosity ↔ chat verbosity（同 enum low/medium/high）
+    if isinstance(text_cfg, dict) and text_cfg.get("verbosity"):
+        payload["verbosity"] = text_cfg["verbosity"]
 
     if body.get("tools"):
         payload["tools"] = [_nest_tool(t) for t in body["tools"]]
@@ -313,11 +321,15 @@ def _content_responses_to_chat(content) -> Any:
         elif pt == "input_image":
             url = p.get("image_url") or ""
             detail = p.get("detail") or "auto"
-            out.append({"type": "image_url",
-                        "image_url": {"url": url, "detail": detail}})
+            iu: dict = {"url": url, "detail": detail}
+            # 02-bug-findings #4: file_id 双向透传
+            if p.get("file_id"):
+                iu["file_id"] = p["file_id"]
+            out.append({"type": "image_url", "image_url": iu})
         elif pt == "input_file":
             f: dict = {}
-            for k in ("file_id", "file_data", "filename"):
+            # 02-bug-findings #5: file_url + detail 双向透传
+            for k in ("file_id", "file_data", "filename", "file_url", "detail"):
                 if k in p:
                     f[k] = p[k]
             out.append({"type": "file", "file": f})
@@ -412,12 +424,15 @@ def translate_response(chat: dict, *, model: str,
     # content text → message item
     content = msg.get("content")
     if isinstance(content, str) and content:
+        # 02-bug-findings #28: 把 chat assistant.annotations 回填到 output_text.annotations
+        ann_list = msg.get("annotations") if isinstance(msg.get("annotations"), list) else []
         output_items.append({
             "type": "message",
             "id": _gen_id("msg_"),
             "role": "assistant",
             "status": "completed",
-            "content": [{"type": "output_text", "text": content, "annotations": []}],
+            "content": [{"type": "output_text", "text": content,
+                          "annotations": list(ann_list)}],
         })
 
     # refusal → message with refusal part
