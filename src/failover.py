@@ -361,6 +361,14 @@ _ERR_TYPE_ANTHROPIC_TO_OPENAI = {
 }
 
 
+def _openai_prompt_cache_key_from_body(ingress_protocol: str, body: Optional[dict]) -> Optional[str]:
+    """仅 OpenAI 协议使用的自动 prompt_cache_key 传递值。"""
+    if ingress_protocol not in ("chat", "responses") or not isinstance(body, dict):
+        return None
+    val = str(body.get("prompt_cache_key") or "").strip()
+    return val or None
+
+
 def _write_affinity_non_stream(
     ingress_protocol: str,
     api_key_name: Optional[str],
@@ -393,7 +401,10 @@ def _write_affinity_non_stream(
             api_key_name or "", client_ip or "", cur_input, ds_output,
         )
     if fp_write:
-        affinity.upsert(fp_write, channel_key, resolved_model)
+        affinity.upsert(
+            fp_write, channel_key, resolved_model,
+            prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+        )
     # 同步更新 client-level soft affinity
     if client_key:
         affinity.client_upsert(client_key, channel_key, resolved_model)
@@ -1525,7 +1536,10 @@ async def _consume_stream(
                 api_key_name or "", client_ip or "", cur_input, output_items,
             )
         if fp_write:
-            affinity.upsert(fp_write, ch.key, resolved_model)
+            affinity.upsert(
+                fp_write, ch.key, resolved_model,
+                prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+            )
         # 同步更新 client-level soft affinity
         if client_key:
             affinity.client_upsert(client_key, ch.key, resolved_model)

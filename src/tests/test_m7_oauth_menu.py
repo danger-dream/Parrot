@@ -33,11 +33,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, oauth_manager, state_db
+    from src import config, log_db, oauth_manager, state_db
     from src.telegram import bot, states, ui
     from src.telegram.menus import oauth_menu, main as main_menu
     return {
-        "config": config, "oauth_manager": oauth_manager, "state_db": state_db,
+        "config": config, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
         "oauth_menu": oauth_menu, "main_menu": main_menu,
     }
@@ -64,6 +64,7 @@ class ApiRecorder:
 
 def _setup(m):
     m["state_db"].init()
+    m["log_db"].init()
     m["state_db"].quota_delete("")  # 无操作，仅确保已初始化
     # 清干净
     def _reset(c):
@@ -73,6 +74,11 @@ def _setup(m):
     # 清 quota 缓存
     for row in m["state_db"].quota_load_all():
         m["state_db"].quota_delete(row["email"])
+    conn = m["log_db"]._get_conn()
+    conn.execute("DELETE FROM request_log")
+    conn.execute("DELETE FROM request_detail")
+    conn.execute("DELETE FROM retry_chain")
+    conn.commit()
     m["states"].clear_all()
 
 
@@ -80,6 +86,28 @@ def _install_recorder(m):
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
+
+
+
+
+def _account_key_for(m, email: str) -> str:
+    for acc in m["oauth_manager"].list_accounts():
+        if acc.get("email") == email:
+            return m["oauth_manager"]._account_key(acc)
+    raise AssertionError(f"account not found: {email}")
+
+
+def _insert_oauth_success(m, email: str, request_id: str = "oauth-r1", *, model: str = "gpt-5.5") -> None:
+    ak = _account_key_for(m, email)
+    ld = m["log_db"]
+    ld.insert_pending(request_id, "1.1.1.1", "k1", model, True,
+                      msg_count=3, tool_count=0, request_headers={}, request_body={})
+    ld.finish_success(
+        request_id, f"oauth:{ak}", "oauth", model,
+        input_tokens=100, output_tokens=20, cache_creation_tokens=10, cache_read_tokens=50,
+        connect_ms=100, first_token_ms=300, total_ms=1500,
+        retry_count=0, affinity_hit=1, response_body='{}', http_status=200,
+    )
 
 
 def _add_fake_account(m, email, **kw):
@@ -118,12 +146,13 @@ def test_list_empty_and_populated(m):
     kb = last["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
     assert "oa:add" in flat
-    assert "oa:refresh_all" in flat
+    assert "oa:refresh_all:1" in flat
     assert "menu:main" in flat
 
     # 添加两个账户后再渲染
     _add_fake_account(m, "user1@x.com")
     _add_fake_account(m, "user2@x.com", disabled_reason="user", enabled=False)
+    _insert_oauth_success(m, "user1@x.com")
     rec.clear()
     m["oauth_menu"].show(42, 100)
     last = rec.last("editMessageText")
@@ -131,6 +160,7 @@ def test_list_empty_and_populated(m):
     assert "user1@x.com" in last["text"]
     assert "user2@x.com" in last["text"]
     assert "用户禁用" in last["text"]
+    assert "缓存 50 (31.2%)" in last["text"]
     # 每个账户一个按钮
     email_btns = [
         b for row in last["reply_markup"]["inline_keyboard"]
@@ -152,6 +182,7 @@ def test_view_detail_with_quota_cache(m):
         "sonnet_util": None, "opus_util": None,
         "raw_data": "{}",
     })
+    _insert_oauth_success(m, "alice@x.com")
 
     rec = _install_recorder(m)
     short = m["ui"].register_code("alice@x.com")
@@ -160,6 +191,8 @@ def test_view_detail_with_quota_cache(m):
     assert last and "alice@x.com" in last["text"]
     assert "5h: 12%" in last["text"]
     assert "7d: 45%" in last["text"]
+    assert "缓存 50 (31.2%)" in last["text"]
+    assert "↑ 160 · ↓ 20" in last["text"]
     # 详情按钮
     kb = last["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
@@ -360,6 +393,62 @@ def test_set_json_missing_fields(m):
     print("  [PASS] set_json 缺字段拒绝")
 
 
+def test_oauth_detail_preserves_list_page(m):
+    """从非首页进入账户详情后，返回列表应保留原分页。"""
+    _setup(m)
+    for i in range(1, 10):
+        _add_fake_account(m, f"user{i}@x.com")
+    rec = _install_recorder(m)
+
+    m["oauth_menu"].show(42, 100, page=3)
+    page3 = rec.last("editMessageText")
+    assert page3 and "第 3/3 页" in page3["text"]
+    assert "user9@x.com" in page3["text"]
+    page3_flat = [
+        b["callback_data"]
+        for row in page3["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    view_cbs = [x for x in page3_flat if x.startswith("oa:view:")]
+    assert len(view_cbs) == 1
+    assert view_cbs[0].endswith(":3")
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-view-p3", view_cbs[0])
+    assert handled
+    detail = rec.last("editMessageText")
+    assert detail and "user9@x.com" in detail["text"]
+    detail_flat = [
+        b["callback_data"]
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:page:3" in detail_flat
+    assert any(x.startswith("oa:refresh_usage:") and x.endswith(":3") for x in detail_flat)
+    assert any(x.startswith("oa:toggle:") and x.endswith(":3") for x in detail_flat)
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-back-p3", "oa:page:3")
+    assert handled
+    back = rec.last("editMessageText")
+    assert back and "第 3/3 页" in back["text"]
+    assert "user9@x.com" in back["text"]
+
+    # 旧消息里的 oa:view:<short> 仍然兼容，默认按第一页处理。
+    legacy_short = m["ui"].register_code("user9@x.com")
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-view-old", f"oa:view:{legacy_short}")
+    assert handled
+    legacy_detail = rec.last("editMessageText")
+    legacy_flat = [
+        b["callback_data"]
+        for row in legacy_detail["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:page:1" in legacy_flat
+    print("  [PASS] oauth detail preserves page + legacy oa:view compatible")
+
+
 def test_router_dispatch(m):
     """通过 bot._handle_callback 间接验证路由在一起能跑通（admin 身份）。"""
     _setup(m)
@@ -406,6 +495,7 @@ def main():
         test_pkce_login_expired_session,
         test_set_json_valid,
         test_set_json_missing_fields,
+        test_oauth_detail_preserves_list_page,
         test_router_dispatch,
     ]
 

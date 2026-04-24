@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .. import cache_display
+
 
 # ─── 全局配置 ─────────────────────────────────────────────────────
 
@@ -352,25 +354,33 @@ def truncate(text: str, limit: int = 3900, suffix: str = "\n\n... (已截断)") 
 
 def fmt_tokens(n) -> str:
     """1234567 → 1.2M；1234 → 1.2K；else → 原样。"""
-    try:
-        n = int(n or 0)
-    except Exception:
-        return "0"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+    return cache_display.fmt_tokens(n)
 
 
 def fmt_rate(num, denom) -> str:
-    try:
-        num = float(num or 0); denom = float(denom or 0)
-    except Exception:
-        return "N/A"
-    if denom <= 0:
-        return "N/A"
-    return f"{num / denom * 100:.1f}%"
+    return cache_display.fmt_rate(num, denom)
+
+
+def prompt_total(input_tokens=0, cache_creation=0, cache_read=0) -> int:
+    return cache_display.prompt_total(input_tokens, cache_creation, cache_read)
+
+
+def prompt_total_from_row(row: dict, *, aggregate: bool = False) -> int:
+    return cache_display.prompt_total_from_row(row, aggregate=aggregate)
+
+
+def fmt_cache_read(cache_read, prompt) -> str:
+    """读缓存展示：`51.7K (60.8%)`。"""
+    return cache_display.cache_read_label(cache_read, prompt)
+
+
+def fmt_cache_phrase(cache_read, prompt) -> str:
+    """完整读缓存短语：`缓存 51.7K (60.8%)`。"""
+    return cache_display.cache_read_phrase(cache_read, prompt)
+
+
+def fmt_cache_phrase_from_row(row: dict, *, aggregate: bool = False) -> str:
+    return cache_display.cache_read_phrase_from_row(row, aggregate=aggregate)
 
 
 def fmt_ms(ms) -> str:

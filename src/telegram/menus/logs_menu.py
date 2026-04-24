@@ -1,9 +1,10 @@
 """最近日志菜单 + 单条详情（含重试链）。
 
 callback_data：
-  `menu:logs`           — 显示最近 20 条
-  `logs:refresh`        — 刷新列表
-  `logs:detail:<short>` — 查看详情（short 是 request_id 前 8 字符的短码）
+  `menu:logs`                  — 显示最近日志第 1 页
+  `logs:page:<page>`           — 显示指定页
+  `logs:refresh:<page>`        — 刷新指定页
+  `logs:detail:<short>:<page>` — 查看详情（short 是 request_id 短码，page 用于返回）
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from ... import log_db
 from .. import states, ui
 
 
-_LIST_LIMIT = 15
+_LIST_PAGE_SIZE = 6
 
 
 _STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
@@ -33,11 +34,31 @@ def _ingress_tag(row: dict) -> str:
     return _INGRESS_TAG.get(row.get("ingress_protocol") or "", "")
 
 
-def _render_list(rows: list[dict]) -> str:
+def _clamp_page(page: int, total: int) -> tuple[int, int]:
+    total_pages = max(1, (max(0, int(total or 0)) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    try:
+        p = int(page or 1)
+    except (TypeError, ValueError):
+        p = 1
+    return max(1, min(p, total_pages)), total_pages
+
+
+def _page_rows(page: int) -> tuple[list[dict], int, int, int]:
+    total = log_db.recent_logs_count()
+    page, total_pages = _clamp_page(page, total)
+    rows = log_db.recent_logs(_LIST_PAGE_SIZE, offset=(page - 1) * _LIST_PAGE_SIZE)
+    return rows, total, page, total_pages
+
+
+def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, total_pages: int | None = None) -> str:
+    total = len(rows) if total is None else int(total or 0)
+    total_pages = max(1, int(total_pages or 1))
     if not rows:
         return "📋 <b>最近日志</b>\n\n暂无记录。"
-    lines = [f"📋 <b>最近 {len(rows)} 条日志</b>",
-             "<i>对照下方按钮的 #编号 点击查看详情</i>"]
+    lines = [
+        f"📋 <b>最近日志 · 第 {page}/{total_pages} 页 · 共 {total} 条</b>",
+        "<i>对照下方按钮的 #编号 点击查看详情</i>",
+    ]
     for idx, r in enumerate(rows, 1):
         ts = ui.fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
         icon = _status_icon(r)
@@ -56,25 +77,26 @@ def _render_list(rows: list[dict]) -> str:
                 line += f"（重试 {r['retry_count']} 次）"
             if r.get("affinity_hit"):
                 line += "  ★亲和"
-        detail_parts = []
         if r.get("status") == "success":
-            inp = (r.get("input_tokens") or 0) + (r.get("cache_creation_tokens") or 0) + (r.get("cache_read_tokens") or 0)
+            inp = ui.prompt_total_from_row(r)
             cr = r.get("cache_read_tokens") or 0
-            tok = f"↑{ui.fmt_tokens(inp)} ↓{ui.fmt_tokens(r.get('output_tokens'))}"
+            tok = f"↑ {ui.fmt_tokens(inp)} · ↓ {ui.fmt_tokens(r.get('output_tokens'))}"
             if cr > 0:
-                tok += f" 缓存{ui.fmt_tokens(cr)}"
-            detail_parts.append(tok)
+                tok += f" · {ui.fmt_cache_phrase_from_row(r)}"
+            line += f"\n  Token: {tok}"
+
+        timing_parts = []
         if r.get("connect_time_ms") is not None:
-            detail_parts.append(f"连接 {ui.fmt_ms(r['connect_time_ms'])}")
+            timing_parts.append(f"连接 {ui.fmt_ms(r['connect_time_ms'])}")
         if r.get("is_stream") and r.get("first_token_time_ms") is not None:
-            detail_parts.append(f"首字 {ui.fmt_ms(r['first_token_time_ms'])}")
+            timing_parts.append(f"首字 {ui.fmt_ms(r['first_token_time_ms'])}")
         if r.get("total_time_ms") is not None:
-            detail_parts.append(f"总 {ui.fmt_ms(r['total_time_ms'])}")
+            timing_parts.append(f"总 {ui.fmt_ms(r['total_time_ms'])}")
         tps_v = ui.calc_row_tps(r)
         if tps_v is not None:
-            detail_parts.append(f"⚡ {ui.fmt_tps(tps_v)}")
-        if detail_parts:
-            line += "\n  " + " · ".join(detail_parts)
+            timing_parts.append(f"⚡ {ui.fmt_tps(tps_v)}")
+        if timing_parts:
+            line += "\n  耗时: " + " · ".join(timing_parts)
 
         if r.get("status") == "error" and r.get("error_message"):
             msg = r["error_message"]
@@ -113,48 +135,53 @@ def _extract_error_summary(raw: str) -> str:
     return (f"{prefix} — {json_part[:150]}" if prefix else json_part[:200])
 
 
-def _list_kb(rows: list[dict]) -> dict:
-    """按钮区只做"详情入口"，文案与列表正文不重复。
-
-    每条日志一个 `📄 #<序号> <时间>` 按钮（2 列），让用户对照列表里的
-    "#1 / #2 / ..." 编号点击查看完整详情。
-    """
+def _list_kb(rows: list[dict], *, page: int, total_pages: int) -> dict:
+    """详情按钮 3 列紧凑排列；分页行参考 OAuth 菜单。"""
     rows_kb: list[list[dict]] = []
     cur: list[dict] = []
-    # 与列表正文 _LIST_LIMIT 保持一致，避免"文字 N 条 vs 按钮 M 条"的不一致
-    for idx, r in enumerate(rows[:_LIST_LIMIT], 1):
+    for idx, r in enumerate(rows, 1):
         rid = r.get("request_id") or ""
         if not rid:
             continue
         short = ui.register_code(rid)
-        ts = ui.fmt_bjt_ts(r.get("created_at"), "%H:%M:%S")
-        cur.append(ui.btn(f"📄 #{idx} {ts}", f"logs:detail:{short}"))
-        if len(cur) >= 2:
+        cur.append(ui.btn(f"📄 #{idx}", f"logs:detail:{short}:{page}"))
+        if len(cur) >= 3:
             rows_kb.append(cur)
             cur = []
     if cur:
         rows_kb.append(cur)
-    rows_kb.append([ui.btn("🔄 刷新", "logs:refresh"),
+
+    if total_pages > 1:
+        nav: list[dict] = []
+        if page > 1:
+            nav.append(ui.btn("◀ 上一页", f"logs:page:{page - 1}"))
+        nav.append(ui.btn(f"{page}/{total_pages}", f"logs:page:{page}"))
+        if page < total_pages:
+            nav.append(ui.btn("下一页 ▶", f"logs:page:{page + 1}"))
+        rows_kb.append(nav)
+    rows_kb.append([ui.btn("🔄 刷新", f"logs:refresh:{page}"),
                     ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.inline_kb(rows_kb)
 
 
 # ─── 列表入口 ─────────────────────────────────────────────────────
 
-def show(chat_id: int, message_id: int, cb_id: str) -> None:
-    ui.answer_cb(cb_id)
-    rows = log_db.recent_logs(_LIST_LIMIT)
-    ui.edit(chat_id, message_id, ui.truncate(_render_list(rows)),
-            reply_markup=_list_kb(rows))
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    rows, total, page, total_pages = _page_rows(page)
+    ui.edit(chat_id, message_id, ui.truncate(_render_list(rows, page=page, total=total, total_pages=total_pages)),
+            reply_markup=_list_kb(rows, page=page, total_pages=total_pages))
 
 
 def send_new(chat_id: int) -> None:
-    rows = log_db.recent_logs(_LIST_LIMIT)
-    ui.send(chat_id, ui.truncate(_render_list(rows)), reply_markup=_list_kb(rows))
+    rows, total, page, total_pages = _page_rows(1)
+    ui.send(chat_id, ui.truncate(_render_list(rows, page=page, total=total, total_pages=total_pages)),
+            reply_markup=_list_kb(rows, page=page, total_pages=total_pages))
 
 
-def refresh(chat_id: int, message_id: int, cb_id: str) -> None:
-    show(chat_id, message_id, cb_id)
+def refresh(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
+    show(chat_id, message_id, cb_id, page=page)
 
 
 # ─── 详情 ─────────────────────────────────────────────────────────
@@ -203,14 +230,13 @@ def _render_detail(detail: dict) -> str:
 
     # Tokens
     if status == "success":
-        inp = (log.get("input_tokens") or 0) + (log.get("cache_creation_tokens") or 0) + (log.get("cache_read_tokens") or 0)
+        inp = ui.prompt_total_from_row(log)
         lines.append("")
         lines.append("<b>Tokens</b>")
-        lines.append(
-            f"↑ {ui.fmt_tokens(inp)} | ↓ {ui.fmt_tokens(log.get('output_tokens'))} | "
-            f"cache {ui.fmt_tokens(log.get('cache_read_tokens'))} "
-            f"(读 {ui.fmt_tokens(log.get('cache_read_tokens'))} / 写 {ui.fmt_tokens(log.get('cache_creation_tokens'))})"
-        )
+        token_line = f"↑ {ui.fmt_tokens(inp)} | ↓ {ui.fmt_tokens(log.get('output_tokens'))}"
+        if (log.get("cache_read_tokens") or 0) > 0:
+            token_line += f" | {ui.fmt_cache_phrase_from_row(log)}"
+        lines.append(token_line)
     # 耗时
     lines.append("")
     lines.append("<b>耗时</b>")
@@ -257,22 +283,22 @@ def _render_detail(detail: dict) -> str:
     return "\n".join(lines)
 
 
-def show_detail(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def show_detail(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
     ui.answer_cb(cb_id)
     rid = ui.resolve_code(short)
     if not rid:
         ui.edit(chat_id, message_id, "⚠ 日志已过期或未找到",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:logs")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"logs:page:{page}")]]))
         return
     try:
         detail = log_db.log_detail(rid)
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 查询失败: <code>{ui.escape_html(str(exc))}</code>",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:logs")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"logs:page:{page}")]]))
         return
     if not detail or not detail.get("log"):
         ui.edit(chat_id, message_id, f"⚠ 未找到 <code>{ui.escape_html(rid)}</code>",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:logs")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"logs:page:{page}")]]))
         return
     body_short = ui.register_code("logbody:" + rid)
     resp_short = ui.register_code("logresp:" + rid)
@@ -281,7 +307,7 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         reply_markup=ui.inline_kb([
             [ui.btn("📨 查看请求 body", f"logs:body:{body_short}"),
              ui.btn("📬 查看响应", f"logs:response:{resp_short}")],
-            [ui.btn("◀ 返回列表", "menu:logs")],
+            [ui.btn(f"◀ 返回第 {page} 页", f"logs:page:{page}")],
         ]),
     )
 
@@ -355,12 +381,28 @@ def show_response_body(chat_id: int, message_id: int, cb_id: str, short: str) ->
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
     if data == "menu:logs":
-        show(chat_id, message_id, cb_id); return True
-    if data == "logs:refresh":
-        refresh(chat_id, message_id, cb_id); return True
+        show(chat_id, message_id, cb_id, page=1); return True
+    if data.startswith("logs:page:"):
+        try:
+            page = int(data.split(":", 2)[2])
+        except Exception:
+            page = 1
+        show(chat_id, message_id, cb_id, page=page); return True
+    if data.startswith("logs:refresh"):
+        parts = data.split(":", 2)
+        try:
+            page = int(parts[2]) if len(parts) > 2 else 1
+        except Exception:
+            page = 1
+        refresh(chat_id, message_id, cb_id, page=page); return True
     if data.startswith("logs:detail:"):
-        short = data.split(":", 2)[2]
-        show_detail(chat_id, message_id, cb_id, short); return True
+        payload = data.split(":", 2)[2]
+        short, _, page_s = payload.partition(":")
+        try:
+            page = int(page_s or 1)
+        except Exception:
+            page = 1
+        show_detail(chat_id, message_id, cb_id, short, page=page); return True
     if data.startswith("logs:body:"):
         show_request_body(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("logs:response:"):

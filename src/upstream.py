@@ -239,6 +239,16 @@ class SSEAssistantBuilder:
 # usage 字段以 anthropic 的 4 键为准（input_tokens / output_tokens /
 # cache_creation / cache_read），保证 log_db 落库无感切换。OpenAI 不区分
 # cache_creation，一律置 0；cache_read 来自 cached_tokens 细节字段。
+#
+# ⚠️ 语义对齐（v0.8.0 修复）：
+# OpenAI 上游的 `prompt_tokens` 是含缓存命中的**总 prompt**，而 Anthropic
+# 的 `input_tokens` 指的是**未命中缓存的新 token**。为了让 DB 里 4 键的语
+# 义统一（Anthropic 风格），此处在归一时做一次扣减：
+#     input_tokens = max(0, prompt_tokens - cached_tokens)
+# 这样 DB 里的 `input_tokens + cache_read_tokens` 始终等于完整 prompt 总量，
+# 展示层的 `↑ = input + cache_creation + cache_read` 公式对 OpenAI / Anthropic
+# 两套协议都能得到正确的总 prompt 大小，缓存命中率 `cache_read / ↑` 也不会
+# 因为重复计数而掉到一半。
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -306,11 +316,14 @@ def extract_usage_chat_json(obj: Any) -> dict:
         return _zero_usage()
     u = obj.get("usage") or {}
     details = u.get("prompt_tokens_details") or {}
+    prompt_total = int(u.get("prompt_tokens", 0) or 0)
+    cached = int(details.get("cached_tokens", 0) or 0)
     return {
-        "input_tokens": int(u.get("prompt_tokens", 0) or 0),
+        # 见文件顶部「语义对齐」说明：扣掉缓存命中部分，对齐 Anthropic 风格
+        "input_tokens": max(0, prompt_total - cached),
         "output_tokens": int(u.get("completion_tokens", 0) or 0),
         "cache_creation": 0,
-        "cache_read": int(details.get("cached_tokens", 0) or 0),
+        "cache_read": cached,
     }
 
 
@@ -383,9 +396,13 @@ class ChatSSEUsageTracker:
                 u = evt.get("usage")
                 if isinstance(u, dict):
                     details = u.get("prompt_tokens_details") or {}
-                    self.usage["input_tokens"] = int(u.get("prompt_tokens", 0) or 0)
+                    prompt_total = int(u.get("prompt_tokens", 0) or 0)
+                    cached = int(details.get("cached_tokens", 0) or 0)
+                    # 见文件顶部「语义对齐」说明：OpenAI 的 prompt_tokens 含
+                    # cache，此处扣除后落库，保持与 Anthropic 语义一致。
+                    self.usage["input_tokens"] = max(0, prompt_total - cached)
                     self.usage["output_tokens"] = int(u.get("completion_tokens", 0) or 0)
-                    self.usage["cache_read"] = int(details.get("cached_tokens", 0) or 0)
+                    self.usage["cache_read"] = cached
                     # cache_creation 在 OpenAI 里没有对应概念，保持 0
 
     def get_full_response(self) -> str:
@@ -506,11 +523,15 @@ def extract_usage_responses_json(obj: Any) -> dict:
         return _zero_usage()
     u = obj.get("usage") or {}
     in_details = u.get("input_tokens_details") or {}
+    prompt_total = int(u.get("input_tokens", 0) or 0)
+    cached = int(in_details.get("cached_tokens", 0) or 0)
     return {
-        "input_tokens": int(u.get("input_tokens", 0) or 0),
+        # 见文件顶部「语义对齐」说明：Responses API 的 input_tokens 同样含
+        # 缓存命中部分，此处扣除后落库。
+        "input_tokens": max(0, prompt_total - cached),
         "output_tokens": int(u.get("output_tokens", 0) or 0),
         "cache_creation": 0,
-        "cache_read": int(in_details.get("cached_tokens", 0) or 0),
+        "cache_read": cached,
     }
 
 
@@ -579,9 +600,12 @@ class ResponsesSSEUsageTracker:
                 if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
                     u = resp["usage"]
                     in_details = u.get("input_tokens_details") or {}
-                    self.usage["input_tokens"] = int(u.get("input_tokens", 0) or 0)
+                    prompt_total = int(u.get("input_tokens", 0) or 0)
+                    cached = int(in_details.get("cached_tokens", 0) or 0)
+                    # 见文件顶部「语义对齐」说明：扣掉缓存命中部分后落库。
+                    self.usage["input_tokens"] = max(0, prompt_total - cached)
                     self.usage["output_tokens"] = int(u.get("output_tokens", 0) or 0)
-                    self.usage["cache_read"] = int(in_details.get("cached_tokens", 0) or 0)
+                    self.usage["cache_read"] = cached
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")

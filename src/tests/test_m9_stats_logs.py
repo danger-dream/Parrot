@@ -113,6 +113,10 @@ def test_fmt_helpers(m):
     assert ui.fmt_rate(0, 0) == "N/A"
     assert ui.fmt_rate(None, None) == "N/A"
 
+    assert ui.prompt_total(100, 10, 50) == 160
+    assert ui.fmt_cache_phrase(50, 160) == "缓存 50 (31.2%)"
+    assert ui.fmt_cache_phrase(51_700, 85_000) == "缓存 51.7K (60.8%)"
+
     assert ui.fmt_ms(250) == "250ms"
     assert ui.fmt_ms(1500) == "1.5s"
     assert ui.fmt_ms(None) == "-"
@@ -150,8 +154,10 @@ def test_stats_overall(m):
     assert "stats:view:0:all" in btns
     assert "stats:view:3:all" in btns
     assert "stats:view:month:all" in btns
-    # 亲和命中率（2/5 = 40%）
+    # 亲和命中率（2/5 = 40%），缓存 token 率（1400/3250 = 43.1%）
     assert "40.0%" in text
+    assert "缓存 1.4K (43.1%)" in text
+    assert "cache" not in text
     print("  [PASS] stats overall with counts + flags")
 
 
@@ -170,6 +176,8 @@ def test_stats_group_by_channel(m):
     # 渠道展示用 emoji + short name（去掉 oauth:/api: 前缀），更人性化
     assert "🔀" in text
     assert ">A<" in text and ">B<" in text   # <code>A</code> / <code>B</code>
+    assert "命中请求" in text
+    assert "缓存 100 (31.2%)" in text
     # 当前选中维度按钮应有 ✓ 标记
     btns_labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
     assert any("渠道 ✓" in l for l in btns_labels)
@@ -235,15 +243,59 @@ def test_logs_list(m):
     assert "✅" in text and "❌" in text
     # 亲和标志
     assert "★亲和" in text
+    # 缓存量带百分比：默认 input=100, cache_write=10, cache_read=50，总 prompt=160
+    assert "缓存 50 (31.2%)" in text
     # 错误摘要解包
     assert "down" in text
 
-    # 按钮中应包含 3 个 detail 短码
-    btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"]
-            for b in row if "callback_data" in b]
+    assert "最近日志 · 第 1/1 页 · 共 3 条" in text
+    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%)" in text
+    assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
+
+    # 按钮中应包含 3 个 detail 短码，且单行 3 列紧凑排列
+    kb_rows = edit["reply_markup"]["inline_keyboard"]
+    first_detail_row = [b for b in kb_rows[0] if b.get("callback_data", "").startswith("logs:detail:")]
+    assert len(first_detail_row) == 3
+    btns = [b["callback_data"] for row in kb_rows for b in row if "callback_data" in b]
     assert sum(1 for b in btns if b.startswith("logs:detail:")) >= 3
-    assert "logs:refresh" in btns
+    assert "logs:refresh:1" in btns
     print("  [PASS] logs list")
+
+
+def test_logs_pagination(m):
+    _setup(m)
+    for i in range(8):
+        _insert_success(m, f"P{i}", "k1", f"model-{i}", "api:A")
+        time.sleep(0.002)
+
+    rec = _install_recorder(m)
+    m["logs_menu"].show(42, 100, "cb")
+    edit = rec.last("editMessageText")
+    text = edit["text"]
+    assert "第 1/2 页 · 共 8 条" in text
+    assert text.count("<b>#") == 6
+    btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "logs:page:2" in btns
+    assert "logs:refresh:1" in btns
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb", "logs:page:2")
+    edit = rec.last("editMessageText")
+    text = edit["text"]
+    assert "第 2/2 页 · 共 8 条" in text
+    assert text.count("<b>#") == 2
+    btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "logs:page:1" in btns
+    detail_cb = next(b for b in btns if b.startswith("logs:detail:"))
+    assert detail_cb.endswith(":2")
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb", detail_cb)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "日志详情" in detail_text
+    detail_btns = [b["callback_data"] for row in rec.last("editMessageText")["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "logs:page:2" in detail_btns
+    print("  [PASS] logs pagination")
 
 
 def test_logs_detail_with_retry_chain(m):
@@ -274,8 +326,9 @@ def test_logs_detail_with_retry_chain(m):
     assert "重试链 (2 次尝试)" in text
     assert "api:A" in text and "api:B" in text
     assert "http_error" in text
-    # Tokens / 耗时
+    # Tokens / 耗时；input=200, cache_read=100，总 prompt=300，缓存率 33.3%
     assert "↑" in text and "↓" in text
+    assert "缓存 100 (33.3%)" in text
     # 重试 1 次 flag
     assert "重试 1 次" in text
     print("  [PASS] logs detail with retry chain")
@@ -330,6 +383,7 @@ def main():
         test_stats_group_by_model_and_apikey,
         test_stats_period_switch,
         test_logs_list,
+        test_logs_pagination,
         test_logs_detail_with_retry_chain,
         test_logs_detail_short_expired,
         test_router_dispatch,

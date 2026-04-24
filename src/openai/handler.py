@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 import traceback
 import uuid
@@ -31,7 +32,7 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from .. import (
-    auth, config, errors, failover, fingerprint, log_db, model_mapping,
+    affinity, auth, config, errors, failover, fingerprint, log_db, model_mapping,
     notifier, scheduler,
 )
 from ..channel import registry
@@ -80,6 +81,53 @@ def _openai_family_models_sorted(cfg: dict) -> list[str]:
 def _store_enabled() -> bool:
     cfg = config.get()
     return bool(((cfg.get("openai") or {}).get("store") or {}).get("enabled", True))
+
+
+def _auto_prompt_cache_cfg() -> dict:
+    cfg = config.get()
+    return ((cfg.get("openai") or {}).get("autoPromptCacheKey") or {})
+
+
+def _auto_prompt_cache_enabled() -> bool:
+    auto = _auto_prompt_cache_cfg()
+    return bool(auto.get("enabled", True))
+
+
+def _new_auto_prompt_cache_key() -> str:
+    auto = _auto_prompt_cache_cfg()
+    prefix = str(auto.get("prefix") or "parrot:auto:v1").strip() or "parrot:auto:v1"
+    # 不含用户内容/会话内容；仅作为 OpenAI 上游 prompt cache 路由 hint。
+    return f"{prefix}:{secrets.token_hex(16)}"
+
+
+def _maybe_apply_auto_prompt_cache_key(body: dict, *, fp_query: str | None) -> str | None:
+    """OpenAI 协议专用：下游未传 prompt_cache_key 时自动补一个。
+
+    优先从亲和链的 fp_query 继承已绑定 key；没有则生成新 key，成功响应
+    后由 failover 绑定到 fp_write，从下一轮开始链式复用。
+    """
+    if not isinstance(body, dict):
+        return None
+    existing = str(body.get("prompt_cache_key") or "").strip()
+    if existing:
+        return existing
+    if not _auto_prompt_cache_enabled():
+        return None
+
+    key: str | None = None
+    if fp_query:
+        try:
+            entry = affinity.get(fp_query)
+        except Exception:
+            entry = None
+        if isinstance(entry, dict):
+            val = str(entry.get("prompt_cache_key") or "").strip()
+            if val:
+                key = val
+    if not key:
+        key = _new_auto_prompt_cache_key()
+    body["prompt_cache_key"] = key
+    return key
 
 
 # ─── 主入口 ───────────────────────────────────────────────────────
@@ -171,6 +219,10 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         fp_query = fingerprint.fingerprint_query_responses(
             key_name or "", client_ip, resolve_current_input_items(body)
         )
+
+    # 5.1 OpenAI 专用 prompt cache 路由 hint：下游没传时基于亲和链自动补。
+    #     Anthropic/其他协议不走本 handler，不受影响。
+    _maybe_apply_auto_prompt_cache_key(body, fp_query=fp_query)
 
     # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘
     req_headers = _sanitize_headers(dict(request.headers))

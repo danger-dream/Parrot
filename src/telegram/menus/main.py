@@ -186,14 +186,17 @@ def _lifetime_stats_block() -> list[str]:
     except Exception:
         s = {"total": 0, "input_tokens": 0, "output_tokens": 0,
              "cache_creation": 0, "cache_read": 0}
-    total_in = (s.get("input_tokens") or 0) + (s.get("cache_creation") or 0) + (s.get("cache_read") or 0)
+    total_in = ui.prompt_total(s.get("input_tokens"), s.get("cache_creation"), s.get("cache_read"))
     out_tok = s.get("output_tokens") or 0
-    return [
+    lines = [
         "📊 <b>累计统计</b>",
         f"  总调用 <code>{s.get('total', 0):,}</code> 次",
         f"  总 Tokens <code>{ui.fmt_tokens(total_in + out_tok)}</code> "
-        f"(↑{ui.fmt_tokens(total_in)} ↓{ui.fmt_tokens(out_tok)})",
+        f"(↑ {ui.fmt_tokens(total_in)} ↓ {ui.fmt_tokens(out_tok)})",
     ]
+    if (s.get("cache_read") or 0) > 0:
+        lines.append(f"  {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}")
+    return lines
 
 
 def _compose_text() -> str:

@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 
-from . import config, notifier, state_db
+from . import cache_display, config, notifier, state_db
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
@@ -1091,25 +1091,14 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
         )
         ts = log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=month_start)
         if ts and ts["total"] > 0:
-            prompt = ts["input"] + ts["cache_creation"] + ts["cache_read"]
-            cache_rate = (ts["cache_read"] / prompt * 100) if prompt > 0 else 0
-            parts.append(
-                f"💎 月度统计: ↑ {_fmt_tokens(prompt)} ↓ {_fmt_tokens(ts['output'])}"
-                f" · 缓存率 {cache_rate:.2f}%"
-            )
+            prompt = cache_display.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
+            line = f"💎 月度统计: ↑ {cache_display.fmt_tokens(prompt)} · ↓ {cache_display.fmt_tokens(ts['output'])}"
+            if (ts.get("cache_read") or 0) > 0:
+                line += f" · {cache_display.cache_read_phrase(ts['cache_read'], prompt)}"
+            parts.append(line)
     except Exception as exc:
         print(f"[oauth] monthly stats lookup failed: {exc}")
     return "\n".join(parts)
-
-
-def _fmt_tokens(n: int) -> str:
-    """简单 token 数格式化：1234567 → 1.23M / 1234 → 1.2K。"""
-    n = int(n or 0)
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
 
 
 async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:

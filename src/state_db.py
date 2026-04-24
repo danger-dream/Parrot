@@ -63,11 +63,12 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_cooldown ON channel_errors(cooldown_until);
 
     CREATE TABLE IF NOT EXISTS cache_affinities (
-      fingerprint  TEXT PRIMARY KEY,
-      channel_key  TEXT NOT NULL,
-      model        TEXT NOT NULL,
-      last_used    INTEGER NOT NULL,
-      created_at   INTEGER NOT NULL
+      fingerprint       TEXT PRIMARY KEY,
+      channel_key       TEXT NOT NULL,
+      model             TEXT NOT NULL,
+      last_used         INTEGER NOT NULL,
+      created_at        INTEGER NOT NULL,
+      prompt_cache_key  TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_affinity_used ON cache_affinities(last_used);
     CREATE INDEX IF NOT EXISTS idx_affinity_channel ON cache_affinities(channel_key);
@@ -125,11 +126,27 @@ def init() -> None:
     conn = _get_conn()
     with _write_lock:
         conn.executescript(_schema_sql())
+        _migrate_affinity_prompt_cache_key_col(conn)
         _migrate_oauth_quota_cache_openai_cols(conn)
         conn.commit()
     if not _initialized:
         print(f"[state_db] Using {_db_path}")
     _initialized = True
+
+
+# ================================================================
+# 幂等迁移：cache_affinities 增加 OpenAI prompt_cache_key
+# ================================================================
+
+def _migrate_affinity_prompt_cache_key_col(conn: sqlite3.Connection) -> None:
+    """老库升级：为 OpenAI 自动 prompt_cache_key 绑定补充可空列。
+
+    该列只被 OpenAI 协议使用；Anthropic/其他协议的亲和绑定保持 NULL，
+    不改变既有调度语义。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(cache_affinities)")}
+    if "prompt_cache_key" not in cols:
+        conn.execute("ALTER TABLE cache_affinities ADD COLUMN prompt_cache_key TEXT")
 
 
 # ================================================================
@@ -477,23 +494,33 @@ def error_rename_channel(old_key: str, new_key: str) -> None:
 # ─── cache_affinities ─────────────────────────────────────────────
 
 def affinity_upsert(fingerprint: str, channel_key: str, model: str,
-                    last_used: int | None = None) -> None:
+                    last_used: int | None = None,
+                    prompt_cache_key: str | None = None) -> None:
     ts = last_used if last_used is not None else now_ms()
     with _write_lock:
         conn = _get_conn()
-        # 先尝试更新；若未命中则插入
-        cur = conn.execute(
-            """UPDATE cache_affinities
-               SET channel_key=?, model=?, last_used=?
-               WHERE fingerprint=?""",
-            (channel_key, model, ts, fingerprint),
-        )
+        # 先尝试更新；若未命中则插入。prompt_cache_key=None 表示不改
+        # 既有值，避免非 OpenAI 协议/老调用路径清空 OpenAI 会话缓存绑定。
+        if prompt_cache_key is not None:
+            cur = conn.execute(
+                """UPDATE cache_affinities
+                   SET channel_key=?, model=?, last_used=?, prompt_cache_key=?
+                   WHERE fingerprint=?""",
+                (channel_key, model, ts, prompt_cache_key, fingerprint),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE cache_affinities
+                   SET channel_key=?, model=?, last_used=?
+                   WHERE fingerprint=?""",
+                (channel_key, model, ts, fingerprint),
+            )
         if cur.rowcount == 0:
             conn.execute(
                 """INSERT INTO cache_affinities
-                   (fingerprint, channel_key, model, last_used, created_at)
-                   VALUES (?,?,?,?,?)""",
-                (fingerprint, channel_key, model, ts, ts),
+                   (fingerprint, channel_key, model, last_used, created_at, prompt_cache_key)
+                   VALUES (?,?,?,?,?,?)""",
+                (fingerprint, channel_key, model, ts, ts, prompt_cache_key),
             )
         conn.commit()
 

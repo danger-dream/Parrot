@@ -90,20 +90,21 @@ def _section_overall(overall: dict) -> str:
     max_tps = overall.get("max_tps")
     min_tps = overall.get("min_tps")
 
+    token_line = f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
+    if raw_cr > 0:
+        token_line += f" | {ui.fmt_cache_phrase(raw_cr, total_inp)}"
+
     lines = [
         "<b>Tokens:</b>",
-        f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)} | "
-        f"cache {ui.fmt_tokens(raw_cr)} ({ui.fmt_rate(raw_cr, total_inp)})",
+        token_line,
         "",
         "<b>请求:</b>",
         f"共 {total} 次 | ✅ {succ} | ❌ {err} | ⏳ {pend}",
         f"成功率 {ui.fmt_rate(succ, total)}",
         "",
         "<b>缓存:</b>",
-        f"命中请求 {succ_hit}/{succ} ({ui.fmt_rate(succ_hit, succ)}) · "
-        f"写入请求 {succ_write}/{succ} ({ui.fmt_rate(succ_write, succ)})",
-        f"读 {ui.fmt_tokens(raw_cr)} ({ui.fmt_rate(raw_cr, total_inp)}) · "
-        f"写 {ui.fmt_tokens(raw_cc)} ({ui.fmt_rate(raw_cc, total_inp)})",
+        f"命中请求 {succ_hit}/{succ} ({ui.fmt_rate(succ_hit, succ)})"
+        + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr > 0 else ""),
         "",
         "<b>耗时（平均）:</b>",
         f"连接 {ui.fmt_ms(avg_conn)} | 首字 {ui.fmt_ms(avg_first)} | 总 {ui.fmt_ms(avg_total)}",
@@ -173,11 +174,16 @@ def _summary_dim_block(title: str, groups: list[dict], render_key,
         succ = int(m.get("success_count") or 0)
         hit = int(m.get("hit_requests") or 0)
         prompt = int(m.get("total_prompt_tokens") or 0)
+        cr = int(m.get("total_cache_read") or 0)
         out.append(f"\n{key}")
-        out.append(
+        line = (
             f"  {total} 次 ({ui.fmt_rate(succ, total)}) · "
-            f"命中 {ui.fmt_rate(hit, succ)} · ↑{ui.fmt_tokens(prompt)}"
+            f"命中请求 {hit}/{succ} ({ui.fmt_rate(hit, succ)}) · "
+            f"↑ {ui.fmt_tokens(prompt)}"
         )
+        if cr > 0:
+            line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
+        out.append(line)
         if extra_line is not None:
             extra = extra_line(g["key"])
             if extra:
@@ -218,14 +224,11 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key,
             if extra:
                 out.append(f"  {extra}")
         out.append(f"  请求 {total} | ✅ {succ} ({ui.fmt_rate(succ, total)}) | ❌ {err}")
-        out.append(
-            f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)} · "
-            f"cache {ui.fmt_tokens(cr)} ({ui.fmt_rate(cr, prompt)})"
-        )
-        out.append(
-            f"  命中 {hit}/{succ} ({ui.fmt_rate(hit, succ)}) · "
-            f"写入 {write}/{succ} ({ui.fmt_rate(write, succ)})"
-        )
+        token_line = f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
+        if cr > 0:
+            token_line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
+        out.append(token_line)
+        out.append(f"  命中请求 {hit}/{succ} ({ui.fmt_rate(hit, succ)})")
         if avg_conn is not None or avg_first is not None:
             out.append(f"  连接 {ui.fmt_ms(avg_conn)} | 首字 {ui.fmt_ms(avg_first)}")
         if avg_tps is not None or max_tps is not None:
@@ -276,8 +279,8 @@ def _section_recent_calls(calls: list[dict]) -> str:
             inp = (r.get("input_tokens") or 0) + (r.get("cache_creation_tokens") or 0) + (r.get("cache_read_tokens") or 0)
             cr = r.get("cache_read_tokens") or 0
             out.append(
-                f"  ↑{ui.fmt_tokens(inp)} · ↓{ui.fmt_tokens(r.get('output_tokens'))}"
-                + (f" · cache {ui.fmt_tokens(cr)}" if cr else "")
+                f"  ↑ {ui.fmt_tokens(inp)} · ↓ {ui.fmt_tokens(r.get('output_tokens'))}"
+                + (f" · {ui.fmt_cache_phrase(cr, inp)}" if cr else "")
             )
         timing = []
         if r.get("connect_time_ms") is not None:
@@ -345,7 +348,7 @@ def _section_overall_compact(overall: dict) -> str:
     # Tokens 行
     lines.append(
         f"↑ {ui.fmt_tokens(total_inp)} · ↓ {ui.fmt_tokens(raw_out)}"
-        + (f" · cache {ui.fmt_tokens(raw_cr)} ({ui.fmt_rate(raw_cr, total_inp)})" if raw_cr else "")
+        + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr else "")
     )
     # 耗时 / 速度
     timing_bits = []
@@ -359,7 +362,7 @@ def _section_overall_compact(overall: dict) -> str:
         lines.append(" · ".join(timing_bits))
     # 缓存命中 + 重试 + 亲和（两家族对称；值为 0 也展示，保持对照）
     if total > 0:
-        extras = [f"请求命中 {succ_hit}/{succ}"]
+        extras = [f"命中请求 {succ_hit}/{succ} ({ui.fmt_rate(succ_hit, succ)})"]
         if total_retries > 0:
             extras.append(f"重试 {total_retries} 次 ({retried}/{total})")
         else:

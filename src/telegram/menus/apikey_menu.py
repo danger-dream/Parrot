@@ -202,15 +202,16 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
     # 本月使用统计
     ms = _key_month_stats(name)
     if ms is not None:
-        prompt = ms["input"] + ms["cache_creation"] + ms["cache_read"]
-        cache_rate = (ms["cache_read"] / prompt * 100) if prompt > 0 else 0
+        prompt = ui.prompt_total(ms["input"], ms["cache_creation"], ms["cache_read"])
+        token_line = f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ms['output'])}"
+        if (ms.get("cache_read") or 0) > 0:
+            token_line += f" · {ui.fmt_cache_phrase(ms['cache_read'], prompt)}"
         lines += [
             "",
             "<b>📈 本月使用统计</b>",
             f"  调用 {ms['total']} 次 · ✅ {ms['success_count']}"
             f" ({ui.fmt_rate(ms['success_count'], ms['total'])}) · ❌ {ms['error_count']}",
-            f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ms['output'])}"
-            f" · 缓存率 {cache_rate:.2f}%",
+            token_line,
         ]
         if ms.get("avg_tps") is not None:
             lines.append(

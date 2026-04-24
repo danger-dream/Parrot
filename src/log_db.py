@@ -835,12 +835,11 @@ def _finalize_tps(agg: dict) -> dict:
     }
 
 
-def recent_logs(
-    limit: int = 20,
+def _recent_logs_where(
     channel_key: str | None = None,
     model: str | None = None,
     status: str | None = None,
-) -> list[dict]:
+) -> tuple[str, list]:
     conds, vals = [], []
     if channel_key:
         conds.append("final_channel_key=?"); vals.append(channel_key)
@@ -849,10 +848,33 @@ def recent_logs(
     if status:
         conds.append("status=?"); vals.append(status)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
-    sql = f"SELECT {_RECENT_COLS} FROM request_log {where} ORDER BY created_at DESC LIMIT ?"
-    vals.append(limit)
+    return where, vals
+
+
+def recent_logs(
+    limit: int = 20,
+    channel_key: str | None = None,
+    model: str | None = None,
+    status: str | None = None,
+    offset: int = 0,
+) -> list[dict]:
+    where, vals = _recent_logs_where(channel_key, model, status)
+    lim = max(1, int(limit or 20))
+    off = max(0, int(offset or 0))
+    sql = f"SELECT {_RECENT_COLS} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    vals.extend([lim, off])
     rows = _get_conn().execute(sql, vals).fetchall()
     return [dict(r) for r in rows]
+
+
+def recent_logs_count(
+    channel_key: str | None = None,
+    model: str | None = None,
+    status: str | None = None,
+) -> int:
+    where, vals = _recent_logs_where(channel_key, model, status)
+    row = _get_conn().execute(f"SELECT COUNT(*) AS n FROM request_log {where}", vals).fetchone()
+    return int(row["n"] or 0) if row else 0
 
 
 def log_detail(request_id: str) -> dict:

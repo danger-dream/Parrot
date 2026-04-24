@@ -78,6 +78,11 @@ def _setup(m):
     m["state_db"].error_delete()
     m["state_db"].affinity_delete()
     m["state_db"].client_affinity_delete()
+    conn = m["log_db"]._get_conn()
+    conn.execute("DELETE FROM request_log")
+    conn.execute("DELETE FROM request_detail")
+    conn.execute("DELETE FROM retry_chain")
+    conn.commit()
     for mod_name in ("cooldown", "scorer", "affinity"):
         m[mod_name]._initialized = False
     m["cooldown"].init()
@@ -99,6 +104,20 @@ def _install_recorder(m):
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
+
+
+
+
+def _insert_channel_success(m, channel_name: str, request_id: str = "ch-r1", *, model: str = "glm-5") -> None:
+    ld = m["log_db"]
+    ld.insert_pending(request_id, "1.1.1.1", "k1", model, True,
+                      msg_count=3, tool_count=0, request_headers={}, request_body={})
+    ld.finish_success(
+        request_id, f"api:{channel_name}", "api", model,
+        input_tokens=100, output_tokens=20, cache_creation_tokens=10, cache_read_tokens=50,
+        connect_ms=100, first_token_ms=300, total_ms=1500,
+        retry_count=0, affinity_hit=1, response_body='{}', http_status=200,
+    )
 
 
 def _add_channel(m, name, url="https://example.com/v", models=None):
@@ -138,12 +157,14 @@ def test_list_empty_and_populated(m):
 
     _add_channel(m, "chA")
     _add_channel(m, "chB", models=[{"real": "gpt-4", "alias": "gpt-4"}])
+    _insert_channel_success(m, "chA")
     rec.clear()
     m["channel_menu"].show(42, 100)
     last = rec.last("editMessageText")
     assert "共 2 个" in last["text"]
     assert "chA" in last["text"]
     assert "chB" in last["text"]
+    assert "缓存 50 (31.2%)" in last["text"]
     print("  [PASS] list empty + populated")
 
 
@@ -153,6 +174,7 @@ def test_detail_renders(m):
         {"real": "GLM-5", "alias": "glm-5"},
         {"real": "GLM-Turbo", "alias": "glm-turbo"},
     ])
+    _insert_channel_success(m, "chA", model="GLM-5")
     rec = _install_recorder(m)
     short = m["ui"].register_code("chA")
     m["channel_menu"].on_view(42, 100, "cb", short)
@@ -161,6 +183,7 @@ def test_detail_renders(m):
     text = last["text"]
     assert "chA" in text
     assert "GLM-5" in text and "glm-5" in text
+    assert "缓存 50 (31.2%)" in text
     # API Key 掩码
     assert "sk-tes" in text and "***" in text
     # 按钮

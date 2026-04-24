@@ -34,6 +34,7 @@ def init() -> None:
                 "channel_key": row["channel_key"],
                 "model": row["model"],
                 "last_used": row["last_used"],
+                "prompt_cache_key": row.get("prompt_cache_key"),
             }
     _initialized = True
     print(f"[affinity] loaded {len(rows)} entries from state.db")
@@ -59,18 +60,32 @@ def get(fingerprint: Optional[str]) -> Optional[dict]:
     return dict(entry)
 
 
-def upsert(fingerprint: Optional[str], channel_key: str, model: str) -> None:
-    """插入或更新绑定。内存 + state.db 双写。"""
+def upsert(fingerprint: Optional[str], channel_key: str, model: str,
+           prompt_cache_key: Optional[str] = None) -> None:
+    """插入或更新绑定。内存 + state.db 双写。
+
+    prompt_cache_key 仅供 OpenAI 协议自动补 `prompt_cache_key` 使用；
+    传 None 表示保留旧值，不影响 Anthropic/其他协议的亲和语义。
+    """
     if not fingerprint:
         return
     now = state_db.now_ms()
     with _lock:
-        _entries[fingerprint] = {
+        prev = _entries.get(fingerprint) or {}
+        entry = {
             "channel_key": channel_key,
             "model": model,
             "last_used": now,
+            "prompt_cache_key": (
+                prompt_cache_key if prompt_cache_key is not None
+                else prev.get("prompt_cache_key")
+            ),
         }
-    state_db.affinity_upsert(fingerprint, channel_key, model, last_used=now)
+        _entries[fingerprint] = entry
+    state_db.affinity_upsert(
+        fingerprint, channel_key, model, last_used=now,
+        prompt_cache_key=prompt_cache_key,
+    )
 
 
 def touch(fingerprint: Optional[str]) -> None:

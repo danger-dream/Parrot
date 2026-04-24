@@ -179,6 +179,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         # reasoning 跨协议桥接："passthrough" = 通过非官方字段 reasoning_content 双向映射；"drop" = 丢弃
         "reasoningBridge": "passthrough",
+        # 自动补 OpenAI prompt_cache_key：仅 /v1/chat/completions 与 /v1/responses 生效。
+        # 下游显式传入时绝不覆盖；未传时根据亲和链复用会话级 key，
+        # 帮 OpenAI/Codex 上游稳定 prompt cache 路由。
+        "autoPromptCacheKey": {
+            "enabled": True,
+            "prefix": "parrot:auto:v1",
+        },
         # 跨变体翻译能力开关
         "translation": {
             "enabled": True,

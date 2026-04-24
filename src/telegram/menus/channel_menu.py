@@ -177,8 +177,8 @@ def _channel_health(ch) -> tuple[str, str]:
     return "🔴", f"近期 {worst:.0f}%"
 
 
-def _summary_text(ch, tps_v: Optional[float] = None) -> str:
-    """列表行上的简短摘要（success_rate · avg_first_byte · sum_requests · 本月 TPS）。"""
+def _summary_text(ch, tps_v: Optional[float] = None, cache_phrase: str = "") -> str:
+    """列表行上的简短摘要（success_rate · avg_first_byte · sum_requests · 本月 TPS · 缓存）。"""
     key = ch.key
     total_req = 0
     avg_fb: list[float] = []
@@ -199,6 +199,8 @@ def _summary_text(ch, tps_v: Optional[float] = None) -> str:
     core = f"{rate_str} · {fb_str} · {total_req} 次"
     if tps_v is not None:
         core += f" · ⚡ {ui.fmt_tps(tps_v)}"
+    if cache_phrase:
+        core += f" · {cache_phrase}"
     return core
 
 
@@ -230,9 +232,15 @@ def _list_text_and_kb() -> tuple[str, dict]:
         try:
             ch_stats = log_db.tokens_for_channel(ch.key, since_ts=month_ts)
             ch_tps = ch_stats.get("avg_tps")
+            ch_prompt = ui.prompt_total(ch_stats.get("input"), ch_stats.get("cache_creation"), ch_stats.get("cache_read"))
+            ch_cache = (
+                ui.fmt_cache_phrase(ch_stats.get("cache_read"), ch_prompt)
+                if (ch_stats.get("cache_read") or 0) > 0 else ""
+            )
         except Exception:
             ch_tps = None
-        summary = _summary_text(ch, tps_v=ch_tps)
+            ch_cache = ""
+        summary = _summary_text(ch, tps_v=ch_tps, cache_phrase=ch_cache)
         lines.append("")
         lines.append(f"{icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
         lines.append(f"  模型: {len(ch.models)} 个 · {ui.escape_html(summary)}")
@@ -318,6 +326,12 @@ def _channel_model_lines(ch) -> list[str]:
             lines.append(stats_line)
 
         ms = stats_by_model.get(real)
+        if ms:
+            m_prompt = ui.prompt_total(ms.get("input"), ms.get("cache_creation"), ms.get("cache_read"))
+            token_line = f"    ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(ms.get('output'))}"
+            if (ms.get("cache_read") or 0) > 0:
+                token_line += f" · {ui.fmt_cache_phrase(ms.get('cache_read'), m_prompt)}"
+            lines.append(token_line)
         if ms and ms.get("avg_tps") is not None:
             lines.append(
                 f"    ⚡ TPS: 平均 {ui.fmt_tps(ms['avg_tps'])} · "
