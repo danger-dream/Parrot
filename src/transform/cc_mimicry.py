@@ -273,6 +273,18 @@ _FAKE_PREFIXES = [
 ]
 
 
+def _stable_tool_names_seed(tool_names) -> int:
+    """Return a process-independent seed for dynamic tool-name mapping.
+
+    Python's built-in hash() is salted per process. Using it here made OAuth
+    tool aliases change after every Parrot restart, which changes the prompt
+    cache key for long Claude Code requests and can force a full cache rewrite.
+    """
+    raw = json.dumps(list(tool_names), ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
 def _build_dynamic_tool_map(tool_names, threshold=5):
     """当 tools 数量超过 threshold 时，生成原名→假名的动态映射。
     返回 dict 或 None（无需映射时）。
@@ -281,7 +293,7 @@ def _build_dynamic_tool_map(tool_names, threshold=5):
         return None
     mapping = {}
     available = list(_FAKE_PREFIXES)
-    rng = random.Random(hash(tuple(tool_names)))  # 同进程内同一组 tools 映射稳定，保证缓存命中
+    rng = random.Random(_stable_tool_names_seed(tool_names))  # 跨进程稳定，避免重启打碎 prompt cache
     rng.shuffle(available)
     for i, name in enumerate(tool_names):
         prefix = available[i % len(available)]

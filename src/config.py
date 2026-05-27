@@ -64,6 +64,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": False,
             "url": "",
         },
+        # ─── New proxy subsystem (2026-05-27) ─────────────────────
+        # proxies: named proxy definitions (socks5 / ss2022)
+        # groups: ordered lists of proxy names for failover
+        # routing: maps contexts to proxy/group names
+        "proxies": {},
+        "groups": {},
+        "routing": {
+            "default": "direct",
+            # "telegram": "direct",
+            # "oauth": "direct",
+            # "models": {},
+            # "channels": {},
+        },
         "monitor": {
             "enabled": True,
             "intervalSeconds": 60,   # 最小 5 秒；UI 会校验

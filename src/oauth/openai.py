@@ -1,13 +1,16 @@
 """OpenAI (ChatGPT / Codex CLI) OAuth provider。
 
-对应 sub2api (Wei-Shaw/sub2api) 里的 Codex CLI OAuth 流程：
-  - PKCE: code_verifier 是 **hex(64 随机字节)**，与 Anthropic 侧 base64url 不同
+对齐 openai/codex 上游 (codex-rs/login) 当前实现：
+  - PKCE: code_verifier 是 **base64url_no_pad(64 随机字节)**（与官方 Codex 一致；
+    历史版本曾用 hex 也能跑，但已切回官方编码以避免上游 fingerprint 收紧时翻车）
   - Authorize URL 必带 `id_token_add_organizations=true` +
-    `codex_cli_simplified_flow=true`
-  - Token 端点用 **form-urlencoded**（不是 JSON）
-  - refresh 时 scope 不含 `offline_access`
+    `codex_cli_simplified_flow=true` + `originator=codex_cli_rs`，scope 含
+    `api.connectors.read api.connectors.invoke`
+  - exchange_code 用 **form-urlencoded**
+  - **refresh 用 JSON**，只发 `{client_id, grant_type, refresh_token}`，不带 scope
+    （Codex 已在 codex-rs/login/src/auth/manager.rs 把刷新切到 JSON 且去掉 scope）
   - email / chatgpt_account_id / organizations 从 id_token payload 解码拿到
-    （**不验 JWT 签名**，仅校验 exp，与 sub2api 对齐）
+    （**不验 JWT 签名**，仅校验 exp）
 
 上游请求（responses）与用量（response 头）在本模块之外完成：
   - 请求构造：src/channel/openai_oauth_channel.py (Commit 2)
@@ -36,8 +39,12 @@ AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 
-SCOPES_AUTHORIZE = "openid profile email offline_access"
-# 刷新时 scope 不能带 offline_access（sub2api 经验，带了会被拒）
+SCOPES_AUTHORIZE = (
+    "openid profile email offline_access "
+    "api.connectors.read api.connectors.invoke"
+)
+# 刷新时 Codex 官方实现完全不传 scope（refresh 默认继承原 scope）。
+# 历史 SCOPES_REFRESH 仅在 mockMode 下作为响应里的占位字段使用。
 SCOPES_REFRESH = "openid profile email"
 
 # 固定的 Codex CLI User-Agent。与 sub2api 最新 Codex 上游请求指纹保持一致。
@@ -118,10 +125,11 @@ def _mock_token_response(email: str | None = None, *, workspace_id: str | None =
 def pkce_generate() -> tuple[str, str]:
     """返回 (code_verifier, code_challenge)。
 
-    OpenAI 特殊：verifier 必须是 hex（64 字节随机 → 128 字符 hex）；
-    challenge 仍是 base64url(sha256(verifier)) 无 padding。
+    与 openai/codex (codex-rs/login/src/pkce.rs) 对齐：
+      verifier  = base64url_no_pad(64 随机字节)  → 86 字符
+      challenge = base64url_no_pad(sha256(verifier))
     """
-    verifier = secrets.token_bytes(64).hex()
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
     digest = hashlib.sha256(verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return verifier, challenge
@@ -140,6 +148,8 @@ def build_login_url(code_challenge: str, state: str,
         # OpenAI / Codex CLI 特有
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
+        # 与 codex-rs/login/src/server.rs:508 对齐：authorize URL 必带 originator
+        "originator": "codex_cli_rs",
     }
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
@@ -147,7 +157,7 @@ def build_login_url(code_challenge: str, state: str,
 # ─── code → token ─────────────────────────────────────────────────
 
 def _post_token_form(data: dict) -> dict:
-    """同步 POST form-urlencoded 到 token 端点。"""
+    """同步 POST form-urlencoded 到 token 端点（用于 authorization_code 换 token）。"""
     resp = network.post_sync(
         TOKEN_URL,
         data=data,
@@ -155,8 +165,33 @@ def _post_token_form(data: dict) -> dict:
             "content-type": "application/x-www-form-urlencoded",
             "accept": "application/json",
             "user-agent": USER_AGENT,
+            # 与 codex-rs/login/src/auth/default_client.rs:234 对齐：Codex HTTP 都带 originator
+            "originator": "codex_cli_rs",
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
+        proxy_purpose="oauth_openai",
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _post_token_json(data: dict) -> dict:
+    """同步 POST application/json 到 token 端点。
+
+    Codex 当前的 refresh_token 走 JSON
+    （codex-rs/login/src/auth/manager.rs:817-829）。
+    """
+    resp = network.post_sync(
+        TOKEN_URL,
+        json=data,
+        headers={
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": USER_AGENT,
+            "originator": "codex_cli_rs",
+        },
+        timeout=_TOKEN_HTTP_TIMEOUT,
+        proxy_purpose="oauth_openai",
     )
     resp.raise_for_status()
     return resp.json()
@@ -318,6 +353,7 @@ def _fetch_accounts_check_payload_sync(access_token: str) -> dict | None:
                 "user-agent": USER_AGENT,
             },
             timeout=_ACCOUNTS_CHECK_TIMEOUT,
+            proxy_purpose="oauth_openai",
         )
         resp.raise_for_status()
         return resp.json()
@@ -486,11 +522,11 @@ def refresh_sync(refresh_token: str, *, email: str | None = None,
     """
     if _mock_mode_enabled():
         return _mock_token_response(email, workspace_id=workspace_id, org_id=org_id)
-    return enrich_token_response_sync(_post_token_form({
+    # 与 codex-rs/login/src/auth/manager.rs:817 对齐：refresh 走 JSON，仅 3 字段，不带 scope。
+    return enrich_token_response_sync(_post_token_json({
+        "client_id": CLIENT_ID,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": CLIENT_ID,
-        "scope": SCOPES_REFRESH,
     }), workspace_id=workspace_id, org_id=org_id)
 
 

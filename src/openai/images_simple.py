@@ -372,7 +372,13 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
 
     try:
         timeout = httpx.Timeout(connect=15.0, read=float(timeout_s), write=30.0, pool=15.0)
-        async with network.async_client(timeout=timeout, http2=False) as client:
+        async with network.async_client(
+            timeout=timeout,
+            http2=False,
+            proxy_purpose="oauth_openai",
+            proxy_channel=f"oauth:{ak}",
+            proxy_model=str(payload.get("model") or ""),
+        ) as client:
             async with client.stream("POST", CODEX_RESPONSES_URL, headers=headers, content=body) as resp:
                 _update_codex_quota(ak, email, resp.headers)
                 if resp.status_code >= 400:

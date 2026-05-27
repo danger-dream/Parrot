@@ -149,7 +149,11 @@ async def probe_channel_model(
     # 用临时 client（独立于服务端主 client 的连接池；避免主池长连接影响 probe 结果）
     # 关键：httpx.Timeout(timeout) 只保证每个阶段（connect/read/write）单独不超过 timeout，
     # 不是总时长。用 asyncio.wait_for 再加一层总时长硬性限制，确保真的不超过 timeout 秒。
-    async with network.async_client(timeout=httpx.Timeout(timeout)) as client:
+    async with network.async_client(
+        timeout=httpx.Timeout(timeout),
+        proxy_channel=ch.key,
+        proxy_model=model,
+    ) as client:
         try:
             resp = await asyncio.wait_for(
                 client.post(

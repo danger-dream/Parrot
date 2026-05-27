@@ -28,6 +28,7 @@ import sys
 import time
 
 import httpx
+import pytest
 
 
 class ChunkedByteStream(httpx.AsyncByteStream):
@@ -227,6 +228,88 @@ def sse_with_blacklist():
     return httpx.Response(200, content=payload,
                           headers={"content-type": "text/event-stream"})
 
+
+
+
+class _MockStreamContext:
+    def __init__(self, resp: httpx.Response):
+        self.resp = resp
+
+    async def __aenter__(self):
+        return self.resp
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.resp.aclose()
+        return False
+
+
+class _FailingEnterCtx:
+    async def __aenter__(self):
+        raise httpx.ConnectError("proxy down")
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _ProxyMockClient:
+    def __init__(self, name: str, router: MockRouter, *, fail_enter: bool = False):
+        self.name = name
+        self.router = router
+        self.fail_enter = fail_enter
+        self.closed = False
+        self.requests: list[httpx.Request] = []
+
+    def stream(self, method, url, *, headers=None, content=None, timeout=None):
+        if self.fail_enter:
+            return _FailingEnterCtx()
+        req = httpx.Request(method, url, headers=headers, content=content)
+        self.requests.append(req)
+        resp = self.router.handle(req)
+        return _MockStreamContext(resp)
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _FakeProxyConnector:
+    def __init__(self, name: str, router: MockRouter, *, fail_enter: bool = False):
+        from src.proxy.connector import Connector
+        # Avoid subclassing: failover only needs .type/.stats/create_httpx_client.
+        from src.proxy.connector import ProxyStats
+        self.name = name
+        self.type = "socks5"
+        self.stats = ProxyStats()
+        self.router = router
+        self.fail_enter = fail_enter
+        self.clients: list[_ProxyMockClient] = []
+
+    def create_httpx_client(self, **kwargs):
+        c = _ProxyMockClient(self.name, self.router, fail_enter=self.fail_enter)
+        self.clients.append(c)
+        return c
+
+
+def _patch_proxy_route(m, connectors: dict[str, object], chain: list[str]):
+    """Patch proxy manager module view for one test."""
+    from src.proxy import manager as pm
+    old = {
+        "init": pm.init,
+        "is_configured": pm.is_configured,
+        "resolve_proxy_chain": pm.resolve_proxy_chain,
+        "get_connector": pm.get_connector,
+    }
+    pm.init = lambda: None
+    pm.is_configured = lambda: True
+    pm.resolve_proxy_chain = lambda **kwargs: list(chain)
+    pm.get_connector = lambda name: connectors.get(name)
+    return pm, old
+
+
+def _restore_proxy_route(pm, old):
+    pm.init = old["init"]
+    pm.is_configured = old["is_configured"]
+    pm.resolve_proxy_chain = old["resolve_proxy_chain"]
+    pm.get_connector = old["get_connector"]
 
 # ─── 用例 ────────────────────────────────────────────────────────
 
@@ -693,6 +776,64 @@ async def test_cooldown_excludes_from_next(m):
     print("  [PASS] cooldown excludes chA from next schedule")
 
 
+async def test_proxy_group_pre_header_connect_error_switches_proxy_same_channel(m):
+    """Proxy group failover: connect error before response headers should try next proxy in same channel."""
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: json_ok_response())
+    chA = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [chA])
+
+    p1 = _FakeProxyConnector("p1", router, fail_enter=True)
+    p2 = _FakeProxyConnector("p2", router, fail_enter=False)
+    pm, old = _patch_proxy_route(m, {"p1": p1, "p2": p2}, ["p1", "p2"])
+    body = {"model": "glm-5", "stream": False, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    try:
+        resp, rid, sr, mc = await _call_proxy(m, router, body)
+    finally:
+        _restore_proxy_route(pm, old)
+    assert resp.status_code == 200
+    await mc.aclose()
+    assert len(p1.clients) == 1
+    assert len(p2.clients) == 1
+    assert p1.clients[0].closed is True
+    assert p2.clients[0].closed is True
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "success"
+    assert log["log"]["proxy_name"] == "p2"
+    assert len(log["retry_chain"]) == 1
+    assert log["retry_chain"][0]["proxy_name"] == "p2"
+    assert p1.stats.total_failures == 1
+    assert p2.stats.total_successes == 1
+
+
+async def test_proxy_group_http_error_does_not_switch_proxy(m):
+    """HTTP response headers lock the proxy attempt; 5xx must not try next proxy in group."""
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: http_500())
+    chA = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [chA])
+
+    p1 = _FakeProxyConnector("p1", router, fail_enter=False)
+    p2 = _FakeProxyConnector("p2", router, fail_enter=False)
+    pm, old = _patch_proxy_route(m, {"p1": p1, "p2": p2}, ["p1", "p2"])
+    body = {"model": "glm-5", "stream": False, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    try:
+        resp, rid, sr, mc = await _call_proxy(m, router, body)
+    finally:
+        _restore_proxy_route(pm, old)
+    assert resp.status_code == 503
+    await mc.aclose()
+    assert len(p1.clients) == 1
+    assert len(p2.clients) == 0
+    log = m["log_db"].log_detail(rid)
+    assert log["retry_chain"][0]["outcome"] == "http_error"
+    assert log["retry_chain"][0]["proxy_name"] == "p1"
+
+
 async def amain():
     m = _import_modules()
 
@@ -713,6 +854,8 @@ async def amain():
         test_stream_blacklist_switch,
         test_affinity_pins_channel,
         test_cooldown_excludes_from_next,
+        test_proxy_group_pre_header_connect_error_switches_proxy_same_channel,
+        test_proxy_group_http_error_does_not_switch_proxy,
     ]
 
     passed = 0

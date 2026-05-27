@@ -519,7 +519,42 @@ def active_socks5_url() -> Optional[str]:
 
 
 def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
-                 http2: bool = False, **kwargs) -> httpx.AsyncClient:
+                 http2: bool = False,
+                 proxy_purpose: str = "",
+                 proxy_channel: str = "",
+                 proxy_model: str = "",
+                 byte_counter=None,
+                 **kwargs) -> httpx.AsyncClient:
+    """Create an async HTTP client, optionally routing through a proxy.
+
+    If the new proxy subsystem is configured, ``proxy_purpose`` /
+    ``proxy_channel`` / ``proxy_model`` are used to resolve a proxy via
+    ``proxy.manager``.  Falls back to legacy ``socks5`` config.
+    """
+    # Try new proxy system first, but only when it is explicitly configured.
+    # DEFAULT_CONFIG always contains routing.default=direct; treating that as
+    # opt-in would silently bypass the legacy network.socks5 setting.
+    try:
+        from .proxy import manager as pm
+        pm.init()
+        if pm.is_configured():
+            target = pm.resolve_proxy_target(
+                channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose)
+            chain = pm.expand_target(target)
+            for pname in chain:
+                conn = pm.get_connector(pname)
+                if conn is None:
+                    continue
+                try:
+                    return conn.create_httpx_client(
+                        timeout=timeout, limits=limits, http2=http2,
+                        byte_counter=byte_counter, **kwargs)
+                except Exception:
+                    continue
+    except Exception:
+        pass  # fall through to legacy
+
+    # Legacy socks5 fallback
     opts = dict(kwargs)
     if timeout is not None:
         opts["timeout"] = timeout
@@ -534,13 +569,44 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
 
 
 def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
-                http2: bool = False, **kwargs) -> httpx.Client:
+                http2: bool = False,
+                proxy_purpose: str = "",
+                proxy_channel: str = "",
+                proxy_model: str = "",
+                **kwargs) -> httpx.Client:
+    """Create a sync HTTP client.
+
+    Sync callers support direct and SOCKS5. SS2022 is async-only; if a route
+    resolves to SS2022 we keep scanning the target chain for a sync-capable
+    fallback, then fall back to legacy socks5.
+    """
     opts = dict(kwargs)
     if timeout is not None:
         opts["timeout"] = timeout
     if limits is not None:
         opts["limits"] = limits
     opts.setdefault("http2", http2)
+
+    try:
+        from .proxy import manager as pm
+        pm.init()
+        if pm.is_configured():
+            target = pm.resolve_proxy_target(
+                channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose)
+            for pname in pm.expand_target(target):
+                conn = pm.get_connector(pname)
+                if conn is None:
+                    continue
+                if conn.type == "direct":
+                    opts.setdefault("trust_env", False)
+                    return httpx.Client(**opts)
+                if conn.type == "socks5":
+                    opts["proxy"] = conn.url
+                    opts["trust_env"] = False
+                    return httpx.Client(**opts)
+    except Exception:
+        pass
+
     proxy = active_socks5_url()
     if proxy:
         opts["proxy"] = proxy
@@ -550,13 +616,21 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
 
 def get_sync(url: str, **kwargs) -> httpx.Response:
     timeout = kwargs.pop("timeout", None)
-    with sync_client(timeout=timeout) as client:
+    proxy_purpose = kwargs.pop("proxy_purpose", "")
+    proxy_channel = kwargs.pop("proxy_channel", "")
+    proxy_model = kwargs.pop("proxy_model", "")
+    with sync_client(timeout=timeout, proxy_purpose=proxy_purpose,
+                     proxy_channel=proxy_channel, proxy_model=proxy_model) as client:
         return client.get(url, **kwargs)
 
 
 def post_sync(url: str, **kwargs) -> httpx.Response:
     timeout = kwargs.pop("timeout", None)
-    with sync_client(timeout=timeout) as client:
+    proxy_purpose = kwargs.pop("proxy_purpose", "")
+    proxy_channel = kwargs.pop("proxy_channel", "")
+    proxy_model = kwargs.pop("proxy_model", "")
+    with sync_client(timeout=timeout, proxy_purpose=proxy_purpose,
+                     proxy_channel=proxy_channel, proxy_model=proxy_model) as client:
         return client.post(url, **kwargs)
 
 

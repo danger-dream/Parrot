@@ -120,6 +120,9 @@ def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, t
         if timing_parts:
             line += "\n  耗时: " + " · ".join(timing_parts)
 
+        if r.get("proxy_name"):
+            line += f"\n  出站代理: 🔀 {ui.escape_html(r['proxy_name'])}"
+
         if r.get("status") == "error" and r.get("error_message"):
             msg = r["error_message"]
             summary = _extract_error_summary(msg)[:120]
@@ -233,6 +236,8 @@ def _render_detail(detail: dict) -> str:
             f"最终渠道: <code>{ui.escape_html(final_ch)}</code>"
             f" / <code>{ui.escape_html(log.get('final_model') or '?')}</code>"
         )
+    if log.get("proxy_name"):
+        lines.append(f"出站代理: 🔀 <code>{ui.escape_html(log['proxy_name'])}</code>")
     # 协议（入口 + 上游）：老日志可能为空，非空才显示避免噪音
     ingress = log.get("ingress_protocol")
     upstream_proto = log.get("upstream_protocol")
@@ -283,7 +288,10 @@ def _render_detail(detail: dict) -> str:
         model = ui.escape_html(c.get("model") or "?")
         oc = c.get("outcome") or "?"
         mark = "✅" if oc == "success" else "❌"
-        lines.append(f"  {mark} <b>{order}.</b> <code>{ch}</code> / <code>{model}</code> — {ui.escape_html(oc)}")
+        proxy_tag = ""
+        if c.get("proxy_name"):
+            proxy_tag = f" 🔀 {ui.escape_html(c['proxy_name'])}"
+        lines.append(f"  {mark} <b>{order}.</b> <code>{ch}</code> / <code>{model}</code>{proxy_tag} — {ui.escape_html(oc)}")
         timing = []
         if c.get("connect_ms") is not None:
             timing.append(f"连接 {ui.fmt_ms(c['connect_ms'])}")

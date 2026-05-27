@@ -37,6 +37,7 @@ images/
 # ─── 杂项 ────────────────────────────────────────────────
 bak/
 .codex/
+.serena/
 .DS_Store
 .idea/
 .vscode/

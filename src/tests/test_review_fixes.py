@@ -161,6 +161,21 @@ def test_anthropic_transforms_default_stream_false(m):
     assert cc["stream"] is False
 
 
+def test_dynamic_tool_map_seed_is_process_independent(m):
+    cc = m["cc_mimicry"]
+    tools = [
+        "read", "edit", "write", "exec", "process", "cron", "message",
+        "gateway", "sessions_list", "sessions_history", "sessions_send",
+        "subagents", "session_status", "sessions_spawn", "browser",
+        "browser_extra",
+    ]
+    mapping1 = cc._build_dynamic_tool_map(tools)
+    mapping2 = cc._build_dynamic_tool_map(list(tools))
+    assert mapping1 == mapping2
+    assert mapping1["exec"] == "extract_exe03"
+    assert mapping1["browser_extra"] == "resolve_bro15"
+
+
 def test_restore_tool_names_only_protocol_tool_name_fields(m):
     cc = m["cc_mimicry"]
     dynamic_map = {"original_tool": "fake_tool"}
@@ -213,3 +228,31 @@ def test_restore_tool_name_field_in_incomplete_sse_json(m):
     restored = cc._restore_tool_names_in_chunk(raw)
     assert b'"name":"sessions_list"' in restored
     assert b'cc_sess_list' not in restored
+
+
+def test_counting_transport_counts_streamed_request_and_response_bytes(m):
+    import asyncio
+    import httpx
+    from src.proxy.connector import CountingAsyncTransport
+
+    async def main():
+        seen = {"up": 0, "down": 0}
+
+        def on_bytes(up=0, down=0):
+            seen["up"] += up
+            seen["down"] += down
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = b""
+            async for chunk in request.stream:
+                body += chunk
+            assert body == b"abcdef"
+            return httpx.Response(200, content=b"xyz123")
+
+        transport = CountingAsyncTransport(httpx.MockTransport(handler), on_bytes)
+        async with httpx.AsyncClient(transport=transport) as client:
+            resp = await client.post("https://example.test/", content=b"abcdef")
+            assert resp.text == "xyz123"
+        assert seen == {"up": 6, "down": 6}
+
+    asyncio.run(main())

@@ -14,7 +14,7 @@ import json
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 
 import httpx
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -515,6 +515,9 @@ class AttemptResult:
     usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0})
     full_response_text: Optional[str] = None
     assistant_response: Optional[dict] = None
+    proxy_name: Optional[str] = None
+    proxy_bytes_up: int = 0
+    proxy_bytes_down: int = 0
 
 
 _OUTCOMES_NO_COOLDOWN = {
@@ -527,6 +530,44 @@ _OUTCOMES_NO_COOLDOWN = {
 
 def _should_cooldown(outcome: str) -> bool:
     return outcome not in _OUTCOMES_NO_COOLDOWN
+
+
+def _proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
+    """Build proxy routing context for a channel/model attempt.
+
+    Routing priority is account = channel > model > function family > default.
+    The family-level function route is the default outlet for every request in
+    that provider family, including OAuth login/refresh/probes and normal
+    channel requests.
+    """
+    proto = getattr(ch, "protocol", "anthropic") or "anthropic"
+    purpose = "oauth_anthropic" if proto == "anthropic" else "oauth_openai"
+    return {
+        "channel_key": ch.key,
+        "model": resolved_model,
+        "purpose": purpose,
+        "account_key": getattr(ch, "account_key", "") or "",
+    }
+
+
+def _pick_non_direct_proxy_name(ch: Channel, resolved_model: str) -> str | None:
+    try:
+        from .proxy import manager as pm
+        pm.init()
+        target = pm.resolve_proxy_target(**_proxy_route_kwargs(ch, resolved_model))
+        for name in pm.expand_target(target):
+            conn = pm.get_connector(name)
+            if conn is not None and conn.type != "direct":
+                return name
+    except Exception:
+        pass
+    return None
+
+
+def _proxy_byte_snapshot(proxy_bytes: Optional[dict]) -> tuple[int, int]:
+    if not proxy_bytes:
+        return 0, 0
+    return int(proxy_bytes.get("up") or 0), int(proxy_bytes.get("down") or 0)
 
 
 # ─── 辅助 ─────────────────────────────────────────────────────────
@@ -615,9 +656,15 @@ async def run_failover(
             idx += 1
             continue
 
+        # Resolve proxy for this attempt (read from proxy manager)
+        _attempt_proxy: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
+
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
+            proxy_name=_attempt_proxy,
         )
+        if _attempt_proxy:
+            log_db.update_pending(request_id, proxy_name=_attempt_proxy)
 
         release_done = False
         def _release_once(_key=ch.key):
@@ -639,12 +686,17 @@ async def run_failover(
             _release_once()
             raise
         last_result = result
+        if _attempt_proxy and not result.proxy_name:
+            result.proxy_name = _attempt_proxy
 
         log_db.update_retry_attempt(
             attempt_id,
             connect_ms=result.connect_ms, first_byte_ms=result.first_byte_ms,
             ended_at=time.time(), outcome=result.outcome,
             error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+            proxy_name=result.proxy_name,
+            bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+            bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
         )
 
         if result.success or result.stream_started:
@@ -734,7 +786,7 @@ async def run_failover(
         remaining_total = max(0.0, deadline_ts - time.time())
         queue_timeout = min(queue_wait_s, remaining_total)
         if queue_timeout > 0:
-            candidate_keys = [(ch.key, (ch, m)) for ch, m in saturated_all]
+            candidate_keys: list[tuple[str, object]] = [(ch.key, (ch, m)) for ch, m in saturated_all]
             acquired = await concurrency.acquire_from_candidates(candidate_keys, queue_timeout)
             if acquired is not None:
                 _ch_key, payload = acquired
@@ -743,8 +795,10 @@ async def run_failover(
                 last_ch_key, last_ch_type, last_model = ch.key, ch.type, resolved_model
                 last_ch_protocol = getattr(ch, "protocol", "anthropic")
 
+                _attempt_proxy2: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
                 attempt_id = log_db.record_retry_attempt(
                     request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
+                    proxy_name=_attempt_proxy2,
                 )
                 release_done2 = False
                 def _release_q(_key=ch.key):
@@ -765,11 +819,16 @@ async def run_failover(
                     _release_q()
                     raise
                 last_result = result
+                if _attempt_proxy2 and not result.proxy_name:
+                    result.proxy_name = _attempt_proxy2
                 log_db.update_retry_attempt(
                     attempt_id,
                     connect_ms=result.connect_ms, first_byte_ms=result.first_byte_ms,
                     ended_at=time.time(), outcome=result.outcome,
                     error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
+                    proxy_name=result.proxy_name,
+                    bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+                    bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
                 )
                 if result.success or result.stream_started:
                     _attach_release_to_response(result.response, _release_q)
@@ -824,6 +883,9 @@ async def run_failover(
         first_token_ms=(last_result.first_byte_ms if last_result else None),
         total_ms=total_ms, http_status=status, affinity_hit=affinity_hit,
         upstream_protocol=last_ch_protocol,
+        proxy_name=(last_result.proxy_name if last_result else None),
+        proxy_bytes_up=(last_result.proxy_bytes_up if last_result else None),
+        proxy_bytes_down=(last_result.proxy_bytes_down if last_result else None),
     )
     return _json_error_for_ingress(ingress_protocol, status, err_type, msg)
 
@@ -900,61 +962,196 @@ async def _try_channel(
     # 与本次请求一一对应的工具名映射；不再依赖 channel 实例属性，避免并发覆盖
     dynamic_map = upstream_req.dynamic_tool_map
 
-    client = upstream.get_client()
-    t_send = time.time()
-    remaining = max(1.0, deadline_ts - t_send)
+    # Proxy routing: resolve per channel/account/model.  A proxy group is
+    # failover at the proxy layer: only pre-response-header failures switch to
+    # the next proxy.  Once we have HTTP response headers, the upstream attempt
+    # is locked to that proxy/channel; HTTP status/body/first-byte/read errors
+    # are channel outcomes and must not silently retry through another proxy.
+    _proxy_client = None
+    _proxy_name_used: str | None = None
+    _proxy_bytes = {"up": 0, "down": 0}
 
-    try:
-        ctx = client.stream(
-            upstream_req.method,
-            upstream_req.url,
-            headers=upstream_req.headers,
-            content=upstream_req.body,
-            timeout=httpx.Timeout(
-                connect=connect_timeout,
-                read=remaining,
-                write=30.0,
-                pool=connect_timeout,
-            ),
-        )
-    except Exception as exc:
+    def _new_proxy_bytes() -> dict:
+        return {"up": 0, "down": 0}
+
+    def _count_proxy_bytes_for(bucket: dict):
+        def _cb(up: int = 0, down: int = 0):
+            bucket["up"] += int(up or 0)
+            bucket["down"] += int(down or 0)
+        return _cb
+
+    def _snapshot_bytes(bucket: dict) -> tuple[int, int]:
+        return int(bucket.get("up") or 0), int(bucket.get("down") or 0)
+
+    def _proxy_attempt_result(outcome: str, detail: str,
+                              bucket: dict | None = None,
+                              pname: str | None = None) -> AttemptResult:
+        up, down = _snapshot_bytes(bucket or {})
         return AttemptResult(
-            outcome="transport_error",
-            error_detail=f"send build error: {exc}",
+            outcome=outcome,
+            error_detail=detail,
+            proxy_name=pname,
+            proxy_bytes_up=up,
+            proxy_bytes_down=down,
         )
 
-    # 进入 stream context
-    upstream_resp: Optional[httpx.Response] = None
+    route_chain: list[tuple[str, Any | None]] = []
     try:
-        # ctx.__aenter__() 发送请求 + 读 response header。httpx 的阶段超时不保证
-        # 总时长（如果上游慢慢吐字节，每阶段单独不超时但累积可能远超 total）。
-        # 用 asyncio.wait_for 做硬性总超时兜底。
+        from .proxy import manager as _pm
+        _pm.init()
+        if _pm.is_configured():
+            chain = _pm.resolve_proxy_chain(**_proxy_route_kwargs(ch, resolved_model))
+            valid_seen = False
+            for _pn in chain:
+                _pc = _pm.get_connector(_pn)
+                if _pc is None:
+                    continue
+                valid_seen = True
+                # Direct is an explicit candidate in the failover chain, but it
+                # still uses the shared upstream client so tests/runtime pooling
+                # semantics stay unchanged.  It is never logged as a proxy.
+                if getattr(_pc, "type", "") == "direct":
+                    route_chain.append(("direct", None))
+                else:
+                    route_chain.append((_pn, _pc))
+            if not valid_seen:
+                return AttemptResult(
+                    outcome="proxy_connect_error",
+                    error_detail=f"proxy route has no valid target: {chain}",
+                )
+    except Exception:
+        route_chain = []
+    if not route_chain:
+        route_chain = [("direct", None)]
+
+    ctx = None
+    upstream_resp: Optional[httpx.Response] = None
+    connect_ms = 0
+    last_pre_header: AttemptResult | None = None
+
+    for _route_name, _pc in route_chain:
+        _proxy_client = None
+        _proxy_name_used = None
+        _proxy_bytes = _new_proxy_bytes()
+        client = upstream.get_client()
+
+        if _pc is not None:
+            try:
+                _pc.stats.total_attempts += 1
+                _pc.stats.last_attempt_ts = time.time()
+                _proxy_name_used = str(_route_name)
+                _proxy_client = _pc.create_httpx_client(
+                    timeout=httpx.Timeout(connect=connect_timeout,
+                                          read=330, write=30, pool=connect_timeout),
+                    byte_counter=_count_proxy_bytes_for(_proxy_bytes),
+                )
+                client = _proxy_client
+            except Exception as exc:
+                _pc.stats.total_failures += 1
+                _pc.stats.last_error = str(exc)[:200]
+                last_pre_header = _proxy_attempt_result(
+                    "proxy_connect_error", f"proxy client error: {exc}",
+                    _proxy_bytes, _proxy_name_used,
+                )
+                await _close_proxy_client(_proxy_client)
+                continue
+
+        t_send = time.time()
+        remaining = max(1.0, deadline_ts - t_send)
+
+        try:
+            ctx = client.stream(
+                upstream_req.method,
+                upstream_req.url,
+                headers=upstream_req.headers,
+                content=upstream_req.body,
+                timeout=httpx.Timeout(
+                    connect=connect_timeout,
+                    read=remaining,
+                    write=30.0,
+                    pool=connect_timeout,
+                ),
+            )
+        except Exception as exc:
+            await _close_proxy_client(_proxy_client)
+            if _pc is not None:
+                _pc.stats.total_failures += 1
+                _pc.stats.last_error = str(exc)[:200]
+            last_pre_header = _proxy_attempt_result(
+                "transport_error", f"send build error: {exc}",
+                _proxy_bytes, _proxy_name_used,
+            )
+            continue
+
         enter_timeout = max(1.0, deadline_ts - time.time())
         try:
             upstream_resp = await asyncio.wait_for(
                 ctx.__aenter__(), timeout=enter_timeout,
             )
         except asyncio.TimeoutError:
-            # 总时长耗尽：ctx 可能未成功 enter，不必 safe_exit
-            return AttemptResult(
-                outcome="total_timeout",
-                error_detail=f"total timeout during connect/headers (> {int(enter_timeout)}s)",
+            await _close_proxy_client(_proxy_client)
+            last_pre_header = _proxy_attempt_result(
+                "total_timeout",
+                f"total timeout during connect/headers (> {int(enter_timeout)}s)",
+                _proxy_bytes, _proxy_name_used,
             )
+            # Overall deadline is exhausted; another proxy cannot help without
+            # violating the request timeout budget.
+            return last_pre_header
         except httpx.ConnectTimeout:
-            return AttemptResult(outcome="connect_timeout",
-                                 error_detail=f"connect timeout > {connect_timeout}s")
+            await _close_proxy_client(_proxy_client)
+            if _pc is not None:
+                _pc.stats.total_failures += 1
+                _pc.stats.last_error = f"connect timeout > {connect_timeout}s"
+            last_pre_header = _proxy_attempt_result(
+                "connect_timeout", f"connect timeout > {connect_timeout}s",
+                _proxy_bytes, _proxy_name_used,
+            )
+            continue
         except httpx.ConnectError as exc:
-            return AttemptResult(outcome="connect_error",
-                                 error_detail=f"connect error: {exc}")
+            await _close_proxy_client(_proxy_client)
+            if _pc is not None:
+                _pc.stats.total_failures += 1
+                _pc.stats.last_error = str(exc)[:200]
+            last_pre_header = _proxy_attempt_result(
+                "connect_error", f"connect error: {exc}",
+                _proxy_bytes, _proxy_name_used,
+            )
+            continue
         except httpx.TimeoutException as exc:
-            return AttemptResult(outcome="connect_timeout",
-                                 error_detail=f"timeout: {exc}")
+            await _close_proxy_client(_proxy_client)
+            if _pc is not None:
+                _pc.stats.total_failures += 1
+                _pc.stats.last_error = str(exc)[:200]
+            last_pre_header = _proxy_attempt_result(
+                "connect_timeout", f"timeout: {exc}",
+                _proxy_bytes, _proxy_name_used,
+            )
+            continue
         except Exception as exc:
-            return AttemptResult(outcome="transport_error",
-                                 error_detail=f"transport: {exc}")
+            await _close_proxy_client(_proxy_client)
+            if _pc is not None:
+                _pc.stats.total_failures += 1
+                _pc.stats.last_error = str(exc)[:200]
+            last_pre_header = _proxy_attempt_result(
+                "transport_error", f"transport: {exc}",
+                _proxy_bytes, _proxy_name_used,
+            )
+            continue
 
         connect_ms = int((time.time() - t_send) * 1000)
+        if _pc is not None:
+            _pc.stats.total_successes += 1
+            _pc.stats.last_success_ts = time.time()
+            _pc.stats.last_latency_ms = connect_ms
+        break
+    else:
+        return last_pre_header or AttemptResult(
+            outcome="proxy_connect_error",
+            error_detail="proxy route has no usable target",
+        )
 
+    try:
         # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次
         _maybe_record_codex_snapshot(ch, upstream_resp)
         _maybe_record_anthropic_snapshot(ch, upstream_resp)
@@ -973,6 +1170,9 @@ async def _try_channel(
                     outcome="total_timeout",
                     connect_ms=connect_ms,
                     error_detail=f"total timeout reading error body (> {int(read_timeout)}s)",
+                    proxy_name=_proxy_name_used,
+                    proxy_bytes_up=_proxy_byte_snapshot(_proxy_bytes)[0],
+                    proxy_bytes_down=_proxy_byte_snapshot(_proxy_bytes)[1],
                 )
             except Exception as exc:
                 await _safe_exit(ctx)
@@ -980,11 +1180,15 @@ async def _try_channel(
                     outcome="transport_error",
                     connect_ms=connect_ms,
                     error_detail=f"read http error body: {exc}",
+                    proxy_name=_proxy_name_used,
+                    proxy_bytes_up=_proxy_byte_snapshot(_proxy_bytes)[0],
+                    proxy_bytes_down=_proxy_byte_snapshot(_proxy_bytes)[1],
                 )
             err_text = raw.decode("utf-8", errors="replace")
             status = upstream_resp.status_code
             resp_headers = _pick_upstream_headers(upstream_resp)
             await _safe_exit(ctx)
+            await _close_proxy_client(_proxy_client)
 
             outcome = "http_auth_error" if status in (401, 403) else "http_error"
             return AttemptResult(
@@ -992,11 +1196,14 @@ async def _try_channel(
                 http_status=status,
                 connect_ms=connect_ms,
                 error_detail=f"HTTP {status}: {err_text[:2000]}",
+                proxy_name=_proxy_name_used,
+                proxy_bytes_up=_proxy_byte_snapshot(_proxy_bytes)[0],
+                proxy_bytes_down=_proxy_byte_snapshot(_proxy_bytes)[1],
             )
 
         # 3. 非流式分支
         if not is_stream:
-            return await _consume_non_stream(
+            result = await _consume_non_stream(
                 ctx, upstream_resp, ch, resolved_model, dynamic_map,
                 connect_ms, start_time, request_id,
                 messages, api_key_name, client_ip,
@@ -1005,10 +1212,14 @@ async def _try_channel(
                 translator_ctx=upstream_req.translator_ctx,
                 body=body,
                 client_key=client_key,
+                proxy_name=_proxy_name_used,
+                proxy_bytes=_proxy_bytes,
             )
+            await _close_proxy_client(_proxy_client)
+            return result
 
         # 4. 流式分支
-        return await _consume_stream(
+        result = await _consume_stream(
             ctx, upstream_resp, ch, resolved_model, dynamic_map,
             connect_ms, start_time, deadline_ts,
             first_byte_timeout, idle_timeout,
@@ -1018,13 +1229,20 @@ async def _try_channel(
             ingress_protocol=ingress_protocol,
             translator_ctx=upstream_req.translator_ctx,
             body=body,
+            proxy_name=_proxy_name_used,
+            proxy_bytes=_proxy_bytes,
+            proxy_client=_proxy_client,
         )
+        if not result.stream_started:
+            await _close_proxy_client(_proxy_client)
+        return result
     except Exception as exc:
         traceback.print_exc()
         try:
             await _safe_exit(ctx)
         except Exception:
             pass
+        await _close_proxy_client(_proxy_client)
         return AttemptResult(
             outcome="transport_error",
             error_detail=f"unexpected: {exc}",
@@ -1034,6 +1252,15 @@ async def _try_channel(
 async def _safe_exit(ctx) -> None:
     try:
         await ctx.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+
+async def _close_proxy_client(client) -> None:
+    if client is None:
+        return
+    try:
+        await client.aclose()
     except Exception:
         pass
 
@@ -1050,6 +1277,8 @@ async def _consume_non_stream(
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
     client_key: Optional[str] = None,
+    proxy_name: Optional[str] = None,
+    proxy_bytes: Optional[dict] = None,
 ) -> AttemptResult:
     # stream-only 上游分流：OpenAI OAuth (chatgpt.com/backend-api/codex) 只返回 SSE，
     # 下游若请求非流式，这里把 SSE 聚合成完整 JSON 再走原有 translator / 落库链路。
@@ -1063,6 +1292,8 @@ async def _consume_non_stream(
             translator_ctx=translator_ctx,
             body=body,
             client_key=client_key,
+            proxy_name=proxy_name,
+            proxy_bytes=proxy_bytes,
         )
 
     # 读 body：用剩余总时间作为硬超时（httpx 的 read timeout 只保证单次 chunk 间隔）
@@ -1155,6 +1386,9 @@ async def _consume_non_stream(
         response_body=restored.decode("utf-8", errors="replace") if isinstance(restored, bytes) else str(restored),
         http_status=upstream_resp.status_code,
         upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
     )
 
     # 跨变体：把上游 JSON 反向成 ingress 期望的格式；同协议 translator_ctx=None 即原样
@@ -1176,6 +1410,9 @@ async def _consume_non_stream(
         connect_ms=connect_ms, total_ms=total_ms, http_status=upstream_resp.status_code,
         usage=usage, assistant_response=assistant_msg,
         full_response_text=restored.decode("utf-8", errors="replace") if isinstance(restored, bytes) else str(restored),
+        proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
     )
 
 
@@ -1192,6 +1429,8 @@ async def _consume_stream_as_non_stream(
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
     client_key: Optional[str] = None,
+    proxy_name: Optional[str] = None,
+    proxy_bytes: Optional[dict] = None,
 ) -> AttemptResult:
     """处理 upstream_stream_only=True 渠道的非流式下游请求。
 
@@ -1355,6 +1594,9 @@ async def _consume_stream_as_non_stream(
         response_body=response_body_text,
         http_status=upstream_resp.status_code,
         upstream_protocol=getattr(ch, "protocol", "anthropic"),
+        proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
     )
 
     # 6) 走跨变体 translator（如果 ingress 是 chat，上游 responses JSON 要翻译成 chat.completion JSON）
@@ -1377,6 +1619,9 @@ async def _consume_stream_as_non_stream(
         http_status=upstream_resp.status_code,
         usage=usage, assistant_response=assistant_msg,
         full_response_text=response_body_text,
+        proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
     )
 
 
@@ -1500,6 +1745,9 @@ async def _consume_stream(
     translator_ctx: Optional[dict] = None,
     body: Optional[dict] = None,
     client_key: Optional[str] = None,
+    proxy_name: Optional[str] = None,
+    proxy_bytes: Optional[dict] = None,
+    proxy_client=None,
 ) -> AttemptResult:
     aiter = upstream_resp.aiter_bytes()
 
@@ -1657,7 +1905,7 @@ async def _consume_stream(
         elif ingress_protocol == "chat" and ch_proto == "openai-responses":
             # stream_r2c translator 累积的下游 chat assistant 形状
             try:
-                assistant_msg = (stream_translator.get_downstream_chat_assistant()
+                assistant_msg = (getattr(stream_translator, "get_downstream_chat_assistant")()
                                  if stream_translator else {"role": "assistant", "content": None})
             except Exception:
                 assistant_msg = {"role": "assistant", "content": None}
@@ -1675,7 +1923,7 @@ async def _consume_stream(
         elif ingress_protocol == "responses" and ch_proto == "openai-chat":
             # stream_c2r translator._collect_output_items() 给出翻译后的下游 output items
             try:
-                output_items = stream_translator._collect_output_items() if stream_translator else []
+                output_items = getattr(stream_translator, "_collect_output_items")() if stream_translator else []
             except Exception:
                 output_items = []
             cur_input = _responses_current_input_items(body or {})
@@ -1705,6 +1953,9 @@ async def _consume_stream(
             response_body=tracker.get_full_response(),
             http_status=upstream_status,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            proxy_name=proxy_name,
+            proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+            proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
         ))
 
     async def _emit_error_and_finalize(err_type: str, message: str, outcome: str):
@@ -1726,6 +1977,9 @@ async def _consume_stream(
             http_status=upstream_status, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            proxy_name=proxy_name,
+            proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+            proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
         ))
 
     async def _finalize_client_cancelled():
@@ -1758,6 +2012,9 @@ async def _consume_stream(
             http_status=upstream_status, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            proxy_name=proxy_name,
+            proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+            proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
         ))
 
     async def stream_generator():
@@ -1868,6 +2125,7 @@ async def _consume_stream(
             raise
         finally:
             await _safe_exit(ctx)
+            await _close_proxy_client(proxy_client)
 
     sresp = StreamingResponse(
         stream_generator(),
@@ -1880,4 +2138,7 @@ async def _consume_stream(
         outcome="success", success=True, stream_started=True,
         response=sresp, http_status=upstream_status,
         connect_ms=connect_ms, first_byte_ms=first_byte_ms,
+        proxy_name=proxy_name,
+        proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+        proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
     )

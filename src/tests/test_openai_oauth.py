@@ -83,15 +83,17 @@ def _install_recorder(m):
 def test_pkce_generate(m):
     p = m["openai_provider"]
     v, c = p.pkce_generate()
-    # OpenAI 特殊：verifier = hex(64 bytes) → 128 char hex
-    assert len(v) == 128 and all(ch in "0123456789abcdef" for ch in v), \
-        f"verifier not hex128: {v[:20]}..."
+    # 对齐 codex-rs/login/src/pkce.rs：
+    # verifier = base64url_no_pad(64 bytes) → 86 char，字母数字/-/_
+    assert len(v) == 86, f"verifier not 86 chars: {v!r} (len={len(v)})"
+    assert all(ch.isalnum() or ch in "-_" for ch in v), f"verifier not base64url: {v[:20]}..."
+    assert "=" not in v, "verifier should not have padding"
     # challenge = base64url(sha256(verifier)) 无 padding
     import base64
     expected = base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
     assert c == expected, f"challenge mismatch: {c} vs {expected}"
     assert "=" not in c, "challenge should not have padding"
-    print("  [PASS] pkce_generate verifier=hex128, challenge=b64url sha256 no-pad")
+    print("  [PASS] pkce_generate verifier=b64url86, challenge=b64url sha256 no-pad")
 
 
 def test_build_login_url(m):
@@ -103,8 +105,12 @@ def test_build_login_url(m):
     assert "codex_cli_simplified_flow=true" in url
     assert "code_challenge_method=S256" in url
     assert "client_id=app_EMoamEEZ73f0CkXaXp7hrann" in url
-    # scope 带 offline_access
+    # scope 带 offline_access + 新增的 api.connectors.*
     assert "offline_access" in url
+    assert "api.connectors.read" in url
+    assert "api.connectors.invoke" in url
+    # 与 Codex 对齐：authorize URL 必带 originator
+    assert "originator=codex_cli_rs" in url
     print("  [PASS] build_login_url contains all required OpenAI-specific params")
 
 
@@ -196,10 +202,11 @@ def test_accounts_check_extracts_plan_and_subscription(m):
                 }
             }
 
-    def fake_get(url, *, headers=None, timeout=None):
+    def fake_get(url, *, headers=None, timeout=None, **kwargs):
         assert url == p.ACCOUNTS_CHECK_URL
         assert headers["authorization"] == "Bearer at"
         assert headers["accept"] == "application/json"
+        assert kwargs.get("proxy_purpose") == "oauth_openai"
         return Resp()
 
     old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)
@@ -242,8 +249,9 @@ def test_accounts_check_selects_current_workspace_by_identity(m):
                 }
             }
 
-    def fake_get(url, *, headers=None, timeout=None):
+    def fake_get(url, *, headers=None, timeout=None, **kwargs):
         assert url == p.ACCOUNTS_CHECK_URL
+        assert kwargs.get("proxy_purpose") == "oauth_openai"
         return Resp()
 
     old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)

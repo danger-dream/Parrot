@@ -287,7 +287,12 @@ class OpenAIOAuthChannel(Channel):
 
         import httpx
         try:
-            async with network.async_client(timeout=timeout_s) as client:
+            async with network.async_client(
+                timeout=timeout_s,
+                proxy_purpose="oauth_openai",
+                proxy_channel=self.key,
+                proxy_model=probe_model,
+            ) as client:
                 # stream 模式：拿到响应头即可，不消费 body 直接关流
                 # （上游会继续生成一小段 token 直到发现连接关闭，算作探测成本）
                 async with client.stream(

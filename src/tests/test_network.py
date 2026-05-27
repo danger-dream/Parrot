@@ -58,3 +58,19 @@ def test_save_network_config(m):
     assert cfg.get()["network"]["socks5"]["enabled"] is True
     n.set_socks5_enabled(False)
     assert cfg.get()["network"]["socks5"]["enabled"] is False
+
+
+
+def test_parse_ss2022_url_accepts_urlsafe_unpadded_key(m):
+    import base64
+    from src.proxy.connector import parse_proxy_url, connector_from_config
+    key = bytes(range(32))
+    password = base64.urlsafe_b64encode(key).decode().rstrip("=")
+    userinfo = base64.urlsafe_b64encode(f"2022-blake3-aes-256-gcm:{password}".encode()).decode().rstrip("=")
+    cfg = parse_proxy_url(f"ss://{userinfo}@127.0.0.1:8388#jp-main")
+    assert cfg["type"] == "ss2022"
+    assert cfg["name"] == "jp-main"
+    conn = connector_from_config("jp-main", cfg)
+    assert conn.type == "ss2022"
+    assert conn.server == "127.0.0.1"
+    assert conn.port == 8388

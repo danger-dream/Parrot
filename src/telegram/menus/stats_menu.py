@@ -265,7 +265,10 @@ def _section_recent_calls(calls: list[dict]) -> str:
         fam_suffix = f" {fam_icon}" if fam_icon else ""
         out.append(f"\n<code>[{ts}]</code> {icon} {model}{fam_suffix}")
         if r.get("final_channel_key"):
-            out.append(f"  渠道: <code>{ui.escape_html(_ch_short_name(r['final_channel_key']))}</code>")
+            ch_line = f"  渠道: <code>{ui.escape_html(_ch_short_name(r['final_channel_key']))}</code>"
+            if r.get("proxy_name"):
+                ch_line += f" · 🔀 <code>{ui.escape_html(r['proxy_name'])}</code>"
+            out.append(ch_line)
         if r.get("status") == "success":
             inp = (r.get("input_tokens") or 0) + (r.get("cache_creation_tokens") or 0) + (r.get("cache_read_tokens") or 0)
             cr = r.get("cache_read_tokens") or 0

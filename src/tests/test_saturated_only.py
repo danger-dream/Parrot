@@ -24,6 +24,7 @@ import sys
 import time
 
 import httpx
+import pytest
 
 # 复用 test_m4_failover 的工具
 from src.tests.test_m4_failover import (
@@ -43,6 +44,16 @@ from src.tests.test_openai_m4 import (
     MockRouter as OAMockRouter,
 )
 
+
+
+
+def _import_modules():
+    return _import_anth()
+
+
+@pytest.fixture
+def m_oa():
+    return _import_oa()
 
 _REQUEST_SEQ = itertools.count()
 

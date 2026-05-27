@@ -22,8 +22,8 @@ from typing import Optional
 from . import states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
-    logs_menu, mapping_menu, oauth_defaults_menu, oauth_menu, stats_menu,
-    status_alert_menu, status_menu, system_menu, update_menu,
+    logs_menu, mapping_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
+    stats_menu, status_alert_menu, status_menu, system_menu, update_menu,
 )
 from .menus import main as main_menu
 
@@ -96,6 +96,7 @@ def start() -> None:
         {"command": "keys",     "description": "管理 API Key"},
         {"command": "mapping",  "description": "模型映射 / 默认模型"},
         {"command": "loadbalancing", "description": "负载均衡"},
+        {"command": "proxy",    "description": "代理管理 / 路由规则"},
         {"command": "settings", "description": "系统设置"},
         {"command": "help",     "description": "帮助"},
     ])
@@ -267,6 +268,9 @@ def _handle_callback(cb: dict) -> None:
         return
 
     # 系统设置菜单
+    if proxy_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        print(f"[tg] handled by proxy_menu ({data})")
+        return
     if system_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
@@ -326,6 +330,9 @@ def _handle_message(msg: dict) -> None:
             return
         if update_menu.handle_text_state(chat_id, action, text):
             return
+        if proxy_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by proxy_menu (action={action})")
+            return
         if system_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by system_menu (action={action})")
             return
@@ -361,6 +368,8 @@ def _handle_message(msg: dict) -> None:
         mapping_menu.send_new(chat_id); return
     if text.startswith("/loadbalancing"):
         load_balancing_menu.send_new(chat_id); return
+    if text.startswith("/proxy") or text.startswith("/proxies"):
+        ui.send(chat_id, "🔀 代理管理", reply_markup=ui.inline_kb([[ui.btn("打开代理管理", "px:show")]])); return
     if text.startswith("/oauth_defaults"):
         oauth_defaults_menu.send_new(chat_id); return
     if text.startswith("/help"):

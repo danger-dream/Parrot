@@ -73,6 +73,7 @@ def _make_session() -> httpx.Client:
         timeout=httpx.Timeout(connect=10.0, read=50.0, write=10.0, pool=10.0),
         limits=httpx.Limits(max_connections=5, max_keepalive_connections=2, keepalive_expiry=30),
         http2=False,
+        proxy_purpose="telegram",
     )
 
 

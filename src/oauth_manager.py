@@ -377,6 +377,7 @@ def _do_refresh_http(refresh_token: str) -> dict:
             "User-Agent": CLI_USER_AGENT,
         },
         timeout=30,
+        proxy_purpose="oauth_anthropic",
     )
     resp.raise_for_status()
     return resp.json()
@@ -531,6 +532,7 @@ def _profile_sync(access_token: str) -> dict:
             "User-Agent": CLI_USER_AGENT,
         },
         timeout=15,
+        proxy_purpose="oauth_anthropic",
     )
     resp.raise_for_status()
     return resp.json()
@@ -556,6 +558,7 @@ def _usage_sync(access_token: str) -> dict:
             "User-Agent": "claude-code/2.1.7",
         },
         timeout=30,
+        proxy_purpose="oauth_anthropic",
     )
     resp.raise_for_status()
     return resp.json()
@@ -1616,6 +1619,7 @@ def exchange_code(code: str, code_verifier: str, state: str) -> dict:
         },
         headers={"Content-Type": "application/json", "User-Agent": CLI_USER_AGENT},
         timeout=15,
+        proxy_purpose="oauth_anthropic",
     )
     resp.raise_for_status()
     return resp.json()

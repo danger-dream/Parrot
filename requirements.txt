@@ -5,3 +5,5 @@ xxhash>=3.4
 dnspython>=2.6
 packaging>=23
 python-multipart>=0.0.20  # multipart/form-data parsing for OpenAI Images API compat
+blake3>=1.0
+cryptography>=42.0

@@ -29,11 +29,11 @@ def _import_modules():
         sys.path.insert(0, root)
     from src import config, log_db, state_db
     from src.telegram import bot, states, ui
-    from src.telegram.menus import logs_menu, stats_menu
+    from src.telegram.menus import logs_menu, stats_menu, proxy_menu
     return {
         "config": config, "log_db": log_db, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
-        "logs_menu": logs_menu, "stats_menu": stats_menu,
+        "logs_menu": logs_menu, "stats_menu": stats_menu, "proxy_menu": proxy_menu,
     }
 
 
@@ -458,3 +458,485 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_proxy_routing_priority_and_legacy_socks5(m):
+    """Proxy manager: default direct 不应遮蔽 legacy socks5；账号路由优先级最高。"""
+    cfg = m["config"]
+    from src.proxy import manager as pm
+    from src import network
+
+    # 默认配置只有 routing.default=direct，不能算启用新代理系统，否则 legacy socks5 会失效。
+    cfg.update(lambda c: c.setdefault("network", {}).__setitem__("socks5", {
+        "enabled": True,
+        "url": "socks5://127.0.0.1:9999",
+    }))
+    pm.init()
+    assert pm.is_configured() is False
+    assert network.active_socks5_url() == "socks5://127.0.0.1:9999"
+
+    def add_proxy_config(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            "p1": {"type": "socks5", "url": "socks5://127.0.0.1:10001"},
+            "p2": {"type": "socks5", "url": "socks5://127.0.0.1:10002"},
+        }
+        net["groups"] = {"g": ["p1", "direct"]}
+        net["routing"] = {
+            "default": "direct",
+            "oauth_openai": "p2",
+            "models": {"gpt-x": "p1"},
+            "channels": {"oauth:openai:a:old": "p2"},
+            "accounts": {"openai:a:new": "g"},
+        }
+    cfg.update(add_proxy_config)
+    pm.init()
+    assert pm.is_configured() is True
+    assert pm.resolve_proxy_target(account_key="openai:a:new", channel_key="oauth:openai:a:old", model="gpt-x") == "g"
+    assert pm.resolve_proxy_chain(account_key="openai:a:new", channel_key="oauth:openai:a:old", model="gpt-x") == ["p1", "direct"]
+    assert pm.resolve_proxy_target(channel_key="oauth:openai:a:old", model="gpt-x") == "p2"
+    assert pm.resolve_proxy_target(model="gpt-x") == "p1"
+    assert pm.resolve_proxy_target(purpose="oauth_openai") == "p2"
+    print("  [PASS] proxy routing priority + legacy socks5")
+
+
+
+def test_proxy_upgrade_from_previous_config_is_smooth(m, tmp_path):
+    """Old configs without the new proxy subtree must keep legacy SOCKS5 behavior.
+
+    Previous releases only had network.socks5.  After deep-merge with the new
+    DEFAULT_CONFIG, network.routing.default=direct appears automatically; that
+    implicit default must not opt users into the new proxy subsystem or bypass
+    the legacy SOCKS5 client.
+    """
+    import json
+    import os
+    import httpx
+    from src import config as cfg_mod, network
+    from src.proxy import manager as pm
+
+    old_path = tmp_path / "old-config.json"
+    old_path.write_text(json.dumps({
+        "listen": {"host": "127.0.0.1", "port": 18082},
+        "apiKeys": {},
+        "oauthAccounts": [],
+        "channels": [],
+        "network": {
+            "dns": {"servers": ["1.1.1.1"]},
+            "socks5": {"enabled": True, "url": "socks5://127.0.0.1:19999"},
+        },
+    }))
+
+    old_cfg_path = cfg_mod.CONFIG_PATH
+    old_cache = getattr(cfg_mod, "_cache", None)
+    old_mtime = getattr(cfg_mod, "_mtime", 0)
+    try:
+        cfg_mod.CONFIG_PATH = str(old_path)
+        cfg_mod._cache = None
+        cfg_mod._mtime = 0
+        loaded = cfg_mod.reload()
+        assert loaded["network"]["routing"] == {"default": "direct"}
+        assert loaded["network"]["proxies"] == {}
+        assert loaded["network"]["groups"] == {}
+
+        pm.init()
+        assert pm.is_configured() is False
+        assert network.active_socks5_url() == "socks5://127.0.0.1:19999"
+
+        captured = {}
+        class DummyClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+            def close(self):
+                pass
+        old_client = httpx.Client
+        httpx.Client = DummyClient
+        try:
+            c = network.sync_client(timeout=1)
+            assert isinstance(c, DummyClient)
+            assert captured["proxy"] == "socks5://127.0.0.1:19999"
+            assert captured["trust_env"] is False
+        finally:
+            httpx.Client = old_client
+    finally:
+        cfg_mod.CONFIG_PATH = old_cfg_path
+        cfg_mod._cache = old_cache
+        cfg_mod._mtime = old_mtime
+        cfg_mod.reload()
+        pm.init()
+
+
+def test_proxy_stats_include_tokens_latency_and_real_bytes(m):
+    """Proxy stats: 统计次数、tokens、平均连接/首字/耗时、总代理字节数。"""
+    ld = m["log_db"]
+    ld.init()
+    conn = ld._get_conn()
+    conn.execute("DELETE FROM request_log")
+    conn.execute("DELETE FROM request_detail")
+    conn.execute("DELETE FROM retry_chain")
+    conn.commit()
+
+    ld.insert_pending("px-1", "1.1.1.1", "k", "gpt-x", True, 1, 0, {}, {})
+    ld.finish_success(
+        "px-1", "oauth:openai:a:new", "oauth", "gpt-x",
+        input_tokens=100, output_tokens=50, cache_creation_tokens=10, cache_read_tokens=5,
+        connect_ms=100, first_token_ms=400, total_ms=1200,
+        proxy_name="p1", proxy_bytes_up=1024, proxy_bytes_down=4096,
+    )
+    ld.insert_pending("px-2", "1.1.1.1", "k", "gpt-x", True, 1, 0, {}, {})
+    ld.finish_error(
+        "px-2", "boom", final_channel_key="oauth:openai:a:new", final_channel_type="oauth", final_model="gpt-x",
+        connect_ms=300, first_token_ms=800, total_ms=2400,
+        proxy_name="p1", proxy_bytes_up=2048, proxy_bytes_down=1024,
+    )
+
+    stats = ld.proxy_stats(limit=10)
+    p1 = next(x for x in stats if x["proxy_name"] == "p1")
+    assert p1["requests"] == 2
+    assert p1["successes"] == 1
+    assert p1["failures"] == 1
+    assert p1["input_tokens"] == 100
+    assert p1["output_tokens"] == 50
+    assert p1["cache_creation_tokens"] == 10
+    assert p1["cache_read_tokens"] == 5
+    assert p1["total_tokens"] == 165
+    assert p1["bytes_up"] == 3072
+    assert p1["bytes_down"] == 5120
+    assert p1["total_bytes"] == 8192
+    assert p1["avg_connect_ms"] == 200
+    assert p1["avg_first_byte_ms"] == 600
+    assert p1["avg_total_ms"] == 1800
+
+    from src.telegram.menus import proxy_menu, system_menu
+    rendered = proxy_menu._fmt_proxy_stats(p1)
+    assert "请求 <code>2</code> 次" in rendered
+    assert "Tokens: <code>165</code> tok" in rendered
+    assert "代理流量: <code>8.0KB</code>" in rendered
+    assert "连接 <code>200ms</code>" in rendered
+    assert "首字 <code>600ms</code>" in rendered
+    assert "总耗时 <code>1800ms</code>" in rendered
+
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {"p1": {"type": "socks5", "url": "socks5://127.0.0.1:10001"}}
+        net["groups"] = {"g1": ["p1", "direct"]}
+    m["config"].update(_cfg)
+    lines, *_ = system_menu._network_summary()
+    text = "\n".join(lines)
+    assert "📊 <code>2</code>次" in text
+    assert "🧮 <code>165</code> tok" in text
+    assert "📦 <code>8.0KB</code>" in text
+    assert "组内总计" in text
+    assert "连接 <code>200ms</code>" in text
+    assert "首字 <code>600ms</code>" in text
+    assert "总耗时 <code>1800ms</code>" in text
+    print("  [PASS] proxy stats tokens + latency + bytes")
+
+
+
+def test_proxy_menu_group_edit_preserves_remove_and_clear_members(m):
+    _setup(m)
+    pmenu = m["proxy_menu"]
+    cfg = m["config"]
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            "p1": {"type": "socks5", "url": "socks5://127.0.0.1:10001"},
+            "p2": {"type": "socks5", "url": "socks5://127.0.0.1:10002"},
+        }
+        net["groups"] = {"g1": ["p1", "p2"]}
+    cfg.update(_cfg)
+    rec = _install_recorder(m)
+
+    assert pmenu.handle_callback(100, 10, "cb", "px:grp_edit:g1") is True
+    st = m["states"].get_state(100)
+    assert st["data"]["members"] == ["p1", "p2"]
+    edit = rec.last("editMessageText")
+    kb = edit["reply_markup"]["inline_keyboard"]
+    flat_cb = [b["callback_data"] for row in kb for b in row]
+    assert "px:grp_rm:p1" in flat_cb
+    assert "px:grp_clear" in flat_cb
+
+    assert pmenu.handle_callback(100, 10, "cb", "px:grp_rm:p1") is True
+    st = m["states"].get_state(100)
+    assert st["data"]["members"] == ["p2"]
+
+    assert pmenu.handle_callback(100, 10, "cb", "px:grp_clear") is True
+    st = m["states"].get_state(100)
+    assert st["data"]["members"] == []
+
+
+def test_proxy_menu_function_route_all_targets_are_supported(m):
+    _setup(m)
+    pmenu = m["proxy_menu"]
+    cfg = m["config"]
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            "ss-only": {"type": "ss2022", "server": "127.0.0.1", "port": 8388,
+                         "cipher": "2022-blake3-aes-128-gcm", "password": "x"},
+            "s5": {"type": "socks5", "url": "socks5://127.0.0.1:10001"},
+        }
+        net["groups"] = {"g-ss": ["ss-only"], "g-mixed": ["ss-only", "s5"]}
+    cfg.update(_cfg)
+    labels = dict(pmenu._all_targets())
+    assert "功能路由不支持" not in labels["ss-only"]
+    assert "功能路由不支持" not in labels["g-ss"]
+    assert "功能路由不支持" not in labels["g-mixed"]
+    assert "功能路由不支持" not in labels["s5"]
+
+
+
+def test_log_db_migrates_proxy_columns_on_old_schema(m):
+    ld = m["log_db"]
+    ld.init()
+    conn = ld._get_conn()
+    # Simulate an old monthly DB where request_log/retry_chain existed before proxy columns.
+    conn.execute("ALTER TABLE request_log RENAME TO request_log_new")
+    conn.execute("ALTER TABLE retry_chain RENAME TO retry_chain_new")
+    conn.execute("""
+        CREATE TABLE request_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          request_id TEXT UNIQUE NOT NULL,
+          created_at REAL NOT NULL,
+          finished_at REAL,
+          client_ip TEXT,
+          api_key_name TEXT,
+          requested_model TEXT,
+          final_channel_key TEXT,
+          final_channel_type TEXT,
+          final_model TEXT,
+          status TEXT DEFAULT 'pending',
+          http_status INTEGER,
+          error_message TEXT,
+          is_stream INTEGER DEFAULT 1,
+          msg_count INTEGER DEFAULT 0,
+          tool_count INTEGER DEFAULT 0,
+          input_tokens INTEGER DEFAULT 0,
+          output_tokens INTEGER DEFAULT 0,
+          cache_creation_tokens INTEGER DEFAULT 0,
+          cache_read_tokens INTEGER DEFAULT 0,
+          connect_time_ms INTEGER,
+          first_token_time_ms INTEGER,
+          total_time_ms INTEGER,
+          retry_count INTEGER DEFAULT 0,
+          affinity_hit INTEGER DEFAULT 0,
+          fingerprint TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE retry_chain (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          request_id TEXT NOT NULL,
+          attempt_order INTEGER NOT NULL,
+          channel_key TEXT NOT NULL,
+          channel_type TEXT NOT NULL,
+          model TEXT NOT NULL,
+          started_at REAL NOT NULL,
+          connect_ms INTEGER,
+          first_byte_ms INTEGER,
+          ended_at REAL,
+          outcome TEXT,
+          error_detail TEXT
+        )
+    """)
+    conn.execute("DROP TABLE request_log_new")
+    conn.execute("DROP TABLE retry_chain_new")
+    conn.commit()
+
+    ld._ensure_migrations(conn)
+    req_cols = {r[1] for r in conn.execute("PRAGMA table_info(request_log)")}
+    retry_cols = {r[1] for r in conn.execute("PRAGMA table_info(retry_chain)")}
+    assert {"proxy_name", "proxy_bytes_up", "proxy_bytes_down"}.issubset(req_cols)
+    assert {"proxy_name", "bytes_up", "bytes_down"}.issubset(retry_cols)
+
+    ld.insert_pending("oldpx", "1.1.1.1", "k", "m", False, 1, 0, {}, {})
+    aid = ld.record_retry_attempt("oldpx", 1, "api:ch", "api", "m", time.time(), proxy_name="p1")
+    ld.update_retry_attempt(aid, outcome="success", bytes_up=3, bytes_down=4)
+    ld.finish_success("oldpx", "api:ch", "api", "m", proxy_name="p1", proxy_bytes_up=3, proxy_bytes_down=4)
+    ps = ld.proxy_stats(limit=10)
+    row = next(x for x in ps if x["proxy_name"] == "p1")
+    assert row["total_bytes"] == 7
+
+
+
+def test_proxy_menu_detail_line_does_not_repeat_proxy_name(m):
+    _setup(m)
+    from src.proxy import manager as pm
+    from src.telegram.menus import proxy_menu
+
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            "misaka-lax": {
+                "type": "ss2022",
+                "server": "38.175.109.137",
+                "port": 48888,
+                "cipher": "2022-blake3-aes-128-gcm",
+                "password": "x",
+            },
+            "s5-main": {"type": "socks5", "url": "socks5://user:pass@example.com:1080"},
+        }
+    m["config"].update(_cfg)
+    pm.init()
+    conns = pm.all_connectors()
+    ss_line = proxy_menu._proxy_detail_line(conns["misaka-lax"])
+    s5_line = proxy_menu._proxy_detail_line(conns["s5-main"])
+    assert "misaka-lax" not in ss_line
+    assert "SS2022" in ss_line
+    assert "38.175.109.137:48888" in ss_line
+    assert "s5-main" not in s5_line
+    assert "SOCKS5" in s5_line
+    assert "pass" not in s5_line
+    assert "***" in s5_line
+
+
+
+def test_proxy_menu_list_uses_pagination_and_detail_buttons(m):
+    _setup(m)
+    from src.telegram.menus import proxy_menu
+    cfg = m["config"]
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            f"p{i}": {"type": "socks5", "url": f"socks5://127.0.0.1:{10000+i}"}
+            for i in range(1, 8)
+        }
+    cfg.update(_cfg)
+    rec = _install_recorder(m)
+
+    proxy_menu.show(100, 10, page=1)
+    edit = rec.last("editMessageText")
+    text = edit["text"]
+    assert "第 1/2 页" in text
+    kb = edit["reply_markup"]["inline_keyboard"]
+    flat = [b["callback_data"] for row in kb for b in row]
+    assert any(cb.startswith("px:view:") for cb in flat)
+    assert not any(cb.startswith("px:test:p") for cb in flat)
+    assert not any(cb.startswith("px:del_confirm:p") for cb in flat)
+    assert "px:groups" in flat
+    assert "px:routing" in flat
+    assert "px:page:2" in flat
+
+    view_cb = next(cb for cb in flat if cb.startswith("px:view:"))
+    rec.clear()
+    assert proxy_menu.handle_callback(100, 10, "cb", view_cb) is True
+    detail = rec.last("editMessageText")
+    detail_flat = [b["callback_data"] for row in detail["reply_markup"]["inline_keyboard"] for b in row]
+    assert any(cb.startswith("px:testv:") for cb in detail_flat)
+    assert any(cb.startswith("px:del_confirm_v:") for cb in detail_flat)
+    assert "px:page:1" in detail_flat
+
+
+
+def test_proxy_group_menu_uses_pagination_and_detail_buttons(m):
+    _setup(m)
+    from src.telegram.menus import proxy_menu
+    cfg = m["config"]
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            f"p{i}": {"type": "socks5", "url": f"socks5://127.0.0.1:{11000+i}"}
+            for i in range(1, 4)
+        }
+        net["groups"] = {
+            f"g{i}": ["p1", "p2"]
+            for i in range(1, 8)
+        }
+    cfg.update(_cfg)
+    rec = _install_recorder(m)
+
+    proxy_menu._show_groups(100, 10, "", page=1)
+    edit = rec.last("editMessageText")
+    text = edit["text"]
+    assert "代理组" in text
+    assert "第 1/2 页" in text
+    kb = edit["reply_markup"]["inline_keyboard"]
+    flat = [b["callback_data"] for row in kb for b in row]
+    assert any(cb.startswith("px:grp_view:") for cb in flat)
+    assert not any(cb.startswith("px:grp_edit:g") for cb in flat)
+    assert not any(cb.startswith("px:grp_test:g") for cb in flat)
+    assert not any(cb.startswith("px:grp_del:g") for cb in flat)
+    assert "px:grp_page:2" in flat
+    assert "px:show" in flat
+    assert "px:routing" in flat
+
+    view_cb = next(cb for cb in flat if cb.startswith("px:grp_view:"))
+    rec.clear()
+    assert proxy_menu.handle_callback(100, 10, "cb", view_cb) is True
+    detail = rec.last("editMessageText")
+    detail_text = detail["text"]
+    assert "成员:" in detail_text
+    detail_flat = [b["callback_data"] for row in detail["reply_markup"]["inline_keyboard"] for b in row]
+    assert any(cb.startswith("px:grp_test_v:") for cb in detail_flat)
+    assert any(cb.startswith("px:grp_edit_v:") for cb in detail_flat)
+    assert any(cb.startswith("px:grp_del_ask:") for cb in detail_flat)
+    assert "px:grp_page:1" in detail_flat
+
+    edit_cb = next(cb for cb in detail_flat if cb.startswith("px:grp_edit_v:"))
+    rec.clear()
+    assert proxy_menu.handle_callback(100, 10, "cb", edit_cb) is True
+    picker = rec.last("editMessageText")
+    picker_flat = [b["callback_data"] for row in picker["reply_markup"]["inline_keyboard"] for b in row]
+    assert "px:grp_page:1" in picker_flat
+
+
+
+def test_failover_proxy_route_kwargs_uses_provider_family_function_route(m):
+    _setup(m)
+    from src import failover
+
+    class Ch:
+        key = "api:anthropic-main"
+        protocol = "anthropic"
+        account_key = ""
+
+    assert failover._proxy_route_kwargs(Ch(), "claude-x") == {
+        "channel_key": "api:anthropic-main",
+        "model": "claude-x",
+        "purpose": "oauth_anthropic",
+        "account_key": "",
+    }
+
+    class OpenAICh:
+        key = "oauth:openai:a"
+        protocol = "openai-responses"
+        account_key = "openai:a"
+
+    assert failover._proxy_route_kwargs(OpenAICh(), "gpt-x") == {
+        "channel_key": "oauth:openai:a",
+        "model": "gpt-x",
+        "purpose": "oauth_openai",
+        "account_key": "openai:a",
+    }
+
+
+def test_proxy_routing_family_priority_between_model_and_default(m):
+    _setup(m)
+    from src.proxy import manager as pm
+    cfg = m["config"]
+    def _cfg(c):
+        net = c.setdefault("network", {})
+        net["proxies"] = {
+            "p-model": {"type": "socks5", "url": "socks5://127.0.0.1:10001"},
+            "p-family": {"type": "socks5", "url": "socks5://127.0.0.1:10002"},
+            "p-default": {"type": "socks5", "url": "socks5://127.0.0.1:10003"},
+        }
+        net["groups"] = {}
+        net["routing"] = {
+            "default": "p-default",
+            "oauth_anthropic": "p-family",
+            "models": {"claude-special": "p-model"},
+        }
+    try:
+        cfg.update(_cfg)
+        pm.init()
+        assert pm.resolve_proxy_target(model="claude-special", purpose="oauth_anthropic") == "p-model"
+        assert pm.resolve_proxy_target(model="claude-normal", purpose="oauth_anthropic") == "p-family"
+        assert pm.resolve_proxy_target(model="claude-normal") == "p-default"
+    finally:
+        cfg.update(lambda c: c.setdefault("network", {}).update({
+            "proxies": {}, "groups": {}, "routing": {"default": "direct"},
+            "socks5": {"enabled": False, "url": ""},
+        }))
+        pm.init()

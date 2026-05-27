@@ -69,7 +69,12 @@ def _schema_sql() -> str:
       -- 入口协议：anthropic（/v1/messages）/ chat / responses。insert_pending 阶段确定。
       ingress_protocol      TEXT,
       -- 选中渠道的上游协议：anthropic / openai-chat / openai-responses。finish_* 阶段确定。
-      upstream_protocol     TEXT
+      upstream_protocol     TEXT,
+      -- 出站代理名称（proxy subsystem）。NULL / 空 = 直连。
+      proxy_name            TEXT,
+      -- 代理层字节数：统计经由该代理转发的上游 body bytes（请求 + 响应）。
+      proxy_bytes_up        INTEGER DEFAULT 0,
+      proxy_bytes_down      INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_log_created ON request_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_log_status ON request_log(status);
@@ -96,7 +101,10 @@ def _schema_sql() -> str:
       first_byte_ms   INTEGER,
       ended_at        REAL,
       outcome         TEXT,
-      error_detail    TEXT
+      error_detail    TEXT,
+      proxy_name      TEXT,
+      bytes_up        INTEGER DEFAULT 0,
+      bytes_down      INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_retry_req ON retry_chain(request_id);
     """
@@ -134,6 +142,26 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         changed = True
     if "upstream_protocol" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN upstream_protocol TEXT")
+        changed = True
+    if "proxy_name" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN proxy_name TEXT")
+        changed = True
+    if "proxy_bytes_up" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN proxy_bytes_up INTEGER DEFAULT 0")
+        changed = True
+    if "proxy_bytes_down" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN proxy_bytes_down INTEGER DEFAULT 0")
+        changed = True
+    # retry_chain migration
+    retry_cols = {row[1] for row in conn.execute("PRAGMA table_info(retry_chain)").fetchall()}
+    if retry_cols and "proxy_name" not in retry_cols:
+        conn.execute("ALTER TABLE retry_chain ADD COLUMN proxy_name TEXT")
+        changed = True
+    if retry_cols and "bytes_up" not in retry_cols:
+        conn.execute("ALTER TABLE retry_chain ADD COLUMN bytes_up INTEGER DEFAULT 0")
+        changed = True
+    if retry_cols and "bytes_down" not in retry_cols:
+        conn.execute("ALTER TABLE retry_chain ADD COLUMN bytes_down INTEGER DEFAULT 0")
         changed = True
     if changed:
         conn.commit()
@@ -297,7 +325,7 @@ def update_pending(request_id: str, **fields: Any) -> None:
         return
     allowed = {
         "fingerprint", "affinity_hit", "requested_model",
-        "msg_count", "tool_count",
+        "msg_count", "tool_count", "proxy_name",
     }
     cols, vals = [], []
     for k, v in fields.items():
@@ -322,15 +350,16 @@ def record_retry_attempt(
     request_id: str, attempt_order: int,
     channel_key: str, channel_type: str, model: str,
     started_at: float,
+    proxy_name: str | None = None,
 ) -> int:
     """插入一次尝试记录，返回该条的 id，后续用 update_retry_attempt 补齐。"""
     with _write_lock:
         conn = _get_conn()
         cur = conn.execute(
             """INSERT INTO retry_chain
-               (request_id, attempt_order, channel_key, channel_type, model, started_at)
-               VALUES (?,?,?,?,?,?)""",
-            (request_id, attempt_order, channel_key, channel_type, model, started_at),
+               (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name)
+               VALUES (?,?,?,?,?,?,?)""",
+            (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -343,6 +372,9 @@ def update_retry_attempt(
     ended_at: float | None = None,
     outcome: str | None = None,
     error_detail: str | None = None,
+    proxy_name: str | None = None,
+    bytes_up: int | None = None,
+    bytes_down: int | None = None,
 ) -> None:
     fields, vals = [], []
     if connect_ms is not None:
@@ -355,6 +387,12 @@ def update_retry_attempt(
         fields.append("outcome=?"); vals.append(outcome)
     if error_detail is not None:
         fields.append("error_detail=?"); vals.append(error_detail)
+    if proxy_name is not None:
+        fields.append("proxy_name=?"); vals.append(proxy_name)
+    if bytes_up is not None:
+        fields.append("bytes_up=?"); vals.append(int(bytes_up or 0))
+    if bytes_down is not None:
+        fields.append("bytes_down=?"); vals.append(int(bytes_down or 0))
     if not fields:
         return
     vals.append(attempt_id)
@@ -383,6 +421,9 @@ def finish_success(
     response_body: str | None = None,
     http_status: int = 200,
     upstream_protocol: str | None = None,
+    proxy_name: str | None = None,
+    proxy_bytes_up: int | None = None,
+    proxy_bytes_down: int | None = None,
 ) -> None:
     with _write_lock:
         conn = _get_conn()
@@ -393,7 +434,8 @@ def finish_success(
                  input_tokens=?, output_tokens=?,
                  cache_creation_tokens=?, cache_read_tokens=?,
                  connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
-                 retry_count=?, affinity_hit=?, upstream_protocol=?
+                 retry_count=?, affinity_hit=?, upstream_protocol=?, proxy_name=?,
+                 proxy_bytes_up=?, proxy_bytes_down=?
                WHERE request_id=?""",
             (
                 time.time(), http_status,
@@ -401,7 +443,8 @@ def finish_success(
                 input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens,
                 connect_ms, first_token_ms, total_ms,
-                retry_count, affinity_hit, upstream_protocol,
+                retry_count, affinity_hit, upstream_protocol, proxy_name,
+                int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
                 request_id,
             ),
         )
@@ -427,6 +470,9 @@ def finish_error(
     response_body: str | None = None,
     affinity_hit: int = 0,
     upstream_protocol: str | None = None,
+    proxy_name: str | None = None,
+    proxy_bytes_up: int | None = None,
+    proxy_bytes_down: int | None = None,
 ) -> None:
     with _write_lock:
         conn = _get_conn()
@@ -435,13 +481,15 @@ def finish_error(
                  status='error', finished_at=?, error_message=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
-                 retry_count=?, affinity_hit=?, upstream_protocol=?
+                 retry_count=?, affinity_hit=?, upstream_protocol=?, proxy_name=?,
+                 proxy_bytes_up=?, proxy_bytes_down=?
                WHERE request_id=?""",
             (
                 time.time(), error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
                 connect_ms, first_token_ms, total_ms,
-                retry_count, affinity_hit, upstream_protocol,
+                retry_count, affinity_hit, upstream_protocol, proxy_name,
+                int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
                 request_id,
             ),
         )
@@ -827,8 +875,97 @@ _RECENT_COLS = (
     "input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, "
     "connect_time_ms, first_token_time_ms, total_time_ms, "
     "retry_count, affinity_hit, "
-    "ingress_protocol, upstream_protocol"
+    "ingress_protocol, upstream_protocol, proxy_name, proxy_bytes_up, proxy_bytes_down"
 )
+
+
+
+def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
+    """Aggregate proxy usage stats across monthly log DBs.
+
+    Includes the requested proxy metrics:
+      requests/successes/failures, tokens, average connect/first-byte/total
+      latency, and total proxied bytes (request + response body bytes).
+    """
+    lim = max(1, int(limit or 20))
+    since = 0.0 if since_ts is None else float(since_ts)
+    acc: dict[str, dict] = {}
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return []
+
+    for conn, close_fn in _iter_month_conns_all(since):
+        try:
+            rows = conn.execute("""
+                SELECT proxy_name,
+                       COUNT(*) AS requests,
+                       SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS successes,
+                       SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS failures,
+                       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(proxy_bytes_up), 0) AS bytes_up,
+                       COALESCE(SUM(proxy_bytes_down), 0) AS bytes_down,
+                       SUM(CASE WHEN connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS connect_sum,
+                       SUM(CASE WHEN connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS connect_n,
+                       SUM(CASE WHEN first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS first_sum,
+                       SUM(CASE WHEN first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS first_n,
+                       SUM(CASE WHEN total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS total_sum,
+                       SUM(CASE WHEN total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS total_n
+                FROM request_log
+                WHERE proxy_name IS NOT NULL AND proxy_name != '' AND created_at >= ?
+                GROUP BY proxy_name
+            """, (since,)).fetchall()
+            for r in rows:
+                name = r["proxy_name"]
+                if not name:
+                    continue
+                b = acc.setdefault(name, {
+                    "proxy_name": name,
+                    "requests": 0, "successes": 0, "failures": 0,
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                    "bytes_up": 0, "bytes_down": 0,
+                    "connect_sum": 0, "connect_n": 0,
+                    "first_sum": 0, "first_n": 0,
+                    "total_sum": 0, "total_n": 0,
+                })
+                for k in ("requests", "successes", "failures", "input_tokens", "output_tokens",
+                          "cache_creation_tokens", "cache_read_tokens", "bytes_up", "bytes_down",
+                          "connect_sum", "connect_n", "first_sum", "first_n", "total_sum", "total_n"):
+                    b[k] += int(r[k] or 0)
+        except Exception as exc:
+            print(f"[log_db] proxy_stats: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    out: list[dict] = []
+    for b in acc.values():
+        total_tokens = int(b["input_tokens"] + b["output_tokens"] +
+                           b["cache_creation_tokens"] + b["cache_read_tokens"])
+        total_bytes = int(b["bytes_up"] + b["bytes_down"])
+        out.append({
+            "proxy_name": b["proxy_name"],
+            "requests": int(b["requests"]),
+            "successes": int(b["successes"]),
+            "failures": int(b["failures"]),
+            "input_tokens": int(b["input_tokens"]),
+            "output_tokens": int(b["output_tokens"]),
+            "cache_creation_tokens": int(b["cache_creation_tokens"]),
+            "cache_read_tokens": int(b["cache_read_tokens"]),
+            "total_tokens": total_tokens,
+            "bytes_up": int(b["bytes_up"]),
+            "bytes_down": int(b["bytes_down"]),
+            "total_bytes": total_bytes,
+            "avg_connect_ms": int(b["connect_sum"] / b["connect_n"]) if b["connect_n"] else 0,
+            "avg_first_byte_ms": int(b["first_sum"] / b["first_n"]) if b["first_n"] else 0,
+            "avg_total_ms": int(b["total_sum"] / b["total_n"]) if b["total_n"] else 0,
+        })
+    out.sort(key=lambda x: (x["requests"], x["total_bytes"]), reverse=True)
+    return out[:lim]
 
 
 # ─── 每秒生成 tokens (TPS) 的 SQL 片段 ─────────────────────────────

@@ -47,12 +47,13 @@ def _main_text_and_kb() -> tuple[str, dict]:
 
     net = cfg.get("network") or {}
     dns_servers = (net.get("dns") or {}).get("servers") or ["8.8.8.8"]
-    s5 = net.get("socks5") or {}
-    s5_enabled = bool(s5.get("enabled")) and bool(s5.get("url"))
+    proxy_count = len(net.get("proxies") or {})
+    default_route = (net.get("routing") or {}).get("default", "direct")
     text += (
         "\n"
         f"网络: DNS <code>{ui.escape_html(','.join(str(x) for x in dns_servers))}</code>"
-        f" · SOCKS5 <code>{'开' if s5_enabled else '关'}</code>"
+        f" · 代理 <code>{proxy_count}</code>个"
+        f" · 路由 <code>{ui.escape_html(str(default_route))}</code>"
     )
 
     kb = ui.inline_kb([
@@ -825,25 +826,116 @@ def _network_summary() -> tuple[list[str], dict, dict, list[str]]:
     dns_cfg = net.get("dns") or {}
     s5_cfg = net.get("socks5") or {}
     servers = list(dns_cfg.get("servers") or ["8.8.8.8"])
-    s5_url = str(s5_cfg.get("url") or "").strip()
-    s5_enabled = bool(s5_cfg.get("enabled")) and bool(s5_url)
+
+    # New proxy system info
+    proxies = net.get("proxies") or {}
+    groups = net.get("groups") or {}
+    routing = net.get("routing") or {}
+    default_route = routing.get("default", "direct")
+
+    proxy_count = len(proxies)
+    group_count = len(groups)
+    rule_count = sum(1 for k in routing if k not in ("default",))
+    rule_count += sum(len(v) for v in routing.values() if isinstance(v, dict))
+
     lines = [
         "🌐 <b>网络设置</b>",
         "",
         f"DNS: <code>{ui.escape_html(', '.join(str(x) for x in servers))}</code>",
-        f"首次同步系统 DNS: <code>{'已完成' if dns_cfg.get('bootstrapped') else '未完成'}</code>",
         f"DNS 缓存: <code>{int(dns_cfg.get('cacheTtlSeconds', 300) or 0)}s</code>",
         "",
-        f"SOCKS5: <code>{'已启用' if s5_enabled else '未启用'}</code>",
+        f"🔀 代理: <code>{proxy_count}</code> 个",
     ]
-    if s5_url:
-        lines.append(f"代理: <code>{ui.escape_html(network.mask_url(s5_url))}</code>")
-    else:
-        lines.append("代理: <code>未设置</code>")
-    lines += [
-        "",
-        "<i>启用 SOCKS5 后，出站 HTTP 请求走 SOCKS5；目标域名交给 SOCKS5 代理端。若 SOCKS5 地址本身是域名，则用上面的 DNS 解析。</i>",
-    ]
+    # Top proxy stats. Show all proxy rows so group totals are not truncated.
+    from ... import log_db
+    pstats = log_db.proxy_stats(limit=1000)
+    pstats_by_name = {p["proxy_name"]: p for p in pstats}
+
+    def _fmt_ms(ms):
+        ms = int(ms or 0)
+        return f"{ms / 1000:.1f}s" if ms >= 10000 else f"{ms}ms"
+
+    def _fmt_bytes(n):
+        n = int(n or 0)
+        if n < 1024:
+            return f"{n}B"
+        if n < 1048576:
+            return f"{n / 1024:.1f}KB"
+        if n < 1073741824:
+            return f"{n / 1048576:.1f}MB"
+        return f"{n / 1073741824:.1f}GB"
+
+    def _empty_stats():
+        return {
+            "requests": 0, "successes": 0, "failures": 0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_creation_tokens": 0, "cache_read_tokens": 0,
+            "total_tokens": 0, "bytes_up": 0, "bytes_down": 0, "total_bytes": 0,
+            "avg_connect_ms": 0, "avg_first_byte_ms": 0, "avg_total_ms": 0,
+        }
+
+    def _merge_stats(names):
+        merged = _empty_stats()
+        weighted = {"connect": 0, "first": 0, "total": 0}
+        count = 0
+        for name in names:
+            if name == "direct":
+                continue
+            ps = pstats_by_name.get(name)
+            if not ps:
+                continue
+            req = int(ps.get("requests") or 0)
+            merged["requests"] += req
+            merged["successes"] += int(ps.get("successes") or 0)
+            merged["failures"] += int(ps.get("failures") or 0)
+            for k in ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "total_tokens", "bytes_up", "bytes_down", "total_bytes"):
+                merged[k] += int(ps.get(k) or 0)
+            weighted["connect"] += int(ps.get("avg_connect_ms") or 0) * req
+            weighted["first"] += int(ps.get("avg_first_byte_ms") or 0) * req
+            weighted["total"] += int(ps.get("avg_total_ms") or 0) * req
+            count += req
+        if count:
+            merged["avg_connect_ms"] = round(weighted["connect"] / count)
+            merged["avg_first_byte_ms"] = round(weighted["first"] / count)
+            merged["avg_total_ms"] = round(weighted["total"] / count)
+        return merged
+
+    def _append_stat_lines(prefix: str, ps: dict) -> None:
+        tok = int(ps.get("total_tokens") or 0)
+        traffic = int(ps.get("total_bytes") or 0)
+        lines.append(
+            f"{prefix}📊 <code>{int(ps.get('requests') or 0)}</code>次"
+            f" · ✅<code>{int(ps.get('successes') or 0)}</code> / ❌<code>{int(ps.get('failures') or 0)}</code>"
+        )
+        lines.append(
+            f"{prefix}🧮 <code>{ui.fmt_tokens(tok)}</code> tok"
+            f" · 📦 <code>{_fmt_bytes(traffic)}</code>"
+        )
+        lines.append(
+            f"{prefix}⏱ 连接 <code>{_fmt_ms(ps.get('avg_connect_ms'))}</code>"
+            f" · 首字 <code>{_fmt_ms(ps.get('avg_first_byte_ms'))}</code>"
+            f" · 总耗时 <code>{_fmt_ms(ps.get('avg_total_ms'))}</code>"
+        )
+
+    if pstats:
+        for ps in pstats[:5]:
+            lines.append(f"  • <code>{ui.escape_html(ps['proxy_name'])}</code>")
+            _append_stat_lines("    ", ps)
+    lines.append("")
+    lines.append(f"📋 代理组: <code>{group_count}</code> 个")
+    for gname, members in list(groups.items())[:5]:
+        merged = _merge_stats(members)
+        member_text = " → ".join(str(m) for m in members)
+        lines.append(f"  • <code>{ui.escape_html(gname)}</code>  <code>{ui.escape_html(member_text)}</code>")
+        if merged["requests"] > 0:
+            lines.append("    组内总计：")
+            _append_stat_lines("      ", merged)
+    lines.append("")
+    lines.append(f"🎯 默认路由: <code>{ui.escape_html(str(default_route))}</code>")
+    lines.append(f"📝 路由规则: <code>{rule_count}</code> 条")
+    if not proxies and not groups:
+        lines.append("")
+        lines.append("<i>未配置代理，所有出站请求直连。</i>")
     return lines, dns_cfg, s5_cfg, servers
 
 
@@ -856,11 +948,11 @@ def _show_network(chat_id: int, message_id: int, cb_id: str) -> None:
         [ui.btn("✏ 修改 DNS", "sys:net:edit_dns"),
          ui.btn("🔄 同步系统 DNS", "sys:net:sync_dns"),
          ui.btn("📦 DNS 缓存", "sys:net:dns_cache")],
-        [ui.btn("🔴 关闭 SOCKS5" if s5_enabled else "🟢 启用 SOCKS5", "sys:net:toggle_socks5"),
-         ui.btn("✏ 设置 SOCKS5", "sys:net:edit_socks5")],
-        [ui.btn("🔄 刷新", "sys:show:network"),
-         ui.btn("🩺 网络检测", "sys:mon:show")],
-        [ui.btn("🏠 返回主菜单", "menu:main"),
+        [ui.btn("🔀 代理管理", "px:show"),
+         ui.btn("📋 代理组", "px:groups"),
+         ui.btn("🎯 路由规则", "px:routing")],
+        [ui.btn("🩺 网络检测", "sys:mon:show"),
+         ui.btn("🏠 返回主菜单", "menu:main"),
          ui.btn("◀ 返回设置", "menu:settings")],
     ]
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
