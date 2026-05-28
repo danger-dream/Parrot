@@ -22,7 +22,7 @@ _LIST_PAGE_SIZE = 6
 _STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
 
 # 入口协议 → 简短标签（anthropic 是默认，不加标签以避免每条日志都冗余显示）
-_INGRESS_TAG = {"chat": "[chat]", "responses": "[rsp]"}
+_INGRESS_TAG = {"chat": "[chat]", "responses": "[rsp]", "responses_ws": "[rsp]"}
 
 
 def _status_icon(row: dict) -> str:
@@ -32,6 +32,27 @@ def _status_icon(row: dict) -> str:
 def _ingress_tag(row: dict) -> str:
     """若入口非 anthropic 则返回 `[chat]`/`[rsp]`，否则空串。"""
     return _INGRESS_TAG.get(row.get("ingress_protocol") or "", "")
+
+
+def _transport_tag(row: dict) -> str:
+    """Transport marker for entries that share the same protocol tag."""
+    if (row.get("ingress_protocol") or "") == "responses_ws":
+        return "WS"
+    if (row.get("ingress_protocol") or "") == "responses" and (row.get("upstream_transport") or "").lower() == "ws":
+        return "↑WS"
+    return ""
+
+
+def _fmt_bytes(n) -> str:
+    try:
+        n = int(n or 0)
+    except Exception:
+        n = 0
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    return f"{n / (1024 * 1024):.1f}MB"
 
 
 def _clamp_page(page: int, total: int) -> tuple[int, int]:
@@ -72,6 +93,14 @@ def _maybe_suffix_status_banner(text: str) -> str:
     return text + "\n\n" + "\n".join(extras)
 
 
+def _display_index(page: int, idx: int) -> int:
+    try:
+        p = max(1, int(page or 1))
+    except (TypeError, ValueError):
+        p = 1
+    return (p - 1) * _LIST_PAGE_SIZE + int(idx)
+
+
 def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, total_pages: int | None = None) -> str:
     total = len(rows) if total is None else int(total or 0)
     total_pages = max(1, int(total_pages or 1))
@@ -82,14 +111,18 @@ def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, t
         "<i>对照下方按钮的 #编号 点击查看详情</i>",
     ]
     for idx, r in enumerate(rows, 1):
+        display_idx = _display_index(page, idx)
         ts = ui.fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
         icon = _status_icon(r)
         model = ui.escape_html(r.get("requested_model") or "?")
         key = ui.escape_html(r.get("api_key_name") or "?")
         ing_tag = _ingress_tag(r)
-        line = f"\n<b>#{idx}</b> <code>{ts}</code> {icon} <b>{key}</b> → {model}"
+        line = f"\n<b>#{display_idx}</b> <code>{ts}</code> {icon} <b>{key}</b> → {model}"
         if ing_tag:
             line += f" <code>{ing_tag}</code>"
+        transport = _transport_tag(r)
+        if transport:
+            line += f" · <b>{transport}</b>"
 
         # 通道 + 重试数
         if r.get("final_channel_key"):
@@ -165,11 +198,12 @@ def _list_kb(rows: list[dict], *, page: int, total_pages: int) -> dict:
     rows_kb: list[list[dict]] = []
     cur: list[dict] = []
     for idx, r in enumerate(rows, 1):
+        display_idx = _display_index(page, idx)
         rid = r.get("request_id") or ""
         if not rid:
             continue
         short = ui.register_code(rid)
-        cur.append(ui.btn(f"📄 #{idx}", f"logs:detail:{short}:{page}"))
+        cur.append(ui.btn(f"📄 #{display_idx}", f"logs:detail:{short}:{page}"))
         if len(cur) >= 3:
             rows_kb.append(cur)
             cur = []
@@ -214,6 +248,7 @@ def refresh(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
 def _render_detail(detail: dict) -> str:
     log = detail.get("log") or {}
     chain = detail.get("retry_chain") or []
+    proxy_chain = detail.get("proxy_chain") or []
 
     rid = log.get("request_id") or "?"
     created = ui.fmt_bjt_ts(log.get("created_at"), "%Y-%m-%d %H:%M:%S")
@@ -245,6 +280,7 @@ def _render_detail(detail: dict) -> str:
         lines.append(
             f"协议: 入口 <code>{ui.escape_html(ingress or '?')}</code>"
             f" → 上游 <code>{ui.escape_html(upstream_proto or '?')}</code>"
+            + (f" / <code>{ui.escape_html(log.get('upstream_transport'))}</code>" if log.get("upstream_transport") else "")
         )
     flags = []
     if log.get("is_stream"):
@@ -276,6 +312,30 @@ def _render_detail(detail: dict) -> str:
     tps_v = ui.calc_row_tps(log)
     if tps_v is not None:
         lines.append(f"⚡ 生成速度: {ui.fmt_tps(tps_v)}")
+
+    # 代理链（同一渠道尝试内的出站代理切换原因）
+    if proxy_chain:
+        lines.append("")
+        lines.append(f"<b>代理链 ({len(proxy_chain)} 次尝试)</b>")
+        for p in proxy_chain:
+            order = p.get("attempt_order") or "?"
+            pname = ui.escape_html(p.get("proxy_name") or "?")
+            oc = p.get("outcome") or "?"
+            mark = "✅" if oc in ("success", "connected") else "❌"
+            lines.append(f"  {mark} <b>{order}.</b> 🔀 <code>{pname}</code> — {ui.escape_html(oc)}")
+            timing = []
+            if p.get("connect_ms") is not None:
+                timing.append(f"连接 {ui.fmt_ms(p['connect_ms'])}")
+            if p.get("started_at") and p.get("ended_at"):
+                dur = (p["ended_at"] - p["started_at"]) * 1000
+                timing.append(f"耗时 {ui.fmt_ms(dur)}")
+            byte_sum = int(p.get("bytes_up") or 0) + int(p.get("bytes_down") or 0)
+            if byte_sum:
+                timing.append(f"流量 {_fmt_bytes(byte_sum)}")
+            if timing:
+                lines.append(f"     · {' · '.join(timing)}")
+            if p.get("error_detail"):
+                lines.append(f"     ⚠ <i>{ui.escape_html(_extract_error_summary(p['error_detail'])[:180])}</i>")
 
     # 重试链
     lines.append("")

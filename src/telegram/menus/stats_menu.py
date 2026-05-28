@@ -263,7 +263,13 @@ def _section_recent_calls(calls: list[dict]) -> str:
         model = ui.escape_html(r.get("requested_model") or "?")
         fam_icon = _protocol_icon(r.get("upstream_protocol"))
         fam_suffix = f" {fam_icon}" if fam_icon else ""
-        out.append(f"\n<code>[{ts}]</code> {icon} {model}{fam_suffix}")
+        if (r.get("ingress_protocol") or "") == "responses_ws":
+            transport_suffix = " · WS"
+        elif (r.get("ingress_protocol") or "") == "responses" and (r.get("upstream_transport") or "").lower() == "ws":
+            transport_suffix = " · ↑WS"
+        else:
+            transport_suffix = ""
+        out.append(f"\n<code>[{ts}]</code> {icon} {model}{fam_suffix}{transport_suffix}")
         if r.get("final_channel_key"):
             ch_line = f"  渠道: <code>{ui.escape_html(_ch_short_name(r['final_channel_key']))}</code>"
             if r.get("proxy_name"):

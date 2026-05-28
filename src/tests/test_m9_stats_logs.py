@@ -58,6 +58,7 @@ def _setup(m):
     conn.execute("DELETE FROM request_log")
     conn.execute("DELETE FROM request_detail")
     conn.execute("DELETE FROM retry_chain")
+    conn.execute("DELETE FROM proxy_chain")
     conn.commit()
     def _cfg(c):
         c["oauthAccounts"] = [{
@@ -83,17 +84,20 @@ def _insert_success(
     m, request_id, api_key, model, channel_key, channel_type="api",
     input_tok=100, output_tok=20, cc=10, cr=50, retry_count=0, affinity_hit=0,
     connect_ms=150, first_token_ms=600, total_ms=3000, is_stream=True,
+    ingress_protocol="anthropic", upstream_protocol=None, upstream_transport=None, http_status=200,
 ):
     ld = m["log_db"]
     ld.insert_pending(request_id, "1.1.1.1", api_key, model, is_stream,
-                     msg_count=3, tool_count=0, request_headers={}, request_body={})
+                     msg_count=3, tool_count=0, request_headers={}, request_body={},
+                     ingress_protocol=ingress_protocol)
     ld.finish_success(
         request_id, channel_key, channel_type, model,
         input_tokens=input_tok, output_tokens=output_tok,
         cache_creation_tokens=cc, cache_read_tokens=cr,
         connect_ms=connect_ms, first_token_ms=first_token_ms, total_ms=total_ms,
         retry_count=retry_count, affinity_hit=affinity_hit,
-        response_body='{"id":"x"}', http_status=200,
+        response_body='{"id":"x"}', http_status=http_status,
+        upstream_protocol=upstream_protocol, upstream_transport=upstream_transport,
     )
 
 
@@ -273,6 +277,29 @@ def test_logs_list(m):
     print("  [PASS] logs list")
 
 
+def test_logs_list_marks_responses_websocket(m):
+    _setup(m)
+    _insert_success(
+        m, "WS1", "virus", "gpt-5.5",
+        "oauth:openai:soarsky0204@gmail.com:51dbffb2-a422-4aec-a76a-f98e243b5b2d",
+        "oauth", input_tok=27, output_tok=21, cc=0, cr=0,
+        ingress_protocol="responses_ws", upstream_protocol="openai-responses", upstream_transport="ws", http_status=101,
+    )
+    _insert_success(
+        m, "UPWS1", "virus", "gpt-5.5",
+        "oauth:openai:soarsky0204@gmail.com:51dbffb2-a422-4aec-a76a-f98e243b5b2d",
+        "oauth", input_tok=27, output_tok=21, cc=0, cr=0,
+        ingress_protocol="responses", upstream_protocol="openai-responses", upstream_transport="ws", http_status=200,
+    )
+    rec = _install_recorder(m)
+    m["logs_menu"].show(42, 100, "cb")
+    text = rec.last("editMessageText")["text"]
+    assert "<code>[rsp]</code> · <b>WS</b>" in text
+    assert "<code>[rsp]</code> · <b>↑WS</b>" in text
+    assert "gpt-5.5" in text
+    print("  [PASS] logs WS marker")
+
+
 def test_logs_pagination(m):
     _setup(m)
     for i in range(8):
@@ -295,8 +322,12 @@ def test_logs_pagination(m):
     text = edit["text"]
     assert "第 2/2 页 · 共 8 条" in text
     assert text.count("<b>#") == 2
+    assert "<b>#7</b>" in text and "<b>#8</b>" in text
+    assert "<b>#1</b>" not in text and "<b>#2</b>" not in text
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
     assert "logs:page:1" in btns
+    detail_labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if b.get("callback_data", "").startswith("logs:detail:")]
+    assert detail_labels == ["📄 #7", "📄 #8"]
     detail_cb = next(b for b in btns if b.startswith("logs:detail:"))
     assert detail_cb.endswith(":2")
 
@@ -315,7 +346,15 @@ def test_logs_detail_with_retry_chain(m):
     # 手工构造一条带重试链的记录
     m["log_db"].insert_pending(rid, "1.1.1.1", "k1", "claude-opus-4-7", True, 3, 0, {}, {})
     a1 = m["log_db"].record_retry_attempt(rid, 1, "api:A", "api", "claude-opus-4-7", time.time())
+    p1 = m["log_db"].record_proxy_attempt(rid, a1, 1, "us-att", time.time())
     time.sleep(0.01)
+    m["log_db"].update_proxy_attempt(p1, connect_ms=200, ended_at=time.time(),
+                                      outcome="connect_error", error_detail="dial timeout",
+                                      bytes_up=10, bytes_down=20)
+    p2 = m["log_db"].record_proxy_attempt(rid, a1, 2, "misaka-lax", time.time())
+    time.sleep(0.01)
+    m["log_db"].update_proxy_attempt(p2, connect_ms=90, ended_at=time.time(),
+                                      outcome="success", bytes_up=30, bytes_down=40)
     m["log_db"].update_retry_attempt(a1, connect_ms=200, first_byte_ms=None, ended_at=time.time(),
                                      outcome="http_error", error_detail="HTTP 500: boom")
     a2 = m["log_db"].record_retry_attempt(rid, 2, "api:B", "api", "claude-opus-4-7", time.time())
@@ -334,6 +373,9 @@ def test_logs_detail_with_retry_chain(m):
     text = rec.last("editMessageText")["text"]
     assert "日志详情" in text
     assert rid in text
+    assert "代理链 (2 次尝试)" in text
+    assert "us-att" in text and "misaka-lax" in text
+    assert "connect_error" in text and "dial timeout" in text
     assert "重试链 (2 次尝试)" in text
     assert "<code>A</code>" in text and "<code>B</code>" in text
     assert "http_error" in text
@@ -747,8 +789,10 @@ def test_log_db_migrates_proxy_columns_on_old_schema(m):
     ld._ensure_migrations(conn)
     req_cols = {r[1] for r in conn.execute("PRAGMA table_info(request_log)")}
     retry_cols = {r[1] for r in conn.execute("PRAGMA table_info(retry_chain)")}
+    proxy_cols = {r[1] for r in conn.execute("PRAGMA table_info(proxy_chain)")}
     assert {"proxy_name", "proxy_bytes_up", "proxy_bytes_down"}.issubset(req_cols)
     assert {"proxy_name", "bytes_up", "bytes_down"}.issubset(retry_cols)
+    assert {"request_id", "retry_attempt_id", "proxy_name", "outcome", "error_detail"}.issubset(proxy_cols)
 
     ld.insert_pending("oldpx", "1.1.1.1", "k", "m", False, 1, 0, {}, {})
     aid = ld.record_retry_attempt("oldpx", 1, "api:ch", "api", "m", time.time(), proxy_name="p1")

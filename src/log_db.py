@@ -4,7 +4,8 @@
 三张表：
   - request_log      请求摘要（供统计与列表）
   - request_detail   大字段（headers / body / response_body）
-  - retry_chain      重试链（每次尝试一条记录）
+  - retry_chain      重试链（每个渠道尝试一条记录）
+  - proxy_chain      代理链（每个渠道尝试内的代理切换明细）
 
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
@@ -70,6 +71,8 @@ def _schema_sql() -> str:
       ingress_protocol      TEXT,
       -- 选中渠道的上游协议：anthropic / openai-chat / openai-responses。finish_* 阶段确定。
       upstream_protocol     TEXT,
+      -- 上游传输层：http / ws。下游 WS 与 HTTP→WS 上游转换都用 ws 标记。
+      upstream_transport    TEXT,
       -- 出站代理名称（proxy subsystem）。NULL / 空 = 直连。
       proxy_name            TEXT,
       -- 代理层字节数：统计经由该代理转发的上游 body bytes（请求 + 响应）。
@@ -107,6 +110,22 @@ def _schema_sql() -> str:
       bytes_down      INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_retry_req ON retry_chain(request_id);
+
+    CREATE TABLE IF NOT EXISTS proxy_chain (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id      TEXT NOT NULL,
+      retry_attempt_id INTEGER,
+      attempt_order   INTEGER NOT NULL,
+      proxy_name      TEXT NOT NULL,
+      started_at      REAL NOT NULL,
+      connect_ms      INTEGER,
+      ended_at        REAL,
+      outcome         TEXT,
+      error_detail    TEXT,
+      bytes_up        INTEGER DEFAULT 0,
+      bytes_down      INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id);
     """
 
 
@@ -143,6 +162,9 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if "upstream_protocol" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN upstream_protocol TEXT")
         changed = True
+    if "upstream_transport" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN upstream_transport TEXT")
+        changed = True
     if "proxy_name" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN proxy_name TEXT")
         changed = True
@@ -163,6 +185,37 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if retry_cols and "bytes_down" not in retry_cols:
         conn.execute("ALTER TABLE retry_chain ADD COLUMN bytes_down INTEGER DEFAULT 0")
         changed = True
+
+    proxy_cols = {row[1] for row in conn.execute("PRAGMA table_info(proxy_chain)").fetchall()}
+    if not proxy_cols:
+        conn.execute("""CREATE TABLE IF NOT EXISTS proxy_chain (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          request_id      TEXT NOT NULL,
+          retry_attempt_id INTEGER,
+          attempt_order   INTEGER NOT NULL,
+          proxy_name      TEXT NOT NULL,
+          started_at      REAL NOT NULL,
+          connect_ms      INTEGER,
+          ended_at        REAL,
+          outcome         TEXT,
+          error_detail    TEXT,
+          bytes_up        INTEGER DEFAULT 0,
+          bytes_down      INTEGER DEFAULT 0
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
+        changed = True
+    else:
+        for col, ddl in (
+            ("retry_attempt_id", "ALTER TABLE proxy_chain ADD COLUMN retry_attempt_id INTEGER"),
+            ("attempt_order", "ALTER TABLE proxy_chain ADD COLUMN attempt_order INTEGER DEFAULT 0"),
+            ("connect_ms", "ALTER TABLE proxy_chain ADD COLUMN connect_ms INTEGER"),
+            ("bytes_up", "ALTER TABLE proxy_chain ADD COLUMN bytes_up INTEGER DEFAULT 0"),
+            ("bytes_down", "ALTER TABLE proxy_chain ADD COLUMN bytes_down INTEGER DEFAULT 0"),
+        ):
+            if col not in proxy_cols:
+                conn.execute(ddl)
+                changed = True
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
     if changed:
         conn.commit()
 
@@ -404,6 +457,59 @@ def update_retry_attempt(
         _get_conn().commit()
 
 
+def record_proxy_attempt(
+    request_id: str,
+    retry_attempt_id: int | None,
+    attempt_order: int,
+    proxy_name: str,
+    started_at: float,
+) -> int:
+    """插入一次代理链尝试，记录组内代理为何切换。"""
+    with _write_lock:
+        conn = _get_conn()
+        cur = conn.execute(
+            """INSERT INTO proxy_chain
+               (request_id, retry_attempt_id, attempt_order, proxy_name, started_at)
+               VALUES (?,?,?,?,?)""",
+            (request_id, retry_attempt_id, attempt_order, proxy_name, started_at),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_proxy_attempt(
+    proxy_attempt_id: int,
+    connect_ms: int | None = None,
+    ended_at: float | None = None,
+    outcome: str | None = None,
+    error_detail: str | None = None,
+    bytes_up: int | None = None,
+    bytes_down: int | None = None,
+) -> None:
+    fields, vals = [], []
+    if connect_ms is not None:
+        fields.append("connect_ms=?"); vals.append(connect_ms)
+    if ended_at is not None:
+        fields.append("ended_at=?"); vals.append(ended_at)
+    if outcome is not None:
+        fields.append("outcome=?"); vals.append(outcome)
+    if error_detail is not None:
+        fields.append("error_detail=?"); vals.append(error_detail)
+    if bytes_up is not None:
+        fields.append("bytes_up=?"); vals.append(int(bytes_up or 0))
+    if bytes_down is not None:
+        fields.append("bytes_down=?"); vals.append(int(bytes_down or 0))
+    if not fields:
+        return
+    vals.append(proxy_attempt_id)
+    with _write_lock:
+        _get_conn().execute(
+            f"UPDATE proxy_chain SET {', '.join(fields)} WHERE id=?",
+            vals,
+        )
+        _get_conn().commit()
+
+
 def finish_success(
     request_id: str,
     final_channel_key: str,
@@ -421,6 +527,7 @@ def finish_success(
     response_body: str | None = None,
     http_status: int = 200,
     upstream_protocol: str | None = None,
+    upstream_transport: str | None = None,
     proxy_name: str | None = None,
     proxy_bytes_up: int | None = None,
     proxy_bytes_down: int | None = None,
@@ -434,7 +541,7 @@ def finish_success(
                  input_tokens=?, output_tokens=?,
                  cache_creation_tokens=?, cache_read_tokens=?,
                  connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
-                 retry_count=?, affinity_hit=?, upstream_protocol=?, proxy_name=?,
+                 retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
                  proxy_bytes_up=?, proxy_bytes_down=?
                WHERE request_id=?""",
             (
@@ -443,7 +550,7 @@ def finish_success(
                 input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens,
                 connect_ms, first_token_ms, total_ms,
-                retry_count, affinity_hit, upstream_protocol, proxy_name,
+                retry_count, affinity_hit, upstream_protocol, upstream_transport, proxy_name,
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
                 request_id,
             ),
@@ -470,6 +577,7 @@ def finish_error(
     response_body: str | None = None,
     affinity_hit: int = 0,
     upstream_protocol: str | None = None,
+    upstream_transport: str | None = None,
     proxy_name: str | None = None,
     proxy_bytes_up: int | None = None,
     proxy_bytes_down: int | None = None,
@@ -481,14 +589,14 @@ def finish_error(
                  status='error', finished_at=?, error_message=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
-                 retry_count=?, affinity_hit=?, upstream_protocol=?, proxy_name=?,
+                 retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
                  proxy_bytes_up=?, proxy_bytes_down=?
                WHERE request_id=?""",
             (
                 time.time(), error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
                 connect_ms, first_token_ms, total_ms,
-                retry_count, affinity_hit, upstream_protocol, proxy_name,
+                retry_count, affinity_hit, upstream_protocol, upstream_transport, proxy_name,
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
                 request_id,
             ),
@@ -875,7 +983,7 @@ _RECENT_COLS = (
     "input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, "
     "connect_time_ms, first_token_time_ms, total_time_ms, "
     "retry_count, affinity_hit, "
-    "ingress_protocol, upstream_protocol, proxy_name, proxy_bytes_up, proxy_bytes_down"
+    "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down"
 )
 
 
@@ -1078,10 +1186,15 @@ def log_detail(request_id: str) -> dict:
         "SELECT * FROM retry_chain WHERE request_id=? ORDER BY attempt_order ASC",
         (request_id,),
     ).fetchall()
+    proxy_rows = _get_conn().execute(
+        "SELECT * FROM proxy_chain WHERE request_id=? ORDER BY attempt_order ASC, id ASC",
+        (request_id,),
+    ).fetchall()
     return {
         "log": dict(log_row) if log_row else None,
         "detail": dict(detail_row) if detail_row else None,
         "retry_chain": [dict(r) for r in chain_rows],
+        "proxy_chain": [dict(r) for r in proxy_rows],
     }
 
 
@@ -1214,7 +1327,7 @@ def stats_summary(
             for r in conn.execute(
                 """SELECT created_at, api_key_name, requested_model,
                           final_channel_key, error_message,
-                          ingress_protocol, upstream_protocol
+                          ingress_protocol, upstream_protocol, upstream_transport
                    FROM request_log WHERE status='error' AND created_at >= ?{_family_where_sql}
                    ORDER BY created_at DESC LIMIT 5""".format(_family_where_sql=_family_where(family)),
                 (since_ts, *_family_params(family)),

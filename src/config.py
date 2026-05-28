@@ -276,6 +276,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "prefix": "parrot:auto:v1",
         },
+        # HTTP /v1/responses 入口是否把 OpenAI OAuth Codex 上游传输切到 WebSocket。
+        # 下游真实 WebSocket /v1/responses 入口不受此开关影响，始终可用。
+        "responsesUpstreamWsForOAuth": False,
         # 跨变体翻译能力开关
         "translation": {
             "enabled": True,

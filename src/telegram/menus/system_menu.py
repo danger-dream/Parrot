@@ -22,6 +22,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
     sc = cfg.get("scoring") or {}
     aff = cfg.get("affinity") or {}
     qm = cfg.get("quotaMonitor") or {}
+    ws_enabled = bool((cfg.get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
+    ws_mode_label = "开" if ws_enabled else "关"
 
     text = (
         "⚙ <b>系统设置</b>\n\n"
@@ -39,6 +41,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         f"调度: <code>{load_balancing.display_mode(cfg.get('channelSelection', 'smart'))}</code>\n"
         f"配额监控: <code>{'开' if qm.get('enabled') else '关'}</code>"
         f" · 间隔 {qm.get('intervalSeconds', 60)}s · 阈值 {qm.get('disableThresholdPercent', 95)}%\n"
+        f"WS模式: HTTP→WS 上游转换 <code>{ws_mode_label}</code>\n"
     )
     bl = cfg.get("contentBlacklist") or {}
     bl_default_count = len((bl.get("default") or []))
@@ -69,8 +72,9 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("⚡ 并发限制", "sys:show:concurrency")],
         [ui.btn("📡 故障订阅", "menu:status_alert"),
          ui.btn("🌐 网络设置", "sys:show:network")],
-        [ui.btn("🆕 版本更新", "menu:update"),
-         ui.btn("◀ 返回主菜单", "menu:main")],
+        [ui.btn("🧬 WS模式", "sys:show:ws_mode"),
+         ui.btn("🆕 版本更新", "menu:update")],
+        [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
 
@@ -1513,6 +1517,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:edit:cc_queue_wait":      _edit_cc_queue_wait(chat_id, message_id, cb_id); return True
     if data == "sys:edit:cc_default_max":     _edit_cc_default_max(chat_id, message_id, cb_id); return True
 
+    # WS 模式
+    if data == "sys:show:ws_mode":            _show_ws_mode(chat_id, message_id, cb_id); return True
+    if data == "sys:ws_mode:toggle":          _on_ws_mode_toggle(chat_id, message_id, cb_id); return True
+
     return False
 
 
@@ -1685,3 +1693,43 @@ def _on_cc_default_max_input(chat_id: int, text: str) -> None:
     label = "不限" if v == 0 else str(v)
     ui.send(chat_id, f"✅ 默认最大并发数已更新为 <code>{label}</code>")
     send_new(chat_id)
+
+
+def _ws_mode_enabled() -> bool:
+    return bool((config.get().get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
+
+
+def _show_ws_mode(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    enabled = _ws_mode_enabled()
+    lines = [
+        "🔌 <b>WS 模式</b>",
+        "",
+        "当前状态：",
+        "• 下游 WebSocket <code>/v1/responses</code>：已支持，默认可用",
+        f"• HTTP Responses 转上游 WS：<code>{'开启' if enabled else '关闭'}</code>",
+        "",
+        "说明：",
+        "开启后，当客户端仍使用 HTTP/SSE <code>/v1/responses</code> 调用 Parrot 时，",
+        "如果选中的上游渠道是 <b>OpenAI OAuth</b> 账号，Parrot 会优先使用 WebSocket 连接 OpenAI Codex 上游。",
+        "",
+        "普通 OpenAI API 渠道不受影响。",
+        "Anthropic / ChatCompletions / images 不受影响。",
+    ]
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([
+        [ui.btn("🔴 关闭 HTTP→WS 上游转换" if enabled else "🟢 开启 HTTP→WS 上游转换", "sys:ws_mode:toggle")],
+        [ui.btn("◀ 返回设置", "menu:settings")],
+    ]))
+
+
+def _on_ws_mode_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+    cur = _ws_mode_enabled()
+    new_enabled = not cur
+    def _mut(c):
+        openai_cfg = c.setdefault("openai", {})
+        openai_cfg["responsesUpstreamWsForOAuth"] = new_enabled
+        openai_cfg.pop("responsesUpstreamTransport", None)
+        openai_cfg.pop("responsesUpstreamWs", None)
+    config.update(_mut)
+    ui.answer_cb(cb_id, "已切换")
+    _show_ws_mode(chat_id, message_id, "")

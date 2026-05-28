@@ -43,6 +43,9 @@ RESPONSES_REQ_ALLOWED: frozenset[str] = frozenset({
     "store", "metadata", "prompt", "background",
     "service_tier", "user", "safety_identifier",
     "prompt_cache_key", "prompt_cache_retention",
+    # Codex Responses WebSocket request payload carries this WS-only metadata.
+    # HTTP passthrough callers still won't send it unless explicitly provided.
+    "client_metadata",
 })
 
 

@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from src import (
@@ -401,6 +401,13 @@ async def proxy_responses(request: Request):
     """OpenAI Responses 入口。详细流程在 src/openai/handler.py。"""
     from src.openai.handler import handle
     return await handle(request, ingress_protocol="responses")
+
+
+@app.websocket("/v1/responses")
+async def proxy_responses_websocket(websocket: WebSocket):
+    """OpenAI/Codex Responses WebSocket 入口（非语音 Realtime）。"""
+    from src.openai.responses_ws import handle_responses_ws
+    await handle_responses_ws(websocket)
 
 
 @app.post("/v1/images/generate")

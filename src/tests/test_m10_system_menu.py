@@ -77,7 +77,7 @@ def test_main_page(m):
             for b in row if "callback_data" in b]
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
                 "sys:show:affinity", "sys:show:cch", "menu:loadbalancing",
-                "sys:show:blacklist", "menu:main"}
+                "sys:show:blacklist", "sys:show:ws_mode", "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
     print("  [PASS] main settings page")
@@ -291,6 +291,28 @@ def test_blacklist_by_channel(m):
     print("  [PASS] blacklist byChannel add")
 
 
+
+def test_ws_mode_menu_and_toggle(m):
+    _reset(m)
+    rec = _install(m)
+    sm = m["system_menu"]
+
+    m["config"].update(lambda c: c.setdefault("openai", {}).__setitem__("responsesUpstreamWsForOAuth", False))
+    sm._show_ws_mode(42, 100, "cb")
+    edit = rec.last("editMessageText")
+    assert "下游 WebSocket <code>/v1/responses</code>：已支持，默认可用" in edit["text"]
+    assert "HTTP Responses 转上游 WS：<code>关闭</code>" in edit["text"]
+    assert "OpenAI OAuth" in edit["text"]
+
+    sm._on_ws_mode_toggle(42, 100, "cb")
+    assert m["config"].get()["openai"]["responsesUpstreamWsForOAuth"] is True
+    edit = rec.last("editMessageText")
+    assert "HTTP Responses 转上游 WS：<code>开启</code>" in edit["text"]
+
+    sm._on_ws_mode_toggle(42, 100, "cb")
+    assert m["config"].get()["openai"]["responsesUpstreamWsForOAuth"] is False
+    print("  [PASS] WS mode menu + toggle")
+
 def test_router_dispatch(m):
     _reset(m)
     rec = _install(m)
@@ -342,6 +364,7 @@ def main():
         test_chsel_switch,
         test_blacklist_default_add_and_remove,
         test_blacklist_by_channel,
+        test_ws_mode_menu_and_toggle,
         test_router_dispatch,
         test_text_state_dispatch_to_system,
     ]

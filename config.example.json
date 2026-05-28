@@ -186,6 +186,11 @@
       "cleanupIntervalSeconds": 300
     },
     "reasoningBridge": "passthrough",
+    "autoPromptCacheKey": {
+      "enabled": true,
+      "prefix": "parrot:auto:v1"
+    },
+    "responsesUpstreamWsForOAuth": false,
     "translation": {
       "enabled": true,
       "rejectOnBuiltinTools": true,
