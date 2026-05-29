@@ -403,6 +403,49 @@ def _restore_tool_names_in_chunk(chunk_bytes, dynamic_map=None):
     return _restore_tool_names_in_json_bytes(chunk_bytes, dynamic_map)
 
 
+# ─── Opus 4.7/4.8 adaptive thinking 适配 ───
+# 旧客户端发的是 thinking.type=enabled + budget_tokens，无法表达 Opus 4.7/4.8
+# 的 effort 档位。这里仅对 opus-4-7 / opus-4-8 把旧式写法升级为 adaptive + effort，
+# disabled（明确不思考）与客户端已自带 effort 的请求都原样保留。
+
+_OPUS_ADAPTIVE_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
+
+
+def _budget_to_effort(budget):
+    try:
+        b = int(budget)
+    except (TypeError, ValueError):
+        return "max"
+    if b >= 16384:
+        return "max"
+    if b >= 8192:
+        return "xhigh"
+    if b >= 2048:
+        return "high"
+    return "medium"
+
+
+def apply_opus_adaptive_thinking(payload, model):
+    """就地把 Opus 4.7/4.8 的旧式 thinking.enabled+budget_tokens 升级为
+    thinking.type=adaptive + output_config.effort。返回 payload 本身。"""
+    if not isinstance(model, str) or not any(model.startswith(m) for m in _OPUS_ADAPTIVE_MODELS):
+        return payload
+    t = payload.get("thinking")
+    if not isinstance(t, dict):
+        return payload
+    ttype = t.get("type")
+    if ttype not in ("enabled", "adaptive"):
+        # disabled / 其它：明确不思考，保持原样
+        return payload
+    effort = _budget_to_effort(t.get("budget_tokens"))
+    payload["thinking"] = {"type": "adaptive"}
+    oc = payload.get("output_config")
+    if not (isinstance(oc, dict) and oc.get("effort")):
+        # 客户端未显式指定 effort 时才注入
+        payload["output_config"] = {**(oc if isinstance(oc, dict) else {}), "effort": effort}
+    return payload
+
+
 # ─── 请求转换 ───（仅签名参数化 email；函数体与 cc-proxy 一致）
 
 def transform_request(body, email=""):
@@ -463,6 +506,8 @@ def transform_request(body, email=""):
 
     if "output_config" in body:
         payload["output_config"] = body["output_config"]
+
+    apply_opus_adaptive_thinking(payload, model)
 
     return payload, dynamic_tool_map
 

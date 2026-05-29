@@ -14,6 +14,7 @@ from .cc_mimicry import (
     _strip_message_cache_control,
     _strip_tool_cache_control,
     add_cache_breakpoints,
+    apply_opus_adaptive_thinking,
 )
 
 
@@ -65,6 +66,8 @@ def standard_transform(body: dict) -> dict:
             "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }
         payload["tools"] = tools
+
+    apply_opus_adaptive_thinking(payload, body.get("model", ""))
 
     return payload
 
