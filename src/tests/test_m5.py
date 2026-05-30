@@ -345,6 +345,93 @@ async def test_proactive_refresh_401_marks_auth_error(m):
     print("  [PASS] auth refresh 401 → marked auth_error + friendly notification")
 
 
+async def test_claude_refresh_compat_falls_back_legacy_no_scope(m):
+    _reset(m)
+    cfg = m["config"]
+
+    def _setup(c):
+        c.setdefault("oauth", {})["mockMode"] = False
+        c["oauthAccounts"] = [{
+            "email": "legacy@test.com",
+            "provider": "claude",
+            "access_token": "old", "refresh_token": "r",
+            "expired": (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "enabled": True, "disabled_reason": None, "disabled_until": None, "models": [],
+        }]
+    cfg.update(_setup)
+
+    calls = []
+    import httpx as _httpx
+    orig_post = m["oauth_manager"].network.post_sync
+    def fake_post(url, json=None, **kw):
+        calls.append((url, dict(json or {})))
+        if url == m["oauth_manager"].OAUTH_TOKEN_URL_LEGACY and "scope" not in (json or {}):
+            req = _httpx.Request("POST", url)
+            return _httpx.Response(200, request=req, json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 28800,
+            })
+        req = _httpx.Request("POST", url)
+        return _httpx.Response(400, request=req, json={"error": "invalid_request"})
+    m["oauth_manager"].network.post_sync = fake_post
+    try:
+        outcomes = await m["oauth_manager"].proactive_refresh_once(refresh_threshold_seconds=600)
+    finally:
+        m["oauth_manager"].network.post_sync = orig_post
+
+    assert outcomes["legacy@test.com"] == "refreshed", outcomes
+    acc = next(a for a in m["config"].get()["oauthAccounts"] if a["email"] == "legacy@test.com")
+    assert acc["enabled"] is True
+    assert acc["disabled_reason"] is None
+    assert acc["access_token"] == "new-access"
+    assert acc["refresh_token"] == "new-refresh"
+    assert calls == [(m["oauth_manager"].OAUTH_TOKEN_URL_LEGACY, {
+        "grant_type": "refresh_token",
+        "refresh_token": "r",
+        "client_id": m["oauth_manager"].OAUTH_CLIENT_ID,
+    })]
+    print("  [PASS] Claude refresh compat: legacy no-scope account uses legacy endpoint")
+
+
+async def test_claude_refresh_400_invalid_request_does_not_disable(m):
+    _reset(m)
+    cfg = m["config"]
+    collector = NotifyCollector()
+    m["notifier"].set_handler(collector)
+
+    def _setup(c):
+        c.setdefault("oauth", {})["mockMode"] = False
+        c["oauthAccounts"] = [{
+            "email": "compat-fail@test.com",
+            "provider": "claude",
+            "access_token": "old", "refresh_token": "r",
+            "scopes": "user:profile",
+            "expired": (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "enabled": True, "disabled_reason": None, "disabled_until": None, "models": [],
+        }]
+    cfg.update(_setup)
+
+    import httpx as _httpx
+    orig_post = m["oauth_manager"].network.post_sync
+    def response_400_invalid_request(url, json=None, **kw):
+        req = _httpx.Request("POST", url)
+        return _httpx.Response(400, request=req, json={"error": "invalid_request"})
+    m["oauth_manager"].network.post_sync = response_400_invalid_request
+    try:
+        outcomes = await m["oauth_manager"].proactive_refresh_once(refresh_threshold_seconds=600)
+    finally:
+        m["oauth_manager"].network.post_sync = orig_post
+
+    assert outcomes["compat-fail@test.com"].startswith("failed:claude_refresh_token_failed"), outcomes
+    acc = next(a for a in m["config"].get()["oauthAccounts"] if a["email"] == "compat-fail@test.com")
+    assert acc["enabled"] is True
+    assert acc["disabled_reason"] is None
+    m["notifier"].wait_drain(2.0)
+    assert any("账号未自动禁用" in msg for msg in collector.messages), collector.messages
+    print("  [PASS] Claude refresh compat: 400 invalid_request does not mark auth_error")
+
+
 # ─── OAuth 配额监控 ──────────────────────────────────────────────
 
 def _fake_usage(util_percent: float, resets_at_future_seconds: int = 3600):
@@ -488,6 +575,8 @@ async def amain():
         test_proactive_refresh_triggers_near_expiry,
         test_proactive_refresh_network_failure_does_not_mark_auth_error,
         test_proactive_refresh_401_marks_auth_error,
+        test_claude_refresh_compat_falls_back_legacy_no_scope,
+        test_claude_refresh_400_invalid_request_does_not_disable,
         test_quota_monitor_disables_high_util,
         test_quota_monitor_resumes_after_reset,
         test_quota_monitor_skips_user_and_auth_error,

@@ -75,3 +75,18 @@ def test_transient_errors_are_retryable_not_auth_error():
     assert err.retryable is True
     assert err.auth_error is False
     assert err.code == "openai_rate_limited"
+
+
+def test_claude_refresh_400_invalid_request_not_auth_error():
+    exc = _http_error(400, "https://platform.claude.com/v1/oauth/token", {"error": "invalid_request"})
+    err = oauth_errors.describe_oauth_error(exc, provider="claude", operation="refresh_token")
+    assert err.auth_error is False
+    assert err.retryable is True
+    assert err.code == "claude_refresh_token_failed"
+
+
+def test_claude_refresh_400_invalid_grant_is_auth_error():
+    exc = _http_error(400, "https://platform.claude.com/v1/oauth/token", {"error": "invalid_grant"})
+    err = oauth_errors.describe_oauth_error(exc, provider="claude", operation="refresh_token")
+    assert err.auth_error is True
+    assert err.code == "claude_token_invalid"

@@ -44,6 +44,7 @@ from .transform.cc_mimicry import CLI_USER_AGENT
 
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_TOKEN_URL_LEGACY = "https://api.anthropic.com/v1/oauth/token"
 OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -363,20 +364,17 @@ def _save_token_fields(account_key: str, new: dict) -> None:
     config.update(mutate)
 
 
-def _do_refresh_http(refresh_token: str, scopes: str = "") -> dict:
-    """真实请求 Anthropic token endpoint。
-
-    scopes: 账号登录时存下的真实 scope（空格分隔）；缺省回退完整六项 OAUTH_SCOPES。
-    源码 QA$() refresh body 明确带 scope 字段（lineage §4.2）。
-    """
+def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None) -> dict:
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+    }
+    if scope:
+        body["scope"] = scope
     resp = network.post_sync(
-        OAUTH_TOKEN_URL,
-        json={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": OAUTH_CLIENT_ID,
-            "scope": scopes or OAUTH_SCOPES,
-        },
+        url,
+        json=body,
         headers={
             "Content-Type": "application/json",
             "User-Agent": CLI_USER_AGENT,
@@ -386,6 +384,64 @@ def _do_refresh_http(refresh_token: str, scopes: str = "") -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _raise_last_refresh_error(errors: list[BaseException]) -> None:
+    if not errors:
+        raise RuntimeError("Claude OAuth refresh failed without recorded error")
+    # 如果所有候选都明确是 invalid_grant / invalid_token / revoked / expired，
+    # 才把最后一个错误交给上层标 auth_error。否则优先抛一个非 auth_error 的
+    # 协议兼容失败，避免 400 invalid_request / invalid_scope 误禁用账号。
+    classified = [
+        oauth_errors.describe_oauth_error(
+            exc, provider="claude", operation="refresh_token"
+        )
+        for exc in errors
+    ]
+    invalid_errors = [exc for exc, err in zip(errors, classified) if err.auth_error]
+    if len(invalid_errors) == len(errors):
+        raise errors[-1]
+    # 网络/超时类保留原异常，避免兼容层包装后丢失 claude_oauth_network_error
+    # / claude_oauth_timeout 的可重试语义。
+    if classified and all(err.code in {"claude_oauth_network_error", "claude_oauth_timeout"} for err in classified):
+        raise errors[-1]
+    summary = [f"{err.code}:{err.status or '-'}" for err in classified]
+    raise RuntimeError("Claude OAuth refresh compatibility failed: " + ", ".join(summary))
+
+
+def _do_refresh_http(refresh_token: str, scopes: str = "") -> dict:
+    """Claude OAuth refresh 兼容层。
+
+    旧账号没有登录响应 scope，沿用已验证的 api.anthropic.com + no-scope；
+    新账号如果保存了真实 scope，则优先尝试 platform.claude.com + scope。
+    任一候选成功即返回；失败候选不写配置、不禁用账号。
+    """
+    scope = (scopes or "").strip()
+    candidates: list[tuple[str, str, str | None]] = []
+    if scope:
+        candidates.append(("platform+scope", OAUTH_TOKEN_URL, scope))
+        candidates.append(("legacy+scope", OAUTH_TOKEN_URL_LEGACY, scope))
+    candidates.append(("legacy-no-scope", OAUTH_TOKEN_URL_LEGACY, None))
+    candidates.append(("platform-no-scope", OAUTH_TOKEN_URL, None))
+
+    errors: list[BaseException] = []
+    for name, url, cand_scope in candidates:
+        try:
+            data = _post_refresh_candidate(url, refresh_token, scope=cand_scope)
+            if errors:
+                print(f"[oauth] Claude refresh fallback succeeded via {name}")
+            return data
+        except Exception as exc:
+            errors.append(exc)
+            err = oauth_errors.describe_oauth_error(
+                exc, provider="claude", operation="refresh_token"
+            )
+            print(f"[oauth] Claude refresh candidate {name} failed: {err.code}")
+            # 明确 token 本身失效时，继续尝试其它候选通常没意义；但为了兼容
+            # 上游把协议错误也包成 400 invalid_grant 的情况，仍让候选链跑完。
+            continue
+
+    _raise_last_refresh_error(errors)
 
 
 def _do_refresh_mock(refresh_token: str) -> dict:
