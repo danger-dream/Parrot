@@ -43,7 +43,7 @@ from .transform.cc_mimicry import CLI_USER_AGENT
 # ─── 常量 ────────────────────────────────────────────────────────
 
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-OAUTH_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -363,14 +363,19 @@ def _save_token_fields(account_key: str, new: dict) -> None:
     config.update(mutate)
 
 
-def _do_refresh_http(refresh_token: str) -> dict:
-    """真实请求 Anthropic token endpoint。"""
+def _do_refresh_http(refresh_token: str, scopes: str = "") -> dict:
+    """真实请求 Anthropic token endpoint。
+
+    scopes: 账号登录时存下的真实 scope（空格分隔）；缺省回退完整六项 OAUTH_SCOPES。
+    源码 QA$() refresh body 明确带 scope 字段（lineage §4.2）。
+    """
     resp = network.post_sync(
         OAUTH_TOKEN_URL,
         json={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": OAUTH_CLIENT_ID,
+            "scope": scopes or OAUTH_SCOPES,
         },
         headers={
             "Content-Type": "application/json",
@@ -398,6 +403,17 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
     force=False 时进入锁后做一次"双重检查"：若另一并发刷新已完成且 token 仍有效则跳过实际请求。
     force=True 时无视剩余时间，强制刷新。
     """
+    # ⛔ 双实例重构期硬禁用刷新：副本与线上共享同一批 OAuth 账号，
+    # 任一方刷新会轮换 access_token/refresh_token，击穿线上 token 导致小夕 401。
+    # 三条刷新入口（proactive_refresh_loop / ensure_valid_token / force_refresh）
+    # 最终都汇到这里，单点拦截即全堵。返回现有 token，绝不发刷新请求。
+    if os.environ.get("PARROT_NO_REFRESH") == "1":
+        _acc = get_account(_resolve_existing_account_key_or_raise(account_key))
+        if _acc and _acc.get("access_token"):
+            return _acc["access_token"]
+        raise RuntimeError(
+            "refresh disabled in dual-instance rebuild mode (PARROT_NO_REFRESH=1)"
+        )
     account_key = _resolve_existing_account_key_or_raise(account_key)
     email = account_key_to_email(account_key)
     lock = _get_refresh_lock(account_key)
@@ -422,7 +438,7 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
         else:
-            data = _do_refresh_http(acc["refresh_token"])
+            data = _do_refresh_http(acc["refresh_token"], acc.get("scopes", ""))
 
         new_expired = datetime.now(timezone.utc) + timedelta(
             seconds=int(data.get("expires_in", 28800))
@@ -434,6 +450,9 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         }
         if "refresh_token" in data and data["refresh_token"]:
             new_fields["refresh_token"] = data["refresh_token"]
+        # §9-3：refresh 响应带新 scope 时回写（源码 QA$() refresh 响应返 scope）
+        if data.get("scope"):
+            new_fields["scopes"] = data["scope"]
         # OpenAI: 刷新响应若带 id_token 同步更新；解码拿出最新 metadata
         # （plan_type / chatgpt_account_id / organization_id 都可能随账户升级
         # 或换组织而变）。email 理论上不变，不覆盖以免生成孤儿 entry。
@@ -527,9 +546,9 @@ def _profile_sync(access_token: str) -> dict:
     resp = network.get_sync(
         OAUTH_PROFILE_URL,
         headers={
+            # §14.1：CC v2.1.156 调 profile 只带 Bearer + json，不带 beta/UA（源码实证）
             "Authorization": f"Bearer {access_token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": CLI_USER_AGENT,
+            "Content-Type": "application/json",
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",
@@ -543,7 +562,7 @@ def _usage_sync(access_token: str) -> dict:
 
     请求头与 sub2api 的 claudeUsageService.FetchUsageWithOptions 对齐（2026-04-20）：
       - Accept / Content-Type / anthropic-beta 与用户抓包一致
-      - User-Agent 用 usage 专用默认值 `claude-code/2.1.7`
+      - User-Agent 跟随 CC 版本（v2.1.156）
       - timeout 30s（sub2api 产线验证值）
     """
     if mock_mode_enabled():
@@ -555,7 +574,7 @@ def _usage_sync(access_token: str) -> dict:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.7",
+            "User-Agent": "claude-code/2.1.156",
         },
         timeout=30,
         proxy_purpose="oauth_anthropic",
@@ -1370,6 +1389,9 @@ def add_account(entry: dict) -> None:
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
         "models": entry.get("models") or [],
+        # §9-1：存登录响应的 scope（空格分隔），供 refresh 时带真实 scope；
+        # 老账号缺省空串，refresh 时回退完整六项 OAUTH_SCOPES。
+        "scopes": entry.get("scopes", "") or "",
     }
     # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
     if provider == "openai":

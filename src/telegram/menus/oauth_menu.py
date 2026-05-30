@@ -1318,6 +1318,8 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         "disabled_reason": None,
         "disabled_until": None,
         "models": [],
+        # §9-1：存登录响应里的 scope，供后续 refresh 带真实 scope
+        "scopes": tok_resp.get("scope", "") or "",
     }
     try:
         oauth_manager.add_account(entry)

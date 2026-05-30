@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Optional
 
 from .. import oauth_manager
@@ -47,9 +48,18 @@ class OAuthChannel(Channel):
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
         body_with_model = {**requested_body, "model": resolved_model}
-        payload, dynamic_map = cc_mimicry.transform_request(body_with_model, email=self.email)
+        # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
+        sid = str(uuid.uuid4())
+        payload, dynamic_map = cc_mimicry.transform_request(
+            body_with_model, email=self.email, session_id=sid)
         signed = cc_mimicry.sign_body(payload)
-        headers = cc_mimicry.build_upstream_headers(access_token)
+        downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
+        original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
+        wants_context_1m = body_with_model.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
+        headers = cc_mimicry.build_upstream_headers(
+            access_token, session_id=sid, model=resolved_model, payload=payload,
+            downstream_betas=downstream_betas, original_model=original_model,
+            wants_context_1m=wants_context_1m)
 
         return UpstreamRequest(
             url=f"{cc_mimicry.ANTHROPIC_API_BASE}/v1/messages?beta=true",

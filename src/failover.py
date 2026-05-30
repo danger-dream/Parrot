@@ -31,6 +31,7 @@ from . import (
 )
 from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
+from .transform import cc_mimicry
 from .openai.transform import common as openai_common
 from .openai.transform import codex_oauth_transform
 from .proxy.connector import DirectConnector, SOCKS5Connector, SS2022Connector
@@ -542,6 +543,40 @@ def _should_cooldown(outcome: str) -> bool:
     return outcome not in _OUTCOMES_NO_COOLDOWN
 
 
+def _is_sonnet_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
+    """Sonnet 1M entitlement 不足：不是渠道故障，去掉 context-1m 同渠道重试一次。
+
+    Anthropic 对缺少 usage credits / group credit 的 Sonnet long-context 请求会返回
+    `429 Usage credits are required for long context requests.`。这类错误如果按普通
+    http_error 记 scorer/cooldown，会很快把健康渠道打坏；正确处理是仅对 Sonnet +
+    本次确实启用了 context-1m 的请求，关闭 1M 后同渠道重试一次。
+    """
+    if result.http_status != 429:
+        return False
+    if result.outcome not in ("http_error", "upstream_error_json"):
+        return False
+    if "usage credits are required for long context requests" not in (result.error_detail or "").lower():
+        return False
+    model = str(resolved_model or "").lower()
+    if not model.startswith(("claude-sonnet-4-5", "claude-sonnet-4-6")):
+        return False
+    # 只处理本次明确带/要求 1M 的请求，避免误吞普通 429。
+    if body.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY) is True:
+        return True
+    return cc_mimicry.request_wants_context_1m(
+        body,
+        downstream_betas=body.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY),
+        original_model=body.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY),
+        resolved_model=resolved_model,
+    )
+
+
+def _retry_body_without_context_1m(body: dict) -> dict:
+    retry_body = dict(body)
+    retry_body[cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY] = False
+    return retry_body
+
+
 def _proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
     """Build proxy routing context for a channel/model attempt.
 
@@ -672,6 +707,7 @@ async def run_failover(
 
     retry_count = 0
     refreshed_once: set[str] = set()
+    retried_without_context_1m: set[tuple[str, str]] = set()
     last_result: Optional[AttemptResult] = None
     # 跟踪真实最后尝试的渠道（不同于"候选列表最后一条"，因为 OAuth 重刷会重试同 ch）
     last_ch_key: Optional[str] = None
@@ -810,6 +846,19 @@ async def run_failover(
                 except Exception:
                     pass
                 # fallthrough 到普通失败处理
+
+        # Sonnet 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m 重试一次，
+        # 避免显式 1M 下游持续请求时把健康渠道打进 cooldown/禁用。
+        context_retry_key = (ch.key, resolved_model)
+        if (
+            _is_sonnet_context_1m_credit_error(result, resolved_model, body)
+            and context_retry_key not in retried_without_context_1m
+        ):
+            retried_without_context_1m.add(context_retry_key)
+            body = _retry_body_without_context_1m(body)
+            print(f"[failover] Sonnet context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
+            retry_count += 1
+            continue
 
         # 普通失败处理
         if _should_cooldown(result.outcome):

@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import os
 import json
 import time
 import uuid
@@ -34,7 +35,15 @@ from src.channel import registry
 from src.client_ip import get_client_ip
 from datetime import datetime, timezone
 from src.telegram import bot as tgbot
-from src.transform.cc_mimicry import DEVICE_ID
+from src.transform.cc_mimicry import (
+    DEVICE_ID,
+    PARROT_DOWNSTREAM_BETAS_KEY,
+    PARROT_ORIGINAL_MODEL_KEY,
+    PARROT_WANTS_CONTEXT_1M_KEY,
+    parse_beta_header,
+    request_wants_context_1m,
+    strip_context_1m_model_marker,
+)
 
 
 # ─── 全局告警节流（避免刷屏）────────────────────────────────────
@@ -224,8 +233,11 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
     _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
     _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
-    _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
-    _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
+    # ⛔ 双实例重构期：关掉后台主动刷新（每 60s 自动刷将过期 token，最危险）
+    # 和 quota_monitor（周期拉 usage，对共享账号的多余访问）。PARROT_NO_REFRESH=1 时跳过。
+    if os.environ.get("PARROT_NO_REFRESH") != "1":
+        _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
+        _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
@@ -481,14 +493,37 @@ async def proxy_messages(request: Request):
             400, errors.ErrType.INVALID_REQUEST, f"invalid json: {e}"
         )
 
-    # 2.1 模型映射 / 入口默认模型：
+    # 2.1 保存下游显式能力信号，再做模型映射 / 入口默认模型：
+    #     - anthropic-beta 可显式请求 context-1m；
+    #     - 原始模型名可能是 `sonnet[1m]` / `*-1m` / `*-context-1m` 这类 1M 别名；
+    #     - `max_tokens` 是输出上限，不参与 1M context 判断。
+    downstream_betas = parse_beta_header(request.headers.get("anthropic-beta"))
+    original_model = body.get("model")
+
+    # 模型映射 / 入口默认模型：
     #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
     #     - body.model 命中别名 → 改写成真实名（只解一层）
-    #     后续白名单/调度/channel 全按真实名走。
+    #     - body.model 带 [1m]/-1m/context-1m → 剥 marker 后再给映射表二次机会
+    #     后续白名单/调度/channel 全按真实名走；显式 1M 意图由私有字段单独传递。
     model_mapping.apply_default(body, "anthropic")
     model_mapping.apply_mapping(body, "anthropic")
+    stripped_model = strip_context_1m_model_marker(body.get("model"))
+    if stripped_model != body.get("model"):
+        body["model"] = stripped_model
+        model_mapping.apply_mapping(body, "anthropic")
 
     model = body.get("model")
+    explicit_context_1m = request_wants_context_1m(
+        body,
+        downstream_betas=downstream_betas,
+        original_model=original_model,
+        resolved_model=model,
+    )
+    body[PARROT_DOWNSTREAM_BETAS_KEY] = downstream_betas
+    if isinstance(original_model, str) and original_model.strip():
+        body[PARROT_ORIGINAL_MODEL_KEY] = original_model.strip()
+    # True = 下游显式要求 1M；None = 交给 Parrot 默认策略（目前仅 Opus 4.x 默认开启）。
+    body[PARROT_WANTS_CONTEXT_1M_KEY] = explicit_context_1m or None
     if not model:
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, "model is required"
@@ -515,7 +550,8 @@ async def proxy_messages(request: Request):
         log_db.insert_pending,
         request_id, client_ip, key_name, model, is_stream,
         len(messages), len(tools),
-        req_headers, body,
+        req_headers,
+        {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_parrot_"))},
         fingerprint=fp_query,
         ingress_protocol="anthropic",
     )

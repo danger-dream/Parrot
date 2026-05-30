@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Optional
 
 from ..transform import cc_mimicry, standard
@@ -113,7 +114,10 @@ class ApiChannel(Channel):
 
         dynamic_map: Optional[dict] = None
         if self.cc_mimicry:
-            payload, dynamic_map = cc_mimicry.transform_request(body_with_model, email="")
+            # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
+            sid = str(uuid.uuid4())
+            payload, dynamic_map = cc_mimicry.transform_request(
+                body_with_model, email="", session_id=sid)
             if self.omit_temperature:
                 payload.pop("temperature", None)
             if self.omit_thinking:
@@ -128,15 +132,20 @@ class ApiChannel(Channel):
                     else:
                         payload.pop("context_management", None)
             signed = cc_mimicry.sign_body(payload)
+            # omit_thinking 时过滤 thinking 类 beta；build_upstream_headers 内部还会
+            # 再剔除 oauth-2025-04-20（messages 不带）。§7.5：复用统一 header 构造，
+            # 补齐 Stainless 整层 + x-app + session-id，避免两处手拼漂移。
+            # 第三方 API 渠道沿用 Bearer 鉴权（auth_scheme=bearer），不改成 x-api-key。
             betas = [b for b in cc_mimicry.BETAS
                      if not self.omit_thinking or "thinking" not in b]
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-                "anthropic-version": "2023-06-01",
-                "anthropic-beta": ",".join(betas),
-                "User-Agent": cc_mimicry.CLI_USER_AGENT,
-            }
+            downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
+            original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
+            wants_context_1m = body_with_model.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
+            headers = cc_mimicry.build_upstream_headers(
+                self.api_key, session_id=sid, betas=betas,
+                auth_scheme="bearer", model=resolved_model, payload=payload,
+                downstream_betas=downstream_betas, original_model=original_model,
+                wants_context_1m=wants_context_1m)
         else:
             payload = standard.standard_transform(body_with_model)
             if self.omit_temperature:

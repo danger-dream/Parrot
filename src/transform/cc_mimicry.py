@@ -31,21 +31,36 @@ from .. import config as _ap_config
 # 所以 BASE_DIR = cc_mimicry.py 所在目录向上两级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CC_VERSION = "2.1.92"
+CC_VERSION = "2.1.156"
 FINGERPRINT_SALT = "59cf53e54c78"
-CC_ENTRYPOINT = "cli"
+CC_ENTRYPOINT = "sdk-cli"
 USER_TYPE = "external"
 
 BETAS = [
     "claude-code-20250219",
-    "oauth-2025-04-20",
+    "context-1m-2025-08-07",               # 长上下文能力位：显式请求 1M 且模型支持时才进 messages
     "interleaved-thinking-2025-05-14",
+    "context-management-2025-06-27",       # 仅最终 payload 含 context_management 时带
     "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",  # 模型白名单门控
     "effort-2025-11-24",
-    "redact-thinking-2026-02-12",
-    "context-management-2025-06-27",
-    "extended-cache-ttl-2025-04-11",
+    "extended-cache-ttl-2025-04-11",       # 与 ttl:"1h" 同生共死
+    "oauth-2025-04-20",                    # OAuth 鉴权层；messages 头拼装时过滤掉（§6/§7）
 ]
+
+CONTEXT_1M_BETA = "context-1m-2025-08-07"
+MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07"
+CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
+OAUTH_BETA = "oauth-2025-04-20"
+
+# server.py 会把下游 HTTP 头里的 beta / 原始模型名折进 body 的私有字段，
+# 这样调度 / failover / Channel 抽象不用整体改签名；transform_request 不会透传这些字段。
+PARROT_DOWNSTREAM_BETAS_KEY = "_parrot_downstream_betas"
+PARROT_ORIGINAL_MODEL_KEY = "_parrot_original_model"
+PARROT_WANTS_CONTEXT_1M_KEY = "_parrot_wants_context_1m"
+
+ONE_M_CONTEXT_TOKENS = 1_000_000
 
 CLI_USER_AGENT = f"claude-cli/{CC_VERSION} ({USER_TYPE}, {CC_ENTRYPOINT})"
 
@@ -99,20 +114,22 @@ def load_config():
 # ─── Fingerprint ───（与 cc-proxy 一字不改）
 
 def compute_fingerprint(messages):
-    first_text = ""
+    # v2.1.156：输入源为「第一个 user message 的最后一个 text content block」
+    # （即实际用户 prompt，跳过前面的 system-reminder block），索引 [4,7,18]。
+    # salt/sha256 不变。6 组 canonical body 离线复核 6/6 命中。
+    prompt_text = ""
     for msg in messages:
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, str):
-                first_text = content
+                prompt_text = content
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        first_text = block.get("text", "")
-                        break
+                        prompt_text = block.get("text", "")   # 取最后一个 text block（不 break）
             break
-    indices = [4, 7, 20]
-    chars = "".join(first_text[i] if i < len(first_text) else "0" for i in indices)
+    indices = [4, 7, 18]
+    chars = "".join(prompt_text[i] if i < len(prompt_text) else "0" for i in indices)
     return hashlib.sha256(f"{FINGERPRINT_SALT}{chars}{CC_VERSION}".encode()).hexdigest()[:3]
 
 
@@ -253,11 +270,59 @@ def add_cache_breakpoints(messages):
     return messages
 
 
+_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
+_THINKING_REMOVED_TEXT = "[Thinking removed]"
+
+
+def _strip_assistant_thinking_blocks(messages):
+    """移除历史 assistant content 中的 thinking / redacted_thinking block。
+
+    Anthropic 会校验历史 thinking block 的签名、位置与是否可回放。很多下游
+    客户端会把上一轮完整 assistant response 原样塞回下一轮，导致
+    `messages.N.content.M: thinking or redacted_thinking ... invalid_blocks`。
+    Claude Code 遇到签名类 400 也会 strip signed thinking blocks 后重试。
+
+    这里在出站前做确定性清洗：只清理历史 assistant content block，不影响顶层
+    request `thinking` 参数；若 assistant 被清到空内容，则补一个文本占位，避免
+    空 assistant message 继续触发 invalid_blocks。函数不原地修改入参。
+    """
+    result = []
+    for msg in messages or []:
+        if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
+            result.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+        new_content = []
+        changed = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in _THINKING_BLOCK_TYPES:
+                changed = True
+                continue
+            new_content.append(block)
+        if not changed:
+            result.append(msg)
+            continue
+        if not new_content:
+            new_content = [{"type": "text", "text": _THINKING_REMOVED_TEXT}]
+        new_msg = dict(msg)
+        new_msg["content"] = new_content
+        result.append(new_msg)
+    return result
+
+
 # ─── Metadata ───（仅签名参数化 email；函数体与 cc-proxy 一致）
 
-def build_metadata(email=""):
+def build_metadata(email="", session_id=None):
     account_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, email)) if email else ""
-    return {"user_id": json.dumps({"device_id": DEVICE_ID, "account_uuid": account_uuid}, separators=(",", ":"))}
+    sid = session_id or str(uuid.uuid4())
+    # §8：真实 body metadata.user_id 内含 session_id，且与 header
+    # X-Claude-Code-Session-Id 同值（complete-audit §5.2）。
+    return {"user_id": json.dumps(
+        {"device_id": DEVICE_ID, "account_uuid": account_uuid, "session_id": sid},
+        separators=(",", ":"))}
 
 
 # ─── 工具名重写 ───（与 cc-proxy 一字不改）
@@ -448,30 +513,15 @@ def apply_opus_adaptive_thinking(payload, model):
 
 # ─── 请求转换 ───（仅签名参数化 email；函数体与 cc-proxy 一致）
 
-def transform_request(body, email=""):
+def transform_request(body, email="", session_id=None):
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
+    messages = _strip_assistant_thinking_blocks(messages)
     messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(messages)
     system_blocks = build_system_blocks(messages)
     model = body.get("model", "claude-sonnet-4-20250514")
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "system": system_blocks,
-        "max_tokens": body.get("max_tokens", 128000),
-        "stream": body.get("stream", False),
-        "metadata": build_metadata(email),
-        "temperature": 1,
-    }
-
-    if "temperature" in body:
-        payload["temperature"] = body["temperature"]
-
-    if "thinking" in body:
-        payload["thinking"] = body["thinking"]
 
     # 动态工具名映射（tools > 5 时触发）
     dynamic_tool_map = None
@@ -481,6 +531,18 @@ def transform_request(body, email=""):
         if dynamic_tool_map:
             print(f"  [tool] dynamic mapping {len(dynamic_tool_map)} tools")
 
+    # §15.1：严格按 CC v2.1.156 wire order 构造 payload（sign_body 按插入序序列化，
+    # 构造顺序 = wire order）：model, messages, system, tools, metadata,
+    # max_tokens, thinking, context_management, output_config, stream。
+    # §15.2 B2：cc_mimicry 链路不注入 temperature/top_p/top_k（CC body 无此字段）。
+    # §15.2 B3：max_tokens 缺省 64000（CC 默认）。§8 B5：metadata.session_id 与
+    # header X-Claude-Code-Session-Id 同源。
+    payload = {
+        "model": model,
+        "messages": messages,
+        "system": system_blocks,
+    }
+
     if body.get("tools"):
         tools = _strip_tool_cache_control([dict(t) for t in body["tools"]])
         for t in tools:
@@ -489,12 +551,20 @@ def transform_request(body, email=""):
         tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         payload["tools"] = tools
 
+    # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
+    # 否则会吞掉下游强制/禁用工具的意图。抓包未含此字段是会话未用到，非协议禁止。
     if "tool_choice" in body:
         tc = body["tool_choice"]
         if isinstance(tc, dict) and "name" in tc:
             tc = dict(tc)
             tc["name"] = _sanitize_tool_name(tc["name"], dynamic_tool_map)
         payload["tool_choice"] = tc
+
+    payload["metadata"] = build_metadata(email, session_id=session_id)
+    payload["max_tokens"] = body.get("max_tokens", 64000)
+
+    if "thinking" in body:
+        payload["thinking"] = body["thinking"]
 
     if "context_management" in body:
         payload["context_management"] = body["context_management"]
@@ -507,6 +577,10 @@ def transform_request(body, email=""):
     if "output_config" in body:
         payload["output_config"] = body["output_config"]
 
+    payload["stream"] = body.get("stream", False)
+
+    # apply_opus_adaptive_thinking 会改 thinking 并可能补 output_config，
+    # 必须在 output_config 写入之后调用（§15.2）。
     apply_opus_adaptive_thinking(payload, model)
 
     return payload, dynamic_tool_map
@@ -514,7 +588,7 @@ def transform_request(body, email=""):
 
 # ─── CCH 签名 ───（与 cc-proxy 一字不改）
 
-CCH_SEED = 0x6E52736AC806831E
+CCH_SEED = 0x4D659218E32A3268
 CCH_PLACEHOLDER = b"cch=00000"
 
 
@@ -530,15 +604,273 @@ def sign_body(payload_dict):
     return body_bytes.replace(CCH_PLACEHOLDER, f"cch={cch}".encode("ascii"), 1)
 
 
-# ─── 上游 headers（OAuth 版本）───（与 cc-proxy 一字不改）
+# ─── 上游 headers（OAuth 版本）───（§7.1 据 v2.1.156 源码真相重写）
 
-def build_upstream_headers(access_token):
-    return {
+# Stainless SDK 层固定值（@anthropic-ai/sdk 0.94.0 getPlatformProperties 输出，
+# 抓包 67/67 印证）。OS/Arch/Runtime-Version 取 Parrot 实际运行环境（Linux/x64/node）。
+_STAINLESS_HEADERS = {
+    "X-Stainless-Lang": "js",
+    "X-Stainless-Package-Version": "0.94.0",
+    "X-Stainless-OS": "Linux",
+    "X-Stainless-Arch": "x64",
+    "X-Stainless-Runtime": "node",
+    "X-Stainless-Runtime-Version": "v24.3.0",
+    "X-Stainless-Retry-Count": "0",
+    "X-Stainless-Timeout": "600",
+}
+
+
+_CONTEXT_1M_MODEL_MARKER_RE = re.compile(
+    # Claude Code 官方模型选择器使用 `sonnet[1m]` / `opus[1m]`，并在出站前
+    # 把 bracket marker 从 body.model 剥掉；`-1m` / `context-1m` 是 Parrot 兼容扩展。
+    r"\[(?:1|2)m\]|"
+    r"(^|[-_./:\s])(?:1m|1000k|1000000)(?:$|[-_./:\s])|"
+    r"1m[-_\s]?context|context[-_\s]?1m",
+    re.I,
+)
+
+_CONTEXT_1M_MODEL_SUFFIX_RE = re.compile(
+    r"(?:\[(?:1|2)m\]|[-_./:\s]context[-_\s]?1m|[-_./:\s]1m[-_\s]?context|[-_./:\s]1m)$",
+    re.I,
+)
+
+_CONTEXT_WINDOW_FIELDS = (
+    "max_context", "max_context_tokens", "maxContext", "maxContextTokens",
+    "context_window", "context_window_tokens", "contextWindow", "contextWindowTokens",
+    "max_context_window", "max_context_window_tokens",
+    "model_context_window", "model_context_window_tokens",
+    "context_length", "context_length_tokens", "max_input_tokens", "maxInputTokens",
+)
+
+_CONTEXT_1M_FLAG_FIELDS = (
+    "context_1m", "use_1m_context", "use1mContext", "long_context", "longContext",
+    "enable_long_context", "enableLongContext",
+)
+
+
+def parse_beta_header(value) -> list[str]:
+    """把下游 anthropic-beta / betas 表达解析为 beta 字符串列表。"""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw_items = []
+        for item in value:
+            raw_items.extend(parse_beta_header(item))
+        return raw_items
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def _has_beta(beta_list, beta: str) -> bool:
+    return beta in set(parse_beta_header(beta_list))
+
+
+def _value_requests_1m_context(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value >= ONE_M_CONTEXT_TOKENS
+    text = str(value or "").strip().lower().replace(",", "")
+    if not text:
+        return False
+    if text.isdigit():
+        try:
+            return int(text) >= ONE_M_CONTEXT_TOKENS
+        except Exception:
+            return False
+    return bool(_CONTEXT_1M_MODEL_MARKER_RE.search(text))
+
+
+def _model_name_requests_context_1m(model) -> bool:
+    return bool(_CONTEXT_1M_MODEL_MARKER_RE.search(str(model or "")))
+
+
+def strip_context_1m_model_marker(model):
+    """把显式 1M 模型别名还原成真实上游 model。
+
+    例：`claude-sonnet-4-6[1m]` / `claude-sonnet-4-6-1m` / `...-context-1m`
+    都在 Parrot 内部归一成 `claude-sonnet-4-6`，显式 1M 意图由
+    `request_wants_context_1m()` 单独记录，不把 marker 透传给调度/上游。
+    """
+    if not isinstance(model, str):
+        return model
+    raw = model.strip()
+    if not raw:
+        return model
+    stripped = _CONTEXT_1M_MODEL_SUFFIX_RE.sub("", raw).strip()
+    return stripped or raw
+
+
+def _iter_context_window_values(body: dict):
+    if not isinstance(body, dict):
+        return
+    for key in _CONTEXT_WINDOW_FIELDS:
+        if key in body:
+            yield body[key]
+    for nested_key in ("extra_body", "extraBody", "metadata"):
+        nested = body.get(nested_key)
+        if isinstance(nested, dict):
+            for key in _CONTEXT_WINDOW_FIELDS:
+                if key in nested:
+                    yield nested[key]
+
+
+def request_wants_context_1m(body=None, *, downstream_betas=None,
+                             original_model=None, resolved_model=None) -> bool:
+    """下游是否显式要求 1M context。
+
+    只把明确意图当成 true：
+      - anthropic-beta / body.betas 含 context-1m；
+      - 原始模型名/别名含 1m/context-1m 标记；
+      - 下游显式传 context window/max context 约 1,000,000；
+      - Parrot 扩展布尔开关 long_context / enableLongContext 等。
+    注意：`max_tokens` 是输出上限，不是上下文窗口，故不参与判断。
+    """
+    if _has_beta(downstream_betas, CONTEXT_1M_BETA):
+        return True
+
+    if isinstance(body, dict):
+        for key in ("betas", "anthropic_beta", "anthropic-beta", "anthropic_betas"):
+            if _has_beta(body.get(key), CONTEXT_1M_BETA):
+                return True
+        for key in _CONTEXT_1M_FLAG_FIELDS:
+            if key in body and _value_requests_1m_context(body[key]):
+                return True
+        for value in _iter_context_window_values(body) or []:
+            if _value_requests_1m_context(value):
+                return True
+
+    for candidate in (original_model, resolved_model, body.get("model") if isinstance(body, dict) else None):
+        if _model_name_requests_context_1m(candidate):
+            return True
+    return False
+
+
+def should_default_context_1m(model) -> bool:
+    """Parrot 默认策略：Opus 4.x 默认 1M；Sonnet 4.x 只在显式 1M 时开启。"""
+    return _is_opus_4_plus_model(model)
+
+
+def _is_opus_4_plus_model(model) -> bool:
+    m = str(model or "").lower()
+    return bool(re.match(r"^claude-opus-(?:[4-9]|[1-9]\d)(?:[-.]|$)", m))
+
+
+def model_supports_context_1m(model) -> bool:
+    """CC 1M context 能力口径：Opus 4+ 默认可开；Sonnet 4.5/4.6 仅显式可开。"""
+    m = str(model or "").lower()
+    if _is_opus_4_plus_model(m):
+        return True
+    return m.startswith(("claude-sonnet-4-5", "claude-sonnet-4-6"))
+
+
+def model_supports_mid_conversation_system(model) -> bool:
+    """CC v2.1.156 mid_conversation_system 模型白名单口径。"""
+    m = str(model or "").lower()
+    if m.startswith("claude-3-"):
+        return True
+    return m.startswith((
+        "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5",
+        "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
+        "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ))
+
+
+def _payload_has_ttl_1h(obj) -> bool:
+    if isinstance(obj, dict):
+        cc = obj.get("cache_control")
+        if isinstance(cc, dict) and str(cc.get("ttl", "")).lower() == "1h":
+            return True
+        return any(_payload_has_ttl_1h(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_payload_has_ttl_1h(v) for v in obj)
+    return False
+
+
+def _payload_has_context_management(payload) -> bool:
+    return isinstance(payload, dict) and "context_management" in payload and payload.get("context_management") is not None
+
+
+def _messages_betas_for_request(model=None, betas=None, *, payload=None,
+                                downstream_betas=None, original_model=None,
+                                wants_context_1m=None):
+    """返回 /v1/messages anthropic-beta 列表。
+
+    规则不再是固定全量 join，而是按最终 payload / 模型 / 下游显式能力请求生成：
+      - oauth-2025-04-20 属 token 端点，messages 永远不带；
+      - context-1m：Opus 4.x 默认开启；Sonnet 4.5/4.6 仅在下游显式 1M 信号时开启；
+        需要强制关闭时可传 wants_context_1m=False；
+      - mid-conversation-system 按 CC 模型白名单带；
+      - context-management 仅最终 payload 含 context_management 时带；
+      - extended-cache-ttl 仅最终 payload 含 ttl:"1h" 时带。
+    """
+    beta_list = BETAS if betas is None else betas
+    if wants_context_1m is None:
+        wants_context_1m = request_wants_context_1m(
+            payload if isinstance(payload, dict) else None,
+            downstream_betas=downstream_betas,
+            original_model=original_model,
+            resolved_model=model,
+        ) or should_default_context_1m(model)
+    allow_context_1m = bool(wants_context_1m) and model_supports_context_1m(model)
+    allow_mid_conversation = model_supports_mid_conversation_system(model)
+    allow_context_management = True if payload is None else _payload_has_context_management(payload)
+    allow_extended_cache_ttl = True if payload is None else _payload_has_ttl_1h(payload)
+
+    out = []
+    for b in beta_list:
+        if b == OAUTH_BETA:
+            continue
+        if b == CONTEXT_1M_BETA and not allow_context_1m:
+            continue
+        if b == MID_CONVERSATION_SYSTEM_BETA and not allow_mid_conversation:
+            continue
+        if b == CONTEXT_MANAGEMENT_BETA and not allow_context_management:
+            continue
+        if b == EXTENDED_CACHE_TTL_BETA and not allow_extended_cache_ttl:
+            continue
+        out.append(b)
+    return out
+
+
+def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_scheme="bearer",
+                           model=None, payload=None, downstream_betas=None,
+                           original_model=None, wants_context_1m=None):
+    """构造 messages 出站 header，对齐 CC v2.1.156 抓包恒定头集合（§7.1）。
+
+    - session_id: 与 body.metadata.user_id.session_id 同值（§7.4/§8），调用方传入。
+    - betas: 允许调用方传入过滤后的 beta 列表（如 api_channel omit_thinking）；
+      缺省用模块 BETAS。无论如何都会剔除 oauth-2025-04-20（那是 token 端点的 beta）。
+    - payload/model/downstream_betas/original_model/wants_context_1m: 用于按最终 body + 模型
+      能力 + 下游显式 1M 信号生成 messages beta，避免无条件硬塞能力位。
+    - auth_scheme: "bearer"(OAuth) 用 Authorization: Bearer；"api_key" 用 x-api-key。
+    注意：x-client-request-id 已删（源码实证 CC 从不在请求发此头，抓包 67/67 无）。
+    Accept-Encoding 只写 gzip,deflate —— 本机 venv 未装 brotli/zstandard，
+    若声明 br/zstd 上游回包会解不开（§7.3）。
+    """
+    sid = session_id or str(uuid.uuid4())
+    beta_str = ",".join(_messages_betas_for_request(
+        model=model, betas=betas, payload=payload,
+        downstream_betas=downstream_betas, original_model=original_model,
+        wants_context_1m=wants_context_1m,
+    ))
+    headers = {
+        # ── CC 应用层 ──
+        "Accept": "application/json",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {access_token}",
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": ",".join(BETAS),
+        "anthropic-beta": beta_str,
         "x-app": "cli",
         "User-Agent": CLI_USER_AGENT,
-        "x-client-request-id": str(uuid.uuid4()),
+        "X-Claude-Code-Session-Id": sid,
     }
+    if auth_scheme == "api_key":
+        headers["x-api-key"] = access_token
+    else:
+        headers["Authorization"] = f"Bearer {access_token}"
+    # ── Stainless SDK 层 ──
+    headers.update(_STAINLESS_HEADERS)
+    headers["anthropic-dangerous-direct-browser-access"] = "true"
+    # ── 传输层（venv 无 brotli/zstandard，只声明 gzip/deflate）──
+    headers["Accept-Encoding"] = "gzip, deflate"
+    return headers
