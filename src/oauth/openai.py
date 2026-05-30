@@ -57,6 +57,11 @@ _TOKEN_HTTP_TIMEOUT = 120.0
 ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 _ACCOUNTS_CHECK_TIMEOUT = 15.0
 
+# ChatGPT/Codex 私有用量端点。它不是 OpenAI public API；只用于主动 quota
+# 刷新/后台 monitor。业务请求返回的 x-codex-* 响应头仍由 failover 实时采样。
+WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+_WHAM_USAGE_TIMEOUT = 30.0
+
 
 # ─── mock 开关（与 oauth_manager.mock_mode_enabled 同语义） ────────
 
@@ -537,6 +542,189 @@ async def refresh(refresh_token: str, *, email: str | None = None,
         refresh_sync, refresh_token,
         email=email, workspace_id=workspace_id, org_id=org_id,
     )
+
+
+# ─── ChatGPT/Codex quota: wham/usage ─────────────────────────────
+
+def _coerce_float(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(v: Any) -> int | None:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso_from_epoch_or_after(*, reset_at: Any = None,
+                             reset_after_seconds: Any = None) -> str | None:
+    ts = _coerce_int(reset_at)
+    if ts is None or ts <= 0:
+        after = _coerce_int(reset_after_seconds)
+        if after is None:
+            return None
+        ts = int(time.time()) + max(0, after)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _wham_window_block(win: dict | None) -> dict:
+    if not isinstance(win, dict):
+        return {}
+    util = _coerce_float(win.get("used_percent"))
+    if util is None:
+        return {}
+    return {
+        "utilization": util,
+        "resets_at": _iso_from_epoch_or_after(
+            reset_at=win.get("reset_at"),
+            reset_after_seconds=win.get("reset_after_seconds"),
+        ),
+        "limit_window_seconds": _coerce_int(win.get("limit_window_seconds")),
+    }
+
+
+def normalize_wham_usage(payload: dict) -> dict:
+    """把 ChatGPT `backend-api/wham/usage` 响应规范成通用 usage 结构。
+
+    wham 返回 primary_window / secondary_window；真实观测 primary=5h、
+    secondary=7d，但这里仍优先按 limit_window_seconds 做小窗/大窗映射，
+    避免把字段名硬编码成业务语义。
+    """
+    rate = payload.get("rate_limit") if isinstance(payload, dict) else None
+    if not isinstance(rate, dict):
+        rate = {}
+
+    windows: list[tuple[str, int | None, dict]] = []
+    for name in ("primary_window", "secondary_window"):
+        raw = rate.get(name)
+        block = _wham_window_block(raw)
+        if not block:
+            continue
+        windows.append((name, block.get("limit_window_seconds"), block))
+
+    five_hour: dict = {}
+    seven_day: dict = {}
+    if len(windows) >= 2:
+        # 有窗口长度时，小窗口归 5h，大窗口归 7d。缺长度的排到后面；
+        # 两个都缺时按 wham 当前语义 fallback：primary=5h、secondary=7d。
+        if any(sec is not None for _, sec, _ in windows):
+            ordered = sorted(windows, key=lambda item: item[1] if item[1] is not None else 10**18)
+        else:
+            ordered = windows
+        five_hour = dict(ordered[0][2])
+        seven_day = dict(ordered[-1][2])
+    elif len(windows) == 1:
+        name, sec, block = windows[0]
+        # 单窗口时仍尽量按窗口长度判断；缺长度则按字段名做保守 fallback。
+        if sec is not None:
+            if sec <= 6 * 3600:
+                five_hour = dict(block)
+            else:
+                seven_day = dict(block)
+        elif name == "primary_window":
+            five_hour = dict(block)
+        else:
+            seven_day = dict(block)
+
+    # 内部辅助字段不写进通用展示路径。
+    for block in (five_hour, seven_day):
+        block.pop("limit_window_seconds", None)
+
+    credits = payload.get("credits") if isinstance(payload, dict) else None
+    if not isinstance(credits, dict):
+        credits = {}
+    credit_balance = _coerce_float(credits.get("balance"))
+    extra_enabled = bool(
+        credits.get("has_credits")
+        or credits.get("unlimited")
+        or credit_balance is not None
+    )
+
+    return {
+        "five_hour": five_hour,
+        "seven_day": seven_day,
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {
+            "is_enabled": extra_enabled,
+            "used_credits": 0,
+            "monthly_limit": 0,
+            "utilization": 0,
+            "balance": credit_balance,
+            "unlimited": bool(credits.get("unlimited")),
+            "overage_limit_reached": bool(credits.get("overage_limit_reached")),
+        },
+        "openai": {
+            "source": "wham_usage",
+            "plan_type": payload.get("plan_type") if isinstance(payload, dict) else None,
+            "allowed": rate.get("allowed"),
+            "limit_reached": rate.get("limit_reached"),
+            "rate_limit_reached_type": payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None,
+        },
+    }
+
+
+def _mock_wham_payload() -> dict:
+    now = int(time.time())
+    return {
+        "user_id": "mock-user",
+        "account_id": "mock-acct",
+        "email": "mock-openai@local",
+        "plan_type": "plus",
+        "rate_limit": {
+            "allowed": True,
+            "limit_reached": False,
+            "primary_window": {
+                "used_percent": 1,
+                "limit_window_seconds": 18000,
+                "reset_after_seconds": 3600,
+                "reset_at": now + 3600,
+            },
+            "secondary_window": {
+                "used_percent": 3,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 604800,
+                "reset_at": now + 604800,
+            },
+        },
+        "credits": {"has_credits": False, "unlimited": False},
+    }
+
+
+def fetch_wham_usage_sync(access_token: str) -> dict:
+    """主动拉 ChatGPT/Codex quota。
+
+    失败会抛异常；调用方必须把失败视为“额度未知”，不能用旧/空数据恢复
+    quota disabled 账号。响应头实时 quota 仍由 failover/openai 子模块采样。
+    """
+    if _mock_mode_enabled():
+        return normalize_wham_usage(_mock_wham_payload())
+    resp = network.get_sync(
+        WHAM_USAGE_URL,
+        headers={
+            "authorization": f"Bearer {access_token}",
+            "accept": "application/json",
+            "user-agent": USER_AGENT,
+            "origin": "https://chatgpt.com",
+            "referer": "https://chatgpt.com/codex/settings/usage",
+        },
+        timeout=_WHAM_USAGE_TIMEOUT,
+        proxy_purpose="oauth_openai",
+    )
+    resp.raise_for_status()
+    return normalize_wham_usage(resp.json())
+
+
+async def fetch_wham_usage(access_token: str) -> dict:
+    return await asyncio.to_thread(fetch_wham_usage_sync, access_token)
 
 
 # ─── id_token 解码 ───────────────────────────────────────────────

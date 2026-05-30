@@ -3,10 +3,9 @@
 覆盖：
   A. fetch_usage 按 provider 分派：
      - Claude 走 /api/oauth/usage（_usage_sync）
-     - OpenAI 走 OpenAIOAuthChannel.probe_usage
-     - OpenAI 响应头最近 5 分钟有被动采样 → fetch_usage 跳过 probe 零成本返回
-     - OpenAI probe 节流桶（openaiProbeMinIntervalSeconds）
-     - 删除账户级联清 openai probe 桶
+     - OpenAI 主动刷新走 ChatGPT wham/usage
+     - OpenAI 响应头实时额度仍由 failover 被动采样保存
+     - 删除账户级联清历史 openai probe 桶
   B. quota_monitor_once 对 OpenAI 账号不再 skip，走统一路径
   C. 响应头超限自动禁用：
      - Anthropic surpassed-threshold=true → set_disabled_by_quota
@@ -108,65 +107,45 @@ def test_fetch_usage_claude_goes_to_api(m):
     print("  [PASS] fetch_usage(claude): calls _usage_sync, returns API structure")
 
 
-def test_fetch_usage_openai_goes_to_probe(m):
-    """OpenAI 账号 fetch_usage → 调 channel.probe_usage，内部合成 snapshot。"""
+def test_fetch_usage_openai_goes_to_wham(m):
+    """OpenAI 账号主动 fetch_usage → ChatGPT wham/usage，不发 Codex probe。"""
     _setup(m)
     _add_openai(m, "oa@o.io")
     m["registry"].rebuild_from_config()
     usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:oa@o.io:acct-123"))
-    # mockMode probe 合成 primary=3% / secondary=1% → 7d=3 / 5h=1
     assert usage["five_hour"]["utilization"] == 1.0
     assert usage["seven_day"]["utilization"] == 3.0
-    # probe 标记被设置
-    assert "openai:oa@o.io:acct-123" in m["oauth_manager"]._OPENAI_PROBE_LAST
-    print("  [PASS] fetch_usage(openai): calls probe_usage, returns synthesized structure")
+    assert usage.get("openai", {}).get("source") == "wham_usage"
+    assert "openai:oa@o.io:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
+    print("  [PASS] fetch_usage(openai): calls wham/usage, returns normalized structure")
 
 
-def test_fetch_usage_openai_skips_when_passive_fresh(m):
-    """OpenAI：如果响应头被动采样 last_passive_update_at 在 5 分钟内 → 跳过 probe。"""
+def test_fetch_usage_openai_ignores_passive_fresh_for_active_refresh(m):
+    """OpenAI 主动 fetch_usage 即使有新鲜响应头缓存，也应拉 wham 作为主动额度源。"""
     _setup(m)
     _add_openai(m, "fresh@o.io")
     m["registry"].rebuild_from_config()
-
-    # 模拟"刚被响应头采样过" → 写一行并把 last_passive_update_at 设成现在
     m["state_db"].quota_patch_passive("openai:fresh@o.io:acct-123", {
         "five_hour_util": 10.0, "seven_day_util": 20.0,
     }, email="fresh@o.io")
 
-    # 这时 fetch_usage 不应触发 probe（_OPENAI_PROBE_LAST 空 → 但 last_passive < 5min）
     usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:fresh@o.io:acct-123"))
-    # 应返回被动采样合成结果，而不是 probe 的 1/3
-    assert usage["five_hour"]["utilization"] == 10.0, usage
-    assert usage["seven_day"]["utilization"] == 20.0, usage
-    # probe 标记未被设置（证明没真正 probe）
+    assert usage["five_hour"]["utilization"] == 1.0, usage
+    assert usage["seven_day"]["utilization"] == 3.0, usage
     assert "openai:fresh@o.io:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
-    print("  [PASS] fetch_usage(openai): skips probe when passive sample is fresh (<5min)")
+    print("  [PASS] fetch_usage(openai): active refresh uses wham even with passive cache")
 
 
-def test_fetch_usage_openai_throttle_between_probes(m):
-    """OpenAI probe 节流：同账号二次 fetch_usage 在最小间隔内应跳过 probe。"""
+def test_fetch_usage_openai_no_probe_throttle(m):
+    """OpenAI 主动 wham 刷新不受历史 probe 节流桶影响。"""
     _setup(m)
     _add_openai(m, "thr@o.io")
     m["registry"].rebuild_from_config()
-
-    # 第一次：触发 probe
-    usage1 = asyncio.run(m["oauth_manager"].fetch_usage("openai:thr@o.io:acct-123"))
-    assert usage1["five_hour"]["utilization"] == 1.0
-    probe_time_1 = m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"]
-
-    # 把 last_passive 设为很久以前，强制 passive 不新鲜；但 probe 桶新鲜 → 应跳过
-    conn = m["state_db"]._get_conn()
-    conn.execute(
-        "UPDATE oauth_quota_cache SET last_passive_update_at=? WHERE account_key=?",
-        (0, "openai:thr@o.io:acct-123"),
-    )
-    conn.commit()
-
-    usage2 = asyncio.run(m["oauth_manager"].fetch_usage("openai:thr@o.io:acct-123"))
-    # 第二次应该返回 state_db 里的旧数据（合成出来的 five_hour/seven_day），不触发新 probe
-    probe_time_2 = m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"]
-    assert probe_time_2 == probe_time_1, "probe should NOT have been triggered (throttle)"
-    print("  [PASS] fetch_usage(openai): throttle bucket blocks rapid probes")
+    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"] = time.time()
+    usage = asyncio.run(m["oauth_manager"].fetch_usage("openai:thr@o.io:acct-123"))
+    assert usage["five_hour"]["utilization"] == 1.0
+    assert usage["seven_day"]["utilization"] == 3.0
+    print("  [PASS] fetch_usage(openai): wham path ignores old probe throttle bucket")
 
 
 def test_delete_account_clears_openai_probe_bucket(m):
@@ -174,9 +153,7 @@ def test_delete_account_clears_openai_probe_bucket(m):
     _setup(m)
     _add_openai(m, "del@o.io")
     m["registry"].rebuild_from_config()
-    asyncio.run(m["oauth_manager"].fetch_usage("openai:del@o.io:acct-123"))
-    assert "openai:del@o.io:acct-123" in m["oauth_manager"]._OPENAI_PROBE_LAST
-
+    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:del@o.io:acct-123"] = time.time()
     m["oauth_manager"].delete_account("openai:del@o.io:acct-123")
     assert "openai:del@o.io:acct-123" not in m["oauth_manager"]._OPENAI_PROBE_LAST
     print("  [PASS] delete_account: openai probe bucket cleared")
@@ -192,10 +169,6 @@ def test_quota_monitor_processes_openai_accounts(m):
     _add_openai(m, "mon@o.io")
     _add_claude(m, "mon@c.io")
     m["registry"].rebuild_from_config()
-
-    # 手动把 OpenAI probe 桶预置：表示刚 probe 过，这样 fetch_usage 节流
-    # → 走 quota_load 返回空 → quota_monitor_once 视为 "ok:..."
-    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:thr@o.io:acct-123"] = time.time()
 
     outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
     # 两个账号都应被处理，不再出现 "skipped:openai_uses_headers"
@@ -461,9 +434,9 @@ def main():
     tests = [
         # A. fetch_usage 统一门面
         test_fetch_usage_claude_goes_to_api,
-        test_fetch_usage_openai_goes_to_probe,
-        test_fetch_usage_openai_skips_when_passive_fresh,
-        test_fetch_usage_openai_throttle_between_probes,
+        test_fetch_usage_openai_goes_to_wham,
+        test_fetch_usage_openai_ignores_passive_fresh_for_active_refresh,
+        test_fetch_usage_openai_no_probe_throttle,
         test_delete_account_clears_openai_probe_bucket,
         # B. quota_monitor_once 对齐
         test_quota_monitor_processes_openai_accounts,

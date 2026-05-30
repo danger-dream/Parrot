@@ -325,13 +325,12 @@ def test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled(m):
     print("  [PASS] oauth list: cached OpenAI value below dynamic threshold stays enabled")
 
 
-def test_oauth_menu_refresh_usage_openai_probe(m):
-    """OpenAI 账户点'刷新用量' → force_refresh + probe_usage（mockMode 合成 snapshot）。"""
+def test_oauth_menu_refresh_usage_openai_wham(m):
+    """OpenAI 账户点“刷新用量” → force_refresh + wham/usage，且不发 probe。"""
     _setup(m)
     _add_openai(m, "ru@openai.test")
     m["registry"].rebuild_from_config()
 
-    # 写一个旧 token / expired 便于观察更新
     def _stamp(c):
         for a in c["oauthAccounts"]:
             if a["email"] == "ru@openai.test":
@@ -339,29 +338,35 @@ def test_oauth_menu_refresh_usage_openai_probe(m):
                 a["expired"] = "2026-01-01T00:00:00Z"
                 a["last_refresh"] = "2026-01-01T00:00:00Z"
     m["config"].update(_stamp)
-    # rebuild 之后 channel 引用的是新配置
     m["registry"].rebuild_from_config()
+
+    called = {"probe": 0}
+    orig_probe = m["OpenAIOAuthChannel"].probe_usage
+    async def _counting_probe(self, *args, **kwargs):
+        called["probe"] += 1
+        return await orig_probe(self, *args, **kwargs)
 
     rec = _UiRecorder()
     m["ui"].api = rec
-    short = m["ui"].register_code("openai:ru@openai.test:acct-ru@openai.test")
-    m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
+    try:
+        m["OpenAIOAuthChannel"].probe_usage = _counting_probe
+        short = m["ui"].register_code("openai:ru@openai.test:acct-ru@openai.test")
+        m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
+    finally:
+        m["OpenAIOAuthChannel"].probe_usage = orig_probe
 
-    # Step 1 结果：force_refresh 更新了 token 三字段
     acc = m["oauth_manager"].get_account("openai:ru@openai.test:acct-ru@openai.test")
     assert acc["access_token"] != "OLD-AT"
     assert acc["expired"] != "2026-01-01T00:00:00Z"
     assert acc["last_refresh"] != "2026-01-01T00:00:00Z"
-    # Step 2 结果：probe_usage mockMode 写入 snapshot
+    assert called["probe"] == 0
     row = m["state_db"].quota_load("openai:ru@openai.test:acct-ru@openai.test")
-    assert row is not None, "probe should have written quota snapshot"
-    # mockMode 合成 primary=3% / secondary=1% → normalize 后 7d=3 / 5h=1
-    assert row["seven_day_util"] == 3.0
+    assert row is not None, "wham should have written quota cache"
     assert row["five_hour_util"] == 1.0
-    # 详情已重渲染 + 头部"已刷新 Token 并更新用量"提示
+    assert row["seven_day_util"] == 3.0
     last = rec.last("editMessageText")
-    assert last and "探测请求成功" in last["text"], last.get("text", "")[:200]
-    print("  [PASS] oauth_menu refresh_usage: openai → force_refresh + probe_usage + re-render")
+    assert last and "wham/usage" in last["text"], last.get("text", "")[:200]
+    print("  [PASS] oauth_menu refresh_usage: openai → force_refresh + wham + re-render")
 
 
 def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
@@ -370,30 +375,25 @@ def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
     _add_openai(m, "limit@openai.test")
     m["registry"].rebuild_from_config()
 
-    from src.channel.openai_oauth_channel import OpenAIOAuthChannel
-    orig_probe = OpenAIOAuthChannel.probe_usage
-
-    async def _probe_100(self, *args, **kwargs):
-        snap = m["openai_provider"].parse_rate_limit_headers({
-            "x-codex-primary-used-percent": "100",
-            "x-codex-primary-window-minutes": "10080",
-            "x-codex-primary-reset-after-seconds": "3600",
-            "x-codex-secondary-used-percent": "0",
-            "x-codex-secondary-window-minutes": "300",
-            "x-codex-secondary-reset-after-seconds": "60",
-        })
-        norm = m["openai_provider"].normalize_codex_snapshot(snap)
-        m["state_db"].quota_save_openai_snapshot(self.account_key, snap, norm, email=self.email)
-        return {"ok": True, "reason": "mock-over-quota"}
+    orig_fetch = m["openai_provider"].fetch_wham_usage_sync
+    def _usage_100(access_token: str):
+        return {
+            "five_hour": {"utilization": 0.0, "resets_at": "2026-01-01T00:01:00Z"},
+            "seven_day": {"utilization": 100.0, "resets_at": "2026-01-01T01:00:00Z"},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "extra_usage": {"is_enabled": False},
+            "openai": {"source": "wham_usage"},
+        }
 
     rec = _UiRecorder()
     m["ui"].api = rec
     try:
-        OpenAIOAuthChannel.probe_usage = _probe_100
+        m["openai_provider"].fetch_wham_usage_sync = _usage_100
         short = m["ui"].register_code("openai:limit@openai.test:acct-limit@openai.test")
         m["oauth_menu"].on_refresh_usage(42, 100, "cb", short)
     finally:
-        OpenAIOAuthChannel.probe_usage = orig_probe
+        m["openai_provider"].fetch_wham_usage_sync = orig_fetch
 
     acc = m["oauth_manager"].get_account("openai:limit@openai.test:acct-limit@openai.test")
     assert acc.get("disabled_reason") == "quota", acc
@@ -402,11 +402,11 @@ def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
     last = rec.last("editMessageText")
     assert last and "配额禁用" in last["text"]
     assert "7d" in last["text"] and "100" in last["text"]
-    print("  [PASS] oauth_menu refresh_usage(openai): over-quota auto disables")
+    print("  [PASS] oauth_menu refresh_usage(openai): wham over-quota auto disables")
 
 
-def test_oauth_menu_refresh_all_probes_openai(m):
-    """refresh_all 对 openai：force_refresh + probe_usage 成功计入 'OpenAI 探测'。"""
+def test_oauth_menu_refresh_all_uses_wham_for_openai(m):
+    """refresh_all 对 openai：force_refresh + wham/usage，不发 probe。"""
     _setup(m)
     m["oauth_manager"].add_account({
         "email": "c@claude.test", "provider": "claude",
@@ -422,26 +422,33 @@ def test_oauth_menu_refresh_all_probes_openai(m):
     m["config"].update(_stamp)
     m["registry"].rebuild_from_config()
 
+    called = {"probe": 0}
+    orig_probe = m["OpenAIOAuthChannel"].probe_usage
+    async def _counting_probe(self, *args, **kwargs):
+        called["probe"] += 1
+        return await orig_probe(self, *args, **kwargs)
+
     rec = _UiRecorder()
     m["ui"].api = rec
-    m["oauth_menu"].on_refresh_all(42, 100, "cb")
-    # 新 UI：至少 2 条 sendMessage（初始进度条 + 结束摘要兜底/降级摘要）
+    try:
+        m["OpenAIOAuthChannel"].probe_usage = _counting_probe
+        m["oauth_menu"].on_refresh_all(42, 100, "cb")
+    finally:
+        m["OpenAIOAuthChannel"].probe_usage = orig_probe
+
     sends = [d for mth, d in rec.calls if mth == "sendMessage"]
     assert sends, "expected progress messages"
     final_text = sends[-1]["text"]
-    # 兜底摘要里应包含两账户的 email 作为节标题
     assert "c@claude.test" in final_text, final_text[:500]
     assert "o@openai.test" in final_text, final_text[:500]
-    # 至少有一条"刷新成功"行
     assert "刷新成功" in final_text, final_text[:500]
-    # 完成标识
     assert "用量刷新完成" in final_text
-    # openai 账户 token 刷过；quota snapshot 也写入
+    assert called["probe"] == 0
     acc = m["oauth_manager"].get_account("openai:o@openai.test:acct-o@openai.test")
     assert acc["access_token"] != "OLD-OPENAI-AT"
     row = m["state_db"].quota_load("openai:o@openai.test:acct-o@openai.test")
     assert row is not None and row["seven_day_util"] == 3.0
-    print("  [PASS] oauth_menu refresh_all: openai force_refresh + probe both ran")
+    print("  [PASS] oauth_menu refresh_all: openai force_refresh + wham")
 
 
 def test_probe_usage_writes_snapshot_in_mock_mode(m):
@@ -479,15 +486,8 @@ def test_delete_account_clears_codex_snapshot_throttle(m):
     print("  [PASS] delete_account: forget_codex_snapshot clears throttle bucket")
 
 
-def test_on_refresh_token_openai_uses_unified_path(m):
-    """2026-04-20 统一路径后：on_refresh_token 对 openai 账号**不主动**调
-    fetch_usage（代码里明确 `if provider_of(ak) != "openai"` 分支）。
-    但 _detail_text_and_kb 在渲染时会调 ensure_quota_fresh → fetch_usage →
-    走 probe 路径（zero-cost 节流已生效时 probe 会被跳过）。
-
-    这个测试的新语义：确认「刷新 Token」按钮的主路径不主动发 probe，让发 probe
-    留给「刷新用量」按钮的明确意图；但详情页渲染顺带刷一次 usage 是合理行为。
-    """
+def test_on_refresh_token_openai_updates_usage_via_wham(m):
+    """刷新 Token 后，OpenAI 也顺手用 wham/usage 更新 quota，且不发 probe。"""
     _setup(m)
     _add_openai(m, "rt@openai.test")
     m["registry"].rebuild_from_config()
@@ -495,39 +495,33 @@ def test_on_refresh_token_openai_uses_unified_path(m):
     rec = _UiRecorder()
     m["ui"].api = rec
 
-    # 预先设置 probe 节流桶，让 _detail_text_and_kb 里的 ensure_quota_fresh
-    # 跳过真实 probe（模拟已有近期采样的场景）
-    import time
-    m["oauth_manager"]._OPENAI_PROBE_LAST["openai:rt@openai.test:acct-rt@openai.test"] = time.time()
-
     called = {"fetch_usage": 0, "probe_usage": 0}
     orig_fetch = m["oauth_manager"].fetch_usage
     async def _counting_fetch(ak):
         called["fetch_usage"] += 1
         return await orig_fetch(ak)
 
-    # channel 层 probe 计数
-    from src.channel.openai_oauth_channel import OpenAIOAuthChannel
-    orig_probe = OpenAIOAuthChannel.probe_usage
+    orig_probe = m["OpenAIOAuthChannel"].probe_usage
     async def _counting_probe(self, *args, **kwargs):
         called["probe_usage"] += 1
         return await orig_probe(self, *args, **kwargs)
 
     try:
         m["oauth_manager"].fetch_usage = _counting_fetch
-        OpenAIOAuthChannel.probe_usage = _counting_probe
+        m["OpenAIOAuthChannel"].probe_usage = _counting_probe
         short = m["ui"].register_code("openai:rt@openai.test:acct-rt@openai.test")
         m["oauth_menu"].on_refresh_token(42, 100, "cb", short)
     finally:
         m["oauth_manager"].fetch_usage = orig_fetch
-        OpenAIOAuthChannel.probe_usage = orig_probe
+        m["OpenAIOAuthChannel"].probe_usage = orig_probe
 
-    # probe_usage 应被节流桶完全阻止 → 未真正 probe
-    assert called["probe_usage"] == 0,         f"probe_usage should be throttled (bucket set in test), got {called['probe_usage']}"
-    # 重渲染详情页成功
+    assert called["fetch_usage"] >= 1
+    assert called["probe_usage"] == 0
+    row = m["state_db"].quota_load("openai:rt@openai.test:acct-rt@openai.test")
+    assert row is not None and row["five_hour_util"] == 1.0
     last = rec.last("editMessageText")
     assert last and ("已刷新" in last["text"] or "Token" in last["text"])
-    print("  [PASS] on_refresh_token(openai): probe throttled correctly, no token burned")
+    print("  [PASS] on_refresh_token(openai): wham usage updated, no probe")
 
 
 def test_status_menu_quota_warnings_tags_openai(m):
@@ -574,12 +568,12 @@ def main():
         test_oauth_menu_detail_openai_shows_provider_and_codex_usage,
         test_oauth_menu_list_cached_openai_over_dynamic_threshold_auto_disables,
         test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled,
-        test_oauth_menu_refresh_usage_openai_probe,
+        test_oauth_menu_refresh_usage_openai_wham,
         test_oauth_menu_refresh_usage_openai_auto_disables_over_quota,
-        test_oauth_menu_refresh_all_probes_openai,
+        test_oauth_menu_refresh_all_uses_wham_for_openai,
         test_probe_usage_writes_snapshot_in_mock_mode,
         test_delete_account_clears_codex_snapshot_throttle,
-        test_on_refresh_token_openai_uses_unified_path,
+        test_on_refresh_token_openai_updates_usage_via_wham,
         test_status_menu_quota_warnings_tags_openai,
     ]
 

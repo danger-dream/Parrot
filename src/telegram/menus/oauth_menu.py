@@ -117,6 +117,29 @@ def _replace_last_with_oauth_error(
     ).splitlines()
 
 
+def _fetch_and_save_usage_sync(ak: str, *, email: str | None = None):
+    """同步拉 usage 并写 quota cache；返回 usage 或 Exception。"""
+    usage = _run_sync(oauth_manager.fetch_usage(ak))
+    if isinstance(usage, Exception):
+        return usage
+    try:
+        state_db.quota_save(
+            ak, oauth_manager.flatten_usage(usage),
+            email=email if email is not None else _account_email(ak),
+        )
+    except Exception as exc:
+        return exc
+    return usage
+
+
+def _evaluate_quota_action(ak: str, usage: dict) -> dict | None:
+    try:
+        return oauth_manager.evaluate_and_toggle_by_usage(ak, usage)
+    except Exception as exc:
+        print(f"[oauth_menu] quota evaluate failed for {ak}: {exc}")
+        return None
+
+
 # ─── 时间 / 用量格式化 ────────────────────────────────────────────
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:
@@ -244,8 +267,8 @@ def _format_account_block(acc: dict) -> str:
         if fh_util is None and sd_util is None:
             lines.append("  📊 用量: <i>尚未获取</i>")
     else:
-        # OpenAI / Claude 都走同一条路径：点账户详情的"刷新用量"按钮。
-        # 对 openai 来说，按钮会发一条最小 codex 探测请求拉响应头。
+        # OpenAI / Claude 都走同一条路径：点账户详情的“刷新用量”按钮。
+        # OpenAI 主动刷新走 wham/usage；业务响应头仍会实时补充 x-codex-*。
         lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
 
     # 月度统计（本月 log_db 聚合）
@@ -816,10 +839,11 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
 
     email = _account_email(ak)
-    if oauth_manager.provider_of(ak) != "openai":
-        usage_result = _run_sync(oauth_manager.fetch_usage(ak))
-        if not isinstance(usage_result, Exception):
-            state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
+    usage_result = _fetch_and_save_usage_sync(ak, email=email)
+    if isinstance(usage_result, Exception):
+        print(f"[oauth_menu] usage fetch after token refresh failed for {ak}: {usage_result}")
+    else:
+        _evaluate_quota_action(ak, usage_result)
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
@@ -836,70 +860,41 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.answer_cb(cb_id, "短码已失效")
         return
     email = _account_email(ak)
-    if oauth_manager.provider_of(ak) == "openai":
-        from ...channel import registry
-        from ...channel.openai_oauth_channel import OpenAIOAuthChannel
-
-        ui.answer_cb(cb_id, "刷新 Token 并发送探测请求...")
+    provider = oauth_manager.provider_of(ak)
+    if provider == "openai":
+        ui.answer_cb(cb_id, "刷新 Token 并拉取额度...")
         tr = _run_sync(oauth_manager.force_refresh(ak))
         if isinstance(tr, Exception):
             ui.send(chat_id, _oauth_error_html(
                 tr, provider="openai", operation="refresh_token",
             ))
             return
-        ch = registry.get_channel(f"oauth:{ak}")
-        if not isinstance(ch, OpenAIOAuthChannel):
-            ui.send(chat_id, "❌ 账户未注册为 OpenAI OAuth 渠道")
-            return
-        pr = _run_sync(ch.probe_usage())
-        if isinstance(pr, Exception):
-            ui.send(chat_id, _oauth_error_html(
-                pr, provider="openai", operation="probe_usage",
-            ))
-            return
-        quota_action = None
-        if pr.get("ok"):
-            try:
-                row = state_db.quota_load(ak) or {}
-                usage = oauth_manager._synthesize_openai_usage_from_row(row)
-                quota_action = oauth_manager.evaluate_and_toggle_by_usage(ak, usage)
-            except Exception as exc:
-                print(f"[oauth_menu] openai refresh_usage quota evaluate failed for {ak}: {exc}")
-        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
-        if pr.get("ok"):
-            head = "✅ 已刷新 Token 并更新用量（探测请求成功）"
-            if quota_action and quota_action.get("action") == "disabled":
-                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
-                head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
-            elif quota_action and quota_action.get("action") == "still_over_quota":
-                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
-                head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
-            elif quota_action and quota_action.get("action") == "resumed":
-                head += "\n♻ 额度已恢复，已自动解除配额禁用"
-        else:
-            reason = pr.get("reason", "?")
-            head = (
-                "⚠ Token 已刷新，但用量探测未成功\n"
-                + oauth_errors.format_oauth_error_html(
-                    str(reason), provider="openai", operation="probe_usage",
-                    include_title=False,
-                )
-            )
-        if text:
-            ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
-        return
-    ui.answer_cb(cb_id, "拉取中...")
+    else:
+        ui.answer_cb(cb_id, "拉取中...")
 
-    usage_result = _run_sync(oauth_manager.fetch_usage(ak))
+    usage_result = _fetch_and_save_usage_sync(ak, email=email)
     if isinstance(usage_result, Exception):
         ui.send(chat_id, _oauth_error_html(
-            usage_result, provider="claude", operation="fetch_usage",
+            usage_result, provider=provider, operation="fetch_usage",
         ))
         return
-    state_db.quota_save(ak, oauth_manager.flatten_usage(usage_result), email=email)
+    quota_action = _evaluate_quota_action(ak, usage_result)
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
-    if text:
+    if not text:
+        return
+    if provider == "openai":
+        head = "✅ 已刷新 Token 并更新用量（wham/usage）"
+        if quota_action and quota_action.get("action") == "disabled":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "still_over_quota":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "resumed":
+            head += "\n♻ 额度已恢复，已自动解除配额禁用"
+        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+    else:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
@@ -1019,9 +1014,6 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: 
 
 def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ui.answer_cb(cb_id, "开始刷新...")
-    from ...channel import registry
-    from ...channel.openai_oauth_channel import OpenAIOAuthChannel
-
     accounts = oauth_manager.list_accounts()
     if not accounts:
         ui.send(chat_id, "❌ 当前无 OAuth 账户可刷新")
@@ -1078,50 +1070,17 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
                 lines.append("")
                 _flush()
                 continue
-            ch = registry.get_channel(f"oauth:{ak}")
-            if not isinstance(ch, OpenAIOAuthChannel):
-                fail_count += 1
-                _replace_last_with_oauth_error(
-                    lines, "openai channel not registered", provider="openai", operation="probe_usage",
-                )
-                lines.append("")
-                _flush()
-                continue
-            pr = _run_sync(ch.probe_usage())
-            if isinstance(pr, Exception):
-                fail_count += 1
-                _replace_last_with_oauth_error(
-                    lines, pr, provider="openai", operation="probe_usage",
-                )
-                lines.append("")
-                _flush()
-                continue
-            if not pr.get("ok"):
-                fail_count += 1
-                reason = pr.get("reason", "?")
-                _replace_last_with_oauth_error(
-                    lines, str(reason), provider="openai", operation="probe_usage",
-                )
-                lines.append("")
-                _flush()
-                continue
-            row = state_db.quota_load(ak) or {}
-            usage = oauth_manager._synthesize_openai_usage_from_row(row)
-        else:
-            result = _run_sync(oauth_manager.fetch_usage(ak))
-            if isinstance(result, Exception):
-                fail_count += 1
-                _replace_last_with_oauth_error(
-                    lines, result, provider="claude", operation="fetch_usage",
-                )
-                lines.append("")
-                _flush()
-                continue
-            usage = result
-            try:
-                state_db.quota_save(ak, oauth_manager.flatten_usage(usage), email=email)
-            except Exception as exc:
-                print(f"[oauth_menu] quota_save failed for {ak}: {exc}")
+
+        result = _fetch_and_save_usage_sync(ak, email=email)
+        if isinstance(result, Exception):
+            fail_count += 1
+            _replace_last_with_oauth_error(
+                lines, result, provider=prov, operation="fetch_usage",
+            )
+            lines.append("")
+            _flush()
+            continue
+        usage = result
 
         # ─ 写入进度 + 评估禁用/恢复 ─
         success_count += 1
@@ -1768,6 +1727,22 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         )
         return
 
+    quota_note = ""
+    saved_acc = _find_openai_existing_for_entry(entry)
+    if saved_acc is not None:
+        saved_ak = _account_key(saved_acc)
+        usage_result = _fetch_and_save_usage_sync(saved_ak, email=saved_acc.get("email") or entry.get("email") or "")
+        if isinstance(usage_result, Exception):
+            quota_note = "\n额度: <code>未获取成功，稍后可手动刷新</code>"
+            print(f"[oauth_menu] openai usage fetch after add failed for {saved_ak}: {usage_result}")
+        else:
+            _evaluate_quota_action(saved_ak, usage_result)
+            parts = []
+            for label, util in zip(("5h", "7d"), oauth_manager.extract_utils_percent(usage_result)[:2]):
+                if util is not None:
+                    parts.append(f"{label} {util:.0f}%")
+            quota_note = "\n额度: <code>" + ui.escape_html(" / ".join(parts) or "已获取") + "</code>"
+
     plan = meta.get("plan_type") or "?"
     plan_tag = f" · plan: <code>{ui.escape_html(plan)}</code>"
     if meta.get("subscription_expires_at"):
@@ -1790,7 +1765,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         f"{title}\n\n"
         f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>{plan_tag}\n"
         f"{workspace_line}"
-        f"过期: <code>{_format_bjt(meta.get('expired'))}</code>\n"
+        f"过期: <code>{_format_bjt(meta.get('expired'))}</code>{quota_note}\n"
         f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
         f"来源: <code>{source}</code>{lb_hint}",
         **_OA_NAV_OPENAI,
@@ -1923,7 +1898,11 @@ def _format_import_error(exc: Exception | None) -> str:
 
 
 def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
-    """导入单个候选；返回 (status, email, message)。"""
+    """导入单个候选；返回 (status, email, message)。
+
+    新 token 保存/替换成功后会 best-effort 拉一次 wham/usage 写 quota cache；
+    失败不影响账号导入，只把提示拼进 message。
+    """
     email_hint = str(item.get("email") or "").strip()
     rt = str(item.get("refresh_token") or "").strip()
     if not rt:
@@ -1934,7 +1913,18 @@ def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
         action, msg = _save_openai_entry_with_duplicate_policy(entry)
         workspace = meta.get("workspace_name") or meta.get("workspace_type") or "workspace"
         plan = meta.get("plan_type") or "?"
-        return action, meta.get("email") or entry.get("email") or email_hint, f"{workspace} / {plan}；{msg}"
+        quota_msg = ""
+        saved = _find_openai_existing_for_entry(entry)
+        if saved is not None:
+            ak = _account_key(saved)
+            usage = _fetch_and_save_usage_sync(ak, email=saved.get("email") or entry.get("email") or email_hint)
+            if isinstance(usage, Exception):
+                quota_msg = "；额度未获取成功"
+                print(f"[oauth_menu] openai import usage fetch failed for {ak}: {usage}")
+            else:
+                _evaluate_quota_action(ak, usage)
+                quota_msg = "；额度已获取"
+        return action, meta.get("email") or entry.get("email") or email_hint, f"{workspace} / {plan}；{msg}{quota_msg}"
 
     # 新 token 无效时，还没有可信 workspace identity，只能做 legacy 兜底：
     # 同邮箱恰好一个账号时，验证现有 token；多 workspace 时 _find_openai_account_by_email
@@ -1949,7 +1939,18 @@ def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
         )
         if existing_entry is not None:
             _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)
-            return "skipped", email_hint, "导入 token 无效，现有 token 有效，已保留现有账号"
+            quota_msg = ""
+            refreshed = _find_openai_existing_for_entry(existing_entry)
+            if refreshed is not None:
+                ak = _account_key(refreshed)
+                usage = _fetch_and_save_usage_sync(ak, email=refreshed.get("email") or email_hint)
+                if isinstance(usage, Exception):
+                    quota_msg = "；额度未获取成功"
+                    print(f"[oauth_menu] openai import existing usage fetch failed for {ak}: {usage}")
+                else:
+                    _evaluate_quota_action(ak, usage)
+                    quota_msg = "；额度已获取"
+            return "skipped", email_hint, "导入 token 无效，现有 token 有效，已保留现有账号" + quota_msg
         return "failed", email_hint, (
             "导入 token 与现有 token 均无效；"
             f"导入错误: {_format_import_error(import_err)}；现有错误: {_format_import_error(existing_err)}"

@@ -430,10 +430,8 @@ def test_openai_refresh_updates_id_token_metadata(m):
     print("  [PASS] force_refresh: openai decodes new id_token without changing account key")
 
 
-def test_fetch_usage_openai_goes_through_probe(m):
-    """2026-04-20 统一路径后：OpenAI 的 fetch_usage 不再抛 QuotaNotSupported，
-    而是分派到 OpenAIOAuthChannel.probe_usage。无 channel 注册时抛
-    RuntimeError（"openai channel not registered"）而非 QuotaNotSupported。"""
+def test_fetch_usage_openai_goes_through_wham(m):
+    """OpenAI 的主动 fetch_usage 走 ChatGPT wham/usage，不依赖 channel 注册/probe。"""
     _setup(m)
     om = m["oauth_manager"]
     om.add_account({
@@ -442,25 +440,15 @@ def test_fetch_usage_openai_goes_through_probe(m):
         "access_token": "at", "refresh_token": "rt",
         "chatgpt_account_id": "acct-x", "plan_type": "plus",
     })
-    # 未 rebuild 注册 → 应抛 RuntimeError
     import asyncio
-    try:
-        asyncio.run(om.fetch_usage("openai:x@openai.test:acct-x"))
-        assert False, "expected RuntimeError (channel not registered)"
-    except RuntimeError as exc:
-        assert "not registered" in str(exc), str(exc)
-
-    # rebuild 后 fetch_usage 应走 probe → 返回合成 dict
-    from src.channel import registry as _registry
-    _registry.rebuild_from_config()
     usage = asyncio.run(om.fetch_usage("openai:x@openai.test:acct-x"))
     assert "five_hour" in usage and "seven_day" in usage
-    # ensure_quota_fresh 对 openai 新路径：若 probe 节流桶已更新则跳过，正常返回 False（被节流）
-    # 这里刚 probe 过 → 下一次 ensure_quota_fresh 应被 openai probe 节流跳过
-    ok = asyncio.run(om.ensure_quota_fresh("openai:x@openai.test:acct-x", timeout_s=1.0))
-    # 在 quotaMonitor.enabled 默认场景下可能返回 False（被 _should_skip_access_refresh）
-    # 或 True（正常执行）——都可接受，不做硬断言
-    print("  [PASS] fetch_usage openai: unified path (probe + synthesized dict)")
+    assert usage["five_hour"]["utilization"] == 1.0, usage
+    assert usage["seven_day"]["utilization"] == 3.0, usage
+    assert usage.get("openai", {}).get("source") == "wham_usage"
+    # 不应再标记 probe 节流桶。
+    assert "openai:x@openai.test:acct-x" not in om._OPENAI_PROBE_LAST
+    print("  [PASS] fetch_usage openai: unified path (wham/usage)")
 
 
 # ─── TG bot: OpenAI add via PKCE ─────────────────────────────────
@@ -581,7 +569,7 @@ def main():
         test_migrate_provider_field_skip_write_when_nothing_to_do,
         test_refresh_notice_openai_wording,
         test_openai_refresh_updates_id_token_metadata,
-        test_fetch_usage_openai_goes_through_probe,
+        test_fetch_usage_openai_goes_through_wham,
         test_tg_openai_add_via_pkce,
         test_tg_openai_add_state_mismatch,
         test_tg_openai_add_via_rt,

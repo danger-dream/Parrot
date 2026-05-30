@@ -646,61 +646,20 @@ async def fetch_profile(access_token: str) -> dict:
 class QuotaNotSupported(Exception):
     """向后兼容保留：fetch_usage 现按 provider 分派，不再抛出此异常。
 
-    2026-04-20 统一 OAuth 用量机制后，OpenAI 也走 fetch_usage 门面
-    （内部转发到 channel.probe_usage）。此类仅作为类型占位保留，避免外部
-    `except QuotaNotSupported` 调用链崩溃；不会再真正抛出。
+    2026-04-20 统一 OAuth 用量机制后，OpenAI 也走 fetch_usage 门面；
+    2026-05-30 起 OpenAI 主动 quota 改走 ChatGPT wham/usage。此类仅作为
+    类型占位保留，避免外部 `except QuotaNotSupported` 调用链崩溃；不会再真正抛出。
     """
 
 
-# 每个 OpenAI 账号的 probe 节流桶（避免 quota_monitor_loop 把 token 烧光）
-# 规则：两次 probe 之间最少间隔 `openaiProbeMinIntervalSeconds`（默认 30min）
+# 兼容旧测试/旧运行时的 OpenAI probe 节流桶。主动 quota 已切到 wham/usage，
+# 这里不再由 fetch_usage 写入；删除账号时仍清理，避免老进程残留内存键。
 _OPENAI_PROBE_LAST: dict[str, float] = {}
 _openai_probe_lock = threading.Lock()
 
 
-def _openai_probe_min_interval_seconds() -> int:
-    qm = config.get().get("quotaMonitor") or {}
-    try:
-        return int(qm.get("openaiProbeMinIntervalSeconds", 1800))
-    except Exception:
-        return 1800
-
-
-def _openai_probe_should_skip(account_key: str) -> bool:
-    """响应头被动采样足够新鲜时跳过 probe；否则按最小间隔节流。"""
-    try:
-        account_key = _resolve_existing_account_key_or_raise(account_key)
-    except Exception:
-        return True
-    # 若最近 5 分钟内有响应头被动采样，认为数据足够新鲜，无需发 probe
-    row = state_db.quota_load(account_key)
-    if row:
-        last_passive_ms = int(row.get("last_passive_update_at") or 0)
-        if last_passive_ms > 0:
-            age_s = (state_db.now_ms() - last_passive_ms) / 1000.0
-            if age_s < 300:
-                return True
-    # 否则按 probe 节流桶判断
-    min_interval = _openai_probe_min_interval_seconds()
-    now = time.time()
-    with _openai_probe_lock:
-        last = _OPENAI_PROBE_LAST.get(account_key, 0.0)
-        if now - last < min_interval:
-            return True
-    return False
-
-
-def _openai_probe_mark(account_key: str) -> None:
-    try:
-        account_key = resolve_account_key(account_key) or account_key
-    except AmbiguousOAuthAccountKey:
-        pass
-    with _openai_probe_lock:
-        _OPENAI_PROBE_LAST[account_key] = time.time()
-
-
 def forget_openai_probe(account_key_or_email: str) -> None:
-    """账户删除时清 probe 节流桶。"""
+    """账户删除时清旧 probe 节流桶。"""
     if not account_key_or_email:
         return
     key = account_key_or_email
@@ -717,54 +676,23 @@ async def fetch_usage(account_key: str) -> dict:
     """统一 usage 拉取门面。按 provider 分派到具体实现：
 
       - Claude / Anthropic: 调 /api/oauth/usage（零 token 成本，JSON body）
-      - OpenAI (Codex)    : 复用 OpenAIOAuthChannel.probe_usage 发最小探测
-                            请求拉响应头，内部已写入 state_db；再反查一次
-                            quota_load 把 flat dict 返回（保持与 Claude 的
-                            返回形状一致）
+      - OpenAI (Codex)    : 调 ChatGPT backend-api/wham/usage（零 Codex 请求成本）
 
     返回：与 Anthropic 原生 `/oauth/usage` JSON 结构兼容的 dict（顶层含
-    five_hour / seven_day / ...）。OpenAI 路径下返回一个**合成结构**，
-    让上层 extract_utils_percent / flatten_usage 能无差别消费。
+    five_hour / seven_day / ...），让 extract_utils_percent / flatten_usage
+    能无差别消费。
     """
     account_key = _resolve_existing_account_key_or_raise(account_key)
     provider = provider_of(account_key)
+    access_token = await ensure_valid_token(account_key)
 
     if provider != "openai":
         # Claude 路径：直接走 /api/oauth/usage
-        access_token = await ensure_valid_token(account_key)
         return await asyncio.to_thread(_usage_sync, access_token)
 
-    # OpenAI 路径：通过 channel.probe_usage 拉响应头。若账号已经因 quota
-    # 禁用，缓存/节流跳过不能作为恢复依据；必须等窗口过期后做一次真实 probe。
-    acc = get_account(account_key) or {}
-    if _openai_probe_should_skip(account_key):
-        if acc.get("disabled_reason") == "quota" and not _quota_disabled_until_still_future(acc):
-            pass
-        else:
-            row = state_db.quota_load(account_key) or {}
-            return _synthesize_openai_usage_from_row(row)
-
-    from .channel import registry
-    ch = registry.get_channel(f"oauth:{account_key}")
-    if ch is None:
-        # 渠道未注册（比如账号刚加还没 rebuild）→ 直接抛，调用方可跳过
-        raise RuntimeError(f"openai channel not registered: {account_key}")
-
-    # 延迟 import 避免循环依赖
-    from .channel.openai_oauth_channel import OpenAIOAuthChannel
-    if not isinstance(ch, OpenAIOAuthChannel):
-        raise RuntimeError(
-            f"account {account_key} resolved to wrong channel type: {type(ch).__name__}"
-        )
-
-    result = await ch.probe_usage()
-    _openai_probe_mark(account_key)
-    if not result.get("ok"):
-        raise RuntimeError(f"openai probe failed: {result.get('reason')}")
-
-    # probe_usage 已写入 state_db，反查组装成 Anthropic 风格 dict
-    row = state_db.quota_load(account_key) or {}
-    return _synthesize_openai_usage_from_row(row)
+    # OpenAI 路径：主动 quota 改走 ChatGPT 私有 wham/usage。业务响应头里的
+    # x-codex-* 仍由 failover/images/ws 实时采样，不在这里发最小 Codex 请求。
+    return await openai_provider.fetch_wham_usage(access_token)
 
 
 def _synthesize_openai_usage_from_row(row: dict) -> dict:
@@ -821,9 +749,8 @@ def _should_skip_access_refresh() -> bool:
 async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> bool:
     """若该账号的配额缓存已过节流窗口，触发一次真实 fetch_usage 并回写。
 
-    2026-04-20 统一路径后，OpenAI 账号也走此路径；但 fetch_usage 内部会先看
-    响应头被动采样是否足够新鲜，若新鲜则跳过 probe（零成本），否则按
-    openaiProbeMinIntervalSeconds 节流。Claude 路径维持原 accessRefreshThrottleSeconds
+    2026-05-30 起，OpenAI 账号主动刷新也走 wham/usage；响应头被动采样
+    只作为业务请求的实时补充。Claude 路径维持原 accessRefreshThrottleSeconds
     行为不变。
     """
     if not account_key:
@@ -1833,10 +1760,8 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             try:
                 usage = await fetch_usage(ak)
                 usage_flat = flatten_usage(usage)
-                # 统一用 quota_save 写入；OpenAI 路径下主动拉/probe 产生的行
-                # 会保留 codex_* 字段（quota_save INSERT OR REPLACE 时会覆盖，
-                # 但 probe_usage 已经先写好了完整行 + 我们这里再次写 five_hour_util
-                # / seven_day_util 是同值，语义一致）。
+                # 统一用 quota_save 写入；OpenAI 主动拉取来自 wham/usage，
+                # 不覆盖响应头实时采样保存在 codex_* 列里的细节。
                 state_db.quota_save(ak, usage_flat, email=email)
             except Exception as exc:
                 print(f"[oauth] usage fetch after refresh failed for {ak}: {exc}")
