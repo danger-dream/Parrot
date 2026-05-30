@@ -376,6 +376,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     )
 
     # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘
+    reasoning_effort = log_db.extract_reasoning_effort(body, ingress_protocol)
     req_headers = _sanitize_headers(dict(request.headers))
     log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_"))}
     await asyncio.to_thread(
@@ -383,6 +384,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         request_id, client_ip, key_name, model, is_stream, msg_count, tool_count,
         req_headers, log_body, fingerprint=fp_query,
         ingress_protocol=ingress_protocol,
+        reasoning_effort=reasoning_effort,
     )
 
     # 7. 调度（ingress_protocol 决定家族过滤；fp_query 决定亲和命中）

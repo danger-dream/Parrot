@@ -112,56 +112,14 @@ def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, t
     ]
     for idx, r in enumerate(rows, 1):
         display_idx = _display_index(page, idx)
-        ts = ui.fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
-        icon = _status_icon(r)
-        model = ui.escape_html(r.get("requested_model") or "?")
         key = ui.escape_html(r.get("api_key_name") or "?")
-        ing_tag = _ingress_tag(r)
-        line = f"\n<b>#{display_idx}</b> <code>{ts}</code> {icon} <b>{key}</b> → {model}"
-        if ing_tag:
-            line += f" <code>{ing_tag}</code>"
-        transport = _transport_tag(r)
-        if transport:
-            line += f" · <b>{transport}</b>"
-
-        # 通道 + 重试数
-        if r.get("final_channel_key"):
-            ch_short = ui.escape_html(ui.channel_display_name(r["final_channel_key"], with_family=True))
-            line += f"\n  渠道: <code>{ch_short}</code>"
-            if r.get("retry_count"):
-                line += f"（重试 {r['retry_count']} 次）"
-            if r.get("affinity_hit"):
-                line += "  ★亲和"
-        if r.get("status") == "success":
-            inp = ui.prompt_total_from_row(r)
-            cr = r.get("cache_read_tokens") or 0
-            tok = f"↑ {ui.fmt_tokens(inp)} · ↓ {ui.fmt_tokens(r.get('output_tokens'))}"
-            if cr > 0:
-                tok += f" · {ui.fmt_cache_phrase_from_row(r)}"
-            line += f"\n  Token: {tok}"
-
-        timing_parts = []
-        if r.get("connect_time_ms") is not None:
-            timing_parts.append(f"连接 {ui.fmt_ms(r['connect_time_ms'])}")
-        if r.get("is_stream") and r.get("first_token_time_ms") is not None:
-            timing_parts.append(f"首字 {ui.fmt_ms(r['first_token_time_ms'])}")
-        if r.get("total_time_ms") is not None:
-            timing_parts.append(f"总 {ui.fmt_ms(r['total_time_ms'])}")
-        tps_v = ui.calc_row_tps(r)
-        if tps_v is not None:
-            timing_parts.append(f"⚡ {ui.fmt_tps(tps_v)}")
-        if timing_parts:
-            line += "\n  耗时: " + " · ".join(timing_parts)
-
-        if r.get("proxy_name"):
-            line += f"\n  出站代理: 🔀 {ui.escape_html(r['proxy_name'])}"
-
-        if r.get("status") == "error" and r.get("error_message"):
-            msg = r["error_message"]
-            summary = _extract_error_summary(msg)[:120]
-            # 用 ⚠ + 斜体行内显示，避免 <pre> 块级元素带来的大空行
-            line += f"\n  ⚠ <i>{ui.escape_html(summary)}</i>"
-
+        prefix = f"\n<b>#{display_idx}</b> "
+        # 列表首行比最近调用多一个 key →
+        headline = ui.fmt_log_entry_headline(r, prefix=f"{prefix}<b>{key}</b> → ")
+        body = ui.fmt_log_entry_body(r)
+        line = headline
+        if body:
+            line += "\n" + body
         lines.append(line)
     return "\n".join(lines)
 
@@ -256,11 +214,12 @@ def _render_detail(detail: dict) -> str:
     status = log.get("status") or "?"
 
     lines = [
-        f"📋 <b>日志详情</b> {icon}",
+        f"📋 <b>日志详情</b>",
         f"ID: <code>{ui.escape_html(rid)}</code>",
         f"时间: <code>{created}</code>",
         f"状态: <code>{ui.escape_html(status)}</code>"
-        + (f" ({log.get('http_status')})" if log.get("http_status") else ""),
+        + (f" ({log.get('http_status')})" if log.get("http_status") else "")
+        + f" {icon}",
         f"客户端: <code>{ui.escape_html(log.get('client_ip') or '?')}</code>"
         f" / Key <code>{ui.escape_html(log.get('api_key_name') or '?')}</code>",
         f"请求模型: <code>{ui.escape_html(log.get('requested_model') or '?')}</code>",
@@ -291,6 +250,9 @@ def _render_detail(detail: dict) -> str:
         flags.append(f"重试 {log['retry_count']} 次")
     if flags:
         lines.append(" · ".join(flags))
+    effort = log.get("reasoning_effort")
+    if effort:
+        lines.append(f"思考强度：🧠 {ui.escape_html(effort)}")
 
     # Tokens
     if status == "success":

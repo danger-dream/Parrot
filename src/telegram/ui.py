@@ -616,3 +616,103 @@ def install_notify_handler() -> None:
                 pass
 
     notifier.set_handler(_handler)
+
+
+# ─── 日志条目共用渲染 ──────────────────────────────────────────────
+
+_LOG_STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
+_LOG_INGRESS_TAG = {"chat": "[chat]", "responses": "[rsp]", "responses_ws": "[rsp]"}
+
+
+def _log_transport_tag(row: dict) -> str:
+    if (row.get("ingress_protocol") or "") == "responses_ws":
+        return "WS"
+    if (row.get("ingress_protocol") or "") == "responses" and (row.get("upstream_transport") or "").lower() == "ws":
+        return "↑WS"
+    return ""
+
+
+def fmt_log_entry_body(r: dict) -> str:
+    """渲染日志条目的 body 部分（渠道 + Token + 耗时 + 传输协议/代理 + 错误）。
+
+    供 logs_menu 列表和 stats_menu 最近调用共用，保证格式完全一致。
+    不含首行（首行由调用方自行拼接：列表带 #编号+key，最近调用不带）。
+    返回多行字符串，每行已有 2 空格缩进前缀。
+    """
+    lines: list[str] = []
+
+    # 渠道
+    if r.get("final_channel_key"):
+        ch_short = escape_html(channel_display_name(r["final_channel_key"], with_family=False))
+        ch_line = f"  渠道: <code>{ch_short}</code>"
+        if r.get("retry_count"):
+            ch_line += f"（重试 {r['retry_count']} 次）"
+        if r.get("affinity_hit"):
+            ch_line += " · ★亲和"
+        lines.append(ch_line)
+
+    # Token
+    if r.get("status") == "success":
+        inp = prompt_total_from_row(r)
+        cr = r.get("cache_read_tokens") or 0
+        tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
+        if cr > 0:
+            tok += f" · {fmt_cache_phrase_from_row(r)}"
+        lines.append(f"  Token: {tok}")
+
+    # 耗时
+    timing_parts: list[str] = []
+    if r.get("connect_time_ms") is not None:
+        timing_parts.append(f"连接 {fmt_ms(r['connect_time_ms'])}")
+    if r.get("is_stream") and r.get("first_token_time_ms") is not None:
+        timing_parts.append(f"首字 {fmt_ms(r['first_token_time_ms'])}")
+    if r.get("total_time_ms") is not None:
+        timing_parts.append(f"总 {fmt_ms(r['total_time_ms'])}")
+    tps_v = calc_row_tps(r)
+    if tps_v is not None:
+        timing_parts.append(f"⚡ {fmt_tps(tps_v)}")
+    if (r.get("retry_count") or 0) > 0 and not r.get("final_channel_key"):
+        # 无渠道行时重试信息追加到耗时行
+        timing_parts.append(f"重试 {r['retry_count']} 次")
+    if timing_parts:
+        lines.append("  耗时: " + " · ".join(timing_parts))
+
+    # 传输协议 + 出站代理（合并一行）
+    transport = _log_transport_tag(r)
+    proxy_name = r.get("proxy_name")
+    if transport or proxy_name:
+        tp_line = "  "
+        if transport:
+            tp_line += f"传输协议: <b>{transport}</b>"
+            if proxy_name:
+                tp_line += f" · 出站代理: {escape_html(proxy_name)}"
+        else:
+            tp_line += f"出站代理: {escape_html(proxy_name)}"
+        lines.append(tp_line)
+
+    # 错误
+    if r.get("status") == "error" and r.get("error_message"):
+        err_short = escape_html(str(r["error_message"])[:120])
+        lines.append(f"  ⚠ <i>{err_short}</i>")
+
+    return "\n".join(lines)
+
+
+def fmt_log_entry_headline(r: dict, *, prefix: str = "") -> str:
+    """渲染日志条目首行：[时间] 模型 · [rsp] · 🧠 effort · icon。
+
+    prefix: 可选前缀（如 '#1 key → '），由调用方传入。
+    """
+    ts = fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
+    icon = _LOG_STATUS_ICON.get(r.get("status"), "?")
+    model = escape_html(r.get("requested_model") or "?")
+    ing_tag = _LOG_INGRESS_TAG.get(r.get("ingress_protocol") or "", "")
+
+    line = f"{prefix}<code>[{ts}]</code> <b>{model}</b>"
+    if ing_tag:
+        line += f" <code>{ing_tag}</code>"
+    effort = r.get("reasoning_effort")
+    if effort:
+        line += f" · 🧠 {escape_html(effort)}"
+    line += f" {icon}"
+    return line

@@ -258,47 +258,11 @@ def _section_recent_calls(calls: list[dict]) -> str:
         return ""
     out = ["<b>最近调用:</b>"]
     for r in calls:
-        ts = ui.fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
-        icon = {"success": "✅", "error": "❌", "pending": "⏳"}.get(r.get("status"), "?")
-        model = ui.escape_html(r.get("requested_model") or "?")
-        fam_icon = _protocol_icon(r.get("upstream_protocol"))
-        fam_suffix = f" {fam_icon}" if fam_icon else ""
-        if (r.get("ingress_protocol") or "") == "responses_ws":
-            transport_suffix = " · WS"
-        elif (r.get("ingress_protocol") or "") == "responses" and (r.get("upstream_transport") or "").lower() == "ws":
-            transport_suffix = " · ↑WS"
-        else:
-            transport_suffix = ""
-        out.append(f"\n<code>[{ts}]</code> {icon} {model}{fam_suffix}{transport_suffix}")
-        if r.get("final_channel_key"):
-            ch_line = f"  渠道: <code>{ui.escape_html(_ch_short_name(r['final_channel_key']))}</code>"
-            if r.get("proxy_name"):
-                ch_line += f" · 🔀 <code>{ui.escape_html(r['proxy_name'])}</code>"
-            out.append(ch_line)
-        if r.get("status") == "success":
-            inp = (r.get("input_tokens") or 0) + (r.get("cache_creation_tokens") or 0) + (r.get("cache_read_tokens") or 0)
-            cr = r.get("cache_read_tokens") or 0
-            out.append(
-                f"  ↑ {ui.fmt_tokens(inp)} · ↓ {ui.fmt_tokens(r.get('output_tokens'))}"
-                + (f" · {ui.fmt_cache_phrase(cr, inp)}" if cr else "")
-            )
-        timing = []
-        if r.get("connect_time_ms") is not None:
-            timing.append(f"连接 {ui.fmt_ms(r['connect_time_ms'])}")
-        if r.get("is_stream") and r.get("first_token_time_ms") is not None:
-            timing.append(f"首字 {ui.fmt_ms(r['first_token_time_ms'])}")
-        if r.get("total_time_ms") is not None:
-            timing.append(f"总 {ui.fmt_ms(r['total_time_ms'])}")
-        tps_v = ui.calc_row_tps(r)
-        if tps_v is not None:
-            timing.append(f"⚡ {ui.fmt_tps(tps_v)}")
-        if (r.get("retry_count") or 0) > 0:
-            timing.append(f"重试 {r['retry_count']} 次")
-        if timing:
-            out.append(f"  耗时: {' · '.join(timing)}")
-        if r.get("status") == "error" and r.get("error_message"):
-            err_short = ui.escape_html(r["error_message"][:120])
-            out.append(f"  错误: <code>{err_short}</code>")
+        headline = ui.fmt_log_entry_headline(r, prefix="\n")
+        body = ui.fmt_log_entry_body(r)
+        out.append(headline)
+        if body:
+            out.append(body)
     return "\n".join(out)
 
 

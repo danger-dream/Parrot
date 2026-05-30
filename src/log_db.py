@@ -77,7 +77,8 @@ def _schema_sql() -> str:
       proxy_name            TEXT,
       -- 代理层字节数：统计经由该代理转发的上游 body bytes（请求 + 响应）。
       proxy_bytes_up        INTEGER DEFAULT 0,
-      proxy_bytes_down      INTEGER DEFAULT 0
+      proxy_bytes_down      INTEGER DEFAULT 0,
+      reasoning_effort      TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_log_created ON request_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_log_status ON request_log(status);
@@ -167,6 +168,9 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         changed = True
     if "proxy_name" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN proxy_name TEXT")
+        changed = True
+    if "reasoning_effort" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN reasoning_effort TEXT")
         changed = True
     if "proxy_bytes_up" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN proxy_bytes_up INTEGER DEFAULT 0")
@@ -342,6 +346,7 @@ def insert_pending(
     request_body: dict | None,
     fingerprint: str | None = None,
     ingress_protocol: str = "anthropic",
+    reasoning_effort: str | None = None,
 ) -> None:
     with _write_lock:
         conn = _get_conn()
@@ -349,8 +354,8 @@ def insert_pending(
             """INSERT INTO request_log
                (request_id, created_at, client_ip, api_key_name, requested_model,
                 status, is_stream, msg_count, tool_count, fingerprint,
-                ingress_protocol)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                ingress_protocol, reasoning_effort)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 request_id, time.time(), client_ip, api_key_name, requested_model,
                 "pending", 1 if is_stream else 0, msg_count, tool_count,
@@ -358,6 +363,7 @@ def insert_pending(
                 # 排查时可用 `log.fingerprint || '%'` 做前缀匹配反查 cache_affinities。
                 fingerprint[:16] if fingerprint else None,
                 ingress_protocol or "anthropic",
+                reasoning_effort,
             ),
         )
         conn.execute(
@@ -983,7 +989,8 @@ _RECENT_COLS = (
     "input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, "
     "connect_time_ms, first_token_time_ms, total_time_ms, "
     "retry_count, affinity_hit, "
-    "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down"
+    "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
+    "reasoning_effort"
 )
 
 
@@ -1468,3 +1475,79 @@ def _finalize_group(agg: dict) -> dict:
     )
     out.update(_finalize_tps(agg))
     return out
+
+
+# ─── reasoning effort 提取 ──────────────────────────────────────
+
+# budget_tokens → effort 映射（与 cc_mimicry._budget_to_effort 保持一致，
+# 即老大之前定的"默认提一档"策略：16384→max, 8192→xhigh, 2048→high, 其余→medium）
+def _budget_to_effort_for_log(budget) -> str:
+    try:
+        b = int(budget)
+    except (TypeError, ValueError):
+        return "max"
+    if b >= 16384:
+        return "max"
+    if b >= 8192:
+        return "xhigh"
+    if b >= 2048:
+        return "high"
+    return "medium"
+
+
+def extract_reasoning_effort(body: dict, ingress_protocol: str = "anthropic") -> str | None:
+    """从请求 body 中提取归一化的思考强度。
+
+    返回小写字符串（如 low / medium / high / xhigh / max）或 None（未开启思考）。
+    不做枚举硬校验——未来新增档位（如 ultra）能自动透传。
+
+    Anthropic 入口：
+      1. output_config.effort（显式指定，最高优先）
+      2. thinking.type=enabled/adaptive + budget_tokens → _budget_to_effort 推断
+      3. thinking.type=disabled / 无 thinking → None
+    OpenAI chat 入口：
+      1. reasoning_effort（顶层字段）
+    OpenAI responses / responses_ws 入口：
+      1. reasoning.effort
+    """
+    if not isinstance(body, dict):
+        return None
+
+    if ingress_protocol == "anthropic":
+        # 优先看 output_config.effort（客户端显式指定）
+        oc = body.get("output_config")
+        if isinstance(oc, dict):
+            eff = oc.get("effort")
+            if isinstance(eff, str) and eff.strip():
+                return eff.strip().lower()
+        # 其次看 thinking 字段
+        t = body.get("thinking")
+        if isinstance(t, dict):
+            ttype = t.get("type")
+            if ttype in ("enabled", "adaptive"):
+                # 有 budget_tokens → 推断档位
+                bt = t.get("budget_tokens")
+                if bt is not None:
+                    return _budget_to_effort_for_log(bt)
+                # enabled 但没指定 budget → 默认 max
+                return "max"
+            # disabled / 其他 → 未开启思考
+        return None
+
+    if ingress_protocol == "chat":
+        # OpenAI chat: 顶层 reasoning_effort
+        eff = body.get("reasoning_effort")
+        if isinstance(eff, str) and eff.strip():
+            return eff.strip().lower()
+        return None
+
+    if ingress_protocol in ("responses", "responses_ws"):
+        # OpenAI responses: reasoning.effort
+        reasoning = body.get("reasoning")
+        if isinstance(reasoning, dict):
+            eff = reasoning.get("effort")
+            if isinstance(eff, str) and eff.strip():
+                return eff.strip().lower()
+        return None
+
+    return None

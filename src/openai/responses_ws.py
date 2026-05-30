@@ -318,12 +318,14 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     _sync_prompt_cache_key_to_ws_create(first_obj, body)
 
     msg_count, tool_count = _count_msg_tool(body, "responses")
+    reasoning_effort = log_db.extract_reasoning_effort(body, "responses_ws")
     req_headers = _sanitize_headers(dict(websocket.headers))
     log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_"))}
     await asyncio.to_thread(
         log_db.insert_pending,
         request_id, client_ip, key_name, model, True, msg_count, tool_count,
         req_headers, log_body, fingerprint=fp_query, ingress_protocol="responses_ws",
+        reasoning_effort=reasoning_effort,
     )
 
     result = scheduler.schedule(

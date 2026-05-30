@@ -545,6 +545,7 @@ async def proxy_messages(request: Request):
     fp_query = fingerprint.fingerprint_query(key_name or "", client_ip, messages)
 
     # 4. pending 日志
+    reasoning_effort = log_db.extract_reasoning_effort(body, "anthropic")
     req_headers = _sanitize_headers(dict(request.headers))
     await asyncio.to_thread(
         log_db.insert_pending,
@@ -554,6 +555,7 @@ async def proxy_messages(request: Request):
         {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_parrot_"))},
         fingerprint=fp_query,
         ingress_protocol="anthropic",
+        reasoning_effort=reasoning_effort,
     )
 
     # 5. 调度
