@@ -734,10 +734,15 @@ async def fetch_usage(account_key: str) -> dict:
         access_token = await ensure_valid_token(account_key)
         return await asyncio.to_thread(_usage_sync, access_token)
 
-    # OpenAI 路径：通过 channel.probe_usage 拉响应头
+    # OpenAI 路径：通过 channel.probe_usage 拉响应头。若账号已经因 quota
+    # 禁用，缓存/节流跳过不能作为恢复依据；必须等窗口过期后做一次真实 probe。
+    acc = get_account(account_key) or {}
     if _openai_probe_should_skip(account_key):
-        row = state_db.quota_load(account_key) or {}
-        return _synthesize_openai_usage_from_row(row)
+        if acc.get("disabled_reason") == "quota" and not _quota_disabled_until_still_future(acc):
+            pass
+        else:
+            row = state_db.quota_load(account_key) or {}
+            return _synthesize_openai_usage_from_row(row)
 
     from .channel import registry
     ch = registry.get_channel(f"oauth:{account_key}")
@@ -1059,8 +1064,22 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
                 "disabled_until": None}
     return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
 
+def _quota_disabled_until_still_future(acc: dict) -> bool:
+    dt = _parse_iso(acc.get("disabled_until"))
+    if dt is None:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt > datetime.now(timezone.utc)
+
+
+def _usage_has_any_quota_signal(usage: dict) -> bool:
+    return any(u is not None for u in extract_utils_percent(usage))
+
+
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
-                                 *, threshold: float | None = None) -> dict:
+                                 *, threshold: float | None = None,
+                                 fresh: bool = True) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
 
     规则：
@@ -1069,8 +1088,11 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
           - 账号已是 quota 禁用：保持不动（不刷新 disabled_until，避免目标移动）
           - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
       • 所有窗口 util < threshold → 可用
-          - 账号是 quota 禁用：set_enabled(True) 自动恢复（忽略 disabled_until，
-            因为 usage 本身已是真实状态）
+          - OpenAI 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
+            不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
+          - OpenAI 账号若 disabled_until 仍在未来，也保持禁用，等窗口到期后再用
+            新鲜响应头/probe 数据恢复。
+          - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
     返回: {
@@ -1124,8 +1146,23 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": "disabled", "utils": utils, "any_over": True,
                 "hit_windows": hit_windows, "disabled_until": latest_reset}
 
-    # 全部窗口都可用
+    # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
+    # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
+    # 因 [None, None, None, None] 被误恢复。
     if reason == "quota":
+        if provider_of(account_key) == "openai":
+            if _quota_disabled_until_still_future(acc):
+                return {"action": "quota_waiting_reset", "utils": utils,
+                        "any_over": False, "hit_windows": [],
+                        "disabled_until": acc.get("disabled_until")}
+            if not _usage_has_any_quota_signal(usage):
+                return {"action": "quota_unknown_keep_disabled", "utils": utils,
+                        "any_over": False, "hit_windows": [],
+                        "disabled_until": acc.get("disabled_until")}
+            if not fresh:
+                return {"action": "quota_stale_keep_disabled", "utils": utils,
+                        "any_over": False, "hit_windows": [],
+                        "disabled_until": acc.get("disabled_until")}
         try:
             set_enabled(account_key, True)
         except Exception as exc:
@@ -1858,6 +1895,7 @@ async def quota_monitor_once() -> dict:
             out[email] = f"skipped:{acc['disabled_reason']}"
             continue
 
+        reason_before = acc.get("disabled_reason")
         try:
             usage = await fetch_usage(ak)
         except Exception as exc:
@@ -1866,7 +1904,18 @@ async def quota_monitor_once() -> dict:
 
         state_db.quota_save(ak, flatten_usage(usage), email=email)
 
-        result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold)
+        # OpenAI quota 恢复必须有本轮新鲜窗口数据；缓存合成/空 usage 不足以
+        # 证明恢复。Claude 仍沿用真实 usage API。
+        fresh_for_resume = True
+        if provider_of(ak) == "openai" and reason_before == "quota":
+            row = state_db.quota_load(ak) or {}
+            last_ms = int(row.get("last_passive_update_at") or row.get("fetched_at") or 0)
+            fresh_for_resume = bool(
+                last_ms and (state_db.now_ms() - last_ms) <= 120_000
+                and _usage_has_any_quota_signal(usage)
+            )
+
+        result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume)
         utils = result["utils"]
         action = result["action"]
 

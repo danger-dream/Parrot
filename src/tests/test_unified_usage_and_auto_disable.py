@@ -386,6 +386,72 @@ def test_openai_user_disabled_not_touched(m):
     print("  [PASS] openai: user-disabled reason preserved")
 
 
+
+def test_openai_quota_disabled_not_resumed_from_unknown_usage(m):
+    _setup(m)
+    _add_openai(m, "unknown@o.io")
+    ak = "openai:unknown@o.io:acct-123"
+    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+    m["oauth_manager"].set_disabled_by_quota(ak, past)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
+        "five_hour": {},
+        "seven_day": {},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+    })
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "quota_unknown_keep_disabled", result
+    assert acc_after["disabled_reason"] == "quota"
+    assert acc_after["enabled"] is False
+    print("  [PASS] openai: quota-disabled account is not resumed from unknown usage")
+
+
+def test_openai_quota_disabled_waits_until_disabled_until_before_resume(m):
+    _setup(m)
+    _add_openai(m, "future@o.io")
+    ak = "openai:future@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
+        "five_hour": {"utilization": 10, "resets_at": None},
+        "seven_day": {"utilization": 20, "resets_at": None},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+    })
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "quota_waiting_reset", result
+    assert acc_after["disabled_reason"] == "quota"
+    assert acc_after["enabled"] is False
+    print("  [PASS] openai: quota-disabled account waits for disabled_until before resume")
+
+
+def test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage(m):
+    _setup(m)
+    _add_openai(m, "fresh@o.io")
+    ak = "openai:fresh@o.io:acct-123"
+    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+    m["oauth_manager"].set_disabled_by_quota(ak, past)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
+        "five_hour": {"utilization": 10, "resets_at": None},
+        "seven_day": {"utilization": 20, "resets_at": None},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+    }, fresh=True)
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "resumed", result
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    print("  [PASS] openai: quota-disabled account resumes after reset with fresh low usage")
+
 # ==============================================================
 # main
 # ==============================================================
@@ -412,6 +478,9 @@ def main():
         test_openai_no_auto_disable_below_threshold,
         test_openai_auto_disable_respects_custom_threshold,
         test_openai_user_disabled_not_touched,
+        test_openai_quota_disabled_not_resumed_from_unknown_usage,
+        test_openai_quota_disabled_waits_until_disabled_until_before_resume,
+        test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage,
     ]
     passed = 0
     failed = 0
