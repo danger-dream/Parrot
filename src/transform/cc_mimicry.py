@@ -181,6 +181,76 @@ def inject_user_system_to_messages(messages, user_system):
     return messages
 
 
+
+# ─── Message/content block normalization ───
+# Top-level request tools are a tagged union, so unknown `type` values must be
+# stripped there. Message content blocks are also tagged by `type`, but unlike
+# tools they can contain JSON Schema-like nested payloads (tool input/result
+# content, images, documents, citations). Keep normalization shallow: only clean
+# known API-bound content block wrappers and never recurse into arbitrary nested
+# JSON.
+
+_CONTENT_BLOCK_ALLOWED_KEYS = {
+    "text": {"type", "text", "citations", "cache_control"},
+    "image": {"type", "source", "cache_control"},
+    "document": {"type", "source", "title", "context", "citations", "cache_control"},
+    "search_result": {"type", "source", "title", "content", "citations", "cache_control"},
+    "tool_use": {"type", "id", "name", "input", "cache_control"},
+    "tool_result": {"type", "tool_use_id", "content", "is_error", "cache_control", "cache_reference"},
+    "thinking": {"type", "thinking", "signature", "cache_control"},
+    "redacted_thinking": {"type", "data", "cache_control"},
+    "server_tool_use": {"type", "id", "name", "input", "cache_control"},
+    "web_search_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "web_fetch_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "code_execution_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "bash_code_execution_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "text_editor_code_execution_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "mcp_tool_use": {"type", "id", "name", "input", "server_name", "cache_control"},
+    "mcp_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "container_upload": {"type", "file_id", "cache_control"},
+    "tool_search_tool_result": {"type", "tool_use_id", "content", "cache_control"},
+    "compaction": {"type", "content", "cache_control"},
+}
+_MESSAGE_ALLOWED_KEYS = {"role", "content", "name"}
+
+
+def _normalize_content_block(block):
+    if not isinstance(block, dict):
+        return block
+    btype = block.get("type")
+    allowed = _CONTENT_BLOCK_ALLOWED_KEYS.get(btype)
+    if allowed is None:
+        # Unknown content block tags should pass through. They may be newly added
+        # Anthropic beta blocks; stripping fields here would be more dangerous
+        # than letting upstream validate them.
+        return dict(block)
+    out = {k: v for k, v in block.items() if k in allowed}
+    if btype == "tool_use" and "caller" in block:
+        # Claude Code strips tool-search-only caller unless the tool-search beta
+        # is active. Parrot does not currently enable that beta on inbound
+        # history, so keep the safe standard API shape.
+        out.pop("caller", None)
+    if btype in ("tool_use", "server_tool_use", "mcp_tool_use") and isinstance(out.get("input"), str):
+        try:
+            out["input"] = json.loads(out["input"]) if out["input"] else {}
+        except Exception:
+            pass
+    return out
+
+
+def _normalize_message_for_api(msg):
+    if not isinstance(msg, dict):
+        return msg
+    out = {k: v for k, v in msg.items() if k in _MESSAGE_ALLOWED_KEYS}
+    content = out.get("content")
+    if isinstance(content, list):
+        out["content"] = [_normalize_content_block(block) for block in content]
+    return out
+
+
+def _normalize_messages_for_api(messages):
+    return [_normalize_message_for_api(msg) for msg in (messages or [])]
+
 # ─── 缓存断点 ───（与 cc-proxy 一字不改）
 
 def _inject_cache_on_msg(msg):
@@ -235,14 +305,87 @@ def _strip_message_cache_control(messages):
     return result
 
 
+_ANTHROPIC_TOOL_ALLOWED_KEYS = {
+    "name",
+    "description",
+    "input_schema",
+    "cache_control",
+    "strict",
+    "eager_input_streaming",
+    "defer_loading",
+}
+_ANTHROPIC_SERVER_TOOL_TYPE_PREFIXES = (
+    "web_search_",
+    "web_fetch_",
+    "computer_",
+    "text_editor_",
+    "bash_",
+    "memory_",
+    "advisor_",
+)
+
+
+def _is_anthropic_server_tool(tool):
+    """Return True for Anthropic built-in/server-tool union variants.
+
+    Normal client tools built by Claude Code are plain objects with name,
+    description and input_schema; they do not include a top-level type. Some
+    SDK/proxy clients accidentally send OpenAI-style or namespace-tagged tools
+    (`type: "function"`, `type: "namespace"`) to the Anthropic endpoint.
+    Anthropic validates `tools[]` as a tagged union, so an unknown top-level
+    `type` triggers: Input tag 'namespace' ... does not match any expected.
+
+    Keep known Anthropic server-tool variants intact; sanitize ordinary client
+    tools to Claude Code's outbound shape.
+    """
+    if not isinstance(tool, dict):
+        return False
+    t = tool.get("type")
+    return isinstance(t, str) and (
+        t in {"web_search", "web_search_20250305"}
+        or any(t.startswith(prefix) for prefix in _ANTHROPIC_SERVER_TOOL_TYPE_PREFIXES)
+    )
+
+
+def _normalize_anthropic_tool(tool):
+    """Normalize one downstream Anthropic tool to the CC-compatible API shape.
+
+    Mirrors Claude Code's toolToAPISchema choke point: standard custom tools are
+    serialized with only name/description/input_schema plus approved optional
+    beta/cache fields. Unknown top-level `type` tags are stripped unless the
+    tool is a known Anthropic server-tool variant.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    if _is_anthropic_server_tool(tool):
+        return {k: v for k, v in tool.items() if k != "cache_control"}
+
+    normalized = {k: v for k, v in tool.items() if k in _ANTHROPIC_TOOL_ALLOWED_KEYS and k != "cache_control"}
+
+    # OpenAI/chat-style compatibility: {type:function,function:{name,description,parameters}}
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        normalized.setdefault("name", fn.get("name"))
+        if "description" in fn:
+            normalized.setdefault("description", fn.get("description"))
+        if "parameters" in fn and "input_schema" not in normalized:
+            normalized["input_schema"] = fn.get("parameters")
+
+    if "input_schema" not in normalized and "parameters" in tool:
+        normalized["input_schema"] = tool.get("parameters")
+
+    # Anthropic client tools require an object input schema. If a malformed
+    # namespace/function wrapper omitted it, provide the minimal object schema
+    # rather than forwarding an unknown union tag that produces a hard 400.
+    if not isinstance(normalized.get("input_schema"), dict):
+        normalized["input_schema"] = {"type": "object", "properties": {}}
+
+    return normalized
+
+
 def _strip_tool_cache_control(tools):
-    """移除客户端在 tools 上设置的 cache_control，由代理统一管理。"""
-    result = []
-    for tool in tools:
-        if isinstance(tool, dict) and "cache_control" in tool:
-            tool = {k: v for k, v in tool.items() if k != "cache_control"}
-        result.append(tool)
-    return result
+    """移除客户端在 tools 上设置的 cache_control，并规范化普通 client tools。"""
+    return [_normalize_anthropic_tool(tool) for tool in tools]
 
 
 def add_cache_breakpoints(messages):
@@ -517,6 +660,7 @@ def transform_request(body, email="", session_id=None):
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
+    messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(messages)
@@ -526,7 +670,8 @@ def transform_request(body, email="", session_id=None):
     # 动态工具名映射（tools > 5 时触发）
     dynamic_tool_map = None
     if body.get("tools"):
-        tool_names = [t.get("name", "") for t in body["tools"]]
+        raw_tools = body["tools"]
+        tool_names = [t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name")]
         dynamic_tool_map = _build_dynamic_tool_map(tool_names)
         if dynamic_tool_map:
             print(f"  [tool] dynamic mapping {len(dynamic_tool_map)} tools")
@@ -544,9 +689,10 @@ def transform_request(body, email="", session_id=None):
     }
 
     if body.get("tools"):
-        tools = _strip_tool_cache_control([dict(t) for t in body["tools"]])
+        tools = _strip_tool_cache_control([dict(t) if isinstance(t, dict) else t for t in body["tools"]])
         for t in tools:
-            t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
+            if isinstance(t, dict) and "name" in t:
+                t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
         tools[-1] = dict(tools[-1])
         tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         payload["tools"] = tools

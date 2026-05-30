@@ -11,6 +11,7 @@
 import json
 
 from .cc_mimicry import (
+    _normalize_messages_for_api,
     _strip_assistant_thinking_blocks,
     _strip_message_cache_control,
     _strip_tool_cache_control,
@@ -26,6 +27,7 @@ def standard_transform(body: dict) -> dict:
     返回纯 dict（未序列化为 bytes）。
     """
     messages = body.get("messages", [])
+    messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     messages = _strip_message_cache_control(messages)
     messages = add_cache_breakpoints(messages)

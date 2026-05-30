@@ -230,6 +230,157 @@ def test_restore_tool_name_field_in_incomplete_sse_json(m):
     assert b'cc_sess_list' not in restored
 
 
+
+def test_anthropic_tool_namespace_type_is_stripped_like_claude_code(m):
+    cc = m["cc_mimicry"]
+    std = m["standard"]
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "namespace",
+                "namespace": "browser",
+                "name": "browser_open",
+                "description": "Open a page",
+                "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}},
+                "extra_client_field": "must not reach Anthropic",
+            }
+        ],
+    }
+
+    cc_payload, _ = cc.transform_request(body, session_id="s")
+    std_payload = std.standard_transform(body)
+
+    for payload in (cc_payload, std_payload):
+        tool = payload["tools"][0]
+        assert tool["name"].endswith("browser_open")
+        assert tool["description"] == "Open a page"
+        assert tool["input_schema"] == {"type": "object", "properties": {"url": {"type": "string"}}}
+        assert tool["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert "type" not in tool
+        assert "namespace" not in tool
+        assert "extra_client_field" not in tool
+
+
+def test_anthropic_chat_style_function_tool_is_flattened(m):
+    cc = m["cc_mimicry"]
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup data",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            },
+        }],
+    }
+    payload, _ = cc.transform_request(body, session_id="s")
+    tool = payload["tools"][0]
+    assert tool["name"] == "lookup"
+    assert tool["description"] == "Lookup data"
+    assert tool["input_schema"] == {"type": "object", "properties": {"q": {"type": "string"}}}
+    assert "type" not in tool
+    assert "function" not in tool
+
+
+def test_anthropic_server_tool_type_is_preserved(m):
+    cc = m["cc_mimicry"]
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+    }
+    payload, _ = cc.transform_request(body, session_id="s")
+    tool = payload["tools"][0]
+    assert tool["type"] == "web_search_20250305"
+    assert tool["name"] == "web_search"
+    assert tool["max_uses"] == 2
+
+
+def test_message_content_block_whitelist_is_shallow_and_preserves_nested_schema(m):
+    cc = m["cc_mimicry"]
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "validate",
+                "caller": {"type": "namespace", "namespace": "tool_search_only"},
+                "input": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"kind": {"type": "string"}},
+                    },
+                    "payload": {"type": "namespace", "namespace": "nested-data-must-stay"},
+                },
+                "extra_client_field": "drop",
+            }],
+            "client_side_meta": "drop",
+        }],
+    }
+    payload, _ = cc.transform_request(body, session_id="s")
+    assistant_msg = next(msg for msg in payload["messages"] if msg.get("role") == "assistant")
+    block = assistant_msg["content"][0]
+    assert block["type"] == "tool_use"
+    assert set(block.keys()) <= {"type", "id", "name", "input", "cache_control"}
+    assert "caller" not in block
+    assert "extra_client_field" not in block
+    assert block["input"]["schema"]["type"] == "object"
+    assert block["input"]["payload"] == {"type": "namespace", "namespace": "nested-data-must-stay"}
+    assert "client_side_meta" not in payload["messages"][0]
+
+
+def test_unknown_message_content_block_passes_through_for_future_betas(m):
+    cc = m["cc_mimicry"]
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "future_beta_block", "foo": {"type": "namespace"}}],
+        }],
+    }
+    payload, _ = cc.transform_request(body, session_id="s")
+    block = payload["messages"][0]["content"][0]
+    assert block["type"] == "future_beta_block"
+    assert block["foo"] == {"type": "namespace"}
+
+
+def test_tool_input_schema_nested_type_fields_are_not_recursively_stripped(m):
+    cc = m["cc_mimicry"]
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "namespace",
+            "namespace": "outer-should-drop",
+            "name": "schema_tool",
+            "description": "schema",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "nested": {
+                        "type": "object",
+                        "properties": {"x": {"type": "string"}},
+                    },
+                    "tagged_payload": {"type": "namespace", "description": "data tag in schema"},
+                },
+            },
+        }],
+    }
+    payload, _ = cc.transform_request(body, session_id="s")
+    tool = payload["tools"][0]
+    assert "type" not in tool
+    assert "namespace" not in tool
+    assert tool["input_schema"]["type"] == "object"
+    assert tool["input_schema"]["properties"]["nested"]["type"] == "object"
+    assert tool["input_schema"]["properties"]["tagged_payload"]["type"] == "namespace"
+
 def test_counting_transport_counts_streamed_request_and_response_bytes(m):
     import asyncio
     import httpx
