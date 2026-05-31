@@ -166,17 +166,31 @@ def _format_reset_text(iso_str: Optional[str]) -> str:
 
 
 def _format_remaining(iso_str: Optional[str]) -> str:
+    """人类可读剩余时间：剩 3天11小时 / 剩 5小时23分 / 剩 4分钟 / 已过期。"""
     dt = _parse_iso(iso_str)
     if dt is None:
         return "?"
     delta = (dt - datetime.now(timezone.utc)).total_seconds()
     if delta <= 0:
         return "已过期"
-    hours = int(delta // 3600)
+    days = int(delta // 86400)
+    hours = int((delta % 86400) // 3600)
     minutes = int((delta % 3600) // 60)
+    if days > 0:
+        return f"剩 {days}天{hours}小时"
     if hours > 0:
-        return f"剩 {hours}h {minutes}m"
-    return f"剩 {minutes}m"
+        return f"剩 {hours}小时{minutes}分"
+    return f"剩 {minutes}分钟"
+
+
+def _fmt_time_full(iso_str: Optional[str]) -> str:
+    """RemainingTimeFormatFull: 2026-06-10 07:09:01（剩 3天11小时）"""
+    dt = _parse_iso(iso_str)
+    if dt is None:
+        return "?"
+    time_str = dt.astimezone(_BJT).strftime("%Y-%m-%d %H:%M:%S")
+    remaining = _format_remaining(iso_str)
+    return f"{time_str}（{remaining}）"
 
 
 def _status_icon(acc: dict) -> str:
@@ -201,19 +215,14 @@ def _this_month_start_ts() -> float:
 
 
 def _format_account_block(acc: dict) -> str:
-    """列表中每条 OAuth 账号的多行展示块。
-
-    示例：
-        ✅ marlenaplocheroei79@gmail.com
-          ⏳ Token 过期: 2026-04-19 12:57:39 (剩 1h 7m)
-          📊 5h 用量:  17% | 重置: 2026-04-19 14:00:00
-          📊 7d 用量:  26% | 重置: 2026-04-25 08:00:00
-          💎 月度统计: ↑ 104.7M · ↓ 1.8M · 缓存 99.8M (95.7%)
-    """
+    """列表中每条 OAuth 账号的统一多行展示块。"""
     email = acc.get("email", "?")
     ak = _account_key(acc)
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason")
+    prov = oauth_manager.provider_of(acc)
+
+    # 状态 tag
     tag = ""
     if reason == "user":
         tag = " [用户禁用]"
@@ -223,59 +232,47 @@ def _format_account_block(acc: dict) -> str:
     elif reason == "auth_error":
         tag = " [认证失败]"
 
-    # provider 图标 + 套餐标签
-    prov = oauth_manager.provider_of(acc)
-    provider_tag = ""
+    # 第一行：icon + email + provider
+    prov_tag = " 🅾️ OpenAI" if prov == "openai" else (" 🅰️ Claude" if prov == "claude" else "")
+    lines = [f"{icon} <code>{ui.escape_html(email)}</code>{prov_tag}{tag}"]
+
+    # 套餐行
     if prov == "openai":
         plan = acc.get("plan_type") or ""
-        sub_exp = acc.get("subscription_expires_at") or ""
-        suffix = f" · {ui.escape_html(plan)}" if plan else ""
-        if sub_exp:
-            suffix += f" · sub 到 {_format_bjt(sub_exp)}"
         workspace = _openai_workspace_label(acc)
-        if workspace:
-            suffix += f" · {workspace}"
-        provider_tag = f" 🅾 OpenAI{suffix}"
+        ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace else ""
+        if plan:
+            lines.append(f"  🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>")
+        sub_exp = acc.get("subscription_expires_at") or ""
+        if sub_exp:
+            lines.append(f"  📅 到期: <code>{_fmt_time_full(sub_exp)}</code>")
     elif prov == "claude":
         cl_label = oauth_manager.claude_plan_label(acc)
         if cl_label:
-            provider_tag = f" 🅰 {ui.escape_html(cl_label)}"
+            lines.append(f"  🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
 
-    lines = [f"{icon} <code>{ui.escape_html(email)}</code>{provider_tag}{tag}"]
-
-    # Token 过期时间（绝对 + 倒计时）
+    # Token 过期
     expired = acc.get("expired")
     if expired:
-        lines.append(
-            f"  ⏳ Token 过期: <code>{_format_bjt(expired)}</code>"
-            f" ({_format_remaining(expired)})"
-        )
+        lines.append(f"  ⏳ Token: <code>{_fmt_time_full(expired)}</code>")
 
-    # 用量（5h / 7d，列成两行，各带绝对重置时间）
+    # 用量（5h / 7d）
     row = state_db.quota_load(ak)
     if row:
         fh_util = row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
-            reset_str = _format_reset_text(reset)
-            lines.append(
-                f"  📊 5h 用量: <b>{fh_util:>4.0f}%</b> | 重置: <code>{reset_str}</code>"
-            )
+            lines.append(f"  📊 5h: <b>{fh_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
         if sd_util is not None:
             reset = row.get("seven_day_reset")
-            reset_str = _format_reset_text(reset)
-            lines.append(
-                f"  📊 7d 用量: <b>{sd_util:>4.0f}%</b> | 重置: <code>{reset_str}</code>"
-            )
+            lines.append(f"  📊 7d: <b>{sd_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
         if fh_util is None and sd_util is None:
             lines.append("  📊 用量: <i>尚未获取</i>")
     else:
-        # OpenAI / Claude 都走同一条路径：点账户详情的“刷新用量”按钮。
-        # OpenAI 主动刷新走 wham/usage；业务响应头仍会实时补充 x-codex-*。
-        lines.append("  📊 用量: <i>尚未获取</i>（请点账户详情手动刷新一次）")
+        lines.append("  📊 用量: <i>尚未获取</i>")
 
-    # 月度统计（本月 log_db 聚合）
+    # 月度统计
     try:
         since_ts = _this_month_start_ts()
         ts = log_db.tokens_for_channel(f"oauth:{ak}", since_ts=since_ts)
@@ -283,18 +280,18 @@ def _format_account_block(acc: dict) -> str:
         ts = None
     if ts and ts["total"] > 0:
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
-        stat_line = f"  💎 月度统计: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
+        stat_line = f"  💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
             stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
         lines.append(stat_line)
         if ts.get("avg_tps") is not None:
             lines.append(
-                f"  ⚡ 本月 TPS: 平均 {ui.fmt_tps(ts.get('avg_tps'))} · "
+                f"  ⚡ TPS: 平均 {ui.fmt_tps(ts.get('avg_tps'))} · "
                 f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
 
-    # 冷却状态（该账号下所有模型聚合）：简短提示；详情在详情页展开
+    # 冷却状态
     from ... import cooldown as _cd
     ck = f"oauth:{ak}"
     cds = [e for e in _cd.active_entries() if e.get("channel_key") == ck]
@@ -747,38 +744,35 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     provider_line = ""
     if prov == "openai":
         plan = acc.get("plan_type") or "?"
-        sub_exp = acc.get("subscription_expires_at") or ""
-        sub_line = (
-            f" · 订阅到: <code>{_format_bjt(sub_exp)}</code>" if sub_exp else ""
-        )
-        provider_line = (
-            f"提供者: <code>🅾 OpenAI (Codex)</code> · 计划: <code>{ui.escape_html(plan)}</code>{sub_line}\n"
-        )
         workspace = _openai_workspace_label(acc, force=True)
-        if workspace and _openai_same_email_count(acc) > 1:
-            provider_line += f"工作区: <code>{workspace}</code>\n"
+        ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace and _openai_same_email_count(acc) > 1 else ""
+        provider_line = f"🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>\n"
+        sub_exp = acc.get("subscription_expires_at") or ""
+        if sub_exp:
+            provider_line += f"📅 到期: <code>{_fmt_time_full(sub_exp)}</code>\n"
     elif prov == "claude":
         cl_label = oauth_manager.claude_plan_label(acc)
-        cl_suffix = f" · {ui.escape_html(cl_label)}" if cl_label else ""
-        provider_line = f"提供者: <code>🅰 Anthropic (Claude){cl_suffix}</code>\n"
-        # 订阅信息
+        provider_line = f"🏷️ 套餐: <code>{ui.escape_html(cl_label or '?')}</code>\n"
         sub_status = acc.get("subscription_status") or ""
         billing = acc.get("billing_type") or ""
         sub_created = acc.get("subscription_created_at") or ""
         if sub_status or billing:
             sub_parts = [s for s in (sub_status, billing) if s]
-            provider_line += f"订阅: <code>{ui.escape_html(' · '.join(sub_parts))}</code>\n"
+            provider_line += f"📋 订阅: <code>{ui.escape_html(' · '.join(sub_parts))}</code>\n"
         if sub_created:
-            provider_line += f"订阅开始: <code>{_format_bjt(sub_created)}</code>\n"
+            provider_line += f"📅 开始: <code>{_format_bjt(sub_created)}</code>\n"
+    else:
+        provider_line = ""
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
     max_cc_label = str(max_cc) if max_cc > 0 else "默认"
+    prov_icon = "🅾️ OpenAI" if prov == "openai" else ("🅰️ Claude" if prov == "claude" else prov)
     text = (
-        f"{icon} <b>{ui.escape_html(email)}</b>\n\n"
+        f"{icon} <b>{ui.escape_html(email)}</b> {prov_icon}\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
         f"{provider_line}"
         f"⚡ 并发上限: <code>{max_cc_label}</code>\n"
-        f"过期: <code>{_format_bjt(acc.get('expired'))}</code> ({_format_remaining(acc.get('expired'))})\n"
-        f"上次刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
+        f"⏳ Token: <code>{_fmt_time_full(acc.get('expired'))}</code>\n"
+        f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
         f"<b>📊 使用量</b>\n{_format_usage_block(account_key)}"
     )
     month_block = _format_month_stats_block(account_key)
@@ -1311,17 +1305,21 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         if load_balancing.is_initialized() else ""
     )
     _cl_plan = oauth_manager.claude_plan_label(entry)
-    _cl_plan_line = f"\n🅰 Claude · {ui.escape_html(_cl_plan)}" if _cl_plan else ""
-    _cl_sub_line = ""
+    _cl_sub_parts = []
     if claude_plan_info.get("subscription_status"):
-        _cl_sub_line = f"\n订阅: {ui.escape_html(claude_plan_info.get('subscription_status', ''))}"
-        if claude_plan_info.get("billing_type"):
-            _cl_sub_line += f" · {ui.escape_html(claude_plan_info['billing_type'])}"
+        _cl_sub_parts.append(claude_plan_info["subscription_status"])
+    if claude_plan_info.get("billing_type"):
+        _cl_sub_parts.append(claude_plan_info["billing_type"])
+    _cl_sub_line = f"\n订阅信息: <code>{ui.escape_html(' · '.join(_cl_sub_parts))}</code>" if _cl_sub_parts else ""
+    _cl_created = claude_plan_info.get("subscription_created_at") or ""
+    _cl_created_line = f"\n开始时间: <code>{_format_bjt(_cl_created)}</code>" if _cl_created else ""
     ui.send_result(
         chat_id,
-        "✅ <b>OAuth 账户已添加</b>\n\n"
-        f"Email: <code>{ui.escape_html(email)}</code>{_cl_plan_line}{_cl_sub_line}\n"
-        f"过期: <code>{_format_bjt(new_expired)}</code>{lb_hint}",
+        "✅ <b>Anthropic OAuth 账户已添加</b>\n\n"
+        f"Email: <code>{ui.escape_html(email)}</code>\n"
+        f"套餐计划: <code>{ui.escape_html(_cl_plan or '?')}</code>{_cl_sub_line}{_cl_created_line}\n"
+        f"过期: <code>{_fmt_time_full(new_expired)}</code>\n"
+        f"来源: <code>Claude OAuth 登录</code>{lb_hint}",
         back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth",
     )
 
@@ -1769,13 +1767,10 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
             quota_note = "\n额度: <code>" + ui.escape_html(" / ".join(parts) or "已获取") + "</code>"
 
     plan = meta.get("plan_type") or "?"
-    plan_tag = f" · plan: <code>{ui.escape_html(plan)}</code>"
-    if meta.get("subscription_expires_at"):
-        plan_tag += f" · sub: <code>{_format_bjt(meta.get('subscription_expires_at'))}</code>"
-    workspace_line = ""
-    if meta.get("workspace_name") or meta.get("workspace_type") or meta.get("workspace_id"):
-        label = meta.get("workspace_name") or meta.get("workspace_type") or "workspace"
-        workspace_line = f"工作区: <code>{ui.escape_html(label)}</code>\n"
+    workspace = meta.get("workspace_name") or meta.get("workspace_type") or ""
+    ws_line = f"工作区: <code>{ui.escape_html(workspace)}</code>\n" if workspace else ""
+    sub_exp = meta.get("subscription_expires_at") or ""
+    sub_line = f"订阅到期时间: <code>{_format_bjt(sub_exp)}</code>\n" if sub_exp else ""
     title = {
         "added": "✅ <b>OpenAI OAuth 账户已添加</b>",
         "replaced": "✅ <b>OpenAI OAuth 账户已更新</b>",
@@ -1788,9 +1783,11 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
     ui.send_result(
         chat_id,
         f"{title}\n\n"
-        f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>{plan_tag}\n"
-        f"{workspace_line}"
-        f"过期: <code>{_format_bjt(meta.get('expired'))}</code>{quota_note}\n"
+        f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>\n"
+        f"套餐计划: <code>{ui.escape_html(plan)}</code>\n"
+        f"{sub_line}"
+        f"{ws_line}"
+        f"过期: <code>{_fmt_time_full(meta.get('expired'))}</code>{quota_note}\n"
         f"处理: <code>{ui.escape_html(action_msg)}</code>\n"
         f"来源: <code>{source}</code>{lb_hint}",
         **_OA_NAV_OPENAI,
