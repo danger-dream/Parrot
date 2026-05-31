@@ -250,7 +250,7 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     assert last, "no editMessageText captured"
     text = last["text"]
     # provider 行
-    assert "🅾 OpenAI" in text or "Provider:" in text, text[:500]
+    assert "🅾" in text and "OpenAI" in text, text[:500]
     # plan 行
     assert "plus" in text
     # 归一化 5h / 7d
