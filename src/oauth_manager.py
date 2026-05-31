@@ -18,6 +18,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import secrets
 import threading
@@ -47,6 +48,7 @@ OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_TOKEN_URL_LEGACY = "https://api.anthropic.com/v1/oauth/token"
 OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BOOTSTRAP_URL = "https://api.anthropic.com/api/claude_cli/bootstrap"
 
 OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 OAUTH_MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
@@ -553,6 +555,17 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                         continue
                 new_fields[k] = data[k]
 
+        # Claude: refresh 后 best-effort 拉 profile 更新套餐信息
+        if provider == "claude":
+            try:
+                profile = _profile_sync(new_fields["access_token"])
+                plan_info = extract_claude_plan_info(profile)
+                for k, v in plan_info.items():
+                    if v not in (None, ""):
+                        new_fields[k] = v
+            except Exception as exc:
+                print(f"[oauth] claude refresh: profile fetch failed for {email}: {exc}")
+
         _save_token_fields(account_key, new_fields)
         return new_fields["access_token"]
 
@@ -614,13 +627,7 @@ def _profile_sync(access_token: str) -> dict:
 
 
 def _usage_sync(access_token: str) -> dict:
-    """调 Anthropic /api/oauth/usage 拿 usage 数据。
-
-    请求头与 sub2api 的 claudeUsageService.FetchUsageWithOptions 对齐（2026-04-20）：
-      - Accept / Content-Type / anthropic-beta 与用户抓包一致
-      - User-Agent 跟随 CC 版本（v2.1.156）
-      - timeout 30s（sub2api 产线验证值）
-    """
+    """调 Anthropic /api/oauth/usage 拿 usage 数据。"""
     if mock_mode_enabled():
         return _mock_usage()
     resp = network.get_sync(
@@ -641,6 +648,59 @@ def _usage_sync(access_token: str) -> dict:
 
 async def fetch_profile(access_token: str) -> dict:
     return await asyncio.to_thread(_profile_sync, access_token)
+
+
+def extract_claude_plan_info(profile: dict) -> dict:
+    """从 /api/oauth/profile 响应中提取套餐信息，返回可直接 merge 到 account entry 的 dict。"""
+    org = profile.get("organization") or {}
+    return {
+        "plan_type": org.get("organization_type") or "",
+        "rate_limit_tier": org.get("rate_limit_tier") or "",
+        "billing_type": org.get("billing_type") or "",
+        "subscription_status": org.get("subscription_status") or "",
+        "subscription_created_at": org.get("subscription_created_at") or "",
+        "has_extra_usage_enabled": bool(org.get("has_extra_usage_enabled")),
+        "seat_tier": org.get("seat_tier") or "",
+    }
+
+
+def claude_plan_label(acc: dict) -> str:
+    """生成人类可读的套餐标签，如 'claude_max (Max 5x)'。"""
+    plan = acc.get("plan_type") or ""
+    tier = acc.get("rate_limit_tier") or ""
+    # rate_limit_tier → 人类可读简称
+    _TIER_SHORT = {
+        "default_claude_ai": "Free",
+        "default_claude_pro": "Pro",
+        "default_claude_max_5x": "Max 5x",
+        "default_claude_max_20x": "Max 20x",
+    }
+    short = _TIER_SHORT.get(tier, tier.replace("default_claude_", "").replace("_", " ") if tier else "")
+    if plan and short:
+        return f"{plan} ({short})"
+    return plan or short or ""
+
+
+def _bootstrap_sync(access_token: str) -> dict:
+    """调 /api/claude_cli/bootstrap 拿实时套餐信息。"""
+    if mock_mode_enabled():
+        return {}
+    resp = network.get_sync(
+        OAUTH_BOOTSTRAP_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/2.1.156",
+        },
+        timeout=15,
+        proxy_purpose="oauth_anthropic",
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def fetch_bootstrap(access_token: str) -> dict:
+    return await asyncio.to_thread(_bootstrap_sync, access_token)
 
 
 class QuotaNotSupported(Exception):
@@ -835,26 +895,39 @@ def ensure_quota_fresh_sync(account_keys: list[str] | str, *,
 def flatten_usage(usage: dict) -> dict:
     """把 /api/oauth/usage 返回的嵌套结构展平，便于写 state_db.oauth_quota_cache。
 
-    ⚠ 单位约定（2026-04-20 二次修复，对齐 sub2api 产线实现）：
-
-      Anthropic 两条 usage 通道单位不同：
-        • `/api/oauth/usage` JSON body（本函数处理的路径）：utilization 已是 0..100 百分比
-          （例：5.0 表示 5%、1.0 表示 1%、65.2 表示 65.2%）
-        • 响应头 `anthropic-ratelimit-unified-5h/7d-utilization`（本项目暂未接入）：
-          0..1 小数，需 × 100 转百分比
-
-      参考 sub2api `backend/internal/service/account_usage_service.go::buildUsageInfo`
-      （line 1208: `Utilization: resp.FiveHour.Utilization` 直接透传），确认主动拉
-      的 JSON body 单位就是百分比。
-
-      历史上 Parrot 做了 "v <= 1.0 → v*100" 的启发式单位探测，遇到用户实际用量 1%
-      （上游返回 1.0）会被误判成 100%。现在改为直接透传，与 sub2api 一致。
+    单位：/api/oauth/usage body 返回 0..100 百分比，_util_pct 做类型校验 +
+    NaN/Inf 保护 + clamp(0,100)。响应头的 0..1 小数在 rate_limit_headers.py 单独处理。
     """
+    def _safe_float(v) -> float:
+        """安全转 float，None / NaN / Inf / 非法值 → 0.0。"""
+        if v is None:
+            return 0.0
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        if math.isnan(f) or math.isinf(f):
+            return 0.0
+        return f
+
     def _util_pct(obj) -> float | None:
         if not obj or obj.get("utilization") is None:
             return None
-        # Anthropic /api/oauth/usage 已是 0..100 百分比，直接透传（对齐 sub2api）
-        return float(obj["utilization"])
+        raw = obj["utilization"]
+        # 类型校验：非数字 → None
+        if not isinstance(raw, (int, float)):
+            try:
+                raw = float(raw)
+            except (TypeError, ValueError):
+                return None
+        v = float(raw)
+        # NaN / Inf → None（上游偶发异常值保护）
+        if math.isnan(v) or math.isinf(v):
+            return None
+        # Anthropic /api/oauth/usage body 返回 0..100 百分比，直接透传。
+        # 不做 0..1 → ×100 启发式转换（用户真实 1% 会被误判为 100%）。
+        # 钳位 0..100（参考 claude-code-rust clamp），异常高值不会触发误禁用。
+        return max(0.0, min(100.0, v))
 
     fh = usage.get("five_hour") or {}
     sd = usage.get("seven_day") or {}
@@ -872,9 +945,9 @@ def flatten_usage(usage: dict) -> dict:
         "sonnet_reset": sds.get("resets_at"),
         "opus_util": _util_pct(sdo),
         "opus_reset": sdo.get("resets_at"),
-        "extra_used": float(extra.get("used_credits", 0) or 0),
-        "extra_limit": float(extra.get("monthly_limit", 0) or 0),
-        "extra_util": float(extra.get("utilization", 0) or 0),
+        "extra_used": _safe_float(extra.get("used_credits")) / 100.0,
+        "extra_limit": _safe_float(extra.get("monthly_limit")) / 100.0,
+        "extra_util": _util_pct(extra),
         "raw_data": json.dumps(usage, ensure_ascii=False),
     }
 
@@ -1416,6 +1489,13 @@ def add_account(entry: dict) -> None:
     # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
     if provider == "openai":
         normalized.update(_openai_metadata_patch(entry))
+    # Claude 专属字段（套餐/订阅信息，来自 /api/oauth/profile）
+    elif provider == "claude":
+        for k in ("plan_type", "rate_limit_tier", "billing_type",
+                   "subscription_status", "subscription_created_at",
+                   "has_extra_usage_enabled", "seat_tier"):
+            if entry.get(k) is not None:
+                normalized[k] = entry[k]
 
     normalized_key = _account_key(normalized)
     added = {"v": False}
@@ -1786,10 +1866,17 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             else:
                 disabled_line = "\n账号未自动禁用；可稍后重试。"
             print(f"[oauth] proactive refresh failed for {ak}: {oauth_errors.technical_detail(exc)}")
+            _rf_plan_tag = ""
+            if provider_of(ak) == "claude":
+                _rf_pl = claude_plan_label(acc)
+                _rf_plan_tag = f"\n🅰 Claude · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
+            elif provider_of(ak) == "openai":
+                _rf_pl = acc.get("plan_type") or ""
+                _rf_plan_tag = f"\n🅾 OpenAI · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
             notifier.notify_event(
                 "oauth_refresh_failed",
                 "⚠ <b>OAuth Token 刷新失败</b>\n"
-                f"账号: <code>{notifier.escape_html(disp)}</code>\n"
+                f"账号: <code>{notifier.escape_html(disp)}</code>{_rf_plan_tag}\n"
                 + oauth_errors.format_oauth_error_html(err)
                 + disabled_line
             )
@@ -1844,6 +1931,15 @@ async def quota_monitor_once() -> dict:
         utils = result["utils"]
         action = result["action"]
 
+        # 通知里追加套餐标签（Claude 显示套餐/tier，OpenAI 显示 plan_type）
+        _plan_tag = ""
+        if provider_of(ak) == "claude":
+            _pl = claude_plan_label(acc)
+            _plan_tag = f"\n🅰 Claude · {notifier.escape_html(_pl)}" if _pl else ""
+        elif provider_of(ak) == "openai":
+            _pl = acc.get("plan_type") or ""
+            _plan_tag = f"\n🅾 OpenAI · {notifier.escape_html(_pl)}" if _pl else ""
+
         if action == "disabled":
             latest_reset = result["disabled_until"]
             hit = " / ".join(result["hit_windows"]) or "?"
@@ -1851,7 +1947,7 @@ async def quota_monitor_once() -> dict:
             notifier.notify_event(
                 "quota_disabled",
                 "⚠ <b>OAuth 配额已用尽，账号被自动禁用</b>\n"
-                f"账号: <code>{notifier.escape_html(email)}</code>\n"
+                f"账号: <code>{notifier.escape_html(email)}</code>{_plan_tag}\n"
                 f"撞到窗口: <code>{hit}</code>\n"
                 f"重置时间: <code>{_to_bjt(latest_reset) if latest_reset else 'unknown'}</code>\n"
                 "所有撞到窗口恢复后即可自动解禁。"
@@ -1863,7 +1959,7 @@ async def quota_monitor_once() -> dict:
             notifier.notify_event(
                 "quota_resumed",
                 "✅ <b>OAuth 配额已恢复，账号重新启用</b>\n"
-                f"账号: <code>{notifier.escape_html(email)}</code>",
+                f"账号: <code>{notifier.escape_html(email)}</code>{_plan_tag}",
             )
         elif action == "kept_enabled":
             parts = [f"{u:.0f}%" if u is not None else "-" for u in utils]

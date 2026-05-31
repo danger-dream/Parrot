@@ -223,7 +223,7 @@ def _format_account_block(acc: dict) -> str:
     elif reason == "auth_error":
         tag = " [认证失败]"
 
-    # provider 图标：claude 不显示（默认），openai 加 🅾 + plan
+    # provider 图标 + 套餐标签
     prov = oauth_manager.provider_of(acc)
     provider_tag = ""
     if prov == "openai":
@@ -236,6 +236,10 @@ def _format_account_block(acc: dict) -> str:
         if workspace:
             suffix += f" · {workspace}"
         provider_tag = f" 🅾 OpenAI{suffix}"
+    elif prov == "claude":
+        cl_label = oauth_manager.claude_plan_label(acc)
+        if cl_label:
+            provider_tag = f" 🅰 {ui.escape_html(cl_label)}"
 
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{provider_tag}{tag}"]
 
@@ -754,7 +758,18 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         if workspace and _openai_same_email_count(acc) > 1:
             provider_line += f"工作区: <code>{workspace}</code>\n"
     elif prov == "claude":
-        provider_line = f"提供者: <code>🅰 Anthropic (Claude)</code>\n"
+        cl_label = oauth_manager.claude_plan_label(acc)
+        cl_suffix = f" · {ui.escape_html(cl_label)}" if cl_label else ""
+        provider_line = f"提供者: <code>🅰 Anthropic (Claude){cl_suffix}</code>\n"
+        # 订阅信息
+        sub_status = acc.get("subscription_status") or ""
+        billing = acc.get("billing_type") or ""
+        sub_created = acc.get("subscription_created_at") or ""
+        if sub_status or billing:
+            sub_parts = [s for s in (sub_status, billing) if s]
+            provider_line += f"订阅: <code>{ui.escape_html(' · '.join(sub_parts))}</code>\n"
+        if sub_created:
+            provider_line += f"订阅开始: <code>{_format_bjt(sub_created)}</code>\n"
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
     max_cc_label = str(max_cc) if max_cc > 0 else "默认"
     text = (
@@ -1251,12 +1266,14 @@ def on_login_code_input(chat_id: int, text: str) -> None:
                        **nav)
         return
 
-    # 获取 email（可选）
+    # 获取 email + 套餐信息（可选）
     email = ""
+    claude_plan_info = {}
     try:
         profile = _run_sync(oauth_manager.fetch_profile(tok_resp.get("access_token", "")))
         if isinstance(profile, dict):
             email = (profile.get("account") or {}).get("email", "") or ""
+            claude_plan_info = oauth_manager.extract_claude_plan_info(profile)
     except Exception:
         pass
 
@@ -1279,6 +1296,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         "models": [],
         # §9-1：存登录响应里的 scope，供后续 refresh 带真实 scope
         "scopes": tok_resp.get("scope", "") or "",
+        **claude_plan_info,
     }
     try:
         oauth_manager.add_account(entry)
@@ -1292,10 +1310,17 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         "\n\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
         if load_balancing.is_initialized() else ""
     )
+    _cl_plan = oauth_manager.claude_plan_label(entry)
+    _cl_plan_line = f"\n🅰 Claude · {ui.escape_html(_cl_plan)}" if _cl_plan else ""
+    _cl_sub_line = ""
+    if claude_plan_info.get("subscription_status"):
+        _cl_sub_line = f"\n订阅: {ui.escape_html(claude_plan_info.get('subscription_status', ''))}"
+        if claude_plan_info.get("billing_type"):
+            _cl_sub_line += f" · {ui.escape_html(claude_plan_info['billing_type'])}"
     ui.send_result(
         chat_id,
         "✅ <b>OAuth 账户已添加</b>\n\n"
-        f"Email: <code>{ui.escape_html(email)}</code>\n"
+        f"Email: <code>{ui.escape_html(email)}</code>{_cl_plan_line}{_cl_sub_line}\n"
         f"过期: <code>{_format_bjt(new_expired)}</code>{lb_hint}",
         back_label="◀ 返回 OAuth 列表", back_callback="menu:oauth",
     )
