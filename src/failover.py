@@ -204,10 +204,14 @@ def _maybe_auto_disable_by_headers(account_key: str, email: str,
         windows = []
         if hit_5h: windows.append("5h")
         if hit_7d: windows.append("7d")
+        _acc = oauth_manager.get_account(account_key)
+        _plan = oauth_manager.claude_plan_label(_acc) if _acc else ""
+        _plan_tag = f" · {ek(_plan)}" if _plan else ""
         notifier.notify_event(
             "quota_disabled",
             "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
-            f"账号: <code>{ek(email)}</code> · 🅰 Claude\n"
+            f"账号: <code>{ek(email)}</code>\n"
+            f"🅰️ Claude{_plan_tag}\n"
             f"超限窗口: <code>{' / '.join(windows)}</code>\n"
             f"恢复时间: <code>{latest or 'unknown'}</code>\n"
             "达到该时间后由 quota_monitor 自动恢复。"
@@ -273,10 +277,14 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
 
     try:
         ek = notifier.escape_html
+        _acc = oauth_manager.get_account(account_key)
+        _plan = (_acc.get("plan_type") or "") if _acc else ""
+        _plan_tag = f" · {ek(_plan)}" if _plan else ""
         notifier.notify_event(
             "quota_disabled",
             "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
-            f"账号: <code>{ek(email)}</code> · 🅾 OpenAI\n"
+            f"账号: <code>{ek(email)}</code>\n"
+            f"🅾️ OpenAI{_plan_tag}\n"
             f"超限窗口: <code>{' / '.join(over_windows)}</code> "
             f"(阈值 {threshold:.0f}%)\n"
             f"恢复时间: <code>{latest_iso or 'unknown'}</code>"
