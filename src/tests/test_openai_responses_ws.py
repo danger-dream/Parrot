@@ -439,13 +439,17 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
         {"type": "response.completed", "response": {"id": "resp_o", "output": [], "usage": {}}},
     ])
 
+    captured: dict[str, Any] = {}
+
     async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
         assert url == "wss://chatgpt.com/backend-api/codex/responses"
         assert headers["authorization"] == "Bearer tok"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
         assert headers["session-id"] == headers["thread-id"]
-        assert headers["session_id"] == headers["session-id"]
-        assert headers["conversation_id"] == headers["thread-id"]
+        # Codex CLI only uses hyphenated session-id; underscore variants must not be sent.
+        assert "session_id" not in headers
+        assert "conversation_id" not in headers
+        captured["headers"] = dict(headers)
         return fake_upstream
 
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
@@ -458,6 +462,10 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     assert upstream_first["stream"] is True
     assert upstream_first["input"] == [{"type": "message", "role": "user", "content": "hello"}]
     assert upstream_first["client_metadata"] == {"a": "b"}
+    # Without client_metadata identity anchors there is no response-side mapping to restore,
+    # so this legacy transform smoke test only requires session/thread headers to be isolated.
+    assert upstream_first["prompt_cache_key"] == "shared-anchor"
+    assert captured["headers"]["session-id"] != "shared-anchor"
     assert "temperature" not in upstream_first
     assert ws.close_calls[-1][0] == 1000
 
@@ -780,6 +788,143 @@ def test_responses_upstream_ws_config_default_off(m):
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     assert m["failover"]._should_use_responses_upstream_ws(ch, ingress_protocol="responses", cfg=cfg) is True
 
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores_response(monkeypatch, m):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
+    ch = _make_oauth_channel_for_failover(m, name="identity@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    captured: dict[str, Any] = {}
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+        captured["headers"] = dict(headers)
+        return fake_ws
+
+    fake_ws = FakeOAuthHttpWs([])
+    events_holder: list[str] = []
+
+    async def dynamic_recv():
+        if not events_holder:
+            for _ in range(20):
+                if fake_ws.sent:
+                    break
+                await asyncio.sleep(0)
+            sent = json.loads(fake_ws.sent[0])
+            cm = sent.get("client_metadata") or {}
+            tm = json.loads(cm["x-codex-turn-metadata"])
+            events_holder.extend(json.dumps(e) for e in [
+                {"type": "response.created", "response": {"id": "resp_identity"}},
+                {"type": "response.completed", "response": {
+                    "id": "resp_identity",
+                    "prompt_cache_key": sent["prompt_cache_key"],
+                    "turn_id": tm["turn_id"],
+                    "metadata": {"installation": cm["x-codex-installation-id"]},
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }},
+            ])
+        if events_holder:
+            return events_holder.pop(0)
+        import websockets
+        raise websockets.ConnectionClosed(None, None)
+
+    fake_ws.recv = dynamic_recv  # type: ignore[method-assign]
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    body = {
+        "model": "test-model", "stream": False, "input": "hello",
+        "prompt_cache_key": "shared-anchor",
+        "client_metadata": {
+            "x-codex-installation-id": "inst-real",
+            "x-codex-window-id": "shared-anchor:0",
+            "x-codex-turn-metadata": json.dumps({
+                "prompt_cache_key": "shared-anchor",
+                "turn_id": "turn-real",
+                "window_id": "shared-anchor:0",
+            }),
+        },
+    }
+    resp, rid = await _call_failover_responses(m, ch, body)
+    assert resp.status_code == 200
+    sent = json.loads(fake_ws.sent[0])
+    cm = sent["client_metadata"]
+    tm = json.loads(cm["x-codex-turn-metadata"])
+    assert sent["prompt_cache_key"] == captured["headers"]["session-id"]
+    assert sent["prompt_cache_key"] != "shared-anchor"
+    assert cm["x-codex-installation-id"] != "inst-real"
+    assert cm["x-codex-window-id"] == f"{sent['prompt_cache_key']}:0"
+    assert tm["prompt_cache_key"] == sent["prompt_cache_key"]
+    assert tm["turn_id"] != "turn-real"
+    assert tm["window_id"] == f"{sent['prompt_cache_key']}:0"
+    assert "conversation_id" not in {k.lower(): v for k, v in captured["headers"].items()}
+
+    obj = json.loads(resp.body)
+    assert obj["prompt_cache_key"] == "shared-anchor"
+    assert obj["turn_id"] == "turn-real"
+    assert obj["metadata"]["installation"] == "inst-real"
+    assert "shared-anchor" in (m["log_db"].log_detail(rid)["detail"].get("response_body") or "")
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_oauth_pending_visible_identity_restored_before_downstream(monkeypatch, m):
+    cfg = _setup(m)
+    cfg["oauth"] = {"providers": {"openai": {"forceCodexCLI": True, "isolateSessionId": True}}}
+    ch = m["OpenAIOAuthChannel"]({
+        "email": "pending@example.com", "provider": "openai",
+        "access_token": "tok", "refresh_token": "rt", "models": ["test-model"],
+    })
+    with m["registry"]._lock:
+        m["registry"]._channels = {ch.key: ch}
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_upstream = FakeUpstreamWebSocket([])
+    events_holder: list[str] = []
+
+    async def dynamic_recv():
+        if not events_holder:
+            for _ in range(20):
+                if fake_upstream.sent:
+                    break
+                await asyncio.sleep(0)
+            sent = json.loads(fake_upstream.sent[0])
+            tm = json.loads(sent["client_metadata"]["x-codex-turn-metadata"])
+            events_holder.extend(json.dumps(e) for e in [
+                {"type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+                 "delta": sent["prompt_cache_key"] + "|" + tm["turn_id"]},
+                {"type": "response.completed", "response": {"id": "resp", "output": [], "usage": {}}},
+            ])
+        if events_holder:
+            return events_holder.pop(0)
+        import websockets
+        raise websockets.ConnectionClosed(None, None)
+
+    fake_upstream.recv = dynamic_recv  # type: ignore[method-assign]
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model", "input": "hello", "stream": True,
+        "prompt_cache_key": "raw-pck",
+        "client_metadata": {"x-codex-turn-metadata": json.dumps({"prompt_cache_key": "raw-pck", "turn_id": "turn-raw"})},
+    })
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    first_downstream = json.loads(ws.sent_texts[0])
+    assert first_downstream["type"] == "response.output_text.delta"
+    assert "raw-pck" in first_downstream["delta"]
+    assert "turn-raw" in first_downstream["delta"]
+    assert "003" not in first_downstream["delta"]  # guard against obvious isolated-session leakage
+    assert ws.close_calls[-1][0] == 1000
 
 @pytest.mark.asyncio
 async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch, m):

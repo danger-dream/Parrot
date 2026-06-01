@@ -182,11 +182,12 @@ def test_transform_legacy_functions(m):
     assert names == ["f1", "f2"], f"got top-level names: {names}"
     assert all(t.get("type") == "function" for t in out["tools"])
     assert out["tool_choice"] == {"type": "function", "name": "f1"}
-    # string function_call (auto)
+    # string function_call (auto) without functions → tool_choice stripped (no tools)
     out2 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1", "input": [], "function_call": "auto",
     })
-    assert out2["tool_choice"] == "auto"
+    assert "tool_choice" not in out2
+    assert "tools" not in out2
     print("  [PASS] transform: legacy functions/function_call → tools/tool_choice (flat name)")
 
 
@@ -284,12 +285,13 @@ def test_transform_normalizes_chat_style_tools(m):
     assert tools[0]["strict"] is True
     # 第二个：原样保留
     assert tools[1]["name"] == "existing"
-    # invalid 工具会被丢弃
+    # invalid 工具会被丢弃; empty tools array stripped entirely
     out2 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1", "input": "hi",
         "tools": [{"type": "function"}],   # 无 name 也无 function 对象
     })
-    assert out2["tools"] == []
+    assert "tools" not in out2
+    assert "tool_choice" not in out2
     # 非 function 类型的工具原样保留
     out3 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1", "input": "hi",
@@ -411,7 +413,7 @@ def test_channel_responses_ingress(m):
     assert h["chatgpt-account-id"] == "acct-123"
     assert h["openai-beta"] == "responses=experimental"
     assert h["originator"] == "codex_cli_rs"
-    assert h["version"] == "0.125.0"
+    assert h["version"] == "0.135.0"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -559,11 +561,11 @@ def test_session_id_isolation_with_prompt_cache_key(m):
     sid_b = req_b.headers.get("session_id")
     assert sid_a and sid_b
     assert sid_a != sid_b, "相同 prompt_cache_key 的不同 api_key 不应共享 session_id"
-    # conversation_id 与 session_id 一致
-    assert req_a.headers.get("conversation_id") == sid_a
+    # conversation_id deprecated — should no longer be present
+    assert "conversation_id" not in req_a.headers
     # 长度 16 hex
     assert len(sid_a) == 16 and all(ch_ in "0123456789abcdef" for ch_ in sid_a)
-    print("  [PASS] session_id: api_key_name-based isolation, conversation_id aligned")
+    print("  [PASS] session_id: api_key_name-based isolation, conversation_id removed")
 
 
 def test_session_id_isolation_disabled(m):

@@ -34,6 +34,12 @@ from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai.transform import common as openai_common
 from .openai.transform import codex_oauth_transform
+from .openai.codex_identity_confuse import (
+    ConfuseState,
+    confuse_client_metadata,
+    confuse_headers as confuse_identity_headers,
+    expose_response_payload,
+)
 from .proxy.connector import DirectConnector, SOCKS5Connector, SS2022Connector
 from .oauth import openai as openai_provider
 from .scheduler import ScheduleResult
@@ -551,12 +557,13 @@ def _should_cooldown(outcome: str) -> bool:
     return outcome not in _OUTCOMES_NO_COOLDOWN
 
 
-def _is_sonnet_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
-    """Sonnet 1M entitlement 不足：不是渠道故障，去掉 context-1m 同渠道重试一次。
+def _is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
+    """Context 1M entitlement 不足：不是渠道故障，去掉 context-1m 同渠道重试一次。
 
-    Anthropic 对缺少 usage credits / group credit 的 Sonnet long-context 请求会返回
+    Anthropic 对缺少 usage credits / group credit 的 long-context 请求会返回
     `429 Usage credits are required for long context requests.`。这类错误如果按普通
-    http_error 记 scorer/cooldown，会很快把健康渠道打坏；正确处理是仅对 Sonnet +
+    http_error 记 scorer/cooldown，会很快把健康渠道打坏；正确处理是对所有支持
+    context-1m 的模型（Opus 4.x / Sonnet 4.5+），关闭 1M 后同渠道重试一次。仅对
     本次确实启用了 context-1m 的请求，关闭 1M 后同渠道重试一次。
     """
     if result.http_status != 429:
@@ -565,8 +572,7 @@ def _is_sonnet_context_1m_credit_error(result: AttemptResult, resolved_model: st
         return False
     if "usage credits are required for long context requests" not in (result.error_detail or "").lower():
         return False
-    model = str(resolved_model or "").lower()
-    if not model.startswith(("claude-sonnet-4-5", "claude-sonnet-4-6")):
+    if not cc_mimicry.model_supports_context_1m(resolved_model):
         return False
     # 只处理本次明确带/要求 1M 的请求，避免误吞普通 429。
     if body.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY) is True:
@@ -859,12 +865,12 @@ async def run_failover(
         # 避免显式 1M 下游持续请求时把健康渠道打进 cooldown/禁用。
         context_retry_key = (ch.key, resolved_model)
         if (
-            _is_sonnet_context_1m_credit_error(result, resolved_model, body)
+            _is_context_1m_credit_error(result, resolved_model, body)
             and context_retry_key not in retried_without_context_1m
         ):
             retried_without_context_1m.add(context_retry_key)
             body = _retry_body_without_context_1m(body)
-            print(f"[failover] Sonnet context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
+            print(f"[failover] context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
             retry_count += 1
             continue
 
@@ -1042,9 +1048,12 @@ def _attach_release_to_response(response: Response, release_fn) -> None:
 
 # ─── OpenAI OAuth Responses: HTTP ingress → WS upstream ───────────────
 
-_RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06"
-_CODEX_CLI_VERSION = "0.125.0"
-_CODEX_CLI_UA = f"codex_cli_rs/{_CODEX_CLI_VERSION}"
+from .openai.codex_constants import (
+    CODEX_CLI_VERSION as _CODEX_CLI_VERSION,
+    CODEX_CLI_USER_AGENT as _CODEX_CLI_UA,
+    CODEX_ORIGINATOR as _CODEX_ORIGINATOR,
+    RESPONSES_WEBSOCKETS_BETA as _RESPONSES_WEBSOCKETS_BETA,
+)
 
 _SKIP_WS_HEADERS = {
     "host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version",
@@ -1081,6 +1090,20 @@ def _ws_proxy_snapshot(proxy_bytes: _WsProxyBytes) -> tuple[int, int]:
     return int(proxy_bytes.up or 0), int(proxy_bytes.down or 0)
 
 
+def _drop_headers_case_insensitive(headers: dict[str, str], names: set[str]) -> dict[str, str]:
+    drop = {n.lower() for n in names}
+    return {k: v for k, v in (headers or {}).items() if str(k).lower() not in drop}
+
+
+def _get_header_case_insensitive(headers: dict[str, str] | None, key: str) -> str:
+    if not headers:
+        return ""
+    for k, v in headers.items():
+        if str(k).lower() == key.lower():
+            return str(v)
+    return ""
+
+
 def _merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in (headers or {}).items():
@@ -1089,18 +1112,22 @@ def _merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]
             continue
         out[str(k)] = str(v)
     out["OpenAI-Beta"] = _RESPONSES_WEBSOCKETS_BETA
-    out.setdefault("originator", "codex_cli_rs")
+    out.setdefault("originator", _CODEX_ORIGINATOR)
     out.setdefault("version", _CODEX_CLI_VERSION)
-    out.setdefault("User-Agent", _CODEX_CLI_UA)
+    # httpx 请求头可能已有 lower-case user-agent；WS 只保留一个 canonical User-Agent。
+    out = _drop_headers_case_insensitive(out, {"user-agent"})
+    out["User-Agent"] = _CODEX_CLI_UA
 
     sid = out.get("session-id") or out.get("session_id")
-    tid = out.get("thread-id") or out.get("conversation_id") or sid
+    tid = out.get("thread-id") or sid
     if sid:
         out.setdefault("session-id", sid)
-        out.setdefault("session_id", sid)
     if tid:
         out.setdefault("thread-id", tid)
-        out.setdefault("conversation_id", tid)
+        out.setdefault("x-client-request-id", tid)
+    # Codex CLI only sends session-id / thread-id (hyphenated).
+    # Remove legacy underscore / conversation variants.
+    out = _drop_headers_case_insensitive(out, {"session_id", "conversation_id", "conversation-id"})
     return out
 
 
@@ -1116,7 +1143,7 @@ def _ensure_oauth_responses_ws_session_headers(
     isolated identity from the original request body as a fallback.
     """
     sid = headers.get("session-id") or headers.get("session_id")
-    tid = headers.get("thread-id") or headers.get("conversation_id") or sid
+    tid = headers.get("thread-id") or sid
     if not sid:
         try:
             from .channel.openai_oauth_channel import _isolate_session_id
@@ -1129,20 +1156,23 @@ def _ensure_oauth_responses_ws_session_headers(
             pass
     if sid:
         headers.setdefault("session-id", sid)
-        headers.setdefault("session_id", sid)
     if tid:
         headers.setdefault("thread-id", tid)
-        headers.setdefault("conversation_id", tid)
+        headers.setdefault("x-client-request-id", tid)
+    # Codex CLI only sends session-id / thread-id (hyphenated).
+    # Remove legacy underscore / conversation variants.
+    for _ck in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
+        del headers[_ck]
 
 
-def _build_oauth_responses_ws_frame(body: dict, resolved_model: str) -> str:
+def _build_oauth_responses_ws_frame(body: dict, resolved_model: str) -> dict:
     payload = openai_common.filter_responses_passthrough(body)
     payload["model"] = resolved_model
     payload = codex_oauth_transform.apply_codex_oauth_transform(
         payload, resolved_model=resolved_model,
     )
     payload["type"] = "response.create"
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return payload
 
 
 def _ws_route_kwargs(ch: Channel, resolved_model: str) -> dict:
@@ -1593,15 +1623,37 @@ async def _build_oauth_responses_ws_upstream_request(
     ch: OpenAIOAuthChannel,
     body: dict,
     resolved_model: str,
-) -> tuple[str, dict[str, str], str, Optional[dict]]:
+) -> tuple[str, dict[str, str], str, Optional[dict], ConfuseState]:
     # 复用 OAuth channel 的鉴权 / session 隔离 / header 构造；只把 URL 改成 WS，
     # body 用 response.create frame 单独生成，避免把 HTTP JSON body 直接发成 WS frame。
     req = await ch.build_upstream_request(body, resolved_model, ingress_protocol="responses")
     ws_url = _http_url_to_ws(req.url)
     headers = _merge_oauth_responses_ws_headers(req.headers)
     _ensure_oauth_responses_ws_session_headers(headers, body)
-    frame = _build_oauth_responses_ws_frame(body, resolved_model)
-    return ws_url, headers, frame, req.translator_ctx
+    frame_obj = _build_oauth_responses_ws_frame(body, resolved_model)
+
+    api_key_name = str((body or {}).get("_api_key_name") or "")
+    sid = _get_header_case_insensitive(headers, "session-id") or _get_header_case_insensitive(headers, "session_id")
+    raw_anchor = str((body or {}).get("prompt_cache_key") or "").strip()
+    identity_state = ConfuseState()
+    if api_key_name and sid:
+        cm = frame_obj.get("client_metadata") if isinstance(frame_obj.get("client_metadata"), dict) else {}
+        confused_cm, identity_state = confuse_client_metadata(
+            api_key_name, cm, session_prompt_cache_key=sid,
+            original_prompt_cache_key=raw_anchor,
+        )
+        if confused_cm:
+            frame_obj["client_metadata"] = confused_cm
+        elif "client_metadata" in frame_obj:
+            frame_obj.pop("client_metadata", None)
+        if identity_state.confused_prompt_cache_key:
+            frame_obj["prompt_cache_key"] = identity_state.confused_prompt_cache_key
+        headers = confuse_identity_headers(headers, identity_state, session_prompt_cache_key=sid)
+    else:
+        headers = _drop_headers_case_insensitive(headers, {"conversation_id", "conversation-id"})
+
+    frame = json.dumps(frame_obj, ensure_ascii=False, separators=(",", ":"))
+    return ws_url, headers, frame, req.translator_ctx, identity_state
 
 
 async def _try_openai_oauth_responses_ws_channel(
@@ -1623,7 +1675,7 @@ async def _try_openai_oauth_responses_ws_channel(
     idle_timeout = int(timeouts.get("idle", 120))
 
     try:
-        ws_url, ws_headers, first_frame, translator_ctx = await _build_oauth_responses_ws_upstream_request(
+        ws_url, ws_headers, first_frame, translator_ctx, identity_state = await _build_oauth_responses_ws_upstream_request(
             ch, body, resolved_model,
         )
     except Exception as exc:
@@ -1696,6 +1748,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 affinity_hit=affinity_hit,
                 translator_ctx=translator_ctx,
                 body=body,
+                identity_state=identity_state,
                 client_key=client_key,
                 proxy_name=proxy_name,
                 proxy_bytes=proxy_bytes,
@@ -1784,6 +1837,7 @@ async def _consume_oauth_responses_ws(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
+    identity_state: ConfuseState,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -1823,6 +1877,7 @@ async def _consume_oauth_responses_ws(
             affinity_hit=affinity_hit,
             translator_ctx=translator_ctx,
             body=body,
+            identity_state=identity_state,
             client_key=client_key,
             proxy_name=proxy_name,
             proxy_bytes=proxy_bytes,
@@ -1846,6 +1901,7 @@ async def _consume_oauth_responses_ws(
         affinity_hit=affinity_hit,
         translator_ctx=translator_ctx,
         body=body,
+        identity_state=identity_state,
         client_key=client_key,
         proxy_name=proxy_name,
         proxy_bytes=proxy_bytes,
@@ -1920,6 +1976,25 @@ async def _recv_oauth_ws_until_visible(
         wait_sec = min(float(idle_timeout), max(1.0, remaining))
 
 
+def _identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
+    if not state.enabled:
+        return data
+    if isinstance(data, str):
+        return expose_response_payload(data.encode("utf-8"), state).decode("utf-8", errors="replace")
+    if isinstance(data, (bytes, bytearray)):
+        return expose_response_payload(bytes(data), state)
+    return data
+
+
+def _identity_log_text(text: str, state: ConfuseState) -> str:
+    if not text or not state.enabled:
+        return text
+    try:
+        return expose_response_payload(text.encode("utf-8"), state).decode("utf-8", errors="replace")
+    except Exception:
+        return text
+
+
 def _ws_json_to_responses_sse(data: str | bytes) -> bytes | None:
     if isinstance(data, bytes):
         return data
@@ -1950,6 +2025,7 @@ async def _consume_oauth_responses_ws_non_stream(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
+    identity_state: ConfuseState,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -1975,7 +2051,7 @@ async def _consume_oauth_responses_ws_non_stream(
         await _finalize_oauth_ws_error(
             pre_error, ch, resolved_model, request_id, retry_count_so_far,
             affinity_hit, start_time, connect_ms, first_byte_ms,
-            tracker, proxy_name, proxy_bytes,
+            tracker, proxy_name, proxy_bytes, identity_state,
         )
         pre_error.proxy_name = proxy_name
         pre_error.proxy_bytes_up = proxy_bytes.up
@@ -2002,13 +2078,21 @@ async def _consume_oauth_responses_ws_non_stream(
                 continue
             if tracker.response_failed:
                 err = AttemptResult(outcome="stream_upstream_error", error_detail=tracker.stream_error_message or "upstream stream error", connect_ms=connect_ms, first_byte_ms=first_byte_ms, http_status=503)
-                await _finalize_oauth_ws_error(err, ch, resolved_model, request_id, retry_count_so_far, affinity_hit, start_time, connect_ms, first_byte_ms, tracker, proxy_name, proxy_bytes)
+                await _finalize_oauth_ws_error(err, ch, resolved_model, request_id, retry_count_so_far, affinity_hit, start_time, connect_ms, first_byte_ms, tracker, proxy_name, proxy_bytes, identity_state)
                 err.proxy_name = proxy_name
                 err.proxy_bytes_up = proxy_bytes.up
                 err.proxy_bytes_down = proxy_bytes.down
                 return err
 
     obj = tracker.to_full_json(fallback_model=resolved_model)
+    if identity_state.enabled:
+        try:
+            obj = json.loads(expose_response_payload(
+                json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                identity_state,
+            ).decode("utf-8"))
+        except Exception:
+            pass
     usage = upstream.extract_usage_responses_json(obj)
     total_ms = int((time.time() - start_time) * 1000)
     scorer.record_success(ch.key, resolved_model, connect_ms=connect_ms, first_byte_ms=first_byte_ms, total_ms=total_ms)
@@ -2025,7 +2109,7 @@ async def _consume_oauth_responses_ws_non_stream(
         cache_creation_tokens=usage["cache_creation"], cache_read_tokens=usage["cache_read"],
         connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
-        response_body=tracker.get_full_response(), http_status=200,
+        response_body=_identity_log_text(tracker.get_full_response(), identity_state), http_status=200,
         upstream_protocol="openai-responses", upstream_transport="ws",
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
     )
@@ -2033,7 +2117,7 @@ async def _consume_oauth_responses_ws_non_stream(
         outcome="success", success=True,
         response=JSONResponse(content=out_obj, status_code=200),
         http_status=200, connect_ms=connect_ms, first_byte_ms=first_byte_ms,
-        total_ms=total_ms, usage=usage, full_response_text=tracker.get_full_response(),
+        total_ms=total_ms, usage=usage, full_response_text=_identity_log_text(tracker.get_full_response(), identity_state),
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         translator_ctx=translator_ctx,
     )
@@ -2052,6 +2136,7 @@ async def _finalize_oauth_ws_error(
     tracker: _WsResponsesTracker,
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
+    identity_state: ConfuseState,
 ) -> None:
     if _should_cooldown(result.outcome):
         cooldown.record_error(ch.key, resolved_model, result.error_detail)
@@ -2064,7 +2149,7 @@ async def _finalize_oauth_ws_error(
         connect_ms=connect_ms, first_token_ms=first_byte_ms,
         total_ms=int((time.time() - start_time) * 1000),
         http_status=_ws_http_status_from_outcome(result), affinity_hit=affinity_hit,
-        response_body=tracker.get_full_response() or None,
+        response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
         upstream_protocol="openai-responses", upstream_transport="ws",
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
     ))
@@ -2090,6 +2175,7 @@ async def _consume_oauth_responses_ws_stream(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
+    identity_state: ConfuseState,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -2133,7 +2219,7 @@ async def _consume_oauth_responses_ws_stream(
             cache_creation_tokens=usage["cache_creation"], cache_read_tokens=usage["cache_read"],
             connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
-            response_body=tracker.get_full_response(), http_status=200,
+            response_body=_identity_log_text(tracker.get_full_response(), identity_state), http_status=200,
             upstream_protocol="openai-responses", upstream_transport="ws",
             proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
         ))
@@ -2145,13 +2231,13 @@ async def _consume_oauth_responses_ws_stream(
         await _finalize_oauth_ws_error(
             result, ch, resolved_model, request_id, retry_count_so_far,
             affinity_hit, start_time, connect_ms, first_byte_ms,
-            tracker, proxy_name, proxy_bytes,
+            tracker, proxy_name, proxy_bytes, identity_state,
         )
 
     async def stream_generator():
         try:
             for data in first_chunks:
-                out = _ws_json_to_responses_sse(data)
+                out = _ws_json_to_responses_sse(_identity_expose_frame(data, identity_state))
                 if out is not None:
                     yield out
             if pre_error is not None:
@@ -2197,7 +2283,7 @@ async def _consume_oauth_responses_ws_stream(
                     if event_type == "codex.rate_limits":
                         continue
                     if tracker.response_failed:
-                        out = _ws_json_to_responses_sse(data)
+                        out = _ws_json_to_responses_sse(_identity_expose_frame(data, identity_state))
                         if out is not None:
                             yield out
                         await finalize_error(AttemptResult(
@@ -2212,7 +2298,7 @@ async def _consume_oauth_responses_ws_stream(
                         await finalize_error(err)
                         yield _sse_error_for_ingress("responses", errors.ErrType.API, err.error_detail or "blacklist")
                         return
-                out = _ws_json_to_responses_sse(data)
+                out = _ws_json_to_responses_sse(_identity_expose_frame(data, identity_state))
                 if out is not None:
                     yield out
         except asyncio.CancelledError:
@@ -2224,7 +2310,7 @@ async def _consume_oauth_responses_ws_stream(
                     connect_ms=connect_ms, first_token_ms=first_byte_ms,
                     total_ms=int((time.time() - start_time) * 1000),
                     http_status=499, affinity_hit=affinity_hit,
-                    response_body=tracker.get_full_response() or None,
+                    response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
                     upstream_protocol="openai-responses", upstream_transport="ws",
                     proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
                 ))

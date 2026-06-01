@@ -503,10 +503,12 @@ class StreamTranslator:
                 "part": {"type": "summary_text", "text": item.text_buf},
             })
         # 03-fix-plan 附录 #1: reasoning item 加 status:"completed"
+        reasoning_summary = ([{"type": "summary_text", "text": item.text_buf}]
+                             if item.summary_part_opened else [])
         completed_item = {
             "type": "reasoning", "id": item.item_id,
-            "summary": ([{"type": "summary_text", "text": item.text_buf}]
-                        if item.summary_part_opened else []),
+            "encrypted_content": item.text_buf if item.summary_part_opened else "",
+            "summary": reasoning_summary,
             "status": "completed",
         }
         yield _emit("response.output_item.done", {

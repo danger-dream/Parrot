@@ -71,11 +71,18 @@ def translate_request(body: dict, *, api_key_name: str = "") -> dict:
     if isinstance(text_cfg, dict) and text_cfg.get("verbosity"):
         payload["verbosity"] = text_cfg["verbosity"]
 
-    if body.get("tools"):
-        payload["tools"] = [_nest_tool(t) for t in body["tools"]]
+    raw_tools = body.get("tools")
+    has_tools = isinstance(raw_tools, list) and len(raw_tools) > 0
+    tools_explicitly_empty = isinstance(raw_tools, list) and len(raw_tools) == 0
+    if has_tools:
+        payload["tools"] = [_nest_tool(t) for t in raw_tools]
 
     if "tool_choice" in body:
-        payload["tool_choice"] = _translate_tool_choice_r2c(body["tool_choice"])
+        if tools_explicitly_empty:
+            # tools=[] + tool_choice → strip orphaned fields to avoid upstream 400.
+            payload.pop("parallel_tool_calls", None)
+        else:
+            payload["tool_choice"] = _translate_tool_choice_r2c(body["tool_choice"])
 
     for k in ("metadata", "service_tier", "safety_identifier",
               "prompt_cache_key", "prompt_cache_retention", "store"):
@@ -308,6 +315,12 @@ def _input_items_to_messages(items: list) -> list:
                         txt = c.get("text")
                         if isinstance(txt, str) and txt:
                             pending_reasoning.append(txt)
+                # Fallback: Codex CLI strips summary but preserves encrypted_content
+                # across turns. Use it when summary/content produced nothing.
+                if not pending_reasoning:
+                    ec = item.get("encrypted_content")
+                    if isinstance(ec, str) and ec:
+                        pending_reasoning.append(ec)
 
         elif t in (
             "web_search_call", "file_search_call", "computer_call",
@@ -463,6 +476,7 @@ def translate_response(chat: dict, *, model: str,
             output_items.append({
                 "type": "reasoning",
                 "id": _gen_id("rs_"),
+                "encrypted_content": reasoning_text,
                 "summary": [{"type": "summary_text", "text": reasoning_text}],
             })
 

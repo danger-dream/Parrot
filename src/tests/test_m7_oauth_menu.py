@@ -227,8 +227,8 @@ def test_missing_reset_shows_upstream_not_returned(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "5h 用量" in list_text and "上游未返回" in list_text
-    assert "7d 用量" in list_text and "上游未返回" in list_text
+    assert "📊 5h: <b>0%</b> · 重置 <code>?</code>" in list_text
+    assert "📊 7d: <b>45%</b> · 重置 <code>?</code>" in list_text
 
     rec.clear()
     short = m["ui"].register_code("missing-reset@x.com")
@@ -238,7 +238,7 @@ def test_missing_reset_shows_upstream_not_returned(m):
     assert "📅 7d: 45% (重置: 上游未返回)" in detail_text
     assert "🤖 Sonnet 7d: 0% (重置: 上游未返回)" in detail_text
     assert "🧠 Opus 7d: 0% (重置: 上游未返回)" in detail_text
-    print("  [PASS] missing reset renders as 上游未返回 in list + detail")
+    print("  [PASS] missing reset renders current list fallback + 上游未返回 in detail")
 
 
 def test_refresh_token_updates_access_and_usage(m):

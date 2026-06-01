@@ -294,8 +294,9 @@ def test_logs_list_marks_responses_websocket(m):
     rec = _install_recorder(m)
     m["logs_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
-    assert "<code>[rsp]</code> · <b>WS</b>" in text
-    assert "<code>[rsp]</code> · <b>↑WS</b>" in text
+    assert text.count("<code>[rsp]</code>") >= 2
+    assert "传输协议: <b>WS</b>" in text
+    assert "传输协议: <b>↑WS</b>" in text
     assert "gpt-5.5" in text
     print("  [PASS] logs WS marker")
 

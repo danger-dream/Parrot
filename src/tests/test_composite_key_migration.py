@@ -656,7 +656,7 @@ def test_flatten_usage_missing_utilization(m):
 
 
 def test_flatten_usage_preserves_resets_and_extra(m):
-    """reset 时间与 extra_usage 字段照常展平；util 透传不影响其他字段。"""
+    """reset 时间与 extra_usage 字段照常展平；extra 金额按当前缓存单位 /100。"""
     out = m["oauth_manager"].flatten_usage({
         "five_hour": {"utilization": 42.5, "resets_at": "2026-04-20T12:00:00Z"},
         "seven_day": {"utilization": 80.0, "resets_at": "2026-04-27T00:00:00Z"},
@@ -668,10 +668,10 @@ def test_flatten_usage_preserves_resets_and_extra(m):
     assert out["five_hour_util"] == 42.5
     assert out["five_hour_reset"] == "2026-04-20T12:00:00Z"
     assert out["seven_day_util"] == 80.0
-    assert out["extra_used"] == 12.5
-    assert out["extra_limit"] == 50.0
+    assert out["extra_used"] == 0.125
+    assert out["extra_limit"] == 0.5
     assert out["extra_util"] == 25.0
-    print("  [PASS] flatten_usage: preserves resets_at and extra_usage fields")
+    print("  [PASS] flatten_usage: preserves resets_at and normalized extra_usage fields")
 
 
 # ==============================================================

@@ -657,7 +657,11 @@ class ChatSSEAssistantBuilder:
 
     @property
     def finish_reason(self) -> Optional[str]:
-        return self._finish_reason
+        fr = self._finish_reason
+        # Guard: upstream claims tool_calls but none were actually returned.
+        if fr in ("tool_calls", "function_call") and not self._tool_calls:
+            return "stop"
+        return fr
 
     def to_full_json(self, *, id: str, model: str, created: int,
                      system_fingerprint: Optional[str] = None,
@@ -671,7 +675,7 @@ class ChatSSEAssistantBuilder:
             "choices": [{
                 "index": 0,
                 "message": self.get_assistant(),
-                "finish_reason": self._finish_reason or "stop",
+                "finish_reason": self.finish_reason or "stop",
                 "logprobs": None,
             }],
         }

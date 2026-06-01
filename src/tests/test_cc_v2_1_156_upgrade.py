@@ -209,7 +209,7 @@ def test_context_1m_request_signals():
 
 
 
-def test_sonnet_context_1m_credit_error_is_retryable_without_channel_failure():
+def test_context_1m_credit_error_is_retryable_without_channel_failure():
     from src import failover
 
     result = failover.AttemptResult(
@@ -221,8 +221,11 @@ def test_sonnet_context_1m_credit_error_is_retryable_without_channel_failure():
         m.PARROT_WANTS_CONTEXT_1M_KEY: True,
         m.PARROT_ORIGINAL_MODEL_KEY: "claude-sonnet-4-6[1m]",
     }
-    assert failover._is_sonnet_context_1m_credit_error(result, "claude-sonnet-4-6", body)
-    assert not failover._is_sonnet_context_1m_credit_error(result, "claude-opus-4-8", body)
+    assert failover._is_context_1m_credit_error(result, "claude-sonnet-4-6", body)
+        # Opus 4.x supports context-1m, so it should also match now.
+    assert failover._is_context_1m_credit_error(result, "claude-opus-4-8", body)
+    # A model that doesn't support 1M should NOT match.
+    assert not failover._is_context_1m_credit_error(result, "claude-3-5-haiku-20241022", body)
     retry_body = failover._retry_body_without_context_1m(body)
     assert retry_body[m.PARROT_WANTS_CONTEXT_1M_KEY] is False
     assert body[m.PARROT_WANTS_CONTEXT_1M_KEY] is True

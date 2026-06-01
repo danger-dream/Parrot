@@ -48,7 +48,7 @@ SCOPES_AUTHORIZE = (
 SCOPES_REFRESH = "openid profile email"
 
 # 固定的 Codex CLI User-Agent。与 sub2api 最新 Codex 上游请求指纹保持一致。
-USER_AGENT = "codex_cli_rs/0.125.0"
+from ..openai.codex_constants import CODEX_CLI_USER_AGENT as USER_AGENT, CODEX_ORIGINATOR
 
 # 运行期请求超时（换 token / 刷 token）。
 _TOKEN_HTTP_TIMEOUT = 120.0
@@ -154,7 +154,7 @@ def build_login_url(code_challenge: str, state: str,
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
         # 与 codex-rs/login/src/server.rs:508 对齐：authorize URL 必带 originator
-        "originator": "codex_cli_rs",
+        "originator": CODEX_ORIGINATOR,
     }
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
@@ -171,7 +171,7 @@ def _post_token_form(data: dict) -> dict:
             "accept": "application/json",
             "user-agent": USER_AGENT,
             # 与 codex-rs/login/src/auth/default_client.rs:234 对齐：Codex HTTP 都带 originator
-            "originator": "codex_cli_rs",
+            "originator": CODEX_ORIGINATOR,
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
         proxy_purpose="oauth_openai",
@@ -193,7 +193,7 @@ def _post_token_json(data: dict) -> dict:
             "content-type": "application/json",
             "accept": "application/json",
             "user-agent": USER_AGENT,
-            "originator": "codex_cli_rs",
+            "originator": CODEX_ORIGINATOR,
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
         proxy_purpose="oauth_openai",

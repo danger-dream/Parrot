@@ -38,6 +38,12 @@ from .. import (
 )
 from ..channel.base import Channel, UpstreamRequest
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
+from .codex_identity_confuse import (
+    ConfuseState,
+    confuse_client_metadata,
+    confuse_headers as confuse_identity_headers,
+    expose_response_payload,
+)
 from ..client_ip import get_client_ip
 from ..openai.transform import common as openai_common
 from ..openai.transform import codex_oauth_transform
@@ -53,9 +59,12 @@ from .handler import (
 )
 
 # Codex source: codex-rs/core/src/client.rs
-_RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06"
-_CODEX_CLI_VERSION = "0.125.0"
-_CODEX_CLI_UA = f"codex_cli_rs/{_CODEX_CLI_VERSION}"
+from .codex_constants import (
+    CODEX_CLI_VERSION as _CODEX_CLI_VERSION,
+    CODEX_CLI_USER_AGENT as _CODEX_CLI_UA,
+    CODEX_ORIGINATOR as _CODEX_ORIGINATOR,
+    RESPONSES_WEBSOCKETS_BETA as _RESPONSES_WEBSOCKETS_BETA,
+)
 
 # Headers used by Codex Responses WS. Most clients will send these to Parrot;
 # forward them when present so sticky routing / observability survives the proxy.
@@ -802,10 +811,38 @@ async def _relay_ws_session(
         translator_ctx=translator_ctx,
     )
 
+    # ── Identity confuse state (shared across the session lifetime) ──
+    _identity_confuse_state = ConfuseState()
+    _session_pck = str(body.get("prompt_cache_key") or "").strip()
+    _original_pck = str(first_obj.get("prompt_cache_key") or _session_pck).strip()
+    if isinstance(ch, OpenAIOAuthChannel) and api_key_name:
+        _identity_confuse_state = ConfuseState(enabled=True, auth_id=api_key_name)
+
+    def _apply_identity_confuse_to_frame(obj: dict) -> dict:
+        """Apply identity confuse to a WS create frame's prompt/cache metadata."""
+        nonlocal _identity_confuse_state
+        if not _identity_confuse_state.enabled:
+            return obj
+        obj = dict(obj)
+        frame_raw_pck = str(obj.get("prompt_cache_key") or _original_pck).strip()
+        cm = obj.get("client_metadata") if isinstance(obj.get("client_metadata"), dict) else {}
+        confused_cm, _identity_confuse_state = confuse_client_metadata(
+            api_key_name, cm, session_prompt_cache_key=_session_pck,
+            state=_identity_confuse_state, original_prompt_cache_key=frame_raw_pck,
+        )
+        if confused_cm:
+            obj["client_metadata"] = confused_cm
+        elif "client_metadata" in obj:
+            obj.pop("client_metadata", None)
+        if _session_pck:
+            obj["prompt_cache_key"] = _session_pck
+        return obj
+
     # Send first frame upstream before accepting downstream. If upstream rejects
     # before a downstream-visible event, the attempt can still fail over.
     try:
         first_upstream_obj = _map_ws_create_frame_for_upstream(first_obj, resolved_model, channel=ch)
+        first_upstream_obj = _apply_identity_confuse_to_frame(first_upstream_obj)
         payload_to_send: str | bytes = _dump_frame(first_upstream_obj)
         proxy_bytes.count(up=_frame_size(payload_to_send))
         await asyncio.wait_for(upstream_ws.send(payload_to_send), timeout=idle_timeout)
@@ -841,7 +878,7 @@ async def _relay_ws_session(
     result.first_byte_ms = int((time.time() - start_time) * 1000)
     result.closed_after_accept = True
     for item in pending_visible:
-        await _send_downstream(websocket, item)
+        await _send_downstream(websocket, _identity_expose_frame(item, _identity_confuse_state))
 
     async def downstream_to_upstream() -> None:
         while True:
@@ -880,6 +917,7 @@ async def _relay_ws_session(
                 local_body["_api_key_name"] = api_key_name or ""
                 _sync_prompt_cache_key_to_ws_create(obj, local_body)
                 mapped = _map_ws_create_frame_for_upstream(obj, resolved_model, channel=ch)
+                mapped = _apply_identity_confuse_to_frame(mapped)
                 data = _dump_frame(mapped)
                 is_text = True
             proxy_bytes.count(up=_frame_size(data))
@@ -919,6 +957,7 @@ async def _relay_ws_session(
                 )
                 return
             proxy_bytes.count(down=_frame_size(data))
+            data = _identity_expose_frame(data, _identity_confuse_state)
             if isinstance(data, str):
                 tracker.feed_text(data)
                 bl_hit = blacklist.match(data, ch.key)
@@ -965,7 +1004,7 @@ async def _relay_ws_session(
 
     result.response_completed = tracker.response_completed
     result.usage = tracker.usage
-    result.response_text = tracker.get_full_response()
+    result.response_text = _identity_log_text(tracker.get_full_response(), _identity_confuse_state)
     result.output_items = tracker.get_output_items()
 
     if result.ok:
@@ -1046,21 +1085,37 @@ async def _build_ws_upstream_request(
         # Codex WebSocket uses the same session/thread identity header names as
         # official codex-rs. Keep old HTTP headers too for compatibility with the
         # internal endpoint while adding the WS names.
-        sid = headers.get("session_id") or headers.get("session-id")
-        cid = headers.get("conversation_id") or headers.get("thread-id") or sid
+        sid = headers.get("session-id") or headers.get("session_id")
+        tid = headers.get("thread-id") or sid
         if not sid:
             api_key_name = str(body.get("_api_key_name") or "")
             raw_anchor = str(body.get("prompt_cache_key") or "").strip()
             if api_key_name and raw_anchor:
                 sid = _isolate_session_id(api_key_name, raw_anchor)
-                cid = sid
-                # Keep HTTP Codex names too; some internal gateways still key on them.
-                headers.setdefault("session_id", sid)
-                headers.setdefault("conversation_id", sid)
+                tid = sid
         if sid:
             headers.setdefault("session-id", sid)
-        if cid:
-            headers.setdefault("thread-id", cid)
+        if tid:
+            headers.setdefault("thread-id", tid)
+            headers.setdefault("x-client-request-id", tid)
+        # Codex CLI only sends session-id / thread-id (hyphenated).
+        for _ck in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
+            del headers[_ck]
+        # Identity confuse: obfuscate identity headers for OAuth channels.
+        api_key_name = str(body.get("_api_key_name") or "")
+        session_pck = sid or ""  # session_id is already the isolated prompt_cache_key
+        if api_key_name and isinstance(ch, OpenAIOAuthChannel):
+            _hdr_state = ConfuseState(enabled=True, auth_id=api_key_name)
+            raw_anchor = str(body.get("prompt_cache_key") or "").strip()
+            if session_pck:
+                _hdr_state.original_prompt_cache_key = raw_anchor
+                _hdr_state.confused_prompt_cache_key = session_pck
+            headers = confuse_identity_headers(headers, _hdr_state,
+                                               session_prompt_cache_key=session_pck)
+        else:
+            # Codex CLI only sends session-id / thread-id (hyphenated).
+            for _ck in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
+                del headers[_ck]
         return UpstreamRequest(url=ws_url, headers=headers, body=b"", translator_ctx=req.translator_ctx)
 
     # Third-party OpenAI Responses API channel. Only same-protocol channels are
@@ -1089,7 +1144,7 @@ def _merge_ws_headers(upstream_headers: dict[str, str], websocket: WebSocket) ->
     out["OpenAI-Beta"] = _RESPONSES_WEBSOCKETS_BETA
 
     # Default Codex-ish identity headers. setdefault preserves explicit channel headers.
-    out.setdefault("originator", "codex_cli_rs")
+    out.setdefault("originator", _CODEX_ORIGINATOR)
     out.setdefault("version", _CODEX_CLI_VERSION)
     out.setdefault("User-Agent", _CODEX_CLI_UA)
 
@@ -1114,6 +1169,10 @@ def _merge_ws_headers(upstream_headers: dict[str, str], websocket: WebSocket) ->
     ua = websocket.headers.get("user-agent")
     if ua and "codex" in ua.lower():
         out["User-Agent"] = ua
+    # Codex CLI only sends session-id / thread-id (hyphenated).
+    # Remove legacy underscore / conversation variants from outbound headers.
+    for _ck in [k for k in list(out) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
+        del out[_ck]
     return out
 
 
@@ -1432,6 +1491,25 @@ def _loads_frame(raw: str | bytes) -> Any:
 
 def _dump_frame(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
+    if not state.enabled:
+        return data
+    if isinstance(data, str):
+        return expose_response_payload(data.encode("utf-8"), state).decode("utf-8", errors="replace")
+    if isinstance(data, (bytes, bytearray)):
+        return expose_response_payload(bytes(data), state)
+    return data
+
+
+def _identity_log_text(text: str, state: ConfuseState) -> str:
+    if not text or not state.enabled:
+        return text
+    try:
+        return expose_response_payload(text.encode("utf-8"), state).decode("utf-8", errors="replace")
+    except Exception:
+        return text
 
 
 async def _send_downstream(websocket: WebSocket, data: str | bytes) -> None:

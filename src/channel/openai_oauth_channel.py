@@ -39,8 +39,14 @@ from .base import Channel, ChannelDisplay, UpstreamRequest
 
 def _provider_cfg() -> dict:
     """读取 config.oauth.providers.openai（缺省字段回退默认值）。"""
+    # 单测/局部配置可能用 config._cache 直接塞一份精简 cfg；因此这里自己
+    # 再兜一层 DEFAULT_CONFIG，避免 defaultModels / forceCodexCLI 等默认值丢失。
+    default = (((config.DEFAULT_CONFIG.get("oauth") or {}).get("providers") or {}).get("openai") or {})
     cfg = (config.get().get("oauth") or {}).get("providers") or {}
-    return cfg.get("openai") or {}
+    current = cfg.get("openai") or {}
+    merged = dict(default)
+    merged.update(current)
+    return merged
 
 
 def _isolate_session_id(api_key_name: str, raw: str) -> str:
@@ -58,8 +64,11 @@ def _isolate_session_id(api_key_name: str, raw: str) -> str:
 # ─── 常量 ────────────────────────────────────────────────────────
 
 CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
-CODEX_CLI_VERSION = "0.125.0"
-CODEX_CLI_USER_AGENT = f"codex_cli_rs/{CODEX_CLI_VERSION}"
+from ..openai.codex_constants import (
+    CODEX_CLI_VERSION,
+    CODEX_CLI_USER_AGENT,
+    CODEX_ORIGINATOR,
+)
 
 
 class OpenAIOAuthChannel(Channel):
@@ -212,7 +221,10 @@ class OpenAIOAuthChannel(Channel):
                 iso = _isolate_session_id(api_key_name, prompt_cache_key)
                 if iso:
                     headers["session_id"] = iso
-                    headers["conversation_id"] = iso
+                    # conversation_id deprecated by Codex — no longer sent.
+
+        # Delete deprecated conversation_id header if present.
+        headers.pop("conversation_id", None)
 
         return UpstreamRequest(
             url=CODEX_UPSTREAM_URL,
@@ -343,10 +355,12 @@ class OpenAIOAuthChannel(Channel):
             "host": "chatgpt.com",
             "authorization": f"Bearer {access_token}",
             "openai-beta": "responses=experimental",
-            "originator": "codex_cli_rs",
+            "originator": CODEX_ORIGINATOR,
             "version": CODEX_CLI_VERSION,
             "accept": "text/event-stream",
             "content-type": "application/json",
+            # x-client-request-id: set downstream by session/identity-confuse logic;
+            # not included here to avoid sending an empty value if nothing overwrites it.
         }
         if self.chatgpt_account_id:
             headers["chatgpt-account-id"] = self.chatgpt_account_id

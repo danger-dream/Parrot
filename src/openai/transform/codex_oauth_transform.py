@@ -325,6 +325,22 @@ def _has_tools_signal(body: dict) -> bool:
     return isinstance(tools, list) and len(tools) > 0
 
 
+def _strip_orphaned_tool_fields(body: dict) -> None:
+    """当 tools 为空数组或缺失时，清理 tool_choice 和 parallel_tool_calls。
+
+    某些上游（如 xAI、DeepSeek）在收到 tools=[] + tool_choice="auto" 时会 400。
+    Codex CLI 在无工具时不发 tool_choice，这里对齐该行为。
+    """
+    tools = body.get("tools")
+    if isinstance(tools, list) and len(tools) > 0:
+        return
+    # tools 缺失或为空数组 → 清理孤立的 tool_choice / parallel_tool_calls
+    body.pop("tool_choice", None)
+    body.pop("parallel_tool_calls", None)
+    if isinstance(tools, list) and len(tools) == 0:
+        body.pop("tools", None)
+
+
 def _has_tool_choice_signal(body: dict) -> bool:
     choice = body.get("tool_choice")
     if choice is None:
@@ -539,6 +555,7 @@ def apply_codex_oauth_transform(
     #      还是 responses（下游可能直接用 ChatCompletions 格式）都要兜底。
     _normalize_codex_tools(body)
     _normalize_codex_tool_choice(body)
+    _strip_orphaned_tool_fields(body)
 
     # 5) input 字符串 → 数组；再把 input 里的 system 消息提到 instructions
     _coerce_input_to_list(body)
