@@ -46,7 +46,21 @@ def _main_text_and_kb() -> tuple[str, dict]:
     bl = cfg.get("contentBlacklist") or {}
     bl_default_count = len((bl.get("default") or []))
     bl_by_ch_count = sum(len(v or []) for v in (bl.get("byChannel") or {}).values())
+    # 翻译层状态
+    tl_cfg = cfg.get("translation") or {}
+    tl_enabled = bool(tl_cfg.get("enabled"))
+    tl_model = tl_cfg.get("model") or ""
+    tl_lang = tl_cfg.get("targetLanguage") or "English"
+    if tl_enabled and tl_model:
+        sys_flag = " · sys" if bool(tl_cfg.get("translateSystemMessages", False)) else ""
+        tl_summary = f"开 · {tl_model} → {tl_lang}{sys_flag}"
+    elif tl_enabled:
+        tl_summary = "开 (未配置模型)"
+    else:
+        tl_summary = "关"
+
     text += f"黑名单: 默认 {bl_default_count} 条 · 渠道专属 {bl_by_ch_count} 条"
+    text += f"\n翻译层: <code>{tl_summary}</code>"
 
     net = cfg.get("network") or {}
     dns_servers = (net.get("dns") or {}).get("servers") or ["8.8.8.8"]
@@ -73,8 +87,9 @@ def _main_text_and_kb() -> tuple[str, dict]:
         [ui.btn("📡 故障订阅", "menu:status_alert"),
          ui.btn("🌐 网络设置", "sys:show:network")],
         [ui.btn("🧬 WS模式", "sys:show:ws_mode"),
-         ui.btn("🆕 版本更新", "menu:update")],
-        [ui.btn("◀ 返回主菜单", "menu:main")],
+         ui.btn("🗣 翻译层", "tl:show")],
+        [ui.btn("🆕 版本更新", "menu:update"),
+         ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
 

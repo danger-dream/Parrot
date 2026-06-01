@@ -29,7 +29,7 @@ from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
     fingerprint, image_db, log_db, model_mapping, network, network_monitor, notifier, oauth_manager, probe,
-    public_ip, scheduler, scorer, state_db, status_monitor, update_checker, upstream,
+    public_ip, scheduler, scorer, state_db, status_monitor, translation, update_checker, upstream,
 )
 from src.channel import registry
 from src.client_ip import get_client_ip
@@ -89,6 +89,10 @@ async def _wal_checkpoint_loop():
             image_db.checkpoint()
         except Exception as e:
             print(f"[image_db] checkpoint failed: {e}")
+        try:
+            translation.checkpoint()
+        except Exception as e:
+            print(f"[translation] checkpoint failed: {e}")
 
 
 async def _stale_pending_loop():
@@ -129,6 +133,7 @@ async def lifespan(app: FastAPI):
     state_db.init()
     log_db.init()
     image_db.init()
+    translation.init()
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
 
     # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
@@ -243,6 +248,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
     _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
+    _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
 
     try:
         yield
@@ -592,6 +598,9 @@ async def proxy_messages(request: Request):
     sat_note = " queued" if (not result.candidates and result.saturated) else ""
     print(f"[{ts}] {client_ip} {key_name} → {model} (msgs={len(messages)}, tools={len(tools)}) "
           f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
+
+    # 5.5 翻译层：对 body 中的 user/system 消息做翻译（默认关闭；失败静默回退原文）
+    body = await translation.translate_body(body, ingress_protocol="anthropic")
 
     # 6. 故障转移 + 上游调用
     try:

@@ -575,6 +575,31 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
     assert ws.close_calls[-1][0] == 1000
 
 
+
+def test_sync_translated_body_to_ws_create_updates_input_and_instructions(m):
+    _setup(m)
+    obj = {
+        "type": "response.create",
+        "model": "test-model",
+        "input": "原文",
+        "instructions": "原系统",
+        "stream": True,
+        "background": False,
+    }
+    body = {
+        "model": "real-model",
+        "input": "translated input",
+        "instructions": "translated instructions",
+        "stream": True,
+        "prompt_cache_key": "pc-translated",
+    }
+    m["responses_ws"]._sync_translated_body_to_ws_create(obj, body)
+    assert obj["model"] == "real-model"
+    assert obj["input"] == "translated input"
+    assert obj["instructions"] == "translated instructions"
+    assert obj["prompt_cache_key"] == "pc-translated"
+    assert "background" not in obj
+
 def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     _setup(m)
     ch = _make_channel(m)

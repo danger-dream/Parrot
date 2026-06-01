@@ -149,6 +149,21 @@
     "maxTokens": 50,
     "userMessage": "1+1=?"
   },
+  "translation": {
+    "enabled": false,
+    "model": "",
+    "fallbackModel": "",
+    "targetLanguage": "English",
+    "prompt": "",
+    "timeoutSeconds": 10,
+    "maxHistoryMessages": 20,
+    "cacheTtlDays": 3,
+    "cachePreloadCount": 100,
+    "failureAlertThreshold": 10,
+    "memoryCacheMaxMb": 100,
+    "memoryCacheTtlSeconds": 7200,
+    "translateSystemMessages": false
+  },
   "telegram": {
     "botToken": "",
     "adminIds": []

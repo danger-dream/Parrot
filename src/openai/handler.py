@@ -34,7 +34,7 @@ from fastapi.responses import Response
 
 from .. import (
     affinity, auth, config, errors, failover, fingerprint, log_db, model_mapping,
-    notifier, scheduler,
+    notifier, scheduler, translation,
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
@@ -425,6 +425,9 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     print(f"[{ts}] {client_ip} {key_name} → {ingress_protocol}:{model} "
           f"(msgs={msg_count}, tools={tool_count}) "
           f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
+
+    # 7.5 翻译层
+    body = await translation.translate_body(body, ingress_protocol=ingress_protocol)
 
     # 7. failover
     try:

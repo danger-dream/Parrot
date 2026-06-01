@@ -34,7 +34,7 @@ from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
     affinity, auth, blacklist, concurrency, config, cooldown, fingerprint, log_db,
-    model_mapping, network, notifier, oauth_manager, scheduler, scorer, upstream,
+    model_mapping, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
@@ -314,6 +314,9 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     body["stream"] = True
     body["_api_key_name"] = key_name or ""
 
+    # 翻译层（first frame）
+    body = await translation.translate_body(body, ingress_protocol="responses")
+
     input_items = resolve_current_input_items(body)
     fp_query = fingerprint.fingerprint_query_responses(key_name or "", client_ip, input_items)
     _maybe_apply_auto_prompt_cache_key(
@@ -324,7 +327,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         model=model,
         ingress_protocol="responses",
     )
-    _sync_prompt_cache_key_to_ws_create(first_obj, body)
+    _sync_translated_body_to_ws_create(first_obj, body)
 
     msg_count, tool_count = _count_msg_tool(body, "responses")
     reasoning_effort = log_db.extract_reasoning_effort(body, "responses_ws")
@@ -915,7 +918,9 @@ async def _relay_ws_session(
                     raise ValueError(ge.message)
                 local_body["stream"] = True
                 local_body["_api_key_name"] = api_key_name or ""
-                _sync_prompt_cache_key_to_ws_create(obj, local_body)
+                # 翻译层（subsequent frame）
+                local_body = await translation.translate_body(local_body, ingress_protocol="responses")
+                _sync_translated_body_to_ws_create(obj, local_body)
                 mapped = _map_ws_create_frame_for_upstream(obj, resolved_model, channel=ch)
                 mapped = _apply_identity_confuse_to_frame(mapped)
                 data = _dump_frame(mapped)
@@ -1462,6 +1467,19 @@ def _sync_prompt_cache_key_to_ws_create(obj: dict, body: dict) -> None:
         obj["prompt_cache_key"] = body["prompt_cache_key"]
     if "background" in obj and "background" not in body:
         obj.pop("background", None)
+
+
+def _sync_translated_body_to_ws_create(obj: dict, body: dict) -> None:
+    """把翻译层改写后的 Responses 字段同步回 response.create WS frame。
+
+    WS 上游实际发送的是原始 obj；若只改 body，会导致日志/调度看到翻译文本，
+    但上游仍收到原文。这里只同步翻译层可能改写的字段，不碰 WS-only 字段。
+    """
+    _sync_prompt_cache_key_to_ws_create(obj, body)
+    if "input" in body:
+        obj["input"] = body["input"]
+    if "instructions" in body:
+        obj["instructions"] = body["instructions"]
 
 
 def _map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel: Channel | None = None) -> dict:
