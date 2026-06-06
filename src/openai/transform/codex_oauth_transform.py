@@ -454,8 +454,20 @@ def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) ->
             continue
         typ = str(item.get("type") or "")
 
-        # store=false 时 reasoning / rs_* 引用无法从上游持久化存储读取；直接丢弃。
+        # Fix A（透传快路径）：store=false 下，裸 reasoning / rs_* 持久化引用上游
+        # 无法读取，仍丢弃；但带合法 encrypted_content 的 reasoning 块要保留透传——
+        # 上游 chatgpt.com 通过 encrypted_content 自解密续接推理链（agent 多步工具
+        # 链场景必需）。判据：encrypted_content 为非空字符串。对齐 codex 原版
+        # history.rs 只保留带 encrypted_content 的 reasoning 块的过滤逻辑。
         if typ == "reasoning":
+            enc = item.get("encrypted_content")
+            if not (isinstance(enc, str) and enc.strip()):
+                continue
+            rs = dict(item)
+            # store=false 上游不接受持久化 reasoning id / rs_* 引用，剥掉避免上游
+            # 按 ID 查持久化存储而 404；encrypted_content 自带续链信息，无需 id。
+            rs.pop("id", None)
+            filtered.append(rs)
             continue
 
         if typ == "item_reference":
@@ -520,6 +532,7 @@ def apply_codex_oauth_transform(
     body: dict,
     *,
     resolved_model: str | None = None,
+    session_key: str | None = None,
 ) -> dict:
     """就地改造 body，返回同一对象。
 
@@ -541,6 +554,17 @@ def apply_codex_oauth_transform(
     # 2) store / stream 强制
     body["store"] = False
     body["stream"] = True
+
+    # 2.5) 主动注入 include=reasoning.encrypted_content（对齐 codex 原版 client.rs）。
+    # store=false 下上游**仅在显式 include 时**才返回 reasoning 的 encrypted_content；
+    # v3 自缓存的捕获完全依赖上游返回它，因此绝不能依赖下游带这个开关（不信任下游）。
+    # 无条件确保它在 include 列表里。
+    _inc = body.get("include")
+    if not isinstance(_inc, list):
+        _inc = []
+    if "reasoning.encrypted_content" not in _inc:
+        _inc = list(_inc) + ["reasoning.encrypted_content"]
+    body["include"] = _inc
 
     # 3) 剥不支持字段
     for k in _STRIP_FIELDS_FOR_CODEX:
@@ -570,8 +594,38 @@ def apply_codex_oauth_transform(
     # 5.5) store=false 兼容：过滤 reasoning/item_reference/id，规范化 call_id。
     _normalize_codex_input(body)
 
+    # 5.6) v3 回填：不信任下游。若下游删了 reasoning 块（store=false 下续链命脉），
+    #      按 session_key 从本地缓存把上一轮上游返回的整批 reasoning/工具调用补回。
+    #      下游诚实带回时 backfill_input 内部走快路径不补（零开销）。
+    _apply_reasoning_backfill(body, session_key, resolved_model)
+
     # 6) instructions 兜底（sub2api 行为：空 → 一行 fallback）
     if _is_empty_str(body.get("instructions")):
         body["instructions"] = _DEFAULT_INSTRUCTIONS
 
     return body
+
+
+def _apply_reasoning_backfill(body: dict, session_key: str | None,
+                              resolved_model: str | None) -> None:
+    """v3 回填挂载点：从本地 reasoning_store 取缓存整批，过滤后插回 input。
+
+    失败绝不影响主流程（任何异常吞掉，退化为不回填）。
+    """
+    if not session_key:
+        return
+    inp = body.get("input")
+    if not isinstance(inp, list) or not inp:
+        return
+    try:
+        from ..reasoning_store import get_items, backfill_input
+        model = str(resolved_model or body.get("model") or "")
+        cached = get_items(session_key, model)
+        if not cached:
+            return
+        new_input, n = backfill_input(inp, cached)
+        if n > 0:
+            body["input"] = new_input
+    except Exception:
+        # 回填是增强不是必需；出错就退化成不回填，绝不阻断请求
+        pass

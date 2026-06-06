@@ -282,6 +282,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "ttlMinutes": 60,
             "cleanupIntervalSeconds": 300,
         },
+        # v3 Codex reasoning replay store（独立库 codex_reasoning.db + 内存 LRU 二级缓存）。
+        # store=false 的 OAuth Codex 路径：捕获上游每轮 reasoning 加密块，下一轮下游
+        # 删了也能按 session_key 回填，保证多步 agent 工具链推理续链。不信任下游。
+        "reasoningStore": {
+            "enabled": True,
+            "dbPath": "codex_reasoning.db",
+            "ttlMinutes": 60,
+            "cleanupIntervalSeconds": 300,
+            "memMaxEntries": 2048,
+            "memMaxBytes": 67108864,
+        },
         # reasoning 跨协议桥接："passthrough" = 通过非官方字段 reasoning_content 双向映射；"drop" = 丢弃
         "reasoningBridge": "passthrough",
         # 自动补 OpenAI prompt_cache_key：仅 /v1/chat/completions 与 /v1/responses 生效。

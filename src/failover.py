@@ -1165,11 +1165,70 @@ def _ensure_oauth_responses_ws_session_headers(
         del headers[_ck]
 
 
+def _capture_reasoning_items(body: Optional[dict], resolved_model: str,
+                             output_items: list) -> None:
+    """v3 捕获：把上游本轮整批 output 按 session_key 存入 reasoning_store。
+
+    从 body 派生 session_key（api_key_name + prompt_cache_key），与回填同源。
+    任何异常吞掉，绝不影响主响应流。
+    """
+    if not body or not isinstance(output_items, list):
+        return
+    try:
+        ak = str((body or {}).get("_api_key_name") or "")
+        pck = str((body or {}).get("prompt_cache_key") or "").strip()
+        if not pck:
+            return
+        from .openai.reasoning_store import make_session_key, save_items
+        sk = make_session_key(ak, pck)
+        if not sk:
+            return
+        save_items(sk, str(resolved_model or ""), output_items)
+    except Exception:
+        pass
+
+
+def _maybe_invalidate_reasoning_on_error(body: Optional[dict], resolved_model: str,
+                                         error_detail: Optional[str]) -> None:
+    """上游拒绝加密推理块时清该会话缓存。判据：错误信息含 encrypted_content
+    或 reasoning 签名失效关键词。任何异常吞掉。"""
+    if not body or not error_detail:
+        return
+    low = str(error_detail).lower()
+    if not any(k in low for k in (
+            "invalid_encrypted_content", "encrypted_content",
+            "reasoning", "thinking_signature", "signature")):
+        return
+    try:
+        ak = str((body or {}).get("_api_key_name") or "")
+        pck = str((body or {}).get("prompt_cache_key") or "").strip()
+        if not pck:
+            return
+        from .openai.reasoning_store import make_session_key, invalidate
+        sk = make_session_key(ak, pck)
+        if sk:
+            invalidate(sk, str(resolved_model or ""))
+    except Exception:
+        pass
+
+
 def _build_oauth_responses_ws_frame(body: dict, resolved_model: str) -> dict:
     payload = openai_common.filter_responses_passthrough(body)
     payload["model"] = resolved_model
+    # v3 回填：WS 是 OAuth Codex 的真实主路径（responsesUpstreamWsForOAuth=True），
+    # 必须在这里派生 session_key 传给 transform，否则回填只在 HTTP 路径生效、WS 漏补。
+    _rs_session_key = None
+    try:
+        _ak = str((body or {}).get("_api_key_name") or "")
+        _pck = str(payload.get("prompt_cache_key") or "").strip()
+        if _pck:
+            from .openai.reasoning_store import make_session_key
+            _rs_session_key = make_session_key(_ak, _pck)
+    except Exception:
+        _rs_session_key = None
     payload = codex_oauth_transform.apply_codex_oauth_transform(
         payload, resolved_model=resolved_model,
+        session_key=_rs_session_key,
     )
     payload["type"] = "response.create"
     return payload
@@ -2212,6 +2271,9 @@ async def _consume_oauth_responses_ws_stream(
             body, tracker.to_full_json(fallback_model=resolved_model), ch.key, resolved_model,
             client_key=client_key,
         )
+        # v3 捕获：把上游本轮整批 output（reasoning + 工具调用，带 encrypted_content）
+        # 按 session_key 存入本地缓存，供下一轮下游删了 reasoning 时回填。WS 流式路径。
+        _capture_reasoning_items(body, resolved_model, tracker.get_output_items())
         await asyncio.shield(asyncio.to_thread(
             log_db.finish_success,
             request_id, ch.key, ch.type, resolved_model,
@@ -2228,6 +2290,9 @@ async def _consume_oauth_responses_ws_stream(
         if state["finalized"]:
             return
         state["finalized"] = True
+        # v3 兜底：上游拒绝 encrypted_content（invalid_encrypted_content / 推理签名
+        # 失效）时，清掉该会话缓存，避免下一轮继续拿失效加密块撞上游。
+        _maybe_invalidate_reasoning_on_error(body, resolved_model, result.error_detail)
         await _finalize_oauth_ws_error(
             result, ch, resolved_model, request_id, retry_count_so_far,
             affinity_hit, start_time, connect_ms, first_byte_ms,

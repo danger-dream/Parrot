@@ -692,3 +692,52 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_codex_transform_injects_include_encrypted_content():
+    """v3: codex transform 必须主动注入 include=reasoning.encrypted_content。
+    store=false 下上游仅在显式 include 时返回加密块，不能依赖下游带。"""
+    import src.openai.transform.codex_oauth_transform as t
+    # 下游完全没带 include
+    out = t.apply_codex_oauth_transform(
+        {"model": "gpt-5.5", "input": [{"type": "message", "role": "user",
+         "content": [{"type": "input_text", "text": "hi"}]}]},
+        resolved_model="gpt-5.5")
+    assert "reasoning.encrypted_content" in (out.get("include") or [])
+
+
+def test_codex_transform_include_no_duplicate():
+    """下游已带 include 时不重复注入。"""
+    import src.openai.transform.codex_oauth_transform as t
+    out = t.apply_codex_oauth_transform(
+        {"model": "gpt-5.5", "include": ["reasoning.encrypted_content"],
+         "input": [{"type": "message", "role": "user",
+         "content": [{"type": "input_text", "text": "hi"}]}]},
+        resolved_model="gpt-5.5")
+    assert (out.get("include") or []).count("reasoning.encrypted_content") == 1
+
+
+def test_codex_transform_reasoning_with_enc_preserved():
+    """v3 Fix A: 带合法 encrypted_content 的 reasoning 块在 input 里要保留透传。"""
+    import src.openai.transform.codex_oauth_transform as t
+    out = t.apply_codex_oauth_transform(
+        {"model": "gpt-5.5", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "reasoning", "encrypted_content": "gAAAAreal", "summary": []},
+        ]},
+        resolved_model="gpt-5.5")
+    kinds = [it.get("type") for it in out["input"]]
+    assert "reasoning" in kinds
+
+
+def test_codex_transform_bare_reasoning_dropped():
+    """裸 reasoning（无 encrypted_content）仍被丢弃。"""
+    import src.openai.transform.codex_oauth_transform as t
+    out = t.apply_codex_oauth_transform(
+        {"model": "gpt-5.5", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "reasoning", "summary": []},
+        ]},
+        resolved_model="gpt-5.5")
+    kinds = [it.get("type") for it in out["input"]]
+    assert "reasoning" not in kinds
