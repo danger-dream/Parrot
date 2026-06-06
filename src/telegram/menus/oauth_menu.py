@@ -21,6 +21,7 @@ import asyncio
 import json
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -214,6 +215,40 @@ def _this_month_start_ts() -> float:
     return month_start.timestamp()
 
 
+# 用量明细行缩进：让明细对齐上一行 5h/7d 的数字（emoji 占位用空格补齐）。
+# 列表页主行是 "  📊 5h"，详情页主行是 "⏱ 5h"，两处 emoji 前缀宽度不同，
+# 缩进常量分开调；TG 比例字体下 emoji 非整数字宽，最终以真机为准微调。
+# 明细行缩进：HTML parse_mode 会吃掉行首普通空格，必须用 NBSP(U+00A0) 才稳定缩进。
+# 列表页主行是 "  📊 5h"，明细行对齐到「5」需要 NBSP×9（真机校准，emoji 宽度非整数倍）。
+_USAGE_DETAIL_INDENT_LIST = "\u00a0" * 7
+# 详情页主行是 "⏱ 5h"（无前导空格、emoji 不同），单独校准。
+_USAGE_DETAIL_INDENT_BLOCK = "\u00a0" * 7
+
+
+def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Optional[str]:
+    """某 OAuth 账号在 [since_ts, now] 窗口内、经 Parrot 的本地请求用量明细行。
+
+    返回已缩进的单行文本；窗口内没有本地请求时返回 None（不堆空行）。
+
+    口径提醒：上一行 5h/7d 百分比是上游账号「全局」配额用量；这里的
+    tokens / 缓存 / 平均 TPS 只统计走 Parrot 的本地日志。账号若在别处也被
+    使用，两者会对不上，属预期，不是 bug。
+    """
+    try:
+        s = log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=since_ts)
+    except Exception:
+        return None
+    if not s or (s.get("total") or 0) <= 0:
+        return None
+    prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
+    parts = [f"↑{ui.fmt_tokens(prompt)} ↓{ui.fmt_tokens(s['output'])}"]
+    if (s.get("cache_read") or 0) > 0:
+        parts.append(ui.fmt_cache_phrase(s["cache_read"], prompt))
+    if s.get("avg_tps") is not None:
+        parts.append(f"均 {ui.fmt_tps(s.get('avg_tps'))}")
+    return indent + " · ".join(parts)
+
+
 def _format_account_block(acc: dict) -> str:
     """列表中每条 OAuth 账号的统一多行展示块。"""
     email = acc.get("email", "?")
@@ -242,35 +277,43 @@ def _format_account_block(acc: dict) -> str:
         workspace = _openai_workspace_label(acc)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace else ""
         if plan:
-            lines.append(f"  🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>")
+            lines.append(f"🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>")
         sub_exp = acc.get("subscription_expires_at") or ""
         if sub_exp:
-            lines.append(f"  📅 到期: <code>{_fmt_time_full(sub_exp)}</code>")
+            lines.append(f"📅 到期: <code>{_fmt_time_full(sub_exp)}</code>")
     elif prov == "claude":
         cl_label = oauth_manager.claude_plan_label(acc)
         if cl_label:
-            lines.append(f"  🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
+            lines.append(f"🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
 
     # Token 过期
     expired = acc.get("expired")
     if expired:
-        lines.append(f"  ⏳ Token: <code>{_fmt_time_full(expired)}</code>")
+        lines.append(f"⏳ Token: <code>{_fmt_time_full(expired)}</code>")
 
-    # 用量（5h / 7d）
+    # 用量（5h / 7d）。百分比来自上游全局配额；其下明细行是「走 Parrot 的
+    # 本地请求」在该窗口内的 tokens/缓存/平均 TPS（口径不同，仅本地流量）。
     row = state_db.quota_load(ak)
+    _now_ts = time.time()
     if row:
         fh_util = row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
-            lines.append(f"  📊 5h: <b>{fh_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 5h: <b>{fh_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            _d = _window_usage_detail(ak, _now_ts - 5 * 3600, _USAGE_DETAIL_INDENT_LIST)
+            if _d:
+                lines.append(_d)
         if sd_util is not None:
             reset = row.get("seven_day_reset")
-            lines.append(f"  📊 7d: <b>{sd_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 7d: <b>{sd_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            _d = _window_usage_detail(ak, _now_ts - 7 * 86400, _USAGE_DETAIL_INDENT_LIST)
+            if _d:
+                lines.append(_d)
         if fh_util is None and sd_util is None:
-            lines.append("  📊 用量: <i>尚未获取</i>")
+            lines.append("📊 用量: <i>尚未获取</i>")
     else:
-        lines.append("  📊 用量: <i>尚未获取</i>")
+        lines.append("📊 用量: <i>尚未获取</i>")
 
     # 月度统计
     try:
@@ -280,13 +323,13 @@ def _format_account_block(acc: dict) -> str:
         ts = None
     if ts and ts["total"] > 0:
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
-        stat_line = f"  💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
+        stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
             stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
         lines.append(stat_line)
         if ts.get("avg_tps") is not None:
             lines.append(
-                f"  ⚡ TPS: 平均 {ui.fmt_tps(ts.get('avg_tps'))} · "
+                f"⚡ TPS: 平均 {ui.fmt_tps(ts.get('avg_tps'))} · "
                 f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
@@ -303,7 +346,7 @@ def _format_account_block(acc: dict) -> str:
             parts.append(f"🔴 永久冻结 {perm_n} 个模型")
         if cool_n:
             parts.append(f"🟠 冷却 {cool_n} 个模型")
-        lines.append("  ⚠ " + " · ".join(parts))
+        lines.append("⚠ " + " · ".join(parts))
 
     return "\n".join(lines)
 
@@ -319,6 +362,11 @@ def _format_usage_block(account_key: str) -> str:
         return f"{label}: {util:.0f}% (重置: {_format_reset_text(reset)})"
 
     out = []
+    _now_ts = time.time()
+    _detail_since = {
+        "five_hour_util": _now_ts - 5 * 3600,
+        "seven_day_util": _now_ts - 7 * 86400,
+    }
     for label, util_k, reset_k in (
         ("⏱ 5h", "five_hour_util", "five_hour_reset"),
         ("📅 7d", "seven_day_util", "seven_day_reset"),
@@ -328,6 +376,10 @@ def _format_usage_block(account_key: str) -> str:
         line = _line(label, row.get(util_k), row.get(reset_k))
         if line:
             out.append(line)
+            if util_k in _detail_since:
+                _d = _window_usage_detail(account_key, _detail_since[util_k], _USAGE_DETAIL_INDENT_BLOCK)
+                if _d:
+                    out.append(_d)
 
     # OpenAI Codex 原始窗口（primary/secondary）：用量值与上方 5h/7d 一致，但展示
     # 原始窗口时长（分钟）让 admin 能看到源数据（例如 primary=10080min=7d，secondary=300min=5h）。
