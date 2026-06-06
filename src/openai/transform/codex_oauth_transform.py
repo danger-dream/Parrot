@@ -540,6 +540,8 @@ def apply_codex_oauth_transform(
       body: Responses API shape（字符串 input 也容忍；见上）
       resolved_model: 调度层已对齐后的模型名（账号白名单已校验过的合法名字）；
         transform **原样透传**给上游，不做任何别名映射。
+      session_key: 历史兼容参数。v0.21.3 起 encrypted_content 只做透明透传，
+        不再由 Parrot 维护本地 replay/backfill，因此这里不再使用。
     """
     # 1) 模型名：**直接透传**。resolved_model 已由账号 supports_model 把关；
     #    不做任何别名/兜底映射，避免新模型未登记被错误降级。
@@ -594,38 +596,8 @@ def apply_codex_oauth_transform(
     # 5.5) store=false 兼容：过滤 reasoning/item_reference/id，规范化 call_id。
     _normalize_codex_input(body)
 
-    # 5.6) v3 回填：不信任下游。若下游删了 reasoning 块（store=false 下续链命脉），
-    #      按 session_key 从本地缓存把上一轮上游返回的整批 reasoning/工具调用补回。
-    #      下游诚实带回时 backfill_input 内部走快路径不补（零开销）。
-    _apply_reasoning_backfill(body, session_key, resolved_model)
-
     # 6) instructions 兜底（sub2api 行为：空 → 一行 fallback）
     if _is_empty_str(body.get("instructions")):
         body["instructions"] = _DEFAULT_INSTRUCTIONS
 
     return body
-
-
-def _apply_reasoning_backfill(body: dict, session_key: str | None,
-                              resolved_model: str | None) -> None:
-    """v3 回填挂载点：从本地 reasoning_store 取缓存整批，过滤后插回 input。
-
-    失败绝不影响主流程（任何异常吞掉，退化为不回填）。
-    """
-    if not session_key:
-        return
-    inp = body.get("input")
-    if not isinstance(inp, list) or not inp:
-        return
-    try:
-        from ..reasoning_store import get_items, backfill_input
-        model = str(resolved_model or body.get("model") or "")
-        cached = get_items(session_key, model)
-        if not cached:
-            return
-        new_input, n = backfill_input(inp, cached)
-        if n > 0:
-            body["input"] = new_input
-    except Exception:
-        # 回填是增强不是必需；出错就退化成不回填，绝不阻断请求
-        pass

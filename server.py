@@ -204,8 +204,6 @@ async def lifespan(app: FastAPI):
     # OpenAI previous_response_id Store（挂在同一张 state.db，独立表）
     from src.openai import store as openai_store
     openai_store.init()
-    from src.openai import reasoning_store as codex_reasoning_store
-    codex_reasoning_store.init()
 
     # 渠道注册表 + 热加载钩子
     registry.rebuild_from_config()
@@ -250,7 +248,6 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
     _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
-    _background_tasks.append(asyncio.create_task(codex_reasoning_store.cleanup_loop()))
     _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
 
     try:

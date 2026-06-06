@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import socket
 import time
@@ -550,11 +551,108 @@ _OUTCOMES_NO_COOLDOWN = {
     "http_auth_error",   # 先刷 token 再判
     "transform_error",   # 代理自己 bug，和上游无关
     "guard_error",       # 请求级 4xx：跨变体 guard 拒绝，与 ch 无关
+    "request_invalid",   # 下游请求内容错误（例如坏 encrypted_content），不冷却渠道
 }
 
 
 def _should_cooldown(outcome: str) -> bool:
     return outcome not in _OUTCOMES_NO_COOLDOWN
+
+
+def _is_invalid_encrypted_content_error(error_detail: Optional[str]) -> bool:
+    """OpenAI/Codex encrypted_content 验签/解密失败是请求内容错误。
+
+    encrypted_content 是下游 transcript 中的 opaque blob，Parrot 只透明透传，
+    不能也不应把这类 4xx 归因到 OAuth 账号/渠道健康。
+    """
+    low = str(error_detail or "").lower()
+    if not low:
+        return False
+    return (
+        "invalid_encrypted_content" in low
+        or ("encrypted content" in low and (
+            "could not be verified" in low
+            or "could not be decrypted" in low
+            or "could not be decrypted or parsed" in low
+        ))
+    )
+
+
+def _request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
+    if _is_invalid_encrypted_content_error(result.error_detail):
+        result.outcome = "request_invalid"
+        result.http_status = 400
+    return result
+
+
+def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
+    """Remove opaque encrypted_content from one request subtree for retry.
+
+    This is a degradation path only after upstream explicitly rejected the EC.
+    It does not synthesize or repair encrypted_content. Reasoning items without EC
+    are not useful for Codex store=false replay, so callers remove them entirely.
+    """
+    if isinstance(value, dict):
+        # content/output arrays may contain structured {type: encrypted_content} parts.
+        out: dict[str, Any] = {}
+        removed = 0
+        for k, v in value.items():
+            if k == "encrypted_content":
+                removed += 1
+                continue
+            if isinstance(v, list):
+                new_list: list[Any] = []
+                for item in v:
+                    if isinstance(item, dict) and item.get("type") == "encrypted_content":
+                        removed += 1
+                        continue
+                    new_item, n = _strip_encrypted_content_value(item)
+                    removed += n
+                    new_list.append(new_item)
+                out[k] = new_list
+                continue
+            new_v, n = _strip_encrypted_content_value(v)
+            removed += n
+            out[k] = new_v
+        return out, removed
+    if isinstance(value, list):
+        out = []
+        removed = 0
+        for item in value:
+            new_item, n = _strip_encrypted_content_value(item)
+            removed += n
+            out.append(new_item)
+        return out, removed
+    return value, 0
+
+
+def _retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
+    """Build a one-shot fallback request by stripping downstream EC from input.
+
+    The include flag is intentionally preserved so a successful retry can still
+    return fresh encrypted_content to the downstream transcript owner.
+    """
+    retry_body = copy.deepcopy(body)
+    inp = retry_body.get("input")
+    if not isinstance(inp, list):
+        return retry_body, 0
+    new_input: list[Any] = []
+    removed = 0
+    for item in inp:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            # Drop the whole reasoning item. Without encrypted_content it would be
+            # dropped by the Codex transform anyway, and keeping summaries would
+            # risk pretending we preserved the opaque reasoning state.
+            if item.get("encrypted_content") is not None:
+                removed += 1
+            else:
+                removed += 1
+            continue
+        new_item, n = _strip_encrypted_content_value(item)
+        removed += n
+        new_input.append(new_item)
+    retry_body["input"] = new_input
+    return retry_body, removed
 
 
 def _is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
@@ -722,6 +820,7 @@ async def run_failover(
     retry_count = 0
     refreshed_once: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
+    retried_without_encrypted_content = False
     last_result: Optional[AttemptResult] = None
     # 跟踪真实最后尝试的渠道（不同于"候选列表最后一条"，因为 OAuth 重刷会重试同 ch）
     last_ch_key: Optional[str] = None
@@ -789,6 +888,7 @@ async def run_failover(
         except BaseException:
             _release_once()
             raise
+        result = _request_invalid_result_if_needed(result)
         last_result = result
         if _attempt_proxy and not result.proxy_name:
             result.proxy_name = _attempt_proxy
@@ -827,6 +927,38 @@ async def run_failover(
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
             )
             return _json_error_for_ingress(ingress_protocol, status, anth_err_type, msg)
+
+        # 下游请求内容错误（例如坏 encrypted_content）：不要冷却渠道。
+        # 对坏 EC 做一次同渠道降级重试：剥掉本次请求 input 里的 encrypted_content，
+        # 让下游 transcript owner 在成功响应中拿到新的 EC；失败则返回 400。
+        if result.outcome == "request_invalid":
+            msg = result.error_detail or "invalid request"
+            if (
+                _is_invalid_encrypted_content_error(msg)
+                and not retried_without_encrypted_content
+            ):
+                retry_body, removed_ec = _retry_body_without_encrypted_content(body)
+                if removed_ec > 0:
+                    retried_without_encrypted_content = True
+                    body = retry_body
+                    retry_count += 1
+                    print(
+                        f"[failover] invalid encrypted_content for {ch.key}/{resolved_model}; "
+                        f"retrying same channel without {removed_ec} encrypted_content item(s)"
+                    )
+                    continue
+            status = int(result.http_status or 400)
+            total_ms = int((time.time() - start_time) * 1000)
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg[:4000], retry_count,
+                final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+                connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms, total_ms=total_ms,
+                http_status=status, affinity_hit=affinity_hit,
+                upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            )
+            return _json_error_for_ingress(
+                ingress_protocol, status, errors.ErrType.INVALID_REQUEST, msg
+            )
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
@@ -944,6 +1076,7 @@ async def run_failover(
                 except BaseException:
                     _release_q()
                     raise
+                result = _request_invalid_result_if_needed(result)
                 last_result = result
                 if _attempt_proxy2 and not result.proxy_name:
                     result.proxy_name = _attempt_proxy2
@@ -960,6 +1093,20 @@ async def run_failover(
                     _attach_release_to_response(result.response, _release_q)
                     return result.response
                 _release_q()
+                if result.outcome == "request_invalid":
+                    status = int(result.http_status or 400)
+                    msg = result.error_detail or "invalid request"
+                    total_ms = int((time.time() - start_time) * 1000)
+                    await asyncio.to_thread(
+                        log_db.finish_error, request_id, msg[:4000], retry_count,
+                        final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+                        connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms, total_ms=total_ms,
+                        http_status=status, affinity_hit=affinity_hit,
+                        upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                    )
+                    return _json_error_for_ingress(
+                        ingress_protocol, status, errors.ErrType.INVALID_REQUEST, msg
+                    )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
                 if _should_cooldown(result.outcome):
                     cooldown.record_error(ch.key, resolved_model, result.error_detail)
@@ -1165,70 +1312,13 @@ def _ensure_oauth_responses_ws_session_headers(
         del headers[_ck]
 
 
-def _capture_reasoning_items(body: Optional[dict], resolved_model: str,
-                             output_items: list) -> None:
-    """v3 捕获：把上游本轮整批 output 按 session_key 存入 reasoning_store。
-
-    从 body 派生 session_key（api_key_name + prompt_cache_key），与回填同源。
-    任何异常吞掉，绝不影响主响应流。
-    """
-    if not body or not isinstance(output_items, list):
-        return
-    try:
-        ak = str((body or {}).get("_api_key_name") or "")
-        pck = str((body or {}).get("prompt_cache_key") or "").strip()
-        if not pck:
-            return
-        from .openai.reasoning_store import make_session_key, save_items
-        sk = make_session_key(ak, pck)
-        if not sk:
-            return
-        save_items(sk, str(resolved_model or ""), output_items)
-    except Exception:
-        pass
-
-
-def _maybe_invalidate_reasoning_on_error(body: Optional[dict], resolved_model: str,
-                                         error_detail: Optional[str]) -> None:
-    """上游拒绝加密推理块时清该会话缓存。判据：错误信息含 encrypted_content
-    或 reasoning 签名失效关键词。任何异常吞掉。"""
-    if not body or not error_detail:
-        return
-    low = str(error_detail).lower()
-    if not any(k in low for k in (
-            "invalid_encrypted_content", "encrypted_content",
-            "reasoning", "thinking_signature", "signature")):
-        return
-    try:
-        ak = str((body or {}).get("_api_key_name") or "")
-        pck = str((body or {}).get("prompt_cache_key") or "").strip()
-        if not pck:
-            return
-        from .openai.reasoning_store import make_session_key, invalidate
-        sk = make_session_key(ak, pck)
-        if sk:
-            invalidate(sk, str(resolved_model or ""))
-    except Exception:
-        pass
-
-
 def _build_oauth_responses_ws_frame(body: dict, resolved_model: str) -> dict:
     payload = openai_common.filter_responses_passthrough(body)
     payload["model"] = resolved_model
-    # v3 回填：WS 是 OAuth Codex 的真实主路径（responsesUpstreamWsForOAuth=True），
-    # 必须在这里派生 session_key 传给 transform，否则回填只在 HTTP 路径生效、WS 漏补。
-    _rs_session_key = None
-    try:
-        _ak = str((body or {}).get("_api_key_name") or "")
-        _pck = str(payload.get("prompt_cache_key") or "").strip()
-        if _pck:
-            from .openai.reasoning_store import make_session_key
-            _rs_session_key = make_session_key(_ak, _pck)
-    except Exception:
-        _rs_session_key = None
+    # encrypted_content 是下游 transcript 状态，Parrot 只透明透传；这里不再
+    # 派生 session_key 或做本地 reasoning replay/backfill。
     payload = codex_oauth_transform.apply_codex_oauth_transform(
         payload, resolved_model=resolved_model,
-        session_key=_rs_session_key,
     )
     payload["type"] = "response.create"
     return payload
@@ -1661,7 +1751,7 @@ def _ws_http_status_from_outcome(result: AttemptResult) -> int:
         return 504
     if result.outcome in ("blacklist_hit", "upstream_error_json", "stream_upstream_error"):
         return 503
-    if result.outcome == "guard_error":
+    if result.outcome in ("guard_error", "request_invalid"):
         return 400
     return 502
 
@@ -2197,9 +2287,10 @@ async def _finalize_oauth_ws_error(
     proxy_bytes: _WsProxyBytes,
     identity_state: ConfuseState,
 ) -> None:
+    result = _request_invalid_result_if_needed(result)
     if _should_cooldown(result.outcome):
         cooldown.record_error(ch.key, resolved_model, result.error_detail)
-    scorer.record_failure(ch.key, resolved_model, connect_ms=connect_ms)
+        scorer.record_failure(ch.key, resolved_model, connect_ms=connect_ms)
     await asyncio.shield(asyncio.to_thread(
         log_db.finish_error,
         request_id, (result.error_detail or result.outcome or "upstream websocket error")[:4000],
@@ -2271,9 +2362,8 @@ async def _consume_oauth_responses_ws_stream(
             body, tracker.to_full_json(fallback_model=resolved_model), ch.key, resolved_model,
             client_key=client_key,
         )
-        # v3 捕获：把上游本轮整批 output（reasoning + 工具调用，带 encrypted_content）
-        # 按 session_key 存入本地缓存，供下一轮下游删了 reasoning 时回填。WS 流式路径。
-        _capture_reasoning_items(body, resolved_model, tracker.get_output_items())
+        # encrypted_content 透明透传：上游产出的 reasoning 只返回给下游，
+        # Parrot 不做本地持久化或后续回填。
         await asyncio.shield(asyncio.to_thread(
             log_db.finish_success,
             request_id, ch.key, ch.type, resolved_model,
@@ -2290,9 +2380,7 @@ async def _consume_oauth_responses_ws_stream(
         if state["finalized"]:
             return
         state["finalized"] = True
-        # v3 兜底：上游拒绝 encrypted_content（invalid_encrypted_content / 推理签名
-        # 失效）时，清掉该会话缓存，避免下一轮继续拿失效加密块撞上游。
-        _maybe_invalidate_reasoning_on_error(body, resolved_model, result.error_detail)
+        # encrypted_content 只做透明透传；无本地 cache 需要清理。
         await _finalize_oauth_ws_error(
             result, ch, resolved_model, request_id, retry_count_so_far,
             affinity_hit, start_time, connect_ms, first_byte_ms,

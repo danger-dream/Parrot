@@ -202,22 +202,10 @@ class OpenAIOAuthChannel(Channel):
 
         payload["model"] = resolved_model
 
-        # v3 reasoning 续链：transform 前派生 session_key（连续性边界，不绑账号），
-        # 供 codex_oauth_transform 回填上一轮缓存的 reasoning/工具调用。
-        _rs_session_key = None
-        try:
-            _ak = str(requested_body.get("_api_key_name") or "")
-            _pck = str(payload.get("prompt_cache_key") or "").strip()
-            if _pck:
-                from ..openai.reasoning_store import make_session_key
-                _rs_session_key = make_session_key(_ak, _pck)
-        except Exception:
-            _rs_session_key = None
-
-        # Step B: codex 兼容改造（store=false 等硬约束）
+        # Step B: codex 兼容改造（store=false 等硬约束）。encrypted_content
+        # 只做透明透传，不由 Parrot 本地维护/回填。
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload, resolved_model=resolved_model,
-            session_key=_rs_session_key,
         )
 
         # Step C: 拿 access_token（会在此触发 refresh if 过期）
