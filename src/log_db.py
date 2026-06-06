@@ -823,6 +823,67 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
     return out
 
 
+def apikey_model_stats(api_key_name: str, since_ts: float) -> list[dict]:
+    """跨月按 final_model 分组聚合某 API Key 下每个模型的统计（含 TPS）。
+
+    用于 API Key 详情页的「按模型展开」视图，口径/字段与 channel_model_stats 一致：
+    每条 dict 含 final_model + tokens_for_channel 的所有字段，按 total 降序。
+    """
+    by_model: dict[str, dict] = {}
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return []
+
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            rows = conn.execute(
+                f"""SELECT
+                     COALESCE(final_model, '?') AS model,
+                     COUNT(*) AS total,
+                     SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                     SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                     SUM(input_tokens) AS inp,
+                     SUM(output_tokens) AS outp,
+                     SUM(cache_creation_tokens) AS cc,
+                     SUM(cache_read_tokens) AS cr,
+                     {_tps_agg_sql()}
+                   FROM request_log
+                   WHERE api_key_name=? AND created_at >= ?
+                   GROUP BY COALESCE(final_model, '?')""",
+                (api_key_name, since_ts),
+            ).fetchall()
+            for r in rows:
+                key = r["model"] or "?"
+                bucket = by_model.setdefault(key, {
+                    "total": 0, "success_count": 0, "error_count": 0,
+                    "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
+                    "tps_num_tokens": 0, "tps_denom_ms": 0,
+                    "max_tps": None, "min_tps": None,
+                })
+                bucket["total"] += int(r["total"] or 0)
+                bucket["success_count"] += int(r["success_count"] or 0)
+                bucket["error_count"] += int(r["error_count"] or 0)
+                bucket["input"] += int(r["inp"] or 0)
+                bucket["output"] += int(r["outp"] or 0)
+                bucket["cache_creation"] += int(r["cc"] or 0)
+                bucket["cache_read"] += int(r["cr"] or 0)
+                _merge_tps(bucket, r)
+        except Exception as exc:
+            print(f"[log_db] apikey_model_stats: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    out = []
+    for model, raw in by_model.items():
+        d = _pack_stats(raw)
+        d["final_model"] = model
+        out.append(d)
+    out.sort(key=lambda x: x["total"], reverse=True)
+    return out
+
+
 def channels_by_requested_model(since_ts: float) -> dict[str, list[dict]]:
     """跨月按 requested_model 分组，汇总每个模型实际落到的 (渠道, 渠道类型) 列表。
 

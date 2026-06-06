@@ -207,42 +207,100 @@ def _fmt_allow_images(entry: dict) -> str:
 
 # ─── 列表视图 ─────────────────────────────────────────────────────
 
+_ALL_PROTO = {"anthropic", "chat", "responses"}
+_PROTO_SHORT = {"anthropic": "Anthropic", "chat": "Chat", "responses": "Responses"}
+_PROTO_FULL = {
+    "anthropic": "Anthropic (/v1/messages)",
+    "chat": "OpenAI Chat (/v1/chat/completions)",
+    "responses": "OpenAI Responses (/v1/responses)",
+}
+
+
+def _perm_summary_short(allowed: list[str], protos: list[str], img: bool) -> str:
+    """列表页用：单行简短权限串。默认全开显示「全部模型 · 全部入口」。"""
+    m = "全部模型" if not allowed else f"{len(allowed)} 个模型"
+    if not protos or set(protos) == _ALL_PROTO:
+        p = "全部入口"
+    else:
+        p = "/".join(_PROTO_SHORT.get(x, x) for x in protos)
+    s = f"{m} · {p}"
+    if img:
+        s += " · 🖼 图片"
+    return s
+
+
 def _render_list() -> tuple[str, dict]:
     keys = (config.get().get("apiKeys") or {})
-    lines = [f"🔑 <b>API Key 管理</b>", f"当前: {len(keys)} 个"]
     if not keys:
-        lines.append("\n暂无 Key，点「➕ 添加」创建。")
-    else:
-        lines.append("")
-        for name, entry in keys.items():
-            if isinstance(entry, str):
-                key_str = entry
-                allowed: list[str] = []
-            else:
-                key_str = entry.get("key", "")
-                allowed = list(entry.get("allowedModels") or [])
-            ms = _key_month_stats(name)
-            tps_line = ""
-            if ms is None:
-                tps_line = "\n  ⚡ 本月 TPS: <i>暂无数据</i>"
-            elif ms.get("avg_tps") is not None:
-                tps_line = (
-                    f"\n  ⚡ 本月 TPS: 平均 {ui.fmt_tps(ms.get('avg_tps'))} · "
-                    f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
-                    f"最低 {ui.fmt_tps(ms.get('min_tps'))} ({ms['total']} 次)"
-                )
-            else:
-                tps_line = f"\n  ⚡ 本月调用 {ms['total']} 次（无可用 TPS 样本）"
-            lines.append(
-                f"• <b>{ui.escape_html(name)}</b>\n"
-                f"  <code>{ui.escape_html(key_str)}</code>\n"
-                f"  {_fmt_allowed(allowed)}\n"
-                f"  {_fmt_allow_images(entry if isinstance(entry, dict) else {})}"
-                f"{tps_line}"
-            )
-        lines.append("\n<i>Tip: 单击 Key 即可复制。</i>")
+        text = "🔑 <b>API Key 管理</b>\n当前: 0 个\n\n暂无 Key，点「➕ 添加」创建。"
+        rows = [[ui.btn("➕ 添加", "ak:add")], [ui.btn("◀ 返回主菜单", "menu:main")]]
+        return text, ui.inline_kb(rows)
 
-    # 每个 key 一个按钮进入详情
+    since_ts = _month_start_ts()
+    per: dict[str, dict] = {}
+    agg = {"total": 0, "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    for name in keys:
+        try:
+            s = log_db.tokens_for_apikey(name, since_ts=since_ts)
+        except Exception:
+            s = {"total": 0, "success_count": 0, "error_count": 0, "input": 0,
+                 "output": 0, "cache_creation": 0, "cache_read": 0, "avg_tps": None,
+                 "max_tps": None, "min_tps": None}
+        per[name] = s
+        for k in agg:
+            agg[k] += int(s.get(k, 0) or 0)
+    active = sum(1 for n in keys if per[n]["total"] > 0)
+    idle = len(keys) - active
+    agg_prompt = ui.prompt_total(agg["input"], agg["cache_creation"], agg["cache_read"])
+
+    head = (
+        "🔑 <b>API Key 管理</b>\n"
+        f"共 {len(keys)} 个 · 活跃 {active}"
+        + (f" · 闲置 {idle}" if idle else "")
+        + f" | 本月 {agg['total']:,} 次"
+    )
+    if agg["total"] > 0:
+        head += f" · ↑ {ui.fmt_tokens(agg_prompt)} · ↓ {ui.fmt_tokens(agg['output'])}"
+
+    lines = [head, ""]
+    for i, (name, entry) in enumerate(keys.items(), 1):
+        if isinstance(entry, str):
+            key_str = entry
+            allowed: list[str] = []
+            protos: list[str] = []
+            img = False
+        else:
+            key_str = entry.get("key", "")
+            allowed = list(entry.get("allowedModels") or [])
+            protos = list(entry.get("allowedProtocols") or [])
+            img = bool(entry.get("allowImages"))
+        s = per[name]
+        dot = "🟢" if s["total"] > 0 else "⚪"
+        lines.append(f"{i}. {dot} <b>{ui.escape_html(name)}</b>")
+        lines.append(f"<code>{ui.escape_html(key_str)}</code>")
+        lines.append(f"🏷️ {_perm_summary_short(allowed, protos, img)}")
+        if s["total"] > 0:
+            prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
+            stat = f"💎 本月: {s['total']:,} 次 · ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(s['output'])}"
+            if (s.get("cache_read") or 0) > 0:
+                stat += f" · {ui.fmt_cache_phrase(s['cache_read'], prompt)}"
+            lines.append(stat)
+            if s.get("avg_tps") is not None:
+                lines.append(
+                    f"⚡ TPS: 平均 {ui.fmt_tps(s.get('avg_tps'))} · "
+                    f"峰值 {ui.fmt_tps(s.get('max_tps'))} · "
+                    f"最低 {ui.fmt_tps(s.get('min_tps'))}"
+                )
+        else:
+            try:
+                s0 = log_db.tokens_for_apikey(name, since_ts=0)
+                hist = s0["total"]
+            except Exception:
+                hist = 0
+            lines.append(f"💎 本月: <i>闲置</i>（历史 {hist:,} 次）")
+        lines.append("")
+    text = ui.truncate("\n".join(lines).rstrip())
+
     rows: list[list[dict]] = []
     cur: list[dict] = []
     for name in keys:
@@ -252,9 +310,9 @@ def _render_list() -> tuple[str, dict]:
             cur = []
     if cur:
         rows.append(cur)
-    rows.append([ui.btn("➕ 添加", "ak:add")])
+    rows.append([ui.btn("➕ 添加", "ak:add"), ui.btn("🔄 刷新", "menu:apikey")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
-    return "\n".join(lines), ui.inline_kb(rows)
+    return text, ui.inline_kb(rows)
 
 
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
@@ -279,46 +337,73 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
     key_str = entry.get("key", "")
     allowed = list(entry.get("allowedModels") or [])
     allowed_protos = list(entry.get("allowedProtocols") or [])
+    img = bool(entry.get("allowImages"))
+
+    since_ts = _month_start_ts()
+    try:
+        s = log_db.tokens_for_apikey(name, since_ts=since_ts)
+    except Exception:
+        s = {"total": 0, "success_count": 0, "error_count": 0, "input": 0,
+             "output": 0, "cache_creation": 0, "cache_read": 0, "avg_tps": None,
+             "max_tps": None, "min_tps": None}
+    active = s["total"] > 0
+    dot = "🟢 活跃" if active else "⚪ 闲置"
+
+    if not allowed_protos or set(allowed_protos) == _ALL_PROTO:
+        proto_str = "全部入口（无限制）"
+    else:
+        proto_str = " / ".join(_PROTO_FULL.get(p, p) for p in allowed_protos)
+
     lines = [
-        f"🔑 <b>{ui.escape_html(name)}</b>",
+        f"🔑 <b>{ui.escape_html(name)}</b>  {dot}",
         "",
         f"Key: <code>{ui.escape_html(key_str)}</code>",
         "",
-        _fmt_allowed(allowed),
+        "状态: <code>enabled</code>",
+        f"🎯 模型: <code>{'全部模型（无限制）' if not allowed else str(len(allowed)) + ' 个白名单'}</code>",
+        f"🔌 协议: <code>{ui.escape_html(proto_str)}</code>",
+        f"🖼 图片接口: <code>{'允许' if img else '禁止'}</code>",
     ]
     if allowed:
         for m in allowed:
-            lines.append(f"  • <code>{ui.escape_html(m)}</code>")
-    else:
-        lines.append("  <i>（未设白名单时，该 Key 可调用任意渠道支持的模型）</i>")
-    lines.append("")
-    lines.append(_fmt_allowed_protocols(allowed_protos))
-    if not allowed_protos:
-        lines.append("  <i>（未限制时，该 Key 可同时用于 /v1/messages、/v1/chat/completions、/v1/responses）</i>")
-    lines.append("")
-    lines.append(_fmt_allow_images(entry))
-    lines.append("  <i>图片生成/编辑是单独权限，默认关闭。</i>")
+            lines.append(f"    • <code>{ui.escape_html(m)}</code>")
 
-    # 本月使用统计
-    ms = _key_month_stats(name)
-    if ms is not None:
-        prompt = ui.prompt_total(ms["input"], ms["cache_creation"], ms["cache_read"])
-        token_line = f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ms['output'])}"
-        if (ms.get("cache_read") or 0) > 0:
-            token_line += f" · {ui.fmt_cache_phrase(ms['cache_read'], prompt)}"
-        lines += [
-            "",
-            "<b>📈 本月使用统计</b>",
-            f"  调用 {ms['total']} 次 · ✅ {ms['success_count']}"
-            f" ({ui.fmt_rate(ms['success_count'], ms['total'])}) · ❌ {ms['error_count']}",
-            token_line,
-        ]
-        if ms.get("avg_tps") is not None:
-            lines.append(
-                f"  ⚡ TPS: 平均 {ui.fmt_tps(ms.get('avg_tps'))} · "
-                f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
-                f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
-            )
+    lines.append("")
+    lines.append("<b>📊 本月使用统计</b>")
+    if active:
+        prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
+        token_line = f"↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(s['output'])}"
+        if (s.get("cache_read") or 0) > 0:
+            token_line += f" · {ui.fmt_cache_phrase(s['cache_read'], prompt)}"
+        lines.append(f"总体: {s['total']:,} 次 · ✅ {s['success_count']} · ❌ {s['error_count']}")
+        lines.append(token_line)
+        lines.append(
+            f"平均 {ui.fmt_tps(s.get('avg_tps'))} · "
+            f"峰值 {ui.fmt_tps(s.get('max_tps'))} · "
+            f"最低 {ui.fmt_tps(s.get('min_tps'))}"
+        )
+        try:
+            by_model = log_db.apikey_model_stats(name, since_ts=since_ts)
+        except Exception:
+            by_model = []
+        if by_model:
+            lines.append("")
+            lines.append("按模型:")
+            for mrow in by_model[:8]:
+                model = ui.escape_html(mrow.get("final_model") or "?")
+                m_prompt = ui.prompt_total(mrow["input"], mrow["cache_creation"], mrow["cache_read"])
+                model_line = (
+                    f"    {mrow['total']:,} 次 · ✅ {mrow['success_count']} · ❌ {mrow['error_count']}"
+                    f" · ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(mrow['output'])}"
+                )
+                if (mrow.get("cache_read") or 0) > 0:
+                    model_line += f" · {ui.fmt_cache_phrase(mrow['cache_read'], m_prompt)}"
+                lines.append(f"  • <code>{model}</code>")
+                lines.append(model_line)
+            if len(by_model) > 8:
+                lines.append(f"  <i>… 其余 {len(by_model) - 8} 个模型未展开</i>")
+    else:
+        lines.append("<i>本月暂无调用</i>")
 
     short = _short_of(name)
     img_label = "🖼 禁用图片接口" if entry.get("allowImages") else "🖼 允许图片接口"
@@ -331,7 +416,7 @@ def _render_detail(name: str) -> tuple[Optional[str], Optional[dict]]:
         [ui.btn("🗑 删除", f"ak:del:{short}")],
         [ui.btn("◀ 返回列表", "menu:apikey")],
     ]
-    return "\n".join(lines), ui.inline_kb(rows)
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
