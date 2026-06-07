@@ -93,6 +93,11 @@ class OpenAIApiChannel(Channel):
 
     def _build_chat_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
         payload = common.filter_chat_passthrough(body)
+        if bool(body.get("_parrot_allow_openai_thinking")) and isinstance(body.get("thinking"), dict):
+            # Internal-only escape hatch for DeepSeek V4 thinking mode.  Keep this
+            # out of the public chat passthrough whitelist so arbitrary OpenAI
+            # compatible channels do not receive non-standard `thinking` fields.
+            payload["thinking"] = body["thinking"]
         payload["model"] = resolved_model
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),

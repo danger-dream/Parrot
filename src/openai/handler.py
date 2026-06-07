@@ -427,7 +427,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
           f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
 
     # 7.5 翻译层
-    body = await translation.translate_body(body, ingress_protocol=ingress_protocol)
+    body = await translation.translate_body(body, ingress_protocol=ingress_protocol, route=result)
 
     # 7. failover
     try:

@@ -7,6 +7,7 @@ callback_data 前缀：`tl:...`
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 
 from ... import config, translation
@@ -41,6 +42,136 @@ def _get_cfg() -> dict:
     return translation._get_cfg()
 
 
+def _current_model_name(cfg: dict | None = None) -> str:
+    cfg = cfg or _get_cfg()
+    return str(cfg.get("model") or "").strip()
+
+
+def _model_overrides(cfg: dict | None = None) -> dict:
+    cfg = cfg or _get_cfg()
+    overrides = cfg.get("modelOverrides") or {}
+    return overrides if isinstance(overrides, dict) else {}
+
+
+def _override_for_model(model: str, cfg: dict | None = None) -> dict:
+    if not model:
+        return {}
+    item = _model_overrides(cfg).get(model)
+    return item if isinstance(item, dict) else {}
+
+
+def _override_body_for_model(model: str, cfg: dict | None = None) -> dict:
+    body = (_override_for_model(model, cfg).get("body") or {})
+    return body if isinstance(body, dict) else {}
+
+
+def _override_summary_for_model(model: str, cfg: dict | None = None) -> str:
+    if not model:
+        return "未设置翻译模型"
+    body = _override_body_for_model(model, cfg)
+    if not body:
+        return "未配置"
+    thinking = body.get("thinking")
+    effort = body.get("reasoning_effort")
+    parts: list[str] = []
+    if isinstance(thinking, dict):
+        t = thinking.get("type")
+        if t:
+            parts.append(f"thinking={t}")
+    if effort:
+        parts.append(f"effort={effort}")
+    extra = [k for k in body.keys() if k not in ("thinking", "reasoning_effort")]
+    if extra:
+        parts.append("body+" + str(len(extra)))
+    return ", ".join(parts) if parts else "已配置"
+
+
+def _sanitize_override_body(raw: dict) -> dict:
+    out: dict = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not k or k.startswith("_parrot_"):
+            continue
+        out[k] = v
+    return out
+
+
+def _scope_cfg(cfg: dict | None = None) -> dict:
+    cfg = cfg or _get_cfg()
+    scope = cfg.get("scope") if isinstance(cfg.get("scope"), dict) else {}
+    return {
+        "models": _string_list(scope.get("models")),
+        "channels": _string_list(scope.get("channels")),
+    }
+
+
+def _string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        s = str(item or "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _scope_summary(kind: str, cfg: dict | None = None) -> str:
+    values = _scope_cfg(cfg).get(kind) or []
+    return "全部" if not values else f"仅 {len(values)} 个"
+
+
+def _channel_scope_items() -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for ch in registry.all_channels():
+        key = str(getattr(ch, "key", "") or "")
+        if not key:
+            continue
+        typ = str(getattr(ch, "type", "") or "")
+        proto = str(getattr(ch, "protocol", "anthropic") or "anthropic")
+        icon = "👤" if typ == "oauth" else "🔑"
+        if proto == "anthropic":
+            icon += "🅰"
+        elif proto.startswith("openai"):
+            icon += "🅾"
+        label = str(getattr(ch, "display_name", "") or getattr(ch, "name", "") or key)
+        items.append((key, f"{icon} {label}"))
+    return items
+
+
+def _toggle_scope_value(kind: str, value: str) -> None:
+    value = str(value or "").strip()
+    if kind not in ("models", "channels") or not value:
+        return
+
+    def _m(c):
+        tl = c.setdefault("translation", {})
+        scope = tl.setdefault("scope", {})
+        if not isinstance(scope, dict):
+            scope = {}
+            tl["scope"] = scope
+        values = _string_list(scope.get(kind))
+        if value in values:
+            values.remove(value)
+        else:
+            values.append(value)
+        scope[kind] = values
+    config.update(_m)
+
+
+def _clear_scope(kind: str) -> None:
+    if kind not in ("models", "channels"):
+        return
+
+    def _m(c):
+        tl = c.setdefault("translation", {})
+        scope = tl.setdefault("scope", {})
+        if not isinstance(scope, dict):
+            scope = {}
+            tl["scope"] = scope
+        scope[kind] = []
+    config.update(_m)
+
+
 # ─── 主页面 ───────────────────────────────────────────────────────
 
 def _main_text_and_kb() -> tuple[str, dict]:
@@ -57,6 +188,9 @@ def _main_text_and_kb() -> tuple[str, dict]:
     mem_mb = int(cfg.get("memoryCacheMaxMb", 100))
     mem_ttl = int(cfg.get("memoryCacheTtlSeconds", 7200))
     translate_system = bool(cfg.get("translateSystemMessages", False))
+    override_summary = _override_summary_for_model(str(model or ""), cfg)
+    model_scope_summary = _scope_summary("models", cfg)
+    channel_scope_summary = _scope_summary("channels", cfg)
     ready_ok, ready_reason = translation.validate_ready(cfg, require_enabled=False)
 
     cache_n = translation.cache_count()
@@ -79,6 +213,9 @@ def _main_text_and_kb() -> tuple[str, dict]:
         f"连续失败告警: <code>{alert_threshold}</code> 次\n"
         f"内存缓存: <code>{mem_mb}MB / TTL {mem_ttl}s</code>\n"
         f"翻译系统消息: <code>{'开' if translate_system else '关'}</code>\n"
+        f"生效模型: <code>{ui.escape_html(model_scope_summary)}</code>\n"
+        f"生效渠道/账号: <code>{ui.escape_html(channel_scope_summary)}</code>\n"
+        f"模型参数: <code>{ui.escape_html(override_summary)}</code>\n"
         f"可用性: <code>{'✅ 可用' if ready_ok else '⚠ ' + ready_reason}</code>\n\n"
         f"缓存: <code>{cache_n}</code> 条"
         f" · 内存 <code>{mem_entries}</code> 条 / <code>{mem_bytes / 1024 / 1024:.2f}MB</code>"
@@ -101,8 +238,11 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("✏ 内存TTL", "tl:edit:mem_ttl")],
         [ui.btn("🧩 翻译系统消息", "tl:toggle:system"),
          ui.btn("🧪 测试翻译", "tl:test")],
+        [ui.btn("🎯 生效模型", "tl:scope:models:0"),
+         ui.btn("🎯 生效渠道/账号", "tl:scope:channels:0")],
         [ui.btn("📝 翻译提示词", "tl:show:prompt"),
-         ui.btn("🗑 清空缓存", "tl:cache:clear")],
+         ui.btn("🧠 模型参数", "tl:show:params")],
+        [ui.btn("🗑 清空缓存", "tl:cache:clear")],
         [ui.btn("◀ 返回设置", "menu:settings"),
          ui.btn("🏠 返回主菜单", "menu:main")],
     ])
@@ -318,6 +458,287 @@ def _on_numeric_input(chat_id: int, key: str, text: str) -> None:
     )
 
 
+# ─── 生效范围 ───────────────────────────────────────────────────
+
+def _show_scope_models(chat_id: int, message_id: int, cb_id: str, page: int = 0) -> None:
+    if cb_id:
+        ui.answer_cb(cb_id)
+    try:
+        models = registry.available_models()
+    except Exception:
+        models = []
+    selected = set(_scope_cfg().get("models") or [])
+    total = len(models)
+    total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PAGE_SIZE
+    page_models = models[start:start + _PAGE_SIZE]
+
+    lines = [
+        "🎯 <b>翻译层生效模型</b>",
+        "",
+        "空选择表示所有模型都启用翻译层；勾选后只对已选模型启用。",
+        "",
+        f"当前: <code>{ui.escape_html(_scope_summary('models'))}</code>",
+    ]
+    if selected:
+        lines.append("已选：")
+        for m in sorted(selected):
+            lines.append(f"• <code>{ui.escape_html(m)}</code>")
+    if models:
+        lines.append(f"\n第 {page + 1}/{total_pages} 页 · 共 {total} 个模型")
+    else:
+        lines.append("\n<i>没有可选模型。</i>")
+
+    rows: list[list[dict]] = []
+    for m in page_models:
+        mark = "✅ " if m in selected else "▫️ "
+        code = ui.register_code(f"tl:scope:model:{m}")
+        rows.append([ui.btn(mark + m, f"tl:scope:model:{code}")])
+
+    nav: list[dict] = []
+    if page > 0:
+        nav.append(ui.btn("◀ 上一页", f"tl:scope:models:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(ui.btn("下一页 ▶", f"tl:scope:models:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ui.btn("🌐 全部模型生效", "tl:scope:models:clear")])
+    rows.append([ui.btn("◀ 返回翻译层", "tl:show")])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def _show_scope_channels(chat_id: int, message_id: int, cb_id: str, page: int = 0) -> None:
+    if cb_id:
+        ui.answer_cb(cb_id)
+    items = _channel_scope_items()
+    selected = set(_scope_cfg().get("channels") or [])
+    total = len(items)
+    total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PAGE_SIZE
+    page_items = items[start:start + _PAGE_SIZE]
+
+    lines = [
+        "🎯 <b>翻译层生效渠道/账号</b>",
+        "",
+        "空选择表示所有渠道/账号都启用翻译层；勾选后只对已选渠道/账号启用。",
+        "",
+        f"当前: <code>{ui.escape_html(_scope_summary('channels'))}</code>",
+    ]
+    if selected:
+        known = {k: label for k, label in items}
+        lines.append("已选：")
+        for key in sorted(selected):
+            label = known.get(key, key)
+            lines.append(f"• {ui.escape_html(label)} <code>{ui.escape_html(key)}</code>")
+    if items:
+        lines.append(f"\n第 {page + 1}/{total_pages} 页 · 共 {total} 个渠道/账号")
+    else:
+        lines.append("\n<i>没有可选渠道/账号。</i>")
+
+    rows: list[list[dict]] = []
+    for key, label in page_items:
+        mark = "✅ " if key in selected else "▫️ "
+        code = ui.register_code(f"tl:scope:channel:{key}")
+        rows.append([ui.btn(mark + label, f"tl:scope:channel:{code}")])
+
+    nav: list[dict] = []
+    if page > 0:
+        nav.append(ui.btn("◀ 上一页", f"tl:scope:channels:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(ui.btn("下一页 ▶", f"tl:scope:channels:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ui.btn("🌐 全部渠道/账号生效", "tl:scope:channels:clear")])
+    rows.append([ui.btn("◀ 返回翻译层", "tl:show")])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def _on_toggle_scope_model(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
+    tag = ui.resolve_code(code)
+    if not tag or not tag.startswith("tl:scope:model:"):
+        ui.answer_cb(cb_id, "会话已过期", show_alert=True)
+        return
+    model = tag[len("tl:scope:model:"):]
+    _toggle_scope_value("models", model)
+    ui.answer_cb(cb_id, "已更新生效模型")
+    _show_scope_models(chat_id, message_id, "", 0)
+
+
+def _on_toggle_scope_channel(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
+    tag = ui.resolve_code(code)
+    if not tag or not tag.startswith("tl:scope:channel:"):
+        ui.answer_cb(cb_id, "会话已过期", show_alert=True)
+        return
+    key = tag[len("tl:scope:channel:"):]
+    _toggle_scope_value("channels", key)
+    ui.answer_cb(cb_id, "已更新生效渠道/账号")
+    _show_scope_channels(chat_id, message_id, "", 0)
+
+
+# ─── 模型上游参数 ────────────────────────────────────────────────
+
+def _show_model_params(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    cfg = _get_cfg()
+    model = _current_model_name(cfg)
+    if not model:
+        ui.edit(
+            chat_id, message_id,
+            "🧠 <b>翻译模型参数</b>\n\n请先设置翻译模型。",
+            reply_markup=ui.inline_kb([[ui.btn("◀ 返回翻译层", "tl:show")]]),
+        )
+        return
+
+    body = _override_body_for_model(model, cfg)
+    body_json = json.dumps(body, ensure_ascii=False, indent=2) if body else "{}"
+    summary = _override_summary_for_model(model, cfg)
+    text = (
+        "🧠 <b>翻译模型参数</b>\n\n"
+        "这里配置的是 <b>翻译层内部调用翻译模型</b> 时附加到上游请求 body 的参数，"
+        "不会附加到最终业务模型请求。\n\n"
+        f"当前翻译模型: <code>{ui.escape_html(model)}</code>\n"
+        f"当前状态: <code>{ui.escape_html(summary)}</code>\n\n"
+        "常用：OpenAI-compatible thinking mode\n"
+        "• high/max 会写入 <code>thinking.type=enabled</code> 和 <code>reasoning_effort</code>\n"
+        "• 关闭 thinking 只移除这两个字段，不影响其它自定义 body 字段\n\n"
+        f"当前 body override:\n<pre>{ui.escape_html(body_json)}</pre>"
+    )
+    rows = [
+        [ui.btn("🧠 thinking=high", "tl:params:think:high"),
+         ui.btn("🧠 thinking=max", "tl:params:think:max")],
+        [ui.btn("🚫 关闭 thinking", "tl:params:think:off"),
+         ui.btn("✏ 自定义 body JSON", "tl:params:body")],
+        [ui.btn("🗑 清除本模型参数", "tl:params:clear")],
+        [ui.btn("◀ 返回翻译层", "tl:show")],
+    ]
+    ui.edit(chat_id, message_id, ui.truncate(text), reply_markup=ui.inline_kb(rows))
+
+
+def _update_current_model_body(mutator) -> tuple[bool, str]:
+    cfg = _get_cfg()
+    model = _current_model_name(cfg)
+    if not model:
+        return False, "请先设置翻译模型"
+
+    def _m(c):
+        tl = c.setdefault("translation", {})
+        overrides = tl.setdefault("modelOverrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+            tl["modelOverrides"] = overrides
+        item = overrides.get(model)
+        if not isinstance(item, dict):
+            item = {}
+        body = item.get("body")
+        if not isinstance(body, dict):
+            body = {}
+        body = dict(body)
+        mutator(body)
+        body = _sanitize_override_body(body)
+        if body:
+            item["body"] = body
+            overrides[model] = item
+        else:
+            item.pop("body", None)
+            if item:
+                overrides[model] = item
+            else:
+                overrides.pop(model, None)
+    config.update(_m)
+    return True, model
+
+
+def _on_set_thinking(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
+    if mode not in ("high", "max", "off"):
+        ui.answer_cb(cb_id, "未知 thinking 模式", show_alert=True)
+        return
+
+    def _mut(body: dict) -> None:
+        if mode == "off":
+            body.pop("thinking", None)
+            body.pop("reasoning_effort", None)
+        else:
+            body["thinking"] = {"type": "enabled"}
+            body["reasoning_effort"] = mode
+
+    ok, model = _update_current_model_body(_mut)
+    if not ok:
+        ui.answer_cb(cb_id, model, show_alert=True)
+        return
+    ui.answer_cb(cb_id, f"已更新 {model}: thinking={mode}")
+    _show_model_params(chat_id, message_id, "-")
+
+
+def _on_clear_model_params(chat_id: int, message_id: int, cb_id: str) -> None:
+    cfg = _get_cfg()
+    model = _current_model_name(cfg)
+    if not model:
+        ui.answer_cb(cb_id, "请先设置翻译模型", show_alert=True)
+        return
+
+    def _m(c):
+        tl = c.setdefault("translation", {})
+        overrides = tl.setdefault("modelOverrides", {})
+        if isinstance(overrides, dict):
+            overrides.pop(model, None)
+    config.update(_m)
+    ui.answer_cb(cb_id, f"已清除 {model} 的模型参数")
+    _show_model_params(chat_id, message_id, "-")
+
+
+def _edit_model_body(chat_id: int, message_id: int, cb_id: str) -> None:
+    model = _current_model_name()
+    if not model:
+        ui.answer_cb(cb_id, "请先设置翻译模型", show_alert=True)
+        return
+    ui.answer_cb(cb_id)
+    current = _override_body_for_model(model)
+    current_json = json.dumps(current, ensure_ascii=False, indent=2) if current else "{}"
+    states.set_state(chat_id, "tl_params_body")
+    ui.edit(
+        chat_id, message_id,
+        "✏ <b>自定义翻译模型 body 参数</b>\n\n"
+        f"当前翻译模型: <code>{ui.escape_html(model)}</code>\n\n"
+        "请发送一个 JSON object，会作为翻译层调用该模型时的额外 body 字段。\n"
+        "例如：\n"
+        "<pre>{\n  \"thinking\": {\"type\": \"enabled\"},\n  \"reasoning_effort\": \"max\"\n}</pre>\n"
+        "发送 <code>{}</code> 表示清空。\n\n"
+        f"当前值:\n<pre>{ui.escape_html(current_json)}</pre>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "tl:show:params")]]),
+    )
+
+
+def _on_model_body_input(chat_id: int, text: str) -> None:
+    raw = (text or "").strip()
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        ui.send(chat_id, f"❌ JSON 解析失败：<code>{ui.escape_html(str(exc))}</code>\n请重新输入：")
+        return
+    if not isinstance(data, dict):
+        ui.send(chat_id, "❌ 必须是 JSON object，例如 <code>{}</code>，请重新输入：")
+        return
+    body = _sanitize_override_body(data)
+
+    def _mut(cur: dict) -> None:
+        cur.clear()
+        cur.update(body)
+
+    ok, model = _update_current_model_body(_mut)
+    if not ok:
+        states.pop_state(chat_id)
+        ui.send(chat_id, f"❌ {ui.escape_html(model)}")
+        return
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id,
+        f"✅ 已更新 <code>{ui.escape_html(model)}</code> 的翻译模型 body 参数",
+        back_label="◀ 返回模型参数", back_callback="tl:show:params",
+    )
+
+
 # ─── 翻译提示词 ──────────────────────────────────────────────────
 
 def _show_prompt(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -523,6 +944,43 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         if data == f"tl:edit:{key}":
             _edit_numeric(chat_id, message_id, cb_id, key); return True
 
+    # 生效范围
+    if data.startswith("tl:scope:models:"):
+        tail = data.split(":", 3)[3]
+        if tail == "clear":
+            _clear_scope("models")
+            ui.answer_cb(cb_id, "已设为全部模型生效")
+            _show_scope_models(chat_id, message_id, "", 0)
+        else:
+            _show_scope_models(chat_id, message_id, cb_id, _safe_int(tail))
+        return True
+    if data.startswith("tl:scope:channels:"):
+        tail = data.split(":", 3)[3]
+        if tail == "clear":
+            _clear_scope("channels")
+            ui.answer_cb(cb_id, "已设为全部渠道/账号生效")
+            _show_scope_channels(chat_id, message_id, "", 0)
+        else:
+            _show_scope_channels(chat_id, message_id, cb_id, _safe_int(tail))
+        return True
+    if data.startswith("tl:scope:model:"):
+        _on_toggle_scope_model(chat_id, message_id, cb_id, data.split(":", 3)[3])
+        return True
+    if data.startswith("tl:scope:channel:"):
+        _on_toggle_scope_channel(chat_id, message_id, cb_id, data.split(":", 3)[3])
+        return True
+
+    # 模型上游参数
+    if data == "tl:show:params":
+        _show_model_params(chat_id, message_id, cb_id); return True
+    if data.startswith("tl:params:think:"):
+        mode = data.split(":", 3)[3]
+        _on_set_thinking(chat_id, message_id, cb_id, mode); return True
+    if data == "tl:params:clear":
+        _on_clear_model_params(chat_id, message_id, cb_id); return True
+    if data == "tl:params:body":
+        _edit_model_body(chat_id, message_id, cb_id); return True
+
     # 提示词
     if data == "tl:show:prompt":
         _show_prompt(chat_id, message_id, cb_id); return True
@@ -551,6 +1009,10 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     # 提示词
     if action == "tl_prompt":
         _on_prompt_input(chat_id, text); return True
+
+    # 模型上游参数 JSON
+    if action == "tl_params_body":
+        _on_model_body_input(chat_id, text); return True
 
     # 测试翻译
     if action == "tl_test":

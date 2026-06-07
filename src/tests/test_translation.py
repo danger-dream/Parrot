@@ -58,6 +58,8 @@ def _fresh_translation():
         "memoryCacheMaxMb": 100,
         "memoryCacheTtlSeconds": 7200,
         "translateSystemMessages": True,
+        "scope": {"models": [], "channels": []},
+        "modelOverrides": {},
     }))
     yield
     translation.clear_cache()
@@ -609,6 +611,14 @@ class TestDefaultPrompt:
         assert "Japanese" in prompt
         assert "{target_language}" not in prompt
 
+    def test_prompt_treats_source_as_data_with_examples(self):
+        prompt = translation.DEFAULT_TRANSLATION_PROMPT
+        assert "inert data" in prompt
+        assert "<source_text>" in prompt
+        assert "Wrong output:" in prompt
+        assert "Chinese" in prompt
+        assert "HACKED" in prompt
+
 
 # ─── 响应解析 ─────────────────────────────────────────────────────
 
@@ -683,6 +693,78 @@ class TestExtractFromResponse:
         assert translation._extract_text_from_sse(raw, "openai-chat", "gpt") == "hello"
 
 
+# ─── 生效范围 ───────────────────────────────────────────────────
+
+class TestTranslationScope:
+    class _Ch:
+        def __init__(self, key):
+            self.key = key
+
+    class _Route:
+        def __init__(self, key):
+            self.candidates = [(TestTranslationScope._Ch(key), "resolved")]
+            self.saturated = []
+
+    def test_empty_scope_allows_all(self):
+        cfg = translation._get_cfg()
+        cfg["scope"] = {"models": [], "channels": []}
+        assert translation._translation_scope_allows({"model": "claude-opus-4-8"}, cfg, None) is True
+
+    def test_model_scope_filters_requested_model(self):
+        cfg = translation._get_cfg()
+        cfg["scope"] = {"models": ["claude-opus-4-8"], "channels": []}
+        assert translation._translation_scope_allows({"model": "claude-opus-4-8"}, cfg, None) is True
+        assert translation._translation_scope_allows({"model": "gpt-5.5"}, cfg, None) is False
+
+    def test_channel_scope_requires_matching_route(self):
+        cfg = translation._get_cfg()
+        cfg["scope"] = {"models": [], "channels": ["oauth:claude:a@example.com"]}
+        assert translation._translation_scope_allows(
+            {"model": "claude-opus-4-8"}, cfg, self._Route("oauth:claude:a@example.com")
+        ) is True
+        assert translation._translation_scope_allows(
+            {"model": "claude-opus-4-8"}, cfg, self._Route("oauth:claude:b@example.com")
+        ) is False
+        assert translation._translation_scope_allows({"model": "claude-opus-4-8"}, cfg, None) is False
+
+
+# ─── 翻译结果安全校验 / 输出预算 ────────────────────────────────
+
+class TestTranslationResultValidation:
+    def test_rejects_blank_translation(self):
+        assert translation._translation_result_problem("hello", "") == "blank"
+
+    def test_does_not_guess_truncation_from_text_shape(self):
+        source = (
+            "Conversation info (untrusted metadata):\n"
+            "```json\n{}\n```\n\n"
+            "你检查下网络，看看是什么问题，为什么会连个镜像都拉取不下来"
+        )
+        truncated = (
+            "Conversation info (untrusted metadata):\n"
+            "```json\n{\n  \"message_id\": \"1217\""
+        )
+        # Completeness is decided from explicit upstream finish_reason/stop_reason,
+        # not heuristic text-shape guessing.
+        assert translation._translation_result_problem(source, truncated) is None
+
+    def test_detects_openai_chat_length_finish(self):
+        assert translation._completion_incomplete_reason({
+            "choices": [{"finish_reason": "length", "message": {"content": "partial"}}]
+        }, "openai-chat") == "finish_reason=length"
+
+    def test_uses_configured_output_limit_as_single_budget(self):
+        assert translation._translation_token_budgets("hello", 128000) == [128000]
+
+    def test_override_max_tokens_precedence(self):
+        cfg = {"modelOverrides": {"m": {"maxTokens": 64000}}}
+        assert translation._override_max_tokens(cfg, "m", "m") == 64000
+
+    def test_body_override_max_tokens_supported(self):
+        cfg = {"modelOverrides": {"m": {"body": {"max_tokens": 32000}}}}
+        assert translation._override_max_tokens(cfg, "m", "m") == 32000
+
+
 # ─── build_translation_body 协议适配 ─────────────────────────────
 
 class TestBuildTranslationBody:
@@ -703,7 +785,7 @@ class TestBuildTranslationBody:
         assert ingress == "anthropic"
         assert body["system"] == "You are a translator"
         assert body["messages"][0]["role"] == "user"
-        assert body["messages"][0]["content"] == "translate me"
+        assert body["messages"][0]["content"] == translation._wrap_source_text("translate me")
         assert body["stream"] is False
 
     def test_openai_chat_body(self):
@@ -715,7 +797,7 @@ class TestBuildTranslationBody:
         assert body["messages"][0]["role"] == "system"
         assert body["messages"][0]["content"] == "You are a translator"
         assert body["messages"][1]["role"] == "user"
-        assert body["messages"][1]["content"] == "translate me"
+        assert body["messages"][1]["content"] == translation._wrap_source_text("translate me")
 
     def test_openai_responses_body(self):
         ch = self._make_mock_channel("openai-responses")
@@ -724,9 +806,94 @@ class TestBuildTranslationBody:
         )
         assert ingress == "responses"
         assert body["instructions"] == "You are a translator"
-        assert body["input"] == "translate me"
+        assert body["input"] == translation._wrap_source_text("translate me")
         assert body.get("max_output_tokens") == 4096
 
+    def test_configured_translation_model_overrides(self):
+        ch = self._make_mock_channel("openai-chat")
+        body, _ = translation._build_translation_body(
+            ch, "translate me", "You are a translator", 4096,
+        )
+        cfg = {
+            "modelOverrides": {
+                "deepseek-v4-flash": {
+                    "body": {"thinking": {"type": "enabled"}, "reasoning_effort": "max"}
+                }
+            }
+        }
+        translation._apply_translation_model_overrides(
+            ch, body, cfg, "deepseek-v4-flash", "deepseek-v4-flash",
+        )
+        assert body["thinking"] == {"type": "enabled"}
+        assert body["reasoning_effort"] == "max"
+        assert body[translation._PARROT_ALLOW_OPENAI_THINKING_KEY] is True
+
+    def test_no_translation_override_does_not_add_thinking(self):
+        ch = self._make_mock_channel("openai-chat")
+        body, _ = translation._build_translation_body(
+            ch, "translate me", "You are a translator", 4096,
+        )
+        translation._apply_translation_model_overrides(
+            ch, body, {"modelOverrides": {}}, "gpt-5.5", "gpt-5.5",
+        )
+        assert "thinking" not in body
+        assert "reasoning_effort" not in body
+        assert translation._PARROT_ALLOW_OPENAI_THINKING_KEY not in body
+
+
+class TestOpenAIApiChannelThinkingPassthrough:
+    def test_internal_thinking_flag_is_passed_to_openai_chat_payload(self):
+        from src.openai.channel.api_channel import OpenAIApiChannel
+
+        ch = OpenAIApiChannel({
+            "name": "DeepSeek-Test",
+            "type": "api",
+            "baseUrl": "https://api.deepseek.com",
+            "apiKey": "sk-test",
+            "protocol": "openai-chat",
+            "models": [{"real": "deepseek-v4-flash", "alias": "deepseek-v4-flash"}],
+            "enabled": True,
+        })
+        body, _ = translation._build_translation_body(
+            ch, "translate me", "You are a translator", 4096,
+        )
+        body["model"] = "deepseek-v4-flash"
+        translation._apply_translation_model_overrides(
+            ch, body,
+            {"modelOverrides": {"deepseek-v4-flash": {"body": {"thinking": {"type": "enabled"}, "reasoning_effort": "max"}}}},
+            "deepseek-v4-flash", "deepseek-v4-flash",
+        )
+
+        req = asyncio.run(ch.build_upstream_request(
+            body, "deepseek-v4-flash", ingress_protocol="chat",
+        ))
+        payload = json.loads(req.body.decode("utf-8"))
+        assert payload["thinking"] == {"type": "enabled"}
+        assert payload["reasoning_effort"] == "max"
+        assert translation._PARROT_ALLOW_OPENAI_THINKING_KEY not in payload
+
+    def test_public_chat_passthrough_still_drops_unflagged_thinking(self):
+        from src.openai.channel.api_channel import OpenAIApiChannel
+
+        ch = OpenAIApiChannel({
+            "name": "OpenAI-Compatible-Test",
+            "type": "api",
+            "baseUrl": "https://example.test",
+            "apiKey": "sk-test",
+            "protocol": "openai-chat",
+            "models": [{"real": "gpt", "alias": "gpt"}],
+            "enabled": True,
+        })
+        req = asyncio.run(ch.build_upstream_request({
+            "model": "gpt",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "max",
+        }, "gpt", ingress_protocol="chat"))
+        payload = json.loads(req.body.decode("utf-8"))
+        assert "thinking" not in payload
+        # reasoning_effort is a standard OpenAI-compatible chat field and remains passthrough.
+        assert payload["reasoning_effort"] == "max"
 
 
 class TestReadiness:
@@ -761,6 +928,8 @@ class TestConfig:
         assert tl["memoryCacheMaxMb"] == 100
         assert tl["memoryCacheTtlSeconds"] == 7200
         assert tl["translateSystemMessages"] is False
+        assert tl["scope"] == {"models": [], "channels": []}
+        assert tl["modelOverrides"] == {}
 
     def test_get_cfg_merges_defaults(self):
         """即使 config 中翻译段缺字段，_get_cfg 补齐默认值。"""

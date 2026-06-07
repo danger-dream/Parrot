@@ -600,7 +600,7 @@ async def proxy_messages(request: Request):
           f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
 
     # 5.5 翻译层：对 body 中的 user/system 消息做翻译（默认关闭；失败静默回退原文）
-    body = await translation.translate_body(body, ingress_protocol="anthropic")
+    body = await translation.translate_body(body, ingress_protocol="anthropic", route=result)
 
     # 6. 故障转移 + 上游调用
     try:

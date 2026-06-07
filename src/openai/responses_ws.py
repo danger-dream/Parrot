@@ -314,9 +314,6 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     body["stream"] = True
     body["_api_key_name"] = key_name or ""
 
-    # 翻译层（first frame）
-    body = await translation.translate_body(body, ingress_protocol="responses")
-
     input_items = resolve_current_input_items(body)
     fp_query = fingerprint.fingerprint_query_responses(key_name or "", client_ip, input_items)
     _maybe_apply_auto_prompt_cache_key(
@@ -327,7 +324,6 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         model=model,
         ingress_protocol="responses",
     )
-    _sync_translated_body_to_ws_create(first_obj, body)
 
     msg_count, tool_count = _count_msg_tool(body, "responses")
     reasoning_effort = log_db.extract_reasoning_effort(body, "responses_ws")
@@ -377,6 +373,10 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     print(f"[{ts}] {client_ip} {key_name} → responses_ws:{model} "
           f"(msgs={msg_count}, tools={tool_count}) "
           f"{'★' if result.affinity_hit else ''}first={chosen}{sat_note}")
+
+    # 翻译层（first frame）：放在调度之后，才能按生效渠道/账号判断。
+    body = await translation.translate_body(body, ingress_protocol="responses", route=result)
+    _sync_translated_body_to_ws_create(first_obj, body)
 
     try:
         accepted = await _run_ws_failover(
@@ -918,8 +918,10 @@ async def _relay_ws_session(
                     raise ValueError(ge.message)
                 local_body["stream"] = True
                 local_body["_api_key_name"] = api_key_name or ""
-                # 翻译层（subsequent frame）
-                local_body = await translation.translate_body(local_body, ingress_protocol="responses")
+                # 翻译层（subsequent frame）：WS 会话已经绑定当前上游渠道。
+                local_body = await translation.translate_body(
+                    local_body, ingress_protocol="responses", route=(ch, resolved_model)
+                )
                 _sync_translated_body_to_ws_create(obj, local_body)
                 mapped = _map_ws_create_frame_for_upstream(obj, resolved_model, channel=ch)
                 mapped = _apply_identity_confuse_to_frame(mapped)

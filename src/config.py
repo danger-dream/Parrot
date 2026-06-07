@@ -204,6 +204,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "memoryCacheMaxMb": 100,
         "memoryCacheTtlSeconds": 7200,
         "translateSystemMessages": False,
+        "scope": {"models": [], "channels": []},
+        "modelOverrides": {},
     },
     "cchMode": "disabled",
     "cchStaticValue": "00000",
