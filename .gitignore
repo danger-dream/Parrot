@@ -42,3 +42,6 @@ bak/
 .idea/
 .vscode/
 *.swp
+backups/
+.update_log
+.update_result
