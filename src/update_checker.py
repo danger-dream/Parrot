@@ -35,6 +35,7 @@ def _cfg() -> dict:
         "includePrerelease": bool(uc.get("includePrerelease", True)),
         "repo": str(uc.get("repo") or "danger-dream/Parrot").strip(),
         "ignoredVersions": list(uc.get("ignoredVersions") or []),
+        "apiBase": str(uc.get("apiBase") or "https://api.github.com").strip().rstrip("/"),
     }
 
 
@@ -230,7 +231,7 @@ def _check_once(*, push: bool = True) -> None:
     cfg = _cfg()
     if not cfg["enabled"] or not cfg["repo"]:
         return
-    url = f"https://api.github.com/repos/{cfg['repo']}/releases?per_page=20"
+    url = f"{cfg['apiBase']}/repos/{cfg['repo']}/releases?per_page=20"
     releases = _http_get_json(url)
     if releases is None:
         return
@@ -263,10 +264,28 @@ def _check_once(*, push: bool = True) -> None:
 
     if should_push:
         try:
-            notifier.notify_event("app_update", _format_release(tag, latest))
+            reply_markup = _build_update_buttons(tag)
+            notifier.notify_event("app_update", _format_release(tag, latest),
+                                  reply_markup=reply_markup)
             notified_for = tag
         except Exception as exc:
             print(f"[update_checker] notify failed: {exc}")
+        # 自动更新模式：检测到新版直接走自更新（仍是双重确认——staged 后等用户点确认）
+        # 注意：只做"备份+拉取"进 staged，重启仍需用户在 TG 点确认（不绕过双重确认）。
+        try:
+            if _cfg_auto_update() and tag not in ignored:
+                from . import updater
+                if not updater.is_busy():
+                    admin_chat = None
+                    try:
+                        admins = (config.get().get("telegram") or {}).get("adminIds") or []
+                        if admins:
+                            admin_chat = int(admins[0])
+                    except Exception:
+                        admin_chat = None
+                    updater.stage_update(tag, chat_id=admin_chat)
+        except Exception as exc:
+            print(f"[update_checker] auto-update trigger failed: {exc}")
 
     _save_state(
         cfg["repo"],
@@ -279,6 +298,29 @@ def _check_once(*, push: bool = True) -> None:
         notified_for=notified_for,
     )
     _set_cache(_load_state(cfg["repo"]))
+
+
+def _cfg_auto_update() -> bool:
+    return bool((config.get().get("updateChecker") or {}).get("autoUpdate", False))
+
+
+def _build_update_buttons(tag: str) -> dict:
+    """构造"更新通知"的 inline 按钮：🚀 立即更新 / 🔕 忽略。
+
+    callback_data 与 update_menu 的路由一致，点击后进入双重确认流程。
+    """
+    # tag 可能较长，但 callback_data 上限 64B，semver tag 远小于此，安全。
+    return {
+        "inline_keyboard": [
+            [
+                {"text": f"🚀 立即更新到 {tag}", "callback_data": f"upd:do_update:{tag}"},
+            ],
+            [
+                {"text": "🔕 忽略此版本", "callback_data": f"upd:ignore:{tag}"},
+                {"text": "📋 查看详情", "callback_data": "menu:update"},
+            ],
+        ]
+    }
 
 
 def _format_release(tag: str, release: dict) -> str:

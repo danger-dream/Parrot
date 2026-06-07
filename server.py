@@ -29,7 +29,7 @@ from src import (
     __version__,
     affinity, auth, config, cooldown, errors, failover,
     fingerprint, image_db, log_db, model_mapping, network, network_monitor, notifier, oauth_manager, probe,
-    public_ip, scheduler, scorer, state_db, status_monitor, translation, update_checker, upstream,
+    public_ip, scheduler, scorer, state_db, status_monitor, translation, update_checker, updater, upstream,
 )
 from src.channel import registry
 from src.client_ip import get_client_ip
@@ -247,6 +247,11 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
+    # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
+    try:
+        updater.resume_after_restart()
+    except Exception as _exc:
+        print(f"[updater] resume_after_restart failed: {_exc}")
     _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
     _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
 

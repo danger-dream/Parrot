@@ -22,8 +22,8 @@ from typing import Callable, Optional
 _lock = threading.Lock()
 _handler: Optional[Callable] = None
 
-# 异步发送队列：notify() 入队 (text, auto_delete_seconds)，worker 出队 → handler
-_queue: "queue.Queue[tuple[str, Optional[int]]]" = queue.Queue(maxsize=1000)
+# 异步发送队列：notify() 入队 (text, auto_delete_seconds, reply_markup, meta)，worker 出队 → handler
+_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=1000)
 _worker_thread: Optional[threading.Thread] = None
 _worker_started = False
 
@@ -45,11 +45,20 @@ def _worker_loop() -> None:
             item = _queue.get()
         except Exception:
             continue
-        # 兼容旧入队格式（直接 str）
+        # 兼容多种入队格式：str / (text, auto_delete) / (text, auto_delete, reply_markup, meta)
+        text = None
+        auto_delete = None
+        reply_markup = None
+        meta = None
         if isinstance(item, tuple):
-            text, auto_delete = item
+            if len(item) >= 4:
+                text, auto_delete, reply_markup, meta = item[0], item[1], item[2], item[3]
+            elif len(item) == 3:
+                text, auto_delete, reply_markup = item
+            else:
+                text, auto_delete = item
         else:
-            text, auto_delete = item, None
+            text = item
         try:
             with _lock:
                 fn = _handler
@@ -57,11 +66,26 @@ def _worker_loop() -> None:
                 print(f"[notify] {text}")
             else:
                 try:
-                    # 优先调新签名（带 auto_delete_seconds）；老 handler 回退到单参
+                    # 按 handler 实际签名传参（用内省判断支持哪些 kwargs），
+                    # 避免用 TypeError 兜底时把 handler 内部的 TypeError 误判为签名不匹配。
+                    kwargs = {}
                     try:
-                        fn(text, auto_delete_seconds=auto_delete)
-                    except TypeError:
-                        fn(text)
+                        import inspect
+                        params = inspect.signature(fn).parameters
+                        accepts_any_kw = any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in params.values()
+                        )
+                        if accepts_any_kw or "auto_delete_seconds" in params:
+                            kwargs["auto_delete_seconds"] = auto_delete
+                        if accepts_any_kw or "reply_markup" in params:
+                            kwargs["reply_markup"] = reply_markup
+                        if accepts_any_kw or "meta" in params:
+                            kwargs["meta"] = meta
+                    except (ValueError, TypeError):
+                        # 拿不到签名（极少数 callable）→ 退化为只传文本
+                        kwargs = {}
+                    fn(text, **kwargs)
                 except Exception as exc:
                     print(f"[notify] handler failed: {exc}")
                     print(f"[notify] (original message): {text}")
@@ -91,21 +115,26 @@ def set_handler(fn: Optional[Callable[[str], None]]) -> None:
     _ensure_worker()
 
 
-def notify(text: str, auto_delete_seconds: Optional[int] = None) -> None:
+def notify(text: str, auto_delete_seconds: Optional[int] = None,
+           reply_markup: Optional[dict] = None, meta: Optional[dict] = None) -> None:
     """发送一条通知消息。**不阻塞**：把 text 推入队列，由 worker 线程异步发出。
 
     auto_delete_seconds: 若设置，handler 会在发送后 N 秒删除该消息（仅 TG handler 支持）。
+    reply_markup: 可选 inline 键盘（仅 TG handler 支持），用于带按钮的交互通知。
+    meta: 可选元信息，handler 可据此回填 message_id（如自更新流程需记住通知消息）。
     队列满（极端情况）→ 丢弃并打印警告，避免 notify 反过来阻塞调用方。
     """
     _ensure_worker()
     try:
-        _queue.put_nowait((text, auto_delete_seconds))
+        _queue.put_nowait((text, auto_delete_seconds, reply_markup, meta))
     except queue.Full:
         print(f"[notify] queue full, dropping message: {text[:80]}")
 
 
 def notify_event(event_key: str, text: str,
-                 auto_delete_seconds: Optional[int] = None) -> None:
+                 auto_delete_seconds: Optional[int] = None,
+                 reply_markup: Optional[dict] = None,
+                 meta: Optional[dict] = None) -> None:
     """事件级通知：受 config.notifications.enabled 总开关 + events[event_key] 单独开关控制。
 
     任一关闭则跳过（仍打印到 stdout，便于排查）。配置不存在时按"开"处理（向前兼容）。
@@ -123,7 +152,8 @@ def notify_event(event_key: str, text: str,
             return
     except Exception as exc:
         print(f"[notify_event] config check failed ({exc}), sending anyway")
-    notify(text, auto_delete_seconds=auto_delete_seconds)
+    notify(text, auto_delete_seconds=auto_delete_seconds,
+           reply_markup=reply_markup, meta=meta)
 
 
 # ─── 异步节流通知（同 event_key N 秒内仅触发一次） ─────────────────

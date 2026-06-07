@@ -632,21 +632,34 @@ def install_notify_handler() -> None:
             target=_runner, daemon=True, name=f"notif-delete-{chat_id}",
         ).start()
 
-    def _handler(text: str, auto_delete_seconds: Optional[int] = None) -> None:
+    def _handler(text: str, auto_delete_seconds: Optional[int] = None,
+                 reply_markup: Optional[dict] = None,
+                 meta: Optional[dict] = None) -> None:
         full_text = text
         if auto_delete_seconds:
             full_text = (
                 text + f"\n\n<i>⏱ 本消息将在 {int(auto_delete_seconds)} 秒后自动删除</i>"
             )
+        first_msg_id = None
         for cid in list(_admin_ids):
             try:
-                resp = send(cid, full_text)
-                if auto_delete_seconds and resp and resp.get("ok"):
+                resp = send(cid, full_text, reply_markup=reply_markup)
+                if resp and resp.get("ok"):
                     mid = (resp.get("result") or {}).get("message_id")
-                    if mid:
+                    if first_msg_id is None:
+                        first_msg_id = mid
+                    if auto_delete_seconds and mid:
                         _delayed_delete(cid, mid, int(auto_delete_seconds))
             except Exception:
                 pass
+        # 回填首个 admin 的 message_id（供自更新流程 edit 同一条通知）
+        if meta is not None and isinstance(meta, dict):
+            cb = meta.get("on_sent")
+            if callable(cb) and first_msg_id is not None:
+                try:
+                    cb(list(_admin_ids)[0] if _admin_ids else None, first_msg_id)
+                except Exception:
+                    pass
 
     notifier.set_handler(_handler)
 
