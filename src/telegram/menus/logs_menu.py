@@ -13,10 +13,12 @@ import json
 from typing import Optional
 
 from ... import log_db
-from .. import states, ui
+from .. import log_inspector, states, ui
 
 
 _LIST_PAGE_SIZE = 6
+_INSPECT_PAGE_SIZE = 6
+_ITEM_PREVIEW_CHARS = 1500
 
 
 _STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
@@ -358,76 +360,397 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str, page: int
     ui.edit(
         chat_id, message_id, ui.truncate(_render_detail(detail)),
         reply_markup=ui.inline_kb([
-            [ui.btn("📨 查看请求 body", f"logs:body:{body_short}"),
-             ui.btn("📬 查看响应", f"logs:response:{resp_short}")],
+            [ui.btn("📨 请求 Body", f"logs:body:{body_short}:{page}"),
+             ui.btn("📬 响应", f"logs:response:{resp_short}:{page}")],
             [ui.btn(f"◀ 返回第 {page} 页", f"logs:page:{page}")],
         ]),
     )
 
 
-def _chunk_for_tg(text: str, chunk_size: int = 3900) -> list[str]:
-    """把长文本切成多条（每条 <= TG 单消息上限）。"""
+
+def _chunk_for_tg(text: str, chunk_size: int = 3200) -> list[str]:
+    """把长文本切成多条。调用方仍需自行 escape。"""
     if not text:
         return [""]
-    parts: list[str] = []
-    for i in range(0, len(text), chunk_size):
-        parts.append(text[i:i + chunk_size])
-    return parts
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
-def _send_body(chat_id: int, rid: str, kind: str) -> None:
-    """kind: 'request' → detail.request_body；'response' → detail.response_body。"""
+def _state_code(state: dict) -> str:
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    return ui.register_code("loginspect:" + payload)
+
+
+def _resolve_state(short: str) -> dict | None:
+    full = ui.resolve_code(short)
+    if not full or not full.startswith("loginspect:"):
+        return None
     try:
-        detail = log_db.log_detail(rid)
-    except Exception as exc:
-        ui.send(chat_id, f"❌ 查询失败: <code>{ui.escape_html(str(exc))}</code>")
-        return
+        obj = json.loads(full[len("loginspect:"):])
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _detail_back_cb(rid: str, page: int | None) -> str:
+    return f"logs:detail:{ui.register_code(rid)}:{int(page or 1)}"
+
+
+def _kind_label(kind: str) -> str:
+    return "请求 Body" if kind == "request" else "响应"
+
+
+def _kind_icon(kind: str) -> str:
+    return "📨" if kind == "request" else "📬"
+
+
+def _raw_for_kind(detail: dict, kind: str):
     data = (detail or {}).get("detail") or {}
     if kind == "request":
-        raw = data.get("request_body")
-        label = "Request Body"
-    else:
-        raw = data.get("response_body")
-        label = "Response"
+        return data.get("request_body")
+    return data.get("response_body")
+
+
+def _items_for_state(state: dict) -> tuple[str, list[dict], str]:
+    rid = str(state.get("r") or "")
+    kind = "request" if state.get("k") == "request" else "response"
+    detail = log_db.log_detail(rid)
+    raw = _raw_for_kind(detail, kind)
     if not raw:
-        ui.send(chat_id, f"(空 {label})")
-        return
-    # request_body 存的是 JSON；response_body 可能是 JSON 或 SSE 文本
-    text = str(raw)
-    # 尝试美化 JSON
+        return rid, [], ""
+    if kind == "request":
+        items = log_inspector.parse_request_body(raw)
+    else:
+        items = log_inspector.parse_response_body(raw)
+    return rid, items, str(raw)
+
+
+def _query_filtered_items(items: list[dict], state: dict) -> list[dict]:
+    return log_inspector.filter_items(items, str(state.get("q") or ""))
+
+
+def _kind_filter(state: dict) -> str:
+    return str(state.get("f") or "")
+
+
+def _apply_kind_filter(items: list[dict], state: dict) -> list[dict]:
+    f = _kind_filter(state)
+    if not f:
+        return list(items)
+    return [it for it in items if str(it.get("kind") or "") == f]
+
+
+def _filtered_sorted_items(items: list[dict], state: dict) -> list[dict]:
+    filtered = _apply_kind_filter(_query_filtered_items(items, state), state)
+    return log_inspector.sort_items(filtered, str(state.get("o") or "original"))
+
+
+def _kind_counts(items: list[dict]) -> list[tuple[str, int]]:
+    counts: dict[str, int] = {}
+    for it in items:
+        k = str(it.get("kind") or "message")
+        counts[k] = counts.get(k, 0) + 1
+    return list(counts.items())
+
+
+def _page_count(total: int) -> int:
+    return max(1, (max(0, int(total or 0)) + _INSPECT_PAGE_SIZE - 1) // _INSPECT_PAGE_SIZE)
+
+
+def _page_for_index(index0: int) -> int:
+    return max(1, (max(0, index0) // _INSPECT_PAGE_SIZE) + 1)
+
+
+def _page_slice(items: list[dict], page: int) -> list[dict]:
+    start = (max(1, int(page or 1)) - 1) * _INSPECT_PAGE_SIZE
+    return items[start:start + _INSPECT_PAGE_SIZE]
+
+
+def _append_button_grid(rows: list[list[dict]], buttons: list[dict], *, cols: int) -> None:
+    for i in range(0, len(buttons), max(1, int(cols or 1))):
+        rows.append(buttons[i:i + max(1, int(cols or 1))])
+
+
+def _seq_for_page(items: list[dict], page: int) -> int | None:
+    rows = _page_slice(items, page)
+    if not rows:
+        return None
+    # 翻页时默认选中该页最后一条“真实消息”；若该页只有 usage/params 等元信息才退回最后一条。
+    selected = log_inspector.selected_item(rows, None) or rows[-1]
     try:
-        obj = json.loads(text)
-        pretty = json.dumps(obj, indent=2, ensure_ascii=False)
-        if len(pretty) <= 30000:  # 过大时保留原样
-            text = pretty
+        return int(selected.get("seq") or 0)
     except Exception:
-        pass
-    chunks = _chunk_for_tg(text)
-    ui.send(chat_id, f"📄 <b>{label}</b> (<code>{ui.escape_html(rid[:8])}</code>) — {len(chunks)} 段")
-    for i, c in enumerate(chunks, 1):
-        suffix = f"\n\n<i>[{i}/{len(chunks)}]</i>" if len(chunks) > 1 else ""
-        # 用 <pre> 保持格式
-        ui.send(chat_id, f"<pre>{ui.escape_html(c)}</pre>{suffix}")
+        return None
+
+
+def _render_item_text(*, rid: str, kind: str, all_count: int, shown_count: int,
+                      selected: dict, page: int, total_pages: int, sort_key: str,
+                      query: str, type_filter: str = "") -> str:
+    seq = int(selected.get("seq") or 0)
+    size = log_inspector.fmt_size(int(selected.get("size") or 0))
+    kind_name = str(selected.get("kind") or "message")
+    kind_name_display = log_inspector.kind_label(kind_name)
+    summary = log_inspector.summary_label(str(selected.get("summary") or ""))
+    text = str(selected.get("text") or selected.get("raw") or "")
+    is_long = len(text) > _ITEM_PREVIEW_CHARS
+    preview = text[:_ITEM_PREVIEW_CHARS]
+
+    lines = [
+        f"{_kind_icon(kind)} <b>{_kind_label(kind)}</b> · <code>{ui.escape_html(rid[:8])}</code>",
+        f"消息: <b>#{seq}</b> / <code>{shown_count}</code>" + (f"（原始 {all_count}）" if shown_count != all_count else ""),
+        f"列表: 第 <code>{page}/{total_pages}</code> 页 · 排序 <code>{ui.escape_html(log_inspector.SORT_LABELS.get(sort_key, sort_key))}</code>",
+    ]
+    if query:
+        lines.append(f"搜索: <code>{ui.escape_html(query)}</code>")
+    if type_filter:
+        lines.append(f"类型: <code>{ui.escape_html(log_inspector.kind_label(type_filter))}</code>")
+    lines.extend([
+        "",
+        f"<b>{ui.escape_html(kind_name_display)}</b> · <code>{ui.escape_html(size)}</code>",
+    ])
+    if summary:
+        lines.append(f"<i>{ui.escape_html(summary)}</i>")
+    lines.append("")
+    lines.append(f"<pre>{ui.escape_html(preview)}</pre>")
+    if is_long:
+        lines.append(f"\n<i>已截断：优先显示前 {_ITEM_PREVIEW_CHARS} 字符，完整内容请点下方按钮。</i>")
+    return ui.truncate("\n".join(lines), 3900)
+
+
+def _empty_inspector_text(rid: str, kind: str, query: str = "") -> str:
+    if query:
+        return (
+            f"{_kind_icon(kind)} <b>{_kind_label(kind)}</b> · <code>{ui.escape_html(rid[:8])}</code>\n\n"
+            f"🔎 搜索 <code>{ui.escape_html(query)}</code> 没有命中。"
+        )
+    return f"{_kind_icon(kind)} <b>{_kind_label(kind)}</b> · <code>{ui.escape_html(rid[:8])}</code>\n\n暂无可显示内容。"
+
+
+def _inspector_kb(*, state: dict, rid: str, items: list[dict], selected_seq: int | None,
+                  page: int, total_pages: int, all_count: int,
+                  type_counts: list[tuple[str, int]] | None = None,
+                  base_count: int | None = None) -> dict:
+    rows: list[list[dict]] = []
+    kind = "request" if state.get("k") == "request" else "response"
+    sort_key = str(state.get("o") or "original")
+    query = str(state.get("q") or "")
+    current_filter = _kind_filter(state)
+    lp = int(state.get("lp") or 1)
+
+    item_buttons: list[dict] = []
+    for item in _page_slice(items, page):
+        seq = int(item.get("seq") or 0)
+        next_state = dict(state)
+        next_state.update({"s": seq, "p": page})
+        item_buttons.append(ui.btn(log_inspector.button_label(item, selected=(seq == selected_seq), compact=True), f"logs:ins:{_state_code(next_state)}"))
+    _append_button_grid(rows, item_buttons, cols=2)
+
+    def _page_state(target_page: int) -> dict:
+        target_page = max(1, min(int(target_page or 1), total_pages))
+        st = dict(state)
+        st.update({"p": target_page, "s": _seq_for_page(items, target_page)})
+        return st
+
+    # 固定紧凑分页：始终给首页 / 上一页 / 当前页 / 下一页 / 尾页，方便长日志快速跳转。
+    first_page = 1
+    prev_page = max(1, page - 1)
+    next_page = min(total_pages, page + 1)
+    last_page = total_pages
+    rows.append([
+        ui.btn("⏮ 首页", f"logs:ins:{_state_code(_page_state(first_page))}"),
+        ui.btn("◀", f"logs:ins:{_state_code(_page_state(prev_page))}"),
+        ui.btn(f"{page}/{total_pages}", f"logs:ins:{_state_code(state)}"),
+        ui.btn("▶", f"logs:ins:{_state_code(_page_state(next_page))}"),
+        ui.btn("尾页 ⏭", f"logs:ins:{_state_code(_page_state(last_page))}"),
+    ])
+
+    sort_state = dict(state)
+    sort_state["o"] = log_inspector.next_sort(sort_key)
+    sort_state["p"] = None
+    rows.append([
+        ui.btn(f"排序:{log_inspector.SORT_LABELS.get(sort_key, sort_key)}", f"logs:ins:{_state_code(sort_state)}"),
+        ui.btn("🔎 搜索", f"logs:search:{_state_code(state)}"),
+    ])
+
+    # 类型统计过滤按钮：基于“搜索后、类型过滤前”的集合统计。
+    counts = list(type_counts or [])
+    if counts:
+        total_base = int(base_count if base_count is not None else sum(n for _, n in counts))
+        filter_buttons: list[dict] = []
+        all_state = dict(state)
+        all_state.update({"f": "", "s": None, "p": None})
+        filter_buttons.append(ui.btn(("✅" if not current_filter else "") + f"全部 {total_base}", f"logs:ins:{_state_code(all_state)}"))
+        for k, n in counts:
+            st = dict(state)
+            st.update({"f": k, "s": None, "p": None})
+            label = ("✅" if current_filter == k else "") + f"{log_inspector.kind_short_label(k)} {n}"
+            filter_buttons.append(ui.btn(label, f"logs:ins:{_state_code(st)}"))
+        _append_button_grid(rows, filter_buttons, cols=3)
+
+    extra: list[dict] = []
+    if query:
+        clear_state = dict(state)
+        clear_state.update({"q": "", "p": None, "s": None})
+        extra.append(ui.btn("清除搜索", f"logs:ins:{_state_code(clear_state)}"))
+    selected = log_inspector.selected_item(items, selected_seq)
+    if selected and len(str(selected.get("text") or selected.get("raw") or "")) > _ITEM_PREVIEW_CHARS:
+        full_state = dict(state)
+        full_state.update({"s": int(selected.get("seq") or 0), "p": page})
+        extra.append(ui.btn("📜 查看完整内容", f"logs:full:{_state_code(full_state)}"))
+    if extra:
+        rows.append(extra)
+
+    rows.append([ui.btn("◀ 返回详情", _detail_back_cb(rid, lp))])
+    return ui.inline_kb(rows)
+
+
+def _show_inspector(chat_id: int, message_id: int, cb_id: str | None, state: dict) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    kind = "request" if state.get("k") == "request" else "response"
+    try:
+        rid, all_items, _raw = _items_for_state(state)
+    except Exception as exc:
+        ui.edit(chat_id, message_id, f"❌ 解析失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+
+    sort_key = str(state.get("o") or "original")
+    query = str(state.get("q") or "")
+    type_filter = _kind_filter(state)
+    query_items = _query_filtered_items(all_items, state)
+    type_counts = _kind_counts(query_items)
+    items = log_inspector.sort_items(_apply_kind_filter(query_items, state), sort_key)
+    if not items:
+        ui.edit(
+            chat_id, message_id, _empty_inspector_text(rid, kind, query),
+            reply_markup=_inspector_kb(state=state, rid=rid, items=[], selected_seq=None, page=1,
+                                       total_pages=1, all_count=len(all_items),
+                                       type_counts=type_counts, base_count=len(query_items)),
+        )
+        return
+
+    selected = log_inspector.selected_item(items, state.get("s")) or items[-1]
+    selected_seq = int(selected.get("seq") or 0)
+    idx = next((i for i, it in enumerate(items) if int(it.get("seq") or 0) == selected_seq), len(items) - 1)
+    if state.get("p") is None:
+        page = _page_for_index(idx)
+    else:
+        try:
+            page = int(state.get("p") or 1)
+        except Exception:
+            page = _page_for_index(idx)
+    total_pages = _page_count(len(items))
+    page = max(1, min(page, total_pages))
+    state = dict(state)
+    state.update({"s": selected_seq, "p": page, "o": sort_key, "q": query, "f": type_filter})
+    text = _render_item_text(
+        rid=rid, kind=kind, all_count=len(all_items), shown_count=len(items), selected=selected,
+        page=page, total_pages=total_pages, sort_key=sort_key, query=query, type_filter=type_filter,
+    )
+    ui.edit(
+        chat_id, message_id, text,
+        reply_markup=_inspector_kb(state=state, rid=rid, items=items, selected_seq=selected_seq,
+                                   page=page, total_pages=total_pages, all_count=len(all_items),
+                                   type_counts=type_counts, base_count=len(query_items)),
+    )
+
+
+def _initial_state(rid: str, kind: str, *, list_page: int = 1) -> dict:
+    return {"r": rid, "k": kind, "s": None, "p": None, "o": "original", "q": "", "f": "", "lp": int(list_page or 1)}
+
+
+def _show_body_inspector(chat_id: int, message_id: int, cb_id: str, payload: str, kind: str) -> None:
+    short, _, page_s = (payload or "").partition(":")
+    try:
+        list_page = int(page_s or 1)
+    except Exception:
+        list_page = 1
+    full = ui.resolve_code(short)
+    prefix = "logbody:" if kind == "request" else "logresp:"
+    if not full or not full.startswith(prefix):
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    rid = full[len(prefix):]
+    ui.answer_cb(cb_id, "加载中...")
+    _show_inspector(chat_id, message_id, None, _initial_state(rid, kind, list_page=list_page))
 
 
 def show_request_body(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    full = ui.resolve_code(short)
-    if not full or not full.startswith("logbody:"):
-        ui.answer_cb(cb_id, "短码已失效")
-        return
-    rid = full[len("logbody:"):]
-    ui.answer_cb(cb_id, "加载中...")
-    _send_body(chat_id, rid, "request")
+    _show_body_inspector(chat_id, message_id, cb_id, short, "request")
 
 
 def show_response_body(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    full = ui.resolve_code(short)
-    if not full or not full.startswith("logresp:"):
+    _show_body_inspector(chat_id, message_id, cb_id, short, "response")
+
+
+def _send_full_item(chat_id: int, cb_id: str, state_short: str) -> None:
+    state = _resolve_state(state_short)
+    if not state:
         ui.answer_cb(cb_id, "短码已失效")
         return
-    rid = full[len("logresp:"):]
-    ui.answer_cb(cb_id, "加载中...")
-    _send_body(chat_id, rid, "response")
+    try:
+        rid, all_items, _raw = _items_for_state(state)
+        items = _filtered_sorted_items(all_items, state)
+        selected = log_inspector.selected_item(items, state.get("s"))
+    except Exception as exc:
+        ui.answer_cb(cb_id, "读取失败")
+        ui.send(chat_id, f"❌ 读取失败: <code>{ui.escape_html(str(exc))}</code>")
+        return
+    if not selected:
+        ui.answer_cb(cb_id, "没有内容")
+        return
+    text = str(selected.get("text") or selected.get("raw") or "")
+    seq = int(selected.get("seq") or 0)
+    kind = str(selected.get("kind") or "message")
+    label = _kind_label("request" if state.get("k") == "request" else "response")
+    title = f"{label} #{seq} {log_inspector.kind_label(kind)} ({rid[:8]})"
+    ui.answer_cb(cb_id, "输出完整内容...")
+    if len(text) <= 12_000:
+        chunks = _chunk_for_tg(text, 3200)
+        ui.send(chat_id, f"📜 <b>{ui.escape_html(title)}</b> — {len(chunks)} 段")
+        for i, c in enumerate(chunks, 1):
+            suffix = f"\n\n<i>[{i}/{len(chunks)}]</i>" if len(chunks) > 1 else ""
+            ui.send(chat_id, f"<pre>{ui.escape_html(c)}</pre>{suffix}")
+        return
+    filename = f"parrot-log-{rid[:8]}-{state.get('k')}-item-{seq}.txt"
+    caption = f"📜 <b>{ui.escape_html(title)}</b> · {log_inspector.fmt_size(len(text.encode('utf-8', errors='replace')))}"
+    if hasattr(ui, "send_document_text"):
+        ui.send_document_text(chat_id, text, filename=filename, caption=caption)
+    else:
+        chunks = _chunk_for_tg(text[:12_000], 3200)
+        ui.send(chat_id, f"📜 <b>{ui.escape_html(title)}</b> — 内容过长，先输出前 {len(chunks)} 段")
+        for i, c in enumerate(chunks, 1):
+            ui.send(chat_id, f"<pre>{ui.escape_html(c)}</pre>\n\n<i>[{i}/{len(chunks)}]</i>")
+
+
+def _begin_search(chat_id: int, message_id: int, cb_id: str, state_short: str) -> None:
+    state = _resolve_state(state_short)
+    if not state:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+    states.set_state(chat_id, "logs_search", {"state": state, "message_id": message_id})
+    ui.answer_cb(cb_id, "请输入搜索关键词")
+    ui.send(chat_id, "🔎 请输入搜索关键词。\n发送 <code>/cancel</code> 取消；发送 <code>/clear</code> 清除搜索。")
+
+
+def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if action != "logs_search":
+        return False
+    st = states.pop_state(chat_id) or {}
+    data = st.get("data") or {}
+    state = dict(data.get("state") or {})
+    message_id = data.get("message_id")
+    if not state or not message_id:
+        ui.send(chat_id, "⚠ 搜索状态已失效，请重新打开日志详情。")
+        return True
+    q = (text or "").strip()
+    if q == "/cancel":
+        ui.send(chat_id, "已取消搜索。")
+        return True
+    if q == "/clear":
+        q = ""
+    state.update({"q": q, "s": None, "p": None})
+    _show_inspector(chat_id, int(message_id), None, state)
+    return True
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────
@@ -460,4 +783,14 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         show_request_body(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("logs:response:"):
         show_response_body(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("logs:ins:"):
+        state = _resolve_state(data.split(":", 2)[2])
+        if not state:
+            ui.answer_cb(cb_id, "短码已失效")
+            return True
+        _show_inspector(chat_id, message_id, cb_id, state); return True
+    if data.startswith("logs:full:"):
+        _send_full_item(chat_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("logs:search:"):
+        _begin_search(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     return False

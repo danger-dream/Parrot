@@ -388,6 +388,110 @@ def test_logs_detail_with_retry_chain(m):
     print("  [PASS] logs detail with retry chain")
 
 
+def test_log_inspector_localizes_pretty_json_and_redacts_encrypted(m):
+    from src.telegram import log_inspector
+    body = {
+        "messages": [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"keyword\":\"abc\",\"limit\":2}"},
+            }]},
+            {"role": "assistant", "content": [{
+                "type": "reasoning",
+                "encrypted_content": "x" * 180,
+                "summary": "hidden thinking",
+            }]},
+        ]
+    }
+    items = log_inspector.parse_request_body(body)
+    user = next(x for x in items if x["kind"] == "user")
+    assert log_inspector.button_label(user).startswith("#1 用户")
+    tc = next(x for x in items if x["kind"] == "tool_call")
+    assert "调用" in log_inspector.button_label(tc)
+    assert '{\n  "keyword": "abc",\n  "limit": 2\n}' in tc["text"]
+    reasoning = next(x for x in items if x["kind"] == "reasoning")
+    assert "思考" in log_inspector.button_label(reasoning)
+    assert "encrypted_content 已省略" in reasoning["text"]
+    assert "x" * 100 not in reasoning["text"]
+    print("  [PASS] log inspector localized labels + pretty json + encrypted redaction")
+
+
+def test_logs_body_inspector_defaults_last_and_truncates(m):
+    _setup(m)
+    rid = "BODY-inspector"
+    long_tail = "尾巴" * 1000
+    body = {
+        "model": "claude-test",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "第一条用户消息"},
+            {"role": "assistant", "content": long_tail},
+        ],
+    }
+    m["log_db"].insert_pending(rid, "1.1.1.1", "k1", "claude-test", True, 3, 0, {}, body)
+    m["log_db"].finish_success(rid, "api:A", "api", "claude-test", response_body='{}')
+
+    rec = _install_recorder(m)
+    short = m["ui"].register_code("logbody:" + rid)
+    m["logs_menu"].show_request_body(42, 100, "cb", short)
+    edit = rec.last("editMessageText")
+    assert edit is not None
+    text = edit["text"]
+    assert "请求 Body" in text
+    assert "消息: <b>#4</b>" in text  # params + 3 条 message，默认最后一条真实消息
+    assert "已截断" in text
+    assert len(text) < 4096
+    assert rec.by("sendMessage") == []
+    flat = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert any(cb.startswith("logs:ins:") for cb in flat)
+    assert any(cb.startswith("logs:full:") for cb in flat)
+    print("  [PASS] logs body inspector default last + truncate")
+
+
+def test_logs_response_inspector_parses_messages_and_search_state(m):
+    _setup(m)
+    rid = "RESP-inspector"
+    body = {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]}
+    response = "\n".join([
+        json.dumps({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "最终"}, ensure_ascii=False),
+        json.dumps({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "回答"}, ensure_ascii=False),
+        json.dumps({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 3, "output_tokens": 2}}}, ensure_ascii=False),
+    ])
+    m["log_db"].insert_pending(rid, "1.1.1.1", "k1", "gpt-test", True, 1, 0, {}, body, ingress_protocol="responses")
+    m["log_db"].finish_success(rid, "oauth:openai:o@openai.test:acct-raw-hidden", "oauth", "gpt-test", response_body=response, upstream_protocol="openai-responses")
+
+    rec = _install_recorder(m)
+    short = m["ui"].register_code("logresp:" + rid)
+    m["logs_menu"].show_response_body(42, 100, "cb", short)
+    edit = rec.last("editMessageText")
+    assert "响应" in edit["text"]
+    assert "最终回答" in edit["text"]
+    assert "消息: <b>#1</b>" in edit["text"]  # 默认跳过 trailing usage，选最后一条真实内容
+    kb = edit["reply_markup"]["inline_keyboard"]
+    flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
+    labels = [b["text"] for row in kb for b in row]
+    assert any("全部 2" in x for x in labels)
+    assert any("助手 1" in x for x in labels)
+    assert any("用量 1" in x for x in labels)
+
+    usage_cb = next(b["callback_data"] for row in kb for b in row if "用量 1" in b["text"])
+    rec.clear()
+    assert m["logs_menu"].handle_callback(42, 100, "cb", usage_cb) is True
+    usage_edit = rec.last("editMessageText")
+    assert "类型: <code>用量统计</code>" in usage_edit["text"]
+    assert "用量统计" in usage_edit["text"]
+
+    search_cb = next(cb for cb in flat if cb.startswith("logs:search:"))
+    rec.clear()
+    assert m["logs_menu"].handle_callback(42, 100, "cb", search_cb) is True
+    assert m["states"].get_state(42)["action"] == "logs_search"
+    assert rec.last("sendMessage") and "请输入搜索关键词" in rec.last("sendMessage")["text"]
+    print("  [PASS] logs response inspector parse + type filter + search state")
+
+
 def test_logs_detail_short_expired(m):
     _setup(m)
     rec = _install_recorder(m)
@@ -473,6 +577,9 @@ def main():
         test_logs_list,
         test_logs_pagination,
         test_logs_detail_with_retry_chain,
+        test_log_inspector_localizes_pretty_json_and_redacts_encrypted,
+        test_logs_body_inspector_defaults_last_and_truncates,
+        test_logs_response_inspector_parses_messages_and_search_state,
         test_logs_detail_short_expired,
         test_openai_workspace_id_hidden_in_stats_and_logs,
         test_router_dispatch,

@@ -283,6 +283,39 @@ def send_photo(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
         return None
 
 
+def send_document_bytes(chat_id: int, data_bytes: bytes, *, filename: str,
+                        caption: str = "", content_type: str = "text/plain; charset=utf-8") -> Optional[dict]:
+    """发送内存中的文件。用于超长日志导出等场景。"""
+    if not _bot_token:
+        return None
+    url = f"https://api.telegram.org/bot{_bot_token}/sendDocument"
+    try:
+        session = _get_session()
+        data: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+            data["parse_mode"] = "HTML"
+        resp = session.post(
+            url, data=data,
+            files={"document": (filename, data_bytes, content_type)},
+        )
+        result = resp.json()
+        if isinstance(result, dict) and result.get("ok"):
+            return result
+        print(f"[tg] sendDocument not ok: {str(result)[:200]}")
+        return result
+    except Exception as exc:
+        print(f"[tg] sendDocument failed: {exc}")
+        return None
+
+
+def send_document_text(chat_id: int, text: str, *, filename: str, caption: str = "") -> Optional[dict]:
+    return send_document_bytes(
+        chat_id, (text or "").encode("utf-8", errors="replace"),
+        filename=filename, caption=caption, content_type="text/plain; charset=utf-8",
+    )
+
+
 def set_my_commands(commands: list[dict]) -> Optional[dict]:
     return api("setMyCommands", {"commands": commands})
 

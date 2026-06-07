@@ -330,6 +330,9 @@ def _handle_message(msg: dict) -> None:
         if load_balancing_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by load_balancing_menu (action={action})")
             return
+        if logs_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by logs_menu (action={action})")
+            return
         if status_alert_menu.handle_text_state(chat_id, action, text):
             return
         if update_menu.handle_text_state(chat_id, action, text):
