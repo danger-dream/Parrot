@@ -170,6 +170,8 @@ def test_list_empty_and_populated(m):
     assert "user2@x.com" in last["text"]
     assert "用户禁用" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:sort:1:all" in flat
     # 每个账户一个按钮
     email_btns = [
         b for row in last["reply_markup"]["inline_keyboard"]
@@ -177,6 +179,57 @@ def test_list_empty_and_populated(m):
     ]
     assert len(email_btns) == 2
     print("  [PASS] oauth list empty + populated")
+
+
+def test_oauth_sort_reorders_accounts(m):
+    _setup(m)
+    for i in range(1, 10):
+        _add_fake_account(m, f"sort{i}@x.com")
+    rec = _install_recorder(m)
+    om = m["oauth_menu"]
+
+    om.show(42, 100, page=3)
+    page3 = rec.last("editMessageText")
+    flat = [
+        b["callback_data"]
+        for row in page3["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:sort:3:all" in flat
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb", "oa:sort:3:available") is True
+    sort_page = rec.last("editMessageText")
+    assert sort_page and "OAuth 账户排序" in sort_page["text"]
+    assert "sort1@x.com" in sort_page["text"] and "sort9@x.com" in sort_page["text"]
+    assert "返回时保留过滤" in sort_page["text"]
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb", "oa:sort_sel:9") is True
+    selected = rec.last("editMessageText")
+    btn_texts = [b["text"] for row in selected["reply_markup"]["inline_keyboard"] for b in row]
+    assert "9 ✅" in btn_texts
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb", "oa:sort_mv:top") is True
+    moved = rec.last("editMessageText")
+    first_line = next(line for line in moved["text"].splitlines() if "sort" in line)
+    assert "sort9@x.com" in first_line, first_line
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb", "oa:sort_save") is True
+    accounts = m["config"].get()["oauthAccounts"]
+    assert accounts[0]["email"] == "sort9@x.com", [a["email"] for a in accounts[:3]]
+    assert [a["email"] for a in accounts[1:4]] == ["sort1@x.com", "sort2@x.com", "sort3@x.com"]
+    saved = rec.last("editMessageText")
+    assert saved and "已保存 OAuth 账户排序" in saved["text"]
+    saved_flat = [
+        b["callback_data"]
+        for row in saved["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:sort:3:available" in saved_flat and "oa:page:3:available" in saved_flat
+    print("  [PASS] oauth sort reorders accounts")
 
 
 def test_view_detail_with_quota_cache(m):
@@ -612,6 +665,7 @@ def main():
 
     tests = [
         test_list_empty_and_populated,
+        test_oauth_sort_reorders_accounts,
         test_view_detail_with_quota_cache,
         test_refresh_token_updates_access_and_usage,
         test_refresh_usage_only,

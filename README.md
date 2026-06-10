@@ -123,6 +123,8 @@ git clone https://github.com/danger-dream/Parrot
 cd Parrot
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
+# 需要运行测试时再安装开发依赖
+./venv/bin/pip install -r requirements-dev.txt
 
 # 编辑 config.json（首次启动会自动生成模板）
 ./venv/bin/python server.py

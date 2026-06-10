@@ -168,6 +168,110 @@ def test_list_empty_and_populated(m):
     print("  [PASS] list empty + populated")
 
 
+def test_list_pagination_and_detail_return_page(m):
+    _setup(m)
+    for i in range(8):
+        _add_channel(m, f"chan-{i:02d}")
+    rec = _install_recorder(m)
+    cm = m["channel_menu"]
+
+    cm.show(42, 100, page=1)
+    page1 = rec.last("editMessageText")
+    assert page1 and "共 8 个 | 第 1/2 页" in page1["text"]
+    assert "chan-00" in page1["text"] and "chan-05" in page1["text"]
+    assert "chan-06" not in page1["text"]
+    page1_btns = [
+        b["callback_data"]
+        for row in page1["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "ch:page:2" in page1_btns
+    assert "ch:sort:1" in page1_btns
+    view_payloads = [cb.split(":", 2)[2] for cb in page1_btns if cb.startswith("ch:view:")]
+    assert view_payloads and all(payload.endswith(":1") for payload in view_payloads)
+
+    rec.clear()
+    cm.show(42, 100, page=2)
+    page2 = rec.last("editMessageText")
+    assert page2 and "共 8 个 | 第 2/2 页" in page2["text"]
+    assert "chan-06" in page2["text"] and "chan-07" in page2["text"]
+    assert "chan-00" not in page2["text"]
+    page2_btns = [
+        b["callback_data"]
+        for row in page2["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "ch:page:1" in page2_btns
+    assert "ch:sort:2" in page2_btns
+    detail_payload = next(cb.split(":", 2)[2] for cb in page2_btns if cb.startswith("ch:view:"))
+    assert detail_payload.endswith(":2")
+
+    rec.clear()
+    cm.on_view(42, 100, "cb", detail_payload)
+    detail = rec.last("editMessageText")
+    assert detail and "chan-06" in detail["text"]
+    detail_btns = [
+        b["callback_data"]
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "ch:page:2" in detail_btns
+    assert any(cb.startswith("ch:toggle:") and cb.endswith(":2") for cb in detail_btns)
+
+    rec.clear()
+    assert cm.handle_callback(42, 100, "cb", "ch:page:2") is True
+    routed = rec.last("editMessageText")
+    assert routed and "第 2/2 页" in routed["text"]
+    print("  [PASS] list pagination + detail return page")
+
+
+def test_channel_sort_reorders_config(m):
+    _setup(m)
+    for i in range(8):
+        _add_channel(m, f"sort-{i:02d}")
+    rec = _install_recorder(m)
+    cm = m["channel_menu"]
+
+    assert cm.handle_callback(42, 100, "cb", "ch:sort:2") is True
+    sort_page = rec.last("editMessageText")
+    assert sort_page and "渠道排序" in sort_page["text"]
+    assert "sort-00" in sort_page["text"] and "sort-07" in sort_page["text"]
+
+    rec.clear()
+    assert cm.handle_callback(42, 100, "cb", "ch:sort_sel:8") is True
+    selected = rec.last("editMessageText")
+    btns = [
+        b["text"]
+        for row in selected["reply_markup"]["inline_keyboard"]
+        for b in row
+    ]
+    assert "8 ✅" in btns
+
+    rec.clear()
+    assert cm.handle_callback(42, 100, "cb", "ch:sort_mv:top") is True
+    moved = rec.last("editMessageText")
+    assert moved and "sort-07" in moved["text"]
+    first_order_line = next(line for line in moved["text"].splitlines() if "sort-" in line)
+    assert "sort-07" in first_order_line, first_order_line
+
+    rec.clear()
+    assert cm.handle_callback(42, 100, "cb", "ch:sort_save") is True
+    names = [c["name"] for c in m["config"].get()["channels"]]
+    assert names[0] == "sort-07", names
+    assert names[1:4] == ["sort-00", "sort-01", "sort-02"], names[:4]
+    api_names = [ch.display_name for ch in m["registry"].all_channels() if ch.type == "api"]
+    assert api_names[0] == "sort-07"
+    saved = rec.last("editMessageText")
+    assert saved and "已保存渠道排序" in saved["text"]
+    saved_btns = [
+        b["callback_data"]
+        for row in saved["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "ch:sort:2" in saved_btns and "ch:page:2" in saved_btns
+    print("  [PASS] channel sort reorders config")
+
+
 def test_detail_renders(m):
     _setup(m)
     _add_channel(m, "chA", models=[
@@ -539,6 +643,8 @@ def main():
 
     tests = [
         test_list_empty_and_populated,
+        test_list_pagination_and_detail_return_page,
+        test_channel_sort_reorders_config,
         test_detail_renders,
         test_toggle_clear_errors_clear_affinity,
         test_global_clear,

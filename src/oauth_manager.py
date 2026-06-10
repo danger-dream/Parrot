@@ -750,9 +750,14 @@ async def fetch_usage(account_key: str) -> dict:
         # Claude 路径：直接走 /api/oauth/usage
         return await asyncio.to_thread(_usage_sync, access_token)
 
-    # OpenAI 路径：主动 quota 改走 ChatGPT 私有 wham/usage。业务响应头里的
+    # OpenAI 路径：主动 quota 走 ChatGPT 私有 wham/usage。业务响应头里的
     # x-codex-* 仍由 failover/images/ws 实时采样，不在这里发最小 Codex 请求。
-    return await openai_provider.fetch_wham_usage(access_token)
+    # 注意：这里只通过 ensure_valid_token 在 token 临期/过期时刷新；菜单里的
+    # “刷新用量”不应无条件 force_refresh，否则 access_token 仍可调用时也可能
+    # 因 refresh_token 被上游轮换/吊销而误报 401。
+    acc = get_account(account_key) or {}
+    account_id = _openai_workspace_id(acc) or None
+    return await openai_provider.fetch_wham_usage(access_token, account_id=account_id)
 
 
 def _synthesize_openai_usage_from_row(row: dict) -> dict:

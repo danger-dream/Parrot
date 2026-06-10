@@ -1,0 +1,7 @@
+# Development / test-only dependencies.
+# NOT required at runtime; keep these out of requirements.txt so production installs stay lean.
+# Install with: venv/bin/pip install -r requirements-dev.txt
+-r requirements.txt
+
+# pytest: used only under src/tests/ (no production code imports it).
+pytest>=8.0

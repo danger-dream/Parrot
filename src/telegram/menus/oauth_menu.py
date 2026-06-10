@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import secrets
 import time
@@ -681,6 +682,8 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
 
     # 翻页
     pag_row = _build_pagination_row(page, total_pages, filter_key)
+    if accounts_all:
+        pag_row.append(ui.btn("↕ 排序", f"oa:sort:{page}:{filter_key}"))
     if pag_row:
         rows.append(pag_row)
 
@@ -716,6 +719,282 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int =
 def send_new(chat_id: int, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
     ui.send(chat_id, text, reply_markup=kb)
+
+
+# ─── 账户排序 ─────────────────────────────────────────────────────
+
+def _all_account_keys() -> list[str]:
+    return [_account_key(acc) for acc in oauth_manager.list_accounts()]
+
+
+def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
+    if n <= 0:
+        return []
+    rows_count = math.ceil(n / max_cols)
+    base = n // rows_count
+    extra = n % rows_count
+    rows: list[list[int]] = []
+    cur = 1
+    for r in range(rows_count):
+        size = base + (1 if r < extra else 0)
+        rows.append(list(range(cur, cur + size)))
+        cur += size
+    return rows
+
+
+def _sort_state_data(chat_id: int) -> Optional[dict]:
+    st = states.get_state(chat_id)
+    if not st or st.get("action") != "oa_sort":
+        return None
+    return st.get("data") or {}
+
+
+def _sort_selection_set(data: dict) -> set[int]:
+    return {int(x) for x in (data.get("selected") or [])}
+
+
+def _set_sort_state(chat_id: int, draft: list[str], *, page: int = 1,
+                    filter_key: str = _FILTER_ALL,
+                    selected: Optional[set[int]] = None) -> None:
+    states.set_state(chat_id, "oa_sort", {
+        "draft": list(draft),
+        "page": max(1, int(page or 1)),
+        "filter_key": _normalize_filter(filter_key),
+        "selected": sorted(selected or []),
+    })
+
+
+def _sort_item_line(idx: int, account_key: str) -> str:
+    acc = oauth_manager.get_account(account_key)
+    if acc is None:
+        return f"{idx}. <code>{ui.escape_html(account_key)}</code> ⚠ 已不存在"
+    email = str(acc.get("email") or oauth_manager.account_key_to_email(account_key) or "?")
+    prov = oauth_manager.provider_of(acc)
+    tag = "🅾" if prov == "openai" else ("🅰" if prov == "claude" else "✉")
+    status = "enabled" if acc.get("enabled", True) and not acc.get("disabled_reason") else (acc.get("disabled_reason") or "disabled")
+    suffix = _openai_workspace_label(acc, force=True) if prov == "openai" else ""
+    suffix_text = f" · {suffix}" if suffix else ""
+    return (
+        f"{idx}. {tag} <code>{ui.escape_html(email)}</code>{suffix_text} "
+        f"<code>{ui.escape_html(status)}</code>"
+    )
+
+
+def _sort_text_and_kb(draft: list[str], selected: set[int], page: int, filter_key: str) -> tuple[str, dict]:
+    filter_key = _normalize_filter(filter_key)
+    lines = [
+        "↕ <b>OAuth 账户排序</b>",
+        "",
+        "当前账户顺序:",
+    ]
+    if not draft:
+        lines.append("<i>当前没有 OAuth 账户。</i>")
+    else:
+        lines.extend(_sort_item_line(i, ak) for i, ak in enumerate(draft, start=1))
+    lines.extend([
+        "",
+        "调整方式:",
+        "先点下方序号勾选账户，再点置顶/置底/上移/下移。",
+        "调整完成后记得点保存排序。",
+        "返回时保留过滤条件和页码。",
+    ])
+
+    rows: list[list[dict]] = []
+    for nums in _split_number_rows(len(draft)):
+        row = []
+        for n in nums:
+            label = f"{n} ✅" if n in selected else str(n)
+            row.append(ui.btn(label, f"oa:sort_sel:{n}"))
+        rows.append(row)
+    if draft:
+        rows.append([
+            ui.btn("🔝 置顶", "oa:sort_mv:top"),
+            ui.btn("🔚 置底", "oa:sort_mv:bottom"),
+            ui.btn("⬆ 上移", "oa:sort_mv:up"),
+            ui.btn("⬇ 下移", "oa:sort_mv:down"),
+        ])
+    rows.append([ui.btn("还原", "oa:sort_reset"), ui.btn("保存排序", "oa:sort_save")])
+    rows.append([
+        ui.btn("◀ 返回 OAuth 列表", _page_callback(page, filter_key)),
+        ui.btn("取消", "oa:sort_cancel"),
+    ])
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def _show_sort(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    data = _sort_state_data(chat_id)
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    if not data:
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    page = max(1, int(data.get("page") or 1))
+    filter_key = _normalize_filter(data.get("filter_key") or _FILTER_ALL)
+    selected = _sort_selection_set(data)
+    text, kb = _sort_text_and_kb(draft, selected, page, filter_key)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_sort_start(chat_id: int, message_id: int, cb_id: str,
+                  page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    draft = _all_account_keys()
+    if not draft:
+        ui.answer_cb(cb_id, "当前没有账户")
+        return
+    _set_sort_state(chat_id, draft, page=page, filter_key=filter_key)
+    _show_sort(chat_id, message_id, cb_id)
+
+
+def on_sort_select(chat_id: int, message_id: int, cb_id: str, idx_str: str) -> None:
+    data = _sort_state_data(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        ui.answer_cb(cb_id, "无效序号")
+        return
+    if idx < 1 or idx > len(draft):
+        ui.answer_cb(cb_id, "序号越界")
+        return
+    selected = _sort_selection_set(data)
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.add(idx)
+    _set_sort_state(
+        chat_id, draft,
+        page=data.get("page") or 1,
+        filter_key=data.get("filter_key") or _FILTER_ALL,
+        selected=selected,
+    )
+    _show_sort(chat_id, message_id, cb_id)
+
+
+def _move_top(draft: list[str], selected: set[int]) -> list[str]:
+    idxs = [i - 1 for i in sorted(selected)]
+    chosen = [draft[i] for i in idxs]
+    rest = [x for i, x in enumerate(draft) if i not in idxs]
+    return chosen + rest
+
+
+def _move_bottom(draft: list[str], selected: set[int]) -> list[str]:
+    idxs = [i - 1 for i in sorted(selected)]
+    chosen = [draft[i] for i in idxs]
+    rest = [x for i, x in enumerate(draft) if i not in idxs]
+    return rest + chosen
+
+
+def _move_up(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
+    arr = list(draft)
+    sel = {i - 1 for i in selected}
+    for i in range(1, len(arr)):
+        if i in sel and (i - 1) not in sel:
+            arr[i - 1], arr[i] = arr[i], arr[i - 1]
+            sel.remove(i)
+            sel.add(i - 1)
+    return arr, {i + 1 for i in sel}
+
+
+def _move_down(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
+    arr = list(draft)
+    sel = {i - 1 for i in selected}
+    for i in range(len(arr) - 2, -1, -1):
+        if i in sel and (i + 1) not in sel:
+            arr[i + 1], arr[i] = arr[i], arr[i + 1]
+            sel.remove(i)
+            sel.add(i + 1)
+    return arr, {i + 1 for i in sel}
+
+
+def on_sort_move(chat_id: int, message_id: int, cb_id: str, op: str) -> None:
+    data = _sort_state_data(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    selected = _sort_selection_set(data)
+    if not selected:
+        ui.answer_cb(cb_id, "请先勾选序号")
+        return
+    if op == "top":
+        new_draft = _move_top(draft, selected)
+        new_sel = set(range(1, len(selected) + 1))
+    elif op == "bottom":
+        new_draft = _move_bottom(draft, selected)
+        start = len(new_draft) - len(selected) + 1
+        new_sel = set(range(start, len(new_draft) + 1))
+    elif op == "up":
+        new_draft, new_sel = _move_up(draft, selected)
+    elif op == "down":
+        new_draft, new_sel = _move_down(draft, selected)
+    else:
+        ui.answer_cb(cb_id, "未知移动操作")
+        return
+    _set_sort_state(
+        chat_id, new_draft,
+        page=data.get("page") or 1,
+        filter_key=data.get("filter_key") or _FILTER_ALL,
+        selected=new_sel,
+    )
+    _show_sort(chat_id, message_id, cb_id)
+
+
+def on_sort_reset(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _sort_state_data(chat_id) or {}
+    page = max(1, int(data.get("page") or 1))
+    filter_key = _normalize_filter(data.get("filter_key") or _FILTER_ALL)
+    _set_sort_state(chat_id, _all_account_keys(), page=page, filter_key=filter_key)
+    ui.answer_cb(cb_id, "已还原当前保存顺序")
+    _show_sort(chat_id, message_id)
+
+
+def _save_account_order(draft: list[str]) -> None:
+    order = {ak: i for i, ak in enumerate(draft)}
+
+    def _mutate(cfg):
+        accounts = list(cfg.get("oauthAccounts") or [])
+        ordered = [a for a in accounts if _account_key(a) in order]
+        ordered.sort(key=lambda a: order.get(_account_key(a), 10**9))
+        rest = [a for a in accounts if _account_key(a) not in order]
+        cfg["oauthAccounts"] = ordered + rest
+
+    config.update(_mutate)
+
+
+def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _sort_state_data(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    page = max(1, int(data.get("page") or 1))
+    filter_key = _normalize_filter(data.get("filter_key") or _FILTER_ALL)
+    _save_account_order(draft)
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已保存")
+    ui.edit(
+        chat_id, message_id,
+        "✅ 已保存 OAuth 账户排序。",
+        reply_markup=ui.inline_kb([
+            [ui.btn("继续排序", f"oa:sort:{page}:{filter_key}"), ui.btn("返回 OAuth 列表", _page_callback(page, filter_key))],
+            [ui.btn("🏠 主菜单", "menu:main")],
+        ]),
+    )
+
+
+def on_sort_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _sort_state_data(chat_id) or {}
+    page = max(1, int(data.get("page") or 1))
+    filter_key = _normalize_filter(data.get("filter_key") or _FILTER_ALL)
+    states.pop_state(chat_id)
+    show(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
 
 
 # ─── 账户详情 ─────────────────────────────────────────────────────
@@ -923,13 +1202,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     email = _account_email(ak)
     provider = oauth_manager.provider_of(ak)
     if provider == "openai":
-        ui.answer_cb(cb_id, "刷新 Token 并拉取额度...")
-        tr = _run_sync(oauth_manager.force_refresh(ak))
-        if isinstance(tr, Exception):
-            ui.send(chat_id, _oauth_error_html(
-                tr, provider="openai", operation="refresh_token",
-            ))
-            return
+        ui.answer_cb(cb_id, "拉取 OpenAI 用量...")
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
@@ -945,7 +1218,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     if not text:
         return
     if provider == "openai":
-        head = "✅ 已刷新 Token 并更新用量（wham/usage）"
+        head = "✅ 已更新用量（wham/usage）"
         if quota_action and quota_action.get("action") == "disabled":
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
@@ -1121,17 +1394,9 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
 
         usage = None
         # ─ 拉 usage ─
-        if prov == "openai":
-            tr = _run_sync(oauth_manager.force_refresh(ak))
-            if isinstance(tr, Exception):
-                fail_count += 1
-                _replace_last_with_oauth_error(
-                    lines, tr, provider="openai", operation="refresh_token",
-                )
-                lines.append("")
-                _flush()
-                continue
-
+        # OpenAI 用量刷新只需要 ensure_valid_token + wham/usage；不要在这里
+        # 无条件 force_refresh。refresh_token 即使失效，也不代表当前
+        # access_token 不能继续调用/拉用量，强刷会把“用量刷新”误报成 401。
         result = _fetch_and_save_usage_sync(ak, email=email)
         if isinstance(result, Exception):
             fail_count += 1
@@ -2249,6 +2514,25 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
             return True
         page, filter_key = _parse_page_filter(payload)
         show(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:sort:"):
+        page, filter_key = _parse_page_filter(data.split(":", 2)[2])
+        on_sort_start(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:sort_sel:"):
+        on_sort_select(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:sort_mv:"):
+        on_sort_move(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data == "oa:sort_reset":
+        on_sort_reset(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:sort_save":
+        on_sort_save(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:sort_cancel":
+        on_sort_cancel(chat_id, message_id, cb_id)
         return True
     if data == "oa:clear_all_errors" or data.startswith("oa:clear_all_errors:"):
         page, filter_key = _parse_page_filter(data[len("oa:clear_all_errors:"):] if data.startswith("oa:clear_all_errors:") else "")

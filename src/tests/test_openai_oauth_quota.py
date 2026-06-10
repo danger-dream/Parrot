@@ -326,7 +326,7 @@ def test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled(m):
 
 
 def test_oauth_menu_refresh_usage_openai_wham(m):
-    """OpenAI 账户点“刷新用量” → force_refresh + wham/usage，且不发 probe。"""
+    """OpenAI 账户点“刷新用量” → 有效 access_token 直接 wham/usage，且不发 probe/强刷 token。"""
     _setup(m)
     _add_openai(m, "ru@openai.test")
     m["registry"].rebuild_from_config()
@@ -335,7 +335,7 @@ def test_oauth_menu_refresh_usage_openai_wham(m):
         for a in c["oauthAccounts"]:
             if a["email"] == "ru@openai.test":
                 a["access_token"] = "OLD-AT"
-                a["expired"] = "2026-01-01T00:00:00Z"
+                a["expired"] = "2099-01-01T00:00:00Z"
                 a["last_refresh"] = "2026-01-01T00:00:00Z"
     m["config"].update(_stamp)
     m["registry"].rebuild_from_config()
@@ -356,9 +356,9 @@ def test_oauth_menu_refresh_usage_openai_wham(m):
         m["OpenAIOAuthChannel"].probe_usage = orig_probe
 
     acc = m["oauth_manager"].get_account("openai:ru@openai.test:acct-ru@openai.test")
-    assert acc["access_token"] != "OLD-AT"
-    assert acc["expired"] != "2026-01-01T00:00:00Z"
-    assert acc["last_refresh"] != "2026-01-01T00:00:00Z"
+    assert acc["access_token"] == "OLD-AT"
+    assert acc["expired"] == "2099-01-01T00:00:00Z"
+    assert acc["last_refresh"] == "2026-01-01T00:00:00Z"
     assert called["probe"] == 0
     row = m["state_db"].quota_load("openai:ru@openai.test:acct-ru@openai.test")
     assert row is not None, "wham should have written quota cache"
@@ -366,7 +366,7 @@ def test_oauth_menu_refresh_usage_openai_wham(m):
     assert row["seven_day_util"] == 3.0
     last = rec.last("editMessageText")
     assert last and "wham/usage" in last["text"], last.get("text", "")[:200]
-    print("  [PASS] oauth_menu refresh_usage: openai → force_refresh + wham + re-render")
+    print("  [PASS] oauth_menu refresh_usage: openai → wham without force_refresh + re-render")
 
 
 def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
@@ -376,7 +376,7 @@ def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
     m["registry"].rebuild_from_config()
 
     orig_fetch = m["openai_provider"].fetch_wham_usage_sync
-    def _usage_100(access_token: str):
+    def _usage_100(access_token: str, *, account_id: str | None = None):
         return {
             "five_hour": {"utilization": 0.0, "resets_at": "2026-01-01T00:01:00Z"},
             "seven_day": {"utilization": 100.0, "resets_at": "2026-01-01T01:00:00Z"},
@@ -406,7 +406,7 @@ def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
 
 
 def test_oauth_menu_refresh_all_uses_wham_for_openai(m):
-    """refresh_all 对 openai：force_refresh + wham/usage，不发 probe。"""
+    """refresh_all 对 openai：有效 access_token 直接 wham/usage，不发 probe/强刷 token。"""
     _setup(m)
     m["oauth_manager"].add_account({
         "email": "c@claude.test", "provider": "claude",
@@ -419,6 +419,7 @@ def test_oauth_menu_refresh_all_uses_wham_for_openai(m):
         for a in c["oauthAccounts"]:
             if a["email"] == "o@openai.test":
                 a["access_token"] = "OLD-OPENAI-AT"
+                a["expired"] = "2099-01-01T00:00:00Z"
     m["config"].update(_stamp)
     m["registry"].rebuild_from_config()
 
@@ -445,10 +446,10 @@ def test_oauth_menu_refresh_all_uses_wham_for_openai(m):
     assert "用量刷新完成" in final_text
     assert called["probe"] == 0
     acc = m["oauth_manager"].get_account("openai:o@openai.test:acct-o@openai.test")
-    assert acc["access_token"] != "OLD-OPENAI-AT"
+    assert acc["access_token"] == "OLD-OPENAI-AT"
     row = m["state_db"].quota_load("openai:o@openai.test:acct-o@openai.test")
     assert row is not None and row["seven_day_util"] == 3.0
-    print("  [PASS] oauth_menu refresh_all: openai force_refresh + wham")
+    print("  [PASS] oauth_menu refresh_all: openai wham without force_refresh")
 
 
 def test_probe_usage_writes_snapshot_in_mock_mode(m):

@@ -8,3 +8,14 @@ python-multipart>=0.0.20  # multipart/form-data parsing for OpenAI Images API co
 blake3>=1.0
 cryptography>=42.0
 websockets>=15.0
+# httpcore: directly subclassed in src/proxy/connector.py for the SS2022 network backend
+# (AsyncNetworkStream/AsyncNetworkBackend/AsyncConnectionPool). Currently pulled in via httpx,
+# but we import its API directly, so pin it explicitly.
+httpcore>=1.0,<2
+# starlette: imported directly in src/openai/responses_ws.py (WebSocketDisconnect/WebSocketState).
+# Pulled in via fastapi, but we use its API directly, so declare it explicitly.
+starlette>=0.46
+# python-socks: hidden runtime dependency. websockets dynamically imports python_socks when
+# connecting through a SOCKS5 proxy (src/failover.py + src/openai/responses_ws.py).
+# Without it: ImportError: connecting through a SOCKS proxy requires python-socks.
+python-socks>=2.0

@@ -438,17 +438,87 @@ def test_fetch_usage_openai_goes_through_wham(m):
         "email": "x@openai.test",
         "provider": "openai",
         "access_token": "at", "refresh_token": "rt",
+        "expired": "2099-01-01T00:00:00Z",
         "chatgpt_account_id": "acct-x", "plan_type": "plus",
     })
+
+    called = {}
+    orig_fetch = m["openai_provider"].fetch_wham_usage
+
+    async def _fake_fetch(access_token: str, *, account_id: str | None = None):
+        called["access_token"] = access_token
+        called["account_id"] = account_id
+        return {
+            "five_hour": {"utilization": 1.0},
+            "seven_day": {"utilization": 3.0},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "extra_usage": {"is_enabled": False},
+            "openai": {"source": "wham_usage"},
+        }
+
     import asyncio
-    usage = asyncio.run(om.fetch_usage("openai:x@openai.test:acct-x"))
+    try:
+        m["openai_provider"].fetch_wham_usage = _fake_fetch
+        usage = asyncio.run(om.fetch_usage("openai:x@openai.test:acct-x"))
+    finally:
+        m["openai_provider"].fetch_wham_usage = orig_fetch
+
+    assert called == {"access_token": "at", "account_id": "acct-x"}, called
     assert "five_hour" in usage and "seven_day" in usage
     assert usage["five_hour"]["utilization"] == 1.0, usage
     assert usage["seven_day"]["utilization"] == 3.0, usage
     assert usage.get("openai", {}).get("source") == "wham_usage"
     # 不应再标记 probe 节流桶。
     assert "openai:x@openai.test:acct-x" not in om._OPENAI_PROBE_LAST
-    print("  [PASS] fetch_usage openai: unified path (wham/usage)")
+    print("  [PASS] fetch_usage openai: unified path (wham/usage + account id)")
+
+
+def test_fetch_wham_usage_sends_account_id_header(m):
+    """wham/usage 请求显式带 ChatGPT-Account-ID，与 Codex BackendClient 对齐。"""
+    _setup(m)
+    p = m["openai_provider"]
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 1, "limit_window_seconds": 18000},
+                    "secondary_window": {"used_percent": 3, "limit_window_seconds": 604800},
+                },
+                "credits": {"has_credits": False},
+            }
+
+    orig_get = p.network.get_sync
+    try:
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+
+        def _fake_get(url, *, headers=None, **kwargs):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            return _Resp()
+
+        p.network.get_sync = _fake_get
+        usage = p.fetch_wham_usage_sync("at-token", account_id="acct-x")
+    finally:
+        p.network.get_sync = orig_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+
+    assert captured["url"] == p.WHAM_USAGE_URL
+    assert captured["headers"].get("authorization") == "Bearer at-token"
+    assert captured["headers"].get("ChatGPT-Account-ID") == "acct-x"
+    assert usage["five_hour"]["utilization"] == 1.0
+    assert usage["seven_day"]["utilization"] == 3.0
+    print("  [PASS] fetch_wham_usage_sync: sends ChatGPT-Account-ID header")
 
 
 # ─── TG bot: OpenAI add via PKCE ─────────────────────────────────
@@ -570,6 +640,7 @@ def main():
         test_refresh_notice_openai_wording,
         test_openai_refresh_updates_id_token_metadata,
         test_fetch_usage_openai_goes_through_wham,
+        test_fetch_wham_usage_sends_account_id_header,
         test_tg_openai_add_via_pkce,
         test_tg_openai_add_state_mismatch,
         test_tg_openai_add_via_rt,

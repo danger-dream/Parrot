@@ -20,6 +20,7 @@ callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -214,20 +215,112 @@ def _mask_key(key: str) -> str:
 
 # ─── 渠道列表 ─────────────────────────────────────────────────────
 
-def _list_text_and_kb() -> tuple[str, dict]:
+_PAGE_SIZE = 6
+
+
+def _page_callback(page: int) -> str:
+    try:
+        page = int(page or 1)
+    except Exception:
+        page = 1
+    return f"ch:page:{max(1, page)}"
+
+
+def _parse_page_payload(payload: str, default_page: int = 1) -> int:
+    if not payload:
+        return max(1, int(default_page or 1))
+    try:
+        return max(1, int(payload))
+    except Exception:
+        return max(1, int(default_page or 1))
+
+
+def _build_pagination_row(current: int, total_pages: int) -> list[dict]:
+    current = max(1, min(int(current or 1), max(1, total_pages)))
+    if total_pages <= 1:
+        return []
+    if total_pages <= 10:
+        btns: list[dict] = []
+        if current > 1:
+            btns.append(ui.btn("⬅ 上一页", _page_callback(current - 1)))
+        else:
+            btns.append(ui.btn("◁ 上一页", "ch:page:noop"))
+        btns.append(ui.btn(f"{current}/{total_pages}", "ch:page:noop"))
+        if current < total_pages:
+            btns.append(ui.btn("➡ 下一页", _page_callback(current + 1)))
+        else:
+            btns.append(ui.btn("下一页 ▷", "ch:page:noop"))
+        return btns
+
+    window = 2
+    lo = max(1, current - window)
+    hi = min(total_pages, current + window)
+    if hi - lo < 4:
+        if lo == 1:
+            hi = min(total_pages, lo + 4)
+        elif hi == total_pages:
+            lo = max(1, hi - 4)
+
+    btns: list[dict] = []
+    if lo > 1:
+        btns.append(ui.btn("1", _page_callback(1)))
+        if lo > 2:
+            btns.append(ui.btn("…", "ch:page:noop"))
+    for p in range(lo, hi + 1):
+        if p == current:
+            btns.append(ui.btn(f"[{p}]", "ch:page:noop"))
+        else:
+            btns.append(ui.btn(str(p), _page_callback(p)))
+    if hi < total_pages:
+        if hi < total_pages - 1:
+            btns.append(ui.btn("…", "ch:page:noop"))
+        btns.append(ui.btn(str(total_pages), _page_callback(total_pages)))
+    return btns
+
+
+def _split_short_page(payload: str, default_page: int = 1) -> tuple[str, int]:
+    raw = payload or ""
+    if ":" not in raw:
+        return raw, max(1, int(default_page or 1))
+    short, _, page_s = raw.rpartition(":")
+    try:
+        page = int(page_s)
+    except Exception:
+        return raw, max(1, int(default_page or 1))
+    if page < 1:
+        page = default_page
+    return short, max(1, int(page or 1))
+
+
+def _callback_payload(short: str, page: int) -> str:
+    try:
+        page = int(page or 1)
+    except Exception:
+        page = 1
+    return f"{short}:{max(1, page)}"
+
+
+def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
     chans = [ch for ch in registry.all_channels() if ch.type == "api"]
     total = len(chans)
+    total_pages = max(1, math.ceil(total / _PAGE_SIZE)) if total else 1
+    page = max(1, min(int(page or 1), total_pages))
+    page_info = f" | 第 {page}/{total_pages} 页" if total_pages > 1 else ""
 
-    lines = [f"🔀 <b>渠道管理</b>", f"共 {total} 个"]
+    lines = [f"🔀 <b>渠道管理</b>", f"共 {total} 个{page_info}"]
     if total == 0:
         lines.append("\n暂无渠道，点「➕ 添加渠道」创建。")
 
     # 本月 channel 级加权平均 TPS（按 channel 维度聚合 tokens/denom）
     month_ts = _month_start_ts()
 
+    start = (page - 1) * _PAGE_SIZE
+    end = start + _PAGE_SIZE
+    page_chans = chans[start:end]
+
     rows: list[list[dict]] = []
     current: list[dict] = []
-    for ch in chans:
+    for idx, ch in enumerate(page_chans, start=start + 1):
         icon, status = _channel_health(ch)
         try:
             ch_stats = log_db.tokens_for_channel(ch.key, since_ts=month_ts)
@@ -242,39 +335,297 @@ def _list_text_and_kb() -> tuple[str, dict]:
             ch_cache = ""
         summary = _summary_text(ch, tps_v=ch_tps, cache_phrase=ch_cache)
         lines.append("")
-        lines.append(f"{icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
+        lines.append(f"{idx}. {icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
         lines.append(f"  模型: {len(ch.models)} 个 · {ui.escape_html(summary)}")
         short = ui.register_code(ch.display_name)
-        current.append(ui.btn(f"{icon} {ch.display_name}", f"ch:view:{short}"))
+        current.append(ui.btn(f"{idx}. {icon} {ch.display_name}", f"ch:view:{_callback_payload(short, page)}"))
         if len(current) >= 2:
             rows.append(current)
             current = []
     if current:
         rows.append(current)
 
+    pag_row = _build_pagination_row(page, total_pages)
+    if total > 0:
+        pag_row.append(ui.btn("↕ 排序", f"ch:sort:{page}"))
+    if pag_row:
+        rows.append(pag_row)
+
     rows.append([
         ui.btn("➕ 添加渠道", "chw:start"),
-        ui.btn("🧹 清全部错误", "ch:clear_errors_all"),
+        ui.btn("🧹 清全部错误", f"ch:clear_errors_all:{page}"),
     ])
     rows.append([
-        ui.btn("🔗 清全部亲和", "ch:clear_affinity_all"),
+        ui.btn("🔗 清全部亲和", f"ch:clear_affinity_all:{page}"),
+        ui.btn("◀ 返回主菜单", "menu:main"),
     ])
-    rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
 
     text = ui.truncate("\n".join(lines))
     return text, ui.inline_kb(rows)
 
 
-def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    text, kb = _list_text_and_kb()
+    text, kb = _list_text_and_kb(page=page)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def send_new(chat_id: int) -> None:
-    text, kb = _list_text_and_kb()
+def send_new(chat_id: int, page: int = 1) -> None:
+    text, kb = _list_text_and_kb(page=page)
     ui.send(chat_id, text, reply_markup=kb)
+
+
+# ─── 渠道排序 ─────────────────────────────────────────────────────
+
+def _api_channel_names() -> list[str]:
+    return [ch.display_name for ch in registry.all_channels() if ch.type == "api"]
+
+
+def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
+    if n <= 0:
+        return []
+    rows_count = math.ceil(n / max_cols)
+    base = n // rows_count
+    extra = n % rows_count
+    rows: list[list[int]] = []
+    cur = 1
+    for r in range(rows_count):
+        size = base + (1 if r < extra else 0)
+        rows.append(list(range(cur, cur + size)))
+        cur += size
+    return rows
+
+
+def _sort_state_data(chat_id: int) -> Optional[dict]:
+    st = states.get_state(chat_id)
+    if not st or st.get("action") != "ch_sort":
+        return None
+    return st.get("data") or {}
+
+
+def _sort_selection_set(data: dict) -> set[int]:
+    return {int(x) for x in (data.get("selected") or [])}
+
+
+def _set_sort_state(chat_id: int, draft: list[str], page: int = 1,
+                    selected: Optional[set[int]] = None) -> None:
+    states.set_state(chat_id, "ch_sort", {
+        "draft": list(draft),
+        "page": max(1, int(page or 1)),
+        "selected": sorted(selected or []),
+    })
+
+
+def _sort_item_line(idx: int, name: str) -> str:
+    ch = registry.get_channel(f"api:{name}")
+    if ch is None:
+        return f"{idx}. <code>{ui.escape_html(name)}</code> ⚠ 已不存在"
+    icon, status = _channel_health(ch)
+    protocol = _protocol_of(ch)
+    proto_label = "🅰" if protocol == "anthropic" else "🅾"
+    return (
+        f"{idx}. {icon} {proto_label} <code>{ui.escape_html(ch.display_name)}</code> "
+        f"{ui.escape_html(status)}"
+    )
+
+
+def _sort_text_and_kb(draft: list[str], selected: set[int], page: int) -> tuple[str, dict]:
+    lines = [
+        "↕ <b>渠道排序</b>",
+        "",
+        "当前渠道顺序:",
+    ]
+    if not draft:
+        lines.append("<i>当前没有 API 渠道。</i>")
+    else:
+        lines.extend(_sort_item_line(i, name) for i, name in enumerate(draft, start=1))
+    lines.extend([
+        "",
+        "调整方式:",
+        "先点下方序号勾选渠道，再点置顶/置底/上移/下移。",
+        "调整完成后记得点保存排序。",
+    ])
+
+    rows: list[list[dict]] = []
+    for nums in _split_number_rows(len(draft)):
+        row = []
+        for n in nums:
+            label = f"{n} ✅" if n in selected else str(n)
+            row.append(ui.btn(label, f"ch:sort_sel:{n}"))
+        rows.append(row)
+    if draft:
+        rows.append([
+            ui.btn("🔝 置顶", "ch:sort_mv:top"),
+            ui.btn("🔚 置底", "ch:sort_mv:bottom"),
+            ui.btn("⬆ 上移", "ch:sort_mv:up"),
+            ui.btn("⬇ 下移", "ch:sort_mv:down"),
+        ])
+    rows.append([ui.btn("还原", "ch:sort_reset"), ui.btn("保存排序", "ch:sort_save")])
+    rows.append([ui.btn("◀ 返回渠道列表", _page_callback(page)), ui.btn("取消", "ch:sort_cancel")])
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def _show_sort(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    data = _sort_state_data(chat_id)
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    if not data:
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    page = _parse_page_payload(str(data.get("page") or 1))
+    selected = _sort_selection_set(data)
+    text, kb = _sort_text_and_kb(draft, selected, page)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_sort_start(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
+    draft = _api_channel_names()
+    if not draft:
+        ui.answer_cb(cb_id, "当前没有渠道")
+        return
+    _set_sort_state(chat_id, draft, page=page)
+    _show_sort(chat_id, message_id, cb_id)
+
+
+def on_sort_select(chat_id: int, message_id: int, cb_id: str, idx_str: str) -> None:
+    data = _sort_state_data(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        ui.answer_cb(cb_id, "无效序号")
+        return
+    if idx < 1 or idx > len(draft):
+        ui.answer_cb(cb_id, "序号越界")
+        return
+    selected = _sort_selection_set(data)
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.add(idx)
+    _set_sort_state(chat_id, draft, page=data.get("page") or 1, selected=selected)
+    _show_sort(chat_id, message_id, cb_id)
+
+
+def _move_top(draft: list[str], selected: set[int]) -> list[str]:
+    idxs = [i - 1 for i in sorted(selected)]
+    chosen = [draft[i] for i in idxs]
+    rest = [x for i, x in enumerate(draft) if i not in idxs]
+    return chosen + rest
+
+
+def _move_bottom(draft: list[str], selected: set[int]) -> list[str]:
+    idxs = [i - 1 for i in sorted(selected)]
+    chosen = [draft[i] for i in idxs]
+    rest = [x for i, x in enumerate(draft) if i not in idxs]
+    return rest + chosen
+
+
+def _move_up(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
+    arr = list(draft)
+    sel = {i - 1 for i in selected}
+    for i in range(1, len(arr)):
+        if i in sel and (i - 1) not in sel:
+            arr[i - 1], arr[i] = arr[i], arr[i - 1]
+            sel.remove(i)
+            sel.add(i - 1)
+    return arr, {i + 1 for i in sel}
+
+
+def _move_down(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
+    arr = list(draft)
+    sel = {i - 1 for i in selected}
+    for i in range(len(arr) - 2, -1, -1):
+        if i in sel and (i + 1) not in sel:
+            arr[i + 1], arr[i] = arr[i], arr[i + 1]
+            sel.remove(i)
+            sel.add(i + 1)
+    return arr, {i + 1 for i in sel}
+
+
+def on_sort_move(chat_id: int, message_id: int, cb_id: str, op: str) -> None:
+    data = _sort_state_data(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    selected = _sort_selection_set(data)
+    if not selected:
+        ui.answer_cb(cb_id, "请先勾选序号")
+        return
+    if op == "top":
+        new_draft = _move_top(draft, selected)
+        new_sel = set(range(1, len(selected) + 1))
+    elif op == "bottom":
+        new_draft = _move_bottom(draft, selected)
+        start = len(new_draft) - len(selected) + 1
+        new_sel = set(range(start, len(new_draft) + 1))
+    elif op == "up":
+        new_draft, new_sel = _move_up(draft, selected)
+    elif op == "down":
+        new_draft, new_sel = _move_down(draft, selected)
+    else:
+        ui.answer_cb(cb_id, "未知移动操作")
+        return
+    _set_sort_state(chat_id, new_draft, page=data.get("page") or 1, selected=new_sel)
+    _show_sort(chat_id, message_id, cb_id)
+
+
+def on_sort_reset(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _sort_state_data(chat_id) or {}
+    page = _parse_page_payload(str(data.get("page") or 1))
+    _set_sort_state(chat_id, _api_channel_names(), page=page)
+    ui.answer_cb(cb_id, "已还原当前保存顺序")
+    _show_sort(chat_id, message_id)
+
+
+def _save_api_channel_order(draft: list[str]) -> None:
+    order = {name: i for i, name in enumerate(draft)}
+
+    def _mutate(cfg):
+        channels = list(cfg.get("channels") or [])
+        ordered = [c for c in channels if c.get("name") in order]
+        ordered.sort(key=lambda c: order.get(c.get("name"), 10**9))
+        rest = [c for c in channels if c.get("name") not in order]
+        cfg["channels"] = ordered + rest
+
+    config.update(_mutate)
+    registry.rebuild_from_config()
+
+
+def on_sort_save(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _sort_state_data(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        show(chat_id, message_id)
+        return
+    draft = list(data.get("draft") or [])
+    page = _parse_page_payload(str(data.get("page") or 1))
+    _save_api_channel_order(draft)
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, "已保存")
+    ui.edit(
+        chat_id, message_id,
+        "✅ 已保存渠道排序。",
+        reply_markup=ui.inline_kb([
+            [ui.btn("继续排序", f"ch:sort:{page}"), ui.btn("返回渠道列表", _page_callback(page))],
+            [ui.btn("🏠 主菜单", "menu:main")],
+        ]),
+    )
+
+
+def on_sort_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _sort_state_data(chat_id) or {}
+    page = _parse_page_payload(str(data.get("page") or 1))
+    states.pop_state(chat_id)
+    show(chat_id, message_id, cb_id, page=page)
 
 
 # ─── 渠道详情 ─────────────────────────────────────────────────────
@@ -341,7 +692,7 @@ def _channel_model_lines(ch) -> list[str]:
     return lines
 
 
-def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
+def _detail_text_and_kb(name: str, page: int = 1) -> tuple[Optional[str], Optional[dict]]:
     ch = registry.get_channel(f"api:{name}")
     if ch is None or ch.type != "api":
         return None, None
@@ -379,36 +730,39 @@ def _detail_text_and_kb(name: str) -> tuple[Optional[str], Optional[dict]]:
     lines.append(f"🔗 亲和绑定: {bound} 个会话")
 
     short = ui.register_code(ch.display_name)
+    payload = _callback_payload(short, page)
     toggle_label = "⬛ 禁用" if enabled else "✅ 启用"
     rows = [
         [ui.btn("🧪 测试模型", f"ch:test:{short}"), ui.btn("✏ 编辑", f"ch:edit:{short}")],
-        [ui.btn("🧹 清错误", f"ch:clear_errors:{short}"),
-         ui.btn("🔗 清亲和", f"ch:clear_affinity:{short}")],
-        [ui.btn(toggle_label, f"ch:toggle:{short}"),
-         ui.btn("🗑 删除", f"ch:del:{short}")],
-        [ui.btn("◀ 返回列表", "menu:channel")],
+        [ui.btn("🧹 清错误", f"ch:clear_errors:{payload}"),
+         ui.btn("🔗 清亲和", f"ch:clear_affinity:{payload}")],
+        [ui.btn(toggle_label, f"ch:toggle:{payload}"),
+         ui.btn("🗑 删除", f"ch:del:{payload}")],
+        [ui.btn("◀ 返回列表", _page_callback(page))],
     ]
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
-def on_view(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
-        show(chat_id, message_id)
+        show(chat_id, message_id, page=page)
         return
     ui.answer_cb(cb_id)
-    text, kb = _detail_text_and_kb(name)
+    text, kb = _detail_text_and_kb(name, page=page)
     if text is None:
         ui.edit(chat_id, message_id, f"⚠ 渠道 <code>{ui.escape_html(name)}</code> 不存在",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", "menu:channel")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _page_callback(page))]]))
         return
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 启停 / 清错误 / 清亲和 / 删除 ───────────────────────────────
 
-def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def on_toggle(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
@@ -420,48 +774,51 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     new_enabled = not (ch.enabled and not ch.disabled_reason)
     registry.update_api_channel(name, {"enabled": new_enabled})
     ui.answer_cb(cb_id, "已启用" if new_enabled else "已禁用")
-    text, kb = _detail_text_and_kb(name)
+    text, kb = _detail_text_and_kb(name, page=page)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def on_clear_errors(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
         return
     cooldown.clear(f"api:{name}", model=None)
     ui.answer_cb(cb_id, "已清除")
-    text, kb = _detail_text_and_kb(name)
+    text, kb = _detail_text_and_kb(name, page=page)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
         return
     affinity.delete_by_channel(f"api:{name}")
     ui.answer_cb(cb_id, "已清空亲和")
-    text, kb = _detail_text_and_kb(name)
+    text, kb = _detail_text_and_kb(name, page=page)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-def on_clear_errors_all(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_clear_errors_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
     cooldown.clear_all()
     ui.answer_cb(cb_id, "已全部清除")
-    show(chat_id, message_id)
+    show(chat_id, message_id, page=page)
 
 
-def on_clear_affinity_all(chat_id: int, message_id: int, cb_id: str) -> None:
+def on_clear_affinity_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
     affinity.delete_all()
     ui.answer_cb(cb_id, "已全部清空")
-    show(chat_id, message_id)
+    show(chat_id, message_id, page=page)
 
 
-def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def on_delete_ask(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
@@ -479,17 +836,18 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str) -> None
         f"• 模型: {len(ch.models)} 个\n\n"
         "此操作会同时清除该渠道所有统计、冷却、亲和数据，不可恢复。",
         reply_markup=ui.inline_kb([[
-            ui.btn("✅ 确认删除", f"ch:del_exec:{short}"),
-            ui.btn("❌ 取消",     f"ch:view:{short}"),
+            ui.btn("✅ 确认删除", f"ch:del_exec:{_callback_payload(short, page)}"),
+            ui.btn("❌ 取消",     f"ch:view:{_callback_payload(short, page)}"),
         ]]),
     )
 
 
-def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+def on_delete_exec(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
     if not name:
         ui.answer_cb(cb_id, "短码已失效")
-        show(chat_id, message_id)
+        show(chat_id, message_id, page=page)
         return
     ok = registry.delete_api_channel(name)
     if ok:
@@ -498,7 +856,7 @@ def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
         if load_balancing.is_initialized():
             extra = "\n已从负载均衡优先级队列中移除。"
         ui.edit(chat_id, message_id, f"✅ 已删除 <code>{ui.escape_html(name)}</code>{extra}")
-        show(chat_id, message_id)
+        show(chat_id, message_id, page=page)
     else:
         ui.answer_cb(cb_id, "删除失败")
 
@@ -1614,10 +1972,32 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "menu:channel":
         show(chat_id, message_id, cb_id)
         return True
-    if data == "ch:clear_errors_all":
-        on_clear_errors_all(chat_id, message_id, cb_id); return True
-    if data == "ch:clear_affinity_all":
-        on_clear_affinity_all(chat_id, message_id, cb_id); return True
+    if data.startswith("ch:page:"):
+        payload = data[len("ch:page:"):]
+        if payload == "noop":
+            ui.answer_cb(cb_id)
+            return True
+        show(chat_id, message_id, cb_id, page=_parse_page_payload(payload))
+        return True
+    if data.startswith("ch:sort:"):
+        on_sort_start(chat_id, message_id, cb_id, page=_parse_page_payload(data[len("ch:sort:"):]))
+        return True
+    if data.startswith("ch:sort_sel:"):
+        on_sort_select(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:sort_mv:"):
+        on_sort_move(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data == "ch:sort_reset":
+        on_sort_reset(chat_id, message_id, cb_id); return True
+    if data == "ch:sort_save":
+        on_sort_save(chat_id, message_id, cb_id); return True
+    if data == "ch:sort_cancel":
+        on_sort_cancel(chat_id, message_id, cb_id); return True
+    if data.startswith("ch:clear_errors_all"):
+        payload = data[len("ch:clear_errors_all"):].lstrip(":")
+        on_clear_errors_all(chat_id, message_id, cb_id, page=_parse_page_payload(payload)); return True
+    if data.startswith("ch:clear_affinity_all"):
+        payload = data[len("ch:clear_affinity_all"):].lstrip(":")
+        on_clear_affinity_all(chat_id, message_id, cb_id, page=_parse_page_payload(payload)); return True
 
     # 向导
     if data == "chw:start":  wiz_start(chat_id, message_id, cb_id); return True

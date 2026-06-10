@@ -699,7 +699,7 @@ def _mock_wham_payload() -> dict:
     }
 
 
-def fetch_wham_usage_sync(access_token: str) -> dict:
+def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -> dict:
     """主动拉 ChatGPT/Codex quota。
 
     失败会抛异常；调用方必须把失败视为“额度未知”，不能用旧/空数据恢复
@@ -707,15 +707,23 @@ def fetch_wham_usage_sync(access_token: str) -> dict:
     """
     if _mock_mode_enabled():
         return normalize_wham_usage(_mock_wham_payload())
+
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "accept": "application/json",
+        "user-agent": USER_AGENT,
+        "origin": "https://chatgpt.com",
+        "referer": "https://chatgpt.com/codex/settings/usage",
+    }
+    # Codex 官方 BackendClient 会把 ChatGPT account/workspace id 一并带到
+    # usage 请求里。单工作区账号通常只靠 Bearer 也能成功，但多工作区账号
+    # 最好显式路由到当前账户，避免刷新到错误 workspace 或被上游收紧鉴权。
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+
     resp = network.get_sync(
         WHAM_USAGE_URL,
-        headers={
-            "authorization": f"Bearer {access_token}",
-            "accept": "application/json",
-            "user-agent": USER_AGENT,
-            "origin": "https://chatgpt.com",
-            "referer": "https://chatgpt.com/codex/settings/usage",
-        },
+        headers=headers,
         timeout=_WHAM_USAGE_TIMEOUT,
         proxy_purpose="oauth_openai",
     )
@@ -723,8 +731,10 @@ def fetch_wham_usage_sync(access_token: str) -> dict:
     return normalize_wham_usage(resp.json())
 
 
-async def fetch_wham_usage(access_token: str) -> dict:
-    return await asyncio.to_thread(fetch_wham_usage_sync, access_token)
+async def fetch_wham_usage(access_token: str, *, account_id: str | None = None) -> dict:
+    return await asyncio.to_thread(
+        fetch_wham_usage_sync, access_token, account_id=account_id,
+    )
 
 
 # ─── id_token 解码 ───────────────────────────────────────────────
