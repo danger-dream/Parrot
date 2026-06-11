@@ -510,6 +510,67 @@ def _engine_tag_image(image_ref: str, repo: str, tag: str) -> bool:
         return False
 
 
+def _split_image_ref(image: str) -> tuple[str, str]:
+    """拆 Docker image 为 (repo, tag)。不支持 digest 自更新时改 tag。"""
+    image = (image or "").strip()
+    if "@" in image:
+        return image, ""
+    last = image.rsplit("/", 1)[-1]
+    if ":" in last:
+        repo, _, tag = image.rpartition(":")
+        return repo, tag or "latest"
+    return image, "latest"
+
+
+def _join_image_ref(repo: str, tag: str) -> str:
+    return f"{repo}:{tag}" if tag else repo
+
+
+def _docker_tag_from_release(target_tag: str) -> str:
+    """GitHub release tag → Docker semver tag。
+
+    GitHub Release 使用 vX.Y.Z；docker/metadata-action 的 semver tag 默认发布为
+    X.Y.Z。Docker 自更新必须拉 Docker tag，而不是原样拿 release tag 去拉，
+    否则 Engine API 会返回 404 manifest unknown。
+    """
+    tag = (target_tag or "").strip()
+    if len(tag) > 1 and tag[0] in "vV" and tag[1].isdigit():
+        return tag[1:]
+    return tag
+
+
+def _docker_pull_ref_for_target(image: str, target_tag: str) -> str:
+    """本次更新应拉取的远端镜像。
+
+    compose 仍然使用配置里的 image（可能是 latest、main、v0.23.0 或其它固定 tag）。
+    这里先按目标 release 精确拉 repo:X.Y.Z，拉完再把本地配置 image tag 指向它，
+    既避免 v 前缀 404，也避免 latest 漂移。
+    """
+    repo, _cur_tag = _split_image_ref(image)
+    if "@" in repo:
+        return image
+    target_docker_tag = _docker_tag_from_release(target_tag)
+    if target_docker_tag:
+        return _join_image_ref(repo, target_docker_tag)
+    return image
+
+
+def _tag_image_for_compose(source_ref: str, compose_image: str) -> tuple[bool, str]:
+    """把已拉取的 source_ref 打成本地 compose 使用的 image tag。"""
+    if source_ref == compose_image:
+        return True, "image tag already matches compose image"
+    repo, tag = _split_image_ref(compose_image)
+    if not tag or "@" in repo:
+        return False, f"cannot tag digest image for compose: {compose_image}"
+    if _has_local_docker():
+        rc, out = _run(["docker", "tag", source_ref, compose_image], timeout=120)
+        if rc != 0:
+            return False, f"docker tag failed: {out[-200:]}"
+        return True, f"tagged {source_ref} -> {compose_image}"
+    ok = _engine_tag_image(source_ref, repo, tag)
+    return (ok, f"tagged {source_ref} -> {compose_image}" if ok else f"engine tag failed: {source_ref} -> {compose_image}")
+
+
 def _engine_pull_image(image: str) -> tuple[bool, str]:
     """POST /images/create?fromImage=&tag= 拉镜像（流式响应，读完即拉完）。"""
     if ":" in image.rsplit("/", 1)[-1]:
@@ -520,17 +581,20 @@ def _engine_pull_image(image: str) -> tuple[bool, str]:
         with _engine_client(600) as c:
             with c.stream("POST", "/images/create",
                           params={"fromImage": from_image, "tag": tag}) as r:
-                if r.status_code != 200:
-                    return False, f"pull http {r.status_code}"
                 last = ""
                 for line in r.iter_lines():
                     if line:
                         last = line
+                if r.status_code != 200:
+                    detail = f"pull http {r.status_code} for {image}"
+                    if last:
+                        detail += f": {last[:200]}"
+                    return False, detail
                 if "error" in last.lower():
-                    return False, f"pull error: {last[:200]}"
-        return True, "image pulled (engine api)"
+                    return False, f"pull error for {image}: {last[:200]}"
+        return True, f"image pulled (engine api): {image}"
     except Exception as exc:
-        return False, f"engine pull failed: {exc}"
+        return False, f"engine pull failed for {image}: {exc}"
 
 
 def _engine_run_sidecar(inner_cmd: str) -> tuple[bool, str]:
@@ -717,21 +781,29 @@ def _docker_backup(target_tag: str) -> tuple[bool, str, str]:
 
 
 def _docker_pull(target_tag: str) -> tuple[bool, str]:
-    """拉新镜像，不重建。宿主用 compose pull；容器内用 Engine API。"""
-    svc = _cfg()["composeService"]
+    """拉新镜像，不重建。
+
+    关键点：GitHub release tag 通常是 vX.Y.Z，但 GHCR semver tag 是 X.Y.Z。
+    先拉目标 Docker tag，再把本地 compose 使用的 image tag 指向它。
+    """
     image = _cfg()["image"]
+    pull_ref = _docker_pull_ref_for_target(image, target_tag)
     if _has_local_docker():
-        cdir = _docker_compose_dir()
-        if not cdir or not os.path.isdir(cdir):
-            return False, f"composeDir invalid: {cdir!r}"
-        rc, out = _run(["docker", "compose", "pull", svc], cwd=cdir, timeout=600)
+        rc, out = _run(["docker", "pull", pull_ref], timeout=600)
         if rc != 0:
-            rc2, out2 = _run(["docker", "pull", image], timeout=600)
-            if rc2 != 0:
-                return False, f"compose pull failed: {out[-200:]} / {out2[-200:]}"
-        return True, "image pulled"
-    # 容器内：Engine API 拉 image
-    return _engine_pull_image(image)
+            return False, f"docker pull failed for {pull_ref}: {out[-300:]}"
+        ok, detail = _tag_image_for_compose(pull_ref, image)
+        if not ok:
+            return False, detail
+        return True, f"image pulled: {pull_ref}; {detail}"
+    # 容器内：Engine API 拉目标镜像，再打成本地 compose image tag
+    ok, detail = _engine_pull_image(pull_ref)
+    if not ok:
+        return False, detail
+    ok, tag_detail = _tag_image_for_compose(pull_ref, image)
+    if not ok:
+        return False, tag_detail
+    return True, f"{detail}; {tag_detail}"
 
 
 def _docker_sidecar_recreate(backup_digest: str = "") -> tuple[bool, str]:

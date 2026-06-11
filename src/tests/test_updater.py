@@ -109,6 +109,52 @@ class TestCfg:
         assert updater._health_url() == "http://127.0.0.1:22122/health"
 
 
+# ─── Docker image tag 解析 ────────────────────────────────────────
+
+class TestDockerImageTarget:
+    def test_release_v_tag_maps_to_semver_docker_tag(self):
+        assert updater._docker_tag_from_release("v0.23.1") == "0.23.1"
+        assert updater._docker_tag_from_release("0.23.1") == "0.23.1"
+        assert updater._docker_pull_ref_for_target(
+            "ghcr.io/danger-dream/parrot:latest", "v0.23.1"
+        ) == "ghcr.io/danger-dream/parrot:0.23.1"
+        assert updater._docker_pull_ref_for_target(
+            "ghcr.io/danger-dream/parrot:v0.23.0", "v0.23.1"
+        ) == "ghcr.io/danger-dream/parrot:0.23.1"
+
+    def test_docker_pull_engine_pulls_semver_and_tags_compose_image(self, monkeypatch):
+        config.update(lambda c: c["updateChecker"].__setitem__(
+            "image", "ghcr.io/danger-dream/parrot:v0.23.1"
+        ))
+        calls = []
+        monkeypatch.setattr(updater, "_has_local_docker", lambda: False)
+        monkeypatch.setattr(updater, "_engine_pull_image", lambda image: calls.append(("pull", image)) or (True, "pulled"))
+        monkeypatch.setattr(updater, "_engine_tag_image", lambda src, repo, tag: calls.append(("tag", src, repo, tag)) or True)
+        ok, detail = updater._docker_pull("v0.23.1")
+        assert ok is True, detail
+        assert calls == [
+            ("pull", "ghcr.io/danger-dream/parrot:0.23.1"),
+            ("tag", "ghcr.io/danger-dream/parrot:0.23.1", "ghcr.io/danger-dream/parrot", "v0.23.1"),
+        ]
+
+    def test_docker_pull_cli_pulls_semver_and_tags_latest(self, monkeypatch):
+        config.update(lambda c: c["updateChecker"].__setitem__(
+            "image", "ghcr.io/danger-dream/parrot:latest"
+        ))
+        calls = []
+        monkeypatch.setattr(updater, "_has_local_docker", lambda: True)
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return 0, ""
+        monkeypatch.setattr(updater, "_run", fake_run)
+        ok, detail = updater._docker_pull("v0.23.2")
+        assert ok is True, detail
+        assert calls == [
+            ["docker", "pull", "ghcr.io/danger-dream/parrot:0.23.2"],
+            ["docker", "tag", "ghcr.io/danger-dream/parrot:0.23.2", "ghcr.io/danger-dream/parrot:latest"],
+        ]
+
+
 # ─── 状态机持久化 ─────────────────────────────────────────────────
 
 class TestStateMachine:
