@@ -86,7 +86,11 @@ def _openai_workspace_label(acc: dict, *, html: bool = True, force: bool = False
         return ""
     name = str(acc.get("workspace_name") or "").strip()
     wtype = str(acc.get("workspace_type") or "").strip()
-    if name:
+    plan = str(acc.get("plan_type") or "").strip()
+    # OpenAI may return Team workspaces with a generic name of "Personal".
+    # Keep the account type visible instead of showing a misleading Personal
+    # workspace label. Curated names such as SP/AU/UK/IN/AU2 still win.
+    if name and not (name.lower() == "personal" and "team" in f"{wtype} {plan}".lower()):
         text = name
     elif wtype:
         text = wtype
@@ -311,7 +315,11 @@ def _format_account_block(acc: dict) -> str:
             _d = _window_usage_detail(ak, _now_ts - 7 * 86400, _USAGE_DETAIL_INDENT_LIST)
             if _d:
                 lines.append(_d)
-        if fh_util is None and sd_util is None:
+        td_util = row.get("thirty_day_util")
+        if td_util is not None:
+            reset = row.get("thirty_day_reset")
+            lines.append(f"📊 30d: <b>{td_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+        if fh_util is None and sd_util is None and td_util is None:
             lines.append("📊 用量: <i>尚未获取</i>")
     else:
         lines.append("📊 用量: <i>尚未获取</i>")
@@ -371,6 +379,7 @@ def _format_usage_block(account_key: str) -> str:
     for label, util_k, reset_k in (
         ("⏱ 5h", "five_hour_util", "five_hour_reset"),
         ("📅 7d", "seven_day_util", "seven_day_reset"),
+        ("📆 30d", "thirty_day_util", "thirty_day_reset"),
         ("🤖 Sonnet 7d", "sonnet_util", "sonnet_reset"),
         ("🧠 Opus 7d", "opus_util", "opus_reset"),
     ):
@@ -1375,7 +1384,7 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
 
     def _labels_for(usage: dict) -> str:
         utils = oauth_manager.extract_utils_percent(usage)
-        tags = ["5h", "7d", "sonnet", "opus"]
+        tags = ["5h", "7d", "30d", "sonnet", "opus"]
         parts = [f"{t} {u:.0f}%" for t, u in zip(tags, utils) if u is not None]
         return " / ".join(parts) if parts else "无数据"
 
@@ -2078,7 +2087,7 @@ def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
         else:
             _evaluate_quota_action(saved_ak, usage_result)
             parts = []
-            for label, util in zip(("5h", "7d"), oauth_manager.extract_utils_percent(usage_result)[:2]):
+            for label, util in zip(("5h", "7d", "30d"), oauth_manager.extract_utils_percent(usage_result)[:3]):
                 if util is not None:
                     parts.append(f"{label} {util:.0f}%")
             quota_note = "\n额度: <code>" + ui.escape_html(" / ".join(parts) or "已获取") + "</code>"

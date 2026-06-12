@@ -198,6 +198,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
             utils = {
                 "5h": row.get("five_hour_util"),
                 "7d": row.get("seven_day_util"),
+                "30d": row.get("thirty_day_util"),
                 "Primary": row.get("codex_primary_used_pct"),
                 "Secondary": row.get("codex_secondary_used_pct"),
             }

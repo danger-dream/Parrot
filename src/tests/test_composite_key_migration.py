@@ -674,6 +674,29 @@ def test_flatten_usage_preserves_resets_and_extra(m):
     print("  [PASS] flatten_usage: preserves resets_at and normalized extra_usage fields")
 
 
+def test_flatten_usage_preserves_openai_thirty_day(m):
+    out = m["oauth_manager"].flatten_usage({
+        "five_hour": {},
+        "seven_day": {},
+        "openai": {
+            "thirty_day": {
+                "utilization": 8.0,
+                "resets_at": "2026-07-12T00:43:10Z",
+            }
+        },
+    })
+    assert out["five_hour_util"] is None
+    assert out["seven_day_util"] is None
+    assert out["thirty_day_util"] == 8.0
+    assert out["thirty_day_reset"] == "2026-07-12T00:43:10Z"
+    assert m["oauth_manager"].extract_utils_percent({
+        "five_hour": {},
+        "seven_day": {},
+        "openai": {"thirty_day": {"utilization": 8.0}},
+    })[:3] == [None, None, 8.0]
+    print("  [PASS] flatten_usage: preserves OpenAI 30d quota")
+
+
 # ==============================================================
 # main
 # ==============================================================
@@ -719,6 +742,7 @@ def main():
         test_flatten_usage_fractional_sub_one,
         test_flatten_usage_missing_utilization,
         test_flatten_usage_preserves_resets_and_extra,
+        test_flatten_usage_preserves_openai_thirty_day,
     ]
     passed = 0
     failed = 0
