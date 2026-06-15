@@ -1041,8 +1041,13 @@ def _notify_cross_process(text: str, chat_id, notify_msg_id, reply_markup=None) 
     if chat_id and notify_msg_id:
         try:
             from .telegram import ui as _ui
-            _ui.edit(int(chat_id), int(notify_msg_id), _ui.truncate(text), reply_markup=reply_markup)
-            edited = True
+            result = _ui.edit(int(chat_id), int(notify_msg_id), _ui.truncate(text), reply_markup=reply_markup)
+            edited = bool(isinstance(result, dict) and result.get("ok"))
+            if not edited:
+                desc = ""
+                if isinstance(result, dict):
+                    desc = str(result.get("description") or result)[:200]
+                print(f"[updater] cross-process edit not ok: {desc or result!r}")
         except Exception as exc:
             print(f"[updater] cross-process edit failed: {exc}")
     if not edited:

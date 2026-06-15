@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 import socket
 import time
 import traceback
@@ -578,10 +579,113 @@ def _is_invalid_encrypted_content_error(error_detail: Optional[str]) -> bool:
     )
 
 
+_CONTEXT_OVERFLOW_HINT_RE = re.compile(
+    r"context.*(?:overflow|too\s+(?:large|long)|exceed|limit|max(?:imum)?|tokens)"
+    r"|context window.*(?:exceed|over|limit|max(?:imum)?|requested|sent|tokens)"
+    r"|prompt.*(?:too\s+(?:large|long)|exceed|over|limit|max(?:imum)?)"
+    r"|(?:request|input).*(?:context|window|length|token).*"
+    r"(?:too\s+(?:large|long)|exceed|over|limit|max(?:imum)?)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_rate_limit_or_quota(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "rate_limit",
+            "requests per minute",
+            "tokens per minute",
+            "request per minute",
+            "token per minute",
+            "quota",
+        )
+    ) or re.search(r"\b(?:rpm|tpm)\b", text) is not None
+
+
+def _is_context_length_exceeded_error(error_detail: Optional[str]) -> bool:
+    """Return True for provider/client errors that mean the prompt is too large.
+
+    These are request-scoped errors: trying another channel for the same model and
+    unchanged transcript just burns quota and cools healthy channels. The session
+    owner downstream must decide whether/how to compact.
+    """
+    raw = str(error_detail or "")
+    low = raw.lower()
+    if not low:
+        return False
+
+    # Groq and some OpenAI-compatible providers use token wording for TPM/RPM
+    # rate limits. Those must remain ordinary upstream/rate-limit failures.
+    if _looks_like_rate_limit_or_quota(low):
+        return False
+
+    precise_markers = (
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "model_context_window_exceeded",
+        "request_too_large",
+    )
+    if any(marker in low for marker in precise_markers):
+        return True
+
+    direct_phrases = (
+        "request exceeds the maximum size",
+        "context length exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "prompt too long",
+        "exceeds model context window",
+        "model token limit",
+        "exceed context limit",
+        "exceeds the model's maximum context",
+        "input is too long for this model",
+        "input too long for the model",
+        "input exceeds the maximum number of tokens",
+    )
+    if any(phrase in low for phrase in direct_phrases):
+        return True
+
+    has_request_size_exceeds = "request size exceeds" in low
+    has_context_window = (
+        "context window" in low
+        or "context length" in low
+        or "maximum context length" in low
+    )
+    if has_request_size_exceeds and has_context_window:
+        return True
+    if "input length" in low and "exceed" in low and "context" in low:
+        return True
+    if "max_tokens" in low and "exceed" in low and "context" in low:
+        return True
+    if "413" in low and "too large" in low:
+        return True
+    if any(phrase in raw for phrase in ("上下文过长", "上下文超出", "上下文长度超", "超出最大上下文", "请压缩上下文")):
+        return True
+
+    return bool(_CONTEXT_OVERFLOW_HINT_RE.search(raw))
+
+
+def _request_invalid_status(result: AttemptResult) -> int:
+    if isinstance(result.http_status, int) and 400 <= result.http_status < 500:
+        return int(result.http_status)
+    return 400
+
+
+def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
+    result.outcome = "request_invalid"
+    result.http_status = int(status)
+    if result.response is None:
+        result.stream_started = False
+    return result
+
+
 def _request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
     if _is_invalid_encrypted_content_error(result.error_detail):
-        result.outcome = "request_invalid"
-        result.http_status = 400
+        return _mark_request_invalid(result, 400)
+    if _is_context_length_exceeded_error(result.error_detail):
+        return _mark_request_invalid(result, _request_invalid_status(result))
     return result
 
 
@@ -957,7 +1061,7 @@ async def run_failover(
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
             )
             return _json_error_for_ingress(
-                ingress_protocol, status, errors.ErrType.INVALID_REQUEST, msg
+                ingress_protocol, status, errors.classify_http_status(status), msg
             )
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
@@ -1105,7 +1209,7 @@ async def run_failover(
                         upstream_protocol=getattr(ch, "protocol", "anthropic"),
                     )
                     return _json_error_for_ingress(
-                        ingress_protocol, status, errors.ErrType.INVALID_REQUEST, msg
+                        ingress_protocol, status, errors.classify_http_status(status), msg
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
                 if _should_cooldown(result.outcome):

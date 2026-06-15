@@ -119,6 +119,17 @@ def http_400():
     return httpx.Response(400, json={"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}})
 
 
+def openai_context_length_error():
+    return httpx.Response(200, json={
+        "error": {
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            "param": "input",
+        }
+    })
+
+
 def sse_ok():
     payload = (
         b'data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":2}}}\n\n'
@@ -134,6 +145,15 @@ def sse_ok():
 
 def sse_first_event_error():
     payload = b'data: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n'
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
+def sse_first_event_context_length_error():
+    payload = (
+        b'data: {"type":"error","error":{"type":"invalid_request_error",'
+        b'"message":"prompt is too long: 200001 tokens > 200000 maximum"}}\n\n'
+    )
     return httpx.Response(200, content=payload,
                           headers={"content-type": "text/event-stream"})
 
@@ -169,6 +189,19 @@ def responses_sse_chunked_metadata_then_error():
         b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","status":"in_progress"}}\n\n',
         b'event: error\n'
         b'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":2}\n\n',
+    ]
+    return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                          headers={"content-type": "text/event-stream"})
+
+
+def responses_sse_chunked_metadata_then_context_length_error():
+    chunks = [
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}}\n\n',
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","status":"in_progress"}}\n\n',
+        b'event: error\n'
+        b'data: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}\n\n',
     ]
     return httpx.Response(200, stream=ChunkedByteStream(chunks),
                           headers={"content-type": "text/event-stream"})
@@ -506,6 +539,36 @@ async def test_400_switches_no_cooldown(m):
     print("  [PASS] 400 switch → next success")
 
 
+async def test_context_length_error_short_circuits_failover(m):
+    _setup(m)
+    router = MockRouter()
+    chb_calls = {"count": 0}
+
+    def chb_handler(req):
+        chb_calls["count"] += 1
+        return responses_sse_ok()
+
+    router.register("https://cha", lambda r: openai_context_length_error())
+    router.register("https://chb", chb_handler)
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    chB = _make_openai_channel("chB", "https://chb", protocol="openai-responses")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "gpt-5.5", "stream": False, "store": False,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="responses")
+    assert resp.status_code == 400, f"expected 400, got {resp.status_code} body={getattr(resp, 'body', b'')[:500]!r}"
+    await mc.aclose()
+
+    assert chb_calls["count"] == 0
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "error", log["log"]
+    assert len(log["retry_chain"]) == 1
+    assert log["retry_chain"][0]["outcome"] == "request_invalid"
+    assert not m["cooldown"].is_blocked("api:chA", "gpt-5.5")
+    print("  [PASS] context_length_exceeded → request_invalid 400 without failover")
+
+
 async def test_stream_success_full_forward(m):
     _setup(m)
     router = MockRouter()
@@ -557,6 +620,37 @@ async def test_stream_first_event_error_switches(m):
     outcomes = [a["outcome"] for a in log["retry_chain"]]
     assert outcomes == ["upstream_error_json", "success"], outcomes
     print("  [PASS] stream first event error → switch → chB ok")
+
+
+async def test_stream_context_length_first_event_short_circuits_failover(m):
+    _setup(m)
+    router = MockRouter()
+    chb_calls = {"count": 0}
+
+    def chb_handler(req):
+        chb_calls["count"] += 1
+        return sse_ok()
+
+    router.register("https://cha", lambda r: sse_first_event_context_length_error())
+    router.register("https://chb", chb_handler)
+    chA = _make_channel(m, "chA", "https://cha")
+    chB = _make_channel(m, "chB", "https://chb")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    assert resp.status_code == 400
+    await mc.aclose()
+
+    assert chb_calls["count"] == 0
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "error", log["log"]
+    assert len(log["retry_chain"]) == 1
+    assert log["retry_chain"][0]["outcome"] == "request_invalid"
+    assert "prompt is too long" in log["log"]["error_message"]
+    assert not m["cooldown"].is_blocked("api:chA", "glm-5")
+    print("  [PASS] stream context overflow first event → request_invalid 400 without failover")
 
 
 async def test_stream_midstream_error_logs_upstream_error(m):
@@ -637,6 +731,37 @@ async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m)
     outcomes = [a["outcome"] for a in log["retry_chain"]]
     assert outcomes == ["upstream_error_json", "success"], outcomes
     print("  [PASS] responses chunked metadata→error before visible chunk → switch → chB ok")
+
+
+async def test_responses_context_length_before_visible_chunk_short_circuits_failover(m):
+    _setup(m)
+    router = MockRouter()
+    chb_calls = {"count": 0}
+
+    def chb_handler(req):
+        chb_calls["count"] += 1
+        return responses_sse_ok()
+
+    router.register("https://cha", lambda r: responses_sse_chunked_metadata_then_context_length_error())
+    router.register("https://chb", chb_handler)
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    chB = _make_openai_channel("chB", "https://chb", protocol="openai-responses")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "gpt-5.5", "stream": True, "store": False,
+            "input": [{"role": "user", "content": [{"type":"input_text", "text":"hi"}]}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="responses")
+    assert resp.status_code == 400
+    await mc.aclose()
+
+    assert chb_calls["count"] == 0
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "error", log["log"]
+    assert len(log["retry_chain"]) == 1
+    assert log["retry_chain"][0]["outcome"] == "request_invalid"
+    assert "context_length_exceeded" in log["log"]["error_message"]
+    assert not m["cooldown"].is_blocked("api:chA", "gpt-5.5")
+    print("  [PASS] responses metadata→context overflow before visible chunk → request_invalid 400 without failover")
 
 
 async def test_responses_to_chat_error_after_item_added_before_chat_bytes_switches(m):
@@ -845,11 +970,14 @@ async def amain():
         test_non_stream_500_then_ok,
         test_all_fail_503,
         test_400_switches_no_cooldown,
+        test_context_length_error_short_circuits_failover,
         test_stream_success_full_forward,
         test_stream_first_event_error_switches,
+        test_stream_context_length_first_event_short_circuits_failover,
         test_stream_midstream_error_logs_upstream_error,
         test_responses_error_before_visible_chunk_switches,
         test_responses_chunked_metadata_error_before_visible_chunk_switches,
+        test_responses_context_length_before_visible_chunk_short_circuits_failover,
         test_responses_to_chat_error_after_item_added_before_chat_bytes_switches,
         test_stream_blacklist_switch,
         test_affinity_pins_channel,

@@ -327,6 +327,28 @@ class TestVersionLogic:
         assert any(b.get("ref") == "src-0.22.1-xxx" for b in backups)
 
 
+# ─── 跨进程 TG 回填 ──────────────────────────────────────────────
+
+class TestCrossProcessNotify:
+    def test_fallback_when_edit_returns_not_ok(self, monkeypatch):
+        calls = []
+
+        from src.telegram import ui as tgui
+
+        def fake_edit(chat_id, message_id, text, reply_markup=None):
+            calls.append(("edit", chat_id, message_id, text, reply_markup))
+            return {"ok": False, "description": "Bad Request: message to edit not found"}
+
+        monkeypatch.setattr(tgui, "truncate", lambda text: text)
+        monkeypatch.setattr(tgui, "edit", fake_edit)
+        monkeypatch.setattr(updater.notifier, "notify_event", lambda kind, text, reply_markup=None: calls.append(("notify", kind, text, reply_markup)))
+
+        updater._notify_cross_process("done", 123, 456, reply_markup={"inline_keyboard": []})
+
+        assert calls[0][0] == "edit"
+        assert calls[1] == ("notify", "app_update", "done", {"inline_keyboard": []})
+
+
 # ─── stage_update（mock 外部命令）─────────────────────────────────
 
 class TestStageUpdate:
