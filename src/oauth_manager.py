@@ -553,6 +553,21 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                     old_identity = _openai_workspace_id(acc)
                     if old_identity and str(data[k]) != old_identity:
                         continue
+                if k == "workspace_name":
+                    incoming_name = str(data[k] or "").strip()
+                    existing_name = str(acc.get("workspace_name") or "").strip()
+                    existing_type = str(acc.get("workspace_type") or acc.get("plan_type") or "").lower()
+                    # OpenAI accounts/check can report Team workspaces with a
+                    # generic display name like "Personal". Do not overwrite a
+                    # previously curated Team workspace label (SP/AU/UK/IN/AU2,
+                    # etc.) with that generic Personal label during refresh.
+                    if (
+                        incoming_name.lower() == "personal"
+                        and "team" in existing_type
+                        and existing_name
+                        and existing_name.lower() not in {"personal", "workspace", "team"}
+                    ):
+                        continue
                 new_fields[k] = data[k]
 
         # Claude: refresh 后 best-effort 拉 profile 更新套餐信息
@@ -936,6 +951,7 @@ def flatten_usage(usage: dict) -> dict:
 
     fh = usage.get("five_hour") or {}
     sd = usage.get("seven_day") or {}
+    td = ((usage.get("openai") or {}).get("thirty_day") or {})
     sds = usage.get("seven_day_sonnet") or {}
     sdo = usage.get("seven_day_opus") or {}
     extra = usage.get("extra_usage") or {}
@@ -946,6 +962,8 @@ def flatten_usage(usage: dict) -> dict:
         "five_hour_reset": fh.get("resets_at"),
         "seven_day_util": _util_pct(sd),
         "seven_day_reset": sd.get("resets_at"),
+        "thirty_day_util": _util_pct(td),
+        "thirty_day_reset": td.get("resets_at"),
         "sonnet_util": _util_pct(sds),
         "sonnet_reset": sds.get("resets_at"),
         "opus_util": _util_pct(sdo),
@@ -958,11 +976,12 @@ def flatten_usage(usage: dict) -> dict:
 
 
 def extract_utils_percent(usage: dict) -> list[float | None]:
-    """返回 [five_hour, seven_day, sonnet, opus] 的百分比（None 表示该指标缺失）。"""
+    """返回 [five_hour, seven_day, 30d, sonnet, opus] 的百分比（None 表示该指标缺失）。"""
     flat = flatten_usage(usage)
     return [
         flat["five_hour_util"],
         flat["seven_day_util"],
+        flat.get("thirty_day_util"),
         flat["sonnet_util"],
         flat["opus_util"],
     ]
@@ -1117,7 +1136,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             threshold = 95.0
 
     utils = extract_utils_percent(usage)
-    window_labels = ["5h", "7d", "sonnet", "opus"]
+    window_labels = ["5h", "7d", "30d", "sonnet", "opus"]
     hit_windows = [lbl for lbl, u in zip(window_labels, utils)
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)

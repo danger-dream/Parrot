@@ -591,6 +591,24 @@ def _wham_window_block(win: dict | None) -> dict:
     }
 
 
+def _wham_window_looks_monthly(win: dict) -> bool:
+    """Return True when a WHAM window is clearly longer than a weekly quota."""
+    sec = _coerce_int(win.get("limit_window_seconds"))
+    if sec is not None:
+        return sec > 8 * 86400
+
+    resets_at = win.get("resets_at")
+    if isinstance(resets_at, str) and resets_at:
+        try:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+            return (dt - datetime.now(timezone.utc)).total_seconds() > 8 * 86400
+        except Exception:
+            return False
+    return False
+
+
 def normalize_wham_usage(payload: dict) -> dict:
     """把 ChatGPT `backend-api/wham/usage` 响应规范成通用 usage 结构。
 
@@ -612,6 +630,7 @@ def normalize_wham_usage(payload: dict) -> dict:
 
     five_hour: dict = {}
     seven_day: dict = {}
+    thirty_day: dict = {}
     if len(windows) >= 2:
         # 有窗口长度时，小窗口归 5h，大窗口归 7d。缺长度的排到后面；
         # 两个都缺时按 wham 当前语义 fallback：primary=5h、secondary=7d。
@@ -634,8 +653,18 @@ def normalize_wham_usage(payload: dict) -> dict:
         else:
             seven_day = dict(block)
 
+    # Preserve the original 5h/7d mapping above. Add only one extra case: when
+    # WHAM returns no 5h window and the sole large window is clearly ~30d, expose
+    # it separately instead of showing it as a misleading 7d quota.
+    if not five_hour and seven_day and _wham_window_looks_monthly(seven_day):
+        thirty_day = dict(seven_day)
+        seven_day = {}
+
+    if thirty_day.get("limit_window_seconds") is not None:
+        thirty_day["window_seconds"] = thirty_day.get("limit_window_seconds")
+
     # 内部辅助字段不写进通用展示路径。
-    for block in (five_hour, seven_day):
+    for block in (five_hour, seven_day, thirty_day):
         block.pop("limit_window_seconds", None)
 
     credits = payload.get("credits") if isinstance(payload, dict) else None
@@ -668,6 +697,7 @@ def normalize_wham_usage(payload: dict) -> dict:
             "allowed": rate.get("allowed"),
             "limit_reached": rate.get("limit_reached"),
             "rate_limit_reached_type": payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None,
+            "thirty_day": thirty_day,
         },
     }
 
