@@ -1498,6 +1498,12 @@ class _ManagedWsConnection:
         try:
             return await self._ws.close(*args, **kwargs)
         finally:
+            wait_closed = getattr(self._ws, "wait_closed", None)
+            if wait_closed is not None:
+                try:
+                    await wait_closed()
+                except Exception:
+                    pass
             if not self._cleanup_done:
                 self._cleanup_done = True
                 await self._cleanup()
@@ -1574,7 +1580,7 @@ async def _open_socket_via_ss2022(
             # coroutine finalizer (prevents "coroutine ignored GeneratorExit").
             shutdown_sock(right)
 
-    async def cleanup() -> None:
+    async def cleanup(*, close_ws_sock: bool = False) -> None:
         nonlocal cleanup_done
         async with cleanup_lock:
             if cleanup_done:
@@ -1584,7 +1590,15 @@ async def _open_socket_via_ss2022(
             for task in tasks:
                 task.cancel()
             shutdown_sock(right)
-            shutdown_sock(left)
+            # `left` is handed to websockets.connect(sock=left). Once the
+            # handshake succeeds, asyncio's transport owns that fd and must be
+            # allowed to unregister/close it itself. Closing it here can race
+            # with the event loop and poison future connects with:
+            #   File descriptor N is used by transport <_SelectorSocketTransport ...>
+            # Only close it on the pre-handshake failure path where websockets
+            # never took ownership.
+            if close_ws_sock:
+                shutdown_sock(left)
             try:
                 await conn.close()
             except Exception:
@@ -1625,7 +1639,7 @@ async def _connect_oauth_responses_ws(
         try:
             ws = await websockets.connect(url, proxy=None, sock=sock, **kwargs)
         except BaseException:
-            await cleanup()
+            await cleanup(close_ws_sock=True)
             raise
         return _ManagedWsConnection(ws, cleanup)
     return await websockets.connect(url, proxy=None, **kwargs)
@@ -1943,6 +1957,7 @@ async def _try_openai_oauth_responses_ws_channel(
     last_error: Optional[AttemptResult] = None
     proxy_attempt_order = 0
     for route_name, connector in _resolve_ws_route_chain_for_channel(ch, resolved_model):
+        route_error: Optional[AttemptResult] = None
         proxy_name = None if connector is None else route_name
         proxy_bytes = _WsProxyBytes()
         t0 = time.time()
@@ -2020,7 +2035,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 upstream_ws = None
             return result
         except asyncio.TimeoutError:
-            last_error = AttemptResult(
+            route_error = AttemptResult(
                 outcome="connect_timeout",
                 error_detail=f"connect timeout > {connect_timeout}s",
                 proxy_name=proxy_name,
@@ -2029,7 +2044,7 @@ async def _try_openai_oauth_responses_ws_channel(
             )
         except InvalidStatus as exc:
             status, detail = _invalid_ws_status_detail(exc)
-            last_error = AttemptResult(
+            route_error = AttemptResult(
                 outcome="http_auth_error" if status in (401, 403) else "http_error",
                 error_detail=detail,
                 http_status=status,
@@ -2038,7 +2053,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 proxy_bytes_down=proxy_bytes.down,
             )
         except Exception as exc:
-            last_error = AttemptResult(
+            route_error = AttemptResult(
                 outcome="connect_error",
                 error_detail=f"connect error: {exc}"[:2000],
                 proxy_name=proxy_name,
@@ -2046,12 +2061,12 @@ async def _try_openai_oauth_responses_ws_channel(
                 proxy_bytes_down=proxy_bytes.down,
             )
         finally:
-            if proxy_attempt_id is not None and last_error is not None:
+            if proxy_attempt_id is not None and route_error is not None:
                 try:
                     log_db.update_proxy_attempt(
                         proxy_attempt_id, connect_ms=int((time.time() - t0) * 1000), ended_at=time.time(),
-                        outcome=last_error.outcome,
-                        error_detail=(last_error.error_detail or "")[:4000] if last_error.error_detail else None,
+                        outcome=route_error.outcome,
+                        error_detail=(route_error.error_detail or "")[:4000] if route_error.error_detail else None,
                         bytes_up=proxy_bytes.up, bytes_down=proxy_bytes.down,
                     )
                 except Exception:
@@ -2061,9 +2076,11 @@ async def _try_openai_oauth_responses_ws_channel(
                     await upstream_ws.close()
                 except Exception:
                     pass
-        if connector is not None and last_error is not None:
+        if route_error is not None:
+            last_error = route_error
+        if connector is not None and route_error is not None:
             connector.stats.total_failures += 1
-            connector.stats.last_error = (last_error.error_detail or last_error.outcome)[:200]
+            connector.stats.last_error = (route_error.error_detail or route_error.outcome)[:200]
         continue
 
     return last_error or AttemptResult(outcome="proxy_connect_error", error_detail="proxy route has no usable target")

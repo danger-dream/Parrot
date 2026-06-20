@@ -1085,6 +1085,8 @@ def test_failover_ss2022_ws_wrapper_close_runs_cleanup_once(m):
         response = None
         async def close(self, *args, **kwargs):
             called.append("ws")
+        async def wait_closed(self):
+            called.append("wait_closed")
 
     async def cleanup():
         called.append("cleanup")
@@ -1092,7 +1094,7 @@ def test_failover_ss2022_ws_wrapper_close_runs_cleanup_once(m):
     wrapped = m["failover"]._ManagedWsConnection(DummyWs(), cleanup)
     asyncio.run(wrapped.close())
     asyncio.run(wrapped.close())
-    assert called == ["ws", "cleanup", "ws"]
+    assert called == ["ws", "wait_closed", "cleanup", "ws", "wait_closed"]
 
 
 def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeypatch, m):
@@ -1103,9 +1105,10 @@ def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeyp
     cleaned = []
 
     async def fake_open(url, connector, proxy_bytes, *, timeout):
-        async def cleanup():
-            cleaned.append(True)
-            left.close()
+        async def cleanup(*, close_ws_sock=False):
+            cleaned.append(close_ws_sock)
+            if close_ws_sock:
+                left.close()
             right.close()
         return left, cleanup
 
@@ -1123,6 +1126,65 @@ def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeyp
     assert cleaned == [True]
     assert left.fileno() == -1
     assert right.fileno() == -1
+
+
+def test_failover_ss2022_cleanup_leaves_ws_owned_socket_after_success(monkeypatch, m):
+    _setup(m)
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    cleaned = []
+
+    async def fake_open(url, connector, proxy_bytes, *, timeout):
+        async def cleanup(*, close_ws_sock=False):
+            cleaned.append(close_ws_sock)
+            if close_ws_sock:
+                left.close()
+            right.close()
+        return left, cleanup
+
+    class DummyWs:
+        response = None
+        async def close(self, *args, **kwargs):
+            pass
+        async def wait_closed(self):
+            pass
+
+    async def fake_connect(*args, **kwargs):
+        return DummyWs()
+
+    monkeypatch.setattr(m["failover"], "_open_socket_via_ss2022", fake_open)
+    monkeypatch.setattr(m["failover"].websockets, "connect", fake_connect)
+    connector = m["failover"].SS2022Connector("dummy", "127.0.0.1", 1, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA")
+    wrapped = asyncio.run(m["failover"]._connect_oauth_responses_ws(
+        "wss://example.invalid/v1/responses",
+        headers={}, connector=connector, proxy_bytes=m["failover"]._WsProxyBytes(), open_timeout=1,
+    ))
+    asyncio.run(wrapped.close())
+    assert cleaned == [False]
+    assert left.fileno() != -1
+    assert right.fileno() == -1
+    left.close()
+
+
+def test_responses_ws_ss2022_ws_wrapper_close_runs_cleanup_once(m):
+    _setup(m)
+    called = []
+
+    class DummyWs:
+        response = None
+        async def close(self, *args, **kwargs):
+            called.append("ws")
+        async def wait_closed(self):
+            called.append("wait_closed")
+
+    async def cleanup():
+        called.append("cleanup")
+
+    wrapped = m["responses_ws"]._ManagedWsConnection(DummyWs(), cleanup)
+    asyncio.run(wrapped.close())
+    asyncio.run(wrapped.close())
+    assert called == ["ws", "wait_closed", "cleanup", "ws", "wait_closed"]
 
 
 @pytest.mark.asyncio

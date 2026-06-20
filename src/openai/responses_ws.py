@@ -1193,6 +1193,32 @@ def _http_url_to_ws(url: str) -> str:
     return urlunparse((scheme, p.netloc, p.path or "", p.params, p.query, p.fragment))
 
 
+class _ManagedWsConnection:
+    """WebSocket connection plus deterministic SS2022 bridge cleanup."""
+
+    def __init__(self, ws, cleanup):
+        self._ws = ws
+        self._cleanup = cleanup
+        self._cleanup_done = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._ws, name)
+
+    async def close(self, *args, **kwargs):
+        try:
+            return await self._ws.close(*args, **kwargs)
+        finally:
+            wait_closed = getattr(self._ws, "wait_closed", None)
+            if wait_closed is not None:
+                try:
+                    await wait_closed()
+                except Exception:
+                    pass
+            if not self._cleanup_done:
+                self._cleanup_done = True
+                await self._cleanup()
+
+
 async def _connect_upstream_ws(
     url: str,
     *,
@@ -1217,8 +1243,13 @@ async def _connect_upstream_ws(
     if isinstance(connector, SOCKS5Connector):
         return await websockets.connect(url, proxy=_socks5h_url(connector.url), **kwargs)
     if isinstance(connector, SS2022Connector):
-        sock = await _open_socket_via_ss2022(url, connector, proxy_bytes, timeout=open_timeout)
-        return await websockets.connect(url, proxy=None, sock=sock, **kwargs)
+        sock, cleanup = await _open_socket_via_ss2022(url, connector, proxy_bytes, timeout=open_timeout)
+        try:
+            ws = await websockets.connect(url, proxy=None, sock=sock, **kwargs)
+        except BaseException:
+            await cleanup(close_ws_sock=True)
+            raise
+        return _ManagedWsConnection(ws, cleanup)
     return await websockets.connect(url, proxy=None, **kwargs)
 
 
@@ -1251,46 +1282,79 @@ async def _open_socket_via_ss2022(
     left, right = socket.socketpair()
     left.setblocking(False)
     right.setblocking(False)
+    stop = asyncio.Event()
+    tasks: list[asyncio.Task] = []
+    cleanup_lock = asyncio.Lock()
+    cleanup_done = False
+
+    def shutdown_sock(sock) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
 
     async def pump_sock_to_ss() -> None:
         try:
-            while True:
+            while not stop.is_set():
                 data = await loop.sock_recv(right, 65536)
                 if not data:
                     return
                 proxy_bytes.count(up=len(data))
                 await conn.write(data)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
         finally:
-            try:
-                await conn.close()
-            except Exception:
-                pass
+            stop.set()
 
     async def pump_ss_to_sock() -> None:
         try:
-            while True:
+            while not stop.is_set():
                 data = await conn.read(65536)
                 if not data:
                     return
                 proxy_bytes.count(down=len(data))
                 await loop.sock_sendall(right, data)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
         finally:
-            try:
-                right.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                right.close()
-            except Exception:
-                pass
+            stop.set()
+            shutdown_sock(right)
 
-    asyncio.create_task(pump_sock_to_ss())
-    asyncio.create_task(pump_ss_to_sock())
-    return left
+    async def cleanup(*, close_ws_sock: bool = False) -> None:
+        nonlocal cleanup_done
+        async with cleanup_lock:
+            if cleanup_done:
+                return
+            cleanup_done = True
+            stop.set()
+            for task in tasks:
+                task.cancel()
+            shutdown_sock(right)
+            # After websockets.connect(sock=left) succeeds, asyncio owns left's
+            # fd and must unregister it before close.  Closing it here races the
+            # selector and can poison later connects with "fd is used by
+            # transport".  Only close left if the WS handshake never took
+            # ownership.
+            if close_ws_sock:
+                shutdown_sock(left)
+            try:
+                await conn.close()
+            except Exception:
+                pass
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    tasks.append(asyncio.create_task(pump_sock_to_ss()))
+    tasks.append(asyncio.create_task(pump_ss_to_sock()))
+    return left, cleanup
 
 
 def _ws_proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
