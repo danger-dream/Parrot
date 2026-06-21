@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
 import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from urllib.parse import urlparse, urlunparse
 
+import httpx
 import websockets
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
@@ -42,14 +41,35 @@ from .codex_identity_confuse import (
     ConfuseState,
     confuse_client_metadata,
     confuse_headers as confuse_identity_headers,
-    expose_response_payload,
 )
 from ..client_ip import get_client_ip
-from ..openai.transform import common as openai_common
-from ..openai.transform import codex_oauth_transform
 from ..openai.transform.guard import GuardError, guard_responses_ingress
 from ..openai.transform.responses_to_chat import resolve_current_input_items
-from ..proxy.connector import SS2022Connector, SOCKS5Connector, DirectConnector
+from ..proxy.connector import SS2022Connector, SOCKS5Connector
+from ..protocols import finalize as finalize_policy
+from ..protocols.runtime import (
+    format_responses_ws_error,
+    is_responses_ws_visible_event_type,
+    is_retryable_responses_ws_error_before_accept,
+    parse_wrapped_responses_ws_error,
+    responses_ws_http_status_from_attempt,
+    should_cooldown,
+    ws_close_code_for_http_status,
+)
+from ..transports import (
+    connect_upstream_ws,
+    http_url_to_ws,
+    legacy_socks5_connector,
+    open_socket_via_ss2022,
+    read_next_responses_ws_step,
+    read_until_first_responses_ws_visible_event,
+    resolve_ws_route_chain,
+    socks5h_url,
+    WsProxyBytes,
+    ws_event_type,
+    ws_frame_size,
+    ws_route_kwargs,
+)
 from .handler import (
     _count_msg_tool,
     _maybe_apply_auto_prompt_cache_key,
@@ -57,13 +77,16 @@ from .handler import (
     _sanitize_headers,
     _store_enabled,
 )
-
-# Codex source: codex-rs/core/src/client.rs
-from .codex_constants import (
-    CODEX_CLI_VERSION as _CODEX_CLI_VERSION,
-    CODEX_CLI_USER_AGENT as _CODEX_CLI_UA,
-    CODEX_ORIGINATOR as _CODEX_ORIGINATOR,
-    RESPONSES_WEBSOCKETS_BETA as _RESPONSES_WEBSOCKETS_BETA,
+from .responses_ws_runtime import (
+    dump_frame,
+    identity_expose_frame,
+    identity_log_text,
+    loads_frame,
+    map_ws_create_frame_for_upstream,
+    merge_responses_ws_headers,
+    request_body_from_ws_create,
+    sync_prompt_cache_key_to_ws_create,
+    sync_translated_body_to_ws_create,
 )
 
 # Headers used by Codex Responses WS. Most clients will send these to Parrot;
@@ -80,27 +103,8 @@ _FORWARD_CLIENT_HEADERS = {
     "x-client-request-id",
 }
 
-_SKIP_UPSTREAM_HEADERS = {
-    "host",
-    "connection",
-    "upgrade",
-    "sec-websocket-key",
-    "sec-websocket-version",
-    "sec-websocket-extensions",
-    "sec-websocket-protocol",
-    "content-length",
-    "accept-encoding",
-}
 
-
-@dataclass
-class _WsProxyBytes:
-    up: int = 0
-    down: int = 0
-
-    def count(self, up: int = 0, down: int = 0) -> None:
-        self.up += int(up or 0)
-        self.down += int(down or 0)
+_WsProxyBytes = WsProxyBytes
 
 
 @dataclass
@@ -121,10 +125,12 @@ class _WsAttemptResult:
         "cache_read": 0,
     })
     response_text: str = ""
+    response_id: Optional[str] = None
     output_items: list[dict] = field(default_factory=list)
     proxy_name: Optional[str] = None
     proxy_bytes: _WsProxyBytes = field(default_factory=_WsProxyBytes)
     upstream_protocol: str = "openai-responses"
+    upstream_transport: str = "ws"
     translator_ctx: Optional[dict] = None
 
 
@@ -237,14 +243,6 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await websocket.close(code=4401, reason=_trim_reason(err))
         return
 
-    allowed_protos = auth.get_allowed_protocols(key_name)
-    if allowed_protos and "responses" not in allowed_protos:
-        await websocket.close(
-            code=4403,
-            reason=_trim_reason("protocol 'responses' is not allowed for this API key"),
-        )
-        return
-
     # A WebSocket server cannot read data frames until it accepts the upgrade.
     # Auth / protocol checks happen before this point; model-specific validation
     # follows after the first response.create frame.
@@ -307,6 +305,9 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         guard_responses_ingress(body, store_enabled=_store_enabled())
     except GuardError as ge:
         await websocket.close(code=_ws_close_code_for_http(ge.status), reason=_trim_reason(ge.message))
+        return
+    if body.get("background") is True:
+        await websocket.close(code=4400, reason=_trim_reason("background async response is not supported on Responses WebSocket"))
         return
 
     # WS transport is streaming by definition. Ensure the upstream payload matches
@@ -519,9 +520,15 @@ async def _run_ws_failover(
                 except Exception:
                     pass
 
-        if _should_cooldown(result.outcome):
-            cooldown.record_error(ch.key, resolved_model, result.error_detail)
-        scorer.record_failure(ch.key, resolved_model, connect_ms=result.connect_ms)
+        finalize_policy.apply_error_health_effects(
+            finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+            scorer=scorer,
+            cooldown=cooldown,
+            channel_key=ch.key,
+            model=resolved_model,
+            error_detail=result.error_detail,
+            connect_ms=result.connect_ms,
+        )
         retry_count += 1
         idx += 1
 
@@ -589,9 +596,15 @@ async def _run_ws_failover(
                         affinity_hit, start_time,
                     )
                     return accepted
-                if _should_cooldown(result.outcome):
-                    cooldown.record_error(ch.key, resolved_model, result.error_detail)
-                scorer.record_failure(ch.key, resolved_model, connect_ms=result.connect_ms)
+                finalize_policy.apply_error_health_effects(
+                    finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                    scorer=scorer,
+                    cooldown=cooldown,
+                    channel_key=ch.key,
+                    model=resolved_model,
+                    error_detail=result.error_detail,
+                    connect_ms=result.connect_ms,
+                )
                 retry_count += 1
             else:
                 msg = f"All candidate channels saturated; queue wait {queue_wait_s:.0f}s timed out."
@@ -617,7 +630,7 @@ async def _run_ws_failover(
         http_status=http_status,
         affinity_hit=affinity_hit,
         upstream_protocol=(getattr(last_ch, "protocol", "openai-responses") if last_ch else None),
-        upstream_transport="ws" if last_ch is not None else None,
+        upstream_transport=(last_result.upstream_transport if last_result and last_ch is not None else ("ws" if last_ch is not None else None)),
         proxy_name=(last_result.proxy_name if last_result else None),
         proxy_bytes_up=(last_result.proxy_bytes.up if last_result else None),
         proxy_bytes_down=(last_result.proxy_bytes.down if last_result else None),
@@ -658,12 +671,21 @@ async def _try_ws_channel(
     first_byte_timeout = int(timeouts.get("firstByte", 30))
     idle_timeout = int(timeouts.get("idle", 120))
 
+    if _responses_ws_upstream_transport(ch) == "sse":
+        return await _try_sse_channel(
+            websocket, first_obj=first_obj, ch=ch, resolved_model=resolved_model, body=body,
+            deadline_ts=deadline_ts, start_time=start_time, request_id=request_id,
+            retry_count_so_far=retry_count_so_far, affinity_hit=affinity_hit,
+            api_key_name=api_key_name, client_ip=client_ip, fp_query=fp_query, client_key=client_key,
+        )
+
     try:
         upstream_req = await _build_ws_upstream_request(ch, body, resolved_model, websocket=websocket)
     except Exception as exc:
         if hasattr(exc, "status") and hasattr(exc, "message"):
+            outcome = "candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "guard_error"
             return _WsAttemptResult(
-                outcome="guard_error",
+                outcome=outcome,
                 error_detail=str(getattr(exc, "message", exc))[:2000],
                 http_status=int(getattr(exc, "status", 400)),
                 upstream_protocol=ch_proto,
@@ -779,6 +801,323 @@ async def _try_ws_channel(
     )
 
 
+def _responses_ws_upstream_transport(ch: Channel) -> str:
+    """Return the upstream transport for Responses WS ingress.
+
+    Existing behavior is WebSocket.  An explicit channel hint can route the
+    WebSocket ingress to a normal HTTP/SSE Responses upstream, used by the
+    protocol-runtime transport bridge tests and by providers that do not expose
+    Responses WebSocket.
+    """
+    if isinstance(ch, OpenAIOAuthChannel):
+        return "ws"
+    value = str(getattr(ch, "responses_ws_upstream_transport", "ws") or "ws").strip().lower()
+    return "sse" if value in ("sse", "http-sse", "http_sse") else "ws"
+
+
+async def _try_sse_channel(
+    websocket: WebSocket,
+    *,
+    first_obj: dict,
+    ch: Channel,
+    resolved_model: str,
+    body: dict,
+    deadline_ts: float,
+    start_time: float,
+    request_id: str,
+    retry_count_so_far: int,
+    affinity_hit: int,
+    api_key_name: str,
+    client_ip: str,
+    fp_query: Optional[str],
+    client_key: Optional[str],
+) -> _WsAttemptResult:
+    ch_proto = getattr(ch, "protocol", "anthropic")
+    cfg = config.get()
+    timeouts = cfg.get("timeouts") or {}
+    connect_timeout = int(timeouts.get("connect", 10))
+    first_byte_timeout = int(timeouts.get("firstByte", 30))
+    idle_timeout = int(timeouts.get("idle", 120))
+    proxy_bytes = _WsProxyBytes()
+
+    try:
+        http_body = dict(body)
+        http_body["stream"] = True
+        upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
+    except Exception as exc:
+        if hasattr(exc, "status") and hasattr(exc, "message"):
+            outcome = "candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "guard_error"
+            return _WsAttemptResult(
+                outcome=outcome,
+                error_detail=str(getattr(exc, "message", exc))[:2000],
+                http_status=int(getattr(exc, "status", 400)),
+                upstream_protocol=ch_proto,
+                upstream_transport="sse",
+            )
+        traceback.print_exc()
+        return _WsAttemptResult(
+            outcome="transform_error",
+            error_detail=f"transform error: {exc}",
+            upstream_protocol=ch_proto,
+            upstream_transport="sse",
+        )
+
+    client = upstream.get_client()
+    response: httpx.Response | None = None
+    t0 = time.time()
+    try:
+        req = client.build_request(
+            upstream_req.method,
+            upstream_req.url,
+            headers=upstream_req.headers,
+            content=upstream_req.body,
+        )
+        proxy_bytes.count(up=len(upstream_req.body or b""))
+        response = await asyncio.wait_for(client.send(req, stream=True), timeout=connect_timeout)
+        connect_ms = int((time.time() - t0) * 1000)
+    except asyncio.TimeoutError:
+        return _WsAttemptResult(
+            outcome="connect_timeout",
+            error_detail=f"connect timeout > {connect_timeout}s",
+            proxy_bytes=proxy_bytes,
+            upstream_protocol=ch_proto,
+            upstream_transport="sse",
+        )
+    except Exception as exc:
+        return _WsAttemptResult(
+            outcome="connect_error",
+            error_detail=f"connect error: {exc}"[:2000],
+            proxy_bytes=proxy_bytes,
+            upstream_protocol=ch_proto,
+            upstream_transport="sse",
+        )
+
+    status = int(response.status_code)
+    if status >= 400:
+        try:
+            body_bytes = await response.aread()
+            proxy_bytes.count(down=len(body_bytes or b""))
+            detail = body_bytes.decode("utf-8", errors="replace")[:2000]
+        except Exception:
+            detail = response.reason_phrase or f"HTTP {status}"
+        finally:
+            await response.aclose()
+        return _WsAttemptResult(
+            outcome="http_auth_error" if status in (401, 403) else "http_error",
+            error_detail=f"HTTP {status}: {detail}"[:2000],
+            http_status=status,
+            connect_ms=connect_ms,
+            proxy_bytes=proxy_bytes,
+            upstream_protocol=ch_proto,
+            upstream_transport="sse",
+        )
+
+    result = _WsAttemptResult(
+        connected=True,
+        outcome="connected",
+        http_status=status,
+        connect_ms=connect_ms,
+        proxy_bytes=proxy_bytes,
+        upstream_protocol=ch_proto,
+        upstream_transport="sse",
+        translator_ctx=upstream_req.translator_ctx,
+    )
+    tracker = _WsTracker()
+    pending: list[str] = []
+    committed = False
+    buf = b""
+    aiter = response.aiter_bytes()
+
+    async def finalize_and_return() -> _WsAttemptResult:
+        result.response_completed = tracker.response_completed
+        result.usage = tracker.usage
+        result.response_text = tracker.get_full_response()
+        result.response_id = tracker.response_id
+        result.output_items = tracker.get_output_items()
+        if result.ok:
+            total_ms = int((time.time() - start_time) * 1000)
+            finalize_policy.apply_success_health_effects(
+                finalize_policy.success_plan(),
+                scorer=scorer,
+                cooldown=cooldown,
+                channel_key=ch.key,
+                model=resolved_model,
+                connect_ms=result.connect_ms,
+                first_byte_ms=result.first_byte_ms,
+                total_ms=total_ms,
+            )
+            _write_responses_affinity(
+                api_key_name=api_key_name,
+                client_ip=client_ip,
+                body=body,
+                response_id=result.response_id,
+                output_items=result.output_items,
+                channel_key=ch.key,
+                resolved_model=resolved_model,
+                client_key=client_key,
+                translator_ctx=result.translator_ctx,
+            )
+            await asyncio.shield(asyncio.to_thread(
+                log_db.finish_success,
+                request_id, ch.key, ch.type, resolved_model,
+                input_tokens=result.usage["input_tokens"],
+                output_tokens=result.usage["output_tokens"],
+                cache_creation_tokens=result.usage["cache_creation"],
+                cache_read_tokens=result.usage["cache_read"],
+                connect_ms=connect_ms,
+                first_token_ms=result.first_byte_ms,
+                total_ms=total_ms,
+                retry_count=retry_count_so_far,
+                affinity_hit=affinity_hit,
+                response_body=result.response_text,
+                http_status=status,
+                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                upstream_transport="sse",
+                proxy_name=None,
+                proxy_bytes_up=proxy_bytes.up,
+                proxy_bytes_down=proxy_bytes.down,
+            ))
+        else:
+            await asyncio.shield(asyncio.to_thread(
+                log_db.finish_error,
+                request_id,
+                (result.error_detail or result.outcome)[:4000],
+                retry_count_so_far,
+                final_channel_key=ch.key,
+                final_channel_type=ch.type,
+                final_model=resolved_model,
+                connect_ms=connect_ms,
+                first_token_ms=result.first_byte_ms,
+                total_ms=int((time.time() - start_time) * 1000),
+                http_status=result.http_status or _http_status_from_ws_outcome(result),
+                affinity_hit=affinity_hit,
+                response_body=result.response_text or None,
+                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                upstream_transport="sse",
+                proxy_name=None,
+                proxy_bytes_up=proxy_bytes.up,
+                proxy_bytes_down=proxy_bytes.down,
+            ))
+        return result
+
+    async def commit_pending() -> None:
+        nonlocal committed
+        if committed:
+            return
+        committed = True
+        result.closed_after_accept = True
+        if result.first_byte_ms is None:
+            result.first_byte_ms = int((time.time() - start_time) * 1000)
+        for item in pending:
+            await _send_downstream(websocket, item)
+        pending.clear()
+
+    try:
+        while True:
+            remaining = deadline_ts - time.time()
+            if remaining <= 0:
+                result.outcome = "total_timeout"
+                result.error_detail = "upstream total timeout"
+                if committed:
+                    await _close_downstream(websocket, 4504, result.error_detail)
+                    return await finalize_and_return()
+                return result
+            wait_sec = min(float(idle_timeout if committed else first_byte_timeout), max(1.0, remaining))
+            try:
+                chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_sec)
+            except StopAsyncIteration:
+                if tracker.response_completed:
+                    result.ok = True
+                    result.outcome = "success"
+                    if committed:
+                        await _close_downstream(websocket, 1000, "")
+                        return await finalize_and_return()
+                    return await finalize_and_return()
+                result.outcome = "upstream_closed" if committed else "closed_before_first_byte"
+                result.error_detail = "upstream SSE ended before response.completed"
+                if committed:
+                    await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                    return await finalize_and_return()
+                return result
+            except asyncio.TimeoutError:
+                result.outcome = "idle_timeout" if committed else "first_byte_timeout"
+                result.error_detail = (
+                    f"upstream idle timeout > {idle_timeout}s" if committed
+                    else f"first SSE event timeout > {first_byte_timeout}s"
+                )
+                if committed:
+                    await _close_downstream(websocket, 4504, result.error_detail)
+                    return await finalize_and_return()
+                return result
+            except Exception as exc:
+                result.outcome = "transport_error" if committed else "closed_before_first_byte"
+                result.error_detail = f"read upstream SSE: {exc}"[:2000]
+                if committed:
+                    await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                    return await finalize_and_return()
+                return result
+
+            proxy_bytes.count(down=len(chunk or b""))
+            buf += chunk or b""
+            buf = buf.replace(b"\r\n", b"\n")
+            buf, blocks = upstream.split_sse_events(buf)
+            for block in blocks:
+                event_name, data = upstream.parse_sse_event_bytes(block)
+                if data is None:
+                    continue
+                if event_name and not data.get("type"):
+                    data = dict(data)
+                    data["type"] = event_name
+                frame_text = _dump_frame(data)
+                tracker.feed_text(frame_text)
+                event_type = _ws_event_type(frame_text)
+
+                if tracker.response_failed:
+                    result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
+                    result.error_detail = tracker.stream_error_message or frame_text[:2000]
+                    if event_type == "response.failed" or committed:
+                        if not committed:
+                            pending.append(frame_text)
+                            await commit_pending()
+                        else:
+                            await _send_downstream(websocket, frame_text)
+                        await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                        return await finalize_and_return()
+                    return result
+
+                visible = _is_ws_visible_event_type(event_type)
+                if visible:
+                    bl_hit = blacklist.match(frame_text, ch.key)
+                    if bl_hit:
+                        result.outcome = "blacklist_hit"
+                        result.error_detail = f"blacklist: {bl_hit}"
+                        if committed:
+                            await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                            return await finalize_and_return()
+                        return result
+
+                if not committed:
+                    pending.append(frame_text)
+                    if visible:
+                        await commit_pending()
+                    elif tracker.response_completed:
+                        result.ok = True
+                        result.outcome = "success"
+                        await commit_pending()
+                        await _close_downstream(websocket, 1000, "")
+                        return await finalize_and_return()
+                    continue
+
+                await _send_downstream(websocket, frame_text)
+                if tracker.response_completed:
+                    result.ok = True
+                    result.outcome = "success"
+                    await _close_downstream(websocket, 1000, "")
+                    return await finalize_and_return()
+    finally:
+        await response.aclose()
+
+
 async def _relay_ws_session(
     websocket: WebSocket,
     upstream_ws,
@@ -861,6 +1200,7 @@ async def _relay_ws_session(
             upstream_ws, tracker, pending_visible, ch.key, first_wait,
             deadline_ts=deadline_ts, idle_timeout=idle_timeout,
             result=result, proxy_bytes=proxy_bytes,
+            timeout_label_seconds=first_byte_timeout,
         )
     except asyncio.TimeoutError:
         result.outcome = "first_byte_timeout"
@@ -916,6 +1256,8 @@ async def _relay_ws_session(
                     guard_responses_ingress(local_body, store_enabled=_store_enabled())
                 except GuardError as ge:
                     raise ValueError(ge.message)
+                if local_body.get("background") is True:
+                    raise ValueError("background async response is not supported on Responses WebSocket")
                 local_body["stream"] = True
                 local_body["_api_key_name"] = api_key_name or ""
                 # 翻译层（subsequent frame）：WS 会话已经绑定当前上游渠道。
@@ -933,57 +1275,55 @@ async def _relay_ws_session(
     async def upstream_to_downstream() -> None:
         nonlocal result
         while True:
-            remaining = deadline_ts - time.time()
-            if remaining <= 0:
+            step = await read_next_responses_ws_step(
+                upstream_ws,
+                tracker,
+                channel_key=ch.key,
+                deadline_ts=deadline_ts,
+                idle_timeout=idle_timeout,
+                proxy_bytes=proxy_bytes,
+                frame_transform=lambda frame: _identity_expose_frame(frame, _identity_confuse_state),
+                skip_event_types=(),
+                blacklist_before_error=True,
+            )
+            if step.outcome == "total_timeout":
                 result.outcome = "total_timeout"
-                result.error_detail = "upstream total timeout"
+                result.error_detail = step.error_detail
                 await _close_downstream(websocket, 4504, "upstream total timeout")
                 return
-            wait_sec = min(float(idle_timeout), max(1.0, remaining))
-            try:
-                data = await asyncio.wait_for(upstream_ws.recv(), timeout=wait_sec)
-            except asyncio.TimeoutError:
+            if step.outcome == "idle_timeout":
                 result.outcome = "idle_timeout"
-                result.error_detail = f"upstream idle timeout > {idle_timeout}s"
+                result.error_detail = step.error_detail
                 await _close_downstream(websocket, 4504, result.error_detail)
                 return
-            except websockets.ConnectionClosed as exc:
-                if tracker.response_completed:
-                    result.ok = True
-                    result.outcome = "success"
-                elif tracker.response_failed:
-                    result.outcome = "stream_upstream_error"
-                    result.error_detail = tracker.stream_error_message or "upstream stream error"
-                else:
-                    result.outcome = "upstream_closed"
-                    result.error_detail = f"upstream websocket closed: {exc}"
-                await _close_downstream(
-                    websocket,
-                    int(exc.rcvd.code if exc.rcvd else 1000),
-                    str(exc.rcvd.reason if exc.rcvd else ""),
-                )
+            if step.outcome == "upstream_closed":
+                result.outcome = "upstream_closed"
+                result.error_detail = step.error_detail
+                await _close_downstream(websocket, step.close_code, step.close_reason)
                 return
-            proxy_bytes.count(down=_frame_size(data))
-            data = _identity_expose_frame(data, _identity_confuse_state)
-            if isinstance(data, str):
-                tracker.feed_text(data)
-                bl_hit = blacklist.match(data, ch.key)
-                if bl_hit:
-                    result.outcome = "blacklist_hit"
-                    result.error_detail = f"blacklist: {bl_hit}"
-                    await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
-                    return
-            await _send_downstream(websocket, data)
-            if tracker.response_failed:
-                result.outcome = "stream_upstream_error"
-                result.error_detail = tracker.stream_error_message or "upstream stream error"
+            if step.outcome == "blacklist_hit":
+                result.outcome = "blacklist_hit"
+                result.error_detail = step.error_detail
                 await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                 return
-            if tracker.response_completed:
+            if step.data is not None and not step.skip_downstream:
+                await _send_downstream(websocket, step.data)
+            if step.outcome == "stream_upstream_error":
+                result.outcome = "stream_upstream_error"
+                result.error_detail = step.error_detail
+                close_code = 1011 if step.data is not None else step.close_code
+                close_reason = _trim_reason(result.error_detail) if step.data is not None else step.close_reason
+                await _close_downstream(websocket, close_code, close_reason)
+                return
+            if step.outcome == "success":
                 result.ok = True
                 result.outcome = "success"
-                await _close_downstream(websocket, 1000, "")
+                close_code = 1000 if step.data is not None else step.close_code
+                close_reason = "" if step.data is not None else step.close_reason
+                await _close_downstream(websocket, close_code, close_reason)
                 return
+            if step.skip_downstream:
+                continue
 
     t_down = asyncio.create_task(downstream_to_upstream())
     t_up = asyncio.create_task(upstream_to_downstream())
@@ -1012,17 +1352,26 @@ async def _relay_ws_session(
     result.response_completed = tracker.response_completed
     result.usage = tracker.usage
     result.response_text = _identity_log_text(tracker.get_full_response(), _identity_confuse_state)
+    result.response_id = tracker.response_id
     result.output_items = tracker.get_output_items()
 
     if result.ok:
         total_ms = int((time.time() - start_time) * 1000)
-        scorer.record_success(ch.key, resolved_model, connect_ms=connect_ms,
-                              first_byte_ms=result.first_byte_ms, total_ms=total_ms)
-        cooldown.clear(ch.key, resolved_model)
+        finalize_policy.apply_success_health_effects(
+            finalize_policy.success_plan(),
+            scorer=scorer,
+            cooldown=cooldown,
+            channel_key=ch.key,
+            model=resolved_model,
+            connect_ms=connect_ms,
+            first_byte_ms=result.first_byte_ms,
+            total_ms=total_ms,
+        )
         _write_responses_affinity(
             api_key_name=api_key_name,
             client_ip=client_ip,
             body=body,
+            response_id=result.response_id,
             output_items=result.output_items,
             channel_key=ch.key,
             resolved_model=resolved_model,
@@ -1044,7 +1393,7 @@ async def _relay_ws_session(
             response_body=result.response_text,
             http_status=101,
             upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-            upstream_transport="ws",
+            upstream_transport=result.upstream_transport,
             proxy_name=proxy_name,
             proxy_bytes_up=proxy_bytes.up,
             proxy_bytes_down=proxy_bytes.down,
@@ -1065,7 +1414,7 @@ async def _relay_ws_session(
             affinity_hit=affinity_hit,
             response_body=result.response_text or None,
             upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-            upstream_transport="ws",
+            upstream_transport=result.upstream_transport,
             proxy_name=proxy_name,
             proxy_bytes_up=proxy_bytes.up,
             proxy_bytes_down=proxy_bytes.down,
@@ -1082,11 +1431,9 @@ async def _build_ws_upstream_request(
     websocket: WebSocket,
 ) -> UpstreamRequest:
     if isinstance(ch, OpenAIOAuthChannel):
-        payload = openai_common.filter_responses_passthrough(body)
-        payload["model"] = resolved_model
         # Reuse the OAuth channel's Codex transform/header logic. This returns
         # an HTTP UpstreamRequest; for WS we only need its URL base + headers.
-        req = await ch.build_upstream_request(payload, resolved_model, ingress_protocol="responses")
+        req = await ch.build_upstream_request(body, resolved_model, ingress_protocol="responses")
         ws_url = _http_url_to_ws(req.url)
         headers = _merge_ws_headers(req.headers, websocket)
         # Codex WebSocket uses the same session/thread identity header names as
@@ -1138,85 +1485,15 @@ async def _build_ws_upstream_request(
 
 
 def _merge_ws_headers(upstream_headers: dict[str, str], websocket: WebSocket) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for k, v in (upstream_headers or {}).items():
-        lk = k.lower()
-        if lk in _SKIP_UPSTREAM_HEADERS:
-            continue
-        if lk == "openai-beta":
-            continue
-        out[k] = str(v)
-
-    # Required by Codex Responses WebSocket v2.
-    out["OpenAI-Beta"] = _RESPONSES_WEBSOCKETS_BETA
-
-    # Default Codex-ish identity headers. setdefault preserves explicit channel headers.
-    out.setdefault("originator", _CODEX_ORIGINATOR)
-    out.setdefault("version", _CODEX_CLI_VERSION)
-    out.setdefault("User-Agent", _CODEX_CLI_UA)
-
-    # Convert incoming OpenAI-style identity headers to Codex WS header names.
-    incoming_sid = websocket.headers.get("session-id") or websocket.headers.get("session_id")
-    incoming_tid = (
-        websocket.headers.get("thread-id")
-        or websocket.headers.get("conversation_id")
-        or websocket.headers.get("x-codex-thread-id")
+    return merge_responses_ws_headers(
+        upstream_headers,
+        websocket.headers,
+        forward_client_headers=_FORWARD_CLIENT_HEADERS,
     )
-    if incoming_sid:
-        out.setdefault("session-id", incoming_sid)
-    if incoming_tid:
-        out.setdefault("thread-id", incoming_tid)
-
-    for name in _FORWARD_CLIENT_HEADERS:
-        val = websocket.headers.get(name)
-        if val:
-            out[name] = val
-
-    # If downstream supplied a Codex user-agent, preserve it; otherwise keep Parrot's default.
-    ua = websocket.headers.get("user-agent")
-    if ua and "codex" in ua.lower():
-        out["User-Agent"] = ua
-    # Codex CLI only sends session-id / thread-id (hyphenated).
-    # Remove legacy underscore / conversation variants from outbound headers.
-    for _ck in [k for k in list(out) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
-        del out[_ck]
-    return out
 
 
 def _http_url_to_ws(url: str) -> str:
-    p = urlparse(url)
-    scheme = p.scheme
-    if scheme == "https":
-        scheme = "wss"
-    elif scheme == "http":
-        scheme = "ws"
-    return urlunparse((scheme, p.netloc, p.path or "", p.params, p.query, p.fragment))
-
-
-class _ManagedWsConnection:
-    """WebSocket connection plus deterministic SS2022 bridge cleanup."""
-
-    def __init__(self, ws, cleanup):
-        self._ws = ws
-        self._cleanup = cleanup
-        self._cleanup_done = False
-
-    def __getattr__(self, name: str):
-        return getattr(self._ws, name)
-
-    async def close(self, *args, **kwargs):
-        try:
-            return await self._ws.close(*args, **kwargs)
-        finally:
-            wait_closed = getattr(self._ws, "wait_closed", None)
-            if wait_closed is not None:
-                try:
-                    await wait_closed()
-                except Exception:
-                    pass
-            if not self._cleanup_done:
-                self._cleanup_done = True
-                await self._cleanup()
+    return http_url_to_ws(url)
 
 
 async def _connect_upstream_ws(
@@ -1227,37 +1504,19 @@ async def _connect_upstream_ws(
     proxy_bytes: _WsProxyBytes,
     open_timeout: float,
 ):
-    kwargs = dict(
-        additional_headers=headers,
-        user_agent_header=None,
+    return await connect_upstream_ws(
+        url,
+        headers=headers,
+        connector=connector,
+        proxy_bytes=proxy_bytes,
         open_timeout=open_timeout,
-        ping_interval=20,
-        ping_timeout=20,
-        close_timeout=10,
-        max_size=None,
-        max_queue=64,
-        compression="deflate",
+        open_socket_func=_open_socket_via_ss2022,
+        connect_func=websockets.connect,
     )
-    if connector is None or isinstance(connector, DirectConnector):
-        return await websockets.connect(url, proxy=None, **kwargs)
-    if isinstance(connector, SOCKS5Connector):
-        return await websockets.connect(url, proxy=_socks5h_url(connector.url), **kwargs)
-    if isinstance(connector, SS2022Connector):
-        sock, cleanup = await _open_socket_via_ss2022(url, connector, proxy_bytes, timeout=open_timeout)
-        try:
-            ws = await websockets.connect(url, proxy=None, sock=sock, **kwargs)
-        except BaseException:
-            await cleanup(close_ws_sock=True)
-            raise
-        return _ManagedWsConnection(ws, cleanup)
-    return await websockets.connect(url, proxy=None, **kwargs)
 
 
 def _socks5h_url(url: str) -> str:
-    # websockets distinguishes socks5 (local DNS) vs socks5h (remote DNS).
-    if url.startswith("socks5://"):
-        return "socks5h://" + url[len("socks5://"):]
-    return url
+    return socks5h_url(url)
 
 
 async def _open_socket_via_ss2022(
@@ -1267,141 +1526,23 @@ async def _open_socket_via_ss2022(
     *,
     timeout: float,
 ):
-    p = urlparse(url)
-    host = p.hostname
-    if not host:
-        raise OSError("websocket URL missing host")
-    port = p.port or (443 if p.scheme == "wss" else 80)
-
-    from ..proxy.ss2022 import SS2022Connection
-
-    conn = SS2022Connection(connector.cipher, connector.password, connector.server, connector.port)
-    await conn.connect(host, port, timeout=timeout)
-
-    loop = asyncio.get_running_loop()
-    left, right = socket.socketpair()
-    left.setblocking(False)
-    right.setblocking(False)
-    stop = asyncio.Event()
-    tasks: list[asyncio.Task] = []
-    cleanup_lock = asyncio.Lock()
-    cleanup_done = False
-
-    def shutdown_sock(sock) -> None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-    async def pump_sock_to_ss() -> None:
-        try:
-            while not stop.is_set():
-                data = await loop.sock_recv(right, 65536)
-                if not data:
-                    return
-                proxy_bytes.count(up=len(data))
-                await conn.write(data)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-        finally:
-            stop.set()
-
-    async def pump_ss_to_sock() -> None:
-        try:
-            while not stop.is_set():
-                data = await conn.read(65536)
-                if not data:
-                    return
-                proxy_bytes.count(down=len(data))
-                await loop.sock_sendall(right, data)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-        finally:
-            stop.set()
-            shutdown_sock(right)
-
-    async def cleanup(*, close_ws_sock: bool = False) -> None:
-        nonlocal cleanup_done
-        async with cleanup_lock:
-            if cleanup_done:
-                return
-            cleanup_done = True
-            stop.set()
-            for task in tasks:
-                task.cancel()
-            shutdown_sock(right)
-            # After websockets.connect(sock=left) succeeds, asyncio owns left's
-            # fd and must unregister it before close.  Closing it here races the
-            # selector and can poison later connects with "fd is used by
-            # transport".  Only close left if the WS handshake never took
-            # ownership.
-            if close_ws_sock:
-                shutdown_sock(left)
-            try:
-                await conn.close()
-            except Exception:
-                pass
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-    tasks.append(asyncio.create_task(pump_sock_to_ss()))
-    tasks.append(asyncio.create_task(pump_ss_to_sock()))
-    return left, cleanup
+    opened = await open_socket_via_ss2022(url, connector, proxy_bytes, timeout=timeout)
+    if isinstance(opened, tuple):
+        sock, _cleanup = opened
+        return sock
+    return opened
 
 
 def _ws_proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
-    return {
-        "channel_key": ch.key,
-        "model": resolved_model,
-        "purpose": "oauth_openai",
-        "account_key": getattr(ch, "account_key", "") or "",
-    }
+    return ws_route_kwargs(ch, resolved_model)
 
 
 def _resolve_ws_route_chain(ch: Channel, resolved_model: str) -> list[tuple[str, Any | None]]:
-    try:
-        from ..proxy import manager as pm
-        pm.init()
-        if pm.is_configured():
-            route_chain: list[tuple[str, Any | None]] = []
-            valid_seen = False
-            for name in pm.resolve_proxy_chain(**_ws_proxy_route_kwargs(ch, resolved_model)):
-                conn = pm.get_connector(name)
-                if conn is None:
-                    continue
-                valid_seen = True
-                if getattr(conn, "type", "") == "direct":
-                    route_chain.append(("direct", None))
-                else:
-                    route_chain.append((name, conn))
-            if valid_seen:
-                return route_chain
-            return []
-    except Exception:
-        pass
-
-    legacy = _legacy_socks5_connector()
-    if legacy is not None:
-        return [("legacy-socks5", legacy)]
-    return [("direct", None)]
+    return resolve_ws_route_chain(ch, resolved_model)
 
 
 def _legacy_socks5_connector() -> SOCKS5Connector | None:
-    try:
-        url = network.active_socks5_url()
-    except Exception:
-        url = None
-    if not url:
-        return None
-    return SOCKS5Connector("legacy-socks5", url)
+    return legacy_socks5_connector()
 
 
 def _pick_non_direct_proxy_name(ch: Channel, resolved_model: str) -> str | None:
@@ -1447,9 +1588,16 @@ async def _finalize_ws_attempt_after_accept(
     affinity_hit: int,
     start_time: float,
 ) -> None:
-    if _should_cooldown(result.outcome):
-        cooldown.record_error(ch.key, resolved_model, result.error_detail)
-    scorer.record_failure(ch.key, resolved_model, connect_ms=result.connect_ms)
+    plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+    finalize_policy.apply_error_health_effects(
+        plan,
+        scorer=scorer,
+        cooldown=cooldown,
+        channel_key=ch.key,
+        model=resolved_model,
+        error_detail=result.error_detail,
+        connect_ms=result.connect_ms,
+    )
     await asyncio.shield(asyncio.to_thread(
         log_db.finish_error,
         request_id,
@@ -1465,7 +1613,7 @@ async def _finalize_ws_attempt_after_accept(
         affinity_hit=affinity_hit,
         response_body=result.response_text or None,
         upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-        upstream_transport="ws",
+        upstream_transport=result.upstream_transport,
         proxy_name=result.proxy_name,
         proxy_bytes_up=result.proxy_bytes.up,
         proxy_bytes_down=result.proxy_bytes.down,
@@ -1477,6 +1625,7 @@ def _write_responses_affinity(
     api_key_name: str,
     client_ip: str,
     body: dict,
+    response_id: Optional[str],
     output_items: list[dict],
     channel_key: str,
     resolved_model: str,
@@ -1494,19 +1643,19 @@ def _write_responses_affinity(
                 fp_write, channel_key, resolved_model,
                 prompt_cache_key=prompt_cache_key,
             )
-        prev_id = (translator_ctx or {}).get("previous_response_id") if isinstance(translator_ctx, dict) else None
-        if prev_id:
+        if response_id:
             try:
                 from ..openai import store as openai_store
-                openai_store.save(
-                    str(prev_id),
-                    str((body or {}).get("previous_response_id") or "") or None,
-                    api_key_name=api_key_name or "",
-                    model=resolved_model,
-                    channel_key=channel_key,
-                    input_items=cur_input,
-                    output_items=output_items,
-                )
+                if openai_store.is_enabled():
+                    openai_store.save(
+                        str(response_id),
+                        str((body or {}).get("previous_response_id") or "") or None,
+                        api_key_name=api_key_name or "",
+                        model=resolved_model,
+                        channel_key=channel_key,
+                        input_items=cur_input,
+                        output_items=output_items,
+                    )
             except Exception:
                 pass
         if client_key:
@@ -1516,84 +1665,35 @@ def _write_responses_affinity(
 
 
 def _request_body_from_ws_create(obj: dict) -> dict:
-    body = dict(obj)
-    body.pop("type", None)
-    # Codex WS payload fields match Responses API fields, plus WS-only generate/client_metadata.
-    body.pop("generate", None)
-    # client_metadata is WS-specific but harmless to keep in the WS frame; don't pass it through
-    # the HTTP-style guard / scheduler body.
-    body.pop("client_metadata", None)
-    return body
+    return request_body_from_ws_create(obj)
 
 
 def _sync_prompt_cache_key_to_ws_create(obj: dict, body: dict) -> None:
-    if body.get("model"):
-        obj["model"] = body["model"]
-    if body.get("prompt_cache_key"):
-        obj["prompt_cache_key"] = body["prompt_cache_key"]
-    if "background" in obj and "background" not in body:
-        obj.pop("background", None)
+    sync_prompt_cache_key_to_ws_create(obj, body)
 
 
 def _sync_translated_body_to_ws_create(obj: dict, body: dict) -> None:
-    """把翻译层改写后的 Responses 字段同步回 response.create WS frame。
-
-    WS 上游实际发送的是原始 obj；若只改 body，会导致日志/调度看到翻译文本，
-    但上游仍收到原文。这里只同步翻译层可能改写的字段，不碰 WS-only 字段。
-    """
-    _sync_prompt_cache_key_to_ws_create(obj, body)
-    if "input" in body:
-        obj["input"] = body["input"]
-    if "instructions" in body:
-        obj["instructions"] = body["instructions"]
+    sync_translated_body_to_ws_create(obj, body)
 
 
 def _map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel: Channel | None = None) -> dict:
-    # Keep WS-only fields such as generate/client_metadata, while applying model
-    # mapping and stripped ingress fields (e.g. background) to subsequent frames.
-    out = dict(obj)
-    typ = out.pop("type", None)
-    if model:
-        out["model"] = model
-    if "background" in out:
-        out.pop("background", None)
-    if isinstance(channel, OpenAIOAuthChannel):
-        # Same Codex compatibility transform as HTTP/SSE OAuth path. It strips
-        # unsupported fields, forces store=false/stream=true, normalizes tools
-        # and input, and removes previous_response_id for ChatGPT's internal API.
-        out = codex_oauth_transform.apply_codex_oauth_transform(out, resolved_model=model)
-    if typ:
-        out["type"] = typ
-    return out
+    return map_ws_create_frame_for_upstream(obj, model, channel=channel)
 
 
 def _loads_frame(raw: str | bytes) -> Any:
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="replace")
-    return json.loads(raw)
+    return loads_frame(raw)
 
 
 def _dump_frame(obj: dict) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return dump_frame(obj)
 
 
 def _identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
-    if not state.enabled:
-        return data
-    if isinstance(data, str):
-        return expose_response_payload(data.encode("utf-8"), state).decode("utf-8", errors="replace")
-    if isinstance(data, (bytes, bytearray)):
-        return expose_response_payload(bytes(data), state)
-    return data
+    return identity_expose_frame(data, state)
 
 
 def _identity_log_text(text: str, state: ConfuseState) -> str:
-    if not text or not state.enabled:
-        return text
-    try:
-        return expose_response_payload(text.encode("utf-8"), state).decode("utf-8", errors="replace")
-    except Exception:
-        return text
+    return identity_log_text(text, state)
 
 
 async def _send_downstream(websocket: WebSocket, data: str | bytes) -> None:
@@ -1613,9 +1713,7 @@ async def _close_downstream(websocket: WebSocket, code: int, reason: str = "") -
 
 
 def _frame_size(data: str | bytes) -> int:
-    if isinstance(data, bytes):
-        return len(data)
-    return len(data.encode("utf-8", errors="replace"))
+    return ws_frame_size(data)
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
@@ -1626,38 +1724,18 @@ def _safe_int(v: Any, default: int = 0) -> int:
 
 
 def _format_ws_error(evt: dict) -> str:
-    err = evt.get("error")
-    if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("error"), dict):
-        err = evt["response"]["error"]
-    if isinstance(err, dict):
-        code = err.get("code") or err.get("type") or err.get("error_type")
-        message = err.get("message") or err.get("reason") or "upstream websocket error"
-        return f"{code}: {message}" if code and str(code) not in str(message) else str(message)
-    message = evt.get("message") or evt.get("reason") or "upstream websocket error"
-    code = evt.get("code") or evt.get("error_type") or evt.get("type")
-    return f"{code}: {message}" if code and code != "error" and str(code) not in str(message) else str(message)
+    return format_responses_ws_error(evt)
 
 
 def _ws_event_type(data: str | bytes) -> str:
-    if not isinstance(data, str):
-        return ""
-    try:
-        obj = json.loads(data)
-    except Exception:
-        return ""
-    return str(obj.get("type") or "") if isinstance(obj, dict) else ""
+    return ws_event_type(data)
 
 
 def _is_ws_visible_event_type(event_type: str) -> bool:
-    if not event_type:
-        return False
     # Keep the WS lock boundary aligned with HTTP/SSE Responses failover:
     # metadata/control events are not enough; only real assistant/tool output
     # makes the attempt irreversible.
-    try:
-        return event_type in upstream.RESPONSES_VISIBLE_EVENTS
-    except Exception:
-        return False
+    return is_responses_ws_visible_event_type(event_type)
 
 
 async def _recv_until_first_visible_ws_event(
@@ -1671,83 +1749,40 @@ async def _recv_until_first_visible_ws_event(
     idle_timeout: int,
     result: _WsAttemptResult,
     proxy_bytes: _WsProxyBytes,
+    timeout_label_seconds: float | int | None = None,
 ) -> str | bytes | None:
-    wait_sec = first_wait
-    while True:
-        data = await asyncio.wait_for(upstream_ws.recv(), timeout=wait_sec)
-        proxy_bytes.count(down=_frame_size(data))
-
-        if isinstance(data, str):
-            maybe_error = _parse_wrapped_ws_error(data)
-            if maybe_error:
-                result.outcome = "upstream_error_json"
-                result.http_status = maybe_error.get("status")
-                result.error_detail = maybe_error.get("message") or data[:2000]
-                if not _is_retryable_ws_error_before_accept(maybe_error):
-                    pending_visible.append(data)
-                    result.closed_after_accept = True
-                return None
-
-            tracker.feed_text(data)
-            event_type = _ws_event_type(data)
-            if tracker.response_failed:
-                result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
-                result.error_detail = tracker.stream_error_message or data[:2000]
-                if event_type == "response.failed":
-                    pending_visible.append(data)
-                    result.closed_after_accept = True
-                return None
-
-            if _is_ws_visible_event_type(event_type):
-                bl_hit = blacklist.match(data, channel_key)
-                if bl_hit:
-                    result.outcome = "blacklist_hit"
-                    result.error_detail = f"blacklist: {bl_hit}"
-                    return None
-                pending_visible.append(data)
-                return data
-
-            pending_visible.append(data)
-            if tracker.response_completed:
-                result.ok = True
-                result.outcome = "success"
-                result.closed_after_accept = True
-                return None
-        else:
-            # Binary frames are real downstream payload. They cannot be inspected
-            # by the text blacklist, but they do define the irreversible boundary.
-            pending_visible.append(data)
-            return data
-
-        remaining = deadline_ts - time.time()
-        if remaining <= 0:
-            result.outcome = "total_timeout"
-            result.error_detail = "upstream total timeout before first visible websocket event"
-            return None
-        wait_sec = min(float(idle_timeout), max(1.0, remaining))
+    step = await read_until_first_responses_ws_visible_event(
+        upstream_ws,
+        tracker,
+        channel_key=channel_key,
+        deadline_ts=deadline_ts,
+        first_wait=first_wait,
+        idle_timeout=idle_timeout,
+        proxy_bytes=proxy_bytes,
+        parse_wrapped_errors=True,
+        timeout_detail_mode="event",
+        timeout_label_seconds=timeout_label_seconds if timeout_label_seconds is not None else first_wait,
+        use_tracker_error_detail=True,
+    )
+    pending_visible.extend(step.pending)
+    if step.ok:
+        result.ok = True
+        result.outcome = "success"
+    elif step.outcome is not None:
+        result.outcome = step.outcome
+        result.error_detail = step.error_detail
+        result.http_status = step.http_status
+    if step.closed_after_accept:
+        result.closed_after_accept = True
+    return step.visible_frame
 
 
 def _parse_wrapped_ws_error(text: str) -> Optional[dict]:
-    try:
-        obj = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(obj, dict) or obj.get("type") != "error":
-        return None
-    status = obj.get("status") or obj.get("status_code")
-    raw_err = obj.get("error")
-    err = raw_err if isinstance(raw_err, dict) else obj
-    code = err.get("code") or err.get("type") or obj.get("code")
-    message = err.get("message") or obj.get("message") or text[:2000]
-    return {"status": int(status) if isinstance(status, int) else None, "code": code, "message": message}
+    return parse_wrapped_responses_ws_error(text)
 
 
 def _is_retryable_ws_error_before_accept(err: dict) -> bool:
-    status = err.get("status")
-    code = str(err.get("code") or "")
-    if code == "websocket_connection_limit_reached":
-        return True
-    return isinstance(status, int) and status in (401, 403, 429, 500, 502, 503, 504)
+    return is_retryable_responses_ws_error_before_accept(err)
 
 
 def _invalid_status_detail(exc: InvalidStatus) -> str:
@@ -1764,33 +1799,11 @@ def _invalid_status_detail(exc: InvalidStatus) -> str:
 
 
 def _http_status_from_ws_outcome(result: Optional[_WsAttemptResult]) -> int:
-    if result and result.http_status:
-        return int(result.http_status)
-    if result and result.outcome in ("connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout"):
-        return 504
-    if result and result.outcome in ("connect_error", "transport_error", "upstream_closed", "closed_before_first_byte"):
-        return 502
-    if result and result.outcome == "client_disconnected":
-        return 499
-    if result and result.outcome == "guard_error":
-        return 400
-    return 503
+    return responses_ws_http_status_from_attempt(result)
 
 
 def _ws_close_code_for_http(status: int) -> int:
-    if status == 400:
-        return 4400
-    if status == 401:
-        return 4401
-    if status == 403:
-        return 4403
-    if status == 404:
-        return 4404
-    if status == 429:
-        return 4429
-    if status == 504:
-        return 4504
-    return 4500 if status >= 500 else 4400
+    return ws_close_code_for_http_status(status)
 
 
 def _trim_reason(reason: str, limit: int = 120) -> str:
@@ -1822,4 +1835,4 @@ def _is_ws_capable_channel(ch: Channel) -> bool:
 
 
 def _should_cooldown(outcome: str) -> bool:
-    return outcome not in {"success", "http_auth_error", "transform_error", "guard_error", "client_disconnected"}
+    return should_cooldown(outcome)

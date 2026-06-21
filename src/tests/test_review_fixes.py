@@ -161,6 +161,23 @@ def test_anthropic_transforms_default_stream_false(m):
     assert cc["stream"] is False
 
 
+def test_standard_anthropic_transform_preserves_native_request_fields(m):
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "hi"}],
+        "service_tier": "auto",
+        "container": {"id": "ctr_1"},
+        "mcp_servers": [{"name": "tools"}],
+    }
+
+    std = m["standard"].standard_transform(body)
+
+    assert std["service_tier"] == "auto"
+    assert std["container"] == {"id": "ctr_1"}
+    assert std["mcp_servers"] == [{"name": "tools"}]
+
+
 def test_dynamic_tool_map_seed_is_process_independent(m):
     cc = m["cc_mimicry"]
     tools = [

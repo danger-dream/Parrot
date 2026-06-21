@@ -16,6 +16,14 @@ from typing import Any, Optional
 import httpx
 
 from . import network
+from .protocols import errors as protocol_errors
+from .protocols.usage import (
+    UsageAccumulator,
+    legacy_usage_from_anthropic_json,
+    legacy_usage_from_openai_chat_json,
+    legacy_usage_from_openai_responses_json,
+    zero_legacy_usage,
+)
 
 
 _client: Optional[httpx.AsyncClient] = None
@@ -79,66 +87,16 @@ def set_client(client: httpx.AsyncClient) -> None:
 
 def extract_usage_from_json(obj: Any) -> dict:
     """非流式响应对象中的 usage 抽取为统一结构。"""
-    if not isinstance(obj, dict):
-        return _zero_usage()
-    u = obj.get("usage") or {}
-    return {
-        "input_tokens": int(u.get("input_tokens", 0) or 0),
-        "output_tokens": int(u.get("output_tokens", 0) or 0),
-        "cache_creation": int(u.get("cache_creation_input_tokens", 0) or 0),
-        "cache_read": int(u.get("cache_read_input_tokens", 0) or 0),
-    }
+    return legacy_usage_from_anthropic_json(obj)
 
 
 def _zero_usage() -> dict:
-    return {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
+    return zero_legacy_usage()
 
 
 def _format_stream_error_info(payload: Any, fallback: str = "upstream stream error") -> tuple[Optional[str], str]:
-    """Return (error_type_or_code, readable_message) for terminal SSE errors.
-
-    Different upstream protocols wrap stream errors differently:
-    - Anthropic: {"type":"error", "error":{"type":..., "message":...}}
-    - OpenAI chat: {"error":{"type":..., "message":...}}
-    - OpenAI responses event:error: {"type":"error", "error":{...}} or
-      {"type":"error", "error_type":..., "message":...}
-    - OpenAI responses failed: {"response":{"error":{...}}}
-
-    Keep this helper deliberately small and dependency-free; it feeds log_db only.
-    """
-    err = payload
-    if isinstance(payload, dict):
-        if isinstance(payload.get("error"), dict):
-            err = payload["error"]
-        elif isinstance(payload.get("response"), dict) and isinstance(payload["response"].get("error"), dict):
-            err = payload["response"]["error"]
-
-    if isinstance(err, dict):
-        code = (
-            err.get("code")
-            or err.get("type")
-            or err.get("error_type")
-            or err.get("status")
-        )
-        message = err.get("message") or err.get("reason") or fallback
-        if code and str(code) not in str(message):
-            return str(code), f"{code}: {message}"
-        return str(code) if code else None, str(message)
-
-    if isinstance(payload, dict):
-        top_type = payload.get("type")
-        code = (
-            payload.get("code")
-            or payload.get("error_type")
-            or (top_type if top_type != "error" else None)
-            or payload.get("status")
-        )
-        message = payload.get("message") or payload.get("reason") or fallback
-        if code and str(code) not in str(message):
-            return str(code), f"{code}: {message}"
-        return str(code) if code else None, str(message)
-
-    return None, fallback
+    """Return (error_type_or_code, readable_message) for terminal SSE errors."""
+    return protocol_errors.extract_error_info(payload, fallback=fallback)
 
 
 def _incomplete_stream_error_info(data: dict) -> tuple[str, str]:
@@ -207,7 +165,8 @@ class SSEUsageTracker:
     """
 
     def __init__(self):
-        self.usage = _zero_usage()
+        self._usage_acc = UsageAccumulator()
+        self.usage = self._usage_acc.legacy_dict()
         self._chunks: list[bytes] = []
         self._buf = b""
         # 是否已见到上游流的"收尾事件"。Anthropic: message_stop。见后判定
@@ -240,21 +199,11 @@ class SSEUsageTracker:
                 self.stream_error_code, self.stream_error_message = _format_stream_error_info(evt)
                 continue
             if t == "message_start":
-                u = (evt.get("message") or {}).get("usage") or {}
-                self.usage["input_tokens"] = int(u.get("input_tokens", 0) or 0)
-                self.usage["cache_creation"] = int(u.get("cache_creation_input_tokens", 0) or 0)
-                self.usage["cache_read"] = int(u.get("cache_read_input_tokens", 0) or 0)
+                self._usage_acc.update_from_anthropic_message_start((evt.get("message") or {}).get("usage") or {})
+                self.usage = self._usage_acc.legacy_dict()
             elif t == "message_delta":
-                u = evt.get("usage") or {}
-                if "output_tokens" in u:
-                    self.usage["output_tokens"] = int(u.get("output_tokens", 0) or 0)
-                # 智谱等上游在 message_delta 补发 input_tokens（message_start 为 0）
-                if "input_tokens" in u:
-                    self.usage["input_tokens"] = int(u.get("input_tokens", 0) or 0)
-                if "cache_read_input_tokens" in u:
-                    v = int(u.get("cache_read_input_tokens", 0) or 0)
-                    if v > self.usage["cache_read"]:
-                        self.usage["cache_read"] = v
+                self._usage_acc.update_from_anthropic_message_delta(evt.get("usage") or {})
+                self.usage = self._usage_acc.legacy_dict()
             elif t == "message_stop":
                 self.saw_stream_end = True
 
@@ -473,19 +422,7 @@ def is_downstream_visible_event(event_name: Optional[str], data: Optional[dict],
 
 def extract_usage_chat_json(obj: Any) -> dict:
     """从 /v1/chat/completions 非流式响应里抽 usage，归一到 4 键。"""
-    if not isinstance(obj, dict):
-        return _zero_usage()
-    u = obj.get("usage") or {}
-    details = u.get("prompt_tokens_details") or {}
-    prompt_total = int(u.get("prompt_tokens", 0) or 0)
-    cached = int(details.get("cached_tokens", 0) or 0)
-    return {
-        # 见文件顶部「语义对齐」说明：扣掉缓存命中部分，对齐 Anthropic 风格
-        "input_tokens": max(0, prompt_total - cached),
-        "output_tokens": int(u.get("completion_tokens", 0) or 0),
-        "cache_creation": 0,
-        "cache_read": cached,
-    }
+    return legacy_usage_from_openai_chat_json(obj)
 
 
 def parse_first_chat_sse_event(chunk: bytes) -> Optional[dict]:
@@ -524,7 +461,8 @@ class ChatSSEUsageTracker:
     """
 
     def __init__(self):
-        self.usage = _zero_usage()
+        self._usage_acc = UsageAccumulator()
+        self.usage = self._usage_acc.legacy_dict()
         self._chunks: list[bytes] = []
         self._buf = b""
         # Chat 流的收尾标记：[DONE] 或任一 choice 带 finish_reason。
@@ -563,15 +501,10 @@ class ChatSSEUsageTracker:
                             break
                 u = evt.get("usage")
                 if isinstance(u, dict):
-                    details = u.get("prompt_tokens_details") or {}
-                    prompt_total = int(u.get("prompt_tokens", 0) or 0)
-                    cached = int(details.get("cached_tokens", 0) or 0)
                     # 见文件顶部「语义对齐」说明：OpenAI 的 prompt_tokens 含
                     # cache，此处扣除后落库，保持与 Anthropic 语义一致。
-                    self.usage["input_tokens"] = max(0, prompt_total - cached)
-                    self.usage["output_tokens"] = int(u.get("completion_tokens", 0) or 0)
-                    self.usage["cache_read"] = cached
-                    # cache_creation 在 OpenAI 里没有对应概念，保持 0
+                    self._usage_acc.set_from_openai_chat_usage(u)
+                    self.usage = self._usage_acc.legacy_dict()
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")
@@ -691,20 +624,7 @@ class ChatSSEAssistantBuilder:
 
 def extract_usage_responses_json(obj: Any) -> dict:
     """从 /v1/responses 非流式响应里抽 usage。"""
-    if not isinstance(obj, dict):
-        return _zero_usage()
-    u = obj.get("usage") or {}
-    in_details = u.get("input_tokens_details") or {}
-    prompt_total = int(u.get("input_tokens", 0) or 0)
-    cached = int(in_details.get("cached_tokens", 0) or 0)
-    return {
-        # 见文件顶部「语义对齐」说明：Responses API 的 input_tokens 同样含
-        # 缓存命中部分，此处扣除后落库。
-        "input_tokens": max(0, prompt_total - cached),
-        "output_tokens": int(u.get("output_tokens", 0) or 0),
-        "cache_creation": 0,
-        "cache_read": cached,
-    }
+    return legacy_usage_from_openai_responses_json(obj)
 
 
 def parse_first_responses_sse_event(chunk: bytes) -> Optional[dict]:
@@ -749,7 +669,8 @@ class ResponsesSSEUsageTracker:
     """从 /v1/responses SSE 中抽取 usage，usage 出现在 `response.completed` / `.failed` / `.incomplete` 事件里。"""
 
     def __init__(self):
-        self.usage = _zero_usage()
+        self._usage_acc = UsageAccumulator()
+        self.usage = self._usage_acc.legacy_dict()
         self._chunks: list[bytes] = []
         self._buf = b""
         # Responses 流的收尾事件：completed / failed / incomplete 之一。
@@ -788,14 +709,9 @@ class ResponsesSSEUsageTracker:
             if event_name in ("response.completed", "response.failed", "response.incomplete"):
                 resp = data.get("response") if isinstance(data, dict) else None
                 if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
-                    u = resp["usage"]
-                    in_details = u.get("input_tokens_details") or {}
-                    prompt_total = int(u.get("input_tokens", 0) or 0)
-                    cached = int(in_details.get("cached_tokens", 0) or 0)
                     # 见文件顶部「语义对齐」说明：扣掉缓存命中部分后落库。
-                    self.usage["input_tokens"] = max(0, prompt_total - cached)
-                    self.usage["output_tokens"] = int(u.get("output_tokens", 0) or 0)
-                    self.usage["cache_read"] = cached
+                    self._usage_acc.set_from_openai_responses_usage(resp["usage"])
+                    self.usage = self._usage_acc.legacy_dict()
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")

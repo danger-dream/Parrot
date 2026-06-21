@@ -5,3 +5,4 @@
 
 # pytest: used only under src/tests/ (no production code imports it).
 pytest>=8.0
+pytest-asyncio>=1.0

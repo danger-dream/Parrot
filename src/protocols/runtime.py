@@ -1,0 +1,640 @@
+"""Protocol runtime primitives shared by failover transports.
+
+Phase 9 moves protocol-specific helpers out of the HTTP/WS failover loops while
+keeping their legacy behaviour.  This module intentionally contains only pure
+selection/encoding/data-shape code: no network I/O, scheduler mutations, or
+cooldown writes live here.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from .. import blacklist, errors
+from ..providers import registry as provider_registry
+from .commit_gate import is_responses_visible_event_type
+from . import registry as protocol_registry
+
+
+def toolkit_for_channel(channel) -> dict[str, Any]:
+    """Return the legacy protocol toolkit dict for a channel.
+
+    The failover loops still consume the historical dict shape.  The registry
+    owns the protocol table, and unknown protocols fail loudly instead of
+    silently parsing with the wrong codec.
+    """
+    proto = getattr(channel, "protocol", "anthropic")
+    try:
+        return protocol_registry.get_toolkit(proto).as_legacy_dict()
+    except KeyError as exc:
+        raise ValueError(
+            f"no upstream toolkit registered for protocol {proto!r} "
+            f"(channel={getattr(channel, 'key', '?')})"
+        ) from exc
+
+
+_ERR_TYPE_ANTHROPIC_TO_OPENAI = {
+    errors.ErrType.API: errors.ErrTypeOpenAI.SERVER,
+    errors.ErrType.TIMEOUT: errors.ErrTypeOpenAI.TIMEOUT,
+    errors.ErrType.RATE_LIMIT: errors.ErrTypeOpenAI.RATE_LIMIT,
+    errors.ErrType.INVALID_REQUEST: errors.ErrTypeOpenAI.INVALID_REQUEST,
+    errors.ErrType.AUTH: errors.ErrTypeOpenAI.AUTH,
+    errors.ErrType.PERMISSION: errors.ErrTypeOpenAI.PERMISSION,
+    errors.ErrType.NOT_FOUND: errors.ErrTypeOpenAI.NOT_FOUND,
+    errors.ErrType.OVERLOADED: errors.ErrTypeOpenAI.SERVER,
+    errors.ErrType.REQUEST_TOO_LARGE: errors.ErrTypeOpenAI.INVALID_REQUEST,
+}
+
+
+def translate_error_type(anth_type: str, ingress: str) -> str:
+    if ingress == "anthropic":
+        return anth_type
+    return _ERR_TYPE_ANTHROPIC_TO_OPENAI.get(anth_type, errors.ErrTypeOpenAI.API)
+
+
+def sse_error_for_ingress(ingress: str, anth_err_type: str, message: str) -> bytes:
+    if ingress == "anthropic":
+        return errors.sse_error_line(anth_err_type, message)
+    mapped = translate_error_type(anth_err_type, ingress)
+    if ingress == "chat":
+        return errors.sse_error_line_chat(mapped, message)
+    return errors.sse_error_line_responses(mapped, message)
+
+
+def json_error_for_ingress(ingress: str, status: int, anth_err_type: str, message: str):
+    if ingress == "anthropic":
+        return errors.json_error_response(status, anth_err_type, message)
+    mapped = translate_error_type(anth_err_type, ingress)
+    return errors.json_error_openai(status, mapped, message)
+
+
+def make_stream_translator(translator_ctx: Optional[dict]):
+    """Instantiate the response stream translator described by translator_ctx."""
+    if not isinstance(translator_ctx, dict):
+        return None
+    name = translator_ctx.get("response_translator")
+    model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_to_responses":
+        from ..openai.transform.stream_r2c import StreamTranslator as _R2C
+        return _R2C(
+            model=model,
+            include_usage=bool(translator_ctx.get("include_usage", False)),
+        )
+    if name == "responses_to_chat":
+        from ..openai.transform.stream_c2r import StreamTranslator as _C2R
+        return _C2R(
+            model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
+    if name == "anthropic_to_chat":
+        from ..openai.transform.stream_chat_to_anthropic import StreamTranslator as _C2A
+        return _C2A(model=model)
+    if name == "anthropic_to_responses":
+        from ..openai.transform.stream_responses_to_anthropic import StreamTranslator as _R2A
+        return _R2A(model=model)
+    if name == "chat_to_anthropic":
+        from ..openai.transform.stream_anthropic_to_chat import StreamTranslator as _A2C
+        return _A2C(
+            model=model,
+            include_usage=bool(translator_ctx.get("include_usage", False)),
+        )
+    if name == "responses_to_anthropic":
+        from ..openai.transform.stream_anthropic_to_responses import StreamTranslator as _A2R
+        return _A2R(
+            model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+            request_body=translator_ctx.get("request_body"),
+        )
+    return None
+
+
+def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dict:
+    """Translate an upstream non-stream response back to the ingress protocol."""
+    if not isinstance(translator_ctx, dict):
+        return obj
+    name = translator_ctx.get("response_translator")
+    model = translator_ctx.get("model_for_response") or ""
+    if name == "chat_to_responses":
+        from ..openai.transform.chat_to_responses import translate_response as _t
+        return _t(obj, model=model)
+    if name == "responses_to_chat":
+        from ..openai.transform.responses_to_chat import translate_response as _t2
+        return _t2(
+            obj,
+            model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
+    if name == "anthropic_to_chat":
+        from ..openai.transform.anthropic_to_chat import translate_response as _t3
+        return _t3(obj, model=model)
+    if name == "chat_to_anthropic":
+        from ..openai.transform.chat_to_anthropic import translate_response as _t4
+        return _t4(obj, model=model)
+    if name == "anthropic_to_responses":
+        from ..openai.transform.anthropic_to_responses import translate_response as _t5
+        return _t5(obj, model=model)
+    if name == "responses_to_anthropic":
+        from ..openai.transform.responses_to_anthropic import translate_response as _t6
+        return _t6(
+            obj,
+            model=model,
+            previous_response_id=translator_ctx.get("previous_response_id"),
+            api_key_name=translator_ctx.get("api_key_name"),
+            channel_key=translator_ctx.get("channel_key"),
+            current_input_items=translator_ctx.get("current_input_items"),
+        )
+    return obj
+
+
+@dataclass
+class AttemptResult:
+    outcome: str
+    success: bool = False
+    stream_started: bool = False
+    response: Any = None
+    http_status: Optional[int] = None
+    connect_ms: Optional[int] = None
+    first_byte_ms: Optional[int] = None
+    total_ms: Optional[int] = None
+    error_detail: Optional[str] = None
+    usage: dict = field(default_factory=lambda: {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation": 0,
+        "cache_read": 0,
+    })
+    full_response_text: Optional[str] = None
+    assistant_response: Optional[dict] = None
+    proxy_name: Optional[str] = None
+    proxy_bytes_up: int = 0
+    proxy_bytes_down: int = 0
+    translator_ctx: Optional[dict] = None
+
+
+@dataclass
+class PreparedNonStreamResponse:
+    obj: dict | None = None
+    restored: bytes | None = None
+    restored_text: str = ""
+    usage: dict = field(default_factory=lambda: {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation": 0,
+        "cache_read": 0,
+    })
+    assistant_msg: dict = field(default_factory=dict)
+    error: AttemptResult | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and isinstance(self.obj, dict) and self.restored is not None
+
+
+async def prepare_non_stream_response(
+    channel,
+    raw: bytes,
+    *,
+    dynamic_map: Optional[dict],
+    connect_ms: int,
+    total_ms: int,
+    translator_ctx: Optional[dict] = None,
+) -> PreparedNonStreamResponse:
+    """Restore, parse, and classify a non-stream upstream response.
+
+    Provider restoration happens before protocol parsing and before any
+    cross-protocol response translator.  Scheduler scoring, DB writes, affinity,
+    and response construction intentionally stay in the caller.
+    """
+    restored = await provider_registry.restore_response_bytes(
+        channel,
+        raw,
+        dynamic_map=dynamic_map,
+        translator_ctx=translator_ctx,
+    )
+    restored_text = (
+        restored.decode("utf-8", errors="replace")
+        if isinstance(restored, bytes)
+        else str(restored)
+    )
+
+    try:
+        obj = json.loads(restored)
+    except Exception as exc:
+        return PreparedNonStreamResponse(
+            restored=restored,
+            restored_text=restored_text,
+            error=AttemptResult(
+                outcome="upstream_malformed",
+                connect_ms=connect_ms,
+                total_ms=total_ms,
+                error_detail=f"non-JSON response: {exc}",
+            ),
+        )
+
+    toolkit = toolkit_for_channel(channel)
+
+    if toolkit["is_upstream_error_json"](obj):
+        return PreparedNonStreamResponse(
+            obj=obj,
+            restored=restored,
+            restored_text=restored_text,
+            error=AttemptResult(
+                outcome="upstream_error_json",
+                connect_ms=connect_ms,
+                total_ms=total_ms,
+                error_detail=json.dumps(obj.get("error", obj), ensure_ascii=False)[:2000],
+                translator_ctx=translator_ctx,
+            ),
+        )
+
+    bl_hit = blacklist.match(restored, getattr(channel, "key", ""))
+    if bl_hit:
+        return PreparedNonStreamResponse(
+            obj=obj,
+            restored=restored,
+            restored_text=restored_text,
+            error=AttemptResult(
+                outcome="blacklist_hit",
+                connect_ms=connect_ms,
+                total_ms=total_ms,
+                error_detail=f"blacklist: {bl_hit}",
+            ),
+        )
+
+    usage = toolkit["extract_usage_json"](obj)
+    assistant_msg = {
+        "role": obj.get("role", "assistant"),
+        "content": obj.get("content") or [],
+    }
+    return PreparedNonStreamResponse(
+        obj=obj,
+        restored=restored,
+        restored_text=restored_text,
+        usage=usage,
+        assistant_msg=assistant_msg,
+    )
+
+
+OUTCOMES_NO_COOLDOWN = frozenset({
+    "success",
+    "http_auth_error",
+    "transform_error",
+    "guard_error",
+    "candidate_guard",
+    "request_invalid",
+    "client_disconnected",
+})
+
+
+def should_cooldown(outcome: str) -> bool:
+    return outcome not in OUTCOMES_NO_COOLDOWN
+
+
+def should_record_failure(outcome: str) -> bool:
+    """Whether an unsuccessful attempt should affect channel health scoring."""
+    return outcome != "candidate_guard"
+
+
+def failover_final_http_status(result: Any | None) -> int:
+    """HTTP status for the final all-candidates-failed JSON response."""
+    outcome = getattr(result, "outcome", None)
+    if outcome in ("connect_timeout", "first_byte_timeout", "total_timeout"):
+        return 504
+    if outcome in ("connect_error", "transport_error"):
+        return 502
+    if outcome == "candidate_guard":
+        return int(getattr(result, "http_status", None) or 400)
+    return 503
+
+
+def upstream_ws_http_status_from_attempt(result: Any) -> int:
+    """HTTP-style status for OpenAI OAuth Responses upstream WS attempts."""
+    http_status = getattr(result, "http_status", None)
+    if http_status is not None:
+        return int(http_status)
+    outcome = getattr(result, "outcome", None)
+    if outcome in ("connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout"):
+        return 504
+    if outcome in ("blacklist_hit", "upstream_error_json", "stream_upstream_error"):
+        return 503
+    if outcome in ("guard_error", "candidate_guard", "request_invalid"):
+        return 400
+    return 502
+
+
+def responses_ws_http_status_from_attempt(result: Any | None) -> int:
+    """HTTP-style status used by the downstream /v1/responses WS ingress."""
+    if result is not None and getattr(result, "http_status", None):
+        return int(getattr(result, "http_status"))
+    outcome = getattr(result, "outcome", None) if result is not None else None
+    if outcome in ("connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout"):
+        return 504
+    if outcome in ("connect_error", "transport_error", "upstream_closed", "closed_before_first_byte"):
+        return 502
+    if outcome == "client_disconnected":
+        return 499
+    if outcome in ("guard_error", "candidate_guard", "request_invalid"):
+        return 400
+    return 503
+
+
+def ws_close_code_for_http_status(status: int) -> int:
+    if status == 400:
+        return 4400
+    if status == 401:
+        return 4401
+    if status == 403:
+        return 4403
+    if status == 404:
+        return 4404
+    if status == 429:
+        return 4429
+    if status == 504:
+        return 4504
+    return 4500 if status >= 500 else 4400
+
+
+def format_responses_ws_error(evt: dict) -> str:
+    """Return the legacy human-readable detail for a Responses WS error event."""
+    err = evt.get("error")
+    if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("error"), dict):
+        err = evt["response"]["error"]
+    if isinstance(err, dict):
+        code = err.get("code") or err.get("type") or err.get("error_type")
+        message = err.get("message") or err.get("reason") or "upstream websocket error"
+        return f"{code}: {message}" if code and str(code) not in str(message) else str(message)
+    message = evt.get("message") or evt.get("reason") or "upstream websocket error"
+    code = evt.get("code") or evt.get("error_type") or evt.get("type")
+    return f"{code}: {message}" if code and code != "error" and str(code) not in str(message) else str(message)
+
+
+def responses_ws_error_detail(data: str | bytes) -> tuple[Optional[int], str]:
+    """Extract HTTP-ish status and short detail from a Responses WS error frame."""
+    if not isinstance(data, str):
+        return None, "upstream websocket error"
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return None, data[:2000]
+    if not isinstance(obj, dict):
+        return None, str(obj)[:2000]
+
+    err: Any = obj.get("error")
+    if isinstance(obj.get("response"), dict) and isinstance(obj["response"].get("error"), dict):
+        err = obj["response"]["error"]
+
+    status = obj.get("status")
+    if isinstance(err, dict):
+        status = err.get("status") or status
+        detail = format_responses_ws_error(obj)
+    else:
+        msg = obj.get("message") or obj.get("reason") or json.dumps(obj, ensure_ascii=False)
+        detail = str(msg)
+
+    try:
+        status_i = int(status) if status is not None else None
+    except Exception:
+        status_i = None
+    return status_i, detail[:2000]
+
+
+def parse_wrapped_responses_ws_error(text: str) -> Optional[dict]:
+    """Parse a top-level Responses WS ``type:error`` frame before accept."""
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "error":
+        return None
+    status = obj.get("status") or obj.get("status_code")
+    raw_err = obj.get("error")
+    err = raw_err if isinstance(raw_err, dict) else obj
+    code = err.get("code") or err.get("type") or obj.get("code")
+    message = err.get("message") or obj.get("message") or text[:2000]
+    return {"status": int(status) if isinstance(status, int) else None, "code": code, "message": message}
+
+
+def is_retryable_responses_ws_error_before_accept(err: dict) -> bool:
+    status = err.get("status")
+    code = str(err.get("code") or "")
+    if code == "websocket_connection_limit_reached":
+        return True
+    return isinstance(status, int) and status in (401, 403, 429, 500, 502, 503, 504)
+
+
+def is_responses_ws_visible_event_type(event_type: str | None) -> bool:
+    return is_responses_visible_event_type(event_type)
+
+
+def is_invalid_encrypted_content_error(error_detail: Optional[str]) -> bool:
+    """OpenAI/Codex encrypted_content validation failures are request-scoped."""
+    low = str(error_detail or "").lower()
+    if not low:
+        return False
+    return (
+        "invalid_encrypted_content" in low
+        or ("encrypted content" in low and (
+            "could not be verified" in low
+            or "could not be decrypted" in low
+            or "could not be decrypted or parsed" in low
+        ))
+    )
+
+
+_CONTEXT_OVERFLOW_HINT_RE = re.compile(
+    r"context.*(?:overflow|too\s+(?:large|long)|exceed|limit|max(?:imum)?|tokens)"
+    r"|context window.*(?:exceed|over|limit|max(?:imum)?|requested|sent|tokens)"
+    r"|prompt.*(?:too\s+(?:large|long)|exceed|over|limit|max(?:imum)?)"
+    r"|(?:request|input).*(?:context|window|length|token).*"
+    r"(?:too\s+(?:large|long)|exceed|over|limit|max(?:imum)?)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_rate_limit_or_quota(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "rate_limit",
+            "requests per minute",
+            "tokens per minute",
+            "request per minute",
+            "token per minute",
+            "quota",
+        )
+    ) or re.search(r"\b(?:rpm|tpm)\b", text) is not None
+
+
+def is_context_length_exceeded_error(error_detail: Optional[str]) -> bool:
+    """Return True for provider/client errors meaning the prompt is too large."""
+    raw = str(error_detail or "")
+    low = raw.lower()
+    if not low:
+        return False
+
+    # Groq and some OpenAI-compatible providers use token wording for TPM/RPM
+    # rate limits. Those must remain ordinary upstream/rate-limit failures.
+    if _looks_like_rate_limit_or_quota(low):
+        return False
+
+    precise_markers = (
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "model_context_window_exceeded",
+        "request_too_large",
+    )
+    if any(marker in low for marker in precise_markers):
+        return True
+
+    direct_phrases = (
+        "request exceeds the maximum size",
+        "context length exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "prompt too long",
+        "exceeds model context window",
+        "model token limit",
+        "exceed context limit",
+        "exceeds the model's maximum context",
+        "input is too long for this model",
+        "input too long for the model",
+        "input exceeds the maximum number of tokens",
+    )
+    if any(phrase in low for phrase in direct_phrases):
+        return True
+
+    has_request_size_exceeds = "request size exceeds" in low
+    has_context_window = (
+        "context window" in low
+        or "context length" in low
+        or "maximum context length" in low
+    )
+    if has_request_size_exceeds and has_context_window:
+        return True
+    if "input length" in low and "exceed" in low and "context" in low:
+        return True
+    if "max_tokens" in low and "exceed" in low and "context" in low:
+        return True
+    if "413" in low and "too large" in low:
+        return True
+    if any(phrase in raw for phrase in ("上下文过长", "上下文超出", "上下文长度超", "超出最大上下文", "请压缩上下文")):
+        return True
+
+    return bool(_CONTEXT_OVERFLOW_HINT_RE.search(raw))
+
+
+def _request_invalid_status(result: AttemptResult) -> int:
+    if isinstance(result.http_status, int) and 400 <= result.http_status < 500:
+        return int(result.http_status)
+    return 400
+
+
+def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
+    result.outcome = "request_invalid"
+    result.http_status = int(status)
+    if result.response is None:
+        result.stream_started = False
+    return result
+
+
+def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
+    if is_invalid_encrypted_content_error(result.error_detail):
+        return _mark_request_invalid(result, 400)
+    if is_context_length_exceeded_error(result.error_detail):
+        return _mark_request_invalid(result, _request_invalid_status(result))
+    return result
+
+
+def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        removed = 0
+        for k, v in value.items():
+            if k == "encrypted_content":
+                removed += 1
+                continue
+            if isinstance(v, list):
+                new_list: list[Any] = []
+                for item in v:
+                    if isinstance(item, dict) and item.get("type") == "encrypted_content":
+                        removed += 1
+                        continue
+                    new_item, n = _strip_encrypted_content_value(item)
+                    removed += n
+                    new_list.append(new_item)
+                out[k] = new_list
+                continue
+            new_v, n = _strip_encrypted_content_value(v)
+            removed += n
+            out[k] = new_v
+        return out, removed
+    if isinstance(value, list):
+        out = []
+        removed = 0
+        for item in value:
+            new_item, n = _strip_encrypted_content_value(item)
+            removed += n
+            out.append(new_item)
+        return out, removed
+    return value, 0
+
+
+def retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
+    """Build a one-shot fallback request by stripping downstream EC from input."""
+    retry_body = copy.deepcopy(body)
+    inp = retry_body.get("input")
+    if not isinstance(inp, list):
+        return retry_body, 0
+    new_input: list[Any] = []
+    removed = 0
+    for item in inp:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            removed += 1
+            continue
+        new_item, n = _strip_encrypted_content_value(item)
+        removed += n
+        new_input.append(new_item)
+    retry_body["input"] = new_input
+    return retry_body, removed
+
+
+def is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
+    """Whether a context-1m entitlement error should retry without context-1m."""
+    if result.http_status != 429:
+        return False
+    if result.outcome not in ("http_error", "upstream_error_json"):
+        return False
+    if "usage credits are required for long context requests" not in (result.error_detail or "").lower():
+        return False
+    from ..transform import cc_mimicry
+    if not cc_mimicry.model_supports_context_1m(resolved_model):
+        return False
+    if body.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY) is True:
+        return True
+    return cc_mimicry.request_wants_context_1m(
+        body,
+        downstream_betas=body.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY),
+        original_model=body.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY),
+        resolved_model=resolved_model,
+    )
+
+
+def retry_body_without_context_1m(body: dict) -> dict:
+    from ..transform import cc_mimicry
+    retry_body = dict(body)
+    retry_body[cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY] = False
+    return retry_body

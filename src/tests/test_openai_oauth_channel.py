@@ -10,7 +10,8 @@
   - OpenAIOAuthChannel.build_upstream_request：
       * responses ingress 透传 + 强制改造 + 完整 headers
       * chat ingress 先走 chat_to_responses.translate_request 再 codex transform
-      * anthropic ingress 直接抛（本家族兼容，不跨家族）
+      * anthropic ingress 翻译成 Responses shape 后走 Codex
+      * 有稳定 session anchor 时附带 Codex reasoning replay scope
       * 老版本缺 chatgpt_account_id 时继续不带该 header 请求
   - supports_model / list_client_models 覆盖账户 models 与默认 codex 列表
 
@@ -28,9 +29,18 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import base64
 import json
 import os
 import sys
+
+
+def _valid_encrypted_content(seed: int = 1) -> str:
+    payload = bytearray(1 + 8 + 16 + 16 + 32)
+    payload[0] = 0x80
+    for i in range(9, len(payload)):
+        payload[i] = (seed + i) % 256
+    return base64.urlsafe_b64encode(bytes(payload)).decode("ascii").rstrip("=")
 
 
 def _import_modules():
@@ -45,6 +55,7 @@ def _import_modules():
         OpenAIOAuthChannel, CODEX_UPSTREAM_URL, CODEX_CLI_USER_AGENT,
     )
     from src.openai.channel.registration import register_factories
+    from src.openai import reasoning_replay
     from src.openai.transform import codex_oauth_transform as transform
     # 必须注册 openai API factory 否则 config 里的 openai-* api channel 会走错分支
     register_factories()
@@ -56,11 +67,13 @@ def _import_modules():
         "CODEX_UPSTREAM_URL": CODEX_UPSTREAM_URL,
         "CODEX_CLI_USER_AGENT": CODEX_CLI_USER_AGENT,
         "transform": transform,
+        "reasoning_replay": reasoning_replay,
     }
 
 
 def _setup(m):
     m["state_db"].init()
+    m["reasoning_replay"].clear()
     def _reset(c):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
@@ -101,6 +114,7 @@ def test_transform_basic(m):
         "metadata": {"x": 1},
         "safety_identifier": "sid",
         "stream_options": {"include_usage": True},
+        "background": False,
     }
     out = t.apply_codex_oauth_transform(body)
     assert out["model"] == "gpt-5"                 # 直接透传（不再做别名映射）
@@ -108,7 +122,7 @@ def test_transform_basic(m):
     assert out["stream"] is True                   # 强制
     for k in ("temperature", "top_p", "max_output_tokens",
               "frequency_penalty", "presence_penalty", "prompt_cache_retention",
-              "user", "metadata", "safety_identifier", "stream_options"):
+              "user", "metadata", "safety_identifier", "stream_options", "background"):
         assert k not in out, f"{k} should be stripped"
     assert out["input"] == [{"type": "message", "role": "user", "content": "hi"}]
     assert out["instructions"] == "You are a helpful coding assistant."
@@ -408,7 +422,7 @@ def test_channel_responses_ingress(m):
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1",
                                                 ingress_protocol="responses"))
     assert req.url == m["CODEX_UPSTREAM_URL"]
-    assert req.translator_ctx is None          # 同协议透传无需反向
+    assert req.translator_ctx is None          # 无 session anchor 时同协议透传无需 ctx
     h = {k.lower(): v for k, v in req.headers.items()}
     assert h["chatgpt-account-id"] == "acct-123"
     assert h["openai-beta"] == "responses=experimental"
@@ -426,6 +440,28 @@ def test_channel_responses_ingress(m):
     print("  [PASS] channel: responses ingress → full codex request shape")
 
 
+def test_channel_responses_ingress_replay_scope_and_injection(m):
+    _setup(m)
+    _add_openai_acc(m)
+    rr = m["reasoning_replay"]
+    encrypted_content = _valid_encrypted_content(13)
+    rr.cache_items(
+        "gpt-5.1",
+        "prompt-cache:anchor",
+        [{"type": "reasoning", "encrypted_content": encrypted_content}],
+    )
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {"model": "gpt-5.1", "input": "continue", "prompt_cache_key": "anchor"}
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
+    ctx = req.translator_ctx
+    assert ctx["codex_reasoning_replay"] == {"model": "gpt-5.1", "session_key": "prompt-cache:anchor"}
+    assert ctx["codex_reasoning_replay_injected"] == 1
+    payload = json.loads(req.body)
+    assert payload["input"][0] == {"type": "reasoning", "summary": [], "content": None, "encrypted_content": encrypted_content}
+    assert payload["input"][1] == {"type": "message", "role": "user", "content": "continue"}
+    print("  [PASS] channel: responses ingress injects cached reasoning replay")
+
+
 def test_channel_chat_ingress_translator(m):
     _setup(m)
     _add_openai_acc(m)
@@ -435,6 +471,8 @@ def test_channel_chat_ingress_translator(m):
         "messages": [{"role": "user", "content": "hi"}],
         "stream": True,
         "stream_options": {"include_usage": True},
+        "response_format": {"type": "json_schema"},
+        "_api_key_name": "internal",
     }
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1",
                                                 ingress_protocol="chat"))
@@ -448,10 +486,47 @@ def test_channel_chat_ingress_translator(m):
     payload = json.loads(req.body)
     # chat→responses translator 应该已把 messages 翻译成 input
     assert isinstance(payload.get("input"), list) and payload["input"]
+    assert "response_format" not in payload
+    assert "_api_key_name" not in payload
     # codex transform 强制 flag
     assert payload["stream"] is True
     assert payload["store"] is False
     print("  [PASS] channel: chat ingress → translator_ctx + input converted")
+
+
+def test_channel_filters_translated_payload_before_codex_transform(m, monkeypatch):
+    _setup(m)
+    _add_openai_acc(m)
+    from src.channel import openai_oauth_channel as oauth_mod
+
+    def fake_translate_request(body, *, target_model=None, codex_oauth=False):
+        return {
+            "model": target_model or body.get("model"),
+            "input": "hi",
+            "stream": False,
+            "messages": [{"role": "user", "content": "should not leak"}],
+            "response_format": {"type": "json_schema"},
+            "container": {"id": "anthropic-only"},
+            "_api_key_name": "internal",
+        }
+
+    monkeypatch.setattr(oauth_mod.anthropic_to_responses, "translate_request", fake_translate_request)
+
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5.1", "messages": [{"role": "user", "content": "hi"}]},
+        "gpt-5.1",
+        ingress_protocol="anthropic",
+    ))
+    payload = json.loads(req.body)
+
+    assert payload["model"] == "gpt-5.1"
+    assert payload["store"] is False
+    assert payload["stream"] is True
+    assert "messages" not in payload
+    assert "response_format" not in payload
+    assert "container" not in payload
+    assert "_api_key_name" not in payload
 
 
 def test_channel_previous_response_id_rejected(m):
@@ -470,19 +545,105 @@ def test_channel_previous_response_id_rejected(m):
     print("  [PASS] channel: previous_response_id rejected on OAuth store=false route")
 
 
-def test_channel_anthropic_ingress_rejected(m):
+def test_channel_codex_rejects_unsupported_responses_server_state(m):
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+
+    for body, label in (
+        ({"model": "gpt-5.1", "conversation": "conv_1", "input": "hi"}, "conversation"),
+        ({"model": "gpt-5.1", "background": True, "input": "hi"}, "background"),
+        ({"model": "gpt-5.1", "input": "hi", "tools": [{"type": "web_search", "name": "search"}]}, "tools:web_search"),
+        ({"model": "gpt-5.1", "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_file", "file_id": "file_doc"},
+        ]}]}, "input_file.file_id"),
+        ({"model": "gpt-5.1", "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "AAAA"}},
+        ]}]}, "input_audio"),
+    ):
+        try:
+            asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
+            raise AssertionError("expected ValueError")
+        except ValueError as exc:
+            assert label in str(exc), str(exc)
+
+    print("  [PASS] channel: Codex rejects unsupported Responses server-state before upstream")
+
+
+def test_channel_codex_rejects_translated_chat_file_id(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+
     try:
-        asyncio.run(ch.build_upstream_request(
-            {"model": "gpt-5.1", "input": "hi"}, "gpt-5.1",
-            ingress_protocol="anthropic",
-        ))
+        asyncio.run(ch.build_upstream_request({
+            "model": "gpt-5.1",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"file_id": "file_img"}},
+            ]}],
+        }, "gpt-5.1", ingress_protocol="chat"))
         raise AssertionError("expected ValueError")
     except ValueError as exc:
-        assert "only serves" in str(exc) or "anthropic" in str(exc), str(exc)
-    print("  [PASS] channel: anthropic ingress rejected with ValueError")
+        assert "input_image.file_id" in str(exc), str(exc)
+
+    print("  [PASS] channel: translated Chat file_id rejected on Codex route")
+
+
+def test_channel_anthropic_ingress_translator(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {
+        "model": "gpt-5.1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 32,
+        "stream": False,
+    }
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
+    assert req.url == m["CODEX_UPSTREAM_URL"]
+    ctx = req.translator_ctx
+    assert ctx["ingress"] == "anthropic"
+    assert ctx["upstream_protocol"] == "openai-responses"
+    assert ctx["response_translator"] == "anthropic_to_responses"
+    assert ctx["model_for_response"] == "gpt-5.1"
+    payload = json.loads(req.body)
+    assert payload["model"] == "gpt-5.1"
+    assert payload["store"] is False
+    assert payload["stream"] is True
+    # Anthropic→Responses translator 先把 messages 转成 input；Codex transform
+    # 再保留 include=reasoning.encrypted_content 透明透传能力。
+    assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    assert payload["include"] == ["reasoning.encrypted_content"]
+    assert "max_output_tokens" not in payload   # Codex transform 会剥不支持字段
+    print("  [PASS] channel: anthropic ingress → codex responses translator_ctx")
+
+
+def test_channel_anthropic_ingress_metadata_session_replay(m):
+    _setup(m)
+    _add_openai_acc(m)
+    rr = m["reasoning_replay"]
+    encrypted_content = _valid_encrypted_content(17)
+    rr.cache_items(
+        "gpt-5.1",
+        "claude:session-abc",
+        [{"type": "reasoning", "encrypted_content": encrypted_content}],
+    )
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {
+        "model": "gpt-5.1",
+        "messages": [{"role": "user", "content": "continue"}],
+        "max_tokens": 32,
+        "metadata": {"user_id": '{"session_id":"session-abc"}'},
+    }
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
+    ctx = req.translator_ctx
+    assert ctx["codex_reasoning_replay"] == {"model": "gpt-5.1", "session_key": "claude:session-abc"}
+    assert ctx["codex_reasoning_replay_injected"] == 1
+    payload = json.loads(req.body)
+    assert payload["input"][0]["type"] == "reasoning"
+    assert payload["input"][0]["encrypted_content"] == encrypted_content
+    assert "metadata" not in payload  # Codex transform strips API metadata after deriving scope.
+    print("  [PASS] channel: anthropic metadata session injects reasoning replay")
 
 
 def test_channel_missing_chatgpt_account_id_legacy_keeps_working(m):
@@ -723,7 +884,7 @@ def test_codex_transform_reasoning_with_enc_preserved():
     out = t.apply_codex_oauth_transform(
         {"model": "gpt-5.5", "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-            {"type": "reasoning", "encrypted_content": "gAAAAreal", "summary": []},
+            {"type": "reasoning", "encrypted_content": _valid_encrypted_content(19), "summary": []},
         ]},
         resolved_model="gpt-5.5")
     kinds = [it.get("type") for it in out["input"]]

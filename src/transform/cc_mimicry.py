@@ -23,6 +23,7 @@ import uuid
 
 import xxhash
 
+from .. import cache_hints
 from .. import config as _ap_config
 
 
@@ -135,7 +136,7 @@ def compute_fingerprint(messages):
 
 # ─── System prompt ───（与 cc-proxy 一字不改）
 
-def build_system_blocks(messages):
+def build_system_blocks(messages, *, inject_cache=True):
     fp = compute_fingerprint(messages)
     version = f"{CC_VERSION}.{fp}"
     cfg = load_config()
@@ -149,9 +150,10 @@ def build_system_blocks(messages):
             parts.append(f"cch={_normalize_cch_value(cfg.get('cch_static_value', '00000'))}")
         attribution = "x-anthropic-billing-header: " + "; ".join(parts) + ";"
         blocks.append({"type": "text", "text": attribution})
-    blocks.append(
-        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-    )
+    cc_block = {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+    if inject_cache:
+        cc_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    blocks.append(cc_block)
     return blocks
 
 
@@ -347,7 +349,7 @@ def _is_anthropic_server_tool(tool):
     )
 
 
-def _normalize_anthropic_tool(tool):
+def _normalize_anthropic_tool(tool, *, preserve_cache_control=False):
     """Normalize one downstream Anthropic tool to the CC-compatible API shape.
 
     Mirrors Claude Code's toolToAPISchema choke point: standard custom tools are
@@ -358,9 +360,14 @@ def _normalize_anthropic_tool(tool):
     if not isinstance(tool, dict):
         return tool
     if _is_anthropic_server_tool(tool):
+        if preserve_cache_control:
+            return dict(tool)
         return {k: v for k, v in tool.items() if k != "cache_control"}
 
-    normalized = {k: v for k, v in tool.items() if k in _ANTHROPIC_TOOL_ALLOWED_KEYS and k != "cache_control"}
+    normalized = {
+        k: v for k, v in tool.items()
+        if k in _ANTHROPIC_TOOL_ALLOWED_KEYS and (preserve_cache_control or k != "cache_control")
+    }
 
     # OpenAI/chat-style compatibility: {type:function,function:{name,description,parameters}}
     fn = tool.get("function")
@@ -383,9 +390,9 @@ def _normalize_anthropic_tool(tool):
     return normalized
 
 
-def _strip_tool_cache_control(tools):
+def _strip_tool_cache_control(tools, *, preserve_cache_control=False):
     """移除客户端在 tools 上设置的 cache_control，并规范化普通 client tools。"""
-    return [_normalize_anthropic_tool(tool) for tool in tools]
+    return [_normalize_anthropic_tool(tool, preserve_cache_control=preserve_cache_control) for tool in tools]
 
 
 def add_cache_breakpoints(messages):
@@ -657,14 +664,16 @@ def apply_opus_adaptive_thinking(payload, model):
 # ─── 请求转换 ───（仅签名参数化 email；函数体与 cc-proxy 一致）
 
 def transform_request(body, email="", session_id=None):
+    explicit_cache_control = cache_hints.has_anthropic_cache_control(body)
     messages = body.get("messages", [])
     user_system = body.get("system")
     messages = inject_user_system_to_messages(messages, user_system)
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
-    messages = _strip_message_cache_control(messages)
-    messages = add_cache_breakpoints(messages)
-    system_blocks = build_system_blocks(messages)
+    if not explicit_cache_control:
+        messages = _strip_message_cache_control(messages)
+        messages = add_cache_breakpoints(messages)
+    system_blocks = build_system_blocks(messages, inject_cache=not explicit_cache_control)
     model = body.get("model", "claude-sonnet-4-20250514")
 
     # 动态工具名映射（tools > 5 时触发）
@@ -689,13 +698,21 @@ def transform_request(body, email="", session_id=None):
     }
 
     if body.get("tools"):
-        tools = _strip_tool_cache_control([dict(t) if isinstance(t, dict) else t for t in body["tools"]])
+        tools = _strip_tool_cache_control(
+            [dict(t) if isinstance(t, dict) else t for t in body["tools"]],
+            preserve_cache_control=explicit_cache_control,
+        )
         for t in tools:
             if isinstance(t, dict) and "name" in t:
                 t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
-        tools[-1] = dict(tools[-1])
-        tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        if not explicit_cache_control:
+            tools[-1] = dict(tools[-1])
+            tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         payload["tools"] = tools
+
+    top_cache = cache_hints.top_level_cache_control(body)
+    if top_cache:
+        payload["cache_control"] = top_cache
 
     # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
     # 否则会吞掉下游强制/禁用工具的意图。抓包未含此字段是会话未用到，非协议禁止。

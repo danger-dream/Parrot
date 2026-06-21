@@ -89,7 +89,8 @@ def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
               finish_reason: Optional[str] = None,
               usage: Optional[dict] = None,
               include_choice: bool = True,
-              is_final_usage_chunk: bool = False) -> bytes:
+              is_final_usage_chunk: bool = False,
+              logprobs: Optional[dict] = None) -> bytes:
     obj: dict[str, Any] = {
         "id": state.chunk_id,
         "object": "chat.completion.chunk",
@@ -102,7 +103,7 @@ def _mk_chunk(state: R2CState, *, delta: Optional[dict] = None,
             "index": 0,
             "delta": delta or {},
             "finish_reason": finish_reason,
-            "logprobs": None,
+            "logprobs": logprobs,
         }]
     # 02-bug-findings #43: include_usage=true 时 OpenAI chat 协议要求每个 chunk
     # 都带 usage 字段，中间 chunk 为 null，最后一帧才是真值。某些 SDK
@@ -275,7 +276,11 @@ class StreamTranslator:
             return
         self.state.chat_text_parts.append(text)
         yield from self._ensure_role_sent()
-        yield _mk_chunk(self.state, delta={"content": text})
+        yield _mk_chunk(
+            self.state,
+            delta={"content": text},
+            logprobs=_responses_delta_logprobs_to_chat(data.get("logprobs"), "content"),
+        )
 
     def _on_refusal_delta(self, data: dict) -> Iterator[bytes]:
         text = data.get("delta")
@@ -283,7 +288,11 @@ class StreamTranslator:
             return
         self.state.chat_refusal_parts.append(text)
         yield from self._ensure_role_sent()
-        yield _mk_chunk(self.state, delta={"refusal": text})
+        yield _mk_chunk(
+            self.state,
+            delta={"refusal": text},
+            logprobs=_responses_delta_logprobs_to_chat(data.get("logprobs"), "refusal"),
+        )
 
     def _on_reasoning_delta(self, data: dict) -> Iterator[bytes]:
         # drop 模式：丢弃 reasoning 文本（usage.reasoning_tokens 不受影响）
@@ -451,3 +460,14 @@ def _usage_resps_to_chat_stream(u: dict) -> dict:
         reasoning_tokens=reasoning,
         total_tokens=total,
     )
+
+
+def _responses_delta_logprobs_to_chat(raw: Any, key: str) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return None
+    clean = [item for item in raw if isinstance(item, dict)]
+    if not clean:
+        return None
+    if key == "refusal":
+        return {"content": None, "refusal": clean}
+    return {"content": clean, "refusal": None}

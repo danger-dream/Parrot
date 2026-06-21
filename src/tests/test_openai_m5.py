@@ -177,6 +177,36 @@ def test_store_expand_chain(m):
     print("  [PASS] store: expand_history 三层链展开按时间顺序")
 
 
+def test_previous_response_item_reference_expands_from_store_history(m):
+    _setup(m)
+    from src.openai.transform import responses_to_chat
+
+    s = m["openai_store"]
+    s.save(
+        "resp_prev",
+        None,
+        api_key_name="k1",
+        model="gpt-5",
+        channel_key="api:c1",
+        input_items=[{"type": "message", "id": "msg_prev", "role": "user", "content": [
+            {"type": "input_text", "text": "stored context"},
+        ]}],
+        output_items=[],
+    )
+
+    out = responses_to_chat.translate_request(
+        {"model": "gpt-5", "previous_response_id": "resp_prev", "input": [
+            {"type": "item_reference", "id": "msg_prev"},
+        ]},
+        api_key_name="k1",
+    )
+
+    assert out["messages"] == [
+        {"role": "user", "content": "stored context"},
+        {"role": "user", "content": "stored context"},
+    ]
+
+
 def test_store_cleanup_expired(m):
     _setup(m)
     s = m["openai_store"]
@@ -303,6 +333,12 @@ def _chat_json(content: str, *, usage=None):
                           headers={"content-type": "application/json"})
 
 
+def _chat_http_500():
+    return httpx.Response(500, json={
+        "error": {"type": "api_error", "message": "temporary upstream failure"}
+    }, headers={"content-type": "application/json"})
+
+
 def _chat_sse(content: str):
     payload = (
         f'data: {{"id":"c","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"role":"assistant"}},"finish_reason":null}}]}}\n\n'
@@ -372,6 +408,58 @@ async def test_e2e_first_then_followup(m):
     assert len(rec2.input_items) == 1
 
     print("  [PASS] 端到端：第一次 + 第二次 prev_id 续接 + Store 链正确")
+
+
+async def test_e2e_previous_response_id_survives_failover(m):
+    """带 previous_response_id 的续接请求切到第二个上游后仍正确保存 parent。"""
+    _setup(m)
+    _install_keys(m, {"alice": {"key": "ccp-alice"}})
+    router = MockRouter()
+    router.register("https://first.example", lambda r: _chat_http_500())
+    router.register("https://second.example", lambda r: _chat_json("second ok"))
+    router.register("https://seed.example", lambda r: _chat_json("seed ok"))
+    seed = _make_openai_channel(m, "seed", "https://seed.example", protocol="openai-chat")
+    first = _make_openai_channel(m, "first", "https://first.example", protocol="openai-chat")
+    second = _make_openai_channel(m, "second", "https://second.example", protocol="openai-chat")
+
+    # 先只装 seed，拿到可用于续接的 response_id，避免首轮就被 first 的 500 影响。
+    _install_channels(m, [seed])
+    resp1, mc1 = await _call(m, router, "responses", {
+        "model": "gpt-5", "stream": False, "input": "seed question",
+    })
+    assert resp1.status_code == 200, f"seed body={resp1.body!r}"
+    rid1 = json.loads(resp1.body)["id"]
+    await mc1.aclose()
+
+    # 续接时 first 先失败，second 成功；两边都必须收到同一份展开历史。
+    router.requests.clear()
+    _install_channels(m, [first, second])
+    resp2, mc2 = await _call(m, router, "responses", {
+        "model": "gpt-5", "stream": False,
+        "previous_response_id": rid1,
+        "input": "follow after failover",
+    })
+    assert resp2.status_code == 200, f"followup body={resp2.body!r}"
+    rid2 = json.loads(resp2.body)["id"]
+    await mc2.aclose()
+
+    assert [str(req.url) for req in router.requests] == [
+        "https://first.example/v1/chat/completions",
+        "https://second.example/v1/chat/completions",
+    ]
+    for req in router.requests:
+        msgs = json.loads(req.content)["messages"]
+        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user"]
+        assert msgs[0] == {"role": "user", "content": "seed question"}
+        assert msgs[1] == {"role": "assistant", "content": "seed ok", "reasoning_content": ""}
+        assert msgs[2] == {"role": "user", "content": "follow after failover"}
+
+    rec2 = m["openai_store"].lookup(rid2, api_key_name="alice")
+    assert rec2.parent_id == rid1
+    assert rec2.channel_key == "api:second"
+    assert rec2.output_items[0]["content"][0]["text"] == "second ok"
+    assert m["cooldown"].is_blocked("api:first", "gpt-5")
+    print("  [PASS] 端到端：prev_id 续接遇 500 failover 后 parent/store 仍正确")
 
 
 async def test_e2e_chain_depth_three(m):
@@ -554,8 +642,10 @@ def main() -> int:
         test_store_forbidden,
         test_store_expired,
         test_store_expand_chain,
+        test_previous_response_item_reference_expands_from_store_history,
         test_store_cleanup_expired,
         _async(test_e2e_first_then_followup),
+        _async(test_e2e_previous_response_id_survives_failover),
         _async(test_e2e_chain_depth_three),
         _async(test_e2e_unknown_prev_id_404),
         _async(test_e2e_cross_key_forbidden_403),

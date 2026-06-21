@@ -58,15 +58,10 @@ def images_allowed(key_name: Optional[str]) -> bool:
 
 
 def get_allowed_protocols(key_name: Optional[str]) -> list[str]:
-    """返回该 Key 的 allowedProtocols 列表；空/未设 = 无限制（对所有入口开放）。
+    """Deprecated compatibility shim.
 
-    合法值：`"anthropic"` / `"chat"` / `"responses"`。
-    本函数只读 config，不做校验；写入路径（TG 菜单）保证字段正确。
+    API Keys no longer gate Anthropic/OpenAI protocol entrances.  Route safety is
+    decided by ProtocolMatrix + provider capabilities; model access remains
+    controlled by ``allowedModels`` returned from ``validate()``.
     """
-    if not key_name:
-        return []
-    cfg = config.get()
-    entry = (cfg.get("apiKeys") or {}).get(key_name)
-    if not isinstance(entry, dict):
-        return []
-    return list(entry.get("allowedProtocols") or [])
+    return []

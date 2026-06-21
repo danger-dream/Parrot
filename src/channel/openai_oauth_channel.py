@@ -3,14 +3,15 @@
 对接 ChatGPT internal API `https://chatgpt.com/backend-api/codex/responses`。
 参考 sub2api 的 openai_gateway_service.buildUpstreamRequest（OAuth 分支）。
 
-仅服务本家族入口（openai-chat / openai-responses）；anthropic 入口被 scheduler
-按模型家族过滤掉（本类 list_client_models 都是 codex 家族模型）。
+默认服务本家族入口（openai-chat / openai-responses）；Phase 8 起，当
+ProtocolMatrix 判定请求能力可安全表达时，也允许 Anthropic 入口先翻译成
+Responses shape 再走 Codex 上游。
 
 运行期流程（每次请求独立，无并发共享状态）：
   1. oauth_manager.ensure_valid_token(email) 拿有效 access_token
      （内部已按 provider 分派到 src.oauth.openai.refresh_sync）
   2. 按 ingress_protocol 准备 Responses shape 请求体：
-     - responses ingress → filter_responses_passthrough
+     - responses ingress → provider adapter target allowlist
      - chat ingress      → chat_to_responses.translate_request
   3. codex_oauth_transform 对请求体做 codex 兼容改造（store=false / stream=true /
      删不支持字段 / 模型名规范化 / input 字符串包列表 / system 提 instructions
@@ -28,10 +29,12 @@ import json
 from typing import Optional
 
 from .. import config, network, oauth_manager
+from ..providers import registry as provider_registry
+from ..openai import reasoning_replay
 from ..openai.transform import (
+    anthropic_to_responses,
     chat_to_responses,
     codex_oauth_transform,
-    common,
     guard,
 )
 from .base import Channel, ChannelDisplay, UpstreamRequest
@@ -69,6 +72,73 @@ from ..openai.codex_constants import (
     CODEX_CLI_USER_AGENT,
     CODEX_ORIGINATOR,
 )
+
+_CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
+    "web_search_call", "file_search_call", "computer_call",
+    "image_generation_call", "code_interpreter_call",
+    "mcp_call", "mcp_list_tools", "mcp_approval_request",
+    "mcp_approval_response",
+})
+
+_CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES = frozenset({
+    "web_search_preview", "file_search", "computer_use_preview",
+    "code_interpreter", "image_generation", "mcp", "local_shell",
+    "web_search", "web_search_2025_08_26", "web_search_preview_2025_03_11",
+    "computer", "computer_use", "apply_patch", "function_shell",
+})
+
+
+def _codex_unsupported_state_label(body: dict) -> str | None:
+    if body.get("conversation"):
+        return "conversation"
+    if body.get("background") is True:
+        return "background"
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("type") in _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES:
+                return f"tools:{tool.get('type')}"
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict):
+        typ = choice.get("type")
+        if typ in _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES:
+            return f"tool_choice:{typ}"
+        if typ == "allowed_tools":
+            nested = choice.get("tools")
+            if isinstance(nested, list):
+                for tool in nested:
+                    if isinstance(tool, dict) and tool.get("type") in _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES:
+                        return f"tool_choice:allowed_tools:{tool.get('type')}"
+    items: list = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, list):
+        items.extend(instructions)
+    inp = body.get("input")
+    if isinstance(inp, list):
+        items.extend(inp)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES:
+            return str(item.get("type"))
+        if item.get("type") == "input_image" and item.get("file_id") is not None:
+            return "input_image.file_id"
+        if item.get("type") == "input_file" and item.get("file_id") is not None:
+            return "input_file.file_id"
+        if item.get("type") == "input_audio":
+            return "input_audio"
+        content = item.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "input_audio":
+                    return "input_audio"
+                if part.get("type") == "input_image" and part.get("file_id") is not None:
+                    return "input_image.file_id"
+                if part.get("type") == "input_file" and part.get("file_id") is not None:
+                    return "input_file.file_id"
+    return None
 
 
 class OpenAIOAuthChannel(Channel):
@@ -160,11 +230,10 @@ class OpenAIOAuthChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "responses",
     ) -> UpstreamRequest:
-        if ingress_protocol not in ("chat", "responses"):
+        if ingress_protocol not in ("anthropic", "chat", "responses"):
             raise ValueError(
-                "OpenAIOAuthChannel only serves openai-chat / openai-responses "
-                f"ingress; got {ingress_protocol!r}. Scheduler family filter "
-                "should have excluded this channel for anthropic ingress."
+                "OpenAIOAuthChannel only serves anthropic / openai-chat / openai-responses "
+                f"ingress; got {ingress_protocol!r}. ProtocolMatrix should have guarded this route."
             )
 
         # Step A: 准备 Responses shape
@@ -178,11 +247,22 @@ class OpenAIOAuthChannel(Channel):
                 "because upstream is forced to store=false; use prompt_cache_key/session_id "
                 "or route this request to an OpenAI API channel."
             )
+        if ingress_protocol == "responses":
+            unsupported_state = _codex_unsupported_state_label(requested_body)
+            if unsupported_state:
+                raise ValueError(
+                    f"{unsupported_state} is not supported on OpenAI OAuth Codex route; "
+                    "route this request to an OpenAI API Responses channel."
+                )
 
         if ingress_protocol == "responses":
-            payload = common.filter_responses_passthrough(requested_body)
-            translator_ctx = None      # 同协议透传，无需响应反向
-        else:
+            payload = provider_registry.filter_request_payload(
+                self,
+                requested_body,
+                protocol="openai-responses",
+            )
+            translator_ctx = None      # 同协议透传无需响应反向；replay scope 稍后会补进 ctx
+        elif ingress_protocol == "chat":
             # chat ingress → responses 上游（同家族跨变体）
             guard.guard_chat_to_responses(requested_body)
             payload = chat_to_responses.translate_request(requested_body)
@@ -199,16 +279,60 @@ class OpenAIOAuthChannel(Channel):
                 "model_for_response": resolved_model,
                 "include_usage": include_usage,
             }
+        else:
+            # anthropic ingress → responses 上游（跨家族，非流式下游）。Codex HTTP
+            # endpoint 仍会被 apply_codex_oauth_transform 强制 stream=true，由
+            # failover 的 upstream_stream_only 聚合路径再反向成 Anthropic message。
+            payload = anthropic_to_responses.translate_request(
+                requested_body,
+                target_model=resolved_model,
+                codex_oauth=True,
+            )
+            translator_ctx = {
+                "ingress": "anthropic",
+                "upstream_protocol": "openai-responses",
+                "response_translator": "anthropic_to_responses",
+                "model_for_response": resolved_model,
+            }
 
         payload["model"] = resolved_model
+        payload = provider_registry.filter_request_payload(
+            self,
+            payload,
+            protocol="openai-responses",
+        )
 
-        # Step B: codex 兼容改造（store=false 等硬约束）。encrypted_content
-        # 只做透明透传，不由 Parrot 本地维护/回填。
+        codex_unsupported_state = _codex_unsupported_state_label(payload)
+        if codex_unsupported_state:
+            raise ValueError(
+                f"{codex_unsupported_state} is not supported on OpenAI OAuth Codex route; "
+                "route this request to an OpenAI API channel."
+            )
+
+        # Step B: Codex reasoning replay scope。必须在 codex transform 剥 metadata
+        # 等字段前计算 scope；没有 prompt_cache_key / metadata / Codex
+        # turn/window/session 锚点时不启用，避免跨会话串状态。
+        replay_scope = reasoning_replay.scope_from_payload(resolved_model, payload)
+
+        # Step C: codex 兼容改造（store=false 等硬约束）。带 encrypted_content 的
+        # replay reasoning 只做透明透传，非法/陈旧 EC 由 failover 清 scope 后降级重试。
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload, resolved_model=resolved_model,
         )
 
-        # Step C: 拿 access_token（会在此触发 refresh if 过期）
+        # Step D: transform 后 input 已规范成 Responses list，再插入 replay items。
+        replay_injected = reasoning_replay.inject_replay_items(payload, replay_scope)
+        if replay_scope is not None:
+            if translator_ctx is None:
+                translator_ctx = {
+                    "ingress": ingress_protocol,
+                    "upstream_protocol": "openai-responses",
+                    "model_for_response": resolved_model,
+                }
+            translator_ctx["codex_reasoning_replay"] = replay_scope
+            translator_ctx["codex_reasoning_replay_injected"] = replay_injected
+
+        # Step E: 拿 access_token（会在此触发 refresh if 过期）
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
         headers = self._build_headers(access_token)

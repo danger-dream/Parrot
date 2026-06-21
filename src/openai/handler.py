@@ -5,7 +5,7 @@
 两条入口，共用这一份实现。
 
 流程（与 docs/openai/08-openai-tree.md §8.1 对齐）：
-  1. auth.validate → key 验证；get_allowed_protocols → 按 Key 限制放行
+  1. auth.validate → key 验证
   2. 读 body
   3. model 白名单 (allowedModels) 检查
   4. CapabilityGuard 自检（n>1 / audio / background / conversation 等）
@@ -271,6 +271,9 @@ def _maybe_apply_auto_prompt_cache_key(
     if not key:
         key = _new_auto_prompt_cache_key()
     body["prompt_cache_key"] = key
+    internal = body.setdefault("_internal_injected_fields", [])
+    if isinstance(internal, list) and "prompt_cache_key" not in internal:
+        internal.append("prompt_cache_key")
     return key
 
 
@@ -292,13 +295,6 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     if err:
         return errors.json_error_openai(401, errors.ErrTypeOpenAI.AUTH, err)
 
-    allowed_protos = auth.get_allowed_protocols(key_name)
-    if allowed_protos and ingress_protocol not in allowed_protos:
-        return errors.json_error_openai(
-            403, errors.ErrTypeOpenAI.PERMISSION,
-            f"protocol '{ingress_protocol}' is not allowed for this API key",
-        )
-
     # 2. body
     raw = await request.body()
     try:
@@ -311,6 +307,11 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "request body must be a JSON object",
         )
+    # Preserve the original client-provided field set before Parrot mutates the
+    # body (default model, internal _api_key_name, auto prompt_cache_key, ...).
+    # Cross-protocol guards use this to reject user-explicit fields that have no
+    # safe equivalent while allowing internal compatibility hints.
+    body["_client_body_fields"] = sorted(str(k) for k in body.keys() if isinstance(k, str))
 
     # 2.1 模型映射 / 入口默认模型：
     #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
@@ -396,6 +397,18 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)
 
     if not result:
+        guard_msg = getattr(result, "guard_error", None)
+        if guard_msg:
+            msg = f"Request cannot be safely routed: {guard_msg}"
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg, 0,
+                http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
+                total_ms=int((time.time() - start_time) * 1000),
+            )
+            return errors.json_error_openai(
+                400, errors.ErrTypeOpenAI.INVALID_REQUEST, msg
+            )
+
         msg = f"No available upstream channels for model: {model} (ingress={ingress_protocol})"
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,

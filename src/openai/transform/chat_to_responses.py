@@ -21,11 +21,17 @@ import time
 import uuid
 from typing import Any, Optional
 
+from .guard import GuardError
+
 
 # ─── id 生成 ──────────────────────────────────────────────────────
 
 def _gen_id(prefix: str) -> str:
     return f"{prefix}{uuid.uuid4().hex[:24]}"
+
+
+def _fail(message: str, *, param: str | None = "messages") -> None:
+    raise GuardError(400, "invalid_request_error", message, param=param)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -59,6 +65,16 @@ def translate_request(body: dict) -> dict:
     # response_format → text.format；两边结构同构（type:text/json_object/json_schema）
     if "response_format" in body:
         payload.setdefault("text", {})["format"] = body["response_format"]
+
+    # Chat logprobs → Responses include/top_logprobs.  Responses only returns
+    # output text logprobs when explicitly requested through include.
+    if body.get("logprobs") is True or isinstance(body.get("top_logprobs"), int):
+        include = list(payload.get("include") or [])
+        if "message.output_text.logprobs" not in include:
+            include.append("message.output_text.logprobs")
+        payload["include"] = include
+    if isinstance(body.get("top_logprobs"), int):
+        payload["top_logprobs"] = body["top_logprobs"]
 
     # reasoning_effort → reasoning.effort
     if "reasoning_effort" in body:
@@ -95,12 +111,14 @@ def _messages_to_input_items(messages: list) -> list:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
+        if msg.get("audio") is not None:
+            _fail("assistant audio references are not supported when routing to responses upstream")
         if role == "tool":
             # tool 响应 → function_call_output
             items.append({
                 "type": "function_call_output",
                 "call_id": msg.get("tool_call_id") or "",
-                "output": _stringify_tool_content(msg.get("content")),
+                "output": _tool_output_chat_to_responses(msg.get("content")),
             })
             continue
         # spec: ChatCompletionRequestFunctionMessage (deprecated legacy)
@@ -112,7 +130,7 @@ def _messages_to_input_items(messages: list) -> list:
             items.append({
                 "type": "function_call_output",
                 "call_id": msg.get("name") or "",
-                "output": _stringify_tool_content(msg.get("content")),
+                "output": _tool_output_chat_to_responses(msg.get("content")),
             })
             continue
         if role == "assistant":
@@ -135,13 +153,12 @@ def _messages_to_input_items(messages: list) -> list:
                     "content": [{"type": "output_text", "text": content, "annotations": []}],
                 })
             elif isinstance(content, list) and content:
-                # chat 的 parts content 在 assistant 上罕见，简化为文本拼接
-                items.append({
-                    "type": "message", "role": "assistant",
-                    "content": [{"type": "output_text",
-                                 "text": _stringify_tool_content(content),
-                                 "annotations": []}],
-                })
+                assistant_content = _assistant_content_chat_to_responses(content)
+                if assistant_content:
+                    items.append({
+                        "type": "message", "role": "assistant",
+                        "content": assistant_content,
+                    })
             for tc in msg.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
@@ -188,6 +205,28 @@ def _messages_to_input_items(messages: list) -> list:
     return items
 
 
+def _assistant_content_chat_to_responses(content: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for p in content:
+        if isinstance(p, str):
+            if p:
+                out.append({"type": "output_text", "text": p, "annotations": []})
+            continue
+        if not isinstance(p, dict):
+            _fail("assistant content parts must be objects when routing to responses upstream")
+        t = p.get("type")
+        if t == "text":
+            out.append({"type": "output_text", "text": str(p.get("text") or ""), "annotations": []})
+        elif t == "refusal":
+            refusal = p.get("refusal")
+            if not isinstance(refusal, str):
+                _fail("assistant refusal content part requires a refusal string when routing to responses upstream")
+            out.append({"type": "refusal", "refusal": refusal})
+        else:
+            _fail(f"assistant content part {t!r} is not supported when routing to responses upstream")
+    return out
+
+
 def _content_chat_to_responses(content) -> list:
     """messages[i].content（string 或 parts）→ Responses message content 列表。"""
     if isinstance(content, str):
@@ -196,7 +235,11 @@ def _content_chat_to_responses(content) -> list:
         return [{"type": "input_text", "text": ""}]
     out: list[dict] = []
     for p in content:
+        if isinstance(p, str):
+            out.append({"type": "input_text", "text": p})
+            continue
         if not isinstance(p, dict):
+            _fail("message content parts must be objects when routing to responses upstream")
             continue
         t = p.get("type")
         if t == "text":
@@ -225,8 +268,7 @@ def _content_chat_to_responses(content) -> list:
                     entry[k] = f[k]
             out.append(entry)
         else:
-            # 未知 part 类型：保守丢弃，避免上游 schema 错误
-            pass
+            _fail(f"content part {t!r} is not supported when routing to responses upstream")
     if not out:
         # 防止 Responses 拒收空 content
         out.append({"type": "input_text", "text": ""})
@@ -256,6 +298,60 @@ def _stringify_tool_content(content) -> str:
         return _json.dumps(content, ensure_ascii=False)
     except Exception:
         return str(content)
+
+
+def _tool_output_chat_to_responses(content) -> str | list[dict[str, Any]]:
+    if content is None or isinstance(content, str):
+        return _stringify_tool_content(content)
+    if not isinstance(content, list):
+        return _stringify_tool_content(content)
+
+    output: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    has_attachment = False
+    for p in content:
+        if isinstance(p, str):
+            text_parts.append(p)
+            output.append({"type": "input_text", "text": p})
+            continue
+        if not isinstance(p, dict):
+            text = _stringify_tool_content(p)
+            text_parts.append(text)
+            output.append({"type": "input_text", "text": text})
+            continue
+        t = p.get("type")
+        if t == "text":
+            text = str(p.get("text") or "")
+            text_parts.append(text)
+            output.append({"type": "input_text", "text": text})
+        elif t == "image_url":
+            iu = p.get("image_url")
+            if isinstance(iu, dict):
+                image = {
+                    "type": "input_image",
+                    "image_url": iu.get("url", ""),
+                    "detail": iu.get("detail") or "auto",
+                }
+                if iu.get("file_id"):
+                    image["file_id"] = iu["file_id"]
+            else:
+                image = {"type": "input_image", "image_url": iu or "", "detail": "auto"}
+            output.append(image)
+            has_attachment = True
+        elif t == "file":
+            f = p.get("file") or {}
+            entry: dict[str, Any] = {"type": "input_file"}
+            for k in ("file_id", "file_data", "filename", "file_url", "detail"):
+                if k in f:
+                    entry[k] = f[k]
+            output.append(entry)
+            has_attachment = True
+        else:
+            _fail(f"tool output content part {t!r} is not supported when routing to responses upstream")
+
+    if has_attachment:
+        return output
+    return "".join(text_parts)
 
 
 def _flatten_tool(t: dict) -> dict:
@@ -345,6 +441,7 @@ def translate_response(resp: dict, *, model: str) -> dict:
     tool_calls = _gather_function_calls(output)
     refusal = _gather_refusal(output)
     reasoning_text = _gather_reasoning_summary(output)
+    logprobs = _gather_logprobs(output)
     # 02-bug-findings #28: 把 output_text.annotations 累计回填到 chat
     # message.annotations（chat ResponseMessage.annotations 与 responses
     # OutputTextContent.annotations 是 1:1 url_citation 等结构，spec-compliant）
@@ -376,7 +473,7 @@ def translate_response(resp: dict, *, model: str) -> dict:
             "index": 0,
             "message": message,
             "finish_reason": finish_reason,
-            "logprobs": None,
+            "logprobs": logprobs,
         }],
         "usage": _usage_resps_to_chat(resp.get("usage") or {}),
     }
@@ -440,6 +537,33 @@ def _gather_refusal(output: list) -> Optional[str]:
                 if isinstance(r, str) and r:
                     parts.append(r)
     return "\n".join(parts) if parts else None
+
+
+def _gather_logprobs(output: list) -> Optional[dict[str, Any]]:
+    content_logprobs: list[dict[str, Any]] = []
+    refusal_logprobs: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for c in item.get("content") or []:
+            if not isinstance(c, dict):
+                continue
+            raw = c.get("logprobs")
+            if not isinstance(raw, list) or not raw:
+                continue
+            clean = [lp for lp in raw if isinstance(lp, dict)]
+            if not clean:
+                continue
+            if c.get("type") == "output_text":
+                content_logprobs.extend(clean)
+            elif c.get("type") == "refusal":
+                refusal_logprobs.extend(clean)
+    if not content_logprobs and not refusal_logprobs:
+        return None
+    return {
+        "content": content_logprobs or None,
+        "refusal": refusal_logprobs or None,
+    }
 
 
 def _gather_reasoning_summary(output: list) -> Optional[str]:

@@ -164,6 +164,62 @@ def test_bug25_guard_rejects_hosted_tool_choice(m):
             g.guard_responses_to_chat(body)
 
 
+def test_guard_rejects_allowed_tools_with_hosted_nested_tool(m):
+    g = m["guard"]
+    body = {"model": "x", "input": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto",
+                            "tools": [{"type": "web_search", "name": "search"}]}}
+    with pytest.raises(g.GuardError) as ei:
+        g.guard_responses_to_chat(body)
+    assert "allowed_tools" in ei.value.message
+    assert "web_search" in ei.value.message
+
+
+def test_guard_allows_max_tool_calls_when_routing_responses_to_chat(m):
+    g = m["guard"]
+    r2c = m["responses_to_chat"]
+    body = {"model": "x", "input": "hi", "max_tool_calls": 1}
+    g.guard_responses_to_chat(body)
+    out = r2c.translate_request(body)
+    assert "max_tool_calls" not in out
+
+
+def test_guard_rejects_function_call_output_attachments_when_routing_responses_to_chat(m):
+    g = m["guard"]
+    body = {
+        "model": "x",
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [{"type": "input_image", "image_url": "https://example.com/a.png"}],
+        }],
+    }
+
+    with pytest.raises(g.GuardError) as ei:
+        g.guard_responses_to_chat(body)
+
+    assert "function_call_output" in ei.value.message
+    assert "input_image" in ei.value.message
+
+
+def test_guard_rejects_input_file_url_when_routing_responses_to_chat(m):
+    g = m["guard"]
+    body = {
+        "model": "x",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_url": "https://example.com/a.pdf"}],
+        }],
+    }
+
+    with pytest.raises(g.GuardError) as ei:
+        g.guard_responses_to_chat(body)
+
+    assert "input_file" in ei.value.message
+    assert "file_url" in ei.value.message
+
+
 # ───────── #26 chat custom tool 展开 ─────────
 
 
@@ -250,6 +306,46 @@ def test_bug27_responses_custom_tool_call_output_to_chat(m):
     tools = [m for m in msgs if m.get("role") == "tool"]
     assert tools and tools[0].get("tool_call_id") == "c1"
     assert tools[0].get("content") == "result"
+
+
+def test_responses_custom_tool_call_output_text_parts_to_chat(m):
+    """custom_tool_call_output text parts use the same safe Chat tool output path."""
+    responses_to_chat = m["responses_to_chat"]
+    body = {
+        "model": "x",
+        "input": [
+            {"role": "user", "content": "do thing"},
+            {"type": "custom_tool_call", "call_id": "c1", "name": "f", "input": "x"},
+            {"type": "custom_tool_call_output", "call_id": "c1", "output": [
+                {"type": "input_text", "text": "hello "},
+                {"type": "output_text", "text": "world"},
+            ]},
+        ],
+    }
+
+    out = responses_to_chat.translate_request(body)
+
+    tools = [m for m in out["messages"] if m.get("role") == "tool"]
+    assert tools and tools[0].get("tool_call_id") == "c1"
+    assert tools[0].get("content") == "hello world"
+
+
+def test_guard_rejects_custom_tool_call_output_attachments_when_routing_responses_to_chat(m):
+    g = m["guard"]
+    body = {
+        "model": "x",
+        "input": [{
+            "type": "custom_tool_call_output",
+            "call_id": "call_1",
+            "output": [{"type": "input_image", "image_url": "https://example.com/a.png"}],
+        }],
+    }
+
+    with pytest.raises(g.GuardError) as ei:
+        g.guard_responses_to_chat(body)
+
+    assert "custom_tool_call_output" in ei.value.message
+    assert "input_image" in ei.value.message
 
 
 # ───────── #30 FunctionTool.strict 必填默认 ─────────

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import os as _ap_os
 import sys as _ap_sys
@@ -31,8 +32,8 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import pytest
+import httpx
 from fastapi import FastAPI, Request
-from starlette.testclient import TestClient
 
 from src import auth, config, errors, image_db
 from src.openai import images_openai_compat as compat
@@ -112,8 +113,24 @@ def _build_app() -> FastAPI:
     return app
 
 
+class _AsgiTestClient:
+    def __init__(self, app: FastAPI):
+        self._app = app
+
+    def post(self, url: str, **kwargs):
+        async def _run():
+            transport = httpx.ASGITransport(app=self._app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                return await client.post(url, **kwargs)
+
+        return asyncio.run(_run())
+
+
 def _make_client(app):
-    return TestClient(app)
+    return _AsgiTestClient(app)
 
 
 def _auth_headers():

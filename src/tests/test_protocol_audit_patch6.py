@@ -103,25 +103,23 @@ def test_bug3_function_call_output_array_flattens_to_text(m):
     assert " more" in tool_msgs[0]["content"]
 
 
-# ───────── #6 input_audio 在 r2c 是死代码 ─────────
+# ───────── #6 input_audio 在 r2c 保真桥接 ─────────
 
 
-def test_bug6_input_audio_in_responses_content_is_dropped(m):
-    """responses InputContent spec 没有 input_audio；r2c 应丢弃（防御）。"""
+def test_bug6_input_audio_in_responses_content_is_preserved(m):
+    """Responses↔Chat 的 input_audio content part 同构，r2c 应保真保留。"""
     responses_to_chat = m["responses_to_chat"]
     body = {"model": "x", "input": [{
         "role": "user",
         "content": [
             {"type": "input_text", "text": "ok"},
-            {"type": "input_audio", "input_audio": {"data": "..."}},  # spec invalid
+            {"type": "input_audio", "input_audio": {"data": "...", "format": "wav"}},
         ],
     }]}
     out = responses_to_chat.translate_request(body)
     parts = out["messages"][0]["content"]
-    if isinstance(parts, list):
-        for p in parts:
-            assert p.get("type") != "input_audio", \
-                f"r2c 应丢弃 spec 不存在的 input_audio: {parts}"
+    assert isinstance(parts, list)
+    assert parts[1] == {"type": "input_audio", "input_audio": {"data": "...", "format": "wav"}}
 
 
 # ───────── #22 system 不强制改 developer ─────────
@@ -168,21 +166,18 @@ def test_bug33_multiple_message_items_each_get_role_chunk(m):
         f"02-bug-findings #33: 多 message item 应各发一个 role chunk: {len(role_chunks)}"
 
 
-# ───────── #40 prediction log warning 但不阻断 ─────────
+# ───────── #40 prediction 无 Responses 等价时剥离但不阻断 ─────────
 
 
-def test_bug40_prediction_field_warns_not_rejects(m, caplog):
-    """guard_chat_to_responses 看到 prediction 应 log.warning 但放行。"""
+def test_bug40_prediction_field_is_output_whitelist_filtered(m):
+    """prediction 是 OpenAI Chat provider hint；Responses fallback 剥离但不阻断。"""
     g = m["guard"]
-    import logging
-    caplog.set_level(logging.WARNING, logger="parrot.openai")
+    c2r = m["chat_to_responses"]
     body = {"model": "x", "messages": [{"role": "user", "content": "hi"}],
             "prediction": {"type": "content", "content": "hello"}}
-    # 不应 raise
     g.guard_chat_to_responses(body)
-    # 应在 caplog 中看到 prediction 相关的 warning
-    assert any("prediction" in rec.message.lower() for rec in caplog.records), \
-        f"prediction 应触发 warning: {[r.message for r in caplog.records]}"
+    out = c2r.translate_request(body)
+    assert "prediction" not in out
 
 
 # ───────── 附录：reasoning item status:completed ─────────

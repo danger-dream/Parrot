@@ -6,6 +6,8 @@ import uuid
 from typing import Optional
 
 from .. import oauth_manager
+from ..openai.transform import chat_to_anthropic, responses_to_anthropic
+from ..providers import registry as provider_registry
 from ..transform import cc_mimicry
 from .base import Channel, ChannelDisplay, UpstreamRequest
 
@@ -43,11 +45,53 @@ class OAuthChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
-        _ = ingress_protocol  # OAuth 只服务 /v1/messages，忽略
+        translator_ctx: Optional[dict] = None
+        if ingress_protocol == "chat":
+            stream_opts = requested_body.get("stream_options") or {}
+            include_usage = bool(stream_opts.get("include_usage")) if isinstance(stream_opts, dict) else False
+            requested_body = chat_to_anthropic.translate_request(requested_body)
+            translator_ctx = {
+                "ingress": "chat",
+                "upstream_protocol": "anthropic",
+                "response_translator": "chat_to_anthropic",
+                "model_for_response": resolved_model,
+                "include_usage": include_usage,
+            }
+        elif ingress_protocol == "responses":
+            from ..openai import store as _store
+            api_key_name = str(requested_body.get("_api_key_name") or "")
+            previous_response_id = requested_body.get("previous_response_id")
+            current_input_items = responses_to_anthropic.resolve_current_input_items(requested_body)
+            responses_request_body = dict(requested_body)
+            requested_body = responses_to_anthropic.translate_request(
+                requested_body, api_key_name=api_key_name, store_enabled=_store.is_enabled(),
+            )
+            translator_ctx = {
+                "ingress": "responses",
+                "upstream_protocol": "anthropic",
+                "response_translator": "responses_to_anthropic",
+                "model_for_response": resolved_model,
+                "previous_response_id": previous_response_id,
+                "api_key_name": api_key_name,
+                "channel_key": self.key,
+                "current_input_items": current_input_items,
+                "request_body": responses_request_body,
+            }
+        elif ingress_protocol != "anthropic":
+            raise ValueError(
+                f"OAuthChannel got unsupported ingress_protocol={ingress_protocol!r}; "
+                "ProtocolMatrix should have guarded this route."
+            )
+
         # OAuth：确保 token 有效 → 走完整 CC 伪装 → 拼 OAuth headers
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
-        body_with_model = {**requested_body, "model": resolved_model}
+        body_with_model = provider_registry.filter_request_payload(
+            self,
+            {**requested_body, "model": resolved_model},
+            protocol="anthropic",
+            bridge=translator_ctx is not None,
+        )
         # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
         sid = str(uuid.uuid4())
         payload, dynamic_map = cc_mimicry.transform_request(
@@ -66,6 +110,7 @@ class OAuthChannel(Channel):
             headers=headers,
             body=signed,
             dynamic_tool_map=dynamic_map,
+            translator_ctx=translator_ctx,
         )
 
     async def restore_response(self, chunk: bytes,

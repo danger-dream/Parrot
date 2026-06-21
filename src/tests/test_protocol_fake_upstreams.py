@@ -1,0 +1,2961 @@
+"""Protocol Runtime fake upstream integration tests.
+
+Covers the Phase 8 fake-upstream matrix slice:
+- Anthropic client -> OpenAI Chat HTTP upstream
+- Anthropic client -> OpenAI Responses HTTP upstream
+- OpenAI Chat client -> Anthropic HTTP upstream
+- OpenAI Responses client -> Anthropic HTTP upstream
+- OpenAI Responses WS client -> OpenAI Responses HTTP/SSE upstream
+- HTTP Responses client -> OpenAI Responses WebSocket upstream
+"""
+
+from __future__ import annotations
+
+# Test isolation: redirect config/state/logs before importing Parrot modules.
+import os as _ap_os
+import sys as _ap_sys
+
+_ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.dirname(_ap_os.path.abspath(__file__)))))
+from src.tests import _isolation
+
+_isolation.isolate()
+
+import asyncio
+import json
+import os
+import sys
+import time
+from types import SimpleNamespace
+
+import httpx
+
+
+def _import_modules():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from src import (
+        affinity,
+        auth,
+        config,
+        cooldown,
+        failover,
+        log_db,
+        scheduler,
+        scorer,
+        state_db,
+        upstream,
+    )
+    from src.channel import api_channel, registry
+    from src.openai import handler as openai_handler
+    from src.openai import responses_ws
+    from src.openai.channel.registration import register_factories
+
+    register_factories()
+    return {
+        "affinity": affinity,
+        "auth": auth,
+        "config": config,
+        "cooldown": cooldown,
+        "failover": failover,
+        "log_db": log_db,
+        "scheduler": scheduler,
+        "scorer": scorer,
+        "state_db": state_db,
+        "upstream": upstream,
+        "registry": registry,
+        "api_channel": api_channel,
+        "openai_handler": openai_handler,
+        "responses_ws": responses_ws,
+    }
+
+
+def _setup(m):
+    m["state_db"].init()
+    m["log_db"].init()
+    m["state_db"].perf_delete()
+    m["state_db"].error_delete()
+    m["state_db"].affinity_delete()
+    m["state_db"].client_affinity_delete()
+    for mod_name in ("affinity", "cooldown", "scorer"):
+        mod = m[mod_name]
+        mod._initialized = False
+    m["affinity"]._client_initialized = False
+    m["affinity"].init()
+    m["affinity"].client_init()
+    m["cooldown"].init()
+    m["scorer"].init()
+
+
+class MockRouter:
+    def __init__(self):
+        self.handlers: dict[str, callable] = {}
+        self.requests: list[httpx.Request] = []
+
+    def register(self, base_url: str, handler):
+        self.handlers[base_url.rstrip("/")] = handler
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        url_str = str(request.url)
+        for base, handler in self.handlers.items():
+            if url_str.startswith(base):
+                return handler(request)
+        return httpx.Response(404, text="no mock")
+
+
+class ChunkedByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]):
+        self.chunks = list(chunks)
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            await asyncio.sleep(0)
+            yield chunk
+
+
+def _json_request(req: httpx.Request) -> dict:
+    return json.loads(req.content.decode("utf-8"))
+
+
+def _make_openai_channel(name: str, base_url: str, *, protocol: str, alias: str, real: str, extra: dict | None = None):
+    from src.openai.channel.api_channel import OpenAIApiChannel
+
+    entry = {
+        "name": name,
+        "type": "api",
+        "baseUrl": base_url,
+        "apiKey": "sk-x",
+        "protocol": protocol,
+        "models": [{"real": real, "alias": alias}],
+        "enabled": True,
+    }
+    if extra:
+        entry.update(extra)
+    return OpenAIApiChannel(entry)
+
+
+def _make_anthropic_channel(m, name: str, base_url: str, *, alias: str, real: str):
+    return m["api_channel"].ApiChannel({
+        "name": name,
+        "type": "api",
+        "baseUrl": base_url,
+        "apiKey": "sk-x",
+        "models": [{"real": real, "alias": alias}],
+        "cc_mimicry": False,
+        "enabled": True,
+    })
+
+
+def _make_openai_oauth_channel(email: str = "fake-ws@example.com"):
+    from src.channel.openai_oauth_channel import OpenAIOAuthChannel
+
+    return OpenAIOAuthChannel({
+        "email": email,
+        "provider": "openai",
+        "accountKey": f"openai:{email}",
+        "accessToken": "tok",
+        "refreshToken": "rt",
+        "expiresAt": 32503680000,
+        "models": ["gpt-5"],
+    })
+
+
+def _install_channels(m, channels):
+    reg = m["registry"]
+    with reg._lock:
+        reg._channels = {ch.key: ch for ch in channels}
+
+
+def _install_keys(m, keys: dict):
+    def _mutate(cfg):
+        cfg["apiKeys"] = keys
+    m["config"].update(_mutate)
+
+
+def _default_key(name="k", key="ccp-test"):
+    return {name: {"key": key, "allowedModels": []}}
+
+
+class FakeHeaders:
+    def __init__(self, data):
+        self._d = {k.lower(): v for k, v in data.items()}
+
+    def get(self, k, default=None):
+        return self._d.get(k.lower(), default)
+
+    def items(self):
+        return self._d.items()
+
+    def keys(self):
+        return self._d.keys()
+
+    def __getitem__(self, k):
+        return self._d[k.lower()]
+
+    def __iter__(self):
+        return iter(self._d.keys())
+
+    def __len__(self):
+        return len(self._d)
+
+
+class FakeClient:
+    def __init__(self, host="1.2.3.4"):
+        self.host = host
+
+
+class FakeRequest:
+    def __init__(self, headers, body_bytes, client_ip="1.2.3.4"):
+        self.headers = FakeHeaders(headers)
+        self._body = body_bytes
+        self.client = FakeClient(client_ip)
+
+    async def body(self):
+        return self._body
+
+
+class FakeWebSocket:
+    def __init__(self, first_obj: dict, *, extra_headers: dict | None = None):
+        headers = {
+            "Authorization": "Bearer sk-ws",
+            "user-agent": "codex_cli_rs/0.125.0",
+            "x-codex-turn-metadata": "turn-meta",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        self.headers = FakeHeaders(headers)
+        self.client = SimpleNamespace(host="1.2.3.4")
+        self.application_state = None
+        self._first_text = json.dumps(first_obj)
+        self.sent_texts: list[str] = []
+        self.close_calls: list[tuple[int, str]] = []
+        self.accepted = False
+
+    async def accept(self):
+        from starlette.websockets import WebSocketState
+        self.accepted = True
+        self.application_state = WebSocketState.CONNECTED
+
+    async def receive(self):
+        if self._first_text is not None:
+            text = self._first_text
+            self._first_text = None
+            return {"type": "websocket.receive", "text": text}
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send_text(self, text: str):
+        self.sent_texts.append(text)
+
+    async def send_bytes(self, data: bytes):
+        self.sent_texts.append(data.decode("utf-8", errors="replace"))
+
+    async def close(self, code: int = 1000, reason: str = ""):
+        from starlette.websockets import WebSocketState
+        self.close_calls.append((code, reason))
+        self.application_state = WebSocketState.DISCONNECTED
+
+
+class FakeOAuthResponseWs:
+    def __init__(self, events: list[dict]):
+        self.sent: list[str] = []
+        self._events = [json.dumps(e) for e in events]
+        self.closed = False
+        self.response = SimpleNamespace(headers={})
+
+    async def send(self, data: str | bytes, text: bool | None = None):
+        self.sent.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+        await asyncio.sleep(0)
+
+    async def recv(self):
+        if self._events:
+            return self._events.pop(0)
+        import websockets
+        raise websockets.ConnectionClosed(None, None)
+
+    async def close(self, *args, **kwargs):
+        self.closed = True
+        return None
+
+
+async def _call_openai_handler(m, router: MockRouter, ingress_protocol: str, body: dict):
+    transport = httpx.MockTransport(router.handle)
+    mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
+    m["upstream"].set_client(mock_client)
+    req = FakeRequest(
+        {"Authorization": "Bearer ccp-test"},
+        json.dumps(body).encode("utf-8"),
+    )
+    resp = await m["openai_handler"].handle(req, ingress_protocol=ingress_protocol)
+    return resp, mock_client
+
+
+async def _call_anthropic_core(m, router: MockRouter, body: dict):
+    transport = httpx.MockTransport(router.handle)
+    mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
+    m["upstream"].set_client(mock_client)
+
+    request_id = f"fake-{int(time.time() * 1000)}"
+    start = time.time()
+    await asyncio.to_thread(
+        m["log_db"].insert_pending,
+        request_id,
+        "1.2.3.4",
+        "ccp-test",
+        body.get("model"),
+        bool(body.get("stream", True)),
+        len(body.get("messages") or []),
+        len(body.get("tools") or []),
+        {},
+        body,
+        ingress_protocol="anthropic",
+    )
+    route = m["scheduler"].schedule(
+        body,
+        api_key_name="ccp-test",
+        client_ip="1.2.3.4",
+        ingress_protocol="anthropic",
+    )
+    assert route, getattr(route, "guard_error", None)
+    resp = await m["failover"].run_failover(
+        route,
+        body,
+        request_id,
+        "ccp-test",
+        "1.2.3.4",
+        is_stream=bool(body.get("stream", True)),
+        start_time=start,
+        ingress_protocol="anthropic",
+    )
+    return resp, mock_client, route
+
+
+def _chat_response(text="openai chat ok"):
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl_fake",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-real",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": text},
+            }],
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens": 3,
+                "total_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            },
+        },
+        headers={"content-type": "application/json"},
+    )
+
+
+def _responses_response(text="openai responses ok"):
+    return httpx.Response(
+        200,
+        json={
+            "id": "resp_fake",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-real",
+            "output": [{
+                "type": "message",
+                "id": "msg_fake",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }],
+            "output_text": text,
+            "usage": {
+                "input_tokens": 8,
+                "output_tokens": 3,
+                "total_tokens": 11,
+                "input_tokens_details": {"cached_tokens": 2},
+            },
+        },
+        headers={"content-type": "application/json"},
+    )
+
+
+def _responses_sse_event(event_type: str, payload: dict) -> bytes:
+    return (
+        f"event: {event_type}\n"
+        f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    ).encode("utf-8")
+
+
+def _responses_sse_response(text="ws over sse ok"):
+    payload = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "sequence_number": 1,
+            "response": {"id": "resp_sse", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {
+                "type": "message", "id": "msg_sse", "role": "assistant",
+                "status": "in_progress", "content": [],
+            },
+        }),
+        _responses_sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "sequence_number": 3,
+            "item_id": "msg_sse",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text,
+        }),
+        _responses_sse_event("response.completed", {
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": {
+                "id": "resp_sse",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_sse", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }],
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 4,
+                    "total_tokens": 11,
+                    "input_tokens_details": {"cached_tokens": 2},
+                },
+            },
+        }),
+    ])
+    return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+
+def _chat_sse_response(text="openai chat stream ok"):
+    payload = b"".join([
+        b'data: {"id":"chatcmpl_sse","object":"chat.completion.chunk","created":1,"model":"gpt-real","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+        (
+            'data: {"id":"chatcmpl_sse","object":"chat.completion.chunk","created":1,'
+            '"model":"gpt-real","choices":[{"index":0,"delta":{"content":'
+            f'{json.dumps(text, ensure_ascii=False)}'
+            '},"finish_reason":null}]}\n\n'
+        ).encode("utf-8"),
+        b'data: {"id":"chatcmpl_sse","object":"chat.completion.chunk","created":1,"model":"gpt-real","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":2}}}\n\n',
+        b'data: [DONE]\n\n',
+    ])
+    return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+
+def _anthropic_sse_response(text="anthropic stream ok"):
+    def ev(name: str, payload: dict) -> bytes:
+        return (
+            f"event: {name}\n"
+            f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        ).encode("utf-8")
+
+    payload = b"".join([
+        ev("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": "msg_stream",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-real",
+                "content": [],
+                "usage": {
+                    "input_tokens": 6,
+                    "cache_creation_input_tokens": 1,
+                    "cache_read_input_tokens": 2,
+                    "output_tokens": 0,
+                },
+            },
+        }),
+        ev("content_block_start", {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }),
+        ev("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        }),
+        ev("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ev("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 3},
+        }),
+        ev("message_stop", {"type": "message_stop"}),
+    ])
+    return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+
+async def _consume_streaming_to_string(resp) -> str:
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _anthropic_response(text="anthropic ok"):
+    return httpx.Response(
+        200,
+        json={
+            "id": "msg_fake",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-real",
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 6,
+                "cache_creation_input_tokens": 1,
+                "cache_read_input_tokens": 2,
+                "output_tokens": 3,
+            },
+        },
+        headers={"content-type": "application/json"},
+    )
+
+
+async def test_anthropic_native_official_fields_passthrough_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-native.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("native anthropic pong")
+
+    router.register("https://anthropic-native.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-native",
+            "https://anthropic-native.example",
+            alias="sonnet",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+        "service_tier": "auto",
+        "container": "container_1",
+        "mcp_servers": [{"type": "url", "url": "https://mcp.example/sse", "name": "docs"}],
+        "openai_only_hint": {"drop": True},
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "anthropic"
+    assert resp.status_code == 200
+    payload = captured["payload"]
+    assert payload["model"] == "claude-real"
+    assert payload["service_tier"] == "auto"
+    assert payload["container"] == "container_1"
+    assert payload["mcp_servers"] == [{"type": "url", "url": "https://mcp.example/sse", "name": "docs"}]
+    assert "openai_only_hint" not in payload
+    assert json.loads(resp.body)["content"] == [{"type": "text", "text": "native anthropic pong"}]
+
+
+async def test_anthropic_client_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat.example/v1/chat/completions"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-real"
+        assert payload["messages"] == [{"role": "user", "content": "ping"}]
+        return _chat_response("chat bridge pong")
+
+    router.register("https://chat.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("chat", "https://chat.example", protocol="openai-chat", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": False, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-chat"
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["type"] == "message"
+    assert out["content"] == [{"type": "text", "text": "chat bridge pong"}]
+    assert out["usage"]["input_tokens"] == 6
+    assert out["usage"]["cache_read_input_tokens"] == 2
+
+
+async def test_anthropic_client_document_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-document.example/v1/chat/completions"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _chat_response("chat document pong")
+
+    router.register("https://chat-document.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("chat-document", "https://chat-document.example", protocol="openai-chat", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "read"},
+            {
+                "type": "document",
+                "title": "brief.pdf",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+            },
+        ]}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-chat"
+    assert resp.status_code == 200, resp.body.decode()
+    payload = captured["payload"]
+    assert payload["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "read"},
+        {"type": "file", "file": {
+            "file_data": "JVBERi0xLjQ=",
+            "filename": "brief.pdf",
+        }},
+    ]}]
+    out = json.loads(resp.body)
+    assert out["content"] == [{"type": "text", "text": "chat document pong"}]
+
+
+async def test_non_stream_restore_runs_before_cross_protocol_response_translator(m, monkeypatch):
+    """Provider restore must run before response translator parses upstream JSON."""
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        return httpx.Response(200, json={
+            "id": "chatcmpl_restore",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-real",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fake_lookup", "arguments": '{"q":"x"}'},
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        }, headers={"content-type": "application/json"})
+
+    calls: list[tuple[bytes, dict | None, dict | None]] = []
+
+    async def fake_restore(channel, chunk, *, dynamic_map=None, translator_ctx=None):
+        calls.append((chunk, dynamic_map, translator_ctx))
+        assert translator_ctx["response_translator"] == "anthropic_to_chat"
+        return chunk.replace(b"fake_lookup", b"lookup")
+
+    monkeypatch.setattr(m["failover"].provider_registry, "restore_response_bytes", fake_restore)
+
+    router.register("https://chat-restore.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("chat-restore", "https://chat-restore.example", protocol="openai-chat", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": False, "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-chat"
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    tool_use = [part for part in out["content"] if part.get("type") == "tool_use"][0]
+    assert tool_use["name"] == "lookup"
+    assert calls and b"fake_lookup" in calls[0][0]
+
+
+async def test_anthropic_client_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses.example/v1/responses"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-real"
+        assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}]
+        return _responses_response("responses bridge pong")
+
+    router.register("https://responses.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("responses", "https://responses.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": False, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["type"] == "message"
+    assert out["content"] == [{"type": "text", "text": "responses bridge pong"}]
+    assert out["usage"]["input_tokens"] == 6
+    assert out["usage"]["cache_read_input_tokens"] == 2
+
+
+async def test_anthropic_client_document_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-document.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _responses_response("responses document pong")
+
+    router.register("https://responses-document.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("responses-document", "https://responses-document.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "read"},
+            {
+                "type": "document",
+                "title": "brief.pdf",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+            },
+            {
+                "type": "document",
+                "title": "remote.pdf",
+                "source": {"type": "url", "url": "https://example.com/remote.pdf"},
+            },
+        ]}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert resp.status_code == 200, resp.body.decode()
+    payload = captured["payload"]
+    assert payload["input"] == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "read"},
+        {"type": "input_file", "file_data": "JVBERi0xLjQ=", "filename": "brief.pdf"},
+        {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
+    ]}]
+    out = json.loads(resp.body)
+    assert out["content"] == [{"type": "text", "text": "responses document pong"}]
+
+
+async def test_anthropic_reasoning_and_service_tier_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-reasoning.example/v1/responses"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-5"
+        assert payload["reasoning"] == {"effort": "xhigh"}
+        assert payload["service_tier"] == "auto"
+        assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "think"}]}]
+        return _responses_response("reasoning bridge pong")
+
+    router.register("https://responses-reasoning.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-reasoning",
+            "https://responses-reasoning.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-5",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "think"}],
+        "thinking": {"type": "adaptive"},
+        "service_tier": "auto",
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert resp.status_code == 200, resp.body.decode()
+    out = json.loads(resp.body)
+    assert out["content"] == [{"type": "text", "text": "reasoning bridge pong"}]
+
+
+async def test_candidate_scoped_reasoning_guard_falls_through_to_supported_model(m):
+    _setup(m)
+    router = MockRouter()
+
+    def good_handler(req: httpx.Request):
+        assert str(req.url) == "https://reasoning-good.example/v1/chat/completions"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-5"
+        assert payload["reasoning_effort"] == "xhigh"
+        return _chat_response("candidate guard fell through")
+
+    router.register("https://reasoning-good.example", good_handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "reasoning-bad",
+            "https://reasoning-bad.example",
+            protocol="openai-chat",
+            alias="sonnet",
+            real="gpt-4o",
+        ),
+        _make_openai_channel(
+            "reasoning-good",
+            "https://reasoning-good.example",
+            protocol="openai-chat",
+            alias="sonnet",
+            real="gpt-5",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "think"}],
+        "thinking": {"type": "adaptive"},
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert [ch.key for ch, _ in route.candidates][:2] == ["api:reasoning-bad", "api:reasoning-good"]
+    assert resp.status_code == 200, resp.body.decode()
+    out = json.loads(resp.body)
+    assert out["content"] == [{"type": "text", "text": "candidate guard fell through"}]
+    assert len(router.requests) == 1
+    assert str(router.requests[0].url) == "https://reasoning-good.example/v1/chat/completions"
+
+
+async def test_anthropic_client_multiturn_tool_result_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-history.example/v1/chat/completions"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-real"
+        assert payload["messages"] == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "need tool", "tool_calls": [{
+                "id": "toolu_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "result x"},
+            {"role": "user", "content": "continue"},
+        ]
+        return _chat_response("chat history pong")
+
+    router.register("https://chat-history.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("chat-history", "https://chat-history.example", protocol="openai-chat", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {
+        "model": "sonnet", "stream": False, "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "need tool"},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result x"},
+                {"type": "text", "text": "continue"},
+            ]},
+        ],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-chat"
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["content"][0]["text"] == "chat history pong"
+
+
+async def test_anthropic_client_multiturn_tool_result_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-history.example/v1/responses"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-real"
+        assert payload["input"] == [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "need tool"}]},
+            {"type": "function_call", "id": "fc_toolu_1", "call_id": "toolu_1", "name": "lookup", "arguments": '{"q":"x"}', "status": "completed"},
+            {"type": "function_call_output", "call_id": "toolu_1", "output": "result x"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ]
+        return _responses_response("responses history pong")
+
+    router.register("https://responses-history.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("responses-history", "https://responses-history.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {
+        "model": "sonnet", "stream": False, "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "need tool"},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result x"},
+                {"type": "text", "text": "continue"},
+            ]},
+        ],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["content"][0]["text"] == "responses history pong"
+
+
+async def test_anthropic_client_tool_result_attachments_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-tool-attachments.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _responses_response("anthropic tool attachments pong")
+
+    router.register("https://responses-tool-attachments.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-tool-attachments",
+            "https://responses-tool-attachments.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [
+                {"type": "text", "text": "see attached"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {
+                    "type": "document",
+                    "title": "brief.pdf",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+                },
+                {
+                    "type": "document",
+                    "title": "remote.pdf",
+                    "context": "remote contract",
+                    "source": {"type": "url", "url": "https://example.com/remote.pdf"},
+                },
+            ],
+        }]}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert resp.status_code == 200
+    payload = captured["payload"]
+    assert payload["model"] == "gpt-real"
+    assert payload["input"] == [{
+        "type": "function_call_output",
+        "call_id": "toolu_1",
+        "output": [
+            {"type": "input_text", "text": "see attached"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
+            {"type": "input_file", "file_data": "JVBERi0xLjQ=", "filename": "brief.pdf"},
+            {"type": "input_text", "text": "Document context: remote contract"},
+            {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
+        ],
+    }]
+    assert json.loads(resp.body)["content"][0]["text"] == "anthropic tool attachments pong"
+
+
+async def test_anthropic_client_to_openai_chat_stream_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-sse.example/v1/chat/completions"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-real"
+        assert payload["stream"] is True
+        assert payload["messages"] == [{"role": "user", "content": "ping"}]
+        return _chat_sse_response("chat stream pong")
+
+    router.register("https://chat-sse.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("chat-sse", "https://chat-sse.example", protocol="openai-chat", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": True, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-chat"
+    assert resp.status_code == 200
+    assert "event: message_start" in text
+    assert '"type":"content_block_delta"' in text
+    assert '"text":"chat stream pong"' in text
+    assert '"stop_reason":"end_turn"' in text
+    assert '"input_tokens":6' in text
+    assert '"cache_read_input_tokens":2' in text
+
+
+async def test_anthropic_client_to_openai_responses_stream_fake_upstream(m):
+    _setup(m)
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-sse.example/v1/responses"
+        payload = _json_request(req)
+        assert payload["model"] == "gpt-real"
+        assert payload["stream"] is True
+        assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}]
+        return _responses_sse_response("responses stream pong")
+
+    router.register("https://responses-sse.example", handler)
+    _install_channels(m, [
+        _make_openai_channel("responses-sse", "https://responses-sse.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": True, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert resp.status_code == 200
+    assert "event: message_start" in text
+    assert '"type":"content_block_delta"' in text
+    assert '"text":"responses stream pong"' in text
+    assert '"stop_reason":"end_turn"' in text
+
+
+async def test_anthropic_client_to_openai_responses_stream_pre_visible_error_fails_over(m):
+    _setup(m)
+    router = MockRouter()
+
+    def bad_handler(req: httpx.Request):
+        assert str(req.url) == "https://bad-responses-sse.example/v1/responses"
+        return httpx.Response(
+            200,
+            content=b"".join([
+                _responses_sse_event("response.created", {
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {"id": "resp_bad", "status": "in_progress"},
+                }),
+                _responses_sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "server_error", "message": "pre-visible boom"},
+                }),
+            ]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    def good_handler(req: httpx.Request):
+        assert str(req.url) == "https://good-responses-sse.example/v1/responses"
+        return _responses_sse_response("good after pre-visible error")
+
+    router.register("https://bad-responses-sse.example", bad_handler)
+    router.register("https://good-responses-sse.example", good_handler)
+    _install_channels(m, [
+        _make_openai_channel("bad-responses-sse", "https://bad-responses-sse.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+        _make_openai_channel("good-responses-sse", "https://good-responses-sse.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": True, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert [str(req.url) for req in router.requests] == [
+        "https://bad-responses-sse.example/v1/responses",
+        "https://good-responses-sse.example/v1/responses",
+    ]
+    assert "pre-visible boom" not in text
+    assert "good after pre-visible error" in text
+    assert "event: message_stop" in text
+
+    conn = m["log_db"]._get_conn()
+    rid = conn.execute("SELECT request_id FROM request_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+    rows = [dict(r) for r in conn.execute(
+        "SELECT channel_key, outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (rid,),
+    ).fetchall()]
+    assert rows == [
+        {"channel_key": route.candidates[0][0].key, "outcome": "upstream_error_json"},
+        {"channel_key": route.candidates[1][0].key, "outcome": "success"},
+    ]
+
+
+async def test_anthropic_client_to_openai_responses_stream_post_visible_error_does_not_fail_over(m):
+    _setup(m)
+    router = MockRouter()
+
+    def bad_handler(req: httpx.Request):
+        assert str(req.url) == "https://bad-post-visible.example/v1/responses"
+        return httpx.Response(
+            200,
+            content=b"".join([
+                _responses_sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "visible before error",
+                }),
+                _responses_sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "server_error", "message": "post-visible boom"},
+                }),
+            ]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    def good_handler(req: httpx.Request):
+        assert str(req.url) == "https://good-post-visible.example/v1/responses"
+        return _responses_sse_response("should not be used")
+
+    router.register("https://bad-post-visible.example", bad_handler)
+    router.register("https://good-post-visible.example", good_handler)
+    _install_channels(m, [
+        _make_openai_channel("bad-post-visible", "https://bad-post-visible.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+        _make_openai_channel("good-post-visible", "https://good-post-visible.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": True, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert [str(req.url) for req in router.requests] == [
+        "https://bad-post-visible.example/v1/responses",
+    ]
+    assert "visible before error" in text
+    assert "post-visible boom" in text
+    assert "should not be used" not in text
+
+    conn = m["log_db"]._get_conn()
+    rid = conn.execute("SELECT request_id FROM request_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+    row = dict(conn.execute(
+        "SELECT status, final_channel_key, error_message FROM request_log WHERE request_id = ?",
+        (rid,),
+    ).fetchone())
+    assert row["status"] == "error"
+    assert row["final_channel_key"] == route.candidates[0][0].key
+    assert "post-visible boom" in row["error_message"]
+
+
+async def test_anthropic_client_to_openai_responses_stream_pre_commit_blacklist_fails_over(m):
+    _setup(m)
+    m["config"].update(lambda cfg: cfg.update({"contentBlacklist": {"default": ["blocked-token"], "byChannel": {}}}))
+    router = MockRouter()
+
+    def bad_handler(req: httpx.Request):
+        assert str(req.url) == "https://bad-blacklist.example/v1/responses"
+        return _responses_sse_response("blocked-token")
+
+    def good_handler(req: httpx.Request):
+        assert str(req.url) == "https://good-blacklist.example/v1/responses"
+        return _responses_sse_response("clean after blacklist")
+
+    router.register("https://bad-blacklist.example", bad_handler)
+    router.register("https://good-blacklist.example", good_handler)
+    _install_channels(m, [
+        _make_openai_channel("bad-blacklist", "https://bad-blacklist.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+        _make_openai_channel("good-blacklist", "https://good-blacklist.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": True, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert [str(req.url) for req in router.requests] == [
+        "https://bad-blacklist.example/v1/responses",
+        "https://good-blacklist.example/v1/responses",
+    ]
+    assert "blocked-token" not in text
+    assert "clean after blacklist" in text
+
+    conn = m["log_db"]._get_conn()
+    rid = conn.execute("SELECT request_id FROM request_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+    rows = [dict(r) for r in conn.execute(
+        "SELECT channel_key, outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (rid,),
+    ).fetchall()]
+    assert rows == [
+        {"channel_key": route.candidates[0][0].key, "outcome": "blacklist_hit"},
+        {"channel_key": route.candidates[1][0].key, "outcome": "success"},
+    ]
+
+
+async def test_anthropic_client_to_openai_responses_stream_post_commit_blacklist_does_not_fail_over(m):
+    _setup(m)
+    m["config"].update(lambda cfg: cfg.update({"contentBlacklist": {"default": ["blocked-token"], "byChannel": {}}}))
+    router = MockRouter()
+
+    def bad_handler(req: httpx.Request):
+        assert str(req.url) == "https://bad-post-blacklist.example/v1/responses"
+        chunks = [
+            _responses_sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "clean first",
+            }),
+            b"".join([
+            _responses_sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "blocked-token",
+            }),
+            _responses_sse_event("response.completed", {
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": {"id": "resp_post_bl", "status": "completed", "usage": {"input_tokens": 1, "output_tokens": 2}},
+            }),
+            ]),
+        ]
+        return httpx.Response(200, stream=ChunkedByteStream(chunks), headers={"content-type": "text/event-stream"})
+
+    def good_handler(req: httpx.Request):
+        assert str(req.url) == "https://good-post-blacklist.example/v1/responses"
+        return _responses_sse_response("should not be used")
+
+    router.register("https://bad-post-blacklist.example", bad_handler)
+    router.register("https://good-post-blacklist.example", good_handler)
+    _install_channels(m, [
+        _make_openai_channel("bad-post-blacklist", "https://bad-post-blacklist.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+        _make_openai_channel("good-post-blacklist", "https://good-post-blacklist.example", protocol="openai-responses", alias="sonnet", real="gpt-real"),
+    ])
+
+    body = {"model": "sonnet", "stream": True, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert [str(req.url) for req in router.requests] == [
+        "https://bad-post-blacklist.example/v1/responses",
+    ]
+    assert "clean first" in text
+    assert '"text":"blocked-token"' not in text
+    assert '"delta":{"type":"text_delta","text":"blocked-token"}' not in text
+    assert "blacklist: blocked-token" in text
+    assert "should not be used" not in text
+
+    conn = m["log_db"]._get_conn()
+    rid = conn.execute("SELECT request_id FROM request_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+    row = dict(conn.execute(
+        "SELECT status, final_channel_key, error_message FROM request_log WHERE request_id = ?",
+        (rid,),
+    ).fetchone())
+    assert row["status"] == "error"
+    assert row["final_channel_key"] == route.candidates[0][0].key
+    assert "blacklist: blocked-token" in row["error_message"]
+
+
+async def test_chat_client_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        assert payload["messages"][0]["role"] == "user"
+        assert payload["messages"][0]["content"][0]["type"] == "text"
+        assert payload["messages"][0]["content"][0]["text"] == "ping"
+        return _anthropic_response("chat client pong")
+
+    router.register("https://anthropic.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth", "https://anthropic.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {"model": "gpt-5", "stream": False, "max_tokens": 32, "messages": [{"role": "user", "content": "ping"}]}
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["object"] == "chat.completion"
+    assert out["choices"][0]["message"] == {"role": "assistant", "content": "chat client pong"}
+    assert out["usage"]["prompt_tokens"] == 9
+    assert out["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+
+
+async def test_chat_client_assistant_refusal_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-chat-refusal.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _responses_response("chat refusal pong")
+
+    router.register("https://responses-chat-refusal.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-chat-refusal",
+            "https://responses-chat-refusal.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": "classified request"},
+            {"role": "assistant", "content": [
+                {"type": "refusal", "refusal": "I can't help with that."},
+            ]},
+            {"role": "user", "content": "thanks"},
+        ],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == "chat refusal pong"
+    payload = captured["payload"]
+    assert payload["model"] == "gpt-real"
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "classified request"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "I can't help with that."}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "thanks"}]},
+    ]
+
+
+async def test_chat_client_logprobs_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-chat-logprobs.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return httpx.Response(200, json={
+            "id": "resp_logprobs",
+            "object": "response",
+            "status": "completed",
+            "created_at": 1,
+            "model": "gpt-real",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "pong",
+                    "annotations": [],
+                    "logprobs": [{
+                        "token": "pong",
+                        "bytes": [112, 111, 110, 103],
+                        "logprob": -0.02,
+                        "top_logprobs": [{"token": "pong", "bytes": [112, 111, 110, 103], "logprob": -0.02}],
+                    }],
+                }],
+            }],
+            "output_text": "pong",
+            "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+        })
+
+    router.register("https://responses-chat-logprobs.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-chat-logprobs",
+            "https://responses-chat-logprobs.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "messages": [{"role": "user", "content": "ping"}],
+        "logprobs": True,
+        "top_logprobs": 2,
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    payload = captured["payload"]
+    assert payload["include"] == ["message.output_text.logprobs"]
+    assert payload["top_logprobs"] == 2
+    out = json.loads(resp.body)
+    assert out["choices"][0]["message"]["content"] == "pong"
+    assert out["choices"][0]["logprobs"]["content"][0]["token"] == "pong"
+
+
+async def test_chat_client_input_audio_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-chat-audio.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _responses_response("chat audio pong")
+
+    router.register("https://responses-chat-audio.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-chat-audio",
+            "https://responses-chat-audio.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "transcribe this"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == "chat audio pong"
+    assert captured["payload"]["input"] == [{
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "transcribe this"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ],
+    }]
+
+
+async def test_chat_client_tool_output_file_url_to_openai_responses_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-chat-tool-file.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _responses_response("chat tool file url pong")
+
+    router.register("https://responses-chat-tool-file.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-chat-tool-file",
+            "https://responses-chat-tool-file.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "messages": [
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "inspect", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": "see attached"},
+                {"type": "file", "file": {
+                    "filename": "remote.pdf",
+                    "file_url": "https://example.com/remote.pdf",
+                }},
+            ]},
+        ],
+        "tools": [{"type": "function", "function": {"name": "inspect", "parameters": {"type": "object"}}}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == "chat tool file url pong"
+    payload = captured["payload"]
+    assert payload["model"] == "gpt-real"
+    assert payload["input"] == [
+        {
+            "type": "function_call",
+            "id": "fc_call_1",
+            "call_id": "call_1",
+            "name": "inspect",
+            "arguments": "{}",
+            "status": "completed",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [
+                {"type": "input_text", "text": "see attached"},
+                {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
+            ],
+        },
+    ]
+
+
+async def test_chat_client_file_data_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-file.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("chat file pong")
+
+    router.register("https://anthropic-file.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-file", "https://anthropic-file.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "read"},
+            {"type": "file", "file": {"filename": "case.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQ="}},
+        ]}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    payload = captured["payload"]
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "read"}
+    assert {k: content[1][k] for k in ("type", "source", "title")} == {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+        "title": "case.pdf",
+    }
+
+
+async def test_chat_client_file_id_to_anthropic_is_guarded(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    router.register("https://anthropic-file.example", lambda req: _anthropic_response("should not be called"))
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-file", "https://anthropic-file.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "messages": [{"role": "user", "content": [
+            {"type": "file", "file": {"file_id": "file_1"}},
+        ]}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 400
+    assert "file" in resp.body.decode()
+
+
+async def test_chat_client_explicit_prompt_cache_key_to_anthropic_is_stripped(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("prompt cache stripped")
+
+    router.register("https://anthropic.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth", "https://anthropic.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "messages": [{"role": "user", "content": "ping"}],
+        "prompt_cache_key": "user-cache-key",
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "prompt_cache_key" not in captured["payload"]
+    out = json.loads(resp.body)
+    assert out["choices"][0]["message"]["content"] == "prompt cache stripped"
+
+
+async def test_chat_client_allowed_tools_to_anthropic_filters_upstream_tools(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-chat-allowed.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("chat allowed tools pong")
+
+    router.register("https://anthropic-chat-allowed.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-chat-allowed", "https://anthropic-chat-allowed.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+        "tools": [
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+        ],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "required",
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+            },
+        },
+        "parallel_tool_calls": False,
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["choices"][0]["message"]["content"] == "chat allowed tools pong"
+    payload = captured["payload"]
+    assert {k: payload["messages"][0]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "ping"}
+    assert len(payload["tools"]) == 1
+    assert {k: payload["tools"][0][k] for k in ("name", "input_schema")} == {
+        "name": "search",
+        "input_schema": {"type": "object"},
+    }
+    assert payload["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
+
+
+async def test_responses_client_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        assert payload["messages"][0]["role"] == "user"
+        assert payload["messages"][0]["content"][0]["type"] == "text"
+        assert payload["messages"][0]["content"][0]["text"] == "ping"
+        return _anthropic_response("responses client pong")
+
+    router.register("https://anthropic.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth", "https://anthropic.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {"model": "gpt-5", "stream": False, "max_output_tokens": 32, "input": "ping"}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["object"] == "response"
+    assert out["output_text"] == "responses client pong"
+    assert out["output"][0]["content"][0]["text"] == "responses client pong"
+    assert out["usage"]["input_tokens"] == 9
+    assert out["usage"]["input_tokens_details"]["cached_tokens"] == 2
+
+
+async def test_responses_native_state_passthrough_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-native-state.example/v1/responses"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _responses_response("native state pong")
+
+    router.register("https://responses-native-state.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-native-state",
+            "https://responses-native-state.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "conversation": "conv_1",
+        "background": True,
+        "input": "ping",
+        "openai_chat_only_hint": {"drop": True},
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "native state pong"
+    payload = captured["payload"]
+    assert payload["model"] == "gpt-real"
+    assert payload["conversation"] == "conv_1"
+    assert payload["background"] is True
+    assert payload["input"] == "ping"
+    assert "openai_chat_only_hint" not in payload
+
+
+async def test_native_responses_response_is_saved_for_fallback_previous_response_id(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    from src.openai import store as openai_store
+
+    openai_store.init()
+    openai_store._reset_for_test()
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def native_handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-store-seed.example/v1/responses"
+        payload = _json_request(req)
+        captured["seed_payload"] = payload
+        return httpx.Response(200, json={
+            "id": "resp_native_seed",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "model": "gpt-real",
+            "output": [{
+                "type": "message",
+                "id": "msg_native_seed",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "native seed ok", "annotations": []}],
+            }],
+            "output_text": "native seed ok",
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        }, headers={"content-type": "application/json"})
+
+    def chat_handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-store-follow.example/v1/chat/completions"
+        payload = _json_request(req)
+        captured["follow_payload"] = payload
+        return _chat_response("chat follow ok")
+
+    router.register("https://responses-store-seed.example", native_handler)
+    router.register("https://chat-store-follow.example", chat_handler)
+
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-store-seed",
+            "https://responses-store-seed.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+    resp1, mc1 = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": False,
+        "input": "seed question",
+    })
+    await mc1.aclose()
+    assert resp1.status_code == 200
+    assert json.loads(resp1.body)["id"] == "resp_native_seed"
+
+    rec = openai_store.lookup("resp_native_seed", api_key_name="k")
+    assert rec.parent_id is None
+    assert rec.channel_key == "api:responses-store-seed"
+    assert rec.input_items == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "seed question"},
+    ]}]
+    assert rec.output_items[0]["content"][0]["text"] == "native seed ok"
+
+    router.requests.clear()
+    _install_channels(m, [
+        _make_openai_channel(
+            "chat-store-follow",
+            "https://chat-store-follow.example",
+            protocol="openai-chat",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+    resp2, mc2 = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": False,
+        "previous_response_id": "resp_native_seed",
+        "input": "follow up",
+    })
+    await mc2.aclose()
+
+    assert resp2.status_code == 200, resp2.body.decode()
+    assert json.loads(resp2.body)["output_text"] == "chat follow ok"
+    assert captured["follow_payload"]["messages"] == [
+        {"role": "user", "content": "seed question"},
+        {"role": "assistant", "content": "native seed ok", "reasoning_content": ""},
+        {"role": "user", "content": "follow up"},
+    ]
+
+
+async def test_native_responses_stream_response_is_saved_for_previous_response_id(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    from src.openai import store as openai_store
+
+    openai_store.init()
+    openai_store._reset_for_test()
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-stream-store.example/v1/responses"
+        payload = _json_request(req)
+        assert payload["stream"] is True
+        assert payload["input"] == "stream seed"
+        return _responses_sse_response("native stream stored")
+
+    router.register("https://responses-stream-store.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-stream-store",
+            "https://responses-stream-store.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    resp, mc = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": True,
+        "input": "stream seed",
+    })
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "event: response.completed" in text
+    rec = openai_store.lookup("resp_sse", api_key_name="k")
+    assert rec.parent_id is None
+    assert rec.channel_key == "api:responses-stream-store"
+    assert rec.input_items == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "stream seed"},
+    ]}]
+    assert rec.output_items[0]["content"][0]["text"] == "native stream stored"
+
+
+async def test_responses_client_text_instruction_items_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-instructions.example/v1/chat/completions"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _chat_response("responses instructions chat pong")
+
+    router.register("https://chat-instructions.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "chat-instructions",
+            "https://chat-instructions.example",
+            protocol="openai-chat",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "instructions": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "follow policy"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "background"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "noted"}]},
+        ],
+        "input": "ping",
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "responses instructions chat pong"
+    assert captured["payload"]["messages"] == [
+        {"role": "system", "content": "follow policy"},
+        {"role": "user", "content": "background"},
+        {"role": "assistant", "content": "noted"},
+        {"role": "user", "content": "ping"},
+    ]
+
+
+async def test_responses_client_local_item_reference_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-local-ref.example/v1/chat/completions"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _chat_response("local ref chat pong")
+
+    router.register("https://chat-local-ref.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "chat-local-ref",
+            "https://chat-local-ref.example",
+            protocol="openai-chat",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "input": [
+            {"type": "message", "id": "msg_1", "role": "user", "content": [
+                {"type": "input_text", "text": "remember this"},
+            ]},
+            {"type": "item_reference", "id": "msg_1"},
+        ],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "local ref chat pong"
+    assert captured["payload"]["messages"] == [
+        {"role": "user", "content": "remember this"},
+        {"role": "user", "content": "remember this"},
+    ]
+
+
+async def test_responses_client_input_audio_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-audio.example/v1/chat/completions"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _chat_response("responses audio pong")
+
+    router.register("https://chat-audio.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "chat-audio",
+            "https://chat-audio.example",
+            protocol="openai-chat",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "transcribe"},
+            {"type": "input_audio", "input_audio": {"data": "BBBB", "format": "mp3"}},
+        ]}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "responses audio pong"
+    assert captured["payload"]["messages"] == [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "input_audio", "input_audio": {"data": "BBBB", "format": "mp3"}},
+        ],
+    }]
+
+
+async def test_responses_client_logprobs_to_openai_chat_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://chat-logprobs.example/v1/chat/completions"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return httpx.Response(200, json={
+            "id": "chatcmpl-logprobs",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-real",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "pong"},
+                "logprobs": {
+                    "content": [{
+                        "token": "pong",
+                        "bytes": [112, 111, 110, 103],
+                        "logprob": -0.02,
+                        "top_logprobs": [{"token": "pong", "bytes": [112, 111, 110, 103], "logprob": -0.02}],
+                    }],
+                    "refusal": None,
+                },
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        })
+
+    router.register("https://chat-logprobs.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "chat-logprobs",
+            "https://chat-logprobs.example",
+            protocol="openai-chat",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "input": "ping",
+        "include": ["message.output_text.logprobs"],
+        "top_logprobs": 2,
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert captured["payload"]["logprobs"] is True
+    assert captured["payload"]["top_logprobs"] == 2
+    out = json.loads(resp.body)
+    assert out["output_text"] == "pong"
+    assert out["output"][0]["content"][0]["logprobs"][0]["token"] == "pong"
+
+
+async def test_responses_client_text_instruction_items_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-instructions.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("responses instructions anthropic pong")
+
+    router.register("https://anthropic-instructions.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-instructions",
+            "https://anthropic-instructions.example",
+            alias="gpt-5",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "instructions": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "follow policy"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "background"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "noted"}]},
+        ],
+        "input": "ping",
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "responses instructions anthropic pong"
+    payload = captured["payload"]
+    assert [{k: block[k] for k in ("type", "text")} for block in payload["system"]] == [
+        {"type": "text", "text": "follow policy"},
+    ]
+    assert [
+        {
+            "role": msg["role"],
+            "content": [{k: block[k] for k in ("type", "text")} for block in msg["content"]],
+        }
+        for msg in payload["messages"]
+    ] == [
+        {"role": "user", "content": [{"type": "text", "text": "background"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "noted"}]},
+        {"role": "user", "content": [{"type": "text", "text": "ping"}]},
+    ]
+
+
+async def test_responses_client_local_item_reference_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-local-ref.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("local ref anthropic pong")
+
+    router.register("https://anthropic-local-ref.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-local-ref",
+            "https://anthropic-local-ref.example",
+            alias="gpt-5",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_output_tokens": 32,
+        "input": [
+            {"type": "message", "id": "msg_1", "role": "user", "content": [
+                {"type": "input_text", "text": "remember this"},
+            ]},
+            {"type": "item_reference", "id": "msg_1"},
+        ],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "local ref anthropic pong"
+    msgs = captured["payload"]["messages"]
+    assert [msg["role"] for msg in msgs] == ["user", "user"]
+    assert [
+        [{k: part[k] for k in ("type", "text")} for part in msg["content"]]
+        for msg in msgs
+    ] == [
+        [{"type": "text", "text": "remember this"}],
+        [{"type": "text", "text": "remember this"}],
+    ]
+
+
+async def test_responses_client_file_documents_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-resp-file.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("responses file pong")
+
+    router.register("https://anthropic-resp-file.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-resp-file", "https://anthropic-resp-file.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_output_tokens": 32,
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "read"},
+            {"type": "input_file", "filename": "brief.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQ="},
+            {"type": "input_file", "filename": "remote.pdf", "file_url": "https://example.com/remote.pdf"},
+        ]}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    payload = captured["payload"]
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "read"}
+    assert {k: content[1][k] for k in ("type", "source", "title")} == {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+        "title": "brief.pdf",
+    }
+    assert {k: content[2][k] for k in ("type", "source", "title")} == {
+        "type": "document",
+        "source": {"type": "url", "url": "https://example.com/remote.pdf"},
+        "title": "remote.pdf",
+    }
+
+
+async def test_responses_client_explicit_prompt_cache_key_to_anthropic_is_stripped(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("responses prompt cache stripped")
+
+    router.register("https://anthropic.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth", "https://anthropic.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "input": "ping",
+        "prompt_cache_key": "user-cache-key",
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "prompt_cache_key" not in captured["payload"]
+    out = json.loads(resp.body)
+    assert out["output_text"] == "responses prompt cache stripped"
+
+
+async def test_responses_client_allowed_tools_to_anthropic_filters_upstream_tools(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-allowed.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("responses allowed tools pong")
+
+    router.register("https://anthropic-allowed.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-allowed", "https://anthropic-allowed.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_output_tokens": 32,
+        "input": "ping",
+        "tools": [
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "function", "name": "search", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "function", "name": "search"}],
+        },
+        "parallel_tool_calls": False,
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["output_text"] == "responses allowed tools pong"
+    payload = captured["payload"]
+    assert payload["model"] == "claude-real"
+    assert {k: payload["messages"][0]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "ping"}
+    assert len(payload["tools"]) == 1
+    assert {k: payload["tools"][0][k] for k in ("name", "input_schema")} == {
+        "name": "search",
+        "input_schema": {"type": "object"},
+    }
+    assert payload["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
+
+
+async def test_chat_client_multiturn_tool_result_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-history.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        msgs = payload["messages"]
+        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user", "user"]
+        assert msgs[0]["content"][0] == {"type": "text", "text": "hi"}
+        assert msgs[1]["content"] == [
+            {"type": "text", "text": "need tool"},
+            {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "x"}},
+        ]
+        assert {k: msgs[2]["content"][0][k] for k in ("type", "tool_use_id", "content")} == {
+            "type": "tool_result", "tool_use_id": "call_1", "content": "result x",
+        }
+        assert {k: msgs[3]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+        return _anthropic_response("chat history client pong")
+
+    router.register("https://anthropic-history.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-history", "https://anthropic-history.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5", "stream": False, "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "need tool", "tool_calls": [{
+                "id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result x"},
+            {"role": "user", "content": "continue"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["choices"][0]["message"]["content"] == "chat history client pong"
+
+
+async def test_chat_client_safe_custom_tool_history_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-chat-custom-history.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        msgs = payload["messages"]
+        assert [msg["role"] for msg in msgs] == ["assistant", "user", "user"]
+        assert msgs[0]["content"] == [
+            {"type": "tool_use", "id": "call_1", "name": "shell", "input": {"cmd": "pwd"}},
+        ]
+        assert {k: msgs[1]["content"][0][k] for k in ("type", "tool_use_id", "content")} == {
+            "type": "tool_result", "tool_use_id": "call_1", "content": "ok",
+        }
+        assert {k: msgs[2]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+        return _anthropic_response("chat custom history pong")
+
+    router.register("https://anthropic-chat-custom-history.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-chat-custom-history",
+            "https://anthropic-chat-custom-history.example",
+            alias="gpt-5",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5", "stream": False, "max_tokens": 32,
+        "messages": [
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1", "type": "custom", "custom": {"name": "shell", "input": {"cmd": "pwd"}},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "continue"},
+        ],
+        "tools": [{"type": "custom", "custom": {"name": "shell"}}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["choices"][0]["message"]["content"] == "chat custom history pong"
+
+
+async def test_responses_client_multiturn_tool_result_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-history.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        msgs = payload["messages"]
+        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user", "user"]
+        assert msgs[0]["content"][0] == {"type": "text", "text": "hi"}
+        assert msgs[1]["content"] == [{"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "x"}}]
+        assert {k: msgs[2]["content"][0][k] for k in ("type", "tool_use_id", "content")} == {
+            "type": "tool_result", "tool_use_id": "call_1", "content": "result x",
+        }
+        assert {k: msgs[3]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+        return _anthropic_response("responses history client pong")
+
+    router.register("https://anthropic-history.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-history", "https://anthropic-history.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5", "stream": False, "max_output_tokens": 32,
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": '{"q":"x"}'},
+            {"type": "function_call_output", "call_id": "call_1", "output": "result x"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["output_text"] == "responses history client pong"
+
+
+async def test_responses_client_tool_result_attachments_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-tool-attachments.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("responses tool attachments pong")
+
+    router.register("https://anthropic-tool-attachments.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-tool-attachments",
+            "https://anthropic-tool-attachments.example",
+            alias="gpt-5",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_output_tokens": 32,
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "inspect", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [
+                {"type": "input_text", "text": "see attached"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high"},
+                {"type": "input_file", "filename": "brief.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQ="},
+                {"type": "input_file", "filename": "remote.pdf", "file_url": "https://example.com/remote.pdf"},
+            ]},
+        ],
+        "tools": [{"type": "function", "name": "inspect", "parameters": {"type": "object"}}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["output_text"] == "responses tool attachments pong"
+    payload = captured["payload"]
+    assert payload["model"] == "claude-real"
+    msgs = payload["messages"]
+    assert [msg["role"] for msg in msgs] == ["assistant", "user"]
+    assert msgs[0]["content"] == [{"type": "tool_use", "id": "call_1", "name": "inspect", "input": {}}]
+    result = msgs[1]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["tool_use_id"] == "call_1"
+    assert result["content"] == [
+        {"type": "text", "text": "see attached"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+            "title": "brief.pdf",
+        },
+        {
+            "type": "document",
+            "source": {"type": "url", "url": "https://example.com/remote.pdf"},
+            "title": "remote.pdf",
+        },
+    ]
+
+
+async def test_responses_client_safe_custom_tool_history_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-custom-history.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("custom history pong")
+
+    router.register("https://anthropic-custom-history.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-custom-history",
+            "https://anthropic-custom-history.example",
+            alias="gpt-5",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "max_output_tokens": 32,
+        "input": [
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": {"cmd": "pwd"}},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "ok"},
+        ],
+        "tools": [{"type": "custom", "name": "shell"}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "custom history pong"
+    payload = captured["payload"]
+    assert "tools" not in payload
+    assert payload["cache_control"] == {"type": "ephemeral"}
+    assert payload["messages"] == [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_1", "name": "shell", "input": {"cmd": "pwd"}},
+        ]},
+        {"role": "user", "content": [{
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "ok",
+        }]},
+    ]
+
+
+async def test_responses_client_previous_response_tool_result_attachments_to_anthropic_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    from src.openai import store as openai_store
+
+    openai_store.init()
+    openai_store._reset_for_test()
+    openai_store.save(
+        "resp_call",
+        None,
+        api_key_name="k",
+        model="gpt-5",
+        channel_key="api:anth-history-attachments",
+        input_items=[],
+        output_items=[{"type": "function_call", "call_id": "call_1", "name": "inspect", "arguments": "{}"}],
+    )
+    openai_store.save(
+        "resp_tool",
+        "resp_call",
+        api_key_name="k",
+        model="gpt-5",
+        channel_key="api:anth-history-attachments",
+        input_items=[{"type": "function_call_output", "call_id": "call_1", "output": [
+            {"type": "input_text", "text": "from stored history"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "input_file", "filename": "brief.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQ="},
+            {"type": "input_file", "filename": "remote.pdf", "file_url": "https://example.com/remote.pdf"},
+        ]}],
+        output_items=[],
+    )
+
+    router = MockRouter()
+    captured: dict[str, object] = {}
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-history-attachments.example/v1/messages"
+        payload = _json_request(req)
+        captured["payload"] = payload
+        return _anthropic_response("responses stored tool attachments pong")
+
+    router.register("https://anthropic-history-attachments.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "anth-history-attachments",
+            "https://anthropic-history-attachments.example",
+            alias="gpt-5",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": False,
+        "previous_response_id": "resp_tool",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+        "tools": [{"type": "function", "name": "inspect", "parameters": {"type": "object"}}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["output_text"] == "responses stored tool attachments pong"
+    msgs = captured["payload"]["messages"]
+    assert [msg["role"] for msg in msgs] == ["assistant", "user", "user"]
+    assert msgs[0]["content"] == [{"type": "tool_use", "id": "call_1", "name": "inspect", "input": {}}]
+    assert msgs[1]["content"][0] == {
+        "type": "tool_result",
+        "tool_use_id": "call_1",
+        "content": [
+            {"type": "text", "text": "from stored history"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ="},
+                "title": "brief.pdf",
+            },
+            {
+                "type": "document",
+                "source": {"type": "url", "url": "https://example.com/remote.pdf"},
+                "title": "remote.pdf",
+            },
+        ],
+    }
+    assert {k: msgs[2]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+
+
+async def test_chat_client_to_anthropic_stream_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-sse.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        assert payload["stream"] is True
+        assert payload["messages"][0]["content"][0]["text"] == "ping"
+        return _anthropic_sse_response("chat stream via anthropic")
+
+    router.register("https://anthropic-sse.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-sse", "https://anthropic-sse.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {
+        "model": "gpt-5",
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc = await _call_openai_handler(m, router, "chat", body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "data: [DONE]" in text
+    assert '"object":"chat.completion.chunk"' in text
+    assert '"content":"chat stream via anthropic"' in text
+    assert '"finish_reason":"stop"' in text
+    assert '"prompt_tokens":9' in text
+    assert '"cached_tokens":2' in text
+
+
+async def test_responses_client_to_anthropic_stream_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://anthropic-sse.example/v1/messages"
+        payload = _json_request(req)
+        assert payload["model"] == "claude-real"
+        assert payload["stream"] is True
+        assert payload["messages"][0]["content"][0]["text"] == "ping"
+        return _anthropic_sse_response("responses stream via anthropic")
+
+    router.register("https://anthropic-sse.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(m, "anth-sse", "https://anthropic-sse.example", alias="gpt-5", real="claude-real"),
+    ])
+
+    body = {"model": "gpt-5", "stream": True, "max_output_tokens": 32, "input": "ping"}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "event: response.created" in text
+    assert "event: response.output_text.delta" in text
+    assert '"delta":"responses stream via anthropic"' in text
+    assert "event: response.completed" in text
+    assert '"input_tokens":9' in text
+    assert '"cached_tokens":2' in text
+
+
+async def test_responses_ws_client_to_http_sse_fake_upstream(m):
+    _setup(m)
+    _install_keys(m, {
+        "ws-key": {
+            "key": "sk-ws",
+            "allowedProtocols": ["responses"],
+            "allowedModels": ["test-model"],
+        }
+    })
+    from src.openai import store as openai_store
+
+    openai_store.init()
+    openai_store._reset_for_test()
+    m["config"].update(lambda cfg: cfg.update({
+        "network": {"routing": {"default": "direct"}},
+        "timeouts": {"connect": 5, "firstByte": 5, "idle": 10, "total": 30},
+        "concurrency": {"queueWaitSeconds": 1},
+        "oauthAccounts": [],
+    }))
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-sse.example/v1/responses"
+        payload = _json_request(req)
+        assert payload["model"] == "real-model"
+        assert payload["stream"] is True
+        assert payload["input"] == "ping"
+        return _responses_sse_response("ws bridge pong")
+
+    router.register("https://responses-sse.example", handler)
+    transport = httpx.MockTransport(router.handle)
+    mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
+    m["upstream"].set_client(mock_client)
+
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-sse", "https://responses-sse.example",
+            protocol="openai-responses", alias="test-model", real="real-model",
+            extra={"responsesWsUpstreamTransport": "sse"},
+        ),
+    ])
+
+    ws = FakeWebSocket({
+        "type": "response.create",
+        "model": "test-model",
+        "input": "ping",
+        "stream": True,
+    })
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    await mock_client.aclose()
+
+    sent = [json.loads(t) for t in ws.sent_texts]
+    assert [e["type"] for e in sent] == [
+        "response.created",
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert sent[2]["delta"] == "ws bridge pong"
+    assert ws.close_calls[-1][0] == 1000
+
+    conn = m["log_db"]._get_conn()
+    row = conn.execute("SELECT upstream_transport, input_tokens, cache_read_tokens, output_tokens FROM request_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert dict(row) == {
+        "upstream_transport": "sse",
+        "input_tokens": 5,
+        "cache_read_tokens": 2,
+        "output_tokens": 4,
+    }
+    rec = openai_store.lookup("resp_sse", api_key_name="ws-key")
+    assert rec.channel_key == "api:responses-sse"
+    assert rec.input_items == [{"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "ping"},
+    ]}]
+    assert rec.output_items[0]["content"][0]["text"] == "ws bridge pong"
+
+
+async def test_http_responses_client_to_ws_fake_upstream(monkeypatch, m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    m["config"].update(lambda cfg: cfg.update({
+        "network": {"routing": {"default": "direct"}},
+        "timeouts": {"connect": 5, "firstByte": 5, "idle": 10, "total": 30},
+        "concurrency": {"queueWaitSeconds": 1},
+        "openai": {"responsesUpstreamWsForOAuth": True},
+        "oauth": {"providers": {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}},
+        # This test installs a fake in-memory OAuth channel directly in the
+        # registry; the persisted/configured OAuth account list must remain off.
+        "oauthAccounts": [],
+    }))
+    _install_channels(m, [_make_openai_oauth_channel("fake-http-ws@example.com")])
+
+    async def fake_token(account_key):
+        assert account_key.startswith("openai:fake-http-ws@example.com")
+        return "tok"
+
+    fake_ws = FakeOAuthResponseWs([
+        {"type": "response.created", "response": {"id": "resp_http_ws"}},
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_http_ws", "role": "assistant", "content": []},
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "msg_http_ws",
+            "delta": "http responses over ws pong",
+        },
+        {"type": "response.completed", "response": {
+            "id": "resp_http_ws",
+            "status": "completed",
+            "output": [{
+                "type": "message", "id": "msg_http_ws", "role": "assistant",
+                "content": [{"type": "output_text", "text": "http responses over ws pong"}],
+            }],
+            "usage": {
+                "input_tokens": 9,
+                "output_tokens": 5,
+                "total_tokens": 14,
+                "input_tokens_details": {"cached_tokens": 3},
+            },
+        }},
+    ])
+    captured: dict[str, object] = {}
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+        captured["url"] = url
+        captured["headers"] = dict(headers)
+        captured["connector"] = connector
+        captured["open_timeout"] = open_timeout
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+
+    router = MockRouter()
+    body = {"model": "gpt-5", "stream": False, "input": "ping", "prompt_cache_key": "anchor"}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    out = json.loads(resp.body)
+    assert out["object"] == "response"
+    assert out["output"][0]["content"][0]["text"] == "http responses over ws pong"
+    assert out["usage"]["input_tokens"] == 9
+    assert out["usage"]["input_tokens_details"]["cached_tokens"] == 3
+    assert captured["url"] == "wss://chatgpt.com/backend-api/codex/responses"
+    assert captured["headers"]["OpenAI-Beta"] == "responses_websockets=2026-02-06"
+    assert captured["connector"] is None
+
+    sent = json.loads(fake_ws.sent[0])
+    assert sent["type"] == "response.create"
+    assert sent["model"] == "gpt-5"
+    assert sent["store"] is False
+    assert sent["stream"] is True
+    assert sent["input"] == [{"type": "message", "role": "user", "content": "ping"}]
+    assert fake_ws.closed is True
+
+    conn = m["log_db"]._get_conn()
+    row = conn.execute(
+        "SELECT status, upstream_protocol, upstream_transport, http_status, "
+        "input_tokens, cache_read_tokens, output_tokens "
+        "FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert dict(row) == {
+        "status": "success",
+        "upstream_protocol": "openai-responses",
+        "upstream_transport": "ws",
+        "http_status": 200,
+        "input_tokens": 6,
+        "cache_read_tokens": 3,
+        "output_tokens": 5,
+    }

@@ -8,45 +8,199 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ...providers.capabilities import (
+    ANTHROPIC_BRIDGE_REQ_ALLOWED,
+    ANTHROPIC_MESSAGES_REQ_ALLOWED,
+    CHAT_REQ_ALLOWED,
+    RESPONSES_REQ_ALLOWED,
+)
+
+
+# ─── Cross-family capability helpers ─────────────────────────────
+
+_OPENAI_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh"})
+_OPENAI_SERVICE_TIERS: frozenset[str] = frozenset({"auto", "default", "flex", "priority"})
+
+
+def supports_reasoning_effort(model: str | None) -> bool:
+    """Return whether an OpenAI-family model is expected to accept reasoning_effort.
+
+    Mirrors cc-switch's current rule: OpenAI o-series and GPT-5+ models support
+    the effort field.  Keep this deliberately conservative so non-reasoning
+    OpenAI-compatible backends do not receive unknown fields.
+    """
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    if name.startswith("deepseek-v4"):
+        return True
+    if name.startswith("o") and len(name) > 1 and name[1].isdigit():
+        return True
+    if not name.startswith("gpt-"):
+        return False
+    rest = name[4:]
+    return bool(rest and rest[0].isdigit() and rest[0] >= "5")
+
+
+def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | None:
+    """Map Anthropic thinking/output_config effort to OpenAI reasoning effort.
+
+    Priority and thresholds intentionally follow cc-switch:
+    - output_config.effort: low/medium/high pass through, max -> xhigh
+    - thinking.type=adaptive -> xhigh
+    - thinking.type=enabled uses budget_tokens: <4000 low, <16000 medium,
+      otherwise high; no budget defaults to high.
+    - disabled/unknown/absent does not produce an effort.
+    """
+    if not isinstance(body, dict):
+        return None
+    output_config = body.get("output_config")
+    if isinstance(output_config, dict):
+        raw_effort = output_config.get("effort")
+        effort = str(raw_effort).strip().lower() if isinstance(raw_effort, str) else ""
+        if effort == "max":
+            return "xhigh"
+        if effort in _OPENAI_REASONING_EFFORTS:
+            return effort
+
+    thinking = body.get("thinking")
+    if not isinstance(thinking, dict):
+        return None
+    typ = str(thinking.get("type") or "").strip().lower()
+    if typ == "adaptive":
+        return "xhigh"
+    if typ != "enabled":
+        return None
+    budget_raw = thinking.get("budget_tokens")
+    try:
+        budget = int(budget_raw) if budget_raw is not None else None
+    except (TypeError, ValueError):
+        budget = None
+    if budget is None:
+        return "high"
+    if budget < 4_000:
+        return "low"
+    if budget < 16_000:
+        return "medium"
+    return "high"
+
+
+def anthropic_reasoning_config_is_mappable(body: dict[str, Any] | None) -> bool:
+    """Whether top-level Anthropic reasoning controls can be represented.
+
+    Historical message `thinking` / `redacted_thinking` blocks are handled by
+    the individual translators because those require stateful replay semantics;
+    this helper only covers request-level controls.
+    """
+    if not isinstance(body, dict):
+        return False
+    has_reasoning_control = body.get("thinking") is not None or body.get("output_config") is not None
+    return bool(has_reasoning_control and resolve_anthropic_reasoning_effort(body))
+
+
+def anthropic_thinking_is_disabled(body: dict[str, Any] | None) -> bool:
+    if not isinstance(body, dict):
+        return False
+    thinking = body.get("thinking")
+    return isinstance(thinking, dict) and str(thinking.get("type") or "").strip().lower() == "disabled" and body.get("output_config") is None
+
+
+def anthropic_context_management_is_ignorable(value: Any) -> bool:
+    """Whether Anthropic context_management can be dropped on OpenAI bridges.
+
+    Claude Code sends ``context_management.edits`` with clear_thinking_* entries
+    when thinking is enabled.  OpenAI-family targets do not understand those
+    Anthropic signed-thinking cleanup controls; dropping them is safe because
+    historical thinking blocks are already guarded/stripped by the bridge.
+    Unknown context-management shapes are not silently ignored.
+    """
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    allowed_keys = {"edits"}
+    if any(k not in allowed_keys for k in value.keys()):
+        return False
+    edits = value.get("edits")
+    if edits in (None, []):
+        return True
+    if not isinstance(edits, list):
+        return False
+    for edit in edits:
+        if not isinstance(edit, dict):
+            return False
+        typ = str(edit.get("type") or "")
+        if not typ.startswith("clear_thinking_"):
+            return False
+    return True
+
+
+def parse_json_object(value: Any) -> dict[str, Any] | None:
+    """Return a JSON object from dict or JSON-object string, otherwise None."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def map_anthropic_service_tier_to_openai(value: Any, *, codex_oauth: bool = False) -> tuple[bool, str | None]:
+    """Map Anthropic service_tier to OpenAI service_tier semantics.
+
+    Returns (recognized, mapped_value).  `None` mapped_value means the request is
+    valid but the best equivalent is omission (notably Codex `standard_only`,
+    where cc-switch simply disables fast/priority mode).
+    """
+    if value is None:
+        return True, None
+    if not isinstance(value, str):
+        return False, None
+    tier = value.strip().lower()
+    if not tier:
+        return True, None
+    if tier == "auto":
+        return True, "priority" if codex_oauth else "auto"
+    if tier == "standard_only":
+        return True, None if codex_oauth else "default"
+    if tier in _OPENAI_SERVICE_TIERS:
+        if codex_oauth and tier == "default":
+            return True, None
+        return True, tier
+    return False, None
+
+
+def map_openai_service_tier_to_anthropic(value: Any) -> tuple[bool, str | None]:
+    """Map OpenAI service_tier intent to Anthropic service_tier.
+
+    Only the safely equivalent latency intents are mapped.  OpenAI `flex` and
+    `priority` imply provider-specific scheduling/fast-lane semantics that
+    Anthropic Messages does not expose here, so compatibility bridges strip them
+    instead of blocking the core request.
+    """
+    if value is None:
+        return True, None
+    if not isinstance(value, str):
+        return False, None
+    tier = value.strip().lower()
+    if not tier:
+        return True, None
+    if tier == "auto":
+        return True, "auto"
+    if tier in ("default", "standard_only"):
+        return True, "standard_only"
+    return False, None
+
 
 # ─── 请求字段白名单 ──────────────────────────────────────────────
 #
-# 透传路径用：从下游请求体里只拷这些键给上游，把 proxy 内部字段（如 _api_key_name）
-# 和上游不认的字段（如 previous_response_id 出现在 chat 上游时）过滤掉。
-# 与官方文档对齐；新字段出现时在此处追加（MS-8 验收再扫一遍）。
-
-CHAT_REQ_ALLOWED: frozenset[str] = frozenset({
-    "model", "messages", "stream", "stream_options",
-    "temperature", "top_p", "n",
-    "max_completion_tokens", "max_tokens", "stop",
-    "frequency_penalty", "presence_penalty",
-    "logprobs", "top_logprobs", "logit_bias",
-    "tools", "tool_choice", "parallel_tool_calls",
-    # 已弃用但 openai-python SDK 仍保留的 legacy 字段；
-    # 老客户端直接透传以保持语义，跨变体翻译不处理（反正 deprecated）
-    "functions", "function_call",
-    "response_format", "modalities", "audio",
-    "store", "metadata", "seed", "prediction",
-    "reasoning_effort", "verbosity", "web_search_options",
-    "service_tier", "user", "safety_identifier",
-    "prompt_cache_key", "prompt_cache_retention",
-})
-
-
-RESPONSES_REQ_ALLOWED: frozenset[str] = frozenset({
-    "model", "input", "stream", "stream_options", "instructions",
-    "previous_response_id", "conversation", "context_management",
-    "include", "temperature", "top_p", "top_logprobs",
-    "max_output_tokens", "max_tool_calls",
-    "tools", "tool_choice", "parallel_tool_calls",
-    "text", "reasoning", "truncation",
-    "store", "metadata", "prompt", "background",
-    "service_tier", "user", "safety_identifier",
-    "prompt_cache_key", "prompt_cache_retention",
-    # Codex Responses WebSocket request payload carries this WS-only metadata.
-    # HTTP passthrough callers still won't send it unless explicitly provided.
-    "client_metadata",
-})
+# The canonical allowlists live in ``src.providers.capabilities`` so native
+# passthrough and cross-family bridge egress filtering share the same provider
+# capability metadata.  Re-export the names here for older transform callers.
 
 
 def filter_chat_passthrough(body: dict) -> dict:
@@ -57,6 +211,18 @@ def filter_chat_passthrough(body: dict) -> dict:
 def filter_responses_passthrough(body: dict) -> dict:
     """同协议 /v1/responses 透传：保留白名单字段。"""
     return {k: v for k, v in body.items() if k in RESPONSES_REQ_ALLOWED}
+
+
+def filter_anthropic_bridge_payload(payload: dict) -> dict:
+    """OpenAI-family → Anthropic bridge 出口：只保留当前安全可表达字段。
+
+    注意这不是源请求字段白名单。源请求里的 provider-specific hint 可以被
+    translator/adapter 安全剥离；真正会丢内容/状态的部分由 matrix/translator
+    的语义 guard 负责。
+    """
+    if not isinstance(payload, dict):
+        return {}
+    return {k: v for k, v in payload.items() if k in ANTHROPIC_BRIDGE_REQ_ALLOWED}
 
 
 # ─── SSE 帧工具 ──────────────────────────────────────────────────

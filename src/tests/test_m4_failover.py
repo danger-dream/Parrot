@@ -130,6 +130,20 @@ def openai_context_length_error():
     })
 
 
+def openai_invalid_encrypted_content_error():
+    return httpx.Response(400, json={
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_encrypted_content",
+            "message": (
+                "The encrypted content gAAA... could not be verified. "
+                "Reason: Encrypted content could not be decrypted or parsed."
+            ),
+            "param": "input",
+        }
+    })
+
+
 def sse_ok():
     payload = (
         b'data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":2}}}\n\n'
@@ -567,6 +581,78 @@ async def test_context_length_error_short_circuits_failover(m):
     assert log["retry_chain"][0]["outcome"] == "request_invalid"
     assert not m["cooldown"].is_blocked("api:chA", "gpt-5.5")
     print("  [PASS] context_length_exceeded → request_invalid 400 without failover")
+
+
+async def test_invalid_encrypted_content_retries_same_channel_without_ec(m):
+    _setup(m)
+    router = MockRouter()
+    calls: list[dict] = []
+    chb_calls = {"count": 0}
+
+    def cha_handler(req):
+        payload = json.loads(req.content)
+        calls.append(payload)
+        has_ec = any(
+            isinstance(item, dict)
+            and item.get("type") == "reasoning"
+            and item.get("encrypted_content")
+            for item in (payload.get("input") or [])
+        )
+        if has_ec:
+            return openai_invalid_encrypted_content_error()
+        return httpx.Response(200, json={
+            "id": "resp_retry_ok",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [{
+                "type": "message",
+                "id": "msg_retry_ok",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "recovered", "annotations": []}],
+            }],
+            "output_text": "recovered",
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+        })
+
+    def chb_handler(req):
+        chb_calls["count"] += 1
+        return responses_sse_ok()
+
+    router.register("https://cha", cha_handler)
+    router.register("https://chb", chb_handler)
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    chB = _make_openai_channel("chB", "https://chb", protocol="openai-responses")
+    _install_channels(m, [chA, chB])
+
+    body = {
+        "model": "gpt-5.5",
+        "stream": False,
+        "input": [
+            {"type": "reasoning", "id": "rs_bad", "summary": [], "encrypted_content": "gAAAAbad"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+    }
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="responses")
+    assert resp.status_code == 200, getattr(resp, "body", b"")[:500]
+    await mc.aclose()
+
+    assert chb_calls["count"] == 0
+    assert len(calls) == 2
+    assert any(item.get("type") == "reasoning" for item in calls[0]["input"])
+    assert all(item.get("type") != "reasoning" for item in calls[1]["input"])
+    assert calls[1]["input"] == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+    out = json.loads(resp.body)
+    assert out["output_text"] == "recovered"
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "success", log["log"]
+    assert log["log"]["final_channel_key"] == "api:chA"
+    assert [item["outcome"] for item in log["retry_chain"]] == ["request_invalid", "success"]
+    assert not m["cooldown"].is_blocked("api:chA", "gpt-5.5")
+    assert not m["cooldown"].is_blocked("api:chB", "gpt-5.5")
+    print("  [PASS] invalid_encrypted_content → same-channel retry without EC")
 
 
 async def test_stream_success_full_forward(m):

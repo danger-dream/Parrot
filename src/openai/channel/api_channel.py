@@ -16,8 +16,12 @@ from typing import Optional
 
 from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
 from ...channel.url_utils import resolve_upstream_url
+from ... import cache_hints
+from ...providers import registry as provider_registry
+from .. import deepseek_reasoning
 from ..transform import (
-    chat_to_responses, common, guard, responses_to_chat,
+    anthropic_to_chat, anthropic_to_responses,
+    chat_to_responses, guard, responses_to_chat,
 )
 
 
@@ -49,6 +53,71 @@ class OpenAIApiChannel(Channel):
             raise ValueError(
                 f"OpenAIApiChannel got invalid protocol: {self.protocol!r}"
             )
+        # Responses WebSocket ingress historically dials third-party Responses API
+        # channels as WebSocket (https://.../v1/responses -> wss://...). Keep that
+        # default for compatibility, while allowing explicit test/configured
+        # channels to exercise the WS-client -> HTTP/SSE-upstream bridge.
+        self.responses_ws_upstream_transport = str(
+            entry.get("responsesWsUpstreamTransport")
+            or entry.get("responses_ws_upstream_transport")
+            or "ws"
+        ).strip().lower()
+        if self.responses_ws_upstream_transport not in ("ws", "sse"):
+            self.responses_ws_upstream_transport = "ws"
+
+    def _is_deepseek(self, model: str | None = None) -> bool:
+        name = str(model or "").lower()
+        return (
+            name.startswith("deepseek-")
+            or "deepseek" in self.name.lower()
+            or "deepseek" in self.base_url.lower()
+        )
+
+    @staticmethod
+    def _anthropic_thinking_type(body: dict) -> str | None:
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict):
+            typ = str(thinking.get("type") or "").strip().lower()
+            return typ or None
+        if body.get("output_config") is not None:
+            return "enabled"
+        return None
+
+    @staticmethod
+    def _tool_choice_forces_tool(choice) -> bool:
+        if choice == "required":
+            return True
+        if isinstance(choice, dict):
+            typ = choice.get("type")
+            return typ in ("function", "required")
+        return False
+
+    def _apply_deepseek_anthropic_bridge_compat(self, source_body: dict, payload: dict, resolved_model: str) -> None:
+        if not self._is_deepseek(resolved_model):
+            return
+        thinking_type = self._anthropic_thinking_type(source_body)
+        explicit_thinking = thinking_type is not None
+        forced_tool_choice = self._tool_choice_forces_tool(payload.get("tool_choice"))
+
+        if explicit_thinking and thinking_type != "disabled" and forced_tool_choice:
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                "DeepSeek thinking mode does not support forced/required tool_choice; use tool_choice=auto or disable thinking",
+                param="tool_choice",
+                scope="request",
+            )
+
+        if thinking_type == "disabled" or not explicit_thinking:
+            # Anthropic Messages default semantics are visible-answer first.  If
+            # the caller did not explicitly request thinking, disable DeepSeek's
+            # default thinking mode to avoid burning the whole output budget in
+            # reasoning_content and to keep forced tool_choice usable.
+            payload["thinking"] = {"type": "disabled"}
+        elif thinking_type in ("enabled", "adaptive"):
+            payload["thinking"] = {"type": "enabled"}
+
+        deepseek_reasoning.inject_into_chat_payload(payload)
 
     def supports_model(self, requested_model: str) -> Optional[str]:
         for m in self.models:
@@ -70,10 +139,15 @@ class OpenAIApiChannel(Channel):
         - `(responses, openai-chat)` → responses→chat 翻译
         - 其他组合：scheduler family 过滤应已拦住；这里做防御性报错
         """
+        if ingress_protocol == "anthropic" and self.protocol == "openai-chat":
+            return self._build_anthropic_to_chat(requested_body, resolved_model)
+        if ingress_protocol == "anthropic" and self.protocol == "openai-responses":
+            return self._build_anthropic_to_responses(requested_body, resolved_model)
+
         if ingress_protocol not in ("chat", "responses"):
             raise ValueError(
-                f"OpenAIApiChannel got non-openai ingress_protocol={ingress_protocol!r}; "
-                "scheduler should have filtered this at family level."
+                f"OpenAIApiChannel got unsupported ingress_protocol={ingress_protocol!r}; "
+                "ProtocolMatrix should have guarded this route."
             )
 
         if ingress_protocol == "chat" and self.protocol == "openai-chat":
@@ -89,11 +163,64 @@ class OpenAIApiChannel(Channel):
             f"unreachable: ingress={ingress_protocol!r} protocol={self.protocol!r}"
         )
 
+    # ─── 跨家族翻译 ────────────────────────────────────────────
+
+    def _build_anthropic_to_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
+        """anthropic ingress → openai-chat 上游（Phase 8 first path, non-stream）。"""
+        payload = anthropic_to_chat.translate_request(body, target_model=resolved_model)
+        payload["model"] = resolved_model
+        payload = provider_registry.filter_request_payload(self, payload, protocol="openai-chat")
+        cache_hints.apply_anthropic_cache_to_openai_payload(
+            body,
+            payload,
+            model=resolved_model,
+            api_key_name=body.get("_parrot_api_key_name"),
+            client_ip=body.get("_parrot_client_ip"),
+        )
+        self._apply_deepseek_anthropic_bridge_compat(body, payload, resolved_model)
+        return UpstreamRequest(
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
+            headers=self._headers(),
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dynamic_tool_map=None,
+            translator_ctx={
+                "ingress": "anthropic",
+                "upstream_protocol": "openai-chat",
+                "response_translator": "anthropic_to_chat",
+                "model_for_response": resolved_model,
+            },
+        )
+
+    def _build_anthropic_to_responses(self, body: dict, resolved_model: str) -> UpstreamRequest:
+        """anthropic ingress → openai-responses 上游（Phase 8 third path, non-stream）。"""
+        payload = anthropic_to_responses.translate_request(body, target_model=resolved_model)
+        payload["model"] = resolved_model
+        payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
+        cache_hints.apply_anthropic_cache_to_openai_payload(
+            body,
+            payload,
+            model=resolved_model,
+            api_key_name=body.get("_parrot_api_key_name"),
+            client_ip=body.get("_parrot_client_ip"),
+        )
+        return UpstreamRequest(
+            url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
+            headers=self._headers(),
+            body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            dynamic_tool_map=None,
+            translator_ctx={
+                "ingress": "anthropic",
+                "upstream_protocol": "openai-responses",
+                "response_translator": "anthropic_to_responses",
+                "model_for_response": resolved_model,
+            },
+        )
+
     # ─── 同协议透传 ────────────────────────────────────────────
 
     def _build_chat_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
-        payload = common.filter_chat_passthrough(body)
-        if bool(body.get("_parrot_allow_openai_thinking")) and isinstance(body.get("thinking"), dict):
+        payload = provider_registry.filter_request_payload(self, body, protocol="openai-chat")
+        if (self._is_deepseek(resolved_model) or bool(body.get("_parrot_allow_openai_thinking"))) and isinstance(body.get("thinking"), dict):
             # Internal-only escape hatch for DeepSeek V4 thinking mode.  Keep this
             # out of the public chat passthrough whitelist so arbitrary OpenAI
             # compatible channels do not receive non-standard `thinking` fields.
@@ -108,7 +235,7 @@ class OpenAIApiChannel(Channel):
         )
 
     def _build_responses_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
-        payload = common.filter_responses_passthrough(body)
+        payload = provider_registry.filter_request_payload(self, body, protocol="openai-responses")
         payload["model"] = resolved_model
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
@@ -125,6 +252,7 @@ class OpenAIApiChannel(Channel):
         guard.guard_chat_to_responses(body)
         payload = chat_to_responses.translate_request(body)
         payload["model"] = resolved_model
+        payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
         # 下游 chat 是否显式要求末帧 usage（stream_options.include_usage）
         stream_opts = body.get("stream_options") or {}
         include_usage = bool(stream_opts.get("include_usage")) if isinstance(stream_opts, dict) else False
@@ -156,6 +284,7 @@ class OpenAIApiChannel(Channel):
         current_input_items = responses_to_chat.resolve_current_input_items(body)
         payload = responses_to_chat.translate_request(body, api_key_name=api_key_name)
         payload["model"] = resolved_model
+        payload = provider_registry.filter_request_payload(self, payload, protocol="openai-chat")
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
@@ -183,6 +312,11 @@ class OpenAIApiChannel(Channel):
     async def restore_response(self, chunk: bytes,
                                dynamic_map: Optional[dict] = None) -> bytes:
         # OpenAI 家族不做工具名还原，原样返回
+        if self._is_deepseek():
+            try:
+                deepseek_reasoning.cache_from_chat_response(json.loads(chunk))
+            except Exception:
+                pass
         return chunk
 
     def display(self) -> ChannelDisplay:

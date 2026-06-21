@@ -10,6 +10,7 @@
   - #41 stream_c2r.close() 在 terminal_error 路径也写 store
   - #43 stream_r2c._mk_chunk include_usage=true 时所有 chunk 都带 usage 字段
        (中间 chunk usage:null，末帧才有真值)
+  - stream Chat ⇄ Responses 文本 logprobs 保真
 """
 
 from __future__ import annotations
@@ -276,3 +277,82 @@ def test_bug43_include_usage_false_no_usage_field(m):
     data_chunks = [d for kind, d in parsed if kind == "data"]
     for c in data_chunks:
         assert "usage" not in c, f"include_usage=false 时不应带 usage：{c}"
+
+
+# ───────── stream logprobs 保真 ─────────
+
+
+def test_stream_c2r_preserves_chat_text_logprobs(m):
+    stream_c2r = m["stream_c2r"]
+    tr = stream_c2r.StreamTranslator(model="x")
+    lp = {
+        "token": "Hi",
+        "bytes": [72, 105],
+        "logprob": -0.01,
+        "top_logprobs": [{
+            "token": "Hi",
+            "bytes": [72, 105],
+            "logprob": -0.01,
+        }],
+    }
+    payload = {
+        "choices": [{
+            "delta": {"content": "Hi"},
+            "logprobs": {"content": [lp], "refusal": None},
+            "finish_reason": "stop",
+        }],
+    }
+
+    chunks = []
+    chunks.extend(tr.feed(("data: " + json.dumps(payload) + "\n\n").encode()))
+    chunks.extend(tr.close())
+    events = _parse_responses_sse(b"".join(chunks))
+
+    delta = next(data for event, data in events if event == "response.output_text.delta")
+    assert delta["logprobs"][0]["token"] == "Hi"
+    assert delta["logprobs"][0]["top_logprobs"][0]["logprob"] == -0.01
+
+    done = next(data for event, data in events if event == "response.output_text.done")
+    assert done["logprobs"][0]["token"] == "Hi"
+
+    part_done = next(data for event, data in events if event == "response.content_part.done")
+    assert part_done["part"]["logprobs"][0]["token"] == "Hi"
+
+    completed = next(data for event, data in events if event == "response.completed")
+    final_part = completed["response"]["output"][0]["content"][0]
+    assert final_part["logprobs"][0]["token"] == "Hi"
+
+
+def test_stream_r2c_preserves_responses_text_delta_logprobs(m):
+    stream_r2c = m["stream_r2c"]
+    tr = stream_r2c.StreamTranslator(model="x")
+    lp = {
+        "token": "Hi",
+        "bytes": [72, 105],
+        "logprob": -0.01,
+        "top_logprobs": [{
+            "token": "Hi",
+            "bytes": [72, 105],
+            "logprob": -0.01,
+        }],
+    }
+
+    chunks = []
+    chunks.extend(tr.feed(
+        ("event: response.output_text.delta\n"
+         "data: " + json.dumps({"delta": "Hi", "logprobs": [lp]}) + "\n\n").encode()
+    ))
+    chunks.extend(tr.feed(
+        b'event: response.completed\ndata: {"response":{"status":"completed"}}\n\n'
+    ))
+    chunks.extend(tr.close())
+    parsed = _parse_chat_sse(b"".join(chunks))
+
+    text_chunk = next(
+        d for kind, d in parsed
+        if kind == "data" and d.get("choices") and d["choices"][0]["delta"].get("content") == "Hi"
+    )
+    logprobs = text_chunk["choices"][0]["logprobs"]
+    assert logprobs["content"][0]["token"] == "Hi"
+    assert logprobs["content"][0]["top_logprobs"][0]["logprob"] == -0.01
+    assert logprobs["refusal"] is None

@@ -2,9 +2,9 @@
 
 调用位置：
   `OpenAIOAuthChannel.build_upstream_request` 里，输入已经是 Responses API
-  shape（责任方：passthrough 过 common.filter_responses_passthrough；或跨协议
-  先过 chat_to_responses.translate_request）。本模块负责把它打成 ChatGPT
-  internal codex 端点 (`/backend-api/codex/responses`) 能接受的样子：
+  shape（责任方：同协议 passthrough 过 provider adapter target allowlist；
+  或跨协议先过 chat_to_responses.translate_request）。本模块负责把它打成
+  ChatGPT internal codex 端点 (`/backend-api/codex/responses`) 能接受的样子：
 
   - `store=false` 强制（OAuth 上游对 store=true 报 400）
   - `stream=true` 强制（OAuth 上游仅支持流式 SSE）
@@ -62,6 +62,9 @@ _STRIP_FIELDS_FOR_CODEX = (
     "metadata",
     "safety_identifier",
     "stream_options",
+    # `background=false` is semantically equivalent to the Codex synchronous
+    # stream path; `background=true` is rejected before this transform.
+    "background",
     # OAuth Codex 强制 store=false，不能把 Responses 持久化引用直传给上游。
     "previous_response_id",
 )

@@ -25,6 +25,7 @@ import sys
 import time
 
 import httpx
+import pytest
 
 
 def _import_modules():
@@ -204,6 +205,203 @@ def test_c2r_translate_request_basics(m):
     print("  [PASS] c2r translate_request: messages → input items, tools flattened")
 
 
+def test_c2r_translate_request_maps_logprobs_to_responses_include(m):
+    c2r = m["chat_to_responses"]
+    body = {
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "ping"}],
+        "logprobs": True,
+        "top_logprobs": 3,
+    }
+
+    out = c2r.translate_request(body)
+
+    assert out["include"] == ["message.output_text.logprobs"]
+    assert out["top_logprobs"] == 3
+
+
+def test_c2r_translate_request_preserves_tool_output_attachments(m):
+    c2r = m["chat_to_responses"]
+    body = {
+        "model": "gpt-5",
+        "messages": [
+            {"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": "see attached"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+                {"type": "file", "file": {
+                    "filename": "brief.pdf",
+                    "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
+                }},
+                {"type": "file", "file": {
+                    "filename": "remote.pdf",
+                    "file_url": "https://example.com/remote.pdf",
+                }},
+            ]},
+        ],
+    }
+
+    out = c2r.translate_request(body)
+
+    assert out["input"] == [{
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": [
+            {"type": "input_text", "text": "see attached"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0xLjQ=", "filename": "brief.pdf"},
+            {"type": "input_file", "file_url": "https://example.com/remote.pdf", "filename": "remote.pdf"},
+        ],
+    }]
+
+
+def test_c2r_translate_request_preserves_assistant_refusal_content_part(m):
+    c2r = m["chat_to_responses"]
+    body = {
+        "model": "gpt-5",
+        "messages": [
+            {"role": "user", "content": "classified request"},
+            {"role": "assistant", "content": [
+                {"type": "refusal", "refusal": "I can't help with that."},
+            ]},
+        ],
+    }
+
+    out = c2r.translate_request(body)
+
+    assert out["input"][1] == {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "I can't help with that."}],
+    }
+
+
+def test_c2r_guard_rejects_assistant_audio_reference_and_unknown_parts(m):
+    g = m["guard"]
+    c2r = m["chat_to_responses"]
+
+    audio_body = {
+        "model": "gpt-5",
+        "messages": [{"role": "assistant", "content": None, "audio": {"id": "audio_1"}}],
+    }
+    with pytest.raises(g.GuardError) as audio_err:
+        g.guard_chat_to_responses(audio_body)
+    assert "audio" in audio_err.value.message
+    with pytest.raises(g.GuardError):
+        c2r.translate_request(audio_body)
+
+    unknown_body = {
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": [{"type": "input_video", "video_url": "https://example.com/v.mp4"}]}],
+    }
+    with pytest.raises(g.GuardError) as unknown_err:
+        g.guard_chat_to_responses(unknown_body)
+    assert "input_video" in unknown_err.value.message
+    with pytest.raises(g.GuardError):
+        c2r.translate_request(unknown_body)
+
+
+def test_openai_variant_bridge_preserves_input_audio(m):
+    g = m["guard"]
+    c2r = m["chat_to_responses"]
+    r2c = m["responses_to_chat"]
+
+    chat_body = {
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "transcribe this"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]}],
+    }
+    g.guard_chat_to_responses(chat_body)
+    responses_payload = c2r.translate_request(chat_body)
+    assert responses_payload["input"][0]["content"][1] == {
+        "type": "input_audio",
+        "input_audio": {"data": "AAAA", "format": "wav"},
+    }
+
+    chat_payload = r2c.translate_request({
+        "model": "gpt-5",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "transcribe this"},
+            {"type": "input_audio", "input_audio": {"data": "BBBB", "format": "mp3"}},
+        ]}],
+    })
+    assert chat_payload["messages"][0]["content"][1] == {
+        "type": "input_audio",
+        "input_audio": {"data": "BBBB", "format": "mp3"},
+    }
+
+
+def test_r2c_translate_request_resolves_local_item_reference(m):
+    r2c = m["responses_to_chat"]
+    body = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "id": "msg_1", "role": "user", "content": [
+                {"type": "input_text", "text": "remember this"},
+            ]},
+            {"type": "item_reference", "id": "msg_1"},
+        ],
+    }
+
+    out = r2c.translate_request(body)
+
+    assert out["messages"] == [
+        {"role": "user", "content": "remember this"},
+        {"role": "user", "content": "remember this"},
+    ]
+
+
+def test_r2c_translate_request_rejects_unresolved_item_reference(m):
+    r2c = m["responses_to_chat"]
+    body = {"model": "gpt-5", "input": [{"type": "item_reference", "id": "missing"}]}
+
+    with pytest.raises(m["guard"].GuardError) as exc:
+        r2c.translate_request(body)
+
+    assert "item_reference" in exc.value.message
+    assert "local input/history" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_api_passthrough_preserves_background(m):
+    ch = _make_openai_channel(
+        m,
+        "oai-resp-bg",
+        "https://responses-bg.example",
+        protocol="openai-responses",
+        real="gpt-5",
+        alias="gpt-5",
+    )
+
+    req = await ch.build_upstream_request(
+        {"model": "gpt-5", "input": "hi", "background": True},
+        "gpt-5",
+        ingress_protocol="responses",
+    )
+    payload = json.loads(req.body.decode("utf-8"))
+
+    assert payload["background"] is True
+    assert payload["input"] == "hi"
+
+
+def test_c2r_request_controls_are_output_whitelist_filtered(m):
+    g = m["guard"]
+    c2r = m["chat_to_responses"]
+    for field, value in (
+        ("stop", ["END"]),
+        ("seed", 123),
+        ("prediction", {"type": "content", "content": "hi"}),
+        ("logit_bias", {"123": 10}),
+        ("frequency_penalty", 0.2),
+        ("presence_penalty", 0.2),
+    ):
+        body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}], field: value}
+        g.guard_chat_to_responses(body)
+        out = c2r.translate_request(body)
+        assert field not in out
+
+
 def test_c2r_translate_response_basics(m):
     c2r = m["chat_to_responses"]
     resp = {
@@ -238,6 +436,42 @@ def test_c2r_translate_response_basics(m):
     assert out["usage"]["prompt_tokens_details"]["cached_tokens"] == 3
     assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 2
     print("  [PASS] c2r translate_response: output → choices[0].message, reasoning_content, tool_calls")
+
+
+def test_c2r_translate_response_maps_output_text_logprobs(m):
+    c2r = m["chat_to_responses"]
+    resp = {
+        "id": "resp_abc",
+        "object": "response",
+        "status": "completed",
+        "created_at": 123,
+        "model": "gpt-5",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "Hi",
+                "annotations": [],
+                "logprobs": [{
+                    "token": "Hi",
+                    "bytes": [72, 105],
+                    "logprob": -0.01,
+                    "top_logprobs": [{"token": "Hi", "bytes": [72, 105], "logprob": -0.01}],
+                }],
+            }],
+        }],
+        "output_text": "Hi",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+
+    out = c2r.translate_response(resp, model="gpt-5")
+
+    logprobs = out["choices"][0]["logprobs"]
+    assert logprobs["content"][0]["token"] == "Hi"
+    assert logprobs["content"][0]["top_logprobs"][0]["logprob"] == -0.01
+    assert logprobs["refusal"] is None
 
 
 def test_r2c_translate_request_basics(m):
@@ -283,6 +517,43 @@ def test_r2c_translate_request_basics(m):
     print("  [PASS] r2c translate_request: input items → chat messages, tool_calls merge")
 
 
+def test_r2c_translate_request_maps_logprobs_to_chat_fields(m):
+    r2c = m["responses_to_chat"]
+    body = {
+        "model": "gpt-5",
+        "input": "ping",
+        "include": ["message.output_text.logprobs"],
+        "top_logprobs": 4,
+    }
+
+    out = r2c.translate_request(body)
+
+    assert out["logprobs"] is True
+    assert out["top_logprobs"] == 4
+
+
+def test_r2c_translate_request_preserves_text_instruction_items(m):
+    r2c = m["responses_to_chat"]
+    body = {
+        "model": "gpt-5",
+        "instructions": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "follow policy"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "background"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "noted"}]},
+        ],
+        "input": "ping",
+    }
+
+    out = r2c.translate_request(body)
+
+    assert out["messages"] == [
+        {"role": "system", "content": "follow policy"},
+        {"role": "user", "content": "background"},
+        {"role": "assistant", "content": "noted"},
+        {"role": "user", "content": "ping"},
+    ]
+
+
 def test_r2c_translate_response_basics(m):
     r2c = m["responses_to_chat"]
     chat = {
@@ -319,6 +590,38 @@ def test_r2c_translate_response_basics(m):
     assert out["usage"]["input_tokens_details"]["cached_tokens"] == 3
     assert out["usage"]["output_tokens_details"]["reasoning_tokens"] == 2
     print("  [PASS] r2c translate_response: chat.completion → response output items")
+
+
+def test_r2c_translate_response_preserves_chat_choice_logprobs(m):
+    r2c = m["responses_to_chat"]
+    chat = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-5",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "pong"},
+            "logprobs": {
+                "content": [{
+                    "token": "pong",
+                    "bytes": [112, 111, 110, 103],
+                    "logprob": -0.02,
+                    "top_logprobs": [{"token": "pong", "bytes": [112, 111, 110, 103], "logprob": -0.02}],
+                }],
+                "refusal": None,
+            },
+        }],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+    }
+
+    out = r2c.translate_response(chat, model="gpt-5")
+
+    part = out["output"][0]["content"][0]
+    assert part["type"] == "output_text"
+    assert part["logprobs"][0]["token"] == "pong"
+    assert part["logprobs"][0]["top_logprobs"][0]["logprob"] == -0.02
 
 
 # ─── 端到端：跨变体请求/响应打通 ─────────────────────────────────
@@ -610,6 +913,41 @@ async def test_guard_r2c_previous_response_id_not_found(m):
     print("  [PASS] r2c guard: unknown previous_response_id → 404 NotFound")
 
 
+async def test_guard_r2c_encrypted_reasoning_include(m):
+    """Responses→Chat 不能静默剥离 encrypted reasoning include。"""
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    chC = _make_openai_channel(m, "oaiC", "https://c.example",
+                               protocol="openai-chat", real="gpt-5", alias="gpt-5")
+    _install_channels(m, [chC])
+
+    body = {"model": "gpt-5", "input": "hi", "include": ["reasoning.encrypted_content"]}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    assert resp.status_code == 400
+    out = json.loads(resp.body)
+    assert out["error"]["type"] == "invalid_request_error"
+    assert "reasoning.encrypted_content" in out["error"]["message"]
+    assert router.last_request is None
+    await mc.aclose()
+    print("  [PASS] r2c guard: encrypted reasoning include → 400")
+
+
+def test_guard_r2c_allows_output_whitelist_filtered_request_controls(m):
+    g = m["guard"]
+    r2c = m["responses_to_chat"]
+    for field, value in (
+        ("prompt", {"id": "pmpt_1"}),
+        ("truncation", "auto"),
+        ("max_tool_calls", 1),
+        ("include", ["unsupported.include"]),
+    ):
+        body = {"model": "gpt-5", "input": "hi", field: value}
+        g.guard_responses_to_chat(body)
+        out = r2c.translate_request(body)
+        assert field not in out
+
+
 async def test_guard_r2c_builtin_call_in_input(m):
     _setup(m)
     _install_keys(m, _default_key())
@@ -657,8 +995,10 @@ def main() -> int:
         _async(test_chat_to_responses_reasoning),
         _async(test_responses_to_chat_text),
         _async(test_responses_to_chat_function_call_roundtrip),
+        _async(test_openai_responses_api_passthrough_preserves_background),
         _async(test_guard_r2c_builtin_tool),
         _async(test_guard_r2c_previous_response_id_not_found),
+        _async(test_guard_r2c_encrypted_reasoning_include),
         _async(test_guard_r2c_builtin_call_in_input),
     ]
     passed = 0

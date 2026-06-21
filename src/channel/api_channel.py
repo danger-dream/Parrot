@@ -6,6 +6,8 @@ import re
 import uuid
 from typing import Optional
 
+from ..openai.transform import chat_to_anthropic, responses_to_anthropic
+from ..providers import registry as provider_registry
 from ..transform import cc_mimicry, standard
 from .base import Channel, ChannelDisplay, UpstreamRequest
 from .url_utils import resolve_upstream_url
@@ -108,9 +110,52 @@ class ApiChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
-        # ingress_protocol 对 anthropic 渠道无意义：本类只服务 /v1/messages 入口。
-        _ = ingress_protocol
-        body_with_model = {**requested_body, "model": resolved_model}
+        # Phase 8: OpenAI-family ingress can route to Anthropic upstream through
+        # request/response translators while unsafe feature gaps stay guarded by matrix.
+        translator_ctx: Optional[dict] = None
+        if ingress_protocol == "chat":
+            stream_opts = requested_body.get("stream_options") or {}
+            include_usage = bool(stream_opts.get("include_usage")) if isinstance(stream_opts, dict) else False
+            requested_body = chat_to_anthropic.translate_request(requested_body)
+            translator_ctx = {
+                "ingress": "chat",
+                "upstream_protocol": "anthropic",
+                "response_translator": "chat_to_anthropic",
+                "model_for_response": resolved_model,
+                "include_usage": include_usage,
+            }
+        elif ingress_protocol == "responses":
+            from ..openai import store as _store
+            api_key_name = str(requested_body.get("_api_key_name") or "")
+            previous_response_id = requested_body.get("previous_response_id")
+            current_input_items = responses_to_anthropic.resolve_current_input_items(requested_body)
+            responses_request_body = dict(requested_body)
+            requested_body = responses_to_anthropic.translate_request(
+                requested_body, api_key_name=api_key_name, store_enabled=_store.is_enabled(),
+            )
+            translator_ctx = {
+                "ingress": "responses",
+                "upstream_protocol": "anthropic",
+                "response_translator": "responses_to_anthropic",
+                "model_for_response": resolved_model,
+                "previous_response_id": previous_response_id,
+                "api_key_name": api_key_name,
+                "channel_key": self.key,
+                "current_input_items": current_input_items,
+                "request_body": responses_request_body,
+            }
+        elif ingress_protocol != "anthropic":
+            raise ValueError(
+                f"ApiChannel got unsupported ingress_protocol={ingress_protocol!r}; "
+                "ProtocolMatrix should have guarded this route."
+            )
+
+        body_with_model = provider_registry.filter_request_payload(
+            self,
+            {**requested_body, "model": resolved_model},
+            protocol="anthropic",
+            bridge=translator_ctx is not None,
+        )
 
         dynamic_map: Optional[dict] = None
         if self.cc_mimicry:
@@ -164,6 +209,7 @@ class ApiChannel(Channel):
             headers=headers,
             body=signed,
             dynamic_tool_map=dynamic_map,
+            translator_ctx=translator_ctx,
         )
 
     async def restore_response(self, chunk: bytes,

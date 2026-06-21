@@ -1,16 +1,22 @@
-"""Codex encrypted_content 透明透传契约测试。
+"""Codex encrypted_content 透明透传 + 最小 replay cache 契约测试。
 
-v0.21.0 曾引入 Parrot 本地 reasoning replay store/backfill，但 encrypted_content
-是上游签名/加密的 opaque transcript 状态，代理无法可靠维护。现在 Parrot 的
-责任边界收缩为：请求 include、保留下游提供的 encrypted_content、剥 store=false
-不适用的 reasoning id，但绝不本地缓存/补全/修复 EC。
+Parrot 不解密、不伪造 encrypted_content；只在有稳定 session anchor 时缓存
+上游最终 Responses output 里的最小 replay items，并在下轮注入。
 """
 
 from __future__ import annotations
 
-import importlib
+import base64
 
 import src.openai.transform.codex_oauth_transform as t
+
+
+def _valid_encrypted_content(seed: int = 1) -> str:
+    payload = bytearray(1 + 8 + 16 + 16 + 32)
+    payload[0] = 0x80
+    for i in range(9, len(payload)):
+        payload[i] = (seed + i) % 256
+    return base64.urlsafe_b64encode(bytes(payload)).decode("ascii").rstrip("=")
 
 
 def _transform(body: dict) -> dict:
@@ -35,7 +41,7 @@ def test_transform_does_not_duplicate_include():
 
 
 def test_reasoning_with_encrypted_content_is_transparently_preserved_without_id():
-    enc = "gAAAAopaque-valid-looking-blob"
+    enc = _valid_encrypted_content(23)
     out = _transform({
         "model": "gpt-5.5",
         "input": [
@@ -73,12 +79,23 @@ def test_session_key_argument_is_ignored_no_backfill_happens():
     assert all(it.get("type") != "reasoning" for it in out["input"])
 
 
-def test_reasoning_store_module_removed_from_runtime_contract():
-    try:
-        importlib.import_module("src.openai.reasoning_store")
-    except ModuleNotFoundError:
-        return
-    raise AssertionError("src.openai.reasoning_store should not be part of runtime contract")
+def test_reasoning_replay_module_is_runtime_contract():
+    import src.openai.reasoning_replay as rr
+
+    rr.clear()
+    enc = _valid_encrypted_content(29)
+    assert rr.cache_items(
+        "gpt-5.5",
+        "prompt-cache:pck",
+        [{"type": "reasoning", "encrypted_content": enc}],
+    ) is True
+    assert rr.get("gpt-5.5", "prompt-cache:pck") == [{
+        "type": "reasoning",
+        "summary": [],
+        "content": None,
+        "encrypted_content": enc,
+    }]
+    rr.clear()
 
 
 def test_invalid_encrypted_content_is_request_invalid_not_channel_failure():
@@ -96,6 +113,19 @@ def test_invalid_encrypted_content_is_request_invalid_not_channel_failure():
     assert out.outcome == "request_invalid"
     assert out.http_status == 400
     assert not f._should_cooldown(out.outcome)
+
+
+def test_invalid_encrypted_content_clears_replay_scope():
+    import src.failover as f
+    import src.openai.reasoning_replay as rr
+
+    rr.clear()
+    rr.cache_items("gpt-5.5", "prompt-cache:pck", [{"type": "reasoning", "encrypted_content": _valid_encrypted_content(31)}])
+    assert rr.get("gpt-5.5", "prompt-cache:pck")
+    assert f._maybe_clear_codex_reasoning_replay({
+        "codex_reasoning_replay": {"model": "gpt-5.5", "session_key": "prompt-cache:pck"},
+    }) is True
+    assert rr.get("gpt-5.5", "prompt-cache:pck") == []
 
 
 def test_context_length_exceeded_is_request_invalid_not_channel_failure():

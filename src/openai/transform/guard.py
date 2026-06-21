@@ -1,8 +1,10 @@
 """Capability guard：在 ingress 入口 + upstream 选型阶段拦截无法完成的请求。
 
 MS-2 只实现"同 ingress 自检"与"跨变体未实现"的拒绝路径：
-  - Chat ingress：拒绝 `n>1` / `audio` 输出（本版本不支持，暂 400）
-  - Responses ingress：`background:true` 静默降级为同步模式（透明兼容），拒绝 `conversation` 对象（首版不做）
+  - Chat ingress：`n>1` 与 audio output 允许 native Chat passthrough，
+    跨协议由 matrix/translator guard。
+  - Responses ingress：`background` / `conversation` 允许 native Responses
+    passthrough，跨协议/Codex 由 matrix/provider guard。
   - 当需要跨变体翻译但 `openai.translation.enabled=false` 时，handler 在调度阶段
     自然得到空候选，返回 503 —— 不在此处干预。
 
@@ -12,23 +14,33 @@ MS-2 只实现"同 ingress 自检"与"跨变体未实现"的拒绝路径：
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+
+
+GuardScope = Literal["request", "candidate"]
 
 
 class GuardError(Exception):
-    """带 HTTP status + OpenAI error type + 人类可读 message，供 handler 映射。"""
+    """带 HTTP status + OpenAI error type + 人类可读 message，供 handler 映射。
+
+    ``scope`` 区分两类 guard：
+    - ``request``：请求本身无论换哪个候选都不可安全服务，应直接返回 4xx。
+    - ``candidate``：当前 provider/model 不支持，但 failover 里后续候选可能支持。
+    """
 
     def __init__(self, status: int, err_type: str, message: str,
-                 *, param: str | None = None):
+                 *, param: str | None = None, scope: GuardScope = "request"):
         super().__init__(message)
         self.status = int(status)
         self.err_type = err_type
         self.message = message
         self.param = param
+        self.scope = scope
 
 
-def _fail(status: int, err_type: str, message: str, *, param: str | None = None):
-    raise GuardError(status, err_type, message, param=param)
+def _fail(status: int, err_type: str, message: str, *, param: str | None = None,
+          scope: GuardScope = "request"):
+    raise GuardError(status, err_type, message, param=param, scope=scope)
 
 
 # ─── Chat ingress ────────────────────────────────────────────────
@@ -36,9 +48,8 @@ def _fail(status: int, err_type: str, message: str, *, param: str | None = None)
 def guard_chat_ingress(body: dict) -> None:
     """Chat 入口自检（不管上游）：拒绝本 proxy 不支持的特性。
 
-    现阶段拒绝：
-      - `n>1`：本 proxy 不聚合多候选
-      - `audio` 输出（modalities 含 "audio"）：本版本不支持 audio 输出
+    `n>1` / audio output 不在入口拒绝：native OpenAI Chat 上游可以
+    直接处理；只有需要 Chat→Responses/Anthropic fallback 时才拒绝。
     """
     from typing import Any as _Any  # noqa: F401
     if not isinstance(body, dict):
@@ -51,27 +62,14 @@ def guard_chat_ingress(body: dict) -> None:
         _fail(400, "invalid_request_error",
               "missing required field 'model'", param="model")
 
-    n = body.get("n")
-    if isinstance(n, int) and n > 1:
-        _fail(400, "invalid_request_error",
-              f"n={n} is not supported by this proxy", param="n")
-
-    modalities = body.get("modalities")
-    if isinstance(modalities, list) and "audio" in modalities:
-        _fail(400, "invalid_request_error",
-              "audio output modality is not supported by this proxy",
-              param="modalities")
-
 
 # ─── Responses ingress ───────────────────────────────────────────
 
 def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
     """Responses 入口自检。
 
-    - background:true → 静默剥除（透明兼容）：代理无状态，不维护 response store 的
-      pending → completed 状态机；客户端 (Codex CLI / OpenAI SDK) 在 background:true
-      下通常也直接读 SSE 流，剥除该字段后走同步路径行为等价。
-    - conversation 对象 → 400（首版不支持 conversation 资源，仅 previous_response_id）
+    - background / conversation → native Responses API 可透传；跨协议/Codex
+      不支持时由 scheduler 的 matrix/provider capability 拒绝对应候选。
     - previous_response_id 带了但 Store 关闭 → 400
 
     跨变体特有的 built-in tools 等在上游选型阶段（OpenAIApiChannel.build_upstream_request
@@ -86,27 +84,6 @@ def guard_responses_ingress(body: dict, *, store_enabled: bool = True) -> None:
     if not model or not isinstance(model, str):
         _fail(400, "invalid_request_error",
               "missing required field 'model'", param="model")
-
-    # background 字段静默剥除（无论 true/false）：
-    # Codex OAuth 上游 /backend-api/codex/responses 不接受 background 参数，
-    # 即使传 false 也会返回 HTTP 400 "Unsupported parameter: background"。
-    # 代理无状态，不实现 background 异步模式；客户端行为等价于同步/流式调用。
-    if "background" in body:
-        had_true = body.get("background") is True
-        body.pop("background", None)
-        try:
-            import logging
-            logging.getLogger("parrot.openai").info(
-                "[guard] background field stripped (compat, had_true=%s)", had_true
-            )
-        except Exception:
-            pass
-
-    # 只在实际提供了 conversation 值时拒绝；显式 null 占位（某些客户端默认带）应放行
-    if body.get("conversation"):
-        _fail(400, "invalid_request_error",
-              "conversation resource is not yet supported; use previous_response_id instead",
-              param="conversation")
 
     if body.get("previous_response_id") and not store_enabled:
         _fail(400, "invalid_request_error",
@@ -126,30 +103,18 @@ def guard_chat_to_responses(body: dict,
                             *, reject_on_multi_candidate: bool = True) -> None:
     """chat ingress → openai-responses 上游 的死角检查。
 
-    绝大部分丢失字段（stop / seed / logprobs / prediction / logit_bias 等）
-    在翻译时静默丢弃——上游客户端也不指望 proxy 保留这些（它们本来就上不了
-    responses API）。只拦住"拒绝更安全"的几类：
+    该 guard 只拦会丢内容/状态的情况。请求控制 hint 交给 translator 的
+    目标 payload 白名单处理：能映射就映射，不能映射就不写入 Responses
+    payload。logprobs/top_logprobs 会映射为 Responses include/top_logprobs。
       - `n>1`（多候选）：responses 不原生支持（ingress guard 已拦，保留防御）
-      - `logprobs/top_logprobs`：下游客户端可能强依赖，默认拒绝以免沉默性能降级
-      - 用户 message 的 content 里含 `input_audio` part：Responses API 的
-        ResponseInputContent 只支持 text/image/file，发过去会被上游 400 拒绝；
-        提前拦截让错误信号更清晰（同协议 chat→chat 不受影响）
+      - `modalities` 含 audio 或顶层 `audio`：需要 audio response
+        输出语义，当前 Chat→Responses fallback 不聚合/回放音频输出。
+      - 用户 message 的 content 里含 `input_audio` part：Chat 与 Responses
+        都能表达该音频输入结构，translator 会保真映射；不能与 audio
+        output/history 混为一类拦截。
     """
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
-
-    # 02-bug-findings #40: prediction 字段在 responses 没对应概念。
-    # 翻译时会被 drop，但客户端可能"以为"会做 prediction，实际无效。
-    # 不阻断（避免破坏现有客户端），但 log warning 让运维能看到。
-    if body.get("prediction") is not None:
-        try:
-            import logging
-            logging.getLogger("parrot.openai").warning(
-                "[guard] prediction field is dropped when routing to responses upstream"
-                " (no equivalent in Responses API); request continues without prediction"
-            )
-        except Exception:
-            pass
 
     if reject_on_multi_candidate:
         n = body.get("n")
@@ -158,22 +123,38 @@ def guard_chat_to_responses(body: dict,
                   f"n={n} is not supported when routing to responses upstream",
                   param="n")
 
-    if body.get("logprobs") or isinstance(body.get("top_logprobs"), int):
+    modalities = body.get("modalities")
+    if body.get("audio") is not None or (isinstance(modalities, list) and "audio" in modalities):
         _fail(400, "invalid_request_error",
-              "logprobs/top_logprobs are not supported when routing to responses upstream",
-              param="logprobs")
+              "audio output is not supported when routing to responses upstream",
+              param="modalities")
 
     for msg in body.get("messages") or []:
         if not isinstance(msg, dict):
             continue
+        role = msg.get("role")
+        if msg.get("audio") is not None:
+            _fail(400, "invalid_request_error",
+                  "assistant audio references are not supported when routing to responses upstream",
+                  param="messages")
         content = msg.get("content")
         if not isinstance(content, list):
             continue
         for p in content:
-            if isinstance(p, dict) and p.get("type") == "input_audio":
+            if isinstance(p, str):
+                continue
+            if not isinstance(p, dict):
                 _fail(400, "invalid_request_error",
-                      "input_audio content parts are not supported when routing to responses upstream",
+                      "message content parts must be objects when routing to responses upstream",
                       param="messages")
+            typ = p.get("type")
+            if typ in ("text", "image_url", "file", "input_audio"):
+                continue
+            if typ == "refusal" and role == "assistant":
+                continue
+            _fail(400, "invalid_request_error",
+                  f"content part '{typ}' is not supported when routing to responses upstream",
+                  param="messages")
 
 
 # Responses 的 tools 中非 function 类型枚举（官方 built-in）。
@@ -212,6 +193,56 @@ _BUILTIN_INPUT_ITEM_TYPES = {
 }
 
 
+def _function_call_output_part_unsupported_for_chat(output: Any) -> str | None:
+    if output is None or isinstance(output, str):
+        return None
+    if not isinstance(output, list):
+        return None
+    for part in output:
+        if isinstance(part, str):
+            continue
+        if not isinstance(part, dict):
+            return type(part).__name__
+        typ = part.get("type")
+        if typ in ("input_text", "output_text", "text"):
+            continue
+        return str(typ or "object")
+    return None
+
+
+def _responses_input_file_unsupported_for_chat(part: dict[str, Any]) -> str | None:
+    if part.get("file_url") is not None:
+        return "file_url"
+    if part.get("file_id") is not None:
+        return None
+    file_data = part.get("file_data")
+    if not isinstance(file_data, str) or not file_data:
+        return "file_data"
+    return None
+
+
+def _responses_item_reference_unresolved_for_current_body(body: dict[str, Any]) -> bool:
+    inp = body.get("input")
+    if not isinstance(inp, list):
+        return False
+    known_ids: set[str] = set()
+    has_history_anchor = bool(body.get("previous_response_id"))
+    for item in inp:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "item_reference":
+            ref_id = item.get("id")
+            if not isinstance(ref_id, str) or not ref_id:
+                return True
+            if ref_id in known_ids or has_history_anchor:
+                continue
+            return True
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            known_ids.add(item_id)
+    return False
+
+
 def guard_responses_to_chat(body: dict,
                             *, store_enabled: bool = True,
                             reject_on_builtin_tools: bool = True) -> None:
@@ -222,10 +253,13 @@ def guard_responses_to_chat(body: dict,
     - `previous_response_id`：MS-3 不接 Store，一律拒绝；
       Store 接入后（MS-5 起）仅在 Store 关闭时拒绝
     - `include` 包含 "reasoning.encrypted_content"：chat 上游没有 encrypted
-      概念 → 静默从 include 列表中剥除（兼容客户端默认带这个开关的场景；
-      客户端拿到的 reasoning 块不会带 encrypted_content 字段，这与 chat
-      上游能力一致，不强迫客户端去识别上游协议来裁请求）
-    - `conversation` / `background`：由 guard_responses_ingress 已拒
+      reasoning replay 概念；必须拒绝，不能静默剥离，否则客户端会以为
+      下一轮仍可拿 encrypted_content 续接推理链。
+    - `conversation` / `background:true`：native Responses only; Chat upstream
+      cannot preserve async response state.
+    - `prompt` / `truncation` / `max_tool_calls` / 其他 include 是 Responses
+      请求/返回 hint，translator 使用目标 Chat payload 白名单处理；不在
+      这里阻断普通 fallback。
     """
     if not isinstance(body, dict):
         _fail(400, "invalid_request_error", "request body must be a JSON object")
@@ -259,6 +293,16 @@ def guard_responses_to_chat(body: dict,
             _fail(400, "invalid_request_error",
                   f"tool_choice type '{tc_type}' is not supported when routing to chat upstream",
                   param="tool_choice")
+        if tc_type == "allowed_tools":
+            for tool in tc.get("tools") or []:
+                if not isinstance(tool, dict):
+                    continue
+                nested_type = tool.get("type")
+                if nested_type in (None, "function", "custom"):
+                    continue
+                _fail(400, "invalid_request_error",
+                      f"tool_choice allowed_tools contains unsupported tool type '{nested_type}' when routing to chat upstream",
+                      param="tool_choice")
 
     # input items 检查
     inp = body.get("input")
@@ -269,9 +313,29 @@ def guard_responses_to_chat(body: dict,
                       f"input item type '{it.get('type')}' is not supported when routing to chat upstream",
                       param="input")
             if isinstance(it, dict) and it.get("type") == "item_reference":
+                if _responses_item_reference_unresolved_for_current_body(body):
+                    _fail(400, "invalid_request_error",
+                          "input item_reference cannot be resolved from local input/history",
+                          param="input")
+            if isinstance(it, dict) and it.get("type") in ("function_call_output", "custom_tool_call_output"):
+                unsupported = _function_call_output_part_unsupported_for_chat(it.get("output"))
+                if unsupported:
+                    _fail(400, "invalid_request_error",
+                          f"{it.get('type')} output part '{unsupported}' is not supported when routing to chat upstream",
+                          param="input")
+            if isinstance(it, dict) and it.get("type") == "input_file":
                 _fail(400, "invalid_request_error",
-                      "input item_reference is not supported (requires server-side store)",
+                      "top-level input_file is not supported when routing to chat upstream",
                       param="input")
+            content = it.get("content") if isinstance(it, dict) else None
+            parts = content if isinstance(content, list) else []
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") == "input_file":
+                    unsupported = _responses_input_file_unsupported_for_chat(part)
+                    if unsupported:
+                        _fail(400, "invalid_request_error",
+                              f"input_file field '{unsupported}' is not supported when routing to chat upstream",
+                              param="input")
 
     # previous_response_id：MS-5 起由 Store 支持；Store 关闭时仍拒绝
     if body.get("previous_response_id") and not store_enabled:
@@ -285,24 +349,17 @@ def guard_responses_to_chat(body: dict,
               "conversation resource is not supported when routing to chat upstream",
               param="conversation")
 
-    # include：reasoning.encrypted_content 在 chat 上游不可得，
-    # 静默从 include 列表中剥除（兼容客户端默认带这个开关的场景），
-    # 不再 400 阻断请求。
+    if body.get("background") is True:
+        _fail(400, "invalid_request_error",
+              "background async response is not supported when routing to chat upstream",
+              param="background")
+
+    # include：reasoning.encrypted_content 在 chat 上游不可得。
+    # 这是会影响下一轮推理链 replay 的高风险语义，禁止静默剥离。
     include = body.get("include")
     if isinstance(include, list):
-        stripped: list[str] = []
-        kept: list[Any] = []
         for inc in include:
             if inc == "reasoning.encrypted_content":
-                stripped.append(inc)
-                continue
-            kept.append(inc)
-        if stripped:
-            body["include"] = kept
-            try:
-                import logging
-                logging.getLogger("parrot.openai").info(
-                    "[guard] include items stripped for chat upstream: %s", stripped
-                )
-            except Exception:
-                pass
+                _fail(400, "invalid_request_error",
+                      "include reasoning.encrypted_content is not supported when routing to chat upstream",
+                      param="include")

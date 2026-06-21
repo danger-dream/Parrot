@@ -348,23 +348,14 @@ async def list_models(request: Request):
     """Anthropic 标准 /v1/models：返回当前代理可见的模型清单。
 
     - 需要 API Key 验证（和 /v1/messages 一致）
-    - 若 Key 有 allowedProtocols，按家族过滤（解决两家族同名模型冲突，例：
-      openai 与 anthropic 都叫 claude-3.5）
-    - 若 Key 有 allowedModels 白名单，再和家族结果取交集
+    - 若 Key 有 allowedModels 白名单，再和全局模型列表取交集
     - 否则返回所有启用渠道聚合的去重模型列表
     """
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    # 按 Key 的 allowedProtocols 推断家族。空/未设 = 全部家族。
-    allowed_protos = auth.get_allowed_protocols(key_name)
-    if allowed_protos:
-        families = {"anthropic" if p == "anthropic" else "openai" for p in allowed_protos}
-        all_models = registry.available_models_for_families(families)
-    else:
-        all_models = registry.available_models()
-        families = None
+    all_models = registry.available_models()
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
@@ -372,15 +363,11 @@ async def list_models(request: Request):
         visible = all_models
 
     # 把 modelMapping 里的别名也当成可用模型暴露出去:
-    # 条件 = 别名所属 ingress line 的家族对该 Key 放行, 且别名指向的真实模型
-    # 也在 visible 集合里 (否则客户端调不通, 暴露就是坑)。
-    allowed_families = families  # None = 全放行
+    # 条件 = 别名指向的真实模型也在 visible 集合里 (否则客户端调不通,
+    # 暴露就是坑)。API Key 不再按协议入口过滤，模型权限仍由 allowedModels 控制。
     visible_set = set(visible)
     alias_seen: set[str] = set()
     for _line in model_mapping.INGRESS_LINES:
-        _fam = model_mapping.INGRESS_FAMILY[_line]
-        if allowed_families is not None and _fam not in allowed_families:
-            continue
         _mp = model_mapping.get_ingress_map(_line)
         for _alias, _real in _mp.items():
             if _alias in visible_set or _alias in alias_seen:
@@ -569,6 +556,11 @@ async def proxy_messages(request: Request):
         reasoning_effort=reasoning_effort,
     )
 
+    # Internal-only routing/cache hints for downstream channel builders.  These
+    # fields are stripped by provider allowlists and never sent upstream.
+    body["_parrot_api_key_name"] = key_name or ""
+    body["_parrot_client_ip"] = client_ip or ""
+
     # 5. 调度
     result = scheduler.schedule(body, api_key_name=key_name, client_ip=client_ip)
 
@@ -577,6 +569,18 @@ async def proxy_messages(request: Request):
         await asyncio.to_thread(log_db.update_pending, request_id, affinity_hit=1)
 
     if not result:
+        guard_msg = getattr(result, "guard_error", None)
+        if guard_msg:
+            msg = f"Request cannot be safely routed: {guard_msg}"
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, msg, 0,
+                http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
+                total_ms=int((time.time() - start_time) * 1000),
+            )
+            return errors.json_error_response(
+                400, errors.ErrType.INVALID_REQUEST, msg
+            )
+
         msg = f"No available upstream channels for model: {model}"
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,

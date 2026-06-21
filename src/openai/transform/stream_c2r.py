@@ -42,7 +42,9 @@ class _MessageItem:
     output_index: int
     content_part_opened: bool = False
     text_buf: str = ""
+    text_logprobs: list[dict[str, Any]] = field(default_factory=list)
     refusal_buf: str = ""
+    refusal_logprobs: list[dict[str, Any]] = field(default_factory=list)
     refusal_part_opened: bool = False
     # 02-bug-findings #16: content_index 必须按 part 打开顺序累计
     # 之前 refusal 写死 1、text 写死 0，先 refusal 后 text 时会撞车。
@@ -238,15 +240,18 @@ class StreamTranslator:
                 yield from self._switch_text_kind("reasoning")
                 yield from self._emit_reasoning_text_delta(rc)
 
+        content_logprobs = _chat_choice_logprobs_part(choice, "content")
+        refusal_logprobs = _chat_choice_logprobs_part(choice, "refusal")
+
         content = delta.get("content")
         if isinstance(content, str) and content:
             yield from self._switch_text_kind("message")
-            yield from self._emit_output_text_delta(content)
+            yield from self._emit_output_text_delta(content, content_logprobs)
 
         refusal = delta.get("refusal")
         if isinstance(refusal, str) and refusal:
             yield from self._switch_text_kind("message")
-            yield from self._emit_refusal_delta(refusal)
+            yield from self._emit_refusal_delta(refusal, refusal_logprobs)
 
         for tc in delta.get("tool_calls") or []:
             if isinstance(tc, dict):
@@ -324,7 +329,7 @@ class StreamTranslator:
             },
         })
 
-    def _emit_output_text_delta(self, text: str) -> Iterator[bytes]:
+    def _emit_output_text_delta(self, text: str, logprobs: list[dict[str, Any]] | None = None) -> Iterator[bytes]:
         item = self.state.message_item
         assert item is not None, "message item must be opened before text delta"
         if not item.content_part_opened:
@@ -341,8 +346,11 @@ class StreamTranslator:
                 "part": {"type": "output_text", "text": "", "annotations": []},
             })
         item.text_buf += text
+        clean_logprobs = _clean_logprobs(logprobs)
+        if clean_logprobs:
+            item.text_logprobs.extend(clean_logprobs)
         # spec: ResponseTextDeltaEvent.logprobs required
-        # 02-bug-findings #29: 始终带 logprobs:[]（本 proxy 不传播 logprobs）
+        # 02-bug-findings #29: 始终带 logprobs；未请求时为空数组。
         yield _emit("response.output_text.delta", {
             "type": "response.output_text.delta",
             "sequence_number": self.state.next_seq(),
@@ -350,10 +358,10 @@ class StreamTranslator:
             "output_index": item.output_index,
             "content_index": item.text_content_index,
             "delta": text,
-            "logprobs": [],
+            "logprobs": clean_logprobs,
         })
 
-    def _emit_refusal_delta(self, text: str) -> Iterator[bytes]:
+    def _emit_refusal_delta(self, text: str, logprobs: list[dict[str, Any]] | None = None) -> Iterator[bytes]:
         item = self.state.message_item
         assert item is not None
         if not item.refusal_part_opened:
@@ -370,6 +378,9 @@ class StreamTranslator:
                 "part": {"type": "refusal", "refusal": ""},
             })
         item.refusal_buf += text
+        clean_logprobs = _clean_logprobs(logprobs)
+        if clean_logprobs:
+            item.refusal_logprobs.extend(clean_logprobs)
         yield _emit("response.refusal.delta", {
             "type": "response.refusal.delta",
             "sequence_number": self.state.next_seq(),
@@ -386,7 +397,7 @@ class StreamTranslator:
         # 先关 text part（用 _emit_output_text_delta 时分配的实际 index）
         if item.content_part_opened:
             # spec: ResponseTextDoneEvent.logprobs required
-            # 02-bug-findings #29: 始终带 logprobs:[]
+            # 02-bug-findings #29: 始终带 logprobs；未请求时为空数组。
             yield _emit("response.output_text.done", {
                 "type": "response.output_text.done",
                 "sequence_number": self.state.next_seq(),
@@ -394,7 +405,7 @@ class StreamTranslator:
                 "output_index": item.output_index,
                 "content_index": item.text_content_index,
                 "text": item.text_buf,
-                "logprobs": [],
+                "logprobs": list(item.text_logprobs),
             })
             yield _emit("response.content_part.done", {
                 "type": "response.content_part.done",
@@ -402,7 +413,7 @@ class StreamTranslator:
                 "item_id": item.item_id,
                 "output_index": item.output_index,
                 "content_index": item.text_content_index,
-                "part": {"type": "output_text", "text": item.text_buf, "annotations": []},
+                "part": _output_text_part(item.text_buf, item.text_logprobs),
             })
         # refusal part（同样用实际分配的 index）
         if item.refusal_part_opened:
@@ -420,14 +431,14 @@ class StreamTranslator:
                 "item_id": item.item_id,
                 "output_index": item.output_index,
                 "content_index": item.refusal_content_index,
-                "part": {"type": "refusal", "refusal": item.refusal_buf},
+                "part": _refusal_part(item.refusal_buf, item.refusal_logprobs),
             })
         # output_item.done
         final_content: list[dict] = []
         if item.content_part_opened:
-            final_content.append({"type": "output_text", "text": item.text_buf, "annotations": []})
+            final_content.append(_output_text_part(item.text_buf, item.text_logprobs))
         if item.refusal_part_opened:
-            final_content.append({"type": "refusal", "refusal": item.refusal_buf})
+            final_content.append(_refusal_part(item.refusal_buf, item.refusal_logprobs))
         completed_item = {
             "type": "message", "id": item.item_id, "role": "assistant",
             "status": "completed", "content": final_content,
@@ -767,9 +778,9 @@ class StreamTranslator:
             mi = self.state.message_item
             final_content: list[dict] = []
             if mi.content_part_opened:
-                final_content.append({"type": "output_text", "text": mi.text_buf, "annotations": []})
+                final_content.append(_output_text_part(mi.text_buf, mi.text_logprobs))
             if mi.refusal_part_opened:
-                final_content.append({"type": "refusal", "refusal": mi.refusal_buf})
+                final_content.append(_refusal_part(mi.refusal_buf, mi.refusal_logprobs))
             items.append((mi.output_index, {
                 "type": "message", "id": mi.item_id, "role": "assistant",
                 "status": "completed", "content": final_content,
@@ -890,3 +901,32 @@ def _usage_chat_to_resps_stream(u: dict) -> dict:
         reasoning_tokens=reasoning,
         total_tokens=total_tokens,
     )
+
+
+def _clean_logprobs(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _chat_choice_logprobs_part(choice: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    logprobs = choice.get("logprobs")
+    if not isinstance(logprobs, dict):
+        return []
+    return _clean_logprobs(logprobs.get(key))
+
+
+def _output_text_part(text: str, logprobs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    part: dict[str, Any] = {"type": "output_text", "text": text, "annotations": []}
+    clean = _clean_logprobs(logprobs)
+    if clean:
+        part["logprobs"] = clean
+    return part
+
+
+def _refusal_part(text: str, logprobs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    part: dict[str, Any] = {"type": "refusal", "refusal": text}
+    clean = _clean_logprobs(logprobs)
+    if clean:
+        part["logprobs"] = clean
+    return part

@@ -11,6 +11,13 @@ from typing import Optional
 from . import affinity, concurrency, config, cooldown, fingerprint, load_balancing, scorer
 from .channel import registry
 from .channel.base import Channel
+from .protocols.matrix import (
+    DEFAULT_MATRIX,
+    ProtocolGuardError,
+    RoutePlan,
+    capabilities_for_channel,
+    extract_request_features,
+)
 
 
 class ScheduleResult:
@@ -19,7 +26,9 @@ class ScheduleResult:
     def __init__(self, candidates: list[tuple[Channel, str]],
                  fp_query: Optional[str], affinity_hit: bool,
                  client_key: Optional[str] = None,
-                 saturated: Optional[list[tuple[Channel, str]]] = None):
+                 saturated: Optional[list[tuple[Channel, str]]] = None,
+                 route_plans: Optional[dict[tuple[str, str], RoutePlan]] = None,
+                 guard_errors: Optional[list[str]] = None):
         self.candidates = candidates
         self.fp_query = fp_query         # 本次请求计算得到的查询指纹（可用于后续事件记录）
         self.affinity_hit = affinity_hit
@@ -27,6 +36,12 @@ class ScheduleResult:
         # 并发饱和（in_flight >= max）的候选：正常 candidates 全部失败后，
         # failover 会把 saturated 作为"可排队等位"的备选集。
         self.saturated: list[tuple[Channel, str]] = saturated or []
+        self.route_plans: dict[tuple[str, str], RoutePlan] = route_plans or {}
+        self.guard_errors: list[str] = guard_errors or []
+        self.guard_error: Optional[str] = self.guard_errors[0] if self.guard_errors else None
+
+    def route_plan_for(self, ch: Channel, model: str) -> Optional[RoutePlan]:
+        return self.route_plans.get((getattr(ch, "key", ""), model))
 
     def __bool__(self) -> bool:
         return bool(self.candidates) or bool(self.saturated)
@@ -34,39 +49,46 @@ class ScheduleResult:
 
 # ─── 筛选 ─────────────────────────────────────────────────────────
 
-def _family(proto: str) -> str:
-    """协议到家族的映射。跨家族互转不做，scheduler 用这个过滤候选。"""
-    return "anthropic" if proto == "anthropic" else "openai"
-
-
 def _filter_candidates(requested_model: str,
                        ingress_protocol: str = "anthropic",
-                       ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]]]:
-    """返回 (available, saturated)：
+                       body: Optional[dict] = None,
+                       ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]], dict[tuple[str, str], RoutePlan], list[str]]:
+    """返回 (available, saturated, route_plans)：
        available = 可立即尝试的候选；
        saturated = 其它条件 OK 但当前并发满的候选（作为排队备选）。
     """
-    ingress_family = _family(ingress_protocol)
+    features = extract_request_features(ingress_protocol, body or {})
     available: list[tuple[Channel, str]] = []
     saturated: list[tuple[Channel, str]] = []
+    route_plans: dict[tuple[str, str], RoutePlan] = {}
+    guard_errors: list[str] = []
     for ch in registry.all_channels():
         if not ch.enabled:
             continue
         if ch.disabled_reason:
             continue
-        ch_protocol = getattr(ch, "protocol", "anthropic")
-        if _family(ch_protocol) != ingress_family:
-            continue
         resolved = ch.supports_model(requested_model)
         if resolved is None:
             continue
+        ch_protocol = getattr(ch, "protocol", "anthropic")
+        try:
+            route_plan = DEFAULT_MATRIX.plan(
+                ingress_protocol,
+                ch_protocol,
+                features=features,
+                capabilities=capabilities_for_channel(ch),
+            )
+        except ProtocolGuardError as exc:
+            guard_errors.append(exc.reason)
+            continue
+        route_plans[(ch.key, resolved)] = route_plan
         if cooldown.is_blocked(ch.key, resolved):
             continue
         if concurrency.is_saturated(ch.key):
             saturated.append((ch, resolved))
             continue
         available.append((ch, resolved))
-    return available, saturated
+    return available, saturated, route_plans, guard_errors
 
 
 # ─── 亲和匹配 ─────────────────────────────────────────────────────
@@ -133,9 +155,9 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     if not requested_model:
         return ScheduleResult([], None, False)
 
-    candidates, saturated = _filter_candidates(requested_model, ingress_protocol)
+    candidates, saturated, route_plans, guard_errors = _filter_candidates(requested_model, ingress_protocol, body=body)
     if not candidates and not saturated:
-        return ScheduleResult([], None, False)
+        return ScheduleResult([], None, False, guard_errors=guard_errors)
 
     if fp_query is None and ingress_protocol == "anthropic":
         fp_query = fingerprint.fingerprint_query(
@@ -160,4 +182,5 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
                                                client_key=client_key)
 
     return ScheduleResult(candidates, fp_query, affinity_hit,
-                          client_key=client_key, saturated=saturated)
+                          client_key=client_key, saturated=saturated,
+                          route_plans=route_plans, guard_errors=guard_errors)

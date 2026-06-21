@@ -4,9 +4,9 @@
   - chat → openai-chat 透传（非流式 + 流式）
   - responses → openai-responses 透传（非流式 + 流式）
   - 同家族跨变体暂不支持 → 503（MS-3 会实现翻译）
-  - CapabilityGuard：chat n>1 → 400
-  - allowedProtocols：不匹配 ingress → 403
-  - /v1/models：按 Key allowedProtocols 家族过滤
+  - CapabilityGuard：chat n>1 native passthrough；跨协议由 matrix/translator 拒绝
+  - allowedProtocols 旧配置被忽略；协议入口不再按 Key 限制
+  - 模型权限仍由 allowedModels 控制
   - 同家族多候选失败切换
 
 运行：./venv/bin/python -m src.tests.test_openai_m2
@@ -385,7 +385,7 @@ async def test_chat_500_switches_next(m):
     print("  [PASS] chat 500 → switch next candidate")
 
 
-async def test_guard_chat_n_gt_1(m):
+async def test_chat_n_gt_1_native_passthrough(m):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -395,31 +395,28 @@ async def test_guard_chat_n_gt_1(m):
 
     body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}], "n": 2}
     resp, mc = await _call_openai_handler(m, router, "chat", body)
-    assert resp.status_code == 400
-    out = json.loads(resp.body)
-    assert out["error"]["type"] == "invalid_request_error"
-    assert out["error"]["param"] == "n"
-    # 上游未被调用
-    assert router.last_request is None, "guard must reject before contacting upstream"
+    assert resp.status_code == 200
+    assert router.last_request is not None
+    upstream_body = json.loads(router.last_request.content)
+    assert upstream_body["n"] == 2
     await mc.aclose()
-    print("  [PASS] guard rejects chat n>1 → 400")
+    print("  [PASS] chat n>1 native passthrough → 200")
 
 
-async def test_allowed_protocols_mismatch_403(m):
+async def test_allowed_protocols_legacy_config_is_ignored(m):
     _setup(m)
-    # Key 只允许 anthropic，然后走 chat 入口 → 403
+    # allowedProtocols 是旧配置：不再拦协议入口；模型权限仍由 allowedModels 控制。
     _install_keys(m, _default_key(allowed_protos=["anthropic"]))
     router = MockRouter()
+    router.register("https://a.example", lambda r: chat_json_ok())
     chA = _make_openai_channel(m, "oaiA", "https://a.example")
     _install_channels(m, [chA])
 
     body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]}
     resp, mc = await _call_openai_handler(m, router, "chat", body)
-    assert resp.status_code == 403, f"status={resp.status_code}"
-    out = json.loads(resp.body)
-    assert out["error"]["type"] == "permission_error"
+    assert resp.status_code == 200, f"status={resp.status_code}, body={resp.body[:300]!r}"
     await mc.aclose()
-    print("  [PASS] allowedProtocols=anthropic blocks chat ingress → 403")
+    print("  [PASS] legacy allowedProtocols no longer blocks chat ingress")
 
 
 # 注：MS-2 时这里曾有 test_cross_variant_not_implemented_yet，验证 MS-2 阶段
@@ -444,8 +441,8 @@ async def test_no_candidates_family_filtered(m):
     print("  [PASS] family filter: anthropic-only registry returns 503 for chat ingress")
 
 
-def test_list_models_family_filter(m):
-    """/v1/models 按 allowedProtocols 过滤家族。同步测试直接调用 registry 接口。"""
+def test_model_permissions_do_not_depend_on_allowed_protocols(m):
+    """旧 allowedProtocols 被忽略；allowedModels 仍是唯一模型白名单。"""
     _setup(m)
     chA = _make_anthropic_channel(m, "anth1", "https://a.example",
                                    real="sonnet", alias="sonnet")
@@ -461,14 +458,18 @@ def test_list_models_family_filter(m):
     assert anth_only == ["sonnet"]
     assert openai_only == ["gpt-5"]
 
-    # auth.get_allowed_protocols
+    # Legacy allowedProtocols is intentionally ignored.
     _install_keys(m, {"k1": {"key": "ccp-a", "allowedProtocols": ["anthropic"]},
                       "k2": {"key": "ccp-b", "allowedProtocols": ["chat", "responses"]},
                       "k3": {"key": "ccp-c"}})
-    assert m["auth"].get_allowed_protocols("k1") == ["anthropic"]
-    assert m["auth"].get_allowed_protocols("k2") == ["chat", "responses"]
+    assert m["auth"].get_allowed_protocols("k1") == []
+    assert m["auth"].get_allowed_protocols("k2") == []
     assert m["auth"].get_allowed_protocols("k3") == []
-    print("  [PASS] /v1/models family filter: registry.available_models_for_families + auth.get_allowed_protocols")
+    assert m["auth"].validate({"authorization": "Bearer ccp-a"})[1] == []
+
+    _install_keys(m, {"k4": {"key": "ccp-d", "allowedModels": ["gpt-5"]}})
+    assert m["auth"].validate({"authorization": "Bearer ccp-d"})[1] == ["gpt-5"]
+    print("  [PASS] legacy allowedProtocols ignored while allowedModels remains configurable")
 
 
 # ─── 驱动 ────────────────────────────────────────────────────────
@@ -491,10 +492,10 @@ def main() -> int:
         _async(test_chat_stream_success),
         _async(test_responses_stream_success),
         _async(test_chat_500_switches_next),
-        _async(test_guard_chat_n_gt_1),
-        _async(test_allowed_protocols_mismatch_403),
+        _async(test_chat_n_gt_1_native_passthrough),
+        _async(test_allowed_protocols_legacy_config_is_ignored),
         _async(test_no_candidates_family_filtered),
-        test_list_models_family_filter,
+        test_model_permissions_do_not_depend_on_allowed_protocols,
     ]
     passed = 0
     try:

@@ -14,14 +14,82 @@ MS-3 约束：
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
 from typing import Any, Optional
 
+from . import guard
+
 
 def _gen_id(prefix: str) -> str:
     return f"{prefix}{uuid.uuid4().hex[:24]}"
+
+
+def _fail(message: str, *, param: str | None = None) -> None:
+    raise guard.GuardError(400, "invalid_request_error", message, param=param)
+
+
+def _instruction_content_to_chat(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        _fail("Responses instructions message content must be text-only", param="instructions")
+    parts: list[dict[str, str]] = []
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                parts.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            _fail("Responses instructions content parts must be objects or strings", param="instructions")
+        typ = part.get("type")
+        if typ in ("input_text", "output_text", "text"):
+            parts.append({"type": "text", "text": str(part.get("text") or "")})
+        elif typ == "refusal":
+            parts.append({"type": "text", "text": str(part.get("refusal") or "")})
+        else:
+            _fail(
+                f"Responses instructions content part {typ!r} cannot be safely converted to Chat instructions",
+                param="instructions",
+            )
+    if len(parts) == 1:
+        return parts[0]["text"]
+    return parts
+
+
+def _instructions_to_messages(instructions: Any) -> list[dict[str, Any]]:
+    if not instructions:
+        return []
+    if isinstance(instructions, str):
+        return [{"role": "system", "content": instructions}]
+    if not isinstance(instructions, list):
+        _fail("Responses instructions must be a string or a text-only input item list", param="instructions")
+
+    messages: list[dict[str, Any]] = []
+    for item in instructions:
+        if not isinstance(item, dict):
+            _fail("Responses instructions items must be objects", param="instructions")
+        typ = item.get("type")
+        if typ not in (None, "message"):
+            _fail(
+                f"Responses instructions item {typ!r} cannot be safely converted to Chat instructions",
+                param="instructions",
+            )
+        role = item.get("role") or "system"
+        if role == "developer":
+            role = "system"
+        if role not in ("system", "user", "assistant"):
+            _fail(
+                f"Responses instructions role {role!r} cannot be safely converted to Chat instructions",
+                param="instructions",
+            )
+        content = _instruction_content_to_chat(item.get("content") or [])
+        if content == "" or content == []:
+            continue
+        messages.append({"role": role, "content": content})
+    return messages
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -38,11 +106,19 @@ def translate_request(body: dict, *, api_key_name: str = "") -> dict:
     failover / handler 映射成 4xx。
     """
     input_items = _resolve_input(body, api_key_name=api_key_name)
-    messages = _input_items_to_messages(input_items)
+    return translate_request_from_input_items(body, input_items)
 
-    # instructions → 首条 system（在任何历史之前）
-    if body.get("instructions"):
-        messages.insert(0, {"role": "system", "content": body["instructions"]})
+
+def translate_request_from_input_items(body: dict, input_items: list) -> dict:
+    """Responses 请求翻译为 Chat 请求，复用调用方已展开的 input items。
+
+    用于需要同时检查完整历史语义的桥接路径，避免 `previous_response_id`
+    被重复查 Store 后让转换和语义补丁看到不同的历史快照。
+    """
+    messages = _input_items_to_messages(resolve_item_references(input_items))
+
+    # instructions → 前置消息（在任何历史之前）
+    messages = _instructions_to_messages(body.get("instructions")) + messages
 
     payload: dict[str, Any] = {"model": body["model"], "messages": messages}
 
@@ -70,6 +146,15 @@ def translate_request(body: dict, *, api_key_name: str = "") -> dict:
     # 02-bug-findings #11: text.verbosity ↔ chat verbosity（同 enum low/medium/high）
     if isinstance(text_cfg, dict) and text_cfg.get("verbosity"):
         payload["verbosity"] = text_cfg["verbosity"]
+
+    include = body.get("include")
+    wants_logprobs = (
+        isinstance(include, list) and "message.output_text.logprobs" in include
+    ) or isinstance(body.get("top_logprobs"), int)
+    if wants_logprobs:
+        payload["logprobs"] = True
+    if isinstance(body.get("top_logprobs"), int):
+        payload["top_logprobs"] = body["top_logprobs"]
 
     raw_tools = body.get("tools")
     has_tools = isinstance(raw_tools, list) and len(raw_tools) > 0
@@ -141,7 +226,49 @@ def _resolve_input(body: dict, *, api_key_name: str = "") -> list:
     else:
         cur_items = []
 
-    return list(history) + cur_items
+    return resolve_item_references(list(history) + cur_items)
+
+
+def resolve_input_items(body: dict, *, api_key_name: str = "") -> list:
+    """返回完整 input items，包含 previous_response_id 展开的历史。"""
+    return _resolve_input(body, api_key_name=api_key_name)
+
+
+def resolve_item_references(items: list) -> list:
+    """Expand Responses item_reference entries against local input/history.
+
+    This only uses items already present in the expanded request context.  A
+    bare item id is not enough to safely query the response store globally.
+    """
+    resolved: list[Any] = []
+    by_id: dict[str, Any] = {}
+
+    def index_item(item: Any) -> None:
+        if not isinstance(item, dict) or item.get("type") == "item_reference":
+            return
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id and item_id not in by_id:
+            by_id[item_id] = item
+
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "item_reference":
+            ref_id = item.get("id")
+            if not isinstance(ref_id, str) or not ref_id:
+                _fail("Responses item_reference requires a non-empty id", param="input")
+            target = by_id.get(ref_id)
+            if target is None:
+                _fail(
+                    f"Responses item_reference id '{ref_id}' cannot be resolved from local input/history",
+                    param="input",
+                )
+            clone = copy.deepcopy(target)
+            resolved.append(clone)
+            index_item(clone)
+            continue
+        resolved.append(item)
+        index_item(item)
+
+    return resolved
 
 
 def resolve_current_input_items(body: dict) -> list:
@@ -298,7 +425,7 @@ def _input_items_to_messages(items: list) -> list:
             messages.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id") or "",
-                "content": item.get("output") or "",
+                "content": _flatten_function_call_output(item.get("output")),
             })
 
         elif t == "reasoning":
@@ -390,9 +517,18 @@ def _content_responses_to_chat(content) -> Any:
                 if k in p:
                     f[k] = p[k]
             out.append({"type": "file", "file": f})
-        # 02-bug-findings #6: spec ResponseInputContent 仅 oneOf
-        # {input_text, input_image, input_file}，没有 input_audio。该分支以前
-        # 是死代码（guard 已拦客户端发的 input_audio）；这里不再保留 fallback。
+        elif pt == "input_audio":
+            # OpenAI Chat 与 Responses 的音频输入 content part 同构；这里
+            # 保留二进制/data-url 引用本身，不做转码或转录降级。
+            audio = p.get("input_audio")
+            if isinstance(audio, dict):
+                out.append({"type": "input_audio", "input_audio": dict(audio)})
+            else:
+                audio_obj: dict[str, Any] = {}
+                for k in ("data", "format"):
+                    if k in p:
+                        audio_obj[k] = p[k]
+                out.append({"type": "input_audio", "input_audio": audio_obj})
         elif pt == "refusal":
             # chat 里没有 refusal part；用空 text 占位，refusal 字段由 translate_response 单独带
             out.append({"type": "text", "text": ""})
@@ -485,24 +621,35 @@ def translate_response(chat: dict, *, model: str,
     if isinstance(content, str) and content:
         # 02-bug-findings #28: 把 chat assistant.annotations 回填到 output_text.annotations
         ann_list = msg.get("annotations") if isinstance(msg.get("annotations"), list) else []
+        content_part: dict[str, Any] = {
+            "type": "output_text",
+            "text": content,
+            "annotations": list(ann_list),
+        }
+        content_logprobs = _chat_choice_logprobs_part(choice0, "content")
+        if content_logprobs:
+            content_part["logprobs"] = content_logprobs
         output_items.append({
             "type": "message",
             "id": _gen_id("msg_"),
             "role": "assistant",
             "status": "completed",
-            "content": [{"type": "output_text", "text": content,
-                          "annotations": list(ann_list)}],
+            "content": [content_part],
         })
 
     # refusal → message with refusal part
     refusal = msg.get("refusal")
     if isinstance(refusal, str) and refusal:
+        refusal_part: dict[str, Any] = {"type": "refusal", "refusal": refusal}
+        refusal_logprobs = _chat_choice_logprobs_part(choice0, "refusal")
+        if refusal_logprobs:
+            refusal_part["logprobs"] = refusal_logprobs
         output_items.append({
             "type": "message",
             "id": _gen_id("msg_"),
             "role": "assistant",
             "status": "completed",
-            "content": [{"type": "refusal", "refusal": refusal}],
+            "content": [refusal_part],
         })
 
     # tool_calls → function_call items
@@ -575,6 +722,16 @@ def translate_response(chat: dict, *, model: str,
             )
 
     return resp
+
+
+def _chat_choice_logprobs_part(choice: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    logprobs = choice.get("logprobs")
+    if not isinstance(logprobs, dict):
+        return []
+    value = logprobs.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def _finish_reason_to_status(finish_reason: Optional[str],

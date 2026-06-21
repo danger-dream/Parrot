@@ -381,13 +381,10 @@ def test_cancelled_status_maps_to_stop(m):
     print("  [PASS] c2r: cancelled/queued/in_progress status → finish_reason=stop")
 
 
-def test_guard_chat_to_responses_rejects_input_audio(m):
-    """chat messages 带 input_audio content part，跨变体路由到 responses 上游时 → 400。
-
-    Responses API 的 ResponseInputContent 只接受 text/image/file；若静默透传
-    会被上游拒绝为 400，不如自己显式拦截让错误信息更明确。
-    """
+def test_guard_chat_to_responses_allows_input_audio(m):
+    """chat messages 带 input_audio content part 时，Chat→Responses 应保真透传。"""
     g = m["guard"]
+    c2r = m["chat_to_responses"]
     body = {
         "model": "gpt-5",
         "messages": [
@@ -399,15 +396,12 @@ def test_guard_chat_to_responses_rejects_input_audio(m):
              ]},
         ],
     }
-    try:
-        g.guard_chat_to_responses(body)
-        assert False, "应该抛 GuardError"
-    except g.GuardError as e:
-        assert e.status == 400
-        assert e.err_type == "invalid_request_error"
-        assert "input_audio" in e.message
+    g.guard_chat_to_responses(body)
+    out = c2r.translate_request(body)
+    parts = out["input"][0]["content"]
+    assert parts[1] == {"type": "input_audio", "input_audio": {"data": "BASE64...", "format": "wav"}}
     # 同协议 chat→chat 不走这个 guard；上面 body 直接 filter_chat_passthrough OK（不拦）
-    print("  [PASS] guard: chat→responses 跨变体拒绝 input_audio")
+    print("  [PASS] guard: chat→responses 跨变体保真透传 input_audio")
 
 
 def test_r2c_assistant_refusal_preserved(m):
@@ -460,29 +454,32 @@ def test_r2c_assistant_mixed_text_and_refusal(m):
 
 
 def test_guard_conversation_null_allowed(m):
-    """conversation=null / 空 dict：不应触发 guard 拒绝；只有非空 conv id 才拒。"""
+    """conversation/background native 入口可透传；Responses→Chat fallback 非空状态仍拒。"""
     g = m["guard"]
 
-    # ingress guard：null 不拒（带 model 满足 #2 校验，焦点在 conversation 字段）
+    # ingress guard：native Responses API 可以真实处理 conversation，不在入口误杀。
     g.guard_responses_ingress({"model": "x", "conversation": None}, store_enabled=True)  # no raise
     g.guard_responses_ingress({"model": "x", "conversation": {}}, store_enabled=True)    # no raise
     g.guard_responses_ingress({"model": "x", "conversation": ""}, store_enabled=True)    # no raise
-    # 显式给值时拒
-    try:
-        g.guard_responses_ingress({"model": "x", "conversation": "conv_xyz"}, store_enabled=True)
-        assert False, "非空 conversation 应被拒"
-    except g.GuardError as e:
-        assert e.status == 400
+    g.guard_responses_ingress({"model": "x", "conversation": "conv_xyz"}, store_enabled=True)  # no raise
+    background_body = {"model": "x", "background": True, "input": "hi"}
+    g.guard_responses_ingress(background_body, store_enabled=True)
+    assert background_body["background"] is True
 
-    # cross-variant guard 同理（cross-variant guard 不强制 model，但加上无副作用）
+    # cross-variant guard：Chat upstream 没有 server-side conversation 资源。
     g.guard_responses_to_chat({"conversation": None}, store_enabled=True)  # no raise
     try:
         g.guard_responses_to_chat({"conversation": {"id": "x"}}, store_enabled=True)
         assert False
     except g.GuardError as e:
         assert e.status == 400
+    try:
+        g.guard_responses_to_chat({"background": True, "input": "hi"}, store_enabled=True)
+        assert False
+    except g.GuardError as e:
+        assert e.status == 400
 
-    print("  [PASS] guard：conversation=null/空 → 放行；非空 → 400")
+    print("  [PASS] guard：conversation/background native 入口放行；Responses→Chat fallback 状态 → 400")
 
 
 # ─── 驱动 ────────────────────────────────────────────────────────
@@ -511,7 +508,7 @@ def main() -> int:
         test_reasoning_content_read_from_reasoning_text,
         test_legacy_function_call_passthrough,
         test_cancelled_status_maps_to_stop,
-        test_guard_chat_to_responses_rejects_input_audio,
+        test_guard_chat_to_responses_allows_input_audio,
         test_r2c_assistant_refusal_preserved,
         test_r2c_assistant_mixed_text_and_refusal,
         _async(test_handler_sanitizes_internal_body_fields),

@@ -28,7 +28,8 @@ import os
 import sys
 import time
 
-from fastapi.testclient import TestClient
+import httpx
+from anyio.from_thread import start_blocking_portal
 
 
 BASE_URL = os.environ.get("OPENAI_PROBE_BASE_URL") or ""
@@ -38,11 +39,24 @@ MODEL    = os.environ.get("OPENAI_PROBE_MODEL", "gpt-5.4")
 DOWNSTREAM_KEY = "ccp-liveprobe-test"
 
 
-# ─── Setup：写配置 + 启动 TestClient ─────────────────────────────
+# ─── Setup：写配置 + 启动 _AsgiProbeClient ─────────────────────────────
 
 def _write_config(tmp_dir: str, protocol: str) -> None:
     """把配置写入 isolated config.json；protocol 决定挂哪种 openai 渠道。"""
     cfg_path = os.environ["ANTHROPIC_PROXY_CONFIG"]
+    # live probe 使用隔离配置，不继承生产代理/后台监控设置；DNS 直接采用系统
+    # resolv.conf，避免默认 8.8.8.8 在容器环境里不可达。
+    dns_servers = []
+    try:
+        with open("/etc/resolv.conf", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0] == "nameserver" and parts[1] not in dns_servers:
+                    dns_servers.append(parts[1])
+    except OSError:
+        pass
+    if not dns_servers:
+        dns_servers = ["8.8.8.8"]
     cfg = {
         "listen": {"host": "127.0.0.1", "port": 0},
         "apiKeys": {
@@ -62,6 +76,27 @@ def _write_config(tmp_dir: str, protocol: str) -> None:
         "logDir":      os.path.join(tmp_dir, "logs"),
         "telegram": {"botToken": "", "adminIds": []},
         "oauth": {"mockMode": True},
+        "network": {
+            "dns": {
+                "servers": dns_servers,
+                "bootstrapFromSystem": False,
+                "bootstrapped": True,
+                "timeoutSeconds": 3,
+                "cacheTtlSeconds": 300,
+            },
+            "socks5": {"enabled": False, "url": ""},
+            "monitor": {
+                "enabled": False,
+                "intervalSeconds": 60,
+                "timeoutSeconds": 5,
+                "dns": False,
+                "socks5": False,
+                "channels": {"enabled": False, "byKey": {}},
+                "core": {"openai": False, "claude": False, "cloudflare": False},
+            },
+        },
+        "statusMonitor": {"enabled": False},
+        "updateChecker": {"enabled": False},
         "timeouts": {"connect": 10, "firstByte": 60, "idle": 60, "total": 180},
         "openai": {
             "store": {"enabled": True, "ttlMinutes": 60, "cleanupIntervalSeconds": 300},
@@ -82,6 +117,129 @@ def _write_config(tmp_dir: str, protocol: str) -> None:
 
 
 # ─── 单项测试 ────────────────────────────────────────────────────
+
+
+class _SyncStreamResponse:
+    def __init__(self, *, status_code: int, headers: httpx.Headers, content: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+    def read(self) -> bytes:
+        return self.content
+
+    def iter_bytes(self):
+        yield self.content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _AsgiProbeClient:
+    def __init__(self, app):
+        self._app = app
+        self._portal_cm = None
+        self._portal = None
+        self._client: httpx.AsyncClient | None = None
+
+    async def _async_enter(self) -> None:
+        # Intentionally avoid FastAPI lifespan here. The production lifespan
+        # starts public-IP/update/status/probe background work; this live probe
+        # should only initialize the request path and contact the configured
+        # non-OAuth upstream.
+        from src import (
+            affinity, cooldown, image_db, log_db, network, scorer, state_db,
+            translation, upstream,
+        )
+        from src.channel import registry
+        from src.openai import store as openai_store
+        from src.openai.channel.registration import register_factories
+
+        network.init()
+        state_db.init()
+        log_db.init()
+        image_db.init()
+        translation.init()
+        affinity.init()
+        affinity.client_init()
+        cooldown.init()
+        scorer.init()
+        register_factories()
+        openai_store.init()
+        registry.rebuild_from_config()
+        upstream.create_client()
+
+        transport = httpx.ASGITransport(app=self._app)
+        self._client = httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        )
+
+    async def _async_exit(self) -> None:
+        from src import upstream
+
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+        await upstream.close_client()
+
+    def post(self, url: str, **kwargs) -> httpx.Response:
+        async def _run():
+            if self._client is None:
+                raise RuntimeError("_AsgiProbeClient must be used as a context manager")
+            return await self._client.post(url, **kwargs)
+
+        if self._portal is None:
+            raise RuntimeError("_AsgiProbeClient must be used as a context manager")
+        return self._portal.call(_run)
+
+    def stream(self, method: str, url: str, **kwargs) -> _SyncStreamResponse:
+        async def _run():
+            if self._client is None:
+                raise RuntimeError("_AsgiProbeClient must be used as a context manager")
+            async with self._client.stream(method, url, **kwargs) as resp:
+                content = await resp.aread()
+                return _SyncStreamResponse(
+                    status_code=resp.status_code,
+                    headers=resp.headers,
+                    content=content,
+                )
+
+        if self._portal is None:
+            raise RuntimeError("_AsgiProbeClient must be used as a context manager")
+        return self._portal.call(_run)
+
+    def __enter__(self):
+        self._portal_cm = start_blocking_portal()
+        self._portal = self._portal_cm.__enter__()
+        try:
+            self._portal.call(self._async_enter)
+        except BaseException:
+            self._portal_cm.__exit__(*sys.exc_info())
+            self._portal_cm = None
+            self._portal = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._portal is not None:
+                self._portal.call(self._async_exit)
+        finally:
+            if self._portal_cm is not None:
+                self._portal_cm.__exit__(exc_type, exc, tb)
+            self._portal_cm = None
+            self._portal = None
+        return False
+
 
 def _headers() -> dict:
     return {"Authorization": f"Bearer {DOWNSTREAM_KEY}",
@@ -120,7 +278,9 @@ def _resp_assert_non_stream(body: bytes) -> dict:
     obj = json.loads(body)
     assert obj.get("object") == "response", f"expected object=response: {obj}"
     assert obj.get("status") == "completed"
-    assert obj.get("id", "").startswith("resp_")
+    # 第三方 Responses 兼容服务不一定使用 OpenAI 官方的 `resp_` 前缀；
+    # 只要求 id 非空，previous_response_id 专项用例会单独验证本地 Store 生成的 id。
+    assert obj.get("id"), obj
     output = obj.get("output") or []
     # 应至少含一个 message / reasoning item
     types = [it.get("type") for it in output]
@@ -128,7 +288,7 @@ def _resp_assert_non_stream(body: bytes) -> dict:
     return obj
 
 
-def _collect_chat_stream(tc: TestClient, url: str, body: dict) -> tuple[str, list[dict]]:
+def _collect_chat_stream(tc: _AsgiProbeClient, url: str, body: dict) -> tuple[str, list[dict]]:
     with tc.stream("POST", url, headers=_headers(), json=body) as resp:
         assert resp.status_code == 200, f"status={resp.status_code} body={resp.read()!r}"
         raw = b""
@@ -160,7 +320,7 @@ def _collect_chat_stream(tc: TestClient, url: str, body: dict) -> tuple[str, lis
     return text, objs
 
 
-def _collect_responses_stream(tc: TestClient, url: str, body: dict) -> tuple[str, list[tuple[str, dict]]]:
+def _collect_responses_stream(tc: _AsgiProbeClient, url: str, body: dict) -> tuple[str, list[tuple[str, dict]]]:
     with tc.stream("POST", url, headers=_headers(), json=body) as resp:
         assert resp.status_code == 200, f"status={resp.status_code} body={resp.read()!r}"
         raw = b""
@@ -196,9 +356,9 @@ def _collect_responses_stream(tc: TestClient, url: str, body: dict) -> tuple[str
 
 
 def _with_protocol(tmp_dir: str, protocol: str):
-    """上下文：切换 channel protocol 后重建 registry；返回 TestClient。"""
+    """上下文：切换 channel protocol 后重建 registry；返回 _AsgiProbeClient。"""
     _write_config(tmp_dir, protocol)
-    # 重置 server 进程内的状态（若之前有 TestClient 起过）
+    # 重置 server 进程内的状态（若之前有 _AsgiProbeClient 起过）
     from src.channel import registry
     try:
         from src import config as _cfg
@@ -206,13 +366,13 @@ def _with_protocol(tmp_dir: str, protocol: str):
     except Exception:
         pass
     registry.rebuild_from_config()
-    return None  # 调用方直接用共享 TestClient
+    return None  # 调用方直接用共享 _AsgiProbeClient
 
 
 # ─── 测试用例 ────────────────────────────────────────────────────
 
 
-def run_case(name: str, tmp_dir: str, tc: TestClient, protocol: str, fn) -> bool:
+def run_case(name: str, tmp_dir: str, tc: _AsgiProbeClient, protocol: str, fn) -> bool:
     print(f"\n▶ {name} (channel protocol={protocol})")
     _with_protocol(tmp_dir, protocol)
     t0 = time.time()
@@ -230,47 +390,47 @@ def run_case(name: str, tmp_dir: str, tc: TestClient, protocol: str, fn) -> bool
     return True
 
 
-def case_chat_to_chat_nonstream(tc: TestClient):
+def case_chat_to_chat_nonstream(tc: _AsgiProbeClient):
     r = tc.post("/v1/chat/completions", headers=_headers(), json=_chat_body(stream=False))
     assert r.status_code == 200, r.text[:500]
     _chat_assert_non_stream(r.content)
 
 
-def case_chat_to_chat_stream(tc: TestClient):
+def case_chat_to_chat_stream(tc: _AsgiProbeClient):
     _collect_chat_stream(tc, "/v1/chat/completions", _chat_body(stream=True))
 
 
-def case_responses_to_responses_nonstream(tc: TestClient):
+def case_responses_to_responses_nonstream(tc: _AsgiProbeClient):
     r = tc.post("/v1/responses", headers=_headers(), json=_responses_body(stream=False))
     assert r.status_code == 200, r.text[:500]
     _resp_assert_non_stream(r.content)
 
 
-def case_responses_to_responses_stream(tc: TestClient):
+def case_responses_to_responses_stream(tc: _AsgiProbeClient):
     _collect_responses_stream(tc, "/v1/responses", _responses_body(stream=True))
 
 
-def case_chat_to_responses_nonstream(tc: TestClient):
+def case_chat_to_responses_nonstream(tc: _AsgiProbeClient):
     r = tc.post("/v1/chat/completions", headers=_headers(), json=_chat_body(stream=False))
     assert r.status_code == 200, r.text[:500]
     _chat_assert_non_stream(r.content)
 
 
-def case_chat_to_responses_stream(tc: TestClient):
+def case_chat_to_responses_stream(tc: _AsgiProbeClient):
     _collect_chat_stream(tc, "/v1/chat/completions", _chat_body(stream=True))
 
 
-def case_responses_to_chat_nonstream(tc: TestClient):
+def case_responses_to_chat_nonstream(tc: _AsgiProbeClient):
     r = tc.post("/v1/responses", headers=_headers(), json=_responses_body(stream=False))
     assert r.status_code == 200, r.text[:500]
     _resp_assert_non_stream(r.content)
 
 
-def case_responses_to_chat_stream(tc: TestClient):
+def case_responses_to_chat_stream(tc: _AsgiProbeClient):
     _collect_responses_stream(tc, "/v1/responses", _responses_body(stream=True))
 
 
-def case_prev_id_followup(tc: TestClient):
+def case_prev_id_followup(tc: _AsgiProbeClient):
     """responses 入口 + openai-chat 上游：第一轮拿 resp_id；第二轮续接。"""
     r1 = tc.post("/v1/responses", headers=_headers(), json={
         "model": MODEL,
@@ -309,7 +469,7 @@ def main() -> int:
 
     tmp_dir = _isolation._TMP_DIR or "/tmp"
 
-    # 首次用任一 protocol 初始化（TestClient 的 lifespan 会启动 registry / state_db）
+    # 首次用任一 protocol 初始化，后续 _AsgiProbeClient 会做最小运行时初始化。
     _write_config(tmp_dir, "openai-chat")
 
     # server.py 位于项目根（与 src/ 同级）
@@ -317,7 +477,7 @@ def main() -> int:
     if _root not in sys.path:
         sys.path.insert(0, _root)
     from server import app  # noqa: F401
-    tc = TestClient(app)
+    tc = _AsgiProbeClient(app)
 
     cases = [
         ("chat ingress → openai-chat 上游（非流式）",   "openai-chat",      case_chat_to_chat_nonstream),
