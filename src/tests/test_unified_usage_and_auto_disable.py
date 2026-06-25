@@ -1,20 +1,20 @@
-"""统一 OAuth 用量机制 + 响应头超限自动禁用测试（2026-04-20）。
+"""统一 OAuth 用量机制 + 响应头超限自动禁用测试(2026-04-20)。
 
-覆盖：
-  A. fetch_usage 按 provider 分派：
-     - Claude 走 /api/oauth/usage（_usage_sync）
+覆盖:
+  A. fetch_usage 按 provider 分派:
+     - Claude 走 /api/oauth/usage(_usage_sync)
      - OpenAI 主动刷新走 ChatGPT wham/usage
      - OpenAI 响应头实时额度仍由 failover 被动采样保存
      - 删除账户级联清历史 openai probe 桶
-  B. quota_monitor_once 对 OpenAI 账号不再 skip，走统一路径
-  C. 响应头超限自动禁用：
+  B. quota_monitor_once 对 OpenAI 账号不再 skip,走统一路径
+  C. 响应头超限自动禁用:
      - Anthropic surpassed-threshold=true → set_disabled_by_quota
      - Anthropic util>=1.0 → set_disabled_by_quota
      - 已 disabled 的账号不重复触发
      - auth_error / user 禁用不被覆盖
      - OpenAI primary/secondary used_percent >= threshold → 禁用
 
-运行：./venv/bin/python -m src.tests.test_unified_usage_and_auto_disable
+运行:./venv/bin/python -m src.tests.test_unified_usage_and_auto_disable
 """
 
 from __future__ import annotations
@@ -97,7 +97,7 @@ class _FakeResp:
 # ==============================================================
 
 def test_fetch_usage_claude_goes_to_api(m):
-    """Claude 账号 fetch_usage → 走 _usage_sync，返回 mock 结构。"""
+    """Claude 账号 fetch_usage → 走 _usage_sync,返回 mock 结构。"""
     _setup(m)
     _add_claude(m, "ca@c.io")
     usage = asyncio.run(m["oauth_manager"].fetch_usage("claude:ca@c.io"))
@@ -108,7 +108,7 @@ def test_fetch_usage_claude_goes_to_api(m):
 
 
 def test_fetch_usage_openai_goes_to_wham(m):
-    """OpenAI 账号主动 fetch_usage → ChatGPT wham/usage，不发 Codex probe。"""
+    """OpenAI 账号主动 fetch_usage → ChatGPT wham/usage,不发 Codex probe。"""
     _setup(m)
     _add_openai(m, "oa@o.io")
     m["registry"].rebuild_from_config()
@@ -121,7 +121,7 @@ def test_fetch_usage_openai_goes_to_wham(m):
 
 
 def test_fetch_usage_openai_ignores_passive_fresh_for_active_refresh(m):
-    """OpenAI 主动 fetch_usage 即使有新鲜响应头缓存，也应拉 wham 作为主动额度源。"""
+    """OpenAI 主动 fetch_usage 即使有新鲜响应头缓存,也应拉 wham 作为主动额度源。"""
     _setup(m)
     _add_openai(m, "fresh@o.io")
     m["registry"].rebuild_from_config()
@@ -178,6 +178,35 @@ def test_quota_monitor_processes_openai_accounts(m):
     assert not openai_outcome.startswith("skipped:openai_uses_headers"), openai_outcome
     assert claude_outcome is not None
     print(f"  [PASS] quota_monitor_once: processes both (openai={openai_outcome}, claude={claude_outcome})")
+
+
+def test_quota_monitor_resumes_openai_despite_old_passive_timestamp(m):
+    """后台主动 wham/usage 刷新不应被旧响应头采样时间戳误判为 stale。"""
+    _setup(m)
+    _add_openai(m, "resume-passive@o.io")
+    m["registry"].rebuild_from_config()
+    ak = "openai:resume-passive@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+
+    m["state_db"].quota_patch_passive(ak, {
+        "five_hour_util": 10.0,
+        "seven_day_util": 20.0,
+    }, email="resume-passive@o.io")
+    old_ms = m["state_db"].now_ms() - 10 * 60 * 1000
+    conn = m["state_db"]._get_conn()
+    conn.execute(
+        "UPDATE oauth_quota_cache SET last_passive_update_at=? WHERE account_key=?",
+        (old_ms, ak),
+    )
+    conn.commit()
+
+    outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert outcomes.get("resume-passive@o.io") == "resumed", outcomes
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    print("  [PASS] quota_monitor_once: old passive timestamp does not block OpenAI resume")
 
 
 # ==============================================================
@@ -238,10 +267,10 @@ def test_anthropic_no_auto_disable_when_below_limit(m):
 
 
 def test_anthropic_auto_disable_idempotent_for_already_disabled(m):
-    """已 disabled_reason="quota" 的账号不重复触发（避免 disabled_until 被覆盖）。"""
+    """已 disabled_reason="quota" 的账号不重复触发(避免 disabled_until 被覆盖)。"""
     _setup(m)
     _add_claude(m, "dq@c.io")
-    # 预置：已经 disabled_reason=quota，disabled_until=一个固定值
+    # 预置:已经 disabled_reason=quota,disabled_until=一个固定值
     m["oauth_manager"].set_disabled_by_quota("claude:dq@c.io", "2099-01-01T00:00:00Z")
     acc = m["oauth_manager"].get_account("claude:dq@c.io")
     ch = m["OAuthChannel"](acc, [])
@@ -279,7 +308,7 @@ def test_anthropic_auth_error_not_touched(m):
 
 
 # ==============================================================
-# C2. 响应头超限自动禁用 — OpenAI
+# C2. 响应头超限自动禁用 - OpenAI
 # ==============================================================
 
 def test_openai_auto_disable_primary_over_threshold(m):
@@ -382,6 +411,29 @@ def test_openai_quota_disabled_not_resumed_from_unknown_usage(m):
     print("  [PASS] openai: quota-disabled account is not resumed from unknown usage")
 
 
+def test_openai_cached_thirty_day_over_threshold_sets_disabled_until(m):
+    _setup(m)
+    _add_openai(m, "thirty-over@o.io")
+    ak = "openai:thirty-over@o.io:acct-123"
+    reset = "2026-07-19T21:23:07Z"
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 1.0,
+        "seven_day_util": 2.0,
+        "thirty_day_util": 99.0,
+        "thirty_day_reset": reset,
+    }, email="thirty-over@o.io")
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_cached_quota(ak, threshold=95)
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "disabled", result
+    assert result["hit_windows"] == ["30d"], result
+    assert result["disabled_until"] == reset, result
+    assert acc_after["disabled_reason"] == "quota"
+    assert acc_after["disabled_until"] == reset
+    print("  [PASS] openai: cached 30d over threshold carries disabled_until")
+
+
 def test_openai_quota_disabled_resumes_with_fresh_low_usage_before_disabled_until(m):
     _setup(m)
     _add_openai(m, "future@o.io")
@@ -464,6 +516,7 @@ def main():
         test_delete_account_clears_openai_probe_bucket,
         # B. quota_monitor_once 对齐
         test_quota_monitor_processes_openai_accounts,
+        test_quota_monitor_resumes_openai_despite_old_passive_timestamp,
         # C. Anthropic 自动禁用
         test_anthropic_auto_disable_surpassed_threshold,
         test_anthropic_auto_disable_util_ge_one,
@@ -476,6 +529,7 @@ def main():
         test_openai_auto_disable_respects_custom_threshold,
         test_openai_user_disabled_not_touched,
         test_openai_quota_disabled_not_resumed_from_unknown_usage,
+        test_openai_cached_thirty_day_over_threshold_sets_disabled_until,
         test_openai_quota_disabled_resumes_with_fresh_low_usage_before_disabled_until,
         test_openai_quota_disabled_keeps_waiting_on_stale_low_usage,
         test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage,

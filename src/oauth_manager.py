@@ -995,8 +995,13 @@ def latest_reset_iso(usage: dict) -> str | None:
     不合理情况。
     """
     candidates: list[datetime] = []
-    for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
-        obj = usage.get(key) or {}
+    for obj in (
+        usage.get("five_hour") or {},
+        usage.get("seven_day") or {},
+        ((usage.get("openai") or {}).get("thirty_day") or {}),
+        usage.get("seven_day_sonnet") or {},
+        usage.get("seven_day_opus") or {},
+    ):
         dt = _parse_iso(obj.get("resets_at"))
         if dt is not None:
             candidates.append(dt)
@@ -1013,11 +1018,16 @@ def reset_iso_for_hit_windows(usage: dict, threshold: float) -> str | None:
     撞到的窗口都过去才恢复；但**不会**因为 5h 撞了而锁到 7d）。
 
     入参 usage：Anthropic 风格 JSON（`flatten_usage` 消费的那种），对 OpenAI
-    合成结构（只有 five_hour / seven_day）同样适用。
+    合成结构（five_hour / seven_day / openai.thirty_day）同样适用。
     """
     candidates: list[datetime] = []
-    for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
-        obj = usage.get(key) or {}
+    for obj in (
+        usage.get("five_hour") or {},
+        usage.get("seven_day") or {},
+        ((usage.get("openai") or {}).get("thirty_day") or {}),
+        usage.get("seven_day_sonnet") or {},
+        usage.get("seven_day_opus") or {},
+    ):
         util = obj.get("utilization")
         if util is None:
             continue
@@ -1125,7 +1135,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
     返回: {
       "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
                 "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
-      "utils": [5h, 7d, sonnet, opus],   # None 表示该指标缺失
+      "utils": [5h, 7d, 30d, sonnet, opus],   # None 表示该指标缺失
       "any_over": bool,
       "hit_windows": ["5h", "7d", ...],   # util ≥ threshold 的窗口标签
       "disabled_until": str|None,
@@ -1940,16 +1950,13 @@ async def quota_monitor_once() -> dict:
 
         state_db.quota_save(ak, flatten_usage(usage), email=email)
 
-        # OpenAI quota 恢复必须有本轮新鲜窗口数据；缓存合成/空 usage 不足以
-        # 证明恢复。Claude 仍沿用真实 usage API。
+        # OpenAI quota 恢复必须有本轮主动 fetch_usage 拿到的窗口数据；空 usage
+        # 不足以证明恢复。不要用 last_passive_update_at 判定这里的新鲜度：旧的
+        # 业务响应头采样时间戳可能早于本轮 wham/usage 主动刷新，误把新数据当 stale。
+        # Claude 仍沿用真实 usage API。
         fresh_for_resume = True
         if provider_of(ak) == "openai" and reason_before == "quota":
-            row = state_db.quota_load(ak) or {}
-            last_ms = int(row.get("last_passive_update_at") or row.get("fetched_at") or 0)
-            fresh_for_resume = bool(
-                last_ms and (state_db.now_ms() - last_ms) <= 120_000
-                and _usage_has_any_quota_signal(usage)
-            )
+            fresh_for_resume = _usage_has_any_quota_signal(usage)
 
         result = evaluate_and_toggle_by_usage(ak, usage, threshold=threshold, fresh=fresh_for_resume)
         utils = result["utils"]
