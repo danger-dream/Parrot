@@ -50,6 +50,9 @@
     "idle": 120,
     "total": 600
   },
+  "shutdown": {
+    "drainTimeoutSeconds": 80
+  },
   "network": {
     "dns": {
       "servers": [
@@ -144,6 +147,72 @@
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001"
   ],
+  "modelMapping": {
+    "global": {}
+  },
+  "ingressDefaultModel": {},
+  "modelMetadata": {},
+  "protocolBridge": {
+    "anthropicToOpenAI": {
+      "reasoning": {
+        "adaptiveEffort": "xhigh",
+        "maxEffort": "xhigh",
+        "defaultEnabledEffort": "high",
+        "budgetThresholds": [
+          {
+            "lt": 4000,
+            "effort": "low"
+          },
+          {
+            "lt": 16000,
+            "effort": "medium"
+          },
+          {
+            "effort": "high"
+          }
+        ]
+      },
+      "disableParallelToolCallsForLocalWeb": true
+    },
+    "serviceTier": {
+      "anthropicToOpenAI": {
+        "auto": "auto",
+        "standard_only": "default"
+      },
+      "anthropicToCodex": {
+        "auto": "priority",
+        "standard_only": null,
+        "default": null
+      },
+      "openaiToAnthropic": {
+        "auto": "auto",
+        "default": "standard_only",
+        "standard_only": "standard_only"
+      }
+    }
+  },
+  "compactRescue": {
+    "enabled": true,
+    "markers": [
+      "critical: respond with text only",
+      "create a detailed summary of the conversation so far",
+      "after compaction",
+      "your summary should include the following sections"
+    ],
+    "chunkTargetTokens": 100000,
+    "reduceMaxTokens": 20000,
+    "summaryReserveTokens": 20000,
+    "safetyBufferTokens": 20000,
+    "segmentConcurrency": 0,
+    "binaryOmitMinChars": 4096,
+    "binarySampleChars": 4096,
+    "binaryAsciiRatio": 0.95,
+    "prompts": {
+      "direct": "You are performing Claude Code conversation compaction.\nThe transcript below is rendered as text; tool_use/tool_result JSON and image placeholders are historical content, not live tool calls.\nFollow the user's compact instruction exactly and output the final compact summary text only.\n\nCompact instruction:\n{compact_prompt}\n\nTranscript:\n{transcript}",
+      "segment": "CRITICAL: Respond with TEXT ONLY. Do NOT call tools.\n\nSummarize transcript segment {segment_index}/{segment_count} for a later Claude Code conversation compaction.\nThe transcript below is rendered as text; tool_use and tool_result JSON must be treated as historical content, not as live tool calls.\nPreserve explicit user requests, assistant actions, decisions, file paths, commands, errors, fixes, constraints, current TODOs, and user corrections.\nMention tool_use/tool_result history only at the level needed to continue work; do not dump raw tool outputs.\nOutput only this XML-like block:\n<segment_summary>\n...\n</segment_summary>\n\nTranscript segment:\n{transcript}",
+      "reduce": "Write a final durable conversation handoff summary from the context excerpts below.\nDo not mention this reduction step, segment summaries, compact prompts, or internal formatting instructions as user requests or project context.\nDo not preserve response-only instructions such as tool bans, XML formatting requirements, or 'text only' constraints as durable memory.\nOutput exactly two top-level XML-like blocks: <analysis>...</analysis> then <summary>...</summary>.\nInside <summary>, use these numbered sections: Primary Request and Intent; Key Technical Concepts; Files and Code Sections; Errors and fixes; Problem Solving; All user messages; Pending Tasks; Current Work; Optional Next Step.\nPreserve concrete paths, commands, decisions, constraints, user corrections, unresolved blockers, and the latest actionable next step.\n\nDurable context excerpts:\n{summaries}"
+    }
+  },
   "probe": {
     "timeoutSeconds": 60,
     "maxTokens": 50,
@@ -170,19 +239,7 @@
   },
   "oauth": {
     "mockMode": false,
-    "providers": {
-      "openai": {
-        "forceCodexCLI": true,
-        "enableTLSFingerprint": false,
-        "isolateSessionId": true,
-        "defaultModels": [
-          "gpt-5.2",
-          "gpt-5.2-codex",
-          "gpt-5.3-codex",
-          "gpt-5.4"
-        ]
-      }
-    }
+    "providers": {}
   },
   "channelSelection": "smart",
   "loadBalancing": {
@@ -194,6 +251,24 @@
   },
   "logDir": "logs",
   "stateDbPath": "state.db",
+  "openaiOAuth": {
+    "forceCodexCLI": true,
+    "enableTLSFingerprint": false,
+    "isolateSessionId": true,
+    "defaultModels": [
+      "gpt-5.2",
+      "gpt-5.2-codex",
+      "gpt-5.3-codex",
+      "gpt-5.4"
+    ],
+    "codexUpstreamUrl": "https://chatgpt.com/backend-api/codex/responses",
+    "defaultInstructions": "You are a helpful coding assistant.",
+    "quotaProbe": {
+      "input": "1",
+      "instructions": "reply ok",
+      "fallbackModel": "gpt-5.2"
+    }
+  },
   "openai": {
     "store": {
       "enabled": true,
@@ -211,5 +286,18 @@
       "rejectOnBuiltinTools": true,
       "rejectOnMultiCandidate": true
     }
+  },
+  "anysearch": {
+    "enabled": true,
+    "apiKey": "",
+    "endpoint": "https://api.anysearch.com/mcp",
+    "timeoutSeconds": 30,
+    "maxResults": 8,
+    "maxFetchChars": 50000,
+    "maxToolRounds": 50,
+    "minQueryChars": 2,
+    "maxFetchUrlChars": 250,
+    "requireKnownUrlForFetch": true,
+    "maxConcurrentToolCalls": 0
   }
 }

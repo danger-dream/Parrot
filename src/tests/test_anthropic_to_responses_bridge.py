@@ -64,6 +64,16 @@ def test_translate_request_text_image_tools_and_history_lifting():
     assert items[4] == {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
 
 
+def test_translate_request_prefers_explicit_max_output_tokens_over_anthropic_max_tokens():
+    out = anthropic_to_responses.translate_request({
+        "messages": [],
+        "max_tokens": 20000,
+        "max_output_tokens": 128000,
+    })
+
+    assert out["max_output_tokens"] == 128000
+
+
 def test_translate_request_preserves_url_image_input():
     body = {"messages": [{"role": "user", "content": [
         {"type": "text", "text": "look"},
@@ -196,6 +206,47 @@ def test_translate_request_rejects_non_object_tool_use_input():
     assert "tool_use.input must be an object" in exc_info.value.message
 
 
+def test_protocol_bridge_default_codex_service_tier_baseline():
+    # Baseline before protocolBridge config: Codex OAuth maps fast-lane intent
+    # differently from generic OpenAI Responses.
+    assert anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "auto",
+    }, codex_oauth=True)["service_tier"] == "priority"
+    assert "service_tier" not in anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "standard_only",
+    }, codex_oauth=True)
+    assert anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "auto",
+    }, codex_oauth=False)["service_tier"] == "auto"
+    assert anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "standard_only",
+    }, codex_oauth=False)["service_tier"] == "default"
+
+
+def test_protocol_bridge_custom_codex_service_tier(monkeypatch):
+    from src.openai.transform import common as common_mod
+
+    base_cfg = common_mod.config.get()
+    custom_cfg = dict(base_cfg)
+    custom_cfg["protocolBridge"] = {
+        "serviceTier": {
+            "anthropicToOpenAI": {"auto": "auto", "standard_only": "default"},
+            "anthropicToCodex": {"auto": "flex", "standard_only": "default", "default": None},
+            "openaiToAnthropic": {"auto": "auto", "default": "standard_only", "standard_only": "standard_only"},
+        }
+    }
+    monkeypatch.setattr(common_mod.config, "get", lambda: custom_cfg)
+
+    codex = anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "auto",
+    }, codex_oauth=True)
+    assert codex["service_tier"] == "flex"
+    standard = anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "standard_only",
+    }, codex_oauth=True)
+    assert standard["service_tier"] == "default"
+
+
 def test_translate_request_maps_reasoning_effort_and_service_tier():
     out = anthropic_to_responses.translate_request({
         "messages": [{"role": "user", "content": "think"}],
@@ -309,13 +360,36 @@ def test_translate_request_allows_stream_but_guards_stateful_thinking_and_builti
         anthropic_to_responses.translate_request({"container": {"id": "c1"}, "messages": []})
     with pytest.raises(GuardError):
         anthropic_to_responses.translate_request({"mcp_servers": [{"name": "mcp"}], "messages": []})
-    with pytest.raises(GuardError):
-        anthropic_to_responses.translate_request({"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]})
+    web_search = anthropic_to_responses.translate_request({"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]})
+    assert web_search["tools"][0]["type"] == "function"
+    assert web_search["tools"][0]["name"] == "web_search"
+    assert web_search["parallel_tool_calls"] is False
+    web_fetch = anthropic_to_responses.translate_request({"messages": [], "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]})
+    assert web_fetch["tools"][0]["name"] == "web_fetch"
     stripped = anthropic_to_responses.translate_request({"messages": [], "stop_sequences": ["END"], "top_k": 5, "service_tier": "turbo"})
     assert "stop" not in stripped
     assert "stop_sequences" not in stripped
     assert "top_k" not in stripped
     assert "service_tier" not in stripped
+
+
+def test_translate_request_textualizes_tool_reference_tool_results():
+    body = {"messages": [{"role": "user", "content": [{
+        "type": "tool_result",
+        "tool_use_id": "call_refs",
+        "content": [
+            {"type": "tool_reference", "tool_name": "WebSearch"},
+            {"type": "tool_reference", "tool_name": "WebFetch"},
+        ],
+    }]}]}
+
+    out = anthropic_to_responses.translate_request(body)
+
+    assert out["input"] == [{
+        "type": "function_call_output",
+        "call_id": "call_refs",
+        "output": "Tool reference: WebSearch\nTool reference: WebFetch",
+    }]
 
 
 def test_translate_response_to_anthropic_message():
@@ -520,3 +594,72 @@ def test_failover_non_stream_translator_returns_anthropic_message():
     assert out["role"] == "assistant"
     assert out["content"] == [{"type": "text", "text": "ok"}]
     assert out["stop_reason"] == "end_turn"
+
+
+def test_translate_response_drops_optional_empty_string_tool_args_by_schema():
+    request_body = {
+        "tools": [{
+            "name": "GenericTool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "optional_note": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        }],
+    }
+    resp = {
+        "id": "resp_1",
+        "status": "completed",
+        "model": "gpt-real",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "GenericTool",
+            "arguments": '{"query":"x","optional_note":""}',
+        }],
+        "usage": {},
+    }
+
+    out = anthropic_to_responses.translate_response(resp, model="alias-model", request_body=request_body)
+
+    assert out["content"] == [{
+        "type": "tool_use",
+        "id": "call_1",
+        "name": "GenericTool",
+        "input": {"query": "x"},
+    }]
+
+
+def test_translate_response_preserves_required_empty_and_nonempty_optional_tool_args():
+    request_body = {
+        "tools": [{
+            "name": "GenericTool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "required_note": {"type": "string"},
+                    "optional_note": {"type": "string"},
+                },
+                "required": ["required_note"],
+            },
+        }],
+    }
+    resp = {
+        "id": "resp_1",
+        "status": "completed",
+        "model": "gpt-real",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "GenericTool",
+            "arguments": '{"required_note":"","optional_note":"1-5"}',
+        }],
+        "usage": {},
+    }
+
+    out = anthropic_to_responses.translate_response(resp, model="alias-model", request_body=request_body)
+
+    assert out["content"][0]["input"] == {"required_note": "", "optional_note": "1-5"}

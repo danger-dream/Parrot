@@ -390,7 +390,7 @@ def test_channel_basic(m):
 
 
 def test_channel_default_models_fallback(m):
-    """账户不设 models → Channel 回落到 config.oauth.providers.openai.defaultModels"""
+    """账户不设 models → Channel 回落到 config.openaiOAuth.defaultModels"""
     _setup(m)
     # 直接调 add_account（不走 _add_openai_acc helper，后者会塞硬编码的 models）
     m["oauth_manager"].add_account({
@@ -411,7 +411,7 @@ def test_channel_default_models_fallback(m):
     # 不在默认列表的别名不会命中（需用户手动补 models）
     assert ch.supports_model("gpt-5") is None
     assert ch.supports_model("gpt-5.1") is None
-    print("  [PASS] channel: default models from config.providers.openai.defaultModels")
+    print("  [PASS] channel: default models from openaiOAuth.defaultModels")
 
 
 def test_channel_responses_ingress(m):
@@ -618,6 +618,62 @@ def test_channel_anthropic_ingress_translator(m):
     print("  [PASS] channel: anthropic ingress → codex responses translator_ctx")
 
 
+def test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {
+        "model": "gpt-5.1",
+        "system": [{"type": "text", "text": "stable root system"}],
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "system", "content": "dynamic reminder should stay in tail"},
+            {"role": "user", "content": "continue"},
+        ],
+        "metadata": {"user_id": '{"session_id":"session-abc"}'},
+        "_parrot_api_key_name": "cc-switch",
+        "_parrot_client_ip": "203.0.113.8",
+    }
+
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
+    payload = json.loads(req.body)
+
+    assert payload["instructions"] == "stable root system"
+    roles = [item.get("role") for item in payload["input"] if item.get("type") == "message"]
+    assert roles == ["user", "developer", "user"]
+    assert any(
+        item.get("role") == "developer" and item.get("content") == [{"type": "input_text", "text": "dynamic reminder should stay in tail"}]
+        for item in payload["input"]
+    )
+    print("  [PASS] channel: Anthropic history system stays as developer tail on Codex route")
+
+
+def test_channel_anthropic_ingress_maps_cache_to_prompt_cache_and_session(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {
+        "model": "gpt-5.1",
+        "system": [{"type": "text", "text": "stable system", "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"user_id": '{"device_id":"dev-1","session_id":"session-abc"}'},
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        "_parrot_api_key_name": "cc-switch",
+        "_parrot_client_ip": "203.0.113.8",
+    }
+
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
+    payload = json.loads(req.body)
+
+    assert payload["prompt_cache_key"].startswith("parrot:cache:v1:a2o-session:")
+    assert "prompt_cache_retention" not in payload  # Codex endpoint rejects retention; transform strips it.
+    assert "metadata" not in payload               # stripped only after deriving the cache/session key.
+    sid = req.headers.get("session_id")
+    assert sid and len(sid) == 16 and all(ch_ in "0123456789abcdef" for ch_ in sid)
+    assert "conversation_id" not in req.headers
+    print("  [PASS] channel: anthropic ingress maps cache_control/session to Codex prompt_cache_key + session_id")
+
+
 def test_channel_anthropic_ingress_metadata_session_replay(m):
     _setup(m)
     _add_openai_acc(m)
@@ -734,8 +790,7 @@ def test_session_id_isolation_disabled(m):
     _setup(m)
     _add_openai_acc(m)
     def _off(c):
-        c.setdefault("oauth", {}).setdefault("providers", {}).setdefault(
-            "openai", {})["isolateSessionId"] = False
+        c.setdefault("openaiOAuth", {})["isolateSessionId"] = False
     m["config"].update(_off)
 
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
@@ -749,7 +804,7 @@ def test_session_id_isolation_disabled(m):
 
     # 恢复默认
     def _on(c):
-        c["oauth"]["providers"]["openai"]["isolateSessionId"] = True
+        c.setdefault("openaiOAuth", {})["isolateSessionId"] = True
     m["config"].update(_on)
     print("  [PASS] session_id: isolateSessionId=false disables header injection")
 
@@ -767,17 +822,70 @@ def test_force_codex_cli_switch(m):
 
     # 关掉
     def _off(c):
-        c.setdefault("oauth", {}).setdefault("providers", {}).setdefault(
-            "openai", {})["forceCodexCLI"] = False
+        c.setdefault("openaiOAuth", {})["forceCodexCLI"] = False
     m["config"].update(_off)
     req2 = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
     assert "user-agent" not in req2.headers
 
     # 恢复
     def _on(c):
-        c["oauth"]["providers"]["openai"]["forceCodexCLI"] = True
+        c.setdefault("openaiOAuth", {})["forceCodexCLI"] = True
     m["config"].update(_on)
     print("  [PASS] forceCodexCLI switch: True injects UA, False omits it")
+
+
+def test_openai_oauth_legacy_provider_runtime_fallback_when_short_config_default(m):
+    _setup(m)
+    _add_openai_acc(m)
+    def _legacy(c):
+        c.setdefault("oauth", {}).setdefault("providers", {})["openai"] = {"forceCodexCLI": False}
+        c["openaiOAuth"] = dict(m["config"].DEFAULT_CONFIG["openaiOAuth"])
+    m["config"].update(_legacy)
+
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    req = asyncio.run(ch.build_upstream_request({"model": "gpt-5.1", "input": "hi"}, "gpt-5.1", ingress_protocol="responses"))
+    assert "user-agent" not in req.headers
+    print("  [PASS] legacy oauth.providers.openai still works when openaiOAuth is default")
+
+
+def test_openai_oauth_short_config_overrides_codex_url_and_default_instructions(m):
+    _setup(m)
+    _add_openai_acc(m)
+    def _custom(c):
+        c.setdefault("openaiOAuth", {})["codexUpstreamUrl"] = "https://example.test/backend-api/codex/responses"
+        c.setdefault("openaiOAuth", {})["defaultInstructions"] = "Custom default instructions."
+        c.setdefault("openaiOAuth", {})["forceCodexCLI"] = False
+    m["config"].update(_custom)
+
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    req = asyncio.run(ch.build_upstream_request({"model": "gpt-5.1", "input": "hi"}, "gpt-5.1", ingress_protocol="responses"))
+    payload = json.loads(req.body)
+    assert req.url == "https://example.test/backend-api/codex/responses"
+    assert payload["instructions"] == "Custom default instructions."
+    assert "user-agent" not in req.headers
+    print("  [PASS] openaiOAuth short config overrides Codex URL/instructions/UA")
+
+
+def test_config_backfills_openai_oauth_from_legacy_provider(m):
+    raw = {
+        "oauth": {
+            "providers": {
+                "openai": {
+                    "forceCodexCLI": False,
+                    "isolateSessionId": False,
+                    "defaultModels": ["legacy-model"],
+                }
+            }
+        }
+    }
+    merged = m["config"]._deep_merge_defaults(m["config"].DEFAULT_CONFIG, raw)
+    changed = m["config"]._normalize_openai_oauth_config(merged, raw)
+    assert changed is True
+    assert merged["openaiOAuth"]["forceCodexCLI"] is False
+    assert merged["openaiOAuth"]["isolateSessionId"] is False
+    assert merged["openaiOAuth"]["defaultModels"] == ["legacy-model"]
+    assert merged["openaiOAuth"]["codexUpstreamUrl"].startswith("https://chatgpt.com/")
+    print("  [PASS] config: legacy oauth.providers.openai backfills openaiOAuth")
 
 
 def test_registry_legacy_account_defaults_to_claude(m):
@@ -820,15 +928,24 @@ def main():
         test_channel_basic,
         test_channel_default_models_fallback,
         test_channel_responses_ingress,
+        test_channel_responses_ingress_replay_scope_and_injection,
         test_channel_chat_ingress_translator,
         test_channel_previous_response_id_rejected,
-        test_channel_anthropic_ingress_rejected,
+        test_channel_codex_rejects_unsupported_responses_server_state,
+        test_channel_codex_rejects_translated_chat_file_id,
+        test_channel_anthropic_ingress_translator,
+        test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache,
+        test_channel_anthropic_ingress_maps_cache_to_prompt_cache_and_session,
+        test_channel_anthropic_ingress_metadata_session_replay,
         test_channel_missing_chatgpt_account_id_legacy_keeps_working,
         test_registry_dispatches_by_provider,
         test_openai_oauth_channel_max_concurrent,
         test_session_id_isolation_with_prompt_cache_key,
         test_session_id_isolation_disabled,
         test_force_codex_cli_switch,
+        test_openai_oauth_legacy_provider_runtime_fallback_when_short_config_default,
+        test_openai_oauth_short_config_overrides_codex_url_and_default_instructions,
+        test_config_backfills_openai_oauth_from_legacy_provider,
         test_registry_legacy_account_defaults_to_claude,
     ]
 

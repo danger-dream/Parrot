@@ -14,6 +14,7 @@ from typing import Any
 
 from . import common
 from .guard import GuardError
+from ... import local_web_tools
 from ...protocols.usage import legacy_usage_from_openai_chat_json
 
 
@@ -53,7 +54,7 @@ def _tool_result_unsupported_label(block: dict[str, Any]) -> str | None:
         return None
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if isinstance(item, dict) and item.get("type") in ("text", "tool_reference"):
                 continue
             if isinstance(item, dict):
                 return f"tool_result:{item.get('type') or 'object'}"
@@ -114,10 +115,10 @@ def guard_request(body: dict) -> None:
     for tool in body.get("tools") or []:
         if not isinstance(tool, dict):
             _fail("tools must contain objects", param="tools")
-        # Anthropic function tools normally omit type. Server/built-in tools
-        # carry a concrete type (for example web_search_20250305) and cannot be
-        # represented as OpenAI function tools without changing semantics.
-        if tool.get("type") not in (None, "function"):
+        # Anthropic function tools normally omit type. Web search/fetch server
+        # tools are emulated by Parrot as local function tools backed by
+        # AnySearch when routing to OpenAI-family upstreams.
+        if tool.get("type") not in (None, "function") and not local_web_tools.is_anthropic_web_tool_type(tool.get("type")):
             _fail("Anthropic built-in/server tools are not supported on Chat bridge yet", param="tools")
 
 
@@ -136,7 +137,10 @@ def _tool_result_text(block: dict[str, Any]) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
-            parts.append(str(item.get("text") or ""))
+            if isinstance(item, dict) and item.get("type") == "tool_reference":
+                parts.append(local_web_tools.tool_reference_text(item))
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text") or ""))
         return "\n".join(p for p in parts if p)
     return json.dumps(content, ensure_ascii=False, separators=(",", ":")) if content is not None else ""
 
@@ -284,11 +288,62 @@ def _convert_messages(messages: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _web_tool_schema(kind: str) -> dict[str, Any]:
+    if kind == "search":
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query", "minLength": 2},
+                "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                "blocked_domains": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "HTTP(S) URL to fetch"},
+            "prompt": {"type": "string", "description": "Optional instruction for how to use the fetched content"},
+        },
+        "required": ["url"],
+        "additionalProperties": False,
+    }
+
+
+def _server_tool_to_chat(tool: dict[str, Any]) -> dict[str, Any] | None:
+    typ = tool.get("type")
+    name = str(tool.get("name") or "")
+    if typ in local_web_tools.ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
+        return {
+            "type": "function",
+            "function": {
+                "name": name or "web_search",
+                "description": "Search the web. Executed locally by Parrot through AnySearch when needed.",
+                "parameters": _web_tool_schema("search"),
+            },
+        }
+    if typ in local_web_tools.ANTHROPIC_WEB_FETCH_TOOL_TYPES:
+        return {
+            "type": "function",
+            "function": {
+                "name": name or "web_fetch",
+                "description": "Fetch a URL and return extracted page content. Executed locally by Parrot through AnySearch when needed.",
+                "parameters": _web_tool_schema("fetch"),
+            },
+        }
+    return None
+
+
 def _convert_tools(tools: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for tool in tools or []:
         if not isinstance(tool, dict):
             _fail("tools must contain objects", param="tools")
+        server_tool = _server_tool_to_chat(tool)
+        if server_tool is not None:
+            out.append(server_tool)
+            continue
         out.append({
             "type": "function",
             "function": {
@@ -326,7 +381,9 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
         "messages": _convert_system(body.get("system")) + _convert_messages(body.get("messages") or []),
         "stream": bool(body.get("stream")),
     }
-    if body.get("max_tokens") is not None:
+    if body.get("max_output_tokens") is not None:
+        payload["max_tokens"] = body.get("max_output_tokens")
+    elif body.get("max_tokens") is not None:
         payload["max_tokens"] = body.get("max_tokens")
     if body.get("stop_sequences"):
         stop = body.get("stop_sequences")
@@ -352,7 +409,13 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
     tool_choice = _convert_tool_choice(body.get("tool_choice"))
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
-    if _disable_parallel_tool_calls(body.get("tool_choice")):
+    if _disable_parallel_tool_calls(body.get("tool_choice")) or (
+        common.disable_parallel_tool_calls_for_local_web()
+        and local_web_tools.request_declares_supported_tools(body)
+    ):
+        # Local web tools are executed inside Parrot.  Disable parallel tool
+        # calls so the upstream model does not mix Parrot-handled WebSearch /
+        # WebFetch calls with client-handled Claude Code tools in one turn.
         payload["parallel_tool_calls"] = False
     return payload
 

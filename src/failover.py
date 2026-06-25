@@ -23,8 +23,9 @@ from websockets.exceptions import InvalidStatus
 import threading
 
 from . import (
-    affinity, blacklist, concurrency, config, cooldown, errors, fingerprint,
-    log_db, notifier, oauth_manager, scorer, state_db, upstream,
+    affinity, blacklist, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
+    local_web_tools, log_db, model_metadata, notifier, oauth_manager, scorer, state_db,
+    token_counter, upstream,
 )
 from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -487,12 +488,25 @@ def _apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> di
     return apply_non_stream_response_translator(obj, translator_ctx)
 
 
-def _sse_error_for_ingress(ingress: str, anth_err_type: str, message: str) -> bytes:
-    return sse_error_for_ingress(ingress, anth_err_type, message)
+def _sse_error_for_ingress(
+    ingress: str,
+    anth_err_type: str,
+    message: str,
+    *,
+    code: Optional[str] = None,
+) -> bytes:
+    return sse_error_for_ingress(ingress, anth_err_type, message, code=code)
 
 
-def _json_error_for_ingress(ingress: str, status: int, anth_err_type: str, message: str):
-    return json_error_for_ingress(ingress, status, anth_err_type, message)
+def _json_error_for_ingress(
+    ingress: str,
+    status: int,
+    anth_err_type: str,
+    message: str,
+    *,
+    code: Optional[str] = None,
+):
+    return json_error_for_ingress(ingress, status, anth_err_type, message, code=code)
 
 
 def _should_cooldown(outcome: str) -> bool:
@@ -605,6 +619,377 @@ def _pick_upstream_headers(resp: httpx.Response) -> dict:
     return metadata_from_response(resp).forward_headers()
 
 
+def _response_body_text(response: Response) -> str | None:
+    body = getattr(response, "body", None)
+    if isinstance(body, str):
+        return body
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body).decode("utf-8", errors="replace")
+    return None
+
+
+def _anthropic_json_from_response(response: Response) -> tuple[dict | None, str | None]:
+    raw = _response_body_text(response) or ""
+    if not raw:
+        return None, "empty compact rescue response"
+    try:
+        obj = json.loads(raw)
+    except Exception as exc:
+        return None, f"invalid compact rescue response json: {exc}"
+    if isinstance(obj, dict) and obj.get("type") == "error":
+        err = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+        msg = err.get("message") if isinstance(err, dict) else None
+        return None, str(msg or "compact rescue upstream error")
+    if not isinstance(obj, dict):
+        return None, "compact rescue response is not an object"
+    return obj, None
+
+
+def _compact_response_log_fields(response: Response, fallback_model: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "final_model": fallback_model,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+    }
+    raw = _response_body_text(response)
+    if not raw:
+        return fields
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return fields
+    if not isinstance(obj, dict):
+        return fields
+    model = str(obj.get("model") or "").strip()
+    if model:
+        fields["final_model"] = model
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+    fields["input_tokens"] = int(usage.get("input_tokens") or 0)
+    fields["output_tokens"] = int(usage.get("output_tokens") or 0)
+    fields["cache_creation_tokens"] = int(
+        usage.get("cache_creation_input_tokens")
+        or usage.get("cache_creation_tokens")
+        or 0
+    )
+    fields["cache_read_tokens"] = int(
+        usage.get("cache_read_input_tokens")
+        or usage.get("cache_read_tokens")
+        or 0
+    )
+    return fields
+
+
+async def _finish_compact_success(
+    request_id: str,
+    body: dict,
+    response: Response,
+    start_time: float,
+    *,
+    retry_count: int,
+    affinity_hit: int,
+) -> None:
+    total_ms = int((time.time() - start_time) * 1000)
+    raw_body = _response_body_text(response)
+    fields = _compact_response_log_fields(
+        response,
+        fallback_model=str(body.get("model") or "compact"),
+    )
+    await asyncio.to_thread(
+        log_db.finish_success,
+        request_id,
+        "compact-rescue",
+        "internal",
+        fields["final_model"],
+        input_tokens=fields["input_tokens"],
+        output_tokens=fields["output_tokens"],
+        cache_creation_tokens=fields["cache_creation_tokens"],
+        cache_read_tokens=fields["cache_read_tokens"],
+        total_ms=total_ms,
+        retry_count=max(0, retry_count),
+        affinity_hit=affinity_hit,
+        response_body=raw_body,
+        upstream_protocol="compact-rescue",
+    )
+
+
+async def _run_compact_direct_rescue_with_compression_model(
+    body: dict,
+    request_id: str,
+    api_key_name: Optional[str],
+    client_ip: str,
+    *,
+    ingress_protocol: str,
+) -> tuple[Response | None, str | None]:
+    """Try Claude Code compact with the configured large compression model.
+
+    This is the fast path before map-reduce: if the configured compression
+    model's metadata says it can fit the entire compact request plus summary
+    reserve and buffer, call it directly.  Any failure returns (None, reason) so
+    callers can fall back to segmented map-reduce.
+    """
+    compression_model = model_metadata.get_compression_model()
+    if not compression_model:
+        return None, "no compression model configured"
+
+    direct_body = compact_rescue.build_direct_summary_body(
+        body,
+        model=compression_model,
+        max_tokens=model_metadata.summary_reserve_tokens(compression_model),
+    )
+
+    prompt_tokens = token_counter.count_request_tokens(direct_body, model=compression_model)
+    if not model_metadata.can_fit_for_compact(compression_model, prompt_tokens):
+        required = model_metadata.required_context_for_compact(prompt_tokens, compression_model)
+        window = model_metadata.context_window(compression_model)
+        return (
+            None,
+            f"compression model {compression_model} context not enough: "
+            f"required={required} window={window}",
+        )
+
+    from . import scheduler as scheduler_mod
+
+    route = scheduler_mod.schedule(
+        direct_body,
+        api_key_name=api_key_name or "",
+        client_ip=client_ip,
+        ingress_protocol=ingress_protocol,
+    )
+    if not route:
+        return None, f"compression model {compression_model} has no available route"
+
+    print(
+        f"[compact-rescue] direct compression request={request_id} "
+        f"model={compression_model} prompt_tokens≈{prompt_tokens}"
+    )
+    response = await run_failover(
+        route,
+        direct_body,
+        f"{request_id}:compact:direct",
+        api_key_name,
+        client_ip,
+        False,
+        time.time(),
+        ingress_protocol=ingress_protocol,
+    )
+    obj, err = _anthropic_json_from_response(response)
+    if err or obj is None:
+        return None, f"compression model failed: {err}"
+    text = compact_rescue.extract_anthropic_message_text(obj).strip()
+    if not text:
+        return None, "compression model produced empty summary"
+    print(
+        f"[compact-rescue] direct compression succeeded request={request_id} "
+        f"summary_chars={len(text)}"
+    )
+    return response, None
+
+
+def _schedule_compact_compression_model_for_map_reduce(
+    body: dict,
+    api_key_name: Optional[str],
+    client_ip: str,
+    *,
+    ingress_protocol: str,
+) -> tuple[str | None, ScheduleResult | None, str | None]:
+    """Return a route for compact segment/reduce calls using compressionModel.
+
+    Even when the full compact prompt cannot fit the compression model for a
+    single direct call, the configured compression model should still own the
+    segmented map-reduce work.  Only fall back to the original model route when
+    no compression model or no route is available.
+    """
+    compression_model = model_metadata.get_compression_model()
+    if not compression_model:
+        return None, None, "no compression model configured"
+
+    from . import scheduler as scheduler_mod
+
+    probe_body, _meta = compact_rescue.sanitized_compact_base(body)
+    probe_body["stream"] = False
+    probe_body["model"] = compression_model
+    probe_body["max_tokens"] = compact_rescue.reduce_max_tokens()
+    probe_body.pop("max_output_tokens", None)
+    route = scheduler_mod.schedule(
+        probe_body,
+        api_key_name=api_key_name or "",
+        client_ip=client_ip,
+        ingress_protocol=ingress_protocol,
+    )
+    if not route:
+        return compression_model, None, f"compression model {compression_model} has no available route"
+    return compression_model, route, None
+
+
+async def _run_compact_map_reduce_rescue(
+    schedule_result: ScheduleResult,
+    body: dict,
+    request_id: str,
+    api_key_name: Optional[str],
+    client_ip: str,
+    is_stream: bool,
+    start_time: float,
+    *,
+    ingress_protocol: str,
+    affinity_hit: int,
+) -> Response:
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    direct_response, direct_skip_reason = await _run_compact_direct_rescue_with_compression_model(
+        body,
+        request_id,
+        api_key_name,
+        client_ip,
+        ingress_protocol=ingress_protocol,
+    )
+    if direct_response is not None:
+        await _finish_compact_success(
+            request_id,
+            body,
+            direct_response,
+            start_time,
+            retry_count=0,
+            affinity_hit=affinity_hit,
+        )
+        if is_stream:
+            return local_web_tools.maybe_wrap_anthropic_json_response_as_sse(direct_response)
+        return direct_response
+    if direct_skip_reason:
+        print(f"[compact-rescue] direct compression skipped request={request_id}: {direct_skip_reason}")
+
+    map_reduce_model, map_reduce_route, map_reduce_skip_reason = _schedule_compact_compression_model_for_map_reduce(
+        body,
+        api_key_name,
+        client_ip,
+        ingress_protocol=ingress_protocol,
+    )
+    if map_reduce_route is not None and map_reduce_model:
+        print(
+            f"[compact-rescue] map-reduce using compression model request={request_id} "
+            f"model={map_reduce_model}"
+        )
+    elif map_reduce_skip_reason:
+        print(f"[compact-rescue] map-reduce compression model skipped request={request_id}: {map_reduce_skip_reason}")
+    active_schedule_result = map_reduce_route or schedule_result
+    active_model = map_reduce_model if map_reduce_route is not None else str(body.get("model") or "")
+
+    chunks = compact_rescue.split_messages_for_compact(
+        messages,
+        model=active_model,
+    )
+    print(
+        f"[compact-rescue] map-reduce request={request_id} "
+        f"messages={len(messages)} chunks={len(chunks)} "
+        f"target_tokens={compact_rescue.chunk_target_tokens()} "
+        f"model={active_model or body.get('model')}"
+    )
+    try:
+        async def run_segment(idx: int, chunk: list[Any]) -> str:
+            chunk_body = compact_rescue.build_segment_summary_body(
+                body,
+                chunk,
+                segment_index=idx,
+                segment_count=len(chunks),
+            )
+            if map_reduce_route is not None and map_reduce_model:
+                chunk_body["model"] = map_reduce_model
+            sub_id = f"{request_id}:compact:{idx}"
+            response = await run_failover(
+                active_schedule_result,
+                chunk_body,
+                sub_id,
+                api_key_name,
+                client_ip,
+                False,
+                time.time(),
+                ingress_protocol=ingress_protocol,
+            )
+            obj, err = _anthropic_json_from_response(response)
+            if err or obj is None:
+                raise RuntimeError(f"segment {idx}/{len(chunks)} failed: {err}")
+            text = compact_rescue.extract_anthropic_message_text(obj).strip()
+            if not text:
+                raise RuntimeError(f"segment {idx}/{len(chunks)} produced empty summary")
+            print(f"[compact-rescue] segment {idx}/{len(chunks)} summary chars={len(text)}")
+            return text
+
+        concurrency = compact_rescue.segment_concurrency()
+        print(
+            f"[compact-rescue] running {len(chunks)} segment summaries in parallel "
+            f"concurrency={'unlimited' if concurrency <= 0 else concurrency}"
+        )
+        if concurrency > 0:
+            sem = asyncio.Semaphore(concurrency)
+
+            async def run_segment_limited(idx: int, chunk: list[Any]) -> str:
+                async with sem:
+                    return await run_segment(idx, chunk)
+
+            segment_results = await asyncio.gather(
+                *(run_segment_limited(idx, chunk) for idx, chunk in enumerate(chunks, start=1)),
+                return_exceptions=True,
+            )
+        else:
+            segment_results = await asyncio.gather(
+                *(run_segment(idx, chunk) for idx, chunk in enumerate(chunks, start=1)),
+                return_exceptions=True,
+            )
+        summaries: list[str] = []
+        for idx, result in enumerate(segment_results, start=1):
+            if isinstance(result, Exception):
+                raise RuntimeError(f"segment {idx}/{len(chunks)} failed: {result}")
+            summaries.append(result)
+
+        reduce_body = compact_rescue.build_reduce_summary_body(body, summaries)
+        if map_reduce_route is not None and map_reduce_model:
+            reduce_body["model"] = map_reduce_model
+        final_response = await run_failover(
+            active_schedule_result,
+            reduce_body,
+            f"{request_id}:compact:reduce",
+            api_key_name,
+            client_ip,
+            False,
+            time.time(),
+            ingress_protocol=ingress_protocol,
+        )
+        obj, err = _anthropic_json_from_response(final_response)
+        if err or obj is None:
+            raise RuntimeError(f"reduce failed: {err}")
+        text = compact_rescue.extract_anthropic_message_text(obj).strip()
+        if not text:
+            raise RuntimeError("reduce produced empty summary")
+        await _finish_compact_success(
+            request_id,
+            body,
+            final_response,
+            start_time,
+            retry_count=len(chunks),
+            affinity_hit=affinity_hit,
+        )
+        if is_stream:
+            return local_web_tools.maybe_wrap_anthropic_json_response_as_sse(final_response)
+        return final_response
+    except Exception as exc:
+        msg = f"compact rescue failed: {exc}"
+        total_ms = int((time.time() - start_time) * 1000)
+        await asyncio.to_thread(
+            log_db.finish_error,
+            request_id,
+            msg[:4000],
+            0,
+            final_channel_key="compact-rescue",
+            final_channel_type="internal",
+            final_model=str(body.get("model") or "compact"),
+            total_ms=total_ms,
+            http_status=500,
+            affinity_hit=affinity_hit,
+            upstream_protocol="compact-rescue",
+        )
+        return _json_error_for_ingress(ingress_protocol, 500, errors.ErrType.API, msg)
+
+
 # ─── 主入口 ───────────────────────────────────────────────────────
 
 async def run_failover(
@@ -634,6 +1019,69 @@ async def run_failover(
     timeouts = cfg.get("timeouts") or {}
     total_timeout = int(timeouts.get("total", 600))
     deadline_ts = start_time + total_timeout
+
+    if ingress_protocol == "anthropic" and compact_rescue.is_claude_code_compact_request(body):
+        try:
+            log_db.update_pending(
+                request_id,
+                msg_count=len(body.get("messages") or []),
+                tool_count=0,
+                reasoning_effort=None,
+            )
+        except Exception:
+            pass
+        if is_stream:
+            task = asyncio.create_task(_run_compact_map_reduce_rescue(
+                schedule_result,
+                body,
+                request_id,
+                api_key_name,
+                client_ip,
+                False,
+                start_time,
+                ingress_protocol=ingress_protocol,
+                affinity_hit=affinity_hit,
+            ))
+            return local_web_tools.stream_anthropic_response_task_with_pings(task)
+        return await _run_compact_map_reduce_rescue(
+            schedule_result,
+            body,
+            request_id,
+            api_key_name,
+            client_ip,
+            False,
+            start_time,
+            ingress_protocol=ingress_protocol,
+            affinity_hit=affinity_hit,
+        )
+
+    # Anthropic web_search/web_fetch server tools cannot be executed by
+    # OpenAI-family upstreams.  When such tools are declared, Parrot runs a
+    # small non-streaming tool loop locally (AnySearch-backed) and converts the
+    # final answer back to SSE if the client requested streaming.
+    local_web_loop_active = (
+        ingress_protocol == "anthropic"
+        and local_web_tools.request_declares_supported_tools(body)
+        and local_web_tools.max_tool_rounds() > 0
+    )
+    if local_web_loop_active and is_stream:
+        inner_body = dict(body)
+        inner_body["stream"] = False
+        task = asyncio.create_task(run_failover(
+            schedule_result,
+            inner_body,
+            request_id,
+            api_key_name,
+            client_ip,
+            False,
+            start_time,
+            ingress_protocol=ingress_protocol,
+        ))
+        return local_web_tools.stream_anthropic_response_task_with_pings(task)
+
+    downstream_stream_requested = bool(is_stream)
+    local_web_rounds = 0
+    local_web_limit_reported = False
 
     retry_count = 0
     refreshed_once: set[str] = set()
@@ -687,17 +1135,23 @@ async def run_failover(
             concurrency.release(_key)
 
         try:
+            candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
+            effective_is_stream = is_stream and not candidate_local_web_loop
+            attempt_body = body
+            if candidate_local_web_loop and body.get("stream"):
+                attempt_body = dict(body)
+                attempt_body["stream"] = False
             if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
                 result = await _try_openai_oauth_responses_ws_channel(
-                    ch, resolved_model, body, is_stream, deadline_ts, start_time,
-                    fp_query, body.get("messages") or [], api_key_name, client_ip,
+                    ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
+                    fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
                     request_id, retry_count, affinity_hit, client_key=client_key,
                     retry_attempt_id=attempt_id,
                 )
             else:
                 result = await _try_channel(
-                    ch, resolved_model, body, is_stream, deadline_ts, start_time,
-                    fp_query, body.get("messages") or [], api_key_name, client_ip,
+                    ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
+                    fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
                     request_id, retry_count, affinity_hit,
                     ingress_protocol=ingress_protocol,
                     client_key=client_key,
@@ -721,10 +1175,76 @@ async def run_failover(
             bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
         )
 
+        if result.success and candidate_local_web_loop:
+            assistant_msg = result.assistant_response if isinstance(result.assistant_response, dict) else None
+            assistant_msg = local_web_tools.normalize_assistant_message_for_local_tools(assistant_msg)
+            local_calls = local_web_tools.extract_local_tool_calls(
+                assistant_msg,
+                body.get("tools") or [],
+                conversation_body=body,
+            )
+            tool_use_total = local_web_tools.tool_use_count(assistant_msg)
+            if local_calls and len(local_calls) == tool_use_total:
+                max_rounds = local_web_tools.max_tool_rounds()
+                if local_web_rounds >= max_rounds:
+                    if local_web_limit_reported:
+                        _release_once()
+                        msg = "local web tool loop kept requesting WebSearch/WebFetch after maxToolRounds"
+                        total_ms = int((time.time() - start_time) * 1000)
+                        await asyncio.to_thread(
+                            log_db.finish_error, request_id, msg, retry_count,
+                            final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+                            connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms, total_ms=total_ms,
+                            http_status=400, affinity_hit=affinity_hit,
+                            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                            proxy_name=result.proxy_name,
+                            proxy_bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+                            proxy_bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+                        )
+                        return _json_error_for_ingress(ingress_protocol, 400, errors.ErrType.INVALID_REQUEST, msg)
+
+                    local_web_limit_reported = True
+                    removed = local_web_tools.remove_supported_tools_from_body(body)
+                    log_db.update_retry_attempt(
+                        attempt_id,
+                        outcome="local_web_tool_limit",
+                        error_detail=(
+                            f"maxToolRounds={max_rounds}; appended synthetic tool_result(s) "
+                            f"for {len(local_calls)} call(s); removed_tools={removed}"
+                        ),
+                    )
+                    print(
+                        f"[local-web-tools] maxToolRounds reached for request {request_id}; "
+                        f"appending limit tool_result(s), removed_tools={removed}"
+                    )
+                    _release_once()
+                    tool_results = local_web_tools.round_limit_results(local_calls, max_rounds)
+                    local_web_tools.append_tool_results_to_body(body, assistant_msg or {}, tool_results)
+                    continue
+
+                local_web_rounds += 1
+                log_db.update_retry_attempt(
+                    attempt_id,
+                    outcome="local_web_tool_round",
+                    error_detail=f"executed {len(local_calls)} local web tool call(s), round={local_web_rounds}",
+                )
+                print(
+                    f"[local-web-tools] executing {len(local_calls)} call(s) "
+                    f"for request {request_id} round={local_web_rounds}"
+                )
+                _release_once()
+                tool_results = await local_web_tools.execute_local_tool_calls(
+                    local_calls, request_id=request_id, round_no=local_web_rounds
+                )
+                local_web_tools.append_tool_results_to_body(body, assistant_msg or {}, tool_results)
+                continue
+
         if result.success or result.stream_started:
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             # 并发 slot release 挂到响应体 finally：stream 消费完 / 客户端断开都会释放
+            if result.success and candidate_local_web_loop and downstream_stream_requested:
+                result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
             _attach_release_to_response(result.response, _release_once)
             return result.response
         # 非成功：立即释放 slot，进入下一候选
@@ -776,7 +1296,15 @@ async def run_failover(
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
             )
             return _json_error_for_ingress(
-                ingress_protocol, status, protocol_errors.legacy_anthropic_error_type_for_http_status(status), msg
+                ingress_protocol,
+                status,
+                protocol_errors.legacy_anthropic_error_type_for_http_status(status),
+                msg,
+                code=(
+                    protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                    if _is_context_length_exceeded_error(msg)
+                    else None
+                ),
             )
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
@@ -883,17 +1411,23 @@ async def run_failover(
                     release_done2 = True
                     concurrency.release(_key)
                 try:
+                    candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
+                    effective_is_stream = is_stream and not candidate_local_web_loop
+                    attempt_body = body
+                    if candidate_local_web_loop and body.get("stream"):
+                        attempt_body = dict(body)
+                        attempt_body["stream"] = False
                     if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
                         result = await _try_openai_oauth_responses_ws_channel(
-                            ch, resolved_model, body, is_stream, deadline_ts, start_time,
-                            fp_query, body.get("messages") or [], api_key_name, client_ip,
+                            ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
+                            fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
                             request_id, retry_count, affinity_hit, client_key=client_key,
                             retry_attempt_id=attempt_id,
                         )
                     else:
                         result = await _try_channel(
-                            ch, resolved_model, body, is_stream, deadline_ts, start_time,
-                            fp_query, body.get("messages") or [], api_key_name, client_ip,
+                            ch, resolved_model, attempt_body, effective_is_stream, deadline_ts, start_time,
+                            fp_query, attempt_body.get("messages") or [], api_key_name, client_ip,
                             request_id, retry_count, affinity_hit,
                             ingress_protocol=ingress_protocol,
                             client_key=client_key,
@@ -915,6 +1449,8 @@ async def run_failover(
                     bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
                     bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
                 )
+                if result.success and candidate_local_web_loop and downstream_stream_requested:
+                    result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
                 if result.success or result.stream_started:
                     _attach_release_to_response(result.response, _release_q)
                     return result.response
@@ -931,7 +1467,15 @@ async def run_failover(
                         upstream_protocol=getattr(ch, "protocol", "anthropic"),
                     )
                     return _json_error_for_ingress(
-                        ingress_protocol, status, protocol_errors.legacy_anthropic_error_type_for_http_status(status), msg
+                        ingress_protocol,
+                        status,
+                        protocol_errors.legacy_anthropic_error_type_for_http_status(status),
+                        msg,
+                        code=(
+                            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                            if _is_context_length_exceeded_error(msg)
+                            else None
+                        ),
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
                 plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
@@ -1182,6 +1726,7 @@ class _WsResponsesTracker:
         self.response_completed = False
         self.response_failed = False
         self.stream_error_message: Optional[str] = None
+        self.stream_error_code: Optional[str] = None
         self._frames: list[str] = []
         self._items: dict[int, dict] = {}
         self._fc_args: dict[int, str] = {}
@@ -1206,11 +1751,22 @@ class _WsResponsesTracker:
         self._frames.append(text)
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
-            _, self.stream_error_message = _ws_error_detail(text)
+            _status, self.stream_error_message = _ws_error_detail(text)
+            self.stream_error_code = None
             return
         if typ == "response.failed":
             self.response_failed = True
-            _, self.stream_error_message = _ws_error_detail(text)
+            _status, self.stream_error_message = _ws_error_detail(text)
+            self.stream_error_code = None
+        elif typ == "response.incomplete":
+            if protocol_errors.is_responses_max_output_incomplete(evt):
+                self.response_failed = True
+                self.stream_error_code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                self.stream_error_message = protocol_errors.responses_max_output_context_error_message(
+                    protocol_errors.responses_incomplete_reason(evt)
+                )
+            else:
+                self.response_completed = True
         elif typ == "response.completed":
             self.response_completed = True
 
@@ -1709,6 +2265,19 @@ async def _consume_oauth_responses_ws_non_stream(
             err.proxy_bytes_up = proxy_bytes.up
             err.proxy_bytes_down = proxy_bytes.down
             return err
+        if step.outcome == "request_invalid":
+            err = AttemptResult(
+                outcome="request_invalid",
+                error_detail=step.error_detail or protocol_errors.responses_max_output_context_error_message(),
+                connect_ms=connect_ms,
+                first_byte_ms=first_byte_ms,
+                http_status=400,
+            )
+            await _finalize_oauth_ws_error(err, ch, resolved_model, request_id, retry_count_so_far, affinity_hit, start_time, connect_ms, first_byte_ms, tracker, proxy_name, proxy_bytes, identity_state)
+            err.proxy_name = proxy_name
+            err.proxy_bytes_up = proxy_bytes.up
+            err.proxy_bytes_down = proxy_bytes.down
+            return err
         if step.outcome == "success":
             break
         if step.skip_downstream:
@@ -1906,11 +2475,25 @@ async def _consume_oauth_responses_ws_stream(
                     await finalize_success()
                     return
                 if tracker.response_failed:
+                    is_context_error = (
+                        tracker.stream_error_code == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                    )
+                    msg = tracker.stream_error_message or (
+                        protocol_errors.responses_max_output_context_error_message()
+                        if is_context_error else "upstream stream error"
+                    )
                     await finalize_error(AttemptResult(
-                        outcome="stream_upstream_error",
-                        error_detail=tracker.stream_error_message or "upstream stream error",
-                        http_status=503,
+                        outcome="request_invalid" if is_context_error else "stream_upstream_error",
+                        error_detail=msg,
+                        http_status=400 if is_context_error else 503,
                     ))
+                    if is_context_error:
+                        yield _sse_error_for_ingress(
+                            "responses",
+                            errors.ErrType.INVALID_REQUEST,
+                            msg,
+                            code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                        )
                     return
                 step = await read_next_responses_ws_step(
                     upstream_ws,
@@ -1941,6 +2524,24 @@ async def _consume_oauth_responses_ws_stream(
                     err = AttemptResult(outcome="blacklist_hit", error_detail=step.error_detail, http_status=503)
                     await finalize_error(err)
                     yield _sse_error_for_ingress("responses", errors.ErrType.API, err.error_detail or "blacklist")
+                    return
+                if step.outcome == "request_invalid":
+                    err = AttemptResult(
+                        outcome="request_invalid",
+                        error_detail=step.error_detail or protocol_errors.responses_max_output_context_error_message(),
+                        http_status=400,
+                    )
+                    await finalize_error(err)
+                    yield _sse_error_for_ingress(
+                        "responses",
+                        errors.ErrType.INVALID_REQUEST,
+                        err.error_detail or "invalid request",
+                        code=(
+                            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                            if _is_context_length_exceeded_error(err.error_detail)
+                            else None
+                        ),
+                    )
                     return
                 if step.data is not None and not step.skip_downstream:
                     out = _ws_json_to_responses_sse(_identity_expose_frame(step.data, identity_state))
@@ -2360,6 +2961,8 @@ async def _consume_stream_as_non_stream(
             channel_key=ch.key,
             model=resolved_model,
         )
+    if ingress_protocol == "anthropic" and isinstance(out_obj, dict) and out_obj.get("type") == "message":
+        assistant_msg = out_obj
 
     # 亲和写入（与 _consume_non_stream 一致）
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
@@ -2610,8 +3213,11 @@ async def _consume_stream(
         state["finalized"] = True
         total_ms = int((time.time() - start_time) * 1000)
 
-        # 已发首包的错误：视为"这一次失败"，记入 cooldown/scorer
-        plan = finalize_policy.error_plan(outcome, failure_policy="post_commit_stream")
+        # 已发首包的普通上游错误视为本次渠道失败；但上下文/请求级错误
+        # 不是渠道健康问题，即使在流中途才被上游明确揭示，也按 runtime
+        # request_invalid 语义处理，避免误伤渠道评分/冷却。
+        failure_policy = "runtime" if outcome == "request_invalid" else "post_commit_stream"
+        plan = finalize_policy.error_plan(outcome, failure_policy=failure_policy)
         finalize_policy.apply_error_health_effects(
             plan,
             scorer=scorer,
@@ -2627,7 +3233,8 @@ async def _consume_stream(
             request_id, message, retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
             connect_ms=connect_ms, first_token_ms=first_byte_ms, total_ms=total_ms,
-            http_status=upstream_status, affinity_hit=affinity_hit,
+            http_status=(400 if outcome == "request_invalid" else upstream_status),
+            affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
@@ -2681,6 +3288,27 @@ async def _consume_stream(
         try:
             # 首个实际下游 chunk 已在返回 StreamingResponse 前确定，确保
             # failover 锁定点等于“下游真的会收到字节”。
+            if (
+                getattr(tracker, "saw_stream_error", False)
+                and getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+            ):
+                msg = (
+                    getattr(tracker, "stream_error_message", None)
+                    or protocol_errors.responses_max_output_context_error_message()
+                )
+                await _emit_error_and_finalize(
+                    errors.ErrType.INVALID_REQUEST,
+                    msg,
+                    outcome="request_invalid",
+                )
+                yield _sse_error_for_ingress(
+                    ingress_protocol,
+                    errors.ErrType.INVALID_REQUEST,
+                    msg,
+                    code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                )
+                return
+
             for out in first_downstream_chunks:
                 yield out
 
@@ -2709,14 +3337,28 @@ async def _consume_stream(
                 if step.kind == "end":
                     break
                 if step.kind == "error":
-                    err_type = errors.ErrType.TIMEOUT if step.err_type == "timeout_error" else errors.ErrType.API
+                    if step.err_type == "timeout_error":
+                        err_type = errors.ErrType.TIMEOUT
+                    elif step.err_type == "invalid_request_error" or step.outcome == "request_invalid":
+                        err_type = errors.ErrType.INVALID_REQUEST
+                    else:
+                        err_type = errors.ErrType.API
                     msg = step.message or "stream error"
                     await _emit_error_and_finalize(
                         err_type,
                         msg,
                         outcome=step.outcome or "transport_error",
                     )
-                    yield _sse_error_for_ingress(ingress_protocol, err_type, msg)
+                    yield _sse_error_for_ingress(
+                        ingress_protocol,
+                        err_type,
+                        msg,
+                        code=(
+                            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                            if step.outcome == "request_invalid" and _is_context_length_exceeded_error(msg)
+                            else None
+                        ),
+                    )
                     return
                 if step.kind == "blacklist":
                     msg = step.message or "blacklist"

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ... import config
 from ...providers.capabilities import (
     ANTHROPIC_BRIDGE_REQ_ALLOWED,
     ANTHROPIC_MESSAGES_REQ_ALLOWED,
@@ -20,6 +21,38 @@ from ...providers.capabilities import (
 
 _OPENAI_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh"})
 _OPENAI_SERVICE_TIERS: frozenset[str] = frozenset({"auto", "default", "flex", "priority"})
+
+
+def _protocol_bridge_cfg() -> dict[str, Any]:
+    root = config.get().get("protocolBridge") or {}
+    return root if isinstance(root, dict) else {}
+
+
+def _anthropic_to_openai_cfg() -> dict[str, Any]:
+    root = _protocol_bridge_cfg().get("anthropicToOpenAI") or {}
+    return root if isinstance(root, dict) else {}
+
+
+def _reasoning_cfg() -> dict[str, Any]:
+    root = _anthropic_to_openai_cfg().get("reasoning") or {}
+    return root if isinstance(root, dict) else {}
+
+
+def _valid_effort(value: Any, default: str) -> str:
+    effort = str(value or "").strip().lower()
+    return effort if effort in _OPENAI_REASONING_EFFORTS else default
+
+
+def disable_parallel_tool_calls_for_local_web() -> bool:
+    return _anthropic_to_openai_cfg().get("disableParallelToolCallsForLocalWeb", True) is not False
+
+
+def _tier_mapping(section: str) -> dict[str, Any]:
+    root = (_protocol_bridge_cfg().get("serviceTier") or {})
+    if not isinstance(root, dict):
+        return {}
+    mapping = root.get(section) or {}
+    return mapping if isinstance(mapping, dict) else {}
 
 
 def supports_reasoning_effort(model: str | None) -> bool:
@@ -54,12 +87,13 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | Non
     """
     if not isinstance(body, dict):
         return None
+    cfg = _reasoning_cfg()
     output_config = body.get("output_config")
     if isinstance(output_config, dict):
         raw_effort = output_config.get("effort")
         effort = str(raw_effort).strip().lower() if isinstance(raw_effort, str) else ""
         if effort == "max":
-            return "xhigh"
+            return _valid_effort(cfg.get("maxEffort"), "xhigh")
         if effort in _OPENAI_REASONING_EFFORTS:
             return effort
 
@@ -68,7 +102,7 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | Non
         return None
     typ = str(thinking.get("type") or "").strip().lower()
     if typ == "adaptive":
-        return "xhigh"
+        return _valid_effort(cfg.get("adaptiveEffort"), "xhigh")
     if typ != "enabled":
         return None
     budget_raw = thinking.get("budget_tokens")
@@ -77,7 +111,22 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | Non
     except (TypeError, ValueError):
         budget = None
     if budget is None:
-        return "high"
+        return _valid_effort(cfg.get("defaultEnabledEffort"), "high")
+    thresholds = cfg.get("budgetThresholds")
+    if isinstance(thresholds, list):
+        for item in thresholds:
+            if not isinstance(item, dict):
+                continue
+            effort = _valid_effort(item.get("effort"), "")
+            if not effort:
+                continue
+            if "lt" not in item:
+                return effort
+            try:
+                if budget < int(float(str(item.get("lt")).replace(",", "").strip())):
+                    return effort
+            except Exception:
+                continue
     if budget < 4_000:
         return "low"
     if budget < 16_000:
@@ -135,6 +184,86 @@ def anthropic_context_management_is_ignorable(value: Any) -> bool:
     return True
 
 
+def _schema_allows_string(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    typ = schema.get("type")
+    if typ == "string":
+        return True
+    if isinstance(typ, list) and "string" in typ:
+        return True
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list) and any(_schema_allows_string(v) for v in variants):
+            return True
+    return False
+
+
+def optional_empty_string_fields_from_tool_schema(schema: Any) -> set[str]:
+    """Return optional string fields where provider "" should mean omitted."""
+    if not isinstance(schema, dict):
+        return set()
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return set()
+    required_raw = schema.get("required")
+    required = {str(x) for x in required_raw} if isinstance(required_raw, list) else set()
+    return {
+        str(name)
+        for name, prop_schema in props.items()
+        if str(name) not in required and _schema_allows_string(prop_schema)
+    }
+
+
+def optional_empty_string_fields_by_tool_from_anthropic_tools(tools: Any) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "")
+        if not name:
+            continue
+        fields = optional_empty_string_fields_from_tool_schema(tool.get("input_schema"))
+        if fields:
+            out[name] = fields
+    return out
+
+
+def optional_empty_string_fields_by_tool_from_responses_tools(tools: Any) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "")
+        if not name:
+            continue
+        fields = optional_empty_string_fields_from_tool_schema(tool.get("parameters"))
+        if fields:
+            out[name] = fields
+    return out
+
+
+def normalize_tool_input_optional_empty_strings(
+    tool_name: str | None,
+    value: Any,
+    optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
+    """Normalize provider-emitted tool args using the original tool schema.
+
+    OpenAI-family function calling may emit optional string arguments as
+    ``""``.  For Claude/Anthropic-style tools, an omitted optional field and an
+    explicit empty string are not equivalent; the latter can be invalid.  Remove
+    only fields that are optional strings according to that tool's schema.
+    Required fields and non-string fields are left untouched.
+    """
+    out = dict(value) if isinstance(value, dict) else {}
+    fields = (optional_empty_string_fields_by_tool or {}).get(str(tool_name or ""), set())
+    for field in list(fields):
+        if out.get(field) == "":
+            out.pop(field, None)
+    return out
+
+
 def parse_json_object(value: Any) -> dict[str, Any] | None:
     """Return a JSON object from dict or JSON-object string, otherwise None."""
     if isinstance(value, dict):
@@ -163,6 +292,10 @@ def map_anthropic_service_tier_to_openai(value: Any, *, codex_oauth: bool = Fals
     tier = value.strip().lower()
     if not tier:
         return True, None
+    mapping = _tier_mapping("anthropicToCodex" if codex_oauth else "anthropicToOpenAI")
+    if tier in mapping:
+        mapped = mapping.get(tier)
+        return True, str(mapped) if mapped is not None else None
     if tier == "auto":
         return True, "priority" if codex_oauth else "auto"
     if tier == "standard_only":
@@ -189,6 +322,10 @@ def map_openai_service_tier_to_anthropic(value: Any) -> tuple[bool, str | None]:
     tier = value.strip().lower()
     if not tier:
         return True, None
+    mapping = _tier_mapping("openaiToAnthropic")
+    if tier in mapping:
+        mapped = mapping.get(tier)
+        return True, str(mapped) if mapped is not None else None
     if tier == "auto":
         return True, "auto"
     if tier in ("default", "standard_only"):

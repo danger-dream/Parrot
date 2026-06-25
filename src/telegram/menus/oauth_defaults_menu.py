@@ -2,7 +2,7 @@
 
 配置字段:
   - Anthropic OAuth → cfg["oauthDefaultModels"] (顶层 list[str])
-  - OpenAI    OAuth → cfg["oauth"]["providers"]["openai"]["defaultModels"]
+  - OpenAI    OAuth → cfg["openaiOAuth"]["defaultModels"]
 
 语义: OAuth 账户 entry 未手动填 models 时的回落列表。改完走 `config.update`
 自动触发 registry 重建, 热生效。
@@ -54,9 +54,7 @@ def _read_list(family: str) -> list[str]:
     if family == "anthropic":
         raw = cfg.get("oauthDefaultModels") or []
     else:
-        raw = (
-            (cfg.get("oauth") or {}).get("providers") or {}
-        ).get("openai", {}).get("defaultModels") or []
+        raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
     return [str(x) for x in raw if isinstance(x, str) and x.strip()]
 
 
@@ -65,10 +63,7 @@ def _write_list(family: str, models: list[str]) -> None:
         if family == "anthropic":
             cfg["oauthDefaultModels"] = list(models)
         else:
-            oauth = cfg.setdefault("oauth", {})
-            providers = oauth.setdefault("providers", {})
-            openai_cfg = providers.setdefault("openai", {})
-            openai_cfg["defaultModels"] = list(models)
+            cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(models)
     config.update(_mutate)
 
 
@@ -220,10 +215,7 @@ def _commit_save(
         if family == "anthropic":
             cfg["oauthDefaultModels"] = list(new_models)
         else:
-            oauth = cfg.setdefault("oauth", {})
-            providers = oauth.setdefault("providers", {})
-            openai_cfg = providers.setdefault("openai", {})
-            openai_cfg["defaultModels"] = list(new_models)
+            cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(new_models)
 
         if not cleanup or not removed:
             return

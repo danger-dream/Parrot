@@ -11,6 +11,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .. import config
+
 
 # Kept in sync with src.openai.transform.guard. Duplicating the small sets here
 # keeps the protocol runtime layer independent from the OpenAI transform package
@@ -36,6 +38,43 @@ _RESPONSES_BUILTIN_INPUT_ITEM_TYPES = frozenset({
 
 _OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 _OPENAI_SERVICE_TIERS = frozenset({"auto", "default", "flex", "priority"})
+
+
+def _protocol_bridge_cfg() -> dict[str, Any]:
+    root = config.get().get("protocolBridge") or {}
+    return root if isinstance(root, dict) else {}
+
+
+def _anthropic_to_openai_cfg() -> dict[str, Any]:
+    root = _protocol_bridge_cfg().get("anthropicToOpenAI") or {}
+    return root if isinstance(root, dict) else {}
+
+
+def _reasoning_cfg() -> dict[str, Any]:
+    root = _anthropic_to_openai_cfg().get("reasoning") or {}
+    return root if isinstance(root, dict) else {}
+
+
+def _valid_effort(value: Any, default: str) -> str:
+    effort = str(value or "").strip().lower()
+    return effort if effort in _OPENAI_REASONING_EFFORTS else default
+
+
+def _tier_mapping(section: str) -> dict[str, Any]:
+    root = _protocol_bridge_cfg().get("serviceTier") or {}
+    if not isinstance(root, dict):
+        return {}
+    mapping = root.get(section) or {}
+    return mapping if isinstance(mapping, dict) else {}
+_ANTHROPIC_LOCAL_WEB_TOOL_TYPES = frozenset({
+    "web_search_20250305",
+    "web_search_20260209",
+    "web_search_20260318",
+    "web_fetch_20250910",
+    "web_fetch_20260209",
+    "web_fetch_20260309",
+    "web_fetch_20260318",
+})
 
 
 @dataclass(frozen=True)
@@ -126,9 +165,10 @@ def _tool_list_has_hosted_or_non_function(ingress_protocol: str, body: dict[str,
             continue
         typ = tool.get("type")
         if ingress_protocol == "anthropic":
-            # Anthropic function tools normally omit type; server tools carry a
-            # concrete type such as web_search_20250305.
-            if typ not in (None, "function"):
+            # Anthropic function tools normally omit type; Parrot can emulate
+            # web_search/web_fetch server tools locally through AnySearch when
+            # crossing to OpenAI-family upstreams.
+            if typ not in (None, "function") and typ not in _ANTHROPIC_LOCAL_WEB_TOOL_TYPES:
                 return True
             continue
         if ingress_protocol == "chat":
@@ -176,6 +216,8 @@ def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | Non
                 continue
             typ = tool.get("type")
             if ingress_protocol == "anthropic" and typ not in (None, "function"):
+                if typ in _ANTHROPIC_LOCAL_WEB_TOOL_TYPES:
+                    continue
                 return str(typ)
             if ingress_protocol == "chat" and typ not in (None, "function"):
                 return str(typ)
@@ -345,7 +387,7 @@ def _anthropic_tool_result_unsupported_label(block: dict[str, Any]) -> str | Non
         return None
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if isinstance(item, dict) and item.get("type") in ("text", "tool_reference"):
                 continue
             if isinstance(item, dict):
                 return f"tool_result:{item.get('type') or 'object'}"
@@ -379,7 +421,7 @@ def _anthropic_tool_result_responses_unsupported_label(block: dict[str, Any]) ->
             if not isinstance(item, dict):
                 return f"tool_result:{type(item).__name__}"
             typ = item.get("type")
-            if typ == "text":
+            if typ in ("text", "tool_reference"):
                 continue
             if typ == "image":
                 image_label = _anthropic_image_unsupported_label(item)
@@ -438,12 +480,13 @@ def _responses_instructions_unsupported_label(body: dict[str, Any]) -> str | Non
 
 
 def _resolve_anthropic_reasoning_effort(body: dict[str, Any]) -> str | None:
+    cfg = _reasoning_cfg()
     output_config = body.get("output_config")
     if isinstance(output_config, dict):
         raw_effort = output_config.get("effort")
         effort = str(raw_effort).strip().lower() if isinstance(raw_effort, str) else ""
         if effort == "max":
-            return "xhigh"
+            return _valid_effort(cfg.get("maxEffort"), "xhigh")
         if effort in _OPENAI_REASONING_EFFORTS:
             return effort
     thinking = body.get("thinking")
@@ -451,7 +494,7 @@ def _resolve_anthropic_reasoning_effort(body: dict[str, Any]) -> str | None:
         return None
     typ = str(thinking.get("type") or "").strip().lower()
     if typ == "adaptive":
-        return "xhigh"
+        return _valid_effort(cfg.get("adaptiveEffort"), "xhigh")
     if typ != "enabled":
         return None
     budget_raw = thinking.get("budget_tokens")
@@ -460,7 +503,22 @@ def _resolve_anthropic_reasoning_effort(body: dict[str, Any]) -> str | None:
     except (TypeError, ValueError):
         budget = None
     if budget is None:
-        return "high"
+        return _valid_effort(cfg.get("defaultEnabledEffort"), "high")
+    thresholds = cfg.get("budgetThresholds")
+    if isinstance(thresholds, list):
+        for item in thresholds:
+            if not isinstance(item, dict):
+                continue
+            effort = _valid_effort(item.get("effort"), "")
+            if not effort:
+                continue
+            if "lt" not in item:
+                return effort
+            try:
+                if budget < int(float(str(item.get("lt")).replace(",", "").strip())):
+                    return effort
+            except Exception:
+                continue
     if budget < 4_000:
         return "low"
     if budget < 16_000:
@@ -504,7 +562,12 @@ def _anthropic_service_tier_is_mappable(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     tier = value.strip().lower()
-    return not tier or tier in {"auto", "standard_only"} or tier in _OPENAI_SERVICE_TIERS
+    if not tier:
+        return True
+    mapping = _tier_mapping("anthropicToOpenAI")
+    if tier in mapping:
+        return True
+    return tier in {"auto", "standard_only"} or tier in _OPENAI_SERVICE_TIERS
 
 
 def _openai_service_tier_is_mappable_to_anthropic(value: Any) -> bool:
@@ -513,7 +576,12 @@ def _openai_service_tier_is_mappable_to_anthropic(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     tier = value.strip().lower()
-    return not tier or tier in {"auto", "default", "standard_only"}
+    if not tier:
+        return True
+    mapping = _tier_mapping("openaiToAnthropic")
+    if tier in mapping:
+        return True
+    return tier in {"auto", "default", "standard_only"}
 
 
 def _file_data_supported(file_data: Any) -> bool:

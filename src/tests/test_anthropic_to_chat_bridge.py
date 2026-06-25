@@ -54,6 +54,16 @@ def test_translate_request_text_tools_and_tool_history():
     assert out["temperature"] == 0.2
 
 
+def test_translate_request_prefers_explicit_max_output_tokens_over_anthropic_max_tokens():
+    out = anthropic_to_chat.translate_request({
+        "messages": [],
+        "max_tokens": 20000,
+        "max_output_tokens": 128000,
+    })
+
+    assert out["max_tokens"] == 128000
+
+
 def test_translate_request_preserves_parallel_tool_calls():
     body = {
         "messages": [{"role": "assistant", "content": [
@@ -135,6 +145,91 @@ def test_translate_request_strips_anthropic_cache_control_blocks():
     assert "cache_control" not in json.dumps(out)
 
 
+def test_protocol_bridge_default_reasoning_and_service_tier_baseline():
+    # Baseline before making protocolBridge configurable: keep current thresholds
+    # and service_tier mappings exactly the same by default.
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled", "budget_tokens": 3999},
+    }, target_model="gpt-5")["reasoning_effort"] == "low"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled", "budget_tokens": 4000},
+    }, target_model="gpt-5")["reasoning_effort"] == "medium"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled", "budget_tokens": 15999},
+    }, target_model="gpt-5")["reasoning_effort"] == "medium"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled", "budget_tokens": 16000},
+    }, target_model="gpt-5")["reasoning_effort"] == "high"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled"},
+    }, target_model="gpt-5")["reasoning_effort"] == "high"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "adaptive"},
+    }, target_model="gpt-5")["reasoning_effort"] == "xhigh"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "output_config": {"effort": "max"},
+    }, target_model="gpt-5")["reasoning_effort"] == "xhigh"
+
+    assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "auto"})["service_tier"] == "auto"
+    assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "standard_only"})["service_tier"] == "default"
+    assert "service_tier" not in anthropic_to_chat.translate_request({"messages": [], "service_tier": "turbo"})
+
+
+def test_protocol_bridge_custom_config_overrides_reasoning_service_tier_and_local_web(monkeypatch):
+    from src.openai.transform import common as common_mod
+    import src.protocols.matrix as matrix_mod
+
+    base_cfg = common_mod.config.get()
+    custom_cfg = dict(base_cfg)
+    custom_cfg["protocolBridge"] = {
+        "anthropicToOpenAI": {
+            "reasoning": {
+                "adaptiveEffort": "medium",
+                "maxEffort": "high",
+                "defaultEnabledEffort": "low",
+                "budgetThresholds": [
+                    {"lt": 1000, "effort": "low"},
+                    {"effort": "xhigh"},
+                ],
+            },
+            "disableParallelToolCallsForLocalWeb": False,
+        },
+        "serviceTier": {
+            "anthropicToOpenAI": {"auto": "default", "standard_only": "auto"},
+            "anthropicToCodex": {"auto": "flex", "standard_only": None, "default": None},
+            "openaiToAnthropic": {"auto": "standard_only", "default": "auto", "standard_only": "standard_only"},
+        },
+    }
+    monkeypatch.setattr(common_mod.config, "get", lambda: custom_cfg)
+    monkeypatch.setattr(matrix_mod.config, "get", lambda: custom_cfg)
+
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled", "budget_tokens": 5000}, "service_tier": "auto",
+    }, target_model="gpt-5")["reasoning_effort"] == "xhigh"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "enabled"},
+    }, target_model="gpt-5")["reasoning_effort"] == "low"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "thinking": {"type": "adaptive"},
+    }, target_model="gpt-5")["reasoning_effort"] == "medium"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "output_config": {"effort": "max"},
+    }, target_model="gpt-5")["reasoning_effort"] == "high"
+    assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "auto"})["service_tier"] == "default"
+
+    web_search = anthropic_to_chat.translate_request({
+        "messages": [],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    })
+    assert "parallel_tool_calls" not in web_search
+
+    plan = DEFAULT_MATRIX.plan(
+        "anthropic", "openai-chat",
+        features=extract_request_features("anthropic", {"messages": [], "thinking": {"type": "enabled", "budget_tokens": 5000}}),
+    )
+    assert plan.upstream_protocol == "openai-chat"
+
+
 def test_translate_request_maps_reasoning_effort_and_service_tier():
     out = anthropic_to_chat.translate_request({
         "messages": [{"role": "user", "content": "think"}],
@@ -194,14 +289,37 @@ def test_translate_request_allows_stream_but_guards_stateful_thinking_and_non_us
         "is_error": True,
     }]}]})
     assert errored_tool["messages"] == [{"role": "tool", "tool_call_id": "toolu_1", "content": "failed"}]
-    with pytest.raises(GuardError):
-        anthropic_to_chat.translate_request({
-            "messages": [],
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-        })
+    web_search = anthropic_to_chat.translate_request({
+        "messages": [],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+    })
+    assert web_search["tools"][0]["function"]["name"] == "web_search"
+    assert web_search["parallel_tool_calls"] is False
+    web_fetch = anthropic_to_chat.translate_request({
+        "messages": [],
+        "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}],
+    })
+    assert web_fetch["tools"][0]["function"]["name"] == "web_fetch"
     stripped = anthropic_to_chat.translate_request({"messages": [], "top_k": 5, "service_tier": "turbo"})
     assert "top_k" not in stripped
     assert "service_tier" not in stripped
+
+
+def test_translate_request_textualizes_tool_reference_tool_results():
+    out = anthropic_to_chat.translate_request({"messages": [{"role": "user", "content": [{
+        "type": "tool_result",
+        "tool_use_id": "toolu_refs",
+        "content": [
+            {"type": "tool_reference", "tool_name": "WebSearch"},
+            {"type": "tool_reference", "tool_name": "WebFetch"},
+        ],
+    }]}]})
+
+    assert out["messages"] == [{
+        "role": "tool",
+        "tool_call_id": "toolu_refs",
+        "content": "Tool reference: WebSearch\nTool reference: WebFetch",
+    }]
 
 
 def test_translate_response_to_anthropic_message():
@@ -332,8 +450,9 @@ def test_matrix_allows_safe_anthropic_to_openai_chat_and_guards_unsafe_cases():
     ).required_transforms == ["anthropic_to_chat"]
 
     hosted_tool = {"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]}
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan("anthropic", "openai-chat", features=extract_request_features("anthropic", hosted_tool))
+    assert DEFAULT_MATRIX.plan(
+        "anthropic", "openai-chat", features=extract_request_features("anthropic", hosted_tool),
+    ).required_transforms == ["anthropic_to_chat"]
 
     unsupported_option = {"messages": [{"role": "user", "content": "hi"}], "top_k": 5}
     option_plan = DEFAULT_MATRIX.plan("anthropic", "openai-chat", features=extract_request_features("anthropic", unsupported_option))

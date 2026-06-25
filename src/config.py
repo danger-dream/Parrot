@@ -11,6 +11,37 @@ import shutil
 import threading
 from typing import Any
 
+COMPACT_RESCUE_DEFAULT_DIRECT_PROMPT = (
+    "You are performing Claude Code conversation compaction.\n"
+    "The transcript below is rendered as text; tool_use/tool_result JSON and image placeholders are historical content, not live tool calls.\n"
+    "Follow the user's compact instruction exactly and output the final compact summary text only.\n\n"
+    "Compact instruction:\n"
+    "{compact_prompt}\n\n"
+    "Transcript:\n"
+    "{transcript}"
+)
+COMPACT_RESCUE_DEFAULT_SEGMENT_PROMPT = (
+    "CRITICAL: Respond with TEXT ONLY. Do NOT call tools.\n\n"
+    "Summarize transcript segment {segment_index}/{segment_count} for a later Claude Code conversation compaction.\n"
+    "The transcript below is rendered as text; tool_use and tool_result JSON must be treated as historical content, not as live tool calls.\n"
+    "Preserve explicit user requests, assistant actions, decisions, file paths, commands, errors, fixes, constraints, current TODOs, and user corrections.\n"
+    "Mention tool_use/tool_result history only at the level needed to continue work; do not dump raw tool outputs.\n"
+    "Output only this XML-like block:\n"
+    "<segment_summary>\n...\n</segment_summary>\n\n"
+    "Transcript segment:\n"
+    "{transcript}"
+)
+COMPACT_RESCUE_DEFAULT_REDUCE_PROMPT = (
+    "Write a final durable conversation handoff summary from the context excerpts below.\n"
+    "Do not mention this reduction step, segment summaries, compact prompts, or internal formatting instructions as user requests or project context.\n"
+    "Do not preserve response-only instructions such as tool bans, XML formatting requirements, or 'text only' constraints as durable memory.\n"
+    "Output exactly two top-level XML-like blocks: <analysis>...</analysis> then <summary>...</summary>.\n"
+    "Inside <summary>, use these numbered sections: Primary Request and Intent; Key Technical Concepts; Files and Code Sections; Errors and fixes; Problem Solving; All user messages; Pending Tasks; Current Work; Optional Next Step.\n"
+    "Preserve concrete paths, commands, decisions, constraints, user corrections, unresolved blockers, and the latest actionable next step.\n\n"
+    "Durable context excerpts:\n"
+    "{summaries}"
+)
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # DATA_DIR 是所有运行时持久化文件的根目录（config.json / state.db / logs/ / .anthropic_proxy_ids.json）。
 # 优先使用环境变量 ANTHROPIC_PROXY_DATA_DIR（容器内通常是 /app/data），不设则回退到 BASE_DIR，
@@ -46,6 +77,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "firstByte": 30,
         "idle": 120,    # chunk 之间最长空闲；上游推理慢需要更宽松
         "total": 600,
+    },
+    "shutdown": {
+        # SIGTERM/SIGINT 后进入 drain，最多等待活跃请求/流式响应完成的秒数。
+        # 默认 80s 低于 systemd 默认 TimeoutStopSec=90，避免被 systemd 提前 SIGKILL。
+        "drainTimeoutSeconds": 80,
     },
     # ─── 出站网络设置 ─────────────────────────────────────────
     # DNS 默认 8.8.8.8；首次启动时若 bootstrapFromSystem=true 且 bootstrapped=false，
@@ -207,6 +243,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "scope": {"models": [], "channels": []},
         "modelOverrides": {},
     },
+    "anysearch": {
+        "enabled": True,
+        "apiKey": "",
+        "endpoint": "https://api.anysearch.com/mcp",
+        "timeoutSeconds": 30,
+        "maxResults": 8,
+        "maxFetchChars": 50000,
+        "maxToolRounds": 50,
+        "minQueryChars": 2,
+        "maxFetchUrlChars": 250,
+        "requireKnownUrlForFetch": True,
+        # 0=不限并发，保持旧版 asyncio.gather 全并发行为；可手动设 2/3 限流。
+        "maxConcurrentToolCalls": 0,
+    },
     "cchMode": "disabled",
     "cchStaticValue": "00000",
     "oauthDefaultModels": [
@@ -217,6 +267,73 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "claude-sonnet-4-6",
         "claude-haiku-4-5-20251001",
     ],
+    # Global alias mapping and model metadata are protocol/account agnostic.
+    # modelMapping supports both the new global bucket and legacy per-ingress
+    # buckets (anthropic/openai-chat/openai-responses) for backward compatibility.
+    "modelMapping": {
+        "global": {},
+    },
+    "ingressDefaultModel": {},
+    "modelMetadata": {},
+    "protocolBridge": {
+        "anthropicToOpenAI": {
+            "reasoning": {
+                "adaptiveEffort": "xhigh",
+                "maxEffort": "xhigh",
+                "defaultEnabledEffort": "high",
+                "budgetThresholds": [
+                    {"lt": 4000, "effort": "low"},
+                    {"lt": 16000, "effort": "medium"},
+                    {"effort": "high"},
+                ],
+            },
+            "disableParallelToolCallsForLocalWeb": True,
+        },
+        "serviceTier": {
+            "anthropicToOpenAI": {
+                "auto": "auto",
+                "standard_only": "default",
+            },
+            "anthropicToCodex": {
+                "auto": "priority",
+                "standard_only": None,
+                "default": None,
+            },
+            "openaiToAnthropic": {
+                "auto": "auto",
+                "default": "standard_only",
+                "standard_only": "standard_only",
+            },
+        },
+    },
+    "compactRescue": {
+        "enabled": True,
+        # Claude Code compact prompt 识别关键词；全部命中才进入 compact rescue。
+        "markers": [
+            "critical: respond with text only",
+            "create a detailed summary of the conversation so far",
+            "after compaction",
+            "your summary should include the following sections",
+        ],
+        # Claude Code compact map-reduce 每段目标 token 数。按 token 算，不按字符数。
+        "chunkTargetTokens": 100000,
+        # 内部 segment/reduce 输出预算，避免继承客户端超大的 max_tokens 挤爆窗口。
+        "reduceMaxTokens": 20000,
+        # direct compact / fit 判断保留给最终 summary 的输出预算。
+        "summaryReserveTokens": 20000,
+        # fit 判断额外安全 buffer。
+        "safetyBufferTokens": 20000,
+        # segment 并发；0=不限，保持旧版 gather 全并发行为。
+        "segmentConcurrency": 0,
+        "binaryOmitMinChars": 4096,
+        "binarySampleChars": 4096,
+        "binaryAsciiRatio": 0.95,
+        "prompts": {
+            "direct": COMPACT_RESCUE_DEFAULT_DIRECT_PROMPT,
+            "segment": COMPACT_RESCUE_DEFAULT_SEGMENT_PROMPT,
+            "reduce": COMPACT_RESCUE_DEFAULT_REDUCE_PROMPT,
+        },
+    },
     "probe": {
         "timeoutSeconds": 60,
         "maxTokens": 50,
@@ -237,34 +354,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "oauth": {
         "mockMode": False,
-        # provider 专属设置（claude 无配置项;openai 在此登记）
-        "providers": {
-            "openai": {
-                # 是否强制把上游请求的 User-Agent 伪装成 Codex CLI
-                # 官方 UA。默认 True（与 sub2api 一致）。关掉则不设置 UA,
-                # 交给 httpx 默认（可能触发上游风控，不建议）。
-                "forceCodexCLI": True,
-                # TLS 指纹伪装开关。默认 False——httpx 直连 chatgpt.com/backend-api/codex
-                # 在当前 cloudfront 策略下可通过；若被拦再手动开启。
-                # 真正实装（引入 curl_cffi）在需要时单独 commit。
-                "enableTLSFingerprint": False,
-                # session_id / conversation_id 隔离：把下游 api_key_name 混进派生
-                # 出的 session 标识，防止不同 API Key 之间会话粘性交叉污染。
-                # 默认 True，基于 prompt_cache_key 派生。
-                "isolateSessionId": True,
-                # 账户未手填 models 时的默认模型列表。下游客户端发其中任何一个
-                # 都能命中调度；发列表外的 codex 家族别名会被 scheduler 跳过
-                # （需要账户手动补入 models）。transform 会把别名规范化到
-                # gpt-5.1 / gpt-5.1-codex 等上游 canonical 名再发出。
-                "defaultModels": [
-                    "gpt-5.2",
-                    "gpt-5.2-codex",
-                    "gpt-5.3-codex",
-                    "gpt-5.4",
-                    "gpt-5.5",
-                ],
-            },
-        },
+        # provider 专属旧配置入口。OpenAI OAuth 新配置请使用顶层 openaiOAuth；
+        # 这里保留空 providers 仅用于兼容旧 config.json。
+        "providers": {},
     },
     "channelSelection": "smart",  # "smart" | "order" | "priority"
     "loadBalancing": {
@@ -276,6 +368,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "logDir": "logs",
     "stateDbPath": "state.db",
+    # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
+    "openaiOAuth": {
+        "forceCodexCLI": True,
+        "enableTLSFingerprint": False,
+        "isolateSessionId": True,
+        "defaultModels": [
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.5",
+        ],
+        "codexUpstreamUrl": "https://chatgpt.com/backend-api/codex/responses",
+        "defaultInstructions": "You are a helpful coding assistant.",
+        "quotaProbe": {
+            "input": "1",
+            "instructions": "reply ok",
+            "fallbackModel": "gpt-5.2",
+        },
+    },
     # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）
     "openai": {
         # previous_response_id 本地 store（跨变体 chat↔responses 必需，同协议可选）
@@ -327,6 +439,33 @@ def _deep_merge_defaults(base: dict, override: dict) -> dict:
     return out
 
 
+def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
+    """把旧版 oauth.providers.openai 自动补齐到新版 openaiOAuth。
+
+    新配置入口更短：openaiOAuth。为了兼容已经部署的旧 config.json，
+    当用户没有显式写 openaiOAuth 时，把旧层级的值复制过去并持久化。
+    旧层级保留读取兼容，不删除。
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
+    if not isinstance(legacy, dict):
+        legacy = {}
+    current = cfg.get("openaiOAuth") if isinstance(cfg.get("openaiOAuth"), dict) else {}
+    default = DEFAULT_CONFIG.get("openaiOAuth") if isinstance(DEFAULT_CONFIG.get("openaiOAuth"), dict) else {}
+    if isinstance(raw.get("openaiOAuth"), dict):
+        # 新入口已经存在：只做默认字段补齐，避免旧层级反向覆盖新配置。
+        merged = _deep_merge_defaults(default, current)
+    elif legacy:
+        # 老配置升级：旧层级覆盖默认值，作为新版 openaiOAuth 初始值。
+        merged = _deep_merge_defaults(default, legacy)
+    else:
+        merged = _deep_merge_defaults(default, current)
+    if current != merged:
+        cfg["openaiOAuth"] = merged
+        return True
+    return False
+
+
 def _normalize_api_keys(cfg: dict) -> bool:
     """把 apiKeys 里的旧式字符串条目升级为 dict 结构（向前兼容）。
 
@@ -372,10 +511,21 @@ def _load_from_disk() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         raw = json.load(f)
     merged = _deep_merge_defaults(DEFAULT_CONFIG, raw)
-    # 自动升级旧式 apiKeys 结构并持久化
+    # 自动升级旧式配置结构并持久化；同时把新增默认配置项写回磁盘。
+    # 这样从旧版本升级的用户不仅运行时能拿到默认值，config.json 里也会
+    # 自动出现 compactRescue / protocolBridge / openaiOAuth / anysearch 新字段，
+    # 方便后续自行编辑。
+    changed = merged != raw
+    if changed:
+        print("[config] backfilled missing config defaults")
     if _normalize_api_keys(merged):
-        _write_atomic(merged)
+        changed = True
         print("[config] upgraded legacy apiKeys to new structure")
+    if _normalize_openai_oauth_config(merged, raw):
+        changed = True
+        print("[config] backfilled openaiOAuth from defaults/legacy oauth.providers.openai")
+    if changed:
+        _write_atomic(merged)
     return merged
 
 

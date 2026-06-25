@@ -16,6 +16,7 @@ from typing import Any
 
 from . import common
 from .guard import GuardError
+from ... import local_web_tools
 from ...protocols.usage import legacy_usage_from_openai_responses_json
 
 
@@ -72,10 +73,10 @@ def guard_request(body: dict) -> None:
     for tool in body.get("tools") or []:
         if not isinstance(tool, dict):
             _fail("tools must contain objects", param="tools")
-        # Anthropic function tools normally omit type. Built-ins carry a type
-        # such as web_search_20250305; guard those until a hosted-tool bridge is
-        # deliberately implemented.
-        if tool.get("type") not in (None, "function"):
+        # Anthropic function tools normally omit type. Web search/fetch server
+        # tools are emulated by Parrot as local function tools backed by
+        # AnySearch when routing to OpenAI-family upstreams.
+        if tool.get("type") not in (None, "function") and not local_web_tools.is_anthropic_web_tool_type(tool.get("type")):
             _fail("Anthropic built-in tools are not supported on Responses bridge yet", param="tools")
 
     choice = body.get("tool_choice")
@@ -107,7 +108,7 @@ def _tool_result_unsupported_label(block: dict[str, Any]) -> str | None:
             if not isinstance(item, dict):
                 return f"tool_result:{type(item).__name__}"
             typ = item.get("type")
-            if typ in ("text", "image"):
+            if typ in ("text", "image", "tool_reference"):
                 continue
             if typ == "document":
                 doc_label = _tool_result_document_unsupported_label(item)
@@ -277,15 +278,19 @@ def _tool_result_output(block: dict[str, Any]) -> str | list[dict[str, Any]]:
             elif typ == "document":
                 has_attachment = True
                 output_parts.extend(_document_to_responses_parts(item))
+            elif typ == "tool_reference":
+                text = local_web_tools.tool_reference_text(item)
+                text_parts.append(text)
+                output_parts.append({"type": "input_text", "text": text})
             else:
                 _fail(f"unsupported Anthropic tool_result content block for Responses bridge: {typ!r}", param="messages")
         if has_attachment:
             return output_parts
-        return "".join(text_parts)
+        return "\n".join(p for p in text_parts if p)
     return _json_dumps(content)
 
 
-def _messages_to_input_items(messages: Any) -> list[dict[str, Any]]:
+def _messages_to_input_items(messages: Any, *, codex_oauth: bool = False) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -293,6 +298,15 @@ def _messages_to_input_items(messages: Any) -> list[dict[str, Any]]:
         role = str(msg.get("role") or "user")
         if role not in ("system", "developer", "user", "assistant"):
             _fail(f"unsupported Anthropic message role for Responses bridge: {role!r}", param="messages")
+        # ChatGPT/Codex rejects system messages inside input; codex_oauth_transform
+        # used to extract every historical role=system message into top-level
+        # instructions.  Claude Code emits dynamic system reminders mid-history,
+        # and moving those to instructions mutates the prompt's leading prefix,
+        # destroying prompt-cache hits.  For Codex OAuth only, keep top-level
+        # Anthropic ``system`` as instructions but map in-history role=system to
+        # developer so the dynamic reminder stays at its original tail position.
+        if codex_oauth and role == "system":
+            role = "developer"
         parts: list[dict[str, Any]] = []
         for block in _blocks(msg.get("content")):
             typ = block.get("type")
@@ -338,11 +352,58 @@ def _messages_to_input_items(messages: Any) -> list[dict[str, Any]]:
     return items
 
 
+def _web_tool_schema(kind: str) -> dict[str, Any]:
+    if kind == "search":
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query", "minLength": 2},
+                "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                "blocked_domains": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "HTTP(S) URL to fetch"},
+            "prompt": {"type": "string", "description": "Optional instruction for how to use the fetched content"},
+        },
+        "required": ["url"],
+        "additionalProperties": False,
+    }
+
+
+def _server_tool_to_responses(tool: dict[str, Any]) -> dict[str, Any] | None:
+    typ = tool.get("type")
+    name = str(tool.get("name") or "")
+    if typ in local_web_tools.ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
+        return {
+            "type": "function",
+            "name": name or "web_search",
+            "description": "Search the web. Executed locally by Parrot through AnySearch when needed.",
+            "parameters": _web_tool_schema("search"),
+        }
+    if typ in local_web_tools.ANTHROPIC_WEB_FETCH_TOOL_TYPES:
+        return {
+            "type": "function",
+            "name": name or "web_fetch",
+            "description": "Fetch a URL and return extracted page content. Executed locally by Parrot through AnySearch when needed.",
+            "parameters": _web_tool_schema("fetch"),
+        }
+    return None
+
+
 def _tools_to_responses(tools: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for tool in tools or []:
         if not isinstance(tool, dict):
             _fail("tools must contain objects", param="tools")
+        server_tool = _server_tool_to_responses(tool)
+        if server_tool is not None:
+            out.append(server_tool)
+            continue
         if tool.get("type") not in (None, "function"):
             _fail("Anthropic built-in tools are not supported on Responses bridge yet", param="tools")
         item: dict[str, Any] = {
@@ -384,13 +445,18 @@ def translate_request(
 ) -> dict:
     guard_request(body)
     payload: dict[str, Any] = {
-        "input": _messages_to_input_items(body.get("messages") or []),
+        "input": _messages_to_input_items(body.get("messages") or [], codex_oauth=codex_oauth),
         "stream": bool(body.get("stream")),
     }
     instructions = _system_to_instructions(body.get("system"))
     if instructions:
         payload["instructions"] = instructions
-    if body.get("max_tokens") is not None:
+    if body.get("max_output_tokens") is not None:
+        # Non-standard but useful for Claude-Code-compatible frontends that
+        # expose the OpenAI Responses output budget directly.  Prefer it when
+        # present instead of inventing/overriding the caller's token limit.
+        payload["max_output_tokens"] = body.get("max_output_tokens")
+    elif body.get("max_tokens") is not None:
         payload["max_output_tokens"] = body.get("max_tokens")
     if body.get("temperature") is not None:
         payload["temperature"] = body.get("temperature")
@@ -419,21 +485,38 @@ def translate_request(
     tool_choice = _tool_choice_to_responses(body.get("tool_choice"))
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
-    if _disable_parallel_tool_calls(body.get("tool_choice")):
+    if _disable_parallel_tool_calls(body.get("tool_choice")) or (
+        common.disable_parallel_tool_calls_for_local_web()
+        and local_web_tools.request_declares_supported_tools(body)
+    ):
+        # Local web tools are executed inside Parrot.  Disable parallel tool
+        # calls so the upstream model does not mix Parrot-handled WebSearch /
+        # WebFetch calls with client-handled Claude Code tools in one turn.
         payload["parallel_tool_calls"] = False
     return payload
 
 
-def _parse_arguments(raw: Any) -> dict[str, Any]:
+def _parse_arguments(
+    raw: Any,
+    *,
+    tool_name: str | None = None,
+    optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
     if isinstance(raw, dict):
-        return raw
+        return common.normalize_tool_input_optional_empty_strings(
+            tool_name, raw, optional_empty_string_fields_by_tool
+        )
     if not isinstance(raw, str) or not raw:
         return {}
     try:
         value = json.loads(raw)
     except Exception:
         return {"_raw": raw}
-    return value if isinstance(value, dict) else {"_value": value}
+    if isinstance(value, dict):
+        return common.normalize_tool_input_optional_empty_strings(
+            tool_name, value, optional_empty_string_fields_by_tool
+        )
+    return {"_value": value}
 
 
 def _gather_output_text(output: list[Any]) -> list[str]:
@@ -477,8 +560,12 @@ def _anthropic_usage_from_responses(resp: dict) -> dict[str, int]:
     }
 
 
-def translate_response(resp: dict, *, model: str = "") -> dict:
+def translate_response(resp: dict, *, model: str = "", request_body: dict[str, Any] | None = None) -> dict:
     output = resp.get("output") if isinstance(resp.get("output"), list) else []
+    optional_empty_string_fields_by_tool = (
+        common.optional_empty_string_fields_by_tool_from_anthropic_tools(request_body.get("tools"))
+        if isinstance(request_body, dict) else {}
+    )
     content: list[dict[str, Any]] = []
 
     text = resp.get("output_text")
@@ -497,7 +584,11 @@ def translate_response(resp: dict, *, model: str = "") -> dict:
                 "type": "tool_use",
                 "id": str(item.get("call_id") or item.get("id") or _gen_id("call_")),
                 "name": str(item.get("name") or ""),
-                "input": _parse_arguments(item.get("arguments")),
+                "input": _parse_arguments(
+                    item.get("arguments"),
+                    tool_name=str(item.get("name") or ""),
+                    optional_empty_string_fields_by_tool=optional_empty_string_fields_by_tool,
+                ),
             })
         elif item.get("type") == "reasoning":
             # Do not expose reasoning summaries as Anthropic thinking until a

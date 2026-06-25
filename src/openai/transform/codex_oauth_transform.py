@@ -16,7 +16,7 @@
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
     gpt-5.6，都原样发出去。新家族只需在 TG 面板或
-    `config.oauth.providers.openai.defaultModels` 加一行，代码零改动。
+    `config.openaiOAuth.defaultModels` 加一行，代码零改动。
   - `instructions` 空 → 注入默认 "You are a helpful coding assistant."
   - legacy `functions` / `function_call` → `tools` / `tool_choice`
   - `input` 是字符串 → 包成 [{type:"message", role:"user", content:<str>}]
@@ -536,6 +536,7 @@ def apply_codex_oauth_transform(
     *,
     resolved_model: str | None = None,
     session_key: str | None = None,
+    default_instructions: str | None = None,
 ) -> dict:
     """就地改造 body，返回同一对象。
 
@@ -601,6 +602,10 @@ def apply_codex_oauth_transform(
 
     # 6) instructions 兜底（sub2api 行为：空 → 一行 fallback）
     if _is_empty_str(body.get("instructions")):
-        body["instructions"] = _DEFAULT_INSTRUCTIONS
+        body["instructions"] = (
+            default_instructions.strip()
+            if isinstance(default_instructions, str) and default_instructions.strip()
+            else _DEFAULT_INSTRUCTIONS
+        )
 
     return body
