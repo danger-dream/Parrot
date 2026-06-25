@@ -1050,6 +1050,9 @@ def usage_from_quota_row(row: dict) -> dict:
     return {
         "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
         "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")),
+        "openai": {
+            "thirty_day": _block(row.get("thirty_day_util"), row.get("thirty_day_reset")),
+        },
         "seven_day_sonnet": _block(row.get("sonnet_util"), row.get("sonnet_reset")),
         "seven_day_opus": _block(row.get("opus_util"), row.get("opus_reset")),
         "extra_usage": {
@@ -1114,8 +1117,8 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       • 所有窗口 util < threshold → 可用
           - OpenAI 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
-          - OpenAI 账号若 disabled_until 仍在未来，也保持禁用，等窗口到期后再用
-            新鲜响应头/probe 数据恢复。
+          - OpenAI 账号若拿到新鲜有效 usage 且所有窗口均低于阈值，即使旧的
+            disabled_until 仍在未来，也恢复；真实用量优先于旧锁定时间。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
@@ -1172,13 +1175,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
 
     # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
     # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
-    # 因 [None, None, None, None] 被误恢复。
+    # 因 [None, None, None, None] 被误恢复。若拿到新鲜有效 usage，则真实
+    # 低用量优先于旧 disabled_until，避免 30d 已重置仍卡在 quota 禁用。
     if reason == "quota":
         if provider_of(account_key) == "openai":
-            if _quota_disabled_until_still_future(acc):
-                return {"action": "quota_waiting_reset", "utils": utils,
-                        "any_over": False, "hit_windows": [],
-                        "disabled_until": acc.get("disabled_until")}
             if not _usage_has_any_quota_signal(usage):
                 return {"action": "quota_unknown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],

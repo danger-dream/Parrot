@@ -697,6 +697,29 @@ def test_flatten_usage_preserves_openai_thirty_day(m):
     print("  [PASS] flatten_usage: preserves OpenAI 30d quota")
 
 
+
+def test_usage_from_quota_row_preserves_openai_thirty_day(m):
+    row = {
+        "five_hour_util": None,
+        "five_hour_reset": None,
+        "seven_day_util": None,
+        "seven_day_reset": None,
+        "thirty_day_util": 1.0,
+        "thirty_day_reset": "2026-07-19T21:23:07Z",
+        "sonnet_util": None,
+        "sonnet_reset": None,
+        "opus_util": None,
+        "opus_reset": None,
+        "extra_used": 0,
+        "extra_limit": 0,
+        "extra_util": 0,
+    }
+    usage = m["oauth_manager"].usage_from_quota_row(row)
+    assert usage["openai"]["thirty_day"]["utilization"] == 1.0
+    assert usage["openai"]["thirty_day"]["resets_at"] == "2026-07-19T21:23:07Z"
+    assert m["oauth_manager"].extract_utils_percent(usage)[:3] == [None, None, 1.0]
+    print("  [PASS] usage_from_quota_row: preserves OpenAI 30d quota")
+
 # ==============================================================
 # main
 # ==============================================================
@@ -743,6 +766,7 @@ def main():
         test_flatten_usage_missing_utilization,
         test_flatten_usage_preserves_resets_and_extra,
         test_flatten_usage_preserves_openai_thirty_day,
+        test_usage_from_quota_row_preserves_openai_thirty_day,
     ]
     passed = 0
     failed = 0

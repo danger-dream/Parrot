@@ -382,7 +382,7 @@ def test_openai_quota_disabled_not_resumed_from_unknown_usage(m):
     print("  [PASS] openai: quota-disabled account is not resumed from unknown usage")
 
 
-def test_openai_quota_disabled_waits_until_disabled_until_before_resume(m):
+def test_openai_quota_disabled_resumes_with_fresh_low_usage_before_disabled_until(m):
     _setup(m)
     _add_openai(m, "future@o.io")
     ak = "openai:future@o.io:acct-123"
@@ -392,16 +392,40 @@ def test_openai_quota_disabled_waits_until_disabled_until_before_resume(m):
     result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
         "five_hour": {"utilization": 10, "resets_at": None},
         "seven_day": {"utilization": 20, "resets_at": None},
+        "openai": {"thirty_day": {"utilization": 1, "resets_at": "2026-07-19T21:23:07Z"}},
         "seven_day_sonnet": {},
         "seven_day_opus": {},
         "extra_usage": {"is_enabled": False},
-    })
+    }, fresh=True)
 
     acc_after = m["oauth_manager"].get_account(ak)
-    assert result["action"] == "quota_waiting_reset", result
+    assert result["action"] == "resumed", result
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    print("  [PASS] openai: fresh low usage resumes before old disabled_until")
+
+
+def test_openai_quota_disabled_keeps_waiting_on_stale_low_usage(m):
+    _setup(m)
+    _add_openai(m, "stale@o.io")
+    ak = "openai:stale@o.io:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(ak, {
+        "five_hour": {"utilization": 10, "resets_at": None},
+        "seven_day": {"utilization": 20, "resets_at": None},
+        "openai": {"thirty_day": {"utilization": 1, "resets_at": "2026-07-19T21:23:07Z"}},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+    }, fresh=False)
+
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert result["action"] == "quota_stale_keep_disabled", result
     assert acc_after["disabled_reason"] == "quota"
     assert acc_after["enabled"] is False
-    print("  [PASS] openai: quota-disabled account waits for disabled_until before resume")
+    print("  [PASS] openai: stale low usage does not resume quota-disabled account")
 
 
 def test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage(m):
@@ -452,7 +476,8 @@ def main():
         test_openai_auto_disable_respects_custom_threshold,
         test_openai_user_disabled_not_touched,
         test_openai_quota_disabled_not_resumed_from_unknown_usage,
-        test_openai_quota_disabled_waits_until_disabled_until_before_resume,
+        test_openai_quota_disabled_resumes_with_fresh_low_usage_before_disabled_until,
+        test_openai_quota_disabled_keeps_waiting_on_stale_low_usage,
         test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage,
     ]
     passed = 0
