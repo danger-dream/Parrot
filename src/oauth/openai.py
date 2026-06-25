@@ -60,7 +60,9 @@ _ACCOUNTS_CHECK_TIMEOUT = 15.0
 # ChatGPT/Codex 私有用量端点。它不是 OpenAI public API；只用于主动 quota
 # 刷新/后台 monitor。业务请求返回的 x-codex-* 响应头仍由 failover 实时采样。
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+WHAM_RESET_CREDIT_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 _WHAM_USAGE_TIMEOUT = 30.0
+_WHAM_RESET_CREDIT_TIMEOUT = 10.0
 
 
 # ─── mock 开关（与 oauth_manager.mock_mode_enabled 同语义） ────────
@@ -677,6 +679,15 @@ def normalize_wham_usage(payload: dict) -> dict:
         or credit_balance is not None
     )
 
+    reset_credits = payload.get("rate_limit_reset_credits") if isinstance(payload, dict) else None
+    if not isinstance(reset_credits, dict):
+        reset_credits = None
+    reset_credit_count = _coerce_int((reset_credits or {}).get("available_count"))
+    reset_credit_summary = (
+        {"available_count": reset_credit_count}
+        if reset_credit_count is not None else None
+    )
+
     return {
         "five_hour": five_hour,
         "seven_day": seven_day,
@@ -698,6 +709,7 @@ def normalize_wham_usage(payload: dict) -> dict:
             "limit_reached": rate.get("limit_reached"),
             "rate_limit_reached_type": payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None,
             "thirty_day": thirty_day,
+            "rate_limit_reset_credits": reset_credit_summary,
         },
     }
 
@@ -726,6 +738,7 @@ def _mock_wham_payload() -> dict:
             },
         },
         "credits": {"has_credits": False, "unlimited": False},
+        "rate_limit_reset_credits": {"available_count": 2},
     }
 
 
@@ -764,6 +777,74 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -
 async def fetch_wham_usage(access_token: str, *, account_id: str | None = None) -> dict:
     return await asyncio.to_thread(
         fetch_wham_usage_sync, access_token, account_id=account_id,
+    )
+
+
+_RESET_CREDIT_OUTCOME_MAP = {
+    "reset": "reset",
+    "nothing_to_reset": "nothingToReset",
+    "no_credit": "noCredit",
+    "already_redeemed": "alreadyRedeemed",
+}
+
+
+def consume_rate_limit_reset_credit_sync(access_token: str, *,
+                                         idempotency_key: str,
+                                         account_id: str | None = None) -> dict:
+    """Consume one official OpenAI/Codex banked rate-limit reset credit.
+
+    This is the upstream reset-credit path added by openai/codex:
+    POST /backend-api/wham/rate-limit-reset-credits/consume with
+    {"redeem_request_id": <idempotency_key>}.
+    """
+    if not idempotency_key:
+        raise ValueError("idempotency_key must not be empty")
+
+    if _mock_mode_enabled():
+        return {
+            "outcome": "reset",
+            "code": "reset",
+            "windows_reset": 1,
+            "idempotency_key": idempotency_key,
+        }
+
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": USER_AGENT,
+        "origin": "https://chatgpt.com",
+        "referer": "https://chatgpt.com/codex/settings/usage",
+    }
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+
+    resp = network.post_sync(
+        WHAM_RESET_CREDIT_CONSUME_URL,
+        headers=headers,
+        json={"redeem_request_id": idempotency_key},
+        timeout=_WHAM_RESET_CREDIT_TIMEOUT,
+        proxy_purpose="oauth_openai",
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    code = str(data.get("code") or "").strip()
+    outcome = _RESET_CREDIT_OUTCOME_MAP.get(code, code)
+    return {
+        "outcome": outcome,
+        "code": code,
+        "windows_reset": _coerce_int(data.get("windows_reset")) or 0,
+        "idempotency_key": idempotency_key,
+        "raw": data,
+    }
+
+
+async def consume_rate_limit_reset_credit(access_token: str, *,
+                                          idempotency_key: str,
+                                          account_id: str | None = None) -> dict:
+    return await asyncio.to_thread(
+        consume_rate_limit_reset_credit_sync, access_token,
+        idempotency_key=idempotency_key, account_id=account_id,
     )
 
 

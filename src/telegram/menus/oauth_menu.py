@@ -23,6 +23,7 @@ import math
 import re
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -146,6 +147,48 @@ def _evaluate_quota_action(ak: str, usage: dict) -> dict | None:
         return None
 
 
+def _openai_reset_credit_count_from_usage(usage: dict | None) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    summary = (usage.get("openai") or {}).get("rate_limit_reset_credits")
+    if not isinstance(summary, dict):
+        summary = usage.get("rate_limit_reset_credits")
+    if not isinstance(summary, dict):
+        return None
+    try:
+        return int(summary.get("available_count"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _openai_reset_credit_count_from_row(row: dict | None) -> int | None:
+    if not row:
+        return None
+    raw = row.get("raw_data")
+    if not raw:
+        return None
+    try:
+        usage = json.loads(raw)
+    except Exception:
+        return None
+    return _openai_reset_credit_count_from_usage(usage)
+
+
+def _openai_reset_credit_label_from_row(row: dict | None, *, show_zero: bool = True) -> str:
+    count = _openai_reset_credit_count_from_row(row)
+    if count is None:
+        return "未获取" if show_zero else ""
+    if count <= 0 and not show_zero:
+        return ""
+    return f"{count} 次"
+
+
+def _ensure_openai_metadata_for_ui(account_keys: list[str] | str, *, force: bool = False) -> None:
+    oauth_manager.ensure_openai_metadata_fresh_sync(
+        account_keys, force=force, min_interval_seconds=3600, timeout_s=5.0,
+    )
+
+
 # ─── 时间 / 用量格式化 ────────────────────────────────────────────
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:
@@ -230,6 +273,33 @@ _USAGE_DETAIL_INDENT_LIST = "\u00a0" * 7
 _USAGE_DETAIL_INDENT_BLOCK = "\u00a0" * 7
 
 
+def _quota_window_since_ts(reset_iso: str | None, window_seconds: int, *, now_ts: float | None = None) -> float:
+    """Return current quota window start timestamp for local usage details.
+
+    Upstream 5h/7d quota is windowed by its next reset time, so the local detail
+    should count from `reset_at - window`. If reset is absent/invalid/stale, fall
+    back to the old rolling window (`now - window`) so the UI still has data.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    fallback = now_ts - window_seconds
+    if not reset_iso:
+        return fallback
+    try:
+        dt = datetime.fromisoformat(str(reset_iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        reset_ts = dt.timestamp()
+    except Exception:
+        return fallback
+    # Stale reset means the cache is old/odd. Future reset beyond one window plus
+    # a small grace is also suspicious. In both cases keep the old rolling window.
+    if reset_ts <= now_ts - 60:
+        return fallback
+    if reset_ts > now_ts + window_seconds + 300:
+        return fallback
+    return reset_ts - window_seconds
+
+
 def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Optional[str]:
     """某 OAuth 账号在 [since_ts, now] 窗口内、经 Parrot 的本地请求用量明细行。
 
@@ -275,14 +345,21 @@ def _format_account_block(acc: dict) -> str:
     # 第一行：icon + email + provider
     prov_tag = " 🅾️ OpenAI" if prov == "openai" else (" 🅰️ Claude" if prov == "claude" else "")
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{prov_tag}{tag}"]
+    row = state_db.quota_load(ak)
 
     # 套餐行
     if prov == "openai":
         plan = acc.get("plan_type") or ""
         workspace = _openai_workspace_label(acc)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace else ""
+        plan_parts = []
         if plan:
-            lines.append(f"🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>")
+            plan_parts.append(f"套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>")
+        reset_label = _openai_reset_credit_label_from_row(row, show_zero=False)
+        if reset_label:
+            plan_parts.append(f"♻️ 官方重置次数: <code>{reset_label}</code>")
+        if plan_parts:
+            lines.append("🏷 " + " · ".join(plan_parts))
         sub_exp = acc.get("subscription_expires_at") or ""
         if sub_exp:
             lines.append(f"📅 到期: <code>{_fmt_time_full(sub_exp)}</code>")
@@ -291,14 +368,8 @@ def _format_account_block(acc: dict) -> str:
         if cl_label:
             lines.append(f"🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
 
-    # Token 过期
-    expired = acc.get("expired")
-    if expired:
-        lines.append(f"⏳ Token: <code>{_fmt_time_full(expired)}</code>")
-
     # 用量（5h / 7d）。百分比来自上游全局配额；其下明细行是「走 Parrot 的
     # 本地请求」在该窗口内的 tokens/缓存/平均 TPS（口径不同，仅本地流量）。
-    row = state_db.quota_load(ak)
     _now_ts = time.time()
     if row:
         fh_util = row.get("five_hour_util")
@@ -306,13 +377,15 @@ def _format_account_block(acc: dict) -> str:
         if fh_util is not None:
             reset = row.get("five_hour_reset")
             lines.append(f"📊 5h: <b>{fh_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
-            _d = _window_usage_detail(ak, _now_ts - 5 * 3600, _USAGE_DETAIL_INDENT_LIST)
+            since_ts = _quota_window_since_ts(reset, 5 * 3600, now_ts=_now_ts)
+            _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
             if _d:
                 lines.append(_d)
         if sd_util is not None:
             reset = row.get("seven_day_reset")
             lines.append(f"📊 7d: <b>{sd_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
-            _d = _window_usage_detail(ak, _now_ts - 7 * 86400, _USAGE_DETAIL_INDENT_LIST)
+            since_ts = _quota_window_since_ts(reset, 7 * 86400, now_ts=_now_ts)
+            _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
             if _d:
                 lines.append(_d)
         td_util = row.get("thirty_day_util")
@@ -372,9 +445,9 @@ def _format_usage_block(account_key: str) -> str:
 
     out = []
     _now_ts = time.time()
-    _detail_since = {
-        "five_hour_util": _now_ts - 5 * 3600,
-        "seven_day_util": _now_ts - 7 * 86400,
+    _detail_window_seconds = {
+        "five_hour_util": 5 * 3600,
+        "seven_day_util": 7 * 86400,
     }
     for label, util_k, reset_k in (
         ("⏱ 5h", "five_hour_util", "five_hour_reset"),
@@ -386,8 +459,11 @@ def _format_usage_block(account_key: str) -> str:
         line = _line(label, row.get(util_k), row.get(reset_k))
         if line:
             out.append(line)
-            if util_k in _detail_since:
-                _d = _window_usage_detail(account_key, _detail_since[util_k], _USAGE_DETAIL_INDENT_BLOCK)
+            if util_k in _detail_window_seconds:
+                since_ts = _quota_window_since_ts(
+                    row.get(reset_k), _detail_window_seconds[util_k], now_ts=_now_ts,
+                )
+                _d = _window_usage_detail(account_key, since_ts, _USAGE_DETAIL_INDENT_BLOCK)
                 if _d:
                     out.append(_d)
 
@@ -604,6 +680,12 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
+        openai_keys = [
+            ak for ak in account_keys
+            if oauth_manager.provider_of(ak) == "openai"
+        ]
+        if openai_keys:
+            _ensure_openai_metadata_for_ui(openai_keys)
         # 如果缓存已经显示 >= quotaMonitor 阈值，立即收敛账号状态，
         # 不等 600s 后台监控下一轮。
         for ak in account_keys:
@@ -1064,18 +1146,22 @@ def _format_month_stats_block(account_key: str) -> str:
     return "\n".join(lines)
 
 
-def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[Optional[str], Optional[dict]]:
+def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL,
+                        *, refresh_quota: bool = True) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_manager.get_account(account_key)
     if acc is None:
         return None, None
     email = acc.get("email", "?")
 
-    if not acc.get("disabled_reason"):
+    if refresh_quota and not acc.get("disabled_reason"):
         oauth_manager.ensure_quota_fresh_sync(account_key)
         try:
             oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
         except Exception as exc:
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
+        acc = oauth_manager.get_account(account_key) or acc
+    if oauth_manager.provider_of(acc) == "openai":
+        _ensure_openai_metadata_for_ui(account_key)
         acc = oauth_manager.get_account(account_key) or acc
 
     icon = _status_icon(acc)
@@ -1087,6 +1173,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         workspace = _openai_workspace_label(acc, force=True)
         ws_suffix = f"（{ui.escape_html(workspace)}）" if workspace and _openai_same_email_count(acc) > 1 else ""
         provider_line = f"🏷️ 套餐: <code>{ui.escape_html(plan)}{ws_suffix}</code>\n"
+        reset_label = _openai_reset_credit_label_from_row(state_db.quota_load(account_key), show_zero=True)
+        provider_line += f"♻️ 官方重置次数: <code>{ui.escape_html(reset_label)}</code>\n"
         sub_exp = acc.get("subscription_expires_at") or ""
         if sub_exp:
             provider_line += f"📅 到期: <code>{_fmt_time_full(sub_exp)}</code>\n"
@@ -1143,9 +1231,21 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
          ui.btn("📊 刷新用量",   f"oa:refresh_usage:{payload}")],
+    ]
+    if prov == "openai":
+        rows.append([
+            ui.btn("⚡ 并发上限", f"oa:emax:{payload}"),
+            ui.btn("♻️ 重置次数", f"oa:reset_quota_ask:{payload}"),
+        ])
+    elif acc.get("disabled_reason") == "quota":
+        rows.append([ui.btn("♻️ 清本地配额禁用", f"oa:reset_quota:{payload}")])
+    rows += [
         [ui.btn("🧹 清模型错误", f"oa:clear_errors:{payload}"),
          ui.btn("🔗 清亲和绑定", f"oa:clear_affinity:{payload}")],
-        [ui.btn(f"⚡ 修改并发上限（当前: {max_cc_label}）", f"oa:emax:{payload}")],
+    ]
+    if prov != "openai":
+        rows.append([ui.btn("⚡ 并发上限", f"oa:emax:{payload}")])
+    rows += [
         [ui.btn(toggle_label,     f"oa:toggle:{payload}"),
          ui.btn("🗑 删除",         f"oa:delete_ask:{payload}")],
         [ui.btn("◀ 返回 OAuth 列表", _page_callback(max(1, int(page or 1)), filter_key))],
@@ -1222,12 +1322,24 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ))
         return
     quota_action = _evaluate_quota_action(ak, usage_result)
+    metadata_action = None
+    if provider == "openai":
+        metadata_action = _run_sync(oauth_manager.ensure_openai_metadata_fresh(
+            ak, force=True, min_interval_seconds=0, timeout_s=5.0,
+        ))
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if not text:
         return
     if provider == "openai":
         head = "✅ 已更新用量（wham/usage）"
+        reset_credit_count = _openai_reset_credit_count_from_usage(usage_result)
+        if reset_credit_count is not None:
+            head += f"\n♻️ 官方重置次数: <code>{reset_credit_count}</code>"
+        if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
+            fields = metadata_action.get("fields") or {}
+            if fields.get("plan_type"):
+                head += f"\n🏷 套餐信息已刷新: <code>{ui.escape_html(fields.get('plan_type'))}</code>"
         if quota_action and quota_action.get("action") == "disabled":
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
@@ -1253,6 +1365,188 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page:
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
+                       page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    ak = _resolve_to_account_key(ui.resolve_code(short))
+    if ak is None:
+        ui.answer_cb(cb_id)
+        return
+    if oauth_manager.provider_of(ak) != "openai":
+        ui.answer_cb(cb_id)
+        return
+
+    email = _account_email(ak)
+    usage_result = _fetch_and_save_usage_sync(ak, email=email)
+    if isinstance(usage_result, Exception):
+        ui.answer_cb(cb_id)
+        return
+    _evaluate_quota_action(ak, usage_result)
+    count = _openai_reset_credit_count_from_usage(usage_result)
+    payload = _callback_payload(short, page, filter_key)
+    if count is None or count <= 0:
+        ui.answer_cb(cb_id)
+        return
+    else:
+        unit = "次" if count == 1 else "次"
+        body = (
+            "♻️ <b>OpenAI 官方额度重置说明</b>\n\n"
+            f"当前可用官方重置次数: <code>{count}</code> {unit}\n\n"
+            "这一步 <b>不会消耗</b> 重置次数，只是进入最终确认页。\n\n"
+            "请确认你理解：\n"
+            "• 这是 OpenAI/Codex 官方 banked reset credit，不是 Parrot 本地清缓存。\n"
+            "• 真正执行后会立刻向 OpenAI 发送 consume 请求，并消耗 <code>1</code> 次官方重置。\n"
+            "• 该操作不可撤销；如果 OpenAI 判断没有可重置窗口，可能返回 no_credit / nothing_to_reset。\n"
+            "• 成功后 Parrot 会立即刷新最新额度；只有 fresh usage 证明低于阈值，才会解除 quota 禁用并清理模型 cooldown。\n"
+            "• 如果刷新失败或额度仍超限，本地 quota 限制会保留，避免误放行。\n"
+            "• 不会清除 user 手动禁用或 auth_error；这些必须手动启用或重新登录。"
+        )
+        # OpenAI 官方要求同一次逻辑 reset 重试时复用同一个 idempotency key。
+        # 先绑定到“最终确认页”按钮，最终执行按钮继续复用，避免 TG 重投/双击消耗多次。
+        reset_idem = str(uuid.uuid4())
+        confirm_short = ui.register_code(f"{ak}|{reset_idem}|confirm")
+        confirm_payload = _callback_payload(confirm_short, page, filter_key)
+        rows = [
+            [ui.btn("我已理解，进入最终确认（不消耗）", f"oa:reset_quota_confirm:{confirm_payload}")],
+            [ui.btn("❌ 取消", f"oa:view:{payload}")],
+        ]
+    ui.edit(chat_id, message_id, body, reply_markup=ui.inline_kb(rows))
+
+
+def _parse_openai_reset_payload(short: str) -> tuple[str | None, str | None, str | None]:
+    resolved = ui.resolve_code(short)
+    if not isinstance(resolved, str):
+        return None, None, None
+    parts = resolved.split("|")
+    ak = _resolve_to_account_key(parts[0])
+    reset_idem = parts[1] if len(parts) >= 2 and parts[1] else None
+    stage = parts[2] if len(parts) >= 3 and parts[2] else None
+    return ak, reset_idem, stage
+
+
+def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str,
+                           page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    ak, reset_idem, stage = _parse_openai_reset_payload(short)
+    if ak is None or not reset_idem or stage != "confirm":
+        ui.answer_cb(cb_id, "确认信息已失效，请重新进入")
+        return
+    if oauth_manager.provider_of(ak) != "openai":
+        ui.answer_cb(cb_id, "仅 OpenAI 有官方重置次数")
+        return
+
+    ui.answer_cb(cb_id, "请做最终确认")
+    email = _account_email(ak)
+    final_short = ui.register_code(f"{ak}|{reset_idem}|execute")
+    final_payload = _callback_payload(final_short, page, filter_key)
+    cancel_payload = _callback_payload(ui.register_code(ak), page, filter_key)
+    reset_label = _openai_reset_credit_label_from_row(state_db.quota_load(ak), show_zero=True)
+    body = (
+        "🚨 <b>最终确认：消耗 1 次 OpenAI 官方重置</b>\n\n"
+        f"账号: <code>{ui.escape_html(email or ak)}</code>\n"
+        f"当前可用官方重置次数: <code>{ui.escape_html(reset_label)}</code>\n\n"
+        "点击下面的最终确认后，会立即调用 OpenAI 官方接口：\n"
+        "<code>rate-limit-reset-credits/consume</code>\n\n"
+        "结果与影响：\n"
+        "• 会消耗该账号 <code>1</code> 次官方 Codex reset credit。\n"
+        "• OpenAI 会重置当前符合条件的 Codex rate-limit 使用窗口。\n"
+        "• 成功后 Parrot 会立即刷新最新额度；只有 fresh usage 证明低于阈值，才自动解除 quota 禁用并清理模型 cooldown。\n"
+        "• 如果刷新失败或额度仍超限，本地 quota 限制会保留，避免误放行。\n"
+        "• 操作不可撤销；请确认这是你当前真正要重置的账号。\n\n"
+        "防误触保护：同一个最终确认按钮重复投递会复用同一个幂等 ID，不会因为 TG 重投而消耗多次。"
+    )
+    rows = [
+        [ui.btn("🚨 最终确认：消耗 1 次官方重置", f"oa:reset_quota:{final_payload}")],
+        [ui.btn("❌ 取消，返回账户详情", f"oa:view:{cancel_payload}")],
+    ]
+    ui.edit(chat_id, message_id, body, reply_markup=ui.inline_kb(rows))
+
+
+def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    resolved = ui.resolve_code(short)
+    ak, reset_idem, reset_stage = _parse_openai_reset_payload(short)
+    if ak is None:
+        ak = _resolve_to_account_key(resolved)
+    if ak is None:
+        ui.answer_cb(cb_id, "短码已失效")
+        return
+
+    provider = oauth_manager.provider_of(ak)
+    if provider == "openai":
+        if not reset_idem or reset_stage != "execute":
+            ui.answer_cb(cb_id, "需要先完成二次确认")
+            text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+            if text:
+                ui.edit(chat_id, message_id,
+                        "⚠️ <b>未执行重置</b>\nOpenAI 官方额度重置必须经过说明页和最终确认页，不能从旧按钮或直达回调直接执行。\n\n" + text,
+                        reply_markup=kb)
+            return
+        ui.answer_cb(cb_id, "正在调用 OpenAI 官方重置...")
+        result = _run_sync(oauth_manager.redeem_openai_rate_limit_reset_credit(ak, idempotency_key=reset_idem))
+        if isinstance(result, Exception):
+            ui.send(chat_id, _oauth_error_html(
+                result, provider="openai", operation="rate_limit_reset_credit",
+            ))
+            return
+        outcome = result.get("outcome")
+        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+        if not text:
+            return
+        if outcome in ("reset", "alreadyRedeemed"):
+            prefix = "♻️ <b>OpenAI 官方额度重置已执行</b>\n"
+            if result.get("available_count") is not None:
+                prefix += f"剩余官方重置次数: <code>{result.get('available_count')}</code>\n"
+            quota_action = result.get("quota_action") or {}
+            action = quota_action.get("action")
+            if result.get("refresh_error"):
+                prefix += "⚠️ 最新额度刷新失败，未自动解除本地 quota 限制；请稍后点「刷新用量」重新确认。\n"
+            elif action == "resumed":
+                prefix += "✅ 已刷新最新额度，确认低于阈值；已自动解除 quota 禁用并清理模型冷却。\n"
+            elif action == "kept_enabled":
+                prefix += "✅ 已刷新最新额度，账号保持可用；已清理相关模型冷却。\n"
+            elif action in ("still_over_quota", "disabled"):
+                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+                prefix += f"⚠️ 已刷新最新额度，但仍超限（<code>{ui.escape_html(hit)}</code>）；本地 quota 限制已保留。\n"
+            elif action == "quota_unknown_keep_disabled":
+                prefix += "⚠️ 最新额度没有有效窗口数据，未自动解除本地 quota 限制。\n"
+            else:
+                prefix += "ℹ️ 已刷新最新额度；未触发自动解禁动作。\n"
+            prefix += "\n"
+            ui.edit(chat_id, message_id, prefix + text, reply_markup=kb)
+        elif outcome == "nothingToReset":
+            ui.edit(chat_id, message_id,
+                    "ℹ️ OpenAI 返回: 当前没有符合条件的使用窗口需要重置。\n\n" + text,
+                    reply_markup=kb)
+        elif outcome == "noCredit":
+            ui.edit(chat_id, message_id,
+                    "⚠️ OpenAI 返回: 当前没有可用的官方重置次数。\n\n" + text,
+                    reply_markup=kb)
+        else:
+            ui.edit(chat_id, message_id,
+                    f"⚠️ OpenAI 重置返回未知结果: <code>{ui.escape_html(str(outcome))}</code>\n\n" + text,
+                    reply_markup=kb)
+        return
+
+    result = oauth_manager.reset_quota(ak)
+    action = result.get("action")
+    if action == "reset":
+        ui.answer_cb(cb_id, "已清本地配额禁用")
+    elif action == "cleared_runtime_state":
+        ui.answer_cb(cb_id, "已清理本地配额/冷却状态")
+    elif action == "noop_user":
+        ui.answer_cb(cb_id, "手动禁用不自动重置")
+    elif action == "noop_auth_error":
+        ui.answer_cb(cb_id, "auth_error 需重新登录")
+    else:
+        ui.answer_cb(cb_id, "无需重置")
+    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+    if text:
+        prefix = "♻️ <b>已清理本地配额禁用</b>\n"
+        if action == "reset":
+            prefix += "已清除该账号的 quota 禁用、模型冷却和本地 quota 缓存；下一次真实请求/刷新会重新采样。\n\n"
+            ui.edit(chat_id, message_id, prefix + text, reply_markup=kb)
+        else:
+            ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
@@ -2608,6 +2902,18 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("oa:clear_errors:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
         on_clear_errors(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:reset_quota_ask:"):
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_reset_quota_ask(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:reset_quota_confirm:"):
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_reset_quota_confirm(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:reset_quota:"):
+        short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
+        on_reset_quota(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:clear_affinity:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

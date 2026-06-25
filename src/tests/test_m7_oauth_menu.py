@@ -33,11 +33,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, log_db, oauth_manager, state_db
+    from src import config, cooldown, log_db, oauth_manager, state_db
     from src.telegram import bot, states, ui
     from src.telegram.menus import oauth_menu, main as main_menu
     return {
-        "config": config, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
+        "config": config, "cooldown": cooldown, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
         "oauth_menu": oauth_menu, "main_menu": main_menu,
     }
@@ -71,9 +71,11 @@ def _setup(m):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
     m["config"].update(_reset)
-    # 清 quota 缓存
+    # 清 quota 缓存 / 模型冷却
     for row in m["state_db"].quota_load_all():
-        m["state_db"].quota_delete(row["email"])
+        m["state_db"].quota_delete(row["account_key"])
+    m["cooldown"].init()
+    m["cooldown"].clear_all()
     conn = m["log_db"]._get_conn()
     conn.execute("DELETE FROM request_log")
     conn.execute("DELETE FROM request_detail")
@@ -132,6 +134,32 @@ def _add_fake_account(m, email, **kw):
     m["config"].update(_m)
 
 
+def _add_openai_fake_account(m, email, **kw):
+    acc = {
+        "email": email,
+        "provider": "openai",
+        "access_token": "old-openai-token-" + email,
+        "refresh_token": "r-openai-" + email,
+        "expired": kw.get(
+            "expired",
+            (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ),
+        "last_refresh": kw.get("last_refresh",
+                               datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        "chatgpt_account_id": kw.get("chatgpt_account_id", "acct-123"),
+        "workspace_id": kw.get("workspace_id", "acct-123"),
+        "organization_id": kw.get("organization_id", "org-x"),
+        "plan_type": kw.get("plan_type", "plus"),
+        "enabled": kw.get("enabled", True),
+        "disabled_reason": kw.get("disabled_reason"),
+        "disabled_until": kw.get("disabled_until"),
+        "models": [],
+    }
+    def _m(cfg):
+        cfg.setdefault("oauthAccounts", []).append(acc)
+    m["config"].update(_m)
+
+
 # ─── Tests ───────────────────────────────────────────────────────
 
 def test_list_empty_and_populated(m):
@@ -170,6 +198,7 @@ def test_list_empty_and_populated(m):
     assert "user2@x.com" in last["text"]
     assert "用户禁用" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "⏳ Token" not in last["text"]
     flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
     assert "oa:sort:1:all" in flat
     # 每个账户一个按钮
@@ -345,6 +374,222 @@ def test_toggle_disable_then_enable(m):
     assert acc["enabled"] is True
     assert acc["disabled_reason"] is None
     print("  [PASS] toggle disable→enable")
+
+
+def test_reset_quota_button_and_callback(m):
+    _setup(m)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _add_fake_account(m, "quota@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
+    ak = _account_key_for(m, "quota@x.com")
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 99.0,
+        "five_hour_reset": future,
+        "seven_day_util": 20.0,
+        "raw_data": "{}",
+    }, email="quota@x.com")
+    m["cooldown"].record_error(
+        f"oauth:{ak}", "claude-reset-model", "quota",
+        cooldown_until=m["state_db"].now_ms() + 600_000,
+    )
+
+    rec = _install_recorder(m)
+    short = m["ui"].register_code(ak)
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail = rec.last("editMessageText")
+    flat = [
+        b["callback_data"]
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    reset_cb = next(x for x in flat if x.startswith("oa:reset_quota:"))
+
+    rec.clear()
+    handled = m["oauth_menu"].handle_callback(42, 100, "cb-reset", reset_cb)
+    assert handled
+    acc_after = m["oauth_manager"].get_account(ak)
+    assert acc_after["enabled"] is True
+    assert acc_after.get("disabled_reason") is None
+    assert m["state_db"].quota_load(ak) is None
+    assert not m["cooldown"].is_blocked(f"oauth:{ak}", "claude-reset-model")
+    updated = rec.last("editMessageText")
+    assert updated and "已清理本地配额禁用" in updated["text"]
+    print("  [PASS] local reset quota button clears quota-disabled/cache/cooldown")
+
+
+def test_quota_window_since_uses_reset_minus_window_with_fallback(m):
+    m["state_db"].init()
+    now_ts = datetime(2026, 6, 25, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    reset_ts = datetime(2026, 6, 25, 13, 30, 0, tzinfo=timezone.utc).timestamp()
+
+    since = m["oauth_menu"]._quota_window_since_ts("2026-06-25T13:30:00Z", 5 * 3600, now_ts=now_ts)
+    assert since == reset_ts - 5 * 3600
+
+    fallback = now_ts - 5 * 3600
+    assert m["oauth_menu"]._quota_window_since_ts(None, 5 * 3600, now_ts=now_ts) == fallback
+    assert m["oauth_menu"]._quota_window_since_ts("", 5 * 3600, now_ts=now_ts) == fallback
+    assert m["oauth_menu"]._quota_window_since_ts("bad-reset", 5 * 3600, now_ts=now_ts) == fallback
+    assert m["oauth_menu"]._quota_window_since_ts("2026-06-25T11:00:00Z", 5 * 3600, now_ts=now_ts) == fallback
+    assert m["oauth_menu"]._quota_window_since_ts("2026-06-26T00:00:00Z", 5 * 3600, now_ts=now_ts) == fallback
+    print("  [PASS] quota window detail uses reset-window and falls back to now-window")
+
+
+def test_openai_reset_credit_count_display_in_list_and_detail(m):
+    _setup(m)
+    _add_openai_fake_account(m, "show-reset@x.com", plan_type="pro")
+    ak = _account_key_for(m, "show-reset@x.com")
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 12.0,
+        "five_hour_reset": "2026-06-25T13:30:00Z",
+        "seven_day_util": 44.0,
+        "seven_day_reset": "2026-06-28T10:00:00Z",
+        "raw_data": json.dumps({"openai": {"rate_limit_reset_credits": {"available_count": 2}}}),
+    }, email="show-reset@x.com")
+
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+    listing = rec.last("editMessageText")
+    assert listing and "🏷 套餐: <code>pro</code> · ♻️ 官方重置次数: <code>2 次</code>" in listing["text"]
+
+    rec.clear()
+    short = m["ui"].register_code(ak)
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail = rec.last("editMessageText")
+    assert detail and "♻️ 官方重置次数: <code>2 次</code>" in detail["text"]
+    detail_rows = detail["reply_markup"]["inline_keyboard"]
+    action_row = next(row for row in detail_rows if any(b.get("callback_data", "").startswith("oa:reset_quota_ask:") for b in row))
+    assert [b["text"] for b in action_row] == ["⚡ 并发上限", "♻️ 重置次数"]
+    assert action_row[0]["callback_data"].startswith("oa:emax:")
+    assert action_row[1]["callback_data"].startswith("oa:reset_quota_ask:")
+
+    # 不是 OpenAI OAuth 账号时，即使构造 reset-count callback，也只清 loading、不弹提示、不改页面。
+    _setup(m)
+    _add_fake_account(m, "claude-no-reset@x.com")
+    rec = _install_recorder(m)
+    claude_short = m["ui"].register_code("claude-no-reset@x.com")
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-not-openai", f"oa:reset_quota_ask:{claude_short}:1")
+    assert rec.last("editMessageText") is None
+    cb_answer = rec.last("answerCallbackQuery")
+    assert cb_answer is not None and "text" not in cb_answer
+
+    # OpenAI 但当前没有可用 reset 次数时，也静默不弹提示、不改页面。
+    _setup(m)
+    _add_openai_fake_account(m, "zero-click@x.com", plan_type="plus")
+    ak_zero_click = _account_key_for(m, "zero-click@x.com")
+    rec = _install_recorder(m)
+    zero_short_click = m["ui"].register_code(ak_zero_click)
+    original_fetch_and_save = m["oauth_menu"]._fetch_and_save_usage_sync
+    def _zero_usage(_ak, *, email=None):
+        return {
+            "five_hour": {"utilization": 1.0, "resets_at": None},
+            "seven_day": {"utilization": 2.0, "resets_at": None},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "extra_usage": {"is_enabled": False},
+            "openai": {"rate_limit_reset_credits": {"available_count": 0}},
+        }
+    m["oauth_menu"]._fetch_and_save_usage_sync = _zero_usage
+    try:
+        assert m["oauth_menu"].handle_callback(42, 100, "cb-zero", f"oa:reset_quota_ask:{zero_short_click}:1")
+    finally:
+        m["oauth_menu"]._fetch_and_save_usage_sync = original_fetch_and_save
+    assert rec.last("editMessageText") is None
+    cb_answer = rec.last("answerCallbackQuery")
+    assert cb_answer is not None and "text" not in cb_answer
+
+
+    _setup(m)
+    _add_openai_fake_account(m, "zero-reset@x.com", plan_type="plus", enabled=False, disabled_reason="user")
+    ak0 = _account_key_for(m, "zero-reset@x.com")
+    m["state_db"].quota_save(ak0, {
+        "fetched_at": m["state_db"].now_ms(),
+        "raw_data": json.dumps({"openai": {"rate_limit_reset_credits": {"available_count": 0}}}),
+    }, email="zero-reset@x.com")
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+    listing0 = rec.last("editMessageText")
+    assert listing0 and "官方重置次数" not in listing0["text"]
+    short0 = m["ui"].register_code(ak0)
+    rec.clear()
+    m["oauth_menu"].on_view(42, 100, "cb", short0)
+    detail0 = rec.last("editMessageText")
+    assert detail0 and "♻️ 官方重置次数: <code>0 次</code>" in detail0["text"]
+    print("  [PASS] openai reset credits shown in list/detail; list hides 0")
+
+
+def test_openai_official_reset_credit_ask_and_confirm(m):
+    _setup(m)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _add_openai_fake_account(m, "quota-openai@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
+    ak = _account_key_for(m, "quota-openai@x.com")
+    m["cooldown"].record_error(
+        f"oauth:{ak}", "gpt-5-codex", "quota",
+        cooldown_until=m["state_db"].now_ms() + 600_000,
+    )
+
+    rec = _install_recorder(m)
+    short = m["ui"].register_code(ak)
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail = rec.last("editMessageText")
+    flat = [
+        b["callback_data"]
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    action_row = next(row for row in detail["reply_markup"]["inline_keyboard"] if any(b.get("callback_data", "").startswith("oa:reset_quota_ask:") for b in row))
+    assert [b["text"] for b in action_row] == ["⚡ 并发上限", "♻️ 重置次数"]
+    ask_cb = next(x for x in flat if x.startswith("oa:reset_quota_ask:"))
+
+    # 旧按钮/直达回调不能绕过二次确认直接消耗官方 reset credit。
+    rec.clear()
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-direct", f"oa:reset_quota:{short}:1")
+    blocked = rec.last("editMessageText")
+    acc_still_disabled = m["oauth_manager"].get_account(ak)
+    assert blocked and "未执行重置" in blocked["text"]
+    assert acc_still_disabled["enabled"] is False
+    assert acc_still_disabled.get("disabled_reason") == "quota"
+
+    rec.clear()
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-ask", ask_cb)
+    ask_msg = rec.last("editMessageText")
+    assert ask_msg and "当前可用官方重置次数" in ask_msg["text"]
+    assert "这一步 <b>不会消耗</b>" in ask_msg["text"]
+    confirm_page_cb = next(
+        b["callback_data"]
+        for row in ask_msg["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("callback_data", "").startswith("oa:reset_quota_confirm:")
+    )
+    confirm_payload = confirm_page_cb.split(":", 2)[2]
+    confirm_short = confirm_payload.split(":", 1)[0]
+    resolved_confirm = m["ui"].resolve_code(confirm_short)
+    assert resolved_confirm and resolved_confirm.startswith(ak + "|") and resolved_confirm.endswith("|confirm")
+
+    rec.clear()
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-confirm-page", confirm_page_cb)
+    final_msg = rec.last("editMessageText")
+    assert final_msg and "最终确认：消耗 1 次 OpenAI 官方重置" in final_msg["text"]
+    assert "当前可用官方重置次数: <code>2 次</code>" in final_msg["text"]
+    final_cb = next(
+        b["callback_data"]
+        for row in final_msg["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("callback_data", "").startswith("oa:reset_quota:")
+    )
+    reset_payload = final_cb.split(":", 2)[2]
+    reset_short = reset_payload.split(":", 1)[0]
+    resolved_reset = m["ui"].resolve_code(reset_short)
+    assert resolved_reset and resolved_reset.startswith(ak + "|") and resolved_reset.endswith("|execute")
+
+    rec.clear()
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-confirm", final_cb)
+    updated = rec.last("editMessageText")
+    acc_after = m["oauth_manager"].get_account(ak)
+    row = m["state_db"].quota_load(ak)
+    assert updated and "OpenAI 官方额度重置已执行" in updated["text"]
+    assert acc_after["enabled"] is True and acc_after.get("disabled_reason") is None
+    assert row is not None and row.get("five_hour_util") == 1.0
+    assert not m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
+    print("  [PASS] openai official reset credit flow asks, consumes, clears local state")
 
 
 def test_delete_flow(m):
@@ -670,6 +915,10 @@ def main():
         test_refresh_token_updates_access_and_usage,
         test_refresh_usage_only,
         test_toggle_disable_then_enable,
+        test_reset_quota_button_and_callback,
+        test_quota_window_since_uses_reset_minus_window_with_fallback,
+        test_openai_reset_credit_count_display_in_list_and_detail,
+        test_openai_official_reset_credit_ask_and_confirm,
         test_delete_flow,
         test_refresh_all_usage,
         test_pkce_login_flow,
