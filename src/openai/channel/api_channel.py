@@ -213,6 +213,7 @@ class OpenAIApiChannel(Channel):
                 "upstream_protocol": "openai-responses",
                 "response_translator": "anthropic_to_responses",
                 "model_for_response": resolved_model,
+                "request_body": body,
             },
         )
 

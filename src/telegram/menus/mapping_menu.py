@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ... import model_mapping
+from ... import compact_rescue, model_mapping, model_metadata
 from .. import states, ui
 
 
@@ -47,13 +47,15 @@ _PAGE_SIZE = 10   # 真实模型按钮每页条数
 
 # line <-> 短码(callback_data 不能塞带斜线的 line 名, 用固定 3 位 hex 避免爆 64B)
 _LINE_CODE: dict[str, str] = {
-    "anthropic":        "anp",
+    model_mapping.GLOBAL_MAPPING_LINE: "glo",
+    "anthropic":        "anp",  # legacy callback compatibility
     "openai-chat":      "oac",
     "openai-responses": "oar",
 }
 _CODE_LINE: dict[str, str] = {v: k for k, v in _LINE_CODE.items()}
 
 _LINE_ICON: dict[str, str] = {
+    model_mapping.GLOBAL_MAPPING_LINE: "🔁",
     "anthropic":        "🅰",
     "openai-chat":      "🅞",
     "openai-responses": "🅞",
@@ -71,35 +73,28 @@ def _line_of_code(code: str) -> Optional[str]:
 # ─── Level 1 总览 ─────────────────────────────────────────────────
 
 def _overview_text() -> str:
-    lines = ["🔁 <b>模型映射 &amp; 默认模型</b>", ""]
-    for line in model_mapping.INGRESS_LINES:
-        icon = _LINE_ICON[line]
-        label = model_mapping.INGRESS_LABEL[line]
-        default = model_mapping.get_default_model(line) or "(未设置)"
-        mp = model_mapping.get_ingress_map(line)
-        lines.append(f"{icon} <b>{ui.escape_html(label)}</b>")
-        lines.append(f"  默认: <code>{ui.escape_html(default)}</code>")
-        lines.append(f"  映射: <b>{len(mp)}</b> 条")
-        if mp:
-            for alias, real in sorted(mp.items()):
-                lines.append(
-                    f"    • <code>{ui.escape_html(alias)}</code> → "
-                    f"<code>{ui.escape_html(real)}</code>"
-                )
-        lines.append("")
-    lines.append("<i>点下方按钮进入某条入口管理。</i>")
+    mp = model_mapping.get_ingress_map(model_mapping.GLOBAL_MAPPING_LINE)
+    metas = model_metadata.all_metadata()
+    compact = model_metadata.get_compression_model() or "(未设置)"
+    lines = [
+        "🤖 <b>模型管理</b>",
+        "",
+        f"🔁 模型映射：<b>{len(mp)}</b> 条",
+        f"🧾 模型元数据：<b>{len(metas)}</b> 个模型",
+        f"🗜 压缩模型：<code>{ui.escape_html(compact)}</code>",
+        f"🧩 分段目标：<code>{compact_rescue.chunk_target_tokens():,}</code> tokens",
+        "",
+        "<i>模型映射按模型名全局生效，不再区分 Anthropic / OpenAI 入口。</i>",
+    ]
     return "\n".join(lines)
 
 
 def _overview_kb() -> dict:
-    rows: list = []
-    for line in model_mapping.INGRESS_LINES:
-        icon = _LINE_ICON[line]
-        label = model_mapping.INGRESS_LABEL[line].split(" (")[0]
-        rows.append([ui.btn(f"{icon} 管理 {label}",
-                            f"map:line:{_code_of_line(line)}")])
-    rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
-    return ui.inline_kb(rows)
+    return ui.inline_kb([
+        [ui.btn("🔁 模型映射", f"map:line:{_code_of_line(model_mapping.GLOBAL_MAPPING_LINE)}")],
+        [ui.btn("🧾 模型元数据", "map:meta")],
+        [ui.btn("◀ 返回主菜单", "menu:main")],
+    ])
 
 
 def show(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -748,6 +743,293 @@ def _on_page_add(
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
+# ─── 模型元数据 ───────────────────────────────────────────────────
+
+_META_FIELD_LABELS = {
+    "contextWindow": "🪟 上下文",
+    "maxOutputTokens": "↓ 最大输出",
+    "vision": "🖼 图片识别",
+    "reasoningEfforts": "🧠 支持思考强度",
+    "defaultReasoningEffort": "🧠 默认思考强度",
+    "inputPricePer1M": "↑ 输入/1M",
+    "outputPricePer1M": "↓ 输出/1M",
+    "cacheReadPricePer1M": "缓存读取/1M",
+    "cacheWritePricePer1M": "缓存写入/1M",
+    "compressionModel": "🗜 压缩模型",
+}
+
+
+def _fmt_bool(v) -> str:
+    return "✅" if v is True else "❌" if v is False else "—"
+
+
+def _fmt_meta_value(key: str, value) -> str:
+    if key in ("vision", "compressionModel"):
+        return _fmt_bool(value)
+    if key == "reasoningEfforts" and isinstance(value, list):
+        return ",".join(str(v) for v in value) or "—"
+    if value is None:
+        return "—"
+    return str(value)
+
+
+def _metadata_text() -> str:
+    metas = model_metadata.all_metadata()
+    compact = model_metadata.get_compression_model() or "(未设置)"
+    lines = [
+        "🧾 <b>模型元数据</b>",
+        "",
+        f"🗜 压缩模型：<code>{ui.escape_html(compact)}</code>",
+        f"🧩 分段目标：<code>{compact_rescue.chunk_target_tokens():,}</code> tokens",
+        "",
+    ]
+    if not metas:
+        lines.append("<i>暂无模型元数据。</i>")
+    else:
+        for model, meta in sorted(metas.items()):
+            flag = " 🗜" if meta.get("compressionModel") else ""
+            ctx = meta.get("contextWindow", "—")
+            out = meta.get("maxOutputTokens", "—")
+            vision = _fmt_bool(meta.get("vision"))
+            lines.append(
+                f"• <code>{ui.escape_html(model)}</code>{flag}\n"
+                f"↳ 🪟 上下文：<code>{ui.escape_html(str(ctx))}</code> · "
+                f"↓ 输出：<code>{ui.escape_html(str(out))}</code> · 🖼 {vision}"
+            )
+    lines += [
+        "",
+        "<i>元数据只和模型名有关，和渠道/账号无关。</i>",
+    ]
+    return "\n".join(lines)
+
+
+def _metadata_kb() -> dict:
+    rows: list = [[ui.btn("➕ 新增/更新元数据", "map:meta_add")]]
+    for model in model_metadata.list_models()[:20]:
+        mc = ui.register_code(f"map:meta_model:{model}")
+        label = f"🧾 {model}"
+        if model == model_metadata.get_compression_model():
+            label = f"🗜 {model}"
+        rows.append([ui.btn(label, f"map:meta_item:{mc}")])
+    if len(model_metadata.list_models()) > 20:
+        rows.append([ui.btn("… 仅显示前 20 个", "map:meta")])
+    rows.append([ui.btn("◀ 返回模型管理", "map:show")])
+    return ui.inline_kb(rows)
+
+
+def _show_metadata(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, _metadata_text(), reply_markup=_metadata_kb())
+
+
+def _bool_text(value) -> str:
+    return "true" if value is True else "false" if value is False else ""
+
+
+def _metadata_config_block(model: str, meta: dict | None = None) -> str:
+    meta = meta or {}
+    lines = [model]
+    field_map = [
+        ("context", meta.get("contextWindow")),
+        ("max_output", meta.get("maxOutputTokens")),
+        ("vision", _bool_text(meta.get("vision"))),
+        ("reasoning", ",".join(meta.get("reasoningEfforts") or [])),
+        ("default_reasoning", meta.get("defaultReasoningEffort")),
+        ("input_price", meta.get("inputPricePer1M")),
+        ("output_price", meta.get("outputPricePer1M")),
+        ("cache_read_price", meta.get("cacheReadPricePer1M")),
+        ("cache_write_price", meta.get("cacheWritePricePer1M")),
+        ("compression", _bool_text(meta.get("compressionModel"))),
+    ]
+    for key, value in field_map:
+        if value is None or value == "":
+            continue
+        lines.append(f"{key}={value}")
+    return "\n".join(lines)
+
+
+def _metadata_input_help(title: str, *, model: str | None = None) -> str:
+    head = f"🧾 <b>{ui.escape_html(title)}</b>"
+    if model:
+        head += f" · <code>{ui.escape_html(model)}</code>"
+    example_model = model or "gpt-5.5"
+    current_block = ""
+    if model:
+        current = _metadata_config_block(model, model_metadata.get_metadata(model))
+        current_block = (
+            "📌 <b>当前配置（可复制后修改）</b>\n"
+            f"<pre>{ui.escape_html(current)}</pre>\n"
+        )
+    example = _metadata_config_block(
+        example_model,
+        {
+            "contextWindow": 273000,
+            "maxOutputTokens": 20000,
+            "vision": False,
+            "reasoningEfforts": ["low", "high", "xhigh"],
+            "defaultReasoningEffort": "high",
+            "inputPricePer1M": 1.25,
+            "outputPricePer1M": 10,
+            "cacheReadPricePer1M": 0.125,
+            "cacheWritePricePer1M": 1.25,
+            "compressionModel": True,
+        },
+    )
+    return (
+        f"{head}\n\n"
+        f"{current_block}"
+        "📋 <b>示例格式</b>\n"
+        f"<pre>{ui.escape_html(example)}</pre>\n"
+        "🧠 <code>reasoning</code> 支持 <code>low,high,xhigh</code> / <code>low，high，xhigh</code> / "
+        "<code>low、high、max</code> / <code>low;high;xhigh;max</code>，会自动去空格并转小写。\n"
+        "🧠 <code>default_reasoning</code> 必须是 reasoning 里已有的值。\n"
+        "🗜 <code>compression=true</code> 会把它设为唯一压缩模型。"
+    )
+
+
+def _start_meta_add(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "map_meta_upsert")
+    ui.edit(
+        chat_id,
+        message_id,
+        _metadata_input_help("新增/更新模型元数据"),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "map:meta")]]),
+    )
+
+
+def _meta_model_from_code(model_code: str) -> str | None:
+    tag = ui.resolve_code(model_code)
+    if not tag:
+        return None
+    try:
+        _, _, model = tag.split(":", 2)
+    except ValueError:
+        return None
+    return model
+
+
+def _show_meta_item(chat_id: int, message_id: int, cb_id: str, model_code: str) -> None:
+    model = _meta_model_from_code(model_code)
+    if not model:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    meta = model_metadata.get_metadata(model)
+    if not meta:
+        ui.answer_cb(cb_id, "该元数据已不存在")
+        _show_metadata(chat_id, message_id, "-")
+        return
+    lines = [
+        "🧾 <b>模型元数据详情</b>",
+        "",
+        f"🤖 模型：<code>{ui.escape_html(model)}</code>",
+    ]
+    for key, label in _META_FIELD_LABELS.items():
+        lines.append(f"{label}：<code>{ui.escape_html(_fmt_meta_value(key, meta.get(key)))}</code>")
+    kb = ui.inline_kb([
+        [ui.btn("✏ 编辑", f"map:meta_edit:{model_code}"),
+         ui.btn("🗜 设为压缩模型", f"map:meta_compact:{model_code}")],
+        [ui.btn("🗑 删除", f"map:meta_del:{model_code}")],
+        [ui.btn("◀ 返回元数据", "map:meta")],
+    ])
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=kb)
+
+
+def _start_meta_edit(chat_id: int, message_id: int, cb_id: str, model_code: str) -> None:
+    model = _meta_model_from_code(model_code)
+    if not model:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "map_meta_upsert")
+    ui.edit(
+        chat_id,
+        message_id,
+        _metadata_input_help("编辑模型元数据", model=model),
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"map:meta_item:{model_code}")]]),
+    )
+
+
+def _set_meta_compact(chat_id: int, message_id: int, cb_id: str, model_code: str) -> None:
+    model = _meta_model_from_code(model_code)
+    if not model:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    try:
+        model_metadata.set_compression_model(model)
+    except ValueError as exc:
+        ui.answer_cb(cb_id, str(exc)); return
+    ui.answer_cb(cb_id, "✅ 已设为压缩模型")
+    _show_meta_item(chat_id, message_id, "-", model_code)
+
+
+def _ask_meta_delete(chat_id: int, message_id: int, cb_id: str, model_code: str) -> None:
+    model = _meta_model_from_code(model_code)
+    if not model:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    ui.answer_cb(cb_id)
+    ui.edit(
+        chat_id,
+        message_id,
+        f"确认删除模型元数据？\n\n<code>{ui.escape_html(model)}</code>",
+        reply_markup=ui.confirm_kb(
+            confirm_callback=f"map:meta_del_ok:{model_code}",
+            cancel_callback=f"map:meta_item:{model_code}",
+        ),
+    )
+
+
+def _meta_delete(chat_id: int, message_id: int, cb_id: str, model_code: str) -> None:
+    model = _meta_model_from_code(model_code)
+    if not model:
+        ui.answer_cb(cb_id, "会话已过期"); return
+    removed = model_metadata.delete_metadata(model)
+    ui.answer_cb(cb_id, "✅ 已删除" if removed else "未命中")
+    _show_metadata(chat_id, message_id, "-")
+
+
+def _parse_metadata_input(text: str) -> tuple[str, dict]:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("输入不能为空")
+    model = ""
+    raw: dict = {}
+    for idx, line in enumerate(lines):
+        sep = "=" if "=" in line else ":" if ":" in line else ""
+        if not sep:
+            if idx == 0:
+                model = line.strip()
+                continue
+            raise ValueError(f"无法解析这一行: {line}")
+        key, val = line.split(sep, 1)
+        key = key.strip()
+        val = val.strip()
+        if key.lower() in {"model", "模型", "name", "模型名"}:
+            model = val
+        else:
+            raw[key] = val
+    if not model:
+        raise ValueError("第一行请写模型名，或使用 model=模型名")
+    meta = model_metadata.normalize_metadata(raw)
+    if not meta:
+        raise ValueError("没有有效元数据字段")
+    return model, meta
+
+
+def _on_meta_upsert(chat_id: int, text: str) -> None:
+    try:
+        model, meta = _parse_metadata_input(text)
+        model_metadata.set_metadata(model, meta)
+    except ValueError as exc:
+        ui.send(chat_id, f"❌ {ui.escape_html(str(exc))}\n\n请重新发送：")
+        return
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id,
+        f"✅ 已保存模型元数据\n<code>{ui.escape_html(model)}</code>",
+        back_label="◀ 返回模型元数据",
+        back_callback="map:meta",
+    )
+
+
 # ─── 路由入口 ─────────────────────────────────────────────────────
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str,
@@ -760,6 +1042,37 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str,
 
     if action == "show":
         show(chat_id, message_id, cb_id)
+        return True
+    if action == "meta":
+        _show_metadata(chat_id, message_id, cb_id)
+        return True
+    if action == "meta_add":
+        _start_meta_add(chat_id, message_id, cb_id)
+        return True
+    if action == "meta_item":
+        if len(parts) < 3:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        _show_meta_item(chat_id, message_id, cb_id, parts[2])
+        return True
+    if action == "meta_edit":
+        if len(parts) < 3:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        _start_meta_edit(chat_id, message_id, cb_id, parts[2])
+        return True
+    if action == "meta_compact":
+        if len(parts) < 3:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        _set_meta_compact(chat_id, message_id, cb_id, parts[2])
+        return True
+    if action == "meta_del":
+        if len(parts) < 3:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        _ask_meta_delete(chat_id, message_id, cb_id, parts[2])
+        return True
+    if action == "meta_del_ok":
+        if len(parts) < 3:
+            ui.answer_cb(cb_id, "会话异常"); return True
+        _meta_delete(chat_id, message_id, cb_id, parts[2])
         return True
 
     # 所有下面的 action 都带 line_code
@@ -872,5 +1185,8 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         return True
     if action.startswith("map_alias_edit:"):
         _on_alias_edit(chat_id, action, text)
+        return True
+    if action == "map_meta_upsert":
+        _on_meta_upsert(chat_id, text)
         return True
     return False

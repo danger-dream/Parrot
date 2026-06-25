@@ -17,6 +17,7 @@ from typing import Any, Optional
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
 from .commit_gate import is_responses_visible_event_type
+from . import errors as protocol_errors
 from . import registry as protocol_registry
 
 
@@ -56,20 +57,39 @@ def translate_error_type(anth_type: str, ingress: str) -> str:
     return _ERR_TYPE_ANTHROPIC_TO_OPENAI.get(anth_type, errors.ErrTypeOpenAI.API)
 
 
-def sse_error_for_ingress(ingress: str, anth_err_type: str, message: str) -> bytes:
+def sse_error_for_ingress(
+    ingress: str,
+    anth_err_type: str,
+    message: str,
+    *,
+    code: str | None = None,
+) -> bytes:
     if ingress == "anthropic":
-        return errors.sse_error_line(anth_err_type, message)
+        if protocol_errors.is_context_length_code_or_message(code, message):
+            message = protocol_errors.context_length_error_message_for_claude_code(message)
+            code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+        return errors.sse_error_line(anth_err_type, message, code=code)
     mapped = translate_error_type(anth_err_type, ingress)
     if ingress == "chat":
-        return errors.sse_error_line_chat(mapped, message)
-    return errors.sse_error_line_responses(mapped, message)
+        return errors.sse_error_line_chat(mapped, message, code=code)
+    return errors.sse_error_line_responses(mapped, message, code=code)
 
 
-def json_error_for_ingress(ingress: str, status: int, anth_err_type: str, message: str):
+def json_error_for_ingress(
+    ingress: str,
+    status: int,
+    anth_err_type: str,
+    message: str,
+    *,
+    code: str | None = None,
+):
     if ingress == "anthropic":
-        return errors.json_error_response(status, anth_err_type, message)
+        if protocol_errors.is_context_length_code_or_message(code, message):
+            message = protocol_errors.context_length_error_message_for_claude_code(message)
+            code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+        return errors.json_error_response(status, anth_err_type, message, code=code)
     mapped = translate_error_type(anth_err_type, ingress)
-    return errors.json_error_openai(status, mapped, message)
+    return errors.json_error_openai(status, mapped, message, code=code)
 
 
 def make_stream_translator(translator_ctx: Optional[dict]):
@@ -98,7 +118,7 @@ def make_stream_translator(translator_ctx: Optional[dict]):
         return _C2A(model=model)
     if name == "anthropic_to_responses":
         from ..openai.transform.stream_responses_to_anthropic import StreamTranslator as _R2A
-        return _R2A(model=model)
+        return _R2A(model=model, request_body=translator_ctx.get("request_body"))
     if name == "chat_to_anthropic":
         from ..openai.transform.stream_anthropic_to_chat import StreamTranslator as _A2C
         return _A2C(
@@ -145,7 +165,7 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
         return _t4(obj, model=model)
     if name == "anthropic_to_responses":
         from ..openai.transform.anthropic_to_responses import translate_response as _t5
-        return _t5(obj, model=model)
+        return _t5(obj, model=model, request_body=translator_ctx.get("request_body"))
     if name == "responses_to_anthropic":
         from ..openai.transform.responses_to_anthropic import translate_response as _t6
         return _t6(
@@ -247,6 +267,16 @@ async def prepare_non_stream_response(
     toolkit = toolkit_for_channel(channel)
 
     if toolkit["is_upstream_error_json"](obj):
+        if protocol_errors.is_responses_max_output_incomplete(obj):
+            error_detail = protocol_errors.responses_max_output_context_error_message(
+                protocol_errors.responses_incomplete_reason(obj)
+            )
+        else:
+            code, msg = protocol_errors.extract_error_info(obj, fallback="upstream error")
+            if protocol_errors.is_context_length_code_or_message(code, msg):
+                error_detail = protocol_errors.context_length_error_message_for_claude_code(msg)
+            else:
+                error_detail = json.dumps(obj.get("error", obj), ensure_ascii=False)[:2000]
         return PreparedNonStreamResponse(
             obj=obj,
             restored=restored,
@@ -255,7 +285,7 @@ async def prepare_non_stream_response(
                 outcome="upstream_error_json",
                 connect_ms=connect_ms,
                 total_ms=total_ms,
-                error_detail=json.dumps(obj.get("error", obj), ensure_ascii=False)[:2000],
+                error_detail=error_detail[:2000],
                 translator_ctx=translator_ctx,
             ),
         )
@@ -369,15 +399,25 @@ def ws_close_code_for_http_status(status: int) -> int:
 
 def format_responses_ws_error(evt: dict) -> str:
     """Return the legacy human-readable detail for a Responses WS error event."""
+    if protocol_errors.is_responses_max_output_incomplete(evt):
+        return protocol_errors.responses_max_output_context_error_message(
+            protocol_errors.responses_incomplete_reason(evt)
+        )
     err = evt.get("error")
     if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("error"), dict):
         err = evt["response"]["error"]
     if isinstance(err, dict):
         code = err.get("code") or err.get("type") or err.get("error_type")
         message = err.get("message") or err.get("reason") or "upstream websocket error"
+        code_s, msg_s = protocol_errors.extract_error_info({"error": err}, fallback="upstream websocket error")
+        if protocol_errors.is_context_length_code_or_message(code_s or code, msg_s):
+            return protocol_errors.context_length_error_message_for_claude_code(msg_s)
         return f"{code}: {message}" if code and str(code) not in str(message) else str(message)
     message = evt.get("message") or evt.get("reason") or "upstream websocket error"
     code = evt.get("code") or evt.get("error_type") or evt.get("type")
+    code_s, msg_s = protocol_errors.extract_error_info(evt, fallback="upstream websocket error")
+    if protocol_errors.is_context_length_code_or_message(code_s or code, msg_s):
+        return protocol_errors.context_length_error_message_for_claude_code(msg_s)
     return f"{code}: {message}" if code and code != "error" and str(code) not in str(message) else str(message)
 
 
@@ -391,6 +431,11 @@ def responses_ws_error_detail(data: str | bytes) -> tuple[Optional[int], str]:
         return None, data[:2000]
     if not isinstance(obj, dict):
         return None, str(obj)[:2000]
+
+    if protocol_errors.is_responses_max_output_incomplete(obj):
+        return 400, protocol_errors.responses_max_output_context_error_message(
+            protocol_errors.responses_incomplete_reason(obj)
+        )
 
     err: Any = obj.get("error")
     if isinstance(obj.get("response"), dict) and isinstance(obj["response"].get("error"), dict):

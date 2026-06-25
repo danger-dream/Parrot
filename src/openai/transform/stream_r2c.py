@@ -25,6 +25,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from ...protocols import errors as protocol_errors
+
 
 def _gen_id(prefix: str) -> str:
     return f"{prefix}{uuid.uuid4().hex[:24]}"
@@ -351,14 +353,30 @@ class StreamTranslator:
         self.state.usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else None
         incomplete = resp.get("incomplete_details") or {}
         reason = incomplete.get("reason") if isinstance(incomplete, dict) else None
-        if reason == "max_output_tokens":
-            self.state.finish_reason = "length"
+        if protocol_errors.is_responses_max_output_incomplete(data, "response.incomplete"):
+            msg = protocol_errors.responses_max_output_context_error_message(reason)
+            self.state.terminal_status = "error"
+            self.state.terminal_error = {
+                "message": msg,
+                "detail": {
+                    "type": "invalid_request_error",
+                    "code": protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                    "param": None,
+                },
+            }
+            self.state.terminal_emitted = True
+            yield _mk_error_chunk(
+                self.state,
+                message=msg,
+                err_type="invalid_request_error",
+                code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                param=None,
+            )
+            yield _DONE
         elif reason == "content_filter":
             self.state.finish_reason = "content_filter"
         else:
             self.state.finish_reason = "stop"
-        return
-        yield
 
     def get_downstream_chat_assistant(self) -> dict:
         """累积至今的下游 chat `assistant` message 快照。

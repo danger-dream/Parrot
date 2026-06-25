@@ -46,3 +46,26 @@ def test_extract_error_info_supports_wrapped_anthropic_and_openai_shapes():
         "error: boom",
     )
     assert errors.extract_error_info({"message": "plain"}) == (None, "plain")
+
+
+def test_context_length_errors_are_formatted_for_claude_code_compact():
+    code, message = errors.extract_error_info({
+        "error": {
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again.",
+        }
+    })
+
+    assert code == "context_length_exceeded"
+    assert message.startswith("Prompt is too long:")
+    assert "context_length_exceeded" in message
+    assert "context window" in message
+
+
+def test_context_length_formatter_preserves_parseable_token_gap():
+    message = errors.context_length_error_message_for_claude_code(
+        "This model's maximum context length is 272000 tokens. 300000 tokens > 272000 maximum."
+    )
+
+    assert message.startswith("Prompt is too long: 300000 tokens > 272000 maximum.")

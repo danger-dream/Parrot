@@ -274,9 +274,14 @@ def _tool_result_content(
         return str(content)
 
 
-def _parse_tool_args(raw: Any) -> dict[str, Any]:
+def _parse_tool_args(
+    raw: Any,
+    *,
+    tool_name: str | None = None,
+    optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
     if isinstance(raw, dict):
-        return raw
+        return common.normalize_tool_input_optional_empty_strings(tool_name, raw, optional_empty_string_fields_by_tool)
     if not isinstance(raw, str) or not raw:
         return {}
     try:
@@ -285,13 +290,14 @@ def _parse_tool_args(raw: Any) -> dict[str, Any]:
         _fail("assistant tool_call function.arguments must be valid JSON object for Chat→Anthropic bridge", param="messages")
     if not isinstance(value, dict):
         _fail("assistant tool_call function.arguments must decode to a JSON object for Chat→Anthropic bridge", param="messages")
-    return value
+    return common.normalize_tool_input_optional_empty_strings(tool_name, value, optional_empty_string_fields_by_tool)
 
 
 def _convert_messages(
     messages: Any,
     *,
     allow_file_url_documents: bool = False,
+    optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, str]]:
     out: list[dict[str, Any]] = []
     system: list[dict[str, str]] = []
@@ -368,7 +374,11 @@ def _convert_messages(
                     "type": "tool_use",
                     "id": tool_use_id,
                     "name": str(fn.get("name") or ""),
-                    "input": _parse_tool_args(fn.get("arguments")),
+                    "input": _parse_tool_args(
+                        fn.get("arguments"),
+                        tool_name=str(fn.get("name") or ""),
+                        optional_empty_string_fields_by_tool=optional_empty_string_fields_by_tool,
+                    ),
                 })
         if not content:
             content = [{"type": "text", "text": ""}]
@@ -510,6 +520,7 @@ def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> 
     messages, system_blocks, _ = _convert_messages(
         body.get("messages") or [],
         allow_file_url_documents=allow_file_url_documents,
+        optional_empty_string_fields_by_tool=common.optional_empty_string_fields_by_tool_from_responses_tools(body.get("tools")),
     )
     payload["messages"] = messages
     if system_blocks:

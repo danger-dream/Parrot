@@ -18,6 +18,7 @@ import httpx
 
 from .. import blacklist, log_db, upstream
 from ..providers import registry as provider_registry
+from ..protocols import errors as protocol_errors
 from ..protocols.commit_gate import SseCommitGate
 from ..protocols.runtime import AttemptResult, make_stream_translator, toolkit_for_channel
 from .base import metadata_from_response
@@ -138,6 +139,37 @@ def _attempt_result(outcome: str, detail: str, *, bucket: dict | None = None,
         proxy_name=proxy_name,
         proxy_bytes_up=up,
         proxy_bytes_down=down,
+    )
+
+
+def _stream_tracker_error_result(
+    tracker,
+    *,
+    connect_ms: int,
+    first_byte_ms: int | None,
+    response_status: int | None = None,
+    translator_ctx: dict | None = None,
+) -> AttemptResult | None:
+    """Convert a terminal SSE error observed by a tracker into an attempt error.
+
+    OpenAI Responses stream-only channels can return HTTP 200 and later terminate
+    the SSE with ``event:error`` / ``response.failed``.  When Parrot aggregates
+    that stream for a non-stream downstream (notably the local WebSearch loop),
+    treating the builder output as success hides semantic errors like
+    ``context_length_exceeded`` from Claude Code and prevents its compact flow.
+    """
+
+    if not bool(getattr(tracker, "saw_stream_error", False)):
+        return None
+    message = getattr(tracker, "stream_error_message", None) or "upstream stream error"
+    detail = str(message)
+    return AttemptResult(
+        outcome="upstream_error_json",
+        connect_ms=connect_ms,
+        first_byte_ms=first_byte_ms,
+        http_status=response_status,
+        error_detail=detail[:2000],
+        translator_ctx=translator_ctx,
     )
 
 
@@ -348,6 +380,15 @@ async def aggregate_stream_as_non_stream_response(
         if isinstance(first_chunk_restored, (bytes, bytearray))
         else first_chunk_restored.encode("utf-8", errors="replace")
     )
+    if err := _stream_tracker_error_result(
+        tracker,
+        connect_ms=connect_ms,
+        first_byte_ms=first_byte_ms,
+        response_status=response.status_code,
+        translator_ctx=translator_ctx,
+    ):
+        await close_response_context(ctx)
+        return StreamAsNonStreamResult(error=err)
 
     while True:
         now = time.time()
@@ -401,6 +442,15 @@ async def aggregate_stream_as_non_stream_response(
             if isinstance(restored_chunk, (bytes, bytearray))
             else restored_chunk.encode("utf-8", errors="replace")
         )
+        if err := _stream_tracker_error_result(
+            tracker,
+            connect_ms=connect_ms,
+            first_byte_ms=first_byte_ms,
+            response_status=response.status_code,
+            translator_ctx=translator_ctx,
+        ):
+            await close_response_context(ctx)
+            return StreamAsNonStreamResult(error=err)
 
     response_headers = metadata_from_response(response).forward_headers()
     await close_response_context(ctx)
@@ -755,6 +805,20 @@ async def read_next_stream_step(
             downstream_chunks = list(stream_translator.feed(restored))
         else:
             downstream_chunks = [restored]
+
+        if (
+            getattr(tracker, "saw_stream_error", False)
+            and getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+        ):
+            return HttpStreamReadStep(
+                kind="error",
+                err_type="invalid_request_error",
+                message=(
+                    getattr(tracker, "stream_error_message", None)
+                    or protocol_errors.responses_max_output_context_error_message()
+                ),
+                outcome="request_invalid",
+            )
 
         if downstream_chunks:
             bl_hit = blacklist.match(b"".join(downstream_chunks), getattr(channel, "key", ""))

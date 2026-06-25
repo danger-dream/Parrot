@@ -667,7 +667,7 @@ def install_notify_handler() -> None:
 # ─── 日志条目共用渲染 ──────────────────────────────────────────────
 
 _LOG_STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
-_LOG_INGRESS_TAG = {"chat": "[chat]", "responses": "[rsp]", "responses_ws": "[rsp]"}
+_LOG_INGRESS_TAG = {"chat": "[chat]", "responses": "[response]", "responses_ws": "[response]"}
 
 
 def _log_transport_tag(row: dict) -> str:
@@ -678,14 +678,31 @@ def _log_transport_tag(row: dict) -> str:
     return ""
 
 
-def fmt_log_entry_body(r: dict) -> str:
-    """渲染日志条目的 body 部分（渠道 + Token + 耗时 + 传输协议/代理 + 错误）。
+def _log_model_display(r: dict) -> str:
+    requested = str(r.get("requested_model") or "?")
+    final = str(r.get("final_model") or "").strip()
+    if final and final != requested:
+        return f"{escape_html(requested)} → {escape_html(final)}"
+    return escape_html(final or requested)
 
-    供 logs_menu 列表和 stats_menu 最近调用共用，保证格式完全一致。
-    不含首行（首行由调用方自行拼接：列表带 #编号+key，最近调用不带）。
-    返回多行字符串，每行已有 2 空格缩进前缀。
+
+def fmt_log_entry_body(r: dict) -> str:
+    """渲染日志条目的 body 部分。
+
+    列表首行只放编号/时间/Key/状态，模型、渠道、Token、耗时、代理分行展示，
+    避免长模型名把 Telegram 单行撑爆。
     """
     lines: list[str] = []
+
+    # 模型 + 入口协议 + 思考强度
+    model_line = f"  模型: <code>{_log_model_display(r)}</code>"
+    ing_tag = _LOG_INGRESS_TAG.get(r.get("ingress_protocol") or "", "")
+    if ing_tag:
+        model_line += f" <code>{ing_tag}</code>"
+    effort = r.get("reasoning_effort")
+    if effort:
+        model_line += f" · 🧠 {escape_html(effort)}"
+    lines.append(model_line)
 
     # 渠道
     if r.get("final_channel_key"):
@@ -718,23 +735,23 @@ def fmt_log_entry_body(r: dict) -> str:
     if tps_v is not None:
         timing_parts.append(f"⚡ {fmt_tps(tps_v)}")
     if (r.get("retry_count") or 0) > 0 and not r.get("final_channel_key"):
-        # 无渠道行时重试信息追加到耗时行
         timing_parts.append(f"重试 {r['retry_count']} 次")
     if timing_parts:
         lines.append("  耗时: " + " · ".join(timing_parts))
 
-    # 传输协议 + 出站代理（合并一行）
+    # 传输协议 / 出站代理 / 本地搜索。常规 response 已在模型行展示，这里只显示特殊 WS。
     transport = _log_transport_tag(r)
     proxy_name = r.get("proxy_name")
-    if transport or proxy_name:
-        tp_line = "  "
-        if transport:
-            tp_line += f"传输协议: <b>{transport}</b>"
-            if proxy_name:
-                tp_line += f" · 出站代理: {escape_html(proxy_name)}"
-        else:
-            tp_line += f"出站代理: {escape_html(proxy_name)}"
-        lines.append(tp_line)
+    try:
+        search_count = int(r.get("local_web_count") or 0)
+    except Exception:
+        search_count = 0
+    if transport in {"WS", "↑WS"}:
+        lines.append(f"  传输协议: <b>{transport}</b>")
+    if proxy_name:
+        lines.append(f"  出站代理: {escape_html(proxy_name)}")
+    if search_count:
+        lines.append(f"  搜索: {search_count} 次")
 
     # 错误
     if r.get("status") == "error" and r.get("error_message"):
@@ -745,20 +762,11 @@ def fmt_log_entry_body(r: dict) -> str:
 
 
 def fmt_log_entry_headline(r: dict, *, prefix: str = "") -> str:
-    """渲染日志条目首行：[时间] 模型 · [rsp] · 🧠 effort · icon。
+    """渲染日志条目首行：#编号 [时间] Key 状态。
 
-    prefix: 可选前缀（如 '#1 key → '），由调用方传入。
+    模型等长字段放到 body 分行，避免 Telegram 列表单行过长换行。
     """
     ts = fmt_bjt_ts(r.get("created_at"), "%m-%d %H:%M:%S")
     icon = _LOG_STATUS_ICON.get(r.get("status"), "?")
-    model = escape_html(r.get("requested_model") or "?")
-    ing_tag = _LOG_INGRESS_TAG.get(r.get("ingress_protocol") or "", "")
-
-    line = f"{prefix}<code>[{ts}]</code> <b>{model}</b>"
-    if ing_tag:
-        line += f" <code>{ing_tag}</code>"
-    effort = r.get("reasoning_effort")
-    if effort:
-        line += f" · 🧠 {escape_html(effort)}"
-    line += f" {icon}"
-    return line
+    key = escape_html(r.get("api_key_name") or "?")
+    return f"{prefix}<code>[{ts}]</code> <b>{key}</b> {icon}"

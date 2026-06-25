@@ -139,6 +139,25 @@ def test_responses_stream_to_anthropic_lazily_emits_after_visible_text():
     assert tail_events[1][1]["usage"]["input_tokens"] == 5
 
 
+def test_responses_stream_to_anthropic_keepalive_becomes_anthropic_ping():
+    tr = ResponsesToAnthropicStream(model="gpt-real")
+    gate = SseCommitGate(protocol="anthropic", stream_translator=tr)
+
+    metadata = (
+        b'event: response.created\n'
+        b'data: {"type":"response.created","response":{"id":"resp_keep","status":"in_progress","model":"gpt-real"}}\n\n'
+    )
+    first = gate.feed(metadata)
+    assert first.downstream_chunks == []
+    assert first.error_event is None
+
+    second = gate.feed(b'event: keepalive\ndata: {"type":"keepalive"}\n\n')
+    assert second.error_event is None
+    events = _events(second.downstream_chunks)
+    assert [e for e, _ in events] == ["message_start", "ping"]
+    assert events[0][1]["message"]["id"] == "resp_keep"
+
+
 def test_responses_stream_to_anthropic_tool_call():
     tr = ResponsesToAnthropicStream(model="gpt-real")
     chunks: list[bytes] = []
@@ -154,6 +173,27 @@ def test_responses_stream_to_anthropic_tool_call():
     assert starts[0]["content_block"] == {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
     assert deltas[0]["delta"] == {"type": "input_json_delta", "partial_json": '{"q":"ping"}'}
     assert msg_delta["delta"]["stop_reason"] == "tool_use"
+
+
+def test_responses_stream_to_anthropic_stops_tool_on_output_item_done():
+    tr = ResponsesToAnthropicStream(model="gpt-real")
+    chunks: list[bytes] = []
+    chunks += list(tr.feed(b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"","status":"in_progress"}}\n\n'))
+    chunks += list(tr.feed(b'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\\"q\\":\\"ping\\"}"}\n\n'))
+    chunks += list(tr.feed(b'event: response.function_call_arguments.done\ndata: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\\"q\\":\\"ping\\"}"}\n\n'))
+    chunks += list(tr.feed(b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\\"q\\":\\"ping\\"}","status":"completed"}}\n\n'))
+    chunks += list(tr.feed(b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"lookup","arguments":"","status":"in_progress"}}\n\n'))
+
+    events = _events(chunks)
+    assert [e for e, _ in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+    ]
+    assert events[3][1] == {"type": "content_block_stop", "index": 0}
+    assert events[4][1]["index"] == 1
 
 
 def test_anthropic_stream_to_chat_text_tool_and_usage():
@@ -402,3 +442,64 @@ def test_matrix_allows_openai_stream_to_anthropic_stream_upstream():
     resp_body = {"stream": True, "input": "hi"}
     assert DEFAULT_MATRIX.plan("chat", "anthropic", features=extract_request_features("chat", chat_body)).required_transforms == ["chat_to_anthropic"]
     assert DEFAULT_MATRIX.plan("responses", "anthropic", features=extract_request_features("responses", resp_body)).required_transforms == ["responses_to_anthropic"]
+
+
+def test_responses_stream_to_anthropic_drops_optional_empty_string_tool_args_by_schema():
+    request_body = {
+        "tools": [{
+            "name": "GenericTool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "optional_note": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        }],
+    }
+    tr = ResponsesToAnthropicStream(model="gpt-real", request_body=request_body)
+    chunks: list[bytes] = []
+    chunks += list(tr.feed(b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"GenericTool","arguments":"","status":"in_progress"}}\n\n'))
+    chunks += list(tr.feed(b'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\\"query\\":\\"x\\",\\"optional_note\\":\\"\\"}"}\n\n'))
+    chunks += list(tr.feed(b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"GenericTool","arguments":"{\\"query\\":\\"x\\",\\"optional_note\\":\\"\\"}","status":"completed"}}\n\n'))
+    chunks += list(tr.feed(b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-real","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'))
+    chunks += list(tr.close())
+
+    events = _events(chunks)
+    deltas = [d for e, d in events if e == "content_block_delta"]
+    assert deltas == [{
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": '{"query":"x"}'},
+    }]
+    assert tr.get_downstream_anthropic_assistant()["content"][0]["input"] == {"query": "x"}
+
+
+def test_responses_stream_to_anthropic_keeps_required_empty_and_nonempty_optional_args():
+    request_body = {
+        "tools": [{
+            "name": "GenericTool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "required_note": {"type": "string"},
+                    "optional_note": {"type": "string"},
+                },
+                "required": ["required_note"],
+            },
+        }],
+    }
+    tr = ResponsesToAnthropicStream(model="gpt-real", request_body=request_body)
+    chunks: list[bytes] = []
+    chunks += list(tr.feed(b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"GenericTool","arguments":"","status":"in_progress"}}\n\n'))
+    args = '{"required_note":"","optional_note":"1-5"}'
+    payload = ('event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"GenericTool","arguments":' + json.dumps(args) + ',"status":"completed"}}\n\n').encode()
+    chunks += list(tr.feed(payload))
+    chunks += list(tr.feed(b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-real"}}\n\n'))
+    chunks += list(tr.close())
+
+    assert tr.get_downstream_anthropic_assistant()["content"][0]["input"] == {
+        "required_note": "",
+        "optional_note": "1-5",
+    }

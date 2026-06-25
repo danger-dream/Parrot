@@ -9,6 +9,7 @@ payloads; this module decides what an upstream/transport error *means*.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Literal
 
 from .. import errors as legacy_errors
@@ -29,6 +30,155 @@ ErrorCategory = Literal[
     "blacklist",
     "client_cancelled",
 ]
+
+
+CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
+RESPONSES_MAX_OUTPUT_INCOMPLETE_REASONS = frozenset({"max_output_tokens", "max_tokens"})
+
+
+def responses_incomplete_reason(payload: Any) -> str | None:
+    """Return ``response.incomplete`` reason from a Responses payload/event.
+
+    OpenAI Responses may report output-budget exhaustion as a terminal
+    ``response.incomplete`` event instead of a normal error.  Many downstream
+    clients do not understand that terminal event, so Parrot normalizes the
+    unambiguous ``max_output_tokens`` case into a context-length style error.
+    """
+    if not isinstance(payload, dict):
+        return None
+    resp = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    if not isinstance(resp, dict):
+        return None
+    details = resp.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    if reason is None and payload.get("type") == "response.incomplete":
+        reason = resp.get("status")
+    if reason is None and resp.get("status") == "incomplete":
+        details = resp.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, dict) else None
+    return str(reason) if reason is not None else None
+
+
+def is_responses_max_output_incomplete(payload: Any, event_name: str | None = None) -> bool:
+    """Whether a Responses terminal incomplete means no usable output budget.
+
+    This intentionally does not inspect token counts or model limits: the
+    explicit upstream terminal reason is enough and is stable across models.
+    """
+    if not isinstance(payload, dict):
+        return False
+    typ = str(payload.get("type") or event_name or "")
+    resp = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    status = resp.get("status") if isinstance(resp, dict) else None
+    if typ != "response.incomplete" and status != "incomplete":
+        return False
+    reason = responses_incomplete_reason(payload)
+    return str(reason or "") in RESPONSES_MAX_OUTPUT_INCOMPLETE_REASONS
+
+
+_CONTEXT_LENGTH_ERROR_CODES = frozenset({
+    CONTEXT_LENGTH_EXCEEDED_CODE,
+    "context_too_large",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+    "request_too_large",
+})
+_CONTEXT_LENGTH_MESSAGE_MARKERS = (
+    "context_length_exceeded",
+    "context_too_large",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+    "request_too_large",
+    "context length exceeded",
+    "maximum context length",
+    "context window",
+    "prompt is too long",
+    "prompt too long",
+    "too many tokens",
+    "model token limit",
+    "input exceeds the context window",
+    "input exceeds the maximum number of tokens",
+    "input is too long",
+    "request size exceeds model context window",
+)
+_TOKEN_GT_RE = re.compile(r"(\d[\d,]*)\s*tokens?\s*>\s*(\d[\d,]*)", re.IGNORECASE)
+
+
+def is_context_length_code_or_message(code: Any = None, message: Any = None) -> bool:
+    """Return True when an upstream error means the prompt exceeds context.
+
+    This intentionally lives in the protocol error module (rather than the
+    failover runtime) so translators can normalize terminal SSE/WS events
+    before they become downstream Anthropic errors.
+    """
+    code_s = str(code or "").strip().lower()
+    msg_s = str(message or "").strip().lower()
+    if code_s in _CONTEXT_LENGTH_ERROR_CODES:
+        return True
+    text = f"{code_s} {msg_s}"
+    if not text.strip():
+        return False
+    if ("rate_limit" in text or "rate limit" in text) and "context" not in text:
+        return False
+    return any(marker in text for marker in _CONTEXT_LENGTH_MESSAGE_MARKERS)
+
+
+def context_length_error_message_for_claude_code(
+    message: Any = None,
+    *,
+    actual_tokens: int | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """Format context overflow so Claude Code triggers reactive compact.
+
+    Old Claude Code does not recover from OpenAI-style
+    ``context_length_exceeded`` alone. Its recovery path looks for the human
+    phrase ``Prompt is too long`` in the Anthropic SDK error message, and can
+    optionally parse ``N tokens > M``. Preserve the upstream detail after the
+    prefix so humans and logs still see the original provider reason.
+    """
+    detail = str(message or "").strip()
+    if "prompt is too long" in detail.lower():
+        return detail
+
+    if actual_tokens is not None and max_tokens is not None:
+        prefix = f"Prompt is too long: {int(actual_tokens)} tokens > {int(max_tokens)} maximum."
+    elif actual_tokens is not None:
+        prefix = f"Prompt is too long: {int(actual_tokens)} tokens exceed the model context window."
+    else:
+        m = _TOKEN_GT_RE.search(detail)
+        if m:
+            actual = m.group(1).replace(",", "")
+            limit = m.group(2).replace(",", "")
+            prefix = f"Prompt is too long: {actual} tokens > {limit} maximum."
+        else:
+            prefix = "Prompt is too long:"
+
+    if not detail:
+        detail = "input exceeds the model context window."
+    if detail.lower().startswith("prompt is too long"):
+        return detail
+    return f"{prefix} {detail}"
+
+
+def responses_max_output_context_error_message(reason: str | None = None) -> str:
+    reason = str(reason or "max_output_tokens")
+    detail = (
+        f"{CONTEXT_LENGTH_EXCEEDED_CODE}: upstream Responses ended incomplete "
+        f"because incomplete_details.reason={reason}; reduce input context or reserved output tokens."
+    )
+    return context_length_error_message_for_claude_code(detail)
+
+
+def _format_error_info(code: Any, message: Any, fallback: str) -> tuple[str | None, str]:
+    code_s = str(code) if code else None
+    msg_s = str(message or fallback)
+    if code_s and code_s not in msg_s:
+        msg_s = f"{code_s}: {msg_s}"
+    if is_context_length_code_or_message(code_s, msg_s):
+        msg_s = context_length_error_message_for_claude_code(msg_s)
+        code_s = code_s or CONTEXT_LENGTH_EXCEEDED_CODE
+    return code_s, msg_s
 
 
 @dataclass(frozen=True)
@@ -159,6 +309,12 @@ def extract_error_info(payload: Any, fallback: str = "upstream stream error") ->
     Responses WS.  This function is intentionally formatting-compatible with the
     old ``upstream._format_stream_error_info`` helper.
     """
+    if is_responses_max_output_incomplete(payload):
+        return (
+            CONTEXT_LENGTH_EXCEEDED_CODE,
+            responses_max_output_context_error_message(responses_incomplete_reason(payload)),
+        )
+
     err = payload
     if isinstance(payload, dict):
         if isinstance(payload.get("error"), dict):
@@ -174,9 +330,7 @@ def extract_error_info(payload: Any, fallback: str = "upstream stream error") ->
             or err.get("status")
         )
         message = err.get("message") or err.get("reason") or fallback
-        if code and str(code) not in str(message):
-            return str(code), f"{code}: {message}"
-        return str(code) if code else None, str(message)
+        return _format_error_info(code, message, fallback)
 
     if isinstance(payload, dict):
         top_type = payload.get("type")
@@ -187,8 +341,6 @@ def extract_error_info(payload: Any, fallback: str = "upstream stream error") ->
             or payload.get("status")
         )
         message = payload.get("message") or payload.get("reason") or fallback
-        if code and str(code) not in str(message):
-            return str(code), f"{code}: {message}"
-        return str(code) if code else None, str(message)
+        return _format_error_info(code, message, fallback)
 
     return None, fallback

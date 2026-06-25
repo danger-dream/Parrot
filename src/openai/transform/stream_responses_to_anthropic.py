@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
+from ...protocols import errors as protocol_errors
+from . import common
 from ...protocols.usage import legacy_usage_from_openai_responses_json
 
 
@@ -44,6 +46,35 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
     except Exception:
         return event_name, None
     return event_name, obj if isinstance(obj, dict) else None
+
+
+def _error_type_from_code_or_message(code: Any, message: Any) -> str:
+    low = f"{code or ''} {message or ''}".lower()
+    if protocol_errors.is_context_length_code_or_message(code, message):
+        return "invalid_request_error"
+    if "rate_limit" in low or "rate limit" in low:
+        return "rate_limit_error"
+    if "permission" in low or "forbidden" in low:
+        return "permission_error"
+    if "auth" in low or "api key" in low:
+        return "authentication_error"
+    return "api_error"
+
+
+def _normalize_error_for_anthropic(err: dict[str, Any]) -> dict[str, Any]:
+    out = dict(err or {})
+    message = out.get("message") or out.get("reason") or "upstream response failed"
+    code = out.get("code") or out.get("error_type")
+    if protocol_errors.is_context_length_code_or_message(code, message):
+        out["type"] = "invalid_request_error"
+        out["code"] = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+        out["message"] = protocol_errors.context_length_error_message_for_claude_code(message)
+        return out
+    if not out.get("message"):
+        out["message"] = str(message)
+    if not out.get("type"):
+        out["type"] = _error_type_from_code_or_message(code, message)
+    return out
 
 
 def _response_from_event(data: dict) -> dict:
@@ -109,12 +140,26 @@ class _State:
 class StreamTranslator:
     """OpenAI Responses SSE → Anthropic SSE."""
 
-    def __init__(self, *, model: str, created_ts: Optional[int] = None):
+    def __init__(
+        self,
+        *,
+        model: str,
+        created_ts: Optional[int] = None,
+        optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
+        request_body: dict[str, Any] | None = None,
+    ):
         self.state = _State(
             message_id=_gen_id("msg_"),
             model=model,
             created_ts=int(created_ts or time.time()),
         )
+        self.optional_empty_string_fields_by_tool = dict(optional_empty_string_fields_by_tool or {})
+        if request_body is not None:
+            self.optional_empty_string_fields_by_tool.update(
+                common.optional_empty_string_fields_by_tool_from_anthropic_tools(
+                    request_body.get("tools") if isinstance(request_body, dict) else None
+                )
+            )
         self._buf = b""
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
@@ -157,7 +202,7 @@ class StreamTranslator:
     def _handle_event(self, event_name: str, data: dict) -> Iterator[bytes]:
         if event_name == "error" or data.get("type") == "error" or isinstance(data.get("error"), dict):
             err = data.get("error") if isinstance(data.get("error"), dict) else data
-            yield _emit("error", {"type": "error", "error": err})
+            yield _emit("error", {"type": "error", "error": _normalize_error_for_anthropic(err)})
             self.state.terminal_emitted = True
             return
 
@@ -165,9 +210,18 @@ class StreamTranslator:
             self._capture_response_metadata(_response_from_event(data))
             return
 
+        if event_name == "keepalive" or data.get("type") == "keepalive":
+            yield from self._emit_ping()
+            return
+
         if event_name == "response.output_item.added":
             item = data.get("item") if isinstance(data.get("item"), dict) else {}
             yield from self._on_output_item_added(data, item)
+            return
+
+        if event_name == "response.output_item.done":
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            yield from self._on_output_item_done(data, item)
             return
 
         if event_name == "response.content_part.added":
@@ -186,13 +240,8 @@ class StreamTranslator:
             delta = data.get("delta")
             if isinstance(delta, str) and delta:
                 st = self._tool_for_delta_event(data)
-                yield from self._start_tool_if_needed(st)
-                st.args += delta
-                yield _emit("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": st.block_index,
-                    "delta": {"type": "input_json_delta", "partial_json": delta},
-                })
+                if not st.stopped:
+                    yield from self._emit_tool_args_delta(st, delta)
             return
 
         if event_name in ("response.completed", "response.incomplete", "response.failed"):
@@ -204,9 +253,24 @@ class StreamTranslator:
             usage = resp.get("usage")
             if isinstance(usage, dict):
                 self.state.usage = usage
-            if event_name == "response.failed":
-                err = resp.get("error") if isinstance(resp.get("error"), dict) else {"message": "upstream response failed"}
-                yield _emit("error", {"type": "error", "error": err})
+            if protocol_errors.is_responses_max_output_incomplete(data, event_name):
+                msg = protocol_errors.responses_max_output_context_error_message(self.state.incomplete_reason)
+                yield _emit("error", {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                        "message": msg,
+                    },
+                })
+                self.state.terminal_emitted = True
+            elif event_name == "response.failed":
+                err = (
+                    resp.get("error")
+                    if isinstance(resp.get("error"), dict)
+                    else {"message": "upstream response failed"}
+                )
+                yield _emit("error", {"type": "error", "error": _normalize_error_for_anthropic(err)})
                 self.state.terminal_emitted = True
             return
 
@@ -226,6 +290,39 @@ class StreamTranslator:
             return
         key = self._key_from_item_event(data, item)
         st = self._tool_state(key)
+        self._update_tool_metadata(st, data, item, key)
+        yield from self._start_tool_if_needed(st)
+
+    def _on_output_item_done(self, data: dict, item: dict) -> Iterator[bytes]:
+        item_type = item.get("type")
+        if item_type != "function_call":
+            return
+        key = self._key_from_item_event(data, item)
+        st = self._tool_state(key)
+        self._update_tool_metadata(st, data, item, key)
+        done_args = item.get("arguments")
+        if self._should_buffer_tool_args(st) and isinstance(done_args, str):
+            st.args = done_args
+        elif isinstance(done_args, str) and done_args != st.args:
+            # Responses usually emits argument deltas before output_item.done,
+            # but some providers only include the final arguments on the done
+            # item.  Emit only the missing suffix when the final value extends
+            # the streamed buffer; otherwise avoid duplicating/mangling JSON.
+            if done_args.startswith(st.args):
+                missing = done_args[len(st.args):]
+                if missing:
+                    yield from self._emit_tool_args_delta(st, missing)
+            elif not st.args:
+                yield from self._emit_tool_args_delta(st, done_args)
+        if self._should_buffer_tool_args(st):
+            yield from self._flush_buffered_tool_args_if_needed(st)
+        else:
+            yield from self._start_tool_if_needed(st)
+        if not st.stopped:
+            st.stopped = True
+            yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
+
+    def _update_tool_metadata(self, st: _ToolState, data: dict, item: dict, key: str) -> None:
         call_id = item.get("call_id") or item.get("id")
         if isinstance(call_id, str) and call_id:
             st.id = call_id
@@ -233,7 +330,6 @@ class StreamTranslator:
         if isinstance(name, str) and name:
             st.name = name
         self._remember_tool_key(data, item, key)
-        yield from self._start_tool_if_needed(st)
 
     # ─── Anthropic emit helpers ──────────────────────────────────
 
@@ -278,6 +374,14 @@ class StreamTranslator:
             "delta": {"type": "text_delta", "text": text},
         })
 
+    def _emit_ping(self) -> Iterator[bytes]:
+        # Anthropic streams may contain ping events.  Forward OpenAI keepalives
+        # as Anthropic pings so Claude Code does not see a dead connection while
+        # Responses spends a long time in hidden/replayed reasoning.
+        if not self.state.message_started:
+            yield from self._emit_message_start()
+        yield _emit("ping", {"type": "ping"})
+
     def _stop_text_if_needed(self) -> Iterator[bytes]:
         if self.state.text_started and not self.state.text_stopped:
             self.state.text_stopped = True
@@ -306,11 +410,56 @@ class StreamTranslator:
             "content_block": {"type": "tool_use", "id": st.id, "name": name, "input": {}},
         })
 
+    def _should_buffer_tool_args(self, st: _ToolState) -> bool:
+        return bool(self.optional_empty_string_fields_by_tool.get(st.name or ""))
+
+    def _sanitized_tool_args_json(self, st: _ToolState) -> str:
+        try:
+            parsed = json.loads(st.args) if st.args else {}
+        except Exception:
+            return st.args
+        if not isinstance(parsed, dict):
+            return st.args
+        normalized = common.normalize_tool_input_optional_empty_strings(
+            st.name,
+            parsed,
+            self.optional_empty_string_fields_by_tool,
+        )
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+    def _emit_tool_args_delta(self, st: _ToolState, delta: str) -> Iterator[bytes]:
+        if not delta:
+            return
+        st.args += delta
+        if self._should_buffer_tool_args(st):
+            return
+        yield from self._start_tool_if_needed(st)
+        yield _emit("content_block_delta", {
+            "type": "content_block_delta",
+            "index": st.block_index,
+            "delta": {"type": "input_json_delta", "partial_json": delta},
+        })
+
+    def _flush_buffered_tool_args_if_needed(self, st: _ToolState) -> Iterator[bytes]:
+        if not self._should_buffer_tool_args(st):
+            return
+        args_json = self._sanitized_tool_args_json(st)
+        yield from self._start_tool_if_needed(st)
+        if args_json:
+            yield _emit("content_block_delta", {
+                "type": "content_block_delta",
+                "index": st.block_index,
+                "delta": {"type": "input_json_delta", "partial_json": args_json},
+            })
+
     def _stop_all_tools(self) -> Iterator[bytes]:
         for key in sorted(self.state.tools.keys(), key=lambda k: self.state.tools[k].block_index):
             st = self.state.tools[key]
             if not st.started:
-                yield from self._start_tool_if_needed(st)
+                if self._should_buffer_tool_args(st):
+                    yield from self._flush_buffered_tool_args_if_needed(st)
+                else:
+                    yield from self._start_tool_if_needed(st)
             if st.started and not st.stopped:
                 st.stopped = True
                 yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
@@ -364,5 +513,10 @@ class StreamTranslator:
                     parsed = {"_raw": st.args}
                 if not isinstance(parsed, dict):
                     parsed = {"_value": parsed}
+                parsed = common.normalize_tool_input_optional_empty_strings(
+                    st.name,
+                    parsed,
+                    self.optional_empty_string_fields_by_tool,
+                )
                 blocks.append({"type": "tool_use", "id": st.id, "name": st.name or "tool", "input": parsed})
         return {"role": "assistant", "content": blocks}

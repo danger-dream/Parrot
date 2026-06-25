@@ -16,6 +16,7 @@ from urllib.parse import urlparse, urlunparse
 import websockets
 
 from .. import blacklist
+from ..protocols import errors as protocol_errors
 from ..protocols.runtime import (
     is_responses_ws_visible_event_type,
     is_retryable_responses_ws_error_before_accept,
@@ -354,6 +355,13 @@ async def read_until_first_responses_ws_visible_event(
                     status, detail = responses_ws_error_detail(data)
                     result.http_status = status
                     result.error_detail = detail
+                if getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE:
+                    result.outcome = "request_invalid"
+                    result.http_status = 400
+                    result.error_detail = (
+                        getattr(tracker, "stream_error_message", None)
+                        or protocol_errors.responses_max_output_context_error_message()
+                    )
                 if event_type == "response.failed":
                     result.pending.append(data)
                     result.stream_started = True
@@ -434,10 +442,20 @@ async def read_next_responses_ws_step(
                 close_reason=close_reason,
             )
         if getattr(tracker, "response_failed", False):
+            is_context_error = (
+                getattr(tracker, "stream_error_code", None)
+                == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+            )
+            error_detail = getattr(tracker, "stream_error_message", None)
+            if not error_detail:
+                error_detail = (
+                    protocol_errors.responses_max_output_context_error_message()
+                    if is_context_error else "upstream stream error"
+                )
             return ResponsesWsReadStep(
-                outcome="stream_upstream_error",
-                error_detail=getattr(tracker, "stream_error_message", None) or "upstream stream error",
-                http_status=503,
+                outcome="request_invalid" if is_context_error else "stream_upstream_error",
+                error_detail=error_detail,
+                http_status=400 if is_context_error else 503,
                 response_failed=True,
                 close_code=close_code,
                 close_reason=close_reason,
@@ -471,9 +489,18 @@ async def read_next_responses_ws_step(
                 step.http_status = 503
                 return step
         if getattr(tracker, "response_failed", False):
-            step.outcome = "stream_upstream_error"
-            step.error_detail = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-            step.http_status = 503
+            if getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE:
+                step.outcome = "request_invalid"
+                step.error_detail = (
+                    getattr(tracker, "stream_error_message", None)
+                    or protocol_errors.responses_max_output_context_error_message()
+                )
+                step.http_status = 400
+                step.skip_downstream = True
+            else:
+                step.outcome = "stream_upstream_error"
+                step.error_detail = getattr(tracker, "stream_error_message", None) or "upstream stream error"
+                step.http_status = 503
             step.response_failed = True
             return step
         if check_blacklist and not blacklist_before_error:

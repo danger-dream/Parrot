@@ -101,6 +101,13 @@ def _format_stream_error_info(payload: Any, fallback: str = "upstream stream err
 
 def _incomplete_stream_error_info(data: dict) -> tuple[str, str]:
     """Readable error info for OpenAI Responses response.incomplete events."""
+    if protocol_errors.is_responses_max_output_incomplete(data):
+        return (
+            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+            protocol_errors.responses_max_output_context_error_message(
+                protocol_errors.responses_incomplete_reason(data)
+            ),
+        )
     resp = data.get("response") if isinstance(data, dict) else None
     details = resp.get("incomplete_details") if isinstance(resp, dict) else None
     reason = details.get("reason") if isinstance(details, dict) else None
@@ -393,6 +400,8 @@ def parse_sse_event_bytes(block: bytes) -> tuple[Optional[str], Optional[dict]]:
 def is_stream_error_event(event_name: Optional[str], data: Optional[dict]) -> bool:
     if not isinstance(data, dict):
         return False
+    if protocol_errors.is_responses_max_output_incomplete(data, event_name):
+        return True
     if event_name == "error" or data.get("type") == "error":
         return True
     if event_name == "response.failed":
@@ -699,11 +708,14 @@ class ResponsesSSEUsageTracker:
                 self.saw_stream_error = True
                 self.stream_error_code, self.stream_error_message = _format_stream_error_info(data)
             elif event_name == "response.incomplete":
-                # Incomplete is a terminal Responses event, but not necessarily an
-                # upstream fault (for example max_output_tokens maps to length).
-                # Treat it as stream end so client disconnect after it will not be
-                # mislabeled, while preserving existing success/translator close behavior.
                 self.saw_stream_end = True
+                if protocol_errors.is_responses_max_output_incomplete(data, event_name):
+                    # Downstream clients commonly miss the Responses-specific
+                    # terminal incomplete event.  Normalize the explicit
+                    # max_output_tokens reason into a context-length style error
+                    # so existing retry/compact paths can recognize it.
+                    self.saw_stream_error = True
+                    self.stream_error_code, self.stream_error_message = _incomplete_stream_error_info(data)
             elif event_name == "response.completed":
                 self.saw_stream_end = True
             if event_name in ("response.completed", "response.failed", "response.incomplete"):
@@ -747,7 +759,7 @@ class ResponsesSSEAssistantBuilder:
             self._got_any = True
             # response.created / response.completed 里的 response 对象是顶层 metadata 来源
             if event_name in ("response.created", "response.in_progress",
-                              "response.completed", "response.failed"):
+                              "response.completed", "response.incomplete", "response.failed"):
                 resp = data.get("response")
                 if isinstance(resp, dict):
                     self._response_obj = resp

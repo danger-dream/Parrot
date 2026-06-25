@@ -30,6 +30,7 @@ import httpx
 from . import config, network
 from .channel import registry
 from .channel.base import Channel
+from .protocols import errors as protocol_errors
 
 
 # ─── 默认翻译提示词 ──────────────────────────────────────────────
@@ -676,6 +677,10 @@ def _completion_incomplete_reason(data: dict, protocol: str) -> Optional[str]:
         return None
 
     if protocol == "openai-responses":
+        if protocol_errors.is_responses_max_output_incomplete(data):
+            return protocol_errors.responses_max_output_context_error_message(
+                protocol_errors.responses_incomplete_reason(data)
+            )
         status = data.get("status")
         details = data.get("incomplete_details")
         if status == "incomplete" or isinstance(details, dict):
@@ -850,6 +855,8 @@ def _extract_text_from_sse(raw: bytes, protocol: str, resolved_model: str) -> Op
             if not isinstance(data, dict):
                 continue
             if data.get("type") == "error" or isinstance(data.get("error"), dict):
+                return None
+            if protocol_errors.is_responses_max_output_incomplete(data, event_name):
                 return None
             typ = str(data.get("type") or event_name or "")
             if typ == "response.output_text.delta" and isinstance(data.get("delta"), str):

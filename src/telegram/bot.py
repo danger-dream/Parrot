@@ -94,7 +94,7 @@ def start() -> None:
         {"command": "channels", "description": "渠道管理"},
         {"command": "oauth",    "description": "管理 OAuth 账户"},
         {"command": "keys",     "description": "管理 API Key"},
-        {"command": "mapping",  "description": "模型映射 / 默认模型"},
+        {"command": "mapping",  "description": "模型管理"},
         {"command": "loadbalancing", "description": "负载均衡"},
         {"command": "proxy",    "description": "代理管理 / 路由规则"},
         {"command": "settings", "description": "系统设置"},

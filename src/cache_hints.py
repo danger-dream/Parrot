@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 
 _CACHE_KEY_PREFIX = "parrot:cache:v1"
+_SESSION_ID_RE = re.compile(r"session[_-]?id['\"=:\s]+([A-Za-z0-9_.:-]{8,})", re.IGNORECASE)
 
 
 def _canon(value: Any) -> Any:
@@ -40,6 +42,66 @@ def _canon(value: Any) -> Any:
 def _json_hash(value: Any) -> str:
     raw = json.dumps(_canon(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _clean_str(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _session_id_from_value(value: Any) -> str | None:
+    """Extract a conversation/session id from common Claude Code metadata shapes.
+
+    Claude Code sends a stable per-session UUID in ``metadata.user_id`` as a
+    JSON string.  Prefer that explicit boundary over hashing growing history;
+    never put the raw value into the upstream key, only into the hash material.
+    """
+    if isinstance(value, dict):
+        for key in (
+            "session_id", "sessionId", "claude_session_id", "claudeSessionId",
+            "claude_code_session_id", "claudeCodeSessionId",
+        ):
+            sid = _clean_str(value.get(key))
+            if sid:
+                return sid
+        for key in ("user_id", "user", "metadata"):
+            sid = _session_id_from_value(value.get(key))
+            if sid:
+                return sid
+        return None
+
+    text = _clean_str(value)
+    if not text:
+        return None
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            sid = _session_id_from_value(obj)
+            if sid:
+                return sid
+    match = _SESSION_ID_RE.search(text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def anthropic_session_id(body: dict[str, Any] | None) -> str | None:
+    """Return a stable Anthropic/Claude conversation id when the client exposes one."""
+    if not isinstance(body, dict):
+        return None
+    # Internal header-derived hint from server.py.  This is stripped by provider
+    # allowlists and never forwarded upstream as-is.
+    sid = _clean_str(body.get("_parrot_claude_code_session_id"))
+    if sid:
+        return sid
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        sid = _session_id_from_value(metadata)
+        if sid:
+            return sid
+    return None
 
 
 def _iter_content_blocks(content: Any):
@@ -176,6 +238,22 @@ def stable_prompt_cache_key_from_anthropic(
 ) -> str | None:
     if not isinstance(body, dict):
         return None
+    model_s = model or body.get("model") or ""
+    api_key_s = api_key_name or body.get("_parrot_api_key_name") or ""
+    client_ip_s = client_ip or body.get("_parrot_client_ip") or ""
+
+    session_id = anthropic_session_id(body)
+    if session_id:
+        material = {
+            "family": "anthropic-to-openai-session",
+            "v": 2,
+            "model": model_s,
+            "api_key_name": api_key_s,
+            "client_ip": client_ip_s,
+            "session_id": session_id,
+        }
+        return f"{_CACHE_KEY_PREFIX}:a2o-session:{_json_hash(material)}"
+
     prefix = _anthropic_stable_prefix(body)
     if not prefix:
         # With only a single dynamic user message and no static prefix there is
@@ -183,9 +261,9 @@ def stable_prompt_cache_key_from_anthropic(
         return None
     material = {
         "family": "anthropic-to-openai",
-        "model": model or body.get("model") or "",
-        "api_key_name": api_key_name or body.get("_parrot_api_key_name") or "",
-        "client_ip": client_ip or body.get("_parrot_client_ip") or "",
+        "model": model_s,
+        "api_key_name": api_key_s,
+        "client_ip": client_ip_s,
         "prefix": prefix,
     }
     return f"{_CACHE_KEY_PREFIX}:a2o:{_json_hash(material)}"

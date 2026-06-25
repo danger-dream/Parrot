@@ -47,6 +47,7 @@ from ..openai.transform.guard import GuardError, guard_responses_ingress
 from ..openai.transform.responses_to_chat import resolve_current_input_items
 from ..proxy.connector import SS2022Connector, SOCKS5Connector
 from ..protocols import finalize as finalize_policy
+from ..protocols import errors as protocol_errors
 from ..protocols.runtime import (
     format_responses_ws_error,
     is_responses_ws_visible_event_type,
@@ -143,6 +144,7 @@ class _WsTracker:
         self.response_id: Optional[str] = None
         self.response_failed = False
         self.stream_error_message: Optional[str] = None
+        self.stream_error_code: Optional[str] = None
         self.response_text_parts: list[str] = []
         self._items: dict[int, dict] = {}
         self._fc_args: dict[int, str] = {}
@@ -163,10 +165,21 @@ class _WsTracker:
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
             self.stream_error_message = _format_ws_error(evt)
+            self.stream_error_code = None
             return
         if typ == "response.failed":
             self.response_failed = True
             self.stream_error_message = _format_ws_error(evt)
+            self.stream_error_code = None
+        elif typ == "response.incomplete":
+            if protocol_errors.is_responses_max_output_incomplete(evt):
+                self.response_failed = True
+                self.stream_error_code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                self.stream_error_message = protocol_errors.responses_max_output_context_error_message(
+                    protocol_errors.responses_incomplete_reason(evt)
+                )
+            else:
+                self.response_completed = True
         elif typ == "response.completed":
             self.response_completed = True
 
@@ -487,6 +500,15 @@ async def _run_ws_failover(
         if result.ok:
             return accepted
         if result.closed_after_accept:
+            await _finalize_ws_attempt_after_accept(
+                result, ch, resolved_model, request_id, retry_count,
+                affinity_hit, start_time,
+            )
+            return accepted
+        if result.outcome == "request_invalid":
+            msg = result.error_detail or protocol_errors.responses_max_output_context_error_message()
+            await _send_context_length_error_frame(websocket, msg)
+            await _close_downstream(websocket, 4400, _trim_reason(msg))
             await _finalize_ws_attempt_after_accept(
                 result, ch, resolved_model, request_id, retry_count,
                 affinity_hit, start_time,
@@ -1073,15 +1095,30 @@ async def _try_sse_channel(
                 event_type = _ws_event_type(frame_text)
 
                 if tracker.response_failed:
-                    result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
+                    is_context_error = (
+                        tracker.stream_error_code == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                    )
+                    result.outcome = (
+                        "request_invalid" if is_context_error
+                        else "stream_upstream_error" if event_type == "response.failed"
+                        else "upstream_error_json"
+                    )
+                    result.http_status = 400 if is_context_error else result.http_status
                     result.error_detail = tracker.stream_error_message or frame_text[:2000]
-                    if event_type == "response.failed" or committed:
+                    if event_type == "response.failed" or committed or is_context_error:
                         if not committed:
-                            pending.append(frame_text)
+                            if not is_context_error:
+                                pending.append(frame_text)
                             await commit_pending()
-                        else:
+                        elif not is_context_error:
                             await _send_downstream(websocket, frame_text)
-                        await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                        if is_context_error:
+                            await _send_context_length_error_frame(websocket, result.error_detail)
+                        await _close_downstream(
+                            websocket,
+                            4400 if is_context_error else 1011,
+                            _trim_reason(result.error_detail),
+                        )
                         return await finalize_and_return()
                     return result
 
@@ -1305,6 +1342,13 @@ async def _relay_ws_session(
                 result.outcome = "blacklist_hit"
                 result.error_detail = step.error_detail
                 await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
+                return
+            if step.outcome == "request_invalid":
+                result.outcome = "request_invalid"
+                result.http_status = 400
+                result.error_detail = step.error_detail or protocol_errors.responses_max_output_context_error_message()
+                await _send_context_length_error_frame(websocket, result.error_detail)
+                await _close_downstream(websocket, 4400, _trim_reason(result.error_detail))
                 return
             if step.data is not None and not step.skip_downstream:
                 await _send_downstream(websocket, step.data)
@@ -1701,6 +1745,22 @@ async def _send_downstream(websocket: WebSocket, data: str | bytes) -> None:
         await websocket.send_bytes(data)
     else:
         await websocket.send_text(data)
+
+
+async def _send_context_length_error_frame(websocket: WebSocket, message: str) -> None:
+    if websocket.application_state == WebSocketState.DISCONNECTED:
+        return
+    try:
+        await _send_downstream(websocket, _dump_frame({
+            "type": "error",
+            "code": protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+            "message": message,
+            "param": None,
+            "sequence_number": 0,
+            "error_type": "invalid_request_error",
+        }))
+    except Exception:
+        pass
 
 
 async def _close_downstream(websocket: WebSocket, code: int, reason: str = "") -> None:

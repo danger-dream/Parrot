@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .. import upstream
+from . import errors as protocol_errors
 from .types import ProtocolToolkit
 
 
@@ -22,7 +23,7 @@ def is_anthropic_error_json(obj: dict[str, Any]) -> bool:
 
 def is_openai_error_json(obj: dict[str, Any]) -> bool:
     """OpenAI-family non-stream error response detector."""
-    return isinstance(obj.get("error"), dict)
+    return isinstance(obj.get("error"), dict) or protocol_errors.is_responses_max_output_incomplete(obj)
 
 
 _TOOLKITS: dict[str, ProtocolToolkit] = {

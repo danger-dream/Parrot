@@ -220,10 +220,14 @@ def test_r2c_incomplete_length(m):
         b'event: response.incomplete\ndata: {"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}\n\n',
     ]
     frames = _run_translator(tr, events)
-    objs, done = _parse_chat_frames(frames)
-    assert done
-    assert objs[-1]["choices"][0]["finish_reason"] == "length"
-    print("  [PASS] r2c: response.incomplete max_output_tokens → finish_reason=length")
+    assert frames[-1] == b"data: [DONE]\n\n"
+    error_frames = [f for f in frames if b'"error"' in f]
+    assert error_frames
+    err = json.loads(error_frames[-1].decode("utf-8").split("data: ", 1)[1])
+    assert err["error"]["type"] == "invalid_request_error"
+    assert err["error"]["code"] == "context_length_exceeded"
+    assert "max_output_tokens" in err["error"]["message"]
+    print("  [PASS] r2c: response.incomplete max_output_tokens → context_length_exceeded error")
 
 
 def test_r2c_reasoning(m):

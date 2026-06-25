@@ -1,0 +1,65 @@
+import asyncio
+import signal
+
+import uvicorn
+
+from src import drain
+import server as parrot_server
+
+
+def test_drain_waits_for_active_lease_then_finishes():
+    async def scenario():
+        drain.reset_for_tests()
+        lease = await drain.enter("test")
+        drain.begin("unit-test")
+        waiter = asyncio.create_task(drain.wait_for_zero(1))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert drain.active_count() == 1
+        await lease.aclose()
+        assert await waiter is True
+        assert drain.active_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_drain_wait_timeout_when_active_request_remains():
+    async def scenario():
+        drain.reset_for_tests()
+        lease = await drain.enter("test")
+        try:
+            drain.begin("unit-test")
+            assert await drain.wait_for_zero(0.01) is False
+            assert drain.active_count() == 1
+        finally:
+            await lease.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_drain_reject_response_shape():
+    drain.reset_for_tests()
+    drain.begin("unit-test")
+    resp = drain.reject_response()
+    assert resp.status_code == 503
+    assert resp.headers["retry-after"] == "5"
+    assert drain.status_snapshot()["draining"] is True
+
+
+def test_drain_aware_server_signal_waits_before_should_exit():
+    async def scenario():
+        drain.reset_for_tests()
+        srv = parrot_server._DrainAwareServer(  # noqa: SLF001 - intentional white-box test
+            uvicorn.Config(parrot_server.app, host="127.0.0.1", port=0, log_level="critical")
+        )
+        srv._drain_loop = asyncio.get_running_loop()  # noqa: SLF001
+        lease = await drain.enter("test-signal")
+        srv.handle_exit(signal.SIGTERM, None)
+        await asyncio.sleep(0)
+        assert drain.is_draining() is True
+        assert srv.should_exit is False
+        await lease.aclose()
+        await asyncio.wait_for(srv._drain_shutdown_task, timeout=1)  # noqa: SLF001
+        assert srv.should_exit is True
+
+    asyncio.run(scenario())
