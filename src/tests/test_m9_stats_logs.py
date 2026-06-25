@@ -273,7 +273,12 @@ def test_logs_list(m):
     assert len(first_detail_row) == 3
     btns = [b["callback_data"] for row in kb_rows for b in row if "callback_data" in b]
     assert sum(1 for b in btns if b.startswith("logs:detail:")) >= 3
-    assert "logs:refresh:1" in btns
+    assert any(b.startswith("logs:list:") for b in btns)
+    labels = [b["text"] for row in kb_rows for b in row if "text" in b]
+    assert "🏠 首页" in labels
+    assert any(t.startswith("🔑 账号：") for t in labels)
+    assert any(t.startswith("🤖 模型：") for t in labels)
+    assert any(t.startswith("📡 渠道：") for t in labels)
     print("  [PASS] logs list")
 
 
@@ -294,7 +299,7 @@ def test_logs_list_marks_responses_websocket(m):
     rec = _install_recorder(m)
     m["logs_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
-    assert text.count("<code>[rsp]</code>") >= 2
+    assert text.count("<code>[response]</code>") >= 2
     assert "传输协议: <b>WS</b>" in text
     assert "传输协议: <b>↑WS</b>" in text
     assert "gpt-5.5" in text
@@ -314,11 +319,13 @@ def test_logs_pagination(m):
     assert "第 1/2 页 · 共 8 条" in text
     assert text.count("<b>#") == 6
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "logs:page:2" in btns
-    assert "logs:refresh:1" in btns
+    assert any(b.startswith("logs:list:") for b in btns)
+    labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
+    assert "🏠 首页" in labels and "◀ 上一页" in labels and "下一页 ▶" in labels
+    next_cb = next(b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if b.get("text") == "下一页 ▶")
 
     rec.clear()
-    m["logs_menu"].handle_callback(42, 100, "cb", "logs:page:2")
+    m["logs_menu"].handle_callback(42, 100, "cb", next_cb)
     edit = rec.last("editMessageText")
     text = edit["text"]
     assert "第 2/2 页 · 共 8 条" in text
@@ -326,25 +333,133 @@ def test_logs_pagination(m):
     assert "<b>#7</b>" in text and "<b>#8</b>" in text
     assert "<b>#1</b>" not in text and "<b>#2</b>" not in text
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "logs:page:1" in btns
+    assert any(b.startswith("logs:list:") for b in btns)
     detail_labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if b.get("callback_data", "").startswith("logs:detail:")]
     assert detail_labels == ["📄 #7", "📄 #8"]
     detail_cb = next(b for b in btns if b.startswith("logs:detail:"))
-    assert detail_cb.endswith(":2")
 
     rec.clear()
     m["logs_menu"].handle_callback(42, 100, "cb", detail_cb)
     detail_text = rec.last("editMessageText")["text"]
     assert "日志详情" in detail_text
     detail_btns = [b["callback_data"] for row in rec.last("editMessageText")["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "logs:page:2" in detail_btns
+    assert any(b.startswith("logs:list:") for b in detail_btns)
     print("  [PASS] logs pagination")
 
 
-def test_logs_detail_with_retry_chain(m):
+def test_logs_filters_preserve_state(m):
+    _setup(m)
+    def _cfg(c):
+        c["apiKeys"] = {"k1": {"key": "x"}, "k2": {"key": "y"}}
+        c["channels"] = [{"name": "A", "type": "api"}, {"name": "B", "type": "api"}]
+        c["oauthAccounts"] = [{
+            "provider": "openai",
+            "email": "o@openai.test",
+            "workspace_id": "acct-raw-hidden",
+            "chatgpt_account_id": "acct-raw-hidden",
+            "access_token": "x",
+            "refresh_token": "r",
+            "models": ["gpt-5.1"],
+        }]
+    m["config"].update(_cfg)
+    _insert_success(m, "F1", "k1", "m1", "api:A")
+    time.sleep(0.002)
+    _insert_success(m, "F2", "k2", "m2", "api:B")
+    time.sleep(0.002)
+    _insert_success(m, "F3", "k1", "m2", "oauth:openai:o@openai.test:acct-raw-hidden", "oauth")
+    time.sleep(0.002)
+    _insert_success(m, "F4", "k3", "parrot-test-context-responses", "__tmp_context_orphan", "api")
+
+    rec = _install_recorder(m)
+    m["logs_menu"].show(42, 100, "cb")
+    edit = rec.last("editMessageText")
+    account_cb = next(
+        b["callback_data"]
+        for row in edit["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text", "").startswith("🔑 账号：")
+    )
+    model_cb = next(
+        b["callback_data"]
+        for row in edit["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text", "").startswith("🤖 模型：")
+    )
+    channel_cb = next(
+        b["callback_data"]
+        for row in edit["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text", "").startswith("📡 渠道：")
+    )
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-model", model_cb)
+    model_menu = rec.last("editMessageText")
+    model_labels = [b.get("text", "") for row in model_menu["reply_markup"]["inline_keyboard"] for b in row]
+    assert "m1" in model_labels and "m2" in model_labels
+    assert not any(label.startswith("parrot-test") for label in model_labels)
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-channel", channel_cb)
+    channel_menu = rec.last("editMessageText")
+    channel_rows = channel_menu["reply_markup"]["inline_keyboard"]
+    channel_labels = [b.get("text", "") for row in channel_rows for b in row]
+    assert "📡 A" in channel_labels
+    assert "📡 B" in channel_labels
+    assert any(label.startswith("🔐 ") and "OAuth" not in label and "acct-raw-hidden" not in label for label in channel_labels)
+    assert not any("__tmp_context" in label or "compact-rescue" in label for label in channel_labels)
+    assert all(len(row) <= 2 for row in channel_rows[:-1])
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-filter", account_cb)
+    filt = rec.last("editMessageText")
+    assert "按 API KEY 账号筛选日志" in filt["text"]
+    k1_cb = next(
+        b["callback_data"]
+        for row in filt["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "k1"
+    )
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-toggle", k1_cb)
+    filt2 = rec.last("editMessageText")
+    assert "当前账号: k1" in filt2["text"]
+    confirm_cb = next(
+        b["callback_data"]
+        for row in filt2["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text") == "确认"
+    )
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-confirm", confirm_cb)
+    filtered = rec.last("editMessageText")
+    assert "共 2 条" in filtered["text"]
+    assert "m1" in filtered["text"] and "m2" in filtered["text"]
+    assert "Key <code>k2</code>" not in filtered["text"]
+    btns = [b for row in filtered["reply_markup"]["inline_keyboard"] for b in row]
+    assert any(b.get("text") == "🔑 账号：k1" for b in btns)
+    detail_cb = next(b["callback_data"] for b in btns if b.get("callback_data", "").startswith("logs:detail:"))
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-detail", detail_cb)
+    detail = rec.last("editMessageText")
+    back_cb = next(
+        b["callback_data"]
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for b in row if b.get("text", "").startswith("◀ 返回第")
+    )
+    assert back_cb.startswith("logs:list:")
+
+    rec.clear()
+    m["logs_menu"].handle_callback(42, 100, "cb-back", back_cb)
+    back = rec.last("editMessageText")
+    assert "共 2 条" in back["text"]
+    btns_back = [b for row in back["reply_markup"]["inline_keyboard"] for b in row]
+    assert any(b.get("text") == "🔑 账号：k1" for b in btns_back)
+    print("  [PASS] logs filters multi-select and preserve state through detail back")
+
+
+def test_logs_detail_with_execution_chain(m):
     _setup(m)
     rid = "D-rid"
-    # 手工构造一条带重试链的记录
+    # 手工构造一条带执行链的记录：普通失败尝试 + 本地搜索轮 + 成功尝试。
     m["log_db"].insert_pending(rid, "1.1.1.1", "k1", "claude-opus-4-7", True, 3, 0, {}, {})
     a1 = m["log_db"].record_retry_attempt(rid, 1, "api:A", "api", "claude-opus-4-7", time.time())
     p1 = m["log_db"].record_proxy_attempt(rid, a1, 1, "us-att", time.time())
@@ -358,7 +473,11 @@ def test_logs_detail_with_retry_chain(m):
                                       outcome="success", bytes_up=30, bytes_down=40)
     m["log_db"].update_retry_attempt(a1, connect_ms=200, first_byte_ms=None, ended_at=time.time(),
                                      outcome="http_error", error_detail="HTTP 500: boom")
-    a2 = m["log_db"].record_retry_attempt(rid, 2, "api:B", "api", "claude-opus-4-7", time.time())
+    a_web = m["log_db"].record_retry_attempt(rid, 2, "api:A", "api", "claude-opus-4-7", time.time())
+    time.sleep(0.01)
+    m["log_db"].update_retry_attempt(a_web, connect_ms=100, first_byte_ms=300, ended_at=time.time(),
+                                      outcome="local_web_tool_round", error_detail="executed 1 local web tool call(s), round=1")
+    a2 = m["log_db"].record_retry_attempt(rid, 3, "api:B", "api", "claude-opus-4-7", time.time())
     time.sleep(0.01)
     m["log_db"].update_retry_attempt(a2, connect_ms=100, first_byte_ms=400, ended_at=time.time(),
                                      outcome="success", error_detail=None)
@@ -377,7 +496,10 @@ def test_logs_detail_with_retry_chain(m):
     assert "代理链 (2 次尝试)" in text
     assert "us-att" in text and "misaka-lax" in text
     assert "connect_error" in text and "dial timeout" in text
-    assert "重试链 (2 次尝试)" in text
+    assert "执行链 (3 次)" in text
+    assert "🔎 <b>2.</b>" in text
+    assert "本地搜索轮" in text
+    assert "❌ <b>2.</b>" not in text
     assert "<code>A</code>" in text and "<code>B</code>" in text
     assert "http_error" in text
     # Tokens / 耗时；input=200, cache_read=100，总 prompt=300，缓存率 33.3%
@@ -385,7 +507,7 @@ def test_logs_detail_with_retry_chain(m):
     assert "缓存 100 (33.3%)" in text
     # 重试 1 次 flag
     assert "重试 1 次" in text
-    print("  [PASS] logs detail with retry chain")
+    print("  [PASS] logs detail with execution chain")
 
 
 def test_log_inspector_localizes_pretty_json_and_redacts_encrypted(m):
@@ -575,8 +697,10 @@ def main():
         test_stats_group_by_model_and_apikey,
         test_stats_period_switch,
         test_logs_list,
+        test_logs_list_marks_responses_websocket,
         test_logs_pagination,
-        test_logs_detail_with_retry_chain,
+        test_logs_filters_preserve_state,
+        test_logs_detail_with_execution_chain,
         test_log_inspector_localizes_pretty_json_and_redacts_encrypted,
         test_logs_body_inspector_defaults_last_and_truncates,
         test_logs_response_inspector_parses_messages_and_search_state,

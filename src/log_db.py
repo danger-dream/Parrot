@@ -6,6 +6,7 @@
   - request_detail   大字段（headers / body / response_body）
   - retry_chain      重试链（每个渠道尝试一条记录）
   - proxy_chain      代理链（每个渠道尝试内的代理切换明细）
+  - local_web_log    Parrot 本地 WebSearch/WebFetch 执行明细
 
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
@@ -127,6 +128,23 @@ def _schema_sql() -> str:
       bytes_down      INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id);
+
+    CREATE TABLE IF NOT EXISTS local_web_log (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id      TEXT NOT NULL,
+      round_no        INTEGER DEFAULT 0,
+      tool_name       TEXT NOT NULL,
+      query           TEXT,
+      url             TEXT,
+      started_at      REAL NOT NULL,
+      ended_at        REAL,
+      status          TEXT,
+      result_count    INTEGER DEFAULT 0,
+      content_bytes   INTEGER DEFAULT 0,
+      content_chars   INTEGER DEFAULT 0,
+      error_message   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_local_web_req ON local_web_log(request_id);
     """
 
 
@@ -220,6 +238,42 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
                 conn.execute(ddl)
                 changed = True
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
+
+    local_web_cols = {row[1] for row in conn.execute("PRAGMA table_info(local_web_log)").fetchall()}
+    if not local_web_cols:
+        conn.execute("""CREATE TABLE IF NOT EXISTS local_web_log (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          request_id      TEXT NOT NULL,
+          round_no        INTEGER DEFAULT 0,
+          tool_name       TEXT NOT NULL,
+          query           TEXT,
+          url             TEXT,
+          started_at      REAL NOT NULL,
+          ended_at        REAL,
+          status          TEXT,
+          result_count    INTEGER DEFAULT 0,
+          content_bytes   INTEGER DEFAULT 0,
+          content_chars   INTEGER DEFAULT 0,
+          error_message   TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_local_web_req ON local_web_log(request_id)")
+        changed = True
+    else:
+        for col, ddl in (
+            ("round_no", "ALTER TABLE local_web_log ADD COLUMN round_no INTEGER DEFAULT 0"),
+            ("query", "ALTER TABLE local_web_log ADD COLUMN query TEXT"),
+            ("url", "ALTER TABLE local_web_log ADD COLUMN url TEXT"),
+            ("ended_at", "ALTER TABLE local_web_log ADD COLUMN ended_at REAL"),
+            ("status", "ALTER TABLE local_web_log ADD COLUMN status TEXT"),
+            ("result_count", "ALTER TABLE local_web_log ADD COLUMN result_count INTEGER DEFAULT 0"),
+            ("content_bytes", "ALTER TABLE local_web_log ADD COLUMN content_bytes INTEGER DEFAULT 0"),
+            ("content_chars", "ALTER TABLE local_web_log ADD COLUMN content_chars INTEGER DEFAULT 0"),
+            ("error_message", "ALTER TABLE local_web_log ADD COLUMN error_message TEXT"),
+        ):
+            if col not in local_web_cols:
+                conn.execute(ddl)
+                changed = True
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_local_web_req ON local_web_log(request_id)")
     if changed:
         conn.commit()
 
@@ -384,7 +438,7 @@ def update_pending(request_id: str, **fields: Any) -> None:
         return
     allowed = {
         "fingerprint", "affinity_hit", "requested_model",
-        "msg_count", "tool_count", "proxy_name",
+        "msg_count", "tool_count", "proxy_name", "reasoning_effort",
     }
     cols, vals = [], []
     for k, v in fields.items():
@@ -515,6 +569,63 @@ def update_proxy_attempt(
         )
         _get_conn().commit()
 
+
+
+
+def record_local_web_call(
+    request_id: str,
+    round_no: int,
+    tool_name: str,
+    query: str | None = None,
+    url: str | None = None,
+    started_at: float | None = None,
+) -> int:
+    with _write_lock:
+        conn = _get_conn()
+        cur = conn.execute(
+            """INSERT INTO local_web_log
+               (request_id, round_no, tool_name, query, url, started_at, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                request_id, int(round_no or 0), tool_name,
+                query, url, float(started_at or time.time()), "running",
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def finish_local_web_call(
+    log_id: int,
+    *,
+    status: str,
+    result_count: int = 0,
+    content_bytes: int = 0,
+    content_chars: int = 0,
+    error_message: str | None = None,
+    ended_at: float | None = None,
+) -> None:
+    with _write_lock:
+        _get_conn().execute(
+            """UPDATE local_web_log SET
+               ended_at=?, status=?, result_count=?, content_bytes=?, content_chars=?, error_message=?
+               WHERE id=?""",
+            (
+                float(ended_at or time.time()), status, int(result_count or 0),
+                int(content_bytes or 0), int(content_chars or 0),
+                (error_message[:4000] if isinstance(error_message, str) else error_message),
+                int(log_id),
+            ),
+        )
+        _get_conn().commit()
+
+
+def local_web_count(request_id: str) -> int:
+    row = _get_conn().execute(
+        "SELECT COUNT(*) AS n FROM local_web_log WHERE request_id=?",
+        (request_id,),
+    ).fetchone()
+    return int(row["n"] or 0) if row else 0
 
 def finish_success(
     request_id: str,
@@ -1051,7 +1162,8 @@ _RECENT_COLS = (
     "connect_time_ms, first_token_time_ms, total_time_ms, "
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
-    "reasoning_effort"
+    "reasoning_effort, "
+    "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count"
 )
 
 
@@ -1204,6 +1316,9 @@ def _recent_logs_where(
     channel_key: str | None = None,
     model: str | None = None,
     status: str | None = None,
+    api_keys: list[str] | None = None,
+    models: list[str] | None = None,
+    channel_keys: list[str] | None = None,
 ) -> tuple[str, list]:
     conds, vals = [], []
     if channel_key:
@@ -1212,6 +1327,20 @@ def _recent_logs_where(
         conds.append("(requested_model=? OR final_model=?)"); vals.extend([model, model])
     if status:
         conds.append("status=?"); vals.append(status)
+    api_keys = [str(x) for x in (api_keys or []) if str(x)]
+    if api_keys:
+        conds.append("api_key_name IN (" + ",".join(["?"] * len(api_keys)) + ")")
+        vals.extend(api_keys)
+    models = [str(x) for x in (models or []) if str(x)]
+    if models:
+        placeholders = ",".join(["?"] * len(models))
+        conds.append(f"(requested_model IN ({placeholders}) OR final_model IN ({placeholders}))")
+        vals.extend(models)
+        vals.extend(models)
+    channel_keys = [str(x) for x in (channel_keys or []) if str(x)]
+    if channel_keys:
+        conds.append("final_channel_key IN (" + ",".join(["?"] * len(channel_keys)) + ")")
+        vals.extend(channel_keys)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     return where, vals
 
@@ -1222,8 +1351,14 @@ def recent_logs(
     model: str | None = None,
     status: str | None = None,
     offset: int = 0,
+    api_keys: list[str] | None = None,
+    models: list[str] | None = None,
+    channel_keys: list[str] | None = None,
 ) -> list[dict]:
-    where, vals = _recent_logs_where(channel_key, model, status)
+    where, vals = _recent_logs_where(
+        channel_key, model, status,
+        api_keys=api_keys, models=models, channel_keys=channel_keys,
+    )
     lim = max(1, int(limit or 20))
     off = max(0, int(offset or 0))
     sql = f"SELECT {_RECENT_COLS} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
@@ -1236,10 +1371,44 @@ def recent_logs_count(
     channel_key: str | None = None,
     model: str | None = None,
     status: str | None = None,
+    api_keys: list[str] | None = None,
+    models: list[str] | None = None,
+    channel_keys: list[str] | None = None,
 ) -> int:
-    where, vals = _recent_logs_where(channel_key, model, status)
+    where, vals = _recent_logs_where(
+        channel_key, model, status,
+        api_keys=api_keys, models=models, channel_keys=channel_keys,
+    )
     row = _get_conn().execute(f"SELECT COUNT(*) AS n FROM request_log {where}", vals).fetchone()
     return int(row["n"] or 0) if row else 0
+
+
+def recent_log_values(kind: str, limit: int = 120) -> list[str]:
+    """Distinct recent values for log filters (current month)."""
+    lim = max(1, min(int(limit or 120), 500))
+    if kind == "apikey":
+        sql = """SELECT api_key_name AS v, COUNT(*) AS n FROM request_log
+                 WHERE api_key_name IS NOT NULL AND api_key_name != ''
+                 GROUP BY api_key_name ORDER BY n DESC, v ASC LIMIT ?"""
+        vals = (lim,)
+    elif kind == "model":
+        sql = """SELECT v, COUNT(*) AS n FROM (
+                   SELECT requested_model AS v FROM request_log
+                    WHERE requested_model IS NOT NULL AND requested_model != ''
+                   UNION ALL
+                   SELECT final_model AS v FROM request_log
+                    WHERE final_model IS NOT NULL AND final_model != ''
+                 ) GROUP BY v ORDER BY n DESC, v ASC LIMIT ?"""
+        vals = (lim,)
+    elif kind == "channel":
+        sql = """SELECT final_channel_key AS v, COUNT(*) AS n FROM request_log
+                 WHERE final_channel_key IS NOT NULL AND final_channel_key != ''
+                 GROUP BY final_channel_key ORDER BY n DESC, v ASC LIMIT ?"""
+        vals = (lim,)
+    else:
+        return []
+    rows = _get_conn().execute(sql, vals).fetchall()
+    return [str(r["v"] or "") for r in rows if str(r["v"] or "")]
 
 
 def log_detail(request_id: str) -> dict:
@@ -1254,8 +1423,21 @@ def log_detail(request_id: str) -> dict:
         "SELECT * FROM retry_chain WHERE request_id=? ORDER BY attempt_order ASC",
         (request_id,),
     ).fetchall()
+    # compact-rescue main rows delegate real upstream work to child request_ids
+    # like '<rid>:compact:direct' / ':compact:1'.  Surface those in details so
+    # the UI shows the actual compression model/channel instead of an empty
+    # execution chain.
+    if not chain_rows and log_row and dict(log_row).get("final_channel_key") == "compact-rescue":
+        chain_rows = _get_conn().execute(
+            "SELECT * FROM retry_chain WHERE request_id LIKE ? ORDER BY request_id ASC, attempt_order ASC",
+            (request_id + ":%",),
+        ).fetchall()
     proxy_rows = _get_conn().execute(
         "SELECT * FROM proxy_chain WHERE request_id=? ORDER BY attempt_order ASC, id ASC",
+        (request_id,),
+    ).fetchall()
+    local_web_rows = _get_conn().execute(
+        "SELECT * FROM local_web_log WHERE request_id=? ORDER BY round_no ASC, id ASC",
         (request_id,),
     ).fetchall()
     return {
@@ -1263,6 +1445,7 @@ def log_detail(request_id: str) -> dict:
         "detail": dict(detail_row) if detail_row else None,
         "retry_chain": [dict(r) for r in chain_rows],
         "proxy_chain": [dict(r) for r in proxy_rows],
+        "local_web_log": [dict(r) for r in local_web_rows],
     }
 
 

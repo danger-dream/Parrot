@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from ... import log_db
+from ... import config, log_db, oauth_manager
 from .. import log_inspector, states, ui
 
 
@@ -22,6 +22,32 @@ _ITEM_PREVIEW_CHARS = 1500
 
 
 _STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
+
+def _retry_chain_mark(outcome: str) -> str:
+    if outcome == "success":
+        return "✅"
+    if outcome == "local_web_tool_round":
+        return "🔎"
+    if outcome == "local_web_tool_limit":
+        return "🧭"
+    if outcome in ("candidate_guard", "guard_error", "request_invalid"):
+        return "🚫"
+    if outcome in ("queue_wait", "pending"):
+        return "⏳"
+    return "❌"
+
+
+def _retry_chain_label(outcome: str) -> str:
+    labels = {
+        "success": "成功",
+        "local_web_tool_round": "本地搜索轮",
+        "local_web_tool_limit": "搜索预算用尽",
+        "candidate_guard": "候选不兼容",
+        "guard_error": "请求拦截",
+        "request_invalid": "请求无效",
+    }
+    return labels.get(outcome, outcome or "?")
+
 
 # 入口协议 → 简短标签（anthropic 是默认，不加标签以避免每条日志都冗余显示）
 _INGRESS_TAG = {"chat": "[chat]", "responses": "[rsp]", "responses_ws": "[rsp]"}
@@ -66,11 +92,75 @@ def _clamp_page(page: int, total: int) -> tuple[int, int]:
     return max(1, min(p, total_pages)), total_pages
 
 
-def _page_rows(page: int) -> tuple[list[dict], int, int, int]:
-    total = log_db.recent_logs_count()
-    page, total_pages = _clamp_page(page, total)
-    rows = log_db.recent_logs(_LIST_PAGE_SIZE, offset=(page - 1) * _LIST_PAGE_SIZE)
-    return rows, total, page, total_pages
+def _norm_values(values) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values or []:
+        s = str(v or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _list_state(page: int = 1, *, api_keys=None, models=None, channels=None) -> dict:
+    return {
+        "p": max(1, int(page or 1)),
+        "a": _norm_values(api_keys),
+        "m": _norm_values(models),
+        "c": _norm_values(channels),
+    }
+
+
+def _normalize_list_state(state: dict | None, *, page: int | None = None) -> dict:
+    st = dict(state or {})
+    try:
+        p = int(page if page is not None else (st.get("p") or 1))
+    except Exception:
+        p = 1
+    return _list_state(
+        p,
+        api_keys=st.get("a") or [],
+        models=st.get("m") or [],
+        channels=st.get("c") or [],
+    )
+
+
+def _list_state_code(state: dict) -> str:
+    payload = json.dumps(_normalize_list_state(state), ensure_ascii=False, separators=(",", ":"))
+    return ui.register_code("loglist:" + payload)
+
+
+def _resolve_list_state(short: str) -> dict | None:
+    full = ui.resolve_code(short)
+    if not full or not full.startswith("loglist:"):
+        return None
+    try:
+        obj = json.loads(full[len("loglist:"):])
+    except Exception:
+        return None
+    return _normalize_list_state(obj if isinstance(obj, dict) else {})
+
+
+def _list_cb(state: dict, *, page: int | None = None) -> str:
+    st = _normalize_list_state(state, page=page)
+    return f"logs:list:{_list_state_code(st)}"
+
+
+def _active_filters(state: dict) -> dict:
+    st = _normalize_list_state(state)
+    return {"api_keys": st["a"], "models": st["m"], "channel_keys": st["c"]}
+
+
+def _page_rows(state: dict) -> tuple[list[dict], int, int, int, dict]:
+    st = _normalize_list_state(state)
+    filters = _active_filters(st)
+    total = log_db.recent_logs_count(**filters)
+    page, total_pages = _clamp_page(st["p"], total)
+    st["p"] = page
+    rows = log_db.recent_logs(_LIST_PAGE_SIZE, offset=(page - 1) * _LIST_PAGE_SIZE, **filters)
+    return rows, total, page, total_pages, st
 
 
 def _maybe_suffix_status_banner(text: str) -> str:
@@ -103,6 +193,97 @@ def _display_index(page: int, idx: int) -> int:
     return (p - 1) * _LIST_PAGE_SIZE + int(idx)
 
 
+def _option_label(kind: str, value: str) -> str:
+    if kind == "channel":
+        name = ui.channel_display_name(value, with_family=True)
+        if str(value or "").startswith("oauth:"):
+            return f"🔐 {name}"
+        return f"📡 {name}"
+    return value
+
+
+def _button_label(text: str, *, max_len: int = 18) -> str:
+    text = str(text or "?")
+    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+
+
+def _filter_summary(kind: str, values: list[str]) -> str:
+    vals = _norm_values(values)
+    if not vals:
+        return "全部"
+    first = _option_label(kind, vals[0])
+    if len(vals) == 1:
+        return _button_label(first, max_len=16)
+    return f"{_button_label(first, max_len=12)} + {len(vals) - 1}"
+
+
+def _api_key_options() -> list[str]:
+    opts = []
+    try:
+        opts.extend((config.get().get("apiKeys") or {}).keys())
+    except Exception:
+        pass
+    opts.extend(log_db.recent_log_values("apikey"))
+    return _norm_values(opts)
+
+
+def _model_options() -> list[str]:
+    # parrot-test* 是内部/历史测试模型（如上下文溢出探针），不展示给用户筛选。
+    return [m for m in _norm_values(log_db.recent_log_values("model"))
+            if not m.startswith("parrot-test")]
+
+
+def _channel_options() -> list[str]:
+    """渠道筛选只展示当前配置里的 API 渠道 + OAuth 账号。
+
+    历史日志里会出现 compact-rescue、__tmp_context_* 等内部/临时 channel key，
+    这些不属于用户可选渠道，不能混进筛选菜单。
+    """
+    opts: list[str] = []
+    try:
+        for ch in config.get().get("channels") or []:
+            name = str(ch.get("name") or "").strip()
+            if name:
+                opts.append(f"api:{name}")
+    except Exception:
+        pass
+    try:
+        for acc in oauth_manager.list_accounts():
+            ak = oauth_manager._account_key(acc)
+            if ak:
+                opts.append(f"oauth:{ak}")
+    except Exception:
+        pass
+    return _norm_values(opts)
+
+
+def _filter_options(kind: str) -> list[str]:
+    if kind == "apikey":
+        return _api_key_options()
+    if kind == "model":
+        return _model_options()
+    if kind == "channel":
+        return _channel_options()
+    return []
+
+
+def _filter_field(kind: str) -> str:
+    return {"apikey": "a", "model": "m", "channel": "c"}.get(kind, "")
+
+
+def _filter_title(kind: str) -> str:
+    return {
+        "apikey": "🔑 按 API KEY 账号筛选日志",
+        "model": "🤖 按模型筛选日志",
+        "channel": "📡 按渠道筛选日志",
+    }.get(kind, "筛选日志")
+
+
+def _filter_current_label(kind: str, values: list[str]) -> str:
+    name = {"apikey": "账号", "model": "模型", "channel": "渠道"}.get(kind, "筛选")
+    return f"当前{name}: {_filter_summary(kind, values)}"
+
+
 def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, total_pages: int | None = None) -> str:
     total = len(rows) if total is None else int(total or 0)
     total_pages = max(1, int(total_pages or 1))
@@ -114,10 +295,8 @@ def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, t
     ]
     for idx, r in enumerate(rows, 1):
         display_idx = _display_index(page, idx)
-        key = ui.escape_html(r.get("api_key_name") or "?")
         prefix = f"\n<b>#{display_idx}</b> "
-        # 列表首行比最近调用多一个 key →
-        headline = ui.fmt_log_entry_headline(r, prefix=f"{prefix}<b>{key}</b> → ")
+        headline = ui.fmt_log_entry_headline(r, prefix=prefix)
         body = ui.fmt_log_entry_body(r)
         line = headline
         if body:
@@ -153,8 +332,10 @@ def _extract_error_summary(raw: str) -> str:
     return (f"{prefix} — {json_part[:150]}" if prefix else json_part[:200])
 
 
-def _list_kb(rows: list[dict], *, page: int, total_pages: int) -> dict:
-    """详情按钮 3 列紧凑排列；分页行参考 OAuth 菜单。"""
+def _list_kb(rows: list[dict], *, state: dict, page: int, total_pages: int) -> dict:
+    """详情按钮 3 列紧凑排列 + 状态保持分页/筛选。"""
+    state = _normalize_list_state(state, page=page)
+    state_code = _list_state_code(state)
     rows_kb: list[list[dict]] = []
     cur: list[dict] = []
     for idx, r in enumerate(rows, 1):
@@ -163,44 +344,170 @@ def _list_kb(rows: list[dict], *, page: int, total_pages: int) -> dict:
         if not rid:
             continue
         short = ui.register_code(rid)
-        cur.append(ui.btn(f"📄 #{display_idx}", f"logs:detail:{short}:{page}"))
+        cur.append(ui.btn(f"📄 #{display_idx}", f"logs:detail:{short}:{state_code}"))
         if len(cur) >= 3:
             rows_kb.append(cur)
             cur = []
     if cur:
         rows_kb.append(cur)
 
-    if total_pages > 1:
-        nav: list[dict] = []
-        if page > 1:
-            nav.append(ui.btn("◀ 上一页", f"logs:page:{page - 1}"))
-        nav.append(ui.btn(f"{page}/{total_pages}", f"logs:page:{page}"))
-        if page < total_pages:
-            nav.append(ui.btn("下一页 ▶", f"logs:page:{page + 1}"))
-        rows_kb.append(nav)
-    rows_kb.append([ui.btn("🔄 刷新", f"logs:refresh:{page}"),
+    prev_page = max(1, page - 1)
+    next_page = min(total_pages, page + 1)
+    rows_kb.append([
+        ui.btn("🏠 首页", _list_cb(state, page=1)),
+        ui.btn("◀ 上一页", _list_cb(state, page=prev_page)),
+        ui.btn(f"{page}/{total_pages}", _list_cb(state, page=page)),
+        ui.btn("下一页 ▶", _list_cb(state, page=next_page)),
+    ])
+    rows_kb.append([
+        ui.btn(f"🔑 账号：{_filter_summary('apikey', state['a'])}", f"logs:filter:apikey:{state_code}"),
+        ui.btn(f"🤖 模型：{_filter_summary('model', state['m'])}", f"logs:filter:model:{state_code}"),
+    ])
+    rows_kb.append([
+        ui.btn(f"📡 渠道：{_filter_summary('channel', state['c'])}", f"logs:filter:channel:{state_code}"),
+    ])
+    rows_kb.append([ui.btn("🔄 刷新", _list_cb(state, page=page)),
                     ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.inline_kb(rows_kb)
 
 
 # ─── 列表入口 ─────────────────────────────────────────────────────
 
-def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None,
+         page: int = 1, state: dict | None = None) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    rows, total, page, total_pages = _page_rows(page)
+    st = _normalize_list_state(state, page=page if state is None else None)
+    rows, total, page, total_pages, st = _page_rows(st)
     ui.edit(chat_id, message_id, ui.truncate(_maybe_suffix_status_banner(_render_list(rows, page=page, total=total, total_pages=total_pages))),
-            reply_markup=_list_kb(rows, page=page, total_pages=total_pages))
+            reply_markup=_list_kb(rows, state=st, page=page, total_pages=total_pages))
 
 
 def send_new(chat_id: int) -> None:
-    rows, total, page, total_pages = _page_rows(1)
+    st = _list_state(1)
+    rows, total, page, total_pages, st = _page_rows(st)
     ui.send(chat_id, ui.truncate(_maybe_suffix_status_banner(_render_list(rows, page=page, total=total, total_pages=total_pages))),
-            reply_markup=_list_kb(rows, page=page, total_pages=total_pages))
+            reply_markup=_list_kb(rows, state=st, page=page, total_pages=total_pages))
 
 
-def refresh(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:
-    show(chat_id, message_id, cb_id, page=page)
+def refresh(chat_id: int, message_id: int, cb_id: str,
+            page: int = 1, state: dict | None = None) -> None:
+    show(chat_id, message_id, cb_id, page=page, state=state)
+
+
+def _filter_state_code(kind: str, base: dict, draft: dict) -> str:
+    payload = json.dumps({
+        "k": kind,
+        "base": _normalize_list_state(base),
+        "draft": _normalize_list_state(draft),
+    }, ensure_ascii=False, separators=(",", ":"))
+    return ui.register_code("logfilter:" + payload)
+
+
+def _resolve_filter_state(short: str) -> dict | None:
+    full = ui.resolve_code(short)
+    if not full or not full.startswith("logfilter:"):
+        return None
+    try:
+        obj = json.loads(full[len("logfilter:"):])
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    kind = str(obj.get("k") or "")
+    if kind not in {"apikey", "model", "channel"}:
+        return None
+    return {
+        "k": kind,
+        "base": _normalize_list_state(obj.get("base") or {}),
+        "draft": _normalize_list_state(obj.get("draft") or {}),
+    }
+
+
+def _render_filter_menu_text(kind: str, draft: dict) -> str:
+    field = _filter_field(kind)
+    return (
+        f"{_filter_title(kind)}\n\n"
+        f"{_filter_current_label(kind, draft.get(field) or [])}"
+    )
+
+
+def _filter_menu_kb(kind: str, base: dict, draft: dict) -> dict:
+    field = _filter_field(kind)
+    selected = set(_norm_values(draft.get(field) or []))
+    options = _filter_options(kind)
+    rows: list[list[dict]] = []
+    buttons: list[dict] = []
+    for value in options[:90]:
+        label = _button_label(_option_label(kind, value), max_len=24 if kind == "channel" else 16)
+        mark = "✅ " if value in selected else ""
+        code = _filter_state_code(kind, base, draft)
+        v_code = ui.register_code(value)
+        buttons.append(ui.btn(mark + label, f"logs:ftoggle:{kind}:{v_code}:{code}"))
+    _append_button_grid(rows, buttons, cols=2 if kind == "channel" else 3)
+    code = _filter_state_code(kind, base, draft)
+    rows.append([
+        ui.btn("取消", f"logs:faction:{kind}:cancel:{code}"),
+        ui.btn("全选", f"logs:faction:{kind}:all:{code}"),
+        ui.btn("反选", f"logs:faction:{kind}:invert:{code}"),
+        ui.btn("确认", f"logs:faction:{kind}:confirm:{code}"),
+    ])
+    return ui.inline_kb(rows)
+
+
+def _show_filter_menu(chat_id: int, message_id: int, cb_id: str | None,
+                      kind: str, base: dict, draft: dict | None = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    draft = _normalize_list_state(draft or base)
+    ui.edit(
+        chat_id, message_id,
+        _render_filter_menu_text(kind, draft),
+        reply_markup=_filter_menu_kb(kind, _normalize_list_state(base), draft),
+    )
+
+
+def _toggle_filter_value(chat_id: int, message_id: int, cb_id: str,
+                         kind: str, value_short: str, state_short: str) -> None:
+    st = _resolve_filter_state(state_short)
+    value = ui.resolve_code(value_short)
+    if not st or not value:
+        ui.answer_cb(cb_id, "筛选状态已失效")
+        return
+    draft = _normalize_list_state(st["draft"])
+    field = _filter_field(kind)
+    values = _norm_values(draft.get(field) or [])
+    if value in values:
+        values = [v for v in values if v != value]
+    else:
+        values.append(value)
+    draft[field] = values
+    _show_filter_menu(chat_id, message_id, cb_id, kind, st["base"], draft)
+
+
+def _filter_action(chat_id: int, message_id: int, cb_id: str,
+                   kind: str, action: str, state_short: str) -> None:
+    st = _resolve_filter_state(state_short)
+    if not st:
+        ui.answer_cb(cb_id, "筛选状态已失效")
+        return
+    base = _normalize_list_state(st["base"])
+    draft = _normalize_list_state(st["draft"])
+    field = _filter_field(kind)
+    if action == "cancel":
+        show(chat_id, message_id, cb_id, state=base)
+        return
+    if action == "confirm":
+        draft["p"] = 1
+        show(chat_id, message_id, cb_id, state=draft)
+        return
+    options = _filter_options(kind)
+    if action == "all":
+        draft[field] = options
+    elif action == "invert":
+        selected = set(_norm_values(draft.get(field) or []))
+        draft[field] = [v for v in options if v not in selected]
+    _show_filter_menu(chat_id, message_id, cb_id, kind, base, draft)
 
 
 # ─── 详情 ─────────────────────────────────────────────────────────
@@ -209,6 +516,7 @@ def _render_detail(detail: dict) -> str:
     log = detail.get("log") or {}
     chain = detail.get("retry_chain") or []
     proxy_chain = detail.get("proxy_chain") or []
+    local_web_log = detail.get("local_web_log") or []
 
     rid = log.get("request_id") or "?"
     created = ui.fmt_bjt_ts(log.get("created_at"), "%Y-%m-%d %H:%M:%S")
@@ -301,9 +609,9 @@ def _render_detail(detail: dict) -> str:
             if p.get("error_detail"):
                 lines.append(f"     ⚠ <i>{ui.escape_html(_extract_error_summary(p['error_detail'])[:180])}</i>")
 
-    # 重试链
+    # 执行链（包含普通渠道尝试、本地搜索轮、预算提示等；local web 轮不计入真正 retry_count）
     lines.append("")
-    lines.append(f"<b>重试链 ({len(chain)} 次尝试)</b>")
+    lines.append(f"<b>执行链 ({len(chain)} 次)</b>")
     if not chain:
         lines.append("  (无记录)")
     for c in chain:
@@ -311,11 +619,12 @@ def _render_detail(detail: dict) -> str:
         ch = ui.escape_html(ui.channel_display_name(c.get("channel_key") or "?", with_family=True))
         model = ui.escape_html(c.get("model") or "?")
         oc = c.get("outcome") or "?"
-        mark = "✅" if oc == "success" else "❌"
+        mark = _retry_chain_mark(oc)
+        label = ui.escape_html(_retry_chain_label(oc))
         proxy_tag = ""
         if c.get("proxy_name"):
             proxy_tag = f" 🔀 {ui.escape_html(c['proxy_name'])}"
-        lines.append(f"  {mark} <b>{order}.</b> <code>{ch}</code> / <code>{model}</code>{proxy_tag} — {ui.escape_html(oc)}")
+        lines.append(f"  {mark} <b>{order}.</b> <code>{ch}</code> / <code>{model}</code>{proxy_tag} — {label}")
         timing = []
         if c.get("connect_ms") is not None:
             timing.append(f"连接 {ui.fmt_ms(c['connect_ms'])}")
@@ -329,6 +638,52 @@ def _render_detail(detail: dict) -> str:
         if c.get("error_detail"):
             lines.append(f"     ⚠ <i>{ui.escape_html(_extract_error_summary(c['error_detail'])[:180])}</i>")
 
+    # 本地搜索 / 抓取日志
+    if local_web_log:
+        lines.append("")
+        lines.append(f"<b>搜索日志 ({len(local_web_log)} 次)</b>")
+        total_bytes = 0
+        total_results = 0
+        for idx, item in enumerate(local_web_log, 1):
+            status_l = item.get("status") or "?"
+            mark = "✅" if status_l == "success" else ("⏳" if status_l == "running" else "❌")
+            tool = ui.escape_html(item.get("tool_name") or "?")
+            round_no = item.get("round_no") or "?"
+            count = int(item.get("result_count") or 0)
+            b = int(item.get("content_bytes") or 0)
+            total_bytes += b
+            total_results += count
+            head = f"  {mark} <b>{idx}.</b> <code>{tool}</code> · round {round_no}"
+            if count:
+                head += f" · 返回 {count} 条"
+            if b:
+                head += f" · {_fmt_bytes(b)}"
+            lines.append(head)
+            query = item.get("query")
+            url = item.get("url")
+            if query:
+                q = ui.escape_html(str(query)[:300])
+                lines.append(f"     查: <i>{q}</i>")
+            if url:
+                u = ui.escape_html(str(url)[:300])
+                lines.append(f"     URL: <code>{u}</code>")
+            timing = []
+            if item.get("started_at") and item.get("ended_at"):
+                timing.append(f"耗时 {ui.fmt_ms((item['ended_at'] - item['started_at']) * 1000)}")
+            if item.get("content_chars"):
+                timing.append(f"字符 {ui.fmt_tokens(item.get('content_chars'))}")
+            if timing:
+                lines.append(f"     · {' · '.join(timing)}")
+            if item.get("error_message"):
+                lines.append(f"     ⚠ <i>{ui.escape_html(str(item['error_message'])[:220])}</i>")
+        summary = []
+        if total_results:
+            summary.append(f"共 {total_results} 条")
+        if total_bytes:
+            summary.append(f"共 {_fmt_bytes(total_bytes)}")
+        if summary:
+            lines.append("  合计: " + " · ".join(summary))
+
     # 错误信息（整体）
     if status == "error" and log.get("error_message"):
         lines.append("")
@@ -338,31 +693,34 @@ def _render_detail(detail: dict) -> str:
     return "\n".join(lines)
 
 
-def show_detail(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
+                page: int = 1, list_state: dict | None = None) -> None:
     ui.answer_cb(cb_id)
+    list_state = _normalize_list_state(list_state, page=page if list_state is None else None)
+    list_code = _list_state_code(list_state)
     rid = ui.resolve_code(short)
     if not rid:
         ui.edit(chat_id, message_id, "⚠ 日志已过期或未找到",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"logs:page:{page}")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _list_cb(list_state))]]))
         return
     try:
         detail = log_db.log_detail(rid)
     except Exception as exc:
         ui.edit(chat_id, message_id, f"❌ 查询失败: <code>{ui.escape_html(str(exc))}</code>",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"logs:page:{page}")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _list_cb(list_state))]]))
         return
     if not detail or not detail.get("log"):
         ui.edit(chat_id, message_id, f"⚠ 未找到 <code>{ui.escape_html(rid)}</code>",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", f"logs:page:{page}")]]))
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _list_cb(list_state))]]))
         return
     body_short = ui.register_code("logbody:" + rid)
     resp_short = ui.register_code("logresp:" + rid)
     ui.edit(
         chat_id, message_id, ui.truncate(_render_detail(detail)),
         reply_markup=ui.inline_kb([
-            [ui.btn("📨 请求 Body", f"logs:body:{body_short}:{page}"),
-             ui.btn("📬 响应", f"logs:response:{resp_short}:{page}")],
-            [ui.btn(f"◀ 返回第 {page} 页", f"logs:page:{page}")],
+            [ui.btn("📨 请求 Body", f"logs:body:{body_short}:{list_code}"),
+             ui.btn("📬 响应", f"logs:response:{resp_short}:{list_code}")],
+            [ui.btn(f"◀ 返回第 {list_state['p']} 页", _list_cb(list_state))],
         ]),
     )
 
@@ -391,8 +749,9 @@ def _resolve_state(short: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-def _detail_back_cb(rid: str, page: int | None) -> str:
-    return f"logs:detail:{ui.register_code(rid)}:{int(page or 1)}"
+def _detail_back_cb(rid: str, list_state: dict | None) -> str:
+    st = _normalize_list_state(list_state or {})
+    return f"logs:detail:{ui.register_code(rid)}:{_list_state_code(st)}"
 
 
 def _kind_label(kind: str) -> str:
@@ -534,7 +893,7 @@ def _inspector_kb(*, state: dict, rid: str, items: list[dict], selected_seq: int
     sort_key = str(state.get("o") or "original")
     query = str(state.get("q") or "")
     current_filter = _kind_filter(state)
-    lp = int(state.get("lp") or 1)
+    list_state = _normalize_list_state(state.get("ls") or {"p": int(state.get("lp") or 1)})
 
     item_buttons: list[dict] = []
     for item in _page_slice(items, page):
@@ -599,7 +958,7 @@ def _inspector_kb(*, state: dict, rid: str, items: list[dict], selected_seq: int
     if extra:
         rows.append(extra)
 
-    rows.append([ui.btn("◀ 返回详情", _detail_back_cb(rid, lp))])
+    rows.append([ui.btn("◀ 返回详情", _detail_back_cb(rid, list_state))])
     return ui.inline_kb(rows)
 
 
@@ -654,16 +1013,14 @@ def _show_inspector(chat_id: int, message_id: int, cb_id: str | None, state: dic
     )
 
 
-def _initial_state(rid: str, kind: str, *, list_page: int = 1) -> dict:
-    return {"r": rid, "k": kind, "s": None, "p": None, "o": "original", "q": "", "f": "", "lp": int(list_page or 1)}
+def _initial_state(rid: str, kind: str, *, list_state: dict | None = None, list_page: int = 1) -> dict:
+    st = _normalize_list_state(list_state or {"p": int(list_page or 1)})
+    return {"r": rid, "k": kind, "s": None, "p": None, "o": "original", "q": "", "f": "", "ls": st, "lp": st["p"]}
 
 
 def _show_body_inspector(chat_id: int, message_id: int, cb_id: str, payload: str, kind: str) -> None:
-    short, _, page_s = (payload or "").partition(":")
-    try:
-        list_page = int(page_s or 1)
-    except Exception:
-        list_page = 1
+    short, _, state_s = (payload or "").partition(":")
+    list_state = _resolve_list_state(state_s) or _list_state(1)
     full = ui.resolve_code(short)
     prefix = "logbody:" if kind == "request" else "logresp:"
     if not full or not full.startswith(prefix):
@@ -671,7 +1028,7 @@ def _show_body_inspector(chat_id: int, message_id: int, cb_id: str, payload: str
         return
     rid = full[len(prefix):]
     ui.answer_cb(cb_id, "加载中...")
-    _show_inspector(chat_id, message_id, None, _initial_state(rid, kind, list_page=list_page))
+    _show_inspector(chat_id, message_id, None, _initial_state(rid, kind, list_state=list_state))
 
 
 def show_request_body(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
@@ -758,6 +1115,9 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
     if data == "menu:logs":
         show(chat_id, message_id, cb_id, page=1); return True
+    if data.startswith("logs:list:"):
+        state = _resolve_list_state(data.split(":", 2)[2]) or _list_state(1)
+        show(chat_id, message_id, cb_id, state=state); return True
     if data.startswith("logs:page:"):
         try:
             page = int(data.split(":", 2)[2])
@@ -771,14 +1131,41 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         except Exception:
             page = 1
         refresh(chat_id, message_id, cb_id, page=page); return True
+    if data.startswith("logs:filter:"):
+        payload = data.split(":", 2)[2]
+        kind, _, short = payload.partition(":")
+        state = _resolve_list_state(short)
+        if not state or kind not in {"apikey", "model", "channel"}:
+            ui.answer_cb(cb_id, "筛选状态已失效")
+            return True
+        _show_filter_menu(chat_id, message_id, cb_id, kind, state); return True
+    if data.startswith("logs:ftoggle:"):
+        payload = data.split(":", 2)[2]
+        parts = payload.split(":", 2)
+        if len(parts) != 3:
+            ui.answer_cb(cb_id, "筛选状态已失效")
+            return True
+        kind, value_short, state_short = parts
+        _toggle_filter_value(chat_id, message_id, cb_id, kind, value_short, state_short); return True
+    if data.startswith("logs:faction:"):
+        payload = data.split(":", 2)[2]
+        parts = payload.split(":", 2)
+        if len(parts) != 3:
+            ui.answer_cb(cb_id, "筛选状态已失效")
+            return True
+        kind, action, state_short = parts
+        _filter_action(chat_id, message_id, cb_id, kind, action, state_short); return True
     if data.startswith("logs:detail:"):
         payload = data.split(":", 2)[2]
-        short, _, page_s = payload.partition(":")
-        try:
-            page = int(page_s or 1)
-        except Exception:
-            page = 1
-        show_detail(chat_id, message_id, cb_id, short, page=page); return True
+        short, _, state_s = payload.partition(":")
+        list_state = _resolve_list_state(state_s)
+        page = 1
+        if list_state is None:
+            try:
+                page = int(state_s or 1)
+            except Exception:
+                page = 1
+        show_detail(chat_id, message_id, cb_id, short, page=page, list_state=list_state); return True
     if data.startswith("logs:body:"):
         show_request_body(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("logs:response:"):
