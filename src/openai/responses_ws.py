@@ -32,8 +32,8 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
-    affinity, auth, blacklist, concurrency, config, cooldown, fingerprint, log_db,
-    model_mapping, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
+    affinity, auth, blacklist, concurrency, config, cooldown, fingerprint, local_web_tools,
+    log_db, model_mapping, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
@@ -323,6 +323,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await websocket.close(code=4400, reason=_trim_reason("background async response is not supported on Responses WebSocket"))
         return
 
+    local_web_tools.prepare_openai_responses_local_web_tools(body)
+
     # WS transport is streaming by definition. Ensure the upstream payload matches
     # Responses WS expectations even if the client omitted stream.
     body["stream"] = True
@@ -342,12 +344,14 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     msg_count, tool_count = _count_msg_tool(body, "responses")
     reasoning_effort = log_db.extract_reasoning_effort(body, "responses_ws")
     req_headers = _sanitize_headers(dict(websocket.headers))
+    fast_mode = log_db.extract_fast_mode(body, "responses_ws", req_headers)
     log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_"))}
     await asyncio.to_thread(
         log_db.insert_pending,
         request_id, client_ip, key_name, model, True, msg_count, tool_count,
         req_headers, log_body, fingerprint=fp_query, ingress_protocol="responses_ws",
         reasoning_effort=reasoning_effort,
+        fast_mode=fast_mode,
     )
 
     result = scheduler.schedule(

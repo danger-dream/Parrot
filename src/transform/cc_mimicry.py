@@ -39,6 +39,7 @@ USER_TYPE = "external"
 
 BETAS = [
     "claude-code-20250219",
+    "fast-mode-2026-02-01",                 # Claude Fast mode：仅显式 speed=fast / 下游 beta 请求时才进 messages
     "context-1m-2025-08-07",               # 长上下文能力位：显式请求 1M 且模型支持时才进 messages
     "interleaved-thinking-2025-05-14",
     "context-management-2025-06-27",       # 仅最终 payload 含 context_management 时带
@@ -49,6 +50,7 @@ BETAS = [
     "oauth-2025-04-20",                    # OAuth 鉴权层；messages 头拼装时过滤掉（§6/§7）
 ]
 
+FAST_MODE_BETA = "fast-mode-2026-02-01"
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07"
 CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
@@ -60,6 +62,7 @@ OAUTH_BETA = "oauth-2025-04-20"
 PARROT_DOWNSTREAM_BETAS_KEY = "_parrot_downstream_betas"
 PARROT_ORIGINAL_MODEL_KEY = "_parrot_original_model"
 PARROT_WANTS_CONTEXT_1M_KEY = "_parrot_wants_context_1m"
+PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
 
 ONE_M_CONTEXT_TOKENS = 1_000_000
 
@@ -687,7 +690,7 @@ def transform_request(body, email="", session_id=None):
 
     # §15.1：严格按 CC v2.1.156 wire order 构造 payload（sign_body 按插入序序列化，
     # 构造顺序 = wire order）：model, messages, system, tools, metadata,
-    # max_tokens, thinking, context_management, output_config, stream。
+    # max_tokens, speed, thinking, context_management, output_config, stream。
     # §15.2 B2：cc_mimicry 链路不注入 temperature/top_p/top_k（CC body 无此字段）。
     # §15.2 B3：max_tokens 缺省 64000（CC 默认）。§8 B5：metadata.session_id 与
     # header X-Claude-Code-Session-Id 同源。
@@ -725,6 +728,9 @@ def transform_request(body, email="", session_id=None):
 
     payload["metadata"] = build_metadata(email, session_id=session_id)
     payload["max_tokens"] = body.get("max_tokens", 64000)
+
+    if request_wants_fast_mode(body):
+        payload["speed"] = "fast"
 
     if "thinking" in body:
         payload["thinking"] = body["thinking"]
@@ -825,6 +831,30 @@ def parse_beta_header(value) -> list[str]:
 
 def _has_beta(beta_list, beta: str) -> bool:
     return beta in set(parse_beta_header(beta_list))
+
+
+def request_wants_fast_mode(body=None, *, downstream_betas=None) -> bool:
+    """下游是否显式要求 Claude Fast mode。
+
+    Anthropic Fast mode 的 wire 形态是二者同时出现：
+      - `anthropic-beta: fast-mode-2026-02-01`
+      - body `speed: "fast"`
+
+    下游可能通过 HTTP header、SDK 风格的 betas 字段，或 Parrot 内部
+    `_parrot_wants_fast_mode` 信号表达同一个意图；这里统一折成布尔值。
+    """
+    if _has_beta(downstream_betas, FAST_MODE_BETA):
+        return True
+
+    if isinstance(body, dict):
+        if body.get(PARROT_WANTS_FAST_MODE_KEY) is True:
+            return True
+        if str(body.get("speed") or "").strip().lower() == "fast":
+            return True
+        for key in ("betas", "anthropic_beta", "anthropic-beta", "anthropic_betas"):
+            if _has_beta(body.get(key), FAST_MODE_BETA):
+                return True
+    return False
 
 
 def _value_requests_1m_context(value) -> bool:
@@ -956,18 +986,24 @@ def _payload_has_context_management(payload) -> bool:
 
 def _messages_betas_for_request(model=None, betas=None, *, payload=None,
                                 downstream_betas=None, original_model=None,
-                                wants_context_1m=None):
+                                wants_context_1m=None, wants_fast_mode=None):
     """返回 /v1/messages anthropic-beta 列表。
 
     规则不再是固定全量 join，而是按最终 payload / 模型 / 下游显式能力请求生成：
       - oauth-2025-04-20 属 token 端点，messages 永远不带；
       - context-1m：Opus 4.x 默认开启；Sonnet 4.5/4.6 仅在下游显式 1M 信号时开启；
         需要强制关闭时可传 wants_context_1m=False；
+      - fast-mode：仅在下游显式 speed=fast / fast-mode beta 时开启；
       - mid-conversation-system 按 CC 模型白名单带；
       - context-management 仅最终 payload 含 context_management 时带；
       - extended-cache-ttl 仅最终 payload 含 ttl:"1h" 时带。
     """
     beta_list = BETAS if betas is None else betas
+    if wants_fast_mode is None:
+        wants_fast_mode = request_wants_fast_mode(
+            payload if isinstance(payload, dict) else None,
+            downstream_betas=downstream_betas,
+        )
     if wants_context_1m is None:
         wants_context_1m = request_wants_context_1m(
             payload if isinstance(payload, dict) else None,
@@ -976,6 +1012,7 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
             resolved_model=model,
         ) or should_default_context_1m(model)
     allow_context_1m = bool(wants_context_1m) and model_supports_context_1m(model)
+    allow_fast_mode = bool(wants_fast_mode)
     allow_mid_conversation = model_supports_mid_conversation_system(model)
     allow_context_management = True if payload is None else _payload_has_context_management(payload)
     allow_extended_cache_ttl = True if payload is None else _payload_has_ttl_1h(payload)
@@ -983,6 +1020,8 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
     out = []
     for b in beta_list:
         if b == OAUTH_BETA:
+            continue
+        if b == FAST_MODE_BETA and not allow_fast_mode:
             continue
         if b == CONTEXT_1M_BETA and not allow_context_1m:
             continue
@@ -998,14 +1037,15 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
 
 def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_scheme="bearer",
                            model=None, payload=None, downstream_betas=None,
-                           original_model=None, wants_context_1m=None):
+                           original_model=None, wants_context_1m=None,
+                           wants_fast_mode=None):
     """构造 messages 出站 header，对齐 CC v2.1.156 抓包恒定头集合（§7.1）。
 
     - session_id: 与 body.metadata.user_id.session_id 同值（§7.4/§8），调用方传入。
     - betas: 允许调用方传入过滤后的 beta 列表（如 api_channel omit_thinking）；
       缺省用模块 BETAS。无论如何都会剔除 oauth-2025-04-20（那是 token 端点的 beta）。
-    - payload/model/downstream_betas/original_model/wants_context_1m: 用于按最终 body + 模型
-      能力 + 下游显式 1M 信号生成 messages beta，避免无条件硬塞能力位。
+    - payload/model/downstream_betas/original_model/wants_context_1m/wants_fast_mode:
+      用于按最终 body + 模型 + 下游显式能力信号生成 messages beta，避免无条件硬塞能力位。
     - auth_scheme: "bearer"(OAuth) 用 Authorization: Bearer；"api_key" 用 x-api-key。
     注意：x-client-request-id 已删（源码实证 CC 从不在请求发此头，抓包 67/67 无）。
     Accept-Encoding 只写 gzip,deflate —— 本机 venv 未装 brotli/zstandard，
@@ -1016,6 +1056,7 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
         model=model, betas=betas, payload=payload,
         downstream_betas=downstream_betas, original_model=original_model,
         wants_context_1m=wants_context_1m,
+        wants_fast_mode=wants_fast_mode,
     ))
     headers = {
         # ── CC 应用层 ──

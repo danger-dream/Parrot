@@ -33,8 +33,8 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from .. import (
-    affinity, auth, config, errors, failover, fingerprint, log_db, model_mapping,
-    notifier, scheduler, translation,
+    affinity, auth, config, errors, failover, fingerprint, local_web_tools,
+    log_db, model_mapping, notifier, scheduler, translation,
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
@@ -347,6 +347,13 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     except GuardError as ge:
         return errors.json_error_openai(ge.status, ge.err_type, ge.message, param=ge.param)
 
+    if ingress_protocol == "responses":
+        # Normalize OpenAI/Codex hosted search-ish tools before scheduling:
+        # web_search becomes a local AnySearch-backed function tool; tool_search
+        # (Codex tool discovery) and image_generation are dropped for non-native
+        # safety, matching CLIProxyAPI's unsupported-provider behavior.
+        local_web_tools.prepare_openai_responses_local_web_tools(body)
+
     # OpenAI 默认非流式（与 anthropic 默认流式相反）
     is_stream = bool(body.get("stream", False))
     msg_count, tool_count = _count_msg_tool(body, ingress_protocol)
@@ -379,6 +386,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘
     reasoning_effort = log_db.extract_reasoning_effort(body, ingress_protocol)
     req_headers = _sanitize_headers(dict(request.headers))
+    fast_mode = log_db.extract_fast_mode(body, ingress_protocol, req_headers)
     log_body = {k: v for k, v in body.items() if not (isinstance(k, str) and k.startswith("_"))}
     await asyncio.to_thread(
         log_db.insert_pending,
@@ -386,6 +394,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         req_headers, log_body, fingerprint=fp_query,
         ingress_protocol=ingress_protocol,
         reasoning_effort=reasoning_effort,
+        fast_mode=fast_mode,
     )
 
     # 7. 调度（ingress_protocol 决定家族过滤；fp_query 决定亲和命中）

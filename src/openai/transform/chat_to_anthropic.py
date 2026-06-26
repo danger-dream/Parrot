@@ -542,6 +542,8 @@ def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> 
     _, service_tier = common.map_openai_service_tier_to_anthropic(body.get("service_tier"))
     if service_tier:
         payload["service_tier"] = service_tier
+    if common.openai_service_tier_requests_anthropic_fast(body.get("service_tier")):
+        payload["speed"] = "fast"
 
     tools = _convert_tools(body.get("tools") or [])
     tools.extend(_convert_legacy_functions(body.get("functions") or []))

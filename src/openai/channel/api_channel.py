@@ -16,7 +16,7 @@ from typing import Optional
 
 from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
 from ...channel.url_utils import resolve_upstream_url
-from ... import cache_hints
+from ... import cache_hints, local_web_tools
 from ...providers import registry as provider_registry
 from .. import deepseek_reasoning
 from ..transform import (
@@ -236,7 +236,9 @@ class OpenAIApiChannel(Channel):
         )
 
     def _build_responses_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
-        payload = provider_registry.filter_request_payload(self, body, protocol="openai-responses")
+        payload = dict(body)
+        local_web_tools.prepare_openai_responses_local_web_tools(payload)
+        payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
         payload["model"] = resolved_model
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
@@ -274,6 +276,8 @@ class OpenAIApiChannel(Channel):
 
     def _build_responses_to_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
         """responses ingress → openai-chat 上游。"""
+        body = dict(body)
+        local_web_tools.prepare_openai_responses_local_web_tools(body)
         # Store 开关决定是否允许 previous_response_id
         from .. import store as _store
         store_enabled = _store.is_enabled()

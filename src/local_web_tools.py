@@ -41,6 +41,16 @@ ANTHROPIC_WEB_FETCH_TOOL_TYPES = frozenset({
     "web_fetch_20260309",
     "web_fetch_20260318",
 })
+OPENAI_WEB_SEARCH_TOOL_TYPES = frozenset({
+    "web_search",
+    "web_search_preview",
+    "web_search_preview_2025_03_11",
+})
+# These are Codex/Responses built-ins that are not safe to forward to arbitrary
+# OpenAI-compatible or cross-family providers.  CLIProxyAPI's xAI executor drops
+# the same pair instead of letting unsupported upstreams 400.
+OPENAI_DROP_TOOL_TYPES = frozenset({"tool_search", "image_generation"})
+OPENAI_LOCAL_WEB_MARKER = "_parrot_openai_local_web_tools"
 SUPPORTED_TOOL_NAMES = frozenset({"WebSearch", "WebFetch", "web_search", "web_fetch"})
 _URL_RE = re.compile(r"https?://[^\s)\]>}\"']+")
 
@@ -219,6 +229,242 @@ def request_declares_supported_tools(body: dict[str, Any] | None) -> bool:
         if is_supported_tool_name(tool.get("name")) or is_anthropic_web_tool_type(tool.get("type")):
             return True
     return False
+
+
+def is_openai_web_search_tool_type(value: Any) -> bool:
+    return isinstance(value, str) and value in OPENAI_WEB_SEARCH_TOOL_TYPES
+
+
+def is_openai_drop_tool_type(value: Any) -> bool:
+    return isinstance(value, str) and value in OPENAI_DROP_TOOL_TYPES
+
+
+def _openai_web_search_function_tool(source: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = source or {}
+    params = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query", "minLength": _min_query_chars()},
+            "allowed_domains": {"type": "array", "items": {"type": "string"}},
+            "blocked_domains": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    tool = {
+        "type": "function",
+        "name": "web_search",
+        "description": str(
+            source.get("description")
+            or "Search the web. Executed locally by Parrot through AnySearch when needed."
+        ),
+        "parameters": params,
+    }
+    if source.get("strict") is True:
+        tool["strict"] = True
+    return tool
+
+
+def _normalize_openai_local_web_tool(tool: Any) -> tuple[dict[str, Any] | None, bool, bool]:
+    """Return (tool_or_none, changed, web_search_enabled)."""
+    if not isinstance(tool, dict):
+        return tool, False, False  # type: ignore[return-value]
+    typ = str(tool.get("type") or "").strip()
+    if is_openai_web_search_tool_type(typ):
+        return _openai_web_search_function_tool(tool), True, True
+    if is_openai_drop_tool_type(typ):
+        return None, True, False
+    return tool, False, False
+
+
+def _normalize_openai_local_web_tool_choice(choice: Any, *, has_tools: bool) -> tuple[Any, bool]:
+    if not isinstance(choice, dict):
+        return choice, False
+    typ = str(choice.get("type") or "").strip()
+    if is_openai_web_search_tool_type(typ):
+        return ({"type": "function", "name": "web_search"} if has_tools else "auto"), True
+    if is_openai_drop_tool_type(typ):
+        return "auto", True
+    if typ == "allowed_tools":
+        tools = choice.get("tools")
+        if not isinstance(tools, list):
+            return choice, False
+        changed = False
+        kept: list[Any] = []
+        for item in tools:
+            normalized, item_changed, _ = _normalize_openai_local_web_tool(item)
+            changed = changed or item_changed
+            if normalized is not None:
+                kept.append(normalized)
+        if not changed:
+            return choice, False
+        if not kept:
+            return "auto", True
+        out = dict(choice)
+        out["tools"] = kept
+        return out, True
+    return choice, False
+
+
+def prepare_openai_responses_local_web_tools(body: dict[str, Any] | None) -> bool:
+    """Normalize Responses built-ins for local/non-native execution.
+
+    * ``web_search`` (and legacy preview aliases) becomes a normal function tool
+      named ``web_search`` so any upstream model can request it; Parrot then runs
+      AnySearch and appends ``function_call_output`` items.
+    * ``tool_search`` and ``image_generation`` are dropped à la CLIProxyAPI's xAI
+      normalizer: they are not safe to forward to arbitrary upstreams and are not
+      web search.
+
+    Returns True when a web_search tool was converted and a local web loop should
+    be active for the request.
+    """
+    if not enabled() or not isinstance(body, dict):
+        return False
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+
+    changed = False
+    has_local_web = False
+    kept: list[Any] = []
+    for tool in tools:
+        normalized, item_changed, item_web = _normalize_openai_local_web_tool(tool)
+        changed = changed or item_changed
+        has_local_web = has_local_web or item_web
+        if normalized is not None:
+            kept.append(normalized)
+    if changed:
+        if kept:
+            body["tools"] = kept
+        else:
+            body.pop("tools", None)
+
+    choice = body.get("tool_choice")
+    if choice is not None:
+        normalized_choice, choice_changed = _normalize_openai_local_web_tool_choice(choice, has_tools=bool(kept or tools))
+        if choice_changed:
+            changed = True
+            if normalized_choice in (None, "auto"):
+                if kept:
+                    body["tool_choice"] = "auto"
+                else:
+                    body.pop("tool_choice", None)
+            else:
+                body["tool_choice"] = normalized_choice
+
+    if not body.get("tools"):
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        body.pop("parallel_tool_calls", None)
+
+    if has_local_web:
+        body[OPENAI_LOCAL_WEB_MARKER] = True
+    elif changed:
+        body.pop(OPENAI_LOCAL_WEB_MARKER, None)
+    return has_local_web
+
+
+def openai_responses_local_web_active(body: dict[str, Any] | None) -> bool:
+    return enabled() and isinstance(body, dict) and body.get(OPENAI_LOCAL_WEB_MARKER) is True
+
+
+def openai_response_assistant_message(response_obj: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(response_obj, dict):
+        return None
+    output = response_obj.get("output")
+    if not isinstance(output, list):
+        return None
+    return {"role": "assistant", "content": output}
+
+
+def _tool_use_to_responses_function_call(block: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(block, dict):
+        return None
+    typ = block.get("type")
+    if typ == "function_call":
+        name = str(block.get("name") or "")
+        if name not in SUPPORTED_TOOL_NAMES:
+            return None
+        item = dict(block)
+        item.setdefault("call_id", item.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+        item.setdefault("status", "completed")
+        return item
+    if typ != "tool_use":
+        return None
+    name = str(block.get("name") or "")
+    if name not in SUPPORTED_TOOL_NAMES:
+        return None
+    call_id = str(block.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+    raw_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    return {
+        "type": "function_call",
+        "id": f"fc_{uuid.uuid4().hex[:24]}",
+        "call_id": call_id,
+        "name": name,
+        "arguments": json.dumps(raw_input, ensure_ascii=False, separators=(",", ":")),
+        "status": "completed",
+    }
+
+
+def append_openai_tool_results_to_body(
+    body: dict[str, Any],
+    assistant_message: dict[str, Any],
+    results: list[LocalToolResult],
+) -> None:
+    inp = body.get("input")
+    if isinstance(inp, str):
+        body["input"] = [{"type": "message", "role": "user", "content": inp}]
+    elif not isinstance(inp, list):
+        body["input"] = []
+    input_items = body["input"]
+
+    assistant_message = normalize_assistant_message_for_local_tools(assistant_message) or {}
+    known_result_ids = {r.tool_use_id for r in results}
+    for block in assistant_message.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        call_item = _tool_use_to_responses_function_call(block)
+        if call_item is None:
+            continue
+        if str(call_item.get("call_id") or "") in known_result_ids:
+            input_items.append(call_item)
+
+    for result in results:
+        item = {
+            "type": "function_call_output",
+            "call_id": result.tool_use_id,
+            "output": result.content,
+        }
+        if result.is_error:
+            item["status"] = "failed"
+        input_items.append(item)
+
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") == "function" and choice.get("name") in SUPPORTED_TOOL_NAMES:
+        body["tool_choice"] = "auto"
+
+
+def remove_openai_supported_tools_from_body(body: dict[str, Any]) -> int:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return 0
+    kept: list[Any] = []
+    removed = 0
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "function" and tool.get("name") in SUPPORTED_TOOL_NAMES:
+            removed += 1
+            continue
+        kept.append(tool)
+    if removed:
+        if kept:
+            body["tools"] = kept
+        else:
+            body.pop("tools", None)
+        choice = body.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("type") == "function" and choice.get("name") in SUPPORTED_TOOL_NAMES:
+            body["tool_choice"] = "auto"
+    return removed
 
 
 def _iter_content_blocks(message: dict[str, Any] | None) -> Iterable[dict[str, Any]]:
@@ -792,6 +1038,159 @@ def stream_anthropic_response_task_with_pings(
             return
         async for chunk in _iter_response_as_anthropic_sse(response):
             yield chunk
+
+    return StreamingResponse(_iter(), media_type="text/event-stream")
+
+
+def _responses_error_payload_from_response(response: Response, body: bytes) -> dict[str, Any]:
+    try:
+        obj = json.loads(body.decode("utf-8")) if body else {}
+    except Exception:
+        obj = {}
+    err = obj.get("error") if isinstance(obj, dict) and isinstance(obj.get("error"), dict) else {}
+    message = str(err.get("message") or (obj.get("message") if isinstance(obj, dict) else "") or "upstream error")
+    return {
+        "type": "response.failed",
+        "response": {
+            "id": f"resp_{uuid.uuid4().hex[:24]}",
+            "object": "response",
+            "created_at": int(__import__("time").time()),
+            "status": "failed",
+            "error": {"type": str(err.get("type") or "api_error"), "message": message},
+            "output": [],
+        },
+    }
+
+
+async def _iter_openai_response_sse(response_obj: dict[str, Any]):
+    response = dict(response_obj)
+    response.setdefault("id", f"resp_{uuid.uuid4().hex[:24]}")
+    response.setdefault("object", "response")
+    response.setdefault("created_at", int(__import__("time").time()))
+    output = response.get("output") if isinstance(response.get("output"), list) else []
+
+    created = dict(response)
+    created["status"] = "in_progress"
+    created["output"] = []
+    yield _sse("response.created", {"type": "response.created", "response": created})
+    yield _sse("response.in_progress", {"type": "response.in_progress", "response": created})
+
+    for idx, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        yield _sse("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": idx,
+            "item": item,
+        })
+        if item.get("type") == "message":
+            content = item.get("content") if isinstance(item.get("content"), list) else []
+            for cidx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                yield _sse("response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": item.get("id"),
+                    "output_index": idx,
+                    "content_index": cidx,
+                    "part": part,
+                })
+                if part.get("type") == "output_text":
+                    text = str(part.get("text") or "")
+                    if text:
+                        yield _sse("response.output_text.delta", {
+                            "type": "response.output_text.delta",
+                            "item_id": item.get("id"),
+                            "output_index": idx,
+                            "content_index": cidx,
+                            "delta": text,
+                        })
+                    yield _sse("response.output_text.done", {
+                        "type": "response.output_text.done",
+                        "item_id": item.get("id"),
+                        "output_index": idx,
+                        "content_index": cidx,
+                        "text": text,
+                    })
+                yield _sse("response.content_part.done", {
+                    "type": "response.content_part.done",
+                    "item_id": item.get("id"),
+                    "output_index": idx,
+                    "content_index": cidx,
+                    "part": part,
+                })
+        yield _sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": idx,
+            "item": item,
+        })
+
+    response["status"] = response.get("status") or "completed"
+    yield _sse("response.completed", {"type": "response.completed", "response": response})
+
+
+def maybe_wrap_responses_json_response_as_sse(response: Response) -> Response:
+    status = int(getattr(response, "status_code", 200) or 200)
+    if status >= 400:
+        return response
+    body = getattr(response, "body", b"")
+    if not body:
+        return response
+    try:
+        obj = json.loads(body.decode("utf-8"))
+    except Exception:
+        return response
+    if not isinstance(obj, dict) or obj.get("object") != "response":
+        return response
+    headers = dict(getattr(response, "headers", {}) or {})
+    headers.pop("content-length", None)
+    headers.pop("content-type", None)
+    return StreamingResponse(_iter_openai_response_sse(obj), media_type="text/event-stream", headers=headers)
+
+
+def stream_responses_response_task_with_pings(
+    task: "asyncio.Task[Response]",
+    *,
+    ping_interval_seconds: float = 5.0,
+) -> StreamingResponse:
+    async def _iter():
+        interval = max(0.5, float(ping_interval_seconds or 5.0))
+        while not task.done():
+            yield _sse("response.ping", {"type": "response.ping"})
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+        try:
+            response = await task
+        except Exception as exc:
+            yield _sse("response.failed", {
+                "type": "response.failed",
+                "response": {
+                    "id": f"resp_{uuid.uuid4().hex[:24]}",
+                    "object": "response",
+                    "created_at": int(__import__("time").time()),
+                    "status": "failed",
+                    "error": {"type": "api_error", "message": f"local web tool loop failed: {exc}"},
+                    "output": [],
+                },
+            })
+            return
+        status = int(getattr(response, "status_code", 200) or 200)
+        body = getattr(response, "body", b"")
+        if status >= 400:
+            yield _sse("response.failed", _responses_error_payload_from_response(response, body))
+            return
+        try:
+            obj = json.loads(body.decode("utf-8")) if body else None
+        except Exception:
+            obj = None
+        if isinstance(obj, dict) and obj.get("object") == "response":
+            async for chunk in _iter_openai_response_sse(obj):
+                yield chunk
+            return
+        if body:
+            yield body
 
     return StreamingResponse(_iter(), media_type="text/event-stream")
 

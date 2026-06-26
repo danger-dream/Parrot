@@ -79,7 +79,8 @@ def _schema_sql() -> str:
       -- 代理层字节数：统计经由该代理转发的上游 body bytes（请求 + 响应）。
       proxy_bytes_up        INTEGER DEFAULT 0,
       proxy_bytes_down      INTEGER DEFAULT 0,
-      reasoning_effort      TEXT
+      reasoning_effort      TEXT,
+      fast_mode             INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_log_created ON request_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_log_status ON request_log(status);
@@ -195,6 +196,9 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         changed = True
     if "proxy_bytes_down" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN proxy_bytes_down INTEGER DEFAULT 0")
+        changed = True
+    if "fast_mode" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN fast_mode INTEGER DEFAULT 0")
         changed = True
     # retry_chain migration
     retry_cols = {row[1] for row in conn.execute("PRAGMA table_info(retry_chain)").fetchall()}
@@ -401,6 +405,7 @@ def insert_pending(
     fingerprint: str | None = None,
     ingress_protocol: str = "anthropic",
     reasoning_effort: str | None = None,
+    fast_mode: bool | None = None,
 ) -> None:
     with _write_lock:
         conn = _get_conn()
@@ -408,8 +413,8 @@ def insert_pending(
             """INSERT INTO request_log
                (request_id, created_at, client_ip, api_key_name, requested_model,
                 status, is_stream, msg_count, tool_count, fingerprint,
-                ingress_protocol, reasoning_effort)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ingress_protocol, reasoning_effort, fast_mode)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 request_id, time.time(), client_ip, api_key_name, requested_model,
                 "pending", 1 if is_stream else 0, msg_count, tool_count,
@@ -418,6 +423,7 @@ def insert_pending(
                 fingerprint[:16] if fingerprint else None,
                 ingress_protocol or "anthropic",
                 reasoning_effort,
+                1 if (extract_fast_mode(request_body, ingress_protocol, request_headers) if fast_mode is None else fast_mode) else 0,
             ),
         )
         conn.execute(
@@ -438,7 +444,7 @@ def update_pending(request_id: str, **fields: Any) -> None:
         return
     allowed = {
         "fingerprint", "affinity_hit", "requested_model",
-        "msg_count", "tool_count", "proxy_name", "reasoning_effort",
+        "msg_count", "tool_count", "proxy_name", "reasoning_effort", "fast_mode",
     }
     cols, vals = [], []
     for k, v in fields.items():
@@ -1162,7 +1168,7 @@ _RECENT_COLS = (
     "connect_time_ms, first_token_time_ms, total_time_ms, "
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
-    "reasoning_effort, "
+    "reasoning_effort, fast_mode, "
     "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count"
 )
 
@@ -1737,6 +1743,66 @@ def _budget_to_effort_for_log(budget) -> str:
     if b >= 2048:
         return "high"
     return "medium"
+
+
+
+# ─── Fast mode 提取 ──────────────────────────────────────────────
+
+_FAST_MODE_BETA = "fast-mode-2026-02-01"
+
+
+def _split_beta_tokens(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_split_beta_tokens(item))
+        return out
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def _get_header(headers: dict | None, name: str) -> str | None:
+    if not isinstance(headers, dict):
+        return None
+    name_l = name.lower()
+    for k, v in headers.items():
+        if str(k).lower() == name_l:
+            return str(v)
+    return None
+
+
+def extract_fast_mode(
+    body: dict | None,
+    ingress_protocol: str = "anthropic",
+    headers: dict | None = None,
+) -> bool:
+    """Return whether the downstream request explicitly requested Fast mode.
+
+    Anthropic Fast mode is represented by ``speed=fast`` plus the
+    ``fast-mode-2026-02-01`` beta header.  OpenAI-family latency equivalent is
+    ``service_tier=priority``.  Internal Parrot hints are accepted so logging can
+    run before/after bridge transforms without losing the flag.
+    """
+    if isinstance(body, dict):
+        if body.get("_parrot_wants_fast_mode") is True:
+            return True
+        if str(body.get("speed") or "").strip().lower() == "fast":
+            return True
+        if str(body.get("service_tier") or "").strip().lower() == "priority":
+            return True
+        for key in (
+            "betas", "anthropic_beta", "anthropic-beta", "anthropic_betas",
+            "_parrot_downstream_betas",
+        ):
+            if _FAST_MODE_BETA in set(_split_beta_tokens(body.get(key))):
+                return True
+
+    for key in ("anthropic-beta", "anthropic_beta"):
+        if _FAST_MODE_BETA in set(_split_beta_tokens(_get_header(headers, key))):
+            return True
+
+    return False
 
 
 def extract_reasoning_effort(body: dict, ingress_protocol: str = "anthropic") -> str | None:

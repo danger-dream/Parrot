@@ -403,6 +403,8 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
     ok, service_tier = common.map_anthropic_service_tier_to_openai(body.get("service_tier"))
     if service_tier:
         payload["service_tier"] = service_tier
+    if common.anthropic_request_wants_openai_priority(body):
+        payload["service_tier"] = "priority"
     tools = _convert_tools(body.get("tools") or [])
     if tools:
         payload["tools"] = tools

@@ -100,10 +100,12 @@ class OAuthChannel(Channel):
         downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
         original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
         wants_context_1m = body_with_model.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
+        wants_fast_mode = body_with_model.get(cc_mimicry.PARROT_WANTS_FAST_MODE_KEY)
         headers = cc_mimicry.build_upstream_headers(
             access_token, session_id=sid, model=resolved_model, payload=payload,
             downstream_betas=downstream_betas, original_model=original_model,
-            wants_context_1m=wants_context_1m)
+            wants_context_1m=wants_context_1m,
+            wants_fast_mode=wants_fast_mode)
 
         return UpstreamRequest(
             url=f"{cc_mimicry.ANTHROPIC_API_BASE}/v1/messages?beta=true",

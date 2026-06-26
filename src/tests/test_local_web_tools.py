@@ -370,3 +370,102 @@ def test_stream_anthropic_response_task_with_pings_keeps_stream_alive():
     assert "event: message_start" in out
     assert "event: message_stop" in out
     assert "done" in out
+
+
+def test_prepare_openai_responses_local_web_tools_converts_web_search_and_drops_unsupported():
+    body = {
+        "model": "m",
+        "input": "search",
+        "tools": [
+            {"type": "web_search_preview_2025_03_11", "description": "Search now"},
+            {"type": "tool_search"},
+            {"type": "image_generation"},
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {"type": "web_search_preview"},
+    }
+
+    assert local_web_tools.prepare_openai_responses_local_web_tools(body) is True
+
+    assert body[local_web_tools.OPENAI_LOCAL_WEB_MARKER] is True
+    assert body["tools"][0]["type"] == "function"
+    assert body["tools"][0]["name"] == "web_search"
+    assert body["tools"][0]["parameters"]["required"] == ["query"]
+    assert [t.get("type") for t in body["tools"]] == ["function", "function"]
+    assert [t.get("name") for t in body["tools"]] == ["web_search", "lookup"]
+    assert body["tool_choice"] == {"type": "function", "name": "web_search"}
+
+
+def test_prepare_openai_responses_drops_tool_search_and_image_generation_without_marker():
+    body = {
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "tool_search"}, {"type": "image_generation"}],
+        "tool_choice": {"type": "tool_search"},
+        "parallel_tool_calls": True,
+    }
+
+    assert local_web_tools.prepare_openai_responses_local_web_tools(body) is False
+
+    assert "tools" not in body
+    assert "tool_choice" not in body
+    assert "parallel_tool_calls" not in body
+    assert local_web_tools.OPENAI_LOCAL_WEB_MARKER not in body
+
+
+def test_append_openai_tool_results_to_responses_input():
+    body = {
+        "input": "search parrot",
+        "tools": [{"type": "function", "name": "web_search", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "name": "web_search"},
+    }
+    assistant = {
+        "role": "assistant",
+        "content": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_search",
+            "name": "web_search",
+            "arguments": '{"query":"parrot"}',
+            "status": "completed",
+        }],
+    }
+
+    local_web_tools.append_openai_tool_results_to_body(
+        body,
+        assistant,
+        [local_web_tools.LocalToolResult("call_search", "result text")],
+    )
+
+    assert body["input"][0] == {"type": "message", "role": "user", "content": "search parrot"}
+    assert body["input"][1]["type"] == "function_call"
+    assert body["input"][1]["call_id"] == "call_search"
+    assert body["input"][2] == {
+        "type": "function_call_output",
+        "call_id": "call_search",
+        "output": "result text",
+    }
+    assert body["tool_choice"] == "auto"
+
+
+def test_wrap_responses_json_response_as_sse():
+    response = JSONResponse({
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "m",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "done", "annotations": []}],
+        }],
+        "output_text": "done",
+    })
+
+    wrapped = local_web_tools.maybe_wrap_responses_json_response_as_sse(response)
+
+    assert isinstance(wrapped, StreamingResponse)
+    assert wrapped.media_type == "text/event-stream"

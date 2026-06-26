@@ -686,6 +686,17 @@ def _log_model_display(r: dict) -> str:
     return escape_html(final or requested)
 
 
+def log_fast_mode_enabled(r: dict) -> bool:
+    try:
+        return bool(int(r.get("fast_mode") or 0))
+    except Exception:
+        return bool(r.get("fast_mode"))
+
+
+def log_fast_mode_badge(r: dict) -> str:
+    return "⚡ Fast" if log_fast_mode_enabled(r) else ""
+
+
 def fmt_log_entry_body(r: dict) -> str:
     """渲染日志条目的 body 部分。
 
@@ -702,6 +713,9 @@ def fmt_log_entry_body(r: dict) -> str:
     effort = r.get("reasoning_effort")
     if effort:
         model_line += f" · 🧠 {escape_html(effort)}"
+    fast_badge = log_fast_mode_badge(r)
+    if fast_badge:
+        model_line += f" · {fast_badge}"
     lines.append(model_line)
 
     # 渠道

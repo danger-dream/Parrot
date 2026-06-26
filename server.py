@@ -46,8 +46,10 @@ from src.transform.cc_mimicry import (
     PARROT_DOWNSTREAM_BETAS_KEY,
     PARROT_ORIGINAL_MODEL_KEY,
     PARROT_WANTS_CONTEXT_1M_KEY,
+    PARROT_WANTS_FAST_MODE_KEY,
     parse_beta_header,
     request_wants_context_1m,
+    request_wants_fast_mode,
     strip_context_1m_model_marker,
 )
 
@@ -626,11 +628,17 @@ async def proxy_messages(request: Request):
         original_model=original_model,
         resolved_model=model,
     )
+    explicit_fast_mode = request_wants_fast_mode(
+        body,
+        downstream_betas=downstream_betas,
+    )
     body[PARROT_DOWNSTREAM_BETAS_KEY] = downstream_betas
     if isinstance(original_model, str) and original_model.strip():
         body[PARROT_ORIGINAL_MODEL_KEY] = original_model.strip()
     # True = 下游显式要求 1M；None = 交给 Parrot 默认策略（目前仅 Opus 4.x 默认开启）。
     body[PARROT_WANTS_CONTEXT_1M_KEY] = explicit_context_1m or None
+    # True = 下游显式要求 Claude Fast mode；None = 不启用。
+    body[PARROT_WANTS_FAST_MODE_KEY] = explicit_fast_mode or None
     if not model:
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, "model is required"
@@ -663,6 +671,7 @@ async def proxy_messages(request: Request):
         fingerprint=fp_query,
         ingress_protocol="anthropic",
         reasoning_effort=reasoning_effort,
+        fast_mode=explicit_fast_mode,
     )
 
     # Internal-only routing/cache hints for downstream channel builders.  These

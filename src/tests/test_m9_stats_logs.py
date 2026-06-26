@@ -19,6 +19,7 @@ _isolation.isolate()
 
 import json
 import os
+import sqlite3
 import sys
 import time
 
@@ -621,6 +622,72 @@ def test_logs_detail_short_expired(m):
     edit = rec.last("editMessageText")
     assert edit and "过期" in edit["text"] or "找到" in edit["text"]
     print("  [PASS] logs detail invalid short")
+
+
+def test_log_db_fast_mode_migration_for_old_month_db(m):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE request_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT UNIQUE NOT NULL,
+      created_at REAL NOT NULL,
+      reasoning_effort TEXT
+    )""")
+    conn.execute("""CREATE TABLE retry_chain (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      attempt_order INTEGER NOT NULL,
+      channel_key TEXT NOT NULL,
+      channel_type TEXT NOT NULL,
+      model TEXT NOT NULL,
+      started_at REAL NOT NULL
+    )""")
+
+    m["log_db"]._ensure_migrations(conn)
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    assert "fast_mode" in cols
+    assert "proxy_bytes_up" in cols
+    assert "proxy_bytes_down" in cols
+    print("  [PASS] log_db old schema migration adds fast_mode")
+
+
+def test_extract_fast_mode_variants(m):
+    ld = m["log_db"]
+    assert ld.extract_fast_mode({"speed": "fast"}, "anthropic") is True
+    assert ld.extract_fast_mode({"service_tier": "priority"}, "responses") is True
+    assert ld.extract_fast_mode({}, "anthropic", {"anthropic-beta": "foo,fast-mode-2026-02-01"}) is True
+    assert ld.extract_fast_mode({"service_tier": "default"}, "responses") is False
+    print("  [PASS] fast mode extraction variants")
+
+
+def test_fast_mode_badge_in_recent_logs_and_detail(m):
+    _setup(m)
+    rid = "FAST-log"
+    body = {
+        "model": "gpt-fast",
+        "input": "hi",
+        "service_tier": "priority",
+    }
+    m["log_db"].insert_pending(
+        rid, "1.1.1.1", "k1", "gpt-fast", True, 1, 0, {}, body,
+        ingress_protocol="responses",
+    )
+    m["log_db"].finish_success(
+        rid, "api:fast", "api", "gpt-fast", input_tokens=1, output_tokens=1,
+        response_body='{"object":"response","output":[]}', upstream_protocol="openai-responses",
+    )
+
+    row = m["log_db"].recent_logs(1)[0]
+    assert row["fast_mode"] == 1
+    assert "⚡ Fast" in m["ui"].fmt_log_entry_body(row)
+
+    rec = _install_recorder(m)
+    short = m["ui"].register_code(rid)
+    m["logs_menu"].show_detail(42, 100, "cb", short)
+    edit = rec.last("editMessageText")
+    assert edit is not None
+    assert "模式：⚡ Fast" in edit["text"]
+    print("  [PASS] Fast mode badge in logs list + detail")
 
 
 def test_openai_workspace_id_hidden_in_stats_and_logs(m):

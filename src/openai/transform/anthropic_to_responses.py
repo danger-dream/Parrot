@@ -479,6 +479,8 @@ def translate_request(
     )
     if service_tier:
         payload["service_tier"] = service_tier
+    if common.anthropic_request_wants_openai_priority(body):
+        payload["service_tier"] = "priority"
     tools = _tools_to_responses(body.get("tools") or [])
     if tools:
         payload["tools"] = tools

@@ -272,6 +272,20 @@ def test_translate_request_maps_reasoning_effort_and_service_tier():
     assert "service_tier" not in standard_codex
 
 
+def test_translate_request_maps_anthropic_fast_mode_to_openai_priority():
+    out = anthropic_to_responses.translate_request({
+        "messages": [{"role": "user", "content": "fast"}],
+        "speed": "fast",
+    }, target_model="gpt-5")
+    assert out["service_tier"] == "priority"
+
+    out = anthropic_to_responses.translate_request({
+        "messages": [{"role": "user", "content": "fast"}],
+        "_parrot_wants_fast_mode": True,
+    }, target_model="gpt-5")
+    assert out["service_tier"] == "priority"
+
+
 def test_translate_request_guards_unmappable_reasoning_controls():
     disabled = anthropic_to_responses.translate_request({
         "messages": [],

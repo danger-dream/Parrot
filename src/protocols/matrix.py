@@ -205,6 +205,13 @@ def _tool_choice_is_hosted_or_non_function(ingress_protocol: str, body: dict[str
 
 
 def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | None:
+    # For Responses, Codex OAuth supports the official client-executed
+    # `tool_search` tool but not generic hosted tools such as web_search or
+    # file_search.  Prefer returning any non-tool_search hosted label when a
+    # mixed tool list is present so the native capability guard does not
+    # accidentally let unsupported tools through just because tool_search
+    # appeared first.
+    fallback_label: str | None = None
     if body.get("container") is not None:
         return "container"
     if body.get("mcp_servers") is not None:
@@ -222,7 +229,11 @@ def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | Non
             if ingress_protocol == "chat" and typ not in (None, "function"):
                 return str(typ)
             if ingress_protocol == "responses" and typ not in (None, "function", "custom"):
-                return str(typ)
+                label = str(typ)
+                if label == "tool_search":
+                    fallback_label = fallback_label or label
+                    continue
+                return label
     choice = body.get("tool_choice")
     if isinstance(choice, dict):
         typ = choice.get("type")
@@ -253,11 +264,19 @@ def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | Non
                             continue
                         nested_typ = tool.get("type")
                         if nested_typ not in (None, "function", "custom"):
-                            return f"tool_choice:allowed_tools:{nested_typ}"
-                return None
+                            label = f"tool_choice:allowed_tools:{nested_typ}"
+                            if nested_typ == "tool_search":
+                                fallback_label = fallback_label or label
+                                continue
+                            return label
+                return fallback_label
             if typ not in (None, "auto", "none", "function", "custom"):
-                return f"tool_choice:{typ}"
-    return None
+                label = f"tool_choice:{typ}"
+                if typ == "tool_search":
+                    fallback_label = fallback_label or label
+                else:
+                    return label
+    return fallback_label
 
 
 def _responses_input_like_items(body: dict[str, Any]) -> list[Any]:
@@ -1093,6 +1112,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
                 "prompt_cache_key",
                 "item_reference",
                 "custom_tool_history",
+                "tool_search",
             })
         else:
             native_state.update({
@@ -1133,12 +1153,23 @@ def _native_state_key_for_label(label: str | None) -> str | None:
     return label
 
 
+def _responses_hosted_tool_supported(label: str | None, native: frozenset[str]) -> bool:
+    # Codex `tool_search` is client-executed tool discovery, not a generic
+    # hosted/server-side tool.  Do not let a provider's broad `hosted_tools`
+    # capability satisfy it; only an explicit `tool_search` native state may.
+    if label in {"tool_search", "tool_choice:tool_search", "tool_choice:allowed_tools:tool_search"}:
+        return "tool_search" in native
+    if "hosted_tools" in native:
+        return True
+    return False
+
+
 def _responses_native_unsupported_label(
     f: RequestFeatures,
     capabilities: ChannelCapabilities | None,
 ) -> str | None:
     native = capabilities.native_state if capabilities is not None else frozenset()
-    if f.has_hosted_tools and "hosted_tools" not in native:
+    if f.has_hosted_tools and not _responses_hosted_tool_supported(f.hosted_tool_label, native):
         return f.hosted_tool_label or "hosted_tools"
     if f.has_custom_tools and "custom_tool_history" not in native:
         return f.custom_tool_label or "custom_tool_history"

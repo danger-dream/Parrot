@@ -563,6 +563,9 @@ def _render_detail(detail: dict) -> str:
     effort = log.get("reasoning_effort")
     if effort:
         lines.append(f"思考强度：🧠 {ui.escape_html(effort)}")
+    fast_badge = ui.log_fast_mode_badge(log)
+    if fast_badge:
+        lines.append(f"模式：{fast_badge}")
 
     # Tokens
     if status == "success":

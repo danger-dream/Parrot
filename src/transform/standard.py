@@ -12,6 +12,7 @@ import json
 
 from .. import cache_hints
 from .cc_mimicry import (
+    PARROT_WANTS_FAST_MODE_KEY,
     _normalize_messages_for_api,
     _strip_assistant_thinking_blocks,
     _strip_message_cache_control,
@@ -70,6 +71,13 @@ def standard_transform(body: dict) -> dict:
     ):
         if k in body:
             payload[k] = body[k]
+
+    # Claude Fast mode 必须同时带 body speed=fast 和 anthropic-beta。
+    # Header 在 Channel 层补，这里只负责最终 Anthropic payload。
+    if body.get(PARROT_WANTS_FAST_MODE_KEY) is True:
+        payload["speed"] = "fast"
+    elif "speed" in body:
+        payload["speed"] = body["speed"]
 
     if body.get("tools"):
         tools = _strip_tool_cache_control(

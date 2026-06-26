@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +46,8 @@ def test_provider_capabilities_expose_protocols_and_state_boundaries():
     assert codex.protocols == frozenset({"openai-responses"})
     assert "encrypted_reasoning_replay" in codex.native_state
     assert "item_reference" in codex.native_state
+    assert "tool_search" in codex.native_state
+    assert "hosted_tools" not in codex.native_state
     assert "file_id" not in codex.native_state
     assert "audio" not in codex.native_state
     assert "conversation" in codex.redlines
@@ -134,8 +137,11 @@ def test_anthropic_native_filter_keeps_official_fields_and_drops_foreign_hints()
             "model": "claude",
             "messages": [],
             "service_tier": "auto",
+            "speed": "fast",
             "container": {"id": "ctr_1"},
             "mcp_servers": [{"name": "tools"}],
+            "_parrot_downstream_betas": ["fast-mode-2026-02-01"],
+            "_parrot_wants_fast_mode": True,
             "prompt_cache_key": "openai-only",
             "response_format": {"type": "json_schema"},
             "_api_key_name": "internal",
@@ -147,9 +153,36 @@ def test_anthropic_native_filter_keeps_official_fields_and_drops_foreign_hints()
         "model": "claude",
         "messages": [],
         "service_tier": "auto",
+        "speed": "fast",
         "container": {"id": "ctr_1"},
         "mcp_servers": [{"name": "tools"}],
+        "_parrot_downstream_betas": ["fast-mode-2026-02-01"],
+        "_parrot_wants_fast_mode": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_anthropic_api_channel_emits_fast_mode_header_and_body():
+    from src.channel.api_channel import ApiChannel
+    from src.transform import cc_mimicry
+
+    for cc_enabled in (False, True):
+        ch = ApiChannel({
+            "name": f"anthropic-fast-{cc_enabled}",
+            "baseUrl": "https://example.test",
+            "apiKey": "sk-test",
+            "models": [],
+            "cc_mimicry": cc_enabled,
+        })
+        req = await ch.build_upstream_request({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY: [cc_mimicry.FAST_MODE_BETA],
+            cc_mimicry.PARROT_WANTS_FAST_MODE_KEY: True,
+        }, "claude-sonnet-4-6")
+        payload = json.loads(req.body.decode("utf-8"))
+        assert payload["speed"] == "fast"
+        assert cc_mimicry.FAST_MODE_BETA in req.headers["anthropic-beta"].split(",")
 
 
 @pytest.mark.asyncio

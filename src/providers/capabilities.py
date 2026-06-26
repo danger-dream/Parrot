@@ -41,22 +41,30 @@ RESPONSES_REQ_ALLOWED: frozenset[str] = frozenset({
 })
 
 
+PARROT_INTERNAL_REQ_FIELDS: frozenset[str] = frozenset({
+    "_parrot_downstream_betas",
+    "_parrot_original_model",
+    "_parrot_wants_context_1m",
+    "_parrot_wants_fast_mode",
+})
+
+
 ANTHROPIC_MESSAGES_REQ_ALLOWED: frozenset[str] = frozenset({
     "model", "messages", "max_tokens",
     "cache_control",
     "container", "context_management", "mcp_servers",
-    "metadata", "output_config", "service_tier",
+    "metadata", "output_config", "service_tier", "speed",
     "stop_sequences", "stream", "system",
     "temperature", "thinking", "tool_choice", "tools",
     "top_k", "top_p",
-})
+}) | PARROT_INTERNAL_REQ_FIELDS
 
 
 ANTHROPIC_BRIDGE_REQ_ALLOWED: frozenset[str] = frozenset({
-    "model", "messages", "max_tokens", "cache_control", "metadata", "service_tier",
+    "model", "messages", "max_tokens", "cache_control", "metadata", "service_tier", "speed",
     "stop_sequences", "stream", "system", "temperature", "tool_choice",
     "tools", "top_p",
-})
+}) | PARROT_INTERNAL_REQ_FIELDS
 
 
 STATEFUL_RESOURCE_REDLINES: frozenset[str] = frozenset({
@@ -159,6 +167,7 @@ OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
         "encrypted_reasoning_replay",
         "item_reference",
         "custom_tool_history",
+        "tool_search",
         "codex_identity_headers",
     }),
     notes=("ChatGPT/Codex OAuth forces store=false/stream=true and uses replay cache for encrypted reasoning",),

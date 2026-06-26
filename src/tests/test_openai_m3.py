@@ -874,24 +874,48 @@ async def test_responses_to_chat_function_call_roundtrip(m):
 # ─── 跨变体 guard ────────────────────────────────────────────────
 
 
-async def test_guard_r2c_builtin_tool(m):
+async def test_r2c_web_search_preview_becomes_local_anysearch_function_tool(m):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
+    router.register("https://c.example", lambda req: httpx.Response(200, json={
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-5",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }))
     chC = _make_openai_channel(m, "oaiC", "https://c.example",
                                protocol="openai-chat", real="gpt-5", alias="gpt-5")
     _install_channels(m, [chC])
 
     body = {"model": "gpt-5", "input": "hi",
-            "tools": [{"type": "web_search_preview"}]}
+            "tools": [{"type": "web_search_preview"}],
+            "tool_choice": {"type": "web_search_preview"}}
     resp, mc = await _call_openai_handler(m, router, "responses", body)
-    assert resp.status_code == 400, f"status={resp.status_code}"
-    out = json.loads(resp.body)
-    assert out["error"]["type"] == "invalid_request_error"
-    assert "web_search_preview" in out["error"]["message"]
-    assert router.last_request is None
+    assert resp.status_code == 200, f"status={resp.status_code}"
+    up = _captured_upstream_body(router)
+    assert up["tools"] == [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web. Executed locally by Parrot through AnySearch when needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query", "minLength": 2},
+                    "allowed_domains": {"type": "array", "items": {"type": "string"}},
+                    "blocked_domains": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }]
+    assert up["tool_choice"] == {"type": "function", "function": {"name": "web_search"}}
     await mc.aclose()
-    print("  [PASS] r2c guard: built-in tool web_search_preview → 400")
+    print("  [PASS] r2c web_search_preview: normalized to local AnySearch function tool")
 
 
 async def test_guard_r2c_previous_response_id_not_found(m):

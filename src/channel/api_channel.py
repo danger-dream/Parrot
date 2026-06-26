@@ -186,11 +186,13 @@ class ApiChannel(Channel):
             downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
             original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
             wants_context_1m = body_with_model.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
+            wants_fast_mode = body_with_model.get(cc_mimicry.PARROT_WANTS_FAST_MODE_KEY)
             headers = cc_mimicry.build_upstream_headers(
                 self.api_key, session_id=sid, betas=betas,
                 auth_scheme="bearer", model=resolved_model, payload=payload,
                 downstream_betas=downstream_betas, original_model=original_model,
-                wants_context_1m=wants_context_1m)
+                wants_context_1m=wants_context_1m,
+                wants_fast_mode=wants_fast_mode)
         else:
             payload = standard.standard_transform(body_with_model)
             if self.omit_temperature:
@@ -203,6 +205,17 @@ class ApiChannel(Channel):
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01",
             }
+            downstream_betas = cc_mimicry.parse_beta_header(
+                body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
+            )
+            wants_fast_mode = body_with_model.get(cc_mimicry.PARROT_WANTS_FAST_MODE_KEY)
+            if cc_mimicry.request_wants_fast_mode(
+                payload, downstream_betas=downstream_betas,
+            ) or wants_fast_mode is True:
+                if cc_mimicry.FAST_MODE_BETA not in downstream_betas:
+                    downstream_betas.append(cc_mimicry.FAST_MODE_BETA)
+            if downstream_betas:
+                headers["anthropic-beta"] = ",".join(dict.fromkeys(downstream_betas))
 
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/messages"),

@@ -250,6 +250,20 @@ def test_translate_request_maps_reasoning_effort_and_service_tier():
     assert adaptive["service_tier"] == "auto"
 
 
+def test_translate_request_maps_anthropic_fast_mode_to_openai_priority():
+    out = anthropic_to_chat.translate_request({
+        "messages": [{"role": "user", "content": "fast"}],
+        "speed": "fast",
+    }, target_model="gpt-5")
+    assert out["service_tier"] == "priority"
+
+    out = anthropic_to_chat.translate_request({
+        "messages": [{"role": "user", "content": "fast"}],
+        "_parrot_downstream_betas": ["fast-mode-2026-02-01"],
+    }, target_model="gpt-5")
+    assert out["service_tier"] == "priority"
+
+
 def test_translate_request_guards_unmappable_reasoning_controls():
     disabled = anthropic_to_chat.translate_request({
         "messages": [],
@@ -320,6 +334,18 @@ def test_translate_request_textualizes_tool_reference_tool_results():
         "tool_call_id": "toolu_refs",
         "content": "Tool reference: WebSearch\nTool reference: WebFetch",
     }]
+
+
+def test_chat_to_anthropic_maps_openai_priority_to_claude_speed():
+    from src.openai.transform import chat_to_anthropic
+
+    out = chat_to_anthropic.translate_request({
+        "model": "gpt-x",
+        "messages": [{"role": "user", "content": "fast"}],
+        "service_tier": "priority",
+    })
+    assert out["speed"] == "fast"
+    assert "service_tier" not in out
 
 
 def test_translate_response_to_anthropic_message():

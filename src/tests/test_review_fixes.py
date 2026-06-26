@@ -167,6 +167,7 @@ def test_standard_anthropic_transform_preserves_native_request_fields(m):
         "max_tokens": 1024,
         "messages": [{"role": "user", "content": "hi"}],
         "service_tier": "auto",
+        "speed": "fast",
         "container": {"id": "ctr_1"},
         "mcp_servers": [{"name": "tools"}],
     }
@@ -174,6 +175,7 @@ def test_standard_anthropic_transform_preserves_native_request_fields(m):
     std = m["standard"].standard_transform(body)
 
     assert std["service_tier"] == "auto"
+    assert std["speed"] == "fast"
     assert std["container"] == {"id": "ctr_1"}
     assert std["mcp_servers"] == [{"name": "tools"}]
 

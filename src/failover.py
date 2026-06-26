@@ -1064,6 +1064,11 @@ async def run_failover(
         and local_web_tools.request_declares_supported_tools(body)
         and local_web_tools.max_tool_rounds() > 0
     )
+    openai_local_web_loop_active = (
+        ingress_protocol == "responses"
+        and local_web_tools.openai_responses_local_web_active(body)
+        and local_web_tools.max_tool_rounds() > 0
+    )
     if local_web_loop_active and is_stream:
         inner_body = dict(body)
         inner_body["stream"] = False
@@ -1078,6 +1083,20 @@ async def run_failover(
             ingress_protocol=ingress_protocol,
         ))
         return local_web_tools.stream_anthropic_response_task_with_pings(task)
+    if openai_local_web_loop_active and is_stream:
+        inner_body = dict(body)
+        inner_body["stream"] = False
+        task = asyncio.create_task(run_failover(
+            schedule_result,
+            inner_body,
+            request_id,
+            api_key_name,
+            client_ip,
+            False,
+            start_time,
+            ingress_protocol=ingress_protocol,
+        ))
+        return local_web_tools.stream_responses_response_task_with_pings(task)
 
     downstream_stream_requested = bool(is_stream)
     local_web_rounds = 0
@@ -1136,9 +1155,10 @@ async def run_failover(
 
         try:
             candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
-            effective_is_stream = is_stream and not candidate_local_web_loop
+            candidate_openai_local_web_loop = openai_local_web_loop_active
+            effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
             attempt_body = body
-            if candidate_local_web_loop and body.get("stream"):
+            if (candidate_local_web_loop or candidate_openai_local_web_loop) and body.get("stream"):
                 attempt_body = dict(body)
                 attempt_body["stream"] = False
             if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
@@ -1239,12 +1259,84 @@ async def run_failover(
                 local_web_tools.append_tool_results_to_body(body, assistant_msg or {}, tool_results)
                 continue
 
+        if result.success and candidate_openai_local_web_loop:
+            response_obj = None
+            try:
+                raw_body = getattr(result.response, "body", b"")
+                response_obj = json.loads(raw_body.decode("utf-8")) if raw_body else None
+            except Exception:
+                response_obj = None
+            assistant_msg = local_web_tools.openai_response_assistant_message(response_obj)
+            assistant_msg = local_web_tools.normalize_assistant_message_for_local_tools(assistant_msg)
+            local_calls = local_web_tools.extract_local_tool_calls(
+                assistant_msg,
+                body.get("tools") or [],
+                conversation_body=body,
+            )
+            tool_use_total = local_web_tools.tool_use_count(assistant_msg)
+            if local_calls and len(local_calls) == tool_use_total:
+                max_rounds = local_web_tools.max_tool_rounds()
+                if local_web_rounds >= max_rounds:
+                    if local_web_limit_reported:
+                        _release_once()
+                        msg = "local OpenAI web_search loop kept requesting web_search after maxToolRounds"
+                        total_ms = int((time.time() - start_time) * 1000)
+                        await asyncio.to_thread(
+                            log_db.finish_error, request_id, msg, retry_count,
+                            final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
+                            connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms, total_ms=total_ms,
+                            http_status=400, affinity_hit=affinity_hit,
+                            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                            proxy_name=result.proxy_name,
+                            proxy_bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
+                            proxy_bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+                        )
+                        return _json_error_for_ingress(ingress_protocol, 400, errors.ErrType.INVALID_REQUEST, msg)
+
+                    local_web_limit_reported = True
+                    removed = local_web_tools.remove_openai_supported_tools_from_body(body)
+                    log_db.update_retry_attempt(
+                        attempt_id,
+                        outcome="local_openai_web_tool_limit",
+                        error_detail=(
+                            f"maxToolRounds={max_rounds}; appended synthetic function_call_output(s) "
+                            f"for {len(local_calls)} call(s); removed_tools={removed}"
+                        ),
+                    )
+                    print(
+                        f"[local-web-tools] OpenAI maxToolRounds reached for request {request_id}; "
+                        f"appending limit function_call_output(s), removed_tools={removed}"
+                    )
+                    _release_once()
+                    tool_results = local_web_tools.round_limit_results(local_calls, max_rounds)
+                    local_web_tools.append_openai_tool_results_to_body(body, assistant_msg or {}, tool_results)
+                    continue
+
+                local_web_rounds += 1
+                log_db.update_retry_attempt(
+                    attempt_id,
+                    outcome="local_openai_web_tool_round",
+                    error_detail=f"executed {len(local_calls)} local OpenAI web_search call(s), round={local_web_rounds}",
+                )
+                print(
+                    f"[local-web-tools] executing {len(local_calls)} OpenAI web_search call(s) "
+                    f"for request {request_id} round={local_web_rounds}"
+                )
+                _release_once()
+                tool_results = await local_web_tools.execute_local_tool_calls(
+                    local_calls, request_id=request_id, round_no=local_web_rounds
+                )
+                local_web_tools.append_openai_tool_results_to_body(body, assistant_msg or {}, tool_results)
+                continue
+
         if result.success or result.stream_started:
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             # 并发 slot release 挂到响应体 finally：stream 消费完 / 客户端断开都会释放
             if result.success and candidate_local_web_loop and downstream_stream_requested:
                 result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
+            if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
+                result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
             _attach_release_to_response(result.response, _release_once)
             return result.response
         # 非成功：立即释放 slot，进入下一候选
@@ -1412,9 +1504,10 @@ async def run_failover(
                     concurrency.release(_key)
                 try:
                     candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
-                    effective_is_stream = is_stream and not candidate_local_web_loop
+                    candidate_openai_local_web_loop = openai_local_web_loop_active
+                    effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
                     attempt_body = body
-                    if candidate_local_web_loop and body.get("stream"):
+                    if (candidate_local_web_loop or candidate_openai_local_web_loop) and body.get("stream"):
                         attempt_body = dict(body)
                         attempt_body["stream"] = False
                     if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
@@ -1451,6 +1544,8 @@ async def run_failover(
                 )
                 if result.success and candidate_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
+                if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
+                    result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
                 if result.success or result.stream_started:
                     _attach_release_to_response(result.response, _release_q)
                     return result.response

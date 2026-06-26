@@ -21,6 +21,8 @@ from ...providers.capabilities import (
 
 _OPENAI_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh"})
 _OPENAI_SERVICE_TIERS: frozenset[str] = frozenset({"auto", "default", "flex", "priority"})
+_ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
+_PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
 
 
 def _protocol_bridge_cfg() -> dict[str, Any]:
@@ -53,6 +55,36 @@ def _tier_mapping(section: str) -> dict[str, Any]:
         return {}
     mapping = root.get(section) or {}
     return mapping if isinstance(mapping, dict) else {}
+
+
+def _parse_beta_header(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_parse_beta_header(item))
+        return out
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def anthropic_request_wants_openai_priority(body: dict | None) -> bool:
+    """Anthropic Fast mode maps to OpenAI service_tier=priority on bridges."""
+    if not isinstance(body, dict):
+        return False
+    if body.get(_PARROT_WANTS_FAST_MODE_KEY) is True:
+        return True
+    if str(body.get("speed") or "").strip().lower() == "fast":
+        return True
+    for key in ("betas", "anthropic_beta", "anthropic-beta", "anthropic_betas", "_parrot_downstream_betas"):
+        if _ANTHROPIC_FAST_MODE_BETA in set(_parse_beta_header(body.get(key))):
+            return True
+    return False
+
+
+def openai_service_tier_requests_anthropic_fast(value: Any) -> bool:
+    """OpenAI priority is the safe latency-equivalent of Anthropic Fast mode."""
+    return isinstance(value, str) and value.strip().lower() == "priority"
 
 
 def supports_reasoning_effort(model: str | None) -> bool:
@@ -310,10 +342,11 @@ def map_anthropic_service_tier_to_openai(value: Any, *, codex_oauth: bool = Fals
 def map_openai_service_tier_to_anthropic(value: Any) -> tuple[bool, str | None]:
     """Map OpenAI service_tier intent to Anthropic service_tier.
 
-    Only the safely equivalent latency intents are mapped.  OpenAI `flex` and
-    `priority` imply provider-specific scheduling/fast-lane semantics that
-    Anthropic Messages does not expose here, so compatibility bridges strip them
-    instead of blocking the core request.
+    Only the safely equivalent service_tier values are mapped here.  OpenAI
+    `priority` is handled separately by
+    `openai_service_tier_requests_anthropic_fast()` because Claude Fast mode is
+    `speed=fast` + `anthropic-beta`, not Anthropic `service_tier`.  OpenAI
+    `flex` still has no safe Anthropic equivalent and is stripped.
     """
     if value is None:
         return True, None
