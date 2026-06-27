@@ -1,4 +1,4 @@
-"""图片生成配置菜单。
+"""图片生成设置菜单。
 
 callback_data 前缀：`img:...`
 """
@@ -54,7 +54,7 @@ def _render() -> tuple[str, dict]:
 
     disabled = c.get("disabledAccounts") or []
     lines = [
-        "🖼 <b>图片生成配置</b>",
+        "🖼 <b>图片生成设置</b>",
         "",
         f"功能状态: {'✅ 启用' if c.get('enabled', True) else '❌ 停用'}",
         f"主模型: <code>{ui.escape_html(c.get('mainModel'))}</code>",
@@ -131,7 +131,7 @@ def _render() -> tuple[str, dict]:
                     view_btns = []
         if view_btns:
             rows.append(view_btns)
-    rows.append([ui.btn("◀ 返回 OAuth", "menu:oauth"), ui.btn("🏠 主菜单", "menu:main")])
+    rows.append([ui.btn("◀ 返回 OAuth 设置", "oa:settings"), ui.btn("🏠 主菜单", "menu:main")])
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 

@@ -143,6 +143,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
     # 因偶发 timeout 立即冷却导致所有 Claude 模型不可用。
     "oauthGraceCount": 3,
+    # OAuth 账户用量展示口径：
+    #   used      = 展示上游返回的已使用百分比（默认，兼容旧 UI）
+    #   remaining = 展示剩余百分比（100 - 已使用百分比）
+    "oauthUsageDisplayMode": "used",
     # Ladder throttle（2026-04-21 新增，防客户端/并发爆发把渠道打穿）：
     # 两次阶梯推进最少间隔 N 秒，期间失败仅累计计数、不推进 cooldown_until。
     # 设 0 关闭该保护。默认 30 秒足够挡住客户端秒级重试。
@@ -173,7 +177,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "quotaMonitor": {
         # 默认关闭：避免每 60s 拉一次 /api/oauth/usage 频繁请求 Anthropic 风控盯上。
-        # 用户可在 TG bot「⚙ 系统设置」→「📈 配额监控」按需启用。
+        # 用户可在 TG bot「🔐 管理 OAuth」→「⚙️ 账户设置」→「📈 配额监控」按需启用。
         "enabled": False,
         "intervalSeconds": 60,
         "disableThresholdPercent": 95,

@@ -21,7 +21,6 @@ def _main_text_and_kb() -> tuple[str, dict]:
     t = cfg.get("timeouts") or {}
     sc = cfg.get("scoring") or {}
     aff = cfg.get("affinity") or {}
-    qm = cfg.get("quotaMonitor") or {}
     ws_enabled = bool((cfg.get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
     ws_mode_label = "开" if ws_enabled else "关"
 
@@ -35,12 +34,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         f"评分: α={sc.get('emaAlpha', 0.25)} · 窗口={sc.get('recentWindow', 50)} · "
         f"惩罚={sc.get('errorPenaltyFactor', 8)} · 探索={sc.get('explorationRate', 0.2)}\n"
         f"亲和: TTL={aff.get('ttlMinutes', 30)}min\n"
-        f"CCH: <code>{cfg.get('cchMode', 'disabled')}</code>"
-        + (f" (<code>{cfg.get('cchStaticValue', '00000')}</code>)" if cfg.get('cchMode') == 'static' else "")
-        + "\n"
         f"调度: <code>{load_balancing.display_mode(cfg.get('channelSelection', 'smart'))}</code>\n"
-        f"配额监控: <code>{'开' if qm.get('enabled') else '关'}</code>"
-        f" · 间隔 {qm.get('intervalSeconds', 60)}s · 阈值 {qm.get('disableThresholdPercent', 95)}%\n"
         f"WS模式: HTTP→WS 上游转换 <code>{ws_mode_label}</code>\n"
     )
     bl = cfg.get("contentBlacklist") or {}
@@ -78,9 +72,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("⛔ 错误阶梯", "sys:show:errwin")],
         [ui.btn("🎯 评分参数", "sys:show:scoring"),
          ui.btn("🔗 亲和参数", "sys:show:affinity")],
-        [ui.btn("🎭 CCH 模式", "sys:show:cch"),
-         ui.btn("⚖️ 负载均衡", "menu:loadbalancing")],
-        [ui.btn("📈 配额监控", "sys:show:quota"),
+        [ui.btn("⚖️ 负载均衡", "menu:loadbalancing"),
          ui.btn("🔔 通知设置", "sys:show:notif")],
         [ui.btn("🛡 首包黑名单", "sys:show:blacklist"),
          ui.btn("⚡ 并发限制", "sys:show:concurrency")],
@@ -431,30 +423,25 @@ def _on_affinity_input(chat_id: int, action: str, text: str) -> None:
 
 # ─── CCH 模式 ─────────────────────────────────────────────────────
 
-_CCH_MODES = ("disabled", "dynamic", "static")
+_CCH_MODES = ("disabled", "dynamic")
 
 
 def _show_cch(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     cfg = config.get()
     mode = cfg.get("cchMode", "disabled")
-    static_val = cfg.get("cchStaticValue", "00000")
     text = (
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>\n\n"
-        f"当前模式: <code>{mode}</code>"
-        + (f"\n静态值: <code>{static_val}</code>" if mode == "static" else "")
+        f"当前模式: <code>{mode if mode in _CCH_MODES else 'disabled'}</code>"
         + "\n\n"
         "<b>说明：</b>\n"
-        "• <code>disabled</code>：不发送 CCH 头（生产默认）\n"
-        "• <code>dynamic</code>：对每次请求 body 计算 xxhash64 → 5 位 hex\n"
-        "• <code>static</code>：使用固定静态值（仅调试用）"
+        "• <code>disabled</code>：不发送 CCH 头\n"
+        "• <code>dynamic</code>：对每次请求 body 计算 xxhash64 → 5 位 hex"
     )
     kb_rows = []
     for m in _CCH_MODES:
         label = f"{'✓ ' if m == mode else ''}{m}"
         kb_rows.append([ui.btn(label, f"sys:cch_set:{m}")])
-    if mode == "static":
-        kb_rows.append([ui.btn("✏ 修改静态值", "sys:edit:cch_static")])
     kb_rows.append([ui.btn("◀ 返回设置", "menu:settings")])
     ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb(kb_rows))
 
@@ -1465,10 +1452,6 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:show:affinity":  _show_affinity(chat_id, message_id, cb_id); return True
     if data.startswith("sys:edit:affinity:"):
         _edit_affinity(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
-    if data == "sys:show:cch":       _show_cch(chat_id, message_id, cb_id); return True
-    if data.startswith("sys:cch_set:"):
-        _on_cch_set(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
-    if data == "sys:edit:cch_static": _edit_cch_static(chat_id, message_id, cb_id); return True
     # 旧入口保留为跳转，渠道选择模式已迁移到「负载均衡」。
     if data == "sys:show:chsel":
         ui.answer_cb(cb_id, "已迁移到负载均衡")
@@ -1478,12 +1461,6 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("sys:chsel_set:"):
         ui.answer_cb(cb_id, "已迁移到负载均衡")
         return True
-
-    # OAuth 配额监控
-    if data == "sys:show:quota":          _show_quota(chat_id, message_id, cb_id); return True
-    if data == "sys:quota_toggle":        _on_quota_toggle(chat_id, message_id, cb_id); return True
-    if data == "sys:edit:quota_interval":   _edit_quota_interval(chat_id, message_id, cb_id); return True
-    if data == "sys:edit:quota_threshold":  _edit_quota_threshold(chat_id, message_id, cb_id); return True
 
     # 网络设置
     if data == "sys:show:network":        _show_network(chat_id, message_id, cb_id); return True
@@ -1554,16 +1531,10 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         _on_scoring_input(chat_id, action, text); return True
     if action.startswith("sys_affinity:"):
         _on_affinity_input(chat_id, action, text); return True
-    if action == "sys_cch_static":
-        _on_cch_static_input(chat_id, text); return True
     if action == "sys_bl_add_default":
         _on_bl_add_default_input(chat_id, text); return True
     if action == "sys_bl_add_ch":
         _on_bl_add_ch_input(chat_id, text); return True
-    if action == "sys_quota_interval":
-        _on_quota_interval_input(chat_id, text); return True
-    if action == "sys_quota_threshold":
-        _on_quota_threshold_input(chat_id, text); return True
     if action == "sys_net_dns":
         _on_dns_input(chat_id, text); return True
     if action == "sys_net_socks5":

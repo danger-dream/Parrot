@@ -70,6 +70,12 @@ def _setup(m):
     def _reset(c):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
+        c["oauthUsageDisplayMode"] = "used"
+        c["cchMode"] = "disabled"
+        c.setdefault("quotaMonitor", {})["enabled"] = False
+        c.setdefault("quotaMonitor", {})["intervalSeconds"] = 60
+        c.setdefault("quotaMonitor", {})["disableThresholdPercent"] = 95
+        c.setdefault("quotaMonitor", {})["resumeThresholdPercent"] = 95
     m["config"].update(_reset)
     # 清 quota 缓存 / 模型冷却
     for row in m["state_db"].quota_load_all():
@@ -174,17 +180,19 @@ def test_list_empty_and_populated(m):
     kb = last["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in kb for b in row if "callback_data" in b]
     assert "oa:add" in flat
+    assert "oa:invalid:list" in flat
     assert "oa:refresh_all:1" in flat
+    assert "oa:settings" in flat
     assert "menu:main" in flat
-    assert "oa:page:1" in flat
-    assert "oa:page:1:available" in flat
-    assert "oa:page:1:quota" in flat
-    assert "oa:page:1:invalid" in flat
+    assert "oa:page:1" not in flat
+    assert "oa:page:1:available" not in flat
+    assert "oa:page:1:quota" not in flat
+    assert "oa:page:1:invalid" not in flat
     texts = [b["text"] for row in kb for b in row if "text" in b]
-    assert "全部√" in texts
-    assert "可用" in texts
-    assert "限额" in texts
-    assert "失效" in texts
+    assert "➕ 新增账户" in texts
+    assert "🧨 移除失效" in texts
+    assert "🔄 刷新用量" in texts
+    assert "⚙️ 账户设置" in texts
 
     # 添加两个账户后再渲染
     _add_fake_account(m, "user1@x.com")
@@ -200,7 +208,7 @@ def test_list_empty_and_populated(m):
     assert "缓存 50 (31.2%)" in last["text"]
     assert "⏳ Token" not in last["text"]
     flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
-    assert "oa:sort:1:all" in flat
+    assert "oa:sort:1:all" not in flat
     # 每个账户一个按钮
     email_btns = [
         b for row in last["reply_markup"]["inline_keyboard"]
@@ -280,8 +288,8 @@ def test_view_detail_with_quota_cache(m):
     m["oauth_menu"].on_view(42, 100, "cb", short)
     last = rec.last("editMessageText")
     assert last and "alice@x.com" in last["text"]
-    assert "5h: 12%" in last["text"]
-    assert "7d: 45%" in last["text"]
+    assert "5h: 已用 12%" in last["text"]
+    assert "7d: 已用 45%" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
     assert "↑ 160 · ↓ 20" in last["text"]
     # 详情按钮
@@ -309,18 +317,120 @@ def test_missing_reset_shows_upstream_not_returned(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📊 5h: <b>0%</b> · 重置 <code>?</code>" in list_text
-    assert "📊 7d: <b>45%</b> · 重置 <code>?</code>" in list_text
+    assert "📊 5h: 已用 <b>0%</b> · 重置 <code>?</code>" in list_text
+    assert "📊 7d: 已用 <b>45%</b> · 重置 <code>?</code>" in list_text
 
     rec.clear()
     short = m["ui"].register_code("missing-reset@x.com")
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert "⏱ 5h: 0% (重置: 上游未返回)" in detail_text
-    assert "📅 7d: 45% (重置: 上游未返回)" in detail_text
-    assert "🤖 Sonnet 7d: 0% (重置: 上游未返回)" in detail_text
-    assert "🧠 Opus 7d: 0% (重置: 上游未返回)" in detail_text
+    assert "⏱ 5h: 已用 0% (重置: 上游未返回)" in detail_text
+    assert "📅 7d: 已用 45% (重置: 上游未返回)" in detail_text
+    assert "🤖 Sonnet 7d: 已用 0% (重置: 上游未返回)" in detail_text
+    assert "🧠 Opus 7d: 已用 0% (重置: 上游未返回)" in detail_text
     print("  [PASS] missing reset renders current list fallback + 上游未返回 in detail")
+
+
+def test_settings_usage_display_mode_toggle(m):
+    _setup(m)
+    _add_fake_account(m, "mode@x.com")
+    m["state_db"].quota_save("mode@x.com", {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 20.0, "five_hour_reset": None,
+        "seven_day_util": 60.0, "seven_day_reset": None,
+        "raw_data": "{}",
+    })
+    rec = _install_recorder(m)
+
+    m["oauth_menu"].on_settings(42, 100, "cb-settings")
+    settings = rec.last("editMessageText")
+    assert settings and "OAuth 账户设置" in settings["text"]
+    assert "Anthropic 可用模型" in settings["text"]
+    assert "OpenAI 可用模型" in settings["text"]
+    assert "📊 <b>用量显示模式</b>" in settings["text"]
+    assert "当前模式: 已使用量" in settings["text"]
+    assert "CCH 模式（Claude Code 伪装）" in settings["text"]
+    assert "当前模式: 🚫 已关闭" in settings["text"]
+    assert "OAuth 配额监控" in settings["text"]
+    assert "状态: 🚫 已停用" in settings["text"]
+    texts = [b["text"] for row in settings["reply_markup"]["inline_keyboard"] for b in row]
+    assert "✏ 修改Anthropic模型" in texts
+    assert "✏ 修改OpenAI模型" in texts
+    assert "🖼 图片生成设置" in texts
+    assert "📈 配额监控" in texts
+    assert "🎭 CCH模式：开启" in texts
+    assert "📊 显示: 剩余用量" in texts
+
+    rec.clear()
+    assert m["oauth_menu"].handle_callback(42, 100, "cb-toggle", "oa:usage_mode:toggle") is True
+    assert m["config"].get()["oauthUsageDisplayMode"] == "remaining"
+    toggled = rec.last("editMessageText")
+    assert toggled and "当前模式: 剩余用量" in toggled["text"]
+    texts = [b["text"] for row in toggled["reply_markup"]["inline_keyboard"] for b in row]
+    assert "📊 显示: 已使用量" in texts
+
+    rec.clear()
+    m["oauth_menu"].show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "📊 5h: 剩余 <b>80%</b>" in list_text
+    assert "📊 7d: 剩余 <b>40%</b>" in list_text
+
+    rec.clear()
+    short = m["ui"].register_code("mode@x.com")
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "⏱ 5h: 剩余 80%" in detail_text
+    assert "📅 7d: 剩余 40%" in detail_text
+    print("  [PASS] OAuth settings toggles usage display mode and persists config")
+
+
+def test_settings_cch_and_quota_monitor_controls(m):
+    _setup(m)
+    rec = _install_recorder(m)
+    om = m["oauth_menu"]
+
+    assert om.handle_callback(42, 100, "cb-cch", "oa:cch_toggle") is True
+    assert m["config"].get()["cchMode"] == "dynamic"
+    text = rec.last("editMessageText")["text"]
+    assert "当前模式: ✅ 已启用" in text
+    texts = [b["text"] for row in rec.last("editMessageText")["reply_markup"]["inline_keyboard"] for b in row]
+    assert "🎭 CCH模式：关闭" in texts
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-quota", "oa:quota") is True
+    quota = rec.last("editMessageText")
+    assert quota and "OAuth 配额监控" in quota["text"]
+    flat = [b["callback_data"] for row in quota["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "oa:quota_toggle" in flat
+    assert "oa:edit:quota_interval" in flat
+    assert "oa:edit:quota_threshold" in flat
+    assert "oa:settings" in flat and "menu:main" in flat
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-quota-toggle", "oa:quota_toggle") is True
+    assert m["config"].get()["quotaMonitor"]["enabled"] is True
+    assert "状态: <b>✅ 已启用</b>" in rec.last("editMessageText")["text"]
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-edit-int", "oa:edit:quota_interval") is True
+    assert m["states"].get_state(42)["action"] == "oa_quota_interval"
+    om.handle_text_state(42, "oa_quota_interval", "600")
+    assert m["states"].get_state(42) is None
+    assert m["config"].get()["quotaMonitor"]["intervalSeconds"] == 600
+    result = rec.last("sendMessage")
+    assert result and "600s" in result["text"]
+    btns = [b["callback_data"] for row in result["reply_markup"]["inline_keyboard"] for b in row]
+    assert btns == ["menu:main", "oa:settings"]
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-edit-th", "oa:edit:quota_threshold") is True
+    assert m["states"].get_state(42)["action"] == "oa_quota_threshold"
+    om.handle_text_state(42, "oa_quota_threshold", "98")
+    assert m["states"].get_state(42) is None
+    qm = m["config"].get()["quotaMonitor"]
+    assert qm["disableThresholdPercent"] == 98.0
+    assert qm["resumeThresholdPercent"] == 98.0
+    print("  [PASS] OAuth settings CCH toggle + quota monitor submenu")
 
 
 def test_refresh_token_updates_access_and_usage(m):
@@ -760,6 +870,7 @@ def test_oauth_filter_preserved_through_detail(m):
     _setup(m)
     _add_fake_account(m, "ok1@x.com")
     _add_fake_account(m, "ok2@x.com")
+    _add_fake_account(m, "ok3@x.com")
     _add_fake_account(m, "quota@x.com", enabled=False, disabled_reason="quota")
     _add_fake_account(m, "bad@x.com", enabled=False, disabled_reason="auth_error")
     rec = _install_recorder(m)
@@ -912,6 +1023,8 @@ def main():
         test_list_empty_and_populated,
         test_oauth_sort_reorders_accounts,
         test_view_detail_with_quota_cache,
+        test_settings_usage_display_mode_toggle,
+        test_settings_cch_and_quota_monitor_controls,
         test_refresh_token_updates_access_and_usage,
         test_refresh_usage_only,
         test_toggle_disable_then_enable,

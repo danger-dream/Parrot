@@ -272,6 +272,44 @@ _USAGE_DETAIL_INDENT_LIST = "\u00a0" * 7
 # 详情页主行是 "⏱ 5h"（无前导空格、emoji 不同），单独校准。
 _USAGE_DETAIL_INDENT_BLOCK = "\u00a0" * 7
 
+_USAGE_DISPLAY_USED = "used"
+_USAGE_DISPLAY_REMAINING = "remaining"
+
+
+def _usage_display_mode() -> str:
+    """OAuth 用量展示口径。配置只影响 UI 展示，不改变 quota cache 存储。"""
+    mode = str(config.get().get("oauthUsageDisplayMode") or _USAGE_DISPLAY_USED).strip().lower()
+    return _USAGE_DISPLAY_REMAINING if mode == _USAGE_DISPLAY_REMAINING else _USAGE_DISPLAY_USED
+
+
+def _usage_display_label(mode: str | None = None) -> str:
+    mode = _usage_display_mode() if mode is None else mode
+    return "剩余用量" if mode == _USAGE_DISPLAY_REMAINING else "已使用量"
+
+
+def _usage_display_percent(util) -> float:
+    """把 state_db 中的 used% 转成当前 UI 模式下应展示的百分比。"""
+    try:
+        used = float(util)
+    except (TypeError, ValueError):
+        return 0.0
+    used = max(0.0, min(100.0, used))
+    if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+        return max(0.0, 100.0 - used)
+    return used
+
+
+def _format_usage_value_html(util, *, decimals: int = 0) -> str:
+    pct = _usage_display_percent(util)
+    label = "剩余" if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else "已用"
+    return f"{label} <b>{pct:.{decimals}f}%</b>"
+
+
+def _format_usage_value_text(util, *, decimals: int = 0) -> str:
+    pct = _usage_display_percent(util)
+    label = "剩余" if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else "已用"
+    return f"{label} {pct:.{decimals}f}%"
+
 
 def _quota_window_since_ts(reset_iso: str | None, window_seconds: int, *, now_ts: float | None = None) -> float:
     """Return current quota window start timestamp for local usage details.
@@ -376,14 +414,14 @@ def _format_account_block(acc: dict) -> str:
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
-            lines.append(f"📊 5h: <b>{fh_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 5h: {_format_usage_value_html(fh_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
             since_ts = _quota_window_since_ts(reset, 5 * 3600, now_ts=_now_ts)
             _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
             if _d:
                 lines.append(_d)
         if sd_util is not None:
             reset = row.get("seven_day_reset")
-            lines.append(f"📊 7d: <b>{sd_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 7d: {_format_usage_value_html(sd_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
             since_ts = _quota_window_since_ts(reset, 7 * 86400, now_ts=_now_ts)
             _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
             if _d:
@@ -391,7 +429,7 @@ def _format_account_block(acc: dict) -> str:
         td_util = row.get("thirty_day_util")
         if td_util is not None:
             reset = row.get("thirty_day_reset")
-            lines.append(f"📊 30d: <b>{td_util:.0f}%</b> · 重置 <code>{_fmt_time_full(reset)}</code>")
+            lines.append(f"📊 30d: {_format_usage_value_html(td_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
         if fh_util is None and sd_util is None and td_util is None:
             lines.append("📊 用量: <i>尚未获取</i>")
     else:
@@ -441,7 +479,7 @@ def _format_usage_block(account_key: str) -> str:
     def _line(label: str, util, reset) -> Optional[str]:
         if util is None:
             return None
-        return f"{label}: {util:.0f}% (重置: {_format_reset_text(reset)})"
+        return f"{label}: {_format_usage_value_text(util)} (重置: {_format_reset_text(reset)})"
 
     out = []
     _now_ts = time.time()
@@ -477,15 +515,19 @@ def _format_usage_block(account_key: str) -> str:
         out.append("")
         out.append("Codex 原始窗口:")
         if codex_primary_pct is not None and codex_primary_win:
-            out.append(f"  primary ({codex_primary_win}min): {codex_primary_pct:.0f}%")
+            out.append(f"  primary ({codex_primary_win}min): {_format_usage_value_text(codex_primary_pct)}")
         if codex_secondary_pct is not None and codex_secondary_win:
-            out.append(f"  secondary ({codex_secondary_win}min): {codex_secondary_pct:.0f}%")
+            out.append(f"  secondary ({codex_secondary_win}min): {_format_usage_value_text(codex_secondary_pct)}")
 
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
     ex_util = row.get("extra_util")
     if ex_limit and ex_limit > 0:
-        out.append(f"💰 额外: ${ex_used or 0:.2f} / ${ex_limit:.2f} ({ex_util or 0:.1f}%)")
+        if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+            remaining = max(0.0, float(ex_limit) - float(ex_used or 0))
+            out.append(f"💰 额外: 剩余 ${remaining:.2f} / ${ex_limit:.2f} ({_usage_display_percent(ex_util):.1f}%)")
+        else:
+            out.append(f"💰 额外: 已用 ${ex_used or 0:.2f} / ${ex_limit:.2f} ({_usage_display_percent(ex_util):.1f}%)")
 
     fetched = row.get("fetched_at")
     if fetched:
@@ -508,6 +550,222 @@ _FILTER_LABELS = {
     _FILTER_QUOTA: "限额",
     _FILTER_INVALID: "失效",
 }
+
+
+def _default_models_for_settings(family: str) -> list[str]:
+    cfg = config.get()
+    if family == "openai":
+        raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
+    else:
+        raw = cfg.get("oauthDefaultModels") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(x) for x in raw if str(x).strip()]
+
+
+def _quota_monitor_values() -> tuple[bool, int, float]:
+    qm = config.get().get("quotaMonitor") or {}
+    enabled = bool(qm.get("enabled", False))
+    interval = int(qm.get("intervalSeconds", 60) or 60)
+    threshold = float(qm.get("disableThresholdPercent", 95) or 95)
+    return enabled, interval, threshold
+
+
+def _cch_enabled() -> bool:
+    # 新 UI 只保留 disabled / dynamic；历史 static 不再作为可选模式展示。
+    return str(config.get().get("cchMode", "disabled")) == "dynamic"
+
+
+def _cch_status_label() -> str:
+    return "✅ 已启用" if _cch_enabled() else "🚫 已关闭"
+
+
+def _usage_toggle_target_label() -> str:
+    target = _USAGE_DISPLAY_USED if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else _USAGE_DISPLAY_REMAINING
+    return _usage_display_label(target)
+
+
+def _settings_text_and_kb() -> tuple[str, dict]:
+    anthropic_models = _default_models_for_settings("anthropic")
+    openai_models = _default_models_for_settings("openai")
+    mode_label = _usage_display_label()
+    quota_enabled, quota_interval, quota_threshold = _quota_monitor_values()
+    quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
+    cch_enabled = _cch_enabled()
+    cch_action = "关闭" if cch_enabled else "开启"
+
+    def _models_line(models: list[str]) -> str:
+        if not models:
+            return "<i>(空)</i>"
+        return ui.escape_html(", ".join(models))
+
+    text = "\n".join([
+        "⚙️ <b>OAuth 账户设置</b>",
+        "",
+        f"🅰️ <b>Anthropic 可用模型</b> ({len(anthropic_models)}):",
+        _models_line(anthropic_models),
+        "",
+        f"🅾️ <b>OpenAI 可用模型</b>({len(openai_models)}):",
+        _models_line(openai_models),
+        "",
+        "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
+        f"当前模式: {_cch_status_label()}",
+        "",
+        "📊 <b>用量显示模式</b>",
+        f"当前模式: {mode_label}",
+        "",
+        "📈 <b>OAuth 配额监控</b>",
+        f"状态: {quota_status}",
+        f"检查间隔: <code>{quota_interval}s</code>",
+        f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
+    ])
+    rows = [
+        [ui.btn("✏ 修改Anthropic模型", "odm:edit:anthropic"),
+         ui.btn("✏ 修改OpenAI模型", "odm:edit:openai")],
+        [ui.btn("🖼 图片生成设置", "img:show"),
+         ui.btn("📈 配额监控", "oa:quota")],
+        [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
+         ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
+        [ui.btn("🏠 返回主菜单", "menu:main"),
+         ui.btn("◀ 返回OAuth账户", "menu:oauth")],
+    ]
+    return text, ui.inline_kb(rows)
+
+
+def on_settings(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_toggle_usage_display_mode(chat_id: int, message_id: int, cb_id: str) -> None:
+    old_mode = _usage_display_mode()
+    new_mode = _USAGE_DISPLAY_REMAINING if old_mode == _USAGE_DISPLAY_USED else _USAGE_DISPLAY_USED
+
+    def _mutate(cfg: dict) -> None:
+        cfg["oauthUsageDisplayMode"] = new_mode
+
+    config.update(_mutate)
+    ui.answer_cb(cb_id, f"已切换为{_usage_display_label(new_mode)}")
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_toggle_cch_mode(chat_id: int, message_id: int, cb_id: str) -> None:
+    new_mode = "disabled" if _cch_enabled() else "dynamic"
+    config.update(lambda c: c.__setitem__("cchMode", new_mode))
+    ui.answer_cb(cb_id, "CCH 已开启" if new_mode == "dynamic" else "CCH 已关闭")
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _quota_menu_text_and_kb() -> tuple[str, dict]:
+    enabled, interval, threshold = _quota_monitor_values()
+    status = "✅ 已启用" if enabled else "🚫 已停用"
+    toggle_label = "🚫 停用" if enabled else "✅ 启用"
+    text = "\n".join([
+        "📈 <b>OAuth 配额监控</b>",
+        "",
+        f"状态: <b>{status}</b>",
+        f"检查间隔: <code>{interval}s</code>",
+        f"禁用阈值: <code>{threshold:.0f}%</code>",
+        "",
+        "<b>说明：</b>",
+        "• 启用后，每 N 秒拉一次每个 OAuth 账号的 usage",
+        "• 任一指标（5h / 7d / Sonnet 7d / Opus 7d）≥ 阈值则自动禁用账号",
+        "• resets_at 过后 + 全部指标 &lt; 阈值 → 自动恢复",
+        "",
+        "<i>⚠ 频繁请求 /api/oauth/usage 可能被 Anthropic 风控盯上；建议保持 ≥60s 间隔。</i>",
+    ])
+    rows = [
+        [ui.btn(toggle_label, "oa:quota_toggle")],
+        [ui.btn("✏ 修改间隔（秒）", "oa:edit:quota_interval"),
+         ui.btn("✏ 修改阈值（%）", "oa:edit:quota_threshold")],
+        [ui.btn("🏠 返回主菜单", "menu:main"),
+         ui.btn("◀ 返回账户设置", "oa:settings")],
+    ]
+    return text, ui.inline_kb(rows)
+
+
+def on_quota_menu(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, kb = _quota_menu_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_quota_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+    cur = bool((config.get().get("quotaMonitor") or {}).get("enabled", False))
+    new_val = not cur
+    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("enabled", new_val))
+    ui.answer_cb(cb_id, "已启用" if new_val else "已停用")
+    text, kb = _quota_menu_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_edit_quota_interval(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_quota_interval")
+    ui.edit(
+        chat_id, message_id,
+        "请输入配额监控间隔（秒，正整数，建议 ≥ 60）：",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:quota")]]),
+    )
+
+
+def on_quota_interval_input(chat_id: int, text: str) -> None:
+    try:
+        v = int((text or "").strip())
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入：")
+        return
+    if v < 10:
+        ui.send(chat_id, "❌ 间隔不能小于 10 秒，请重新输入（建议 ≥ 60s 避免被风控）：")
+        return
+    if v > 86400:
+        ui.send(chat_id, "❌ 间隔不能超过 86400 秒（1 天），请重新输入：")
+        return
+    config.update(lambda c: c.setdefault("quotaMonitor", {}).__setitem__("intervalSeconds", v))
+    states.pop_state(chat_id)
+    ui.send(
+        chat_id, f"✅ 配额监控间隔已更新为 <code>{v}s</code>",
+        reply_markup=ui.inline_kb([[ui.btn("🏠 返回主菜单", "menu:main"), ui.btn("◀ 返回账户设置", "oa:settings")]]),
+    )
+
+
+def on_edit_quota_threshold(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, "oa_quota_threshold")
+    ui.edit(
+        chat_id, message_id,
+        "请输入禁用阈值（百分比，1-100）：\n"
+        "<i>任一指标到达阈值即禁用该账号。常见值：90 / 95 / 98 / 99</i>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:quota")]]),
+    )
+
+
+def on_quota_threshold_input(chat_id: int, text: str) -> None:
+    try:
+        v = float((text or "").strip().rstrip("%"))
+    except ValueError:
+        ui.send(chat_id, "❌ 非法数字，请重新输入（如 98）：")
+        return
+    if v < 1 or v > 100:
+        ui.send(chat_id, "❌ 阈值需在 1-100 之间，请重新输入：")
+        return
+
+    def _mutate(cfg: dict) -> None:
+        qm = cfg.setdefault("quotaMonitor", {})
+        qm["disableThresholdPercent"] = v
+        qm["resumeThresholdPercent"] = v
+
+    config.update(_mutate)
+    states.pop_state(chat_id)
+    ui.send(
+        chat_id, f"✅ 配额禁用阈值已更新为 <code>{v:.0f}%</code>",
+        reply_markup=ui.inline_kb([[ui.btn("🏠 返回主菜单", "menu:main"), ui.btn("◀ 返回账户设置", "oa:settings")]]),
+    )
 
 
 def _normalize_filter(value: str | None) -> str:
@@ -699,7 +957,13 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
     quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
     user_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "user")
     auth_err = sum(1 for a in accounts_all if a.get("disabled_reason") == "auth_error")
-    accounts = [a for a in accounts_all if _filter_account(a, filter_key)]
+    # 只有总账户数超过一页时才需要筛选；一页内全部看得见，强制回到全部视图。
+    show_filter_row = total_all > _PAGE_SIZE
+    if not show_filter_row:
+        filter_key = _FILTER_ALL
+        accounts = list(accounts_all)
+    else:
+        accounts = [a for a in accounts_all if _filter_account(a, filter_key)]
     total = len(accounts)
 
     # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
@@ -771,32 +1035,34 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
             row_btns.append(ui.btn(f"{num}. {tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
         rows.append(row_btns)
 
-    # 翻页
-    pag_row = _build_pagination_row(page, total_pages, filter_key)
-    if accounts_all:
-        pag_row.append(ui.btn("↕ 排序", f"oa:sort:{page}:{filter_key}"))
-    if pag_row:
-        rows.append(pag_row)
+    # 翻页/排序：当前列表只有一页时不显示。
+    if total_pages > 1:
+        pag_row = _build_pagination_row(page, total_pages, filter_key)
+        if accounts_all:
+            pag_row.append(ui.btn("↕ 排序", f"oa:sort:{page}:{filter_key}"))
+        if pag_row:
+            rows.append(pag_row)
 
-    # 过滤按钮
-    rows.append([
-        ui.btn(f"全部{'√' if filter_key == _FILTER_ALL else ''}", _page_callback(1, _FILTER_ALL)),
-        ui.btn(f"可用{'√' if filter_key == _FILTER_AVAILABLE else ''}", _page_callback(1, _FILTER_AVAILABLE)),
-        ui.btn(f"限额{'√' if filter_key == _FILTER_QUOTA else ''}", _page_callback(1, _FILTER_QUOTA)),
-        ui.btn(f"失效{'√' if filter_key == _FILTER_INVALID else ''}", _page_callback(1, _FILTER_INVALID)),
-    ])
+    # 过滤按钮：总账户数超过一页时才显示。
+    if show_filter_row:
+        rows.append([
+            ui.btn(f"全部{'√' if filter_key == _FILTER_ALL else ''}", _page_callback(1, _FILTER_ALL)),
+            ui.btn(f"可用{'√' if filter_key == _FILTER_AVAILABLE else ''}", _page_callback(1, _FILTER_AVAILABLE)),
+            ui.btn(f"限额{'√' if filter_key == _FILTER_QUOTA else ''}", _page_callback(1, _FILTER_QUOTA)),
+            ui.btn(f"失效{'√' if filter_key == _FILTER_INVALID else ''}", _page_callback(1, _FILTER_INVALID)),
+        ])
 
     # 操作按钮（每页都有）
+    refresh_cb = f"oa:refresh_all:{page}" if filter_key == _FILTER_ALL else f"oa:refresh_all:{page}:{filter_key}"
     rows.append([
         ui.btn("➕ 新增账户", "oa:add"),
-        ui.btn("🔄 刷新全部用量", f"oa:refresh_all:{page}" if filter_key == _FILTER_ALL else f"oa:refresh_all:{page}:{filter_key}"),
+        ui.btn("🧨 移除失效", "oa:invalid:list"),
+        ui.btn("🔄 刷新用量", refresh_cb),
     ])
-    # 只有存在 OAuth 账号的冷却条目时才显示"清除所有错误"（避免空操作按钮）
-    if cd_keys_any:
-        clear_cb = f"oa:clear_all_errors:{page}" if filter_key == _FILTER_ALL else f"oa:clear_all_errors:{page}:{filter_key}"
-        rows.append([ui.btn(f"🧹 清除所有账户错误（{len(cd_keys_any)} 个）", clear_cb)])
-    rows.append([ui.btn("🖼 图片生成", "img:show"), ui.btn("🧨 移除失效", "oa:invalid:list")])
-    rows.append([ui.btn("🧩 OAuth 默认模型", "odm:show"), ui.btn("◀ 返回主菜单", "menu:main")])
+    rows.append([
+        ui.btn("⚙️ 账户设置", "oa:settings"),
+        ui.btn("◀ 返回主菜单", "menu:main"),
+    ])
     return ui.truncate(_maybe_suffix_status_banner(text)), ui.inline_kb(rows)
 
 
@@ -2806,6 +3072,27 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "menu:oauth":
         show(chat_id, message_id, cb_id)
         return True
+    if data == "oa:settings":
+        on_settings(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:usage_mode:toggle":
+        on_toggle_usage_display_mode(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:cch_toggle":
+        on_toggle_cch_mode(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:quota":
+        on_quota_menu(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:quota_toggle":
+        on_quota_toggle(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:edit:quota_interval":
+        on_edit_quota_interval(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:edit:quota_threshold":
+        on_edit_quota_threshold(chat_id, message_id, cb_id)
+        return True
     if data == "oa:refresh_all" or data.startswith("oa:refresh_all:"):
         page, filter_key = _parse_page_filter(data[len("oa:refresh_all:"):] if data.startswith("oa:refresh_all:") else "")
         on_refresh_all(chat_id, message_id, cb_id, page=page, filter_key=filter_key)
@@ -2956,6 +3243,12 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         return True
     if action == "oa_emax":
         on_edit_max_concurrent_input(chat_id, text)
+        return True
+    if action == "oa_quota_interval":
+        on_quota_interval_input(chat_id, text)
+        return True
+    if action == "oa_quota_threshold":
+        on_quota_threshold_input(chat_id, text)
         return True
     return False
 

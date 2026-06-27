@@ -331,7 +331,7 @@ def _start_edit(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
         "映射 / 默认模型会受影响。</i>"
     )
     ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
-        [ui.btn("❌ 取消", "odm:show")],
+        [ui.btn("❌ 取消", "oa:settings")],
     ]))
 
 
@@ -402,7 +402,7 @@ def _on_edit_input(chat_id: int, action: str, text: str) -> None:
                 f"odm:commit:{pending_code}:keep")],
         [ui.btn("🧹 保存并清理全部引用",
                 f"odm:commit:{pending_code}:clean")],
-        [ui.btn("❌ 取消", "odm:show")],
+        [ui.btn("❌ 取消", "oa:settings")],
     ])
     ui.send(chat_id, text, reply_markup=kb)
 
@@ -535,8 +535,8 @@ def _send_saved_result(
     parts.append("<i>热生效 — 现有 OAuth 渠道实例已重建。</i>")
     ui.send_result(
         chat_id, "\n\n".join(parts),
-        back_label="◀ 返回 OAuth 默认",
-        back_callback="odm:show",
+        back_label="◀ 返回 OAuth 设置",
+        back_callback="oa:settings",
     )
 
 
