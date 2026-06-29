@@ -80,11 +80,11 @@ def _tool_use_input(block: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def guard_request(body: dict) -> None:
+def guard_request(body: dict, *, target_model: str | None = None) -> None:
     if not isinstance(body, dict):
         _fail("request body must be a JSON object")
     if (body.get("thinking") is not None or body.get("output_config") is not None) and not common.anthropic_thinking_is_disabled(body):
-        if not common.anthropic_reasoning_config_is_mappable(body):
+        if not common.anthropic_reasoning_config_is_mappable(body, target_model=target_model):
             _fail("Anthropic thinking/output_config cannot be mapped to OpenAI reasoning_effort", param="thinking")
     if body.get("context_management") is not None and not common.anthropic_context_management_is_ignorable(body.get("context_management")):
         _fail("Anthropic context_management is not supported on OpenAI Chat bridge yet", param="context_management")
@@ -376,7 +376,7 @@ def _disable_parallel_tool_calls(choice: Any) -> bool:
 
 
 def translate_request(body: dict, *, target_model: str | None = None) -> dict:
-    guard_request(body)
+    guard_request(body, target_model=target_model)
     payload: dict[str, Any] = {
         "messages": _convert_system(body.get("system")) + _convert_messages(body.get("messages") or []),
         "stream": bool(body.get("stream")),
@@ -391,7 +391,7 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
     for key in ("temperature", "top_p", "metadata"):
         if body.get(key) is not None:
             payload[key] = body.get(key)
-    effort = common.resolve_anthropic_reasoning_effort(body)
+    effort = common.resolve_anthropic_reasoning_effort(body, target_model=target_model)
     if effort:
         if target_model and not common.supports_reasoning_effort(target_model):
             _fail(

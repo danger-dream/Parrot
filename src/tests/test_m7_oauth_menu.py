@@ -191,7 +191,7 @@ def test_list_empty_and_populated(m):
     texts = [b["text"] for row in kb for b in row if "text" in b]
     assert "➕ 新增账户" in texts
     assert "🧨 移除失效" in texts
-    assert "🔄 刷新用量" in texts
+    assert "🔄 刷新用量/重置卡" in texts
     assert "⚙️ 账户设置" in texts
 
     # 添加两个账户后再渲染
@@ -554,7 +554,19 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
         "five_hour_reset": "2026-06-25T13:30:00Z",
         "seven_day_util": 44.0,
         "seven_day_reset": "2026-06-28T10:00:00Z",
-        "raw_data": json.dumps({"openai": {"rate_limit_reset_credits": {"available_count": 2}}}),
+        "raw_data": json.dumps({"openai": {
+            "rate_limit_reset_credits": {"available_count": 2},
+            "rate_limit_reset_credit_details": {
+                "available_count": 2,
+                "data": [{
+                    "id": "card-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z",
+                    "expires_at": "2026-07-17T00:00:00Z",
+                }],
+            },
+        }}),
     }, email="show-reset@x.com")
 
     rec = _install_recorder(m)
@@ -567,6 +579,10 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail = rec.last("editMessageText")
     assert detail and "♻️ 官方重置次数: <code>2 次</code>" in detail["text"]
+    assert "♻️ 官方重置卡" in detail["text"]
+    assert "Codex 额度重置" in detail["text"]
+    assert "发放:" in detail["text"] and "过期:" in detail["text"]
+    assert "Codex 原始窗口" not in detail["text"]
     detail_rows = detail["reply_markup"]["inline_keyboard"]
     action_row = next(row for row in detail_rows if any(b.get("callback_data", "").startswith("oa:reset_quota_ask:") for b in row))
     assert [b["text"] for b in action_row] == ["⚡ 并发上限", "♻️ 重置次数"]
@@ -625,7 +641,77 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     m["oauth_menu"].on_view(42, 100, "cb", short0)
     detail0 = rec.last("editMessageText")
     assert detail0 and "♻️ 官方重置次数: <code>0 次</code>" in detail0["text"]
+    assert "♻️ 官方重置卡" not in detail0["text"]
     print("  [PASS] openai reset credits shown in list/detail; list hides 0")
+
+
+def test_quota_disabled_openai_missing_cache_sync_fetches_usage_and_reset_cards(m):
+    _setup(m)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _add_openai_fake_account(m, "missing-cache@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
+    ak = _account_key_for(m, "missing-cache@x.com")
+    assert m["state_db"].quota_load(ak) is None
+
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+
+    row = None
+    for _ in range(20):
+        row = m["state_db"].quota_load(ak)
+        if row is not None:
+            break
+        import time as _time
+        _time.sleep(0.05)
+    assert row is not None
+    assert row.get("five_hour_util") is not None
+    raw = json.loads(row.get("raw_data") or "{}")
+    openai = raw.get("openai") or {}
+    assert (openai.get("rate_limit_reset_credits") or {}).get("available_count") == 2
+    assert (openai.get("rate_limit_reset_credit_details") or {}).get("data")
+    text = rec.last("editMessageText")["text"]
+    assert "missing-cache@x.com" in text
+    assert "尚未获取" not in text
+    assert "官方重置次数" in text
+    print("  [PASS] quota-disabled OpenAI missing cache gets initial usage/reset-card sync")
+
+
+def test_openai_reset_credit_cards_block_uses_post_consume_count_override(m):
+    _setup(m)
+    block = m["oauth_menu"]._format_reset_credit_cards_block(
+        {
+            "available_count": 2,
+            "data": [
+                {
+                    "id": "old-card-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z",
+                    "expires_at": "2026-07-17T00:00:00Z",
+                },
+                {
+                    "id": "old-card-2",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-18T00:00:00Z",
+                    "expires_at": "2026-07-18T00:00:00Z",
+                },
+            ],
+        },
+        cached_count=1,
+        available_count_override=1,
+    )
+    assert "当前可用 <code>1 次</code>" in block
+    assert "仍在同步" in block
+    assert "old-card" not in block
+    assert "发放:" not in block
+
+    hidden = m["oauth_menu"]._format_reset_credit_cards_block(
+        {"available_count": 1, "data": [{"status": "available"}]},
+        cached_count=0,
+        available_count_override=0,
+    )
+    assert hidden == ""
+    print("  [PASS] reset-card post-consume count override avoids stale card list")
 
 
 def test_openai_official_reset_credit_ask_and_confirm(m):
@@ -633,6 +719,25 @@ def test_openai_official_reset_credit_ask_and_confirm(m):
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _add_openai_fake_account(m, "quota-openai@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
     ak = _account_key_for(m, "quota-openai@x.com")
+    m["state_db"].quota_save(ak, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 99.0,
+        "five_hour_reset": future,
+        "seven_day_util": 20.0,
+        "raw_data": json.dumps({"openai": {
+            "rate_limit_reset_credits": {"available_count": 2},
+            "rate_limit_reset_credit_details": {
+                "available_count": 2,
+                "data": [{
+                    "id": "card-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2026-06-17T00:00:00Z",
+                    "expires_at": "2026-07-17T00:00:00Z",
+                }],
+            },
+        }}),
+    }, email="quota-openai@x.com")
     m["cooldown"].record_error(
         f"oauth:{ak}", "gpt-5-codex", "quota",
         cooldown_until=m["state_db"].now_ms() + 600_000,
@@ -736,7 +841,7 @@ def test_refresh_all_usage(m):
     final = sent[-1] if sent else ""
     assert "u1@x.com" in final and "u2@x.com" in final, final[:500]
     assert final.count("✅ 刷新成功") >= 2, final[:500]
-    assert "用量刷新完成" in final, final[:500]
+    assert "用量刷新完成 / 重置卡刷新完成" in final, final[:500]
     print("  [PASS] refresh_all 两个账户都写入了 quota 缓存")
 
 
@@ -1031,6 +1136,7 @@ def main():
         test_reset_quota_button_and_callback,
         test_quota_window_since_uses_reset_minus_window_with_fallback,
         test_openai_reset_credit_count_display_in_list_and_detail,
+        test_openai_reset_credit_cards_block_uses_post_consume_count_override,
         test_openai_official_reset_credit_ask_and_confirm,
         test_delete_flow,
         test_refresh_all_usage,

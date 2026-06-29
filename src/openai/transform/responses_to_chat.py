@@ -442,12 +442,8 @@ def _input_items_to_messages(items: list) -> list:
                         txt = c.get("text")
                         if isinstance(txt, str) and txt:
                             pending_reasoning.append(txt)
-                # Fallback: Codex CLI strips summary but preserves encrypted_content
-                # across turns. Use it when summary/content produced nothing.
-                if not pending_reasoning:
-                    ec = item.get("encrypted_content")
-                    if isinstance(ec, str) and ec:
-                        pending_reasoning.append(ec)
+                # reasoning.encrypted_content 是 Responses 原生/OAuth 续链字段，
+                # Chat 上游不识别；这里不把它伪装成 reasoning_content。
 
         elif t in (
             "web_search_call", "file_search_call", "computer_call",
@@ -603,7 +599,8 @@ def translate_response(chat: dict, *, model: str,
 
     output_items: list[dict] = []
 
-    # reasoning_content（非官方字段）→ reasoning item；
+    # reasoning_content（非官方字段）→ reasoning item summary；
+    # 不生成 reasoning.encrypted_content：Chat 上游无法提供真正可 replay 的 EC。
     # drop 模式丢弃文本（usage.reasoning_tokens 仍透传）
     reasoning_text = msg.get("reasoning_content")
     if isinstance(reasoning_text, str) and reasoning_text:
@@ -612,7 +609,6 @@ def translate_response(chat: dict, *, model: str,
             output_items.append({
                 "type": "reasoning",
                 "id": _gen_id("rs_"),
-                "encrypted_content": reasoning_text,
                 "summary": [{"type": "summary_text", "text": reasoning_text}],
             })
 

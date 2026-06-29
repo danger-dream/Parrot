@@ -238,7 +238,10 @@ def test_c2r_stream_passthrough(m):
     events = _parse_responses_events(frames)
     names = [n for n, _ in events]
     assert "response.reasoning_summary_text.delta" in names
-    print("  [PASS] c2r 流式 passthrough: 生成 reasoning_summary_text.delta")
+    reasoning_done = [d for n, d in events if n == "response.output_item.done" and d.get("item", {}).get("type") == "reasoning"]
+    assert reasoning_done
+    assert "encrypted_content" not in reasoning_done[0]["item"]
+    print("  [PASS] c2r 流式 passthrough: 生成 reasoning_summary_text.delta，不伪造 encrypted_content")
 
 
 def test_c2r_stream_drop(m):

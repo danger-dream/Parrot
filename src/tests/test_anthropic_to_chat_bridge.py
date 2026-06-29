@@ -169,6 +169,9 @@ def test_protocol_bridge_default_reasoning_and_service_tier_baseline():
     assert anthropic_to_chat.translate_request({
         "messages": [], "output_config": {"effort": "max"},
     }, target_model="gpt-5")["reasoning_effort"] == "xhigh"
+    assert anthropic_to_chat.translate_request({
+        "messages": [], "output_config": {"effort": "max"},
+    }, target_model="glm-5.2")["reasoning_effort"] == "max"
 
     assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "auto"})["service_tier"] == "auto"
     assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "standard_only"})["service_tier"] == "default"
@@ -275,6 +278,13 @@ def test_translate_request_guards_unmappable_reasoning_controls():
             "messages": [],
             "thinking": {"type": "enabled"},
         }, target_model="gpt-4o")
+
+    glm = anthropic_to_chat.translate_request({
+        "messages": [],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+    }, target_model="glm-5.2")
+    assert glm["reasoning_effort"] == "max"
 
 
 def test_translate_request_allows_stream_but_guards_stateful_thinking_and_non_user_images():
@@ -579,6 +589,57 @@ def test_deepseek_explicit_thinking_rejects_forced_tool_choice():
         asyncio.run(ch.build_upstream_request(body, "deepseek-v4-flash", ingress_protocol="anthropic"))
     assert "DeepSeek thinking mode does not support" in exc_info.value.message
 
+
+def test_bigmodel_anthropic_bridge_maps_thinking_and_reasoning_effort():
+    ch = OpenAIApiChannel({
+        "name": "智谱 Coding",
+        "baseUrl": "https://open.bigmodel.cn",
+        "apiPath": "/api/coding/paas/v4/chat/completions",
+        "apiKey": "sk-test",
+        "protocol": "openai-chat",
+        "models": [{"alias": "glm-5.2", "real": "glm-5.2"}],
+    })
+    body = {
+        "messages": [{"role": "user", "content": "think"}],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+    }
+
+    req = asyncio.run(ch.build_upstream_request(body, "glm-5.2", ingress_protocol="anthropic"))
+    payload = json.loads(req.body)
+
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
+
+    disabled_req = asyncio.run(ch.build_upstream_request({
+        "messages": [{"role": "user", "content": "quick"}],
+        "thinking": {"type": "disabled"},
+    }, "glm-5.2", ingress_protocol="anthropic"))
+    disabled_payload = json.loads(disabled_req.body)
+
+    assert disabled_payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in disabled_payload
+
+
+def test_bigmodel_chat_passthrough_preserves_thinking():
+    ch = OpenAIApiChannel({
+        "name": "智谱 Coding",
+        "baseUrl": "https://open.bigmodel.cn",
+        "apiPath": "/api/coding/paas/v4/chat/completions",
+        "apiKey": "sk-test",
+        "protocol": "openai-chat",
+        "models": [{"alias": "glm-5.2", "real": "glm-5.2"}],
+    })
+
+    req = asyncio.run(ch.build_upstream_request({
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }, "glm-5.2", ingress_protocol="chat"))
+    payload = json.loads(req.body)
+
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
 
 def test_openai_api_channel_filters_translated_anthropic_to_chat_payload(monkeypatch):
     ch = OpenAIApiChannel({

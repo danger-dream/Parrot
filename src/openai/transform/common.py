@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from ... import config
@@ -20,9 +21,13 @@ from ...providers.capabilities import (
 # ─── Cross-family capability helpers ─────────────────────────────
 
 _OPENAI_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh"})
+_BIGMODEL_REASONING_EFFORTS: frozenset[str] = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max",
+})
 _OPENAI_SERVICE_TIERS: frozenset[str] = frozenset({"auto", "default", "flex", "priority"})
 _ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
 _PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
+_GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
 
 
 def _protocol_bridge_cfg() -> dict[str, Any]:
@@ -43,6 +48,52 @@ def _reasoning_cfg() -> dict[str, Any]:
 def _valid_effort(value: Any, default: str) -> str:
     effort = str(value or "").strip().lower()
     return effort if effort in _OPENAI_REASONING_EFFORTS else default
+
+
+def _valid_bigmodel_effort(value: Any, default: str) -> str:
+    effort = str(value or "").strip().lower()
+    return effort if effort in _BIGMODEL_REASONING_EFFORTS else default
+
+
+def _glm_version(model: str | None) -> tuple[int, int | None] | None:
+    name = str(model or "").strip().lower()
+    m = _GLM_VERSION_RE.match(name)
+    if not m:
+        return None
+    major = int(m.group(1))
+    minor = int(m.group(2)) if m.group(2) is not None else None
+    return major, minor
+
+
+def supports_bigmodel_thinking(model: str | None) -> bool:
+    """Return whether a GLM model supports BigModel chat `thinking`.
+
+    BigModel documents thinking support for GLM-5 family and GLM-4.5/4.6/4.7
+    families. Keep this model-name based so generic OpenAI-compatible channels
+    do not receive BigModel-only fields by accident.
+    """
+    ver = _glm_version(model)
+    if ver is None:
+        return False
+    major, minor = ver
+    if major >= 5:
+        return True
+    return major == 4 and minor is not None and minor >= 5
+
+
+def supports_bigmodel_reasoning_effort(model: str | None) -> bool:
+    """Return whether BigModel accepts top-level `reasoning_effort`.
+
+    Per BigModel docs, `reasoning_effort` is supported by GLM-5.2 and newer.
+    Older GLM thinking models still accept `thinking`, but not this knob.
+    """
+    ver = _glm_version(model)
+    if ver is None:
+        return False
+    major, minor = ver
+    if major > 5:
+        return True
+    return major == 5 and minor is not None and minor >= 2
 
 
 def disable_parallel_tool_calls_for_local_web() -> bool:
@@ -97,6 +148,8 @@ def supports_reasoning_effort(model: str | None) -> bool:
     name = str(model or "").strip().lower()
     if not name:
         return False
+    if supports_bigmodel_reasoning_effort(name):
+        return True
     if name.startswith("deepseek-v4"):
         return True
     if name.startswith("o") and len(name) > 1 and name[1].isdigit():
@@ -107,23 +160,29 @@ def supports_reasoning_effort(model: str | None) -> bool:
     return bool(rest and rest[0].isdigit() and rest[0] >= "5")
 
 
-def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | None:
+def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None, *, target_model: str | None = None) -> str | None:
     """Map Anthropic thinking/output_config effort to OpenAI reasoning effort.
 
-    Priority and thresholds intentionally follow cc-switch:
+    Priority and thresholds intentionally follow cc-switch for OpenAI targets:
     - output_config.effort: low/medium/high pass through, max -> xhigh
     - thinking.type=adaptive -> xhigh
     - thinking.type=enabled uses budget_tokens: <4000 low, <16000 medium,
       otherwise high; no budget defaults to high.
     - disabled/unknown/absent does not produce an effort.
+
+    BigModel GLM-5.2+ accepts a wider effort vocabulary, including `max`, so
+    preserve `max` instead of downgrading it to OpenAI's `xhigh` alias.
     """
     if not isinstance(body, dict):
         return None
     cfg = _reasoning_cfg()
+    bigmodel_effort = supports_bigmodel_reasoning_effort(target_model)
     output_config = body.get("output_config")
     if isinstance(output_config, dict):
         raw_effort = output_config.get("effort")
         effort = str(raw_effort).strip().lower() if isinstance(raw_effort, str) else ""
+        if bigmodel_effort and effort in _BIGMODEL_REASONING_EFFORTS:
+            return effort
         if effort == "max":
             return _valid_effort(cfg.get("maxEffort"), "xhigh")
         if effort in _OPENAI_REASONING_EFFORTS:
@@ -134,6 +193,8 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | Non
         return None
     typ = str(thinking.get("type") or "").strip().lower()
     if typ == "adaptive":
+        if bigmodel_effort:
+            return _valid_bigmodel_effort(cfg.get("adaptiveEffort"), "max")
         return _valid_effort(cfg.get("adaptiveEffort"), "xhigh")
     if typ != "enabled":
         return None
@@ -166,7 +227,7 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None) -> str | Non
     return "high"
 
 
-def anthropic_reasoning_config_is_mappable(body: dict[str, Any] | None) -> bool:
+def anthropic_reasoning_config_is_mappable(body: dict[str, Any] | None, *, target_model: str | None = None) -> bool:
     """Whether top-level Anthropic reasoning controls can be represented.
 
     Historical message `thinking` / `redacted_thinking` blocks are handled by
@@ -176,7 +237,7 @@ def anthropic_reasoning_config_is_mappable(body: dict[str, Any] | None) -> bool:
     if not isinstance(body, dict):
         return False
     has_reasoning_control = body.get("thinking") is not None or body.get("output_config") is not None
-    return bool(has_reasoning_control and resolve_anthropic_reasoning_effort(body))
+    return bool(has_reasoning_control and resolve_anthropic_reasoning_effort(body, target_model=target_model))
 
 
 def anthropic_thinking_is_disabled(body: dict[str, Any] | None) -> bool:

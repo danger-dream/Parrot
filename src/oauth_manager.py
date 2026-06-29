@@ -755,7 +755,7 @@ async def fetch_usage(account_key: str) -> dict:
       - OpenAI (Codex)    : 调 ChatGPT backend-api/wham/usage（零 Codex 请求成本）
 
     返回：与 Anthropic 原生 `/oauth/usage` JSON 结构兼容的 dict（顶层含
-    five_hour / seven_day / ...），让 extract_utils_percent / flatten_usage
+    five_hour / seven_day / ...），让 extract_utils_percent / latest_reset_iso / flatten_usage
     能无差别消费。
     """
     account_key = _resolve_existing_account_key_or_raise(account_key)
@@ -774,6 +774,56 @@ async def fetch_usage(account_key: str) -> dict:
     acc = get_account(account_key) or {}
     account_id = _openai_workspace_id(acc) or None
     return await openai_provider.fetch_wham_usage(access_token, account_id=account_id)
+
+
+async def fetch_openai_rate_limit_reset_credits(account_key: str) -> dict:
+    """Fetch OpenAI/Codex reset-credit card details for one OAuth account."""
+    account_key = _resolve_existing_account_key_or_raise(account_key)
+    if provider_of(account_key) != "openai":
+        raise ValueError("rate limit reset credits are only available for OpenAI OAuth accounts")
+    acc = get_account(account_key) or {}
+    access_token = await ensure_valid_token(account_key)
+    account_id = _openai_workspace_id(acc) or None
+    return await openai_provider.fetch_rate_limit_reset_credits(
+        access_token, account_id=account_id,
+    )
+
+
+def attach_openai_reset_credit_details_to_usage(
+    usage: dict,
+    details: dict | None,
+    *,
+    sync_available_count: bool = True,
+) -> dict:
+    """Store OpenAI reset-card details beside the usage summary in raw_data.
+
+    Parrot's quota cache has a single raw_data JSON blob. Keep the WHAM usage
+    summary and reset-card detail list in that same blob so UI rendering can be
+    cache-only and never has to call the slow detail endpoint synchronously.
+    """
+    if not isinstance(usage, dict):
+        usage = {}
+    if not isinstance(details, dict):
+        return usage
+
+    out = dict(usage)
+    openai = dict(out.get("openai") or {})
+    stored_details = dict(details)
+    stored_details.setdefault("fetched_at", _format_utc(datetime.now(timezone.utc)))
+    openai["rate_limit_reset_credit_details"] = stored_details
+
+    if sync_available_count:
+        try:
+            count = int(stored_details.get("available_count"))
+        except (TypeError, ValueError):
+            count = None
+        if count is not None:
+            summary = dict(openai.get("rate_limit_reset_credits") or {})
+            summary["available_count"] = count
+            openai["rate_limit_reset_credits"] = summary
+
+    out["openai"] = openai
+    return out
 
 
 def _synthesize_openai_usage_from_row(row: dict) -> dict:

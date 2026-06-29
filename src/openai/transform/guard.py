@@ -221,6 +221,24 @@ def _responses_input_file_unsupported_for_chat(part: dict[str, Any]) -> str | No
     return None
 
 
+def _responses_input_like_items(body: dict[str, Any]) -> list[Any]:
+    items: list[Any] = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, list):
+        items.extend(instructions)
+    inp = body.get("input")
+    if isinstance(inp, list):
+        items.extend(inp)
+    return items
+
+
+def _responses_has_encrypted_reasoning_input(body: dict[str, Any]) -> bool:
+    for item in _responses_input_like_items(body):
+        if isinstance(item, dict) and item.get("type") == "reasoning" and item.get("encrypted_content"):
+            return True
+    return False
+
+
 def _responses_item_reference_unresolved_for_current_body(body: dict[str, Any]) -> bool:
     inp = body.get("input")
     if not isinstance(inp, list):
@@ -252,9 +270,10 @@ def guard_responses_to_chat(body: dict,
     - `input` 含 built-in call item（web_search_call 等）→ 400
     - `previous_response_id`：MS-3 不接 Store，一律拒绝；
       Store 接入后（MS-5 起）仅在 Store 关闭时拒绝
-    - `include` 包含 "reasoning.encrypted_content"：chat 上游没有 encrypted
-      reasoning replay 概念；必须拒绝，不能静默剥离，否则客户端会以为
-      下一轮仍可拿 encrypted_content 续接推理链。
+    - `input` / `instructions` 携带 `reasoning.encrypted_content`：chat
+      上游没有 encrypted reasoning replay 概念，translator 会直接丢弃该字段。
+    - `include` 包含 "reasoning.encrypted_content" 时，它只是响应投影 hint；
+      translator 不会转发给 chat payload，可安全忽略。
     - `conversation` / `background:true`：native Responses only; Chat upstream
       cannot preserve async response state.
     - `prompt` / `truncation` / `max_tool_calls` / 其他 include 是 Responses
@@ -354,12 +373,6 @@ def guard_responses_to_chat(body: dict,
               "background async response is not supported when routing to chat upstream",
               param="background")
 
-    # include：reasoning.encrypted_content 在 chat 上游不可得。
-    # 这是会影响下一轮推理链 replay 的高风险语义，禁止静默剥离。
-    include = body.get("include")
-    if isinstance(include, list):
-        for inc in include:
-            if inc == "reasoning.encrypted_content":
-                _fail(400, "invalid_request_error",
-                      "include reasoning.encrypted_content is not supported when routing to chat upstream",
-                      param="include")
+    # reasoning.encrypted_content 是 Responses 原生/OAuth 续链字段，Chat 上游不识别。
+    # 该字段由 translator 在 Responses→Chat 时直接丢弃；summary/content 仍可按
+    # reasoning passthrough 规则桥接为非官方 reasoning_content。

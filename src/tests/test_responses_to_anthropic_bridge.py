@@ -472,12 +472,13 @@ def test_translate_request_guards_responses_content_that_would_be_lost():
         responses_to_anthropic.translate_request({"model": "m", "conversation": "conv_1", "input": "hi"})
     with pytest.raises(GuardError):
         responses_to_anthropic.translate_request({"model": "m", "input": [{"type": "reasoning", "encrypted_content": "gAAAA"}, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]})
-    with pytest.raises(GuardError):
-        responses_to_anthropic.translate_request({
-            "model": "m",
-            "input": "hi",
-            "include": ["reasoning.encrypted_content"],
-        })
+    include_only = responses_to_anthropic.translate_request({
+        "model": "m",
+        "input": "hi",
+        "include": ["reasoning.encrypted_content"],
+    })
+    assert include_only["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert "include" not in include_only
 
 
 @pytest.mark.parametrize("field,value", [
@@ -586,10 +587,15 @@ def test_matrix_allows_safe_responses_to_anthropic_and_guards_unsafe_cases():
     control_plan = DEFAULT_MATRIX.plan("responses", "anthropic", features=extract_request_features("responses", controls))
     assert control_plan.required_transforms == ["responses_to_anthropic"]
 
+    assert DEFAULT_MATRIX.plan(
+        "responses", "anthropic",
+        features=extract_request_features("responses", {"input": "hi", "include": ["reasoning.encrypted_content"]}),
+    ).required_transforms == ["responses_to_anthropic"]
+
     with pytest.raises(ProtocolGuardError):
         DEFAULT_MATRIX.plan(
             "responses", "anthropic",
-            features=extract_request_features("responses", {"input": "hi", "include": ["reasoning.encrypted_content"]}),
+            features=extract_request_features("responses", {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]}),
         )
 
     assistant_image = {"input": [{"type": "message", "role": "assistant", "content": [{"type": "input_image", "image_url": "https://example.com/a.png"}]}]}

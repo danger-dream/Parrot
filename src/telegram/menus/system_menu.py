@@ -7,7 +7,6 @@ callback_data 前缀：`sys:...`
 from __future__ import annotations
 
 import asyncio
-import re
 
 from ... import concurrency, config, load_balancing, network, network_monitor, state_db
 from ...channel import registry
@@ -453,30 +452,6 @@ def _on_cch_set(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
     config.update(lambda c: c.__setitem__("cchMode", mode))
     ui.answer_cb(cb_id, f"已切换到 {mode}")
     _show_cch(chat_id, message_id, "-")
-
-
-def _edit_cch_static(chat_id: int, message_id: int, cb_id: str) -> None:
-    ui.answer_cb(cb_id)
-    states.set_state(chat_id, "sys_cch_static")
-    ui.edit(
-        chat_id, message_id,
-        "请输入 CCH 静态值（5 位 0-9 a-f hex；如 <code>abcde</code>）：",
-        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:cch")]]),
-    )
-
-
-def _on_cch_static_input(chat_id: int, text: str) -> None:
-    v = (text or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{5}", v):
-        ui.send(chat_id, "❌ 需要正好 5 位 hex（0-9 a-f），请重新输入：")
-        return
-    config.update(lambda c: c.__setitem__("cchStaticValue", v))
-    states.pop_state(chat_id)
-    ui.send_result(
-        chat_id,
-        f"✅ CCH 静态值已更新为 <code>{v}</code>",
-        back_label="◀ 返回 CCH 设置", back_callback="sys:show:cch",
-    )
 
 
 # ─── 渠道选择模式 ────────────────────────────────────────────────

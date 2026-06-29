@@ -328,8 +328,6 @@ def _responses_stateful_input_item_label(body: dict[str, Any]) -> str | None:
         if not isinstance(item, dict):
             continue
         typ = item.get("type")
-        if typ == "reasoning" and isinstance(item.get("encrypted_content"), str) and item.get("encrypted_content"):
-            return "reasoning.encrypted_content"
         if typ in _RESPONSES_BUILTIN_INPUT_ITEM_TYPES:
             return str(typ)
     return None
@@ -457,10 +455,15 @@ def _anthropic_tool_result_responses_unsupported_label(block: dict[str, Any]) ->
     return f"tool_result:{type(content).__name__}"
 
 
-def _responses_wants_encrypted_reasoning(body: dict[str, Any]) -> bool:
-    include = body.get("include")
-    if isinstance(include, list) and "reasoning.encrypted_content" in include:
-        return True
+def _responses_has_encrypted_reasoning_input(body: dict[str, Any]) -> bool:
+    """Return whether the request carries encrypted reasoning history.
+
+    `include: ["reasoning.encrypted_content"]` by itself is only a response
+    projection hint.  Chat fallback never understands encrypted reasoning and
+    drops this field in the translator; Anthropic fallback still rejects real
+    encrypted reasoning history because that bridge has no equivalent replay
+    mechanism.
+    """
     for item in _responses_input_like_items(body):
         if isinstance(item, dict) and item.get("type") == "reasoning" and item.get("encrypted_content"):
             return True
@@ -830,7 +833,7 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
         has_stateful_input_items = stateful_input_item_label is not None
         custom_tool_label = _responses_custom_tool_label(body)
         has_custom_tools = custom_tool_label is not None
-        has_encrypted_reasoning = _responses_wants_encrypted_reasoning(body)
+        has_encrypted_reasoning = _responses_has_encrypted_reasoning_input(body)
         responses_instructions_unsupported_label = _responses_instructions_unsupported_label(body)
     if ingress_protocol == "anthropic":
         if (
@@ -1425,8 +1428,6 @@ class ProtocolMatrix:
                         "OpenAI Responses→Chat hosted/stateful tools are not enabled yet"
                         + _label_suffix(f.hosted_tool_label or f.stateful_input_item_label)
                     )
-                if f.has_encrypted_reasoning:
-                    raise ProtocolGuardError("OpenAI Responses→Chat include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet")
                 if f.wants_background:
                     raise ProtocolGuardError("OpenAI Responses→Chat background async state is not enabled yet")
                 if f.responses_tool_output_chat_unsupported_label:

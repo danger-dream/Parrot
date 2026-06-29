@@ -148,8 +148,7 @@
   },
 
   // ─── CCH 模式（Claude Code 伪装） ───
-  "cchMode": "disabled",             // "dynamic" | "static" | "disabled"
-  "cchStaticValue": "00000",
+  "cchMode": "disabled",             // "dynamic" | "disabled"
 
   // ─── OAuth 默认模型（当账号的 models 字段留空时使用） ───
   "oauthDefaultModels": [

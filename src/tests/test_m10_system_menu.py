@@ -180,7 +180,7 @@ def test_affinity_fields(m):
     print("  [PASS] affinity fields")
 
 
-def test_cch_mode_switch_and_static(m):
+def test_cch_mode_switch(m):
     _reset(m)
     rec = _install(m)
     sm = m["system_menu"]
@@ -190,27 +190,17 @@ def test_cch_mode_switch_and_static(m):
     sm._on_cch_set(42, 100, "cb", "dynamic")
     assert m["config"].get()["cchMode"] == "dynamic"
 
-    sm._on_cch_set(42, 100, "cb", "static")
-    assert m["config"].get()["cchMode"] == "static"
-
-    # 编辑静态值
-    sm._edit_cch_static(42, 100, "cb")
-    sm._on_cch_static_input(42, "bad")  # 太短
-    assert m["states"].get_state(42) is not None
-    sm._on_cch_static_input(42, "abcde1")  # 太长
-    assert m["states"].get_state(42) is not None
-    sm._on_cch_static_input(42, "ghhij")  # 非 hex
-    assert m["states"].get_state(42) is not None
-    sm._on_cch_static_input(42, "a1b2c")
-    assert m["config"].get()["cchStaticValue"] == "a1b2c"
-
     sm._on_cch_set(42, 100, "cb", "disabled")
+    assert m["config"].get()["cchMode"] == "disabled"
+
+    # static 是历史测试模式，新 UI 不再允许切换。
+    sm._on_cch_set(42, 100, "cb", "static")
     assert m["config"].get()["cchMode"] == "disabled"
 
     # 无效模式
     sm._on_cch_set(42, 100, "cb", "bogus")
     assert m["config"].get()["cchMode"] == "disabled"
-    print("  [PASS] CCH mode + static value")
+    print("  [PASS] CCH mode switch")
 
 
 def test_chsel_switch(m):

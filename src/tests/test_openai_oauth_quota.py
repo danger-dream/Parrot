@@ -9,7 +9,7 @@
       * 30s 节流窗口内重复调用不再写
       * 响应头无 codex 字段时不写
   - oauth_menu 详情页对 provider=openai 账户的展示
-      （provider 行 / Codex 原始窗口块 / refresh_usage 友好提示）
+      （provider 行 / 5h/7d 归一化展示 / refresh_usage 友好提示）
   - status_menu._quota_warnings 对 openai 账户追加 🅾 标记
 
 用 HTTPX Response 的 mock 对象代替真实网络。
@@ -255,10 +255,10 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     assert "plus" in text
     # 归一化 5h / 7d
     assert "5h" in text and "77" in text
-    # Codex 原始窗口块
-    assert "Codex 原始窗口" in text
-    assert "primary (10080min)" in text
-    print("  [PASS] oauth_menu detail: provider tag + plan + codex usage")
+    # 不再展示低价值的 Codex 原始窗口块
+    assert "Codex 原始窗口" not in text
+    assert "primary (10080min)" not in text
+    print("  [PASS] oauth_menu detail: provider tag + plan + normalized codex usage")
 
 
 def test_oauth_menu_list_cached_openai_over_dynamic_threshold_auto_disables(m):

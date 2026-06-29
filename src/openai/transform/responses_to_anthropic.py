@@ -156,12 +156,11 @@ def guard_request(body: dict, *, store_enabled: bool = True) -> None:
     # fields, and unsupported service_tier values are stripped/fallback by the
     # bridge output allowlist. They do not change conversation content/tool
     # semantics for this target.
-    include = body.get("include")
-    if isinstance(include, list) and "reasoning.encrypted_content" in include:
-        _fail(
-            "Responses include reasoning.encrypted_content cannot be produced by Anthropic fallback",
-            param="include",
-        )
+    # include-only reasoning.encrypted_content is a response projection hint.  The
+    # Anthropic bridge cannot produce it, but when there is no actual encrypted
+    # reasoning history in input, dropping the hint is safer than rejecting an
+    # otherwise stateless request.  Real encrypted reasoning history is still
+    # rejected by _stateful_input_item_label below.
     # `conversation` is different: it names server-side state that this bridge
     # cannot load or replay, so align direct translator calls with the real
     # Responses ingress guard and reject non-null values instead of pretending

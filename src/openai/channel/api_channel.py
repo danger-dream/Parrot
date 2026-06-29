@@ -20,7 +20,7 @@ from ... import cache_hints, local_web_tools
 from ...providers import registry as provider_registry
 from .. import deepseek_reasoning
 from ..transform import (
-    anthropic_to_chat, anthropic_to_responses,
+    anthropic_to_chat, anthropic_to_responses, common,
     chat_to_responses, guard, responses_to_chat,
 )
 
@@ -91,6 +91,25 @@ class OpenAIApiChannel(Channel):
             typ = choice.get("type")
             return typ in ("function", "required")
         return False
+
+    def _apply_bigmodel_anthropic_bridge_compat(self, source_body: dict, payload: dict, resolved_model: str) -> None:
+        if not common.supports_bigmodel_thinking(resolved_model):
+            return
+        thinking_type = self._anthropic_thinking_type(source_body)
+        explicit_thinking = thinking_type is not None
+        if not explicit_thinking:
+            return
+
+        # BigModel's OpenAI-compatible Chat API uses a provider-specific
+        # `thinking` switch plus top-level `reasoning_effort` for GLM-5.2+.
+        # Anthropic `adaptive` / `enabled` both map to BigModel `enabled`;
+        # Anthropic `disabled` only stays disabled when no output_config effort
+        # asks us to enable reasoning again.
+        if thinking_type == "disabled" and source_body.get("output_config") is None:
+            payload["thinking"] = {"type": "disabled"}
+            payload.pop("reasoning_effort", None)
+        else:
+            payload["thinking"] = {"type": "enabled"}
 
     def _apply_deepseek_anthropic_bridge_compat(self, source_body: dict, payload: dict, resolved_model: str) -> None:
         if not self._is_deepseek(resolved_model):
@@ -177,6 +196,7 @@ class OpenAIApiChannel(Channel):
             api_key_name=body.get("_parrot_api_key_name"),
             client_ip=body.get("_parrot_client_ip"),
         )
+        self._apply_bigmodel_anthropic_bridge_compat(body, payload, resolved_model)
         self._apply_deepseek_anthropic_bridge_compat(body, payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
@@ -221,10 +241,14 @@ class OpenAIApiChannel(Channel):
 
     def _build_chat_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
         payload = provider_registry.filter_request_payload(self, body, protocol="openai-chat")
-        if (self._is_deepseek(resolved_model) or bool(body.get("_parrot_allow_openai_thinking"))) and isinstance(body.get("thinking"), dict):
-            # Internal-only escape hatch for DeepSeek V4 thinking mode.  Keep this
-            # out of the public chat passthrough whitelist so arbitrary OpenAI
-            # compatible channels do not receive non-standard `thinking` fields.
+        if (
+            self._is_deepseek(resolved_model)
+            or common.supports_bigmodel_thinking(resolved_model)
+            or bool(body.get("_parrot_allow_openai_thinking"))
+        ) and isinstance(body.get("thinking"), dict):
+            # Internal-only/provider-specific escape hatch for non-standard Chat
+            # `thinking` fields. Keep it out of the public allowlist so arbitrary
+            # OpenAI-compatible channels do not receive unsupported fields.
             payload["thinking"] = body["thinking"]
         payload["model"] = resolved_model
         return UpstreamRequest(

@@ -138,7 +138,6 @@
     }
   },
   "cchMode": "disabled",
-  "cchStaticValue": "00000",
   "oauthDefaultModels": [
     "claude-opus-4-5",
     "claude-opus-4-6",

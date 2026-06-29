@@ -521,6 +521,113 @@ def test_fetch_wham_usage_sends_account_id_header(m):
     print("  [PASS] fetch_wham_usage_sync: sends ChatGPT-Account-ID header")
 
 
+def test_fetch_rate_limit_reset_credits_sends_account_id_header(m):
+    """reset-card detail list mirrors Codex WHAM path and account-id routing."""
+    _setup(m)
+    p = m["openai_provider"]
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "available_count": 2,
+                "total_earned_count": 4,
+                "credits": [
+                    {
+                        "id": "credit-1",
+                        "reset_type": "codex_rate_limits",
+                        "status": "available",
+                        "granted_at": "2026-06-17T00:00:00Z",
+                        "expires_at": "2026-07-17T00:00:00Z",
+                        "title": "ignored",
+                    },
+                    {
+                        "id": "credit-2",
+                        "reset_type": "codex_rate_limits",
+                        "status": "available",
+                        "granted_at": "2026-06-18T00:00:00Z",
+                        "expires_at": None,
+                    },
+                ],
+            }
+
+    orig_get = p.network.get_sync
+    try:
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+
+        def _fake_get(url, *, headers=None, **kwargs):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["timeout"] = kwargs.get("timeout")
+            captured["proxy_purpose"] = kwargs.get("proxy_purpose")
+            return _Resp()
+
+        p.network.get_sync = _fake_get
+        details = p.fetch_rate_limit_reset_credits_sync("at-token", account_id="acct-x")
+    finally:
+        p.network.get_sync = orig_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+
+    assert captured["url"] == p.WHAM_RESET_CREDIT_LIST_URL
+    assert captured["headers"].get("authorization") == "Bearer at-token"
+    assert captured["headers"].get("ChatGPT-Account-ID") == "acct-x"
+    assert captured["proxy_purpose"] == "oauth_openai"
+    assert details == {
+        "available_count": 2,
+        "data": [
+            {
+                "id": "credit-1",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": "2026-06-17T00:00:00Z",
+                "expires_at": "2026-07-17T00:00:00Z",
+            },
+            {
+                "id": "credit-2",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": "2026-06-18T00:00:00Z",
+                "expires_at": None,
+            },
+        ],
+    }
+    print("  [PASS] fetch_rate_limit_reset_credits_sync: WHAM path + sanitized payload")
+
+
+def test_oauth_manager_fetches_openai_reset_credit_details_with_account_id(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account({
+        "email": "cards@openai.test",
+        "provider": "openai",
+        "access_token": "at", "refresh_token": "rt",
+        "expired": "2099-01-01T00:00:00Z",
+        "chatgpt_account_id": "acct-cards", "plan_type": "plus",
+    })
+
+    called = {}
+    orig_fetch = m["openai_provider"].fetch_rate_limit_reset_credits
+
+    async def _fake_fetch(access_token: str, *, account_id: str | None = None):
+        called["access_token"] = access_token
+        called["account_id"] = account_id
+        return {"available_count": 1, "data": []}
+
+    import asyncio
+    try:
+        m["openai_provider"].fetch_rate_limit_reset_credits = _fake_fetch
+        details = asyncio.run(om.fetch_openai_rate_limit_reset_credits("openai:cards@openai.test:acct-cards"))
+    finally:
+        m["openai_provider"].fetch_rate_limit_reset_credits = orig_fetch
+
+    assert called == {"access_token": "at", "account_id": "acct-cards"}, called
+    assert details["available_count"] == 1
+    print("  [PASS] oauth_manager reset-credit details: account token + workspace id")
+
+
 # ─── TG bot: OpenAI add via PKCE ─────────────────────────────────
 
 def test_tg_openai_add_via_pkce(m):
@@ -641,6 +748,8 @@ def main():
         test_openai_refresh_updates_id_token_metadata,
         test_fetch_usage_openai_goes_through_wham,
         test_fetch_wham_usage_sends_account_id_header,
+        test_fetch_rate_limit_reset_credits_sends_account_id_header,
+        test_oauth_manager_fetches_openai_reset_credit_details_with_account_id,
         test_tg_openai_add_via_pkce,
         test_tg_openai_add_state_mismatch,
         test_tg_openai_add_via_rt,

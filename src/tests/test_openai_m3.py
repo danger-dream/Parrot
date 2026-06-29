@@ -580,6 +580,7 @@ def test_r2c_translate_response_basics(m):
     types = [it["type"] for it in items]
     assert types == ["reasoning", "message", "function_call"]
     assert items[0]["summary"][0]["text"] == "because math"
+    assert "encrypted_content" not in items[0]
     assert items[1]["content"][0]["text"] == "The answer is 2"
     assert items[2]["call_id"] == "call_1"
     assert items[2]["arguments"] == "{}"
@@ -938,23 +939,45 @@ async def test_guard_r2c_previous_response_id_not_found(m):
 
 
 async def test_guard_r2c_encrypted_reasoning_include(m):
-    """Responses→Chat 不能静默剥离 encrypted reasoning include。"""
+    """Responses→Chat 允许 include/历史 EC；translator 丢弃 Chat 不支持的 encrypted_content。"""
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
+    router.register("https://c.example", lambda req: httpx.Response(200, json={
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-5",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }))
     chC = _make_openai_channel(m, "oaiC", "https://c.example",
                                protocol="openai-chat", real="gpt-5", alias="gpt-5")
     _install_channels(m, [chC])
 
     body = {"model": "gpt-5", "input": "hi", "include": ["reasoning.encrypted_content"]}
     resp, mc = await _call_openai_handler(m, router, "responses", body)
-    assert resp.status_code == 400
-    out = json.loads(resp.body)
-    assert out["error"]["type"] == "invalid_request_error"
-    assert "reasoning.encrypted_content" in out["error"]["message"]
-    assert router.last_request is None
+    assert resp.status_code == 200
+    up = _captured_upstream_body(router)
+    assert "include" not in up
+    assert up["messages"] == [{"role": "user", "content": "hi"}]
+    request_count = len(router.requests)
+
+    body_with_history = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "reasoning", "encrypted_content": "gAAAA"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "again"}]},
+        ],
+    }
+    resp2, _ = await _call_openai_handler(m, router, "responses", body_with_history)
+    assert resp2.status_code == 200
+    up2 = _captured_upstream_body(router)
+    assert up2["messages"] == [{"role": "user", "content": "again"}]
+    assert "gAAAA" not in json.dumps(up2)
+    assert len(router.requests) == request_count + 1
     await mc.aclose()
-    print("  [PASS] r2c guard: encrypted reasoning include → 400")
+    print("  [PASS] r2c guard: include/history EC stripped for chat fallback")
 
 
 def test_guard_r2c_allows_output_whitelist_filtered_request_controls(m):

@@ -599,6 +599,7 @@ def test_matrix_guards_responses_stateful_file_audio_and_allows_request_controls
         {"input": "hi", "prompt": {"id": "pmpt_1"}},
         {"input": "hi", "truncation": "auto"},
         {"input": "hi", "include": ["unsupported.include"]},
+        {"input": "hi", "include": ["reasoning.encrypted_content"]},
     ]
 
     for body in control_bodies:
@@ -613,7 +614,6 @@ def test_matrix_guards_responses_stateful_file_audio_and_allows_request_controls
         {"input": [{"type": "item_reference", "id": "item_1"}]},
         {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]},
         {"input": [{"type": "input_file", "file_id": "file_1"}]},
-        {"input": "hi", "include": ["reasoning.encrypted_content"]},
     ]
 
     for body in unsafe_bodies:
@@ -703,14 +703,20 @@ def test_matrix_allows_internal_prompt_cache_hints_to_anthropic():
         "responses", "anthropic", features=extract_request_features("responses", resp_body),
     ).required_transforms == ["responses_to_anthropic"]
 
-    with pytest.raises(ProtocolGuardError):
-        DEFAULT_MATRIX.plan(
-            "responses", "openai-chat",
-            features=extract_request_features(
-                "responses",
-                {"input": "hi", "include": ["reasoning.encrypted_content"]},
-            ),
-        )
+    assert DEFAULT_MATRIX.plan(
+        "responses", "openai-chat",
+        features=extract_request_features(
+            "responses",
+            {"input": "hi", "include": ["reasoning.encrypted_content"]},
+        ),
+    ).required_transforms == ["responses_to_chat"]
+    assert DEFAULT_MATRIX.plan(
+        "responses", "openai-chat",
+        features=extract_request_features(
+            "responses",
+            {"input": [{"type": "reasoning", "encrypted_content": "gAAAA"}]},
+        ),
+    ).required_transforms == ["responses_to_chat"]
 
     assert DEFAULT_MATRIX.plan(
         "chat", "openai-responses",

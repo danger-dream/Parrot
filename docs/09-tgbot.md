@@ -50,7 +50,7 @@
 [  user1@gmail.com  ]
 [  user2@gmail.com  ]
 ─────────────────────
-[ ➕ 新增账户 ][ 🔄 刷新全部用量 ]
+[ ➕ 新增账户 ][ 🔄 刷新用量/重置卡 ]
 [       ◀ 返回主菜单       ]
 ```
 
@@ -73,14 +73,14 @@
 ║ 🧠 Opus 7d: 32%
 ║ 💰 额外额度: $0.00 / $50.00
 ╚══════════════════════════════╝
-[ 🔄 刷新 Token  ][ 📊 刷新用量 ]
+[ 🔄 刷新 Token  ][ 📊 刷新用量/重置卡 ]
 [ 🚫 禁用       ][ 🗑 删除     ]
 [ ◀ 返回 OAuth 菜单              ]
 ```
 
 操作：
 - 「刷新 Token」→ 调 `force_refresh(email)` → 显示新过期时间
-- 「刷新用量」→ 调 `fetch_usage(email)` → 更新显示
+- 「刷新用量/重置卡」→ 调 `fetch_usage(email)`；OpenAI 账号同时拉取官方重置卡明细 → 更新显示
 - 「禁用」→ 弹二次确认 → `set_enabled(email, False, reason="user")`
 - 「删除」→ 弹二次确认 → `delete_account(email)`
 
@@ -123,9 +123,9 @@
    ```
 3. 用户发 JSON → 解析 → `add_account(...)` → 回复结果
 
-### 9.2.4 刷新全部用量
+### 9.2.4 刷新用量/重置卡
 
-对每个 `enabled=True` 的账户并发调 `fetch_usage(email)`（限速：每账户 1s 间隔，避免一口气触发 rate-limit）。完成后刷新列表视图。
+对每个 OAuth 账户刷新用量；OpenAI 账号会同时刷新官方重置卡次数与卡片明细，并写入同一份 quota cache。完成后刷新列表视图。
 
 ## 9.3 渠道管理
 
@@ -590,11 +590,10 @@ body/response 过长时分页显示或只显示前 2K + 剩余字数提示。
 ```
 当前: disabled
 说明: CCH 是 Claude Code 头部签名。disabled = 不加；
-      dynamic = 基于 body xxhash 计算；
-      static = 固定值。
+      dynamic = 基于 body xxhash 计算。
 ```
 
-按钮：切换 disabled/dynamic/static；static 模式下可改值。
+按钮：切换 disabled/dynamic。
 
 ### 9.7.5 首包黑名单
 

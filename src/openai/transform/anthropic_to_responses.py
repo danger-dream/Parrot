@@ -32,14 +32,14 @@ def _json_dumps(value: Any, *, sort_keys: bool = False) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=sort_keys)
 
 
-def guard_request(body: dict) -> None:
+def guard_request(body: dict, *, target_model: str | None = None) -> None:
     if not isinstance(body, dict):
         _fail("request body must be a JSON object")
     if body.get("thinking") is not None and not common.anthropic_thinking_is_disabled(body):
-        if not common.anthropic_reasoning_config_is_mappable(body):
+        if not common.anthropic_reasoning_config_is_mappable(body, target_model=target_model):
             _fail("Anthropic thinking cannot be mapped to Responses reasoning.effort", param="thinking")
     if body.get("output_config") is not None:
-        if not common.anthropic_reasoning_config_is_mappable(body):
+        if not common.anthropic_reasoning_config_is_mappable(body, target_model=target_model):
             _fail("Anthropic output_config.effort cannot be mapped to Responses reasoning.effort", param="output_config")
     if body.get("context_management") is not None and not common.anthropic_context_management_is_ignorable(body.get("context_management")):
         _fail("Anthropic context_management is not supported on Responses bridge yet", param="context_management")
@@ -443,7 +443,7 @@ def translate_request(
     target_model: str | None = None,
     codex_oauth: bool = False,
 ) -> dict:
-    guard_request(body)
+    guard_request(body, target_model=target_model)
     payload: dict[str, Any] = {
         "input": _messages_to_input_items(body.get("messages") or [], codex_oauth=codex_oauth),
         "stream": bool(body.get("stream")),
@@ -464,7 +464,7 @@ def translate_request(
         payload["top_p"] = body.get("top_p")
     if body.get("metadata") is not None:
         payload["metadata"] = body.get("metadata")
-    effort = common.resolve_anthropic_reasoning_effort(body)
+    effort = common.resolve_anthropic_reasoning_effort(body, target_model=target_model)
     if effort:
         if target_model and not common.supports_reasoning_effort(target_model):
             _fail(

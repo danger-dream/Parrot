@@ -60,8 +60,10 @@ _ACCOUNTS_CHECK_TIMEOUT = 15.0
 # ChatGPT/Codex 私有用量端点。它不是 OpenAI public API；只用于主动 quota
 # 刷新/后台 monitor。业务请求返回的 x-codex-* 响应头仍由 failover 实时采样。
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+WHAM_RESET_CREDIT_LIST_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 WHAM_RESET_CREDIT_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 _WHAM_USAGE_TIMEOUT = 30.0
+_WHAM_RESET_CREDIT_LIST_TIMEOUT = 5.0
 _WHAM_RESET_CREDIT_TIMEOUT = 10.0
 
 
@@ -742,6 +744,30 @@ def _mock_wham_payload() -> dict:
     }
 
 
+def _mock_rate_limit_reset_credits_payload() -> dict:
+    now = int(time.time())
+    return {
+        "available_count": 2,
+        "total_earned_count": 2,
+        "credits": [
+            {
+                "id": "mock-reset-credit-1",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400)),
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 30 * 86400)),
+            },
+            {
+                "id": "mock-reset-credit-2",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 2 * 86400)),
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 29 * 86400)),
+            },
+        ],
+    }
+
+
 def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -> dict:
     """主动拉 ChatGPT/Codex quota。
 
@@ -777,6 +803,89 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -
 async def fetch_wham_usage(access_token: str, *, account_id: str | None = None) -> dict:
     return await asyncio.to_thread(
         fetch_wham_usage_sync, access_token, account_id=account_id,
+    )
+
+
+def _normalize_reset_credit_timestamp(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(value)))
+    return str(value)
+
+
+def normalize_rate_limit_reset_credits(payload: dict) -> dict:
+    """Normalize WHAM rate-limit reset credit detail payload.
+
+    The upstream endpoint returns `credits` with `granted_at` / `expires_at`
+    RFC3339 strings and an authoritative `available_count`. It intentionally
+    returns details for at most the first 10 available cards and has no cursor.
+    Keep only the fields Parrot needs for display / explicit redemption UX.
+    """
+    if not isinstance(payload, dict):
+        payload = {}
+
+    data: list[dict] = []
+    credits = payload.get("credits")
+    if isinstance(credits, list):
+        for item in credits:
+            if not isinstance(item, dict):
+                continue
+            data.append({
+                "id": str(item.get("id") or ""),
+                "reset_type": str(item.get("reset_type") or ""),
+                "status": str(item.get("status") or ""),
+                "granted_at": _normalize_reset_credit_timestamp(item.get("granted_at")),
+                "expires_at": _normalize_reset_credit_timestamp(item.get("expires_at")),
+            })
+
+    available_count = _coerce_int(payload.get("available_count"))
+    if available_count is None:
+        available_count = len(data)
+    return {
+        "available_count": available_count,
+        "data": data,
+    }
+
+
+def fetch_rate_limit_reset_credits_sync(access_token: str, *,
+                                        account_id: str | None = None) -> dict:
+    """Fetch available OpenAI/Codex reset-credit cards from ChatGPT WHAM.
+
+    This mirrors openai/codex `list_rate_limit_reset_credits`: Parrot uses its
+    own OAuth account token and optional ChatGPT-Account-ID routing header; it
+    never reads the local Codex CLI auth file.
+    """
+    if not access_token:
+        raise ValueError("access_token must not be empty")
+
+    if _mock_mode_enabled():
+        return normalize_rate_limit_reset_credits(_mock_rate_limit_reset_credits_payload())
+
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "accept": "application/json",
+        "user-agent": USER_AGENT,
+        "origin": "https://chatgpt.com",
+        "referer": "https://chatgpt.com/codex/settings/usage",
+    }
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+
+    resp = network.get_sync(
+        WHAM_RESET_CREDIT_LIST_URL,
+        headers=headers,
+        timeout=_WHAM_RESET_CREDIT_LIST_TIMEOUT,
+        proxy_purpose="oauth_openai",
+    )
+    resp.raise_for_status()
+    return normalize_rate_limit_reset_credits(resp.json())
+
+
+async def fetch_rate_limit_reset_credits(access_token: str, *,
+                                         account_id: str | None = None) -> dict:
+    return await asyncio.to_thread(
+        fetch_rate_limit_reset_credits_sync, access_token, account_id=account_id,
     )
 
 

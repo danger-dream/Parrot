@@ -9,7 +9,7 @@
   - `delta.content` → 打开 message item + output_text part，持续 output_text.delta；
     切换到其他 item 类型前先 close
   - `delta.reasoning_content`（非官方）→ 打开 reasoning item + summary_part，
-    持续 reasoning_summary_text.delta
+    持续 reasoning_summary_text.delta；不伪造 reasoning.encrypted_content
   - `delta.tool_calls[i]` 首次出现 → 新 function_call item，按 tc.index 索引；
     后续 arguments 累加到同一 item
   - `finish_reason` → 收尾状态（"length"→ status=incomplete）
@@ -513,12 +513,13 @@ class StreamTranslator:
                 "summary_index": 0,
                 "part": {"type": "summary_text", "text": item.text_buf},
             })
-        # 03-fix-plan 附录 #1: reasoning item 加 status:"completed"
+        # 03-fix-plan 附录 #1: reasoning item 加 status:"completed"。
+        # Chat 上游无法产生真正可 replay 的 reasoning.encrypted_content，
+        # 所以这里只输出 summary，不伪造 encrypted_content。
         reasoning_summary = ([{"type": "summary_text", "text": item.text_buf}]
                              if item.summary_part_opened else [])
         completed_item = {
             "type": "reasoning", "id": item.item_id,
-            "encrypted_content": item.text_buf if item.summary_part_opened else "",
             "summary": reasoning_summary,
             "status": "completed",
         }
