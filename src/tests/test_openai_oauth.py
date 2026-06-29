@@ -474,6 +474,41 @@ def test_fetch_usage_openai_goes_through_wham(m):
     print("  [PASS] fetch_usage openai: unified path (wham/usage + account id)")
 
 
+def test_normalize_rate_limit_reset_credits_sanitizes_payload(m):
+    p = m["openai_provider"]
+    payload = {
+        "available_count": 1,
+        "total_earned_count": 2,
+        "credits": [
+            {
+                "id": "RateLimitResetCredit_secret-full-id",
+                "status": "available",
+                "granted_at": "2026-06-12T01:33:14Z",
+                "expires_at": "2026-07-12T01:33:14Z",
+                "cookie": "do-not-leak",
+            },
+            {
+                "id": "RateLimitResetCredit_redeemed-id",
+                "status": "redeemed",
+                "issued_at": "2026-06-10T00:00:00Z",
+                "expiration_time": "2026-07-10T00:00:00Z",
+            },
+        ],
+    }
+    norm = p.normalize_rate_limit_reset_credits(payload)
+    assert norm["available_count"] == 1
+    assert norm["total_earned_count"] == 2
+    assert norm["credits"][0] == {
+        "index": 1,
+        "status": "available",
+        "granted_at": "2026-06-12T01:33:14Z",
+        "expires_at": "2026-07-12T01:33:14Z",
+    }
+    assert "RateLimitResetCredit_secret" not in repr(norm)
+    assert "cookie" not in repr(norm)
+    print("  [PASS] normalize_rate_limit_reset_credits: keeps times/counts, drops IDs/secrets")
+
+
 def test_fetch_wham_usage_sends_account_id_header(m):
     """wham/usage 请求显式带 ChatGPT-Account-ID，与 Codex BackendClient 对齐。"""
     _setup(m)
@@ -519,6 +554,59 @@ def test_fetch_wham_usage_sends_account_id_header(m):
     assert usage["five_hour"]["utilization"] == 1.0
     assert usage["seven_day"]["utilization"] == 3.0
     print("  [PASS] fetch_wham_usage_sync: sends ChatGPT-Account-ID header")
+
+
+def test_fetch_rate_limit_reset_credits_sends_auth_and_account_header(m):
+    """Dedicated reset-credit endpoint uses Codex Bearer auth and redacts raw IDs."""
+    _setup(m)
+    p = m["openai_provider"]
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "available_count": 1,
+                "total_earned_count": 1,
+                "credits": [{
+                    "id": "RateLimitResetCredit_sensitive-id",
+                    "status": "available",
+                    "granted_at": "2026-06-12T01:33:14Z",
+                    "expires_at": "2026-07-12T01:33:14Z",
+                }],
+            }
+
+    orig_get = p.network.get_sync
+    try:
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+
+        def _fake_get(url, *, headers=None, **kwargs):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["timeout"] = kwargs.get("timeout")
+            captured["proxy_purpose"] = kwargs.get("proxy_purpose")
+            return _Resp()
+
+        p.network.get_sync = _fake_get
+        credits = p.fetch_rate_limit_reset_credits_sync("at-token", account_id="acct-x")
+    finally:
+        p.network.get_sync = orig_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+
+    assert captured["url"] == p.WHAM_RESET_CREDITS_URL
+    assert captured["headers"].get("authorization") == "Bearer at-token"
+    assert captured["headers"].get("ChatGPT-Account-ID") == "acct-x"
+    assert captured["headers"].get("openai-beta") == "codex-1"
+    assert captured["proxy_purpose"] == "oauth_openai"
+    assert credits["credits"][0]["granted_at"] == "2026-06-12T01:33:14Z"
+    assert "sensitive-id" not in repr(credits)
+    print("  [PASS] fetch_rate_limit_reset_credits_sync: auth/account headers + sanitized output")
 
 
 # ─── TG bot: OpenAI add via PKCE ─────────────────────────────────
@@ -640,7 +728,9 @@ def main():
         test_refresh_notice_openai_wording,
         test_openai_refresh_updates_id_token_metadata,
         test_fetch_usage_openai_goes_through_wham,
+        test_normalize_rate_limit_reset_credits_sanitizes_payload,
         test_fetch_wham_usage_sends_account_id_header,
+        test_fetch_rate_limit_reset_credits_sends_auth_and_account_header,
         test_tg_openai_add_via_pkce,
         test_tg_openai_add_state_mismatch,
         test_tg_openai_add_via_rt,

@@ -27,6 +27,7 @@ import os
 import secrets
 import time
 from typing import Any
+from pathlib import Path
 from urllib.parse import urlencode
 
 from .. import network
@@ -60,8 +61,10 @@ _ACCOUNTS_CHECK_TIMEOUT = 15.0
 # ChatGPT/Codex 私有用量端点。它不是 OpenAI public API；只用于主动 quota
 # 刷新/后台 monitor。业务请求返回的 x-codex-* 响应头仍由 failover 实时采样。
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+WHAM_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 WHAM_RESET_CREDIT_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 _WHAM_USAGE_TIMEOUT = 30.0
+_WHAM_RESET_CREDITS_TIMEOUT = 10.0
 _WHAM_RESET_CREDIT_TIMEOUT = 10.0
 
 
@@ -611,6 +614,92 @@ def _wham_window_looks_monthly(win: dict) -> bool:
     return False
 
 
+def _coerce_str(v: Any) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _extract_reset_credit_list(payload: Any) -> list[dict]:
+    """Best-effort extraction for the dedicated WHAM reset-credit list.
+
+    The observed endpoint returns a top-level ``credits`` list plus counters. Keep
+    the parser tolerant so small upstream shape changes do not break the UI.
+    """
+    if isinstance(payload, list):
+        return [c for c in payload if isinstance(c, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("credits", "rate_limit_reset_credits", "items", "data", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [c for c in value if isinstance(c, dict)]
+        if isinstance(value, dict):
+            nested = value.get("credits") or value.get("items") or value.get("data")
+            if isinstance(nested, list):
+                return [c for c in nested if isinstance(c, dict)]
+    return []
+
+
+def _normalize_reset_credit_entry(raw: dict, index: int) -> dict:
+    status = _coerce_str(raw.get("status")) or "unknown"
+    granted_at = (
+        _coerce_str(raw.get("granted_at"))
+        or _coerce_str(raw.get("created_at"))
+        or _coerce_str(raw.get("issued_at"))
+        or _coerce_str(raw.get("grant_time"))
+        or _coerce_str(raw.get("createdAt"))
+        or _coerce_str(raw.get("grantedAt"))
+        or _coerce_str(raw.get("issuedAt"))
+    )
+    expires_at = (
+        _coerce_str(raw.get("expires_at"))
+        or _coerce_str(raw.get("expiration_time"))
+        or _coerce_str(raw.get("expiresAt"))
+        or _coerce_str(raw.get("expires"))
+    )
+    return {
+        "index": index,
+        "status": status,
+        "granted_at": granted_at,
+        "expires_at": expires_at,
+    }
+
+
+def normalize_rate_limit_reset_credits(payload: dict | list) -> dict:
+    """Normalize ``/wham/rate-limit-reset-credits`` without exposing IDs.
+
+    Only count fields and per-card grant/expiry/status are retained. Token-like
+    values, cookies, raw IDs and full upstream payloads are intentionally not
+    returned to keep UI/logs safe.
+    """
+    credits = [
+        _normalize_reset_credit_entry(raw, i)
+        for i, raw in enumerate(_extract_reset_credit_list(payload), start=1)
+    ]
+    available = None
+    total_earned = None
+    if isinstance(payload, dict):
+        available = _coerce_int(payload.get("available_count"))
+        total_earned = _coerce_int(payload.get("total_earned_count"))
+        if available is None:
+            summary = payload.get("rate_limit_reset_credits")
+            if isinstance(summary, dict):
+                available = _coerce_int(summary.get("available_count"))
+                total_earned = total_earned if total_earned is not None else _coerce_int(summary.get("total_earned_count"))
+    if available is None:
+        available = sum(1 for c in credits if c.get("status") == "available")
+    if total_earned is None:
+        total_earned = len(credits)
+    return {
+        "available_count": available,
+        "total_earned_count": total_earned,
+        "credits": credits,
+    }
+
+
 def normalize_wham_usage(payload: dict) -> dict:
     """把 ChatGPT `backend-api/wham/usage` 响应规范成通用 usage 结构。
 
@@ -742,6 +831,22 @@ def _mock_wham_payload() -> dict:
     }
 
 
+def _auth_headers(access_token: str, *, account_id: str | None = None,
+                  referer: str = "https://chatgpt.com/codex/settings/usage") -> dict:
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "accept": "application/json",
+        "user-agent": USER_AGENT,
+        "originator": CODEX_ORIGINATOR,
+        "openai-beta": "codex-1",
+        "origin": "https://chatgpt.com",
+        "referer": referer,
+    }
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+    return headers
+
+
 def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -> dict:
     """主动拉 ChatGPT/Codex quota。
 
@@ -751,18 +856,10 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -
     if _mock_mode_enabled():
         return normalize_wham_usage(_mock_wham_payload())
 
-    headers = {
-        "authorization": f"Bearer {access_token}",
-        "accept": "application/json",
-        "user-agent": USER_AGENT,
-        "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/codex/settings/usage",
-    }
     # Codex 官方 BackendClient 会把 ChatGPT account/workspace id 一并带到
     # usage 请求里。单工作区账号通常只靠 Bearer 也能成功，但多工作区账号
     # 最好显式路由到当前账户，避免刷新到错误 workspace 或被上游收紧鉴权。
-    if account_id:
-        headers["ChatGPT-Account-ID"] = account_id
+    headers = _auth_headers(access_token, account_id=account_id)
 
     resp = network.get_sync(
         WHAM_USAGE_URL,
@@ -777,6 +874,111 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -
 async def fetch_wham_usage(access_token: str, *, account_id: str | None = None) -> dict:
     return await asyncio.to_thread(
         fetch_wham_usage_sync, access_token, account_id=account_id,
+    )
+
+
+def _mock_reset_credits_payload() -> dict:
+    now = int(time.time())
+    return {
+        "available_count": 2,
+        "total_earned_count": 2,
+        "credits": [
+            {
+                "id": "RateLimitResetCredit_mock1",
+                "status": "available",
+                "granted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600)),
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 29 * 86400)),
+            },
+            {
+                "id": "RateLimitResetCredit_mock2",
+                "status": "available",
+                "granted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 7200)),
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 30 * 86400)),
+            },
+        ],
+    }
+
+
+def fetch_rate_limit_reset_credits_sync(access_token: str, *,
+                                        account_id: str | None = None) -> dict:
+    """Fetch the dedicated Codex reset-credit cards list from ChatGPT WHAM.
+
+    This endpoint includes per-credit grant/expiry timestamps; wham/usage only
+    includes the available count. The returned structure is normalized and
+    deliberately excludes upstream IDs or raw payloads.
+    """
+    if not access_token:
+        raise ValueError("Codex access_token missing from tokens.access_token")
+    if _mock_mode_enabled():
+        return normalize_rate_limit_reset_credits(_mock_reset_credits_payload())
+
+    resp = network.get_sync(
+        WHAM_RESET_CREDITS_URL,
+        headers=_auth_headers(access_token, account_id=account_id),
+        timeout=_WHAM_RESET_CREDITS_TIMEOUT,
+        proxy_purpose="oauth_openai",
+    )
+    resp.raise_for_status()
+    return normalize_rate_limit_reset_credits(resp.json())
+
+
+async def fetch_rate_limit_reset_credits(access_token: str, *,
+                                         account_id: str | None = None) -> dict:
+    return await asyncio.to_thread(
+        fetch_rate_limit_reset_credits_sync, access_token, account_id=account_id,
+    )
+
+
+def codex_auth_path(path: str | os.PathLike | None = None) -> Path:
+    """Return the local Codex CLI auth path.
+
+    ``~/.codex/auth.json`` is the default. Operators may override it with
+    PARROT_CODEX_AUTH_PATH (or CODEX_AUTH_PATH for CLI compatibility).
+    """
+    if path:
+        return Path(path).expanduser()
+    env_path = os.environ.get("PARROT_CODEX_AUTH_PATH") or os.environ.get("CODEX_AUTH_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path.home() / ".codex" / "auth.json"
+
+
+def load_codex_auth(path: str | os.PathLike | None = None) -> dict:
+    """Load local Codex CLI auth JSON without logging or returning secrets."""
+    auth_file = codex_auth_path(path)
+    if not auth_file.exists():
+        raise FileNotFoundError(f"Codex auth.json not found: {auth_file}")
+    with auth_file.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Codex auth.json must contain a JSON object")
+    return data
+
+
+def _codex_auth_access_parts(auth: dict) -> tuple[str, str | None]:
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    if not isinstance(tokens, dict):
+        raise ValueError("Codex auth.json missing tokens object")
+    access_token = tokens.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise ValueError("Codex auth.json missing tokens.access_token")
+    account_id = tokens.get("account_id") or auth.get("account_id") or auth.get("chatgpt_account_id")
+    return access_token.strip(), str(account_id).strip() if account_id else None
+
+
+def fetch_local_codex_rate_limit_reset_credits_sync(
+    *, auth_path: str | os.PathLike | None = None,
+) -> dict:
+    """Read local Codex CLI credentials and fetch reset-credit grant/expiry data."""
+    access_token, account_id = _codex_auth_access_parts(load_codex_auth(auth_path))
+    return fetch_rate_limit_reset_credits_sync(access_token, account_id=account_id)
+
+
+async def fetch_local_codex_rate_limit_reset_credits(
+    *, auth_path: str | os.PathLike | None = None,
+) -> dict:
+    return await asyncio.to_thread(
+        fetch_local_codex_rate_limit_reset_credits_sync, auth_path=auth_path,
     )
 
 
@@ -808,16 +1010,8 @@ def consume_rate_limit_reset_credit_sync(access_token: str, *,
             "idempotency_key": idempotency_key,
         }
 
-    headers = {
-        "authorization": f"Bearer {access_token}",
-        "accept": "application/json",
-        "content-type": "application/json",
-        "user-agent": USER_AGENT,
-        "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/codex/settings/usage",
-    }
-    if account_id:
-        headers["ChatGPT-Account-ID"] = account_id
+    headers = _auth_headers(access_token, account_id=account_id)
+    headers["content-type"] = "application/json"
 
     resp = network.post_sync(
         WHAM_RESET_CREDIT_CONSUME_URL,

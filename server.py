@@ -450,6 +450,39 @@ async def health():
     }
 
 
+@app.get("/v1/codex/rate-limit-reset-credits")
+async def codex_rate_limit_reset_credits(request: Request):
+    """Return local Codex reset-credit grant/expiry times.
+
+    Reads ~/.codex/auth.json (or PARROT_CODEX_AUTH_PATH / CODEX_AUTH_PATH), uses
+    tokens.access_token as Bearer auth for ChatGPT WHAM, and returns only safe
+    card fields: status, granted_at, expires_at. No access/refresh token, cookie
+    or full upstream ID is ever returned.
+    """
+    _key_name, _allowed_models, err = auth.validate(request.headers)
+    if err:
+        return errors.json_error_response(401, errors.ErrType.AUTH, err)
+    try:
+        return await asyncio.to_thread(
+            oauth_manager.openai_provider.fetch_local_codex_rate_limit_reset_credits_sync,
+        )
+    except FileNotFoundError:
+        return errors.json_error_response(
+            404, errors.ErrType.API,
+            "Codex auth.json not found at ~/.codex/auth.json",
+        )
+    except ValueError as exc:
+        return errors.json_error_response(400, errors.ErrType.API, str(exc))
+    except Exception as exc:
+        import httpx as _httpx
+        if isinstance(exc, _httpx.HTTPStatusError) and exc.response.status_code == 401:
+            return errors.json_error_response(
+                401, errors.ErrType.AUTH,
+                "Codex credentials are invalid or Authorization header was not accepted by ChatGPT.",
+            )
+        raise
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     """Anthropic 标准 /v1/models：返回当前代理可见的模型清单。

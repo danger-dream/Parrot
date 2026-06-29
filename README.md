@@ -315,6 +315,11 @@ JSON 请求体：
 返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤），Anthropic 标准格式。
 **配置了模型映射的别名也会在这里一同列出**（条件：别名所在入口的家族对该 Key 放行，且别名指向的真实模型本身对该 Key 可见），这样下游客户端直接拉列表就能看到最新别名。
 
+### `GET /v1/codex/rate-limit-reset-credits`
+用 Parrot API Key 鉴权后，读取运行 Parrot 机器上的 `~/.codex/auth.json`（可用 `PARROT_CODEX_AUTH_PATH` 或 `CODEX_AUTH_PATH` 覆盖），取 `tokens.access_token` 请求 ChatGPT WHAM：`https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`。
+
+返回内容只保留安全字段：可用次数、累计发放次数，以及每张重置卡的 `status` / `granted_at` / `expires_at`；不会返回 `access_token`、`refresh_token`、cookie、完整唯一 ID 或上游原始 payload。若上游返回 401，表示本机 Codex 凭证失效，或 Authorization header 没被正确携带/接受。
+
 ### `GET /health`
 运维健康检查（无鉴权）：
 ```json
@@ -359,6 +364,7 @@ JSON 请求体：
 - 每条账户显示：状态图标 / 过期时间 / 5h 7d 用量 / 月度统计 / 冷却中的模型
 - 详情页：两家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
+- OpenAI 详情页支持官方 Codex banked reset credit 消耗确认；账户设置页支持查看「本机 Codex 重置卡」的发放时间和过期时间（北京时间）
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
 - 图片生成入口：OAuth 列表底部提供「🖼 图片生成」，用于配置图片模型、缓存、图片专用账号禁用列表和最近图片日志。
 
@@ -483,7 +489,7 @@ JSON 请求体：
 }
 ```
 
-> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 Codex 探测头），频繁请求可能被风控盯上。
+> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 ChatGPT `wham/usage`），频繁请求可能被风控盯上。
 
 > `apiKeys.*.allowImages` **默认关闭** —— 新建或历史 API Key 不会自动获得图片生成 / 编辑能力，必须在 TG「🔑 管理 API Key」里显式开启。
 

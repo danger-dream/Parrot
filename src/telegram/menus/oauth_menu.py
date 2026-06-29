@@ -585,6 +585,112 @@ def _usage_toggle_target_label() -> str:
     return _usage_display_label(target)
 
 
+def _reset_credit_dt(iso_str: str | None) -> datetime | None:
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _reset_credit_time_bjt(iso_str: str | None) -> str:
+    dt = _reset_credit_dt(iso_str)
+    if dt is None:
+        return "?"
+    return dt.astimezone(_BJT).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _reset_credit_status_order(card: dict) -> tuple[int, float, int]:
+    status = str(card.get("status") or "").lower()
+    status_rank = 0 if status == "available" else 1
+    expires = _reset_credit_dt(card.get("expires_at"))
+    ts = expires.timestamp() if expires else float("inf")
+    try:
+        index = int(card.get("index") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    return status_rank, ts, index
+
+
+def _codex_reset_credits_text_and_kb(result: dict) -> tuple[str, dict]:
+    cards = result.get("credits") if isinstance(result, dict) else []
+    if not isinstance(cards, list):
+        cards = []
+    cards = [c for c in cards if isinstance(c, dict)]
+    cards.sort(key=_reset_credit_status_order)
+
+    try:
+        available = int(result.get("available_count"))
+    except (TypeError, ValueError, AttributeError):
+        available = sum(1 for c in cards if str(c.get("status") or "").lower() == "available")
+    try:
+        total_earned = int(result.get("total_earned_count"))
+    except (TypeError, ValueError, AttributeError):
+        total_earned = len(cards)
+
+    lines = [
+        "♻️ <b>本机 Codex 免费重置卡</b>",
+        "",
+        f"可用次数: <code>{available}</code> · 已发放: <code>{total_earned}</code>",
+        "时间已从 UTC 转为北京时间（UTC+8）。",
+    ]
+    if not cards:
+        lines += ["", "暂无重置卡。"]
+    else:
+        lines += ["", "<b>重置卡明细</b>"]
+        for idx, card in enumerate(cards, start=1):
+            lines.append(f"{idx}. 发放时间: <code>{_reset_credit_time_bjt(card.get('granted_at'))}</code>")
+            lines.append(f"   过期时间: <code>{_reset_credit_time_bjt(card.get('expires_at'))}</code>")
+
+    rows = [
+        [ui.btn("🔄 刷新", "oa:codex_reset_credits")],
+        [ui.btn("◀ 返回账户设置", "oa:settings"), ui.btn("◀ 返回OAuth账户", "menu:oauth")],
+    ]
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def _local_codex_reset_credit_error_html(exc) -> str:
+    if isinstance(exc, FileNotFoundError):
+        return (
+            "❌ <b>未找到本机 Codex 凭证</b>\n"
+            "• 路径：<code>~/.codex/auth.json</code>\n"
+            "• 处理：先在运行 Parrot 的这台机器完成 Codex 登录，再回来刷新。"
+        )
+    if isinstance(exc, ValueError) and "tokens.access_token" in str(exc):
+        return (
+            "❌ <b>Codex 凭证格式不完整</b>\n"
+            "• 原因：<code>~/.codex/auth.json</code> 缺少 <code>tokens.access_token</code>。\n"
+            "• 处理：重新登录 Codex 后重试。"
+        )
+    return _oauth_error_html(exc, provider="openai", operation="rate_limit_reset_credits")
+
+
+def on_local_codex_reset_credits(chat_id: int, message_id: int, cb_id: str | None = None) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id, "查询本机 Codex 重置卡...")
+    try:
+        result = openai_provider.fetch_local_codex_rate_limit_reset_credits_sync()
+    except Exception as exc:
+        text = _local_codex_reset_credit_error_html(exc)
+        if message_id:
+            ui.edit(
+                chat_id, message_id, text,
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回账户设置", "oa:settings")]]),
+            )
+        else:
+            ui.send(chat_id, text)
+        return
+    text, kb = _codex_reset_credits_text_and_kb(result)
+    if message_id:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    else:
+        ui.send(chat_id, text, reply_markup=kb)
+
+
 def _settings_text_and_kb() -> tuple[str, dict]:
     anthropic_models = _default_models_for_settings("anthropic")
     openai_models = _default_models_for_settings("openai")
@@ -624,6 +730,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
          ui.btn("✏ 修改OpenAI模型", "odm:edit:openai")],
         [ui.btn("🖼 图片生成设置", "img:show"),
          ui.btn("📈 配额监控", "oa:quota")],
+        [ui.btn("♻️ 本机Codex重置卡", "oa:codex_reset_credits")],
         [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
          ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
         [ui.btn("🏠 返回主菜单", "menu:main"),
@@ -3083,6 +3190,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data == "oa:quota":
         on_quota_menu(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:codex_reset_credits":
+        on_local_codex_reset_credits(chat_id, message_id, cb_id)
         return True
     if data == "oa:quota_toggle":
         on_quota_toggle(chat_id, message_id, cb_id)

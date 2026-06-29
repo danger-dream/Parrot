@@ -187,6 +187,18 @@ def describe_oauth_error(
                 operation=op,
                 technical=technical,
             )
+        if op == "rate_limit_reset_credits" and status == 401:
+            return OAuthDisplayError(
+                code="openai_codex_reset_credits_401",
+                title="Codex 凭证无效或未带 Authorization",
+                reason="本机 Codex 凭证里的 tokens.access_token 可能已失效，或请求没有正确携带 Authorization header。",
+                action="在本机重新执行 Codex 登录后重试，并确认 ~/.codex/auth.json 存在 tokens.access_token。",
+                auth_error=True,
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
         if status == 403:
             return OAuthDisplayError(
                 code="openai_permission_403",

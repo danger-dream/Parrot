@@ -433,6 +433,46 @@ def test_settings_cch_and_quota_monitor_controls(m):
     print("  [PASS] OAuth settings CCH toggle + quota monitor submenu")
 
 
+def test_settings_codex_reset_credits_button_and_render(m):
+    _setup(m)
+    rec = _install_recorder(m)
+    om = m["oauth_menu"]
+
+    om.on_settings(42, 100, "cb")
+    settings = rec.last("editMessageText")
+    assert settings and "本机Codex重置卡" in repr(settings["reply_markup"])
+    flat = [
+        b["callback_data"]
+        for row in settings["reply_markup"]["inline_keyboard"]
+        for b in row if "callback_data" in b
+    ]
+    assert "oa:codex_reset_credits" in flat
+
+    orig_fetch = om.openai_provider.fetch_local_codex_rate_limit_reset_credits_sync
+    try:
+        om.openai_provider.fetch_local_codex_rate_limit_reset_credits_sync = lambda: {
+            "available_count": 1,
+            "total_earned_count": 1,
+            "credits": [{
+                "status": "available",
+                "granted_at": "2026-06-12T01:33:14Z",
+                "expires_at": "2026-07-12T01:33:14Z",
+            }],
+        }
+        rec.clear()
+        assert om.handle_callback(42, 100, "cb", "oa:codex_reset_credits") is True
+    finally:
+        om.openai_provider.fetch_local_codex_rate_limit_reset_credits_sync = orig_fetch
+
+    rendered = rec.last("editMessageText")
+    assert rendered and "本机 Codex 免费重置卡" in rendered["text"]
+    assert "可用次数: <code>1</code>" in rendered["text"]
+    assert "发放时间: <code>2026-06-12 09:33:14</code>" in rendered["text"]
+    assert "过期时间: <code>2026-07-12 09:33:14</code>" in rendered["text"]
+    assert "RateLimitResetCredit" not in rendered["text"]
+    print("  [PASS] settings exposes local Codex reset credits and renders BJT times without IDs")
+
+
 def test_refresh_token_updates_access_and_usage(m):
     _setup(m)
     _add_fake_account(m, "bob@x.com")
@@ -1025,6 +1065,7 @@ def main():
         test_view_detail_with_quota_cache,
         test_settings_usage_display_mode_toggle,
         test_settings_cch_and_quota_monitor_controls,
+        test_settings_codex_reset_credits_button_and_render,
         test_refresh_token_updates_access_and_usage,
         test_refresh_usage_only,
         test_toggle_disable_then_enable,
