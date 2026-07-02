@@ -47,7 +47,7 @@ def _fresh_updater():
         "repo": "danger-dream/Parrot",
         "serviceName": "parrot.service",
         "composeDir": _tmpdir,
-        "composeService": "anthropic-proxy",
+        "composeService": "parrot",
         "containerName": "parrot",
         "image": "ghcr.io/danger-dream/parrot:latest",
         "keepBackups": 5,
@@ -97,7 +97,7 @@ class TestCfg:
         config.update(lambda c: c.__setitem__("updateChecker", {}))
         cfg = updater._cfg()
         assert cfg["repo"] == "danger-dream/Parrot"
-        assert cfg["composeService"] == "anthropic-proxy"
+        assert cfg["composeService"] == "parrot"
         assert cfg["containerName"] == "parrot"
         assert cfg["keepBackups"] == 5
         assert cfg["healthTimeoutSeconds"] == 90

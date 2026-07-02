@@ -111,7 +111,7 @@ def _cfg() -> dict:
         "repo": str(uc.get("repo") or "danger-dream/Parrot").strip(),
         "serviceName": str(uc.get("serviceName") or "parrot.service").strip(),
         "composeDir": str(uc.get("composeDir") or "").strip(),
-        "composeService": str(uc.get("composeService") or "anthropic-proxy").strip(),
+        "composeService": str(uc.get("composeService") or "parrot").strip(),
         "containerName": str(uc.get("containerName") or "parrot").strip(),
         "image": str(uc.get("image") or "ghcr.io/danger-dream/parrot:latest").strip(),
         "keepBackups": int(uc.get("keepBackups", 5) or 5),
