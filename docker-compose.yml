@@ -6,7 +6,7 @@
 # - 端口 22122 直接暴露给宿主机；如需 127.0.0.1 only，把 ports 改成 "127.0.0.1:22122:22122"。
 
 services:
-  anthropic-proxy:
+  parrot:
     image: ghcr.io/danger-dream/parrot:latest
     container_name: parrot
     restart: unless-stopped

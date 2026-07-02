@@ -47,7 +47,7 @@ def _fresh_updater():
         "repo": "danger-dream/Parrot",
         "serviceName": "parrot.service",
         "composeDir": _tmpdir,
-        "composeService": "anthropic-proxy",
+        "composeService": "parrot",
         "containerName": "parrot",
         "image": "ghcr.io/danger-dream/parrot:latest",
         "keepBackups": 5,
@@ -97,7 +97,7 @@ class TestCfg:
         config.update(lambda c: c.__setitem__("updateChecker", {}))
         cfg = updater._cfg()
         assert cfg["repo"] == "danger-dream/Parrot"
-        assert cfg["composeService"] == "anthropic-proxy"
+        assert cfg["composeService"] == "parrot"
         assert cfg["containerName"] == "parrot"
         assert cfg["keepBackups"] == 5
         assert cfg["healthTimeoutSeconds"] == 90
@@ -277,6 +277,13 @@ class TestComposeUpInner:
         script = updater._compose_up_inner(backup_digest="sha256:deadbeef")
         # 校验 compose 合法
         assert "docker compose config" in script
+        # service 名预检必须在 rm 旧容器之前完成；配置失配时不能先停服务再 no such service
+        assert "docker compose config --services" in script
+        assert "resolve_service" in script
+        assert "com.docker.compose.service" in script
+        assert script.index("\nresolve_service\n") < script.index("# ③ stop+rm")
+        # 重建/回滚都使用解析后的 service，而不是把可能过期的配置值写死进 compose up
+        assert 'docker compose up -d --force-recreate "$SVC"' in script
         # 健康门控
         assert "wait_health" in script or "/health" in script
         # 失败回滚函数
