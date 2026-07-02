@@ -206,18 +206,83 @@ def _tool_choice_is_hosted_or_non_function(ingress_protocol: str, body: dict[str
     return typ not in (None, "auto", "none", "function", "custom", "allowed_tools")
 
 
+def _append_unique(labels: list[str], label: str) -> None:
+    if label not in labels:
+        labels.append(label)
+
+
+def _responses_tool_type_label(tool_type: Any, *, prefix: str = "") -> str | None:
+    if tool_type in (None, "function", "custom"):
+        return None
+    return f"{prefix}{tool_type}"
+
+
+def _responses_tool_labels_from_tool_list(tools: Any, *, prefix: str = "") -> tuple[str, ...]:
+    if not isinstance(tools, list):
+        return ()
+    labels: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        label = _responses_tool_type_label(tool.get("type"), prefix=prefix)
+        if label:
+            _append_unique(labels, str(label))
+    return tuple(labels)
+
+
+def _responses_native_input_labels(body: dict[str, Any]) -> tuple[str, ...]:
+    # Codex uses `tool_search_call` / `tool_search_output` history items for
+    # client-executed tool discovery.  `tool_search_output.tools[]` can carry
+    # namespace specs that the model may call in later turns, so the input
+    # history can require both native states even when the current top-level
+    # tools list is empty.
+    labels: list[str] = []
+    for item in _responses_input_like_items(body):
+        if not isinstance(item, dict):
+            continue
+        typ = item.get("type")
+        if typ in ("tool_search_call", "tool_search_output"):
+            _append_unique(labels, "tool_search")
+            if typ == "tool_search_output":
+                for label in _responses_tool_labels_from_tool_list(item.get("tools")):
+                    _append_unique(labels, label)
+        if typ in ("function_call", "custom_tool_call") and item.get("namespace"):
+            _append_unique(labels, "namespace")
+    return tuple(labels)
+
+
 def _hosted_tool_labels(ingress_protocol: str, body: dict[str, Any]) -> tuple[str, ...]:
     # For Responses, Codex OAuth supports native passthrough tool states such
     # as `tool_search` and `namespace`, but not generic hosted tools such as
-    # web_search or file_search.  Keep scanning after native-passthrough labels
-    # so mixed tool lists still surface unsupported hosted tools, and retain
-    # every required native-passthrough label so capability checks do not let a
-    # provider that supports only one passthrough type satisfy another.
-    passthrough_labels: list[str] = []
+    # web_search or file_search.  Scan the full request and retain every hosted
+    # / native-passthrough requirement so a provider's broad `hosted_tools`
+    # capability cannot mask a missing Codex-native `namespace`/`tool_search`,
+    # and vice versa.
+    if ingress_protocol == "responses":
+        labels: list[str] = []
+        if body.get("container") is not None:
+            _append_unique(labels, "container")
+        if body.get("mcp_servers") is not None:
+            _append_unique(labels, "mcp_servers")
+        for label in _responses_tool_labels_from_tool_list(body.get("tools") or []):
+            _append_unique(labels, label)
 
-    def remember_passthrough(label: str) -> None:
-        if label not in passthrough_labels:
-            passthrough_labels.append(label)
+        choice = body.get("tool_choice")
+        if isinstance(choice, dict):
+            typ = choice.get("type")
+            if typ == "allowed_tools":
+                for label in _responses_tool_labels_from_tool_list(
+                    choice.get("tools"), prefix="tool_choice:allowed_tools:",
+                ):
+                    _append_unique(labels, label)
+            elif typ in _RESPONSES_NON_CHAT_TOOL_CHOICE_TYPES:
+                _append_unique(labels, f"tool_choice:{typ}")
+            elif typ not in (None, "auto", "none", "function", "custom"):
+                _append_unique(labels, f"tool_choice:{typ}")
+
+        for label in _responses_native_input_labels(body):
+            _append_unique(labels, label)
+        return tuple(labels)
 
     if body.get("container") is not None:
         return ("container",)
@@ -235,12 +300,6 @@ def _hosted_tool_labels(ingress_protocol: str, body: dict[str, Any]) -> tuple[st
                 return (str(typ),)
             if ingress_protocol == "chat" and typ not in (None, "function"):
                 return (str(typ),)
-            if ingress_protocol == "responses" and typ not in (None, "function", "custom"):
-                label = str(typ)
-                if label in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
-                    remember_passthrough(label)
-                    continue
-                return (label,)
     choice = body.get("tool_choice")
     if isinstance(choice, dict):
         typ = choice.get("type")
@@ -260,31 +319,7 @@ def _hosted_tool_labels(ingress_protocol: str, body: dict[str, Any]) -> tuple[st
                         return (f"tool_choice:allowed_tools:{nested_typ}",)
                 return ()
             return (f"tool_choice:{typ}",)
-        if ingress_protocol == "responses":
-            if typ in _RESPONSES_NON_CHAT_TOOL_CHOICE_TYPES:
-                return (f"tool_choice:{typ}",)
-            if typ == "allowed_tools":
-                tools = choice.get("tools")
-                if isinstance(tools, list):
-                    for tool in tools:
-                        if not isinstance(tool, dict):
-                            continue
-                        nested_typ = tool.get("type")
-                        if nested_typ not in (None, "function", "custom"):
-                            label = f"tool_choice:allowed_tools:{nested_typ}"
-                            if nested_typ in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
-                                remember_passthrough(label)
-                                continue
-                            return (label,)
-                return tuple(passthrough_labels)
-            if typ not in (None, "auto", "none", "function", "custom"):
-                label = f"tool_choice:{typ}"
-                if typ in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
-                    remember_passthrough(label)
-                else:
-                    return (label,)
-    return tuple(passthrough_labels)
-
+    return ()
 
 def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | None:
     labels = _hosted_tool_labels(ingress_protocol, body)

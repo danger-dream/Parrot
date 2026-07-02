@@ -282,12 +282,12 @@ def test_responses_codex_oauth_still_rejects_other_hosted_tools(monkeypatch):
     }
     available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
 
-    assert [ch.key for ch, _ in available] == ["api-r"]
+    assert available == []
     assert saturated == []
-    assert ("oauth-r", "real") not in plans
-    assert plans[("api-r", "real")].cost == 0
+    assert plans == {}
     assert guards == [
         "OpenAI Responses native route does not support requested server-side state: web_search",
+        "OpenAI Responses native route does not support requested server-side state: tool_search",
     ]
 
 

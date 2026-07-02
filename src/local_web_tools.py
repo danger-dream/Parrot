@@ -47,9 +47,9 @@ OPENAI_WEB_SEARCH_TOOL_TYPES = frozenset({
     "web_search_preview_2025_03_11",
 })
 # These are Codex/Responses built-ins that are not safe to forward to arbitrary
-# OpenAI-compatible or cross-family providers.  CLIProxyAPI's xAI executor drops
-# the same pair instead of letting unsupported upstreams 400.
-OPENAI_DROP_TOOL_TYPES = frozenset({"tool_search", "image_generation"})
+# OpenAI-compatible or cross-family providers.  tool_search is deliberately not
+# listed here because Codex handles it as a native client-executed tool.
+OPENAI_DROP_TOOL_TYPES = frozenset({"image_generation"})
 OPENAI_LOCAL_WEB_MARKER = "_parrot_openai_local_web_tools"
 SUPPORTED_TOOL_NAMES = frozenset({"WebSearch", "WebFetch", "web_search", "web_fetch"})
 _URL_RE = re.compile(r"https?://[^\s)\]>}\"']+")
@@ -312,9 +312,9 @@ def prepare_openai_responses_local_web_tools(body: dict[str, Any] | None) -> boo
     * ``web_search`` (and legacy preview aliases) becomes a normal function tool
       named ``web_search`` so any upstream model can request it; Parrot then runs
       AnySearch and appends ``function_call_output`` items.
-    * ``tool_search`` and ``image_generation`` are dropped à la CLIProxyAPI's xAI
-      normalizer: they are not safe to forward to arbitrary upstreams and are not
-      web search.
+    * ``tool_search`` is preserved for Codex-native routing. ``image_generation``
+      is still dropped à la CLIProxyAPI's xAI normalizer: it is not web search
+      and is not safe to forward to arbitrary upstreams.
 
     Returns True when a web_search tool was converted and a local web loop should
     be active for the request.

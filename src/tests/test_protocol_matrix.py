@@ -260,8 +260,8 @@ def test_matrix_rejects_mixed_codex_namespace_and_unsupported_hosted_tool():
     }
     features = extract_request_features("responses", body)
 
-    assert features.hosted_tool_label == "web_search_preview"
-    assert features.hosted_tool_labels == ("web_search_preview",)
+    assert features.hosted_tool_label == "namespace"
+    assert features.hosted_tool_labels == ("namespace", "web_search_preview")
 
     with pytest.raises(ProtocolGuardError) as exc:
         DEFAULT_MATRIX.plan(
@@ -269,6 +269,113 @@ def test_matrix_rejects_mixed_codex_namespace_and_unsupported_hosted_tool():
             capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"namespace"})),
         )
     assert "web_search_preview" in exc.value.reason
+
+
+def test_matrix_rejects_mixed_codex_namespace_and_hosted_tool_for_hosted_only_provider():
+    from src.protocols.matrix import extract_request_features
+
+    for tools in (
+        [
+            {"type": "namespace", "name": "codex_app", "tools": []},
+            {"type": "file_search"},
+        ],
+        [
+            {"type": "file_search"},
+            {"type": "namespace", "name": "codex_app", "tools": []},
+        ],
+    ):
+        features = extract_request_features("responses", {"input": "hi", "tools": tools})
+
+        assert set(features.hosted_tool_labels) == {"namespace", "file_search"}
+
+        with pytest.raises(ProtocolGuardError) as api_exc:
+            DEFAULT_MATRIX.plan(
+                "responses", "openai-responses", features=features,
+                capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"hosted_tools"})),
+            )
+        assert "namespace" in api_exc.value.reason
+
+        with pytest.raises(ProtocolGuardError) as codex_exc:
+            DEFAULT_MATRIX.plan(
+                "responses", "openai-responses", features=features,
+                capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"namespace"})),
+            )
+        assert "file_search" in codex_exc.value.reason
+
+
+def test_matrix_detects_codex_tool_search_and_namespace_from_input_history():
+    from src.protocols.matrix import extract_request_features
+
+    body = {
+        "input": [
+            {
+                "type": "tool_search_call",
+                "call_id": "search_1",
+                "execution": "client",
+                "arguments": {"query": "calendar"},
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "search_1",
+                "status": "completed",
+                "execution": "client",
+                "tools": [
+                    {"type": "namespace", "name": "codex_app", "tools": []},
+                ],
+            },
+        ],
+    }
+    features = extract_request_features("responses", body)
+
+    assert features.hosted_tool_labels == ("tool_search", "namespace")
+
+    with pytest.raises(ProtocolGuardError) as hosted_exc:
+        DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features,
+            capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"hosted_tools"})),
+        )
+    assert "tool_search" in hosted_exc.value.reason
+
+    with pytest.raises(ProtocolGuardError) as namespace_exc:
+        DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features,
+            capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"tool_search"})),
+        )
+    assert "namespace" in namespace_exc.value.reason
+
+    assert DEFAULT_MATRIX.plan(
+        "responses", "openai-responses", features=features,
+        capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"tool_search", "namespace"})),
+    ).cost == 0
+
+
+def test_matrix_detects_namespace_from_namespaced_response_call_history():
+    from src.protocols.matrix import extract_request_features
+
+    for item_type in ("function_call", "custom_tool_call"):
+        body = {
+            "input": [
+                {
+                    "type": item_type,
+                    "call_id": "call_1",
+                    "name": "update",
+                    "namespace": "codex_app",
+                    "arguments" if item_type == "function_call" else "input": "{}",
+                }
+            ],
+        }
+        features = extract_request_features("responses", body)
+
+        assert features.hosted_tool_labels == ("namespace",)
+        with pytest.raises(ProtocolGuardError):
+            DEFAULT_MATRIX.plan(
+                "responses", "openai-responses", features=features,
+                capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"hosted_tools"})),
+            )
+        assert DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features,
+            capabilities=ChannelCapabilities(protocol="openai-responses", native_state=frozenset({"namespace"})),
+        ).cost == 0
 
 
 def test_matrix_allows_codex_namespace_allowed_tools_choice_when_native():

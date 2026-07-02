@@ -391,12 +391,12 @@ def test_prepare_openai_responses_local_web_tools_converts_web_search_and_drops_
     assert body["tools"][0]["type"] == "function"
     assert body["tools"][0]["name"] == "web_search"
     assert body["tools"][0]["parameters"]["required"] == ["query"]
-    assert [t.get("type") for t in body["tools"]] == ["function", "function"]
-    assert [t.get("name") for t in body["tools"]] == ["web_search", "lookup"]
+    assert [t.get("type") for t in body["tools"]] == ["function", "tool_search", "function"]
+    assert [t.get("name") for t in body["tools"]] == ["web_search", None, "lookup"]
     assert body["tool_choice"] == {"type": "function", "name": "web_search"}
 
 
-def test_prepare_openai_responses_drops_tool_search_and_image_generation_without_marker():
+def test_prepare_openai_responses_preserves_tool_search_and_drops_image_generation_without_marker():
     body = {
         "model": "m",
         "input": "hi",
@@ -407,9 +407,9 @@ def test_prepare_openai_responses_drops_tool_search_and_image_generation_without
 
     assert local_web_tools.prepare_openai_responses_local_web_tools(body) is False
 
-    assert "tools" not in body
-    assert "tool_choice" not in body
-    assert "parallel_tool_calls" not in body
+    assert body["tools"] == [{"type": "tool_search"}]
+    assert body["tool_choice"] == {"type": "tool_search"}
+    assert body["parallel_tool_calls"] is True
     assert local_web_tools.OPENAI_LOCAL_WEB_MARKER not in body
 
 
