@@ -45,3 +45,6 @@ bak/
 backups/
 .update_log
 .update_result
+
+# Local debug/probe outputs
+_debug/

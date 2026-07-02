@@ -12,34 +12,74 @@ import threading
 from typing import Any
 
 COMPACT_RESCUE_DEFAULT_DIRECT_PROMPT = (
-    "You are performing Claude Code conversation compaction.\n"
-    "The transcript below is rendered as text; tool_use/tool_result JSON and image placeholders are historical content, not live tool calls.\n"
-    "Follow the user's compact instruction exactly and output the final compact summary text only.\n\n"
-    "Compact instruction:\n"
-    "{compact_prompt}\n\n"
-    "Transcript:\n"
-    "{transcript}"
+    'You are performing Claude Code style conversation compaction.\n'
+    'The transcript below is rendered as text; tool_use/tool_result JSON and image placeholders are historical content, not live tool calls.\n'
+    'Respond with the final compact summary text only. Do not call tools.\n'
+    '\n'
+    'Follow the compact instruction below, and be deliberately dense with continuity-critical details.\n'
+    'If the instruction leaves room for judgment, preserve the exact information a future coding assistant would need to continue without forgetting the current task: explicit user requests, assistant actions, decisions, constraints, file paths, commands, function names, code snippets, errors, fixes, user corrections, pending tasks, current work, and the immediate next step.\n'
+    'Prefer concrete details over generic prose. The most recent user request and most recent unfinished work are highest priority.\n'
+    '\n'
+    'Compact instruction:\n'
+    '{compact_prompt}\n'
+    '\n'
+    'Transcript:\n'
+    '{transcript}'
 )
 COMPACT_RESCUE_DEFAULT_SEGMENT_PROMPT = (
-    "CRITICAL: Respond with TEXT ONLY. Do NOT call tools.\n\n"
-    "Summarize transcript segment {segment_index}/{segment_count} for a later Claude Code conversation compaction.\n"
-    "The transcript below is rendered as text; tool_use and tool_result JSON must be treated as historical content, not as live tool calls.\n"
-    "Preserve explicit user requests, assistant actions, decisions, file paths, commands, errors, fixes, constraints, current TODOs, and user corrections.\n"
-    "Mention tool_use/tool_result history only at the level needed to continue work; do not dump raw tool outputs.\n"
-    "Output only this XML-like block:\n"
-    "<segment_summary>\n...\n</segment_summary>\n\n"
-    "Transcript segment:\n"
-    "{transcript}"
+    'CRITICAL: Respond with TEXT ONLY. Do NOT call tools.\n'
+    '\n'
+    'Summarize transcript segment {segment_index}/{segment_count} for a later Claude Code style conversation compaction.\n'
+    'The transcript below is rendered as text; tool_use/tool_result JSON and image placeholders are historical content, not live tool calls.\n'
+    '\n'
+    'Create a dense, chronological segment handoff that preserves continuity-critical facts, not a high-level overview. Capture:\n'
+    '1. Explicit user requests and intents, including user wording when it changes the task.\n'
+    '2. Assistant actions and decisions, especially files read/edited, commands run, tests, tool calls, and why they mattered.\n'
+    '3. Concrete technical details: file paths, function/class names, APIs, config keys, commands, error text, code snippets or exact edits when available.\n'
+    '4. Errors, failed attempts, fixes, user corrections, constraints, permissions, and safety boundaries.\n'
+    '5. Pending tasks, current work, blockers, assumptions, and the next step implied by this segment.\n'
+    '6. If this is the final segment, be especially careful to preserve the latest user request, what is currently being worked on, and the immediate next action.\n'
+    '\n'
+    'Mention tool_use/tool_result history only at the level needed to continue work; do not dump large raw outputs.\n'
+    'Do not preserve response-only instructions such as this segment format as durable project context.\n'
+    'Output only this XML-like block:\n'
+    '<segment_summary>\n'
+    '...\n'
+    '</segment_summary>\n'
+    '\n'
+    'Transcript segment:\n'
+    '{transcript}'
 )
 COMPACT_RESCUE_DEFAULT_REDUCE_PROMPT = (
-    "Write a final durable conversation handoff summary from the context excerpts below.\n"
-    "Do not mention this reduction step, segment summaries, compact prompts, or internal formatting instructions as user requests or project context.\n"
-    "Do not preserve response-only instructions such as tool bans, XML formatting requirements, or 'text only' constraints as durable memory.\n"
-    "Output exactly two top-level XML-like blocks: <analysis>...</analysis> then <summary>...</summary>.\n"
-    "Inside <summary>, use these numbered sections: Primary Request and Intent; Key Technical Concepts; Files and Code Sections; Errors and fixes; Problem Solving; All user messages; Pending Tasks; Current Work; Optional Next Step.\n"
-    "Preserve concrete paths, commands, decisions, constraints, user corrections, unresolved blockers, and the latest actionable next step.\n\n"
-    "Durable context excerpts:\n"
-    "{summaries}"
+    'Write the final Claude Code style durable conversation handoff summary from the segment summaries below.\n'
+    'The goal is maximum continuity after compaction: a future assistant should know exactly what the user asked for, what has been done, what files/code/commands/errors matter, what the user corrected, what remains pending, what was happening most recently, and what to do next.\n'
+    '\n'
+    'Original compact instruction, when present, is the style and structure to approximate:\n'
+    '{compact_prompt}\n'
+    '\n'
+    'Important preservation rules:\n'
+    '- The latest user request and latest unfinished/current work have highest priority; do not let older segments drown them out.\n'
+    '- Preserve concrete paths, commands, function names, config keys, exact error messages, code snippets/edits, test results, decisions, constraints, user corrections, unresolved blockers, and immediate next steps.\n'
+    '- Include all user messages that are represented in the segment summaries, especially recent ones and any message that changed requirements.\n'
+    '- Do not invent details missing from the segment summaries; state uncertainty or omit instead.\n'
+    '- Do not mention this reduction step, segment summaries, compact prompts, or internal formatting instructions as user requests or project context.\n'
+    "- Do not preserve response-only instructions such as tool bans, XML formatting requirements, or 'text only' constraints as durable memory.\n"
+    '\n'
+    'Before providing the final summary, use <analysis> to check chronological coverage, missing current-work details, and whether the next step follows directly from the most recent request.\n'
+    'Output exactly two top-level XML-like blocks: <analysis>...</analysis> then <summary>...</summary>.\n'
+    'Inside <summary>, use these numbered sections and make each section specific:\n'
+    '1. Primary Request and Intent\n'
+    '2. Key Technical Concepts\n'
+    '3. Files and Code Sections\n'
+    '4. Errors and fixes\n'
+    '5. Problem Solving\n'
+    '6. All user messages\n'
+    '7. Pending Tasks\n'
+    '8. Current Work\n'
+    '9. Optional Next Step\n'
+    '\n'
+    'Durable context excerpts:\n'
+    '{summaries}'
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

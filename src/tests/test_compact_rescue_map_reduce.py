@@ -38,6 +38,8 @@ def test_compact_rescue_default_knobs_match_current_hardcoded_behavior():
     reduce_text = reduce_body["messages"][0]["content"][0]["text"]
     assert "Output exactly two top-level XML-like blocks" in reduce_text
     assert "Primary Request and Intent" in reduce_text
+    assert "latest user request and latest unfinished/current work have highest priority" in reduce_text
+    assert _compact_prompt() in reduce_text
 
 
 def test_compact_rescue_custom_config_overrides_prompts_and_knobs(monkeypatch):
@@ -134,6 +136,8 @@ def test_map_reduce_bodies_strip_top_controls_and_preserve_segment_messages():
     rendered = json.dumps(reduce_body, ensure_ascii=False)
     assert "Segment 1" in rendered
     assert "Segment 2" in rendered
-    assert "CRITICAL: Respond with TEXT ONLY" not in rendered
-    assert "Do NOT call any tools" not in rendered
-    assert "compact prompt" in rendered
+    # The final reducer now receives the original compact instruction as a
+    # style/structure reference while still treating it as non-durable context.
+    assert "Original compact instruction" in rendered
+    assert "CRITICAL: Respond with TEXT ONLY" in rendered
+    assert "latest user request and latest unfinished/current work have highest priority" in rendered
