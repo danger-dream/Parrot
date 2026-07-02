@@ -683,6 +683,7 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
 LOG="{log}"
 : > "$LOG" 2>/dev/null || true
 logln() {{ echo "[$(date -u +%H:%M:%S)] $*" >> "$LOG" 2>/dev/null || true; }}
+SVC="{svc}"
 health_ok() {{ {health_cmd} >/dev/null 2>&1; }}
 wait_health() {{
   ok=0
@@ -691,6 +692,45 @@ wait_health() {{
     if health_ok; then ok=1; break; fi
   done
   return $([ "$ok" = "1" ] && echo 0 || echo 1)
+}}
+service_exists() {{
+  printf '%s\n' "$SERVICES" | grep -Fx -- "$1" >/dev/null 2>&1
+}}
+resolve_service() {{
+  SERVICES="$(docker compose config --services 2>&1)"
+  SERVICES_RC=$?
+  if [ $SERVICES_RC -ne 0 ]; then
+    logln "❌ compose 服务列表读取失败："
+    echo "$SERVICES" | head -20 >> "$LOG" 2>/dev/null || true
+    echo "ROLLBACK" > {flag_dir}/.update_result 2>/dev/null || true
+    exit 1
+  fi
+  if [ -n "$SVC" ] && service_exists "$SVC"; then
+    return 0
+  fi
+  OLD_SVC="$SVC"
+  LABEL_SVC="$(docker inspect -f '{{{{ index .Config.Labels "com.docker.compose.service" }}}}' {name} 2>/dev/null || true)"
+  if [ -n "$LABEL_SVC" ] && [ "$LABEL_SVC" != "<no value>" ] && service_exists "$LABEL_SVC"; then
+    SVC="$LABEL_SVC"
+    logln "⚠️ composeService=$OLD_SVC 不存在，自动使用当前容器的 compose service：$SVC"
+    return 0
+  fi
+  for candidate in "{name}" "parrot" "anthropic-proxy"; do
+    if [ -n "$candidate" ] && service_exists "$candidate"; then
+      SVC="$candidate"
+      logln "⚠️ composeService=$OLD_SVC 不存在，自动使用检测到的服务：$SVC"
+      return 0
+    fi
+  done
+  SERVICE_COUNT="$(printf '%s\n' "$SERVICES" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+  if [ "$SERVICE_COUNT" = "1" ]; then
+    SVC="$(printf '%s\n' "$SERVICES" | sed '/^[[:space:]]*$/d' | head -1)"
+    logln "⚠️ composeService=$OLD_SVC 不存在，自动使用唯一 compose 服务：$SVC"
+    return 0
+  fi
+  logln "❌ composeService=$OLD_SVC 不存在，且无法自动判断。可用服务：$(printf '%s' "$SERVICES" | tr '\n' ' ')"
+  echo "ROLLBACK" > {flag_dir}/.update_result 2>/dev/null || true
+  exit 1
 }}
 
 fail_rollback() {{
@@ -702,7 +742,7 @@ fail_rollback() {{
     logln "⚠️ 无备份 digest，无法回滚镜像"
   fi
   docker rm -f {name} 2>/dev/null || true
-  RB_OUT="$(docker compose up -d --force-recreate {svc} 2>&1)"
+  RB_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
   echo "$RB_OUT" | tail -10 >> "$LOG" 2>/dev/null || true
   logln "回滚重建完成，验证健康…"
   if wait_health; then
@@ -715,7 +755,7 @@ fail_rollback() {{
 }}
 
 sleep 1
-logln "开始重建：service={svc} container={name} image={image}"
+logln "开始重建：service=$SVC container={name} image={image}"
 # ① 校验 compose 合法；不合法 → 完全不动旧容器
 CFG_ERR="$(docker compose config 2>&1 >/dev/null)"
 if [ $? -ne 0 ]; then
@@ -725,10 +765,14 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 logln "✅ compose 校验通过（备份 digest={backup_digest}）"
+# ② 先确认目标 service 存在；配置错时尽量按 container_name / 常见服务名 / 唯一服务自动修正。
+#    这一步必须在 rm 旧容器前完成，避免 service 名失配时先停服务再报 no such service。
+resolve_service
+logln "使用 compose service=$SVC"
 # ③ stop+rm 旧容器（镜像 digest 已备份，可回滚），compose up 新容器
 docker rm -f {name} 2>/dev/null || true
 logln "启动新容器…"
-UP_OUT="$(docker compose up -d --force-recreate {svc} 2>&1)"
+UP_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
 UP_RC=$?
 echo "$UP_OUT" | tail -20 >> "$LOG" 2>/dev/null || true
 if [ $UP_RC -ne 0 ]; then logln "❌ compose up 失败（rc=$UP_RC）"; fail_rollback; fi
