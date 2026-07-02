@@ -32,7 +32,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
-    affinity, auth, blacklist, concurrency, config, cooldown, fingerprint, local_web_tools,
+    affinity, apikey_limiter, auth, blacklist, concurrency, config, cooldown, fingerprint, local_web_tools,
     log_db, model_mapping, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest
@@ -384,6 +384,17 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await websocket.close(code=code, reason=_trim_reason(msg))
         return
 
+    try:
+        key_lease = await apikey_limiter.acquire(key_name or "", None)
+    except apikey_limiter.ApiKeyLimitError as exc:
+        await asyncio.to_thread(
+            log_db.finish_error, request_id, exc.message, 0,
+            http_status=429, affinity_hit=(1 if result.affinity_hit else 0),
+            total_ms=int((time.time() - start_time) * 1000),
+        )
+        await websocket.close(code=4429, reason=_trim_reason(exc.message))
+        return
+
     ts = time.strftime("%H:%M:%S", time.localtime(start_time))
     first_list = result.candidates or result.saturated
     chosen = first_list[0][0].key if first_list else "?"
@@ -397,25 +408,28 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     _sync_translated_body_to_ws_create(first_obj, body)
 
     try:
-        accepted = await _run_ws_failover(
-            websocket, first_obj=first_obj,
-            schedule_result=result, body=body, request_id=request_id,
-            api_key_name=key_name or "", client_ip=client_ip,
-            start_time=start_time, fp_query=fp_query,
-        )
-    except Exception as exc:
-        traceback.print_exc()
-        total_ms = int((time.time() - start_time) * 1000)
-        await asyncio.to_thread(
-            log_db.finish_error, request_id, f"unexpected: {exc}", 0,
-            http_status=500, total_ms=total_ms,
-            affinity_hit=(1 if result.affinity_hit else 0),
-        )
-        if not accepted and websocket.application_state != WebSocketState.DISCONNECTED:
-            try:
-                await websocket.close(code=4500, reason=_trim_reason(f"internal: {exc}"))
-            except Exception:
-                pass
+        try:
+            accepted = await _run_ws_failover(
+                websocket, first_obj=first_obj,
+                schedule_result=result, body=body, request_id=request_id,
+                api_key_name=key_name or "", client_ip=client_ip,
+                start_time=start_time, fp_query=fp_query,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            total_ms = int((time.time() - start_time) * 1000)
+            await asyncio.to_thread(
+                log_db.finish_error, request_id, f"unexpected: {exc}", 0,
+                http_status=500, total_ms=total_ms,
+                affinity_hit=(1 if result.affinity_hit else 0),
+            )
+            if not accepted and websocket.application_state != WebSocketState.DISCONNECTED:
+                try:
+                    await websocket.close(code=4500, reason=_trim_reason(f"internal: {exc}"))
+                except Exception:
+                    pass
+    finally:
+        await key_lease.release()
 
 
 async def _run_ws_failover(

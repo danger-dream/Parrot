@@ -6,8 +6,22 @@
   "apiKeys": {
     "my-downstream-key": {
       "key": "sk-REPLACE-ME-with-any-string-downstream-clients-send-as-auth",
-      "allowedModels": []
+      "allowedModels": [],
+      "enabled": true,
+      "allowImages": false,
+      "limits": {
+        "enabled": null,
+        "maxConcurrent": null,
+        "maxQueue": null,
+        "queueWaitSeconds": null
+      }
     }
+  },
+  "apiKeyConcurrency": {
+    "enabled": true,
+    "defaultMaxConcurrent": 5,
+    "defaultMaxQueue": 50,
+    "defaultQueueWaitSeconds": 1800
   },
   "oauthAccounts": [],
   "channels": [

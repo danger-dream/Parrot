@@ -365,6 +365,8 @@ JSON 请求体：
 ### 🔑 API Key
 发送 `/keys` 管理下游代理 Key。列表直接显示完整 Key（单击即复制）；每个 Key 可设模型白名单（多选勾选）；删除二次确认。图片生成 / 编辑权限由 `allowImages` 单独控制，默认关闭，需要在 Key 详情页点击「🖼 允许图片接口」后才能调用 `/v1/images/generate` / `/v1/images/edit`。
 
+API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ 系统设置 → 🔑 API Key 限流」里设置，默认单 Key 5 并发、50 队列、最长等待 30 分钟；单个 Key 可在详情页「🚦 请求限流」覆盖 `enabled / maxConcurrent / maxQueue / queueWaitSeconds`，其中 `limits.enabled` 优先级高于全局开关。
+
 ### 🖼 图片生成
 从「🔐 管理 OAuth」列表底部进入，用于管理 Parrot 图片接口的运行参数与日志：
 - 功能开关、主模型 `mainModel`、图片工具模型 `toolModel`。
@@ -448,6 +450,7 @@ JSON 请求体：
     "dbPath": "image_logs.db"
   },
   "timeouts":      { "connect": 10, "firstByte": 30, "idle": 120, "total": 600 },
+  "apiKeyConcurrency": { "enabled": true, "defaultMaxConcurrent": 5, "defaultMaxQueue": 50, "defaultQueueWaitSeconds": 1800 },
   "concurrency":   { "enabled": true, "queueWaitSeconds": 30, "defaultMaxConcurrent": 0 },
   "errorWindows":  [1, 3, 5, 10, 15, 0],
   "oauthGraceCount": 3,

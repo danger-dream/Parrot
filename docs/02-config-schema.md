@@ -17,8 +17,24 @@
     "default": "ccp-d4aacba392d5b6a30cfb029049f02351b79414fee39e0efe",
     "custom": {
       "key": "sk-REPLACE_WITH_YOUR_CUSTOM_KEY",
-      "allowedModels": []
+      "enabled": true,                 // API Key 自身可用开关；缺失/null 默认为 true
+      "allowedModels": [],
+      "allowImages": false,
+      "limits": {                      // 单 Key 限流覆盖；字段缺失/null 继承 apiKeyConcurrency
+        "enabled": null,               // 优先级高于 apiKeyConcurrency.enabled
+        "maxConcurrent": null,         // 0 = 不限并发
+        "maxQueue": null,              // 0 = 不排队，满并发直接 429
+        "queueWaitSeconds": null       // 0 = 不等待，满并发直接 429
+      }
     }
+  },
+
+  // ─── 下游 API Key 级并发限制默认值 ───
+  "apiKeyConcurrency": {
+    "enabled": true,
+    "defaultMaxConcurrent": 5,
+    "defaultMaxQueue": 50,
+    "defaultQueueWaitSeconds": 1800
   },
 
   // ─── OAuth 账户列表 ───
@@ -197,6 +213,8 @@
 ```
 
 `apiKeys.<name>.key` 是下游客户端作为 Bearer / x-api-key 使用的密钥字符串。配置层不要求 `ccp-` 前缀，任意字符串都可；TG bot 自动生成时仍使用 `ccp-<48 hex>`，也可以在菜单里输入自定义 key。
+
+`apiKeys.<name>.enabled` 控制该 Key 是否可用，缺失或 `null` 时按 `true` 处理。`apiKeyConcurrency` 是 API Key 级限流默认值；`apiKeys.<name>.limits.enabled/maxConcurrent/maxQueue/queueWaitSeconds` 是单 Key 覆盖，其中 `limits.enabled` 优先级高于全局 `apiKeyConcurrency.enabled`。默认单 Key 5 并发、50 队列、最长等待 1800 秒；队列满、等待超时或客户端断开时请求会从队列移除并返回/结束。
 
 ## 2.2 字段语义详解
 

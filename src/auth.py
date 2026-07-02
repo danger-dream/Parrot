@@ -40,6 +40,8 @@ def validate(headers) -> tuple[Optional[str], list[str], Optional[str]]:
         if not key_value:
             continue
         if hmac.compare_digest(str(key_value), token):
+            if entry.get("enabled") is False:
+                return None, [], "API key is disabled"
             allowed = list(entry.get("allowedModels") or [])
             return name, allowed, None
 

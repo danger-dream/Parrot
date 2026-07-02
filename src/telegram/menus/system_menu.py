@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
-from ... import concurrency, config, load_balancing, network, network_monitor, state_db
+from ... import apikey_limiter, concurrency, config, load_balancing, network, network_monitor, state_db
 from ...channel import registry
 from .. import states, ui
 
@@ -71,11 +71,11 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("⛔ 错误阶梯", "sys:show:errwin")],
         [ui.btn("🎯 评分参数", "sys:show:scoring"),
          ui.btn("🔗 亲和参数", "sys:show:affinity")],
-        [ui.btn("⚖️ 负载均衡", "menu:loadbalancing"),
-         ui.btn("🔔 通知设置", "sys:show:notif")],
+        [ui.btn("🔔 通知设置", "sys:show:notif"),
+         ui.btn("📡 故障订阅", "menu:status_alert")],
         [ui.btn("🛡 首包黑名单", "sys:show:blacklist"),
-         ui.btn("⚡ 并发限制", "sys:show:concurrency")],
-        [ui.btn("📡 故障订阅", "menu:status_alert"),
+         ui.btn("⚡ 渠道并发", "sys:show:concurrency")],
+        [ui.btn("🔑 API Key 限流", "sys:show:aklim"),
          ui.btn("🌐 网络设置", "sys:show:network")],
         [ui.btn("🧬 WS模式", "sys:show:ws_mode"),
          ui.btn("🗣 翻译层", "tl:show")],
@@ -1484,6 +1484,13 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:edit:cc_queue_wait":      _edit_cc_queue_wait(chat_id, message_id, cb_id); return True
     if data == "sys:edit:cc_default_max":     _edit_cc_default_max(chat_id, message_id, cb_id); return True
 
+    # API Key 限流
+    if data == "sys:show:aklim":              _show_aklim(chat_id, message_id, cb_id); return True
+    if data == "sys:aklim_toggle":            _on_aklim_toggle(chat_id, message_id, cb_id); return True
+    if data == "sys:edit:aklim_max":          _edit_aklim(chat_id, message_id, cb_id, "max"); return True
+    if data == "sys:edit:aklim_queue":        _edit_aklim(chat_id, message_id, cb_id, "queue"); return True
+    if data == "sys:edit:aklim_wait":         _edit_aklim(chat_id, message_id, cb_id, "wait"); return True
+
     # WS 模式
     if data == "sys:show:ws_mode":            _show_ws_mode(chat_id, message_id, cb_id); return True
     if data == "sys:ws_mode:toggle":          _on_ws_mode_toggle(chat_id, message_id, cb_id); return True
@@ -1520,6 +1527,8 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         _on_cc_queue_wait_input(chat_id, text); return True
     if action == "sys_cc_default_max":
         _on_cc_default_max_input(chat_id, text); return True
+    if action.startswith("sys_aklim_"):
+        _on_aklim_input(chat_id, action, text); return True
     return False
 
 
@@ -1653,6 +1662,128 @@ def _on_cc_default_max_input(chat_id: int, text: str) -> None:
     states.pop_state(chat_id)
     label = "不限" if v == 0 else str(v)
     ui.send(chat_id, f"✅ 默认最大并发数已更新为 <code>{label}</code>")
+    send_new(chat_id)
+
+
+# ─── API Key 限流默认值 ───────────────────────────────────────────
+
+
+def _fmt_aklim_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _parse_aklim_duration(text: str) -> int:
+    raw = (text or "").strip().lower()
+    if not raw:
+        raise ValueError
+    mult = 1
+    if raw.endswith("s"):
+        raw = raw[:-1].strip(); mult = 1
+    elif raw.endswith("m"):
+        raw = raw[:-1].strip(); mult = 60
+    elif raw.endswith("h"):
+        raw = raw[:-1].strip(); mult = 3600
+    v = int(raw) * mult
+    if v < 0:
+        raise ValueError
+    return v
+
+
+def _show_aklim(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    cfg = config.get()
+    ak_cfg = cfg.get("apiKeyConcurrency") or {}
+    enabled = bool(ak_cfg.get("enabled", True))
+    default_max = int(ak_cfg.get("defaultMaxConcurrent", 5))
+    default_queue = int(ak_cfg.get("defaultMaxQueue", 50))
+    default_wait = int(ak_cfg.get("defaultQueueWaitSeconds", 1800))
+    totals = apikey_limiter.totals()
+    snap = apikey_limiter.snapshot()
+    lines = [
+        "🔑 <b>API Key 默认限流</b>",
+        "",
+        f"总开关: <code>{'开' if enabled else '关'}</code>",
+        f"默认并发上限: <code>{default_max if default_max > 0 else '不限'}</code>",
+        f"默认队列上限: <code>{default_queue}</code>",
+        f"默认最长等待: <code>{_fmt_aklim_duration(default_wait)}</code>",
+        "",
+        f"实时汇总: 在途 <b>{totals['in_flight']}</b> · 排队 <b>{totals['waiting']}</b> · 追踪 Key {totals['tracked_keys']}",
+    ]
+    interesting = [r for r in snap if r.get("in_flight", 0) > 0 or r.get("waiting", 0) > 0]
+    if interesting:
+        lines.append("")
+        lines.append("活跃 Key:")
+        for row in interesting[:12]:
+            max_c = "∞" if row.get("unlimited") else str(row.get("max_concurrent", 0))
+            icon = "🔴" if (not row.get("unlimited") and row.get("max_concurrent", 0) > 0 and row.get("in_flight", 0) >= row.get("max_concurrent", 0)) else "🟢"
+            lines.append(
+                f"  {icon} <code>{ui.escape_html(row.get('key_name', ''))}</code> · "
+                f"{row.get('in_flight', 0)}/{max_c} 在途 · "
+                f"{row.get('waiting', 0)}/{row.get('max_queue', 0)} 排队"
+            )
+        if len(interesting) > 12:
+            lines.append(f"  <i>...还有 {len(interesting) - 12} 个未列出</i>")
+    else:
+        lines.append("")
+        lines.append("<i>暂无排队或在途中的 API Key 请求。</i>")
+
+    kb = ui.inline_kb([
+        [ui.btn("🔴 关闭 Key 限流" if enabled else "🟢 开启 Key 限流", "sys:aklim_toggle")],
+        [ui.btn("✏ 默认并发", "sys:edit:aklim_max"), ui.btn("✏ 默认队列", "sys:edit:aklim_queue")],
+        [ui.btn("✏ 默认等待", "sys:edit:aklim_wait"), ui.btn("🔄 刷新", "sys:show:aklim")],
+        [ui.btn("◀ 返回设置", "menu:settings")],
+    ])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=kb)
+
+
+def _on_aklim_toggle(chat_id: int, message_id: int, cb_id: str) -> None:
+    cfg = config.get()
+    cur = bool((cfg.get("apiKeyConcurrency") or {}).get("enabled", True))
+    def _mut(c):
+        c.setdefault("apiKeyConcurrency", {})["enabled"] = not cur
+    config.update(_mut)
+    ui.answer_cb(cb_id, "已切换")
+    _show_aklim(chat_id, message_id, "")
+
+
+def _edit_aklim(chat_id: int, message_id: int, cb_id: str, field: str) -> None:
+    ui.answer_cb(cb_id)
+    states.set_state(chat_id, f"sys_aklim_{field}")
+    if field == "wait":
+        text = "请输入默认最长等待时间：\n支持 <code>1800</code>、<code>30m</code>、<code>1h</code>；<code>0</code> 表示不等待。"
+    elif field == "max":
+        text = "请输入默认并发上限（整数 ≥0）：\n<code>0</code> 表示不限。"
+    else:
+        text = "请输入默认队列上限（整数 ≥0）：\n<code>0</code> 表示不排队。"
+    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:aklim")]]))
+
+
+def _on_aklim_input(chat_id: int, action: str, text: str) -> None:
+    field = action.removeprefix("sys_aklim_")
+    try:
+        if field == "wait":
+            value = _parse_aklim_duration(text)
+        else:
+            value = int((text or "").strip())
+            if value < 0:
+                raise ValueError
+    except Exception:
+        ui.send(chat_id, "❌ 需要非负整数；等待时间可带 s/m/h，请重新输入：")
+        return
+    key_map = {"max": "defaultMaxConcurrent", "queue": "defaultMaxQueue", "wait": "defaultQueueWaitSeconds"}
+    if field not in key_map:
+        states.pop_state(chat_id); return
+    def _mut(c):
+        c.setdefault("apiKeyConcurrency", {})[key_map[field]] = value
+    config.update(_mut)
+    states.pop_state(chat_id)
+    label = _fmt_aklim_duration(value) if field == "wait" else ("不限" if field == "max" and value == 0 else str(value))
+    ui.send(chat_id, f"✅ API Key 默认限流已更新为 <code>{ui.escape_html(label)}</code>")
     send_new(chat_id)
 
 

@@ -70,7 +70,7 @@ def test_main_page(m):
     m["system_menu"].show(42, 100, "cb")
     edit = rec.last("editMessageText")
     text = edit["text"]
-    # 主页应含系统项；渠道选择已迁移为负载均衡入口，CCH/配额监控迁移到 OAuth 账户设置。
+    # 主页应含系统项；负载均衡入口保留在主菜单，系统设置不重复展示。
     for s in ("超时", "错误阶梯", "评分", "亲和", "调度", "黑名单"):
         assert s in text, s
     assert "CCH" not in text
@@ -78,10 +78,11 @@ def test_main_page(m):
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"]
             for b in row if "callback_data" in b]
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
-                "sys:show:affinity", "menu:loadbalancing", "sys:show:notif",
-                "sys:show:blacklist", "sys:show:ws_mode", "menu:main"}
+                "sys:show:affinity", "sys:show:notif", "menu:status_alert",
+                "sys:show:blacklist", "sys:show:aklim", "sys:show:ws_mode", "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
+    assert "menu:loadbalancing" not in btns
     assert "sys:show:cch" not in btns
     assert "sys:show:quota" not in btns
     print("  [PASS] main settings page")

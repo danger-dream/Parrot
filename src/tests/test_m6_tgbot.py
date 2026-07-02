@@ -353,6 +353,42 @@ def test_notifier_handler_to_admins(m):
     print("  [PASS] notifier → admin broadcast")
 
 
+def test_apikey_pagination_and_sort(m):
+    cfg = m["config"]
+    ak = m["apikey_menu"]
+    states = m["states"]
+    ui = m["ui"]
+    states.clear_all()
+    ui.configure("", [])
+    cfg.update(lambda c: c.__setitem__("apiKeys", {
+        f"k{i}": {"key": f"ccp-secret-value-{i:02d}", "enabled": True, "allowedModels": [], "allowImages": False}
+        for i in range(1, 7)
+    }))
+    rec = _install_recorder(m)
+
+    ak.show(42, 100, "cb", page=1)
+    edit = rec.last("editMessageText")
+    assert "第 1/2 页" in edit["text"]
+    assert "k1" in edit["text"] and "k4" in edit["text"]
+    assert "k5" not in edit["text"]
+    btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"] for b in row]
+    assert "ak:page:2" in btns
+    assert "ak:sort:1" in btns
+
+    rec.clear()
+    ak.handle_callback(42, 100, "cb2", "ak:page:2")
+    edit = rec.last("editMessageText")
+    assert "第 2/2 页" in edit["text"]
+    assert "k5" in edit["text"] and "k6" in edit["text"]
+
+    ak.handle_callback(42, 100, "cb3", "ak:sort:1")
+    ak.handle_callback(42, 100, "cb4", "ak:sort_sel:6")
+    ak.handle_callback(42, 100, "cb5", "ak:sort_mv:top")
+    ak.handle_callback(42, 100, "cb6", "ak:sort_save")
+    assert list(cfg.get()["apiKeys"].keys())[0] == "k6"
+    print("  [PASS] apikey pagination/sort")
+
+
 # ─── main ────────────────────────────────────────────────────────
 
 def main():

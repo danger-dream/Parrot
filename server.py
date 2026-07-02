@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src import (
     __version__, drain,
-    affinity, auth, compact_rescue, config, cooldown, errors, failover,
+    affinity, apikey_limiter, auth, compact_rescue, config, cooldown, errors, failover,
     fingerprint, image_db, log_db, model_mapping, model_metadata, network,
     network_monitor, notifier, oauth_manager, probe, public_ip, scheduler, scorer,
     state_db, status_monitor, token_counter, translation, update_checker, updater,
@@ -288,13 +288,39 @@ app.add_middleware(
 )
 
 
+_API_KEY_LIMITED_HTTP_PATHS = {
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/images/generate",
+    "/v1/images/edit",
+    "/v1/images/generations",
+    "/images/generations",
+    "/v1/images/edits",
+    "/images/edits",
+}
+
+
+def _api_key_limit_error_response(path: str, exc: apikey_limiter.ApiKeyLimitError):
+    if path == "/v1/messages":
+        resp = errors.json_error_response(429, errors.ErrType.RATE_LIMIT, exc.message)
+    else:
+        resp = errors.json_error_openai(429, errors.ErrTypeOpenAI.RATE_LIMIT, exc.message)
+    for k, v in exc.headers.items():
+        resp.headers[k] = v
+    if exc.retry_after is not None:
+        resp.headers["Retry-After"] = str(exc.retry_after)
+    return resp
+
+
 @app.middleware("http")
 async def _drain_http_middleware(request: Request, call_next):
     """Reject new work while draining and keep active bodies counted.
 
     The active lease is held until the response body iterator finishes.  That
     matters for StreamingResponse/SSE because the route handler returns before
-    the chunked body is done.
+    the chunked body is done.  下游 API Key 限流也在这里统一挂载，避免每个
+    handler 分别处理 streaming release。
     """
 
     path = request.url.path
@@ -306,11 +332,25 @@ async def _drain_http_middleware(request: Request, call_next):
         return await call_next(request)
 
     lease = await drain.enter(f"http {request.method} {path}")
+    key_lease = None
     try:
+        if request.method.upper() == "POST" and path in _API_KEY_LIMITED_HTTP_PATHS:
+            key_name, _allowed_models, err = auth.validate(request.headers)
+            if not err and key_name:
+                try:
+                    key_lease = await apikey_limiter.acquire(key_name, request)
+                except apikey_limiter.ApiKeyLimitError as exc:
+                    await lease.aclose()
+                    return _api_key_limit_error_response(path, exc)
         response = await call_next(request)
     except BaseException:
+        if key_lease is not None:
+            await key_lease.release()
         await lease.aclose()
         raise
+
+    if key_lease is not None:
+        response = apikey_limiter.attach_release_to_response(response, key_lease)
 
     body_iterator = getattr(response, "body_iterator", None)
     if body_iterator is None:

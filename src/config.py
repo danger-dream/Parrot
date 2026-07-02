@@ -95,6 +95,13 @@ CONFIG_PATH = os.environ.get("ANTHROPIC_PROXY_CONFIG") or os.path.join(DATA_DIR,
 DEFAULT_CONFIG: dict[str, Any] = {
     "listen": {"host": "0.0.0.0", "port": 18082},
     "apiKeys": {},
+    # 下游 API Key 级并发限制默认值；单 Key 可用 apiKeys.<name>.limits 覆盖。
+    "apiKeyConcurrency": {
+        "enabled": True,
+        "defaultMaxConcurrent": 5,
+        "defaultMaxQueue": 50,
+        "defaultQueueWaitSeconds": 1800,
+    },
     "oauthAccounts": [],
     "channels": [],
     "images": {
@@ -525,7 +532,7 @@ def _normalize_api_keys(cfg: dict) -> bool:
     changed = False
     for name, v in list(keys.items()):
         if isinstance(v, str):
-            keys[name] = {"key": v, "allowedModels": []}
+            keys[name] = {"key": v, "enabled": True, "allowedModels": []}
             changed = True
         elif isinstance(v, dict):
             if "key" not in v:
@@ -533,6 +540,10 @@ def _normalize_api_keys(cfg: dict) -> bool:
                 del keys[name]
                 changed = True
                 continue
+            if "enabled" not in v:
+                # Key 自身可用开关；缺失/空值按启用处理。
+                v["enabled"] = True
+                changed = True
             if "allowedModels" not in v:
                 v["allowedModels"] = []
                 changed = True

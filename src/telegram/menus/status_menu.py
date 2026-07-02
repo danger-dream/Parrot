@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, scorer, state_db
+from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, scorer, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -330,6 +330,41 @@ def _render_fastest_family(fam: str, items: list, tps_map: dict) -> list[str]:
     return out
 
 
+def _fmt_aklim_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _apikey_limiter_block() -> list[str]:
+    totals = apikey_limiter.totals()
+    out = [
+        f"  在途 <b>{totals['in_flight']}</b> · 排队 <b>{totals['waiting']}</b> · 追踪 {totals['tracked_keys']} 个 Key",
+    ]
+    interesting = [
+        r for r in apikey_limiter.snapshot()
+        if r.get("in_flight", 0) > 0 or r.get("waiting", 0) > 0
+    ]
+    if not interesting:
+        out.append("  <i>所有 API Key 均空闲。</i>")
+        return out
+    for row in interesting[:10]:
+        max_c = "∞" if row.get("unlimited") else str(row.get("max_concurrent", 0))
+        icon = "🔴" if (not row.get("unlimited") and row.get("max_concurrent", 0) > 0 and row.get("in_flight", 0) >= row.get("max_concurrent", 0)) else "🟢"
+        wait = int(row.get("oldest_wait_seconds", 0) or 0)
+        wait_part = f" · 最久 {_fmt_aklim_seconds(wait)}" if wait > 0 else ""
+        out.append(
+            f"  {icon} <code>{ui.escape_html(row.get('key_name', ''))}</code> · "
+            f"{row.get('in_flight', 0)}/{max_c} · 排队 {row.get('waiting', 0)}/{row.get('max_queue', 0)}{wait_part}"
+        )
+    if len(interesting) > 10:
+        out.append(f"  <i>...还有 {len(interesting) - 10} 个未列出</i>")
+    return out
+
+
 def _concurrency_block(cc_cfg: dict) -> list[str]:
     """状态总览里的并发信息块：总计 + 配置 + 各渠道一行。"""
     totals = concurrency.totals()
@@ -437,10 +472,17 @@ def _compose() -> tuple[str, dict]:
         lines += ["", "<b>📈 配额预警 (≥80%):</b>"]
         lines += quota_warn
 
+    # API Key 限流队列
+    ak_cfg = cfg.get("apiKeyConcurrency") or {}
+    ak_totals = apikey_limiter.totals()
+    if bool(ak_cfg.get("enabled", True)) or ak_totals.get("in_flight", 0) > 0 or ak_totals.get("waiting", 0) > 0:
+        lines += ["", "<b>🔑 API Key 队列:</b>"]
+        lines += _apikey_limiter_block()
+
     # 并发队列（只要启用了并发限制就显示）
     cc_cfg = cfg.get("concurrency") or {}
     if bool(cc_cfg.get("enabled", True)):
-        lines += ["", "<b>⚡ 并发队列:</b>"]
+        lines += ["", "<b>⚡ 渠道并发队列:</b>"]
         lines += _concurrency_block(cc_cfg)
 
     # 问题渠道
