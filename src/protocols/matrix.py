@@ -29,6 +29,7 @@ _RESPONSES_NON_CHAT_TOOL_CHOICE_TYPES = frozenset({
     "computer_use_preview", "computer", "computer_use",
     "code_interpreter", "image_generation", "mcp", "apply_patch", "function_shell",
 })
+_RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES = frozenset({"tool_search", "namespace"})
 _RESPONSES_BUILTIN_INPUT_ITEM_TYPES = frozenset({
     "web_search_call", "file_search_call", "computer_call",
     "image_generation_call", "code_interpreter_call", "mcp_call",
@@ -129,6 +130,7 @@ class RequestFeatures:
     custom_tool_label: str | None = None
     has_hosted_tools: bool = False
     hosted_tool_label: str | None = None
+    hosted_tool_labels: tuple[str, ...] = ()
     has_stateful_input_items: bool = False
     stateful_input_item_label: str | None = None
     raw: dict[str, Any] | None = None
@@ -204,18 +206,23 @@ def _tool_choice_is_hosted_or_non_function(ingress_protocol: str, body: dict[str
     return typ not in (None, "auto", "none", "function", "custom", "allowed_tools")
 
 
-def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | None:
-    # For Responses, Codex OAuth supports the official client-executed
-    # `tool_search` tool but not generic hosted tools such as web_search or
-    # file_search.  Prefer returning any non-tool_search hosted label when a
-    # mixed tool list is present so the native capability guard does not
-    # accidentally let unsupported tools through just because tool_search
-    # appeared first.
-    fallback_label: str | None = None
+def _hosted_tool_labels(ingress_protocol: str, body: dict[str, Any]) -> tuple[str, ...]:
+    # For Responses, Codex OAuth supports native passthrough tool states such
+    # as `tool_search` and `namespace`, but not generic hosted tools such as
+    # web_search or file_search.  Keep scanning after native-passthrough labels
+    # so mixed tool lists still surface unsupported hosted tools, and retain
+    # every required native-passthrough label so capability checks do not let a
+    # provider that supports only one passthrough type satisfy another.
+    passthrough_labels: list[str] = []
+
+    def remember_passthrough(label: str) -> None:
+        if label not in passthrough_labels:
+            passthrough_labels.append(label)
+
     if body.get("container") is not None:
-        return "container"
+        return ("container",)
     if body.get("mcp_servers") is not None:
-        return "mcp_servers"
+        return ("mcp_servers",)
     tools = body.get("tools") or []
     if isinstance(tools, list):
         for tool in tools:
@@ -225,37 +232,37 @@ def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | Non
             if ingress_protocol == "anthropic" and typ not in (None, "function"):
                 if typ in _ANTHROPIC_LOCAL_WEB_TOOL_TYPES:
                     continue
-                return str(typ)
+                return (str(typ),)
             if ingress_protocol == "chat" and typ not in (None, "function"):
-                return str(typ)
+                return (str(typ),)
             if ingress_protocol == "responses" and typ not in (None, "function", "custom"):
                 label = str(typ)
-                if label == "tool_search":
-                    fallback_label = fallback_label or label
+                if label in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
+                    remember_passthrough(label)
                     continue
-                return label
+                return (label,)
     choice = body.get("tool_choice")
     if isinstance(choice, dict):
         typ = choice.get("type")
         if ingress_protocol == "anthropic" and typ not in ("auto", "none", "any", "tool"):
-            return f"tool_choice:{typ}"
+            return (f"tool_choice:{typ}",)
         if ingress_protocol == "chat" and typ not in (None, "function"):
             if typ == "allowed_tools":
                 nested = choice.get("allowed_tools")
                 tools = nested.get("tools") if isinstance(nested, dict) else None
                 if not isinstance(tools, list) or not tools:
-                    return "tool_choice:allowed_tools"
+                    return ("tool_choice:allowed_tools",)
                 for tool in tools:
                     if not isinstance(tool, dict):
-                        return "tool_choice:allowed_tools:invalid"
+                        return ("tool_choice:allowed_tools:invalid",)
                     nested_typ = tool.get("type")
                     if nested_typ != "function":
-                        return f"tool_choice:allowed_tools:{nested_typ}"
-                return None
-            return f"tool_choice:{typ}"
+                        return (f"tool_choice:allowed_tools:{nested_typ}",)
+                return ()
+            return (f"tool_choice:{typ}",)
         if ingress_protocol == "responses":
             if typ in _RESPONSES_NON_CHAT_TOOL_CHOICE_TYPES:
-                return f"tool_choice:{typ}"
+                return (f"tool_choice:{typ}",)
             if typ == "allowed_tools":
                 tools = choice.get("tools")
                 if isinstance(tools, list):
@@ -265,18 +272,23 @@ def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | Non
                         nested_typ = tool.get("type")
                         if nested_typ not in (None, "function", "custom"):
                             label = f"tool_choice:allowed_tools:{nested_typ}"
-                            if nested_typ == "tool_search":
-                                fallback_label = fallback_label or label
+                            if nested_typ in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
+                                remember_passthrough(label)
                                 continue
-                            return label
-                return fallback_label
+                            return (label,)
+                return tuple(passthrough_labels)
             if typ not in (None, "auto", "none", "function", "custom"):
                 label = f"tool_choice:{typ}"
-                if typ == "tool_search":
-                    fallback_label = fallback_label or label
+                if typ in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
+                    remember_passthrough(label)
                 else:
-                    return label
-    return fallback_label
+                    return (label,)
+    return tuple(passthrough_labels)
+
+
+def _hosted_tool_label(ingress_protocol: str, body: dict[str, Any]) -> str | None:
+    labels = _hosted_tool_labels(ingress_protocol, body)
+    return labels[0] if labels else None
 
 
 def _responses_input_like_items(body: dict[str, Any]) -> list[Any]:
@@ -821,8 +833,9 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
     chat_content_responses_unsupported_label: str | None = None
     chat_content_anthropic_unsupported_label: str | None = None
     chat_tool_call_anthropic_unsupported_label: str | None = None
-    hosted_tool_label = _hosted_tool_label(ingress_protocol, body)
-    has_hosted_tools = hosted_tool_label is not None
+    hosted_tool_labels = _hosted_tool_labels(ingress_protocol, body)
+    hosted_tool_label = hosted_tool_labels[0] if hosted_tool_labels else None
+    has_hosted_tools = bool(hosted_tool_labels)
     custom_tool_label: str | None = None
     has_custom_tools = False
     has_encrypted_reasoning = False
@@ -1093,6 +1106,7 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
         custom_tool_label=custom_tool_label,
         has_hosted_tools=has_hosted_tools,
         hosted_tool_label=hosted_tool_label,
+        hosted_tool_labels=hosted_tool_labels,
         has_stateful_input_items=has_stateful_input_items,
         stateful_input_item_label=stateful_input_item_label,
         raw=body,
@@ -1116,6 +1130,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
                 "item_reference",
                 "custom_tool_history",
                 "tool_search",
+                "namespace",
             })
         else:
             native_state.update({
@@ -1157,11 +1172,12 @@ def _native_state_key_for_label(label: str | None) -> str | None:
 
 
 def _responses_hosted_tool_supported(label: str | None, native: frozenset[str]) -> bool:
-    # Codex `tool_search` is client-executed tool discovery, not a generic
-    # hosted/server-side tool.  Do not let a provider's broad `hosted_tools`
-    # capability satisfy it; only an explicit `tool_search` native state may.
-    if label in {"tool_search", "tool_choice:tool_search", "tool_choice:allowed_tools:tool_search"}:
-        return "tool_search" in native
+    # Codex native passthrough tools are not generic hosted/server-side tools.
+    # Do not let a provider's broad `hosted_tools` capability satisfy them;
+    # only explicit native-state support may.
+    for tool_type in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
+        if label in {tool_type, f"tool_choice:{tool_type}", f"tool_choice:allowed_tools:{tool_type}"}:
+            return tool_type in native
     if "hosted_tools" in native:
         return True
     return False
@@ -1172,8 +1188,13 @@ def _responses_native_unsupported_label(
     capabilities: ChannelCapabilities | None,
 ) -> str | None:
     native = capabilities.native_state if capabilities is not None else frozenset()
-    if f.has_hosted_tools and not _responses_hosted_tool_supported(f.hosted_tool_label, native):
-        return f.hosted_tool_label or "hosted_tools"
+    if f.has_hosted_tools:
+        hosted_tool_labels = f.hosted_tool_labels or ((f.hosted_tool_label,) if f.hosted_tool_label else ())
+        for hosted_tool_label in hosted_tool_labels:
+            if not _responses_hosted_tool_supported(hosted_tool_label, native):
+                return hosted_tool_label
+        if not hosted_tool_labels:
+            return "hosted_tools"
     if f.has_custom_tools and "custom_tool_history" not in native:
         return f.custom_tool_label or "custom_tool_history"
     if f.has_encrypted_reasoning and "encrypted_reasoning_replay" not in native:
