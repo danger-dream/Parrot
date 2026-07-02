@@ -26,6 +26,7 @@ from src.tests import _isolation
 _tmpdir = _isolation.isolate()
 
 import json
+import subprocess
 import time
 
 import pytest
@@ -305,6 +306,25 @@ class TestComposeUpInner:
         script = updater._compose_up_inner(backup_digest="sha256:x")
         # 30/3 = 10 次
         assert "seq 1 10" in script
+
+    def test_shell_values_are_quoted_and_script_parses(self, tmp_path):
+        config.update(lambda c: c["updateChecker"].update({
+            "runtimeMode": "docker",
+            "composeDir": str(tmp_path / "compose dir"),
+            "composeService": "parrot svc",
+            "containerName": "parrot container",
+            "image": "repo/parrot:tag with space",
+        }))
+        updater._mode_cache = None
+        script = updater._compose_up_inner(backup_digest="sha256:dead beef")
+        assert "SVC='parrot svc'" in script
+        assert "NAME='parrot container'" in script
+        assert "IMAGE='repo/parrot:tag with space'" in script
+        assert "BACKUP_DIGEST='sha256:dead beef'" in script
+        assert 'docker exec "$NAME"' in script
+        assert 'docker tag "$BACKUP_DIGEST" "$IMAGE"' in script
+        proc = subprocess.run(["sh", "-n"], input=script, text=True, capture_output=True)
+        assert proc.returncode == 0, proc.stderr
 
 
 # ─── 版本对比 ─────────────────────────────────────────────────────

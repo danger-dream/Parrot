@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -666,8 +667,16 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     cdir = _docker_compose_dir()
     flag_dir = f"{cdir}/data"   # sidecar 挂的是 composeDir:composeDir，真实路径在这
     tries = max(10, min(60, int(cfg.get("healthTimeoutSeconds", 90) or 90) // 3))
-    health_cmd = f"docker exec {name} curl -fsS http://127.0.0.1:22122/health"
     log = f"{flag_dir}/.update_log"
+
+    # 这些值来自用户部署环境/config，虽然正常情况下只会是 parrot/镜像名/绝对路径，
+    # 但 sidecar 脚本是 shell 字符串；统一 shlex.quote，避免空格/特殊字符把脚本拼坏。
+    svc_q = shlex.quote(svc)
+    name_q = shlex.quote(name)
+    image_q = shlex.quote(image)
+    flag_dir_q = shlex.quote(flag_dir)
+    log_q = shlex.quote(log)
+    backup_digest_q = shlex.quote(backup_digest) if backup_digest else "''"
     # 全程把关键步骤 + 错误输出写入 .update_log，供 TG「查看失败日志」读取。
     #
     # 零裸奔重建策略（修订版，避开 rename+compose label 冲突）：
@@ -680,11 +689,15 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     #      确保回滚后服务真的可用；只有回滚后健康才写 ROLLBACK（成功回滚），
     #      否则写 ROLLBACK_FAILED（回滚也没起来，极端情况，需人工）。
     script = f"""set +e
-LOG="{log}"
+LOG={log_q}
+FLAG_DIR={flag_dir_q}
+SVC={svc_q}
+NAME={name_q}
+IMAGE={image_q}
+BACKUP_DIGEST={backup_digest_q}
 : > "$LOG" 2>/dev/null || true
 logln() {{ echo "[$(date -u +%H:%M:%S)] $*" >> "$LOG" 2>/dev/null || true; }}
-SVC="{svc}"
-health_ok() {{ {health_cmd} >/dev/null 2>&1; }}
+health_ok() {{ docker exec "$NAME" curl -fsS http://127.0.0.1:22122/health >/dev/null 2>&1; }}
 wait_health() {{
   ok=0
   for i in $(seq 1 {tries}); do
@@ -702,20 +715,20 @@ resolve_service() {{
   if [ $SERVICES_RC -ne 0 ]; then
     logln "❌ compose 服务列表读取失败："
     echo "$SERVICES" | head -20 >> "$LOG" 2>/dev/null || true
-    echo "ROLLBACK" > {flag_dir}/.update_result 2>/dev/null || true
+    echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
     exit 1
   fi
   if [ -n "$SVC" ] && service_exists "$SVC"; then
     return 0
   fi
   OLD_SVC="$SVC"
-  LABEL_SVC="$(docker inspect -f '{{{{ index .Config.Labels "com.docker.compose.service" }}}}' {name} 2>/dev/null || true)"
+  LABEL_SVC="$(docker inspect -f '{{{{ index .Config.Labels "com.docker.compose.service" }}}}' "$NAME" 2>/dev/null || true)"
   if [ -n "$LABEL_SVC" ] && [ "$LABEL_SVC" != "<no value>" ] && service_exists "$LABEL_SVC"; then
     SVC="$LABEL_SVC"
     logln "⚠️ composeService=$OLD_SVC 不存在，自动使用当前容器的 compose service：$SVC"
     return 0
   fi
-  for candidate in "{name}" "parrot" "anthropic-proxy"; do
+  for candidate in "$NAME" "parrot" "anthropic-proxy"; do
     if [ -n "$candidate" ] && service_exists "$candidate"; then
       SVC="$candidate"
       logln "⚠️ composeService=$OLD_SVC 不存在，自动使用检测到的服务：$SVC"
@@ -729,19 +742,19 @@ resolve_service() {{
     return 0
   fi
   logln "❌ composeService=$OLD_SVC 不存在，且无法自动判断。可用服务：$(printf '%s' "$SERVICES" | tr '\n' ' ')"
-  echo "ROLLBACK" > {flag_dir}/.update_result 2>/dev/null || true
+  echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
   exit 1
 }}
 
 fail_rollback() {{
   logln "❌ 更新失败，开始回滚到备份版本"
-  echo "ROLLBACK" > {flag_dir}/.update_result 2>/dev/null || true
-  if [ -n "{backup_digest}" ]; then
-    docker tag {backup_digest} {image} 2>/dev/null && logln "已把镜像 tag 指回备份 digest" || logln "⚠️ 回滚 tag 失败"
+  echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
+  if [ -n "$BACKUP_DIGEST" ]; then
+    docker tag "$BACKUP_DIGEST" "$IMAGE" 2>/dev/null && logln "已把镜像 tag 指回备份 digest" || logln "⚠️ 回滚 tag 失败"
   else
     logln "⚠️ 无备份 digest，无法回滚镜像"
   fi
-  docker rm -f {name} 2>/dev/null || true
+  docker rm -f "$NAME" 2>/dev/null || true
   RB_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
   echo "$RB_OUT" | tail -10 >> "$LOG" 2>/dev/null || true
   logln "回滚重建完成，验证健康…"
@@ -749,28 +762,28 @@ fail_rollback() {{
     logln "✅ 回滚成功，旧版本已恢复并健康"
   else
     logln "❌ 回滚后健康检查仍未通过（需人工介入）"
-    echo "ROLLBACK_FAILED" > {flag_dir}/.update_result 2>/dev/null || true
+    echo "ROLLBACK_FAILED" > "$FLAG_DIR/.update_result" 2>/dev/null || true
   fi
   exit 1
 }}
 
 sleep 1
-logln "开始重建：service=$SVC container={name} image={image}"
+logln "开始重建：service=$SVC container=$NAME image=$IMAGE"
 # ① 校验 compose 合法；不合法 → 完全不动旧容器
 CFG_ERR="$(docker compose config 2>&1 >/dev/null)"
 if [ $? -ne 0 ]; then
   logln "❌ compose 文件校验失败，未改动旧容器："
   echo "$CFG_ERR" | head -20 >> "$LOG" 2>/dev/null || true
-  echo "ROLLBACK" > {flag_dir}/.update_result 2>/dev/null || true
+  echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
   exit 1
 fi
-logln "✅ compose 校验通过（备份 digest={backup_digest}）"
+logln "✅ compose 校验通过（备份 digest=$BACKUP_DIGEST）"
 # ② 先确认目标 service 存在；配置错时尽量按 container_name / 常见服务名 / 唯一服务自动修正。
 #    这一步必须在 rm 旧容器前完成，避免 service 名失配时先停服务再报 no such service。
 resolve_service
 logln "使用 compose service=$SVC"
 # ③ stop+rm 旧容器（镜像 digest 已备份，可回滚），compose up 新容器
-docker rm -f {name} 2>/dev/null || true
+docker rm -f "$NAME" 2>/dev/null || true
 logln "启动新容器…"
 UP_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
 UP_RC=$?
@@ -781,12 +794,12 @@ logln "新容器已启动，等待健康检查（最多 {tries*3}s）…"
 if ! wait_health; then
   logln "❌ 健康检查未通过（{tries*3}s 内 /health 未就绪）"
   logln "新容器最近日志："
-  docker logs --tail 30 {name} >> "$LOG" 2>&1 || true
+  docker logs --tail 30 "$NAME" >> "$LOG" 2>&1 || true
   fail_rollback
 fi
 # ⑤ 成功
 logln "✅ 更新成功，健康检查通过"
-echo "OK" > {flag_dir}/.update_result 2>/dev/null || true
+echo "OK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
 exit 0
 """
     return script
