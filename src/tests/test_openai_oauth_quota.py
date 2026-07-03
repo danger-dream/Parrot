@@ -443,6 +443,7 @@ def test_oauth_menu_refresh_all_uses_wham_for_openai(m):
     assert "c@claude.test" in final_text, final_text[:500]
     assert "o@openai.test" in final_text, final_text[:500]
     assert "刷新成功" in final_text, final_text[:500]
+    assert "重置次数" in final_text, final_text[:500]
     assert "用量刷新完成" in final_text
     assert called["probe"] == 0
     acc = m["oauth_manager"].get_account("openai:o@openai.test:acct-o@openai.test")

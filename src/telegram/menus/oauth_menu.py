@@ -1999,12 +1999,12 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     if not text:
         return
     if provider == "openai":
-        head = "✅ 已更新用量/重置卡（wham/usage + reset-card）"
+        head = "✅ 已更新用量（wham/usage）"
         reset_credit_count = _openai_reset_credit_count_from_usage(usage_result)
         if reset_credit_count is not None:
-            head += f"\n♻️ 官方重置次数: <code>{reset_credit_count}</code>"
+            head += f"\n♻️ 重置次数: <code>{reset_credit_count}</code>"
         if refresh_result.get("reset_credit_error") is not None:
-            head += "\n⚠️ 重置卡明细刷新失败，已更新用量；稍后可再点「刷新用量/重置卡」。"
+            head += "\n⚠️ 重置次数刷新失败，已更新用量；稍后可再点「刷新用量/重置卡」。"
         if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
             fields = metadata_action.get("fields") or {}
             if fields.get("plan_type"):
@@ -2513,6 +2513,171 @@ def _start_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: lis
     ).start()
 
 
+def _refresh_all_usage_summary(usage: dict | None, *, provider: str,
+                               reset_credit_error=None) -> str:
+    if not isinstance(usage, dict):
+        return "无数据"
+    utils = oauth_manager.extract_utils_percent(usage)
+    tags = ["5h", "7d", "30d", "sonnet", "opus"]
+    parts = []
+    for tag, util in zip(tags, utils):
+        if util is None:
+            continue
+        try:
+            parts.append(f"{tag} {float(util):.0f}%")
+        except (TypeError, ValueError):
+            continue
+    if provider == "openai":
+        reset_count = _openai_reset_credit_count_from_usage(usage)
+        if reset_count is not None:
+            parts.append(f"重置次数 {reset_count}")
+        elif reset_credit_error is not None:
+            parts.append("重置次数 获取失败")
+    return " / ".join(parts) if parts else "无数据"
+
+
+def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys: list[str],
+                                  *, page: int = 1, filter_key: str = _FILTER_ALL,
+                                  final_target_message_id: int | None = None,
+                                  delete_progress_later: bool = False,
+                                  send_fallback_summary: bool = False) -> None:
+    """Old concise refresh-all progress format, with OpenAI reset-credit count."""
+    lines: list[str] = ["🔄 <b>批量刷新 OAuth 用量</b>", ""]
+    success_count = 0
+    fail_count = 0
+
+    def _flush() -> None:
+        if progress_mid == -1:
+            return
+        try:
+            ui.edit(chat_id, progress_mid, ui.truncate("\n".join(lines)))
+        except Exception:
+            pass
+
+    _flush()
+    for idx, ak in enumerate([k for k in account_keys if k], 1):
+        provider = oauth_manager.provider_of(ak)
+        email = _account_email(ak)
+        prov_tag = "🅾 OpenAI" if provider == "openai" else ("🅰 Claude" if provider == "claude" else ui.escape_html(provider or "OAuth"))
+        ek = ui.escape_html(email or ak)
+
+        lines.append(f"<b>{idx}. {ek}</b> · {prov_tag}")
+        lines.append("  ⌛ 正在刷新用量...")
+        _flush()
+
+        def _stage(stage: str, payload=None) -> None:
+            if stage == "reset_start":
+                lines[-1] = "  ⌛ 正在刷新重置次数..."
+                _flush()
+
+        acquired = False
+        with _BACKGROUND_REFRESH_LOCK:
+            if ak not in _BACKGROUND_REFRESH_INFLIGHT:
+                _BACKGROUND_REFRESH_INFLIGHT.add(ak)
+                acquired = True
+        if not acquired:
+            lines[-1] = "  ⌛ 已有刷新任务进行中，等待结果..."
+            _flush()
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                with _BACKGROUND_REFRESH_LOCK:
+                    busy = ak in _BACKGROUND_REFRESH_INFLIGHT
+                if not busy:
+                    break
+                time.sleep(0.5)
+            row = state_db.quota_load(ak)
+            if _quota_cache_has_usage_signal(row):
+                success_count += 1
+                usage = None
+                try:
+                    usage = oauth_manager.usage_from_quota_row(row) if row else None
+                except Exception:
+                    usage = None
+                lines[-1] = f"  ✅ 刷新成功: {_refresh_all_usage_summary(usage, provider=provider)}"
+            else:
+                fail_count += 1
+                lines[-1] = "  ⚠ 等待已有刷新任务超时，稍后可重试"
+            lines.append("")
+            _flush()
+            continue
+
+        try:
+            result = _fetch_and_save_usage_result_sync(ak, email=email, on_stage=_stage)
+            if result.get("error") is not None:
+                fail_count += 1
+                _replace_last_with_oauth_error(
+                    lines, result["error"], provider=provider, operation="fetch_usage",
+                )
+                lines.append("")
+                _flush()
+                continue
+
+            usage = result.get("usage")
+            success_count += 1
+            lines[-1] = (
+                "  ✅ 刷新成功: "
+                + _refresh_all_usage_summary(
+                    usage, provider=provider,
+                    reset_credit_error=result.get("reset_credit_error"),
+                )
+            )
+            if result.get("reset_credit_error") is not None and provider == "openai":
+                lines.append("  ⚠ 重置次数刷新失败，已保留用量结果")
+
+            if isinstance(usage, dict):
+                quota_action = _evaluate_quota_action(ak, usage)
+            else:
+                quota_action = None
+            if quota_action and quota_action.get("action") == "disabled":
+                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+                lines.append(f"  🔒 触发自动禁用（超限窗口: <code>{ui.escape_html(hit)}</code>）")
+            elif quota_action and quota_action.get("action") == "still_over_quota":
+                hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+                lines.append(f"  ⚠ 仍未恢复，维持禁用（超限: <code>{ui.escape_html(hit)}</code>）")
+            elif quota_action and quota_action.get("action") == "resumed":
+                lines.append("  ♻ 额度已恢复，已自动解除禁用")
+            elif quota_action and quota_action.get("action") == "noop_user":
+                lines.append("  🚫 手动禁用中（不自动恢复）")
+            elif quota_action and quota_action.get("action") == "noop_auth_error":
+                lines.append("  ⚠ auth_error（不自动恢复，需重新登录）")
+            elif quota_action and quota_action.get("action") == "disable_failed":
+                lines.append("  ❌ 自动禁用写入失败，见 systemd 日志")
+            elif quota_action and quota_action.get("action") == "resume_failed":
+                lines.append("  ❌ 自动解禁写入失败，见 systemd 日志")
+        except Exception as exc:
+            fail_count += 1
+            lines[-1] = f"  ❌ 刷新异常: <code>{ui.escape_html(str(exc))[:120]}</code>"
+        finally:
+            with _BACKGROUND_REFRESH_LOCK:
+                _BACKGROUND_REFRESH_INFLIGHT.discard(ak)
+
+        lines.append("")
+        _flush()
+
+    lines.append(f"📢 用量刷新完成：成功 {success_count} 个，失败 {fail_count} 个。")
+    lines.append("本消息 5 分钟后自动销毁。")
+    _flush()
+
+    try:
+        list_text, list_kb = _list_text_and_kb(page=page, filter_key=filter_key)
+        target_mid = final_target_message_id or progress_mid
+        if list_text and target_mid != -1:
+            ui.edit(chat_id, target_mid, list_text, reply_markup=list_kb)
+    except Exception as exc:
+        print(f"[oauth_menu] final list render failed: {exc}")
+
+    if send_fallback_summary:
+        ui.send(chat_id, ui.truncate("\n".join(lines)))
+
+    if delete_progress_later and progress_mid != -1:
+        def _delete_later():
+            try:
+                ui.delete_message(chat_id, progress_mid)
+            except Exception:
+                pass
+        threading.Timer(300.0, _delete_later).start()
+
+
 # ─── 刷新全部用量 / 重置卡 ─────────────────────────────────────────────
 #
 # 交互：不覆盖原 OAuth 面板，而是新发一条「进度消息」追加式展示：
@@ -2537,11 +2702,7 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
         ui.send(chat_id, "❌ 当前无可刷新的 OAuth 账户")
         return
 
-    initial_items = [
-        _progress_account_block(ak, idx, "  等待更新...")
-        for idx, ak in enumerate(account_keys, 1)
-    ]
-    resp = ui.send(chat_id, _build_oauth_update_panel(initial_items))
+    resp = ui.send(chat_id, "🔄 <b>批量刷新 OAuth 用量</b>\n\n⌛ 初始化...")
     if not resp or not resp.get("ok"):
         ui.send(chat_id, "❌ 无法创建进度消息")
         return
@@ -2551,14 +2712,27 @@ def on_refresh_all(chat_id: int, message_id: int, cb_id: str, page: int = 1, fil
 
     # 真实 TG 有 message_id：后台刷新，避免 callback 长时间占住。
     # 测试/降级无 message_id：同步跑完并追加一条最终摘要，保持可断言。
-    _start_oauth_update_panel(
+    if progress_mid != -1:
+        threading.Thread(
+            target=_run_refresh_all_legacy_panel,
+            args=(chat_id, int(progress_mid), account_keys),
+            kwargs={
+                "page": page,
+                "filter_key": filter_key,
+                "final_target_message_id": message_id,
+                "delete_progress_later": True,
+                "send_fallback_summary": False,
+            },
+            daemon=True,
+        ).start()
+        return
+
+    _run_refresh_all_legacy_panel(
         chat_id, int(progress_mid), account_keys,
         page=page, filter_key=filter_key,
         final_target_message_id=message_id,
         delete_progress_later=True,
         send_fallback_summary=(progress_mid == -1),
-        show_transition_hint=False,
-        background=(progress_mid != -1),
     )
 
 
