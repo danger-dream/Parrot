@@ -1227,6 +1227,30 @@ def _latest_iso(*values: str | None) -> str | None:
     return _format_utc(latest.astimezone(timezone.utc)) if latest else None
 
 
+_CODEX_MISSING_RESET_FALLBACK_SECONDS = 10 * 60
+
+
+def _codex_cached_reset_ms(row: dict, base_ms: int | None,
+                           reset_key: str) -> int | None:
+    try:
+        reset_sec = row.get(reset_key)
+        if reset_sec is not None:
+            reset_sec = int(reset_sec)
+            # Most rows store reset-after-seconds relative to the passive
+            # snapshot. Be tolerant of future absolute epoch seconds too.
+            if reset_sec > 1_000_000_000:
+                return reset_sec * 1000
+            if base_ms is not None:
+                return base_ms + max(0, reset_sec) * 1000
+            return None
+    except Exception:
+        pass
+
+    if base_ms is None:
+        return None
+    return base_ms + _CODEX_MISSING_RESET_FALLBACK_SECONDS * 1000
+
+
 def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
     """Return active Codex response-header quota hits cached for an OpenAI account.
 
@@ -1234,7 +1258,8 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
     If a quota-disabled account has a still-active Codex header snapshot over the
     threshold, quota_monitor must not immediately resume it just because WHAM is
     below threshold. Use last_passive_update_at + reset_after_seconds so expired
-    header snapshots don't keep accounts disabled forever.
+    header snapshots don't keep accounts disabled forever. If a rare snapshot has
+    no reset-after header, bound it by a short TTL.
     """
     row = state_db.quota_load(account_key)
     if not row:
@@ -1256,22 +1281,8 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
         if pct is None or pct < threshold:
             continue
 
-        reset_iso = None
-        reset_ms = None
-        try:
-            reset_sec = row.get(reset_key)
-            if reset_sec is not None:
-                reset_sec = int(reset_sec)
-                # Most rows store reset-after-seconds relative to the passive
-                # snapshot. Be tolerant of future absolute epoch seconds too.
-                if reset_sec > 1_000_000_000:
-                    reset_ms = reset_sec * 1000
-                elif base_ms is not None:
-                    reset_ms = base_ms + max(0, reset_sec) * 1000
-                reset_iso = _iso_from_ms(reset_ms)
-        except Exception:
-            reset_ms = None
-            reset_iso = None
+        reset_ms = _codex_cached_reset_ms(row, base_ms, reset_key)
+        reset_iso = _iso_from_ms(reset_ms)
 
         # The cached header said "over threshold", but its reset time has passed;
         # ignore it and let fresh WHAM usage decide recovery.
@@ -1290,7 +1301,8 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
 
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
-                                 fresh: bool = True) -> dict:
+                                 fresh: bool = True,
+                                 respect_disabled_until: bool = True) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
 
     规则：
@@ -1301,8 +1313,13 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       • 所有窗口 util < threshold → 可用
           - OpenAI 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
-          - OpenAI 账号若拿到新鲜有效 usage 且所有窗口均低于阈值，即使旧的
-            disabled_until 仍在未来，也恢复；真实用量优先于旧锁定时间。
+          - OpenAI 账号若仍处于 disabled_until 冷却期，或仍有未过期的 Codex
+            响应头超限快照，继续保持 quota 禁用，避免 WHAM/Codex 边界不同步
+            导致“假恢复”。
+          - OpenAI 账号只有在冷却期/响应头快照都过期，且本轮新鲜有效 usage
+            全部低于阈值时，才 set_enabled(True) 自动恢复。
+            respect_disabled_until=False 的官方 reset credit / 手动强刷新路径例外：
+            上游已确认消耗 reset 后，可用新鲜 usage 直接覆盖本地旧冷却时间。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
@@ -1384,7 +1401,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
-            if _quota_disabled_until_still_future(acc):
+            if respect_disabled_until and _quota_disabled_until_still_future(acc):
                 return {"action": "quota_cooldown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
@@ -1990,13 +2007,19 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
         out["quota_action"] = {"action": "refresh_failed_keep_disabled"}
         return out
 
+    # A successful upstream reset makes any previously cached Codex response-header
+    # hit stale. Delete the row before writing fresh WHAM usage so old codex_* columns
+    # do not immediately re-disable the account on the next monitor tick.
+    state_db.quota_delete(canonical)
     state_db.quota_save(canonical, flatten_usage(usage), email=str(acc.get("email") or ""))
     out["usage"] = usage
     reset_credits = ((usage.get("openai") or {}).get("rate_limit_reset_credits") or {})
     if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
         out["available_count"] = reset_credits.get("available_count")
 
-    eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
+    eval_result = evaluate_and_toggle_by_usage(
+        canonical, usage, fresh=True, respect_disabled_until=False,
+    )
     out["quota_action"] = eval_result
     if eval_result.get("action") in ("resumed", "kept_enabled") and not eval_result.get("any_over"):
         out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)

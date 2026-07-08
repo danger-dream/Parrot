@@ -453,6 +453,48 @@ def test_openai_quota_resume_respects_active_codex_snapshot(m):
     print("  [PASS] OpenAI quota resume respects active Codex over-threshold snapshot")
 
 
+def test_openai_quota_ignores_expired_codex_snapshot_missing_reset(m):
+    """Codex over-threshold snapshots without reset headers must expire by short TTL."""
+    _setup(m)
+    email = "stale-codex@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2000-01-01T00:00:00Z")
+
+    snap = m["openai_provider"].parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "96",
+        "x-codex-primary-window-minutes": "300",
+    })
+    assert snap is not None
+    m["state_db"].quota_save_openai_snapshot(
+        key, snap, m["openai_provider"].normalize_codex_snapshot(snap), email=email,
+    )
+    old_ms = m["state_db"].now_ms() - 11 * 60 * 1000
+    conn = m["state_db"]._get_conn()
+    conn.execute(
+        "UPDATE oauth_quota_cache SET fetched_at=?, last_passive_update_at=? WHERE account_key=?",
+        (old_ms, old_ms, key),
+    )
+    conn.commit()
+
+    wham_below_threshold = {
+        "five_hour": {"utilization": 1.0, "resets_at": "2099-01-01T00:01:00Z"},
+        "seven_day": {"utilization": 1.0, "resets_at": "2099-01-01T01:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": {"source": "wham_usage"},
+    }
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, wham_below_threshold, threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "resumed", result
+    assert acc.get("enabled") is True, acc
+    assert acc.get("disabled_reason") is None, acc
+    print("  [PASS] OpenAI quota ignores stale Codex over-threshold snapshot without reset")
+
+
 def test_openai_quota_resume_waits_for_future_disabled_until(m):
     """OpenAI quota-disabled accounts must not resume before disabled_until expires."""
     _setup(m)
@@ -714,6 +756,7 @@ def main():
         test_oauth_menu_refresh_usage_openai_wham,
         test_oauth_menu_refresh_usage_openai_auto_disables_over_quota,
         test_openai_quota_resume_respects_active_codex_snapshot,
+        test_openai_quota_ignores_expired_codex_snapshot_missing_reset,
         test_openai_quota_resume_waits_for_future_disabled_until,
         test_quota_monitor_notifies_when_openai_quota_really_resumes,
         test_openai_plan_workspace_label_disambiguates_same_email,
