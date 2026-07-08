@@ -64,9 +64,17 @@ def _setup(m):
     m["config"].update(_reset)
     for row in m["state_db"].quota_load_all():
         m["state_db"].quota_delete(row.get("account_key") or row["email"])
-    # 清 failover 的节流桶（test 之间不共享节流状态）
+    # 清 failover / UI 的跨 test 状态。
     m["failover"]._codex_snapshot_last.clear()
     m["states"].clear_all()
+    # UI list/detail helpers schedule daemon background refreshes in production. In
+    # this standalone integration test they race with the next case's isolated
+    # config/state, so no-op the schedulers and clear in-flight buckets.
+    if "oauth_menu" in m:
+        m["oauth_menu"]._schedule_oauth_cache_refresh_for_ui = lambda *a, **kw: None
+        m["oauth_menu"]._schedule_openai_metadata_for_ui = lambda *a, **kw: None
+        m["oauth_menu"]._BACKGROUND_REFRESH_INFLIGHT.clear()
+        m["oauth_menu"]._METADATA_REFRESH_INFLIGHT.clear()
 
 
 def _add_openai(m, email="q@openai.test"):
@@ -405,6 +413,139 @@ def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):
     print("  [PASS] oauth_menu refresh_usage(openai): wham over-quota auto disables")
 
 
+def test_openai_quota_resume_respects_active_codex_snapshot(m):
+    """WHAM 低于阈值时，仍要尊重未过期的 Codex 响应头超限快照。"""
+    _setup(m)
+    email = "edge@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+
+    snap = m["openai_provider"].parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "96",
+        "x-codex-primary-reset-after-seconds": "3600",
+        "x-codex-primary-window-minutes": "300",
+        "x-codex-secondary-used-percent": "10",
+        "x-codex-secondary-window-minutes": "10080",
+    })
+    assert snap is not None
+    m["state_db"].quota_save_openai_snapshot(
+        key, snap, m["openai_provider"].normalize_codex_snapshot(snap), email=email,
+    )
+
+    wham_below_threshold = {
+        "five_hour": {"utilization": 1.0, "resets_at": "2099-01-01T00:01:00Z"},
+        "seven_day": {"utilization": 1.0, "resets_at": "2099-01-01T01:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": {"source": "wham_usage"},
+    }
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, wham_below_threshold, threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "still_over_quota", result
+    assert result["any_over"] is True, result
+    assert "codex primary 96%" in result["hit_windows"], result
+    assert acc.get("disabled_reason") == "quota", acc
+    assert acc.get("enabled") is False, acc
+    print("  [PASS] OpenAI quota resume respects active Codex over-threshold snapshot")
+
+
+def test_openai_quota_resume_waits_for_future_disabled_until(m):
+    """OpenAI quota-disabled accounts must not resume before disabled_until expires."""
+    _setup(m)
+    email = "cooldown@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+
+    wham_below_threshold = {
+        "five_hour": {"utilization": 1.0, "resets_at": "2099-01-01T00:01:00Z"},
+        "seven_day": {"utilization": 1.0, "resets_at": "2099-01-01T01:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": {"source": "wham_usage"},
+    }
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, wham_below_threshold, threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "quota_cooldown_keep_disabled", result
+    assert acc.get("disabled_reason") == "quota", acc
+    assert acc.get("enabled") is False, acc
+    assert acc.get("disabled_until") == "2099-01-01T00:00:00Z", acc
+    print("  [PASS] OpenAI quota resume waits for future disabled_until")
+
+
+def test_quota_monitor_notifies_when_openai_quota_really_resumes(m):
+    """Once disabled_until has expired and fresh WHAM usage is low, resume and notify."""
+    _setup(m)
+    email = "notify-resume@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2000-01-01T00:00:00Z")
+
+    wham_below_threshold = {
+        "five_hour": {"utilization": 1.0, "resets_at": "2000-01-01T00:01:00Z"},
+        "seven_day": {"utilization": 1.0, "resets_at": "2000-01-01T01:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": {"source": "wham_usage"},
+    }
+
+    calls = []
+    orig_fetch = m["oauth_manager"].fetch_usage
+    orig_notify = m["oauth_manager"].notifier.throttled_notify_event_sync
+
+    async def _fake_fetch_usage(account_key):
+        assert account_key == key
+        return wham_below_threshold
+
+    def _fake_notify(event, throttle_key, message, **kwargs):
+        calls.append((event, throttle_key, message, kwargs))
+
+    import asyncio
+    try:
+        m["oauth_manager"].fetch_usage = _fake_fetch_usage
+        m["oauth_manager"].notifier.throttled_notify_event_sync = _fake_notify
+        out = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    finally:
+        m["oauth_manager"].fetch_usage = orig_fetch
+        m["oauth_manager"].notifier.throttled_notify_event_sync = orig_notify
+
+    acc = m["oauth_manager"].get_account(key)
+    assert out[email] == "resumed", out
+    assert acc.get("enabled") is True, acc
+    assert acc.get("disabled_reason") is None, acc
+    assert len(calls) == 1, calls
+    assert calls[0][0] == "quota_resumed", calls
+    assert calls[0][1] == f"quota_resumed:{key}", calls
+    assert "OAuth 配额已恢复" in calls[0][2]
+    assert "OpenAI · Plus" in calls[0][2]
+    print("  [PASS] quota_monitor resumes and sends notification after cooldown expires")
+
+
+def test_openai_plan_workspace_label_disambiguates_same_email(m):
+    _setup(m)
+    label = m["oauth_manager"].openai_plan_workspace_label({
+        "plan_type": "team",
+        "workspace_name": "us",
+        "workspace_id": "d5611c34-1909-44f5-ac0a-9ef630e41c85",
+    })
+    assert label == "OpenAI · Team（us）"
+    assert "d5611c34" not in label
+    plus_label = m["oauth_manager"].openai_plan_workspace_label({
+        "plan_type": "plus",
+        "workspace_name": "Personal",
+    })
+    assert plus_label == "OpenAI · Plus"
+    print("  [PASS] OpenAI notification label shows readable plan/workspace without raw id")
+
+
 def test_oauth_menu_refresh_all_uses_wham_for_openai(m):
     """refresh_all 对 openai：有效 access_token 直接 wham/usage，不发 probe/强刷 token。"""
     _setup(m)
@@ -572,6 +713,10 @@ def main():
         test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled,
         test_oauth_menu_refresh_usage_openai_wham,
         test_oauth_menu_refresh_usage_openai_auto_disables_over_quota,
+        test_openai_quota_resume_respects_active_codex_snapshot,
+        test_openai_quota_resume_waits_for_future_disabled_until,
+        test_quota_monitor_notifies_when_openai_quota_really_resumes,
+        test_openai_plan_workspace_label_disambiguates_same_email,
         test_oauth_menu_refresh_all_uses_wham_for_openai,
         test_probe_usage_writes_snapshot_in_mock_mode,
         test_delete_account_clears_codex_snapshot_throttle,

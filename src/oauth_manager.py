@@ -1165,6 +1165,129 @@ def _usage_has_any_quota_signal(usage: dict) -> bool:
     return any(u is not None for u in extract_utils_percent(usage))
 
 
+def openai_plan_workspace_label(acc: dict | None) -> str:
+    """Human label for OpenAI OAuth accounts.
+
+    The same email can appear in multiple ChatGPT workspaces. Keep the label
+    readable for notifications: plan plus workspace name, without leaking a raw
+    workspace/account UUID suffix.
+    """
+    if not acc:
+        return "OpenAI"
+    plan_raw = str(acc.get("plan_type") or "").strip()
+    workspace = str(acc.get("workspace_name") or "").strip()
+    plan_map = {
+        "team": "Team",
+        "plus": "Plus",
+        "pro": "Pro",
+        "free": "Free",
+        "enterprise": "Enterprise",
+    }
+    plan = plan_map.get(plan_raw.lower(), plan_raw[:1].upper() + plan_raw[1:] if plan_raw else "")
+    if plan and workspace and workspace.lower() != "personal":
+        return f"OpenAI · {plan}（{workspace}）"
+    if plan:
+        return f"OpenAI · {plan}"
+    if workspace and workspace.lower() != "personal":
+        return f"OpenAI · {workspace}"
+    return "OpenAI"
+
+
+def _ms_timestamp(value) -> int | None:
+    try:
+        if value is None:
+            return None
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    # state_db historically stores quota timestamps in milliseconds, while a few
+    # call sites/comments still talk in seconds. Accept both for safety.
+    if v > 10_000_000_000:
+        return int(v)
+    if v > 1_000_000_000:
+        return int(v * 1000)
+    return None
+
+
+def _iso_from_ms(ms: int | None) -> str | None:
+    if ms is None:
+        return None
+    try:
+        return _format_utc(datetime.fromtimestamp(ms / 1000, tz=timezone.utc))
+    except Exception:
+        return None
+
+
+def _latest_iso(*values: str | None) -> str | None:
+    latest = None
+    for value in values:
+        dt = _parse_iso(value)
+        if dt is not None and (latest is None or dt > latest):
+            latest = dt
+    return _format_utc(latest.astimezone(timezone.utc)) if latest else None
+
+
+def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
+    """Return active Codex response-header quota hits cached for an OpenAI account.
+
+    WHAM /usage and Codex response headers can disagree near reset boundaries.
+    If a quota-disabled account has a still-active Codex header snapshot over the
+    threshold, quota_monitor must not immediately resume it just because WHAM is
+    below threshold. Use last_passive_update_at + reset_after_seconds so expired
+    header snapshots don't keep accounts disabled forever.
+    """
+    row = state_db.quota_load(account_key)
+    if not row:
+        return {"any_over": False, "hit_windows": [], "latest_reset": None}
+
+    base_ms = _ms_timestamp(row.get("last_passive_update_at")) or _ms_timestamp(row.get("fetched_at"))
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    hits: list[str] = []
+    resets: list[str | None] = []
+
+    for label, pct_key, reset_key in (
+        ("codex primary", "codex_primary_used_pct", "codex_primary_reset_sec"),
+        ("codex secondary", "codex_secondary_used_pct", "codex_secondary_reset_sec"),
+    ):
+        try:
+            pct = float(row.get(pct_key)) if row.get(pct_key) is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        if pct is None or pct < threshold:
+            continue
+
+        reset_iso = None
+        reset_ms = None
+        try:
+            reset_sec = row.get(reset_key)
+            if reset_sec is not None:
+                reset_sec = int(reset_sec)
+                # Most rows store reset-after-seconds relative to the passive
+                # snapshot. Be tolerant of future absolute epoch seconds too.
+                if reset_sec > 1_000_000_000:
+                    reset_ms = reset_sec * 1000
+                elif base_ms is not None:
+                    reset_ms = base_ms + max(0, reset_sec) * 1000
+                reset_iso = _iso_from_ms(reset_ms)
+        except Exception:
+            reset_ms = None
+            reset_iso = None
+
+        # The cached header said "over threshold", but its reset time has passed;
+        # ignore it and let fresh WHAM usage decide recovery.
+        if reset_ms is not None and reset_ms <= now_ms:
+            continue
+
+        hits.append(f"{label} {pct:.0f}%")
+        resets.append(reset_iso)
+
+    return {
+        "any_over": bool(hits),
+        "hit_windows": hits,
+        "latest_reset": _latest_iso(*resets),
+    }
+
+
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
                                  fresh: bool = True) -> dict:
@@ -1218,12 +1341,24 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 "hit_windows": hit_windows,
                 "disabled_until": acc.get("disabled_until")}
 
+    cached_codex_hit = None
+    if provider_of(account_key) == "openai":
+        cached_codex_hit = _cached_openai_codex_quota_hit(account_key, threshold)
+        if cached_codex_hit.get("any_over"):
+            any_over = True
+            for _hit in cached_codex_hit.get("hit_windows") or []:
+                if _hit not in hit_windows:
+                    hit_windows.append(_hit)
+
     if any_over:
         if reason == "quota":
             return {"action": "still_over_quota", "utils": utils,
                     "any_over": True, "hit_windows": hit_windows,
-                    "disabled_until": acc.get("disabled_until")}
-        latest_reset = reset_iso_for_hit_windows(usage, threshold)
+                    "disabled_until": acc.get("disabled_until") or (cached_codex_hit or {}).get("latest_reset")}
+        latest_reset = _latest_iso(
+            reset_iso_for_hit_windows(usage, threshold),
+            (cached_codex_hit or {}).get("latest_reset"),
+        )
         try:
             set_disabled_by_quota(account_key, latest_reset)
         except Exception as exc:
@@ -1236,8 +1371,9 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
 
     # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
     # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
-    # 因 [None, None, None, None] 被误恢复。若拿到新鲜有效 usage，则真实
-    # 低用量优先于旧 disabled_until，避免 30d 已重置仍卡在 quota 禁用。
+    # 因 [None, None, None, None] 被误恢复。若 disabled_until 仍在未来，也不
+    # 提前恢复：OpenAI WHAM 与 Codex 响应头在边界附近会不同步，提前恢复会
+    # 造成“恢复通知 → 下一次请求马上响应头禁用”的假恢复。
     if reason == "quota":
         if provider_of(account_key) == "openai":
             if not _usage_has_any_quota_signal(usage):
@@ -1246,6 +1382,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                         "disabled_until": acc.get("disabled_until")}
             if not fresh:
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
+                        "any_over": False, "hit_windows": [],
+                        "disabled_until": acc.get("disabled_until")}
+            if _quota_disabled_until_still_future(acc):
+                return {"action": "quota_cooldown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
         try:
@@ -2275,8 +2415,8 @@ async def quota_monitor_once() -> dict:
             _pl = claude_plan_label(acc)
             _plan_tag = f"\n🅰 Claude · {notifier.escape_html(_pl)}" if _pl else ""
         elif provider_of(ak) == "openai":
-            _pl = acc.get("plan_type") or ""
-            _plan_tag = f"\n🅾 OpenAI · {notifier.escape_html(_pl)}" if _pl else ""
+            _label = openai_plan_workspace_label(acc)
+            _plan_tag = f"\n🅾 {notifier.escape_html(_label)}" if _label else ""
 
         if action == "disabled":
             latest_reset = result["disabled_until"]
@@ -2294,10 +2434,12 @@ async def quota_monitor_once() -> dict:
             out[email] = "still_over_quota"
         elif action == "resumed":
             out[email] = "resumed"
-            notifier.notify_event(
+            notifier.throttled_notify_event_sync(
                 "quota_resumed",
+                f"quota_resumed:{ak}",
                 "✅ <b>OAuth 配额已恢复，账号重新启用</b>\n"
                 f"账号: <code>{notifier.escape_html(email)}</code>{_plan_tag}",
+                cooldown_seconds=300,
             )
         elif action == "kept_enabled":
             parts = [f"{u:.0f}%" if u is not None else "-" for u in utils]
