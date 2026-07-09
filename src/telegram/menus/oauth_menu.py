@@ -425,10 +425,6 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
 def _should_refresh_account_for_ui(acc: dict | None) -> bool:
     if not acc or not acc.get("email"):
         return False
-    if oauth_manager.provider_of(acc) == "xai":
-        # Grok/xAI 请求级 usage/cost 随模型响应返回；账号级 quota/billing 属于
-        # xAI Management API，不用 OAuth refresh token 在账户页轮询。
-        return False
     # 用户手动禁用 / auth_error 不做自动远端刷新；quota 禁用需要刷新，
     # 否则缺 cache 时会一直显示“尚未获取”，也无法自动恢复。
     return acc.get("disabled_reason") not in ("user", "auth_error")
@@ -454,6 +450,8 @@ def _needs_oauth_cache_refresh_for_ui(account_key: str) -> bool:
         return True
 
     stale = _quota_cache_is_stale_for_ui(row)
+    if prov == "xai" and not _quota_cache_has_usage_signal(row):
+        return True
     if prov == "openai":
         count = _openai_reset_credit_count_from_row(row)
         details = _openai_reset_credit_details_from_row(row)
@@ -715,6 +713,152 @@ def _fmt_usd(v: float | int | None) -> str:
     return f"${x:.2f}"
 
 
+def _fmt_credit_amount(v) -> str:
+    if v is None:
+        return "?"
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    if abs(x - int(x)) < 1e-9:
+        return f"{int(x):,}"
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def _xai_raw_from_row(row: dict | None) -> dict:
+    if not row or not row.get("raw_data"):
+        return {}
+    try:
+        raw = json.loads(row.get("raw_data") or "{}")
+    except Exception:
+        return {}
+    xai = raw.get("xai") if isinstance(raw, dict) else None
+    return xai if isinstance(xai, dict) else {}
+
+
+def _xai_raw(account_key: str) -> dict:
+    return _xai_raw_from_row(state_db.quota_load(account_key))
+
+
+def _xai_tier_label(xai: dict) -> str:
+    user = xai.get("user") if isinstance(xai.get("user"), dict) else {}
+    settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
+    vals = []
+    for v in (user.get("subscription_tier"), settings.get("subscription_tier_display")):
+        s = str(v or "").strip()
+        if s and s not in vals:
+            vals.append(s)
+    return " / ".join(vals)
+
+
+def _xai_access_parts(xai: dict) -> list[str]:
+    user = xai.get("user") if isinstance(xai.get("user"), dict) else {}
+    settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
+    blocked = bool(user.get("blocked") or user.get("user_blocked_reason") or user.get("team_blocked_reasons"))
+    allow_access = settings.get("allow_access")
+    has_code = user.get("has_grok_code_access")
+    parts = []
+    if blocked:
+        parts.append("⚠ 账号受限")
+    elif allow_access is False:
+        parts.append("⚠ 访问受限")
+    elif allow_access is True or has_code is True:
+        parts.append("✅ 访问正常")
+    if has_code is True:
+        parts.append("Grok Code 可用")
+    elif has_code is False:
+        parts.append("Grok Code 不可用")
+    return parts
+
+
+def _format_xai_provider_line(account_key: str, *, detail: bool = False) -> str:
+    xai = _xai_raw(account_key)
+    if not xai or xai.get("source") == "unsupported":
+        return ""
+    lines: list[str] = []
+    tier = _xai_tier_label(xai)
+    access = _xai_access_parts(xai)
+    if tier:
+        if detail:
+            lines.append(f"🏷 套餐: <code>{ui.escape_html(tier)}</code>")
+        else:
+            code_part = " · ✅ Grok Code 可用" if "Grok Code 可用" in access else ""
+            lines.append(f"🏷 套餐: {ui.escape_html(tier)}{code_part}")
+    if detail and access:
+        icon = "⚠" if any(str(x).startswith("⚠") for x in access) else "✅"
+        lines.append(f"{icon} 访问: <code>{ui.escape_html(' · '.join(access))}</code>")
+    return "\n".join(lines) + ("\n" if lines and detail else "")
+
+
+def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str:
+    row = state_db.quota_load(account_key)
+    xai = _xai_raw_from_row(row)
+    if not xai or xai.get("source") == "unsupported":
+        return "📊 官方额度: <i>尚未获取</i>" if not detail else "<b>📊 官方账单</b>\n尚未获取（点「刷新账单」拉取）"
+
+    billing = xai.get("billing") if isinstance(xai.get("billing"), dict) else {}
+    settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
+    used = billing.get("used")
+    limit = billing.get("monthly_limit")
+    remaining = billing.get("remaining")
+    pct = billing.get("used_percent")
+    period_end = billing.get("billing_period_end")
+
+    def _pct_text(value) -> str:
+        try:
+            return f"{float(value):.2f}%"
+        except (TypeError, ValueError):
+            return "?"
+
+    if not detail:
+        if limit not in (None, "") and used not in (None, ""):
+            reset = _format_bjt(period_end) if period_end else "?"
+            return (
+                f"📊 额度: 剩余 {_fmt_credit_amount(remaining)} / "
+                f"{_fmt_credit_amount(limit)} · 已用 {_pct_text(pct)} · "
+                f"重置 {ui.escape_html(reset)}"
+            )
+        return "📊 额度: <i>上游未返回月额度</i>"
+
+    lines = ["<b>📊 官方账单</b>"]
+    if limit not in (None, "") and used not in (None, ""):
+        lines.append(
+            f"月额度: <code>{_fmt_credit_amount(used)} / {_fmt_credit_amount(limit)}</code> credits"
+            f"（剩 {_fmt_credit_amount(remaining)}，已用 {_pct_text(pct)}）"
+        )
+    else:
+        lines.append("月额度: <i>上游未返回</i>")
+    start = billing.get("billing_period_start")
+    end = billing.get("billing_period_end")
+    if start or end:
+        lines.append(f"账期: <code>{_format_bjt(start)}</code> → <code>{_format_bjt(end)}</code>")
+    if billing.get("on_demand_cap") is not None or billing.get("on_demand_used") is not None:
+        lines.append(
+            f"按需: 上限 <code>{_fmt_credit_amount(billing.get('on_demand_cap'))}</code>"
+            f" · 已用 <code>{_fmt_credit_amount(billing.get('on_demand_used'))}</code>"
+        )
+    if billing.get("prepaid_balance") is not None:
+        lines.append(f"预付余额: <code>{_fmt_credit_amount(billing.get('prepaid_balance'))}</code>")
+    if billing.get("is_unified_billing_user") is not None:
+        lines.append("统一计费: <code>是</code>" if billing.get("is_unified_billing_user") else "统一计费: <code>否</code>")
+    if settings.get("default_model"):
+        lines.append(f"默认模型: <code>{ui.escape_html(str(settings.get('default_model')))}</code>")
+    comp_parts = []
+    if settings.get("compaction_mode"):
+        comp_parts.append(str(settings.get("compaction_mode")))
+    if settings.get("flush_soft_threshold_tokens") is not None:
+        comp_parts.append(f"flush {settings.get('flush_soft_threshold_tokens')} tokens")
+    if comp_parts:
+        lines.append(f"Compaction: <code>{ui.escape_html(' · '.join(comp_parts))}</code>")
+    errors = xai.get("errors") if isinstance(xai.get("errors"), dict) else {}
+    if errors:
+        lines.append("⚠ 部分补充接口刷新失败，已保留主账单数据。")
+    if row and row.get("fetched_at"):
+        dt = datetime.fromtimestamp(int(row.get("fetched_at")) / 1000, tz=_BJT)
+        lines.append(f"<i>更新于 {dt.strftime('%H:%M:%S')}</i>")
+    return "\n".join(lines)
+
+
 def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     """Grok/xAI OAuth 本地花费块。
 
@@ -735,15 +879,16 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     output = int(month.get("output") or 0)
     cache_read = int(month.get("cache_read") or 0)
 
-    money_line = f"📊 本月金额: {_fmt_usd(cost)}"
+    money_line = f"💵 本地计费: {_fmt_usd(cost)}"
     if bill_count > 0:
         money_line += f" · {bill_count} 笔计费"
 
-    usage_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
+    usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
     if cache_read > 0:
         usage_line += f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
 
-    lines = [money_line, usage_line]
+    lines = ["<b>💵 Parrot 本地计费</b>"] if detail else []
+    lines.extend([money_line, usage_line])
     if month.get("avg_tps") is not None:
         lines.append(
             f"⚡️ TPS: 平均 {ui.fmt_tps(month.get('avg_tps'))} · "
@@ -836,11 +981,16 @@ def _format_account_block(acc: dict) -> str:
         cl_label = oauth_manager.claude_plan_label(acc)
         if cl_label:
             lines.append(f"🏷️ 套餐: <code>{ui.escape_html(cl_label)}</code>")
+    elif prov == "xai":
+        plan_line = _format_xai_provider_line(ak, detail=False)
+        if plan_line:
+            lines.extend(plan_line.splitlines())
 
-    # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok 没有
-    # OAuth 账号级 quota，改展示 Parrot 本地累计金额/token。
+    # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
+    # 展示官方月度额度 + Parrot 本地累计金额/token。
     _now_ts = time.time()
     if prov == "xai":
+        lines.extend(_format_xai_official_block(ak, detail=False).splitlines())
         lines.extend(_format_xai_spend_block(ak, detail=False).splitlines())
     elif row:
         fh_util = row.get("five_hour_util")
@@ -865,12 +1015,12 @@ def _format_account_block(acc: dict) -> str:
             lines.append(f"📊 30d: {_format_usage_value_html(td_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
         if fh_util is None and sd_util is None and td_util is None:
             if prov == "xai":
-                lines.append("📊 用量: <i>请求级 usage/cost 随响应记录；账号级额度需 Management API</i>")
+                lines.append("📊 官方额度: <i>尚未获取</i>")
             else:
                 lines.append("📊 用量: <i>尚未获取</i>")
     else:
         if prov == "xai":
-            lines.append("📊 用量: <i>请求级 usage/cost 随响应记录；账号级额度需 Management API</i>")
+            lines.append("📊 官方额度: <i>尚未获取</i>")
         else:
             lines.append("📊 用量: <i>尚未获取</i>")
 
@@ -913,7 +1063,7 @@ def _format_account_block(acc: dict) -> str:
 def _format_usage_block(account_key: str) -> str:
     provider = oauth_manager.provider_of(account_key)
     if provider == "xai":
-        return _format_xai_spend_block(account_key, detail=True)
+        return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(account_key, detail=True)
     row = state_db.quota_load(account_key)
     if not row:
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
@@ -1936,6 +2086,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             provider_line += f"📋 订阅: <code>{ui.escape_html(' · '.join(sub_parts))}</code>\n"
         if sub_created:
             provider_line += f"📅 开始: <code>{_format_bjt(sub_created)}</code>\n"
+    elif prov == "xai":
+        provider_line = _format_xai_provider_line(account_key, detail=True)
     else:
         provider_line = ""
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
@@ -1961,7 +2113,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         text += "\n\n" + reset_cards_block
 
     month_block = _format_month_stats_block(account_key)
-    if month_block and prov != "xai":
+    if month_block:
         text += "\n" + month_block
 
     short = ui.register_code(account_key)
@@ -1985,7 +2137,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             text += f" (累计失败 {e['error_count']} 次)\n"
 
     payload = _callback_payload(short, page, filter_key)
-    usage_btn_label = "💵 金额说明" if prov == "xai" else "📊 刷新用量/重置卡"
+    usage_btn_label = "📊 刷新账单" if prov == "xai" else "📊 刷新用量/重置卡"
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
          ui.btn(usage_btn_label,   f"oa:refresh_usage:{payload}")],
@@ -2078,19 +2230,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     email = _account_email(ak)
     provider = oauth_manager.provider_of(ak)
-    if provider == "xai":
-        ui.answer_cb(cb_id, "Grok 金额来自本地响应日志")
-        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
-        if text:
-            head = (
-                "ℹ️ Grok 金额统计来自 Parrot 本地响应日志里的 "
-                "<code>usage.cost_in_usd_ticks</code>；\n"
-                "账号级余额 / prepaid balance / spending limit 仍需要 xAI Management API key + team_id。"
-            )
-            ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
-        return
     if provider == "openai":
         ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
+    elif provider == "xai":
+        ui.answer_cb(cb_id, "拉取 Grok 官方账单...")
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
@@ -2126,6 +2269,17 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             fields = metadata_action.get("fields") or {}
             if fields.get("plan_type"):
                 head += f"\n🏷 套餐信息已刷新: <code>{ui.escape_html(fields.get('plan_type'))}</code>"
+        if quota_action and quota_action.get("action") == "disabled":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "still_over_quota":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "resumed":
+            head += "\n♻ 额度已恢复，已自动解除配额禁用"
+        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+    elif provider == "xai":
+        head = "✅ 已更新 Grok 官方账单"
         if quota_action and quota_action.get("action") == "disabled":
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"

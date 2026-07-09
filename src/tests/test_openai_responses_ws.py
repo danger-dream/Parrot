@@ -675,6 +675,14 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     assert "background" not in codex_mapped
     assert "unknown_provider_field" not in codex_mapped
     assert "_api_key_name" not in codex_mapped
+    assert "ws_request_header_x_openai_internal_codex_responses_lite" not in codex_mapped.get("client_metadata", {})
+
+    codex_lite_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
+        "type": "response.create", "model": "gpt-5.6-luna", "input": "hello",
+        "stream": True, "client_metadata": {"a": "b"},
+    }, "gpt-5.6-luna", channel=oauth)
+    assert codex_lite_mapped["client_metadata"]["a"] == "b"
+    assert codex_lite_mapped["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"] == "true"
 
 
 @pytest.mark.asyncio

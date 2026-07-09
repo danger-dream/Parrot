@@ -26,6 +26,7 @@ import json
 import os
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -40,9 +41,13 @@ CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 SCOPES = "openid profile email offline_access grok-cli:access api:access"
 REDIRECT_URI = "http://127.0.0.1:56121/callback"
 DEFAULT_API_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_CLI_PROXY_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+DEFAULT_CLI_CLIENT_VERSION = "0.2.93"
 
 _TOKEN_HTTP_TIMEOUT = 120.0
 _DISCOVERY_TIMEOUT = 15.0
+_CLI_HTTP_TIMEOUT = 15.0
+_CLI_OPTIONAL_HTTP_TIMEOUT = 8.0
 _USER_AGENT = "parrot/xai-oauth-adapter"
 
 
@@ -115,6 +120,20 @@ def _redirect_uri() -> str:
 
 def api_base_url() -> str:
     return _cfg_str("apiBaseUrl", "api_base_url", "baseUrl", default=DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def cli_proxy_base_url() -> str:
+    return _cfg_str(
+        "cliProxyBaseUrl", "cli_proxy_base_url",
+        default=DEFAULT_CLI_PROXY_BASE_URL,
+    ).rstrip("/")
+
+
+def cli_client_version() -> str:
+    return _cfg_str(
+        "cliClientVersion", "cli_client_version",
+        default=DEFAULT_CLI_CLIENT_VERSION,
+    )
 
 
 def authorization_url() -> str:
@@ -425,12 +444,257 @@ def extract_user_info(id_token_claims: dict) -> dict:
     }
 
 
+# ─── Grok CLI billing / usage helpers ───────────────────────────
+
+
+def _validate_cli_proxy_base_url(raw_url: str) -> str:
+    raw = str(raw_url or "").strip().rstrip("/")
+    if not raw:
+        raise ValueError("xAI CLI proxy base URL is empty")
+    parsed = urlparse(raw)
+    if parsed.scheme != "https":
+        raise ValueError(f"xAI CLI proxy base URL must use https: {raw!r}")
+    host = (parsed.hostname or "").lower().strip()
+    if host != "cli-chat-proxy.grok.com":
+        raise ValueError(f"xAI CLI proxy base URL host {host!r} is not cli-chat-proxy.grok.com")
+    return raw
+
+
+def _cli_proxy_url(path_and_query: str) -> str:
+    path = str(path_and_query or "").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    return _validate_cli_proxy_base_url(cli_proxy_base_url()) + path
+
+
+def _num_val(obj: Any) -> float | None:
+    if isinstance(obj, dict):
+        obj = obj.get("val")
+    if obj is None:
+        return None
+    try:
+        return float(obj)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_num(v: float | None) -> int | float | None:
+    if v is None:
+        return None
+    if abs(v - int(v)) < 1e-9:
+        return int(v)
+    return v
+
+
+def _cli_get_json_sync(access_token: str, path_and_query: str,
+                       *, timeout: float | None = None) -> dict:
+    resp = network.get_sync(
+        _cli_proxy_url(path_and_query),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": f"grok-cli/{cli_client_version()}",
+            "x-grok-client-version": cli_client_version(),
+        },
+        timeout=_CLI_HTTP_TIMEOUT if timeout is None else timeout,
+        proxy_purpose="oauth_xai",
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def _optional_cli_get_json_sync(access_token: str, path_and_query: str) -> tuple[dict | None, str | None]:
+    try:
+        return _cli_get_json_sync(
+            access_token, path_and_query, timeout=_CLI_OPTIONAL_HTTP_TIMEOUT,
+        ), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _history_items(raw_history: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_history, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_history:
+        if not isinstance(item, dict):
+            continue
+        cyc = item.get("billingCycle") or item.get("billing_cycle") or {}
+        included = _clean_num(_num_val(item.get("includedUsed") or item.get("included_used")))
+        ondemand = _clean_num(_num_val(item.get("onDemandUsed") or item.get("on_demand_used")))
+        total = _clean_num(_num_val(item.get("totalUsed") or item.get("total_used")))
+        out.append({
+            "year": cyc.get("year") if isinstance(cyc, dict) else None,
+            "month": cyc.get("month") if isinstance(cyc, dict) else None,
+            "included_used": included,
+            "on_demand_used": ondemand,
+            "total_used": total,
+        })
+    return out
+
+
+def _mock_cli_billing_usage() -> dict:
+    usage = empty_usage()
+    usage["openai"] = {"thirty_day": {"utilization": 0.0, "resets_at": None}}
+    usage["xai"] = {
+        "source": "mock",
+        "quota_supported": True,
+        "billing": {
+            "monthly_limit": 0,
+            "used": 0,
+            "remaining": None,
+            "used_percent": None,
+            "billing_period_start": None,
+            "billing_period_end": None,
+        },
+        "user": {"has_grok_code_access": True, "subscription_tier": "Mock"},
+        "settings": {"allow_access": True, "subscription_tier_display": "Mock"},
+    }
+    return usage
+
+
+def fetch_cli_billing_usage_sync(access_token: str) -> dict:
+    """Fetch Grok CLI official billing/subscription snapshot.
+
+    Main quota signal comes from ``/v1/billing?format=auto-topup``.  The returned
+    structure keeps Claude/OpenAI-compatible empty windows, maps the monthly
+    credit utilization to ``openai.thirty_day`` for the shared quota monitor, and
+    stores the detailed xAI payload under ``xai`` for UI rendering.
+    """
+    if _mock_mode_enabled():
+        return _mock_cli_billing_usage()
+
+    auto = _cli_get_json_sync(access_token, "/billing?format=auto-topup")
+    optional_paths = {
+        "credits": "/billing?format=credits",
+        "user": "/user?include=subscription",
+        "settings": "/settings",
+    }
+    optional_results: dict[str, tuple[dict | None, str | None]] = {}
+    with ThreadPoolExecutor(max_workers=len(optional_paths)) as pool:
+        futures = {
+            pool.submit(_optional_cli_get_json_sync, access_token, path): name
+            for name, path in optional_paths.items()
+        }
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                optional_results[name] = fut.result()
+            except Exception as exc:
+                optional_results[name] = (None, f"{type(exc).__name__}: {exc}")
+
+    credits, credits_err = optional_results.get("credits", (None, "not fetched"))
+    user, user_err = optional_results.get("user", (None, "not fetched"))
+    settings, settings_err = optional_results.get("settings", (None, "not fetched"))
+
+    auto_cfg = auto.get("config") if isinstance(auto.get("config"), dict) else {}
+    credits_cfg = credits.get("config") if isinstance(credits, dict) and isinstance(credits.get("config"), dict) else {}
+
+    monthly_limit = _num_val(auto_cfg.get("monthlyLimit") or auto_cfg.get("monthly_limit"))
+    used = _num_val(
+        auto_cfg.get("used")
+        or auto_cfg.get("totalUsed")
+        or auto_cfg.get("total_used")
+        or auto_cfg.get("includedUsed")
+        or auto_cfg.get("included_used")
+    )
+    remaining = None
+    used_percent = None
+    if monthly_limit is not None and monthly_limit > 0 and used is not None:
+        remaining = max(0.0, monthly_limit - used)
+        used_percent = max(0.0, min(100.0, used / monthly_limit * 100.0))
+
+    period_start = auto_cfg.get("billingPeriodStart") or auto_cfg.get("billing_period_start")
+    period_end = auto_cfg.get("billingPeriodEnd") or auto_cfg.get("billing_period_end")
+    current_period = credits_cfg.get("currentPeriod") if isinstance(credits_cfg.get("currentPeriod"), dict) else {}
+
+    on_demand_cap = _num_val(auto_cfg.get("onDemandCap") or auto_cfg.get("on_demand_cap"))
+    if on_demand_cap is None:
+        on_demand_cap = _num_val(credits_cfg.get("onDemandCap") or credits_cfg.get("on_demand_cap"))
+    on_demand_used = _num_val(credits_cfg.get("onDemandUsed") or credits_cfg.get("on_demand_used"))
+    prepaid_balance = _num_val(credits_cfg.get("prepaidBalance") or credits_cfg.get("prepaid_balance"))
+
+    user = user if isinstance(user, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
+    team_blocked = user.get("teamBlockedReasons") if isinstance(user.get("teamBlockedReasons"), list) else []
+    blocked_reason = user.get("userBlockedReason")
+
+    xai: dict[str, Any] = {
+        "source": "cli-chat-proxy",
+        "quota_supported": True,
+        "billing": {
+            "monthly_limit": _clean_num(monthly_limit),
+            "used": _clean_num(used),
+            "remaining": _clean_num(remaining),
+            "used_percent": used_percent,
+            "billing_period_start": period_start,
+            "billing_period_end": period_end,
+            "on_demand_cap": _clean_num(on_demand_cap),
+            "on_demand_used": _clean_num(on_demand_used),
+            "prepaid_balance": _clean_num(prepaid_balance),
+            "is_unified_billing_user": credits_cfg.get("isUnifiedBillingUser"),
+            "top_up_method": credits_cfg.get("topUpMethod"),
+            "credits_period_type": current_period.get("type") if isinstance(current_period, dict) else None,
+            "credits_period_start": current_period.get("start") if isinstance(current_period, dict) else None,
+            "credits_period_end": current_period.get("end") if isinstance(current_period, dict) else None,
+            "history": _history_items(auto_cfg.get("history")),
+        },
+        "user": {
+            "user_id": user.get("userId"),
+            "principal_type": user.get("principalType"),
+            "principal_id": user.get("principalId"),
+            "has_grok_code_access": user.get("hasGrokCodeAccess"),
+            "subscription_tier": user.get("subscriptionTier"),
+            "blocked": bool(blocked_reason or team_blocked),
+            "user_blocked_reason": blocked_reason,
+            "team_blocked_reasons": team_blocked,
+        },
+        "settings": {
+            "allow_access": settings.get("allow_access"),
+            "subscription_tier_display": settings.get("subscription_tier_display"),
+            "default_model": settings.get("default_model"),
+            "on_demand_enabled": settings.get("on_demand_enabled"),
+            "usage_billing_redirect_url": settings.get("usage_billing_redirect_url"),
+            "compaction_mode": settings.get("compaction_mode"),
+            "flush_soft_threshold_tokens": settings.get("flush_soft_threshold_tokens"),
+        },
+    }
+    errors = {
+        k: v for k, v in {
+            "credits": credits_err,
+            "user": user_err,
+            "settings": settings_err,
+        }.items() if v
+    }
+    if errors:
+        xai["errors"] = errors
+
+    thirty_day = {}
+    if used_percent is not None:
+        thirty_day = {"utilization": used_percent, "resets_at": period_end}
+
+    return {
+        "five_hour": {},
+        "seven_day": {},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "openai": {"thirty_day": thirty_day},
+        "extra_usage": {"is_enabled": bool(on_demand_cap and on_demand_cap > 0)},
+        "xai": xai,
+    }
+
+
+async def fetch_cli_billing_usage(access_token: str) -> dict:
+    return await asyncio.to_thread(fetch_cli_billing_usage_sync, access_token)
+
+
 def empty_usage() -> dict:
     """Return an Anthropic-shaped usage payload with xAI marked unsupported.
 
-    xAI OAuth currently has no confirmed zero-cost quota endpoint equivalent to
-    Claude `/oauth/usage` or OpenAI/Codex WHAM.  Returning no quota signal keeps
-    Parrot from auto-disabling or auto-resuming accounts based on guessed data.
+    Kept for backward compatibility and tests.  Runtime xAI billing now uses
+    ``fetch_cli_billing_usage``; this empty shape is still useful when callers
+    intentionally need a no-signal placeholder.
     """
     return {
         "five_hour": {},

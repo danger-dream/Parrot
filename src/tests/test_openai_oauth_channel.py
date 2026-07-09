@@ -402,8 +402,12 @@ def test_channel_default_models_fallback(m):
     })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:no-models@x:acct"))
     models = ch.list_client_models()
-    # 默认 5 个：gpt-5.2 / gpt-5.2-codex / gpt-5.3-codex / gpt-5.4 / gpt-5.5
-    expected = {"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"}
+    # 默认模型跟随 Codex 官方目录：GPT-5.6 系列优先，保留旧稳定模型。
+    expected = {
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+        "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
+    }
     assert set(models) == expected, models
     # supports_model 命中
     for m_id in expected:
@@ -427,7 +431,7 @@ def test_channel_responses_ingress(m):
     assert h["chatgpt-account-id"] == "acct-123"
     assert h["openai-beta"] == "responses=experimental"
     assert h["originator"] == "codex_cli_rs"
-    assert h["version"] == "0.135.0"
+    assert h["version"] == "0.144.0"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -437,7 +441,34 @@ def test_channel_responses_ingress(m):
     assert payload["store"] is False
     assert payload["stream"] is True
     assert "temperature" not in payload
+    assert "x-openai-internal-codex-responses-lite" not in h
     print("  [PASS] channel: responses ingress → full codex request shape")
+
+
+def test_channel_responses_ingress_gpt56_enables_responses_lite(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {"model": "gpt-5.6-luna", "input": "hi", "stream": False}
+    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.6-luna",
+                                                ingress_protocol="responses"))
+    h = {k.lower(): v for k, v in req.headers.items()}
+    assert h["version"] == "0.144.0"
+    assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
+    assert h["x-openai-internal-codex-responses-lite"] == "true"
+    payload = json.loads(req.body)
+    assert payload["model"] == "gpt-5.6-luna"
+    assert payload["store"] is False
+    assert payload["stream"] is True
+    assert payload["instructions"] == ""
+    assert payload["parallel_tool_calls"] is False
+    assert payload["reasoning"]["context"] == "all_turns"
+    assert "tools" not in payload
+    assert payload["input"][0] == {"type": "additional_tools", "role": "developer", "tools": []}
+    assert payload["input"][1]["role"] == "developer"
+    assert payload["input"][1]["content"][0]["type"] == "input_text"
+    assert payload["input"][2] == {"type": "message", "role": "user", "content": "hi"}
+    print("  [PASS] channel: GPT-5.6 enables Codex Responses Lite")
 
 
 def test_channel_responses_ingress_replay_scope_and_injection(m):

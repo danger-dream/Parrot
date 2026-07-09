@@ -206,6 +206,114 @@ def test_xai_account_key_registry_and_usage(m):
     assert ch.supports_model("grok-4") == "grok-4"
 
 
+def test_xai_cli_billing_usage_parse_and_quota_shape(m, monkeypatch):
+    _setup(m)
+    p = m["xai_provider"]
+    om = m["oauth_manager"]
+
+    def _disable_mock(c):
+        c.setdefault("oauth", {})["mockMode"] = False
+    m["config"].update(_disable_mock)
+    monkeypatch.setattr(p, "_mock_mode_enabled", lambda: False)
+
+    class Resp:
+        def __init__(self, data):
+            self._data = data
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return self._data
+
+    def fake_get(url, *, headers=None, timeout=None, proxy_purpose=None):
+        assert headers["Authorization"] == "Bearer at-xai"
+        assert headers["x-grok-client-version"] == "0.2.93"
+        assert proxy_purpose == "oauth_xai"
+        if "format=auto-topup" in url:
+            return Resp({"config": {
+                "monthlyLimit": {"val": 15000},
+                "used": {"val": 2},
+                "onDemandCap": {"val": 0},
+                "billingPeriodStart": "2026-07-01T00:00:00+00:00",
+                "billingPeriodEnd": "2026-08-01T00:00:00+00:00",
+                "history": [{
+                    "billingCycle": {"year": 2026, "month": 6},
+                    "includedUsed": {"val": 1},
+                    "onDemandUsed": {"val": 0},
+                    "totalUsed": {"val": 1},
+                }],
+            }})
+        if "format=credits" in url:
+            return Resp({"config": {
+                "onDemandUsed": {"val": 0},
+                "prepaidBalance": {"val": 0},
+                "isUnifiedBillingUser": True,
+            }})
+        if url.endswith("/user?include=subscription"):
+            return Resp({
+                "userId": "sub-1",
+                "principalType": "User",
+                "principalId": "sub-1",
+                "hasGrokCodeAccess": True,
+                "subscriptionTier": "GrokPro",
+                "userBlockedReason": None,
+                "teamBlockedReasons": [],
+            })
+        if url.endswith("/settings"):
+            return Resp({
+                "allow_access": True,
+                "subscription_tier_display": "SuperGrok",
+                "default_model": "grok-4-5",
+                "compaction_mode": "segments",
+                "flush_soft_threshold_tokens": 4000,
+            })
+        raise AssertionError(url)
+
+    monkeypatch.setattr(p.network, "get_sync", fake_get)
+    usage = p.fetch_cli_billing_usage_sync("at-xai")
+    billing = usage["xai"]["billing"]
+    assert billing["monthly_limit"] == 15000
+    assert billing["used"] == 2
+    assert billing["remaining"] == 14998
+    assert billing["used_percent"] == pytest.approx(2 / 15000 * 100)
+    assert usage["xai"]["user"]["subscription_tier"] == "GrokPro"
+    assert usage["xai"]["settings"]["default_model"] == "grok-4-5"
+    flat = om.flatten_usage(usage)
+    assert flat["thirty_day_util"] == pytest.approx(2 / 15000 * 100)
+    assert flat["thirty_day_reset"] == "2026-08-01T00:00:00+00:00"
+    assert flat["five_hour_util"] is None
+    assert flat["seven_day_util"] is None
+
+
+def test_xai_quota_resume_uses_fresh_billing_even_before_period_end(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    future = _future_expired(86400 * 10)
+    om.add_account({
+        "provider": "xai",
+        "email": "grok@example.test",
+        "subject": "sub-1",
+        "access_token": "at-xai",
+        "refresh_token": "rt-xai",
+        "expired": _future_expired(),
+        "disabled_reason": "quota",
+        "disabled_until": future,
+    })
+    usage = {
+        "five_hour": {},
+        "seven_day": {},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "openai": {"thirty_day": {"utilization": 10.0, "resets_at": future}},
+        "extra_usage": {"is_enabled": False},
+        "xai": {"source": "cli-chat-proxy", "quota_supported": True},
+    }
+    result = om.evaluate_and_toggle_by_usage("xai:sub-1", usage, threshold=95, fresh=True)
+    assert result["action"] == "resumed"
+    acc = om.get_account("xai:sub-1")
+    assert acc["enabled"] is True
+    assert acc.get("disabled_reason") is None
+
+
 def test_xai_channel_request_shape_and_provider_capabilities(m):
     _setup(m)
     account = {

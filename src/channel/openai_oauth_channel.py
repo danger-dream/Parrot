@@ -101,6 +101,8 @@ from ..openai.codex_constants import (
     CODEX_CLI_VERSION,
     CODEX_CLI_USER_AGENT,
     CODEX_ORIGINATOR,
+    CODEX_RESPONSES_LITE_HEADER,
+    codex_model_uses_responses_lite,
 )
 
 _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
@@ -382,6 +384,8 @@ class OpenAIOAuthChannel(Channel):
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
         headers = self._build_headers(access_token)
+        if codex_model_uses_responses_lite(payload.get("model") or resolved_model):
+            headers[CODEX_RESPONSES_LITE_HEADER] = "true"
         # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
         # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
         prov_cfg = _provider_cfg()

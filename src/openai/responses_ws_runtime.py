@@ -14,7 +14,9 @@ from .codex_constants import (
     CODEX_CLI_USER_AGENT,
     CODEX_CLI_VERSION,
     CODEX_ORIGINATOR,
+    CODEX_RESPONSES_LITE_WS_METADATA_KEY,
     RESPONSES_WEBSOCKETS_BETA,
+    codex_model_uses_responses_lite,
 )
 from .codex_identity_confuse import (
     ConfuseState,
@@ -122,6 +124,16 @@ def _filter_responses_payload(
     return filtered
 
 
+def _mark_codex_responses_lite_frame(frame_obj: dict, model: str | None = None) -> None:
+    if not codex_model_uses_responses_lite(model or frame_obj.get("model")):
+        return
+    client_metadata = frame_obj.get("client_metadata")
+    if not isinstance(client_metadata, dict):
+        client_metadata = {}
+    client_metadata[CODEX_RESPONSES_LITE_WS_METADATA_KEY] = "true"
+    frame_obj["client_metadata"] = client_metadata
+
+
 def build_oauth_responses_ws_frame(body: dict, resolved_model: str, *, channel=None) -> dict:
     payload = _filter_responses_payload(body, channel=channel, codex=True)
     payload["model"] = resolved_model
@@ -131,6 +143,7 @@ def build_oauth_responses_ws_frame(body: dict, resolved_model: str, *, channel=N
         resolved_model=resolved_model,
     )
     payload["type"] = "response.create"
+    _mark_codex_responses_lite_frame(payload, resolved_model)
     return payload
 
 
@@ -168,6 +181,8 @@ def prepare_oauth_responses_ws_request_parts(
     frame_obj = _frame_from_oauth_upstream_request(upstream_req, resolved_model)
     if frame_obj is None:
         frame_obj = build_oauth_responses_ws_frame(body, resolved_model, channel=channel)
+    else:
+        _mark_codex_responses_lite_frame(frame_obj, resolved_model)
 
     api_key_name = str((body or {}).get("_api_key_name") or "")
     sid = get_header_case_insensitive(headers, "session-id") or get_header_case_insensitive(headers, "session_id")
@@ -278,6 +293,7 @@ def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> 
         out.pop("background", None)
     if isinstance(channel, OpenAIOAuthChannel):
         out = codex_oauth_transform.apply_codex_oauth_transform(out, resolved_model=model)
+        _mark_codex_responses_lite_frame(out, model)
     if typ:
         out["type"] = typ
     return out

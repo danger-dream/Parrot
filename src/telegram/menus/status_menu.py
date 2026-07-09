@@ -177,7 +177,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
     account_keys = [
         _account_key(a) for a in cfg.get("oauthAccounts", [])
         if a.get("email") and not a.get("disabled_reason")
-        and oauth_manager.provider_of(a) in ("claude", "openai")
+        and oauth_manager.provider_of(a) in ("claude", "openai", "xai")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
@@ -211,9 +211,10 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                 "Sonnet": row.get("sonnet_util"),
                 "Opus": row.get("opus_util"),
             }
+        elif provider == "xai":
+            # Grok/xAI: 官方 billing 月度额度百分比映射到通用 30d 列。
+            utils = {"月度": row.get("thirty_day_util")}
         else:
-            # Grok/xAI 没有 Codex/Claude 式 quota 百分比端点；请求级 usage/cost
-            # 单独由响应 usage 统计，不参与这里的配额预警。
             continue
         hot = [(k, v) for k, v in utils.items() if v is not None and v >= threshold_pct]
         if hot:

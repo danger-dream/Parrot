@@ -15,8 +15,8 @@
   - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
-    gpt-5.6，都原样发出去。新家族只需在 TG 面板或
-    `config.openaiOAuth.defaultModels` 加一行，代码零改动。
+    gpt-5.6，都原样发出去。需要特殊 wire shape 的新家族在本 transform 中按
+    官方 Codex 模型元数据做最小兼容。
   - `instructions` 空 → 注入默认 "You are a helpful coding assistant."
   - legacy `functions` / `function_call` → `tools` / `tool_choice`
   - `input` 是字符串 → 包成 [{type:"message", role:"user", content:<str>}]
@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
+
+from ..codex_constants import codex_model_uses_responses_lite
 
 
 # ─── 默认 instructions（仅一行，与 sub2api applyInstructions 对齐）──
@@ -531,6 +533,40 @@ def _normalize_codex_input(body: dict) -> bool:
     return modified
 
 
+def _apply_responses_lite_body(body: dict) -> None:
+    """Adapt Codex request body to official Responses Lite wire shape.
+
+    Codex models.json marks GPT-5.6 variants with ``use_responses_lite=true``.
+    The official client moves tools and instructions into developer input items,
+    clears top-level instructions/tools, and disables parallel tool calls.
+    """
+    tools = body.pop("tools", None)
+    if not isinstance(tools, list):
+        tools = []
+
+    instructions = body.get("instructions")
+    prefix: list[dict[str, Any]] = [
+        {"type": "additional_tools", "role": "developer", "tools": tools}
+    ]
+    if isinstance(instructions, str) and instructions.strip():
+        prefix.append({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": instructions}],
+        })
+
+    _coerce_input_to_list(body)
+    existing_input = body.get("input")
+    body["input"] = prefix + (existing_input if isinstance(existing_input, list) else [])
+    body["instructions"] = ""
+    body["parallel_tool_calls"] = False
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        reasoning = {}
+    reasoning["context"] = "all_turns"
+    body["reasoning"] = reasoning
+
+
 def apply_codex_oauth_transform(
     body: dict,
     *,
@@ -607,5 +643,8 @@ def apply_codex_oauth_transform(
             if isinstance(default_instructions, str) and default_instructions.strip()
             else _DEFAULT_INSTRUCTIONS
         )
+
+    if codex_model_uses_responses_lite(body.get("model")):
+        _apply_responses_lite_body(body)
 
     return body

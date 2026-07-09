@@ -807,7 +807,7 @@ async def fetch_usage(account_key: str) -> dict:
 
       - Claude / Anthropic: 调 /api/oauth/usage（零 token 成本，JSON body）
       - OpenAI (Codex)    : 调 ChatGPT backend-api/wham/usage（零 Codex 请求成本）
-      - xAI / Grok        : 暂无确认的零成本 quota 端点，返回“未知”空结构
+      - xAI / Grok        : 调 Grok CLI proxy billing/user/settings（零模型 token 成本）
 
     返回：与 Anthropic 原生 `/oauth/usage` JSON 结构兼容的 dict（顶层含
     five_hour / seven_day / ...），让 extract_utils_percent / latest_reset_iso / flatten_usage
@@ -816,10 +816,10 @@ async def fetch_usage(account_key: str) -> dict:
     account_key = _resolve_existing_account_key_or_raise(account_key)
     provider = provider_of(account_key)
 
-    if provider == "xai":
-        return xai_provider.empty_usage()
-
     access_token = await ensure_valid_token(account_key)
+
+    if provider == "xai":
+        return await xai_provider.fetch_cli_billing_usage(access_token)
 
     if provider != "openai":
         # Claude 路径：直接走 /api/oauth/usage
@@ -1370,7 +1370,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
           - 账号已是 quota 禁用：保持不动（不刷新 disabled_until，避免目标移动）
           - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
       • 所有窗口 util < threshold → 可用
-          - OpenAI 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
+          - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
           - OpenAI 账号若仍处于 disabled_until 冷却期，或仍有未过期的 Codex
             响应头超限快照，继续保持 quota 禁用，避免 WHAM/Codex 边界不同步
@@ -1379,6 +1379,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             全部低于阈值时，才 set_enabled(True) 自动恢复。
             respect_disabled_until=False 的官方 reset credit / 手动强刷新路径例外：
             上游已确认消耗 reset 后，可用新鲜 usage 直接覆盖本地旧冷却时间。
+          - Grok 账号使用官方 billing 月度快照，fresh usage 低于阈值即可恢复。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
@@ -1398,15 +1399,16 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         except Exception:
             threshold = 95.0
 
+    canonical = _resolve_existing_account_key(account_key)
+    if canonical:
+        account_key = canonical
+    provider = provider_of(account_key)
     utils = extract_utils_percent(usage)
-    window_labels = ["5h", "7d", "30d", "sonnet", "opus"]
+    window_labels = ["5h", "7d", "月度" if provider == "xai" else "30d", "sonnet", "opus"]
     hit_windows = [lbl for lbl, u in zip(window_labels, utils)
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)
 
-    canonical = _resolve_existing_account_key(account_key)
-    if canonical:
-        account_key = canonical
     acc = get_account(account_key)
     if acc is None:
         return {"action": "noop_missing", "utils": utils, "any_over": any_over,
@@ -1451,7 +1453,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
     # 提前恢复：OpenAI WHAM 与 Codex 响应头在边界附近会不同步，提前恢复会
     # 造成“恢复通知 → 下一次请求马上响应头禁用”的假恢复。
     if reason == "quota":
-        if provider_of(account_key) in ("openai", "xai"):
+        if provider in ("openai", "xai"):
             if not _usage_has_any_quota_signal(usage):
                 return {"action": "quota_unknown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
@@ -1460,7 +1462,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
-            if respect_disabled_until and _quota_disabled_until_still_future(acc):
+            # OpenAI/Codex 的 WHAM 与响应头窗口可能短暂不同步，需等本地
+            # disabled_until 过期；Grok 使用官方 billing 月度快照，fresh 数据
+            # 低于阈值即可恢复，避免充值/提额后被锁到月底。
+            if provider == "openai" and respect_disabled_until and _quota_disabled_until_still_future(acc):
                 return {"action": "quota_cooldown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
@@ -2350,7 +2355,15 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
     if prov == "openai":
         parts.append("📊 用量: <i>由响应头更新（无独立端点）</i>")
     elif prov == "xai":
-        parts.append("📊 用量: <i>请求级 usage/cost 由响应返回；账号级额度需 xAI Management API</i>")
+        td_util = (usage_flat or {}).get("thirty_day_util") if usage_flat else None
+        td_reset = (usage_flat or {}).get("thirty_day_reset") if usage_flat else None
+        if td_util is not None:
+            parts.append(
+                f"📊 月度额度: <b>{td_util:.2f}%</b>"
+                f" | 重置: <code>{_to_bjt(td_reset)}</code>"
+            )
+        else:
+            parts.append("📊 月度额度: <i>本次未拉取到</i>")
     elif usage_flat:
         fh_util = usage_flat.get("five_hour_util")
         sd_util = usage_flat.get("seven_day_util")
@@ -2504,9 +2517,6 @@ async def quota_monitor_once() -> dict:
             continue
         ak = _account_key(acc)
         provider = provider_of(acc)
-        if provider == "xai":
-            out[ak] = "skipped:xai_account_quota_unsupported"
-            continue
         if acc.get("disabled_reason") in ("user", "auth_error"):
             out[email] = f"skipped:{acc['disabled_reason']}"
             continue
@@ -2540,6 +2550,8 @@ async def quota_monitor_once() -> dict:
         elif provider == "openai":
             _label = openai_plan_workspace_label(acc)
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('openai')} {notifier.escape_html(_label)}" if _label else ""
+        elif provider == "xai":
+            _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
 
         if action == "disabled":
             latest_reset = result["disabled_until"]

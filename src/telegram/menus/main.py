@@ -23,14 +23,13 @@ def _kb() -> dict:
 
 def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     """返回当前用量 >= threshold 的 OAuth 账户数量（不含已禁用）。"""
-    # 使用 oauth_manager.list_accounts() 作为唯一数据源，
-    # 只覆盖有账号级 quota 体系的 provider（Claude + OpenAI）；Grok/xAI
-    # 请求级 usage/cost 随响应记录，不参与这里的配额热度计数。
+    # 使用 oauth_manager.list_accounts() 作为唯一数据源。
+    # Claude/OpenAI 走窗口配额；Grok/xAI 走官方月度 billing percent。
     accounts = oauth_manager.list_accounts()
     account_keys = [
         _account_key(a) for a in accounts
         if a.get("email") and not a.get("disabled_reason")
-        and oauth_manager.provider_of(a) in ("claude", "openai")
+        and oauth_manager.provider_of(a) in ("claude", "openai", "xai")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
@@ -39,14 +38,18 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
         email = acc.get("email")
         if not email:
             continue
-        if oauth_manager.provider_of(acc) not in ("claude", "openai"):
+        provider = oauth_manager.provider_of(acc)
+        if provider not in ("claude", "openai", "xai"):
             continue
         ak = _account_key(acc)
         row = state_db.quota_load(ak)
         if not row:
             continue
-        utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",
-                                       "sonnet_util", "opus_util")]
+        if provider == "xai":
+            utils = [row.get("thirty_day_util")]
+        else:
+            utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",
+                                           "thirty_day_util", "sonnet_util", "opus_util")]
         if any(u is not None and u >= threshold_pct for u in utils):
             n += 1
     return n
