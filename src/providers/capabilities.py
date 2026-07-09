@@ -173,3 +173,18 @@ OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
     }),
     notes=("ChatGPT/Codex OAuth forces store=false/stream=true and uses replay cache for encrypted reasoning",),
 )
+
+
+XAI_OAUTH_CAPABILITIES = ProviderCapabilities(
+    adapter_name="xai-oauth",
+    family="openai",
+    protocols=frozenset({"openai-responses"}),
+    transports=frozenset({"sse"}),
+    passthrough_request_fields={"openai-responses": RESPONSES_REQ_ALLOWED},
+    native_state=frozenset({
+        "prompt_cache_key",
+        "x_grok_conv_id",
+        "web_search",
+    }),
+    notes=("xAI/Grok OAuth uses https://api.x.ai/v1/responses with Bearer OAuth, SSE, and native web_search",),
+)

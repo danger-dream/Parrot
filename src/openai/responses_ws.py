@@ -375,7 +375,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await notifier.throttled_notify_event(
             "no_channels",
             f"no_channels:responses_ws:{model}",
-            "🚨 <b>无可用渠道</b>（OpenAI Responses WS 入口）\n"
+            f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} Responses WS 入口）\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"模型: <code>{ek(model)}</code>\n"
             "请检查该家族是否有启用且未冷却的渠道。",
@@ -550,10 +550,11 @@ async def _run_ws_failover(
                     pass
                 try:
                     ek = notifier.escape_html
+                    prov = getattr(ch, "provider", "") or oauth_manager.provider_of(ak)
                     notifier.notify_event(
                         "oauth_refresh_failed",
                         "⚠ <b>OAuth Token 刷新失败</b>（Responses WS 请求路径触发）\n"
-                        f"账号: <code>{ek(email)}</code>\n"
+                        f"账号: <code>{ek(email)}</code> · {notifier.provider_tag(prov)}\n"
                         f"原因: <code>{ek(str(exc))}</code>\n"
                         "账号已被自动禁用 (auth_error)。请通过 TG Bot 重新登录或粘贴新 JSON。"
                     )

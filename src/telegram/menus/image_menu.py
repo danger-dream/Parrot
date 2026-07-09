@@ -220,7 +220,7 @@ def on_accounts(chat_id: int, message_id: int, cb_id: str) -> None:
     lines = ["🚫 <b>图片禁用账号</b>", "", "点击账号切换图片模块禁用状态；这里只影响图片生成/编辑，不影响普通 API。", ""]
     accounts = images_simple.list_image_accounts(include_disabled=True)
     if not accounts:
-        lines.append("暂无 OpenAI OAuth 账号。")
+        lines.append(f"暂无 {ui.provider_tag('openai')} OAuth 账号。")
     for row in accounts:
         ak = row["account_key"]
         email = row.get("email") or ak

@@ -544,8 +544,73 @@ def family_of(protocol: Optional[str]) -> Optional[str]:
     return None
 
 
-FAMILY_ICON = {"anthropic": "🅰", "openai": "🅾"}
-FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI"}
+FAMILY_ICON = {"anthropic": "🅰️", "openai": "🅾️/𝕏"}
+FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI & Grok"}
+
+PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏"}
+PROVIDER_CUSTOM_EMOJI = {
+    "claude": "5872779796257184592",
+    "anthropic": "5872779796257184592",
+    "openai": "5861557411784957025",
+    "xai": "5819115571463068721",
+}
+PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦"}
+PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok"}
+PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok"}
+
+
+def _provider_key(provider: str | None) -> str:
+    p = str(provider or "").strip().lower()
+    return "claude" if p == "anthropic" else p
+
+
+def _telegram_ui_provider_table(name: str) -> dict:
+    try:
+        from .. import config
+        cfg = config.get().get("telegramUi") or {}
+        table = cfg.get(name) or {}
+        return table if isinstance(table, dict) else {}
+    except Exception:
+        return {}
+
+
+def provider_btn_emoji(provider: str | None) -> str:
+    p = _provider_key(provider)
+    table = _telegram_ui_provider_table("providerBtnEmoji")
+    return str(table.get(p) or PROVIDER_BTN_EMOJI.get(p) or "✉")
+
+
+def provider_icon(provider: str | None) -> str:
+    """Plain-text/provider button emoji. Safe for inline keyboards and code blocks."""
+    return provider_btn_emoji(provider)
+
+
+def provider_custom_emoji_id(provider: str | None) -> str:
+    p = _provider_key(provider)
+    table = _telegram_ui_provider_table("providerCustomEmoji")
+    return str(table.get(p) or PROVIDER_CUSTOM_EMOJI.get(p) or "").strip()
+
+
+def provider_custom_emoji_html(provider: str | None) -> str:
+    p = _provider_key(provider)
+    custom_id = provider_custom_emoji_id(p)
+    if custom_id:
+        fallback = PROVIDER_CUSTOM_FALLBACK.get(p) or provider_btn_emoji(p) or "•"
+        return f'<tg-emoji emoji-id="{escape_html(custom_id)}">{escape_html(fallback)}</tg-emoji>'
+    return escape_html(provider_btn_emoji(p))
+
+
+def provider_label(provider: str | None, *, full: bool = False) -> str:
+    table = PROVIDER_FULL_LABEL if full else PROVIDER_LABEL
+    p = _provider_key(provider)
+    return table.get(p, p or "OAuth")
+
+
+def provider_tag(provider: str | None, *, full: bool = False, rich: bool = True) -> str:
+    p = _provider_key(provider)
+    icon = provider_custom_emoji_html(p) if rich else provider_btn_emoji(p)
+    label = provider_label(p, full=full)
+    return f"{icon} {escape_html(label) if rich else label}" if label else icon
 
 
 def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
@@ -586,11 +651,13 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
             # may still be opaque, but normal runtime should resolve via config.
             provider, _, ident = account_key.partition(":")
             name = ident or account_key
-        if with_family:
-            if provider == "openai":
-                name += " 🅾"
-            elif provider == "claude":
-                name += " 🅰"
+        if provider:
+            if with_family:
+                name += f" · {provider_tag(provider, rich=False)}"
+            else:
+                # Logs and compact stats still need the provider label because
+                # the same email can exist as OpenAI and xAI/Grok accounts.
+                name += f" · {provider_label(provider)}"
         return name
     if key.startswith("api:"):
         return key.split(":", 1)[1]
@@ -600,9 +667,13 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
 
 
 def family_tag(family: Optional[str]) -> str:
-    """统一的家族前缀标签，格式：🅰 Anthropic"""
+    """统一的家族前缀标签，保持纯文本，适用于按钮/日志/code block。"""
     if not family:
         return ""
+    if family == "anthropic":
+        return f"{provider_icon('claude')} {FAMILY_LABEL.get(family, family)}"
+    if family == "openai":
+        return f"{provider_icon('openai')}/{provider_icon('xai')} {FAMILY_LABEL.get(family, family)}"
     return f"{FAMILY_ICON.get(family, '?')} {FAMILY_LABEL.get(family, family)}"
 
 

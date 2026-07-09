@@ -36,6 +36,8 @@ def _norm_provider(provider: str | None) -> str:
     p = (provider or "").lower().strip()
     if p in {"openai", "oa", "chatgpt", "codex"}:
         return "openai"
+    if p in {"xai", "x-ai", "grok"}:
+        return "xai"
     if p in {"claude", "anthropic"}:
         return "claude"
     return p or "oauth"
@@ -241,6 +243,69 @@ def describe_oauth_error(
                 reason="探测请求成功返回，但响应里没有 x-codex-* 用量字段。",
                 action="稍后再试；如果持续出现，可能是上游响应格式变化。",
                 retryable=True,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
+
+    # xAI / Grok OAuth.
+    if prov == "xai":
+        if op == "exchange_code" and _is_invalid_token(status, body_code):
+            return OAuthDisplayError(
+                code="xai_code_exchange_401" if status == 401 else "xai_code_exchange_invalid",
+                title="Grok 登录 code 已失效",
+                reason="这个 code 可能已经用过、过期、复制不完整，或不是本次登录会话生成的。",
+                action="重新生成 Grok 登录链接，并复制浏览器地址栏里的完整 callback URL。",
+                auth_error=True,
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
+        if op == "refresh_token" and _is_invalid_token(status, body_code):
+            return OAuthDisplayError(
+                code="xai_token_401" if status == 401 else "xai_token_invalid",
+                title="Grok 授权已失效",
+                reason="refresh_token 可能已过期、被撤销，或账号重新登录后旧 token 被替换。",
+                action="重新登录这个 Grok 账号。",
+                auth_error=True,
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
+        if status == 403:
+            return OAuthDisplayError(
+                code="xai_permission_403",
+                title="Grok 拒绝访问",
+                reason="当前账号或 token 没有访问 xAI/Grok API 的权限。",
+                action="确认账号权限；如果账号正常，请重新登录。",
+                auth_error=(op == "refresh_token"),
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
+        if status == 429:
+            return OAuthDisplayError(
+                code="xai_rate_limited",
+                title="Grok 请求过于频繁",
+                reason="上游触发了限流，本次刷新或调用没有完成。",
+                action="稍后再试，避免连续批量刷新。",
+                retryable=True,
+                status=status,
+                provider=prov,
+                operation=op,
+                technical=technical,
+            )
+        if status and status >= 500:
+            return OAuthDisplayError(
+                code=f"xai_upstream_{status}",
+                title="Grok 服务临时异常",
+                reason="xAI 认证或 API 返回服务端错误。",
+                action="稍后重试。",
+                retryable=True,
+                status=status,
                 provider=prov,
                 operation=op,
                 technical=technical,

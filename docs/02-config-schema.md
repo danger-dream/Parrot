@@ -189,11 +189,45 @@
     "adminIds": []
   },
 
+  // ─── Telegram UI 展示增强 ───
+  // providerCustomEmoji 只用于消息正文 HTML（<tg-emoji>），可稳定显示 Telegram custom emoji；
+  // providerBtnEmoji 用于 inline keyboard / code block / 纯文本兜底，因为按钮不支持 rich entity。
+  "telegramUi": {
+    "providerCustomEmoji": {
+      "openai": "5861557411784957025",
+      "claude": "5872779796257184592",
+      "xai": "5819115571463068721"
+    },
+    "providerBtnEmoji": {
+      "openai": "🅾️",
+      "claude": "🅰️",
+      "xai": "𝕏"
+    }
+  },
+
   // ─── OAuth 开发期开关 ───
-  // mockMode=true 时，oauth_manager 不发真实 HTTP 到 api.anthropic.com
+  // mockMode=true 时，oauth_manager 不发真实 HTTP 到 api.anthropic.com / auth.openai.com / auth.x.ai
   // 用于开发期避免风控；生产部署时置为 false
   "oauth": {
     "mockMode": false
+  },
+
+  // ─── xAI / Grok OAuth ───
+  // OAuth 参数默认对齐官方 xAI CLI/Grok OAuth；如 xAI 调整 client/scope/redirect，可在这里覆盖。
+  // 请求级 token/cost 用量来自 xAI 响应 usage.cost_in_usd_ticks；
+  // 账号级历史 usage / prepaid balance / spending limit 属于 xAI Management API，需额外 management key + team_id。
+  "xaiOAuth": {
+    "issuer": "https://auth.x.ai",
+    "discoveryUrl": "https://auth.x.ai/.well-known/openid-configuration",
+    "clientId": "b1a00492-073a-47ea-816f-4c329264a828",
+    "redirectUri": "http://127.0.0.1:56121/callback",
+    "scope": "openid profile email offline_access grok-cli:access api:access",
+    "apiBaseUrl": "https://api.x.ai/v1",
+    "baseUrl": "https://api.x.ai/v1",          // 兼容旧命名；新配置优先用 apiBaseUrl
+    "responsesPath": "",                       // 非空时覆盖 /responses 路径拼接
+    "isolateSessionId": true,                  // prompt_cache_key → x-grok-conv-id 时按 API key 隔离
+    "userAgent": "parrot/xai-oauth-adapter",
+    "defaultModels": ["grok-4.5"]
   },
 
   // ─── 调度算法 / 负载均衡 ───

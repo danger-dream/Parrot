@@ -11,10 +11,11 @@ from src.providers import registry
 
 
 class FakeChannel:
-    def __init__(self, *, protocol="anthropic", type="api", cc_mimicry=False):
+    def __init__(self, *, protocol="anthropic", type="api", cc_mimicry=False, provider=""):
         self.protocol = protocol
         self.type = type
         self.cc_mimicry = cc_mimicry
+        self.provider = provider
         self.calls = []
 
     async def restore_response(self, chunk: bytes, dynamic_map=None) -> bytes:
@@ -30,6 +31,7 @@ def test_adapter_selection_matches_existing_channel_kinds():
     assert registry.adapter_for_channel(FakeChannel(protocol="anthropic", type="oauth", cc_mimicry=True)).name == "anthropic-oauth"
     assert registry.adapter_for_channel(FakeChannel(protocol="openai-chat", type="api", cc_mimicry=False)).name == "openai-api"
     assert registry.adapter_for_channel(FakeChannel(protocol="openai-responses", type="oauth", cc_mimicry=False)).name == "openai-codex"
+    assert registry.adapter_for_channel(FakeChannel(protocol="openai-responses", type="oauth", provider="xai")).name == "xai-oauth"
 
 
 def test_provider_capabilities_expose_protocols_and_state_boundaries():
@@ -40,6 +42,15 @@ def test_provider_capabilities_expose_protocols_and_state_boundaries():
     assert "conversation" in api.native_state
     assert "file_id" in api.native_state
     assert "audio" in api.native_state
+
+    xai = registry.capabilities_for_channel(FakeChannel(protocol="openai-responses", type="oauth", provider="xai"))
+    assert xai.adapter_name == "xai-oauth"
+    assert xai.protocols == frozenset({"openai-responses"})
+    assert "prompt_cache_key" in xai.native_state
+    assert "web_search" in xai.native_state
+    assert "tool_search" not in xai.native_state
+    assert "namespace" not in xai.native_state
+    assert "ws" not in xai.transports
 
     codex = registry.capabilities_for_channel(FakeChannel(protocol="openai-responses", type="oauth"))
     assert codex.adapter_name == "openai-codex"

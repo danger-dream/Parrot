@@ -24,11 +24,13 @@ def _kb() -> dict:
 def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     """返回当前用量 >= threshold 的 OAuth 账户数量（不含已禁用）。"""
     # 使用 oauth_manager.list_accounts() 作为唯一数据源，
-    # 覆盖所有 provider（Claude + OpenAI），而非仅 cfg.oauthAccounts。
+    # 只覆盖有账号级 quota 体系的 provider（Claude + OpenAI）；Grok/xAI
+    # 请求级 usage/cost 随响应记录，不参与这里的配额热度计数。
     accounts = oauth_manager.list_accounts()
     account_keys = [
         _account_key(a) for a in accounts
         if a.get("email") and not a.get("disabled_reason")
+        and oauth_manager.provider_of(a) in ("claude", "openai")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
@@ -36,6 +38,8 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     for acc in accounts:
         email = acc.get("email")
         if not email:
+            continue
+        if oauth_manager.provider_of(acc) not in ("claude", "openai"):
             continue
         ak = _account_key(acc)
         row = state_db.quota_load(ak)
@@ -149,19 +153,19 @@ def _address_block(port: int) -> list[str]:
     out += [
         "",
         "📍 <b>接口地址</b> (POST)",
-        "  <b>Anthropic</b>",
+        f"  {ui.provider_tag('claude', full=True)}",
         f"    本地 <code>http://127.0.0.1:{port}/v1/messages</code>",
     ]
     if pub:
         out.append(f"    公网 <code>http://{pub}:{port}/v1/messages</code>")
     out += [
-        "  <b>OpenAI Chat</b>",
+        f"  {ui.provider_tag('openai')} Chat",
         f"    本地 <code>http://127.0.0.1:{port}/v1/chat/completions</code>",
     ]
     if pub:
         out.append(f"    公网 <code>http://{pub}:{port}/v1/chat/completions</code>")
     out += [
-        "  <b>OpenAI Responses</b>",
+        f"  {ui.provider_tag('openai')} Responses",
         f"    本地 <code>http://127.0.0.1:{port}/v1/responses</code>",
     ]
     if pub:

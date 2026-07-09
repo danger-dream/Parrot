@@ -31,12 +31,12 @@ from . import config, network, notifier, state_db
 TARGETS: dict[str, dict] = {
     "claude": {
         "label": "Claude",
-        "icon": "🅰",
+        "icon": "🅰️",
         "base": "https://status.claude.com",
     },
     "openai": {
         "label": "OpenAI",
-        "icon": "🅾",
+        "icon": "🅾️",
         "base": "https://status.openai.com",
     },
     "cloudflare": {
@@ -80,7 +80,21 @@ def _provider_label(provider: str) -> str:
 
 
 def _provider_icon(provider: str) -> str:
+    """Plain-text icon for buttons and compact non-rich text."""
+    try:
+        table = ((config.get().get("telegramUi") or {}).get("providerBtnEmoji") or {})
+        if isinstance(table, dict) and provider in table:
+            return str(table.get(provider) or TARGETS.get(provider, {}).get("icon", "📡"))
+    except Exception:
+        pass
     return TARGETS.get(provider, {}).get("icon", "📡")
+
+
+def _provider_tag(provider: str) -> str:
+    """HTML provider tag for message/notification body."""
+    if provider in ("claude", "openai", "xai"):
+        return notifier.provider_tag(provider)
+    return f"{_provider_icon(provider)} {notifier.escape_html(_provider_label(provider))}"
 
 
 def _statuspage_base(provider: str) -> str:
@@ -324,7 +338,7 @@ def get_active_summary() -> Optional[str]:
         max_impact = max(((_impact_rank(i.get("impact")), i.get("impact") or "none") for i in incs),
                           key=lambda x: x[0])
         worst_rank = max(worst_rank, max_impact[0])
-        parts.append(f"{_provider_icon(p)} {_provider_label(p)} × {len(incs)}")
+        parts.append(f"{_provider_tag(p)} × {len(incs)}")
     if not parts:
         return None
     icon = "🔴" if worst_rank >= 3 else ("🟠" if worst_rank >= 2 else "🟡")

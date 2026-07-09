@@ -149,6 +149,51 @@ def _render_model_channels(items: list[dict], limit: int = 3) -> str:
     return line
 
 
+def _channel_provider_bucket(channel_key: str) -> str:
+    key = str(channel_key or "")
+    if key.startswith("oauth:"):
+        try:
+            from ...oauth_ids import provider_from_channel_key
+            prov = provider_from_channel_key(key)
+        except Exception:
+            prov = ""
+        if prov == "xai":
+            return f"{ui.provider_tag('xai')} OAuth"
+        if prov == "openai":
+            return f"{ui.provider_tag('openai')} OAuth"
+        if prov == "claude":
+            return f"{ui.provider_tag('claude')} OAuth"
+        return "🔐 OAuth"
+    if key.startswith("api:"):
+        return "🔀 API 渠道"
+    return "其他"
+
+
+def _provider_split_line_from_channels(groups: list[dict]) -> str:
+    totals: dict[str, int] = {}
+    for g in groups or []:
+        k = g.get("key") or "?"
+        if k == "?":
+            continue
+        label = _channel_provider_bucket(k)
+        total = int(((g.get("metrics") or {}).get("total")) or 0)
+        if total <= 0:
+            continue
+        totals[label] = totals.get(label, 0) + total
+    if not totals:
+        return ""
+    order = [
+        f"{ui.provider_tag('openai')} OAuth",
+        f"{ui.provider_tag('xai')} OAuth",
+        "🔀 API 渠道",
+        f"{ui.provider_tag('claude')} OAuth",
+        "🔐 OAuth",
+        "其他",
+    ]
+    parts = [f"{label} {totals[label]} 次" for label in order if totals.get(label)]
+    return "账号/渠道类型: " + " · ".join(parts)
+
+
 def _summary_dim_block(title: str, groups: list[dict], render_key,
                        extra_line=None) -> str:
     """汇总视图里某个维度的 Top 块（紧凑两行/条）。
@@ -348,6 +393,10 @@ def _section_family(family: str, result: dict,
 
     tag = ui.family_tag(family)
     parts = [f"<b>{tag}</b>", _section_overall_compact(overall)]
+    if family == "openai":
+        split = _provider_split_line_from_channels(result.get("by_channel") or [])
+        if split:
+            parts.append(split)
 
     if show_by_channel:
         by_channel = _strip_unknown(result.get("by_channel") or [])
@@ -383,9 +432,9 @@ def _render_key_family_split(apikey: str, anth_total: int, oai_total: int) -> st
     """按 Key Top 每条的家族细分小字：🅰 X 次 · 🅾 Y 次"""
     bits = []
     if anth_total > 0:
-        bits.append(f"🅰 {anth_total} 次")
+        bits.append(f"{ui.provider_icon('claude')} {anth_total} 次")
     if oai_total > 0:
-        bits.append(f"🅾 {oai_total} 次")
+        bits.append(f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} {oai_total} 次")
     return " · ".join(bits)
 
 

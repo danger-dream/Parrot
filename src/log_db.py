@@ -815,6 +815,155 @@ def tokens_for_apikey(api_key_name: str, since_ts: float) -> dict:
     )
 
 
+def _extract_xai_response_from_response_body(body: str | None) -> dict | None:
+    """从 xAI/Grok response body 中提取最终 response 对象。
+
+    xAI OAuth channel 在 Parrot 内按 upstream_stream_only 处理，即使下游非流式，
+    request_detail.response_body 里也常保存为 SSE event stream；最终 usage/cost 与
+    实际 service_tier 位于 `response.completed` 的 `response` 对象。这里同时兼容
+    普通 JSON 响应。
+    """
+    if not body:
+        return None
+
+    def _response_from_obj(obj: Any) -> dict | None:
+        if not isinstance(obj, dict):
+            return None
+        resp = obj.get("response")
+        if isinstance(resp, dict):
+            return resp
+        if isinstance(obj.get("usage"), dict) or obj.get("service_tier") is not None:
+            return obj
+        return None
+
+    text = str(body).strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        resp = _response_from_obj(obj)
+        if resp:
+            return resp
+    except Exception:
+        pass
+
+    latest: dict | None = None
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        resp = _response_from_obj(obj)
+        if resp:
+            latest = resp
+    return latest
+
+
+def _extract_xai_usage_from_response_body(body: str | None) -> dict | None:
+    """从 xAI/Grok response body 中提取最终 usage。"""
+    resp = _extract_xai_response_from_response_body(body)
+    if not isinstance(resp, dict):
+        return None
+    usage = resp.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
+def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
+    """聚合某 xAI/Grok OAuth channel 的 Parrot 本地调用金额与 tokens。
+
+    金额来自 xAI 响应 usage.cost_in_usd_ticks，换算：USD=ticks/1e10。
+    tokens 仍以 request_log 已归一化字段为准（input 不含 cache_read，UI 再合计）。
+    """
+    out: dict[str, Any] = {
+        "total": 0, "success_count": 0, "error_count": 0,
+        "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
+        "cost_ticks": 0, "cost_rows": 0,
+        "service_tier_counts": {},
+        "tps_num_tokens": 0, "tps_denom_ms": 0,
+        "max_tps": None, "min_tps": None,
+    }
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        tps = _finalize_tps(out)
+        out.update(tps)
+        out["cost_usd"] = 0.0
+        return out
+
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            rows = conn.execute(
+                """SELECT
+                     l.status,
+                     l.is_stream,
+                     l.first_token_time_ms,
+                     l.total_time_ms,
+                     l.input_tokens, l.output_tokens,
+                     l.cache_creation_tokens, l.cache_read_tokens,
+                     d.response_body
+                   FROM request_log l
+                   LEFT JOIN request_detail d USING(request_id)
+                   WHERE l.final_channel_key=? AND l.created_at >= ?""",
+                (channel_key, since_ts),
+            ).fetchall()
+            for r in rows:
+                out["total"] += 1
+                if r["status"] == "success":
+                    out["success_count"] += 1
+                elif r["status"] == "error":
+                    out["error_count"] += 1
+                out["input"] += int(r["input_tokens"] or 0)
+                out["output"] += int(r["output_tokens"] or 0)
+                out["cache_creation"] += int(r["cache_creation_tokens"] or 0)
+                out["cache_read"] += int(r["cache_read_tokens"] or 0)
+                output_tokens = int(r["output_tokens"] or 0)
+                total_ms = int(r["total_time_ms"] or 0)
+                first_ms = r["first_token_time_ms"]
+                denom_ms = 0
+                if r["status"] == "success" and output_tokens > 0:
+                    if int(r["is_stream"] or 0) == 1 and first_ms is not None and total_ms > int(first_ms or 0):
+                        denom_ms = total_ms - int(first_ms or 0)
+                    elif int(r["is_stream"] or 0) == 0 and total_ms > 0:
+                        denom_ms = total_ms
+                if denom_ms > 0:
+                    out["tps_num_tokens"] += output_tokens
+                    out["tps_denom_ms"] += denom_ms
+                    tps = output_tokens * 1000.0 / denom_ms
+                    out["max_tps"] = tps if out.get("max_tps") is None else max(float(out["max_tps"]), tps)
+                    out["min_tps"] = tps if out.get("min_tps") is None else min(float(out["min_tps"]), tps)
+                resp = _extract_xai_response_from_response_body(r["response_body"])
+                if isinstance(resp, dict):
+                    tier = str(resp.get("service_tier") or "").strip().lower()
+                    if tier:
+                        counts = out.setdefault("service_tier_counts", {})
+                        counts[tier] = int(counts.get(tier) or 0) + 1
+                usage = resp.get("usage") if isinstance(resp, dict) else None
+                if not isinstance(usage, dict):
+                    continue
+                ticks = usage.get("cost_in_usd_ticks")
+                try:
+                    if ticks is not None:
+                        out["cost_ticks"] += int(ticks)
+                        out["cost_rows"] += 1
+                except (TypeError, ValueError):
+                    pass
+        except Exception as exc:
+            print(f"[log_db] xai_cost_for_channel: skip: {exc}")
+        finally:
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    tps = _finalize_tps(out)
+    out.update(tps)
+    out["cost_usd"] = float(out["cost_ticks"] or 0) / 10_000_000_000
+    return out
+
+
 def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict:
     """按给定 WHERE 条件跨月聚合；where 不含 created_at 过滤。"""
     out: dict[str, Any] = {

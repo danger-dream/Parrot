@@ -7,6 +7,8 @@ Claude 仍使用 ``claude:<email>``；OpenAI 使用
 ``openai:<email>:<workspace_id>``。其中 workspace_id 优先取
 entry.workspace_id，缺失时回退 entry.chatgpt_account_id。两者都缺失时
 才回退旧的 ``openai:<email>``，保证老配置继续可用。
+xAI 使用 ``xai:<subject>``；缺 subject 的导入/旧数据回退到
+``xai:<email>``。历史临时格式 ``xai:<email>:<subject>`` 仍在解析路径兼容。
 
 调用约定
 --------
@@ -63,12 +65,35 @@ def openai_composite_identity(acc: dict) -> str:
     return email
 
 
+def xai_subject(acc: dict) -> str:
+    """xAI OIDC subject for stable account identity."""
+    for key in ("subject", "sub"):
+        value = str(acc.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def xai_composite_identity(acc: dict) -> str:
+    """xAI provider-local identity string: `subject` when possible.
+
+    The OIDC subject is the stable account id. Email stays display-only and is
+    only used as a fallback for legacy/imported entries that lack id_token/sub.
+    """
+    subject = xai_subject(acc)
+    if subject:
+        return subject
+    return str(acc.get("email") or "").strip()
+
+
 def account_identity(acc: dict) -> str:
     """账户 entry → provider 内部身份片段。"""
     provider = _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
     email = str(acc.get("email") or "")
     if provider == "openai":
         return openai_composite_identity(acc)
+    if provider == "xai":
+        return xai_composite_identity(acc)
     return email
 
 
@@ -120,8 +145,8 @@ def identity_from_channel_key(channel_key: str) -> str:
 def email_from_channel_key(channel_key: str) -> str:
     """兼容旧调用名。
 
-    对 Claude 返回 email；对 OpenAI 新 key 返回复合 identity。真正需要展示
-    email 的路径应回查 account entry。
+    对 Claude 返回 email；对 OpenAI/xAI 新 key 返回复合 identity。真正需要
+    展示 email 的路径应回查 account entry。
     """
     return identity_from_channel_key(channel_key)
 
@@ -140,4 +165,4 @@ def is_account_key(value: Any) -> bool:
     if not isinstance(value, str) or ":" not in value:
         return False
     prov = value.split(":", 1)[0]
-    return _normalize_provider(prov) == prov and prov in ("claude", "openai")
+    return _normalize_provider(prov) == prov and prov in ("claude", "openai", "xai")

@@ -1151,6 +1151,7 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
 def capabilities_for_channel(channel) -> ChannelCapabilities:
     protocol = getattr(channel, "protocol", "anthropic")
     ch_type = getattr(channel, "type", "api")
+    provider = getattr(channel, "provider", "")
     transports: set[str] = {"http-sse", "http-json"}
     if bool(getattr(channel, "upstream_stream_only", False)):
         transports.discard("http-json")
@@ -1158,7 +1159,12 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
     if protocol == "openai-chat":
         native_state.update({"multi_candidate", "file_id", "audio"})
     elif protocol == "openai-responses":
-        if ch_type == "oauth":
+        if ch_type == "oauth" and provider == "xai":
+            native_state.update({
+                "prompt_cache_key",
+                "web_search",
+            })
+        elif ch_type == "oauth":
             native_state.update({
                 "encrypted_reasoning_replay",
                 "prompt_cache_key",
@@ -1179,7 +1185,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
                 "background",
                 "audio",
             })
-    if protocol == "openai-responses" and ch_type == "oauth":
+    if protocol == "openai-responses" and ch_type == "oauth" and provider != "xai":
         transports.add("ws")
     return ChannelCapabilities(
         protocol=protocol,
@@ -1208,11 +1214,23 @@ def _native_state_key_for_label(label: str | None) -> str | None:
 
 def _responses_hosted_tool_supported(label: str | None, native: frozenset[str]) -> bool:
     # Codex native passthrough tools are not generic hosted/server-side tools.
-    # Do not let a provider's broad `hosted_tools` capability satisfy them;
-    # only explicit native-state support may.
+    # xAI similarly supports a narrow hosted tool subset (currently web_search)
+    # without supporting arbitrary OpenAI hosted tools such as file_search.
+    # Do not let a provider's broad `hosted_tools` capability satisfy explicit
+    # native requirements; and allow narrow explicit tool support without granting
+    # all hosted tools.
+    if not label:
+        return False
     for tool_type in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
         if label in {tool_type, f"tool_choice:{tool_type}", f"tool_choice:allowed_tools:{tool_type}"}:
             return tool_type in native
+    if label in {"web_search", "tool_choice:web_search", "tool_choice:allowed_tools:web_search"}:
+        return "web_search" in native or "hosted_tools" in native
+    if label in native:
+        return True
+    for prefix in ("tool_choice:", "tool_choice:allowed_tools:"):
+        if label.startswith(prefix) and label[len(prefix):] in native:
+            return True
     if "hosted_tools" in native:
         return True
     return False

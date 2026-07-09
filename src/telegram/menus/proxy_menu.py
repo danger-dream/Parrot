@@ -10,7 +10,7 @@ import asyncio
 import re
 from typing import Optional
 
-from ... import config
+from ... import config, oauth_manager
 from ...proxy import manager as pm
 from ...proxy.connector import parse_proxy_url, _mask_url
 from ...channel import registry
@@ -27,6 +27,34 @@ def _proxy_icon(c) -> str:
     if c.stats.last_success_ts >= c.stats.last_attempt_ts - 1:
         return "🟢"
     return "🔴"
+
+
+def _oauth_provider_for_channel(ch) -> str:
+    provider = str(getattr(ch, "provider", "") or "")
+    if provider:
+        return provider
+    key = str(getattr(ch, "key", "") or "")
+    if key.startswith("oauth:"):
+        try:
+            return oauth_manager.provider_of(key[len("oauth:"):])
+        except Exception:
+            pass
+    return "claude" if getattr(ch, "protocol", "anthropic") == "anthropic" else "openai"
+
+
+def _oauth_provider_icon(ch) -> str:
+    return ui.provider_icon(_oauth_provider_for_channel(ch))
+
+
+def _route_model_icon(model: str) -> str:
+    m = str(model or "").lower()
+    if m.startswith(("claude", "anthropic")):
+        return ui.provider_icon("claude")
+    if m.startswith(("grok", "xai")):
+        return ui.provider_icon("xai")
+    if m.startswith(("gpt", "o1", "o3", "o4")):
+        return ui.provider_icon("openai")
+    return "🤖"
 
 
 def _type_badge(t: str) -> str:
@@ -854,7 +882,7 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     model_count = len(r.get("models") or {})
 
     # 功能路由摘要
-    func_keys = {"telegram": "Telegram", "oauth_anthropic": "Anthropic 家族", "oauth_openai": "OpenAI 家族"}
+    func_keys = {"telegram": "Telegram", "oauth_anthropic": "Anthropic 家族", "oauth_openai": "OpenAI & Grok 家族"}
     func_lines = []
     for k, label in func_keys.items():
         v = r.get(k)
@@ -964,14 +992,14 @@ def _show_func_routing(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id)
     r = pm.get_routing()
     funcs = [
-        ("telegram", "📱 Telegram", "Bot 所有功能调用"),
-        ("oauth_anthropic", "🟠 Anthropic 家族", "OAuth、登录/刷新、渠道请求、测试、/v1/messages"),
-        ("oauth_openai", "🟢 OpenAI 家族", "OAuth、登录/刷新、渠道请求、测试、OpenAI 入口"),
+        ("telegram", "📱 Telegram", "📱 Telegram", "Bot 所有功能调用"),
+        ("oauth_anthropic", f"{ui.provider_tag('claude', full=True)} 家族", f"{ui.provider_icon('claude')} Anthropic 家族", "OAuth、登录/刷新、渠道请求、测试、/v1/messages"),
+        ("oauth_openai", f"{ui.provider_tag('openai')}/{ui.provider_tag('xai')} 家族", f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok 家族", "OAuth、登录/刷新、渠道请求、测试、OpenAI-style / Grok 入口"),
     ]
     lines = ["📡 <b>功能路由</b>", "",
              "<i>家族级默认出口；账号/渠道/模型未命中时走这里，未设置则走默认路由。</i>",
-             "<i>Telegram / Anthropic 家族 / OpenAI 家族均支持代理组、代理、直连、默认。</i>", ""]
-    for key, label, desc in funcs:
+             f"<i>Telegram / {ui.provider_tag('claude', full=True)} 家族 / {ui.provider_tag('openai')}/{ui.provider_tag('xai')} 家族均支持代理组、代理、直连、默认。</i>", ""]
+    for key, label, _btn_label, desc in funcs:
         val = r.get(key)
         route = f"<code>{ui.escape_html(str(val))}</code>" if val else "<i>默认</i>"
         lines.append(f"{label}  {desc}")
@@ -979,8 +1007,8 @@ def _show_func_routing(chat_id: int, message_id: int, cb_id: str) -> None:
         lines.append("")
 
     rows = []
-    for key, label, _ in funcs:
-        short = label.split(" ", 1)[-1]
+    for key, _label, btn_label, _ in funcs:
+        short = btn_label.split(" ", 1)[-1]
         rows.append([ui.btn(f"✏️ {short}", f"px:rt_pick:{key}")])
     rows.append([ui.btn("◀ 返回路由规则", "px:routing")])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
@@ -1005,19 +1033,19 @@ def _show_account_routing(chat_id: int, message_id: int, cb_id: str,
         lines.append("<i>没有 OAuth 账号。</i>")
     else:
         for i, c in enumerate(chs):
-            prov = getattr(c, "protocol", "anthropic")
-            icon = "🅰" if prov == "anthropic" else "🅾"
+            icon = _oauth_provider_icon(c)
             route = acct_cfg.get(c.key)
             r_str = f"→ <code>{ui.escape_html(str(route))}</code>" if route else ""
-            lines.append(f"{icon} {ui.escape_html(c.display_name)} {r_str}")
+            display = ui.channel_display_name(c.key, with_family=False)
+            lines.append(f"{icon} {ui.escape_html(display)} {r_str}")
 
     rows = []
     for i, c in enumerate(chs):
-        prov = getattr(c, "protocol", "anthropic")
-        icon = "🅰" if prov == "anthropic" else "🅾"
+        icon = _oauth_provider_icon(c)
         route = acct_cfg.get(c.key)
         tag = f" [{route}]" if route else ""
-        rows.append([ui.btn(f"{icon} {c.display_name}{tag}", f"px:rt_item:a:{i}")])
+        display = ui.channel_display_name(c.key, with_family=False)
+        rows.append([ui.btn(f"{icon} {display}{tag}", f"px:rt_item:a:{i}")])
 
     rows.append([ui.btn("◀ 返回路由规则", "px:routing")])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
@@ -1087,13 +1115,7 @@ def _show_model_routing(chat_id: int, message_id: int, cb_id: str,
         for i, m in enumerate(page_models, start=start):
             route = model_cfg.get(m)
             r_str = f"→ <code>{ui.escape_html(str(route))}</code>" if route else ""
-            # Infer family from model name
-            if m.startswith("claude") or m.startswith("anthropic"):
-                icon = "🅰"
-            elif m.startswith("gpt") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
-                icon = "🅾"
-            else:
-                icon = "🤖"
+            icon = _route_model_icon(m)
             lines.append(f"{icon} <code>{ui.escape_html(m)}</code> {r_str}")
         lines.append(f"\n第 {page}/{total_pages} 页 · 共 {total} 个模型")
 
@@ -1101,13 +1123,7 @@ def _show_model_routing(chat_id: int, message_id: int, cb_id: str,
     for i, m in enumerate(page_models, start=start):
         route = model_cfg.get(m)
         tag = f" [{route}]" if route else ""
-        # Family icon
-        if m.startswith("claude") or m.startswith("anthropic"):
-            icon = "🅰"
-        elif m.startswith("gpt") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
-            icon = "🅾"
-        else:
-            icon = "🤖"
+        icon = _route_model_icon(m)
         rows.append([ui.btn(f"{icon} {m}{tag}", f"px:rt_item:m:{i}")])
 
     # Pagination
@@ -1148,7 +1164,7 @@ def _rt_item_pick(chat_id: int, message_id: int, cb_id: str,
     if category == "a":
         chs = {c.key: c for c in registry.all_channels() if c.type == "oauth"}
         if key in chs:
-            display = chs[key].display_name
+            display = ui.channel_display_name(chs[key].key, with_family=False)
     elif category == "c":
         chs = {c.key: c for c in registry.all_channels() if c.type == "api"}
         if key in chs:

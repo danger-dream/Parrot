@@ -345,17 +345,19 @@ def test_settings_usage_display_mode_toggle(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     settings = rec.last("editMessageText")
     assert settings and "OAuth 账户设置" in settings["text"]
-    assert "Anthropic 可用模型" in settings["text"]
-    assert "OpenAI 可用模型" in settings["text"]
+    assert "Claude <b>可用模型</b>" in settings["text"]
+    assert "OpenAI <b>可用模型</b>" in settings["text"]
+    assert "Grok <b>可用模型</b>" in settings["text"]
+    assert "tg-emoji" in settings["text"]
     assert "📊 <b>用量显示模式</b>" in settings["text"]
     assert "当前模式: 已使用量" in settings["text"]
     assert "CCH 模式（Claude Code 伪装）" in settings["text"]
     assert "当前模式: 🚫 已关闭" in settings["text"]
     assert "OAuth 配额监控" in settings["text"]
     assert "状态: 🚫 已停用" in settings["text"]
-    texts = [b["text"] for row in settings["reply_markup"]["inline_keyboard"] for b in row]
-    assert "✏ 修改Anthropic模型" in texts
-    assert "✏ 修改OpenAI模型" in texts
+    keyboard = settings["reply_markup"]["inline_keyboard"]
+    texts = [b["text"] for row in keyboard for b in row]
+    assert [b["text"] for b in keyboard[0]] == ["✏ Claude 模型", "✏ OpenAI 模型", "✏ Grok 模型"]
     assert "🖼 图片生成设置" in texts
     assert "📈 配额监控" in texts
     assert "🎭 CCH模式：开启" in texts

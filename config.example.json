@@ -282,6 +282,21 @@
       "fallbackModel": "gpt-5.2"
     }
   },
+  "xaiOAuth": {
+    "issuer": "https://auth.x.ai",
+    "discoveryUrl": "https://auth.x.ai/.well-known/openid-configuration",
+    "clientId": "b1a00492-073a-47ea-816f-4c329264a828",
+    "redirectUri": "http://127.0.0.1:56121/callback",
+    "scope": "openid profile email offline_access grok-cli:access api:access",
+    "apiBaseUrl": "https://api.x.ai/v1",
+    "baseUrl": "https://api.x.ai/v1",
+    "responsesPath": "",
+    "isolateSessionId": true,
+    "userAgent": "parrot/xai-oauth-adapter",
+    "defaultModels": [
+      "grok-4.5"
+    ]
+  },
   "openai": {
     "store": {
       "enabled": true,
@@ -312,5 +327,17 @@
     "maxFetchUrlChars": 250,
     "requireKnownUrlForFetch": true,
     "maxConcurrentToolCalls": 0
+  },
+  "telegramUi": {
+    "providerCustomEmoji": {
+      "openai": "5861557411784957025",
+      "claude": "5872779796257184592",
+      "xai": "5819115571463068721"
+    },
+    "providerBtnEmoji": {
+      "openai": "🅾️",
+      "claude": "🅰️",
+      "xai": "𝕏"
+    }
   }
 }

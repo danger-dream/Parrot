@@ -37,7 +37,7 @@ def _has_family_account(family: str) -> bool:
     # 看 OAuth 账号
     for acc in cfg_data.get("oauthAccounts", []) or []:
         prov = (acc.get("provider") or "").lower()
-        if family == "openai" and prov == "openai":
+        if family == "openai" and prov in ("openai", "xai"):
             return True
         if family == "anthropic" and prov in ("", "anthropic", "claude"):
             return True

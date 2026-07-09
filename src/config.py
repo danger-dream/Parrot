@@ -403,6 +403,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "recentCalls": True,   # 最近调用
         },
     },
+    # Telegram UI 展示增强。providerCustomEmoji 只用于消息正文 HTML；
+    # providerBtnEmoji 用于 inline keyboard / 纯文本兜底。
+    "telegramUi": {
+        "providerCustomEmoji": {
+            "openai": "5861557411784957025",
+            "claude": "5872779796257184592",
+            "xai": "5819115571463068721",
+        },
+        "providerBtnEmoji": {
+            "openai": "🅾️",
+            "claude": "🅰️",
+            "xai": "𝕏",
+        },
+    },
     "oauth": {
         "mockMode": False,
         # provider 专属旧配置入口。OpenAI OAuth 新配置请使用顶层 openaiOAuth；
@@ -438,6 +452,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "instructions": "reply ok",
             "fallbackModel": "gpt-5.2",
         },
+    },
+    # xAI / Grok OAuth 配置。默认值对齐当前 xAI CLI/Grok OAuth；
+    # client/scope/redirect/discovery/apiBase 均可在这里覆盖。
+    "xaiOAuth": {
+        "issuer": "https://auth.x.ai",
+        "discoveryUrl": "https://auth.x.ai/.well-known/openid-configuration",
+        "clientId": "b1a00492-073a-47ea-816f-4c329264a828",
+        "redirectUri": "http://127.0.0.1:56121/callback",
+        "scope": "openid profile email offline_access grok-cli:access api:access",
+        "apiBaseUrl": "https://api.x.ai/v1",
+        "baseUrl": "https://api.x.ai/v1",
+        "responsesPath": "",
+        "isolateSessionId": True,
+        "userAgent": "parrot/xai-oauth-adapter",
+        "defaultModels": [
+            "grok-4.5",
+        ],
     },
     # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）
     "openai": {

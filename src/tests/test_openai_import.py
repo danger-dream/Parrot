@@ -299,4 +299,6 @@ def test_openai_import_text_preview_sets_confirm_state(m):
     assert state["data"]["items"][0]["email"] == "a@example.com"
     sent = ui.api.last("sendMessage")
     assert sent and "a@example.com" in sent["text"]
-    assert "导入 Sub2API 账户" in sent["text"]
+    assert "导入" in sent["text"]
+    assert "Sub2API 账户" in sent["text"]
+    assert "<tg-emoji" in sent["text"]

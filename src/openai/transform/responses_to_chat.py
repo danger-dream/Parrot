@@ -708,7 +708,7 @@ def translate_response(chat: dict, *, model: str,
             _notifier.throttled_notify_event_sync(
                 "openai_store_save_failed",
                 f"openai_store_save_failed:{api_key_name}",
-                "❌ <b>OpenAI Store 写入失败</b>（非流式）\n"
+                f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（非流式）\n"
                 f"API Key: <code>{ek(api_key_name)}</code>\n"
                 f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(channel_key or '?')}</code>\n"
                 f"resp_id: <code>{ek(resp_id)}</code>\n"

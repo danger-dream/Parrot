@@ -39,6 +39,62 @@ def escape_html(s) -> str:
                   .replace(">", "&gt;"))
 
 
+_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏"}
+_PROVIDER_CUSTOM_EMOJI = {
+    "claude": "5872779796257184592",
+    "anthropic": "5872779796257184592",
+    "openai": "5861557411784957025",
+    "xai": "5819115571463068721",
+}
+_PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦"}
+_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok"}
+
+
+def _provider_key(provider: str | None) -> str:
+    p = str(provider or "").strip().lower()
+    return "claude" if p == "anthropic" else p
+
+
+def _telegram_ui_provider_table(name: str) -> dict:
+    try:
+        from . import config
+        cfg = config.get().get("telegramUi") or {}
+        table = cfg.get(name) or {}
+        return table if isinstance(table, dict) else {}
+    except Exception:
+        return {}
+
+
+def provider_btn_emoji(provider: str | None) -> str:
+    """Plain-text/provider button emoji for notifications that cannot use rich entities."""
+    p = _provider_key(provider)
+    table = _telegram_ui_provider_table("providerBtnEmoji")
+    return str(table.get(p) or _PROVIDER_BTN_EMOJI.get(p) or "✉")
+
+
+def provider_custom_emoji_html(provider: str | None) -> str:
+    """HTML custom emoji for notification/message body provider badges."""
+    p = _provider_key(provider)
+    table = _telegram_ui_provider_table("providerCustomEmoji")
+    custom_id = str(table.get(p) or _PROVIDER_CUSTOM_EMOJI.get(p) or "").strip()
+    if custom_id:
+        fallback = _PROVIDER_CUSTOM_FALLBACK.get(p) or provider_btn_emoji(p) or "•"
+        return f'<tg-emoji emoji-id="{escape_html(custom_id)}">{escape_html(fallback)}</tg-emoji>'
+    return escape_html(provider_btn_emoji(p))
+
+
+def provider_label(provider: str | None) -> str:
+    p = _provider_key(provider)
+    return _PROVIDER_LABEL.get(p, p or "OAuth")
+
+
+def provider_tag(provider: str | None, *, rich: bool = True) -> str:
+    p = _provider_key(provider)
+    icon = provider_custom_emoji_html(p) if rich else provider_btn_emoji(p)
+    label = provider_label(p)
+    return f"{icon} {escape_html(label) if rich else label}" if label else icon
+
+
 def _worker_loop() -> None:
     while True:
         try:

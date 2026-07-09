@@ -627,7 +627,7 @@ body/response 过长时分页显示或只显示前 2K + 剩余字数提示。
 
 按钮：`smart` / `order` / `priority`。
 
-选择 `priority` 后可分别进入 Anthropic / OpenAI 协议优先级编辑页，使用序号勾选、置顶/置底/上移/下移和批量设置调整队列；选中按钮显示为 `3 ✅`。
+选择 `priority` 后可分别进入 Anthropic / OpenAI & Grok 协议优先级编辑页，使用序号勾选、置顶/置底/上移/下移和批量设置调整队列；选中按钮显示为 `3 ✅`。
 
 ## 9.8 权限与状态管理
 

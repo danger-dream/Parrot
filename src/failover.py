@@ -267,7 +267,7 @@ def _maybe_auto_disable_by_headers(account_key: str, email: str,
             "quota_disabled",
             "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
             f"账号: <code>{ek(email)}</code>\n"
-            f"🅰️ Claude{_plan_tag}\n"
+            f"{notifier.provider_tag('claude')}{_plan_tag}\n"
             f"超限窗口: <code>{' / '.join(windows)}</code>\n"
             f"恢复时间: <code>{latest or 'unknown'}</code>\n"
             "达到该时间后由 quota_monitor 自动恢复。"
@@ -339,7 +339,7 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
             "quota_disabled",
             "⚠ <b>OAuth 配额已用尽（响应头实时触发）</b>\n"
             f"账号: <code>{ek(email)}</code>\n"
-            f"🅾️ {ek(_label)}\n"
+            f"{notifier.provider_custom_emoji_html('openai')} {ek(_label)}\n"
             f"超限窗口: <code>{' / '.join(over_windows)}</code> "
             f"(阈值 {threshold:.0f}%)\n"
             f"恢复时间: <code>{latest_iso or 'unknown'}</code>"
@@ -468,7 +468,7 @@ def _maybe_save_native_responses_store(
             notifier.throttled_notify_event_sync(
                 "openai_store_save_failed",
                 f"openai_store_save_failed:{api_key_name}",
-                "❌ <b>OpenAI Store 写入失败</b>（native Responses）\n"
+                f"❌ {notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（native Responses）\n"
                 f"API Key: <code>{ek(str(api_key_name or ''))}</code>\n"
                 f"模型: <code>{ek(model)}</code> · 渠道: <code>{ek(str(channel_key or '?'))}</code>\n"
                 f"resp_id: <code>{ek(response_id)}</code>\n"
@@ -1420,10 +1420,11 @@ async def run_failover(
                     pass
                 try:
                     ek = notifier.escape_html
+                    prov = getattr(ch, "provider", "") or oauth_manager.provider_of(ak)
                     notifier.notify_event(
                         "oauth_refresh_failed",
                         "⚠ <b>OAuth Token 刷新失败</b>（请求路径触发）\n"
-                        f"账号: <code>{ek(email)}</code>\n"
+                        f"账号: <code>{ek(email)}</code> · {notifier.provider_tag(prov)}\n"
                         f"原因: <code>{ek(str(exc))}</code>\n"
                         "账号已被自动禁用 (auth_error)。请通过 TG Bot 重新登录或粘贴新 JSON。"
                     )

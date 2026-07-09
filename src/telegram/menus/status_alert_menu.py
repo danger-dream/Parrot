@@ -46,7 +46,7 @@ def _format_active_block() -> str:
             continue
         total += len(incs)
         lines.append("")
-        lines.append(f"{status_monitor._provider_icon(p)} <b>{status_monitor._provider_label(p)}</b>")
+        lines.append(status_monitor._provider_tag(p))
         for i in incs[:5]:
             name = (i.get("name") or "").strip()
             impact = (i.get("impact") or "none").lower()
@@ -88,8 +88,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
         [ui.btn(f"{'🟢 已开启' if enabled else '🔴 已关闭'} · 切换", "stat:toggle_enabled")],
     ]
     rows.append([
-        ui.btn(("✅ " if "claude" in targets else "⬛ ") + "Claude", "stat:toggle_tgt:claude"),
-        ui.btn(("✅ " if "openai" in targets else "⬛ ") + "OpenAI", "stat:toggle_tgt:openai"),
+        ui.btn(("✅ " if "claude" in targets else "⬛ ") + status_monitor._provider_icon("claude") + " Claude", "stat:toggle_tgt:claude"),
+        ui.btn(("✅ " if "openai" in targets else "⬛ ") + status_monitor._provider_icon("openai") + " OpenAI", "stat:toggle_tgt:openai"),
         ui.btn(("✅ " if "cloudflare" in targets else "⬛ ") + "Cloudflare", "stat:toggle_tgt:cloudflare"),
     ])
     rows.append([
@@ -236,10 +236,10 @@ def _history(chat_id: int, message_id: int, cb_id: str) -> None:
             incs = status_monitor.list_recent_incidents(p, limit=5)
         except Exception as exc:
             incs = []
-            lines.append(f"\n{status_monitor._provider_icon(p)} <b>{status_monitor._provider_label(p)}</b> — 拉取失败: <code>{ui.escape_html(str(exc))}</code>")
+            lines.append(f"\n{status_monitor._provider_tag(p)} — 拉取失败: <code>{ui.escape_html(str(exc))}</code>")
             continue
         lines.append("")
-        lines.append(f"{status_monitor._provider_icon(p)} <b>{status_monitor._provider_label(p)}</b>")
+        lines.append(status_monitor._provider_tag(p))
         if not incs:
             lines.append("  (空)")
             continue
@@ -297,7 +297,7 @@ def _show_muted_list(chat_id: int, message_id: int, cb_id: Optional[str] = None)
         name = r["name"] or "(unnamed)"
         ts = r["muted_at"]
         when = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
-        lines.append(f"{status_monitor._provider_icon(prov)} {ui.escape_html(name[:60])}")
+        lines.append(f"{status_monitor._provider_tag(prov)} {ui.escape_html(name[:60])}")
         lines.append(f"  <code>{ui.escape_html(iid)}</code> · 屏蔽于 {when}")
         short = ui.register_code(f"stat_unmute:{prov}:{iid}")
         kb_rows.append([ui.btn(f"✅ 解除 [{status_monitor._provider_label(prov)}] {name[:25]}",

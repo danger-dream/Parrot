@@ -37,11 +37,11 @@ from .. import states, ui
 from . import main as main_menu
 
 
-# 渠道协议取值与展示标签。新增 openai 家族时在此集中维护。
+# 渠道协议取值与展示标签。OpenAI-style 协议家族同时承载 OpenAI API 和 xAI/Grok 兼容入口。
 PROTOCOL_CHOICES: list[tuple[str, str]] = [
-    ("anthropic",        "🅰 Anthropic (/v1/messages)"),
-    ("openai-chat",      "🅞 OpenAI Chat (/v1/chat/completions)"),
-    ("openai-responses", "🅞 OpenAI Responses (/v1/responses)"),
+    ("anthropic",        f"{ui.provider_icon('claude')} Anthropic (/v1/messages)"),
+    ("openai-chat",      f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok Chat (/v1/chat/completions)"),
+    ("openai-responses", f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok Responses (/v1/responses)"),
 ]
 
 _PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
@@ -423,7 +423,7 @@ def _sort_item_line(idx: int, name: str) -> str:
         return f"{idx}. <code>{ui.escape_html(name)}</code> ⚠ 已不存在"
     icon, status = _channel_health(ch)
     protocol = _protocol_of(ch)
-    proto_label = "🅰" if protocol == "anthropic" else "🅾"
+    proto_label = ui.provider_icon("claude") if protocol == "anthropic" else f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}"
     return (
         f"{idx}. {icon} {proto_label} <code>{ui.escape_html(ch.display_name)}</code> "
         f"{ui.escape_html(status)}"
@@ -960,9 +960,9 @@ def _wiz_send_protocol_panel(chat_id: int) -> None:
         head +
         "➕ <b>添加渠道（3/5）</b>\n\n"
         "请选择该渠道的上游协议：\n\n"
-        "• <b>Anthropic</b> — 对接 Claude 风格 <code>/v1/messages</code>，支持 CC 伪装（默认）\n"
-        "• <b>OpenAI Chat</b> — 对接 <code>/v1/chat/completions</code> 兼容上游（DeepSeek、智谱等）\n"
-        "• <b>OpenAI Responses</b> — 对接 <code>/v1/responses</code>（gpt-5 / o 系列 / 新 Responses API）",
+        f"• {ui.provider_tag('claude', full=True)} — 对接 Claude 风格 <code>/v1/messages</code>，支持 CC 伪装（默认）\n"
+        f"• {ui.provider_tag('openai')} Chat — 对接 <code>/v1/chat/completions</code> 兼容上游（DeepSeek、智谱等）\n"
+        f"• {ui.provider_tag('openai')} Responses — 对接 <code>/v1/responses</code>（gpt-5 / o 系列 / 新 Responses API）",
         reply_markup=ui.inline_kb(rows),
     )
 
@@ -1624,7 +1624,7 @@ def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> N
         chat_id, message_id,
         f"🔌 <b>切换协议 [{ui.escape_html(ch.display_name)}]</b>\n\n"
         f"当前：<code>{ui.escape_html(_PROTOCOL_LABEL.get(current, current))}</code>\n\n"
-        "<i>切换到 OpenAI 家族会自动关闭 CC 伪装；切回 Anthropic 将恢复。\n"
+        "<i>切换到 OpenAI & Grok 家族会自动关闭 CC 伪装；切回 Anthropic 将恢复。\n"
         "注意：切换协议不自动更新 Base URL / API Key / 模型列表，请按需要另行修改。</i>"
         + extra,
         reply_markup=ui.inline_kb(rows),

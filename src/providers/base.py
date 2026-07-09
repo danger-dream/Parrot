@@ -17,6 +17,7 @@ from .capabilities import (
     CC_MIMICRY_CAPABILITIES,
     OPENAI_API_CAPABILITIES,
     OPENAI_CODEX_CAPABILITIES,
+    XAI_OAUTH_CAPABILITIES,
     ProviderCapabilities,
 )
 
@@ -87,3 +88,8 @@ class OpenAIApiAdapter(ProviderAdapter):
 class OpenAICodexAdapter(ProviderAdapter):
     name = "openai-codex"
     capabilities = OPENAI_CODEX_CAPABILITIES
+
+
+class XAIOAuthAdapter(ProviderAdapter):
+    name = "xai-oauth"
+    capabilities = XAI_OAUTH_CAPABILITIES

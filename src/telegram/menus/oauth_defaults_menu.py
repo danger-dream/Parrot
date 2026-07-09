@@ -3,6 +3,7 @@
 配置字段:
   - Anthropic OAuth → cfg["oauthDefaultModels"] (顶层 list[str])
   - OpenAI    OAuth → cfg["openaiOAuth"]["defaultModels"]
+  - Grok/xAI  OAuth → cfg["xaiOAuth"]["defaultModels"]
 
 语义: OAuth 账户 entry 未手动填 models 时的回落列表。改完走 `config.update`
 自动触发 registry 重建, 热生效。
@@ -35,16 +36,40 @@ from ... import config
 from .. import states, ui
 
 
-_FAMILIES: tuple[str, ...] = ("anthropic", "openai")
+_FAMILIES: tuple[str, ...] = ("anthropic", "openai", "xai")
 
 _FAM_LABEL = {
     "anthropic": "Anthropic OAuth",
     "openai":    "OpenAI OAuth",
+    "xai":       "Grok OAuth",
 }
 _FAM_ICON = {
-    "anthropic": "🅰",
-    "openai":    "🅞",
+    "anthropic": ui.provider_icon("claude"),
+    "openai":    ui.provider_icon("openai"),
+    "xai":       ui.provider_icon("xai"),
 }
+
+_FAM_PROVIDER = {
+    "anthropic": "claude",
+    "openai":    "openai",
+    "xai":       "xai",
+}
+
+
+def _fam_body_label(family: str, *, bold: bool = True) -> str:
+    icon = ui.provider_custom_emoji_html(_FAM_PROVIDER.get(family, family))
+    label = ui.escape_html(_FAM_LABEL.get(family, family))
+    return f"{icon} <b>{label}</b>" if bold else f"{icon} {label}"
+
+
+def _ingress_body_label(ingress: str) -> str:
+    if ingress == "anthropic":
+        return f"{ui.provider_custom_emoji_html('claude')} Anthropic (/v1/messages)"
+    if ingress == "openai-chat":
+        return f"{ui.provider_custom_emoji_html('openai')}/{ui.provider_custom_emoji_html('xai')} OpenAI & Grok Chat (/v1/chat/completions)"
+    if ingress == "openai-responses":
+        return f"{ui.provider_custom_emoji_html('openai')}/{ui.provider_custom_emoji_html('xai')} OpenAI & Grok Responses (/v1/responses)"
+    return ui.escape_html(ingress)
 
 
 # ─── 读写底层 ────────────────────────────────────────────────────
@@ -53,6 +78,8 @@ def _read_list(family: str) -> list[str]:
     cfg = config.get()
     if family == "anthropic":
         raw = cfg.get("oauthDefaultModels") or []
+    elif family == "xai":
+        raw = (cfg.get("xaiOAuth") or {}).get("defaultModels") or []
     else:
         raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
     return [str(x) for x in raw if isinstance(x, str) and x.strip()]
@@ -62,6 +89,8 @@ def _write_list(family: str, models: list[str]) -> None:
     def _mutate(cfg: dict) -> None:
         if family == "anthropic":
             cfg["oauthDefaultModels"] = list(models)
+        elif family == "xai":
+            cfg.setdefault("xaiOAuth", {})["defaultModels"] = list(models)
         else:
             cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(models)
     config.update(_mutate)
@@ -100,9 +129,9 @@ def _scan_references(family: str, removed: set[str]) -> dict:
 
     只关心与 `family` 相关的入口:
       anthropic → ingressDefaultModel["anthropic"] + modelMapping["anthropic"]
-      openai    → ingressDefaultModel["openai-chat"/"openai-responses"]
+      openai/xai → ingressDefaultModel["openai-chat"/"openai-responses"]
                 + modelMapping["openai-chat"/"openai-responses"]
-    API Key 白名单本身无家族概念 — OpenAI 家族模型可能和 Anthropic 模型
+    API Key 白名单本身无家族概念 — OpenAI & Grok 家族模型可能和 Anthropic 模型
     同名吗? 实践上不会(Claude vs GPT 名字不会碰撞), 但为求精确, 只在白名单里
     按 "模型名是否在 removed 集合内" 做命中, 不分家族。
 
@@ -120,6 +149,7 @@ def _scan_references(family: str, removed: set[str]) -> dict:
     fam_ingress = {
         "anthropic": {"anthropic"},
         "openai":    {"openai-chat", "openai-responses"},
+        "xai":       {"openai-chat", "openai-responses"},
     }
     ingresses = fam_ingress.get(family, set())
 
@@ -207,6 +237,7 @@ def _commit_save(
     fam_ingress = {
         "anthropic": {"anthropic"},
         "openai":    {"openai-chat", "openai-responses"},
+        "xai":       {"openai-chat", "openai-responses"},
     }
     ingresses = fam_ingress.get(family, set())
 
@@ -214,6 +245,8 @@ def _commit_save(
         # a) 先写 OAuth 默认
         if family == "anthropic":
             cfg["oauthDefaultModels"] = list(new_models)
+        elif family == "xai":
+            cfg.setdefault("xaiOAuth", {})["defaultModels"] = list(new_models)
         else:
             cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(new_models)
 
@@ -277,10 +310,8 @@ def _overview_text() -> str:
         "",
     ]
     for fam in _FAMILIES:
-        icon = _FAM_ICON[fam]
-        label = _FAM_LABEL[fam]
         models = _read_list(fam)
-        lines.append(f"{icon} <b>{label}</b> ({len(models)}):")
+        lines.append(f"{_fam_body_label(fam)} ({len(models)}):")
         if models:
             joined = ", ".join(ui.escape_html(m) for m in models)
             lines.append(f"<code>{joined}</code>")
@@ -292,8 +323,9 @@ def _overview_text() -> str:
 
 def _overview_kb() -> dict:
     return ui.inline_kb([
-        [ui.btn("✏ 修改 Anthropic", "odm:edit:anthropic"),
-         ui.btn("✏ 修改 OpenAI",    "odm:edit:openai")],
+        [ui.btn(f"✏ 修改 {ui.provider_icon('claude')} Claude", "odm:edit:anthropic"),
+         ui.btn(f"✏ 修改 {ui.provider_icon('openai')} OpenAI",    "odm:edit:openai")],
+        [ui.btn(f"✏ 修改 {ui.provider_icon('xai')} Grok",      "odm:edit:xai")],
         [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
 
@@ -317,10 +349,8 @@ def _start_edit(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
     states.set_state(chat_id, f"odm_edit:{family}")
     current = _read_list(family)
     current_line = ", ".join(current) if current else "(空)"
-    icon = _FAM_ICON[family]
-    label = _FAM_LABEL[family]
     text = (
-        f"✏ <b>修改 {icon} {label} 默认模型</b>\n\n"
+        f"✏ <b>修改</b> {_fam_body_label(family)} <b>默认模型</b>\n\n"
         f"当前列表 ({len(current)}, 点击可复制作为起点):\n"
         f"<code>{ui.escape_html(current_line)}</code>\n\n"
         "请直接发送<b>新的模型列表</b>:\n"
@@ -410,10 +440,8 @@ def _on_edit_input(chat_id: int, action: str, text: str) -> None:
 def _render_confirm(
     family: str, new_models: list[str], removed: set[str], refs: dict,
 ) -> str:
-    icon = _FAM_ICON[family]
-    label = _FAM_LABEL[family]
     lines = [
-        f"⚠ <b>确认保存 {icon} {label} 默认模型</b>",
+        f"⚠ <b>确认保存</b> {_fam_body_label(family)} <b>默认模型</b>",
         "",
         f"即将移除 ({len(removed)} 项):",
     ]
@@ -442,7 +470,7 @@ def _render_confirm(
         lines.append(f"🔁 <b>模型映射</b> ({len(refs['mappings'])}):")
         for row in refs["mappings"]:
             lines.append(
-                f"  • {_INGRESS_LABEL.get(row['ingress'], row['ingress'])}: "
+                f"  • {_ingress_body_label(row['ingress'])}: "
                 f"<code>{ui.escape_html(row['alias'])}</code> → "
                 f"<code>{ui.escape_html(row['real'])}</code>"
             )
@@ -452,7 +480,7 @@ def _render_confirm(
         lines.append(f"🎯 <b>入口默认模型</b> ({len(refs['defaults'])}):")
         for row in refs["defaults"]:
             lines.append(
-                f"  • {_INGRESS_LABEL.get(row['ingress'], row['ingress'])}: "
+                f"  • {_ingress_body_label(row['ingress'])}: "
                 f"<code>{ui.escape_html(row['value'])}</code>"
             )
         lines.append("")
@@ -477,9 +505,7 @@ def _send_saved_result(
     chat_id: int, family: str, new_models: list[str],
     summary: dict | None,
 ) -> None:
-    icon = _FAM_ICON[family]
-    label = _FAM_LABEL[family]
-    parts = [f"✅ 已保存 {icon} <b>{label}</b> 默认模型 "
+    parts = [f"✅ 已保存 {_fam_body_label(family)} 默认模型 "
              f"({len(new_models)} 项)"]
     if new_models:
         joined = ", ".join(ui.escape_html(m) for m in new_models)
@@ -527,7 +553,7 @@ def _send_saved_result(
                 f"🎯 清除入口默认 ({len(summary['defaults_cleared'])}):"
             )
             for ing in summary["defaults_cleared"]:
-                lines.append(f"  • {_INGRESS_LABEL.get(ing, ing)}")
+                lines.append(f"  • {_ingress_body_label(ing)}")
         if lines:
             parts.append("\n".join(lines))
 

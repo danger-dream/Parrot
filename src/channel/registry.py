@@ -14,6 +14,7 @@ from .api_channel import ApiChannel
 from .base import Channel
 from .oauth_channel import OAuthChannel
 from .openai_oauth_channel import OpenAIOAuthChannel
+from .xai_oauth_channel import XAIOAuthChannel
 from .url_utils import (
     normalize_api_path,
     split_base_url,
@@ -48,6 +49,8 @@ def rebuild_from_config() -> None:
         try:
             if provider == "openai":
                 ch = OpenAIOAuthChannel(acc)
+            elif provider == "xai":
+                ch = XAIOAuthChannel(acc)
             else:
                 ch = OAuthChannel(acc, default_models)
             new[ch.key] = ch
@@ -113,6 +116,21 @@ def get_channel(key: str) -> Optional[Channel]:
                 and getattr(c, "protocol", "") == "openai-responses"
                 and getattr(c, "email", None) == identity
             ]
+            return matches[0] if len(matches) == 1 else None
+        if key.startswith("oauth:xai:"):
+            identity = key[len("oauth:xai:"):]
+            legacy_email = ""
+            legacy_subject = ""
+            if ":" in identity:
+                legacy_email, _, legacy_subject = identity.partition(":")
+            matches = []
+            for c in _channels.values():
+                if c.type != "oauth" or getattr(c, "provider", "") != "xai":
+                    continue
+                email = str(getattr(c, "email", "") or "")
+                subject = str(getattr(c, "subject", "") or "")
+                if identity in (email, subject) or (legacy_email == email and legacy_subject == subject):
+                    matches.append(c)
             return matches[0] if len(matches) == 1 else None
         return None
 

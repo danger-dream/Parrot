@@ -1,0 +1,429 @@
+"""xAI / Grok OAuth provider, channel, registry and TG entry tests."""
+
+from __future__ import annotations
+
+import os as _ap_os
+import sys as _ap_sys
+_ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(
+    _ap_os.path.dirname(_ap_os.path.abspath(__file__))
+)))
+from src.tests import _isolation
+_isolation.isolate()
+
+import base64
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+import pytest
+import asyncio
+
+
+def _import_modules():
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from src import config, log_db, oauth_manager, state_db
+    from src.channel import registry
+    from src.channel.xai_oauth_channel import XAIOAuthChannel
+    from src.oauth import xai as xai_provider
+    from src.providers import registry as provider_registry
+    from src.protocols.matrix import capabilities_for_channel
+    from src.telegram import states, ui
+    from src.telegram.menus import oauth_menu
+    return {
+        "config": config,
+        "oauth_manager": oauth_manager,
+        "state_db": state_db,
+        "log_db": log_db,
+        "registry": registry,
+        "XAIOAuthChannel": XAIOAuthChannel,
+        "xai_provider": xai_provider,
+        "provider_registry": provider_registry,
+        "capabilities_for_channel": capabilities_for_channel,
+        "states": states,
+        "ui": ui,
+        "oauth_menu": oauth_menu,
+    }
+
+
+class ApiRecorder:
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, method, data=None):
+        self.calls.append((method, dict(data) if data else {}))
+        return {"ok": True, "result": {"message_id": 123}}
+
+    def by(self, method):
+        return [d for m, d in self.calls if m == method]
+
+    def last(self, method):
+        items = self.by(method)
+        return items[-1] if items else None
+
+
+def _setup(m):
+    m["state_db"].init()
+    def _reset(c):
+        c.setdefault("oauth", {})["mockMode"] = True
+        c["oauthAccounts"] = []
+        c["channels"] = []
+        xai_cfg = dict(m["config"].DEFAULT_CONFIG.get("xaiOAuth") or {})
+        xai_cfg["defaultModels"] = ["grok-4", "grok-code-fast-1"]
+        c["xaiOAuth"] = xai_cfg
+    m["config"].update(_reset)
+    m["states"].clear_all()
+
+
+def _install_recorder(m):
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    return rec
+
+
+def _future_expired(seconds: int = 3600) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_xai_pkce_login_url_and_mock_token(m):
+    _setup(m)
+    p = m["xai_provider"]
+    verifier, challenge = p.pkce_generate()
+    assert len(verifier) == 128
+    assert all(ch.isalnum() or ch in "-_" for ch in verifier)
+    expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    assert challenge == expected
+
+    url = p.build_login_url("CHALLENGE", "STATE")
+    assert url.startswith("https://auth.x.ai/oauth/authorize?")
+    assert "client_id=b1a00492-073a-47ea-816f-4c329264a828" in url
+    assert "grok-cli%3Aaccess" in url
+    assert "api%3Aaccess" in url
+    assert "code_challenge_method=S256" in url
+    assert "plan=generic" in url
+
+    tok = p.exchange_code_sync("mock-code", verifier)
+    assert tok["access_token"].startswith("mock-xai-access-")
+    assert tok["refresh_token"].startswith("mock-xai-refresh-")
+    info = p.extract_user_info(p.decode_id_token(tok["id_token"]))
+    assert info["email"].startswith("mock-xai-")
+    assert info["subject"].startswith("mock-xai-sub-")
+
+
+def test_xai_config_overrides_oauth_defaults(m):
+    _setup(m)
+    p = m["xai_provider"]
+
+    def _override(c):
+        x = c.setdefault("xaiOAuth", {})
+        x["clientId"] = "custom-xai-client"
+        x["redirectUri"] = "http://127.0.0.1:56121/custom-callback"
+        x["scope"] = ["openid", "offline_access", "api:access"]
+        x["apiBaseUrl"] = "https://api.x.ai/v1/custom"
+
+    m["config"].update(_override)
+    url = p.build_login_url("CHALLENGE", "STATE", nonce="NONCE")
+    assert "client_id=custom-xai-client" in url
+    assert "redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcustom-callback" in url
+    assert "scope=openid+offline_access+api%3Aaccess" in url
+    tok = p.refresh_sync("refresh-token-0123456789", email="cfg@example.test", subject="cfg-sub")
+    assert tok["base_url"] == "https://api.x.ai/v1/custom"
+    assert tok["redirect_uri"] == "http://127.0.0.1:56121/custom-callback"
+    assert tok["scope"] == "openid offline_access api:access"
+
+
+def test_xai_account_key_registry_and_usage(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    p = m["xai_provider"]
+    tok = p.refresh_sync("refresh-token-0123456789", email="grok@example.test", subject="sub-1")
+    om.add_account({
+        "provider": "xai",
+        "email": tok["email"],
+        "access_token": tok["access_token"],
+        "refresh_token": tok["refresh_token"],
+        "expired": _future_expired(),
+        "id_token": tok["id_token"],
+        "subject": tok["subject"],
+        "models": ["grok-4"],
+    })
+
+    accounts = om.list_accounts()
+    assert len(accounts) == 1
+    ak = om._canonical_key(accounts[0]) if hasattr(om, "_canonical_key") else None
+    assert ak == "xai:sub-1"
+    assert om.provider_of(ak) == "xai"
+    assert om.account_key_to_email(ak) == "grok@example.test"
+    usage = p.empty_usage()
+    assert usage["xai"]["quota_supported"] is False
+
+    # Legacy/imported xAI account without subject upgrades in-place when a later
+    # id_token exposes the stable OIDC subject.
+    _setup(m)
+    om.add_account({
+        "provider": "xai",
+        "email": "legacy@example.test",
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expired": _future_expired(),
+    })
+    assert om._canonical_key(om.list_accounts()[0]) == "xai:legacy@example.test"
+    tok2 = p.refresh_sync("refresh-token-legacy", email="legacy@example.test", subject="legacy-sub")
+    om.add_account({
+        "provider": "xai",
+        "email": tok2["email"],
+        "access_token": tok2["access_token"],
+        "refresh_token": tok2["refresh_token"],
+        "expired": _future_expired(),
+        "id_token": tok2["id_token"],
+        "subject": tok2["subject"],
+    })
+    accounts = om.list_accounts()
+    assert len(accounts) == 1
+    assert om._canonical_key(accounts[0]) == "xai:legacy-sub"
+
+    # Restore the account used by the channel/registry checks below.
+    _setup(m)
+    om.add_account({
+        "provider": "xai",
+        "email": tok["email"],
+        "access_token": tok["access_token"],
+        "refresh_token": tok["refresh_token"],
+        "expired": _future_expired(),
+        "id_token": tok["id_token"],
+        "subject": tok["subject"],
+        "models": ["grok-4"],
+    })
+
+    m["registry"].rebuild_from_config()
+    ch = m["registry"].get_channel(f"oauth:{ak}")
+    assert isinstance(ch, m["XAIOAuthChannel"])
+    assert m["registry"].get_channel("oauth:xai:grok@example.test:sub-1") is ch
+    assert ch.provider == "xai"
+    assert ch.supports_model("grok-4") == "grok-4"
+
+
+def test_xai_channel_request_shape_and_provider_capabilities(m):
+    _setup(m)
+    account = {
+        "provider": "xai",
+        "email": "grok@example.test",
+        "subject": "sub-1",
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expired": _future_expired(),
+        "models": ["grok-4"],
+    }
+    ch = m["XAIOAuthChannel"](account)
+
+    adapter = m["provider_registry"].adapter_for_channel(ch)
+    assert adapter.name == "xai-oauth"
+    assert "tool_search" not in adapter.capabilities.native_state
+    assert "namespace" not in adapter.capabilities.native_state
+    assert "web_search" in adapter.capabilities.native_state
+    assert "ws" not in adapter.capabilities.transports
+
+    matrix_caps = m["capabilities_for_channel"](ch)
+    assert "prompt_cache_key" in matrix_caps.native_state
+    assert "tool_search" not in matrix_caps.native_state
+    assert "namespace" not in matrix_caps.native_state
+    assert "web_search" in matrix_caps.native_state
+    assert "ws" not in matrix_caps.transports
+
+    old_ensure = m["oauth_manager"].ensure_valid_token
+    async def fake_ensure(account_key):
+        assert account_key == "xai:sub-1"
+        return "at-fresh"
+    m["oauth_manager"].ensure_valid_token = fake_ensure
+    try:
+        req = asyncio_run(async_build(ch, {
+            "model": "grok-4",
+            "input": "hi",
+            "stream": False,
+            "prompt_cache_key": "session-1",
+            "_api_key_name": "client-a",
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "previous_response_id": "",
+            "stream_options": {"include_usage": False, "ignored": True},
+            "metadata": {"probe_id": "should-be-dropped"},
+            "service_tier": "auto",
+        }))
+    finally:
+        m["oauth_manager"].ensure_valid_token = old_ensure
+
+    assert req.url == "https://api.x.ai/v1/responses"
+    assert req.headers["authorization"] == "Bearer at-fresh"
+    assert req.headers["accept"] == "text/event-stream"
+    assert req.headers["x-grok-conv-id"] != "session-1"
+    payload = json.loads(req.body.decode("utf-8"))
+    assert payload["model"] == "grok-4"
+    assert payload["stream"] is True
+    assert payload["stream_options"] == {"include_usage": True}
+    assert "previous_response_id" not in payload
+    assert "metadata" not in payload
+    assert "service_tier" not in payload
+    assert payload["prompt_cache_key"] == "session-1"
+    assert "tool_choice" not in payload
+    assert "parallel_tool_calls" not in payload
+
+
+def test_xai_channel_maps_anthropic_fast_to_priority(m):
+    _setup(m)
+    ch = m["XAIOAuthChannel"]({
+        "provider": "xai",
+        "email": "grok@example.test",
+        "subject": "sub-1",
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expired": _future_expired(),
+        "models": ["grok-4"],
+    })
+    old_ensure = m["oauth_manager"].ensure_valid_token
+    async def fake_ensure(account_key):
+        return "at-fresh"
+    m["oauth_manager"].ensure_valid_token = fake_ensure
+    try:
+        req = asyncio_run(async_build(ch, {
+            "model": "grok-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "speed": "fast",
+        }, ingress_protocol="anthropic"))
+    finally:
+        m["oauth_manager"].ensure_valid_token = old_ensure
+    payload = json.loads(req.body.decode("utf-8"))
+    assert payload["service_tier"] == "priority"
+
+
+def test_xai_channel_keeps_native_web_search_and_normalizes_aliases(m):
+    _setup(m)
+    ch = m["XAIOAuthChannel"]({
+        "provider": "xai",
+        "email": "grok@example.test",
+        "subject": "sub-1",
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expired": _future_expired(),
+        "models": ["grok-4"],
+    })
+    old_ensure = m["oauth_manager"].ensure_valid_token
+    async def fake_ensure(account_key):
+        return "at-fresh"
+    m["oauth_manager"].ensure_valid_token = fake_ensure
+    try:
+        req = asyncio_run(async_build(ch, {
+            "model": "grok-4",
+            "input": "search latest xAI docs",
+            "tools": [{
+                "type": "web_search_preview",
+                "blocked_domains": ["example.com"],
+                "enable_image_search": True,
+                "context_size": "high",
+            }],
+            "tool_choice": {"type": "web_search_preview"},
+            "parallel_tool_calls": True,
+        }))
+    finally:
+        m["oauth_manager"].ensure_valid_token = old_ensure
+    payload = json.loads(req.body.decode("utf-8"))
+    assert payload["tools"] == [{
+        "type": "web_search",
+        "excluded_domains": ["example.com"],
+        "enable_image_search": True,
+    }]
+    assert payload["tool_choice"] == {"type": "web_search"}
+    assert payload["parallel_tool_calls"] is True
+
+
+def test_xai_cost_aggregation_from_sse_usage(m):
+    _setup(m)
+    log_db = m["log_db"]
+    log_db.init()
+    channel = "oauth:xai:cost-sub"
+    request_id = "xai-cost-test-1"
+    body = (
+        'event: response.completed\n'
+        'data: {"type":"response.completed","response":{"service_tier":"priority","usage":'
+        '{"input_tokens":226,"input_tokens_details":{"cached_tokens":128},'
+        '"output_tokens":49,"cost_in_usd_ticks":5540000}}}\n\n'
+    )
+    conn = log_db._get_conn()
+    conn.execute(
+        """INSERT INTO request_log
+           (request_id, created_at, final_channel_key, final_channel_type,
+            requested_model, final_model, status, http_status, is_stream,
+            input_tokens, output_tokens, cache_read_tokens, total_time_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (request_id, 1000.0, channel, "oauth", "grok-4.5", "grok-4.5",
+         "success", 200, 1, 98, 49, 128, 1573),
+    )
+    conn.execute(
+        "INSERT INTO request_detail (request_id, response_body) VALUES (?,?)",
+        (request_id, body),
+    )
+    conn.commit()
+
+    s = log_db.xai_cost_for_channel(channel, since_ts=0)
+    assert s["cost_ticks"] == 5540000
+    assert s["cost_usd"] == pytest.approx(0.000554)
+    assert s["input"] == 98
+    assert s["cache_read"] == 128
+    assert s["output"] == 49
+    assert s["service_tier_counts"] == {"priority": 1}
+
+
+def asyncio_run(coro):
+    return asyncio.run(coro)
+
+
+async def async_build(ch, body, *, ingress_protocol="responses"):
+    return await ch.build_upstream_request(body, "grok-4", ingress_protocol=ingress_protocol)
+
+
+def test_xai_channel_rejects_previous_response_id(m):
+    _setup(m)
+    ch = m["XAIOAuthChannel"]({
+        "provider": "xai",
+        "email": "grok@example.test",
+        "subject": "sub-1",
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expired": _future_expired(),
+        "models": ["grok-4"],
+    })
+    with pytest.raises(ValueError) as exc:
+        asyncio_run(async_build(ch, {"model": "grok-4", "input": "hi", "previous_response_id": "resp_1"}))
+    assert "previous_response_id is not supported" in str(exc.value)
+
+
+def test_xai_tg_login_and_refresh_token_entries(m):
+    _setup(m)
+    rec = _install_recorder(m)
+    menu = m["oauth_menu"]
+    states = m["states"]
+    om = m["oauth_manager"]
+
+    menu.on_add_menu(1, 10, "cb")
+    rendered = rec.last("editMessageText") or {}
+    assert "Grok 登录获取 Token" in rendered.get("text", "") or "Grok" in json.dumps(rendered, ensure_ascii=False)
+
+    menu.on_login_xai_start(1, 10, "cb")
+    st = states.get_state(1)
+    assert st and st["action"] == "oa_xai_code"
+    url_text = (rec.last("editMessageText") or {}).get("text", "")
+    assert "auth.x.ai" in url_text
+    state = (st.get("data") or {}).get("state")
+    menu.on_login_xai_code_input(1, f"http://127.0.0.1:56121/callback?code=abc&state={state}")
+    assert any(om.provider_of(acc) == "xai" for acc in om.list_accounts())
+    assert "Grok OAuth 账户已" in (rec.last("sendMessage") or {}).get("text", "")
+
+    rec.calls.clear()
+    menu.on_set_rt_xai_start(1, 10, "cb")
+    assert (states.get_state(1) or {}).get("action") == "oa_xai_rt"
+    menu.on_set_rt_xai_input(1, "refresh_token: rt_xai_abcdefghijklmnopqrstuvwxyz")
+    assert any(om.provider_of(acc) == "xai" for acc in om.list_accounts())
+    assert "Grok OAuth 账户已" in (rec.last("sendMessage") or {}).get("text", "")

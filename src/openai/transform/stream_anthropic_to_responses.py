@@ -435,7 +435,7 @@ class StreamTranslator:
             _notifier.throttled_notify_event_sync(
                 "openai_store_save_failed",
                 f"openai_store_save_failed:{self._store_api_key_name}",
-                "❌ <b>OpenAI Store 写入失败</b>（流式 Anthropic→Responses）\n"
+                f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（流式 Anthropic→Responses）\n"
                 f"API Key: <code>{ek(self._store_api_key_name)}</code>\n"
                 f"模型: <code>{ek(self.state.model)}</code> · 渠道: <code>{ek(self._store_channel_key or '?')}</code>\n"
                 f"resp_id: <code>{ek(self.state.resp_id)}</code>\n"

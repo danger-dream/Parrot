@@ -6,6 +6,7 @@ Selection is intentionally lightweight and mirrors today's Channel classes:
 - Anthropic OAuth                      → Anthropic OAuth
 - OpenAI API channels                  → OpenAI API
 - OpenAI OAuth/Codex channels          → OpenAI Codex
+- xAI OAuth/Grok channels              → xAI OAuth
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from .base import (
     CcMimicryAdapter,
     OpenAIApiAdapter,
     OpenAICodexAdapter,
+    XAIOAuthAdapter,
     ProviderAdapter,
     ProviderAttemptContext,
 )
@@ -27,6 +29,7 @@ _CC_MIMICRY = CcMimicryAdapter()
 _ANTHROPIC_OAUTH = AnthropicOAuthAdapter()
 _OPENAI_API = OpenAIApiAdapter()
 _OPENAI_CODEX = OpenAICodexAdapter()
+_XAI_OAUTH = XAIOAuthAdapter()
 
 
 def adapter_for_channel(channel) -> ProviderAdapter:
@@ -34,6 +37,8 @@ def adapter_for_channel(channel) -> ProviderAdapter:
     ch_type = getattr(channel, "type", "api")
 
     if protocol.startswith("openai-"):
+        if ch_type == "oauth" and getattr(channel, "provider", "") == "xai":
+            return _XAI_OAUTH
         return _OPENAI_CODEX if ch_type == "oauth" else _OPENAI_API
 
     if ch_type == "oauth":

@@ -306,6 +306,118 @@ def _normalize_openai_local_web_tool_choice(choice: Any, *, has_tools: bool) -> 
     return choice, False
 
 
+_XAI_WEB_SEARCH_TOOL_ALLOWED_FIELDS = frozenset({
+    "type",
+    "allowed_domains",
+    "excluded_domains",
+    "enable_image_understanding",
+    "enable_image_search",
+})
+
+
+def _normalize_xai_native_web_search_tool(tool: Any) -> tuple[dict[str, Any] | Any, bool]:
+    """Normalize OpenAI hosted search aliases to xAI's native web_search tool.
+
+    xAI documents the Responses-compatible tool as ``{"type":"web_search"}``
+    with four optional parameters.  Keep ordinary function/custom tools intact,
+    but avoid forwarding OpenAI preview aliases or unrelated hosted tool fields
+    that xAI's stricter API may reject.
+    """
+    if not isinstance(tool, dict):
+        return tool, False
+    typ = str(tool.get("type") or "").strip()
+    if not is_openai_web_search_tool_type(typ):
+        return tool, False
+    out: dict[str, Any] = {"type": "web_search"}
+    for key in _XAI_WEB_SEARCH_TOOL_ALLOWED_FIELDS:
+        if key != "type" and key in tool:
+            out[key] = tool[key]
+    # Parrot/OpenAI-local schemas historically used blocked_domains; xAI calls
+    # the equivalent excluded_domains.  Prefer the official field if both exist.
+    if "excluded_domains" not in out and "blocked_domains" in tool:
+        out["excluded_domains"] = tool.get("blocked_domains")
+    return out, out != tool
+
+
+def _normalize_xai_native_web_search_tool_choice(choice: Any) -> tuple[Any, bool]:
+    if not isinstance(choice, dict):
+        return choice, False
+    typ = str(choice.get("type") or "").strip()
+    if is_openai_web_search_tool_type(typ):
+        return {"type": "web_search"}, typ != "web_search" or choice != {"type": "web_search"}
+    if typ == "allowed_tools":
+        tools = choice.get("tools")
+        if not isinstance(tools, list):
+            return choice, False
+        changed = False
+        normalized_tools: list[Any] = []
+        for item in tools:
+            normalized, item_changed = _normalize_xai_native_web_search_tool(item)
+            changed = changed or item_changed
+            normalized_tools.append(normalized)
+        if not changed:
+            return choice, False
+        out = dict(choice)
+        out["tools"] = normalized_tools
+        return out, True
+    return choice, False
+
+
+def prepare_xai_responses_native_web_search_tools(body: dict[str, Any] | None) -> bool:
+    """Keep web_search as an xAI-native hosted tool instead of local AnySearch.
+
+    Returns True when the request declared a web_search tool and was normalized
+    for xAI.  This is intentionally separate from
+    :func:`prepare_openai_responses_local_web_tools` so scheduler/provider
+    selection can choose by family.
+    """
+    if not isinstance(body, dict):
+        return False
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    declared = False
+    changed = False
+    normalized_tools: list[Any] = []
+    for tool in tools:
+        if isinstance(tool, dict) and is_openai_web_search_tool_type(tool.get("type")):
+            declared = True
+        normalized, item_changed = _normalize_xai_native_web_search_tool(tool)
+        changed = changed or item_changed
+        normalized_tools.append(normalized)
+    if changed:
+        body["tools"] = normalized_tools
+    choice = body.get("tool_choice")
+    if choice is not None:
+        normalized_choice, choice_changed = _normalize_xai_native_web_search_tool_choice(choice)
+        if choice_changed:
+            body["tool_choice"] = normalized_choice
+    if declared:
+        body.pop(OPENAI_LOCAL_WEB_MARKER, None)
+    return declared
+
+
+def request_declares_openai_web_search_tools(body: dict[str, Any] | None) -> bool:
+    """Whether a Responses request declares OpenAI/xAI web_search hosted tools."""
+    if not isinstance(body, dict):
+        return False
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and is_openai_web_search_tool_type(tool.get("type")):
+                return True
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict):
+        typ = str(choice.get("type") or "").strip()
+        if is_openai_web_search_tool_type(typ):
+            return True
+        if typ == "allowed_tools":
+            for item in choice.get("tools") or []:
+                if isinstance(item, dict) and is_openai_web_search_tool_type(item.get("type")):
+                    return True
+    return False
+
+
 def prepare_openai_responses_local_web_tools(body: dict[str, Any] | None) -> bool:
     """Normalize Responses built-ins for local/non-native execution.
 

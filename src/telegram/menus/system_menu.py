@@ -1198,8 +1198,14 @@ def _mon_on(v: bool) -> str:
     return "✅ 开" if v else "🚫 关"
 
 
-def _mon_core_label(key: str) -> str:
-    return {"openai": "OpenAI", "claude": "Claude", "cloudflare": "Cloudflare"}.get(key, key)
+def _mon_core_label(key: str, *, rich: bool = False) -> str:
+    if key == "openai":
+        return ui.provider_tag("openai") if rich else "OpenAI"
+    if key == "claude":
+        return ui.provider_tag("claude") if rich else "Claude"
+    if key == "cloudflare":
+        return "Cloudflare"
+    return ui.escape_html(key) if rich else key
 
 
 def _mon_last_lines(limit: int = 12) -> list[str]:
@@ -1242,7 +1248,7 @@ def _show_monitor(chat_id: int, message_id: int, cb_id: str) -> None:
         f"SOCKS5 检测: <code>{_mon_on(bool(c.get('socks5')))}</code>",
         f"渠道连接性: <code>{_mon_on(bool(ch_cfg.get('enabled')))}</code> · 已选 {len(network_monitor.enabled_channel_keys())} 个",
         "核心上游: " + " · ".join(
-            f"{_mon_core_label(k)} {'✅' if core.get(k) else '🚫'}"
+            f"{_mon_core_label(k, rich=True)} {'✅' if core.get(k) else '🚫'}"
             for k in ("openai", "claude", "cloudflare")
         ),
         "",
@@ -1307,10 +1313,10 @@ def _show_monitor_core(chat_id: int, message_id: int, cb_id: str) -> None:
     core = _mon_cfg().get("core") or {}
     lines = ["🧭 <b>核心上游检测</b>", ""]
     for k in ("openai", "claude", "cloudflare"):
-        lines.append(f"{_mon_core_label(k)}: <code>{_mon_on(bool(core.get(k)))}</code>")
+        lines.append(f"{_mon_core_label(k, rich=True)}: <code>{_mon_on(bool(core.get(k)))}</code>")
     rows = [
-        [ui.btn("OpenAI " + ("关" if core.get("openai") else "开"), "sys:mon:core_toggle:openai")],
-        [ui.btn("Claude " + ("关" if core.get("claude") else "开"), "sys:mon:core_toggle:claude")],
+        [ui.btn(ui.provider_icon("openai") + " OpenAI " + ("关" if core.get("openai") else "开"), "sys:mon:core_toggle:openai")],
+        [ui.btn(ui.provider_icon("claude") + " Claude " + ("关" if core.get("claude") else "开"), "sys:mon:core_toggle:claude")],
         [ui.btn("Cloudflare " + ("关" if core.get("cloudflare") else "开"), "sys:mon:core_toggle:cloudflare")],
         [ui.btn("◀ 返回网络检测", "sys:mon:show")],
     ]

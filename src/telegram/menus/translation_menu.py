@@ -129,11 +129,22 @@ def _channel_scope_items() -> list[tuple[str, str]]:
         typ = str(getattr(ch, "type", "") or "")
         proto = str(getattr(ch, "protocol", "anthropic") or "anthropic")
         icon = "👤" if typ == "oauth" else "🔑"
-        if proto == "anthropic":
-            icon += "🅰"
-        elif proto.startswith("openai"):
-            icon += "🅾"
-        label = str(getattr(ch, "display_name", "") or getattr(ch, "name", "") or key)
+        if typ == "oauth":
+            provider = str(getattr(ch, "provider", "") or "")
+            if not provider and key.startswith("oauth:"):
+                try:
+                    from ... import oauth_manager
+                    provider = oauth_manager.provider_of(key[len("oauth:"):])
+                except Exception:
+                    provider = ""
+            icon += ui.provider_icon(provider or ("claude" if proto == "anthropic" else "openai"))
+            label = ui.channel_display_name(key, with_family=False)
+        else:
+            if proto == "anthropic":
+                icon += ui.provider_icon("claude")
+            elif proto.startswith("openai"):
+                icon += f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}"
+            label = str(getattr(ch, "display_name", "") or getattr(ch, "name", "") or key)
         items.append((key, f"{icon} {label}"))
     return items
 

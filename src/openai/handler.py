@@ -74,6 +74,25 @@ def _count_msg_tool(body: dict, ingress_protocol: str) -> tuple[int, int]:
     return 1, tool_count
 
 
+def _has_xai_oauth_candidate(model: str | None) -> bool:
+    """Whether the current model can be served by an enabled xAI OAuth channel."""
+    if not model:
+        return False
+    for ch in registry.all_channels():
+        if not getattr(ch, "enabled", False):
+            continue
+        if getattr(ch, "disabled_reason", None):
+            continue
+        if getattr(ch, "type", "") != "oauth" or getattr(ch, "provider", "") != "xai":
+            continue
+        try:
+            if ch.supports_model(model) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _openai_family_models_sorted(cfg: dict) -> list[str]:
     """/v1/models 之外，仅给 no_channels 告警文案用（简化描述）。"""
     # 占位：这里给一个空实现，以免引入多余依赖
@@ -348,11 +367,19 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(ge.status, ge.err_type, ge.message, param=ge.param)
 
     if ingress_protocol == "responses":
-        # Normalize OpenAI/Codex hosted search-ish tools before scheduling:
-        # web_search becomes a local AnySearch-backed function tool; tool_search
-        # (Codex tool discovery) and image_generation are dropped for non-native
-        # safety, matching CLIProxyAPI's unsupported-provider behavior.
-        local_web_tools.prepare_openai_responses_local_web_tools(body)
+        # Normalize hosted search-ish tools before scheduling.  xAI/Grok has a
+        # native Responses-compatible web_search tool, so keep it hosted when a
+        # matching xAI OAuth channel can serve the requested model.  Other
+        # OpenAI-family upstreams keep the previous safe behaviour: web_search
+        # is converted into Parrot's local AnySearch-backed function loop, while
+        # non-portable hosted tools are dropped/guarded.
+        if (
+            local_web_tools.request_declares_openai_web_search_tools(body)
+            and _has_xai_oauth_candidate(model)
+        ):
+            local_web_tools.prepare_xai_responses_native_web_search_tools(body)
+        else:
+            local_web_tools.prepare_openai_responses_local_web_tools(body)
 
     # OpenAI 默认非流式（与 anthropic 默认流式相反）
     is_stream = bool(body.get("stream", False))
@@ -429,7 +456,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         await notifier.throttled_notify_event(
             "no_channels",
             f"no_channels:{ingress_protocol}:{model}",
-            "🚨 <b>无可用渠道</b>（OpenAI 入口）\n"
+            f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} 入口）\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"入口: <code>{ingress_protocol}</code> / 模型: <code>{ek(model)}</code>\n"
             "请检查该家族是否有启用且未冷却的渠道。",

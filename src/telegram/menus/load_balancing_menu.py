@@ -20,8 +20,8 @@ from .. import states, ui
 
 
 _FAMILY_LABELS = {
-    "anthropic": "🅰 Anthropic 协议",
-    "openai": "🅾 OpenAI 协议",
+    "anthropic": f"{ui.provider_icon('claude')} Anthropic 协议",
+    "openai": f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok 协议",
 }
 
 _MODE_LABELS = {
@@ -49,7 +49,13 @@ def _normalized_keys(family: str) -> list[str]:
 def _channel_icon(ch) -> str:
     if ch.type == "oauth":
         prov = provider_from_channel_key(ch.key)
-        return "🅾 🔐" if prov == "openai" else "🅰 🔐"
+        if prov == "openai":
+            return f"{ui.provider_icon('openai')} 🔐"
+        if prov == "xai":
+            return f"{ui.provider_icon('xai')} 🔐"
+        if prov == "claude":
+            return f"{ui.provider_icon('claude')} 🔐"
+        return "✉ 🔐"
     return "🔀"
 
 
@@ -148,8 +154,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
     ]]
     if mode == "priority":
         lines.extend(["", "请选择要调整的协议类型"])
-        rows.append([ui.btn("🅰 Anthropic 协议", "lb:fam:anthropic")])
-        rows.append([ui.btn("🅾 OpenAI 协议", "lb:fam:openai")])
+        rows.append([ui.btn(f"{ui.provider_icon('claude')} Anthropic 协议", "lb:fam:anthropic")])
+        rows.append([ui.btn(f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok 协议", "lb:fam:openai")])
         rows.append([ui.btn("🧹 清除全部亲和", "lb:aff_all")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return "\n".join(lines), ui.inline_kb(rows)

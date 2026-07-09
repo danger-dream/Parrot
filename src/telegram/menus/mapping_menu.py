@@ -56,10 +56,22 @@ _CODE_LINE: dict[str, str] = {v: k for k, v in _LINE_CODE.items()}
 
 _LINE_ICON: dict[str, str] = {
     model_mapping.GLOBAL_MAPPING_LINE: "🔁",
-    "anthropic":        "🅰",
-    "openai-chat":      "🅞",
-    "openai-responses": "🅞",
+    "anthropic":        ui.provider_icon("claude"),
+    "openai-chat":      f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}",
+    "openai-responses": f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}",
 }
+
+
+def _line_body_icon(line: str) -> str:
+    if line == "anthropic":
+        return ui.provider_custom_emoji_html("claude")
+    if line in ("openai-chat", "openai-responses"):
+        return f"{ui.provider_custom_emoji_html('openai')}/{ui.provider_custom_emoji_html('xai')}"
+    return _LINE_ICON.get(line, "🔁")
+
+
+def _line_body_label(line: str) -> str:
+    return f"{_line_body_icon(line)} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}"
 
 
 def _code_of_line(line: str) -> str:
@@ -84,7 +96,7 @@ def _overview_text() -> str:
         f"🗜 压缩模型：<code>{ui.escape_html(compact)}</code>",
         f"🧩 分段目标：<code>{compact_rescue.chunk_target_tokens():,}</code> tokens",
         "",
-        "<i>模型映射按模型名全局生效，不再区分 Anthropic / OpenAI 入口。</i>",
+        "<i>模型映射按模型名全局生效，不再区分 Anthropic / OpenAI & Grok 入口。</i>",
     ]
     return "\n".join(lines)
 
@@ -109,12 +121,11 @@ def send_new(chat_id: int) -> None:
 # ─── Level 2 单条 line 的管理页 ────────────────────────────────────
 
 def _line_text(line: str) -> str:
-    icon = _LINE_ICON[line]
     label = model_mapping.INGRESS_LABEL[line]
     default = model_mapping.get_default_model(line)
     mp = model_mapping.get_ingress_map(line)
     out = [
-        f"{icon} <b>{ui.escape_html(label)}</b>",
+        f"{_line_body_icon(line)} <b>{ui.escape_html(label)}</b>",
         "",
         f"默认模型: <code>{ui.escape_html(default) if default else '(未设置)'}</code>",
         f"映射 ({len(mp)}):",
@@ -185,7 +196,7 @@ def _show_item(
     ui.answer_cb(cb_id)
     lc = _code_of_line(line)
     text = (
-        f"{_LINE_ICON[line]} <b>映射条目 · "
+        f"{_line_body_icon(line)} <b>映射条目 · "
         f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
         f"别名: <code>{ui.escape_html(alias)}</code>\n"
         f"真实: <code>{ui.escape_html(real)}</code>\n\n"
@@ -224,7 +235,7 @@ def _start_edit_alias(
     states.set_state(chat_id, f"map_alias_edit:{lc}:{alias_code}")
     ui.edit(
         chat_id, message_id,
-        f"{_LINE_ICON[line]} <b>修改别名 · "
+        f"{_line_body_icon(line)} <b>修改别名 · "
         f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
         f"当前别名: <code>{ui.escape_html(alias)}</code> → "
         f"<code>{ui.escape_html(mp[alias])}</code>\n\n"
@@ -293,7 +304,7 @@ def _on_alias_edit(chat_id: int, action: str, text: str) -> None:
     ui.send_result(
         chat_id,
         f"✅ 已修改别名\n"
-        f"{_LINE_ICON[line]} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}\n"
+        f"{_line_body_label(line)}\n"
         f"<code>{ui.escape_html(old_alias)}</code> → "
         f"<code>{ui.escape_html(new_alias)}</code> (真实: <code>{ui.escape_html(real)}</code>)",
         back_label="◀ 返回该入口",
@@ -338,7 +349,7 @@ def _edit_edit_real_picker(
     total = len(models)
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     text = (
-        f"{_LINE_ICON[line]} <b>修改真实模型 · "
+        f"{_line_body_icon(line)} <b>修改真实模型 · "
         f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
         f"别名: <code>{ui.escape_html(alias)}</code>\n"
         f"当前真实: <code>{ui.escape_html(current)}</code>\n\n"
@@ -397,7 +408,7 @@ def _start_add(chat_id: int, message_id: int, cb_id: str, line: str) -> None:
     states.set_state(chat_id, f"map_alias_input:{lc}")
     ui.edit(
         chat_id, message_id,
-        f"{_LINE_ICON[line]} <b>新增映射 · "
+        f"{_line_body_icon(line)} <b>新增映射 · "
         f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
         "请输入<b>别名</b>(客户端请求时传递的模型名):\n"
         "例如: <code>gpt-5.5</code>、<code>my-fast-model</code>\n\n"
@@ -485,7 +496,7 @@ def _send_real_picker_for_add(
 def _picker_text_add(line: str, alias: str, page: int, total: int) -> str:
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     return (
-        f"{_LINE_ICON[line]} <b>新增映射 · "
+        f"{_line_body_icon(line)} <b>新增映射 · "
         f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
         f"别名 <code>{ui.escape_html(alias)}</code> → 请选择真实模型:\n\n"
         f"<i>第 {page + 1}/{total_pages} 页, 共 {total} 个可选模型。</i>"
@@ -534,7 +545,7 @@ def _picker_text_default(line: str, page: int, total: int) -> str:
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     current = model_mapping.get_default_model(line)
     return (
-        f"{_LINE_ICON[line]} <b>设置默认模型 · "
+        f"{_line_body_icon(line)} <b>设置默认模型 · "
         f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
         f"当前: <code>{ui.escape_html(current) if current else '(未设置)'}</code>\n\n"
         "请点击一个真实模型作为默认:\n"
@@ -614,7 +625,7 @@ def _on_pick_real(
     ui.send_result(
         chat_id,
         f"✅ 已新增映射\n"
-        f"{_LINE_ICON[line]} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}\n"
+        f"{_line_body_label(line)}\n"
         f"<code>{ui.escape_html(alias)}</code> → "
         f"<code>{ui.escape_html(real)}</code>",
         back_label="◀ 返回该入口",
