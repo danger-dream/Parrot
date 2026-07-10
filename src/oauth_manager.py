@@ -1211,15 +1211,6 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
                 "disabled_until": None}
     return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
 
-def _quota_disabled_until_still_future(acc: dict) -> bool:
-    dt = _parse_iso(acc.get("disabled_until"))
-    if dt is None:
-        return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt > datetime.now(timezone.utc)
-
-
 def _usage_has_any_quota_signal(usage: dict) -> bool:
     return any(u is not None for u in extract_utils_percent(usage))
 
@@ -1360,8 +1351,7 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
 
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
-                                 fresh: bool = True,
-                                 respect_disabled_until: bool = True) -> dict:
+                                 fresh: bool = True) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
 
     规则：
@@ -1372,13 +1362,11 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       • 所有窗口 util < threshold → 可用
           - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
-          - OpenAI 账号若仍处于 disabled_until 冷却期，或仍有未过期的 Codex
-            响应头超限快照，继续保持 quota 禁用，避免 WHAM/Codex 边界不同步
-            导致“假恢复”。
-          - OpenAI 账号只有在冷却期/响应头快照都过期，且本轮新鲜有效 usage
-            全部低于阈值时，才 set_enabled(True) 自动恢复。
-            respect_disabled_until=False 的官方 reset credit / 手动强刷新路径例外：
-            上游已确认消耗 reset 后，可用新鲜 usage 直接覆盖本地旧冷却时间。
+          - OpenAI 账号若仍有未过期的 Codex 响应头超限快照，继续保持 quota
+            禁用，避免 WHAM/Codex 边界不同步导致“假恢复”。
+          - 若 Codex 没有活动的超限快照，且本轮新鲜有效 usage 全部低于阈值，
+            说明上游窗口已经重置；直接恢复并清除旧 disabled_until。旧时间只是
+            上次超限时的预测，不能覆盖更新后的上游事实。
           - Grok 账号使用官方 billing 月度快照，fresh usage 低于阈值即可恢复。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
@@ -1447,11 +1435,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": "disabled", "utils": utils, "any_over": True,
                 "hit_windows": hit_windows, "disabled_until": latest_reset}
 
-    # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
-    # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
-    # 因 [None, None, None, None] 被误恢复。若 disabled_until 仍在未来，也不
-    # 提前恢复：OpenAI WHAM 与 Codex 响应头在边界附近会不同步，提前恢复会
-    # 造成“恢复通知 → 下一次请求马上响应头禁用”的假恢复。
+    # 全部窗口都可用。空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其
+    # quota 禁用账号不能因 [None, None, None, None] 被误恢复。OpenAI 若仍有
+    # 活动的 Codex 超限快照，前面的 any_over 分支已经保持禁用；否则新鲜
+    # WHAM 低用量应覆盖旧 disabled_until，因为后者只是上次超限时的预测。
     if reason == "quota":
         if provider in ("openai", "xai"):
             if not _usage_has_any_quota_signal(usage):
@@ -1460,13 +1447,6 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                         "disabled_until": acc.get("disabled_until")}
             if not fresh:
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
-                        "any_over": False, "hit_windows": [],
-                        "disabled_until": acc.get("disabled_until")}
-            # OpenAI/Codex 的 WHAM 与响应头窗口可能短暂不同步，需等本地
-            # disabled_until 过期；Grok 使用官方 billing 月度快照，fresh 数据
-            # 低于阈值即可恢复，避免充值/提额后被锁到月底。
-            if provider == "openai" and respect_disabled_until and _quota_disabled_until_still_future(acc):
-                return {"action": "quota_cooldown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
         try:
@@ -2116,9 +2096,7 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
         out["available_count"] = reset_credits.get("available_count")
 
-    eval_result = evaluate_and_toggle_by_usage(
-        canonical, usage, fresh=True, respect_disabled_until=False,
-    )
+    eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
     out["quota_action"] = eval_result
     if eval_result.get("action") in ("resumed", "kept_enabled") and not eval_result.get("any_over"):
         out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)

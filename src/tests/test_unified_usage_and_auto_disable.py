@@ -438,7 +438,7 @@ def test_openai_cached_thirty_day_over_threshold_sets_disabled_until(m):
     print("  [PASS] openai: cached 30d over threshold carries disabled_until")
 
 
-def test_openai_quota_disabled_waits_for_disabled_until_even_with_fresh_low_usage(m):
+def test_openai_quota_disabled_resumes_from_fresh_low_usage_before_disabled_until(m):
     _setup(m)
     _add_openai(m, "future@o.io")
     ak = "openai:future@o.io:acct-123"
@@ -455,10 +455,11 @@ def test_openai_quota_disabled_waits_for_disabled_until_even_with_fresh_low_usag
     }, fresh=True)
 
     acc_after = m["oauth_manager"].get_account(ak)
-    assert result["action"] == "quota_cooldown_keep_disabled", result
-    assert acc_after.get("disabled_reason") == "quota"
-    assert acc_after["enabled"] is False
-    print("  [PASS] openai: fresh low usage waits for disabled_until cooldown")
+    assert result["action"] == "resumed", result
+    assert acc_after.get("disabled_reason") is None
+    assert acc_after["enabled"] is True
+    assert acc_after.get("disabled_until") is None
+    print("  [PASS] openai: fresh low usage overrides obsolete disabled_until")
 
 
 def test_openai_quota_disabled_keeps_waiting_on_stale_low_usage(m):
@@ -684,7 +685,7 @@ def main():
         test_openai_user_disabled_not_touched,
         test_openai_quota_disabled_not_resumed_from_unknown_usage,
         test_openai_cached_thirty_day_over_threshold_sets_disabled_until,
-        test_openai_quota_disabled_waits_for_disabled_until_even_with_fresh_low_usage,
+        test_openai_quota_disabled_resumes_from_fresh_low_usage_before_disabled_until,
         test_openai_quota_disabled_keeps_waiting_on_stale_low_usage,
         test_openai_quota_disabled_resumes_after_reset_with_fresh_low_usage,
         test_openai_official_reset_credit_clears_local_quota_after_upstream_success,

@@ -495,8 +495,8 @@ def test_openai_quota_ignores_expired_codex_snapshot_missing_reset(m):
     print("  [PASS] OpenAI quota ignores stale Codex over-threshold snapshot without reset")
 
 
-def test_openai_quota_resume_waits_for_future_disabled_until(m):
-    """OpenAI quota-disabled accounts must not resume before disabled_until expires."""
+def test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until(m):
+    """Fresh low usage must override an obsolete predicted disabled_until."""
     _setup(m)
     email = "cooldown@openai.test"
     key = f"openai:{email}:acct-{email}"
@@ -515,11 +515,11 @@ def test_openai_quota_resume_waits_for_future_disabled_until(m):
         key, wham_below_threshold, threshold=95, fresh=True,
     )
     acc = m["oauth_manager"].get_account(key)
-    assert result["action"] == "quota_cooldown_keep_disabled", result
-    assert acc.get("disabled_reason") == "quota", acc
-    assert acc.get("enabled") is False, acc
-    assert acc.get("disabled_until") == "2099-01-01T00:00:00Z", acc
-    print("  [PASS] OpenAI quota resume waits for future disabled_until")
+    assert result["action"] == "resumed", result
+    assert acc.get("disabled_reason") is None, acc
+    assert acc.get("enabled") is True, acc
+    assert acc.get("disabled_until") is None, acc
+    print("  [PASS] OpenAI quota resume trusts fresh low usage over old disabled_until")
 
 
 def test_quota_monitor_notifies_when_openai_quota_really_resumes(m):
@@ -757,7 +757,7 @@ def main():
         test_oauth_menu_refresh_usage_openai_auto_disables_over_quota,
         test_openai_quota_resume_respects_active_codex_snapshot,
         test_openai_quota_ignores_expired_codex_snapshot_missing_reset,
-        test_openai_quota_resume_waits_for_future_disabled_until,
+        test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until,
         test_quota_monitor_notifies_when_openai_quota_really_resumes,
         test_openai_plan_workspace_label_disambiguates_same_email,
         test_oauth_menu_refresh_all_uses_wham_for_openai,
