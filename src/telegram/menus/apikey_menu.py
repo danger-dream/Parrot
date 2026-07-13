@@ -418,7 +418,10 @@ def _render_list(page: int = 1) -> tuple[str, dict]:
             prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
             stat = f"💎 本月: {s['total']:,} 次 · ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(s['output'])}"
             if (s.get("cache_read") or 0) > 0:
-                stat += f" · {ui.fmt_cache_phrase(s['cache_read'], prompt)}"
+                stat += (
+                    f" · {ui.fmt_cache_phrase(s['cache_read'], prompt)}"
+                    f" · 💵 {ui.fmt_cost(s)}"
+                )
             lines.append(stat)
             if s.get("avg_tps") is not None:
                 lines.append(
@@ -512,7 +515,10 @@ def _render_detail(name: str, page: int = 1) -> tuple[Optional[str], Optional[di
         prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
         token_line = f"↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(s['output'])}"
         if (s.get("cache_read") or 0) > 0:
-            token_line += f" · {ui.fmt_cache_phrase(s['cache_read'], prompt)}"
+            token_line += (
+                f" · {ui.fmt_cache_phrase(s['cache_read'], prompt)}"
+                f" · 💵 {ui.fmt_cost(s)}"
+            )
         lines.append(f"总体: {s['total']:,} 次 · ✅ {s['success_count']} · ❌ {s['error_count']}")
         lines.append(token_line)
         lines.append(
@@ -535,7 +541,10 @@ def _render_detail(name: str, page: int = 1) -> tuple[Optional[str], Optional[di
                     f" · ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(mrow['output'])}"
                 )
                 if (mrow.get("cache_read") or 0) > 0:
-                    model_line += f" · {ui.fmt_cache_phrase(mrow['cache_read'], m_prompt)}"
+                    model_line += (
+                        f" · {ui.fmt_cache_phrase(mrow['cache_read'], m_prompt)}"
+                        f" · 💵 {ui.fmt_cost(mrow)}"
+                    )
                 lines.append(f"  • <code>{model}</code>")
                 lines.append(model_line)
             if len(by_model) > 8:

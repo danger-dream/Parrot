@@ -206,6 +206,8 @@ def test_list_empty_and_populated(m):
     assert "user2@x.com" in last["text"]
     assert "用户禁用" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "≈" not in last["text"]
     assert "⏳ Token" not in last["text"]
     flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
     assert "oa:sort:1:all" not in flat
@@ -291,6 +293,8 @@ def test_view_detail_with_quota_cache(m):
     assert "5h: 已用 12%" in last["text"]
     assert "7d: 已用 45%" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "≈" not in last["text"]
     assert "↑ 160 · ↓ 20" in last["text"]
     # 详情按钮
     kb = last["reply_markup"]["inline_keyboard"]

@@ -700,17 +700,7 @@ def _quota_window_since_ts(reset_iso: str | None, window_seconds: int, *, now_ts
 
 
 def _fmt_usd(v: float | int | None) -> str:
-    try:
-        x = float(v or 0)
-    except (TypeError, ValueError):
-        x = 0.0
-    if x <= 0:
-        return "$0.00"
-    if x < 0.01:
-        return f"${x:.6f}"
-    if x < 1:
-        return f"${x:.4f}"
-    return f"${x:.2f}"
+    return ui.fmt_usd(v)
 
 
 def _fmt_credit_amount(v) -> str:
@@ -862,8 +852,8 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
 def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     """Grok/xAI OAuth 本地花费块。
 
-    只展示 Parrot 本地响应日志累计到的真实 cost/token，不做预算、进度条或
-    百分比，避免被误读为 xAI 官方额度/余额。
+    独立计费行只展示 Parrot 本地响应日志累计到的真实上游 cost/token，不做
+    预算、进度条或百分比；缓存行金额则复用全局“真实优先、估算兜底”口径。
     """
     ck = f"oauth:{account_key}"
     since_ts = _this_month_start_ts()
@@ -872,6 +862,11 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     except Exception as exc:
         print(f"[oauth_menu] xai month spend lookup failed for {account_key}: {exc}")
         month = {}
+    try:
+        priced_month = log_db.tokens_for_channel(ck, since_ts=since_ts)
+    except Exception as exc:
+        print(f"[oauth_menu] xai priced month lookup failed for {account_key}: {exc}")
+        priced_month = {}
 
     cost = float(month.get("cost_usd") or 0.0)
     bill_count = int(month.get("cost_rows") or 0)
@@ -885,7 +880,10 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
 
     usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
     if cache_read > 0:
-        usage_line += f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
+        usage_line += (
+            f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
+            f" · 💵 {ui.fmt_cost(priced_month)}"
+        )
 
     lines = ["<b>💵 Parrot 本地计费</b>"] if detail else []
     lines.extend([money_line, usage_line])
@@ -933,6 +931,7 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Opti
     parts = [f"↑{ui.fmt_tokens(prompt)} ↓{ui.fmt_tokens(s['output'])}"]
     if (s.get("cache_read") or 0) > 0:
         parts.append(ui.fmt_cache_phrase(s["cache_read"], prompt))
+        parts.append(f"💵 {ui.fmt_cost(s)}")
     if s.get("avg_tps") is not None:
         parts.append(f"均 {ui.fmt_tps(s.get('avg_tps'))}")
     return indent + " · ".join(parts)
@@ -1034,7 +1033,10 @@ def _format_account_block(acc: dict) -> str:
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
         stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
-            stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
+            stat_line += (
+                f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
+                f" · 💵 {ui.fmt_cost(ts)}"
+            )
         lines.append(stat_line)
         if ts.get("avg_tps") is not None:
             lines.append(
@@ -2005,7 +2007,10 @@ def _format_month_stats_block(account_key: str) -> str:
     out_tok = overall["output"]
     token_line = f"↑ {ui.fmt_tokens(inp_prompt)} · ↓ {ui.fmt_tokens(out_tok)}"
     if (overall.get("cache_read") or 0) > 0:
-        token_line += f" · {ui.fmt_cache_phrase(overall['cache_read'], inp_prompt)}"
+        token_line += (
+            f" · {ui.fmt_cache_phrase(overall['cache_read'], inp_prompt)}"
+            f" · 💵 {ui.fmt_cost(overall)}"
+        )
 
     lines = [
         "",
@@ -2027,7 +2032,10 @@ def _format_month_stats_block(account_key: str) -> str:
                 f" · ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(ms['output'])}"
             )
             if (ms.get("cache_read") or 0) > 0:
-                model_line += f" · {ui.fmt_cache_phrase(ms['cache_read'], m_prompt)}"
+                model_line += (
+                    f" · {ui.fmt_cache_phrase(ms['cache_read'], m_prompt)}"
+                    f" · 💵 {ui.fmt_cost(ms)}"
+                )
             lines.append(f"  • <code>{model}</code>")
             lines.append(model_line)
             if ms.get("avg_tps") is not None:

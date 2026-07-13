@@ -467,7 +467,7 @@ def test_xai_cost_aggregation_from_sse_usage(m):
             requested_model, final_model, status, http_status, is_stream,
             input_tokens, output_tokens, cache_read_tokens, total_time_ms)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (request_id, 1000.0, channel, "oauth", "grok-4.5", "grok-4.5",
+        (request_id, datetime.now(timezone.utc).timestamp(), channel, "oauth", "grok-4.5", "grok-4.5",
          "success", 200, 1, 98, 49, 128, 1573),
     )
     conn.execute(
@@ -483,6 +483,10 @@ def test_xai_cost_aggregation_from_sse_usage(m):
     assert s["cache_read"] == 128
     assert s["output"] == 49
     assert s["service_tier_counts"] == {"priority": 1}
+
+    text = m["oauth_menu"]._format_xai_spend_block("xai:cost-sub", detail=True)
+    assert "缓存 128 (56.6%) · 💵 $0.00" in text
+    assert "≈" not in text
 
 
 def asyncio_run(coro):

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional
 
 import httpx
@@ -504,6 +505,42 @@ def fmt_cache_phrase_from_row(row: dict, *, aggregate: bool = False) -> str:
     return cache_display.cache_read_phrase_from_row(row, aggregate=aggregate)
 
 
+def fmt_cost(metrics: dict | None) -> str:
+    """Format request cost in USD with a stable two-decimal UI contract."""
+    from .. import config
+
+    pricing_cfg = config.get().get("pricing", {})
+    if isinstance(pricing_cfg, dict) and not bool(pricing_cfg.get("enabled", True)):
+        return "已关闭"
+    data = metrics if isinstance(metrics, dict) else {}
+    ticks = max(0, int(data.get("cost_ticks") or 0))
+    costed = max(0, int(data.get("costed_success") or 0))
+    unpriced = max(0, int(data.get("unpriced_success") or 0))
+    if costed <= 0:
+        return f"未计价（{unpriced} 次）" if unpriced else "$0.00"
+    amount = fmt_usd(Decimal(ticks) / Decimal(10_000_000_000))
+    if unpriced:
+        amount += f" · {unpriced} 次未计价"
+    return amount
+
+
+def fmt_usd(value) -> str:
+    """Format a USD value to two decimals using decimal half-up rounding."""
+    try:
+        amount = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal(0)
+    amount = max(Decimal(0), amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return f"${amount:,.2f}"
+
+
+def fmt_cost_from_row(row: dict | None) -> str:
+    """Format one request row's actual/estimated cost."""
+    from .. import log_db
+
+    return fmt_cost(log_db.cost_for_log(row))
+
+
 def fmt_ms(ms) -> str:
     if ms is None:
         return "-"
@@ -835,7 +872,7 @@ def fmt_log_entry_body(r: dict) -> str:
         cr = r.get("cache_read_tokens") or 0
         tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
         if cr > 0:
-            tok += f" · {fmt_cache_phrase_from_row(r)}"
+            tok += f" · {fmt_cache_phrase_from_row(r)} · 💵 {fmt_cost_from_row(r)}"
         lines.append(f"  Token: {tok}")
 
     # 耗时

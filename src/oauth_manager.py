@@ -2729,6 +2729,7 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
     # 月度统计
     try:
         from . import log_db
+        from .telegram import ui as telegram_ui
         month_start = (
             datetime.now(_BJT_TZ)
             .replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -2739,7 +2740,10 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
             prompt = cache_display.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
             line = f"💎 月度统计: ↑ {cache_display.fmt_tokens(prompt)} · ↓ {cache_display.fmt_tokens(ts['output'])}"
             if (ts.get("cache_read") or 0) > 0:
-                line += f" · {cache_display.cache_read_phrase(ts['cache_read'], prompt)}"
+                line += (
+                    f" · {cache_display.cache_read_phrase(ts['cache_read'], prompt)}"
+                    f" · 💵 {telegram_ui.fmt_cost(ts)}"
+                )
             parts.append(line)
     except Exception as exc:
         print(f"[oauth] monthly stats lookup failed: {exc}")

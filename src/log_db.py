@@ -1773,6 +1773,192 @@ def finish_error(
             _request_handles.pop(handle.request_id, None)
 
 
+def _estimate_cost_into(bucket: dict, row, *, row_count: int, pricing_settings) -> None:
+    estimate = model_pricing.estimate_cost(
+        row["pricing_model"],
+        input_tokens=row["input_tokens"] or 0,
+        output_tokens=row["output_tokens"] or 0,
+        cache_creation_tokens=row["cache_creation_tokens"] or 0,
+        cache_read_tokens=row["cache_read_tokens"] or 0,
+        priority=bool(row["fast_mode"]),
+        pricing_settings=pricing_settings,
+    )
+    if estimate is None:
+        _add_unpriced(bucket, row_count)
+        return
+    _add_cost(bucket, estimate.total_ticks, row_count, actual=False)
+
+
+def _accumulate_filtered_costs(
+    conn,
+    since_ts: float,
+    where: str,
+    where_args: tuple,
+    bucket: dict,
+) -> None:
+    """Accumulate cost for one hard-coded request_log filter into bucket."""
+    pricing_settings = model_pricing.settings()
+    if not pricing_settings.enabled:
+        return
+
+    rows = conn.execute(
+        f"""SELECT
+               COALESCE(final_model, requested_model, '?') AS pricing_model,
+               COALESCE(fast_mode, 0) AS fast_mode,
+               COUNT(*) AS row_count,
+               SUM(input_tokens) AS input_tokens,
+               SUM(output_tokens) AS output_tokens,
+               SUM(cache_creation_tokens) AS cache_creation_tokens,
+               SUM(cache_read_tokens) AS cache_read_tokens
+             FROM request_log
+             WHERE ({where}) AND created_at >= ?
+               AND status='success'
+               AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'
+             GROUP BY pricing_model, fast_mode""",
+        where_args + (since_ts,),
+    ).fetchall()
+    for row in rows:
+        _estimate_cost_into(
+            bucket,
+            row,
+            row_count=int(row["row_count"] or 0),
+            pricing_settings=pricing_settings,
+        )
+
+    rows = conn.execute(
+        f"""SELECT
+               COALESCE(request_log.final_model, request_log.requested_model, '?') AS pricing_model,
+               COALESCE(request_log.fast_mode, 0) AS fast_mode,
+               request_log.input_tokens AS input_tokens,
+               request_log.output_tokens AS output_tokens,
+               request_log.cache_creation_tokens AS cache_creation_tokens,
+               request_log.cache_read_tokens AS cache_read_tokens,
+               request_detail.response_body AS response_body
+             FROM request_log
+             LEFT JOIN request_detail USING (request_id)
+             WHERE ({where}) AND request_log.created_at >= ?
+               AND request_log.status='success'
+               AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
+        where_args + (since_ts,),
+    ).fetchall()
+    for row in rows:
+        actual_ticks = model_pricing.extract_actual_cost_ticks(row["response_body"])
+        if actual_ticks is not None:
+            _add_cost(bucket, actual_ticks, 1, actual=True)
+        else:
+            _estimate_cost_into(
+                bucket,
+                row,
+                row_count=1,
+                pricing_settings=pricing_settings,
+            )
+
+
+def _accumulate_grouped_costs(
+    conn,
+    since_ts: float,
+    where: str,
+    where_args: tuple,
+    group_expr: str,
+    buckets: dict[str, dict],
+) -> None:
+    """Accumulate costs by one trusted SQL grouping expression."""
+    pricing_settings = model_pricing.settings()
+    if not pricing_settings.enabled:
+        return
+
+    rows = conn.execute(
+        f"""SELECT
+               {group_expr} AS grp_key,
+               COALESCE(final_model, requested_model, '?') AS pricing_model,
+               COALESCE(fast_mode, 0) AS fast_mode,
+               COUNT(*) AS row_count,
+               SUM(input_tokens) AS input_tokens,
+               SUM(output_tokens) AS output_tokens,
+               SUM(cache_creation_tokens) AS cache_creation_tokens,
+               SUM(cache_read_tokens) AS cache_read_tokens
+             FROM request_log
+             WHERE ({where}) AND created_at >= ?
+               AND status='success'
+               AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'
+             GROUP BY grp_key, pricing_model, fast_mode""",
+        where_args + (since_ts,),
+    ).fetchall()
+    for row in rows:
+        key = row["grp_key"] or "?"
+        bucket = buckets.setdefault(key, _new_token_stats_agg())
+        _estimate_cost_into(
+            bucket,
+            row,
+            row_count=int(row["row_count"] or 0),
+            pricing_settings=pricing_settings,
+        )
+
+    rows = conn.execute(
+        f"""SELECT
+               {group_expr} AS grp_key,
+               COALESCE(request_log.final_model, request_log.requested_model, '?') AS pricing_model,
+               COALESCE(request_log.fast_mode, 0) AS fast_mode,
+               request_log.input_tokens AS input_tokens,
+               request_log.output_tokens AS output_tokens,
+               request_log.cache_creation_tokens AS cache_creation_tokens,
+               request_log.cache_read_tokens AS cache_read_tokens,
+               request_detail.response_body AS response_body
+             FROM request_log
+             LEFT JOIN request_detail USING (request_id)
+             WHERE ({where}) AND request_log.created_at >= ?
+               AND request_log.status='success'
+               AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
+        where_args + (since_ts,),
+    ).fetchall()
+    for row in rows:
+        key = row["grp_key"] or "?"
+        bucket = buckets.setdefault(key, _new_token_stats_agg())
+        actual_ticks = model_pricing.extract_actual_cost_ticks(row["response_body"])
+        if actual_ticks is not None:
+            _add_cost(bucket, actual_ticks, 1, actual=True)
+        else:
+            _estimate_cost_into(
+                bucket,
+                row,
+                row_count=1,
+                pricing_settings=pricing_settings,
+            )
+
+
+def cost_for_log(row: dict | None) -> dict:
+    """Return actual/estimated cost metrics for one successful request row."""
+    out = _new_cost_agg()
+    if not isinstance(row, dict) or row.get("status") != "success":
+        return out
+    pricing_settings = model_pricing.settings()
+    if not pricing_settings.enabled:
+        return out
+
+    channel_key = str(row.get("final_channel_key") or "")
+    if channel_key.startswith("oauth:xai:"):
+        actual_ticks = model_pricing.extract_actual_cost_ticks(row.get("response_body"))
+        if actual_ticks is not None:
+            _add_cost(out, actual_ticks, 1, actual=True)
+            return out
+
+    pricing_model = row.get("final_model") or row.get("requested_model") or "?"
+    estimate = model_pricing.estimate_cost(
+        str(pricing_model),
+        input_tokens=row.get("input_tokens") or 0,
+        output_tokens=row.get("output_tokens") or 0,
+        cache_creation_tokens=row.get("cache_creation_tokens") or 0,
+        cache_read_tokens=row.get("cache_read_tokens") or 0,
+        priority=bool(row.get("fast_mode")),
+        pricing_settings=pricing_settings,
+    )
+    if estimate is None:
+        _add_unpriced(out, 1)
+    else:
+        _add_cost(out, estimate.total_ticks, 1, actual=False)
+    return out
+
+
 def stats_lifetime() -> dict:
     """跨所有月份 db 的累计统计：总调用次数 + 各类 token。
 
@@ -1784,6 +1970,7 @@ def stats_lifetime() -> dict:
         "input_tokens": 0, "output_tokens": 0,
         "cache_creation": 0, "cache_read": 0,
     }
+    out.update(_new_cost_agg())
     if _log_dir is None:
         return out
     if not os.path.isdir(_log_dir):
@@ -1820,6 +2007,7 @@ def stats_lifetime() -> dict:
                 out["output_tokens"] += int(row["outp"] or 0)
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
+            _accumulate_filtered_costs(conn, 0, "1=1", (), out)
         except Exception as exc:
             raise HistoricalLogError(f"stats_lifetime failed for {name}: {exc}") from exc
         finally:
@@ -1996,12 +2184,7 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
 
 def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict:
     """按给定 WHERE 条件跨月聚合；where 不含 created_at 过滤。"""
-    out: dict[str, Any] = {
-        "total": 0, "success_count": 0, "error_count": 0,
-        "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
-        "tps_num_tokens": 0, "tps_denom_ms": 0,
-        "max_tps": None, "min_tps": None,
-    }
+    out: dict[str, Any] = _new_token_stats_agg()
     if _log_dir is None or not os.path.isdir(_log_dir):
         return _pack_stats(out)
 
@@ -2030,6 +2213,7 @@ def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
                 _merge_tps(out, row)
+            _accumulate_filtered_costs(conn, since_ts, where, where_args, out)
         except Exception as exc:
             raise HistoricalLogError(f"aggregate query failed: {exc}") from exc
         finally:
@@ -2054,7 +2238,23 @@ def _pack_stats(raw: dict) -> dict:
         "avg_tps": tps["avg_tps"],
         "max_tps": tps["max_tps"],
         "min_tps": tps["min_tps"],
+        "cost_ticks": raw.get("cost_ticks", 0),
+        "actual_cost_ticks": raw.get("actual_cost_ticks", 0),
+        "estimated_cost_ticks": raw.get("estimated_cost_ticks", 0),
+        "costed_success": raw.get("costed_success", 0),
+        "unpriced_success": raw.get("unpriced_success", 0),
     }
+
+
+def _new_token_stats_agg() -> dict:
+    bucket = {
+        "total": 0, "success_count": 0, "error_count": 0,
+        "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
+        "tps_num_tokens": 0, "tps_denom_ms": 0,
+        "max_tps": None, "min_tps": None,
+    }
+    bucket.update(_new_cost_agg())
+    return bucket
 
 
 def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
@@ -2087,12 +2287,7 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
             ).fetchall()
             for r in rows:
                 key = r["model"] or "?"
-                bucket = by_model.setdefault(key, {
-                    "total": 0, "success_count": 0, "error_count": 0,
-                    "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
-                    "tps_num_tokens": 0, "tps_denom_ms": 0,
-                    "max_tps": None, "min_tps": None,
-                })
+                bucket = by_model.setdefault(key, _new_token_stats_agg())
                 bucket["total"] += int(r["total"] or 0)
                 bucket["success_count"] += int(r["success_count"] or 0)
                 bucket["error_count"] += int(r["error_count"] or 0)
@@ -2101,6 +2296,14 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
                 bucket["cache_creation"] += int(r["cc"] or 0)
                 bucket["cache_read"] += int(r["cr"] or 0)
                 _merge_tps(bucket, r)
+            _accumulate_grouped_costs(
+                conn,
+                since_ts,
+                "final_channel_key=?",
+                (channel_key,),
+                "COALESCE(final_model, '?')",
+                by_model,
+            )
         except Exception as exc:
             raise HistoricalLogError(f"channel_model_stats failed: {exc}") from exc
         finally:
@@ -2149,12 +2352,7 @@ def apikey_model_stats(api_key_name: str, since_ts: float) -> list[dict]:
             ).fetchall()
             for r in rows:
                 key = r["model"] or "?"
-                bucket = by_model.setdefault(key, {
-                    "total": 0, "success_count": 0, "error_count": 0,
-                    "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
-                    "tps_num_tokens": 0, "tps_denom_ms": 0,
-                    "max_tps": None, "min_tps": None,
-                })
+                bucket = by_model.setdefault(key, _new_token_stats_agg())
                 bucket["total"] += int(r["total"] or 0)
                 bucket["success_count"] += int(r["success_count"] or 0)
                 bucket["error_count"] += int(r["error_count"] or 0)
@@ -2163,6 +2361,14 @@ def apikey_model_stats(api_key_name: str, since_ts: float) -> list[dict]:
                 bucket["cache_creation"] += int(r["cc"] or 0)
                 bucket["cache_read"] += int(r["cr"] or 0)
                 _merge_tps(bucket, r)
+            _accumulate_grouped_costs(
+                conn,
+                since_ts,
+                "api_key_name=?",
+                (api_key_name,),
+                "COALESCE(final_model, '?')",
+                by_model,
+            )
         except Exception as exc:
             raise HistoricalLogError(f"apikey_model_stats failed: {exc}") from exc
         finally:
@@ -2385,6 +2591,7 @@ _RECENT_COLS = (
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
     "reasoning_effort, fast_mode, "
+    "(SELECT response_body FROM request_detail rd WHERE rd.request_id=request_log.request_id) AS response_body, "
     "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count"
 )
 
@@ -2764,7 +2971,12 @@ def recent_log_values(kind: str, limit: int = 120) -> list[str]:
 
 def log_detail(request_id: str) -> dict:
     log_row = _get_conn().execute(
-        "SELECT * FROM request_log WHERE request_id=?", (request_id,),
+        """SELECT request_log.*,
+                  request_detail.response_body AS response_body
+             FROM request_log
+             LEFT JOIN request_detail USING(request_id)
+            WHERE request_log.request_id=?""",
+        (request_id,),
     ).fetchone()
     detail_row = _get_conn().execute(
         "SELECT request_headers, request_body, response_body FROM request_detail WHERE request_id=?",
@@ -3058,14 +3270,19 @@ def stats_summary(
             # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0
             for r in conn.execute(
                 """SELECT request_id, created_at, api_key_name, requested_model,
-                          final_channel_key, is_stream, msg_count, tool_count,
+                          final_model, final_channel_key, is_stream, msg_count, tool_count,
                           input_tokens, output_tokens,
                           cache_creation_tokens, cache_read_tokens,
                           connect_time_ms, first_token_time_ms, total_time_ms,
-                          retry_count, affinity_hit
+                          retry_count, affinity_hit, fast_mode,
+                          'success' AS status,
+                          (SELECT response_body FROM request_detail rd
+                            WHERE rd.request_id=request_log.request_id) AS response_body
                    FROM request_log
                    WHERE created_at >= ?{_family_where_sql} AND status='success' AND cache_read_tokens=0
-                   ORDER BY created_at DESC LIMIT 3""".format(_family_where_sql=_family_where(family)),
+                   ORDER BY created_at DESC LIMIT 3""".format(
+                       _family_where_sql=_family_where(family),
+                   ),
                 (since_ts, *_family_params(family)),
             ).fetchall():
                 recent_cache_misses.append(dict(r))

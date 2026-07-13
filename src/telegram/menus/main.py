@@ -193,7 +193,10 @@ def _lifetime_stats_block() -> list[str]:
         f"(↑ {ui.fmt_tokens(total_in)} ↓ {ui.fmt_tokens(out_tok)})",
     ]
     if (s.get("cache_read") or 0) > 0:
-        lines.append(f"  {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}")
+        lines.append(
+            f"  {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}"
+            f" · 💵 {ui.fmt_cost(s)}"
+        )
     return lines
 
 

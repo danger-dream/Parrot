@@ -28,11 +28,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, log_db, state_db
+    from src import config, log_db, oauth_manager, state_db
     from src.telegram import bot, states, ui
     from src.telegram.menus import logs_menu, stats_menu, proxy_menu
     return {
-        "config": config, "log_db": log_db, "state_db": state_db,
+        "config": config, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
         "logs_menu": logs_menu, "stats_menu": stats_menu, "proxy_menu": proxy_menu,
     }
@@ -135,6 +135,22 @@ def test_fmt_helpers(m):
     assert ui.prompt_total(100, 10, 50) == 160
     assert ui.fmt_cache_phrase(50, 160) == "缓存 50 (31.2%)"
     assert ui.fmt_cache_phrase(51_700, 85_000) == "缓存 51.7K (60.8%)"
+    assert ui.fmt_usd(0.005) == "$0.01"
+    assert ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "costed_success": 1,
+        "unpriced_success": 0,
+    }) == "$12.35"
+    assert ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "costed_success": 1,
+        "unpriced_success": 2,
+    }) == "$12.35 · 2 次未计价"
+    assert "≈" not in ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "estimated_cost_ticks": 123_450_000_000,
+        "costed_success": 1,
+    })
 
     assert ui.fmt_ms(250) == "250ms"
     assert ui.fmt_ms(1500) == "1.5s"
@@ -176,6 +192,8 @@ def test_stats_overall(m):
     # 亲和命中率（2/5 = 40%），缓存 token 率（1400/3250 = 43.1%）
     assert "40.0%" in text
     assert "缓存 1.4K (43.1%)" in text
+    assert " · 💵 " in text
+    assert "≈" not in text
     assert "cache" not in text
     print("  [PASS] stats overall with counts + flags")
 
@@ -216,8 +234,8 @@ def test_stats_cost_estimate_and_unknown_coverage(m):
     rec = _install_recorder(m)
     m["stats_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
-    assert "<b>金额:</b>" in text
-    assert "≈ $41.7500 · 1 次未计价" in text
+    assert "💵 $41.75 · 1 次未计价" in text
+    assert "≈" not in text
 
 
 def test_stats_prefers_xai_actual_cost_ticks(m):
@@ -233,7 +251,7 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
         input_tok=999,
         output_tok=111,
         cc=0,
-        cr=0,
+        cr=100,
         response_body=json.dumps({"usage": {"cost_in_usd_ticks": actual_ticks}}),
         ingress_protocol="responses",
         upstream_protocol="openai-responses",
@@ -246,12 +264,14 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
     assert overall["estimated_cost_ticks"] == 0
     assert overall["costed_success"] == 1
     assert overall["unpriced_success"] == 0
+    row = m["log_db"].recent_logs(limit=1)[0]
+    assert m["ui"].fmt_cost_from_row(row) == "$0.01"
 
     rec = _install_recorder(m)
     m["stats_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
-    assert "$0.0123" in text
-    assert "≈ $0.0123" not in text
+    assert "$0.01" in text
+    assert "≈" not in text
 
 
 def test_stats_fast_mode_uses_priority_pricing(m):
@@ -272,6 +292,77 @@ def test_stats_fast_mode_uses_priority_pricing(m):
     assert result["overall"]["cost_ticks"] == 14 * 10_000_000_000
 
 
+def test_cost_available_to_all_request_and_window_cache_surfaces(m):
+    _setup(m)
+    expected = int(41.75 * 10_000_000_000)
+    _insert_success(
+        m,
+        "cost-everywhere",
+        "priced-key",
+        "gpt-5.6-sol",
+        "api:Priced",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=1_000_000,
+    )
+
+    lifetime = m["log_db"].stats_lifetime()
+    channel = m["log_db"].tokens_for_channel("api:Priced", 0)
+    apikey = m["log_db"].tokens_for_apikey("priced-key", 0)
+    channel_model = m["log_db"].channel_model_stats("api:Priced", 0)[0]
+    apikey_model = m["log_db"].apikey_model_stats("priced-key", 0)[0]
+    for metrics in (lifetime, channel, apikey, channel_model, apikey_model):
+        assert metrics["cost_ticks"] == expected
+        assert metrics["costed_success"] == 1
+        assert metrics["unpriced_success"] == 0
+
+    row = m["log_db"].recent_logs(limit=1)[0]
+    assert row["request_id"] == "cost-everywhere"
+    assert m["log_db"].cost_for_log(row)["cost_ticks"] == expected
+    detail = m["log_db"].log_detail("cost-everywhere")
+    assert m["log_db"].cost_for_log(detail["log"])["cost_ticks"] == expected
+    assert m["ui"].fmt_cost_from_row(row) == "$41.75"
+
+    # OAuth token 刷新通知也是 Telegram 展示面，月度缓存旁必须有金额。
+    _insert_success(
+        m,
+        "cost-refresh-notice",
+        "priced-key",
+        "gpt-5.6-sol",
+        "oauth:openai:notice@example.test:acct",
+        channel_type="oauth",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=1_000_000,
+    )
+    notice = m["oauth_manager"]._build_refresh_notice(
+        "openai:notice@example.test:acct", usage_flat=None,
+    )
+    assert "缓存 1.0M (33.3%) · 💵 $41.75" in notice
+    assert "≈" not in notice
+
+
+def test_cache_miss_write_sample_includes_request_cost(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-cache-write",
+        "priced-key",
+        "gpt-5.6-sol",
+        "api:Priced",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=0,
+    )
+    summary = m["log_db"].stats_summary(0)
+    text = m["stats_menu"]._section_cache_misses(summary["recent_cache_misses"])
+    assert "写 1.0M · 💵 $41.25" in text
+    assert "≈" not in text
+
+
 def test_stats_group_by_channel(m):
     _setup(m)
     _insert_success(m, "c1", "k1", "m1", "api:A")
@@ -289,6 +380,7 @@ def test_stats_group_by_channel(m):
     assert ">A<" in text and ">B<" in text   # <code>A</code> / <code>B</code>
     assert "命中请求" in text
     assert "缓存 100 (31.2%)" in text
+    assert " · 💵 " in text
     # 当前选中维度按钮应有 ✓ 标记
     btns_labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
     assert any("渠道 ✓" in l for l in btns_labels)
@@ -360,7 +452,7 @@ def test_logs_list(m):
     assert "down" in text
 
     assert "最近日志 · 请求日志 · 第 1/1 页 · 共 3 条" in text
-    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%)" in text
+    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%) · 💵 " in text
     assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
 
     # 顶部可切换请求/多媒体日志；详情按钮仍单行 3 列紧凑排列。
