@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from . import config
+from . import config, model_pricing
 
 _BJT = timezone(timedelta(hours=8))
 _local = threading.local()
@@ -1976,16 +1976,10 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                     if tier:
                         counts = out.setdefault("service_tier_counts", {})
                         counts[tier] = int(counts.get(tier) or 0) + 1
-                usage = resp.get("usage") if isinstance(resp, dict) else None
-                if not isinstance(usage, dict):
-                    continue
-                ticks = usage.get("cost_in_usd_ticks")
-                try:
-                    if ticks is not None:
-                        out["cost_ticks"] += int(ticks)
-                        out["cost_rows"] += 1
-                except (TypeError, ValueError):
-                    pass
+                ticks = model_pricing.extract_actual_cost_ticks(r["response_body"])
+                if ticks is not None:
+                    out["cost_ticks"] += ticks
+                    out["cost_rows"] += 1
         except Exception as exc:
             raise HistoricalLogError(f"xai_cost_for_channel failed: {exc}") from exc
         finally:
@@ -2838,6 +2832,106 @@ _GROUP_BY_COLS = {
 }
 
 
+def _accumulate_usage_costs(
+    conn,
+    since_ts: float,
+    family: str | None,
+    overall: dict,
+    by_channel: dict[str, dict],
+    by_model: dict[str, dict],
+    by_apikey: dict[str, dict],
+) -> None:
+    """把成功请求的 USD 金额合并进统计桶。
+
+    普通渠道按模型价格表分组估算；xAI OAuth 若响应携带官方
+    ``cost_in_usd_ticks`` 则优先采用真实金额，缺失时再回退估算。
+    """
+
+    pricing_settings = model_pricing.settings()
+    if not pricing_settings.enabled:
+        return
+
+    def buckets(channel_key: str, model_key: str, apikey_key: str) -> tuple[dict, ...]:
+        return (
+            overall,
+            by_channel.setdefault(channel_key or "?", _new_group_agg()),
+            by_model.setdefault(model_key or "?", _new_group_agg()),
+            by_apikey.setdefault(apikey_key or "?", _new_group_agg()),
+        )
+
+    def apply_estimate(row, *, row_count: int) -> None:
+        targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
+        estimate = model_pricing.estimate_cost(
+            row["pricing_model"] or row["model_key"],
+            input_tokens=row["input_tokens"] or 0,
+            output_tokens=row["output_tokens"] or 0,
+            cache_creation_tokens=row["cache_creation_tokens"] or 0,
+            cache_read_tokens=row["cache_read_tokens"] or 0,
+            priority=bool(row["fast_mode"]),
+            pricing_settings=pricing_settings,
+        )
+        if estimate is None:
+            for target in targets:
+                _add_unpriced(target, row_count)
+            return
+        for target in targets:
+            _add_cost(target, estimate.total_ticks, row_count, actual=False)
+
+    # 非 xAI 请求可以先按四个展示维度 + 实际计价模型 + fast/priority 聚合，
+    # 避免把整段历史逐行搬进 Python。
+    estimated_rows = conn.execute(
+        f"""SELECT
+               COALESCE(final_model, requested_model, '?') AS pricing_model,
+               COALESCE(final_channel_key, '?') AS channel_key,
+               COALESCE(requested_model, '?') AS model_key,
+               COALESCE(api_key_name, '?') AS apikey_key,
+               COALESCE(fast_mode, 0) AS fast_mode,
+               COUNT(*) AS row_count,
+               SUM(input_tokens) AS input_tokens,
+               SUM(output_tokens) AS output_tokens,
+               SUM(cache_creation_tokens) AS cache_creation_tokens,
+               SUM(cache_read_tokens) AS cache_read_tokens
+             FROM request_log
+             WHERE created_at >= ?{_family_where(family)}
+               AND status='success'
+               AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'
+             GROUP BY pricing_model, channel_key, model_key, apikey_key, fast_mode""",
+        (since_ts, *_family_params(family)),
+    ).fetchall()
+    for row in estimated_rows:
+        apply_estimate(row, row_count=int(row["row_count"] or 0))
+
+    # xAI 的真实费用位于响应 usage 中，只能按请求读取 detail；正常统计页不会
+    # 扫描其它渠道的大响应正文。
+    xai_rows = conn.execute(
+        f"""SELECT
+               COALESCE(request_log.final_model, request_log.requested_model, '?') AS pricing_model,
+               COALESCE(request_log.final_channel_key, '?') AS channel_key,
+               COALESCE(request_log.requested_model, '?') AS model_key,
+               COALESCE(request_log.api_key_name, '?') AS apikey_key,
+               COALESCE(request_log.fast_mode, 0) AS fast_mode,
+               request_log.input_tokens AS input_tokens,
+               request_log.output_tokens AS output_tokens,
+               request_log.cache_creation_tokens AS cache_creation_tokens,
+               request_log.cache_read_tokens AS cache_read_tokens,
+               request_detail.response_body AS response_body
+             FROM request_log
+             LEFT JOIN request_detail USING (request_id)
+             WHERE request_log.created_at >= ?{_family_where(family)}
+               AND request_log.status='success'
+               AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
+        (since_ts, *_family_params(family)),
+    ).fetchall()
+    for row in xai_rows:
+        targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
+        actual_ticks = model_pricing.extract_actual_cost_ticks(row["response_body"])
+        if actual_ticks is not None:
+            for target in targets:
+                _add_cost(target, actual_ticks, 1, actual=True)
+            continue
+        apply_estimate(row, row_count=1)
+
+
 def stats_summary(
     since_ts: float,
     group_by: str | None = None,
@@ -2933,6 +3027,15 @@ def stats_summary(
             _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
             _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
             _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
+            _accumulate_usage_costs(
+                conn,
+                since_ts,
+                family,
+                overall_agg,
+                by_channel,
+                by_model,
+                by_apikey,
+            )
 
             for r in conn.execute(
                 """SELECT created_at, api_key_name, requested_model,
@@ -3016,7 +3119,9 @@ _OVERALL_FIELDS = [
 
 
 def _new_overall_agg() -> dict:
-    return {k: 0 for k in _OVERALL_FIELDS}
+    bucket = {k: 0 for k in _OVERALL_FIELDS}
+    bucket.update(_new_cost_agg())
+    return bucket
 
 
 def _accumulate(agg: dict, row) -> None:
@@ -3044,6 +3149,11 @@ def _finalize_overall(agg: dict) -> dict:
         "avg_connect_ms": _avg(agg["sum_connect_ms"], agg["cnt_connect"]),
         "avg_first_token_ms": _avg(agg["sum_first_token_ms"], agg["cnt_first_token"]),
         "avg_total_ms": _avg(agg["sum_total_ms"], agg["cnt_total"]),
+        "cost_ticks": agg["cost_ticks"],
+        "actual_cost_ticks": agg["actual_cost_ticks"],
+        "estimated_cost_ticks": agg["estimated_cost_ticks"],
+        "costed_success": agg["costed_success"],
+        "unpriced_success": agg["unpriced_success"],
     }
     out.update(_finalize_tps(agg))
     return out
@@ -3060,7 +3170,34 @@ _GROUP_FIELDS = [
 
 
 def _new_group_agg() -> dict:
-    return {k: 0 for k in _GROUP_FIELDS}
+    bucket = {k: 0 for k in _GROUP_FIELDS}
+    bucket.update(_new_cost_agg())
+    return bucket
+
+
+def _new_cost_agg() -> dict:
+    return {
+        "cost_ticks": 0,
+        "actual_cost_ticks": 0,
+        "estimated_cost_ticks": 0,
+        "costed_success": 0,
+        "unpriced_success": 0,
+    }
+
+
+def _add_cost(bucket: dict, ticks: int, rows: int, *, actual: bool) -> None:
+    value = max(0, int(ticks or 0))
+    count = max(0, int(rows or 0))
+    bucket["cost_ticks"] = int(bucket.get("cost_ticks") or 0) + value
+    source_key = "actual_cost_ticks" if actual else "estimated_cost_ticks"
+    bucket[source_key] = int(bucket.get(source_key) or 0) + value
+    bucket["costed_success"] = int(bucket.get("costed_success") or 0) + count
+
+
+def _add_unpriced(bucket: dict, rows: int) -> None:
+    bucket["unpriced_success"] = int(bucket.get("unpriced_success") or 0) + max(
+        0, int(rows or 0)
+    )
 
 
 def _accumulate_group(agg: dict, row) -> None:

@@ -308,6 +308,14 @@
     "mode": "forever",
     "days": null
   },
+  "pricing": {
+    "enabled": true,
+    "autoUpdate": true,
+    "sourceUrl": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    "refreshHours": 24,
+    "aliases": {},
+    "overrides": {}
+  },
   "stateDbPath": "state.db",
   "openaiOAuth": {
     "forceCodexCLI": true,

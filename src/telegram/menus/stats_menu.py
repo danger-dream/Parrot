@@ -56,6 +56,34 @@ def _ch_short_name(key: str) -> str:
     return ui.channel_display_name(key, with_family=True)
 
 
+def _fmt_cost(metrics: dict) -> str:
+    """格式化 USD 金额；含估算项时加 ≈，未知价格绝不静默按 $0 处理。"""
+
+    pricing_cfg = config.get().get("pricing", {})
+    if isinstance(pricing_cfg, dict) and not bool(pricing_cfg.get("enabled", True)):
+        return "已关闭"
+    ticks = max(0, int(metrics.get("cost_ticks") or 0))
+    estimated_ticks = max(0, int(metrics.get("estimated_cost_ticks") or 0))
+    costed = max(0, int(metrics.get("costed_success") or 0))
+    unpriced = max(0, int(metrics.get("unpriced_success") or 0))
+    if costed <= 0:
+        return f"未计价（{unpriced} 次）" if unpriced else "$0.000000"
+    usd = ticks / 10_000_000_000
+    if usd >= 1000:
+        amount = f"${usd:,.2f}"
+    elif usd >= 0.01:
+        amount = f"${usd:,.4f}"
+    elif usd >= 0.0001:
+        amount = f"${usd:,.6f}"
+    else:
+        amount = f"${usd:,.8f}"
+    if estimated_ticks > 0:
+        amount = "≈ " + amount
+    if unpriced:
+        amount += f" · {unpriced} 次未计价"
+    return amount
+
+
 def _section_overall(overall: dict) -> str:
     """cc-proxy 同款 6 段总览：Tokens / 请求 / 缓存 / 耗时 / 重试 / 亲和。"""
     total = int(overall.get("total") or 0)
@@ -88,6 +116,9 @@ def _section_overall(overall: dict) -> str:
     lines = [
         "<b>Tokens:</b>",
         token_line,
+        "",
+        "<b>金额:</b>",
+        _fmt_cost(overall),
         "",
         "<b>请求:</b>",
         f"共 {total} 次 | ✅ {succ} | ❌ {err} | ⏳ {pend}",
@@ -219,6 +250,7 @@ def _summary_dim_block(title: str, groups: list[dict], render_key,
         )
         if cr > 0:
             line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
+        line += f" · {_fmt_cost(m)}"
         out.append(line)
         if extra_line is not None:
             extra = extra_line(g["key"])
@@ -264,6 +296,7 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key,
         if cr > 0:
             token_line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
         out.append(token_line)
+        out.append(f"  💵 {_fmt_cost(m)}")
         out.append(f"  命中请求 {hit}/{succ} ({ui.fmt_rate(hit, succ)})")
         if avg_conn is not None or avg_first is not None:
             out.append(f"  连接 {ui.fmt_ms(avg_conn)} | 首字 {ui.fmt_ms(avg_first)}")
@@ -359,6 +392,7 @@ def _section_overall_compact(overall: dict) -> str:
         f"↑ {ui.fmt_tokens(total_inp)} · ↓ {ui.fmt_tokens(raw_out)}"
         + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr else "")
     )
+    lines.append(f"💵 {_fmt_cost(overall)}")
     # 耗时 / 速度
     timing_bits = []
     if avg_first is not None:

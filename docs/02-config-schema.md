@@ -253,6 +253,16 @@
     }
   },
 
+  // ─── Token 金额统计 ───
+  "pricing": {
+    "enabled": true,
+    "autoUpdate": true,
+    "sourceUrl": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    "refreshHours": 24,
+    "aliases": {},
+    "overrides": {}
+  },
+
   // ─── 路径 / 请求日志留存 ───
   "logDir": "logs",
   "logRetention": {
@@ -334,6 +344,35 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 运行时：
 - 客户端请求 `model=glm-5` → 匹配 `alias` → 向上游发 `model=GLM-5`（真实名）
 - 客户端请求 `model=GLM-5`（真实名）→ 若 `alias` 列表中无此值，视为不支持（**除非 real==alias 同值**）
+
+### Token 金额统计 `pricing`
+
+- `enabled`：是否在 Telegram 统计页计算金额；关闭后不读取响应正文做费用聚合。
+- `autoUpdate`：是否后台刷新 LiteLLM 价格目录。启动时先读取 `$ANTHROPIC_PROXY_DATA_DIR/model_pricing.json`（Docker 默认 `/app/data/model_pricing.json`）缓存，缓存不存在或损坏时使用仓库内置快照；远端失败不会影响代理请求。
+- `sourceUrl`：价格目录地址，只接受 `https://`。
+- `refreshHours`：远端刷新间隔，最小 1 小时。
+- `aliases`：自定义模型名映射，例如 `{"my-sol": "gpt-5.6-sol"}`。
+- `overrides`：自定义价格，单位均为 USD / 1M Token。至少填写 `inputPerMillion` 和 `outputPerMillion`；可选 `cacheWritePerMillion`、`cacheReadPerMillion` 及四个 `priority*PerMillion` 字段。
+
+```json
+{
+  "pricing": {
+    "aliases": {"my-sol": "gpt-5.6-sol"},
+    "overrides": {
+      "private-model": {
+        "inputPerMillion": 2.5,
+        "outputPerMillion": 15,
+        "cacheWritePerMillion": 2.5,
+        "cacheReadPerMillion": 0.25,
+        "priorityInputPerMillion": 5,
+        "priorityOutputPerMillion": 30
+      }
+    }
+  }
+}
+```
+
+统计金额是按当前价格目录对历史 Token 的等价估算，因此用 `≈` 标识；价格目录更新后，历史估算也可能变化。xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该请求的真实上游金额。未知模型会计入“未计价”请求数，不会按 `$0` 混入总金额。
 
 ### 超时语义（关键）
 

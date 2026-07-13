@@ -131,6 +131,13 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             account = cfg["oauthAccounts"][0]
             assert account == old_cfg["oauthAccounts"][0]
 
+            assert cfg["pricing"]["enabled"] is True
+            assert cfg["pricing"]["autoUpdate"] is True
+            assert cfg["pricing"]["refreshHours"] == 24
+            assert cfg["pricing"]["sourceUrl"].startswith("https://")
+            assert cfg["pricing"]["aliases"] == {}
+            assert cfg["pricing"]["overrides"] == {}
+
         # 旧路径保留，不删除用户原配置，方便兼容和人工核对。
         assert saved["oauth"]["providers"]["openai"]["defaultModels"] == ["legacy-model"]
     finally:

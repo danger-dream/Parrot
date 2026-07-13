@@ -475,6 +475,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "forever",
         "days": None,
     },
+    # Token 金额统计：以 LiteLLM 模型价格表估算 USD；xAI OAuth 响应若返回
+    # cost_in_usd_ticks，则统计页优先使用上游真实金额。
+    "pricing": {
+        "enabled": True,
+        "autoUpdate": True,
+        "sourceUrl": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+        "refreshHours": 24,
+        # 自定义模型名 → 价格表模型名。
+        "aliases": {},
+        # 单位均为 USD / 1M Token；至少填写 inputPerMillion/outputPerMillion。
+        "overrides": {},
+    },
     "stateDbPath": "state.db",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {

@@ -86,18 +86,19 @@ def _insert_success(
     input_tok=100, output_tok=20, cc=10, cr=50, retry_count=0, affinity_hit=0,
     connect_ms=150, first_token_ms=600, total_ms=3000, is_stream=True,
     ingress_protocol="anthropic", upstream_protocol=None, upstream_transport=None, http_status=200,
+    response_body='{"id":"x"}', fast_mode=None,
 ):
     ld = m["log_db"]
     ld.insert_pending(request_id, "1.1.1.1", api_key, model, is_stream,
                      msg_count=3, tool_count=0, request_headers={}, request_body={},
-                     ingress_protocol=ingress_protocol)
+                     ingress_protocol=ingress_protocol, fast_mode=fast_mode)
     ld.finish_success(
         request_id, channel_key, channel_type, model,
         input_tokens=input_tok, output_tokens=output_tok,
         cache_creation_tokens=cc, cache_read_tokens=cr,
         connect_ms=connect_ms, first_token_ms=first_token_ms, total_ms=total_ms,
         retry_count=retry_count, affinity_hit=affinity_hit,
-        response_body='{"id":"x"}', http_status=http_status,
+        response_body=response_body, http_status=http_status,
         upstream_protocol=upstream_protocol, upstream_transport=upstream_transport,
     )
 
@@ -177,6 +178,98 @@ def test_stats_overall(m):
     assert "缓存 1.4K (43.1%)" in text
     assert "cache" not in text
     print("  [PASS] stats overall with counts + flags")
+
+
+def test_stats_cost_estimate_and_unknown_coverage(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-priced",
+        "k1",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=1_000_000,
+        cr=1_000_000,
+    )
+    _insert_success(
+        m,
+        "cost-unknown",
+        "k2",
+        "private-unknown-model",
+        "api:Private",
+        input_tok=500,
+        output_tok=100,
+        cc=0,
+        cr=0,
+    )
+
+    result = m["log_db"].stats_summary(0)
+    overall = result["overall"]
+    assert overall["cost_ticks"] == int(41.75 * 10_000_000_000)
+    assert overall["estimated_cost_ticks"] == overall["cost_ticks"]
+    assert overall["actual_cost_ticks"] == 0
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 1
+
+    rec = _install_recorder(m)
+    m["stats_menu"].show(42, 100, "cb")
+    text = rec.last("editMessageText")["text"]
+    assert "<b>金额:</b>" in text
+    assert "≈ $41.7500 · 1 次未计价" in text
+
+
+def test_stats_prefers_xai_actual_cost_ticks(m):
+    _setup(m)
+    actual_ticks = 123_456_789
+    _insert_success(
+        m,
+        "cost-xai",
+        "k-xai",
+        "grok-private-model",
+        "oauth:xai:account",
+        channel_type="oauth",
+        input_tok=999,
+        output_tok=111,
+        cc=0,
+        cr=0,
+        response_body=json.dumps({"usage": {"cost_in_usd_ticks": actual_ticks}}),
+        ingress_protocol="responses",
+        upstream_protocol="openai-responses",
+    )
+
+    result = m["log_db"].stats_summary(0)
+    overall = result["overall"]
+    assert overall["cost_ticks"] == actual_ticks
+    assert overall["actual_cost_ticks"] == actual_ticks
+    assert overall["estimated_cost_ticks"] == 0
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 0
+
+    rec = _install_recorder(m)
+    m["stats_menu"].show(42, 100, "cb")
+    text = rec.last("editMessageText")["text"]
+    assert "$0.0123" in text
+    assert "≈ $0.0123" not in text
+
+
+def test_stats_fast_mode_uses_priority_pricing(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-priority",
+        "k1",
+        "gpt-5.6-luna",
+        "api:OpenAI",
+        input_tok=1_000_000,
+        output_tok=1_000_000,
+        cc=0,
+        cr=0,
+        fast_mode=True,
+    )
+    result = m["log_db"].stats_summary(0)
+    assert result["overall"]["cost_ticks"] == 14 * 10_000_000_000
 
 
 def test_stats_group_by_channel(m):

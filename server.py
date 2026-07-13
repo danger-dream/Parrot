@@ -32,7 +32,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src import (
     __version__, drain,
     affinity, apikey_limiter, auth, compact_rescue, config, cooldown, errors, failover,
-    fingerprint, image_db, log_db, model_mapping, model_metadata, network,
+    fingerprint, image_db, log_db, model_mapping, model_metadata, model_pricing, network,
     network_monitor, notifier, oauth_manager, probe, public_ip, scheduler, scorer,
     state_db, status_monitor, token_counter, translation, update_checker, updater,
     upstream,
@@ -247,6 +247,11 @@ async def lifespan(app: FastAPI):
 
     # httpx 客户端
     upstream.create_client()
+    try:
+        model_pricing.initialize()
+    except Exception as exc:
+        # 金额统计是旁路能力，价格表异常不能阻断代理启动；后台刷新仍会继续尝试恢复。
+        print(f"[Pricing] local catalog load failed: {exc}")
 
     # 后台获取公网 IPv4（用于主菜单显示外网 BaseURL，失败则不显示）
     public_ip.fetch_async()
@@ -283,6 +288,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
+    _background_tasks.append(asyncio.create_task(model_pricing.refresh_loop()))
     # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
     try:
         updater.resume_after_restart()
