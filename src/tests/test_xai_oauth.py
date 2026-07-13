@@ -485,8 +485,62 @@ def test_xai_cost_aggregation_from_sse_usage(m):
     assert s["service_tier_counts"] == {"priority": 1}
 
     text = m["oauth_menu"]._format_xai_spend_block("xai:cost-sub", detail=True)
-    assert "缓存 128 (56.6%) · 💵 $0.00" in text
+    assert "缓存 128 (56.6%) · 💵 实际 $0.00" in text
     assert "≈" not in text
+
+
+def test_xai_cost_disabled_does_not_read_response_body(m):
+    _setup(m)
+    log_db = m["log_db"]
+    log_db.init()
+    channel = "oauth:xai:cost-disabled"
+    conn = log_db._get_conn()
+    conn.execute(
+        """INSERT INTO request_log
+           (request_id, created_at, final_channel_key, final_channel_type,
+            requested_model, final_model, status, input_tokens, output_tokens)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            "xai-cost-disabled",
+            datetime.now(timezone.utc).timestamp(),
+            channel,
+            "oauth",
+            "grok-4.5",
+            "grok-4.5",
+            "success",
+            10,
+            2,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO request_detail (request_id, response_body) VALUES (?,?)",
+        ("xai-cost-disabled", '{"usage":{"cost_in_usd_ticks":123}}'),
+    )
+    conn.commit()
+    original_enabled = bool(
+        (m["config"].get().get("pricing") or {}).get("enabled", True)
+    )
+    statements = []
+    try:
+        m["config"].update(
+            lambda c: c.setdefault("pricing", {}).__setitem__("enabled", False)
+        )
+        conn.set_trace_callback(statements.append)
+        stats = log_db.xai_cost_for_channel(channel, since_ts=0)
+        conn.set_trace_callback(None)
+        assert stats["cost_rows"] == 0
+        assert not any("request_detail" in sql.lower() for sql in statements)
+        text = m["oauth_menu"]._format_xai_spend_block(
+            "xai:cost-disabled", detail=True
+        )
+        assert "本地计费: 已关闭" in text
+    finally:
+        conn.set_trace_callback(None)
+        m["config"].update(
+            lambda c: c.setdefault("pricing", {}).__setitem__(
+                "enabled", original_enabled
+            )
+        )
 
 
 def asyncio_run(coro):

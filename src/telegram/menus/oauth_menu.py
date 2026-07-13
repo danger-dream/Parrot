@@ -857,6 +857,10 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     """
     ck = f"oauth:{account_key}"
     since_ts = _this_month_start_ts()
+    pricing_cfg = config.get().get("pricing", {})
+    pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
+        pricing_cfg.get("enabled", True)
+    )
     try:
         month = log_db.xai_cost_for_channel(ck, since_ts=since_ts)
     except Exception as exc:
@@ -874,8 +878,12 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     output = int(month.get("output") or 0)
     cache_read = int(month.get("cache_read") or 0)
 
-    money_line = f"💵 本地计费: {_fmt_usd(cost)}"
-    if bill_count > 0:
+    money_line = (
+        f"💵 本地计费: {_fmt_usd(cost)}"
+        if pricing_enabled
+        else "💵 本地计费: 已关闭"
+    )
+    if pricing_enabled and bill_count > 0:
         money_line += f" · {bill_count} 笔计费"
 
     usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"

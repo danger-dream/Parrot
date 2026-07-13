@@ -256,23 +256,24 @@ def test_apikey_cache_stats_include_cost(m):
         cache_creation_tokens=1_000_000, cache_read_tokens=1_000_000,
         connect_ms=10, first_token_ms=20, total_ms=1000,
         response_body='{"id":"test"}', http_status=200,
+        upstream_protocol="openai-responses",
     )
 
     rec = _install_recorder(m)
     m["apikey_menu"].show(100, 50)
     list_text = rec.last("editMessageText")["text"]
-    assert "缓存 1.0M (33.3%) · 💵 $41.75" in list_text
+    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in list_text
     assert "≈" not in list_text
 
     lifetime_text = "\n".join(m["main_menu"]._lifetime_stats_block())
-    assert "缓存 1.0M (33.3%) · 💵 $41.75" in lifetime_text
+    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in lifetime_text
     assert "≈" not in lifetime_text
 
     short = m["apikey_menu"]._short_of("priced")
     rec.clear()
     m["apikey_menu"].on_view(100, 50, "cb-view", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert detail_text.count("缓存 1.0M (33.3%) · 💵 $41.75") >= 2
+    assert detail_text.count("缓存 1.0M (33.3%) · 💵 估算 $68.50") >= 2
     assert "≈" not in detail_text
 
 

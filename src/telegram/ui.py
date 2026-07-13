@@ -506,7 +506,7 @@ def fmt_cache_phrase_from_row(row: dict, *, aggregate: bool = False) -> str:
 
 
 def fmt_cost(metrics: dict | None) -> str:
-    """Format request cost in USD with a stable two-decimal UI contract."""
+    """Format actual/estimated USD cost with a stable two-decimal contract."""
     from .. import config
 
     pricing_cfg = config.get().get("pricing", {})
@@ -514,11 +514,25 @@ def fmt_cost(metrics: dict | None) -> str:
         return "已关闭"
     data = metrics if isinstance(metrics, dict) else {}
     ticks = max(0, int(data.get("cost_ticks") or 0))
+    actual_ticks = max(0, int(data.get("actual_cost_ticks") or 0))
+    estimated_ticks = max(0, int(data.get("estimated_cost_ticks") or 0))
     costed = max(0, int(data.get("costed_success") or 0))
+    actual_count = max(0, int(data.get("actual_costed_success") or 0))
+    estimated_count = max(0, int(data.get("estimated_costed_success") or 0))
     unpriced = max(0, int(data.get("unpriced_success") or 0))
     if costed <= 0:
         return f"未计价（{unpriced} 次）" if unpriced else "$0.00"
     amount = fmt_usd(Decimal(ticks) / Decimal(10_000_000_000))
+    if actual_count > 0 and estimated_count > 0:
+        actual_amount = fmt_usd(Decimal(actual_ticks) / Decimal(10_000_000_000))
+        estimated_amount = fmt_usd(
+            Decimal(estimated_ticks) / Decimal(10_000_000_000)
+        )
+        amount = f"{amount}（实际 {actual_amount} + 估算 {estimated_amount}）"
+    elif actual_count > 0:
+        amount = f"实际 {amount}"
+    elif estimated_count > 0:
+        amount = f"估算 {amount}"
     if unpriced:
         amount += f" · {unpriced} 次未计价"
     return amount

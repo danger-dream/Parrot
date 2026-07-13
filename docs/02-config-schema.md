@@ -347,7 +347,7 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 
 ### Token 金额统计 `pricing`
 
-- `enabled`：是否在 Telegram 统计页计算金额；关闭后不读取响应正文做费用聚合。
+- `enabled`：是否在 Telegram 的统计、日志和账户等页面计算金额；关闭后不读取响应正文做费用聚合。
 - `autoUpdate`：是否后台刷新 LiteLLM 价格目录。启动时先读取 `$ANTHROPIC_PROXY_DATA_DIR/model_pricing.json`（Docker 默认 `/app/data/model_pricing.json`）缓存，缓存不存在或损坏时使用仓库内置快照；远端失败不会影响代理请求。
 - `sourceUrl`：价格目录地址，只接受 `https://`。
 - `refreshHours`：远端刷新间隔，最小 1 小时。
@@ -372,7 +372,9 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 }
 ```
 
-统计金额是按当前价格目录对历史 Token 的等价估算，价格目录更新后历史估算也可能变化；xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该请求的真实上游金额。Telegram 界面统一显示为两位小数且不加约等号，所有展示 Token 缓存的统计/日志位置都会同步显示金额。LiteLLM 价格目录与 xAI 实际费用均以 USD 计价，因此 Parrot 不做实时汇率换算。未知模型会计入“未计价”请求数，不会按 `$0` 混入总金额。
+统计金额是按当前价格目录对历史 Token 的等价估算，价格目录更新后历史估算也可能变化；xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该请求的真实上游金额。LiteLLM 的长上下文阶梯价按**单次请求**的 `input + cache creation + cache read` 判断：显式 `*_above_Nk_tokens` 单价优先，否则应用 `long_context_*_multiplier`；OpenAI Priority 与 Anthropic Fast 价格也会同步应用。数据库只保存缓存写入总 Token、没有保存每段缓存的 TTL；当目录同时提供不同的 5 分钟 / 1 小时缓存写入价时，该请求会标记为“未计价”，不会猜测 TTL 后套用某一档价格。
+
+Telegram 界面统一显示为两位小数且不加约等号，并区分“实际”“估算”和两者混合金额；所有展示 Token 缓存的统计/日志位置都会同步显示金额。LiteLLM 价格目录与 xAI 实际费用均以 USD 计价，因此 Parrot 不做实时汇率换算。未知模型会计入“未计价”请求数，不会按 `$0` 混入总金额。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若迁移后的历史行缺少上游协议、无法确认新旧口径，Parrot 会将该请求标记为“未计价”，避免重复收费。
 
 ### 超时语义（关键）
 

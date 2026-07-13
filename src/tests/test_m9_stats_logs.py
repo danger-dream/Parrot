@@ -89,6 +89,8 @@ def _insert_success(
     response_body='{"id":"x"}', fast_mode=None,
 ):
     ld = m["log_db"]
+    if upstream_protocol is None and str(model).startswith("gpt-5.6"):
+        upstream_protocol = "openai-responses"
     ld.insert_pending(request_id, "1.1.1.1", api_key, model, is_stream,
                      msg_count=3, tool_count=0, request_headers={}, request_body={},
                      ingress_protocol=ingress_protocol, fast_mode=fast_mode)
@@ -146,6 +148,20 @@ def test_fmt_helpers(m):
         "costed_success": 1,
         "unpriced_success": 2,
     }) == "$12.35 · 2 次未计价"
+    assert ui.fmt_cost({
+        "cost_ticks": 123_450_000_000,
+        "estimated_cost_ticks": 123_450_000_000,
+        "estimated_costed_success": 1,
+        "costed_success": 1,
+    }) == "估算 $12.35"
+    assert ui.fmt_cost({
+        "cost_ticks": 150_000_000_000,
+        "actual_cost_ticks": 50_000_000_000,
+        "estimated_cost_ticks": 100_000_000_000,
+        "actual_costed_success": 1,
+        "estimated_costed_success": 2,
+        "costed_success": 3,
+    }) == "$15.00（实际 $5.00 + 估算 $10.00）"
     assert "≈" not in ui.fmt_cost({
         "cost_ticks": 123_450_000_000,
         "estimated_cost_ticks": 123_450_000_000,
@@ -225,7 +241,7 @@ def test_stats_cost_estimate_and_unknown_coverage(m):
 
     result = m["log_db"].stats_summary(0)
     overall = result["overall"]
-    assert overall["cost_ticks"] == int(41.75 * 10_000_000_000)
+    assert overall["cost_ticks"] == int(68.5 * 10_000_000_000)
     assert overall["estimated_cost_ticks"] == overall["cost_ticks"]
     assert overall["actual_cost_ticks"] == 0
     assert overall["costed_success"] == 1
@@ -234,7 +250,7 @@ def test_stats_cost_estimate_and_unknown_coverage(m):
     rec = _install_recorder(m)
     m["stats_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
-    assert "💵 $41.75 · 1 次未计价" in text
+    assert "💵 估算 $68.50" in text
     assert "≈" not in text
 
 
@@ -265,13 +281,47 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
     assert overall["costed_success"] == 1
     assert overall["unpriced_success"] == 0
     row = m["log_db"].recent_logs(limit=1)[0]
-    assert m["ui"].fmt_cost_from_row(row) == "$0.01"
+    assert m["ui"].fmt_cost_from_row(row) == "实际 $0.01"
 
     rec = _install_recorder(m)
     m["stats_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
     assert "$0.01" in text
     assert "≈" not in text
+
+
+def test_stats_labels_mixed_actual_and_estimated_cost(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "cost-estimated-half",
+        "k-est",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=100_000,
+        output_tok=0,
+        cc=0,
+        cr=0,
+    )
+    _insert_success(
+        m,
+        "cost-actual-half",
+        "k-xai",
+        "grok-private-model",
+        "oauth:xai:account",
+        channel_type="oauth",
+        input_tok=1,
+        output_tok=1,
+        cc=0,
+        cr=0,
+        response_body=json.dumps({"usage": {"cost_in_usd_ticks": 5_000_000_000}}),
+        upstream_protocol="xai-responses",
+    )
+    overall = m["log_db"].stats_summary(0)["overall"]
+    assert overall["cost_ticks"] == 10_000_000_000
+    assert overall["actual_costed_success"] == 1
+    assert overall["estimated_costed_success"] == 1
+    assert m["ui"].fmt_cost(overall) == "$1.00（实际 $0.50 + 估算 $0.50）"
 
 
 def test_stats_fast_mode_uses_priority_pricing(m):
@@ -282,19 +332,105 @@ def test_stats_fast_mode_uses_priority_pricing(m):
         "k1",
         "gpt-5.6-luna",
         "api:OpenAI",
-        input_tok=1_000_000,
-        output_tok=1_000_000,
+        input_tok=100_000,
+        output_tok=100_000,
         cc=0,
         cr=0,
         fast_mode=True,
     )
     result = m["log_db"].stats_summary(0)
-    assert result["overall"]["cost_ticks"] == 14 * 10_000_000_000
+    assert result["overall"]["cost_ticks"] == int(1.4 * 10_000_000_000)
+
+
+def test_stats_classifies_long_context_per_request_before_sum(m):
+    _setup(m)
+    # Two 150k requests remain short even though their aggregate exceeds 272k.
+    for idx in range(2):
+        _insert_success(
+            m,
+            f"cost-short-{idx}",
+            "k1",
+            "gpt-5.6-sol",
+            "api:OpenAI",
+            input_tok=150_000,
+            output_tok=0,
+            cc=0,
+            cr=0,
+        )
+    _insert_success(
+        m,
+        "cost-long",
+        "k1",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=300_000,
+        output_tok=0,
+        cc=0,
+        cr=0,
+    )
+    result = m["log_db"].stats_summary(0)
+    # 2 × (150k × $5/M) + (300k × $10/M) = $4.50.
+    assert result["overall"]["cost_ticks"] == int(4.5 * 10_000_000_000)
+    assert result["overall"]["costed_success"] == 3
+
+
+def test_ambiguous_legacy_cached_usage_is_explicitly_unpriced(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "legacy-cache-semantics",
+        "k1",
+        "gpt-5.6-sol",
+        "api:OpenAI",
+        input_tok=100_000,
+        output_tok=10_000,
+        cc=0,
+        cr=80_000,
+        upstream_protocol="",
+    )
+    result = m["log_db"].stats_summary(0)
+    assert result["overall"]["costed_success"] == 0
+    assert result["overall"]["unpriced_success"] == 1
+    row = m["log_db"].recent_logs(limit=1)[0]
+    assert m["ui"].fmt_cost_from_row(row) == "未计价（1 次）"
+
+
+def test_ambiguous_anthropic_cache_write_ttl_does_not_hide_other_costs(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "claude-no-write",
+        "k1",
+        "claude-opus-4-6",
+        "oauth:anthropic:test",
+        input_tok=1_000,
+        output_tok=100,
+        cc=0,
+        cr=0,
+        upstream_protocol="anthropic",
+    )
+    _insert_success(
+        m,
+        "claude-unknown-ttl",
+        "k1",
+        "claude-opus-4-6",
+        "oauth:anthropic:test",
+        input_tok=1_000,
+        output_tok=100,
+        cc=1_000,
+        cr=0,
+        upstream_protocol="anthropic",
+    )
+    result = m["log_db"].stats_summary(0)
+    overall = result["overall"]
+    assert overall["cost_ticks"] == 75_000_000
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 1
 
 
 def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     _setup(m)
-    expected = int(41.75 * 10_000_000_000)
+    expected = int(68.5 * 10_000_000_000)
     _insert_success(
         m,
         "cost-everywhere",
@@ -322,7 +458,7 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     assert m["log_db"].cost_for_log(row)["cost_ticks"] == expected
     detail = m["log_db"].log_detail("cost-everywhere")
     assert m["log_db"].cost_for_log(detail["log"])["cost_ticks"] == expected
-    assert m["ui"].fmt_cost_from_row(row) == "$41.75"
+    assert m["ui"].fmt_cost_from_row(row) == "估算 $68.50"
 
     # OAuth token 刷新通知也是 Telegram 展示面，月度缓存旁必须有金额。
     _insert_success(
@@ -340,7 +476,7 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     notice = m["oauth_manager"]._build_refresh_notice(
         "openai:notice@example.test:acct", usage_flat=None,
     )
-    assert "缓存 1.0M (33.3%) · 💵 $41.75" in notice
+    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in notice
     assert "≈" not in notice
 
 
@@ -359,8 +495,33 @@ def test_cache_miss_write_sample_includes_request_cost(m):
     )
     summary = m["log_db"].stats_summary(0)
     text = m["stats_menu"]._section_cache_misses(summary["recent_cache_misses"])
-    assert "写 1.0M · 💵 $41.25" in text
+    assert "写 1.0M · 💵 估算 $67.50" in text
     assert "≈" not in text
+
+
+def test_stats_without_cost_never_reads_response_body(m):
+    _setup(m)
+    _insert_success(
+        m,
+        "no-cost-body-read",
+        "k1",
+        "grok-4",
+        "oauth:xai:test",
+        input_tok=10,
+        output_tok=2,
+        cc=0,
+        cr=0,
+        response_body='{"usage":{"cost_in_usd_ticks":123}}',
+        upstream_protocol="xai-responses",
+    )
+    conn = m["log_db"]._get_conn()
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        m["log_db"].stats_summary(0, include_cost=False)
+    finally:
+        conn.set_trace_callback(None)
+    assert not any("request_detail" in sql.lower() for sql in statements)
 
 
 def test_stats_group_by_channel(m):
@@ -909,6 +1070,93 @@ def test_log_db_fast_mode_migration_for_old_month_db(m):
     assert "proxy_bytes_up" in cols
     assert "proxy_bytes_down" in cols
     print("  [PASS] log_db old schema migration adds fast_mode")
+
+
+def test_stats_lifetime_migrates_real_old_month_before_cost_query(m):
+    _setup(m)
+    ld = m["log_db"]
+    path = os.path.join(ld._log_dir, "1999-01.db")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(path + suffix)
+        except FileNotFoundError:
+            pass
+    try:
+        conn = sqlite3.connect(path)
+        conn.executescript(ld._schema_sql())
+        conn.execute(
+            """INSERT INTO request_log(
+                   request_id, created_at, status, api_key_name, requested_model,
+                   final_model, final_channel_key, input_tokens, output_tokens,
+                   cache_creation_tokens, cache_read_tokens)
+               VALUES('old-priced', 1, 'success', 'k', 'gpt-5.6-sol',
+                      'gpt-5.6-sol', 'api:OpenAI', 100000, 10000, 0, 0)"""
+        )
+        for col in (
+            "fast_mode", "ingress_protocol", "upstream_protocol",
+            "upstream_transport", "proxy_name", "proxy_bytes_up", "proxy_bytes_down",
+        ):
+            conn.execute(f"ALTER TABLE request_log DROP COLUMN {col}")
+        conn.commit()
+        conn.close()
+
+        lifetime = ld.stats_lifetime()
+        assert lifetime["total"] == 1
+        assert lifetime["costed_success"] == 1
+        assert lifetime["unpriced_success"] == 0
+        assert lifetime["cost_ticks"] == int(0.8 * 10_000_000_000)
+
+        check = sqlite3.connect(path)
+        cols = {row[1] for row in check.execute("PRAGMA table_info(request_log)")}
+        check.close()
+        assert {"fast_mode", "upstream_protocol", "proxy_bytes_up"} <= cols
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
+
+
+def test_stats_lifetime_readonly_archive_is_not_silently_dropped(m, monkeypatch):
+    _setup(m)
+    ld = m["log_db"]
+    path = os.path.join(ld._log_dir, "1999-02.db")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(path + suffix)
+        except FileNotFoundError:
+            pass
+    original = ld._get_conn_for_month
+    try:
+        conn = sqlite3.connect(path)
+        conn.executescript(ld._schema_sql())
+        conn.execute(
+            """INSERT INTO request_log(
+                   request_id, created_at, status, api_key_name, requested_model,
+                   final_model, final_channel_key, input_tokens, output_tokens)
+               VALUES('readonly-unpriced', 1, 'success', 'k', 'gpt-5.6-sol',
+                      'gpt-5.6-sol', 'api:OpenAI', 100000, 10000)"""
+        )
+        conn.commit()
+        conn.close()
+
+        def fail_migration(month):
+            if month == "1999-02":
+                raise sqlite3.OperationalError("readonly archive")
+            return original(month)
+
+        monkeypatch.setattr(ld, "_get_conn_for_month", fail_migration)
+        lifetime = ld.stats_lifetime()
+        assert lifetime["total"] == 1
+        assert lifetime["costed_success"] == 0
+        assert lifetime["unpriced_success"] == 1
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
 
 
 def test_extract_fast_mode_variants(m):

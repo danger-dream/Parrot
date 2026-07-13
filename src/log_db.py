@@ -1773,7 +1773,82 @@ def finish_error(
             _request_handles.pop(handle.request_id, None)
 
 
+def _long_context_case_sql(
+    conn,
+    *,
+    model_expr: str,
+    prompt_expr: str,
+    where_sql: str,
+    where_args: tuple,
+    pricing_settings,
+) -> tuple[str, tuple]:
+    """Build a small CASE that classifies long context before token SUM()."""
+
+    rows = conn.execute(
+        f"SELECT DISTINCT {model_expr} AS pricing_model FROM request_log WHERE {where_sql}",
+        where_args,
+    ).fetchall()
+    clauses: list[str] = []
+    args: list[Any] = []
+    for row in rows:
+        model = str(row["pricing_model"] or "?")
+        threshold = model_pricing.long_context_threshold(
+            model, pricing_settings=pricing_settings
+        )
+        if threshold <= 0:
+            continue
+        clauses.append(f"WHEN {model_expr}=? AND {prompt_expr}>? THEN 1")
+        args.extend((model, threshold))
+    if not clauses:
+        return "0", ()
+    return "CASE " + " ".join(clauses) + " ELSE 0 END", tuple(args)
+
+
+def _cache_ttl_known_case_sql(
+    conn,
+    *,
+    model_expr: str,
+    cache_creation_expr: str,
+    where_sql: str,
+    where_args: tuple,
+    pricing_settings,
+) -> tuple[str, tuple]:
+    """Classify requests whose cache-write TTL cannot be reconstructed."""
+
+    rows = conn.execute(
+        f"SELECT DISTINCT {model_expr} AS pricing_model FROM request_log WHERE {where_sql}",
+        where_args,
+    ).fetchall()
+    ambiguous_models = [
+        str(row["pricing_model"] or "?")
+        for row in rows
+        if model_pricing.has_ambiguous_cache_write_ttl(
+            str(row["pricing_model"] or "?"), pricing_settings=pricing_settings
+        )
+    ]
+    if not ambiguous_models:
+        return "1", ()
+    placeholders = ",".join("?" for _ in ambiguous_models)
+    return (
+        f"CASE WHEN {model_expr} IN ({placeholders}) "
+        f"AND {cache_creation_expr}>0 THEN 0 ELSE 1 END",
+        tuple(ambiguous_models),
+    )
+
+
 def _estimate_cost_into(bucket: dict, row, *, row_count: int, pricing_settings) -> None:
+    row_keys = row.keys() if hasattr(row, "keys") else ()
+    if (
+        "usage_semantics_known" in row_keys
+        and not bool(row["usage_semantics_known"])
+    ) or (
+        "cache_ttl_known" in row_keys and not bool(row["cache_ttl_known"])
+    ):
+        _add_unpriced(bucket, row_count)
+        return
+    forced_long_context = (
+        bool(row["long_context"]) if "long_context" in row_keys else None
+    )
     estimate = model_pricing.estimate_cost(
         row["pricing_model"],
         input_tokens=row["input_tokens"] or 0,
@@ -1781,6 +1856,7 @@ def _estimate_cost_into(bucket: dict, row, *, row_count: int, pricing_settings) 
         cache_creation_tokens=row["cache_creation_tokens"] or 0,
         cache_read_tokens=row["cache_read_tokens"] or 0,
         priority=bool(row["fast_mode"]),
+        long_context=forced_long_context,
         pricing_settings=pricing_settings,
     )
     if estimate is None:
@@ -1801,21 +1877,53 @@ def _accumulate_filtered_costs(
     if not pricing_settings.enabled:
         return
 
+    model_expr = "COALESCE(final_model, requested_model, '?')"
+    prompt_expr = (
+        "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
+        "+ COALESCE(cache_read_tokens, 0)"
+    )
+    standard_where = (
+        f"({where}) AND created_at >= ? AND status='success' "
+        "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
+    )
+    standard_args = where_args + (since_ts,)
+    long_case, long_args = _long_context_case_sql(
+        conn,
+        model_expr=model_expr,
+        prompt_expr=prompt_expr,
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+    )
+    cache_ttl_case, cache_ttl_args = _cache_ttl_known_case_sql(
+        conn,
+        model_expr=model_expr,
+        cache_creation_expr="COALESCE(cache_creation_tokens, 0)",
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+    )
     rows = conn.execute(
         f"""SELECT
-               COALESCE(final_model, requested_model, '?') AS pricing_model,
+               {model_expr} AS pricing_model,
                COALESCE(fast_mode, 0) AS fast_mode,
+               {long_case} AS long_context,
+               {cache_ttl_case} AS cache_ttl_known,
+               MIN(CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                              AND COALESCE(upstream_protocol, '') = ''
+                        THEN 0 ELSE 1 END) AS usage_semantics_known,
                COUNT(*) AS row_count,
                SUM(input_tokens) AS input_tokens,
                SUM(output_tokens) AS output_tokens,
                SUM(cache_creation_tokens) AS cache_creation_tokens,
                SUM(cache_read_tokens) AS cache_read_tokens
              FROM request_log
-             WHERE ({where}) AND created_at >= ?
-               AND status='success'
-               AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'
-             GROUP BY pricing_model, fast_mode""",
-        where_args + (since_ts,),
+             WHERE {standard_where}
+             GROUP BY pricing_model, fast_mode, long_context, cache_ttl_known,
+                      CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                                AND COALESCE(upstream_protocol, '') = ''
+                           THEN 0 ELSE 1 END""",
+        long_args + cache_ttl_args + standard_args,
     ).fetchall()
     for row in rows:
         _estimate_cost_into(
@@ -1833,14 +1941,17 @@ def _accumulate_filtered_costs(
                request_log.output_tokens AS output_tokens,
                request_log.cache_creation_tokens AS cache_creation_tokens,
                request_log.cache_read_tokens AS cache_read_tokens,
-               request_detail.response_body AS response_body
+               CASE WHEN COALESCE(request_log.cache_read_tokens, 0) > 0
+                          AND COALESCE(request_log.upstream_protocol, '') = ''
+                    THEN 0 ELSE 1 END AS usage_semantics_known,
+               substr(request_detail.response_body, -{_XAI_COST_BODY_TAIL_CHARS}) AS response_body
              FROM request_log
              LEFT JOIN request_detail USING (request_id)
              WHERE ({where}) AND request_log.created_at >= ?
                AND request_log.status='success'
                AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
         where_args + (since_ts,),
-    ).fetchall()
+    )
     for row in rows:
         actual_ticks = model_pricing.extract_actual_cost_ticks(row["response_body"])
         if actual_ticks is not None:
@@ -1867,22 +1978,55 @@ def _accumulate_grouped_costs(
     if not pricing_settings.enabled:
         return
 
+    model_expr = "COALESCE(final_model, requested_model, '?')"
+    prompt_expr = (
+        "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
+        "+ COALESCE(cache_read_tokens, 0)"
+    )
+    standard_where = (
+        f"({where}) AND created_at >= ? AND status='success' "
+        "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
+    )
+    standard_args = where_args + (since_ts,)
+    long_case, long_args = _long_context_case_sql(
+        conn,
+        model_expr=model_expr,
+        prompt_expr=prompt_expr,
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+    )
+    cache_ttl_case, cache_ttl_args = _cache_ttl_known_case_sql(
+        conn,
+        model_expr=model_expr,
+        cache_creation_expr="COALESCE(cache_creation_tokens, 0)",
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+    )
     rows = conn.execute(
         f"""SELECT
                {group_expr} AS grp_key,
-               COALESCE(final_model, requested_model, '?') AS pricing_model,
+               {model_expr} AS pricing_model,
                COALESCE(fast_mode, 0) AS fast_mode,
+               {long_case} AS long_context,
+               {cache_ttl_case} AS cache_ttl_known,
+               MIN(CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                              AND COALESCE(upstream_protocol, '') = ''
+                        THEN 0 ELSE 1 END) AS usage_semantics_known,
                COUNT(*) AS row_count,
                SUM(input_tokens) AS input_tokens,
                SUM(output_tokens) AS output_tokens,
                SUM(cache_creation_tokens) AS cache_creation_tokens,
                SUM(cache_read_tokens) AS cache_read_tokens
              FROM request_log
-             WHERE ({where}) AND created_at >= ?
-               AND status='success'
-               AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'
-             GROUP BY grp_key, pricing_model, fast_mode""",
-        where_args + (since_ts,),
+             WHERE {standard_where}
+             GROUP BY grp_key, pricing_model, fast_mode, long_context,
+                      cache_ttl_known,
+                      CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                                AND COALESCE(upstream_protocol, '') = ''
+                           THEN 0 ELSE 1 END""",
+        long_args + cache_ttl_args + standard_args,
     ).fetchall()
     for row in rows:
         key = row["grp_key"] or "?"
@@ -1903,14 +2047,17 @@ def _accumulate_grouped_costs(
                request_log.output_tokens AS output_tokens,
                request_log.cache_creation_tokens AS cache_creation_tokens,
                request_log.cache_read_tokens AS cache_read_tokens,
-               request_detail.response_body AS response_body
+               CASE WHEN COALESCE(request_log.cache_read_tokens, 0) > 0
+                          AND COALESCE(request_log.upstream_protocol, '') = ''
+                    THEN 0 ELSE 1 END AS usage_semantics_known,
+               substr(request_detail.response_body, -{_XAI_COST_BODY_TAIL_CHARS}) AS response_body
              FROM request_log
              LEFT JOIN request_detail USING (request_id)
              WHERE ({where}) AND request_log.created_at >= ?
                AND request_log.status='success'
                AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
         where_args + (since_ts,),
-    ).fetchall()
+    )
     for row in rows:
         key = row["grp_key"] or "?"
         bucket = buckets.setdefault(key, _new_token_stats_agg())
@@ -1941,6 +2088,13 @@ def cost_for_log(row: dict | None) -> dict:
         if actual_ticks is not None:
             _add_cost(out, actual_ticks, 1, actual=True)
             return out
+
+    # Old OpenAI rows stored total prompt tokens in input_tokens, while current
+    # rows store uncached input.  Migrated rows have no upstream_protocol, so a
+    # cache hit is ambiguous and must not be presented as a precise estimate.
+    if (row.get("cache_read_tokens") or 0) > 0 and not row.get("upstream_protocol"):
+        _add_unpriced(out, 1)
+        return out
 
     pricing_model = row.get("final_model") or row.get("requested_model") or "?"
     estimate = model_pricing.estimate_cost(
@@ -1980,13 +2134,26 @@ def stats_lifetime() -> dict:
         if not name.endswith(".db"):
             continue
         path = os.path.join(_log_dir, name)
-        # 当月 db 用 thread-local 可写连接；其它月只读打开
+        # 当月 db 用 thread-local 连接；其它月经统一入口打开，确保老月份先补齐
+        # fast_mode 等既有列再参与金额聚合。
+        cost_schema_ready = True
         if path == current_path:
             conn = _get_conn()
             close_fn = None
         else:
             conn = _open_readonly(path)
             close_fn = conn.close
+            request_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
+            }
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            cost_schema_ready = {
+                "final_model", "fast_mode", "upstream_protocol",
+            }.issubset(request_cols) and "request_detail" in tables
         try:
             row = conn.execute(
                 """SELECT
@@ -2007,7 +2174,10 @@ def stats_lifetime() -> dict:
                 out["output_tokens"] += int(row["outp"] or 0)
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
-            _accumulate_filtered_costs(conn, 0, "1=1", (), out)
+            if cost_schema_ready:
+                _accumulate_filtered_costs(conn, 0, "1=1", (), out)
+            elif model_pricing.settings().enabled:
+                _add_unpriced(out, int(row["succ"] or 0))
         except Exception as exc:
             raise HistoricalLogError(f"stats_lifetime failed for {name}: {exc}") from exc
         finally:
@@ -2117,22 +2287,29 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
         out["cost_usd"] = 0.0
         return out
 
+    include_cost = model_pricing.settings().enabled
+    response_expr = (
+        f"substr(d.response_body, -{_XAI_COST_BODY_TAIL_CHARS})"
+        if include_cost
+        else "NULL"
+    )
+    detail_join = "LEFT JOIN request_detail d USING(request_id)" if include_cost else ""
     for conn, close_fn in _iter_month_conns_all(since_ts):
         try:
             rows = conn.execute(
-                """SELECT
+                f"""SELECT
                      l.status,
                      l.is_stream,
                      l.first_token_time_ms,
                      l.total_time_ms,
                      l.input_tokens, l.output_tokens,
                      l.cache_creation_tokens, l.cache_read_tokens,
-                     d.response_body
+                     {response_expr} AS response_body
                    FROM request_log l
-                   LEFT JOIN request_detail d USING(request_id)
+                   {detail_join}
                    WHERE l.final_channel_key=? AND l.created_at >= ?""",
                 (channel_key, since_ts),
-            ).fetchall()
+            )
             for r in rows:
                 out["total"] += 1
                 if r["status"] == "success":
@@ -2158,16 +2335,17 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                     tps = output_tokens * 1000.0 / denom_ms
                     out["max_tps"] = tps if out.get("max_tps") is None else max(float(out["max_tps"]), tps)
                     out["min_tps"] = tps if out.get("min_tps") is None else min(float(out["min_tps"]), tps)
-                resp = _extract_xai_response_from_response_body(r["response_body"])
-                if isinstance(resp, dict):
-                    tier = str(resp.get("service_tier") or "").strip().lower()
-                    if tier:
-                        counts = out.setdefault("service_tier_counts", {})
-                        counts[tier] = int(counts.get(tier) or 0) + 1
-                ticks = model_pricing.extract_actual_cost_ticks(r["response_body"])
-                if ticks is not None:
-                    out["cost_ticks"] += ticks
-                    out["cost_rows"] += 1
+                if include_cost:
+                    resp = _extract_xai_response_from_response_body(r["response_body"])
+                    if isinstance(resp, dict):
+                        tier = str(resp.get("service_tier") or "").strip().lower()
+                        if tier:
+                            counts = out.setdefault("service_tier_counts", {})
+                            counts[tier] = int(counts.get(tier) or 0) + 1
+                    ticks = model_pricing.extract_actual_cost_ticks(r["response_body"])
+                    if ticks is not None:
+                        out["cost_ticks"] += ticks
+                        out["cost_rows"] += 1
         except Exception as exc:
             raise HistoricalLogError(f"xai_cost_for_channel failed: {exc}") from exc
         finally:
@@ -2241,6 +2419,8 @@ def _pack_stats(raw: dict) -> dict:
         "cost_ticks": raw.get("cost_ticks", 0),
         "actual_cost_ticks": raw.get("actual_cost_ticks", 0),
         "estimated_cost_ticks": raw.get("estimated_cost_ticks", 0),
+        "actual_costed_success": raw.get("actual_costed_success", 0),
+        "estimated_costed_success": raw.get("estimated_costed_success", 0),
         "costed_success": raw.get("costed_success", 0),
         "unpriced_success": raw.get("unpriced_success", 0),
     }
@@ -2580,7 +2760,8 @@ def _family_params(family: str | None) -> tuple:
         return ()
     return _FAMILY_UPSTREAM[family]
 
-_RECENT_COLS = (
+_XAI_COST_BODY_TAIL_CHARS = 262_144
+_RECENT_COLS_BASE = (
     "request_id, created_at, api_key_name, requested_model, "
     "final_channel_key, final_channel_type, final_model, "
     "status, http_status, error_message, is_stream, "
@@ -2591,15 +2772,43 @@ _RECENT_COLS = (
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
     "reasoning_effort, fast_mode, "
-    "(SELECT response_body FROM request_detail rd WHERE rd.request_id=request_log.request_id) AS response_body, "
+)
+_RECENT_COLS_SUFFIX = (
     "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count"
 )
 
 
-def _compatible_recent_cols(conn: sqlite3.Connection) -> str:
-    """Project nullable timing columns when reading pre-migration monthly DBs."""
+def _recent_cols(*, include_cost: bool | None = None) -> str:
+    if include_cost is None:
+        include_cost = model_pricing.settings().enabled
+    if include_cost:
+        response_expr = (
+            "CASE WHEN COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%' "
+            "THEN (SELECT substr(response_body, -"
+            f"{_XAI_COST_BODY_TAIL_CHARS}"
+            ") FROM request_detail rd WHERE rd.request_id=request_log.request_id) "
+            "ELSE NULL END AS response_body, "
+        )
+    else:
+        response_expr = "NULL AS response_body, "
+    return _RECENT_COLS_BASE + response_expr + _RECENT_COLS_SUFFIX
+
+
+def _compatible_recent_cols(
+    conn: sqlite3.Connection,
+    *,
+    include_cost: bool | None = None,
+) -> str:
+    """Project nullable timing and pricing columns for historical DBs."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
-    sql = _RECENT_COLS
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "request_detail" not in tables:
+        include_cost = False
+    sql = _recent_cols(include_cost=include_cost)
     for name in (
         "idle_time_ms", "final_round_id", "request_elapsed_ms",
         "request_upload_ms", "response_headers_wait_ms",
@@ -2609,11 +2818,6 @@ def _compatible_recent_cols(conn: sqlite3.Connection) -> str:
     ):
         if name not in cols:
             sql = sql.replace(name, f"NULL AS {name}")
-    tables = {
-        row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-    }
     if "local_web_log" not in tables:
         sql = sql.replace(
             "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count",
@@ -2633,7 +2837,6 @@ def _request_connect_sql(conn: sqlite3.Connection) -> str:
     if "response_headers_wait_ms" in cols:
         legacy += " AND response_headers_wait_ms IS NULL"
     return f"CASE WHEN ({legacy}) THEN NULL ELSE connect_time_ms END"
-
 
 def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
     """Aggregate proxy usage stats across monthly log DBs.
@@ -3073,6 +3276,18 @@ def _accumulate_usage_costs(
 
     def apply_estimate(row, *, row_count: int) -> None:
         targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
+        row_keys = row.keys() if hasattr(row, "keys") else ()
+        if "usage_semantics_known" in row_keys and not bool(row["usage_semantics_known"]):
+            for target in targets:
+                _add_unpriced(target, row_count)
+            return
+        if "cache_ttl_known" in row_keys and not bool(row["cache_ttl_known"]):
+            for target in targets:
+                _add_unpriced(target, row_count)
+            return
+        forced_long_context = (
+            bool(row["long_context"]) if "long_context" in row_keys else None
+        )
         estimate = model_pricing.estimate_cost(
             row["pricing_model"] or row["model_key"],
             input_tokens=row["input_tokens"] or 0,
@@ -3080,6 +3295,7 @@ def _accumulate_usage_costs(
             cache_creation_tokens=row["cache_creation_tokens"] or 0,
             cache_read_tokens=row["cache_read_tokens"] or 0,
             priority=bool(row["fast_mode"]),
+            long_context=forced_long_context,
             pricing_settings=pricing_settings,
         )
         if estimate is None:
@@ -3091,24 +3307,57 @@ def _accumulate_usage_costs(
 
     # 非 xAI 请求可以先按四个展示维度 + 实际计价模型 + fast/priority 聚合，
     # 避免把整段历史逐行搬进 Python。
+    model_expr = "COALESCE(final_model, requested_model, '?')"
+    prompt_expr = (
+        "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
+        "+ COALESCE(cache_read_tokens, 0)"
+    )
+    standard_where = (
+        f"created_at >= ?{_family_where(family)} AND status='success' "
+        "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
+    )
+    standard_args = (since_ts, *_family_params(family))
+    long_case, long_args = _long_context_case_sql(
+        conn,
+        model_expr=model_expr,
+        prompt_expr=prompt_expr,
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+    )
+    cache_ttl_case, cache_ttl_args = _cache_ttl_known_case_sql(
+        conn,
+        model_expr=model_expr,
+        cache_creation_expr="COALESCE(cache_creation_tokens, 0)",
+        where_sql=standard_where,
+        where_args=standard_args,
+        pricing_settings=pricing_settings,
+    )
     estimated_rows = conn.execute(
         f"""SELECT
-               COALESCE(final_model, requested_model, '?') AS pricing_model,
+               {model_expr} AS pricing_model,
                COALESCE(final_channel_key, '?') AS channel_key,
                COALESCE(requested_model, '?') AS model_key,
                COALESCE(api_key_name, '?') AS apikey_key,
                COALESCE(fast_mode, 0) AS fast_mode,
+               {long_case} AS long_context,
+               {cache_ttl_case} AS cache_ttl_known,
+               MIN(CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                              AND COALESCE(upstream_protocol, '') = ''
+                        THEN 0 ELSE 1 END) AS usage_semantics_known,
                COUNT(*) AS row_count,
                SUM(input_tokens) AS input_tokens,
                SUM(output_tokens) AS output_tokens,
                SUM(cache_creation_tokens) AS cache_creation_tokens,
                SUM(cache_read_tokens) AS cache_read_tokens
              FROM request_log
-             WHERE created_at >= ?{_family_where(family)}
-               AND status='success'
-               AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'
-             GROUP BY pricing_model, channel_key, model_key, apikey_key, fast_mode""",
-        (since_ts, *_family_params(family)),
+             WHERE {standard_where}
+             GROUP BY pricing_model, channel_key, model_key, apikey_key,
+                      fast_mode, long_context, cache_ttl_known,
+                      CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                                AND COALESCE(upstream_protocol, '') = ''
+                           THEN 0 ELSE 1 END""",
+        long_args + cache_ttl_args + standard_args,
     ).fetchall()
     for row in estimated_rows:
         apply_estimate(row, row_count=int(row["row_count"] or 0))
@@ -3126,14 +3375,17 @@ def _accumulate_usage_costs(
                request_log.output_tokens AS output_tokens,
                request_log.cache_creation_tokens AS cache_creation_tokens,
                request_log.cache_read_tokens AS cache_read_tokens,
-               request_detail.response_body AS response_body
+               CASE WHEN COALESCE(request_log.cache_read_tokens, 0) > 0
+                          AND COALESCE(request_log.upstream_protocol, '') = ''
+                    THEN 0 ELSE 1 END AS usage_semantics_known,
+               substr(request_detail.response_body, -{_XAI_COST_BODY_TAIL_CHARS}) AS response_body
              FROM request_log
              LEFT JOIN request_detail USING (request_id)
              WHERE request_log.created_at >= ?{_family_where(family)}
                AND request_log.status='success'
                AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
         (since_ts, *_family_params(family)),
-    ).fetchall()
+    )
     for row in xai_rows:
         targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
         actual_ticks = model_pricing.extract_actual_cost_ticks(row["response_body"])
@@ -3150,6 +3402,7 @@ def stats_summary(
     summary_top_limit: int = 3,
     group_limit: int = 10,
     family: str | None = None,
+    include_cost: bool = True,
 ) -> dict:
     """跨月统计聚合。
 
@@ -3167,6 +3420,7 @@ def stats_summary(
     group_by 决定哪个维度展开到 group_limit；其它两个维度保持 summary_top_limit。
     group_by=None 时三个维度都只取 summary_top_limit。
     """
+    include_cost = bool(include_cost and model_pricing.settings().enabled)
     conns = _iter_month_conns(since_ts)
     overall_agg = _new_overall_agg()
     by_channel: dict[str, dict] = {}
@@ -3175,6 +3429,7 @@ def stats_summary(
     recent_errors: list[dict] = []
     recent_calls: list[dict] = []
     recent_cache_misses: list[dict] = []
+    need_groups = bool(summary_top_limit > 0 or group_by in _GROUP_BY_COLS)
 
     def _agg_group(target: dict, conn, col_expr: str) -> None:
         connect_expr = _request_connect_sql(conn)
@@ -3235,19 +3490,32 @@ def stats_summary(
             _accumulate(overall_agg, row)
             _merge_tps(overall_agg, row)
 
-            # 永远聚合三个维度（cc-proxy 风格：汇总视图也展示三方 Top）
-            _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
-            _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
-            _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
-            _accumulate_usage_costs(
-                conn,
-                since_ts,
-                family,
-                overall_agg,
-                by_channel,
-                by_model,
-                by_apikey,
-            )
+            if need_groups:
+                _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
+                _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
+                _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
+            if include_cost:
+                if need_groups:
+                    _accumulate_usage_costs(
+                        conn,
+                        since_ts,
+                        family,
+                        overall_agg,
+                        by_channel,
+                        by_model,
+                        by_apikey,
+                    )
+                else:
+                    _accumulate_filtered_costs(
+                        conn,
+                        since_ts,
+                        "1=1" + _family_where(family),
+                        _family_params(family),
+                        overall_agg,
+                    )
+
+            if not need_groups:
+                continue
 
             for r in conn.execute(
                 """SELECT created_at, api_key_name, requested_model,
@@ -3260,29 +3528,38 @@ def stats_summary(
                 recent_errors.append(dict(r))
 
             for r in conn.execute(
-                f"""SELECT {_compatible_recent_cols(conn)}
+                f"""SELECT {_compatible_recent_cols(conn, include_cost=include_cost)}
                    FROM request_log WHERE created_at >= ?{_family_where(family)}
                    ORDER BY created_at DESC LIMIT 3""",
                 (since_ts, *_family_params(family)),
             ).fetchall():
                 recent_calls.append(_sanitize_request_timing(r))
 
-            # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0
+            # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0。
+            # pricing 关闭时不能为了菜单读取任何响应正文。
+            cache_miss_response_expr = (
+                "CASE WHEN COALESCE(final_channel_key, '') LIKE 'oauth:xai:%' "
+                "THEN (SELECT substr(response_body, -"
+                f"{_XAI_COST_BODY_TAIL_CHARS}"
+                ") FROM request_detail rd "
+                "WHERE rd.request_id=request_log.request_id) "
+                "ELSE NULL END AS response_body"
+                if include_cost
+                else "NULL AS response_body"
+            )
             for r in conn.execute(
-                """SELECT request_id, created_at, api_key_name, requested_model,
+                f"""SELECT request_id, created_at, api_key_name, requested_model,
                           final_model, final_channel_key, is_stream, msg_count, tool_count,
                           input_tokens, output_tokens,
                           cache_creation_tokens, cache_read_tokens,
                           connect_time_ms, first_token_time_ms, total_time_ms,
                           retry_count, affinity_hit, fast_mode,
                           'success' AS status,
-                          (SELECT response_body FROM request_detail rd
-                            WHERE rd.request_id=request_log.request_id) AS response_body
+                          {cache_miss_response_expr}
                    FROM request_log
-                   WHERE created_at >= ?{_family_where_sql} AND status='success' AND cache_read_tokens=0
-                   ORDER BY created_at DESC LIMIT 3""".format(
-                       _family_where_sql=_family_where(family),
-                   ),
+                   WHERE created_at >= ?{_family_where(family)}
+                     AND status='success' AND cache_read_tokens=0
+                   ORDER BY created_at DESC LIMIT 3""",
                 (since_ts, *_family_params(family)),
             ).fetchall():
                 recent_cache_misses.append(dict(r))
@@ -3369,6 +3646,8 @@ def _finalize_overall(agg: dict) -> dict:
         "cost_ticks": agg["cost_ticks"],
         "actual_cost_ticks": agg["actual_cost_ticks"],
         "estimated_cost_ticks": agg["estimated_cost_ticks"],
+        "actual_costed_success": agg["actual_costed_success"],
+        "estimated_costed_success": agg["estimated_costed_success"],
         "costed_success": agg["costed_success"],
         "unpriced_success": agg["unpriced_success"],
     }
@@ -3397,6 +3676,8 @@ def _new_cost_agg() -> dict:
         "cost_ticks": 0,
         "actual_cost_ticks": 0,
         "estimated_cost_ticks": 0,
+        "actual_costed_success": 0,
+        "estimated_costed_success": 0,
         "costed_success": 0,
         "unpriced_success": 0,
     }
@@ -3408,6 +3689,10 @@ def _add_cost(bucket: dict, ticks: int, rows: int, *, actual: bool) -> None:
     bucket["cost_ticks"] = int(bucket.get("cost_ticks") or 0) + value
     source_key = "actual_cost_ticks" if actual else "estimated_cost_ticks"
     bucket[source_key] = int(bucket.get(source_key) or 0) + value
+    source_count_key = (
+        "actual_costed_success" if actual else "estimated_costed_success"
+    )
+    bucket[source_count_key] = int(bucket.get(source_count_key) or 0) + count
     bucket["costed_success"] = int(bucket.get("costed_success") or 0) + count
 
 
