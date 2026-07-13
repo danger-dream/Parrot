@@ -34,7 +34,11 @@
     "enabled": true,
     "defaultMaxConcurrent": 5,
     "defaultMaxQueue": 50,
-    "defaultQueueWaitSeconds": 1800
+    "defaultQueueWaitSeconds": 1800,
+    "defaultMaxRequestBodyBytes": 8388608,       // 单个排队请求最多预读/回放 8 MiB
+    "defaultMaxRequestBodyEvents": 4096,         // 单个排队请求最多缓存 4096 个 ASGI body 事件
+    "defaultMaxQueuedBodyBytesPerKey": 33554432, // 单 Key 排队请求体估算内存上限 32 MiB
+    "maxQueuedBodyBytes": 134217728              // 全进程排队请求体估算内存上限 128 MiB
   },
 
   // ─── OAuth 账户列表 ───
@@ -249,6 +253,8 @@
 `apiKeys.<name>.key` 是下游客户端作为 Bearer / x-api-key 使用的密钥字符串。配置层不要求 `ccp-` 前缀，任意字符串都可；TG bot 自动生成时仍使用 `ccp-<48 hex>`，也可以在菜单里输入自定义 key。
 
 `apiKeys.<name>.enabled` 控制该 Key 是否可用，缺失或 `null` 时按 `true` 处理。`apiKeyConcurrency` 是 API Key 级限流默认值；`apiKeys.<name>.limits.enabled/maxConcurrent/maxQueue/queueWaitSeconds` 是单 Key 覆盖，其中 `limits.enabled` 优先级高于全局 `apiKeyConcurrency.enabled`。默认单 Key 5 并发、50 队列、最长等待 1800 秒；队列满、等待超时或客户端断开时请求会从队列移除并返回/结束。
+
+排队期间，限流器会读取 ASGI `receive` 以尽早发现客户端断开，并把期间读到的 `http.request` 事件完整回放给下游。`defaultMaxRequestBodyBytes` 和 `defaultMaxRequestBodyEvents` 限制单个排队请求，超限返回 413；`defaultMaxQueuedBodyBytesPerKey` 和 `maxQueuedBodyBytes` 分别限制单 Key 与全进程保留的请求体估算内存（正文加每事件固定开销），达到聚合上限时返回 429。请求获得并发槽位、缓存事件回放完毕后，后续 body 由下游直接读取；取消、超时与响应结束都会释放保留内存。
 
 ## 2.2 字段语义详解
 

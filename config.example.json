@@ -21,7 +21,11 @@
     "enabled": true,
     "defaultMaxConcurrent": 5,
     "defaultMaxQueue": 50,
-    "defaultQueueWaitSeconds": 1800
+    "defaultQueueWaitSeconds": 1800,
+    "defaultMaxRequestBodyBytes": 8388608,
+    "defaultMaxRequestBodyEvents": 4096,
+    "defaultMaxQueuedBodyBytesPerKey": 33554432,
+    "maxQueuedBodyBytes": 134217728
   },
   "oauthAccounts": [],
   "channels": [

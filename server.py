@@ -339,6 +339,21 @@ async def _drain_http_middleware(request: Request, call_next):
             if not err and key_name:
                 try:
                     key_lease = await apikey_limiter.acquire(key_name, request)
+                except apikey_limiter.RequestBodyTooLarge as exc:
+                    await lease.aclose()
+                    message = str(exc)
+                    if path == "/v1/messages":
+                        return errors.json_error_response(
+                            413,
+                            errors.ErrType.REQUEST_TOO_LARGE,
+                            message,
+                        )
+                    return errors.json_error_openai(
+                        413,
+                        errors.ErrTypeOpenAI.INVALID_REQUEST,
+                        message,
+                        code="request_too_large",
+                    )
                 except apikey_limiter.ApiKeyLimitError as exc:
                     await lease.aclose()
                     return _api_key_limit_error_response(path, exc)

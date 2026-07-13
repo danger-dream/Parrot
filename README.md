@@ -450,7 +450,16 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
     "dbPath": "image_logs.db"
   },
   "timeouts":      { "connect": 10, "firstByte": 30, "idle": 120, "total": 600 },
-  "apiKeyConcurrency": { "enabled": true, "defaultMaxConcurrent": 5, "defaultMaxQueue": 50, "defaultQueueWaitSeconds": 1800 },
+  "apiKeyConcurrency": {
+    "enabled": true,
+    "defaultMaxConcurrent": 5,
+    "defaultMaxQueue": 50,
+    "defaultQueueWaitSeconds": 1800,
+    "defaultMaxRequestBodyBytes": 8388608,
+    "defaultMaxRequestBodyEvents": 4096,
+    "defaultMaxQueuedBodyBytesPerKey": 33554432,
+    "maxQueuedBodyBytes": 134217728
+  },
   "concurrency":   { "enabled": true, "queueWaitSeconds": 30, "defaultMaxConcurrent": 0 },
   "errorWindows":  [1, 3, 5, 10, 15, 0],
   "oauthGraceCount": 3,

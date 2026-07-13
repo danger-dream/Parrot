@@ -101,6 +101,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaultMaxConcurrent": 5,
         "defaultMaxQueue": 50,
         "defaultQueueWaitSeconds": 1800,
+        # 排队期间 disconnect watcher 会预读并回放请求体；以下上限避免慢排队
+        # 请求用大 body / 过度分片占满进程内存。
+        "defaultMaxRequestBodyBytes": 8388608,
+        "defaultMaxRequestBodyEvents": 4096,
+        "defaultMaxQueuedBodyBytesPerKey": 33554432,
+        "maxQueuedBodyBytes": 134217728,
     },
     "oauthAccounts": [],
     "channels": [],

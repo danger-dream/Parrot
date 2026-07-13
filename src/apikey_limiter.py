@@ -6,7 +6,11 @@
 
 配置：
   apiKeyConcurrency.enabled/defaultMaxConcurrent/defaultMaxQueue/defaultQueueWaitSeconds
-  apiKeys.<name>.limits.enabled/maxConcurrent/maxQueue/queueWaitSeconds
+  apiKeyConcurrency.defaultMaxRequestBodyBytes/defaultMaxRequestBodyEvents
+  apiKeyConcurrency.defaultMaxQueuedBodyBytesPerKey/maxQueuedBodyBytesTotal
+  apiKeys.<name>.limits may override the corresponding per-key/body defaults with
+  enabled/maxConcurrent/maxQueue/queueWaitSeconds and
+  maxRequestBodyBytes/maxRequestBodyEvents/maxQueuedBodyBytes.
 
 单 Key 的 limits.enabled 优先级高于全局 enabled；其它 limits 字段缺失 / null 时继承全局默认。
 """
@@ -15,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import Request
 from starlette.responses import Response
+from starlette.types import Message, Receive
 
 from . import config
 
@@ -28,6 +34,7 @@ from . import config
 class Waiter:
     future: asyncio.Future
     enqueued_at: float
+    capacity_reserved: bool = False
 
 
 @dataclass
@@ -36,6 +43,10 @@ class ResolvedLimits:
     max_concurrent: int
     max_queue: int
     queue_wait_seconds: int
+    max_request_body_bytes: int
+    max_request_body_events: int
+    max_queued_body_bytes: int
+    max_queued_body_bytes_total: int
     enabled_source: str = "global"
     max_concurrent_source: str = "global"
     max_queue_source: str = "global"
@@ -67,26 +78,208 @@ class ApiKeyLimitError(Exception):
         self.headers = headers or {}
 
 
+DEFAULT_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BODY_EVENTS = 1024
+DEFAULT_MAX_QUEUED_BODY_BYTES_PER_KEY = 32 * 1024 * 1024
+DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL = 128 * 1024 * 1024
+# Aggregate budgets include a conservative estimate for each retained ASGI dict.
+QUEUED_BODY_EVENT_OVERHEAD_BYTES = 1024
+
+_queued_body_lock = asyncio.Lock()
+_queued_body_bytes_by_key: dict[str, int] = {}
+_queued_body_bytes_total = 0
+
+
+class RequestBodyTooLarge(Exception):
+    """A queued request exceeded a replay-buffer byte/event budget."""
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int,
+        reason: str = "request_bytes",
+        max_events: int | None = None,
+    ):
+        self.max_bytes = int(max_bytes)
+        self.max_events = None if max_events is None else int(max_events)
+        self.reason = reason
+        if reason == "event_count":
+            message = f"queued request has more than {self.max_events} body events"
+        elif reason == "key_aggregate":
+            message = f"API key queued-body budget exceeds {self.max_bytes} accounted bytes"
+        elif reason == "process_aggregate":
+            message = f"process queued-body budget exceeds {self.max_bytes} accounted bytes"
+        else:
+            message = f"queued request body exceeds {self.max_bytes} bytes"
+        super().__init__(message)
+
+
+class _BodyPreservingReceive:
+    """Replay body events consumed while a queued request is monitored.
+
+    Starlette exposes no public receive-interposition hook.  This class therefore
+    reads and replaces ``Request._receive`` exactly once, solely to retain unread
+    ``http.request`` messages; all buffered messages are replayed byte-for-byte.
+    """
+
+    def __init__(self, request: Request, key_name: str, limits: ResolvedLimits):
+        self._raw_receive: Receive = request._receive
+        self._key_name = key_name
+        self._limits = limits
+        self._buffer: deque[tuple[Message, int]] = deque()
+        self._buffered_bytes = 0
+        self._buffered_events = 0
+        self._reserved_bytes = 0
+        self._abandoned = False
+
+    async def receive(self) -> Message:
+        """Release accounting as each retained event is replayed, then go live."""
+        global _queued_body_bytes_total
+        async with _queued_body_lock:
+            if self._buffer:
+                message, charge = self._buffer.popleft()
+                self._reserved_bytes -= charge
+                _queued_body_bytes_total -= charge
+                key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0) - charge
+                if key_bytes > 0:
+                    _queued_body_bytes_by_key[self._key_name] = key_bytes
+                else:
+                    _queued_body_bytes_by_key.pop(self._key_name, None)
+                return message
+        return await self._raw_receive()
+
+    async def _reserve(self, message: Message) -> None:
+        global _queued_body_bytes_total
+        body_bytes = len(message.get("body", b""))
+        charge = body_bytes + QUEUED_BODY_EVENT_OVERHEAD_BYTES
+        # Body events may arrive throughout a long queue wait. Resolve the
+        # effective budgets for every event so config hot reloads take effect.
+        limits = _resolve_limits(self._key_name)
+        async with _queued_body_lock:
+            self._limits = limits
+            next_body_bytes = self._buffered_bytes + body_bytes
+            next_events = self._buffered_events + 1
+            key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0)
+            if next_body_bytes > limits.max_request_body_bytes:
+                raise RequestBodyTooLarge(max_bytes=limits.max_request_body_bytes)
+            if next_events > limits.max_request_body_events:
+                raise RequestBodyTooLarge(
+                    max_bytes=limits.max_request_body_bytes,
+                    max_events=limits.max_request_body_events,
+                    reason="event_count",
+                )
+            if key_bytes + charge > limits.max_queued_body_bytes:
+                raise RequestBodyTooLarge(
+                    max_bytes=limits.max_queued_body_bytes,
+                    reason="key_aggregate",
+                )
+            if _queued_body_bytes_total + charge > limits.max_queued_body_bytes_total:
+                raise RequestBodyTooLarge(
+                    max_bytes=limits.max_queued_body_bytes_total,
+                    reason="process_aggregate",
+                )
+            if self._abandoned:
+                return
+            self._buffer.append((message, charge))
+            self._buffered_bytes = next_body_bytes
+            self._buffered_events = next_events
+            self._reserved_bytes += charge
+            _queued_body_bytes_by_key[self._key_name] = key_bytes + charge
+            _queued_body_bytes_total += charge
+
+    async def wait_for_disconnect(self) -> None:
+        """Consume raw events while preserving every request-body event."""
+        while True:
+            message = await self._raw_receive()
+            message_type = message.get("type")
+            if message_type == "http.disconnect":
+                return
+            if message_type != "http.request":
+                continue
+            # Once receive() yielded an event, finish its reservation even if
+            # admission concurrently cancels this watcher; otherwise that body
+            # chunk would be consumed without being replayable.
+            reserve_task = asyncio.create_task(self._reserve(message))
+            try:
+                await asyncio.shield(reserve_task)
+            except asyncio.CancelledError:
+                await reserve_task
+                raise
+
+    async def abandon(self) -> None:
+        """Release all remaining reservations exactly once."""
+        global _queued_body_bytes_total
+        async with _queued_body_lock:
+            if self._abandoned:
+                return
+            self._abandoned = True
+            charge = self._reserved_bytes
+            self._reserved_bytes = 0
+            self._buffer.clear()
+            _queued_body_bytes_total -= charge
+            key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0) - charge
+            if key_bytes > 0:
+                _queued_body_bytes_by_key[self._key_name] = key_bytes
+            else:
+                _queued_body_bytes_by_key.pop(self._key_name, None)
+
+
+def _body_preserving_receive(
+    request: Request,
+    key_name: str,
+    limits: ResolvedLimits,
+) -> _BodyPreservingReceive:
+    guard = getattr(request, "_parrot_body_preserving_receive", None)
+    if isinstance(guard, _BodyPreservingReceive):
+        return guard
+    guard = _BodyPreservingReceive(request, key_name, limits)
+    # This is the only private Request hook used; see the class docstring.
+    request._receive = guard.receive
+    setattr(request, "_parrot_body_preserving_receive", guard)
+    return guard
+
+
+def _request_receive_guard(request: Request | None) -> _BodyPreservingReceive | None:
+    if request is None:
+        return None
+    guard = getattr(request, "_parrot_body_preserving_receive", None)
+    return guard if isinstance(guard, _BodyPreservingReceive) else None
+
+
 class ApiKeyLease:
     """一次 API Key slot 占用。release 幂等。"""
 
     def __init__(self, key_name: str, slot: ApiKeySlot | None,
                  limits: ResolvedLimits | None, *, queue_wait_ms: int = 0,
-                 noop: bool = False):
+                 noop: bool = False,
+                 replay_guard: _BodyPreservingReceive | None = None):
         self.key_name = key_name
         self.slot = slot
         self.limits = limits
         self.queue_wait_ms = int(queue_wait_ms)
         self.noop = noop
+        self._replay_guard = replay_guard
         self._released = False
+        self._release_task: asyncio.Task[None] | None = None
         self.attached_to_response = False
 
     async def release(self) -> None:
-        if self.noop or self._released or self.slot is None:
-            self._released = True
+        if self._released:
             return
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._finish_release())
+        # All callers await the same independently running cleanup. Cancelling
+        # one caller cannot strand body accounting or the concurrency slot.
+        await asyncio.shield(self._release_task)
+
+    async def _finish_release(self) -> None:
+        try:
+            if self._replay_guard is not None:
+                await self._replay_guard.abandon()
+        finally:
+            if not self.noop and self.slot is not None:
+                await _release_slot(self.slot)
         self._released = True
-        await _release_slot(self.slot)
 
 
 _slots: dict[str, ApiKeySlot] = {}
@@ -114,6 +307,26 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
     global_max = _as_int(global_cfg.get("defaultMaxConcurrent"), _DEFAULT_MAX_CONCURRENT)
     global_queue = _as_int(global_cfg.get("defaultMaxQueue"), _DEFAULT_MAX_QUEUE)
     global_wait = _as_int(global_cfg.get("defaultQueueWaitSeconds"), _DEFAULT_QUEUE_WAIT_SECONDS)
+    global_request_body_bytes = _as_int(
+        global_cfg.get("defaultMaxRequestBodyBytes"),
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+        minimum=1,
+    )
+    global_request_body_events = _as_int(
+        global_cfg.get("defaultMaxRequestBodyEvents"),
+        DEFAULT_MAX_REQUEST_BODY_EVENTS,
+        minimum=1,
+    )
+    global_queued_body_bytes = _as_int(
+        global_cfg.get("defaultMaxQueuedBodyBytesPerKey"),
+        DEFAULT_MAX_QUEUED_BODY_BYTES_PER_KEY,
+        minimum=1,
+    )
+    max_queued_body_bytes_total = _as_int(
+        global_cfg.get("maxQueuedBodyBytesTotal"),
+        DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL,
+        minimum=1,
+    )
 
     entry = (cfg.get("apiKeys") or {}).get(key_name)
     limits = entry.get("limits") if isinstance(entry, dict) else None
@@ -148,11 +361,31 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         queue_wait = global_wait
         wait_source = "global"
 
+    max_request_body_bytes = _as_int(
+        limits.get("maxRequestBodyBytes"),
+        global_request_body_bytes,
+        minimum=1,
+    )
+    max_request_body_events = _as_int(
+        limits.get("maxRequestBodyEvents"),
+        global_request_body_events,
+        minimum=1,
+    )
+    max_queued_body_bytes = _as_int(
+        limits.get("maxQueuedBodyBytes"),
+        global_queued_body_bytes,
+        minimum=1,
+    )
+
     return ResolvedLimits(
         enabled=enabled,
         max_concurrent=max_concurrent,
         max_queue=max_queue,
         queue_wait_seconds=queue_wait,
+        max_request_body_bytes=max_request_body_bytes,
+        max_request_body_events=max_request_body_events,
+        max_queued_body_bytes=max_queued_body_bytes,
+        max_queued_body_bytes_total=max_queued_body_bytes_total,
         enabled_source=enabled_source,
         max_concurrent_source=max_source,
         max_queue_source=queue_source,
@@ -176,6 +409,8 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
     """占用一个 API Key 并发槽位；必要时进入 FIFO 队列。
 
     返回 ApiKeyLease，调用方必须在请求生命周期结束时 release。
+    Queue disconnect monitoring preserves every unread ``http.request`` event
+    and replays it to the route after admission.
     """
     key = str(key_name or "").strip()
     if not key:
@@ -192,6 +427,9 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
     async with slot.lock:
         slot.limits = _resolve_limits(key)
         limits = slot.limits
+        # Existing FIFO waiters get first claim on any newly available or
+        # hot-reloaded capacity before this fresh request may use the fast path.
+        _wake_eligible_waiters_locked(slot)
         if not limits.enabled:
             return ApiKeyLease(key, None, limits, noop=True)
         if limits.unlimited or slot.in_flight < limits.max_concurrent:
@@ -205,27 +443,86 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
         waiter = Waiter(future=fut, enqueued_at=time.monotonic())
         slot.waiters.append(waiter)
 
+    queue_deadline = start_wait + max(0, limits.queue_wait_seconds)
+    disconnect_request = request
     try:
-        await _wait_for_turn_or_abort(slot, waiter, request, limits.queue_wait_seconds)
+        await _wait_for_turn_or_abort(
+            slot,
+            waiter,
+            disconnect_request,
+            limits,
+            deadline=queue_deadline,
+        )
         queue_wait_ms = int((time.monotonic() - start_wait) * 1000)
-        # 被 release 唤醒后真正占位；若热加载导致仍无空位，则重新排队。
+        # A normal wake-up owns a reserved capacity slot.  Keeping that
+        # reservation in ``in_flight`` prevents a newly arriving request from
+        # barging ahead of the FIFO waiter before it reacquires ``slot.lock``.
         while True:
             async with slot.lock:
                 slot.limits = _resolve_limits(key)
                 limits = slot.limits
+                replay_guard = _request_receive_guard(disconnect_request)
+                if waiter.capacity_reserved:
+                    waiter.capacity_reserved = False
+                    if not limits.enabled:
+                        if slot.in_flight > 0:
+                            slot.in_flight -= 1
+                        _wake_eligible_waiters_locked(slot)
+                        return ApiKeyLease(
+                            key, None, limits, noop=True, replay_guard=replay_guard
+                        )
+                    if limits.unlimited:
+                        _wake_eligible_waiters_locked(slot)
+                    return ApiKeyLease(
+                        key,
+                        slot,
+                        limits,
+                        queue_wait_ms=queue_wait_ms,
+                        replay_guard=replay_guard,
+                    )
                 if not limits.enabled:
-                    return ApiKeyLease(key, None, limits, noop=True)
-                if limits.unlimited or slot.in_flight < limits.max_concurrent:
+                    _wake_eligible_waiters_locked(slot)
+                    return ApiKeyLease(
+                        key, None, limits, noop=True, replay_guard=replay_guard
+                    )
+                if limits.unlimited:
                     slot.in_flight += 1
-                    return ApiKeyLease(key, slot, limits, queue_wait_ms=queue_wait_ms)
+                    _wake_eligible_waiters_locked(slot)
+                    return ApiKeyLease(
+                        key,
+                        slot,
+                        limits,
+                        queue_wait_ms=queue_wait_ms,
+                        replay_guard=replay_guard,
+                    )
+                if slot.in_flight < limits.max_concurrent:
+                    slot.in_flight += 1
+                    return ApiKeyLease(
+                        key,
+                        slot,
+                        limits,
+                        queue_wait_ms=queue_wait_ms,
+                        replay_guard=replay_guard,
+                    )
                 if limits.max_queue <= 0 or len(slot.waiters) >= limits.max_queue:
                     raise _queue_full_error(key, slot)
                 fut = asyncio.get_event_loop().create_future()
                 waiter = Waiter(future=fut, enqueued_at=time.monotonic())
                 slot.waiters.append(waiter)
-            await _wait_for_turn_or_abort(slot, waiter, request, limits.queue_wait_seconds)
+            await _wait_for_turn_or_abort(
+                slot,
+                waiter,
+                disconnect_request,
+                limits,
+                deadline=queue_deadline,
+            )
     except BaseException:
-        await _drop_waiter(slot, waiter)
+        try:
+            await _drop_waiter(slot, waiter)
+        finally:
+            replay_guard = _request_receive_guard(disconnect_request)
+            if replay_guard is not None:
+                await replay_guard.abandon()
         raise
 
 
@@ -233,57 +530,133 @@ async def _wait_for_turn_or_abort(
     slot: ApiKeySlot,
     waiter: Waiter,
     request: Request | None,
-    timeout_seconds: int,
+    limits: ResolvedLimits,
+    *,
+    deadline: float | None = None,
 ) -> None:
+    timeout_seconds = limits.queue_wait_seconds
+    if deadline is None:
+        deadline = time.monotonic() + max(0, timeout_seconds)
+    remaining_seconds = max(0.0, deadline - time.monotonic())
     wait_items: list[asyncio.Future | asyncio.Task] = [waiter.future]
     timeout_task: asyncio.Task | None = None
     disconnect_task: asyncio.Task | None = None
-    if timeout_seconds <= 0:
+    limits_task: asyncio.Task | None = None
+    if remaining_seconds <= 0:
         await _drop_waiter(slot, waiter)
         raise _timeout_error(slot.key_name, slot, timeout_seconds)
-    timeout_task = asyncio.create_task(asyncio.sleep(timeout_seconds))
+    timeout_task = asyncio.create_task(asyncio.sleep(remaining_seconds))
     wait_items.append(timeout_task)
+    limits_task = asyncio.create_task(_wait_for_limit_relaxation(slot))
+    wait_items.append(limits_task)
     if request is not None:
-        disconnect_task = asyncio.create_task(_wait_http_disconnect(request))
+        disconnect_task = asyncio.create_task(
+            _wait_http_disconnect(request, slot.key_name, limits)
+        )
         wait_items.append(disconnect_task)
 
     try:
         done, _pending = await asyncio.wait(wait_items, return_when=asyncio.FIRST_COMPLETED)
-        if waiter.future in done:
-            return
-        await _drop_waiter(slot, waiter)
         if disconnect_task is not None and disconnect_task in done:
+            await _drop_waiter(slot, waiter)
+            disconnect_error = disconnect_task.exception()
+            if disconnect_error is not None:
+                raise disconnect_error
             raise ApiKeyLimitError(
                 f"API key '{slot.key_name}' queued request was cancelled because the client disconnected.",
                 reason="client_disconnected",
             )
+        if waiter.future in done:
+            return
+        await _drop_waiter(slot, waiter)
         raise _timeout_error(slot.key_name, slot, timeout_seconds)
     finally:
-        for item in wait_items:
-            if item is not waiter.future and not item.done():
-                item.cancel()
+        background_tasks = [
+            item for item in wait_items
+            if item is not waiter.future and isinstance(item, asyncio.Task)
+        ]
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        if background_tasks:
+            cleanup_results = await asyncio.gather(
+                *background_tasks, return_exceptions=True
+            )
+            # A watcher cancelled by admission may have already consumed an
+            # event whose reservation then exceeded a budget.  Do not hide it.
+            for result in cleanup_results:
+                if isinstance(result, RequestBodyTooLarge):
+                    raise result
 
 
-async def _wait_http_disconnect(request: Request) -> None:
+async def _wait_http_disconnect(
+    request: Request,
+    key_name: str,
+    limits: ResolvedLimits,
+) -> None:
+    guard = _body_preserving_receive(request, key_name, limits)
+    try:
+        await guard.wait_for_disconnect()
+    except RequestBodyTooLarge:
+        raise
+    except Exception:
+        # A closed/broken ASGI receive channel is equivalent to disconnect.
+        return
+
+
+def _pop_next_waiter_locked(slot: ApiKeySlot) -> Waiter | None:
+    while slot.waiters:
+        waiter = slot.waiters.pop(0)
+        if not waiter.future.done():
+            return waiter
+    return None
+
+
+def _wake_all_waiters_locked(slot: ApiKeySlot) -> None:
+    """Wake every waiter without reserving finite capacity."""
     while True:
-        try:
-            if await request.is_disconnected():
-                return
-        except Exception:
+        waiter = _pop_next_waiter_locked(slot)
+        if waiter is None:
             return
-        await asyncio.sleep(1.0)
+        waiter.future.set_result(None)
+
+
+def _wake_eligible_waiters_locked(slot: ApiKeySlot) -> None:
+    """Wake bypassed waiters or reserve each newly available finite slot."""
+    limits = slot.limits
+    if not limits.enabled or limits.unlimited:
+        _wake_all_waiters_locked(slot)
+        return
+    available = max(0, limits.max_concurrent - slot.in_flight)
+    while available > 0:
+        waiter = _pop_next_waiter_locked(slot)
+        if waiter is None:
+            return
+        waiter.capacity_reserved = True
+        slot.in_flight += 1
+        available -= 1
+        waiter.future.set_result(None)
+
+
+async def _wait_for_limit_relaxation(slot: ApiKeySlot) -> None:
+    """Poll config while queued so hot-disable/unlimited changes wake waiters."""
+    while True:
+        await asyncio.sleep(0.5)
+        try:
+            latest = _resolve_limits(slot.key_name)
+        except Exception:
+            continue
+        async with slot.lock:
+            slot.limits = latest
+            _wake_eligible_waiters_locked(slot)
 
 
 async def _release_slot(slot: ApiKeySlot) -> None:
     async with slot.lock:
+        slot.limits = _resolve_limits(slot.key_name)
         if slot.in_flight > 0:
             slot.in_flight -= 1
-        while slot.waiters:
-            waiter = slot.waiters.pop(0)
-            fut = waiter.future
-            if not fut.done():
-                fut.set_result(None)
-                break
+        _wake_eligible_waiters_locked(slot)
 
 
 async def _drop_waiter(slot: ApiKeySlot, waiter: Waiter) -> None:
@@ -292,6 +665,12 @@ async def _drop_waiter(slot: ApiKeySlot, waiter: Waiter) -> None:
             slot.waiters.remove(waiter)
         except ValueError:
             pass
+        if waiter.capacity_reserved:
+            waiter.capacity_reserved = False
+            if slot.in_flight > 0:
+                slot.in_flight -= 1
+            slot.limits = _resolve_limits(slot.key_name)
+            _wake_eligible_waiters_locked(slot)
     if not waiter.future.done():
         waiter.future.cancel()
 
@@ -326,7 +705,7 @@ def _headers(slot: ApiKeySlot | None, queue_wait_ms: int = 0) -> dict[str, str]:
 
 def attach_release_to_response(response: Response, lease: ApiKeyLease) -> Response:
     """把 lease 释放绑定到响应体发送结束；StreamingResponse 支持客户端断开释放。"""
-    if lease.noop or lease._released:
+    if lease._released or (lease.noop and lease._replay_guard is None):
         return response
     lease.attached_to_response = True
     for k, v in _headers(lease.slot, lease.queue_wait_ms).items():
