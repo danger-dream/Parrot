@@ -869,10 +869,17 @@ async def open_response_with_proxy_chain(
     upstream_req,
     deadline_ts: float,
     connect_timeout: int,
+    first_byte_timeout: int,
     request_id: str,
     retry_attempt_id: int | None,
 ) -> OpenedHttpResponse:
-    """Open upstream HTTP response headers, retrying only pre-header proxy failures."""
+    """Open upstream HTTP response headers, retrying only pre-header proxy failures.
+
+    ``httpx`` only applies its connect timeout to pool/TCP/TLS setup.  Entering a
+    streaming response context also waits for response headers, so cap that wait
+    with the first-byte timeout as well.  Otherwise an upstream that accepts the
+    socket but never sends headers can occupy the request until the total timeout.
+    """
     route_chain, route_error = _resolve_http_route_chain(channel, resolved_model)
     if route_error is not None:
         return OpenedHttpResponse(error=route_error)
@@ -965,22 +972,54 @@ async def open_response_with_proxy_chain(
             )
             continue
 
-        enter_timeout = max(1.0, deadline_ts - time.time())
-        try:
-            upstream_resp = await asyncio.wait_for(ctx.__aenter__(), timeout=enter_timeout)
-        except asyncio.TimeoutError:
+        remaining_total = deadline_ts - time.time()
+        if remaining_total <= 0:
+            await close_response_context(ctx)
             await close_proxy_client(proxy_client)
+            elapsed_ms = int((time.time() - t_send) * 1000)
             last_pre_header = _attempt_result(
                 "total_timeout",
-                f"total timeout during connect/headers (> {int(enter_timeout)}s)",
+                "total timeout before waiting for response headers",
                 bucket=proxy_bytes,
                 proxy_name=proxy_name_used,
             )
+            last_pre_header.connect_ms = elapsed_ms
+            return OpenedHttpResponse(error=last_pre_header)
+
+        header_wait_timeout = min(float(first_byte_timeout), remaining_total)
+        timeout_outcome = (
+            "total_timeout"
+            if remaining_total <= float(first_byte_timeout)
+            else "first_byte_timeout"
+        )
+        try:
+            upstream_resp = await asyncio.wait_for(
+                ctx.__aenter__(),
+                timeout=max(0.001, header_wait_timeout),
+            )
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.time() - t_send) * 1000)
+            await close_response_context(ctx)
+            await close_proxy_client(proxy_client)
+            if timeout_outcome == "total_timeout":
+                detail = f"total timeout during connect/headers (> {header_wait_timeout:g}s)"
+            else:
+                detail = (
+                    f"first byte timeout > {first_byte_timeout}s "
+                    "while waiting for response headers"
+                )
+            last_pre_header = _attempt_result(
+                timeout_outcome,
+                detail,
+                bucket=proxy_bytes,
+                proxy_name=proxy_name_used,
+            )
+            last_pre_header.connect_ms = elapsed_ms
             if proxy_attempt_id is not None:
                 try:
                     log_db.update_proxy_attempt(
                         proxy_attempt_id,
-                        connect_ms=int((time.time() - t_send) * 1000),
+                        connect_ms=elapsed_ms,
                         ended_at=time.time(),
                         outcome=last_pre_header.outcome,
                         error_detail=(last_pre_header.error_detail or "")[:4000],

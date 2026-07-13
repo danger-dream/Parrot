@@ -2744,6 +2744,7 @@ async def _try_channel(
         upstream_req=upstream_req,
         deadline_ts=deadline_ts,
         connect_timeout=connect_timeout,
+        first_byte_timeout=first_byte_timeout,
         request_id=request_id,
         retry_attempt_id=retry_attempt_id,
     )
