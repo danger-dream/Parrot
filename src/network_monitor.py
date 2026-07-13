@@ -141,6 +141,10 @@ def update_settings(mutator) -> None:
         except Exception:
             mon["intervalSeconds"] = 60
     config.update(_mut)
+    # monitor_loop intentionally skips run_once() while disabled, so it cannot
+    # perform run_once's stale-row cleanup after the master switch is turned off.
+    if not cfg().get("enabled", True):
+        state_db.network_check_delete_stale(set())
 
 
 def set_channel_enabled(channel_key: str, enabled: bool) -> None:
@@ -228,9 +232,26 @@ def _dns_check(timeout: float) -> CheckResult:
 
 
 async def _socks5_check(timeout: float) -> CheckResult:
+    targets: list[tuple[str, str]] = []
+
+    # Legacy global SOCKS5 setting.
     s5 = network.socks5_cfg()
     raw = str(s5.get("url") or "").strip()
-    if not (bool(s5.get("enabled")) and raw):
+    if bool(s5.get("enabled")) and raw:
+        targets.append(("全局", raw))
+
+    # Named proxies used by account/channel/model routing.
+    net = config.get().get("network") or {}
+    for name, proxy_cfg in (net.get("proxies") or {}).items():
+        if not isinstance(proxy_cfg, dict):
+            continue
+        if str(proxy_cfg.get("type") or "").strip().lower() != "socks5":
+            continue
+        url = str(proxy_cfg.get("url") or "").strip()
+        if url:
+            targets.append((str(name), url))
+
+    if not targets:
         return CheckResult(
             key="socks5",
             label="SOCKS5 代理",
@@ -238,29 +259,29 @@ async def _socks5_check(timeout: float) -> CheckResult:
             ok=False,
             detail="SOCKS5 未配置或未启用",
         )
-    try:
-        norm = network.normalize_socks5_url(raw)
-    except Exception as exc:
-        return CheckResult("socks5", "SOCKS5 代理", "socks5", False, f"配置错误: {exc}")
+
     t0 = time.time()
-    try:
-        if not network._is_ip_literal(norm.host) and norm.host != "localhost":
-            network.resolve_host(norm.host, timeout=timeout, use_cache=False)
-        async with httpx.AsyncClient(
-            proxy=norm.url,
-            trust_env=False,
-            http2=False,
-            timeout=httpx.Timeout(connect=timeout, read=timeout, write=timeout, pool=timeout),
-            follow_redirects=False,
-        ) as client:
-            resp = await client.get(_SOCKS5_TEST_URL, headers={"User-Agent": "parrot-network-monitor/0.1"})
-            ok = resp.status_code < 500
-            detail = "" if ok else f"HTTP {resp.status_code}"
-    except Exception as exc:
-        ok = False
-        detail = str(exc)[:180]
+    failures: list[str] = []
+    for name, url in targets:
+        try:
+            norm = network.normalize_socks5_url(url)
+            if not network._is_ip_literal(norm.host) and norm.host != "localhost":
+                network.resolve_host(norm.host, timeout=timeout, use_cache=False)
+            async with httpx.AsyncClient(
+                proxy=norm.url,
+                trust_env=False,
+                http2=False,
+                timeout=httpx.Timeout(connect=timeout, read=timeout, write=timeout, pool=timeout),
+                follow_redirects=False,
+            ) as client:
+                resp = await client.get(_SOCKS5_TEST_URL, headers={"User-Agent": "parrot-network-monitor/0.1"})
+                if resp.status_code >= 500:
+                    failures.append(f"{name}: HTTP {resp.status_code}")
+        except Exception as exc:
+            failures.append(f"{name}: {str(exc)[:120]}")
     latency = int((time.time() - t0) * 1000)
-    return CheckResult("socks5", "SOCKS5 代理", "socks5", ok, detail, latency)
+    detail = "; ".join(failures[:4])
+    return CheckResult("socks5", "SOCKS5 代理", "socks5", not failures, detail, latency)
 
 
 def _tcp_connect(host: str, port: int, timeout: float) -> int:
