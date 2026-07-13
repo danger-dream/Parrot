@@ -62,6 +62,60 @@ def test_state_and_summary(m):
     assert nm.active_summary() is None
 
 
+def test_disabling_monitor_clears_persisted_banner(m):
+    st = m["state_db"]
+    nm = m["network_monitor"]
+    st.init()
+    st.network_check_save({
+        "key": "socks5",
+        "label": "SOCKS5 代理",
+        "category": "socks5",
+        "ok": False,
+        "detail": "old failure",
+        "latency_ms": None,
+        "checked_at": 1,
+    })
+    assert nm.active_summary() is not None
+    nm.update_settings(lambda mon: mon.__setitem__("enabled", False))
+    assert nm.active_summary() is None
+
+
+def test_socks5_check_recognizes_named_proxy(m, monkeypatch):
+    import asyncio
+
+    nm = m["network_monitor"]
+    cfg = m["config"]
+
+    def _set(c):
+        net = c.setdefault("network", {})
+        net["socks5"] = {"enabled": False, "url": ""}
+        net["proxies"] = {
+            "ipv6-1": {"type": "socks5", "url": "socks5://127.0.0.1:52081"},
+        }
+    cfg.update(_set)
+
+    class _Response:
+        status_code = 200
+
+    class _Client:
+        def __init__(self, **kwargs):
+            assert kwargs["proxy"] == "socks5://127.0.0.1:52081"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return _Response()
+
+    monkeypatch.setattr(nm.httpx, "AsyncClient", _Client)
+    result = asyncio.run(nm._socks5_check(5))
+    assert result.ok is True
+    assert result.detail == ""
+
+
 # ─── 新增：core 检测家族过滤 + 孤儿渠道清理 ──────────────────
 
 def _import_modules_for_family():
