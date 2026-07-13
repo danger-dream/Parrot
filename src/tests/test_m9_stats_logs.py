@@ -828,13 +828,17 @@ def test_proxy_routing_priority_and_legacy_socks5(m):
             "oauth_openai": "p2",
             "models": {"gpt-x": "p1"},
             "channels": {"oauth:openai:a:old": "p2"},
-            "accounts": {"openai:a:new": "g"},
+            "accounts": {
+                "openai:a:new": "g",
+                "oauth:openai:a:fallback": "p2",
+            },
         }
     cfg.update(add_proxy_config)
     pm.init()
     assert pm.is_configured() is True
     assert pm.resolve_proxy_target(account_key="openai:a:new", channel_key="oauth:openai:a:old", model="gpt-x") == "g"
     assert pm.resolve_proxy_chain(account_key="openai:a:new", channel_key="oauth:openai:a:old", model="gpt-x") == ["p1", "direct"]
+    assert pm.resolve_proxy_target(account_key="openai:a:missing", channel_key="oauth:openai:a:fallback", model="gpt-x") == "p2"
     assert pm.resolve_proxy_target(channel_key="oauth:openai:a:old", model="gpt-x") == "p2"
     assert pm.resolve_proxy_target(model="gpt-x") == "p1"
     assert pm.resolve_proxy_target(purpose="oauth_openai") == "p2"

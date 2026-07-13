@@ -148,9 +148,15 @@ def resolve_proxy_target(*, channel_key: str = "", model: str = "",
 
     # 1. Account/channel-level override (same priority; account wins ties)
     acct_routes = r.get("accounts") or {}
-    acct_key = account_key or channel_key
-    if acct_key and acct_key in acct_routes:
-        return acct_routes[acct_key]
+    if account_key and account_key in acct_routes:
+        return acct_routes[account_key]
+    # The Telegram account-routing UI stores OAuth channel keys (``oauth:...``),
+    # while transports also pass the provider account key (without that prefix).
+    # Account keys still win when both routes exist, but a missing account-key
+    # route must fall back to the saved channel key instead of silently going
+    # direct.
+    if channel_key and channel_key in acct_routes:
+        return acct_routes[channel_key]
 
     # 1b. Channel-level override
     ch_routes = r.get("channels") or {}
