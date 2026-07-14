@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
@@ -100,7 +101,17 @@ _DNS_TARGETS = (
 )
 
 _SOCKS5_TEST_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+_SOCKS5_MAX_CONCURRENCY = 4
+_SOCKS5_ROUND_DEADLINE_FACTOR = 2.0
+_SOCKS5_MIN_ROUND_DEADLINE_SECONDS = 0.1
 _loop_task: asyncio.Task | None = None
+
+# Settings are changed by synchronous Telegram handlers, while the background
+# loop and manual ``asyncio.run`` calls may use different event loops/threads.
+# A process-wide threading lock therefore protects the generation check and the
+# synchronous save/notify commit as one linearizable critical section.
+_monitor_lifecycle_lock = threading.RLock()
+_monitor_generation = 0
 
 
 def cfg() -> dict:
@@ -133,6 +144,8 @@ def _monitor_cfg_mut(c: dict) -> dict:
 
 
 def update_settings(mutator) -> None:
+    global _monitor_generation
+
     def _mut(c: dict) -> None:
         mon = _monitor_cfg_mut(c)
         mutator(mon)
@@ -140,11 +153,24 @@ def update_settings(mutator) -> None:
             mon["intervalSeconds"] = max(5, int(mon.get("intervalSeconds", 60) or 60))
         except Exception:
             mon["intervalSeconds"] = 60
-    config.update(_mut)
-    # monitor_loop intentionally skips run_once() while disabled, so it cannot
-    # perform run_once's stale-row cleanup after the master switch is turned off.
-    if not cfg().get("enabled", True):
-        state_db.network_check_delete_stale(set())
+
+    with _monitor_lifecycle_lock:
+        config.update(_mut)
+        # Every successful monitor settings update invalidates rounds that
+        # captured an older configuration. In particular, disable followed by
+        # re-enable advances twice, so an old round can never match the new era.
+        _monitor_generation += 1
+        # monitor_loop skips run_once() while disabled, so clear persisted rows
+        # here. The configuration write already succeeded; cleanup is strictly
+        # best-effort and must not turn a successful UI toggle into a failure.
+        if not cfg().get("enabled", True):
+            try:
+                state_db.network_check_delete_stale(set())
+            except Exception as exc:
+                print(
+                    "[network_monitor] disabled-state cleanup failed: "
+                    f"{type(exc).__name__}"
+                )
 
 
 def set_channel_enabled(channel_key: str, enabled: bool) -> None:
@@ -231,6 +257,13 @@ def _dns_check(timeout: float) -> CheckResult:
     )
 
 
+def _safe_socks5_error(exc: Exception) -> str:
+    """Return a useful error category without echoing proxy URLs/credentials."""
+    if isinstance(exc, TimeoutError):
+        return "超时"
+    return type(exc).__name__
+
+
 async def _socks5_check(timeout: float) -> CheckResult:
     targets: list[tuple[str, str]] = []
 
@@ -260,25 +293,84 @@ async def _socks5_check(timeout: float) -> CheckResult:
             detail="SOCKS5 未配置或未启用",
         )
 
+    per_probe_timeout = max(0.01, float(timeout))
+    round_deadline = max(
+        _SOCKS5_MIN_ROUND_DEADLINE_SECONDS,
+        per_probe_timeout * _SOCKS5_ROUND_DEADLINE_FACTOR,
+    )
+    semaphore = asyncio.Semaphore(_SOCKS5_MAX_CONCURRENCY)
+
+    async def _probe(index: int, url: str) -> tuple[int, str | None]:
+        async with semaphore:
+            try:
+                norm = network.normalize_socks5_url(url)
+                # AsyncClient resolves and connects to the proxy as part of this
+                # cancellable operation; a separate synchronous pre-resolution
+                # would escape the round deadline and block the event loop.
+                async with httpx.AsyncClient(
+                    proxy=norm.url,
+                    trust_env=False,
+                    http2=False,
+                    timeout=httpx.Timeout(
+                        connect=per_probe_timeout,
+                        read=per_probe_timeout,
+                        write=per_probe_timeout,
+                        pool=per_probe_timeout,
+                    ),
+                    follow_redirects=False,
+                ) as client:
+                    resp = await client.get(
+                        _SOCKS5_TEST_URL,
+                        headers={"User-Agent": "parrot-network-monitor/0.1"},
+                    )
+                    if resp.status_code >= 500:
+                        return index, f"HTTP {resp.status_code}"
+                return index, None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return index, _safe_socks5_error(exc)
+
+    tasks: list[asyncio.Task] = []
+    task_indexes: dict[asyncio.Task, int] = {}
+    for index, (_name, url) in enumerate(targets):
+        task = asyncio.create_task(
+            _probe(index, url),
+            name=f"network-monitor-socks5-{index}",
+        )
+        tasks.append(task)
+        task_indexes[task] = index
+
     t0 = time.time()
-    failures: list[str] = []
-    for name, url in targets:
-        try:
-            norm = network.normalize_socks5_url(url)
-            if not network._is_ip_literal(norm.host) and norm.host != "localhost":
-                network.resolve_host(norm.host, timeout=timeout, use_cache=False)
-            async with httpx.AsyncClient(
-                proxy=norm.url,
-                trust_env=False,
-                http2=False,
-                timeout=httpx.Timeout(connect=timeout, read=timeout, write=timeout, pool=timeout),
-                follow_redirects=False,
-            ) as client:
-                resp = await client.get(_SOCKS5_TEST_URL, headers={"User-Agent": "parrot-network-monitor/0.1"})
-                if resp.status_code >= 500:
-                    failures.append(f"{name}: HTTP {resp.status_code}")
-        except Exception as exc:
-            failures.append(f"{name}: {str(exc)[:120]}")
+    failures_by_index: dict[int, str] = {}
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=round_deadline)
+        for task in done:
+            index = task_indexes[task]
+            if task.cancelled():
+                failures_by_index[index] = "已取消"
+                continue
+            try:
+                _index, error = task.result()
+            except Exception as exc:
+                error = _safe_socks5_error(exc)
+            if error:
+                failures_by_index[index] = error
+        for task in pending:
+            failures_by_index[task_indexes[task]] = "整轮超时"
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Consume every result/cancellation before returning or propagating an
+        # outer cancellation, so probes cannot survive their monitoring round.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    failures = [
+        f"{name}: {failures_by_index[index]}"
+        for index, (name, _url) in enumerate(targets)
+        if index in failures_by_index
+    ]
     latency = int((time.time() - t0) * 1000)
     detail = "; ".join(failures[:4])
     return CheckResult("socks5", "SOCKS5 代理", "socks5", not failures, detail, latency)
@@ -356,14 +448,30 @@ def _core_check(name: str, timeout: float) -> CheckResult:
 
 
 async def run_once(*, save: bool = True) -> list[CheckResult]:
-    c = cfg()
+    if save:
+        # Capture settings and generation atomically relative to update_settings.
+        with _monitor_lifecycle_lock:
+            c = cfg()
+            round_generation: int | None = _monitor_generation
+    else:
+        c = cfg()
+        round_generation = None
+
     if not c.get("enabled", True):
         # 总开关关了：清掉 state.db 里所有遗留状态，避免主菜单 banner 永久红
         if save:
-            try:
-                state_db.network_check_delete_stale(set())
-            except Exception as exc:
-                print(f"[network_monitor] stale cleanup failed: {exc}")
+            with _monitor_lifecycle_lock:
+                if (
+                    round_generation == _monitor_generation
+                    and not cfg().get("enabled", True)
+                ):
+                    try:
+                        state_db.network_check_delete_stale(set())
+                    except Exception as exc:
+                        print(
+                            "[network_monitor] stale cleanup failed: "
+                            f"{type(exc).__name__}"
+                        )
         return []
     timeout = float(c.get("timeoutSeconds", 5) or 5)
     out: list[CheckResult] = []
@@ -408,14 +516,27 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
         out.append(await asyncio.to_thread(_core_check, name, timeout))
 
     if save:
-        for res in out:
-            _save_result(res)
-        # 清掉 state.db 里所有不在本轮 expected_keys 中的残留
-        # 覆盖场景：删 OAuth 账户、删 API 渠道、关单项检测、关总开关
-        try:
-            state_db.network_check_delete_stale(expected_keys)
-        except Exception as exc:
-            print(f"[network_monitor] stale cleanup failed: {exc}")
+        # This lock closes the check-then-commit TOCTOU window. Whichever side
+        # enters first is linearized first: either the complete save/notify
+        # commit happens before the settings update, or the generation changes
+        # and this old round performs no externally visible commit at all.
+        with _monitor_lifecycle_lock:
+            if (
+                round_generation != _monitor_generation
+                or not cfg().get("enabled", True)
+            ):
+                return out
+            for res in out:
+                _save_result(res)
+            # 清掉 state.db 里所有不在本轮 expected_keys 中的残留
+            # 覆盖场景：删 OAuth 账户、删 API 渠道、关单项检测、关总开关
+            try:
+                state_db.network_check_delete_stale(expected_keys)
+            except Exception as exc:
+                print(
+                    "[network_monitor] stale cleanup failed: "
+                    f"{type(exc).__name__}"
+                )
     return out
 
 

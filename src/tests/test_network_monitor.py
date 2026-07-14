@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+import copy as _ap_copy
 import os as _ap_os
 import sys as _ap_sys
+
+import pytest
+
 _ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(
     _ap_os.path.dirname(_ap_os.path.abspath(__file__))
 )))
 from src.tests import _isolation
 _isolation.isolate()
+
+
+@pytest.fixture(autouse=True)
+def _restore_network_config_after_test():
+    """Prevent monitor/proxy config mutations from leaking across test files."""
+    from src import config
+
+    before = _ap_copy.deepcopy(config.get().get("network"))
+    yield
+
+    def _restore(c):
+        if before is None:
+            c.pop("network", None)
+        else:
+            c["network"] = _ap_copy.deepcopy(before)
+
+    config.update(_restore)
 
 
 def _import_modules():
@@ -114,6 +135,251 @@ def test_socks5_check_recognizes_named_proxy(m, monkeypatch):
     result = asyncio.run(nm._socks5_check(5))
     assert result.ok is True
     assert result.detail == ""
+
+
+def test_disable_and_reenable_rejects_old_generation(m, monkeypatch):
+    import asyncio
+
+    nm = m["network_monitor"]
+    st = m["state_db"]
+    st.init()
+    st.network_check_delete_stale(set())
+
+    def _enable(mon):
+        mon.update({
+            "enabled": True,
+            "dns": False,
+            "socks5": True,
+            "channels": {"enabled": False, "byKey": {}},
+            "core": {"openai": False, "claude": False, "cloudflare": False},
+            "timeoutSeconds": 1,
+        })
+
+    nm.update_settings(_enable)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    notifications = []
+
+    async def _blocked_check(_timeout):
+        started.set()
+        await release.wait()
+        return nm.CheckResult("socks5", "SOCKS5 代理", "socks5", False, "old")
+
+    monkeypatch.setattr(nm, "_socks5_check", _blocked_check)
+    monkeypatch.setattr(
+        nm.notifier,
+        "notify_event",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    async def _case():
+        old_round = asyncio.create_task(nm.run_once(save=True))
+        await started.wait()
+        nm.update_settings(lambda mon: mon.__setitem__("enabled", False))
+        assert st.network_check_load("socks5") is None
+        nm.update_settings(lambda mon: mon.__setitem__("enabled", True))
+        release.set()
+        results = await old_round
+        assert len(results) == 1
+
+    asyncio.run(_case())
+    assert st.network_check_load("socks5") is None
+    assert notifications == []
+
+
+def test_disable_cleanup_failure_is_best_effort(m, monkeypatch, capsys):
+    nm = m["network_monitor"]
+    nm.update_settings(lambda mon: mon.__setitem__("enabled", True))
+
+    def _fail_cleanup(_live_keys):
+        raise RuntimeError("socks5://user:super-secret@example.test:1080")
+
+    monkeypatch.setattr(nm.state_db, "network_check_delete_stale", _fail_cleanup)
+    nm.update_settings(lambda mon: mon.__setitem__("enabled", False))
+
+    assert nm.cfg()["enabled"] is False
+    output = capsys.readouterr().out
+    assert "disabled-state cleanup failed: RuntimeError" in output
+    assert "super-secret" not in output
+    assert "socks5://" not in output
+
+
+def test_socks5_check_is_bounded_and_aggregates_safe_errors(m, monkeypatch):
+    import asyncio
+
+    nm = m["network_monitor"]
+    cfg = m["config"]
+
+    def _set(c):
+        net = c.setdefault("network", {})
+        net["socks5"] = {
+            "enabled": True,
+            "url": "socks5://127.0.0.1:10000",
+        }
+        net["proxies"] = {
+            **{
+                f"named-{i}": {
+                    "type": "socks5",
+                    "url": f"socks5://127.0.0.1:{10001 + i}",
+                }
+                for i in range(5)
+            },
+            "secret-proxy": {
+                "type": "socks5",
+                "url": "socks5://user:super-secret@127.0.0.1:10009",
+            },
+        }
+
+    cfg.update(_set)
+    active = 0
+    max_active = 0
+    seen = []
+    first_batch_full = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    class _Client:
+        def __init__(self, **kwargs):
+            self.proxy = kwargs["proxy"]
+            assert kwargs["trust_env"] is False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            seen.append(self.proxy)
+            if active == nm._SOCKS5_MAX_CONCURRENCY:
+                first_batch_full.set()
+            try:
+                await release.wait()
+                if "super-secret" in self.proxy:
+                    raise RuntimeError(f"failed via {self.proxy}")
+                return _Response(503 if self.proxy.endswith(":10004") else 200)
+            finally:
+                active -= 1
+
+    monkeypatch.setattr(nm.httpx, "AsyncClient", _Client)
+
+    async def _case():
+        check = asyncio.create_task(nm._socks5_check(1))
+        await asyncio.wait_for(first_batch_full.wait(), timeout=1)
+        assert active == nm._SOCKS5_MAX_CONCURRENCY
+        release.set()
+        result = await asyncio.wait_for(check, timeout=1)
+        leftovers = [
+            task for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and task.get_name().startswith("network-monitor-socks5-")
+        ]
+        return result, leftovers
+
+    result, leftovers = asyncio.run(_case())
+    assert max_active == nm._SOCKS5_MAX_CONCURRENCY
+    assert len(seen) == 7  # legacy global plus six named proxies
+    assert result.ok is False
+    assert "named-3: HTTP 503" in result.detail
+    assert "secret-proxy: RuntimeError" in result.detail
+    assert "super-secret" not in result.detail
+    assert "socks5://" not in result.detail
+    assert active == 0
+    assert leftovers == []
+
+
+def test_socks5_round_deadline_and_cancellation_leave_no_tasks(m, monkeypatch):
+    import asyncio
+    import time
+
+    nm = m["network_monitor"]
+    cfg = m["config"]
+
+    def _set(c):
+        net = c.setdefault("network", {})
+        net["socks5"] = {"enabled": False, "url": ""}
+        net["proxies"] = {
+            f"slow-{i}": {
+                "type": "socks5",
+                "url": f"socks5://127.0.0.1:{11000 + i}",
+            }
+            for i in range(6)
+        }
+
+    cfg.update(_set)
+    monkeypatch.setattr(nm, "_SOCKS5_ROUND_DEADLINE_FACTOR", 1.0)
+    monkeypatch.setattr(nm, "_SOCKS5_MIN_ROUND_DEADLINE_SECONDS", 0.02)
+    active = 0
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            nonlocal active
+            active += 1
+            entered.set()
+            try:
+                await never.wait()
+            finally:
+                active -= 1
+
+    monkeypatch.setattr(nm.httpx, "AsyncClient", _Client)
+
+    async def _probe_tasks():
+        return [
+            task for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and task.get_name().startswith("network-monitor-socks5-")
+        ]
+
+    async def _deadline_case():
+        started_at = time.monotonic()
+        result = await nm._socks5_check(0.02)
+        elapsed = time.monotonic() - started_at
+        return result, elapsed, await _probe_tasks()
+
+    result, elapsed, leftovers = asyncio.run(_deadline_case())
+    assert result.ok is False
+    assert "slow-0: 整轮超时" in result.detail
+    assert elapsed < 0.5
+    assert active == 0
+    assert leftovers == []
+
+    # Also exercise caller cancellation, which must run the same cancel+gather
+    # cleanup path instead of leaving proxy tasks behind.
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def _cancel_case():
+        check = asyncio.create_task(nm._socks5_check(5))
+        await entered.wait()
+        check.cancel()
+        try:
+            await check
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled SOCKS5 round did not propagate cancellation")
+        return await _probe_tasks()
+
+    leftovers = asyncio.run(_cancel_case())
+    assert active == 0
+    assert leftovers == []
 
 
 # ─── 新增：core 检测家族过滤 + 孤儿渠道清理 ──────────────────
