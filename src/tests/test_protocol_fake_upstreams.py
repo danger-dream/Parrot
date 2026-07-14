@@ -28,6 +28,7 @@ import time
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 
 def _import_modules():
@@ -1085,6 +1086,154 @@ async def test_anthropic_client_to_openai_responses_stream_fake_upstream(m):
     assert '"type":"content_block_delta"' in text
     assert '"text":"responses stream pong"' in text
     assert '"stop_reason":"end_turn"' in text
+
+
+async def test_anthropic_messages_stream_invalid_image_http_400_short_circuits(m):
+    _setup(m)
+    router = MockRouter()
+    fallback_calls = {"count": 0}
+
+    def invalid_image_handler(req: httpx.Request):
+        assert str(req.url) == "https://invalid-image.example/v1/responses"
+        return httpx.Response(400, json={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "param": "input",
+                "message": "Invalid image data: expected a base64-encoded image.",
+            }
+        })
+
+    def fallback_handler(req: httpx.Request):
+        fallback_calls["count"] += 1
+        return _responses_sse_response("must not fail over")
+
+    router.register("https://invalid-image.example", invalid_image_handler)
+    router.register("https://invalid-image-fallback.example", fallback_handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "invalid-image",
+            "https://invalid-image.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+        _make_openai_channel(
+            "invalid-image-fallback",
+            "https://invalid-image-fallback.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "invalid image request"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert route.candidates[0][0].protocol == "openai-responses"
+    assert [str(req.url) for req in router.requests] == [
+        "https://invalid-image.example/v1/responses",
+    ]
+    assert fallback_calls["count"] == 0
+    assert resp.status_code == 400
+    assert resp.headers["content-type"].startswith("application/json")
+    assert b"event: error" not in resp.body
+    payload = json.loads(resp.body)
+    assert payload == {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Invalid image data: expected a base64-encoded image.",
+            "code": "invalid_value",
+        },
+    }
+
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, http_status, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    attempts = [dict(row) for row in conn.execute(
+        "SELECT channel_key, outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["http_status"] == 400
+    assert request_row["retry_count"] == 0
+    assert attempts == [{
+        "channel_key": route.candidates[0][0].key,
+        "outcome": "request_invalid",
+    }]
+    assert not m["cooldown"].is_blocked(route.candidates[0][0].key, "gpt-real")
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real") is None
+
+
+@pytest.mark.parametrize("status,error_type", [(429, "rate_limit_error"), (503, "server_error")])
+async def test_anthropic_messages_stream_retryable_http_errors_still_fail_over_and_cool_down(
+    m,
+    status,
+    error_type,
+):
+    _setup(m)
+    router = MockRouter()
+    bad_base = f"https://retryable-{status}.example"
+    good_base = f"https://retryable-{status}-fallback.example"
+
+    def bad_handler(req: httpx.Request):
+        return httpx.Response(status, json={
+            "error": {
+                "type": error_type,
+                "code": "temporarily_unavailable",
+                "message": "retry later",
+            }
+        })
+
+    router.register(bad_base, bad_handler)
+    router.register(good_base, lambda req: _responses_sse_response("retry succeeded"))
+    _install_channels(m, [
+        _make_openai_channel(
+            f"retryable-{status}", bad_base, protocol="openai-responses", alias="sonnet", real="gpt-real",
+        ),
+        _make_openai_channel(
+            f"retryable-{status}-fallback",
+            good_base,
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "retry succeeded" in text
+    assert [str(req.url) for req in router.requests] == [
+        f"{bad_base}/v1/responses",
+        f"{good_base}/v1/responses",
+    ]
+    conn = m["log_db"]._get_conn()
+    request_id = conn.execute(
+        "SELECT request_id FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_id,),
+    ).fetchall()]
+    assert outcomes == ["http_error", "success"]
+    assert m["cooldown"].is_blocked(route.candidates[0][0].key, "gpt-real")
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real")["total_requests"] == 1
 
 
 async def test_anthropic_client_to_openai_responses_stream_pre_visible_error_fails_over(m):

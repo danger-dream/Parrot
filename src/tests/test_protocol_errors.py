@@ -48,6 +48,45 @@ def test_extract_error_info_supports_wrapped_anthropic_and_openai_shapes():
     assert errors.extract_error_info({"message": "plain"}) == (None, "plain")
 
 
+def test_request_invalid_error_info_accepts_explicit_input_validation_shapes():
+    openai = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "invalid_value",
+            "param": "input",
+            "message": "Invalid image data.",
+        }
+    }
+    provider = {
+        "type": "invalid_request_error",
+        "code": "invalid_image",
+        "param": "messages[0].content[0]",
+        "message": "Image could not be decoded.",
+    }
+
+    assert errors.request_invalid_error_info(openai) == ("invalid_value", "Invalid image data.")
+    assert errors.request_invalid_error_info(provider) == ("invalid_image", "Image could not be decoded.")
+
+
+def test_request_invalid_error_info_fails_closed_for_channel_or_ambiguous_400_bodies():
+    assert errors.request_invalid_error_info({"message": "bad request"}) is None
+    assert errors.request_invalid_error_info({
+        "error": {
+            "type": "api_error",
+            "code": "upstream_rejected",
+            "message": "channel request was rejected",
+        }
+    }) is None
+    assert errors.request_invalid_error_info({
+        "error": {
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+            "param": "model",
+            "message": "configured upstream model does not exist",
+        }
+    }) is None
+
+
 def test_context_length_errors_are_formatted_for_claude_code_compact():
     code, message = errors.extract_error_info({
         "error": {

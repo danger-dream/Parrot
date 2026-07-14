@@ -1392,9 +1392,12 @@ async def run_failover(
                 protocol_errors.legacy_anthropic_error_type_for_http_status(status),
                 msg,
                 code=(
-                    protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-                    if _is_context_length_exceeded_error(msg)
-                    else None
+                    getattr(result, "error_code", None)
+                    or (
+                        protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                        if _is_context_length_exceeded_error(msg)
+                        else None
+                    )
                 ),
             )
 
@@ -1567,9 +1570,12 @@ async def run_failover(
                         protocol_errors.legacy_anthropic_error_type_for_http_status(status),
                         msg,
                         code=(
-                            protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-                            if _is_context_length_exceeded_error(msg)
-                            else None
+                            getattr(result, "error_code", None)
+                            or (
+                                protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                                if _is_context_length_exceeded_error(msg)
+                                else None
+                            )
                         ),
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支

@@ -186,6 +186,48 @@ def test_context_length_detector_does_not_swallow_tpm_rate_limits():
         assert out.http_status == 413, detail
 
 
+def test_structured_invalid_image_http_400_is_request_invalid_with_safe_code_message():
+    import src.failover as f
+
+    result = f.AttemptResult(
+        outcome="http_error",
+        http_status=400,
+        error_detail=(
+            'HTTP 400: {"error":{"type":"invalid_request_error",'
+            '"code":"invalid_value","param":"input",'
+            '"message":"Invalid image data: expected a base64-encoded image."}}'
+        ),
+    )
+
+    out = f._request_invalid_result_if_needed(result)
+    assert out.outcome == "request_invalid"
+    assert out.http_status == 400
+    assert out.error_code == "invalid_value"
+    assert out.error_detail == "Invalid image data: expected a base64-encoded image."
+    assert not f._should_cooldown(out.outcome)
+
+
+def test_structured_request_invalid_http_classification_keeps_retryable_and_ambiguous_errors():
+    import src.failover as f
+
+    cases = [
+        (429, '{"error":{"type":"invalid_request_error","code":"invalid_value","param":"input","message":"bad"}}'),
+        (503, '{"error":{"type":"invalid_request_error","code":"invalid_value","param":"input","message":"bad"}}'),
+        (400, '{"error":{"type":"api_error","code":"upstream_rejected","message":"channel failure"}}'),
+        (400, "not json"),
+    ]
+    for status, body in cases:
+        result = f.AttemptResult(
+            outcome="http_error",
+            http_status=status,
+            error_detail=f"HTTP {status}: {body}",
+        )
+        out = f._request_invalid_result_if_needed(result)
+        assert out.outcome == "http_error", (status, body)
+        assert out.http_status == status, (status, body)
+        assert f._should_cooldown(out.outcome), (status, body)
+
+
 def test_request_invalid_413_keeps_request_too_large_for_anthropic_ingress():
     import json
     import src.errors as errors

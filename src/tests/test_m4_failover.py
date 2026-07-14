@@ -1,7 +1,7 @@
 """M4 故障转移集成测试。
 
 使用 httpx.MockTransport 模拟上游行为，不触网。覆盖：
-  - 非流式成功 / HTTP 500 → 切换 / HTTP 400 → 切换但不 cooldown
+  - 非流式成功 / HTTP 500 → 切换 / 渠道语义 HTTP 400 → 切换并 cooldown
   - 流式成功完整转发
   - 上游首个 SSE event 是 error → 切换
   - 首包文本黑名单命中 → 切换
@@ -115,8 +115,15 @@ def http_500():
     return httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "oops"}})
 
 
-def http_400():
-    return httpx.Response(400, json={"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}})
+def http_channel_400():
+    return httpx.Response(400, json={
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "code": "upstream_rejected",
+            "message": "channel request was rejected",
+        },
+    })
 
 
 def openai_context_length_error():
@@ -531,11 +538,11 @@ async def test_all_fail_503(m):
     print("  [PASS] all_fail → 503")
 
 
-async def test_400_switches_no_cooldown(m):
-    """HTTP 400 应切下一个渠道但不记 cooldown（请求级问题）。"""
+async def test_channel_semantic_400_still_switches_and_cools_down(m):
+    """A structured channel-side 400 must remain on normal failover/health paths."""
     _setup(m)
     router = MockRouter()
-    router.register("https://cha", lambda r: http_400())
+    router.register("https://cha", lambda r: http_channel_400())
     router.register("https://chb", lambda r: json_ok_response())
     chA = _make_channel(m, "chA", "https://cha")
     chB = _make_channel(m, "chB", "https://chb")
@@ -546,11 +553,13 @@ async def test_400_switches_no_cooldown(m):
     resp, rid, sr, mc = await _call_proxy(m, router, body)
     assert resp.status_code == 200
     await mc.aclose()
-    # chA HTTP 400 仍记入 cooldown，按当前策略（outcome=http_error → should_cooldown=True）
-    # 测试目的：记录当前行为，确保切换发生
+
+    log = m["log_db"].log_detail(rid)
+    assert [item["outcome"] for item in log["retry_chain"]] == ["http_error", "success"]
+    assert m["cooldown"].is_blocked("api:chA", "glm-5")
     assert m["scorer"].get_stats("api:chA", "glm-5")["total_requests"] == 1
     assert m["scorer"].get_stats("api:chB", "glm-5")["success_count"] == 1
-    print("  [PASS] 400 switch → next success")
+    print("  [PASS] channel 400 → switch/cooldown → next success")
 
 
 async def test_context_length_error_short_circuits_failover(m):
@@ -1055,7 +1064,7 @@ async def amain():
         test_non_stream_success,
         test_non_stream_500_then_ok,
         test_all_fail_503,
-        test_400_switches_no_cooldown,
+        test_channel_semantic_400_still_switches_and_cools_down,
         test_context_length_error_short_circuits_failover,
         test_stream_success_full_forward,
         test_stream_first_event_error_switches,

@@ -190,6 +190,7 @@ class AttemptResult:
     first_byte_ms: Optional[int] = None
     total_ms: Optional[int] = None
     error_detail: Optional[str] = None
+    error_code: Optional[str] = None
     usage: dict = field(default_factory=lambda: {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -596,11 +597,32 @@ def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
     return result
 
 
+def _structured_http_request_invalid_error_info(
+    result: AttemptResult,
+) -> tuple[str | None, str] | None:
+    """Return safe code/message for an explicit pre-commit HTTP 400 input error."""
+    if result.outcome != "http_error" or result.http_status != 400:
+        return None
+    raw = str(result.error_detail or "").strip()
+    prefix = "HTTP 400:"
+    if raw.startswith(prefix):
+        raw = raw[len(prefix):].lstrip()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    return protocol_errors.request_invalid_error_info(payload)
+
+
 def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
     if is_invalid_encrypted_content_error(result.error_detail):
         return _mark_request_invalid(result, 400)
     if is_context_length_exceeded_error(result.error_detail):
         return _mark_request_invalid(result, _request_invalid_status(result))
+    request_error = _structured_http_request_invalid_error_info(result)
+    if request_error is not None:
+        result.error_code, result.error_detail = request_error
+        return _mark_request_invalid(result, 400)
     return result
 
 

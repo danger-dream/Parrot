@@ -302,6 +302,79 @@ def classify_attempt_outcome(outcome: str, http_status: int | None) -> Normalize
     )
 
 
+_REQUEST_INVALID_ERROR_TYPES = frozenset({
+    "invalid_request_error",
+    "invalid_request",
+})
+_REQUEST_INVALID_INPUT_CODES = frozenset({
+    "invalid_value",
+    "invalid_type",
+    "invalid_input",
+    "invalid_parameter",
+    "invalid_image",
+    "invalid_image_url",
+    "invalid_base64",
+    "missing_required_parameter",
+    "unsupported_value",
+})
+_REQUEST_INPUT_PARAM_ROOTS = frozenset({
+    "input",
+    "messages",
+    "prompt",
+    "content",
+    "image",
+    "image_url",
+    "tools",
+    "tool_choice",
+    "max_tokens",
+    "max_output_tokens",
+})
+
+
+def request_invalid_error_info(payload: Any) -> tuple[str | None, str] | None:
+    """Extract an explicit client-input validation error from a provider payload.
+
+    This is deliberately fail-closed: an HTTP 400 alone is not enough.  The
+    provider must supply an invalid-request type, or an input-validation code
+    tied to a known request parameter.  Channel/model/auth-style 400 errors and
+    unstructured bodies therefore remain eligible for normal failover.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    err: Any = payload
+    if isinstance(payload.get("error"), dict):
+        err = payload["error"]
+    elif isinstance(payload.get("response"), dict) and isinstance(payload["response"].get("error"), dict):
+        err = payload["response"]["error"]
+    if not isinstance(err, dict):
+        return None
+
+    error_type = str(err.get("type") or err.get("error_type") or "").strip().lower()
+    raw_code = err.get("code")
+    code = str(raw_code).strip()[:128] if raw_code is not None else None
+    code_key = str(code or "").lower()
+    raw_param = err.get("param")
+    param = str(raw_param).strip() if raw_param is not None else ""
+    param_root = re.split(r"[.\[]", param.lower(), maxsplit=1)[0]
+    param_is_input = param_root in _REQUEST_INPUT_PARAM_ROOTS
+
+    if error_type:
+        if error_type not in _REQUEST_INVALID_ERROR_TYPES:
+            return None
+        # A structured invalid-request type is sufficient when no narrower code
+        # is supplied.  If a code is present, require known input semantics or
+        # an explicit client-input parameter so model/channel errors fail closed.
+        if code and code_key not in _REQUEST_INVALID_INPUT_CODES and not param_is_input:
+            return None
+    elif code_key not in _REQUEST_INVALID_INPUT_CODES or not param_is_input:
+        return None
+
+    raw_message = err.get("message") or err.get("reason") or "invalid request"
+    message = str(raw_message).strip()[:2000] or "invalid request"
+    return code, message
+
+
 def extract_error_info(payload: Any, fallback: str = "upstream stream error") -> tuple[str | None, str]:
     """Return ``(error_code, readable_message)`` for JSON/SSE/WS error payloads.
 
