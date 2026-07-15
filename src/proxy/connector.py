@@ -8,10 +8,12 @@ built-in proxy support; Direct is just a plain client.
 from __future__ import annotations
 
 import asyncio
+import logging
+import socket
 import ssl
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpcore
@@ -225,6 +227,253 @@ class SOCKS5Connector(Connector):
 
 # ── SS2022 connector (httpcore network backend) ──────────────────
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SS2022BridgeTerminal:
+    """First terminal condition observed by an SS2022 duplex bridge."""
+
+    direction: str
+    cause: BaseException | None = None
+    graceful: bool = False
+
+
+class SS2022DuplexBridge:
+    """Single owner for one SS2022 tunnel bridged through a socketpair.
+
+    The application socket is owned by the bridge only until ``handoff_socket``.
+    After handoff, asyncio / websockets owns that socket and this bridge never
+    closes it directly.  The bridge continues to own the internal peer, both
+    pump tasks, and the raw ``SS2022Connection``.
+    """
+
+    def __init__(self, conn: SS2022Connection, *, byte_counter: Any = None):
+        self._conn = conn
+        self._byte_counter = byte_counter
+        self._loop = asyncio.get_running_loop()
+        self._application_socket, self._internal_socket = socket.socketpair()
+        self._application_socket.setblocking(False)
+        self._internal_socket.setblocking(False)
+        self._handed_off = False
+        self._terminal: SS2022BridgeTerminal | None = None
+        self._close_error: BaseException | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closed_event = asyncio.Event()
+        self._pump_tasks: tuple[asyncio.Task[None], asyncio.Task[None]] = (
+            asyncio.create_task(
+                self._pump_application_to_ss(),
+                name="ss2022-bridge-application-to-ss",
+            ),
+            asyncio.create_task(
+                self._pump_ss_to_application(),
+                name="ss2022-bridge-ss-to-application",
+            ),
+        )
+
+    @classmethod
+    async def create(
+        cls,
+        conn: SS2022Connection,
+        *,
+        byte_counter: Any = None,
+    ) -> "SS2022DuplexBridge":
+        try:
+            return cls(conn, byte_counter=byte_counter)
+        except BaseException:
+            try:
+                await conn.close()
+            except Exception as close_exc:
+                logger.debug(
+                    "SS2022 connection close after bridge setup failure failed (%s)",
+                    type(close_exc).__name__,
+                )
+            raise
+
+    @property
+    def terminal(self) -> SS2022BridgeTerminal | None:
+        return self._terminal
+
+    @property
+    def close_error(self) -> BaseException | None:
+        return self._close_error
+
+    @property
+    def closed(self) -> bool:
+        return self._closed_event.is_set()
+
+    @property
+    def handed_off(self) -> bool:
+        return self._handed_off
+
+    @property
+    def pump_tasks(self) -> tuple[asyncio.Task[None], asyncio.Task[None]]:
+        return self._pump_tasks
+
+    def handoff_socket(self) -> socket.socket:
+        """Transfer the application socket to an asyncio transport exactly once."""
+        if self._handed_off:
+            raise RuntimeError("SS2022 bridge application socket already handed off")
+        if self._close_task is not None:
+            raise RuntimeError("SS2022 bridge is closing")
+        self._handed_off = True
+        return self._application_socket
+
+    def _count(self, *, up: int = 0, down: int = 0) -> None:
+        if self._byte_counter is not None:
+            self._byte_counter.count(up=up, down=down)
+
+    async def _pump_application_to_ss(self) -> None:
+        try:
+            while True:
+                data = await self._loop.sock_recv(self._internal_socket, 65536)
+                if not data:
+                    await self._terminate_from_pump(
+                        direction="application_to_ss_eof",
+                        cause=None,
+                        graceful=True,
+                    )
+                    return
+                self._count(up=len(data))
+                await self._conn.write(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._terminate_from_pump(
+                direction="application_to_ss_error",
+                cause=exc,
+                graceful=False,
+            )
+
+    async def _pump_ss_to_application(self) -> None:
+        try:
+            while True:
+                data = await self._conn.read(65536)
+                if not data:
+                    await self._terminate_from_pump(
+                        direction="ss_to_application_eof",
+                        cause=None,
+                        graceful=True,
+                    )
+                    return
+                self._count(down=len(data))
+                await self._loop.sock_sendall(self._internal_socket, data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._terminate_from_pump(
+                direction="ss_to_application_error",
+                cause=exc,
+                graceful=False,
+            )
+
+    async def _terminate_from_pump(
+        self,
+        *,
+        direction: str,
+        cause: BaseException | None,
+        graceful: bool,
+    ) -> None:
+        terminal = SS2022BridgeTerminal(
+            direction=direction,
+            cause=cause,
+            graceful=graceful,
+        )
+        # A separate close supervisor owns cancellation/await of both pumps.
+        # The terminating pump returns instead of awaiting a task that waits for
+        # it, which avoids self-wait deadlocks while still making close complete.
+        self._ensure_close_task(terminal=terminal)
+
+    def _ensure_close_task(
+        self,
+        *,
+        terminal: SS2022BridgeTerminal,
+    ) -> asyncio.Task[None]:
+        if self._terminal is None:
+            self._terminal = terminal
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_impl(graceful=self._terminal.graceful),
+                name="ss2022-bridge-close",
+            )
+        return self._close_task
+
+    async def _await_close_task(self, task: asyncio.Task[None]) -> None:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
+    @staticmethod
+    def _shutdown(sock: socket.socket, how: int) -> None:
+        try:
+            sock.shutdown(how)
+        except OSError:
+            # Already shut down or closed is the expected idempotent-close case.
+            return
+
+    async def _close_impl(self, *, graceful: bool) -> None:
+        try:
+            # SHUT_WR is the correct graceful EOF direction: the application
+            # reads EOF from its socket. Real transport failures abort both ways.
+            self._shutdown(
+                self._internal_socket,
+                socket.SHUT_WR if graceful else socket.SHUT_RDWR,
+            )
+
+            siblings = [task for task in self._pump_tasks if not task.done()]
+            for task in siblings:
+                task.cancel()
+            if siblings:
+                await asyncio.gather(*siblings, return_exceptions=True)
+
+            try:
+                self._internal_socket.close()
+            except OSError:
+                pass
+
+            # Before handoff, nobody else can close the application socket. Once
+            # handed off, closing it here would race the selector transport.
+            if not self._handed_off:
+                self._shutdown(self._application_socket, socket.SHUT_RDWR)
+                try:
+                    self._application_socket.close()
+                except OSError:
+                    pass
+
+            try:
+                await self._conn.close()
+            except Exception as exc:
+                self._close_error = exc
+                logger.debug(
+                    "SS2022 bridge raw close failed (%s)",
+                    type(exc).__name__,
+                )
+        finally:
+            self._closed_event.set()
+
+    async def aclose(
+        self,
+        *,
+        cause: BaseException | None = None,
+        direction: str = "owner_close",
+    ) -> None:
+        task = self._ensure_close_task(
+            terminal=SS2022BridgeTerminal(
+                direction=direction,
+                cause=cause,
+                graceful=cause is None,
+            ),
+        )
+        await self._await_close_task(task)
+
+    async def wait_closed(self) -> None:
+        await self._closed_event.wait()
+
+
 class _SS2022Stream(httpcore.AsyncNetworkStream):
     """Wraps an SS2022Connection as an httpcore AsyncNetworkStream.
 
@@ -258,93 +507,49 @@ class _SS2022Stream(httpcore.AsyncNetworkStream):
             raise httpcore.WriteTimeout("SS2022 write timeout")
 
     async def aclose(self) -> None:
+        if self._closed:
+            return
         self._closed = True
         await self._conn.close()
 
     async def start_tls(self, ssl_context: ssl.SSLContext,
                         server_hostname: str | None = None,
                         timeout: float | None = None) -> httpcore.AsyncNetworkStream:
-        """Upgrade to TLS over the SS2022 tunnel (for HTTPS requests)."""
-        # We need to do a real TLS handshake over the encrypted tunnel.
-        # Use asyncio's built-in TLS support via a socket pair.
-        loop = asyncio.get_running_loop()
+        """Upgrade to TLS while transferring tunnel ownership to one bridge."""
+        if self._closed:
+            raise httpcore.ConnectError("SS2022 stream is closed")
 
-        # Create a connected socket pair
-        import socket
-        rsock, wsock = socket.socketpair()
-        rsock.setblocking(False)
-        wsock.setblocking(False)
-
-        # Pump data between SS2022 conn ↔ wsock in background
-        pump_task = asyncio.ensure_future(
-            self._pump(wsock, loop))
-
+        bridge = await SS2022DuplexBridge.create(self._conn)
+        self._closed = True
+        application_socket = bridge.handoff_socket()
         try:
-            # Do TLS handshake on rsock
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(
-                    sock=rsock,
+                    sock=application_socket,
                     ssl=ssl_context,
                     server_hostname=server_hostname,
                 ),
                 timeout=timeout,
             )
-            return _TLSOverSS2022Stream(reader, writer, pump_task, wsock)
-        except Exception:
-            pump_task.cancel()
-            rsock.close()
-            wsock.close()
+        except BaseException as exc:
+            # Ownership transferred when open_connection received sock=. It must
+            # unregister/close that socket; the bridge only closes its own peer.
+            await bridge.aclose(cause=exc, direction="tls_handshake_error")
             raise
-
-    async def _pump(self, wsock, loop):
-        """Bidirectional pump between SS2022 conn and a socket."""
-        try:
-            await asyncio.gather(
-                self._pump_read(wsock, loop),
-                self._pump_write(wsock, loop),
-            )
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    async def _pump_read(self, wsock, loop):
-        """SS2022 → wsock"""
-        try:
-            while not self._closed:
-                data = await self._conn.read(65536)
-                if not data:
-                    break
-                await loop.sock_sendall(wsock, data)
-        except Exception:
-            pass
-        finally:
-            try:
-                wsock.shutdown(0)
-            except Exception:
-                pass
-
-    async def _pump_write(self, wsock, loop):
-        """wsock → SS2022"""
-        try:
-            while not self._closed:
-                data = await loop.sock_recv(wsock, 65536)
-                if not data:
-                    break
-                await self._conn.write(data)
-        except Exception:
-            pass
+        return _TLSOverSS2022Stream(reader, writer, bridge)
 
     def get_extra_info(self, info: str) -> object:
         return None
 
 
 class _TLSOverSS2022Stream(httpcore.AsyncNetworkStream):
-    """TLS connection running over an SS2022 tunnel."""
+    """TLS connection whose socket transport and SS bridge close in order."""
 
-    def __init__(self, reader, writer, pump_task, wsock):
+    def __init__(self, reader, writer, bridge: SS2022DuplexBridge):
         self._reader = reader
         self._writer = writer
-        self._pump_task = pump_task
-        self._wsock = wsock
+        self._bridge = bridge
+        self._close_task: asyncio.Task[None] | None = None
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         try:
@@ -360,13 +565,53 @@ class _TLSOverSS2022Stream(httpcore.AsyncNetworkStream):
         except asyncio.TimeoutError:
             raise httpcore.WriteTimeout("TLS write timeout")
 
-    async def aclose(self) -> None:
-        self._writer.close()
-        self._pump_task.cancel()
+    @staticmethod
+    def _abort_writer(writer) -> BaseException | None:
+        transport = getattr(writer, "transport", None)
+        abort = getattr(transport, "abort", None)
+        if abort is None:
+            return None
         try:
-            self._wsock.close()
-        except Exception:
-            pass
+            abort()
+        except Exception as exc:
+            return exc
+        return None
+
+    async def _close_impl(self) -> None:
+        close_error: BaseException | None = None
+        try:
+            self._writer.close()
+            await self._writer.wait_closed()
+        except Exception as exc:
+            close_error = exc
+            abort_error = self._abort_writer(self._writer)
+            logger.debug(
+                "TLS-over-SS2022 writer close failed (%s); abort=%s",
+                type(exc).__name__,
+                type(abort_error).__name__ if abort_error is not None else "ok",
+            )
+        finally:
+            await self._bridge.aclose(
+                cause=close_error,
+                direction=(
+                    "tls_stream_close_error" if close_error is not None
+                    else "tls_stream_close"
+                ),
+            )
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_impl(),
+                name="tls-over-ss2022-close",
+            )
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            try:
+                await self._close_task
+            finally:
+                raise
 
     async def start_tls(self, *args, **kwargs):
         raise NotImplementedError("already TLS")

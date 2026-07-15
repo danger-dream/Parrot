@@ -285,8 +285,14 @@ class SS2022Connection:
             self._writer = _Writer(rw, aead, nonce)
 
             self._raw_r = rr
-        except Exception:
+        except BaseException:
             rw.close()
+            try:
+                await rw.wait_closed()
+            except Exception:
+                # Preserve the connect/handshake cause; the writer is already
+                # closing and no bridge owner exists yet.
+                pass
             raise
 
     async def _parse_resp(self) -> None:

@@ -1252,22 +1252,32 @@ async def test_http_responses_oauth_ws_logs_first_packet_not_first_visible(monke
     assert first_ms == 10
 
 
-def test_failover_ss2022_ws_wrapper_close_runs_cleanup_once(m):
+def test_failover_ss2022_ws_wrapper_close_waits_then_closes_owner_once(m):
     _setup(m)
     called = []
 
     class DummyWs:
         response = None
         async def close(self, *args, **kwargs):
-            called.append("ws")
+            called.append("ws.close")
+        async def wait_closed(self):
+            called.append("ws.wait_closed")
 
-    async def cleanup():
-        called.append("cleanup")
+    class DummyBridge:
+        async def aclose(self, *, cause=None, direction="owner_close"):
+            called.append(("bridge.aclose", cause, direction))
 
-    wrapped = m["failover"]._ManagedWsConnection(DummyWs(), cleanup)
-    asyncio.run(wrapped.close())
-    asyncio.run(wrapped.close())
-    assert called == ["ws", "cleanup", "ws"]
+    async def run():
+        wrapped = m["failover"]._ManagedWsConnection(DummyWs(), DummyBridge())
+        await wrapped.close()
+        await wrapped.close()
+
+    asyncio.run(run())
+    assert called == [
+        "ws.close",
+        "ws.wait_closed",
+        ("bridge.aclose", None, "websocket_close"),
+    ]
 
 
 def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeypatch, m):
@@ -1277,14 +1287,24 @@ def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeyp
     right.setblocking(False)
     cleaned = []
 
-    async def fake_open(url, connector, proxy_bytes, *, timeout):
-        async def cleanup():
-            cleaned.append(True)
-            left.close()
+    class FakeBridge:
+        def handoff_socket(self):
+            return left
+
+        async def aclose(self, *, cause=None, direction="owner_close"):
+            cleaned.append((type(cause).__name__, direction))
             right.close()
-        return left, cleanup
+
+    async def fake_open(url, connector, proxy_bytes, *, timeout):
+        return FakeBridge()
 
     async def fake_connect(*args, **kwargs):
+        # websockets owns sock= once called; emulate that ownership with a real
+        # asyncio transport and close/wait_closed before surfacing handshake failure.
+        reader, writer = await asyncio.open_connection(sock=kwargs["sock"])
+        del reader
+        writer.close()
+        await writer.wait_closed()
         raise RuntimeError("boom")
 
     monkeypatch.setattr(m["failover"], "_open_socket_via_ss2022", fake_open)
@@ -1298,8 +1318,8 @@ def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeyp
             timing=timing,
             round_timeouts=m["failover"].RoundTimeouts(1, 1, 1, 2),
         ))
-    assert cleaned == [True]
-    assert left.fileno() == -1
+    assert cleaned == [("RuntimeError", "websocket_handshake_error")]
+    assert left.fileno() == -1  # closed by asyncio transport, never by bridge
     assert right.fileno() == -1
 
 
