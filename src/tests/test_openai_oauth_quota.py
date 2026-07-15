@@ -734,6 +734,104 @@ def test_status_menu_quota_warnings_tags_openai(m):
     print("  [PASS] status_menu _quota_warnings: openai accounts get custom emoji tag")
 
 
+def _low_wham(**openai_overrides):
+    openai = {"source": "wham_usage", "allowed": True, "limit_reached": False}
+    openai.update(openai_overrides)
+    return {
+        "five_hour": {"utilization": 1.0, "resets_at": "2099-01-01T00:01:00Z"},
+        "seven_day": {"utilization": 2.0, "resets_at": "2099-01-01T01:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": openai,
+    }
+
+
+def test_fresh_openai_recovery_clears_runtime_but_preserves_fresh_quota(m):
+    """A real recovery must unblock routing without deleting the new WHAM row."""
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-recovery@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    usage = _low_wham()
+    m["state_db"].quota_save(
+        key, m["oauth_manager"].flatten_usage(usage), email=email,
+    )
+    cooldown.record_error(
+        channel_key, "gpt-test", "429", cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, usage, threshold=95, fresh=True,
+    )
+
+    assert result["action"] == "resumed", result
+    assert result["runtime_state"]["cooldown_cleared"] is True, result
+    assert not cooldown.is_blocked(channel_key, "gpt-test")
+    assert m["state_db"].quota_load(key) is not None
+    assert result["runtime_state"]["quota_cache_cleared"] is False
+    print("  [PASS] fresh OpenAI recovery clears runtime and preserves fresh quota")
+
+
+def test_non_genuine_openai_recovery_never_clears_runtime(m):
+    """Stale, unknown and still-over-limit observations must leave cooldowns intact."""
+    from src import cooldown
+
+    scenarios = [
+        ("stale", _low_wham(), False, "quota_stale_keep_disabled"),
+        ("unknown", {"openai": {"source": "wham_usage"}}, True, "quota_unknown_keep_disabled"),
+        (
+            "over",
+            {**_low_wham(), "five_hour": {"utilization": 99.0}},
+            True,
+            "still_over_quota",
+        ),
+    ]
+    for suffix, usage, fresh, expected_action in scenarios:
+        _setup(m)
+        email = f"no-runtime-clear-{suffix}@openai.test"
+        key = f"openai:{email}:acct-{email}"
+        channel_key = f"oauth:{key}"
+        _add_openai(m, email)
+        m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+        cooldown.record_error(
+            channel_key, "gpt-test", "429",
+            cooldown_until=m["state_db"].now_ms() + 60_000,
+        )
+
+        result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+            key, usage, threshold=95, fresh=fresh,
+        )
+        assert result["action"] == expected_action, result
+        assert cooldown.is_blocked(channel_key, "gpt-test"), (suffix, result)
+        cooldown.clear(channel_key, model=None)
+    print("  [PASS] stale/unknown/over-limit observations never clear runtime")
+
+
+def test_explicit_wham_gate_keeps_quota_disabled_with_distinct_action(m):
+    for field, value in (("allowed", False), ("limit_reached", True)):
+        _setup(m)
+        email = f"wham-{field}@openai.test"
+        key = f"openai:{email}:acct-{email}"
+        _add_openai(m, email)
+        m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+        usage = _low_wham(**{field: value})
+
+        result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+            key, usage, threshold=95, fresh=True,
+        )
+        acc = m["oauth_manager"].get_account(key)
+        assert result["action"] == "wham_limit_keep_disabled", result
+        assert result["any_over"] is True, result
+        assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    print("  [PASS] explicit WHAM gate keeps quota disabled with distinct action")
+
+
 # ─── main ────────────────────────────────────────────────────────
 
 def main():
@@ -765,6 +863,9 @@ def main():
         test_delete_account_clears_codex_snapshot_throttle,
         test_on_refresh_token_openai_updates_usage_via_wham,
         test_status_menu_quota_warnings_tags_openai,
+        test_fresh_openai_recovery_clears_runtime_but_preserves_fresh_quota,
+        test_non_genuine_openai_recovery_never_clears_runtime,
+        test_explicit_wham_gate_keeps_quota_disabled_with_distinct_action,
     ]
 
     passed = 0

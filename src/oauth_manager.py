@@ -1215,6 +1215,14 @@ def _usage_has_any_quota_signal(usage: dict) -> bool:
     return any(u is not None for u in extract_utils_percent(usage))
 
 
+def _explicit_openai_wham_limit(usage: dict) -> bool:
+    """Whether a WHAM response explicitly says routing is unavailable."""
+    openai = usage.get("openai") if isinstance(usage, dict) else None
+    if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
+        return False
+    return openai.get("allowed") is False or openai.get("limit_reached") is True
+
+
 def openai_plan_workspace_label(acc: dict | None) -> str:
     """Human label for OpenAI OAuth accounts.
 
@@ -1373,6 +1381,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
 
     返回: {
       "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
+                "wham_limit_disabled"|"wham_limit_keep_disabled"|
                 "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
       "utils": [5h, 7d, 30d, sonnet, opus],   # None 表示该指标缺失
       "any_over": bool,
@@ -1406,6 +1415,28 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": f"noop_{reason}", "utils": utils, "any_over": any_over,
                 "hit_windows": hit_windows,
                 "disabled_until": acc.get("disabled_until")}
+
+    # WHAM's explicit gate is authoritative even when its percentage windows
+    # are absent or temporarily report a low number.  In particular, never turn
+    # "allowed: false" / "limit_reached: true" into quota recovery.
+    wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage)
+    if wham_limit:
+        hit_windows.append("WHAM limit")
+        if reason == "quota":
+            return {"action": "wham_limit_keep_disabled", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": acc.get("disabled_until")}
+        latest_reset = reset_iso_for_hit_windows(usage, threshold)
+        try:
+            set_disabled_by_quota(account_key, latest_reset)
+        except Exception as exc:
+            print(f"[oauth] evaluate WHAM disable failed for {account_key}: {exc}")
+            return {"action": "disable_failed", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": None}
+        return {"action": "wham_limit_disabled", "utils": utils,
+                "any_over": True, "hit_windows": hit_windows,
+                "disabled_until": latest_reset}
 
     cached_codex_hit = None
     if provider_of(account_key) == "openai":
@@ -1456,8 +1487,18 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             return {"action": "resume_failed", "utils": utils,
                     "any_over": False, "hit_windows": [],
                     "disabled_until": acc.get("disabled_until")}
+        runtime_state = None
+        if provider == "openai" and fresh:
+            # A genuine fresh recovery must also remove local cooldown/snapshot
+            # state or routing can remain blocked after the account is enabled.
+            # Preserve the just-written fresh quota cache for status and future
+            # evaluation.
+            runtime_state = _clear_oauth_runtime_state(
+                account_key, clear_quota_cache=False,
+            )
         return {"action": "resumed", "utils": utils, "any_over": False,
-                "hit_windows": [], "disabled_until": None}
+                "hit_windows": [], "disabled_until": None,
+                "runtime_state": runtime_state}
     return {"action": "kept_enabled", "utils": utils, "any_over": False,
             "hit_windows": [], "disabled_until": None}
 
@@ -2098,7 +2139,9 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
 
     eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
     out["quota_action"] = eval_result
-    if eval_result.get("action") in ("resumed", "kept_enabled") and not eval_result.get("any_over"):
+    if eval_result.get("action") == "resumed":
+        out["runtime_clear"] = eval_result.get("runtime_state")
+    elif eval_result.get("action") == "kept_enabled" and not eval_result.get("any_over"):
         out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)
     return out
 
@@ -2531,7 +2574,7 @@ async def quota_monitor_once() -> dict:
         elif provider == "xai":
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
 
-        if action == "disabled":
+        if action in ("disabled", "wham_limit_disabled"):
             latest_reset = result["disabled_until"]
             hit = " / ".join(result["hit_windows"]) or "?"
             out[email] = f"disabled_quota:{latest_reset}"
@@ -2543,8 +2586,8 @@ async def quota_monitor_once() -> dict:
                 f"重置时间: <code>{_to_bjt(latest_reset) if latest_reset else 'unknown'}</code>\n"
                 "所有撞到窗口恢复后即可自动解禁。"
             )
-        elif action == "still_over_quota":
-            out[email] = "still_over_quota"
+        elif action in ("still_over_quota", "wham_limit_keep_disabled"):
+            out[email] = action
         elif action == "resumed":
             out[email] = "resumed"
             notifier.throttled_notify_event_sync(

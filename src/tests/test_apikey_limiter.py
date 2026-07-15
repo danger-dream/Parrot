@@ -146,7 +146,11 @@ async def test_queued_request_body_replay_is_bounded(monkeypatch):
         return chunks.pop(0)
 
     request = Request(
-        {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []},
+        {
+            "type": "http", "method": "POST", "path": "/v1/responses",
+            # The actual ASGI stream, not Content-Length alone, must enforce the cap.
+            "headers": [(b"content-length", b"1")],
+        },
         receive,
     )
     queued = asyncio.create_task(apikey_limiter.acquire("k", request))
@@ -430,6 +434,51 @@ async def test_process_wide_queued_body_aggregate_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_aggregate_error_survives_watcher_cancellation_and_gather(monkeypatch):
+    """Admission may win the wait race, but a watcher aggregate error must win cleanup."""
+    monkeypatch.setattr(
+        apikey_limiter, "QUEUED_BODY_EVENT_OVERHEAD_BYTES", 0, raising=False,
+    )
+    monkeypatch.setattr(
+        apikey_limiter.config,
+        "get",
+        lambda: _aggregate_budget_cfg(per_key=100, process=5),
+    )
+    original_reserve = apikey_limiter._BodyPreservingReceive._reserve
+    reserve_started = asyncio.Event()
+    allow_reserve = asyncio.Event()
+
+    async def paused_reserve(self, message):
+        reserve_started.set()
+        await allow_reserve.wait()
+        return await original_reserve(self, message)
+
+    monkeypatch.setattr(
+        apikey_limiter._BodyPreservingReceive, "_reserve", paused_reserve,
+    )
+    active = await apikey_limiter.acquire("k")
+    request = _queued_request([
+        {"type": "http.request", "body": b"12345678", "more_body": True},
+    ])
+    queued = asyncio.create_task(apikey_limiter.acquire("k", request))
+    await asyncio.wait_for(reserve_started.wait(), timeout=1)
+
+    # Wake/admit the FIFO waiter while its watcher has an event in hand.  The
+    # wait cleanup cancels that watcher and gathers it; the pending aggregate
+    # failure must not be replaced by a successful lease or CancelledError.
+    await active.release()
+    await asyncio.sleep(0.05)
+    assert not queued.done()
+    allow_reserve.set()
+
+    with pytest.raises(apikey_limiter.RequestBodyTooLarge) as exc_info:
+        await asyncio.wait_for(queued, timeout=1)
+    assert exc_info.value.reason == "process_aggregate"
+    assert apikey_limiter._queued_body_bytes_total == 0
+    assert apikey_limiter.key_snapshot("k")["in_flight"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("body", [b"", b"x"], ids=["empty", "one-byte"])
 async def test_queued_body_event_count_is_bounded(monkeypatch, body):
     monkeypatch.setattr(
@@ -649,3 +698,124 @@ async def test_hot_disable_wakes_waiters_without_active_release(monkeypatch):
     assert all(lease.noop for lease in leases)
     assert apikey_limiter.key_snapshot("k")["waiting"] == 0
     await active.release()
+
+
+def _request(path: str, *, content_type: str = "application/json", content_length: int | None = None):
+    headers = [(b"content-type", content_type.encode())]
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(
+        {"type": "http", "method": "POST", "path": path, "headers": headers},
+        receive,
+    )
+
+
+def test_public_process_aggregate_key_is_primary_with_legacy_fallback(monkeypatch):
+    current = _aggregate_budget_cfg(per_key=100, process=111)
+    current["apiKeyConcurrency"]["maxQueuedBodyBytes"] = 222
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
+    assert apikey_limiter._resolve_limits("k").max_queued_body_bytes_total == 222
+
+    del current["apiKeyConcurrency"]["maxQueuedBodyBytes"]
+    assert apikey_limiter._resolve_limits("k").max_queued_body_bytes_total == 111
+
+
+@pytest.mark.asyncio
+async def test_image_total_body_contract_accepts_legal_20mib_single_images(monkeypatch):
+    current = _cfg()
+    current["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] = 8 * 1024 * 1024
+    current["images"] = {"maxInputImageBytes": 20 * 1024 * 1024}
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
+
+    raw_size = 20 * 1024 * 1024
+    multipart = _request(
+        "/v1/images/edit",
+        content_type="multipart/form-data; boundary=x",
+        content_length=raw_size + 4096,
+    )
+    multipart_lease = await apikey_limiter.acquire("k", multipart)
+    await multipart_lease.release()
+
+    data_url_wire = 4 * ((raw_size + 2) // 3) + 512
+    json_request = _request(
+        "/v1/images/edit", content_length=data_url_wire,
+    )
+    json_lease = await apikey_limiter.acquire("k", json_request)
+    await json_lease.release()
+
+
+def test_compat_image_contract_covers_multi_image_and_mask(monkeypatch):
+    current = _cfg()
+    current["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] = 100
+    current["images"] = {"maxInputImageBytes": 300}
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
+    limits = apikey_limiter._resolve_limits("k")
+
+    multipart_max = apikey_limiter._request_body_max_bytes(
+        _request("/v1/images/edits", content_type="multipart/form-data; boundary=x"),
+        limits,
+    )
+    json_max = apikey_limiter._request_body_max_bytes(
+        _request("/v1/images/edits"), limits,
+    )
+    # 16 legal images plus one mask, with a bounded form/JSON envelope.
+    assert multipart_max >= 17 * 300
+    assert json_max >= 17 * (4 * ((300 + 2) // 3))
+    assert json_max > multipart_max
+
+
+@pytest.mark.asyncio
+async def test_nonqueued_chunked_body_uses_same_total_byte_contract(monkeypatch):
+    current = _cfg()
+    current["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] = 5
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
+    messages = [
+        {"type": "http.request", "body": b"123", "more_body": True},
+        {"type": "http.request", "body": b"456", "more_body": False},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    request = Request(
+        {
+            "type": "http", "method": "POST", "path": "/v1/responses",
+            # Deliberately false-low: streamed bytes remain authoritative.
+            "headers": [(b"content-length", b"1")],
+        },
+        receive,
+    )
+    lease = await apikey_limiter.acquire("k", request)
+    with pytest.raises(apikey_limiter.RequestBodyTooLarge) as exc_info:
+        await request.body()
+    assert exc_info.value.reason == "request_bytes"
+    await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_nonqueued_body_event_count_uses_same_contract(monkeypatch):
+    current = _cfg()
+    current["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] = 100
+    current["apiKeyConcurrency"]["defaultMaxRequestBodyEvents"] = 1
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
+    messages = [
+        {"type": "http.request", "body": b"a", "more_body": True},
+        {"type": "http.request", "body": b"b", "more_body": False},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/messages", "headers": []},
+        receive,
+    )
+    lease = await apikey_limiter.acquire("k", request)
+    with pytest.raises(apikey_limiter.RequestBodyTooLarge) as exc_info:
+        await request.body()
+    assert exc_info.value.reason == "event_count"
+    await lease.release()

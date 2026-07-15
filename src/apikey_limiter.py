@@ -7,7 +7,8 @@
 配置：
   apiKeyConcurrency.enabled/defaultMaxConcurrent/defaultMaxQueue/defaultQueueWaitSeconds
   apiKeyConcurrency.defaultMaxRequestBodyBytes/defaultMaxRequestBodyEvents
-  apiKeyConcurrency.defaultMaxQueuedBodyBytesPerKey/maxQueuedBodyBytesTotal
+  apiKeyConcurrency.defaultMaxQueuedBodyBytesPerKey/maxQueuedBodyBytes
+  (legacy maxQueuedBodyBytesTotal is accepted only as a fallback)
   apiKeys.<name>.limits may override the corresponding per-key/body defaults with
   enabled/maxConcurrent/maxQueue/queueWaitSeconds and
   maxRequestBodyBytes/maxRequestBodyEvents/maxQueuedBodyBytes.
@@ -85,13 +86,24 @@ DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL = 128 * 1024 * 1024
 # Aggregate budgets include a conservative estimate for each retained ASGI dict.
 QUEUED_BODY_EVENT_OVERHEAD_BYTES = 1024
 
+# OpenAI's image edit contract allows up to 16 input images plus one mask.  A
+# legal 20 MiB image is larger on the wire when carried as a JSON data URL, so
+# the generic API-body default cannot be used as the total-body cap for these
+# endpoints.  Multipart file parts are streamed by Starlette into spooled files
+# after admission; only queued events are retained here, under the aggregate
+# budgets below.
+_COMPAT_IMAGE_EDIT_PATHS = frozenset({"/v1/images/edits", "/images/edits"})
+_SINGLE_IMAGE_EDIT_PATHS = frozenset({"/v1/images/edit"})
+_OPENAI_MAX_EDIT_IMAGES = 16
+_IMAGE_BODY_ENVELOPE_BYTES = 1024 * 1024
+
 _queued_body_lock = asyncio.Lock()
 _queued_body_bytes_by_key: dict[str, int] = {}
 _queued_body_bytes_total = 0
 
 
 class RequestBodyTooLarge(Exception):
-    """A queued request exceeded a replay-buffer byte/event budget."""
+    """A request exceeded its total-body or queued aggregate budget."""
 
     def __init__(
         self,
@@ -104,14 +116,51 @@ class RequestBodyTooLarge(Exception):
         self.max_events = None if max_events is None else int(max_events)
         self.reason = reason
         if reason == "event_count":
-            message = f"queued request has more than {self.max_events} body events"
+            message = f"request has more than {self.max_events} body events"
         elif reason == "key_aggregate":
             message = f"API key queued-body budget exceeds {self.max_bytes} accounted bytes"
         elif reason == "process_aggregate":
             message = f"process queued-body budget exceeds {self.max_bytes} accounted bytes"
         else:
-            message = f"queued request body exceeds {self.max_bytes} bytes"
+            message = f"request body exceeds {self.max_bytes} bytes"
         super().__init__(message)
+
+
+def _request_body_max_bytes(request: Request, limits: ResolvedLimits) -> int:
+    """Resolve the total wire-body contract for this endpoint.
+
+    ``images.maxInputImageBytes`` limits decoded images.  JSON/data-URL bodies
+    need base64 expansion headroom, while multipart carries raw file bytes.  The
+    standard edits endpoint supports 16 images and a mask; the legacy edit
+    endpoint supports one image.  This is a total-body bound, not an in-memory
+    allocation target: normal multipart parsing remains spooled by Starlette.
+    """
+    generic_max = int(limits.max_request_body_bytes)
+    path = str(request.scope.get("path") or "")
+    if path not in _COMPAT_IMAGE_EDIT_PATHS and path not in _SINGLE_IMAGE_EDIT_PATHS:
+        return generic_max
+
+    cfg = config.get()
+    image_cfg = cfg.get("images") or {}
+    max_image_bytes = _as_int(
+        image_cfg.get("maxInputImageBytes"),
+        20 * 1024 * 1024,
+        minimum=1,
+    )
+    image_slots = (
+        _OPENAI_MAX_EDIT_IMAGES + 1
+        if path in _COMPAT_IMAGE_EDIT_PATHS
+        else 1
+    )
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        per_image_wire_bytes = max_image_bytes
+    else:
+        # Exact base64 ceiling plus a small per-value allowance for the data URL
+        # prefix, JSON quoting and separators.
+        per_image_wire_bytes = 4 * ((max_image_bytes + 2) // 3) + 256
+    endpoint_max = image_slots * per_image_wire_bytes + _IMAGE_BODY_ENVELOPE_BYTES
+    return max(generic_max, endpoint_max)
 
 
 class _BodyPreservingReceive:
@@ -123,6 +172,7 @@ class _BodyPreservingReceive:
     """
 
     def __init__(self, request: Request, key_name: str, limits: ResolvedLimits):
+        self._request = request
         self._raw_receive: Receive = request._receive
         self._key_name = key_name
         self._limits = limits
@@ -131,6 +181,35 @@ class _BodyPreservingReceive:
         self._buffered_events = 0
         self._reserved_bytes = 0
         self._abandoned = False
+
+    def validate_content_length(self) -> None:
+        raw = self._request.headers.get("content-length")
+        if raw is None:
+            return
+        try:
+            content_length = int(raw)
+        except (TypeError, ValueError):
+            return
+        limits = _resolve_limits(self._key_name)
+        max_bytes = _request_body_max_bytes(self._request, limits)
+        if content_length > max_bytes:
+            raise RequestBodyTooLarge(max_bytes=max_bytes)
+
+    def _account_body_event(self, message: Message, limits: ResolvedLimits) -> None:
+        body_bytes = len(message.get("body", b""))
+        next_body_bytes = self._buffered_bytes + body_bytes
+        next_events = self._buffered_events + 1
+        max_bytes = _request_body_max_bytes(self._request, limits)
+        if next_body_bytes > max_bytes:
+            raise RequestBodyTooLarge(max_bytes=max_bytes)
+        if next_events > limits.max_request_body_events:
+            raise RequestBodyTooLarge(
+                max_bytes=max_bytes,
+                max_events=limits.max_request_body_events,
+                reason="event_count",
+            )
+        self._buffered_bytes = next_body_bytes
+        self._buffered_events = next_events
 
     async def receive(self) -> Message:
         """Release accounting as each retained event is replayed, then go live."""
@@ -146,7 +225,12 @@ class _BodyPreservingReceive:
                 else:
                     _queued_body_bytes_by_key.pop(self._key_name, None)
                 return message
-        return await self._raw_receive()
+        message = await self._raw_receive()
+        if message.get("type") == "http.request":
+            limits = _resolve_limits(self._key_name)
+            self._limits = limits
+            self._account_body_event(message, limits)
+        return message
 
     async def _reserve(self, message: Message) -> None:
         global _queued_body_bytes_total
@@ -156,18 +240,11 @@ class _BodyPreservingReceive:
         # effective budgets for every event so config hot reloads take effect.
         limits = _resolve_limits(self._key_name)
         async with _queued_body_lock:
+            if self._abandoned:
+                return
             self._limits = limits
-            next_body_bytes = self._buffered_bytes + body_bytes
-            next_events = self._buffered_events + 1
+            self._account_body_event(message, limits)
             key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0)
-            if next_body_bytes > limits.max_request_body_bytes:
-                raise RequestBodyTooLarge(max_bytes=limits.max_request_body_bytes)
-            if next_events > limits.max_request_body_events:
-                raise RequestBodyTooLarge(
-                    max_bytes=limits.max_request_body_bytes,
-                    max_events=limits.max_request_body_events,
-                    reason="event_count",
-                )
             if key_bytes + charge > limits.max_queued_body_bytes:
                 raise RequestBodyTooLarge(
                     max_bytes=limits.max_queued_body_bytes,
@@ -178,11 +255,7 @@ class _BodyPreservingReceive:
                     max_bytes=limits.max_queued_body_bytes_total,
                     reason="process_aggregate",
                 )
-            if self._abandoned:
-                return
             self._buffer.append((message, charge))
-            self._buffered_bytes = next_body_bytes
-            self._buffered_events = next_events
             self._reserved_bytes += charge
             _queued_body_bytes_by_key[self._key_name] = key_bytes + charge
             _queued_body_bytes_total += charge
@@ -231,8 +304,10 @@ def _body_preserving_receive(
 ) -> _BodyPreservingReceive:
     guard = getattr(request, "_parrot_body_preserving_receive", None)
     if isinstance(guard, _BodyPreservingReceive):
+        guard.validate_content_length()
         return guard
     guard = _BodyPreservingReceive(request, key_name, limits)
+    guard.validate_content_length()
     # This is the only private Request hook used; see the class docstring.
     request._receive = guard.receive
     setattr(request, "_parrot_body_preserving_receive", guard)
@@ -322,8 +397,13 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         DEFAULT_MAX_QUEUED_BODY_BYTES_PER_KEY,
         minimum=1,
     )
+    process_queued_body_budget = global_cfg.get("maxQueuedBodyBytes")
+    if process_queued_body_budget is None:
+        # Backward compatibility for the pre-review private spelling.  The
+        # documented/public key above always wins when both are present.
+        process_queued_body_budget = global_cfg.get("maxQueuedBodyBytesTotal")
     max_queued_body_bytes_total = _as_int(
-        global_cfg.get("maxQueuedBodyBytesTotal"),
+        process_queued_body_budget,
         DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL,
         minimum=1,
     )
@@ -432,9 +512,15 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
         _wake_eligible_waiters_locked(slot)
         if not limits.enabled:
             return ApiKeyLease(key, None, limits, noop=True)
+        replay_guard = (
+            _body_preserving_receive(request, key, limits)
+            if request is not None else None
+        )
         if limits.unlimited or slot.in_flight < limits.max_concurrent:
             slot.in_flight += 1
-            return ApiKeyLease(key, slot, limits, queue_wait_ms=0)
+            return ApiKeyLease(
+                key, slot, limits, queue_wait_ms=0, replay_guard=replay_guard
+            )
 
         if limits.max_queue <= 0 or len(slot.waiters) >= limits.max_queue:
             raise _queue_full_error(key, slot)

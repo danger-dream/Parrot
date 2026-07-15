@@ -313,6 +313,50 @@ def _api_key_limit_error_response(path: str, exc: apikey_limiter.ApiKeyLimitErro
     return resp
 
 
+def _request_body_limit_error_response(
+    path: str, exc: apikey_limiter.RequestBodyTooLarge,
+):
+    """Map per-request limits to 413 and shared queue pressure to 429."""
+    aggregate_pressure = exc.reason in {"key_aggregate", "process_aggregate"}
+    status = 429 if aggregate_pressure else 413
+    if path == "/v1/messages":
+        resp = errors.json_error_response(
+            status,
+            errors.ErrType.RATE_LIMIT if aggregate_pressure else errors.ErrType.REQUEST_TOO_LARGE,
+            str(exc),
+            code="queued_body_capacity" if aggregate_pressure else "request_too_large",
+        )
+    else:
+        resp = errors.json_error_openai(
+            status,
+            errors.ErrTypeOpenAI.RATE_LIMIT if aggregate_pressure else errors.ErrTypeOpenAI.INVALID_REQUEST,
+            str(exc),
+            code="queued_body_capacity" if aggregate_pressure else "request_too_large",
+        )
+    if aggregate_pressure:
+        resp.headers["Retry-After"] = "1"
+    return resp
+
+
+def _find_request_body_limit_error(exc: BaseException) -> apikey_limiter.RequestBodyTooLarge | None:
+    """Unwrap Starlette/AnyIO task-group errors without version-specific APIs."""
+    if isinstance(exc, apikey_limiter.RequestBodyTooLarge):
+        return exc
+    for nested in getattr(exc, "exceptions", ()) or ():
+        found = _find_request_body_limit_error(nested)
+        if found is not None:
+            return found
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        found = _find_request_body_limit_error(cause)
+        if found is not None:
+            return found
+    context = getattr(exc, "__context__", None)
+    if context is not None and context is not exc:
+        return _find_request_body_limit_error(context)
+    return None
+
+
 @app.middleware("http")
 async def _drain_http_middleware(request: Request, call_next):
     """Reject new work while draining and keep active bodies counted.
@@ -341,27 +385,23 @@ async def _drain_http_middleware(request: Request, call_next):
                     key_lease = await apikey_limiter.acquire(key_name, request)
                 except apikey_limiter.RequestBodyTooLarge as exc:
                     await lease.aclose()
-                    message = str(exc)
-                    if path == "/v1/messages":
-                        return errors.json_error_response(
-                            413,
-                            errors.ErrType.REQUEST_TOO_LARGE,
-                            message,
-                        )
-                    return errors.json_error_openai(
-                        413,
-                        errors.ErrTypeOpenAI.INVALID_REQUEST,
-                        message,
-                        code="request_too_large",
-                    )
+                    return _request_body_limit_error_response(path, exc)
                 except apikey_limiter.ApiKeyLimitError as exc:
                     await lease.aclose()
                     return _api_key_limit_error_response(path, exc)
         response = await call_next(request)
-    except BaseException:
+    except apikey_limiter.RequestBodyTooLarge as exc:
         if key_lease is not None:
             await key_lease.release()
         await lease.aclose()
+        return _request_body_limit_error_response(path, exc)
+    except BaseException as exc:
+        if key_lease is not None:
+            await key_lease.release()
+        await lease.aclose()
+        body_limit_error = _find_request_body_limit_error(exc)
+        if body_limit_error is not None:
+            return _request_body_limit_error_response(path, body_limit_error)
         raise
 
     if key_lease is not None:
