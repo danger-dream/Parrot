@@ -266,7 +266,8 @@ def test_apikey_cache_stats_include_cost(m):
     assert "≈" not in list_text
 
     lifetime_text = "\n".join(m["main_menu"]._lifetime_stats_block())
-    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in lifetime_text
+    assert "总 Tokens <code>4.0M</code> (↑ 3.0M ↓ 1.0M) · 💵 估算 $68.50" in lifetime_text
+    assert "缓存 1.0M (33.3%)" in lifetime_text
     assert "≈" not in lifetime_text
 
     short = m["apikey_menu"]._short_of("priced")

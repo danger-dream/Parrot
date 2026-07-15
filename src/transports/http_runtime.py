@@ -307,6 +307,7 @@ async def read_http_error_response(
         http_status=status,
         connect_ms=connect_ms,
         error_detail=f"HTTP {status}: {err_text[:2000]}",
+        full_response_text=err_text,
         proxy_name=proxy_name,
         proxy_bytes_up=up,
         proxy_bytes_down=down,
@@ -454,6 +455,11 @@ async def aggregate_stream_as_non_stream_response(
                 first_byte_ms=first_byte_ms,
                 error_detail=json.dumps(first_event.get("error", first_event), ensure_ascii=False)[:2000],
                 translator_ctx=translator_ctx,
+                full_response_text=(
+                    first_chunk_restored.decode("utf-8", errors="replace")
+                    if isinstance(first_chunk_restored, (bytes, bytearray))
+                    else str(first_chunk_restored)
+                ),
             )
         )
 
@@ -466,6 +472,11 @@ async def aggregate_stream_as_non_stream_response(
                 connect_ms=connect_ms,
                 first_byte_ms=first_byte_ms,
                 error_detail=f"blacklist: {bl_hit}",
+                full_response_text=(
+                    first_chunk_restored.decode("utf-8", errors="replace")
+                    if isinstance(first_chunk_restored, (bytes, bytearray))
+                    else str(first_chunk_restored)
+                ),
             )
         )
 
@@ -478,6 +489,13 @@ async def aggregate_stream_as_non_stream_response(
         if isinstance(first_chunk_restored, (bytes, bytearray))
         else first_chunk_restored.encode("utf-8", errors="replace")
     )
+
+    def with_partial_billing(err: AttemptResult) -> AttemptResult:
+        err.full_response_text = bytes(raw_buf).decode("utf-8", errors="replace")
+        usage = getattr(tracker, "usage", None)
+        if isinstance(usage, dict):
+            err.usage = dict(usage)
+        return err
     if err := _stream_tracker_error_result(
         tracker,
         connect_ms=connect_ms,
@@ -486,7 +504,7 @@ async def aggregate_stream_as_non_stream_response(
         translator_ctx=translator_ctx,
     ):
         await close_response_context(ctx)
-        return StreamAsNonStreamResult(error=err)
+        return StreamAsNonStreamResult(error=with_partial_billing(err))
 
     while True:
         try:
@@ -497,10 +515,10 @@ async def aggregate_stream_as_non_stream_response(
         except BusinessTimeoutError as exc:
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
-                error=_with_timing(timing, AttemptResult(
+                error=with_partial_billing(_with_timing(timing, AttemptResult(
                     outcome=exc.outcome,
                     error_detail=f"{exc.outcome} reading SSE [stream-only→non-stream]",
-                ))
+                )))
             )
         except StopAsyncIteration:
             if timing is not None:
@@ -517,10 +535,10 @@ async def aggregate_stream_as_non_stream_response(
         except Exception as exc:
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
-                error=_with_timing(timing, AttemptResult(
+                error=with_partial_billing(_with_timing(timing, AttemptResult(
                     outcome="transport_error",
                     error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
-                ))
+                )))
             )
         restored_chunk = await provider_registry.restore_response_bytes(
             channel,
@@ -543,7 +561,7 @@ async def aggregate_stream_as_non_stream_response(
             translator_ctx=translator_ctx,
         ):
             await close_response_context(ctx)
-            return StreamAsNonStreamResult(error=err)
+            return StreamAsNonStreamResult(error=with_partial_billing(err))
 
     response_headers = metadata_from_response(response).forward_headers()
     await close_response_context(ctx)
@@ -562,13 +580,11 @@ async def aggregate_stream_as_non_stream_response(
 
     if not builder.has_any_event:
         return StreamAsNonStreamResult(
-            error=AttemptResult(
+            error=with_partial_billing(_with_timing(timing, AttemptResult(
                 outcome="upstream_malformed",
-                connect_ms=connect_ms,
-                first_byte_ms=first_byte_ms,
                 error_detail="stream ended without any SSE event [stream-only→non-stream]",
                 full_response_text=response_body_text,
-            )
+            )))
         )
 
     obj = builder.to_full_json(fallback_model=resolved_model)

@@ -872,14 +872,13 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
         print(f"[oauth_menu] xai priced month lookup failed for {account_key}: {exc}")
         priced_month = {}
 
-    cost = float(month.get("cost_usd") or 0.0)
-    bill_count = int(month.get("cost_rows") or 0)
+    bill_count = int(month.get("costed_success") or 0)
     prompt = ui.prompt_total(month.get("input") or 0, month.get("cache_creation") or 0, month.get("cache_read") or 0)
     output = int(month.get("output") or 0)
     cache_read = int(month.get("cache_read") or 0)
 
     money_line = (
-        f"💵 本地计费: {_fmt_usd(cost)}"
+        f"💵 本地计费: {ui.fmt_cost(month)}"
         if pricing_enabled
         else "💵 本地计费: 已关闭"
     )
@@ -888,10 +887,7 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
 
     usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
     if cache_read > 0:
-        usage_line += (
-            f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
-            f" · 💵 {ui.fmt_cost(priced_month)}"
-        )
+        usage_line += f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
 
     lines = ["<b>💵 Parrot 本地计费</b>"] if detail else []
     lines.extend([money_line, usage_line])
@@ -939,7 +935,7 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Opti
     parts = [f"↑{ui.fmt_tokens(prompt)} ↓{ui.fmt_tokens(s['output'])}"]
     if (s.get("cache_read") or 0) > 0:
         parts.append(ui.fmt_cache_phrase(s["cache_read"], prompt))
-        parts.append(f"💵 {ui.fmt_cost(s)}")
+    parts.append(f"💵 {ui.fmt_cost(s)}")
     if s.get("avg_tps") is not None:
         parts.append(f"均 {ui.fmt_tps(s.get('avg_tps'))}")
     return indent + " · ".join(parts)
@@ -1041,10 +1037,8 @@ def _format_account_block(acc: dict) -> str:
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
         stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
-            stat_line += (
-                f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
-                f" · 💵 {ui.fmt_cost(ts)}"
-            )
+            stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
+        stat_line += f" · 💵 {ui.fmt_cost(ts)}"
         lines.append(stat_line)
         if ts.get("avg_tps") is not None:
             lines.append(
@@ -2015,10 +2009,8 @@ def _format_month_stats_block(account_key: str) -> str:
     out_tok = overall["output"]
     token_line = f"↑ {ui.fmt_tokens(inp_prompt)} · ↓ {ui.fmt_tokens(out_tok)}"
     if (overall.get("cache_read") or 0) > 0:
-        token_line += (
-            f" · {ui.fmt_cache_phrase(overall['cache_read'], inp_prompt)}"
-            f" · 💵 {ui.fmt_cost(overall)}"
-        )
+        token_line += f" · {ui.fmt_cache_phrase(overall['cache_read'], inp_prompt)}"
+    token_line += f" · 💵 {ui.fmt_cost(overall)}"
 
     lines = [
         "",
@@ -2040,10 +2032,8 @@ def _format_month_stats_block(account_key: str) -> str:
                 f" · ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(ms['output'])}"
             )
             if (ms.get("cache_read") or 0) > 0:
-                model_line += (
-                    f" · {ui.fmt_cache_phrase(ms['cache_read'], m_prompt)}"
-                    f" · 💵 {ui.fmt_cost(ms)}"
-                )
+                model_line += f" · {ui.fmt_cache_phrase(ms['cache_read'], m_prompt)}"
+            model_line += f" · 💵 {ui.fmt_cost(ms)}"
             lines.append(f"  • <code>{model}</code>")
             lines.append(model_line)
             if ms.get("avg_tps") is not None:

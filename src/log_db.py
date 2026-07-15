@@ -154,7 +154,11 @@ def _schema_sql() -> str:
       proxy_bytes_up        INTEGER DEFAULT 0,
       proxy_bytes_down      INTEGER DEFAULT 0,
       reasoning_effort      TEXT,
-      fast_mode             INTEGER DEFAULT 0
+      fast_mode             INTEGER DEFAULT 0,
+      -- Actual upstream tier observed at terminal response; request intent is separate.
+      actual_service_tier   TEXT,
+      -- Downstream request summary only; attempt accounting lives separately.
+      usage_observed        INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_log_created ON request_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_log_status ON request_log(status);
@@ -193,9 +197,41 @@ def _schema_sql() -> str:
       error_detail    TEXT,
       proxy_name      TEXT,
       bytes_up        INTEGER DEFAULT 0,
-      bytes_down      INTEGER DEFAULT 0
+      bytes_down      INTEGER DEFAULT 0,
+      outbound_service_tier TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_retry_req ON retry_chain(request_id);
+
+    -- Immutable settlement facts: exactly one row per real upstream retry attempt.
+    -- request_log remains the downstream-request summary for backward compatibility.
+    CREATE TABLE IF NOT EXISTS upstream_attempt_usage (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      retry_attempt_id      INTEGER UNIQUE NOT NULL,
+      root_request_id       TEXT NOT NULL,
+      call_request_id       TEXT NOT NULL,
+      attempt_order         INTEGER NOT NULL,
+      channel_key           TEXT NOT NULL,
+      channel_type          TEXT NOT NULL,
+      model                 TEXT NOT NULL,
+      pricing_model         TEXT,
+      outcome               TEXT,
+      usage_observed        INTEGER NOT NULL DEFAULT 0,
+      input_tokens          INTEGER NOT NULL DEFAULT 0,
+      output_tokens         INTEGER NOT NULL DEFAULT 0,
+      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+      service_tier          TEXT,
+      outbound_service_tier TEXT,
+      dispatch_state        TEXT NOT NULL DEFAULT 'unknown',
+      pricing_snapshot_json TEXT,
+      pricing_version       TEXT,
+      cost_source           TEXT NOT NULL,
+      cost_ticks            INTEGER,
+      settled_at            REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_attempt_usage_root ON upstream_attempt_usage(root_request_id);
+    CREATE INDEX IF NOT EXISTS idx_attempt_usage_channel ON upstream_attempt_usage(channel_key);
+    CREATE INDEX IF NOT EXISTS idx_attempt_usage_model ON upstream_attempt_usage(model);
 
     CREATE TABLE IF NOT EXISTS proxy_chain (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -344,6 +380,72 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if "final_round_id" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN final_round_id TEXT")
         changed = True
+    if "actual_service_tier" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN actual_service_tier TEXT")
+        changed = True
+    if "usage_observed" not in cols:
+        conn.execute(
+            "ALTER TABLE request_log ADD COLUMN usage_observed INTEGER"
+        )
+        changed = True
+
+    attempt_usage_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(upstream_attempt_usage)").fetchall()
+    }
+    if not attempt_usage_cols:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS upstream_attempt_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, retry_attempt_id INTEGER UNIQUE NOT NULL,
+          root_request_id TEXT NOT NULL, call_request_id TEXT NOT NULL,
+          attempt_order INTEGER NOT NULL, channel_key TEXT NOT NULL,
+          channel_type TEXT NOT NULL, model TEXT NOT NULL, pricing_model TEXT,
+          outcome TEXT, usage_observed INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          service_tier TEXT, outbound_service_tier TEXT,
+          dispatch_state TEXT NOT NULL DEFAULT 'unknown',
+          pricing_snapshot_json TEXT, pricing_version TEXT,
+          cost_source TEXT NOT NULL, cost_ticks INTEGER, settled_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_attempt_usage_root ON upstream_attempt_usage(root_request_id);
+        CREATE INDEX IF NOT EXISTS idx_attempt_usage_channel ON upstream_attempt_usage(channel_key);
+        CREATE INDEX IF NOT EXISTS idx_attempt_usage_model ON upstream_attempt_usage(model);
+        """)
+        changed = True
+    else:
+        # Recover from any interrupted/partial migration. Table existence alone
+        # does not imply that the immutable settlement schema is complete.
+        for col, ddl in (
+            ("retry_attempt_id", "ALTER TABLE upstream_attempt_usage ADD COLUMN retry_attempt_id INTEGER"),
+            ("root_request_id", "ALTER TABLE upstream_attempt_usage ADD COLUMN root_request_id TEXT NOT NULL DEFAULT ''"),
+            ("call_request_id", "ALTER TABLE upstream_attempt_usage ADD COLUMN call_request_id TEXT NOT NULL DEFAULT ''"),
+            ("attempt_order", "ALTER TABLE upstream_attempt_usage ADD COLUMN attempt_order INTEGER NOT NULL DEFAULT 0"),
+            ("channel_key", "ALTER TABLE upstream_attempt_usage ADD COLUMN channel_key TEXT NOT NULL DEFAULT ''"),
+            ("channel_type", "ALTER TABLE upstream_attempt_usage ADD COLUMN channel_type TEXT NOT NULL DEFAULT ''"),
+            ("model", "ALTER TABLE upstream_attempt_usage ADD COLUMN model TEXT NOT NULL DEFAULT ''"),
+            ("pricing_model", "ALTER TABLE upstream_attempt_usage ADD COLUMN pricing_model TEXT"),
+            ("outcome", "ALTER TABLE upstream_attempt_usage ADD COLUMN outcome TEXT"),
+            ("usage_observed", "ALTER TABLE upstream_attempt_usage ADD COLUMN usage_observed INTEGER NOT NULL DEFAULT 0"),
+            ("input_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0"),
+            ("output_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0"),
+            ("cache_creation_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0"),
+            ("cache_read_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0"),
+            ("service_tier", "ALTER TABLE upstream_attempt_usage ADD COLUMN service_tier TEXT"),
+            ("outbound_service_tier", "ALTER TABLE upstream_attempt_usage ADD COLUMN outbound_service_tier TEXT"),
+            ("dispatch_state", "ALTER TABLE upstream_attempt_usage ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'unknown'"),
+            ("pricing_snapshot_json", "ALTER TABLE upstream_attempt_usage ADD COLUMN pricing_snapshot_json TEXT"),
+            ("pricing_version", "ALTER TABLE upstream_attempt_usage ADD COLUMN pricing_version TEXT"),
+            ("cost_source", "ALTER TABLE upstream_attempt_usage ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'unpriced'"),
+            ("cost_ticks", "ALTER TABLE upstream_attempt_usage ADD COLUMN cost_ticks INTEGER"),
+            ("settled_at", "ALTER TABLE upstream_attempt_usage ADD COLUMN settled_at REAL NOT NULL DEFAULT 0"),
+        ):
+            if col not in attempt_usage_cols:
+                conn.execute(ddl)
+                changed = True
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_attempt_usage_retry ON upstream_attempt_usage(retry_attempt_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_usage_root ON upstream_attempt_usage(root_request_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_usage_channel ON upstream_attempt_usage(channel_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_usage_model ON upstream_attempt_usage(model)")
     # retry_chain migration
     retry_cols = {row[1] for row in conn.execute("PRAGMA table_info(retry_chain)").fetchall()}
     if retry_cols and "proxy_name" not in retry_cols:
@@ -370,6 +472,9 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         if "final_round_id" not in retry_cols:
             conn.execute("ALTER TABLE retry_chain ADD COLUMN final_round_id TEXT")
             changed = True
+    if retry_cols and "outbound_service_tier" not in retry_cols:
+        conn.execute("ALTER TABLE retry_chain ADD COLUMN outbound_service_tier TEXT")
+        changed = True
 
     proxy_cols = {row[1] for row in conn.execute("PRAGMA table_info(proxy_chain)").fetchall()}
     if not proxy_cols:
@@ -1394,6 +1499,7 @@ def record_retry_attempt(
     channel_key: str, channel_type: str, model: str,
     started_at: float,
     proxy_name: str | None = None,
+    outbound_service_tier: str | None = None,
 ) -> RowLogHandle:
     """Insert one outer channel attempt and return a month-bound row handle."""
     request = _request_handle(request_id)
@@ -1401,15 +1507,226 @@ def record_retry_attempt(
         conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO retry_chain
-               (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name)
-               VALUES (?,?,?,?,?,?,?)""",
-            (request.request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name),
+               (request_id, attempt_order, channel_key, channel_type, model,
+                started_at, proxy_name, outbound_service_tier)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                request.request_id, attempt_order, channel_key, channel_type, model,
+                started_at, proxy_name, outbound_service_tier,
+            ),
         )
         conn.commit()
         return RowLogHandle(
             table="retry_chain", row_id=int(cur.lastrowid),
             request_id=request.request_id, db=request.db,
         )
+
+
+def _outbound_service_tier(request_body: Any) -> str | None:
+    """Read a tier only from a complete outbound JSON request body."""
+    obj = request_body
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            obj = json.loads(bytes(obj).decode("utf-8"))
+        except Exception:
+            return None
+    elif isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except Exception:
+            return None
+    if not isinstance(obj, dict):
+        return None
+    value = obj.get("service_tier")
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    return value or None
+
+
+def mark_retry_attempt_dispatch(
+    attempt_id: int | RowLogHandle,
+    request_body: Any,
+) -> None:
+    """Persist the resolved outbound tier immediately before transport dispatch."""
+    handle = _row_handle(attempt_id, table="retry_chain")
+    tier = _outbound_service_tier(request_body)
+    with _write_lock:
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
+            "UPDATE retry_chain SET outbound_service_tier=? WHERE id=?",
+            (tier, handle.row_id),
+        )
+        conn.commit()
+
+
+def _billing_root_request_id(call_request_id: str) -> str:
+    """Map Compact's internal call ids back to the downstream request."""
+
+    marker = ":compact:"
+    return call_request_id.split(marker, 1)[0] if marker in call_request_id else call_request_id
+
+
+def _usage_values(usage: dict | None, normalized) -> tuple[int, int, int, int]:
+    if normalized.usage_observed:
+        return (
+            normalized.input_tokens, normalized.output_tokens,
+            normalized.cache_creation_tokens, normalized.cache_read_tokens,
+        )
+    if isinstance(usage, dict):
+        return (
+            max(0, int(usage.get("input_tokens") or 0)),
+            max(0, int(usage.get("output_tokens") or 0)),
+            max(0, int(usage.get("cache_creation", usage.get("cache_creation_tokens", 0)) or 0)),
+            max(0, int(usage.get("cache_read", usage.get("cache_read_tokens", 0)) or 0)),
+        )
+    return (0, 0, 0, 0)
+
+
+def _settle_retry_attempt_locked(
+    conn: sqlite3.Connection,
+    attempt_id: int,
+    *,
+    outcome: str | None = None,
+    response_body: Any = None,
+    usage: dict | None = None,
+    usage_observed: bool | None = None,
+    final: bool = False,
+) -> bool:
+    """Insert one immutable normalized settlement row (idempotent)."""
+
+    if conn.execute(
+        "SELECT 1 FROM upstream_attempt_usage WHERE retry_attempt_id=?",
+        (int(attempt_id),),
+    ).fetchone():
+        return False
+    attempt = conn.execute(
+        "SELECT * FROM retry_chain WHERE id=?", (int(attempt_id),)
+    ).fetchone()
+    if attempt is None:
+        return False
+    resolved_outcome = str(outcome or attempt["outcome"] or "")
+    # Candidate/transform guards never crossed the upstream transport boundary.
+    # They remain retry diagnostics, not billing ledger facts.
+    if resolved_outcome in {
+        "candidate_guard", "guard_error", "transform_error", "queue_timeout",
+    }:
+        return False
+    normalized = model_pricing.normalize_response_billing(response_body)
+    tokens = _usage_values(usage, normalized)
+    if usage_observed is None:
+        observed = normalized.usage_observed or any(tokens)
+    else:
+        observed = bool(usage_observed)
+    root_request_id = _billing_root_request_id(str(attempt["request_id"]))
+    actual_tier = normalized.service_tier
+    outbound_tier = (
+        str(attempt["outbound_service_tier"] or "").strip().lower() or None
+    )
+    tier = actual_tier or outbound_tier
+    priority = tier in {"priority", "fast"}
+    pricing_model = model_pricing.provider_pricing_model(
+        str(attempt["model"] or "?"), str(attempt["channel_key"] or "")
+    )
+    actual_ticks = (
+        normalized.actual_cost_ticks
+        if str(attempt["channel_key"] or "").lower().startswith(("oauth:xai:", "xai:", "api:xai:"))
+        else None
+    )
+    if normalized.usage_observed or actual_ticks is not None:
+        dispatch_state = "sent"
+    elif resolved_outcome == "success" or resolved_outcome.startswith(("http_", "stream_")):
+        dispatch_state = "sent"
+    elif attempt["first_byte_ms"] is not None:
+        dispatch_state = "sent"
+    else:
+        # Connect/send/timeout failures cannot prove whether the upstream
+        # accepted bytes. Preserve the attempt but never turn it into $0.
+        dispatch_state = "unknown"
+    cost_source = "unpriced"
+    cost_ticks: int | None = None
+    pricing_snapshot_json: str | None = None
+    pricing_version: str | None = None
+    if dispatch_state == "sent" and actual_ticks is not None:
+        cost_source, cost_ticks = "actual", actual_ticks
+        pricing_snapshot_json = json.dumps(
+            {"schema": 1, "source": "upstream_actual", "model": pricing_model},
+            sort_keys=True, separators=(",", ":"),
+        )
+        pricing_version = "upstream-actual-v1"
+    elif dispatch_state == "sent" and observed:
+        estimate = model_pricing.estimate_cost(
+            pricing_model,
+            input_tokens=tokens[0], output_tokens=tokens[1],
+            cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
+            priority=priority,
+        )
+        if estimate is not None:
+            cost_source, cost_ticks = "estimated", estimate.total_ticks
+            pricing_snapshot_json, pricing_version = model_pricing.resolved_pricing_snapshot(
+                pricing_model,
+                input_tokens=tokens[0], output_tokens=tokens[1],
+                cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
+                priority=priority,
+            )
+    conn.execute(
+        """INSERT OR IGNORE INTO upstream_attempt_usage
+           (retry_attempt_id, root_request_id, call_request_id, attempt_order,
+            channel_key, channel_type, model, pricing_model, outcome, usage_observed,
+            input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+            service_tier, outbound_service_tier, dispatch_state,
+            pricing_snapshot_json, pricing_version,
+            cost_source, cost_ticks, settled_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(attempt_id), root_request_id, str(attempt["request_id"]),
+            int(attempt["attempt_order"] or 0), str(attempt["channel_key"] or ""),
+            str(attempt["channel_type"] or ""), str(attempt["model"] or ""),
+            pricing_model, resolved_outcome, 1 if observed else 0,
+            *tokens, tier, outbound_tier, dispatch_state,
+            pricing_snapshot_json, pricing_version,
+            cost_source, cost_ticks, time.time(),
+        ),
+    )
+    if final and actual_tier:
+        conn.execute(
+            "UPDATE request_log SET actual_service_tier=? WHERE request_id=?",
+            (actual_tier, root_request_id),
+        )
+    return True
+
+
+def settle_retry_attempt(
+    attempt_id: int | RowLogHandle,
+    *,
+    outcome: str | None = None,
+    response_body: Any = None,
+    usage: dict | None = None,
+    usage_observed: bool | None = None,
+    final: bool = False,
+) -> bool:
+    handle = _row_handle(attempt_id, table="retry_chain")
+    with _write_lock:
+        conn = _get_conn_for_ref(handle.db)
+        inserted = _settle_retry_attempt_locked(
+            conn, handle.row_id, outcome=outcome, response_body=response_body,
+            usage=usage, usage_observed=usage_observed, final=final,
+        )
+        conn.commit()
+        return inserted
+
+
+def _settle_latest_retry_locked(
+    conn: sqlite3.Connection, request_id: str, **kwargs: Any
+) -> bool:
+    row = conn.execute(
+        """SELECT r.id FROM retry_chain r
+           LEFT JOIN upstream_attempt_usage a ON a.retry_attempt_id=r.id
+           WHERE r.request_id=? AND a.id IS NULL
+           ORDER BY r.attempt_order DESC, r.id DESC LIMIT 1""",
+        (request_id,),
+    ).fetchone()
+    return bool(row and _settle_retry_attempt_locked(conn, int(row["id"]), **kwargs))
 
 
 def update_retry_attempt(
@@ -1429,6 +1746,9 @@ def update_retry_attempt(
     proxy_name: str | None = None,
     bytes_up: int | None = None,
     bytes_down: int | None = None,
+    response_body: Any = None,
+    usage: dict | None = None,
+    usage_observed: bool | None = None,
 ) -> None:
     fields, vals = [], []
     if final_round_id is not None:
@@ -1469,6 +1789,14 @@ def update_retry_attempt(
             f"UPDATE retry_chain SET {', '.join(fields)} WHERE id=?",
             vals,
         )
+        # ``open`` is the only non-terminal transport state.  All terminal
+        # outcomes settle here, including successful local-tool sub-rounds;
+        # guard/transform failures are filtered by the settlement function.
+        if outcome is not None and outcome != "open":
+            _settle_retry_attempt_locked(
+                conn, handle.row_id, outcome=outcome, response_body=response_body,
+                usage=usage, usage_observed=usage_observed, final=False,
+            )
         conn.commit()
 
 
@@ -1669,10 +1997,22 @@ def finish_success(
     request_upload_ms: int | None = None,
     response_headers_wait_ms: int | None = None,
     response_body_first_byte_wait_ms: int | None = None,
+    usage_observed: bool | None = None,
 ) -> None:
     handle = _request_handle(request_id)
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
+        normalized_billing = model_pricing.normalize_response_billing(response_body)
+        observed = (
+            bool(usage_observed) if usage_observed is not None
+            else bool(
+                normalized_billing.usage_observed
+                or any((
+                    input_tokens, output_tokens,
+                    cache_creation_tokens, cache_read_tokens,
+                ))
+            )
+        )
         conn.execute(
             """UPDATE request_log SET
                  status='success', finished_at=?, http_status=?,
@@ -1684,7 +2024,8 @@ def finish_success(
                  retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
                  proxy_bytes_up=?, proxy_bytes_down=?,
                  request_upload_ms=?, response_headers_wait_ms=?,
-                 response_body_first_byte_wait_ms=?
+                 response_body_first_byte_wait_ms=?, usage_observed=?,
+                 actual_service_tier=?
                WHERE request_id=?""",
             (
                 time.time(), http_status,
@@ -1697,6 +2038,8 @@ def finish_success(
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
                 request_upload_ms, response_headers_wait_ms,
                 response_body_first_byte_wait_ms,
+                1 if observed else 0,
+                normalized_billing.service_tier,
                 handle.request_id,
             ),
         )
@@ -1705,6 +2048,14 @@ def finish_success(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
                 (response_body, handle.request_id),
             )
+        _settle_latest_retry_locked(
+            conn, handle.request_id, outcome="success", response_body=response_body,
+            usage={
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+                "cache_creation": cache_creation_tokens, "cache_read": cache_read_tokens,
+            },
+            usage_observed=usage_observed, final=True,
+        )
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _request_handles.pop(handle.request_id, None)
@@ -1735,11 +2086,17 @@ def finish_error(
     response_headers_wait_ms: int | None = None,
     response_body_first_byte_wait_ms: int | None = None,
     status: str = "error",
+    usage_observed: bool | None = None,
 ) -> None:
     terminal_status = "cancelled" if status == "cancelled" else "error"
     handle = _request_handle(request_id)
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
+        normalized_billing = model_pricing.normalize_response_billing(response_body)
+        observed = (
+            bool(usage_observed) if usage_observed is not None
+            else bool(normalized_billing.usage_observed)
+        )
         conn.execute(
             """UPDATE request_log SET
                  status=?, finished_at=?, error_message=?, http_status=?,
@@ -1749,7 +2106,8 @@ def finish_error(
                  retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
                  proxy_bytes_up=?, proxy_bytes_down=?,
                  request_upload_ms=?, response_headers_wait_ms=?,
-                 response_body_first_byte_wait_ms=?
+                 response_body_first_byte_wait_ms=?, usage_observed=?,
+                 actual_service_tier=?
                WHERE request_id=?""",
             (
                 terminal_status, time.time(), error_message, http_status,
@@ -1760,6 +2118,8 @@ def finish_error(
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
                 request_upload_ms, response_headers_wait_ms,
                 response_body_first_byte_wait_ms,
+                1 if observed else 0,
+                normalized_billing.service_tier,
                 handle.request_id,
             ),
         )
@@ -1768,6 +2128,10 @@ def finish_error(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
                 (response_body, handle.request_id),
             )
+        _settle_latest_retry_locked(
+            conn, handle.request_id, outcome=terminal_status, response_body=response_body,
+            usage_observed=usage_observed, final=True,
+        )
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _request_handles.pop(handle.request_id, None)
@@ -1865,6 +2229,23 @@ def _estimate_cost_into(bucket: dict, row, *, row_count: int, pricing_settings) 
     _add_cost(bucket, estimate.total_ticks, row_count, actual=False)
 
 
+def _add_attempt_cost_row(bucket: dict, row) -> None:
+    source = str(row["cost_source"] or "unpriced")
+    if source == "actual":
+        _add_cost(bucket, int(row["cost_ticks"] or 0), 1, actual=True)
+    elif source == "estimated":
+        _add_cost(bucket, int(row["cost_ticks"] or 0), 1, actual=False)
+    else:
+        _add_unpriced(bucket, 1)
+
+
+def _attempt_rows_exist(conn: sqlite3.Connection) -> bool:
+    try:
+        return conn.execute("SELECT 1 FROM upstream_attempt_usage LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
 def _accumulate_filtered_costs(
     conn,
     since_ts: float,
@@ -1877,6 +2258,20 @@ def _accumulate_filtered_costs(
     if not pricing_settings.enabled:
         return
 
+    if _attempt_rows_exist(conn):
+        attempt_where = (
+            "a.channel_key=?" if where.strip() == "final_channel_key=?" else where
+        )
+        rows = conn.execute(
+            f"""SELECT a.cost_source, a.cost_ticks
+                FROM upstream_attempt_usage a
+                JOIN request_log ON request_log.request_id=a.root_request_id
+                WHERE ({attempt_where}) AND request_log.created_at >= ?""",
+            where_args + (since_ts,),
+        ).fetchall()
+        for row in rows:
+            _add_attempt_cost_row(bucket, row)
+
     model_expr = "COALESCE(final_model, requested_model, '?')"
     prompt_expr = (
         "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
@@ -1884,6 +2279,8 @@ def _accumulate_filtered_costs(
     )
     standard_where = (
         f"({where}) AND created_at >= ? AND status='success' "
+        "AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage au "
+        "WHERE au.root_request_id=request_log.request_id) "
         "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
     )
     standard_args = where_args + (since_ts,)
@@ -1909,8 +2306,10 @@ def _accumulate_filtered_costs(
                COALESCE(fast_mode, 0) AS fast_mode,
                {long_case} AS long_context,
                {cache_ttl_case} AS cache_ttl_known,
-               MIN(CASE WHEN COALESCE(cache_read_tokens, 0) > 0
-                              AND COALESCE(upstream_protocol, '') = ''
+               MIN(CASE WHEN usage_observed = 0 THEN 0
+                        WHEN usage_observed IS NULL
+                             AND COALESCE(cache_read_tokens, 0) > 0
+                             AND COALESCE(upstream_protocol, '') = ''
                         THEN 0 ELSE 1 END) AS usage_semantics_known,
                COUNT(*) AS row_count,
                SUM(input_tokens) AS input_tokens,
@@ -1920,7 +2319,9 @@ def _accumulate_filtered_costs(
              FROM request_log
              WHERE {standard_where}
              GROUP BY pricing_model, fast_mode, long_context, cache_ttl_known,
-                      CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                      CASE WHEN usage_observed = 0 THEN 0
+                           WHEN usage_observed IS NULL
+                                AND COALESCE(cache_read_tokens, 0) > 0
                                 AND COALESCE(upstream_protocol, '') = ''
                            THEN 0 ELSE 1 END""",
         long_args + cache_ttl_args + standard_args,
@@ -1941,14 +2342,18 @@ def _accumulate_filtered_costs(
                request_log.output_tokens AS output_tokens,
                request_log.cache_creation_tokens AS cache_creation_tokens,
                request_log.cache_read_tokens AS cache_read_tokens,
-               CASE WHEN COALESCE(request_log.cache_read_tokens, 0) > 0
-                          AND COALESCE(request_log.upstream_protocol, '') = ''
+               CASE WHEN request_log.usage_observed = 0 THEN 0
+                    WHEN request_log.usage_observed IS NULL
+                         AND COALESCE(request_log.cache_read_tokens, 0) > 0
+                         AND COALESCE(request_log.upstream_protocol, '') = ''
                     THEN 0 ELSE 1 END AS usage_semantics_known,
                substr(request_detail.response_body, -{_XAI_COST_BODY_TAIL_CHARS}) AS response_body
              FROM request_log
              LEFT JOIN request_detail USING (request_id)
              WHERE ({where}) AND request_log.created_at >= ?
                AND request_log.status='success'
+               AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage au
+                               WHERE au.root_request_id=request_log.request_id)
                AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
         where_args + (since_ts,),
     )
@@ -1978,6 +2383,21 @@ def _accumulate_grouped_costs(
     if not pricing_settings.enabled:
         return
 
+    if _attempt_rows_exist(conn):
+        channel_attempts = where.strip() == "final_channel_key=?"
+        attempt_where = "a.channel_key=?" if channel_attempts else where
+        attempt_group_expr = "COALESCE(a.model, '?')" if channel_attempts else group_expr
+        rows = conn.execute(
+            f"""SELECT {attempt_group_expr} AS grp_key, a.cost_source, a.cost_ticks
+                FROM upstream_attempt_usage a
+                JOIN request_log ON request_log.request_id=a.root_request_id
+                WHERE ({attempt_where}) AND request_log.created_at >= ?""",
+            where_args + (since_ts,),
+        ).fetchall()
+        for row in rows:
+            key = row["grp_key"] or "?"
+            _add_attempt_cost_row(buckets.setdefault(key, _new_token_stats_agg()), row)
+
     model_expr = "COALESCE(final_model, requested_model, '?')"
     prompt_expr = (
         "COALESCE(input_tokens, 0) + COALESCE(cache_creation_tokens, 0) "
@@ -1985,6 +2405,8 @@ def _accumulate_grouped_costs(
     )
     standard_where = (
         f"({where}) AND created_at >= ? AND status='success' "
+        "AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage au "
+        "WHERE au.root_request_id=request_log.request_id) "
         "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
     )
     standard_args = where_args + (since_ts,)
@@ -2011,8 +2433,10 @@ def _accumulate_grouped_costs(
                COALESCE(fast_mode, 0) AS fast_mode,
                {long_case} AS long_context,
                {cache_ttl_case} AS cache_ttl_known,
-               MIN(CASE WHEN COALESCE(cache_read_tokens, 0) > 0
-                              AND COALESCE(upstream_protocol, '') = ''
+               MIN(CASE WHEN usage_observed = 0 THEN 0
+                        WHEN usage_observed IS NULL
+                             AND COALESCE(cache_read_tokens, 0) > 0
+                             AND COALESCE(upstream_protocol, '') = ''
                         THEN 0 ELSE 1 END) AS usage_semantics_known,
                COUNT(*) AS row_count,
                SUM(input_tokens) AS input_tokens,
@@ -2023,7 +2447,9 @@ def _accumulate_grouped_costs(
              WHERE {standard_where}
              GROUP BY grp_key, pricing_model, fast_mode, long_context,
                       cache_ttl_known,
-                      CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                      CASE WHEN usage_observed = 0 THEN 0
+                           WHEN usage_observed IS NULL
+                                AND COALESCE(cache_read_tokens, 0) > 0
                                 AND COALESCE(upstream_protocol, '') = ''
                            THEN 0 ELSE 1 END""",
         long_args + cache_ttl_args + standard_args,
@@ -2047,14 +2473,18 @@ def _accumulate_grouped_costs(
                request_log.output_tokens AS output_tokens,
                request_log.cache_creation_tokens AS cache_creation_tokens,
                request_log.cache_read_tokens AS cache_read_tokens,
-               CASE WHEN COALESCE(request_log.cache_read_tokens, 0) > 0
-                          AND COALESCE(request_log.upstream_protocol, '') = ''
+               CASE WHEN request_log.usage_observed = 0 THEN 0
+                    WHEN request_log.usage_observed IS NULL
+                         AND COALESCE(request_log.cache_read_tokens, 0) > 0
+                         AND COALESCE(request_log.upstream_protocol, '') = ''
                     THEN 0 ELSE 1 END AS usage_semantics_known,
                substr(request_detail.response_body, -{_XAI_COST_BODY_TAIL_CHARS}) AS response_body
              FROM request_log
              LEFT JOIN request_detail USING (request_id)
              WHERE ({where}) AND request_log.created_at >= ?
                AND request_log.status='success'
+               AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage au
+                               WHERE au.root_request_id=request_log.request_id)
                AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
         where_args + (since_ts,),
     )
@@ -2073,10 +2503,48 @@ def _accumulate_grouped_costs(
             )
 
 
+def _attempt_cost_for_request(request_id: str, created_at: Any = None) -> dict | None:
+    if not request_id or _log_dir is None:
+        return None
+    conn = None
+    close = False
+    try:
+        if created_at is not None:
+            month = datetime.fromtimestamp(float(created_at), _BJT).strftime("%Y-%m")
+            conn = _get_conn_for_month(month)
+            close = conn is not None
+        if conn is None:
+            conn = _get_conn()
+        rows = conn.execute(
+            """SELECT cost_source, cost_ticks FROM upstream_attempt_usage
+               WHERE root_request_id=? ORDER BY id""",
+            (request_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        out = _new_cost_agg()
+        for item in rows:
+            _add_attempt_cost_row(out, item)
+        return out
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+    finally:
+        if close and conn is not None:
+            conn.close()
+
+
 def cost_for_log(row: dict | None) -> dict:
-    """Return actual/estimated cost metrics for one successful request row."""
+    """Return aggregate cost for every real upstream attempt of one request."""
     out = _new_cost_agg()
-    if not isinstance(row, dict) or row.get("status") != "success":
+    if not isinstance(row, dict):
+        return out
+    attempt_cost = _attempt_cost_for_request(
+        str(row.get("request_id") or ""), row.get("created_at")
+    )
+    if attempt_cost is not None:
+        return attempt_cost
+    # Backward-compatible fallback for pre-migration request_log rows.
+    if row.get("status") != "success":
         return out
     pricing_settings = model_pricing.settings()
     if not pricing_settings.enabled:
@@ -2088,22 +2556,23 @@ def cost_for_log(row: dict | None) -> dict:
         if actual_ticks is not None:
             _add_cost(out, actual_ticks, 1, actual=True)
             return out
-
-    # Old OpenAI rows stored total prompt tokens in input_tokens, while current
-    # rows store uncached input.  Migrated rows have no upstream_protocol, so a
-    # cache hit is ambiguous and must not be presented as a precise estimate.
+    if row.get("usage_observed") is not None and not bool(row.get("usage_observed")):
+        _add_unpriced(out, 1)
+        return out
     if (row.get("cache_read_tokens") or 0) > 0 and not row.get("upstream_protocol"):
         _add_unpriced(out, 1)
         return out
-
-    pricing_model = row.get("final_model") or row.get("requested_model") or "?"
+    pricing_model = model_pricing.provider_pricing_model(
+        str(row.get("final_model") or row.get("requested_model") or "?"), channel_key
+    )
     estimate = model_pricing.estimate_cost(
-        str(pricing_model),
+        pricing_model,
         input_tokens=row.get("input_tokens") or 0,
         output_tokens=row.get("output_tokens") or 0,
         cache_creation_tokens=row.get("cache_creation_tokens") or 0,
         cache_read_tokens=row.get("cache_read_tokens") or 0,
-        priority=bool(row.get("fast_mode")),
+        priority=bool(row.get("actual_service_tier") in {"priority", "fast"})
+        if row.get("actual_service_tier") else bool(row.get("fast_mode")),
         pricing_settings=pricing_settings,
     )
     if estimate is None:
@@ -2175,6 +2644,11 @@ def stats_lifetime() -> dict:
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
             if cost_schema_ready:
+                delta = _attempt_token_delta_for_filter(conn, "1=1", (), 0)
+                out["input_tokens"] += delta[0]
+                out["output_tokens"] += delta[1]
+                out["cache_creation"] += delta[2]
+                out["cache_read"] += delta[3]
                 _accumulate_filtered_costs(conn, 0, "1=1", (), out)
             elif model_pricing.settings().enabled:
                 _add_unpriced(out, int(row["succ"] or 0))
@@ -2276,11 +2750,12 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
     out: dict[str, Any] = {
         "total": 0, "success_count": 0, "error_count": 0,
         "input": 0, "output": 0, "cache_creation": 0, "cache_read": 0,
-        "cost_ticks": 0, "cost_rows": 0,
+        "cost_rows": 0,
         "service_tier_counts": {},
         "tps_num_tokens": 0, "tps_denom_ms": 0,
         "max_tps": None, "min_tps": None,
     }
+    out.update(_new_cost_agg())
     if _log_dir is None or not os.path.isdir(_log_dir):
         tps = _finalize_tps(out)
         out.update(tps)
@@ -2304,6 +2779,8 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                      l.total_time_ms,
                      l.input_tokens, l.output_tokens,
                      l.cache_creation_tokens, l.cache_read_tokens,
+                     EXISTS (SELECT 1 FROM upstream_attempt_usage a
+                             WHERE a.root_request_id=l.request_id) AS has_attempt_usage,
                      {response_expr} AS response_body
                    FROM request_log l
                    {detail_join}
@@ -2316,10 +2793,11 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                     out["success_count"] += 1
                 elif r["status"] == "error":
                     out["error_count"] += 1
-                out["input"] += int(r["input_tokens"] or 0)
-                out["output"] += int(r["output_tokens"] or 0)
-                out["cache_creation"] += int(r["cache_creation_tokens"] or 0)
-                out["cache_read"] += int(r["cache_read_tokens"] or 0)
+                if not bool(r["has_attempt_usage"]):
+                    out["input"] += int(r["input_tokens"] or 0)
+                    out["output"] += int(r["output_tokens"] or 0)
+                    out["cache_creation"] += int(r["cache_creation_tokens"] or 0)
+                    out["cache_read"] += int(r["cache_read_tokens"] or 0)
                 output_tokens = int(r["output_tokens"] or 0)
                 total_ms = int(r["total_time_ms"] or 0)
                 first_ms = r["first_token_time_ms"]
@@ -2335,7 +2813,7 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                     tps = output_tokens * 1000.0 / denom_ms
                     out["max_tps"] = tps if out.get("max_tps") is None else max(float(out["max_tps"]), tps)
                     out["min_tps"] = tps if out.get("min_tps") is None else min(float(out["min_tps"]), tps)
-                if include_cost:
+                if include_cost and not bool(r["has_attempt_usage"]):
                     resp = _extract_xai_response_from_response_body(r["response_body"])
                     if isinstance(resp, dict):
                         tier = str(resp.get("service_tier") or "").strip().lower()
@@ -2344,7 +2822,27 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                             counts[tier] = int(counts.get(tier) or 0) + 1
                     ticks = model_pricing.extract_actual_cost_ticks(r["response_body"])
                     if ticks is not None:
-                        out["cost_ticks"] += ticks
+                        _add_cost(out, ticks, 1, actual=True)
+                        out["cost_rows"] += 1
+            attempts = conn.execute(
+                """SELECT a.* FROM upstream_attempt_usage a
+                   JOIN request_log l ON l.request_id=a.root_request_id
+                   WHERE a.channel_key=? AND l.created_at>=?""",
+                (channel_key, since_ts),
+            ).fetchall()
+            for a in attempts:
+                if bool(a["usage_observed"]):
+                    out["input"] += int(a["input_tokens"] or 0)
+                    out["output"] += int(a["output_tokens"] or 0)
+                    out["cache_creation"] += int(a["cache_creation_tokens"] or 0)
+                    out["cache_read"] += int(a["cache_read_tokens"] or 0)
+                tier = str(a["service_tier"] or "").strip().lower()
+                if tier:
+                    counts = out.setdefault("service_tier_counts", {})
+                    counts[tier] = int(counts.get(tier) or 0) + 1
+                if include_cost:
+                    _add_attempt_cost_row(out, a)
+                    if a["cost_source"] in {"actual", "estimated"}:
                         out["cost_rows"] += 1
         except Exception as exc:
             raise HistoricalLogError(f"xai_cost_for_channel failed: {exc}") from exc
@@ -2358,6 +2856,103 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
     out.update(tps)
     out["cost_usd"] = float(out["cost_ticks"] or 0) / 10_000_000_000
     return out
+
+
+def _attempt_token_delta_for_filter(
+    conn: sqlite3.Connection, where: str, where_args: tuple, since_ts: float
+) -> tuple[int, int, int, int]:
+    """Replace final-request tokens with all observed attempt tokens."""
+
+    if not _attempt_rows_exist(conn):
+        return (0, 0, 0, 0)
+    old = conn.execute(
+        f"""SELECT SUM(input_tokens) AS inp, SUM(output_tokens) AS outp,
+                   SUM(cache_creation_tokens) AS cc, SUM(cache_read_tokens) AS cr
+            FROM request_log
+            WHERE {where} AND created_at >= ?
+              AND EXISTS (SELECT 1 FROM upstream_attempt_usage a
+                          WHERE a.root_request_id=request_log.request_id)""",
+        where_args + (since_ts,),
+    ).fetchone()
+    if where.strip() == "final_channel_key=?":
+        attempt_where = "a.channel_key=?"
+    else:
+        attempt_where = where.replace("api_key_name", "request_log.api_key_name")
+        attempt_where = attempt_where.replace("requested_model", "request_log.requested_model")
+    new = conn.execute(
+        f"""SELECT SUM(a.input_tokens) AS inp, SUM(a.output_tokens) AS outp,
+                   SUM(a.cache_creation_tokens) AS cc, SUM(a.cache_read_tokens) AS cr
+            FROM upstream_attempt_usage a
+            JOIN request_log ON request_log.request_id=a.root_request_id
+            WHERE {attempt_where} AND request_log.created_at >= ?
+              AND a.usage_observed=1""",
+        where_args + (since_ts,),
+    ).fetchone()
+    return tuple(
+        int((new[key] if new else 0) or 0) - int((old[key] if old else 0) or 0)
+        for key in ("inp", "outp", "cc", "cr")
+    )
+
+
+def _replace_summary_tokens_with_attempts(
+    conn: sqlite3.Connection, since_ts: float, family: str | None,
+    overall: dict, by_channel: dict, by_model: dict, by_apikey: dict,
+) -> None:
+    if not _attempt_rows_exist(conn):
+        return
+    args = (since_ts, *_family_params(family))
+    roots = conn.execute(
+        f"""SELECT request_log.final_channel_key AS channel_key,
+                   request_log.requested_model AS model_key, request_log.api_key_name AS apikey_key,
+                   request_log.input_tokens AS inp, request_log.output_tokens AS outp,
+                   request_log.cache_creation_tokens AS cc, request_log.cache_read_tokens AS cr
+            FROM request_log
+            WHERE request_log.created_at >= ?{_family_where(family)}
+              AND EXISTS (SELECT 1 FROM upstream_attempt_usage a
+                          WHERE a.root_request_id=request_log.request_id)""",
+        args,
+    ).fetchall()
+    for row in roots:
+        vals = (int(row["inp"] or 0), int(row["outp"] or 0), int(row["cc"] or 0), int(row["cr"] or 0))
+        overall["total_input_tokens"] -= vals[0]
+        overall["total_output_tokens"] -= vals[1]
+        overall["total_cache_creation"] -= vals[2]
+        overall["total_cache_read"] -= vals[3]
+        for bucket in (
+            by_channel.setdefault(row["channel_key"] or "?", _new_group_agg()),
+            by_model.setdefault(row["model_key"] or "?", _new_group_agg()),
+            by_apikey.setdefault(row["apikey_key"] or "?", _new_group_agg()),
+        ):
+            bucket["total_prompt_tokens"] -= vals[0] + vals[2] + vals[3]
+            bucket["total_output_tokens"] -= vals[1]
+            bucket["total_cache_creation"] -= vals[2]
+            bucket["total_cache_read"] -= vals[3]
+    attempts = conn.execute(
+        f"""SELECT a.channel_key, request_log.requested_model AS model_key,
+                   request_log.api_key_name AS apikey_key, a.input_tokens AS inp,
+                   a.output_tokens AS outp, a.cache_creation_tokens AS cc,
+                   a.cache_read_tokens AS cr
+            FROM upstream_attempt_usage a
+            JOIN request_log ON request_log.request_id=a.root_request_id
+            WHERE request_log.created_at >= ?{_family_where(family)}
+              AND a.usage_observed=1""",
+        args,
+    ).fetchall()
+    for row in attempts:
+        vals = (int(row["inp"] or 0), int(row["outp"] or 0), int(row["cc"] or 0), int(row["cr"] or 0))
+        overall["total_input_tokens"] += vals[0]
+        overall["total_output_tokens"] += vals[1]
+        overall["total_cache_creation"] += vals[2]
+        overall["total_cache_read"] += vals[3]
+        for bucket in (
+            by_channel.setdefault(row["channel_key"] or "?", _new_group_agg()),
+            by_model.setdefault(row["model_key"] or "?", _new_group_agg()),
+            by_apikey.setdefault(row["apikey_key"] or "?", _new_group_agg()),
+        ):
+            bucket["total_prompt_tokens"] += vals[0] + vals[2] + vals[3]
+            bucket["total_output_tokens"] += vals[1]
+            bucket["total_cache_creation"] += vals[2]
+            bucket["total_cache_read"] += vals[3]
 
 
 def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict:
@@ -2391,6 +2986,11 @@ def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
                 _merge_tps(out, row)
+            delta = _attempt_token_delta_for_filter(conn, where, where_args, since_ts)
+            out["input"] += delta[0]
+            out["output"] += delta[1]
+            out["cache_creation"] += delta[2]
+            out["cache_read"] += delta[3]
             _accumulate_filtered_costs(conn, since_ts, where, where_args, out)
         except Exception as exc:
             raise HistoricalLogError(f"aggregate query failed: {exc}") from exc
@@ -3274,6 +3874,21 @@ def _accumulate_usage_costs(
             by_apikey.setdefault(apikey_key or "?", _new_group_agg()),
         )
 
+    if _attempt_rows_exist(conn):
+        attempt_rows = conn.execute(
+            f"""SELECT a.cost_source, a.cost_ticks,
+                       COALESCE(a.channel_key, request_log.final_channel_key, '?') AS channel_key,
+                       COALESCE(request_log.requested_model, '?') AS model_key,
+                       COALESCE(request_log.api_key_name, '?') AS apikey_key
+                FROM upstream_attempt_usage a
+                JOIN request_log ON request_log.request_id=a.root_request_id
+                WHERE request_log.created_at >= ?{_family_where(family)}""",
+            (since_ts, *_family_params(family)),
+        ).fetchall()
+        for row in attempt_rows:
+            for target in buckets(row["channel_key"], row["model_key"], row["apikey_key"]):
+                _add_attempt_cost_row(target, row)
+
     def apply_estimate(row, *, row_count: int) -> None:
         targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
         row_keys = row.keys() if hasattr(row, "keys") else ()
@@ -3314,6 +3929,8 @@ def _accumulate_usage_costs(
     )
     standard_where = (
         f"created_at >= ?{_family_where(family)} AND status='success' "
+        "AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage au "
+        "WHERE au.root_request_id=request_log.request_id) "
         "AND COALESCE(final_channel_key, '') NOT LIKE 'oauth:xai:%'"
     )
     standard_args = (since_ts, *_family_params(family))
@@ -3342,8 +3959,10 @@ def _accumulate_usage_costs(
                COALESCE(fast_mode, 0) AS fast_mode,
                {long_case} AS long_context,
                {cache_ttl_case} AS cache_ttl_known,
-               MIN(CASE WHEN COALESCE(cache_read_tokens, 0) > 0
-                              AND COALESCE(upstream_protocol, '') = ''
+               MIN(CASE WHEN usage_observed = 0 THEN 0
+                        WHEN usage_observed IS NULL
+                             AND COALESCE(cache_read_tokens, 0) > 0
+                             AND COALESCE(upstream_protocol, '') = ''
                         THEN 0 ELSE 1 END) AS usage_semantics_known,
                COUNT(*) AS row_count,
                SUM(input_tokens) AS input_tokens,
@@ -3354,7 +3973,9 @@ def _accumulate_usage_costs(
              WHERE {standard_where}
              GROUP BY pricing_model, channel_key, model_key, apikey_key,
                       fast_mode, long_context, cache_ttl_known,
-                      CASE WHEN COALESCE(cache_read_tokens, 0) > 0
+                      CASE WHEN usage_observed = 0 THEN 0
+                           WHEN usage_observed IS NULL
+                                AND COALESCE(cache_read_tokens, 0) > 0
                                 AND COALESCE(upstream_protocol, '') = ''
                            THEN 0 ELSE 1 END""",
         long_args + cache_ttl_args + standard_args,
@@ -3375,14 +3996,18 @@ def _accumulate_usage_costs(
                request_log.output_tokens AS output_tokens,
                request_log.cache_creation_tokens AS cache_creation_tokens,
                request_log.cache_read_tokens AS cache_read_tokens,
-               CASE WHEN COALESCE(request_log.cache_read_tokens, 0) > 0
-                          AND COALESCE(request_log.upstream_protocol, '') = ''
+               CASE WHEN request_log.usage_observed = 0 THEN 0
+                    WHEN request_log.usage_observed IS NULL
+                         AND COALESCE(request_log.cache_read_tokens, 0) > 0
+                         AND COALESCE(request_log.upstream_protocol, '') = ''
                     THEN 0 ELSE 1 END AS usage_semantics_known,
                substr(request_detail.response_body, -{_XAI_COST_BODY_TAIL_CHARS}) AS response_body
              FROM request_log
              LEFT JOIN request_detail USING (request_id)
              WHERE request_log.created_at >= ?{_family_where(family)}
                AND request_log.status='success'
+               AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage au
+                               WHERE au.root_request_id=request_log.request_id)
                AND COALESCE(request_log.final_channel_key, '') LIKE 'oauth:xai:%'""",
         (since_ts, *_family_params(family)),
     )
@@ -3494,6 +4119,10 @@ def stats_summary(
                 _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
                 _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
                 _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
+            _replace_summary_tokens_with_attempts(
+                conn, since_ts, family, overall_agg,
+                by_channel, by_model, by_apikey,
+            )
             if include_cost:
                 if need_groups:
                     _accumulate_usage_costs(

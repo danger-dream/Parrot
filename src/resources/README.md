@@ -8,3 +8,6 @@
 - 运行时缓存：`$ANTHROPIC_PROXY_DATA_DIR/model_pricing.json`
 
 Parrot 启动后会按 `pricing.sourceUrl` / `pricing.refreshHours` 异步刷新；响应大小限制为 16 MiB，解析、校验和原子落盘在线程中完成。刷新失败不会覆盖本地可用目录，也不会影响代理请求。
+内置兜底目录还包含 Parrot 默认的 `xai/grok-4.5` Token 费率。裸模型名
+`grok-4.5` 经确认的 xAI 渠道路由时，会先补全 provider 再解析价格；远端目录
+刷新失败时也可正常计价。

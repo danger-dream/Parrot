@@ -485,7 +485,8 @@ def test_xai_cost_aggregation_from_sse_usage(m):
     assert s["service_tier_counts"] == {"priority": 1}
 
     text = m["oauth_menu"]._format_xai_spend_block("xai:cost-sub", detail=True)
-    assert "缓存 128 (56.6%) · 💵 实际 $0.00" in text
+    assert "💵 本地计费: 实际 $0.00 · 1 笔计费" in text
+    assert "缓存 128 (56.6%)" in text
     assert "≈" not in text
 
 

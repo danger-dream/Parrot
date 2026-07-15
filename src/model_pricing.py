@@ -12,7 +12,9 @@ input 中猜测扣减缓存命中。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -34,9 +36,6 @@ _CACHE_FILENAME = "model_pricing.json"
 _MAX_REMOTE_CATALOG_BYTES = 16 * 1024 * 1024
 _DATE_SUFFIX_RE = re.compile(r"(?:-\d{8}|-\d{4}-\d{2}-\d{2})$")
 _ABOVE_TOKEN_RE = re.compile(r"_above_(\d+)([kKmM])_tokens(?:_priority)?$")
-_COST_TICKS_RE = re.compile(
-    r'"cost_in_usd_ticks"\s*:\s*"?(\d+)"?', re.IGNORECASE
-)
 _PROVIDER_PREFIXES = (
     "openai/",
     "anthropic/",
@@ -92,6 +91,24 @@ class PricingSettings:
     overrides: Mapping[str, PricingEntry]
 
 
+@dataclass(frozen=True)
+class NormalizedBilling:
+    """Billing facts observed on one real upstream response.
+
+    ``usage_observed`` is deliberately independent from token values: an
+    explicit all-zero usage object is observed and can be priced at zero, while
+    a missing usage object remains unpriced.
+    """
+
+    usage_observed: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    service_tier: str | None = None
+    actual_cost_ticks: int | None = None
+
+
 _lock = threading.RLock()
 _catalog: dict[str, PricingEntry] = {}
 _initialized = False
@@ -103,7 +120,7 @@ def _nonnegative_float(value: Any) -> float | None:
         result = float(value)
     except (TypeError, ValueError):
         return None
-    if result < 0 or result != result:  # NaN
+    if result < 0 or not math.isfinite(result):
         return None
     return result
 
@@ -144,6 +161,38 @@ def _above_token_price(
 def _entry_from_litellm(raw: Any) -> PricingEntry | None:
     if not isinstance(raw, Mapping):
         return None
+    # A malformed numeric field invalidates this model only.  In particular,
+    # never let +/-Inf silently become a default multiplier or poison Decimal.
+    numeric_fields = (
+        "input_cost_per_token", "output_cost_per_token",
+        "cache_creation_input_token_cost", "cache_read_input_token_cost",
+        "input_cost_per_token_priority", "output_cost_per_token_priority",
+        "cache_creation_input_token_cost_priority",
+        "cache_read_input_token_cost_priority",
+        "long_context_input_cost_multiplier",
+        "long_context_output_cost_multiplier",
+        "long_context_input_token_threshold",
+        "cache_creation_input_token_cost_above_1hr",
+    )
+    for field in numeric_fields:
+        if field in raw and raw.get(field) is not None:
+            value = _nonnegative_float(raw.get(field))
+            if value is None:
+                return None
+    for field, value in raw.items():
+        field_name = str(field)
+        is_numeric_tariff = (
+            "cost_per_token" in field_name
+            or field_name.endswith("_cost_multiplier")
+            or field_name.endswith("_token_threshold")
+        )
+        if is_numeric_tariff and value is not None and _nonnegative_float(value) is None:
+            return None
+    provider_specific = raw.get("provider_specific_entry")
+    if isinstance(provider_specific, Mapping) and provider_specific.get("fast") is not None:
+        fast = _nonnegative_float(provider_specific.get("fast"))
+        if fast is None:
+            return None
     input_price = _nonnegative_float(raw.get("input_cost_per_token"))
     output_price = _nonnegative_float(raw.get("output_cost_per_token"))
     # 只有图片价、按次价等条目不能被误当作 $0 的 Token 模型。
@@ -298,6 +347,18 @@ def _entry_from_override(raw: Any) -> PricingEntry | None:
 
     if not isinstance(raw, Mapping):
         return None
+    numeric_fields = (
+        "inputPerMillion", "outputPerMillion", "cacheWritePerMillion",
+        "cacheReadPerMillion", "priorityInputPerMillion",
+        "priorityOutputPerMillion", "priorityCacheWritePerMillion",
+        "priorityCacheReadPerMillion",
+    )
+    if any(
+        name in raw and raw.get(name) is not None
+        and _nonnegative_float(raw.get(name)) is None
+        for name in numeric_fields
+    ):
+        return None
     input_m = _nonnegative_float(raw.get("inputPerMillion"))
     output_m = _nonnegative_float(raw.get("outputPerMillion"))
     if input_m is None or output_m is None:
@@ -365,6 +426,25 @@ def _model_candidates(model: str, aliases: Mapping[str, str]) -> list[str]:
         if stripped and stripped != item:
             candidates.append(stripped)
     return list(dict.fromkeys(candidates))
+
+
+def provider_pricing_model(model: str, channel_key: str | None = None) -> str:
+    """Return the provider-qualified pricing key when routing proves provider.
+
+    Bare Grok names are ambiguous in a shared catalog.  An xAI channel is
+    authoritative, so qualify it before alias/date fallback resolution.
+    """
+
+    normalized = str(model or "").strip()
+    channel = str(channel_key or "").strip().lower()
+    if normalized and "/" not in normalized and (
+        channel.startswith("oauth:xai:")
+        or channel == "xai"
+        or channel.startswith("xai:")
+        or channel.startswith("api:xai:")
+    ):
+        return f"xai/{normalized}"
+    return normalized
 
 
 def resolve_price(
@@ -553,35 +633,26 @@ def estimate_cost(
     )
 
 
-def _extract_ticks_from_obj(obj: Any) -> int | None:
-    if not isinstance(obj, Mapping):
-        return None
-    candidates = [obj]
-    for key in ("response", "data"):
-        nested = obj.get(key)
-        if isinstance(nested, Mapping):
-            candidates.append(nested)
-    for candidate in candidates:
-        usage = candidate.get("usage")
-        if not isinstance(usage, Mapping):
-            continue
-        raw = usage.get("cost_in_usd_ticks")
-        try:
-            ticks = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if ticks >= 0:
-            return ticks
-    return None
+def _safe_nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
-def extract_actual_cost_ticks(response_body: Any) -> int | None:
-    """提取 xAI 返回的真实 ``cost_in_usd_ticks``，同时兼容 JSON 与 SSE。"""
+def _strict_response_objects(response_body: Any):
+    """Yield only whole JSON objects or JSON from exact SSE ``data:`` lines.
 
-    if response_body is None:
-        return None
+    Arbitrary text/metadata is never searched.  This is intentionally stricter
+    than the old regex fallback, which could mistake echoed request metadata for
+    an official xAI usage cost.
+    """
+
     if isinstance(response_body, Mapping):
-        return _extract_ticks_from_obj(response_body)
+        yield response_body
+        return
+    if response_body is None:
+        return
     if isinstance(response_body, bytes):
         text = response_body.decode("utf-8", errors="replace")
     else:
@@ -590,20 +661,185 @@ def extract_actual_cost_ticks(response_body: Any) -> int | None:
         parsed = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError):
         parsed = None
-    ticks = _extract_ticks_from_obj(parsed)
-    if ticks is not None:
-        return ticks
-    # SSE 与截断到尾部的超大 JSON 都可以直接从最后一次 usage 中提取。
-    # finditer 不会像 splitlines() 那样再复制整段响应。
-    last_ticks: int | None = None
-    for match in _COST_TICKS_RE.finditer(text):
-        try:
-            last_ticks = int(match.group(1))
-        except (TypeError, ValueError):
+    if isinstance(parsed, Mapping):
+        yield parsed
+        return
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        # Native Responses WebSocket logs are one complete JSON frame per line.
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                obj = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                obj = None
+            if isinstance(obj, Mapping):
+                yield obj
             continue
-    if last_ticks is not None:
-        return last_ticks
-    return None
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, Mapping):
+            yield obj
+
+
+def _billing_candidates(obj: Mapping[str, Any]):
+    """Yield protocol-defined containers and whether actual cost is trusted.
+
+    Token usage may legitimately live under Anthropic ``message`` or a provider
+    ``data`` envelope. xAI actual cost is stricter: accept it only on a complete
+    non-event JSON response or a terminal Responses event/response object.
+    """
+
+    event_type = str(obj.get("type") or "").strip().lower()
+    terminal = not event_type or event_type in {
+        "response.completed", "response.failed", "response.incomplete",
+    }
+    yield obj, terminal
+    response = obj.get("response")
+    if isinstance(response, Mapping):
+        yield response, terminal
+    message = obj.get("message")
+    if isinstance(message, Mapping):
+        yield message, False
+    data = obj.get("data")
+    if isinstance(data, Mapping):
+        yield data, False
+
+
+def normalize_response_billing(response_body: Any) -> NormalizedBilling:
+    observed = False
+    input_tokens = output_tokens = cache_creation = cache_read = 0
+    service_tier: str | None = None
+    actual_ticks: int | None = None
+
+    for obj in _strict_response_objects(response_body):
+        for candidate, allow_actual_cost in _billing_candidates(obj):
+            tier = candidate.get("service_tier")
+            if isinstance(tier, str) and tier.strip():
+                service_tier = tier.strip().lower()
+            usage = candidate.get("usage")
+            if not isinstance(usage, Mapping):
+                continue
+            token_fields = {
+                "input_tokens", "prompt_tokens", "output_tokens",
+                "completion_tokens", "cache_read_input_tokens",
+                "cache_read_tokens", "cache_creation_input_tokens",
+                "cache_creation_tokens",
+            }
+            if any(field in usage for field in token_fields):
+                observed = True
+            # Presence, not truthiness, controls replacement so explicit zero is
+            # retained while Anthropic message_start/message_delta can merge.
+            if "input_tokens" in usage or "prompt_tokens" in usage:
+                prompt = _safe_nonnegative_int(
+                    usage.get("input_tokens", usage.get("prompt_tokens", 0))
+                )
+                details = usage.get("input_tokens_details")
+                if not isinstance(details, Mapping):
+                    details = usage.get("prompt_tokens_details")
+                cached = _safe_nonnegative_int(
+                    details.get("cached_tokens", 0) if isinstance(details, Mapping) else 0
+                )
+                cache_read = _safe_nonnegative_int(
+                    usage.get("cache_read_input_tokens", usage.get("cache_read_tokens", cached))
+                )
+                cache_creation = _safe_nonnegative_int(
+                    usage.get("cache_creation_input_tokens", usage.get("cache_creation_tokens", 0))
+                )
+                # OpenAI prompt/input totals include cached tokens; Anthropic
+                # exposes cache fields beside an uncached input count.
+                is_openai_shape = "prompt_tokens" in usage or isinstance(
+                    usage.get("input_tokens_details"), Mapping
+                )
+                input_tokens = max(0, prompt - cache_read) if is_openai_shape else prompt
+            if "output_tokens" in usage or "completion_tokens" in usage:
+                output_tokens = _safe_nonnegative_int(
+                    usage.get("output_tokens", usage.get("completion_tokens", 0))
+                )
+            if allow_actual_cost and "cost_in_usd_ticks" in usage:
+                try:
+                    value = int(usage.get("cost_in_usd_ticks"))
+                except (TypeError, ValueError, OverflowError):
+                    value = -1
+                if value >= 0:
+                    actual_ticks = value
+
+    return NormalizedBilling(
+        usage_observed=observed,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+        service_tier=service_tier,
+        actual_cost_ticks=actual_ticks,
+    )
+
+
+def resolved_pricing_snapshot(
+    model: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    priority: bool = False,
+    long_context: bool | None = None,
+    pricing_settings: PricingSettings | None = None,
+) -> tuple[str | None, str | None]:
+    """Freeze the exact tariff inputs used by one immutable settlement."""
+    resolved = resolve_price(model, pricing_settings=pricing_settings)
+    if resolved is None:
+        return None, None
+    pricing_model, entry = resolved
+    prompt_tokens = sum(max(0, int(v or 0)) for v in (
+        input_tokens, cache_creation_tokens, cache_read_tokens,
+    ))
+    use_long_context = (
+        bool(long_context) if long_context is not None else bool(
+            entry.long_context_input_threshold > 0
+            and prompt_tokens > entry.long_context_input_threshold
+        )
+    )
+    snapshot = {
+        "schema": 1,
+        "model": pricing_model,
+        "priority": bool(priority),
+        "long_context": use_long_context,
+        "input_per_token": _effective_price(
+            entry, "input_per_token", priority=priority,
+            long_context=use_long_context, input_side=True,
+        ),
+        "output_per_token": _effective_price(
+            entry, "output_per_token", priority=priority,
+            long_context=use_long_context, input_side=False,
+        ),
+        "cache_write_per_token": _effective_price(
+            entry, "cache_write_per_token", priority=priority,
+            long_context=use_long_context, input_side=True,
+        ),
+        "cache_read_per_token": _effective_price(
+            entry, "cache_read_per_token", priority=priority,
+            long_context=use_long_context, input_side=True,
+        ),
+        "long_context_threshold": entry.long_context_input_threshold,
+    }
+    raw = json.dumps(
+        snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    version = "pricing-v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return raw, version
+
+
+def extract_actual_cost_ticks(response_body: Any) -> int | None:
+    """Extract official cost only from strict JSON/SSE usage paths."""
+
+    return normalize_response_billing(response_body).actual_cost_ticks
 
 
 async def refresh_once() -> bool:
@@ -676,7 +912,8 @@ async def refresh_loop() -> None:
         pricing_cfg = config.get().get("pricing", {})
         raw_hours = pricing_cfg.get("refreshHours", 24) if isinstance(pricing_cfg, Mapping) else 24
         try:
-            hours = max(1.0, float(raw_hours))
+            parsed_hours = float(raw_hours)
+            hours = max(1.0, parsed_hours) if math.isfinite(parsed_hours) else 24.0
         except (TypeError, ValueError):
             hours = 24.0
         await asyncio.sleep(hours * 3600)

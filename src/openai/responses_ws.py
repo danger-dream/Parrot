@@ -667,6 +667,8 @@ async def _run_ws_failover(
             proxy_name=result.proxy_name,
             bytes_up=result.proxy_bytes.up,
             bytes_down=result.proxy_bytes.down,
+            response_body=result.response_text or None,
+            usage=result.usage,
         )
 
         if result.ok:
@@ -817,6 +819,8 @@ async def _run_ws_failover(
                     proxy_name=result.proxy_name,
                     bytes_up=result.proxy_bytes.up,
                     bytes_down=result.proxy_bytes.down,
+                    response_body=result.response_text or None,
+                    usage=result.usage,
                 )
                 if result.ok:
                     return accepted
@@ -937,6 +941,10 @@ async def _try_ws_channel(
             error_detail=f"transform error: {exc}",
             upstream_protocol=ch_proto,
         )
+
+    if retry_attempt_id is not None:
+        # Native Responses WS keeps the same protocol-level service_tier.
+        log_db.mark_retry_attempt_dispatch(retry_attempt_id, body)
 
     route_chain = _resolve_ws_route_chain(ch, resolved_model)
     round_timeouts = RoundTimeouts.from_config(timeouts)
@@ -1240,6 +1248,9 @@ async def _try_sse_channel(
             upstream_protocol=ch_proto,
             upstream_transport="sse",
         )
+
+    if retry_attempt_id is not None:
+        log_db.mark_retry_attempt_dispatch(retry_attempt_id, upstream_req.body)
 
     try:
         opened = await open_response_with_proxy_chain(

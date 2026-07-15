@@ -886,7 +886,8 @@ def fmt_log_entry_body(r: dict) -> str:
         cr = r.get("cache_read_tokens") or 0
         tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
         if cr > 0:
-            tok += f" · {fmt_cache_phrase_from_row(r)} · 💵 {fmt_cost_from_row(r)}"
+            tok += f" · {fmt_cache_phrase_from_row(r)}"
+        tok += f" · 💵 {fmt_cost_from_row(r)}"
         lines.append(f"  Token: {tok}")
 
     # 耗时

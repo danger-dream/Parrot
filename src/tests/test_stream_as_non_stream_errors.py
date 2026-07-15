@@ -85,6 +85,11 @@ async def test_stream_only_nonstream_incomplete_max_output_is_context_error():
     assert result.error.error_detail.startswith("Prompt is too long:")
     assert "context_length_exceeded" in result.error.error_detail
     assert "max_output_tokens" in result.error.error_detail
+    # Billing evidence survives the terminal error path instead of being
+    # discarded before retry/failover settlement.
+    assert "response.incomplete" in (result.error.full_response_text or "")
+    assert result.error.usage["input_tokens"] == 271409
+    assert result.error.usage["output_tokens"] == 137
 
     normalized = request_invalid_result_if_needed(result.error)
     assert normalized.outcome == "request_invalid"

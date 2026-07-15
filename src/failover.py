@@ -1645,6 +1645,8 @@ async def run_failover(
             proxy_name=result.proxy_name,
             bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
             bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+            response_body=getattr(result, "full_response_text", None),
+            usage=getattr(result, "usage", None),
         )
 
         if result.success and candidate_local_web_loop:
@@ -2098,6 +2100,8 @@ async def run_failover(
                     proxy_name=result.proxy_name,
                     bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
                     bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
+                    response_body=getattr(result, "full_response_text", None),
+                    usage=getattr(result, "usage", None),
                 )
                 if result.success and candidate_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
@@ -2675,6 +2679,8 @@ async def _try_openai_oauth_responses_ws_channel(
         return AttemptResult(outcome="transform_error", error_detail=f"transform error: {exc}")
 
     round_timeouts = RoundTimeouts.from_config(timeouts)
+    if retry_attempt_id is not None:
+        log_db.mark_retry_attempt_dispatch(retry_attempt_id, first_frame)
     last_error: Optional[AttemptResult] = None
     proxy_attempt_order = 0
     for route_name, connector in _resolve_ws_route_chain_for_channel(ch, resolved_model):
@@ -3639,6 +3645,9 @@ async def _try_channel(
             error_detail=f"transform error: {exc}",
             http_status=None,
         )
+
+    if retry_attempt_id is not None:
+        log_db.mark_retry_attempt_dispatch(retry_attempt_id, upstream_req.body)
 
     # 与本次请求一一对应的工具名映射；不再依赖 channel 实例属性，避免并发覆盖
     dynamic_map = upstream_req.dynamic_tool_map

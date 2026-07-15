@@ -233,9 +233,13 @@ def test_extract_actual_xai_cost_from_json_and_sse():
         ]
     )
     assert model_pricing.extract_actual_cost_ticks(sse) == ticks
+    # A truncated/arbitrary metadata fragment is not a trusted JSON/SSE path.
     truncated_json_tail = (
         ('{"output":"' + ("x" * 300_000) + '","usage":{"cost_in_usd_ticks":')
         + str(ticks)
         + "}}"
     )[-262_144:]
-    assert model_pricing.extract_actual_cost_ticks(truncated_json_tail) == ticks
+    assert model_pricing.extract_actual_cost_ticks(truncated_json_tail) is None
+    assert model_pricing.extract_actual_cost_ticks(
+        'metadata: {"usage":{"cost_in_usd_ticks":123456789}}'
+    ) is None

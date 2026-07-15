@@ -264,4 +264,25 @@ def retry_chain_of(request_id) -> list[Row]
 原则：**轻量状态数据需要快速读写且重启恢复**，放 state.db；体积可能很大的
 OpenAI history 独立分库；**业务日志写多读少且数据量大**，按月分库便于归档与迁移。
 
-当 `logRetention.mode="days"` 时，完整过期月份直接删除整库；留存临界所在月份会删除过期请求及 `request_detail` / retry / proxy / local-web 关联行，再压缩 SQLite 以实际回收磁盘空间。TG Bot 必须经两次确认后才会保存该策略并执行首次清理；之后由后台维护循环每天最多检查一次。
+当 `logRetention.mode="days"` 时，完整过期月份直接删除整库；留存临界所在月份会删除过期请求及 `request_detail` / retry / proxy / local-web / attempt-usage 关联行，再压缩 SQLite 以实际回收磁盘空间。TG Bot 必须经两次确认后才会保存该策略并执行首次清理；之后由后台维护循环每天最多检查一次。
+
+## 按上游尝试结算
+
+`request_log` 继续作为向后兼容的下游请求摘要：Token 字段只描述 Parrot 对下游
+暴露的用量，不会改写为包含重试或故障转移的用量。费用单独结算到
+`upstream_attempt_usage`；每次真实上游 dispatch 对应一条不可变、可幂等 finalize
+的记录。dispatch 前发生的转换/guard 错误只留在 `retry_chain` 供排障，不作为账单事实。
+
+每条尝试结算保存规范化 Token、是否真实观察到 Token usage、响应/出站 service tier、
+dispatch 确定性、补全 provider 的模型、冻结后的实际费率快照及版本，以及费用来源
+（`actual`、`estimated`、`unpriced`）。Tier 优先级为“响应实际 tier > 出站请求 tier >
+未知”；下游意图不是账单事实。显式全零 Token 字段属于已观察用量，估价为 0；缺失
+usage 不得估成 0。xAI 上游返回的实际费用可以在 Token usage 缺失时结算；无法确认
+是否已发出的传输错误必须标为未计价。
+
+重试、failover、本地 WebSearch 多轮和 Compact map/reduce 子调用分别结算。Compact
+子调用 ID 只在聚合时映射回原下游请求。聚合以不可变尝试事实为准；只有完全没有
+尝试事实的旧记录才回退到 `request_log` 旧计价逻辑。
+
+月度数据库使用增量迁移：旧请求记录继续可读；新增请求摘要/尝试账本字段和索引时，
+不会改写历史 Token 语义。

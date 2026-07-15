@@ -705,15 +705,13 @@ def _render_detail(detail: dict) -> str:
     if status == "success":
         lines.extend(["", "<b>Tokens</b>"])
         token_line = f"↑ {ui.fmt_tokens(ui.prompt_total_from_row(log))} | ↓ {ui.fmt_tokens(log.get('output_tokens'))}"
+        cost_row = dict(log)
+        stored_detail = detail.get("detail") or {}
+        if isinstance(stored_detail, dict):
+            cost_row["response_body"] = stored_detail.get("response_body")
         if (log.get("cache_read_tokens") or 0) > 0:
-            cost_row = dict(log)
-            stored_detail = detail.get("detail") or {}
-            if isinstance(stored_detail, dict):
-                cost_row["response_body"] = stored_detail.get("response_body")
-            token_line += (
-                f" | {ui.fmt_cache_phrase_from_row(log)}"
-                f" | 💵 {ui.fmt_cost_from_row(cost_row)}"
-            )
+            token_line += f" | {ui.fmt_cache_phrase_from_row(log)}"
+        token_line += f" | 💵 {ui.fmt_cost_from_row(cost_row)}"
         lines.append(token_line)
 
     lines.extend(["", "<b>请求总览</b>"])

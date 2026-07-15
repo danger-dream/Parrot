@@ -85,7 +85,8 @@ def _section_overall(overall: dict) -> str:
     max_tps = overall.get("max_tps")
     min_tps = overall.get("min_tps")
 
-    token_line = f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
+    token_line = (f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
+                  f" | 💵 {_fmt_cost(overall)}")
 
     lines = [
         "<b>Tokens:</b>",
@@ -97,8 +98,7 @@ def _section_overall(overall: dict) -> str:
         "",
         "<b>缓存:</b>",
         f"命中请求 {succ_hit}/{succ} ({ui.fmt_rate(succ_hit, succ)})"
-        + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr > 0 else "")
-        + f" · 💵 {_fmt_cost(overall)}",
+        + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr > 0 else ""),
         "",
         "<b>耗时（平均）:</b>",
         f"连接 {ui.fmt_ms(avg_conn)} | 首字 {ui.fmt_ms(avg_first)} | 总 {ui.fmt_ms(avg_total)}",

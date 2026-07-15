@@ -5732,5 +5732,18 @@
     "supports_tool_choice": true,
     "supports_vision": true,
     "supports_web_search": true
+  },
+  "xai/grok-4.5": {
+    "cache_read_input_token_cost": 7.5e-07,
+    "input_cost_per_token": 3e-06,
+    "litellm_provider": "xai",
+    "mode": "responses",
+    "output_cost_per_token": 1.5e-05,
+    "supports_function_calling": true,
+    "supports_native_streaming": true,
+    "supports_prompt_caching": true,
+    "supports_reasoning": true,
+    "supports_tool_choice": true,
+    "supports_web_search": true
   }
 }
