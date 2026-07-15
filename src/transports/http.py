@@ -7,8 +7,8 @@ proxy, parsing, or timeout semantics change here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Mapping
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 import httpx
 
@@ -23,6 +23,7 @@ class HttpStreamRequest:
     read_timeout: float
     write_timeout: float = 30.0
     pool_timeout: float | None = None
+    extensions: Mapping[str, Any] | None = None
 
     def timeout(self) -> httpx.Timeout:
         return httpx.Timeout(
@@ -41,4 +42,5 @@ def open_stream(client, request: HttpStreamRequest):
         headers=dict(request.headers),
         content=request.content,
         timeout=request.timeout(),
+        extensions=dict(request.extensions or {}),
     )

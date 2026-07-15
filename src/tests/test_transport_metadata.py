@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from types import SimpleNamespace
 
 from src.transports import metadata_from_response, pick_forward_headers
@@ -85,21 +84,41 @@ def test_websocket_frame_helpers_are_protocol_agnostic():
     assert ws_event_type(b'{"type":"binary"}') == ""
 
 
-def test_http_response_headers_are_capped_by_first_byte_timeout(monkeypatch):
+def test_http_stream_final_headers_are_business_connection_boundary(monkeypatch):
     from src.transports import http_runtime
+    from src.transports.timing import HttpAttemptTiming as RealHttpAttemptTiming
 
-    class SlowContext:
+    class FakeClock:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds):
+            self.value += seconds
+
+    clock = FakeClock()
+    timings = []
+
+    def timing_factory(**kwargs):
+        timing = RealHttpAttemptTiming(clock=clock, wall_clock=clock, **kwargs)
+        timings.append(timing)
+        return timing
+
+    class StalledContext:
         def __init__(self):
             self.exited = False
 
         async def __aenter__(self):
-            await asyncio.sleep(0.2)
-            return SimpleNamespace(status_code=200, headers={})
+            clock.advance(2)
+            timings[-1]._state_changed.set()
+            await asyncio.Event().wait()
 
         async def __aexit__(self, exc_type, exc, tb):
             self.exited = True
 
-    ctx = SlowContext()
+    ctx = StalledContext()
+    monkeypatch.setattr(http_runtime, "HttpAttemptTiming", timing_factory)
     monkeypatch.setattr(
         http_runtime,
         "_resolve_http_route_chain",
@@ -114,38 +133,57 @@ def test_http_response_headers_are_capped_by_first_byte_timeout(monkeypatch):
         upstream_req=SimpleNamespace(
             method="POST", url="https://upstream.test", headers={}, body=b"{}",
         ),
-        deadline_ts=time.time() + 5,
         connect_timeout=1,
-        first_byte_timeout=0.02,
-        request_id="header-timeout",
+        first_byte_timeout=9,
+        idle_timeout=9,
+        total_timeout=10,
+        response_mode="stream",
+        request_id="header-connection-timeout",
         retry_attempt_id=None,
     ))
 
     assert not result.ok
-    assert result.error.outcome == "first_byte_timeout"
-    assert "waiting for response headers" in result.error.error_detail
-    assert result.error.connect_ms is not None
+    assert result.error.outcome == "connection_timeout"
+    assert result.error.connect_ms is None
+    assert result.error.total_ms == 2000
     assert ctx.exited is True
 
 
 def test_http_response_header_wait_preserves_nearer_total_deadline(monkeypatch):
     from src.transports import http_runtime
+    from src.transports.timing import HttpAttemptTiming as RealHttpAttemptTiming
 
-    class SlowContext:
+    class FakeClock:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+    clock = FakeClock()
+    timings = []
+
+    def timing_factory(**kwargs):
+        timing = RealHttpAttemptTiming(clock=clock, wall_clock=clock, **kwargs)
+        timings.append(timing)
+        return timing
+
+    class StalledContext:
         async def __aenter__(self):
-            await asyncio.sleep(0.2)
-            return SimpleNamespace(status_code=200, headers={})
+            clock.value += 2
+            timings[-1]._state_changed.set()
+            await asyncio.Event().wait()
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
+    monkeypatch.setattr(http_runtime, "HttpAttemptTiming", timing_factory)
     monkeypatch.setattr(
         http_runtime,
         "_resolve_http_route_chain",
         lambda channel, model: ([('direct', None)], None),
     )
     monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
-    monkeypatch.setattr(http_runtime, "open_stream", lambda client, request: SlowContext())
+    monkeypatch.setattr(http_runtime, "open_stream", lambda client, request: StalledContext())
 
     result = asyncio.run(http_runtime.open_response_with_proxy_chain(
         channel=SimpleNamespace(),
@@ -153,15 +191,18 @@ def test_http_response_header_wait_preserves_nearer_total_deadline(monkeypatch):
         upstream_req=SimpleNamespace(
             method="POST", url="https://upstream.test", headers={}, body=b"{}",
         ),
-        deadline_ts=time.time() + 0.02,
-        connect_timeout=1,
-        first_byte_timeout=1,
+        connect_timeout=10,
+        first_byte_timeout=10,
+        idle_timeout=10,
+        total_timeout=1,
+        response_mode="stream",
         request_id="total-timeout",
         retry_attempt_id=None,
     ))
 
     assert not result.ok
     assert result.error.outcome == "total_timeout"
+    assert result.error.total_ms == 2000
 
 
 def test_http_response_headers_can_open_before_first_byte_timeout(monkeypatch):
@@ -192,9 +233,11 @@ def test_http_response_headers_can_open_before_first_byte_timeout(monkeypatch):
         upstream_req=SimpleNamespace(
             method="POST", url="https://upstream.test", headers={}, body=b"{}",
         ),
-        deadline_ts=time.time() + 5,
         connect_timeout=1,
         first_byte_timeout=1,
+        idle_timeout=1,
+        total_timeout=5,
+        response_mode="stream",
         request_id="header-success",
         retry_attempt_id=None,
     ))

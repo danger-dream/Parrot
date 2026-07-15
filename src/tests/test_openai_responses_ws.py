@@ -135,6 +135,7 @@ class FakeWebSocket:
         self.sent_texts: list[str] = []
         self.close_calls: list[tuple[int, str]] = []
         self.accepted = False
+        self._closed = asyncio.Event()
 
     async def accept(self):
         self.accepted = True
@@ -149,6 +150,10 @@ class FakeWebSocket:
             return {"type": "websocket.receive", "text": text}
         if self._extra_receive:
             return self._extra_receive.pop(0)
+        # A real connected client blocks here; an immediate synthetic disconnect
+        # races the new owned per-frame timing task and can cancel a healthy
+        # upstream before its terminal frame. ``close()`` releases this waiter.
+        await self._closed.wait()
         return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_text(self, text: str):
@@ -159,6 +164,7 @@ class FakeWebSocket:
 
     async def close(self, code: int = 1000, reason: str = ""):
         self.close_calls.append((code, reason))
+        self._closed.set()
         from starlette.websockets import WebSocketState
         self.application_state = WebSocketState.DISCONNECTED
 
@@ -248,14 +254,15 @@ class FakeOAuthHttpStreamWs:
         return None
 
 
-class DelayedOAuthHttpStreamWs(FakeOAuthHttpStreamWs):
-    def __init__(self, events: list[dict[str, Any]], delays: list[float]):
+class ClockedOAuthHttpStreamWs(FakeOAuthHttpStreamWs):
+    def __init__(self, events: list[dict[str, Any]], delays: list[float], clock):
         super().__init__(events)
         self._delays = list(delays)
+        self._clock = clock
 
     async def recv(self):
         if self._delays:
-            await asyncio.sleep(self._delays.pop(0))
+            self._clock.advance(self._delays.pop(0))
         return await super().recv()
 
 
@@ -297,6 +304,13 @@ def _retry_chain(m, request_id: str):
         "SELECT * FROM retry_chain WHERE request_id=? ORDER BY attempt_order", (request_id,)
     ).fetchall()]
 
+
+def _proxy_chain(m, request_id: str):
+    conn = m["log_db"]._get_conn()
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM proxy_chain WHERE request_id=? ORDER BY attempt_order", (request_id,)
+    ).fetchall()]
+
 def _make_channel(m):
     ch = m["OpenAIApiChannel"]({
         "name": "ws-upstream",
@@ -336,7 +350,7 @@ async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
     ]
     fake_upstream = FakeUpstreamWebSocket(events)
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         assert url == "wss://up.example/v1/responses"
         assert headers["Authorization"] == "Bearer up-key"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
@@ -414,7 +428,7 @@ async def test_responses_ws_blacklist_before_first_visible_fails_over(monkeypatc
         {"type": "response.completed", "response": {"id": "good", "output": [], "usage": {}}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         if url == "wss://bad.example/v1/responses":
             return bad
         if url == "wss://good.example/v1/responses":
@@ -467,7 +481,7 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
 
     captured: dict[str, Any] = {}
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         assert url == "wss://chatgpt.com/backend-api/codex/responses"
         assert headers["authorization"] == "Bearer tok"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
@@ -508,7 +522,7 @@ async def test_responses_ws_accepts_explicit_session_headers(monkeypatch, m):
         {"type": "response.completed", "response": {"id": "resp", "output": [], "usage": {}}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         assert headers["session-id"] == "sid-1"
         assert headers["thread-id"] == "tid-1"
         return fake_upstream
@@ -545,7 +559,7 @@ async def test_responses_ws_error_after_metadata_before_visible_fails_over(monke
         {"type": "response.completed", "response": {"id": "good", "output": [], "usage": {}}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return bad_up if "bad-meta" in url else good_up
 
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
@@ -590,7 +604,7 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
     ])
     fake_upstream.response = SimpleNamespace(headers={"x-codex-primary-used-percent": "12"})
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_upstream
 
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
@@ -704,7 +718,7 @@ async def test_responses_ws_writes_log_retry_usage_proxy_and_affinity(monkeypatc
         }},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         proxy_bytes.count(up=11, down=17)
         return fake_upstream
 
@@ -732,12 +746,28 @@ async def test_responses_ws_writes_log_retry_usage_proxy_and_affinity(monkeypatc
     assert row["proxy_name"] == "proxy-a"
     assert row["proxy_bytes_up"] > 0
     assert row["proxy_bytes_down"] > 0
+    assert row["final_round_id"]
+    assert row["connect_time_ms"] is not None
+    assert row["first_token_time_ms"] is not None
+    assert row["idle_time_ms"] is not None
+    assert row["total_time_ms"] is not None
+    assert row["request_elapsed_ms"] is not None
     chain = _retry_chain(m, row["request_id"])
     assert len(chain) == 1
     assert chain[0]["outcome"] == "success"
     assert chain[0]["proxy_name"] == "proxy-a"
     assert chain[0]["bytes_up"] > 0
     assert chain[0]["bytes_down"] > 0
+    assert chain[0]["final_round_id"] == row["final_round_id"]
+    assert chain[0]["total_ms"] is not None
+    assert chain[0]["attempt_elapsed_ms"] is not None
+    rounds = _proxy_chain(m, row["request_id"])
+    assert len(rounds) == 1
+    assert rounds[0]["round_id"] == row["final_round_id"]
+    assert rounds[0]["transport"] == "ws"
+    assert rounds[0]["request_mode"] == "ws"
+    assert rounds[0]["total_ms"] is not None
+    assert rounds[0]["ended_at"] is not None
     assert row["fingerprint"] is None  # first-turn requests have no query affinity anchor
     fp_write = m["fingerprint"].fingerprint_write_responses(
         "ws-key",
@@ -768,7 +798,7 @@ async def test_responses_ws_proxy_chain_falls_back_before_first_event(monkeypatc
                                 last_success_ts=0, last_latency_ms=0, total_failures=0, last_error=None)
     dummy = DummyProxy()
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         calls.append(connector)
         if connector is dummy:
             raise OSError("proxy down")
@@ -780,6 +810,12 @@ async def test_responses_ws_proxy_chain_falls_back_before_first_event(monkeypatc
 
     assert calls == [dummy, None]
     assert dummy.stats.total_failures == 1
+    row = _last_request_log(m)
+    rounds = _proxy_chain(m, row["request_id"])
+    assert len(rounds) == 2
+    assert rounds[0]["round_id"] != rounds[1]["round_id"]
+    assert all(item["ended_at"] is not None for item in rounds)
+    assert rounds[-1]["round_id"] == row["final_round_id"]
     assert ws.close_calls[-1][0] == 1000
 
 
@@ -804,7 +840,7 @@ async def test_responses_ws_filters_non_responses_channels_without_scoring_failu
         {"type": "response.completed", "response": {"id": "resp", "output": [], "usage": {}}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         assert url == "wss://good-after.example/v1/responses"
         return fake_upstream
 
@@ -832,7 +868,7 @@ async def test_responses_ws_stream_error_after_visible_logs_and_cools_down(monke
         {"type": "response.failed", "response": {"id": "resp", "error": {"code": "boom", "message": "failed later"}, "usage": {}}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_upstream
 
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
@@ -872,7 +908,7 @@ async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores
 
     captured: dict[str, Any] = {}
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         captured["headers"] = dict(headers)
         return fake_ws
 
@@ -978,7 +1014,7 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
 
     fake_upstream.recv = dynamic_recv  # type: ignore[method-assign]
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_upstream
 
     monkeypatch.setattr(m["responses_ws"].oauth_manager, "ensure_valid_token", fake_token)
@@ -1018,7 +1054,7 @@ async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch,
     ])
     captured = {}
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         captured["url"] = url
         captured["headers"] = dict(headers)
         return fake_ws
@@ -1067,7 +1103,7 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
         }},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_ws
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
@@ -1125,7 +1161,7 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
     ])
     attempts = [bad_ws, good_ws]
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return attempts.pop(0)
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
@@ -1175,7 +1211,23 @@ async def test_http_responses_oauth_ws_logs_first_packet_not_first_visible(monke
     async def fake_token(account_key):
         return "tok"
 
-    fake_ws = DelayedOAuthHttpStreamWs([
+    class FakeClock:
+        def __init__(self):
+            self.value = 100.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds):
+            self.value += seconds
+
+    clock = FakeClock()
+    real_timing = m["failover"].WsAttemptTiming
+
+    def timing_factory(**kwargs):
+        return real_timing(clock=clock, wall_clock=clock, **kwargs)
+
+    fake_ws = ClockedOAuthHttpStreamWs([
         {"type": "response.created", "response": {"id": "resp_first"}},
         {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
         {"type": "response.completed", "response": {
@@ -1183,12 +1235,13 @@ async def test_http_responses_oauth_ws_logs_first_packet_not_first_visible(monke
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
             "usage": {"input_tokens": 2, "output_tokens": 1},
         }},
-    ], delays=[0.01, 0.15, 0.01])
+    ], delays=[0.01, 0.15, 0.01], clock=clock)
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_ws
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "WsAttemptTiming", timing_factory)
     monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
     body = {"model": "test-model", "stream": True, "input": "hello", "prompt_cache_key": "anchor"}
     resp, rid = await _call_failover_responses(m, ch, body)
@@ -1196,8 +1249,7 @@ async def test_http_responses_oauth_ws_logs_first_packet_not_first_visible(monke
     assert "event: response.created" in text
     assert "event: response.output_text.delta" in text
     first_ms = m["log_db"].log_detail(rid)["log"]["first_token_time_ms"]
-    assert first_ms is not None
-    assert first_ms < 120
+    assert first_ms == 10
 
 
 def test_failover_ss2022_ws_wrapper_close_runs_cleanup_once(m):
@@ -1239,9 +1291,12 @@ def test_failover_ss2022_cleanup_closes_socketpair_when_ws_connect_fails(monkeyp
     monkeypatch.setattr(m["failover"].websockets, "connect", fake_connect)
     connector = m["failover"].SS2022Connector("dummy", "127.0.0.1", 1, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA")
     with pytest.raises(RuntimeError):
+        timing = m["failover"].WsAttemptTiming(route_type="ss2022")
         asyncio.run(m["failover"]._connect_oauth_responses_ws(
             "wss://example.invalid/v1/responses",
             headers={}, connector=connector, proxy_bytes=m["failover"]._WsProxyBytes(), open_timeout=1,
+            timing=timing,
+            round_timeouts=m["failover"].RoundTimeouts(1, 1, 1, 2),
         ))
     assert cleaned == [True]
     assert left.fileno() == -1
@@ -1270,7 +1325,7 @@ async def test_http_responses_oauth_ws_pre_visible_error_fails_over_to_http_chan
         {"type": "error", "status": 503, "error": {"code": "server_error", "message": "boom"}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return bad_ws
 
     class MockStreamCtx:
@@ -1279,7 +1334,10 @@ async def test_http_responses_oauth_ws_pre_visible_error_fails_over_to_http_chan
         async def __aexit__(self, *args): await self.resp.aclose(); return False
 
     class MockClient:
-        def stream(self, method, url, headers=None, content=None, timeout=None):
+        def stream(self, method, url, headers=None, content=None, timeout=None, extensions=None):
+            # Accept the production HTTPcore trace extension without fabricating
+            # connection timing in this protocol-failover fake.
+            del extensions
             assert url == "https://api.example/v1/responses"
             resp = __import__("httpx").Response(200, content=(
                 _response_sse_event("response.output_text.delta", {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ok"}) +
@@ -1324,7 +1382,7 @@ async def test_http_responses_oauth_ws_error_after_visible_does_not_failover(mon
         {"type": "response.failed", "response": {"id": "resp", "error": {"code": "boom", "message": "failed later"}, "usage": {}}},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_ws
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
@@ -1367,7 +1425,7 @@ async def test_http_responses_oauth_ws_consumes_codex_rate_limits_event(monkeypa
         }},
     ])
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_ws
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)

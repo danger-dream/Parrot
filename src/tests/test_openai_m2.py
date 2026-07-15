@@ -472,6 +472,104 @@ def test_model_permissions_do_not_depend_on_allowed_protocols(m):
     print("  [PASS] legacy allowedProtocols ignored while allowedModels remains configurable")
 
 
+class _JumpingHandlerTime:
+    """Handler-local clock: wall time jumps while monotonic advances normally."""
+
+    def __init__(self, monotonic_values):
+        self._monotonic_values = iter(monotonic_values)
+        self.wall_calls = 0
+
+    def time(self):
+        self.wall_calls += 1
+        return 1_000.0 if self.wall_calls == 1 else 91_000.0
+
+    def monotonic(self):
+        return next(self._monotonic_values)
+
+    @staticmethod
+    def localtime(value=None):
+        return time.localtime(value)
+
+    @staticmethod
+    def strftime(fmt, value):
+        return time.strftime(fmt, value)
+
+
+async def test_openai_no_candidates_total_uses_monotonic(monkeypatch, m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    ch = _make_anthropic_channel(
+        m, "anth-only", "https://a.example", real="sonnet", alias="sonnet"
+    )
+    _install_channels(m, [ch])
+
+    captured = {}
+    original_finish_error = m["log_db"].finish_error
+
+    def capture_finish_error(*args, **kwargs):
+        captured.update(kwargs)
+        return original_finish_error(*args, **kwargs)
+
+    async def no_notify(*args, **kwargs):
+        return None
+
+    empty_result = m["scheduler"].ScheduleResult(
+        candidates=[], fp_query=None, affinity_hit=False, saturated=[]
+    )
+    monkeypatch.setattr(m["scheduler"], "schedule", lambda *args, **kwargs: empty_result)
+
+    clock = _JumpingHandlerTime([10.0, 10.25])
+    monkeypatch.setattr(m["openai_handler"], "time", clock)
+    monkeypatch.setattr(m["log_db"], "finish_error", capture_finish_error)
+    monkeypatch.setattr(
+        m["openai_handler"].notifier, "throttled_notify_event", no_notify
+    )
+
+    router = MockRouter()
+    body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
+    resp, client = await _call_openai_handler(m, router, "chat", body)
+    await client.aclose()
+
+    assert resp.status_code == 503
+    assert captured["total_ms"] == 250
+    assert clock.wall_calls == 1
+
+
+async def test_openai_failover_receives_monotonic_start_and_exception_total(
+    monkeypatch, m
+):
+    _setup(m)
+    _install_keys(m, _default_key())
+    ch = _make_openai_channel(m, "oai", "https://a.example")
+    _install_channels(m, [ch])
+
+    captured = {}
+    original_finish_error = m["log_db"].finish_error
+
+    def capture_finish_error(*args, **kwargs):
+        captured["finish"] = kwargs
+        return original_finish_error(*args, **kwargs)
+
+    async def failing_run_failover(*args, **kwargs):
+        captured["start_monotonic"] = kwargs.get("start_monotonic")
+        raise RuntimeError("unit failover failure")
+
+    clock = _JumpingHandlerTime([20.0, 20.4])
+    monkeypatch.setattr(m["openai_handler"], "time", clock)
+    monkeypatch.setattr(m["log_db"], "finish_error", capture_finish_error)
+    monkeypatch.setattr(m["failover"], "run_failover", failing_run_failover)
+
+    router = MockRouter()
+    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]}
+    resp, client = await _call_openai_handler(m, router, "chat", body)
+    await client.aclose()
+
+    assert resp.status_code == 500
+    assert captured["start_monotonic"] == 20.0
+    assert captured["finish"]["total_ms"] == 399
+    assert clock.wall_calls == 1
+
+
 # ─── 驱动 ────────────────────────────────────────────────────────
 
 

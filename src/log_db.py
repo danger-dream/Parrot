@@ -16,8 +16,10 @@ import os
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from . import config
 
@@ -28,6 +30,43 @@ _local = threading.local()
 _write_lock = threading.RLock()
 _initialized = False
 _log_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class LogDbRef:
+    """A concrete monthly database identity captured when a row is created."""
+
+    month: str
+    path: str
+
+
+@dataclass(frozen=True)
+class RequestLogHandle:
+    request_id: str
+    db: LogDbRef
+
+
+@dataclass(frozen=True)
+class RowLogHandle:
+    table: Literal["retry_chain", "proxy_chain", "local_web_log"]
+    row_id: int
+    request_id: str
+    db: LogDbRef
+
+    def __int__(self) -> int:
+        """Compatibility for old tests/diagnostics; production updates use handle."""
+
+        return self.row_id
+
+
+class HistoricalLogError(RuntimeError):
+    """A historical month couldn't be queried read-only and must not be skipped."""
+
+
+# Compatibility lookup for call sites migrated incrementally.  The authoritative
+# value is still the immutable handle returned by insert_pending; S5/S6 thread it
+# explicitly through active request paths.
+_request_handles: dict[str, RequestLogHandle] = {}
 
 
 def _resolve_log_dir() -> str:
@@ -62,9 +101,17 @@ def _schema_sql() -> str:
       output_tokens         INTEGER DEFAULT 0,
       cache_creation_tokens INTEGER DEFAULT 0,
       cache_read_tokens     INTEGER DEFAULT 0,
+      -- Four business metrics from the final/terminal upstream route round.
       connect_time_ms       INTEGER,
       first_token_time_ms   INTEGER,
+      idle_time_ms          INTEGER,
       total_time_ms         INTEGER,
+      final_round_id        TEXT,
+      -- Downstream/request lifecycle display only; never a business round total.
+      request_elapsed_ms    INTEGER,
+      request_upload_ms     INTEGER,
+      response_headers_wait_ms INTEGER,
+      response_body_first_byte_wait_ms INTEGER,
       retry_count           INTEGER DEFAULT 0,
       affinity_hit          INTEGER DEFAULT 0,
       fingerprint           TEXT,
@@ -103,8 +150,17 @@ def _schema_sql() -> str:
       channel_type    TEXT NOT NULL,
       model           TEXT NOT NULL,
       started_at      REAL NOT NULL,
+      -- Final/terminal route-round summary for this channel attempt.
+      final_round_id  TEXT,
       connect_ms      INTEGER,
       first_byte_ms   INTEGER,
+      idle_ms         INTEGER,
+      request_upload_ms INTEGER,
+      response_headers_wait_ms INTEGER,
+      response_body_first_byte_wait_ms INTEGER,
+      total_ms        INTEGER,
+      -- Outer channel-attempt display duration; never added to round total.
+      attempt_elapsed_ms INTEGER,
       ended_at        REAL,
       outcome         TEXT,
       error_detail    TEXT,
@@ -119,9 +175,26 @@ def _schema_sql() -> str:
       request_id      TEXT NOT NULL,
       retry_attempt_id INTEGER,
       attempt_order   INTEGER NOT NULL,
+      -- proxy_chain is the route-round detail table; direct is stored explicitly.
+      round_id        TEXT,
+      transport       TEXT,
+      request_mode    TEXT,
       proxy_name      TEXT NOT NULL,
       started_at      REAL NOT NULL,
       connect_ms      INTEGER,
+      first_byte_ms   INTEGER,
+      idle_ms         INTEGER,
+      total_ms        INTEGER,
+      dns_ms          INTEGER,
+      tcp_ms          INTEGER,
+      proxy_tcp_ms    INTEGER,
+      proxy_tunnel_ms INTEGER,
+      tls_ms          INTEGER,
+      target_tls_ms   INTEGER,
+      ws_handshake_ms INTEGER,
+      request_upload_ms INTEGER,
+      response_headers_wait_ms INTEGER,
+      response_body_first_byte_wait_ms INTEGER,
       ended_at        REAL,
       outcome         TEXT,
       error_detail    TEXT,
@@ -162,10 +235,41 @@ def init() -> None:
     print(f"[log_db] Using {path}")
 
 
-def _current_db_path() -> tuple[str, str]:
+def _db_ref_for_timestamp(timestamp: float | None = None) -> LogDbRef:
     assert _log_dir is not None
-    month = datetime.now(_BJT).strftime("%Y-%m")
-    return os.path.join(_log_dir, f"{month}.db"), month
+    dt = datetime.now(_BJT) if timestamp is None else datetime.fromtimestamp(float(timestamp), tz=_BJT)
+    month = dt.strftime("%Y-%m")
+    return LogDbRef(month=month, path=os.path.join(_log_dir, f"{month}.db"))
+
+
+def _current_db_path() -> tuple[str, str]:
+    ref = _db_ref_for_timestamp()
+    return ref.path, ref.month
+
+
+def _request_handle(value: str | RequestLogHandle) -> RequestLogHandle:
+    if isinstance(value, RequestLogHandle):
+        return value
+    with _write_lock:
+        known = _request_handles.get(str(value))
+    if known is not None:
+        return known
+    # Compatibility only for pre-handle callers that didn't originate through
+    # insert_pending in this process.  New production paths pass the handle.
+    return RequestLogHandle(request_id=str(value), db=_db_ref_for_timestamp())
+
+
+def _row_handle(
+    value: int | RowLogHandle,
+    *,
+    table: Literal["retry_chain", "proxy_chain", "local_web_log"],
+) -> RowLogHandle:
+    if isinstance(value, RowLogHandle):
+        if value.table != table:
+            raise ValueError(f"row handle table mismatch: {value.table!r} != {table!r}")
+        return value
+    # Legacy compatibility; production callers are migrated to RowLogHandle.
+    return RowLogHandle(table=table, row_id=int(value), request_id="", db=_db_ref_for_timestamp())
 
 
 def _ensure_migrations(conn: sqlite3.Connection) -> None:
@@ -200,6 +304,19 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if "fast_mode" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN fast_mode INTEGER DEFAULT 0")
         changed = True
+    for col in (
+        "idle_time_ms",
+        "request_elapsed_ms",
+        "request_upload_ms",
+        "response_headers_wait_ms",
+        "response_body_first_byte_wait_ms",
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE request_log ADD COLUMN {col} INTEGER")
+            changed = True
+    if "final_round_id" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN final_round_id TEXT")
+        changed = True
     # retry_chain migration
     retry_cols = {row[1] for row in conn.execute("PRAGMA table_info(retry_chain)").fetchall()}
     if retry_cols and "proxy_name" not in retry_cols:
@@ -211,6 +328,21 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if retry_cols and "bytes_down" not in retry_cols:
         conn.execute("ALTER TABLE retry_chain ADD COLUMN bytes_down INTEGER DEFAULT 0")
         changed = True
+    if retry_cols:
+        for col in (
+            "idle_ms",
+            "attempt_elapsed_ms",
+            "request_upload_ms",
+            "response_headers_wait_ms",
+            "response_body_first_byte_wait_ms",
+            "total_ms",
+        ):
+            if col not in retry_cols:
+                conn.execute(f"ALTER TABLE retry_chain ADD COLUMN {col} INTEGER")
+                changed = True
+        if "final_round_id" not in retry_cols:
+            conn.execute("ALTER TABLE retry_chain ADD COLUMN final_round_id TEXT")
+            changed = True
 
     proxy_cols = {row[1] for row in conn.execute("PRAGMA table_info(proxy_chain)").fetchall()}
     if not proxy_cols:
@@ -219,9 +351,25 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           request_id      TEXT NOT NULL,
           retry_attempt_id INTEGER,
           attempt_order   INTEGER NOT NULL,
+          round_id        TEXT,
+          transport       TEXT,
+          request_mode    TEXT,
           proxy_name      TEXT NOT NULL,
           started_at      REAL NOT NULL,
           connect_ms      INTEGER,
+          first_byte_ms   INTEGER,
+          idle_ms         INTEGER,
+          total_ms        INTEGER,
+          dns_ms          INTEGER,
+          tcp_ms          INTEGER,
+          proxy_tcp_ms    INTEGER,
+          proxy_tunnel_ms INTEGER,
+          tls_ms          INTEGER,
+          target_tls_ms   INTEGER,
+          ws_handshake_ms INTEGER,
+          request_upload_ms INTEGER,
+          response_headers_wait_ms INTEGER,
+          response_body_first_byte_wait_ms INTEGER,
           ended_at        REAL,
           outcome         TEXT,
           error_detail    TEXT,
@@ -229,12 +377,29 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           bytes_down      INTEGER DEFAULT 0
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_round ON proxy_chain(round_id)")
         changed = True
     else:
         for col, ddl in (
             ("retry_attempt_id", "ALTER TABLE proxy_chain ADD COLUMN retry_attempt_id INTEGER"),
             ("attempt_order", "ALTER TABLE proxy_chain ADD COLUMN attempt_order INTEGER DEFAULT 0"),
+            ("round_id", "ALTER TABLE proxy_chain ADD COLUMN round_id TEXT"),
+            ("transport", "ALTER TABLE proxy_chain ADD COLUMN transport TEXT"),
+            ("request_mode", "ALTER TABLE proxy_chain ADD COLUMN request_mode TEXT"),
             ("connect_ms", "ALTER TABLE proxy_chain ADD COLUMN connect_ms INTEGER"),
+            ("first_byte_ms", "ALTER TABLE proxy_chain ADD COLUMN first_byte_ms INTEGER"),
+            ("idle_ms", "ALTER TABLE proxy_chain ADD COLUMN idle_ms INTEGER"),
+            ("total_ms", "ALTER TABLE proxy_chain ADD COLUMN total_ms INTEGER"),
+            ("dns_ms", "ALTER TABLE proxy_chain ADD COLUMN dns_ms INTEGER"),
+            ("tcp_ms", "ALTER TABLE proxy_chain ADD COLUMN tcp_ms INTEGER"),
+            ("proxy_tcp_ms", "ALTER TABLE proxy_chain ADD COLUMN proxy_tcp_ms INTEGER"),
+            ("proxy_tunnel_ms", "ALTER TABLE proxy_chain ADD COLUMN proxy_tunnel_ms INTEGER"),
+            ("tls_ms", "ALTER TABLE proxy_chain ADD COLUMN tls_ms INTEGER"),
+            ("target_tls_ms", "ALTER TABLE proxy_chain ADD COLUMN target_tls_ms INTEGER"),
+            ("ws_handshake_ms", "ALTER TABLE proxy_chain ADD COLUMN ws_handshake_ms INTEGER"),
+            ("request_upload_ms", "ALTER TABLE proxy_chain ADD COLUMN request_upload_ms INTEGER"),
+            ("response_headers_wait_ms", "ALTER TABLE proxy_chain ADD COLUMN response_headers_wait_ms INTEGER"),
+            ("response_body_first_byte_wait_ms", "ALTER TABLE proxy_chain ADD COLUMN response_body_first_byte_wait_ms INTEGER"),
             ("bytes_up", "ALTER TABLE proxy_chain ADD COLUMN bytes_up INTEGER DEFAULT 0"),
             ("bytes_down", "ALTER TABLE proxy_chain ADD COLUMN bytes_down INTEGER DEFAULT 0"),
         ):
@@ -242,6 +407,7 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
                 conn.execute(ddl)
                 changed = True
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_req ON proxy_chain(request_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proxy_chain_round ON proxy_chain(round_id)")
 
     local_web_cols = {row[1] for row in conn.execute("PRAGMA table_info(local_web_log)").fetchall()}
     if not local_web_cols:
@@ -282,23 +448,23 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
-def _get_conn() -> sqlite3.Connection:
-    """按月切换 thread-local 连接；跨月时关闭旧连接建立新连接。"""
+def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
+    """Return a write connection permanently bound to ``ref.path``.
+
+    Connections are cached per thread *by path*, so a request that crosses the
+    Beijing month boundary can still update its original DB.  We intentionally
+    don't close the old-month connection just because the wall month changed.
+    """
+
     if _log_dir is None:
         raise RuntimeError("log_db.init() not called")
-    path, month = _current_db_path()
-    need_new = (
-        getattr(_local, "conn", None) is None
-        or getattr(_local, "month", None) != month
-    )
-    if need_new:
-        old = getattr(_local, "conn", None)
-        if old is not None:
-            try:
-                old.close()
-            except Exception:
-                pass
-        conn = sqlite3.connect(path, timeout=10)
+    cache = getattr(_local, "write_conns", None)
+    if cache is None:
+        cache = {}
+        _local.write_conns = cache
+    conn = cache.get(ref.path)
+    if conn is None:
+        conn = sqlite3.connect(ref.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -307,28 +473,60 @@ def _get_conn() -> sqlite3.Connection:
             conn.executescript(_schema_sql())
             _ensure_migrations(conn)
             conn.commit()
-        _local.conn = conn
-        _local.month = month
-    return _local.conn
+        cache[ref.path] = conn
+    # Legacy introspection compatibility only; write routing never reads these.
+    _local.conn = conn
+    _local.month = ref.month
+    return conn
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Return the current-month write connection for non-request maintenance."""
+
+    return _get_conn_for_ref(_db_ref_for_timestamp())
+
+
+def _open_readonly(path: str) -> sqlite3.Connection:
+    try:
+        uri = f"{Path(path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+    except Exception as exc:
+        raise HistoricalLogError(f"cannot open historical log read-only: {path}: {exc}") from exc
 
 
 def _get_conn_for_month(month: str) -> sqlite3.Connection | None:
-    """打开指定月份的 DB 用于只读查询；不存在返回 None。
+    """Open an existing month read-only; this function never runs migrations."""
 
-    打开方式改为读写（非 `?mode=ro`）以便 `_ensure_migrations` 能为老 DB
-    追加新列。查询层仍按只读使用，没有 INSERT/UPDATE 路径进入。
-    """
     if _log_dir is None:
         return None
     path = os.path.join(_log_dir, f"{month}.db")
     if not os.path.exists(path):
         return None
+    return _open_readonly(path)
+
+
+def migrate_month_schema(month: str) -> None:
+    """Explicit write migration entry; ordinary historical reads never call it."""
+
+    if _log_dir is None:
+        raise RuntimeError("log_db.init() not called")
+    path = os.path.join(_log_dir, f"{month}.db")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
     conn = sqlite3.connect(path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    with _write_lock:
-        _ensure_migrations(conn)
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        with _write_lock:
+            conn.executescript(_schema_sql())
+            _ensure_migrations(conn)
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def checkpoint() -> None:
@@ -406,9 +604,12 @@ def insert_pending(
     ingress_protocol: str = "anthropic",
     reasoning_effort: str | None = None,
     fast_mode: bool | None = None,
-) -> None:
+    created_at: float | None = None,
+) -> RequestLogHandle:
+    created = time.time() if created_at is None else float(created_at)
+    handle = RequestLogHandle(request_id=request_id, db=_db_ref_for_timestamp(created))
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """INSERT INTO request_log
                (request_id, created_at, client_ip, api_key_name, requested_model,
@@ -416,7 +617,7 @@ def insert_pending(
                 ingress_protocol, reasoning_effort, fast_mode)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                request_id, time.time(), client_ip, api_key_name, requested_model,
+                request_id, created, client_ip, api_key_name, requested_model,
                 "pending", 1 if is_stream else 0, msg_count, tool_count,
                 # log 表只存 16 字符（节省空间）；它是 affinity 表 32 字符指纹的前缀，
                 # 排查时可用 `log.fingerprint || '%'` 做前缀匹配反查 cache_affinities。
@@ -436,9 +637,11 @@ def insert_pending(
             ),
         )
         conn.commit()
+        _request_handles[request_id] = handle
+    return handle
 
 
-def update_pending(request_id: str, **fields: Any) -> None:
+def update_pending(request_id: str | RequestLogHandle, **fields: Any) -> None:
     """在 pending 阶段追加一些字段（如 fingerprint / affinity_hit）。"""
     if not fields:
         return
@@ -456,38 +659,51 @@ def update_pending(request_id: str, **fields: Any) -> None:
         vals.append(v)
     if not cols:
         return
-    vals.append(request_id)
+    handle = _request_handle(request_id)
+    vals.append(handle.request_id)
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             f"UPDATE request_log SET {', '.join(cols)} WHERE request_id=?",
             vals,
         )
-        _get_conn().commit()
+        conn.commit()
 
 
 def record_retry_attempt(
-    request_id: str, attempt_order: int,
+    request_id: str | RequestLogHandle, attempt_order: int,
     channel_key: str, channel_type: str, model: str,
     started_at: float,
     proxy_name: str | None = None,
-) -> int:
-    """插入一次尝试记录，返回该条的 id，后续用 update_retry_attempt 补齐。"""
+) -> RowLogHandle:
+    """Insert one outer channel attempt and return a month-bound row handle."""
+    request = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO retry_chain
                (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name)
                VALUES (?,?,?,?,?,?,?)""",
-            (request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name),
+            (request.request_id, attempt_order, channel_key, channel_type, model, started_at, proxy_name),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return RowLogHandle(
+            table="retry_chain", row_id=int(cur.lastrowid),
+            request_id=request.request_id, db=request.db,
+        )
 
 
 def update_retry_attempt(
-    attempt_id: int,
+    attempt_id: int | RowLogHandle,
+    final_round_id: str | None = None,
     connect_ms: int | None = None,
     first_byte_ms: int | None = None,
+    idle_ms: int | None = None,
+    attempt_elapsed_ms: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
+    total_ms: int | None = None,
     ended_at: float | None = None,
     outcome: str | None = None,
     error_detail: str | None = None,
@@ -496,10 +712,22 @@ def update_retry_attempt(
     bytes_down: int | None = None,
 ) -> None:
     fields, vals = [], []
+    if final_round_id is not None:
+        fields.append("final_round_id=?"); vals.append(final_round_id)
     if connect_ms is not None:
         fields.append("connect_ms=?"); vals.append(connect_ms)
     if first_byte_ms is not None:
         fields.append("first_byte_ms=?"); vals.append(first_byte_ms)
+    for name, value in (
+        ("idle_ms", idle_ms),
+        ("attempt_elapsed_ms", attempt_elapsed_ms),
+        ("request_upload_ms", request_upload_ms),
+        ("response_headers_wait_ms", response_headers_wait_ms),
+        ("response_body_first_byte_wait_ms", response_body_first_byte_wait_ms),
+        ("total_ms", total_ms),
+    ):
+        if value is not None:
+            fields.append(f"{name}=?"); vals.append(int(value))
     if ended_at is not None:
         fields.append("ended_at=?"); vals.append(ended_at)
     if outcome is not None:
@@ -514,38 +742,72 @@ def update_retry_attempt(
         fields.append("bytes_down=?"); vals.append(int(bytes_down or 0))
     if not fields:
         return
-    vals.append(attempt_id)
+    handle = _row_handle(attempt_id, table="retry_chain")
+    vals.append(handle.row_id)
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             f"UPDATE retry_chain SET {', '.join(fields)} WHERE id=?",
             vals,
         )
-        _get_conn().commit()
+        conn.commit()
 
 
 def record_proxy_attempt(
-    request_id: str,
-    retry_attempt_id: int | None,
+    request_id: str | RequestLogHandle,
+    retry_attempt_id: int | RowLogHandle | None,
     attempt_order: int,
     proxy_name: str,
     started_at: float,
-) -> int:
-    """插入一次代理链尝试，记录组内代理为何切换。"""
+    *,
+    round_id: str | None = None,
+    transport: str | None = None,
+    request_mode: str | None = None,
+) -> RowLogHandle:
+    """Insert one real route round (including ``direct``) with a bound handle."""
+    request = _request_handle(request_id)
+    retry_id: int | None = None
+    if retry_attempt_id is not None:
+        retry = _row_handle(retry_attempt_id, table="retry_chain")
+        if isinstance(retry_attempt_id, RowLogHandle) and retry.db != request.db:
+            raise ValueError("retry and route round must belong to the same monthly DB")
+        retry_id = retry.row_id
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO proxy_chain
-               (request_id, retry_attempt_id, attempt_order, proxy_name, started_at)
-               VALUES (?,?,?,?,?)""",
-            (request_id, retry_attempt_id, attempt_order, proxy_name, started_at),
+               (request_id, retry_attempt_id, attempt_order, round_id, transport,
+                request_mode, proxy_name, started_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                request.request_id, retry_id, attempt_order, round_id, transport,
+                request_mode, proxy_name, started_at,
+            ),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return RowLogHandle(
+            table="proxy_chain", row_id=int(cur.lastrowid),
+            request_id=request.request_id, db=request.db,
+        )
 
 
 def update_proxy_attempt(
-    proxy_attempt_id: int,
+    proxy_attempt_id: int | RowLogHandle,
+    started_at: float | None = None,
     connect_ms: int | None = None,
+    first_byte_ms: int | None = None,
+    idle_ms: int | None = None,
+    total_ms: int | None = None,
+    dns_ms: int | None = None,
+    tcp_ms: int | None = None,
+    proxy_tcp_ms: int | None = None,
+    proxy_tunnel_ms: int | None = None,
+    tls_ms: int | None = None,
+    target_tls_ms: int | None = None,
+    ws_handshake_ms: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
     ended_at: float | None = None,
     outcome: str | None = None,
     error_detail: str | None = None,
@@ -553,8 +815,27 @@ def update_proxy_attempt(
     bytes_down: int | None = None,
 ) -> None:
     fields, vals = [], []
+    if started_at is not None:
+        fields.append("started_at=?"); vals.append(float(started_at))
     if connect_ms is not None:
         fields.append("connect_ms=?"); vals.append(connect_ms)
+    for name, value in (
+        ("first_byte_ms", first_byte_ms),
+        ("idle_ms", idle_ms),
+        ("total_ms", total_ms),
+        ("dns_ms", dns_ms),
+        ("tcp_ms", tcp_ms),
+        ("proxy_tcp_ms", proxy_tcp_ms),
+        ("proxy_tunnel_ms", proxy_tunnel_ms),
+        ("tls_ms", tls_ms),
+        ("target_tls_ms", target_tls_ms),
+        ("ws_handshake_ms", ws_handshake_ms),
+        ("request_upload_ms", request_upload_ms),
+        ("response_headers_wait_ms", response_headers_wait_ms),
+        ("response_body_first_byte_wait_ms", response_body_first_byte_wait_ms),
+    ):
+        if value is not None:
+            fields.append(f"{name}=?"); vals.append(int(value))
     if ended_at is not None:
         fields.append("ended_at=?"); vals.append(ended_at)
     if outcome is not None:
@@ -567,42 +848,48 @@ def update_proxy_attempt(
         fields.append("bytes_down=?"); vals.append(int(bytes_down or 0))
     if not fields:
         return
-    vals.append(proxy_attempt_id)
+    handle = _row_handle(proxy_attempt_id, table="proxy_chain")
+    vals.append(handle.row_id)
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             f"UPDATE proxy_chain SET {', '.join(fields)} WHERE id=?",
             vals,
         )
-        _get_conn().commit()
+        conn.commit()
 
 
 
 
 def record_local_web_call(
-    request_id: str,
+    request_id: str | RequestLogHandle,
     round_no: int,
     tool_name: str,
     query: str | None = None,
     url: str | None = None,
     started_at: float | None = None,
-) -> int:
+) -> RowLogHandle:
+    request = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(request.db)
         cur = conn.execute(
             """INSERT INTO local_web_log
                (request_id, round_no, tool_name, query, url, started_at, status)
                VALUES (?,?,?,?,?,?,?)""",
             (
-                request_id, int(round_no or 0), tool_name,
+                request.request_id, int(round_no or 0), tool_name,
                 query, url, float(started_at or time.time()), "running",
             ),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return RowLogHandle(
+            table="local_web_log", row_id=int(cur.lastrowid),
+            request_id=request.request_id, db=request.db,
+        )
 
 
 def finish_local_web_call(
-    log_id: int,
+    log_id: int | RowLogHandle,
     *,
     status: str,
     result_count: int = 0,
@@ -611,8 +898,10 @@ def finish_local_web_call(
     error_message: str | None = None,
     ended_at: float | None = None,
 ) -> None:
+    handle = _row_handle(log_id, table="local_web_log")
     with _write_lock:
-        _get_conn().execute(
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
             """UPDATE local_web_log SET
                ended_at=?, status=?, result_count=?, content_bytes=?, content_chars=?, error_message=?
                WHERE id=?""",
@@ -620,21 +909,22 @@ def finish_local_web_call(
                 float(ended_at or time.time()), status, int(result_count or 0),
                 int(content_bytes or 0), int(content_chars or 0),
                 (error_message[:4000] if isinstance(error_message, str) else error_message),
-                int(log_id),
+                handle.row_id,
             ),
         )
-        _get_conn().commit()
+        conn.commit()
 
 
-def local_web_count(request_id: str) -> int:
-    row = _get_conn().execute(
+def local_web_count(request_id: str | RequestLogHandle) -> int:
+    handle = _request_handle(request_id)
+    row = _get_conn_for_ref(handle.db).execute(
         "SELECT COUNT(*) AS n FROM local_web_log WHERE request_id=?",
-        (request_id,),
+        (handle.request_id,),
     ).fetchone()
     return int(row["n"] or 0) if row else 0
 
 def finish_success(
-    request_id: str,
+    request_id: str | RequestLogHandle,
     final_channel_key: str,
     final_channel_type: str,
     final_model: str,
@@ -644,7 +934,10 @@ def finish_success(
     cache_read_tokens: int = 0,
     connect_ms: int | None = None,
     first_token_ms: int | None = None,
+    idle_ms: int | None = None,
     total_ms: int | None = None,
+    final_round_id: str | None = None,
+    request_elapsed_ms: int | None = None,
     retry_count: int = 0,
     affinity_hit: int = 0,
     response_body: str | None = None,
@@ -654,40 +947,52 @@ def finish_success(
     proxy_name: str | None = None,
     proxy_bytes_up: int | None = None,
     proxy_bytes_down: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
 ) -> None:
+    handle = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """UPDATE request_log SET
                  status='success', finished_at=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  input_tokens=?, output_tokens=?,
                  cache_creation_tokens=?, cache_read_tokens=?,
-                 connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
+                 connect_time_ms=?, first_token_time_ms=?, idle_time_ms=?, total_time_ms=?,
+                 final_round_id=?, request_elapsed_ms=?,
                  retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
-                 proxy_bytes_up=?, proxy_bytes_down=?
+                 proxy_bytes_up=?, proxy_bytes_down=?,
+                 request_upload_ms=?, response_headers_wait_ms=?,
+                 response_body_first_byte_wait_ms=?
                WHERE request_id=?""",
             (
                 time.time(), http_status,
                 final_channel_key, final_channel_type, final_model,
                 input_tokens, output_tokens,
                 cache_creation_tokens, cache_read_tokens,
-                connect_ms, first_token_ms, total_ms,
+                connect_ms, first_token_ms, idle_ms, total_ms,
+                final_round_id, request_elapsed_ms,
                 retry_count, affinity_hit, upstream_protocol, upstream_transport, proxy_name,
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
-                request_id,
+                request_upload_ms, response_headers_wait_ms,
+                response_body_first_byte_wait_ms,
+                handle.request_id,
             ),
         )
         if response_body is not None:
             conn.execute(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
-                (response_body, request_id),
+                (response_body, handle.request_id),
             )
         conn.commit()
+        if _request_handles.get(handle.request_id) == handle:
+            _request_handles.pop(handle.request_id, None)
 
 
 def finish_error(
-    request_id: str,
+    request_id: str | RequestLogHandle,
     error_message: str,
     retry_count: int = 0,
     final_channel_key: str | None = None,
@@ -695,7 +1000,10 @@ def finish_error(
     final_model: str | None = None,
     connect_ms: int | None = None,
     first_token_ms: int | None = None,
+    idle_ms: int | None = None,
     total_ms: int | None = None,
+    final_round_id: str | None = None,
+    request_elapsed_ms: int | None = None,
     http_status: int | None = None,
     response_body: str | None = None,
     affinity_hit: int = 0,
@@ -704,32 +1012,44 @@ def finish_error(
     proxy_name: str | None = None,
     proxy_bytes_up: int | None = None,
     proxy_bytes_down: int | None = None,
+    request_upload_ms: int | None = None,
+    response_headers_wait_ms: int | None = None,
+    response_body_first_byte_wait_ms: int | None = None,
 ) -> None:
+    handle = _request_handle(request_id)
     with _write_lock:
-        conn = _get_conn()
+        conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """UPDATE request_log SET
                  status='error', finished_at=?, error_message=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
-                 connect_time_ms=?, first_token_time_ms=?, total_time_ms=?,
+                 connect_time_ms=?, first_token_time_ms=?, idle_time_ms=?, total_time_ms=?,
+                 final_round_id=?, request_elapsed_ms=?,
                  retry_count=?, affinity_hit=?, upstream_protocol=?, upstream_transport=?, proxy_name=?,
-                 proxy_bytes_up=?, proxy_bytes_down=?
+                 proxy_bytes_up=?, proxy_bytes_down=?,
+                 request_upload_ms=?, response_headers_wait_ms=?,
+                 response_body_first_byte_wait_ms=?
                WHERE request_id=?""",
             (
                 time.time(), error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
-                connect_ms, first_token_ms, total_ms,
+                connect_ms, first_token_ms, idle_ms, total_ms,
+                final_round_id, request_elapsed_ms,
                 retry_count, affinity_hit, upstream_protocol, upstream_transport, proxy_name,
                 int(proxy_bytes_up or 0), int(proxy_bytes_down or 0),
-                request_id,
+                request_upload_ms, response_headers_wait_ms,
+                response_body_first_byte_wait_ms,
+                handle.request_id,
             ),
         )
         if response_body is not None:
             conn.execute(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
-                (response_body, request_id),
+                (response_body, handle.request_id),
             )
         conn.commit()
+        if _request_handles.get(handle.request_id) == handle:
+            _request_handles.pop(handle.request_id, None)
 
 
 def stats_lifetime() -> dict:
@@ -757,12 +1077,7 @@ def stats_lifetime() -> dict:
             conn = _get_conn()
             close_fn = None
         else:
-            try:
-                uri = f"file:{path}?mode=ro"
-                conn = sqlite3.connect(uri, uri=True, timeout=10)
-                conn.row_factory = sqlite3.Row
-            except Exception:
-                continue
+            conn = _open_readonly(path)
             close_fn = conn.close
         try:
             row = conn.execute(
@@ -785,7 +1100,7 @@ def stats_lifetime() -> dict:
                 out["cache_creation"] += int(row["cc"] or 0)
                 out["cache_read"] += int(row["cr"] or 0)
         except Exception as exc:
-            print(f"[log_db] stats_lifetime: {name} skipped: {exc}")
+            raise HistoricalLogError(f"stats_lifetime failed for {name}: {exc}") from exc
         finally:
             if close_fn is not None:
                 try:
@@ -951,7 +1266,7 @@ def xai_cost_for_channel(channel_key: str, since_ts: float = 0) -> dict:
                 except (TypeError, ValueError):
                     pass
         except Exception as exc:
-            print(f"[log_db] xai_cost_for_channel: skip: {exc}")
+            raise HistoricalLogError(f"xai_cost_for_channel failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1001,7 +1316,7 @@ def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict
                 out["cache_read"] += int(row["cr"] or 0)
                 _merge_tps(out, row)
         except Exception as exc:
-            print(f"[log_db] _aggregate_by_filter: skip: {exc}")
+            raise HistoricalLogError(f"aggregate query failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1072,7 +1387,7 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
                 bucket["cache_read"] += int(r["cr"] or 0)
                 _merge_tps(bucket, r)
         except Exception as exc:
-            print(f"[log_db] channel_model_stats: skip: {exc}")
+            raise HistoricalLogError(f"channel_model_stats failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1134,7 +1449,7 @@ def apikey_model_stats(api_key_name: str, since_ts: float) -> list[dict]:
                 bucket["cache_read"] += int(r["cr"] or 0)
                 _merge_tps(bucket, r)
         except Exception as exc:
-            print(f"[log_db] apikey_model_stats: skip: {exc}")
+            raise HistoricalLogError(f"apikey_model_stats failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1178,7 +1493,7 @@ def channels_by_requested_model(since_ts: float) -> dict[str, list[dict]]:
                 k = (r["ck"], r["ct"])
                 bucket[k] = bucket.get(k, 0) + int(r["cnt"] or 0)
         except Exception as exc:
-            print(f"[log_db] channels_by_requested_model: skip: {exc}")
+            raise HistoricalLogError(f"channels_by_requested_model failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1217,7 +1532,7 @@ def tps_by_channel_model(since_ts: float) -> dict[tuple[str, str], float]:
                 })
                 _merge_tps(bucket, r)
         except Exception as exc:
-            print(f"[log_db] tps_by_channel_model: skip: {exc}")
+            raise HistoricalLogError(f"tps_by_channel_model failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1252,17 +1567,11 @@ def _iter_month_conns_all(since_ts: float):
         if cursor == end and path == current_path:
             yield _get_conn(), lambda: None
         elif os.path.exists(path):
-            try:
-                # 打开为读写：读路径不会 INSERT/UPDATE，但 _ensure_migrations 需要
-                # ALTER TABLE 能力给老月份 DB 补列（如新增 ingress_protocol）。
-                c = sqlite3.connect(path, timeout=10)
-                c.row_factory = sqlite3.Row
-                c.execute("PRAGMA busy_timeout=5000")
-                with _write_lock:
-                    _ensure_migrations(c)
-                yield c, c.close
-            except Exception:
-                pass
+            # Historical reads are fail-closed and read-only.  Missing nullable
+            # columns are handled by projection helpers; incompatible required
+            # schema raises HistoricalLogError instead of silently dropping a month.
+            c = _open_readonly(path)
+            yield c, c.close
         if m == 12:
             cursor = (y + 1, 1)
         else:
@@ -1314,7 +1623,9 @@ _RECENT_COLS = (
     "final_channel_key, final_channel_type, final_model, "
     "status, http_status, error_message, is_stream, "
     "input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, "
-    "connect_time_ms, first_token_time_ms, total_time_ms, "
+    "connect_time_ms, first_token_time_ms, idle_time_ms, total_time_ms, "
+    "final_round_id, request_elapsed_ms, "
+    "request_upload_ms, response_headers_wait_ms, response_body_first_byte_wait_ms, "
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
     "reasoning_effort, fast_mode, "
@@ -1322,13 +1633,51 @@ _RECENT_COLS = (
 )
 
 
+def _compatible_recent_cols(conn: sqlite3.Connection) -> str:
+    """Project nullable timing columns when reading pre-migration monthly DBs."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    sql = _RECENT_COLS
+    for name in (
+        "idle_time_ms", "final_round_id", "request_elapsed_ms",
+        "request_upload_ms", "response_headers_wait_ms",
+        "response_body_first_byte_wait_ms", "ingress_protocol",
+        "upstream_protocol", "upstream_transport", "proxy_name",
+        "proxy_bytes_up", "proxy_bytes_down", "reasoning_effort", "fast_mode",
+    ):
+        if name not in cols:
+            sql = sql.replace(name, f"NULL AS {name}")
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "local_web_log" not in tables:
+        sql = sql.replace(
+            "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count",
+            "0 AS local_web_count",
+        )
+    return sql
+
+
+def _request_connect_sql(conn: sqlite3.Connection) -> str:
+    """Return a read-only compatibility expression for historical bad values."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+    legacy = (
+        "status='error' "
+        "AND lower(COALESCE(error_message,'')) LIKE '%first byte timeout%' "
+        "AND lower(COALESCE(error_message,'')) LIKE '%response header%'"
+    )
+    if "response_headers_wait_ms" in cols:
+        legacy += " AND response_headers_wait_ms IS NULL"
+    return f"CASE WHEN ({legacy}) THEN NULL ELSE connect_time_ms END"
+
 
 def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
     """Aggregate proxy usage stats across monthly log DBs.
 
     Includes the requested proxy metrics:
-      requests/successes/failures, tokens, average connect/first-byte/total
-      latency, and total proxied bytes (request + response body bytes).
+      requests/successes/failures, tokens, connect/first-byte/idle/total
+      sum+sample-count pairs and averages, plus proxied request/response bytes.
     """
     lim = max(1, int(limit or 20))
     since = 0.0 if since_ts is None else float(since_ts)
@@ -1338,7 +1687,17 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
 
     for conn, close_fn in _iter_month_conns_all(since):
         try:
-            rows = conn.execute("""
+            connect_expr = _request_connect_sql(conn)
+            request_cols = {row[1] for row in conn.execute("PRAGMA table_info(request_log)").fetchall()}
+            idle_sum_expr = (
+                "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN idle_time_ms ELSE 0 END)"
+                if "idle_time_ms" in request_cols else "0"
+            )
+            idle_n_expr = (
+                "SUM(CASE WHEN idle_time_ms IS NOT NULL THEN 1 ELSE 0 END)"
+                if "idle_time_ms" in request_cols else "0"
+            )
+            rows = conn.execute(f"""
                 SELECT proxy_name,
                        COUNT(*) AS requests,
                        SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS successes,
@@ -1349,10 +1708,12 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                        COALESCE(SUM(proxy_bytes_up), 0) AS bytes_up,
                        COALESCE(SUM(proxy_bytes_down), 0) AS bytes_down,
-                       SUM(CASE WHEN connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS connect_sum,
-                       SUM(CASE WHEN connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS connect_n,
+                       SUM(CASE WHEN {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS connect_sum,
+                       SUM(CASE WHEN {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS connect_n,
                        SUM(CASE WHEN first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS first_sum,
                        SUM(CASE WHEN first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS first_n,
+                       {idle_sum_expr} AS idle_sum,
+                       {idle_n_expr} AS idle_n,
                        SUM(CASE WHEN total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS total_sum,
                        SUM(CASE WHEN total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS total_n
                 FROM request_log
@@ -1371,14 +1732,16 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
                     "bytes_up": 0, "bytes_down": 0,
                     "connect_sum": 0, "connect_n": 0,
                     "first_sum": 0, "first_n": 0,
+                    "idle_sum": 0, "idle_n": 0,
                     "total_sum": 0, "total_n": 0,
                 })
                 for k in ("requests", "successes", "failures", "input_tokens", "output_tokens",
                           "cache_creation_tokens", "cache_read_tokens", "bytes_up", "bytes_down",
-                          "connect_sum", "connect_n", "first_sum", "first_n", "total_sum", "total_n"):
+                          "connect_sum", "connect_n", "first_sum", "first_n",
+                          "idle_sum", "idle_n", "total_sum", "total_n"):
                     b[k] += int(r[k] or 0)
         except Exception as exc:
-            print(f"[log_db] proxy_stats: skip: {exc}")
+            raise HistoricalLogError(f"proxy_stats failed: {exc}") from exc
         finally:
             try:
                 close_fn()
@@ -1403,8 +1766,17 @@ def proxy_stats(limit: int = 20, since_ts: float | None = None) -> list[dict]:
             "bytes_up": int(b["bytes_up"]),
             "bytes_down": int(b["bytes_down"]),
             "total_bytes": total_bytes,
+            "connect_sum_ms": int(b["connect_sum"]),
+            "connect_sample_count": int(b["connect_n"]),
+            "first_byte_sum_ms": int(b["first_sum"]),
+            "first_byte_sample_count": int(b["first_n"]),
+            "idle_sum_ms": int(b["idle_sum"]),
+            "idle_sample_count": int(b["idle_n"]),
+            "total_sum_ms": int(b["total_sum"]),
+            "total_sample_count": int(b["total_n"]),
             "avg_connect_ms": int(b["connect_sum"] / b["connect_n"]) if b["connect_n"] else 0,
             "avg_first_byte_ms": int(b["first_sum"] / b["first_n"]) if b["first_n"] else 0,
+            "avg_idle_ms": int(b["idle_sum"] / b["idle_n"]) if b["idle_n"] else 0,
             "avg_total_ms": int(b["total_sum"] / b["total_n"]) if b["total_n"] else 0,
         })
     out.sort(key=lambda x: (x["requests"], x["total_bytes"]), reverse=True)
@@ -1500,6 +1872,73 @@ def _recent_logs_where(
     return where, vals
 
 
+def _is_response_header_first_byte_timeout(outcome: object, error_detail: object) -> bool:
+    """Identify the historical branch that mislabeled header wait as connect.
+
+    Text/outcome, rather than a numeric threshold, is used so a legitimate slow
+    connection is never discarded merely because it took about 90 seconds.
+    """
+    outcome_text = str(outcome or "").strip().lower()
+    detail_text = str(error_detail or "").strip().lower()
+    return (
+        (outcome_text == "first_byte_timeout" or "first byte timeout" in detail_text)
+        and "response header" in detail_text
+    )
+
+
+def compatible_connect_ms(
+    connect_ms: object,
+    *,
+    outcome: object,
+    error_detail: object,
+    stage_timing_present: bool,
+):
+    """Return a connect sample only when it is not the identifiable legacy bug.
+
+    Old response-header timeout rows have the precise timeout outcome/message but
+    no newly-added stage timing.  New rows carry a measured header-wait (or proxy
+    attempt total), so a real slow connect is retained.  No numeric cutoff is
+    used.  This helper is also used at the live scorer boundary as defense in
+    depth; it never rewrites a persisted row.
+    """
+    if not stage_timing_present and _is_response_header_first_byte_timeout(outcome, error_detail):
+        return None
+    return connect_ms
+
+
+def _sanitize_request_timing(row: object) -> dict:
+    item = dict(row)  # sqlite3.Row or an ordinary mapping
+    item["connect_time_ms"] = compatible_connect_ms(
+        item.get("connect_time_ms"),
+        outcome=item.get("status"),
+        error_detail=item.get("error_message"),
+        stage_timing_present=item.get("response_headers_wait_ms") is not None,
+    )
+    return item
+
+
+def _sanitize_retry_timing(row: object) -> dict:
+    item = dict(row)
+    item["connect_ms"] = compatible_connect_ms(
+        item.get("connect_ms"),
+        outcome=item.get("outcome"),
+        error_detail=item.get("error_detail"),
+        stage_timing_present=item.get("response_headers_wait_ms") is not None,
+    )
+    return item
+
+
+def _sanitize_proxy_timing(row: object) -> dict:
+    item = dict(row)
+    item["connect_ms"] = compatible_connect_ms(
+        item.get("connect_ms"),
+        outcome=item.get("outcome"),
+        error_detail=item.get("error_detail"),
+        stage_timing_present=item.get("total_ms") is not None,
+    )
+    return item
+
+
 def recent_logs(
     limit: int = 20,
     channel_key: str | None = None,
@@ -1516,10 +1955,11 @@ def recent_logs(
     )
     lim = max(1, int(limit or 20))
     off = max(0, int(offset or 0))
-    sql = f"SELECT {_RECENT_COLS} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    conn = _get_conn()
+    sql = f"SELECT {_compatible_recent_cols(conn)} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
     vals.extend([lim, off])
-    rows = _get_conn().execute(sql, vals).fetchall()
-    return [dict(r) for r in rows]
+    rows = conn.execute(sql, vals).fetchall()
+    return [_sanitize_request_timing(r) for r in rows]
 
 
 def recent_logs_count(
@@ -1596,10 +2036,10 @@ def log_detail(request_id: str) -> dict:
         (request_id,),
     ).fetchall()
     return {
-        "log": dict(log_row) if log_row else None,
+        "log": _sanitize_request_timing(log_row) if log_row else None,
         "detail": dict(detail_row) if detail_row else None,
-        "retry_chain": [dict(r) for r in chain_rows],
-        "proxy_chain": [dict(r) for r in proxy_rows],
+        "retry_chain": [_sanitize_retry_timing(r) for r in chain_rows],
+        "proxy_chain": [_sanitize_proxy_timing(r) for r in proxy_rows],
         "local_web_log": [dict(r) for r in local_web_rows],
     }
 
@@ -1669,6 +2109,7 @@ def stats_summary(
     recent_cache_misses: list[dict] = []
 
     def _agg_group(target: dict, conn, col_expr: str) -> None:
+        connect_expr = _request_connect_sql(conn)
         rows = conn.execute(
             f"""SELECT {col_expr} AS grp_key,
                  COUNT(*) AS total,
@@ -1680,8 +2121,8 @@ def stats_summary(
                  SUM(output_tokens) AS total_output_tokens,
                  SUM(cache_creation_tokens) AS total_cache_creation,
                  SUM(cache_read_tokens) AS total_cache_read,
-                 SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS sum_connect_ms,
-                 SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
                  SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
                  {_tps_agg_sql()}
@@ -1697,6 +2138,7 @@ def stats_summary(
 
     try:
         for conn, _ in conns:
+            connect_expr = _request_connect_sql(conn)
             row = conn.execute(
                 f"""SELECT
                      COUNT(*) AS total,
@@ -1712,8 +2154,8 @@ def stats_summary(
                      SUM(output_tokens) AS total_output_tokens,
                      SUM(cache_creation_tokens) AS total_cache_creation,
                      SUM(cache_read_tokens) AS total_cache_read,
-                     SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN connect_time_ms ELSE 0 END) AS sum_connect_ms,
-                     SUM(CASE WHEN status='success' AND connect_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+                     SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+                     SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
                      SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
                      SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
                      SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
@@ -1741,12 +2183,12 @@ def stats_summary(
                 recent_errors.append(dict(r))
 
             for r in conn.execute(
-                f"""SELECT {_RECENT_COLS}
+                f"""SELECT {_compatible_recent_cols(conn)}
                    FROM request_log WHERE created_at >= ?{_family_where(family)}
                    ORDER BY created_at DESC LIMIT 3""",
                 (since_ts, *_family_params(family)),
             ).fetchall():
-                recent_calls.append(dict(r))
+                recent_calls.append(_sanitize_request_timing(r))
 
             # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0
             for r in conn.execute(

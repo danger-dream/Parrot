@@ -58,14 +58,24 @@ from ..protocols.runtime import (
     ws_close_code_for_http_status,
 )
 from ..transports import (
+    BusinessTimeoutError,
+    RoundTimeouts,
+    WsAttemptTiming,
+    await_ws_owned,
+    close_proxy_client,
+    close_response_context,
     connect_upstream_ws,
+    finalize_opened_http_response,
     http_url_to_ws,
+    next_nonempty_http_chunk,
+    open_response_with_proxy_chain,
     legacy_socks5_connector,
     open_socket_via_ss2022,
     read_next_responses_ws_step,
     read_until_first_responses_ws_visible_event,
     resolve_ws_route_chain,
     socks5h_url,
+    wait_ws_round_io,
     WsProxyBytes,
     ws_event_type,
     ws_frame_size,
@@ -116,9 +126,13 @@ class _WsAttemptResult:
     outcome: str = "transport_error"
     error_detail: str = ""
     http_status: Optional[int] = None
+    round_id: Optional[str] = None
     connect_ms: Optional[int] = None
     first_byte_ms: Optional[int] = None
+    idle_ms: Optional[int] = None
+    total_ms: Optional[int] = None
     response_completed: bool = False
+    request_finalized: bool = False
     usage: dict = field(default_factory=lambda: {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -133,6 +147,68 @@ class _WsAttemptResult:
     upstream_protocol: str = "openai-responses"
     upstream_transport: str = "ws"
     translator_ctx: Optional[dict] = None
+
+
+def _persist_ws_route_round(
+    route_attempt_id,
+    timing: WsAttemptTiming,
+    proxy_bytes: _WsProxyBytes,
+    *,
+    outcome: str,
+    error_detail: str | None = None,
+    terminal: bool,
+):
+    snapshot = (
+        timing.finish(outcome, error_detail)
+        if terminal
+        else timing.snapshot(terminal=False)
+    )
+    if route_attempt_id is not None:
+        try:
+            log_db.update_proxy_attempt(
+                route_attempt_id,
+                started_at=snapshot.started_at,
+                connect_ms=snapshot.connection_ms,
+                first_byte_ms=snapshot.first_byte_ms,
+                idle_ms=snapshot.idle_ms,
+                total_ms=snapshot.total_ms,
+                ws_handshake_ms=snapshot.ws_handshake_ms,
+                ended_at=snapshot.ended_at if terminal else None,
+                outcome=outcome,
+                error_detail=(error_detail or "")[:4000] if error_detail else None,
+                bytes_up=proxy_bytes.up,
+                bytes_down=proxy_bytes.down,
+            )
+        except Exception:
+            pass
+    return snapshot
+
+
+def _apply_ws_snapshot(result: _WsAttemptResult, timing: WsAttemptTiming, *, terminal: bool) -> _WsAttemptResult:
+    snapshot = timing.snapshot(terminal=terminal)
+    result.round_id = snapshot.round_id
+    result.connect_ms = snapshot.connection_ms
+    result.first_byte_ms = snapshot.first_byte_ms
+    result.idle_ms = snapshot.idle_ms
+    result.total_ms = snapshot.total_ms
+    return result
+
+
+def _apply_http_snapshot(result: _WsAttemptResult, opened, *, terminal: bool) -> _WsAttemptResult:
+    if opened.timing is None:
+        return result
+    snapshot = opened.timing.snapshot(terminal=terminal)
+    result.round_id = snapshot.round_id
+    result.connect_ms = snapshot.connection_ms
+    result.first_byte_ms = snapshot.first_byte_ms
+    result.idle_ms = snapshot.idle_ms
+    result.total_ms = snapshot.total_ms
+    return result
+
+
+def _sync_http_proxy_bytes(result_bytes: _WsProxyBytes, opened) -> None:
+    result_bytes.up = int(opened.proxy_bytes.get("up") or 0)
+    result_bytes.down = int(opened.proxy_bytes.get("down") or 0)
 
 
 class _WsTracker:
@@ -247,6 +323,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     """FastAPI WebSocket handler for /v1/responses."""
 
     start_time = time.time()
+    start_monotonic = time.monotonic()
     request_id = str(uuid.uuid4())
     accepted = False
     client_ip = _websocket_client_ip(websocket)
@@ -369,7 +446,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=None,
+            request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         ek = notifier.escape_html
         await notifier.throttled_notify_event(
@@ -390,7 +468,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await asyncio.to_thread(
             log_db.finish_error, request_id, exc.message, 0,
             http_status=429, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=None,
+            request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         await websocket.close(code=4429, reason=_trim_reason(exc.message))
         return
@@ -413,14 +492,16 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
                 websocket, first_obj=first_obj,
                 schedule_result=result, body=body, request_id=request_id,
                 api_key_name=key_name or "", client_ip=client_ip,
-                start_time=start_time, fp_query=fp_query,
+                start_time=start_time, start_monotonic=start_monotonic,
+                fp_query=fp_query,
             )
         except Exception as exc:
             traceback.print_exc()
-            total_ms = int((time.time() - start_time) * 1000)
+            request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
             await asyncio.to_thread(
                 log_db.finish_error, request_id, f"unexpected: {exc}", 0,
-                http_status=500, total_ms=total_ms,
+                http_status=500, total_ms=None,
+                request_elapsed_ms=request_elapsed_ms,
                 affinity_hit=(1 if result.affinity_hit else 0),
             )
             if not accepted and websocket.application_state != WebSocketState.DISCONNECTED:
@@ -442,12 +523,11 @@ async def _run_ws_failover(
     api_key_name: str,
     client_ip: str,
     start_time: float,
+    start_monotonic: float,
     fp_query: Optional[str],
 ) -> bool:
     cfg = config.get()
-    timeouts = cfg.get("timeouts") or {}
-    total_timeout = int(timeouts.get("total", 600))
-    deadline_ts = start_time + total_timeout
+    deadline_ts = 0.0  # legacy argument; every upstream route owns its round total
     queue_wait_s = float((cfg.get("concurrency") or {}).get("queueWaitSeconds", 30))
 
     affinity_hit = 1 if schedule_result.affinity_hit else 0
@@ -479,6 +559,7 @@ async def _run_ws_failover(
             continue
 
         attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
+        attempt_started_monotonic = time.monotonic()
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
             proxy_name=attempt_proxy,
@@ -494,6 +575,9 @@ async def _run_ws_failover(
                 request_id=request_id, retry_count_so_far=retry_count,
                 affinity_hit=affinity_hit, api_key_name=api_key_name,
                 client_ip=client_ip, fp_query=fp_query, client_key=client_key,
+                retry_attempt_id=attempt_id,
+                start_monotonic=start_monotonic,
+                attempt_start_monotonic=attempt_started_monotonic,
             )
         finally:
             concurrency.release(ch.key)
@@ -505,8 +589,12 @@ async def _run_ws_failover(
 
         log_db.update_retry_attempt(
             attempt_id,
+            final_round_id=result.round_id,
             connect_ms=result.connect_ms,
             first_byte_ms=result.first_byte_ms,
+            idle_ms=result.idle_ms,
+            total_ms=result.total_ms,
+            attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic) * 1000),
             ended_at=time.time(),
             outcome=result.outcome,
             error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
@@ -518,19 +606,21 @@ async def _run_ws_failover(
         if result.ok:
             return accepted
         if result.closed_after_accept:
-            await _finalize_ws_attempt_after_accept(
-                result, ch, resolved_model, request_id, retry_count,
-                affinity_hit, start_time,
-            )
+            if not result.request_finalized:
+                await _finalize_ws_attempt_after_accept(
+                    result, ch, resolved_model, request_id, retry_count,
+                    affinity_hit, start_time, start_monotonic,
+                )
             return accepted
         if result.outcome == "request_invalid":
             msg = result.error_detail or protocol_errors.responses_max_output_context_error_message()
             await _send_context_length_error_frame(websocket, msg)
             await _close_downstream(websocket, 4400, _trim_reason(msg))
-            await _finalize_ws_attempt_after_accept(
-                result, ch, resolved_model, request_id, retry_count,
-                affinity_hit, start_time,
-            )
+            if not result.request_finalized:
+                await _finalize_ws_attempt_after_accept(
+                    result, ch, resolved_model, request_id, retry_count,
+                    affinity_hit, start_time, start_monotonic,
+                )
             return accepted
 
         if ch.type == "oauth" and result.http_status in (401, 403) and ch.key not in refreshed_once:
@@ -587,8 +677,7 @@ async def _run_ws_failover(
             seen.add(k)
             deduped.append((ch, m))
         saturated_all = deduped
-        remaining_total = max(0.0, deadline_ts - time.time())
-        queue_timeout = min(queue_wait_s, remaining_total)
+        queue_timeout = queue_wait_s  # queue wait is outside every upstream round
         if queue_timeout > 0:
             acquired = await concurrency.acquire_from_candidates(
                 [(ch.key, (ch, m)) for ch, m in saturated_all], queue_timeout,
@@ -599,6 +688,7 @@ async def _run_ws_failover(
                 attempt_order += 1
                 last_ch, last_model = ch, resolved_model
                 attempt_proxy = _pick_non_direct_proxy_name(ch, resolved_model)
+                attempt_started_monotonic2 = time.monotonic()
                 attempt_id = log_db.record_retry_attempt(
                     request_id, attempt_order, ch.key, ch.type, resolved_model,
                     time.time(), proxy_name=attempt_proxy,
@@ -611,6 +701,9 @@ async def _run_ws_failover(
                         request_id=request_id, retry_count_so_far=retry_count,
                         affinity_hit=affinity_hit, api_key_name=api_key_name,
                         client_ip=client_ip, fp_query=fp_query, client_key=client_key,
+                        retry_attempt_id=attempt_id,
+                        start_monotonic=start_monotonic,
+                        attempt_start_monotonic=attempt_started_monotonic2,
                     )
                 finally:
                     concurrency.release(ch.key)
@@ -620,8 +713,12 @@ async def _run_ws_failover(
                 accepted = accepted or result.closed_after_accept or result.ok or result.connected
                 log_db.update_retry_attempt(
                     attempt_id,
+                    final_round_id=result.round_id,
                     connect_ms=result.connect_ms,
                     first_byte_ms=result.first_byte_ms,
+                    idle_ms=result.idle_ms,
+                    total_ms=result.total_ms,
+                    attempt_elapsed_ms=int((time.monotonic() - attempt_started_monotonic2) * 1000),
                     ended_at=time.time(),
                     outcome=result.outcome,
                     error_detail=(result.error_detail or "")[:4000] if result.error_detail else None,
@@ -632,10 +729,11 @@ async def _run_ws_failover(
                 if result.ok:
                     return accepted
                 if result.closed_after_accept:
-                    await _finalize_ws_attempt_after_accept(
-                        result, ch, resolved_model, request_id, retry_count,
-                        affinity_hit, start_time,
-                    )
+                    if not result.request_finalized:
+                        await _finalize_ws_attempt_after_accept(
+                            result, ch, resolved_model, request_id, retry_count,
+                            affinity_hit, start_time, start_monotonic,
+                        )
                     return accepted
                 finalize_policy.apply_error_health_effects(
                     finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
@@ -652,7 +750,8 @@ async def _run_ws_failover(
                 await asyncio.to_thread(
                     log_db.finish_error, request_id, msg, retry_count,
                     http_status=429, affinity_hit=affinity_hit,
-                    total_ms=int((time.time() - start_time) * 1000),
+                    total_ms=None,
+                    request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
                 )
                 await _close_downstream(websocket, 4429, msg)
                 return accepted
@@ -667,7 +766,10 @@ async def _run_ws_failover(
         final_model=last_model,
         connect_ms=(last_result.connect_ms if last_result else None),
         first_token_ms=(last_result.first_byte_ms if last_result else None),
-        total_ms=int((time.time() - start_time) * 1000),
+        idle_ms=(last_result.idle_ms if last_result else None),
+        total_ms=(last_result.total_ms if last_result else None),
+        final_round_id=(last_result.round_id if last_result else None),
+        request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         http_status=http_status,
         affinity_hit=affinity_hit,
         upstream_protocol=(getattr(last_ch, "protocol", "openai-responses") if last_ch else None),
@@ -696,6 +798,9 @@ async def _try_ws_channel(
     client_ip: str,
     fp_query: Optional[str],
     client_key: Optional[str],
+    retry_attempt_id,
+    start_monotonic: float,
+    attempt_start_monotonic: float,
 ) -> _WsAttemptResult:
     ch_proto = getattr(ch, "protocol", "anthropic")
     if ch_proto != "openai-responses":
@@ -718,6 +823,9 @@ async def _try_ws_channel(
             deadline_ts=deadline_ts, start_time=start_time, request_id=request_id,
             retry_count_so_far=retry_count_so_far, affinity_hit=affinity_hit,
             api_key_name=api_key_name, client_ip=client_ip, fp_query=fp_query, client_key=client_key,
+            retry_attempt_id=retry_attempt_id,
+            start_monotonic=start_monotonic,
+            attempt_start_monotonic=attempt_start_monotonic,
         )
 
     try:
@@ -739,73 +847,65 @@ async def _try_ws_channel(
         )
 
     route_chain = _resolve_ws_route_chain(ch, resolved_model)
+    round_timeouts = RoundTimeouts.from_config(timeouts)
     last_error: Optional[_WsAttemptResult] = None
+    route_order = 0
 
     for route_name, connector in route_chain:
+        last_error = None
+        route_order += 1
         proxy_bytes = _WsProxyBytes()
         proxy_name_used = None if connector is None else route_name
-        t0 = time.time()
+        route_log_name = route_name if connector is not None else "direct"
+        route_type = str(getattr(connector, "type", "direct") or "direct")
+        round_id = str(uuid.uuid4())
+        route_attempt_id = None
+        try:
+            route_attempt_id = log_db.record_proxy_attempt(
+                request_id,
+                retry_attempt_id,
+                route_order,
+                route_log_name,
+                time.time(),
+                round_id=round_id,
+                transport="ws",
+                request_mode="ws",
+            )
+        except Exception:
+            route_attempt_id = None
+
+        timing = WsAttemptTiming(route_type=route_type, round_id=round_id)
+        upstream_ws = None
         try:
             if connector is not None:
                 connector.stats.total_attempts += 1
-                connector.stats.last_attempt_ts = t0
+                connector.stats.last_attempt_ts = time.time()
             upstream_ws = await _connect_upstream_ws(
                 upstream_req.url,
                 headers=upstream_req.headers,
                 connector=connector,
                 proxy_bytes=proxy_bytes,
-                open_timeout=connect_timeout,
+                open_timeout=round_timeouts.connection + 0.5,
+                timing=timing,
+                round_timeouts=round_timeouts,
             )
-            connect_ms = int((time.time() - t0) * 1000)
+            if not timing.connection_complete:
+                timing.mark_handshake_complete()
+            open_snapshot = _persist_ws_route_round(
+                route_attempt_id,
+                timing,
+                proxy_bytes,
+                outcome="open",
+                terminal=False,
+            )
+            connect_ms = open_snapshot.connection_ms
             if connector is not None:
                 connector.stats.total_successes += 1
                 connector.stats.last_success_ts = time.time()
-                connector.stats.last_latency_ms = connect_ms
+                connector.stats.last_latency_ms = int(connect_ms or 0)
             # Headers from a successful WS upgrade carry Codex quota snapshots.
             _maybe_record_codex_ws_snapshot(ch, getattr(upstream_ws, "response", None))
-        except asyncio.TimeoutError:
-            last_error = _WsAttemptResult(
-                outcome="connect_timeout",
-                error_detail=f"connect timeout > {connect_timeout}s",
-                connect_ms=None,
-                proxy_name=proxy_name_used,
-                proxy_bytes=proxy_bytes,
-                upstream_protocol=ch_proto,
-            )
-            if connector is not None:
-                connector.stats.total_failures += 1
-                connector.stats.last_error = last_error.error_detail[:200]
-            continue
-        except InvalidStatus as exc:
-            status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
-            detail = _invalid_status_detail(exc)
-            last_error = _WsAttemptResult(
-                outcome="http_auth_error" if status in (401, 403) else "http_error",
-                error_detail=detail,
-                http_status=status or None,
-                proxy_name=proxy_name_used,
-                proxy_bytes=proxy_bytes,
-                upstream_protocol=ch_proto,
-            )
-            if connector is not None:
-                connector.stats.total_failures += 1
-                connector.stats.last_error = detail[:200]
-            continue
-        except Exception as exc:
-            detail = f"connect error: {exc}"
-            last_error = _WsAttemptResult(
-                outcome="connect_error",
-                error_detail=detail[:2000],
-                proxy_name=proxy_name_used,
-                proxy_bytes=proxy_bytes,
-                upstream_protocol=ch_proto,
-            )
-            if connector is not None:
-                connector.stats.total_failures += 1
-                connector.stats.last_error = detail[:200]
-            continue
 
-        try:
             relay_result = await _relay_ws_session(
                 websocket, upstream_ws,
                 first_obj=first_obj,
@@ -820,6 +920,7 @@ async def _try_ws_channel(
                 fp_query=fp_query,
                 client_key=client_key,
                 start_time=start_time,
+                start_monotonic=start_monotonic,
                 deadline_ts=deadline_ts,
                 connect_ms=connect_ms,
                 first_byte_timeout=first_byte_timeout,
@@ -827,13 +928,142 @@ async def _try_ws_channel(
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
                 translator_ctx=upstream_req.translator_ctx,
+                timing=timing,
+                round_timeouts=round_timeouts,
+                route_attempt_id=route_attempt_id,
             )
-            return relay_result
+            if not timing.terminal:
+                _persist_ws_route_round(
+                    route_attempt_id,
+                    timing,
+                    proxy_bytes,
+                    outcome=relay_result.outcome,
+                    error_detail=relay_result.error_detail,
+                    terminal=True,
+                )
+            _apply_ws_snapshot(relay_result, timing, terminal=True)
+            if relay_result.ok or relay_result.closed_after_accept:
+                return relay_result
+            last_error = relay_result
+        except asyncio.CancelledError:
+            async def finish_cancelled_round() -> None:
+                if upstream_ws is not None:
+                    try:
+                        await upstream_ws.close()
+                    except BaseException:
+                        pass
+                if timing.terminal:
+                    return
+                cancelled_snapshot = _persist_ws_route_round(
+                    route_attempt_id,
+                    timing,
+                    proxy_bytes,
+                    outcome="cancelled",
+                    error_detail="cancelled",
+                    terminal=True,
+                )
+                try:
+                    await asyncio.to_thread(
+                        log_db.update_retry_attempt,
+                        retry_attempt_id,
+                        final_round_id=cancelled_snapshot.round_id,
+                        connect_ms=cancelled_snapshot.connection_ms,
+                        first_byte_ms=cancelled_snapshot.first_byte_ms,
+                        idle_ms=cancelled_snapshot.idle_ms,
+                        total_ms=cancelled_snapshot.total_ms,
+                        attempt_elapsed_ms=int((time.monotonic() - attempt_start_monotonic) * 1000),
+                        ended_at=time.time(),
+                        outcome="cancelled",
+                        error_detail="cancelled",
+                        proxy_name=proxy_name_used,
+                        bytes_up=proxy_bytes.up,
+                        bytes_down=proxy_bytes.down,
+                    )
+                    await asyncio.to_thread(
+                        log_db.finish_error,
+                        request_id,
+                        "client disconnected",
+                        retry_count_so_far,
+                        final_channel_key=ch.key,
+                        final_channel_type=ch.type,
+                        final_model=resolved_model,
+                        connect_ms=cancelled_snapshot.connection_ms,
+                        first_token_ms=cancelled_snapshot.first_byte_ms,
+                        idle_ms=cancelled_snapshot.idle_ms,
+                        total_ms=cancelled_snapshot.total_ms,
+                        final_round_id=cancelled_snapshot.round_id,
+                        request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+                        http_status=499,
+                        affinity_hit=affinity_hit,
+                        upstream_protocol=ch_proto,
+                        upstream_transport="ws",
+                        proxy_name=proxy_name_used,
+                        proxy_bytes_up=proxy_bytes.up,
+                        proxy_bytes_down=proxy_bytes.down,
+                    )
+                except Exception:
+                    pass
+
+            await await_ws_owned(finish_cancelled_round())
+            upstream_ws = None
+            raise
+        except BusinessTimeoutError as exc:
+            last_error = _WsAttemptResult(
+                outcome=exc.outcome,
+                error_detail=exc.outcome,
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+                upstream_protocol=ch_proto,
+            )
+        except asyncio.TimeoutError as exc:
+            last_error = _WsAttemptResult(
+                outcome="transport_timeout",
+                error_detail=f"websocket transport timeout: {exc}"[:2000],
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+                upstream_protocol=ch_proto,
+            )
+        except InvalidStatus as exc:
+            status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+            detail = _invalid_status_detail(exc)
+            last_error = _WsAttemptResult(
+                outcome="http_auth_error" if status in (401, 403) else "http_error",
+                error_detail=detail,
+                http_status=status or None,
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+                upstream_protocol=ch_proto,
+            )
+        except Exception as exc:
+            connected = timing.connection_complete
+            detail = f"{'websocket relay' if connected else 'connect'} error: {exc}"
+            last_error = _WsAttemptResult(
+                outcome="transport_error" if connected else "connect_error",
+                error_detail=detail[:2000],
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+                upstream_protocol=ch_proto,
+            )
         finally:
-            try:
-                await upstream_ws.close()
-            except Exception:
-                pass
+            if last_error is not None and not timing.terminal:
+                _persist_ws_route_round(
+                    route_attempt_id,
+                    timing,
+                    proxy_bytes,
+                    outcome=last_error.outcome,
+                    error_detail=last_error.error_detail,
+                    terminal=True,
+                )
+                _apply_ws_snapshot(last_error, timing, terminal=True)
+            if upstream_ws is not None:
+                try:
+                    await upstream_ws.close()
+                except Exception:
+                    pass
+        if connector is not None and last_error is not None:
+            connector.stats.total_failures += 1
+            connector.stats.last_error = (last_error.error_detail or last_error.outcome)[:200]
+        continue
 
     return last_error or _WsAttemptResult(
         outcome="proxy_connect_error",
@@ -872,6 +1102,9 @@ async def _try_sse_channel(
     client_ip: str,
     fp_query: Optional[str],
     client_key: Optional[str],
+    retry_attempt_id,
+    start_monotonic: float,
+    attempt_start_monotonic: float,
 ) -> _WsAttemptResult:
     ch_proto = getattr(ch, "protocol", "anthropic")
     cfg = config.get()
@@ -879,6 +1112,7 @@ async def _try_sse_channel(
     connect_timeout = int(timeouts.get("connect", 10))
     first_byte_timeout = int(timeouts.get("firstByte", 30))
     idle_timeout = int(timeouts.get("idle", 120))
+    total_timeout = int(timeouts.get("total", 600))
     proxy_bytes = _WsProxyBytes()
 
     try:
@@ -903,61 +1137,117 @@ async def _try_sse_channel(
             upstream_transport="sse",
         )
 
-    client = upstream.get_client()
-    response: httpx.Response | None = None
-    t0 = time.time()
     try:
-        req = client.build_request(
-            upstream_req.method,
-            upstream_req.url,
-            headers=upstream_req.headers,
-            content=upstream_req.body,
+        opened = await open_response_with_proxy_chain(
+            channel=ch,
+            resolved_model=resolved_model,
+            upstream_req=upstream_req,
+            connect_timeout=connect_timeout,
+            first_byte_timeout=first_byte_timeout,
+            idle_timeout=idle_timeout,
+            total_timeout=total_timeout,
+            response_mode="stream",
+            request_id=request_id,
+            retry_attempt_id=retry_attempt_id,
         )
-        proxy_bytes.count(up=len(upstream_req.body or b""))
-        response = await asyncio.wait_for(client.send(req, stream=True), timeout=connect_timeout)
-        connect_ms = int((time.time() - t0) * 1000)
-    except asyncio.TimeoutError:
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(asyncio.to_thread(
+                log_db.update_retry_attempt,
+                retry_attempt_id,
+                attempt_elapsed_ms=int((time.monotonic() - attempt_start_monotonic) * 1000),
+                ended_at=time.time(),
+                outcome="cancelled",
+                error_detail="upstream SSE bridge cancelled before response headers",
+            ))
+            await asyncio.shield(asyncio.to_thread(
+                log_db.finish_error,
+                request_id,
+                "client disconnected",
+                retry_count_so_far,
+                final_channel_key=ch.key,
+                final_channel_type=ch.type,
+                final_model=resolved_model,
+                request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+                http_status=499,
+                affinity_hit=affinity_hit,
+                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                upstream_transport="sse",
+            ))
+        except BaseException:
+            pass
+        raise
+    if opened.error is not None:
+        error = opened.error
         return _WsAttemptResult(
-            outcome="connect_timeout",
-            error_detail=f"connect timeout > {connect_timeout}s",
-            proxy_bytes=proxy_bytes,
-            upstream_protocol=ch_proto,
-            upstream_transport="sse",
-        )
-    except Exception as exc:
-        return _WsAttemptResult(
-            outcome="connect_error",
-            error_detail=f"connect error: {exc}"[:2000],
-            proxy_bytes=proxy_bytes,
+            outcome=error.outcome,
+            error_detail=error.error_detail,
+            http_status=error.http_status,
+            round_id=error.round_id,
+            connect_ms=error.connect_ms,
+            first_byte_ms=error.first_byte_ms,
+            idle_ms=error.idle_ms,
+            total_ms=error.total_ms,
+            proxy_name=error.proxy_name,
+            proxy_bytes=_WsProxyBytes(error.proxy_bytes_up, error.proxy_bytes_down),
             upstream_protocol=ch_proto,
             upstream_transport="sse",
         )
 
+    response = opened.response
     status = int(response.status_code)
+    _sync_http_proxy_bytes(proxy_bytes, opened)
+    connect_ms = opened.connect_ms
     if status >= 400:
+        parts: list[bytes] = []
+        outcome = "http_auth_error" if status in (401, 403) else "http_error"
+        detail = response.reason_phrase or f"HTTP {status}"
         try:
-            body_bytes = await response.aread()
-            proxy_bytes.count(down=len(body_bytes or b""))
-            detail = body_bytes.decode("utf-8", errors="replace")[:2000]
-        except Exception:
-            detail = response.reason_phrase or f"HTTP {status}"
-        finally:
-            await response.aclose()
-        return _WsAttemptResult(
-            outcome="http_auth_error" if status in (401, 403) else "http_error",
+            aiter = response.aiter_bytes()
+            while True:
+                parts.append(await next_nonempty_http_chunk(
+                    aiter, opened.timing, opened.round_timeouts,
+                ))
+        except StopAsyncIteration:
+            if opened.timing is not None:
+                opened.timing.mark_io_complete()
+            body_bytes = b"".join(parts)
+            detail = body_bytes.decode("utf-8", errors="replace")[:2000] or detail
+        except asyncio.CancelledError:
+            finalize_opened_http_response(opened, "cancelled", "HTTP error response read cancelled")
+            await await_ws_owned(close_response_context(opened.ctx))
+            await await_ws_owned(close_proxy_client(opened.proxy_client))
+            raise
+        except BusinessTimeoutError as exc:
+            outcome = exc.outcome
+            detail = exc.outcome
+        except httpx.TimeoutException as exc:
+            outcome = "transport_timeout"
+            detail = f"HTTP response transport timeout: {exc}"
+        except Exception as exc:
+            detail = f"HTTP error response read failed: {exc}"
+        result = _WsAttemptResult(
+            outcome=outcome,
             error_detail=f"HTTP {status}: {detail}"[:2000],
             http_status=status,
-            connect_ms=connect_ms,
+            proxy_name=opened.proxy_name,
             proxy_bytes=proxy_bytes,
             upstream_protocol=ch_proto,
             upstream_transport="sse",
         )
+        _sync_http_proxy_bytes(proxy_bytes, opened)
+        finalize_opened_http_response(opened, result.outcome, result.error_detail)
+        _apply_http_snapshot(result, opened, terminal=True)
+        await close_response_context(opened.ctx)
+        await close_proxy_client(opened.proxy_client)
+        return result
 
     result = _WsAttemptResult(
         connected=True,
         outcome="connected",
         http_status=status,
         connect_ms=connect_ms,
+        proxy_name=opened.proxy_name,
         proxy_bytes=proxy_bytes,
         upstream_protocol=ch_proto,
         upstream_transport="sse",
@@ -968,6 +1258,16 @@ async def _try_sse_channel(
     committed = False
     buf = b""
     aiter = response.aiter_bytes()
+    round_terminalized = False
+
+    def terminalize_round(outcome: str, error_detail: str | None) -> None:
+        nonlocal round_terminalized
+        if round_terminalized:
+            return
+        finalize_opened_http_response(opened, outcome, error_detail)
+        _apply_http_snapshot(result, opened, terminal=True)
+        _sync_http_proxy_bytes(proxy_bytes, opened)
+        round_terminalized = True
 
     async def finalize_and_return() -> _WsAttemptResult:
         result.response_completed = tracker.response_completed
@@ -975,8 +1275,11 @@ async def _try_sse_channel(
         result.response_text = tracker.get_full_response()
         result.response_id = tracker.response_id
         result.output_items = tracker.get_output_items()
+        terminalize_round(result.outcome, result.error_detail)
+        request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
+        result.request_finalized = True
         if result.ok:
-            total_ms = int((time.time() - start_time) * 1000)
+            total_ms = result.total_ms
             finalize_policy.apply_success_health_effects(
                 finalize_policy.success_plan(),
                 scorer=scorer,
@@ -998,28 +1301,40 @@ async def _try_sse_channel(
                 client_key=client_key,
                 translator_ctx=result.translator_ctx,
             )
-            await asyncio.shield(asyncio.to_thread(
+            await await_ws_owned(asyncio.to_thread(
                 log_db.finish_success,
                 request_id, ch.key, ch.type, resolved_model,
                 input_tokens=result.usage["input_tokens"],
                 output_tokens=result.usage["output_tokens"],
                 cache_creation_tokens=result.usage["cache_creation"],
                 cache_read_tokens=result.usage["cache_read"],
-                connect_ms=connect_ms,
+                connect_ms=result.connect_ms,
                 first_token_ms=result.first_byte_ms,
-                total_ms=total_ms,
+                idle_ms=result.idle_ms,
+                total_ms=result.total_ms,
+                final_round_id=result.round_id,
+                request_elapsed_ms=request_elapsed_ms,
                 retry_count=retry_count_so_far,
                 affinity_hit=affinity_hit,
                 response_body=result.response_text,
                 http_status=status,
                 upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                 upstream_transport="sse",
-                proxy_name=None,
+                proxy_name=opened.proxy_name,
                 proxy_bytes_up=proxy_bytes.up,
                 proxy_bytes_down=proxy_bytes.down,
             ))
         else:
-            await asyncio.shield(asyncio.to_thread(
+            finalize_policy.apply_error_health_effects(
+                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                scorer=scorer,
+                cooldown=cooldown,
+                channel_key=ch.key,
+                model=resolved_model,
+                error_detail=result.error_detail,
+                connect_ms=result.connect_ms,
+            )
+            await await_ws_owned(asyncio.to_thread(
                 log_db.finish_error,
                 request_id,
                 (result.error_detail or result.outcome)[:4000],
@@ -1027,15 +1342,18 @@ async def _try_sse_channel(
                 final_channel_key=ch.key,
                 final_channel_type=ch.type,
                 final_model=resolved_model,
-                connect_ms=connect_ms,
+                connect_ms=result.connect_ms,
                 first_token_ms=result.first_byte_ms,
-                total_ms=int((time.time() - start_time) * 1000),
+                idle_ms=result.idle_ms,
+                total_ms=result.total_ms,
+                final_round_id=result.round_id,
+                request_elapsed_ms=request_elapsed_ms,
                 http_status=result.http_status or _http_status_from_ws_outcome(result),
                 affinity_hit=affinity_hit,
                 response_body=result.response_text or None,
                 upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                 upstream_transport="sse",
-                proxy_name=None,
+                proxy_name=opened.proxy_name,
                 proxy_bytes_up=proxy_bytes.up,
                 proxy_bytes_down=proxy_bytes.down,
             ))
@@ -1047,26 +1365,20 @@ async def _try_sse_channel(
             return
         committed = True
         result.closed_after_accept = True
-        if result.first_byte_ms is None:
-            result.first_byte_ms = int((time.time() - start_time) * 1000)
+        _apply_http_snapshot(result, opened, terminal=False)
         for item in pending:
             await _send_downstream(websocket, item)
         pending.clear()
 
     try:
         while True:
-            remaining = deadline_ts - time.time()
-            if remaining <= 0:
-                result.outcome = "total_timeout"
-                result.error_detail = "upstream total timeout"
-                if committed:
-                    await _close_downstream(websocket, 4504, result.error_detail)
-                    return await finalize_and_return()
-                return result
-            wait_sec = min(float(idle_timeout if committed else first_byte_timeout), max(1.0, remaining))
             try:
-                chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_sec)
+                chunk = await next_nonempty_http_chunk(
+                    aiter, opened.timing, opened.round_timeouts,
+                )
             except StopAsyncIteration:
+                if opened.timing is not None:
+                    opened.timing.mark_io_complete()
                 if tracker.response_completed:
                     result.ok = True
                     result.outcome = "success"
@@ -1080,12 +1392,16 @@ async def _try_sse_channel(
                     await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                     return await finalize_and_return()
                 return result
-            except asyncio.TimeoutError:
-                result.outcome = "idle_timeout" if committed else "first_byte_timeout"
-                result.error_detail = (
-                    f"upstream idle timeout > {idle_timeout}s" if committed
-                    else f"first SSE event timeout > {first_byte_timeout}s"
-                )
+            except BusinessTimeoutError as exc:
+                result.outcome = exc.outcome
+                result.error_detail = exc.outcome
+                if committed:
+                    await _close_downstream(websocket, 4504, result.error_detail)
+                    return await finalize_and_return()
+                return result
+            except httpx.TimeoutException as exc:
+                result.outcome = "transport_timeout"
+                result.error_detail = f"upstream SSE transport timeout: {exc}"
                 if committed:
                     await _close_downstream(websocket, 4504, result.error_detail)
                     return await finalize_and_return()
@@ -1098,8 +1414,8 @@ async def _try_sse_channel(
                     return await finalize_and_return()
                 return result
 
-            proxy_bytes.count(down=len(chunk or b""))
-            buf += chunk or b""
+            _sync_http_proxy_bytes(proxy_bytes, opened)
+            buf += chunk
             buf = buf.replace(b"\r\n", b"\n")
             buf, blocks = upstream.split_sse_events(buf)
             for block in blocks:
@@ -1112,8 +1428,12 @@ async def _try_sse_channel(
                 frame_text = _dump_frame(data)
                 tracker.feed_text(frame_text)
                 event_type = _ws_event_type(frame_text)
+                if tracker.response_completed and opened.timing is not None:
+                    opened.timing.mark_io_complete()
 
                 if tracker.response_failed:
+                    if opened.timing is not None:
+                        opened.timing.mark_io_complete()
                     is_context_error = (
                         tracker.stream_error_code == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
                     )
@@ -1170,8 +1490,72 @@ async def _try_sse_channel(
                     result.outcome = "success"
                     await _close_downstream(websocket, 1000, "")
                     return await finalize_and_return()
+    except WebSocketDisconnect:
+        result.outcome = "client_disconnected"
+        result.error_detail = "client disconnected"
+        if committed:
+            return await finalize_and_return()
+        return result
+    except asyncio.CancelledError:
+        async def finish_cancelled_bridge() -> None:
+            if result.request_finalized:
+                return
+            result.outcome = "cancelled"
+            result.error_detail = "upstream SSE bridge cancelled"
+            terminalize_round(result.outcome, result.error_detail)
+            result.request_finalized = True
+            try:
+                await asyncio.to_thread(
+                    log_db.update_retry_attempt,
+                    retry_attempt_id,
+                    final_round_id=result.round_id,
+                    connect_ms=result.connect_ms,
+                    first_byte_ms=result.first_byte_ms,
+                    idle_ms=result.idle_ms,
+                    total_ms=result.total_ms,
+                    attempt_elapsed_ms=int((time.monotonic() - attempt_start_monotonic) * 1000),
+                    ended_at=time.time(),
+                    outcome="cancelled",
+                    error_detail=result.error_detail,
+                    proxy_name=opened.proxy_name,
+                    bytes_up=proxy_bytes.up,
+                    bytes_down=proxy_bytes.down,
+                )
+                await asyncio.to_thread(
+                    log_db.finish_error,
+                    request_id,
+                    "client disconnected",
+                    retry_count_so_far,
+                    final_channel_key=ch.key,
+                    final_channel_type=ch.type,
+                    final_model=resolved_model,
+                    connect_ms=result.connect_ms,
+                    first_token_ms=result.first_byte_ms,
+                    idle_ms=result.idle_ms,
+                    total_ms=result.total_ms,
+                    final_round_id=result.round_id,
+                    request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
+                    http_status=499,
+                    affinity_hit=affinity_hit,
+                    upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                    upstream_transport="sse",
+                    proxy_name=opened.proxy_name,
+                    proxy_bytes_up=proxy_bytes.up,
+                    proxy_bytes_down=proxy_bytes.down,
+                )
+            except Exception:
+                pass
+
+        await await_ws_owned(finish_cancelled_bridge())
+        raise
     finally:
-        await response.aclose()
+        if not round_terminalized:
+            terminalize_round(result.outcome, result.error_detail)
+        try:
+            await await_ws_owned(close_response_context(opened.ctx))
+            await await_ws_owned(close_proxy_client(opened.proxy_client))
+        except BaseException:
+            pass
 
 
 async def _relay_ws_session(
@@ -1190,6 +1574,7 @@ async def _relay_ws_session(
     fp_query: Optional[str],
     client_key: Optional[str],
     start_time: float,
+    start_monotonic: float,
     deadline_ts: float,
     connect_ms: int,
     first_byte_timeout: int,
@@ -1197,6 +1582,9 @@ async def _relay_ws_session(
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
     translator_ctx: Optional[dict],
+    timing: WsAttemptTiming,
+    round_timeouts: RoundTimeouts,
+    route_attempt_id,
 ) -> _WsAttemptResult:
     tracker = _WsTracker()
     result = _WsAttemptResult(
@@ -1236,6 +1624,106 @@ async def _relay_ws_session(
             obj["prompt_cache_key"] = _session_pck
         return obj
 
+    async def finalize_accepted_request() -> _WsAttemptResult:
+        if result.request_finalized:
+            return result
+        result.response_completed = tracker.response_completed
+        result.usage = tracker.usage
+        result.response_text = _identity_log_text(tracker.get_full_response(), _identity_confuse_state)
+        result.response_id = tracker.response_id
+        result.output_items = tracker.get_output_items()
+        _persist_ws_route_round(
+            route_attempt_id,
+            timing,
+            proxy_bytes,
+            outcome=result.outcome,
+            error_detail=result.error_detail,
+            terminal=True,
+        )
+        _apply_ws_snapshot(result, timing, terminal=True)
+        result.request_finalized = True
+        request_elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
+
+        if result.ok:
+            finalize_policy.apply_success_health_effects(
+                finalize_policy.success_plan(),
+                scorer=scorer,
+                cooldown=cooldown,
+                channel_key=ch.key,
+                model=resolved_model,
+                connect_ms=result.connect_ms,
+                first_byte_ms=result.first_byte_ms,
+                total_ms=result.total_ms,
+            )
+            _write_responses_affinity(
+                api_key_name=api_key_name,
+                client_ip=client_ip,
+                body=body,
+                response_id=result.response_id,
+                output_items=result.output_items,
+                channel_key=ch.key,
+                resolved_model=resolved_model,
+                client_key=client_key,
+                translator_ctx=result.translator_ctx,
+            )
+            await await_ws_owned(asyncio.to_thread(
+                log_db.finish_success,
+                request_id, ch.key, ch.type, resolved_model,
+                input_tokens=result.usage["input_tokens"],
+                output_tokens=result.usage["output_tokens"],
+                cache_creation_tokens=result.usage["cache_creation"],
+                cache_read_tokens=result.usage["cache_read"],
+                connect_ms=result.connect_ms,
+                first_token_ms=result.first_byte_ms,
+                idle_ms=result.idle_ms,
+                total_ms=result.total_ms,
+                final_round_id=result.round_id,
+                request_elapsed_ms=request_elapsed_ms,
+                retry_count=retry_count_so_far,
+                affinity_hit=affinity_hit,
+                response_body=result.response_text,
+                http_status=101,
+                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                upstream_transport=result.upstream_transport,
+                proxy_name=proxy_name,
+                proxy_bytes_up=proxy_bytes.up,
+                proxy_bytes_down=proxy_bytes.down,
+            ))
+        else:
+            finalize_policy.apply_error_health_effects(
+                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                scorer=scorer,
+                cooldown=cooldown,
+                channel_key=ch.key,
+                model=resolved_model,
+                error_detail=result.error_detail,
+                connect_ms=result.connect_ms,
+            )
+            await await_ws_owned(asyncio.to_thread(
+                log_db.finish_error,
+                request_id,
+                (result.error_detail or result.outcome)[:4000],
+                retry_count_so_far,
+                final_channel_key=ch.key,
+                final_channel_type=ch.type,
+                final_model=resolved_model,
+                connect_ms=result.connect_ms,
+                first_token_ms=result.first_byte_ms,
+                idle_ms=result.idle_ms,
+                total_ms=result.total_ms,
+                final_round_id=result.round_id,
+                request_elapsed_ms=request_elapsed_ms,
+                http_status=_http_status_from_ws_outcome(result),
+                affinity_hit=affinity_hit,
+                response_body=result.response_text or None,
+                upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                upstream_transport=result.upstream_transport,
+                proxy_name=proxy_name,
+                proxy_bytes_up=proxy_bytes.up,
+                proxy_bytes_down=proxy_bytes.down,
+            ))
+        return result
+
     # Send first frame upstream before accepting downstream. If upstream rejects
     # before a downstream-visible event, the attempt can still fail over.
     try:
@@ -1243,19 +1731,32 @@ async def _relay_ws_session(
         first_upstream_obj = _apply_identity_confuse_to_frame(first_upstream_obj)
         payload_to_send: str | bytes = _dump_frame(first_upstream_obj)
         proxy_bytes.count(up=_frame_size(payload_to_send))
-        await asyncio.wait_for(upstream_ws.send(payload_to_send), timeout=idle_timeout)
+        await wait_ws_round_io(
+            upstream_ws.send(payload_to_send),
+            timing=timing,
+            round_timeouts=round_timeouts,
+        )
+    except BusinessTimeoutError as exc:
+        result.outcome = exc.outcome
+        result.error_detail = exc.outcome
+        return _apply_ws_snapshot(result, timing, terminal=True)
+    except asyncio.TimeoutError as exc:
+        result.outcome = "transport_timeout"
+        result.error_detail = f"send first websocket frame transport timeout: {exc}"
+        return _apply_ws_snapshot(result, timing, terminal=True)
     except Exception as exc:
         result.outcome = "transport_error"
         result.error_detail = f"send first websocket frame: {exc}"
         return result
 
     pending_visible: list[str | bytes] = []
-    first_wait = min(first_byte_timeout, max(1, int(deadline_ts - time.time())))
+    first_wait = round_timeouts.first_byte
     try:
         first_visible = await _recv_until_first_visible_ws_event(
             upstream_ws, tracker, pending_visible, ch.key, first_wait,
             deadline_ts=deadline_ts, idle_timeout=idle_timeout,
             result=result, proxy_bytes=proxy_bytes,
+            timing=timing, round_timeouts=round_timeouts,
             timeout_label_seconds=first_byte_timeout,
         )
     except asyncio.TimeoutError:
@@ -1272,9 +1773,11 @@ async def _relay_ws_session(
         return result
 
     if first_visible is None:
+        if result.ok or result.closed_after_accept:
+            return await finalize_accepted_request()
         return result
 
-    result.first_byte_ms = int((time.time() - start_time) * 1000)
+    _apply_ws_snapshot(result, timing, terminal=False)
     result.closed_after_accept = True
     for item in pending_visible:
         await _send_downstream(websocket, _identity_expose_frame(item, _identity_confuse_state))
@@ -1326,7 +1829,11 @@ async def _relay_ws_session(
                 data = _dump_frame(mapped)
                 is_text = True
             proxy_bytes.count(up=_frame_size(data))
-            await upstream_ws.send(data, text=is_text)
+            await wait_ws_round_io(
+                upstream_ws.send(data, text=is_text),
+                timing=timing,
+                round_timeouts=round_timeouts,
+            )
 
     async def upstream_to_downstream() -> None:
         nonlocal result
@@ -1341,14 +1848,14 @@ async def _relay_ws_session(
                 frame_transform=lambda frame: _identity_expose_frame(frame, _identity_confuse_state),
                 skip_event_types=(),
                 blacklist_before_error=True,
+                timing=timing,
+                round_timeouts=round_timeouts,
             )
-            if step.outcome == "total_timeout":
-                result.outcome = "total_timeout"
-                result.error_detail = step.error_detail
-                await _close_downstream(websocket, 4504, "upstream total timeout")
-                return
-            if step.outcome == "idle_timeout":
-                result.outcome = "idle_timeout"
+            if step.outcome in (
+                "connection_timeout", "first_byte_timeout", "idle_timeout",
+                "total_timeout", "transport_timeout",
+            ):
+                result.outcome = step.outcome
                 result.error_detail = step.error_detail
                 await _close_downstream(websocket, 4504, result.error_detail)
                 return
@@ -1390,10 +1897,20 @@ async def _relay_ws_session(
 
     t_down = asyncio.create_task(downstream_to_upstream())
     t_up = asyncio.create_task(upstream_to_downstream())
-    done, pending = await asyncio.wait({t_down, t_up}, return_when=asyncio.FIRST_COMPLETED)
+    tasks = {t_down, t_up}
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
+    if t_down in done and not tracker.response_completed and not tracker.response_failed:
+        result.outcome = "client_disconnected"
+        result.error_detail = "client disconnected"
     for task in done:
         exc = task.exception()
         if exc is None:
@@ -1409,81 +1926,14 @@ async def _relay_ws_session(
                 result.outcome = "client_disconnected"
                 result.error_detail = "client disconnected"
             continue
+        if isinstance(exc, BusinessTimeoutError):
+            result.outcome = exc.outcome
+            result.error_detail = exc.outcome
+            continue
         result.outcome = "transport_error"
         result.error_detail = f"websocket relay error: {exc}"
 
-    result.response_completed = tracker.response_completed
-    result.usage = tracker.usage
-    result.response_text = _identity_log_text(tracker.get_full_response(), _identity_confuse_state)
-    result.response_id = tracker.response_id
-    result.output_items = tracker.get_output_items()
-
-    if result.ok:
-        total_ms = int((time.time() - start_time) * 1000)
-        finalize_policy.apply_success_health_effects(
-            finalize_policy.success_plan(),
-            scorer=scorer,
-            cooldown=cooldown,
-            channel_key=ch.key,
-            model=resolved_model,
-            connect_ms=connect_ms,
-            first_byte_ms=result.first_byte_ms,
-            total_ms=total_ms,
-        )
-        _write_responses_affinity(
-            api_key_name=api_key_name,
-            client_ip=client_ip,
-            body=body,
-            response_id=result.response_id,
-            output_items=result.output_items,
-            channel_key=ch.key,
-            resolved_model=resolved_model,
-            client_key=client_key,
-            translator_ctx=result.translator_ctx,
-        )
-        await asyncio.shield(asyncio.to_thread(
-            log_db.finish_success,
-            request_id, ch.key, ch.type, resolved_model,
-            input_tokens=result.usage["input_tokens"],
-            output_tokens=result.usage["output_tokens"],
-            cache_creation_tokens=result.usage["cache_creation"],
-            cache_read_tokens=result.usage["cache_read"],
-            connect_ms=connect_ms,
-            first_token_ms=result.first_byte_ms,
-            total_ms=total_ms,
-            retry_count=retry_count_so_far,
-            affinity_hit=affinity_hit,
-            response_body=result.response_text,
-            http_status=101,
-            upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-            upstream_transport=result.upstream_transport,
-            proxy_name=proxy_name,
-            proxy_bytes_up=proxy_bytes.up,
-            proxy_bytes_down=proxy_bytes.down,
-        ))
-    else:
-        await asyncio.shield(asyncio.to_thread(
-            log_db.finish_error,
-            request_id,
-            (result.error_detail or result.outcome)[:4000],
-            retry_count_so_far,
-            final_channel_key=ch.key,
-            final_channel_type=ch.type,
-            final_model=resolved_model,
-            connect_ms=connect_ms,
-            first_token_ms=result.first_byte_ms,
-            total_ms=int((time.time() - start_time) * 1000),
-            http_status=_http_status_from_ws_outcome(result),
-            affinity_hit=affinity_hit,
-            response_body=result.response_text or None,
-            upstream_protocol=getattr(ch, "protocol", "openai-responses"),
-            upstream_transport=result.upstream_transport,
-            proxy_name=proxy_name,
-            proxy_bytes_up=proxy_bytes.up,
-            proxy_bytes_down=proxy_bytes.down,
-        ))
-
-    return result
+    return await finalize_accepted_request()
 
 
 async def _build_ws_upstream_request(
@@ -1566,6 +2016,8 @@ async def _connect_upstream_ws(
     connector,
     proxy_bytes: _WsProxyBytes,
     open_timeout: float,
+    timing: WsAttemptTiming,
+    round_timeouts: RoundTimeouts,
 ):
     return await connect_upstream_ws(
         url,
@@ -1573,6 +2025,8 @@ async def _connect_upstream_ws(
         connector=connector,
         proxy_bytes=proxy_bytes,
         open_timeout=open_timeout,
+        timing=timing,
+        round_timeouts=round_timeouts,
         open_socket_func=_open_socket_via_ss2022,
         connect_func=websockets.connect,
     )
@@ -1589,11 +2043,9 @@ async def _open_socket_via_ss2022(
     *,
     timeout: float,
 ):
-    opened = await open_socket_via_ss2022(url, connector, proxy_bytes, timeout=timeout)
-    if isinstance(opened, tuple):
-        sock, _cleanup = opened
-        return sock
-    return opened
+    return await open_socket_via_ss2022(
+        url, connector, proxy_bytes, timeout=timeout,
+    )
 
 
 def _ws_proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
@@ -1650,6 +2102,7 @@ async def _finalize_ws_attempt_after_accept(
     retry_count_so_far: int,
     affinity_hit: int,
     start_time: float,
+    start_monotonic: float,
 ) -> None:
     plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
     finalize_policy.apply_error_health_effects(
@@ -1671,7 +2124,10 @@ async def _finalize_ws_attempt_after_accept(
         final_model=resolved_model,
         connect_ms=result.connect_ms,
         first_token_ms=result.first_byte_ms,
-        total_ms=int((time.time() - start_time) * 1000),
+        idle_ms=result.idle_ms,
+        total_ms=result.total_ms,
+        final_round_id=result.round_id,
+        request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         http_status=_http_status_from_ws_outcome(result),
         affinity_hit=affinity_hit,
         response_body=result.response_text or None,
@@ -1828,6 +2284,8 @@ async def _recv_until_first_visible_ws_event(
     idle_timeout: int,
     result: _WsAttemptResult,
     proxy_bytes: _WsProxyBytes,
+    timing: WsAttemptTiming,
+    round_timeouts: RoundTimeouts,
     timeout_label_seconds: float | int | None = None,
 ) -> str | bytes | None:
     step = await read_until_first_responses_ws_visible_event(
@@ -1842,8 +2300,11 @@ async def _recv_until_first_visible_ws_event(
         timeout_detail_mode="event",
         timeout_label_seconds=timeout_label_seconds if timeout_label_seconds is not None else first_wait,
         use_tracker_error_detail=True,
+        timing=timing,
+        round_timeouts=round_timeouts,
     )
     pending_visible.extend(step.pending)
+    _apply_ws_snapshot(result, timing, terminal=False)
     if step.ok:
         result.ok = True
         result.outcome = "success"

@@ -306,6 +306,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         )
 
     start_time = time.time()
+    start_monotonic = time.monotonic()
     request_id = str(uuid.uuid4())
     client_ip = get_client_ip(request)
 
@@ -439,7 +440,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             await asyncio.to_thread(
                 log_db.finish_error, request_id, msg, 0,
                 http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
-                total_ms=int((time.time() - start_time) * 1000),
+                total_ms=int((time.monotonic() - start_monotonic) * 1000),
             )
             return errors.json_error_openai(
                 400, errors.ErrTypeOpenAI.INVALID_REQUEST, msg
@@ -449,7 +450,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         # 节流告警
         ek = notifier.escape_html
@@ -484,10 +485,11 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             result, body, request_id, key_name or "", client_ip,
             is_stream=is_stream, start_time=start_time,
             ingress_protocol=ingress_protocol,
+            start_monotonic=start_monotonic,
         )
     except Exception as exc:
         traceback.print_exc()
-        total_ms = int((time.time() - start_time) * 1000)
+        total_ms = int((time.monotonic() - start_monotonic) * 1000)
         await asyncio.to_thread(
             log_db.finish_error, request_id, f"unexpected: {exc}", 0,
             http_status=500, total_ms=total_ms,

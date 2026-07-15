@@ -24,6 +24,7 @@ from ..protocols.runtime import (
     responses_ws_error_detail,
 )
 from ..proxy.connector import DirectConnector, SOCKS5Connector, SS2022Connector
+from .timing import BusinessTimeoutError, RoundTimeouts, WsAttemptTiming
 from .websocket import event_type as ws_event_type, frame_size as ws_frame_size
 
 
@@ -247,14 +248,19 @@ async def connect_upstream_ws(
     connector,
     proxy_bytes,
     open_timeout: float,
+    timing: WsAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     open_socket_func=None,
     connect_func=None,
 ):
-    """Open a WS connection through direct/SOCKS5/SS2022 transport."""
+    """Open one WS route; caller constructs ``timing`` immediately beforehand."""
+
     connect = connect_func or websockets.connect
     kwargs = dict(
         additional_headers=headers,
         user_agent_header=None,
+        # Keep the library's transport timer later than the business connection
+        # deadline so the unique business winner isn't relabelled by a tie.
         open_timeout=open_timeout,
         ping_interval=20,
         ping_timeout=20,
@@ -263,28 +269,84 @@ async def connect_upstream_ws(
         max_queue=64,
         compression="deflate",
     )
-    if connector is None or isinstance(connector, DirectConnector):
-        return await connect(url, proxy=None, **kwargs)
-    if isinstance(connector, SOCKS5Connector):
-        return await connect(url, proxy=socks5h_url(connector.url), **kwargs)
-    if isinstance(connector, SS2022Connector):
-        opener = open_socket_func or open_socket_via_ss2022
-        opened = await opener(url, connector, proxy_bytes, timeout=open_timeout)
-        cleanup = None
-        if isinstance(opened, tuple) and len(opened) == 2:
-            sock, cleanup = opened
-        else:
-            sock = opened
-        try:
-            ws = await connect(url, proxy=None, sock=sock, **kwargs)
-        except BaseException:
+
+    async def _connect_once():
+        if connector is None or isinstance(connector, DirectConnector):
+            return await connect(url, proxy=None, **kwargs)
+        if isinstance(connector, SOCKS5Connector):
+            return await connect(url, proxy=socks5h_url(connector.url), **kwargs)
+        if isinstance(connector, SS2022Connector):
+            opener = open_socket_func or open_socket_via_ss2022
+            opened = await opener(url, connector, proxy_bytes, timeout=open_timeout)
+            cleanup = None
+            if isinstance(opened, tuple) and len(opened) == 2:
+                sock, cleanup = opened
+            else:
+                sock = opened
+            try:
+                ws = await connect(url, proxy=None, sock=sock, **kwargs)
+            except BaseException:
+                if cleanup is not None:
+                    await cleanup()
+                raise
             if cleanup is not None:
-                await cleanup()
-            raise
-        if cleanup is not None:
-            return ManagedWsConnection(ws, cleanup)
+                return ManagedWsConnection(ws, cleanup)
+            return ws
+        return await connect(url, proxy=None, **kwargs)
+
+    if timing is not None and round_timeouts is not None:
+        ws = await timing.wait_for(_connect_once(), round_timeouts)
+        timing.mark_handshake_complete()
         return ws
-    return await connect(url, proxy=None, **kwargs)
+    return await _connect_once()
+
+
+async def await_ws_owned(awaitable):
+    """Finish one WS terminal/cleanup owner even if its caller is cancelled."""
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
+
+
+async def wait_ws_round_io(
+    awaitable,
+    *,
+    timing: WsAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+):
+    """Await send/recv while the WS round's dynamic business deadlines compete."""
+
+    if timing is not None and round_timeouts is not None:
+        return await timing.wait_for(awaitable, round_timeouts)
+    return await awaitable
+
+
+async def _next_nonempty_ws_frame(
+    upstream_ws,
+    *,
+    timing: WsAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+):
+    """Receive the next non-empty frame; only it is response activity."""
+
+    while True:
+        data = await wait_ws_round_io(
+            upstream_ws.recv(), timing=timing, round_timeouts=round_timeouts,
+        )
+        if isinstance(data, str):
+            if not data.encode("utf-8"):
+                continue
+        elif not data:
+            continue
+        if timing is not None:
+            timing.mark_ws_frame(data)
+        return data
 
 
 async def read_until_first_responses_ws_visible_event(
@@ -297,10 +359,13 @@ async def read_until_first_responses_ws_visible_event(
     idle_timeout: int,
     proxy_bytes: WsProxyBytes | None = None,
     start_time: float | None = None,
+    start_monotonic: float | None = None,
     parse_wrapped_errors: bool = False,
     timeout_detail_mode: str = "event",
     timeout_label_seconds: float | int | None = None,
     use_tracker_error_detail: bool = False,
+    timing: WsAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
 ) -> ResponsesWsPreVisibleResult:
     """Read Responses WS frames until the first downstream-visible frame.
 
@@ -309,26 +374,24 @@ async def read_until_first_responses_ws_visible_event(
     logging, cooldown/scorer, affinity, and local result mapping.
     """
     result = ResponsesWsPreVisibleResult()
-    wait_sec = first_wait
-    timeout_label = timeout_label_seconds if timeout_label_seconds is not None else first_wait
 
     while True:
         try:
-            data = await asyncio.wait_for(upstream_ws.recv(), timeout=wait_sec)
+            data = await _next_nonempty_ws_frame(
+                upstream_ws, timing=timing, round_timeouts=round_timeouts,
+            )
+        except BusinessTimeoutError as exc:
+            result.outcome = exc.outcome
+            result.error_detail = exc.outcome
+            return result
         except asyncio.TimeoutError:
-            result.outcome = "first_byte_timeout"
-            if timeout_detail_mode == "packet_or_visible":
-                result.error_detail = (
-                    f"first websocket packet timeout > {timeout_label}s"
-                    if result.first_packet_ms is None else
-                    f"first websocket visible event timeout > {timeout_label}s"
-                )
-            else:
-                result.error_detail = f"first websocket event timeout > {timeout_label}s"
+            # Compatibility fallback for callers not yet supplying a round.
+            result.outcome = "transport_timeout"
+            result.error_detail = "websocket transport timeout before first frame"
             return result
 
-        if result.first_packet_ms is None and start_time is not None:
-            result.first_packet_ms = int((time.time() - start_time) * 1000)
+        if result.first_packet_ms is None and timing is not None:
+            result.first_packet_ms = timing.snapshot().first_byte_ms
         if proxy_bytes is not None:
             proxy_bytes.count(down=ws_frame_size(data))
 
@@ -348,6 +411,8 @@ async def read_until_first_responses_ws_visible_event(
             tracker.feed_text(data)
 
             if getattr(tracker, "response_failed", False):
+                if timing is not None:
+                    timing.mark_io_complete()
                 result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
                 if use_tracker_error_detail:
                     result.error_detail = getattr(tracker, "stream_error_message", None) or data[:2000]
@@ -380,6 +445,8 @@ async def read_until_first_responses_ws_visible_event(
 
             result.pending.append(data)
             if getattr(tracker, "response_completed", False):
+                if timing is not None:
+                    timing.mark_io_complete()
                 result.ok = True
                 result.outcome = "success"
                 result.closed_after_accept = True
@@ -390,13 +457,6 @@ async def read_until_first_responses_ws_visible_event(
             result.pending.append(data)
             result.visible_frame = data
             return result
-
-        remaining = deadline_ts - time.time()
-        if remaining <= 0:
-            result.outcome = "total_timeout"
-            result.error_detail = "upstream total timeout before first visible websocket event"
-            return result
-        wait_sec = min(float(idle_timeout), max(1.0, remaining))
 
 
 async def read_next_responses_ws_step(
@@ -412,26 +472,29 @@ async def read_next_responses_ws_step(
     closed_error_detail: str | None = None,
     blacklist_before_error: bool = False,
     check_blacklist: bool = True,
+    timing: WsAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
 ) -> ResponsesWsReadStep:
     """Read and classify one post-accept Responses WS frame."""
-    remaining = deadline_ts - time.time()
-    if remaining <= 0:
+    try:
+        data = await _next_nonempty_ws_frame(
+            upstream_ws, timing=timing, round_timeouts=round_timeouts,
+        )
+    except BusinessTimeoutError as exc:
         return ResponsesWsReadStep(
-            outcome="total_timeout",
-            error_detail="upstream total timeout",
+            outcome=exc.outcome,
+            error_detail=exc.outcome,
             http_status=504,
         )
-
-    wait_sec = min(float(idle_timeout), max(1.0, remaining))
-    try:
-        data = await asyncio.wait_for(upstream_ws.recv(), timeout=wait_sec)
     except asyncio.TimeoutError:
         return ResponsesWsReadStep(
-            outcome="idle_timeout",
-            error_detail=f"upstream idle timeout > {idle_timeout}s",
+            outcome="transport_timeout",
+            error_detail="websocket transport timeout",
             http_status=504,
         )
     except websockets.ConnectionClosed as exc:
+        if timing is not None:
+            timing.mark_io_complete()
         close_code = int(exc.rcvd.code if exc.rcvd else 1000)
         close_reason = str(exc.rcvd.reason if exc.rcvd else "")
         if getattr(tracker, "response_completed", False):
@@ -489,6 +552,8 @@ async def read_next_responses_ws_step(
                 step.http_status = 503
                 return step
         if getattr(tracker, "response_failed", False):
+            if timing is not None:
+                timing.mark_io_complete()
             if getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE:
                 step.outcome = "request_invalid"
                 step.error_detail = (
@@ -511,6 +576,8 @@ async def read_next_responses_ws_step(
                 step.http_status = 503
                 return step
         if getattr(tracker, "response_completed", False):
+            if timing is not None:
+                timing.mark_io_complete()
             step.outcome = "success"
             step.response_completed = True
             return step

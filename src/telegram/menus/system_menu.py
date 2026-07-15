@@ -13,6 +13,55 @@ from ...channel import registry
 from .. import states, ui
 
 
+def _merge_proxy_stats_for_system(names, stats_map: dict[str, dict]) -> dict:
+    """Merge backend proxy metrics by each metric's own non-NULL sample count."""
+
+    merged = {
+        "requests": 0, "successes": 0, "failures": 0,
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_creation_tokens": 0, "cache_read_tokens": 0,
+        "total_tokens": 0, "bytes_up": 0, "bytes_down": 0, "total_bytes": 0,
+        "connect_sum_ms": 0, "connect_sample_count": 0,
+        "first_byte_sum_ms": 0, "first_byte_sample_count": 0,
+        "idle_sum_ms": 0, "idle_sample_count": 0,
+        "total_sum_ms": 0, "total_sample_count": 0,
+        "avg_connect_ms": 0, "avg_first_byte_ms": 0,
+        "avg_idle_ms": 0, "avg_total_ms": 0,
+    }
+    for name in names:
+        if name == "direct":
+            continue
+        ps = stats_map.get(name)
+        if not ps:
+            continue
+        req = int(ps.get("requests") or 0)
+        merged["requests"] += req
+        merged["successes"] += int(ps.get("successes") or 0)
+        merged["failures"] += int(ps.get("failures") or 0)
+        for key in (
+            "input_tokens", "output_tokens", "cache_creation_tokens",
+            "cache_read_tokens", "total_tokens", "bytes_up", "bytes_down", "total_bytes",
+        ):
+            merged[key] += int(ps.get(key) or 0)
+        for sum_key, count_key in (
+            ("connect_sum_ms", "connect_sample_count"),
+            ("first_byte_sum_ms", "first_byte_sample_count"),
+            ("idle_sum_ms", "idle_sample_count"),
+            ("total_sum_ms", "total_sample_count"),
+        ):
+            merged[sum_key] += int(ps.get(sum_key) or 0)
+            merged[count_key] += int(ps.get(count_key) or 0)
+    for avg_key, sum_key, count_key in (
+        ("avg_connect_ms", "connect_sum_ms", "connect_sample_count"),
+        ("avg_first_byte_ms", "first_byte_sum_ms", "first_byte_sample_count"),
+        ("avg_idle_ms", "idle_sum_ms", "idle_sample_count"),
+        ("avg_total_ms", "total_sum_ms", "total_sample_count"),
+    ):
+        count = int(merged[count_key] or 0)
+        merged[avg_key] = round(merged[sum_key] / count) if count else 0
+    return merged
+
+
 # ─── 主菜单 ───────────────────────────────────────────────────────
 
 def _main_text_and_kb() -> tuple[str, dict]:
@@ -846,40 +895,8 @@ def _network_summary() -> tuple[list[str], dict, dict, list[str]]:
             return f"{n / 1048576:.1f}MB"
         return f"{n / 1073741824:.1f}GB"
 
-    def _empty_stats():
-        return {
-            "requests": 0, "successes": 0, "failures": 0,
-            "input_tokens": 0, "output_tokens": 0,
-            "cache_creation_tokens": 0, "cache_read_tokens": 0,
-            "total_tokens": 0, "bytes_up": 0, "bytes_down": 0, "total_bytes": 0,
-            "avg_connect_ms": 0, "avg_first_byte_ms": 0, "avg_total_ms": 0,
-        }
-
     def _merge_stats(names):
-        merged = _empty_stats()
-        weighted = {"connect": 0, "first": 0, "total": 0}
-        count = 0
-        for name in names:
-            if name == "direct":
-                continue
-            ps = pstats_by_name.get(name)
-            if not ps:
-                continue
-            req = int(ps.get("requests") or 0)
-            merged["requests"] += req
-            merged["successes"] += int(ps.get("successes") or 0)
-            merged["failures"] += int(ps.get("failures") or 0)
-            for k in ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "total_tokens", "bytes_up", "bytes_down", "total_bytes"):
-                merged[k] += int(ps.get(k) or 0)
-            weighted["connect"] += int(ps.get("avg_connect_ms") or 0) * req
-            weighted["first"] += int(ps.get("avg_first_byte_ms") or 0) * req
-            weighted["total"] += int(ps.get("avg_total_ms") or 0) * req
-            count += req
-        if count:
-            merged["avg_connect_ms"] = round(weighted["connect"] / count)
-            merged["avg_first_byte_ms"] = round(weighted["first"] / count)
-            merged["avg_total_ms"] = round(weighted["total"] / count)
-        return merged
+        return _merge_proxy_stats_for_system(names, pstats_by_name)
 
     def _append_stat_lines(prefix: str, ps: dict) -> None:
         tok = int(ps.get("total_tokens") or 0)

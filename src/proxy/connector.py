@@ -146,7 +146,7 @@ class Connector:
 
     def create_httpx_client(self, *, timeout: httpx.Timeout | None = None,
                             limits: httpx.Limits | None = None,
-                            http2: bool = False, **kw) -> httpx.AsyncClient:
+                            http2: bool = False, timing=None, **kw) -> httpx.AsyncClient:
         raise NotImplementedError
 
     async def test_connectivity(self, *, timeout: float = 8.0) -> dict:
@@ -183,7 +183,7 @@ class DirectConnector(Connector):
     def config_dict(self) -> dict:
         return {"type": "direct"}
 
-    def create_httpx_client(self, *, byte_counter=None, **kw) -> httpx.AsyncClient:
+    def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
         kw.setdefault("timeout", httpx.Timeout(10))
         limits = kw.pop("limits", None)
         http2 = bool(kw.pop("http2", False))
@@ -209,7 +209,7 @@ class SOCKS5Connector(Connector):
     def config_dict(self) -> dict:
         return {"type": "socks5", "url": self.url}
 
-    def create_httpx_client(self, *, byte_counter=None, **kw) -> httpx.AsyncClient:
+    def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
         kw.setdefault("timeout", httpx.Timeout(10))
         limits = kw.pop("limits", None)
         http2 = bool(kw.pop("http2", False))
@@ -380,18 +380,22 @@ class _TLSOverSS2022Stream(httpcore.AsyncNetworkStream):
 class _SS2022Backend(httpcore.AsyncNetworkBackend):
     """httpcore network backend that establishes SS2022 tunnels."""
 
-    def __init__(self, cipher: str, password: str, server: str, port: int):
+    def __init__(self, cipher: str, password: str, server: str, port: int,
+                 timing=None):
         self._cipher = cipher
         self._password = password
         self._server = server
         self._port = port
+        self._timing = timing
 
     async def connect_tcp(self, host: str, port: int,
                           timeout: float | None = None,
                           local_address: str | None = None,
                           socket_options=None) -> httpcore.AsyncNetworkStream:
-        conn = SS2022Connection(self._cipher, self._password,
-                                self._server, self._port)
+        conn = SS2022Connection(
+            self._cipher, self._password, self._server, self._port,
+            timing=self._timing,
+        )
         try:
             await conn.connect(host, port, timeout=timeout or 8.0)
         except (ConnectionError, TimeoutError, OSError, SS2022Error) as e:
@@ -427,12 +431,13 @@ class SS2022Connector(Connector):
             "password": self.password,
         }
 
-    def create_httpx_client(self, *, byte_counter=None, **kw) -> httpx.AsyncClient:
+    def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
         kw.setdefault("timeout", httpx.Timeout(10))
         limits = kw.pop("limits", None)
         http2 = bool(kw.pop("http2", False))
-        backend = _SS2022Backend(self.cipher, self.password,
-                                 self.server, self.port)
+        backend = _SS2022Backend(
+            self.cipher, self.password, self.server, self.port, timing=timing,
+        )
         # Inject our network backend into httpx's transport pool.
         if limits is None:
             base_transport = httpx.AsyncHTTPTransport(http2=http2)

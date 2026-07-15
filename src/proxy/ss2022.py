@@ -229,11 +229,12 @@ class SS2022Connection:
     """Async SS2022 TCP tunnel. connect() establishes the encrypted channel."""
 
     __slots__ = (
-        "_spec", "_psk", "_shost", "_sport",
+        "_spec", "_psk", "_shost", "_sport", "_timing",
         "_reader", "_writer", "_raw_r", "_raw_w", "_salt", "_resp_ok",
     )
 
-    def __init__(self, cipher: str, password: str, server: str, port: int):
+    def __init__(self, cipher: str, password: str, server: str, port: int,
+                 timing=None):
         if cipher not in CIPHERS:
             raise ValueError(f"unsupported cipher: {cipher}")
         self._spec = CIPHERS[cipher]
@@ -242,6 +243,7 @@ class SS2022Connection:
             raise ValueError(f"key length {len(self._psk)} != {self._spec.key_size}")
         self._shost = server
         self._sport = port
+        self._timing = timing
         self._reader: Optional[_Reader] = None
         self._writer: Optional[_Writer] = None
         self._raw_r: Optional[asyncio.StreamReader] = None
@@ -252,8 +254,13 @@ class SS2022Connection:
     async def connect(self, host: str, port: int, *,
                       initial_payload: bytes = b"",
                       timeout: float = 8.0) -> None:
-        rr, rw = await asyncio.wait_for(
-            asyncio.open_connection(self._shost, self._sport), timeout=timeout)
+        tcp_started = time.monotonic()
+        try:
+            rr, rw = await asyncio.wait_for(
+                asyncio.open_connection(self._shost, self._sport), timeout=timeout)
+        finally:
+            if self._timing is not None:
+                self._timing.record_proxy_tcp(tcp_started, time.monotonic())
         self._raw_w = rw
         try:
             ks = self._spec.key_size

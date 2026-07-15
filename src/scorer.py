@@ -30,6 +30,13 @@ _lock = threading.Lock()
 _stats: dict[tuple[str, str], dict] = {}
 _initialized = False
 
+# Old rows aggregated the superseded physical-connect meaning.  A deployment
+# must explicitly activate this version after reviewing production state.db;
+# until then init() neutralizes old connect EMA in memory and never writes DB.
+TIMING_SEMANTICS_META_KEY = "scorer.timing_semantics_version"
+TIMING_SEMANTICS_VERSION = "upstream-round-v2"
+_loaded_timing_semantics_version: str | None = None
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -49,12 +56,23 @@ def _params() -> dict:
     }
 
 
+def _loaded_connect_ema(row: dict, *, stored_version: str | None, neutral: float) -> float:
+    """Pure compatibility rule used by init and deterministic migration tests."""
+
+    if stored_version != TIMING_SEMANTICS_VERSION:
+        return float(neutral)
+    value = row.get("avg_connect_ms")
+    return float(value) if value is not None else float(neutral)
+
+
 def init() -> None:
-    global _initialized
+    global _initialized, _loaded_timing_semantics_version
     if _initialized:
         return
     rows = state_db.perf_load_all()
     params = _params()
+    stored_version = state_db.schema_meta_get(TIMING_SEMANTICS_META_KEY)
+    _loaded_timing_semantics_version = stored_version
     window = params["recentWindow"]
     with _lock:
         _stats.clear()
@@ -70,13 +88,16 @@ def init() -> None:
                 "success_count": succ,
                 "recent_requests": capped_recent,
                 "recent_success_count": capped_succ,
-                "avg_connect_ms": float(row.get("avg_connect_ms") or 0),
+                "avg_connect_ms": _loaded_connect_ema(
+                    row, stored_version=stored_version, neutral=params["defaultScore"],
+                ),
                 "avg_first_byte_ms": float(row.get("avg_first_byte_ms") or 0),
                 "avg_total_ms": float(row.get("avg_total_ms") or 0),
                 "last_updated": int(row.get("last_updated") or 0),
             }
     _initialized = True
-    print(f"[scorer] loaded {len(rows)} entries from state.db")
+    suffix = "" if stored_version == TIMING_SEMANTICS_VERSION else " (legacy connect EMA neutralized in memory)"
+    print(f"[scorer] loaded {len(rows)} entries from state.db{suffix}")
 
 
 def _get(channel_key: str, model: str) -> Optional[dict]:
@@ -140,7 +161,11 @@ def record_success(channel_key: str, model: str,
             stats = {
                 "total_requests": 0, "success_count": 0,
                 "recent_requests": 0, "recent_success_count": 0,
-                "avg_connect_ms": float(connect_ms or 0),
+                # Missing means pool reuse / not reliably observed, never a
+                # synthetic zero-latency connection sample.
+                "avg_connect_ms": (
+                    float(connect_ms) if connect_ms is not None else params["defaultScore"]
+                ),
                 "avg_first_byte_ms": float(first_byte_ms or 0),
                 "avg_total_ms": float(total_ms or 0),
                 "last_updated": _now_ms(),
@@ -164,7 +189,8 @@ def record_success(channel_key: str, model: str,
 
         # EMA 延迟
         if stats["total_requests"] == 1:
-            stats["avg_connect_ms"] = float(connect_ms or 0)
+            if connect_ms is not None:
+                stats["avg_connect_ms"] = float(connect_ms)
             stats["avg_first_byte_ms"] = float(first_byte_ms or 0)
             stats["avg_total_ms"] = float(total_ms or 0)
         else:
@@ -266,6 +292,41 @@ def _pick_explore_target(ordered: list) -> Optional[int]:
 
 
 # ─── 维护 ─────────────────────────────────────────────────────────
+
+def timing_semantics_migration(*, apply: bool = False) -> dict:
+    """Preview or explicitly activate the new scorer timing semantics.
+
+    ``apply=False`` is read-only and reports the number of rows whose legacy
+    connect EMA would be neutralized.  ``apply=True`` is deliberately never
+    called at import/startup; deployment must authorize it separately.
+    """
+
+    global _loaded_timing_semantics_version
+    rows = state_db.perf_load_all()
+    current = state_db.schema_meta_get(TIMING_SEMANTICS_META_KEY)
+    needed = current != TIMING_SEMANTICS_VERSION
+    result = {
+        "current_version": current,
+        "target_version": TIMING_SEMANTICS_VERSION,
+        "rows": len(rows) if needed else 0,
+        "applied": False,
+    }
+    if not apply or not needed:
+        return result
+
+    neutral = _params()["defaultScore"]
+    for row in rows:
+        migrated = dict(row)
+        migrated["avg_connect_ms"] = float(neutral)
+        state_db.perf_save(str(row["channel_key"]), str(row["model"]), migrated)
+    state_db.schema_meta_set(TIMING_SEMANTICS_META_KEY, TIMING_SEMANTICS_VERSION)
+    with _lock:
+        for stats in _stats.values():
+            stats["avg_connect_ms"] = float(neutral)
+    _loaded_timing_semantics_version = TIMING_SEMANTICS_VERSION
+    result["applied"] = True
+    return result
+
 
 def clear_stats(channel_key: Optional[str] = None, model: Optional[str] = None) -> None:
     with _lock:

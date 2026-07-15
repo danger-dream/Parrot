@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,16 +25,25 @@ from ..protocols.runtime import AttemptResult, make_stream_translator, toolkit_f
 from .base import metadata_from_response
 from .http import HttpStreamRequest, open_stream
 from .policy import proxy_byte_snapshot, proxy_route_kwargs
+from .timing import (
+    BusinessTimeoutError,
+    HttpAttemptTiming,
+    RoundTimeouts,
+    classify_httpx_timeout,
+)
 
 
 @dataclass
 class OpenedHttpResponse:
     ctx: Any | None = None
     response: httpx.Response | None = None
-    connect_ms: int = 0
+    connect_ms: int | None = None
+    timing: HttpAttemptTiming | None = None
     proxy_name: str | None = None
     proxy_bytes: dict[str, int] = field(default_factory=lambda: {"up": 0, "down": 0})
     proxy_client: Any | None = None
+    proxy_attempt_id: Any | None = None
+    round_timeouts: RoundTimeouts | None = None
     error: AttemptResult | None = None
 
     @property
@@ -142,10 +152,74 @@ def _attempt_result(outcome: str, detail: str, *, bucket: dict | None = None,
     )
 
 
+def _with_timing(
+    timing: HttpAttemptTiming | None,
+    result: AttemptResult,
+    *,
+    terminal: bool = True,
+) -> AttemptResult:
+    if timing is None:
+        return result
+    if terminal:
+        timing.finish(result.outcome, result.error_detail)
+    return timing.apply_to(result, terminal=False)
+
+
+async def _next_nonempty_http_chunk(
+    aiter,
+    timing: HttpAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+) -> bytes:
+    """Return the next non-empty raw body chunk under this round's deadlines."""
+
+    while True:
+        awaitable = aiter.__anext__()
+        if timing is not None and round_timeouts is not None:
+            chunk = await timing.wait_for(awaitable, round_timeouts)
+        else:
+            chunk = await awaitable
+        if not chunk:
+            continue
+        raw = bytes(chunk)
+        if timing is not None:
+            timing.mark_response_body_byte(raw)
+        return raw
+
+
+async def next_nonempty_http_chunk(
+    aiter,
+    timing: HttpAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+) -> bytes:
+    """Public raw-body activity primitive for HTTP/SSE bridge consumers."""
+
+    return await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+
+
+async def _read_response_bytes(
+    response: httpx.Response,
+    timing: HttpAttemptTiming | None,
+    round_timeouts: RoundTimeouts | None,
+) -> bytes:
+    """Read a response using only non-empty raw bytes as business activity."""
+
+    if timing is not None:
+        timing.start_response_body_wait()
+    parts: list[bytes] = []
+    aiter = response.aiter_bytes()
+    while True:
+        try:
+            parts.append(await _next_nonempty_http_chunk(aiter, timing, round_timeouts))
+        except StopAsyncIteration:
+            if timing is not None:
+                timing.mark_io_complete()
+            return b"".join(parts)
+
+
 def _stream_tracker_error_result(
     tracker,
     *,
-    connect_ms: int,
+    connect_ms: int | None,
     first_byte_ms: int | None,
     response_status: int | None = None,
     translator_ctx: dict | None = None,
@@ -177,38 +251,50 @@ async def read_http_error_response(
     ctx,
     response: httpx.Response,
     *,
-    deadline_ts: float,
-    connect_ms: int,
+    connect_ms: int | None,
+    timing: HttpAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     proxy_name: str | None = None,
     proxy_bytes: dict | None = None,
     translator_ctx: dict | None = None,
 ) -> AttemptResult:
-    """Read and normalize a non-2xx/3xx HTTP response without proxy failover."""
-    read_timeout = max(1.0, deadline_ts - time.time())
+    """Read and normalize a non-2xx/3xx response under round deadlines."""
+
     try:
-        raw = await asyncio.wait_for(response.aread(), timeout=read_timeout)
-    except asyncio.TimeoutError:
+        raw = await _read_response_bytes(response, timing, round_timeouts)
+    except asyncio.CancelledError:
+        await close_response_context(ctx)
+        raise
+    except BusinessTimeoutError as exc:
         await close_response_context(ctx)
         up, down = proxy_byte_snapshot(proxy_bytes)
-        return AttemptResult(
-            outcome="total_timeout",
-            connect_ms=connect_ms,
-            error_detail=f"total timeout reading error body (> {int(read_timeout)}s)",
+        return _with_timing(timing, AttemptResult(
+            outcome=exc.outcome,
+            error_detail=f"{exc.outcome} reading HTTP error body",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
-        )
+        ))
+    except httpx.TimeoutException as exc:
+        await close_response_context(ctx)
+        up, down = proxy_byte_snapshot(proxy_bytes)
+        return _with_timing(timing, AttemptResult(
+            outcome=classify_httpx_timeout(exc),
+            error_detail=f"read HTTP error body timeout: {exc}",
+            proxy_name=proxy_name,
+            proxy_bytes_up=up,
+            proxy_bytes_down=down,
+        ))
     except Exception as exc:
         await close_response_context(ctx)
         up, down = proxy_byte_snapshot(proxy_bytes)
-        return AttemptResult(
+        return _with_timing(timing, AttemptResult(
             outcome="transport_error",
-            connect_ms=connect_ms,
             error_detail=f"read http error body: {exc}",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
-        )
+        ))
 
     err_text = raw.decode("utf-8", errors="replace")
     status = response.status_code
@@ -216,7 +302,7 @@ async def read_http_error_response(
 
     up, down = proxy_byte_snapshot(proxy_bytes)
     outcome = "http_auth_error" if status in (401, 403) else "http_error"
-    return AttemptResult(
+    return _with_timing(timing, AttemptResult(
         outcome=outcome,
         http_status=status,
         connect_ms=connect_ms,
@@ -225,37 +311,47 @@ async def read_http_error_response(
         proxy_bytes_up=up,
         proxy_bytes_down=down,
         translator_ctx=translator_ctx,
-    )
+    ))
 
 
 async def read_non_stream_body(
     ctx,
     response: httpx.Response,
     *,
-    deadline_ts: float,
-    connect_ms: int,
+    connect_ms: int | None,
+    timing: HttpAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
 ) -> HttpBodyReadResult:
-    """Read a non-stream response body and close the response context."""
-    read_timeout = max(1.0, deadline_ts - time.time())
+    """Read a non-stream body; first-byte is inapplicable, idle starts on body."""
+
     try:
-        raw = await asyncio.wait_for(response.aread(), timeout=read_timeout)
-    except asyncio.TimeoutError:
+        raw = await _read_response_bytes(response, timing, round_timeouts)
+    except asyncio.CancelledError:
+        await close_response_context(ctx)
+        raise
+    except BusinessTimeoutError as exc:
         await close_response_context(ctx)
         return HttpBodyReadResult(
-            error=AttemptResult(
-                outcome="total_timeout",
-                connect_ms=connect_ms,
-                error_detail=f"total timeout reading non-stream body (> {int(read_timeout)}s)",
-            )
+            error=_with_timing(timing, AttemptResult(
+                outcome=exc.outcome,
+                error_detail=f"{exc.outcome} reading non-stream body",
+            ))
+        )
+    except httpx.TimeoutException as exc:
+        await close_response_context(ctx)
+        return HttpBodyReadResult(
+            error=_with_timing(timing, AttemptResult(
+                outcome=classify_httpx_timeout(exc),
+                error_detail=f"non-stream body timeout: {exc}",
+            ))
         )
     except Exception as exc:
         await close_response_context(ctx)
         return HttpBodyReadResult(
-            error=AttemptResult(
+            error=_with_timing(timing, AttemptResult(
                 outcome="transport_error",
-                connect_ms=connect_ms,
                 error_detail=f"read non-stream body: {exc}",
-            )
+            ))
         )
 
     response_headers = metadata_from_response(response).forward_headers()
@@ -263,11 +359,10 @@ async def read_non_stream_body(
 
     if not raw:
         return HttpBodyReadResult(
-            error=AttemptResult(
+            error=_with_timing(timing, AttemptResult(
                 outcome="closed_before_first_byte",
-                connect_ms=connect_ms,
                 error_detail="upstream empty body",
-            )
+            ))
         )
     return HttpBodyReadResult(raw=raw, response_headers=response_headers)
 
@@ -279,60 +374,63 @@ async def aggregate_stream_as_non_stream_response(
     resolved_model: str,
     *,
     dynamic_map: dict | None,
-    connect_ms: int,
+    connect_ms: int | None,
     start_time: float,
     deadline_ts: float,
     total_timeout: int,
     first_byte_timeout: int,
     idle_timeout: int,
+    timing: HttpAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
 ) -> StreamAsNonStreamResult:
     """Aggregate an upstream SSE response into one non-stream JSON object."""
     raw_buf = bytearray()
     aiter = response.aiter_bytes()
 
-    first_wait = min(first_byte_timeout, max(1, int(deadline_ts - time.time())))
+    if timing is not None:
+        timing.start_response_body_wait()
     try:
-        first_chunk = await asyncio.wait_for(aiter.__anext__(), timeout=first_wait)
-    except asyncio.TimeoutError:
+        first_chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+    except asyncio.CancelledError:
+        await close_response_context(ctx)
+        raise
+    except BusinessTimeoutError as exc:
         await close_response_context(ctx)
         return StreamAsNonStreamResult(
-            error=AttemptResult(
-                outcome="first_byte_timeout",
-                connect_ms=connect_ms,
-                error_detail=f"first byte timeout (> {first_wait}s) [stream-only→non-stream]",
-            )
+            error=_with_timing(timing, AttemptResult(
+                outcome=exc.outcome,
+                error_detail=f"{exc.outcome} [stream-only→non-stream]",
+            ))
         )
     except StopAsyncIteration:
+        if timing is not None:
+            timing.mark_io_complete()
         await close_response_context(ctx)
         return StreamAsNonStreamResult(
-            error=AttemptResult(
+            error=_with_timing(timing, AttemptResult(
                 outcome="closed_before_first_byte",
-                connect_ms=connect_ms,
                 error_detail="upstream closed stream before first byte [stream-only→non-stream]",
-            )
+            ))
+        )
+    except httpx.TimeoutException as exc:
+        await close_response_context(ctx)
+        return StreamAsNonStreamResult(
+            error=_with_timing(timing, AttemptResult(
+                outcome=classify_httpx_timeout(exc),
+                error_detail=f"first byte transport timeout: {exc} [stream-only→non-stream]",
+            ))
         )
     except Exception as exc:
         await close_response_context(ctx)
         return StreamAsNonStreamResult(
-            error=AttemptResult(
+            error=_with_timing(timing, AttemptResult(
                 outcome="transport_error",
-                connect_ms=connect_ms,
                 error_detail=f"first byte transport: {exc} [stream-only→non-stream]",
-            )
+            ))
         )
 
-    first_byte_ms = int((time.time() - start_time) * 1000)
-    if not first_chunk:
-        await close_response_context(ctx)
-        return StreamAsNonStreamResult(
-            error=AttemptResult(
-                outcome="closed_before_first_byte",
-                connect_ms=connect_ms,
-                first_byte_ms=first_byte_ms,
-                error_detail="upstream sent empty first chunk [stream-only→non-stream]",
-            )
-        )
+    first_byte_ms = timing.snapshot().first_byte_ms if timing is not None else None
 
     first_chunk_restored = await provider_registry.restore_response_bytes(
         channel,
@@ -391,44 +489,39 @@ async def aggregate_stream_as_non_stream_response(
         return StreamAsNonStreamResult(error=err)
 
     while True:
-        now = time.time()
-        if now >= deadline_ts:
-            await close_response_context(ctx)
-            return StreamAsNonStreamResult(
-                error=AttemptResult(
-                    outcome="total_timeout",
-                    connect_ms=connect_ms,
-                    first_byte_ms=first_byte_ms,
-                    error_detail=f"total timeout reading SSE (> {total_timeout}s) [stream-only→non-stream]",
-                )
-            )
-        wait_s = max(1, min(idle_timeout, int(deadline_ts - now)))
         try:
-            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_s)
-        except asyncio.TimeoutError:
+            chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+        except asyncio.CancelledError:
+            await close_response_context(ctx)
+            raise
+        except BusinessTimeoutError as exc:
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
-                error=AttemptResult(
-                    outcome="idle_timeout",
-                    connect_ms=connect_ms,
-                    first_byte_ms=first_byte_ms,
-                    error_detail=f"idle timeout (> {idle_timeout}s) [stream-only→non-stream]",
-                )
+                error=_with_timing(timing, AttemptResult(
+                    outcome=exc.outcome,
+                    error_detail=f"{exc.outcome} reading SSE [stream-only→non-stream]",
+                ))
             )
         except StopAsyncIteration:
+            if timing is not None:
+                timing.mark_io_complete()
             break
+        except httpx.TimeoutException as exc:
+            await close_response_context(ctx)
+            return StreamAsNonStreamResult(
+                error=_with_timing(timing, AttemptResult(
+                    outcome=classify_httpx_timeout(exc),
+                    error_detail=f"read SSE timeout: {exc} [stream-only→non-stream]",
+                ))
+            )
         except Exception as exc:
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
-                error=AttemptResult(
+                error=_with_timing(timing, AttemptResult(
                     outcome="transport_error",
-                    connect_ms=connect_ms,
-                    first_byte_ms=first_byte_ms,
                     error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
-                )
+                ))
             )
-        if not chunk:
-            continue
         restored_chunk = await provider_registry.restore_response_bytes(
             channel,
             chunk,
@@ -473,7 +566,7 @@ async def aggregate_stream_as_non_stream_response(
     except Exception:
         pass
 
-    total_ms = int((time.time() - start_time) * 1000)
+    total_ms = timing.snapshot(terminal=True).total_ms if timing is not None else None
     usage = toolkit["extract_usage_json"](obj)
     assistant_msg = {"role": "assistant", "content": obj.get("output") or []}
     response_body_text = bytes(raw_buf).decode("utf-8", errors="replace")
@@ -487,10 +580,6 @@ async def aggregate_stream_as_non_stream_response(
         first_byte_ms=first_byte_ms,
         total_ms=total_ms,
     )
-
-
-def _remaining_ms(deadline_ts: float) -> int:
-    return max(0, int((deadline_ts - time.time()) * 1000))
 
 
 def _downstream_stream_protocol(ingress_protocol: str) -> str:
@@ -513,6 +602,8 @@ async def _read_until_first_downstream_chunk(
     protocol: str,
     first_chunk: bytes,
     stream_translator=None,
+    timing: HttpAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
 ) -> tuple[list[bytes], dict | None]:
     commit_gate = SseCommitGate(protocol=protocol, stream_translator=stream_translator)
@@ -534,13 +625,7 @@ async def _read_until_first_downstream_chunk(
         return downstream_chunks, err
 
     while True:
-        remaining = _remaining_ms(deadline_ts)
-        if remaining <= 0:
-            raise asyncio.TimeoutError("upstream total timeout before first downstream chunk")
-        wait_sec = min(idle_timeout, max(1, remaining / 1000))
-        chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_sec)
-        if not chunk:
-            continue
+        chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
         restored = await provider_registry.restore_response_bytes(
             channel,
             chunk,
@@ -558,69 +643,62 @@ async def prepare_stream_response_start(
     channel,
     *,
     dynamic_map: dict | None,
-    connect_ms: int,
+    connect_ms: int | None,
     deadline_ts: float,
     first_byte_timeout: int,
     idle_timeout: int,
     ingress_protocol: str,
+    timing: HttpAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
 ) -> HttpStreamStartResult:
     """Read through the pre-commit SSE boundary for an HTTP stream response."""
     aiter = response.aiter_bytes()
 
-    t_first_start = time.time()
-    remaining_ms = _remaining_ms(deadline_ts)
-    first_wait = min(first_byte_timeout, max(1, remaining_ms / 1000))
+    if timing is not None:
+        timing.start_response_body_wait()
 
     try:
-        first_chunk = await asyncio.wait_for(aiter.__anext__(), timeout=first_wait)
-    except asyncio.TimeoutError:
+        first_chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+    except asyncio.CancelledError:
         await close_response_context(ctx)
-        if _remaining_ms(deadline_ts) <= 0:
-            return HttpStreamStartResult(
-                error=AttemptResult(
-                    outcome="total_timeout",
-                    connect_ms=connect_ms,
-                    error_detail="total timeout during first byte wait",
-                )
-            )
+        raise
+    except BusinessTimeoutError as exc:
+        await close_response_context(ctx)
         return HttpStreamStartResult(
-            error=AttemptResult(
-                outcome="first_byte_timeout",
-                connect_ms=connect_ms,
-                error_detail=f"first byte timeout > {first_byte_timeout}s",
-            )
+            error=_with_timing(timing, AttemptResult(
+                outcome=exc.outcome,
+                error_detail=f"{exc.outcome} during first raw body byte wait",
+            ))
         )
     except StopAsyncIteration:
+        if timing is not None:
+            timing.mark_io_complete()
         await close_response_context(ctx)
         return HttpStreamStartResult(
-            error=AttemptResult(
+            error=_with_timing(timing, AttemptResult(
                 outcome="closed_before_first_byte",
-                connect_ms=connect_ms,
                 error_detail="upstream closed stream before first byte",
-            )
+            ))
         )
-    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TimeoutException) as exc:
+    except httpx.TimeoutException as exc:
         await close_response_context(ctx)
         return HttpStreamStartResult(
-            error=AttemptResult(
+            error=_with_timing(timing, AttemptResult(
+                outcome=classify_httpx_timeout(exc),
+                error_detail=f"first byte transport timeout: {exc}",
+            ))
+        )
+    except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+        await close_response_context(ctx)
+        return HttpStreamStartResult(
+            error=_with_timing(timing, AttemptResult(
                 outcome="transport_error",
-                connect_ms=connect_ms,
                 error_detail=f"first byte transport: {exc}",
-            )
+            ))
         )
 
-    first_byte_ms = int((time.time() - t_first_start) * 1000 + connect_ms)
-    if not first_chunk:
-        await close_response_context(ctx)
-        return HttpStreamStartResult(
-            error=AttemptResult(
-                outcome="closed_before_first_byte",
-                connect_ms=connect_ms,
-                first_byte_ms=first_byte_ms,
-                error_detail="upstream sent empty first chunk",
-            )
-        )
+    first_byte_ms = timing.snapshot().first_byte_ms if timing is not None else None
 
     toolkit = toolkit_for_channel(channel)
     tracker = toolkit["stream_tracker"]()
@@ -641,37 +719,43 @@ async def prepare_stream_response_start(
                 protocol=_downstream_stream_protocol(ingress_protocol),
                 first_chunk=first_chunk,
                 stream_translator=stream_translator,
+                timing=timing,
+                round_timeouts=round_timeouts,
                 translator_ctx=translator_ctx,
             )
-        except asyncio.TimeoutError:
+        except BusinessTimeoutError as exc:
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=AttemptResult(
-                    outcome="first_byte_timeout",
-                    connect_ms=connect_ms,
-                    first_byte_ms=first_byte_ms,
-                    error_detail=f"first downstream chunk timeout > {idle_timeout}s",
-                )
+                error=_with_timing(timing, AttemptResult(
+                    outcome=exc.outcome,
+                    error_detail=f"{exc.outcome} before first downstream-visible chunk",
+                ))
             )
         except StopAsyncIteration:
+            if timing is not None:
+                timing.mark_io_complete()
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=AttemptResult(
+                error=_with_timing(timing, AttemptResult(
                     outcome="closed_before_first_byte",
-                    connect_ms=connect_ms,
-                    first_byte_ms=first_byte_ms,
                     error_detail="upstream closed stream before first downstream chunk",
-                )
+                ))
             )
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TimeoutException) as exc:
+        except httpx.TimeoutException as exc:
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=AttemptResult(
+                error=_with_timing(timing, AttemptResult(
+                    outcome=classify_httpx_timeout(exc),
+                    error_detail=f"first downstream chunk timeout: {exc}",
+                ))
+            )
+        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            await close_response_context(ctx)
+            return HttpStreamStartResult(
+                error=_with_timing(timing, AttemptResult(
                     outcome="transport_error",
-                    connect_ms=connect_ms,
-                    first_byte_ms=first_byte_ms,
                     error_detail=f"first downstream chunk transport: {exc}",
-                )
+                ))
             )
         if pre_visible_error:
             await close_response_context(ctx)
@@ -750,48 +834,40 @@ async def read_next_stream_step(
     deadline_ts: float,
     start_time: float,
     idle_timeout: int,
+    timing: HttpAttemptTiming | None = None,
+    round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
 ) -> HttpStreamReadStep:
     """Read and normalize one post-commit HTTP SSE stream step."""
     while True:
-        remaining = _remaining_ms(deadline_ts)
-        if remaining <= 0:
-            return HttpStreamReadStep(
-                kind="error",
-                err_type="timeout_error",
-                message=f"upstream total timeout > {int((deadline_ts - start_time))}s",
-                outcome="total_timeout",
-            )
-
-        wait_sec = min(idle_timeout, max(1, remaining / 1000))
         try:
-            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=wait_sec)
-        except asyncio.TimeoutError:
-            if _remaining_ms(deadline_ts) <= 0:
-                return HttpStreamReadStep(
-                    kind="error",
-                    err_type="timeout_error",
-                    message="upstream total timeout",
-                    outcome="total_timeout",
-                )
+            chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
+        except BusinessTimeoutError as exc:
             return HttpStreamReadStep(
                 kind="error",
                 err_type="timeout_error",
-                message=f"upstream idle timeout > {idle_timeout}s",
-                outcome="idle_timeout",
+                message=exc.outcome,
+                outcome=exc.outcome,
             )
         except StopAsyncIteration:
+            if timing is not None:
+                timing.mark_io_complete()
             return HttpStreamReadStep(kind="end")
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.TimeoutException) as exc:
+        except httpx.TimeoutException as exc:
+            outcome = classify_httpx_timeout(exc)
+            return HttpStreamReadStep(
+                kind="error",
+                err_type="api_error",
+                message=f"stream transport timeout: {exc}",
+                outcome=outcome,
+            )
+        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
             return HttpStreamReadStep(
                 kind="error",
                 err_type="api_error",
                 message=f"stream transport error: {exc}",
                 outcome="transport_error",
             )
-
-        if not chunk:
-            continue
 
         restored = await provider_registry.restore_response_bytes(
             channel,
@@ -862,60 +938,161 @@ def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[
     return route_chain, None
 
 
+def _persist_proxy_attempt_timing(
+    proxy_attempt_id,
+    timing: HttpAttemptTiming,
+    *,
+    outcome: str | None,
+    error_detail: str | None,
+    proxy_bytes: dict,
+    terminal: bool,
+):
+    snapshot = (
+        timing.finish(outcome or "transport_error", error_detail)
+        if terminal else timing.snapshot()
+    )
+    if proxy_attempt_id is None:
+        return snapshot
+    try:
+        log_db.update_proxy_attempt(
+            proxy_attempt_id,
+            started_at=snapshot.started_at,
+            connect_ms=snapshot.connect_ms,
+            first_byte_ms=snapshot.first_byte_ms,
+            idle_ms=snapshot.idle_ms,
+            total_ms=snapshot.total_ms,
+            dns_ms=snapshot.dns_ms,
+            tcp_ms=snapshot.tcp_ms,
+            proxy_tcp_ms=snapshot.proxy_tcp_ms,
+            proxy_tunnel_ms=snapshot.proxy_tunnel_ms,
+            tls_ms=snapshot.tls_ms,
+            target_tls_ms=snapshot.target_tls_ms,
+            ws_handshake_ms=snapshot.ws_handshake_ms,
+            request_upload_ms=snapshot.request_upload_ms,
+            response_headers_wait_ms=snapshot.response_headers_wait_ms,
+            response_body_first_byte_wait_ms=snapshot.response_body_first_byte_wait_ms,
+            ended_at=snapshot.ended_at,
+            outcome=outcome,
+            error_detail=(error_detail or "")[:4000] if error_detail else None,
+            bytes_up=proxy_bytes.get("up"),
+            bytes_down=proxy_bytes.get("down"),
+        )
+    except Exception:
+        pass
+    return snapshot
+
+
+def finalize_opened_http_response(
+    opened: OpenedHttpResponse,
+    outcome: str,
+    error_detail: str | None = None,
+):
+    """Idempotently terminalize and persist one opened HTTP route round."""
+
+    if opened.timing is None:
+        return None
+    return _persist_proxy_attempt_timing(
+        opened.proxy_attempt_id,
+        opened.timing,
+        outcome=outcome,
+        error_detail=error_detail,
+        proxy_bytes=opened.proxy_bytes,
+        terminal=True,
+    )
+
+
+async def _finish_pre_header_round(
+    *,
+    ctx,
+    proxy_client,
+    proxy_attempt_id,
+    timing: HttpAttemptTiming,
+    outcome: str,
+    detail: str,
+    proxy_name: str | None,
+    proxy_bytes: dict,
+) -> AttemptResult:
+    if ctx is not None:
+        await close_response_context(ctx)
+    await close_proxy_client(proxy_client)
+    result = _attempt_result(
+        outcome, detail, bucket=proxy_bytes, proxy_name=proxy_name,
+    )
+    _persist_proxy_attempt_timing(
+        proxy_attempt_id,
+        timing,
+        outcome=outcome,
+        error_detail=detail,
+        proxy_bytes=proxy_bytes,
+        terminal=True,
+    )
+    return timing.apply_to(result, terminal=False)
+
+
+class _LateRoundTiming:
+    """Proxy setup holder so client construction stays outside business round time."""
+
+    target: HttpAttemptTiming | None = None
+
+    def record_proxy_tcp(self, started_at: float, ended_at: float) -> None:
+        if self.target is not None:
+            self.target.record_proxy_tcp(started_at, ended_at)
+
+
 async def open_response_with_proxy_chain(
     *,
     channel,
     resolved_model: str,
     upstream_req,
-    deadline_ts: float,
     connect_timeout: int,
     first_byte_timeout: int,
-    request_id: str,
-    retry_attempt_id: int | None,
+    idle_timeout: int,
+    total_timeout: int,
+    response_mode: str,
+    request_id,
+    retry_attempt_id=None,
 ) -> OpenedHttpResponse:
-    """Open upstream HTTP response headers, retrying only pre-header proxy failures.
-
-    ``httpx`` only applies its connect timeout to pool/TCP/TLS setup.  Entering a
-    streaming response context also waits for response headers, so cap that wait
-    with the first-byte timeout as well.  Otherwise an upstream that accepts the
-    socket but never sends headers can occupy the request until the total timeout.
-    """
+    """Open one independent round per HTTP route, retrying pre-header failures."""
     route_chain, route_error = _resolve_http_route_chain(channel, resolved_model)
     if route_error is not None:
         return OpenedHttpResponse(error=route_error)
+    if response_mode not in ("stream", "non_stream"):
+        raise ValueError(f"invalid HTTP response mode: {response_mode!r}")
+    round_timeouts = RoundTimeouts.from_config({
+        "connect": connect_timeout,
+        "firstByte": first_byte_timeout,
+        "idle": idle_timeout,
+        "total": total_timeout,
+    })
 
     last_pre_header: AttemptResult | None = None
     proxy_attempt_order = 0
 
     for route_name, connector in route_chain:
+        route_type = getattr(connector, "type", "direct") if connector is not None else "direct"
         proxy_client = None
-        proxy_name_used = None
+        proxy_name_used = str(route_name) if connector is not None else None
+        route_log_name = str(route_name) if connector is not None else "direct"
         proxy_bytes = _new_proxy_bytes()
         client = upstream.get_client()
-        proxy_attempt_id: int | None = None
+        proxy_attempt_id = None
         proxy_attempt_order += 1
         proxy_started_at = time.time()
+        late_timing = _LateRoundTiming()
 
         if connector is not None:
-            proxy_name_used = str(route_name)
-            try:
-                proxy_attempt_id = log_db.record_proxy_attempt(
-                    request_id, retry_attempt_id, proxy_attempt_order,
-                    proxy_name_used, proxy_started_at,
-                )
-            except Exception:
-                proxy_attempt_id = None
             try:
                 connector.stats.total_attempts += 1
                 connector.stats.last_attempt_ts = proxy_started_at
                 proxy_client = connector.create_httpx_client(
                     timeout=httpx.Timeout(
-                        connect=connect_timeout,
-                        read=330,
-                        write=30,
-                        pool=connect_timeout,
+                        connect=round_timeouts.connection + 0.5,
+                        read=max(330.0, round_timeouts.total + 1.0),
+                        write=30.0,
+                        pool=round_timeouts.connection + 0.5,
                     ),
                     byte_counter=_count_proxy_bytes_for(proxy_bytes),
+                    timing=late_timing,
                 )
                 client = proxy_client
             except Exception as exc:
@@ -923,27 +1100,32 @@ async def open_response_with_proxy_chain(
                 connector.stats.last_error = str(exc)[:200]
                 last_pre_header = _attempt_result(
                     "proxy_connect_error",
-                    f"proxy client error: {exc}",
+                    f"proxy client error before upstream round: {exc}",
                     bucket=proxy_bytes,
                     proxy_name=proxy_name_used,
                 )
-                if proxy_attempt_id is not None:
-                    try:
-                        log_db.update_proxy_attempt(
-                            proxy_attempt_id,
-                            ended_at=time.time(),
-                            outcome=last_pre_header.outcome,
-                            error_detail=(last_pre_header.error_detail or "")[:4000],
-                            bytes_up=proxy_bytes.get("up"),
-                            bytes_down=proxy_bytes.get("down"),
-                        )
-                    except Exception:
-                        pass
                 await close_proxy_client(proxy_client)
                 continue
 
-        t_send = time.time()
-        remaining = max(1.0, deadline_ts - t_send)
+        round_id = str(uuid.uuid4())
+        try:
+            proxy_attempt_id = log_db.record_proxy_attempt(
+                request_id, retry_attempt_id, proxy_attempt_order,
+                route_log_name, time.time(),
+                round_id=round_id,
+                transport="http",
+                request_mode=f"http_{response_mode}",
+            )
+        except Exception:
+            proxy_attempt_id = None
+
+        # Authoritative round starts only now: immediately before client.stream.
+        timing = HttpAttemptTiming(
+            route_type=route_type,
+            response_mode=response_mode,
+            round_id=round_id,
+        )
+        late_timing.target = timing
 
         try:
             ctx = open_stream(
@@ -953,10 +1135,11 @@ async def open_response_with_proxy_chain(
                     url=upstream_req.url,
                     headers=upstream_req.headers,
                     content=upstream_req.body,
-                    connect_timeout=connect_timeout,
-                    read_timeout=remaining,
+                    connect_timeout=round_timeouts.connection + 0.5,
+                    read_timeout=max(330.0, round_timeouts.total + 1.0),
                     write_timeout=30.0,
-                    pool_timeout=connect_timeout,
+                    pool_timeout=round_timeouts.connection + 0.5,
+                    extensions={"trace": timing.trace},
                 ),
             )
         except Exception as exc:
@@ -964,197 +1147,130 @@ async def open_response_with_proxy_chain(
             if connector is not None:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = str(exc)[:200]
-            last_pre_header = _attempt_result(
+            last_pre_header = _with_timing(timing, _attempt_result(
                 "transport_error",
                 f"send build error: {exc}",
                 bucket=proxy_bytes,
                 proxy_name=proxy_name_used,
+            ))
+            _persist_proxy_attempt_timing(
+                proxy_attempt_id,
+                timing,
+                outcome=last_pre_header.outcome,
+                error_detail=last_pre_header.error_detail,
+                proxy_bytes=proxy_bytes,
+                terminal=True,
             )
             continue
 
-        remaining_total = deadline_ts - time.time()
-        if remaining_total <= 0:
-            await close_response_context(ctx)
-            await close_proxy_client(proxy_client)
-            elapsed_ms = int((time.time() - t_send) * 1000)
-            last_pre_header = _attempt_result(
-                "total_timeout",
-                "total timeout before waiting for response headers",
-                bucket=proxy_bytes,
-                proxy_name=proxy_name_used,
-            )
-            last_pre_header.connect_ms = elapsed_ms
-            return OpenedHttpResponse(error=last_pre_header)
-
-        header_wait_timeout = min(float(first_byte_timeout), remaining_total)
-        timeout_outcome = (
-            "total_timeout"
-            if remaining_total <= float(first_byte_timeout)
-            else "first_byte_timeout"
-        )
         try:
-            upstream_resp = await asyncio.wait_for(
-                ctx.__aenter__(),
-                timeout=max(0.001, header_wait_timeout),
-            )
-        except asyncio.TimeoutError:
-            elapsed_ms = int((time.time() - t_send) * 1000)
-            await close_response_context(ctx)
-            await close_proxy_client(proxy_client)
-            if timeout_outcome == "total_timeout":
-                detail = f"total timeout during connect/headers (> {header_wait_timeout:g}s)"
-            else:
-                detail = (
-                    f"first byte timeout > {first_byte_timeout}s "
-                    "while waiting for response headers"
-                )
-            last_pre_header = _attempt_result(
-                timeout_outcome,
-                detail,
-                bucket=proxy_bytes,
+            upstream_resp = await timing.wait_for(ctx.__aenter__(), round_timeouts)
+            if response_mode == "stream" and not timing.connection_complete:
+                # High-level API return is the authoritative final-header boundary.
+                timing.mark_connection_complete()
+        except asyncio.CancelledError:
+            await asyncio.shield(_finish_pre_header_round(
+                ctx=ctx,
+                proxy_client=proxy_client,
+                proxy_attempt_id=proxy_attempt_id,
+                timing=timing,
+                outcome="cancelled",
+                detail="upstream HTTP round cancelled before response commit",
                 proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+            ))
+            raise
+        except BusinessTimeoutError as exc:
+            detail = f"{exc.outcome} while opening upstream response"
+            last_pre_header = await _finish_pre_header_round(
+                ctx=ctx,
+                proxy_client=proxy_client,
+                proxy_attempt_id=proxy_attempt_id,
+                timing=timing,
+                outcome=exc.outcome,
+                detail=detail,
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
             )
-            last_pre_header.connect_ms = elapsed_ms
-            if proxy_attempt_id is not None:
-                try:
-                    log_db.update_proxy_attempt(
-                        proxy_attempt_id,
-                        connect_ms=elapsed_ms,
-                        ended_at=time.time(),
-                        outcome=last_pre_header.outcome,
-                        error_detail=(last_pre_header.error_detail or "")[:4000],
-                        bytes_up=proxy_bytes.get("up"),
-                        bytes_down=proxy_bytes.get("down"),
-                    )
-                except Exception:
-                    pass
-            return OpenedHttpResponse(error=last_pre_header)
-        except httpx.ConnectTimeout:
-            await close_proxy_client(proxy_client)
             if connector is not None:
                 connector.stats.total_failures += 1
-                connector.stats.last_error = f"connect timeout > {connect_timeout}s"
-            last_pre_header = _attempt_result(
-                "connect_timeout",
-                f"connect timeout > {connect_timeout}s",
-                bucket=proxy_bytes,
-                proxy_name=proxy_name_used,
-            )
-            if proxy_attempt_id is not None:
-                try:
-                    log_db.update_proxy_attempt(
-                        proxy_attempt_id,
-                        connect_ms=int((time.time() - t_send) * 1000),
-                        ended_at=time.time(),
-                        outcome=last_pre_header.outcome,
-                        error_detail=(last_pre_header.error_detail or "")[:4000],
-                        bytes_up=proxy_bytes.get("up"),
-                        bytes_down=proxy_bytes.get("down"),
-                    )
-                except Exception:
-                    pass
-            continue
-        except httpx.ConnectError as exc:
-            await close_proxy_client(proxy_client)
-            if connector is not None:
-                connector.stats.total_failures += 1
-                connector.stats.last_error = str(exc)[:200]
-            last_pre_header = _attempt_result(
-                "connect_error",
-                f"connect error: {exc}",
-                bucket=proxy_bytes,
-                proxy_name=proxy_name_used,
-            )
-            if proxy_attempt_id is not None:
-                try:
-                    log_db.update_proxy_attempt(
-                        proxy_attempt_id,
-                        connect_ms=int((time.time() - t_send) * 1000),
-                        ended_at=time.time(),
-                        outcome=last_pre_header.outcome,
-                        error_detail=(last_pre_header.error_detail or "")[:4000],
-                        bytes_up=proxy_bytes.get("up"),
-                        bytes_down=proxy_bytes.get("down"),
-                    )
-                except Exception:
-                    pass
+                connector.stats.last_error = detail[:200]
             continue
         except httpx.TimeoutException as exc:
-            await close_proxy_client(proxy_client)
+            outcome = classify_httpx_timeout(exc)
+            detail = f"{outcome}: {exc}"
+            last_pre_header = await _finish_pre_header_round(
+                ctx=ctx,
+                proxy_client=proxy_client,
+                proxy_attempt_id=proxy_attempt_id,
+                timing=timing,
+                outcome=outcome,
+                detail=detail,
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+            )
             if connector is not None:
                 connector.stats.total_failures += 1
-                connector.stats.last_error = str(exc)[:200]
-            last_pre_header = _attempt_result(
-                "connect_timeout",
-                f"timeout: {exc}",
-                bucket=proxy_bytes,
+                connector.stats.last_error = detail[:200]
+            continue
+        except httpx.ConnectError as exc:
+            detail = f"connect error: {exc}"
+            last_pre_header = await _finish_pre_header_round(
+                ctx=ctx,
+                proxy_client=proxy_client,
+                proxy_attempt_id=proxy_attempt_id,
+                timing=timing,
+                outcome="connect_error",
+                detail=detail,
                 proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
             )
-            if proxy_attempt_id is not None:
-                try:
-                    log_db.update_proxy_attempt(
-                        proxy_attempt_id,
-                        connect_ms=int((time.time() - t_send) * 1000),
-                        ended_at=time.time(),
-                        outcome=last_pre_header.outcome,
-                        error_detail=(last_pre_header.error_detail or "")[:4000],
-                        bytes_up=proxy_bytes.get("up"),
-                        bytes_down=proxy_bytes.get("down"),
-                    )
-                except Exception:
-                    pass
+            if connector is not None:
+                connector.stats.total_failures += 1
+                connector.stats.last_error = detail[:200]
             continue
         except Exception as exc:
-            await close_proxy_client(proxy_client)
+            detail = f"transport: {exc}"
+            last_pre_header = await _finish_pre_header_round(
+                ctx=ctx,
+                proxy_client=proxy_client,
+                proxy_attempt_id=proxy_attempt_id,
+                timing=timing,
+                outcome="transport_error",
+                detail=detail,
+                proxy_name=proxy_name_used,
+                proxy_bytes=proxy_bytes,
+            )
             if connector is not None:
                 connector.stats.total_failures += 1
-                connector.stats.last_error = str(exc)[:200]
-            last_pre_header = _attempt_result(
-                "transport_error",
-                f"transport: {exc}",
-                bucket=proxy_bytes,
-                proxy_name=proxy_name_used,
-            )
-            if proxy_attempt_id is not None:
-                try:
-                    log_db.update_proxy_attempt(
-                        proxy_attempt_id,
-                        connect_ms=int((time.time() - t_send) * 1000),
-                        ended_at=time.time(),
-                        outcome=last_pre_header.outcome,
-                        error_detail=(last_pre_header.error_detail or "")[:4000],
-                        bytes_up=proxy_bytes.get("up"),
-                        bytes_down=proxy_bytes.get("down"),
-                    )
-                except Exception:
-                    pass
+                connector.stats.last_error = detail[:200]
             continue
 
-        connect_ms = int((time.time() - t_send) * 1000)
-        if proxy_attempt_id is not None:
-            try:
-                log_db.update_proxy_attempt(
-                    proxy_attempt_id,
-                    connect_ms=connect_ms,
-                    ended_at=time.time(),
-                    outcome="connected",
-                    bytes_up=proxy_bytes.get("up"),
-                    bytes_down=proxy_bytes.get("down"),
-                )
-            except Exception:
-                pass
+        connect_ms = timing.snapshot().connect_ms
+        _persist_proxy_attempt_timing(
+            proxy_attempt_id,
+            timing,
+            outcome="open",
+            error_detail=None,
+            proxy_bytes=proxy_bytes,
+            terminal=False,
+        )
         if connector is not None:
             connector.stats.total_successes += 1
             connector.stats.last_success_ts = time.time()
-            connector.stats.last_latency_ms = connect_ms
+            if connect_ms is not None:
+                connector.stats.last_latency_ms = connect_ms
 
         return OpenedHttpResponse(
             ctx=ctx,
             response=upstream_resp,
             connect_ms=connect_ms,
+            timing=timing,
             proxy_name=proxy_name_used,
             proxy_bytes=proxy_bytes,
             proxy_client=proxy_client,
+            proxy_attempt_id=proxy_attempt_id,
+            round_timeouts=round_timeouts,
         )
 
     return OpenedHttpResponse(

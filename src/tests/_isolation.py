@@ -1,12 +1,12 @@
 """测试隔离：所有测试共用的环境初始化。
 
-在 import src.* 之前调用 `isolate()`，把 config.json / state.db / logs/
-全部重定向到 tmpdir，避免测试直接改生产文件。
+父 bootstrap 在任何 src import 前创建绝对临时根；各测试调用
+`isolate()` 只复核并复用该根，把 config.json / state.db / logs/ 保持在其中。
 """
 
 import os
+from pathlib import Path
 import sys
-import tempfile
 
 
 _ISOLATED = False
@@ -14,21 +14,30 @@ _TMP_DIR: str | None = None
 
 
 def isolate() -> str:
-    """创建临时目录并通过环境变量把 config / state_db / log_db 路径全部重定向进去。
+    """复核父bootstrap并复用其config/state/log绝对临时路径。
 
-    必须在 `from src import ...` 之前调用。返回 tmpdir 路径。
+    必须在业务 `from src import ...` 之前调用。返回隔离data目录。
     """
     global _ISOLATED, _TMP_DIR
     if _ISOLATED:
         assert _TMP_DIR is not None
         return _TMP_DIR
 
-    tmp = tempfile.mkdtemp(prefix="ap-test-")
+    if os.environ.get("PARROT_TEST_ISOLATED") != "1":
+        raise RuntimeError(
+            "test isolation must be installed before importing src; "
+            "use python3 src/tests/isolated_pytest.py"
+        )
+    root = Path(os.environ["PARROT_TEST_ROOT"]).resolve()
+    data_dir = Path(os.environ["ANTHROPIC_PROXY_DATA_DIR"]).resolve()
+    try:
+        data_dir.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"isolated data dir escaped root: {data_dir}") from exc
+    tmp = str(data_dir)
     _TMP_DIR = tmp
 
-    # config.json
-    cfg_path = os.path.join(tmp, "config.json")
-    os.environ["ANTHROPIC_PROXY_CONFIG"] = cfg_path
+    cfg_path = str(Path(os.environ["ANTHROPIC_PROXY_CONFIG"]).resolve())
 
     # 若已经有 src.config 模块被加载，强制指过去（防止跨文件先后 import）
     mod = sys.modules.get("src.config")
@@ -44,12 +53,12 @@ def isolate() -> str:
         "apiKeys": {},
         "oauthAccounts": [],
         "channels": [],
-        "stateDbPath": os.path.join(tmp, "state.db"),
-        "logDir":      os.path.join(tmp, "logs"),
+        "stateDbPath": os.environ["PARROT_TEST_STATE_PATH"],
+        "logDir":      os.environ["PARROT_TEST_LOG_DIR"],
         "telegram": {"botToken": "", "adminIds": []},
         # 确保测试里 mock 模式开（OAuth 不触网）
         "oauth": {"mockMode": True},
-        "images": {"dbPath": os.path.join(tmp, "image_logs.db")},
+        "images": {"dbPath": os.environ["PARROT_TEST_IMAGE_PATH"]},
     }
     with open(cfg_path, "w") as f:
         json.dump(minimal, f, indent=2, ensure_ascii=False)

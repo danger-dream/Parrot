@@ -4,7 +4,8 @@ callback_data：
   `menu:logs`                  — 显示最近日志第 1 页
   `logs:page:<page>`           — 显示指定页
   `logs:refresh:<page>`        — 刷新指定页
-  `logs:detail:<short>:<page>` — 查看详情（short 是 request_id 短码，page 用于返回）
+  `logs:detail:<short>:<state>` — 查看详情（state 用于返回列表）
+  `logs:dpage:<short>:<n>:<state>` — 查看完整详情的第 n 页
 """
 
 from __future__ import annotations
@@ -317,19 +318,19 @@ def _extract_error_summary(raw: str) -> str:
             prefix = raw[:colon_idx]
             json_part = raw[colon_idx + 2:]
         else:
-            return raw[:200]
+            return raw
     try:
         obj = json.loads(json_part)
     except Exception:
-        return (raw[:200])
+        return raw
     err = obj.get("error") if isinstance(obj, dict) else None
     if isinstance(err, dict):
         msg = err.get("message", "")
         if msg:
             t = err.get("type") or ""
             summary = f"{t}: {msg}" if t else msg
-            return (f"{prefix} — {summary}" if prefix else summary)[:200]
-    return (f"{prefix} — {json_part[:150]}" if prefix else json_part[:200])
+            return f"{prefix} — {summary}" if prefix else summary
+    return f"{prefix} — {json_part}" if prefix else json_part
 
 
 def _list_kb(rows: list[dict], *, state: dict, page: int, total_pages: int) -> dict:
@@ -512,44 +513,139 @@ def _filter_action(chat_id: int, message_id: int, cb_id: str,
 
 # ─── 详情 ─────────────────────────────────────────────────────────
 
+def _detail_inline(value: object, fallback: str = "?") -> str:
+    text = str(value if value not in (None, "") else fallback)
+    return " ".join(text.splitlines())
+
+
+def _detail_metric_line(row: dict, *, request: bool = False,
+                        first_applicable: bool = True) -> str | None:
+    keys = (
+        ("连接", "connect_time_ms" if request else "connect_ms"),
+        ("首字", "first_token_time_ms" if request else "first_byte_ms"),
+        ("空闲", "idle_time_ms" if request else "idle_ms"),
+        ("总计", "total_time_ms" if request else "total_ms"),
+    )
+    parts = []
+    for label, key in keys:
+        if label == "首字" and not first_applicable:
+            continue
+        value = row.get(key)
+        if value is not None:
+            parts.append(f"{label} {ui.fmt_ms(value)}")
+    return " · ".join(parts) if parts else None
+
+
+def _detail_stage_line(row: dict) -> str | None:
+    stage_keys = [
+        ("DNS", "dns_ms"),
+        ("TCP", "tcp_ms"),
+        ("代理 TCP", "proxy_tcp_ms"),
+        ("代理隧道", "proxy_tunnel_ms"),
+    ]
+    # Current round snapshots expose target_tls_ms and keep tls_ms as a
+    # compatibility alias.  Show one reliable phase, never duplicate it.
+    if row.get("target_tls_ms") is not None:
+        stage_keys.append(("目标 TLS", "target_tls_ms"))
+    else:
+        stage_keys.append(("TLS", "tls_ms"))
+    stage_keys.extend([
+        ("WS 握手", "ws_handshake_ms"),
+        ("请求上传", "request_upload_ms"),
+        ("等待响应头", "response_headers_wait_ms"),
+        ("头后首 Body", "response_body_first_byte_wait_ms"),
+    ])
+    parts = [
+        f"{label} {ui.fmt_ms(row.get(key))}"
+        for label, key in stage_keys
+        if row.get(key) is not None
+    ]
+    return " · ".join(parts) if parts else None
+
+
+def _append_detail_text(lines: list[str], raw: object, *, indent: str = "", italic: bool = False) -> None:
+    """Append all text without loss; chunks are escaped and independently tagged."""
+    text = str(raw or "")
+    physical_lines = text.splitlines() or [""]
+    for physical in physical_lines:
+        chunks = [physical[i:i + 500] for i in range(0, len(physical), 500)] or [""]
+        for chunk in chunks:
+            escaped = ui.escape_html(chunk)
+            lines.append(f"{indent}<i>{escaped}</i>" if italic else f"{indent}{escaped}")
+
+
+def _append_round_detail(lines: list[str], p: dict, *, nested: bool = True) -> None:
+    indent = "     " if nested else "  "
+    order = p.get("attempt_order") or "?"
+    pname = ui.escape_html(_detail_inline(p.get("proxy_name") or "direct"))
+    outcome = _detail_inline(p.get("outcome"))
+    mark = "✅" if outcome in ("success", "connected") else "❌"
+    lines.append(f"{indent}{mark} <b>轮次 {order}</b> · <code>{pname}</code> — {ui.escape_html(outcome)}")
+    identity = []
+    if p.get("round_id"):
+        identity.append(f"ID <code>{ui.escape_html(_detail_inline(p['round_id']))}</code>")
+    if p.get("transport"):
+        identity.append(f"传输 <code>{ui.escape_html(_detail_inline(p['transport']))}</code>")
+    if p.get("request_mode"):
+        identity.append(f"模式 <code>{ui.escape_html(_detail_inline(p['request_mode']))}</code>")
+    if identity:
+        lines.append(f"{indent}   · " + " · ".join(identity))
+    metrics = _detail_metric_line(
+        p,
+        first_applicable=p.get("request_mode") != "http_non_stream",
+    )
+    if metrics:
+        lines.append(f"{indent}   · 业务计时: {metrics}")
+    stages = _detail_stage_line(p)
+    if stages:
+        lines.append(f"{indent}   · 可靠阶段（可能重叠，不相加）: {stages}")
+    byte_sum = int(p.get("bytes_up") or 0) + int(p.get("bytes_down") or 0)
+    if byte_sum:
+        lines.append(f"{indent}   · 流量 {_fmt_bytes(byte_sum)}")
+    if p.get("error_detail"):
+        _append_detail_text(
+            lines,
+            _extract_error_summary(str(p["error_detail"])),
+            indent=f"{indent}   ⚠ ",
+            italic=True,
+        )
+
+
 def _render_detail(detail: dict) -> str:
     log = detail.get("log") or {}
     chain = detail.get("retry_chain") or []
     proxy_chain = detail.get("proxy_chain") or []
     local_web_log = detail.get("local_web_log") or []
 
-    rid = log.get("request_id") or "?"
+    rid = _detail_inline(log.get("request_id"))
     created = ui.fmt_bjt_ts(log.get("created_at"), "%Y-%m-%d %H:%M:%S")
-    icon = _status_icon(log)
-    status = log.get("status") or "?"
-
+    status = _detail_inline(log.get("status"))
     lines = [
-        f"📋 <b>日志详情</b>",
+        "📋 <b>日志详情</b>",
         f"ID: <code>{ui.escape_html(rid)}</code>",
         f"时间: <code>{created}</code>",
         f"状态: <code>{ui.escape_html(status)}</code>"
         + (f" ({log.get('http_status')})" if log.get("http_status") else "")
-        + f" {icon}",
-        f"客户端: <code>{ui.escape_html(log.get('client_ip') or '?')}</code>"
-        f" / Key <code>{ui.escape_html(log.get('api_key_name') or '?')}</code>",
-        f"请求模型: <code>{ui.escape_html(log.get('requested_model') or '?')}</code>",
+        + f" {_status_icon(log)}",
+        f"客户端: <code>{ui.escape_html(_detail_inline(log.get('client_ip')))}</code>"
+        f" / Key <code>{ui.escape_html(_detail_inline(log.get('api_key_name')))}</code>",
+        f"请求模型: <code>{ui.escape_html(_detail_inline(log.get('requested_model')))}</code>",
     ]
     if log.get("final_channel_key"):
         final_ch = ui.channel_display_name(log["final_channel_key"], with_family=True)
         lines.append(
-            f"最终渠道: <code>{ui.escape_html(final_ch)}</code>"
-            f" / <code>{ui.escape_html(log.get('final_model') or '?')}</code>"
+            f"最终渠道: <code>{ui.escape_html(_detail_inline(final_ch))}</code>"
+            f" / <code>{ui.escape_html(_detail_inline(log.get('final_model')))}</code>"
         )
     if log.get("proxy_name"):
-        lines.append(f"出站代理: 🔀 <code>{ui.escape_html(log['proxy_name'])}</code>")
-    # 协议（入口 + 上游）：老日志可能为空，非空才显示避免噪音
+        lines.append(f"出站代理: 🔀 <code>{ui.escape_html(_detail_inline(log['proxy_name']))}</code>")
     ingress = log.get("ingress_protocol")
     upstream_proto = log.get("upstream_protocol")
     if ingress or upstream_proto:
         lines.append(
-            f"协议: 入口 <code>{ui.escape_html(ingress or '?')}</code>"
-            f" → 上游 <code>{ui.escape_html(upstream_proto or '?')}</code>"
-            + (f" / <code>{ui.escape_html(log.get('upstream_transport'))}</code>" if log.get("upstream_transport") else "")
+            f"协议: 入口 <code>{ui.escape_html(_detail_inline(ingress))}</code>"
+            f" → 上游 <code>{ui.escape_html(_detail_inline(upstream_proto))}</code>"
+            + (f" / <code>{ui.escape_html(_detail_inline(log.get('upstream_transport')))}</code>" if log.get("upstream_transport") else "")
         )
     flags = []
     if log.get("is_stream"):
@@ -560,125 +656,108 @@ def _render_detail(detail: dict) -> str:
         flags.append(f"重试 {log['retry_count']} 次")
     if flags:
         lines.append(" · ".join(flags))
-    effort = log.get("reasoning_effort")
-    if effort:
-        lines.append(f"思考强度：🧠 {ui.escape_html(effort)}")
+    if log.get("reasoning_effort"):
+        lines.append(f"思考强度：🧠 {ui.escape_html(_detail_inline(log['reasoning_effort']))}")
     fast_badge = ui.log_fast_mode_badge(log)
     if fast_badge:
         lines.append(f"模式：{fast_badge}")
 
-    # Tokens
     if status == "success":
-        inp = ui.prompt_total_from_row(log)
-        lines.append("")
-        lines.append("<b>Tokens</b>")
-        token_line = f"↑ {ui.fmt_tokens(inp)} | ↓ {ui.fmt_tokens(log.get('output_tokens'))}"
+        lines.extend(["", "<b>Tokens</b>"])
+        token_line = f"↑ {ui.fmt_tokens(ui.prompt_total_from_row(log))} | ↓ {ui.fmt_tokens(log.get('output_tokens'))}"
         if (log.get("cache_read_tokens") or 0) > 0:
             token_line += f" | {ui.fmt_cache_phrase_from_row(log)}"
         lines.append(token_line)
-    # 耗时
-    lines.append("")
-    lines.append("<b>耗时</b>")
-    lines.append(
-        f"连接 {ui.fmt_ms(log.get('connect_time_ms'))} · "
-        f"首字 {ui.fmt_ms(log.get('first_token_time_ms'))} · "
-        f"总 {ui.fmt_ms(log.get('total_time_ms'))}"
-    )
+
+    lines.extend(["", "<b>请求总览</b>"])
+    if log.get("final_round_id"):
+        lines.append(f"最终轮次: <code>{ui.escape_html(_detail_inline(log['final_round_id']))}</code>")
+    request_first_applicable = bool(log.get("is_stream") or log.get("upstream_transport") == "ws")
+    request_metrics = _detail_metric_line(log, request=True, first_applicable=request_first_applicable)
+    lines.append(f"业务计时: {request_metrics or '无可靠样本'}")
+    if log.get("request_elapsed_ms") is not None:
+        lines.append(f"请求全程（外层）: {ui.fmt_ms(log.get('request_elapsed_ms'))}")
+    request_stages = _detail_stage_line(log)
+    if request_stages:
+        lines.append(f"可靠阶段（可能重叠，不相加）: {request_stages}")
     tps_v = ui.calc_row_tps(log)
     if tps_v is not None:
         lines.append(f"⚡ 生成速度: {ui.fmt_tps(tps_v)}")
 
-    # 代理链（同一渠道尝试内的出站代理切换原因）
-    if proxy_chain:
-        lines.append("")
-        lines.append(f"<b>代理链 ({len(proxy_chain)} 次尝试)</b>")
-        for p in proxy_chain:
-            order = p.get("attempt_order") or "?"
-            pname = ui.escape_html(p.get("proxy_name") or "?")
-            oc = p.get("outcome") or "?"
-            mark = "✅" if oc in ("success", "connected") else "❌"
-            lines.append(f"  {mark} <b>{order}.</b> 🔀 <code>{pname}</code> — {ui.escape_html(oc)}")
-            timing = []
-            if p.get("connect_ms") is not None:
-                timing.append(f"连接 {ui.fmt_ms(p['connect_ms'])}")
-            if p.get("started_at") and p.get("ended_at"):
-                dur = (p["ended_at"] - p["started_at"]) * 1000
-                timing.append(f"耗时 {ui.fmt_ms(dur)}")
-            byte_sum = int(p.get("bytes_up") or 0) + int(p.get("bytes_down") or 0)
-            if byte_sum:
-                timing.append(f"流量 {_fmt_bytes(byte_sum)}")
-            if timing:
-                lines.append(f"     · {' · '.join(timing)}")
-            if p.get("error_detail"):
-                lines.append(f"     ⚠ <i>{ui.escape_html(_extract_error_summary(p['error_detail'])[:180])}</i>")
+    rounds_by_attempt: dict[str, list[dict]] = {}
+    unassigned_rounds: list[dict] = []
+    for item in proxy_chain:
+        retry_id = item.get("retry_attempt_id")
+        if retry_id is None:
+            unassigned_rounds.append(item)
+        else:
+            rounds_by_attempt.setdefault(str(retry_id), []).append(item)
 
-    # 执行链（包含普通渠道尝试、本地搜索轮、预算提示等；local web 轮不计入真正 retry_count）
-    lines.append("")
-    lines.append(f"<b>执行链 ({len(chain)} 次)</b>")
+    lines.extend(["", f"<b>执行链 ({len(chain)} 次渠道尝试 / {len(proxy_chain)} 个上游轮次)</b>"])
     if not chain:
-        lines.append("  (无记录)")
+        lines.append("  (无渠道尝试记录)")
     for c in chain:
         order = c.get("attempt_order") or "?"
-        ch = ui.escape_html(ui.channel_display_name(c.get("channel_key") or "?", with_family=True))
-        model = ui.escape_html(c.get("model") or "?")
-        oc = c.get("outcome") or "?"
-        mark = _retry_chain_mark(oc)
-        label = ui.escape_html(_retry_chain_label(oc))
-        proxy_tag = ""
-        if c.get("proxy_name"):
-            proxy_tag = f" 🔀 {ui.escape_html(c['proxy_name'])}"
-        lines.append(f"  {mark} <b>{order}.</b> <code>{ch}</code> / <code>{model}</code>{proxy_tag} — {label}")
-        timing = []
-        if c.get("connect_ms") is not None:
-            timing.append(f"连接 {ui.fmt_ms(c['connect_ms'])}")
-        if c.get("first_byte_ms") is not None:
-            timing.append(f"首字 {ui.fmt_ms(c['first_byte_ms'])}")
-        if c.get("started_at") and c.get("ended_at"):
-            dur = (c["ended_at"] - c["started_at"]) * 1000
-            timing.append(f"耗时 {ui.fmt_ms(dur)}")
-        if timing:
-            lines.append(f"     · {' · '.join(timing)}")
+        ch = ui.escape_html(_detail_inline(ui.channel_display_name(c.get("channel_key") or "?", with_family=True)))
+        model = ui.escape_html(_detail_inline(c.get("model")))
+        outcome = _detail_inline(c.get("outcome"))
+        mark = _retry_chain_mark(outcome)
+        label = ui.escape_html(_retry_chain_label(outcome))
+        proxy_tag = f" 🔀 {ui.escape_html(_detail_inline(c['proxy_name']))}" if c.get("proxy_name") else ""
+        lines.append(f"  {mark} <b>尝试 {order}.</b> <code>{ch}</code> / <code>{model}</code>{proxy_tag} — {label}")
+        if c.get("final_round_id"):
+            lines.append(f"     · 终止轮次 <code>{ui.escape_html(_detail_inline(c['final_round_id']))}</code>")
+        child_rounds = rounds_by_attempt.pop(str(c.get("id")), [])
+        final_mode = child_rounds[-1].get("request_mode") if child_rounds else None
+        attempt_metrics = _detail_metric_line(c, first_applicable=final_mode != "http_non_stream")
+        if attempt_metrics:
+            lines.append(f"     · 终止轮摘要: {attempt_metrics}")
+        if c.get("attempt_elapsed_ms") is not None:
+            lines.append(f"     · 渠道尝试全程（外层）: {ui.fmt_ms(c.get('attempt_elapsed_ms'))}")
+        attempt_stages = _detail_stage_line(c)
+        if attempt_stages:
+            lines.append(f"     · 可靠阶段（可能重叠，不相加）: {attempt_stages}")
         if c.get("error_detail"):
-            lines.append(f"     ⚠ <i>{ui.escape_html(_extract_error_summary(c['error_detail'])[:180])}</i>")
+            _append_detail_text(lines, _extract_error_summary(str(c["error_detail"])), indent="     ⚠ ", italic=True)
+        for p in child_rounds:
+            _append_round_detail(lines, p)
 
-    # 本地搜索 / 抓取日志
+    remaining_rounds = unassigned_rounds + [p for values in rounds_by_attempt.values() for p in values]
+    if remaining_rounds:
+        lines.extend(["", f"<b>未关联渠道尝试的上游轮次 ({len(remaining_rounds)} 个)</b>"])
+        for p in remaining_rounds:
+            _append_round_detail(lines, p, nested=False)
+
     if local_web_log:
-        lines.append("")
-        lines.append(f"<b>搜索日志 ({len(local_web_log)} 次)</b>")
+        lines.extend(["", f"<b>搜索日志 ({len(local_web_log)} 次)</b>"])
         total_bytes = 0
         total_results = 0
         for idx, item in enumerate(local_web_log, 1):
-            status_l = item.get("status") or "?"
-            mark = "✅" if status_l == "success" else ("⏳" if status_l == "running" else "❌")
-            tool = ui.escape_html(item.get("tool_name") or "?")
-            round_no = item.get("round_no") or "?"
+            local_status = _detail_inline(item.get("status"))
+            mark = "✅" if local_status == "success" else ("⏳" if local_status == "running" else "❌")
             count = int(item.get("result_count") or 0)
-            b = int(item.get("content_bytes") or 0)
-            total_bytes += b
+            byte_count = int(item.get("content_bytes") or 0)
             total_results += count
-            head = f"  {mark} <b>{idx}.</b> <code>{tool}</code> · round {round_no}"
+            total_bytes += byte_count
+            head = f"  {mark} <b>{idx}.</b> <code>{ui.escape_html(_detail_inline(item.get('tool_name')))}</code> · round {item.get('round_no') or '?'}"
             if count:
                 head += f" · 返回 {count} 条"
-            if b:
-                head += f" · {_fmt_bytes(b)}"
+            if byte_count:
+                head += f" · {_fmt_bytes(byte_count)}"
             lines.append(head)
-            query = item.get("query")
-            url = item.get("url")
-            if query:
-                q = ui.escape_html(str(query)[:300])
-                lines.append(f"     查: <i>{q}</i>")
-            if url:
-                u = ui.escape_html(str(url)[:300])
-                lines.append(f"     URL: <code>{u}</code>")
-            timing = []
+            if item.get("query"):
+                _append_detail_text(lines, item["query"], indent="     查: ", italic=True)
+            if item.get("url"):
+                _append_detail_text(lines, item["url"], indent="     URL: ")
+            local_timing = []
             if item.get("started_at") and item.get("ended_at"):
-                timing.append(f"耗时 {ui.fmt_ms((item['ended_at'] - item['started_at']) * 1000)}")
+                local_timing.append(f"耗时 {ui.fmt_ms((item['ended_at'] - item['started_at']) * 1000)}")
             if item.get("content_chars"):
-                timing.append(f"字符 {ui.fmt_tokens(item.get('content_chars'))}")
-            if timing:
-                lines.append(f"     · {' · '.join(timing)}")
+                local_timing.append(f"字符 {ui.fmt_tokens(item.get('content_chars'))}")
+            if local_timing:
+                lines.append(f"     · {' · '.join(local_timing)}")
             if item.get("error_message"):
-                lines.append(f"     ⚠ <i>{ui.escape_html(str(item['error_message'])[:220])}</i>")
+                _append_detail_text(lines, item["error_message"], indent="     ⚠ ", italic=True)
         summary = []
         if total_results:
             summary.append(f"共 {total_results} 条")
@@ -687,17 +766,32 @@ def _render_detail(detail: dict) -> str:
         if summary:
             lines.append("  合计: " + " · ".join(summary))
 
-    # 错误信息（整体）
     if status == "error" and log.get("error_message"):
-        lines.append("")
-        lines.append("<b>错误信息</b>")
-        lines.append(f"<i>{ui.escape_html(_extract_error_summary(log['error_message'])[:300])}</i>")
+        lines.extend(["", "<b>最终错误</b>"])
+        _append_detail_text(lines, _extract_error_summary(str(log["error_message"])), italic=True)
 
     return "\n".join(lines)
 
 
+def _render_detail_pages(detail: dict, limit: int = 3600) -> list[str]:
+    """Paginate by complete escaped lines; no content is discarded or HTML tag cut."""
+    lines = _render_detail(detail).splitlines()
+    pages: list[list[str]] = [[]]
+    page_len = 0
+    for line in lines:
+        added = len(line) + (1 if pages[-1] else 0)
+        if pages[-1] and page_len + added > limit:
+            pages.append([])
+            page_len = 0
+            added = len(line)
+        pages[-1].append(line)
+        page_len += added
+    return ["\n".join(page) for page in pages if page] or [""]
+
+
 def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
-                page: int = 1, list_state: dict | None = None) -> None:
+                page: int = 1, list_state: dict | None = None,
+                detail_page: int = 1) -> None:
     ui.answer_cb(cb_id)
     list_state = _normalize_list_state(list_state, page=page if list_state is None else None)
     list_code = _list_state_code(list_state)
@@ -718,14 +812,24 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
         return
     body_short = ui.register_code("logbody:" + rid)
     resp_short = ui.register_code("logresp:" + rid)
-    ui.edit(
-        chat_id, message_id, ui.truncate(_render_detail(detail)),
-        reply_markup=ui.inline_kb([
-            [ui.btn("📨 请求 Body", f"logs:body:{body_short}:{list_code}"),
-             ui.btn("📬 响应", f"logs:response:{resp_short}:{list_code}")],
-            [ui.btn(f"◀ 返回第 {list_state['p']} 页", _list_cb(list_state))],
-        ]),
-    )
+    detail_pages = _render_detail_pages(detail)
+    detail_page = max(1, min(int(detail_page or 1), len(detail_pages)))
+    text = detail_pages[detail_page - 1]
+    if len(detail_pages) > 1:
+        text += f"\n\n<i>详情第 {detail_page}/{len(detail_pages)} 页</i>"
+    rows = [[
+        ui.btn("📨 请求 Body", f"logs:body:{body_short}:{list_code}"),
+        ui.btn("📬 响应", f"logs:response:{resp_short}:{list_code}"),
+    ]]
+    if len(detail_pages) > 1:
+        nav = []
+        if detail_page > 1:
+            nav.append(ui.btn("◀ 上一页", f"logs:dpage:{short}:{detail_page - 1}:{list_code}"))
+        if detail_page < len(detail_pages):
+            nav.append(ui.btn("下一页 ▶", f"logs:dpage:{short}:{detail_page + 1}:{list_code}"))
+        rows.append(nav)
+    rows.append([ui.btn(f"◀ 返回第 {list_state['p']} 页", _list_cb(list_state))])
+    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb(rows))
 
 
 
@@ -1158,6 +1262,23 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
             return True
         kind, action, state_short = parts
         _filter_action(chat_id, message_id, cb_id, kind, action, state_short); return True
+    if data.startswith("logs:dpage:"):
+        payload = data.split(":", 2)[2]
+        parts = payload.split(":", 2)
+        if len(parts) != 3:
+            ui.answer_cb(cb_id, "详情页状态已失效")
+            return True
+        short, detail_page_s, state_s = parts
+        try:
+            detail_page = int(detail_page_s)
+        except Exception:
+            detail_page = 1
+        list_state = _resolve_list_state(state_s) or _list_state(1)
+        show_detail(
+            chat_id, message_id, cb_id, short,
+            list_state=list_state, detail_page=detail_page,
+        )
+        return True
     if data.startswith("logs:detail:"):
         payload = data.split(":", 2)[2]
         short, _, state_s = payload.partition(":")

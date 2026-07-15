@@ -625,6 +625,7 @@ async def proxy_images_edits_openai(request: Request):
 @app.post("/v1/messages")
 async def proxy_messages(request: Request):
     start_time = time.time()
+    start_monotonic = time.monotonic()
     request_id = str(uuid.uuid4())
     client_ip = get_client_ip(request)
 
@@ -736,7 +737,7 @@ async def proxy_messages(request: Request):
             await asyncio.to_thread(
                 log_db.finish_error, request_id, msg, 0,
                 http_status=400, affinity_hit=(1 if result.affinity_hit else 0),
-                total_ms=int((time.time() - start_time) * 1000),
+                total_ms=int((time.monotonic() - start_monotonic) * 1000),
             )
             return errors.json_error_response(
                 400, errors.ErrType.INVALID_REQUEST, msg
@@ -746,7 +747,7 @@ async def proxy_messages(request: Request):
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=int((time.monotonic() - start_monotonic) * 1000),
         )
         # 主动告警（节流 5min）：帮助运维第一时间发现
         ek = notifier.escape_html
@@ -771,7 +772,7 @@ async def proxy_messages(request: Request):
             msg,
             0,
             http_status=400,
-            total_ms=int((time.time() - start_time) * 1000),
+            total_ms=int((time.monotonic() - start_monotonic) * 1000),
             affinity_hit=(1 if result.affinity_hit else 0),
         )
         print(
@@ -800,10 +801,11 @@ async def proxy_messages(request: Request):
         response = await failover.run_failover(
             result, body, request_id, key_name, client_ip,
             is_stream=is_stream, start_time=start_time,
+            start_monotonic=start_monotonic,
         )
     except Exception as e:
         import traceback; traceback.print_exc()
-        total_ms = int((time.time() - start_time) * 1000)
+        total_ms = int((time.monotonic() - start_monotonic) * 1000)
         await asyncio.to_thread(
             log_db.finish_error, request_id, f"unexpected: {e}", 0,
             http_status=500, total_ms=total_ms,

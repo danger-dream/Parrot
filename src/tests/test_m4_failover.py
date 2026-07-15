@@ -286,10 +286,14 @@ def sse_with_blacklist():
 
 
 class _MockStreamContext:
-    def __init__(self, resp: httpx.Response):
+    def __init__(self, resp: httpx.Response, trace=None):
         self.resp = resp
+        self.trace = trace
 
     async def __aenter__(self):
+        if self.trace is not None:
+            await self.trace("http11.send_request_body.started", {})
+            await self.trace("http11.send_request_body.complete", {})
         return self.resp
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -313,13 +317,16 @@ class _ProxyMockClient:
         self.closed = False
         self.requests: list[httpx.Request] = []
 
-    def stream(self, method, url, *, headers=None, content=None, timeout=None):
+    def stream(self, method, url, *, headers=None, content=None, timeout=None, extensions=None):
+        # This fake owns request upload, so it emits the same authoritative
+        # send-body trace boundary as HTTPcore instead of inventing wall timing.
+        trace = (extensions or {}).get("trace")
         if self.fail_enter:
             return _FailingEnterCtx()
         req = httpx.Request(method, url, headers=headers, content=content)
         self.requests.append(req)
         resp = self.router.handle(req)
-        return _MockStreamContext(resp)
+        return _MockStreamContext(resp, trace=trace)
 
     async def aclose(self):
         self.closed = True
@@ -400,7 +407,8 @@ _REQUEST_SEQ = itertools.count()
 async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip="1.1.1.1",
                       ingress_protocol="anthropic"):
     """模拟 server.py /v1/messages 或 OpenAI handler 的核心调用链。"""
-    # 注入 mock client
+    # conftest makes MockTransport emit HTTPcore's authoritative send-body
+    # boundary; proxy-specific fakes below do the same from their context owner.
     transport = httpx.MockTransport(router.handle)
     mock_client = httpx.AsyncClient(transport=transport, timeout=10.0)
     m["upstream"].set_client(mock_client)
@@ -767,7 +775,8 @@ async def test_stream_midstream_error_logs_upstream_error(m):
     assert log["log"]["status"] == "error", log["log"]
     assert "busy later" in log["log"]["error_message"]
     assert log["log"]["error_message"] != "client disconnected"
-    assert log["retry_chain"][0]["outcome"] == "success"
+    assert log["retry_chain"][0]["outcome"] == "stream_upstream_error"
+    assert log["retry_chain"][0]["total_ms"] is not None
     print("  [PASS] stream midstream error → DB records upstream error, not client disconnected")
 
 
@@ -1074,6 +1083,7 @@ async def amain():
         test_responses_chunked_metadata_error_before_visible_chunk_switches,
         test_responses_context_length_before_visible_chunk_short_circuits_failover,
         test_responses_to_chat_error_after_item_added_before_chat_bytes_switches,
+        test_invalid_encrypted_content_retries_same_channel_without_ec,
         test_stream_blacklist_switch,
         test_affinity_pins_channel,
         test_cooldown_excludes_from_next,

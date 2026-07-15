@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 from ._isolation import isolate
 
 isolate()
@@ -14,6 +17,31 @@ class _DummyChannel:
 class _DummyScheduleResult:
     candidates = [(_DummyChannel(), "gpt-5.5")]
     saturated = []
+
+
+class _FakeEncoding:
+    name = "o200k_base"
+
+    @staticmethod
+    def encode(text: str):
+        # Deterministic token-like result; importantly distinct from bytes/3.
+        return range((len(text) + 1) // 2)
+
+
+def _install_fake_tiktoken(monkeypatch, request):
+    calls: list[str] = []
+
+    def encoding_for_model(model: str):
+        calls.append(model)
+        return _FakeEncoding()
+
+    monkeypatch.setitem(sys.modules, "tiktoken", SimpleNamespace(
+        encoding_for_model=encoding_for_model,
+        get_encoding=lambda name: _FakeEncoding(),
+    ))
+    token_counter._encoding_for_model.cache_clear()
+    request.addfinalizer(token_counter._encoding_for_model.cache_clear)
+    return calls
 
 
 def test_model_metadata_safe_limit_and_single_compression_model():
@@ -92,7 +120,8 @@ def test_token_counter_counts_responses_input_string():
     assert count > 10
 
 
-def test_tiktoken_model_name_normalization_for_parrot_names():
+def test_tiktoken_model_name_normalization_for_parrot_names(monkeypatch, request):
+    calls = _install_fake_tiktoken(monkeypatch, request)
     assert token_counter._normalized_tiktoken_model_name("gpt") == "gpt-5"
     assert token_counter._normalized_tiktoken_model_name("gpt-5.5") == "gpt-5"
     assert token_counter._normalized_tiktoken_model_name("channel/account:gpt-5.5") == "gpt-5"
@@ -100,14 +129,17 @@ def test_tiktoken_model_name_normalization_for_parrot_names():
     assert token_counter._encoding_for_model("gpt-5.5").name == "o200k_base"
     assert token_counter._normalized_tiktoken_model_name("deepseek-v4-pro") is None
     assert token_counter._encoding_for_model("deepseek-v4-pro").name == "o200k_base"
+    assert calls == ["gpt-5", "gpt-5"]
 
 
-def test_unknown_models_fallback_to_gpt5_tiktoken_not_bytes():
+def test_unknown_models_fallback_to_gpt5_tiktoken_not_bytes(monkeypatch, request):
+    calls = _install_fake_tiktoken(monkeypatch, request)
     text = "用户请求：请继续。" * 1000
     token_count = token_counter.count_text_tokens(text, model="deepseek-v4-pro")
     byte_estimate = (len(text.encode("utf-8")) + 2) // 3
     assert token_count < byte_estimate
     assert token_count == token_counter.count_text_tokens(text, model="gpt-5")
+    assert calls == ["gpt-5", "gpt-5"]
 
 
 def test_image_base64_is_not_counted_as_text_tokens():

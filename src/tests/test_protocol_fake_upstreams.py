@@ -3060,7 +3060,7 @@ async def test_http_responses_client_to_ws_fake_upstream(monkeypatch, m):
     ])
     captured: dict[str, object] = {}
 
-    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout):
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         captured["url"] = url
         captured["headers"] = dict(headers)
         captured["connector"] = connector

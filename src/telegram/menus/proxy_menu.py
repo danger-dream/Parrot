@@ -172,8 +172,12 @@ def _merge_group_stats(members: list[str], pstats: dict) -> dict:
               "cache_creation_tokens": 0, "cache_read_tokens": 0,
               "total_tokens": 0,
               "bytes_up": 0, "bytes_down": 0, "total_bytes": 0,
-              "avg_connect_ms": 0, "avg_first_byte_ms": 0, "avg_total_ms": 0}
-    count = 0
+              "connect_sum_ms": 0, "connect_sample_count": 0,
+              "first_byte_sum_ms": 0, "first_byte_sample_count": 0,
+              "idle_sum_ms": 0, "idle_sample_count": 0,
+              "total_sum_ms": 0, "total_sample_count": 0,
+              "avg_connect_ms": 0, "avg_first_byte_ms": 0,
+              "avg_idle_ms": 0, "avg_total_ms": 0}
     for m in members:
         if m == "direct":
             continue
@@ -191,14 +195,22 @@ def _merge_group_stats(members: list[str], pstats: dict) -> dict:
         merged["bytes_up"] += int(ps.get("bytes_up", 0) or 0)
         merged["bytes_down"] += int(ps.get("bytes_down", 0) or 0)
         merged["total_bytes"] += int(ps.get("total_bytes", 0) or 0)
-        merged["avg_connect_ms"] += ps["avg_connect_ms"] * ps["requests"]
-        merged["avg_first_byte_ms"] += ps["avg_first_byte_ms"] * ps["requests"]
-        merged["avg_total_ms"] += ps["avg_total_ms"] * ps["requests"]
-        count += ps["requests"]
-    if count > 0:
-        merged["avg_connect_ms"] = round(merged["avg_connect_ms"] / count)
-        merged["avg_first_byte_ms"] = round(merged["avg_first_byte_ms"] / count)
-        merged["avg_total_ms"] = round(merged["avg_total_ms"] / count)
+        for sum_key, count_key in (
+            ("connect_sum_ms", "connect_sample_count"),
+            ("first_byte_sum_ms", "first_byte_sample_count"),
+            ("idle_sum_ms", "idle_sample_count"),
+            ("total_sum_ms", "total_sample_count"),
+        ):
+            merged[sum_key] += int(ps.get(sum_key) or 0)
+            merged[count_key] += int(ps.get(count_key) or 0)
+    for avg_key, sum_key, count_key in (
+        ("avg_connect_ms", "connect_sum_ms", "connect_sample_count"),
+        ("avg_first_byte_ms", "first_byte_sum_ms", "first_byte_sample_count"),
+        ("avg_idle_ms", "idle_sum_ms", "idle_sample_count"),
+        ("avg_total_ms", "total_sum_ms", "total_sample_count"),
+    ):
+        count = int(merged[count_key] or 0)
+        merged[avg_key] = round(merged[sum_key] / count) if count else 0
     return merged
 
 

@@ -494,11 +494,10 @@ def test_logs_detail_with_execution_chain(m):
     text = rec.last("editMessageText")["text"]
     assert "日志详情" in text
     assert rid in text
-    assert "代理链 (2 次尝试)" in text
+    assert "执行链 (3 次渠道尝试 / 2 个上游轮次)" in text
     assert "us-att" in text and "misaka-lax" in text
     assert "connect_error" in text and "dial timeout" in text
-    assert "执行链 (3 次)" in text
-    assert "🔎 <b>2.</b>" in text
+    assert "🔎 <b>尝试 2.</b>" in text
     assert "本地搜索轮" in text
     assert "❌ <b>2.</b>" not in text
     assert "<code>A</code>" in text and "<code>B</code>" in text
