@@ -274,6 +274,7 @@ async def lifespan(app: FastAPI):
         for t in _background_tasks:
             t.cancel()
         await asyncio.gather(*_background_tasks, return_exceptions=True)
+        await apikey_limiter.shutdown_spooling()
         tgbot.stop()
         await upstream.close_client()
 
@@ -338,6 +339,24 @@ def _request_body_limit_error_response(
     return resp
 
 
+def _queued_body_spool_error_response(
+    path: str, exc: apikey_limiter.QueuedBodySpoolError,
+):
+    """Return a retryable service error when bounded spool I/O is unavailable."""
+    message = str(exc) or "queued request body spool is unavailable"
+    if path == "/v1/messages":
+        resp = errors.json_error_response(
+            503, errors.ErrType.OVERLOADED, message, code="queued_body_spool_unavailable",
+        )
+    else:
+        resp = errors.json_error_openai(
+            503, errors.ErrTypeOpenAI.SERVER, message,
+            code="queued_body_spool_unavailable",
+        )
+    resp.headers["Retry-After"] = "1"
+    return resp
+
+
 def _find_request_body_limit_error(exc: BaseException) -> apikey_limiter.RequestBodyTooLarge | None:
     """Unwrap Starlette/AnyIO task-group errors without version-specific APIs."""
     if isinstance(exc, apikey_limiter.RequestBodyTooLarge):
@@ -354,6 +373,27 @@ def _find_request_body_limit_error(exc: BaseException) -> apikey_limiter.Request
     context = getattr(exc, "__context__", None)
     if context is not None and context is not exc:
         return _find_request_body_limit_error(context)
+    return None
+
+
+def _find_queued_body_spool_error(
+    exc: BaseException,
+) -> apikey_limiter.QueuedBodySpoolError | None:
+    """Unwrap task-group errors containing a spool failure."""
+    if isinstance(exc, apikey_limiter.QueuedBodySpoolError):
+        return exc
+    for nested in getattr(exc, "exceptions", ()) or ():
+        found = _find_queued_body_spool_error(nested)
+        if found is not None:
+            return found
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        found = _find_queued_body_spool_error(cause)
+        if found is not None:
+            return found
+    context = getattr(exc, "__context__", None)
+    if context is not None and context is not exc:
+        return _find_queued_body_spool_error(context)
     return None
 
 
@@ -386,6 +426,9 @@ async def _drain_http_middleware(request: Request, call_next):
                 except apikey_limiter.RequestBodyTooLarge as exc:
                     await lease.aclose()
                     return _request_body_limit_error_response(path, exc)
+                except apikey_limiter.QueuedBodySpoolError as exc:
+                    await lease.aclose()
+                    return _queued_body_spool_error_response(path, exc)
                 except apikey_limiter.ApiKeyLimitError as exc:
                     await lease.aclose()
                     return _api_key_limit_error_response(path, exc)
@@ -395,6 +438,11 @@ async def _drain_http_middleware(request: Request, call_next):
             await key_lease.release()
         await lease.aclose()
         return _request_body_limit_error_response(path, exc)
+    except apikey_limiter.QueuedBodySpoolError as exc:
+        if key_lease is not None:
+            await key_lease.release()
+        await lease.aclose()
+        return _queued_body_spool_error_response(path, exc)
     except BaseException as exc:
         if key_lease is not None:
             await key_lease.release()
@@ -402,6 +450,9 @@ async def _drain_http_middleware(request: Request, call_next):
         body_limit_error = _find_request_body_limit_error(exc)
         if body_limit_error is not None:
             return _request_body_limit_error_response(path, body_limit_error)
+        spool_error = _find_queued_body_spool_error(exc)
+        if spool_error is not None:
+            return _queued_body_spool_error_response(path, spool_error)
         raise
 
     if key_lease is not None:

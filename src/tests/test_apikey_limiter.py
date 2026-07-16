@@ -1,4 +1,9 @@
 import asyncio
+import gc
+import os
+import stat
+import weakref
+from pathlib import Path
 
 import httpx
 import pytest
@@ -34,11 +39,17 @@ def _reset_slots(monkeypatch):
     apikey_limiter._slots.clear()
     apikey_limiter._queued_body_bytes_by_key.clear()
     apikey_limiter._queued_body_bytes_total = 0
+    apikey_limiter._queued_body_spool_bytes_by_key.clear()
+    apikey_limiter._queued_body_spool_bytes_total = 0
+    apikey_limiter._active_body_guards.clear()
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: _cfg())
     yield
     apikey_limiter._slots.clear()
     apikey_limiter._queued_body_bytes_by_key.clear()
     apikey_limiter._queued_body_bytes_total = 0
+    apikey_limiter._queued_body_spool_bytes_by_key.clear()
+    apikey_limiter._queued_body_spool_bytes_total = 0
+    apikey_limiter._active_body_guards.clear()
 
 
 @pytest.mark.asyncio
@@ -332,6 +343,19 @@ def _aggregate_budget_cfg(*, per_key: int, process: int, max_events: int = 10):
             for name in ("k", "k2")
         },
     }
+
+
+def _spool_cfg(tmp_path, *, wait_seconds: int = 10):
+    cfg = _aggregate_budget_cfg(per_key=100_000, process=100_000)
+    cfg["apiKeyConcurrency"].update({
+        "defaultQueueWaitSeconds": wait_seconds,
+        "defaultMaxRequestBodyBytes": 100_000,
+        "queuedBodySpoolThresholdBytes": 1,
+        "queuedBodySpoolDirectory": str(tmp_path),
+        "defaultMaxQueuedBodySpoolBytesPerKey": 100_000,
+        "maxQueuedBodySpoolBytes": 100_000,
+    })
+    return cfg
 
 
 def _queued_request(messages, consumed: asyncio.Event | None = None) -> Request:
@@ -819,3 +843,336 @@ async def test_nonqueued_body_event_count_uses_same_contract(monkeypatch):
         await request.body()
     assert exc_info.value.reason == "event_count"
     await lease.release()
+
+
+async def _wait_for_spool_bytes(expected: int) -> None:
+    async def ready():
+        while apikey_limiter._queued_body_spool_bytes_total != expected:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(ready(), timeout=2)
+
+
+def _assert_spool_clean(tmp_path, request: Request | None = None) -> None:
+    assert apikey_limiter._queued_body_bytes_total == 0
+    assert apikey_limiter._queued_body_bytes_by_key == {}
+    assert apikey_limiter._queued_body_spool_bytes_total == 0
+    assert apikey_limiter._queued_body_spool_bytes_by_key == {}
+    assert list(Path(tmp_path).iterdir()) == []
+    if request is not None:
+        guard = apikey_limiter._request_receive_guard(request)
+        assert guard is not None
+        assert guard._spool is None
+
+
+@pytest.mark.asyncio
+async def test_spooled_body_cancellation_closes_file_and_accounting(monkeypatch, tmp_path):
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path))
+    active = await apikey_limiter.acquire("k")
+    request = _queued_request([
+        {"type": "http.request", "body": b"cancel-me", "more_body": True},
+    ])
+    queued = asyncio.create_task(apikey_limiter.acquire("k", request))
+    await _wait_for_spool_bytes(len(b"cancel-me"))
+
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    _assert_spool_clean(tmp_path, request)
+    await active.release()
+
+
+@pytest.mark.asyncio
+async def test_spool_disk_budget_stays_reserved_until_file_is_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path))
+    active = await apikey_limiter.acquire("k")
+    chunks = (b"first-chunk", b"second-chunk")
+    request = _queued_request([
+        {"type": "http.request", "body": chunks[0], "more_body": True},
+        {"type": "http.request", "body": chunks[1], "more_body": False},
+    ])
+    queued = asyncio.create_task(apikey_limiter.acquire("k", request))
+    await _wait_for_spool_bytes(sum(map(len, chunks)))
+    await active.release()
+    lease = await asyncio.wait_for(queued, timeout=1)
+
+    first = await request.receive()
+    assert first["body"] == chunks[0]
+    # The backing file still contains both events, so its whole allocation must
+    # continue to count even though the first event has been handed downstream.
+    assert apikey_limiter._queued_body_spool_bytes_total == sum(map(len, chunks))
+    second = await request.receive()
+    assert second["body"] == chunks[1]
+    assert apikey_limiter._queued_body_spool_bytes_total == 0
+    await lease.release()
+    _assert_spool_clean(tmp_path, request)
+
+
+@pytest.mark.asyncio
+async def test_spooled_body_timeout_closes_file_and_accounting(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path, wait_seconds=1),
+    )
+    active = await apikey_limiter.acquire("k")
+    request = _queued_request([
+        {"type": "http.request", "body": b"timeout-body", "more_body": True},
+    ])
+    queued = asyncio.create_task(apikey_limiter.acquire("k", request))
+    await _wait_for_spool_bytes(len(b"timeout-body"))
+
+    with pytest.raises(apikey_limiter.ApiKeyLimitError) as exc_info:
+        await asyncio.wait_for(queued, timeout=2)
+    assert exc_info.value.reason == "queue_timeout"
+    _assert_spool_clean(tmp_path, request)
+    await active.release()
+
+
+@pytest.mark.asyncio
+async def test_spooled_body_disconnect_closes_file_and_accounting(monkeypatch, tmp_path):
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path))
+    active = await apikey_limiter.acquire("k")
+    messages = [
+        {"type": "http.request", "body": b"partial-body", "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/responses", "headers": []},
+        receive,
+    )
+    with pytest.raises(apikey_limiter.ApiKeyLimitError) as exc_info:
+        await apikey_limiter.acquire("k", request)
+    assert exc_info.value.reason == "client_disconnected"
+    _assert_spool_clean(tmp_path, request)
+    await active.release()
+
+
+@pytest.mark.asyncio
+async def test_spooled_body_hot_disable_noop_release_cleans(monkeypatch, tmp_path):
+    current = _spool_cfg(tmp_path)
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
+    active = await apikey_limiter.acquire("k")
+    request = _queued_request([
+        {"type": "http.request", "body": b"hot-disable", "more_body": True},
+    ])
+    queued = asyncio.create_task(apikey_limiter.acquire("k", request))
+    await _wait_for_spool_bytes(len(b"hot-disable"))
+
+    current["apiKeyConcurrency"]["enabled"] = False
+    lease = await asyncio.wait_for(queued, timeout=2)
+    assert lease.noop
+    # A noop lease still owns the queued replay resource until response cleanup.
+    assert apikey_limiter._queued_body_spool_bytes_total == len(b"hot-disable")
+    await lease.release()
+    _assert_spool_clean(tmp_path, request)
+    await active.release()
+
+
+@pytest.mark.asyncio
+async def test_spool_write_exception_closes_file_and_accounting(monkeypatch, tmp_path):
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path))
+    active = await apikey_limiter.acquire("k")
+    request = _queued_request([
+        {"type": "http.request", "body": b"io-failure", "more_body": True},
+    ])
+
+    async def fail_write(self, *args, **kwargs):
+        # Open the real temporary object first so cleanup proves fd/file closure.
+        if self._spool is None:
+            self._spool = self._open_spool(self._limits)
+            self._spool.rollover()
+            self._spooled_to_disk = True
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(
+        apikey_limiter._BodyPreservingReceive, "_write_spooled_body", fail_write,
+    )
+    with pytest.raises(apikey_limiter.QueuedBodySpoolError):
+        await apikey_limiter.acquire("k", request)
+    _assert_spool_clean(tmp_path, request)
+    await active.release()
+
+
+@pytest.mark.asyncio
+async def test_spool_error_wins_concurrent_admission_handoff(monkeypatch, tmp_path):
+    """A watcher spool failure must not be hidden by a simultaneous FIFO wake."""
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path))
+    write_started = asyncio.Event()
+    allow_failure = asyncio.Event()
+
+    async def paused_failure(self, *args, **kwargs):
+        write_started.set()
+        await allow_failure.wait()
+        raise OSError("handoff disk failure")
+
+    monkeypatch.setattr(
+        apikey_limiter._BodyPreservingReceive,
+        "_write_spooled_body",
+        paused_failure,
+    )
+    active = await apikey_limiter.acquire("k")
+    request = _queued_request([
+        {"type": "http.request", "body": b"handoff-body", "more_body": True},
+    ])
+    queued = asyncio.create_task(apikey_limiter.acquire("k", request))
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+
+    await active.release()
+    await asyncio.sleep(0)
+    allow_failure.set()
+    with pytest.raises(apikey_limiter.QueuedBodySpoolError):
+        await asyncio.wait_for(queued, timeout=1)
+    _assert_spool_clean(tmp_path, request)
+    assert apikey_limiter.key_snapshot("k")["in_flight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_default_spool_capacity_tracks_effective_request_limit_and_stays_bounded(
+    monkeypatch, tmp_path,
+):
+    """Defaults admit one legal body, while concurrent retained bodies remain capped."""
+    monkeypatch.setattr(
+        apikey_limiter, "DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_PER_KEY", 10,
+    )
+    monkeypatch.setattr(
+        apikey_limiter, "DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_TOTAL", 20,
+    )
+    cfg = _aggregate_budget_cfg(per_key=100_000, process=100_000)
+    cfg["apiKeyConcurrency"].update({
+        "defaultMaxRequestBodyBytes": 100,
+        "queuedBodySpoolThresholdBytes": 1,
+        "queuedBodySpoolDirectory": str(tmp_path),
+        "defaultMaxQueuedBodySpoolBytesPerKey": 10,
+        "maxQueuedBodySpoolBytes": 20,
+    })
+    cfg["apiKeys"]["k2"] = {"key": "secret", "enabled": True, "limits": {}}
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+
+    first = _queued_request([])
+    first_guard = apikey_limiter._body_preserving_receive(
+        first, "k", apikey_limiter._resolve_limits("k"),
+    )
+    await first_guard._reserve(
+        {"type": "http.request", "body": b"a" * 60, "more_body": True}
+    )
+    assert apikey_limiter._queued_body_spool_bytes_total == 60
+
+    second = _queued_request([])
+    second_guard = apikey_limiter._body_preserving_receive(
+        second, "k2", apikey_limiter._resolve_limits("k2"),
+    )
+    with pytest.raises(apikey_limiter.RequestBodyTooLarge) as exc_info:
+        await second_guard._reserve(
+            {"type": "http.request", "body": b"b" * 50, "more_body": True}
+        )
+    assert exc_info.value.reason == "process_aggregate"
+    assert exc_info.value.max_bytes == 100
+
+    await second_guard.abandon()
+    await first_guard.abandon()
+    _assert_spool_clean(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_spool_directory_and_file_permissions_are_private(monkeypatch, tmp_path):
+    spool_dir = tmp_path / "spool"
+    spool_dir.mkdir(mode=0o777)
+    os.chmod(spool_dir, 0o777)
+    monkeypatch.setattr(
+        apikey_limiter.config, "get", lambda: _spool_cfg(spool_dir),
+    )
+    request = _queued_request([])
+    guard = apikey_limiter._body_preserving_receive(
+        request, "k", apikey_limiter._resolve_limits("k"),
+    )
+    await guard._reserve(
+        {"type": "http.request", "body": b"private", "more_body": True}
+    )
+    assert stat.S_IMODE(spool_dir.stat().st_mode) == 0o700
+    assert guard._spool is not None
+    assert stat.S_IMODE(os.fstat(guard._spool.fileno()).st_mode) == 0o600
+    await guard.abandon()
+    _assert_spool_clean(spool_dir, request)
+
+
+@pytest.mark.asyncio
+async def test_spool_directory_symlink_fails_closed_and_cleans(monkeypatch, tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "spool-link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(
+        apikey_limiter.config, "get", lambda: _spool_cfg(link),
+    )
+    request = _queued_request([])
+    guard = apikey_limiter._body_preserving_receive(
+        request, "k", apikey_limiter._resolve_limits("k"),
+    )
+    with pytest.raises(apikey_limiter.QueuedBodySpoolError):
+        await guard._reserve(
+            {"type": "http.request", "body": b"blocked", "more_body": True}
+        )
+    await guard.abandon()
+    assert list(target.iterdir()) == []
+    assert apikey_limiter._queued_body_bytes_total == 0
+    assert apikey_limiter._queued_body_spool_bytes_total == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_spooling_closes_all_live_guards(monkeypatch, tmp_path):
+    cfg = _spool_cfg(tmp_path)
+    cfg["apiKeys"]["k2"] = {"key": "secret", "enabled": True, "limits": {}}
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+    guards = []
+    for key, body in (("k", b"first"), ("k2", b"second")):
+        request = _queued_request([])
+        guard = apikey_limiter._body_preserving_receive(
+            request, key, apikey_limiter._resolve_limits(key),
+        )
+        await guard._reserve(
+            {"type": "http.request", "body": body, "more_body": True}
+        )
+        guards.append(guard)
+
+    assert apikey_limiter._queued_body_spool_bytes_total == 11
+    assert len(apikey_limiter._active_body_guards) == 2
+    await apikey_limiter.shutdown_spooling()
+    await apikey_limiter.shutdown_spooling()  # repeated shutdown is harmless
+
+    assert all(guard._spool is None for guard in guards)
+    assert len(apikey_limiter._active_body_guards) == 0
+    _assert_spool_clean(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_repeated_spool_cleanup_releases_fds_files_and_guard_memory(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _spool_cfg(tmp_path))
+    fd_dir = Path("/proc/self/fd")
+    before_fds = len(list(fd_dir.iterdir())) if fd_dir.exists() else None
+    guard_refs = []
+
+    for _ in range(40):
+        request = _queued_request([])
+        guard = apikey_limiter._body_preserving_receive(
+            request, "k", apikey_limiter._resolve_limits("k"),
+        )
+        guard_refs.append(weakref.ref(guard))
+        await guard._reserve(
+            {"type": "http.request", "body": b"retained", "more_body": True}
+        )
+        await guard.abandon()
+        await guard.abandon()
+
+    del guard, request
+    gc.collect()
+    after_fds = len(list(fd_dir.iterdir())) if fd_dir.exists() else None
+    if before_fds is not None and after_fds is not None:
+        assert after_fds <= before_fds + 1
+    assert all(ref() is None for ref in guard_refs)
+    assert len(apikey_limiter._active_body_guards) == 0
+    _assert_spool_clean(tmp_path)

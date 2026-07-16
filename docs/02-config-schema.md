@@ -24,7 +24,8 @@
         "enabled": null,               // 优先级高于 apiKeyConcurrency.enabled
         "maxConcurrent": null,         // 0 = 不限并发
         "maxQueue": null,              // 0 = 不排队，满并发直接 429
-        "queueWaitSeconds": null       // 0 = 不等待，满并发直接 429
+        "queueWaitSeconds": null,      // 0 = 不等待，满并发直接 429
+        "maxQueuedBodySpoolBytes": null // 单 Key 临时磁盘预算；null 继承全局
       }
     }
   },
@@ -38,7 +39,11 @@
     "defaultMaxRequestBodyBytes": 8388608,       // 单个排队请求最多预读/回放 8 MiB
     "defaultMaxRequestBodyEvents": 4096,         // 单个排队请求最多缓存 4096 个 ASGI body 事件
     "defaultMaxQueuedBodyBytesPerKey": 33554432, // 单 Key 排队请求体估算内存上限 32 MiB
-    "maxQueuedBodyBytes": 134217728              // 全进程排队请求体估算内存上限 128 MiB
+    "maxQueuedBodyBytes": 134217728,             // 全进程排队请求体估算内存上限 128 MiB
+    "queuedBodySpoolThresholdBytes": 1048576,    // 单请求超过 1 MiB 后转入临时文件
+    "queuedBodySpoolDirectory": "",             // 空 = 数据目录/queued-body-spool
+    "defaultMaxQueuedBodySpoolBytesPerKey": 536870912, // 单 Key 临时磁盘上限 512 MiB
+    "maxQueuedBodySpoolBytes": 2147483648        // 全进程临时磁盘上限 2 GiB
   },
 
   // ─── OAuth 账户列表 ───
@@ -254,7 +259,9 @@
 
 `apiKeys.<name>.enabled` 控制该 Key 是否可用，缺失或 `null` 时按 `true` 处理。`apiKeyConcurrency` 是 API Key 级限流默认值；`apiKeys.<name>.limits.enabled/maxConcurrent/maxQueue/queueWaitSeconds` 是单 Key 覆盖，其中 `limits.enabled` 优先级高于全局 `apiKeyConcurrency.enabled`。默认单 Key 5 并发、50 队列、最长等待 1800 秒；队列满、等待超时或客户端断开时请求会从队列移除并返回/结束。
 
-排队期间，限流器会读取 ASGI `receive` 以尽早发现客户端断开，并把期间读到的 `http.request` 事件完整回放给下游。`defaultMaxRequestBodyBytes` 和 `defaultMaxRequestBodyEvents` 是排队与非排队请求一致使用的单请求总量限制，超限返回 413；图片编辑端点会按 `images.maxInputImageBytes`、multipart/JSON（data URL 的 base64 膨胀）、标准多图与 mask 合同自动提高总 body 上限，保证合法的 20 MiB 单图不会被通用 8 MiB 默认值误拒绝。`defaultMaxQueuedBodyBytesPerKey` 和 `maxQueuedBodyBytes` 分别限制单 Key 与全进程保留的请求体估算内存（正文加每事件固定开销），达到聚合上限时返回 429 并带 `Retry-After`；旧配置名 `maxQueuedBodyBytesTotal` 仅在没有公开键 `maxQueuedBodyBytes` 时作为兼容回退。请求获得并发槽位、缓存事件回放完毕后，后续 body 由下游直接读取；multipart 继续由 Starlette 使用 spool 文件解析，取消、超时与响应结束都会释放队列保留内存。
+排队期间，限流器会读取 ASGI `receive` 以尽早发现客户端断开，并把期间读到的 `http.request` 事件按原边界完整回放给下游。`defaultMaxRequestBodyBytes` 和 `defaultMaxRequestBodyEvents` 是排队与非排队请求一致使用的单请求总量限制，超限返回 413；图片编辑端点会按 `images.maxInputImageBytes`、multipart/JSON（data URL 的 base64 膨胀）、标准多图与 mask 合同自动提高总 body 上限，保证合法图片请求不会被通用 8 MiB 默认值误拒绝。
+
+待回放 body 不会全部常驻内存：单请求累计正文超过 `queuedBodySpoolThresholdBytes`（默认 1 MiB）时，已缓存和后续正文会迁移到 `tempfile.SpooledTemporaryFile` 的磁盘后端。`queuedBodySpoolDirectory` 为空时使用数据目录下的 `queued-body-spool/`，也可配置绝对路径或相对数据目录的路径。`defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes` 继续限制单 Key / 全进程的内存正文与 ASGI 事件开销；`defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 独立限制临时磁盘，单 Key 还可用 `limits.maxQueuedBodySpoolBytes` 覆盖。任一聚合资源达到上限均返回 429 并带 `Retry-After`；旧配置名 `maxQueuedBodyBytesTotal` 仅在没有公开键 `maxQueuedBodyBytes` 时作为兼容回退。请求获得并发槽位、缓存事件回放完毕后，后续 body 由下游直接读取；成功、异常、等待超时、任务取消、客户端断开、热禁用及 FIFO handoff 都会归零 accounting，并关闭临时对象（Linux 匿名临时 inode、Windows 删除即关闭语义均由标准库处理）。
 
 ## 2.2 字段语义详解
 

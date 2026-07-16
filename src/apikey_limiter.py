@@ -8,10 +8,13 @@
   apiKeyConcurrency.enabled/defaultMaxConcurrent/defaultMaxQueue/defaultQueueWaitSeconds
   apiKeyConcurrency.defaultMaxRequestBodyBytes/defaultMaxRequestBodyEvents
   apiKeyConcurrency.defaultMaxQueuedBodyBytesPerKey/maxQueuedBodyBytes
+  apiKeyConcurrency.queuedBodySpoolThresholdBytes/queuedBodySpoolDirectory
+  apiKeyConcurrency.defaultMaxQueuedBodySpoolBytesPerKey/maxQueuedBodySpoolBytes
   (legacy maxQueuedBodyBytesTotal is accepted only as a fallback)
   apiKeys.<name>.limits may override the corresponding per-key/body defaults with
   enabled/maxConcurrent/maxQueue/queueWaitSeconds and
-  maxRequestBodyBytes/maxRequestBodyEvents/maxQueuedBodyBytes.
+  maxRequestBodyBytes/maxRequestBodyEvents/maxQueuedBodyBytes/
+  maxQueuedBodySpoolBytes.
 
 单 Key 的 limits.enabled 优先级高于全局 enabled；其它 limits 字段缺失 / null 时继承全局默认。
 """
@@ -19,9 +22,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
+import tempfile
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Request
@@ -48,6 +56,10 @@ class ResolvedLimits:
     max_request_body_events: int
     max_queued_body_bytes: int
     max_queued_body_bytes_total: int
+    queued_body_spool_threshold_bytes: int
+    max_queued_body_spool_bytes: int
+    max_queued_body_spool_bytes_total: int
+    queued_body_spool_directory: str
     enabled_source: str = "global"
     max_concurrent_source: str = "global"
     max_queue_source: str = "global"
@@ -83,6 +95,9 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_REQUEST_BODY_EVENTS = 1024
 DEFAULT_MAX_QUEUED_BODY_BYTES_PER_KEY = 32 * 1024 * 1024
 DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL = 128 * 1024 * 1024
+DEFAULT_QUEUED_BODY_SPOOL_THRESHOLD_BYTES = 1024 * 1024
+DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_PER_KEY = 512 * 1024 * 1024
+DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_TOTAL = 2 * 1024 * 1024 * 1024
 # Aggregate budgets include a conservative estimate for each retained ASGI dict.
 QUEUED_BODY_EVENT_OVERHEAD_BYTES = 1024
 
@@ -100,6 +115,9 @@ _IMAGE_BODY_ENVELOPE_BYTES = 1024 * 1024
 _queued_body_lock = asyncio.Lock()
 _queued_body_bytes_by_key: dict[str, int] = {}
 _queued_body_bytes_total = 0
+_queued_body_spool_bytes_by_key: dict[str, int] = {}
+_queued_body_spool_bytes_total = 0
+_active_body_guards: weakref.WeakSet[_BodyPreservingReceive] = weakref.WeakSet()
 
 
 class RequestBodyTooLarge(Exception):
@@ -124,6 +142,20 @@ class RequestBodyTooLarge(Exception):
         else:
             message = f"request body exceeds {self.max_bytes} bytes"
         super().__init__(message)
+
+
+class QueuedBodySpoolError(Exception):
+    """A queued request body could not be safely spooled."""
+
+
+@dataclass
+class _BufferedBodyEvent:
+    message_without_body: Message
+    had_body: bool
+    offset: int
+    body_bytes: int
+    memory_charge: int
+    spool_charge: int
 
 
 def _request_body_max_bytes(request: Request, limits: ResolvedLimits) -> int:
@@ -176,10 +208,15 @@ class _BodyPreservingReceive:
         self._raw_receive: Receive = request._receive
         self._key_name = key_name
         self._limits = limits
-        self._buffer: deque[tuple[Message, int]] = deque()
+        self._buffer: deque[_BufferedBodyEvent] = deque()
         self._buffered_bytes = 0
         self._buffered_events = 0
         self._reserved_bytes = 0
+        self._reserved_spool_bytes = 0
+        self._spool_size = 0
+        self._spool: Any | None = None
+        self._spooled_to_disk = False
+        self._guard_lock = asyncio.Lock()
         self._abandoned = False
 
     def validate_content_length(self) -> None:
@@ -213,17 +250,24 @@ class _BodyPreservingReceive:
 
     async def receive(self) -> Message:
         """Release accounting as each retained event is replayed, then go live."""
-        global _queued_body_bytes_total
-        async with _queued_body_lock:
+        async with self._guard_lock:
             if self._buffer:
-                message, charge = self._buffer.popleft()
-                self._reserved_bytes -= charge
-                _queued_body_bytes_total -= charge
-                key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0) - charge
-                if key_bytes > 0:
-                    _queued_body_bytes_by_key[self._key_name] = key_bytes
-                else:
-                    _queued_body_bytes_by_key.pop(self._key_name, None)
+                event = self._buffer.popleft()
+                try:
+                    body = await self._read_spooled_body(event)
+                except Exception as exc:
+                    await self._release_event_accounting(event)
+                    if not self._buffer:
+                        await self._close_spool()
+                    raise QueuedBodySpoolError(
+                        f"failed to replay queued request body: {exc}"
+                    ) from exc
+                await self._release_event_accounting(event)
+                message = dict(event.message_without_body)
+                if event.had_body:
+                    message["body"] = body
+                if not self._buffer:
+                    await self._close_spool()
                 return message
         message = await self._raw_receive()
         if message.get("type") == "http.request":
@@ -233,32 +277,254 @@ class _BodyPreservingReceive:
         return message
 
     async def _reserve(self, message: Message) -> None:
-        global _queued_body_bytes_total
         body_bytes = len(message.get("body", b""))
-        charge = body_bytes + QUEUED_BODY_EVENT_OVERHEAD_BYTES
         # Body events may arrive throughout a long queue wait. Resolve the
         # effective budgets for every event so config hot reloads take effect.
         limits = _resolve_limits(self._key_name)
-        async with _queued_body_lock:
+        async with self._guard_lock:
             if self._abandoned:
                 return
             self._limits = limits
             self._account_body_event(message, limits)
-            key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0)
-            if key_bytes + charge > limits.max_queued_body_bytes:
+            offset = self._spool_size
+            next_spool_size = offset + body_bytes
+            move_to_disk = (
+                self._spooled_to_disk
+                or next_spool_size > limits.queued_body_spool_threshold_bytes
+            )
+            existing_body_shift = (
+                self._spool_size if move_to_disk and not self._spooled_to_disk else 0
+            )
+            memory_charge = QUEUED_BODY_EVENT_OVERHEAD_BYTES
+            spool_charge = body_bytes if move_to_disk else 0
+            if not move_to_disk:
+                memory_charge += body_bytes
+
+            await self._reserve_accounting(
+                limits,
+                memory_delta=memory_charge - existing_body_shift,
+                spool_delta=spool_charge + existing_body_shift,
+            )
+            if existing_body_shift:
+                for buffered in self._buffer:
+                    buffered.memory_charge -= buffered.body_bytes
+                    buffered.spool_charge += buffered.body_bytes
+                self._reserved_bytes -= existing_body_shift
+                self._reserved_spool_bytes += existing_body_shift
+            self._reserved_bytes += memory_charge
+            self._reserved_spool_bytes += spool_charge
+            self._spool_size = next_spool_size
+            self._spooled_to_disk = move_to_disk
+
+            try:
+                if body_bytes:
+                    await self._write_spooled_body(
+                        message.get("body", b""),
+                        offset=offset,
+                        limits=limits,
+                        rollover=move_to_disk,
+                    )
+            except Exception as exc:
+                raise QueuedBodySpoolError(
+                    f"failed to spool queued request body: {exc}"
+                ) from exc
+
+            metadata = dict(message)
+            had_body = "body" in metadata
+            metadata.pop("body", None)
+            self._buffer.append(_BufferedBodyEvent(
+                message_without_body=metadata,
+                had_body=had_body,
+                offset=offset,
+                body_bytes=body_bytes,
+                memory_charge=memory_charge,
+                spool_charge=spool_charge,
+            ))
+
+    async def _reserve_accounting(
+        self,
+        limits: ResolvedLimits,
+        *,
+        memory_delta: int,
+        spool_delta: int,
+    ) -> None:
+        global _queued_body_bytes_total, _queued_body_spool_bytes_total
+        request_max = _request_body_max_bytes(self._request, limits)
+        one_request_memory = (
+            min(request_max, limits.queued_body_spool_threshold_bytes)
+            + limits.max_request_body_events * QUEUED_BODY_EVENT_OVERHEAD_BYTES
+        )
+        key_memory_budget = limits.max_queued_body_bytes
+        if key_memory_budget == DEFAULT_MAX_QUEUED_BODY_BYTES_PER_KEY:
+            key_memory_budget = max(key_memory_budget, one_request_memory)
+        process_memory_budget = limits.max_queued_body_bytes_total
+        if process_memory_budget == DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL:
+            process_memory_budget = max(process_memory_budget, one_request_memory)
+        key_spool_budget = limits.max_queued_body_spool_bytes
+        if key_spool_budget == DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_PER_KEY:
+            key_spool_budget = max(key_spool_budget, request_max)
+        process_spool_budget = limits.max_queued_body_spool_bytes_total
+        if process_spool_budget == DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_TOTAL:
+            process_spool_budget = max(process_spool_budget, request_max)
+        async with _queued_body_lock:
+            key_memory = _queued_body_bytes_by_key.get(self._key_name, 0)
+            key_spool = _queued_body_spool_bytes_by_key.get(self._key_name, 0)
+            if key_memory + memory_delta > key_memory_budget:
                 raise RequestBodyTooLarge(
-                    max_bytes=limits.max_queued_body_bytes,
+                    max_bytes=key_memory_budget,
                     reason="key_aggregate",
                 )
-            if _queued_body_bytes_total + charge > limits.max_queued_body_bytes_total:
+            if _queued_body_bytes_total + memory_delta > process_memory_budget:
                 raise RequestBodyTooLarge(
-                    max_bytes=limits.max_queued_body_bytes_total,
+                    max_bytes=process_memory_budget,
                     reason="process_aggregate",
                 )
-            self._buffer.append((message, charge))
-            self._reserved_bytes += charge
-            _queued_body_bytes_by_key[self._key_name] = key_bytes + charge
-            _queued_body_bytes_total += charge
+            if key_spool + spool_delta > key_spool_budget:
+                raise RequestBodyTooLarge(
+                    max_bytes=key_spool_budget,
+                    reason="key_aggregate",
+                )
+            if _queued_body_spool_bytes_total + spool_delta > process_spool_budget:
+                raise RequestBodyTooLarge(
+                    max_bytes=process_spool_budget,
+                    reason="process_aggregate",
+                )
+            _set_key_accounting(
+                _queued_body_bytes_by_key,
+                self._key_name,
+                key_memory + memory_delta,
+            )
+            _set_key_accounting(
+                _queued_body_spool_bytes_by_key,
+                self._key_name,
+                key_spool + spool_delta,
+            )
+            _queued_body_bytes_total += memory_delta
+            _queued_body_spool_bytes_total += spool_delta
+
+    def _open_spool(self, limits: ResolvedLimits) -> Any:
+        raw_directory = str(limits.queued_body_spool_directory or "").strip()
+        directory = Path(raw_directory) if raw_directory else Path(config.DATA_DIR) / "queued-body-spool"
+        if not directory.is_absolute():
+            directory = Path(config.DATA_DIR) / directory
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_stat = directory.lstat()
+        if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError("queued body spool path is not a real directory")
+        if directory_stat.st_uid != os.geteuid():
+            raise OSError("queued body spool directory has an unsafe owner")
+        os.chmod(directory, 0o700)
+        return tempfile.SpooledTemporaryFile(
+            max_size=max(0, limits.queued_body_spool_threshold_bytes),
+            mode="w+b",
+            dir=os.fspath(directory),
+            prefix="parrot-queued-body-",
+        )
+
+    async def _write_spooled_body(
+        self,
+        body: bytes,
+        *,
+        offset: int,
+        limits: ResolvedLimits,
+        rollover: bool,
+    ) -> None:
+        if self._spool is None:
+            self._spool = self._open_spool(limits)
+
+        def _write() -> None:
+            assert self._spool is not None
+            if rollover:
+                self._spool.rollover()
+            self._spool.seek(offset)
+            written = self._spool.write(body)
+            if written != len(body):
+                raise OSError(f"short spool write: {written}/{len(body)}")
+            self._spool.flush()
+
+        if rollover:
+            await self._run_blocking_io(_write)
+        else:
+            _write()
+
+    async def _read_spooled_body(self, event: _BufferedBodyEvent) -> bytes:
+        if event.body_bytes == 0:
+            return b""
+        if self._spool is None:
+            raise OSError("queued body spool is closed")
+
+        def _read() -> bytes:
+            assert self._spool is not None
+            self._spool.seek(event.offset)
+            body = self._spool.read(event.body_bytes)
+            if len(body) != event.body_bytes:
+                raise OSError(
+                    f"short spool read: {len(body)}/{event.body_bytes}"
+                )
+            return body
+
+        if self._spooled_to_disk:
+            return await self._run_blocking_io(_read)
+        return _read()
+
+    @staticmethod
+    async def _run_blocking_io(func):
+        """Let an in-flight fd operation finish before cancellation cleanup.
+
+        ``asyncio.to_thread`` cancellation only abandons the await; it cannot
+        stop the worker thread.  Waiting for that worker here prevents abandon()
+        from closing/reusing the descriptor while a read/write is still active.
+        """
+        task = asyncio.create_task(asyncio.to_thread(func))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _release_event_accounting(self, event: _BufferedBodyEvent) -> None:
+        global _queued_body_bytes_total
+        async with _queued_body_lock:
+            self._reserved_bytes -= event.memory_charge
+            _queued_body_bytes_total -= event.memory_charge
+            _set_key_accounting(
+                _queued_body_bytes_by_key,
+                self._key_name,
+                _queued_body_bytes_by_key.get(self._key_name, 0) - event.memory_charge,
+            )
+
+    async def _close_spool(self) -> None:
+        spool, self._spool = self._spool, None
+        close_error: Exception | None = None
+        try:
+            if spool is not None:
+                if self._spooled_to_disk:
+                    await self._run_blocking_io(spool.close)
+                else:
+                    spool.close()
+        except Exception as exc:
+            close_error = exc
+        finally:
+            # A rolled temporary file keeps its full allocation until close;
+            # releasing per-event disk accounting before this point would let
+            # physical usage exceed the configured process/key budget.
+            await self._release_spool_accounting()
+        if close_error is not None:
+            raise QueuedBodySpoolError(
+                f"failed to close queued request body spool: {close_error}"
+            ) from close_error
+
+    async def _release_spool_accounting(self) -> None:
+        global _queued_body_spool_bytes_total
+        async with _queued_body_lock:
+            spool_charge = self._reserved_spool_bytes
+            self._reserved_spool_bytes = 0
+            _queued_body_spool_bytes_total -= spool_charge
+            _set_key_accounting(
+                _queued_body_spool_bytes_by_key,
+                self._key_name,
+                _queued_body_spool_bytes_by_key.get(self._key_name, 0) - spool_charge,
+            )
 
     async def wait_for_disconnect(self) -> None:
         """Consume raw events while preserving every request-body event."""
@@ -282,19 +548,31 @@ class _BodyPreservingReceive:
     async def abandon(self) -> None:
         """Release all remaining reservations exactly once."""
         global _queued_body_bytes_total
-        async with _queued_body_lock:
+        async with self._guard_lock:
             if self._abandoned:
                 return
             self._abandoned = True
-            charge = self._reserved_bytes
+            memory_charge = self._reserved_bytes
             self._reserved_bytes = 0
             self._buffer.clear()
-            _queued_body_bytes_total -= charge
-            key_bytes = _queued_body_bytes_by_key.get(self._key_name, 0) - charge
-            if key_bytes > 0:
-                _queued_body_bytes_by_key[self._key_name] = key_bytes
-            else:
-                _queued_body_bytes_by_key.pop(self._key_name, None)
+            async with _queued_body_lock:
+                _queued_body_bytes_total -= memory_charge
+                _set_key_accounting(
+                    _queued_body_bytes_by_key,
+                    self._key_name,
+                    _queued_body_bytes_by_key.get(self._key_name, 0) - memory_charge,
+                )
+            try:
+                await self._close_spool()
+            finally:
+                _active_body_guards.discard(self)
+
+
+def _set_key_accounting(mapping: dict[str, int], key_name: str, value: int) -> None:
+    if value > 0:
+        mapping[key_name] = value
+    else:
+        mapping.pop(key_name, None)
 
 
 def _body_preserving_receive(
@@ -311,6 +589,7 @@ def _body_preserving_receive(
     # This is the only private Request hook used; see the class docstring.
     request._receive = guard.receive
     setattr(request, "_parrot_body_preserving_receive", guard)
+    _active_body_guards.add(guard)
     return guard
 
 
@@ -319,6 +598,16 @@ def _request_receive_guard(request: Request | None) -> _BodyPreservingReceive | 
         return None
     guard = getattr(request, "_parrot_body_preserving_receive", None)
     return guard if isinstance(guard, _BodyPreservingReceive) else None
+
+
+async def shutdown_spooling() -> None:
+    """Close and unaccount all queued body stores during application shutdown."""
+    guards = list(_active_body_guards)
+    if guards:
+        await asyncio.gather(
+            *(guard.abandon() for guard in guards),
+            return_exceptions=True,
+        )
 
 
 class ApiKeyLease:
@@ -407,6 +696,24 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         DEFAULT_MAX_QUEUED_BODY_BYTES_TOTAL,
         minimum=1,
     )
+    queued_body_spool_threshold_bytes = _as_int(
+        global_cfg.get("queuedBodySpoolThresholdBytes"),
+        DEFAULT_QUEUED_BODY_SPOOL_THRESHOLD_BYTES,
+        minimum=0,
+    )
+    global_queued_body_spool_bytes = _as_int(
+        global_cfg.get("defaultMaxQueuedBodySpoolBytesPerKey"),
+        DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_PER_KEY,
+        minimum=1,
+    )
+    max_queued_body_spool_bytes_total = _as_int(
+        global_cfg.get("maxQueuedBodySpoolBytes"),
+        DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_TOTAL,
+        minimum=1,
+    )
+    queued_body_spool_directory = str(
+        global_cfg.get("queuedBodySpoolDirectory") or ""
+    ).strip()
 
     entry = (cfg.get("apiKeys") or {}).get(key_name)
     limits = entry.get("limits") if isinstance(entry, dict) else None
@@ -456,6 +763,11 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         global_queued_body_bytes,
         minimum=1,
     )
+    max_queued_body_spool_bytes = _as_int(
+        limits.get("maxQueuedBodySpoolBytes"),
+        global_queued_body_spool_bytes,
+        minimum=1,
+    )
 
     return ResolvedLimits(
         enabled=enabled,
@@ -466,6 +778,10 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         max_request_body_events=max_request_body_events,
         max_queued_body_bytes=max_queued_body_bytes,
         max_queued_body_bytes_total=max_queued_body_bytes_total,
+        queued_body_spool_threshold_bytes=queued_body_spool_threshold_bytes,
+        max_queued_body_spool_bytes=max_queued_body_spool_bytes,
+        max_queued_body_spool_bytes_total=max_queued_body_spool_bytes_total,
+        queued_body_spool_directory=queued_body_spool_directory,
         enabled_source=enabled_source,
         max_concurrent_source=max_source,
         max_queue_source=queue_source,
@@ -671,7 +987,7 @@ async def _wait_for_turn_or_abort(
             # A watcher cancelled by admission may have already consumed an
             # event whose reservation then exceeded a budget.  Do not hide it.
             for result in cleanup_results:
-                if isinstance(result, RequestBodyTooLarge):
+                if isinstance(result, (RequestBodyTooLarge, QueuedBodySpoolError)):
                     raise result
 
 
@@ -683,7 +999,7 @@ async def _wait_http_disconnect(
     guard = _body_preserving_receive(request, key_name, limits)
     try:
         await guard.wait_for_disconnect()
-    except RequestBodyTooLarge:
+    except (RequestBodyTooLarge, QueuedBodySpoolError):
         raise
     except Exception:
         # A closed/broken ASGI receive channel is equivalent to disconnect.

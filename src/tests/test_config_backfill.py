@@ -68,6 +68,10 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["apiKeyConcurrency"]["defaultMaxRequestBodyEvents"] == 4096
             assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodyBytesPerKey"] == 32 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["maxQueuedBodyBytes"] == 128 * 1024 * 1024
+            assert cfg["apiKeyConcurrency"]["queuedBodySpoolThresholdBytes"] == 1024 * 1024
+            assert cfg["apiKeyConcurrency"]["queuedBodySpoolDirectory"] == ""
+            assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodySpoolBytesPerKey"] == 512 * 1024 * 1024
+            assert cfg["apiKeyConcurrency"]["maxQueuedBodySpoolBytes"] == 2 * 1024 * 1024 * 1024
 
         # 旧路径保留，不删除用户原配置，方便兼容和人工核对。
         assert saved["oauth"]["providers"]["openai"]["defaultModels"] == ["legacy-model"]
