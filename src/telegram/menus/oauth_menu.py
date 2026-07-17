@@ -2485,6 +2485,8 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "已清本地配额禁用")
     elif action == "cleared_runtime_state":
         ui.answer_cb(cb_id, "已清理本地配额/冷却状态")
+    elif action == "reset_failed":
+        ui.answer_cb(cb_id, "重置失败，账号保持禁用")
     elif action == "noop_user":
         ui.answer_cb(cb_id, "手动禁用不自动重置")
     elif action == "noop_auth_error":
@@ -2493,10 +2495,24 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "无需重置")
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
     if text:
-        prefix = "♻️ <b>已清理本地配额禁用</b>\n"
         if action == "reset":
-            prefix += "已清除该账号的 quota 禁用、模型冷却和本地 quota 缓存；下一次真实请求/刷新会重新采样。\n\n"
+            prefix = (
+                "♻️ <b>已清理本地配额禁用</b>\n"
+                "已清除该账号的 quota 禁用、模型冷却和本地 quota 缓存；"
+                "下一次真实请求/刷新会重新采样。\n\n"
+            )
             ui.edit(chat_id, message_id, prefix + text, reply_markup=kb)
+        elif action == "reset_failed":
+            if result.get("required_state_cleared"):
+                detail = "本地阻断已清，但账号启用未能持久化；账号仍保持禁用。"
+            else:
+                detail = "至少一项本地配额/冷却状态未能持久化清除；账号仍保持禁用。"
+            ui.edit(
+                chat_id,
+                message_id,
+                f"⚠️ <b>本地配额重置失败</b>\n{detail}\n\n" + text,
+                reply_markup=kb,
+            )
         else:
             ui.edit(chat_id, message_id, text, reply_markup=kb)
 

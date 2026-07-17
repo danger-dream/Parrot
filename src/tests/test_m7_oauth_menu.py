@@ -524,9 +524,54 @@ def test_reset_quota_button_and_callback(m):
     assert acc_after.get("disabled_reason") is None
     assert m["state_db"].quota_load(ak) is None
     assert not m["cooldown"].is_blocked(f"oauth:{ak}", "claude-reset-model")
+    answer = rec.last("answerCallbackQuery")
+    assert answer and answer.get("text") == "已清本地配额禁用"
     updated = rec.last("editMessageText")
     assert updated and "已清理本地配额禁用" in updated["text"]
     print("  [PASS] local reset quota button clears quota-disabled/cache/cooldown")
+
+
+def test_reset_quota_failure_callback_never_claims_success(m, monkeypatch):
+    _setup(m)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    email = "quota-failure@x.com"
+    _add_fake_account(m, email, enabled=False, disabled_reason="quota", disabled_until=future)
+    ak = _account_key_for(m, email)
+    m["state_db"].quota_save(
+        ak,
+        {
+            "fetched_at": m["state_db"].now_ms(),
+            "five_hour_util": 99.0,
+            "five_hour_reset": future,
+            "seven_day_util": 20.0,
+            "raw_data": "{}",
+        },
+        email=email,
+    )
+    m["cooldown"].record_error(
+        f"oauth:{ak}", "claude-reset-model", "quota",
+        cooldown_until=m["state_db"].now_ms() + 600_000,
+    )
+
+    rec = _install_recorder(m)
+    short = m["ui"].register_code(ak)
+    monkeypatch.setattr(
+        m["state_db"], "quota_delete",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic quota_delete failure")
+        ),
+    )
+
+    m["oauth_menu"].on_reset_quota(42, 100, "cb-reset-fail", short)
+
+    account = m["oauth_manager"].get_account(ak)
+    assert account["enabled"] is False and account["disabled_reason"] == "quota"
+    answer = rec.last("answerCallbackQuery")
+    assert answer and "失败" in answer.get("text", ""), answer
+    assert "已清" not in answer.get("text", "")
+    updated = rec.last("editMessageText")
+    assert updated and "重置失败" in updated["text"], updated
+    assert "已清理本地配额禁用" not in updated["text"]
 
 
 def test_quota_window_since_uses_reset_minus_window_with_fallback(m):

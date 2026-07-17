@@ -214,11 +214,13 @@ def _was_actively_blocked(state: dict, now: int) -> bool:
     return cd == _INF or cd > now
 
 
-def clear(channel_key: str, model: Optional[str] = None) -> None:
+def clear(channel_key: str, model: Optional[str] = None, *,
+          notify_recovered: bool = True) -> None:
     """清除冷却。model=None 清该 channel 下所有模型。
 
-    对每个清除前真的在冷却的条目，触发"channel_recovered"事件通知（避免每次成功
-    都报一次"恢复"——只有从"被锁中"变成"未锁"才算恢复）。
+    对每个清除前真的在冷却的条目，默认触发 ``channel_recovered`` 事件。
+    调用方若还要提交更高层状态（例如先清 cooldown 再持久化启用 OAuth 账号），
+    可用 ``notify_recovered=False`` 抑制这个中间态通知，由最终提交点统一回执。
     """
     now = _now_ms()
     recovered: list[tuple[str, str, bool]] = []   # (ck, model, was_permanent)
@@ -238,14 +240,15 @@ def clear(channel_key: str, model: Optional[str] = None) -> None:
         for k in keys:
             _entries.pop(k, None)
 
-    ek = notifier.escape_html
-    for ck, mdl, was_perm in recovered:
-        tag = "永久冻结" if was_perm else "冷却"
-        notifier.notify_event(
-            "channel_recovered",
-            f"✅ <b>渠道恢复</b>（从{tag}中）\n"
-            f"渠道: <code>{ek(ck)}</code> ({ek(mdl)})",
-        )
+    if notify_recovered:
+        ek = notifier.escape_html
+        for ck, mdl, was_perm in recovered:
+            tag = "永久冻结" if was_perm else "冷却"
+            notifier.notify_event(
+                "channel_recovered",
+                f"✅ <b>渠道恢复</b>（从{tag}中）\n"
+                f"渠道: <code>{ek(ck)}</code> ({ek(mdl)})",
+            )
 
 
 def clear_all() -> None:

@@ -25,9 +25,12 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import json
 import sys
 import time
 import traceback
+
+import pytest
 
 
 def _import_modules():
@@ -650,11 +653,150 @@ def test_manual_reset_quota_clears_local_quota_cache_and_cooldown(m):
 
     acc_after = m["oauth_manager"].get_account(ak)
     assert result["action"] == "reset", result
+    assert result["required_state_cleared"] is True, result
     assert acc_after.get("disabled_reason") is None
     assert acc_after["enabled"] is True
     assert m["state_db"].quota_load(ak) is None
     assert not m["cooldown"].is_blocked(f"oauth:{ak}", "gpt-5-codex")
     print("  [PASS] openai: manual reset clears local quota-disabled/cache/cooldown state")
+
+
+def test_manual_reset_commits_required_clears_before_enable(m, monkeypatch):
+    _setup(m)
+    email = "manual-reset-order@o.io"
+    _add_openai(m, email)
+    ak = f"openai:{email}:acct-123"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+    m["state_db"].quota_save(
+        ak, {"fetched_at": m["state_db"].now_ms(), "five_hour_util": 99.0},
+        email=email,
+    )
+    m["cooldown"].record_error(
+        f"oauth:{ak}", "gpt-5-codex", "quota",
+        cooldown_until=m["state_db"].now_ms() + 600_000,
+    )
+
+    original_error_delete = m["state_db"].error_delete
+    original_quota_delete = m["state_db"].quota_delete
+    original_write = m["config"]._write_atomic
+    order = []
+
+    def observed_error_delete(*args, **kwargs):
+        order.append("cooldown_delete")
+        return original_error_delete(*args, **kwargs)
+
+    def observed_quota_delete(*args, **kwargs):
+        order.append("quota_delete")
+        return original_quota_delete(*args, **kwargs)
+
+    def observed_write(candidate):
+        target = next(
+            acc for acc in candidate.get("oauthAccounts", [])
+            if acc.get("email") == email
+        )
+        if target.get("enabled") is True:
+            order.append("enable_write")
+        return original_write(candidate)
+
+    with monkeypatch.context() as observed:
+        observed.setattr(m["state_db"], "error_delete", observed_error_delete)
+        observed.setattr(m["state_db"], "quota_delete", observed_quota_delete)
+        observed.setattr(m["config"], "_write_atomic", observed_write)
+        result = m["oauth_manager"].reset_quota(ak)
+
+    assert result["action"] == "reset", result
+    assert order == ["cooldown_delete", "quota_delete", "enable_write"], order
+
+
+def _disk_account(config, email):
+    with open(config.path(), "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return next(acc for acc in raw.get("oauthAccounts", []) if acc.get("email") == email)
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "expected_error", "cooldown_remains", "quota_remains"),
+    [
+        ("error_delete", "runtime_state_clear_failed", True, False),
+        ("quota_delete", "runtime_state_clear_failed", False, True),
+        ("set_enabled", "account_enable_failed", False, False),
+    ],
+)
+def test_manual_reset_quota_persistence_failures_are_fail_closed(
+    m, monkeypatch, failure_point, expected_error, cooldown_remains, quota_remains,
+):
+    _setup(m)
+    email = f"manual-reset-{failure_point}@o.io"
+    _add_openai(m, email)
+    ak = f"openai:{email}:acct-123"
+    channel_key = f"oauth:{ak}"
+    model = "gpt-5-codex"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    m["oauth_manager"].set_disabled_by_quota(ak, future)
+    m["state_db"].quota_save(
+        ak,
+        {
+            "fetched_at": m["state_db"].now_ms(),
+            "five_hour_util": 99.0,
+            "five_hour_reset": future,
+            "seven_day_util": 20.0,
+        },
+        email=email,
+    )
+    m["cooldown"].record_error(
+        channel_key, model, "quota",
+        cooldown_until=m["state_db"].now_ms() + 600_000,
+    )
+
+    original_write = m["config"]._write_atomic
+    notices = []
+    monkeypatch.setattr(
+        m["cooldown"].notifier, "notify_event",
+        lambda event, *args, **kwargs: notices.append(event),
+    )
+    with monkeypatch.context() as fault:
+        if failure_point == "error_delete":
+            fault.setattr(
+                m["state_db"], "error_delete",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("synthetic error_delete failure")
+                ),
+            )
+        elif failure_point == "quota_delete":
+            fault.setattr(
+                m["state_db"], "quota_delete",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("synthetic quota_delete failure")
+                ),
+            )
+        else:
+            def fail_enabling_candidate(candidate):
+                target = next(
+                    acc for acc in candidate.get("oauthAccounts", [])
+                    if acc.get("email") == email
+                )
+                if target.get("enabled") is True:
+                    raise OSError("synthetic config enable persistence failure")
+                return original_write(candidate)
+
+            fault.setattr(m["config"], "_write_atomic", fail_enabling_candidate)
+
+        result = m["oauth_manager"].reset_quota(ak)
+
+    assert result["action"] == "reset_failed", result
+    assert result["error_code"] == expected_error, result
+    assert result["required_state_cleared"] is (failure_point == "set_enabled"), result
+    assert notices == []
+    current = m["oauth_manager"].get_account(ak)
+    assert current["enabled"] is False and current["disabled_reason"] == "quota"
+    disk = _disk_account(m["config"], email)
+    assert disk["enabled"] is False and disk["disabled_reason"] == "quota"
+    m["config"].reload()
+    reloaded = m["oauth_manager"].get_account(ak)
+    assert reloaded["enabled"] is False and reloaded["disabled_reason"] == "quota"
+    assert m["cooldown"].is_blocked(channel_key, model) is cooldown_remains
+    assert (m["state_db"].quota_load(ak) is not None) is quota_remains
 
 # ==============================================================
 # main

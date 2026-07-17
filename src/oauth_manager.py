@@ -1486,7 +1486,9 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             # cooldown clear itself is DB-first, so a failed delete leaves the
             # current process and a restarted process consistently blocked.
             runtime_state = _clear_oauth_runtime_state(
-                account_key, clear_quota_cache=False,
+                account_key,
+                clear_quota_cache=False,
+                notify_recovered=False,
             )
             if not runtime_state.get("required_state_cleared"):
                 print(
@@ -2026,12 +2028,15 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
     set_enabled(account_key, False, reason="quota", disabled_until=resets_at)
 
 
-def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> dict:
+def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
+                               notify_recovered: bool = True) -> dict:
     """Clear local runtime state for one OAuth channel.
 
     `clear_quota_cache=False` preserves the fresh quota row used to prove
     recovery. ``required_state_cleared`` is true only when every persistent
-    state required for routing recovery was committed successfully.
+    state required for routing recovery was committed successfully. Callers
+    which must persist a later account-enable commit pass ``notify_recovered=False``
+    so clearing an intermediate blocker cannot emit a false recovery notice.
     """
     ch_key = f"oauth:{canonical}"
     out = {
@@ -2042,7 +2047,9 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> di
     }
     try:
         from . import cooldown
-        cooldown.clear(ch_key, model=None)
+        cooldown.clear(
+            ch_key, model=None, notify_recovered=notify_recovered,
+        )
         out["cooldown_cleared"] = True
     except Exception as exc:
         out["cooldown_error"] = type(exc).__name__
@@ -2078,7 +2085,8 @@ def reset_quota(account_key: str) -> dict:
     This mirrors CLIProxyAPI's ResetQuota semantics: it does not reset upstream
     limits, but clears Parrot's local quota-disabled state and model cooldown so
     the account can participate in routing again. User-disabled and auth_error
-    accounts are intentionally left untouched.
+    accounts are intentionally left untouched. A quota-disabled account is only
+    enabled after every required local blocker was durably cleared.
     """
     acc = get_account(account_key)
     if acc is None:
@@ -2090,11 +2098,40 @@ def reset_quota(account_key: str) -> dict:
         return {"action": f"noop_{reason}", "account_key": canonical,
                 "disabled_reason": reason}
 
-    action = "reset" if reason == "quota" else "cleared_runtime_state"
-    if reason == "quota":
-        set_enabled(canonical, True)
+    # For quota-disabled accounts, TG is the final success receipt. Suppress the
+    # lower-level channel recovery notice until the account-enable commit exists;
+    # on failure there must be no recovery signal at all.
+    runtime = _clear_oauth_runtime_state(
+        canonical,
+        clear_quota_cache=True,
+        notify_recovered=reason != "quota",
+    )
+    if not runtime.get("required_state_cleared"):
+        return {
+            "action": "reset_failed",
+            "error_code": "runtime_state_clear_failed",
+            "account_key": canonical,
+            "disabled_reason": reason,
+            **runtime,
+        }
 
-    runtime = _clear_oauth_runtime_state(canonical, clear_quota_cache=True)
+    if reason == "quota":
+        try:
+            set_enabled(canonical, True)
+        except Exception as exc:
+            print(f"[oauth] reset quota enable failed for {canonical}: {exc}")
+            return {
+                "action": "reset_failed",
+                "error_code": "account_enable_failed",
+                "enable_error": type(exc).__name__,
+                "account_key": canonical,
+                "disabled_reason": reason,
+                **runtime,
+            }
+        action = "reset"
+    else:
+        action = "cleared_runtime_state"
+
     return {"action": action, "account_key": canonical,
             "disabled_reason": reason, **runtime}
 

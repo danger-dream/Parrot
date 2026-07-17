@@ -25,6 +25,7 @@ _ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(
 from src.tests import _isolation
 _isolation.isolate()
 
+import json
 import os
 import sys
 import time
@@ -747,6 +748,12 @@ def _low_wham(**openai_overrides):
     }
 
 
+def _disk_account(config, email):
+    with open(config.path(), "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return next(acc for acc in raw.get("oauthAccounts", []) if acc.get("email") == email)
+
+
 def test_fresh_openai_recovery_clears_runtime_but_preserves_fresh_quota(m):
     """A real recovery must unblock routing without deleting the new WHAM row."""
     from src import cooldown
@@ -858,6 +865,119 @@ def test_fresh_openai_recovery_delete_failure_is_fail_closed_and_not_notified(
     original_delete(channel_key, None)
     cooldown._entries.clear()
     print("  [PASS] failed cooldown delete stays disabled/current+reload/no notify")
+
+
+def test_fresh_openai_recovery_enable_write_failure_stays_disabled_and_silent(
+    m, monkeypatch,
+):
+    """Real set_enabled/config failure must not publish enable or recovery notices."""
+    import asyncio
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-enable-failure@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    cooldown.record_error(
+        channel_key, "gpt-test", "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    usage = _low_wham()
+
+    async def fetch_usage(_account_key):
+        return usage
+
+    original_write = m["config"]._write_atomic
+
+    def fail_enabling_candidate(candidate):
+        target = next(
+            acc for acc in candidate.get("oauthAccounts", [])
+            if acc.get("email") == email
+        )
+        if target.get("enabled") is True:
+            raise OSError("synthetic config enable persistence failure")
+        return original_write(candidate)
+
+    evaluated = []
+    real_evaluate = m["oauth_manager"].evaluate_and_toggle_by_usage
+
+    def capture_evaluate(*args, **kwargs):
+        result = real_evaluate(*args, **kwargs)
+        evaluated.append(result)
+        return result
+
+    notices = []
+    with monkeypatch.context() as fault:
+        fault.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+        fault.setattr(m["oauth_manager"], "evaluate_and_toggle_by_usage", capture_evaluate)
+        fault.setattr(m["config"], "_write_atomic", fail_enabling_candidate)
+        fault.setattr(
+            cooldown.notifier, "notify_event",
+            lambda event, *args, **kwargs: notices.append(event),
+        )
+        fault.setattr(
+            m["oauth_manager"].notifier, "throttled_notify_event_sync",
+            lambda event, *args, **kwargs: notices.append(event),
+        )
+        outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+
+    result = evaluated[0]
+    assert outcomes[email] == "resume_failed", outcomes
+    assert result["action"] == "resume_failed", result
+    assert result["error_code"] == "account_enable_failed", result
+    assert result["runtime_state"]["required_state_cleared"] is True, result
+    assert notices == []
+    current = m["oauth_manager"].get_account(key)
+    assert current["enabled"] is False and current["disabled_reason"] == "quota"
+    disk = _disk_account(m["config"], email)
+    assert disk["enabled"] is False and disk["disabled_reason"] == "quota"
+    m["config"].reload()
+    reloaded = m["oauth_manager"].get_account(key)
+    assert reloaded["enabled"] is False and reloaded["disabled_reason"] == "quota"
+
+
+def test_fresh_openai_recovery_notifies_once_only_after_durable_enable(m, monkeypatch):
+    """Monitor success emits one quota_resumed after live and disk are enabled."""
+    import asyncio
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-enable-success@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    cooldown.record_error(
+        channel_key, "gpt-test", "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    usage = _low_wham()
+
+    async def fetch_usage(_account_key):
+        return usage
+
+    notices = []
+
+    def capture_notice(event, *args, **kwargs):
+        current = m["oauth_manager"].get_account(key)
+        disk = _disk_account(m["config"], email)
+        notices.append((event, current.get("enabled"), disk.get("enabled")))
+
+    with monkeypatch.context() as fault:
+        fault.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+        fault.setattr(cooldown.notifier, "notify_event", capture_notice)
+        fault.setattr(
+            m["oauth_manager"].notifier, "throttled_notify_event_sync", capture_notice,
+        )
+        outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+
+    assert outcomes[email] == "resumed", outcomes
+    assert notices == [("quota_resumed", True, True)], notices
+    assert not cooldown.is_blocked(channel_key, "gpt-test")
+    m["config"].reload()
+    assert m["oauth_manager"].get_account(key)["enabled"] is True
 
 
 def test_cooldown_record_then_clear_is_linearized_across_db_and_memory(m, monkeypatch):
