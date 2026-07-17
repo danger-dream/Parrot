@@ -122,7 +122,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     now = _now_ms()
 
     with _lock:
-        state = _entries.get((channel_key, model)) or {
+        existing = _entries.get((channel_key, model))
+        state = dict(existing) if existing is not None else {
             "error_count": 0,
             "cooldown_until": None,
             "last_error_message": None,
@@ -185,10 +186,12 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         state["last_error_message"] = message
         state["first_error_at"] = first_error_at
         state["last_advance_at"] = last_advance_at
+        # Persist before publishing the copied state, while holding the same
+        # lock used by clear(). This makes record and clear linearisable and a
+        # failed save cannot create a memory-only cooldown.
+        state_db.error_save(channel_key, model, new_count, cooldown_until, message)
         _entries[(channel_key, model)] = state
         result = dict(state)
-
-    state_db.error_save(channel_key, model, new_count, cooldown_until, message)
 
     if just_became_permanent:
         ek = notifier.escape_html

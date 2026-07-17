@@ -860,6 +860,160 @@ def test_fresh_openai_recovery_delete_failure_is_fail_closed_and_not_notified(
     print("  [PASS] failed cooldown delete stays disabled/current+reload/no notify")
 
 
+def test_cooldown_record_then_clear_is_linearized_across_db_and_memory(m, monkeypatch):
+    """clear cannot slip between record_error persistence and memory publish."""
+    import threading
+    from src import cooldown
+
+    _setup(m)
+    channel_key = "oauth:openai:record-before-clear@test:acct-rbc"
+    model = "gpt-test"
+    cooldown._entries.clear()
+    original_save = m["state_db"].error_save
+    original_delete = m["state_db"].error_delete
+    original_delete(channel_key, None)
+    save_entered = threading.Event()
+    allow_save = threading.Event()
+    delete_called = threading.Event()
+    errors = []
+
+    def delayed_save(*args, **kwargs):
+        save_entered.set()
+        assert allow_save.wait(2)
+        return original_save(*args, **kwargs)
+
+    def observed_delete(*args, **kwargs):
+        delete_called.set()
+        return original_delete(*args, **kwargs)
+
+    def run(call):
+        try:
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(m["state_db"], "error_save", delayed_save)
+    monkeypatch.setattr(m["state_db"], "error_delete", observed_delete)
+    monkeypatch.setattr(cooldown.notifier, "notify_event", lambda *a, **kw: None)
+    record = threading.Thread(target=lambda: run(lambda: cooldown.record_error(
+        channel_key, model, "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )))
+    record.start()
+    assert save_entered.wait(2)
+    clear = threading.Thread(target=lambda: run(lambda: cooldown.clear(channel_key)))
+    clear.start()
+    clear.join(0.05)
+    assert clear.is_alive()
+    assert not delete_called.is_set()
+    allow_save.set()
+    record.join(2)
+    clear.join(2)
+    assert not record.is_alive() and not clear.is_alive() and errors == []
+    assert cooldown.get_state(channel_key, model) is None
+    assert m["state_db"].error_load(channel_key, model) is None
+
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert not cooldown.is_blocked(channel_key, model)
+    monkeypatch.setattr(m["state_db"], "error_save", original_save)
+    monkeypatch.setattr(m["state_db"], "error_delete", original_delete)
+    print("  [PASS] record commit linearizes before clear; reload stays clear")
+
+
+def test_cooldown_clear_then_new_record_is_consistent_after_reload(m, monkeypatch):
+    """A genuinely new error after clear is present in both memory and DB."""
+    import threading
+    from src import cooldown
+
+    _setup(m)
+    channel_key = "oauth:openai:clear-before-record@test:acct-cbr"
+    model = "gpt-test"
+    cooldown._entries.clear()
+    original_save = m["state_db"].error_save
+    original_delete = m["state_db"].error_delete
+    original_delete(channel_key, None)
+    cooldown.record_error(
+        channel_key, model, "old",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
+    save_called = threading.Event()
+    errors = []
+
+    def delayed_delete(*args, **kwargs):
+        delete_entered.set()
+        assert allow_delete.wait(2)
+        return original_delete(*args, **kwargs)
+
+    def observed_save(*args, **kwargs):
+        save_called.set()
+        return original_save(*args, **kwargs)
+
+    def run(call):
+        try:
+            call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(m["state_db"], "error_delete", delayed_delete)
+    monkeypatch.setattr(m["state_db"], "error_save", observed_save)
+    monkeypatch.setattr(cooldown.notifier, "notify_event", lambda *a, **kw: None)
+    clear = threading.Thread(target=lambda: run(lambda: cooldown.clear(channel_key)))
+    clear.start()
+    assert delete_entered.wait(2)
+    record = threading.Thread(target=lambda: run(lambda: cooldown.record_error(
+        channel_key, model, "new",
+        cooldown_until=m["state_db"].now_ms() + 120_000,
+    )))
+    record.start()
+    record.join(0.05)
+    assert record.is_alive()
+    assert not save_called.is_set()
+    allow_delete.set()
+    clear.join(2)
+    record.join(2)
+    assert not clear.is_alive() and not record.is_alive() and errors == []
+    assert cooldown.is_blocked(channel_key, model)
+    assert m["state_db"].error_load(channel_key, model) is not None
+
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert cooldown.is_blocked(channel_key, model)
+    monkeypatch.setattr(m["state_db"], "error_save", original_save)
+    monkeypatch.setattr(m["state_db"], "error_delete", original_delete)
+    original_delete(channel_key, None)
+    cooldown._entries.clear()
+    print("  [PASS] clear linearizes before a new record; reload keeps new block")
+
+
+def test_cooldown_error_save_failure_does_not_publish_memory_state(m, monkeypatch):
+    import pytest
+    from src import cooldown
+
+    _setup(m)
+    channel_key = "oauth:openai:save-failure@test:acct-save"
+    model = "gpt-test"
+    cooldown._entries.clear()
+    m["state_db"].error_delete(channel_key, None)
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("synthetic state DB save failure")
+
+    monkeypatch.setattr(m["state_db"], "error_save", fail_save)
+    with pytest.raises(RuntimeError, match="synthetic state DB save failure"):
+        cooldown.record_error(
+            channel_key, model, "429",
+            cooldown_until=m["state_db"].now_ms() + 60_000,
+        )
+    assert cooldown.get_state(channel_key, model) is None
+    assert m["state_db"].error_load(channel_key, model) is None
+    print("  [PASS] failed error_save publishes neither DB nor memory state")
+
+
 def test_non_genuine_openai_recovery_never_clears_runtime(m):
     """Stale, unknown and still-over-limit observations must leave cooldowns intact."""
     from src import cooldown
