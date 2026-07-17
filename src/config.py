@@ -101,8 +101,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaultMaxConcurrent": 5,
         "defaultMaxQueue": 50,
         "defaultQueueWaitSeconds": 1800,
-        # 排队期间 disconnect watcher 会预读并回放请求体。小 body 留内存；
-        # 超过阈值后落到有界临时文件，避免合法图片 body 长时间驻留内存。
+        # 排队期间 disconnect watcher 会预读并回放请求体；以下单请求字节/事件
+        # 上限只约束该 replay 资源。非排队核心 API 保持各协议入口原有契约；图片
+        # 入口另按 maxInputImageBytes 和 multipart/JSON 形态执行 endpoint 上限。
         "defaultMaxRequestBodyBytes": 8388608,
         "defaultMaxRequestBodyEvents": 4096,
         "defaultMaxQueuedBodyBytesPerKey": 33554432,

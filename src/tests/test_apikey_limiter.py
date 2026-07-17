@@ -137,8 +137,10 @@ async def test_queued_disconnect_watch_preserves_unread_request_body():
     await asyncio.wait_for(body_seen_by_watcher.wait(), timeout=1)
     await first.release()
     second = await asyncio.wait_for(queued, timeout=1)
+    assert second.receive is not None
 
-    body = await asyncio.wait_for(request.body(), timeout=1)
+    downstream_request = Request(request.scope, second.receive)
+    body = await asyncio.wait_for(downstream_request.body(), timeout=1)
     assert body == b'{"model":"gpt-test","input":"hello"}'
     assert apikey_limiter._queued_body_bytes_total == 0
     await second.release()
@@ -207,13 +209,22 @@ async def test_fastapi_middleware_replays_queued_chunked_body_end_to_end():
     release_first = asyncio.Event()
     second_body_sent = asyncio.Event()
 
-    @app.middleware("http")
-    async def limit_requests(request: Request, call_next):
-        lease = await apikey_limiter.acquire("k", request)
-        try:
-            return await call_next(request)
-        finally:
-            await lease.release()
+    class LimitRequests:
+        def __init__(self, downstream):
+            self.downstream = downstream
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http":
+                await self.downstream(scope, receive, send)
+                return
+            request = Request(scope, receive=receive)
+            lease = await apikey_limiter.acquire("k", request, receive=receive)
+            try:
+                await self.downstream(scope, lease.receive or receive, send)
+            finally:
+                await lease.release()
+
+    app.add_middleware(LimitRequests)
 
     @app.post("/echo")
     async def echo(request: Request):
@@ -793,7 +804,7 @@ def test_compat_image_contract_covers_multi_image_and_mask(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nonqueued_chunked_body_uses_same_total_byte_contract(monkeypatch):
+async def test_nonqueued_core_chunked_body_is_not_replay_limited(monkeypatch):
     current = _cfg()
     current["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] = 5
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: current)
@@ -808,20 +819,20 @@ async def test_nonqueued_chunked_body_uses_same_total_byte_contract(monkeypatch)
     request = Request(
         {
             "type": "http", "method": "POST", "path": "/v1/responses",
-            # Deliberately false-low: streamed bytes remain authoritative.
+            # Deliberately false-low: queue replay limits must not become a
+            # nonqueued core protocol cap.
             "headers": [(b"content-length", b"1")],
         },
         receive,
     )
     lease = await apikey_limiter.acquire("k", request)
-    with pytest.raises(apikey_limiter.RequestBodyTooLarge) as exc_info:
-        await request.body()
-    assert exc_info.value.reason == "request_bytes"
+    assert lease.receive is None
+    assert await request.body() == b"123456"
     await lease.release()
 
 
 @pytest.mark.asyncio
-async def test_nonqueued_body_event_count_uses_same_contract(monkeypatch):
+async def test_nonqueued_core_event_count_is_not_replay_limited(monkeypatch):
     current = _cfg()
     current["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] = 100
     current["apiKeyConcurrency"]["defaultMaxRequestBodyEvents"] = 1
@@ -839,9 +850,8 @@ async def test_nonqueued_body_event_count_uses_same_contract(monkeypatch):
         receive,
     )
     lease = await apikey_limiter.acquire("k", request)
-    with pytest.raises(apikey_limiter.RequestBodyTooLarge) as exc_info:
-        await request.body()
-    assert exc_info.value.reason == "event_count"
+    assert lease.receive is None
+    assert await request.body() == b"ab"
     await lease.release()
 
 
@@ -859,10 +869,9 @@ def _assert_spool_clean(tmp_path, request: Request | None = None) -> None:
     assert apikey_limiter._queued_body_spool_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_by_key == {}
     assert list(Path(tmp_path).iterdir()) == []
-    if request is not None:
-        guard = apikey_limiter._request_receive_guard(request)
-        assert guard is not None
-        assert guard._spool is None
+    # Receive ownership is no longer stored on a Starlette Request. A complete
+    # cleanup therefore has no retained guard in the global shutdown registry.
+    assert len(apikey_limiter._active_body_guards) == 0
 
 
 @pytest.mark.asyncio
@@ -895,13 +904,14 @@ async def test_spool_disk_budget_stays_reserved_until_file_is_closed(monkeypatch
     await _wait_for_spool_bytes(sum(map(len, chunks)))
     await active.release()
     lease = await asyncio.wait_for(queued, timeout=1)
+    assert lease.receive is not None
 
-    first = await request.receive()
+    first = await lease.receive()
     assert first["body"] == chunks[0]
     # The backing file still contains both events, so its whole allocation must
     # continue to count even though the first event has been handed downstream.
     assert apikey_limiter._queued_body_spool_bytes_total == sum(map(len, chunks))
-    second = await request.receive()
+    second = await lease.receive()
     assert second["body"] == chunks[1]
     assert apikey_limiter._queued_body_spool_bytes_total == 0
     await lease.release()

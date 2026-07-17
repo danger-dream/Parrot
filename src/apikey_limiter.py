@@ -109,6 +109,14 @@ QUEUED_BODY_EVENT_OVERHEAD_BYTES = 1024
 # budgets below.
 _COMPAT_IMAGE_EDIT_PATHS = frozenset({"/v1/images/edits", "/images/edits"})
 _SINGLE_IMAGE_EDIT_PATHS = frozenset({"/v1/images/edit"})
+_IMAGE_PROTOCOL_BODY_PATHS = frozenset({
+    "/v1/images/generate",
+    "/v1/images/edit",
+    "/v1/images/generations",
+    "/images/generations",
+    "/v1/images/edits",
+    "/images/edits",
+})
 _OPENAI_MAX_EDIT_IMAGES = 16
 _IMAGE_BODY_ENVELOPE_BYTES = 1024 * 1024
 
@@ -145,7 +153,26 @@ class RequestBodyTooLarge(Exception):
 
 
 class QueuedBodySpoolError(Exception):
-    """A queued request body could not be safely spooled."""
+    """A queued request body could not be safely spooled.
+
+    The exception text is deliberately stable and contains no OS error detail.
+    Callers may return it to clients without exposing configured paths.
+    """
+
+    def __init__(self, *, operation: str = "io"):
+        self.operation = str(operation or "io")
+        super().__init__("queued request body spool is temporarily unavailable")
+
+
+def _spool_failure(operation: str, exc: BaseException) -> QueuedBodySpoolError:
+    """Log bounded, non-secret diagnostics and return a stable client error."""
+    errno = getattr(exc, "errno", None)
+    errno_text = f" errno={errno}" if isinstance(errno, int) else ""
+    print(
+        f"[apikey_limiter] queued body spool {operation} failed "
+        f"type={type(exc).__name__}{errno_text}"
+    )
+    return QueuedBodySpoolError(operation=operation)
 
 
 @dataclass
@@ -196,16 +223,18 @@ def _request_body_max_bytes(request: Request, limits: ResolvedLimits) -> int:
 
 
 class _BodyPreservingReceive:
-    """Replay body events consumed while a queued request is monitored.
+    """Pure ASGI receive adapter for bounded queue-time replay.
 
-    Starlette exposes no public receive-interposition hook.  This class therefore
-    reads and replaces ``Request._receive`` exactly once, solely to retain unread
-    ``http.request`` messages; all buffered messages are replayed byte-for-byte.
+    The owner passes the original ASGI ``receive`` callable explicitly. During
+    queueing the disconnect watcher is its only consumer; after watcher shutdown,
+    the owner passes ``receive`` below to the downstream application. No
+    Starlette ``Request`` internals are read or replaced.
     """
 
-    def __init__(self, request: Request, key_name: str, limits: ResolvedLimits):
+    def __init__(self, request: Request, raw_receive: Receive,
+                 key_name: str, limits: ResolvedLimits):
         self._request = request
-        self._raw_receive: Receive = request._receive
+        self._raw_receive = raw_receive
         self._key_name = key_name
         self._limits = limits
         self._buffer: deque[_BufferedBodyEvent] = deque()
@@ -259,9 +288,7 @@ class _BodyPreservingReceive:
                     await self._release_event_accounting(event)
                     if not self._buffer:
                         await self._close_spool()
-                    raise QueuedBodySpoolError(
-                        f"failed to replay queued request body: {exc}"
-                    ) from exc
+                    raise _spool_failure("replay", exc) from exc
                 await self._release_event_accounting(event)
                 message = dict(event.message_without_body)
                 if event.had_body:
@@ -325,9 +352,7 @@ class _BodyPreservingReceive:
                         rollover=move_to_disk,
                     )
             except Exception as exc:
-                raise QueuedBodySpoolError(
-                    f"failed to spool queued request body: {exc}"
-                ) from exc
+                raise _spool_failure("write", exc) from exc
 
             metadata = dict(message)
             had_body = "body" in metadata
@@ -510,9 +535,7 @@ class _BodyPreservingReceive:
             # physical usage exceed the configured process/key budget.
             await self._release_spool_accounting()
         if close_error is not None:
-            raise QueuedBodySpoolError(
-                f"failed to close queued request body spool: {close_error}"
-            ) from close_error
+            raise _spool_failure("close", close_error) from close_error
 
     async def _release_spool_accounting(self) -> None:
         global _queued_body_spool_bytes_total
@@ -575,29 +598,26 @@ def _set_key_accounting(mapping: dict[str, int], key_name: str, value: int) -> N
         mapping.pop(key_name, None)
 
 
+def _requires_nonqueued_body_guard(request: Request) -> bool:
+    """Whether this endpoint has an explicit protocol-level body contract."""
+    return str(request.scope.get("path") or "") in _IMAGE_PROTOCOL_BODY_PATHS
+
+
 def _body_preserving_receive(
     request: Request,
     key_name: str,
     limits: ResolvedLimits,
+    raw_receive: Receive | None = None,
 ) -> _BodyPreservingReceive:
-    guard = getattr(request, "_parrot_body_preserving_receive", None)
-    if isinstance(guard, _BodyPreservingReceive):
-        guard.validate_content_length()
-        return guard
-    guard = _BodyPreservingReceive(request, key_name, limits)
+    guard = _BodyPreservingReceive(
+        request,
+        raw_receive if raw_receive is not None else request.receive,
+        key_name,
+        limits,
+    )
     guard.validate_content_length()
-    # This is the only private Request hook used; see the class docstring.
-    request._receive = guard.receive
-    setattr(request, "_parrot_body_preserving_receive", guard)
     _active_body_guards.add(guard)
     return guard
-
-
-def _request_receive_guard(request: Request | None) -> _BodyPreservingReceive | None:
-    if request is None:
-        return None
-    guard = getattr(request, "_parrot_body_preserving_receive", None)
-    return guard if isinstance(guard, _BodyPreservingReceive) else None
 
 
 async def shutdown_spooling() -> None:
@@ -626,6 +646,16 @@ class ApiKeyLease:
         self._released = False
         self._release_task: asyncio.Task[None] | None = None
         self.attached_to_response = False
+
+    @property
+    def receive(self) -> Receive | None:
+        """ASGI receive callable the owner must pass downstream, if wrapped."""
+        return self._replay_guard.receive if self._replay_guard is not None else None
+
+    @property
+    def response_headers(self) -> dict[str, str]:
+        """Limiter diagnostics to add to the downstream response start event."""
+        return _headers(self.slot, self.queue_wait_ms)
 
     async def release(self) -> None:
         if self._released:
@@ -801,7 +831,11 @@ async def _get_slot(key_name: str) -> ApiKeySlot:
         return slot
 
 
-async def acquire(key_name: str | None, request: Request | None = None) -> ApiKeyLease:
+async def acquire(
+    key_name: str | None,
+    request: Request | None = None,
+    *, receive: Receive | None = None,
+) -> ApiKeyLease:
     """占用一个 API Key 并发槽位；必要时进入 FIFO 队列。
 
     返回 ApiKeyLease，调用方必须在请求生命周期结束时 release。
@@ -828,11 +862,15 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
         _wake_eligible_waiters_locked(slot)
         if not limits.enabled:
             return ApiKeyLease(key, None, limits, noop=True)
-        replay_guard = (
-            _body_preserving_receive(request, key, limits)
-            if request is not None else None
-        )
         if limits.unlimited or slot.in_flight < limits.max_concurrent:
+            # Generic replay limits are queue resource contracts, not protocol
+            # caps for nonqueued core APIs. Image endpoints keep their separate,
+            # endpoint-aware protocol body contract.
+            replay_guard = None
+            if request is not None and _requires_nonqueued_body_guard(request):
+                replay_guard = _body_preserving_receive(
+                    request, key, limits, raw_receive=receive,
+                )
             slot.in_flight += 1
             return ApiKeyLease(
                 key, slot, limits, queue_wait_ms=0, replay_guard=replay_guard
@@ -841,17 +879,21 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
         if limits.max_queue <= 0 or len(slot.waiters) >= limits.max_queue:
             raise _queue_full_error(key, slot)
 
+        replay_guard = None
+        if request is not None:
+            replay_guard = _body_preserving_receive(
+                request, key, limits, raw_receive=receive,
+            )
         fut = asyncio.get_event_loop().create_future()
         waiter = Waiter(future=fut, enqueued_at=time.monotonic())
         slot.waiters.append(waiter)
 
     queue_deadline = start_wait + max(0, limits.queue_wait_seconds)
-    disconnect_request = request
     try:
         await _wait_for_turn_or_abort(
             slot,
             waiter,
-            disconnect_request,
+            replay_guard,
             limits,
             deadline=queue_deadline,
         )
@@ -863,7 +905,6 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
             async with slot.lock:
                 slot.limits = _resolve_limits(key)
                 limits = slot.limits
-                replay_guard = _request_receive_guard(disconnect_request)
                 if waiter.capacity_reserved:
                     waiter.capacity_reserved = False
                     if not limits.enabled:
@@ -914,7 +955,7 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
             await _wait_for_turn_or_abort(
                 slot,
                 waiter,
-                disconnect_request,
+                replay_guard,
                 limits,
                 deadline=queue_deadline,
             )
@@ -922,7 +963,6 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
         try:
             await _drop_waiter(slot, waiter)
         finally:
-            replay_guard = _request_receive_guard(disconnect_request)
             if replay_guard is not None:
                 await replay_guard.abandon()
         raise
@@ -931,7 +971,7 @@ async def acquire(key_name: str | None, request: Request | None = None) -> ApiKe
 async def _wait_for_turn_or_abort(
     slot: ApiKeySlot,
     waiter: Waiter,
-    request: Request | None,
+    replay_guard: _BodyPreservingReceive | None,
     limits: ResolvedLimits,
     *,
     deadline: float | None = None,
@@ -951,10 +991,8 @@ async def _wait_for_turn_or_abort(
     wait_items.append(timeout_task)
     limits_task = asyncio.create_task(_wait_for_limit_relaxation(slot))
     wait_items.append(limits_task)
-    if request is not None:
-        disconnect_task = asyncio.create_task(
-            _wait_http_disconnect(request, slot.key_name, limits)
-        )
+    if replay_guard is not None:
+        disconnect_task = asyncio.create_task(_wait_http_disconnect(replay_guard))
         wait_items.append(disconnect_task)
 
     try:
@@ -991,12 +1029,7 @@ async def _wait_for_turn_or_abort(
                     raise result
 
 
-async def _wait_http_disconnect(
-    request: Request,
-    key_name: str,
-    limits: ResolvedLimits,
-) -> None:
-    guard = _body_preserving_receive(request, key_name, limits)
+async def _wait_http_disconnect(guard: _BodyPreservingReceive) -> None:
     try:
         await guard.wait_for_disconnect()
     except (RequestBodyTooLarge, QueuedBodySpoolError):

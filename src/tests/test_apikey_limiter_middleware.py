@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from starlette.responses import Response
 from starlette.requests import Request
 
@@ -71,28 +72,39 @@ async def _post(path: str, content) -> httpx.Response:
         )
 
 
+def _core_echo_app() -> FastAPI:
+    echo_app = FastAPI()
+    echo_app.add_middleware(parrot_server._DrainHttpMiddleware)
+
+    @echo_app.post("/v1/messages")
+    @echo_app.post("/v1/chat/completions")
+    @echo_app.post("/v1/responses")
+    async def echo(request: Request):
+        return Response(content=await request.body(), media_type="application/octet-stream")
+
+    return echo_app
+
+
+async def _post_to(app, path: str, content) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post(
+            path,
+            headers={"authorization": "Bearer secret", "content-type": "application/json"},
+            content=content,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("path", "expected_type"),
-    [
-        ("/v1/messages", "request_too_large"),
-        ("/v1/responses", "invalid_request_error"),
-    ],
+    "path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"],
 )
-async def test_production_middleware_request_bytes_returns_413_schema(
-    monkeypatch, path, expected_type,
-):
+async def test_nonqueued_core_request_bytes_are_not_replay_limited(monkeypatch, path):
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: _config(request_bytes=5))
-    response = await _post(path, b"123456")
-    assert response.status_code == 413
-    payload = response.json()
-    if path == "/v1/messages":
-        assert payload["type"] == "error"
-        assert payload["error"]["type"] == expected_type
-    else:
-        assert payload["error"]["type"] == expected_type
-    assert payload["error"]["code"] == "request_too_large"
-    assert "retry-after" not in response.headers
+    response = await _post_to(_core_echo_app(), path, b"123456")
+    assert response.status_code == 200
+    assert response.content == b"123456"
+    assert response.headers["x-parrot-apiKey-in-flight"] == "1"
 
 
 class _TwoChunks(httpx.AsyncByteStream):
@@ -103,15 +115,16 @@ class _TwoChunks(httpx.AsyncByteStream):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/v1/messages", "/v1/responses"])
-async def test_production_middleware_event_count_returns_413(monkeypatch, path):
+@pytest.mark.parametrize(
+    "path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"],
+)
+async def test_nonqueued_core_event_count_is_not_replay_limited(monkeypatch, path):
     monkeypatch.setattr(
         apikey_limiter.config, "get", lambda: _config(request_bytes=100, events=1),
     )
-    response = await _post(path, _TwoChunks())
-    assert response.status_code == 413
-    assert response.json()["error"]["code"] == "request_too_large"
-    assert "body events" in response.json()["error"]["message"]
+    response = await _post_to(_core_echo_app(), path, _TwoChunks())
+    assert response.status_code == 200
+    assert response.content == b"ab"
 
 
 @pytest.mark.asyncio
@@ -173,6 +186,48 @@ async def test_production_middleware_disk_aggregate_pressure_returns_429_and_cle
     assert apikey_limiter._queued_body_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_total == 0
     assert list(Path(tmp_path).iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_production_middleware_spool_os_error_is_stable_and_sanitized(
+    monkeypatch, tmp_path, capsys,
+):
+    cfg = _config(
+        request_bytes=100,
+        per_key=100,
+        process=100,
+        spool_threshold=1,
+        spool_directory=str(tmp_path),
+    )
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+    secret_path = "/srv/parrot/private/queued-body-spool/tenant-secret"
+
+    def fail_open(_self, _limits):
+        raise PermissionError(13, "permission denied", secret_path)
+
+    monkeypatch.setattr(
+        apikey_limiter._BodyPreservingReceive, "_open_spool", fail_open,
+    )
+    active = await apikey_limiter.acquire("k")
+    try:
+        response = await _post("/v1/responses", b"123456")
+    finally:
+        await active.release()
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["error"]["code"] == "queued_body_spool_unavailable"
+    assert payload["error"]["message"] == (
+        "queued request body spool is temporarily unavailable"
+    )
+    assert secret_path not in response.text
+    assert "permission denied" not in response.text.lower()
+    server_log = capsys.readouterr().out
+    assert "type=PermissionError" in server_log
+    assert "errno=13" in server_log
+    assert secret_path not in server_log
+    assert apikey_limiter._queued_body_bytes_total == 0
+    assert apikey_limiter._queued_body_spool_bytes_total == 0
 
 
 def _multipart_multi_image_body(total_bytes: int) -> bytes:
