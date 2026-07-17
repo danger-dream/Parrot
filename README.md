@@ -460,7 +460,6 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
     "defaultMaxQueuedBodyBytesPerKey": 33554432,
     "maxQueuedBodyBytes": 134217728,
     "queuedBodySpoolThresholdBytes": 1048576,
-    "queuedBodySpoolDirectory": "",
     "defaultMaxQueuedBodySpoolBytesPerKey": 536870912,
     "maxQueuedBodySpoolBytes": 2147483648
   },
@@ -503,7 +502,7 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 > `apiKeys.*.allowImages` **默认关闭** —— 新建或历史 API Key 不会自动获得图片生成 / 编辑能力，必须在 TG「🔑 管理 API Key」里显式开启。
 
-> API Key 请求排队时，小于 `queuedBodySpoolThresholdBytes` 的待回放 body 保留在内存；超过阈值后自动转入临时文件。空的 `queuedBodySpoolDirectory` 表示使用数据目录下的 `queued-body-spool/`。内存预算沿用 `defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes`；磁盘临时数据另由 `defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 约束，成功、失败、取消或断开后都会关闭并删除。
+> API Key 请求排队时，小于 `queuedBodySpoolThresholdBytes` 的待回放 body 保留在内存；超过阈值后自动转入数据目录下固定的 `queued-body-spool/` 私有临时目录。内存预算沿用 `defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes`；磁盘临时数据另由 `defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 约束，成功、失败、取消或断开后都会关闭并删除。
 
 > `images.cacheRetentionDays=0` 表示不按时间清理；`images.cacheMaxBytes=0` 表示不按空间清理。相对 `cachePath` 会落在数据目录下，Parrot 会阻止相对路径逃逸。
 

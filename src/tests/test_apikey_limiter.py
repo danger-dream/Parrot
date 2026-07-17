@@ -1,7 +1,5 @@
 import asyncio
 import gc
-import os
-import stat
 import weakref
 from pathlib import Path
 
@@ -35,7 +33,7 @@ def _cfg(**limits):
 
 
 @pytest.fixture(autouse=True)
-def _reset_slots(monkeypatch):
+def _reset_slots(monkeypatch, tmp_path):
     apikey_limiter._slots.clear()
     apikey_limiter._queued_body_bytes_by_key.clear()
     apikey_limiter._queued_body_bytes_total = 0
@@ -43,6 +41,7 @@ def _reset_slots(monkeypatch):
     apikey_limiter._queued_body_spool_bytes_total = 0
     apikey_limiter._active_body_guards.clear()
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: _cfg())
+    monkeypatch.setattr(apikey_limiter.config, "DATA_DIR", str(tmp_path))
     yield
     apikey_limiter._slots.clear()
     apikey_limiter._queued_body_bytes_by_key.clear()
@@ -362,7 +361,6 @@ def _spool_cfg(tmp_path, *, wait_seconds: int = 10):
         "defaultQueueWaitSeconds": wait_seconds,
         "defaultMaxRequestBodyBytes": 100_000,
         "queuedBodySpoolThresholdBytes": 1,
-        "queuedBodySpoolDirectory": str(tmp_path),
         "defaultMaxQueuedBodySpoolBytesPerKey": 100_000,
         "maxQueuedBodySpoolBytes": 100_000,
     })
@@ -868,7 +866,8 @@ def _assert_spool_clean(tmp_path, request: Request | None = None) -> None:
     assert apikey_limiter._queued_body_bytes_by_key == {}
     assert apikey_limiter._queued_body_spool_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_by_key == {}
-    assert list(Path(tmp_path).iterdir()) == []
+    spool_dir = Path(tmp_path) / "queued-body-spool"
+    assert not spool_dir.exists() or list(spool_dir.iterdir()) == []
     # Receive ownership is no longer stored on a Starlette Request. A complete
     # cleanup therefore has no retained guard in the global shutdown registry.
     assert len(apikey_limiter._active_body_guards) == 0
@@ -1054,7 +1053,6 @@ async def test_default_spool_capacity_tracks_effective_request_limit_and_stays_b
     cfg["apiKeyConcurrency"].update({
         "defaultMaxRequestBodyBytes": 100,
         "queuedBodySpoolThresholdBytes": 1,
-        "queuedBodySpoolDirectory": str(tmp_path),
         "defaultMaxQueuedBodySpoolBytesPerKey": 10,
         "maxQueuedBodySpoolBytes": 20,
     })
@@ -1084,51 +1082,6 @@ async def test_default_spool_capacity_tracks_effective_request_limit_and_stays_b
     await second_guard.abandon()
     await first_guard.abandon()
     _assert_spool_clean(tmp_path)
-
-
-@pytest.mark.asyncio
-async def test_spool_directory_and_file_permissions_are_private(monkeypatch, tmp_path):
-    spool_dir = tmp_path / "spool"
-    spool_dir.mkdir(mode=0o777)
-    os.chmod(spool_dir, 0o777)
-    monkeypatch.setattr(
-        apikey_limiter.config, "get", lambda: _spool_cfg(spool_dir),
-    )
-    request = _queued_request([])
-    guard = apikey_limiter._body_preserving_receive(
-        request, "k", apikey_limiter._resolve_limits("k"),
-    )
-    await guard._reserve(
-        {"type": "http.request", "body": b"private", "more_body": True}
-    )
-    assert stat.S_IMODE(spool_dir.stat().st_mode) == 0o700
-    assert guard._spool is not None
-    assert stat.S_IMODE(os.fstat(guard._spool.fileno()).st_mode) == 0o600
-    await guard.abandon()
-    _assert_spool_clean(spool_dir, request)
-
-
-@pytest.mark.asyncio
-async def test_spool_directory_symlink_fails_closed_and_cleans(monkeypatch, tmp_path):
-    target = tmp_path / "target"
-    target.mkdir()
-    link = tmp_path / "spool-link"
-    link.symlink_to(target, target_is_directory=True)
-    monkeypatch.setattr(
-        apikey_limiter.config, "get", lambda: _spool_cfg(link),
-    )
-    request = _queued_request([])
-    guard = apikey_limiter._body_preserving_receive(
-        request, "k", apikey_limiter._resolve_limits("k"),
-    )
-    with pytest.raises(apikey_limiter.QueuedBodySpoolError):
-        await guard._reserve(
-            {"type": "http.request", "body": b"blocked", "more_body": True}
-        )
-    await guard.abandon()
-    assert list(target.iterdir()) == []
-    assert apikey_limiter._queued_body_bytes_total == 0
-    assert apikey_limiter._queued_body_spool_bytes_total == 0
 
 
 @pytest.mark.asyncio

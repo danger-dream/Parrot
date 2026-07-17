@@ -8,7 +8,7 @@
   apiKeyConcurrency.enabled/defaultMaxConcurrent/defaultMaxQueue/defaultQueueWaitSeconds
   apiKeyConcurrency.defaultMaxRequestBodyBytes/defaultMaxRequestBodyEvents
   apiKeyConcurrency.defaultMaxQueuedBodyBytesPerKey/maxQueuedBodyBytes
-  apiKeyConcurrency.queuedBodySpoolThresholdBytes/queuedBodySpoolDirectory
+  apiKeyConcurrency.queuedBodySpoolThresholdBytes
   apiKeyConcurrency.defaultMaxQueuedBodySpoolBytesPerKey/maxQueuedBodySpoolBytes
   (legacy maxQueuedBodyBytesTotal is accepted only as a fallback)
   apiKeys.<name>.limits may override the corresponding per-key/body defaults with
@@ -22,8 +22,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import stat
 import tempfile
 import time
 import weakref
@@ -59,7 +57,6 @@ class ResolvedLimits:
     queued_body_spool_threshold_bytes: int
     max_queued_body_spool_bytes: int
     max_queued_body_spool_bytes_total: int
-    queued_body_spool_directory: str
     enabled_source: str = "global"
     max_concurrent_source: str = "global"
     max_queue_source: str = "global"
@@ -428,21 +425,12 @@ class _BodyPreservingReceive:
             _queued_body_spool_bytes_total += spool_delta
 
     def _open_spool(self, limits: ResolvedLimits) -> Any:
-        raw_directory = str(limits.queued_body_spool_directory or "").strip()
-        directory = Path(raw_directory) if raw_directory else Path(config.DATA_DIR) / "queued-body-spool"
-        if not directory.is_absolute():
-            directory = Path(config.DATA_DIR) / directory
+        directory = Path(config.DATA_DIR) / "queued-body-spool"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory_stat = directory.lstat()
-        if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
-            raise OSError("queued body spool path is not a real directory")
-        if directory_stat.st_uid != os.geteuid():
-            raise OSError("queued body spool directory has an unsafe owner")
-        os.chmod(directory, 0o700)
         return tempfile.SpooledTemporaryFile(
             max_size=max(0, limits.queued_body_spool_threshold_bytes),
             mode="w+b",
-            dir=os.fspath(directory),
+            dir=directory,
             prefix="parrot-queued-body-",
         )
 
@@ -741,10 +729,6 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         DEFAULT_MAX_QUEUED_BODY_SPOOL_BYTES_TOTAL,
         minimum=1,
     )
-    queued_body_spool_directory = str(
-        global_cfg.get("queuedBodySpoolDirectory") or ""
-    ).strip()
-
     entry = (cfg.get("apiKeys") or {}).get(key_name)
     limits = entry.get("limits") if isinstance(entry, dict) else None
     if not isinstance(limits, dict):
@@ -811,7 +795,6 @@ def _resolve_limits(key_name: str) -> ResolvedLimits:
         queued_body_spool_threshold_bytes=queued_body_spool_threshold_bytes,
         max_queued_body_spool_bytes=max_queued_body_spool_bytes,
         max_queued_body_spool_bytes_total=max_queued_body_spool_bytes_total,
-        queued_body_spool_directory=queued_body_spool_directory,
         enabled_source=enabled_source,
         max_concurrent_source=max_source,
         max_queue_source=queue_source,

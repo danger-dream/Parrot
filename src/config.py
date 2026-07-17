@@ -110,7 +110,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaultMaxQueuedBodyBytesPerKey": 33554432,
         "maxQueuedBodyBytes": 134217728,
         "queuedBodySpoolThresholdBytes": 1048576,
-        "queuedBodySpoolDirectory": "",
         "defaultMaxQueuedBodySpoolBytesPerKey": 536870912,
         "maxQueuedBodySpoolBytes": 2147483648,
     },

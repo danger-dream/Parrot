@@ -69,7 +69,6 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodyBytesPerKey"] == 32 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["maxQueuedBodyBytes"] == 128 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["queuedBodySpoolThresholdBytes"] == 1024 * 1024
-            assert cfg["apiKeyConcurrency"]["queuedBodySpoolDirectory"] == ""
             assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodySpoolBytesPerKey"] == 512 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["maxQueuedBodySpoolBytes"] == 2 * 1024 * 1024 * 1024
 

@@ -20,8 +20,7 @@ def _config(*, request_bytes: int = 100, events: int = 10,
             per_key: int = 100, process: int = 100,
             spool_threshold: int = 1024 * 1024,
             spool_per_key: int = 512 * 1024 * 1024,
-            spool_process: int = 2 * 1024 * 1024 * 1024,
-            spool_directory: str = "") -> dict:
+            spool_process: int = 2 * 1024 * 1024 * 1024) -> dict:
     return {
         "apiKeyConcurrency": {
             "enabled": True,
@@ -33,7 +32,6 @@ def _config(*, request_bytes: int = 100, events: int = 10,
             "defaultMaxQueuedBodyBytesPerKey": per_key,
             "maxQueuedBodyBytes": process,
             "queuedBodySpoolThresholdBytes": spool_threshold,
-            "queuedBodySpoolDirectory": spool_directory,
             "defaultMaxQueuedBodySpoolBytesPerKey": spool_per_key,
             "maxQueuedBodySpoolBytes": spool_process,
         },
@@ -42,7 +40,7 @@ def _config(*, request_bytes: int = 100, events: int = 10,
 
 
 @pytest.fixture(autouse=True)
-def _reset_runtime(monkeypatch):
+def _reset_runtime(monkeypatch, tmp_path):
     drain.reset_for_tests()
     apikey_limiter._slots.clear()
     apikey_limiter._queued_body_bytes_by_key.clear()
@@ -51,6 +49,7 @@ def _reset_runtime(monkeypatch):
     apikey_limiter._queued_body_spool_bytes_total = 0
     monkeypatch.setattr(parrot_server.auth, "validate", lambda _headers: ("k", [], None))
     monkeypatch.setattr(parrot_server.auth, "images_allowed", lambda _key: True)
+    monkeypatch.setattr(apikey_limiter.config, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(
         apikey_limiter, "QUEUED_BODY_EVENT_OVERHEAD_BYTES", 0, raising=False,
     )
@@ -61,6 +60,11 @@ def _reset_runtime(monkeypatch):
     apikey_limiter._queued_body_bytes_total = 0
     apikey_limiter._queued_body_spool_bytes_by_key.clear()
     apikey_limiter._queued_body_spool_bytes_total = 0
+
+
+def _assert_spool_empty(tmp_path) -> None:
+    spool_dir = Path(tmp_path) / "queued-body-spool"
+    assert not spool_dir.exists() or list(spool_dir.iterdir()) == []
 
 
 async def _post(path: str, content, *, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -228,7 +232,6 @@ async def test_production_middleware_disk_aggregate_pressure_returns_429_and_cle
         spool_threshold=1,
         spool_per_key=5 if pressure == "key" else 100,
         spool_process=5 if pressure == "process" else 100,
-        spool_directory=str(tmp_path),
     )
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
     active = await apikey_limiter.acquire("k")
@@ -242,7 +245,7 @@ async def test_production_middleware_disk_aggregate_pressure_returns_429_and_cle
     assert response.json()["error"]["code"] == "queued_body_capacity"
     assert apikey_limiter._queued_body_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_total == 0
-    assert list(Path(tmp_path).iterdir()) == []
+    _assert_spool_empty(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -257,7 +260,6 @@ async def test_production_middleware_spool_os_error_is_stable_and_sanitized(
         per_key=100,
         process=100,
         spool_threshold=1,
-        spool_directory=str(tmp_path),
     )
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
     secret_path = "/srv/parrot/private/queued-body-spool/tenant-secret"
@@ -334,7 +336,6 @@ async def test_production_middleware_queued_33mib_multi_image_spools_and_replays
         per_key=32 * 1024 * 1024,
         process=128 * 1024 * 1024,
         spool_threshold=1024 * 1024,
-        spool_directory=str(tmp_path),
     )
     cfg["images"] = {"maxInputImageBytes": 20 * 1024 * 1024}
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
@@ -388,7 +389,7 @@ async def test_production_middleware_queued_33mib_multi_image_spools_and_replays
     assert apikey_limiter._queued_body_bytes_by_key == {}
     assert apikey_limiter._queued_body_spool_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_by_key == {}
-    assert list(Path(tmp_path).iterdir()) == []
+    _assert_spool_empty(tmp_path)
 
 
 def _image_endpoint_max(path: str) -> int:
@@ -416,7 +417,6 @@ async def test_image_json_body_limit_is_stable_413_for_both_parsers(
         per_key=1024,
         process=4096,
         spool_threshold=16,
-        spool_directory=str(tmp_path),
     )
     cfg["images"] = {"maxInputImageBytes": 64}
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
@@ -436,7 +436,7 @@ async def test_image_json_body_limit_is_stable_413_for_both_parsers(
     assert "retry-after" not in response.headers
     assert apikey_limiter._queued_body_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_total == 0
-    assert list(Path(tmp_path).iterdir()) == []
+    _assert_spool_empty(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -503,7 +503,6 @@ async def test_small_queued_body_stays_in_memory_without_disk_rollover(
         per_key=4096,
         process=4096,
         spool_threshold=1024,
-        spool_directory=str(tmp_path),
     )
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
     active = await apikey_limiter.acquire("k")
@@ -519,4 +518,4 @@ async def test_small_queued_body_stays_in_memory_without_disk_rollover(
     await request
     assert apikey_limiter._queued_body_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_total == 0
-    assert list(Path(tmp_path).iterdir()) == []
+    _assert_spool_empty(tmp_path)
