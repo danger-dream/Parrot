@@ -229,8 +229,11 @@ def clear(channel_key: str, model: Optional[str] = None) -> None:
             if entry and _was_actively_blocked(entry, now):
                 was_perm = entry.get("cooldown_until") == _INF
                 recovered.append((k[0], k[1], was_perm))
+        # Persistent deletion is the commit point. If it fails, leave every
+        # in-memory entry intact so current-process and restart behavior agree.
+        state_db.error_delete(channel_key, model)
+        for k in keys:
             _entries.pop(k, None)
-    state_db.error_delete(channel_key, model)
 
     ek = notifier.escape_html
     for ck, mdl, was_perm in recovered:
@@ -244,8 +247,8 @@ def clear(channel_key: str, model: Optional[str] = None) -> None:
 
 def clear_all() -> None:
     with _lock:
+        state_db.error_delete(None, None)
         _entries.clear()
-    state_db.error_delete(None, None)
 
 
 def rename_channel(old_key: str, new_key: str) -> None:

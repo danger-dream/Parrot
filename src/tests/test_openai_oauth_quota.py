@@ -772,10 +772,92 @@ def test_fresh_openai_recovery_clears_runtime_but_preserves_fresh_quota(m):
 
     assert result["action"] == "resumed", result
     assert result["runtime_state"]["cooldown_cleared"] is True, result
+    assert result["runtime_state"]["required_state_cleared"] is True, result
     assert not cooldown.is_blocked(channel_key, "gpt-test")
+    assert m["state_db"].error_load(channel_key, "gpt-test") is None
     assert m["state_db"].quota_load(key) is not None
     assert result["runtime_state"]["quota_cache_cleared"] is False
-    print("  [PASS] fresh OpenAI recovery clears runtime and preserves fresh quota")
+
+    # Simulated process reload must not resurrect the pre-recovery cooldown.
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert not cooldown.is_blocked(channel_key, "gpt-test")
+    print("  [PASS] fresh OpenAI recovery clears runtime and survives reload")
+
+
+def test_fresh_openai_recovery_delete_failure_is_fail_closed_and_not_notified(
+    m, monkeypatch,
+):
+    """A failed persistent cooldown delete must never look like recovery."""
+    import asyncio
+    from src import cooldown
+
+    _setup(m)
+    email = "runtime-delete-failure@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    channel_key = f"oauth:{key}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    usage = _low_wham()
+    cooldown.record_error(
+        channel_key, "gpt-test", "429",
+        cooldown_until=m["state_db"].now_ms() + 60_000,
+    )
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+    assert m["state_db"].error_load(channel_key, "gpt-test") is not None
+
+    original_delete = m["state_db"].error_delete
+
+    def fail_delete(_channel_key=None, _model=None):
+        raise RuntimeError("synthetic state DB delete failure")
+
+    async def fetch_usage(_account_key):
+        return usage
+
+    captured_results = []
+    real_evaluate = m["oauth_manager"].evaluate_and_toggle_by_usage
+
+    def capture_evaluate(*args, **kwargs):
+        result = real_evaluate(*args, **kwargs)
+        captured_results.append(result)
+        return result
+
+    notifications = []
+    monkeypatch.setattr(m["state_db"], "error_delete", fail_delete)
+    monkeypatch.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+    monkeypatch.setattr(
+        m["oauth_manager"], "evaluate_and_toggle_by_usage", capture_evaluate,
+    )
+    monkeypatch.setattr(
+        m["oauth_manager"].notifier,
+        "throttled_notify_event_sync",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+
+    outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    result = captured_results[0]
+    account = m["oauth_manager"].get_account(key)
+    assert outcomes[email] == "resume_failed", outcomes
+    assert result["action"] == "resume_failed", result
+    assert result["error_code"] == "runtime_state_clear_failed", result
+    assert result["runtime_state"]["cooldown_cleared"] is False, result
+    assert result["runtime_state"]["required_state_cleared"] is False, result
+    assert account["enabled"] is False and account["disabled_reason"] == "quota"
+    assert notifications == []
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+
+    # A simulated restart must reload the still-persisted cooldown and remain blocked.
+    cooldown._entries.clear()
+    cooldown._initialized = False
+    cooldown.init()
+    assert cooldown.is_blocked(channel_key, "gpt-test")
+
+    # Explicit cleanup keeps this standalone integration module isolated.
+    monkeypatch.setattr(m["state_db"], "error_delete", original_delete)
+    original_delete(channel_key, None)
+    cooldown._entries.clear()
+    print("  [PASS] failed cooldown delete stays disabled/current+reload/no notify")
 
 
 def test_non_genuine_openai_recovery_never_clears_runtime(m):

@@ -1480,22 +1480,33 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
+        runtime_state = None
+        if provider == "openai" and fresh:
+            # Clear persistent/runtime routing blockers before enabling. The
+            # cooldown clear itself is DB-first, so a failed delete leaves the
+            # current process and a restarted process consistently blocked.
+            runtime_state = _clear_oauth_runtime_state(
+                account_key, clear_quota_cache=False,
+            )
+            if not runtime_state.get("required_state_cleared"):
+                print(
+                    f"[oauth] evaluate resume blocked by runtime state for "
+                    f"{account_key}: {runtime_state}"
+                )
+                return {"action": "resume_failed", "utils": utils,
+                        "any_over": False, "hit_windows": [],
+                        "disabled_until": acc.get("disabled_until"),
+                        "error_code": "runtime_state_clear_failed",
+                        "runtime_state": runtime_state}
         try:
             set_enabled(account_key, True)
         except Exception as exc:
             print(f"[oauth] evaluate set_enabled failed for {account_key}: {exc}")
             return {"action": "resume_failed", "utils": utils,
                     "any_over": False, "hit_windows": [],
-                    "disabled_until": acc.get("disabled_until")}
-        runtime_state = None
-        if provider == "openai" and fresh:
-            # A genuine fresh recovery must also remove local cooldown/snapshot
-            # state or routing can remain blocked after the account is enabled.
-            # Preserve the just-written fresh quota cache for status and future
-            # evaluation.
-            runtime_state = _clear_oauth_runtime_state(
-                account_key, clear_quota_cache=False,
-            )
+                    "disabled_until": acc.get("disabled_until"),
+                    "error_code": "account_enable_failed",
+                    "runtime_state": runtime_state}
         return {"action": "resumed", "utils": utils, "any_over": False,
                 "hit_windows": [], "disabled_until": None,
                 "runtime_state": runtime_state}
@@ -2018,17 +2029,23 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
 def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> dict:
     """Clear local runtime state for one OAuth channel.
 
-    `clear_quota_cache=False` is used after an official OpenAI reset, because the
-    fresh quota row has just been saved and must remain visible/evaluable.
+    `clear_quota_cache=False` preserves the fresh quota row used to prove
+    recovery. ``required_state_cleared`` is true only when every persistent
+    state required for routing recovery was committed successfully.
     """
     ch_key = f"oauth:{canonical}"
-    out = {"channel_key": ch_key, "quota_cache_cleared": False}
+    out = {
+        "channel_key": ch_key,
+        "cooldown_cleared": False,
+        "quota_cache_cleared": False,
+        "snapshots_cleared": False,
+    }
     try:
         from . import cooldown
         cooldown.clear(ch_key, model=None)
         out["cooldown_cleared"] = True
     except Exception as exc:
-        out["cooldown_error"] = str(exc)
+        out["cooldown_error"] = type(exc).__name__
         print(f"[oauth] runtime clear cooldown failed for {canonical}: {exc}")
 
     if clear_quota_cache:
@@ -2036,7 +2053,7 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> di
             state_db.quota_delete(canonical)
             out["quota_cache_cleared"] = True
         except Exception as exc:
-            out["quota_cache_error"] = str(exc)
+            out["quota_cache_error"] = type(exc).__name__
             print(f"[oauth] runtime clear quota cache failed for {canonical}: {exc}")
 
     try:
@@ -2045,9 +2062,13 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool) -> di
         failover.forget_anthropic_snapshot(canonical)
         out["snapshots_cleared"] = True
     except Exception as exc:
-        out["snapshot_error"] = str(exc)
+        out["snapshot_error"] = type(exc).__name__
         print(f"[oauth] runtime clear snapshot failed for {canonical}: {exc}")
     forget_openai_probe(canonical)
+    out["required_state_cleared"] = bool(
+        out["cooldown_cleared"]
+        and (not clear_quota_cache or out["quota_cache_cleared"])
+    )
     return out
 
 
