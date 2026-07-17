@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi import FastAPI
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.requests import Request
 
 import server as parrot_server
@@ -50,6 +50,7 @@ def _reset_runtime(monkeypatch):
     apikey_limiter._queued_body_spool_bytes_by_key.clear()
     apikey_limiter._queued_body_spool_bytes_total = 0
     monkeypatch.setattr(parrot_server.auth, "validate", lambda _headers: ("k", [], None))
+    monkeypatch.setattr(parrot_server.auth, "images_allowed", lambda _key: True)
     monkeypatch.setattr(
         apikey_limiter, "QUEUED_BODY_EVENT_OVERHEAD_BYTES", 0, raising=False,
     )
@@ -62,14 +63,15 @@ def _reset_runtime(monkeypatch):
     apikey_limiter._queued_body_spool_bytes_total = 0
 
 
-async def _post(path: str, content) -> httpx.Response:
+async def _post(path: str, content, *, headers: dict[str, str] | None = None) -> httpx.Response:
+    request_headers = {
+        "authorization": "Bearer secret",
+        "content-type": "application/json",
+    }
+    request_headers.update(headers or {})
     transport = httpx.ASGITransport(app=parrot_server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        return await client.post(
-            path,
-            headers={"authorization": "Bearer secret", "content-type": "application/json"},
-            content=content,
-        )
+        return await client.post(path, headers=request_headers, content=content)
 
 
 def _core_echo_app() -> FastAPI:
@@ -80,38 +82,71 @@ def _core_echo_app() -> FastAPI:
     @echo_app.post("/v1/chat/completions")
     @echo_app.post("/v1/responses")
     async def echo(request: Request):
-        return Response(content=await request.body(), media_type="application/octet-stream")
+        body = await request.body()
+        return JSONResponse({
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest(),
+        })
 
     return echo_app
 
 
-async def _post_to(app, path: str, content) -> httpx.Response:
+class _ChunkedBody(httpx.AsyncByteStream):
+    def __init__(self, body: bytes):
+        self.body = body
+
+    async def __aiter__(self):
+        cut = max(1, len(self.body) // 2)
+        yield self.body[:cut]
+        await asyncio.sleep(0)
+        yield self.body[cut:]
+
+
+def _wire_body(body: bytes, mode: str):
+    if mode == "content_length":
+        return body, {}
+    headers = {"content-length": "1"} if mode == "false_low" else {}
+    return _ChunkedBody(body), headers
+
+
+async def _post_to(
+    app, path: str, content, *, headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    request_headers = {
+        "authorization": "Bearer secret",
+        "content-type": "application/json",
+    }
+    request_headers.update(headers or {})
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        return await client.post(
-            path,
-            headers={"authorization": "Bearer secret", "content-type": "application/json"},
-            content=content,
-        )
+        return await client.post(path, headers=request_headers, content=content)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"],
 )
-async def test_nonqueued_core_request_bytes_are_not_replay_limited(monkeypatch, path):
-    monkeypatch.setattr(apikey_limiter.config, "get", lambda: _config(request_bytes=5))
-    response = await _post_to(_core_echo_app(), path, b"123456")
+@pytest.mark.parametrize("mode", ["content_length", "chunked", "false_low"])
+async def test_nonqueued_core_over_8mib_is_not_replay_limited(
+    monkeypatch, path, mode,
+):
+    replay_cap = 8 * 1024 * 1024
+    cfg = _config(
+        request_bytes=replay_cap,
+        events=1,
+        per_key=32 * 1024 * 1024,
+        process=128 * 1024 * 1024,
+    )
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+    body = b"x" * (replay_cap + 1)
+    content, headers = _wire_body(body, mode)
+    response = await _post_to(_core_echo_app(), path, content, headers=headers)
     assert response.status_code == 200
-    assert response.content == b"123456"
+    assert response.json() == {
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
     assert response.headers["x-parrot-apiKey-in-flight"] == "1"
-
-
-class _TwoChunks(httpx.AsyncByteStream):
-    async def __aiter__(self):
-        yield b"a"
-        await asyncio.sleep(0)
-        yield b"b"
 
 
 @pytest.mark.asyncio
@@ -119,12 +154,34 @@ class _TwoChunks(httpx.AsyncByteStream):
     "path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"],
 )
 async def test_nonqueued_core_event_count_is_not_replay_limited(monkeypatch, path):
-    monkeypatch.setattr(
-        apikey_limiter.config, "get", lambda: _config(request_bytes=100, events=1),
-    )
-    response = await _post_to(_core_echo_app(), path, _TwoChunks())
+    cfg = _config(request_bytes=100, events=1)
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+    body = b"ab"
+    response = await _post_to(_core_echo_app(), path, _ChunkedBody(body))
     assert response.status_code == 200
-    assert response.content == b"ab"
+    assert response.json()["sha256"] == hashlib.sha256(body).hexdigest()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"],
+)
+@pytest.mark.parametrize("mode", ["content_length", "chunked", "false_low"])
+async def test_queued_core_over_replay_cap_returns_stable_413(
+    monkeypatch, path, mode,
+):
+    cfg = _config(request_bytes=8, events=10, per_key=100, process=100)
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+    body = b"x" * 9
+    content, headers = _wire_body(body, mode)
+    active = await apikey_limiter.acquire("k")
+    try:
+        response = await _post_to(_core_echo_app(), path, content, headers=headers)
+    finally:
+        await active.release()
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert "retry-after" not in response.headers
 
 
 @pytest.mark.asyncio
@@ -189,8 +246,11 @@ async def test_production_middleware_disk_aggregate_pressure_returns_429_and_cle
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/v1/responses", "/v1/images/edit", "/v1/images/edits"],
+)
 async def test_production_middleware_spool_os_error_is_stable_and_sanitized(
-    monkeypatch, tmp_path, capsys,
+    monkeypatch, tmp_path, capsys, path,
 ):
     cfg = _config(
         request_bytes=100,
@@ -210,7 +270,7 @@ async def test_production_middleware_spool_os_error_is_stable_and_sanitized(
     )
     active = await apikey_limiter.acquire("k")
     try:
-        response = await _post("/v1/responses", b"123456")
+        response = await _post(path, b"123456")
     finally:
         await active.release()
 
@@ -331,12 +391,28 @@ async def test_production_middleware_queued_33mib_multi_image_spools_and_replays
     assert list(Path(tmp_path).iterdir()) == []
 
 
+def _image_endpoint_max(path: str) -> int:
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    return apikey_limiter._request_body_max_bytes(
+        request, apikey_limiter._resolve_limits("k"),
+    )
+
+
 @pytest.mark.asyncio
-async def test_image_endpoint_absolute_cap_is_413_queued_and_nonqueued_and_never_spools(
-    monkeypatch, tmp_path,
+@pytest.mark.parametrize("path", ["/v1/images/edit", "/v1/images/edits"])
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("mode", ["content_length", "chunked", "false_low"])
+async def test_image_json_body_limit_is_stable_413_for_both_parsers(
+    monkeypatch, tmp_path, path, queued, mode,
 ):
     cfg = _config(
         request_bytes=100,
+        events=10,
         per_key=1024,
         process=4096,
         spool_threshold=16,
@@ -344,29 +420,78 @@ async def test_image_endpoint_absolute_cap_is_413_queued_and_nonqueued_and_never
     )
     cfg["images"] = {"maxInputImageBytes": 64}
     monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
-    limits = apikey_limiter._resolve_limits("k")
-    request_for_limit = Request(
-        {
-            "type": "http", "method": "POST", "path": "/v1/images/edits",
-            "headers": [(b"content-type", b"application/json")],
-        }
-    )
-    endpoint_max = apikey_limiter._request_body_max_bytes(request_for_limit, limits)
-    body = b"x" * (endpoint_max + 1)
+    body = b"x" * (_image_endpoint_max(path) + 1)
+    content, headers = _wire_body(body, mode)
 
-    nonqueued = await _post("/v1/images/edits", body)
-    assert nonqueued.status_code == 413
-    active = await apikey_limiter.acquire("k")
+    active = await apikey_limiter.acquire("k") if queued else None
     try:
-        queued = await _post("/v1/images/edits", body)
+        response = await _post(path, content, headers=headers)
     finally:
-        await active.release()
-    assert queued.status_code == 413
-    assert nonqueued.json()["error"]["code"] == "request_too_large"
-    assert queued.json()["error"]["code"] == "request_too_large"
+        if active is not None:
+            await active.release()
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "retry-after" not in response.headers
     assert apikey_limiter._queued_body_bytes_total == 0
     assert apikey_limiter._queued_body_spool_bytes_total == 0
     assert list(Path(tmp_path).iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/images/edit", "/v1/images/edits"])
+@pytest.mark.parametrize("queued", [False, True])
+async def test_image_json_event_limit_is_stable_413_for_both_parsers(
+    monkeypatch, path, queued,
+):
+    cfg = _config(request_bytes=100, events=1, per_key=100, process=100)
+    cfg["images"] = {"maxInputImageBytes": 64}
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+    active = await apikey_limiter.acquire("k") if queued else None
+    try:
+        response = await _post(path, _ChunkedBody(b"{}"))
+    finally:
+        if active is not None:
+            await active.release()
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert "body events" in response.json()["error"]["message"]
+    assert apikey_limiter._queued_body_bytes_total == 0
+    assert apikey_limiter._queued_body_spool_bytes_total == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/images/edit", "/v1/images/edits"])
+@pytest.mark.parametrize("pressure", ["key", "process"])
+async def test_image_json_aggregate_pressure_is_429_only_while_queued(
+    monkeypatch, path, pressure,
+):
+    cfg = _config(
+        request_bytes=100,
+        events=10,
+        per_key=1 if pressure == "key" else 100,
+        process=1 if pressure == "process" else 100,
+        spool_threshold=100,
+    )
+    cfg["images"] = {"maxInputImageBytes": 64}
+    monkeypatch.setattr(apikey_limiter.config, "get", lambda: cfg)
+
+    nonqueued = await _post(path, b"{}")
+    assert nonqueued.status_code != 429
+
+    active = await apikey_limiter.acquire("k")
+    try:
+        queued = await _post(path, b"{}")
+    finally:
+        await active.release()
+    assert queued.status_code == 429
+    assert queued.headers["retry-after"] == "1"
+    assert queued.json()["error"]["code"] == "queued_body_capacity"
+    assert queued.json()["error"]["type"] == "rate_limit_exceeded"
+    assert apikey_limiter._queued_body_bytes_total == 0
+    assert apikey_limiter._queued_body_spool_bytes_total == 0
 
 
 @pytest.mark.asyncio

@@ -29,7 +29,7 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .. import auth, errors
+from .. import apikey_limiter, auth, errors
 from .images_simple import (
     UpstreamImageError,
     _DEFAULTS,
@@ -243,6 +243,11 @@ async def _parse_json(
 ) -> None:
     try:
         body = await request.json()
+    except (
+        apikey_limiter.RequestBodyTooLarge,
+        apikey_limiter.QueuedBodySpoolError,
+    ):
+        raise
     except Exception as exc:
         raise ValueError(f"invalid json: {exc}") from exc
     if not isinstance(body, dict):

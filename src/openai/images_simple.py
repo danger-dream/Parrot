@@ -26,7 +26,16 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .. import auth, config, errors, image_db, network, oauth_manager, state_db
+from .. import (
+    apikey_limiter,
+    auth,
+    config,
+    errors,
+    image_db,
+    network,
+    oauth_manager,
+    state_db,
+)
 from ..oauth import normalize_provider
 from ..oauth import openai as openai_provider
 from ..oauth_ids import account_key as make_account_key
@@ -569,6 +578,11 @@ async def _read_body(request: Request, *, action: str, cfg: dict) -> tuple[str, 
 
     try:
         body = await request.json()
+    except (
+        apikey_limiter.RequestBodyTooLarge,
+        apikey_limiter.QueuedBodySpoolError,
+    ):
+        raise
     except Exception as exc:
         raise ValueError(f"invalid json: {exc}") from exc
     if not isinstance(body, dict):
