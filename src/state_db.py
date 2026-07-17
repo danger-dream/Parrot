@@ -682,6 +682,20 @@ def _get_conn() -> sqlite3.Connection:
     return _local.conn
 
 
+def _rollback_failed_write(conn: sqlite3.Connection) -> None:
+    """Rollback one failed write, discarding an unusable thread connection."""
+    try:
+        conn.rollback()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            if getattr(_local, "conn", None) is conn:
+                _local.conn = None
+
+
 def checkpoint() -> None:
     conn = _get_conn()
     try:
@@ -820,13 +834,18 @@ def error_save(channel_key: str, model: str, error_count: int,
                cooldown_until: int | None, message: str | None) -> None:
     """cooldown_until: None/正数 毫秒时间戳; -1 = 永久。"""
     with _write_lock:
-        _get_conn().execute(
-            """INSERT OR REPLACE INTO channel_errors
-               (channel_key, model, error_count, cooldown_until, last_error_message, last_error_at)
-               VALUES (?,?,?,?,?,?)""",
-            (channel_key, model, error_count, cooldown_until, message, now_ms()),
-        )
-        _get_conn().commit()
+        conn = _get_conn()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO channel_errors
+                   (channel_key, model, error_count, cooldown_until, last_error_message, last_error_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (channel_key, model, error_count, cooldown_until, message, now_ms()),
+            )
+            conn.commit()
+        except Exception:
+            _rollback_failed_write(conn)
+            raise
 
 
 def error_load(channel_key: str, model: str) -> dict | None:
@@ -844,19 +863,24 @@ def error_load_all() -> list[dict]:
 
 def error_delete(channel_key: str | None = None, model: str | None = None) -> None:
     with _write_lock:
-        if channel_key and model:
-            _get_conn().execute(
-                "DELETE FROM channel_errors WHERE channel_key=? AND model=?",
-                (channel_key, model),
-            )
-        elif channel_key:
-            _get_conn().execute(
-                "DELETE FROM channel_errors WHERE channel_key=?",
-                (channel_key,),
-            )
-        else:
-            _get_conn().execute("DELETE FROM channel_errors")
-        _get_conn().commit()
+        conn = _get_conn()
+        try:
+            if channel_key and model:
+                conn.execute(
+                    "DELETE FROM channel_errors WHERE channel_key=? AND model=?",
+                    (channel_key, model),
+                )
+            elif channel_key:
+                conn.execute(
+                    "DELETE FROM channel_errors WHERE channel_key=?",
+                    (channel_key,),
+                )
+            else:
+                conn.execute("DELETE FROM channel_errors")
+            conn.commit()
+        except Exception:
+            _rollback_failed_write(conn)
+            raise
 
 
 def error_rename_channel(old_key: str, new_key: str) -> None:
