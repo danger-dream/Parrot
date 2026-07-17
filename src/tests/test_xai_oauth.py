@@ -295,6 +295,7 @@ def test_xai_quota_resume_uses_fresh_billing_even_before_period_end(m):
         "access_token": "at-xai",
         "refresh_token": "rt-xai",
         "expired": _future_expired(),
+        "enabled": False,
         "disabled_reason": "quota",
         "disabled_until": future,
     })

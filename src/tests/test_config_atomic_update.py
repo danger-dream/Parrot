@@ -64,7 +64,7 @@ def test_update_write_failure_keeps_live_disk_and_callbacks_atomic(
             original_replace = config.os.replace
 
             def fail_live_replace(src, dst):
-                if src == str(path) + ".tmp" and dst == str(path):
+                if dst == str(path):
                     raise OSError("synthetic live replace failure")
                 return original_replace(src, dst)
 

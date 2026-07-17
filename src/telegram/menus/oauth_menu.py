@@ -2483,10 +2483,16 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
     action = result.get("action")
     if action == "reset":
         ui.answer_cb(cb_id, "已清本地配额禁用")
+    elif action == "already_enabled":
+        ui.answer_cb(cb_id, "账号已启用")
     elif action == "cleared_runtime_state":
         ui.answer_cb(cb_id, "已清理本地配额/冷却状态")
     elif action == "reset_failed":
         ui.answer_cb(cb_id, "重置失败，账号保持禁用")
+    elif action == "state_conflict":
+        ui.answer_cb(cb_id, "账号状态已变化，未自动启用")
+    elif action == "invalid_state":
+        ui.answer_cb(cb_id, "账号状态无效，未自动启用")
     elif action == "noop_user":
         ui.answer_cb(cb_id, "手动禁用不自动重置")
     elif action == "noop_auth_error":

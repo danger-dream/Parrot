@@ -1501,7 +1501,9 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                         "error_code": "runtime_state_clear_failed",
                         "runtime_state": runtime_state}
         try:
-            set_enabled(account_key, True)
+            enable_result = set_enabled(
+                account_key, True, expected_disabled_reason="quota",
+            )
         except Exception as exc:
             print(f"[oauth] evaluate set_enabled failed for {account_key}: {exc}")
             return {"action": "resume_failed", "utils": utils,
@@ -1509,8 +1511,27 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                     "disabled_until": acc.get("disabled_until"),
                     "error_code": "account_enable_failed",
                     "runtime_state": runtime_state}
-        return {"action": "resumed", "utils": utils, "any_over": False,
-                "hit_windows": [], "disabled_until": None,
+        enable_state = (enable_result or {}).get("state")
+        if enable_state == "enabled":
+            return {"action": "resumed", "utils": utils, "any_over": False,
+                    "hit_windows": [], "disabled_until": None,
+                    "runtime_state": runtime_state}
+        if enable_state == "already_enabled":
+            return {"action": "kept_enabled", "utils": utils, "any_over": False,
+                    "hit_windows": [], "disabled_until": None,
+                    "runtime_state": runtime_state}
+        if enable_state == "missing":
+            action = "noop_missing"
+        else:
+            current_reason = (enable_result or {}).get("disabled_reason")
+            action = (f"noop_{current_reason}"
+                      if current_reason in ("user", "auth_error")
+                      else enable_state or "state_conflict")
+        return {"action": action, "utils": utils, "any_over": False,
+                "hit_windows": [],
+                "disabled_until": (enable_result or {}).get("disabled_until"),
+                "disabled_reason": (enable_result or {}).get("disabled_reason"),
+                "error_code": "account_state_conflict",
                 "runtime_state": runtime_state}
     return {"action": "kept_enabled", "utils": utils, "any_over": False,
             "hit_windows": [], "disabled_until": None}
@@ -1997,11 +2018,18 @@ def delete_account(account_key: str) -> None:
     forget_openai_probe(cleanup_key)
 
 
+_EXPECTED_REASON_UNSET = object()
+
+
 def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
-                disabled_until: str | None = None) -> None:
+                disabled_until: str | None = None, *,
+                expected_disabled_reason=_EXPECTED_REASON_UNSET) -> dict | None:
+    """Set account state; recovery may require the account to still be quota-disabled."""
     canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
     target_provider, target_identity = _split_ak(account_key)
+    conditional = expected_disabled_reason is not _EXPECTED_REASON_UNSET
+    decision = {"state": "missing", "disabled_reason": None, "disabled_until": None}
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
@@ -2013,6 +2041,23 @@ def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                     continue
                 if has_prov and _acc_provider(acc) != target_provider:
                     continue
+            if conditional:
+                current_reason = acc.get("disabled_reason")
+                current_enabled = acc.get("enabled")
+                decision.update(disabled_reason=current_reason,
+                                disabled_until=acc.get("disabled_until"))
+                if type(current_enabled) is not bool:
+                    decision["state"] = "invalid_state"
+                    return
+                if current_enabled:
+                    decision["state"] = (
+                        "already_enabled" if not current_reason else "invalid_state"
+                    )
+                    return
+                if current_reason != expected_disabled_reason:
+                    decision["state"] = "state_conflict"
+                    return
+                decision["state"] = "enabled"
             acc["enabled"] = enabled
             if enabled:
                 acc["disabled_reason"] = None
@@ -2021,7 +2066,8 @@ def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                 acc["disabled_reason"] = reason or "user"
                 acc["disabled_until"] = disabled_until
             return
-    config.update(mutate)
+    config.update(mutate, skip_if_unchanged=conditional)
+    return decision if conditional else None
 
 
 def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
@@ -2117,7 +2163,9 @@ def reset_quota(account_key: str) -> dict:
 
     if reason == "quota":
         try:
-            set_enabled(canonical, True)
+            enable_result = set_enabled(
+                canonical, True, expected_disabled_reason="quota",
+            )
         except Exception as exc:
             print(f"[oauth] reset quota enable failed for {canonical}: {exc}")
             return {
@@ -2128,7 +2176,22 @@ def reset_quota(account_key: str) -> dict:
                 "disabled_reason": reason,
                 **runtime,
             }
-        action = "reset"
+        enable_state = (enable_result or {}).get("state")
+        if enable_state == "enabled":
+            action = "reset"
+        elif enable_state == "already_enabled":
+            action = "already_enabled"
+        elif enable_state == "missing":
+            action = "noop_missing"
+        else:
+            current_reason = (enable_result or {}).get("disabled_reason")
+            action = (f"noop_{current_reason}"
+                      if current_reason in ("user", "auth_error")
+                      else enable_state or "state_conflict")
+            return {"action": action, "error_code": "account_state_conflict",
+                    "account_key": canonical, "disabled_reason": current_reason,
+                    "disabled_until": (enable_result or {}).get("disabled_until"),
+                    **runtime}
     else:
         action = "cleared_runtime_state"
 

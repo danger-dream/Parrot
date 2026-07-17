@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import shutil
+import tempfile
 import threading
 from typing import Any
 
@@ -657,20 +658,29 @@ def _rotate_backups() -> None:
 
 
 def _write_atomic(data: dict) -> None:
-    tmp = CONFIG_PATH + ".tmp"
+    """Write through a private 0600 temp file, then atomically replace config."""
+    parent = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
+    prefix = f".{os.path.basename(CONFIG_PATH)}."
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=parent, text=True)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with stream as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         _rotate_backups()
         os.replace(tmp, CONFIG_PATH)
-    except Exception:
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        raise
 
 
 def _current_mtime() -> float:
@@ -728,7 +738,7 @@ def save() -> None:
         _mtime = _current_mtime()
 
 
-def update(mutator) -> dict:
+def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
     """以 mutator(cfg) 的方式原子修改 cfg 并持久化。
 
     `mutator` 是一个接受当前 cfg dict 的函数，可原地修改；返回值被忽略。
@@ -744,6 +754,8 @@ def update(mutator) -> dict:
             _ensure_loaded()
         candidate = copy.deepcopy(_cache)
         mutator(candidate)
+        if skip_if_unchanged and candidate == _cache:
+            return _cache
         _write_atomic(candidate)
         _mtime = _current_mtime()
         _cache = candidate
