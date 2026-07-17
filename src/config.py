@@ -519,10 +519,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _cache: dict[str, Any] | None = None
 _mtime: float = 0.0
-# 必须是可重入锁 (RLock)：
-# update() 持锁后调 _fire_reload_callbacks → registry._on_reload →
-# rebuild_from_config() → config.get() 又试图获取本锁。
-# 用 threading.Lock (non-reentrant) 会让同线程二次 acquire 永久死锁。
+# 必须是可重入锁 (RLock)：同一线程内的加载/保存辅助函数可能再次访问配置。
+# reload callbacks 始终在锁外执行，避免 callback 跨模块重入造成死锁。
 _lock = threading.RLock()
 _reload_callbacks: list = []
 
@@ -731,22 +729,25 @@ def save() -> None:
 
 
 def update(mutator) -> dict:
-    """以 mutator(cfg) 的方式修改 cfg 并持久化。
+    """以 mutator(cfg) 的方式原子修改 cfg 并持久化。
 
     `mutator` 是一个接受当前 cfg dict 的函数，可原地修改；返回值被忽略。
-    调用完成后自动持久化并触发回调。
+    mutator 只接触当前配置的深拷贝；候选配置持久化成功后才发布为共享
+    cache 并触发回调。这样写盘失败不会留下仅当前进程可见的半提交状态。
 
     **callback 在锁外执行**：避免 callback 内访问 config 接口时被自身锁阻塞，
     也消除其它跨模块 callback 链可能产生的死锁。
     """
-    global _mtime
+    global _cache, _mtime
     with _lock:
         if _cache is None:
             _ensure_loaded()
-        mutator(_cache)
-        _write_atomic(_cache)
+        candidate = copy.deepcopy(_cache)
+        mutator(candidate)
+        _write_atomic(candidate)
         _mtime = _current_mtime()
-        snapshot = _cache
+        _cache = candidate
+        snapshot = candidate
     _fire_reload_callbacks(snapshot)
     return snapshot
 
