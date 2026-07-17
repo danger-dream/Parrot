@@ -101,6 +101,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaultMaxConcurrent": 5,
         "defaultMaxQueue": 50,
         "defaultQueueWaitSeconds": 1800,
+        # 排队期间 disconnect watcher 会预读并回放请求体。小 body 留内存；
+        # 超过阈值后落到有界临时文件，避免合法图片 body 长时间驻留内存。
+        "defaultMaxRequestBodyBytes": 8388608,
+        "defaultMaxRequestBodyEvents": 4096,
+        "defaultMaxQueuedBodyBytesPerKey": 33554432,
+        "maxQueuedBodyBytes": 134217728,
+        "queuedBodySpoolThresholdBytes": 1048576,
+        "queuedBodySpoolDirectory": "",
+        "defaultMaxQueuedBodySpoolBytesPerKey": 536870912,
+        "maxQueuedBodySpoolBytes": 2147483648,
     },
     "oauthAccounts": [],
     "channels": [],

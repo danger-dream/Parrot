@@ -1211,17 +1211,16 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
                 "disabled_until": None}
     return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
 
-def _quota_disabled_until_still_future(acc: dict) -> bool:
-    dt = _parse_iso(acc.get("disabled_until"))
-    if dt is None:
-        return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt > datetime.now(timezone.utc)
-
-
 def _usage_has_any_quota_signal(usage: dict) -> bool:
     return any(u is not None for u in extract_utils_percent(usage))
+
+
+def _explicit_openai_wham_limit(usage: dict) -> bool:
+    """Whether a WHAM response explicitly says routing is unavailable."""
+    openai = usage.get("openai") if isinstance(usage, dict) else None
+    if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
+        return False
+    return openai.get("allowed") is False or openai.get("limit_reached") is True
 
 
 def openai_plan_workspace_label(acc: dict | None) -> str:
@@ -1360,8 +1359,7 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
 
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
-                                 fresh: bool = True,
-                                 respect_disabled_until: bool = True) -> dict:
+                                 fresh: bool = True) -> dict:
     """核心策略：拿到新鲜 usage 后评估禁用/恢复，并执行状态切换。
 
     规则：
@@ -1372,19 +1370,18 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       • 所有窗口 util < threshold → 可用
           - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
-          - OpenAI 账号若仍处于 disabled_until 冷却期，或仍有未过期的 Codex
-            响应头超限快照，继续保持 quota 禁用，避免 WHAM/Codex 边界不同步
-            导致“假恢复”。
-          - OpenAI 账号只有在冷却期/响应头快照都过期，且本轮新鲜有效 usage
-            全部低于阈值时，才 set_enabled(True) 自动恢复。
-            respect_disabled_until=False 的官方 reset credit / 手动强刷新路径例外：
-            上游已确认消耗 reset 后，可用新鲜 usage 直接覆盖本地旧冷却时间。
+          - OpenAI 账号若仍有未过期的 Codex 响应头超限快照，继续保持 quota
+            禁用，避免 WHAM/Codex 边界不同步导致“假恢复”。
+          - 若 Codex 没有活动的超限快照，且本轮新鲜有效 usage 全部低于阈值，
+            说明上游窗口已经重置；直接恢复并清除旧 disabled_until。旧时间只是
+            上次超限时的预测，不能覆盖更新后的上游事实。
           - Grok 账号使用官方 billing 月度快照，fresh usage 低于阈值即可恢复。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
     返回: {
       "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
+                "wham_limit_disabled"|"wham_limit_keep_disabled"|
                 "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
       "utils": [5h, 7d, 30d, sonnet, opus],   # None 表示该指标缺失
       "any_over": bool,
@@ -1419,6 +1416,28 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 "hit_windows": hit_windows,
                 "disabled_until": acc.get("disabled_until")}
 
+    # WHAM's explicit gate is authoritative even when its percentage windows
+    # are absent or temporarily report a low number.  In particular, never turn
+    # "allowed: false" / "limit_reached: true" into quota recovery.
+    wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage)
+    if wham_limit:
+        hit_windows.append("WHAM limit")
+        if reason == "quota":
+            return {"action": "wham_limit_keep_disabled", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": acc.get("disabled_until")}
+        latest_reset = reset_iso_for_hit_windows(usage, threshold)
+        try:
+            set_disabled_by_quota(account_key, latest_reset)
+        except Exception as exc:
+            print(f"[oauth] evaluate WHAM disable failed for {account_key}: {exc}")
+            return {"action": "disable_failed", "utils": utils,
+                    "any_over": True, "hit_windows": hit_windows,
+                    "disabled_until": None}
+        return {"action": "wham_limit_disabled", "utils": utils,
+                "any_over": True, "hit_windows": hit_windows,
+                "disabled_until": latest_reset}
+
     cached_codex_hit = None
     if provider_of(account_key) == "openai":
         cached_codex_hit = _cached_openai_codex_quota_hit(account_key, threshold)
@@ -1447,11 +1466,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": "disabled", "utils": utils, "any_over": True,
                 "hit_windows": hit_windows, "disabled_until": latest_reset}
 
-    # 全部窗口都可用。OpenAI 的 usage 来自响应头/最小 probe 的缓存合成，
-    # 空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其 quota 禁用账号不能
-    # 因 [None, None, None, None] 被误恢复。若 disabled_until 仍在未来，也不
-    # 提前恢复：OpenAI WHAM 与 Codex 响应头在边界附近会不同步，提前恢复会
-    # 造成“恢复通知 → 下一次请求马上响应头禁用”的假恢复。
+    # 全部窗口都可用。空缓存或被节流跳过的旧缓存不能证明额度恢复；尤其
+    # quota 禁用账号不能因 [None, None, None, None] 被误恢复。OpenAI 若仍有
+    # 活动的 Codex 超限快照，前面的 any_over 分支已经保持禁用；否则新鲜
+    # WHAM 低用量应覆盖旧 disabled_until，因为后者只是上次超限时的预测。
     if reason == "quota":
         if provider in ("openai", "xai"):
             if not _usage_has_any_quota_signal(usage):
@@ -1462,13 +1480,6 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
-            # OpenAI/Codex 的 WHAM 与响应头窗口可能短暂不同步，需等本地
-            # disabled_until 过期；Grok 使用官方 billing 月度快照，fresh 数据
-            # 低于阈值即可恢复，避免充值/提额后被锁到月底。
-            if provider == "openai" and respect_disabled_until and _quota_disabled_until_still_future(acc):
-                return {"action": "quota_cooldown_keep_disabled", "utils": utils,
-                        "any_over": False, "hit_windows": [],
-                        "disabled_until": acc.get("disabled_until")}
         try:
             set_enabled(account_key, True)
         except Exception as exc:
@@ -1476,8 +1487,18 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             return {"action": "resume_failed", "utils": utils,
                     "any_over": False, "hit_windows": [],
                     "disabled_until": acc.get("disabled_until")}
+        runtime_state = None
+        if provider == "openai" and fresh:
+            # A genuine fresh recovery must also remove local cooldown/snapshot
+            # state or routing can remain blocked after the account is enabled.
+            # Preserve the just-written fresh quota cache for status and future
+            # evaluation.
+            runtime_state = _clear_oauth_runtime_state(
+                account_key, clear_quota_cache=False,
+            )
         return {"action": "resumed", "utils": utils, "any_over": False,
-                "hit_windows": [], "disabled_until": None}
+                "hit_windows": [], "disabled_until": None,
+                "runtime_state": runtime_state}
     return {"action": "kept_enabled", "utils": utils, "any_over": False,
             "hit_windows": [], "disabled_until": None}
 
@@ -2116,11 +2137,11 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
         out["available_count"] = reset_credits.get("available_count")
 
-    eval_result = evaluate_and_toggle_by_usage(
-        canonical, usage, fresh=True, respect_disabled_until=False,
-    )
+    eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
     out["quota_action"] = eval_result
-    if eval_result.get("action") in ("resumed", "kept_enabled") and not eval_result.get("any_over"):
+    if eval_result.get("action") == "resumed":
+        out["runtime_clear"] = eval_result.get("runtime_state")
+    elif eval_result.get("action") == "kept_enabled" and not eval_result.get("any_over"):
         out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)
     return out
 
@@ -2553,7 +2574,7 @@ async def quota_monitor_once() -> dict:
         elif provider == "xai":
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
 
-        if action == "disabled":
+        if action in ("disabled", "wham_limit_disabled"):
             latest_reset = result["disabled_until"]
             hit = " / ".join(result["hit_windows"]) or "?"
             out[email] = f"disabled_quota:{latest_reset}"
@@ -2565,8 +2586,8 @@ async def quota_monitor_once() -> dict:
                 f"重置时间: <code>{_to_bjt(latest_reset) if latest_reset else 'unknown'}</code>\n"
                 "所有撞到窗口恢复后即可自动解禁。"
             )
-        elif action == "still_over_quota":
-            out[email] = "still_over_quota"
+        elif action in ("still_over_quota", "wham_limit_keep_disabled"):
+            out[email] = action
         elif action == "resumed":
             out[email] = "resumed"
             notifier.throttled_notify_event_sync(

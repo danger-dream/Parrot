@@ -13,7 +13,8 @@
         "enabled": null,
         "maxConcurrent": null,
         "maxQueue": null,
-        "queueWaitSeconds": null
+        "queueWaitSeconds": null,
+        "maxQueuedBodySpoolBytes": null
       }
     }
   },
@@ -21,7 +22,15 @@
     "enabled": true,
     "defaultMaxConcurrent": 5,
     "defaultMaxQueue": 50,
-    "defaultQueueWaitSeconds": 1800
+    "defaultQueueWaitSeconds": 1800,
+    "defaultMaxRequestBodyBytes": 8388608,
+    "defaultMaxRequestBodyEvents": 4096,
+    "defaultMaxQueuedBodyBytesPerKey": 33554432,
+    "maxQueuedBodyBytes": 134217728,
+    "queuedBodySpoolThresholdBytes": 1048576,
+    "queuedBodySpoolDirectory": "",
+    "defaultMaxQueuedBodySpoolBytesPerKey": 536870912,
+    "maxQueuedBodySpoolBytes": 2147483648
   },
   "oauthAccounts": [],
   "channels": [

@@ -2269,10 +2269,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             fields = metadata_action.get("fields") or {}
             if fields.get("plan_type"):
                 head += f"\n🏷 套餐信息已刷新: <code>{ui.escape_html(fields.get('plan_type'))}</code>"
-        if quota_action and quota_action.get("action") == "disabled":
+        if quota_action and quota_action.get("action") in ("disabled", "wham_limit_disabled"):
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
-        elif quota_action and quota_action.get("action") == "still_over_quota":
+        elif quota_action and quota_action.get("action") in ("still_over_quota", "wham_limit_keep_disabled"):
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
             head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
         elif quota_action and quota_action.get("action") == "resumed":
@@ -2453,7 +2453,10 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
                 prefix += "✅ 已刷新最新额度，确认低于阈值；已自动解除 quota 禁用并清理模型冷却。\n"
             elif action == "kept_enabled":
                 prefix += "✅ 已刷新最新额度，账号保持可用；已清理相关模型冷却。\n"
-            elif action in ("still_over_quota", "disabled"):
+            elif action in (
+                "still_over_quota", "disabled",
+                "wham_limit_keep_disabled", "wham_limit_disabled",
+            ):
                 hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
                 prefix += f"⚠️ 已刷新最新额度，但仍超限（<code>{ui.escape_html(hit)}</code>）；本地 quota 限制已保留。\n"
             elif action == "quota_unknown_keep_disabled":
@@ -2899,10 +2902,10 @@ def _run_refresh_all_legacy_panel(chat_id: int, progress_mid: int, account_keys:
                 quota_action = _evaluate_quota_action(ak, usage)
             else:
                 quota_action = None
-            if quota_action and quota_action.get("action") == "disabled":
+            if quota_action and quota_action.get("action") in ("disabled", "wham_limit_disabled"):
                 hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
                 lines.append(f"  🔒 触发自动禁用（超限窗口: <code>{ui.escape_html(hit)}</code>）")
-            elif quota_action and quota_action.get("action") == "still_over_quota":
+            elif quota_action and quota_action.get("action") in ("still_over_quota", "wham_limit_keep_disabled"):
                 hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
                 lines.append(f"  ⚠ 仍未恢复，维持禁用（超限: <code>{ui.escape_html(hit)}</code>）")
             elif quota_action and quota_action.get("action") == "resumed":
