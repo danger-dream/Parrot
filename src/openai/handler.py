@@ -447,6 +447,11 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             )
 
         msg = f"No available upstream channels for model: {model} (ingress={ingress_protocol})"
+        exclusion_summary = result.exclusion_summary()
+        print(
+            f"[scheduler] no channels ingress={ingress_protocol} model={model}: "
+            f"{exclusion_summary}"
+        )
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
@@ -460,7 +465,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
             f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} 入口）\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"入口: <code>{ingress_protocol}</code> / 模型: <code>{ek(model)}</code>\n"
-            "请检查该家族是否有启用且未冷却的渠道。",
+            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
+            "请按筛选详情检查渠道状态。",
         )
         # 区分 model-not-exist（任何家族都没有的模型）与 no-candidates
         err_type = errors.ErrTypeOpenAI.NOT_FOUND if _model_never_supported(model) \

@@ -7,11 +7,13 @@ this object and are deliberately excluded.
 
 Business fields are transport-mode specific:
 
-* ``http_stream``: connection ends at final response headers; first-byte and
-  idle both start there.  Every non-empty response-body bytes chunk is activity.
-* ``http_non_stream``: connection ends at the reliable request-body-send
-  completion trace event.  First-byte is not applicable.  Idle starts only after
-  the first non-empty response-body bytes chunk.
+* ``http_stream``: connection ends at the reliable request-body-send completion
+  trace event.  First-byte then covers the complete wait for response headers
+  plus the first non-empty response-body bytes chunk; idle starts at the same
+  boundary.  Every later non-empty response-body bytes chunk is activity.
+* ``http_non_stream``: connection also ends at request-body-send completion.
+  First-byte is not applicable.  Idle starts only after the first non-empty
+  response-body bytes chunk.
 * ``ws``: connection ends when the WebSocket handshake API returns; first-byte
   and idle both start there.  Every non-empty bytes/text frame is activity.
 
@@ -340,11 +342,12 @@ class UpstreamRoundTiming:
     async def wait_for(self, awaitable, timeouts: RoundTimeouts):
         """Await I/O while reacting to monotonic round-state deadline changes.
 
-        This matters for non-stream HTTP: ``ctx.__aenter__`` is still waiting for
-        response headers after the request body has been sent, but the business
-        connection deadline must stop at that send-complete trace event.  The
-        same task then continues under total-only semantics without being
-        cancelled and restarted.
+        This matters for HTTP: ``ctx.__aenter__`` is still waiting for response
+        headers after the request body has been sent, but the business connection
+        deadline must stop at that send-complete trace event.  The same task then
+        continues without being cancelled and restarted: stream requests switch
+        to first-byte/idle/total semantics, while non-stream requests switch to
+        total-only semantics until body activity begins.
         """
 
         task = asyncio.ensure_future(awaitable)
@@ -600,11 +603,13 @@ class HttpAttemptTiming(UpstreamRoundTiming):
         elif event in self._RESPONSE_HEADERS_EVENTS and self._response_headers_wait_ms is None:
             self._response_headers_wait_ms = elapsed
 
-        if state == "complete":
-            if self.request_mode == "http_non_stream" and event in self._UPLOAD_EVENTS:
-                self.mark_connection_complete(now)
-            elif self.request_mode == "http_stream" and event in self._RESPONSE_HEADERS_EVENTS:
-                self.mark_connection_complete(now)
+        if state == "complete" and event in self._UPLOAD_EVENTS:
+            # ``connect`` is a transport/upload deadline, not a server-think-time
+            # deadline.  In particular, stream requests may legitimately wait
+            # longer than ``timeouts.connect`` for response headers; that wait is
+            # governed by ``firstByte``.  HTTPcore emits this milestone for both
+            # fresh and reused connections, unlike TCP/TLS trace events.
+            self.mark_connection_complete(now)
 
     def record_proxy_tcp(self, started_at: float, ended_at: float) -> None:
         """Record SS2022's directly observed proxy-server TCP dial."""

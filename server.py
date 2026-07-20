@@ -904,6 +904,11 @@ async def proxy_messages(request: Request):
             )
 
         msg = f"No available upstream channels for model: {model}"
+        exclusion_summary = result.exclusion_summary()
+        print(
+            f"[scheduler] no channels ingress=anthropic model={model}: "
+            f"{exclusion_summary}"
+        )
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
@@ -916,7 +921,8 @@ async def proxy_messages(request: Request):
             "🚨 <b>无可用渠道</b>\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"请求模型: <code>{ek(model)}</code>\n"
-            "请检查渠道是否全部禁用或全部进入冷却。"
+            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
+            "请按筛选详情检查渠道状态。"
         )
         # 先尝试更精准的错误类型：model 不在任何渠道 → not_found；所有渠道冷却 → api_error
         err_type = errors.ErrType.NOT_FOUND if _model_never_supported(model) else errors.ErrType.API

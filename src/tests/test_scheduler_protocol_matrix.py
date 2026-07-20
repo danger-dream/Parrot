@@ -19,6 +19,40 @@ def _ch(key, protocol, alias="m", real="real", type="api"):
     return FakeChannel(key=key, protocol=protocol, alias=alias, real=real, type=type)
 
 
+def test_schedule_explains_disabled_and_cooldown_exclusions(monkeypatch):
+    disabled = _ch("api:disabled", "anthropic")
+    disabled.enabled = False
+    cooling = _ch("api:cooling", "anthropic")
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: [disabled, cooling])
+    monkeypatch.setattr(
+        scheduler.cooldown,
+        "is_blocked",
+        lambda key, model: key == "api:cooling",
+    )
+    monkeypatch.setattr(
+        scheduler.cooldown,
+        "get_state",
+        lambda key, model: {"cooldown_until": -1} if key == "api:cooling" else None,
+    )
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    result = scheduler.schedule(
+        {"model": "m", "messages": []},
+        api_key_name="k",
+        client_ip="127.0.0.1",
+        ingress_protocol="anthropic",
+    )
+
+    assert not result
+    assert result.exclusions == [
+        {"channel": "api:disabled", "reason": "disabled"},
+        {"channel": "api:cooling", "reason": "cooldown", "detail": "permanent"},
+    ]
+    assert result.exclusion_summary() == (
+        "api:disabled=disabled; api:cooling=cooldown(permanent)"
+    )
+
+
 def test_filter_candidates_uses_matrix_and_phase8_reachability(monkeypatch):
     channels = [
         _ch("a", "anthropic"),

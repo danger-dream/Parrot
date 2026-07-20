@@ -22,7 +22,7 @@ _INSPECT_PAGE_SIZE = 6
 _ITEM_PREVIEW_CHARS = 1500
 
 
-_STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
+_STATUS_ICON = {"success": "✅", "error": "❌", "cancelled": "⏹", "pending": "⏳"}
 
 def _retry_chain_mark(outcome: str) -> str:
     if outcome == "success":
@@ -766,8 +766,9 @@ def _render_detail(detail: dict) -> str:
         if summary:
             lines.append("  合计: " + " · ".join(summary))
 
-    if status == "error" and log.get("error_message"):
-        lines.extend(["", "<b>最终错误</b>"])
+    if status in ("error", "cancelled") and log.get("error_message"):
+        title = "客户端取消" if status == "cancelled" else "最终错误"
+        lines.extend(["", f"<b>{title}</b>"])
         _append_detail_text(lines, _extract_error_summary(str(log["error_message"])), italic=True)
 
     return "\n".join(lines)

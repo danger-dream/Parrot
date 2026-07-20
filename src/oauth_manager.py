@@ -1997,8 +1997,10 @@ def delete_account(account_key: str) -> None:
     ch_key = f"oauth:{cleanup_key}"
     load_balancing.sync_channel_removed(ch_key)
     state_db.perf_delete(ch_key)
-    state_db.error_delete(ch_key)
-    # 走内存 + state.db 双清接口，避免只清硬盘留下内存脏亲和。
+    # cooldown 与亲和都必须走各自的内存 + state.db 双清接口；否则同一
+    # account key 在当前进程内重新添加后可能继承只存在于内存的冻结状态。
+    from . import cooldown as _cooldown
+    _cooldown.clear(ch_key, notify_recovered=False)
     from . import affinity as _affinity
     _affinity.delete_by_channel(ch_key)
     try:

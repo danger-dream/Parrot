@@ -28,7 +28,8 @@ class ScheduleResult:
                  client_key: Optional[str] = None,
                  saturated: Optional[list[tuple[Channel, str]]] = None,
                  route_plans: Optional[dict[tuple[str, str], RoutePlan]] = None,
-                 guard_errors: Optional[list[str]] = None):
+                 guard_errors: Optional[list[str]] = None,
+                 exclusions: Optional[list[dict]] = None):
         self.candidates = candidates
         self.fp_query = fp_query         # 本次请求计算得到的查询指纹（可用于后续事件记录）
         self.affinity_hit = affinity_hit
@@ -39,6 +40,21 @@ class ScheduleResult:
         self.route_plans: dict[tuple[str, str], RoutePlan] = route_plans or {}
         self.guard_errors: list[str] = guard_errors or []
         self.guard_error: Optional[str] = self.guard_errors[0] if self.guard_errors else None
+        # 仅供内部日志/告警使用，不回显给 API 客户端。每项代表一个原本支持
+        # requested_model、但在调度筛选中被排除的渠道。
+        self.exclusions: list[dict] = exclusions or []
+
+    def exclusion_summary(self, limit: int = 12) -> str:
+        parts: list[str] = []
+        for item in self.exclusions[:max(0, int(limit))]:
+            channel = str(item.get("channel") or "?")
+            reason = str(item.get("reason") or "unknown")
+            detail = str(item.get("detail") or "").strip()
+            parts.append(f"{channel}={reason}{f'({detail})' if detail else ''}")
+        remaining = len(self.exclusions) - len(parts)
+        if remaining > 0:
+            parts.append(f"+{remaining} more")
+        return "; ".join(parts) or "no model-supporting channels"
 
     def route_plan_for(self, ch: Channel, model: str) -> Optional[RoutePlan]:
         return self.route_plans.get((getattr(ch, "key", ""), model))
@@ -52,6 +68,7 @@ class ScheduleResult:
 def _filter_candidates(requested_model: str,
                        ingress_protocol: str = "anthropic",
                        body: Optional[dict] = None,
+                       diagnostics: Optional[list[dict]] = None,
                        ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]], dict[tuple[str, str], RoutePlan], list[str]]:
     """返回 (available, saturated, route_plans)：
        available = 可立即尝试的候选；
@@ -62,13 +79,20 @@ def _filter_candidates(requested_model: str,
     saturated: list[tuple[Channel, str]] = []
     route_plans: dict[tuple[str, str], RoutePlan] = {}
     guard_errors: list[str] = []
+    excluded = diagnostics if diagnostics is not None else []
     for ch in registry.all_channels():
-        if not ch.enabled:
-            continue
-        if ch.disabled_reason:
-            continue
         resolved = ch.supports_model(requested_model)
         if resolved is None:
+            continue
+        if not ch.enabled:
+            excluded.append({"channel": ch.key, "reason": "disabled"})
+            continue
+        if ch.disabled_reason:
+            excluded.append({
+                "channel": ch.key,
+                "reason": "disabled_reason",
+                "detail": str(ch.disabled_reason)[:240],
+            })
             continue
         ch_protocol = getattr(ch, "protocol", "anthropic")
         try:
@@ -80,11 +104,25 @@ def _filter_candidates(requested_model: str,
             )
         except ProtocolGuardError as exc:
             guard_errors.append(exc.reason)
+            excluded.append({
+                "channel": ch.key,
+                "reason": "protocol_guard",
+                "detail": str(exc.reason)[:240],
+            })
             continue
         route_plans[(ch.key, resolved)] = route_plan
         if cooldown.is_blocked(ch.key, resolved):
+            state = cooldown.get_state(ch.key, resolved) or {}
+            until = state.get("cooldown_until")
+            detail = "permanent" if until == -1 else f"until={until}"
+            excluded.append({
+                "channel": ch.key,
+                "reason": "cooldown",
+                "detail": detail,
+            })
             continue
         if concurrency.is_saturated(ch.key):
+            excluded.append({"channel": ch.key, "reason": "saturated"})
             saturated.append((ch, resolved))
             continue
         available.append((ch, resolved))
@@ -155,9 +193,19 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     if not requested_model:
         return ScheduleResult([], None, False)
 
-    candidates, saturated, route_plans, guard_errors = _filter_candidates(requested_model, ingress_protocol, body=body)
+    exclusions: list[dict] = []
+    candidates, saturated, route_plans, guard_errors = _filter_candidates(
+        requested_model,
+        ingress_protocol,
+        body=body,
+        diagnostics=exclusions,
+    )
     if not candidates and not saturated:
-        return ScheduleResult([], None, False, guard_errors=guard_errors)
+        return ScheduleResult(
+            [], None, False,
+            guard_errors=guard_errors,
+            exclusions=exclusions,
+        )
 
     if fp_query is None and ingress_protocol == "anthropic":
         fp_query = fingerprint.fingerprint_query(
@@ -183,4 +231,5 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
 
     return ScheduleResult(candidates, fp_query, affinity_hit,
                           client_key=client_key, saturated=saturated,
-                          route_plans=route_plans, guard_errors=guard_errors)
+                          route_plans=route_plans, guard_errors=guard_errors,
+                          exclusions=exclusions)

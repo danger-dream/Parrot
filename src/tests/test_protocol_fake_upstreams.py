@@ -115,6 +115,23 @@ class ChunkedByteStream(httpx.AsyncByteStream):
             yield chunk
 
 
+class TerminalThenHangByteStream(httpx.AsyncByteStream):
+    """Yield one complete Responses payload but deliberately never send EOF."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.release = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        yield self.payload
+        await self.release.wait()
+
+    async def aclose(self):
+        self.closed.set()
+        self.release.set()
+
+
 def _json_request(req: httpx.Request) -> dict:
     return json.loads(req.content.decode("utf-8"))
 
@@ -1086,6 +1103,173 @@ async def test_anthropic_client_to_openai_responses_stream_fake_upstream(m):
     assert '"type":"content_block_delta"' in text
     assert '"text":"responses stream pong"' in text
     assert '"stop_reason":"end_turn"' in text
+
+
+async def test_responses_terminal_event_finishes_without_waiting_for_http_eof(m):
+    _setup(m)
+    router = MockRouter()
+    terminal_payload = _responses_sse_response("terminal without eof").content
+    hanging = TerminalThenHangByteStream(terminal_payload)
+
+    def handler(req: httpx.Request):
+        return httpx.Response(
+            200,
+            stream=hanging,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router.register("https://responses-no-eof.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-no-eof",
+            "https://responses-no-eof.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+    text = await asyncio.wait_for(_consume_streaming_to_string(resp), timeout=1.0)
+    await mc.aclose()
+
+    assert "terminal without eof" in text
+    assert hanging.closed.is_set()
+
+
+async def test_stream_generator_aclose_records_cancelled_without_cooldown(m, monkeypatch):
+    _setup(m)
+    router = MockRouter()
+    partial_payload = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": "resp_partial", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "item_id": "msg_partial",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial",
+        }),
+    ])
+    hanging = TerminalThenHangByteStream(partial_payload)
+    router.register(
+        "https://responses-aclose.example",
+        lambda req: httpx.Response(
+            200,
+            stream=hanging,
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-aclose",
+            "https://responses-aclose.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+    finish_statuses: list[str] = []
+    original_finish_error = m["log_db"].finish_error
+
+    def recorded_finish_error(*args, **kwargs):
+        finish_statuses.append(str(kwargs.get("status") or "error"))
+        return original_finish_error(*args, **kwargs)
+
+    monkeypatch.setattr(m["log_db"], "finish_error", recorded_finish_error)
+    iterator = resp.body_iterator
+    emitted = b""
+    for _ in range(10):
+        item = await asyncio.wait_for(anext(iterator), timeout=1.0)
+        emitted += item.encode() if isinstance(item, str) else item
+        if b"partial" in emitted:
+            break
+    assert b"partial" in emitted
+    await iterator.aclose()
+    await mc.aclose()
+
+    latest = m["log_db"]._get_conn().execute(
+        "SELECT status, error_message FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert finish_statuses == ["cancelled"]
+    assert latest is not None and latest["status"] == "cancelled"
+    assert latest["error_message"] == "client disconnected"
+    assert hanging.closed.is_set()
+    assert m["cooldown"].get_state("api:responses-aclose", "gpt-real") is None
+
+
+async def test_terminal_finalization_survives_consumer_cancellation_between_db_writes(m, monkeypatch):
+    _setup(m)
+    router = MockRouter()
+    router.register(
+        "https://responses-cancel.example",
+        lambda req: _responses_sse_response("cancel after terminal"),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-cancel",
+            "https://responses-cancel.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+
+    retry_write_entered = asyncio.Event()
+    release_retry_write = asyncio.Event()
+    finish_success_calls: list[str] = []
+    original_to_thread = asyncio.to_thread
+    original_finish_success = m["log_db"].finish_success
+
+    async def controlled_to_thread(func, /, *args, **kwargs):
+        if func is m["log_db"].update_retry_attempt:
+            retry_write_entered.set()
+            await release_retry_write.wait()
+        return func(*args, **kwargs)
+
+    def recorded_finish_success(request_id, *args, **kwargs):
+        finish_success_calls.append(str(request_id))
+        return original_finish_success(request_id, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", controlled_to_thread)
+    monkeypatch.setattr(m["log_db"], "finish_success", recorded_finish_success)
+    consumer = asyncio.create_task(_consume_streaming_to_string(resp))
+    await asyncio.wait_for(retry_write_entered.wait(), timeout=1.0)
+    consumer.cancel()
+    await asyncio.sleep(0)
+    assert not consumer.done()
+
+    release_retry_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await mc.aclose()
+    monkeypatch.setattr(asyncio, "to_thread", original_to_thread)
+
+    assert len(finish_success_calls) == 1
 
 
 async def test_anthropic_messages_stream_invalid_image_http_400_short_circuits(m):

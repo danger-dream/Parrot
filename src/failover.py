@@ -1763,10 +1763,22 @@ def _attach_release_to_response(response: Response, release_fn) -> None:
             async for chunk in original:
                 yield chunk
         finally:
+            # Closing an async-generator wrapper while it is suspended at
+            # ``yield`` does not automatically aclose the wrapped iterator.
+            # Propagate ownership explicitly so its request-log finalizer and
+            # upstream response-context cleanup always run.
             try:
-                release_fn()
-            except Exception:
-                pass
+                aclose = getattr(original, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await await_ws_owned(aclose())
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    release_fn()
+                except Exception:
+                    pass
 
     response.body_iterator = _wrapped()
 
@@ -3651,6 +3663,18 @@ async def _consume_stream(
     # 3. 通过检查 → 开始向下游发 ★
     state: dict = {"finalized": False}
 
+    def _responses_terminal_received() -> bool:
+        """Responses 的显式终态就是 I/O 边界，不再额外等待 HTTP EOF。
+
+        部分兼容上游会在 response.completed/failed/incomplete 后保持连接；继续
+        等 EOF 会长期占用共享连接池，而且客户端收到终态后断开还会把正常请求
+        带进 cancellation 收尾路径。
+        """
+        return (
+            ch_proto == "openai-responses"
+            and bool(getattr(tracker, "saw_stream_end", False))
+        )
+
     async def _persist_stream_retry(outcome: str, error_detail: str | None = None):
         if timing is None:
             return None
@@ -3903,7 +3927,7 @@ async def _consume_stream(
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
             http_status=upstream_status, affinity_hit=affinity_hit,
-            response_body=tracker.get_full_response(),
+            response_body=tracker.get_full_response(), status="cancelled",
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -3926,11 +3950,11 @@ async def _consume_stream(
                     getattr(tracker, "stream_error_message", None)
                     or protocol_errors.responses_max_output_context_error_message()
                 )
-                await _emit_error_and_finalize(
+                await await_ws_owned(_emit_error_and_finalize(
                     errors.ErrType.INVALID_REQUEST,
                     msg,
                     outcome="request_invalid",
-                )
+                ))
                 yield _sse_error_for_ingress(
                     ingress_protocol,
                     errors.ErrType.INVALID_REQUEST,
@@ -3944,14 +3968,18 @@ async def _consume_stream(
 
             if getattr(tracker, "saw_stream_error", False):
                 msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-                await _emit_error_and_finalize(
+                await await_ws_owned(_emit_error_and_finalize(
                     "api_error", msg,
                     outcome="stream_upstream_error",
-                )
+                ))
                 return
 
-            # 后续 chunk，带 idle / total 超时
-            while True:
+            # Responses 已在首个下游 chunk 中给出显式终态时直接收尾；否则继续
+            # 读取。普通 Chat/Anthropic 仍保留原有 EOF/终态生成规则。
+            upstream_terminal = _responses_terminal_received()
+
+            # 后续 chunk，带 first-byte / idle / total 超时
+            while not upstream_terminal:
                 step = await read_next_stream_step(
                     aiter=aiter,
                     channel=ch,
@@ -3976,11 +4004,11 @@ async def _consume_stream(
                     else:
                         err_type = errors.ErrType.API
                     msg = step.message or "stream error"
-                    await _emit_error_and_finalize(
+                    await await_ws_owned(_emit_error_and_finalize(
                         err_type,
                         msg,
                         outcome=step.outcome or "transport_error",
-                    )
+                    ))
                     yield _sse_error_for_ingress(
                         ingress_protocol,
                         err_type,
@@ -3994,11 +4022,11 @@ async def _consume_stream(
                     return
                 if step.kind == "blacklist":
                     msg = step.message or "blacklist"
-                    await _emit_error_and_finalize(
+                    await await_ws_owned(_emit_error_and_finalize(
                         errors.ErrType.API,
                         msg,
                         outcome="blacklist_hit",
-                    )
+                    ))
                     yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
                     return
 
@@ -4011,11 +4039,14 @@ async def _consume_stream(
                 # 错误并结束，避免被 finally/CancelledError 误标成 client disconnected。
                 if getattr(tracker, "saw_stream_error", False):
                     msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-                    await _emit_error_and_finalize(
+                    await await_ws_owned(_emit_error_and_finalize(
                         "api_error", msg,
                         outcome="stream_upstream_error",
-                    )
+                    ))
                     return
+
+                if _responses_terminal_received():
+                    upstream_terminal = True
 
             # 上游已正常收尾 → 先让 translator 生成终态帧/完成内部副作用，
             # 再落库 success，最后 yield 终态帧。这样 close()/Store 阶段若异常，
@@ -4024,18 +4055,26 @@ async def _consume_stream(
             terminal_chunks: list[bytes] = []
             if stream_translator is not None:
                 terminal_chunks = list(stream_translator.close())
-            await _finalize_success()
+            # terminal owner 在客户端恰好于终态帧附近断开时也必须完成 retry、
+            # proxy 和 request_log 三者落账，不能留下半完成 pending。
+            await await_ws_owned(_finalize_success())
             for out in terminal_chunks:
                 yield out
         except asyncio.CancelledError:
-            # 客户端断开（或上层取消）：不归咎上游，不记 cooldown/scorer
-            await _finalize_client_cancelled()
+            # 客户端断开（或上层取消）：不归咎上游，不记 cooldown/scorer。
+            # 独立 terminal task 必须先完成持久化，再向上重新抛取消。
+            await await_ws_owned(_finalize_client_cancelled())
+            raise
+        except GeneratorExit:
+            # StreamingResponse/ASGI 主动 aclose async generator 时可能使用
+            # GeneratorExit 而不是 CancelledError，语义同样是下游结束消费。
+            await await_ws_owned(_finalize_client_cancelled())
             raise
         except BaseException as exc:
-            await _emit_error_and_finalize(
+            await await_ws_owned(_emit_error_and_finalize(
                 "api_error", f"stream error: {exc}",
                 outcome="transport_error",
-            )
+            ))
             raise
         finally:
             await _safe_exit(ctx)

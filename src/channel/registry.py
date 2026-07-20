@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from .. import config, load_balancing, state_db
+from .. import config, cooldown, load_balancing, state_db
 from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
@@ -84,7 +84,10 @@ def _sync_state_db_with_channels() -> None:
 
     for row in state_db.error_load_all():
         if row["channel_key"] not in live_keys:
-            state_db.error_delete(row["channel_key"])
+            # cooldown 的内存态与 state.db 必须通过同一个提交点删除。
+            # 直接删 DB 会让同 key 在当前进程内重新出现时仍被旧内存态拦截，
+            # 只能靠重启恢复。
+            cooldown.clear(row["channel_key"], notify_recovered=False)
 
     state_db.affinity_delete_stale_channels(live_keys)
     state_db.client_affinity_delete_stale_channels(live_keys)

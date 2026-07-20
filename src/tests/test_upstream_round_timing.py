@@ -61,15 +61,18 @@ def test_round_identity_and_wall_clock_are_not_duration_inputs():
 
 
 @pytest.mark.asyncio
-async def test_http_stream_final_headers_end_connection_and_raw_bytes_drive_first_idle():
+async def test_http_stream_send_complete_ends_connection_and_first_byte_includes_headers():
     clock = FakeClock()
     timing = HttpAttemptTiming(clock=clock, wall_clock=clock, response_mode="stream")
 
+    await timing.trace("http11.send_request_body.started", {})
+    clock.advance(0.20)
+    await timing.trace("http11.send_request_body.complete", {})
     await timing.trace("http11.receive_response_headers.started", {})
     clock.advance(0.30)
     await timing.trace("http11.receive_response_headers.complete", {})
 
-    assert timing.snapshot().connection_ms == 300
+    assert timing.snapshot().connection_ms == 200
     assert timing.next_deadline(_timeouts(first=0.5, idle=0.2)).outcome == "idle_timeout"
 
     timing.start_response_body_wait()
@@ -77,17 +80,19 @@ async def test_http_stream_final_headers_end_connection_and_raw_bytes_drive_firs
     assert timing.mark_response_body_byte(b"") is False
     assert timing.snapshot().first_byte_ms is None
     assert timing.mark_response_body_byte(b": heartbeat\n\n") is True
-    assert timing.snapshot().first_byte_ms == 100
+    # Business first-byte starts when upload completes, so it includes the
+    # complete 300 ms response-header wait plus the 100 ms body wait.
+    assert timing.snapshot().first_byte_ms == 400
     assert timing.next_deadline(_timeouts(first=0.01, idle=0.4)).outcome == "idle_timeout"
 
     clock.advance(0.25)
     timing.mark_response_body_byte(b" ")
     clock.advance(0.05)
     terminal = timing.finish("success")
-    assert terminal.connection_ms == 300
-    assert terminal.first_byte_ms == 100
+    assert terminal.connection_ms == 200
+    assert terminal.first_byte_ms == 400
     assert terminal.idle_ms == 50
-    assert terminal.total_ms == 700
+    assert terminal.total_ms == 900
     assert terminal.response_headers_wait_ms == 300
     assert terminal.response_body_first_byte_wait_ms == 100
 
@@ -165,17 +170,21 @@ def test_non_stream_snapshot_never_exposes_first_byte_even_after_activity():
 
 
 @pytest.mark.asyncio
-async def test_dynamic_wait_switches_same_non_stream_io_task_after_send_complete():
+@pytest.mark.parametrize("response_mode", ["stream", "non_stream"])
+async def test_dynamic_wait_switches_same_http_io_task_after_send_complete(response_mode):
     clock = FakeClock()
-    timing = HttpAttemptTiming(clock=clock, wall_clock=clock, response_mode="non_stream")
+    timing = HttpAttemptTiming(clock=clock, wall_clock=clock, response_mode=response_mode)
     gate: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-    waiter = asyncio.create_task(timing.wait_for(gate, _timeouts(connection=1, total=10)))
+    waiter = asyncio.create_task(
+        timing.wait_for(gate, _timeouts(connection=1, first=5, idle=5, total=10))
+    )
     await asyncio.sleep(0)
 
     clock.advance(0.8)
     timing.mark_connection_complete()
     await asyncio.sleep(0)
-    # Crossing the old connection deadline must not cancel the same header task.
+    # Crossing the old connection deadline must not cancel the same response
+    # header task.  Stream mode is now governed by first-byte; non-stream by total.
     clock.advance(0.5)
     gate.set_result("headers")
     assert await waiter == "headers"

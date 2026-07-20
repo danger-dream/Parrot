@@ -1148,7 +1148,18 @@ def attach_release_to_response(response: Response, lease: ApiKeyLease) -> Respon
             async for chunk in body_iterator:
                 yield chunk
         finally:
-            await lease.release()
+            # aclose() on this wrapper while suspended at yield does not close
+            # the wrapped iterator automatically.  Propagate the close so the
+            # upstream context and request-log terminal owner cannot be orphaned.
+            try:
+                aclose = getattr(body_iterator, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
+            finally:
+                await lease.release()
 
     response.body_iterator = _wrapped_body_iterator()
     return response

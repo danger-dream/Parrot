@@ -737,7 +737,7 @@ def install_notify_handler() -> None:
 
 # ─── 日志条目共用渲染 ──────────────────────────────────────────────
 
-_LOG_STATUS_ICON = {"success": "✅", "error": "❌", "pending": "⏳"}
+_LOG_STATUS_ICON = {"success": "✅", "error": "❌", "cancelled": "⏹", "pending": "⏳"}
 _LOG_INGRESS_TAG = {"chat": "[chat]", "responses": "[response]", "responses_ws": "[response]"}
 
 
@@ -838,10 +838,11 @@ def fmt_log_entry_body(r: dict) -> str:
     if search_count:
         lines.append(f"  搜索: {search_count} 次")
 
-    # 错误
-    if r.get("status") == "error" and r.get("error_message"):
+    # 错误 / 客户端取消
+    if r.get("status") in ("error", "cancelled") and r.get("error_message"):
         err_short = escape_html(str(r["error_message"])[:120])
-        lines.append(f"  ⚠ <i>{err_short}</i>")
+        marker = "⏹" if r.get("status") == "cancelled" else "⚠"
+        lines.append(f"  {marker} <i>{err_short}</i>")
 
     return "\n".join(lines)
 

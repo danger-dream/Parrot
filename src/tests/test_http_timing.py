@@ -78,6 +78,20 @@ class _Context:
         return None
 
 
+class _DelayedHeadersContext(_Context):
+    def __init__(self, request, *, header_delay: float) -> None:
+        super().__init__(request)
+        self.header_delay = float(header_delay)
+
+    async def __aenter__(self):
+        await self.trace("http11.send_request_body.started", {})
+        await self.trace("http11.send_request_body.complete", {})
+        await self.trace("http11.receive_response_headers.started", {})
+        await asyncio.sleep(self.header_delay)
+        await self.trace("http11.receive_response_headers.complete", {})
+        return self.response
+
+
 def _request():
     return SimpleNamespace(
         method="POST", url="https://unit.invalid", headers={}, body=b"{}",
@@ -177,6 +191,30 @@ async def test_direct_stream_round_records_direct_and_only_nonempty_raw_bytes_ar
     assert updates[-1][1]["outcome"] == "success"
     assert updates[-1][1]["ended_at"] is not None
     assert contexts[0].exited is False  # response owner closes after terminal handling
+
+
+@pytest.mark.asyncio
+async def test_stream_response_headers_may_exceed_connect_timeout(monkeypatch):
+    _inserted, updates = _patch_persistence(monkeypatch)
+    monkeypatch.setattr(
+        http_runtime, "_resolve_http_route_chain",
+        lambda channel, model: ([("direct", None)], None),
+    )
+    monkeypatch.setattr(
+        http_runtime,
+        "open_stream",
+        lambda client, request: _DelayedHeadersContext(request, header_delay=0.05),
+    )
+    kwargs = _open_kwargs()
+    kwargs.update(connect_timeout=0.01, first_byte_timeout=0.2)
+
+    opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
+
+    assert opened.ok
+    assert opened.timing.connection_complete
+    assert opened.connect_ms is not None
+    assert updates[-1][1]["outcome"] == "open"
+    await opened.ctx.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio

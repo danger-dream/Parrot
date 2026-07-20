@@ -1015,13 +1015,15 @@ def finish_error(
     request_upload_ms: int | None = None,
     response_headers_wait_ms: int | None = None,
     response_body_first_byte_wait_ms: int | None = None,
+    status: str = "error",
 ) -> None:
+    terminal_status = "cancelled" if status == "cancelled" else "error"
     handle = _request_handle(request_id)
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         conn.execute(
             """UPDATE request_log SET
-                 status='error', finished_at=?, error_message=?, http_status=?,
+                 status=?, finished_at=?, error_message=?, http_status=?,
                  final_channel_key=?, final_channel_type=?, final_model=?,
                  connect_time_ms=?, first_token_time_ms=?, idle_time_ms=?, total_time_ms=?,
                  final_round_id=?, request_elapsed_ms=?,
@@ -1031,7 +1033,7 @@ def finish_error(
                  response_body_first_byte_wait_ms=?
                WHERE request_id=?""",
             (
-                time.time(), error_message, http_status,
+                terminal_status, time.time(), error_message, http_status,
                 final_channel_key, final_channel_type, final_model,
                 connect_ms, first_token_ms, idle_ms, total_ms,
                 final_round_id, request_elapsed_ms,

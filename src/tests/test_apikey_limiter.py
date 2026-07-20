@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 
 from src import apikey_limiter
 
@@ -624,6 +624,43 @@ async def test_noop_response_attachment_cleans_unread_replay_buffer():
     await asyncio.wait_for(cleaned_up(), timeout=1)
     assert apikey_limiter._queued_body_bytes_total == 0
     assert apikey_limiter._queued_body_bytes_by_key == {}
+
+
+@pytest.mark.asyncio
+async def test_streaming_response_wrapper_propagates_aclose_to_inner_iterator():
+    class InnerStream:
+        def __init__(self):
+            self.sent = False
+            self.closed = False
+            self.release = asyncio.Event()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.sent:
+                self.sent = True
+                return b"chunk"
+            await self.release.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            self.closed = True
+            self.release.set()
+
+    lease = await apikey_limiter.acquire("k")
+    inner = InnerStream()
+    response = apikey_limiter.attach_release_to_response(
+        StreamingResponse(inner), lease
+    )
+    wrapped = response.body_iterator
+
+    assert await anext(wrapped) == b"chunk"
+    await wrapped.aclose()
+
+    assert inner.closed
+    assert lease._released
+    assert apikey_limiter.key_snapshot("k")["in_flight"] == 0
 
 
 @pytest.mark.asyncio

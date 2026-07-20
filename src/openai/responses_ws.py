@@ -443,6 +443,11 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
 
     if not result:
         msg = f"No available upstream channels for model: {model} (ingress=responses_ws)"
+        exclusion_summary = result.exclusion_summary()
+        print(
+            f"[scheduler] no channels ingress=responses_ws model={model}: "
+            f"{exclusion_summary}"
+        )
         await asyncio.to_thread(
             log_db.finish_error, request_id, msg, 0,
             http_status=503, affinity_hit=(1 if result.affinity_hit else 0),
@@ -456,7 +461,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
             f"🚨 <b>无可用渠道</b>（{notifier.provider_tag('openai')} Responses WS 入口）\n"
             f"客户端: <code>{ek(client_ip)}</code> / Key <code>{ek(str(key_name))}</code>\n"
             f"模型: <code>{ek(model)}</code>\n"
-            "请检查该家族是否有启用且未冷却的渠道。",
+            f"筛选详情: <code>{ek(exclusion_summary)}</code>\n"
+            "请按筛选详情检查渠道状态。",
         )
         code = 4404 if _model_never_supported(model) else 4503
         await websocket.close(code=code, reason=_trim_reason(msg))
@@ -1000,6 +1006,7 @@ async def _try_ws_channel(
                         proxy_name=proxy_name_used,
                         proxy_bytes_up=proxy_bytes.up,
                         proxy_bytes_down=proxy_bytes.down,
+                        status="cancelled",
                     )
                 except Exception:
                     pass
@@ -1173,6 +1180,7 @@ async def _try_sse_channel(
                 affinity_hit=affinity_hit,
                 upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                 upstream_transport="sse",
+                status="cancelled",
             ))
         except BaseException:
             pass
@@ -1542,6 +1550,7 @@ async def _try_sse_channel(
                     proxy_name=opened.proxy_name,
                     proxy_bytes_up=proxy_bytes.up,
                     proxy_bytes_down=proxy_bytes.down,
+                    status="cancelled",
                 )
             except Exception:
                 pass
@@ -1721,6 +1730,11 @@ async def _relay_ws_session(
                 proxy_name=proxy_name,
                 proxy_bytes_up=proxy_bytes.up,
                 proxy_bytes_down=proxy_bytes.down,
+                status=(
+                    "cancelled"
+                    if result.outcome in ("cancelled", "client_disconnected")
+                    else "error"
+                ),
             ))
         return result
 
