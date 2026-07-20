@@ -302,8 +302,8 @@ def parse_models_input(raw: str) -> list[dict]:
 | 操作 | state.db 需要做 |
 |---|---|
 | 新增 | 无（新渠道无历史） |
-| 重命名（改 name/email） | `perf_rename_channel`、`error_rename_channel`、`affinity_rename_channel` |
-| 删除 | `perf_delete(key)`、`error_delete(key)`、`affinity_delete_by_channel(key)` |
+| 重命名（改 name/email） | 通过 `channel_state.rename_with_config()` 串行配置/reload、单个 DB 事务和内存镜像发布 |
+| 删除 | 原子发布 config + priorityOrders 删除，给在途 generation 加 tombstone，再通过各运行时模块同步删除 DB 与内存镜像 |
 | 修改 URL / Key / 模型 | 性能/错误数据可保留（但若模型列表变化，旧模型不再被调度） |
 | 禁用 | 不清数据（重新启用可复用） |
 
@@ -312,17 +312,26 @@ def parse_models_input(raw: str) -> list[dict]:
 ```python
 def _sync_state_db_with_channels():
     """config 重建后，清理 state.db 中已不存在的 channel_key 记录。"""
-    live_keys = set(_channels.keys())
-    # perf
-    for row in state_db.perf_load_all():
-        if row["channel_key"] not in live_keys:
-            state_db.perf_delete(row["channel_key"])
-    # errors
-    for row in state_db.error_load_all():
-        if row["channel_key"] not in live_keys:
-            state_db.error_delete(row["channel_key"])
+    live_keys = channel_state.include_transitions(set(_channels.keys()))
+    # 所有带内存镜像的状态都通过模块层清理。scorer 在可选 DB 写
+    # 不可用时会保留 memory-only 评分，因此 stale 集取 DB∪内存。
+    stale_perf = {r["channel_key"] for r in state_db.perf_load_all()
+                  if r["channel_key"] not in live_keys}
+    stale_perf |= {key for key in scorer.channel_keys()
+                   if key not in live_keys}
+    stale_errors = {r["channel_key"] for r in state_db.error_load_all()
+                    if r["channel_key"] not in live_keys}
+    for channel_key in stale_perf:
+        scorer.clear_stats(channel_key)
+    for channel_key in stale_errors:
+        cooldown.clear(channel_key, notify_recovered=False)
     # affinity
-    state_db.affinity_delete_stale_channels(live_keys)
+    affinity.delete_stale_channels(live_keys)
+    affinity.client_delete_stale_channels(live_keys)
 ```
 
 这样渠道删除后，state.db 不会遗留孤儿数据。
+
+运行期改名后，旧 key 会在当前进程内保留为 late-write alias：改名前已经在途的请求仍把评分、冷却和两类 affinity 写到新 key。旧 concurrency slot 按旧 key 原地排空，并冻结改名前的 `maxConcurrent`；即使 slot 先清除、稍后才有旧请求进入，也继续使用冻结值。为避免字符串 key 无法区分旧/新 generation，当前进程内禁止立刻重新创建同名旧 key；重启后不存在旧在途请求和 alias，才可安全复用。
+
+删除渠道时，目标 key 会在 config 删除前进入进程级 tombstone。旧请求的 scorer/cooldown/两类 affinity 与 OAuth quota 副作用都会被丢弃；即使没有 concurrency slot，也可能存在“已选中渠道但尚未 acquire”或关闭并发限制的旧请求，因此 tombstone 必须保留到进程重启，不能仅凭 slot 排空解除。同名渠道只能在重启后安全复用；配置删除失败则立即撤销 tombstone，不改变原渠道。

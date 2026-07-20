@@ -13,12 +13,12 @@ import time
 from types import SimpleNamespace
 from typing import Optional
 
-from . import config, notifier, quota_errors, state_db
+from . import channel_state, config, notifier, quota_errors, state_db
 
 
 _INF = -1  # state.db 中用 -1 表示永久
 
-_lock = threading.Lock()
+_lock = channel_state.mutation_lock
 _entries: dict[tuple[str, str], dict] = {}  # (channel_key, model) -> state
 _initialized = False
 
@@ -111,7 +111,9 @@ def get_state(channel_key: str, model: str) -> Optional[dict]:
 
 def is_blocked(channel_key: str, model: str) -> bool:
     """(channel, model) 是否处于冷却中（永久或未过期的 cooldown_until）。"""
-    state = get_state(channel_key, model)
+    with _lock:
+        channel_key = channel_state.resolve(channel_key)
+        state = get_state(channel_key, model)
     if not state:
         return False
     cd = state.get("cooldown_until")
@@ -154,7 +156,6 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
     """
     windows = _windows()
-    grace = _grace_count(channel_key)
     ladder_min_interval = _ladder_min_interval_ms()
     permanent_min_age = _permanent_min_age_ms()
     explicit_cooldown = cooldown_until
@@ -162,6 +163,10 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     now = _now_ms()
 
     with _lock:
+        channel_key = channel_state.resolve(channel_key)
+        if channel_state.is_deleted(channel_key):
+            return {}
+        grace = _grace_count(channel_key)
         existing = _entries.get((channel_key, model))
         state = dict(existing) if existing is not None else {
             "error_count": 0,
@@ -229,7 +234,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         # Persist before publishing the copied state, while holding the same
         # lock used by clear(). This makes record and clear linearisable and a
         # failed save cannot create a memory-only cooldown.
-        state_db.error_save(channel_key, model, new_count, cooldown_until, message)
+        with state_db.optional_write_timeout():
+            state_db.error_save(channel_key, model, new_count, cooldown_until, message)
         _entries[(channel_key, model)] = state
         result = dict(state)
 
@@ -255,7 +261,8 @@ def _was_actively_blocked(state: dict, now: int) -> bool:
 
 
 def clear(channel_key: str, model: Optional[str] = None, *,
-          notify_recovered: bool = True) -> None:
+          notify_recovered: bool = True,
+          resolve_alias: bool = True) -> None:
     """清除冷却。model=None 清该 channel 下所有模型。
 
     对每个清除前真的在冷却的条目，默认触发 ``channel_recovered`` 事件。
@@ -265,6 +272,8 @@ def clear(channel_key: str, model: Optional[str] = None, *,
     now = _now_ms()
     recovered: list[tuple[str, str, bool]] = []   # (ck, model, was_permanent)
     with _lock:
+        if resolve_alias:
+            channel_key = channel_state.resolve(channel_key)
         if model is None:
             keys = [k for k in _entries if k[0] == channel_key]
         else:
@@ -276,7 +285,8 @@ def clear(channel_key: str, model: Optional[str] = None, *,
                 recovered.append((k[0], k[1], was_perm))
         # Persistent deletion is the commit point. If it fails, leave every
         # in-memory entry intact so current-process and restart behavior agree.
-        state_db.error_delete(channel_key, model)
+        with state_db.optional_write_timeout():
+            state_db.error_delete(channel_key, model)
         for k in keys:
             _entries.pop(k, None)
 
@@ -293,19 +303,22 @@ def clear(channel_key: str, model: Optional[str] = None, *,
 
 def clear_all() -> None:
     with _lock:
-        state_db.error_delete(None, None)
+        with state_db.optional_write_timeout():
+            state_db.error_delete(None, None)
         _entries.clear()
 
 
-def rename_channel(old_key: str, new_key: str) -> None:
+def rename_channel(old_key: str, new_key: str, *, persist: bool = True) -> None:
     if old_key == new_key:
         return
     with _lock:
+        if persist:
+            with state_db.optional_write_timeout():
+                state_db.error_rename_channel(old_key, new_key)
         old_items = [(k, v) for k, v in _entries.items() if k[0] == old_key]
         for (_, model), state in old_items:
             _entries.pop((old_key, model), None)
             _entries[(new_key, model)] = state
-    state_db.error_rename_channel(old_key, new_key)
 
 
 def active_entries(now_ms: Optional[int] = None) -> list[dict]:

@@ -10,8 +10,13 @@
     // previous_response_id 本地 store 相关（见 05）
     "store": {
       "enabled": true,              // 关闭则下游 responses 调 chat 上游时拒绝带 previous_response_id 的请求
+      "dbPath": "openai_response_store.db", // 相对路径以 DATA_DIR 为根；必须与 stateDbPath 不同
       "ttlMinutes": 60,             // 记录 TTL
-      "cleanupIntervalSeconds": 300 // 后台清理周期
+      "cleanupIntervalSeconds": 300, // 后台清理周期
+      "cleanupBatchSize": 100,      // 单个短事务候选行数上限
+      "cleanupBatchBytes": 8388608, // 单个事务 payload 上限；超大单行仍会单独删除
+      "cleanupMaxBatches": 100,     // 每轮清理最多提交批次数
+      "cleanupTimeBudgetSeconds": 10 // 每轮清理时间预算
     },
     // reasoning 跨协议桥接（见 06）
     "reasoningBridge": "passthrough",  // "passthrough" | "drop"
@@ -79,9 +84,10 @@
 
 ## 2.5 不可热加载的字段
 
-与现状一致：`listen.*` / `stateDbPath` / `logDir` / `telegram.*`。
+`listen.*` / `stateDbPath` / `openai.store.dbPath` / `logDir` / `telegram.*`
+需重启。其余 `openai.*` 字段支持热加载。
 
-新增字段 `openai.*` / `channels[].protocol` / `apiKeys[].allowedProtocols` **全部支持热加载**（`config.update` 触发 `registry.rebuild_from_config`，后者按新 `protocol` 重新实例化渠道）。
+除 `openai.store.dbPath` 外，新增的 `openai.*` / `channels[].protocol` / `apiKeys[].allowedProtocols` 支持热加载（`config.update` 触发 `registry.rebuild_from_config`，后者按新 `protocol` 重新实例化渠道）。
 
 ## 2.6 默认值清单（加到 `config.DEFAULT_CONFIG`）
 
@@ -89,8 +95,13 @@
 DEFAULT_CONFIG["openai"] = {
     "store": {
         "enabled": True,
+        "dbPath": "openai_response_store.db",
         "ttlMinutes": 60,
         "cleanupIntervalSeconds": 300,
+        "cleanupBatchSize": 100,
+        "cleanupBatchBytes": 8388608,
+        "cleanupMaxBatches": 100,
+        "cleanupTimeBudgetSeconds": 10,
     },
     "reasoningBridge": "passthrough",
     "translation": {
@@ -126,7 +137,10 @@ DEFAULT_CONFIG["openai"] = {
       "enabled": true }
   ],
   "openai": {
-    "store": { "enabled": true, "ttlMinutes": 60, "cleanupIntervalSeconds": 300 },
+    "store": { "enabled": true, "dbPath": "openai_response_store.db", "ttlMinutes": 60,
+               "cleanupIntervalSeconds": 300, "cleanupBatchSize": 100,
+               "cleanupBatchBytes": 8388608, "cleanupMaxBatches": 100,
+               "cleanupTimeBudgetSeconds": 10 },
     "reasoningBridge": "passthrough",
     "translation": { "enabled": true, "rejectOnBuiltinTools": true, "rejectOnMultiCandidate": true }
   }

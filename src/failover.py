@@ -491,10 +491,10 @@ def _maybe_save_native_responses_store(
             output_items=output_items,
         )
     except Exception as exc:
-        traceback.print_exc()
+        should_log = True
         try:
             ek = notifier.escape_html
-            notifier.throttled_notify_event_sync(
+            should_log = notifier.throttled_notify_event_sync(
                 "openai_store_save_failed",
                 f"openai_store_save_failed:{api_key_name}",
                 f"❌ {notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（native Responses）\n"
@@ -506,6 +506,8 @@ def _maybe_save_native_responses_store(
             )
         except Exception:
             pass
+        if should_log:
+            traceback.print_exc()
 
 
 def _make_stream_translator(translator_ctx: Optional[dict]):

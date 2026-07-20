@@ -220,17 +220,26 @@ def sync_channel_removed(channel_key: str) -> bool:
     changed = {"v": False}
 
     def _mutate(c: dict) -> None:
-        lb = c.setdefault("loadBalancing", {})
-        po = lb.setdefault("priorityOrders", {})
-        for fam in FAMILIES:
-            arr = list(po.get(fam) or [])
-            new = [x for x in arr if x != channel_key]
-            if new != arr:
-                po[fam] = new
-                changed["v"] = True
+        changed["v"] = mutate_channels_removed(c, {channel_key})
 
     config.update(_mutate)
     return changed["v"]
+
+
+def mutate_channels_removed(cfg: dict, channel_keys: set[str]) -> bool:
+    """Pure config mutation for atomically removing priority-order entries."""
+    if not channel_keys:
+        return False
+    changed = False
+    lb = cfg.setdefault("loadBalancing", {})
+    po = lb.setdefault("priorityOrders", {})
+    for fam in FAMILIES:
+        arr = list(po.get(fam) or [])
+        new = [key for key in arr if key not in channel_keys]
+        if new != arr:
+            po[fam] = new
+            changed = True
+    return changed
 
 
 def sync_channel_renamed(old_key: str, new_key: str, family: str) -> bool:
@@ -248,27 +257,35 @@ def sync_channel_renamed(old_key: str, new_key: str, family: str) -> bool:
     changed = {"v": False}
 
     def _mutate(c: dict) -> None:
-        lb = c.setdefault("loadBalancing", {})
-        po = lb.setdefault("priorityOrders", {})
-        for fam in FAMILIES:
-            arr = list(po.get(fam) or [])
-            new_arr: list[str] = []
-            seen: set[str] = set()
-            for key in arr:
-                if fam == family:
-                    k = new_key if key == old_key else key
-                elif key in (old_key, new_key):
-                    continue
-                else:
-                    k = key
-                if k not in seen:
-                    new_arr.append(k)
-                    seen.add(k)
-            if fam == family and new_key not in seen:
-                new_arr.append(new_key)
-            if new_arr != arr:
-                po[fam] = new_arr
-                changed["v"] = True
+        changed["v"] = mutate_channel_renamed(c, old_key, new_key, family)
 
     config.update(_mutate)
     return changed["v"]
+
+
+def mutate_channel_renamed(cfg: dict, old_key: str, new_key: str,
+                           family: str) -> bool:
+    """Pure config mutation used when a caller must publish rename atomically."""
+    lb = cfg.setdefault("loadBalancing", {})
+    po = lb.setdefault("priorityOrders", {})
+    changed = False
+    for fam in FAMILIES:
+        arr = list(po.get(fam) or [])
+        new_arr: list[str] = []
+        seen: set[str] = set()
+        for key in arr:
+            if fam == family:
+                k = new_key if key == old_key else key
+            elif key in (old_key, new_key):
+                continue
+            else:
+                k = key
+            if k not in seen:
+                new_arr.append(k)
+                seen.add(k)
+        if fam == family and new_key not in seen:
+            new_arr.append(new_key)
+        if new_arr != arr:
+            po[fam] = new_arr
+            changed = True
+    return changed

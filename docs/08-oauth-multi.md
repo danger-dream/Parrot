@@ -172,18 +172,27 @@ def add_account(entry: dict):
         config.save()
     registry.rebuild_from_config()
 
-def delete_account(email: str):
-    with _account_lock:
-        cfg = config.get()
-        accounts = cfg.get("oauthAccounts", [])
-        cfg["oauthAccounts"] = [a for a in accounts if a["email"] != email]
-        config.save()
-    # 清理 state.db
-    state_db.perf_delete(f"oauth:{email}")
-    state_db.error_delete(f"oauth:{email}")
-    state_db.affinity_delete_by_channel(f"oauth:{email}")
-    state_db.quota_delete(email)
-    registry.rebuild_from_config()
+def delete_account(account_key: str):
+    # 先解析真正删除的 canonical keys；裸 email 兼容匹配多个 provider。
+    cleanup_keys = resolve_delete_targets(account_key)
+    channel_keys = {f"oauth:{key}" for key in cleanup_keys}
+    with config.serialized_updates(), channel_state.mutation_lock:
+        # 账户与 priorityOrders 在同一次 config update 中发布。
+        for channel in channel_keys:
+            channel_state.retire_deleted(channel)
+        config.update(lambda cfg: remove_accounts_and_priorities(cfg, cleanup_keys))
+        # 进程重启前保留 tombstone；不能仅凭 concurrency slot 排空判断
+        # 已无旧请求。丢弃迟到的评分、冷却、两类 affinity 和 quota 写入。
+        for channel in channel_keys:
+            for generation in channel_state.alias_sources(channel) | {channel}:
+                concurrency.retire_channel(generation, deleted_target=channel)
+        for key in cleanup_keys:
+            channel = f"oauth:{key}"
+            scorer.clear_stats(channel)
+            cooldown.clear(channel, notify_recovered=False, resolve_alias=False)
+            affinity.delete_by_channel(channel)
+            affinity.client_delete_by_channel(channel)
+            state_db.quota_delete(key)
 
 def set_enabled(email: str, enabled: bool, reason: str | None = None):
     """

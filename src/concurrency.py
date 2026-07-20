@@ -15,11 +15,12 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import config
+from . import channel_state, config
 
 
 @dataclass
@@ -47,6 +48,13 @@ class ChannelSlot:
 # 全局 slot 表。key = channel.key（"api:xxx" 或 "oauth:provider:email"）。
 _slots: dict[str, ChannelSlot] = {}
 _slots_lock = asyncio.Lock()
+_slots_guard = threading.RLock()
+# Renamed keys are allowed to drain in place. Moving a live slot would make
+# existing requests release the old key while its counter lives under the new
+# key, permanently leaking in_flight and waiters.
+_retired_keys: set[str] = set()
+_retired_limits: dict[str, int] = {}
+_deleted_retire_targets: dict[str, str] = {}
 
 # 全局"释放事件"：任一渠道 release 时 set 一次，用来唤醒"跨候选"排队方
 # （acquire_from_candidates 会注册到多个 slot 的 waiter 队列里，任一 slot 释放都要醒）。
@@ -73,16 +81,19 @@ def _get_channel_max(ch_key: str) -> int:
     return mc if mc > 0 else default_max
 
 
-async def _get_or_create_slot(ch_key: str) -> ChannelSlot:
-    async with _slots_lock:
-        slot = _slots.get(ch_key)
-        if slot is None:
-            slot = ChannelSlot(key=ch_key, max_concurrent=_get_channel_max(ch_key))
-            _slots[ch_key] = slot
-        else:
-            # 热加载可能改了 max_concurrent；只更新 max，不动 in_flight
-            slot.max_concurrent = _get_channel_max(ch_key)
-        return slot
+def _get_or_create_slot_locked(ch_key: str) -> ChannelSlot:
+    slot = _slots.get(ch_key)
+    if slot is None:
+        max_concurrent = (
+            _retired_limits[ch_key]
+            if ch_key in _retired_keys and ch_key in _retired_limits
+            else _get_channel_max(ch_key)
+        )
+        slot = ChannelSlot(key=ch_key, max_concurrent=max_concurrent)
+        _slots[ch_key] = slot
+    elif ch_key not in _retired_keys:
+        slot.max_concurrent = _get_channel_max(ch_key)
+    return slot
 
 
 def _enabled() -> bool:
@@ -98,18 +109,24 @@ async def try_acquire(ch_key: str) -> bool:
     """
     if not _enabled():
         return True
-    slot = await _get_or_create_slot(ch_key)
-    if slot.is_unlimited():
-        slot.in_flight += 1
-        return True
-    async with slot.lock:
-        if slot.in_flight < slot.max_concurrent:
-            slot.in_flight += 1
-            return True
+    async with _slots_lock:
+        with channel_state.mutation_lock, _slots_guard:
+            slot = _get_or_create_slot_locked(ch_key)
+            if slot.is_unlimited():
+                slot.in_flight += 1
+                return True
+            if slot.in_flight < slot.max_concurrent:
+                slot.in_flight += 1
+                return True
     return False
 
 
 def release(ch_key: str) -> None:
+    with channel_state.mutation_lock, _slots_guard:
+        _release_locked(ch_key)
+
+
+def _release_locked(ch_key: str) -> None:
     """释放一个位置，唤醒该 slot 的 FIFO 队头（若有）。
 
     同步函数，可在 try/finally 里直接调用。
@@ -121,22 +138,60 @@ def release(ch_key: str) -> None:
         # 不限制的渠道仅做 in_flight 计数回减，无需唤醒
         if slot.in_flight > 0:
             slot.in_flight -= 1
+        _cleanup_retired_slot(ch_key, slot)
         return
     if slot.in_flight > 0:
         slot.in_flight -= 1
     # 唤醒队头 waiter（只唤醒一个；FIFO 语义）
     # 注意：即使没 waiter，也要 set 一次 _release_event，唤醒 acquire_from_candidates
     # 里跨 slot 轮询的等待方。
+    woke_waiter = False
     while slot.waiters:
         fut = slot.waiters.pop(0)
         if not fut.done():
             fut.set_result(None)
+            woke_waiter = True
             break
         # done 的是被别处取消 / 已超时的，继续找下一个
     try:
         _release_event.set()
     except Exception:
         pass
+    if not woke_waiter:
+        _cleanup_retired_slot(ch_key, slot)
+
+
+def _cleanup_retired_slot(ch_key: str, slot: ChannelSlot) -> None:
+    with channel_state.mutation_lock, _slots_guard:
+        if (
+            ch_key in _retired_keys
+            and slot.in_flight == 0
+            and not slot.waiters
+            and _slots.get(ch_key) is slot
+        ):
+            _slots.pop(ch_key, None)
+            if _deleted_retire_targets.pop(ch_key, None) is not None:
+                _retired_keys.discard(ch_key)
+                _retired_limits.pop(ch_key, None)
+                # Keep the deleted target tombstoned until process restart.
+                # A request can exist before acquire (or concurrency can be
+                # disabled), so an empty slot is not proof that no old
+                # generation can publish late side effects.
+
+
+async def _acquire_or_register_waiter(
+    ch_key: str,
+) -> tuple[ChannelSlot, asyncio.Future | None, bool]:
+    """Atomically acquire available capacity or append one waiter."""
+    async with _slots_lock:
+        with channel_state.mutation_lock, _slots_guard:
+            slot = _get_or_create_slot_locked(ch_key)
+            if slot.is_unlimited() or slot.in_flight < slot.max_concurrent:
+                slot.in_flight += 1
+                return slot, None, True
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            slot.waiters.append(fut)
+            return slot, fut, False
 
 
 async def acquire_from_candidates(
@@ -173,21 +228,13 @@ async def acquire_from_candidates(
 
         # step 2: 为每个 slot 注册 waiter
         futures: list[tuple[ChannelSlot, asyncio.Future]] = []
-        for ch_key, _ in candidates:
-            slot = await _get_or_create_slot(ch_key)
-            if slot.is_unlimited():
-                # 不限制的渠道几乎不会到这里（前面 try_acquire 已成），
-                # 兜底再试一次
-                if await try_acquire(ch_key):
-                    for s, fut in futures:
-                        _drop_waiter(s, fut)
-                    for _, payload in candidates:
-                        if _ == ch_key:
-                            return (ch_key, payload)
-                    return (ch_key, candidates[0][1])
-                continue
-            fut: asyncio.Future = asyncio.get_event_loop().create_future()
-            slot.waiters.append(fut)
+        for ch_key, payload in candidates:
+            slot, fut, acquired = await _acquire_or_register_waiter(ch_key)
+            if acquired:
+                for previous_slot, previous_fut in futures:
+                    _drop_waiter(previous_slot, previous_fut)
+                return (ch_key, payload)
+            assert fut is not None
             futures.append((slot, fut))
 
         # 同时等 _release_event 作为兜底唤醒源（覆盖 slot 被重建等极端情况）
@@ -195,21 +242,30 @@ async def acquire_from_candidates(
         global_wake = asyncio.create_task(_release_event.wait())
         wait_futs = [fut for _, fut in futures] + [global_wake]
 
+        cancelled = False
         try:
             done, _pending = await asyncio.wait(
                 wait_futs,
                 timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             # 不管怎么样都要把自己从所有 slot 的 waiter 队列里摘掉，避免泄漏
             for slot, fut in futures:
                 _drop_waiter(slot, fut)
             if not global_wake.done():
                 global_wake.cancel()
+            if cancelled:
+                for slot, _ in futures:
+                    _cleanup_retired_slot(slot.key, slot)
 
         if not done:
             # 超时
+            for slot, _ in futures:
+                _cleanup_retired_slot(slot.key, slot)
             return None
 
         # step 3: 被唤醒，挨个候选再试一次
@@ -221,74 +277,109 @@ async def acquire_from_candidates(
 
 
 def _drop_waiter(slot: ChannelSlot, fut: asyncio.Future) -> None:
-    try:
-        slot.waiters.remove(fut)
-    except ValueError:
-        pass
-    if not fut.done():
+    with channel_state.mutation_lock, _slots_guard:
         try:
-            fut.cancel()
-        except Exception:
+            slot.waiters.remove(fut)
+        except ValueError:
             pass
+        if not fut.done():
+            try:
+                fut.cancel()
+            except Exception:
+                pass
 
 
 def is_saturated(ch_key: str) -> bool:
     """同步查询是否饱和（用于 scheduler filter 的快速路径）。"""
     if not _enabled():
         return False
-    slot = _slots.get(ch_key)
-    if slot is None:
-        # 未构造过 → 必然空闲（除非 max=0 也算空闲）
-        return False
-    slot.max_concurrent = _get_channel_max(ch_key)
-    return slot.is_saturated()
+    with channel_state.mutation_lock, _slots_guard:
+        slot = _slots.get(ch_key)
+        if slot is None:
+            return False
+        if ch_key not in _retired_keys:
+            slot.max_concurrent = _get_channel_max(ch_key)
+        return slot.is_saturated()
 
 
 def snapshot() -> list[dict]:
     """供 TG Bot 展示：[{ch_key, in_flight, max, waiting}]。"""
     out = []
-    for key, slot in _slots.items():
-        slot.max_concurrent = _get_channel_max(key)
-        out.append({
-            "channel_key": key,
-            "in_flight": slot.in_flight,
-            "max_concurrent": slot.max_concurrent,
-            "waiting": len(slot.waiters),
-            "unlimited": slot.is_unlimited(),
-        })
+    with channel_state.mutation_lock, _slots_guard:
+        for key, slot in _slots.items():
+            if key not in _retired_keys:
+                slot.max_concurrent = _get_channel_max(key)
+            out.append({
+                "channel_key": key,
+                "in_flight": slot.in_flight,
+                "max_concurrent": slot.max_concurrent,
+                "waiting": len(slot.waiters),
+                "unlimited": slot.is_unlimited(),
+            })
     out.sort(key=lambda x: x["channel_key"])
     return out
 
 
 def totals() -> dict:
     """汇总：{in_flight, waiting, tracked_channels}。"""
-    in_flight = sum(s.in_flight for s in _slots.values())
-    waiting = sum(len(s.waiters) for s in _slots.values())
-    return {
-        "in_flight": in_flight,
-        "waiting": waiting,
-        "tracked_channels": len(_slots),
-    }
+    with channel_state.mutation_lock, _slots_guard:
+        return {
+            "in_flight": sum(s.in_flight for s in _slots.values()),
+            "waiting": sum(len(s.waiters) for s in _slots.values()),
+            "tracked_channels": len(_slots),
+        }
 
 
 def forget_channel(ch_key: str) -> None:
     """渠道删除 / 改名时清理。必须确保 in_flight=0、waiters 空，否则忽略。"""
-    slot = _slots.get(ch_key)
-    if slot is None:
-        return
-    if slot.in_flight > 0 or slot.waiters:
-        # 还有在途请求或排队方 → 不清，等它们自行完成
-        return
-    _slots.pop(ch_key, None)
+    with channel_state.mutation_lock, _slots_guard:
+        slot = _slots.get(ch_key)
+        if slot is None:
+            return
+        if slot.in_flight > 0 or slot.waiters:
+            return
+        _slots.pop(ch_key, None)
 
 
-def rename_channel(old_key: str, new_key: str) -> None:
-    """渠道改名：把 slot 搬到新 key 下（保留 in_flight / waiters）。"""
+def capture_rename_limit(ch_key: str) -> int:
+    """Capture the old generation's limit before config publishes its rename."""
+    with channel_state.mutation_lock, _slots_guard:
+        slot = _slots.get(ch_key)
+        return slot.max_concurrent if slot is not None else _get_channel_max(ch_key)
+
+
+def retire_channel(ch_key: str, *, frozen_max: int | None = None,
+                   deleted_target: str | None = None) -> None:
+    """Let one removed/renamed generation drain without leaking its slot."""
+    with channel_state.mutation_lock, _slots_guard:
+        _retired_keys.add(ch_key)
+        if deleted_target is not None:
+            channel_state.retire_deleted(deleted_target)
+            _deleted_retire_targets[ch_key] = deleted_target
+        slot = _slots.get(ch_key)
+        if frozen_max is None:
+            frozen_max = slot.max_concurrent if slot is not None else _get_channel_max(ch_key)
+        _retired_limits[ch_key] = int(frozen_max)
+        if slot is not None:
+            slot.max_concurrent = int(frozen_max)
+            _cleanup_retired_slot(ch_key, slot)
+        elif deleted_target is not None:
+            # There is no tracked slot, but a request may still be between
+            # registry selection and acquire, or concurrency may be disabled.
+            # Drop slot bookkeeping while retaining the deleted generation's
+            # process-lifetime tombstone.
+            _deleted_retire_targets.pop(ch_key, None)
+            _retired_keys.discard(ch_key)
+            _retired_limits.pop(ch_key, None)
+
+
+def rename_channel(old_key: str, new_key: str, *, frozen_max: int | None = None) -> None:
+    """Retire the old slot in place; new requests get a separate new slot.
+
+    Existing requests and waiters still release/wake by ``old_key``. The old
+    slot is removed by the final release after it drains. Destination state is
+    never overwritten.
+    """
     if old_key == new_key:
         return
-    slot = _slots.pop(old_key, None)
-    if slot is None:
-        return
-    slot.key = new_key
-    slot.max_concurrent = _get_channel_max(new_key)
-    _slots[new_key] = slot
+    retire_channel(old_key, frozen_max=frozen_max)

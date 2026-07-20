@@ -524,13 +524,13 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 > `images.cacheRetentionDays=0` 表示不按时间清理；`images.cacheMaxBytes=0` 表示不按空间清理。相对 `cachePath` 会落在数据目录下，Parrot 会阻止相对路径逃逸。
 
-**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
+**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `openai.store.dbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
 
 ---
 
 ## 🛠 运维
 
-所有持久化数据集中在 `<安装目录>/data/`：`config.json` / `state.db` / `image_logs.db` / `logs/` / `images/` / `.anthropic_proxy_ids.json`。
+所有持久化数据集中在 `<安装目录>/data/`：`config.json` / `state.db` / `openai_response_store.db` / `image_logs.db` / `logs/` / `images/` / `.anthropic_proxy_ids.json`。
 
 ### 启动 / 停止 / 重启 / 状态（Docker Compose）
 
@@ -574,7 +574,11 @@ GPT/Grok 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`�
 
 ### 状态数据
 
-`data/state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache / openai_response_store。永久保留。
+`data/state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache 等轻量运行时状态，永久保留。
+
+`data/openai_response_store.db`（SQLite）：`previous_response_id` history 表
+`openai_response_store`。升级自旧版本时不在线迁移旧表；新库 miss 会只读回退
+`state.db`，让旧 id 在原 TTL 内继续可用。
 
 ### 配置备份
 
@@ -619,6 +623,7 @@ Parrot/
 ├── data/                        ← 运行时持久化（容器挂载点；源码模式不存在）
 │   ├── config.json              ← 唯一配置文件
 │   ├── state.db                 ← 运行时状态（永久）
+│   ├── openai_response_store.db ← previous_response_id history（TTL）
 │   ├── image_logs.db            ← 图片/视频统一多媒体任务日志（兼容旧图片历史）
 │   ├── logs/YYYY-MM.db          ← 按月分库业务日志
 │   ├── images/                  ← 图片/视频缓存（开启后，保留兼容目录名）
@@ -628,6 +633,8 @@ Parrot/
     ├── auth.py                  ← 下游 API Key 验证
     ├── errors.py                ← 标准错误响应
     ├── state_db.py              ← state.db 读写
+    ├── channel_state.py         ← 运行期渠道改名的配置/DB/内存原子协调
+    ├── sqlite_errors.py         ← SQLite 可用性错误精确分类
     ├── log_db.py                ← 按月日志库读写 + 跨月聚合（支持 family 过滤）
     ├── image_db.py              ← 兼容旧库的多媒体日志底层 + GPT 图片尝试统计
     ├── media_db.py              ← 统一图片/视频日志门面

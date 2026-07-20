@@ -9,7 +9,11 @@ Responses API 是**有状态**的：客户端可以用 `previous_response_id` �
 
 实现：`src/openai/store.py`。
 
-## 5.1 存储表（挂在既有 `state.db` 里，命名空间隔离）
+## 5.1 存储表（独立 SQLite）
+
+默认写入 `DATA_DIR/openai_response_store.db`（可用
+`openai.store.dbPath` 指定；相对路径仍以 `DATA_DIR` 为根）。它必须与
+`stateDbPath` 不同，避免大 history 表的写入和清理阻塞评分、冷却与亲和状态。
 
 ```sql
 CREATE TABLE IF NOT EXISTS openai_response_store (
@@ -27,9 +31,10 @@ CREATE INDEX IF NOT EXISTS idx_resp_store_expires ON openai_response_store(expir
 CREATE INDEX IF NOT EXISTS idx_resp_store_key     ON openai_response_store(api_key_name);
 ```
 
-为什么挂 `state.db` 而不是新开一个库：
-- 状态数据库的运维逻辑（WAL checkpoint、备份）已经成熟
-- openai-专属的表名前缀隔离，不污染 Anthropic 表
+升级不会在线搬迁大表，也不会再写 legacy `state.db`。新库查不到 id 时，
+Store 会只读查询旧 `state.db.openai_response_store`；因此升级前创建的
+`previous_response_id` 可继续使用到原 TTL 到期。旧库不存在或没有该表时
+按普通 miss 处理；新库记录始终优先，可自然覆盖同 id 的旧记录。
 
 ## 5.2 Store 接口
 
@@ -67,8 +72,12 @@ def expand_history(response_id: str, *, api_key_name: str) -> list[dict]:
     """返回按链条展开的 items：最老的在前，`input_items + output_items` 拼起来。
        内部递归沿 parent_id 向上，直到 None 或命中循环（防御）。"""
 
-def cleanup_expired(now: float | None = None) -> int: ...
-"""返回清理数。每次 ~几十 ms。"""
+def cleanup_expired(now: float | None = None, *,
+                    batch_size: int | None = None,
+                    max_batches: int | None = None,
+                    batch_bytes: int | None = None,
+                    time_budget_seconds: float | None = None) -> int: ...
+"""返回清理数；每批独立短事务，并受行数、payload 字节数、批数和时间预算限制。"""
 ```
 
 ## 5.3 链展开算法
@@ -115,19 +124,34 @@ def expand_history(response_id, *, api_key_name, max_depth=50):
 | `ResponseNotFound` | 404 | `{error:{message:"response not found", type:"not_found_error"}}` |
 | `ResponseExpired` | 410 | `{error:{message:"response expired", ...}}` |
 | `ResponseForbidden` | 403 | `{error:{message:"response does not belong to this api key",...}}` |
+| legacy/new Store 暂时不可用（BUSY/LOCKED/I/O/FULL） | 503 | `server_error`；不得伪装成 404 |
 
 ## 5.6 TTL 与清理
 
 - 默认 `openai.store.ttlMinutes = 60`
 - 每次 save 时写 `expires_at = now + ttl`
 - 后台 `cleanup_expired` 循环每 `openai.store.cleanupIntervalSeconds`（默认 300）跑一次
+- 每批候选最多 `cleanupBatchSize`（默认 100）条，并受
+  `cleanupBatchBytes`（默认 8 MiB）约束；单条超大 history 仍会独立删除，
+  避免单次事务制造超大 WAL
+- 每批立即提交并释放 Store 写锁，让并发 save 有机会插队
+- 每轮最多提交 `cleanupMaxBatches`（默认 100）批，并受
+  `cleanupTimeBudgetSeconds`（默认 10 秒）约束；默认每轮最多可追赶
+  10,000 条小记录，积压由后续轮次继续处理
 - 清理任务挂在 `server.py` lifespan 的 `_background_tasks`（见 [07-anthropic-touchpoints.md](./07-anthropic-touchpoints.md)）
 
 ## 5.7 并发与隔离
 
-- 写入用 `state_db` 现有的 `_write_lock`（RLock）复用
+- 独立库使用自己的 `_write_lock`（RLock）与 thread-local 连接，不和 `state.db` 写锁耦合
 - 读取无锁（SQLite WAL 模式已够）
+- legacy `state.db` 仅以 SQLite `mode=ro` 打开，且只在新库 miss 时查询
+- `save()` 失败会 rollback 后重新抛出，由协议收尾层限频告警，不把半开事务留在线程连接中
 - `api_key_name` 字段用来防误读：Key A 看不到 Key B 的 response_id（即使碰撞）
+
+升级后 legacy 表不再由在线清理任务写入或删除。记录超过 TTL 后会立即变为
+不可读，但物理页面仍留在旧 `state.db`。如需回收，应至少等待一个完整 TTL，
+在维护窗口停止 Parrot、备份并校验旧库后离线删除 legacy 表/记录；不得在运行中
+执行 `VACUUM` 或大事务清理。
 
 ## 5.8 `conversation` 资源
 
