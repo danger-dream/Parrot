@@ -166,6 +166,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "groups": {},
         "routing": {
             "default": "direct",
+            # 仅当已配置的非直连路由无法解析/建立时，才允许自动追加 direct。
+            # 未配置任何网络规则时仍按正常默认值直连，不受此开关限制。
+            "directFallback": False,
             # "telegram": "direct",
             # "oauth": "direct",
             # "models": {},

@@ -215,6 +215,18 @@ def responses_sse_chunked_metadata_then_error():
                           headers={"content-type": "text/event-stream"})
 
 
+def responses_sse_chunked_metadata_then_close():
+    """Emit only pre-commit Responses metadata, then EOF without a terminal event."""
+    chunks = [
+        b'event: response.created\n'
+        b'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_eof","status":"in_progress"}}\n\n',
+        b'event: response.in_progress\n'
+        b'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_eof","status":"in_progress"}}\n\n',
+    ]
+    return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                          headers={"content-type": "text/event-stream"})
+
+
 def responses_sse_chunked_metadata_then_context_length_error():
     chunks = [
         b'event: response.created\n'
@@ -837,6 +849,34 @@ async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m)
     print("  [PASS] responses chunked metadata→error before visible chunk → switch → chB ok")
 
 
+async def test_responses_precommit_eof_persists_received_sse(m):
+    """An EOF before Chat-visible output must still retain received Responses SSE."""
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: responses_sse_chunked_metadata_then_close())
+    chA = _make_openai_channel("chA", "https://cha", protocol="openai-responses")
+    _install_channels(m, [chA])
+
+    body = {"model": "gpt-5.5", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="chat")
+    assert resp.status_code == 503
+    await mc.aclose()
+
+    log = m["log_db"].log_detail(rid)
+    expected = (
+        'event: response.created\n'
+        'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_eof","status":"in_progress"}}\n\n'
+        'event: response.in_progress\n'
+        'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_eof","status":"in_progress"}}\n\n'
+    )
+    assert log["log"]["status"] == "error", log["log"]
+    assert log["log"]["error_message"] == "upstream closed stream before first downstream chunk"
+    assert log["retry_chain"][0]["outcome"] == "closed_before_first_byte"
+    assert log["detail"]["response_body"] == expected
+    print("  [PASS] pre-commit EOF retains received SSE in error log")
+
+
 async def test_responses_context_length_before_visible_chunk_short_circuits_failover(m):
     _setup(m)
     router = MockRouter()
@@ -1081,6 +1121,7 @@ async def amain():
         test_stream_midstream_error_logs_upstream_error,
         test_responses_error_before_visible_chunk_switches,
         test_responses_chunked_metadata_error_before_visible_chunk_switches,
+        test_responses_precommit_eof_persists_received_sse,
         test_responses_context_length_before_visible_chunk_short_circuits_failover,
         test_responses_to_chat_error_after_item_added_before_chat_bytes_switches,
         test_invalid_encrypted_content_retries_same_channel_without_ec,

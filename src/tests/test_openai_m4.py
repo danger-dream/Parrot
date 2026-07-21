@@ -172,6 +172,62 @@ def test_r2c_text_flow(m):
     print("  [PASS] r2c: output_text → role + content + finish_reason=stop")
 
 
+def test_r2c_done_only_text_fallback(m):
+    """A valid Responses stream may carry text only in terminal done events."""
+    T = m["stream_r2c"].StreamTranslator
+    tr = T(model="gpt-5")
+    events = [
+        b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n',
+        b'event: response.content_part.added\ndata: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
+        b'event: response.output_text.done\ndata: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"done only"}\n\n',
+        b'event: response.content_part.done\ndata: {"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"done only","annotations":[]}}\n\n',
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}\n\n',
+    ]
+    objs, done = _parse_chat_frames(_run_translator(tr, events))
+    assert done
+    contents = [o["choices"][0]["delta"].get("content") for o in objs
+                if o["choices"][0]["delta"].get("content")]
+    assert contents == ["done only"]
+    print("  [PASS] r2c: output_text.done/content_part.done fallback emits one text chunk")
+
+
+def test_r2c_done_only_refusal_fallback(m):
+    """A terminal-only refusal must also cross the Chat commit boundary once."""
+    T = m["stream_r2c"].StreamTranslator
+    tr = T(model="gpt-5")
+    events = [
+        b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n',
+        b'event: response.content_part.added\ndata: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":""}}\n\n',
+        b'event: response.refusal.done\ndata: {"type":"response.refusal.done","output_index":0,"content_index":0,"refusal":"cannot comply"}\n\n',
+        b'event: response.content_part.done\ndata: {"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"cannot comply"}}\n\n',
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}\n\n',
+    ]
+    objs, done = _parse_chat_frames(_run_translator(tr, events))
+    assert done
+    refusals = [o["choices"][0]["delta"].get("refusal") for o in objs
+                if o["choices"][0]["delta"].get("refusal")]
+    assert refusals == ["cannot comply"]
+    print("  [PASS] r2c: refusal.done/content_part.done fallback emits one refusal chunk")
+
+
+def test_r2c_done_text_fallback_dedupes_delta_and_repairs_tail(m):
+    T = m["stream_r2c"].StreamTranslator
+    tr = T(model="gpt-5")
+    events = [
+        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hel"}\n\n',
+        b'event: response.output_text.done\ndata: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"hello"}\n\n',
+        b'event: response.content_part.done\ndata: {"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"}}\n\n',
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}\n\n',
+    ]
+    objs, done = _parse_chat_frames(_run_translator(tr, events))
+    assert done
+    contents = [o["choices"][0]["delta"].get("content") for o in objs
+                if o["choices"][0]["delta"].get("content")]
+    assert contents == ["hel", "lo"]
+    assert "".join(contents) == "hello"
+    print("  [PASS] r2c: done snapshot appends only missing tail and never duplicates")
+
+
 def test_r2c_tool_call(m):
     T = m["stream_r2c"].StreamTranslator
     tr = T(model="gpt-5")
@@ -209,6 +265,72 @@ def test_r2c_tool_call(m):
     assert "".join(pieces) == "{\"city\":\"SF\"}"
     assert objs[-1]["choices"][0]["finish_reason"] == "tool_calls"
     print("  [PASS] r2c: function_call 首包带 id/name，arguments 增量流，finish=tool_calls")
+
+
+def test_r2c_function_call_arguments_done_fallback(m):
+    """A complete arguments snapshot must repair a stream with no arg deltas."""
+    T = m["stream_r2c"].StreamTranslator
+    tr = T(model="gpt-5")
+    events = [
+        b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_A","name":"get_w","arguments":"","status":"in_progress"}}\n\n',
+        b'event: response.function_call_arguments.done\ndata: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","name":"get_w","arguments":"{\\"city\\":\\"SF\\"}"}\n\n',
+        b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_A","name":"get_w","arguments":"{\\"city\\":\\"SF\\"}","status":"completed"}}\n\n',
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_A","name":"get_w","arguments":"{\\"city\\":\\"SF\\"}"}]}}\n\n',
+    ]
+    objs, done = _parse_chat_frames(_run_translator(tr, events))
+    assert done
+    pieces = [
+        tc["function"]["arguments"]
+        for obj in objs
+        for tc in obj["choices"][0]["delta"].get("tool_calls", [])
+        if (tc.get("function") or {}).get("arguments")
+    ]
+    expected_args = json.dumps({"city": "SF"}, separators=(",", ":"))
+    assert pieces == [expected_args]
+    assert tr.get_downstream_chat_assistant()["tool_calls"][0]["function"]["arguments"] == expected_args
+    assert objs[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    print("  [PASS] r2c: function_call_arguments.done emits complete args once")
+
+
+def test_r2c_output_item_done_text_fallback(m):
+    """A completed message item can be the only text-bearing event."""
+    T = m["stream_r2c"].StreamTranslator
+    tr = T(model="gpt-5")
+    events = [
+        b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}\n\n',
+        b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"item snapshot","annotations":[]}]}}\n\n',
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"item snapshot","annotations":[]}]}]}}\n\n',
+    ]
+    objs, done = _parse_chat_frames(_run_translator(tr, events))
+    assert done
+    contents = [obj["choices"][0]["delta"].get("content") for obj in objs
+                if obj["choices"][0]["delta"].get("content")]
+    assert contents == ["item snapshot"]
+    assert tr.get_downstream_chat_assistant()["content"] == "item snapshot"
+    print("  [PASS] r2c: output_item.done message snapshot emits text")
+
+
+def test_r2c_output_item_done_function_call_fallback(m):
+    """A completed function item must repair a missing arguments event."""
+    T = m["stream_r2c"].StreamTranslator
+    tr = T(model="gpt-5")
+    events = [
+        b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_A","name":"get_w","arguments":"","status":"in_progress"}}\n\n',
+        b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_A","name":"get_w","arguments":"{\\"limit\\":1}","status":"completed"}}\n\n',
+        b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_A","name":"get_w","arguments":"{\\"limit\\":1}"}]}}\n\n',
+    ]
+    objs, done = _parse_chat_frames(_run_translator(tr, events))
+    assert done
+    pieces = [
+        tc["function"]["arguments"]
+        for obj in objs
+        for tc in obj["choices"][0]["delta"].get("tool_calls", [])
+        if (tc.get("function") or {}).get("arguments")
+    ]
+    expected_args = json.dumps({"limit": 1}, separators=(",", ":"))
+    assert pieces == [expected_args]
+    assert tr.get_downstream_chat_assistant()["tool_calls"][0]["function"]["arguments"] == expected_args
+    print("  [PASS] r2c: output_item.done function snapshot emits missing args")
 
 
 def test_r2c_incomplete_length(m):
@@ -509,6 +631,43 @@ async def _consume_streaming_to_string(resp) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
+async def test_e2e_chat_to_responses_truncated_stream_is_not_success(m):
+    """Visible partial output followed by EOF must not be fabricated as stop."""
+    _setup(m)
+    _install_keys(m, {"k": {"key": "ccp-test"}})
+    router = MockRouter()
+
+    def _handler(req):
+        chunks = [
+            b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_truncated","status":"in_progress"}}\n\n',
+            b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_truncated","role":"assistant","status":"in_progress","content":[]}}\n\n',
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}\n\n',
+        ]
+        return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                              headers={"content-type": "text/event-stream"})
+
+    router.register("https://truncated.example", _handler)
+    ch = _make_openai_channel(m, "oaiTruncated", "https://truncated.example", protocol="openai-responses")
+    _install_channels(m, [ch])
+
+    resp, mc = await _call_openai_handler(
+        m, router, "chat",
+        {"model": "gpt-5", "stream": True, "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert resp.status_code == 200
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert "partial" in text
+    assert "response may be incomplete" in text
+    objs, _done = _parse_chat_frames([text.encode()])
+    assert not any(
+        choice.get("finish_reason") == "stop"
+        for obj in objs for choice in obj.get("choices", [])
+    )
+    print("  [PASS] handler e2e: visible Responses EOF emits stream error, never fake stop")
+
+
 async def test_e2e_chat_to_responses_stream(m):
     _setup(m)
     _install_keys(m, {"k": {"key": "ccp-test"}})
@@ -557,6 +716,74 @@ async def test_e2e_chat_to_responses_stream(m):
     await mc.aclose()
     print("  [PASS] 端到端：chat ingress → openai-responses 上游 stream")
 
+
+async def test_e2e_chat_to_responses_done_only_stream(m):
+    """The commit gate must accept text supplied only by terminal done events."""
+    _setup(m)
+    _install_keys(m, {"k": {"key": "ccp-test"}})
+    router = MockRouter()
+
+    def _handler(req):
+        chunks = [
+            b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_done","status":"in_progress"}}\n\n',
+            b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_done","role":"assistant","status":"in_progress","content":[]}}\n\n',
+            b'event: response.content_part.added\ndata: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
+            b'event: response.output_text.done\ndata: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"terminal text"}\n\n',
+            b'event: response.content_part.done\ndata: {"type":"response.content_part.done","output_index":0,"content_index":0,"part":{"type":"output_text","text":"terminal text","annotations":[]}}\n\n',
+            b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_done","role":"assistant","status":"completed","content":[{"type":"output_text","text":"terminal text","annotations":[]}]}}\n\n',
+            b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_done","status":"completed","output":[{"type":"message","id":"msg_done","role":"assistant","content":[{"type":"output_text","text":"terminal text","annotations":[]}]}]}}\n\n',
+        ]
+        return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                              headers={"content-type": "text/event-stream"})
+
+    router.register("https://done.example", _handler)
+    ch = _make_openai_channel(m, "oaiDone", "https://done.example", protocol="openai-responses")
+    _install_channels(m, [ch])
+
+    resp, mc = await _call_openai_handler(
+        m, router, "chat",
+        {"model": "gpt-5", "stream": True, "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert resp.status_code == 200
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+    assert "chat.completion.chunk" in text
+    assert "terminal text" in text
+    assert "[DONE]" in text
+    print("  [PASS] handler e2e: done-only Responses text crosses Chat commit boundary")
+
+
+async def test_e2e_chat_to_responses_output_item_done_only_stream(m):
+    """The commit gate must also accept text present only in output_item.done."""
+    _setup(m)
+    _install_keys(m, {"k": {"key": "ccp-test"}})
+    router = MockRouter()
+
+    def _handler(req):
+        chunks = [
+            b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_item_done","status":"in_progress"}}\n\n',
+            b'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_item_done","role":"assistant","status":"in_progress","content":[]}}\n\n',
+            b'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_item_done","role":"assistant","status":"completed","content":[{"type":"output_text","text":"item terminal text","annotations":[]}]}}\n\n',
+            b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_item_done","status":"completed","output":[{"type":"message","id":"msg_item_done","role":"assistant","content":[{"type":"output_text","text":"item terminal text","annotations":[]}]}]}}\n\n',
+        ]
+        return httpx.Response(200, stream=ChunkedByteStream(chunks),
+                              headers={"content-type": "text/event-stream"})
+
+    router.register("https://item-done.example", _handler)
+    ch = _make_openai_channel(m, "oaiItemDone", "https://item-done.example", protocol="openai-responses")
+    _install_channels(m, [ch])
+
+    resp, mc = await _call_openai_handler(
+        m, router, "chat",
+        {"model": "gpt-5", "stream": True, "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert resp.status_code == 200
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+    assert "chat.completion.chunk" in text
+    assert "item terminal text" in text
+    assert "[DONE]" in text
+    print("  [PASS] handler e2e: output_item.done text crosses Chat commit boundary")
 
 
 async def test_e2e_responses_chunked_error_before_visible_switch(m):
@@ -716,7 +943,13 @@ def main() -> int:
 
     tests = [
         test_r2c_text_flow,
+        test_r2c_done_only_text_fallback,
+        test_r2c_done_only_refusal_fallback,
+        test_r2c_done_text_fallback_dedupes_delta_and_repairs_tail,
         test_r2c_tool_call,
+        test_r2c_function_call_arguments_done_fallback,
+        test_r2c_output_item_done_text_fallback,
+        test_r2c_output_item_done_function_call_fallback,
         test_r2c_incomplete_length,
         test_r2c_reasoning,
         test_r2c_include_usage,
@@ -729,7 +962,10 @@ def main() -> int:
         test_c2r_empty_content_only_tool_calls,
         _async(test_e2e_responses_chunked_error_before_visible_switch),
         _async(test_e2e_chat_responses_item_added_error_before_chat_bytes_switch),
+        _async(test_e2e_chat_to_responses_truncated_stream_is_not_success),
         _async(test_e2e_chat_to_responses_stream),
+        _async(test_e2e_chat_to_responses_done_only_stream),
+        _async(test_e2e_chat_to_responses_output_item_done_only_stream),
         _async(test_e2e_responses_to_chat_stream),
     ]
     passed = 0

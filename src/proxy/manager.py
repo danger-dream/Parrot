@@ -111,19 +111,83 @@ def get_routing() -> dict:
         return dict(_routing)
 
 
-def is_configured() -> bool:
-    """Whether the new proxy subsystem has any user-visible configuration.
+def _network_config_snapshot() -> dict:
+    """Read the source-of-truth network subtree without trusting runtime state."""
+    try:
+        net = config.get().get("network") or {}
+        return net if isinstance(net, dict) else {}
+    except Exception:
+        return {}
 
-    DEFAULT_CONFIG always contains routing.default=direct after deep merge, so
-    callers must not treat that default as an explicit opt-in. This preserves
-    legacy network.socks5 behavior until a proxy/group or a non-default route is
-    actually configured.
-    """
-    with _lock:
-        if _connectors or _groups:
+
+def _has_explicit_routing_rule(routing: dict) -> bool:
+    """Whether routing contains anything beyond the implicit default direct."""
+    for key, value in routing.items():
+        if key == "directFallback":
+            continue
+        if key == "default":
+            if value != "direct":
+                return True
+            continue
+        if key in ("accounts", "channels", "models"):
+            if isinstance(value, dict) and value:
+                return True
+            continue
+        # An explicit family/purpose route matters even when it selects direct:
+        # it intentionally overrides legacy SOCKS5 for that purpose.
+        if value not in (None, "", {}, []):
             return True
-        r = dict(_routing)
-    return bool(r and r != {"default": "direct"})
+    return False
+
+
+def _has_non_direct_target(value) -> bool:
+    if isinstance(value, list):
+        return any(_has_non_direct_target(item) for item in value)
+    return isinstance(value, str) and bool(value) and value != "direct"
+
+
+def has_non_direct_routing_rules() -> bool:
+    """Whether config asks any traffic to use a non-direct new-proxy target.
+
+    This deliberately ignores a mere proxy definition.  A user may add proxies
+    before assigning a route; until a non-direct rule exists, normal direct
+    behavior remains available.
+    """
+    routing = _network_config_snapshot().get("routing") or {}
+    if not isinstance(routing, dict):
+        return False
+    for key, value in routing.items():
+        if key == "directFallback":
+            continue
+        if key in ("accounts", "channels", "models"):
+            if isinstance(value, dict) and any(_has_non_direct_target(v) for v in value.values()):
+                return True
+            continue
+        if _has_non_direct_target(value):
+            return True
+    return False
+
+
+def direct_fallback_enabled() -> bool:
+    """Whether a broken configured non-direct route may explicitly use direct."""
+    routing = _network_config_snapshot().get("routing") or {}
+    return bool(routing.get("directFallback", False)) if isinstance(routing, dict) else False
+
+
+def is_configured() -> bool:
+    """Whether the new proxy subsystem has user-provided configuration.
+
+    Invalid proxy definitions count as configured too.  Otherwise a broken
+    definition selected by a route could disappear from runtime state and cause
+    a silent downgrade to direct traffic.
+    """
+    net = _network_config_snapshot()
+    raw_proxies = net.get("proxies") or {}
+    raw_groups = net.get("groups") or {}
+    routing = net.get("routing") or {}
+    return bool(raw_proxies or raw_groups or (
+        isinstance(routing, dict) and _has_explicit_routing_rule(routing)
+    ))
 
 
 # ── Route resolution ─────────────────────────────────────────────
@@ -181,11 +245,15 @@ def resolve_proxy_target(*, channel_key: str = "", model: str = "",
 
 
 def _expand_target(target: str | list[str]) -> list[str]:
-    """Expand a target (proxy name or group name) into a list of proxy names."""
+    """Expand a target (proxy name or group name) into a list of proxy names.
+
+    An empty/invalid explicitly configured target is not equivalent to direct:
+    callers must fail closed unless the user enabled ``directFallback``.
+    """
     if isinstance(target, list):
-        return list(target) or ["direct"]
+        return list(target)
     if not isinstance(target, str) or not target:
-        return ["direct"]
+        return []
     g = get_group(target)
     if g:
         return g
@@ -369,6 +437,14 @@ def set_routing(key: str, value: str, *, section: str = "") -> None:
             sub[key] = value
         else:
             routing[key] = value
+    config.update(_mut)
+
+
+def set_direct_fallback(enabled: bool) -> None:
+    """Persist the user-controlled implicit direct fallback switch."""
+    def _mut(c):
+        routing = c.setdefault("network", {}).setdefault("routing", {})
+        routing["directFallback"] = bool(enabled)
     config.update(_mut)
 
 

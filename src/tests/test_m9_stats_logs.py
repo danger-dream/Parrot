@@ -879,7 +879,10 @@ def test_proxy_upgrade_from_previous_config_is_smooth(m, tmp_path):
         cfg_mod._cache = None
         cfg_mod._mtime = 0
         loaded = cfg_mod.reload()
-        assert loaded["network"]["routing"] == {"default": "direct"}
+        assert loaded["network"]["routing"] == {
+            "default": "direct",
+            "directFallback": False,
+        }
         assert loaded["network"]["proxies"] == {}
         assert loaded["network"]["groups"] == {}
 

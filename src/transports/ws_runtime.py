@@ -181,27 +181,43 @@ def legacy_socks5_connector() -> SOCKS5Connector | None:
 
 
 def resolve_ws_route_chain(channel, resolved_model: str) -> list[tuple[str, Any | None]]:
+    """Resolve a WS route with the same explicit-direct policy as HTTP."""
+    from ..proxy import manager as pm
+
+    configured = False
     try:
-        from ..proxy import manager as pm
         pm.init()
-        if pm.is_configured():
+        configured = pm.is_configured()
+        if configured:
+            source_chain = pm.resolve_proxy_chain(**ws_route_kwargs(channel, resolved_model))
             route_chain: list[tuple[str, Any | None]] = []
-            valid_seen = False
-            for name in pm.resolve_proxy_chain(**ws_route_kwargs(channel, resolved_model)):
+            for name in source_chain:
                 conn = pm.get_connector(name)
                 if conn is None:
                     continue
-                valid_seen = True
                 if getattr(conn, "type", "") == "direct":
                     route_chain.append(("direct", None))
                 else:
                     route_chain.append((name, conn))
-            if valid_seen:
+            if route_chain:
+                if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in route_chain):
+                    route_chain.append(("direct", None))
                 return route_chain
+            if pm.direct_fallback_enabled():
+                print(f"[proxy] WS route has no usable target; using enabled direct fallback: {source_chain}")
+                return [("direct", None)]
             return []
-    except Exception:
-        pass
+        if pm.has_non_direct_routing_rules():
+            return []
+    except Exception as exc:
+        if pm.direct_fallback_enabled():
+            print(f"[proxy] WS route resolution failed; using enabled direct fallback: {exc}")
+            return [("direct", None)]
+        if configured or pm.has_non_direct_routing_rules():
+            print(f"[proxy] WS route resolution failed closed: {exc}")
+            return []
 
+    # No configured new-proxy route: preserve the normal legacy/direct path.
     legacy = legacy_socks5_connector()
     if legacy is not None:
         return [("legacy-socks5", legacy)]

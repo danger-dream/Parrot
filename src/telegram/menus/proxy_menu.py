@@ -889,6 +889,7 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     r = pm.get_routing()
 
     default_route = r.get("default", "direct")
+    direct_fallback = bool(r.get("directFallback", False))
     acct_count = len(r.get("accounts") or {})
     ch_count = len(r.get("channels") or {})
     model_count = len(r.get("models") or {})
@@ -904,7 +905,14 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     lines = [
         "🎯 <b>路由规则</b>", "",
         "<i>优先级: 账号 = 渠道 > 模型 > 功能路由 > 默认路由</i>", "",
-        f"📌 默认路由: <code>{ui.escape_html(str(default_route))}</code>", "",
+        f"📌 默认路由: <code>{ui.escape_html(str(default_route))}</code>",
+        f"🛟 直连兜底: <b>{'开启' if direct_fallback else '关闭'}</b>",
+        (
+            "<i>已配置的非直连路由异常时，会在代理链末尾尝试 direct；可能暴露本机出口。</i>"
+            if direct_fallback else
+            "<i>已配置的非直连路由异常时保持失败，不会静默改走 direct；未配置网络规则时仍正常直连。</i>"
+        ),
+        "",
         "📡 功能路由：",
     ]
     if func_lines:
@@ -917,12 +925,20 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     rows = [
         [ui.btn("📌 默认路由", "px:rt_pick:default"),
          ui.btn("📡 功能路由", "px:rt_func")],
+        [ui.btn(f"🛟 直连兜底：{'开启' if direct_fallback else '关闭'}", "px:rt_df")],
         [ui.btn("👤 账号路由", "px:rt_accounts"),
          ui.btn("📦 渠道路由", "px:rt_channels"),
          ui.btn("🤖 模型路由", "px:rt_models")],
         [ui.btn("◀ 返回网络设置", "sys:show:network")],
     ]
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def _toggle_direct_fallback(chat_id: int, message_id: int, cb_id: str) -> None:
+    enabled = not pm.direct_fallback_enabled()
+    pm.set_direct_fallback(enabled)
+    ui.answer_cb(cb_id, "直连兜底已开启" if enabled else "直连兜底已关闭")
+    _show_routing(chat_id, message_id, "")
 
 
 # ── target picker (shared for all) ──────────────────────────────
@@ -1265,6 +1281,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     # 路由规则
     if data == "px:routing":
         _show_routing(chat_id, message_id, cb_id); return True
+    if data == "px:rt_df":
+        _toggle_direct_fallback(chat_id, message_id, cb_id); return True
     if data == "px:rt_func":
         _show_func_routing(chat_id, message_id, cb_id); return True
     if data == "px:rt_accounts":

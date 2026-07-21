@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any, Optional
 
@@ -17,6 +18,7 @@ import httpx
 
 from . import network
 from .protocols import errors as protocol_errors
+from .protocols.sse import split_sse_events as _split_sse_events_bytes
 from .protocols.usage import (
     UsageAccumulator,
     legacy_usage_from_anthropic_json,
@@ -338,20 +340,13 @@ def _iter_sse_data_lines(buf: bytes):
 
 
 def _iter_sse_events(buf: bytes):
-    """按 `\\n\\n` 边界把 buf 切成若干完整 event 块。
+    """Split complete LF- or CRLF-framed SSE events from *buf*.
 
-    返回 (剩余 buf, [event_block_text,...])。event_block_text 原封保留行内容
-    （用 \\n 拼接），便于各家族的 builder 自行拿 `event:` / `data:` 等。
+    HTTPX preserves wire framing, so CRLF must be handled explicitly instead of
+    relying on a transport-level newline normalization that does not occur.
     """
-    events: list[str] = []
-    while True:
-        # SSE 规范上分隔符是 `\n\n`（也有 `\r\n\r\n`，httpx 已经归一到 \n）
-        sep = b"\n\n"
-        if sep not in buf:
-            break
-        block, buf = buf.split(sep, 1)
-        events.append(block.decode("utf-8", errors="replace"))
-    return buf, events
+    buf, blocks = _split_sse_events_bytes(buf)
+    return buf, [block.decode("utf-8", errors="replace") for block in blocks]
 
 
 def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
@@ -377,20 +372,8 @@ def _parse_event_block(block: str) -> tuple[Optional[str], Optional[dict]]:
 
 
 def split_sse_events(buf: bytes) -> tuple[bytes, list[bytes]]:
-    """Byte-preserving SSE event splitter.
-
-    Returns raw event block bytes without the trailing blank line, so callers can
-    buffer metadata events before the first downstream-visible chunk and replay
-    them exactly.
-    """
-    events: list[bytes] = []
-    while True:
-        sep = b"\n\n"
-        if sep not in buf:
-            break
-        block, buf = buf.split(sep, 1)
-        events.append(block)
-    return buf, events
+    """Backward-compatible export of the shared LF/CRLF SSE splitter."""
+    return _split_sse_events_bytes(buf)
 
 
 def parse_sse_event_bytes(block: bytes) -> tuple[Optional[str], Optional[dict]]:
@@ -649,12 +632,12 @@ def parse_first_responses_sse_event(chunk: bytes) -> Optional[dict]:
     """
     if not chunk:
         return None
-    try:
-        text = chunk.decode("utf-8", errors="replace")
-    except Exception:
-        return None
-    # 只看第一个以 `\n\n` 结束的 event block（chunk 可能没含完整 event，尽力而为）
-    blocks = text.split("\n\n")
+    # 优先看完整的 LF/CRLF event；首个网络 chunk 若尚未带完整分隔符，
+    # 仍保留旧行为，对当前已收到的部分尽力解析。
+    remaining, raw_blocks = _split_sse_events_bytes(chunk)
+    blocks = [raw.decode("utf-8", errors="replace") for raw in raw_blocks]
+    if remaining.strip():
+        blocks.append(remaining.decode("utf-8", errors="replace"))
     for block in blocks:
         if not block.strip():
             continue
@@ -730,22 +713,135 @@ class ResponsesSSEUsageTracker:
 
 
 class ResponsesSSEAssistantBuilder:
-    """从 /v1/responses SSE 中还原 output_items，供 fingerprint_write_responses 使用。
+    """Rebuild final Responses output items from an incremental SSE stream.
 
-    聚合规则（简化版；完整翻译器在 MS-3/MS-4 做）：
-      - `response.output_item.added / done`：把 item 按 output_index 记录
-      - `response.output_text.delta`：按 (output_index, content_index) 拼 text
-      - `response.function_call_arguments.delta`：按 output_index 拼 arguments
+    Detailed SSE events are useful when an upstream omits the final response
+    snapshot; conversely, ``response.completed.response.output`` is authoritative
+    when it is present.  The builder merges both instead of letting a sparse
+    ``output_item.added`` event overwrite a complete terminal response.
     """
 
     def __init__(self):
         self._buf = b""
-        self._items: dict[int, dict] = {}             # output_index → item
-        self._fc_args: dict[int, str] = {}            # output_index → arguments buf
-        self._msg_text: dict[tuple, str] = {}         # (output_index, content_index) → text
+        self._items: dict[int, dict] = {}
+        self._fc_args: dict[int, str] = {}
+        self._msg_text: dict[tuple[int, int], str] = {}
+        self._msg_refusal: dict[tuple[int, int], str] = {}
         self._got_any = False
-        # response 顶层 metadata（由 response.created / response.completed 事件携带）
         self._response_obj: Optional[dict] = None
+        self._completed_response_obj: Optional[dict] = None
+
+    @staticmethod
+    def _index(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _merge_text_snapshot(current: str, snapshot: Any) -> str:
+        """Merge a full terminal snapshot without duplicating delta text."""
+        if not isinstance(snapshot, str):
+            return current
+        if not current:
+            return snapshot
+        if snapshot.startswith(current):
+            return snapshot
+        if current.startswith(snapshot):
+            return current
+        # A terminal event is more authoritative than a conflicting intermediate
+        # snapshot; response.completed can still supersede it later.
+        return snapshot
+
+    @staticmethod
+    def _merge_preferred_text(preferred: Any, supplemental: Any) -> Any:
+        """Keep the authoritative value unless the supplement safely extends it."""
+        if not isinstance(preferred, str) or not preferred:
+            return supplemental if isinstance(supplemental, str) else preferred
+        if not isinstance(supplemental, str) or not supplemental:
+            return preferred
+        if supplemental.startswith(preferred):
+            return supplemental
+        return preferred
+
+    def _append_part_delta(self, store: dict[tuple[int, int], str], data: dict) -> None:
+        delta = data.get("delta")
+        if not isinstance(delta, str):
+            return
+        key = (self._index(data.get("output_index")), self._index(data.get("content_index")))
+        store[key] = store.get(key, "") + delta
+
+    def _set_part_snapshot(self, store: dict[tuple[int, int], str], data: dict, value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        key = (self._index(data.get("output_index")), self._index(data.get("content_index")))
+        store[key] = self._merge_text_snapshot(store.get(key, ""), value)
+
+    def _capture_item_snapshot(self, output_index: int, item: dict) -> None:
+        """Record content/arguments embedded in item snapshots as terminal data."""
+        item_type = item.get("type")
+        if item_type == "function_call":
+            args = item.get("arguments")
+            if isinstance(args, str):
+                self._fc_args[output_index] = self._merge_text_snapshot(
+                    self._fc_args.get(output_index, ""), args,
+                )
+            return
+        if item_type != "message":
+            return
+        content = item.get("content")
+        if not isinstance(content, list):
+            return
+        for content_index, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            data = {"output_index": output_index, "content_index": content_index}
+            if part.get("type") == "output_text":
+                self._set_part_snapshot(self._msg_text, data, part.get("text"))
+            elif part.get("type") == "refusal":
+                self._set_part_snapshot(self._msg_refusal, data, part.get("refusal"))
+
+    def _record_item(self, output_index: int, item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        snapshot = copy.deepcopy(item)
+        self._items[output_index] = snapshot
+        self._capture_item_snapshot(output_index, snapshot)
+
+    @staticmethod
+    def _merge_item_snapshots(preferred: dict, supplemental: dict) -> dict:
+        """Fill sparse fields from *supplemental* without replacing final data."""
+        merged = copy.deepcopy(preferred)
+        for key, value in supplemental.items():
+            if key == "content":
+                continue
+            if merged.get(key) in (None, "", [], {}):
+                merged[key] = copy.deepcopy(value)
+
+        pref_content = merged.get("content")
+        supp_content = supplemental.get("content")
+        if not isinstance(pref_content, list):
+            if isinstance(supp_content, list):
+                merged["content"] = copy.deepcopy(supp_content)
+            return merged
+        if not isinstance(supp_content, list):
+            return merged
+
+        content = copy.deepcopy(pref_content)
+        for index, part in enumerate(supp_content):
+            if index >= len(content):
+                content.append(copy.deepcopy(part))
+                continue
+            existing = content[index]
+            if not isinstance(existing, dict) or not isinstance(part, dict):
+                if existing in (None, "", [], {}):
+                    content[index] = copy.deepcopy(part)
+                continue
+            for key, value in part.items():
+                if existing.get(key) in (None, "", [], {}):
+                    existing[key] = copy.deepcopy(value)
+        merged["content"] = content
+        return merged
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
@@ -754,64 +850,113 @@ class ResponsesSSEAssistantBuilder:
         self._buf, events = _iter_sse_events(self._buf)
         for block in events:
             event_name, data = _parse_event_block(block)
-            if event_name is None or data is None:
+            if event_name is None or not isinstance(data, dict):
                 continue
             self._got_any = True
-            # response.created / response.completed 里的 response 对象是顶层 metadata 来源
-            if event_name in ("response.created", "response.in_progress",
-                              "response.completed", "response.incomplete", "response.failed"):
-                resp = data.get("response")
-                if isinstance(resp, dict):
-                    self._response_obj = resp
-            if event_name == "response.output_item.added":
-                idx = int(data.get("output_index", 0))
-                item = dict(data.get("item") or {})
-                self._items[idx] = item
-            elif event_name == "response.output_item.done":
-                idx = int(data.get("output_index", 0))
-                item = dict(data.get("item") or {})
-                self._items[idx] = item
+
+            if event_name in (
+                "response.created", "response.in_progress", "response.completed",
+                "response.incomplete", "response.failed",
+            ):
+                response = data.get("response")
+                if isinstance(response, dict):
+                    self._response_obj = copy.deepcopy(response)
+                    if event_name == "response.completed":
+                        self._completed_response_obj = copy.deepcopy(response)
+                    # The terminal response can be the only place an upstream
+                    # exposes output items, so keep it as a source as well.
+                    if event_name in ("response.completed", "response.incomplete"):
+                        output = response.get("output")
+                        if isinstance(output, list):
+                            for output_index, item in enumerate(output):
+                                self._record_item(output_index, item)
+
+            if event_name in ("response.output_item.added", "response.output_item.done"):
+                self._record_item(self._index(data.get("output_index")), data.get("item"))
             elif event_name == "response.output_text.delta":
-                key = (int(data.get("output_index", 0)), int(data.get("content_index", 0)))
-                self._msg_text[key] = self._msg_text.get(key, "") + (data.get("delta") or "")
+                self._append_part_delta(self._msg_text, data)
+            elif event_name == "response.output_text.done":
+                self._set_part_snapshot(self._msg_text, data, data.get("text"))
+            elif event_name == "response.refusal.delta":
+                self._append_part_delta(self._msg_refusal, data)
+            elif event_name == "response.refusal.done":
+                self._set_part_snapshot(self._msg_refusal, data, data.get("refusal"))
+            elif event_name == "response.content_part.done":
+                part = data.get("part")
+                if isinstance(part, dict):
+                    if part.get("type") == "output_text":
+                        self._set_part_snapshot(self._msg_text, data, part.get("text"))
+                    elif part.get("type") == "refusal":
+                        self._set_part_snapshot(self._msg_refusal, data, part.get("refusal"))
             elif event_name == "response.function_call_arguments.delta":
-                idx = int(data.get("output_index", 0))
-                self._fc_args[idx] = self._fc_args.get(idx, "") + (data.get("delta") or "")
+                output_index = self._index(data.get("output_index"))
+                delta = data.get("delta")
+                if isinstance(delta, str):
+                    self._fc_args[output_index] = self._fc_args.get(output_index, "") + delta
+            elif event_name == "response.function_call_arguments.done":
+                output_index = self._index(data.get("output_index"))
+                self._fc_args[output_index] = self._merge_text_snapshot(
+                    self._fc_args.get(output_index, ""), data.get("arguments"),
+                )
+
+    def _base_items_by_index(self) -> dict[int, dict]:
+        """Start from response.completed output, then fill only missing snapshots."""
+        out: dict[int, dict] = {}
+        response = self._completed_response_obj or self._response_obj
+        if isinstance(response, dict) and isinstance(response.get("output"), list):
+            for output_index, item in enumerate(response["output"]):
+                if isinstance(item, dict):
+                    out[output_index] = copy.deepcopy(item)
+        for output_index, item in self._items.items():
+            existing = out.get(output_index)
+            out[output_index] = (
+                self._merge_item_snapshots(existing, item)
+                if isinstance(existing, dict) else copy.deepcopy(item)
+            )
+        return out
+
+    def _apply_message_buffers(self, output_index: int, item: dict) -> None:
+        content = item.get("content")
+        if not isinstance(content, list):
+            content = []
+        else:
+            content = copy.deepcopy(content)
+
+        for store, part_type, value_key in (
+            (self._msg_text, "output_text", "text"),
+            (self._msg_refusal, "refusal", "refusal"),
+        ):
+            for (item_index, content_index), value in store.items():
+                if item_index != output_index or not value:
+                    continue
+                while len(content) <= content_index:
+                    content.append({})
+                part = content[content_index]
+                if not isinstance(part, dict):
+                    part = {}
+                    content[content_index] = part
+                part.setdefault("type", part_type)
+                part[value_key] = self._merge_preferred_text(part.get(value_key), value)
+                if part_type == "output_text":
+                    part.setdefault("annotations", [])
+        item["content"] = content
 
     def get_output_items(self) -> list[dict]:
-        """按 output_index 顺序返回 items（用于 fingerprint_write_responses 等）。"""
+        """Return final output items ordered by Responses ``output_index``."""
         out: list[dict] = []
-        for idx in sorted(self._items.keys()):
-            item = dict(self._items[idx])
-            t = item.get("type")
-            if t == "message":
-                # 合并 output_text deltas 到 content 中
-                content = list(item.get("content") or [])
-                merged = {}
-                for (oi, ci), text in self._msg_text.items():
-                    if oi != idx:
-                        continue
-                    merged.setdefault(ci, text)
-                for ci in sorted(merged.keys()):
-                    # 如果 done 事件已带完整 text 就保留原样；否则补回
-                    if ci < len(content) and isinstance(content[ci], dict):
-                        if not content[ci].get("text"):
-                            content[ci]["text"] = merged[ci]
-                    else:
-                        content.append({"type": "output_text", "text": merged[ci], "annotations": []})
-                item["content"] = content
-            elif t == "function_call":
-                args_buf = self._fc_args.get(idx)
-                if args_buf and not item.get("arguments"):
-                    item["arguments"] = args_buf
+        for output_index, source_item in sorted(self._base_items_by_index().items()):
+            item = copy.deepcopy(source_item)
+            item_type = item.get("type")
+            if item_type == "message":
+                self._apply_message_buffers(output_index, item)
+            elif item_type == "function_call":
+                item["arguments"] = self._merge_preferred_text(
+                    item.get("arguments"), self._fc_args.get(output_index, ""),
+                )
             out.append(item)
         return out
 
     def get_assistant(self) -> dict:
-        """返回 OpenAI Responses 风格的 assistant 对象，供 fingerprint_write_responses 用。
-
-        首版只包含 items 列表；MS-7 才真正接入 fingerprint，暂以结构占位。
-        """
         return {"role": "assistant", "output": self.get_output_items()}
 
     @property
@@ -819,15 +964,9 @@ class ResponsesSSEAssistantBuilder:
         return self._got_any
 
     def to_full_json(self, *, fallback_model: str = "") -> dict:
-        """把累积的 SSE 聚合成完整的 /v1/responses 响应 JSON。
-
-        优先使用 response.completed 事件里的 response 对象做骨架；
-        若骨架缺失，用 fallback_model 兜底并现场组装 output。
-        """
-        base: dict = {}
-        if isinstance(self._response_obj, dict):
-            base = dict(self._response_obj)
-        # 无论 base 有没有 output，都用 builder 内部聚合的 items 覆盖（更可靠）
+        """Build one complete Responses object without losing terminal output."""
+        source = self._completed_response_obj or self._response_obj
+        base: dict = copy.deepcopy(source) if isinstance(source, dict) else {}
         base["output"] = self.get_output_items()
         base.setdefault("object", "response")
         base.setdefault("status", "completed")

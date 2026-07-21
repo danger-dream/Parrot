@@ -1460,6 +1460,7 @@ async def run_failover(
                 idle_ms=result.idle_ms, total_ms=result.total_ms,
                 final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                 http_status=status, affinity_hit=affinity_hit,
+                response_body=result.full_response_text,
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
                 **_request_stage_kwargs(result),
             )
@@ -1656,6 +1657,7 @@ async def run_failover(
                         idle_ms=result.idle_ms, total_ms=result.total_ms,
                         final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                         http_status=status, affinity_hit=affinity_hit,
+                        response_body=result.full_response_text,
                         upstream_protocol=getattr(ch, "protocol", "anthropic"),
                         **_request_stage_kwargs(result),
                     )
@@ -1732,6 +1734,7 @@ async def run_failover(
         final_round_id=(last_result.round_id if last_result else None),
         request_elapsed_ms=request_elapsed_ms,
         http_status=status, affinity_hit=affinity_hit,
+        response_body=(last_result.full_response_text if last_result else None),
         upstream_protocol=last_ch_protocol,
         proxy_name=(last_result.proxy_name if last_result else None),
         proxy_bytes_up=(last_result.proxy_bytes_up if last_result else None),
@@ -4047,6 +4050,20 @@ async def _consume_stream(
 
                 if _responses_terminal_received():
                     upstream_terminal = True
+
+            if not getattr(tracker, "saw_stream_end", False):
+                # A transport EOF after visible output cannot be retried without
+                # duplicating client-visible text, but it is still not success.
+                # Surface a stream error and keep the request/channel logs honest
+                # instead of fabricating finish_reason=stop.
+                msg = "upstream stream ended without a terminal response event; response may be incomplete"
+                await await_ws_owned(_emit_error_and_finalize(
+                    errors.ErrType.API,
+                    msg,
+                    outcome="stream_truncated",
+                ))
+                yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
+                return
 
             # 上游已正常收尾 → 先让 translator 生成终态帧/完成内部副作用，
             # 再落库 success，最后 yield 终态帧。这样 close()/Store 阶段若异常，

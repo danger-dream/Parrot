@@ -6,13 +6,13 @@
 
 状态机要点：
   - 首个 delta（文本或 tool_call）之前发一个"role chunk"（delta.role="assistant"）
-  - output_item.added 里的 function_call：记录 output_index → chat tool_calls 的
-    index 映射；首次 emit 时带 id/name/arguments=""，后续 arguments delta 只带
-    index + function.arguments
-  - response.output_text.delta → delta.content
+  - output_item.added/done 里的 function_call：记录 output_index → chat tool_calls 的
+    index 映射；首次 emit 时带 id/name/arguments=""，arguments delta/done 或
+    output_item.done 的完整快照只补发尚未转发的尾部
+  - response.output_text.delta；若仅有 output_text.done/content_part.done，则补发完整文本
+  - response.refusal.delta；若仅有 refusal.done/content_part.done，则补发完整拒绝文本
   - response.reasoning_summary_text.delta / response.reasoning_text.delta →
     delta.reasoning_content（非官方字段；客户端不识别会忽略）
-  - response.refusal.delta → delta.refusal
   - response.completed：收尾发 finish_reason chunk + 可选 usage chunk + [DONE]
   - response.failed / error：立即发 error 帧 + [DONE]
 """
@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from ...protocols import errors as protocol_errors
+from ...protocols.sse import split_sse_events
 
 
 def _gen_id(prefix: str) -> str:
@@ -49,7 +50,12 @@ class R2CState:
     next_tc_index: int = 0
     # 下游 chat assistant 累积（供 MS-7 亲和 fingerprint_write_chat 使用）
     chat_text_parts: list = field(default_factory=list)
+    # 每个 Responses output/content part 已转发的文本。终态 done 事件携带完整
+    # 文本时用它做去重，并补齐上游未发 delta 的尾部。
+    chat_text_by_part: dict[tuple[int, int], str] = field(default_factory=dict)
     chat_refusal_parts: list = field(default_factory=list)
+    # 与文本同理：refusal.done 可能是拒绝文本唯一的载体。
+    chat_refusal_by_part: dict[tuple[int, int], str] = field(default_factory=dict)
     fc_args_by_tc_index: dict[int, str] = field(default_factory=dict)
     # 02-bug-findings #35: 累积 annotation.added 事件
     annotations: list = field(default_factory=list)
@@ -152,8 +158,8 @@ class StreamTranslator:
         if not chunk:
             return
         self._buf += chunk
-        while b"\n\n" in self._buf:
-            block_bytes, self._buf = self._buf.split(b"\n\n", 1)
+        self._buf, blocks = split_sse_events(self._buf)
+        for block_bytes in blocks:
             block = block_bytes.decode("utf-8", errors="replace")
             if not block.strip():
                 continue
@@ -177,6 +183,17 @@ class StreamTranslator:
                 err_type=(err_detail.get("type") if isinstance(err_detail, dict) else None) or "server_error",
                 code=err_detail.get("code") if isinstance(err_detail, dict) else None,
                 param=err_detail.get("param") if isinstance(err_detail, dict) else None,
+            )
+            yield _DONE
+            return
+
+        if self.state.terminal_status is None:
+            # EOF is not a normal Responses completion.  Returning stop here
+            # would make a truncated response indistinguishable from success.
+            yield _mk_error_chunk(
+                self.state,
+                message="upstream stream ended without a terminal response event",
+                err_type="server_error",
             )
             yield _DONE
             return
@@ -209,15 +226,25 @@ class StreamTranslator:
         # responses 事件在 MS-4 首版只处理关键子集；未识别的 event 静默丢弃
         if event_name == "response.output_item.added":
             yield from self._on_output_item_added(data or {})
+        elif event_name == "response.output_item.done":
+            yield from self._on_output_item_done(data or {})
         elif event_name == "response.output_text.delta":
             yield from self._on_output_text_delta(data or {})
+        elif event_name == "response.output_text.done":
+            yield from self._on_output_text_done(data or {})
+        elif event_name == "response.content_part.done":
+            yield from self._on_content_part_done(data or {})
         elif event_name == "response.refusal.delta":
             yield from self._on_refusal_delta(data or {})
+        elif event_name == "response.refusal.done":
+            yield from self._on_refusal_done(data or {})
         elif event_name in ("response.reasoning_summary_text.delta",
                              "response.reasoning_text.delta"):
             yield from self._on_reasoning_delta(data or {})
         elif event_name == "response.function_call_arguments.delta":
             yield from self._on_fc_args_delta(data or {})
+        elif event_name == "response.function_call_arguments.done":
+            yield from self._on_fc_args_done(data or {})
         elif event_name == "response.output_text.annotation.added":
             yield from self._on_annotation_added(data or {})
         elif event_name == "response.completed":
@@ -226,10 +253,9 @@ class StreamTranslator:
             yield from self._on_incomplete(data or {})
         elif event_name in ("response.failed", "error"):
             yield from self._on_error(event_name, data or {})
-        # 其他事件（response.created、response.in_progress、output_item.done、
-        # content_part.added/done、output_text.done、reasoning_summary_part.*、
-        # reasoning_summary_text.done、function_call_arguments.done、
-        # web_search_call.* 等）对 chat 下游无用，忽略
+        # 其他事件（response.created、response.in_progress、content_part.added、
+        # reasoning_summary_part.*、reasoning_summary_text.done、web_search_call.* 等）
+        # 对 chat 下游无用，忽略
 
     def _ensure_role_sent(self) -> Iterator[bytes]:
         if self.state.role_sent:
@@ -250,9 +276,20 @@ class StreamTranslator:
                 self.state.role_sent = False
                 yield from self._ensure_role_sent()
             return
-        if item_type != "function_call":
-            return
+        if item_type == "function_call":
+            yield from self._ensure_function_call_started(data, item)
+
+    def _ensure_function_call_started(self, data: dict, item: dict) -> Iterator[bytes]:
+        """Register and emit a Chat tool-call start exactly once.
+
+        A normal Responses stream supplies this through ``output_item.added``.
+        ``output_item.done`` also carries the complete item, so it can repair a
+        stream that omitted the earlier item event without duplicating a normal
+        tool call.
+        """
         output_index = int(data.get("output_index", 0))
+        if output_index in self.state.fc_output_index_to_tc_index:
+            return
         tc_index = self.state.next_tc_index
         self.state.next_tc_index += 1
         self.state.fc_output_index_to_tc_index[output_index] = tc_index
@@ -272,10 +309,76 @@ class StreamTranslator:
             }],
         })
 
+    def _on_output_item_done(self, data: dict) -> Iterator[bytes]:
+        """Use the complete terminal item as a last-resort content snapshot."""
+        item = data.get("item") or {}
+        item_type = item.get("type")
+        if item_type == "function_call":
+            yield from self._ensure_function_call_started(data, item)
+            yield from self._emit_terminal_fc_args_tail(data, item.get("arguments"))
+            return
+        if item_type != "message":
+            return
+        content = item.get("content")
+        if not isinstance(content, list):
+            return
+        for content_index, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            part_data = dict(data)
+            part_data["content_index"] = content_index
+            if part.get("type") == "output_text":
+                yield from self._emit_terminal_text_tail(part_data, part.get("text"))
+            elif part.get("type") == "refusal":
+                yield from self._emit_terminal_refusal_tail(part_data, part.get("refusal"))
+
+    @staticmethod
+    def _content_key(data: dict) -> tuple[int, int]:
+        """Stable key for a Responses message content part."""
+        try:
+            output_index = int(data.get("output_index", 0) or 0)
+        except (TypeError, ValueError):
+            output_index = 0
+        try:
+            content_index = int(data.get("content_index", 0) or 0)
+        except (TypeError, ValueError):
+            content_index = 0
+        return output_index, content_index
+
+    def _emit_terminal_text_tail(self, data: dict, full_text: Any) -> Iterator[bytes]:
+        """Emit only the text not already delivered through delta events.
+
+        Some valid Responses streams provide text only in ``output_text.done``
+        (or its enclosing ``content_part.done``) rather than in text deltas.
+        The done payload is a full snapshot, so it also safely repairs a stream
+        that supplied only an initial subset of deltas.
+        """
+        if not isinstance(full_text, str) or not full_text:
+            return
+        key = self._content_key(data)
+        emitted = self.state.chat_text_by_part.get(key, "")
+        if not emitted:
+            tail = full_text
+            self.state.chat_text_by_part[key] = full_text
+        elif full_text.startswith(emitted):
+            tail = full_text[len(emitted):]
+            self.state.chat_text_by_part[key] = full_text
+        else:
+            # A contradictory terminal snapshot cannot be safely merged without
+            # risking duplicated or reordered client-visible text.
+            return
+        if not tail:
+            return
+        self.state.chat_text_parts.append(tail)
+        yield from self._ensure_role_sent()
+        yield _mk_chunk(self.state, delta={"content": tail})
+
     def _on_output_text_delta(self, data: dict) -> Iterator[bytes]:
         text = data.get("delta")
         if not isinstance(text, str) or not text:
             return
+        key = self._content_key(data)
+        self.state.chat_text_by_part[key] = self.state.chat_text_by_part.get(key, "") + text
         self.state.chat_text_parts.append(text)
         yield from self._ensure_role_sent()
         yield _mk_chunk(
@@ -284,10 +387,44 @@ class StreamTranslator:
             logprobs=_responses_delta_logprobs_to_chat(data.get("logprobs"), "content"),
         )
 
+    def _on_output_text_done(self, data: dict) -> Iterator[bytes]:
+        yield from self._emit_terminal_text_tail(data, data.get("text"))
+
+    def _on_content_part_done(self, data: dict) -> Iterator[bytes]:
+        part = data.get("part")
+        if not isinstance(part, dict):
+            return
+        if part.get("type") == "output_text":
+            yield from self._emit_terminal_text_tail(data, part.get("text"))
+        elif part.get("type") == "refusal":
+            yield from self._emit_terminal_refusal_tail(data, part.get("refusal"))
+
+    def _emit_terminal_refusal_tail(self, data: dict, full_text: Any) -> Iterator[bytes]:
+        """Emit a refusal.done/content_part.done suffix exactly once."""
+        if not isinstance(full_text, str) or not full_text:
+            return
+        key = self._content_key(data)
+        emitted = self.state.chat_refusal_by_part.get(key, "")
+        if not emitted:
+            tail = full_text
+            self.state.chat_refusal_by_part[key] = full_text
+        elif full_text.startswith(emitted):
+            tail = full_text[len(emitted):]
+            self.state.chat_refusal_by_part[key] = full_text
+        else:
+            return
+        if not tail:
+            return
+        self.state.chat_refusal_parts.append(tail)
+        yield from self._ensure_role_sent()
+        yield _mk_chunk(self.state, delta={"refusal": tail})
+
     def _on_refusal_delta(self, data: dict) -> Iterator[bytes]:
         text = data.get("delta")
         if not isinstance(text, str) or not text:
             return
+        key = self._content_key(data)
+        self.state.chat_refusal_by_part[key] = self.state.chat_refusal_by_part.get(key, "") + text
         self.state.chat_refusal_parts.append(text)
         yield from self._ensure_role_sent()
         yield _mk_chunk(
@@ -295,6 +432,9 @@ class StreamTranslator:
             delta={"refusal": text},
             logprobs=_responses_delta_logprobs_to_chat(data.get("logprobs"), "refusal"),
         )
+
+    def _on_refusal_done(self, data: dict) -> Iterator[bytes]:
+        yield from self._emit_terminal_refusal_tail(data, data.get("refusal"))
 
     def _on_reasoning_delta(self, data: dict) -> Iterator[bytes]:
         # drop 模式：丢弃 reasoning 文本（usage.reasoning_tokens 不受影响）
@@ -326,6 +466,33 @@ class StreamTranslator:
             }],
         })
 
+    def _emit_terminal_fc_args_tail(self, data: dict, full_args: Any) -> Iterator[bytes]:
+        """Emit only function-call arguments not already delivered by deltas."""
+        if not isinstance(full_args, str):
+            return
+        output_index = int(data.get("output_index", 0))
+        tc_index = self.state.fc_output_index_to_tc_index.get(output_index)
+        if tc_index is None:
+            return
+        emitted = self.state.fc_args_by_tc_index.get(tc_index, "")
+        if not full_args.startswith(emitted):
+            # A contradictory final snapshot cannot be appended without
+            # corrupting the JSON argument stream sent to the client.
+            return
+        tail = full_args[len(emitted):]
+        self.state.fc_args_by_tc_index[tc_index] = full_args
+        if not tail:
+            return
+        yield _mk_chunk(self.state, delta={
+            "tool_calls": [{
+                "index": tc_index,
+                "function": {"arguments": tail},
+            }],
+        })
+
+    def _on_fc_args_done(self, data: dict) -> Iterator[bytes]:
+        yield from self._emit_terminal_fc_args_tail(data, data.get("arguments"))
+
     def _on_annotation_added(self, data: dict) -> Iterator[bytes]:
         """02-bug-findings #35: 累积 annotation 到 state；chat 流没有
         annotation 增量事件，annotation 在 close() 之前由 get_downstream_chat_assistant
@@ -342,10 +509,13 @@ class StreamTranslator:
         resp = data.get("response") or {}
         self.state.terminal_status = "completed"
         self.state.usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else None
-        self.state.finish_reason = _finish_reason_for_responses(resp, fallback="stop")
-        # 不主动 emit 帧：由 close() 统一发
-        return
-        yield  # noqa: make this a generator
+        fallback = "tool_calls" if self.state.fc_output_index_to_tc_index else "stop"
+        self.state.finish_reason = _finish_reason_for_responses(resp, fallback=fallback)
+        # An empty but completed Responses result is valid.  Emit a normal Chat
+        # role chunk so the commit gate does not turn it into a fake pre-first-
+        # chunk 503; close() then supplies stop + [DONE].
+        if not self.state.role_sent:
+            yield from self._ensure_role_sent()
 
     def _on_incomplete(self, data: dict) -> Iterator[bytes]:
         resp = data.get("response") or {}
@@ -375,8 +545,14 @@ class StreamTranslator:
             yield _DONE
         elif reason == "content_filter":
             self.state.finish_reason = "content_filter"
+            if not self.state.role_sent:
+                yield from self._ensure_role_sent()
         else:
             self.state.finish_reason = "stop"
+            if not self.state.role_sent:
+                # A non-error incomplete terminal event may legitimately carry
+                # no content.  It still represents a normal Chat stream result.
+                yield from self._ensure_role_sent()
 
     def get_downstream_chat_assistant(self) -> dict:
         """累积至今的下游 chat `assistant` message 快照。
@@ -455,7 +631,10 @@ def _finish_reason_for_responses(resp: dict, *, fallback: str) -> str:
             for it in output:
                 if isinstance(it, dict) and it.get("type") == "function_call":
                     return "tool_calls"
-        return "stop"
+        # Detailed item events may contain a function call while the completed
+        # snapshot omits output.  Keep the caller's state-derived fallback
+        # rather than incorrectly labelling that tool turn as stop.
+        return fallback
     if status in ("failed", "cancelled"):
         return fallback
     return fallback

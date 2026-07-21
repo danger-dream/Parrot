@@ -547,6 +547,18 @@ async def aggregate_stream_as_non_stream_response(
 
     response_headers = metadata_from_response(response).forward_headers()
     await close_response_context(ctx)
+    response_body_text = bytes(raw_buf).decode("utf-8", errors="replace")
+
+    if not getattr(tracker, "saw_stream_end", False):
+        return StreamAsNonStreamResult(
+            error=AttemptResult(
+                outcome="upstream_malformed",
+                connect_ms=connect_ms,
+                first_byte_ms=first_byte_ms,
+                error_detail="stream ended without a terminal SSE event [stream-only→non-stream]",
+                full_response_text=response_body_text,
+            )
+        )
 
     if not builder.has_any_event:
         return StreamAsNonStreamResult(
@@ -555,6 +567,7 @@ async def aggregate_stream_as_non_stream_response(
                 connect_ms=connect_ms,
                 first_byte_ms=first_byte_ms,
                 error_detail="stream ended without any SSE event [stream-only→non-stream]",
+                full_response_text=response_body_text,
             )
         )
 
@@ -569,7 +582,6 @@ async def aggregate_stream_as_non_stream_response(
     total_ms = timing.snapshot(terminal=True).total_ms if timing is not None else None
     usage = toolkit["extract_usage_json"](obj)
     assistant_msg = {"role": "assistant", "content": obj.get("output") or []}
-    response_body_text = bytes(raw_buf).decode("utf-8", errors="replace")
 
     return StreamAsNonStreamResult(
         obj=obj,
@@ -706,6 +718,16 @@ async def prepare_stream_response_start(
     ch_proto = getattr(channel, "protocol", "anthropic")
     stream_translator = make_stream_translator(translator_ctx)
 
+    def _attach_precommit_response(result: AttemptResult) -> AttemptResult:
+        """Keep received pre-commit SSE data available to terminal error logging."""
+        try:
+            full_response = tracker.get_full_response()
+        except Exception:
+            full_response = None
+        if full_response:
+            result.full_response_text = full_response
+        return result
+
     if ch_proto == "openai-responses" or stream_translator is not None:
         try:
             first_downstream_chunks, pre_visible_error = await _read_until_first_downstream_chunk(
@@ -726,47 +748,47 @@ async def prepare_stream_response_start(
         except BusinessTimeoutError as exc:
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=_with_timing(timing, AttemptResult(
+                error=_with_timing(timing, _attach_precommit_response(AttemptResult(
                     outcome=exc.outcome,
                     error_detail=f"{exc.outcome} before first downstream-visible chunk",
-                ))
+                )))
             )
         except StopAsyncIteration:
             if timing is not None:
                 timing.mark_io_complete()
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=_with_timing(timing, AttemptResult(
+                error=_with_timing(timing, _attach_precommit_response(AttemptResult(
                     outcome="closed_before_first_byte",
                     error_detail="upstream closed stream before first downstream chunk",
-                ))
+                )))
             )
         except httpx.TimeoutException as exc:
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=_with_timing(timing, AttemptResult(
+                error=_with_timing(timing, _attach_precommit_response(AttemptResult(
                     outcome=classify_httpx_timeout(exc),
                     error_detail=f"first downstream chunk timeout: {exc}",
-                ))
+                )))
             )
         except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=_with_timing(timing, AttemptResult(
+                error=_with_timing(timing, _attach_precommit_response(AttemptResult(
                     outcome="transport_error",
                     error_detail=f"first downstream chunk transport: {exc}",
-                ))
+                )))
             )
         if pre_visible_error:
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=AttemptResult(
+                error=_attach_precommit_response(AttemptResult(
                     outcome="upstream_error_json",
                     connect_ms=connect_ms,
                     first_byte_ms=first_byte_ms,
                     error_detail=json.dumps(pre_visible_error.get("error", pre_visible_error), ensure_ascii=False)[:2000],
                     translator_ctx=translator_ctx,
-                )
+                ))
             )
     else:
         first_chunk_restored = await provider_registry.restore_response_bytes(
@@ -775,6 +797,10 @@ async def prepare_stream_response_start(
             dynamic_map=dynamic_map,
             translator_ctx=translator_ctx,
         )
+        # Record the restored bytes before classifying a first-event error so
+        # pre-commit upstream error payloads follow the same persistence path.
+        tracker.feed(first_chunk_restored)
+        builder.feed(first_chunk_restored)
         first_event = toolkit["first_event_parser"](first_chunk_restored)
         if first_event and (
             first_event.get("type") == "error"
@@ -783,16 +809,14 @@ async def prepare_stream_response_start(
         ):
             await close_response_context(ctx)
             return HttpStreamStartResult(
-                error=AttemptResult(
+                error=_attach_precommit_response(AttemptResult(
                     outcome="upstream_error_json",
                     connect_ms=connect_ms,
                     first_byte_ms=first_byte_ms,
                     error_detail=json.dumps(first_event.get("error", first_event), ensure_ascii=False)[:2000],
                     translator_ctx=translator_ctx,
-                )
+                ))
             )
-        tracker.feed(first_chunk_restored)
-        builder.feed(first_chunk_restored)
         if stream_translator is not None:
             first_downstream_chunks = list(stream_translator.feed(first_chunk_restored))
         else:
@@ -803,12 +827,12 @@ async def prepare_stream_response_start(
     if bl_hit:
         await close_response_context(ctx)
         return HttpStreamStartResult(
-            error=AttemptResult(
+            error=_attach_precommit_response(AttemptResult(
                 outcome="blacklist_hit",
                 connect_ms=connect_ms,
                 first_byte_ms=first_byte_ms,
                 error_detail=f"blacklist: {bl_hit}",
-            )
+            ))
         )
 
     return HttpStreamStartResult(
@@ -910,32 +934,61 @@ async def read_next_stream_step(
 
 
 def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[str, Any | None]], AttemptResult | None]:
-    route_chain: list[tuple[str, Any | None]] = []
+    """Resolve an HTTP route without silently bypassing configured proxies.
+
+    Direct remains the normal default when no new-proxy route exists.  Once a
+    non-direct route is configured, parser/connector failures are fail-closed
+    unless the user explicitly enabled ``routing.directFallback``.
+    """
+    from ..proxy import manager as pm
+
+    configured = False
     try:
-        from ..proxy import manager as pm
         pm.init()
-        if pm.is_configured():
-            chain = pm.resolve_proxy_chain(**proxy_route_kwargs(channel, resolved_model))
-            valid_seen = False
-            for proxy_name in chain:
-                connector = pm.get_connector(proxy_name)
-                if connector is None:
-                    continue
-                valid_seen = True
-                if getattr(connector, "type", "") == "direct":
-                    route_chain.append(("direct", None))
-                else:
-                    route_chain.append((proxy_name, connector))
-            if not valid_seen:
+        configured = pm.is_configured()
+        if not configured:
+            if pm.has_non_direct_routing_rules():
                 return [], AttemptResult(
                     outcome="proxy_connect_error",
-                    error_detail=f"proxy route has no valid target: {chain}",
+                    error_detail="configured non-direct proxy route could not be initialized",
                 )
-    except Exception:
-        route_chain = []
-    if not route_chain:
-        route_chain = [("direct", None)]
-    return route_chain, None
+            return [("direct", None)], None
+
+        chain = pm.resolve_proxy_chain(**proxy_route_kwargs(channel, resolved_model))
+        route_chain: list[tuple[str, Any | None]] = []
+        for proxy_name in chain:
+            connector = pm.get_connector(proxy_name)
+            if connector is None:
+                continue
+            if getattr(connector, "type", "") == "direct":
+                route_chain.append(("direct", None))
+            else:
+                route_chain.append((proxy_name, connector))
+
+        if route_chain:
+            if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in route_chain):
+                route_chain.append(("direct", None))
+            return route_chain, None
+
+        if pm.direct_fallback_enabled():
+            print(f"[proxy] HTTP route has no usable target; using enabled direct fallback: {chain}")
+            return [("direct", None)], None
+        return [], AttemptResult(
+            outcome="proxy_connect_error",
+            error_detail=f"proxy route has no valid target: {chain}",
+        )
+    except Exception as exc:
+        if pm.direct_fallback_enabled():
+            print(f"[proxy] HTTP route resolution failed; using enabled direct fallback: {exc}")
+            return [("direct", None)], None
+        if configured or pm.has_non_direct_routing_rules():
+            return [], AttemptResult(
+                outcome="proxy_connect_error",
+                error_detail=f"proxy route resolution failed: {exc}",
+            )
+        # No configured network rule: direct is the intended default, not a
+        # fallback downgrade.
+        return [("direct", None)], None
 
 
 def _persist_proxy_attempt_timing(

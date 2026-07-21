@@ -518,6 +518,58 @@ def active_socks5_url() -> Optional[str]:
     return normalize_socks5_url(raw).url
 
 
+def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, proxy_model: str):
+    """Return an explicit new-proxy chain, or ``None`` for the legacy/default path.
+
+    A configured non-direct rule must never disappear into a direct/legacy client
+    simply because its connector failed to parse.  ``directFallback`` is the sole
+    opt-in for adding direct to such a chain.
+    """
+    from .proxy import manager as pm
+    from .proxy.connector import ProxyConnectError
+
+    configured = False
+    try:
+        pm.init()
+        configured = pm.is_configured()
+        if not configured:
+            if pm.has_non_direct_routing_rules():
+                raise ProxyConnectError("configured non-direct proxy route could not be initialized")
+            return None
+
+        source_chain = pm.resolve_proxy_chain(
+            channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose,
+        )
+        chain = []
+        for name in source_chain:
+            connector = pm.get_connector(name)
+            if connector is not None:
+                chain.append((name, connector))
+        if chain:
+            if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in chain):
+                direct = pm.get_connector("direct")
+                if direct is not None:
+                    chain.append(("direct", direct))
+            return chain
+        if pm.direct_fallback_enabled():
+            direct = pm.get_connector("direct")
+            if direct is not None:
+                print(f"[proxy] network route has no usable target; using enabled direct fallback: {source_chain}")
+                return [("direct", direct)]
+        raise ProxyConnectError(f"proxy route has no valid target: {source_chain}")
+    except ProxyConnectError:
+        raise
+    except Exception as exc:
+        if pm.direct_fallback_enabled():
+            direct = pm.get_connector("direct")
+            if direct is not None:
+                print(f"[proxy] network route resolution failed; using enabled direct fallback: {exc}")
+                return [("direct", direct)]
+        if configured or pm.has_non_direct_routing_rules():
+            raise ProxyConnectError(f"proxy route resolution failed: {exc}") from exc
+        return None
+
+
 def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                  http2: bool = False,
                  proxy_purpose: str = "",
@@ -531,30 +583,28 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
     ``proxy_channel`` / ``proxy_model`` are used to resolve a proxy via
     ``proxy.manager``.  Falls back to legacy ``socks5`` config.
     """
-    # Try new proxy system first, but only when it is explicitly configured.
-    # DEFAULT_CONFIG always contains routing.default=direct; treating that as
-    # opt-in would silently bypass the legacy network.socks5 setting.
-    try:
-        from .proxy import manager as pm
-        pm.init()
-        if pm.is_configured():
-            target = pm.resolve_proxy_target(
-                channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose)
-            chain = pm.expand_target(target)
-            for pname in chain:
-                conn = pm.get_connector(pname)
-                if conn is None:
-                    continue
-                try:
-                    return conn.create_httpx_client(
-                        timeout=timeout, limits=limits, http2=http2,
-                        byte_counter=byte_counter, **kwargs)
-                except Exception:
-                    continue
-    except Exception:
-        pass  # fall through to legacy
+    chain = _configured_proxy_chain_or_none(
+        proxy_purpose=proxy_purpose,
+        proxy_channel=proxy_channel,
+        proxy_model=proxy_model,
+    )
+    if chain is not None:
+        from .proxy.connector import ProxyConnectError
+        last_exc: Exception | None = None
+        for pname, conn in chain:
+            try:
+                return conn.create_httpx_client(
+                    timeout=timeout, limits=limits, http2=http2,
+                    byte_counter=byte_counter, **kwargs,
+                )
+            except Exception as exc:
+                last_exc = exc
+                print(f"[proxy] async client construction failed for {pname}: {exc}")
+        raise ProxyConnectError(
+            f"configured proxy route has no usable async client: {last_exc or 'unknown error'}"
+        )
 
-    # Legacy socks5 fallback
+    # No configured new-proxy route: preserve legacy SOCKS5/default behavior.
     opts = dict(kwargs)
     if timeout is not None:
         opts["timeout"] = timeout
@@ -587,25 +637,27 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
         opts["limits"] = limits
     opts.setdefault("http2", http2)
 
-    try:
-        from .proxy import manager as pm
-        pm.init()
-        if pm.is_configured():
-            target = pm.resolve_proxy_target(
-                channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose)
-            for pname in pm.expand_target(target):
-                conn = pm.get_connector(pname)
-                if conn is None:
-                    continue
-                if conn.type == "direct":
-                    opts.setdefault("trust_env", False)
-                    return httpx.Client(**opts)
-                if conn.type == "socks5":
-                    opts["proxy"] = conn.url
-                    opts["trust_env"] = False
-                    return httpx.Client(**opts)
-    except Exception:
-        pass
+    chain = _configured_proxy_chain_or_none(
+        proxy_purpose=proxy_purpose,
+        proxy_channel=proxy_channel,
+        proxy_model=proxy_model,
+    )
+    if chain is not None:
+        from .proxy.connector import ProxyConnectError
+        unsupported: list[str] = []
+        for pname, conn in chain:
+            if conn.type == "direct":
+                opts.setdefault("trust_env", False)
+                return httpx.Client(**opts)
+            if conn.type == "socks5":
+                opts["proxy"] = conn.url
+                opts["trust_env"] = False
+                return httpx.Client(**opts)
+            unsupported.append(str(pname))
+        raise ProxyConnectError(
+            "configured proxy route has no sync-compatible target"
+            + (f": {', '.join(unsupported)}" if unsupported else "")
+        )
 
     proxy = active_socks5_url()
     if proxy:
