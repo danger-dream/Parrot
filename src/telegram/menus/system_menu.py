@@ -7,10 +7,22 @@ callback_data 前缀：`sys:...`
 from __future__ import annotations
 
 import asyncio
+import secrets
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
-from ... import apikey_limiter, concurrency, config, load_balancing, network, network_monitor, state_db
+from ... import apikey_limiter, concurrency, config, load_balancing, log_db, network, network_monitor, state_db
 from ...channel import registry
 from .. import states, ui
+
+
+_BJT = timezone(timedelta(hours=8))
+_RETENTION_PLAN_TTL_SECONDS = 600
+_retention_pending_lock = threading.Lock()
+# code → {chat_id, kind, expires_at, ...}; callback 本身只带 8 位短码，实际计划
+# 永远留在服务端，不接受客户端传来的路径、月份或删除范围。
+_retention_pending: dict[str, dict] = {}
 
 
 def _merge_proxy_stats_for_system(names, stats_map: dict[str, dict]) -> dict:
@@ -69,6 +81,12 @@ def _main_text_and_kb() -> tuple[str, dict]:
     t = cfg.get("timeouts") or {}
     sc = cfg.get("scoring") or {}
     aff = cfg.get("affinity") or {}
+    retention = log_db.retention_policy(cfg)
+    retention_label = (
+        "全部保留"
+        if retention["mode"] == "forever"
+        else f"按天留存（{retention['days']} 天）"
+    )
     ws_enabled = bool((cfg.get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
     ws_mode_label = "开" if ws_enabled else "关"
 
@@ -84,6 +102,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
         f"亲和: TTL={aff.get('ttlMinutes', 30)}min\n"
         f"调度: <code>{load_balancing.display_mode(cfg.get('channelSelection', 'smart'))}</code>\n"
         f"WS模式: HTTP→WS 上游转换 <code>{ws_mode_label}</code>\n"
+        f"请求日志留存: <code>{retention_label}</code>\n"
     )
     bl = cfg.get("contentBlacklist") or {}
     bl_default_count = len((bl.get("default") or []))
@@ -128,8 +147,9 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🌐 网络设置", "sys:show:network")],
         [ui.btn("🧬 WS模式", "sys:show:ws_mode"),
          ui.btn("🗣 翻译层", "tl:show")],
-        [ui.btn("🆕 版本更新", "menu:update"),
-         ui.btn("◀ 返回主菜单", "menu:main")],
+        [ui.btn("🗃 数据留存", "sys:show:retention"),
+         ui.btn("🆕 版本更新", "menu:update")],
+        [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
 
@@ -143,6 +163,399 @@ def show(chat_id: int, message_id: int, cb_id: str) -> None:
 def send_new(chat_id: int) -> None:
     text, kb = _main_text_and_kb()
     ui.send(chat_id, text, reply_markup=kb)
+
+
+# ─── 请求日志数据留存 ───────────────────────────────────────────────
+
+
+def _fmt_retention_bytes(value) -> str:
+    try:
+        size = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "0 B"
+
+
+def _fmt_retention_time(value) -> str:
+    try:
+        return datetime.fromtimestamp(float(value), tz=_BJT).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "时间不可表示"
+
+
+
+def _purge_expired_retention_pending() -> None:
+    now = time.time()
+    with _retention_pending_lock:
+        expired = [code for code, value in _retention_pending.items()
+                   if float(value.get("expires_at") or 0) <= now]
+        for code in expired:
+            _retention_pending.pop(code, None)
+
+
+def _register_retention_pending(chat_id: int, kind: str, **payload) -> str:
+    _purge_expired_retention_pending()
+    # ui.register_code 只解决 callback 64-byte 限制；真正计划和权限绑定都在本字典里。
+    code = ui.register_code(f"retention:{kind}:{secrets.token_hex(16)}")
+    data = {
+        "chat_id": int(chat_id),
+        "kind": kind,
+        "expires_at": time.time() + _RETENTION_PLAN_TTL_SECONDS,
+        **payload,
+    }
+    with _retention_pending_lock:
+        _retention_pending[code] = data
+    return code
+
+
+def _get_retention_pending(code: str, chat_id: int, kind: str) -> dict | None:
+    _purge_expired_retention_pending()
+    with _retention_pending_lock:
+        item = _retention_pending.get(code)
+        if not item or item.get("kind") != kind or int(item.get("chat_id") or -1) != int(chat_id):
+            return None
+        return dict(item)
+
+
+def _pop_retention_pending(code: str, chat_id: int, kind: str | None = None) -> dict | None:
+    _purge_expired_retention_pending()
+    with _retention_pending_lock:
+        item = _retention_pending.get(code)
+        if not item or int(item.get("chat_id") or -1) != int(chat_id):
+            return None
+        if kind is not None and item.get("kind") != kind:
+            return None
+        _retention_pending.pop(code, None)
+        return dict(item)
+
+
+def _retention_menu_text_kb() -> tuple[str, dict]:
+    policy = log_db.retention_policy()
+    if policy["mode"] == "days":
+        policy_lines = [
+            "当前留存模式：<code>按天留存</code>",
+            f"保留天数：<code>{int(policy['days'])} 天</code>",
+        ]
+    else:
+        policy_lines = ["当前留存模式：<code>全部保留</code>"]
+    lines = [
+        "🗃 <b>请求日志数据留存</b>",
+        "",
+        *policy_lines,
+        "",
+        "<b>清理范围</b>",
+        "• 请求摘要与其统计来源",
+        "• 原始 request / response 内容",
+        "• 重试、代理、本地 Web 调用明细",
+        "",
+        "<b>不会影响</b>",
+        "• state.db 运行状态",
+        "• 图片日志、图片缓存、翻译缓存",
+        "",
+        "<i>按天留存最少 1 天、无业务上限。整月过期库会删除文件；边界月会精确删除旧记录并压缩数据库以释放磁盘。</i>",
+    ]
+    if log_db.retention_cleanup_busy():
+        lines.extend(["", "⏳ <i>日志留存清理正在执行，完成前不能切换策略。</i>"])
+    rows: list[list[dict]] = []
+    if policy["mode"] == "days":
+        rows.append([
+            ui.btn("⏰ 修改保留天数", "sys:retention:days"),
+            ui.btn("♾ 切换为全部保留", "sys:retention:forever"),
+        ])
+    else:
+        rows.append([ui.btn("⏰ 设置按天数留存", "sys:retention:days")])
+    rows.append([ui.btn("◀ 返回系统设置", "menu:settings")])
+    return "\n".join(lines), ui.inline_kb(rows)
+
+
+def _show_retention(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    text, kb = _retention_menu_text_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _edit_retention_days(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    if log_db.retention_cleanup_busy():
+        ui.edit(chat_id, message_id, "⏳ 日志留存清理正在执行，完成后再修改策略。",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
+        return
+    policy = log_db.retention_policy()
+    current = (
+        f"当前为按天留存，保留 <code>{int(policy['days'])}</code> 天。请输入新的保留天数："
+        if policy["mode"] == "days"
+        else "当前为全部保留。请输入要保留的天数："
+    )
+    states.set_state(chat_id, "sys_retention_days")
+    ui.edit(
+        chat_id,
+        message_id,
+        f"{current}\n\n"
+        "• 必须是正整数\n"
+        "• 最少 <code>1</code> 天\n"
+        "• 不设业务最大值\n\n"
+        "示例：<code>7</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:retention:cancel_input")]]),
+    )
+
+
+def _on_retention_days_input(chat_id: int, text: str) -> None:
+    try:
+        days = int((text or "").strip())
+    except (TypeError, ValueError):
+        ui.send(chat_id, "❌ 请输入大于等于 1 的整数天数：")
+        return
+    if days < 1:
+        ui.send(chat_id, "❌ 最少保留 1 天，请重新输入：")
+        return
+    states.pop_state(chat_id)
+    current = log_db.retention_policy()
+    if current["mode"] == "days":
+        old_days = int(current["days"])
+        if days == old_days:
+            ui.send(
+                chat_id,
+                f"ℹ️ 当前已经是按天留存 <code>{days}</code> 天，未修改设置。",
+                reply_markup=ui.inline_kb([[ui.btn("🗃 返回数据留存", "sys:show:retention")]]),
+            )
+            return
+        if days > old_days:
+            # 延长保留期不会扩大删除范围，因此直接保存，不走删除预览。
+            result = log_db.extend_retention_days(days)
+            if result.get("ok"):
+                ui.send(
+                    chat_id,
+                    "✅ <b>按天留存天数已修改</b>\n\n"
+                    f"留存模式：按天留存\n"
+                    f"保留天数：<code>{old_days}</code> 天 → <code>{days}</code> 天\n\n"
+                    "本次只是延长保留时间，不会发起即时清理；此前已删除的历史日志无法恢复。",
+                    reply_markup=ui.inline_kb([[ui.btn("🗃 返回数据留存", "sys:show:retention")]]),
+                )
+            else:
+                ui.send(
+                    chat_id,
+                    f"⚠️ 修改保留天数失败：<code>{ui.escape_html(str(result.get('reason') or '未知错误'))}</code>",
+                    reply_markup=ui.inline_kb([[ui.btn("🗃 返回数据留存", "sys:show:retention")]]),
+                )
+            return
+        transition = f"即将把按天留存从 {old_days} 天缩短为 {days} 天"
+    else:
+        transition = "即将从全部保留切换为按天留存"
+
+    # 首次启用或缩短留存期会扩大删除范围，必须先展示警告、扫描清单，再二次确认。
+    code = _register_retention_pending(chat_id, "first", days=days)
+    ui.send(
+        chat_id,
+        f"⚠️ <b>{transition}</b>\n\n"
+        f"新的保留天数：<code>{days}</code> 天。\n"
+        "最终保存后，系统会自动清理早于留存临界时间的请求日志。\n\n"
+        "将移除请求摘要、原始 request / response、重试、代理和本地 Web 明细；"
+        "对应历史统计与日志详情也将不再可查。\n\n"
+        "继续后只会扫描并展示清理清单，<b>不会保存设置，也不会删除数据</b>。",
+        reply_markup=ui.inline_kb([
+            [ui.btn("✅ 继续扫描清理清单", f"sys:retention:scan:{code}")],
+            [ui.btn("❌ 取消", f"sys:retention:cancel:{code}")],
+        ]),
+    )
+
+
+def _retention_item_lines(item: dict, ordinal: int) -> list[str]:
+    month = ui.escape_html(str(item.get("month") or "?"))
+    bundle = _fmt_retention_bytes(item.get("bundle_bytes"))
+    total = int(item.get("total_requests") or 0)
+    expired = int(item.get("expired_requests") or 0)
+    if item.get("action") == "delete_file":
+        return [
+            f"<b>{ordinal}. {month}.db</b> · <code>{bundle}</code>",
+            f"   整库删除 · {expired:,} 条请求",
+        ]
+    return [
+        f"<b>{ordinal}. {month}.db</b> · 当前 <code>{bundle}</code>",
+        f"   删除 {expired:,} / {total:,} 条过期请求及关联明细",
+        "   随后压缩该月数据库以释放空间",
+    ]
+
+
+def _render_retention_plan(chat_id: int, message_id: int, code: str, page: int) -> None:
+    entry = _get_retention_pending(code, chat_id, "plan")
+    if entry is None:
+        ui.edit(chat_id, message_id, "⚠️ 清理预览已过期，请重新设置保留天数。",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
+        return
+    plan = entry.get("plan") or {}
+    items = list(plan.get("items") or [])
+    page_size = 6
+    page_count = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(int(page), page_count - 1))
+    start = page * page_size
+    visible = items[start:start + page_size]
+    days = int(plan.get("days") or 0)
+    lines = [
+        "🔎 <b>数据清理预览</b>",
+        "",
+        "<i>尚未保存策略，尚未删除任何数据。</i>",
+        f"新策略：保留最近 <code>{days}</code> 天",
+        f"清理临界：<code>{_fmt_retention_time(plan.get('cutoff'))}</code>（北京时间）",
+        f"已扫描：{int(plan.get('scanned_months') or 0)} 个数据库 · {_fmt_retention_bytes(plan.get('scanned_bytes'))}",
+        "",
+    ]
+    if not items:
+        lines.append("✅ 当前没有早于临界时间的请求日志，无需删除历史数据。")
+    else:
+        lines.append(f"本次涉及 {len(items)} 个数据库（第 {page + 1}/{page_count} 页）：")
+        lines.append("")
+        for ordinal, item in enumerate(visible, start=start + 1):
+            lines.extend(_retention_item_lines(item, ordinal))
+            lines.append("")
+    preflight = plan.get("preflight") or {}
+    if items and any(item.get("action") == "trim_and_vacuum" for item in items):
+        if preflight.get("ok"):
+            lines.extend([
+                "<b>压缩空间预检：通过</b>",
+                f"可用：<code>{_fmt_retention_bytes(preflight.get('effective_available_bytes'))}</code> · "
+                f"需要至少：<code>{_fmt_retention_bytes(preflight.get('required_bytes'))}</code>",
+            ])
+        else:
+            lines.extend([
+                "⚠️ <b>压缩空间预检未通过</b>",
+                ui.escape_html(str(preflight.get("reason") or "未知原因")),
+            ])
+    lines.extend([
+        "",
+        "⚠️ 删除不可恢复；历史统计和日志详情将不再可查。",
+    ])
+
+    rows: list[list[dict]] = []
+    nav: list[dict] = []
+    if page > 0:
+        nav.append(ui.btn("◀ 上一页", f"sys:retention:plan:{code}:{page - 1}"))
+    if page < page_count - 1:
+        nav.append(ui.btn("下一页 ▶", f"sys:retention:plan:{code}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if page == page_count - 1 and bool(preflight.get("ok")):
+        label = "✅ 确认保存策略" if not items else "🗑 确认保存并执行清理"
+        rows.append([ui.btn(label, f"sys:retention:commit:{code}")])
+    rows.append([ui.btn("❌ 取消", f"sys:retention:cancel:{code}")])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def _scan_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
+    entry = _pop_retention_pending(code, chat_id, "first")
+    if entry is None:
+        ui.answer_cb(cb_id, "确认已过期，请重新输入天数", show_alert=True)
+        return
+    ui.answer_cb(cb_id, "正在扫描…")
+    ui.edit(chat_id, message_id, "🔎 <b>正在扫描所有月度请求日志…</b>\n\n不会读取或展示请求正文。")
+    try:
+        plan = log_db.plan_retention(int(entry["days"]))
+    except Exception as exc:
+        ui.edit(chat_id, message_id, f"❌ 扫描失败：<code>{ui.escape_html(str(exc))}</code>",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
+        return
+    if plan.get("errors"):
+        details = "\n".join(f"• {ui.escape_html(str(item))}" for item in plan["errors"][:8])
+        ui.edit(chat_id, message_id, "❌ <b>扫描未完成，已拒绝生成删除计划</b>\n\n" + details,
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
+        return
+    plan_code = _register_retention_pending(chat_id, "plan", plan=plan)
+    _render_retention_plan(chat_id, message_id, plan_code, 0)
+
+
+def _retention_progress_text(days: int, event: dict) -> str:
+    item = event.get("item") or {}
+    month = ui.escape_html(str(item.get("month") or "?"))
+    index = int(event.get("index") or 0)
+    total = int(event.get("total") or 0)
+    phase = event.get("phase")
+    lines = [
+        "🧹 <b>正在执行请求日志清理</b>",
+        f"策略：保留最近 <code>{days}</code> 天",
+        "",
+        f"[{index}/{total}] <code>{month}.db</code>",
+    ]
+    if phase == "item_start":
+        lines.append("正在准备…")
+    elif phase == "trim_delete":
+        lines.append("正在删除过期请求及关联原始数据…")
+    elif phase == "trim_vacuum":
+        lines.append("正在压缩数据库以释放空间，可能需要一些时间…")
+    elif phase == "item_done":
+        result = event.get("result") or {}
+        if result.get("ok"):
+            lines.append("✅ 本项完成")
+        else:
+            lines.append("⚠️ 本项未完整完成，正在记录结果…")
+    return "\n".join(lines)
+
+
+def _commit_retention(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
+    entry = _pop_retention_pending(code, chat_id, "plan")
+    if entry is None:
+        ui.answer_cb(cb_id, "清理预览已过期，请重新扫描", show_alert=True)
+        return
+    plan = entry.get("plan") or {}
+    days = int(plan.get("days") or 0)
+    ui.answer_cb(cb_id, "开始执行清理…")
+    busy_kb = ui.inline_kb([[ui.btn("⏳ 正在清理…", "sys:retention:noop")]])
+    ui.edit(chat_id, message_id, "🧹 <b>正在验证清理计划并保存策略…</b>", reply_markup=busy_kb)
+
+    def _progress(event: dict) -> None:
+        ui.edit(chat_id, message_id, _retention_progress_text(days, event), reply_markup=busy_kb)
+
+    result = log_db.apply_retention_plan(plan, activate_policy=True, progress=_progress)
+    if result.get("ok"):
+        text = (
+            "✅ <b>数据留存策略已生效</b>\n\n"
+            f"当前策略：仅保留最近 <code>{int(result.get('days') or days)}</code> 天\n"
+            f"整库删除：<code>{int(result.get('full_months_deleted') or 0)}</code> 个\n"
+            f"已删除历史请求：<code>{int(result.get('deleted_requests') or 0):,}</code> 条\n"
+            f"实际释放磁盘：<code>{_fmt_retention_bytes(result.get('actual_free_bytes'))}</code>"
+        )
+    else:
+        errors = result.get("errors") or []
+        reason = result.get("reason") or "；".join(str(x) for x in errors) or "未知错误"
+        if result.get("config_saved"):
+            text = (
+                "⚠️ <b>数据留存策略已保存，但清理未完整完成</b>\n\n"
+                f"当前策略：仅保留最近 <code>{int(result.get('days') or days)}</code> 天\n"
+                f"已删除历史请求：<code>{int(result.get('deleted_requests') or 0):,}</code> 条\n"
+                f"原因：<code>{ui.escape_html(str(reason))}</code>\n\n"
+                "系统会在后续维护周期继续检查；也可重新进入此菜单扫描。"
+            )
+        else:
+            text = (
+                "❌ <b>未保存数据留存策略，未执行删除</b>\n\n"
+                f"原因：<code>{ui.escape_html(str(reason))}</code>"
+            )
+    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
+        [ui.btn("🗃 返回数据留存", "sys:show:retention")],
+        [ui.btn("◀ 返回系统设置", "menu:settings")],
+    ]))
+
+
+def _set_retention_forever(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    result = log_db.set_retention_forever()
+    if not result.get("ok"):
+        ui.edit(chat_id, message_id, f"⚠️ {ui.escape_html(str(result.get('reason') or '切换失败'))}",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
+        return
+    ui.edit(chat_id, message_id, "✅ 已切换为 <b>全部保留</b>。\n\n不会删除已有请求日志。",
+            reply_markup=ui.inline_kb([[ui.btn("◀ 返回数据留存", "sys:show:retention")]]))
+
+
+def _cancel_retention(chat_id: int, message_id: int, cb_id: str, code: str | None = None) -> None:
+    states.pop_state(chat_id)
+    if code:
+        _pop_retention_pending(code, chat_id)
+    ui.answer_cb(cb_id, "已取消")
+    text, kb = _retention_menu_text_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 超时设置 ─────────────────────────────────────────────────────
@@ -1437,6 +1850,34 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "menu:settings":
         show(chat_id, message_id, cb_id); return True
 
+    # 请求日志留存：两次确认分别使用 first / plan 短期服务端状态。
+    if data == "sys:show:retention":
+        _show_retention(chat_id, message_id, cb_id); return True
+    if data == "sys:retention:days":
+        _edit_retention_days(chat_id, message_id, cb_id); return True
+    if data == "sys:retention:forever":
+        _set_retention_forever(chat_id, message_id, cb_id); return True
+    if data == "sys:retention:cancel_input":
+        _cancel_retention(chat_id, message_id, cb_id); return True
+    if data == "sys:retention:noop":
+        ui.answer_cb(cb_id, "清理正在执行，请稍候"); return True
+    if data.startswith("sys:retention:scan:"):
+        _scan_retention(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
+    if data.startswith("sys:retention:plan:"):
+        parts = data.split(":")
+        if len(parts) != 5:
+            ui.answer_cb(cb_id, "无效的分页请求"); return True
+        try:
+            page = int(parts[4])
+        except ValueError:
+            ui.answer_cb(cb_id, "无效的页码"); return True
+        ui.answer_cb(cb_id)
+        _render_retention_plan(chat_id, message_id, parts[3], page); return True
+    if data.startswith("sys:retention:commit:"):
+        _commit_retention(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
+    if data.startswith("sys:retention:cancel:"):
+        _cancel_retention(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
+
     if data == "sys:show:timeouts":  _show_timeouts(chat_id, message_id, cb_id); return True
     if data == "sys:edit:timeouts":  _edit_timeouts(chat_id, message_id, cb_id); return True
     if data == "sys:show:errwin":    _show_errwin(chat_id, message_id, cb_id); return True
@@ -1522,6 +1963,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if action == "sys_retention_days":
+        _on_retention_days_input(chat_id, text); return True
     if action == "sys_timeouts":
         _on_timeouts_input(chat_id, text); return True
     if action == "sys_errwin":

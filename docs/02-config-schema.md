@@ -248,8 +248,12 @@
     }
   },
 
-  // ─── 路径 ───
+  // ─── 路径 / 请求日志留存 ───
   "logDir": "logs",
+  "logRetention": {
+    "mode": "forever",              // "forever" | "days"；默认永久保留
+    "days": null                      // mode="days" 时为整数，最少 1；无业务上限
+  },
   "stateDbPath": "state.db"
 }
 ```
@@ -263,6 +267,15 @@
 待回放 body 不会全部常驻内存：单请求累计正文超过 `queuedBodySpoolThresholdBytes`（默认 1 MiB）时，已缓存和后续正文会迁移到数据目录下固定的 `queued-body-spool/` 私有临时目录。`defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes` 继续限制单 Key / 全进程的内存正文与 ASGI 事件开销；`defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 独立限制临时磁盘，单 Key 还可用 `limits.maxQueuedBodySpoolBytes` 覆盖。任一聚合资源达到上限均返回 429 并带 `Retry-After`；旧配置名 `maxQueuedBodyBytesTotal` 仅在没有公开键 `maxQueuedBodyBytes` 时作为兼容回退。请求获得并发槽位、缓存事件回放完毕后，后续 body 由下游直接读取；成功、异常、等待超时、任务取消、客户端断开、热禁用及 FIFO handoff 都会归零 accounting，并关闭、删除临时文件。
 
 ## 2.2 字段语义详解
+
+### 请求日志留存 `logRetention`
+
+- `mode="forever"`：默认值，永久保留 `logs/YYYY-MM.db` 的业务请求日志。
+- `mode="days"`：仅保留从当前时刻向前回溯 `days` 天内的数据；`days` 必须为整数且 `>= 1`，无业务上限。模式与天数是独立字段，已处于该模式时可单独修改 `days`。
+- 在按天留存模式增大 `days`（如 3 → 5）只更新配置、不触发即时清理；首次启用或缩短 `days`（如 5 → 3）会扩大删除范围，TG Bot 必须先展示警告、扫描并逐月列出待清理项，第二次确认后才写入配置并执行删除。确认页的计划短期有效，执行前会重新验证，避免确认期间数据范围变化。
+- 仅影响月度业务日志：请求摘要、原始请求/响应、重试链、代理链与本地 Web 明细；**不影响** `state.db`、图片日志/缓存和翻译缓存。
+- 完整过期月份会删除整个 DB 文件（及其 WAL/SHM sidecar）；留存临界落在某个月中间时，会精确删除关联记录并执行 SQLite 压缩，才能实际释放磁盘空间。压缩前会做磁盘余量预检，空间不足时 fail-closed。
+- 已启用的策略由后台维护循环每天最多执行一次到期检查；不会在正常 API 请求的同步写入路径执行大型删除或 `VACUUM`。
 
 ### 渠道 `disabled_reason` 状态机
 
@@ -352,7 +365,7 @@ TG Bot 修改的所有操作都走 `config.save()`，采用 `tmp + os.replace` �
 - 添加/编辑/删除渠道
 - 添加/编辑/删除 OAuth 账户
 - 添加/删除 API Key
-- 修改超时 / 错误阶梯 / 黑名单 / CCH 模式
+- 修改超时 / 错误阶梯 / 黑名单 / CCH 模式 / 请求日志留存
 
 写入后无需重启（热加载生效）。
 

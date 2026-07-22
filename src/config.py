@@ -446,6 +446,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "logDir": "logs",
+    # 请求业务日志留存：forever = 永久保留；days = 仅保留最近 N 天（N >= 1）。
+    # 无效/缺失配置在运行时 fail-closed 为 forever，避免升级或手工编辑误删日志。
+    "logRetention": {
+        "mode": "forever",
+        "days": None,
+    },
     "stateDbPath": "state.db",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {

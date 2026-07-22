@@ -271,6 +271,10 @@
     }
   },
   "logDir": "logs",
+  "logRetention": {
+    "mode": "forever",
+    "days": null
+  },
   "stateDbPath": "state.db",
   "openaiOAuth": {
     "forceCodexCLI": true,

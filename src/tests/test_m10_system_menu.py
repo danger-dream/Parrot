@@ -28,11 +28,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, state_db
+    from src import config, log_db, state_db
     from src.telegram import bot, states, ui
     from src.telegram.menus import load_balancing_menu, system_menu
     return {
-        "config": config, "state_db": state_db,
+        "config": config, "log_db": log_db, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
         "load_balancing_menu": load_balancing_menu,
         "system_menu": system_menu,
@@ -78,7 +78,7 @@ def test_main_page(m):
     btns = [b["callback_data"] for row in edit["reply_markup"]["inline_keyboard"]
             for b in row if "callback_data" in b]
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
-                "sys:show:affinity", "sys:show:notif", "menu:status_alert",
+                "sys:show:affinity", "sys:show:notif", "menu:status_alert", "sys:show:retention",
                 "sys:show:blacklist", "sys:show:aklim", "sys:show:ws_mode", "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
@@ -308,6 +308,123 @@ def test_ws_mode_menu_and_toggle(m):
     assert m["config"].get()["openai"]["responsesUpstreamWsForOAuth"] is False
     print("  [PASS] WS mode menu + toggle")
 
+def test_log_retention_two_confirm_flow(m):
+    _reset(m)
+    rec = _install(m)
+    sm = m["system_menu"]
+    ld = m["log_db"]
+    sm._retention_pending.clear()
+    calls = {"plan": 0, "apply": []}
+    plan = {
+        "days": 7,
+        "cutoff": 1_770_000_000.0,
+        "reference_ts": 1_770_604_800.0,
+        "base_policy": {"mode": "forever", "days": None},
+        "items": [{
+            "month": "2026-07", "action": "trim_and_vacuum", "bundle_bytes": 1024,
+            "total_requests": 10, "expired_requests": 3,
+        }],
+        "errors": [],
+        "scanned_months": 1,
+        "scanned_bytes": 1024,
+        "preflight": {"ok": True, "effective_available_bytes": 20 * 1024**3, "required_bytes": 2 * 1024**3},
+        "signature": "test-signature",
+    }
+    old_plan = ld.plan_retention
+    old_apply = ld.apply_retention_plan
+    old_busy = ld.retention_cleanup_busy
+    try:
+        def fake_plan(days):
+            calls["plan"] += 1
+            assert days == 7
+            return plan
+        def fake_apply(got_plan, *, activate_policy=False, progress=None):
+            calls["apply"].append((got_plan, activate_policy))
+            if progress:
+                progress({"phase": "item_start", "item": plan["items"][0], "index": 1, "total": 1})
+            return {
+                "ok": True, "days": 7, "full_months_deleted": 0,
+                "deleted_requests": 3, "actual_free_bytes": 1024,
+            }
+        ld.plan_retention = fake_plan
+        ld.apply_retention_plan = fake_apply
+        ld.retention_cleanup_busy = lambda: False
+
+        sm._show_retention(42, 100, "cb")
+        assert "请求日志数据留存" in rec.last("editMessageText")["text"]
+        sm._edit_retention_days(42, 100, "cb")
+        assert m["states"].get_state(42)["action"] == "sys_retention_days"
+        sm._on_retention_days_input(42, "7")
+        # 输入阶段只有第一层确认，尚未扫描 / 保存 / 删除。
+        assert calls["plan"] == 0
+        first = rec.last("sendMessage")
+        scan_cb = next(
+            b["callback_data"] for row in first["reply_markup"]["inline_keyboard"]
+            for b in row if b["callback_data"].startswith("sys:retention:scan:")
+        )
+        sm.handle_callback(42, 200, "cb", scan_cb)
+        assert calls["plan"] == 1
+        preview = rec.last("editMessageText")
+        assert "数据清理预览" in preview["text"]
+        commit_cb = next(
+            b["callback_data"] for row in preview["reply_markup"]["inline_keyboard"]
+            for b in row if b["callback_data"].startswith("sys:retention:commit:")
+        )
+        sm.handle_callback(42, 200, "cb", commit_cb)
+        assert calls["apply"] == [(plan, True)]
+        assert "数据留存策略已生效" in rec.last("editMessageText")["text"]
+    finally:
+        ld.plan_retention = old_plan
+        ld.apply_retention_plan = old_apply
+        ld.retention_cleanup_busy = old_busy
+        sm._retention_pending.clear()
+    print("  [PASS] log retention two-confirm flow")
+
+
+def test_log_retention_days_mode_can_update_day_value(m):
+    _reset(m)
+    rec = _install(m)
+    sm = m["system_menu"]
+    sm._retention_pending.clear()
+    m["config"].update(lambda cfg: cfg.__setitem__("logRetention", {"mode": "days", "days": 3}))
+    try:
+        sm._show_retention(42, 100, "cb")
+        page = rec.last("editMessageText")
+        assert "当前留存模式：<code>按天留存</code>" in page["text"]
+        assert "保留天数：<code>3 天</code>" in page["text"]
+        callbacks = [
+            button["callback_data"]
+            for row in page["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        assert "sys:retention:days" in callbacks
+        assert "sys:retention:forever" in callbacks
+
+        # 3 → 5 仍是按天留存模式，只更新天数，不生成删除预览。
+        sm._edit_retention_days(42, 100, "cb")
+        assert "当前为按天留存，保留 <code>3</code> 天" in rec.last("editMessageText")["text"]
+        sm._on_retention_days_input(42, "5")
+        assert m["config"].get()["logRetention"] == {"mode": "days", "days": 5}
+        assert "按天留存天数已修改" in rec.last("sendMessage")["text"]
+        assert not sm._retention_pending
+
+        # 5 → 2 会缩短留存期，必须回到两次确认的删除预览流程。
+        sm._edit_retention_days(42, 100, "cb")
+        sm._on_retention_days_input(42, "2")
+        warning = rec.last("sendMessage")
+        assert "从 5 天缩短为 2 天" in warning["text"]
+        assert any(
+            button["callback_data"].startswith("sys:retention:scan:")
+            for row in warning["reply_markup"]["inline_keyboard"]
+            for button in row
+        )
+    finally:
+        m["config"].update(lambda cfg: cfg.__setitem__("logRetention", {"mode": "forever", "days": None}))
+        sm._retention_pending.clear()
+        m["states"].clear_all()
+    print("  [PASS] log retention mode/day-value separation")
+
+
 def test_router_dispatch(m):
     _reset(m)
     rec = _install(m)
@@ -359,6 +476,8 @@ def main():
         test_blacklist_default_add_and_remove,
         test_blacklist_by_channel,
         test_ws_mode_menu_and_toggle,
+        test_log_retention_two_confirm_flow,
+        test_log_retention_days_mode_can_update_day_value,
         test_router_dispatch,
         test_text_state_dispatch_to_system,
     ]

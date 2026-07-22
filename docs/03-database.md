@@ -251,8 +251,10 @@ def retry_chain_of(request_id) -> list[Row]
 | 错误冷却 | state.db | 否 | 临时（cooldown 到期清除） |
 | 亲和绑定 | state.db | 否 | TTL 30min |
 | OAuth 配额缓存 | state.db | 否 | 实时覆盖写 |
-| 请求流水 | logs/YYYY-MM.db | 是 | 按月归档（永久保留文件） |
-| 重试链 | logs/YYYY-MM.db | 是 | 同上 |
-| 请求/响应 body | logs/YYYY-MM.db | 是 | 同上 |
+| 请求流水 | logs/YYYY-MM.db | 是 | 默认永久保留；可由 `logRetention` 按天清理 |
+| 重试链 | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
+| 请求/响应 body | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 
 原则：**状态数据需要快速读写且重启恢复**，放 state.db；**业务日志写多读少且数据量大**，按月分库便于归档与迁移。
+
+当 `logRetention.mode="days"` 时，完整过期月份直接删除整库；留存临界所在月份会删除过期请求及 `request_detail` / retry / proxy / local-web 关联行，再压缩 SQLite 以实际回收磁盘空间。TG Bot 必须经两次确认后才会保存该策略并执行首次清理；之后由后台维护循环每天最多检查一次。

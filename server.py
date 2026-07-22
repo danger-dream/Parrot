@@ -113,6 +113,20 @@ async def _stale_pending_loop():
                 print(f"[log_db] cleaned {cleared} stale pending records")
         except Exception as e:
             print(f"[log_db] stale cleanup failed: {e}")
+        # 留存策略已经由 TG 二次确认后持久化；这里每天最多实际清理一次。
+        # 放在后台维护线程而非请求写入路径，避免一条新请求撞上大型 VACUUM。
+        try:
+            retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
+            if not retention.get("skipped"):
+                if retention.get("ok"):
+                    removed = int(retention.get("deleted_requests") or 0)
+                    freed = int(retention.get("actual_free_bytes") or 0)
+                    if removed or freed:
+                        print(f"[log_db] retention cleanup removed {removed} requests, freed {freed} bytes")
+                else:
+                    print(f"[log_db] retention cleanup failed: {retention.get('reason') or retention.get('errors')}")
+        except Exception as e:
+            print(f"[log_db] retention cleanup failed: {e}")
 
 
 async def _affinity_cleanup_loop():
@@ -144,6 +158,19 @@ async def lifespan(app: FastAPI):
     image_db.init()
     translation.init()
     await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
+    # 手工编辑 config 后重启的按天留存策略也应尽快收敛；默认永久保留时只做
+    # 一个轻量判断，不会触碰任何日志数据。
+    try:
+        retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
+        if retention.get("ok") and not retention.get("skipped"):
+            removed = int(retention.get("deleted_requests") or 0)
+            freed = int(retention.get("actual_free_bytes") or 0)
+            if removed or freed:
+                print(f"[log_db] startup retention cleanup removed {removed} requests, freed {freed} bytes")
+        elif not retention.get("ok"):
+            print(f"[log_db] startup retention cleanup failed: {retention.get('reason') or retention.get('errors')}")
+    except Exception as exc:
+        print(f"[log_db] startup retention cleanup failed: {exc}")
 
     # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
     try:

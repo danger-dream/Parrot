@@ -11,8 +11,11 @@
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
 
+import hashlib
 import json
 import os
+import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -30,6 +33,26 @@ _local = threading.local()
 _write_lock = threading.RLock()
 _initialized = False
 _log_dir: str | None = None
+
+# 日志留存清理在独立锁下串行运行；真正删除 / VACUUM 时还会持有
+# _write_lock，避免与请求流水写入交错。
+_retention_lock = threading.Lock()
+_retention_auto_lock = threading.Lock()
+_last_retention_cleanup_key: tuple[int, str] | None = None
+
+# 每线程仍通过 _local 缓存连接；额外登记是为了整月删除前可以关闭旧月的
+# 空闲写连接，使 unlink 后磁盘空间能够立即回收，而不是等 worker 线程退出。
+_write_conn_registry_lock = threading.Lock()
+_write_conn_registry: dict[str, list[sqlite3.Connection]] = {}
+_retired_log_paths: set[str] = set()
+
+_MONTH_LOG_NAME_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})\.db$")
+_RETENTION_MODE_FOREVER = "forever"
+_RETENTION_MODE_DAYS = "days"
+_RETENTION_CHILD_TABLES = ("request_detail", "retry_chain", "proxy_chain", "local_web_log")
+# SQLite VACUUM 在最坏情况下会临时占用约两倍原库空间；额外留出 10%（至少 512 MiB）
+# 以容纳 WAL / 并发写入等波动。
+_RETENTION_VACUUM_MIN_MARGIN_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -61,6 +84,10 @@ class RowLogHandle:
 
 class HistoricalLogError(RuntimeError):
     """A historical month couldn't be queried read-only and must not be skipped."""
+
+
+class RetentionPlanError(RuntimeError):
+    """A retention plan cannot be safely executed in the current log state."""
 
 
 # Compatibility lookup for call sites migrated incrementally.  The authoritative
@@ -458,13 +485,28 @@ def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
 
     if _log_dir is None:
         raise RuntimeError("log_db.init() not called")
+    with _write_conn_registry_lock:
+        if ref.path in _retired_log_paths:
+            # 整月留存清理已经删除过这个文件；绝不能因旧 RequestLogHandle
+            # 或跨月迟到写入而创建一个同名空库。
+            raise RetentionPlanError(f"log database was removed by retention cleanup: {ref.path}")
     cache = getattr(_local, "write_conns", None)
     if cache is None:
         cache = {}
         _local.write_conns = cache
     conn = cache.get(ref.path)
+    if conn is not None:
+        # 留存清理可从其它 worker 线程关闭旧月的闲置连接。其 thread-local
+        # cache 仍可能留着对象，先探测并丢弃已关闭连接。
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            cache.pop(ref.path, None)
+            conn = None
     if conn is None:
-        conn = sqlite3.connect(ref.path, timeout=10)
+        # check_same_thread=False 仅用于留存清理在持 _write_lock 时关闭旧月闲置
+        # 连接；正常读写仍按 thread-local 路由，且写操作始终由 _write_lock 串行。
+        conn = sqlite3.connect(ref.path, timeout=10, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -474,6 +516,8 @@ def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
             _ensure_migrations(conn)
             conn.commit()
         cache[ref.path] = conn
+        with _write_conn_registry_lock:
+            _write_conn_registry.setdefault(ref.path, []).append(conn)
     # Legacy introspection compatibility only; write routing never reads these.
     _local.conn = conn
     _local.month = ref.month
@@ -530,10 +574,685 @@ def migrate_month_schema(month: str) -> None:
 
 
 def checkpoint() -> None:
+    # 留存清理/压缩会长期独占写锁；checkpoint 是最佳努力维护，不应因此阻塞
+    # FastAPI event loop。抢不到锁时交给下一轮即可。
+    if not _write_lock.acquire(blocking=False):
+        return
     try:
-        _get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            _get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        _write_lock.release()
+
+
+# ─── 请求日志留存 ───────────────────────────────────────────────────
+
+
+def retention_policy(cfg: dict | None = None) -> dict[str, Any]:
+    """返回 fail-closed 的请求日志留存策略。
+
+    缺失、类型错误或非法天数一律按 ``forever`` 处理，避免手工改坏 config 后
+    意外触发历史日志删除。
+    """
+
+    cfg = cfg if isinstance(cfg, dict) else config.get()
+    raw = cfg.get("logRetention") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    if raw.get("mode") != _RETENTION_MODE_DAYS:
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    value = raw.get("days")
+    if isinstance(value, bool):
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    if isinstance(value, float) and not value.is_integer():
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    if days < 1:
+        return {"mode": _RETENTION_MODE_FOREVER, "days": None}
+    return {"mode": _RETENTION_MODE_DAYS, "days": days}
+
+
+def set_retention_forever() -> dict[str, Any]:
+    """关闭自动留存清理（不删除现有日志）。"""
+
+    global _last_retention_cleanup_key
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "已有日志留存清理正在执行，请完成后再切换。"}
+    try:
+        config.update(lambda cfg: cfg.__setitem__(
+            "logRetention", {"mode": _RETENTION_MODE_FOREVER, "days": None},
+        ))
+        with _retention_auto_lock:
+            _last_retention_cleanup_key = None
+        return {"ok": True, "policy": retention_policy()}
+    except Exception as exc:
+        return {"ok": False, "reason": f"保存日志留存设置失败：{exc}"}
+    finally:
+        _retention_lock.release()
+
+
+def extend_retention_days(days: Any) -> dict[str, Any]:
+    """在已启用按天留存时延长保留天数，不触发即时清理。
+
+    仅允许 ``new_days > current_days``。缩短留存期会扩大删除范围，必须经由
+    ``plan_retention()`` / ``apply_retention_plan()`` 的双重确认路径处理。
+    """
+
+    new_days = _require_retention_days(days)
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "reason": "已有日志留存清理正在执行，请完成后再修改。"}
+    try:
+        current = retention_policy()
+        if current["mode"] != _RETENTION_MODE_DAYS:
+            return {"ok": False, "reason": "当前不是按天留存模式，请重新进入数据留存页面。"}
+        old_days = int(current["days"])
+        if new_days <= old_days:
+            return {
+                "ok": False,
+                "reason": "延长保留天数必须大于当前值；缩短留存期请走清理预览确认。",
+            }
+        config.update(lambda cfg: cfg.__setitem__(
+            "logRetention", {"mode": _RETENTION_MODE_DAYS, "days": new_days},
+        ))
+        # 延长留存期不会产生新的删除范围；今天不必再触发一次自动扫描，明日会按
+        # 新天数继续日常收敛。此前已经被旧策略清理的数据当然无法恢复。
+        _mark_retention_cleanup(new_days, time.time())
+        return {
+            "ok": True,
+            "old_days": old_days,
+            "days": new_days,
+            "policy": retention_policy(),
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"保存日志留存设置失败：{exc}"}
+    finally:
+        _retention_lock.release()
+
+
+def retention_cleanup_busy() -> bool:
+    return _retention_lock.locked()
+
+
+def _require_retention_days(value: Any) -> int:
+    if isinstance(value, bool):
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数")
+    try:
+        days = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数")
+    if days < 1:
+        raise RetentionPlanError("保留天数必须是大于等于 1 的整数")
+    return days
+
+
+def _monthly_log_files() -> list[tuple[str, str]]:
+    """列出严格符合 YYYY-MM.db 的月度业务日志文件。
+
+    不匹配的 .db（例如用户另外放在 logDir 的库）永远不纳入留存计划，避免
+    配置错误扩大删除范围。
+    """
+
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return []
+    out: list[tuple[str, str]] = []
+    for entry in os.scandir(_log_dir):
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        match = _MONTH_LOG_NAME_RE.fullmatch(entry.name)
+        if not match:
+            continue
+        try:
+            year = int(match.group("year"))
+            month_num = int(match.group("month"))
+            datetime(year, month_num, 1, tzinfo=_BJT)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        out.append((entry.name[:-3], entry.path))
+    return sorted(out)
+
+
+def _log_bundle_bytes(path: str) -> int:
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += int(os.path.getsize(path + suffix))
+        except OSError:
+            pass
+    return total
+
+
+def _existing_tables(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+
+
+def _read_retention_metadata(path: str, cutoff: float) -> dict[str, Any]:
+    conn = _open_readonly(path)
+    try:
+        tables = _existing_tables(conn)
+        if "request_log" not in tables:
+            raise RetentionPlanError("缺少 request_log 表")
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
+        }
+        if "request_id" not in columns or "created_at" not in columns:
+            raise RetentionPlanError("request_log 缺少 request_id 或 created_at 列")
+        row = conn.execute(
+            """SELECT COUNT(*) AS total_requests,
+                      SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END) AS expired_requests
+                 FROM request_log""",
+            (float(cutoff),),
+        ).fetchone()
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+        freelist_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+        return {
+            "total_requests": int(row["total_requests"] or 0),
+            "expired_requests": int(row["expired_requests"] or 0),
+            "page_size": page_size,
+            "freelist_bytes": page_size * freelist_pages,
+        }
+    finally:
+        conn.close()
+
+
+def _retention_target_signature(plan: dict[str, Any]) -> str:
+    payload = {
+        "days": int(plan.get("days") or 0),
+        "cutoff": f"{float(plan.get('cutoff') or 0):.6f}",
+        "items": [
+            {
+                "month": str(item.get("month") or ""),
+                "action": str(item.get("action") or ""),
+                "expired_requests": int(item.get("expired_requests") or 0),
+            }
+            for item in (plan.get("items") or [])
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _retention_preflight(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """检查边界月 VACUUM 前的可用空间。
+
+    整月文件会先删，因此可把它们的当前体积计入可用空间预期；边界月逐个
+    压缩，所需临时空间取其中最大值而非累计值。
+    """
+
+    partial = [item for item in items if item.get("action") == "trim_and_vacuum"]
+    if not partial:
+        return {
+            "ok": True,
+            "available_bytes": 0,
+            "full_delete_credit_bytes": 0,
+            "effective_available_bytes": 0,
+            "required_bytes": 0,
+            "reason": "",
+        }
+    if _log_dir is None:
+        return {"ok": False, "reason": "日志目录尚未初始化"}
+    try:
+        free_bytes = int(shutil.disk_usage(_log_dir).free)
+        full_credit = sum(
+            _log_bundle_bytes(str(item["path"]))
+            for item in items
+            if item.get("action") == "delete_file"
+        )
+        required = 0
+        for item in partial:
+            db_bytes = int(os.path.getsize(str(item["path"])))
+            margin = max(_RETENTION_VACUUM_MIN_MARGIN_BYTES, db_bytes // 10)
+            required = max(required, db_bytes * 2 + margin)
+        effective = free_bytes + full_credit
+        ok = effective >= required
+        reason = "" if ok else (
+            f"可用空间不足：压缩边界月需要至少 {required} 字节可用空间，"
+            f"当前可用（含先删除完整月份后的预期）为 {effective} 字节"
+        )
+        return {
+            "ok": ok,
+            "available_bytes": free_bytes,
+            "full_delete_credit_bytes": full_credit,
+            "effective_available_bytes": effective,
+            "required_bytes": required,
+            "reason": reason,
+        }
+    except OSError as exc:
+        return {"ok": False, "reason": f"读取日志目录磁盘空间失败：{exc}"}
+
+
+def _build_retention_plan(
+    days: int,
+    cutoff: float,
+    reference_ts: float,
+    *,
+    base_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """根据固定 cutoff 扫描待删数据；不会写入或删除任何文件。"""
+
+    days = _require_retention_days(days)
+    reference_ts = float(reference_ts)
+    cutoff = float(cutoff)
+    policy = retention_policy() if base_policy is None else retention_policy({"logRetention": base_policy})
+    plan: dict[str, Any] = {
+        "days": days,
+        "cutoff": cutoff,
+        "reference_ts": reference_ts,
+        "created_at": time.time(),
+        "base_policy": policy,
+        "items": [],
+        "errors": [],
+        "scanned_months": 0,
+        "scanned_bytes": 0,
+        "scanned_requests": 0,
+    }
+    if _log_dir is None:
+        plan["errors"].append("日志目录尚未初始化")
+        plan["preflight"] = {"ok": False, "reason": "日志目录尚未初始化"}
+        plan["signature"] = _retention_target_signature(plan)
+        return plan
+
+    active_month = datetime.fromtimestamp(reference_ts, tz=_BJT).strftime("%Y-%m")
+    for month, path in _monthly_log_files():
+        bundle_bytes = _log_bundle_bytes(path)
+        plan["scanned_months"] += 1
+        plan["scanned_bytes"] += bundle_bytes
+        try:
+            meta = _read_retention_metadata(path, cutoff)
+        except Exception as exc:
+            plan["errors"].append(f"{month}.db 无法安全扫描：{exc}")
+            continue
+        total_requests = int(meta["total_requests"])
+        expired_requests = int(meta["expired_requests"])
+        plan["scanned_requests"] += total_requests
+        if expired_requests <= 0:
+            continue
+        # 当前写入月份绝不 unlink：即使它所有现有记录都已过期，仍可能有
+        # thread-local 连接在后续请求中继续使用该文件，必须原地清理并压缩。
+        action = (
+            "delete_file"
+            if expired_requests == total_requests and month != active_month
+            else "trim_and_vacuum"
+        )
+        plan["items"].append({
+            "month": month,
+            "path": path,
+            "action": action,
+            "cutoff": cutoff,
+            "db_bytes": int(os.path.getsize(path)),
+            "bundle_bytes": bundle_bytes,
+            "total_requests": total_requests,
+            "expired_requests": expired_requests,
+            "freelist_bytes": int(meta["freelist_bytes"]),
+        })
+
+    plan["preflight"] = (
+        {"ok": False, "reason": "扫描存在错误，不能执行删除"}
+        if plan["errors"] else _retention_preflight(plan["items"])
+    )
+    plan["signature"] = _retention_target_signature(plan)
+    return plan
+
+
+def plan_retention(days: int, now_ts: float | None = None) -> dict[str, Any]:
+    """生成按天留存的只读清理计划，用于 TG 的第二次确认页。"""
+
+    now = time.time() if now_ts is None else float(now_ts)
+    days = _require_retention_days(days)
+    return _build_retention_plan(
+        days,
+        now - days * 86400,
+        now,
+        base_policy=retention_policy(),
+    )
+
+
+def _revalidate_retention_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict):
+        raise RetentionPlanError("清理计划格式无效")
+    days = _require_retention_days(plan.get("days"))
+    try:
+        cutoff = float(plan["cutoff"])
+        reference_ts = float(plan["reference_ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RetentionPlanError("清理计划缺少时间边界") from exc
+    base_policy = plan.get("base_policy")
+    if not isinstance(base_policy, dict):
+        raise RetentionPlanError("清理计划缺少原始策略快照")
+    fresh = _build_retention_plan(days, cutoff, reference_ts, base_policy=base_policy)
+    if fresh.get("errors"):
+        raise RetentionPlanError("；".join(str(x) for x in fresh["errors"]))
+    if fresh.get("signature") != plan.get("signature"):
+        raise RetentionPlanError("日志数据在确认期间发生变化，请重新扫描后再确认")
+    if not bool((fresh.get("preflight") or {}).get("ok")):
+        raise RetentionPlanError(str((fresh.get("preflight") or {}).get("reason") or "磁盘空间预检失败"))
+    return fresh
+
+
+def _emit_retention_progress(progress, event: dict[str, Any]) -> None:
+    if not callable(progress):
+        return
+    try:
+        progress(event)
+    except Exception as exc:
+        # 进度消息失败不应中断已经确认的清理任务。
+        print(f"[log_db] retention progress callback failed: {exc}")
+
+
+def _has_active_handle_for_path(path: str) -> bool:
+    return any(handle.db.path == path for handle in _request_handles.values())
+
+
+def _close_cached_write_connections(path: str) -> None:
+    """关闭已无活跃请求的旧月连接，供整库删除前调用。
+
+    调用方必须持有 _write_lock。连接创建时已明确 check_same_thread=False；
+    正常业务仍保持 thread-local 使用方式，这里只在历史库退役时跨线程 close。
+    """
+
+    with _write_conn_registry_lock:
+        conns = list(_write_conn_registry.pop(path, []))
+    for conn in conns:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    local_cache = getattr(_local, "write_conns", None)
+    if isinstance(local_cache, dict):
+        local_cache.pop(path, None)
+
+
+def _mark_log_path_retired(path: str) -> None:
+    with _write_conn_registry_lock:
+        _retired_log_paths.add(path)
+
+
+def _delete_whole_retention_month(item: dict[str, Any]) -> dict[str, Any]:
+    """删除完整过期月库及 WAL/SHM；调用方必须持有 _write_lock。"""
+
+    path = str(item["path"])
+    if _has_active_handle_for_path(path):
+        raise RetentionPlanError(f"{item['month']}.db 仍有活跃请求，拒绝删除")
+    if not os.path.exists(path):
+        raise RetentionPlanError(f"{item['month']}.db 已不存在，请重新扫描")
+    before_bytes = _log_bundle_bytes(path)
+    _close_cached_write_connections(path)
+    removed_files: list[str] = []
+    try:
+        os.unlink(path)
+        removed_files.append(path)
+    except Exception as exc:
+        raise RetentionPlanError(f"删除 {item['month']}.db 失败：{exc}") from exc
+    # 主库已经不在后必须立即 retire，哪怕某个 sidecar 因临时系统错误尚未删掉，
+    # 也不能允许旧 handle 重新创建同名空库。
+    _mark_log_path_retired(path)
+    sidecar_errors: list[str] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = path + suffix
+        try:
+            os.unlink(sidecar)
+            removed_files.append(sidecar)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            sidecar_errors.append(f"{os.path.basename(sidecar)}: {exc}")
+    error = "；".join(sidecar_errors)
+    return {
+        "month": item["month"],
+        "action": "delete_file",
+        "ok": not bool(error),
+        "deleted_requests": int(item.get("expired_requests") or 0),
+        "before_bytes": before_bytes,
+        "after_bytes": _log_bundle_bytes(path),
+        "removed_files": len(removed_files),
+        "compacted": False,
+        "error": error,
+    }
+
+
+def _trim_retention_month(
+    item: dict[str, Any],
+    *,
+    progress=None,
+    index: int = 0,
+    total: int = 0,
+) -> dict[str, Any]:
+    """精确删除边界月过期记录及关联明细，并 VACUUM 回收物理空间。"""
+
+    path = str(item["path"])
+    before_bytes = _log_bundle_bytes(path)
+    result = {
+        "month": item["month"],
+        "action": "trim_and_vacuum",
+        "ok": False,
+        "deleted_requests": 0,
+        "before_bytes": before_bytes,
+        "after_bytes": before_bytes,
+        "removed_files": 0,
+        "compacted": False,
+        "error": "",
+    }
+    conn: sqlite3.Connection | None = None
+    committed = False
+    try:
+        conn = sqlite3.connect(path, timeout=10, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        tables = _existing_tables(conn)
+        if "request_log" not in tables:
+            raise RetentionPlanError("缺少 request_log 表")
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(request_log)").fetchall()
+        }
+        if "request_id" not in columns or "created_at" not in columns:
+            raise RetentionPlanError("request_log 缺少 request_id 或 created_at 列")
+
+        _emit_retention_progress(progress, {
+            "phase": "trim_delete", "item": item, "index": index, "total": total,
+        })
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TEMP TABLE _parrot_retention_ids (request_id TEXT PRIMARY KEY)")
+        conn.execute(
+            "INSERT INTO _parrot_retention_ids(request_id) "
+            "SELECT request_id FROM request_log WHERE created_at < ?",
+            (float(item["cutoff"]),),
+        )
+        target_count = int(conn.execute("SELECT COUNT(*) FROM _parrot_retention_ids").fetchone()[0] or 0)
+        for table in _RETENTION_CHILD_TABLES:
+            if table in tables:
+                conn.execute(
+                    f"DELETE FROM {table} WHERE request_id IN "
+                    "(SELECT request_id FROM _parrot_retention_ids)"
+                )
+        conn.execute(
+            "DELETE FROM request_log WHERE request_id IN "
+            "(SELECT request_id FROM _parrot_retention_ids)"
+        )
+        conn.commit()
+        committed = True
+        result["deleted_requests"] = target_count
+        try:
+            conn.execute("DROP TABLE IF EXISTS _parrot_retention_ids")
+        except Exception:
+            pass
+
+        if target_count:
+            _emit_retention_progress(progress, {
+                "phase": "trim_vacuum", "item": item, "index": index, "total": total,
+            })
+            # 先落下 WAL，随后 VACUUM；若此阶段失败，逻辑删除已提交，结果会如实
+            # 标记“未完成压缩”，而不会谎称已释放磁盘。
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                result["compacted"] = True
+            except Exception as exc:
+                result["error"] = f"历史记录已删除，但数据库压缩失败：{exc}"
+        result["ok"] = not bool(result["error"])
+    except Exception as exc:
+        if conn is not None and conn.in_transaction:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        if committed:
+            result["error"] = result["error"] or f"历史记录已删除，但后续处理失败：{exc}"
+        else:
+            result["error"] = f"清理 {item['month']}.db 失败：{exc}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        result["after_bytes"] = _log_bundle_bytes(path)
+    return result
+
+
+def _execute_retention_plan(plan: dict[str, Any], progress=None) -> dict[str, Any]:
+    """在已持有 _write_lock 的前提下执行已重验过的留存计划。"""
+
+    items = list(plan.get("items") or [])
+    before_free = 0
+    if _log_dir is not None:
+        try:
+            before_free = int(shutil.disk_usage(_log_dir).free)
+        except OSError:
+            pass
+    results: list[dict[str, Any]] = []
+    # 先删完整月份，既快速释放空间，也让后续边界月 VACUUM 有更充足余量。
+    ordered = sorted(items, key=lambda item: 0 if item.get("action") == "delete_file" else 1)
+    for index, item in enumerate(ordered, start=1):
+        _emit_retention_progress(progress, {
+            "phase": "item_start", "item": item, "index": index, "total": len(ordered),
+        })
+        if item.get("action") == "delete_file":
+            try:
+                result = _delete_whole_retention_month(item)
+            except Exception as exc:
+                result = {
+                    "month": item.get("month"), "action": "delete_file", "ok": False,
+                    "deleted_requests": 0, "before_bytes": _log_bundle_bytes(str(item.get("path") or "")),
+                    "after_bytes": _log_bundle_bytes(str(item.get("path") or "")),
+                    "removed_files": 0, "compacted": False, "error": str(exc),
+                }
+        else:
+            result = _trim_retention_month(item, progress=progress, index=index, total=len(ordered))
+        results.append(result)
+        _emit_retention_progress(progress, {
+            "phase": "item_done", "item": item, "result": result,
+            "index": index, "total": len(ordered),
+        })
+
+    after_free = before_free
+    if _log_dir is not None:
+        try:
+            after_free = int(shutil.disk_usage(_log_dir).free)
+        except OSError:
+            pass
+    logical_before = sum(int(row.get("before_bytes") or 0) for row in results)
+    logical_after = sum(int(row.get("after_bytes") or 0) for row in results)
+    errors = [str(row.get("error")) for row in results if row.get("error")]
+    return {
+        "ok": not errors,
+        "items": results,
+        "deleted_requests": sum(int(row.get("deleted_requests") or 0) for row in results),
+        "full_months_deleted": sum(1 for row in results if row.get("ok") and row.get("action") == "delete_file"),
+        "logical_bytes_removed": max(0, logical_before - logical_after),
+        "actual_free_bytes": max(0, after_free - before_free),
+        "errors": errors,
+    }
+
+
+def _mark_retention_cleanup(days: int, reference_ts: float) -> None:
+    global _last_retention_cleanup_key
+    day = datetime.fromtimestamp(float(reference_ts), tz=_BJT).strftime("%Y-%m-%d")
+    with _retention_auto_lock:
+        _last_retention_cleanup_key = (int(days), day)
+
+
+def apply_retention_plan(
+    plan: dict[str, Any],
+    *,
+    activate_policy: bool = False,
+    progress=None,
+) -> dict[str, Any]:
+    """重验并执行留存计划。
+
+    ``activate_policy=True`` 仅供 TG 第二次确认使用：预检、重验均通过后才将
+    config 持久化为按天留存，随后立刻执行；若执行中途出错，策略仍保持生效，
+    由后续维护轮次继续收敛，不会出现“已删数据但配置回到永久保留”的假象。
+    """
+
+    if not _retention_lock.acquire(blocking=False):
+        return {"ok": False, "config_saved": False, "reason": "已有日志留存清理正在执行"}
+    try:
+        with _write_lock:
+            try:
+                fresh = _revalidate_retention_plan(plan)
+            except Exception as exc:
+                return {"ok": False, "config_saved": False, "reason": str(exc)}
+            config_saved = False
+            expected = retention_policy({"logRetention": plan.get("base_policy")})
+            if retention_policy() != expected:
+                return {
+                    "ok": False,
+                    "config_saved": False,
+                    "reason": "留存策略在确认期间已被修改，请重新扫描后再确认",
+                }
+            if activate_policy:
+                try:
+                    days = int(fresh["days"])
+                    config.update(lambda cfg: cfg.__setitem__(
+                        "logRetention", {"mode": _RETENTION_MODE_DAYS, "days": days},
+                    ))
+                    config_saved = True
+                except Exception as exc:
+                    return {"ok": False, "config_saved": False, "reason": f"保存留存策略失败：{exc}"}
+            result = _execute_retention_plan(fresh, progress=progress)
+            result["config_saved"] = config_saved
+            result["days"] = int(fresh["days"])
+            _mark_retention_cleanup(int(fresh["days"]), float(fresh["reference_ts"]))
+            return result
+    finally:
+        _retention_lock.release()
+
+
+def maybe_cleanup_retention(now_ts: float | None = None) -> dict[str, Any]:
+    """按已保存策略每天最多执行一次自动到期清理。"""
+
+    now = time.time() if now_ts is None else float(now_ts)
+    policy = retention_policy()
+    if policy["mode"] != _RETENTION_MODE_DAYS:
+        return {"ok": True, "skipped": True, "reason": "永久保留"}
+    days = int(policy["days"])
+    day = datetime.fromtimestamp(now, tz=_BJT).strftime("%Y-%m-%d")
+    global _last_retention_cleanup_key
+    with _retention_auto_lock:
+        if _last_retention_cleanup_key == (days, day):
+            return {"ok": True, "skipped": True, "reason": "今日已检查"}
+        # 即便预检失败也不要每 5 分钟反复触发一次大型扫描 / VACUUM；明日会重试。
+        _last_retention_cleanup_key = (days, day)
+    try:
+        plan = plan_retention(days, now_ts=now)
+        result = apply_retention_plan(plan, activate_policy=False)
+        result["automatic"] = True
+        return result
+    except Exception as exc:
+        return {"ok": False, "automatic": True, "reason": f"自动日志留存清理失败：{exc}"}
+
 
 
 def migrate_channel_keys(mapping: dict[str, str]) -> dict:
