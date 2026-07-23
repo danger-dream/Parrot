@@ -4,6 +4,8 @@ callback_data：
   `menu:logs`                  — 显示最近日志第 1 页
   `logs:page:<page>`           — 显示指定页
   `logs:refresh:<page>`        — 刷新指定页
+  `logs:query:<state>`         — 打开查询方式二级菜单
+  `logs:queryclear:<state>`    — 清空全部查询条件并返回日志列表
   `logs:detail:<short>:<state>` — 查看详情（state 用于返回列表）
   `logs:dpage:<short>:<n>:<state>` — 查看完整详情的第 n 页
 """
@@ -361,14 +363,10 @@ def _list_kb(rows: list[dict], *, state: dict, page: int, total_pages: int) -> d
         ui.btn("下一页 ▶", _list_cb(state, page=next_page)),
     ])
     rows_kb.append([
-        ui.btn(f"🔑 账号：{_filter_summary('apikey', state['a'])}", f"logs:filter:apikey:{state_code}"),
-        ui.btn(f"🤖 模型：{_filter_summary('model', state['m'])}", f"logs:filter:model:{state_code}"),
+        ui.btn("🔄 刷新", _list_cb(state, page=page)),
+        ui.btn("🔎 查询", f"logs:query:{state_code}"),
+        ui.btn("◀ 返回主菜单", "menu:main"),
     ])
-    rows_kb.append([
-        ui.btn(f"📡 渠道：{_filter_summary('channel', state['c'])}", f"logs:filter:channel:{state_code}"),
-    ])
-    rows_kb.append([ui.btn("🔄 刷新", _list_cb(state, page=page)),
-                    ui.btn("◀ 返回主菜单", "menu:main")])
     return ui.inline_kb(rows_kb)
 
 
@@ -394,6 +392,45 @@ def send_new(chat_id: int) -> None:
 def refresh(chat_id: int, message_id: int, cb_id: str,
             page: int = 1, state: dict | None = None) -> None:
     show(chat_id, message_id, cb_id, page=page, state=state)
+
+
+def _render_query_menu_text(state: dict) -> str:
+    st = _normalize_list_state(state)
+    return (
+        "🔎 <b>查询日志</b>\n\n"
+        "请选择查询方式。当前条件：\n"
+        f"🔑 账号：{ui.escape_html(_filter_summary('apikey', st['a']))}\n"
+        f"🤖 模型：{ui.escape_html(_filter_summary('model', st['m']))}\n"
+        f"📡 渠道：{ui.escape_html(_filter_summary('channel', st['c']))}"
+    )
+
+
+def _query_menu_kb(state: dict) -> dict:
+    st = _normalize_list_state(state)
+    state_code = _list_state_code(st)
+    return ui.inline_kb([
+        [
+            ui.btn("🔑 账号", f"logs:filter:apikey:{state_code}"),
+            ui.btn("🤖 模型", f"logs:filter:model:{state_code}"),
+            ui.btn("📡 渠道", f"logs:filter:channel:{state_code}"),
+        ],
+        [ui.btn("🧹 清空查询条件", f"logs:queryclear:{state_code}")],
+        [ui.btn("◀ 返回日志", _list_cb(st))],
+    ])
+
+
+def _clear_query_filters(chat_id: int, message_id: int, cb_id: str, state_short: str) -> None:
+    if not _resolve_list_state(state_short):
+        ui.answer_cb(cb_id, "查询状态已失效")
+        return
+    show(chat_id, message_id, cb_id, state=_list_state(1))
+
+
+def _show_query_menu(chat_id: int, message_id: int, cb_id: str | None, state: dict) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    st = _normalize_list_state(state)
+    ui.edit(chat_id, message_id, _render_query_menu_text(st), reply_markup=_query_menu_kb(st))
 
 
 def _filter_state_code(kind: str, base: dict, draft: dict) -> str:
@@ -1239,6 +1276,14 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         except Exception:
             page = 1
         refresh(chat_id, message_id, cb_id, page=page); return True
+    if data.startswith("logs:queryclear:"):
+        _clear_query_filters(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("logs:query:"):
+        state = _resolve_list_state(data.split(":", 2)[2])
+        if not state:
+            ui.answer_cb(cb_id, "查询状态已失效")
+            return True
+        _show_query_menu(chat_id, message_id, cb_id, state); return True
     if data.startswith("logs:filter:"):
         payload = data.split(":", 2)[2]
         kind, _, short = payload.partition(":")

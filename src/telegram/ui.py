@@ -831,10 +831,13 @@ def fmt_log_entry_body(r: dict) -> str:
         search_count = int(r.get("local_web_count") or 0)
     except Exception:
         search_count = 0
+    network_parts: list[str] = []
     if transport in {"WS", "↑WS"}:
-        lines.append(f"  传输协议: <b>{transport}</b>")
+        network_parts.append(f"传输协议: <b>{transport}</b>")
     if proxy_name:
-        lines.append(f"  出站代理: {escape_html(proxy_name)}")
+        network_parts.append(f"出站代理: {escape_html(proxy_name)}")
+    if network_parts:
+        lines.append("  " + " · ".join(network_parts))
     if search_count:
         lines.append(f"  搜索: {search_count} 次")
 
