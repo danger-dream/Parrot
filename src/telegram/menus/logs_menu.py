@@ -291,9 +291,9 @@ def _render_list(rows: list[dict], *, page: int = 1, total: int | None = None, t
     total = len(rows) if total is None else int(total or 0)
     total_pages = max(1, int(total_pages or 1))
     if not rows:
-        return "📋 <b>最近日志</b>\n\n暂无记录。"
+        return "📋 <b>最近日志 · 请求日志</b>\n\n暂无记录。"
     lines = [
-        f"📋 <b>最近日志 · 第 {page}/{total_pages} 页 · 共 {total} 条</b>",
+        f"📋 <b>最近日志 · 请求日志 · 第 {page}/{total_pages} 页 · 共 {total} 条</b>",
         "<i>对照下方按钮的 #编号 点击查看详情</i>",
     ]
     for idx, r in enumerate(rows, 1):
@@ -339,7 +339,10 @@ def _list_kb(rows: list[dict], *, state: dict, page: int, total_pages: int) -> d
     """详情按钮 3 列紧凑排列 + 状态保持分页/筛选。"""
     state = _normalize_list_state(state, page=page)
     state_code = _list_state_code(state)
-    rows_kb: list[list[dict]] = []
+    rows_kb: list[list[dict]] = [[
+        ui.btn("✅ 💬 请求日志", _list_cb(state, page=page)),
+        ui.btn("🎞 多媒体日志", "media:logs"),
+    ]]
     cur: list[dict] = []
     for idx, r in enumerate(rows, 1):
         display_idx = _display_index(page, idx)

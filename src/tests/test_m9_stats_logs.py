@@ -123,6 +123,8 @@ def test_fmt_helpers(m):
     assert ui.fmt_tokens(500) == "500"
     assert ui.fmt_tokens(1500) == "1.5K"
     assert ui.fmt_tokens(2_500_000) == "2.5M"
+    assert ui.fmt_tokens(12_325_000_000) == "12.3B"
+    assert ui.fmt_tokens(2_500_000_000_000) == "2.5T"
     assert ui.fmt_tokens(None) == "0"
 
     assert ui.fmt_rate(50, 200) == "25.0%"
@@ -264,13 +266,17 @@ def test_logs_list(m):
     # 错误摘要解包
     assert "down" in text
 
-    assert "最近日志 · 第 1/1 页 · 共 3 条" in text
+    assert "最近日志 · 请求日志 · 第 1/1 页 · 共 3 条" in text
     assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%)" in text
     assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
 
-    # 按钮中应包含 3 个 detail 短码，且单行 3 列紧凑排列
+    # 顶部可切换请求/多媒体日志；详情按钮仍单行 3 列紧凑排列。
     kb_rows = edit["reply_markup"]["inline_keyboard"]
-    first_detail_row = [b for b in kb_rows[0] if b.get("callback_data", "").startswith("logs:detail:")]
+    assert any(b.get("callback_data") == "media:logs" for b in kb_rows[0])
+    first_detail_row = next(
+        row for row in kb_rows
+        if any(b.get("callback_data", "").startswith("logs:detail:") for b in row)
+    )
     assert len(first_detail_row) == 3
     btns = [b["callback_data"] for row in kb_rows for b in row if "callback_data" in b]
     assert sum(1 for b in btns if b.startswith("logs:detail:")) >= 3

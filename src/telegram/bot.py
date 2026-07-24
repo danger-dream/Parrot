@@ -22,8 +22,9 @@ from typing import Optional
 from . import states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
-    logs_menu, mapping_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
+    logs_menu, mapping_menu, media_logs_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
     stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
+    xai_imagine_menu,
 )
 from .menus import main as main_menu
 
@@ -239,8 +240,12 @@ def _handle_callback(cb: dict) -> None:
     if oauth_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
-    # 图片生成菜单
+    # GPT/Codex 图片生成设置
     if image_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
+    # Grok Imagine 图片 / 视频设置
+    if xai_imagine_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
     # 渠道管理菜单
@@ -255,7 +260,9 @@ def _handle_callback(cb: dict) -> None:
     if load_balancing_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
-    # 日志菜单
+    # 普通请求日志 / 多媒体业务日志
+    if media_logs_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
     if logs_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
@@ -323,6 +330,9 @@ def _handle_message(msg: dict) -> None:
             return
         if image_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by image_menu (action={action})")
+            return
+        if xai_imagine_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by xai_imagine_menu (action={action})")
             return
         if channel_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by channel_menu (action={action})")

@@ -106,13 +106,17 @@ QUEUED_BODY_EVENT_OVERHEAD_BYTES = 1024
 # budgets below.
 _COMPAT_IMAGE_EDIT_PATHS = frozenset({"/v1/images/edits", "/images/edits"})
 _SINGLE_IMAGE_EDIT_PATHS = frozenset({"/v1/images/edit"})
-_IMAGE_PROTOCOL_BODY_PATHS = frozenset({
+_MEDIA_PROTOCOL_BODY_PATHS = frozenset({
     "/v1/images/generate",
     "/v1/images/edit",
     "/v1/images/generations",
     "/images/generations",
     "/v1/images/edits",
     "/images/edits",
+    "/v1/videos",
+    "/v1/videos/generations",
+    "/v1/videos/edits",
+    "/v1/videos/extensions",
 })
 _OPENAI_MAX_EDIT_IMAGES = 16
 _IMAGE_BODY_ENVELOPE_BYTES = 1024 * 1024
@@ -588,7 +592,7 @@ def _set_key_accounting(mapping: dict[str, int], key_name: str, value: int) -> N
 
 def _requires_nonqueued_body_guard(request: Request) -> bool:
     """Whether this endpoint has an explicit protocol-level body contract."""
-    return str(request.scope.get("path") or "") in _IMAGE_PROTOCOL_BODY_PATHS
+    return str(request.scope.get("path") or "") in _MEDIA_PROTOCOL_BODY_PATHS
 
 
 def _body_preserving_receive(

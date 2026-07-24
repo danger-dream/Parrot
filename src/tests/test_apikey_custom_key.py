@@ -105,6 +105,7 @@ def test_add_custom_key_flow_writes_config(m):
     assert keys["client-a"]["key"] == "sk-custom_123+/="
     assert keys["client-a"]["allowedModels"] == []
     assert keys["client-a"]["allowImages"] is False
+    assert keys["client-a"]["allowVideos"] is False
     assert states.get_state(42) is None
     assert "sk-custom_123+/=" in rec.last("sendMessage")["text"]
 
@@ -130,7 +131,12 @@ def test_rekey_custom_flow_writes_config(m):
     rec = _install_recorder(m)
     ak = m["apikey_menu"]
     m["config"].update(lambda c: c.__setitem__("apiKeys", {
-        "alpha": {"key": "old-alpha-key", "allowedModels": ["m1"], "allowImages": True},
+        "alpha": {
+            "key": "old-alpha-key",
+            "allowedModels": ["m1"],
+            "allowImages": True,
+            "allowVideos": True,
+        },
         "beta": {"key": "beta-secret", "allowedModels": []},
     }))
 
@@ -144,6 +150,7 @@ def test_rekey_custom_flow_writes_config(m):
     assert entry["key"] == "new-alpha_key+/=1"
     assert entry["allowedModels"] == ["m1"]
     assert entry["allowImages"] is True
+    assert entry["allowVideos"] is True
     assert m["states"].get_state(42) is None
     result = rec.last("sendMessage")["text"]
     assert "new-alpha_key+/=1" in result

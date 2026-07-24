@@ -1,4 +1,4 @@
-"""图片生成设置菜单。
+"""GPT / Codex 图片生成设置菜单。
 
 callback_data 前缀：`img:...`
 """
@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import Optional
 
 from ... import config, image_db
@@ -30,108 +29,35 @@ def _fmt_bytes(n) -> str:
     return f"{n:.1f}{units[i]}"
 
 
-def _fmt_ms(ms) -> str:
-    try:
-        ms = float(ms or 0)
-    except Exception:
-        return "-"
-    if ms <= 0:
-        return "-"
-    if ms < 1000:
-        return f"{int(ms)}ms"
-    return f"{ms / 1000:.1f}s"
-
-
 def _cfg() -> dict:
     return images_simple.settings()
 
 
 def _render() -> tuple[str, dict]:
     c = _cfg()
-    s = image_db.summary()
-    top = image_db.account_top(5)
-    recent = image_db.recent(8)
-
     disabled = c.get("disabledAccounts") or []
     lines = [
-        "🖼 <b>图片生成设置</b>",
+        "🖼 <b>GPT / Codex 图片设置</b>",
         "",
         f"功能状态: {'✅ 启用' if c.get('enabled', True) else '❌ 停用'}",
         f"主模型: <code>{ui.escape_html(c.get('mainModel'))}</code>",
         f"图片模型: <code>{ui.escape_html(c.get('toolModel'))}</code>",
         f"禁用账号: <b>{len(disabled)}</b> 个",
-        f"缓存图片: {'✅ 开启' if c.get('cacheEnabled') else '❌ 关闭'}",
+        f"媒体缓存: {'✅ 开启' if c.get('cacheEnabled') else '❌ 关闭'}（GPT/Grok 图片 + Grok 视频）",
         f"缓存路径: <code>{ui.escape_html(c.get('cachePath'))}</code>",
         f"缓存保留: <code>{int(c.get('cacheRetentionDays') or 0)}</code> 天（0=永久）",
         f"缓存上限: <code>{_fmt_bytes(c.get('cacheMaxBytes') or 0)}</code>（0=不限）",
         "",
-        "<b>📊 统计</b>",
-        f"生成 {int(s.get('generate_count') or 0)} / 编辑 {int(s.get('edit_count') or 0)}",
-        f"成功 {int(s.get('success_count') or 0)} / 失败 {int(s.get('failed_count') or 0)} / 进行中 {int(s.get('running_count') or 0)}",
-        f"平均耗时 {_fmt_ms(s.get('avg_duration_ms'))} / 总耗时 {_fmt_ms(s.get('total_duration_ms'))}",
-        f"图片总大小 {_fmt_bytes(s.get('image_bytes'))} / 已缓存 {int(s.get('cached_images') or 0)} 张",
+        "<i>GPT 与 Grok 的图片/视频统计、账号排行和任务详情已统一到多媒体日志。</i>",
     ]
-
-    lines.append("")
-    lines.append("<b>👤 账号 Top 5</b>")
-    if not top:
-        lines.append("暂无账号调用记录。")
-    else:
-        for i, row in enumerate(top, 1):
-            email = row.get("account_email") or row.get("account_key") or "?"
-            lines.append(f"{i}. <code>{ui.escape_html(email)}</code>")
-            lines.append(
-                f"  调用 {int(row.get('total') or 0)} · ✅ {int(row.get('success_count') or 0)} "
-                f"· ❌ {int(row.get('failed_count') or 0)} · 平均 {_fmt_ms(row.get('avg_duration_ms'))} "
-                f"· 总耗时 {_fmt_ms(row.get('total_duration_ms'))}"
-            )
-
-    lines.append("")
-    lines.append("<b>🕘 最近调用</b>")
-    if not recent:
-        lines.append("暂无调用记录。")
-    else:
-        for row in recent:
-            status = row.get("status")
-            icon = "🚧" if status == "running" else ("✅" if status == "success" else "❌")
-            action = "生成" if row.get("action") == "generate" else "编辑"
-            email = row.get("account_email") or "?"
-            if status == "running":
-                tail = f"已生成 {image_db.seconds_since(row.get('created_at'))}s"
-            else:
-                tail = f"{_fmt_ms(row.get('duration_ms'))} · {_fmt_bytes(row.get('image_bytes'))}"
-            lines.append(
-                f"#{row.get('id')} {icon} {image_db.fmt_bjt(row.get('created_at'))} {action} · {tail}\n"
-                f"  账号: <code>{ui.escape_html(email)}</code>"
-            )
-            if row.get("status") == "failed" and row.get("error_message"):
-                lines.append(f"  错误: <i>{ui.escape_html(str(row.get('error_message'))[:80])}</i>")
-
     rows = [
-        [ui.btn("✅/❌ 启停功能", "img:toggle"), ui.btn("🔁 缓存开关", "img:cache_toggle")],
+        [ui.btn("✅/❌ 启停功能", "img:toggle"), ui.btn("🔁 媒体缓存开关", "img:cache_toggle")],
         [ui.btn("🧠 修改主模型", "img:set_main"), ui.btn("🎨 修改图片模型", "img:set_tool")],
         [ui.btn("🚫 禁用账号", "img:accounts"), ui.btn("📁 缓存路径", "img:set_path")],
         [ui.btn("🗓 保留天数", "img:set_retention"), ui.btn("💾 缓存上限", "img:set_max")],
+        [ui.btn("🎞 查看多媒体日志", "media:logs")],
+        [ui.btn("◀ 返回 OAuth 设置", "oa:settings"), ui.btn("🏠 主菜单", "menu:main")],
     ]
-    # 最近成功且有缓存文件的日志按钮：只有当前开启缓存图片时显示。
-    view_btns = []
-    if c.get("cacheEnabled"):
-        for row in recent:
-            if row.get("status") != "success":
-                continue
-            try:
-                paths = json.loads(row.get("cache_paths") or "[]")
-            except Exception:
-                paths = []
-            if paths and any(os.path.exists(p) for p in paths):
-                short = ui.register_code(f"imglog:{row.get('id')}")
-                view_btns.append(ui.btn(f"看图 #{row.get('id')}", f"img:view:{short}"))
-                if len(view_btns) >= 2:
-                    rows.append(view_btns)
-                    view_btns = []
-        if view_btns:
-            rows.append(view_btns)
-    rows.append([ui.btn("◀ 返回 OAuth 设置", "oa:settings"), ui.btn("🏠 主菜单", "menu:main")])
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
@@ -181,7 +107,7 @@ def on_set_tool(chat_id: int, message_id: int, cb_id: str) -> None:
 def on_set_path(chat_id: int, message_id: int, cb_id: str) -> None:
     _ask(
         chat_id, message_id, cb_id, "img_set_path",
-        "请输入图片缓存路径：\n\n"
+        "请输入图片/视频缓存路径：\n\n"
         "• 相对路径会放在 Parrot 运行数据目录下，例如 <code>images</code>\n"
         "• 绝对路径会按原样使用\n"
         "• 文件名由系统生成，不会使用用户输入拼路径",
@@ -197,7 +123,7 @@ def on_set_max(chat_id: int, message_id: int, cb_id: str) -> None:
         chat_id, message_id, cb_id, "img_set_max",
         "请输入缓存空间上限，单位可以是 B / KB / MB / GB：\n\n"
         "例如：<code>1GB</code>、<code>500MB</code>、<code>0</code>。\n"
-        "<code>0</code> = 不按空间清理；超过上限时会删除最老的约 20% 图片。",
+        "<code>0</code> = 不按空间清理；超过上限时会删除最老的约 20% 媒体文件。",
     )
 
 
@@ -235,7 +161,7 @@ def on_accounts(chat_id: int, message_id: int, cb_id: str) -> None:
         lines.append(f"{mark} <code>{ui.escape_html(email)}</code>{extra}")
         short = ui.register_code(f"imgacc:{ak}")
         rows.append([ui.btn(f"{mark} {email}", f"img:acc_toggle:{short}")])
-    rows.append([ui.btn("◀ 返回图片配置", "img:show")])
+    rows.append([ui.btn("◀ 返回 GPT 图片设置", "img:show")])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
 
 
@@ -326,7 +252,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
             return True
         _mutate_images(lambda img: img.__setitem__("mainModel", val))
         states.pop_state(chat_id)
-        ui.send_result(chat_id, f"✅ 主模型已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回图片配置", back_callback="img:show")
+        ui.send_result(chat_id, f"✅ 主模型已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
     if action == "img_set_tool":
         if not val:
@@ -334,7 +260,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
             return True
         _mutate_images(lambda img: img.__setitem__("toolModel", val))
         states.pop_state(chat_id)
-        ui.send_result(chat_id, f"✅ 图片模型已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回图片配置", back_callback="img:show")
+        ui.send_result(chat_id, f"✅ 图片模型已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
     if action == "img_set_path":
         if not val:
@@ -343,7 +269,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         # 只做基本路径规范化；真正写文件时仍由 images_simple 用安全文件名写入。
         _mutate_images(lambda img: img.__setitem__("cachePath", val))
         states.pop_state(chat_id)
-        ui.send_result(chat_id, f"✅ 缓存路径已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回图片配置", back_callback="img:show")
+        ui.send_result(chat_id, f"✅ 缓存路径已更新为 <code>{ui.escape_html(val)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
     if action == "img_set_retention":
         try:
@@ -355,7 +281,7 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
             return True
         _mutate_images(lambda img: img.__setitem__("cacheRetentionDays", days))
         states.pop_state(chat_id)
-        ui.send_result(chat_id, f"✅ 缓存保留天数已更新为 <code>{days}</code>", back_label="◀ 返回图片配置", back_callback="img:show")
+        ui.send_result(chat_id, f"✅ 缓存保留天数已更新为 <code>{days}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
     if action == "img_set_max":
         try:
@@ -367,6 +293,6 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
             return True
         _mutate_images(lambda img: img.__setitem__("cacheMaxBytes", n))
         states.pop_state(chat_id)
-        ui.send_result(chat_id, f"✅ 缓存空间上限已更新为 <code>{_fmt_bytes(n)}</code>", back_label="◀ 返回图片配置", back_callback="img:show")
+        ui.send_result(chat_id, f"✅ 缓存空间上限已更新为 <code>{_fmt_bytes(n)}</code>", back_label="◀ 返回 GPT 图片设置", back_callback="img:show")
         return True
     return False

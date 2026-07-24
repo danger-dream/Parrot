@@ -1,12 +1,8 @@
-"""state.db —— 运行时状态持久化，永久保留。
+"""state.db —— 运行时状态持久化。
 
-四张表：
-  - performance_stats       渠道x模型的滑动窗口 + EMA 统计
-  - channel_errors          错误阶梯冷却
-  - cache_affinities        会话亲和绑定
-  - oauth_quota_cache       OAuth 配额缓存（TG Bot 渲染用）
-
-全表写操作由单一 `_write_lock` 序列化。连接采用 thread-local，WAL 模式。
+保存渠道性能/冷却、会话亲和、OAuth 配额、网络检查，以及 xAI 异步视频
+任务的短期账号绑定。全表写操作由单一 `_write_lock` 序列化；连接采用
+thread-local，WAL 模式。
 """
 
 import os
@@ -118,6 +114,17 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_network_check_category ON network_check_status(category);
     CREATE INDEX IF NOT EXISTS idx_network_check_ok ON network_check_status(ok);
+
+    CREATE TABLE IF NOT EXISTS xai_video_jobs (
+      request_id   TEXT PRIMARY KEY,
+      channel_key  TEXT NOT NULL,
+      api_key_name TEXT NOT NULL,
+      model        TEXT NOT NULL,
+      created_at   INTEGER NOT NULL,
+      expires_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_expires ON xai_video_jobs(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_channel ON xai_video_jobs(channel_key);
     """
 
 
@@ -757,6 +764,77 @@ def network_check_delete_stale(live_keys: set[str]) -> None:
             if r["key"] not in live_keys:
                 conn.execute("DELETE FROM network_check_status WHERE key=?", (r["key"],))
         conn.commit()
+
+
+# ─── xAI Imagine video job bindings ───────────────────────────────
+
+def xai_video_job_save(
+    request_id: str,
+    *,
+    channel_key: str,
+    api_key_name: str,
+    model: str,
+    ttl_seconds: int,
+) -> None:
+    """Persist the OAuth/API-key identity needed to poll one async video job."""
+    created_at = now_ms()
+    expires_at = created_at + max(1, int(ttl_seconds)) * 1000
+    with _write_lock:
+        conn = _get_conn()
+        try:
+            conn.execute("DELETE FROM xai_video_jobs WHERE expires_at<=?", (created_at,))
+            conn.execute(
+                """INSERT OR REPLACE INTO xai_video_jobs
+                   (request_id, channel_key, api_key_name, model, created_at, expires_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (
+                    request_id,
+                    channel_key,
+                    api_key_name,
+                    model,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            _rollback_failed_write(conn)
+            raise
+
+
+def xai_video_job_load(request_id: str) -> dict | None:
+    """Load a live binding; expired rows are removed atomically on access."""
+    now = now_ms()
+    row = _get_conn().execute(
+        "SELECT * FROM xai_video_jobs WHERE request_id=?", (request_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if int(row["expires_at"] or 0) > now:
+        return dict(row)
+    xai_video_job_delete(request_id)
+    return None
+
+
+def xai_video_job_delete(request_id: str | None = None) -> None:
+    with _write_lock:
+        conn = _get_conn()
+        if request_id:
+            conn.execute("DELETE FROM xai_video_jobs WHERE request_id=?", (request_id,))
+        else:
+            conn.execute("DELETE FROM xai_video_jobs")
+        conn.commit()
+
+
+def xai_video_job_cleanup(now: int | None = None) -> int:
+    with _write_lock:
+        conn = _get_conn()
+        cur = conn.execute(
+            "DELETE FROM xai_video_jobs WHERE expires_at<=?",
+            (int(now if now is not None else now_ms()),),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
 
 
 # ─── performance_stats ────────────────────────────────────────────

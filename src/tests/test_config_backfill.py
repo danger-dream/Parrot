@@ -17,8 +17,28 @@ def test_old_config_file_is_backfilled_with_new_defaults():
     original = config.get()
     old_cfg = {
         "listen": {"host": "127.0.0.1", "port": 0},
-        "apiKeys": {},
-        "oauthAccounts": [],
+        "apiKeys": {
+            "legacy-dict": {
+                "key": "ccp-legacy-dict",
+                "enabled": True,
+                "allowedModels": ["legacy-model"],
+                "allowImages": True,
+                "legacyCustomField": "keep-me",
+            },
+            "legacy-string": "ccp-legacy-string",
+        },
+        "oauthAccounts": [
+            {
+                "provider": "xai",
+                "email": "legacy-xai@example.test",
+                "subject": "legacy-xai-subject",
+                "enabled": True,
+                "access_token": "legacy-access-token",
+                "refresh_token": "legacy-refresh-token",
+                "id_token": "legacy-id-token",
+                "expired": "2999-01-01T00:00:00Z",
+            }
+        ],
         "channels": [],
         "stateDbPath": os.path.join(TMP, "state.db"),
         "logDir": os.path.join(TMP, "logs"),
@@ -31,6 +51,11 @@ def test_old_config_file_is_backfilled_with_new_defaults():
                     "defaultModels": ["legacy-model"],
                 }
             },
+        },
+        "xaiOAuth": {
+            "apiBaseUrl": "https://api.x.ai/v1",
+            "defaultModels": ["legacy-grok-model"],
+            "userAgent": "legacy-xai-client",
         },
         "anysearch": {
             "enabled": True,
@@ -71,6 +96,40 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["apiKeyConcurrency"]["queuedBodySpoolThresholdBytes"] == 1024 * 1024
             assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodySpoolBytesPerKey"] == 512 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["maxQueuedBodySpoolBytes"] == 2 * 1024 * 1024 * 1024
+
+            # Grok Imagine 新字段自动补齐，但既有 xAI 文本配置不被覆盖。
+            assert cfg["xaiOAuth"]["apiBaseUrl"] == "https://api.x.ai/v1"
+            assert cfg["xaiOAuth"]["defaultModels"] == ["legacy-grok-model"]
+            assert cfg["xaiOAuth"]["userAgent"] == "legacy-xai-client"
+            assert cfg["xaiOAuth"]["imageModels"] == [
+                "grok-imagine-image",
+                "grok-imagine-image-quality",
+            ]
+            assert cfg["xaiOAuth"]["videoModels"] == [
+                "grok-imagine-video",
+                "grok-imagine-video-1.5",
+            ]
+            assert cfg["xaiOAuth"]["videoJobTtlSeconds"] == 10800
+            assert cfg["xaiOAuth"]["mediaRequestTimeoutSeconds"] == 180
+
+            # 旧 Key 权限与白名单保持原值；视频权限只做 fail-closed 补齐。
+            dict_key = cfg["apiKeys"]["legacy-dict"]
+            assert dict_key["key"] == "ccp-legacy-dict"
+            assert dict_key["enabled"] is True
+            assert dict_key["allowedModels"] == ["legacy-model"]
+            assert dict_key["allowImages"] is True
+            assert dict_key["allowVideos"] is False
+            assert dict_key["legacyCustomField"] == "keep-me"
+            string_key = cfg["apiKeys"]["legacy-string"]
+            assert string_key["key"] == "ccp-legacy-string"
+            assert string_key["enabled"] is True
+            assert string_key["allowedModels"] == []
+            assert string_key["allowImages"] is False
+            assert string_key["allowVideos"] is False
+
+            # 配置回填不得改写既有 OAuth 凭证或身份字段。
+            account = cfg["oauthAccounts"][0]
+            assert account == old_cfg["oauthAccounts"][0]
 
         # 旧路径保留，不删除用户原配置，方便兼容和人工核对。
         assert saved["oauth"]["providers"]["openai"]["defaultModels"] == ["legacy-model"]

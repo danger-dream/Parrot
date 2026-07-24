@@ -70,7 +70,13 @@ def _get_entry(name: str) -> Optional[dict]:
     if entry is None:
         return None
     if isinstance(entry, str):
-        return {"key": entry, "enabled": True, "allowedModels": [], "allowImages": False}
+        return {
+            "key": entry,
+            "enabled": True,
+            "allowedModels": [],
+            "allowImages": False,
+            "allowVideos": False,
+        }
     if isinstance(entry, dict):
         return entry
     return None
@@ -270,6 +276,7 @@ def _create_api_key_entry(name: str, api_key: str) -> None:
             "enabled": True,
             "allowedModels": [],
             "allowImages": False,
+            "allowVideos": False,
         }
     config.update(_mutate)
 
@@ -282,7 +289,13 @@ def _set_api_key_value(name: str, api_key: str) -> bool:
         keys = cfg.setdefault("apiKeys", {})
         entry = keys.get(name)
         if isinstance(entry, str):
-            keys[name] = {"key": api_key, "allowedModels": []}
+            keys[name] = {
+                "key": api_key,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             updated = True
         elif isinstance(entry, dict):
             entry["key"] = api_key
@@ -317,12 +330,19 @@ def _send_rekeyed(chat_id: int, name: str, api_key: str, page: int = 1) -> None:
 
 # ─── 列表视图 ─────────────────────────────────────────────────────
 
-def _perm_summary_short(allowed: list[str], img: bool, enabled: bool = True) -> str:
+def _perm_summary_short(
+    allowed: list[str],
+    img: bool,
+    video: bool,
+    enabled: bool = True,
+) -> str:
     """列表页用：单行简短权限串。协议入口不再按 Key 限制。"""
     m = "全部模型" if not allowed else f"{len(allowed)} 个模型"
     s = m
     if img:
         s += " · 🖼 图片"
+    if video:
+        s += " · 🎬 视频"
     if not enabled:
         s += " · ⛔ 停用"
     return s
@@ -379,18 +399,20 @@ def _render_list(page: int = 1) -> tuple[str, dict]:
             key_str = entry
             allowed: list[str] = []
             img = False
+            video = False
             key_enabled = True
         else:
             entry = entry if isinstance(entry, dict) else {}
             key_str = entry.get("key", "")
             allowed = list(entry.get("allowedModels") or [])
             img = bool(entry.get("allowImages"))
+            video = bool(entry.get("allowVideos"))
             key_enabled = entry.get("enabled") is not False
         s = per[name]
         dot = "⛔" if not key_enabled else ("🟢" if s["total"] > 0 else "⚪")
         lines.append(f"{i}. {dot} <b>{ui.escape_html(name)}</b>")
         lines.append(f"Key: <code>{ui.escape_html(key_str)}</code>")
-        lines.append(f"🏷️ {_perm_summary_short(allowed, img, key_enabled)}")
+        lines.append(f"🏷️ {_perm_summary_short(allowed, img, video, key_enabled)}")
         lines.append(f"🚦 限流: <code>{ui.escape_html(_limit_brief(name))}</code>")
         if s["total"] > 0:
             prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
@@ -456,6 +478,7 @@ def _render_detail(name: str, page: int = 1) -> tuple[Optional[str], Optional[di
     key_str = entry.get("key", "")
     allowed = list(entry.get("allowedModels") or [])
     img = bool(entry.get("allowImages"))
+    video = bool(entry.get("allowVideos"))
     key_enabled = entry.get("enabled") is not False
 
     since_ts = _month_start_ts()
@@ -476,6 +499,7 @@ def _render_detail(name: str, page: int = 1) -> tuple[Optional[str], Optional[di
         f"状态: <code>{'enabled' if key_enabled else 'disabled'}</code>",
         f"🎯 模型: <code>{'全部模型（无限制）' if not allowed else str(len(allowed)) + ' 个白名单'}</code>",
         f"🖼 图片接口: <code>{'允许' if img else '禁止'}</code>",
+        f"🎬 视频接口: <code>{'允许' if video else '禁止（默认）'}</code>",
         f"🚦 Key 限流: <code>{ui.escape_html(_limit_brief(name))}</code>",
     ]
     if allowed:
@@ -522,16 +546,19 @@ def _render_detail(name: str, page: int = 1) -> tuple[Optional[str], Optional[di
     short = _short_of(name)
     payload = _callback_payload(short, page)
     img_label = "🖼 禁用图片接口" if entry.get("allowImages") else "🖼 允许图片接口"
+    video_label = "🎬 禁用视频接口" if entry.get("allowVideos") else "🎬 允许视频接口"
     enabled_label = "⛔ 停用 API Key" if key_enabled else "✅ 启用 API Key"
     rows = [
         [ui.btn("🔁 重新生成 key", f"ak:regen:{payload}"),
          ui.btn("✏ 自定义新 key", f"ak:rekey:{payload}")],
         [ui.btn("🎯 编辑允许模型", f"ak:perm:{payload}"),
-         ui.btn(img_label, f"ak:img:{payload}")],
+         ui.btn("🚦 请求限流", f"ak:lim:{payload}")],
+        [ui.btn(img_label, f"ak:img:{payload}"),
+         ui.btn(video_label, f"ak:vid:{payload}")],
         [ui.btn("🗑 删除", f"ak:del:{payload}"),
          ui.btn(enabled_label, f"ak:enabled:{payload}")],
-        [ui.btn("🚦 请求限流", f"ak:lim:{payload}"),
-         ui.btn("◀ 返回列表", _page_callback(page))],
+        [ui.btn("◀ 返回列表", _page_callback(page)),
+         ui.btn("🏠 主菜单", "menu:main")],
     ]
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
@@ -776,10 +803,45 @@ def on_images_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page
         keys = cfg.setdefault("apiKeys", {})
         cur = keys.get(name)
         if isinstance(cur, str):
-            cur = {"key": cur, "enabled": True, "allowedModels": [], "allowImages": False}
+            cur = {
+                "key": cur,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             keys[name] = cur
         if isinstance(cur, dict):
             cur["allowImages"] = not bool(cur.get("allowImages", False))
+    config.update(_mutate)
+    ui.answer_cb(cb_id, "已切换")
+    text, kb = _render_detail(name, page=page)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_videos_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        ui.answer_cb(cb_id, "未找到 Key")
+        show(chat_id, message_id, page=page)
+        return
+
+    def _mutate(cfg):
+        keys = cfg.setdefault("apiKeys", {})
+        cur = keys.get(name)
+        if isinstance(cur, str):
+            cur = {
+                "key": cur,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
+            keys[name] = cur
+        if isinstance(cur, dict):
+            cur["allowVideos"] = not bool(cur.get("allowVideos", False))
     config.update(_mutate)
     ui.answer_cb(cb_id, "已切换")
     text, kb = _render_detail(name, page=page)
@@ -799,7 +861,13 @@ def on_key_enabled_toggle(chat_id: int, message_id: int, cb_id: str, short: str,
         keys = cfg.setdefault("apiKeys", {})
         cur = keys.get(name)
         if isinstance(cur, str):
-            cur = {"key": cur, "enabled": True, "allowedModels": [], "allowImages": False}
+            cur = {
+                "key": cur,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             keys[name] = cur
         if isinstance(cur, dict):
             cur["enabled"] = not (cur.get("enabled") is not False)
@@ -876,7 +944,13 @@ def on_limit_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page:
         keys = cfg.setdefault("apiKeys", {})
         entry = keys.get(name)
         if isinstance(entry, str):
-            entry = {"key": entry, "enabled": True, "allowedModels": [], "allowImages": False}
+            entry = {
+                "key": entry,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             keys[name] = entry
         if isinstance(entry, dict):
             entry.setdefault("limits", {})["enabled"] = not bool(cur)
@@ -953,7 +1027,13 @@ def on_limit_input(chat_id: int, action: str, text: str) -> None:
         keys = cfg.setdefault("apiKeys", {})
         entry = keys.get(name)
         if isinstance(entry, str):
-            entry = {"key": entry, "enabled": True, "allowedModels": [], "allowImages": False}
+            entry = {
+                "key": entry,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             keys[name] = entry
         if isinstance(entry, dict):
             limits = entry.setdefault("limits", {})
@@ -975,11 +1055,50 @@ def on_limit_input(chat_id: int, action: str, text: str) -> None:
 _PERM_STATE = "ak_perm_editing"
 
 
+def _configured_media_models() -> tuple[list[str], list[str]]:
+    xai_cfg = config.get().get("xaiOAuth") or {}
+    if not isinstance(xai_cfg, dict):
+        return [], []
+
+    def _clean(key: str) -> list[str]:
+        raw = xai_cfg.get(key) or []
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw:
+            model = str(item or "").strip()
+            if model and model not in out:
+                out.append(model)
+        return out
+
+    return _clean("imageModels"), _clean("videoModels")
+
+
+def _available_permission_models() -> list[str]:
+    """文本渠道模型与已配置的 Imagine 媒体模型的稳定并集。"""
+    image_models, video_models = _configured_media_models()
+    out: list[str] = []
+    for model in [*registry.available_models(), *image_models, *video_models]:
+        if model and model not in out:
+            out.append(model)
+    return out
+
+
+def _permission_model_label(model: str) -> str:
+    image_models, video_models = _configured_media_models()
+    if model in image_models:
+        return f"🖼 {model}"
+    if model in video_models:
+        return f"🎬 {model}"
+    return model
+
+
 def _render_perm_edit(name: str, models: list[str], checked: set[str]) -> tuple[str, dict]:
     lines = [
         f"🎯 <b>编辑允许模型</b>: {ui.escape_html(name)}",
         "",
-        "点击下方模型切换勾选。清空 → 视为无限制。",
+        "点击下方模型切换勾选。🖼 为图片模型，🎬 为视频模型。",
+        "清空 → 视为无限制；媒体接口仍需单独开启图片/视频权限。",
         f"当前已选: <b>{len(checked)}</b>" + ("（= 不限制）" if not checked else " 个"),
     ]
 
@@ -987,7 +1106,8 @@ def _render_perm_edit(name: str, models: list[str], checked: set[str]) -> tuple[
     cur: list[dict] = []
     for idx, m in enumerate(models):
         mark = "☑" if m in checked else "☐"
-        cur.append(ui.btn(f"{mark} {m}", f"ak:pt:{_short_of(name)}:{idx}"))
+        label = _permission_model_label(m)
+        cur.append(ui.btn(f"{mark} {label}", f"ak:pt:{_short_of(name)}:{idx}"))
         if len(cur) >= 2:
             rows.append(cur)
             cur = []
@@ -1012,7 +1132,7 @@ def on_perm_enter(chat_id: int, message_id: int, cb_id: str, short: str, page: i
         show(chat_id, message_id)
         return
 
-    models = registry.available_models()
+    models = _available_permission_models()
     if not models:
         ui.edit(
             chat_id, message_id,
@@ -1099,7 +1219,13 @@ def on_perm_save(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         keys = cfg.setdefault("apiKeys", {})
         entry = keys.get(name)
         if isinstance(entry, str):
-            entry = {"key": entry, "allowedModels": []}
+            entry = {
+                "key": entry,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             keys[name] = entry
         if not isinstance(entry, dict):
             return
@@ -1443,6 +1569,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("ak:img:"):
         short, page = _split_short_page(data.split(":", 2)[2])
         on_images_toggle(chat_id, message_id, cb_id, short, page)
+        return True
+    if data.startswith("ak:vid:"):
+        short, page = _split_short_page(data.split(":", 2)[2])
+        on_videos_toggle(chat_id, message_id, cb_id, short, page)
         return True
     if data.startswith("ak:enabled:"):
         short, page = _split_short_page(data.split(":", 2)[2])

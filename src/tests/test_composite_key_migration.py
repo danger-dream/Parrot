@@ -482,13 +482,13 @@ def test_openai_workspace_key_migration_unique_rows_and_config(m):
 
     # image rows
     image_db.init()
-    image_db.start_call(
+    image_log_id = image_db.start_call(
         request_id="img-uniq", api_key_name="ak", action="generate",
         main_model="gpt-image-2", tool_model="gpt-image-2", size="1024x1024",
         prompt_preview="p", prompt_hash="h",
     )
-    image_db.finish_call(1, status="success", account_key="openai:uniq@openai.test", account_email="uniq@openai.test")
-    image_db.start_attempt(1, request_id="img-uniq", account_key="openai:uniq@openai.test", account_email="uniq@openai.test")
+    image_db.finish_call(image_log_id, status="success", account_key="openai:uniq@openai.test", account_email="uniq@openai.test")
+    image_db.start_attempt(image_log_id, request_id="img-uniq", account_key="openai:uniq@openai.test", account_email="uniq@openai.test")
 
     stats = om.bootstrap_openai_workspace_key_migration()
     assert stats["mapping_count"] == 3, stats

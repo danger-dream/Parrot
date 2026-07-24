@@ -4,13 +4,14 @@
   POST /v1/images/generations  {prompt, model?, n?, size?, response_format?, quality?, ...}
   POST /v1/images/edits        {prompt, model?, image[s]?, mask?, ...}
 
-内部复用 ``images_simple._execute_pipeline``（Codex Responses + image_generation tool）。
-对齐参考：sub2api/backend/internal/service/openai_images*.go
+按 ``model`` 路由：配置的 Grok Imagine 图片模型透明转给 xAI OAuth，
+其余模型继续复用 ``images_simple._execute_pipeline``（Codex Responses + image_generation tool）。
 
 设计原则：
 - 入参完整解析 OpenAI 标准字段（JSON + multipart）
-- ``n>1`` 显式降为 1，响应里带 ``parrot_warning``（Codex image_generation tool 一次只出一张）
-- ``response_format=url`` 由于 OAuth 拿不到真实 CDN URL，回填 data URL（同 sub2api）
+- Grok Imagine 支持原生 ``n<=10``、URL/Base64 响应和最多 3 张编辑参考图
+- GPT/Codex 管线的 ``n>1`` 显式降为 1，响应里带 ``parrot_warning``
+- GPT/Codex 的 ``response_format=url`` 回填 data URL（同 sub2api）
 - ``model``/``quality``/``background``/``output_format``/``moderation``/``style``/
   ``output_compression``/``partial_images``/``mask`` 透传到 image_generation tool
 - ``generate`` 入口收到 ``mask`` 时记录 warning 日志（mask 仅 edit 有意义）
@@ -30,6 +31,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .. import apikey_limiter, auth, errors
+from ..xai import imagine as xai_imagine
 from .images_simple import (
     UpstreamImageError,
     _DEFAULTS,
@@ -59,10 +61,12 @@ class _ParsedRequest:
     model: str | None = None
     size: str | None = None
     response_format: str = "b64_json"
+    response_format_explicit: bool = False
     requested_n: int = 1
     input_images: list[str] = field(default_factory=list)
     mask_url: str | None = None
     native_options: dict[str, Any] = field(default_factory=dict)
+    xai_options: dict[str, Any] = field(default_factory=dict)
 
 
 # ── 公共小工具 ─────────────────────────────────────────────────────────────
@@ -193,6 +197,7 @@ async def _parse_multipart(
     rf = _str_or_none(form.get("response_format"))
     if rf is not None:
         parsed.response_format = rf.lower()
+        parsed.response_format_explicit = True
     if form.get("n") is not None and form.get("n") != "":
         parsed.requested_n = _coerce_int(form.get("n"), field_name="n", minimum=1)
 
@@ -204,6 +209,10 @@ async def _parse_multipart(
         v = form.get(fld)
         if v is not None and v != "":
             parsed.native_options[fld] = _coerce_int(v, field_name=fld, minimum=0)
+    for fld in ("aspect_ratio", "resolution", "user"):
+        v = _str_or_none(form.get(fld))
+        if v is not None:
+            parsed.xai_options[fld] = v
 
     if action == "edit":
         file_fields: list[Any] = []
@@ -263,6 +272,7 @@ async def _parse_json(
     rf = _str_or_none(body.get("response_format"))
     if rf is not None:
         parsed.response_format = rf.lower()
+        parsed.response_format_explicit = True
     if body.get("n") is not None:
         parsed.requested_n = _coerce_int(body.get("n"), field_name="n", minimum=1)
 
@@ -273,6 +283,12 @@ async def _parse_json(
     for fld in _NATIVE_INT_FIELDS:
         if body.get(fld) is not None:
             parsed.native_options[fld] = _coerce_int(body.get(fld), field_name=fld, minimum=0)
+    for fld in ("aspect_ratio", "resolution", "user"):
+        v = _str_or_none(body.get(fld))
+        if v is not None:
+            parsed.xai_options[fld] = v
+    if isinstance(body.get("storage_options"), dict):
+        parsed.xai_options["storage_options"] = dict(body["storage_options"])
 
     if action == "edit":
         # 支持 image 单值 / image 数组 / images 数组
@@ -287,6 +303,16 @@ async def _parse_json(
             parsed.input_images.append(
                 _normalize_image_input(raw_image, max_bytes=max_image_bytes)
             )
+        elif isinstance(raw_image, dict):
+            iu = raw_image.get("image_url") or raw_image.get("url")
+            if isinstance(iu, str) and iu.strip():
+                parsed.input_images.append(
+                    _normalize_image_input(iu, max_bytes=max_image_bytes)
+                )
+            elif raw_image.get("file_id"):
+                raise ValueError(
+                    "image.file_id is not supported (use image.url instead)"
+                )
 
         raw_images = body.get("images")
         if isinstance(raw_images, list):
@@ -377,7 +403,7 @@ async def _run_handler(request: Request, *, action: str) -> JSONResponse:
     if not cfg.get("enabled", True):
         return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "image generation is disabled")
 
-    key_name, _, err = auth.validate(request.headers)
+    key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return _json_error(401, errors.ErrTypeOpenAI.AUTH, err)
     if not auth.images_allowed(key_name):
@@ -404,18 +430,35 @@ async def _run_handler(request: Request, *, action: str) -> JSONResponse:
             param="response_format",
         )
 
+    if action == "edit" and not parsed.input_images:
+        return _bad_request(
+            "image is required for edits (use 'image' or 'images[]')",
+            param="image",
+        )
+
+    # The standard Images routes are shared.  Only explicitly configured Grok
+    # Imagine models select xAI; every other model keeps the existing GPT/Codex
+    # image pipeline unchanged.
+    if xai_imagine.is_xai_image_model(parsed.model):
+        assert key_name is not None
+        return await xai_imagine.handle_image(
+            parsed,
+            action=action,
+            key_name=key_name,
+            allowed_models=allowed_models,
+        )
+    if xai_imagine.looks_like_xai_image_model(parsed.model):
+        return _bad_request(
+            f"unsupported xAI image model {parsed.model!r}",
+            param="model",
+        )
+
     n_warning = False
     if parsed.requested_n > 1:
         n_warning = True
         print(
             f"[images-openai-compat] requested n={parsed.requested_n} downgraded to 1 "
             "(Codex image_generation tool returns 1 image per call)"
-        )
-
-    if action == "edit" and not parsed.input_images:
-        return _bad_request(
-            "image is required for edits (use 'image' or 'images[]')",
-            param="image",
         )
 
     try:

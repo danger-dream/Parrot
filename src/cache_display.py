@@ -56,12 +56,16 @@ def prompt_total_from_row(row: dict, *, aggregate: bool = False) -> int:
 
 
 def fmt_tokens(n: Any) -> str:
-    """1234567 → 1.2M；1234 → 1.2K；else → 原样。"""
+    """按 K / M / B / T 缩写展示 token 数；小于 1000 时原样返回。"""
     n = _to_int(n)
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
+    for divisor, suffix in (
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ):
+        if n >= divisor:
+            return f"{n / divisor:.1f}{suffix}"
     return str(n)
 
 

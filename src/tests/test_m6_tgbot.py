@@ -160,6 +160,8 @@ def test_apikey_add_flow(m):
     assert entry["key"].startswith("ccp-")
     assert len(entry["key"]) == 4 + 48  # ccp- + 48 hex
     assert entry["allowedModels"] == []   # 默认无限制
+    assert entry["allowImages"] is False
+    assert entry["allowVideos"] is False
     assert sts.get_state(100) is None
     assert len(rec.by_method("sendMessage")) >= 1
     print("  [PASS] apikey add flow (valid)")

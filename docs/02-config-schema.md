@@ -20,6 +20,7 @@
       "enabled": true,                 // API Key 自身可用开关；缺失/null 默认为 true
       "allowedModels": [],
       "allowImages": false,
+      "allowVideos": false,           // 视频费用较高，默认关闭
       "limits": {                      // 单 Key 限流覆盖；字段缺失/null 继承 apiKeyConcurrency
         "enabled": null,               // 优先级高于 apiKeyConcurrency.enabled
         "maxConcurrent": null,         // 0 = 不限并发
@@ -235,7 +236,11 @@
     "responsesPath": "",                       // 非空时覆盖 /responses 路径拼接
     "isolateSessionId": true,                  // prompt_cache_key → x-grok-conv-id 时按 API key 隔离
     "userAgent": "parrot/xai-oauth-adapter",
-    "defaultModels": ["grok-4.5"]
+    "imageModels": ["grok-imagine-image", "grok-imagine-image-quality"],
+    "videoModels": ["grok-imagine-video", "grok-imagine-video-1.5"],
+    "videoJobTtlSeconds": 10800,                // request_id → OAuth 账号绑定保留 3 小时
+    "mediaRequestTimeoutSeconds": 180,
+    "defaultModels": ["grok-4.5"]               // 仅文本 /responses 调度
   },
 
   // ─── 调度算法 / 负载均衡 ───
@@ -258,6 +263,8 @@
 }
 ```
 
+> **Grok Imagine 升级兼容：**从不含 Imagine 配置的旧版本升级时无需手工修改 `config.json`。缺失的 `xaiOAuth.imageModels`、`videoModels`、`videoJobTtlSeconds`、`mediaRequestTimeoutSeconds` 会按默认值补齐；既有 xAI 文本配置、OAuth 账号及 token 原样保留。历史 API Key 保留原 `allowedModels` / `allowImages`，仅新增默认关闭的 `allowVideos: false`。启动时 `state.db` 会幂等创建 `xai_video_jobs`；`image_logs.db` 的历史图片表只原地新增统一多媒体字段，旧行按 OpenAI 图片解释，不替换现有表或清空历史数据。
+
 `apiKeys.<name>.key` 是下游客户端作为 Bearer / x-api-key 使用的密钥字符串。配置层不要求 `ccp-` 前缀，任意字符串都可；TG bot 自动生成时仍使用 `ccp-<48 hex>`，也可以在菜单里输入自定义 key。
 
 `apiKeys.<name>.enabled` 控制该 Key 是否可用，缺失或 `null` 时按 `true` 处理。`apiKeyConcurrency` 是 API Key 级限流默认值；`apiKeys.<name>.limits.enabled/maxConcurrent/maxQueue/queueWaitSeconds` 是单 Key 覆盖，其中 `limits.enabled` 优先级高于全局 `apiKeyConcurrency.enabled`。默认单 Key 5 并发、50 队列、最长等待 1800 秒；队列满、等待超时或客户端断开时请求会从队列移除并返回/结束。
@@ -273,7 +280,7 @@
 - `mode="forever"`：默认值，永久保留 `logs/YYYY-MM.db` 的业务请求日志。
 - `mode="days"`：仅保留从当前时刻向前回溯 `days` 天内的数据；`days` 必须为整数且 `>= 1`，无业务上限。模式与天数是独立字段，已处于该模式时可单独修改 `days`。
 - 在按天留存模式增大 `days`（如 3 → 5）只更新配置、不触发即时清理；首次启用或缩短 `days`（如 5 → 3）会扩大删除范围，TG Bot 必须先展示警告、扫描并逐月列出待清理项，第二次确认后才写入配置并执行删除。确认页的计划短期有效，执行前会重新验证，避免确认期间数据范围变化。
-- 仅影响月度业务日志：请求摘要、原始请求/响应、重试链、代理链与本地 Web 明细；**不影响** `state.db`、图片日志/缓存和翻译缓存。
+- 仅影响月度业务日志：请求摘要、原始请求/响应、重试链、代理链与本地 Web 明细；**不影响** `state.db`、统一多媒体日志/图片缓存和翻译缓存。
 - 完整过期月份会删除整个 DB 文件（及其 WAL/SHM sidecar）；留存临界落在某个月中间时，会精确删除关联记录并执行 SQLite 压缩，才能实际释放磁盘空间。压缩前会做磁盘余量预检，空间不足时 fail-closed。
 - 已启用的策略由后台维护循环每天最多执行一次到期检查；不会在正常 API 请求的同步写入路径执行大型删除或 `VACUUM`。
 

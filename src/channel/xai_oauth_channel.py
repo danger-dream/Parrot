@@ -121,7 +121,10 @@ class XAIOAuthChannel(Channel):
             or _provider_cfg().get("baseUrl")
             or xai_provider.api_base_url()
         ).rstrip("/")
-        self.api_path = str(account.get("apiPath") or _provider_cfg().get("responsesPath") or "").strip() or None
+        self.api_path = (
+            str(account.get("apiPath") or _provider_cfg().get("responsesPath") or "").strip()
+            or None
+        )
 
         models = account.get("models") or []
         if models:
@@ -131,6 +134,25 @@ class XAIOAuthChannel(Channel):
         else:
             self.models = list(_provider_cfg().get("defaultModels") or [])
 
+        provider_cfg = _provider_cfg()
+        image_models = (
+            account.get("imageModels")
+            if "imageModels" in account
+            else provider_cfg.get("imageModels")
+        )
+        video_models = (
+            account.get("videoModels")
+            if "videoModels" in account
+            else provider_cfg.get("videoModels")
+        )
+        # 媒体模型不并入 self.models，避免被普通文本 /responses 调度器选中。
+        self.image_models = [
+            str(m) for m in (image_models or []) if str(m).strip()
+        ]
+        self.video_models = [
+            str(m) for m in (video_models or []) if str(m).strip()
+        ]
+
     def supports_model(self, requested_model: str) -> Optional[str]:
         if requested_model not in self.models:
             return None
@@ -138,6 +160,23 @@ class XAIOAuthChannel(Channel):
 
     def list_client_models(self) -> list[str]:
         return list(self.models)
+
+    def supports_media_model(self, kind: str, requested_model: str) -> bool:
+        """Return whether this OAuth account is enabled for one Imagine model."""
+        if kind == "image":
+            models = self.image_models
+        elif kind == "video":
+            models = self.video_models
+        else:
+            models = []
+        return requested_model in models
+
+    async def build_media_headers(self) -> dict[str, str]:
+        """Reuse the existing OAuth lifecycle and return JSON Imagine headers."""
+        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        headers = self._build_headers(access_token)
+        headers["accept"] = "application/json"
+        return headers
 
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,

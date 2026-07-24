@@ -327,10 +327,23 @@ _API_KEY_LIMITED_HTTP_PATHS = {
     "/images/generations",
     "/v1/images/edits",
     "/images/edits",
+    "/v1/videos",
+    "/v1/videos/generations",
+    "/v1/videos/edits",
+    "/v1/videos/extensions",
     # Codex WebRTC call creation uses the ChatGPT-backend-shaped request body;
     # WebSocket realtime sessions acquire their API-key lease in their handler.
     "/backend-api/codex/realtime/calls",
 }
+
+
+def _is_api_key_limited_http_request(method: str, path: str) -> bool:
+    if method.upper() == "POST":
+        return path in _API_KEY_LIMITED_HTTP_PATHS
+    if method.upper() == "GET" and path.startswith("/v1/videos/"):
+        request_id = path[len("/v1/videos/"):]
+        return bool(request_id and "/" not in request_id)
+    return False
 
 
 def _api_key_limit_error_response(path: str, exc: apikey_limiter.ApiKeyLimitError):
@@ -515,7 +528,7 @@ class _DrainHttpMiddleware:
 
         try:
             request = Request(scope, receive=receive)
-            if method.upper() == "POST" and path in _API_KEY_LIMITED_HTTP_PATHS:
+            if _is_api_key_limited_http_request(method, path):
                 key_name, _allowed_models, err = auth.validate(request.headers)
                 if not err and key_name:
                     key_lease = await apikey_limiter.acquire(
@@ -815,7 +828,7 @@ async def proxy_images_edit(request: Request):
     return await handle_edit(request)
 
 
-# OpenAI Images API 兼容入口：标准 schema、对接现有 OAuth 账号管线。
+# OpenAI Images API 兼容入口：按 model 在 GPT/Codex 与 xAI OAuth 间分流。
 @app.post(
     "/v1/images/generations",
     summary="OpenAI-compatible image generation",
@@ -823,9 +836,9 @@ async def proxy_images_edit(request: Request):
         "Standard OpenAI `/v1/images/generations` endpoint. Accepts `prompt`, "
         "`model`, `n`, `size`, `response_format`, `quality`, `background`, "
         "`output_format`, `moderation`, `style`, `output_compression`, "
-        "`partial_images`. Internally uses Parrot's OpenAI OAuth account pool. "
-        "`n > 1` is downgraded to 1 (one image per upstream call) and the "
-        "response includes a `parrot_warning` field."
+        "`partial_images`. Configured `grok-imagine-image*` models use the xAI "
+        "OAuth pool; all other models retain the GPT/Codex image pipeline. "
+        "Only the GPT/Codex path downgrades `n > 1` to one image."
     ),
     tags=["images"],
 )
@@ -850,6 +863,47 @@ async def proxy_images_generations_openai(request: Request):
 async def proxy_images_edits_openai(request: Request):
     from src.openai.images_openai_compat import handle_edits
     return await handle_edits(request)
+
+
+@app.post(
+    "/v1/videos/generations",
+    summary="Generate a video with xAI Imagine",
+    tags=["videos"],
+)
+@app.post("/v1/videos", include_in_schema=False)
+async def proxy_xai_video_generation(request: Request):
+    from src.xai.imagine import handle_video_create
+    return await handle_video_create(request, action="generate")
+
+
+@app.post(
+    "/v1/videos/edits",
+    summary="Edit a video with xAI Imagine",
+    tags=["videos"],
+)
+async def proxy_xai_video_edit(request: Request):
+    from src.xai.imagine import handle_video_create
+    return await handle_video_create(request, action="edit")
+
+
+@app.post(
+    "/v1/videos/extensions",
+    summary="Extend a video with xAI Imagine",
+    tags=["videos"],
+)
+async def proxy_xai_video_extension(request: Request):
+    from src.xai.imagine import handle_video_create
+    return await handle_video_create(request, action="extend")
+
+
+@app.get(
+    "/v1/videos/{request_id}",
+    summary="Get an xAI Imagine video task",
+    tags=["videos"],
+)
+async def proxy_xai_video_result(request: Request, request_id: str):
+    from src.xai.imagine import handle_video_result
+    return await handle_video_result(request, request_id)
 
 
 @app.post("/v1/messages")

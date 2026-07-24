@@ -59,6 +59,17 @@ def images_allowed(key_name: Optional[str]) -> bool:
     return bool(entry.get("allowImages", False))
 
 
+def videos_allowed(key_name: Optional[str]) -> bool:
+    """该 Key 是否允许调用 Parrot 视频生成/编辑接口。默认 False。"""
+    if not key_name:
+        return False
+    cfg = config.get()
+    entry = (cfg.get("apiKeys") or {}).get(key_name)
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("allowVideos", False))
+
+
 def get_allowed_protocols(key_name: Optional[str]) -> list[str]:
     """Deprecated compatibility shim.
 

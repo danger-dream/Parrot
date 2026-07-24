@@ -492,6 +492,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "responsesPath": "",
         "isolateSessionId": True,
         "userAgent": "parrot/xai-oauth-adapter",
+        # 媒体模型单独声明，不能混入 defaultModels（后者只用于文本 /responses 调度）。
+        "imageModels": [
+            "grok-imagine-image",
+            "grok-imagine-image-quality",
+        ],
+        "videoModels": [
+            "grok-imagine-video",
+            "grok-imagine-video-1.5",
+        ],
+        # 视频任务是异步的；短期绑定用于让后续轮询复用创建任务的 OAuth 账号。
+        "videoJobTtlSeconds": 10800,
+        "mediaRequestTimeoutSeconds": 180,
         "defaultModels": [
             "grok-4.5",
         ],
@@ -587,7 +599,13 @@ def _normalize_api_keys(cfg: dict) -> bool:
     changed = False
     for name, v in list(keys.items()):
         if isinstance(v, str):
-            keys[name] = {"key": v, "enabled": True, "allowedModels": []}
+            keys[name] = {
+                "key": v,
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+                "allowVideos": False,
+            }
             changed = True
         elif isinstance(v, dict):
             if "key" not in v:
@@ -605,6 +623,10 @@ def _normalize_api_keys(cfg: dict) -> bool:
             if "allowImages" not in v:
                 # 新增图片接口权限默认关闭，避免老 Key 自动获得新能力。
                 v["allowImages"] = False
+                changed = True
+            if "allowVideos" not in v:
+                # 视频生成费用较高，既有 Key 默认不自动获得权限。
+                v["allowVideos"] = False
                 changed = True
         else:
             # 其它类型（list / None 等）视为无效

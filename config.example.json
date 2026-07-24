@@ -9,6 +9,7 @@
       "allowedModels": [],
       "enabled": true,
       "allowImages": false,
+      "allowVideos": false,
       "limits": {
         "enabled": null,
         "maxConcurrent": null,
@@ -305,6 +306,16 @@
     "responsesPath": "",
     "isolateSessionId": true,
     "userAgent": "parrot/xai-oauth-adapter",
+    "imageModels": [
+      "grok-imagine-image",
+      "grok-imagine-image-quality"
+    ],
+    "videoModels": [
+      "grok-imagine-video",
+      "grok-imagine-video-1.5"
+    ],
+    "videoJobTtlSeconds": 10800,
+    "mediaRequestTimeoutSeconds": 180,
     "defaultModels": [
       "grok-4.5"
     ]

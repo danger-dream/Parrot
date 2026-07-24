@@ -1169,6 +1169,12 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     anthropic_models = _default_models_for_settings("anthropic")
     openai_models = _default_models_for_settings("openai")
     xai_models = _default_models_for_settings("xai")
+    cfg = config.get()
+    xai_cfg = cfg.get("xaiOAuth") if isinstance(cfg.get("xaiOAuth"), dict) else {}
+    xai_image_models = xai_cfg.get("imageModels") if isinstance(xai_cfg.get("imageModels"), list) else []
+    xai_video_models = xai_cfg.get("videoModels") if isinstance(xai_cfg.get("videoModels"), list) else []
+    images_cfg = cfg.get("images") if isinstance(cfg.get("images"), dict) else {}
+    gpt_images_status = "✅ 已启用" if images_cfg.get("enabled", True) else "🚫 已停用"
     mode_label = _usage_display_label()
     quota_enabled, quota_interval, quota_threshold = _quota_monitor_values()
     quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
@@ -1189,8 +1195,12 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"{_provider_tag('openai')} <b>可用模型</b> ({len(openai_models)}):",
         _models_line(openai_models),
         "",
-        f"{_provider_tag('xai')} <b>可用模型</b> ({len(xai_models)}):",
+        f"{_provider_tag('xai')} <b>文本模型</b> ({len(xai_models)}):",
         _models_line(xai_models),
+        "",
+        "🎨 <b>媒体能力</b>",
+        f"GPT / Codex 图片: {gpt_images_status}",
+        f"Grok Imagine: 图片 <b>{len(xai_image_models)}</b> · 视频 <b>{len(xai_video_models)}</b>",
         "",
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
         f"当前模式: {_cch_status_label()}",
@@ -1206,11 +1216,12 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     rows = [
         [ui.btn("✏ Claude 模型", "odm:edit:anthropic"),
          ui.btn("✏ OpenAI 模型", "odm:edit:openai"),
-         ui.btn("✏ Grok 模型", "odm:edit:xai")],
-        [ui.btn("🖼 图片生成设置", "img:show"),
-         ui.btn("📈 配额监控", "oa:quota")],
-        [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
+         ui.btn("✏ Grok 文本", "odm:edit:xai")],
+        [ui.btn("🖼 GPT 图片设置", "img:show"),
+         ui.btn("🎨 Grok Imagine", "xim:show")],
+        [ui.btn("📈 配额监控", "oa:quota"),
          ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
+        [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle")],
         [ui.btn("🏠 返回主菜单", "menu:main"),
          ui.btn("◀ 返回OAuth账户", "menu:oauth")],
     ]

@@ -487,7 +487,8 @@ def _cleanup_cache(root: Path, cfg: dict) -> None:
         max_bytes = int(cfg.get("cacheMaxBytes") or 0)
     except Exception:
         retention_days, max_bytes = 0, 0
-    suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    # The same cache is shared by GPT images and xAI Imagine images/videos.
+    suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".m4v"}
     files: list[Path] = []
     for p in root.rglob("*"):
         try:

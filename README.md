@@ -24,6 +24,8 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 | `POST /v1/responses` | OpenAI Responses API | Codex CLI、新版 OpenAI SDK |
 | `POST /v1/images/generate` | Parrot 图片生成 | 用 Parrot API Key 调 ChatGPT/Codex 图片生成 |
 | `POST /v1/images/edit` | Parrot 图片编辑 | 单图修改 / 重绘 / 风格化 |
+| `POST /v1/images/generations`、`/v1/images/edits` | OpenAI Images API | 按模型分流到 GPT/Codex 或 xAI Grok Imagine |
+| `POST /v1/videos/*`、`GET /v1/videos/{request_id}` | xAI Imagine Videos API | 视频生成、编辑、延长与异步结果查询 |
 
 **三类上游渠道**
 
@@ -35,7 +37,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 
 **家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。
 
-**图片生成 / 修改**：提供 Parrot 简化图片接口 `POST /v1/images/generate` 和 `POST /v1/images/edit`，内部复用 OpenAI OAuth 账号走 ChatGPT Codex Responses + `image_generation` tool；下游只需要 Parrot API Key、提示词、可选分辨率即可生成图片，编辑接口额外提交单张输入图。图片权限与普通文本 API 独立，API Key 默认不允许图片接口，需要在 TG 面板显式开启。
+**图片 / 视频生成**：Parrot 简化图片接口仍走 ChatGPT Codex Responses + `image_generation` tool；标准 `/v1/images/generations`、`/v1/images/edits` 则按 `model` 分流，`grok-imagine-image*` 使用现有 xAI OAuth，其余图片模型保持原 GPT/Codex 管线。xAI 视频通过 `/v1/videos/generations|edits|extensions` 创建异步任务，再用 `GET /v1/videos/{request_id}` 查询；查询固定复用创建任务的 OAuth 账号。
 
 **运行时保护**
 
@@ -49,7 +51,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 - **评分调度**：滑动窗口 EMA 延迟 + 失败惩罚；带 20% 探索率避免赢家通吃
 - **模型映射 & 入口默认模型**：三条入口（anthropic / openai-chat / openai-responses）各自独立维护 `别名 → 真实模型` 表和默认模型；下游客户端发别名、代理改写成真实名再走调度，上游发新模型时**改 TG bot 即生效，无需重启客户端**
 - **出站网络设置**：支持在 TG「系统设置 → 网络设置」里配置 DNS 与 SOCKS5。DNS 默认 `8.8.8.8`，首次启动可从系统 DNS 同步一次；DNS 支持普通 IP/域名、DoT（`dot://...`）和 DoH（`https://.../dns-query`），DNS 服务器域名本身用系统 DNS 解析避免套娃。启用 SOCKS5 后所有出站 HTTP 请求走 SOCKS5，代理地址若为域名则使用配置 DNS 解析，保存前会检测并二次确认。内置「网络检测」后台监控，可按间隔检测 DNS / SOCKS5 / 渠道 TCP 连通性 / OpenAI、Claude、Cloudflare 核心上游，并在失败/恢复边沿各通知一次。
-- **图片日志与缓存**：图片调用写入独立 `image_logs.db`，不污染文本请求日志；可选缓存生成结果到 `images/`，支持保留天数 / 空间上限清理。API 响应不暴露本地缓存路径，TG 管理员可在最近图片日志中点按钮查看缓存图片。
+- **多媒体日志与媒体缓存**：GPT/Grok 图片及 Grok 视频任务统一写入独立 `image_logs.db`，不污染文本请求日志；视频轮询只更新原任务。开启缓存后，GPT/Grok 图片与已完成的 Grok 视频共用 `images/` 缓存和清理策略，TG 管理员可在「最近日志 → 多媒体日志」查看仍存在的图片或视频。
 
 **Telegram 图形管理面板**
 
@@ -347,33 +349,45 @@ JSON 请求体：
 - **专题视图**：按渠道 / 按模型 Top10，每条前缀 🅰/🅾 家族图标
 
 ### 📋 最近日志
-15 条最新请求，每条一个 `📄 #N 详情` 按钮点进详情页（完整重试链 + 请求/响应 body）。
+页面可在两类日志之间切换：
+- `💬 请求日志`：普通文本 / Responses / Chat / WS 请求，详情包含完整重试链和请求/响应 body；
+- `🎞 多媒体日志`：统一展示 GPT/Grok 图片生成与编辑、Grok 视频生成/编辑/延长。视频后续轮询只更新同一任务，详情显示进度、最终状态、OAuth 账号、耗时和 xAI 实际费用。
 
 ### 🔀 渠道管理
 添加向导（4 步 + 测试面板）、渠道详情、编辑、测试模型（单/全部）。
 
 > **Base URL 自适应**（v0.5.0+）：默认填上游域名即可，代理按协议追加 `/v1/messages`、`/v1/chat/completions`、`/v1/responses`。若上游接口挂在非标准路径（如智谱 Coding Plan 的 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），直接把**完整调用路径**贴进来，向导会自动拆分为 `baseUrl + apiPath` 存储，协议不匹配时给出交互式选择（采用识别到的协议 / 坚持当前协议清空路径 / 返回修改）。
 
-### 🔐 管理 OAuth（支持两家族）
-- ➕ 新增账户：第一步选 Claude / OpenAI；Claude 支持 PKCE 登录 + 粘贴 JSON；OpenAI 粘贴 refresh_token
+### 🔐 管理 OAuth
+- ➕ 新增账户：支持 Claude / OpenAI / Grok；各家按现有登录或 refresh_token 流程接入
 - 每条账户显示：状态图标 / 过期时间 / 5h 7d 用量 / 月度统计 / 冷却中的模型
-- 详情页：两家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
+- 详情页：三家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
-- 图片生成入口：OAuth 列表底部提供「🖼 图片生成」，用于配置图片模型、缓存、图片专用账号禁用列表和最近图片日志。
+- 账户设置中的媒体入口明确拆分：
+  - 「🖼 GPT 图片设置」管理 GPT/Codex 图片模型、缓存和图片专用账号禁用列表；
+  - 「🎨 Grok Imagine」管理 xAI 图片/视频模型、视频任务绑定时长和媒体请求超时，并显示图片模型路由边界；
+  - 两个设置页都可跳转到统一的「🎞 多媒体日志」。
 
 ### 🔑 API Key
-发送 `/keys` 管理下游代理 Key。列表直接显示完整 Key（单击即复制）；每个 Key 可设模型白名单（多选勾选）；删除二次确认。图片生成 / 编辑权限由 `allowImages` 单独控制，默认关闭，需要在 Key 详情页点击「🖼 允许图片接口」后才能调用 `/v1/images/generate` / `/v1/images/edit`。
+发送 `/keys` 管理下游代理 Key。列表直接显示完整 Key（单击即复制）；每个 Key 可设模型白名单（多选勾选，包含已配置的 Grok 图片/视频模型）；删除二次确认。图片权限由 `allowImages` 单独控制，视频权限由 `allowVideos` 单独控制，二者默认关闭，可在 Key 详情页分别点击「🖼 允许图片接口」和「🎬 允许视频接口」。
 
 API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ 系统设置 → 🔑 API Key 限流」里设置，默认单 Key 5 并发、50 队列、最长等待 30 分钟；单个 Key 可在详情页「🚦 请求限流」覆盖 `enabled / maxConcurrent / maxQueue / queueWaitSeconds`，其中 `limits.enabled` 优先级高于全局开关。
 
-### 🖼 图片生成
-从「🔐 管理 OAuth」列表底部进入，用于管理 Parrot 图片接口的运行参数与日志：
-- 功能开关、主模型 `mainModel`、图片工具模型 `toolModel`。
-- 图片专用账号禁用列表，只影响图片生成 / 编辑，不影响普通 OpenAI OAuth 文本请求。
-- 图片缓存开关、缓存路径、保留天数、缓存空间上限。
-- 图片调用统计、账号 Top 5、最近调用列表。
-- 当缓存开启且图片文件仍存在时，最近成功调用会显示「看图 #id」按钮，管理员可直接把缓存图片发回 Telegram 查看。
+### 🖼 GPT / Codex 图片设置
+从「🔐 管理 OAuth → ⚙️ 账户设置」进入，用于管理 GPT/Codex 图片接口的运行参数：
+- 功能开关、主模型 `mainModel`、图片工具模型 `toolModel`；
+- 图片专用账号禁用列表，只影响图片生成 / 编辑，不影响普通 OpenAI OAuth 文本请求；
+- 图片缓存开关、缓存路径、保留天数、缓存空间上限；
+- 统计、账号排行、最近任务和缓存图片查看统一移到「🎞 多媒体日志」。
+
+### 🎨 Grok Imagine 设置
+从「🔐 管理 OAuth → ⚙️ 账户设置」进入：
+- 编辑 `xaiOAuth.imageModels` 与 `xaiOAuth.videoModels`；
+- 编辑视频任务绑定时长 `videoJobTtlSeconds` 与媒体请求超时 `mediaRequestTimeoutSeconds`；
+- 页面明确展示：配置的 `grok-imagine-image*` 走 xAI OAuth，其他图片模型继续走 GPT/Codex；
+- API Key 详情页分别控制图片、视频权限，模型白名单页用 🖼 / 🎬 标出对应媒体模型；
+- 页面可直接进入「🎞 多媒体日志」，查看 GPT/Grok 统一统计、费用和任务状态。
 
 ### ⚖️ 负载均衡
 - `smart` 智能调度：按滑动窗口评分 + 探索率排序
@@ -423,7 +437,7 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 ```jsonc
 {
   "listen":   { "host": "0.0.0.0", "port": 22122 },
-  "apiKeys":  { "default": { "key": "ccp-xxx", "allowedModels": [], "allowImages": false } },
+  "apiKeys":  { "default": { "key": "ccp-xxx", "allowedModels": [], "allowImages": false, "allowVideos": false } },
   "oauthAccounts": [
     { "email": "xxx@example.com", "provider": "claude", "access_token": "...", "refresh_token": "...", "expired": "..." },
     { "email": "yyy@example.com", "provider": "openai", "access_token": "...", "refresh_token": "...", "plan_type": "plus", "chatgpt_account_id": "..." }
@@ -502,6 +516,10 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 > `apiKeys.*.allowImages` **默认关闭** —— 新建或历史 API Key 不会自动获得图片生成 / 编辑能力，必须在 TG「🔑 管理 API Key」里显式开启。
 
+> `apiKeys.*.allowVideos` **默认关闭** —— 视频费用较高，需在 TG「🔑 管理 API Key」里为获准的下游 Key 单独开启，并可配合 `allowedModels` 限定视频模型。
+
+> **旧版本升级无需手工迁移：**启动时会保留既有 API Key、`allowedModels`、`allowImages`、OAuth 账号及全部 token，只为缺失字段补上 Imagine 默认配置，并将历史 Key 的 `allowVideos` 设为 `false`。`state.db` 会幂等新增 `xai_video_jobs`；既有 `image_logs.db` 会原地补充多媒体字段，历史 GPT 图片记录自动按 `provider=openai`、`media_type=image` 解释，不删除、不改名、不清空。若要开放视频，升级后再按 Key 显式开启即可。
+
 > API Key 请求排队时，小于 `queuedBodySpoolThresholdBytes` 的待回放 body 保留在内存；超过阈值后自动转入数据目录下固定的 `queued-body-spool/` 私有临时目录。内存预算沿用 `defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes`；磁盘临时数据另由 `defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 约束，成功、失败、取消或断开后都会关闭并删除。
 
 > `images.cacheRetentionDays=0` 表示不按时间清理；`images.cacheMaxBytes=0` 表示不按空间清理。相对 `cachePath` 会落在数据目录下，Parrot 会阻止相对路径逃逸。
@@ -548,11 +566,11 @@ docker compose logs --since 1h         # 最近 1 小时
 
 按月分库在 `data/logs/YYYY-MM.db`（SQLite）。在 TG Bot「📋 最近日志」查看；或宿主机直接 `sqlite3 <安装目录>/data/logs/2026-04.db`。
 
-图片生成 / 编辑调用使用独立日志库 `data/image_logs.db`，包含主调用表和账号尝试表；不会改动或污染普通文本请求日志。
+GPT/Grok 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`；历史主调用表原地扩展为统一多媒体任务日志，GPT 图片账号尝试表继续保留。视频创建记一条 `pending`，客户端轮询只更新该记录直至 `success / failed / expired`，不会污染普通文本请求日志。
 
-### 图片缓存
+### 多媒体缓存
 
-图片缓存默认关闭。开启后，生成 / 编辑结果会保存到 `data/images/`（或 `images.cachePath` 指定的位置），并按 `images.cacheRetentionDays` 和 `images.cacheMaxBytes` 自动清理。缓存路径只在服务端内部使用，API 响应不会暴露本地文件路径；管理员可在 TG「🖼 图片生成」最近调用中点击「看图 #id」查看仍存在的缓存图片。
+缓存默认关闭。开启后，GPT/Grok 图片以及轮询完成的 Grok 视频会保存到 `data/images/`（或 `images.cachePath` 指定的位置），并统一按 `images.cacheRetentionDays` 和 `images.cacheMaxBytes` 自动清理。缓存路径只在服务端内部使用，API 响应不会暴露本地文件路径；管理员可在 TG「📋 最近日志 → 🎞 多媒体日志」的任务详情中查看仍存在的缓存图片或视频。
 
 ### 状态数据
 
@@ -601,9 +619,9 @@ Parrot/
 ├── data/                        ← 运行时持久化（容器挂载点；源码模式不存在）
 │   ├── config.json              ← 唯一配置文件
 │   ├── state.db                 ← 运行时状态（永久）
-│   ├── image_logs.db            ← 图片生成/编辑调用日志
+│   ├── image_logs.db            ← 图片/视频统一多媒体任务日志（兼容旧图片历史）
 │   ├── logs/YYYY-MM.db          ← 按月分库业务日志
-│   ├── images/                  ← 图片缓存（开启后）
+│   ├── images/                  ← 图片/视频缓存（开启后，保留兼容目录名）
 │   └── .anthropic_proxy_ids.json ← device_id 持久化
 └── src/
     ├── config.py                ← 配置加载/保存/热加载
@@ -611,7 +629,8 @@ Parrot/
     ├── errors.py                ← 标准错误响应
     ├── state_db.py              ← state.db 读写
     ├── log_db.py                ← 按月日志库读写 + 跨月聚合（支持 family 过滤）
-    ├── image_db.py              ← 图片调用日志 + 账号尝试统计
+    ├── image_db.py              ← 兼容旧库的多媒体日志底层 + GPT 图片尝试统计
+    ├── media_db.py              ← 统一图片/视频日志门面
     ├── public_ip.py
     ├── fingerprint.py           ← 会话亲和指纹（按 Anthropic 标准字段归一化）
     ├── affinity.py
@@ -650,9 +669,11 @@ Parrot/
             ├── stats_menu.py    ← 家族化汇总 + 专题 + Key 家族拆分
             ├── logs_menu.py
             ├── channel_menu.py
-            ├── oauth_menu.py    ← 支持 Claude + OpenAI 双家族管理
-            ├── apikey_menu.py   ← API Key 权限 / 图片权限
-            ├── image_menu.py    ← 图片生成配置 / 日志 / 缓存查看
+            ├── oauth_menu.py    ← 支持 Claude + OpenAI + Grok OAuth 管理
+            ├── apikey_menu.py   ← API Key 模型 / 图片 / 视频权限
+            ├── image_menu.py    ← GPT/Codex 图片配置 / 缓存设置
+            ├── xai_imagine_menu.py ← Grok Imagine 图片 / 视频设置
+            ├── media_logs_menu.py   ← GPT/Grok 统一多媒体日志
             ├── system_menu.py
             └── help_menu.py
 ```
@@ -701,11 +722,11 @@ Parrot/
 - 账号是否被停用、认证失败、配额禁用，或在「🖼 图片生成」里被图片模块单独禁用。
 - 账号是否处于图片模块独立冷却中。
 
-### 图片生成成功但 TG 看不到缓存图按钮
-「看图 #id」按钮只在以下条件同时满足时显示：
-- 图片缓存已开启。
-- 该调用成功。
-- `image_logs.db` 里记录了缓存路径。
+### 图片或视频生成成功但 TG 看不到查看按钮
+「📋 最近日志 → 🎞 多媒体日志 → 任务详情」中的查看按钮只在以下条件同时满足时显示：
+- 多媒体缓存已开启；
+- 图片调用成功，或 Grok 视频已轮询到完成状态；
+- `image_logs.db` 里记录了缓存路径；
 - 本地缓存文件还没有被保留天数 / 空间上限清理掉。
 
 ### TG bot 无响应
@@ -720,7 +741,8 @@ refresh_token 已失效。在 TG bot「🔐 管理 OAuth」→ 点该账户 →�
 已修复（v0.x 起）。如升级后仍遇到，检查 OAuth 渠道的 `upstream_stream_only` 属性是否为 True（源码部署场景）。
 
 ### 查某次请求为什么失败
-「📋 最近日志」→ 找到那条 → 点「📄 #N」→ **重试链**会显示每次尝试的渠道 + outcome + 错误原因。
+- 普通请求：「📋 最近日志 → 💬 请求日志」→ 点「📄 #N」，重试链会显示每次渠道尝试和错误原因；
+- 图片 / 视频：「📋 最近日志 → 🎞 多媒体日志」→ 点「📄 #N」，查看模型、OAuth 账号、任务进度、耗时、费用和最终错误。
 
 ---
 
