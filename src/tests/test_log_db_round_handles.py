@@ -127,6 +127,60 @@ def test_request_retry_and_round_handles_survive_month_rollover_and_id_collision
     assert _row(feb.db.path, "proxy_chain", 1)["round_id"] == "round-feb"
 
 
+def test_cleanup_stale_pending_preserves_known_client_disconnect_semantics(isolated_log_db):
+    created = time.time() - 1900
+    disconnected = _insert("stale-client-disconnect", created)
+    retry = log_db.record_retry_attempt(
+        disconnected, 1, "api:channel", "api", "model", created,
+    )
+    log_db.update_retry_attempt(
+        retry,
+        ended_at=created + 1,
+        outcome="client_disconnected",
+        error_detail="client disconnected",
+    )
+
+    proxy_only = _insert("stale-proxy-client-disconnect", created)
+    open_retry = log_db.record_retry_attempt(
+        proxy_only, 1, "api:channel", "api", "model", created,
+    )
+    proxy_round = log_db.record_proxy_attempt(
+        proxy_only,
+        open_retry,
+        1,
+        "direct",
+        created,
+        round_id="stale-proxy-round",
+        transport="http",
+        request_mode="http_stream",
+    )
+    log_db.update_proxy_attempt(
+        proxy_round,
+        ended_at=created + 1,
+        outcome="client_disconnected",
+        error_detail="client disconnected",
+    )
+    orphan = _insert("stale-orphan", created)
+
+    assert log_db.cleanup_stale_pending(1800) == 3
+
+    disconnected_row = _request(disconnected.db.path, disconnected.request_id)
+    proxy_only_row = _request(proxy_only.db.path, proxy_only.request_id)
+    orphan_row = _request(orphan.db.path, orphan.request_id)
+    assert (
+        disconnected_row["status"],
+        disconnected_row["http_status"],
+        disconnected_row["error_message"],
+    ) == ("cancelled", 499, "client disconnected")
+    assert (
+        proxy_only_row["status"],
+        proxy_only_row["http_status"],
+        proxy_only_row["error_message"],
+    ) == ("cancelled", 499, "client disconnected")
+    assert orphan_row["status"] == "error"
+    assert orphan_row["error_message"] == "process crashed (stale pending)"
+
+
 def test_historical_open_is_read_only_and_migration_is_explicit(isolated_log_db):
     path = isolated_log_db / "2024-01.db"
     conn = sqlite3.connect(path)

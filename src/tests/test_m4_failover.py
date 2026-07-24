@@ -711,8 +711,9 @@ async def test_stream_success_full_forward(m):
     print("  [PASS] stream_success_full_forward")
 
 
-async def test_stream_first_event_error_switches(m):
+async def test_stream_first_event_error_switches(m, monkeypatch):
     _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
     router = MockRouter()
     router.register("https://cha", lambda r: sse_first_event_error())
     router.register("https://chb", lambda r: sse_ok())
@@ -733,8 +734,8 @@ async def test_stream_first_event_error_switches(m):
     assert log["log"]["status"] == "success"
     assert log["log"]["final_channel_key"] == "api:chB"
     outcomes = [a["outcome"] for a in log["retry_chain"]]
-    assert outcomes == ["upstream_error_json", "success"], outcomes
-    print("  [PASS] stream first event error → switch → chB ok")
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "upstream_error_json", "success"], outcomes
+    print("  [PASS] stream overload retries same channel twice → switch → chB ok")
 
 
 async def test_stream_context_length_first_event_short_circuits_failover(m):
@@ -792,8 +793,9 @@ async def test_stream_midstream_error_logs_upstream_error(m):
     print("  [PASS] stream midstream error → DB records upstream error, not client disconnected")
 
 
-async def test_responses_error_before_visible_chunk_switches(m):
+async def test_responses_error_before_visible_chunk_switches(m, monkeypatch):
     _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
     router = MockRouter()
     router.register("https://cha", lambda r: responses_sse_midstream_error())
     router.register("https://chb", lambda r: responses_sse_ok())
@@ -816,14 +818,15 @@ async def test_responses_error_before_visible_chunk_switches(m):
     assert log["log"]["status"] == "success", log["log"]
     assert log["log"]["final_channel_key"] == "api:chB"
     outcomes = [a["outcome"] for a in log["retry_chain"]]
-    assert outcomes == ["upstream_error_json", "success"], outcomes
-    print("  [PASS] responses metadata→error before visible chunk → switch → chB ok")
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "upstream_error_json", "success"], outcomes
+    print("  [PASS] responses overload retries same channel twice → switch → chB ok")
 
 
 
 
-async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m):
+async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m, monkeypatch):
     _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
     router = MockRouter()
     router.register("https://cha", lambda r: responses_sse_chunked_metadata_then_error())
     router.register("https://chb", lambda r: responses_sse_ok())
@@ -845,8 +848,8 @@ async def test_responses_chunked_metadata_error_before_visible_chunk_switches(m)
     assert log["log"]["status"] == "success", log["log"]
     assert log["log"]["final_channel_key"] == "api:chB"
     outcomes = [a["outcome"] for a in log["retry_chain"]]
-    assert outcomes == ["upstream_error_json", "success"], outcomes
-    print("  [PASS] responses chunked metadata→error before visible chunk → switch → chB ok")
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "upstream_error_json", "success"], outcomes
+    print("  [PASS] responses chunked overload retries twice → switch → chB ok")
 
 
 async def test_responses_precommit_eof_persists_received_sse(m):
@@ -908,8 +911,9 @@ async def test_responses_context_length_before_visible_chunk_short_circuits_fail
     print("  [PASS] responses metadata→context overflow before visible chunk → request_invalid 400 without failover")
 
 
-async def test_responses_to_chat_error_after_item_added_before_chat_bytes_switches(m):
+async def test_responses_to_chat_error_after_item_added_before_chat_bytes_switches(m, monkeypatch):
     _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
     router = MockRouter()
     router.register("https://cha", lambda r: responses_sse_item_then_error())
     router.register("https://chb", lambda r: chat_sse_ok())
@@ -930,8 +934,8 @@ async def test_responses_to_chat_error_after_item_added_before_chat_bytes_switch
     assert log["log"]["status"] == "success", log["log"]
     assert log["log"]["final_channel_key"] == "api:chB"
     outcomes = [a["outcome"] for a in log["retry_chain"]]
-    assert outcomes == ["upstream_error_json", "success"], outcomes
-    print("  [PASS] responses→chat item.added then error before chat bytes → switch → chB ok")
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "upstream_error_json", "success"], outcomes
+    print("  [PASS] responses→chat pre-visible overload retries twice → switch → chB ok")
 
 
 async def test_stream_blacklist_switch(m):

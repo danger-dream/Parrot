@@ -122,6 +122,7 @@ class ResponsesWsPreVisibleResult:
     visible_frame: str | bytes | None = None
     outcome: str | None = None
     error_detail: str = ""
+    error_code: Optional[str] = None
     http_status: Optional[int] = None
     first_packet_ms: Optional[int] = None
     stream_started: bool = False
@@ -410,6 +411,7 @@ async def read_until_first_responses_ws_visible_event(
                 if maybe_error:
                     result.outcome = "upstream_error_json"
                     result.http_status = maybe_error.get("status")
+                    result.error_code = str(maybe_error.get("code") or "") or None
                     result.error_detail = maybe_error.get("message") or data[:2000]
                     if not is_retryable_responses_ws_error_before_accept(maybe_error):
                         result.pending.append(data)
@@ -423,6 +425,7 @@ async def read_until_first_responses_ws_visible_event(
                 if timing is not None:
                     timing.mark_io_complete()
                 result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
+                result.error_code = getattr(tracker, "stream_error_code", None)
                 if use_tracker_error_detail:
                     result.error_detail = getattr(tracker, "stream_error_message", None) or data[:2000]
                 else:

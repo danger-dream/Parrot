@@ -10,6 +10,7 @@ from ..openai.transform import chat_to_anthropic, responses_to_anthropic
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry, standard
 from .base import Channel, ChannelDisplay, UpstreamRequest
+from .compatibility import forced_for_model, normalize_mode, normalize_models
 from .url_utils import resolve_upstream_url
 
 
@@ -84,6 +85,12 @@ class ApiChannel(Channel):
         # 部分第三方 Claude 中转把 thinking.enabled 当不支持参数 → 400。
         # 默认 False；按渠道开启。
         self.omit_thinking = bool(entry.get("omitThinking", False))
+        # 能力型兼容策略：auto 只透传下游明确意图；force 由 Parrot 对全部
+        # 模型（models=[]）或指定真实上游模型主动补齐能力属性。
+        self.context_1m_mode = normalize_mode(entry.get("context1mMode"))
+        self.context_1m_models = normalize_models(entry.get("context1mModels"))
+        self.fast_mode = normalize_mode(entry.get("fastMode"))
+        self.fast_models = normalize_models(entry.get("fastModels"))
         # ApiChannel 只处理 anthropic 协议；openai-* 会被 registry factory 分派到
         # src/openai/channel/api_channel.py::OpenAIApiChannel。这里做防御性 assert
         # 保证配置中的 protocol 与实际类一致，避免误配置造成难查 bug。
@@ -103,6 +110,14 @@ class ApiChannel(Channel):
 
     def list_client_models(self) -> list[str]:
         return [m.get("alias", "") for m in self.models if m.get("alias")]
+
+    def forces_context_1m(self, resolved_model: str) -> bool:
+        return forced_for_model(
+            self.context_1m_mode, self.context_1m_models, resolved_model,
+        )
+
+    def forces_fast_mode(self, resolved_model: str) -> bool:
+        return forced_for_model(self.fast_mode, self.fast_models, resolved_model)
 
     # ─── 请求构造 ─────────────────────────────────────────────────
 
@@ -157,6 +172,35 @@ class ApiChannel(Channel):
             bridge=translator_ctx is not None,
         )
 
+        # 自动模式只透传下游明确能力意图；强制模式则在最终上游协议层补齐。
+        downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
+        original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
+        internal_context_1m = body_with_model.get(
+            cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY
+        )
+        if isinstance(internal_context_1m, bool):
+            # 1M 权限回退会显式写 False；必须优先于原始模型标记/下游 beta。
+            wants_context_1m = internal_context_1m
+        else:
+            wants_context_1m = cc_mimicry.request_wants_context_1m(
+                body_with_model,
+                downstream_betas=downstream_betas,
+                original_model=original_model,
+                resolved_model=resolved_model,
+            )
+        wants_fast_mode = cc_mimicry.request_wants_fast_mode(
+            body_with_model, downstream_betas=downstream_betas,
+        )
+        if self.forces_context_1m(resolved_model):
+            wants_context_1m = True
+            body_with_model[cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY] = True
+        if self.forces_fast_mode(resolved_model):
+            wants_fast_mode = True
+        if wants_fast_mode:
+            # Fast 的 Anthropic wire 形态要求 body.speed 与 beta 同时存在；
+            # 下游只从 header 表达意图时也在转换前补内部信号。
+            body_with_model[cc_mimicry.PARROT_WANTS_FAST_MODE_KEY] = True
+
         dynamic_map: Optional[dict] = None
         if self.cc_mimicry:
             # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
@@ -183,16 +227,13 @@ class ApiChannel(Channel):
             # 第三方 API 渠道沿用 Bearer 鉴权（auth_scheme=bearer），不改成 x-api-key。
             betas = [b for b in cc_mimicry.BETAS
                      if not self.omit_thinking or "thinking" not in b]
-            downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
-            original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
-            wants_context_1m = body_with_model.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
-            wants_fast_mode = body_with_model.get(cc_mimicry.PARROT_WANTS_FAST_MODE_KEY)
             headers = cc_mimicry.build_upstream_headers(
                 self.api_key, session_id=sid, betas=betas,
                 auth_scheme="bearer", model=resolved_model, payload=payload,
                 downstream_betas=downstream_betas, original_model=original_model,
                 wants_context_1m=wants_context_1m,
-                wants_fast_mode=wants_fast_mode)
+                wants_fast_mode=wants_fast_mode,
+                allow_any_model_context_1m=True)
         else:
             payload = standard.standard_transform(body_with_model)
             if self.omit_temperature:
@@ -205,17 +246,15 @@ class ApiChannel(Channel):
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01",
             }
-            downstream_betas = cc_mimicry.parse_beta_header(
-                body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
-            )
-            wants_fast_mode = body_with_model.get(cc_mimicry.PARROT_WANTS_FAST_MODE_KEY)
-            if cc_mimicry.request_wants_fast_mode(
-                payload, downstream_betas=downstream_betas,
-            ) or wants_fast_mode is True:
-                if cc_mimicry.FAST_MODE_BETA not in downstream_betas:
-                    downstream_betas.append(cc_mimicry.FAST_MODE_BETA)
-            if downstream_betas:
-                headers["anthropic-beta"] = ",".join(dict.fromkeys(downstream_betas))
+            outgoing_betas = cc_mimicry.parse_beta_header(downstream_betas)
+            if self.omit_thinking:
+                outgoing_betas = [b for b in outgoing_betas if "thinking" not in b]
+            if wants_context_1m and cc_mimicry.CONTEXT_1M_BETA not in outgoing_betas:
+                outgoing_betas.append(cc_mimicry.CONTEXT_1M_BETA)
+            if wants_fast_mode and cc_mimicry.FAST_MODE_BETA not in outgoing_betas:
+                outgoing_betas.append(cc_mimicry.FAST_MODE_BETA)
+            if outgoing_betas:
+                headers["anthropic-beta"] = ",".join(dict.fromkeys(outgoing_betas))
 
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/messages"),

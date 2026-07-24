@@ -12,6 +12,7 @@ from .. import config, cooldown, load_balancing, state_db
 from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
+from .compatibility import normalize_mode, normalize_models
 from .oauth_channel import OAuthChannel
 from .openai_oauth_channel import OpenAIOAuthChannel
 from .xai_oauth_channel import XAIOAuthChannel
@@ -199,7 +200,8 @@ def install_config_reload_hook() -> None:
 def add_api_channel(entry: dict) -> dict:
     """
     添加一个 API 渠道（type="api"），写入 config 并触发重建。
-    entry 需含 name/baseUrl/apiKey/models；可含 cc_mimicry/enabled/apiPath。
+    entry 需含 name/baseUrl/apiKey/models；可含 cc_mimicry/enabled/apiPath，
+    以及渠道兼容策略字段。
 
     apiPath 语义（拆分完整调用路径）：
     - 如果用户在 baseUrl 里直接写了完整路径（末段命中 messages / completions /
@@ -250,6 +252,10 @@ def add_api_channel(entry: dict) -> dict:
             "cc_mimicry": bool(entry.get("cc_mimicry", default_cc)),
             "omitTemperature": bool(entry.get("omitTemperature", False)),
             "omitThinking": bool(entry.get("omitThinking", False)),
+            "context1mMode": normalize_mode(entry.get("context1mMode")),
+            "context1mModels": normalize_models(entry.get("context1mModels")),
+            "fastMode": normalize_mode(entry.get("fastMode")),
+            "fastModels": normalize_models(entry.get("fastModels")),
             "maxConcurrent": int(entry.get("maxConcurrent", 0) or 0),
             "enabled": bool(entry.get("enabled", True)),
             "disabled_reason": None,
@@ -268,7 +274,8 @@ def add_api_channel(entry: dict) -> dict:
 
 def update_api_channel(name: str, patch: dict) -> dict | None:
     """
-    编辑渠道。patch 可含 name/baseUrl/apiKey/models/cc_mimicry/enabled/apiPath/protocol。
+    编辑渠道。patch 可含 name/baseUrl/apiKey/models/cc_mimicry/enabled/apiPath/protocol，
+    以及 omitTemperature/omitThinking/context1m*/fast* 兼容策略字段。
     改名时自动在 state.db / scorer / affinity 上级联。
     返回更新后的 entry；若渠道不存在返回 None。
 
@@ -354,6 +361,14 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
             target["omitTemperature"] = bool(patch["omitTemperature"])
         if "omitThinking" in patch:
             target["omitThinking"] = bool(patch["omitThinking"])
+        if "context1mMode" in patch:
+            target["context1mMode"] = normalize_mode(patch["context1mMode"])
+        if "context1mModels" in patch:
+            target["context1mModels"] = normalize_models(patch["context1mModels"])
+        if "fastMode" in patch:
+            target["fastMode"] = normalize_mode(patch["fastMode"])
+        if "fastModels" in patch:
+            target["fastModels"] = normalize_models(patch["fastModels"])
         if "protocol" in patch:
             target["protocol"] = new_proto
             # 切换到 openai-* 时强制关闭 CC 伪装；切回 anthropic 保留用户原设置（若无则 True）

@@ -26,8 +26,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from ... import affinity, config, cooldown, load_balancing, log_db, probe, scorer, state_db
+from ... import affinity, config, cooldown, load_balancing, log_db, probe, quota_errors, scorer, state_db
 from ...channel import api_channel, registry
+from ...channel.compatibility import FORCE_MODE, normalize_mode, normalize_models
 from ...channel.url_utils import (
     detect_suffix_protocol,
     split_base_url,
@@ -49,6 +50,41 @@ _PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
 
 def _protocol_of(ch) -> str:
     return getattr(ch, "protocol", "anthropic")
+
+
+_COMPAT_FEATURES = {
+    "1m": {
+        "mode_attr": "context_1m_mode",
+        "models_attr": "context_1m_models",
+        "mode_key": "context1mMode",
+        "models_key": "context1mModels",
+        "title": "🧠 1M 上下文标志",
+    },
+    "fast": {
+        "mode_attr": "fast_mode",
+        "models_attr": "fast_models",
+        "mode_key": "fastMode",
+        "models_key": "fastModels",
+        "title": "⚡ Fast 模式",
+    },
+}
+
+
+def _compat_feature_values(ch, feature: str) -> tuple[str, list[str]]:
+    spec = _COMPAT_FEATURES[feature]
+    return (
+        normalize_mode(getattr(ch, spec["mode_attr"], "auto")),
+        normalize_models(getattr(ch, spec["models_attr"], [])),
+    )
+
+
+def _compat_feature_status(ch, feature: str) -> str:
+    mode, models = _compat_feature_values(ch, feature)
+    if mode != FORCE_MODE:
+        return "自动（透传）"
+    if not models:
+        return "强制 · 全部模型"
+    return f"强制 · {len(models)} 个模型"
 
 
 _BJT = timezone(timedelta(hours=8))
@@ -152,8 +188,11 @@ def _channel_health(ch) -> tuple[str, str]:
     cd_entries = cooldown.active_entries()
     perm = [e for e in cd_entries if e["channel_key"] == key and e["cooldown_until"] == -1]
     temp = [e for e in cd_entries if e["channel_key"] == key and e["cooldown_until"] != -1]
+    quota_temp = [e for e in temp if quota_errors.active_quota_cooldown(e)]
     if perm:
         return "🔴", f"永久冷却 ({len(perm)}模型)"
+    if temp and len(quota_temp) == len(temp):
+        return "🟠", f"配额冷却 ({len(temp)}模型)"
     if temp:
         return "🟠", f"冷却中 ({len(temp)}模型)"
 
@@ -652,9 +691,12 @@ def _channel_model_lines(ch) -> list[str]:
         perf = perfs.get(real)
         cd = cd_map.get(real)
 
+        quota_cooling = bool(cd and quota_errors.active_quota_cooldown(cd, now_ms=now))
         if cd:
             if cd["cooldown_until"] == -1:
                 line += " 🔴 <b>永久冷却</b>"
+            elif quota_cooling:
+                line += " 🟠 <b>配额冷却</b>"
             else:
                 remaining = max(0, (cd["cooldown_until"] - now) // 1000)
                 line += f" 🟠 冷却 {remaining}s"
@@ -666,6 +708,11 @@ def _channel_model_lines(ch) -> list[str]:
             else:
                 line += " ⚪ 暂无数据"
         lines.append(line)
+        if quota_cooling:
+            reset_text = quota_errors.format_bjt_ms(cd["cooldown_until"])
+            lines.append("    原因: 周/月额度已用尽（1310）")
+            lines.append(f"    恢复: <code>{reset_text}</code> 北京时间")
+            lines.append("    调度: 恢复前自动跳过本渠道模型")
 
         if perf and perf["total_requests"] > 0:
             stats_line = (
@@ -715,8 +762,16 @@ def _detail_text_and_kb(name: str, page: int = 1) -> tuple[Optional[str], Option
         lines.append(f"🔌 协议: <code>{ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))}</code>")
     lines += [
         f"🎭 CC 伪装: <code>{'开启' if ch.cc_mimicry else '关闭'}</code>",
-        f"🌡 剔除 temperature: <code>{'开启' if getattr(ch, 'omit_temperature', False) else '关闭'}</code>",
-        f"🧠 剔除 thinking: <code>{'开启' if getattr(ch, 'omit_thinking', False) else '关闭'}</code>",
+        "🧩 兼容剔除: "
+        f"<code>temperature {'开' if getattr(ch, 'omit_temperature', False) else '关'}"
+        f" · thinking {'开' if getattr(ch, 'omit_thinking', False) else '关'}</code>",
+    ]
+    if protocol == "anthropic":
+        lines.append(
+            f"🧠 1M 上下文: <code>{_compat_feature_status(ch, '1m')}</code>"
+        )
+    lines += [
+        f"⚡ Fast 模式: <code>{_compat_feature_status(ch, 'fast')}</code>",
         f"⚡ 并发上限: <code>{getattr(ch, 'max_concurrent', 0) or '默认'}</code>",
         f"{'✅' if enabled else '⬛'} 状态: <code>{'enabled' if enabled else (ch.disabled_reason or 'disabled')}</code>",
         "",
@@ -1564,30 +1619,17 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
     if ch is None:
         return
     cc_label = "🎭 切换 CC 伪装（当前: 开）" if ch.cc_mimicry else "🎭 切换 CC 伪装（当前: 关）"
-    omit_temp = bool(getattr(ch, "omit_temperature", False))
-    omit_label = (
-        "🌡 切换剔除 temperature（当前: 开）"
-        if omit_temp
-        else "🌡 切换剔除 temperature（当前: 关）"
-    )
-    omit_think = bool(getattr(ch, "omit_thinking", False))
-    think_label = (
-        "🧠 切换剔除 thinking（当前: 开）"
-        if omit_think
-        else "🧠 切换剔除 thinking（当前: 关）"
-    )
     protocol = _protocol_of(ch)
     rows = [
         [ui.btn("✏ 名称",   f"ch:ename:{short}"),
          ui.btn("✏ URL",    f"ch:eurl:{short}")],
         [ui.btn("✏ API Key", f"ch:ekey:{short}"),
          ui.btn("✏ 模型列表", f"ch:emodels:{short}")],
-        [ui.btn(f"⚡ 并发上限（当前: {getattr(ch, 'max_concurrent', 0) or '默认'}）",
-                f"ch:emax:{short}")],
+        [ui.btn(f"⚡ 并发上限（{getattr(ch, 'max_concurrent', 0) or '默认'}）",
+                f"ch:emax:{short}"),
+         ui.btn("🧩 渠道兼容配置", f"ch:cmp:{short}")],
         [ui.btn(f"🔌 切换协议（当前: {_PROTOCOL_LABEL.get(protocol, protocol)}）",
                 f"ch:eproto:{short}")],
-        [ui.btn(omit_label, f"ch:eomit:{short}")],
-        [ui.btn(think_label, f"ch:ethink:{short}")],
     ]
     # openai-* 家族下 CC 伪装按钮无效（内部强制 False），隐藏以减少困惑
     if protocol == "anthropic":
@@ -1598,6 +1640,202 @@ def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
         f"✏ <b>编辑 [{ui.escape_html(ch.display_name)}]</b>\n\n选择要修改的字段：",
         reply_markup=ui.inline_kb(rows),
     )
+
+
+def _resolve_compat_channel(short: str):
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    return name, ch
+
+
+def _render_compat_menu(chat_id: int, message_id: int, short: str) -> None:
+    _, ch = _resolve_compat_channel(short)
+    if ch is None:
+        return
+    protocol = _protocol_of(ch)
+    temp_on = bool(getattr(ch, "omit_temperature", False))
+    thinking_on = bool(getattr(ch, "omit_thinking", False))
+    lines = [
+        f"🧩 <b>渠道兼容配置 [{ui.escape_html(ch.display_name)}]</b>",
+        "",
+        "这些设置只修改该渠道的最终上游请求，不影响其他渠道。",
+        "能力项的 <b>自动</b> 表示透传；<b>强制</b> 表示由 Parrot 对命中模型主动开启。",
+        "",
+        f"🌡 剔除 temperature：<code>{'开启' if temp_on else '关闭'}</code>",
+        f"🧠 剔除 thinking：<code>{'开启' if thinking_on else '关闭'}</code>",
+    ]
+    if protocol == "anthropic":
+        lines.append(f"🧠 1M 上下文：<code>{_compat_feature_status(ch, '1m')}</code>")
+    lines.append(f"⚡ Fast 模式：<code>{_compat_feature_status(ch, 'fast')}</code>")
+
+    rows = [[
+        ui.btn(f"🌡 temperature：{'开' if temp_on else '关'}", f"ch:eomit:{short}"),
+        ui.btn(f"🧠 thinking：{'开' if thinking_on else '关'}", f"ch:ethink:{short}"),
+    ]]
+    if protocol == "anthropic":
+        rows.append([
+            ui.btn("🧠 1M 上下文", f"ch:cf:{short}:1m"),
+            ui.btn("⚡ Fast 模式", f"ch:cf:{short}:fast"),
+        ])
+    else:
+        rows.append([ui.btn("⚡ Fast 模式", f"ch:cf:{short}:fast")])
+    rows.append([ui.btn("◀ 返回渠道编辑", f"ch:edit:{short}")])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def on_compat_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    _render_compat_menu(chat_id, message_id, short)
+
+
+def _compat_model_label(model: dict, selected: bool, all_models: bool) -> str:
+    real = str(model.get("real") or "")
+    alias = str(model.get("alias") or real)
+    display = alias if alias == real else f"{alias} → {real}"
+    if len(display) > 48:
+        display = display[:45] + "…"
+    marker = "○" if all_models else ("✅" if selected else "⬜")
+    return f"{marker} {display}"
+
+
+def _render_compat_feature(
+    chat_id: int, message_id: int, short: str, feature: str,
+) -> None:
+    if feature not in _COMPAT_FEATURES:
+        return
+    _, ch = _resolve_compat_channel(short)
+    if ch is None:
+        return
+    if feature == "1m" and _protocol_of(ch) != "anthropic":
+        _render_compat_menu(chat_id, message_id, short)
+        return
+
+    spec = _COMPAT_FEATURES[feature]
+    mode, selected_models = _compat_feature_values(ch, feature)
+    all_models = not selected_models
+    scope = "全部模型（含今后新增）" if all_models else f"仅 {len(selected_models)} 个已选模型"
+    if feature == "1m":
+        behavior = (
+            "自动：只透传下游已经请求的 1M 标志。\n"
+            "强制：命中范围时主动加入 <code>context-1m-2025-08-07</code>。"
+        )
+    else:
+        behavior = (
+            "自动：只透传下游已经请求的 Fast。\n"
+            "强制：Anthropic 写入 <code>speed=fast + fast-mode beta</code>；"
+            "OpenAI 写入 <code>service_tier=priority</code>。"
+        )
+    lines = [
+        f"{spec['title']} <b>[{ui.escape_html(ch.display_name)}]</b>",
+        "",
+        f"当前模式：<code>{'强制' if mode == FORCE_MODE else '自动（透传）'}</code>",
+        f"模型范围：<code>{scope}</code>",
+        "",
+        behavior,
+        "未命中范围的模型始终保持自动透传，不会被强制关闭。",
+    ]
+    if mode != FORCE_MODE:
+        lines += ["", "<i>模型范围可预先选择，切到强制模式后生效。</i>"]
+
+    rows = [[
+        ui.btn(f"{'●' if mode != FORCE_MODE else '○'} 自动（透传）", f"ch:cm:{short}:{feature}:auto"),
+        ui.btn(f"{'●' if mode == FORCE_MODE else '○'} 强制", f"ch:cm:{short}:{feature}:force"),
+    ]]
+    rows.append([
+        ui.btn(
+            f"{'●' if all_models else '○'} 全部模型（当前及未来）",
+            f"ch:ca:{short}:{feature}",
+        )
+    ])
+    for idx, model in enumerate(ch.models):
+        real = str(model.get("real") or "")
+        rows.append([
+            ui.btn(
+                _compat_model_label(model, real in selected_models, all_models),
+                f"ch:ct:{short}:{feature}:{idx}",
+            )
+        ])
+    rows.append([ui.btn("◀ 返回兼容配置", f"ch:cmp:{short}")])
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
+
+
+def on_compat_feature(
+    chat_id: int, message_id: int, cb_id: str, short: str, feature: str,
+) -> None:
+    ui.answer_cb(cb_id)
+    _render_compat_feature(chat_id, message_id, short, feature)
+
+
+def on_compat_feature_mode(
+    chat_id: int, message_id: int, cb_id: str,
+    short: str, feature: str, mode: str,
+) -> None:
+    name, ch = _resolve_compat_channel(short)
+    if ch is None or feature not in _COMPAT_FEATURES:
+        ui.answer_cb(cb_id, "渠道或设置不存在")
+        return
+    if feature == "1m" and _protocol_of(ch) != "anthropic":
+        ui.answer_cb(cb_id, "仅 Anthropic 渠道支持 1M 标志")
+        return
+    normalized = normalize_mode(mode)
+    spec = _COMPAT_FEATURES[feature]
+    registry.update_api_channel(name, {spec["mode_key"]: normalized})
+    ui.answer_cb(cb_id, "已设为强制" if normalized == FORCE_MODE else "已设为自动透传")
+    _render_compat_feature(chat_id, message_id, short, feature)
+
+
+def on_compat_feature_all_models(
+    chat_id: int, message_id: int, cb_id: str, short: str, feature: str,
+) -> None:
+    name, ch = _resolve_compat_channel(short)
+    if ch is None or feature not in _COMPAT_FEATURES:
+        ui.answer_cb(cb_id, "渠道或设置不存在")
+        return
+    if feature == "1m" and _protocol_of(ch) != "anthropic":
+        ui.answer_cb(cb_id, "仅 Anthropic 渠道支持 1M 标志")
+        return
+    spec = _COMPAT_FEATURES[feature]
+    registry.update_api_channel(name, {spec["models_key"]: []})
+    ui.answer_cb(cb_id, "已设为全部模型")
+    _render_compat_feature(chat_id, message_id, short, feature)
+
+
+def on_compat_feature_toggle_model(
+    chat_id: int, message_id: int, cb_id: str,
+    short: str, feature: str, idx_text: str,
+) -> None:
+    name, ch = _resolve_compat_channel(short)
+    if ch is None or feature not in _COMPAT_FEATURES:
+        ui.answer_cb(cb_id, "渠道或设置不存在")
+        return
+    if feature == "1m" and _protocol_of(ch) != "anthropic":
+        ui.answer_cb(cb_id, "仅 Anthropic 渠道支持 1M 标志")
+        return
+    try:
+        model = ch.models[int(idx_text)]
+        real = str(model.get("real") or "").strip()
+    except (ValueError, IndexError, TypeError):
+        ui.answer_cb(cb_id, "模型不存在")
+        return
+    if not real:
+        ui.answer_cb(cb_id, "模型名为空")
+        return
+
+    spec = _COMPAT_FEATURES[feature]
+    _, selected = _compat_feature_values(ch, feature)
+    if not selected:
+        # 从“全部模型”点某个模型时，直接切成“仅此模型”。
+        selected = [real]
+    elif real in selected:
+        if len(selected) == 1:
+            ui.answer_cb(cb_id, "至少保留一个；如需全部请点“全部模型”")
+            return
+        selected = [m for m in selected if m != real]
+    else:
+        selected.append(real)
+    registry.update_api_channel(name, {spec["models_key"]: selected})
+    ui.answer_cb(cb_id, "已更新模型范围")
+    _render_compat_feature(chat_id, message_id, short, feature)
 
 
 def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
@@ -1799,7 +2037,7 @@ def on_edit_omit_temperature_toggle(
         ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
         return
     ui.answer_cb(cb_id, "已切换")
-    on_edit_menu(chat_id, message_id, "-", short)
+    _render_compat_menu(chat_id, message_id, short)
 
 
 def on_edit_omit_thinking_toggle(
@@ -1818,7 +2056,7 @@ def on_edit_omit_thinking_toggle(
         ui.send(chat_id, f"❌ 切换失败: {ui.escape_html(str(exc))}")
         return
     ui.answer_cb(cb_id, "已切换")
-    on_edit_menu(chat_id, message_id, "-", short)
+    _render_compat_menu(chat_id, message_id, short)
 
 
 def _do_edit(chat_id: int, short: str, field: str, value: Any) -> tuple[bool, str]:
@@ -2058,6 +2296,24 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_edit_models(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:ecc:"):
         on_edit_cc_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:cmp:"):
+        on_compat_menu(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data.startswith("ch:cf:"):
+        parts = data.split(":")
+        if len(parts) == 4:
+            on_compat_feature(chat_id, message_id, cb_id, parts[2], parts[3]); return True
+    if data.startswith("ch:cm:"):
+        parts = data.split(":")
+        if len(parts) == 5:
+            on_compat_feature_mode(chat_id, message_id, cb_id, parts[2], parts[3], parts[4]); return True
+    if data.startswith("ch:ca:"):
+        parts = data.split(":")
+        if len(parts) == 4:
+            on_compat_feature_all_models(chat_id, message_id, cb_id, parts[2], parts[3]); return True
+    if data.startswith("ch:ct:"):
+        parts = data.split(":")
+        if len(parts) == 5:
+            on_compat_feature_toggle_model(chat_id, message_id, cb_id, parts[2], parts[3], parts[4]); return True
     if data.startswith("ch:eomit:"):
         on_edit_omit_temperature_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:ethink:"):

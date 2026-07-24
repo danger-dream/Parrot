@@ -7,6 +7,8 @@ callback_data 前缀：`sys:...`
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 import secrets
 import threading
 import time
@@ -90,12 +92,25 @@ def _main_text_and_kb() -> tuple[str, dict]:
     ws_enabled = bool((cfg.get("openai") or {}).get("responsesUpstreamWsForOAuth", False))
     ws_mode_label = "开" if ws_enabled else "关"
 
+    retry_transient = ((cfg.get("retry") or {}).get("transient") or {})
+    retry_enabled = bool(retry_transient.get("enabled", True))
+    try:
+        retry_extra = max(0, int(retry_transient.get("maxExtraAttempts", 2)))
+    except (TypeError, ValueError):
+        retry_extra = 2
+    retry_summary = (
+        f"候选按序故障转移 · 瞬时额外 {retry_extra} 次 · 仅首包前"
+        if retry_enabled and retry_extra > 0
+        else "候选按序故障转移 · 瞬时加试关闭"
+    )
+
     text = (
         "⚙ <b>系统设置</b>\n\n"
         f"超时: 连接 <code>{t.get('connect', 10)}s</code> | "
         f"首字 <code>{t.get('firstByte', 30)}s</code> | "
         f"空闲 <code>{t.get('idle', 30)}s</code> | "
         f"总 <code>{t.get('total', 600)}s</code>\n"
+        f"重试: {retry_summary}\n"
         f"错误阶梯: <code>{','.join(str(x) for x in (cfg.get('errorWindows') or []))}</code>\n"
         f"评分: α={sc.get('emaAlpha', 0.25)} · 窗口={sc.get('recentWindow', 50)} · "
         f"惩罚={sc.get('errorPenaltyFactor', 8)} · 探索={sc.get('explorationRate', 0.2)}\n"
@@ -149,7 +164,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🗣 翻译层", "tl:show")],
         [ui.btn("🗃 数据留存", "sys:show:retention"),
          ui.btn("🆕 版本更新", "menu:update")],
-        [ui.btn("◀ 返回主菜单", "menu:main")],
+        [ui.btn("🔁 重试设置", "sys:show:retry"),
+         ui.btn("◀ 返回主菜单", "menu:main")],
     ])
     return text, kb
 
@@ -163,6 +179,246 @@ def show(chat_id: int, message_id: int, cb_id: str) -> None:
 def send_new(chat_id: int) -> None:
     text, kb = _main_text_and_kb()
     ui.send(chat_id, text, reply_markup=kb)
+
+
+# ─── 重试设置 ───────────────────────────────────────────────────────
+
+_RETRY_TRANSIENT_EVENTS = [
+    ("openaiServerOverloaded", "OpenAI overload", "OpenAI <code>server_is_overloaded</code>"),
+    ("openaiServerError", "OpenAI server_error", "OpenAI <code>server_error</code>"),
+    ("claudeOverloaded", "Claude overload", "Claude <code>overloaded_error / HTTP 529</code>"),
+    ("xaiUnavailable", "xAI unavailable", "xAI <code>HTTP 503 / UNAVAILABLE</code>"),
+]
+_RETRY_RECOVERY_EVENTS = [
+    ("oauthRefresh", "OAuth 刷新", "OAuth 401/403：每个报错账号刷新后，原账号加试 1 次"),
+    ("invalidEncryptedContent", "EC 修复", "无效 encrypted_content：全请求移除后加试 1 次"),
+    ("claudeContext1mFallback", "1M 回退", "Claude 1M 权限不足：当前候选回退普通上下文加试 1 次"),
+]
+
+
+def _retry_sections() -> tuple[dict, dict]:
+    retry = config.get().get("retry") or {}
+    if not isinstance(retry, dict):
+        retry = {}
+    transient = retry.get("transient") or {}
+    recovery = retry.get("recovery") or {}
+    return (
+        transient if isinstance(transient, dict) else {},
+        recovery if isinstance(recovery, dict) else {},
+    )
+
+
+def _fmt_retry_delay(value) -> str:
+    try:
+        return f"{float(value):.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _retry_menu_text_kb() -> tuple[str, dict]:
+    transient, recovery = _retry_sections()
+    enabled = bool(transient.get("enabled", True))
+    try:
+        extra = max(0, int(transient.get("maxExtraAttempts", 2)))
+    except (TypeError, ValueError):
+        extra = 2
+    delays = transient.get("backoffSeconds") or [0.75, 1.75]
+    if not isinstance(delays, (list, tuple)):
+        delays = [0.75, 1.75]
+    delay_text = " → ".join(f"{_fmt_retry_delay(v)}s" for v in delays) or "0.75s → 1.75s"
+    error_flags = transient.get("errors") or {}
+    if not isinstance(error_flags, dict):
+        error_flags = {}
+
+    lines = [
+        "🔁 <b>重试设置</b>",
+        "",
+        "生效边界: <code>仅下游首个可见内容前</code>",
+        "候选故障转移: <code>✅ 已启用</code> · 数量随当次候选动态变化",
+        f"瞬时额外机会: <code>全请求共享 {extra} 次</code>",
+        f"退避: <code>{delay_text}</code>（各加 0–0.25s 抖动）",
+        "",
+        "<i>当前账号 / 渠道 → 命中瞬时错误时原候选加试 → 仍失败则继续后续账号 / 渠道 → 全部候选耗尽才返回错误</i>",
+        "",
+        "<b>核心故障转移（次数动态）</b>",
+        "✅ 账号 / 渠道：按调度顺序尝试当次全部可用候选",
+        "✅ 代理路由：连接失败时按代理组顺序继续尝试",
+        "",
+        "<b>同候选瞬时加试（共享次数 + 退避）</b>",
+    ]
+    for key, _button_label, description in _RETRY_TRANSIENT_EVENTS:
+        selected = bool(error_flags.get(key, True))
+        if selected and enabled and extra > 0:
+            mark = "✅"
+        elif selected:
+            mark = "⏸"
+        else:
+            mark = "🚫"
+        lines.append(f"{mark} {description}")
+
+    lines.extend(["", "<b>鉴权与请求修复（独立防循环）</b>"])
+    for key, _button_label, description in _RETRY_RECOVERY_EVENTS:
+        lines.append(f"{'✅' if recovery.get(key, True) else '🚫'} {description}")
+    lines.extend([
+        "",
+        "<i>“额外机会”只限制瞬时错误的原候选加试，不会截断后续账号 / 渠道。"
+        "OAuth 刷新若仍失败会继续后续候选；EC 仍无效则按请求错误返回；并发排队不计作重试。"
+        "退避项少于额外机会时，后续加试沿用最后一项。</i>",
+    ])
+
+    rows: list[list[dict]] = [
+        [ui.btn("✅ 瞬时加试：开启" if enabled else "🚫 瞬时加试：关闭", "sys:retry:toggle_transient"),
+         ui.btn("ℹ 候选切换：全部", "sys:retry:failover_info")],
+        [ui.btn(f"✏ 额外机会：{extra}", "sys:retry:edit_attempts"),
+         ui.btn("✏ 退避：" + ",".join(_fmt_retry_delay(v) for v in delays), "sys:retry:edit_backoff")],
+    ]
+    for offset in range(0, len(_RETRY_TRANSIENT_EVENTS), 2):
+        row = []
+        for key, label, _description in _RETRY_TRANSIENT_EVENTS[offset:offset + 2]:
+            row.append(ui.btn(
+                f"{'☑' if error_flags.get(key, True) else '☐'} {label}",
+                f"sys:retry:toggle_error:{key}",
+            ))
+        rows.append(row)
+    for offset in range(0, len(_RETRY_RECOVERY_EVENTS), 2):
+        row = []
+        for key, label, _description in _RETRY_RECOVERY_EVENTS[offset:offset + 2]:
+            row.append(ui.btn(
+                f"{'☑' if recovery.get(key, True) else '☐'} {label}",
+                f"sys:retry:toggle_recovery:{key}",
+            ))
+        rows.append(row)
+    rows.append([ui.btn("◀ 返回系统设置", "menu:settings")])
+    return "\n".join(lines), ui.inline_kb(rows)
+
+
+def _show_retry(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    text, kb = _retry_menu_text_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _toggle_retry_transient(chat_id: int, message_id: int, cb_id: str) -> None:
+    transient, _ = _retry_sections()
+    new_value = not bool(transient.get("enabled", True))
+    config.update(
+        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__("enabled", new_value)
+    )
+    ui.answer_cb(cb_id, "瞬时加试已开启" if new_value else "瞬时加试已关闭")
+    _show_retry(chat_id, message_id, "-")
+
+
+def _toggle_retry_item(chat_id: int, message_id: int, cb_id: str, *, group: str, key: str) -> None:
+    valid = (
+        {item[0] for item in _RETRY_TRANSIENT_EVENTS}
+        if group == "errors"
+        else {item[0] for item in _RETRY_RECOVERY_EVENTS}
+    )
+    if key not in valid:
+        ui.answer_cb(cb_id, "未知重试项", show_alert=True)
+        return
+    transient, recovery = _retry_sections()
+    current = (
+        bool((transient.get("errors") or {}).get(key, True))
+        if group == "errors"
+        else bool(recovery.get(key, True))
+    )
+    new_value = not current
+
+    def _mutate(c):
+        retry = c.setdefault("retry", {})
+        if group == "errors":
+            retry.setdefault("transient", {}).setdefault("errors", {})[key] = new_value
+        else:
+            retry.setdefault("recovery", {})[key] = new_value
+
+    config.update(_mutate)
+    ui.answer_cb(cb_id, "已开启" if new_value else "已关闭")
+    _show_retry(chat_id, message_id, "-")
+
+
+def _edit_retry_attempts(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    transient, _ = _retry_sections()
+    current = transient.get("maxExtraAttempts", 2)
+    states.set_state(chat_id, "sys_retry_attempts")
+    ui.edit(
+        chat_id,
+        message_id,
+        "请输入全请求共享的瞬时错误额外机会数：\n\n"
+        "• 范围 <code>1–5</code>\n"
+        "• 不会按账号／渠道数量倍增\n"
+        "• 设为关闭请使用菜单中的总开关\n\n"
+        f"当前：<code>{ui.escape_html(str(current))}</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:retry")]]),
+    )
+
+
+def _on_retry_attempts_input(chat_id: int, text: str) -> None:
+    try:
+        value = int((text or "").strip())
+    except (TypeError, ValueError):
+        ui.send(chat_id, "❌ 请输入 1–5 的整数：")
+        return
+    if value < 1 or value > 5:
+        ui.send(chat_id, "❌ 额外机会需在 1–5 之间，请重新输入：")
+        return
+    config.update(
+        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__("maxExtraAttempts", value)
+    )
+    states.pop_state(chat_id)
+    ui.send_result(
+        chat_id,
+        f"✅ 瞬时错误额外机会已更新为 <code>{value}</code> 次（全请求共享）",
+        back_label="◀ 返回重试设置",
+        back_callback="sys:show:retry",
+    )
+
+
+def _edit_retry_backoff(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    transient, _ = _retry_sections()
+    current = transient.get("backoffSeconds") or [0.75, 1.75]
+    states.set_state(chat_id, "sys_retry_backoff")
+    ui.edit(
+        chat_id,
+        message_id,
+        "请输入瞬时加试退避秒数，以逗号分隔：\n\n"
+        "• 1–5 项，每项范围 <code>0–60</code> 秒\n"
+        "• 每次实际等待会另加 0–0.25 秒抖动\n"
+        "• 项数不足时，后续加试沿用最后一项\n\n"
+        f"当前：<code>{ui.escape_html(','.join(_fmt_retry_delay(v) for v in current))}</code>\n"
+        "示例：<code>0.75,1.75</code>",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "sys:show:retry")]]),
+    )
+
+
+def _on_retry_backoff_input(chat_id: int, text: str) -> None:
+    raw = [part for part in re.split(r"[,，;；\s]+", (text or "").strip()) if part]
+    if not raw or len(raw) > 5:
+        ui.send(chat_id, "❌ 请输入 1–5 个退避秒数：")
+        return
+    values: list[float] = []
+    try:
+        for part in raw:
+            value = float(part)
+            if not math.isfinite(value) or value < 0 or value > 60:
+                raise ValueError
+            values.append(round(value, 3))
+    except (TypeError, ValueError):
+        ui.send(chat_id, "❌ 每项必须是 0–60 之间的数字，请重新输入：")
+        return
+    config.update(
+        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__("backoffSeconds", values)
+    )
+    states.pop_state(chat_id)
+    formatted = ",".join(_fmt_retry_delay(v) for v in values)
+    ui.send_result(
+        chat_id,
+        f"✅ 瞬时加试退避已更新为 <code>{formatted}</code> 秒",
+        back_label="◀ 返回重试设置",
+        back_callback="sys:show:retry",
+    )
 
 
 # ─── 请求日志数据留存 ───────────────────────────────────────────────
@@ -1061,6 +1317,7 @@ _NOTIF_EVENTS = [
     ("channel_recovered",     "✅ 渠道恢复"),
     ("quota_disabled",        "⚠ 配额禁用"),
     ("quota_resumed",         "✅ 配额恢复"),
+    ("quota_cooldown",        "🟠 配额冷却"),
     ("oauth_refreshed",       "🔄 OAuth Token 刷新成功"),
     ("oauth_refresh_failed",  "❌ OAuth Token 刷新失败"),
     ("no_channels",           "🚨 无可用渠道告警"),
@@ -1878,6 +2135,34 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("sys:retention:cancel:"):
         _cancel_retention(chat_id, message_id, cb_id, data.split(":", 3)[3]); return True
 
+    # 重试设置：核心候选/代理故障转移始终保留，仅配置首包前加试和独立恢复分支。
+    if data == "sys:show:retry":
+        _show_retry(chat_id, message_id, cb_id); return True
+    if data == "sys:retry:toggle_transient":
+        _toggle_retry_transient(chat_id, message_id, cb_id); return True
+    if data == "sys:retry:failover_info":
+        ui.answer_cb(
+            cb_id,
+            "账号／渠道会按调度顺序尝试当次全部可用候选；代理组按路由顺序处理连接失败。"
+            "这些核心故障转移不会被瞬时加试总开关截断。",
+            show_alert=True,
+        )
+        return True
+    if data == "sys:retry:edit_attempts":
+        _edit_retry_attempts(chat_id, message_id, cb_id); return True
+    if data == "sys:retry:edit_backoff":
+        _edit_retry_backoff(chat_id, message_id, cb_id); return True
+    if data.startswith("sys:retry:toggle_error:"):
+        _toggle_retry_item(
+            chat_id, message_id, cb_id,
+            group="errors", key=data.split(":", 3)[3],
+        ); return True
+    if data.startswith("sys:retry:toggle_recovery:"):
+        _toggle_retry_item(
+            chat_id, message_id, cb_id,
+            group="recovery", key=data.split(":", 3)[3],
+        ); return True
+
     if data == "sys:show:timeouts":  _show_timeouts(chat_id, message_id, cb_id); return True
     if data == "sys:edit:timeouts":  _edit_timeouts(chat_id, message_id, cb_id); return True
     if data == "sys:show:errwin":    _show_errwin(chat_id, message_id, cb_id); return True
@@ -1965,6 +2250,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
     if action == "sys_retention_days":
         _on_retention_days_input(chat_id, text); return True
+    if action == "sys_retry_attempts":
+        _on_retry_attempts_input(chat_id, text); return True
+    if action == "sys_retry_backoff":
+        _on_retry_backoff_input(chat_id, text); return True
     if action == "sys_timeouts":
         _on_timeouts_input(chat_id, text); return True
     if action == "sys_errwin":

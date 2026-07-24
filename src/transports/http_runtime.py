@@ -781,6 +781,26 @@ async def prepare_stream_response_start(
             )
         if pre_visible_error:
             await close_response_context(ctx)
+            # A Responses ``response.incomplete`` before any downstream-visible
+            # bytes can be surfaced by the commit gate as a pre-commit error.
+            # ``max_output_tokens`` is request/context-budget scoped, not an
+            # unhealthy upstream: preserve its normalized 400 semantics so the
+            # failover loop does not cool down the only eligible channel.
+            if protocol_errors.is_responses_max_output_incomplete(pre_visible_error):
+                message = protocol_errors.responses_max_output_context_error_message(
+                    protocol_errors.responses_incomplete_reason(pre_visible_error)
+                )
+                return HttpStreamStartResult(
+                    error=_attach_precommit_response(AttemptResult(
+                        outcome="request_invalid",
+                        connect_ms=connect_ms,
+                        first_byte_ms=first_byte_ms,
+                        http_status=400,
+                        error_code=protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE,
+                        error_detail=message,
+                        translator_ctx=translator_ctx,
+                    ))
+                )
             return HttpStreamStartResult(
                 error=_attach_precommit_response(AttemptResult(
                     outcome="upstream_error_json",

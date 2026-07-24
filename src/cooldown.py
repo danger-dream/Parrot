@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 from typing import Optional
 
-from . import config, notifier, state_db
+from . import config, notifier, quota_errors, state_db
 
 
 _INF = -1  # state.db 中用 -1 表示永久
@@ -27,17 +28,56 @@ def init() -> None:
     if _initialized:
         return
     rows = state_db.error_load_all()
+    channel_cfg = {
+        f"api:{entry.get('name')}": entry
+        for entry in (config.get().get("channels") or [])
+        if isinstance(entry, dict) and entry.get("name")
+    }
+    upgraded_quota = 0
     with _lock:
         _entries.clear()
         for row in rows:
-            key = (row["channel_key"], row["model"])
+            channel_key = row["channel_key"]
+            model = row["model"]
+            message = row["last_error_message"]
+            cooldown_until = row["cooldown_until"]
+
+            # Upgrade an already-recorded Zhipu 1310 from the old one-minute
+            # ladder cooldown to its still-future upstream reset time.  This is
+            # scoped by the configured BigModel host and exact stored 429/code,
+            # so ordinary rate limits and other providers remain untouched.
+            entry = channel_cfg.get(channel_key) or {}
+            if cooldown_until != _INF and str(message or "").lstrip().startswith("HTTP 429:"):
+                reset_ms = quota_errors.zhipu_1310_reset_ms(
+                    SimpleNamespace(
+                        base_url=entry.get("baseUrl") or "",
+                        provider=entry.get("provider") or "",
+                    ),
+                    http_status=429,
+                    error_detail=message,
+                )
+                if reset_ms is not None and (
+                    cooldown_until is None or int(cooldown_until) < reset_ms
+                ):
+                    cooldown_until = reset_ms
+                    state_db.error_save(
+                        channel_key,
+                        model,
+                        int(row["error_count"] or 0),
+                        cooldown_until,
+                        message,
+                    )
+                    upgraded_quota += 1
+
+            key = (channel_key, model)
             _entries[key] = {
                 "error_count": int(row["error_count"] or 0),
-                "cooldown_until": row["cooldown_until"],
-                "last_error_message": row["last_error_message"],
+                "cooldown_until": cooldown_until,
+                "last_error_message": message,
             }
     _initialized = True
-    print(f"[cooldown] loaded {len(rows)} entries from state.db")
+    suffix = f"; upgraded {upgraded_quota} Zhipu quota cooldown(s)" if upgraded_quota else ""
+    print(f"[cooldown] loaded {len(rows)} entries from state.db{suffix}")
 
 
 def _windows() -> list[int]:

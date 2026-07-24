@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 import traceback
 import uuid
@@ -25,7 +26,7 @@ import threading
 
 from . import (
     affinity, blacklist, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
-    local_web_tools, log_db, model_metadata, notifier, oauth_manager, scorer, state_db,
+    local_web_tools, log_db, model_metadata, notifier, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
 from .channel.base import Channel
@@ -50,16 +51,25 @@ from .protocols import finalize as finalize_policy
 from .protocols import errors as protocol_errors
 from .protocols.runtime import (
     AttemptResult,
+    DEFAULT_TRANSIENT_RETRY_DELAYS_S,
+    MAX_CONFIGURED_TRANSIENT_RETRIES,
     apply_non_stream_response_translator,
+    configured_transient_retry_delays,
     failover_final_http_status,
     is_context_1m_credit_error,
     is_responses_ws_visible_event_type,
     json_error_for_ingress,
     make_stream_translator,
+    parse_retry_after_seconds,
     prepare_non_stream_response,
+    recovery_retry_allowed,
     is_context_length_exceeded_error,
     is_invalid_encrypted_content_error,
+    retryable_transient_error_kind,
     responses_ws_error_detail,
+    transient_retry_allowed,
+    transient_retry_config,
+    transient_retry_limit,
     request_invalid_result_if_needed,
     retry_body_without_encrypted_content,
     retry_body_without_context_1m,
@@ -581,6 +591,11 @@ def _retry_body_without_context_1m(body: dict) -> dict:
     return retry_body_without_context_1m(body)
 
 
+def _channel_forces_context_1m(ch: Channel, resolved_model: str) -> bool:
+    check = getattr(ch, "forces_context_1m", None)
+    return bool(callable(check) and check(resolved_model))
+
+
 def _proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
     return transport_policy.proxy_route_kwargs(ch, resolved_model)
 
@@ -649,6 +664,97 @@ def _elapsed_ms(start_monotonic: float) -> int:
     return max(0, int((time.monotonic() - start_monotonic) * 1000))
 
 
+# Only explicit transient provider signals are retried on the same candidate.
+# The request-scoped budget prevents candidate count from multiplying retries.
+_DEFAULT_TRANSIENT_RETRY_DELAYS_S = DEFAULT_TRANSIENT_RETRY_DELAYS_S
+_MAX_CONFIGURED_TRANSIENT_RETRIES = MAX_CONFIGURED_TRANSIENT_RETRIES
+
+
+def _effective_retry_cfg(cfg: Optional[dict] = None) -> dict:
+    return cfg if isinstance(cfg, dict) else config.get()
+
+
+def _transient_retry_config(cfg: Optional[dict] = None) -> dict:
+    return transient_retry_config(_effective_retry_cfg(cfg))
+
+
+def _transient_retry_limit(cfg: Optional[dict] = None) -> int:
+    return transient_retry_limit(_effective_retry_cfg(cfg))
+
+
+def _transient_retry_allowed(kind: str | None, cfg: Optional[dict] = None) -> bool:
+    return transient_retry_allowed(kind, _effective_retry_cfg(cfg))
+
+
+def _recovery_retry_allowed(name: str, cfg: Optional[dict] = None) -> bool:
+    return recovery_retry_allowed(name, _effective_retry_cfg(cfg))
+
+
+def _configured_transient_retry_delays() -> tuple[float, ...]:
+    return configured_transient_retry_delays(config.get())
+
+
+def _overload_retry_delay_seconds(retry_ordinal: int) -> float:
+    """Compatibility-named delay hook, now shared by all transient retry kinds."""
+    delays = _configured_transient_retry_delays()
+    index = min(max(0, int(retry_ordinal)), len(delays) - 1)
+    return delays[index] + random.uniform(0.0, 0.25)
+
+
+async def _wait_for_overload_retry(
+    retry_ordinal: int,
+    deadline_ts: float,
+    *,
+    retry_after_seconds: float | None = None,
+) -> float | None:
+    """Wait Retry-After or configured jittered backoff within the request deadline."""
+    if retry_after_seconds is None:
+        delay = _overload_retry_delay_seconds(retry_ordinal)
+    else:
+        parsed = parse_retry_after_seconds(retry_after_seconds)
+        delay = (
+            _overload_retry_delay_seconds(retry_ordinal)
+            if parsed is None
+            else parsed
+        )
+    if deadline_ts > 0 and time.time() + delay >= deadline_ts:
+        return None
+    await asyncio.sleep(delay)
+    return delay
+
+
+def _notify_zhipu_quota_cooldown(ch: Channel, model: str, reset_ms: int) -> None:
+    """Best-effort TG notice with a direct link to an API channel's detail page."""
+    channel_name = str(getattr(ch, "display_name", None) or getattr(ch, "key", "?"))
+    reset_text = quota_errors.format_bjt_ms(reset_ms)
+    ek = notifier.escape_html
+    reply_markup = None
+    if getattr(ch, "type", "") == "api":
+        try:
+            from .telegram import ui as telegram_ui
+            short = telegram_ui.register_code(channel_name)
+            reply_markup = telegram_ui.inline_kb([
+                [telegram_ui.btn("🔀 查看渠道详情", f"ch:view:{short}:1")],
+            ])
+        except Exception:
+            reply_markup = None
+    notifier.throttled_notify_event_sync(
+        "quota_cooldown",
+        f"quota_cooldown:{getattr(ch, 'key', channel_name)}:{model}:{reset_ms}",
+        "🟠 <b>渠道模型进入配额冷却</b>\n"
+        f"渠道: <code>{ek(channel_name)}</code>\n"
+        f"模型: <code>{ek(model)}</code>\n"
+        "原因: <b>周/月使用额度已达上限</b>（上游 <code>1310</code>）\n"
+        f"自动恢复: <code>{ek(reset_text)}</code>（北京时间）\n\n"
+        "<b>调度影响</b>\n"
+        f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
+        "同模型的其他渠道仍可继续承接请求。\n\n"
+        "<i>这不是手动禁用，也不是永久冻结。到达上游给出的重置时间后自动恢复调度。</i>",
+        cooldown_seconds=86_400,
+        reply_markup=reply_markup,
+    )
+
+
 def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
     return protocol_errors.classify_attempt_outcome(outcome, http_status).anthropic_error_type
 
@@ -656,6 +762,22 @@ def _err_type_from_outcome(outcome: str, http_status: Optional[int]) -> str:
 def _pick_upstream_headers(resp: httpx.Response) -> dict:
     """转发部分上游 headers 到下游（限定范围）。"""
     return metadata_from_response(resp).forward_headers()
+
+
+def _attach_retry_after_from_response(
+    result: AttemptResult,
+    response: httpx.Response | None,
+) -> AttemptResult:
+    if result.retry_after_seconds is not None or response is None:
+        return result
+    try:
+        raw = response.headers.get("Retry-After")
+    except Exception:
+        raw = None
+    parsed = parse_retry_after_seconds(raw)
+    if parsed is not None:
+        result.retry_after_seconds = parsed
+    return result
 
 
 def _response_body_text(response: Response) -> str | None:
@@ -1153,6 +1275,10 @@ async def run_failover(
     local_web_limit_reported = False
 
     retry_count = 0
+    # Shared across the whole request: changing candidates must not replenish
+    # the configured same-candidate transient retry budget.
+    transient_retry_limit = _transient_retry_limit(cfg)
+    transient_retries_used = 0
     refreshed_once: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
     retried_without_encrypted_content = False
@@ -1437,7 +1563,8 @@ async def run_failover(
         if result.outcome == "request_invalid":
             msg = result.error_detail or "invalid request"
             if (
-                _is_invalid_encrypted_content_error(msg)
+                _recovery_retry_allowed("invalidEncryptedContent", cfg)
+                and _is_invalid_encrypted_content_error(msg)
                 and not retried_without_encrypted_content
             ):
                 cleared_replay = _maybe_clear_codex_reasoning_replay(result.translator_ctx)
@@ -1481,7 +1608,8 @@ async def run_failover(
 
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
-            ch.type == "oauth"
+            _recovery_retry_allowed("oauthRefresh", cfg)
+            and ch.type == "oauth"
             and result.http_status in (401, 403)
             and ch.key not in refreshed_once
         ):
@@ -1513,11 +1641,13 @@ async def run_failover(
                     pass
                 # fallthrough 到普通失败处理
 
-        # Sonnet 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m 重试一次，
-        # 避免显式 1M 下游持续请求时把健康渠道打进 cooldown/禁用。
+        # 自动透传的 1M entitlement 不足不是渠道故障：同渠道去掉 context-1m
+        # 重试一次；渠道明确强制 1M 时不能反向撤销该兼容策略。
         context_retry_key = (ch.key, resolved_model)
         if (
-            _is_context_1m_credit_error(result, resolved_model, body)
+            _recovery_retry_allowed("claudeContext1mFallback", cfg)
+            and not _channel_forces_context_1m(ch, resolved_model)
+            and _is_context_1m_credit_error(result, resolved_model, body)
             and context_retry_key not in retried_without_context_1m
         ):
             retried_without_context_1m.add(context_retry_key)
@@ -1525,6 +1655,61 @@ async def run_failover(
             print(f"[failover] context-1m rejected for {ch.key}/{resolved_model}; retrying same channel without context-1m")
             retry_count += 1
             continue
+
+        # Zhipu's explicit weekly/monthly quota signal is not a short rate limit.
+        # Park only this channel/model until the validated upstream reset time,
+        # then continue the normal candidate failover without disabling the channel.
+        quota_reset_ms = quota_errors.zhipu_1310_reset_ms(
+            ch,
+            http_status=result.http_status,
+            error_detail=result.error_detail,
+        )
+        if quota_reset_ms is not None:
+            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            if plan.record_cooldown_error:
+                cooldown.record_error(
+                    ch.key,
+                    resolved_model,
+                    result.error_detail,
+                    cooldown_until=quota_reset_ms,
+                )
+            if plan.record_failure:
+                scorer.record_failure(
+                    ch.key,
+                    resolved_model,
+                    connect_ms=_scorer_connect_ms(result),
+                )
+            try:
+                _notify_zhipu_quota_cooldown(ch, resolved_model, quota_reset_ms)
+            except Exception as exc:
+                print(f"[failover] quota cooldown notification failed for {ch.key}: {exc}")
+            retry_count += 1
+            idx += 1
+            continue
+
+        # OpenAI server_is_overloaded/server_error, Claude overloaded_error/529,
+        # and direct xAI 503 are explicit transient signals.  The slot is already
+        # released, so backoff does not occupy channel concurrency.  Intermediate
+        # retries do not score/cool down; the terminal failure below does so once.
+        transient_kind = retryable_transient_error_kind(ch, result)
+        if (
+            transient_retries_used < transient_retry_limit
+            and _transient_retry_allowed(transient_kind, cfg)
+        ):
+            delay = await _wait_for_overload_retry(
+                transient_retries_used,
+                deadline_ts,
+                retry_after_seconds=result.retry_after_seconds,
+            )
+            if delay is not None:
+                transient_retries_used += 1
+                retry_count += 1
+                print(
+                    f"[failover] transient {transient_kind} on {ch.key}/{resolved_model}; "
+                    f"retrying same channel ({transient_retries_used}/"
+                    f"{transient_retry_limit}) after {delay:.2f}s"
+                )
+                continue
 
         # 普通失败处理
         plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
@@ -2288,6 +2473,10 @@ async def _try_openai_oauth_responses_ws_channel(
                 retry_attempt_id=retry_attempt_id,
                 attempt_start_monotonic=attempt_start_monotonic,
             )
+            result = _attach_retry_after_from_response(
+                result,
+                getattr(upstream_ws, "response", None),
+            )
             if result.stream_started and isinstance(result.response, StreamingResponse):
                 # The post-commit generator owns WS + round terminalization.
                 upstream_ws = None
@@ -2332,6 +2521,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 proxy_name=proxy_name,
             )
         except InvalidStatus as exc:
+            invalid_response = getattr(exc, "response", None)
             status, detail = _invalid_ws_status_detail(exc)
             last_error = AttemptResult(
                 outcome="http_auth_error" if status in (401, 403) else "http_error",
@@ -2339,6 +2529,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 http_status=status,
                 proxy_name=proxy_name,
             )
+            last_error = _attach_retry_after_from_response(last_error, invalid_response)
         except Exception as exc:
             connected = timing.connection_complete
             last_error = AttemptResult(
@@ -2401,6 +2592,7 @@ async def _consume_oauth_responses_ws(
 ) -> AttemptResult:
     tracker = _WsResponsesTracker(ch)
     try:
+        log_db.update_pending_fast_mode_from_upstream(request_id, first_frame)
         proxy_bytes.count(up=_frame_size(first_frame))
         await wait_ws_round_io(
             upstream_ws.send(first_frame),
@@ -2537,6 +2729,7 @@ async def _recv_oauth_ws_until_visible(
     return step.pending, AttemptResult(
         outcome=step.outcome,
         error_detail=step.error_detail,
+        error_code=step.error_code,
         http_status=step.http_status,
         stream_started=step.stream_started,
     ), step.first_packet_ms
@@ -3136,6 +3329,9 @@ async def _try_channel(
         upstream_req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol=ingress_protocol,
         )
+        log_db.update_pending_fast_mode_from_upstream(
+            request_id, upstream_req.body, upstream_req.headers,
+        )
     except Exception as exc:
         # GuardError（OpenAI 跨变体死角）带 .status / .err_type / .message 属性；
         # scope=request 表示请求级 guard，可短路到客户端 4xx；scope=candidate
@@ -3201,6 +3397,7 @@ async def _try_channel(
                 proxy_bytes=_proxy_bytes,
                 translator_ctx=upstream_req.translator_ctx,
             )
+            result = _attach_retry_after_from_response(result, upstream_resp)
             result = _request_invalid_result_if_needed(result)
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
@@ -3223,6 +3420,7 @@ async def _try_channel(
                 round_timeouts=opened.round_timeouts,
                 start_monotonic=start_monotonic,
             )
+            result = _attach_retry_after_from_response(result, upstream_resp)
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
             return result
@@ -3248,6 +3446,7 @@ async def _try_channel(
             start_monotonic=start_monotonic,
             attempt_start_monotonic=attempt_start_monotonic,
         )
+        result = _attach_retry_after_from_response(result, upstream_resp)
         if not result.stream_started:
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
@@ -3678,34 +3877,41 @@ async def _consume_stream(
             and bool(getattr(tracker, "saw_stream_end", False))
         )
 
-    async def _persist_stream_retry(outcome: str, error_detail: str | None = None):
+    def _finish_stream_timing(outcome: str, error_detail: str | None = None):
         if timing is None:
             return None
-        snapshot = (
+        return (
             finalize_opened_http_response(opened_response, outcome, error_detail)
             if opened_response is not None
             else timing.finish(outcome, error_detail)
         )
-        if retry_attempt_id is not None:
-            await asyncio.shield(asyncio.to_thread(
-                log_db.update_retry_attempt,
-                retry_attempt_id,
-                final_round_id=snapshot.round_id,
-                connect_ms=snapshot.connect_ms,
-                first_byte_ms=snapshot.first_byte_ms,
-                idle_ms=snapshot.idle_ms,
-                attempt_elapsed_ms=_elapsed_ms(attempt_start_monotonic),
-                request_upload_ms=snapshot.request_upload_ms,
-                response_headers_wait_ms=snapshot.response_headers_wait_ms,
-                response_body_first_byte_wait_ms=snapshot.response_body_first_byte_wait_ms,
-                total_ms=snapshot.total_ms,
-                ended_at=time.time(),
-                outcome=outcome,
-                error_detail=(error_detail or "")[:4000] if error_detail else None,
-                proxy_name=proxy_name,
-                bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
-                bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
-            ))
+
+    async def _persist_stream_retry_attempt(snapshot, outcome: str, error_detail: str | None = None):
+        if snapshot is None or retry_attempt_id is None:
+            return
+        await asyncio.shield(asyncio.to_thread(
+            log_db.update_retry_attempt,
+            retry_attempt_id,
+            final_round_id=snapshot.round_id,
+            connect_ms=snapshot.connect_ms,
+            first_byte_ms=snapshot.first_byte_ms,
+            idle_ms=snapshot.idle_ms,
+            attempt_elapsed_ms=_elapsed_ms(attempt_start_monotonic),
+            request_upload_ms=snapshot.request_upload_ms,
+            response_headers_wait_ms=snapshot.response_headers_wait_ms,
+            response_body_first_byte_wait_ms=snapshot.response_body_first_byte_wait_ms,
+            total_ms=snapshot.total_ms,
+            ended_at=time.time(),
+            outcome=outcome,
+            error_detail=(error_detail or "")[:4000] if error_detail else None,
+            proxy_name=proxy_name,
+            bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
+            bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
+        ))
+
+    async def _persist_stream_retry(outcome: str, error_detail: str | None = None):
+        snapshot = _finish_stream_timing(outcome, error_detail)
+        await _persist_stream_retry_attempt(snapshot, outcome, error_detail)
         return snapshot
 
     async def _finalize_success():
@@ -3919,8 +4125,14 @@ async def _consume_stream(
             return
         state["finalized"] = True
         request_elapsed_ms = _elapsed_ms(start_monotonic)
-        timing_snapshot = await _persist_stream_retry("client_disconnected", "client disconnected")
-        await asyncio.shield(asyncio.to_thread(
+        # The outer request record is the user-visible terminal truth.  Persist
+        # it before the retry-chain bookkeeping: a disconnect can interrupt the
+        # latter after it has been written, which otherwise leaves request_log
+        # pending until the stale-record cleaner falsely calls it a crash.
+        timing_snapshot = _finish_stream_timing(
+            "client_disconnected", "client disconnected",
+        )
+        await await_ws_owned(asyncio.to_thread(
             log_db.finish_error,
             request_id, "client disconnected", retry_count_so_far,
             final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
@@ -3929,7 +4141,7 @@ async def _consume_stream(
             total_ms=(timing_snapshot.total_ms if timing_snapshot is not None else None),
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
-            http_status=upstream_status, affinity_hit=affinity_hit,
+            http_status=499, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(), status="cancelled",
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
@@ -3937,6 +4149,9 @@ async def _consume_stream(
             proxy_bytes_down=_proxy_byte_snapshot(proxy_bytes)[1],
             **_timing_stage_kwargs(timing, terminal=True),
         ))
+        await _persist_stream_retry_attempt(
+            timing_snapshot, "client_disconnected", "client disconnected",
+        )
 
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""

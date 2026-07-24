@@ -2301,16 +2301,57 @@ def _iter_month_conns_all(since_ts: float):
 
 def cleanup_stale_pending(timeout_seconds: int = 1800) -> int:
     cutoff = time.time() - timeout_seconds
+    finished_at = time.time()
     with _write_lock:
-        cur = _get_conn().execute(
+        conn = _get_conn()
+        # A cancelled downstream stream can have already terminalized either
+        # its retry-chain row or only its final proxy-route row when
+        # cancellation interrupts the outer request-log write.  Keep that known
+        # client outcome instead of fabricating a process crash; truly orphaned
+        # pending rows retain the old diagnosis.
+        cur = conn.execute(
             """UPDATE request_log
-               SET status='error',
-                   error_message='process crashed (stale pending)',
+               SET status=CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM retry_chain rc
+                           WHERE rc.request_id=request_log.request_id
+                             AND rc.outcome='client_disconnected'
+                       ) OR EXISTS (
+                           SELECT 1 FROM proxy_chain pc
+                           WHERE pc.request_id=request_log.request_id
+                             AND pc.outcome='client_disconnected'
+                       ) THEN 'cancelled'
+                       ELSE 'error'
+                   END,
+                   error_message=CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM retry_chain rc
+                           WHERE rc.request_id=request_log.request_id
+                             AND rc.outcome='client_disconnected'
+                       ) OR EXISTS (
+                           SELECT 1 FROM proxy_chain pc
+                           WHERE pc.request_id=request_log.request_id
+                             AND pc.outcome='client_disconnected'
+                       ) THEN 'client disconnected'
+                       ELSE 'process crashed (stale pending)'
+                   END,
+                   http_status=CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM retry_chain rc
+                           WHERE rc.request_id=request_log.request_id
+                             AND rc.outcome='client_disconnected'
+                       ) OR EXISTS (
+                           SELECT 1 FROM proxy_chain pc
+                           WHERE pc.request_id=request_log.request_id
+                             AND pc.outcome='client_disconnected'
+                       ) THEN 499
+                       ELSE http_status
+                   END,
                    finished_at=?
                WHERE status='pending' AND created_at < ?""",
-            (time.time(), cutoff),
+            (finished_at, cutoff),
         )
-        _get_conn().commit()
+        conn.commit()
         return cur.rowcount
 
 
@@ -3115,6 +3156,41 @@ def extract_fast_mode(
             return True
 
     return False
+
+
+def update_pending_fast_mode_from_upstream(
+    request_id: str | RequestLogHandle,
+    upstream_body: dict | str | bytes | bytearray | None,
+    upstream_headers: dict | None = None,
+) -> bool | None:
+    """Sync the summary Fast badge from the actual upstream wire payload.
+
+    ``request_detail.request_body`` deliberately remains the sanitized downstream
+    request.  Only ``request_log.fast_mode`` is refreshed, so candidate failover
+    can replace a previous candidate's forced mode with the mode actually used by
+    the next candidate.
+
+    Returns the detected state, or ``None`` when the payload is not a JSON object
+    and therefore cannot authoritatively replace the current summary value.
+    """
+    payload = upstream_body
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = bytes(payload).decode("utf-8")
+        except Exception:
+            return None
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return None
+    if not isinstance(payload, dict):
+        return None
+
+    enabled = extract_fast_mode(payload, headers=upstream_headers)
+    update_pending(request_id, fast_mode=1 if enabled else 0)
+    return enabled
+
 
 
 def extract_reasoning_effort(body: dict, ingress_protocol: str = "anthropic") -> str | None:

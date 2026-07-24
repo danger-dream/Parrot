@@ -19,7 +19,7 @@ from typing import Awaitable, Callable, Optional
 
 import httpx
 
-from . import config, cooldown, network
+from . import config, cooldown, network, quota_errors
 from .channel import registry
 from .channel.base import Channel
 
@@ -247,6 +247,11 @@ async def recovery_run_once() -> int:
     cleared = 0
     now_ms = int(time.time() * 1000)
     for entry in cooldown.active_entries():
+        # Explicit long-lived quota cooldowns already carry an authoritative reset
+        # time.  Do not turn the generic recovery loop into a 30-second quota poll.
+        if quota_errors.active_quota_cooldown(entry, now_ms=now_ms):
+            continue
+
         ch = registry.get_channel(entry["channel_key"])
         if ch is None or ch.type != "api" or not ch.enabled:
             continue

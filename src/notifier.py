@@ -239,7 +239,8 @@ def _throttle_should_emit(alert_key: str, cooldown_seconds: int) -> bool:
 
 
 async def throttled_notify_event(event_key: str, alert_key: str, text: str,
-                                 *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC) -> None:
+                                 *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC,
+                                 reply_markup: Optional[dict] = None) -> None:
     """节流版事件通知（async 版本）。
 
     `event_key` 决定 notify_event 的开关；`alert_key` 决定节流桶
@@ -247,18 +248,19 @@ async def throttled_notify_event(event_key: str, alert_key: str, text: str,
     """
     if not _throttle_should_emit(alert_key, cooldown_seconds):
         return
-    notify_event(event_key, text)
+    notify_event(event_key, text, reply_markup=reply_markup)
 
 
 def throttled_notify_event_sync(event_key: str, alert_key: str, text: str,
-                                *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC) -> None:
+                                *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC,
+                                reply_markup: Optional[dict] = None) -> None:
     """同 throttled_notify_event，但可从同步上下文调用。
 
     用在那些没法 await 的场景（如 sync 翻译器收尾、sync 的 Store save 回调）。
     """
     if not _throttle_should_emit(alert_key, cooldown_seconds):
         return
-    notify_event(event_key, text)
+    notify_event(event_key, text, reply_markup=reply_markup)
 
 
 def wait_drain(timeout: float = 5.0) -> bool:

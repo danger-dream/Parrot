@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, scorer, state_db
+from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, quota_errors, scorer, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
 from .. import ui
@@ -47,15 +47,19 @@ def _channel_overview() -> dict:
     chs = registry.all_channels()
     cd_keys: set[str] = set()
     perm_keys: set[str] = set()
+    quota_cooldown_keys: set[str] = set()
     for e in cooldown.active_entries():
         cd_keys.add(e["channel_key"])
         if e["cooldown_until"] == -1:
             perm_keys.add(e["channel_key"])
+        elif quota_errors.active_quota_cooldown(e):
+            quota_cooldown_keys.add(e["channel_key"])
 
     def _new_bucket() -> dict:
         return {
             "total": 0, "enabled": 0, "user_disabled": 0,
-            "quota_disabled": 0, "auth_err": 0, "cooling": 0, "permanent": 0,
+            "quota_disabled": 0, "quota_cooling": 0, "auth_err": 0,
+            "cooling": 0, "permanent": 0,
         }
 
     buckets: dict[str, dict] = {"anthropic": _new_bucket(), "openai": _new_bucket()}
@@ -78,6 +82,8 @@ def _channel_overview() -> dict:
         b["enabled"] += 1
         if ch.key in perm_keys:
             b["permanent"] += 1
+        elif ch.key in quota_cooldown_keys:
+            b["quota_cooling"] += 1
         elif ch.key in cd_keys:
             b["cooling"] += 1
     buckets["total_all"] = len(chs)
@@ -113,6 +119,12 @@ def _problem_channels() -> list[str]:
             ec = int(e.get("error_count") or 0)
             if e["cooldown_until"] == -1:
                 out.append(f"• {icon} {short} ({model}) — 永久冷却 · 累计失败 {ec} 次")
+            elif quota_errors.active_quota_cooldown(e):
+                reset = quota_errors.format_bjt_ms(e["cooldown_until"], compact=True)
+                out.append(
+                    f"• 🟠 {short} ({model}) — <b>配额冷却</b>\n"
+                    f"  恢复 {reset} · 周/月额度耗尽（1310）"
+                )
             else:
                 remaining = max(0, (e["cooldown_until"] - int(time.time() * 1000)) // 1000)
                 out.append(
@@ -275,6 +287,8 @@ def _fmt_channel_bucket(bucket: dict) -> str:
     parts = [f"共 {bucket['total']} · ✅ 可用 {bucket['enabled']}"]
     if bucket["cooling"]:
         parts.append(f"⚠ 冷却 {bucket['cooling']}")
+    if bucket.get("quota_cooling"):
+        parts.append(f"🟠 配额冷却 {bucket['quota_cooling']}")
     if bucket["permanent"]:
         parts.append(f"🔴 永久 {bucket['permanent']}")
     if bucket["user_disabled"]:

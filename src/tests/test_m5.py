@@ -215,6 +215,40 @@ async def test_recovery_run_once(m):
     print("  [PASS] recovery_run_once cleared API, skipped OAuth")
 
 
+async def test_recovery_skips_active_long_lived_quota_cooldown(m):
+    """Known 1310 reset windows must stay quiet until their cooldown expires."""
+    _reset(m)
+    m["config"].update(
+        lambda c: c.setdefault("cooldownRecovery", {}).__setitem__("enabled", True)
+    )
+    ch = _make_api_channel(m, "chA", "https://open.bigmodel.cn/api/paas/v4")
+    _install_channels(m, [ch])
+    reset_ms = int((time.time() + 3600) * 1000)
+    detail = (
+        'HTTP 429: {"error":{"code":"1310","message":'
+        '"[1310][每周/每月使用上限，限额将在 2099-01-01 00:00:00 重置]"}}'
+    )
+    m["cooldown"].record_error(ch.key, "glm-5", detail, cooldown_until=reset_ms)
+
+    calls = []
+    original = m["probe"].probe_channel_model
+
+    async def must_not_probe(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("active quota cooldown must not be probed")
+
+    m["probe"].probe_channel_model = must_not_probe
+    try:
+        cleared = await m["probe"].recovery_run_once()
+    finally:
+        m["probe"].probe_channel_model = original
+
+    assert cleared == 0
+    assert calls == []
+    assert m["cooldown"].is_blocked(ch.key, "glm-5")
+    print("  [PASS] recovery skips active long-lived quota cooldown")
+
+
 # ─── OAuth 主动刷新 ──────────────────────────────────────────────
 
 async def test_proactive_refresh_triggers_near_expiry(m):
@@ -572,6 +606,7 @@ async def amain():
         test_probe_api_success_and_failure,
         test_probe_oauth_skipped,
         test_recovery_run_once,
+        test_recovery_skips_active_long_lived_quota_cooldown,
         test_proactive_refresh_triggers_near_expiry,
         test_proactive_refresh_network_failure_does_not_mark_auth_error,
         test_proactive_refresh_401_marks_auth_error,

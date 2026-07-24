@@ -199,6 +199,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "queueWaitSeconds": 30,           # TG Bot 可改，全满排队超时
         "defaultMaxConcurrent": 0,        # 渠道未配 maxConcurrent 时的默认（0=不限）
     },
+    # 首包前的同候选瞬时加试，以及各自独立防循环的鉴权/请求修复。
+    # 候选账号/渠道切换与代理组故障转移属于核心路径，不受本开关截断。
+    "retry": {
+        "transient": {
+            "enabled": True,
+            "maxExtraAttempts": 2,        # 全请求共享，不会按候选数倍增
+            "backoffSeconds": [0.75, 1.75],
+            "errors": {
+                "openaiServerOverloaded": True,
+                "openaiServerError": True,
+                "claudeOverloaded": True,
+                "xaiUnavailable": True,
+            },
+        },
+        "recovery": {
+            "oauthRefresh": True,                 # 每个报错 OAuth 账号最多一次
+            "invalidEncryptedContent": True,      # 全请求最多一次
+            "claudeContext1mFallback": True,      # 每个候选/模型最多一次
+        },
+    },
     "errorWindows": [1, 3, 5, 10, 15, 0],
     # OAuth 渠道宽容次数：前 N 次失败只累计计数不进入冷却（成功一次清零）。
     # 第 N+1 次失败开始按 errorWindows 阶梯。设计目的：避免单 OAuth 账号
@@ -263,6 +283,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "channel_recovered": True,    # 永久/长冷却被清除（手动 / probe 恢复）
             "quota_disabled": True,       # OAuth 配额到达阈值被自动禁用
             "quota_resumed": True,        # OAuth 配额恢复被自动启用
+            "quota_cooldown": True,       # API 渠道单模型按上游重置时间临时冷却
             "oauth_refreshed": True,      # OAuth Token 自动刷新成功
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
             "no_channels": True,          # 无可用渠道（503）

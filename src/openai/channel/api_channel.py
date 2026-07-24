@@ -15,6 +15,12 @@ import json
 from typing import Optional
 
 from ...channel.base import Channel, ChannelDisplay, UpstreamRequest
+from ...channel.compatibility import (
+    apply_forced_openai_fast_mode,
+    forced_for_model,
+    normalize_mode,
+    normalize_models,
+)
 from ...channel.url_utils import resolve_upstream_url
 from ... import cache_hints, local_web_tools
 from ...providers import registry as provider_registry
@@ -53,6 +59,14 @@ class OpenAIApiChannel(Channel):
             raise ValueError(
                 f"OpenAIApiChannel got invalid protocol: {self.protocol!r}"
             )
+        # 通用渠道兼容设置必须作用在最终 OpenAI 出站 payload，而不是只在
+        # Anthropic 转换前处理，否则跨协议请求会显示已开启但实际无效。
+        self.omit_temperature = bool(entry.get("omitTemperature", False))
+        self.omit_thinking = bool(entry.get("omitThinking", False))
+        self.context_1m_mode = normalize_mode(entry.get("context1mMode"))
+        self.context_1m_models = normalize_models(entry.get("context1mModels"))
+        self.fast_mode = normalize_mode(entry.get("fastMode"))
+        self.fast_models = normalize_models(entry.get("fastModels"))
         # Responses WebSocket ingress historically dials third-party Responses API
         # channels as WebSocket (https://.../v1/responses -> wss://...). Keep that
         # default for compatibility, while allowing explicit test/configured
@@ -147,6 +161,17 @@ class OpenAIApiChannel(Channel):
     def list_client_models(self) -> list[str]:
         return [m.get("alias", "") for m in self.models if m.get("alias")]
 
+    def forces_fast_mode(self, resolved_model: str) -> bool:
+        return forced_for_model(self.fast_mode, self.fast_models, resolved_model)
+
+    def _apply_compatibility(self, payload: dict, resolved_model: str) -> None:
+        """在所有翻译/供应商适配完成后修改最终 OpenAI 出站字段。"""
+        if self.omit_temperature:
+            payload.pop("temperature", None)
+        if self.omit_thinking:
+            payload.pop("thinking", None)
+        apply_forced_openai_fast_mode(self, payload, resolved_model)
+
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "anthropic",
@@ -198,6 +223,7 @@ class OpenAIApiChannel(Channel):
         )
         self._apply_bigmodel_anthropic_bridge_compat(body, payload, resolved_model)
         self._apply_deepseek_anthropic_bridge_compat(body, payload, resolved_model)
+        self._apply_compatibility(payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
@@ -223,6 +249,7 @@ class OpenAIApiChannel(Channel):
             api_key_name=body.get("_parrot_api_key_name"),
             client_ip=body.get("_parrot_client_ip"),
         )
+        self._apply_compatibility(payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
@@ -251,6 +278,7 @@ class OpenAIApiChannel(Channel):
             # OpenAI-compatible channels do not receive unsupported fields.
             payload["thinking"] = body["thinking"]
         payload["model"] = resolved_model
+        self._apply_compatibility(payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),
@@ -264,6 +292,7 @@ class OpenAIApiChannel(Channel):
         local_web_tools.prepare_openai_responses_local_web_tools(payload)
         payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
         payload["model"] = resolved_model
+        self._apply_compatibility(payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
             headers=self._headers(),
@@ -280,6 +309,7 @@ class OpenAIApiChannel(Channel):
         payload = chat_to_responses.translate_request(body)
         payload["model"] = resolved_model
         payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
+        self._apply_compatibility(payload, resolved_model)
         # 下游 chat 是否显式要求末帧 usage（stream_options.include_usage）
         stream_opts = body.get("stream_options") or {}
         include_usage = bool(stream_opts.get("include_usage")) if isinstance(stream_opts, dict) else False
@@ -314,6 +344,7 @@ class OpenAIApiChannel(Channel):
         payload = responses_to_chat.translate_request(body, api_key_name=api_key_name)
         payload["model"] = resolved_model
         payload = provider_registry.filter_request_payload(self, payload, protocol="openai-chat")
+        self._apply_compatibility(payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/chat/completions"),
             headers=self._headers(),

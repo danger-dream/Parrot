@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+from ..channel.compatibility import apply_forced_openai_fast_mode
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
 from ..openai.transform import codex_oauth_transform
 from ..providers import registry as provider_registry
@@ -291,6 +292,8 @@ def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> 
         out["model"] = model
     if "background" in out:
         out.pop("background", None)
+    if channel is not None:
+        apply_forced_openai_fast_mode(channel, out, model)
     if isinstance(channel, OpenAIOAuthChannel):
         out = codex_oauth_transform.apply_codex_oauth_transform(out, resolved_model=model)
         _mark_codex_responses_lite_frame(out, model)

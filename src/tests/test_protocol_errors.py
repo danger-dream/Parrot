@@ -2,8 +2,26 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+
 from src import errors as legacy_errors
-from src.protocols import errors
+from src.protocols import errors, runtime
+
+
+def test_retry_after_parser_supports_delta_date_and_safe_bounds():
+    assert runtime.parse_retry_after_seconds("7") == 7.0
+    assert runtime.parse_retry_after_seconds("999") == runtime.MAX_RETRY_AFTER_SECONDS
+    assert runtime.parse_retry_after_seconds("nan") is None
+
+    now = datetime(2026, 7, 24, 13, 0, 0, tzinfo=timezone.utc)
+    header = format_datetime(now + timedelta(seconds=12), usegmt=True)
+    assert runtime.parse_retry_after_seconds(header, now_ts=now.timestamp()) == 12.0
+
+
+def test_retry_delay_config_discards_non_finite_values():
+    cfg = {"retry": {"transient": {"backoffSeconds": ["nan", "inf", 1.25]}}}
+    assert runtime.configured_transient_retry_delays(cfg) == (1.25,)
 
 
 def test_http_status_classification_preserves_legacy_anthropic_types():

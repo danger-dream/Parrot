@@ -986,7 +986,8 @@ def _payload_has_context_management(payload) -> bool:
 
 def _messages_betas_for_request(model=None, betas=None, *, payload=None,
                                 downstream_betas=None, original_model=None,
-                                wants_context_1m=None, wants_fast_mode=None):
+                                wants_context_1m=None, wants_fast_mode=None,
+                                allow_any_model_context_1m=False):
     """返回 /v1/messages anthropic-beta 列表。
 
     规则不再是固定全量 join，而是按最终 payload / 模型 / 下游显式能力请求生成：
@@ -1011,7 +1012,9 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
             original_model=original_model,
             resolved_model=model,
         ) or should_default_context_1m(model)
-    allow_context_1m = bool(wants_context_1m) and model_supports_context_1m(model)
+    allow_context_1m = bool(wants_context_1m) and (
+        bool(allow_any_model_context_1m) or model_supports_context_1m(model)
+    )
     allow_fast_mode = bool(wants_fast_mode)
     allow_mid_conversation = model_supports_mid_conversation_system(model)
     allow_context_management = True if payload is None else _payload_has_context_management(payload)
@@ -1038,7 +1041,7 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
 def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_scheme="bearer",
                            model=None, payload=None, downstream_betas=None,
                            original_model=None, wants_context_1m=None,
-                           wants_fast_mode=None):
+                           wants_fast_mode=None, allow_any_model_context_1m=False):
     """构造 messages 出站 header，对齐 CC v2.1.156 抓包恒定头集合（§7.1）。
 
     - session_id: 与 body.metadata.user_id.session_id 同值（§7.4/§8），调用方传入。
@@ -1046,6 +1049,8 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
       缺省用模块 BETAS。无论如何都会剔除 oauth-2025-04-20（那是 token 端点的 beta）。
     - payload/model/downstream_betas/original_model/wants_context_1m/wants_fast_mode:
       用于按最终 body + 模型 + 下游显式能力信号生成 messages beta，避免无条件硬塞能力位。
+    - allow_any_model_context_1m: API 兼容渠道可透传/强制未知模型的 1M 标志；
+      OAuth 官方渠道仍保留模型能力白名单。
     - auth_scheme: "bearer"(OAuth) 用 Authorization: Bearer；"api_key" 用 x-api-key。
     注意：x-client-request-id 已删（源码实证 CC 从不在请求发此头，抓包 67/67 无）。
     Accept-Encoding 只写 gzip,deflate —— 本机 venv 未装 brotli/zstandard，
@@ -1057,6 +1062,7 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
         downstream_betas=downstream_betas, original_model=original_model,
         wants_context_1m=wants_context_1m,
         wants_fast_mode=wants_fast_mode,
+        allow_any_model_context_1m=allow_any_model_context_1m,
     ))
     headers = {
         # ── CC 应用层 ──

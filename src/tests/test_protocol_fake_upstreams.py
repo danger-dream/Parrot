@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -836,6 +837,89 @@ async def test_anthropic_reasoning_and_service_tier_to_openai_responses_fake_ups
     assert out["content"] == [{"type": "text", "text": "reasoning bridge pong"}]
 
 
+async def test_forced_fast_updates_http_log_without_mutating_raw_request(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def handler(req: httpx.Request):
+        payload = _json_request(req)
+        assert payload["service_tier"] == "priority"
+        return _responses_response("forced fast")
+
+    router.register("https://forced-fast.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "forced-fast",
+            "https://forced-fast.example",
+            protocol="openai-responses",
+            alias="gpt-fast",
+            real="gpt-fast-real",
+            extra={"fastMode": "force", "fastModels": []},
+        ),
+    ])
+
+    body = {"model": "gpt-fast", "stream": False, "input": "hello"}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200, resp.body.decode()
+    conn = m["log_db"]._get_conn()
+    row = conn.execute(
+        "SELECT request_id, fast_mode FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["fast_mode"] == 1
+    detail = m["log_db"].log_detail(row["request_id"])["detail"]
+    assert "service_tier" not in json.loads(detail["request_body"])
+
+
+async def test_fast_log_follows_final_http_failover_candidate(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+
+    def forced_failure(req: httpx.Request):
+        assert _json_request(req)["service_tier"] == "priority"
+        return httpx.Response(500, json={
+            "error": {"type": "api_error", "code": "temporary_failure", "message": "try another channel"},
+        })
+
+    def auto_success(req: httpx.Request):
+        assert "service_tier" not in _json_request(req)
+        return _responses_response("fallback without fast")
+
+    router.register("https://forced-fast-fail.example", forced_failure)
+    router.register("https://auto-fast-success.example", auto_success)
+    _install_channels(m, [
+        _make_openai_channel(
+            "forced-fast-fail",
+            "https://forced-fast-fail.example",
+            protocol="openai-responses",
+            alias="gpt-fast",
+            real="gpt-fast-real",
+            extra={"fastMode": "force", "fastModels": []},
+        ),
+        _make_openai_channel(
+            "auto-fast-success",
+            "https://auto-fast-success.example",
+            protocol="openai-responses",
+            alias="gpt-fast",
+            real="gpt-fast-real",
+        ),
+    ])
+
+    body = {"model": "gpt-fast", "stream": False, "input": "hello"}
+    resp, mc = await _call_openai_handler(m, router, "responses", body)
+    await mc.aclose()
+
+    assert resp.status_code == 200, resp.body.decode()
+    row = m["log_db"]._get_conn().execute(
+        "SELECT fast_mode, final_channel_key FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["final_channel_key"] == "api:auto-fast-success"
+    assert row["fast_mode"] == 0
+
+
 async def test_candidate_scoped_reasoning_guard_falls_through_to_supported_model(m):
     _setup(m)
     router = MockRouter()
@@ -1143,6 +1227,59 @@ async def test_responses_terminal_event_finishes_without_waiting_for_http_eof(m)
     assert hanging.closed.is_set()
 
 
+async def test_chat_precommit_max_output_is_request_invalid_without_cooldown(m):
+    """A pre-visible Responses incomplete event is request-scoped, not channel health."""
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    payload = _responses_sse_event("response.incomplete", {
+        "type": "response.incomplete",
+        "response": {
+            "id": "resp_precommit_max_output",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        },
+    })
+    router.register(
+        "https://responses-precommit-max-output.example",
+        lambda req: httpx.Response(
+            200, content=payload, headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-precommit-max-output",
+            "https://responses-precommit-max-output.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    resp, mc = await _call_openai_handler(m, router, "chat", {
+        "model": "gpt-5",
+        "stream": True,
+        "messages": [{"role": "user", "content": "ping"}],
+    })
+    await mc.aclose()
+
+    assert resp.status_code == 400
+    error = json.loads(resp.body)["error"]
+    assert error["code"] == "context_length_exceeded"
+    assert "max_output_tokens" in error["message"]
+    latest = m["log_db"]._get_conn().execute(
+        "SELECT status, http_status, error_message FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert latest is not None
+    assert latest["status"] == "error"
+    assert latest["http_status"] == 400
+    assert "max_output_tokens" in latest["error_message"]
+    assert m["cooldown"].get_state(
+        "api:responses-precommit-max-output", "gpt-real",
+    ) is None
+
+
 async def test_stream_generator_aclose_records_cancelled_without_cooldown(m, monkeypatch):
     _setup(m)
     router = MockRouter()
@@ -1212,6 +1349,81 @@ async def test_stream_generator_aclose_records_cancelled_without_cooldown(m, mon
     assert latest["error_message"] == "client disconnected"
     assert hanging.closed.is_set()
     assert m["cooldown"].get_state("api:responses-aclose", "gpt-real") is None
+
+
+async def test_client_disconnect_finishes_outer_log_before_retry_bookkeeping(m, monkeypatch):
+    """An interruption after retry persistence must not leave request_log pending."""
+    _setup(m)
+    router = MockRouter()
+    partial_payload = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": "resp_cancel_order", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "item_id": "msg_cancel_order",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial",
+        }),
+    ])
+    hanging = TerminalThenHangByteStream(partial_payload)
+    router.register(
+        "https://responses-cancel-order.example",
+        lambda req: httpx.Response(
+            200, stream=hanging, headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-cancel-order",
+            "https://responses-cancel-order.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+    iterator = resp.body_iterator
+    emitted = b""
+    for _ in range(10):
+        item = await asyncio.wait_for(anext(iterator), timeout=1.0)
+        emitted += item.encode() if isinstance(item, str) else item
+        if b"partial" in emitted:
+            break
+    assert b"partial" in emitted
+
+    original_to_thread = asyncio.to_thread
+    interrupted = False
+
+    async def interrupt_after_retry_write(func, /, *args, **kwargs):
+        nonlocal interrupted
+        result = await original_to_thread(func, *args, **kwargs)
+        if func is m["log_db"].update_retry_attempt and not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated interruption after retry persistence")
+        return result
+
+    monkeypatch.setattr(asyncio, "to_thread", interrupt_after_retry_write)
+    await iterator.aclose()
+    await mc.aclose()
+
+    latest = m["log_db"]._get_conn().execute(
+        "SELECT status, http_status, error_message FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert interrupted is True
+    assert latest is not None
+    assert latest["status"] == "cancelled"
+    assert latest["http_status"] == 499
+    assert latest["error_message"] == "client disconnected"
 
 
 async def test_terminal_finalization_survives_consumer_cancellation_between_db_writes(m, monkeypatch):
@@ -1416,6 +1628,531 @@ async def test_anthropic_messages_stream_retryable_http_errors_still_fail_over_a
         (request_id,),
     ).fetchall()]
     assert outcomes == ["http_error", "success"]
+    assert m["cooldown"].is_blocked(route.candidates[0][0].key, "gpt-real")
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real")["total_requests"] == 1
+
+
+async def test_openai_previsible_overload_retries_same_channel_without_health_penalty(m, monkeypatch):
+    """The exact CXP/OpenAI Responses SSE overload shape is retried pre-commit."""
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    router = MockRouter()
+    attempts = {"count": 0}
+    overload_sse = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": "resp_overloaded", "status": "in_progress"},
+        }),
+        _responses_sse_event("error", {
+            "type": "error",
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "param": None,
+            },
+        }),
+    ])
+
+    def handler(req: httpx.Request):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return httpx.Response(
+                200, content=overload_sse, headers={"content-type": "text/event-stream"},
+            )
+        return _responses_sse_response("openai overload recovered")
+
+    router.register("https://openai-overload.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "openai-overload",
+            "https://openai-overload.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "openai overload recovered" in text
+    assert attempts["count"] == 3
+    assert [str(req.url) for req in router.requests] == [
+        "https://openai-overload.example/v1/responses",
+    ] * 3
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["retry_count"] == 2
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "success"]
+    assert m["cooldown"].get_state(route.candidates[0][0].key, "gpt-real") is None
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real")["total_requests"] == 1
+
+
+async def test_openai_server_error_retries_same_channel_without_health_penalty(m, monkeypatch):
+    """Exact OpenAI server_error uses the configured shared transient budget."""
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    router = MockRouter()
+    attempts = {"count": 0}
+    server_error_sse = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": "resp_server_error", "status": "in_progress"},
+        }),
+        _responses_sse_event("error", {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "code": "server_error",
+                "message": "An error occurred while processing your request. You can retry your request.",
+            },
+        }),
+    ])
+
+    def handler(req: httpx.Request):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return httpx.Response(
+                200, content=server_error_sse, headers={"content-type": "text/event-stream"},
+            )
+        return _responses_sse_response("openai server_error recovered")
+
+    router.register("https://openai-server-error.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "openai-server-error",
+            "https://openai-server-error.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "openai server_error recovered" in text
+    assert attempts["count"] == 3
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["retry_count"] == 2
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "success"]
+    assert m["cooldown"].get_state(route.candidates[0][0].key, "gpt-real") is None
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real")["total_requests"] == 1
+
+
+async def test_http_transient_retry_prefers_bounded_retry_after_header(m, monkeypatch):
+    _setup(m)
+    router = MockRouter()
+    calls = {"count": 0}
+    observed = []
+
+    async def capture_wait(ordinal, deadline_ts, *, retry_after_seconds=None):
+        observed.append(retry_after_seconds)
+        return 0.0
+
+    monkeypatch.setattr(m["failover"], "_wait_for_overload_retry", capture_wait)
+
+    def handler(req: httpx.Request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "type": "server_error",
+                        "code": "server_error",
+                        "message": "retry after the requested delay",
+                    }
+                },
+                headers={"Retry-After": "7"},
+            )
+        return _responses_sse_response("retry-after recovered")
+
+    router.register("https://retry-after.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "retry-after", "https://retry-after.example",
+            protocol="openai-responses", alias="sonnet", real="gpt-real",
+        ),
+    ])
+    body = {
+        "model": "sonnet", "stream": True, "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, _route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert "retry-after recovered" in text
+    assert calls["count"] == 2
+    assert observed == [7.0]
+
+
+async def test_transient_retry_limit_is_hot_configured_and_still_switches_candidate(m, monkeypatch):
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    original_retry = json.loads(json.dumps(m["config"].get().get("retry") or {}))
+    m["config"].update(
+        lambda c: c.setdefault("retry", {}).setdefault("transient", {}).__setitem__(
+            "maxExtraAttempts", 1,
+        )
+    )
+    router = MockRouter()
+    bad_calls = {"count": 0}
+
+    def bad(req: httpx.Request):
+        bad_calls["count"] += 1
+        return httpx.Response(503, json={
+            "error": {
+                "type": "server_error",
+                "code": "server_error",
+                "message": "retryable exact server_error",
+            }
+        })
+
+    try:
+        router.register("https://configured-retry.example", bad)
+        router.register(
+            "https://configured-retry-fallback.example",
+            lambda req: _responses_sse_response("configured fallback ok"),
+        )
+        _install_channels(m, [
+            _make_openai_channel(
+                "configured-retry", "https://configured-retry.example",
+                protocol="openai-responses", alias="sonnet", real="gpt-real",
+            ),
+            _make_openai_channel(
+                "configured-retry-fallback", "https://configured-retry-fallback.example",
+                protocol="openai-responses", alias="sonnet", real="gpt-real",
+            ),
+        ])
+        body = {
+            "model": "sonnet", "stream": True, "max_tokens": 32,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        resp, mc, _route = await _call_anthropic_core(m, router, body)
+        text = await _consume_streaming_to_string(resp)
+        await mc.aclose()
+        assert resp.status_code == 200
+        assert "configured fallback ok" in text
+        assert bad_calls["count"] == 2  # original attempt + configured one extra
+        assert [str(req.url) for req in router.requests][-1] == (
+            "https://configured-retry-fallback.example/v1/responses"
+        )
+    finally:
+        m["config"].update(lambda c: c.__setitem__("retry", original_retry))
+
+
+async def test_claude_overloaded_529_retries_same_channel_without_health_penalty(m, monkeypatch):
+    """Anthropic's documented 529/overloaded_error follows the same bounded retry."""
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    router = MockRouter()
+    attempts = {"count": 0}
+
+    def handler(req: httpx.Request):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return httpx.Response(529, json={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+            })
+        return _anthropic_sse_response("claude overload recovered")
+
+    router.register("https://claude-overload.example", handler)
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m,
+            "claude-overload",
+            "https://claude-overload.example",
+            alias="sonnet",
+            real="claude-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "claude overload recovered" in text
+    assert attempts["count"] == 3
+    assert [str(req.url) for req in router.requests] == [
+        "https://claude-overload.example/v1/messages",
+    ] * 3
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["retry_count"] == 2
+    assert outcomes == ["http_error", "http_error", "success"]
+    assert m["cooldown"].get_state(route.candidates[0][0].key, "claude-real") is None
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "claude-real")["total_requests"] == 1
+
+
+async def test_xai_direct_503_retries_same_channel_without_health_penalty(m, monkeypatch):
+    """Direct api.x.ai 503 is the REST counterpart of xAI SDK UNAVAILABLE."""
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    router = MockRouter()
+    attempts = {"count": 0}
+
+    def handler(req: httpx.Request):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return httpx.Response(503, json={
+                "error": {"type": "server_error", "message": "Service temporarily unavailable."},
+            })
+        return _responses_sse_response("xai overload recovered")
+
+    router.register("https://api.x.ai", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "xai-overload",
+            "https://api.x.ai",
+            protocol="openai-responses",
+            alias="grok",
+            real="grok-real",
+        ),
+    ])
+
+    body = {
+        "model": "grok",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "xai overload recovered" in text
+    assert attempts["count"] == 3
+    assert [str(req.url) for req in router.requests] == [
+        "https://api.x.ai/v1/responses",
+    ] * 3
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["retry_count"] == 2
+    assert outcomes == ["http_error", "http_error", "success"]
+    assert m["cooldown"].get_state(route.candidates[0][0].key, "grok-real") is None
+    assert m["scorer"].get_stats(route.candidates[0][0].key, "grok-real")["total_requests"] == 1
+
+
+def test_zhipu_quota_parser_rejects_generic_429_and_non_zhipu(m):
+    parser = m["failover"].quota_errors.zhipu_1310_reset_ms
+    reset = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    zhipu = SimpleNamespace(base_url="https://open.bigmodel.cn/api/anthropic")
+    other = SimpleNamespace(base_url="https://other.example")
+    generic = '{"error":{"code":"1302","message":"RPM limit"}}'
+    exact = f'{{"error":{{"code":"1310","message":"限额将在 {reset} 重置"}}}}'
+    assert parser(zhipu, http_status=429, error_detail=generic) is None
+    assert parser(zhipu, http_status=503, error_detail=exact) is None
+    assert parser(other, http_status=429, error_detail=exact) is None
+    assert parser(zhipu, http_status=429, error_detail=exact) is not None
+
+
+def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        m["failover"].notifier,
+        "throttled_notify_event_sync",
+        lambda event, alert, text, **kwargs: calls.append((event, alert, text, kwargs)),
+    )
+    channel = SimpleNamespace(
+        key="api:智谱 Max",
+        type="api",
+        display_name="智谱 Max",
+    )
+    reset_ms = int(datetime(2026, 7, 26, 10, 1, 10, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
+    m["failover"]._notify_zhipu_quota_cooldown(channel, "glm-5.2", reset_ms)
+
+    assert len(calls) == 1
+    event, alert, text, kwargs = calls[0]
+    assert event == "quota_cooldown"
+    assert "api:智谱 Max:glm-5.2" in alert
+    assert "周/月使用额度已达上限" in text
+    assert "2026-07-26 10:01:10" in text
+    assert "仅跳过" in text and "不是手动禁用" in text
+    button = kwargs["reply_markup"]["inline_keyboard"][0][0]
+    assert button["text"] == "🔀 查看渠道详情"
+    assert button["callback_data"].startswith("ch:view:")
+
+
+async def test_zhipu_1310_cools_only_channel_model_until_reset_and_fails_over(m, monkeypatch):
+    _setup(m)
+    router = MockRouter()
+    bjt = timezone(timedelta(hours=8))
+    reset_dt = (datetime.now(bjt) + timedelta(days=2)).replace(microsecond=0)
+    reset_text = reset_dt.strftime("%Y-%m-%d %H:%M:%S")
+    reset_ms = int(reset_dt.timestamp() * 1000)
+    notices = []
+    monkeypatch.setattr(
+        m["failover"],
+        "_notify_zhipu_quota_cooldown",
+        lambda ch, model, until: notices.append((ch.key, model, until)),
+    )
+
+    def zhipu_handler(req: httpx.Request):
+        return httpx.Response(429, json={
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "code": "1310",
+                "message": f"[1310][您已达到每周/每月使用上限，您的限额将在 {reset_text} 重置。][req-1]",
+            },
+            "request_id": "req-1",
+        })
+
+    router.register("https://open.bigmodel.cn", zhipu_handler)
+    router.register("https://zhipu-fallback.example", lambda req: _anthropic_sse_response("fallback ok"))
+    _install_channels(m, [
+        _make_anthropic_channel(
+            m, "智谱 Max", "https://open.bigmodel.cn/api/anthropic",
+            alias="glm", real="glm-5.2",
+        ),
+        _make_anthropic_channel(
+            m, "智谱老号", "https://zhipu-fallback.example",
+            alias="glm", real="glm-5.2",
+        ),
+    ])
+
+    body = {
+        "model": "glm",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert resp.status_code == 200
+    assert "fallback ok" in text
+    assert [str(req.url) for req in router.requests] == [
+        "https://open.bigmodel.cn/api/anthropic/v1/messages",
+        "https://zhipu-fallback.example/v1/messages",
+    ]
+    zhipu_channel = route.candidates[0][0]
+    state = m["cooldown"].get_state(zhipu_channel.key, "glm-5.2")
+    assert state is not None
+    assert state["error_count"] == 1
+    assert state["cooldown_until"] == reset_ms
+    assert m["cooldown"].is_blocked(zhipu_channel.key, "glm-5.2")
+    assert zhipu_channel.enabled is True
+    assert notices == [(zhipu_channel.key, "glm-5.2", reset_ms)]
+    assert m["scorer"].get_stats(zhipu_channel.key, "glm-5.2")["total_requests"] == 1
+
+
+async def test_openai_overload_exhaustion_scores_and_cools_once(m, monkeypatch):
+    """Only the terminal third overload may affect health/cooldown state."""
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    router = MockRouter()
+    overload_sse = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "response": {"id": "resp_overloaded_final", "status": "in_progress"},
+        }),
+        _responses_sse_event("error", {
+            "type": "error",
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "param": None,
+            },
+        }),
+    ])
+    router.register(
+        "https://openai-overload-exhausted.example",
+        lambda req: httpx.Response(
+            200, content=overload_sse, headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "openai-overload-exhausted",
+            "https://openai-overload-exhausted.example",
+            protocol="openai-responses",
+            alias="sonnet",
+            real="gpt-real",
+        ),
+    ])
+
+    body = {
+        "model": "sonnet",
+        "stream": True,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    resp, mc, route = await _call_anthropic_core(m, router, body)
+    await mc.aclose()
+
+    assert resp.status_code == 503
+    assert len(router.requests) == 3
+    conn = m["log_db"]._get_conn()
+    request_row = dict(conn.execute(
+        "SELECT request_id, retry_count FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone())
+    outcomes = [row[0] for row in conn.execute(
+        "SELECT outcome FROM retry_chain WHERE request_id = ? ORDER BY attempt_order",
+        (request_row["request_id"],),
+    ).fetchall()]
+    assert request_row["retry_count"] == 3
+    assert outcomes == ["upstream_error_json", "upstream_error_json", "upstream_error_json"]
+    state = m["cooldown"].get_state(route.candidates[0][0].key, "gpt-real")
+    assert state is not None
+    assert state["error_count"] == 1
     assert m["cooldown"].is_blocked(route.candidates[0][0].key, "gpt-real")
     assert m["scorer"].get_stats(route.candidates[0][0].key, "gpt-real")["total_requests"] == 1
 

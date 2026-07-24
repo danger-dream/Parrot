@@ -79,13 +79,97 @@ def test_main_page(m):
             for b in row if "callback_data" in b]
     expected = {"sys:show:timeouts", "sys:show:errwin", "sys:show:scoring",
                 "sys:show:affinity", "sys:show:notif", "menu:status_alert", "sys:show:retention",
-                "sys:show:blacklist", "sys:show:aklim", "sys:show:ws_mode", "menu:main"}
+                "sys:show:blacklist", "sys:show:aklim", "sys:show:ws_mode", "sys:show:retry",
+                "menu:main"}
     for e in expected:
         assert e in btns, f"missing btn {e}"
     assert "menu:loadbalancing" not in btns
     assert "sys:show:cch" not in btns
     assert "sys:show:quota" not in btns
+    bottom = edit["reply_markup"]["inline_keyboard"][-1]
+    assert [button["callback_data"] for button in bottom] == ["sys:show:retry", "menu:main"]
+    assert "候选按序故障转移" in text
     print("  [PASS] main settings page")
+
+
+def test_retry_settings_menu_and_controls(m):
+    _reset(m)
+    rec = _install(m)
+    sm = m["system_menu"]
+    original = json.loads(json.dumps(m["config"].get().get("retry") or {}))
+    defaults = {
+        "transient": {
+            "enabled": True,
+            "maxExtraAttempts": 2,
+            "backoffSeconds": [0.75, 1.75],
+            "errors": {
+                "openaiServerOverloaded": True,
+                "openaiServerError": True,
+                "claudeOverloaded": True,
+                "xaiUnavailable": True,
+            },
+        },
+        "recovery": {
+            "oauthRefresh": True,
+            "invalidEncryptedContent": True,
+            "claudeContext1mFallback": True,
+        },
+    }
+    try:
+        m["config"].update(lambda c: c.__setitem__("retry", json.loads(json.dumps(defaults))))
+        sm._show_retry(42, 100, "cb")
+        page = rec.last("editMessageText")
+        assert "全请求共享 2 次" in page["text"]
+        assert "仍失败则继续后续账号 / 渠道" in page["text"]
+        assert "每个报错账号刷新后" in page["text"]
+        callbacks = [
+            button["callback_data"]
+            for row in page["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        for expected_cb in (
+            "sys:retry:toggle_transient",
+            "sys:retry:edit_attempts",
+            "sys:retry:edit_backoff",
+            "sys:retry:toggle_error:openaiServerError",
+            "sys:retry:toggle_recovery:oauthRefresh",
+        ):
+            assert expected_cb in callbacks
+
+        sm._toggle_retry_transient(42, 100, "cb")
+        assert m["config"].get()["retry"]["transient"]["enabled"] is False
+        sm._toggle_retry_transient(42, 100, "cb")
+        assert m["config"].get()["retry"]["transient"]["enabled"] is True
+
+        sm._toggle_retry_item(
+            42, 100, "cb", group="errors", key="openaiServerError",
+        )
+        assert m["config"].get()["retry"]["transient"]["errors"]["openaiServerError"] is False
+
+        sm._edit_retry_attempts(42, 100, "cb")
+        sm._on_retry_attempts_input(42, "6")
+        assert m["states"].get_state(42) is not None
+        sm._on_retry_attempts_input(42, "3")
+        assert m["config"].get()["retry"]["transient"]["maxExtraAttempts"] == 3
+        assert m["states"].get_state(42) is None
+
+        sm._edit_retry_backoff(42, 100, "cb")
+        sm._on_retry_backoff_input(42, "-1,2")
+        assert m["states"].get_state(42) is not None
+        sm._on_retry_backoff_input(42, "nan,1")
+        assert m["states"].get_state(42) is not None
+        sm._on_retry_backoff_input(42, "inf,1")
+        assert m["states"].get_state(42) is not None
+        sm._on_retry_backoff_input(42, "0.5, 1.25")
+        assert m["config"].get()["retry"]["transient"]["backoffSeconds"] == [0.5, 1.25]
+        assert m["states"].get_state(42) is None
+
+        sm._show_notif(42, 100, "cb")
+        assert "配额冷却" in rec.last("editMessageText")["text"]
+    finally:
+        m["config"].update(lambda c: c.__setitem__("retry", original))
+        m["states"].clear_all()
+    print("  [PASS] retry settings UI + hot config controls")
 
 
 def test_timeouts_edit(m):
@@ -468,6 +552,7 @@ def main():
 
     tests = [
         test_main_page,
+        test_retry_settings_menu_and_controls,
         test_timeouts_edit,
         test_errwin_edit,
         test_scoring_fields,

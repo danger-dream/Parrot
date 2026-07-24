@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 import traceback
 import uuid
@@ -49,12 +50,18 @@ from ..proxy.connector import SS2022Connector, SOCKS5Connector
 from ..protocols import finalize as finalize_policy
 from ..protocols import errors as protocol_errors
 from ..protocols.runtime import (
+    configured_transient_retry_delays,
     format_responses_ws_error,
     is_responses_ws_visible_event_type,
     is_retryable_responses_ws_error_before_accept,
+    parse_retry_after_seconds,
     parse_wrapped_responses_ws_error,
+    recovery_retry_allowed,
     responses_ws_http_status_from_attempt,
+    retryable_transient_error_kind,
     should_cooldown,
+    transient_retry_allowed,
+    transient_retry_limit,
     ws_close_code_for_http_status,
 )
 from ..transports import (
@@ -125,7 +132,9 @@ class _WsAttemptResult:
     closed_after_accept: bool = False
     outcome: str = "transport_error"
     error_detail: str = ""
+    error_code: Optional[str] = None
     http_status: Optional[int] = None
+    retry_after_seconds: Optional[float] = None
     round_id: Optional[str] = None
     connect_ms: Optional[int] = None
     first_byte_ms: Optional[int] = None
@@ -147,6 +156,53 @@ class _WsAttemptResult:
     upstream_protocol: str = "openai-responses"
     upstream_transport: str = "ws"
     translator_ctx: Optional[dict] = None
+
+
+def _retry_after_from_headers(headers: Any) -> float | None:
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        raw = None
+    return parse_retry_after_seconds(raw)
+
+
+def _attach_ws_retry_after(result: _WsAttemptResult, headers: Any) -> _WsAttemptResult:
+    if result.retry_after_seconds is None:
+        result.retry_after_seconds = _retry_after_from_headers(headers)
+    return result
+
+
+def _transient_retry_delay_seconds(
+    retry_ordinal: int,
+    cfg: dict,
+    *,
+    retry_after_seconds: float | None = None,
+) -> float:
+    if retry_after_seconds is not None:
+        parsed = parse_retry_after_seconds(retry_after_seconds)
+        if parsed is not None:
+            return parsed
+    delays = configured_transient_retry_delays(cfg)
+    index = min(max(0, int(retry_ordinal)), len(delays) - 1)
+    return delays[index] + random.uniform(0.0, 0.25)
+
+
+async def _wait_for_transient_retry(
+    retry_ordinal: int,
+    cfg: dict,
+    deadline_ts: float,
+    *,
+    retry_after_seconds: float | None = None,
+) -> float | None:
+    delay = _transient_retry_delay_seconds(
+        retry_ordinal,
+        cfg,
+        retry_after_seconds=retry_after_seconds,
+    )
+    if deadline_ts > 0 and time.time() + delay >= deadline_ts:
+        return None
+    await asyncio.sleep(delay)
+    return delay
 
 
 def _persist_ws_route_round(
@@ -241,12 +297,12 @@ class _WsTracker:
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
             self.stream_error_message = _format_ws_error(evt)
-            self.stream_error_code = None
+            self.stream_error_code = protocol_errors.extract_error_info(evt)[0]
             return
         if typ == "response.failed":
             self.response_failed = True
             self.stream_error_message = _format_ws_error(evt)
-            self.stream_error_code = None
+            self.stream_error_code = protocol_errors.extract_error_info(evt)[0]
         elif typ == "response.incomplete":
             if protocol_errors.is_responses_max_output_incomplete(evt):
                 self.response_failed = True
@@ -533,7 +589,9 @@ async def _run_ws_failover(
     fp_query: Optional[str],
 ) -> bool:
     cfg = config.get()
-    deadline_ts = 0.0  # legacy argument; every upstream route owns its round total
+    deadline_ts = 0.0  # legacy transport argument; every upstream route owns its round total
+    total_timeout_s = float((cfg.get("timeouts") or {}).get("total", 600))
+    retry_deadline_ts = start_time + total_timeout_s
     queue_wait_s = float((cfg.get("concurrency") or {}).get("queueWaitSeconds", 30))
 
     affinity_hit = 1 if schedule_result.affinity_hit else 0
@@ -545,6 +603,8 @@ async def _run_ws_failover(
     ]
     saturated_extras: list[tuple[Channel, str]] = []
     refreshed_once: set[str] = set()
+    transient_limit = transient_retry_limit(cfg)
+    transient_retries_used = 0
     retry_count = 0
     attempt_order = 0
     last_result: Optional[_WsAttemptResult] = None
@@ -629,7 +689,12 @@ async def _run_ws_failover(
                 )
             return accepted
 
-        if ch.type == "oauth" and result.http_status in (401, 403) and ch.key not in refreshed_once:
+        if (
+            recovery_retry_allowed("oauthRefresh", cfg)
+            and ch.type == "oauth"
+            and result.http_status in (401, 403)
+            and ch.key not in refreshed_once
+        ):
             refreshed_once.add(ch.key)
             ak = getattr(ch, "account_key", None) or getattr(ch, "email", "")
             try:
@@ -656,6 +721,27 @@ async def _run_ws_failover(
                     )
                 except Exception:
                     pass
+
+        transient_kind = retryable_transient_error_kind(ch, result)
+        if (
+            transient_retries_used < transient_limit
+            and transient_retry_allowed(transient_kind, cfg)
+        ):
+            delay = await _wait_for_transient_retry(
+                transient_retries_used,
+                cfg,
+                retry_deadline_ts,
+                retry_after_seconds=result.retry_after_seconds,
+            )
+            if delay is not None:
+                transient_retries_used += 1
+                retry_count += 1
+                print(
+                    f"[responses_ws] transient {transient_kind} on "
+                    f"{ch.key}/{resolved_model}; retrying same channel "
+                    f"({transient_retries_used}/{transient_limit}) after {delay:.2f}s"
+                )
+                continue
 
         finalize_policy.apply_error_health_effects(
             finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
@@ -948,6 +1034,10 @@ async def _try_ws_channel(
                     terminal=True,
                 )
             _apply_ws_snapshot(relay_result, timing, terminal=True)
+            _attach_ws_retry_after(
+                relay_result,
+                getattr(getattr(upstream_ws, "response", None), "headers", None),
+            )
             if relay_result.ok or relay_result.closed_after_accept:
                 return relay_result
             last_error = relay_result
@@ -1031,7 +1121,8 @@ async def _try_ws_channel(
                 upstream_protocol=ch_proto,
             )
         except InvalidStatus as exc:
-            status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+            invalid_response = getattr(exc, "response", None)
+            status = int(getattr(invalid_response, "status_code", 0) or 0)
             detail = _invalid_status_detail(exc)
             last_error = _WsAttemptResult(
                 outcome="http_auth_error" if status in (401, 403) else "http_error",
@@ -1040,6 +1131,9 @@ async def _try_ws_channel(
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
                 upstream_protocol=ch_proto,
+                retry_after_seconds=_retry_after_from_headers(
+                    getattr(invalid_response, "headers", None)
+                ),
             )
         except Exception as exc:
             connected = timing.connection_complete
@@ -1126,6 +1220,9 @@ async def _try_sse_channel(
         http_body = dict(body)
         http_body["stream"] = True
         upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
+        log_db.update_pending_fast_mode_from_upstream(
+            request_id, upstream_req.body, upstream_req.headers,
+        )
     except Exception as exc:
         if hasattr(exc, "status") and hasattr(exc, "message"):
             outcome = "candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "guard_error"
@@ -1190,7 +1287,9 @@ async def _try_sse_channel(
         return _WsAttemptResult(
             outcome=error.outcome,
             error_detail=error.error_detail,
+            error_code=error.error_code,
             http_status=error.http_status,
+            retry_after_seconds=error.retry_after_seconds,
             round_id=error.round_id,
             connect_ms=error.connect_ms,
             first_byte_ms=error.first_byte_ms,
@@ -1242,6 +1341,7 @@ async def _try_sse_channel(
             proxy_bytes=proxy_bytes,
             upstream_protocol=ch_proto,
             upstream_transport="sse",
+            retry_after_seconds=_retry_after_from_headers(response.headers),
         )
         _sync_http_proxy_bytes(proxy_bytes, opened)
         finalize_opened_http_response(opened, result.outcome, result.error_detail)
@@ -1260,6 +1360,7 @@ async def _try_sse_channel(
         upstream_protocol=ch_proto,
         upstream_transport="sse",
         translator_ctx=upstream_req.translator_ctx,
+        retry_after_seconds=_retry_after_from_headers(response.headers),
     )
     tracker = _WsTracker()
     pending: list[str] = []
@@ -1451,6 +1552,7 @@ async def _try_sse_channel(
                         else "upstream_error_json"
                     )
                     result.http_status = 400 if is_context_error else result.http_status
+                    result.error_code = tracker.stream_error_code
                     result.error_detail = tracker.stream_error_message or frame_text[:2000]
                     if event_type == "response.failed" or committed or is_context_error:
                         if not committed:
@@ -1743,6 +1845,7 @@ async def _relay_ws_session(
     try:
         first_upstream_obj = _map_ws_create_frame_for_upstream(first_obj, resolved_model, channel=ch)
         first_upstream_obj = _apply_identity_confuse_to_frame(first_upstream_obj)
+        log_db.update_pending_fast_mode_from_upstream(request_id, first_upstream_obj)
         payload_to_send: str | bytes = _dump_frame(first_upstream_obj)
         proxy_bytes.count(up=_frame_size(payload_to_send))
         await wait_ws_round_io(
@@ -2325,6 +2428,7 @@ async def _recv_until_first_visible_ws_event(
     elif step.outcome is not None:
         result.outcome = step.outcome
         result.error_detail = step.error_detail
+        result.error_code = step.error_code
         result.http_status = step.http_status
     if step.closed_after_accept:
         result.closed_after_accept = True
