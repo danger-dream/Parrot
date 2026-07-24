@@ -526,6 +526,21 @@ class OpenAIOAuthChannel(Channel):
 
     # ─── 内部 ─────────────────────────────────────────────────
 
+    async def build_realtime_headers(self) -> dict[str, str]:
+        """Return existing Codex OAuth identity headers for a realtime handshake.
+
+        Token lifecycle remains entirely in ``oauth_manager.ensure_valid_token``;
+        this is only a small transport-specific view of the already-established
+        OAuth channel identity.
+        """
+        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        headers = self._build_headers(access_token)
+        # These are specific to the SSE Responses endpoint.  Realtime callers
+        # supply their own content negotiation / beta headers where needed.
+        for name in ("host", "accept", "content-type", "openai-beta"):
+            headers.pop(name, None)
+        return headers
+
     def _build_headers(self, access_token: str) -> dict[str, str]:
         prov_cfg = _provider_cfg()
         headers = {

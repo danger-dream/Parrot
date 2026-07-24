@@ -327,6 +327,9 @@ _API_KEY_LIMITED_HTTP_PATHS = {
     "/images/generations",
     "/v1/images/edits",
     "/images/edits",
+    # Codex WebRTC call creation uses the ChatGPT-backend-shaped request body;
+    # WebSocket realtime sessions acquire their API-key lease in their handler.
+    "/backend-api/codex/realtime/calls",
 }
 
 
@@ -756,6 +759,46 @@ async def proxy_responses_websocket(websocket: WebSocket):
     from src.openai.responses_ws import handle_responses_ws
     async with drain.active("ws /v1/responses"):
         await handle_responses_ws(websocket)
+
+
+@app.websocket("/v1/realtime")
+async def proxy_realtime_websocket(websocket: WebSocket):
+    """Codex Realtime V1/V2 transparent WebSocket relay."""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
+    from src.openai.realtime import handle_realtime_ws
+    async with drain.active("ws /v1/realtime"):
+        await handle_realtime_ws(websocket, path="/v1/realtime")
+
+
+@app.websocket("/v1/live")
+async def proxy_realtime_live_websocket(websocket: WebSocket):
+    """Codex Realtime V3 transparent WebSocket relay."""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
+    from src.openai.realtime import handle_realtime_ws
+    async with drain.active("ws /v1/live"):
+        await handle_realtime_ws(websocket, path="/v1/live")
+
+
+@app.websocket("/v1/live/{call_id}")
+async def proxy_realtime_live_sideband_websocket(websocket: WebSocket, call_id: str):
+    """Codex Realtime V3 WebRTC sideband relay for an existing call."""
+    if drain.is_draining():
+        await websocket.close(code=1013, reason="Parrot is draining for graceful restart")
+        return
+    from src.openai.realtime import handle_realtime_ws
+    async with drain.active("ws /v1/live/{call_id}"):
+        await handle_realtime_ws(websocket, path=f"/v1/live/{call_id}", live_call_id=call_id)
+
+
+@app.post("/backend-api/codex/realtime/calls")
+async def proxy_realtime_call(request: Request):
+    """Codex backend-shaped WebRTC call creation relay."""
+    from src.openai.realtime import handle_realtime_call
+    return await handle_realtime_call(request)
 
 
 @app.post("/v1/images/generate")
