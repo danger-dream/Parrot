@@ -340,14 +340,22 @@ def _input_items_to_messages(items: list) -> list:
                 # 回喂 chat 上游时要把 refusal parts 单独提取到 message.refusal 字段，
                 # 避免信息被折叠成空 text 丢失
                 refusal_texts: list[str] = []
-                non_refusal_parts: list = []
-                for p in content_parts:
-                    if isinstance(p, dict) and p.get("type") == "refusal":
-                        r = p.get("refusal")
-                        if isinstance(r, str) and r:
-                            refusal_texts.append(r)
-                    else:
-                        non_refusal_parts.append(p)
+                if isinstance(content_parts, str):
+                    # EasyInputMessage.content may be a plain string.  Hermes
+                    # uses this form for locally generated fallback/final
+                    # assistant messages.  Iterating it as content parts would
+                    # drop every character and emit an empty Anthropic text
+                    # block after the Responses→Chat→Anthropic bridge.
+                    non_refusal_parts: Any = content_parts
+                else:
+                    non_refusal_parts = []
+                    for p in content_parts:
+                        if isinstance(p, dict) and p.get("type") == "refusal":
+                            r = p.get("refusal")
+                            if isinstance(r, str) and r:
+                                refusal_texts.append(r)
+                        else:
+                            non_refusal_parts.append(p)
                 # 纯 refusal（无文本/图片 parts）→ content 必须是 null，
                 # 否则严格上游（如官方 gpt-*）会因 assistant.content 为空列表而 400
                 msg_out: dict = {
