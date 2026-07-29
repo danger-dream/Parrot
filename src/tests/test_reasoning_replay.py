@@ -94,6 +94,34 @@ def test_skips_tool_call_without_matching_output():
     assert payload["input"] == [{"type": "message", "role": "user", "content": "hi"}]
 
 
+def test_replay_cache_isolated_by_oauth_account_key():
+    encrypted_content = _valid_encrypted_content(9)
+    assert rr.cache_items(
+        "gpt-5.5", "prompt-cache:pck", [
+            {"type": "reasoning", "encrypted_content": encrypted_content},
+        ], account_key="openai:account-a",
+    ) is True
+
+    account_b_payload = {
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+    assert rr.inject_replay_items(account_b_payload, {
+        "model": "gpt-5.5",
+        "session_key": "prompt-cache:pck",
+        "account_key": "openai:account-b",
+    }) == 0
+
+    account_a_payload = {
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+    }
+    assert rr.inject_replay_items(account_a_payload, {
+        "model": "gpt-5.5",
+        "session_key": "prompt-cache:pck",
+        "account_key": "openai:account-a",
+    }) == 1
+    assert account_a_payload["input"][0]["encrypted_content"] == encrypted_content
+
+
 def test_delete_from_translator_ctx_clears_scope():
     rr.cache_items("gpt-5.5", "prompt-cache:pck", [{"type": "reasoning", "encrypted_content": _valid_encrypted_content(7)}])
     assert rr.delete_from_translator_ctx({"codex_reasoning_replay": {"model": "gpt-5.5", "session_key": "prompt-cache:pck"}}) is True

@@ -183,6 +183,7 @@ XAI_OAUTH_CAPABILITIES = ProviderCapabilities(
     passthrough_request_fields={"openai-responses": RESPONSES_REQ_ALLOWED},
     native_state=frozenset({
         "prompt_cache_key",
+        "encrypted_reasoning_replay",
         "x_grok_conv_id",
         "web_search",
     }),

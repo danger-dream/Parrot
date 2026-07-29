@@ -48,7 +48,7 @@ def _sanitize_headers(headers: dict) -> dict:
     out: dict[str, Any] = {}
     for k, v in headers.items():
         kl = k.lower()
-        if kl in ("authorization", "x-api-key"):
+        if kl in ("authorization", "x-api-key", "session-id", "x-session-id"):
             out[k] = "***"
         else:
             out[k] = v
@@ -255,11 +255,11 @@ def _claude_code_session_prompt_cache_key(
     model: str,
     ingress_protocol: str,
 ) -> str | None:
-    """从 Claude Code 原生会话 ID 派生随机 fallback 的稳定替代值。
+    """从 Claude Code 原生会话 ID 派生稳定的 prompt cache key。
 
     原始 header 不进入 PCK 或上游 payload；同时沿用 stable anchor 的调用方
-    隔离维度，避免不同 Key/IP/模型/入口共用缓存路由。
-    仅由 `_maybe_apply_auto_prompt_cache_key` 在其它稳定来源均不可用时调用。
+    隔离维度，避免不同 Key/IP/模型/入口共用缓存路由。只要该 header 存在，
+    它就优先于内容派生的 stable anchor，避免同一 Claude Code 会话中途换 key。
     """
     session_id = str(claude_code_session_id or "").strip()
     if not session_id:
@@ -289,9 +289,10 @@ def _maybe_apply_auto_prompt_cache_key(
 ) -> str | None:
     """OpenAI 协议专用：下游未传 prompt_cache_key 时自动补一个。
 
-    优先级：下游显式值 → fingerprint 亲和链值 → 稳定 anchor key →
-    Claude Code session fallback → 随机兜底。成功响应后由 failover 把最终
-    key 绑定到 fp_write。
+    优先级：下游显式值 → fingerprint 亲和链值 → Claude Code session key →
+    稳定 anchor key → 随机兜底。成功响应后由 failover 把最终 key 绑定到
+    fp_write。Claude Code 的原生 session ID 必须先于内容 anchor，避免第二条
+    user/tool 回灌出现后在同一会话中切换 prompt_cache_key。
     """
     if not isinstance(body, dict):
         return None
@@ -312,16 +313,16 @@ def _maybe_apply_auto_prompt_cache_key(
             if val:
                 key = val
     if not key:
-        key = _stable_prompt_cache_key(
-            body,
+        key = _claude_code_session_prompt_cache_key(
+            claude_code_session_id,
             api_key_name=api_key_name,
             client_ip=client_ip,
             model=model,
             ingress_protocol=ingress_protocol,
         )
     if not key:
-        key = _claude_code_session_prompt_cache_key(
-            claude_code_session_id,
+        key = _stable_prompt_cache_key(
+            body,
             api_key_name=api_key_name,
             client_ip=client_ip,
             model=model,
@@ -334,6 +335,101 @@ def _maybe_apply_auto_prompt_cache_key(
     if isinstance(internal, list) and "prompt_cache_key" not in internal:
         internal.append("prompt_cache_key")
     return key
+
+
+def _openai_http_affinity_keys(
+    headers: Any,
+    body: dict,
+    *,
+    api_key_name: str,
+    client_ip: str,
+    model: str,
+    ingress_protocol: str,
+) -> tuple[str | None, str | None]:
+    """Return ``(effective, legacy_transcript)`` OpenAI affinity keys.
+
+    A stable ``session-id`` header wins over a client-explicit
+    ``prompt_cache_key``, followed by Claude Code's native session header.  When
+    none exists the historical transcript fingerprint remains authoritative.
+    Stable identifiers are hashed with the API-key tenant/protocol/model boundary
+    before they are used as affinity keys.
+    """
+    if ingress_protocol == "chat":
+        legacy = fingerprint.fingerprint_query_chat(
+            api_key_name or "", client_ip, body.get("messages") or [],
+        )
+    else:
+        legacy = fingerprint.fingerprint_query_responses(
+            api_key_name or "", client_ip, resolve_current_input_items(body),
+        )
+
+    session_id = str(headers.get("session-id") or "").strip()
+    claude_code_session_id = str(
+        headers.get("x-claude-code-session-id") or ""
+    ).strip()
+    explicit_pck = ""
+    client_fields = body.get("_client_body_fields")
+    if (
+        (isinstance(client_fields, list) and "prompt_cache_key" in client_fields)
+        or (client_fields is None and "prompt_cache_key" in body)
+    ):
+        explicit_pck = str(body.get("prompt_cache_key") or "").strip()
+
+    if session_id:
+        stable_kind, stable_value = "session-id", session_id
+    elif explicit_pck:
+        stable_kind, stable_value = "prompt_cache_key", explicit_pck
+    elif claude_code_session_id:
+        stable_kind, stable_value = (
+            "claude-code-session-id", claude_code_session_id,
+        )
+    else:
+        stable_kind, stable_value = "", ""
+    stable = fingerprint.stable_openai_affinity_key(
+        api_key_name or "", ingress_protocol, model, stable_kind, stable_value,
+    ) if stable_value else None
+    return stable or legacy, legacy
+
+
+def _bridge_legacy_openai_affinity(
+    stable_fp_query: str | None,
+    legacy_fp_query: str | None,
+    *,
+    prompt_cache_key: str | None = None,
+    requested_model: str | None = None,
+) -> bool:
+    """Bind an unbound stable key from this request's exact legacy transcript.
+
+    Client-level soft affinity is deliberately not consulted: it is useful for
+    cache locality but is not proof of encrypted-content ownership.
+    """
+    if not stable_fp_query or stable_fp_query == legacy_fp_query:
+        return False
+    if affinity.get(stable_fp_query) is not None:
+        return False
+    legacy = affinity.get(legacy_fp_query) if legacy_fp_query else None
+    if not isinstance(legacy, dict):
+        return False
+    channel_key = str(legacy.get("channel_key") or "")
+    bound_model = str(legacy.get("model") or "")
+    if not channel_key or not bound_model:
+        return False
+    if requested_model:
+        bound_channel = registry.get_channel(channel_key)
+        try:
+            resolved = bound_channel.supports_model(requested_model) if bound_channel else None
+        except Exception:
+            resolved = None
+        if resolved != bound_model:
+            return False
+    explicit_pck = str(prompt_cache_key or "").strip()
+    affinity.upsert(
+        stable_fp_query,
+        channel_key,
+        bound_model,
+        prompt_cache_key=(explicit_pck or legacy.get("prompt_cache_key")),
+    )
+    return True
 
 
 # ─── 主入口 ───────────────────────────────────────────────────────
@@ -430,15 +526,27 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 下划线前缀 + 不在 CHAT/RESPONSES_REQ_ALLOWED 白名单里 → filter_*_passthrough 不会转发给上游。
     body["_api_key_name"] = key_name or ""
 
-    # 5. fingerprint_query（会话亲和；MS-7 接入）
-    if ingress_protocol == "chat":
-        fp_query = fingerprint.fingerprint_query_chat(
-            key_name or "", client_ip, body.get("messages") or []
-        )
-    else:
-        fp_query = fingerprint.fingerprint_query_responses(
-            key_name or "", client_ip, resolve_current_input_items(body)
-        )
+    # 5. fingerprint_query（会话亲和）。稳定 session-id header 优先，其次
+    # 下游显式 prompt_cache_key、Claude Code session；没有稳定标识时保持
+    # 旧 transcript fingerprint。
+    fp_query, legacy_fp_query = _openai_http_affinity_keys(
+        request.headers,
+        body,
+        api_key_name=key_name or "",
+        client_ip=client_ip,
+        model=model,
+        ingress_protocol=ingress_protocol,
+    )
+    _bridge_legacy_openai_affinity(
+        fp_query,
+        legacy_fp_query,
+        prompt_cache_key=(
+            str(body.get("prompt_cache_key") or "").strip()
+            if "prompt_cache_key" in (body.get("_client_body_fields") or [])
+            else None
+        ),
+        requested_model=model,
+    )
 
     # 5.1 OpenAI 专用 prompt cache 路由 hint：下游没传时基于亲和链自动补。
     #     Anthropic/其他协议不走本 handler，不受影响。

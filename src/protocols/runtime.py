@@ -87,14 +87,19 @@ def json_error_for_ingress(
     message: str,
     *,
     code: str | None = None,
+    details: dict | None = None,
 ):
     if ingress == "anthropic":
         if protocol_errors.is_context_length_code_or_message(code, message):
             message = protocol_errors.context_length_error_message_for_claude_code(message)
             code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
-        return errors.json_error_response(status, anth_err_type, message, code=code)
+        return errors.json_error_response(
+            status, anth_err_type, message, code=code, details=details,
+        )
     mapped = translate_error_type(anth_err_type, ingress)
-    return errors.json_error_openai(status, mapped, message, code=code)
+    return errors.json_error_openai(
+        status, mapped, message, code=code, details=details,
+    )
 
 
 def make_stream_translator(translator_ctx: Optional[dict]):
@@ -513,6 +518,87 @@ def _upstream_error_identity(result: AttemptResult) -> tuple[str, str, bool]:
     return error_type, error_code, structured
 
 
+def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
+    """Recognize only explicit account/billing exhaustion signals.
+
+    Generic 403/429 responses deliberately remain unclassified so their existing
+    OAuth refresh and retry behaviour is unchanged.
+    """
+    try:
+        status = int(getattr(result, "http_status", None) or 0)
+    except (TypeError, ValueError):
+        return None
+    if status not in (403, 429):
+        return None
+
+    detail = str(getattr(result, "error_detail", "") or "").strip()[:4000]
+    error_type, error_code, _ = _upstream_error_identity(result)
+    message = detail
+    start = detail.find("{")
+    if start >= 0:
+        try:
+            obj = json.loads(detail[start:])
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            error_obj = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+            if isinstance(error_obj, dict):
+                message = str(error_obj.get("message") or obj.get("message") or detail)
+    low = " ".join((error_type, error_code, message.lower(), detail.lower()))
+
+    matched = False
+    if status == 429:
+        matched = error_code in {
+            "quota_exhausted",
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+            "billing_limit_reached",
+            "billing_not_active",
+            "credits_exhausted",
+            "credit_balance_exhausted",
+        } or error_type in {"insufficient_quota", "billing_error"}
+        if not matched:
+            matched = any(marker in low for marker in (
+                "exceeded your current quota",
+                "insufficient quota",
+                "check your plan and billing details",
+                "billing hard limit",
+                "billing limit has been reached",
+                "out of credits",
+                "no credits remaining",
+                "not enough credits",
+                "credit balance is too low",
+                "usage credits are required",
+            ))
+    elif status == 403:
+        matched = error_code in {
+            "quota_exhausted",
+            "insufficient_quota",
+            "billing_hard_limit_reached",
+            "billing_limit_reached",
+            "billing_not_active",
+            "credits_exhausted",
+            "credit_balance_exhausted",
+        } or error_type in {"insufficient_quota", "billing_error"}
+        if not matched:
+            matched = any(marker in low for marker in (
+                "used all credits",
+                "used all your credits",
+                "all credits have been used",
+                "credits exhausted",
+                "monthly spending limit",
+                "monthly spend limit",
+                "monthly budget has been reached",
+            ))
+    if not matched:
+        return None
+    return {
+        "classification": "quota_exhausted",
+        "code": error_code or error_type,
+        "message": message,
+    }
+
+
 def retryable_transient_error_kind(channel: Any, result: AttemptResult) -> str | None:
     """Classify the small allowlist of safe pre-commit same-candidate retries.
 
@@ -880,6 +966,9 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
         out = []
         removed = 0
         for item in value:
+            if isinstance(item, dict) and item.get("type") == "encrypted_content":
+                removed += 1
+                continue
             new_item, n = _strip_encrypted_content_value(item)
             removed += n
             out.append(new_item)
@@ -888,22 +977,15 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
 
 
 def retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
-    """Build a one-shot fallback request by stripping downstream EC from input."""
-    retry_body = copy.deepcopy(body)
-    inp = retry_body.get("input")
-    if not isinstance(inp, list):
-        return retry_body, 0
-    new_input: list[Any] = []
-    removed = 0
-    for item in inp:
-        if isinstance(item, dict) and item.get("type") == "reasoning":
-            removed += 1
-            continue
-        new_item, n = _strip_encrypted_content_value(item)
-        removed += n
-        new_input.append(new_item)
-    retry_body["input"] = new_input
-    return retry_body, removed
+    """Deep-copy a request and recursively remove only encrypted content.
+
+    Reasoning items themselves are portable once their opaque EC field is gone;
+    summary/content/id and adjacent message/tool items must remain available to a
+    failover candidate.
+    """
+    copied = copy.deepcopy(body)
+    stripped, removed = _strip_encrypted_content_value(copied)
+    return (stripped if isinstance(stripped, dict) else copied), removed
 
 
 def is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:

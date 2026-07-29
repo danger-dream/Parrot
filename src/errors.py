@@ -23,17 +23,32 @@ class ErrType:
     OVERLOADED = "overloaded_error"
 
 
-def build_error_payload(err_type: str, message: str, *, code: Optional[str] = None) -> dict:
+def build_error_payload(
+    err_type: str,
+    message: str,
+    *,
+    code: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> dict:
     error = {"type": err_type, "message": message}
     if code is not None:
         error["code"] = code
+    if details is not None:
+        error["details"] = details
     return {"type": "error", "error": error}
 
 
-def json_error_response(status: int, err_type: str, message: str, *, code: Optional[str] = None) -> JSONResponse:
+def json_error_response(
+    status: int,
+    err_type: str,
+    message: str,
+    *,
+    code: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status,
-        content=build_error_payload(err_type, message, code=code),
+        content=build_error_payload(err_type, message, code=code, details=details),
     )
 
 
@@ -64,16 +79,23 @@ class ErrTypeOpenAI:
 
 
 def _openai_error_body(err_type: str, message: str, *, param: Optional[str] = None,
-                       code: Optional[str] = None) -> dict:
-    return {"error": {"message": message, "type": err_type, "code": code, "param": param}}
+                       code: Optional[str] = None,
+                       details: Optional[dict] = None) -> dict:
+    error = {"message": message, "type": err_type, "code": code, "param": param}
+    if details is not None:
+        error["details"] = details
+    return {"error": error}
 
 
 def json_error_openai(status: int, err_type: str, message: str,
-                      *, param: Optional[str] = None, code: Optional[str] = None) -> JSONResponse:
+                      *, param: Optional[str] = None, code: Optional[str] = None,
+                      details: Optional[dict] = None) -> JSONResponse:
     """OpenAI 风格的 HTTP JSON 错误响应（未发首包时用）。"""
     return JSONResponse(
         status_code=status,
-        content=_openai_error_body(err_type, message, param=param, code=code),
+        content=_openai_error_body(
+            err_type, message, param=param, code=code, details=details,
+        ),
     )
 
 

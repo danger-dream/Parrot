@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
 import traceback
 import uuid
@@ -54,6 +55,7 @@ from .protocols.runtime import (
     DEFAULT_TRANSIENT_RETRY_DELAYS_S,
     MAX_CONFIGURED_TRANSIENT_RETRIES,
     apply_non_stream_response_translator,
+    bounded_account_quota_error,
     configured_transient_retry_delays,
     failover_final_http_status,
     is_context_1m_credit_error,
@@ -403,6 +405,7 @@ def _write_affinity_non_stream(
     channel_key: str,
     resolved_model: str,
     client_key: Optional[str] = None,
+    fp_query: Optional[str] = None,
 ) -> None:
     """成功完成非流式请求后按 ingress 走对应家族的 fingerprint_write。"""
     fp_write: Optional[str] = None
@@ -423,10 +426,19 @@ def _write_affinity_non_stream(
         fp_write = fingerprint.fingerprint_write_responses(
             api_key_name or "", client_ip or "", cur_input, ds_output,
         )
+    prompt_cache_key = _openai_prompt_cache_key_from_body(ingress_protocol, body)
+    # Stable session fp_query must follow the channel that actually succeeded.
+    # This is also safe for legacy transcript fp_query and closes the stale-owner
+    # window during failover; fp_write remains the forward transcript bridge.
+    if fp_query:
+        affinity.upsert(
+            fp_query, channel_key, resolved_model,
+            prompt_cache_key=prompt_cache_key,
+        )
     if fp_write:
         affinity.upsert(
             fp_write, channel_key, resolved_model,
-            prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+            prompt_cache_key=prompt_cache_key,
         )
     # 同步更新 client-level soft affinity
     if client_key:
@@ -521,8 +533,11 @@ def _json_error_for_ingress(
     message: str,
     *,
     code: Optional[str] = None,
+    details: Optional[dict] = None,
 ):
-    return json_error_for_ingress(ingress, status, anth_err_type, message, code=code)
+    return json_error_for_ingress(
+        ingress, status, anth_err_type, message, code=code, details=details,
+    )
 
 
 def _should_cooldown(outcome: str) -> bool:
@@ -581,6 +596,23 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
 
 def _retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
     return retry_body_without_encrypted_content(body)
+
+
+def _attempt_body_for_channel(
+    body: dict,
+    channel_key: str,
+    bound_channel_key: Optional[str],
+    portable_body: Optional[dict] = None,
+) -> dict:
+    """Return the body safe for one candidate without mutating request state."""
+    if channel_key == bound_channel_key:
+        return body
+    if portable_body is not None:
+        return portable_body
+    if bound_channel_key:
+        stripped, _ = _retry_body_without_encrypted_content(body)
+        return stripped
+    return body
 
 
 def _is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
@@ -662,6 +694,180 @@ def _should_use_responses_upstream_ws(
 
 def _elapsed_ms(start_monotonic: float) -> int:
     return max(0, int((time.monotonic() - start_monotonic) * 1000))
+
+
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"']+")
+_SECRET_RE = re.compile(r"(?i)\b(?:sk|sess|key)-[A-Za-z0-9_-]{8,}\b")
+_FIELD_SECRET_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _sanitize_upstream_message(value: Any) -> str:
+    """Extract one readable, bounded message without nested JSON or credentials."""
+    text = str(value or "").strip()
+    text = re.sub(r"^HTTP\s+\d{3}\s*:\s*", "", text, flags=re.IGNORECASE)
+    code_message = text
+    for _ in range(2):
+        candidate = code_message.strip()
+        start = candidate.find("{")
+        if start < 0:
+            break
+        try:
+            obj = json.loads(candidate[start:])
+        except Exception:
+            break
+        if not isinstance(obj, dict):
+            break
+        error_obj = obj.get("error")
+        if isinstance(error_obj, dict):
+            next_value = (
+                error_obj.get("message") or error_obj.get("detail")
+                or obj.get("message") or obj.get("detail")
+            )
+        elif isinstance(error_obj, str):
+            next_value = error_obj
+        else:
+            next_value = obj.get("message") or obj.get("detail")
+        if next_value is None:
+            code_message = "Upstream returned an error"
+            break
+        code_message = str(next_value)
+    if code_message.lstrip().startswith(("{", "[")):
+        code_message = "Upstream returned an error"
+    code_message = _BEARER_RE.sub("Bearer [redacted]", code_message)
+    code_message = _FIELD_SECRET_RE.sub("credential=[redacted]", code_message)
+    code_message = _SECRET_RE.sub("[redacted credential]", code_message)
+    code_message = _EMAIL_RE.sub("[redacted account]", code_message)
+    code_message = re.sub(r"\s+", " ", code_message).strip()
+    return (code_message or "Unknown upstream error")[:500]
+
+
+def _structured_attempt_error(
+    result: AttemptResult,
+    ordinal: int,
+    channel: Optional[Channel] = None,
+) -> dict:
+    quota = bounded_account_quota_error(result)
+    status = int(result.http_status) if isinstance(result.http_status, int) else None
+    detail = str(result.error_detail or "")
+    code = str(result.error_code or "").strip() or None
+    if code is None:
+        start = detail.find("{")
+        if start >= 0:
+            try:
+                obj = json.loads(detail[start:])
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                error_obj = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+                if isinstance(error_obj, dict):
+                    raw_code = error_obj.get("code") or error_obj.get("type") or obj.get("code")
+                    code = str(raw_code).strip() if raw_code is not None else None
+    if code and (
+        len(code) > 120
+        or _EMAIL_RE.search(code)
+        or _SECRET_RE.search(code)
+        or _FIELD_SECRET_RE.search(code)
+    ):
+        code = None
+    if quota is not None:
+        classification = "quota_exhausted"
+    elif result.outcome in ("request_invalid", "guard_error", "candidate_guard"):
+        classification = "invalid_request"
+    elif status == 401:
+        classification = "authentication_error"
+    elif status == 403:
+        classification = "permission_error"
+    elif status == 429:
+        classification = "rate_limit_error"
+    elif status is not None and status >= 500:
+        classification = "upstream_server_error"
+    elif status is not None:
+        classification = "upstream_http_error"
+    elif "timeout" in str(result.outcome or ""):
+        classification = "timeout"
+    elif result.outcome in ("connect_error", "transport_error", "proxy_connect_error"):
+        classification = "transport_error"
+    else:
+        classification = str(result.outcome or "upstream_error")
+
+    transient_kind = retryable_transient_error_kind(channel, result) if channel is not None else None
+    if quota is not None:
+        retryable, retry_scope = True, "next_candidate"
+    elif transient_kind:
+        retryable, retry_scope = True, "same_candidate"
+    elif classification == "invalid_request":
+        retryable, retry_scope = False, "none"
+    else:
+        retryable, retry_scope = True, "next_candidate"
+    return {
+        "attempt": int(ordinal),
+        "status": status,
+        "classification": classification,
+        "code": code,
+        "message": _sanitize_upstream_message(
+            quota.get("message") if quota is not None else detail
+        ),
+        "retryable": retryable,
+        "retry_scope": retry_scope,
+    }
+
+
+def _structured_failure_details(attempts: list[dict]) -> dict:
+    safe_attempts = [dict(item) for item in attempts]
+    if not safe_attempts:
+        safe_attempts = [{
+            "attempt": 0,
+            "status": None,
+            "classification": "no_candidates",
+            "code": None,
+            "message": "No upstream candidate produced a response",
+            "retryable": False,
+            "retry_scope": "none",
+        }]
+    priority = {
+        "invalid_request": 100,
+        "quota_exhausted": 95,
+        "authentication_error": 90,
+        "permission_error": 85,
+        "rate_limit_error": 80,
+        "upstream_http_error": 75,
+        "upstream_server_error": 70,
+        "timeout": 60,
+        "transport_error": 50,
+    }
+    root_attempt = max(
+        safe_attempts,
+        key=lambda item: priority.get(str(item.get("classification") or ""), 40),
+    )
+    root_cause = {
+        key: root_attempt.get(key)
+        for key in ("status", "classification", "code", "message")
+    }
+    # Attempt entries describe Parrot's internal candidate progression.  The
+    # terminal root cause instead tells the downstream whether replaying the
+    # whole Parrot request is useful after every candidate has been exhausted.
+    if root_cause.get("classification") == "quota_exhausted":
+        root_cause.update(retryable=False, retry_scope="none")
+    elif bool(root_attempt.get("retryable")):
+        root_cause.update(retryable=True, retry_scope="request")
+    else:
+        root_cause.update(retryable=False, retry_scope="none")
+    status_text = f" {root_cause['status']}" if root_cause.get("status") is not None else ""
+    summary = (
+        f"Upstream{status_text} {root_cause['classification']}: "
+        f"{root_cause['message']}"
+    )
+    if len(safe_attempts) > 1:
+        summary += f" ({len(safe_attempts)} upstream attempts failed)"
+    return {
+        "summary": summary[:700],
+        "root_cause": root_cause,
+        "attempts": safe_attempts,
+    }
 
 
 # Only explicit transient provider signals are retried on the same candidate.
@@ -1182,6 +1388,15 @@ async def run_failover(
     affinity_hit = 1 if schedule_result.affinity_hit else 0
     fp_query = schedule_result.fp_query
     client_key = getattr(schedule_result, "client_key", None)
+    bound_channel_key = getattr(schedule_result, "bound_channel_key", None)
+    encrypted_content_count = int(
+        getattr(schedule_result, "encrypted_content_count", 0) or 0
+    )
+    portable_body: Optional[dict] = None
+    if encrypted_content_count > 0:
+        stripped_body, removed_ec = _retry_body_without_encrypted_content(body)
+        if removed_ec > 0:
+            portable_body = stripped_body
 
     cfg = config.get()
     timeouts = cfg.get("timeouts") or {}
@@ -1283,6 +1498,7 @@ async def run_failover(
     retried_without_context_1m: set[tuple[str, str]] = set()
     retried_without_encrypted_content = False
     last_result: Optional[AttemptResult] = None
+    structured_attempts: list[dict] = []
     # 跟踪真实最后尝试的渠道（不同于"候选列表最后一条"，因为 OAuth 重刷会重试同 ch）
     last_ch_key: Optional[str] = None
     last_ch_type: Optional[str] = None
@@ -1334,9 +1550,11 @@ async def run_failover(
             candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
             candidate_openai_local_web_loop = openai_local_web_loop_active
             effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
-            attempt_body = body
-            if (candidate_local_web_loop or candidate_openai_local_web_loop) and body.get("stream"):
-                attempt_body = dict(body)
+            attempt_body = _attempt_body_for_channel(
+                body, ch.key, bound_channel_key, portable_body,
+            )
+            if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
+                attempt_body = dict(attempt_body)
                 attempt_body["stream"] = False
             if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
                 result = await _try_openai_oauth_responses_ws_channel(
@@ -1363,6 +1581,11 @@ async def run_failover(
             raise
         result = _request_invalid_result_if_needed(result)
         last_result = result
+        quota_exhaustion = bounded_account_quota_error(result)
+        if not result.success and not result.stream_started:
+            structured_attempts.append(
+                _structured_attempt_error(result, attempt_order, ch),
+            )
         if _attempt_proxy and not result.proxy_name:
             result.proxy_name = _attempt_proxy
 
@@ -1528,6 +1751,14 @@ async def run_failover(
                 continue
 
         if result.success or result.stream_started:
+            # Non-stream success is also rebound at the orchestration boundary so
+            # every successful candidate (including specialized transports) moves
+            # the stable session owner.  Streaming success rebinds on completion.
+            if result.success and not result.stream_started and fp_query:
+                affinity.upsert(
+                    fp_query, ch.key, resolved_model,
+                    prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+                )
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             # 并发 slot release 挂到响应体 finally：stream 消费完 / 客户端断开都会释放
@@ -1611,6 +1842,7 @@ async def run_failover(
             _recovery_retry_allowed("oauthRefresh", cfg)
             and ch.type == "oauth"
             and result.http_status in (401, 403)
+            and quota_exhaustion is None
             and ch.key not in refreshed_once
         ):
             refreshed_once.add(ch.key)
@@ -1693,7 +1925,8 @@ async def run_failover(
         # retries do not score/cool down; the terminal failure below does so once.
         transient_kind = retryable_transient_error_kind(ch, result)
         if (
-            transient_retries_used < transient_retry_limit
+            quota_exhaustion is None
+            and transient_retries_used < transient_retry_limit
             and _transient_retry_allowed(transient_kind, cfg)
         ):
             delay = await _wait_for_overload_retry(
@@ -1772,9 +2005,11 @@ async def run_failover(
                     candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
                     candidate_openai_local_web_loop = openai_local_web_loop_active
                     effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
-                    attempt_body = body
-                    if (candidate_local_web_loop or candidate_openai_local_web_loop) and body.get("stream"):
-                        attempt_body = dict(body)
+                    attempt_body = _attempt_body_for_channel(
+                        body, ch.key, bound_channel_key, portable_body,
+                    )
+                    if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
+                        attempt_body = dict(attempt_body)
                         attempt_body["stream"] = False
                     if _should_use_responses_upstream_ws(ch, ingress_protocol=ingress_protocol, cfg=cfg):
                         result = await _try_openai_oauth_responses_ws_channel(
@@ -1801,6 +2036,10 @@ async def run_failover(
                     raise
                 result = _request_invalid_result_if_needed(result)
                 last_result = result
+                if not result.success and not result.stream_started:
+                    structured_attempts.append(
+                        _structured_attempt_error(result, attempt_order, ch),
+                    )
                 if _attempt_proxy2 and not result.proxy_name:
                     result.proxy_name = _attempt_proxy2
                 log_db.update_retry_attempt(
@@ -1828,6 +2067,11 @@ async def run_failover(
                 if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
                 if result.success or result.stream_started:
+                    if result.success and not result.stream_started and fp_query:
+                        affinity.upsert(
+                            fp_query, ch.key, resolved_model,
+                            prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+                        )
                     _attach_release_to_response(result.response, _release_q)
                     return result.response
                 _release_q()
@@ -1904,7 +2148,8 @@ async def run_failover(
     if last_result and last_result.outcome == "candidate_guard":
         status = int(last_result.http_status or 400)
         err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(status)
-    msg = f"All upstream channels failed. Last error: {err_detail[:400]}"
+    failure_details = _structured_failure_details(structured_attempts)
+    msg = str(failure_details["summary"])
 
     request_elapsed_ms = _elapsed_ms(start_monotonic)
     await asyncio.to_thread(
@@ -1926,7 +2171,14 @@ async def run_failover(
         proxy_bytes_down=(last_result.proxy_bytes_down if last_result else None),
         **_request_stage_kwargs(last_result),
     )
-    return _json_error_for_ingress(ingress_protocol, status, err_type, msg)
+    return _json_error_for_ingress(
+        ingress_protocol,
+        status,
+        err_type,
+        msg,
+        code=failure_details["root_cause"].get("code"),
+        details=failure_details,
+    )
 
 
 # ─── 并发 slot release 辅助 ──────────────────────────────────────
@@ -2917,6 +3169,7 @@ async def _consume_oauth_responses_ws_non_stream(
         "responses", api_key_name, client_ip, messages,
         {"role": "assistant", "content": obj.get("output") or []},
         body, out_obj, ch.key, resolved_model, client_key=client_key,
+        fp_query=fp_query,
     )
     await await_ws_owned(asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
@@ -3099,7 +3352,7 @@ async def _consume_oauth_responses_ws_stream(
             "responses", api_key_name, client_ip, messages,
             {"role": "assistant", "content": tracker.get_output_items()},
             body, tracker.to_full_json(fallback_model=resolved_model), ch.key, resolved_model,
-            client_key=client_key,
+            client_key=client_key, fp_query=fp_query,
         )
         # encrypted_content 透明透传：上游产出的 reasoning 只返回给下游，
         # Parrot 不做本地持久化或后续回填。
@@ -3613,7 +3866,7 @@ async def _consume_non_stream(
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
                                 ch.key, resolved_model,
-                                client_key=client_key)
+                                client_key=client_key, fp_query=fp_query)
 
     response = JSONResponse(
         content=out_obj,
@@ -3747,7 +4000,7 @@ async def _consume_stream_as_non_stream(
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
                                 ch.key, resolved_model,
-                                client_key=client_key)
+                                client_key=client_key, fp_query=fp_query)
 
     response = JSONResponse(
         content=out_obj,
@@ -4024,10 +4277,16 @@ async def _consume_stream(
             fp_write = fingerprint.fingerprint_write_responses(
                 api_key_name or "", client_ip or "", cur_input, output_items,
             )
+        prompt_cache_key = _openai_prompt_cache_key_from_body(ingress_protocol, body)
+        if fp_query:
+            affinity.upsert(
+                fp_query, ch.key, resolved_model,
+                prompt_cache_key=prompt_cache_key,
+            )
         if fp_write:
             affinity.upsert(
                 fp_write, ch.key, resolved_model,
-                prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
+                prompt_cache_key=prompt_cache_key,
             )
         # 同步更新 client-level soft affinity
         if client_key:

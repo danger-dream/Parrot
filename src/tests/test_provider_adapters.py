@@ -47,6 +47,7 @@ def test_provider_capabilities_expose_protocols_and_state_boundaries():
     assert xai.adapter_name == "xai-oauth"
     assert xai.protocols == frozenset({"openai-responses"})
     assert "prompt_cache_key" in xai.native_state
+    assert "encrypted_reasoning_replay" in xai.native_state
     assert "web_search" in xai.native_state
     assert "tool_search" not in xai.native_state
     assert "namespace" not in xai.native_state

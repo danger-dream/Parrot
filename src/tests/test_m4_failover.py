@@ -188,6 +188,16 @@ def sse_midstream_error():
                           headers={"content-type": "text/event-stream"})
 
 
+def sse_truncated_after_visible_output():
+    payload = (
+        b'data: {"type":"message_start","message":{"id":"msg_truncated","role":"assistant","usage":{"input_tokens":10}}}\n\n'
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
 def responses_sse_midstream_error():
     payload = (
         b'event: response.created\n'
@@ -417,7 +427,7 @@ _REQUEST_SEQ = itertools.count()
 
 
 async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip="1.1.1.1",
-                      ingress_protocol="anthropic"):
+                      ingress_protocol="anthropic", fp_query=None):
     """模拟 server.py /v1/messages 或 OpenAI handler 的核心调用链。"""
     # conftest makes MockTransport emit HTTPcore's authoritative send-body
     # boundary; proxy-specific fakes below do the same from their context owner.
@@ -438,7 +448,7 @@ async def _call_proxy(m, router: MockRouter, body: dict, api_key="k1", client_ip
 
     sched_result = m["scheduler"].schedule(
         body, api_key_name=api_key, client_ip=client_ip,
-        ingress_protocol=ingress_protocol,
+        ingress_protocol=ingress_protocol, fp_query=fp_query,
     )
     if not sched_result.candidates:
         from src import errors as er
@@ -662,17 +672,25 @@ async def test_invalid_encrypted_content_retries_same_channel_without_ec(m):
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
         ],
     }
-    resp, rid, sr, mc = await _call_proxy(m, router, body, ingress_protocol="responses")
+    # EC replay is accepted only with an exact owner binding.
+    m["affinity"].upsert("ec-owner-fp", chA.key, "gpt-5.5")
+    resp, rid, sr, mc = await _call_proxy(
+        m, router, body, ingress_protocol="responses", fp_query="ec-owner-fp",
+    )
     assert resp.status_code == 200, getattr(resp, "body", b"")[:500]
     await mc.aclose()
 
     assert chb_calls["count"] == 0
     assert len(calls) == 2
     assert any(item.get("type") == "reasoning" for item in calls[0]["input"])
-    assert all(item.get("type") != "reasoning" for item in calls[1]["input"])
-    assert calls[1]["input"] == [
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
-    ]
+    assert calls[1]["input"][0] == {
+        "type": "reasoning", "id": "rs_bad", "summary": [],
+    }
+    assert "encrypted_content" not in calls[1]["input"][0]
+    assert calls[1]["input"][1] == {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "continue"}],
+    }
     out = json.loads(resp.body)
     assert out["output_text"] == "recovered"
     log = m["log_db"].log_detail(rid)
@@ -709,6 +727,32 @@ async def test_stream_success_full_forward(m):
     assert log["log"]["output_tokens"] == 7
     assert log["log"]["cache_read_tokens"] == 2
     print("  [PASS] stream_success_full_forward")
+
+
+async def test_http_stream_affinity_rebinds_only_after_complete_finalizer(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: http_500())
+    router.register("https://chb", lambda r: sse_ok())
+    chA = _make_channel(m, "chA", "https://cha")
+    chB = _make_channel(m, "chB", "https://chb")
+    _install_channels(m, [chA, chB])
+    stable_fp = "stable-http-stream-complete"
+    m["affinity"].upsert(stable_fp, chA.key, "glm-5")
+
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, fp_query=stable_fp)
+    assert resp.status_code == 200
+    # Returning a StreamingResponse is not a successful terminal event yet.
+    assert m["affinity"].get(stable_fp)["channel_key"] == chA.key
+
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    assert "message_stop" in body_text
+    assert m["affinity"].get(stable_fp)["channel_key"] == chB.key
+    assert m["log_db"].log_detail(rid)["log"]["status"] == "success"
 
 
 async def test_stream_first_event_error_switches(m, monkeypatch):
@@ -791,6 +835,36 @@ async def test_stream_midstream_error_logs_upstream_error(m):
     assert log["retry_chain"][0]["outcome"] == "stream_upstream_error"
     assert log["retry_chain"][0]["total_ms"] is not None
     print("  [PASS] stream midstream error → DB records upstream error, not client disconnected")
+
+
+@pytest.mark.parametrize(
+    "stream_response",
+    [sse_midstream_error, sse_truncated_after_visible_output],
+    ids=["terminal-error", "truncated"],
+)
+async def test_http_started_stream_error_or_truncation_does_not_rebind(m, stream_response):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: http_500())
+    router.register("https://chb", lambda r: stream_response())
+    chA = _make_channel(m, "chA", "https://cha")
+    chB = _make_channel(m, "chB", "https://chb")
+    _install_channels(m, [chA, chB])
+    stable_fp = f"stable-http-stream-{stream_response.__name__}"
+    m["affinity"].upsert(stable_fp, chA.key, "glm-5")
+
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body, fp_query=stable_fp)
+    assert resp.status_code == 200
+    assert m["affinity"].get(stable_fp)["channel_key"] == chA.key
+
+    body_text = await _consume_streaming_to_string(resp)
+    await _close_background(resp, mc)
+
+    assert m["affinity"].get(stable_fp)["channel_key"] == chA.key
+    assert m["log_db"].log_detail(rid)["log"]["status"] == "error"
+    assert "error" in body_text
 
 
 async def test_responses_error_before_visible_chunk_switches(m, monkeypatch):

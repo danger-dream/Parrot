@@ -142,22 +142,37 @@ def test_auto_prompt_cache_key_uses_claude_session_in_random_fallback(m):
     assert key1 != changed_ip
 
 
-def test_auto_prompt_cache_key_stable_anchor_precedes_claude_session(m):
+def test_auto_prompt_cache_key_claude_session_precedes_stable_anchor(m):
     _setup(m)
-    body = {"model": "gpt-5.5", "messages": [
+    early_body = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "bootstrap"},
+    ]}
+    mature_body = {"model": "gpt-5.5", "messages": [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "bootstrap"},
         {"role": "assistant", "content": "ack"},
+        {"role": "tool", "content": "tool result"},
         {"role": "user", "content": "real task"},
     ]}
+    kwargs = {
+        "fp_query": None,
+        "api_key_name": "alice",
+        "client_ip": "1.2.3.4",
+        "model": "gpt-5.5",
+        "ingress_protocol": "chat",
+        "claude_code_session_id": "123e4567-e89b-12d3-a456-426614174000",
+    }
 
-    key = m["handler"]._maybe_apply_auto_prompt_cache_key(
-        body, fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
-        model="gpt-5.5", ingress_protocol="chat",
-        claude_code_session_id="123e4567-e89b-12d3-a456-426614174000",
+    early_key = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        early_body, **kwargs,
+    )
+    mature_key = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        mature_body, **kwargs,
     )
 
-    assert key.startswith("parrot:auto:v1:stable:")
+    assert early_key == mature_key
+    assert early_key.startswith("parrot:auto:v1:claude-session:")
 
 
 def test_handler_forwards_claude_session_header_to_pck_resolver(m):

@@ -46,12 +46,19 @@ def _clean_str(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _cache_key(model: str | None, session_key: str | None) -> str:
+def _cache_key(
+    model: str | None,
+    session_key: str | None,
+    account_key: str | None = None,
+) -> str:
     model_s = _clean_str(model)
     session_s = _clean_str(session_key)
+    account_s = _clean_str(account_key)
     if not model_s or not session_s:
         return ""
-    return "\x00".join(("codex-reasoning-replay", model_s, session_s))
+    # account_key is an ownership boundary: equal session/model values on two
+    # OAuth workspaces must never share opaque encrypted reasoning.
+    return "\x00".join(("codex-reasoning-replay", account_s, model_s, session_s))
 
 
 def _clone_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -115,16 +122,24 @@ def clear() -> None:
         _entries.clear()
 
 
-def delete(model: str | None, session_key: str | None) -> None:
-    key = _cache_key(model, session_key)
+def delete(
+    model: str | None,
+    session_key: str | None,
+    account_key: str | None = None,
+) -> None:
+    key = _cache_key(model, session_key, account_key)
     if not key:
         return
     with _lock:
         _entries.pop(key, None)
 
 
-def get(model: str | None, session_key: str | None) -> list[dict[str, Any]]:
-    key = _cache_key(model, session_key)
+def get(
+    model: str | None,
+    session_key: str | None,
+    account_key: str | None = None,
+) -> list[dict[str, Any]]:
+    key = _cache_key(model, session_key, account_key)
     if not key:
         return []
     with _lock:
@@ -196,13 +211,18 @@ def normalize_items(items: Any) -> list[dict[str, Any]]:
     return out
 
 
-def cache_items(model: str | None, session_key: str | None, items: Any) -> bool:
-    key = _cache_key(model, session_key)
+def cache_items(
+    model: str | None,
+    session_key: str | None,
+    items: Any,
+    account_key: str | None = None,
+) -> bool:
+    key = _cache_key(model, session_key, account_key)
     if not key:
         return False
     normalized = normalize_items(items)
     if not normalized:
-        delete(model, session_key)
+        delete(model, session_key, account_key)
         return False
     with _lock:
         _purge_expired()
@@ -304,14 +324,24 @@ def session_key_from_headers(headers: Any) -> str:
     return ""
 
 
-def scope_from_payload(model: str | None, payload: Any, headers: Any = None) -> dict[str, str] | None:
+def scope_from_payload(
+    model: str | None,
+    payload: Any,
+    headers: Any = None,
+    *,
+    account_key: str | None = None,
+) -> dict[str, str] | None:
     model_s = _clean_str(model)
     if not model_s:
         return None
     session_key = session_key_from_payload(payload) or session_key_from_headers(headers)
     if not session_key:
         return None
-    return {"model": model_s, "session_key": session_key}
+    scope = {"model": model_s, "session_key": session_key}
+    clean_account_key = _clean_str(account_key)
+    if clean_account_key:
+        scope["account_key"] = clean_account_key
+    return scope
 
 
 def _has_input_reasoning(input_items: list[Any]) -> bool:
@@ -448,7 +478,9 @@ def inject_replay_items(payload: dict[str, Any], scope: dict[str, str] | None) -
     input_items = payload.get("input")
     if not isinstance(input_items, list):
         return 0
-    replay_items = get(scope.get("model"), scope.get("session_key"))
+    replay_items = get(
+        scope.get("model"), scope.get("session_key"), scope.get("account_key"),
+    )
     if not replay_items:
         return 0
     filtered = _filter_replay_for_input(input_items, replay_items)
@@ -460,10 +492,17 @@ def inject_replay_items(payload: dict[str, Any], scope: dict[str, str] | None) -
     return len(filtered)
 
 
-def cache_from_response(model: str | None, session_key: str | None, response_obj: Any) -> bool:
+def cache_from_response(
+    model: str | None,
+    session_key: str | None,
+    response_obj: Any,
+    account_key: str | None = None,
+) -> bool:
     if not isinstance(response_obj, dict):
         return False
-    return cache_items(model, session_key, response_obj.get("output"))
+    return cache_items(
+        model, session_key, response_obj.get("output"), account_key,
+    )
 
 
 def cache_from_translator_ctx(translator_ctx: Any, response_obj: Any) -> bool:
@@ -472,7 +511,10 @@ def cache_from_translator_ctx(translator_ctx: Any, response_obj: Any) -> bool:
     scope = translator_ctx.get("codex_reasoning_replay")
     if not isinstance(scope, dict):
         return False
-    return cache_from_response(scope.get("model"), scope.get("session_key"), response_obj)
+    return cache_from_response(
+        scope.get("model"), scope.get("session_key"), response_obj,
+        scope.get("account_key"),
+    )
 
 
 def delete_from_translator_ctx(translator_ctx: Any) -> bool:
@@ -481,5 +523,7 @@ def delete_from_translator_ctx(translator_ctx: Any) -> bool:
     scope = translator_ctx.get("codex_reasoning_replay")
     if not isinstance(scope, dict):
         return False
-    delete(scope.get("model"), scope.get("session_key"))
+    delete(
+        scope.get("model"), scope.get("session_key"), scope.get("account_key"),
+    )
     return True

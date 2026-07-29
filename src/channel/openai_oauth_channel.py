@@ -345,7 +345,9 @@ class OpenAIOAuthChannel(Channel):
         # Step B: Codex reasoning replay scope。必须在 codex transform 剥 metadata
         # 等字段前计算 scope；没有 prompt_cache_key / metadata / Codex
         # turn/window/session 锚点时不启用，避免跨会话串状态。
-        replay_scope = reasoning_replay.scope_from_payload(resolved_model, payload)
+        replay_scope = reasoning_replay.scope_from_payload(
+            resolved_model, payload, account_key=self.account_key,
+        )
 
         # Step B.5: Anthropic ingress 的 cache_control 在 Anthropic→Responses
         # translator 中会被剥离；在进入 Codex transform 前补 OpenAI/Codex 可用

@@ -267,6 +267,46 @@ def _make_hash_canon(ns: str, api_key_name: str, client_ip: str,
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def stable_openai_affinity_key(
+    api_key_name: str,
+    ingress_protocol: str,
+    model: str,
+    stable_id_kind: str,
+    stable_id: str,
+) -> Optional[str]:
+    """Derive a non-reversible OpenAI HTTP session affinity key.
+
+    The downstream session identifier is never embedded in the stored key.  The
+    API-key tenant, ingress protocol and requested model are part of the digest so
+    equal client identifiers cannot cross those isolation boundaries.
+    """
+    identifier = str(stable_id or "").strip()
+    kind = str(stable_id_kind or "").strip().lower()
+    protocol = str(ingress_protocol or "").strip().lower()
+    requested_model = str(model or "").strip()
+    if not identifier or kind not in (
+        "session-id", "prompt_cache_key", "claude-code-session-id",
+    ):
+        return None
+    if protocol not in ("chat", "responses") or not requested_model:
+        return None
+    material = json.dumps(
+        {
+            "v": 1,
+            "tenant": str(api_key_name or ""),
+            "protocol": protocol,
+            "model": requested_model,
+            "kind": kind,
+            "stable_id": identifier,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"openai-session-v1:{digest[:32]}"
+
+
 # ─── Chat 入口 ───────────────────────────────────────────────────
 
 

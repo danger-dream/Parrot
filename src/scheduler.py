@@ -18,6 +18,7 @@ from .protocols.matrix import (
     capabilities_for_channel,
     extract_request_features,
 )
+from .protocols.runtime import retry_body_without_encrypted_content
 
 
 class ScheduleResult:
@@ -29,11 +30,19 @@ class ScheduleResult:
                  saturated: Optional[list[tuple[Channel, str]]] = None,
                  route_plans: Optional[dict[tuple[str, str], RoutePlan]] = None,
                  guard_errors: Optional[list[str]] = None,
-                 exclusions: Optional[list[dict]] = None):
+                 exclusions: Optional[list[dict]] = None,
+                 bound_channel_key: Optional[str] = None,
+                 encrypted_content_count: int = 0):
         self.candidates = candidates
         self.fp_query = fp_query         # 本次请求计算得到的查询指纹（可用于后续事件记录）
         self.affinity_hit = affinity_hit
         self.client_key = client_key     # client-level affinity key（failover 写入用）
+        # 仅精确 fingerprint/session 绑定可证明 encrypted_content owner。
+        # client-level soft affinity 绝不写入这个字段。
+        self.bound_channel_key = bound_channel_key
+        # 没有精确 owner 时不能保留任何账号密文；failover 依据该标记给所有
+        # 候选发送清理后的临时副本，而不是直接拒绝请求。
+        self.encrypted_content_count = max(0, int(encrypted_content_count or 0))
         # 并发饱和（in_flight >= max）的候选：正常 candidates 全部失败后，
         # failover 会把 saturated 作为"可排队等位"的备选集。
         self.saturated: list[tuple[Channel, str]] = saturated or []
@@ -69,12 +78,14 @@ def _filter_candidates(requested_model: str,
                        ingress_protocol: str = "anthropic",
                        body: Optional[dict] = None,
                        diagnostics: Optional[list[dict]] = None,
+                       bound_channel_key: Optional[str] = None,
+                       portable_body: Optional[dict] = None,
                        ) -> tuple[list[tuple[Channel, str]], list[tuple[Channel, str]], dict[tuple[str, str], RoutePlan], list[str]]:
     """返回 (available, saturated, route_plans)：
        available = 可立即尝试的候选；
        saturated = 其它条件 OK 但当前并发满的候选（作为排队备选）。
     """
-    features = extract_request_features(ingress_protocol, body or {})
+    request_body = body or {}
     available: list[tuple[Channel, str]] = []
     saturated: list[tuple[Channel, str]] = []
     route_plans: dict[tuple[str, str], RoutePlan] = {}
@@ -95,6 +106,13 @@ def _filter_candidates(requested_model: str,
             })
             continue
         ch_protocol = getattr(ch, "protocol", "anthropic")
+        # EC belongs to the exact bound channel.  For every other candidate,
+        # Matrix must plan the portable request shape that failover will actually
+        # send, not reject the candidate based on another account's opaque state.
+        planning_body = request_body
+        if portable_body is not None and ch.key != bound_channel_key:
+            planning_body = portable_body
+        features = extract_request_features(ingress_protocol, planning_body)
         try:
             route_plan = DEFAULT_MATRIX.plan(
                 ingress_protocol,
@@ -193,27 +211,52 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     if not requested_model:
         return ScheduleResult([], None, False)
 
+    if fp_query is None and ingress_protocol == "anthropic":
+        fp_query = fingerprint.fingerprint_query(
+            api_key_name, client_ip, body.get("messages") or [],
+        )
+
+    client_key = affinity.make_client_key(api_key_name, client_ip, requested_model)
+    exact_bound = affinity.get(fp_query) if fp_query else None
+    bound_channel_key: Optional[str] = None
+    if isinstance(exact_bound, dict):
+        candidate_key = str(exact_bound.get("channel_key") or "")
+        bound_model = str(exact_bound.get("model") or "")
+        owner_channel = registry.get_channel(candidate_key) if candidate_key else None
+        try:
+            owner_resolved_model = (
+                owner_channel.supports_model(requested_model) if owner_channel else None
+            )
+        except Exception:
+            owner_resolved_model = None
+        if owner_resolved_model and owner_resolved_model == bound_model:
+            bound_channel_key = candidate_key
+
+    # Opaque encrypted reasoning is portable only to its exact bound owner.
+    # Without ownership proof every candidate must receive a stripped copy; this
+    # is a safe account switch, not a request-format error.
+    portable_body, encrypted_content_count = retry_body_without_encrypted_content(body)
+    if encrypted_content_count <= 0:
+        portable_body = None
+
     exclusions: list[dict] = []
     candidates, saturated, route_plans, guard_errors = _filter_candidates(
         requested_model,
         ingress_protocol,
         body=body,
         diagnostics=exclusions,
+        bound_channel_key=bound_channel_key,
+        portable_body=portable_body,
     )
     if not candidates and not saturated:
         return ScheduleResult(
-            [], None, False,
+            [], fp_query, False,
+            client_key=client_key,
             guard_errors=guard_errors,
             exclusions=exclusions,
+            bound_channel_key=bound_channel_key,
+            encrypted_content_count=encrypted_content_count,
         )
-
-    if fp_query is None and ingress_protocol == "anthropic":
-        fp_query = fingerprint.fingerprint_query(
-            api_key_name, client_ip, body.get("messages") or []
-        )
-
-    # 构造 client-level affinity key
-    client_key = affinity.make_client_key(api_key_name, client_ip, requested_model)
 
     cfg = config.get()
     mode = (cfg.get("channelSelection") or "smart").lower()
@@ -232,4 +275,6 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     return ScheduleResult(candidates, fp_query, affinity_hit,
                           client_key=client_key, saturated=saturated,
                           route_plans=route_plans, guard_errors=guard_errors,
-                          exclusions=exclusions)
+                          exclusions=exclusions,
+                          bound_channel_key=bound_channel_key,
+                          encrypted_content_count=encrypted_content_count)

@@ -280,7 +280,9 @@ def _make_oauth_channel_for_failover(m, *, name="oauth@example.com"):
     return ch
 
 
-async def _call_failover_responses(m, ch, body: dict[str, Any]):
+async def _call_failover_responses(
+    m, ch, body: dict[str, Any], *, fp_query=None, bound_channel_key=None,
+):
     from src.scheduler import ScheduleResult
     request_id = f"http-ws-{len(body)}-{int(time.time()*1000000)}"
     start = time.time()
@@ -290,7 +292,11 @@ async def _call_failover_responses(m, ch, body: dict[str, Any]):
         1, 0, {}, body, ingress_protocol="responses",
     )
     body.setdefault("_api_key_name", "ws-key")
-    sr = ScheduleResult(candidates=[(ch, "test-model")], saturated=[], affinity_hit=False, fp_query=None, client_key="client:1")
+    sr = ScheduleResult(
+        candidates=[(ch, "test-model")], saturated=[],
+        affinity_hit=bool(fp_query), fp_query=fp_query, client_key="client:1",
+        bound_channel_key=bound_channel_key,
+    )
     resp = await m["failover"].run_failover(
         sr, body, request_id, "ws-key", "1.2.3.4",
         is_stream=bool(body.get("stream", False)), start_time=start, ingress_protocol="responses",
@@ -1277,19 +1283,63 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
     monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
     body = {"model": "test-model", "stream": True, "input": "hello", "prompt_cache_key": "anchor"}
-    resp, rid = await _call_failover_responses(m, ch, body)
+    stable_fp = "stable-oauth-ws-complete"
+    old_owner = "oauth:old-owner"
+    m["affinity"].upsert(stable_fp, old_owner, "test-model")
+    resp, rid = await _call_failover_responses(
+        m, ch, body, fp_query=stable_fp, bound_channel_key=old_owner,
+    )
     assert resp.status_code == 200
+    assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
     text = b"".join([c async for c in resp.body_iterator]).decode("utf-8")
     assert "event: response.created" in text
     assert "event: response.output_text.delta" in text
     assert '"delta":"ok"' in text or '"delta": "ok"' in text
     assert "event: response.completed" in text
     assert fake_ws.closed is True
+    assert m["affinity"].get(stable_fp)["channel_key"] == ch.key
     row = m["log_db"].log_detail(rid)["log"]
     assert row["status"] == "success"
     assert row["http_status"] == 200
     assert row["upstream_protocol"] == "openai-responses"
     assert row["upstream_transport"] == "ws"
+
+
+@pytest.mark.asyncio
+async def test_http_responses_oauth_ws_truncation_does_not_rebind(monkeypatch, m):
+    cfg = _setup(m)
+    cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
+    cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
+    ch = _make_oauth_channel_for_failover(m, name="truncated@example.com")
+
+    async def fake_token(account_key):
+        return "tok"
+
+    fake_ws = FakeOAuthHttpStreamWs([
+        {"type": "response.created", "response": {"id": "resp_truncated"}},
+        {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "partial"},
+    ])
+
+    async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
+        return fake_ws
+
+    monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
+    stable_fp = "stable-oauth-ws-truncated"
+    old_owner = "oauth:old-owner"
+    m["affinity"].upsert(stable_fp, old_owner, "test-model")
+    body = {"model": "test-model", "stream": True, "input": "hello", "prompt_cache_key": "anchor"}
+    resp, rid = await _call_failover_responses(
+        m, ch, body, fp_query=stable_fp, bound_channel_key=old_owner,
+    )
+    assert resp.status_code == 200
+    assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
+
+    text = b"".join([c async for c in resp.body_iterator]).decode("utf-8")
+    assert "event: response.output_text.delta" in text
+    assert "upstream websocket closed" in text
+    assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
+    assert m["log_db"].log_detail(rid)["log"]["status"] == "error"
 
 
 @pytest.mark.asyncio
@@ -1304,6 +1354,7 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
         "test-model",
         "prompt-cache:anchor",
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=ch.account_key,
     )
 
     async def fake_token(account_key):
@@ -1339,7 +1390,7 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
 
     assert resp.status_code == 200
     assert json.loads(resp.body)["output"][0]["content"][0]["text"] == "ok"
-    assert rr.get("test-model", "prompt-cache:anchor") == []
+    assert rr.get("test-model", "prompt-cache:anchor", account_key=ch.account_key) == []
     assert attempts == []
 
     first_payload = json.loads(bad_ws.sent[0])

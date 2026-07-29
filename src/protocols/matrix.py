@@ -1161,6 +1161,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
     elif protocol == "openai-responses":
         if ch_type == "oauth" and provider == "xai":
             native_state.update({
+                "encrypted_reasoning_replay",
                 "prompt_cache_key",
                 "web_search",
             })

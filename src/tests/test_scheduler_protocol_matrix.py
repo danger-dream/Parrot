@@ -361,6 +361,33 @@ def test_responses_encrypted_reasoning_input_can_fallback_to_chat(monkeypatch):
     ]
 
 
+def test_responses_encrypted_reasoning_replay_routes_to_xai_oauth(monkeypatch):
+    xai = _ch("oauth-xai", "openai-responses", type="oauth")
+    xai.provider = "xai"
+    channels = [xai]
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    body = {
+        "model": "m",
+        "input": [{
+            "id": "rs_grok_1",
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [],
+            "encrypted_content": "gAAAA",
+        }],
+        "include": ["reasoning.encrypted_content"],
+    }
+    available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
+
+    assert [ch.key for ch, _ in available] == ["oauth-xai"]
+    assert saturated == []
+    assert plans[("oauth-xai", "real")].cost == 0
+    assert guards == []
+
+
 def test_responses_conversation_routes_only_to_native_api_channel(monkeypatch):
     channels = [
         _ch("a", "anthropic"),
