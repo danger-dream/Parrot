@@ -1408,6 +1408,13 @@ def _latest_iso(*values: str | None) -> str | None:
 
 _CODEX_MISSING_RESET_FALLBACK_SECONDS = 10 * 60
 
+# A cached Codex response-header snapshot only guards the WHAM/Codex boundary,
+# where both sources describe roughly the same moment. Once fresh WHAM usage is
+# clearly newer than the snapshot, the snapshot is a stale observation and must
+# not veto recovery. Keep the margin comfortably above WHAM propagation delay
+# and the 30s response-header sampling throttle.
+_CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS = 15 * 60 * 1000
+
 
 def _codex_cached_reset_ms(row: dict, base_ms: int | None,
                            reset_key: str) -> int | None:
@@ -1430,6 +1437,22 @@ def _codex_cached_reset_ms(row: dict, base_ms: int | None,
     return base_ms + _CODEX_MISSING_RESET_FALLBACK_SECONDS * 1000
 
 
+def _codex_snapshot_superseded_by_usage(row: dict) -> bool:
+    """Whether the cached Codex header snapshot predates fresh WHAM usage.
+
+    ``fetched_at`` is written by ``quota_save`` from an active WHAM fetch, while
+    ``last_passive_update_at`` is written by passive Codex response-header
+    sampling. When WHAM data is clearly newer, the header snapshot is an old
+    observation: upstream may have reset the window early, so its locally
+    predicted reset time is no longer evidence of an over-quota state.
+    """
+    passive_ms = _ms_timestamp(row.get("last_passive_update_at"))
+    usage_ms = _ms_timestamp(row.get("fetched_at"))
+    if passive_ms is None or usage_ms is None:
+        return False
+    return usage_ms - passive_ms >= _CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS
+
+
 def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
     """Return active Codex response-header quota hits cached for an OpenAI account.
 
@@ -1439,9 +1462,16 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
     below threshold. Use last_passive_update_at + reset_after_seconds so expired
     header snapshots don't keep accounts disabled forever. If a rare snapshot has
     no reset-after header, bound it by a short TTL.
+
+    The snapshot is also dropped once fresh WHAM usage is clearly newer than it:
+    the locally predicted reset time assumes a full window, so an early upstream
+    reset would otherwise keep the account disabled for days.
     """
     row = state_db.quota_load(account_key)
     if not row:
+        return {"any_over": False, "hit_windows": [], "latest_reset": None}
+
+    if _codex_snapshot_superseded_by_usage(row):
         return {"any_over": False, "hit_windows": [], "latest_reset": None}
 
     base_ms = _ms_timestamp(row.get("last_passive_update_at")) or _ms_timestamp(row.get("fetched_at"))
