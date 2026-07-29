@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from src.protocols import finalize
 
 
@@ -132,6 +136,109 @@ def test_apply_success_health_effects_is_dependency_injected():
     assert cd.cleared == [("api:ch", "m")]
     assert sc.failures == []
     assert cd.errors == []
+
+
+def test_success_health_effects_isolate_sqlite_failures_and_continue(caplog):
+    class LockedScorer(_Scorer):
+        def record_success(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    cd = _Cooldown()
+    finalize._last_warning_at.clear()
+    caplog.set_level("WARNING")
+    finalize.apply_success_health_effects(
+        finalize.success_plan(),
+        scorer=LockedScorer(),
+        cooldown=cd,
+        channel_key="api:ch",
+        model="m",
+    )
+
+    assert cd.cleared == [("api:ch", "m")]
+    assert "response preserved" in caplog.text
+
+
+def test_health_effects_do_not_hide_programming_errors():
+    class BrokenScorer(_Scorer):
+        def record_success(self, *_args, **_kwargs):
+            raise ValueError("programming bug")
+
+    with pytest.raises(ValueError, match="programming bug"):
+        finalize.apply_success_health_effects(
+            finalize.success_plan(),
+            scorer=BrokenScorer(),
+            cooldown=_Cooldown(),
+            channel_key="api:ch",
+            model="m",
+        )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        sqlite3.ProgrammingError("closed connection"),
+        sqlite3.IntegrityError("constraint failed"),
+        sqlite3.OperationalError("no such table: channel_errors"),
+    ],
+)
+def test_health_effects_do_not_hide_sqlite_programming_or_schema_errors(exc):
+    class BrokenScorer(_Scorer):
+        def record_success(self, *_args, **_kwargs):
+            raise exc
+
+    with pytest.raises(type(exc), match=str(exc)):
+        finalize.apply_success_health_effects(
+            finalize.success_plan(),
+            scorer=BrokenScorer(),
+            cooldown=_Cooldown(),
+            channel_key="api:ch",
+            model="m",
+        )
+
+
+def test_error_health_effects_isolate_sqlite_failures_and_continue(caplog):
+    class LockedCooldown(_Cooldown):
+        def record_error(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    sc = _Scorer()
+    finalize._last_warning_at.clear()
+    caplog.set_level("WARNING")
+    finalize.apply_error_health_effects(
+        finalize.error_plan("upstream_error", failure_policy="post_commit_stream"),
+        scorer=sc,
+        cooldown=LockedCooldown(),
+        channel_key="api:ch",
+        model="m",
+        error_detail="failed",
+        connect_ms=12,
+    )
+
+    assert sc.failures == [{
+        "channel_key": "api:ch",
+        "model": "m",
+        "connect_ms": 12,
+    }]
+    assert "response preserved" in caplog.text
+
+
+def test_health_effect_sqlite_warnings_are_rate_limited(caplog):
+    class LockedScorer(_Scorer):
+        def record_success(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    finalize._last_warning_at.clear()
+    caplog.set_level("WARNING")
+    for _ in range(3):
+        finalize.apply_success_health_effects(
+            finalize.success_plan(),
+            scorer=LockedScorer(),
+            cooldown=_Cooldown(),
+            channel_key="api:ch",
+            model="m",
+        )
+    warnings = [r for r in caplog.records if "response preserved" in r.message]
+    assert len(warnings) == 1
 
 
 def test_apply_error_health_effects_respects_plan_flags():

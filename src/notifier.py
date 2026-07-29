@@ -253,14 +253,16 @@ async def throttled_notify_event(event_key: str, alert_key: str, text: str,
 
 def throttled_notify_event_sync(event_key: str, alert_key: str, text: str,
                                 *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC,
-                                reply_markup: Optional[dict] = None) -> None:
+                                reply_markup: Optional[dict] = None) -> bool:
     """同 throttled_notify_event，但可从同步上下文调用。
 
     用在那些没法 await 的场景（如 sync 翻译器收尾、sync 的 Store save 回调）。
+    返回是否实际进入发送队列，供同步调用方避免重复日志。
     """
     if not _throttle_should_emit(alert_key, cooldown_seconds):
-        return
+        return False
     notify_event(event_key, text, reply_markup=reply_markup)
+    return True
 
 
 def wait_drain(timeout: float = 5.0) -> bool:

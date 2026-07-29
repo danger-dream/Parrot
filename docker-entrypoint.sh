@@ -3,6 +3,7 @@
 # → 若挂载了 docker.sock，把它的 gid 加到 app 的补充组（自更新 sidecar 需要）
 # → 用 gosu 降权到 app 启动。
 set -e
+umask 077
 
 DATA_DIR="${ANTHROPIC_PROXY_DATA_DIR:-/app/data}"
 DOCKER_SOCK="/var/run/docker.sock"
@@ -18,6 +19,25 @@ if [ "$(id -u)" = "0" ]; then
         chown app:app "$DATA_DIR/backups" 2>/dev/null || true
         chown app:app "$DATA_DIR/backups/"* 2>/dev/null || true
     fi
+    if [ "$(stat -c %u "$DATA_DIR/logs" 2>/dev/null)" != "1000" ]; then
+        chown app:app "$DATA_DIR/logs"
+    fi
+
+    # The response Store contains complete request/output history. Repair the
+    # default DB files before dropping privileges, but reject symlinks or
+    # non-files instead of following them as root. Custom absolute dbPath
+    # values are validated by src/openai/store.py after gosu.
+    for suffix in "" "-wal" "-shm"; do
+        store_file="$DATA_DIR/openai_response_store.db$suffix"
+        if [ -e "$store_file" ] || [ -L "$store_file" ]; then
+            if [ -L "$store_file" ] || [ ! -f "$store_file" ]; then
+                echo "OpenAI Store path is not a regular file: $store_file" >&2
+                exit 1
+            fi
+            chown app:app "$store_file"
+            chmod 600 "$store_file"
+        fi
+    done
 
     # 自更新支持：若挂载了 docker.sock，让降权后的 app 用户能访问它。
     # gosu 会重置补充组，所以必须把 sock 的 gid 注册成一个组并把 app 加进去，
@@ -39,6 +59,18 @@ if [ "$(id -u)" = "0" ]; then
         fi
     fi
 
+fi
+
+# UMask protects all newly created DB/WAL/SHM files.  The directory modes are
+# explicit so a normal source/container umask cannot make sensitive data
+# traversable by another local user.
+for private_dir in "$DATA_DIR" "$DATA_DIR/logs" "$DATA_DIR/backups"; do
+    if [ -d "$private_dir" ]; then
+        chmod 700 "$private_dir"
+    fi
+done
+
+if [ "$(id -u)" = "0" ]; then
     exec gosu app "$@"
 else
     exec "$@"

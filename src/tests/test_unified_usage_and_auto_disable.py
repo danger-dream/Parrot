@@ -70,7 +70,9 @@ def _setup(m):
     m["config"].update(clear_accounts)
     m["oauth_manager"]._refresh_locks.clear()
     m["failover"]._codex_snapshot_last.clear()
+    m["failover"]._codex_snapshot_inflight.clear()
     m["failover"]._anthropic_snapshot_last.clear()
+    m["failover"]._anthropic_snapshot_inflight.clear()
     m["oauth_manager"]._OPENAI_PROBE_LAST.clear()
     m["cooldown"].init()
     m["cooldown"].clear_all()
@@ -337,6 +339,75 @@ def test_openai_auto_disable_primary_over_threshold(m):
     assert acc_after["disabled_reason"] == "quota", acc_after
     assert acc_after["enabled"] is False
     print("  [PASS] openai: primary 98% (>=95) → auto-disabled")
+
+
+def test_openai_auto_disable_survives_locked_quota_cache(m, monkeypatch):
+    """A failed auxiliary snapshot write must not bypass realtime disable."""
+    import sqlite3
+
+    _setup(m)
+    email = "locked-cache@o.io"
+    account_key = f"openai:{email}:acct-123"
+    _add_openai(m, email)
+    acc = m["oauth_manager"].get_account(account_key)
+    ch = m["OpenAIOAuthChannel"](acc)
+    resp = _FakeResp({
+        "x-codex-primary-used-percent": "98",
+        "x-codex-primary-reset-after-seconds": "600",
+        "x-codex-primary-window-minutes": "10080",
+    })
+    attempts = []
+
+    def locked(*_args, **_kwargs):
+        attempts.append("write")
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(m["state_db"], "quota_save_openai_snapshot", locked)
+    m["failover"]._maybe_record_codex_snapshot(ch, resp)
+
+    current = m["oauth_manager"].get_account(account_key)
+    assert current["enabled"] is False, current
+    assert current["disabled_reason"] == "quota", current
+    assert account_key not in m["failover"]._codex_snapshot_last
+    assert account_key not in m["failover"]._codex_snapshot_inflight
+
+    # A failed write must not advance the 30s throttle; the next response
+    # retries persistence immediately (disable remains idempotent).
+    m["failover"]._maybe_record_codex_snapshot(ch, resp)
+    assert attempts == ["write", "write"]
+
+
+def test_anthropic_auto_disable_survives_locked_quota_cache(m, monkeypatch):
+    """The Anthropic passive sampler follows the same fail-open cache rule."""
+    import sqlite3
+
+    _setup(m)
+    email = "locked-cache@c.io"
+    account_key = f"claude:{email}"
+    _add_claude(m, email)
+    acc = m["oauth_manager"].get_account(account_key)
+    ch = m["OAuthChannel"](acc, [])
+    resp = _FakeResp({
+        "anthropic-ratelimit-unified-5h-utilization": "1.0",
+        "anthropic-ratelimit-unified-5h-surpassed-threshold": "true",
+        "anthropic-ratelimit-unified-5h-reset": str(int(time.time() + 600)),
+    })
+    attempts = []
+
+    def locked(*_args, **_kwargs):
+        attempts.append("write")
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(m["state_db"], "quota_patch_passive", locked)
+    m["failover"]._maybe_record_anthropic_snapshot(ch, resp)
+
+    current = m["oauth_manager"].get_account(account_key)
+    assert current["enabled"] is False, current
+    assert current["disabled_reason"] == "quota", current
+    assert account_key not in m["failover"]._anthropic_snapshot_last
+    assert account_key not in m["failover"]._anthropic_snapshot_inflight
+    m["failover"]._maybe_record_anthropic_snapshot(ch, resp)
+    assert attempts == ["write", "write"]
 
 
 def test_openai_no_auto_disable_below_threshold(m):

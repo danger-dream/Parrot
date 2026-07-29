@@ -835,22 +835,27 @@ class StreamTranslator:
         except Exception as exc:
             # 与非流式 translate_response 的处理一致：失败不中断已发完的流，
             # 但走节流告警让运维能看到（详见 responses_to_chat.translate_response）。
-            import traceback as _tb
-            _tb.print_exc()
             from ... import notifier as _notifier
             ek = _notifier.escape_html
-            _notifier.throttled_notify_event_sync(
-                "openai_store_save_failed",
-                f"openai_store_save_failed:{self._store_api_key_name}",
-                f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（流式）\n"
-                f"API Key: <code>{ek(self._store_api_key_name)}</code>\n"
-                f"模型: <code>{ek(self.state.model)}</code> · "
-                f"渠道: <code>{ek(self._store_channel_key or '?')}</code>\n"
-                f"resp_id: <code>{ek(self.state.resp_id)}</code>\n"
-                f"原因: <code>{ek(str(exc))[:300]}</code>\n"
-                "⚠ 下一次带该 previous_response_id 的请求会 404；"
-                "请检查 state.db 读写权限与磁盘空间。",
-            )
+            should_log = True
+            try:
+                should_log = _notifier.throttled_notify_event_sync(
+                    "openai_store_save_failed",
+                    f"openai_store_save_failed:{self._store_api_key_name}",
+                    f"❌ {_notifier.provider_custom_emoji_html('openai')} <b>OpenAI Store 写入失败</b>（流式）\n"
+                    f"API Key: <code>{ek(self._store_api_key_name)}</code>\n"
+                    f"模型: <code>{ek(self.state.model)}</code> · "
+                    f"渠道: <code>{ek(self._store_channel_key or '?')}</code>\n"
+                    f"resp_id: <code>{ek(self.state.resp_id)}</code>\n"
+                    f"原因: <code>{ek(str(exc))[:300]}</code>\n"
+                    "⚠ 下一次带该 previous_response_id 的请求会 404；"
+                    "请检查 openai.store.dbPath 配置、对应文件权限与磁盘空间。",
+                )
+            except Exception:
+                pass
+            if should_log:
+                import traceback as _tb
+                _tb.print_exc()
 
     def _response_skeleton(self, *, status: str) -> dict:
         # 02-bug-findings #13: spec Response required 14 字段

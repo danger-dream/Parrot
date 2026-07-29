@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 from typing import Optional
 
-from .. import config, cooldown, load_balancing, state_db
+from .. import affinity, channel_state, config, cooldown, load_balancing, scorer, state_db
 from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
@@ -23,7 +24,7 @@ from .url_utils import (
 )
 
 
-_lock = threading.Lock()
+_lock = channel_state.mutation_lock
 _channels: dict[str, Channel] = {}
 
 # 按 protocol 名分派到 Channel 子类的 factory。未注册的 protocol 回落到 ApiChannel
@@ -39,6 +40,13 @@ def register_channel_factory(protocol: str, cls: type[Channel]) -> None:
 
 
 def rebuild_from_config() -> None:
+    # Snapshot, generation validation, publication, and stale cleanup are one
+    # lifecycle. A paused old rebuild must not overwrite a completed rename.
+    with channel_state.mutation_lock:
+        _rebuild_from_config_locked()
+
+
+def _rebuild_from_config_locked() -> None:
     """根据当前 config 重建所有渠道实例。"""
     cfg = config.get()
     default_models = list(cfg.get("oauthDefaultModels") or [])
@@ -54,6 +62,9 @@ def rebuild_from_config() -> None:
                 ch = XAIOAuthChannel(acc)
             else:
                 ch = OAuthChannel(acc, default_models)
+            if channel_state.is_retired_source(ch.key):
+                print(f"[registry] skip reused retired channel key: {ch.key}")
+                continue
             new[ch.key] = ch
         except Exception as exc:
             print(f"[registry] skip invalid OAuth account (provider={provider}): {exc}")
@@ -63,6 +74,9 @@ def rebuild_from_config() -> None:
         cls = _channel_factories.get(proto, ApiChannel)
         try:
             ch = cls(entry)
+            if channel_state.is_retired_source(ch.key):
+                print(f"[registry] skip reused retired channel key: {ch.key}")
+                continue
             new[ch.key] = ch
         except Exception as exc:
             print(f"[registry] skip invalid API channel (protocol={proto}): {exc}")
@@ -75,68 +89,84 @@ def rebuild_from_config() -> None:
 
 
 def _sync_state_db_with_channels() -> None:
-    """清理 state.db 中不再存在的 channel_key。"""
-    with _lock:
-        live_keys = set(_channels.keys())
+    """清理 state.db 和内存镜像中不再存在的 channel_key。"""
+    with channel_state.mutation_lock:
+        with _lock:
+            live_keys = channel_state.include_transitions(set(_channels.keys()))
 
-    for row in state_db.perf_load_all():
-        if row["channel_key"] not in live_keys:
-            state_db.perf_delete(row["channel_key"])
+        stale_perf = {
+            row["channel_key"] for row in state_db.perf_load_all()
+            if row["channel_key"] not in live_keys
+        }
+        # 可选 SQLite 写失败时 scorer 会合法地保留 memory-only 评分；
+        # stale 集必须同时覆盖 DB 和内存，否则同名渠道重建会继承旧分数。
+        stale_perf.update(
+            channel_key for channel_key in scorer.channel_keys()
+            if channel_key not in live_keys
+        )
+        for channel_key in stale_perf:
+            scorer.clear_stats(channel_key)
 
-    for row in state_db.error_load_all():
-        if row["channel_key"] not in live_keys:
+        stale_errors = {
+            row["channel_key"] for row in state_db.error_load_all()
+            if row["channel_key"] not in live_keys
+        }
+        for channel_key in stale_errors:
             # cooldown 的内存态与 state.db 必须通过同一个提交点删除。
-            # 直接删 DB 会让同 key 在当前进程内重新出现时仍被旧内存态拦截，
-            # 只能靠重启恢复。
-            cooldown.clear(row["channel_key"], notify_recovered=False)
+            # resolve_alias=False 清理的就是被判定为 stale 的旧 generation。
+            cooldown.clear(
+                channel_key, notify_recovered=False, resolve_alias=False,
+            )
 
-    state_db.affinity_delete_stale_channels(live_keys)
-    state_db.client_affinity_delete_stale_channels(live_keys)
+        affinity.delete_stale_channels(live_keys)
+        affinity.client_delete_stale_channels(live_keys)
 
 
 def all_channels() -> list[Channel]:
-    with _lock:
-        return list(_channels.values())
+    with channel_state.mutation_lock:
+        with _lock:
+            return list(_channels.values())
 
 
 def get_channel(key: str) -> Optional[Channel]:
-    with _lock:
-        ch = _channels.get(key)
-        if ch is not None:
-            return ch
-        # 兼容：调用方可能还在传老格式 "oauth:<email>"（不含 provider 段）
-        if key.startswith("oauth:") and key.count(":") == 1:
-            email = key[len("oauth:"):]
-            matches = [
-                c for c in _channels.values()
-                if getattr(c, "email", None) == email and c.type == "oauth"
-            ]
-            return matches[0] if len(matches) == 1 else None
-        if key.startswith("oauth:openai:"):
-            identity = key[len("oauth:openai:"):]
-            matches = [
-                c for c in _channels.values()
-                if c.type == "oauth"
-                and getattr(c, "protocol", "") == "openai-responses"
-                and getattr(c, "email", None) == identity
-            ]
-            return matches[0] if len(matches) == 1 else None
-        if key.startswith("oauth:xai:"):
-            identity = key[len("oauth:xai:"):]
-            legacy_email = ""
-            legacy_subject = ""
-            if ":" in identity:
-                legacy_email, _, legacy_subject = identity.partition(":")
-            matches = []
-            for c in _channels.values():
-                if c.type != "oauth" or getattr(c, "provider", "") != "xai":
-                    continue
-                email = str(getattr(c, "email", "") or "")
-                subject = str(getattr(c, "subject", "") or "")
-                if identity in (email, subject) or (legacy_email == email and legacy_subject == subject):
-                    matches.append(c)
-            return matches[0] if len(matches) == 1 else None
-        return None
+    with channel_state.mutation_lock:
+        with _lock:
+            ch = _channels.get(key)
+            if ch is not None:
+                return ch
+            # 兼容：调用方可能还在传老格式 "oauth:<email>"（不含 provider 段）
+            if key.startswith("oauth:") and key.count(":") == 1:
+                email = key[len("oauth:"):]
+                matches = [
+                    c for c in _channels.values()
+                    if getattr(c, "email", None) == email and c.type == "oauth"
+                ]
+                return matches[0] if len(matches) == 1 else None
+            if key.startswith("oauth:openai:"):
+                identity = key[len("oauth:openai:"):]
+                matches = [
+                    c for c in _channels.values()
+                    if c.type == "oauth"
+                    and getattr(c, "protocol", "") == "openai-responses"
+                    and getattr(c, "email", None) == identity
+                ]
+                return matches[0] if len(matches) == 1 else None
+            if key.startswith("oauth:xai:"):
+                identity = key[len("oauth:xai:"):]
+                legacy_email = ""
+                legacy_subject = ""
+                if ":" in identity:
+                    legacy_email, _, legacy_subject = identity.partition(":")
+                matches = []
+                for c in _channels.values():
+                    if c.type != "oauth" or getattr(c, "provider", "") != "xai":
+                        continue
+                    email = str(getattr(c, "email", "") or "")
+                    subject = str(getattr(c, "subject", "") or "")
+                    if identity in (email, subject) or (legacy_email == email and legacy_subject == subject):
+                        matches.append(c)
+                return matches[0] if len(matches) == 1 else None
+            return None
 
 
 def enabled_channels() -> list[Channel]:
@@ -198,6 +228,11 @@ def install_config_reload_hook() -> None:
 # ─── 添加 / 更新 / 删除 API 渠道 ─────────────────────────────────
 
 def add_api_channel(entry: dict) -> dict:
+    with config.serialized_updates():
+        return _add_api_channel_serialized(entry)
+
+
+def _add_api_channel_serialized(entry: dict) -> dict:
     """
     添加一个 API 渠道（type="api"），写入 config 并触发重建。
     entry 需含 name/baseUrl/apiKey/models；可含 cc_mimicry/enabled/apiPath，
@@ -214,6 +249,7 @@ def add_api_channel(entry: dict) -> dict:
     name = entry.get("name")
     if not name:
         raise ValueError("channel name is required")
+    channel_state.assert_reusable(f"api:{name}")
 
     protocol = entry.get("protocol") or "anthropic"
     # openai-* 渠道不走 Claude Code 伪装，强制 False
@@ -273,6 +309,11 @@ def add_api_channel(entry: dict) -> dict:
 
 
 def update_api_channel(name: str, patch: dict) -> dict | None:
+    with config.serialized_updates():
+        return _update_api_channel_serialized(name, patch)
+
+
+def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
     """
     编辑渠道。patch 可含 name/baseUrl/apiKey/models/cc_mimicry/enabled/apiPath/protocol，
     以及 omitTemperature/omitThinking/context1m*/fast* 兼容策略字段。
@@ -290,6 +331,10 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
     old_entry = next(
         (c for c in config.get().get("channels", []) if c.get("name") == name),
         {},
+    )
+    old_entry_snapshot = copy.deepcopy(old_entry)
+    old_priority_orders = copy.deepcopy(
+        config.get().get("loadBalancing", {}).get("priorityOrders", {})
     )
     old_family = load_balancing.family_for_protocol(old_entry.get("protocol", "anthropic"))
 
@@ -387,41 +432,62 @@ def update_api_channel(name: str, patch: dict) -> dict | None:
         if "name" in patch:
             target["name"] = patch["name"]
 
+        final_name = target.get("name", name)
+        final_family = load_balancing.family_for_protocol(
+            target.get("protocol", "anthropic")
+        )
+        final_key = f"api:{final_name}"
+        if load_balancing.is_initialized(cfg) and (
+            final_key != old_key or final_family != old_family
+        ):
+            load_balancing.mutate_channel_renamed(
+                cfg, old_key, final_key, final_family,
+            )
+
+    new_name = patch.get("name", name)
+    new_key = f"api:{new_name}"
+    if new_key != old_key:
+        channel_state.assert_reusable(new_key)
+
+    def _rollback(cfg):
+        channels = cfg.get("channels", [])
+        for index, entry in enumerate(channels):
+            if entry.get("name") == new_name:
+                channels[index] = copy.deepcopy(old_entry_snapshot)
+                break
+        cfg.setdefault("loadBalancing", {})["priorityOrders"] = copy.deepcopy(
+            old_priority_orders
+        )
+
     try:
-        config.update(_mutate)
+        if new_key != old_key:
+            channel_state.rename_with_config(
+                old_channel_key=old_key,
+                new_channel_key=new_key,
+                config_mutator=_mutate,
+                rollback_mutator=_rollback,
+            )
+        else:
+            config.update(_mutate)
     except (KeyError, ValueError) as exc:
         raise exc
-
-    # 若改了名，做级联迁移（scorer/cooldown/affinity 内部各自负责把 state.db 同步改名）
-    new_name = patch.get("name", name)
-    new_entry = next(
-        (c for c in config.get().get("channels", []) if c.get("name") == new_name),
-        {},
-    )
-    new_family = load_balancing.family_for_protocol(new_entry.get("protocol", "anthropic"))
-    if new_name != name:
-        from .. import scorer, affinity, cooldown
-        new_key = f"api:{new_name}"
-        scorer.rename_channel(old_key, new_key)
-        cooldown.rename_channel(old_key, new_key)
-        affinity.rename_channel(old_key, new_key)
-        affinity.client_rename_channel(old_key, new_key)
-        from .. import concurrency
-        concurrency.rename_channel(old_key, new_key)
-        # 维护用户优先级表；family 用更新后的 protocol 推导
-        load_balancing.sync_channel_renamed(old_key, new_key, new_family)
-    elif "protocol" in patch and old_family != new_family:
-        # 只有协议 family 实际变化时，才从旧 family 移除并追加到新 family 队尾。
-        # 菜单保存时可能把当前 protocol 原样带回，不能因此打乱用户优先级。
-        load_balancing.sync_channel_removed(old_key)
-        load_balancing.sync_channel_added(old_key, new_family)
 
     rebuild_from_config()
     return {"name": new_name}
 
 
 def delete_api_channel(name: str) -> bool:
+    with config.serialized_updates():
+        return _delete_api_channel_serialized(name)
+
+
+def _delete_api_channel_serialized(name: str) -> bool:
     key = f"api:{name}"
+    if not any(
+        channel.get("name") == name
+        for channel in config.get().get("channels", [])
+    ):
+        return False
     found = {"ok": False}
 
     def _mutate(cfg):
@@ -430,19 +496,34 @@ def delete_api_channel(name: str) -> bool:
             if c.get("name") == name:
                 channels.pop(i)
                 found["ok"] = True
+                load_balancing.mutate_channels_removed(cfg, {key})
                 return
-    config.update(_mutate)
-    if not found["ok"]:
-        return False
 
-    # 级联清理（scorer/cooldown/affinity 内部各自负责把 state.db 一并清掉）
-    from .. import scorer, affinity, cooldown
-    scorer.clear_stats(key)
-    cooldown.clear(key)
-    affinity.delete_by_channel(key)
-    affinity.client_delete_by_channel(key)
-    load_balancing.sync_channel_removed(key)
-    from .. import concurrency
-    concurrency.forget_channel(key)
-    rebuild_from_config()
+    # Config removal, priority removal, and tombstoning are one lifecycle.
+    # Requests already using the old Channel object may finish later; their
+    # scorer/cooldown/affinity side effects must not recreate deleted state.
+    from .. import affinity, concurrency, cooldown, scorer
+    with channel_state.mutation_lock:
+        generation_keys = sorted(channel_state.alias_sources(key)) + [key]
+        frozen_limits = {
+            generation_key: concurrency.capture_rename_limit(generation_key)
+            for generation_key in generation_keys
+        }
+        channel_state.retire_deleted(key)
+        try:
+            config.update(_mutate)
+        except BaseException:
+            channel_state.restore_deleted(key)
+            raise
+        for generation_key in generation_keys:
+            concurrency.retire_channel(
+                generation_key,
+                frozen_max=frozen_limits[generation_key],
+                deleted_target=key,
+            )
+        scorer.clear_stats(key)
+        cooldown.clear(key, notify_recovered=False, resolve_alias=False)
+        affinity.delete_by_channel(key)
+        affinity.client_delete_by_channel(key)
+        rebuild_from_config()
     return True

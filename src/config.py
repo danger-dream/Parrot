@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 import threading
+from contextlib import contextmanager
 from typing import Any
 
 COMPACT_RESCUE_DEFAULT_DIRECT_PROMPT = (
@@ -84,7 +85,8 @@ COMPACT_RESCUE_DEFAULT_REDUCE_PROMPT = (
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# DATA_DIR 是所有运行时持久化文件的根目录（config.json / state.db / logs/ / .anthropic_proxy_ids.json）。
+# DATA_DIR 是所有运行时持久化文件的根目录（config.json / state.db /
+# openai_response_store.db / logs/ / .anthropic_proxy_ids.json）。
 # 优先使用环境变量 ANTHROPIC_PROXY_DATA_DIR（容器内通常是 /app/data），不设则回退到 BASE_DIR，
 # 保持现有源码安装方式（systemd 直跑）行为完全不变。
 DATA_DIR = os.environ.get("ANTHROPIC_PROXY_DATA_DIR") or BASE_DIR
@@ -534,8 +536,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # previous_response_id 本地 store（跨变体 chat↔responses 必需，同协议可选）
         "store": {
             "enabled": True,
+            # 独立于 stateDbPath，relative path 以 DATA_DIR 为根；改后需重启。
+            "dbPath": "openai_response_store.db",
             "ttlMinutes": 60,
             "cleanupIntervalSeconds": 300,
+            # 每批同时受行数和 JSON payload 字节数限制，批间释放 Store 锁；
+            # 每轮再受批次数与时间预算限制，既能追赶积压也不长期阻塞 save。
+            "cleanupBatchSize": 100,
+            "cleanupBatchBytes": 8 * 1024 * 1024,
+            "cleanupMaxBatches": 100,
+            "cleanupTimeBudgetSeconds": 10,
         },
         # reasoning 跨协议桥接："passthrough" = 通过非官方字段 reasoning_content 双向映射；"drop" = 丢弃
         "reasoningBridge": "passthrough",
@@ -564,6 +574,7 @@ _mtime: float = 0.0
 # 必须是可重入锁 (RLock)：同一线程内的加载/保存辅助函数可能再次访问配置。
 # reload callbacks 始终在锁外执行，避免 callback 跨模块重入造成死锁。
 _lock = threading.RLock()
+_update_lifecycle_lock = threading.RLock()
 _reload_callbacks: list = []
 
 
@@ -789,6 +800,13 @@ def save() -> None:
         _mtime = _current_mtime()
 
 
+@contextmanager
+def serialized_updates():
+    """Keep a multi-step config/state lifecycle ahead of other config writes."""
+    with _update_lifecycle_lock:
+        yield
+
+
 def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
     """以 mutator(cfg) 的方式原子修改 cfg 并持久化。
 
@@ -800,19 +818,20 @@ def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
     也消除其它跨模块 callback 链可能产生的死锁。
     """
     global _cache, _mtime
-    with _lock:
-        if _cache is None:
-            _ensure_loaded()
-        candidate = copy.deepcopy(_cache)
-        mutator(candidate)
-        if skip_if_unchanged and candidate == _cache:
-            return _cache
-        _write_atomic(candidate)
-        _mtime = _current_mtime()
-        _cache = candidate
-        snapshot = candidate
-    _fire_reload_callbacks(snapshot)
-    return snapshot
+    with _update_lifecycle_lock:
+        with _lock:
+            if _cache is None:
+                _ensure_loaded()
+            candidate = copy.deepcopy(_cache)
+            mutator(candidate)
+            if skip_if_unchanged and candidate == _cache:
+                return _cache
+            _write_atomic(candidate)
+            _mtime = _current_mtime()
+            _cache = candidate
+            snapshot = candidate
+        _fire_reload_callbacks(snapshot)
+        return snapshot
 
 
 def on_reload(cb) -> None:

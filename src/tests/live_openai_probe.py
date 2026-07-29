@@ -99,7 +99,12 @@ def _write_config(tmp_dir: str, protocol: str) -> None:
         "updateChecker": {"enabled": False},
         "timeouts": {"connect": 10, "firstByte": 60, "idle": 60, "total": 180},
         "openai": {
-            "store": {"enabled": True, "ttlMinutes": 60, "cleanupIntervalSeconds": 300},
+            "store": {
+                "enabled": True,
+                "dbPath": os.path.join(tmp_dir, "openai_response_store.db"),
+                "ttlMinutes": 60,
+                "cleanupIntervalSeconds": 300,
+            },
             "reasoningBridge": "passthrough",
             "translation": {"enabled": True, "rejectOnBuiltinTools": True,
                             "rejectOnMultiCandidate": True},

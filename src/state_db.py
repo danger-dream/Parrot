@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Iterable
 
 from . import config
@@ -144,10 +145,14 @@ def init() -> None:
     os.makedirs(os.path.dirname(_db_path) or ".", exist_ok=True)
     conn = _get_conn()
     with _write_lock:
-        conn.executescript(_schema_sql())
-        _migrate_affinity_prompt_cache_key_col(conn)
-        _migrate_oauth_quota_cache_openai_cols(conn)
-        conn.commit()
+        try:
+            conn.executescript(_schema_sql())
+            _migrate_affinity_prompt_cache_key_col(conn)
+            _migrate_oauth_quota_cache_openai_cols(conn)
+            conn.commit()
+        except BaseException:
+            _rollback_failed_write(conn)
+            raise
     if not _initialized:
         print(f"[state_db] Using {_db_path}")
     _initialized = True
@@ -180,12 +185,12 @@ def schema_meta_get(key: str) -> str | None:
 
 
 def schema_meta_set(key: str, value: str) -> None:
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
             (key, value),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 # ================================================================
@@ -280,19 +285,7 @@ def run_composite_key_migration(email_to_key: dict[str, str]) -> dict:
                 new_ck = f"oauth:{ak}"
                 if old_ck == new_ck:
                     continue
-                r1 = conn.execute(
-                    "UPDATE performance_stats SET channel_key=? WHERE channel_key=?",
-                    (new_ck, old_ck),
-                )
-                r2 = conn.execute(
-                    "UPDATE channel_errors SET channel_key=? WHERE channel_key=?",
-                    (new_ck, old_ck),
-                )
-                r3 = conn.execute(
-                    "UPDATE cache_affinities SET channel_key=? WHERE channel_key=?",
-                    (new_ck, old_ck),
-                )
-                ch_migrated += r1.rowcount + r2.rowcount + r3.rowcount
+                ch_migrated += _rename_channel_key_no_commit(conn, old_ck, new_ck)
             stats["migrated_channel_rows"] = ch_migrated
 
             conn.execute(
@@ -376,136 +369,129 @@ def _rename_performance_stats_channel_key_no_commit(
     return updated_conflicts + deleted_conflicts + renamed
 
 def _rename_channel_key_no_commit(conn: sqlite3.Connection, old_key: str, new_key: str) -> int:
+    """Rename all persisted channel mirrors inside the caller's transaction.
+
+    Startup migrations call this directly; runtime renames call it through
+    ``rename_runtime_channel_state`` and publish memory under channel_state's
+    shared lifecycle lock.
+    """
     if old_key == new_key:
         return 0
     count = 0
     # performance_stats 有 PRIMARY KEY(channel_key, model)，需先合并再改名。
     count += _rename_performance_stats_channel_key_no_commit(conn, old_key, new_key)
-    # 其他表没有同样的复合唯一键冲突，直接改名即可。
-    for table in ("channel_errors", "cache_affinities", "client_affinities"):
+    # channel_errors 同样有 PRIMARY KEY(channel_key, model)。运行时 cooldown
+    # 的既有语义是 old key 获胜；迁移路径保持一致，先删除冲突的新 key 行。
+    cur = conn.execute(
+        """
+        DELETE FROM channel_errors
+        WHERE channel_key = ?
+          AND model IN (
+            SELECT model FROM channel_errors WHERE channel_key = ?
+          )
+        """,
+        (new_key, old_key),
+    )
+    count += int(cur.rowcount or 0)
+    cur = conn.execute(
+        "UPDATE channel_errors SET channel_key=? WHERE channel_key=?",
+        (new_key, old_key),
+    )
+    count += int(cur.rowcount or 0)
+
+    # affinity 表的主键是 fingerprint/client_key，channel_key 本身不唯一。
+    for table in ("cache_affinities", "client_affinities"):
         try:
             cur = conn.execute(
                 f"UPDATE {table} SET channel_key=? WHERE channel_key=?",
                 (new_key, old_key),
             )
             count += int(cur.rowcount or 0)
-        except sqlite3.OperationalError:
-            # Older DBs may not have client_affinities yet.
-            pass
+        except sqlite3.OperationalError as exc:
+            # Older DBs may not have client_affinities yet.  Other I/O/schema
+            # failures must abort the migration instead of becoming a miss.
+            if "no such table" not in str(exc).lower():
+                raise
     return count
 
 
-def quota_rename_account_key(old_key: str, new_key: str, *, email: str | None = None) -> int:
-    """Rename oauth_quota_cache primary key without changing quota contents."""
+def _quota_rename_account_key_no_commit(conn: sqlite3.Connection,
+                                        old_key: str, new_key: str, *,
+                                        email: str | None = None) -> int:
     if not old_key or not new_key or old_key == new_key:
         return 0
     if email is None:
         email = new_key.split(":", 1)[1] if ":" in new_key else new_key
-    with _write_lock:
-        conn = _get_conn()
-        old = conn.execute(
-            "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-            (old_key,),
-        ).fetchone()
-        if old is None:
-            return 0
-        new = conn.execute(
-            "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-            (new_key,),
-        ).fetchone()
-        if new is not None:
-            conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
-            conn.commit()
-            return 0
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-        insert_cols = cols
-        placeholders = ",".join(["?"] * len(insert_cols))
-        values = [
-            new_key if c == "account_key"
-            else email if c == "email"
-            else old[c]
-            for c in insert_cols
-        ]
-        conn.execute(
-            f"INSERT INTO oauth_quota_cache ({','.join(insert_cols)}) VALUES ({placeholders})",
-            values,
-        )
+    old = conn.execute(
+        "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+        (old_key,),
+    ).fetchone()
+    if old is None:
+        return 0
+    new = conn.execute(
+        "SELECT * FROM oauth_quota_cache WHERE account_key=?",
+        (new_key,),
+    ).fetchone()
+    if new is not None:
+        old_ts = max(int(old["fetched_at"] or 0), int(old["last_passive_update_at"] or 0))
+        new_ts = max(int(new["fetched_at"] or 0), int(new["last_passive_update_at"] or 0))
+        if old_ts > new_ts:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+            values = [
+                new_key if c == "account_key"
+                else email if c == "email"
+                else old[c]
+                for c in cols
+            ]
+            assignments = ",".join([f"{c}=?" for c in cols])
+            conn.execute(
+                f"UPDATE oauth_quota_cache SET {assignments} WHERE account_key=?",
+                values + [new_key],
+            )
         conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
-        conn.commit()
-        return 1
+        return 0
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
+    placeholders = ",".join(["?"] * len(cols))
+    values = [
+        new_key if c == "account_key"
+        else email if c == "email"
+        else old[c]
+        for c in cols
+    ]
+    conn.execute(
+        f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
+        values,
+    )
+    conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
+    return 1
 
 
-def rename_oauth_identity(old_account_key: str, new_account_key: str, *,
-                          email: str | None = None) -> dict:
-    """Rename state rows from one OAuth logical identity to another."""
-    stats = {"quota_rows": 0, "channel_rows": 0}
-    if not old_account_key or not new_account_key or old_account_key == new_account_key:
-        return stats
-    with _write_lock:
-        conn = _get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            old_ck = f"oauth:{old_account_key}"
-            new_ck = f"oauth:{new_account_key}"
-            stats["channel_rows"] = _rename_channel_key_no_commit(conn, old_ck, new_ck)
+def quota_rename_account_key(old_key: str, new_key: str, *, email: str | None = None) -> int:
+    """Rename oauth_quota_cache primary key without changing quota contents."""
+    return _commit_write(
+        lambda conn: _quota_rename_account_key_no_commit(
+            conn, old_key, new_key, email=email,
+        )
+    )
 
-            old = conn.execute(
-                "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-                (old_account_key,),
-            ).fetchone()
-            if old is not None:
-                new = conn.execute(
-                    "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-                    (new_account_key,),
-                ).fetchone()
-                if new is not None:
-                    old_ts = max(int(old["fetched_at"] or 0), int(old["last_passive_update_at"] or 0))
-                    new_ts = max(int(new["fetched_at"] or 0), int(new["last_passive_update_at"] or 0))
-                    if old_ts > new_ts:
-                        cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-                        values = [
-                            new_account_key if c == "account_key"
-                            else email if c == "email" and email is not None
-                            else old[c]
-                            for c in cols
-                        ]
-                        assignments = ",".join([f"{c}=?" for c in cols])
-                        conn.execute(
-                            f"UPDATE oauth_quota_cache SET {assignments} WHERE account_key=?",
-                            values + [new_account_key],
-                        )
-                    conn.execute(
-                        "DELETE FROM oauth_quota_cache WHERE account_key=?",
-                        (old_account_key,),
-                    )
-                else:
-                    if email is None:
-                        email = old["email"]
-                    cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-                    placeholders = ",".join(["?"] * len(cols))
-                    values = [
-                        new_account_key if c == "account_key"
-                        else email if c == "email"
-                        else old[c]
-                        for c in cols
-                    ]
-                    conn.execute(
-                        f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
-                        values,
-                    )
-                    conn.execute(
-                        "DELETE FROM oauth_quota_cache WHERE account_key=?",
-                        (old_account_key,),
-                    )
-                    stats["quota_rows"] = 1
-            conn.execute("COMMIT")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-    return stats
+
+def rename_runtime_channel_state(old_channel_key: str, new_channel_key: str, *,
+                                 old_account_key: str | None = None,
+                                 new_account_key: str | None = None,
+                                 email: str | None = None) -> int:
+    """Atomically rename every persisted mirror for one live channel."""
+    if old_channel_key == new_channel_key:
+        return 0
+
+    def write(conn: sqlite3.Connection) -> int:
+        changed = _rename_channel_key_no_commit(conn, old_channel_key, new_channel_key)
+        if old_account_key and new_account_key and old_account_key != new_account_key:
+            changed += _quota_rename_account_key_no_commit(
+                conn, old_account_key, new_account_key, email=email,
+            )
+        return changed
+
+    return _commit_write(write)
 
 
 OPENAI_WORKSPACE_KEY_VERSION = "1"
@@ -703,6 +689,52 @@ def _rollback_failed_write(conn: sqlite3.Connection) -> None:
                 _local.conn = None
 
 
+def _commit_write(effect):
+    """Run one state mutation with rollback-safe transaction handling."""
+    with _write_lock:
+        conn = _get_conn()
+        try:
+            result = effect(conn)
+            conn.commit()
+            return result
+        except BaseException:
+            _rollback_failed_write(conn)
+            raise
+
+
+@contextmanager
+def optional_write_timeout(timeout_ms: int = 100):
+    """Temporarily bound an auxiliary state write's SQLite lock wait.
+
+    The global write lock keeps the connection-local PRAGMA change from
+    leaking into another state mutation. Nested state writers are safe because
+    ``_write_lock`` is re-entrant.
+    """
+    bounded = max(1, min(int(timeout_ms), 5_000))
+    if _db_path is None:
+        # Preserve the original initialization error at the actual write site;
+        # this context manager itself must not become a new prerequisite.
+        yield
+        return
+    with _write_lock:
+        conn = _get_conn()
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        previous = int(row[0] if row is not None else 5_000)
+        conn.execute(f"PRAGMA busy_timeout={bounded}")
+        try:
+            yield
+        finally:
+            if getattr(_local, "conn", None) is conn:
+                try:
+                    conn.execute(f"PRAGMA busy_timeout={previous}")
+                except sqlite3.Error:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                    _local.conn = None
+
+
 def checkpoint() -> None:
     conn = _get_conn()
     try:
@@ -718,8 +750,8 @@ def now_ms() -> int:
 # ─── network_check_status ───────────────────────────────────────
 
 def network_check_save(row: dict[str, Any]) -> None:
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             """INSERT OR REPLACE INTO network_check_status
                (key, label, category, ok, detail, latency_ms, checked_at)
                VALUES (?,?,?,?,?,?,?)""",
@@ -733,7 +765,7 @@ def network_check_save(row: dict[str, Any]) -> None:
                 int(row.get("checked_at") or now_ms()),
             ),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def network_check_load(key: str) -> dict | None:
@@ -751,19 +783,20 @@ def network_check_load_all() -> list[dict]:
 
 
 def network_check_delete(key: str) -> None:
-    with _write_lock:
-        _get_conn().execute("DELETE FROM network_check_status WHERE key=?", (key,))
-        _get_conn().commit()
+    _commit_write(
+        lambda conn: conn.execute(
+            "DELETE FROM network_check_status WHERE key=?", (key,),
+        )
+    )
 
 
 def network_check_delete_stale(live_keys: set[str]) -> None:
-    with _write_lock:
-        conn = _get_conn()
+    def write(conn):
         rows = conn.execute("SELECT key FROM network_check_status").fetchall()
         for r in rows:
             if r["key"] not in live_keys:
                 conn.execute("DELETE FROM network_check_status WHERE key=?", (r["key"],))
-        conn.commit()
+    _commit_write(write)
 
 
 # ─── xAI Imagine video job bindings ───────────────────────────────
@@ -841,25 +874,30 @@ def xai_video_job_cleanup(now: int | None = None) -> int:
 
 def perf_save(channel_key: str, model: str, stats: dict[str, Any]) -> None:
     with _write_lock:
-        _get_conn().execute(
-            """INSERT OR REPLACE INTO performance_stats
-               (channel_key, model, total_requests, success_count,
-                recent_requests, recent_success_count,
-                avg_connect_ms, avg_first_byte_ms, avg_total_ms, last_updated)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (
-                channel_key, model,
-                int(stats.get("total_requests", 0)),
-                int(stats.get("success_count", 0)),
-                int(stats.get("recent_requests", 0)),
-                int(stats.get("recent_success_count", 0)),
-                float(stats.get("avg_connect_ms", 0.0)),
-                float(stats.get("avg_first_byte_ms", 0.0)),
-                float(stats.get("avg_total_ms", 0.0)),
-                int(stats.get("last_updated", now_ms())),
-            ),
-        )
-        _get_conn().commit()
+        conn = _get_conn()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO performance_stats
+                   (channel_key, model, total_requests, success_count,
+                    recent_requests, recent_success_count,
+                    avg_connect_ms, avg_first_byte_ms, avg_total_ms, last_updated)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    channel_key, model,
+                    int(stats.get("total_requests", 0)),
+                    int(stats.get("success_count", 0)),
+                    int(stats.get("recent_requests", 0)),
+                    int(stats.get("recent_success_count", 0)),
+                    float(stats.get("avg_connect_ms", 0.0)),
+                    float(stats.get("avg_first_byte_ms", 0.0)),
+                    float(stats.get("avg_total_ms", 0.0)),
+                    int(stats.get("last_updated", now_ms())),
+                ),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            _rollback_failed_write(conn)
+            raise
 
 
 def perf_load(channel_key: str, model: str) -> dict | None:
@@ -876,34 +914,28 @@ def perf_load_all() -> list[dict]:
 
 
 def perf_delete(channel_key: str | None = None, model: str | None = None) -> None:
-    with _write_lock:
+    def write(conn):
         if channel_key and model:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM performance_stats WHERE channel_key=? AND model=?",
                 (channel_key, model),
             )
         elif channel_key:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM performance_stats WHERE channel_key=?",
                 (channel_key,),
             )
         else:
-            _get_conn().execute("DELETE FROM performance_stats")
-        _get_conn().commit()
+            conn.execute("DELETE FROM performance_stats")
+    _commit_write(write)
 
 
 def perf_rename_channel(old_key: str, new_key: str) -> None:
     if old_key == new_key:
         return
-    with _write_lock:
-        conn = _get_conn()
-        # 先删新 key 下的所有行（避免主键冲突），再把 old 的改名
-        conn.execute("DELETE FROM performance_stats WHERE channel_key=?", (new_key,))
-        conn.execute(
-            "UPDATE performance_stats SET channel_key=? WHERE channel_key=?",
-            (new_key, old_key),
-        )
-        conn.commit()
+    def write(conn):
+        _rename_performance_stats_channel_key_no_commit(conn, old_key, new_key)
+    _commit_write(write)
 
 
 # ─── channel_errors ───────────────────────────────────────────────
@@ -964,14 +996,24 @@ def error_delete(channel_key: str | None = None, model: str | None = None) -> No
 def error_rename_channel(old_key: str, new_key: str) -> None:
     if old_key == new_key:
         return
-    with _write_lock:
-        conn = _get_conn()
-        conn.execute("DELETE FROM channel_errors WHERE channel_key=?", (new_key,))
+    def write(conn):
+        # Only conflicting models are replaced by old-key state.  Models that
+        # exist solely on the destination identity must survive the merge.
+        conn.execute(
+            """
+            DELETE FROM channel_errors
+            WHERE channel_key=?
+              AND model IN (
+                SELECT model FROM channel_errors WHERE channel_key=?
+              )
+            """,
+            (new_key, old_key),
+        )
         conn.execute(
             "UPDATE channel_errors SET channel_key=? WHERE channel_key=?",
             (new_key, old_key),
         )
-        conn.commit()
+    _commit_write(write)
 
 
 # ─── cache_affinities ─────────────────────────────────────────────
@@ -982,40 +1024,44 @@ def affinity_upsert(fingerprint: str, channel_key: str, model: str,
     ts = last_used if last_used is not None else now_ms()
     with _write_lock:
         conn = _get_conn()
-        # 先尝试更新；若未命中则插入。prompt_cache_key=None 表示不改
-        # 既有值，避免非 OpenAI 协议/老调用路径清空 OpenAI 会话缓存绑定。
-        if prompt_cache_key is not None:
-            cur = conn.execute(
-                """UPDATE cache_affinities
-                   SET channel_key=?, model=?, last_used=?, prompt_cache_key=?
-                   WHERE fingerprint=?""",
-                (channel_key, model, ts, prompt_cache_key, fingerprint),
-            )
-        else:
-            cur = conn.execute(
-                """UPDATE cache_affinities
-                   SET channel_key=?, model=?, last_used=?
-                   WHERE fingerprint=?""",
-                (channel_key, model, ts, fingerprint),
-            )
-        if cur.rowcount == 0:
-            conn.execute(
-                """INSERT INTO cache_affinities
-                   (fingerprint, channel_key, model, last_used, created_at, prompt_cache_key)
-                   VALUES (?,?,?,?,?,?)""",
-                (fingerprint, channel_key, model, ts, ts, prompt_cache_key),
-            )
-        conn.commit()
+        try:
+            # 先尝试更新；若未命中则插入。prompt_cache_key=None 表示不改
+            # 既有值，避免非 OpenAI 协议/老调用路径清空 OpenAI 会话缓存绑定。
+            if prompt_cache_key is not None:
+                cur = conn.execute(
+                    """UPDATE cache_affinities
+                       SET channel_key=?, model=?, last_used=?, prompt_cache_key=?
+                       WHERE fingerprint=?""",
+                    (channel_key, model, ts, prompt_cache_key, fingerprint),
+                )
+            else:
+                cur = conn.execute(
+                    """UPDATE cache_affinities
+                       SET channel_key=?, model=?, last_used=?
+                       WHERE fingerprint=?""",
+                    (channel_key, model, ts, fingerprint),
+                )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """INSERT INTO cache_affinities
+                       (fingerprint, channel_key, model, last_used, created_at, prompt_cache_key)
+                       VALUES (?,?,?,?,?,?)""",
+                    (fingerprint, channel_key, model, ts, ts, prompt_cache_key),
+                )
+            conn.commit()
+        except sqlite3.Error:
+            _rollback_failed_write(conn)
+            raise
 
 
 def affinity_touch(fingerprint: str, last_used: int | None = None) -> None:
     ts = last_used if last_used is not None else now_ms()
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             "UPDATE cache_affinities SET last_used=? WHERE fingerprint=?",
             (ts, fingerprint),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def affinity_load(fingerprint: str) -> dict | None:
@@ -1032,62 +1078,62 @@ def affinity_load_all() -> list[dict]:
 
 
 def affinity_delete(fingerprint: str | None = None) -> None:
-    with _write_lock:
+    def write(conn):
         if fingerprint:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM cache_affinities WHERE fingerprint=?",
                 (fingerprint,),
             )
         else:
-            _get_conn().execute("DELETE FROM cache_affinities")
-        _get_conn().commit()
+            conn.execute("DELETE FROM cache_affinities")
+    _commit_write(write)
 
 
 def affinity_delete_by_channel(channel_key: str) -> None:
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             "DELETE FROM cache_affinities WHERE channel_key=?",
             (channel_key,),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def affinity_delete_stale_channels(live_keys: Iterable[str]) -> None:
     """删除不在 live_keys 中的所有渠道对应的亲和记录。"""
     live_set = set(live_keys)
-    with _write_lock:
-        rows = _get_conn().execute(
+    def write(conn):
+        rows = conn.execute(
             "SELECT DISTINCT channel_key FROM cache_affinities"
         ).fetchall()
         stale = [r["channel_key"] for r in rows if r["channel_key"] not in live_set]
         for k in stale:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM cache_affinities WHERE channel_key=?", (k,)
             )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def affinity_rename_channel(old_key: str, new_key: str) -> None:
     if old_key == new_key:
         return
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             "UPDATE cache_affinities SET channel_key=? WHERE channel_key=?",
             (new_key, old_key),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
-def affinity_cleanup(ttl_ms: int) -> int:
+def affinity_cleanup(ttl_ms: int, *, cutoff_ms: int | None = None) -> int:
     """清理 last_used 早于 now-ttl 的记录。返回清理条数。"""
-    cutoff = now_ms() - ttl_ms
-    with _write_lock:
-        cur = _get_conn().execute(
+    cutoff = cutoff_ms if cutoff_ms is not None else now_ms() - ttl_ms
+    def write(conn):
+        cur = conn.execute(
             "DELETE FROM cache_affinities WHERE last_used < ?",
             (cutoff,),
         )
-        _get_conn().commit()
         return cur.rowcount
+    return _commit_write(write)
 
 
 # ─── client_affinities ─────────────────────────────────────────────
@@ -1097,20 +1143,24 @@ def client_affinity_upsert(client_key: str, channel_key: str, model: str,
     ts = last_used if last_used is not None else now_ms()
     with _write_lock:
         conn = _get_conn()
-        cur = conn.execute(
-            """UPDATE client_affinities
-               SET channel_key=?, model=?, last_used=?
-               WHERE client_key=?""",
-            (channel_key, model, ts, client_key),
-        )
-        if cur.rowcount == 0:
-            conn.execute(
-                """INSERT INTO client_affinities
-                   (client_key, channel_key, model, last_used, created_at)
-                   VALUES (?,?,?,?,?)""",
-                (client_key, channel_key, model, ts, ts),
+        try:
+            cur = conn.execute(
+                """UPDATE client_affinities
+                   SET channel_key=?, model=?, last_used=?
+                   WHERE client_key=?""",
+                (channel_key, model, ts, client_key),
             )
-        conn.commit()
+            if cur.rowcount == 0:
+                conn.execute(
+                    """INSERT INTO client_affinities
+                       (client_key, channel_key, model, last_used, created_at)
+                       VALUES (?,?,?,?,?)""",
+                    (client_key, channel_key, model, ts, ts),
+                )
+            conn.commit()
+        except sqlite3.Error:
+            _rollback_failed_write(conn)
+            raise
 
 
 def client_affinity_load_all() -> list[dict]:
@@ -1119,63 +1169,106 @@ def client_affinity_load_all() -> list[dict]:
 
 
 def client_affinity_delete(client_key: str | None = None) -> None:
-    with _write_lock:
+    def write(conn):
         if client_key:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM client_affinities WHERE client_key=?",
                 (client_key,),
             )
         else:
-            _get_conn().execute("DELETE FROM client_affinities")
-        _get_conn().commit()
+            conn.execute("DELETE FROM client_affinities")
+    _commit_write(write)
 
 
 def client_affinity_delete_by_channel(channel_key: str) -> None:
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             "DELETE FROM client_affinities WHERE channel_key=?",
             (channel_key,),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def client_affinity_delete_stale_channels(live_keys: Iterable[str]) -> None:
     live_set = set(live_keys)
-    with _write_lock:
-        rows = _get_conn().execute(
+    def write(conn):
+        rows = conn.execute(
             "SELECT DISTINCT channel_key FROM client_affinities"
         ).fetchall()
         stale = [r["channel_key"] for r in rows if r["channel_key"] not in live_set]
         for k in stale:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM client_affinities WHERE channel_key=?", (k,)
             )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def client_affinity_rename_channel(old_key: str, new_key: str) -> None:
     if old_key == new_key:
         return
-    with _write_lock:
-        _get_conn().execute(
+    def write(conn):
+        conn.execute(
             "UPDATE client_affinities SET channel_key=? WHERE channel_key=?",
             (new_key, old_key),
         )
-        _get_conn().commit()
+    _commit_write(write)
 
 
-def client_affinity_cleanup(ttl_ms: int) -> int:
-    cutoff = now_ms() - ttl_ms
-    with _write_lock:
-        cur = _get_conn().execute(
+def client_affinity_cleanup(ttl_ms: int, *, cutoff_ms: int | None = None) -> int:
+    cutoff = cutoff_ms if cutoff_ms is not None else now_ms() - ttl_ms
+    def write(conn):
+        cur = conn.execute(
             "DELETE FROM client_affinities WHERE last_used < ?",
             (cutoff,),
         )
-        _get_conn().commit()
         return cur.rowcount
+    return _commit_write(write)
 
 
 # ─── oauth_quota_cache ────────────────────────────────────────────
+
+def _commit_quota_write(account_key: str, effect):
+    """Commit one quota-cache write against the current OAuth generation.
+
+    A request that started before an identity rename still carries the old
+    account key.  Resolve that generation while holding the shared lifecycle
+    lock so it updates the renamed row instead of recreating a stale one.  The
+    same lock makes the tombstone check atomic with deletion cleanup: once a
+    delete starts, no late quota write can slip in after its final DELETE.
+    """
+    from . import channel_state
+
+    with channel_state.mutation_lock:
+        source_channel_key = f"oauth:{account_key}"
+        target_channel_key = channel_state.resolve(source_channel_key)
+        if (
+            channel_state.is_deleted(source_channel_key)
+            or channel_state.is_deleted(target_channel_key)
+        ):
+            return None
+        prefix = "oauth:"
+        target_account_key = (
+            target_channel_key[len(prefix):]
+            if target_channel_key.startswith(prefix)
+            else account_key
+        )
+        with optional_write_timeout():
+            return _commit_write(
+                lambda conn: effect(conn, target_account_key)
+            )
+
+
+def _quota_display_email(account_key: str) -> str:
+    """Best-effort email fallback for canonical and legacy quota keys."""
+    if ":" not in account_key:
+        return account_key
+    provider, identity = account_key.split(":", 1)
+    # OpenAI canonical keys are provider:email:workspace. Historical xAI
+    # keys can also be provider:email:subject. The email is the first identity
+    # component; Claude remains provider:email.
+    if provider in {"openai", "xai"} and ":" in identity:
+        return identity.split(":", 1)[0]
+    return identity
 
 def quota_save(account_key: str, data: dict[str, Any],
                *, email: str | None = None) -> None:
@@ -1183,12 +1276,12 @@ def quota_save(account_key: str, data: dict[str, Any],
 
     若调用方未显式提供 email，则按 "provider:email" 拆出 email 作显示列兜底。
     """
-    if email is None:
-        email = account_key.split(":", 1)[1] if ":" in account_key else account_key
-    with _write_lock:
-        conn = _get_conn()
+    def write(conn, target_account_key: str):
+        target_email = email
+        if target_email is None:
+            target_email = _quota_display_email(target_account_key)
         values = (
-            email,
+            target_email,
             int(data.get("fetched_at", now_ms())),
             data.get("five_hour_util"),
             data.get("five_hour_reset"),
@@ -1207,7 +1300,7 @@ def quota_save(account_key: str, data: dict[str, Any],
         )
         row = conn.execute(
             "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
-            (account_key,),
+            (target_account_key,),
         ).fetchone()
         if row is None:
             conn.execute(
@@ -1221,7 +1314,7 @@ def quota_save(account_key: str, data: dict[str, Any],
                     extra_used, extra_limit, extra_util,
                     raw_data)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (account_key,) + values,
+                (target_account_key,) + values,
             )
         else:
             conn.execute(
@@ -1235,9 +1328,9 @@ def quota_save(account_key: str, data: dict[str, Any],
                      extra_used=?, extra_limit=?, extra_util=?,
                      raw_data=?
                    WHERE account_key=?""",
-                values + (account_key,),
+                values + (target_account_key,),
             )
-        conn.commit()
+    _commit_quota_write(account_key, write)
 
 
 def quota_load(account_key_or_email: str) -> dict | None:
@@ -1274,9 +1367,9 @@ def quota_load_all() -> list[dict]:
 
 
 def quota_delete(account_key_or_email: str) -> None:
-    with _write_lock:
+    def write(conn):
         if ":" in account_key_or_email:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM oauth_quota_cache WHERE account_key=?",
                 (account_key_or_email,),
             )
@@ -1284,16 +1377,16 @@ def quota_delete(account_key_or_email: str) -> None:
             # early schema upgrades. Keep this as a best-effort cleanup only.
             prov, identity = account_key_or_email.split(":", 1)
             if prov == "openai":
-                _get_conn().execute(
+                conn.execute(
                     "DELETE FROM oauth_quota_cache WHERE account_key=?",
                     (identity,),
                 )
         else:
-            _get_conn().execute(
+            conn.execute(
                 "DELETE FROM oauth_quota_cache WHERE email=?",
                 (account_key_or_email,),
             )
-        _get_conn().commit()
+    _commit_write(write)
 
 
 def quota_patch_passive(account_key: str, patch: dict,
@@ -1317,20 +1410,20 @@ def quota_patch_passive(account_key: str, patch: dict,
     safe = {k: v for k, v in patch.items() if k in ALLOWED}
     if not safe:
         return
-    if email is None:
-        email = account_key.split(":", 1)[1] if ":" in account_key else account_key
     now_ms_val = now_ms()
 
-    with _write_lock:
-        conn = _get_conn()
+    def write(conn, target_account_key: str):
+        target_email = email
+        if target_email is None:
+            target_email = _quota_display_email(target_account_key)
         row = conn.execute(
             "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
-            (account_key,),
+            (target_account_key,),
         ).fetchone()
         if row is None:
             # 不存在 → INSERT 一条，只带白名单字段，其他 NULL
             cols = ["account_key", "email", "fetched_at", "last_passive_update_at"]
-            vals = [account_key, email, 0, now_ms_val]
+            vals = [target_account_key, target_email, 0, now_ms_val]
             for k, v in safe.items():
                 cols.append(k)
                 vals.append(v)
@@ -1343,12 +1436,12 @@ def quota_patch_passive(account_key: str, patch: dict,
             # 存在 → UPDATE 白名单字段 + last_passive_update_at
             set_parts = [f"{k}=?" for k in safe.keys()]
             set_parts.append("last_passive_update_at=?")
-            vals = list(safe.values()) + [now_ms_val, account_key]
+            vals = list(safe.values()) + [now_ms_val, target_account_key]
             conn.execute(
                 f"UPDATE oauth_quota_cache SET {', '.join(set_parts)} WHERE account_key=?",
                 vals,
             )
-        conn.commit()
+    _commit_quota_write(account_key, write)
 
 
 def quota_save_openai_snapshot(account_key: str, snap: dict,
@@ -1380,13 +1473,13 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
         ts = now + max(0, int(sec))
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
-    if email is None:
-        email = account_key.split(":", 1)[1] if ":" in account_key else account_key
     passive_ts = fetched_at
-    with _write_lock:
-        conn = _get_conn()
+    def write(conn, target_account_key: str):
+        target_email = email
+        if target_email is None:
+            target_email = _quota_display_email(target_account_key)
         values = (
-            email,
+            target_email,
             fetched_at,
             passive_ts,
             normalized.get("five_hour_util"),
@@ -1403,7 +1496,7 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
         )
         row = conn.execute(
             "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
-            (account_key,),
+            (target_account_key,),
         ).fetchone()
         if row is None:
             conn.execute(
@@ -1419,7 +1512,7 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
                     codex_primary_over_secondary_pct)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    account_key,
+                    target_account_key,
                 ) + values[:7] + (
                     None, None,        # sonnet —— OpenAI 无此维度
                     None, None,        # opus   —— 同上
@@ -1437,6 +1530,6 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
                      codex_secondary_used_pct=?, codex_secondary_reset_sec=?, codex_secondary_window_min=?,
                      codex_primary_over_secondary_pct=?
                    WHERE account_key=?""",
-                values + (account_key,),
+                values + (target_account_key,),
             )
-        conn.commit()
+    _commit_quota_write(account_key, write)

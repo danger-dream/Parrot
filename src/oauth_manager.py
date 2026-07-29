@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -341,7 +342,63 @@ def _remaining_str(iso_or_none: str | None) -> str:
     return f"{h}h {m}m" if h > 0 else f"{m}m"
 
 
-def _save_token_fields(account_key: str, new: dict) -> None:
+def _rename_priority_orders_in_config(cfg: dict, old_channel_key: str,
+                                      new_channel_key: str, family: str) -> None:
+    """Rename one priority key inside the caller's atomic config mutation."""
+    lb = cfg.setdefault("loadBalancing", {})
+    orders = lb.setdefault("priorityOrders", {})
+    for current_family in ("anthropic", "openai"):
+        result: list[str] = []
+        seen: set[str] = set()
+        for key in list(orders.get(current_family) or []):
+            if current_family == family and key == old_channel_key:
+                key = new_channel_key
+            elif key in (old_channel_key, new_channel_key) and current_family != family:
+                continue
+            if key not in seen:
+                result.append(key)
+                seen.add(key)
+        orders[current_family] = result
+
+
+def _rename_runtime_oauth_identity(old_account_key: str, new_account_key: str, *,
+                                   config_mutator, rollback_mutator,
+                                   email: str | None = None) -> None:
+    """Atomically coordinate config publication with all mirrored state."""
+    if not old_account_key or not new_account_key or old_account_key == new_account_key:
+        config.update(config_mutator)
+        return
+    from . import channel_state
+
+    old_channel_key = f"oauth:{old_account_key}"
+    new_channel_key = f"oauth:{new_account_key}"
+    channel_state.rename_with_config(
+        old_channel_key=old_channel_key,
+        new_channel_key=new_channel_key,
+        old_account_key=old_account_key,
+        new_account_key=new_account_key,
+        email=email,
+        config_mutator=config_mutator,
+        rollback_mutator=rollback_mutator,
+    )
+
+
+def _save_token_fields(account_key: str, new: dict) -> bool:
+    """Persist one refresh result only if its exact account generation survives.
+
+    A refresh may finish after the account was renamed or deleted.  The
+    process-lifetime channel generation map is authoritative here: a rename
+    may forward the result to its exact destination, while a deleted or
+    otherwise missing generation must drop it.  Never fall back to matching a
+    bare email, because Claude and OpenAI accounts may legitimately share one.
+    """
+    from . import channel_state
+
+    with config.serialized_updates(), channel_state.mutation_lock:
+        return _save_token_fields_serialized(account_key, new)
+
+
+def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
     """把刷新后的 token 字段写回 config.oauthAccounts（按 account_key 精确匹配）。
 
     若刷新返回了新的 OpenAI workspace/account id，则需要把相关运行时状态和
@@ -351,49 +408,109 @@ def _save_token_fields(account_key: str, new: dict) -> None:
     若该账号此前因 `auth_error` 被自动禁用，刷新成功视为身份恢复：
     同时清掉 disabled_reason / disabled_until 并把 enabled 重新置 True。
     """
-    canonical = _resolve_existing_account_key(account_key)
-    target_key = canonical or account_key
-    old_acc = get_account(target_key)
-    target_email = account_key_to_email(target_key)
-    old_key = _canonical_key(old_acc) if old_acc else (canonical or account_key)
+    from . import channel_state
+
+    # Production callers always pass a canonical key.  Keep the unambiguous
+    # legacy bare-email helper behavior for tests/admin paths, but resolve it
+    # before entering the generation check and never use email for mutation.
+    source_account_key = account_key
+    if ":" not in source_account_key:
+        try:
+            source_account_key = _resolve_existing_account_key(source_account_key) or ""
+        except AmbiguousOAuthAccountKey:
+            return False
+        if not source_account_key:
+            return False
+
+    source_channel_key = f"oauth:{source_account_key}"
+    target_channel_key = channel_state.resolve(source_channel_key)
+    if (
+        channel_state.is_deleted(source_channel_key)
+        or channel_state.is_deleted(target_channel_key)
+        or not target_channel_key.startswith("oauth:")
+    ):
+        return False
+    target_key = target_channel_key[len("oauth:"):]
+
+    old_acc = next(
+        (
+            account for account in config.get().get("oauthAccounts", [])
+            if _canonical_key(account) == target_key
+        ),
+        None,
+    )
+    if old_acc is None:
+        return False
+
+    source_provider, _source_identity = _split_ak(source_account_key)
+    if _acc_provider(old_acc) != _normalize_provider(source_provider):
+        return False
+
+    old_acc_snapshot = copy.deepcopy(old_acc) if old_acc is not None else None
+    old_priority_orders = copy.deepcopy(
+        config.get().get("loadBalancing", {}).get("priorityOrders", {})
+    )
+    target_email = str(old_acc.get("email") or account_key_to_email(target_key))
+    old_key = _canonical_key(old_acc)
     new_key = old_key
+    rename_family = "anthropic"
     if old_acc:
         preview = dict(old_acc)
         preview.update(new)
         new_key = _canonical_key(preview)
         target_email = str(preview.get("email") or target_email)
+        rename_family = (
+            "openai" if _is_openai_family_provider(provider_of(preview))
+            else "anthropic"
+        )
 
-    if old_key and new_key and old_key != new_key:
-        try:
-            state_db.rename_oauth_identity(old_key, new_key, email=target_email)
-        except Exception as exc:
-            print(f"[oauth] state rename failed {old_key} -> {new_key}: {exc}")
-        try:
-            _prov = provider_of(old_acc or old_key)
-            load_balancing.sync_channel_renamed(
-                f"oauth:{old_key}", f"oauth:{new_key}",
-                "openai" if _is_openai_family_provider(_prov) else "anthropic",
-            )
-        except Exception as exc:
-            print(f"[oauth] priority rename failed {old_key} -> {new_key}: {exc}")
+    if old_key != new_key:
+        from . import channel_state
+        channel_state.assert_reusable(f"oauth:{new_key}")
+        for account in config.get().get("oauthAccounts", []):
+            candidate = _canonical_key(account)
+            if candidate == new_key and candidate != old_key:
+                raise ValueError(f"OAuth account identity already exists: {new_key}")
 
     def mutate(cfg):
+        updated = False
         for acc in cfg.get("oauthAccounts", []):
-            if old_acc is not None:
-                if _canonical_key(acc) != old_key:
-                    continue
-            elif canonical:
-                if _canonical_key(acc) != canonical:
-                    continue
-            elif acc.get("email") != target_email:
+            if _canonical_key(acc) != old_key:
                 continue
             acc.update(new)
             if acc.get("disabled_reason") == "auth_error":
                 acc["disabled_reason"] = None
                 acc["disabled_until"] = None
                 acc["enabled"] = True
+            updated = True
             break
-    config.update(mutate)
+        if updated and old_key != new_key:
+            _rename_priority_orders_in_config(
+                cfg, f"oauth:{old_key}", f"oauth:{new_key}", rename_family,
+            )
+
+    def rollback(cfg):
+        if old_acc_snapshot is not None:
+            accounts = cfg.get("oauthAccounts", [])
+            for index, acc in enumerate(accounts):
+                if _canonical_key(acc) == new_key:
+                    accounts[index] = copy.deepcopy(old_acc_snapshot)
+                    break
+        cfg.setdefault("loadBalancing", {})["priorityOrders"] = copy.deepcopy(
+            old_priority_orders
+        )
+
+    if old_key and new_key and old_key != new_key:
+        _rename_runtime_oauth_identity(
+            old_key,
+            new_key,
+            email=target_email,
+            config_mutator=mutate,
+            rollback_mutator=rollback,
+        )
+    else:
+        config.update(mutate)
+    return True
 
 
 def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None) -> dict:
@@ -636,7 +753,11 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
             except Exception as exc:
                 print(f"[oauth] claude refresh: profile fetch failed for {email}: {exc}")
 
-        _save_token_fields(account_key, new_fields)
+        if not _save_token_fields(account_key, new_fields):
+            print(
+                f"[oauth] discarded refresh result for retired generation: "
+                f"{account_key}"
+            )
         return new_fields["access_token"]
 
 
@@ -1812,6 +1933,12 @@ def _openai_metadata_patch(entry: dict) -> dict:
 
 
 def add_account(entry: dict) -> None:
+    """Serialize target resolution, snapshots, config publication, and state rename."""
+    with config.serialized_updates():
+        _add_account_serialized(entry)
+
+
+def _add_account_serialized(entry: dict) -> None:
     """entry 需至少含 email / access_token / refresh_token。
 
     支持可选字段：
@@ -1901,11 +2028,17 @@ def add_account(entry: dict) -> None:
             break
     rename_old_key = _canonical_key(existing_target) if existing_target else ""
     rename_new_key = normalized_key if rename_old_key and rename_old_key != normalized_key else ""
+    from . import channel_state
+    if existing_target is None or rename_new_key:
+        channel_state.assert_reusable(f"oauth:{normalized_key}")
     if rename_new_key:
-        try:
-            state_db.rename_oauth_identity(rename_old_key, rename_new_key, email=email)
-        except Exception as exc:
-            print(f"[oauth] pre-rename state failed {rename_old_key} -> {rename_new_key}: {exc}")
+        for account in config.get().get("oauthAccounts", []):
+            if account is not existing_target and _canonical_key(account) == normalized_key:
+                raise ValueError(f"OAuth account identity already exists: {normalized_key}")
+    existing_snapshot = copy.deepcopy(existing_target) if existing_target else None
+    old_priority_orders = copy.deepcopy(
+        config.get().get("loadBalancing", {}).get("priorityOrders", {})
+    )
 
     def mutate(cfg):
         accounts = cfg.setdefault("oauthAccounts", [])
@@ -1941,28 +2074,38 @@ def add_account(entry: dict) -> None:
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
             if rename_new_key:
-                lb = cfg.setdefault("loadBalancing", {})
-                po = lb.setdefault("priorityOrders", {})
                 fam = "openai" if _is_openai_family_provider(provider) else "anthropic"
-                for f in ("anthropic", "openai"):
-                    arr = list(po.get(f) or [])
-                    new_arr: list[str] = []
-                    seen: set[str] = set()
-                    for key in arr:
-                        if f == fam and key == f"oauth:{rename_old_key}":
-                            key = f"oauth:{rename_new_key}"
-                        elif key in (f"oauth:{rename_old_key}", f"oauth:{rename_new_key}"):
-                            if f != fam:
-                                continue
-                        if key not in seen:
-                            new_arr.append(key)
-                            seen.add(key)
-                    po[f] = new_arr
+                _rename_priority_orders_in_config(
+                    cfg,
+                    f"oauth:{rename_old_key}",
+                    f"oauth:{rename_new_key}",
+                    fam,
+                )
             return
         accounts.append(normalized)
         added["v"] = True
 
-    config.update(mutate)
+    def rollback(cfg):
+        if existing_snapshot is not None:
+            accounts = cfg.get("oauthAccounts", [])
+            for index, account in enumerate(accounts):
+                if _canonical_key(account) == rename_new_key:
+                    accounts[index] = copy.deepcopy(existing_snapshot)
+                    break
+        cfg.setdefault("loadBalancing", {})["priorityOrders"] = copy.deepcopy(
+            old_priority_orders
+        )
+
+    if rename_new_key:
+        _rename_runtime_oauth_identity(
+            rename_old_key,
+            rename_new_key,
+            email=email,
+            config_mutator=mutate,
+            rollback_mutator=rollback,
+        )
+    else:
+        config.update(mutate)
     if added["v"]:
         load_balancing.sync_channel_added(
             f"oauth:{normalized_key}",
@@ -1971,53 +2114,108 @@ def add_account(entry: dict) -> None:
 
 
 def delete_account(account_key: str) -> None:
+    with config.serialized_updates():
+        _delete_account_serialized(account_key)
+
+
+def _delete_account_serialized(account_key: str) -> None:
     """按 account_key 精确删除一个账号 + 级联清理。
 
     兼容：若入参是裸 email（老 API），按 email 删除（可能删掉多条同邮箱的老数据）。
     """
-    canonical = _resolve_existing_account_key(account_key)
+    configured_keys = {
+        _canonical_key(account) for account in config.get().get("oauthAccounts", [])
+    }
+    if account_key not in configured_keys:
+        from . import channel_state
+        raw_channel = f"oauth:{account_key}"
+        resolved_channel = channel_state.resolve(raw_channel)
+        if resolved_channel != raw_channel:
+            account_key = resolved_channel[len("oauth:"):]
+    try:
+        canonical = _resolve_existing_account_key(account_key)
+    except AmbiguousOAuthAccountKey:
+        # Legacy bare-email deletion intentionally removes every provider entry
+        # sharing that email; ambiguity is only unsafe for single-account reads.
+        if ":" in account_key:
+            raise
+        canonical = None
     has_prov = ":" in account_key
     target_provider, target_identity = _split_ak(account_key)
 
+    def matches(account: dict) -> bool:
+        if canonical:
+            return _canonical_key(account) == canonical
+        if account.get("email") != target_identity:
+            return False
+        if not has_prov:
+            return True
+        return _acc_provider(account) == target_provider
+
+    cleanup_keys = [
+        _canonical_key(account)
+        for account in config.get().get("oauthAccounts", [])
+        if matches(account)
+    ]
+    if not cleanup_keys:
+        return
+    channel_keys = {f"oauth:{key}" for key in cleanup_keys}
+
     def mutate(cfg):
         accounts = cfg.get("oauthAccounts", [])
-        def _keep(a):
-            if canonical:
-                return _canonical_key(a) != canonical
-            if a.get("email") != target_identity:
-                return True
-            if not has_prov:
-                return False  # 老 API：按 email 删除（同邮箱可能多条，统一删）
-            return _acc_provider(a) != target_provider
-        cfg["oauthAccounts"] = [a for a in accounts if _keep(a)]
-    config.update(mutate)
+        cfg["oauthAccounts"] = [account for account in accounts if not matches(account)]
+        load_balancing.mutate_channels_removed(cfg, channel_keys)
 
-    # state.db 级联清理
-    cleanup_key = canonical or account_key
-    ch_key = f"oauth:{cleanup_key}"
-    load_balancing.sync_channel_removed(ch_key)
-    state_db.perf_delete(ch_key)
-    # cooldown 与亲和都必须走各自的内存 + state.db 双清接口；否则同一
-    # account key 在当前进程内重新添加后可能继承只存在于内存的冻结状态。
-    from . import cooldown as _cooldown
-    _cooldown.clear(ch_key, notify_recovered=False)
-    from . import affinity as _affinity
-    _affinity.delete_by_channel(ch_key)
-    try:
-        _affinity.client_delete_by_channel(ch_key)
-    except Exception:
-        pass
-    state_db.quota_delete(cleanup_key)
+    # Remove config + priority entries atomically, then keep every removed
+    # generation tombstoned until restart. Late in-flight responses must not
+    # recreate scorer/cooldown/affinity/quota rows after the cleanup commit.
+    from . import affinity as _affinity, channel_state, concurrency
+    from . import cooldown as _cooldown, scorer as _scorer
+    with channel_state.mutation_lock:
+        retirement_plan = {
+            channel_key: sorted(channel_state.alias_sources(channel_key)) + [channel_key]
+            for channel_key in channel_keys
+        }
+        frozen_limits = {
+            generation_key: concurrency.capture_rename_limit(generation_key)
+            for generation_keys in retirement_plan.values()
+            for generation_key in generation_keys
+        }
+        for channel_key in channel_keys:
+            channel_state.retire_deleted(channel_key)
+        try:
+            config.update(mutate)
+        except BaseException:
+            for channel_key in channel_keys:
+                channel_state.restore_deleted(channel_key)
+            raise
+        for channel_key, generation_keys in retirement_plan.items():
+            for generation_key in generation_keys:
+                concurrency.retire_channel(
+                    generation_key,
+                    frozen_max=frozen_limits[generation_key],
+                    deleted_target=channel_key,
+                )
 
-    # failover 的响应头 snapshot 节流桶（Codex + Anthropic 都清）
-    try:
-        from . import failover
-        failover.forget_codex_snapshot(cleanup_key)
-        failover.forget_anthropic_snapshot(cleanup_key)
-    except Exception:
-        pass
-    # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
-    forget_openai_probe(cleanup_key)
+        for cleanup_key in cleanup_keys:
+            ch_key = f"oauth:{cleanup_key}"
+            _scorer.clear_stats(ch_key)
+            _cooldown.clear(
+                ch_key, notify_recovered=False, resolve_alias=False,
+            )
+            _affinity.delete_by_channel(ch_key)
+            _affinity.client_delete_by_channel(ch_key)
+            state_db.quota_delete(cleanup_key)
+
+            # failover 的响应头 snapshot 节流桶（Codex + Anthropic 都清）
+            try:
+                from . import failover
+                failover.forget_codex_snapshot(cleanup_key)
+                failover.forget_anthropic_snapshot(cleanup_key)
+            except Exception:
+                pass
+            # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
+            forget_openai_probe(cleanup_key)
 
 
 _EXPECTED_REASON_UNSET = object()

@@ -207,7 +207,7 @@ def record_success(channel_key, model, connect_ms, first_byte_ms, total_ms):
     #    满了则用"滑出旧平均成功率 + 滑入一次成功"等效 EMA
     # 3. EMA 更新 avg_connect_ms / avg_first_byte_ms / avg_total_ms（α=0.25）
     # 4. lastUpdated = now_ms()
-    # 5. state_db.perf_save
+    # 5. 由 scorer 模块在同一 mutation lifecycle 内持久化并发布内存快照
 
 def record_failure(channel_key, model, connect_ms):
     # 1. totalRequests++

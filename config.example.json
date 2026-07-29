@@ -355,8 +355,13 @@
   "openai": {
     "store": {
       "enabled": true,
+      "dbPath": "openai_response_store.db",
       "ttlMinutes": 60,
-      "cleanupIntervalSeconds": 300
+      "cleanupIntervalSeconds": 300,
+      "cleanupBatchSize": 100,
+      "cleanupBatchBytes": 8388608,
+      "cleanupMaxBatches": 100,
+      "cleanupTimeBudgetSeconds": 10
     },
     "reasoningBridge": "passthrough",
     "autoPromptCacheKey": {

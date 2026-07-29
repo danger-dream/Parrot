@@ -1,11 +1,13 @@
 # 03 — 数据库设计
 
-两套独立的 SQLite 库：
+三套独立的 SQLite 库：
 
 - **state.db** — 运行时状态，**永久保留**（性能统计、错误冷却、亲和、配额缓存）
+- **openai_response_store.db** — OpenAI `previous_response_id` history（TTL 清理）
 - **logs/YYYY-MM.db** — 业务日志，**按月分库**（请求流水、重试链、完整 body）
 
-两者均启用 WAL 模式，定时 checkpoint。
+各库均启用 WAL 模式。OpenAI history 与 `state.db` 分库，避免大表清理长时间
+占用轻量状态写锁；旧版 `state.db.openai_response_store` 只用于升级后的只读 fallback。
 
 ## 3.1 state.db Schema
 
@@ -101,9 +103,12 @@ def quota_save(email, data: dict)
 def quota_load(email) -> Row | None
 def quota_load_all() -> list[Row]
 def quota_delete(email)
+
+# coordinated live rename (performance/errors/fp/client/quota in one transaction)
+def rename_runtime_channel_state(old_channel_key, new_channel_key, ...)
 ```
 
-所有写操作由单一 `_write_lock`（threading.Lock）序列化，避免跨协程冲突。
+所有 state.db 写操作由单一 `_write_lock`（`threading.RLock`）序列化。运行期渠道改名不直接逐表调用这些接口，而由 `src/channel_state.py` 协调：配置写入和 reload、单个 SQLite 事务、scorer/cooldown/两类 affinity 内存发布共用同一生命周期锁；失败时在释放过渡 key 前恢复旧配置。这样 reload cleanup 不会把改名中的 old/new 状态误判为 stale，也不会留下只更新 DB 或只更新内存的中间态。
 
 ## 3.2 logs/YYYY-MM.db Schema
 
@@ -251,10 +256,12 @@ def retry_chain_of(request_id) -> list[Row]
 | 错误冷却 | state.db | 否 | 临时（cooldown 到期清除） |
 | 亲和绑定 | state.db | 否 | TTL 30min |
 | OAuth 配额缓存 | state.db | 否 | 实时覆盖写 |
+| OpenAI response history | openai_response_store.db | 否 | TTL 60min（默认） |
 | 请求流水 | logs/YYYY-MM.db | 是 | 默认永久保留；可由 `logRetention` 按天清理 |
 | 重试链 | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 | 请求/响应 body | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 
-原则：**状态数据需要快速读写且重启恢复**，放 state.db；**业务日志写多读少且数据量大**，按月分库便于归档与迁移。
+原则：**轻量状态数据需要快速读写且重启恢复**，放 state.db；体积可能很大的
+OpenAI history 独立分库；**业务日志写多读少且数据量大**，按月分库便于归档与迁移。
 
 当 `logRetention.mode="days"` 时，完整过期月份直接删除整库；留存临界所在月份会删除过期请求及 `request_detail` / retry / proxy / local-web 关联行，再压缩 SQLite 以实际回收磁盘空间。TG Bot 必须经两次确认后才会保存该策略并执行首次清理；之后由后台维护循环每天最多检查一次。

@@ -18,17 +18,27 @@
 
 from __future__ import annotations
 
+import logging
 import random
+import sqlite3
 import threading
 import time
 from typing import Optional
 
-from . import config, state_db
+from . import channel_state, config, state_db
+from .sqlite_errors import is_availability_error
 
 
 _lock = threading.Lock()
+# Keep one score mutation's memory snapshot and persistence ordered with
+# channel-key renames.  Reads still use only _lock and remain cheap.
+_mutation_lock = channel_state.mutation_lock
 _stats: dict[tuple[str, str], dict] = {}
 _initialized = False
+_logger = logging.getLogger(__name__)
+_persist_warning_lock = threading.Lock()
+_last_persist_warning_at = 0.0
+_PERSIST_WARNING_INTERVAL_SECONDS = 60.0
 
 # Old rows aggregated the superseded physical-connect meaning.  A deployment
 # must explicitly activate this version after reviewing production state.db;
@@ -146,11 +156,35 @@ def get_score(channel_key: str, model: str) -> float:
     return calculate_score(_get(channel_key, model))
 
 
+def _persist_best_effort(channel_key: str, model: str, snapshot: dict) -> None:
+    """Persist scoring without allowing SQLite failures onto the response path."""
+    global _last_persist_warning_at
+    try:
+        with state_db.optional_write_timeout():
+            state_db.perf_save(channel_key, model, snapshot)
+    except sqlite3.Error as exc:
+        if not is_availability_error(exc):
+            raise
+        now = time.monotonic()
+        should_warn = False
+        with _persist_warning_lock:
+            if (
+                _last_persist_warning_at == 0.0
+                or now - _last_persist_warning_at >= _PERSIST_WARNING_INTERVAL_SECONDS
+            ):
+                _last_persist_warning_at = now
+                should_warn = True
+        if should_warn:
+            _logger.warning(
+                "scorer SQLite persistence failed; keeping in-memory score: %s", exc,
+            )
+
+
 # ─── 记录成功 / 失败 ─────────────────────────────────────────────
 
-def record_success(channel_key: str, model: str,
-                   connect_ms: Optional[float], first_byte_ms: Optional[float],
-                   total_ms: Optional[float]) -> None:
+def _record_success(channel_key: str, model: str,
+                    connect_ms: Optional[float], first_byte_ms: Optional[float],
+                    total_ms: Optional[float]) -> None:
     params = _params()
     window = params["recentWindow"]
     alpha = params["emaAlpha"]
@@ -203,10 +237,20 @@ def record_success(channel_key: str, model: str,
 
         snapshot = dict(stats)
 
-    state_db.perf_save(channel_key, model, snapshot)
+    _persist_best_effort(channel_key, model, snapshot)
 
 
-def record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -> None:
+def record_success(channel_key: str, model: str,
+                   connect_ms: Optional[float], first_byte_ms: Optional[float],
+                   total_ms: Optional[float]) -> None:
+    with _mutation_lock:
+        channel_key = channel_state.resolve(channel_key)
+        if channel_state.is_deleted(channel_key):
+            return
+        _record_success(channel_key, model, connect_ms, first_byte_ms, total_ms)
+
+
+def _record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -> None:
     params = _params()
     window = params["recentWindow"]
     alpha = params["emaAlpha"]
@@ -241,7 +285,15 @@ def record_failure(channel_key: str, model: str, connect_ms: Optional[float]) ->
 
         snapshot = dict(stats)
 
-    state_db.perf_save(channel_key, model, snapshot)
+    _persist_best_effort(channel_key, model, snapshot)
+
+
+def record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -> None:
+    with _mutation_lock:
+        channel_key = channel_state.resolve(channel_key)
+        if channel_state.is_deleted(channel_key):
+            return
+        _record_failure(channel_key, model, connect_ms)
 
 
 # ─── 排序 + 探索 ────────────────────────────────────────────────
@@ -329,26 +381,35 @@ def timing_semantics_migration(*, apply: bool = False) -> dict:
 
 
 def clear_stats(channel_key: Optional[str] = None, model: Optional[str] = None) -> None:
-    with _lock:
-        if channel_key and model:
-            _stats.pop((channel_key, model), None)
-        elif channel_key:
-            for k in [k for k in _stats if k[0] == channel_key]:
-                _stats.pop(k, None)
-        else:
-            _stats.clear()
-    state_db.perf_delete(channel_key, model)
+    with _mutation_lock:
+        state_db.perf_delete(channel_key, model)
+        with _lock:
+            if channel_key and model:
+                _stats.pop((channel_key, model), None)
+            elif channel_key:
+                for k in [k for k in _stats if k[0] == channel_key]:
+                    _stats.pop(k, None)
+            else:
+                _stats.clear()
 
 
-def rename_channel(old_key: str, new_key: str) -> None:
+def rename_channel(old_key: str, new_key: str, *, persist: bool = True) -> None:
     if old_key == new_key:
         return
-    with _lock:
-        items = [(k, v) for k, v in _stats.items() if k[0] == old_key]
-        for (_, m), v in items:
-            _stats.pop((old_key, m), None)
-            _stats[(new_key, m)] = v
-    state_db.perf_rename_channel(old_key, new_key)
+    with _mutation_lock:
+        if persist:
+            with state_db.optional_write_timeout():
+                state_db.perf_rename_channel(old_key, new_key)
+        with _lock:
+            items = [(k, v) for k, v in _stats.items() if k[0] == old_key]
+            for (_, m), v in items:
+                _stats.pop((old_key, m), None)
+                current = _stats.get((new_key, m))
+                if (
+                    current is None
+                    or int(v.get("last_updated", 0)) > int(current.get("last_updated", 0))
+                ):
+                    _stats[(new_key, m)] = v
 
 
 def snapshot() -> list[dict]:
@@ -372,3 +433,9 @@ def snapshot() -> list[dict]:
                 "score": round(score),
             })
     return out
+
+
+def channel_keys() -> set[str]:
+    """Return raw in-memory keys without requiring complete display stats."""
+    with _lock:
+        return {channel_key for channel_key, _model in _stats}

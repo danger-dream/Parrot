@@ -237,7 +237,7 @@ async def lifespan(app: FastAPI):
     from src.openai.channel.registration import register_factories as _openai_register_factories
     _openai_register_factories()
 
-    # OpenAI previous_response_id Store（挂在同一张 state.db，独立表）
+    # OpenAI previous_response_id Store（独立 SQLite；旧 state.db 只读兼容）
     from src.openai import store as openai_store
     openai_store.init()
 

@@ -363,7 +363,7 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - 大部分字段（channels / oauthAccounts / timeouts / scoring / ...）热加载即生效
 - **不热加载**：
   - `listen.host` / `listen.port`（需重启）
-  - `stateDbPath` / `logDir`（需重启）
+  - `stateDbPath` / `logDir` / `openai.store.dbPath`（需重启）
   - `telegram.botToken` / `telegram.adminIds`（需重启）
 
 ## 2.4 TG Bot 对 config.json 的写入

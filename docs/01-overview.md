@@ -57,6 +57,7 @@ anthropic-proxy/
 │
 ├── config.json                       # 唯一配置文件（含所有 OAuth 账号、渠道、密钥、调参）
 ├── state.db                          # 运行时状态（perf_stats / cooldown / affinity / quota_cache）
+├── openai_response_store.db          # previous_response_id history（TTL 清理）
 ├── logs/
 │   ├── 2026-04.db                    # 当月业务日志
 │   └── 2026-05.db                    # 跨月自动切换
@@ -73,6 +74,8 @@ anthropic-proxy/
     ├── errors.py                     # Anthropic 标准错误响应
     │
     ├── state_db.py                   # state.db 的所有读写接口
+    ├── channel_state.py              # 运行期渠道改名的配置/DB/内存协调锁
+    ├── sqlite_errors.py              # SQLite 可用性错误分类（不吞编程/Schema 错误）
     ├── log_db.py                     # 按月日志库的所有读写接口
     │
     ├── fingerprint.py                # 会话亲和指纹（query / write 两个函数）

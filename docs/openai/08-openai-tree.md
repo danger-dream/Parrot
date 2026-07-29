@@ -128,7 +128,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
 
 ## 8.3 `store.py` （~180 行）
 
-见 [05-store.md](./05-store.md)。挂在 state.db 上的一张表 + CRUD + 后台清理 loop。
+见 [05-store.md](./05-store.md)。使用独立 `openai_response_store.db`，提供 CRUD、
+旧 `state.db` 只读 fallback 与有界后台清理 loop。
 
 ## 8.4 `channel/api_channel.py` （~200 行）
 
