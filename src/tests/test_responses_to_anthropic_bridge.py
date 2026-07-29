@@ -43,6 +43,38 @@ def test_translate_request_composes_responses_input_to_anthropic_messages():
     ]
 
 
+def test_translate_request_preserves_easy_input_string_messages_after_tool_history():
+    """Hermes may append local fallback messages as EasyInputMessage strings."""
+    body = {
+        "model": "resp-model",
+        "stream": True,
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "start"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": '{}'},
+            {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+            {"role": "assistant", "content": "local max-iteration fallback"},
+            {"role": "user", "content": "follow-up"},
+        ],
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+    }
+
+    out = responses_to_anthropic.translate_request(body)
+
+    assert out["stream"] is True
+    assert out["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "start"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "result"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "local max-iteration fallback"}]},
+        {"role": "user", "content": [{"type": "text", "text": "follow-up"}]},
+    ]
+    assert all(
+        part.get("type") != "text" or bool(part.get("text"))
+        for message in out["messages"]
+        for part in message["content"]
+    )
+
+
 def test_translate_request_preserves_parallel_tool_calls():
     body = {
         "model": "resp-model",
