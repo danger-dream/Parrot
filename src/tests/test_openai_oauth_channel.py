@@ -475,17 +475,23 @@ def test_channel_responses_ingress_replay_scope_and_injection(m):
     _setup(m)
     _add_openai_acc(m)
     rr = m["reasoning_replay"]
+    account_key = "openai:o@openai.test:acct-123"
     encrypted_content = _valid_encrypted_content(13)
     rr.cache_items(
         "gpt-5.1",
         "prompt-cache:anchor",
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=account_key,
     )
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
     body = {"model": "gpt-5.1", "input": "continue", "prompt_cache_key": "anchor"}
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
     ctx = req.translator_ctx
-    assert ctx["codex_reasoning_replay"] == {"model": "gpt-5.1", "session_key": "prompt-cache:anchor"}
+    assert ctx["codex_reasoning_replay"] == {
+        "model": "gpt-5.1",
+        "session_key": "prompt-cache:anchor",
+        "account_key": account_key,
+    }
     assert ctx["codex_reasoning_replay_injected"] == 1
     payload = json.loads(req.body)
     assert payload["input"][0] == {"type": "reasoning", "summary": [], "content": None, "encrypted_content": encrypted_content}
@@ -709,13 +715,15 @@ def test_channel_anthropic_ingress_metadata_session_replay(m):
     _setup(m)
     _add_openai_acc(m)
     rr = m["reasoning_replay"]
+    account_key = "openai:o@openai.test:acct-123"
     encrypted_content = _valid_encrypted_content(17)
     rr.cache_items(
         "gpt-5.1",
         "claude:session-abc",
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=account_key,
     )
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
     body = {
         "model": "gpt-5.1",
         "messages": [{"role": "user", "content": "continue"}],
@@ -724,7 +732,11 @@ def test_channel_anthropic_ingress_metadata_session_replay(m):
     }
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
     ctx = req.translator_ctx
-    assert ctx["codex_reasoning_replay"] == {"model": "gpt-5.1", "session_key": "claude:session-abc"}
+    assert ctx["codex_reasoning_replay"] == {
+        "model": "gpt-5.1",
+        "session_key": "claude:session-abc",
+        "account_key": account_key,
+    }
     assert ctx["codex_reasoning_replay_injected"] == 1
     payload = json.loads(req.body)
     assert payload["input"][0]["type"] == "reasoning"

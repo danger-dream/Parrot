@@ -268,7 +268,7 @@ def test_non_encrypted_upstream_error_still_channel_failure():
     assert f._should_cooldown(out.outcome)
 
 
-def test_retry_body_without_encrypted_content_strips_input_only_keeps_include():
+def test_retry_body_without_encrypted_content_strips_only_ec_keeps_include():
     import src.failover as f
 
     body = {
@@ -290,10 +290,13 @@ def test_retry_body_without_encrypted_content_strips_input_only_keeps_include():
     retry_body, removed = f._retry_body_without_encrypted_content(body)
     assert removed == 2
     assert retry_body["include"] == ["reasoning.encrypted_content"]
-    assert [it["type"] for it in retry_body["input"]] == ["message", "function_call_output"]
-    assert retry_body["input"][1]["output"] == [{"type": "input_text", "text": "visible"}]
+    assert [it["type"] for it in retry_body["input"]] == [
+        "message", "reasoning", "function_call_output",
+    ]
+    assert retry_body["input"][1] == {"type": "reasoning", "id": "rs_1", "summary": []}
+    assert retry_body["input"][2]["output"] == [{"type": "input_text", "text": "visible"}]
     # 原 body 不被就地修改
-    assert any(it.get("type") == "reasoning" for it in body["input"])
+    assert body["input"][1]["encrypted_content"] == "bad"
 
 
 def test_retry_body_without_encrypted_content_noop_when_no_input_ec():
