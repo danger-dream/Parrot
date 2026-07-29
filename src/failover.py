@@ -123,6 +123,7 @@ from .transports import policy as transport_policy
 _CODEX_SNAPSHOT_WRITE_INTERVAL_S = 30.0
 _codex_snapshot_last: dict[str, float] = {}
 _codex_snapshot_lock = threading.Lock()
+_codex_snapshot_inflight: set[str] = set()
 
 
 def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
@@ -134,21 +135,39 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
+
+        # Auto-disable is based on this response, not on whether the auxiliary
+        # SQLite snapshot can be persisted. A BUSY/FULL/READONLY cache must
+        # never leave an explicitly over-limit account enabled.
+        _maybe_auto_disable_by_codex_snapshot(account_key, email, snap)
+
         # throttle bucket 用 account_key 作 key；OpenAI 同一邮箱可能有多个
-        # workspace，不能按 email 合并。
+        # workspace，不能按 email 合并。只在成功写入后推进 last；inflight
+        # 防止多个并发响应同时穿透，但写失败会立刻允许下一次重试。
         now = time.time()
         with _codex_snapshot_lock:
             last = _codex_snapshot_last.get(account_key, 0.0)
-            if now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S:
+            if (
+                now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S
+                or account_key in _codex_snapshot_inflight
+            ):
                 return
-            _codex_snapshot_last[account_key] = now
-        normalized = openai_provider.normalize_codex_snapshot(snap)
-        state_db.quota_save_openai_snapshot(account_key, snap, normalized, email=email)
-
-        # 🚨 响应头超限自动禁用（2026-04-20 新增）
-        # Codex 无 surpassed-threshold，但有 primary/secondary used percent；
-        # 判断任一 ≥ disableThresholdPercent 则触发（与 quota_monitor_once 语义一致）
-        _maybe_auto_disable_by_codex_snapshot(account_key, email, snap)
+            _codex_snapshot_inflight.add(account_key)
+        try:
+            normalized = openai_provider.normalize_codex_snapshot(snap)
+            state_db.quota_save_openai_snapshot(
+                account_key, snap, normalized, email=email,
+            )
+        except BaseException:
+            # Do not advance the throttle bucket: a following response should
+            # retry the cache write instead of waiting 30 seconds.
+            raise
+        else:
+            with _codex_snapshot_lock:
+                _codex_snapshot_last[account_key] = time.time()
+        finally:
+            with _codex_snapshot_lock:
+                _codex_snapshot_inflight.discard(account_key)
     except Exception as exc:
         print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
 
@@ -166,6 +185,7 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
 _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S = 30.0
 _anthropic_snapshot_last: dict[str, float] = {}
 _anthropic_snapshot_lock = threading.Lock()
+_anthropic_snapshot_inflight: set[str] = set()
 
 
 def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
@@ -181,21 +201,32 @@ def _maybe_record_anthropic_snapshot(ch: Channel, resp: httpx.Response) -> None:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
         email = ch.email
-        now = time.time()
-        with _anthropic_snapshot_lock:
-            last = _anthropic_snapshot_last.get(account_key, 0.0)
-            if now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S:
-                return
-            _anthropic_snapshot_last[account_key] = now
-        state_db.quota_patch_passive(account_key, patch, email=email)
 
-        # 🚨 响应头超限自动禁用（2026-04-20 新增）
-        # 5h/7d 任一超限且账号当前未被禁用 → 立即置为 quota disabled
-        # 这比 quota_monitor_loop 的轮询快得多（下一次请求前就禁用，不用等 30min）
+        # Keep realtime disable independent from the best-effort quota cache.
         _maybe_auto_disable_by_headers(
             account_key, ch.email, dict(resp.headers),
             provider="claude",
         )
+
+        now = time.time()
+        with _anthropic_snapshot_lock:
+            last = _anthropic_snapshot_last.get(account_key, 0.0)
+            if (
+                now - last < _ANTHROPIC_SNAPSHOT_WRITE_INTERVAL_S
+                or account_key in _anthropic_snapshot_inflight
+            ):
+                return
+            _anthropic_snapshot_inflight.add(account_key)
+        try:
+            state_db.quota_patch_passive(account_key, patch, email=email)
+        except BaseException:
+            raise
+        else:
+            with _anthropic_snapshot_lock:
+                _anthropic_snapshot_last[account_key] = time.time()
+        finally:
+            with _anthropic_snapshot_lock:
+                _anthropic_snapshot_inflight.discard(account_key)
     except Exception as exc:
         print(f"[failover] anthropic snapshot record failed for "
               f"{getattr(ch, 'email', '?')}: {exc}")
@@ -214,6 +245,8 @@ def forget_anthropic_snapshot(account_key_or_email: str) -> None:
     with _anthropic_snapshot_lock:
         _anthropic_snapshot_last.pop(email, None)
         _anthropic_snapshot_last.pop(key, None)
+        _anthropic_snapshot_inflight.discard(email)
+        _anthropic_snapshot_inflight.discard(key)
 
 
 # ─── 响应头超限自动禁用（2026-04-20 新增） ───────────────────────
@@ -380,6 +413,8 @@ def forget_codex_snapshot(account_key_or_email: str) -> None:
     with _codex_snapshot_lock:
         _codex_snapshot_last.pop(email, None)
         _codex_snapshot_last.pop(key, None)
+        _codex_snapshot_inflight.discard(email)
+        _codex_snapshot_inflight.discard(key)
 
 
 def _toolkit_for(ch: Channel) -> dict:

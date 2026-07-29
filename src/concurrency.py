@@ -102,15 +102,34 @@ def _enabled() -> bool:
     return bool(cc_cfg.get("enabled", True))
 
 
+def _is_deleted_generation_locked(ch_key: str) -> bool:
+    """Whether a successful delete retired this exact/aliased generation.
+
+    Rename-only generations may continue draining in place.  A delete is
+    different: requests that have not acquired capacity yet must not start an
+    upstream call with credentials removed from config.
+    """
+    deleted_target = _deleted_retire_targets.get(ch_key)
+    if deleted_target is not None:
+        return True
+    resolved = channel_state.resolve(ch_key)
+    return (
+        channel_state.is_deleted(ch_key)
+        or channel_state.is_deleted(resolved)
+    )
+
+
 async def try_acquire(ch_key: str) -> bool:
     """非阻塞尝试占一个位置。成功 in_flight+=1，返回 True；满了返回 False。
 
     禁用并发限制或渠道不限（max=0）时永远返回 True。
     """
-    if not _enabled():
-        return True
     async with _slots_lock:
         with channel_state.mutation_lock, _slots_guard:
+            if _is_deleted_generation_locked(ch_key):
+                return False
+            if not _enabled():
+                return True
             slot = _get_or_create_slot_locked(ch_key)
             if slot.is_unlimited():
                 slot.in_flight += 1
@@ -181,10 +200,12 @@ def _cleanup_retired_slot(ch_key: str, slot: ChannelSlot) -> None:
 
 async def _acquire_or_register_waiter(
     ch_key: str,
-) -> tuple[ChannelSlot, asyncio.Future | None, bool]:
+) -> tuple[ChannelSlot | None, asyncio.Future | None, bool]:
     """Atomically acquire available capacity or append one waiter."""
     async with _slots_lock:
         with channel_state.mutation_lock, _slots_guard:
+            if _is_deleted_generation_locked(ch_key):
+                return None, None, False
             slot = _get_or_create_slot_locked(ch_key)
             if slot.is_unlimited() or slot.in_flight < slot.max_concurrent:
                 slot.in_flight += 1
@@ -234,8 +255,14 @@ async def acquire_from_candidates(
                 for previous_slot, previous_fut in futures:
                     _drop_waiter(previous_slot, previous_fut)
                 return (ch_key, payload)
+            if slot is None:
+                # Deleted after scheduler selection but before acquire.
+                continue
             assert fut is not None
             futures.append((slot, fut))
+
+        if not futures:
+            return None
 
         # 同时等 _release_event 作为兜底唤醒源（覆盖 slot 被重建等极端情况）
         _release_event.clear()
@@ -287,6 +314,23 @@ def _drop_waiter(slot: ChannelSlot, fut: asyncio.Future) -> None:
                 fut.cancel()
             except Exception:
                 pass
+
+
+def _cancel_waiter_threadsafe(fut: asyncio.Future) -> None:
+    """Cancel a waiter on its owning loop (delete may run in a TG thread)."""
+    if fut.done():
+        return
+    try:
+        loop = fut.get_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(fut.cancel)
+        else:
+            fut.cancel()
+    except Exception:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
 
 
 def is_saturated(ch_key: str) -> bool:
@@ -362,6 +406,17 @@ def retire_channel(ch_key: str, *, frozen_max: int | None = None,
         _retired_limits[ch_key] = int(frozen_max)
         if slot is not None:
             slot.max_concurrent = int(frozen_max)
+            if deleted_target is not None:
+                # A rename may drain queued waiters; a delete may not. Wake
+                # every pre-acquire waiter so it rechecks the generation and
+                # fails or selects another candidate without using old creds.
+                for fut in slot.waiters:
+                    _cancel_waiter_threadsafe(fut)
+                slot.waiters.clear()
+                try:
+                    _release_event.set()
+                except Exception:
+                    pass
             _cleanup_retired_slot(ch_key, slot)
         elif deleted_target is not None:
             # There is no tracked slot, but a request may still be between

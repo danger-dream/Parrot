@@ -137,6 +137,13 @@ def _do_refresh_sync(email: str) -> str:
     return data["access_token"]
 ```
 
+> 当前实现以 canonical `account_key`（provider + identity/workspace）而不是裸
+> email 作为 refresh lock 和保存目标。远端请求返回后，保存阶段在
+> `config.serialized_updates()` + `channel_state.mutation_lock` 内重新核对该
+> generation：改名 generation 可通过 alias 精确转发到新 canonical key；删除、
+> 缺失或 provider 不匹配时直接丢弃结果。禁止回退到 email 匹配，因为同一邮箱
+> 可以合法同时存在 Claude 与 OpenAI 账户。
+
 ### 8.2.3 用量拉取
 
 ```python
@@ -207,6 +214,11 @@ def set_disabled_by_quota(email: str, resets_at: str):
 ```
 
 ### 8.2.5 配额监控
+
+响应头实时超限判定与 quota snapshot 持久化相互独立：先直接根据本次响应头
+执行 auto-disable，再 best-effort 写 cache。SQLite `BUSY/LOCKED/FULL/READONLY`
+不能阻止禁用；30 秒持久化节流只在写入成功后推进，写失败允许下一次响应立即
+重试。这样明确超限的账号不会因辅助缓存故障继续消耗上游额度。
 
 ```python
 async def quota_monitor_loop():

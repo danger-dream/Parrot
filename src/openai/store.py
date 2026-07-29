@@ -41,6 +41,11 @@ class ResponseForbidden(Exception):
     pass
 
 
+class ResponseIdConflict(Exception):
+    """Another API key already owns this upstream response id."""
+    pass
+
+
 # ─── DTO ─────────────────────────────────────────────────────────
 
 
@@ -70,6 +75,9 @@ _logger = logging.getLogger(__name__)
 _cleanup_warning_lock = threading.Lock()
 _last_cleanup_warning_at = 0.0
 _CLEANUP_WARNING_INTERVAL_SECONDS = 3600.0
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def _paths_same_file(left: str, right: str) -> bool:
@@ -80,6 +88,68 @@ def _paths_same_file(left: str, right: str) -> bool:
         return os.path.samefile(left, right)
     except OSError:
         return False
+
+
+def _validate_private_path(path: str, *, directory: bool) -> os.stat_result:
+    """Fail closed on symlinks, foreign owners, or unsafe access."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(info.st_mode):
+        kind = "directory" if directory else "regular file"
+        raise RuntimeError(f"OpenAI Store path is not a {kind}: {path}")
+    if info.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"OpenAI Store path must be owned by uid {os.geteuid()}: {path}"
+        )
+    mode = stat.S_IMODE(info.st_mode)
+    if directory:
+        # Source installs default DATA_DIR to the repository root, which is
+        # commonly 0755.  That remains safe for 0600 DB files as long as
+        # another uid cannot replace directory entries.  New/container data
+        # directories are still created/fixed to 0700.
+        if mode & 0o022:
+            raise RuntimeError(
+                "OpenAI Store directory must not be group/world writable "
+                f"(recommended mode 0700): {path}"
+            )
+    elif mode & 0o077:
+        raise RuntimeError(
+            f"OpenAI Store path must be private (mode 0600): {path}"
+        )
+    return info
+
+
+def _prepare_private_db_path(path: str) -> None:
+    """Create a private DB inode without relying on the process umask."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=_PRIVATE_DIR_MODE, exist_ok=True)
+    _validate_private_path(parent, directory=True)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, _PRIVATE_FILE_MODE)
+    except FileExistsError:
+        _validate_private_path(path, directory=False)
+    else:
+        os.close(fd)
+        _validate_private_path(path, directory=False)
+
+
+def _validate_private_store_files() -> None:
+    if not _db_path:
+        return
+    _validate_private_path(_db_path, directory=False)
+    for suffix in ("-wal", "-shm"):
+        sidecar = f"{_db_path}{suffix}"
+        try:
+            _validate_private_path(sidecar, directory=False)
+        except FileNotFoundError:
+            pass
 
 
 def _legacy_regular_file_exists(path: str) -> bool:
@@ -103,14 +173,17 @@ def _absolute_data_path(value: str) -> str:
     if os.path.isabs(value):
         return os.path.abspath(value)
     data_root = os.path.realpath(config.DATA_DIR)
-    resolved = os.path.realpath(os.path.join(data_root, value))
+    candidate = os.path.abspath(os.path.join(data_root, value))
+    resolved = os.path.realpath(candidate)
     try:
         inside_data_dir = os.path.commonpath((data_root, resolved)) == data_root
     except ValueError:
         inside_data_dir = False
     if not inside_data_dir:
         raise RuntimeError("relative openai.store.dbPath must stay within DATA_DIR")
-    return resolved
+    # Preserve the lexical final path so _prepare_private_db_path can reject a
+    # symlink inode instead of silently opening its realpath target.
+    return candidate
 
 
 def _resolve_legacy_db_path() -> str:
@@ -179,11 +252,21 @@ def _get_conn() -> sqlite3.Connection:
         _close_local_connection("conn")
         conn = None
     if conn is None:
+        # Check existing sidecars before SQLite can read, replace, or delete
+        # them.  The owner-only-writable parent makes the post-check stable
+        # against another uid racing a replacement.
+        _validate_private_store_files()
         conn = sqlite3.connect(_db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA journal_size_limit={_JOURNAL_SIZE_LIMIT_BYTES}")
+            _validate_private_store_files()
+        except BaseException:
+            conn.close()
+            raise
         _local.conn = conn
         _local.conn_path = _db_path
     return conn
@@ -255,12 +338,13 @@ def init() -> None:
         _close_local_connection("legacy_conn")
     _db_path = resolved
     _legacy_db_path = legacy
-    os.makedirs(os.path.dirname(_db_path) or ".", exist_ok=True)
+    _prepare_private_db_path(_db_path)
     conn = _get_conn()
     with _write_lock:
         try:
             conn.executescript(_SCHEMA)
             conn.commit()
+            _validate_private_store_files()
         except BaseException:
             _rollback_failed_write(conn)
             raise
@@ -320,11 +404,31 @@ def save(response_id: str, parent_id: Optional[str], *,
     conn = _get_conn()
     with _write_lock:
         try:
-            conn.execute(
-                """INSERT OR REPLACE INTO openai_response_store
+            local_owner = conn.execute(
+                "SELECT api_key_name FROM openai_response_store WHERE response_id=?",
+                (response_id,),
+            ).fetchone()
+            if local_owner is None:
+                legacy = _legacy_lookup(response_id)
+                if (
+                    legacy is not None
+                    and legacy["api_key_name"] != (api_key_name or "")
+                ):
+                    raise ResponseIdConflict(response_id)
+            cur = conn.execute(
+                """INSERT INTO openai_response_store
                    (response_id, parent_id, api_key_name, model, channel_key,
                     created_at, expires_at, input_items, output_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(response_id) DO UPDATE SET
+                     parent_id=excluded.parent_id,
+                     model=excluded.model,
+                     channel_key=excluded.channel_key,
+                     created_at=excluded.created_at,
+                     expires_at=excluded.expires_at,
+                     input_items=excluded.input_items,
+                     output_items=excluded.output_items
+                   WHERE openai_response_store.api_key_name=excluded.api_key_name""",
                 (
                     response_id, parent_id, api_key_name or "", model or "",
                     channel_key or "", now, expires_at,
@@ -332,6 +436,8 @@ def save(response_id: str, parent_id: Optional[str], *,
                     json.dumps(output_items, ensure_ascii=False),
                 ),
             )
+            if cur.rowcount != 1:
+                raise ResponseIdConflict(response_id)
             conn.commit()
         except BaseException:
             _rollback_failed_write(conn)

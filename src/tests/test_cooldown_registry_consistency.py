@@ -53,7 +53,8 @@ def test_registry_orphan_cleanup_uses_cooldown_commit_point(monkeypatch):
 
     cleared: list[tuple[str, str | None, bool]] = []
 
-    def clear(channel_key, model=None, *, notify_recovered=True):
+    def clear(channel_key, model=None, *, notify_recovered=True,
+              resolve_alias=True):
         cleared.append((channel_key, model, notify_recovered))
 
     monkeypatch.setattr(registry.cooldown, "clear", clear)

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -37,6 +40,7 @@ def isolated_store(monkeypatch):
     # by isolated_pytest.py; a relative dbPath must never fall back to BASE_DIR.
     root = Path(config.DATA_DIR) / f"sqlite-root-fix-{uuid.uuid4().hex}"
     root.mkdir(parents=True)
+    root.chmod(0o700)
     cfg = {
         "stateDbPath": "state.db",
         "openai": {"store": {
@@ -166,6 +170,116 @@ def test_relative_store_path_cannot_escape_through_symlink(isolated_store):
         shutil.rmtree(outside, ignore_errors=True)
 
 
+def test_store_rejects_final_symlink_even_when_target_stays_in_data_dir(isolated_store):
+    root, cfg = isolated_store
+    target = root / "private-target.db"
+    target.touch(mode=0o600)
+    link = root / "store-link.db"
+    link.symlink_to(target)
+    cfg["openai"]["store"]["dbPath"] = link.name
+    store._reset_for_test(reinitialize=True)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        store.init()
+
+
+def test_store_db_wal_and_shm_are_private_under_umask_022(isolated_store):
+    root, _cfg = isolated_store
+    store._reset_for_test(reinitialize=True)
+    for suffix in ("", "-wal", "-shm"):
+        (root / f"responses.db{suffix}").unlink(missing_ok=True)
+
+    previous_umask = os.umask(0o022)
+    try:
+        store.init()
+        _save("private-modes")
+        # Keep the WAL connection open while checking all three inodes.
+        store._get_conn().execute("SELECT 1").fetchone()
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    for suffix in ("", "-wal", "-shm"):
+        path = root / f"responses.db{suffix}"
+        assert path.is_file(), path
+        assert path.stat().st_uid == os.geteuid(), path
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, path
+
+
+def test_store_accepts_owner_held_source_root_mode_0755(isolated_store):
+    root, _cfg = isolated_store
+    store._reset_for_test(reinitialize=True)
+    root.chmod(0o755)
+    try:
+        store.init()
+        _save("source-root-0755")
+        assert store.lookup(
+            "source-root-0755", api_key_name="key-a",
+        ).response_id == "source-root-0755"
+        assert stat.S_IMODE((root / "responses.db").stat().st_mode) == 0o600
+    finally:
+        root.chmod(0o700)
+
+
+def test_store_rejects_group_world_writable_parent(isolated_store):
+    root, _cfg = isolated_store
+    store._reset_for_test(reinitialize=True)
+    root.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeError, match="group/world writable"):
+            store.init()
+    finally:
+        root.chmod(0o700)
+
+
+def test_store_rejects_insecure_existing_database_mode(isolated_store):
+    root, _cfg = isolated_store
+    store._reset_for_test(reinitialize=True)
+    db_path = root / "responses.db"
+    for suffix in ("", "-wal", "-shm"):
+        (root / f"responses.db{suffix}").unlink(missing_ok=True)
+    db_path.touch(mode=0o644)
+    db_path.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="mode 0600"):
+        store.init()
+
+    # Let the fixture cleanup/reinitialization inspect this path safely.
+    db_path.chmod(0o600)
+
+
+def test_store_rejects_insecure_existing_wal_before_sqlite_opens_it(isolated_store):
+    root, _cfg = isolated_store
+    store._reset_for_test(reinitialize=True)
+    db_path = root / "responses.db"
+    wal_path = root / "responses.db-wal"
+    for suffix in ("", "-wal", "-shm"):
+        (root / f"responses.db{suffix}").unlink(missing_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE marker (value TEXT)")
+    db_path.chmod(0o600)
+    wal_path.write_bytes(b"must-not-be-opened")
+    wal_path.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="mode 0600"):
+        store.init()
+    assert wal_path.read_bytes() == b"must-not-be-opened"
+
+    wal_path.unlink()
+
+
+def test_store_rejects_foreign_owner_before_sqlite_open(isolated_store, monkeypatch):
+    root, _cfg = isolated_store
+    store._reset_for_test(reinitialize=True)
+    db_path = root / "responses.db"
+    for suffix in ("", "-wal", "-shm"):
+        (root / f"responses.db{suffix}").unlink(missing_ok=True)
+    db_path.touch(mode=0o600)
+    actual_uid = os.geteuid()
+    monkeypatch.setattr(store.os, "geteuid", lambda: actual_uid + 1)
+    with pytest.raises(RuntimeError, match="must be owned"):
+        store.init()
+
+
 def test_legacy_fallback_is_read_only_and_new_database_wins(isolated_store):
     root, _cfg = isolated_store
     legacy = root / "state.db"
@@ -218,6 +332,55 @@ def test_legacy_fallback_preserves_expired_and_forbidden_semantics(isolated_stor
         store.lookup("legacy-expired", api_key_name="key-a")
     with pytest.raises(store.ResponseForbidden):
         store.lookup("legacy-forbidden", api_key_name="key-a")
+
+
+def test_response_id_collision_cannot_replace_another_api_key(isolated_store):
+    store.save(
+        "shared-upstream-id", None,
+        api_key_name="key-a", model="model-a", channel_key="api:a",
+        input_items=[{"owner": "a"}], output_items=[{"answer": "a"}],
+    )
+
+    with pytest.raises(store.ResponseIdConflict):
+        store.save(
+            "shared-upstream-id", None,
+            api_key_name="key-b", model="model-b", channel_key="api:b",
+            input_items=[{"owner": "b"}], output_items=[{"answer": "b"}],
+        )
+
+    original = store.lookup("shared-upstream-id", api_key_name="key-a")
+    assert original.model == "model-a"
+    assert original.input_items == [{"owner": "a"}]
+    with pytest.raises(store.ResponseForbidden):
+        store.lookup("shared-upstream-id", api_key_name="key-b")
+
+    # The owning key may still update/retry the same upstream id.
+    store.save(
+        "shared-upstream-id", None,
+        api_key_name="key-a", model="model-a2", channel_key="api:a",
+        input_items=[{"owner": "a2"}], output_items=[],
+    )
+    updated = store.lookup("shared-upstream-id", api_key_name="key-a")
+    assert updated.model == "model-a2"
+    assert updated.input_items == [{"owner": "a2"}]
+
+
+def test_legacy_response_id_collision_is_rejected_before_shadowing(isolated_store):
+    root, _cfg = isolated_store
+    now = time.time()
+    with sqlite3.connect(root / "state.db") as conn:
+        conn.execute(LEGACY_SCHEMA)
+        conn.execute(
+            "INSERT INTO openai_response_store VALUES (?, NULL, ?, 'old', '', ?, ?, '[]', '[]')",
+            ("legacy-owned-id", "key-a", now, now + 3600),
+        )
+    with pytest.raises(store.ResponseIdConflict):
+        store.save(
+            "legacy-owned-id", None,
+            api_key_name="key-b", model="new", channel_key="api:new",
+            input_items=[], output_items=[],
+        )
+    assert store.lookup("legacy-owned-id", api_key_name="key-a").model == "old"
 
 
 def test_expand_history_cycle_and_depth_are_bounded(isolated_store):
@@ -1333,6 +1496,147 @@ def test_oauth_refresh_rejects_duplicate_destination_identity():
     assert scorer.get_stats(f"oauth:{old_key}", "model") is not None
 
 
+def test_late_openai_refresh_after_delete_cannot_mutate_same_email_claude(monkeypatch):
+    """Refresh result is bound to provider + canonical generation, never email."""
+    from src import cooldown, oauth_manager
+
+    state_db.init(); scorer.init(); cooldown.init(); affinity.init(); affinity.client_init()
+    suffix = uuid.uuid4().hex
+    email = f"shared-refresh-{suffix}@example.test"
+    claude = {
+        "email": email, "provider": "claude",
+        "access_token": "claude-access", "refresh_token": "claude-refresh",
+        "disabled_reason": "auth_error", "enabled": False,
+    }
+    openai = {
+        "email": email, "provider": "openai",
+        "access_token": "openai-access", "refresh_token": "openai-refresh",
+        "chatgpt_account_id": f"workspace-{suffix}", "enabled": True,
+    }
+    openai_key = oauth_manager._canonical_key(openai)
+    config.update(
+        lambda cfg: cfg.__setitem__(
+            "oauthAccounts", [dict(claude), dict(openai)],
+        )
+    )
+
+    refresh_started = threading.Event()
+    allow_refresh = threading.Event()
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def paused_refresh(*_args, **_kwargs):
+        refresh_started.set()
+        assert allow_refresh.wait(5)
+        return {
+            "access_token": "late-openai-access",
+            "refresh_token": "late-openai-refresh",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr(oauth_manager.openai_provider, "refresh_sync", paused_refresh)
+
+    def worker():
+        try:
+            results.append(oauth_manager._refresh_sync_locked(openai_key, True))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        assert refresh_started.wait(5)
+        oauth_manager.delete_account(openai_key)
+        remaining = config.get().get("oauthAccounts", [])
+        assert [oauth_manager._canonical_key(account) for account in remaining] == [
+            oauth_manager._canonical_key(claude)
+        ]
+        allow_refresh.set()
+        thread.join(5)
+    finally:
+        allow_refresh.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert results == ["late-openai-access"]
+    remaining = config.get().get("oauthAccounts", [])
+    assert len(remaining) == 1
+    assert remaining[0]["provider"] == "claude"
+    assert remaining[0]["access_token"] == "claude-access"
+    assert remaining[0]["refresh_token"] == "claude-refresh"
+    assert remaining[0]["disabled_reason"] == "auth_error"
+    assert remaining[0]["enabled"] is False
+    assert oauth_manager.get_account(openai_key) is None
+
+
+def test_late_refresh_follows_exact_openai_rename_generation(monkeypatch):
+    """A renamed generation accepts its own late refresh without email lookup."""
+    from src import cooldown, oauth_manager
+    from src.channel import registry
+
+    state_db.init(); scorer.init(); cooldown.init(); affinity.init(); affinity.client_init()
+    suffix = uuid.uuid4().hex
+    email = f"rename-refresh-{suffix}@example.test"
+    old_account = {
+        "email": email, "provider": "openai",
+        "access_token": "old-access", "refresh_token": "old-refresh",
+        "chatgpt_account_id": f"old-workspace-{suffix}", "enabled": True,
+    }
+    old_key = oauth_manager._canonical_key(old_account)
+    new_workspace = f"new-workspace-{suffix}"
+    new_key = f"openai:{email}:{new_workspace}"
+    config.update(
+        lambda cfg: cfg.__setitem__("oauthAccounts", [dict(old_account)])
+    )
+    registry.rebuild_from_config()
+
+    refresh_started = threading.Event()
+    allow_refresh = threading.Event()
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def paused_refresh(*_args, **_kwargs):
+        refresh_started.set()
+        assert allow_refresh.wait(5)
+        return {
+            "access_token": "late-access",
+            "refresh_token": "late-refresh",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr(oauth_manager.openai_provider, "refresh_sync", paused_refresh)
+    def worker():
+        try:
+            results.append(oauth_manager._refresh_sync_locked(old_key, True))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        assert refresh_started.wait(5)
+        assert oauth_manager._save_token_fields(
+            old_key, {"chatgpt_account_id": new_workspace},
+        )
+        assert oauth_manager.get_account(new_key) is not None
+        allow_refresh.set()
+        thread.join(5)
+    finally:
+        allow_refresh.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert results == ["late-access"]
+    renamed = oauth_manager.get_account(new_key)
+    assert renamed is not None
+    assert renamed["provider"] == "openai"
+    assert renamed["access_token"] == "late-access"
+    assert renamed["refresh_token"] == "late-refresh"
+    assert oauth_manager.get_account(old_key) is None
+
+
 def test_concurrent_reload_waits_until_oauth_state_rename_is_published(monkeypatch):
     from src import oauth_manager
     from src.channel import registry
@@ -1900,3 +2204,101 @@ def test_delete_renamed_destination_waits_for_old_generation_to_drain():
     assert channel_state.is_deleted(new_key)
     with pytest.raises(ValueError, match="restart before reusing"):
         registry.add_api_channel(dict(entry, name=new_name))
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_pre_acquire_waiter_and_rejects_disabled_limit_path():
+    """A successful delete must prevent queued/limit-disabled old-key use."""
+    from src import concurrency
+    from src.channel import registry
+
+    suffix = uuid.uuid4().hex
+    name = f"queued-delete-{suffix}"
+    key = f"api:{name}"
+    entry = {
+        "name": name, "type": "api", "baseUrl": "http://127.0.0.1:9",
+        "apiKey": "***", "protocol": "anthropic",
+        "models": [{"real": "model", "alias": "model"}],
+        "cc_mimicry": True, "enabled": True, "maxConcurrent": 1,
+    }
+
+    def seed(cfg):
+        cfg["channels"] = [dict(entry)]
+        cfg.setdefault("concurrency", {})["enabled"] = True
+        cfg["concurrency"]["defaultMaxConcurrent"] = 1
+
+    config.update(seed)
+    registry.rebuild_from_config()
+    assert await concurrency.try_acquire(key)
+    waiter = asyncio.create_task(
+        concurrency.acquire_from_candidates([(key, "old-credential")], 5),
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        with concurrency._slots_guard:
+            slot = concurrency._slots.get(key)
+            if slot is not None and slot.waiters:
+                break
+    with concurrency._slots_guard:
+        assert len(concurrency._slots[key].waiters) == 1
+
+    assert registry.delete_api_channel(name)
+    result = await asyncio.wait_for(waiter, timeout=1)
+    assert result is None
+    assert not await concurrency.try_acquire(key)
+
+    # The generation check must run before the old "limits disabled => True"
+    # shortcut as well.
+    config.update(
+        lambda cfg: cfg.setdefault("concurrency", {}).__setitem__("enabled", False)
+    )
+    assert not await concurrency.try_acquire(key)
+
+    concurrency.release(key)
+    config.update(
+        lambda cfg: cfg.setdefault("concurrency", {}).__setitem__("enabled", True)
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_still_allows_old_generation_waiter_to_drain():
+    """Deletion rejection must not change the existing rename-drain contract."""
+    from src import concurrency
+    from src.channel import registry
+
+    suffix = uuid.uuid4().hex
+    old_name = f"queued-rename-old-{suffix}"
+    new_name = f"queued-rename-new-{suffix}"
+    old_key = f"api:{old_name}"
+    entry = {
+        "name": old_name, "type": "api", "baseUrl": "http://127.0.0.1:9",
+        "apiKey": "***", "protocol": "anthropic",
+        "models": [{"real": "model", "alias": "model"}],
+        "cc_mimicry": True, "enabled": True, "maxConcurrent": 1,
+    }
+
+    def seed(cfg):
+        cfg["channels"] = [dict(entry)]
+        cfg.setdefault("concurrency", {})["enabled"] = True
+        cfg["concurrency"]["defaultMaxConcurrent"] = 1
+
+    config.update(seed)
+    registry.rebuild_from_config()
+    assert await concurrency.try_acquire(old_key)
+    waiter = asyncio.create_task(
+        concurrency.acquire_from_candidates([(old_key, "old-generation")], 5),
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        with concurrency._slots_guard:
+            slot = concurrency._slots.get(old_key)
+            if slot is not None and slot.waiters:
+                break
+    with concurrency._slots_guard:
+        assert len(concurrency._slots[old_key].waiters) == 1
+
+    assert registry.update_api_channel(old_name, {"name": new_name}) is not None
+    concurrency.release(old_key)
+    acquired = await asyncio.wait_for(waiter, timeout=1)
+    assert acquired == (old_key, "old-generation")
+    concurrency.release(old_key)

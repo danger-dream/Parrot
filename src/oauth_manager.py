@@ -383,12 +383,22 @@ def _rename_runtime_oauth_identity(old_account_key: str, new_account_key: str, *
     )
 
 
-def _save_token_fields(account_key: str, new: dict) -> None:
-    with config.serialized_updates():
-        _save_token_fields_serialized(account_key, new)
+def _save_token_fields(account_key: str, new: dict) -> bool:
+    """Persist one refresh result only if its exact account generation survives.
+
+    A refresh may finish after the account was renamed or deleted.  The
+    process-lifetime channel generation map is authoritative here: a rename
+    may forward the result to its exact destination, while a deleted or
+    otherwise missing generation must drop it.  Never fall back to matching a
+    bare email, because Claude and OpenAI accounts may legitimately share one.
+    """
+    from . import channel_state
+
+    with config.serialized_updates(), channel_state.mutation_lock:
+        return _save_token_fields_serialized(account_key, new)
 
 
-def _save_token_fields_serialized(account_key: str, new: dict) -> None:
+def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
     """把刷新后的 token 字段写回 config.oauthAccounts（按 account_key 精确匹配）。
 
     若刷新返回了新的 OpenAI workspace/account id，则需要把相关运行时状态和
@@ -398,15 +408,50 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> None:
     若该账号此前因 `auth_error` 被自动禁用，刷新成功视为身份恢复：
     同时清掉 disabled_reason / disabled_until 并把 enabled 重新置 True。
     """
-    canonical = _resolve_existing_account_key(account_key)
-    target_key = canonical or account_key
-    old_acc = get_account(target_key)
+    from . import channel_state
+
+    # Production callers always pass a canonical key.  Keep the unambiguous
+    # legacy bare-email helper behavior for tests/admin paths, but resolve it
+    # before entering the generation check and never use email for mutation.
+    source_account_key = account_key
+    if ":" not in source_account_key:
+        try:
+            source_account_key = _resolve_existing_account_key(source_account_key) or ""
+        except AmbiguousOAuthAccountKey:
+            return False
+        if not source_account_key:
+            return False
+
+    source_channel_key = f"oauth:{source_account_key}"
+    target_channel_key = channel_state.resolve(source_channel_key)
+    if (
+        channel_state.is_deleted(source_channel_key)
+        or channel_state.is_deleted(target_channel_key)
+        or not target_channel_key.startswith("oauth:")
+    ):
+        return False
+    target_key = target_channel_key[len("oauth:"):]
+
+    old_acc = next(
+        (
+            account for account in config.get().get("oauthAccounts", [])
+            if _canonical_key(account) == target_key
+        ),
+        None,
+    )
+    if old_acc is None:
+        return False
+
+    source_provider, _source_identity = _split_ak(source_account_key)
+    if _acc_provider(old_acc) != _normalize_provider(source_provider):
+        return False
+
     old_acc_snapshot = copy.deepcopy(old_acc) if old_acc is not None else None
     old_priority_orders = copy.deepcopy(
         config.get().get("loadBalancing", {}).get("priorityOrders", {})
     )
-    target_email = account_key_to_email(target_key)
-    old_key = _canonical_key(old_acc) if old_acc else (canonical or account_key)
+    target_email = str(old_acc.get("email") or account_key_to_email(target_key))
+    old_key = _canonical_key(old_acc)
     new_key = old_key
     rename_family = "anthropic"
     if old_acc:
@@ -430,13 +475,7 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> None:
     def mutate(cfg):
         updated = False
         for acc in cfg.get("oauthAccounts", []):
-            if old_acc is not None:
-                if _canonical_key(acc) != old_key:
-                    continue
-            elif canonical:
-                if _canonical_key(acc) != canonical:
-                    continue
-            elif acc.get("email") != target_email:
+            if _canonical_key(acc) != old_key:
                 continue
             acc.update(new)
             if acc.get("disabled_reason") == "auth_error":
@@ -471,6 +510,7 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> None:
         )
     else:
         config.update(mutate)
+    return True
 
 
 def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None) -> dict:
@@ -713,7 +753,11 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
             except Exception as exc:
                 print(f"[oauth] claude refresh: profile fetch failed for {email}: {exc}")
 
-        _save_token_fields(account_key, new_fields)
+        if not _save_token_fields(account_key, new_fields):
+            print(
+                f"[oauth] discarded refresh result for retired generation: "
+                f"{account_key}"
+            )
         return new_fields["access_token"]
 
 

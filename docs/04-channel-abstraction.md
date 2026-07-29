@@ -334,4 +334,4 @@ def _sync_state_db_with_channels():
 
 运行期改名后，旧 key 会在当前进程内保留为 late-write alias：改名前已经在途的请求仍把评分、冷却和两类 affinity 写到新 key。旧 concurrency slot 按旧 key 原地排空，并冻结改名前的 `maxConcurrent`；即使 slot 先清除、稍后才有旧请求进入，也继续使用冻结值。为避免字符串 key 无法区分旧/新 generation，当前进程内禁止立刻重新创建同名旧 key；重启后不存在旧在途请求和 alias，才可安全复用。
 
-删除渠道时，目标 key 会在 config 删除前进入进程级 tombstone。旧请求的 scorer/cooldown/两类 affinity 与 OAuth quota 副作用都会被丢弃；即使没有 concurrency slot，也可能存在“已选中渠道但尚未 acquire”或关闭并发限制的旧请求，因此 tombstone 必须保留到进程重启，不能仅凭 slot 排空解除。同名渠道只能在重启后安全复用；配置删除失败则立即撤销 tombstone，不改变原渠道。
+删除渠道时，目标 key 会在 config 删除前进入进程级 tombstone。已经 acquire 的请求可按旧 generation 收尾，但 FIFO 中尚未 acquire 的 waiter 会被取消；它被唤醒后必须重查 tombstone，不能再使用已删除凭据。`try_acquire()` 在检查“并发限制已关闭”捷径之前也必须先拒绝 deleted generation。旧请求的 scorer/cooldown/两类 affinity 与 OAuth quota 副作用都会被丢弃；即使没有 concurrency slot，也可能存在“已选中渠道但尚未 acquire”或关闭并发限制的旧请求，因此 tombstone 必须保留到进程重启，不能仅凭 slot 排空解除。同名渠道只能在重启后安全复用；配置删除失败则立即撤销 tombstone，不改变原渠道。

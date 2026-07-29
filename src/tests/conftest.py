@@ -143,6 +143,27 @@ def _restore_telegram_ui_globals():
         ui._admin_ids = set(orig_admin_ids)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_channel_generation_globals():
+    """Process-lifetime tombstones must not leak between independent tests."""
+    from src import channel_state, concurrency
+
+    def reset() -> None:
+        with channel_state.mutation_lock, concurrency._slots_guard:
+            channel_state._transition_keys.clear()
+            channel_state._aliases.clear()
+            channel_state._deleted_keys.clear()
+            concurrency._retired_keys.clear()
+            concurrency._retired_limits.clear()
+            concurrency._deleted_retire_targets.clear()
+
+    reset()
+    try:
+        yield
+    finally:
+        reset()
+
+
 async def _traced_httpx_mock_handle(self, request):
     """Make MockTransport emulate HTTPcore's authoritative upload trace.
 

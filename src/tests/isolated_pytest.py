@@ -42,6 +42,7 @@ def main(argv: list[str]) -> int:
     image_path = (data_dir / "image_logs.db").resolve()
     for path in (data_dir, log_dir):
         path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
     for path in (data_dir, log_dir, config_path, state_path, image_path):
         if not path.is_absolute() or not _under(path, root):
             raise SystemExit(f"isolation refused: unsafe path {path}")

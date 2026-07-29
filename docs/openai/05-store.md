@@ -34,7 +34,9 @@ CREATE INDEX IF NOT EXISTS idx_resp_store_key     ON openai_response_store(api_k
 升级不会在线搬迁大表，也不会再写 legacy `state.db`。新库查不到 id 时，
 Store 会只读查询旧 `state.db.openai_response_store`；因此升级前创建的
 `previous_response_id` 可继续使用到原 TTL 到期。旧库不存在或没有该表时
-按普通 miss 处理；新库记录始终优先，可自然覆盖同 id 的旧记录。
+按普通 miss 处理；同一 API Key 的新库记录优先，可自然覆盖同 id 的旧记录。
+如果另一个 Key 已在新库或 legacy 表中拥有同一个 `response_id`，写入会明确
+失败，不能覆盖原 owner 的 history。
 
 ## 5.2 Store 接口
 
@@ -57,6 +59,7 @@ class StoredResponse:
 class ResponseNotFound(Exception): ...
 class ResponseExpired(Exception): ...
 class ResponseForbidden(Exception): ...   # key 不一致
+class ResponseIdConflict(Exception): ...  # 写入 id 已属于另一个 key
 
 def init() -> None: ...
 
@@ -144,9 +147,17 @@ def expand_history(response_id, *, api_key_name, max_depth=50):
 
 - 独立库使用自己的 `_write_lock`（RLock）与 thread-local 连接，不和 `state.db` 写锁耦合
 - 读取无锁（SQLite WAL 模式已够）
+- `response_id` 冲突更新带 owner 条件；只有原 `api_key_name` 才能更新同 id，
+  另一个 Key 会得到 `ResponseIdConflict`，不会发生 `INSERT OR REPLACE` 跨租户覆盖
 - legacy `state.db` 仅以 SQLite `mode=ro` 打开，且只在新库 miss 时查询
 - `save()` 失败会 rollback 后重新抛出，由协议收尾层限频告警，不把半开事务留在线程连接中
 - `api_key_name` 字段用来防误读：Key A 看不到 Key B 的 response_id（即使碰撞）
+- 默认容器入口使用 `umask 077` 并把 data 目录固定为 `0700`；Store 目录必须
+  由当前进程 uid 持有且不可被 group/world 写入（源码部署兼容 owner 持有的
+  `0755` 仓库根目录），数据库、`-wal`、`-shm` 必须是同 uid 的普通文件且
+  mode 不宽于 `0600`。新数据库用显式 `0600` 原子预创建，不依赖调用方
+  umask；已有路径若是 symlink、外部 owner 或文件权限过宽，启动会 fail closed
+- WAL 配置 `journal_size_limit=64 MiB`，避免突发写入后长期保留无界高水位
 
 升级后 legacy 表不再由在线清理任务写入或删除。记录超过 TTL 后会立即变为
 不可读，但物理页面仍留在旧 `state.db`。如需回收，应至少等待一个完整 TTL，
