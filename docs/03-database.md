@@ -280,16 +280,24 @@ OpenAI history 独立分库；**业务日志写多读少且数据量大**，按�
 HTTP/WS 代理链只允许在尚未开始发送时切换下一条 route；一旦请求可能离开 Parrot 就不在
 同一 retry 行内重放，避免生成两次上游账单却只留下一个结算事实。
 
-每条尝试结算保存规范化 Token、是否真实观察到 Token usage、响应/出站 service tier、
-dispatch 确定性、补全 provider 的模型、冻结后的实际费率快照及版本，以及费用来源
-（`actual`、`estimated`、`unpriced`）。Tier 优先级为“响应实际 tier > 出站请求 tier >
-未知”；下游意图不是账单事实。显式全零 Token 字段属于已观察用量，估价为 0；缺失
-usage 不得估成 0。xAI 上游返回的实际费用可以在 Token usage 缺失时结算；无法确认
-是否已发出的传输错误必须标为未计价。
+每条尝试结算保存规范化 Token、是否真实观察到完整 Token usage、该次尝试的上游协议、
+响应/出站 service tier、dispatch 确定性、补全 provider 的模型、冻结后的实际费率快照及
+版本，以及费用来源（`actual`、`estimated`、`unpriced`）。OpenAI 的 tier 优先级为
+“响应实际 tier > 出站请求 tier > 未知”；Anthropic 的容量 `service_tier` 与 Claude
+`speed=fast` 是两个维度，Fast 只认 dispatch 前冻结的出站 `speed=fast`。下游意图不是
+账单事实。显式完整的全零 Token 字段属于已观察用量，估价为 0；只有 input 或 output
+一侧的 partial usage、缺失 usage 或非法数值均不得把另一侧默认为 0。xAI 上游返回的
+实际费用可以在 Token usage 缺失时结算；无法确认是否已发出的传输错误必须标为未计价。
 
 重试、failover、本地 WebSearch 多轮和 Compact map/reduce 子调用分别结算。Compact
-子调用 ID 只在聚合时映射回原下游请求。聚合以不可变尝试事实为准；只有完全没有
-尝试事实的旧记录才回退到 `request_log` 旧计价逻辑。
+子调用 ID 只在聚合时映射回原下游请求。请求数仍描述下游请求，Token、金额与 family
+归属描述每次真实上游尝试；两者数量不同时界面会明确显示“上游 N 次”。跨协议 failover
+按每条尝试自己的协议归属 family，不能继承根请求最终成功协议。聚合以不可变尝试事实
+为准；partial ledger 缺少最终成功尝试时保留 `request_log` 中唯一可用的最终 Token，
+同时将缺失的 dispatch 费用标为未计价，避免 Token 被减成负数或静默漏账。
+Responses WebSocket 可在同一物理连接中顺序发送多个 `response.create`；每个 create
+仍是独立下游请求，分别创建 request、retry 和 attempt-usage 记录，连接复用不会把多轮
+调用压成一次请求或一条账单。
 
 月度数据库使用增量迁移：旧请求记录继续可读；新增请求摘要/尝试账本字段和索引时，
 不会改写历史 Token 语义。

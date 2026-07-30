@@ -56,6 +56,7 @@ def _setup(m):
     m["log_db"].init()
     # 清空当月 log
     conn = m["log_db"]._get_conn()
+    conn.execute("DELETE FROM upstream_attempt_usage")
     conn.execute("DELETE FROM request_log")
     conn.execute("DELETE FROM request_detail")
     conn.execute("DELETE FROM retry_chain")
@@ -333,7 +334,7 @@ def test_stats_labels_mixed_actual_and_estimated_cost(m):
     assert m["ui"].fmt_cost(overall) == "$1.00（实际 $0.50 + 估算 $0.50）"
 
 
-def test_stats_downstream_fast_intent_does_not_invent_priority_pricing(m):
+def test_stats_downstream_fast_intent_without_actual_tier_is_unpriced(m):
     _setup(m)
     _insert_success(
         m,
@@ -348,7 +349,10 @@ def test_stats_downstream_fast_intent_does_not_invent_priority_pricing(m):
         fast_mode=True,
     )
     result = m["log_db"].stats_summary(0)
-    assert result["overall"]["cost_ticks"] == int(0.7 * 10_000_000_000)
+    assert result["overall"]["cost_ticks"] == 0
+    assert result["overall"]["costed_success"] == 0
+    assert result["overall"]["unpriced_success"] == 1
+    assert m["ui"].fmt_cost(result["overall"]) == "未计价（1 次）"
 
 
 def test_stats_classifies_long_context_per_request_before_sum(m):
@@ -1509,6 +1513,7 @@ def test_proxy_stats_include_tokens_latency_and_real_bytes(m):
     ld = m["log_db"]
     ld.init()
     conn = ld._get_conn()
+    conn.execute("DELETE FROM upstream_attempt_usage")
     conn.execute("DELETE FROM request_log")
     conn.execute("DELETE FROM request_detail")
     conn.execute("DELETE FROM retry_chain")
@@ -1710,6 +1715,10 @@ def test_log_db_migrates_proxy_columns_on_old_schema(m):
     ld.init()
     conn = ld._get_conn()
     # Simulate an old monthly DB where request_log/retry_chain existed before proxy columns.
+    # Such a database predates the immutable attempt ledger; remove modern
+    # fixture rows before rebuilding retry_chain so its AUTOINCREMENT ids cannot
+    # collide with unrelated settlement rows from earlier tests.
+    conn.execute("DELETE FROM upstream_attempt_usage")
     conn.execute("ALTER TABLE request_log RENAME TO request_log_new")
     conn.execute("ALTER TABLE retry_chain RENAME TO retry_chain_new")
     conn.execute("""

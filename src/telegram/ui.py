@@ -528,20 +528,30 @@ def fmt_cost(metrics: dict | None) -> str:
     estimated_count = nonnegative_int("estimated_costed_success")
     unpriced = nonnegative_int("unpriced_success")
     if costed <= 0:
-        return f"未计价（{unpriced} 次）" if unpriced else "$0.00"
-    amount = fmt_usd(Decimal(ticks) / Decimal(10_000_000_000))
-    if actual_count > 0 and estimated_count > 0:
-        actual_amount = fmt_usd(Decimal(actual_ticks) / Decimal(10_000_000_000))
-        estimated_amount = fmt_usd(
-            Decimal(estimated_ticks) / Decimal(10_000_000_000)
-        )
-        amount = f"{amount}（实际 {actual_amount} + 估算 {estimated_amount}）"
-    elif actual_count > 0:
-        amount = f"实际 {amount}"
-    elif estimated_count > 0:
-        amount = f"估算 {amount}"
-    if unpriced:
-        amount += f" · {unpriced} 次未计价"
+        amount = f"未计价（{unpriced} 次）" if unpriced else "$0.00"
+    else:
+        amount = fmt_usd(Decimal(ticks) / Decimal(10_000_000_000))
+        if actual_count > 0 and estimated_count > 0:
+            actual_amount = fmt_usd(Decimal(actual_ticks) / Decimal(10_000_000_000))
+            estimated_amount = fmt_usd(
+                Decimal(estimated_ticks) / Decimal(10_000_000_000)
+            )
+            amount = f"{amount}（实际 {actual_amount} + 估算 {estimated_amount}）"
+        elif actual_count > 0:
+            amount = f"实际 {amount}"
+        elif estimated_count > 0:
+            amount = f"估算 {amount}"
+        if unpriced:
+            amount += f" · {unpriced} 次未计价"
+    # Request counters describe downstream calls, while billing rows describe
+    # concrete upstream attempts.  Make failover attribution explicit whenever
+    # those dimensions differ (for example channel A billed one failed attempt
+    # but channel B owns the final request result).
+    upstream_attempts = costed + unpriced
+    if "total" in data and upstream_attempts > 0:
+        requests = nonnegative_int("total")
+        if upstream_attempts != requests:
+            amount += f" · 上游 {upstream_attempts} 次"
     return amount
 
 
@@ -564,7 +574,10 @@ def cost_metrics_from_row(row: dict | None) -> dict:
     """Return one request's immutable/fallback cost metrics."""
     from .. import log_db
 
-    return log_db.cost_for_log(row)
+    metrics = dict(log_db.cost_for_log(row))
+    if isinstance(row, dict):
+        metrics["total"] = 1
+    return metrics
 
 
 def fmt_cost_from_row(row: dict | None) -> str:

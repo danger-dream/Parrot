@@ -347,7 +347,7 @@ JSON 请求体：
 - 维度：汇总（两家族分段）/ 按渠道 / 按模型 / 按 Key
 - **汇总视图**：先 🅰 Anthropic 段（overall + 按渠道 Top3 + 按模型 Top3），后 🅾 OpenAI 段（同上，完整含重试/亲和）；底部跨家族按 Key Top + 最近调用（带家族图标）+ 未命中样本
 - **专题视图**：按渠道 / 按模型 Top10，每条前缀 🅰/🅾 家族图标
-- **金额统计**：根据 [models.dev](https://models.dev) 的供应商价格目录，按每次真实上游尝试冻结输入 / 输出 / 缓存写入 / 缓存读取 Token 的 USD 金额，并在 Telegram 中所有展示 Token 的请求、账户、渠道、模型和 API Key 位置同步显示；支持单档长上下文阶梯、OpenAI Priority 与 Anthropic Fast 完整替换价。`models.json` 只校验规范模型身份，不提供价格；第三方 API 渠道需通过 `pricing.channelProviders` 明确供应商，避免同名模型套错价格。xAI 响应若返回可信的 `cost_in_usd_ticks` 则优先采用真实金额；界面区分实际、估算、混合与未计价。金额固定两位小数且不加约等号；未知/歧义模型、缺失 usage、无法确认旧 Token 口径、Claude 缓存写入 TTL 不可区分、多档 context tier、缺失 Priority/Fast tariff、未知 service tier，或日志缺少独立 reasoning/audio Token 维度时都会 fail-closed 为“未计价”，不会静默按 `$0` 或错误档位处理。models.dev 与 xAI 实际费用均为 USD，不做实时汇率换算。
+- **金额统计**：根据 [models.dev](https://models.dev) 的供应商价格目录，按每次真实上游尝试冻结输入 / 输出 / 缓存写入 / 缓存读取 Token 的 USD 金额，并在 Telegram 中所有展示 Token 的请求、账户、渠道、模型和 API Key 位置同步显示；请求数仍描述下游调用，发生 failover 时会另标“上游 N 次”。支持单档长上下文阶梯、OpenAI Priority 与 Anthropic Fast 完整替换价；Anthropic 的容量 `service_tier` 不会覆盖出站 `speed=fast` 证据。`models.json` 只校验规范模型身份，不提供价格；第三方 API 渠道需通过 `pricing.channelProviders` 明确供应商，避免同名模型套错价格。xAI 响应若返回可信的 `cost_in_usd_ticks` 则优先采用真实金额；界面区分实际、估算、混合与未计价。金额固定两位小数且不加约等号；未知/歧义模型、缺失或只有单侧的 partial usage、无法确认旧 Token 口径、Claude 缓存写入 TTL 不可区分、多档 context tier、缺失 Priority/Fast tariff、未知 service tier，或日志缺少独立 reasoning/audio Token 维度时都会 fail-closed 为“未计价”，不会静默按 `$0` 或错误档位处理。models.dev 与 xAI 实际费用均为 USD，不做实时汇率换算。
 
 ### 📋 最近日志
 页面可在两类日志之间切换：

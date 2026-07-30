@@ -349,7 +349,7 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 
 ### Token 金额统计 `pricing`
 
-- `enabled`：是否在 Telegram 的统计、日志和账户等页面计算金额；关闭后不读取响应正文做费用聚合。
+- `enabled`：是否在 Telegram 的统计、日志和账户等页面计算金额；关闭后不读取响应正文做费用聚合，也不会发起远端价格目录刷新。
 - `autoUpdate`：是否后台同时刷新 models.dev 的供应商 API 目录与规范模型目录。启动时先读取 `$ANTHROPIC_PROXY_DATA_DIR/models_dev_catalog.json.gz`（Docker 默认 `/app/data/models_dev_catalog.json.gz`）缓存，缓存不存在或损坏时使用仓库内置 gzip 快照；任一远端失败都不会替换当前目录或影响代理请求。
 - `sourceUrl`：models.dev 供应商模型与价格目录，默认 `https://models.dev/api.json`，只接受 `https://`。金额只从这里读取，单位为 USD / 1M Token。
 - `modelsUrl`：规范模型身份目录，默认 `https://models.dev/models.json`，只接受 `https://`。该文件不提供价格，仅用于确认规范模型 ID；只有映射唯一时才建立裸模型别名。

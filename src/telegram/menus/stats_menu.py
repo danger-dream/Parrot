@@ -396,8 +396,17 @@ def _section_family(family: str, result: dict,
                     show_by_model: bool = True) -> str:
     """单个家族完整段：overall + (可选) by_channel Top3 + (可选) by_model Top3。"""
     overall = result.get("overall") or {}
-    if int(overall.get("total") or 0) == 0:
-        return ""  # 没流量不展示
+    total = int(overall.get("total") or 0)
+    upstream_facts = (
+        int(overall.get("costed_success") or 0)
+        + int(overall.get("unpriced_success") or 0)
+        + int(overall.get("total_input_tokens") or 0)
+        + int(overall.get("total_output_tokens") or 0)
+        + int(overall.get("total_cache_creation") or 0)
+        + int(overall.get("total_cache_read") or 0)
+    )
+    if total == 0 and upstream_facts == 0:
+        return ""  # 没有下游请求，也没有归属该家族的真实上游尝试
 
     tag = ui.family_tag(family)
     parts = [f"<b>{tag}</b>", _section_overall_compact(overall)]
@@ -421,14 +430,21 @@ def _section_family(family: str, result: dict,
         by_model = _strip_unknown(result.get("by_model") or [])
         if by_model:
             mc = model_channels or {}
+            def family_channels(model: str) -> list[dict]:
+                return [
+                    item for item in (mc.get(model) or [])
+                    if ui.family_of(item.get("upstream_protocol")) == family
+                ]
+
+            def family_channels_line(model: str) -> str:
+                items = family_channels(model)
+                return "所属: " + _render_model_channels(items) if items else ""
+
             block = _summary_dim_block(
                 "按模型 Top",
                 by_model[:3],
                 lambda k: f"<code>{ui.escape_html(k)}</code>",
-                extra_line=lambda k: (
-                    "所属: " + _render_model_channels(mc.get(k) or [])
-                    if mc.get(k) else ""
-                ),
+                extra_line=family_channels_line,
             )
             parts.append("")
             parts.append(block)

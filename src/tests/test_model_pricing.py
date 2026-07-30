@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import gzip
 import json
 
 import pytest
@@ -375,6 +377,36 @@ def test_models_dev_parser_rejects_wrong_types_and_untracked_token_tariffs(cost)
     assert "provider/unsafe" not in parsed
 
 
+def test_catalog_and_overrides_fail_closed_for_python_bigints():
+    huge = 10 ** 1000
+    assert model_pricing._entry_from_models_dev({
+        "cost": {"input": huge, "output": 2},
+    }) is None
+    assert model_pricing._entry_from_models_dev({
+        "cost": {
+            "input": 1,
+            "output": 2,
+            "tiers": [{
+                "input": 3,
+                "output": 4,
+                "tier": {"type": "context", "size": huge},
+            }],
+        },
+    }) is None
+    parsed = model_pricing.settings({
+        "pricing": {
+            "enabled": True,
+            "overrides": {
+                "huge": {
+                    "inputPerMillion": huge,
+                    "outputPerMillion": 1,
+                }
+            },
+        }
+    })
+    assert "huge" not in parsed.overrides
+
+
 def test_models_dev_parser_accepts_equal_specialist_and_aggregate_tariffs():
     parsed = model_pricing._parse_catalog(
         {
@@ -522,6 +554,86 @@ def test_corrupt_runtime_catalog_falls_back_to_bundled_snapshot(tmp_path, monkey
     assert status["models"] >= 500
     assert model_pricing.resolve_price("openai/gpt-5.6-sol") is not None
     model_pricing.reset_for_tests()
+
+
+def test_truncated_runtime_gzip_catalog_falls_back_to_bundled_snapshot(
+    tmp_path, monkeypatch,
+):
+    from src import config
+
+    # gzip raises EOFError (rather than BadGzipFile) for a valid header whose
+    # compressed member/trailer was truncated.
+    truncated = gzip.compress(b'{"schema":1,"api":{},"models":{}}')[:-8]
+    (tmp_path / "models_dev_catalog.json.gz").write_bytes(truncated)
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    model_pricing.reset_for_tests()
+    model_pricing.initialize()
+    assert model_pricing.catalog_status()["source"] == "bundled"
+    model_pricing.reset_for_tests()
+
+
+def test_pathological_runtime_json_depth_falls_back_to_bundled_snapshot(
+    tmp_path, monkeypatch,
+):
+    from src import config
+
+    pathological = ("[" * 2_000 + "0" + "]" * 2_000).encode()
+    with gzip.open(tmp_path / "models_dev_catalog.json.gz", "wb") as handle:
+        handle.write(pathological)
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    model_pricing.reset_for_tests()
+    model_pricing.initialize()
+    assert model_pricing.catalog_status()["source"] == "bundled"
+    model_pricing.reset_for_tests()
+
+
+def test_local_catalog_decompression_is_bounded(tmp_path, monkeypatch):
+    path = tmp_path / "oversized.json.gz"
+    with gzip.open(path, "wb") as handle:
+        handle.write(b" " * 65)
+    monkeypatch.setattr(model_pricing, "_MAX_LOCAL_CATALOG_BYTES", 64)
+    with pytest.raises(ValueError, match="local pricing catalog exceeds"):
+        model_pricing._load_json(str(path))
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_bigint_interval_falls_back_instead_of_exiting(monkeypatch):
+    from src import config
+
+    delays = []
+
+    async def no_refresh():
+        return False
+
+    async def stop_after_delay(delay):
+        delays.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(model_pricing, "refresh_once", no_refresh)
+    monkeypatch.setattr(model_pricing.asyncio, "sleep", stop_after_delay)
+    monkeypatch.setattr(
+        config, "get", lambda: {"pricing": {"refreshHours": 10 ** 1000}},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await model_pricing.refresh_loop()
+    assert delays == [24 * 3600]
+
+
+@pytest.mark.asyncio
+async def test_refresh_disabled_does_not_touch_remote_client(monkeypatch):
+    from src import config, upstream
+
+    monkeypatch.setattr(
+        config, "get", lambda: {
+            "pricing": {"enabled": False, "autoUpdate": True},
+        },
+    )
+
+    def unexpected_client():
+        raise AssertionError("disabled pricing must not create a remote client")
+
+    monkeypatch.setattr(upstream, "get_client", unexpected_client)
+    assert await model_pricing.refresh_once() is False
 
 
 def test_extract_actual_xai_cost_from_json_and_sse():

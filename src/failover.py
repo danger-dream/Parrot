@@ -1571,6 +1571,7 @@ async def run_failover(
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
             proxy_name=_attempt_proxy,
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
         )
         if _attempt_proxy:
             log_db.update_pending(request_id, proxy_name=_attempt_proxy)
@@ -2039,6 +2040,7 @@ async def run_failover(
                 attempt_id = log_db.record_retry_attempt(
                     request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
                     proxy_name=_attempt_proxy2,
+                    upstream_protocol=getattr(ch, "protocol", "anthropic"),
                 )
                 release_done2 = False
                 def _release_q(_key=ch.key):
@@ -2109,6 +2111,7 @@ async def run_failover(
                     bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
                     response_body=getattr(result, "full_response_text", None),
                     usage=getattr(result, "usage", None),
+                    usage_observed=getattr(result, "usage_observed", None),
                 )
                 if result.success and candidate_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
@@ -4106,6 +4109,7 @@ async def _consume_non_stream(
 
     # 成功：记录并构造响应
     usage = prepared.usage
+    billing = model_pricing.normalize_response_billing(prepared.restored_text)
     # assistant_msg 仅给亲和 fingerprint_write 用，且目前 fingerprint_write 只支持
     # anthropic 家族；openai 的亲和由 MS-7 补上。这里保持 anthropic 形状即可。
     assistant_msg = prepared.assistant_msg
@@ -4134,6 +4138,7 @@ async def _consume_non_stream(
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
         response_body=restored_text,
         http_status=upstream_resp.status_code,
+        usage_observed=billing.usage_observed,
         upstream_protocol=getattr(ch, "protocol", "anthropic"),
         proxy_name=proxy_name,
         proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -4172,7 +4177,8 @@ async def _consume_non_stream(
         connect_ms=connect_ms, first_byte_ms=first_byte_ms,
         idle_ms=(timing_snapshot.idle_ms if timing_snapshot is not None else None),
         total_ms=round_total_ms, http_status=upstream_resp.status_code,
-        usage=usage, assistant_response=assistant_msg,
+        usage=usage, usage_observed=billing.usage_observed,
+        assistant_response=assistant_msg,
         full_response_text=restored_text,
         proxy_name=proxy_name,
         proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -4247,6 +4253,7 @@ async def _consume_stream_as_non_stream(
     round_total_ms = prepared.total_ms
     request_elapsed_ms = _elapsed_ms(start_monotonic)
     response_body_text = prepared.response_body_text
+    billing = model_pricing.normalize_response_billing(response_body_text)
 
     finalize_policy.apply_success_health_effects(
         finalize_policy.success_plan(),
@@ -4271,6 +4278,7 @@ async def _consume_stream_as_non_stream(
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
         response_body=response_body_text,
         http_status=upstream_resp.status_code,
+        usage_observed=billing.usage_observed,
         upstream_protocol=getattr(ch, "protocol", "anthropic"),
         proxy_name=proxy_name,
         proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -4309,7 +4317,8 @@ async def _consume_stream_as_non_stream(
         idle_ms=(timing_snapshot.idle_ms if timing_snapshot is not None else None),
         total_ms=round_total_ms,
         http_status=upstream_resp.status_code,
-        usage=usage, assistant_response=assistant_msg,
+        usage=usage, usage_observed=billing.usage_observed,
+        assistant_response=assistant_msg,
         full_response_text=response_body_text,
         proxy_name=proxy_name,
         proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],

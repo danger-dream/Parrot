@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os as _os
+import sqlite3
 import sys as _sys
 import time
 from types import SimpleNamespace
@@ -68,8 +69,29 @@ def test_strict_normalization_observes_zero_and_terminal_errors(m):
         '{"input_tokens":1,"cost_in_usd_ticks":777}}}\n\n'
     )
     wrapped = mp.normalize_response_billing(wrapped_nonterminal)
-    assert wrapped.usage_observed is True
+    assert wrapped.usage_observed is False
+    assert wrapped.usage_invalid is True
     assert wrapped.actual_cost_ticks is None
+
+    split_usage = mp.normalize_response_billing(
+        'data: {"type":"message_start","message":{"usage":'
+        '{"input_tokens":4,"cache_read_input_tokens":1}}}\n\n'
+        'data: {"type":"message_delta","usage":{"output_tokens":2}}\n\n'
+    )
+    assert split_usage.usage_observed is True
+    assert split_usage.usage_invalid is False
+    assert (
+        split_usage.input_tokens, split_usage.output_tokens,
+        split_usage.cache_read_tokens,
+    ) == (4, 2, 1)
+
+    malformed_then_partial = mp.normalize_response_billing(
+        'data: {"type":"message_start","message":{"usage":'
+        '{"input_tokens":-1}}}\n\n'
+        'data: {"type":"message_delta","usage":{"output_tokens":2}}\n\n'
+    )
+    assert malformed_then_partial.usage_observed is False
+    assert malformed_then_partial.usage_invalid is True
 
 
 def test_strict_normalization_rejects_corrupt_usage_without_zero_coercion(m):
@@ -399,7 +421,8 @@ def test_partial_attempt_ledger_keeps_missing_dispatched_attempt_unpriced(m):
     # Simulate process death after dispatch and later stale-request recovery.
     ld._get_conn().execute(
         """UPDATE request_log
-           SET status='error', final_channel_key='api:B', final_model='gpt-5.6-sol'
+           SET status='success', final_channel_key='api:B', final_model='gpt-5.6-sol',
+               input_tokens=20, output_tokens=2, usage_observed=1
            WHERE request_id='partial-ledger'"""
     )
     ld._get_conn().commit()
@@ -415,20 +438,38 @@ def test_partial_attempt_ledger_keeps_missing_dispatched_attempt_unpriced(m):
     summary = ld.stats_summary(0)["overall"]
     assert summary["costed_success"] == 1
     assert summary["unpriced_success"] == 1
-    assert ld.tokens_for_channel("api:A", 0)["costed_success"] == 1
-    assert ld.tokens_for_channel("api:B", 0)["unpriced_success"] == 1
+    assert (summary["total_input_tokens"], summary["total_output_tokens"]) == (30, 3)
+    first_channel = ld.tokens_for_channel("api:A", 0)
+    final_channel = ld.tokens_for_channel("api:B", 0)
+    assert first_channel["costed_success"] == 1
+    assert (first_channel["input"], first_channel["output"]) == (10, 1)
+    assert final_channel["unpriced_success"] == 1
+    assert (final_channel["input"], final_channel["output"]) == (20, 2)
     by_key = ld.tokens_for_apikey("k", 0)
     assert (by_key["costed_success"], by_key["unpriced_success"]) == (1, 1)
+    assert (by_key["input"], by_key["output"]) == (30, 3)
     channel_models = {
         row["final_model"]: row for row in ld.channel_model_stats("api:B", 0)
     }
     assert channel_models["gpt-5.6-sol"]["unpriced_success"] == 1
+    assert (
+        channel_models["gpt-5.6-sol"]["input"],
+        channel_models["gpt-5.6-sol"]["output"],
+    ) == (20, 2)
     apikey_models = {
         row["final_model"]: row for row in ld.apikey_model_stats("k", 0)
     }
-    assert set(apikey_models) == {"gpt-5.6-sol"}
-    assert apikey_models["gpt-5.6-sol"]["costed_success"] == 1
+    assert set(apikey_models) == {"gpt-5.6-luna", "gpt-5.6-sol"}
+    assert apikey_models["gpt-5.6-luna"]["costed_success"] == 1
+    assert (
+        apikey_models["gpt-5.6-luna"]["input"],
+        apikey_models["gpt-5.6-luna"]["output"],
+    ) == (10, 1)
     assert apikey_models["gpt-5.6-sol"]["unpriced_success"] == 1
+    assert (
+        apikey_models["gpt-5.6-sol"]["input"],
+        apikey_models["gpt-5.6-sol"]["output"],
+    ) == (20, 2)
 
 
 def test_actual_service_tier_overrides_fast_intent(m):
@@ -603,6 +644,31 @@ def test_explicit_observed_flag_cannot_turn_malformed_usage_into_zero_cost(m):
     assert tuple(row) == (0, "unpriced", None)
 
 
+def test_partial_usage_body_cannot_be_completed_by_default_zero_runtime_dict(m):
+    _setup(m); ld = m["log_db"]
+    _pending(ld, "partial-usage-body")
+    aid = ld.record_retry_attempt(
+        "partial-usage-body", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    )
+    ld.mark_retry_attempt_dispatch(aid, {})
+    ld.update_retry_attempt(
+        aid,
+        outcome="upstream_error_json",
+        response_body=json.dumps({"usage": {"output_tokens": 7}}),
+        usage={
+            "input_tokens": 0, "output_tokens": 7,
+            "cache_creation": 0, "cache_read": 0,
+        },
+        usage_observed=True,
+        ended_at=2.0,
+    )
+    row = ld._get_conn().execute(
+        "SELECT usage_observed,input_tokens,output_tokens,cost_source,cost_ticks "
+        "FROM upstream_attempt_usage WHERE retry_attempt_id=?", (aid.row_id,),
+    ).fetchone()
+    assert tuple(row) == (0, 0, 0, "unpriced", None)
+
+
 def test_pre_dispatch_guard_does_not_create_billing_fact(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "guard")
@@ -615,6 +681,19 @@ def test_pre_dispatch_guard_does_not_create_billing_fact(m):
     assert ld._get_conn().execute(
         "SELECT COUNT(*) FROM upstream_attempt_usage WHERE retry_attempt_id=?", (aid.row_id,),
     ).fetchone()[0] == 0
+
+    _pending(ld, "cancelled-after-wire")
+    sent = ld.record_retry_attempt(
+        "cancelled-after-wire", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    )
+    ld.update_retry_attempt(
+        sent, outcome="cancelled", bytes_up=64, ended_at=2.0,
+    )
+    sent_row = ld._get_conn().execute(
+        "SELECT dispatch_state,cost_source FROM upstream_attempt_usage "
+        "WHERE retry_attempt_id=?", (sent.row_id,),
+    ).fetchone()
+    assert tuple(sent_row) == ("sent", "unpriced")
 
 
 def test_response_transform_failure_after_dispatch_preserves_billing_fact(m):
@@ -694,6 +773,60 @@ def test_anthropic_outbound_speed_fast_freezes_models_dev_fast_tariff(m):
     assert row["cost_ticks"] == expected.total_ticks
 
 
+def test_anthropic_response_service_tier_does_not_override_fast_speed(m):
+    _setup(m); ld = m["log_db"]; mp = m["model_pricing"]
+    channel = "oauth:anthropic:user@example.com"
+    _pending(ld, "claude-fast-tier", "claude-opus-5")
+    aid = ld.record_retry_attempt(
+        "claude-fast-tier", 1, channel, "oauth", "claude-opus-5", 1.0,
+        upstream_protocol="anthropic",
+    )
+    # These fields are orthogonal in Anthropic's request schema.  speed=fast
+    # selects the premium token tariff; service_tier=auto must not erase it.
+    ld.mark_retry_attempt_dispatch(
+        aid, {"service_tier": "auto", "speed": "fast"},
+    )
+    body = json.dumps({
+        "service_tier": "standard",
+        "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
+    })
+    ld.finish_success(
+        "claude-fast-tier", channel, "oauth", "claude-opus-5",
+        input_tokens=100_000, output_tokens=100_000,
+        response_body=body, upstream_protocol="anthropic",
+    )
+    row = ld._get_conn().execute(
+        "SELECT service_tier,outbound_service_tier,upstream_protocol,"
+        "cost_source,cost_ticks FROM upstream_attempt_usage "
+        "WHERE retry_attempt_id=?", (aid.row_id,),
+    ).fetchone()
+    expected = mp.estimate_cost(
+        "anthropic/claude-opus-5",
+        input_tokens=100_000, output_tokens=100_000, priority=True,
+    )
+    standard = mp.estimate_cost(
+        "anthropic/claude-opus-5",
+        input_tokens=100_000, output_tokens=100_000, priority=False,
+    )
+    assert expected is not None and standard is not None
+    assert ld._outbound_service_tier(
+        {"service_tier": "auto", "speed": "fast"},
+        upstream_protocol="anthropic",
+    ) == "fast"
+    assert ld._outbound_service_tier(
+        {"speed": "fast"}
+    ) is None
+    assert ld._outbound_service_tier(
+        {"service_tier": "auto", "speed": "fast"},
+        upstream_protocol="openai-responses",
+    ) == "auto"
+    assert tuple(row[:4]) == (
+        "standard", "fast", "anthropic", "estimated",
+    )
+    assert row["cost_ticks"] == expected.total_ticks
+    assert row["cost_ticks"] != standard.total_ticks
+
+
 def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "multi")
@@ -717,7 +850,14 @@ def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
         body = json.dumps({"usage": {"input_tokens": inp, "output_tokens": 5}})
         ld.settle_retry_attempt(aid, outcome="success", response_body=body)
         ld.update_retry_attempt(aid, outcome="success", ended_at=float(order + 1))
-    ld.finish_success("compact", "compact-rescue", "internal", "gpt-5.6-sol", response_body="{}")
+    ld.finish_success(
+        "compact", "compact-rescue", "internal", "gpt-5.6-sol",
+        input_tokens=50, output_tokens=5,
+        response_body=json.dumps({
+            "usage": {"input_tokens": 50, "output_tokens": 5},
+        }),
+        usage_observed=True,
+    )
 
     rows = ld._get_conn().execute(
         "SELECT root_request_id,COUNT(*) n,SUM(input_tokens) inp,SUM(output_tokens) outp "
@@ -748,6 +888,82 @@ def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
     assert b_cost["cost_ticks"] == b_row["cost_ticks"]
 
 
+def test_cross_protocol_attempts_keep_family_and_request_dimensions_separate(m):
+    _setup(m); ld = m["log_db"]; ui = m["ui"]
+    _pending(ld, "cross-family", "gpt-5.6-sol")
+    anthropic_channel = "oauth:anthropic:user@example.com"
+    first = ld.record_retry_attempt(
+        "cross-family", 1, anthropic_channel, "oauth", "claude-opus-5", 1.0,
+        upstream_protocol="anthropic",
+    )
+    ld.mark_retry_attempt_dispatch(first, {})
+    ld.update_retry_attempt(
+        first, outcome="http_error", ended_at=2.0,
+        response_body=json.dumps({
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+        }),
+    )
+    second = ld.record_retry_attempt(
+        "cross-family", 2, "api:B", "api", "gpt-5.6-sol", 3.0,
+        upstream_protocol="openai-responses",
+    )
+    ld.mark_retry_attempt_dispatch(second, {})
+    final_body = json.dumps({
+        "usage": {"input_tokens": 200, "output_tokens": 20},
+    })
+    ld.finish_success(
+        "cross-family", "api:B", "api", "gpt-5.6-sol",
+        input_tokens=200, output_tokens=20, response_body=final_body,
+        retry_count=1, upstream_protocol="openai-responses",
+    )
+
+    anthropic = ld.stats_summary(
+        0, family="anthropic", summary_top_limit=20,
+    )["overall"]
+    openai = ld.stats_summary(
+        0, family="openai", summary_top_limit=20,
+    )["overall"]
+    assert (anthropic["total"], anthropic["total_input_tokens"],
+            anthropic["total_output_tokens"], anthropic["costed_success"]) == (
+        0, 100, 10, 1,
+    )
+    assert (openai["total"], openai["total_input_tokens"],
+            openai["total_output_tokens"], openai["costed_success"]) == (
+        1, 200, 20, 1,
+    )
+
+    # Downstream request counts remain final-route facts.  Billing text makes
+    # the one concrete upstream call explicit instead of showing a bare
+    # "0 requests + positive cost" contradiction.
+    first_channel = ld.tokens_for_channel(anthropic_channel, 0)
+    assert first_channel["total"] == 0
+    assert first_channel["costed_success"] == 1
+    assert "上游 1 次" in ui.fmt_cost(first_channel)
+    assert "上游 1 次" in ui.fmt_cost(anthropic)
+    from src.telegram.menus import stats_menu
+    model_channels = ld.channels_by_requested_model(0)
+    channel_facts = {
+        (item["key"], item["upstream_protocol"])
+        for item in model_channels["gpt-5.6-sol"]
+    }
+    assert channel_facts == {
+        (anthropic_channel, "anthropic"),
+        ("api:B", "openai-responses"),
+    }
+    family_block = stats_menu._section_family(
+        "anthropic",
+        ld.stats_summary(0, family="anthropic", summary_top_limit=20),
+        model_channels=model_channels,
+    )
+    assert "请求 0" in family_block
+    assert "上游 1 次" in family_block
+    assert "<code>B</code>" not in family_block
+    request_row = dict(ld._get_conn().execute(
+        "SELECT * FROM request_log WHERE request_id='cross-family'"
+    ).fetchone())
+    assert "上游 2 次" in ui.fmt_cost_from_row(request_row)
+
+
 def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "model-split", "gpt-5.6-luna")
@@ -775,11 +991,13 @@ def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
     assert channel_a["gpt-5.6-luna"]["costed_success"] == 1
     assert (channel_b["gpt-5.6-sol"]["input"], channel_b["gpt-5.6-sol"]["output"]) == (20, 2)
     assert channel_b["gpt-5.6-sol"]["costed_success"] == 1
-    # API-key model details are explicitly grouped by the request's final_model,
-    # while channel details use each channel attempt's actual model.
-    assert set(by_apikey) == {"gpt-5.6-sol"}
-    assert (by_apikey["gpt-5.6-sol"]["input"], by_apikey["gpt-5.6-sol"]["output"]) == (30, 3)
-    assert by_apikey["gpt-5.6-sol"]["costed_success"] == 2
+    # Token and cost dimensions use the same concrete attempt model even when
+    # the final successful route resolved to a different model.
+    assert set(by_apikey) == {"gpt-5.6-luna", "gpt-5.6-sol"}
+    assert (by_apikey["gpt-5.6-luna"]["input"], by_apikey["gpt-5.6-luna"]["output"]) == (10, 1)
+    assert by_apikey["gpt-5.6-luna"]["costed_success"] == 1
+    assert (by_apikey["gpt-5.6-sol"]["input"], by_apikey["gpt-5.6-sol"]["output"]) == (20, 2)
+    assert by_apikey["gpt-5.6-sol"]["costed_success"] == 1
 
 
 def test_token_surfaces_show_cost_without_cache_hit(m):
@@ -914,9 +1132,237 @@ def test_partial_attempt_schema_migration_is_idempotent(m):
     assert {
         "call_request_id", "usage_observed", "service_tier",
         "outbound_service_tier", "dispatch_state", "pricing_snapshot_json",
-        "pricing_version", "cost_source", "cost_ticks", "settled_at",
+        "upstream_protocol", "pricing_version", "cost_source", "cost_ticks",
+        "settled_at",
     } <= attempt_cols
-    assert "outbound_service_tier" in retry_cols
+    assert {"outbound_service_tier", "upstream_protocol"} <= retry_cols
+
+
+def test_migrated_attempt_without_call_identity_does_not_double_count_tokens(m):
+    _setup(m); ld = m["log_db"]
+    _pending(ld, "legacy-attempt-identity")
+    ld._get_conn().execute(
+        """UPDATE request_log
+           SET status='success', final_channel_key='api:B',
+               final_channel_type='api', final_model='gpt-5.6-sol',
+               input_tokens=20, output_tokens=2, usage_observed=1
+           WHERE request_id='legacy-attempt-identity'"""
+    )
+    ld._get_conn().execute(
+        """INSERT INTO upstream_attempt_usage
+           (retry_attempt_id,root_request_id,call_request_id,attempt_order,
+            channel_key,channel_type,model,outcome,usage_observed,input_tokens,
+            output_tokens,cache_creation_tokens,cache_read_tokens,
+            dispatch_state,cost_source,settled_at)
+           VALUES (999,'legacy-attempt-identity','',1,'api:A','api',
+                   'gpt-5.6-luna','success',1,10,1,0,0,'sent','unpriced',1)"""
+    )
+    ld._get_conn().commit()
+
+    overall = ld.stats_summary(0, summary_top_limit=0)["overall"]
+    assert (overall["total_input_tokens"], overall["total_output_tokens"]) == (20, 2)
+
+
+def test_real_month_migration_repairs_partial_attempt_schema_before_indexes(
+    m, tmp_path, monkeypatch,
+):
+    import sqlite3
+    ld = m["log_db"]
+    monkeypatch.setattr(ld, "_log_dir", str(tmp_path))
+    path = tmp_path / "2026-06.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(ld._schema_sql())
+    conn.executescript("""
+        DROP INDEX idx_attempt_usage_root;
+        DROP INDEX idx_attempt_usage_channel;
+        DROP INDEX idx_attempt_usage_model;
+        DROP TABLE upstream_attempt_usage;
+        CREATE TABLE upstream_attempt_usage (
+          id INTEGER PRIMARY KEY,
+          retry_attempt_id INTEGER,
+          root_request_id TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    ld.migrate_month_schema("2026-06")
+    ld.migrate_month_schema("2026-06")
+    conn = sqlite3.connect(path)
+    try:
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(upstream_attempt_usage)"
+        )}
+        indexes = {row[1] for row in conn.execute(
+            "PRAGMA index_list(upstream_attempt_usage)"
+        )}
+    finally:
+        conn.close()
+    assert {"channel_key", "model", "upstream_protocol", "cost_ticks"} <= cols
+    assert {
+        "idx_attempt_usage_root", "idx_attempt_usage_channel",
+        "idx_attempt_usage_model", "idx_attempt_usage_retry",
+    } <= indexes
+
+
+def test_family_stats_skip_read_only_pre_protocol_month_without_crashing(m):
+    _setup(m); ld = m["log_db"]
+    _pending(ld, "pre-protocol-month")
+    aid = ld.record_retry_attempt(
+        "pre-protocol-month", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+        upstream_protocol="openai-responses",
+    )
+    ld.mark_retry_attempt_dispatch(aid, {})
+    ld.update_retry_attempt(
+        aid, outcome="success", ended_at=2.0,
+        response_body=json.dumps({
+            "service_tier": "default",
+            "usage": {"input_tokens": 4, "output_tokens": 2},
+        }),
+    )
+    ld.finish_success(
+        "pre-protocol-month", "api:A", "api", "gpt-5.6-luna",
+        input_tokens=4, output_tokens=2, usage_observed=True,
+        upstream_protocol="openai-responses",
+    )
+
+    current = ld._get_conn()
+    historical_path = _os.path.join(ld._log_dir, "1999-01.db")
+    historical = sqlite3.connect(historical_path)
+    current.backup(historical)
+    historical.execute("ALTER TABLE request_log DROP COLUMN upstream_protocol")
+    historical.execute("ALTER TABLE retry_chain DROP COLUMN upstream_protocol")
+    historical.execute(
+        "ALTER TABLE upstream_attempt_usage DROP COLUMN upstream_protocol"
+    )
+    historical.commit()
+    historical.close()
+    for table in (
+        "upstream_attempt_usage", "retry_chain", "request_detail", "request_log",
+    ):
+        current.execute(f"DELETE FROM {table}")
+    current.commit()
+
+    try:
+        result = ld.stats_summary(0, family="openai", summary_top_limit=20)
+        assert result["overall"]["total"] == 0
+        assert result["overall"]["costed_success"] == 0
+        assert result["overall"]["unpriced_success"] == 0
+    finally:
+        _os.unlink(historical_path)
+
+
+def test_stats_many_model_channel_pairs_do_not_build_unbounded_sql_cases(
+    m, monkeypatch,
+):
+    _setup(m); ld = m["log_db"]; mp = m["model_pricing"]
+    monkeypatch.setattr(mp, "long_context_threshold", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        mp, "has_ambiguous_cache_write_ttl", lambda *args, **kwargs: True,
+    )
+    rows = [
+        (
+            f"many-pairs-{i}", 1.0, "k", f"model-{i}", f"api:channel-{i}",
+            "api", f"model-{i}", "success", 2, 1, 1, 0, 1,
+        )
+        for i in range(1_100)
+    ]
+    conn = ld._get_conn()
+    conn.executemany(
+        """INSERT INTO request_log
+           (request_id,created_at,api_key_name,requested_model,
+            final_channel_key,final_channel_type,final_model,status,
+            input_tokens,output_tokens,cache_creation_tokens,cache_read_tokens,
+            usage_observed)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    conn.commit()
+
+    overall = ld.stats_summary(0, summary_top_limit=0)["overall"]
+    assert overall["total"] == 1_100
+    assert overall["costed_success"] == 0
+    assert overall["unpriced_success"] == 1_100
+
+
+def test_legacy_fast_and_failed_rows_fail_closed_instead_of_showing_zero(m):
+    _setup(m); ld = m["log_db"]; ui = m["ui"]; mp = m["model_pricing"]
+    _pending(ld, "legacy-fast-unknown", fast=True)
+    fast_body = json.dumps({
+        "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
+    })
+    ld.finish_success(
+        "legacy-fast-unknown", "api:openai", "api", "gpt-5.6-luna",
+        input_tokens=100_000, output_tokens=100_000,
+        response_body=fast_body, usage_observed=True,
+        upstream_protocol="openai-responses",
+    )
+    _pending(ld, "legacy-failed", "gpt-5.6-luna")
+    ld.finish_error(
+        "legacy-failed", "upstream failed after dispatch",
+        final_channel_key="api:A", final_channel_type="api",
+        final_model="gpt-5.6-luna", upstream_protocol="openai-responses",
+    )
+    _pending(ld, "legacy-anthropic-capacity", "claude-opus-5")
+    anthropic_body = json.dumps({
+        "service_tier": "priority",
+        "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
+    })
+    ld.finish_success(
+        "legacy-anthropic-capacity", "oauth:anthropic:user@example.com",
+        "oauth", "claude-opus-5", input_tokens=100_000,
+        output_tokens=100_000, response_body=anthropic_body,
+        usage_observed=True, upstream_protocol="anthropic",
+    )
+    _pending(ld, "legacy-unknown-priority", "gpt-5.6-luna")
+    unknown_body = json.dumps({
+        "service_tier": "priority",
+        "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
+    })
+    ld.finish_success(
+        "legacy-unknown-priority", "api:openai", "api", "gpt-5.6-luna",
+        input_tokens=100_000, output_tokens=100_000,
+        response_body=unknown_body, usage_observed=True,
+    )
+
+    fast_row = dict(ld._get_conn().execute(
+        "SELECT * FROM request_log WHERE request_id='legacy-fast-unknown'"
+    ).fetchone())
+    failed_row = dict(ld._get_conn().execute(
+        "SELECT * FROM request_log WHERE request_id='legacy-failed'"
+    ).fetchone())
+    anthropic_row = dict(ld._get_conn().execute(
+        "SELECT * FROM request_log "
+        "WHERE request_id='legacy-anthropic-capacity'"
+    ).fetchone())
+    unknown_row = dict(ld._get_conn().execute(
+        "SELECT * FROM request_log "
+        "WHERE request_id='legacy-unknown-priority'"
+    ).fetchone())
+    fast_cost = ld.cost_for_log(fast_row)
+    failed_cost = ld.cost_for_log(failed_row)
+    anthropic_cost = ld.cost_for_log(anthropic_row)
+    unknown_cost = ld.cost_for_log(unknown_row)
+    assert (fast_cost["costed_success"], fast_cost["unpriced_success"]) == (0, 1)
+    assert (failed_cost["costed_success"], failed_cost["unpriced_success"]) == (0, 1)
+    assert ui.fmt_cost(fast_cost) == "未计价（1 次）"
+    assert ui.fmt_cost(failed_cost) == "未计价（1 次）"
+    standard = mp.estimate_cost(
+        "anthropic/claude-opus-5", input_tokens=100_000,
+        output_tokens=100_000, priority=False,
+    )
+    fast = mp.estimate_cost(
+        "anthropic/claude-opus-5", input_tokens=100_000,
+        output_tokens=100_000, priority=True,
+    )
+    assert standard is not None and fast is not None
+    assert anthropic_cost["cost_ticks"] == standard.total_ticks
+    assert anthropic_cost["cost_ticks"] != fast.total_ticks
+    assert (unknown_cost["costed_success"], unknown_cost["unpriced_success"]) == (0, 1)
+
+    overall = ld.stats_summary(0, summary_top_limit=0)["overall"]
+    assert overall["costed_success"] == 1
+    assert overall["unpriced_success"] == 3
 
 
 def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):

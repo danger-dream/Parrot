@@ -33,6 +33,7 @@ _BUNDLED_PATH = os.path.join(
 )
 _CACHE_FILENAME = "models_dev_catalog.json.gz"
 _MAX_REMOTE_CATALOG_BYTES = 16 * 1024 * 1024
+_MAX_LOCAL_CATALOG_BYTES = 32 * 1024 * 1024
 _MAX_BILLING_INTEGER = (1 << 63) - 1
 _PROVIDER_ALIASES = {
     "claude": "anthropic",
@@ -120,7 +121,7 @@ def _nonnegative_float(value: Any) -> float | None:
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if result < 0 or not math.isfinite(result):
         return None
@@ -138,7 +139,10 @@ def _catalog_number(value: Any) -> float | None:
 def _catalog_positive_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
-    return value if value > 0 else None
+    # Context thresholds are bound into SQLite INTEGER parameters by the
+    # aggregate queries.  Accepting an arbitrary-size Python int here merely
+    # postpones the failure until a user opens the statistics page.
+    return value if 0 < value <= _MAX_BILLING_INTEGER else None
 
 
 def _strict_nonnegative_int(value: Any) -> int | None:
@@ -435,8 +439,13 @@ def _parse_catalog(
 
 def _load_json(path: str) -> Any:
     opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8") as handle:
-        return json.load(handle)
+    with opener(path, "rb") as handle:
+        raw = handle.read(_MAX_LOCAL_CATALOG_BYTES + 1)
+    if len(raw) > _MAX_LOCAL_CATALOG_BYTES:
+        raise ValueError(
+            f"local pricing catalog exceeds {_MAX_LOCAL_CATALOG_BYTES} bytes"
+        )
+    return json.loads(raw.decode("utf-8"))
 
 
 def _catalog_payload_parts(payload: Any) -> tuple[Any, Any]:
@@ -463,7 +472,10 @@ def initialize() -> None:
                 parsed, aliases, providers = _parse_models_dev_catalog(
                     api_payload, models_payload
                 )
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            except (
+                OSError, EOFError, ValueError, TypeError, RecursionError,
+                json.JSONDecodeError,
+            ) as exc:
                 last_error = exc
                 continue
             _catalog = parsed
@@ -998,7 +1010,11 @@ def _billing_candidates(obj: Mapping[str, Any]):
 def normalize_response_billing(response_body: Any) -> NormalizedBilling:
     observed = False
     usage_invalid = False
+    actual_cost_invalid = False
     tier_invalid = False
+    usage_container_seen = False
+    input_observed = False
+    output_observed = False
     input_tokens = output_tokens = cache_creation = cache_read = 0
     service_tier: str | None = None
     actual_ticks: int | None = None
@@ -1008,10 +1024,12 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
             tier = candidate.get("service_tier")
             if isinstance(tier, str) and tier.strip():
                 service_tier = tier.strip().lower()
+                tier_invalid = False
             elif "service_tier" in candidate and tier is not None:
                 tier_invalid = True
             if "usage" not in candidate:
                 continue
+            usage_container_seen = True
             usage = candidate.get("usage")
             if not isinstance(usage, Mapping):
                 usage_invalid = True
@@ -1031,6 +1049,9 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                 next_cache_read = cache_read
 
                 has_prompt = "input_tokens" in usage or "prompt_tokens" in usage
+                has_output = (
+                    "output_tokens" in usage or "completion_tokens" in usage
+                )
                 details_obj = None
                 details_present = False
                 if "input_tokens_details" in usage:
@@ -1102,7 +1123,7 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         else:
                             next_input = prompt - next_cache_read if is_openai_shape else prompt
 
-                if "output_tokens" in usage or "completion_tokens" in usage:
+                if has_output:
                     parsed_output = _strict_nonnegative_int(
                         usage.get("output_tokens", usage.get("completion_tokens"))
                     )
@@ -1116,20 +1137,35 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     output_tokens = next_output
                     cache_creation = next_cache_creation
                     cache_read = next_cache_read
-                    observed = True
-                    usage_invalid = False
+                    input_observed = input_observed or has_prompt
+                    output_observed = output_observed or has_output
+                    observed = input_observed and output_observed
+                    # A later self-contained usage object is authoritative and
+                    # can replace an earlier malformed event. Separate valid
+                    # stream fragments may combine, but one fragment alone
+                    # must not erase prior corruption.
+                    if has_prompt and has_output:
+                        usage_invalid = False
                 else:
                     usage_invalid = True
             if allow_actual_cost and "cost_in_usd_ticks" in usage:
                 value = _strict_nonnegative_int(usage.get("cost_in_usd_ticks"))
                 if value is not None:
                     actual_ticks = value
+                    actual_cost_invalid = False
                 else:
-                    usage_invalid = True
+                    actual_cost_invalid = True
 
+    incomplete_usage = usage_container_seen and not observed
     return NormalizedBilling(
-        usage_observed=bool(observed and not usage_invalid and not tier_invalid),
-        usage_invalid=bool(usage_invalid or tier_invalid),
+        usage_observed=bool(
+            observed and not usage_invalid and not tier_invalid
+            and not actual_cost_invalid
+        ),
+        usage_invalid=bool(
+            usage_invalid or incomplete_usage or tier_invalid
+            or actual_cost_invalid
+        ),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_creation_tokens=cache_creation,
@@ -1340,7 +1376,7 @@ async def refresh_loop() -> None:
         try:
             parsed_hours = float(raw_hours)
             hours = max(1.0, parsed_hours) if math.isfinite(parsed_hours) else 24.0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             hours = 24.0
         await asyncio.sleep(hours * 3600)
 
