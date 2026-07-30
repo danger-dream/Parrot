@@ -92,6 +92,12 @@ class _DelayedHeadersContext(_Context):
         return self.response
 
 
+class _AfterDispatchErrorContext(_Context):
+    async def __aenter__(self):
+        await self.trace("http11.send_request_headers.started", {})
+        raise httpx.ReadTimeout("failed after request dispatch")
+
+
 def _request():
     return SimpleNamespace(
         method="POST", url="https://unit.invalid", headers={}, body=b"{}",
@@ -281,6 +287,38 @@ async def test_proxy_switch_creates_fresh_round_and_terminalizes_previous_round(
     assert opened.timing.round_id == inserted[1]["round_id"]
     assert any(handle == "route-1" and data["outcome"] == "connect_error" for handle, data in updates)
     assert any(handle == "route-2" and data["outcome"] == "open" for handle, data in updates)
+
+
+@pytest.mark.asyncio
+async def test_proxy_route_is_not_replayed_after_request_dispatch_started(monkeypatch):
+    inserted, updates = _patch_persistence(monkeypatch)
+    connector = _Connector()
+    calls = 0
+    dispatched = []
+
+    monkeypatch.setattr(
+        http_runtime, "_resolve_http_route_chain",
+        lambda channel, model: ([("p1", connector), ("direct", None)], None),
+    )
+    monkeypatch.setattr(
+        http_runtime.log_db,
+        "mark_retry_attempt_dispatch",
+        lambda retry_id, body: dispatched.append((retry_id, body)),
+    )
+
+    def open_stream(client, request):
+        nonlocal calls
+        calls += 1
+        return _AfterDispatchErrorContext(request)
+
+    monkeypatch.setattr(http_runtime, "open_stream", open_stream)
+    opened = await http_runtime.open_response_with_proxy_chain(**_open_kwargs())
+
+    assert opened.error is not None and opened.error.outcome == "read_timeout"
+    assert calls == 1
+    assert [row["proxy_name"] for row in inserted] == ["p1"]
+    assert dispatched == [("retry-handle", b"{}")]
+    assert updates[-1][1]["outcome"] == "read_timeout"
 
 
 @pytest.mark.asyncio

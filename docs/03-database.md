@@ -236,7 +236,9 @@ def retry_chain_of(request_id) -> list[Row]
 - 未变化：返回已打开连接
 - 变化了：关闭旧连接，打开新月份 DB，重建 schema（`CREATE IF NOT EXISTS`）
 
-所有写操作都经由 `_get_conn()`，跨月请求会自动写入新月库（不跨库迁移数据）。
+新请求在 `insert_pending()` 时绑定当时的月库，后续 request/retry/proxy/local-web/
+attempt-usage 写入都携带同一个 `RowLogHandle`。因此跨过北京时间月界的长请求仍完整
+落在开始月份，不会出现摘要在旧库、结算在新库的拆分；月界之后新建的请求才进入新库。
 
 ## 3.4 跨库数据聚合（TG Bot 统计）
 
@@ -259,6 +261,7 @@ def retry_chain_of(request_id) -> list[Row]
 | OpenAI response history | openai_response_store.db | 否 | TTL 60min（默认） |
 | 请求流水 | logs/YYYY-MM.db | 是 | 默认永久保留；可由 `logRetention` 按天清理 |
 | 重试链 | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
+| 上游尝试结算 | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 | 请求/响应 body | logs/YYYY-MM.db | 是 | 与所属请求流水同生命周期 |
 
 原则：**轻量状态数据需要快速读写且重启恢复**，放 state.db；体积可能很大的
@@ -272,6 +275,10 @@ OpenAI history 独立分库；**业务日志写多读少且数据量大**，按�
 暴露的用量，不会改写为包含重试或故障转移的用量。费用单独结算到
 `upstream_attempt_usage`；每次真实上游 dispatch 对应一条不可变、可幂等 finalize
 的记录。dispatch 前发生的转换/guard 错误只留在 `retry_chain` 供排障，不作为账单事实。
+`retry_chain.dispatched_at` 在传输层开始发送时立即落盘：若进程随后在 finalize 前退出，
+聚合会把缺失结算的该次 dispatch 明确计为 `unpriced`，而不是回退请求摘要后漏算整次尝试。
+HTTP/WS 代理链只允许在尚未开始发送时切换下一条 route；一旦请求可能离开 Parrot 就不在
+同一 retry 行内重放，避免生成两次上游账单却只留下一个结算事实。
 
 每条尝试结算保存规范化 Token、是否真实观察到 Token usage、响应/出站 service tier、
 dispatch 确定性、补全 provider 的模型、冻结后的实际费率快照及版本，以及费用来源

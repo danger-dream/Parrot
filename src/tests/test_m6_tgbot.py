@@ -237,14 +237,20 @@ def test_apikey_cache_stats_include_cost(m):
     conn.execute("DELETE FROM request_log")
     conn.execute("DELETE FROM request_detail")
     conn.commit()
-    m["config"].update(lambda c: c.__setitem__("apiKeys", {
-        "priced": {
-            "key": "ccp-test-not-a-production-secret",
-            "enabled": True,
-            "allowedModels": [],
-            "allowImages": False,
-        },
-    }))
+    def configure_priced_key(c):
+        c["apiKeys"] = {
+            "priced": {
+                "key": "ccp-test-not-a-production-secret",
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+            },
+        }
+        pricing = c.setdefault("pricing", {})
+        pricing["enabled"] = True
+        pricing.setdefault("channelProviders", {})["api:Priced"] = "openai"
+
+    m["config"].update(configure_priced_key)
     ld = m["log_db"]
     ld.insert_pending(
         "apikey-cost", "127.0.0.1", "priced", "gpt-5.6-sol", True,

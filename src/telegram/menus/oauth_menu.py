@@ -852,8 +852,8 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
 def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     """Grok/xAI OAuth 本地花费块。
 
-    独立计费行只展示 Parrot 本地响应日志累计到的真实上游 cost/token，不做
-    预算、进度条或百分比；缓存行金额则复用全局“真实优先、估算兜底”口径。
+    只展示 Parrot 本地上游尝试累计的金额与 Token，不做预算、进度条或
+    百分比；金额统一复用“真实优先、估算兜底、未知明确未计价”的口径。
     """
     ck = f"oauth:{account_key}"
     since_ts = _this_month_start_ts()
@@ -866,12 +866,6 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     except Exception as exc:
         print(f"[oauth_menu] xai month spend lookup failed for {account_key}: {exc}")
         month = {}
-    try:
-        priced_month = log_db.tokens_for_channel(ck, since_ts=since_ts)
-    except Exception as exc:
-        print(f"[oauth_menu] xai priced month lookup failed for {account_key}: {exc}")
-        priced_month = {}
-
     bill_count = int(month.get("costed_success") or 0)
     prompt = ui.prompt_total(month.get("input") or 0, month.get("cache_creation") or 0, month.get("cache_read") or 0)
     output = int(month.get("output") or 0)
@@ -916,6 +910,21 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
             lines.append("🚀 服务层级: " + " · ".join(parts))
     return "\n".join(lines)
 
+def _has_local_usage_or_billing(stats: dict | None) -> bool:
+    if not isinstance(stats, dict):
+        return False
+    for name in (
+        "total", "input", "output", "cache_creation", "cache_read",
+        "costed_success", "unpriced_success",
+    ):
+        try:
+            if int(stats.get(name) or 0) > 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return False
+
+
 def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Optional[str]:
     """某 OAuth 账号在 [since_ts, now] 窗口内、经 Parrot 的本地请求用量明细行。
 
@@ -929,7 +938,7 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Opti
         s = log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=since_ts)
     except Exception:
         return None
-    if not s or (s.get("total") or 0) <= 0:
+    if not _has_local_usage_or_billing(s):
         return None
     prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
     parts = [f"↑{ui.fmt_tokens(prompt)} ↓{ui.fmt_tokens(s['output'])}"]
@@ -1033,7 +1042,7 @@ def _format_account_block(acc: dict) -> str:
         ts = log_db.tokens_for_channel(f"oauth:{ak}", since_ts=since_ts)
     except Exception:
         ts = None
-    if prov != "xai" and ts and ts["total"] > 0:
+    if prov != "xai" and _has_local_usage_or_billing(ts):
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
         stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
@@ -1995,7 +2004,7 @@ def _format_month_stats_block(account_key: str) -> str:
         overall = log_db.tokens_for_channel(ck, since_ts=since_ts)
     except Exception:
         return ""
-    if not overall or overall.get("total", 0) <= 0:
+    if not _has_local_usage_or_billing(overall):
         return ""
     try:
         by_model = log_db.channel_model_stats(ck, since_ts=since_ts)

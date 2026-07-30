@@ -200,12 +200,15 @@ async def _read_response_bytes(
     response: httpx.Response,
     timing: HttpAttemptTiming | None,
     round_timeouts: RoundTimeouts | None,
+    partial_state: dict[str, Any] | None = None,
 ) -> bytes:
     """Read a response using only non-empty raw bytes as business activity."""
 
     if timing is not None:
         timing.start_response_body_wait()
     parts: list[bytes] = []
+    if partial_state is not None:
+        partial_state["parts"] = parts
     aiter = response.aiter_bytes()
     while True:
         try:
@@ -257,13 +260,16 @@ async def read_http_error_response(
     proxy_name: str | None = None,
     proxy_bytes: dict | None = None,
     translator_ctx: dict | None = None,
+    partial_state: dict[str, Any] | None = None,
 ) -> AttemptResult:
     """Read and normalize a non-2xx/3xx response under round deadlines."""
 
     try:
-        raw = await _read_response_bytes(response, timing, round_timeouts)
+        raw = await _read_response_bytes(
+            response, timing, round_timeouts, partial_state,
+        )
     except asyncio.CancelledError:
-        await close_response_context(ctx)
+        # The owning HTTP attempt closes the context and terminalizes its root.
         raise
     except BusinessTimeoutError as exc:
         await close_response_context(ctx)
@@ -322,13 +328,16 @@ async def read_non_stream_body(
     connect_ms: int | None,
     timing: HttpAttemptTiming | None = None,
     round_timeouts: RoundTimeouts | None = None,
+    partial_state: dict[str, Any] | None = None,
 ) -> HttpBodyReadResult:
     """Read a non-stream body; first-byte is inapplicable, idle starts on body."""
 
     try:
-        raw = await _read_response_bytes(response, timing, round_timeouts)
+        raw = await _read_response_bytes(
+            response, timing, round_timeouts, partial_state,
+        )
     except asyncio.CancelledError:
-        await close_response_context(ctx)
+        # The owning HTTP attempt closes the context and terminalizes its root.
         raise
     except BusinessTimeoutError as exc:
         await close_response_context(ctx)
@@ -384,9 +393,12 @@ async def aggregate_stream_as_non_stream_response(
     timing: HttpAttemptTiming | None = None,
     round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
+    partial_state: dict[str, Any] | None = None,
 ) -> StreamAsNonStreamResult:
     """Aggregate an upstream SSE response into one non-stream JSON object."""
     raw_buf = bytearray()
+    if partial_state is not None:
+        partial_state["raw_buf"] = raw_buf
     aiter = response.aiter_bytes()
 
     if timing is not None:
@@ -394,7 +406,7 @@ async def aggregate_stream_as_non_stream_response(
     try:
         first_chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
     except asyncio.CancelledError:
-        await close_response_context(ctx)
+        # The owning HTTP attempt closes the context and terminalizes its root.
         raise
     except BusinessTimeoutError as exc:
         await close_response_context(ctx)
@@ -433,12 +445,24 @@ async def aggregate_stream_as_non_stream_response(
 
     first_byte_ms = timing.snapshot().first_byte_ms if timing is not None else None
 
-    first_chunk_restored = await provider_registry.restore_response_bytes(
-        channel,
-        first_chunk,
-        dynamic_map=dynamic_map,
-        translator_ctx=translator_ctx,
-    )
+    try:
+        first_chunk_restored = await provider_registry.restore_response_bytes(
+            channel,
+            first_chunk,
+            dynamic_map=dynamic_map,
+            translator_ctx=translator_ctx,
+        )
+    except Exception as exc:
+        await close_response_context(ctx)
+        raw_text = bytes(first_chunk).decode("utf-8", errors="replace")
+        return StreamAsNonStreamResult(
+            error=_with_timing(timing, AttemptResult(
+                outcome="transform_error",
+                error_detail=f"response restoration failed: {exc}"[:2000],
+                full_response_text=raw_text,
+                translator_ctx=translator_ctx,
+            ))
+        )
     toolkit = toolkit_for_channel(channel)
 
     first_event = toolkit["first_event_parser"](first_chunk_restored)
@@ -510,7 +534,7 @@ async def aggregate_stream_as_non_stream_response(
         try:
             chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
         except asyncio.CancelledError:
-            await close_response_context(ctx)
+            # The owning HTTP attempt closes the context and terminalizes its root.
             raise
         except BusinessTimeoutError as exc:
             await close_response_context(ctx)
@@ -527,10 +551,10 @@ async def aggregate_stream_as_non_stream_response(
         except httpx.TimeoutException as exc:
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
-                error=_with_timing(timing, AttemptResult(
+                error=with_partial_billing(_with_timing(timing, AttemptResult(
                     outcome=classify_httpx_timeout(exc),
                     error_detail=f"read SSE timeout: {exc} [stream-only→non-stream]",
-                ))
+                )))
             )
         except Exception as exc:
             await close_response_context(ctx)
@@ -540,12 +564,23 @@ async def aggregate_stream_as_non_stream_response(
                     error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
                 )))
             )
-        restored_chunk = await provider_registry.restore_response_bytes(
-            channel,
-            chunk,
-            dynamic_map=dynamic_map,
-            translator_ctx=translator_ctx,
-        )
+        try:
+            restored_chunk = await provider_registry.restore_response_bytes(
+                channel,
+                chunk,
+                dynamic_map=dynamic_map,
+                translator_ctx=translator_ctx,
+            )
+        except Exception as exc:
+            raw_buf.extend(bytes(chunk))
+            await close_response_context(ctx)
+            return StreamAsNonStreamResult(
+                error=with_partial_billing(_with_timing(timing, AttemptResult(
+                    outcome="transform_error",
+                    error_detail=f"response restoration failed: {exc}"[:2000],
+                    translator_ctx=translator_ctx,
+                )))
+            )
         builder.feed(restored_chunk)
         tracker.feed(restored_chunk)
         raw_buf.extend(
@@ -569,13 +604,11 @@ async def aggregate_stream_as_non_stream_response(
 
     if not getattr(tracker, "saw_stream_end", False):
         return StreamAsNonStreamResult(
-            error=AttemptResult(
+            error=with_partial_billing(_with_timing(timing, AttemptResult(
                 outcome="upstream_malformed",
-                connect_ms=connect_ms,
-                first_byte_ms=first_byte_ms,
                 error_detail="stream ended without a terminal SSE event [stream-only→non-stream]",
                 full_response_text=response_body_text,
-            )
+            )))
         )
 
     if not builder.has_any_event:
@@ -636,30 +669,39 @@ async def _read_until_first_downstream_chunk(
 ) -> tuple[list[bytes], dict | None]:
     commit_gate = SseCommitGate(protocol=protocol, stream_translator=stream_translator)
 
+    async def restore(raw: bytes) -> bytes:
+        try:
+            return await provider_registry.restore_response_bytes(
+                channel,
+                raw,
+                dynamic_map=dynamic_map,
+                translator_ctx=translator_ctx,
+            )
+        except Exception as exc:
+            # The un-restored upstream frame is still useful billing evidence.
+            # Trackers parse protocol fields, not confused tool names, so feed a
+            # best-effort copy before surfacing the presentation failure.
+            try:
+                tracker.feed(raw)
+                builder.feed(raw)
+            except Exception:
+                pass
+            raise RuntimeError(f"response restoration failed: {exc}") from exc
+
     async def feed_restored(restored: bytes) -> tuple[list[bytes], dict | None]:
         tracker.feed(restored)
         builder.feed(restored)
         result = commit_gate.feed(restored)
         return result.downstream_chunks, result.error_event
 
-    restored_first = await provider_registry.restore_response_bytes(
-        channel,
-        first_chunk,
-        dynamic_map=dynamic_map,
-        translator_ctx=translator_ctx,
-    )
+    restored_first = await restore(first_chunk)
     downstream_chunks, err = await feed_restored(restored_first)
     if downstream_chunks or err is not None:
         return downstream_chunks, err
 
     while True:
         chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
-        restored = await provider_registry.restore_response_bytes(
-            channel,
-            chunk,
-            dynamic_map=dynamic_map,
-            translator_ctx=translator_ctx,
-        )
+        restored = await restore(chunk)
         downstream_chunks, err = await feed_restored(restored)
         if downstream_chunks or err is not None:
             return downstream_chunks, err
@@ -679,6 +721,7 @@ async def prepare_stream_response_start(
     timing: HttpAttemptTiming | None = None,
     round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
+    partial_state: dict[str, Any] | None = None,
 ) -> HttpStreamStartResult:
     """Read through the pre-commit SSE boundary for an HTTP stream response."""
     aiter = response.aiter_bytes()
@@ -689,7 +732,7 @@ async def prepare_stream_response_start(
     try:
         first_chunk = await _next_nonempty_http_chunk(aiter, timing, round_timeouts)
     except asyncio.CancelledError:
-        await close_response_context(ctx)
+        # The owning HTTP attempt closes the context and terminalizes its root.
         raise
     except BusinessTimeoutError as exc:
         await close_response_context(ctx)
@@ -731,6 +774,8 @@ async def prepare_stream_response_start(
     toolkit = toolkit_for_channel(channel)
     tracker = toolkit["stream_tracker"]()
     builder = toolkit["stream_builder"]()
+    if partial_state is not None:
+        partial_state["tracker"] = tracker
     ch_proto = getattr(channel, "protocol", "anthropic")
     stream_translator = make_stream_translator(translator_ctx)
 
@@ -795,6 +840,15 @@ async def prepare_stream_response_start(
                     error_detail=f"first downstream chunk transport: {exc}",
                 )))
             )
+        except Exception as exc:
+            await close_response_context(ctx)
+            return HttpStreamStartResult(
+                error=_with_timing(timing, _attach_precommit_response(AttemptResult(
+                    outcome="transform_error",
+                    error_detail=f"first downstream chunk transform: {exc}"[:2000],
+                    translator_ctx=translator_ctx,
+                )))
+            )
         if pre_visible_error:
             await close_response_context(ctx)
             # A Responses ``response.incomplete`` before any downstream-visible
@@ -827,12 +881,27 @@ async def prepare_stream_response_start(
                 ))
             )
     else:
-        first_chunk_restored = await provider_registry.restore_response_bytes(
-            channel,
-            first_chunk,
-            dynamic_map=dynamic_map,
-            translator_ctx=translator_ctx,
-        )
+        try:
+            first_chunk_restored = await provider_registry.restore_response_bytes(
+                channel,
+                first_chunk,
+                dynamic_map=dynamic_map,
+                translator_ctx=translator_ctx,
+            )
+        except Exception as exc:
+            try:
+                tracker.feed(first_chunk)
+                builder.feed(first_chunk)
+            except Exception:
+                pass
+            await close_response_context(ctx)
+            return HttpStreamStartResult(
+                error=_with_timing(timing, _attach_precommit_response(AttemptResult(
+                    outcome="transform_error",
+                    error_detail=f"response restoration failed: {exc}"[:2000],
+                    translator_ctx=translator_ctx,
+                )))
+            )
         # Record the restored bytes before classifying a first-event error so
         # pre-commit upstream error payloads follow the same persistence path.
         tracker.feed(first_chunk_restored)
@@ -929,12 +998,25 @@ async def read_next_stream_step(
                 outcome="transport_error",
             )
 
-        restored = await provider_registry.restore_response_bytes(
-            channel,
-            chunk,
-            dynamic_map=dynamic_map,
-            translator_ctx=translator_ctx,
-        )
+        try:
+            restored = await provider_registry.restore_response_bytes(
+                channel,
+                chunk,
+                dynamic_map=dynamic_map,
+                translator_ctx=translator_ctx,
+            )
+        except Exception as exc:
+            try:
+                tracker.feed(chunk)
+                builder.feed(chunk)
+            except Exception:
+                pass
+            return HttpStreamReadStep(
+                kind="error",
+                err_type="api_error",
+                message=f"response restoration failed: {exc}"[:2000],
+                outcome="transform_error",
+            )
         tracker.feed(restored)
         builder.feed(restored)
         if stream_translator is not None:
@@ -1213,6 +1295,12 @@ async def open_response_with_proxy_chain(
             route_type=route_type,
             response_mode=response_mode,
             round_id=round_id,
+            on_dispatch=(
+                (lambda: log_db.mark_retry_attempt_dispatch(
+                    retry_attempt_id, upstream_req.body,
+                ))
+                if retry_attempt_id is not None else None
+            ),
         )
         late_timing.target = timing
 
@@ -1284,6 +1372,8 @@ async def open_response_with_proxy_chain(
             if connector is not None:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = detail[:200]
+            if timing.dispatch_started:
+                return OpenedHttpResponse(error=last_pre_header)
             continue
         except httpx.TimeoutException as exc:
             outcome = classify_httpx_timeout(exc)
@@ -1301,6 +1391,8 @@ async def open_response_with_proxy_chain(
             if connector is not None:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = detail[:200]
+            if timing.dispatch_started:
+                return OpenedHttpResponse(error=last_pre_header)
             continue
         except httpx.ConnectError as exc:
             detail = f"connect error: {exc}"
@@ -1317,6 +1409,8 @@ async def open_response_with_proxy_chain(
             if connector is not None:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = detail[:200]
+            if timing.dispatch_started:
+                return OpenedHttpResponse(error=last_pre_header)
             continue
         except Exception as exc:
             detail = f"transport: {exc}"
@@ -1333,6 +1427,8 @@ async def open_response_with_proxy_chain(
             if connector is not None:
                 connector.stats.total_failures += 1
                 connector.stats.last_error = detail[:200]
+            if timing.dispatch_started:
+                return OpenedHttpResponse(error=last_pre_header)
             continue
 
         connect_ms = timing.snapshot().connect_ms

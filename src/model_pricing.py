@@ -1,8 +1,8 @@
 """模型 Token 费用估算。
 
-价格目录来自 LiteLLM ``model_prices_and_context_window.json``。运行时先加载
-随仓库提供的本地快照，再用远端目录异步刷新并写入 data 目录缓存；远端不可用
-不会影响请求处理。
+价格与供应商模型 ID 来自 models.dev ``api.json``，``models.json`` 仅用于
+校验规范模型身份并建立无歧义的裸模型别名。运行时先加载随仓库提供的本地快照，
+再异步刷新两份远端目录并原子写入 data 缓存；远端不可用不会影响请求处理。
 
 当前 ``request_log`` 的 input_tokens 已扣除 cache_read_tokens，因此四类 Token
 可直接分别计价。旧日志若无法确认这一口径，由 log_db 标记为未计价，不能再从
@@ -12,41 +12,36 @@ input 中猜测扣减缓存命中。
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import math
 import os
-import re
+import tempfile
 import threading
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
 from . import config
 
 TICKS_PER_USD = 10_000_000_000
-_DEFAULT_SOURCE_URL = (
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
-    "model_prices_and_context_window.json"
-)
+_DEFAULT_SOURCE_URL = "https://models.dev/api.json"
+_DEFAULT_MODELS_URL = "https://models.dev/models.json"
 _BUNDLED_PATH = os.path.join(
-    os.path.dirname(__file__), "resources", "model_prices_and_context_window.json"
+    os.path.dirname(__file__), "resources", "models_dev_catalog.json.gz"
 )
-_CACHE_FILENAME = "model_pricing.json"
+_CACHE_FILENAME = "models_dev_catalog.json.gz"
 _MAX_REMOTE_CATALOG_BYTES = 16 * 1024 * 1024
-_DATE_SUFFIX_RE = re.compile(r"(?:-\d{8}|-\d{4}-\d{2}-\d{2})$")
-_ABOVE_TOKEN_RE = re.compile(r"_above_(\d+)([kKmM])_tokens(?:_priority)?$")
-_PROVIDER_PREFIXES = (
-    "openai/",
-    "anthropic/",
-    "xai/",
-    "gemini/",
-    "google/",
-    "vertex_ai/",
-    "azure/",
-    "bedrock/",
-    "litellm_proxy/",
-)
+_MAX_BILLING_INTEGER = (1 << 63) - 1
+_PROVIDER_ALIASES = {
+    "claude": "anthropic",
+    "gemini": "google",
+    "vertex_ai": "google-vertex",
+    "bedrock": "amazon-bedrock",
+}
+_STANDARD_SERVICE_TIERS = {"default", "standard", "auto"}
+_PRIORITY_SERVICE_TIERS = {"priority", "fast"}
 
 
 @dataclass(frozen=True)
@@ -72,6 +67,7 @@ class PricingEntry:
     priority_above_cache_read_per_token: float | None = None
     fast_multiplier: float = 1.0
     cache_write_1h_per_token: float | None = None
+    cache_write_ttl_ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +85,7 @@ class PricingSettings:
     enabled: bool
     aliases: Mapping[str, str]
     overrides: Mapping[str, PricingEntry]
+    channel_providers: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -101,6 +98,7 @@ class NormalizedBilling:
     """
 
     usage_observed: bool = False
+    usage_invalid: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_tokens: int = 0
@@ -111,11 +109,15 @@ class NormalizedBilling:
 
 _lock = threading.RLock()
 _catalog: dict[str, PricingEntry] = {}
+_catalog_aliases: dict[str, str] = {}
+_catalog_providers: set[str] = set()
 _initialized = False
 _catalog_source = "none"
 
 
 def _nonnegative_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -125,194 +127,328 @@ def _nonnegative_float(value: Any) -> float | None:
     return result
 
 
-def _positive_int(value: Any) -> int | None:
-    try:
-        result = int(value)
-    except (TypeError, ValueError):
+def _catalog_number(value: Any) -> float | None:
+    """Accept only finite JSON numbers from the models.dev schema."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return result if result > 0 else None
+    return _nonnegative_float(value)
 
 
-def _above_token_price(
-    raw: Mapping[str, Any],
-    field: str,
-    *,
-    priority: bool,
-) -> tuple[int, float] | None:
-    """Read the highest explicit ``above_Nk_tokens`` tariff for one field."""
-
-    prefix = f"{field}_above_"
-    suffix = "_priority" if priority else ""
-    candidates: list[tuple[int, float]] = []
-    for key, value in raw.items():
-        key_text = str(key)
-        if not key_text.startswith(prefix) or not key_text.endswith(suffix):
-            continue
-        if not priority and key_text.endswith("_priority"):
-            continue
-        match = _ABOVE_TOKEN_RE.search(key_text)
-        price = _nonnegative_float(value)
-        if match is not None and price is not None:
-            scale = 1_000 if match.group(2).lower() == "k" else 1_000_000
-            candidates.append((int(match.group(1)) * scale, price))
-    return max(candidates, default=None, key=lambda item: item[0])
+def _catalog_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
 
 
-def _entry_from_litellm(raw: Any) -> PricingEntry | None:
+def _strict_nonnegative_int(value: Any) -> int | None:
+    """Parse one billing integer without coercing corruption to zero."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed < 0 or parsed > _MAX_BILLING_INTEGER:
+        return None
+    return parsed
+
+
+def _entry_from_models_dev(raw: Any) -> PricingEntry | None:
+    """Parse one models.dev API model entry (prices are USD / 1M tokens)."""
+
     if not isinstance(raw, Mapping):
         return None
-    # A malformed numeric field invalidates this model only.  In particular,
-    # never let +/-Inf silently become a default multiplier or poison Decimal.
-    numeric_fields = (
-        "input_cost_per_token", "output_cost_per_token",
-        "cache_creation_input_token_cost", "cache_read_input_token_cost",
-        "input_cost_per_token_priority", "output_cost_per_token_priority",
-        "cache_creation_input_token_cost_priority",
-        "cache_read_input_token_cost_priority",
-        "long_context_input_cost_multiplier",
-        "long_context_output_cost_multiplier",
-        "long_context_input_token_threshold",
-        "cache_creation_input_token_cost_above_1hr",
-    )
-    for field in numeric_fields:
-        if field in raw and raw.get(field) is not None:
-            value = _nonnegative_float(raw.get(field))
-            if value is None:
-                return None
-    for field, value in raw.items():
-        field_name = str(field)
-        is_numeric_tariff = (
-            "cost_per_token" in field_name
-            or field_name.endswith("_cost_multiplier")
-            or field_name.endswith("_token_threshold")
-        )
-        if is_numeric_tariff and value is not None and _nonnegative_float(value) is None:
-            return None
-    provider_specific = raw.get("provider_specific_entry")
-    if isinstance(provider_specific, Mapping) and provider_specific.get("fast") is not None:
-        fast = _nonnegative_float(provider_specific.get("fast"))
-        if fast is None:
-            return None
-    input_price = _nonnegative_float(raw.get("input_cost_per_token"))
-    output_price = _nonnegative_float(raw.get("output_cost_per_token"))
-    # 只有图片价、按次价等条目不能被误当作 $0 的 Token 模型。
-    if input_price is None or output_price is None:
+    cost = raw.get("cost")
+    if not isinstance(cost, Mapping):
         return None
-    cache_write = _nonnegative_float(raw.get("cache_creation_input_token_cost"))
-    cache_read = _nonnegative_float(raw.get("cache_read_input_token_cost"))
-    all_explicit_thresholds: set[int] = set()
-    for key in raw:
-        match = _ABOVE_TOKEN_RE.search(str(key))
-        if match is not None:
-            scale = 1_000 if match.group(2).lower() == "k" else 1_000_000
-            all_explicit_thresholds.add(int(match.group(1)) * scale)
-    if len(all_explicit_thresholds) > 1:
-        return None
-    above_fields = {
-        "input": _above_token_price(raw, "input_cost_per_token", priority=False),
-        "output": _above_token_price(raw, "output_cost_per_token", priority=False),
-        "cache_write": _above_token_price(
-            raw, "cache_creation_input_token_cost", priority=False
-        ),
-        "cache_read": _above_token_price(
-            raw, "cache_read_input_token_cost", priority=False
-        ),
-        "priority_input": _above_token_price(
-            raw, "input_cost_per_token", priority=True
-        ),
-        "priority_output": _above_token_price(
-            raw, "output_cost_per_token", priority=True
-        ),
-        "priority_cache_write": _above_token_price(
-            raw, "cache_creation_input_token_cost", priority=True
-        ),
-        "priority_cache_read": _above_token_price(
-            raw, "cache_read_input_token_cost", priority=True
-        ),
-    }
-    thresholds = [item[0] for item in above_fields.values() if item is not None]
-    declared_threshold = _positive_int(raw.get("long_context_input_token_threshold"))
-    if declared_threshold is not None:
-        thresholds.append(declared_threshold)
-    # The current catalog uses one threshold per model.  If it ever grows
-    # multiple tiers (or conflicts with the declared threshold), fail this
-    # model closed instead of silently selecting the wrong tariff with a
-    # single-tier data structure.
-    if len(set(thresholds)) > 1:
-        return None
-    threshold = min(thresholds) if thresholds else 0
 
-    def above(name: str) -> float | None:
-        item = above_fields[name]
-        return item[1] if item is not None and item[0] == threshold else None
+    numeric_cost_fields = (
+        "input", "output", "cache_write", "cache_read",
+        "reasoning", "input_audio", "output_audio",
+    )
+    if any(
+        field in cost and _catalog_number(cost.get(field)) is None
+        for field in numeric_cost_fields
+    ):
+        return None
+    input_per_million = _catalog_number(cost.get("input"))
+    output_per_million = _catalog_number(cost.get("output"))
+    # Image/video/per-request-only entries cannot become fake zero-cost token models.
+    if input_per_million is None or output_per_million is None:
+        return None
+    # The attempt ledger currently retains aggregate input/output tokens only.
+    # A catalog entry that bills reasoning or audio at a different rate needs
+    # a token-dimension split we do not have, so estimating it would be false
+    # precision. Entries whose specialist rate equals the aggregate rate are
+    # safe because the split cannot change the total.
+    for special, aggregate in (
+        ("reasoning", output_per_million),
+        ("input_audio", input_per_million),
+        ("output_audio", output_per_million),
+    ):
+        if special in cost and _catalog_number(cost.get(special)) != aggregate:
+            return None
+
+    def per_token(value: Any, fallback: float | None = None) -> float | None:
+        parsed = _catalog_number(value)
+        return fallback if parsed is None else parsed / 1_000_000
+
+    input_price = input_per_million / 1_000_000
+    output_price = output_per_million / 1_000_000
+    cache_write = per_token(cost.get("cache_write"), input_price)
+    cache_read = per_token(cost.get("cache_read"), input_price)
+
+    tiers_raw = cost.get("tiers", [])
+    if tiers_raw is None:
+        tiers_raw = []
+    if not isinstance(tiers_raw, list):
+        return None
+    context_tiers: list[tuple[int, Mapping[str, Any]]] = []
+    for item in tiers_raw:
+        if not isinstance(item, Mapping) or not isinstance(item.get("tier"), Mapping):
+            return None
+        tier_meta = item["tier"]
+        if tier_meta.get("type") != "context":
+            return None
+        threshold = _catalog_positive_int(tier_meta.get("size"))
+        if threshold is None:
+            return None
+        if any(
+            field in item and _catalog_number(item.get(field)) is None
+            for field in (
+                "input", "output", "cache_write", "cache_read",
+                "reasoning", "input_audio", "output_audio",
+            )
+        ):
+            return None
+        if _catalog_number(item.get("input")) is None or _catalog_number(
+            item.get("output")
+        ) is None:
+            return None
+        for special, aggregate_field in (
+            ("reasoning", "output"),
+            ("input_audio", "input"),
+            ("output_audio", "output"),
+        ):
+            if (
+                special in item
+                and _catalog_number(item.get(special))
+                != _catalog_number(item.get(aggregate_field))
+            ):
+                return None
+        context_tiers.append((threshold, item))
+    # The settlement schema intentionally represents one request-wide context
+    # threshold. Multiple models.dev context tiers must remain unpriced rather
+    # than being flattened into a plausible but wrong tariff.
+    if len(context_tiers) > 1:
+        return None
+
+    legacy_above = cost.get("context_over_200k")
+    if legacy_above is not None and not isinstance(legacy_above, Mapping):
+        return None
+    tier_threshold = 0
+    tier_cost: Mapping[str, Any] | None = None
+    if context_tiers:
+        tier_threshold, tier_cost = context_tiers[0]
+    elif isinstance(legacy_above, Mapping):
+        tier_threshold, tier_cost = 200_000, legacy_above
+    if tier_cost is not None and any(
+        field in tier_cost and _catalog_number(tier_cost.get(field)) is None
+        for field in (
+            "input", "output", "cache_write", "cache_read",
+            "reasoning", "input_audio", "output_audio",
+        )
+    ):
+        return None
+    if tier_cost is not None:
+        for special, aggregate_field in (
+            ("reasoning", "output"),
+            ("input_audio", "input"),
+            ("output_audio", "output"),
+        ):
+            if (
+                special in tier_cost
+                and _catalog_number(tier_cost.get(special))
+                != _catalog_number(tier_cost.get(aggregate_field))
+            ):
+                return None
+
+    modes = raw.get("experimental", {})
+    modes = modes.get("modes", {}) if isinstance(modes, Mapping) else {}
+    fast = modes.get("fast") if isinstance(modes, Mapping) else None
+    fast_cost = fast.get("cost") if isinstance(fast, Mapping) else None
+    if fast_cost is not None and not isinstance(fast_cost, Mapping):
+        return None
+    if isinstance(fast_cost, Mapping) and any(
+        field in fast_cost and _catalog_number(fast_cost.get(field)) is None
+        for field in (
+            "input", "output", "cache_write", "cache_read",
+            "reasoning", "input_audio", "output_audio",
+        )
+    ):
+        return None
+    if isinstance(fast_cost, Mapping):
+        fast_input_raw = _catalog_number(fast_cost.get("input"))
+        fast_output_raw = _catalog_number(fast_cost.get("output"))
+        if fast_input_raw is None or fast_output_raw is None:
+            return None
+        for special, aggregate in (
+            ("reasoning", fast_output_raw),
+            ("input_audio", fast_input_raw),
+            ("output_audio", fast_output_raw),
+        ):
+            if special in fast_cost and _catalog_number(fast_cost.get(special)) != aggregate:
+                return None
+
+    def tier_price(field: str, fallback: float) -> float | None:
+        if tier_cost is None:
+            return None
+        return per_token(tier_cost.get(field), fallback)
+
+    def fast_price(field: str, fallback: float) -> float | None:
+        if not isinstance(fast_cost, Mapping):
+            return None
+        return per_token(fast_cost.get(field), fallback)
+
+    fast_input = fast_price("input", input_price)
+    fast_output = fast_price("output", output_price)
+    fast_input_fallback = fast_input if fast_input is not None else input_price
+    fast_cache_write = fast_price("cache_write", fast_input_fallback)
+    fast_cache_read = fast_price("cache_read", fast_input_fallback)
 
     return PricingEntry(
         input_per_token=input_price,
         output_per_token=output_price,
-        # 缺少专用缓存价时按普通输入价估算，宁可保守也不把已用 Token 算成 0。
-        cache_write_per_token=input_price if cache_write is None else cache_write,
-        cache_read_per_token=input_price if cache_read is None else cache_read,
-        priority_input_per_token=_nonnegative_float(raw.get("input_cost_per_token_priority")),
-        priority_output_per_token=_nonnegative_float(raw.get("output_cost_per_token_priority")),
-        priority_cache_write_per_token=_nonnegative_float(
-            raw.get("cache_creation_input_token_cost_priority")
+        cache_write_per_token=cache_write if cache_write is not None else input_price,
+        cache_read_per_token=cache_read if cache_read is not None else input_price,
+        priority_input_per_token=fast_input,
+        priority_output_per_token=fast_output,
+        priority_cache_write_per_token=fast_cache_write,
+        priority_cache_read_per_token=fast_cache_read,
+        long_context_input_threshold=tier_threshold,
+        above_input_per_token=tier_price("input", input_price),
+        above_output_per_token=tier_price("output", output_price),
+        above_cache_write_per_token=tier_price(
+            "cache_write", cache_write if cache_write is not None else input_price
         ),
-        priority_cache_read_per_token=_nonnegative_float(
-            raw.get("cache_read_input_token_cost_priority")
+        above_cache_read_per_token=tier_price(
+            "cache_read", cache_read if cache_read is not None else input_price
         ),
-        long_context_input_threshold=threshold,
-        long_context_input_multiplier=(
-            _nonnegative_float(raw.get("long_context_input_cost_multiplier")) or 1.0
+        # models.dev fast mode is an exact replacement tariff, not a multiplier.
+        # Keep the same fast tariff above a context threshold unless the source
+        # eventually publishes an explicit fast-context tier.
+        priority_above_input_per_token=fast_input if tier_threshold else None,
+        priority_above_output_per_token=fast_output if tier_threshold else None,
+        priority_above_cache_write_per_token=(
+            fast_cache_write if tier_threshold else None
         ),
-        long_context_output_multiplier=(
-            _nonnegative_float(raw.get("long_context_output_cost_multiplier")) or 1.0
-        ),
-        above_input_per_token=above("input"),
-        above_output_per_token=above("output"),
-        above_cache_write_per_token=above("cache_write"),
-        above_cache_read_per_token=above("cache_read"),
-        priority_above_input_per_token=above("priority_input"),
-        priority_above_output_per_token=above("priority_output"),
-        priority_above_cache_write_per_token=above("priority_cache_write"),
-        priority_above_cache_read_per_token=above("priority_cache_read"),
-        fast_multiplier=(
-            _nonnegative_float(
-                (raw.get("provider_specific_entry") or {}).get("fast")
-                if isinstance(raw.get("provider_specific_entry"), Mapping)
-                else None
-            )
-            or 1.0
-        ),
-        cache_write_1h_per_token=_nonnegative_float(
-            raw.get("cache_creation_input_token_cost_above_1hr")
+        priority_above_cache_read_per_token=(fast_cache_read if tier_threshold else None),
+        # Anthropic usage combines 5-minute and 1-hour cache writes, while
+        # models.dev currently publishes one cache_write tariff. request_log
+        # does not retain the TTL split, so aggregated cache writes must fail
+        # closed instead of assuming every write used the cheaper TTL.
+        cache_write_ttl_ambiguous=bool(
+            str(raw.get("family") or "").lower().startswith("claude")
+            and "cache_write" in cost
         ),
     )
 
 
-def _parse_catalog(payload: Any) -> dict[str, PricingEntry]:
-    if not isinstance(payload, Mapping):
-        raise ValueError("pricing catalog must be a JSON object")
+def _parse_models_dev_catalog(
+    api_payload: Any,
+    models_payload: Any,
+) -> tuple[dict[str, PricingEntry], dict[str, str], set[str]]:
+    if not isinstance(api_payload, Mapping) or not isinstance(models_payload, Mapping):
+        raise ValueError("models.dev catalogs must be JSON objects")
     parsed: dict[str, PricingEntry] = {}
-    for model, raw in payload.items():
-        if not isinstance(model, str) or not model.strip():
+    aliases: dict[str, str] = {}
+    providers: set[str] = set()
+    raw_model_targets: dict[str, set[str]] = {}
+
+    for provider_key, provider_raw in api_payload.items():
+        if not isinstance(provider_key, str) or not isinstance(provider_raw, Mapping):
             continue
-        entry = _entry_from_litellm(raw)
-        if entry is not None:
-            parsed[model.strip().lower()] = entry
+        provider = provider_key.strip().lower()
+        models = provider_raw.get("models")
+        if not provider or not isinstance(models, Mapping):
+            continue
+        providers.add(provider)
+        provider_id_aliases: dict[str, str | None] = {}
+        for model_key, raw in models.items():
+            if not isinstance(model_key, str) or not model_key.strip():
+                continue
+            model = model_key.strip().lower()
+            entry = _entry_from_models_dev(raw)
+            if entry is None:
+                continue
+            target = f"{provider}/{model}"
+            parsed[target] = entry
+            raw_model_targets.setdefault(model, set()).add(target)
+            raw_id = raw.get("id") if isinstance(raw, Mapping) else None
+            if isinstance(raw_id, str) and raw_id.strip():
+                raw_id_normalized = raw_id.strip().lower()
+                raw_model_targets.setdefault(raw_id_normalized, set()).add(target)
+                alias = f"{provider}/{raw_id_normalized}"
+                previous = provider_id_aliases.get(alias)
+                provider_id_aliases[alias] = target if previous in (None, target) else ""
+        for alias, target in provider_id_aliases.items():
+            if target and alias not in parsed:
+                aliases[alias] = target
+
+    for canonical_key in models_payload:
+        if not isinstance(canonical_key, str) or "/" not in canonical_key:
+            continue
+        lab, model = canonical_key.strip().lower().split("/", 1)
+        canonical_target = f"{lab}/{model}"
+        direct_target = (
+            canonical_target
+            if canonical_target in parsed
+            else aliases.get(canonical_target, "")
+        )
+        targets = raw_model_targets.get(model, set())
+        # A bare model ID does not identify a serving provider. Only add the
+        # convenience alias when models.json confirms the canonical identity
+        # and api.json contains exactly one provider-price target for that raw
+        # ID. Otherwise callers must use <provider>/<Model ID> explicitly.
+        if len(targets) == 1:
+            sole_target = next(iter(targets))
+            if not direct_target or direct_target == sole_target:
+                aliases[model] = sole_target
+
     if not parsed:
         raise ValueError("pricing catalog contains no token-priced models")
-    return parsed
+    return parsed, aliases, providers
+
+
+def _parse_catalog(
+    api_payload: Any,
+    models_payload: Any,
+) -> dict[str, PricingEntry]:
+    """Test/helper compatibility: return the parsed models.dev price entries."""
+
+    return _parse_models_dev_catalog(api_payload, models_payload)[0]
 
 
 def _load_json(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as handle:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _catalog_payload_parts(payload: Any) -> tuple[Any, Any]:
+    if not isinstance(payload, Mapping) or payload.get("schema") != 1:
+        raise ValueError("invalid models.dev catalog bundle")
+    return payload.get("api"), payload.get("models")
 
 
 def initialize() -> None:
     """同步加载缓存或随包快照；不发网络请求，可安全放在 lifespan 启动阶段。"""
 
-    global _catalog, _initialized, _catalog_source
+    global _catalog, _catalog_aliases, _catalog_providers, _initialized, _catalog_source
     with _lock:
         if _initialized:
             return
@@ -323,11 +459,16 @@ def initialize() -> None:
         last_error: Exception | None = None
         for path, source in candidates:
             try:
-                parsed = _parse_catalog(_load_json(path))
+                api_payload, models_payload = _catalog_payload_parts(_load_json(path))
+                parsed, aliases, providers = _parse_models_dev_catalog(
+                    api_payload, models_payload
+                )
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 last_error = exc
                 continue
             _catalog = parsed
+            _catalog_aliases = aliases
+            _catalog_providers = providers
             _catalog_source = source
             _initialized = True
             return
@@ -335,9 +476,11 @@ def initialize() -> None:
 
 
 def reset_for_tests() -> None:
-    global _catalog, _initialized, _catalog_source
+    global _catalog, _catalog_aliases, _catalog_providers, _initialized, _catalog_source
     with _lock:
         _catalog = {}
+        _catalog_aliases = {}
+        _catalog_providers = set()
         _initialized = False
         _catalog_source = "none"
 
@@ -403,10 +546,22 @@ def settings(cfg: Mapping[str, Any] | None = None) -> PricingSettings:
             entry = _entry_from_override(raw)
             if entry is not None:
                 overrides[model.strip().lower()] = entry
+    channel_providers_raw = pricing_cfg.get("channelProviders", {})
+    channel_providers: dict[str, str] = {}
+    if isinstance(channel_providers_raw, Mapping):
+        for channel_key, provider in channel_providers_raw.items():
+            if (
+                isinstance(channel_key, str)
+                and isinstance(provider, str)
+                and channel_key.strip()
+                and provider.strip()
+            ):
+                channel_providers[channel_key.strip().lower()] = provider.strip().lower()
     return PricingSettings(
         enabled=bool(pricing_cfg.get("enabled", True)),
         aliases=aliases,
         overrides=overrides,
+        channel_providers=channel_providers,
     )
 
 
@@ -416,34 +571,51 @@ def _model_candidates(model: str, aliases: Mapping[str, str]) -> list[str]:
         return []
     normalized = aliases.get(normalized, normalized)
     candidates: list[str] = [normalized]
-    for prefix in _PROVIDER_PREFIXES:
-        if normalized.startswith(prefix):
-            candidates.append(normalized[len(prefix) :])
-            break
-    # 日期后缀只作为 exact miss 后的保守 fallback；不做任意 family 模糊匹配。
-    for item in tuple(candidates):
-        stripped = _DATE_SUFFIX_RE.sub("", item)
-        if stripped and stripped != item:
-            candidates.append(stripped)
+    if "/" in normalized:
+        provider, remainder = normalized.split("/", 1)
+        mapped_provider = _PROVIDER_ALIASES.get(provider)
+        if mapped_provider:
+            candidates.append(f"{mapped_provider}/{remainder}")
+    # Never strip provider or dated-version segments. models.dev prices are
+    # provider/model specific; a plausible fallback can silently select a
+    # different upstream tariff. Custom variants require an explicit alias.
     return list(dict.fromkeys(candidates))
 
 
-def provider_pricing_model(model: str, channel_key: str | None = None) -> str:
-    """Return the provider-qualified pricing key when routing proves provider.
-
-    Bare Grok names are ambiguous in a shared catalog.  An xAI channel is
-    authoritative, so qualify it before alias/date fallback resolution.
-    """
+def provider_pricing_model(
+    model: str,
+    channel_key: str | None = None,
+    *,
+    pricing_settings: PricingSettings | None = None,
+) -> str:
+    """Qualify a provider Model ID only when the route proves its provider."""
 
     normalized = str(model or "").strip()
+    if not normalized:
+        return normalized
+    current = pricing_settings or settings()
+    explicit_alias = current.aliases.get(normalized.lower())
+    if explicit_alias:
+        # An explicit alias is already a complete pricing lookup decision and
+        # therefore takes precedence over automatic route qualification.
+        return explicit_alias
+    if normalized.lower() in current.overrides:
+        # A user-supplied tariff is already an explicit pricing decision. Do
+        # not make a naked override unreachable merely because the channel is
+        # also mapped to a models.dev provider.
+        return normalized
     channel = str(channel_key or "").strip().lower()
-    if normalized and "/" not in normalized and (
-        channel.startswith("oauth:xai:")
-        or channel == "xai"
-        or channel.startswith("xai:")
-        or channel.startswith("api:xai:")
-    ):
-        return f"xai/{normalized}"
+    provider = ""
+    parts = channel.split(":", 2)
+    if len(parts) >= 2 and parts[0] == "oauth":
+        provider = parts[1]
+    else:
+        provider = current.channel_providers.get(channel, "")
+    provider = _PROVIDER_ALIASES.get(provider, provider)
+    if provider:
+        if normalized.lower().startswith(f"{provider}/"):
+            return normalized
+        return f"{provider}/{normalized}"
     return normalized
 
 
@@ -452,11 +624,6 @@ def resolve_price(
     *,
     pricing_settings: PricingSettings | None = None,
 ) -> tuple[str, PricingEntry] | None:
-    if not _initialized:
-        try:
-            initialize()
-        except Exception:
-            return None
     current = pricing_settings or settings()
     if not current.enabled:
         return None
@@ -465,11 +632,23 @@ def resolve_price(
         override = current.overrides.get(candidate)
         if override is not None:
             return candidate, override
+    # Explicit overrides remain usable even if a packaged/cache catalog is
+    # unavailable. Only catalog-backed resolution depends on initialization.
+    if not _initialized:
+        try:
+            initialize()
+        except Exception:
+            return None
     with _lock:
         for candidate in candidates:
             entry = _catalog.get(candidate)
             if entry is not None:
                 return candidate, entry
+            target = _catalog_aliases.get(candidate)
+            if target:
+                entry = _catalog.get(target)
+                if entry is not None:
+                    return target, entry
     return None
 
 
@@ -495,6 +674,8 @@ def has_ambiguous_cache_write_ttl(
     if resolved is None:
         return False
     entry = resolved[1]
+    if entry.cache_write_ttl_ambiguous:
+        return True
     one_hour = entry.cache_write_1h_per_token
     return bool(
         one_hour is not None
@@ -504,9 +685,18 @@ def has_ambiguous_cache_write_ttl(
 
 
 def _ticks(tokens: int, price_per_token: float) -> int:
-    token_count = max(0, int(tokens or 0))
-    value = Decimal(token_count) * Decimal(str(price_per_token)) * Decimal(TICKS_PER_USD)
-    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    token_count = _strict_nonnegative_int(tokens)
+    price = _nonnegative_float(price_per_token)
+    if token_count is None or price is None:
+        raise ValueError("invalid billing component")
+    try:
+        value = Decimal(token_count) * Decimal(str(price)) * Decimal(TICKS_PER_USD)
+        result = int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, OverflowError, ValueError) as exc:
+        raise ValueError("billing component exceeds numeric limits") from exc
+    if result < 0 or result > _MAX_BILLING_INTEGER:
+        raise ValueError("billing component exceeds SQLite integer range")
+    return result
 
 
 def _effective_price(
@@ -552,7 +742,39 @@ def _effective_price(
     return base
 
 
-def estimate_cost(
+def priority_from_service_tier(value: Any) -> bool | None:
+    """Map a proven upstream tier to standard/priority, else fail closed.
+
+    ``None`` means the provider exposed a tier whose tariff models.dev does not
+    describe (for example ``flex``), not that the request was standard.
+    """
+
+    if value is None:
+        return False
+    normalized = str(value).strip().lower()
+    if not normalized or normalized in _STANDARD_SERVICE_TIERS:
+        return False
+    if normalized in _PRIORITY_SERVICE_TIERS:
+        return True
+    return None
+
+
+def _has_priority_tariff(entry: PricingEntry) -> bool:
+    return bool(
+        entry.fast_multiplier > 1
+        or any(
+            value is not None
+            for value in (
+                entry.priority_input_per_token,
+                entry.priority_output_per_token,
+                entry.priority_cache_write_per_token,
+                entry.priority_cache_read_per_token,
+            )
+        )
+    )
+
+
+def estimate_cost_with_snapshot(
     model: str,
     *,
     input_tokens: int = 0,
@@ -562,27 +784,49 @@ def estimate_cost(
     priority: bool = False,
     long_context: bool | None = None,
     pricing_settings: PricingSettings | None = None,
-) -> CostEstimate | None:
+) -> tuple[CostEstimate, str, str] | None:
+    """Resolve once and return a cost plus the exact immutable tariff snapshot."""
+
+    parsed_tokens = tuple(
+        _strict_nonnegative_int(value)
+        for value in (
+            input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+        )
+    )
+    if any(value is None for value in parsed_tokens):
+        return None
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = (
+        int(value) for value in parsed_tokens
+    )
     resolved = resolve_price(model, pricing_settings=pricing_settings)
     if resolved is None:
         return None
     pricing_model, entry = resolved
+    # A proven priority/fast request needs an explicit replacement tariff.
+    # Falling back to standard prices would be a plausible-looking undercount.
+    if priority and not _has_priority_tariff(entry):
+        return None
     # Anthropic exposes different 5-minute and 1-hour cache-write tariffs,
     # while request_log currently retains only their combined token count.
     # Returning a precise-looking estimate would silently choose the wrong
     # tariff for one of the two cases, so fail closed for those requests.
     if (
-        max(0, int(cache_creation_tokens or 0)) > 0
-        and has_ambiguous_cache_write_ttl(
-            pricing_model, pricing_settings=pricing_settings
+        cache_creation_tokens > 0
+        and (
+            entry.cache_write_ttl_ambiguous
+            or (
+                entry.cache_write_1h_per_token is not None
+                and entry.cache_write_1h_per_token > 0
+                and abs(entry.cache_write_1h_per_token - entry.cache_write_per_token) > 1e-18
+            )
         )
     ):
         return None
     prompt_tokens = (
-        max(0, int(input_tokens or 0))
-        + max(0, int(cache_creation_tokens or 0))
-        + max(0, int(cache_read_tokens or 0))
+        input_tokens + cache_creation_tokens + cache_read_tokens
     )
+    if prompt_tokens > _MAX_BILLING_INTEGER:
+        return None
     use_long_context = (
         bool(long_context)
         if long_context is not None
@@ -619,25 +863,64 @@ def estimate_cost(
         long_context=use_long_context,
         input_side=True,
     )
-    input_ticks = _ticks(input_tokens, input_price)
-    output_ticks = _ticks(output_tokens, output_price)
-    cache_write_ticks = _ticks(cache_creation_tokens, cache_write_price)
-    cache_read_ticks = _ticks(cache_read_tokens, cache_read_price)
-    return CostEstimate(
-        total_ticks=input_ticks + output_ticks + cache_write_ticks + cache_read_ticks,
+    try:
+        input_ticks = _ticks(input_tokens, input_price)
+        output_ticks = _ticks(output_tokens, output_price)
+        cache_write_ticks = _ticks(cache_creation_tokens, cache_write_price)
+        cache_read_ticks = _ticks(cache_read_tokens, cache_read_price)
+    except ValueError:
+        return None
+    total_ticks = input_ticks + output_ticks + cache_write_ticks + cache_read_ticks
+    if total_ticks > _MAX_BILLING_INTEGER:
+        return None
+    estimate = CostEstimate(
+        total_ticks=total_ticks,
         input_ticks=input_ticks,
         output_ticks=output_ticks,
         cache_write_ticks=cache_write_ticks,
         cache_read_ticks=cache_read_ticks,
         pricing_model=pricing_model,
     )
+    snapshot = {
+        "schema": 1,
+        "model": pricing_model,
+        "priority": bool(priority),
+        "long_context": use_long_context,
+        "input_per_token": input_price,
+        "output_per_token": output_price,
+        "cache_write_per_token": cache_write_price,
+        "cache_read_per_token": cache_read_price,
+        "long_context_threshold": entry.long_context_input_threshold,
+    }
+    raw = json.dumps(
+        snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    version = "pricing-v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return estimate, raw, version
 
 
-def _safe_nonnegative_int(value: Any) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError, OverflowError):
-        return 0
+def estimate_cost(
+    model: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    priority: bool = False,
+    long_context: bool | None = None,
+    pricing_settings: PricingSettings | None = None,
+) -> CostEstimate | None:
+    settled = estimate_cost_with_snapshot(
+        model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+        priority=priority,
+        long_context=long_context,
+        pricing_settings=pricing_settings,
+    )
+    return settled[0] if settled is not None else None
 
 
 def _strict_response_objects(response_body: Any):
@@ -714,6 +997,8 @@ def _billing_candidates(obj: Mapping[str, Any]):
 
 def normalize_response_billing(response_body: Any) -> NormalizedBilling:
     observed = False
+    usage_invalid = False
+    tier_invalid = False
     input_tokens = output_tokens = cache_creation = cache_read = 0
     service_tier: str | None = None
     actual_ticks: int | None = None
@@ -723,8 +1008,13 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
             tier = candidate.get("service_tier")
             if isinstance(tier, str) and tier.strip():
                 service_tier = tier.strip().lower()
+            elif "service_tier" in candidate and tier is not None:
+                tier_invalid = True
+            if "usage" not in candidate:
+                continue
             usage = candidate.get("usage")
             if not isinstance(usage, Mapping):
+                usage_invalid = True
                 continue
             token_fields = {
                 "input_tokens", "prompt_tokens", "output_tokens",
@@ -732,46 +1022,114 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                 "cache_read_tokens", "cache_creation_input_tokens",
                 "cache_creation_tokens",
             }
-            if any(field in usage for field in token_fields):
-                observed = True
-            # Presence, not truthiness, controls replacement so explicit zero is
-            # retained while Anthropic message_start/message_delta can merge.
-            if "input_tokens" in usage or "prompt_tokens" in usage:
-                prompt = _safe_nonnegative_int(
-                    usage.get("input_tokens", usage.get("prompt_tokens", 0))
+            has_token_fields = any(field in usage for field in token_fields)
+            if has_token_fields:
+                valid = True
+                next_input = input_tokens
+                next_output = output_tokens
+                next_cache_creation = cache_creation
+                next_cache_read = cache_read
+
+                has_prompt = "input_tokens" in usage or "prompt_tokens" in usage
+                details_obj = None
+                details_present = False
+                if "input_tokens_details" in usage:
+                    details_present = True
+                    details_obj = usage.get("input_tokens_details")
+                elif "prompt_tokens_details" in usage:
+                    details_present = True
+                    details_obj = usage.get("prompt_tokens_details")
+                if details_present and not isinstance(details_obj, Mapping):
+                    valid = False
+
+                cached_from_details = 0
+                if isinstance(details_obj, Mapping) and "cached_tokens" in details_obj:
+                    parsed = _strict_nonnegative_int(details_obj.get("cached_tokens"))
+                    if parsed is None:
+                        valid = False
+                    else:
+                        cached_from_details = parsed
+
+                cache_read_present = bool(
+                    "cache_read_input_tokens" in usage
+                    or "cache_read_tokens" in usage
+                    or (isinstance(details_obj, Mapping) and "cached_tokens" in details_obj)
+                    or has_prompt
                 )
-                details = usage.get("input_tokens_details")
-                if not isinstance(details, Mapping):
-                    details = usage.get("prompt_tokens_details")
-                cached = _safe_nonnegative_int(
-                    details.get("cached_tokens", 0) if isinstance(details, Mapping) else 0
-                )
-                cache_read = _safe_nonnegative_int(
-                    usage.get("cache_read_input_tokens", usage.get("cache_read_tokens", cached))
-                )
-                cache_creation = _safe_nonnegative_int(
-                    usage.get("cache_creation_input_tokens", usage.get("cache_creation_tokens", 0))
-                )
-                # OpenAI prompt/input totals include cached tokens; Anthropic
-                # exposes cache fields beside an uncached input count.
-                is_openai_shape = "prompt_tokens" in usage or isinstance(
-                    usage.get("input_tokens_details"), Mapping
-                )
-                input_tokens = max(0, prompt - cache_read) if is_openai_shape else prompt
-            if "output_tokens" in usage or "completion_tokens" in usage:
-                output_tokens = _safe_nonnegative_int(
-                    usage.get("output_tokens", usage.get("completion_tokens", 0))
-                )
+                if "cache_read_input_tokens" in usage:
+                    parsed_cache_read = _strict_nonnegative_int(
+                        usage.get("cache_read_input_tokens")
+                    )
+                elif "cache_read_tokens" in usage:
+                    parsed_cache_read = _strict_nonnegative_int(usage.get("cache_read_tokens"))
+                else:
+                    parsed_cache_read = cached_from_details
+                if cache_read_present:
+                    if parsed_cache_read is None:
+                        valid = False
+                    else:
+                        next_cache_read = parsed_cache_read
+
+                if "cache_creation_input_tokens" in usage:
+                    parsed_cache_creation = _strict_nonnegative_int(
+                        usage.get("cache_creation_input_tokens")
+                    )
+                elif "cache_creation_tokens" in usage:
+                    parsed_cache_creation = _strict_nonnegative_int(
+                        usage.get("cache_creation_tokens")
+                    )
+                else:
+                    parsed_cache_creation = cache_creation
+                if parsed_cache_creation is None:
+                    valid = False
+                else:
+                    next_cache_creation = parsed_cache_creation
+
+                if has_prompt:
+                    prompt = _strict_nonnegative_int(
+                        usage.get("input_tokens", usage.get("prompt_tokens"))
+                    )
+                    if prompt is None:
+                        valid = False
+                    else:
+                        # OpenAI prompt/input totals include cached tokens;
+                        # Anthropic exposes cache fields beside uncached input.
+                        is_openai_shape = "prompt_tokens" in usage or isinstance(
+                            usage.get("input_tokens_details"), Mapping
+                        )
+                        if is_openai_shape and next_cache_read > prompt:
+                            valid = False
+                        else:
+                            next_input = prompt - next_cache_read if is_openai_shape else prompt
+
+                if "output_tokens" in usage or "completion_tokens" in usage:
+                    parsed_output = _strict_nonnegative_int(
+                        usage.get("output_tokens", usage.get("completion_tokens"))
+                    )
+                    if parsed_output is None:
+                        valid = False
+                    else:
+                        next_output = parsed_output
+
+                if valid:
+                    input_tokens = next_input
+                    output_tokens = next_output
+                    cache_creation = next_cache_creation
+                    cache_read = next_cache_read
+                    observed = True
+                    usage_invalid = False
+                else:
+                    usage_invalid = True
             if allow_actual_cost and "cost_in_usd_ticks" in usage:
-                try:
-                    value = int(usage.get("cost_in_usd_ticks"))
-                except (TypeError, ValueError, OverflowError):
-                    value = -1
-                if value >= 0:
+                value = _strict_nonnegative_int(usage.get("cost_in_usd_ticks"))
+                if value is not None:
                     actual_ticks = value
+                else:
+                    usage_invalid = True
 
     return NormalizedBilling(
-        usage_observed=observed,
+        usage_observed=bool(observed and not usage_invalid and not tier_invalid),
+        usage_invalid=bool(usage_invalid or tier_invalid),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_creation_tokens=cache_creation,
@@ -779,6 +1137,70 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
         service_tier=service_tier,
         actual_cost_ticks=actual_ticks,
     )
+
+
+def preserve_billing_evidence_tail(
+    response_text: str,
+    *,
+    usage: Mapping[str, Any] | None,
+    usage_observed: bool,
+    service_tier: str | None,
+    actual_cost_ticks: int | None,
+    event_type: str | None,
+    max_chars: int = 200_000,
+) -> str:
+    """Bound a WS transcript without discarding already-parsed billing facts.
+
+    A single terminal frame can exceed the log-body limit. Blindly keeping its
+    final characters may remove ``service_tier`` or xAI's official cost field
+    from the beginning of that same JSON object. Append a compact, explicitly
+    marked protocol-shaped evidence line only when truncation is necessary.
+    """
+
+    raw = str(response_text or "")
+    limit = max(1, int(max_chars))
+    if len(raw) <= limit:
+        return raw
+
+    response: dict[str, Any] = {}
+    tier = str(service_tier or "").strip().lower()
+    if tier:
+        response["service_tier"] = tier
+    usage_obj: dict[str, Any] = {}
+    if usage_observed and isinstance(usage, Mapping):
+        uncached = _strict_nonnegative_int(usage.get("input_tokens")) or 0
+        cached = _strict_nonnegative_int(
+            usage.get("cache_read", usage.get("cache_read_tokens"))
+        ) or 0
+        usage_obj.update({
+            "input_tokens": uncached + cached,
+            "output_tokens": _strict_nonnegative_int(usage.get("output_tokens")) or 0,
+            "input_tokens_details": {"cached_tokens": cached},
+            "cache_creation_tokens": _strict_nonnegative_int(
+                usage.get("cache_creation", usage.get("cache_creation_tokens"))
+            ) or 0,
+        })
+    actual = _strict_nonnegative_int(actual_cost_ticks)
+    if actual is not None:
+        usage_obj["cost_in_usd_ticks"] = actual
+    if usage_obj:
+        response["usage"] = usage_obj
+
+    if response:
+        typ = str(event_type or "response.in_progress").strip().lower()
+        if typ not in {
+            "response.completed", "response.failed", "response.incomplete",
+            "response.in_progress",
+        }:
+            typ = "response.in_progress"
+        evidence = json.dumps({
+            "type": typ,
+            "response": response,
+            "_parrot_truncated_billing_evidence": True,
+        }, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if len(evidence) + 1 < limit:
+            return raw[-(limit - len(evidence) - 1):] + "\n" + evidence
+    return raw[-limit:]
 
 
 def resolved_pricing_snapshot(
@@ -793,47 +1215,17 @@ def resolved_pricing_snapshot(
     pricing_settings: PricingSettings | None = None,
 ) -> tuple[str | None, str | None]:
     """Freeze the exact tariff inputs used by one immutable settlement."""
-    resolved = resolve_price(model, pricing_settings=pricing_settings)
-    if resolved is None:
-        return None, None
-    pricing_model, entry = resolved
-    prompt_tokens = sum(max(0, int(v or 0)) for v in (
-        input_tokens, cache_creation_tokens, cache_read_tokens,
-    ))
-    use_long_context = (
-        bool(long_context) if long_context is not None else bool(
-            entry.long_context_input_threshold > 0
-            and prompt_tokens > entry.long_context_input_threshold
-        )
+    settled = estimate_cost_with_snapshot(
+        model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+        priority=priority,
+        long_context=long_context,
+        pricing_settings=pricing_settings,
     )
-    snapshot = {
-        "schema": 1,
-        "model": pricing_model,
-        "priority": bool(priority),
-        "long_context": use_long_context,
-        "input_per_token": _effective_price(
-            entry, "input_per_token", priority=priority,
-            long_context=use_long_context, input_side=True,
-        ),
-        "output_per_token": _effective_price(
-            entry, "output_per_token", priority=priority,
-            long_context=use_long_context, input_side=False,
-        ),
-        "cache_write_per_token": _effective_price(
-            entry, "cache_write_per_token", priority=priority,
-            long_context=use_long_context, input_side=True,
-        ),
-        "cache_read_per_token": _effective_price(
-            entry, "cache_read_per_token", priority=priority,
-            long_context=use_long_context, input_side=True,
-        ),
-        "long_context_threshold": entry.long_context_input_threshold,
-    }
-    raw = json.dumps(
-        snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False,
-    )
-    version = "pricing-v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return raw, version
+    return (settled[1], settled[2]) if settled is not None else (None, None)
 
 
 def extract_actual_cost_ticks(response_body: Any) -> int | None:
@@ -843,7 +1235,7 @@ def extract_actual_cost_ticks(response_body: Any) -> int | None:
 
 
 async def refresh_once() -> bool:
-    """从远端刷新目录并原子落盘；失败时保留当前目录。"""
+    """Refresh both models.dev catalogs and atomically replace one gzip bundle."""
 
     pricing_cfg = config.get().get("pricing", {})
     if (
@@ -853,47 +1245,81 @@ async def refresh_once() -> bool:
     ):
         return False
     url = str(pricing_cfg.get("sourceUrl") or _DEFAULT_SOURCE_URL).strip()
-    if not url.startswith("https://"):
-        raise ValueError("pricing.sourceUrl must use https://")
+    models_url = str(pricing_cfg.get("modelsUrl") or _DEFAULT_MODELS_URL).strip()
+    if not url.startswith("https://") or not models_url.startswith("https://"):
+        raise ValueError("pricing.sourceUrl and pricing.modelsUrl must use https://")
     from . import upstream
 
-    response = await upstream.get_client().get(url, timeout=20.0)
-    response.raise_for_status()
-    raw_payload = response.content
-    if len(raw_payload) > _MAX_REMOTE_CATALOG_BYTES:
-        raise ValueError(
-            f"pricing catalog exceeds {_MAX_REMOTE_CATALOG_BYTES} bytes"
-        )
+    client = upstream.get_client()
+    api_response, models_response = await asyncio.gather(
+        client.get(url, timeout=20.0),
+        client.get(models_url, timeout=20.0),
+    )
+    api_response.raise_for_status()
+    models_response.raise_for_status()
+    raw_api = api_response.content
+    raw_models = models_response.content
+    if (
+        len(raw_api) > _MAX_REMOTE_CATALOG_BYTES
+        or len(raw_models) > _MAX_REMOTE_CATALOG_BYTES
+        or len(raw_api) + len(raw_models) > _MAX_REMOTE_CATALOG_BYTES
+    ):
+        raise ValueError(f"models.dev catalogs exceed {_MAX_REMOTE_CATALOG_BYTES} bytes")
     cache_path = os.path.join(config.DATA_DIR, _CACHE_FILENAME)
 
-    def parse_and_store() -> dict[str, PricingEntry]:
-        payload = json.loads(raw_payload)
-        parsed_catalog = _parse_catalog(payload)
+    def parse_and_store() -> tuple[dict[str, PricingEntry], dict[str, str], set[str]]:
+        api_payload = json.loads(raw_api)
+        models_payload = json.loads(raw_models)
+        parsed_catalog, aliases, providers = _parse_models_dev_catalog(
+            api_payload, models_payload
+        )
         # 防止上游异常页或被截断的小对象覆盖可用缓存。
-        if len(parsed_catalog) < 100:
+        if len(parsed_catalog) < 500 or len(models_payload) < 100:
             raise ValueError(
                 f"pricing catalog unexpectedly small: {len(parsed_catalog)}"
             )
-        tmp_path = f"{cache_path}.tmp"
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(cache_path)}.",
+            suffix=".tmp",
+            dir=os.path.dirname(cache_path),
+        )
         try:
-            with open(tmp_path, "wb") as handle:
-                handle.write(raw_payload)
+            bundle = json.dumps(
+                {"schema": 1, "api": api_payload, "models": models_payload},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                with gzip.GzipFile(
+                    fileobj=handle, mode="wb", compresslevel=9, mtime=0
+                ) as zipped:
+                    zipped.write(bundle)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_path, cache_path)
         finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
             except OSError:
                 pass
-        return parsed_catalog
+        return parsed_catalog, aliases, providers
 
-    parsed = await asyncio.to_thread(parse_and_store)
-    global _catalog, _catalog_source, _initialized
+    parsed, aliases, providers = await asyncio.to_thread(parse_and_store)
+    global _catalog, _catalog_aliases, _catalog_providers, _catalog_source, _initialized
     with _lock:
         _catalog = parsed
+        _catalog_aliases = aliases
+        _catalog_providers = providers
         _catalog_source = "remote"
         _initialized = True
     return True
@@ -921,4 +1347,9 @@ async def refresh_loop() -> None:
 
 def catalog_status() -> dict[str, Any]:
     with _lock:
-        return {"source": _catalog_source, "models": len(_catalog)}
+        return {
+            "source": _catalog_source,
+            "models": len(_catalog),
+            "aliases": len(_catalog_aliases),
+            "providers": len(_catalog_providers),
+        }

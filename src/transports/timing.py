@@ -534,6 +534,12 @@ class HttpAttemptTiming(UpstreamRoundTiming):
         "http11.send_request_body",
         "http2.send_request_body",
     }
+    _DISPATCH_EVENTS = {
+        "http11.send_request_headers",
+        "http2.send_request_headers",
+        "http11.send_request_body",
+        "http2.send_request_body",
+    }
     _RESPONSE_HEADERS_EVENTS = {
         "http11.receive_response_headers",
         "http2.receive_response_headers",
@@ -547,6 +553,7 @@ class HttpAttemptTiming(UpstreamRoundTiming):
         round_id: str | None = None,
         clock: Clock = time.monotonic,
         wall_clock: WallClock = time.time,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> None:
         request_mode: RoundMode = (
             "http_stream" if response_mode == "stream" else "http_non_stream"
@@ -559,6 +566,12 @@ class HttpAttemptTiming(UpstreamRoundTiming):
             clock=clock,
             wall_clock=wall_clock,
         )
+        self._on_dispatch = on_dispatch
+        self._dispatch_started = False
+
+    @property
+    def dispatch_started(self) -> bool:
+        return self._dispatch_started
 
     @staticmethod
     def _split_event(name: str) -> tuple[str, str] | None:
@@ -578,6 +591,14 @@ class HttpAttemptTiming(UpstreamRoundTiming):
         now = self._clock()
         if state == "started":
             self._phase_started[event] = now
+            if event in self._DISPATCH_EVENTS and not self._dispatch_started:
+                self._dispatch_started = True
+                if self._on_dispatch is not None:
+                    try:
+                        self._on_dispatch()
+                    except Exception:
+                        # Billing diagnostics must never break the proxy path.
+                        pass
             return
 
         started = self._phase_started.pop(event, None)

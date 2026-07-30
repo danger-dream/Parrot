@@ -513,13 +513,20 @@ def fmt_cost(metrics: dict | None) -> str:
     if isinstance(pricing_cfg, dict) and not bool(pricing_cfg.get("enabled", True)):
         return "已关闭"
     data = metrics if isinstance(metrics, dict) else {}
-    ticks = max(0, int(data.get("cost_ticks") or 0))
-    actual_ticks = max(0, int(data.get("actual_cost_ticks") or 0))
-    estimated_ticks = max(0, int(data.get("estimated_cost_ticks") or 0))
-    costed = max(0, int(data.get("costed_success") or 0))
-    actual_count = max(0, int(data.get("actual_costed_success") or 0))
-    estimated_count = max(0, int(data.get("estimated_costed_success") or 0))
-    unpriced = max(0, int(data.get("unpriced_success") or 0))
+
+    def nonnegative_int(name: str) -> int:
+        try:
+            return max(0, int(data.get(name) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    ticks = nonnegative_int("cost_ticks")
+    actual_ticks = nonnegative_int("actual_cost_ticks")
+    estimated_ticks = nonnegative_int("estimated_cost_ticks")
+    costed = nonnegative_int("costed_success")
+    actual_count = nonnegative_int("actual_costed_success")
+    estimated_count = nonnegative_int("estimated_costed_success")
+    unpriced = nonnegative_int("unpriced_success")
     if costed <= 0:
         return f"未计价（{unpriced} 次）" if unpriced else "$0.00"
     amount = fmt_usd(Decimal(ticks) / Decimal(10_000_000_000))
@@ -544,15 +551,26 @@ def fmt_usd(value) -> str:
         amount = Decimal(str(value or 0))
     except (InvalidOperation, TypeError, ValueError):
         amount = Decimal(0)
-    amount = max(Decimal(0), amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if not amount.is_finite() or amount < 0:
+        amount = Decimal(0)
+    try:
+        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        amount = Decimal(0)
     return f"${amount:,.2f}"
+
+
+def cost_metrics_from_row(row: dict | None) -> dict:
+    """Return one request's immutable/fallback cost metrics."""
+    from .. import log_db
+
+    return log_db.cost_for_log(row)
 
 
 def fmt_cost_from_row(row: dict | None) -> str:
     """Format one request row's actual/estimated cost."""
-    from .. import log_db
 
-    return fmt_cost(log_db.cost_for_log(row))
+    return fmt_cost(cost_metrics_from_row(row))
 
 
 def fmt_ms(ms) -> str:
@@ -880,15 +898,27 @@ def fmt_log_entry_body(r: dict) -> str:
             ch_line += " · ★亲和"
         lines.append(ch_line)
 
-    # Token
-    if r.get("status") == "success":
+    # Token / billing. Failed attempts can still be billed, so surface an
+    # immutable actual/estimated/unpriced fact even when request_log has no
+    # final-response Token summary.
+    row_status = r.get("status")
+    cost_metrics = (
+        cost_metrics_from_row(r)
+        if row_status in ("success", "error", "cancelled") else {}
+    )
+    if row_status == "success":
         inp = prompt_total_from_row(r)
         cr = r.get("cache_read_tokens") or 0
         tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
         if cr > 0:
             tok += f" · {fmt_cache_phrase_from_row(r)}"
-        tok += f" · 💵 {fmt_cost_from_row(r)}"
+        tok += f" · 💵 {fmt_cost(cost_metrics)}"
         lines.append(f"  Token: {tok}")
+    elif row_status in ("error", "cancelled") and (
+        int(cost_metrics.get("costed_success") or 0) > 0
+        or int(cost_metrics.get("unpriced_success") or 0) > 0
+    ):
+        lines.append(f"  计费: 💵 {fmt_cost(cost_metrics)}")
 
     # 耗时
     timing_parts: list[str] = []

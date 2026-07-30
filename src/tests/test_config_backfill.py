@@ -134,7 +134,9 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["pricing"]["enabled"] is True
             assert cfg["pricing"]["autoUpdate"] is True
             assert cfg["pricing"]["refreshHours"] == 24
-            assert cfg["pricing"]["sourceUrl"].startswith("https://")
+            assert cfg["pricing"]["sourceUrl"] == "https://models.dev/api.json"
+            assert cfg["pricing"]["modelsUrl"] == "https://models.dev/models.json"
+            assert cfg["pricing"]["channelProviders"] == {}
             assert cfg["pricing"]["aliases"] == {}
             assert cfg["pricing"]["overrides"] == {}
 
@@ -146,3 +148,21 @@ def test_old_config_file_is_backfilled_with_new_defaults():
         config._cache = None
         config._mtime = 0
         config.reload()
+
+
+def test_pricing_source_migration_only_rewrites_the_former_builtin_default():
+    legacy = {
+        "pricing": {
+            "sourceUrl": (
+                "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+                "model_prices_and_context_window.json"
+            )
+        }
+    }
+    assert config._normalize_pricing_sources(legacy) is True
+    assert legacy["pricing"]["sourceUrl"] == "https://models.dev/api.json"
+    assert legacy["pricing"]["modelsUrl"] == "https://models.dev/models.json"
+
+    custom = {"pricing": {"sourceUrl": "https://example.test/models-dev-api.json"}}
+    assert config._normalize_pricing_sources(custom) is False
+    assert custom["pricing"]["sourceUrl"] == "https://example.test/models-dev-api.json"

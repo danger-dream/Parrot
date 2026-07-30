@@ -311,8 +311,10 @@
   "pricing": {
     "enabled": true,
     "autoUpdate": true,
-    "sourceUrl": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    "sourceUrl": "https://models.dev/api.json",
+    "modelsUrl": "https://models.dev/models.json",
     "refreshHours": 24,
+    "channelProviders": {},
     "aliases": {},
     "overrides": {}
   },

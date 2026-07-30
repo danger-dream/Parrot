@@ -702,17 +702,24 @@ def _render_detail(detail: dict) -> str:
     if fast_badge:
         lines.append(f"模式：{fast_badge}")
 
+    cost_row = dict(log)
+    stored_detail = detail.get("detail") or {}
+    if isinstance(stored_detail, dict):
+        cost_row["response_body"] = stored_detail.get("response_body")
+    cost_metrics = log_db.cost_for_log(cost_row)
+
     if status == "success":
         lines.extend(["", "<b>Tokens</b>"])
         token_line = f"↑ {ui.fmt_tokens(ui.prompt_total_from_row(log))} | ↓ {ui.fmt_tokens(log.get('output_tokens'))}"
-        cost_row = dict(log)
-        stored_detail = detail.get("detail") or {}
-        if isinstance(stored_detail, dict):
-            cost_row["response_body"] = stored_detail.get("response_body")
         if (log.get("cache_read_tokens") or 0) > 0:
             token_line += f" | {ui.fmt_cache_phrase_from_row(log)}"
-        token_line += f" | 💵 {ui.fmt_cost_from_row(cost_row)}"
+        token_line += f" | 💵 {ui.fmt_cost(cost_metrics)}"
         lines.append(token_line)
+    elif status in ("error", "cancelled") and (
+        int(cost_metrics.get("costed_success") or 0) > 0
+        or int(cost_metrics.get("unpriced_success") or 0) > 0
+    ):
+        lines.extend(["", "<b>计费</b>", f"💵 {ui.fmt_cost(cost_metrics)}"])
 
     lines.extend(["", "<b>请求总览</b>"])
     if log.get("final_round_id"):

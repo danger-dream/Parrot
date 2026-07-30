@@ -2736,14 +2736,18 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
             .timestamp()
         )
         ts = log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=month_start)
-        if ts and ts["total"] > 0:
+        if ts and any(
+            int(ts.get(name) or 0) > 0
+            for name in (
+                "total", "input", "output", "cache_creation", "cache_read",
+                "costed_success", "unpriced_success",
+            )
+        ):
             prompt = cache_display.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
             line = f"💎 月度统计: ↑ {cache_display.fmt_tokens(prompt)} · ↓ {cache_display.fmt_tokens(ts['output'])}"
             if (ts.get("cache_read") or 0) > 0:
-                line += (
-                    f" · {cache_display.cache_read_phrase(ts['cache_read'], prompt)}"
-                    f" · 💵 {telegram_ui.fmt_cost(ts)}"
-                )
+                line += f" · {cache_display.cache_read_phrase(ts['cache_read'], prompt)}"
+            line += f" · 💵 {telegram_ui.fmt_cost(ts)}"
             parts.append(line)
     except Exception as exc:
         print(f"[oauth] monthly stats lookup failed: {exc}")

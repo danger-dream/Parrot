@@ -85,8 +85,10 @@ def _section_overall(overall: dict) -> str:
     max_tps = overall.get("max_tps")
     min_tps = overall.get("min_tps")
 
-    token_line = (f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
-                  f" | 💵 {_fmt_cost(overall)}")
+    token_line = f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
+    if raw_cr > 0:
+        token_line += f" | {ui.fmt_cache_phrase(raw_cr, total_inp)}"
+    token_line += f" | 💵 {_fmt_cost(overall)}"
 
     lines = [
         "<b>Tokens:</b>",
@@ -222,7 +224,7 @@ def _summary_dim_block(title: str, groups: list[dict], render_key,
         )
         if cr > 0:
             line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
-        line += f" · {_fmt_cost(m)}"
+        line += f" · 💵 {_fmt_cost(m)}"
         out.append(line)
         if extra_line is not None:
             extra = extra_line(g["key"])
