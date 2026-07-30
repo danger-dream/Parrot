@@ -249,6 +249,12 @@ async def lifespan(app: FastAPI):
     upstream.create_client()
     try:
         model_pricing.initialize()
+        migrated = model_metadata.migrate_legacy_config()
+        if migrated["bindings"] or migrated["compression"]:
+            print(
+                "[Metadata] migrated legacy config: "
+                f"bindings={migrated['bindings']} compression={migrated['compression']}"
+            )
     except Exception as exc:
         # 金额统计是旁路能力，价格表异常不能阻断代理启动；后台刷新仍会继续尝试恢复。
         print(f"[Pricing] local catalog load failed: {exc}")
@@ -607,20 +613,15 @@ def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
         return None
     if getattr(ch, "protocol", "anthropic") == "anthropic":
         return None
-    model_candidates = []
-    for candidate in (resolved_model, body.get("model")):
-        name = str(candidate or "").strip()
-        if name and name not in model_candidates:
-            model_candidates.append(name)
-    metadata_model = ""
-    safe_limit = None
-    for name in model_candidates:
-        limit = model_metadata.safe_prompt_limit(name)
-        if limit is not None and limit > 0:
-            metadata_model = name
-            safe_limit = limit
-            break
-    if not metadata_model or safe_limit is None:
+    metadata_model = str(
+        body.get("_client_visible_model") or body.get("model") or ""
+    ).strip()
+    safe_limit = model_metadata.safe_prompt_limit(
+        metadata_model,
+        scope_key=str(getattr(ch, "key", "") or ""),
+        outbound_model=str(resolved_model or ""),
+    )
+    if not metadata_model or safe_limit is None or safe_limit <= 0:
         return None
     prompt_tokens = token_counter.count_request_tokens(body, model=metadata_model)
     if prompt_tokens <= safe_limit:
@@ -953,6 +954,7 @@ async def proxy_messages(request: Request):
         model_mapping.apply_mapping(body, "anthropic")
 
     model = body.get("model")
+    body["_client_visible_model"] = str(model or "").strip()
     explicit_context_1m = request_wants_context_1m(
         body,
         downstream_betas=downstream_betas,

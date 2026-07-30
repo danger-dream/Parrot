@@ -480,6 +480,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     )
     model_mapping.apply_default(body, _ingress_line)
     model_mapping.apply_mapping(body, _ingress_line)
+    body["_client_visible_model"] = str(body.get("model") or "").strip()
 
     # 3. model 白名单
     model = body.get("model")

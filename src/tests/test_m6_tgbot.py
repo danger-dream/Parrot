@@ -249,6 +249,12 @@ def test_apikey_cache_stats_include_cost(m):
         pricing = c.setdefault("pricing", {})
         pricing["enabled"] = True
         pricing.setdefault("channelProviders", {})["api:Priced"] = "openai"
+        c["modelBindings"] = {
+            "defaults": {
+                "gpt-5.6-sol": {"target": "openai/gpt-5.6-sol", "source": "test"},
+            },
+            "scoped": {},
+        }
 
     m["config"].update(configure_priced_key)
     ld = m["log_db"]

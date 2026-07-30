@@ -12,14 +12,50 @@ unchanged during the migration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 
+_MAX_USAGE_INTEGER = (1 << 63) - 1
+
+
 def _to_int(value: Any) -> int:
+    """Legacy permissive conversion retained for non-ledger compatibility helpers."""
     try:
         return int(value or 0)
     except Exception:
         return 0
+
+
+def _strict_token(value: Any) -> int | None:
+    """Parse an upstream token count without coercing corruption to zero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed < 0 or parsed > _MAX_USAGE_INTEGER:
+        return None
+    return parsed
+
+
+def _strict_fields(usage_obj: Any, names: tuple[str, ...]) -> tuple[dict[str, int], bool, bool]:
+    """Return parsed present fields, whether usage was observed, and validity."""
+    if not isinstance(usage_obj, dict):
+        return {}, False, usage_obj is None
+    present = {name: usage_obj[name] for name in names if name in usage_obj}
+    if not present:
+        return {}, False, True
+    parsed: dict[str, int] = {}
+    for name, value in present.items():
+        token = _strict_token(value)
+        if token is None:
+            return {}, False, False
+        parsed[name] = token
+    return parsed, True, True
 
 
 @dataclass
@@ -42,84 +78,168 @@ class Usage:
 
 
 class UsageAccumulator:
-    """Mutable usage accumulator with protocol-specific update helpers."""
+    """Mutable strict usage accumulator with an independent observation fact."""
 
     def __init__(self) -> None:
         self.usage = Usage()
+        self.usage_observed = False
+        self.usage_invalid = False
+        self._input_observed = False
+        self._output_observed = False
 
     def legacy_dict(self) -> dict[str, int]:
         return self.usage.to_legacy_dict()
 
-    def set_from_anthropic_json_usage(self, usage_obj: Any) -> None:
-        u = usage_obj if isinstance(usage_obj, dict) else {}
-        self.usage = Usage(
-            input_tokens=_to_int(u.get("input_tokens")),
-            output_tokens=_to_int(u.get("output_tokens")),
-            cache_write_tokens=_to_int(u.get("cache_creation_input_tokens")),
-            cache_read_tokens=_to_int(u.get("cache_read_input_tokens")),
-            raw=dict(u),
+    def _reject(self) -> None:
+        self.usage_invalid = True
+        self.usage_observed = False
+
+    def _refresh_observed(self) -> None:
+        self.usage_observed = bool(
+            not self.usage_invalid and self._input_observed and self._output_observed
         )
 
+    def set_from_anthropic_json_usage(self, usage_obj: Any) -> None:
+        names = (
+            "input_tokens", "output_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+        parsed, observed, valid = _strict_fields(usage_obj, names)
+        if not valid:
+            self._reject()
+            return
+        if not observed:
+            return
+        u = usage_obj
+        self.usage = Usage(
+            input_tokens=parsed.get("input_tokens", 0),
+            output_tokens=parsed.get("output_tokens", 0),
+            cache_write_tokens=parsed.get("cache_creation_input_tokens", 0),
+            cache_read_tokens=parsed.get("cache_read_input_tokens", 0),
+            raw=dict(u),
+        )
+        self._input_observed = "input_tokens" in parsed
+        self._output_observed = "output_tokens" in parsed
+        self._refresh_observed()
+
     def update_from_anthropic_message_start(self, usage_obj: Any) -> None:
-        u = usage_obj if isinstance(usage_obj, dict) else {}
-        self.usage.input_tokens = _to_int(u.get("input_tokens"))
-        self.usage.cache_write_tokens = _to_int(u.get("cache_creation_input_tokens"))
-        self.usage.cache_read_tokens = _to_int(u.get("cache_read_input_tokens"))
-        self.usage.raw = dict(u)
+        names = (
+            "input_tokens", "output_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+        parsed, observed, valid = _strict_fields(usage_obj, names)
+        if not valid:
+            self._reject()
+            return
+        if not observed:
+            return
+        self.usage.input_tokens = parsed.get("input_tokens", 0)
+        self.usage.output_tokens = parsed.get("output_tokens", self.usage.output_tokens)
+        self.usage.cache_write_tokens = parsed.get("cache_creation_input_tokens", 0)
+        self.usage.cache_read_tokens = parsed.get("cache_read_input_tokens", 0)
+        self.usage.raw = dict(usage_obj)
+        self._input_observed = self._input_observed or "input_tokens" in parsed
+        self._output_observed = self._output_observed or "output_tokens" in parsed
+        self._refresh_observed()
 
     def update_from_anthropic_message_delta(self, usage_obj: Any) -> None:
-        u = usage_obj if isinstance(usage_obj, dict) else {}
-        if "output_tokens" in u:
-            self.usage.output_tokens = max(self.usage.output_tokens, _to_int(u.get("output_tokens")))
-        # Some Anthropic-compatible upstreams send input_tokens in message_delta
-        # while message_start had 0; others send zero-filled prompt/cache fields
-        # with output-only deltas. Preserve the largest cumulative value so a
-        # later zero cannot erase message_start accounting.
-        if "input_tokens" in u:
-            self.usage.input_tokens = max(self.usage.input_tokens, _to_int(u.get("input_tokens")))
-        if "cache_creation_input_tokens" in u:
+        names = (
+            "input_tokens", "output_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+        parsed, observed, valid = _strict_fields(usage_obj, names)
+        if not valid:
+            self._reject()
+            return
+        if not observed:
+            return
+        if "output_tokens" in parsed:
+            self.usage.output_tokens = max(self.usage.output_tokens, parsed["output_tokens"])
+        # Compatible providers sometimes repeat prompt/cache counters as zero in
+        # message_delta. Preserve the cumulative maximum from message_start.
+        if "input_tokens" in parsed:
+            self.usage.input_tokens = max(self.usage.input_tokens, parsed["input_tokens"])
+        if "cache_creation_input_tokens" in parsed:
             self.usage.cache_write_tokens = max(
-                self.usage.cache_write_tokens,
-                _to_int(u.get("cache_creation_input_tokens")),
+                self.usage.cache_write_tokens, parsed["cache_creation_input_tokens"],
             )
-        if "cache_read_input_tokens" in u:
+        if "cache_read_input_tokens" in parsed:
             self.usage.cache_read_tokens = max(
-                self.usage.cache_read_tokens,
-                _to_int(u.get("cache_read_input_tokens")),
+                self.usage.cache_read_tokens, parsed["cache_read_input_tokens"],
             )
-        if u:
-            self.usage.raw = dict(u)
+        self.usage.raw = dict(usage_obj)
+        self._input_observed = self._input_observed or "input_tokens" in parsed
+        self._output_observed = self._output_observed or "output_tokens" in parsed
+        self._refresh_observed()
 
-    def set_from_openai_chat_usage(self, usage_obj: Any) -> None:
-        u = usage_obj if isinstance(usage_obj, dict) else {}
-        details = u.get("prompt_tokens_details") or {}
-        completion_details = u.get("completion_tokens_details") or {}
-        prompt_total = _to_int(u.get("prompt_tokens"))
-        cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
-        reasoning = _to_int(completion_details.get("reasoning_tokens")) if isinstance(completion_details, dict) else 0
+    def _set_from_openai(self, usage_obj: Any, *, prompt_name: str, output_name: str,
+                         details_name: str, output_details_name: str) -> None:
+        names = (prompt_name, output_name)
+        parsed, observed, valid = _strict_fields(usage_obj, names)
+        if not valid:
+            self._reject()
+            return
+        if not isinstance(usage_obj, dict):
+            self._reject()
+            return
+        details = usage_obj.get(details_name, {})
+        output_details = usage_obj.get(output_details_name, {})
+        if details is None:
+            details = {}
+        if output_details is None:
+            output_details = {}
+        if not isinstance(details, dict) or not isinstance(output_details, dict):
+            self._reject()
+            return
+        cached = 0
+        if "cached_tokens" in details:
+            parsed_cached = _strict_token(details.get("cached_tokens"))
+            if parsed_cached is None:
+                self._reject()
+                return
+            cached = parsed_cached
+        reasoning = 0
+        if "reasoning_tokens" in output_details:
+            parsed_reasoning = _strict_token(output_details.get("reasoning_tokens"))
+            if parsed_reasoning is None:
+                self._reject()
+                return
+            reasoning = parsed_reasoning
+        if not observed:
+            return
+        if prompt_name not in parsed or output_name not in parsed:
+            self._reject()
+            return
+        prompt_total = parsed.get(prompt_name, 0)
+        if cached > prompt_total:
+            self._reject()
+            return
         self.usage = Usage(
-            input_tokens=max(0, prompt_total - cached),
-            output_tokens=_to_int(u.get("completion_tokens")),
+            input_tokens=prompt_total - cached,
+            output_tokens=parsed.get(output_name, 0),
             cache_read_tokens=cached,
             cache_write_tokens=0,
             reasoning_tokens=reasoning,
-            raw=dict(u),
+            raw=dict(usage_obj),
+        )
+        self._input_observed = True
+        self._output_observed = True
+        self._refresh_observed()
+
+    def set_from_openai_chat_usage(self, usage_obj: Any) -> None:
+        self._set_from_openai(
+            usage_obj,
+            prompt_name="prompt_tokens", output_name="completion_tokens",
+            details_name="prompt_tokens_details",
+            output_details_name="completion_tokens_details",
         )
 
     def set_from_openai_responses_usage(self, usage_obj: Any) -> None:
-        u = usage_obj if isinstance(usage_obj, dict) else {}
-        details = u.get("input_tokens_details") or {}
-        output_details = u.get("output_tokens_details") or {}
-        prompt_total = _to_int(u.get("input_tokens"))
-        cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
-        reasoning = _to_int(output_details.get("reasoning_tokens")) if isinstance(output_details, dict) else 0
-        self.usage = Usage(
-            input_tokens=max(0, prompt_total - cached),
-            output_tokens=_to_int(u.get("output_tokens")),
-            cache_read_tokens=cached,
-            cache_write_tokens=0,
-            reasoning_tokens=reasoning,
-            raw=dict(u),
+        self._set_from_openai(
+            usage_obj,
+            prompt_name="input_tokens", output_name="output_tokens",
+            details_name="input_tokens_details",
+            output_details_name="output_tokens_details",
         )
 
 
@@ -128,21 +248,40 @@ def zero_legacy_usage() -> dict[str, int]:
 
 
 def legacy_usage_from_anthropic_json(obj: Any) -> dict[str, int]:
-    acc = UsageAccumulator()
-    if isinstance(obj, dict):
-        acc.set_from_anthropic_json_usage(obj.get("usage") or {})
-    return acc.legacy_dict()
+    """Permissive compatibility extraction; ledger trackers are strict above."""
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    return {
+        "input_tokens": _to_int(usage.get("input_tokens")),
+        "output_tokens": _to_int(usage.get("output_tokens")),
+        "cache_creation": _to_int(usage.get("cache_creation_input_tokens")),
+        "cache_read": _to_int(usage.get("cache_read_input_tokens")),
+    }
 
 
 def legacy_usage_from_openai_chat_json(obj: Any) -> dict[str, int]:
-    acc = UsageAccumulator()
-    if isinstance(obj, dict):
-        acc.set_from_openai_chat_usage(obj.get("usage") or {})
-    return acc.legacy_dict()
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("prompt_tokens_details") or {}
+    cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    prompt = _to_int(usage.get("prompt_tokens"))
+    return {
+        "input_tokens": max(0, prompt - cached),
+        "output_tokens": _to_int(usage.get("completion_tokens")),
+        "cache_creation": 0,
+        "cache_read": cached,
+    }
 
 
 def legacy_usage_from_openai_responses_json(obj: Any) -> dict[str, int]:
-    acc = UsageAccumulator()
-    if isinstance(obj, dict):
-        acc.set_from_openai_responses_usage(obj.get("usage") or {})
-    return acc.legacy_dict()
+    usage = obj.get("usage") if isinstance(obj, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("input_tokens_details") or {}
+    cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    prompt = _to_int(usage.get("input_tokens"))
+    return {
+        "input_tokens": max(0, prompt - cached),
+        "output_tokens": _to_int(usage.get("output_tokens")),
+        "cache_creation": 0,
+        "cache_read": cached,
+    }

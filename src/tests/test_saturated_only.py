@@ -164,6 +164,69 @@ async def test_anth_saturated_only_queues_then_200(m):
     print("  [PASS] anthropic saturated-only → queue → 200")
 
 
+async def test_anth_saturated_failure_preserves_tracker_usage(m):
+    """排队拿到渠道后的失败结算也必须使用 tracker 的累计 usage。"""
+    _setup_anth(m)
+    from src import concurrency
+    _reset_slots(concurrency)
+    _set_concurrency_cfg(m["config"], enabled=True, queue_wait_s=10, default_max=0)
+    m["config"].update(
+        lambda c: c.setdefault("contentBlacklist", {}).__setitem__(
+            "default", ["content_policy_violation"]
+        )
+    )
+
+    payload = (
+        b'data: {"type":"message_start","message":{"id":"x","role":"assistant",'
+        b'"usage":{"input_tokens":100,"cache_creation_input_tokens":0,'
+        b'"cache_read_input_tokens":20}}}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+        b'"usage":{"input_tokens":0,"output_tokens":10,'
+        b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}\n\n'
+        b'data: {"type":"content_block_start","index":0,"content_block":'
+        b'{"type":"text","text":"content_policy_violation detected"}}\n\n'
+    )
+    router = MockRouter()
+    router.register(
+        "https://cha",
+        lambda r: httpx.Response(
+            200, content=payload, headers={"content-type": "text/event-stream"}
+        ),
+    )
+    chA = _make_anth_channel_with_max(m, "chA", "https://cha", max_concurrent=1)
+    _install_channels(m, [chA])
+    assert await concurrency.try_acquire("api:chA") is True
+
+    async def _free_after():
+        await asyncio.sleep(0.3)
+        concurrency.release("api:chA")
+
+    body = {
+        "model": "glm-5", "stream": True, "max_tokens": 50,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    free_task = asyncio.create_task(_free_after())
+    resp, rid, sr, mc = await _call_proxy_fixed(m, router, body)
+    await free_task
+
+    row = m["log_db"]._get_conn().execute(
+        """SELECT usage_observed, input_tokens, output_tokens,
+                  cache_creation_tokens, cache_read_tokens
+             FROM upstream_attempt_usage WHERE root_request_id=?""",
+        (rid,),
+    ).fetchone()
+    assert sr.candidates == [] and len(sr.saturated) == 1
+    assert resp.status_code == 503
+    assert row is not None
+    assert tuple(row) == (1, 100, 10, 0, 20), tuple(row)
+
+    m["config"].update(
+        lambda c: c.setdefault("contentBlacklist", {}).__setitem__("default", [])
+    )
+    await mc.aclose()
+    print("  [PASS] anthropic saturated failure preserves tracker usage")
+
+
 # ─── 用例 2：OpenAI 入口 saturated-only → 真 handler 排队成功 ─────
 async def test_oa_saturated_only_queues_then_200(m_oa):
     """OpenAI 入口走真 handler.handle，验证修复后 if not result 不再误判 503。"""
@@ -273,6 +336,7 @@ async def amain() -> int:
     print("── saturated-only 修复回归套件 ─────────────────────")
     tests = [
         ("anth_saturated_only", lambda: test_anth_saturated_only_queues_then_200(m_anth)),
+        ("anth_saturated_usage", lambda: test_anth_saturated_failure_preserves_tracker_usage(m_anth)),
         ("oa_saturated_only", lambda: test_oa_saturated_only_queues_then_200(m_oa)),
         ("anth_no_channels_still_503", lambda: test_anth_no_channels_still_503(m_anth)),
         ("anth_queue_timeout_503", lambda: test_anth_saturated_queue_timeout_503(m_anth)),

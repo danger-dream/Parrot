@@ -1018,6 +1018,90 @@ async def test_guard_r2c_builtin_call_in_input(m):
     print("  [PASS] r2c guard: input contains file_search_call → 400")
 
 
+async def test_http_mapping_freezes_routed_logical_metadata_binding(m):
+    """A global alias must bind after mapping, before channel alias resolution."""
+    _setup(m)
+    _install_keys(m, _default_key())
+
+    external_alias = "grok-4.5"
+    logical_model = "routed-logical-model"
+    outbound_model = "vendor-outbound-model"
+
+    def _configure(cfg):
+        cfg["modelMapping"] = {"global": {external_alias: logical_model}}
+        cfg["modelBindings"] = {
+            "defaults": {
+                logical_model: {
+                    "target": "openai/gpt-5.4",
+                    "source": "test",
+                },
+            },
+            "scoped": {},
+        }
+        cfg["modelMetadata"] = {}
+
+    m["config"].update(_configure)
+
+    from src import model_pricing
+    model_pricing.reset_for_tests()
+    model_pricing.initialize()
+    external_canonical = model_pricing.canonical_official_model(external_alias)
+    assert external_canonical == "xai/grok-4.5"
+
+    router = MockRouter()
+
+    def _handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "chatcmpl-binding", "object": "chat.completion",
+            "created": 1, "model": outbound_model,
+            "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        })
+
+    router.register("https://binding.example", _handler)
+    channel = _make_openai_channel(
+        m, "binding", "https://binding.example",
+        protocol="openai-chat", real=outbound_model, alias=logical_model,
+    )
+    _install_channels(m, [channel])
+
+    resp, client = await _call_openai_handler(
+        m, router, "chat", {
+            "model": external_alias,
+            "stream": False,
+            "messages": [{"role": "user", "content": "ping"}],
+        },
+    )
+    try:
+        assert resp.status_code == 200
+        assert _captured_upstream_body(router)["model"] == outbound_model
+
+        conn = m["log_db"]._get_conn()
+        request_row = conn.execute(
+            "SELECT request_id, requested_model FROM request_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        attempt = conn.execute(
+            "SELECT * FROM retry_chain WHERE request_id=? ORDER BY attempt_order LIMIT 1",
+            (request_row["request_id"],),
+        ).fetchone()
+        assert request_row["requested_model"] == logical_model
+        assert attempt["dispatched_at"] is not None
+        assert attempt["model"] == outbound_model
+        assert attempt["client_visible_model"] == logical_model
+        assert attempt["binding_source"] == "metadata_default"
+        assert attempt["binding_pricing_key"] == "openai/gpt-5.4"
+        assert attempt["binding_pricing_key"] != external_canonical
+        frozen = json.loads(attempt["binding_json"])
+        assert frozen["dispatch"]["client_visible_model"] == logical_model
+        assert frozen["dispatch"]["outbound_model_id"] == outbound_model
+        assert frozen["tariff"] is not None
+    finally:
+        await client.aclose()
+
+
 # ─── 驱动 ────────────────────────────────────────────────────────
 
 
@@ -1043,6 +1127,7 @@ def main() -> int:
         _async(test_responses_to_chat_text),
         _async(test_responses_to_chat_function_call_roundtrip),
         _async(test_openai_responses_api_passthrough_preserves_background),
+        _async(test_http_mapping_freezes_routed_logical_metadata_binding),
         _async(test_guard_r2c_builtin_tool),
         _async(test_guard_r2c_previous_response_id_not_found),
         _async(test_guard_r2c_encrypted_reasoning_include),

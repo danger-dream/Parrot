@@ -465,6 +465,7 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     _ingress_line = "openai-responses"
     model_mapping.apply_default(body, _ingress_line)
     model_mapping.apply_mapping(body, _ingress_line)
+    body["_client_visible_model"] = str(body.get("model") or "").strip()
 
     model = body.get("model")
     if not model or not isinstance(model, str):
@@ -628,6 +629,9 @@ async def _run_ws_failover(
     queue_wait_s = float((cfg.get("concurrency") or {}).get("queueWaitSeconds", 30))
 
     affinity_hit = 1 if schedule_result.affinity_hit else 0
+    client_visible_model = str(
+        body.get("_client_visible_model") or body.get("model") or ""
+    ).strip()
     client_key = getattr(schedule_result, "client_key", None)
 
     pending = [
@@ -662,6 +666,8 @@ async def _run_ws_failover(
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
             proxy_name=attempt_proxy,
+            upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+            client_visible_model=client_visible_model,
         )
         if attempt_proxy:
             log_db.update_pending(request_id, proxy_name=attempt_proxy)
@@ -820,6 +826,8 @@ async def _run_ws_failover(
                 attempt_id = log_db.record_retry_attempt(
                     request_id, attempt_order, ch.key, ch.type, resolved_model,
                     time.time(), proxy_name=attempt_proxy,
+                    upstream_protocol=getattr(ch, "protocol", "openai-responses"),
+                    client_visible_model=client_visible_model,
                 )
                 try:
                     result = await _try_ws_channel(
@@ -917,6 +925,7 @@ async def _run_ws_failover(
         http_status=http_status,
         affinity_hit=affinity_hit,
         response_body=(last_result.response_text or None) if last_result else None,
+        usage=(last_result.usage if last_result else None),
         usage_observed=(last_result.usage_observed if last_result else None),
         upstream_protocol=(getattr(last_ch, "protocol", "openai-responses") if last_ch else None),
         upstream_transport=(last_result.upstream_transport if last_result and last_ch is not None else ("ws" if last_ch is not None else None)),
@@ -1170,6 +1179,7 @@ async def _try_ws_channel(
                         http_status=499,
                         affinity_hit=affinity_hit,
                         response_body=response_body,
+                        usage=usage,
                         usage_observed=usage_observed,
                         upstream_protocol=ch_proto,
                         upstream_transport="ws",
@@ -1490,6 +1500,7 @@ async def _try_sse_channel(
                     http_status=499,
                     affinity_hit=affinity_hit,
                     response_body=response_text or None,
+                    usage=usage,
                     usage_observed=normalized.usage_observed,
                     upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                     upstream_transport="sse",
@@ -1667,6 +1678,7 @@ async def _try_sse_channel(
                 http_status=result.http_status or _http_status_from_ws_outcome(result),
                 affinity_hit=affinity_hit,
                 response_body=result.response_text or None,
+                usage=result.usage,
                 usage_observed=result.usage_observed,
                 upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                 upstream_transport="sse",
@@ -1861,6 +1873,7 @@ async def _try_sse_channel(
                     http_status=499,
                     affinity_hit=affinity_hit,
                     response_body=result.response_text or None,
+                    usage=result.usage,
                     usage_observed=result.usage_observed,
                     upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                     upstream_transport="sse",
@@ -2080,6 +2093,7 @@ async def _relay_ws_session(
                 http_status=_http_status_from_ws_outcome(result),
                 affinity_hit=affinity_hit,
                 response_body=result.response_text or None,
+                usage=result.usage,
                 usage_observed=result.usage_observed,
                 upstream_protocol=getattr(ch, "protocol", "openai-responses"),
                 upstream_transport=result.upstream_transport,
@@ -2524,6 +2538,7 @@ async def _finalize_ws_attempt_after_accept(
         http_status=_http_status_from_ws_outcome(result),
         affinity_hit=affinity_hit,
         response_body=result.response_text or None,
+        usage=result.usage,
         usage_observed=result.usage_observed,
         upstream_protocol=getattr(ch, "protocol", "openai-responses"),
         upstream_transport=result.upstream_transport,

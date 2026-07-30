@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 from ._isolation import isolate
 
@@ -44,32 +47,28 @@ def _install_fake_tiktoken(monkeypatch, request):
     return calls
 
 
-def test_model_metadata_safe_limit_and_single_compression_model():
-    config.update(lambda c: c.__setitem__("modelMetadata", {}))
+def test_model_metadata_safe_limit_and_independent_compression_model():
+    config.update(lambda c: c.update({
+        "modelBindings": {"defaults": {}, "scoped": {}},
+        "compressionModel": "",
+        "modelMetadata": {},
+    }))
+    model_metadata.set_binding("gpt-5.5", "openai/gpt-5.5", source="test")
+    model_metadata.set_compression_model("gpt-5.5")
 
-    model_metadata.set_metadata(
-        "gpt-5.5",
-        {
-            "context": "273000",
-            "max_output": "64000",
-            "vision": "false",
-            "input_price": "1.25",
-            "compression": "true",
-            "reasoning": " LOW， high 、XHIGH; max ",
-            "default_reasoning": "xHIGH",
-        },
+    metadata = model_metadata.get_metadata("gpt-5.5")
+    assert model_metadata.context_window("gpt-5.5") == metadata["contextWindow"]
+    assert model_metadata.safe_prompt_limit("gpt-5.5") == (
+        metadata["contextWindow"] - 20000 - 20000
     )
-    assert model_metadata.context_window("gpt-5.5") == 273000
-    # Claude Code-compatible reserve: min(max_output, 20k) + 20k buffer.
-    assert model_metadata.safe_prompt_limit("gpt-5.5") == 273000 - 20000 - 20000
     assert model_metadata.get_compression_model() == "gpt-5.5"
-    meta = model_metadata.get_metadata("gpt-5.5")
-    assert meta["reasoningEfforts"] == ["low", "high", "xhigh", "max"]
-    assert meta["defaultReasoningEffort"] == "xhigh"
+    assert "inputPricePer1M" not in metadata
+    assert isinstance(metadata["cost"], dict)
 
-    model_metadata.set_metadata("deepseek-4v-pro", {"context": 1_000_000, "compression": True})
+    # Compact selection no longer mutates metadata/binding records.
+    model_metadata.set_compression_model("deepseek-4v-pro")
     assert model_metadata.get_compression_model() == "deepseek-4v-pro"
-    assert model_metadata.get_metadata("gpt-5.5").get("compressionModel") is False
+    assert model_metadata.resolve_binding("gpt-5.5").target == "openai/gpt-5.5"
 
 
 def test_model_metadata_default_reasoning_must_be_supported():
@@ -160,24 +159,25 @@ def test_image_base64_is_not_counted_as_text_tokens():
     assert token_counter.count_request_tokens(body, model="deepseek-v4-pro") < 100
 
 
-def test_deepseek_compression_model_can_fit_replayed_compact_shape():
-    config.update(
-        lambda c: c.__setitem__(
-            "modelMetadata",
-            {"deepseek-v4-pro": {"contextWindow": 700_000, "maxOutputTokens": 100_000, "compressionModel": True}},
-        )
-    )
+def test_bound_compression_model_can_fit_replayed_compact_shape():
+    config.update(lambda c: c.update({
+        "modelBindings": {
+            "defaults": {"gpt-5.5": {"target": "openai/gpt-5.5", "source": "test"}},
+            "scoped": {},
+        },
+        "compressionModel": "gpt-5.5",
+    }))
     body = {
         "model": "gpt-5.5",
         "messages": [{"role": "user", "content": "用户请求：请继续。" * 55_000}],
     }
     direct_body, _ = compact_rescue.sanitized_compact_base(body)
-    direct_body["model"] = "deepseek-v4-pro"
+    direct_body["model"] = "gpt-5.5"
     direct_body["stream"] = False
-    direct_body["max_tokens"] = model_metadata.summary_reserve_tokens("deepseek-v4-pro")
-    prompt_tokens = token_counter.count_request_tokens(direct_body, model="deepseek-v4-pro")
-    assert prompt_tokens < 660_000
-    assert model_metadata.can_fit_for_compact("deepseek-v4-pro", prompt_tokens)
+    direct_body["max_tokens"] = model_metadata.summary_reserve_tokens("gpt-5.5")
+    prompt_tokens = token_counter.count_request_tokens(direct_body, model="gpt-5.5")
+    assert prompt_tokens < model_metadata.context_window("gpt-5.5")
+    assert model_metadata.can_fit_for_compact("gpt-5.5", prompt_tokens)
 
 
 def test_compact_split_defaults_to_configured_token_chunks(monkeypatch):
@@ -237,6 +237,93 @@ def test_internal_compact_bodies_cap_output_budget():
     assert "max_output_tokens" not in segment
     assert reduce["max_tokens"] == compact_rescue.reduce_max_tokens()
     assert "max_output_tokens" not in reduce
+
+
+@pytest.mark.asyncio
+async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
+    import server
+    from src import model_pricing
+    from starlette.responses import JSONResponse
+
+    external_alias = "grok-4.5"
+    logical_model = "routed-logical-model"
+    outbound_model = "vendor-outbound-model"
+    config.update(lambda cfg: cfg.update({
+        "modelMapping": {"global": {external_alias: logical_model}},
+        "modelBindings": {
+            "defaults": {
+                logical_model: {"target": "openai/gpt-5.4", "source": "test"},
+            },
+            "scoped": {},
+        },
+        "modelMetadata": {},
+    }))
+    model_pricing.reset_for_tests()
+    model_pricing.initialize()
+
+    class _Request:
+        headers = {"x-api-key": "test-key"}
+        client = SimpleNamespace(host="127.0.0.1")
+
+        async def body(self):
+            return json.dumps({
+                # Anthropic uniquely strips this marker and maps a second time.
+                "model": f"{external_alias}[1m]",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "ping"}],
+            }).encode("utf-8")
+
+    channel = SimpleNamespace(
+        key="api:binding", type="api", protocol="openai-responses",
+    )
+    route = SimpleNamespace(
+        candidates=[(channel, outbound_model)], saturated=[],
+        affinity_hit=False,
+    )
+    captured = {}
+
+    monkeypatch.setattr(server.auth, "validate", lambda headers: ("test", [], None))
+    monkeypatch.setattr(server.log_db, "insert_pending", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server.scheduler, "schedule", lambda *args, **kwargs: route)
+    original_safe_prompt_limit = server.model_metadata.safe_prompt_limit
+
+    def _capture_safe_prompt_limit(model, **kwargs):
+        captured["preflight_model"] = model
+        return original_safe_prompt_limit(model, **kwargs)
+
+    monkeypatch.setattr(
+        server.model_metadata, "safe_prompt_limit", _capture_safe_prompt_limit,
+    )
+
+    async def _identity_translate(body, **kwargs):
+        return body
+
+    async def _capture_failover(_route, body, *args, **kwargs):
+        captured["body"] = body
+        captured["binding"] = model_pricing.build_pricing_binding(
+            channel_key=channel.key,
+            channel_type=channel.type,
+            upstream_protocol=channel.protocol,
+            outbound_model_id=outbound_model,
+            client_visible_model=body["_client_visible_model"],
+        )
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(server.translation, "translate_body", _identity_translate)
+    monkeypatch.setattr(server.failover, "run_failover", _capture_failover)
+
+    response = await server.proxy_messages(_Request())
+    assert response.status_code == 200
+    assert captured["body"]["model"] == logical_model
+    assert captured["body"]["_client_visible_model"] == logical_model
+    assert captured["preflight_model"] == logical_model
+    binding = captured["binding"]
+    assert binding.client_visible_model == logical_model
+    assert binding.outbound_model_id == outbound_model
+    assert binding.binding_source == "metadata_default"
+    assert binding.pricing_key == "openai/gpt-5.4"
+    assert binding.pricing_key != model_pricing.canonical_official_model(external_alias)
+    assert binding.tariff is not None
 
 
 def test_context_guard_skips_claude_code_compact_requests():

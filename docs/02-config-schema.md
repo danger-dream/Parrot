@@ -253,16 +253,30 @@
     }
   },
 
-  // ─── Token 金额统计 ───
+  // ─── models.dev 元数据绑定 / 独立压缩模型 ───
+  "modelBindings": {
+    "defaults": {
+      "gpt-5.4": {"target": "openai/gpt-5.4", "source": "auto"}
+    },
+    "scoped": {
+      "api:Vendor": {
+        "client-alias": {
+          "target": "openai/gpt-5.4",
+          "outboundModel": "Vendor-Real-Model",
+          "source": "manual"
+        }
+      }
+    }
+  },
+  "compressionModel": "gpt-5.4",
+
+  // ─── models.dev 目录刷新 / Token 金额统计 ───
   "pricing": {
     "enabled": true,
     "autoUpdate": true,
     "sourceUrl": "https://models.dev/api.json",
     "modelsUrl": "https://models.dev/models.json",
-    "refreshHours": 24,
-    "channelProviders": {},
-    "aliases": {},
-    "overrides": {}
+    "refreshHours": 24
   },
 
   // ─── 路径 / 请求日志留存 ───
@@ -347,38 +361,26 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - 客户端请求 `model=glm-5` → 匹配 `alias` → 向上游发 `model=GLM-5`（真实名）
 - 客户端请求 `model=GLM-5`（真实名）→ 若 `alias` 列表中无此值，视为不支持（**除非 real==alias 同值**）
 
+### 模型元数据绑定 `modelBindings` 与压缩模型 `compressionModel`
+
+- `defaults`：键为客户端可见模型名/渠道 alias，值只保存 models.dev `provider/model` identity 与来源；不复制全量目录记录。
+- `scoped`：先按稳定 scope key（`api:<name>` / `oauth:<provider>:<identity>`），再按客户端可见模型名索引；API alias 同时保存当时的 `outboundModel`，alias 被改指后旧专属绑定不再误用。
+- 有效解析固定为 `scoped > default > none`。context window、max output、能力展示和估算价格均从该绑定指向的同一份 models.dev 目录取得；没有有效绑定时保持无元数据/未计价，不按 provider 或模型前缀猜测。
+- Telegram「自动同步元数据」扫描每个 OAuth/API scope 的已有客户端模型，去重后只按 `models.json` canonical 官方根与 `api.json` 的 exact 同名记录建立/更新默认绑定，不覆盖专属绑定。专属流程按 scope → scope 内模型 → provider → provider 模型选择。
+- `compressionModel` 是独立的客户端可见模型名。运行时按实际 compact 路由解析相同的有效绑定来取得 context/max output。旧 `modelMetadata[*].compressionModel=true` 会一次性迁移，旧手工元数据只有 exact canonical 命中时才迁成默认绑定。
+
 ### Token 金额统计 `pricing`
 
 - `enabled`：是否在 Telegram 的统计、日志和账户等页面计算金额；关闭后不读取响应正文做费用聚合。
 - `autoUpdate`：是否后台同时刷新 models.dev 的供应商 API 目录与规范模型目录。启动时先读取 `$ANTHROPIC_PROXY_DATA_DIR/models_dev_catalog.json.gz`（Docker 默认 `/app/data/models_dev_catalog.json.gz`）缓存，缓存不存在或损坏时使用仓库内置 gzip 快照；任一远端失败都不会替换当前目录或影响代理请求。
 - `sourceUrl`：models.dev 供应商模型与价格目录，默认 `https://models.dev/api.json`，只接受 `https://`。金额只从这里读取，单位为 USD / 1M Token。
-- `modelsUrl`：规范模型身份目录，默认 `https://models.dev/models.json`，只接受 `https://`。该文件不提供价格，仅用于确认规范模型 ID；只有映射唯一时才建立裸模型别名。
+- `modelsUrl`：规范模型身份目录，默认 `https://models.dev/models.json`，只接受 `https://`。该文件不提供价格，仅用于 canonical 官方 exact 同名匹配。
 - `refreshHours`：远端刷新间隔，最小 1 小时。
-- `channelProviders`：第三方 API 渠道的 models.dev Provider ID 映射，键为不可变渠道 key（例如 `api:OpenRouter`），值为 `api.json` 顶层 provider（例如 `openrouter`）。OAuth 渠道会从 `oauth:<provider>:...` 自动识别；无法证明 provider 的 API 渠道保持未计价，避免把同名 Model ID 套用到错误供应商价格。
-- `aliases`：自定义模型名映射，例如 `{"my-sol": "openai/gpt-5.6-sol"}`；不自动剥离 provider 或日期后缀，非目录原名必须显式映射。
-- `overrides`：自定义价格，单位均为 USD / 1M Token。至少填写 `inputPerMillion` 和 `outputPerMillion`；可选 `cacheWritePerMillion`、`cacheReadPerMillion` 及四个 `priority*PerMillion` 字段。
+- 旧 `channelProviders` / `aliases` / `overrides` 字段可继续留在配置中，避免升级时丢配置；新的 dispatch-time 估算不使用它们绕过元数据绑定，也不接受手工价格覆盖。
 
-```json
-{
-  "pricing": {
-    "aliases": {"my-sol": "openai/gpt-5.6-sol"},
-    "overrides": {
-      "private-model": {
-        "inputPerMillion": 2.5,
-        "outputPerMillion": 15,
-        "cacheWritePerMillion": 2.5,
-        "cacheReadPerMillion": 0.25,
-        "priorityInputPerMillion": 5,
-        "priorityOutputPerMillion": 30
-      }
-    }
-  }
-}
-```
+新请求在每次上游尝试 dispatch 时按真实 scope、客户端可见 model 和出站真实 model 解析有效元数据绑定，并冻结其 models.dev provider/model、费率与目录版本；之后配置或目录更新不会重算该结算。没有有效绑定或绑定记录没有可用 Token 价格时保持 `unpriced`。只有没有尝试账本的历史请求才会按当前有效绑定做兼容估算。xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该次尝试的真实上游金额。长上下文阶梯按**单次请求**的 `input + cache creation + cache read` 判断；当前结算结构只支持一档 context tier，目录若为同一模型提供多档阈值则该模型 fail-closed 为未计价。`experimental.modes.fast.cost` 是完整替换价，不与标准长上下文价叠加；没有响应/真实出站 fast 事实时不会从下游 intent 臆测加速价，实际为 priority/fast 但目录没有对应 tariff、或上游返回 `flex` 等未知计费档位时同样保持未计价。数据库只保存缓存写入总 Token、没有保存 Anthropic 5 分钟 / 1 小时 TTL 拆分，因此 Claude 请求只要包含 cache creation 就标记为“未计价”。目录若要求单独计费 reasoning/audio Token、但价格与聚合 input/output 不同，也会保持未计价，避免用缺失的 Token 维度生成假精确金额。
 
-新请求在每次上游尝试结束时冻结 models.dev 供应商费率、版本和金额，之后目录更新不会重算该结算；只有没有尝试账本的历史请求才按当前目录做兼容估算。xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该次尝试的真实上游金额。长上下文阶梯按**单次请求**的 `input + cache creation + cache read` 判断；当前结算结构只支持一档 context tier，目录若为同一模型提供多档阈值则该模型 fail-closed 为未计价。`experimental.modes.fast.cost` 是完整替换价，不与标准长上下文价叠加；没有响应/真实出站 fast 事实时不会从下游 intent 臆测加速价，实际为 priority/fast 但目录没有对应 tariff、或上游返回 `flex` 等未知计费档位时同样保持未计价。数据库只保存缓存写入总 Token、没有保存 Anthropic 5 分钟 / 1 小时 TTL 拆分，因此 Claude 请求只要包含 cache creation 就标记为“未计价”。目录若要求单独计费 reasoning/audio Token、但价格与聚合 input/output 不同，也会保持未计价，避免用缺失的 Token 维度生成假精确金额。
-
-Telegram 界面统一显示为两位小数且不加约等号，并区分“实际”“估算”和两者混合金额；所有展示 Token 缓存的统计/日志位置都会同步显示金额。models.dev 价格与 xAI 实际费用均以 USD 计价，因此 Parrot 不做实时汇率换算。供应商限定模型名优先于裸模型别名，未知或歧义模型会计入“未计价”请求数，不会按 `$0` 混入总金额。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，Parrot 会将该请求标记为“未计价”，避免重复收费。
+Telegram 界面统一显示为两位小数且不加约等号，并区分“实际”“估算”和两者混合金额；所有展示 Token 缓存的统计/日志位置都会同步显示金额。models.dev 价格与 xAI 实际费用均以 USD 计价，因此 Parrot 不做实时汇率换算。无绑定、绑定失效或目录无价格的模型会计入“未计价”请求数，不会按 `$0` 混入总金额。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，Parrot 会将该请求标记为“未计价”，避免重复收费。
 
 ### 超时语义（关键）
 

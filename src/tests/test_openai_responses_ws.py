@@ -368,11 +368,26 @@ def _make_channel(m, *, extra: dict[str, Any] | None = None):
 
 @pytest.mark.asyncio
 async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
-    _setup(m)
+    cfg = _setup(m)
+    external_alias = "grok-4.5"
+    logical_model = "test-model"
+    cfg["modelMapping"] = {"global": {external_alias: logical_model}}
+    cfg["modelBindings"] = {
+        "defaults": {
+            logical_model: {"target": "openai/gpt-5.4", "source": "test"},
+        },
+        "scoped": {},
+    }
+    cfg["modelMetadata"] = {}
+    from src import model_pricing
+    model_pricing.reset_for_tests()
+    model_pricing.initialize()
+    assert model_pricing.canonical_official_model(external_alias) == "xai/grok-4.5"
+
     _make_channel(m)
     ws = FakeWebSocket({
         "type": "response.create",
-        "model": "test-model",
+        "model": external_alias,
         "input": "hello",
         "stream": True,
         "background": False,
@@ -411,7 +426,22 @@ async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
     ]
     row = _last_request_log(m)
     chain = _retry_chain(m, row["request_id"])
+    assert row["requested_model"] == logical_model
     assert len(chain) == 1 and chain[0]["dispatched_at"] is not None
+    assert chain[0]["client_visible_model"] == logical_model
+    assert chain[0]["model"] == "real-model"
+    assert chain[0]["binding_source"] == "metadata_default"
+    assert chain[0]["binding_pricing_key"] == "openai/gpt-5.4"
+    assert chain[0]["binding_pricing_key"] != "xai/grok-4.5"
+    frozen = json.loads(chain[0]["binding_json"])
+    assert frozen["dispatch"] == {
+        "channel_key": "api:ws-upstream",
+        "channel_type": "api",
+        "client_visible_model": logical_model,
+        "outbound_model_id": "real-model",
+        "upstream_protocol": "openai-responses",
+    }
+    assert frozen["tariff"] is not None
     assert ws.close_calls[-1][0] == 1000
 
 
@@ -2071,6 +2101,18 @@ async def test_responses_ws_large_terminal_frame_keeps_billing_evidence(
     cfg["pricing"] = {
         "enabled": True,
         "channelProviders": {ch.key: "xai"},
+    }
+    cfg["modelBindings"] = {
+        "defaults": {},
+        "scoped": {
+            ch.key: {
+                "test-model": {
+                    "target": "xai/grok-4.5",
+                    "outboundModel": "real-model",
+                    "source": "test",
+                },
+            },
+        },
     }
     ws = FakeWebSocket({
         "type": "response.create", "model": "test-model",

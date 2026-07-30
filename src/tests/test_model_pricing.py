@@ -460,17 +460,35 @@ async def test_refresh_fetches_both_models_dev_sources_and_writes_one_atomic_bun
     class Response:
         def __init__(self, content):
             self.content = content
+            self.headers = {"content-length": str(len(content))}
+            self.produced = 0
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            self.closed = True
 
         def raise_for_status(self):
             return None
 
+        async def aiter_bytes(self):
+            for offset in range(0, len(self.content), 257):
+                chunk = self.content[offset:offset + 257]
+                self.produced += len(chunk)
+                yield chunk
+
     class Client:
         def __init__(self):
             self.calls = []
+            self.responses = []
 
-        async def get(self, url, timeout):
-            self.calls.append((url, timeout))
-            return Response(payloads[url])
+        def stream(self, method, url, timeout):
+            self.calls.append((method, url, timeout))
+            response = Response(payloads[url])
+            self.responses.append(response)
+            return response
 
     client = Client()
     pricing_cfg = {
@@ -483,15 +501,35 @@ async def test_refresh_fetches_both_models_dev_sources_and_writes_one_atomic_bun
     monkeypatch.setattr(config, "get", lambda: {"pricing": pricing_cfg})
     monkeypatch.setattr(upstream, "get_client", lambda: client)
 
+    monkeypatch.setattr(
+        model_pricing, "_MAX_REMOTE_CATALOG_BYTES",
+        len(payloads["https://models.dev/api.json"])
+        + len(payloads["https://models.dev/models.json"]),
+    )
     model_pricing.reset_for_tests()
     assert await model_pricing.refresh_once() is True
     cache = tmp_path / "models_dev_catalog.json.gz"
     assert cache.is_file() and cache.stat().st_size > 0
-    assert {url for url, _ in client.calls} == {
+    assert {url for _, url, _ in client.calls} == {
         "https://models.dev/api.json",
         "https://models.dev/models.json",
     }
     before = cache.read_bytes()
+
+    # The two files share one budget. Stop the companion stream at its first
+    # crossing chunk and preserve the existing last-known-good cache.
+    api_size = len(payloads["https://models.dev/api.json"])
+    models_size = len(payloads["https://models.dev/models.json"])
+    monkeypatch.setattr(
+        model_pricing, "_MAX_REMOTE_CATALOG_BYTES", api_size + models_size // 2,
+    )
+    with pytest.raises(ValueError):
+        await model_pricing.refresh_once()
+    crossing = client.responses[-1]
+    assert crossing.produced < models_size
+    assert crossing.produced <= models_size // 2 + 257
+    assert crossing.closed is True
+    assert cache.read_bytes() == before
 
     model_pricing.reset_for_tests()
     model_pricing.initialize()
@@ -503,11 +541,68 @@ async def test_refresh_fetches_both_models_dev_sources_and_writes_one_atomic_bun
     assert estimate is not None and estimate.input_ticks == model_pricing.TICKS_PER_USD
 
     # A malformed companion catalog must not replace the last good bundle.
+    monkeypatch.setattr(model_pricing, "_MAX_REMOTE_CATALOG_BYTES", 16 * 1024 * 1024)
     payloads["https://models.dev/models.json"] = b"[]"
     with pytest.raises(ValueError):
         await model_pricing.refresh_once()
     assert cache.read_bytes() == before
     model_pricing.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_catalog_download_content_length_rejects_before_body_and_chunked_stops_at_crossing():
+    class Response:
+        def __init__(self, chunks, headers):
+            self.chunks = chunks
+            self.headers = headers
+            self.produced = 0
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            self.closed = True
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            for chunk in self.chunks:
+                self.produced += len(chunk)
+                yield chunk
+
+    class Client:
+        def __init__(self, response):
+            self.response = response
+
+        def stream(self, method, url, timeout):
+            assert method == "GET" and timeout == 20.0
+            return self.response
+
+    length_response = Response([b"body-must-not-be-read"], {"content-length": "9"})
+    with pytest.raises(ValueError):
+        await model_pricing._download_catalog_bounded(
+            Client(length_response), "https://models.dev/api.json", 8,
+        )
+    assert length_response.produced == 0
+    assert length_response.closed is True
+
+    malformed = Response([b"body-must-not-be-read"], {"content-length": "8, 9"})
+    with pytest.raises(ValueError):
+        await model_pricing._download_catalog_bounded(
+            Client(malformed), "https://models.dev/api.json", 100,
+        )
+    assert malformed.produced == 0
+    assert malformed.closed is True
+
+    chunked = Response([b"1234", b"5678", b"9", b"not-read"], {})
+    with pytest.raises(ValueError):
+        await model_pricing._download_catalog_bounded(
+            Client(chunked), "https://models.dev/api.json", 8,
+        )
+    assert chunked.produced == 9
+    assert chunked.closed is True
 
 
 def test_corrupt_runtime_catalog_falls_back_to_bundled_snapshot(tmp_path, monkeypatch):
@@ -565,3 +660,99 @@ def test_service_tier_classifier_rejects_unknown_tariffs():
     assert model_pricing.priority_from_service_tier("priority") is True
     assert model_pricing.priority_from_service_tier("fast") is True
     assert model_pricing.priority_from_service_tier("flex") is None
+
+
+def test_models_dev_missing_cache_tariffs_are_explicit_zero_in_all_contexts():
+    entry = model_pricing._entry_from_models_dev({
+        "cost": {
+            "input": 3,
+            "output": 15,
+            "tiers": [{
+                "tier": {"type": "context", "size": 200_000},
+                "input": 6,
+                "output": 22.5,
+            }],
+        }
+    })
+    assert entry is not None
+    assert entry.cache_write_per_token == 0
+    assert entry.cache_read_per_token == 0
+    assert entry.above_cache_write_per_token == 0
+    assert entry.above_cache_read_per_token == 0
+
+
+def test_dispatch_binding_provider_facts_do_not_come_from_channel_names_or_bare_catalog_aliases(monkeypatch):
+    overrides = {
+        "provider-a/shared/model": {"inputPerMillion": 1, "outputPerMillion": 2},
+        "provider-b/shared/model": {"inputPerMillion": 9, "outputPerMillion": 18},
+    }
+    settings = model_pricing.settings({
+        "pricing": {
+            "enabled": True,
+            "channelProviders": {
+                "api:a": "provider-a",
+                "api:b": "provider-b",
+            },
+            "overrides": overrides,
+        }
+    })
+    a = model_pricing.build_pricing_binding(
+        channel_key="api:a", channel_type="api",
+        upstream_protocol="openai-responses", outbound_model_id="shared/model",
+        pricing_settings=settings,
+    )
+    b = model_pricing.build_pricing_binding(
+        channel_key="api:b", channel_type="api",
+        upstream_protocol="openai-responses", outbound_model_id="shared/model",
+        pricing_settings=settings,
+    )
+    assert a.model_id == b.model_id == "shared/model"
+    # pricing.channelProviders/overrides are no longer metadata bindings.
+    assert (a.provider_id, a.pricing_key, a.tariff) == (None, None, None)
+    assert (b.provider_id, b.pricing_key, b.tariff) == (None, None, None)
+    assert a.binding_source == b.binding_source == "unbound"
+    assert a.binding_version != b.binding_version
+
+    monkeypatch.setattr(model_pricing, "_initialized", True)
+    monkeypatch.setattr(model_pricing, "_catalog", {
+        "openai/unique": model_pricing.PricingEntry(1e-6, 2e-6, 0, 0),
+    })
+    monkeypatch.setattr(model_pricing, "_catalog_aliases", {"unique": "openai/unique"})
+    for channel_name in ("api:xai-looking", "api:openai-looking"):
+        unproven = model_pricing.build_pricing_binding(
+            channel_key=channel_name,
+            channel_type="api",
+            upstream_protocol="openai-responses",
+            outbound_model_id="unique",
+            pricing_settings=model_pricing.settings({"pricing": {"enabled": True}}),
+        )
+        assert unproven.provider_id is None
+        assert unproven.pricing_key is None
+        assert unproven.tariff is None
+
+
+def test_dispatch_binding_preserves_exact_model_id_with_slash():
+    binding = model_pricing.build_pricing_binding(
+        channel_key="api:router",
+        channel_type="api",
+        upstream_protocol="openai-responses",
+        outbound_model_id="lab/model/version",
+        pricing_settings=model_pricing.settings({
+            "pricing": {
+                "enabled": True,
+                "channelProviders": {"api:router": "provider"},
+                "overrides": {
+                    "provider/lab/model/version": {
+                        "inputPerMillion": 2,
+                        "outputPerMillion": 8,
+                    }
+                },
+            }
+        }),
+    )
+    assert binding.model_id == "lab/model/version"
+    assert binding.provider_id is None
+    assert binding.pricing_key is None
+    assert binding.tariff is None
+    assert binding.binding_json
+    assert binding.binding_version.startswith("binding-v1:")

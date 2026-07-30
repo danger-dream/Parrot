@@ -208,13 +208,23 @@ class SSEUsageTracker:
                 self.stream_error_code, self.stream_error_message = _format_stream_error_info(evt)
                 continue
             if t == "message_start":
-                self._usage_acc.update_from_anthropic_message_start((evt.get("message") or {}).get("usage") or {})
+                message = evt.get("message")
+                usage_obj = message.get("usage") if isinstance(message, dict) else None
+                self._usage_acc.update_from_anthropic_message_start(usage_obj)
                 self.usage = self._usage_acc.legacy_dict()
             elif t == "message_delta":
-                self._usage_acc.update_from_anthropic_message_delta(evt.get("usage") or {})
+                self._usage_acc.update_from_anthropic_message_delta(evt.get("usage"))
                 self.usage = self._usage_acc.legacy_dict()
             elif t == "message_stop":
                 self.saw_stream_end = True
+
+    @property
+    def usage_observed(self) -> bool:
+        return bool(self._usage_acc.usage_observed)
+
+    @property
+    def usage_invalid(self) -> bool:
+        return bool(self._usage_acc.usage_invalid)
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")
@@ -498,6 +508,14 @@ class ChatSSEUsageTracker:
                     self._usage_acc.set_from_openai_chat_usage(u)
                     self.usage = self._usage_acc.legacy_dict()
 
+    @property
+    def usage_observed(self) -> bool:
+        return bool(self._usage_acc.usage_observed)
+
+    @property
+    def usage_invalid(self) -> bool:
+        return bool(self._usage_acc.usage_invalid)
+
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")
 
@@ -707,6 +725,14 @@ class ResponsesSSEUsageTracker:
                     # 见文件顶部「语义对齐」说明：扣掉缓存命中部分后落库。
                     self._usage_acc.set_from_openai_responses_usage(resp["usage"])
                     self.usage = self._usage_acc.legacy_dict()
+
+    @property
+    def usage_observed(self) -> bool:
+        return bool(self._usage_acc.usage_observed)
+
+    @property
+    def usage_invalid(self) -> bool:
+        return bool(self._usage_acc.usage_invalid)
 
     def get_full_response(self) -> str:
         return b"".join(self._chunks).decode("utf-8", errors="replace")

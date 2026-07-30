@@ -1138,32 +1138,52 @@ async def _run_compact_direct_rescue_with_compression_model(
     if not compression_model:
         return None, "no compression model configured"
 
-    direct_body = compact_rescue.build_direct_summary_body(
-        body,
-        model=compression_model,
-        max_tokens=model_metadata.summary_reserve_tokens(compression_model),
-    )
-
-    prompt_tokens = token_counter.count_request_tokens(direct_body, model=compression_model)
-    if not model_metadata.can_fit_for_compact(compression_model, prompt_tokens):
-        required = model_metadata.required_context_for_compact(prompt_tokens, compression_model)
-        window = model_metadata.context_window(compression_model)
-        return (
-            None,
-            f"compression model {compression_model} context not enough: "
-            f"required={required} window={window}",
-        )
-
     from . import scheduler as scheduler_mod
 
+    probe_body, _ = compact_rescue.sanitized_compact_base(body)
+    probe_body.update({
+        "model": compression_model,
+        "stream": False,
+        "_client_visible_model": compression_model,
+    })
     route = scheduler_mod.schedule(
-        direct_body,
+        probe_body,
         api_key_name=api_key_name or "",
         client_ip=client_ip,
         ingress_protocol=ingress_protocol,
     )
     if not route:
         return None, f"compression model {compression_model} has no available route"
+    first_routes = list(route.candidates) + list(route.saturated)
+    metadata_channel, metadata_outbound = first_routes[0]
+    scope_key = str(metadata_channel.key)
+    reserve = model_metadata.summary_reserve_tokens(
+        compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+    )
+    direct_body = compact_rescue.build_direct_summary_body(
+        body,
+        model=compression_model,
+        max_tokens=reserve,
+    )
+    direct_body["_client_visible_model"] = compression_model
+
+    prompt_tokens = token_counter.count_request_tokens(direct_body, model=compression_model)
+    if not model_metadata.can_fit_for_compact(
+        compression_model, prompt_tokens,
+        scope_key=scope_key, outbound_model=metadata_outbound,
+    ):
+        required = model_metadata.required_context_for_compact(
+            prompt_tokens, compression_model,
+            scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        window = model_metadata.context_window(
+            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        return (
+            None,
+            f"compression model {compression_model} context not enough: "
+            f"required={required} window={window}",
+        )
 
     print(
         f"[compact-rescue] direct compression request={request_id} "
@@ -1215,6 +1235,7 @@ def _schedule_compact_compression_model_for_map_reduce(
     probe_body, _meta = compact_rescue.sanitized_compact_base(body)
     probe_body["stream"] = False
     probe_body["model"] = compression_model
+    probe_body["_client_visible_model"] = compression_model
     probe_body["max_tokens"] = compact_rescue.reduce_max_tokens()
     probe_body.pop("max_output_tokens", None)
     route = scheduler_mod.schedule(
@@ -1225,6 +1246,19 @@ def _schedule_compact_compression_model_for_map_reduce(
     )
     if not route:
         return compression_model, None, f"compression model {compression_model} has no available route"
+    first_routes = list(route.candidates) + list(route.saturated)
+    metadata_channel, metadata_outbound = first_routes[0]
+    binding = model_metadata.resolve_binding(
+        compression_model,
+        scope_key=str(metadata_channel.key),
+        outbound_model=str(metadata_outbound),
+    )
+    if binding is None:
+        return (
+            compression_model,
+            None,
+            f"compression model {compression_model} has no effective metadata binding",
+        )
     return compression_model, route, None
 
 
@@ -1279,9 +1313,26 @@ async def _run_compact_map_reduce_rescue(
         print(f"[compact-rescue] map-reduce compression model skipped request={request_id}: {map_reduce_skip_reason}")
     active_schedule_result = map_reduce_route or schedule_result
     active_model = map_reduce_model if map_reduce_route is not None else str(body.get("model") or "")
+    active_routes = list(active_schedule_result.candidates) + list(active_schedule_result.saturated)
+    active_channel, active_outbound = active_routes[0] if active_routes else (None, None)
+    active_scope = str(getattr(active_channel, "key", "") or "")
+    bound_output_limit = model_metadata.max_output_tokens(
+        active_model,
+        scope_key=active_scope,
+        outbound_model=str(active_outbound or ""),
+    )
+    bound_prompt_limit = model_metadata.safe_prompt_limit(
+        active_model,
+        scope_key=active_scope,
+        outbound_model=str(active_outbound or ""),
+    )
+    segment_target = compact_rescue.chunk_target_tokens()
+    if map_reduce_route is not None and bound_prompt_limit is not None:
+        segment_target = max(1, min(segment_target, bound_prompt_limit))
 
     chunks = compact_rescue.split_messages_for_compact(
         messages,
+        target_tokens=segment_target,
         model=active_model,
     )
     print(
@@ -1300,6 +1351,12 @@ async def _run_compact_map_reduce_rescue(
             )
             if map_reduce_route is not None and map_reduce_model:
                 chunk_body["model"] = map_reduce_model
+            chunk_body["_client_visible_model"] = active_model
+            if bound_output_limit is not None:
+                chunk_body["max_tokens"] = min(
+                    int(chunk_body.get("max_tokens") or bound_output_limit),
+                    bound_output_limit,
+                )
             sub_id = f"{request_id}:compact:{idx}"
             response = await run_failover(
                 active_schedule_result,
@@ -1350,6 +1407,12 @@ async def _run_compact_map_reduce_rescue(
         reduce_body = compact_rescue.build_reduce_summary_body(body, summaries)
         if map_reduce_route is not None and map_reduce_model:
             reduce_body["model"] = map_reduce_model
+        reduce_body["_client_visible_model"] = active_model
+        if bound_output_limit is not None:
+            reduce_body["max_tokens"] = min(
+                int(reduce_body.get("max_tokens") or bound_output_limit),
+                bound_output_limit,
+            )
         final_response = await run_failover(
             active_schedule_result,
             reduce_body,
@@ -1422,6 +1485,9 @@ async def run_failover(
         # Legacy callers start outer elapsed at entry; wall time never enters durations.
         start_monotonic = time.monotonic()
     candidates = list(schedule_result.candidates)
+    client_visible_model = str(
+        body.get("_client_visible_model") or body.get("model") or ""
+    ).strip()
     affinity_hit = 1 if schedule_result.affinity_hit else 0
     fp_query = schedule_result.fp_query
     client_key = getattr(schedule_result, "client_key", None)
@@ -1571,6 +1637,8 @@ async def run_failover(
         attempt_id = log_db.record_retry_attempt(
             request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
             proxy_name=_attempt_proxy,
+            upstream_protocol=getattr(ch, "protocol", "anthropic"),
+            client_visible_model=client_visible_model,
         )
         if _attempt_proxy:
             log_db.update_pending(request_id, proxy_name=_attempt_proxy)
@@ -1864,6 +1932,7 @@ async def run_failover(
                 final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                 http_status=status, affinity_hit=affinity_hit,
                 response_body=result.full_response_text,
+                usage=result.usage,
                 usage_observed=result.usage_observed,
                 upstream_protocol=getattr(ch, "protocol", "anthropic"),
                 **_request_stage_kwargs(result),
@@ -2039,6 +2108,8 @@ async def run_failover(
                 attempt_id = log_db.record_retry_attempt(
                     request_id, attempt_order, ch.key, ch.type, resolved_model, time.time(),
                     proxy_name=_attempt_proxy2,
+                    upstream_protocol=getattr(ch, "protocol", "anthropic"),
+                    client_visible_model=client_visible_model,
                 )
                 release_done2 = False
                 def _release_q(_key=ch.key):
@@ -2109,6 +2180,7 @@ async def run_failover(
                     bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
                     response_body=getattr(result, "full_response_text", None),
                     usage=getattr(result, "usage", None),
+                    usage_observed=getattr(result, "usage_observed", None),
                 )
                 if result.success and candidate_local_web_loop and downstream_stream_requested:
                     result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
@@ -2135,6 +2207,7 @@ async def run_failover(
                         final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                         http_status=status, affinity_hit=affinity_hit,
                         response_body=result.full_response_text,
+                        usage=result.usage,
                         usage_observed=result.usage_observed,
                         upstream_protocol=getattr(ch, "protocol", "anthropic"),
                         **_request_stage_kwargs(result),
@@ -2214,6 +2287,7 @@ async def run_failover(
         request_elapsed_ms=request_elapsed_ms,
         http_status=status, affinity_hit=affinity_hit,
         response_body=(last_result.full_response_text if last_result else None),
+        usage=(last_result.usage if last_result else None),
         usage_observed=(last_result.usage_observed if last_result else None),
         upstream_protocol=last_ch_protocol,
         proxy_name=(last_result.proxy_name if last_result else None),
@@ -2916,6 +2990,7 @@ async def _try_openai_oauth_responses_ws_channel(
                     request_elapsed_ms=_elapsed_ms(start_monotonic),
                     http_status=499,
                     response_body=cancelled.full_response_text,
+                    usage=cancelled.usage,
                     usage_observed=cancelled.usage_observed,
                     affinity_hit=affinity_hit,
                     upstream_protocol="openai-responses",
@@ -3411,6 +3486,7 @@ async def _finalize_oauth_ws_error(
         request_elapsed_ms=request_elapsed_ms,
         http_status=_ws_http_status_from_outcome(result), affinity_hit=affinity_hit,
         response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
+        usage=tracker.usage,
         usage_observed=tracker.usage_observed,
         upstream_protocol="openai-responses", upstream_transport="ws",
         proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
@@ -3582,6 +3658,7 @@ async def _consume_oauth_responses_ws_stream(
             request_elapsed_ms=request_elapsed_ms,
             http_status=499, affinity_hit=affinity_hit,
             response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
+            usage=tracker.usage,
             usage_observed=tracker.usage_observed,
             upstream_protocol="openai-responses", upstream_transport="ws",
             proxy_name=proxy_name, proxy_bytes_up=proxy_bytes.up, proxy_bytes_down=proxy_bytes.down,
@@ -3864,6 +3941,7 @@ async def _try_channel(
             http_status=499,
             affinity_hit=affinity_hit,
             response_body=result.full_response_text,
+            usage=result.usage,
             usage_observed=result.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
@@ -4609,6 +4687,7 @@ async def _consume_stream(
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
             http_status=upstream_status,
+            usage_observed=tracker.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -4650,6 +4729,8 @@ async def _consume_stream(
             http_status=(400 if outcome == "request_invalid" else upstream_status),
             affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(),
+            usage=tracker.usage,
+            usage_observed=tracker.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],
@@ -4701,6 +4782,8 @@ async def _consume_stream(
             request_elapsed_ms=request_elapsed_ms,
             http_status=499, affinity_hit=affinity_hit,
             response_body=tracker.get_full_response(), status="cancelled",
+            usage=tracker.usage,
+            usage_observed=tracker.usage_observed,
             upstream_protocol=getattr(ch, "protocol", "anthropic"),
             proxy_name=proxy_name,
             proxy_bytes_up=_proxy_byte_snapshot(proxy_bytes)[0],

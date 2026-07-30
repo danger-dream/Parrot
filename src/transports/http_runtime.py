@@ -519,6 +519,7 @@ async def aggregate_stream_as_non_stream_response(
         usage = getattr(tracker, "usage", None)
         if isinstance(usage, dict):
             err.usage = dict(usage)
+        err.usage_observed = bool(getattr(tracker, "usage_observed", False))
         return err
     if err := _stream_tracker_error_result(
         tracker,
@@ -780,13 +781,17 @@ async def prepare_stream_response_start(
     stream_translator = make_stream_translator(translator_ctx)
 
     def _attach_precommit_response(result: AttemptResult) -> AttemptResult:
-        """Keep received pre-commit SSE data available to terminal error logging."""
+        """Keep pre-commit SSE bytes and strict tracker billing facts together."""
         try:
             full_response = tracker.get_full_response()
         except Exception:
             full_response = None
         if full_response:
             result.full_response_text = full_response
+        usage = getattr(tracker, "usage", None)
+        if isinstance(usage, dict):
+            result.usage = dict(usage)
+        result.usage_observed = bool(getattr(tracker, "usage_observed", False))
         return result
 
     if ch_proto == "openai-responses" or stream_translator is not None:

@@ -205,6 +205,11 @@
     "global": {}
   },
   "ingressDefaultModel": {},
+  "modelBindings": {
+    "defaults": {},
+    "scoped": {}
+  },
+  "compressionModel": "",
   "modelMetadata": {},
   "protocolBridge": {
     "anthropicToOpenAI": {

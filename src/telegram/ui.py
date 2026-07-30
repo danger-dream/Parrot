@@ -505,8 +505,13 @@ def fmt_cache_phrase_from_row(row: dict, *, aggregate: bool = False) -> str:
     return cache_display.cache_read_phrase_from_row(row, aggregate=aggregate)
 
 
-def fmt_cost(metrics: dict | None) -> str:
-    """Format actual/estimated USD cost with a stable two-decimal contract."""
+def fmt_cost(
+    metrics: dict | None,
+    *,
+    show_source: bool = True,
+    decimal_places: int = 2,
+) -> str:
+    """Format actual/estimated USD cost for the requested UI surface."""
     from .. import config
 
     pricing_cfg = config.get().get("pricing", {})
@@ -528,25 +533,37 @@ def fmt_cost(metrics: dict | None) -> str:
     estimated_count = nonnegative_int("estimated_costed_success")
     unpriced = nonnegative_int("unpriced_success")
     if costed <= 0:
-        return f"未计价（{unpriced} 次）" if unpriced else "$0.00"
-    amount = fmt_usd(Decimal(ticks) / Decimal(10_000_000_000))
-    if actual_count > 0 and estimated_count > 0:
-        actual_amount = fmt_usd(Decimal(actual_ticks) / Decimal(10_000_000_000))
+        return (
+            f"未计价（{unpriced} 次）"
+            if unpriced
+            else fmt_usd(0, decimal_places=decimal_places)
+        )
+    amount = fmt_usd(
+        Decimal(ticks) / Decimal(10_000_000_000),
+        decimal_places=decimal_places,
+    )
+    if show_source and actual_count > 0 and estimated_count > 0:
+        actual_amount = fmt_usd(
+            Decimal(actual_ticks) / Decimal(10_000_000_000),
+            decimal_places=decimal_places,
+        )
         estimated_amount = fmt_usd(
-            Decimal(estimated_ticks) / Decimal(10_000_000_000)
+            Decimal(estimated_ticks) / Decimal(10_000_000_000),
+            decimal_places=decimal_places,
         )
         amount = f"{amount}（实际 {actual_amount} + 估算 {estimated_amount}）"
-    elif actual_count > 0:
+    elif show_source and actual_count > 0:
         amount = f"实际 {amount}"
-    elif estimated_count > 0:
+    elif show_source and estimated_count > 0:
         amount = f"估算 {amount}"
     if unpriced:
         amount += f" · {unpriced} 次未计价"
     return amount
 
 
-def fmt_usd(value) -> str:
-    """Format a USD value to two decimals using decimal half-up rounding."""
+def fmt_usd(value, *, decimal_places: int = 2) -> str:
+    """Format a USD value using decimal half-up rounding."""
+    places = max(0, int(decimal_places))
     try:
         amount = Decimal(str(value or 0))
     except (InvalidOperation, TypeError, ValueError):
@@ -554,10 +571,13 @@ def fmt_usd(value) -> str:
     if not amount.is_finite() or amount < 0:
         amount = Decimal(0)
     try:
-        amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        amount = amount.quantize(
+            Decimal(1).scaleb(-places),
+            rounding=ROUND_HALF_UP,
+        )
     except InvalidOperation:
         amount = Decimal(0)
-    return f"${amount:,.2f}"
+    return f"${amount:,.{places}f}"
 
 
 def cost_metrics_from_row(row: dict | None) -> dict:
@@ -912,13 +932,13 @@ def fmt_log_entry_body(r: dict) -> str:
         tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
         if cr > 0:
             tok += f" · {fmt_cache_phrase_from_row(r)}"
-        tok += f" · 💵 {fmt_cost(cost_metrics)}"
+        tok += f" · {fmt_cost(cost_metrics, show_source=False, decimal_places=3)}"
         lines.append(f"  Token: {tok}")
     elif row_status in ("error", "cancelled") and (
         int(cost_metrics.get("costed_success") or 0) > 0
         or int(cost_metrics.get("unpriced_success") or 0) > 0
     ):
-        lines.append(f"  计费: 💵 {fmt_cost(cost_metrics)}")
+        lines.append(f"  计费: {fmt_cost(cost_metrics, show_source=False, decimal_places=3)}")
 
     # 耗时
     timing_parts: list[str] = []

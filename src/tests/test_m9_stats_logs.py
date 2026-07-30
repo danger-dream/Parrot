@@ -71,6 +71,14 @@ def _setup(m):
             "api:priced": "openai",
             "api:anthropic-main": "anthropic",
         }
+        c["modelBindings"] = {
+            "defaults": {
+                "gpt-5.6-sol": {"target": "openai/gpt-5.6-sol", "source": "test"},
+                "gpt-5.6-luna": {"target": "openai/gpt-5.6-luna", "source": "test"},
+                "claude-opus-4-6": {"target": "anthropic/claude-opus-4-6", "source": "test"},
+            },
+            "scoped": {},
+        }
         c["oauthAccounts"] = [{
             "provider": "openai",
             "email": "o@openai.test",
@@ -147,6 +155,13 @@ def test_fmt_helpers(m):
     assert ui.fmt_cache_phrase(50, 160) == "缓存 50 (31.2%)"
     assert ui.fmt_cache_phrase(51_700, 85_000) == "缓存 51.7K (60.8%)"
     assert ui.fmt_usd(0.005) == "$0.01"
+    assert ui.fmt_usd(0.06, decimal_places=3) == "$0.060"
+    assert ui.fmt_cost({
+        "cost_ticks": 600_000_000,
+        "estimated_cost_ticks": 600_000_000,
+        "estimated_costed_success": 1,
+        "costed_success": 1,
+    }, show_source=False, decimal_places=3) == "$0.060"
     assert ui.fmt_cost({
         "cost_ticks": 123_450_000_000,
         "costed_success": 1,
@@ -522,8 +537,11 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     first_channel = "oauth:openai:attempt-only@example.test:acct"
     first = m["log_db"].record_retry_attempt(
         handle, 1, first_channel, "oauth", "gpt-5.6-luna", 1.0,
+        upstream_protocol="openai-responses",
     )
-    m["log_db"].mark_retry_attempt_dispatch(first, {})
+    m["log_db"].mark_retry_attempt_dispatch(
+        first, {"model": "gpt-5.6-luna"},
+    )
     m["log_db"].update_retry_attempt(
         first,
         outcome="http_error",
@@ -534,9 +552,11 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     )
     second = m["log_db"].record_retry_attempt(
         handle, 2, "oauth:openai:winner@example.test:acct", "oauth",
-        "gpt-5.6-luna", 3.0,
+        "gpt-5.6-luna", 3.0, upstream_protocol="openai-responses",
     )
-    m["log_db"].mark_retry_attempt_dispatch(second, {})
+    m["log_db"].mark_retry_attempt_dispatch(
+        second, {"model": "gpt-5.6-luna"},
+    )
     final_body = json.dumps({
         "usage": {"input_tokens": 10, "output_tokens": 2}
     })
@@ -694,7 +714,8 @@ def test_logs_list(m):
     assert "down" in text
 
     assert "最近日志 · 请求日志 · 第 1/1 页 · 共 3 条" in text
-    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%) · 💵 " in text
+    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%) · " in text
+    assert "💵" not in text
     assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
 
     # 顶部可切换请求/多媒体日志；详情按钮仍单行 3 列紧凑排列。

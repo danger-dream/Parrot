@@ -8,6 +8,8 @@ import sys as _sys
 import time
 from types import SimpleNamespace
 
+import pytest
+
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 from src.tests import _isolation
 _isolation.isolate()
@@ -36,6 +38,15 @@ def _setup(m):
         "api:openai": "openai",
     }
     m["config"].get()["pricing"] = pricing
+    m["config"].get()["modelBindings"] = {
+        "defaults": {
+            "gpt-5.6-luna": {"target": "openai/gpt-5.6-luna", "source": "test"},
+            "gpt-5.6-sol": {"target": "openai/gpt-5.6-sol", "source": "test"},
+            "grok-4.5": {"target": "xai/grok-4.5", "source": "test"},
+            "claude-opus-4-6": {"target": "anthropic/claude-opus-4-6", "source": "test"},
+        },
+        "scoped": {},
+    }
     m["log_db"].init()
     conn = m["log_db"]._get_conn()
     for table in ("upstream_attempt_usage", "retry_chain", "request_detail", "request_log"):
@@ -48,6 +59,179 @@ def _pending(ld, rid: str, model: str = "gpt-5.6-luna", *, fast: bool = False):
         rid, "127.0.0.1", "k", model, False, 1, 0, {}, {},
         ingress_protocol="responses", fast_mode=fast,
     )
+
+
+def _attempt(
+    ld, rid: str, order: int, channel: str, channel_type: str,
+    model: str, started_at: float, *, protocol: str = "openai-responses",
+):
+    return ld.record_retry_attempt(
+        rid, order, channel, channel_type, model, started_at,
+        upstream_protocol=protocol,
+    )
+
+
+def _dispatch(ld, attempt, model: str, **payload):
+    ld.mark_retry_attempt_dispatch(attempt, {"model": model, **payload})
+
+
+def test_anthropic_tracker_observes_zero_usage_and_preserves_start_snapshot(m):
+    tracker = m["failover"].upstream.SSEUsageTracker()
+    tracker.feed(
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":100,"cache_creation_input_tokens":0,'
+        b'"cache_read_input_tokens":20}}}\n\n'
+    )
+    tracker.feed(
+        b'data: {"type":"message_delta","usage":{"input_tokens":0,'
+        b'"output_tokens":10,"cache_creation_input_tokens":0,'
+        b'"cache_read_input_tokens":0}}\n\n'
+    )
+    assert tracker.usage_observed is True
+    assert tracker.usage == {
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "cache_creation": 0,
+        "cache_read": 20,
+    }
+
+    explicit_zero = m["failover"].upstream.SSEUsageTracker()
+    explicit_zero.feed(
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":0,"output_tokens":0,'
+        b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
+    )
+    assert explicit_zero.usage_observed is True
+    assert not any(explicit_zero.usage.values())
+
+    missing = m["failover"].upstream.SSEUsageTracker()
+    missing.feed(b'data: {"type":"message_start","message":{}}\n\n')
+    assert missing.usage_observed is False
+
+    malformed = m["failover"].upstream.SSEUsageTracker()
+    malformed.feed(
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":"broken","output_tokens":0}}}\n\n'
+    )
+    assert malformed.usage_observed is False
+    assert malformed.usage_invalid is True
+
+
+def _install_anthropic_test_tariff(m):
+    mp = m["model_pricing"]
+    mp.initialize()
+    target = "anthropic/claude-ledger-price"
+    mp._catalog_models[target] = {
+        "id": "claude-ledger-price",
+        "name": "Claude Ledger Test",
+        "family": "test",
+        "limit": {"context": 200000, "output": 10000},
+        "cost": {"input": 1, "output": 2, "cache_write": 3, "cache_read": 0.5},
+    }
+    mp._catalog[target] = mp.PricingEntry(
+        input_per_token=1 / 1_000_000,
+        output_per_token=2 / 1_000_000,
+        cache_write_per_token=3 / 1_000_000,
+        cache_read_per_token=0.5 / 1_000_000,
+    )
+    m["config"].get()["modelBindings"]["defaults"]["claude-ledger"] = {
+        "target": target, "source": "test",
+    }
+
+
+def _anthropic_zero_delta_tracker(m):
+    tracker = m["failover"].upstream.SSEUsageTracker()
+    tracker.feed(
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":100,"cache_creation_input_tokens":0,'
+        b'"cache_read_input_tokens":20,"output_tokens":0}}}\n\n'
+        b'data: {"type":"message_delta","usage":{"input_tokens":0,'
+        b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,'
+        b'"output_tokens":10}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+    return tracker
+
+
+def test_anthropic_tracker_snapshot_is_authoritative_for_request_and_attempt_ticks(m):
+    _setup(m)
+    _install_anthropic_test_tariff(m)
+    ld = m["log_db"]
+    rid = "anthropic-zero-delta-success"
+    _pending(ld, rid, "claude-ledger")
+    aid = _attempt(
+        ld, rid, 1, "api:anthropic-ledger", "api", "claude-ledger", 1.0,
+        protocol="anthropic",
+    )
+    _dispatch(ld, aid, "claude-ledger")
+    tracker = _anthropic_zero_delta_tracker(m)
+    ld.finish_success(
+        rid, "api:anthropic-ledger", "api", "claude-ledger",
+        input_tokens=tracker.usage["input_tokens"],
+        output_tokens=tracker.usage["output_tokens"],
+        cache_creation_tokens=tracker.usage["cache_creation"],
+        cache_read_tokens=tracker.usage["cache_read"],
+        response_body=tracker.get_full_response(),
+        usage_observed=tracker.usage_observed,
+    )
+    ld.update_retry_attempt(aid, outcome="success", ended_at=2.0)
+
+    request = ld._get_conn().execute(
+        "SELECT * FROM request_log WHERE request_id=?", (rid,),
+    ).fetchone()
+    attempt = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (aid.row_id,),
+    ).fetchone()
+    assert (
+        request["input_tokens"], request["output_tokens"],
+        request["cache_creation_tokens"], request["cache_read_tokens"],
+        request["usage_observed"],
+    ) == (100, 10, 0, 20, 1)
+    assert (
+        attempt["input_tokens"], attempt["output_tokens"],
+        attempt["cache_creation_tokens"], attempt["cache_read_tokens"],
+        attempt["usage_observed"],
+    ) == (100, 10, 0, 20, 1)
+    assert attempt["cost_source"] == "estimated"
+    assert attempt["cost_ticks"] == 1_300_000
+    assert attempt["binding_provider_id"] == "anthropic"
+    assert attempt["binding_model_id"] == "claude-ledger-price"
+    assert attempt["binding_json"] and attempt["binding_version"]
+
+
+@pytest.mark.parametrize("outcome,status", [("stream_upstream_error", "error"), ("client_disconnected", "cancelled")])
+def test_anthropic_tracker_snapshot_survives_error_and_cancel_settlement(m, outcome, status):
+    _setup(m)
+    _install_anthropic_test_tariff(m)
+    ld = m["log_db"]
+    rid = f"anthropic-zero-delta-{status}"
+    _pending(ld, rid, "claude-ledger")
+    aid = _attempt(
+        ld, rid, 1, "api:anthropic-ledger", "api", "claude-ledger", 1.0,
+        protocol="anthropic",
+    )
+    _dispatch(ld, aid, "claude-ledger")
+    tracker = _anthropic_zero_delta_tracker(m)
+    ld.update_retry_attempt(
+        aid, outcome=outcome, ended_at=2.0,
+        response_body=tracker.get_full_response(), usage=tracker.usage,
+        usage_observed=tracker.usage_observed, settle=False,
+    )
+    ld.finish_error(
+        rid, outcome, final_channel_key="api:anthropic-ledger",
+        final_channel_type="api", final_model="claude-ledger",
+        response_body=tracker.get_full_response(), usage=tracker.usage,
+        usage_observed=tracker.usage_observed, status=status,
+    )
+    attempt = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (aid.row_id,),
+    ).fetchone()
+    assert (
+        attempt["input_tokens"], attempt["output_tokens"],
+        attempt["cache_creation_tokens"], attempt["cache_read_tokens"],
+    ) == (100, 10, 0, 20)
+    assert attempt["usage_observed"] == 1
+    assert attempt["cost_ticks"] == 1_300_000
 
 
 def test_strict_normalization_observes_zero_and_terminal_errors(m):
@@ -165,8 +349,8 @@ def test_http_pre_header_cancellation_terminalizes_root_and_retry(m, monkeypatch
     rid = "cancel-before-headers"
     body = {"model": "test-model", "input": "hello", "stream": False}
     _pending(m["log_db"], rid, "test-model")
-    retry = m["log_db"].record_retry_attempt(
-        rid, 1, ch.key, ch.type, "gpt-5.6-luna", time.time(),
+    retry = _attempt(
+        m["log_db"], rid, 1, ch.key, ch.type, "gpt-5.6-luna", time.time(),
     )
     entered = asyncio.Event()
 
@@ -218,8 +402,8 @@ def test_http_body_cancellation_preserves_complete_usage_chunk(m, monkeypatch):
     rid = "cancel-after-body-chunk"
     body = {"model": "test-model", "input": "hello", "stream": False}
     _pending(m["log_db"], rid, "test-model")
-    retry = m["log_db"].record_retry_attempt(
-        rid, 1, ch.key, ch.type, "gpt-5.6-luna", time.time(),
+    retry = _attempt(
+        m["log_db"], rid, 1, ch.key, ch.type, "gpt-5.6-luna", time.time(),
     )
     waiting = asyncio.Event()
     closed = []
@@ -253,7 +437,8 @@ def test_http_body_cancellation_preserves_complete_usage_chunk(m, monkeypatch):
 
     async def fake_open(**kwargs):
         m["log_db"].mark_retry_attempt_dispatch(
-            kwargs["retry_attempt_id"], {"service_tier": "default"},
+            kwargs["retry_attempt_id"],
+            {"model": "gpt-5.6-luna", "service_tier": "default"},
         )
         return SimpleNamespace(
             error=None,
@@ -351,13 +536,14 @@ def test_provider_qualified_bundled_grok_default(m):
 def test_missing_usage_unpriced_but_explicit_zero_costs_zero(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "missing")
-    a1 = ld.record_retry_attempt("missing", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
-    ld.mark_retry_attempt_dispatch(a1, {})
+    a1 = _attempt(ld, "missing", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    _dispatch(ld, a1, "gpt-5.6-luna")
     ld.update_retry_attempt(a1, outcome="http_error", ended_at=2.0)
     ld.finish_error("missing", "boom", final_channel_key="api:A", final_model="gpt-5.6-luna")
 
     _pending(ld, "zero")
-    a2 = ld.record_retry_attempt("zero", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    a2 = _attempt(ld, "zero", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    _dispatch(ld, a2, "gpt-5.6-luna")
     body = json.dumps({"usage": {"input_tokens": 0, "output_tokens": 0}})
     ld.finish_success("zero", "api:A", "api", "gpt-5.6-luna", response_body=body)
     ld.update_retry_attempt(a2, outcome="success", ended_at=2.0)
@@ -370,7 +556,7 @@ def test_missing_usage_unpriced_but_explicit_zero_costs_zero(m):
     assert tuple(rows[0])[:5] == ("missing", 0, "sent", "unpriced", None)
     assert tuple(rows[1])[:5] == ("zero", 1, "sent", "estimated", 0)
     assert rows[1]["pricing_snapshot_json"]
-    assert rows[1]["pricing_version"].startswith("pricing-v1:")
+    assert rows[1]["pricing_version"].startswith("pricing-v2:")
     assert ld.cost_for_log(dict(ld._get_conn().execute(
         "SELECT * FROM request_log WHERE request_id='missing'"
     ).fetchone()))["unpriced_success"] == 1
@@ -383,19 +569,20 @@ def test_missing_usage_unpriced_but_explicit_zero_costs_zero(m):
 def test_partial_attempt_ledger_keeps_missing_dispatched_attempt_unpriced(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "partial-ledger")
-    settled = ld.record_retry_attempt(
-        "partial-ledger", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    settled = _attempt(
+        ld, "partial-ledger", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
     )
+    _dispatch(ld, settled, "gpt-5.6-luna")
     ld.update_retry_attempt(
         settled,
         outcome="http_error",
         ended_at=2.0,
         response_body=json.dumps({"usage": {"input_tokens": 10, "output_tokens": 1}}),
     )
-    crashed = ld.record_retry_attempt(
-        "partial-ledger", 2, "api:B", "api", "gpt-5.6-sol", 3.0,
+    crashed = _attempt(
+        ld, "partial-ledger", 2, "api:B", "api", "gpt-5.6-sol", 3.0,
     )
-    ld.mark_retry_attempt_dispatch(crashed, {"model": "gpt-5.6-sol"})
+    _dispatch(ld, crashed, "gpt-5.6-sol")
     # Simulate process death after dispatch and later stale-request recovery.
     ld._get_conn().execute(
         """UPDATE request_log
@@ -431,10 +618,143 @@ def test_partial_attempt_ledger_keeps_missing_dispatched_attempt_unpriced(m):
     assert apikey_models["gpt-5.6-sol"]["unpriced_success"] == 1
 
 
+def test_dispatch_binding_is_frozen_across_config_change_and_next_attempt_uses_new_tariff(m):
+    _setup(m)
+    ld = m["log_db"]
+    mp = m["model_pricing"]
+    mp.initialize()
+    for suffix, input_price, output_price in (("a", 1, 2), ("b", 9, 18)):
+        target = f"provider/price-{suffix}"
+        mp._catalog_models[target] = {
+            "id": f"price-{suffix}", "name": f"Price {suffix.upper()}",
+            "limit": {"context": 100000, "output": 10000},
+            "cost": {"input": input_price, "output": output_price},
+        }
+        mp._catalog[target] = mp.PricingEntry(
+            input_price / 1_000_000, output_price / 1_000_000, 0, 0,
+        )
+    m["config"].get()["modelBindings"]["scoped"] = {
+        "api:freeze": {
+            "route-model": {
+                "target": "provider/price-a", "outboundModel": "route-model",
+                "source": "test",
+            },
+        },
+    }
+
+    _pending(ld, "freeze-current", "route-model")
+    first = _attempt(
+        ld, "freeze-current", 1, "api:freeze", "api", "route-model", 1.0,
+    )
+    _dispatch(ld, first, "route-model")
+    frozen_retry = ld._get_conn().execute(
+        "SELECT * FROM retry_chain WHERE id=?", (first.row_id,),
+    ).fetchone()
+
+    m["config"].get()["modelBindings"]["scoped"]["api:freeze"]["route-model"] = {
+        "target": "provider/price-b", "outboundModel": "route-model",
+        "source": "test",
+    }
+    mp._catalog["provider/price-a"] = mp.PricingEntry(
+        99 / 1_000_000, 198 / 1_000_000, 0, 0,
+    )
+    # A second transport hook cannot mutate the already frozen attempt.
+    _dispatch(ld, first, "route-model", service_tier="priority")
+    still_frozen = ld._get_conn().execute(
+        "SELECT * FROM retry_chain WHERE id=?", (first.row_id,),
+    ).fetchone()
+    assert still_frozen["binding_version"] == frozen_retry["binding_version"]
+    assert still_frozen["outbound_service_tier"] == "default"
+
+    body = json.dumps({"service_tier": "default", "usage": {"input_tokens": 1, "output_tokens": 0}})
+    ld.finish_success(
+        "freeze-current", "api:freeze", "api", "route-model",
+        input_tokens=1, output_tokens=0, response_body=body,
+        usage_observed=True,
+    )
+    first_usage = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (first.row_id,),
+    ).fetchone()
+    assert first_usage["cost_ticks"] == 10_000
+    assert first_usage["binding_version"] == frozen_retry["binding_version"]
+    assert first_usage["binding_pricing_key"] == "provider/price-a"
+    assert first_usage["binding_provider_id"] == "provider"
+
+    _pending(ld, "freeze-next", "route-model")
+    second = _attempt(
+        ld, "freeze-next", 1, "api:freeze", "api", "route-model", 2.0,
+    )
+    _dispatch(ld, second, "route-model")
+    ld.finish_success(
+        "freeze-next", "api:freeze", "api", "route-model",
+        input_tokens=1, output_tokens=0, response_body=body,
+        usage_observed=True,
+    )
+    second_usage = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (second.row_id,),
+    ).fetchone()
+    assert second_usage["cost_ticks"] == 90_000
+    assert second_usage["binding_pricing_key"] == "provider/price-b"
+    assert second_usage["binding_version"] != first_usage["binding_version"]
+    aggregate = ld.stats_summary(0)["overall"]
+    assert aggregate["cost_ticks"] == 100_000
+
+
+def test_catalog_refresh_after_dispatch_changes_only_the_next_attempt(m, monkeypatch):
+    _setup(m)
+    ld = m["log_db"]
+    mp = m["model_pricing"]
+    _pending(ld, "catalog-frozen")
+    first = _attempt(
+        ld, "catalog-frozen", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    )
+    _dispatch(ld, first, "gpt-5.6-luna")
+    first_retry = ld._get_conn().execute(
+        "SELECT * FROM retry_chain WHERE id=?", (first.row_id,),
+    ).fetchone()
+
+    refreshed = dict(mp._catalog)
+    refreshed["openai/gpt-5.6-luna"] = mp.PricingEntry(
+        99 / 1_000_000, 198 / 1_000_000, 0, 0,
+    )
+    monkeypatch.setattr(mp, "_catalog", refreshed)
+    monkeypatch.setattr(mp, "_catalog_revision", "models-dev-sha256:refreshed")
+
+    body = json.dumps({"service_tier": "default", "usage": {"input_tokens": 1, "output_tokens": 0}})
+    ld.finish_success(
+        "catalog-frozen", "api:A", "api", "gpt-5.6-luna",
+        input_tokens=1, output_tokens=0, response_body=body,
+        usage_observed=True,
+    )
+    first_usage = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (first.row_id,),
+    ).fetchone()
+    assert first_usage["binding_version"] == first_retry["binding_version"]
+    assert first_usage["cost_ticks"] == 10_000
+
+    _pending(ld, "catalog-next")
+    second = _attempt(
+        ld, "catalog-next", 1, "api:A", "api", "gpt-5.6-luna", 2.0,
+    )
+    _dispatch(ld, second, "gpt-5.6-luna")
+    ld.finish_success(
+        "catalog-next", "api:A", "api", "gpt-5.6-luna",
+        input_tokens=1, output_tokens=0, response_body=body,
+        usage_observed=True,
+    )
+    second_usage = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (second.row_id,),
+    ).fetchone()
+    assert second_usage["cost_ticks"] == 990_000
+    assert second_usage["binding_revision"] == "models-dev-sha256:refreshed"
+    assert second_usage["binding_version"] != first_usage["binding_version"]
+
+
 def test_actual_service_tier_overrides_fast_intent(m):
     _setup(m); ld = m["log_db"]; mp = m["model_pricing"]
     _pending(ld, "tier", fast=True)
-    aid = ld.record_retry_attempt("tier", 1, "api:openai", "api", "gpt-5.6-luna", 1.0)
+    aid = _attempt(ld, "tier", 1, "api:openai", "api", "gpt-5.6-luna", 1.0)
+    _dispatch(ld, aid, "gpt-5.6-luna", service_tier="priority")
     body = json.dumps({
         "service_tier": "default",
         "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
@@ -466,10 +786,10 @@ def test_actual_service_tier_overrides_fast_intent(m):
 def test_outbound_tier_is_second_precedence_and_intent_is_not_billing_fact(m):
     _setup(m); ld = m["log_db"]; mp = m["model_pricing"]
     _pending(ld, "outbound", fast=False)
-    aid = ld.record_retry_attempt(
-        "outbound", 1, "api:openai", "api", "gpt-5.6-luna", 1.0,
+    aid = _attempt(
+        ld, "outbound", 1, "api:openai", "api", "gpt-5.6-luna", 1.0,
     )
-    ld.mark_retry_attempt_dispatch(aid, {"service_tier": "priority"})
+    _dispatch(ld, aid, "gpt-5.6-luna", service_tier="priority")
     body = json.dumps({"usage": {"input_tokens": 100_000, "output_tokens": 100_000}})
     ld.finish_success(
         "outbound", "api:openai", "api", "gpt-5.6-luna",
@@ -492,10 +812,10 @@ def test_outbound_tier_is_second_precedence_and_intent_is_not_billing_fact(m):
 def test_unknown_or_unpriced_upstream_service_tier_is_not_standard_priced(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "unknown-tier")
-    aid = ld.record_retry_attempt(
-        "unknown-tier", 1, "api:openai", "api", "gpt-5.6-luna", 1.0,
+    aid = _attempt(
+        ld, "unknown-tier", 1, "api:openai", "api", "gpt-5.6-luna", 1.0,
     )
-    ld.mark_retry_attempt_dispatch(aid, {"service_tier": "flex"})
+    _dispatch(ld, aid, "gpt-5.6-luna", service_tier="flex")
     body = json.dumps({
         "service_tier": "flex",
         "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
@@ -516,12 +836,50 @@ def test_unknown_or_unpriced_upstream_service_tier_is_not_standard_priced(m):
     assert ld.cost_for_log(request)["unpriced_success"] == 1
 
 
+def test_xai_actual_zero_uses_provider_binding_and_non_xai_does_not_trust_it(m):
+    _setup(m)
+    ld = m["log_db"]
+
+    _pending(ld, "xai-zero", "grok-4.5")
+    xai = _attempt(
+        ld, "xai-zero", 1, "oauth:xai:user@example.com", "oauth", "grok-4.5", 1.0,
+    )
+    _dispatch(ld, xai, "grok-4.5")
+    xai_body = json.dumps({
+        "service_tier": "default",
+        "usage": {"input_tokens": 10, "output_tokens": 2, "cost_in_usd_ticks": 0},
+    })
+    ld.update_retry_attempt(xai, outcome="http_error", response_body=xai_body, ended_at=2.0)
+    xai_row = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (xai.row_id,),
+    ).fetchone()
+    assert (xai_row["cost_source"], xai_row["cost_ticks"]) == ("actual", 0)
+
+    _pending(ld, "not-xai-zero")
+    other = _attempt(
+        ld, "not-xai-zero", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    )
+    _dispatch(ld, other, "gpt-5.6-luna")
+    other_body = json.dumps({
+        "service_tier": "default",
+        "usage": {"input_tokens": 10, "output_tokens": 2, "cost_in_usd_ticks": 0},
+    })
+    ld.update_retry_attempt(other, outcome="http_error", response_body=other_body, ended_at=2.0)
+    other_row = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?", (other.row_id,),
+    ).fetchone()
+    assert other_row["binding_provider_id"] == "openai"
+    assert other_row["cost_source"] == "estimated"
+    assert other_row["cost_ticks"] > 0
+
+
 def test_xai_error_actual_cost_and_strict_sse(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "xai-err", "grok-4.5")
-    aid = ld.record_retry_attempt(
-        "xai-err", 1, "oauth:xai:user@example.com", "oauth", "grok-4.5", 1.0
+    aid = _attempt(
+        ld, "xai-err", 1, "oauth:xai:user@example.com", "oauth", "grok-4.5", 1.0
     )
+    _dispatch(ld, aid, "grok-4.5", service_tier="priority")
     body = (
         'event: response.failed\n'
         'data: {"type":"response.failed","response":{"service_tier":"priority",'
@@ -538,7 +896,7 @@ def test_xai_error_actual_cost_and_strict_sse(m):
     assert row["cost_source"] == "actual" and row["cost_ticks"] == 321
     assert row["pricing_model"] == "xai/grok-4.5"
     assert row["usage_observed"] == 0
-    assert row["pricing_version"] == "upstream-actual-v1"
+    assert row["pricing_version"].startswith("upstream-actual-v2:")
 
 
 def test_legacy_xai_error_response_without_actual_cost_is_explicitly_unpriced(m):
@@ -620,10 +978,10 @@ def test_pre_dispatch_guard_does_not_create_billing_fact(m):
 def test_response_transform_failure_after_dispatch_preserves_billing_fact(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "post-dispatch-transform")
-    aid = ld.record_retry_attempt(
-        "post-dispatch-transform", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    aid = _attempt(
+        ld, "post-dispatch-transform", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
     )
-    ld.mark_retry_attempt_dispatch(aid, {})
+    _dispatch(ld, aid, "gpt-5.6-luna")
     ld.update_retry_attempt(
         aid,
         outcome="transform_error",
@@ -662,11 +1020,11 @@ def test_known_connect_failure_before_dispatch_is_not_an_unpriced_bill(m):
 def test_anthropic_outbound_speed_fast_freezes_models_dev_fast_tariff(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "claude-fast", "claude-opus-4-6")
-    aid = ld.record_retry_attempt(
-        "claude-fast", 1, "oauth:anthropic:user@example.com", "oauth",
-        "claude-opus-4-6", 1.0,
+    aid = _attempt(
+        ld, "claude-fast", 1, "oauth:anthropic:user@example.com", "oauth",
+        "claude-opus-4-6", 1.0, protocol="anthropic",
     )
-    ld.mark_retry_attempt_dispatch(aid, json.dumps({"speed": "fast"}))
+    _dispatch(ld, aid, "claude-opus-4-6", speed="fast")
     body = json.dumps({"usage": {"input_tokens": 100, "output_tokens": 10}})
     ld.finish_success(
         "claude-fast", "oauth:anthropic:user@example.com", "oauth",
@@ -697,10 +1055,12 @@ def test_anthropic_outbound_speed_fast_freezes_models_dev_fast_tariff(m):
 def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "multi")
-    a1 = ld.record_retry_attempt("multi", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    a1 = _attempt(ld, "multi", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    _dispatch(ld, a1, "gpt-5.6-luna")
     b1 = json.dumps({"usage": {"input_tokens": 100, "output_tokens": 10}})
     ld.update_retry_attempt(a1, outcome="http_error", response_body=b1, ended_at=2.0)
-    a2 = ld.record_retry_attempt("multi", 2, "api:B", "api", "gpt-5.6-luna", 3.0)
+    a2 = _attempt(ld, "multi", 2, "api:B", "api", "gpt-5.6-luna", 3.0)
+    _dispatch(ld, a2, "gpt-5.6-luna")
     b2 = json.dumps({"usage": {"input_tokens": 200, "output_tokens": 20}})
     ld.finish_success(
         "multi", "api:B", "api", "gpt-5.6-luna",
@@ -711,9 +1071,11 @@ def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
     # Compact map/reduce uses child call ids but must aggregate on the parent.
     _pending(ld, "compact", "gpt-5.6-sol")
     for order, suffix, inp in ((1, "1", 30), (2, "2", 40), (3, "reduce", 50)):
-        aid = ld.record_retry_attempt(
-            f"compact:compact:{suffix}", order, "api:C", "api", "gpt-5.6-sol", float(order)
+        aid = _attempt(
+            ld, f"compact:compact:{suffix}", order, "api:C", "api",
+            "gpt-5.6-sol", float(order),
         )
+        _dispatch(ld, aid, "gpt-5.6-sol")
         body = json.dumps({"usage": {"input_tokens": inp, "output_tokens": 5}})
         ld.settle_retry_attempt(aid, outcome="success", response_body=body)
         ld.update_retry_attempt(aid, outcome="success", ended_at=float(order + 1))
@@ -751,16 +1113,18 @@ def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
 def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "model-split", "gpt-5.6-luna")
-    first = ld.record_retry_attempt(
-        "model-split", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
+    first = _attempt(
+        ld, "model-split", 1, "api:A", "api", "gpt-5.6-luna", 1.0,
     )
+    _dispatch(ld, first, "gpt-5.6-luna")
     ld.update_retry_attempt(
         first, outcome="http_error", ended_at=2.0,
         response_body=json.dumps({"usage": {"input_tokens": 10, "output_tokens": 1}}),
     )
-    second = ld.record_retry_attempt(
-        "model-split", 2, "api:B", "api", "gpt-5.6-sol", 3.0,
+    second = _attempt(
+        ld, "model-split", 2, "api:B", "api", "gpt-5.6-sol", 3.0,
     )
+    _dispatch(ld, second, "gpt-5.6-sol")
     final_body = json.dumps({"usage": {"input_tokens": 20, "output_tokens": 2}})
     ld.finish_success(
         "model-split", "api:B", "api", "gpt-5.6-sol",
@@ -785,7 +1149,8 @@ def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
 def test_token_surfaces_show_cost_without_cache_hit(m):
     _setup(m); ld = m["log_db"]; ui = m["ui"]
     _pending(ld, "display")
-    aid = ld.record_retry_attempt("display", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    aid = _attempt(ld, "display", 1, "api:A", "api", "gpt-5.6-luna", 1.0)
+    _dispatch(ld, aid, "gpt-5.6-luna")
     body = json.dumps({"usage": {"input_tokens": 100, "output_tokens": 10}})
     ld.finish_success(
         "display", "api:A", "api", "gpt-5.6-luna",
@@ -794,7 +1159,7 @@ def test_token_surfaces_show_cost_without_cache_hit(m):
     ld.update_retry_attempt(aid, outcome="success", ended_at=2.0)
     row = dict(ld._get_conn().execute("SELECT * FROM request_log WHERE request_id='display'").fetchone())
     rendered = ui.fmt_log_entry_body(row)
-    assert "Token:" in rendered and "💵" in rendered
+    assert "Token:" in rendered and "$" in rendered and "💵" not in rendered
     assert "未计价" not in rendered
 
 
@@ -831,13 +1196,13 @@ def test_backward_compatible_schema_migration_keeps_old_rows_readable(m):
 def test_transformed_outbound_priority_is_persisted_and_response_overrides_it(m):
     _setup(m); ld = m["log_db"]; mp = m["model_pricing"]
     _pending(ld, "outbound-tier")
-    aid = ld.record_retry_attempt(
-        "outbound-tier", 1, "oauth:openai:user@example.com", "oauth",
+    aid = _attempt(
+        ld, "outbound-tier", 1, "oauth:openai:user@example.com", "oauth",
         "gpt-5.6-luna", 1.0,
     )
     # This is the post-transform payload: Anthropic auto on Codex becomes
     # OpenAI priority even though the downstream fast_mode flag was false.
-    ld.mark_retry_attempt_dispatch(aid, {"service_tier": "priority"})
+    _dispatch(ld, aid, "gpt-5.6-luna", service_tier="priority")
     body = json.dumps({"usage": {"input_tokens": 100_000, "output_tokens": 100_000}})
     ld.finish_success(
         "outbound-tier", "oauth:openai:user@example.com", "oauth", "gpt-5.6-luna",
@@ -861,10 +1226,10 @@ def test_transformed_outbound_priority_is_persisted_and_response_overrides_it(m)
     assert row["cost_ticks"] == expected.total_ticks
 
     _pending(ld, "response-tier", fast=True)
-    aid2 = ld.record_retry_attempt(
-        "response-tier", 1, "api:openai", "api", "gpt-5.6-luna", 1.0,
+    aid2 = _attempt(
+        ld, "response-tier", 1, "api:openai", "api", "gpt-5.6-luna", 1.0,
     )
-    ld.mark_retry_attempt_dispatch(aid2, {"service_tier": "priority"})
+    _dispatch(ld, aid2, "gpt-5.6-luna", service_tier="priority")
     default_body = json.dumps({
         "service_tier": "default",
         "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
@@ -915,15 +1280,22 @@ def test_partial_attempt_schema_migration_is_idempotent(m):
         "call_request_id", "usage_observed", "service_tier",
         "outbound_service_tier", "dispatch_state", "pricing_snapshot_json",
         "pricing_version", "cost_source", "cost_ticks", "settled_at",
+        "binding_provider_id", "binding_model_id", "binding_pricing_key",
+        "binding_source", "binding_json", "binding_version", "binding_revision",
     } <= attempt_cols
-    assert "outbound_service_tier" in retry_cols
+    assert {
+        "outbound_service_tier", "upstream_protocol", "binding_provider_id",
+        "binding_model_id", "binding_pricing_key", "binding_source",
+        "binding_json", "binding_version", "binding_revision",
+    } <= retry_cols
 
 
 def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):
     _setup(m); ld = m["log_db"]; ui = m["ui"]
     channel = "oauth:xai:user@example.com"
     _pending(ld, "xai-consistent", "grok-4.5")
-    aid = ld.record_retry_attempt("xai-consistent", 1, channel, "oauth", "grok-4.5", 1.0)
+    aid = _attempt(ld, "xai-consistent", 1, channel, "oauth", "grok-4.5", 1.0)
+    _dispatch(ld, aid, "grok-4.5")
     body = json.dumps({
         "usage": {"input_tokens": 10, "output_tokens": 2, "cost_in_usd_ticks": 321}
     })
@@ -940,7 +1312,7 @@ def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):
     global_cost = ld.stats_summary(0, summary_top_limit=5)["overall"]
     assert per_log["cost_ticks"] == per_account["cost_ticks"] == global_cost["cost_ticks"] == 321
     assert ui.fmt_cost(per_log) == ui.fmt_cost(per_account) == ui.fmt_cost(global_cost)
-    assert "计费: 💵 实际 $0.00" in ui.fmt_log_entry_body(request_row)
+    assert "计费: $0.000" in ui.fmt_log_entry_body(request_row)
     from src.telegram.menus import logs_menu
     assert "<b>计费</b>\n💵 实际 $0.00" in logs_menu._render_detail(
         ld.log_detail("xai-consistent")
@@ -955,14 +1327,14 @@ def test_xai_actual_cost_requires_provider_qualified_route(m):
     m["config"].get()["pricing"] = pricing
 
     _pending(ld, "xai-mapped", "grok-4.5")
-    mapped = ld.record_retry_attempt(
-        "xai-mapped", 1, "api:vendor", "api", "grok-4.5", 1.0,
+    mapped = _attempt(
+        ld, "xai-mapped", 1, "api:vendor", "api", "grok-4.5", 1.0,
     )
     mapped_body = json.dumps({
         "usage": {"input_tokens": 10, "output_tokens": 2,
                   "cost_in_usd_ticks": 321}
     })
-    ld.mark_retry_attempt_dispatch(mapped, {})
+    _dispatch(ld, mapped, "grok-4.5")
     ld.update_retry_attempt(
         mapped, outcome="http_error", response_body=mapped_body, ended_at=2.0,
     )
@@ -972,11 +1344,14 @@ def test_xai_actual_cost_requires_provider_qualified_route(m):
     ).fetchone()
     assert tuple(mapped_row) == ("xai/grok-4.5", "actual", 321)
 
+    # Without an effective binding, an API channel name/provider hint is not
+    # sufficient to trust provider-reported actual cost.
+    del m["config"].get()["modelBindings"]["defaults"]["grok-4.5"]
     _pending(ld, "xai-name-only", "grok-4.5")
-    name_only = ld.record_retry_attempt(
-        "xai-name-only", 1, "api:xai:unproven", "api", "grok-4.5", 1.0,
+    name_only = _attempt(
+        ld, "xai-name-only", 1, "api:xai:unproven", "api", "grok-4.5", 1.0,
     )
-    ld.mark_retry_attempt_dispatch(name_only, {})
+    _dispatch(ld, name_only, "grok-4.5")
     ld.update_retry_attempt(
         name_only, outcome="http_error", response_body=mapped_body, ended_at=2.0,
     )
@@ -984,7 +1359,7 @@ def test_xai_actual_cost_requires_provider_qualified_route(m):
         "SELECT pricing_model,cost_source,cost_ticks FROM upstream_attempt_usage "
         "WHERE retry_attempt_id=?", (name_only.row_id,),
     ).fetchone()
-    assert name_row["pricing_model"] == "grok-4.5"
+    assert name_row["pricing_model"] is None
     assert name_row["cost_source"] == "unpriced"
     assert name_row["cost_ticks"] is None
 

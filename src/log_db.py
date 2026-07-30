@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from . import config, model_pricing
+from . import config, model_metadata, model_pricing
 
 _BJT = timezone(timedelta(hours=8))
 _local = threading.local()
@@ -181,6 +181,7 @@ def _schema_sql() -> str:
       channel_key     TEXT NOT NULL,
       channel_type    TEXT NOT NULL,
       model           TEXT NOT NULL,
+      client_visible_model TEXT,
       started_at      REAL NOT NULL,
       -- Final/terminal route-round summary for this channel attempt.
       final_round_id  TEXT,
@@ -201,7 +202,15 @@ def _schema_sql() -> str:
       bytes_down      INTEGER DEFAULT 0,
       -- Set immediately before the transport owns/sends the upstream request.
       dispatched_at   REAL,
-      outbound_service_tier TEXT
+      outbound_service_tier TEXT,
+      upstream_protocol TEXT,
+      binding_provider_id TEXT,
+      binding_model_id TEXT,
+      binding_pricing_key TEXT,
+      binding_source TEXT,
+      binding_json TEXT,
+      binding_version TEXT,
+      binding_revision TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_retry_req ON retry_chain(request_id);
 
@@ -217,6 +226,13 @@ def _schema_sql() -> str:
       channel_type          TEXT NOT NULL,
       model                 TEXT NOT NULL,
       pricing_model         TEXT,
+      binding_provider_id   TEXT,
+      binding_model_id      TEXT,
+      binding_pricing_key   TEXT,
+      binding_source        TEXT,
+      binding_json          TEXT,
+      binding_version       TEXT,
+      binding_revision      TEXT,
       outcome               TEXT,
       usage_observed        INTEGER NOT NULL DEFAULT 0,
       input_tokens          INTEGER NOT NULL DEFAULT 0,
@@ -430,6 +446,9 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           root_request_id TEXT NOT NULL, call_request_id TEXT NOT NULL,
           attempt_order INTEGER NOT NULL, channel_key TEXT NOT NULL,
           channel_type TEXT NOT NULL, model TEXT NOT NULL, pricing_model TEXT,
+          binding_provider_id TEXT, binding_model_id TEXT, binding_pricing_key TEXT,
+          binding_source TEXT, binding_json TEXT, binding_version TEXT,
+          binding_revision TEXT,
           outcome TEXT, usage_observed INTEGER NOT NULL DEFAULT 0,
           input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
           cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -455,6 +474,13 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
             ("channel_type", "ALTER TABLE upstream_attempt_usage ADD COLUMN channel_type TEXT NOT NULL DEFAULT ''"),
             ("model", "ALTER TABLE upstream_attempt_usage ADD COLUMN model TEXT NOT NULL DEFAULT ''"),
             ("pricing_model", "ALTER TABLE upstream_attempt_usage ADD COLUMN pricing_model TEXT"),
+            ("binding_provider_id", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_provider_id TEXT"),
+            ("binding_model_id", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_model_id TEXT"),
+            ("binding_pricing_key", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_pricing_key TEXT"),
+            ("binding_source", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_source TEXT"),
+            ("binding_json", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_json TEXT"),
+            ("binding_version", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_version TEXT"),
+            ("binding_revision", "ALTER TABLE upstream_attempt_usage ADD COLUMN binding_revision TEXT"),
             ("outcome", "ALTER TABLE upstream_attempt_usage ADD COLUMN outcome TEXT"),
             ("usage_observed", "ALTER TABLE upstream_attempt_usage ADD COLUMN usage_observed INTEGER NOT NULL DEFAULT 0"),
             ("input_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0"),
@@ -509,6 +535,16 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     if retry_cols and "dispatched_at" not in retry_cols:
         conn.execute("ALTER TABLE retry_chain ADD COLUMN dispatched_at REAL")
         changed = True
+    if retry_cols:
+        for col in (
+            "upstream_protocol", "client_visible_model",
+            "binding_provider_id", "binding_model_id",
+            "binding_pricing_key", "binding_source", "binding_json",
+            "binding_version", "binding_revision",
+        ):
+            if col not in retry_cols:
+                conn.execute(f"ALTER TABLE retry_chain ADD COLUMN {col} TEXT")
+                changed = True
 
     proxy_cols = {row[1] for row in conn.execute("PRAGMA table_info(proxy_chain)").fetchall()}
     if not proxy_cols:
@@ -1563,6 +1599,8 @@ def record_retry_attempt(
     started_at: float,
     proxy_name: str | None = None,
     outbound_service_tier: str | None = None,
+    upstream_protocol: str | None = None,
+    client_visible_model: str | None = None,
 ) -> RowLogHandle:
     """Insert one outer channel attempt and return a month-bound row handle."""
     request = _request_handle(request_id)
@@ -1571,11 +1609,14 @@ def record_retry_attempt(
         cur = conn.execute(
             """INSERT INTO retry_chain
                (request_id, attempt_order, channel_key, channel_type, model,
-                started_at, proxy_name, outbound_service_tier)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                client_visible_model, started_at, proxy_name,
+                outbound_service_tier, upstream_protocol)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 request.request_id, attempt_order, channel_key, channel_type, model,
-                started_at, proxy_name, outbound_service_tier,
+                str(client_visible_model or model).strip(), started_at, proxy_name,
+                outbound_service_tier,
+                str(upstream_protocol or "").strip().lower() or None,
             ),
         )
         conn.commit()
@@ -1585,8 +1626,8 @@ def record_retry_attempt(
         )
 
 
-def _outbound_service_tier(request_body: Any) -> str | None:
-    """Read a billable mode only from a complete outbound JSON body."""
+def _outbound_payload(request_body: Any) -> dict[str, Any] | None:
+    """Parse exactly one complete outbound JSON payload."""
     obj = request_body
     if isinstance(obj, (bytes, bytearray)):
         try:
@@ -1598,35 +1639,83 @@ def _outbound_service_tier(request_body: Any) -> str | None:
             obj = json.loads(obj)
         except Exception:
             return None
-    if not isinstance(obj, dict):
+    return obj if isinstance(obj, dict) else None
+
+
+def _outbound_service_tier(
+    request_body: Any,
+    upstream_protocol: str | None = None,
+) -> str | None:
+    """Freeze tier from a complete resolved payload, including protocol default."""
+    obj = _outbound_payload(request_body)
+    if obj is None:
         return None
     value = obj.get("service_tier")
     if isinstance(value, str) and value.strip():
         return value.strip().lower()
-    # models.dev Anthropic fast mode is carried as ``speed=fast`` rather than
-    # OpenAI's ``service_tier=priority``. This is the resolved outbound payload,
-    # not downstream intent, so it is safe to freeze as the attempted tariff.
+    if "service_tier" in obj and value is not None:
+        return None
     speed = obj.get("speed")
-    if isinstance(speed, str) and speed.strip().lower() == "fast":
-        return "fast"
+    if isinstance(speed, str) and speed.strip():
+        normalized_speed = speed.strip().lower()
+        return "fast" if normalized_speed == "fast" else normalized_speed
+    if "speed" in obj and speed is not None:
+        return None
+    if str(upstream_protocol or "").strip().lower() in {
+        "anthropic", "openai-chat", "openai-responses",
+    }:
+        return "default"
     return None
+
+
+def _outbound_model_id(request_body: Any) -> str:
+    obj = _outbound_payload(request_body)
+    if obj is None:
+        return ""
+    value = obj.get("model")
+    if not isinstance(value, str):
+        response = obj.get("response")
+        value = response.get("model") if isinstance(response, dict) else None
+    return value.strip() if isinstance(value, str) else ""
 
 
 def mark_retry_attempt_dispatch(
     attempt_id: int | RowLogHandle,
     request_body: Any,
 ) -> None:
-    """Persist the resolved outbound tier immediately before transport dispatch."""
+    """Atomically freeze dispatch time, exact route/model/tier, and tariff binding."""
     handle = _row_handle(attempt_id, table="retry_chain")
-    tier = _outbound_service_tier(request_body)
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
+        attempt = conn.execute(
+            "SELECT * FROM retry_chain WHERE id=?", (handle.row_id,),
+        ).fetchone()
+        if attempt is None or attempt["dispatched_at"] is not None:
+            return
+        protocol = str(attempt["upstream_protocol"] or "").strip().lower() or None
+        tier = _outbound_service_tier(request_body, protocol)
+        outbound_model = _outbound_model_id(request_body)
+        binding = model_pricing.build_pricing_binding(
+            channel_key=str(attempt["channel_key"] or ""),
+            channel_type=str(attempt["channel_type"] or ""),
+            upstream_protocol=protocol,
+            outbound_model_id=outbound_model,
+            client_visible_model=str(
+                attempt["client_visible_model"] or attempt["model"] or outbound_model
+            ),
+        )
         conn.execute(
-            """UPDATE retry_chain
-               SET outbound_service_tier=COALESCE(outbound_service_tier, ?),
-                   dispatched_at=COALESCE(dispatched_at, ?)
-               WHERE id=?""",
-            (tier, time.time(), handle.row_id),
+            """UPDATE retry_chain SET
+                   outbound_service_tier=?, dispatched_at=?,
+                   binding_provider_id=?, binding_model_id=?,
+                   binding_pricing_key=?, binding_source=?, binding_json=?,
+                   binding_version=?, binding_revision=?
+               WHERE id=? AND dispatched_at IS NULL""",
+            (
+                tier, time.time(), binding.provider_id, binding.model_id,
+                binding.pricing_key, binding.binding_source, binding.binding_json,
+                binding.binding_version, binding.source_revision, handle.row_id,
+            ),
         )
         conn.commit()
 
@@ -1638,37 +1727,65 @@ def _billing_root_request_id(call_request_id: str) -> str:
     return call_request_id.split(marker, 1)[0] if marker in call_request_id else call_request_id
 
 
+def _strict_tracker_usage(usage: Any) -> tuple[tuple[int, int, int, int], bool]:
+    if not isinstance(usage, dict):
+        return (0, 0, 0, 0), False
+    required = ("input_tokens", "output_tokens")
+    if any(name not in usage for name in required):
+        return (0, 0, 0, 0), False
+    raw = (
+        usage.get("input_tokens"),
+        usage.get("output_tokens"),
+        usage.get("cache_creation", usage.get("cache_creation_tokens", 0)),
+        usage.get("cache_read", usage.get("cache_read_tokens", 0)),
+    )
+    parsed = tuple(model_pricing._strict_nonnegative_int(value) for value in raw)
+    if any(value is None for value in parsed):
+        return (0, 0, 0, 0), False
+    return tuple(int(value) for value in parsed), True  # type: ignore[arg-type]
+
+
 def _usage_values(
     usage: dict | None,
+    usage_observed: bool | None,
     normalized,
 ) -> tuple[tuple[int, int, int, int], bool]:
-    """Return strict tokens and whether the supplied representation was valid."""
-
+    """Select authoritative tracker usage before compatibility body fallback."""
+    if usage_observed is not None:
+        if not usage_observed:
+            return (0, 0, 0, 0), False
+        tokens, valid = _strict_tracker_usage(usage)
+        return tokens, bool(valid)
     if normalized.usage_invalid:
         return (0, 0, 0, 0), False
     if normalized.usage_observed:
         return (
-            (
-                normalized.input_tokens, normalized.output_tokens,
-                normalized.cache_creation_tokens, normalized.cache_read_tokens,
-            ),
-            True,
-        )
-    if isinstance(usage, dict):
-        raw = (
-            usage.get("input_tokens", 0),
-            usage.get("output_tokens", 0),
-            usage.get("cache_creation", usage.get("cache_creation_tokens", 0)),
-            usage.get("cache_read", usage.get("cache_read_tokens", 0)),
-        )
-        parsed = tuple(model_pricing._strict_nonnegative_int(value) for value in raw)
-        if all(value is not None for value in parsed):
-            return (
-                tuple(int(value) for value in parsed),  # type: ignore[arg-type]
-                True,
-            )
-        return (0, 0, 0, 0), False
-    return (0, 0, 0, 0), usage is None
+            normalized.input_tokens, normalized.output_tokens,
+            normalized.cache_creation_tokens, normalized.cache_read_tokens,
+        ), True
+    tokens, valid = _strict_tracker_usage(usage)
+    # Legacy callers lacked an observation bit; only non-zero values can prove
+    # observation. Explicit all-zero requires usage_observed=True.
+    return tokens, bool(valid and any(tokens))
+
+
+def _validated_attempt_binding(attempt: sqlite3.Row):
+    binding = model_pricing.pricing_binding_from_json(
+        attempt["binding_json"], attempt["binding_version"],
+    )
+    if binding is None:
+        return None
+    if (
+        binding.channel_key != str(attempt["channel_key"] or "")
+        or binding.channel_type != str(attempt["channel_type"] or "")
+        or binding.provider_id != attempt["binding_provider_id"]
+        or binding.model_id != str(attempt["binding_model_id"] or "")
+        or binding.pricing_key != attempt["binding_pricing_key"]
+        or binding.binding_source != str(attempt["binding_source"] or "")
+        or binding.source_revision != attempt["binding_revision"]
+    ):
+        return None
+    return binding
 
 
 def _settle_retry_attempt_locked(
@@ -1695,41 +1812,27 @@ def _settle_retry_attempt_locked(
         return False
     resolved_outcome = str(outcome or attempt["outcome"] or "")
     normalized = model_pricing.normalize_response_billing(response_body)
-    tokens, usage_valid = _usage_values(usage, normalized)
-    if not usage_valid:
-        observed = False
-    elif usage_observed is None:
-        observed = normalized.usage_observed or any(tokens)
-    else:
-        observed = bool(usage_observed)
+    tokens, observed = _usage_values(usage, usage_observed, normalized)
     root_request_id = _billing_root_request_id(str(attempt["request_id"]))
     actual_tier = normalized.service_tier
     outbound_tier = (
         str(attempt["outbound_service_tier"] or "").strip().lower() or None
     )
     tier = actual_tier or outbound_tier
-    priority = model_pricing.priority_from_service_tier(tier)
-    pricing_settings = model_pricing.settings()
-    pricing_model = model_pricing.provider_pricing_model(
-        str(attempt["model"] or "?"), str(attempt["channel_key"] or ""),
-        pricing_settings=pricing_settings,
+    priority = (
+        model_pricing.priority_from_service_tier(tier)
+        if tier is not None else None
     )
-    # Trust xAI's provider-specific cost field only after the immutable route
-    # and model qualification prove an xAI tariff. A channel merely named
-    # ``api:xai:*`` is not provider evidence; ``channelProviders`` or an
-    # explicitly qualified model is.
+    binding = _validated_attempt_binding(attempt)
+    pricing_model = binding.pricing_key if binding is not None else None
+    # Provider-specific actuals use the independently persisted provider fact,
+    # never a pricing-key prefix or a channel display/name heuristic.
     actual_ticks = (
         normalized.actual_cost_ticks
-        if pricing_model.lower().startswith("xai/")
+        if binding is not None and binding.provider_id == "xai"
         else None
     )
     if attempt["dispatched_at"] is not None:
-        dispatch_state = "sent"
-    elif normalized.usage_observed or actual_ticks is not None:
-        dispatch_state = "sent"
-    elif attempt["first_byte_ms"] is not None:
-        dispatch_state = "sent"
-    elif resolved_outcome == "success" or resolved_outcome.startswith("stream_"):
         dispatch_state = "sent"
     elif resolved_outcome in {
         "candidate_guard", "guard_error", "transform_error", "queue_timeout",
@@ -1737,51 +1840,66 @@ def _settle_retry_attempt_locked(
         "http_connect_timeout", "pool_timeout", "cancelled",
         "client_disconnected",
     }:
-        # These outcomes are definitively pre-dispatch when no stronger wire or
-        # response fact above exists. Keep them only in retry_chain diagnostics.
         dispatch_state = "not_sent"
     else:
-        # Connect/send/timeout failures cannot prove whether the upstream
-        # accepted bytes. Preserve the attempt but never turn it into $0.
         dispatch_state = "unknown"
     if dispatch_state == "not_sent":
         return False
+
     cost_source = "unpriced"
     cost_ticks: int | None = None
     pricing_snapshot_json: str | None = None
     pricing_version: str | None = None
-    if dispatch_state == "sent" and actual_ticks is not None:
+    if dispatch_state == "sent" and actual_ticks is not None and binding is not None:
         cost_source, cost_ticks = "actual", actual_ticks
         pricing_snapshot_json = json.dumps(
-            {"schema": 1, "source": "upstream_actual", "model": pricing_model},
+            {
+                "schema": 2,
+                "source": "upstream_actual",
+                "provider_id": binding.provider_id,
+                "binding_version": binding.binding_version,
+            },
             sort_keys=True, separators=(",", ":"),
         )
-        pricing_version = "upstream-actual-v1"
-    elif dispatch_state == "sent" and observed and priority is not None:
-        settled = model_pricing.estimate_cost_with_snapshot(
-            pricing_model,
+        pricing_version = "upstream-actual-v2:" + binding.binding_version.split(":", 1)[-1]
+    elif (
+        dispatch_state == "sent"
+        and observed
+        and priority is not None
+        and binding is not None
+    ):
+        settled = model_pricing.estimate_cost_from_binding(
+            binding,
             input_tokens=tokens[0], output_tokens=tokens[1],
             cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
             priority=bool(priority),
-            pricing_settings=pricing_settings,
         )
         if settled is not None:
             estimate, pricing_snapshot_json, pricing_version = settled
             cost_source, cost_ticks = "estimated", estimate.total_ticks
+
     conn.execute(
         """INSERT OR IGNORE INTO upstream_attempt_usage
            (retry_attempt_id, root_request_id, call_request_id, attempt_order,
-            channel_key, channel_type, model, pricing_model, outcome, usage_observed,
+            channel_key, channel_type, model, pricing_model,
+            binding_provider_id, binding_model_id, binding_pricing_key,
+            binding_source, binding_json, binding_version, binding_revision,
+            outcome, usage_observed,
             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
             service_tier, outbound_service_tier, dispatch_state,
             pricing_snapshot_json, pricing_version,
             cost_source, cost_ticks, settled_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             int(attempt_id), root_request_id, str(attempt["request_id"]),
             int(attempt["attempt_order"] or 0), str(attempt["channel_key"] or ""),
             str(attempt["channel_type"] or ""), str(attempt["model"] or ""),
-            pricing_model, resolved_outcome, 1 if observed else 0,
+            pricing_model,
+            attempt["binding_provider_id"], attempt["binding_model_id"],
+            attempt["binding_pricing_key"], attempt["binding_source"],
+            attempt["binding_json"], attempt["binding_version"],
+            attempt["binding_revision"],
+            resolved_outcome, 1 if observed else 0,
             *tokens, tier, outbound_tier, dispatch_state,
             pricing_snapshot_json, pricing_version,
             cost_source, cost_ticks, time.time(),
@@ -2109,18 +2227,19 @@ def finish_success(
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         normalized_billing = model_pricing.normalize_response_billing(response_body)
-        if normalized_billing.usage_invalid:
+        supplied_usage = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation": cache_creation_tokens,
+            "cache_read": cache_read_tokens,
+        }
+        _tokens, supplied_valid = _strict_tracker_usage(supplied_usage)
+        if usage_observed is not None:
+            observed = bool(usage_observed and supplied_valid)
+        elif normalized_billing.usage_invalid:
             observed = False
-        elif usage_observed is not None:
-            observed = bool(usage_observed)
         else:
-            observed = bool(
-                normalized_billing.usage_observed
-                or any((
-                    input_tokens, output_tokens,
-                    cache_creation_tokens, cache_read_tokens,
-                ))
-            )
+            observed = bool(normalized_billing.usage_observed or any(_tokens))
         conn.execute(
             """UPDATE request_log SET
                  status='success', finished_at=?, http_status=?,
@@ -2158,10 +2277,7 @@ def finish_success(
             )
         _settle_latest_retry_locked(
             conn, handle.request_id, outcome="success", response_body=response_body,
-            usage={
-                "input_tokens": input_tokens, "output_tokens": output_tokens,
-                "cache_creation": cache_creation_tokens, "cache_read": cache_read_tokens,
-            },
+            usage=supplied_usage,
             usage_observed=usage_observed, final=True,
         )
         conn.commit()
@@ -2194,6 +2310,7 @@ def finish_error(
     response_headers_wait_ms: int | None = None,
     response_body_first_byte_wait_ms: int | None = None,
     status: str = "error",
+    usage: dict | None = None,
     usage_observed: bool | None = None,
 ) -> None:
     terminal_status = "cancelled" if status == "cancelled" else "error"
@@ -2201,10 +2318,11 @@ def finish_error(
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         normalized_billing = model_pricing.normalize_response_billing(response_body)
-        if normalized_billing.usage_invalid:
+        _error_tokens, error_usage_valid = _strict_tracker_usage(usage)
+        if usage_observed is not None:
+            observed = bool(usage_observed and error_usage_valid)
+        elif normalized_billing.usage_invalid:
             observed = False
-        elif usage_observed is not None:
-            observed = bool(usage_observed)
         else:
             observed = bool(normalized_billing.usage_observed)
         conn.execute(
@@ -2240,7 +2358,7 @@ def finish_error(
             )
         _settle_latest_retry_locked(
             conn, handle.request_id, outcome=terminal_status, response_body=response_body,
-            usage_observed=usage_observed, final=True,
+            usage=usage, usage_observed=usage_observed, final=True,
         )
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
@@ -2270,11 +2388,14 @@ def _long_context_case_sql(
     for row in rows:
         model = str(row["pricing_model"] or "?")
         channel = str(row["pricing_channel"] or "?")
-        qualified_model = model_pricing.provider_pricing_model(
-            model, channel, pricing_settings=pricing_settings,
+        binding = model_metadata.resolve_binding(
+            model, scope_key=channel, outbound_model=model,
         )
-        threshold = model_pricing.long_context_threshold(
-            qualified_model, pricing_settings=pricing_settings
+        threshold = (
+            model_pricing.long_context_threshold(
+                binding.target, pricing_settings=pricing_settings,
+            )
+            if binding is not None else 0
         )
         if threshold <= 0:
             continue
@@ -2309,11 +2430,11 @@ def _cache_ttl_known_case_sql(
     for row in rows:
         model = str(row["pricing_model"] or "?")
         channel = str(row["pricing_channel"] or "?")
-        qualified_model = model_pricing.provider_pricing_model(
-            model, channel, pricing_settings=pricing_settings,
+        binding = model_metadata.resolve_binding(
+            model, scope_key=channel, outbound_model=model,
         )
-        if model_pricing.has_ambiguous_cache_write_ttl(
-            qualified_model, pricing_settings=pricing_settings,
+        if binding is not None and model_pricing.has_ambiguous_cache_write_ttl(
+            binding.target, pricing_settings=pricing_settings,
         ):
             ambiguous_pairs.append((model, channel))
     if not ambiguous_pairs:
@@ -2346,11 +2467,15 @@ def _estimate_cost_into(bucket: dict, row, *, row_count: int, pricing_settings) 
         str(row["pricing_channel"] or "")
         if "pricing_channel" in row_keys else ""
     )
-    pricing_model = model_pricing.provider_pricing_model(
-        raw_model, channel, pricing_settings=pricing_settings,
+    visible_model = (
+        str(row["model_key"] or raw_model)
+        if "model_key" in row_keys else raw_model
+    )
+    binding = model_metadata.resolve_binding(
+        visible_model, scope_key=channel, outbound_model=raw_model,
     )
     estimate = model_pricing.estimate_cost(
-        pricing_model,
+        binding.target if binding is not None else "",
         input_tokens=row["input_tokens"] or 0,
         output_tokens=row["output_tokens"] or 0,
         cache_creation_tokens=row["cache_creation_tokens"] or 0,
@@ -2425,8 +2550,8 @@ def _attempt_exclusion_sql(conn: sqlite3.Connection) -> str:
     if _retry_dispatch_ready(conn):
         root_expr = _retry_root_expr("rd")
         parts.append(
-            "NOT EXISTS (SELECT 1 FROM retry_chain rd "
-            f"WHERE rd.dispatched_at IS NOT NULL AND {root_expr}=request_log.request_id)"
+            "request_log.request_id NOT IN (SELECT "
+            f"{root_expr} FROM retry_chain rd WHERE rd.dispatched_at IS NOT NULL)"
         )
     return ("AND " + " AND ".join(parts) + " ") if parts else ""
 
@@ -2902,9 +3027,10 @@ def cost_for_log(row: dict | None) -> dict:
     if (row.get("cache_read_tokens") or 0) > 0 and not row.get("upstream_protocol"):
         _add_unpriced(out, 1)
         return out
-    pricing_model = model_pricing.provider_pricing_model(
-        str(row.get("final_model") or row.get("requested_model") or "?"), channel_key,
-        pricing_settings=pricing_settings,
+    binding = model_metadata.resolve_binding(
+        str(row.get("requested_model") or row.get("final_model") or "?"),
+        scope_key=channel_key,
+        outbound_model=str(row.get("final_model") or ""),
     )
     priority = model_pricing.priority_from_service_tier(
         row.get("actual_service_tier")
@@ -2913,7 +3039,7 @@ def cost_for_log(row: dict | None) -> dict:
         _add_unpriced(out, 1)
         return out
     estimate = model_pricing.estimate_cost(
-        pricing_model,
+        binding.target if binding is not None else "",
         input_tokens=row.get("input_tokens") or 0,
         output_tokens=row.get("output_tokens") or 0,
         cache_creation_tokens=row.get("cache_creation_tokens") or 0,
@@ -4583,13 +4709,14 @@ def _accumulate_usage_costs(
         forced_long_context = (
             bool(row["long_context"]) if "long_context" in row_keys else None
         )
-        pricing_model = model_pricing.provider_pricing_model(
-            str(row["pricing_model"] or row["model_key"] or "?"),
-            str(row["channel_key"] or ""),
-            pricing_settings=pricing_settings,
+        outbound_model = str(row["pricing_model"] or row["model_key"] or "?")
+        binding = model_metadata.resolve_binding(
+            str(row["model_key"] or outbound_model),
+            scope_key=str(row["channel_key"] or ""),
+            outbound_model=outbound_model,
         )
         estimate = model_pricing.estimate_cost(
-            pricing_model,
+            binding.target if binding is not None else "",
             input_tokens=row["input_tokens"] or 0,
             output_tokens=row["output_tokens"] or 0,
             cache_creation_tokens=row["cache_creation_tokens"] or 0,

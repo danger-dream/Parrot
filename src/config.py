@@ -355,14 +355,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "claude-sonnet-4-6",
         "claude-haiku-4-5-20251001",
     ],
-    # Global alias mapping and model metadata are protocol/account agnostic.
+    # Global alias mapping is protocol/account agnostic. Model metadata is
+    # resolved separately through exact models.dev default/scoped bindings.
     # modelMapping supports both the new global bucket and legacy per-ingress
     # buckets (anthropic/openai-chat/openai-responses) for backward compatibility.
     "modelMapping": {
         "global": {},
     },
     "ingressDefaultModel": {},
-    "modelMetadata": {},
+    # models.dev identities only; catalog metadata/prices stay in the shared cache.
+    "modelBindings": {
+        "defaults": {},
+        "scoped": {},
+    },
+    # Independent compact-rescue model. Legacy modelMetadata[*].compressionModel
+    # is migrated after the bundled/cache models.dev catalog is initialized.
+    "compressionModel": "",
+    "modelMetadata": {},  # read only for one-time exact legacy migration
     "protocolBridge": {
         "anthropicToOpenAI": {
             "reasoning": {
@@ -475,20 +484,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "forever",
         "days": None,
     },
-    # Token 金额统计：以 models.dev 供应商价格估算 USD；models.json 只用于
-    # 规范模型身份。xAI OAuth 返回 cost_in_usd_ticks 时优先使用真实金额。
+    # models.dev 单一目录与金额开关。新请求只从 modelBindings 指向的
+    # provider/model 读取费率；xAI 返回可信 cost_in_usd_ticks 时优先实际金额。
     "pricing": {
         "enabled": True,
         "autoUpdate": True,
         "sourceUrl": "https://models.dev/api.json",
         "modelsUrl": "https://models.dev/models.json",
         "refreshHours": 24,
-        # API 渠道 → models.dev provider ID。OAuth 渠道可从不可变 key 自动识别；
-        # 第三方 API 渠道必须显式指定，避免同一 Model ID 套错供应商价格。
+        # 以下旧字段只保留配置兼容；dispatch-time 估算不会用它们绕过绑定。
         "channelProviders": {},
-        # 自定义模型名 → 价格表模型名。
         "aliases": {},
-        # 单位均为 USD / 1M Token；至少填写 inputPerMillion/outputPerMillion。
         "overrides": {},
     },
     "stateDbPath": "state.db",

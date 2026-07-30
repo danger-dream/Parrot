@@ -16,7 +16,13 @@ Your summary should include the following sections:
 """
 
 
-def test_compact_rescue_default_knobs_match_current_hardcoded_behavior():
+def test_compact_rescue_default_knobs_match_current_hardcoded_behavior(monkeypatch):
+    cfg = dict(compact_rescue.config.get())
+    cfg["compactRescue"] = compact_rescue.config.DEFAULT_CONFIG["compactRescue"]
+    cfg["modelBindings"] = {"defaults": {}, "scoped": {}}
+    cfg["modelMetadata"] = {}
+    monkeypatch.setattr(compact_rescue.config, "get", lambda: cfg)
+    monkeypatch.setattr(model_metadata.config, "get", lambda: cfg)
     assert compact_rescue.chunk_target_tokens() == 100000
     assert compact_rescue.reduce_max_tokens() == 20000
     assert model_metadata.summary_reserve_tokens("unknown-model") == 20000

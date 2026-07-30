@@ -12,6 +12,7 @@ input 中猜测扣减缓存命中。
 from __future__ import annotations
 
 import asyncio
+import copy
 import gzip
 import hashlib
 import json
@@ -19,7 +20,7 @@ import math
 import os
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
@@ -89,6 +90,26 @@ class PricingSettings:
 
 
 @dataclass(frozen=True)
+class PricingBinding:
+    """Immutable dispatch-time route identity and complete tariff snapshot."""
+
+    channel_key: str
+    channel_type: str
+    upstream_protocol: str | None
+    client_visible_model: str
+    outbound_model_id: str
+    provider_id: str | None
+    model_id: str
+    pricing_key: str | None
+    binding_source: str
+    source_revision: str | None
+    tariff: PricingEntry | None
+    tariff_source: str | None
+    binding_json: str
+    binding_version: str
+
+
+@dataclass(frozen=True)
 class NormalizedBilling:
     """Billing facts observed on one real upstream response.
 
@@ -111,8 +132,14 @@ _lock = threading.RLock()
 _catalog: dict[str, PricingEntry] = {}
 _catalog_aliases: dict[str, str] = {}
 _catalog_providers: set[str] = set()
+# The same downloaded bundle also backs model metadata bindings. These indexes
+# retain source records in memory; persistent config stores identities only.
+_catalog_models: dict[str, dict[str, Any]] = {}
+_catalog_provider_names: dict[str, str] = {}
+_canonical_official_models: dict[str, str] = {}
 _initialized = False
 _catalog_source = "none"
+_catalog_revision = "none"
 
 
 def _nonnegative_float(value: Any) -> float | None:
@@ -199,8 +226,11 @@ def _entry_from_models_dev(raw: Any) -> PricingEntry | None:
 
     input_price = input_per_million / 1_000_000
     output_price = output_per_million / 1_000_000
-    cache_write = per_token(cost.get("cache_write"), input_price)
-    cache_read = per_token(cost.get("cache_read"), input_price)
+    # models.dev omission means this token class is not billed. This differs
+    # deliberately from operator overrides, whose legacy input-price fallback is
+    # retained in _entry_from_override().
+    cache_write = per_token(cost.get("cache_write"), 0.0)
+    cache_read = per_token(cost.get("cache_read"), 0.0)
 
     tiers_raw = cost.get("tiers", [])
     if tiers_raw is None:
@@ -317,14 +347,14 @@ def _entry_from_models_dev(raw: Any) -> PricingEntry | None:
     fast_input = fast_price("input", input_price)
     fast_output = fast_price("output", output_price)
     fast_input_fallback = fast_input if fast_input is not None else input_price
-    fast_cache_write = fast_price("cache_write", fast_input_fallback)
-    fast_cache_read = fast_price("cache_read", fast_input_fallback)
+    fast_cache_write = fast_price("cache_write", 0.0)
+    fast_cache_read = fast_price("cache_read", 0.0)
 
     return PricingEntry(
         input_per_token=input_price,
         output_per_token=output_price,
-        cache_write_per_token=cache_write if cache_write is not None else input_price,
-        cache_read_per_token=cache_read if cache_read is not None else input_price,
+        cache_write_per_token=cache_write if cache_write is not None else 0.0,
+        cache_read_per_token=cache_read if cache_read is not None else 0.0,
         priority_input_per_token=fast_input,
         priority_output_per_token=fast_output,
         priority_cache_write_per_token=fast_cache_write,
@@ -332,12 +362,8 @@ def _entry_from_models_dev(raw: Any) -> PricingEntry | None:
         long_context_input_threshold=tier_threshold,
         above_input_per_token=tier_price("input", input_price),
         above_output_per_token=tier_price("output", output_price),
-        above_cache_write_per_token=tier_price(
-            "cache_write", cache_write if cache_write is not None else input_price
-        ),
-        above_cache_read_per_token=tier_price(
-            "cache_read", cache_read if cache_read is not None else input_price
-        ),
+        above_cache_write_per_token=tier_price("cache_write", 0.0),
+        above_cache_read_per_token=tier_price("cache_read", 0.0),
         # models.dev fast mode is an exact replacement tariff, not a multiplier.
         # Keep the same fast tariff above a context threshold unless the source
         # eventually publishes an explicit fast-context tier.
@@ -424,6 +450,61 @@ def _parse_models_dev_catalog(
     return parsed, aliases, providers
 
 
+def _parse_models_dev_metadata_indexes(
+    api_payload: Any,
+    models_payload: Any,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str], dict[str, str]]:
+    """Build exact provider/model metadata and canonical-official indexes.
+
+    Unlike the tariff index this includes models without token pricing. The
+    canonical matcher only accepts a models.json root whose provider/model also
+    exists exactly in api.json; it never guesses providers from model prefixes.
+    """
+    if not isinstance(api_payload, Mapping) or not isinstance(models_payload, Mapping):
+        raise ValueError("models.dev catalogs must be JSON objects")
+    entries: dict[str, dict[str, Any]] = {}
+    provider_names: dict[str, str] = {}
+    for provider_key, provider_raw in api_payload.items():
+        if not isinstance(provider_key, str) or not isinstance(provider_raw, Mapping):
+            continue
+        provider = provider_key.strip().lower()
+        models = provider_raw.get("models")
+        if not provider or not isinstance(models, Mapping):
+            continue
+        display_name = provider_raw.get("name")
+        provider_names[provider] = (
+            display_name.strip()
+            if isinstance(display_name, str) and display_name.strip()
+            else provider
+        )
+        for model_key, raw in models.items():
+            if (
+                not isinstance(model_key, str)
+                or not model_key.strip()
+                or not isinstance(raw, Mapping)
+            ):
+                continue
+            model = model_key.strip().lower()
+            entries[f"{provider}/{model}"] = copy.deepcopy(dict(raw))
+
+    candidates: dict[str, set[str]] = {}
+    for canonical_key in models_payload:
+        if not isinstance(canonical_key, str) or "/" not in canonical_key:
+            continue
+        provider, model = canonical_key.strip().lower().split("/", 1)
+        target = f"{provider}/{model}"
+        if target not in entries:
+            continue
+        candidates.setdefault(model, set()).add(target)
+        candidates.setdefault(target, set()).add(target)
+    official = {
+        name: next(iter(targets))
+        for name, targets in candidates.items()
+        if len(targets) == 1
+    }
+    return entries, provider_names, official
+
+
 def _parse_catalog(
     api_payload: Any,
     models_payload: Any,
@@ -445,10 +526,20 @@ def _catalog_payload_parts(payload: Any) -> tuple[Any, Any]:
     return payload.get("api"), payload.get("models")
 
 
+def _catalog_revision_for_payloads(api_payload: Any, models_payload: Any) -> str:
+    canonical = json.dumps(
+        {"api": api_payload, "models": models_payload},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return "models-dev-sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
 def initialize() -> None:
     """同步加载缓存或随包快照；不发网络请求，可安全放在 lifespan 启动阶段。"""
 
-    global _catalog, _catalog_aliases, _catalog_providers, _initialized, _catalog_source
+    global _catalog, _catalog_aliases, _catalog_providers, _catalog_models
+    global _catalog_provider_names, _canonical_official_models
+    global _initialized, _catalog_source, _catalog_revision
     with _lock:
         if _initialized:
             return
@@ -463,26 +554,156 @@ def initialize() -> None:
                 parsed, aliases, providers = _parse_models_dev_catalog(
                     api_payload, models_payload
                 )
+                metadata_models, provider_names, official_models = (
+                    _parse_models_dev_metadata_indexes(api_payload, models_payload)
+                )
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 last_error = exc
                 continue
             _catalog = parsed
             _catalog_aliases = aliases
             _catalog_providers = providers
+            _catalog_models = metadata_models
+            _catalog_provider_names = provider_names
+            _canonical_official_models = official_models
             _catalog_source = source
+            _catalog_revision = _catalog_revision_for_payloads(api_payload, models_payload)
             _initialized = True
             return
         raise RuntimeError(f"failed to load model pricing catalog: {last_error}")
 
 
 def reset_for_tests() -> None:
-    global _catalog, _catalog_aliases, _catalog_providers, _initialized, _catalog_source
+    global _catalog, _catalog_aliases, _catalog_providers, _catalog_models
+    global _catalog_provider_names, _canonical_official_models
+    global _initialized, _catalog_source, _catalog_revision
     with _lock:
         _catalog = {}
         _catalog_aliases = {}
         _catalog_providers = set()
+        _catalog_models = {}
+        _catalog_provider_names = {}
+        _canonical_official_models = {}
         _initialized = False
         _catalog_source = "none"
+        _catalog_revision = "none"
+
+
+def _ensure_catalog() -> bool:
+    if _initialized:
+        return True
+    try:
+        initialize()
+    except Exception:
+        return False
+    return True
+
+
+def catalog_model(provider_model: str) -> dict[str, Any] | None:
+    """Return one exact models.dev api.json model record.
+
+    The key must be the persisted ``provider/model`` identity. Catalog aliases
+    and bare model IDs are deliberately not accepted by metadata bindings.
+    """
+    key = str(provider_model or "").strip().lower()
+    if not key or "/" not in key or not _ensure_catalog():
+        return None
+    with _lock:
+        raw = _catalog_models.get(key)
+        return copy.deepcopy(raw) if raw is not None else None
+
+
+def catalog_metadata(provider_model: str) -> dict[str, Any] | None:
+    """Project one exact catalog record into Parrot's runtime metadata shape."""
+    raw = catalog_model(provider_model)
+    if raw is None:
+        return None
+    limit = raw.get("limit") if isinstance(raw.get("limit"), Mapping) else {}
+    modalities = raw.get("modalities") if isinstance(raw.get("modalities"), Mapping) else {}
+    input_modalities = modalities.get("input") if isinstance(modalities, Mapping) else []
+    reasoning_efforts: list[str] = []
+    options = raw.get("reasoning_options")
+    if isinstance(options, list):
+        for option in options:
+            if not isinstance(option, Mapping) or option.get("type") != "effort":
+                continue
+            values = option.get("values")
+            if isinstance(values, list):
+                reasoning_efforts = [
+                    str(value).strip().lower() for value in values
+                    if str(value).strip()
+                ]
+                break
+    context = _catalog_positive_int(limit.get("context"))
+    output = _catalog_positive_int(limit.get("output"))
+    result: dict[str, Any] = {
+        "name": str(raw.get("name") or raw.get("id") or provider_model),
+        "description": str(raw.get("description") or ""),
+        "family": str(raw.get("family") or ""),
+        "vision": bool(
+            raw.get("attachment") is True
+            or (isinstance(input_modalities, list) and "image" in input_modalities)
+        ),
+        "reasoning": bool(raw.get("reasoning")),
+        "reasoningEfforts": reasoning_efforts,
+        "toolCall": bool(raw.get("tool_call")),
+        "structuredOutput": bool(raw.get("structured_output")),
+        "temperature": bool(raw.get("temperature")),
+        "modalities": copy.deepcopy(dict(modalities)),
+        "releaseDate": str(raw.get("release_date") or ""),
+        # Preserve the complete catalog pricing object for display/consumers.
+        "cost": copy.deepcopy(raw.get("cost")) if isinstance(raw.get("cost"), Mapping) else None,
+    }
+    if context is not None:
+        result["contextWindow"] = context
+    if output is not None:
+        result["maxOutputTokens"] = output
+    return result
+
+
+def catalog_providers() -> list[dict[str, str]]:
+    if not _ensure_catalog():
+        return []
+    with _lock:
+        return [
+            {"id": provider, "name": _catalog_provider_names.get(provider, provider)}
+            for provider in sorted(_catalog_provider_names)
+        ]
+
+
+def catalog_provider_models(provider_id: str) -> list[dict[str, Any]]:
+    provider = str(provider_id or "").strip().lower()
+    if not provider or not _ensure_catalog():
+        return []
+    prefix = f"{provider}/"
+    with _lock:
+        keys = sorted(key for key in _catalog_models if key.startswith(prefix))
+        return [
+            {
+                "key": key,
+                "id": key[len(prefix):],
+                "name": str(_catalog_models[key].get("name") or key[len(prefix):]),
+            }
+            for key in keys
+        ]
+
+
+def canonical_official_model(model: str) -> str | None:
+    """Resolve an exact canonical model ID to its official provider/model."""
+    name = str(model or "").strip().lower()
+    if not name or not _ensure_catalog():
+        return None
+    with _lock:
+        return _canonical_official_models.get(name)
+
+
+def catalog_tariff(provider_model: str) -> PricingEntry | None:
+    """Return tariff only for one exact provider/model binding identity."""
+    key = str(provider_model or "").strip().lower()
+    if not key or not _ensure_catalog():
+        return None
+    with _lock:
+        return _catalog.get(key)
 
 
 def _entry_from_override(raw: Any) -> PricingEntry | None:
@@ -617,6 +838,241 @@ def provider_pricing_model(
             return normalized
         return f"{provider}/{normalized}"
     return normalized
+
+
+def _normalize_provider_id(value: Any) -> str | None:
+    provider = str(value or "").strip().lower()
+    provider = _PROVIDER_ALIASES.get(provider, provider)
+    if not provider or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for ch in provider):
+        return None
+    return provider
+
+
+def _provider_from_explicit_target(target: str) -> str | None:
+    if "/" not in target:
+        return None
+    return _normalize_provider_id(target.partition("/")[0])
+
+
+def _pricing_entry_payload(entry: PricingEntry) -> dict[str, Any]:
+    return {item.name: getattr(entry, item.name) for item in fields(PricingEntry)}
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    )
+
+
+def _binding_price(
+    pricing_key: str,
+    current: PricingSettings,
+) -> tuple[str, PricingEntry, str, str] | None:
+    """Read a tariff only from an exact metadata-binding catalog identity."""
+    key = str(pricing_key or "").strip().lower()
+    if not key or not current.enabled or not _ensure_catalog():
+        return None
+    with _lock:
+        entry = _catalog.get(key)
+        if entry is None:
+            return None
+        return key, entry, f"models.dev:{_catalog_source}", _catalog_revision
+
+
+def build_pricing_binding(
+    *,
+    channel_key: str,
+    channel_type: str,
+    upstream_protocol: str | None,
+    outbound_model_id: str,
+    client_visible_model: str | None = None,
+    pricing_settings: PricingSettings | None = None,
+) -> PricingBinding:
+    """Freeze an effective metadata binding and its exact models.dev tariff.
+
+    Route/provider naming is never a pricing fallback. A typed OAuth provider is
+    retained only as proof for provider-reported actual cost (not estimation).
+    """
+    current = pricing_settings or settings()
+    stable_key = str(channel_key or "").strip()
+    stable_type = str(channel_type or "").strip().lower()
+    protocol = str(upstream_protocol or "").strip().lower() or None
+    exact_model = str(outbound_model_id or "").strip()
+    visible_model = str(client_visible_model or exact_model).strip()
+    channel_normalized = stable_key.lower()
+
+    oauth_provider: str | None = None
+    if stable_type == "oauth" and channel_normalized.startswith("oauth:"):
+        typed = channel_normalized.split(":", 2)
+        if len(typed) == 3 and typed[2]:
+            candidate = _normalize_provider_id(typed[1])
+            if candidate in {"anthropic", "openai", "xai"}:
+                oauth_provider = candidate
+
+    from . import model_metadata
+
+    metadata_binding = model_metadata.resolve_binding(
+        visible_model,
+        scope_key=stable_key,
+        outbound_model=exact_model,
+    )
+    if metadata_binding is not None:
+        provider_id = metadata_binding.provider_id
+        catalog_model_id = metadata_binding.catalog_model_id
+        pricing_key: str | None = metadata_binding.target
+        binding_source = f"metadata_{metadata_binding.kind}"
+    else:
+        provider_id = oauth_provider
+        catalog_model_id = exact_model
+        pricing_key = None
+        binding_source = "unbound"
+
+    priced = _binding_price(pricing_key, current) if pricing_key else None
+    tariff: PricingEntry | None = None
+    tariff_source: str | None = None
+    source_revision: str | None = None
+    if priced is not None:
+        pricing_key, tariff, tariff_source, source_revision = priced
+
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "dispatch": {
+            "channel_key": stable_key,
+            "channel_type": stable_type,
+            "upstream_protocol": protocol,
+            "client_visible_model": visible_model,
+            "outbound_model_id": exact_model,
+        },
+        "metadata": {
+            "provider_id": provider_id,
+            "model_id": catalog_model_id,
+            "pricing_key": pricing_key,
+            "binding_source": binding_source,
+            "source_revision": source_revision,
+        },
+        "tariff": (
+            {"source": tariff_source, **_pricing_entry_payload(tariff)}
+            if tariff is not None else None
+        ),
+    }
+    raw = _canonical_json(payload)
+    version = "binding-v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return PricingBinding(
+        channel_key=stable_key,
+        channel_type=stable_type,
+        upstream_protocol=protocol,
+        client_visible_model=visible_model,
+        outbound_model_id=exact_model,
+        provider_id=provider_id,
+        model_id=catalog_model_id,
+        pricing_key=pricing_key,
+        binding_source=binding_source,
+        source_revision=source_revision,
+        tariff=tariff,
+        tariff_source=tariff_source,
+        binding_json=raw,
+        binding_version=version,
+    )
+
+
+def pricing_binding_from_json(
+    raw: Any,
+    expected_version: str | None = None,
+) -> PricingBinding | None:
+    """Strictly validate a persisted canonical binding; corruption fails closed."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, Mapping) or payload.get("schema") != 1:
+            return None
+        if _canonical_json(payload) != raw:
+            return None
+        version = "binding-v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if expected_version is not None and version != expected_version:
+            return None
+        dispatch = payload.get("dispatch")
+        metadata = payload.get("metadata")
+        if not isinstance(dispatch, Mapping) or not isinstance(metadata, Mapping):
+            return None
+        channel_key = dispatch.get("channel_key")
+        channel_type = dispatch.get("channel_type")
+        outbound_model_id = dispatch.get("outbound_model_id")
+        client_visible_model = dispatch.get("client_visible_model", outbound_model_id)
+        protocol = dispatch.get("upstream_protocol")
+        if not all(
+            isinstance(value, str)
+            for value in (channel_key, channel_type, outbound_model_id, client_visible_model)
+        ):
+            return None
+        if protocol is not None and not isinstance(protocol, str):
+            return None
+        catalog_model_id = metadata.get("model_id")
+        if not isinstance(catalog_model_id, str):
+            return None
+        provider_id = metadata.get("provider_id")
+        pricing_key = metadata.get("pricing_key")
+        binding_source = metadata.get("binding_source")
+        source_revision = metadata.get("source_revision")
+        if provider_id is not None and not isinstance(provider_id, str):
+            return None
+        if pricing_key is not None and not isinstance(pricing_key, str):
+            return None
+        if not isinstance(binding_source, str):
+            return None
+        if source_revision is not None and not isinstance(source_revision, str):
+            return None
+
+        tariff_raw = payload.get("tariff")
+        tariff: PricingEntry | None = None
+        tariff_source: str | None = None
+        if tariff_raw is not None:
+            if not isinstance(tariff_raw, Mapping):
+                return None
+            tariff_source = tariff_raw.get("source")
+            if not isinstance(tariff_source, str) or not tariff_source:
+                return None
+            values: dict[str, Any] = {}
+            for item in fields(PricingEntry):
+                if item.name not in tariff_raw:
+                    return None
+                value = tariff_raw[item.name]
+                if item.name == "cache_write_ttl_ambiguous":
+                    if not isinstance(value, bool):
+                        return None
+                    values[item.name] = value
+                elif item.name == "long_context_input_threshold":
+                    parsed = _strict_nonnegative_int(value)
+                    if parsed is None:
+                        return None
+                    values[item.name] = parsed
+                elif value is None:
+                    values[item.name] = None
+                else:
+                    parsed_float = _nonnegative_float(value)
+                    if parsed_float is None:
+                        return None
+                    values[item.name] = parsed_float
+            tariff = PricingEntry(**values)
+        return PricingBinding(
+            channel_key=channel_key,
+            channel_type=channel_type,
+            upstream_protocol=protocol,
+            client_visible_model=client_visible_model,
+            outbound_model_id=outbound_model_id,
+            provider_id=provider_id,
+            model_id=catalog_model_id,
+            pricing_key=pricing_key,
+            binding_source=binding_source,
+            source_revision=source_revision,
+            tariff=tariff,
+            tariff_source=tariff_source,
+            binding_json=raw,
+            binding_version=version,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def resolve_price(
@@ -896,6 +1352,118 @@ def estimate_cost_with_snapshot(
         snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False,
     )
     version = "pricing-v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return estimate, raw, version
+
+
+def estimate_cost_from_binding(
+    binding: PricingBinding,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    priority: bool = False,
+) -> tuple[CostEstimate, str, str] | None:
+    """Price solely from a validated dispatch-time binding and its frozen tariff."""
+    if (
+        binding.tariff is None
+        or not binding.pricing_key
+        or not binding.channel_key
+        or binding.channel_type not in {"api", "oauth"}
+        or binding.upstream_protocol not in {
+            "anthropic", "openai-chat", "openai-responses",
+        }
+        or not binding.outbound_model_id
+    ):
+        return None
+    parsed_tokens = tuple(
+        _strict_nonnegative_int(value)
+        for value in (
+            input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+        )
+    )
+    if any(value is None for value in parsed_tokens):
+        return None
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = (
+        int(value) for value in parsed_tokens
+    )
+    entry = binding.tariff
+    if priority and not _has_priority_tariff(entry):
+        return None
+    if (
+        cache_creation_tokens > 0
+        and (
+            entry.cache_write_ttl_ambiguous
+            or (
+                entry.cache_write_1h_per_token is not None
+                and entry.cache_write_1h_per_token > 0
+                and abs(entry.cache_write_1h_per_token - entry.cache_write_per_token) > 1e-18
+            )
+        )
+    ):
+        return None
+    prompt_tokens = input_tokens + cache_creation_tokens + cache_read_tokens
+    if prompt_tokens > _MAX_BILLING_INTEGER:
+        return None
+    long_context = bool(
+        entry.long_context_input_threshold > 0
+        and prompt_tokens > entry.long_context_input_threshold
+    )
+    prices = (
+        _effective_price(
+            entry, "input_per_token", priority=priority,
+            long_context=long_context, input_side=True,
+        ),
+        _effective_price(
+            entry, "output_per_token", priority=priority,
+            long_context=long_context, input_side=False,
+        ),
+        _effective_price(
+            entry, "cache_write_per_token", priority=priority,
+            long_context=long_context, input_side=True,
+        ),
+        _effective_price(
+            entry, "cache_read_per_token", priority=priority,
+            long_context=long_context, input_side=True,
+        ),
+    )
+    try:
+        component_ticks = tuple(
+            _ticks(tokens, price)
+            for tokens, price in zip(
+                (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens),
+                prices,
+            )
+        )
+    except ValueError:
+        return None
+    total_ticks = sum(component_ticks)
+    if total_ticks > _MAX_BILLING_INTEGER:
+        return None
+    estimate = CostEstimate(
+        total_ticks=total_ticks,
+        input_ticks=component_ticks[0],
+        output_ticks=component_ticks[1],
+        cache_write_ticks=component_ticks[2],
+        cache_read_ticks=component_ticks[3],
+        pricing_model=binding.pricing_key,
+    )
+    snapshot = {
+        "schema": 2,
+        "binding_version": binding.binding_version,
+        "pricing_key": binding.pricing_key,
+        "tariff_source": binding.tariff_source,
+        "source_revision": binding.source_revision,
+        "priority": bool(priority),
+        "long_context": long_context,
+        "long_context_threshold": entry.long_context_input_threshold,
+        "input_per_token": prices[0],
+        "output_per_token": prices[1],
+        "cache_write_per_token": prices[2],
+        "cache_read_per_token": prices[3],
+    }
+    raw = _canonical_json(snapshot)
+    version = "pricing-v2:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return estimate, raw, version
 
 
@@ -1234,6 +1802,41 @@ def extract_actual_cost_ticks(response_body: Any) -> int | None:
     return normalize_response_billing(response_body).actual_cost_ticks
 
 
+async def _download_catalog_bounded(client: Any, url: str, budget: int) -> bytes:
+    """Stream one source under the remaining shared uncompressed byte budget."""
+    if budget < 0:
+        raise ValueError("negative catalog download budget")
+    async with client.stream("GET", url, timeout=20.0) as response:
+        response.raise_for_status()
+        raw_length = response.headers.get("content-length")
+        if raw_length is not None:
+            value = str(raw_length).strip()
+            if not value or not value.isascii() or not value.isdecimal():
+                raise ValueError(f"invalid Content-Length for {url}")
+            declared = int(value)
+            if declared > budget:
+                raise ValueError(
+                    f"models.dev catalogs exceed {_MAX_REMOTE_CATALOG_BYTES} bytes"
+                )
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise ValueError("catalog stream produced non-bytes data")
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > budget:
+                raise ValueError(
+                    f"models.dev catalogs exceed {_MAX_REMOTE_CATALOG_BYTES} bytes"
+                )
+            chunks.append(bytes(chunk))
+        # Content-Encoding can make decoded aiter_bytes() length differ from the
+        # wire Content-Length. The header is an early upper-bound check; the
+        # decoded stream is independently bounded above.
+        return b"".join(chunks)
+
+
 async def refresh_once() -> bool:
     """Refresh both models.dev catalogs and atomically replace one gzip bundle."""
 
@@ -1251,27 +1854,27 @@ async def refresh_once() -> bool:
     from . import upstream
 
     client = upstream.get_client()
-    api_response, models_response = await asyncio.gather(
-        client.get(url, timeout=20.0),
-        client.get(models_url, timeout=20.0),
+    # Sequential streaming naturally closes a failed/oversized response before
+    # the peer starts, and the second source receives only the shared remainder.
+    raw_api = await _download_catalog_bounded(
+        client, url, _MAX_REMOTE_CATALOG_BYTES,
     )
-    api_response.raise_for_status()
-    models_response.raise_for_status()
-    raw_api = api_response.content
-    raw_models = models_response.content
-    if (
-        len(raw_api) > _MAX_REMOTE_CATALOG_BYTES
-        or len(raw_models) > _MAX_REMOTE_CATALOG_BYTES
-        or len(raw_api) + len(raw_models) > _MAX_REMOTE_CATALOG_BYTES
-    ):
-        raise ValueError(f"models.dev catalogs exceed {_MAX_REMOTE_CATALOG_BYTES} bytes")
+    raw_models = await _download_catalog_bounded(
+        client, models_url, _MAX_REMOTE_CATALOG_BYTES - len(raw_api),
+    )
     cache_path = os.path.join(config.DATA_DIR, _CACHE_FILENAME)
 
-    def parse_and_store() -> tuple[dict[str, PricingEntry], dict[str, str], set[str]]:
+    def parse_and_store() -> tuple[
+        dict[str, PricingEntry], dict[str, str], set[str],
+        dict[str, dict[str, Any]], dict[str, str], dict[str, str], str,
+    ]:
         api_payload = json.loads(raw_api)
         models_payload = json.loads(raw_models)
         parsed_catalog, aliases, providers = _parse_models_dev_catalog(
             api_payload, models_payload
+        )
+        metadata_models, provider_names, official_models = (
+            _parse_models_dev_metadata_indexes(api_payload, models_payload)
         )
         # 防止上游异常页或被截断的小对象覆盖可用缓存。
         if len(parsed_catalog) < 500 or len(models_payload) < 100:
@@ -1312,15 +1915,28 @@ async def refresh_once() -> bool:
                     os.unlink(tmp_path)
             except OSError:
                 pass
-        return parsed_catalog, aliases, providers
+        revision = _catalog_revision_for_payloads(api_payload, models_payload)
+        return (
+            parsed_catalog, aliases, providers, metadata_models,
+            provider_names, official_models, revision,
+        )
 
-    parsed, aliases, providers = await asyncio.to_thread(parse_and_store)
-    global _catalog, _catalog_aliases, _catalog_providers, _catalog_source, _initialized
+    (
+        parsed, aliases, providers, metadata_models,
+        provider_names, official_models, revision,
+    ) = await asyncio.to_thread(parse_and_store)
+    global _catalog, _catalog_aliases, _catalog_providers, _catalog_models
+    global _catalog_provider_names, _canonical_official_models
+    global _catalog_source, _catalog_revision, _initialized
     with _lock:
         _catalog = parsed
         _catalog_aliases = aliases
         _catalog_providers = providers
+        _catalog_models = metadata_models
+        _catalog_provider_names = provider_names
+        _canonical_official_models = official_models
         _catalog_source = "remote"
+        _catalog_revision = revision
         _initialized = True
     return True
 
@@ -1349,7 +1965,10 @@ def catalog_status() -> dict[str, Any]:
     with _lock:
         return {
             "source": _catalog_source,
+            "revision": _catalog_revision,
             "models": len(_catalog),
+            "metadata_models": len(_catalog_models),
             "aliases": len(_catalog_aliases),
-            "providers": len(_catalog_providers),
+            "providers": len(_catalog_provider_names),
+            "canonical_official": len(_canonical_official_models),
         }
