@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os as _ap_os
 import sys as _ap_sys
+
+import pytest
 _ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(
     _ap_os.path.dirname(_ap_os.path.abspath(__file__))
 )))
@@ -30,6 +32,80 @@ def test_parse_dns_input(m):
         pass
     else:
         raise AssertionError("unsupported DNS scheme should fail")
+
+
+def test_parse_resolv_conf_filters_local_stub_addresses(m, tmp_path):
+    n = m["network"]
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text(
+        "\n".join([
+            "nameserver 127.0.0.11",
+            "nameserver 127.0.0.22",
+            "nameserver 127.0.0.53",
+            "nameserver 127.255.255.254",
+            "nameserver ::1",
+            "nameserver ::ffff:127.0.0.22",
+            "nameserver 0.0.0.0",
+            "nameserver ::",
+            "nameserver 10.0.0.53",
+            "nameserver 192.168.1.1",
+            "nameserver 1.1.1.1",
+            "nameserver 10.0.0.53",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    assert n._parse_resolv_conf(str(resolv)) == [
+        "10.0.0.53",
+        "192.168.1.1",
+        "1.1.1.1",
+    ]
+
+
+def test_sync_system_dns_preserves_current_config_when_no_upstream(m, monkeypatch):
+    cfg = m["config"]
+    n = m["network"]
+
+    def _seed(c):
+        dns = c.setdefault("network", {}).setdefault("dns", {})
+        dns["servers"] = ["213.186.33.99"]
+        dns["bootstrapped"] = True
+
+    cfg.update(_seed)
+    monkeypatch.setattr(n, "_parse_resolv_conf", lambda: [])
+
+    with pytest.raises(ValueError, match="当前 DNS 未修改"):
+        n.sync_system_dns_now()
+
+    assert cfg.get()["network"]["dns"]["servers"] == ["213.186.33.99"]
+
+
+def test_sync_system_dns_keeps_valid_private_upstreams(m, monkeypatch):
+    cfg = m["config"]
+    n = m["network"]
+
+    monkeypatch.setattr(n, "_parse_resolv_conf", lambda: ["10.0.0.53", "1.1.1.1"])
+    assert n.sync_system_dns_now() == ["10.0.0.53", "1.1.1.1"]
+    assert cfg.get()["network"]["dns"]["servers"] == ["10.0.0.53", "1.1.1.1"]
+
+
+def test_bootstrap_preserves_current_config_when_no_upstream(m, monkeypatch):
+    cfg = m["config"]
+    n = m["network"]
+
+    def _seed(c):
+        dns = c.setdefault("network", {}).setdefault("dns", {})
+        dns["servers"] = ["213.186.33.99"]
+        dns["bootstrapFromSystem"] = True
+        dns["bootstrapped"] = False
+
+    cfg.update(_seed)
+    monkeypatch.setattr(n, "_parse_resolv_conf", lambda: [])
+    n.bootstrap_system_dns_once()
+
+    dns = cfg.get()["network"]["dns"]
+    assert dns["servers"] == ["213.186.33.99"]
+    assert dns["bootstrapped"] is True
 
 
 def test_normalize_socks5_url(m):

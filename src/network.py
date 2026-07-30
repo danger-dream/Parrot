@@ -283,6 +283,30 @@ def init() -> None:
             _HOOKED = True
 
 
+def _is_persistable_system_dns_server(raw: str) -> bool:
+    """Return whether a system resolver is safe to persist as an upstream DNS.
+
+    Loopback resolvers such as Docker's 127.0.0.11 or systemd-resolved's
+    127.0.0.53 are local namespace entry points, not portable upstream DNS
+    servers.  Unspecified addresses are invalid upstream targets as well.
+    Private/LAN addresses remain valid because they may be intentional DNS
+    servers supplied by the deployment network.
+    """
+    try:
+        spec = normalize_dns_server(raw)
+    except ValueError:
+        return False
+    try:
+        addr = ipaddress.ip_address(spec.host.strip("[]"))
+    except ValueError:
+        # Preserve the existing leniency for hostname-based resolver entries.
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return not (addr.is_loopback or addr.is_unspecified)
+
+
 def _parse_resolv_conf(path: str = "/etc/resolv.conf") -> list[str]:
     out: list[str] = []
     try:
@@ -294,28 +318,33 @@ def _parse_resolv_conf(path: str = "/etc/resolv.conf") -> list[str]:
                 parts = line.split()
                 if len(parts) < 2 or parts[0] != "nameserver":
                     continue
-                ip = parts[1].strip()
-                try:
-                    normalize_dns_server(ip)
-                except ValueError:
+                server = parts[1].strip()
+                if not _is_persistable_system_dns_server(server):
                     continue
-                if ip not in out:
-                    out.append(ip)
+                if server not in out:
+                    out.append(server)
     except OSError:
         pass
     return out
 
 
 def bootstrap_system_dns_once() -> None:
-    """Sync system DNS to config once if requested and not yet bootstrapped."""
+    """Sync usable system DNS to config once without persisting local stubs."""
     dcfg = dns_cfg()
     if not bool(dcfg.get("bootstrapFromSystem", True)):
         return
     if bool(dcfg.get("bootstrapped", False)):
         return
     servers = _parse_resolv_conf()
+
     if not servers:
-        servers = dns_servers()
+        def _mark_attempted(c: dict) -> None:
+            dns_obj = c.setdefault("network", {}).setdefault("dns", {})
+            dns_obj["bootstrapped"] = True
+
+        config.update(_mark_attempted, skip_if_unchanged=True)
+        print("[network] skipped DNS bootstrap: no persistable system DNS server")
+        return
 
     def _mut(c: dict) -> None:
         dns_obj = c.setdefault("network", {}).setdefault("dns", {})
@@ -327,8 +356,10 @@ def bootstrap_system_dns_once() -> None:
 
 
 def sync_system_dns_now() -> list[str]:
-    """Manually sync current system DNS and mark bootstrapped."""
-    servers = _parse_resolv_conf() or dns_servers()
+    """Manually sync usable system DNS and mark bootstrapped."""
+    servers = _parse_resolv_conf()
+    if not servers:
+        raise ValueError("系统 DNS 中没有可同步的上游地址，当前 DNS 未修改")
 
     def _mut(c: dict) -> None:
         dns_obj = c.setdefault("network", {}).setdefault("dns", {})
