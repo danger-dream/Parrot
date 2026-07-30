@@ -365,10 +365,12 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
             ch_stats = log_db.tokens_for_channel(ch.key, since_ts=month_ts)
             ch_tps = ch_stats.get("avg_tps")
             ch_prompt = ui.prompt_total(ch_stats.get("input"), ch_stats.get("cache_creation"), ch_stats.get("cache_read"))
-            ch_cache = (
-                ui.fmt_cache_phrase(ch_stats.get("cache_read"), ch_prompt)
-                if (ch_stats.get("cache_read") or 0) > 0 else ""
-            )
+            ch_cache = f"💵 {ui.fmt_cost(ch_stats)}"
+            if (ch_stats.get("cache_read") or 0) > 0:
+                ch_cache = (
+                    f"{ui.fmt_cache_phrase(ch_stats.get('cache_read'), ch_prompt)}"
+                    f" · {ch_cache}"
+                )
         except Exception:
             ch_tps = None
             ch_cache = ""
@@ -729,6 +731,7 @@ def _channel_model_lines(ch) -> list[str]:
             token_line = f"    ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(ms.get('output'))}"
             if (ms.get("cache_read") or 0) > 0:
                 token_line += f" · {ui.fmt_cache_phrase(ms.get('cache_read'), m_prompt)}"
+            token_line += f" · 💵 {ui.fmt_cost(ms)}"
             lines.append(token_line)
         if ms and ms.get("avg_tps") is not None:
             lines.append(

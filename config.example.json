@@ -308,6 +308,16 @@
     "mode": "forever",
     "days": null
   },
+  "pricing": {
+    "enabled": true,
+    "autoUpdate": true,
+    "sourceUrl": "https://models.dev/api.json",
+    "modelsUrl": "https://models.dev/models.json",
+    "refreshHours": 24,
+    "channelProviders": {},
+    "aliases": {},
+    "overrides": {}
+  },
   "stateDbPath": "state.db",
   "openaiOAuth": {
     "forceCodexCLI": true,

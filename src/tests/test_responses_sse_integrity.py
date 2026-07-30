@@ -5,6 +5,7 @@ import time
 
 import httpx
 
+from src import model_pricing
 from src.openai.transform.stream_r2c import StreamTranslator
 from src.protocols.commit_gate import SseCommitGate
 from src.protocols.sse import split_sse_events
@@ -230,6 +231,7 @@ async def test_non_stream_aggregate_rejects_eof_without_terminal_event():
             "output_index": 0,
             "content_index": 0,
             "delta": "partial",
+            "usage": {"input_tokens": 7, "output_tokens": 3},
         })]),
         headers={"content-type": "text/event-stream"},
     )
@@ -252,3 +254,8 @@ async def test_non_stream_aggregate_rejects_eof_without_terminal_event():
     assert result.error is not None
     assert result.error.outcome == "upstream_malformed"
     assert "without a terminal SSE event" in (result.error.error_detail or "")
+    billing = model_pricing.normalize_response_billing(
+        result.error.full_response_text,
+    )
+    assert billing.usage_observed is True
+    assert (billing.input_tokens, billing.output_tokens) == (7, 3)

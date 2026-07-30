@@ -206,6 +206,8 @@ def test_list_empty_and_populated(m):
     assert "user2@x.com" in last["text"]
     assert "用户禁用" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "≈" not in last["text"]
     assert "⏳ Token" not in last["text"]
     flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
     assert "oa:sort:1:all" not in flat
@@ -291,6 +293,8 @@ def test_view_detail_with_quota_cache(m):
     assert "5h: 已用 12%" in last["text"]
     assert "7d: 已用 45%" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "≈" not in last["text"]
     assert "↑ 160 · ↓ 20" in last["text"]
     # 详情按钮
     kb = last["reply_markup"]["inline_keyboard"]
@@ -707,19 +711,32 @@ def test_quota_disabled_openai_missing_cache_sync_fetches_usage_and_reset_cards(
     m["oauth_menu"].show(42, 100)
 
     row = None
-    for _ in range(20):
+    openai = {}
+    rendered = None
+    # The refresh writes the primary usage snapshot before the reset-card
+    # detail fetch and final menu edit. Wait for the state this test actually
+    # asserts instead of racing on mere row existence.
+    for _ in range(40):
         row = m["state_db"].quota_load(ak)
-        if row is not None:
+        raw = json.loads((row or {}).get("raw_data") or "{}")
+        openai = raw.get("openai") or {}
+        rendered = rec.last("editMessageText")
+        if (
+            row is not None
+            and row.get("five_hour_util") is not None
+            and (openai.get("rate_limit_reset_credit_details") or {}).get("data")
+            and rendered is not None
+            and "尚未获取" not in rendered["text"]
+        ):
             break
         import time as _time
         _time.sleep(0.05)
     assert row is not None
     assert row.get("five_hour_util") is not None
-    raw = json.loads(row.get("raw_data") or "{}")
-    openai = raw.get("openai") or {}
     assert (openai.get("rate_limit_reset_credits") or {}).get("available_count") == 2
     assert (openai.get("rate_limit_reset_credit_details") or {}).get("data")
-    text = rec.last("editMessageText")["text"]
+    assert rendered is not None
+    text = rendered["text"]
     assert "missing-cache@x.com" in text
     assert "尚未获取" not in text
     assert "官方重置次数" in text

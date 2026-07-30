@@ -56,6 +56,10 @@ def _ch_short_name(key: str) -> str:
     return ui.channel_display_name(key, with_family=True)
 
 
+def _fmt_cost(metrics: dict) -> str:
+    return ui.fmt_cost(metrics)
+
+
 def _section_overall(overall: dict) -> str:
     """cc-proxy 同款 6 段总览：Tokens / 请求 / 缓存 / 耗时 / 重试 / 亲和。"""
     total = int(overall.get("total") or 0)
@@ -84,6 +88,7 @@ def _section_overall(overall: dict) -> str:
     token_line = f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
     if raw_cr > 0:
         token_line += f" | {ui.fmt_cache_phrase(raw_cr, total_inp)}"
+    token_line += f" | 💵 {_fmt_cost(overall)}"
 
     lines = [
         "<b>Tokens:</b>",
@@ -219,6 +224,7 @@ def _summary_dim_block(title: str, groups: list[dict], render_key,
         )
         if cr > 0:
             line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
+        line += f" · 💵 {_fmt_cost(m)}"
         out.append(line)
         if extra_line is not None:
             extra = extra_line(g["key"])
@@ -263,6 +269,7 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key,
         token_line = f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
         if cr > 0:
             token_line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
+        token_line += f" · 💵 {_fmt_cost(m)}"
         out.append(token_line)
         out.append(f"  命中请求 {hit}/{succ} ({ui.fmt_rate(hit, succ)})")
         if avg_conn is not None or avg_first is not None:
@@ -293,7 +300,7 @@ def _section_cache_misses(misses: list[dict]) -> str:
         out.append(f"  渠道: <code>{ch_disp}</code>")
         out.append(
             f"  ↑{ui.fmt_tokens(inp)} · 写 {ui.fmt_tokens(write)} · "
-            f"msgs {msgs} · tools {tools}"
+            f"💵 {ui.fmt_cost_from_row(r)} · msgs {msgs} · tools {tools}"
         )
     return "\n".join(out)
 
@@ -358,6 +365,7 @@ def _section_overall_compact(overall: dict) -> str:
     lines.append(
         f"↑ {ui.fmt_tokens(total_inp)} · ↓ {ui.fmt_tokens(raw_out)}"
         + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr else "")
+        + f" · 💵 {_fmt_cost(overall)}"
     )
     # 耗时 / 速度
     timing_bits = []

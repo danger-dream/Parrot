@@ -125,6 +125,54 @@ def test_plan_and_execution_delete_full_month_and_trim_boundary_month(retention_
     try:
         assert conn.execute("SELECT request_id FROM request_log").fetchall() == [(feb_fresh.request_id,)]
         assert conn.execute("SELECT request_id FROM request_detail").fetchall() == [(feb_fresh.request_id,)]
+        assert conn.execute(
+            "SELECT root_request_id FROM upstream_attempt_usage"
+        ).fetchall() == [(feb_fresh.request_id,)]
+    finally:
+        conn.close()
+
+
+def test_boundary_trim_removes_compact_children_and_attempt_ledger(retention_log_dir):
+    created = _ts(2026, 2, 2)
+    root = log_db.insert_pending(
+        "compact-old", "127.0.0.1", "test-key", "test-model", False,
+        1, 0, {}, {}, created_at=created,
+    )
+    child = log_db.RequestLogHandle(
+        request_id="compact-old:compact:segment-1", db=root.db,
+    )
+    retry = log_db.record_retry_attempt(
+        child, 1, "api:test", "api", "test-model", created,
+    )
+    log_db.mark_retry_attempt_dispatch(retry, {})
+    log_db.update_retry_attempt(
+        retry,
+        outcome="http_error",
+        response_body='{"usage":{"input_tokens":1,"output_tokens":1}}',
+        ended_at=created + 1,
+    )
+    proxy = log_db.record_proxy_attempt(
+        child, retry, 1, "direct", created,
+        round_id="compact-round", transport="http", request_mode="http_non_stream",
+    )
+    log_db.update_proxy_attempt(proxy, ended_at=created + 1, outcome="http_error")
+    web = log_db.record_local_web_call(
+        child, 1, "search", query="old", started_at=created,
+    )
+    log_db.finish_local_web_call(web, status="error", ended_at=created + 1)
+    log_db.finish_error(root, "failed")
+
+    plan = log_db.plan_retention(7, now_ts=_ts(2026, 2, 15))
+    result = log_db.apply_retention_plan(plan)
+    assert result["ok"] is True, result
+
+    conn = sqlite3.connect(retention_log_dir / "2026-02.db")
+    try:
+        for table in (
+            "request_log", "request_detail", "retry_chain", "proxy_chain",
+            "local_web_log", "upstream_attempt_usage",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     finally:
         conn.close()
 

@@ -475,6 +475,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "forever",
         "days": None,
     },
+    # Token 金额统计：以 models.dev 供应商价格估算 USD；models.json 只用于
+    # 规范模型身份。xAI OAuth 返回 cost_in_usd_ticks 时优先使用真实金额。
+    "pricing": {
+        "enabled": True,
+        "autoUpdate": True,
+        "sourceUrl": "https://models.dev/api.json",
+        "modelsUrl": "https://models.dev/models.json",
+        "refreshHours": 24,
+        # API 渠道 → models.dev provider ID。OAuth 渠道可从不可变 key 自动识别；
+        # 第三方 API 渠道必须显式指定，避免同一 Model ID 套错供应商价格。
+        "channelProviders": {},
+        # 自定义模型名 → 价格表模型名。
+        "aliases": {},
+        # 单位均为 USD / 1M Token；至少填写 inputPerMillion/outputPerMillion。
+        "overrides": {},
+    },
     "stateDbPath": "state.db",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {
@@ -616,6 +632,27 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
     return False
 
 
+def _normalize_pricing_sources(cfg: dict) -> bool:
+    """Move the former built-in LiteLLM URL to the models.dev API schema.
+
+    Only the exact old default is rewritten. A user-supplied HTTPS mirror of
+    models.dev remains untouched.
+    """
+
+    pricing = cfg.get("pricing")
+    if not isinstance(pricing, dict):
+        return False
+    legacy = (
+        "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+        "model_prices_and_context_window.json"
+    )
+    if str(pricing.get("sourceUrl") or "").strip() != legacy:
+        return False
+    pricing["sourceUrl"] = "https://models.dev/api.json"
+    pricing["modelsUrl"] = "https://models.dev/models.json"
+    return True
+
+
 def _normalize_api_keys(cfg: dict) -> bool:
     """把 apiKeys 里的旧式字符串条目升级为 dict 结构（向前兼容）。
 
@@ -688,6 +725,9 @@ def _load_from_disk() -> dict:
     if _normalize_openai_oauth_config(merged, raw):
         changed = True
         print("[config] backfilled openaiOAuth from defaults/legacy oauth.providers.openai")
+    if _normalize_pricing_sources(merged):
+        changed = True
+        print("[config] migrated built-in pricing source from LiteLLM to models.dev")
     if changed:
         _write_atomic(merged)
     return merged

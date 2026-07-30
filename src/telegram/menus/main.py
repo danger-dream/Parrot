@@ -190,10 +190,13 @@ def _lifetime_stats_block() -> list[str]:
         "📊 <b>累计统计</b>",
         f"  总调用 <code>{s.get('total', 0):,}</code> 次",
         f"  总 Tokens <code>{ui.fmt_tokens(total_in + out_tok)}</code> "
-        f"(↑ {ui.fmt_tokens(total_in)} ↓ {ui.fmt_tokens(out_tok)})",
+        f"(↑ {ui.fmt_tokens(total_in)} ↓ {ui.fmt_tokens(out_tok)})"
+        f" · 💵 {ui.fmt_cost(s)}",
     ]
     if (s.get("cache_read") or 0) > 0:
-        lines.append(f"  {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}")
+        lines.append(
+            f"  {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}"
+        )
     return lines
 
 

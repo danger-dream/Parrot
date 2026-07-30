@@ -37,11 +37,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, state_db
+    from src import config, log_db, state_db
     from src.telegram import bot, states, ui
     from src.telegram.menus import apikey_menu, main as main_menu
     return {
-        "config": config, "state_db": state_db,
+        "config": config, "log_db": log_db, "state_db": state_db,
         "bot": bot, "states": states, "ui": ui,
         "apikey_menu": apikey_menu, "main_menu": main_menu,
     }
@@ -229,6 +229,59 @@ def test_apikey_del_flow(m):
     ak.on_del_exec(100, 50, "cb-bad", "00000000")
     # 不 crash；并重新展示主菜单
     print("  [PASS] apikey del flow (list → confirm → exec)")
+
+
+def test_apikey_cache_stats_include_cost(m):
+    m["log_db"].init()
+    conn = m["log_db"]._get_conn()
+    conn.execute("DELETE FROM request_log")
+    conn.execute("DELETE FROM request_detail")
+    conn.commit()
+    def configure_priced_key(c):
+        c["apiKeys"] = {
+            "priced": {
+                "key": "ccp-test-not-a-production-secret",
+                "enabled": True,
+                "allowedModels": [],
+                "allowImages": False,
+            },
+        }
+        pricing = c.setdefault("pricing", {})
+        pricing["enabled"] = True
+        pricing.setdefault("channelProviders", {})["api:Priced"] = "openai"
+
+    m["config"].update(configure_priced_key)
+    ld = m["log_db"]
+    ld.insert_pending(
+        "apikey-cost", "127.0.0.1", "priced", "gpt-5.6-sol", True,
+        msg_count=1, tool_count=0, request_headers={}, request_body={},
+    )
+    ld.finish_success(
+        "apikey-cost", "api:Priced", "api", "gpt-5.6-sol",
+        input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_creation_tokens=1_000_000, cache_read_tokens=1_000_000,
+        connect_ms=10, first_token_ms=20, total_ms=1000,
+        response_body='{"id":"test"}', http_status=200,
+        upstream_protocol="openai-responses",
+    )
+
+    rec = _install_recorder(m)
+    m["apikey_menu"].show(100, 50)
+    list_text = rec.last("editMessageText")["text"]
+    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in list_text
+    assert "≈" not in list_text
+
+    lifetime_text = "\n".join(m["main_menu"]._lifetime_stats_block())
+    assert "总 Tokens <code>4.0M</code> (↑ 3.0M ↓ 1.0M) · 💵 估算 $68.50" in lifetime_text
+    assert "缓存 1.0M (33.3%)" in lifetime_text
+    assert "≈" not in lifetime_text
+
+    short = m["apikey_menu"]._short_of("priced")
+    rec.clear()
+    m["apikey_menu"].on_view(100, 50, "cb-view", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert detail_text.count("缓存 1.0M (33.3%) · 💵 估算 $68.50") >= 2
+    assert "≈" not in detail_text
 
 
 def test_bot_routing_non_admin(m):

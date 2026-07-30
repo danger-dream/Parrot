@@ -228,6 +228,8 @@ def test_list_empty_and_populated(m):
     assert "chA" in last["text"]
     assert "chB" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
+    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "≈" not in last["text"]
     print("  [PASS] list empty + populated")
 
 
@@ -351,6 +353,8 @@ def test_detail_renders(m):
     assert "chA" in text
     assert "GLM-5" in text and "glm-5" in text
     assert "缓存 50 (31.2%)" in text
+    assert "缓存 50 (31.2%) · 💵 " in text
+    assert "≈" not in text
     # API Key 掩码
     assert "sk-tes" in text and "***" in text
     # 按钮

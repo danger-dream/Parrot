@@ -248,7 +248,12 @@ def _today_snapshot_by_family() -> dict:
 
     def _snap(fam: str | None) -> dict:
         try:
-            r = log_db.stats_summary(since_ts=since, family=fam, summary_top_limit=0)
+            r = log_db.stats_summary(
+                since_ts=since,
+                family=fam,
+                summary_top_limit=0,
+                include_cost=False,
+            )
             o = r.get("overall") or {}
             return {
                 "total": int(o.get("total") or 0),

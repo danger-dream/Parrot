@@ -226,6 +226,9 @@ class AttemptResult:
         "cache_creation": 0,
         "cache_read": 0,
     })
+    # Independent from token values: an authoritative 0/0 usage is observed,
+    # while a missing/malformed usage object is not.
+    usage_observed: Optional[bool] = None
     full_response_text: Optional[str] = None
     assistant_response: Optional[dict] = None
     proxy_name: Optional[str] = None
@@ -268,12 +271,29 @@ async def prepare_non_stream_response(
     cross-protocol response translator.  Scheduler scoring, DB writes, affinity,
     and response construction intentionally stay in the caller.
     """
-    restored = await provider_registry.restore_response_bytes(
-        channel,
-        raw,
-        dynamic_map=dynamic_map,
-        translator_ctx=translator_ctx,
-    )
+    raw_text = bytes(raw).decode("utf-8", errors="replace")
+    try:
+        restored = await provider_registry.restore_response_bytes(
+            channel,
+            raw,
+            dynamic_map=dynamic_map,
+            translator_ctx=translator_ctx,
+        )
+    except Exception as exc:
+        # Restoration is a downstream presentation concern.  Preserve the
+        # exact upstream body so terminal billing can still inspect actual cost,
+        # usage, and service tier even when an adapter itself fails.
+        return PreparedNonStreamResponse(
+            restored_text=raw_text,
+            error=AttemptResult(
+                outcome="transform_error",
+                connect_ms=connect_ms,
+                total_ms=total_ms,
+                error_detail=f"response restoration failed: {exc}"[:2000],
+                full_response_text=raw_text,
+                translator_ctx=translator_ctx,
+            ),
+        )
     restored_text = (
         restored.decode("utf-8", errors="replace")
         if isinstance(restored, bytes)
@@ -291,6 +311,7 @@ async def prepare_non_stream_response(
                 connect_ms=connect_ms,
                 total_ms=total_ms,
                 error_detail=f"non-JSON response: {exc}",
+                full_response_text=restored_text,
             ),
         )
 
@@ -316,6 +337,7 @@ async def prepare_non_stream_response(
                 connect_ms=connect_ms,
                 total_ms=total_ms,
                 error_detail=error_detail[:2000],
+                full_response_text=restored_text,
                 translator_ctx=translator_ctx,
             ),
         )
@@ -331,6 +353,7 @@ async def prepare_non_stream_response(
                 connect_ms=connect_ms,
                 total_ms=total_ms,
                 error_detail=f"blacklist: {bl_hit}",
+                full_response_text=restored_text,
             ),
         )
 

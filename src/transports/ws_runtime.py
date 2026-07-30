@@ -406,6 +406,12 @@ async def read_until_first_responses_ws_visible_event(
             proxy_bytes.count(down=ws_frame_size(data))
 
         if isinstance(data, str):
+            # Every upstream text frame must reach the tracker before a terminal
+            # classification returns. Attempt settlement relies on the exact
+            # response body for usage/service-tier/actual-cost extraction.
+            event_type = ws_event_type(data)
+            tracker.feed_text(data)
+
             if parse_wrapped_errors:
                 maybe_error = parse_wrapped_responses_ws_error(data)
                 if maybe_error:
@@ -417,9 +423,6 @@ async def read_until_first_responses_ws_visible_event(
                         result.pending.append(data)
                         result.closed_after_accept = True
                     return result
-
-            event_type = ws_event_type(data)
-            tracker.feed_text(data)
 
             if getattr(tracker, "response_failed", False):
                 if timing is not None:
