@@ -1414,6 +1414,51 @@ _CODEX_MISSING_RESET_FALLBACK_SECONDS = 10 * 60
 # not veto recovery. Keep the margin comfortably above WHAM propagation delay
 # and the 30s response-header sampling throttle.
 _CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS = 15 * 60 * 1000
+_QUOTA_OBSERVATION_GENERATION_FIELD = "quota_observation_generation"
+_QUOTA_OBSERVATION_FIELD = "quota_observation"
+_CODEX_OBSERVATION_SOURCE = "openai_codex_headers"
+
+
+def _quota_observation_generation(acc: dict | None) -> int | None:
+    """Return the persistent quota-observation generation, or None if corrupt."""
+    if not isinstance(acc, dict):
+        return None
+    value = acc.get(_QUOTA_OBSERVATION_GENERATION_FIELD, 0)
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def codex_quota_observation(snap: dict) -> dict:
+    """Build a JSON-safe persistent observation from Codex response headers."""
+    observed_at = _ms_timestamp(snap.get("fetched_at"))
+    if observed_at is None:
+        observed_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    sanitized: dict[str, int | float] = {}
+    for name in ("primary", "secondary"):
+        pct_key = f"{name}_used_pct"
+        try:
+            pct = float(snap.get(pct_key)) if snap.get(pct_key) is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        if pct is not None and math.isfinite(pct):
+            sanitized[pct_key] = pct
+
+        for suffix in ("reset_sec", "window_min"):
+            key = f"{name}_{suffix}"
+            try:
+                value = int(snap.get(key)) if snap.get(key) is not None else None
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value >= 0:
+                sanitized[key] = value
+
+    return {
+        "source": _CODEX_OBSERVATION_SOURCE,
+        "observed_at": observed_at,
+        "snapshot": sanitized,
+    }
 
 
 def _codex_cached_reset_ms(row: dict, base_ms: int | None,
@@ -1437,23 +1482,110 @@ def _codex_cached_reset_ms(row: dict, base_ms: int | None,
     return base_ms + _CODEX_MISSING_RESET_FALLBACK_SECONDS * 1000
 
 
-def _codex_snapshot_superseded_by_usage(row: dict) -> bool:
-    """Whether the cached Codex header snapshot predates fresh WHAM usage.
+def _codex_snapshot_from_quota_row(row: dict) -> dict:
+    return {
+        f"{name}_{suffix}": row.get(f"codex_{name}_{suffix}")
+        for name in ("primary", "secondary")
+        for suffix in ("used_pct", "reset_sec", "window_min")
+    }
 
-    ``fetched_at`` is written by ``quota_save`` from an active WHAM fetch, while
-    ``last_passive_update_at`` is written by passive Codex response-header
-    sampling. When WHAM data is clearly newer, the header snapshot is an old
-    observation: upstream may have reset the window early, so its locally
-    predicted reset time is no longer evidence of an over-quota state.
+
+def _persistent_codex_observation(account_key: str) -> tuple[dict | None, int | None]:
+    acc = get_account(account_key)
+    observation = acc.get(_QUOTA_OBSERVATION_FIELD) if isinstance(acc, dict) else None
+    if not isinstance(observation, dict):
+        return None, None
+    if observation.get("source") != _CODEX_OBSERVATION_SOURCE:
+        return None, None
+    snapshot = observation.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None, None
+    return snapshot, _ms_timestamp(observation.get("observed_at"))
+
+
+def _codex_window_candidates(account_key: str, row: dict) -> dict[str, list[dict]]:
+    """Return newest known Codex evidence for each semantic quota window.
+
+    The config observation is written before the auxiliary SQLite snapshot, so
+    it covers BUSY/FULL/READONLY failures. Partial snapshots are merged per
+    semantic window rather than allowing one newly observed window to erase an
+    older, still-relevant other window.
     """
-    passive_ms = _ms_timestamp(row.get("last_passive_update_at"))
-    usage_ms = _ms_timestamp(row.get("fetched_at"))
-    if passive_ms is None or usage_ms is None:
-        return False
-    return usage_ms - passive_ms >= _CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS
+    grouped: dict[str, list[dict]] = {"five_hour": [], "seven_day": []}
+
+    def add(snapshot: dict | None, observed_ms: int | None, *, row_fallback: dict | None = None):
+        if not isinstance(snapshot, dict):
+            return
+        window_map = openai_provider.codex_snapshot_window_map(snapshot)
+        for raw_name in ("primary", "secondary"):
+            pct_key = f"{raw_name}_used_pct"
+            try:
+                pct = float(snapshot.get(pct_key)) if snapshot.get(pct_key) is not None else None
+            except (TypeError, ValueError):
+                pct = None
+            if pct is None or not math.isfinite(pct):
+                continue
+            semantic = window_map[raw_name]
+            reset_ms = _codex_cached_reset_ms(
+                snapshot, observed_ms, f"{raw_name}_reset_sec",
+            )
+            if reset_ms is None and row_fallback is not None:
+                reset_dt = _parse_iso(row_fallback.get(f"{semantic}_reset"))
+                if reset_dt is not None:
+                    reset_ms = int(reset_dt.timestamp() * 1000)
+            grouped[semantic].append({
+                "raw_name": raw_name,
+                "semantic": semantic,
+                "pct": pct,
+                "observed_ms": observed_ms,
+                "reset_ms": reset_ms,
+            })
+
+    add(
+        _codex_snapshot_from_quota_row(row),
+        _ms_timestamp(row.get("last_passive_update_at")),
+        row_fallback=row,
+    )
+    persistent_snapshot, persistent_ms = _persistent_codex_observation(account_key)
+    add(persistent_snapshot, persistent_ms)
+
+    # Known timestamps are comparable, so only the newest observation for that
+    # semantic window remains relevant. Timestamp-less legacy evidence stays as
+    # an additional fail-closed candidate until its absolute reset expires.
+    for semantic, candidates in tuple(grouped.items()):
+        unknown = [item for item in candidates if item["observed_ms"] is None]
+        known = [item for item in candidates if item["observed_ms"] is not None]
+        newest = max(known, key=lambda item: item["observed_ms"]) if known else None
+        grouped[semantic] = unknown + ([newest] if newest is not None else [])
+    return grouped
 
 
-def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
+def _fresh_wham_window_utils(usage: dict | None) -> dict[str, float | None]:
+    openai = usage.get("openai") if isinstance(usage, dict) else None
+    if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
+        return {}
+
+    def explicit_util(name: str) -> float | None:
+        block = usage.get(name) if isinstance(usage, dict) else None
+        raw = block.get("utilization") if isinstance(block, dict) else None
+        if isinstance(raw, bool) or raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value < 0 or value > 100:
+            return None
+        return value
+
+    return {
+        "five_hour": explicit_util("five_hour"),
+        "seven_day": explicit_util("seven_day"),
+    }
+
+
+def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
+                                    usage: dict | None = None) -> dict:
     """Return active Codex response-header quota hits cached for an OpenAI account.
 
     WHAM /usage and Codex response headers can disagree near reset boundaries.
@@ -1463,43 +1595,45 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float) -> dict:
     header snapshots don't keep accounts disabled forever. If a rare snapshot has
     no reset-after header, bound it by a short TTL.
 
-    The snapshot is also dropped once fresh WHAM usage is clearly newer than it:
-    the locally predicted reset time assumes a full window, so an early upstream
-    reset would otherwise keep the account disabled for days.
+    A Codex window is superseded only when active WHAM usage is clearly newer
+    *and* contains the corresponding semantic window explicitly below threshold.
+    Missing 5h/7d evidence never clears the other window. A persistent config
+    observation closes the safety gap when auxiliary SQLite snapshot writes fail
+    and also provides the generation used by the final account-enable CAS.
     """
-    row = state_db.quota_load(account_key)
-    if not row:
-        return {"any_over": False, "hit_windows": [], "latest_reset": None}
+    row = state_db.quota_load(account_key) or {}
 
-    if _codex_snapshot_superseded_by_usage(row):
-        return {"any_over": False, "hit_windows": [], "latest_reset": None}
-
-    base_ms = _ms_timestamp(row.get("last_passive_update_at")) or _ms_timestamp(row.get("fetched_at"))
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    usage_ms = _ms_timestamp(row.get("fetched_at"))
+    wham_windows = _fresh_wham_window_utils(usage)
     hits: list[str] = []
     resets: list[str | None] = []
 
-    for label, pct_key, reset_key in (
-        ("codex primary", "codex_primary_used_pct", "codex_primary_reset_sec"),
-        ("codex secondary", "codex_secondary_used_pct", "codex_secondary_reset_sec"),
-    ):
-        try:
-            pct = float(row.get(pct_key)) if row.get(pct_key) is not None else None
-        except (TypeError, ValueError):
-            pct = None
-        if pct is None or pct < threshold:
-            continue
+    for semantic, candidates in _codex_window_candidates(account_key, row).items():
+        for candidate in candidates:
+            pct = candidate["pct"]
+            if pct < threshold:
+                continue
+            reset_ms = candidate["reset_ms"]
+            if reset_ms is not None and reset_ms <= now_ms:
+                continue
 
-        reset_ms = _codex_cached_reset_ms(row, base_ms, reset_key)
-        reset_iso = _iso_from_ms(reset_ms)
+            observed_ms = candidate["observed_ms"]
+            wham_pct = wham_windows.get(semantic)
+            superseded = bool(
+                observed_ms is not None
+                and usage_ms is not None
+                and usage_ms - observed_ms >= _CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS
+                and wham_pct is not None
+                and wham_pct < threshold
+            )
+            if superseded:
+                continue
 
-        # The cached header said "over threshold", but its reset time has passed;
-        # ignore it and let fresh WHAM usage decide recovery.
-        if reset_ms is not None and reset_ms <= now_ms:
-            continue
-
-        hits.append(f"{label} {pct:.0f}%")
-        resets.append(reset_iso)
+            label = f"codex {candidate['raw_name']} {pct:.0f}%"
+            if label not in hits:
+                hits.append(label)
+            resets.append(_iso_from_ms(reset_ms))
 
     return {
         "any_over": bool(hits),
@@ -1562,6 +1696,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": "noop_missing", "utils": utils, "any_over": any_over,
                 "hit_windows": hit_windows, "disabled_until": None}
     reason = acc.get("disabled_reason")
+    expected_quota_generation = _quota_observation_generation(acc)
     if reason in ("user", "auth_error"):
         return {"action": f"noop_{reason}", "utils": utils, "any_over": any_over,
                 "hit_windows": hit_windows,
@@ -1579,19 +1714,33 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                     "disabled_until": acc.get("disabled_until")}
         latest_reset = reset_iso_for_hit_windows(usage, threshold)
         try:
-            set_disabled_by_quota(account_key, latest_reset)
+            disable_result = set_disabled_by_quota(account_key, latest_reset)
         except Exception as exc:
             print(f"[oauth] evaluate WHAM disable failed for {account_key}: {exc}")
             return {"action": "disable_failed", "utils": utils,
                     "any_over": True, "hit_windows": hit_windows,
                     "disabled_until": None}
+        disable_state = (disable_result or {}).get("state")
+        if disable_state != "disabled":
+            return {"action": (
+                        "wham_limit_keep_disabled"
+                        if disable_state == "already_quota_disabled"
+                        else disable_state or "disable_failed"
+                    ),
+                    "utils": utils, "any_over": True,
+                    "hit_windows": hit_windows,
+                    "disabled_until": (disable_result or {}).get("disabled_until"),
+                    "disabled_reason": (disable_result or {}).get("disabled_reason"),
+                    "error_code": "account_state_conflict"}
         return {"action": "wham_limit_disabled", "utils": utils,
                 "any_over": True, "hit_windows": hit_windows,
                 "disabled_until": latest_reset}
 
     cached_codex_hit = None
     if provider_of(account_key) == "openai":
-        cached_codex_hit = _cached_openai_codex_quota_hit(account_key, threshold)
+        cached_codex_hit = _cached_openai_codex_quota_hit(
+            account_key, threshold, usage if fresh else None,
+        )
         if cached_codex_hit.get("any_over"):
             any_over = True
             for _hit in cached_codex_hit.get("hit_windows") or []:
@@ -1608,12 +1757,24 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             (cached_codex_hit or {}).get("latest_reset"),
         )
         try:
-            set_disabled_by_quota(account_key, latest_reset)
+            disable_result = set_disabled_by_quota(account_key, latest_reset)
         except Exception as exc:
             print(f"[oauth] evaluate set_disabled_by_quota failed for {account_key}: {exc}")
             return {"action": "disable_failed", "utils": utils,
                     "any_over": True, "hit_windows": hit_windows,
                     "disabled_until": None}
+        disable_state = (disable_result or {}).get("state")
+        if disable_state != "disabled":
+            return {"action": (
+                        "still_over_quota"
+                        if disable_state == "already_quota_disabled"
+                        else disable_state or "disable_failed"
+                    ),
+                    "utils": utils, "any_over": True,
+                    "hit_windows": hit_windows,
+                    "disabled_until": (disable_result or {}).get("disabled_until"),
+                    "disabled_reason": (disable_result or {}).get("disabled_reason"),
+                    "error_code": "account_state_conflict"}
         return {"action": "disabled", "utils": utils, "any_over": True,
                 "hit_windows": hit_windows, "disabled_until": latest_reset}
 
@@ -1631,6 +1792,11 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 return {"action": "quota_stale_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],
                         "disabled_until": acc.get("disabled_until")}
+        if expected_quota_generation is None:
+            return {"action": "resume_failed", "utils": utils,
+                    "any_over": False, "hit_windows": [],
+                    "disabled_until": acc.get("disabled_until"),
+                    "error_code": "quota_observation_generation_invalid"}
         runtime_state = None
         if provider == "openai" and fresh:
             # Clear persistent/runtime routing blockers before enabling. The
@@ -1654,6 +1820,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         try:
             enable_result = set_enabled(
                 account_key, True, expected_disabled_reason="quota",
+                expected_quota_observation_generation=expected_quota_generation,
             )
         except Exception as exc:
             print(f"[oauth] evaluate set_enabled failed for {account_key}: {exc}")
@@ -2249,17 +2416,29 @@ def _delete_account_serialized(account_key: str) -> None:
 
 
 _EXPECTED_REASON_UNSET = object()
+_EXPECTED_QUOTA_GENERATION_UNSET = object()
 
 
 def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                 disabled_until: str | None = None, *,
-                expected_disabled_reason=_EXPECTED_REASON_UNSET) -> dict | None:
-    """Set account state; recovery may require the account to still be quota-disabled."""
+                expected_disabled_reason=_EXPECTED_REASON_UNSET,
+                expected_quota_observation_generation=_EXPECTED_QUOTA_GENERATION_UNSET,
+                ) -> dict | None:
+    """Set account state with optional quota reason/generation CAS guards."""
     canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
     target_provider, target_identity = _split_ak(account_key)
-    conditional = expected_disabled_reason is not _EXPECTED_REASON_UNSET
-    decision = {"state": "missing", "disabled_reason": None, "disabled_until": None}
+    reason_conditional = expected_disabled_reason is not _EXPECTED_REASON_UNSET
+    generation_conditional = (
+        expected_quota_observation_generation is not _EXPECTED_QUOTA_GENERATION_UNSET
+    )
+    conditional = reason_conditional or generation_conditional
+    decision = {
+        "state": "missing",
+        "disabled_reason": None,
+        "disabled_until": None,
+        "quota_observation_generation": None,
+    }
 
     def mutate(cfg):
         for acc in cfg.get("oauthAccounts", []):
@@ -2274,8 +2453,10 @@ def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
             if conditional:
                 current_reason = acc.get("disabled_reason")
                 current_enabled = acc.get("enabled")
+                current_generation = _quota_observation_generation(acc)
                 decision.update(disabled_reason=current_reason,
-                                disabled_until=acc.get("disabled_until"))
+                                disabled_until=acc.get("disabled_until"),
+                                quota_observation_generation=current_generation)
                 if type(current_enabled) is not bool:
                     decision["state"] = "invalid_state"
                     return
@@ -2284,24 +2465,99 @@ def set_enabled(account_key: str, enabled: bool, reason: str | None = None,
                         "already_enabled" if not current_reason else "invalid_state"
                     )
                     return
-                if current_reason != expected_disabled_reason:
+                if reason_conditional and current_reason != expected_disabled_reason:
                     decision["state"] = "state_conflict"
+                    return
+                if generation_conditional and (
+                    current_generation is None
+                    or current_generation != expected_quota_observation_generation
+                ):
+                    decision["state"] = "quota_observation_conflict"
                     return
                 decision["state"] = "enabled"
             acc["enabled"] = enabled
             if enabled:
                 acc["disabled_reason"] = None
                 acc["disabled_until"] = None
+                acc.pop(_QUOTA_OBSERVATION_FIELD, None)
             else:
                 acc["disabled_reason"] = reason or "user"
                 acc["disabled_until"] = disabled_until
+                if (reason or "user") != "quota":
+                    acc.pop(_QUOTA_OBSERVATION_FIELD, None)
             return
     config.update(mutate, skip_if_unchanged=conditional)
     return decision if conditional else None
 
 
-def set_disabled_by_quota(account_key: str, resets_at: str | None) -> None:
-    set_enabled(account_key, False, reason="quota", disabled_until=resets_at)
+def set_disabled_by_quota(account_key: str, resets_at: str | None, *,
+                          observation: dict | None = None) -> dict:
+    """Persist a quota disable and advance its observation generation.
+
+    Repeated real-time observations keep the original disabled_until but still
+    advance the generation. This makes a concurrent recovery CAS fail even when
+    the auxiliary SQLite snapshot could not be written.
+    """
+    canonical = _resolve_existing_account_key(account_key)
+    has_prov = ":" in account_key
+    target_provider, target_identity = _split_ak(account_key)
+    decision = {
+        "state": "missing",
+        "disabled_reason": None,
+        "disabled_until": None,
+        "quota_observation_generation": None,
+    }
+
+    def mutate(cfg):
+        for acc in cfg.get("oauthAccounts", []):
+            if canonical:
+                if _canonical_key(acc) != canonical:
+                    continue
+            else:
+                if acc.get("email") != target_identity:
+                    continue
+                if has_prov and _acc_provider(acc) != target_provider:
+                    continue
+
+            current_enabled = acc.get("enabled", True)
+            current_reason = acc.get("disabled_reason")
+            decision.update(
+                disabled_reason=current_reason,
+                disabled_until=acc.get("disabled_until"),
+            )
+            if type(current_enabled) is not bool:
+                decision["state"] = "invalid_state"
+                return
+            if current_reason not in (None, "quota"):
+                decision["state"] = "state_conflict"
+                return
+            if current_enabled and current_reason is not None:
+                decision["state"] = "invalid_state"
+                return
+            if not current_enabled and current_reason != "quota":
+                decision["state"] = "invalid_state"
+                return
+
+            current_generation = _quota_observation_generation(acc)
+            next_generation = (current_generation if current_generation is not None else 0) + 1
+            acc[_QUOTA_OBSERVATION_GENERATION_FIELD] = next_generation
+            if isinstance(observation, dict):
+                acc[_QUOTA_OBSERVATION_FIELD] = copy.deepcopy(observation)
+
+            if current_enabled:
+                acc["enabled"] = False
+                acc["disabled_reason"] = "quota"
+                acc["disabled_until"] = resets_at
+                decision["state"] = "disabled"
+                decision["disabled_reason"] = "quota"
+                decision["disabled_until"] = resets_at
+            else:
+                decision["state"] = "already_quota_disabled"
+            decision["quota_observation_generation"] = next_generation
+            return
+
+    config.update(mutate, skip_if_unchanged=True)
+    return decision
 
 
 def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
