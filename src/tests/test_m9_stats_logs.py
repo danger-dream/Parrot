@@ -651,6 +651,32 @@ def test_log_detail_shows_three_decimal_cost_formula_from_frozen_attempt(m):
     assert "\n💵 $0.18\n" not in text
 
 
+def test_log_detail_formula_separates_anthropic_5m_and_1h_cache_writes(m):
+    snapshot = json.dumps({
+        "input_per_token": 5 / 1_000_000,
+        "output_per_token": 25 / 1_000_000,
+        "cache_write_per_token": 6.25 / 1_000_000,
+        "cache_write_5m_per_token": 6.25 / 1_000_000,
+        "cache_write_1h_per_token": 10 / 1_000_000,
+        "cache_read_per_token": 0.5 / 1_000_000,
+    })
+    formula = m["logs_menu"]._attempt_cost_formula({
+        "cost_source": "estimated",
+        "input_tokens": 20_000,
+        "output_tokens": 10_000,
+        "cache_creation_tokens": 80_000,
+        "cache_creation_5m_tokens": 30_000,
+        "cache_creation_1h_tokens": 50_000,
+        "cache_read_tokens": 0,
+        "pricing_snapshot_json": snapshot,
+    })
+    assert formula == (
+        "输入 20,000 × $5/M + 输出 10,000 × $25/M"
+        " + 缓存写入 5m 30,000 × $6.25/M"
+        " + 缓存写入 1h 50,000 × $10/M"
+    )
+
+
 def test_cache_miss_write_sample_includes_request_cost(m):
     _setup(m)
     _insert_success(

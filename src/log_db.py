@@ -238,6 +238,8 @@ def _schema_sql() -> str:
       input_tokens          INTEGER NOT NULL DEFAULT 0,
       output_tokens         INTEGER NOT NULL DEFAULT 0,
       cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_5m_tokens INTEGER,
+      cache_creation_1h_tokens INTEGER,
       cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
       service_tier          TEXT,
       outbound_service_tier TEXT,
@@ -452,7 +454,9 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           binding_revision TEXT,
           outcome TEXT, usage_observed INTEGER NOT NULL DEFAULT 0,
           input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-          cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_creation_5m_tokens INTEGER, cache_creation_1h_tokens INTEGER,
+          cache_read_tokens INTEGER NOT NULL DEFAULT 0,
           service_tier TEXT, outbound_service_tier TEXT,
           upstream_protocol TEXT,
           dispatch_state TEXT NOT NULL DEFAULT 'unknown',
@@ -488,6 +492,8 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
             ("input_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0"),
+            ("cache_creation_5m_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cache_creation_5m_tokens INTEGER"),
+            ("cache_creation_1h_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cache_creation_1h_tokens INTEGER"),
             ("cache_read_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0"),
             ("service_tier", "ALTER TABLE upstream_attempt_usage ADD COLUMN service_tier TEXT"),
             ("outbound_service_tier", "ALTER TABLE upstream_attempt_usage ADD COLUMN outbound_service_tier TEXT"),
@@ -1735,12 +1741,14 @@ def _billing_root_request_id(call_request_id: str) -> str:
     return call_request_id.split(marker, 1)[0] if marker in call_request_id else call_request_id
 
 
-def _strict_tracker_usage(usage: Any) -> tuple[tuple[int, int, int, int], bool]:
+def _strict_tracker_usage(
+    usage: Any,
+) -> tuple[tuple[int, int, int, int], tuple[int, int] | None, bool]:
     if not isinstance(usage, dict):
-        return (0, 0, 0, 0), False
+        return (0, 0, 0, 0), None, False
     required = ("input_tokens", "output_tokens")
     if any(name not in usage for name in required):
-        return (0, 0, 0, 0), False
+        return (0, 0, 0, 0), None, False
     raw = (
         usage.get("input_tokens"),
         usage.get("output_tokens"),
@@ -1749,32 +1757,75 @@ def _strict_tracker_usage(usage: Any) -> tuple[tuple[int, int, int, int], bool]:
     )
     parsed = tuple(model_pricing._strict_nonnegative_int(value) for value in raw)
     if any(value is None for value in parsed):
-        return (0, 0, 0, 0), False
-    return tuple(int(value) for value in parsed), True  # type: ignore[arg-type]
+        return (0, 0, 0, 0), None, False
+    tokens = tuple(int(value) for value in parsed)
+    split: tuple[int, int] | None = None
+    if "cache_creation_5m" in usage and "cache_creation_1h" in usage:
+        parsed_split = (
+            model_pricing._strict_nonnegative_int(usage.get("cache_creation_5m")),
+            model_pricing._strict_nonnegative_int(usage.get("cache_creation_1h")),
+        )
+        if all(value is not None for value in parsed_split):
+            candidate = tuple(int(value) for value in parsed_split)
+            if sum(candidate) == tokens[2]:
+                split = candidate  # type: ignore[assignment]
+    return tokens, split, True
 
 
 def _usage_values(
     usage: dict | None,
     usage_observed: bool | None,
     normalized,
-) -> tuple[tuple[int, int, int, int], bool]:
+) -> tuple[tuple[int, int, int, int], tuple[int, int] | None, bool]:
     """Select authoritative tracker usage before compatibility body fallback."""
     if usage_observed is not None:
         if not usage_observed:
-            return (0, 0, 0, 0), False
-        tokens, valid = _strict_tracker_usage(usage)
-        return tokens, bool(valid)
+            return (0, 0, 0, 0), None, False
+        tokens, split, valid = _strict_tracker_usage(usage)
+        if (
+            valid
+            and split is None
+            and not normalized.usage_invalid
+            and normalized.usage_observed
+            and tokens == (
+                normalized.input_tokens,
+                normalized.output_tokens,
+                normalized.cache_creation_tokens,
+                normalized.cache_read_tokens,
+            )
+            and normalized.cache_creation_5m_tokens is not None
+            and normalized.cache_creation_1h_tokens is not None
+            and normalized.cache_creation_5m_tokens
+            + normalized.cache_creation_1h_tokens == tokens[2]
+        ):
+            split = (
+                normalized.cache_creation_5m_tokens,
+                normalized.cache_creation_1h_tokens,
+            )
+        return tokens, split, bool(valid)
     if normalized.usage_invalid:
-        return (0, 0, 0, 0), False
+        return (0, 0, 0, 0), None, False
     if normalized.usage_observed:
-        return (
+        tokens = (
             normalized.input_tokens, normalized.output_tokens,
             normalized.cache_creation_tokens, normalized.cache_read_tokens,
-        ), True
-    tokens, valid = _strict_tracker_usage(usage)
+        )
+        split = None
+        if (
+            normalized.cache_creation_5m_tokens is not None
+            and normalized.cache_creation_1h_tokens is not None
+            and normalized.cache_creation_5m_tokens
+            + normalized.cache_creation_1h_tokens == normalized.cache_creation_tokens
+        ):
+            split = (
+                normalized.cache_creation_5m_tokens,
+                normalized.cache_creation_1h_tokens,
+            )
+        return tokens, split, True
+    tokens, split, valid = _strict_tracker_usage(usage)
     # Legacy callers lacked an observation bit; only non-zero values can prove
     # observation. Explicit all-zero requires usage_observed=True.
-    return tokens, bool(valid and any(tokens))
+    return tokens, split, bool(valid and any(tokens))
 
 
 def _attempt_priority_mode(
@@ -1842,7 +1893,9 @@ def _settle_retry_attempt_locked(
         return False
     resolved_outcome = str(outcome or attempt["outcome"] or "")
     normalized = model_pricing.normalize_response_billing(response_body)
-    tokens, observed = _usage_values(usage, usage_observed, normalized)
+    tokens, cache_creation_split, observed = _usage_values(
+        usage, usage_observed, normalized,
+    )
     root_request_id = _billing_root_request_id(str(attempt["request_id"]))
     actual_tier = normalized.service_tier
     outbound_tier = (
@@ -1915,6 +1968,12 @@ def _settle_retry_attempt_locked(
             binding,
             input_tokens=tokens[0], output_tokens=tokens[1],
             cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
+            cache_creation_5m_tokens=(
+                cache_creation_split[0] if cache_creation_split is not None else None
+            ),
+            cache_creation_1h_tokens=(
+                cache_creation_split[1] if cache_creation_split is not None else None
+            ),
             priority=bool(priority),
         )
         if settled is not None:
@@ -1928,11 +1987,12 @@ def _settle_retry_attempt_locked(
             binding_provider_id, binding_model_id, binding_pricing_key,
             binding_source, binding_json, binding_version, binding_revision,
             outcome, usage_observed,
-            input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+            input_tokens, output_tokens, cache_creation_tokens,
+            cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens,
             service_tier, outbound_service_tier, upstream_protocol, dispatch_state,
             pricing_snapshot_json, pricing_version,
             cost_source, cost_ticks, settled_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             int(attempt_id), root_request_id, str(attempt["request_id"]),
             int(attempt["attempt_order"] or 0), str(attempt["channel_key"] or ""),
@@ -1943,7 +2003,10 @@ def _settle_retry_attempt_locked(
             attempt["binding_json"], attempt["binding_version"],
             attempt["binding_revision"],
             resolved_outcome, 1 if observed else 0,
-            *tokens, tier, outbound_tier, upstream_protocol or None, dispatch_state,
+            tokens[0], tokens[1], tokens[2],
+            cache_creation_split[0] if cache_creation_split is not None else None,
+            cache_creation_split[1] if cache_creation_split is not None else None,
+            tokens[3], tier, outbound_tier, upstream_protocol or None, dispatch_state,
             pricing_snapshot_json, pricing_version,
             cost_source, cost_ticks, time.time(),
         ),
@@ -2276,7 +2339,7 @@ def finish_success(
             "cache_creation": cache_creation_tokens,
             "cache_read": cache_read_tokens,
         }
-        _tokens, supplied_valid = _strict_tracker_usage(supplied_usage)
+        _tokens, _supplied_split, supplied_valid = _strict_tracker_usage(supplied_usage)
         if usage_observed is not None:
             observed = bool(usage_observed and supplied_valid)
         elif normalized_billing.usage_invalid:
@@ -2361,7 +2424,7 @@ def finish_error(
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         normalized_billing = model_pricing.normalize_response_billing(response_body)
-        _error_tokens, error_usage_valid = _strict_tracker_usage(usage)
+        _error_tokens, _error_split, error_usage_valid = _strict_tracker_usage(usage)
         if usage_observed is not None:
             observed = bool(usage_observed and error_usage_valid)
         elif normalized_billing.usage_invalid:
@@ -4813,7 +4876,8 @@ def log_detail(request_id: str) -> dict:
     ).fetchall()
     billing_rows = _get_conn().execute(
         """SELECT attempt_order, input_tokens, output_tokens,
-                  cache_creation_tokens, cache_read_tokens,
+                  cache_creation_tokens, cache_creation_5m_tokens,
+                  cache_creation_1h_tokens, cache_read_tokens,
                   pricing_snapshot_json, cost_source, cost_ticks
              FROM upstream_attempt_usage
             WHERE root_request_id=?

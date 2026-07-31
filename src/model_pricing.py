@@ -25,6 +25,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
 from . import config
+from .protocols.usage import anthropic_cache_creation_split
 
 TICKS_PER_USD = 10_000_000_000
 _DEFAULT_SOURCE_URL = "https://models.dev/api.json"
@@ -124,6 +125,8 @@ class NormalizedBilling:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    cache_creation_5m_tokens: int | None = None
+    cache_creation_1h_tokens: int | None = None
     service_tier: str | None = None
     actual_cost_ticks: int | None = None
 
@@ -1472,9 +1475,17 @@ def estimate_cost_from_binding(
     output_tokens: int = 0,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    cache_creation_5m_tokens: int | None = None,
+    cache_creation_1h_tokens: int | None = None,
     priority: bool = False,
 ) -> tuple[CostEstimate, str, str] | None:
-    """Price solely from a validated dispatch-time binding and its frozen tariff."""
+    """Price solely from a validated dispatch-time binding and its frozen tariff.
+
+    Anthropic publishes an aggregate cache-write count plus an exact 5m/1h
+    split.  The aggregate remains the display/token fact; the split selects the
+    two different write tariffs.  Old responses without that split retain the
+    previous unpriced behaviour rather than guessing a TTL.
+    """
     if (
         binding.tariff is None
         or not binding.pricing_key
@@ -1497,21 +1508,40 @@ def estimate_cost_from_binding(
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens = (
         int(value) for value in parsed_tokens
     )
+
+    split_supplied = (
+        cache_creation_5m_tokens is not None or cache_creation_1h_tokens is not None
+    )
+    cache_creation_5m = cache_creation_1h = 0
+    if split_supplied:
+        if cache_creation_5m_tokens is None or cache_creation_1h_tokens is None:
+            return None
+        parsed_split = (
+            _strict_nonnegative_int(cache_creation_5m_tokens),
+            _strict_nonnegative_int(cache_creation_1h_tokens),
+        )
+        if any(value is None for value in parsed_split):
+            return None
+        cache_creation_5m, cache_creation_1h = (
+            int(value) for value in parsed_split
+        )
+        if cache_creation_5m + cache_creation_1h != cache_creation_tokens:
+            return None
+
     entry = binding.tariff
     if priority and not _has_priority_tariff(entry):
         return None
-    if (
-        cache_creation_tokens > 0
-        and (
-            entry.cache_write_ttl_ambiguous
-            or (
-                entry.cache_write_1h_per_token is not None
-                and entry.cache_write_1h_per_token > 0
-                and abs(entry.cache_write_1h_per_token - entry.cache_write_per_token) > 1e-18
-            )
+    ttl_specific_tariff = bool(
+        entry.cache_write_ttl_ambiguous
+        or (
+            entry.cache_write_1h_per_token is not None
+            and entry.cache_write_1h_per_token > 0
+            and abs(entry.cache_write_1h_per_token - entry.cache_write_per_token) > 1e-18
         )
-    ):
+    )
+    if cache_creation_tokens > 0 and ttl_specific_tariff and not split_supplied:
         return None
+
     prompt_tokens = input_tokens + cache_creation_tokens + cache_read_tokens
     if prompt_tokens > _MAX_BILLING_INTEGER:
         return None
@@ -1537,25 +1567,39 @@ def estimate_cost_from_binding(
             long_context=long_context, input_side=True,
         ),
     )
+
+    one_hour_price: float | None = None
+    if split_supplied:
+        if binding.provider_id == "anthropic":
+            # Anthropic's published rule is 2× the effective input tariff; Fast
+            # and long-context modifiers therefore remain attached to this attempt.
+            one_hour_price = prices[0] * 2.0
+        elif cache_creation_1h > 0:
+            return None
+
     try:
-        component_ticks = tuple(
-            _ticks(tokens, price)
-            for tokens, price in zip(
-                (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens),
-                prices,
-            )
-        )
+        input_ticks = _ticks(input_tokens, prices[0])
+        output_ticks = _ticks(output_tokens, prices[1])
+        cache_read_ticks = _ticks(cache_read_tokens, prices[3])
+        if split_supplied:
+            cache_write_ticks = _ticks(cache_creation_5m, prices[2])
+            if cache_creation_1h > 0:
+                if one_hour_price is None:
+                    return None
+                cache_write_ticks += _ticks(cache_creation_1h, one_hour_price)
+        else:
+            cache_write_ticks = _ticks(cache_creation_tokens, prices[2])
     except ValueError:
         return None
-    total_ticks = sum(component_ticks)
+    total_ticks = input_ticks + output_ticks + cache_write_ticks + cache_read_ticks
     if total_ticks > _MAX_BILLING_INTEGER:
         return None
     estimate = CostEstimate(
         total_ticks=total_ticks,
-        input_ticks=component_ticks[0],
-        output_ticks=component_ticks[1],
-        cache_write_ticks=component_ticks[2],
-        cache_read_ticks=component_ticks[3],
+        input_ticks=input_ticks,
+        output_ticks=output_ticks,
+        cache_write_ticks=cache_write_ticks,
+        cache_read_ticks=cache_read_ticks,
         pricing_model=binding.pricing_key,
     )
     snapshot = {
@@ -1572,6 +1616,13 @@ def estimate_cost_from_binding(
         "cache_write_per_token": prices[2],
         "cache_read_per_token": prices[3],
     }
+    if split_supplied:
+        snapshot.update({
+            "cache_write_5m_per_token": prices[2],
+            "cache_write_1h_per_token": one_hour_price,
+            "cache_creation_5m_tokens": cache_creation_5m,
+            "cache_creation_1h_tokens": cache_creation_1h,
+        })
     raw = _canonical_json(snapshot)
     version = "pricing-v2:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return estimate, raw, version
@@ -1678,6 +1729,8 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
     usage_invalid = False
     tier_invalid = False
     input_tokens = output_tokens = cache_creation = cache_read = 0
+    cache_creation_5m: int | None = None
+    cache_creation_1h: int | None = None
     service_tier: str | None = None
     actual_ticks: int | None = None
 
@@ -1707,6 +1760,13 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                 next_output = output_tokens
                 next_cache_creation = cache_creation
                 next_cache_read = cache_read
+                next_cache_creation_5m = cache_creation_5m
+                next_cache_creation_1h = cache_creation_1h
+                is_anthropic_usage = bool(
+                    "cache_creation_input_tokens" in usage
+                    or "cache_read_input_tokens" in usage
+                    or isinstance(usage.get("cache_creation"), Mapping)
+                )
 
                 has_prompt = "input_tokens" in usage or "prompt_tokens" in usage
                 details_obj = None
@@ -1746,7 +1806,10 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     if parsed_cache_read is None:
                         valid = False
                     else:
-                        next_cache_read = parsed_cache_read
+                        next_cache_read = (
+                            max(cache_read, parsed_cache_read)
+                            if is_anthropic_usage else parsed_cache_read
+                        )
 
                 if "cache_creation_input_tokens" in usage:
                     parsed_cache_creation = _strict_nonnegative_int(
@@ -1761,7 +1824,14 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                 if parsed_cache_creation is None:
                     valid = False
                 else:
-                    next_cache_creation = parsed_cache_creation
+                    next_cache_creation = (
+                        max(cache_creation, parsed_cache_creation)
+                        if is_anthropic_usage else parsed_cache_creation
+                    )
+                ttl_split = anthropic_cache_creation_split(usage)
+                if ttl_split is not None:
+                    next_cache_creation_5m = max(cache_creation_5m or 0, ttl_split[0])
+                    next_cache_creation_1h = max(cache_creation_1h or 0, ttl_split[1])
 
                 if has_prompt:
                     prompt = _strict_nonnegative_int(
@@ -1778,7 +1848,12 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                         if is_openai_shape and next_cache_read > prompt:
                             valid = False
                         else:
-                            next_input = prompt - next_cache_read if is_openai_shape else prompt
+                            if is_openai_shape:
+                                next_input = prompt - next_cache_read
+                            elif is_anthropic_usage:
+                                next_input = max(input_tokens, prompt)
+                            else:
+                                next_input = prompt
 
                 if "output_tokens" in usage or "completion_tokens" in usage:
                     parsed_output = _strict_nonnegative_int(
@@ -1794,6 +1869,8 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     output_tokens = next_output
                     cache_creation = next_cache_creation
                     cache_read = next_cache_read
+                    cache_creation_5m = next_cache_creation_5m
+                    cache_creation_1h = next_cache_creation_1h
                     observed = True
                     usage_invalid = False
                 else:
@@ -1812,6 +1889,8 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
         output_tokens=output_tokens,
         cache_creation_tokens=cache_creation,
         cache_read_tokens=cache_read,
+        cache_creation_5m_tokens=cache_creation_5m,
+        cache_creation_1h_tokens=cache_creation_1h,
         service_tier=service_tier,
         actual_cost_ticks=actual_ticks,
     )
@@ -1850,14 +1929,26 @@ def preserve_billing_evidence_tail(
         cached = _strict_nonnegative_int(
             usage.get("cache_read", usage.get("cache_read_tokens"))
         ) or 0
+        aggregate_write = _strict_nonnegative_int(
+            usage.get("cache_creation", usage.get("cache_creation_tokens"))
+        ) or 0
         usage_obj.update({
             "input_tokens": uncached + cached,
             "output_tokens": _strict_nonnegative_int(usage.get("output_tokens")) or 0,
             "input_tokens_details": {"cached_tokens": cached},
-            "cache_creation_tokens": _strict_nonnegative_int(
-                usage.get("cache_creation", usage.get("cache_creation_tokens"))
-            ) or 0,
+            "cache_creation_tokens": aggregate_write,
         })
+        five_minute = _strict_nonnegative_int(usage.get("cache_creation_5m"))
+        one_hour = _strict_nonnegative_int(usage.get("cache_creation_1h"))
+        if (
+            five_minute is not None
+            and one_hour is not None
+            and five_minute + one_hour == aggregate_write
+        ):
+            usage_obj["cache_creation"] = {
+                "ephemeral_5m_input_tokens": five_minute,
+                "ephemeral_1h_input_tokens": one_hour,
+            }
     actual = _strict_nonnegative_int(actual_cost_ticks)
     if actual is not None:
         usage_obj["cost_in_usd_ticks"] = actual

@@ -658,6 +658,13 @@ _BILLING_COMPONENTS = (
     ("cache_creation_tokens", "cache_write_per_token", "缓存写入"),
     ("cache_read_tokens", "cache_read_per_token", "缓存读取"),
 )
+_ANTHROPIC_TTL_BILLING_COMPONENTS = (
+    ("input_tokens", "input_per_token", "输入"),
+    ("output_tokens", "output_per_token", "输出"),
+    ("cache_creation_5m_tokens", "cache_write_5m_per_token", "缓存写入 5m"),
+    ("cache_creation_1h_tokens", "cache_write_1h_per_token", "缓存写入 1h"),
+    ("cache_read_tokens", "cache_read_per_token", "缓存读取"),
+)
 
 
 def _fmt_price_per_million(price_per_token: object) -> str | None:
@@ -683,8 +690,15 @@ def _attempt_cost_formula(attempt: dict) -> str | None:
     if not isinstance(snapshot, dict):
         return None
 
+    split_known = (
+        attempt.get("cache_creation_5m_tokens") is not None
+        and attempt.get("cache_creation_1h_tokens") is not None
+    )
+    components = (
+        _ANTHROPIC_TTL_BILLING_COMPONENTS if split_known else _BILLING_COMPONENTS
+    )
     terms: list[str] = []
-    for token_key, price_key, label in _BILLING_COMPONENTS:
+    for token_key, price_key, label in components:
         try:
             tokens = int(attempt.get(token_key) or 0)
         except (TypeError, ValueError, OverflowError):

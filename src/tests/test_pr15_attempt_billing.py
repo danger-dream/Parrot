@@ -199,6 +199,70 @@ def test_anthropic_tracker_snapshot_is_authoritative_for_request_and_attempt_tic
     assert attempt["binding_json"] and attempt["binding_version"]
 
 
+def test_claude_oauth_cache_write_ttl_split_is_priced_exactly(m):
+    _setup(m)
+    ld = m["log_db"]
+    rid = "claude-oauth-cache-ttl"
+    _pending(ld, rid, "claude-opus-4-6")
+    aid = _attempt(
+        ld, rid, 1, "oauth:claude:user@example.com", "oauth",
+        "claude-opus-4-6", 1.0, protocol="anthropic",
+    )
+    _dispatch(ld, aid, "claude-opus-4-6")
+
+    tracker = m["failover"].upstream.SSEUsageTracker()
+    tracker.feed(
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":20000,"output_tokens":0,'
+        b'"cache_creation_input_tokens":80000,"cache_read_input_tokens":0,'
+        b'"cache_creation":{"ephemeral_5m_input_tokens":30000,'
+        b'"ephemeral_1h_input_tokens":50000}}}}\n\n'
+        b'data: {"type":"message_delta","usage":{"input_tokens":0,'
+        b'"output_tokens":10000,"cache_creation_input_tokens":0,'
+        b'"cache_read_input_tokens":0}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+    assert tracker.usage_observed is True
+    assert tracker.usage == {
+        "input_tokens": 20_000,
+        "output_tokens": 10_000,
+        "cache_creation": 80_000,
+        "cache_read": 0,
+        "cache_creation_5m": 30_000,
+        "cache_creation_1h": 50_000,
+    }
+
+    ld.finish_success(
+        rid, "oauth:claude:user@example.com", "oauth", "claude-opus-4-6",
+        input_tokens=tracker.usage["input_tokens"],
+        output_tokens=tracker.usage["output_tokens"],
+        cache_creation_tokens=tracker.usage["cache_creation"],
+        cache_read_tokens=tracker.usage["cache_read"],
+        response_body=tracker.get_full_response(),
+        usage_observed=tracker.usage_observed,
+        upstream_protocol="anthropic",
+    )
+    ld.update_retry_attempt(aid, outcome="success", ended_at=2.0)
+
+    attempt = ld._get_conn().execute(
+        "SELECT * FROM upstream_attempt_usage WHERE retry_attempt_id=?",
+        (aid.row_id,),
+    ).fetchone()
+    assert attempt["binding_provider_id"] == "anthropic"
+    assert attempt["binding_pricing_key"] == "anthropic/claude-opus-4-6"
+    assert (
+        attempt["cache_creation_tokens"],
+        attempt["cache_creation_5m_tokens"],
+        attempt["cache_creation_1h_tokens"],
+    ) == (80_000, 30_000, 50_000)
+    assert attempt["cost_source"] == "estimated"
+    # $0.10 input + $0.25 output + $0.1875 5m write + $0.50 1h write.
+    assert attempt["cost_ticks"] == 10_375_000_000
+    snapshot = json.loads(attempt["pricing_snapshot_json"])
+    assert snapshot["cache_write_5m_per_token"] == 6.25 / 1_000_000
+    assert snapshot["cache_write_1h_per_token"] == 10 / 1_000_000
+
+
 @pytest.mark.parametrize("outcome,status", [("stream_upstream_error", "error"), ("client_disconnected", "cancelled")])
 def test_anthropic_tracker_snapshot_survives_error_and_cancel_settlement(m, outcome, status):
     _setup(m)
@@ -1404,6 +1468,7 @@ def test_partial_attempt_schema_migration_is_idempotent(m):
     assert {"usage_observed", "actual_service_tier"} <= request_cols
     assert {
         "call_request_id", "usage_observed", "service_tier",
+        "cache_creation_5m_tokens", "cache_creation_1h_tokens",
         "outbound_service_tier", "dispatch_state", "pricing_snapshot_json",
         "pricing_version", "cost_source", "cost_ticks", "settled_at",
         "binding_provider_id", "binding_model_id", "binding_pricing_key",

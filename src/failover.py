@@ -3908,6 +3908,12 @@ async def _try_channel(
                 "cache_creation": normalized.cache_creation_tokens,
                 "cache_read": normalized.cache_read_tokens,
             }
+            if (
+                normalized.cache_creation_5m_tokens is not None
+                and normalized.cache_creation_1h_tokens is not None
+            ):
+                result.usage["cache_creation_5m"] = normalized.cache_creation_5m_tokens
+                result.usage["cache_creation_1h"] = normalized.cache_creation_1h_tokens
             result.usage_observed = normalized.usage_observed
         bytes_up, bytes_down = _proxy_byte_snapshot(proxy_bytes)
         if retry_attempt_id is not None:

@@ -58,23 +58,61 @@ def _strict_fields(usage_obj: Any, names: tuple[str, ...]) -> tuple[dict[str, in
     return parsed, True, True
 
 
+CACHE_CREATION_5M_KEY = "cache_creation_5m"
+CACHE_CREATION_1H_KEY = "cache_creation_1h"
+
+
+def anthropic_cache_creation_split(usage_obj: Any) -> tuple[int, int] | None:
+    """Return Anthropic's exact 5m/1h cache-write split when present and valid.
+
+    ``cache_creation_input_tokens`` remains the aggregate compatibility field.
+    Current Anthropic responses additionally expose a nested ``cache_creation``
+    object.  Compatible/older providers may omit it; that absence is not invalid
+    usage, but it cannot prove an exact TTL tariff split.
+    """
+    if not isinstance(usage_obj, dict):
+        return None
+    details = usage_obj.get("cache_creation")
+    if not isinstance(details, dict):
+        return None
+    if not {
+        "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens",
+    }.issubset(details):
+        return None
+    five_minute = _strict_token(details.get("ephemeral_5m_input_tokens"))
+    one_hour = _strict_token(details.get("ephemeral_1h_input_tokens"))
+    if five_minute is None or one_hour is None:
+        return None
+    if "cache_creation_input_tokens" in usage_obj:
+        aggregate = _strict_token(usage_obj.get("cache_creation_input_tokens"))
+        if aggregate is None or five_minute + one_hour != aggregate:
+            return None
+    return five_minute, one_hour
+
+
 @dataclass
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    cache_write_5m_tokens: int | None = None
+    cache_write_1h_tokens: int | None = None
     reasoning_tokens: int = 0
     raw: dict | None = None
 
     def to_legacy_dict(self) -> dict[str, int]:
-        """Return the legacy four-key shape expected by log_db/failover."""
-        return {
+        """Return the legacy shape plus an exact Anthropic TTL split when known."""
+        result = {
             "input_tokens": int(self.input_tokens or 0),
             "output_tokens": int(self.output_tokens or 0),
             "cache_creation": int(self.cache_write_tokens or 0),
             "cache_read": int(self.cache_read_tokens or 0),
         }
+        if self.cache_write_5m_tokens is not None and self.cache_write_1h_tokens is not None:
+            result[CACHE_CREATION_5M_KEY] = int(self.cache_write_5m_tokens)
+            result[CACHE_CREATION_1H_KEY] = int(self.cache_write_1h_tokens)
+        return result
 
 
 class UsageAccumulator:
@@ -111,11 +149,14 @@ class UsageAccumulator:
         if not observed:
             return
         u = usage_obj
+        split = anthropic_cache_creation_split(usage_obj)
         self.usage = Usage(
             input_tokens=parsed.get("input_tokens", 0),
             output_tokens=parsed.get("output_tokens", 0),
             cache_write_tokens=parsed.get("cache_creation_input_tokens", 0),
             cache_read_tokens=parsed.get("cache_read_input_tokens", 0),
+            cache_write_5m_tokens=(split[0] if split is not None else None),
+            cache_write_1h_tokens=(split[1] if split is not None else None),
             raw=dict(u),
         )
         self._input_observed = "input_tokens" in parsed
@@ -137,6 +178,9 @@ class UsageAccumulator:
         self.usage.output_tokens = parsed.get("output_tokens", self.usage.output_tokens)
         self.usage.cache_write_tokens = parsed.get("cache_creation_input_tokens", 0)
         self.usage.cache_read_tokens = parsed.get("cache_read_input_tokens", 0)
+        split = anthropic_cache_creation_split(usage_obj)
+        self.usage.cache_write_5m_tokens = split[0] if split is not None else None
+        self.usage.cache_write_1h_tokens = split[1] if split is not None else None
         self.usage.raw = dict(usage_obj)
         self._input_observed = self._input_observed or "input_tokens" in parsed
         self._output_observed = self._output_observed or "output_tokens" in parsed
@@ -167,6 +211,12 @@ class UsageAccumulator:
             self.usage.cache_read_tokens = max(
                 self.usage.cache_read_tokens, parsed["cache_read_input_tokens"],
             )
+        split = anthropic_cache_creation_split(usage_obj)
+        if split is not None:
+            current_5m = self.usage.cache_write_5m_tokens or 0
+            current_1h = self.usage.cache_write_1h_tokens or 0
+            self.usage.cache_write_5m_tokens = max(current_5m, split[0])
+            self.usage.cache_write_1h_tokens = max(current_1h, split[1])
         self.usage.raw = dict(usage_obj)
         self._input_observed = self._input_observed or "input_tokens" in parsed
         self._output_observed = self._output_observed or "output_tokens" in parsed
@@ -251,12 +301,17 @@ def legacy_usage_from_anthropic_json(obj: Any) -> dict[str, int]:
     """Permissive compatibility extraction; ledger trackers are strict above."""
     usage = obj.get("usage") if isinstance(obj, dict) else None
     usage = usage if isinstance(usage, dict) else {}
-    return {
+    result = {
         "input_tokens": _to_int(usage.get("input_tokens")),
         "output_tokens": _to_int(usage.get("output_tokens")),
         "cache_creation": _to_int(usage.get("cache_creation_input_tokens")),
         "cache_read": _to_int(usage.get("cache_read_input_tokens")),
     }
+    split = anthropic_cache_creation_split(usage)
+    if split is not None:
+        result[CACHE_CREATION_5M_KEY] = split[0]
+        result[CACHE_CREATION_1H_KEY] = split[1]
+    return result
 
 
 def legacy_usage_from_openai_chat_json(obj: Any) -> dict[str, int]:
