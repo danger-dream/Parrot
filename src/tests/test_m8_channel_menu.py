@@ -38,13 +38,13 @@ def _import_modules():
         affinity, config, cooldown, log_db, probe, scorer, state_db,
     )
     from src.channel import registry, api_channel
-    from src.telegram import bot, states, ui
+    from src.telegram import bot, menu_cache, states, ui
     from src.telegram.menus import channel_menu, main as main_menu, status_menu
     return {
         "affinity": affinity, "config": config, "cooldown": cooldown,
         "log_db": log_db, "probe": probe, "scorer": scorer, "state_db": state_db,
         "registry": registry, "api_channel": api_channel,
-        "bot": bot, "states": states, "ui": ui,
+        "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
         "channel_menu": channel_menu, "main_menu": main_menu, "status_menu": status_menu,
     }
 
@@ -66,8 +66,17 @@ class ApiRecorder:
         return [d for m, d in self.calls if m == method]
 
     def last(self, method):
-        l = self.by(method)
-        return l[-1] if l else None
+        deadline = time.time() + 5
+        while True:
+            calls = self.by(method)
+            item = calls[-1] if calls else None
+            text = str((item or {}).get("text") or "")
+            loading = any(marker in text for marker in (
+                "正在加载，完成后", "统计正在加载", "统计加载中", "历史统计加载中",
+            ))
+            if not loading or time.time() >= deadline:
+                return item
+            time.sleep(0.01)
 
     def clear(self):
         self.calls.clear()
@@ -102,7 +111,23 @@ def _setup(m):
     m["registry"].rebuild_from_config()
 
 
+def _seed_stats_snapshots(m) -> None:
+    """测试显式模拟中央调度器与详情队列已生成快照。"""
+    cache = m["menu_cache"]
+    since = cache.month_start_ts()
+    cache.PERIOD_STATS.store(
+        ("period", int(since)), m["log_db"].stats_period_snapshot(since),
+    )
+    for channel in m["registry"].all_channels():
+        if channel.type == "api":
+            cache.DETAIL_STATS.store(
+                ("channel-model", channel.key, int(since)),
+                m["log_db"].channel_model_stats(channel.key, since_ts=since),
+            )
+
+
 def _install_recorder(m):
+    _seed_stats_snapshots(m)
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
@@ -221,6 +246,7 @@ def test_list_empty_and_populated(m):
     _add_channel(m, "chA")
     _add_channel(m, "chB", models=[{"real": "gpt-4", "alias": "gpt-4"}])
     _insert_channel_success(m, "chA")
+    _seed_stats_snapshots(m)
     rec.clear()
     m["channel_menu"].show(42, 100)
     last = rec.last("editMessageText")
@@ -228,7 +254,8 @@ def test_list_empty_and_populated(m):
     assert "chA" in last["text"]
     assert "chB" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
-    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "\n  💵 $0.000" in last["text"]
+    assert "缓存 50 (31.2%) · 💵" not in last["text"]
     assert "≈" not in last["text"]
     print("  [PASS] list empty + populated")
 
@@ -353,7 +380,8 @@ def test_detail_renders(m):
     assert "chA" in text
     assert "GLM-5" in text and "glm-5" in text
     assert "缓存 50 (31.2%)" in text
-    assert "缓存 50 (31.2%) · 💵 " in text
+    assert "\n    💵 $0.000" in text
+    assert "缓存 50 (31.2%) · 💵" not in text
     assert "≈" not in text
     # API Key 掩码
     assert "sk-tes" in text and "***" in text

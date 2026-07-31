@@ -3468,6 +3468,7 @@ def _replace_model_tokens_with_attempts(
 def _replace_summary_tokens_with_attempts(
     conn: sqlite3.Connection, since_ts: float, family: str | None,
     overall: dict, by_channel: dict, by_model: dict, by_apikey: dict,
+    family_targets: dict[str, tuple[dict, dict, dict, dict]] | None = None,
 ) -> None:
     if not _attempt_rows_exist(conn):
         return
@@ -3475,6 +3476,7 @@ def _replace_summary_tokens_with_attempts(
     roots = conn.execute(
         f"""SELECT request_log.final_channel_key AS channel_key,
                    request_log.requested_model AS model_key, request_log.api_key_name AS apikey_key,
+                   request_log.upstream_protocol AS family_protocol,
                    request_log.input_tokens AS inp, request_log.output_tokens AS outp,
                    request_log.cache_creation_tokens AS cc, request_log.cache_read_tokens AS cr
             FROM request_log
@@ -3483,24 +3485,33 @@ def _replace_summary_tokens_with_attempts(
                           WHERE a.root_request_id=request_log.request_id)""",
         args,
     ).fetchall()
-    for row in roots:
+    def apply_root(row, sign: int, targets: tuple[dict, dict, dict, dict]) -> None:
+        target_overall, target_channels, target_models, target_apikeys = targets
         vals = (int(row["inp"] or 0), int(row["outp"] or 0), int(row["cc"] or 0), int(row["cr"] or 0))
-        overall["total_input_tokens"] -= vals[0]
-        overall["total_output_tokens"] -= vals[1]
-        overall["total_cache_creation"] -= vals[2]
-        overall["total_cache_read"] -= vals[3]
+        target_overall["total_input_tokens"] += sign * vals[0]
+        target_overall["total_output_tokens"] += sign * vals[1]
+        target_overall["total_cache_creation"] += sign * vals[2]
+        target_overall["total_cache_read"] += sign * vals[3]
         for bucket in (
-            by_channel.setdefault(row["channel_key"] or "?", _new_group_agg()),
-            by_model.setdefault(row["model_key"] or "?", _new_group_agg()),
-            by_apikey.setdefault(row["apikey_key"] or "?", _new_group_agg()),
+            target_channels.setdefault(row["channel_key"] or "?", _new_group_agg()),
+            target_models.setdefault(row["model_key"] or "?", _new_group_agg()),
+            target_apikeys.setdefault(row["apikey_key"] or "?", _new_group_agg()),
         ):
-            bucket["total_prompt_tokens"] -= vals[0] + vals[2] + vals[3]
-            bucket["total_output_tokens"] -= vals[1]
-            bucket["total_cache_creation"] -= vals[2]
-            bucket["total_cache_read"] -= vals[3]
+            bucket["total_prompt_tokens"] += sign * (vals[0] + vals[2] + vals[3])
+            bucket["total_output_tokens"] += sign * vals[1]
+            bucket["total_cache_creation"] += sign * vals[2]
+            bucket["total_cache_read"] += sign * vals[3]
+
+    all_targets = (overall, by_channel, by_model, by_apikey)
+    for row in roots:
+        apply_root(row, -1, all_targets)
+        fam = _family_from_protocol(row["family_protocol"])
+        if family_targets and fam in family_targets:
+            apply_root(row, -1, family_targets[fam])
     attempts = conn.execute(
         f"""SELECT a.channel_key, request_log.requested_model AS model_key,
-                   request_log.api_key_name AS apikey_key, a.input_tokens AS inp,
+                   request_log.api_key_name AS apikey_key,
+                   request_log.upstream_protocol AS family_protocol, a.input_tokens AS inp,
                    a.output_tokens AS outp, a.cache_creation_tokens AS cc,
                    a.cache_read_tokens AS cr
             FROM upstream_attempt_usage a
@@ -3510,20 +3521,10 @@ def _replace_summary_tokens_with_attempts(
         args,
     ).fetchall()
     for row in attempts:
-        vals = (int(row["inp"] or 0), int(row["outp"] or 0), int(row["cc"] or 0), int(row["cr"] or 0))
-        overall["total_input_tokens"] += vals[0]
-        overall["total_output_tokens"] += vals[1]
-        overall["total_cache_creation"] += vals[2]
-        overall["total_cache_read"] += vals[3]
-        for bucket in (
-            by_channel.setdefault(row["channel_key"] or "?", _new_group_agg()),
-            by_model.setdefault(row["model_key"] or "?", _new_group_agg()),
-            by_apikey.setdefault(row["apikey_key"] or "?", _new_group_agg()),
-        ):
-            bucket["total_prompt_tokens"] += vals[0] + vals[2] + vals[3]
-            bucket["total_output_tokens"] += vals[1]
-            bucket["total_cache_creation"] += vals[2]
-            bucket["total_cache_read"] += vals[3]
+        apply_root(row, 1, all_targets)
+        fam = _family_from_protocol(row["family_protocol"])
+        if family_targets and fam in family_targets:
+            apply_root(row, 1, family_targets[fam])
 
 
 def _aggregate_by_filter(where: str, where_args: tuple, since_ts: float) -> dict:
@@ -3995,6 +3996,15 @@ def _family_params(family: str | None) -> tuple:
     if not family or family not in _FAMILY_UPSTREAM:
         return ()
     return _FAMILY_UPSTREAM[family]
+
+
+def _family_from_protocol(protocol: str | None) -> str | None:
+    value = str(protocol or "")
+    for family, protocols in _FAMILY_UPSTREAM.items():
+        if value in protocols:
+            return family
+    return None
+
 
 _XAI_COST_BODY_TAIL_CHARS = 262_144
 _RECENT_COLS_BASE = (
@@ -4597,12 +4607,22 @@ def log_detail(request_id: str) -> dict:
         "SELECT * FROM local_web_log WHERE request_id=? ORDER BY round_no ASC, id ASC",
         (request_id,),
     ).fetchall()
+    billing_rows = _get_conn().execute(
+        """SELECT attempt_order, input_tokens, output_tokens,
+                  cache_creation_tokens, cache_read_tokens,
+                  pricing_snapshot_json, cost_source, cost_ticks
+             FROM upstream_attempt_usage
+            WHERE root_request_id=?
+            ORDER BY settled_at ASC, id ASC""",
+        (request_id,),
+    ).fetchall()
     return {
         "log": _sanitize_request_timing(log_row) if log_row else None,
         "detail": dict(detail_row) if detail_row else None,
         "retry_chain": [_sanitize_retry_timing(r) for r in chain_rows],
         "proxy_chain": [_sanitize_proxy_timing(r) for r in proxy_rows],
         "local_web_log": [dict(r) for r in local_web_rows],
+        "billing_attempts": [dict(r) for r in billing_rows],
     }
 
 
@@ -4646,6 +4666,8 @@ def _accumulate_usage_costs(
     by_channel: dict[str, dict],
     by_model: dict[str, dict],
     by_apikey: dict[str, dict],
+    family_targets: dict[str, tuple[dict, dict, dict, dict]] | None = None,
+    object_cost_targets: tuple[dict[str, dict], dict[str, dict]] | None = None,
 ) -> None:
     """把成功请求的 USD 金额合并进统计桶。
 
@@ -4659,44 +4681,79 @@ def _accumulate_usage_costs(
     pricing_exprs = _request_pricing_exprs(conn)
     attempt_exclusion = _attempt_exclusion_sql(conn)
 
-    def buckets(channel_key: str, model_key: str, apikey_key: str) -> tuple[dict, ...]:
-        return (
+    def buckets(channel_key: str, model_key: str, apikey_key: str,
+                family_protocol: str | None = None) -> tuple[dict, ...]:
+        targets: list[dict] = [
             overall,
             by_channel.setdefault(channel_key or "?", _new_group_agg()),
             by_model.setdefault(model_key or "?", _new_group_agg()),
             by_apikey.setdefault(apikey_key or "?", _new_group_agg()),
+        ]
+        fam = _family_from_protocol(family_protocol)
+        if family_targets and fam in family_targets:
+            fam_overall, fam_channels, fam_models, fam_apikeys = family_targets[fam]
+            targets.extend((
+                fam_overall,
+                fam_channels.setdefault(channel_key or "?", _new_group_agg()),
+                fam_models.setdefault(model_key or "?", _new_group_agg()),
+                fam_apikeys.setdefault(apikey_key or "?", _new_group_agg()),
+            ))
+        return tuple(targets)
+
+    def object_buckets(channel_key: str, apikey_key: str) -> tuple[dict, ...]:
+        if object_cost_targets is None:
+            return ()
+        object_channels, object_apikeys = object_cost_targets
+        return (
+            object_channels.setdefault(channel_key or "?", _new_cost_agg()),
+            object_apikeys.setdefault(apikey_key or "?", _new_cost_agg()),
         )
 
     if _attempt_rows_exist(conn):
         attempt_rows = conn.execute(
-            f"""SELECT a.cost_source, a.cost_ticks,
+            f"""SELECT a.cost_source, a.cost_ticks, a.service_tier,
                        COALESCE(a.channel_key, request_log.final_channel_key, '?') AS channel_key,
                        COALESCE(request_log.requested_model, '?') AS model_key,
-                       COALESCE(request_log.api_key_name, '?') AS apikey_key
+                       COALESCE(request_log.api_key_name, '?') AS apikey_key,
+                       request_log.upstream_protocol AS family_protocol
                 FROM upstream_attempt_usage a
                 JOIN request_log ON request_log.request_id=a.root_request_id
                 WHERE request_log.created_at >= ?{_family_where(family)}""",
             (since_ts, *_family_params(family)),
         ).fetchall()
         for row in attempt_rows:
-            for target in buckets(row["channel_key"], row["model_key"], row["apikey_key"]):
+            for target in buckets(row["channel_key"], row["model_key"], row["apikey_key"], row["family_protocol"]):
+                _add_service_tier(target, row["service_tier"])
+                _add_attempt_cost_row(target, row)
+            for target in object_buckets(row["channel_key"], row["apikey_key"]):
                 _add_attempt_cost_row(target, row)
     missing_rows = _missing_dispatch_rows(
         conn,
         select_sql=(
             "COALESCE(r.channel_key, '?') AS channel_key, "
             "COALESCE(request_log.requested_model, '?') AS model_key, "
-            "COALESCE(request_log.api_key_name, '?') AS apikey_key"
+            "COALESCE(request_log.api_key_name, '?') AS apikey_key, "
+            "request_log.upstream_protocol AS family_protocol"
         ),
-        where_sql=f"request_log.created_at>=?{_family_where(family)}",
+        where_sql=(
+            "request_log.created_at>=?"
+            + _family_where(family).replace(
+                "upstream_protocol", "request_log.upstream_protocol"
+            )
+        ),
         args=(since_ts, *_family_params(family)),
     )
     for row in missing_rows:
-        for target in buckets(row["channel_key"], row["model_key"], row["apikey_key"]):
+        for target in buckets(row["channel_key"], row["model_key"], row["apikey_key"], row["family_protocol"]):
+            _add_unpriced(target, 1)
+        for target in object_buckets(row["channel_key"], row["apikey_key"]):
             _add_unpriced(target, 1)
 
     def apply_estimate(row, *, row_count: int) -> None:
-        targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
+        targets = buckets(
+            row["channel_key"], row["model_key"], row["apikey_key"],
+            row["family_protocol"] if "family_protocol" in row.keys() else None,
+        )
         row_keys = row.keys() if hasattr(row, "keys") else ()
         if "usage_semantics_known" in row_keys and not bool(row["usage_semantics_known"]):
             for target in targets:
@@ -4770,6 +4827,7 @@ def _accumulate_usage_costs(
                COALESCE(final_channel_key, '?') AS channel_key,
                COALESCE(requested_model, '?') AS model_key,
                COALESCE(api_key_name, '?') AS apikey_key,
+               upstream_protocol AS family_protocol,
                COALESCE({pricing_exprs['fast_mode']}, 0) AS fast_mode,
                {long_case} AS long_context,
                {cache_ttl_case} AS cache_ttl_known,
@@ -4782,12 +4840,50 @@ def _accumulate_usage_costs(
              FROM request_log
              WHERE {standard_where}
              GROUP BY pricing_model, channel_key, model_key, apikey_key,
-                      fast_mode, long_context, cache_ttl_known,
+                      family_protocol, fast_mode, long_context, cache_ttl_known,
                       {pricing_exprs['usage_known']}""",
         long_args + cache_ttl_args + standard_args,
     ).fetchall()
+    object_estimates: tuple[dict[tuple, dict], dict[tuple, dict]] = ({}, {})
     for row in estimated_rows:
         apply_estimate(row, row_count=int(row["row_count"] or 0))
+        if object_cost_targets is None:
+            continue
+        # 旧 tokens_for_channel/tokens_for_apikey 以 outbound pricing_model 为
+        # visible model，并在对象内跨 requested alias/API key 合并后估价。
+        # 这里复用同一批 SQL 事实，在 Python 中恢复那一精确分组，避免再次扫库。
+        common = (
+            row["pricing_model"], row["channel_key"], int(row["fast_mode"] or 0),
+            int(row["long_context"] or 0), int(row["cache_ttl_known"] or 0),
+            int(row["usage_semantics_known"] or 0),
+        )
+        for index, object_key in enumerate((row["channel_key"], row["apikey_key"])):
+            merge_key = (object_key or "?", *common)
+            merged = object_estimates[index].setdefault(merge_key, {
+                "pricing_model": row["pricing_model"],
+                "pricing_channel": row["channel_key"],
+                "fast_mode": row["fast_mode"],
+                "long_context": row["long_context"],
+                "cache_ttl_known": row["cache_ttl_known"],
+                "usage_semantics_known": row["usage_semantics_known"],
+                "row_count": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_creation_tokens": 0, "cache_read_tokens": 0,
+            })
+            merged["row_count"] += int(row["row_count"] or 0)
+            for token_key in (
+                "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens",
+            ):
+                merged[token_key] += int(row[token_key] or 0)
+    if object_cost_targets is not None:
+        for index, merged_rows in enumerate(object_estimates):
+            target_map = object_cost_targets[index]
+            for merge_key, merged in merged_rows.items():
+                _estimate_cost_into(
+                    target_map.setdefault(merge_key[0], _new_cost_agg()),
+                    merged,
+                    row_count=int(merged["row_count"] or 0),
+                    pricing_settings=pricing_settings,
+                )
 
     # xAI 的真实费用位于响应 usage 中，只能按请求读取 detail；正常统计页不会
     # 扫描其它渠道的大响应正文。
@@ -4804,6 +4900,7 @@ def _accumulate_usage_costs(
                COALESCE(request_log.final_channel_key, '?') AS channel_key,
                COALESCE(request_log.requested_model, '?') AS model_key,
                COALESCE(request_log.api_key_name, '?') AS apikey_key,
+               request_log.upstream_protocol AS family_protocol,
                COALESCE({pricing_exprs['fast_mode']}, 0) AS fast_mode,
                request_log.input_tokens AS input_tokens,
                request_log.output_tokens AS output_tokens,
@@ -4820,20 +4917,33 @@ def _accumulate_usage_costs(
         (since_ts, *_family_params(family)),
     )
     for row in xai_rows:
-        targets = buckets(row["channel_key"], row["model_key"], row["apikey_key"])
+        targets = buckets(
+            row["channel_key"], row["model_key"], row["apikey_key"], row["family_protocol"],
+        )
+        response = _extract_xai_response_from_response_body(row["response_body"])
+        tier = response.get("service_tier") if isinstance(response, dict) else None
+        for target in targets:
+            _add_service_tier(target, tier)
+        object_targets = object_buckets(row["channel_key"], row["apikey_key"])
         normalized = model_pricing.normalize_response_billing(row["response_body"])
         actual_ticks = normalized.actual_cost_ticks
         if actual_ticks is not None:
-            for target in targets:
+            for target in (*targets, *object_targets):
                 _add_cost(target, actual_ticks, 1, actual=True)
             continue
         if normalized.usage_invalid or (
             row["status"] != "success" and row["response_body"]
         ):
-            for target in targets:
+            for target in (*targets, *object_targets):
                 _add_unpriced(target, 1)
         elif row["status"] == "success":
             apply_estimate(row, row_count=1)
+            if object_targets:
+                # xAI legacy estimate is per request in旧口径；不做跨请求合并。
+                for target in object_targets:
+                    _estimate_cost_into(
+                        target, row, row_count=1, pricing_settings=pricing_settings,
+                    )
 
 
 def stats_summary(
@@ -4843,6 +4953,7 @@ def stats_summary(
     group_limit: int = 10,
     family: str | None = None,
     include_cost: bool = True,
+    include_family_slices: bool = False,
 ) -> dict:
     """跨月统计聚合。
 
@@ -4870,6 +4981,13 @@ def stats_summary(
     recent_calls: list[dict] = []
     recent_cache_misses: list[dict] = []
     need_groups = bool(summary_top_limit > 0 or group_by in _GROUP_BY_COLS)
+    collect_families = bool(include_family_slices and family is None)
+    family_aggs: dict[str, tuple[dict, dict, dict, dict]] = {
+        fam: (_new_overall_agg(), {}, {}, {}) for fam in _FAMILY_UPSTREAM
+    } if collect_families else {}
+    object_cost_maps: tuple[dict[str, dict], dict[str, dict]] | None = (
+        ({}, {}) if collect_families else None
+    )
 
     def _agg_group(target: dict, conn, col_expr: str) -> None:
         connect_expr = _request_connect_sql(conn)
@@ -4896,6 +5014,39 @@ def stats_summary(
         for r in rows:
             k = r["grp_key"] or "?"
             bucket = target.setdefault(k, _new_group_agg())
+            _accumulate_group(bucket, r)
+            _merge_tps(bucket, r)
+
+    def _agg_family_groups(conn, col_expr: str, target_index: int) -> None:
+        if not family_aggs:
+            return
+        connect_expr = _request_connect_sql(conn)
+        rows = conn.execute(
+            f"""SELECT upstream_protocol AS family_protocol, {col_expr} AS grp_key,
+                 COUNT(*) AS total,
+                 SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                 SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                 SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS hit_requests,
+                 SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS write_requests,
+                 SUM(input_tokens + cache_creation_tokens + cache_read_tokens) AS total_prompt_tokens,
+                 SUM(output_tokens) AS total_output_tokens,
+                 SUM(cache_creation_tokens) AS total_cache_creation,
+                 SUM(cache_read_tokens) AS total_cache_read,
+                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+                 SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+                 SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
+                 SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
+                 {_tps_agg_sql()}
+               FROM request_log WHERE created_at >= ?
+               GROUP BY family_protocol, grp_key""",
+            (since_ts,),
+        ).fetchall()
+        for r in rows:
+            fam = _family_from_protocol(r["family_protocol"])
+            if fam not in family_aggs:
+                continue
+            target = family_aggs[fam][target_index]
+            bucket = target.setdefault(r["grp_key"] or "?", _new_group_agg())
             _accumulate_group(bucket, r)
             _merge_tps(bucket, r)
 
@@ -4930,13 +5081,52 @@ def stats_summary(
             _accumulate(overall_agg, row)
             _merge_tps(overall_agg, row)
 
+            if family_aggs:
+                family_rows = conn.execute(
+                    f"""SELECT upstream_protocol AS family_protocol,
+                         COUNT(*) AS total,
+                         SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                         SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                         SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
+                         SUM(retry_count) AS total_retries,
+                         SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS retried_requests,
+                         SUM(CASE WHEN affinity_hit=1 THEN 1 ELSE 0 END) AS affinity_hits,
+                         SUM(CASE WHEN status='success' AND cache_read_tokens > 0 THEN 1 ELSE 0 END) AS success_with_cache_hit,
+                         SUM(CASE WHEN status='success' AND cache_creation_tokens > 0 THEN 1 ELSE 0 END) AS success_with_cache_write,
+                         SUM(input_tokens) AS total_input_tokens,
+                         SUM(output_tokens) AS total_output_tokens,
+                         SUM(cache_creation_tokens) AS total_cache_creation,
+                         SUM(cache_read_tokens) AS total_cache_read,
+                         SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN {connect_expr} ELSE 0 END) AS sum_connect_ms,
+                         SUM(CASE WHEN status='success' AND {connect_expr} IS NOT NULL THEN 1 ELSE 0 END) AS cnt_connect,
+                         SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN first_token_time_ms ELSE 0 END) AS sum_first_token_ms,
+                         SUM(CASE WHEN status='success' AND is_stream=1 AND first_token_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_first_token,
+                         SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN total_time_ms ELSE 0 END) AS sum_total_ms,
+                         SUM(CASE WHEN status='success' AND total_time_ms IS NOT NULL THEN 1 ELSE 0 END) AS cnt_total,
+                         {_tps_agg_sql()}
+                       FROM request_log WHERE created_at >= ?
+                       GROUP BY family_protocol""",
+                    (since_ts,),
+                ).fetchall()
+                for family_row in family_rows:
+                    fam = _family_from_protocol(family_row["family_protocol"])
+                    if fam not in family_aggs:
+                        continue
+                    fam_overall = family_aggs[fam][0]
+                    _accumulate(fam_overall, family_row)
+                    _merge_tps(fam_overall, family_row)
+
             if need_groups:
                 _agg_group(by_channel, conn, _GROUP_BY_COLS["channel"])
                 _agg_group(by_model,   conn, _GROUP_BY_COLS["model"])
                 _agg_group(by_apikey,  conn, _GROUP_BY_COLS["apikey"])
+                _agg_family_groups(conn, _GROUP_BY_COLS["channel"], 1)
+                _agg_family_groups(conn, _GROUP_BY_COLS["model"], 2)
+                _agg_family_groups(conn, _GROUP_BY_COLS["apikey"], 3)
             _replace_summary_tokens_with_attempts(
                 conn, since_ts, family, overall_agg,
                 by_channel, by_model, by_apikey,
+                family_targets=family_aggs or None,
             )
             if include_cost:
                 if need_groups:
@@ -4948,6 +5138,8 @@ def stats_summary(
                         by_channel,
                         by_model,
                         by_apikey,
+                        family_targets=family_aggs or None,
+                        object_cost_targets=object_cost_maps,
                     )
                 else:
                     _accumulate_filtered_costs(
@@ -5037,7 +5229,7 @@ def stats_summary(
     model_top   = group_limit if group_by == "model"   else summary_top_limit
     apikey_top  = group_limit if group_by == "apikey"  else summary_top_limit
 
-    return {
+    result = {
         "overall": _finalize_overall(overall_agg),
         "by_channel": _finalize_dim(by_channel, channel_top),
         "by_model":   _finalize_dim(by_model,   model_top),
@@ -5046,6 +5238,116 @@ def stats_summary(
         "recent_calls": recent_calls,
         "recent_cache_misses": recent_cache_misses,
     }
+    if family_aggs:
+        result["family_results"] = {
+            fam: {
+                "overall": _finalize_overall(targets[0]),
+                "by_channel": _finalize_dim(targets[1], channel_top),
+                "by_model": _finalize_dim(targets[2], model_top),
+                "by_apikey": _finalize_dim(targets[3], apikey_top),
+                "recent_errors": [],
+                "recent_calls": [],
+                "recent_cache_misses": [],
+            }
+            for fam, targets in family_aggs.items()
+        }
+        result["object_cost_maps"] = object_cost_maps
+    return result
+
+
+def _token_stats_from_group(metrics: dict) -> dict:
+    """把 stats_summary 的分组字段无损映射为对象统计字段。"""
+    cache_creation = int(metrics.get("total_cache_creation") or 0)
+    cache_read = int(metrics.get("total_cache_read") or 0)
+    prompt = int(metrics.get("total_prompt_tokens") or 0)
+    return {
+        "total": int(metrics.get("total") or 0),
+        "success_count": int(metrics.get("success_count") or 0),
+        "error_count": int(metrics.get("error_count") or 0),
+        "input": prompt - cache_creation - cache_read,
+        "output": int(metrics.get("total_output_tokens") or 0),
+        "cache_creation": cache_creation,
+        "cache_read": cache_read,
+        "avg_tps": metrics.get("avg_tps"),
+        "max_tps": metrics.get("max_tps"),
+        "min_tps": metrics.get("min_tps"),
+        "cost_ticks": int(metrics.get("cost_ticks") or 0),
+        "actual_cost_ticks": int(metrics.get("actual_cost_ticks") or 0),
+        "estimated_cost_ticks": int(metrics.get("estimated_cost_ticks") or 0),
+        "actual_costed_success": int(metrics.get("actual_costed_success") or 0),
+        "estimated_costed_success": int(metrics.get("estimated_costed_success") or 0),
+        "costed_success": int(metrics.get("costed_success") or 0),
+        "unpriced_success": int(metrics.get("unpriced_success") or 0),
+        "service_tier_counts": dict(metrics.get("service_tier_counts") or {}),
+    }
+
+
+def stats_period_snapshot(since_ts: float, *, include_cost: bool = True) -> dict:
+    """构建菜单共享的 period 快照。
+
+    all/anthropic/openai 与 channel/model/apikey 切片在同一轮连接遍历中完成；
+    attempt ledger、金额估算和 xAI actual cost 事实只处理一次。对象 map 与旧
+    ``tokens_for_channel`` / ``tokens_for_apikey`` 使用相同 token、TPS 和计费桶。
+    """
+    # 菜单对象规模远小于此上限；取完整维度后由 UI 自己切 Top N。
+    summary = stats_summary(
+        since_ts,
+        summary_top_limit=1_000_000,
+        group_limit=1_000_000,
+        include_cost=include_cost,
+        include_family_slices=True,
+    )
+    families = summary.pop("family_results", {})
+    object_cost_maps = summary.pop("object_cost_maps", ({}, {})) or ({}, {})
+    by_channel = {
+        str(row.get("key") or "?"): _token_stats_from_group(row.get("metrics") or {})
+        for row in summary.get("by_channel") or []
+    }
+    by_apikey = {
+        str(row.get("key") or "?"): _token_stats_from_group(row.get("metrics") or {})
+        for row in summary.get("by_apikey") or []
+    }
+    cost_fields = tuple(_new_cost_agg())
+    for target_map, exact_costs in zip((by_channel, by_apikey), object_cost_maps):
+        for key, stats in target_map.items():
+            exact = exact_costs.get(key) or _new_cost_agg()
+            for field in cost_fields:
+                stats[field] = exact[field]
+    return {
+        "since_ts": float(since_ts),
+        "summary": summary,
+        "families": families,
+        "model_channels": channels_by_requested_model(since_ts),
+        "by_channel": by_channel,
+        "by_apikey": by_apikey,
+    }
+
+
+def request_totals_by_apikey() -> dict[str, int]:
+    """按 API Key 批量返回全历史调用次数，仅用于列表中的“历史 N 次”。"""
+    totals: dict[str, int] = {}
+    current_path, _ = _current_db_path()
+    for _, path in _monthly_log_files():
+        if path == current_path:
+            conn = _get_conn()
+            close_fn = None
+        else:
+            conn = _open_readonly(path)
+            close_fn = conn.close
+        try:
+            rows = conn.execute(
+                """SELECT COALESCE(api_key_name, '?') AS api_key_name, COUNT(*) AS total
+                     FROM request_log GROUP BY api_key_name"""
+            ).fetchall()
+            for row in rows:
+                key = str(row["api_key_name"] or "?")
+                totals[key] = totals.get(key, 0) + int(row["total"] or 0)
+        except Exception as exc:
+            raise HistoricalLogError(f"request_totals_by_apikey failed: {exc}") from exc
+        finally:
+            if close_fn is not None:
+                close_fn()
+    return totals
 
 
 # ─── 聚合辅助 ──────────────────────────────────────────────────────
@@ -5150,6 +5452,14 @@ def _add_unpriced(bucket: dict, rows: int) -> None:
     bucket["unpriced_success"] = int(bucket.get("unpriced_success") or 0) + max(
         0, int(rows or 0)
     )
+
+
+def _add_service_tier(bucket: dict, service_tier: str | None) -> None:
+    tier = str(service_tier or "").strip().lower()
+    if not tier:
+        return
+    counts = bucket.setdefault("service_tier_counts", {})
+    counts[tier] = int(counts.get(tier) or 0) + 1
 
 
 def _accumulate_group(agg: dict, row) -> None:

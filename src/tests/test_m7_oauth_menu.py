@@ -26,6 +26,7 @@ _isolation.isolate()
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 
@@ -34,11 +35,11 @@ def _import_modules():
     if root not in sys.path:
         sys.path.insert(0, root)
     from src import config, cooldown, log_db, oauth_manager, state_db
-    from src.telegram import bot, states, ui
+    from src.telegram import bot, menu_cache, states, ui
     from src.telegram.menus import oauth_menu, main as main_menu
     return {
         "config": config, "cooldown": cooldown, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
-        "bot": bot, "states": states, "ui": ui,
+        "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
         "oauth_menu": oauth_menu, "main_menu": main_menu,
     }
 
@@ -55,8 +56,17 @@ class ApiRecorder:
         return [d for m, d in self.calls if m == method]
 
     def last(self, method):
-        l = self.by(method)
-        return l[-1] if l else None
+        deadline = time.time() + 5
+        while True:
+            calls = self.by(method)
+            item = calls[-1] if calls else None
+            text = str((item or {}).get("text") or "")
+            loading = any(marker in text for marker in (
+                "正在加载，完成后", "统计正在加载", "统计加载中", "历史统计加载中",
+            ))
+            if not loading or time.time() >= deadline:
+                return item
+            time.sleep(0.01)
 
     def clear(self):
         self.calls.clear()
@@ -90,7 +100,33 @@ def _setup(m):
     m["states"].clear_all()
 
 
+def _seed_common_snapshots(m) -> None:
+    """测试显式模拟中央调度器及低频详情队列已生成快照。"""
+    cache = m["menu_cache"]
+    since = cache.month_start_ts()
+    cache.PERIOD_STATS.store(
+        ("period", int(since)), m["log_db"].stats_period_snapshot(since),
+    )
+    accounts = m["oauth_manager"].list_accounts()
+    for account in accounts:
+        account_key = m["oauth_manager"]._account_key(account)
+        cache.DETAIL_STATS.store(
+            ("oauth-model", account_key, int(since)),
+            m["log_db"].channel_model_stats(
+                f"oauth:{account_key}", since_ts=since,
+            ),
+        )
+    for key, account_key, window_since in m["oauth_menu"]._oauth_window_specs(accounts):
+        cache.WINDOW_STATS.store(
+            key,
+            m["log_db"].tokens_for_channel(
+                f"oauth:{account_key}", since_ts=window_since,
+            ),
+        )
+
+
 def _install_recorder(m):
+    _seed_common_snapshots(m)
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
@@ -198,6 +234,7 @@ def test_list_empty_and_populated(m):
     _add_fake_account(m, "user1@x.com")
     _add_fake_account(m, "user2@x.com", disabled_reason="user", enabled=False)
     _insert_oauth_success(m, "user1@x.com")
+    _seed_common_snapshots(m)
     rec.clear()
     m["oauth_menu"].show(42, 100)
     last = rec.last("editMessageText")
@@ -206,7 +243,8 @@ def test_list_empty_and_populated(m):
     assert "user2@x.com" in last["text"]
     assert "用户禁用" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
-    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "\n💵 " in last["text"]
+    assert "缓存 50 (31.2%) · 💵" not in last["text"]
     assert "≈" not in last["text"]
     assert "⏳ Token" not in last["text"]
     flat = [b["callback_data"] for row in last["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
@@ -293,7 +331,9 @@ def test_view_detail_with_quota_cache(m):
     assert "5h: 已用 12%" in last["text"]
     assert "7d: 已用 45%" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
-    assert "缓存 50 (31.2%) · 💵 " in last["text"]
+    assert "均 " in last["text"] and " · $0.000" in last["text"]
+    assert "累计金额：$0.00" in last["text"]
+    assert "缓存 50 (31.2%) · 💵" not in last["text"]
     assert "≈" not in last["text"]
     assert "↑ 160 · ↓ 20" in last["text"]
     # 详情按钮
@@ -304,6 +344,58 @@ def test_view_detail_with_quota_cache(m):
     assert any(x.startswith("oa:toggle:") for x in flat)
     assert any(x.startswith("oa:delete_ask:") for x in flat)
     print("  [PASS] oauth detail (含 quota 缓存渲染)")
+
+
+def test_openai_window_cost_is_inline_three_decimals_and_detail_uses_amount_label(m):
+    _setup(m)
+    email = "window-cost@openai.test"
+    _add_openai_fake_account(m, email)
+    account_key = _account_key_for(m, email)
+    now = datetime.now(timezone.utc)
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 20.0,
+        "five_hour_reset": (now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "seven_day_util": 40.0,
+        "seven_day_reset": (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "raw_data": "{}",
+    })
+    stats = {
+        "total": 1, "success_count": 1, "error_count": 0,
+        "input": 250, "output": 300,
+        "cache_creation": 50, "cache_read": 900,
+        "avg_tps": 42.5, "max_tps": 50.0, "min_tps": 30.0,
+        "cost_ticks": 12_345_000_000, "costed_success": 1,
+    }
+    for key, _account_key, _since in m["oauth_menu"]._oauth_window_specs(
+        m["oauth_manager"].list_accounts()
+    ):
+        m["menu_cache"].WINDOW_STATS.store(key, dict(stats))
+
+    month_snapshot = {"by_channel": {f"oauth:{account_key}": dict(stats)}}
+    account = m["oauth_manager"].get_account(account_key)
+    list_text = m["oauth_menu"]._format_account_block(
+        account, month_snapshot=month_snapshot,
+    )
+    inline = (
+        "↑1.2K ↓300 · 缓存 900 (75.0%) · 均 42.5 t/s · $1.235"
+    )
+    assert list_text.count(inline) == 2
+    assert "\n" + m["oauth_menu"]._USAGE_DETAIL_INDENT_LIST + "💵" not in list_text
+
+    usage_text = m["oauth_menu"]._format_usage_block(
+        account_key, month_snapshot=month_snapshot,
+    )
+    assert usage_text.count(inline) == 2
+    assert "\n" + m["oauth_menu"]._USAGE_DETAIL_INDENT_BLOCK + "💵" not in usage_text
+
+    month_text = m["oauth_menu"]._format_month_stats_block(
+        account_key,
+        month_snapshot=month_snapshot,
+        by_model=[dict(stats, final_model="gpt-5.6-sol")],
+    )
+    assert month_text.count("累计金额：$1.23") == 2
+    assert "💵" not in month_text
 
 
 def test_missing_reset_shows_upstream_not_returned(m):
@@ -700,47 +792,28 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     print("  [PASS] openai reset credits shown in list/detail; list hides 0")
 
 
-def test_quota_disabled_openai_missing_cache_sync_fetches_usage_and_reset_cards(m):
+def test_quota_disabled_openai_missing_cache_list_does_not_auto_refresh(m):
     _setup(m)
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _add_openai_fake_account(m, "missing-cache@x.com", enabled=False, disabled_reason="quota", disabled_until=future)
+    _add_openai_fake_account(
+        m, "missing-cache@x.com", enabled=False,
+        disabled_reason="quota", disabled_until=future,
+    )
     ak = _account_key_for(m, "missing-cache@x.com")
     assert m["state_db"].quota_load(ak) is None
 
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
 
-    row = None
-    openai = {}
-    rendered = None
-    # The refresh writes the primary usage snapshot before the reset-card
-    # detail fetch and final menu edit. Wait for the state this test actually
-    # asserts instead of racing on mere row existence.
-    for _ in range(40):
-        row = m["state_db"].quota_load(ak)
-        raw = json.loads((row or {}).get("raw_data") or "{}")
-        openai = raw.get("openai") or {}
-        rendered = rec.last("editMessageText")
-        if (
-            row is not None
-            and row.get("five_hour_util") is not None
-            and (openai.get("rate_limit_reset_credit_details") or {}).get("data")
-            and rendered is not None
-            and "尚未获取" not in rendered["text"]
-        ):
-            break
-        import time as _time
-        _time.sleep(0.05)
-    assert row is not None
-    assert row.get("five_hour_util") is not None
-    assert (openai.get("rate_limit_reset_credits") or {}).get("available_count") == 2
-    assert (openai.get("rate_limit_reset_credit_details") or {}).get("data")
+    rendered = rec.last("editMessageText")
     assert rendered is not None
-    text = rendered["text"]
-    assert "missing-cache@x.com" in text
-    assert "尚未获取" not in text
-    assert "官方重置次数" in text
-    print("  [PASS] quota-disabled OpenAI missing cache gets initial usage/reset-card sync")
+    assert "missing-cache@x.com" in rendered["text"]
+    assert "尚未获取" in rendered["text"]
+    assert m["state_db"].quota_load(ak) is None
+    # 进入常用列表只读快照；远端用量必须由显式刷新按钮触发，页面也不二次改写。
+    time.sleep(0.05)
+    assert len(rec.by("editMessageText")) == 1
+    print("  [PASS] OAuth list does not auto-refresh missing remote usage")
 
 
 def test_openai_reset_credit_cards_block_uses_post_consume_count_override(m):

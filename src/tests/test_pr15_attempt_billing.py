@@ -1109,6 +1109,20 @@ def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
     assert a_cost["cost_ticks"] == a_row["cost_ticks"]
     assert b_cost["cost_ticks"] == b_row["cost_ticks"]
 
+    # Telegram 共享 period 快照必须保持同一 attempt/token/cost 归属，不能因
+    # 批量 channel map 又退回 final channel 或只计最后一次尝试。
+    snapshot = ld.stats_period_snapshot(0)
+    fields = (
+        "total", "success_count", "error_count", "input", "output",
+        "cache_creation", "cache_read", "cost_ticks", "actual_cost_ticks",
+        "estimated_cost_ticks", "costed_success", "unpriced_success",
+    )
+    for channel, old in (("api:A", a_cost), ("api:B", b_cost)):
+        current = snapshot["by_channel"][channel]
+        assert {key: current[key] for key in fields} == {
+            key: old[key] for key in fields
+        }
+
 
 def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
     _setup(m); ld = m["log_db"]
@@ -1314,7 +1328,7 @@ def test_xai_cost_surfaces_share_actual_estimated_and_unpriced_state(m):
     assert ui.fmt_cost(per_log) == ui.fmt_cost(per_account) == ui.fmt_cost(global_cost)
     assert "计费: $0.000" in ui.fmt_log_entry_body(request_row)
     from src.telegram.menus import logs_menu
-    assert "<b>计费</b>\n💵 实际 $0.00" in logs_menu._render_detail(
+    assert "<b>计费</b>\n💵 $0.00" in logs_menu._render_detail(
         ld.log_detail("xai-consistent")
     )
 
@@ -1364,7 +1378,7 @@ def test_xai_actual_cost_requires_provider_qualified_route(m):
     assert name_row["cost_ticks"] is None
 
 
-def test_unknown_xai_model_is_unpriced_not_zero(m):
+def test_unknown_xai_model_stays_unpriced_in_ledger_but_ui_only_shows_amount(m):
     _setup(m); ld = m["log_db"]; ui = m["ui"]
     channel = "oauth:xai:user@example.com"
     _pending(ld, "xai-unknown", "grok-does-not-exist")
@@ -1381,4 +1395,4 @@ def test_unknown_xai_model_is_unpriced_not_zero(m):
     account = ld.xai_cost_for_channel(channel, since_ts=0)
     assert account["costed_success"] == 0
     assert account["unpriced_success"] == 1
-    assert ui.fmt_cost(account) == "未计价（1 次）"
+    assert ui.fmt_cost(account) == "$0.00"

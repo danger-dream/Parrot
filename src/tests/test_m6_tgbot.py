@@ -38,11 +38,11 @@ def _import_modules():
     if root not in sys.path:
         sys.path.insert(0, root)
     from src import config, log_db, state_db
-    from src.telegram import bot, states, ui
+    from src.telegram import bot, menu_cache, states, ui
     from src.telegram.menus import apikey_menu, main as main_menu
     return {
         "config": config, "log_db": log_db, "state_db": state_db,
-        "bot": bot, "states": states, "ui": ui,
+        "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
         "apikey_menu": apikey_menu, "main_menu": main_menu,
     }
 
@@ -62,14 +62,43 @@ class ApiRecorder:
         return [d for (m, d) in self.calls if m == method]
 
     def last(self, method: str) -> dict | None:
-        lst = self.by_method(method)
-        return lst[-1] if lst else None
+        deadline = time.time() + 5
+        while True:
+            lst = self.by_method(method)
+            item = lst[-1] if lst else None
+            text = str((item or {}).get("text") or "")
+            loading = any(marker in text for marker in (
+                "正在加载，完成后", "统计正在加载", "统计加载中", "历史统计加载中",
+            ))
+            if not loading or time.time() >= deadline:
+                return item
+            time.sleep(0.01)
 
     def clear(self):
         self.calls.clear()
 
 
+def _seed_common_snapshots(m) -> None:
+    """测试显式模拟中央调度器已完成预热，不让菜单同步查真实库。"""
+    ld = m["log_db"]
+    ld.init()
+    cache = m["menu_cache"]
+    for since in {cache.today_start_ts(), cache.month_start_ts()}:
+        cache.PERIOD_STATS.store(
+            ("period", int(since)), ld.stats_period_snapshot(since),
+        )
+    cache.LIFETIME_STATS.store("lifetime", ld.stats_lifetime())
+    cache.HISTORY_TOTALS.store("apikey-history", ld.request_totals_by_apikey())
+    since = cache.month_start_ts()
+    for name in (m["config"].get().get("apiKeys") or {}):
+        cache.DETAIL_STATS.store(
+            ("apikey-model", name, int(since)),
+            ld.apikey_model_stats(name, since_ts=since),
+        )
+
+
 def _install_recorder(m) -> ApiRecorder:
+    _seed_common_snapshots(m)
     rec = ApiRecorder()
     m["ui"].api = rec  # 猴补
     return rec
@@ -274,19 +303,30 @@ def test_apikey_cache_stats_include_cost(m):
     rec = _install_recorder(m)
     m["apikey_menu"].show(100, 50)
     list_text = rec.last("editMessageText")["text"]
-    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in list_text
+    assert "缓存 1.0M (33.3%)" in list_text
+    assert "💵 $68.500" in list_text
+    assert "缓存 1.0M (33.3%) · 💵" not in list_text
     assert "≈" not in list_text
 
-    lifetime_text = "\n".join(m["main_menu"]._lifetime_stats_block())
-    assert "总 Tokens <code>4.0M</code> (↑ 3.0M ↓ 1.0M) · 💵 估算 $68.50" in lifetime_text
-    assert "缓存 1.0M (33.3%)" in lifetime_text
+    lifetime_text = "\n".join(
+        m["main_menu"]._lifetime_stats_block(m["log_db"].stats_lifetime())
+    )
+    assert (
+        "总 Tokens <code>4.0M</code> (↑ 3.0M ↓ 1.0M)"
+        " · 缓存 1.0M (33.3%)\n  累计金额 $68.50"
+    ) in lifetime_text
+    assert "Tokens <code>4.0M</code>" in lifetime_text
+    assert "Tokens <code>4.0M</code> (↑ 3.0M ↓ 1.0M) · 💵" not in lifetime_text
     assert "≈" not in lifetime_text
 
     short = m["apikey_menu"]._short_of("priced")
     rec.clear()
     m["apikey_menu"].on_view(100, 50, "cb-view", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert detail_text.count("缓存 1.0M (33.3%) · 💵 估算 $68.50") >= 2
+    assert detail_text.count("缓存 1.0M (33.3%)") >= 2
+    assert detail_text.count("💵 $68.500") >= 2
+    assert "估算" not in detail_text and "实际" not in detail_text and "未计价" not in detail_text
+    assert "缓存 1.0M (33.3%) · 💵" not in detail_text
     assert "≈" not in detail_text
 
 

@@ -36,7 +36,7 @@ from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
 from ...oauth import openai as openai_provider, xai as xai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
-from .. import states, ui
+from .. import menu_cache, states, ui
 from . import main as main_menu
 
 
@@ -619,9 +619,7 @@ def _provider_label(provider: str | None, *, full: bool = False) -> str:
 
 def _this_month_start_ts() -> float:
     """北京时间本月 00:00:00 的时间戳。"""
-    now = datetime.now(_BJT)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return month_start.timestamp()
+    return menu_cache.month_start_ts()
 
 
 # 用量明细行缩进：让明细对齐上一行 5h/7d 的数字（emoji 占位用空格补齐）。
@@ -849,11 +847,13 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
     return "\n".join(lines)
 
 
-def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
+def _format_xai_spend_block(account_key: str, *, detail: bool = False,
+                            month_stats: dict | None = None,
+                            stats_loading: bool = False) -> str:
     """Grok/xAI OAuth 本地花费块。
 
     只展示 Parrot 本地上游尝试累计的金额与 Token，不做预算、进度条或
-    百分比；金额统一复用“真实优先、估算兜底、未知明确未计价”的口径。
+    百分比；不同结算来源在界面中统一合并为一个金额。
     """
     ck = f"oauth:{account_key}"
     since_ts = _this_month_start_ts()
@@ -861,12 +861,10 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
     pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
         pricing_cfg.get("enabled", True)
     )
-    try:
-        month = log_db.xai_cost_for_channel(ck, since_ts=since_ts)
-    except Exception as exc:
-        print(f"[oauth_menu] xai month spend lookup failed for {account_key}: {exc}")
-        month = {}
-    bill_count = int(month.get("costed_success") or 0)
+    if month_stats is None:
+        snapshot = menu_cache.PERIOD_STATS.peek(("period", int(since_ts))).value or {}
+        month_stats = (snapshot.get("by_channel") or {}).get(ck)
+    month = month_stats or {}
     prompt = ui.prompt_total(month.get("input") or 0, month.get("cache_creation") or 0, month.get("cache_read") or 0)
     output = int(month.get("output") or 0)
     cache_read = int(month.get("cache_read") or 0)
@@ -876,21 +874,19 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False) -> str:
         if pricing_enabled
         else "💵 本地计费: 已关闭"
     )
-    if pricing_enabled and bill_count > 0:
-        money_line += f" · {bill_count} 笔计费"
-
     usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
     if cache_read > 0:
         usage_line += f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
 
     lines = ["<b>💵 Parrot 本地计费</b>"] if detail else []
-    lines.extend([money_line, usage_line])
+    lines.append(usage_line)
     if month.get("avg_tps") is not None:
         lines.append(
             f"⚡️ TPS: 平均 {ui.fmt_tps(month.get('avg_tps'))} · "
             f"峰值 {ui.fmt_tps(month.get('max_tps'))} · "
             f"最低 {ui.fmt_tps(month.get('min_tps'))}"
         )
+    lines.append(money_line)
 
     tier_counts = month.get("service_tier_counts") or {}
     if isinstance(tier_counts, dict) and tier_counts:
@@ -925,7 +921,15 @@ def _has_local_usage_or_billing(stats: dict | None) -> bool:
     return False
 
 
-def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Optional[str]:
+def _window_stats_cache_key(account_key: str, window_name: str) -> tuple:
+    # key 表达业务窗口身份而不是滚动 since 时间。无有效 reset 时 since 会持续
+    # 变化；若把 since 放进 key，预热结果会在渲染前跨桶并被静默漏掉。
+    return "oauth-window", account_key, window_name
+
+
+def _window_usage_detail(account_key: str, since_ts: float, indent: str,
+                         window_name: str, stats: dict | None = None, *,
+                         stats_loading: bool = False) -> Optional[str]:
     """某 OAuth 账号在 [since_ts, now] 窗口内、经 Parrot 的本地请求用量明细行。
 
     返回已缩进的单行文本；窗口内没有本地请求时返回 None（不堆空行）。
@@ -934,23 +938,26 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str) -> Opti
     tokens / 缓存 / 平均 TPS 只统计走 Parrot 的本地日志。账号若在别处也被
     使用，两者会对不上，属预期，不是 bug。
     """
-    try:
-        s = log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=since_ts)
-    except Exception:
-        return None
+    if stats is None:
+        key = _window_stats_cache_key(account_key, window_name)
+        cached = menu_cache.WINDOW_STATS.peek(key)
+        stats = cached.value
+    s = stats or {}
     if not _has_local_usage_or_billing(s):
         return None
     prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
     parts = [f"↑{ui.fmt_tokens(prompt)} ↓{ui.fmt_tokens(s['output'])}"]
     if (s.get("cache_read") or 0) > 0:
         parts.append(ui.fmt_cache_phrase(s["cache_read"], prompt))
-    parts.append(f"💵 {ui.fmt_cost(s)}")
     if s.get("avg_tps") is not None:
         parts.append(f"均 {ui.fmt_tps(s.get('avg_tps'))}")
+    if oauth_manager.provider_of(account_key) in {"claude", "openai"}:
+        parts.append(ui.fmt_cost(s, decimal_places=3))
     return indent + " · ".join(parts)
 
 
-def _format_account_block(acc: dict) -> str:
+def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
+                          stats_loading: bool = False) -> str:
     """列表中每条 OAuth 账号的统一多行展示块。"""
     email = acc.get("email", "?")
     ak = _account_key(acc)
@@ -1003,7 +1010,10 @@ def _format_account_block(acc: dict) -> str:
     _now_ts = time.time()
     if prov == "xai":
         lines.extend(_format_xai_official_block(ak, detail=False).splitlines())
-        lines.extend(_format_xai_spend_block(ak, detail=False).splitlines())
+        month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{ak}")
+        lines.extend(_format_xai_spend_block(
+            ak, detail=False, month_stats=month_stats, stats_loading=stats_loading,
+        ).splitlines())
     elif row:
         fh_util = row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
@@ -1011,14 +1021,18 @@ def _format_account_block(acc: dict) -> str:
             reset = row.get("five_hour_reset")
             lines.append(f"📊 5h: {_format_usage_value_html(fh_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
             since_ts = _quota_window_since_ts(reset, 5 * 3600, now_ts=_now_ts)
-            _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
+            _d = _window_usage_detail(
+                ak, since_ts, _USAGE_DETAIL_INDENT_LIST, "5h",
+            )
             if _d:
                 lines.append(_d)
         if sd_util is not None:
             reset = row.get("seven_day_reset")
             lines.append(f"📊 7d: {_format_usage_value_html(sd_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
             since_ts = _quota_window_since_ts(reset, 7 * 86400, now_ts=_now_ts)
-            _d = _window_usage_detail(ak, since_ts, _USAGE_DETAIL_INDENT_LIST)
+            _d = _window_usage_detail(
+                ak, since_ts, _USAGE_DETAIL_INDENT_LIST, "7d",
+            )
             if _d:
                 lines.append(_d)
         td_util = row.get("thirty_day_util")
@@ -1036,18 +1050,13 @@ def _format_account_block(acc: dict) -> str:
         else:
             lines.append("📊 用量: <i>尚未获取</i>")
 
-    # 月度统计
-    try:
-        since_ts = _this_month_start_ts()
-        ts = log_db.tokens_for_channel(f"oauth:{ak}", since_ts=since_ts)
-    except Exception:
-        ts = None
+    # 月度统计来自所有菜单共享的一次批量快照。
+    ts = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{ak}")
     if prov != "xai" and _has_local_usage_or_billing(ts):
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
         stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
             stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
-        stat_line += f" · 💵 {ui.fmt_cost(ts)}"
         lines.append(stat_line)
         if ts.get("avg_tps") is not None:
             lines.append(
@@ -1055,6 +1064,7 @@ def _format_account_block(acc: dict) -> str:
                 f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
+        lines.append(f"💵 {ui.fmt_cost(ts)}")
 
     # 冷却状态
     from ... import cooldown as _cd
@@ -1073,10 +1083,14 @@ def _format_account_block(acc: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_usage_block(account_key: str) -> str:
+def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
+                        stats_loading: bool = False) -> str:
     provider = oauth_manager.provider_of(account_key)
     if provider == "xai":
-        return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(account_key, detail=True)
+        month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{account_key}")
+        return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(
+            account_key, detail=True, month_stats=month_stats, stats_loading=stats_loading,
+        )
     row = state_db.quota_load(account_key)
     if not row:
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
@@ -1106,7 +1120,10 @@ def _format_usage_block(account_key: str) -> str:
                 since_ts = _quota_window_since_ts(
                     row.get(reset_k), _detail_window_seconds[util_k], now_ts=_now_ts,
                 )
-                _d = _window_usage_detail(account_key, since_ts, _USAGE_DETAIL_INDENT_BLOCK)
+                window_name = "5h" if util_k == "five_hour_util" else "7d"
+                _d = _window_usage_detail(
+                    account_key, since_ts, _USAGE_DETAIL_INDENT_BLOCK, window_name,
+                )
                 if _d:
                     out.append(_d)
 
@@ -1537,29 +1554,21 @@ def _maybe_suffix_status_banner(text: str) -> str:
     return text + "\n\n" + "\n".join(extras)
 
 
-def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str, dict]:
+def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
+                      month_snapshot: dict | None = None,
+                      stats_loading: bool = False) -> tuple[str, dict]:
     accounts_all = oauth_manager.list_accounts()
     filter_key = _normalize_filter(filter_key)
-    # 页面只读本地缓存；缓存过期走后台刷新。完全缺 OpenAI usage cache
-    # 的场景由 show/on_view 先切到进度面板，避免在这里卡住 callback。
+    # 常用列表只读取本地状态与主动维护的月度快照。保留既有的本地配额
+    # 阈值收敛（不访问网络）；远端用量仍只由显式刷新操作负责。
     account_keys = _refreshable_account_keys_for_ui(accounts_all)
+    for account_key in account_keys:
+        try:
+            oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
+        except Exception as exc:
+            print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
     if account_keys:
-        # 如果缓存已经显示 >= quotaMonitor 阈值，立即收敛账号状态，
-        # 不等 600s 后台监控下一轮。页面渲染只读缓存，不等待远端刷新。
-        for ak in account_keys:
-            try:
-                oauth_manager.evaluate_and_toggle_by_cached_quota(ak)
-            except Exception as exc:
-                print(f"[oauth_menu] cached quota evaluate failed for {ak}: {exc}")
         accounts_all = oauth_manager.list_accounts()
-        account_keys = _refreshable_account_keys_for_ui(accounts_all)
-        _schedule_oauth_cache_refresh_for_ui(account_keys)
-        openai_keys = [
-            ak for ak in account_keys
-            if oauth_manager.provider_of(ak) == "openai"
-        ]
-        if openai_keys:
-            _schedule_openai_metadata_for_ui(openai_keys)
     total_all = len(accounts_all)
     normal = sum(1 for a in accounts_all if a.get("enabled", True) and not a.get("disabled_reason"))
     quota_disabled = sum(1 for a in accounts_all if a.get("disabled_reason") == "quota")
@@ -1616,7 +1625,9 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
         lines = [summary, ""]
         for i, acc in enumerate(page_accounts, start=start + 1):
             # 序号 + 账号多行块；序号前缀追加到块的第一行
-            block = _format_account_block(acc)
+            block = _format_account_block(
+                acc, month_snapshot=month_snapshot, stats_loading=stats_loading,
+            )
             first, _, rest = block.partition("\n")
             lines.append(f"{i}. {first}")
             if rest:
@@ -1674,47 +1685,105 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL) -> tuple[str
     return ui.truncate(_maybe_suffix_status_banner(text)), ui.inline_kb(rows)
 
 
+def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
+    specs: list[tuple[tuple, str, float]] = []
+    now_ts = time.time()
+    for account in accounts:
+        account_key = _account_key(account)
+        row = state_db.quota_load(account_key)
+        if not row:
+            continue
+        for window_name, util_key, reset_key, seconds in (
+            ("5h", "five_hour_util", "five_hour_reset", 5 * 3600),
+            ("7d", "seven_day_util", "seven_day_reset", 7 * 86400),
+        ):
+            if row.get(util_key) is None:
+                continue
+            since = _quota_window_since_ts(row.get(reset_key), seconds, now_ts=now_ts)
+            specs.append((
+                _window_stats_cache_key(account_key, window_name), account_key, since,
+            ))
+    return specs
+
+
+def refresh_window_snapshots_now() -> bool:
+    """由唯一统计调度线程同步刷新所有 OAuth 5h/7d 本地明细。"""
+    ok = True
+    for key, account_key, since in _oauth_window_specs(oauth_manager.list_accounts()):
+        ok = menu_cache.WINDOW_STATS.refresh_now(
+            key,
+            lambda target=account_key, start=since: log_db.tokens_for_channel(
+                f"oauth:{target}", since_ts=start,
+            ),
+        ) and ok
+    return ok
+
+
+def _request_window_snapshots(accounts: list[dict]) -> bool:
+    """请求缺失/过期窗口快照，并返回旧页面所需快照是否均已存在。"""
+    ready = True
+    for key, account_key, since in _oauth_window_specs(accounts):
+        cached = menu_cache.WINDOW_STATS.peek(key)
+        if cached.value is None:
+            ready = False
+        if not cached.fresh:
+            menu_cache.WINDOW_STATS.request(
+                key,
+                lambda target=account_key, start=since: log_db.tokens_for_channel(
+                    f"oauth:{target}", since_ts=start,
+                ),
+            )
+    return ready
+
+
+def _render_cached_list(page: int, filter_key: str) -> tuple[str, dict]:
+    since = _this_month_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    return _list_text_and_kb(
+        page=page, filter_key=filter_key, month_snapshot=period.value,
+    )
+
+
+def _list_snapshot_ready() -> bool:
+    since = _this_month_start_ts()
+    if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
+        return False
+    # OAuth 列表原来显示的 5h/7d 本地 Token、缓存、TPS、金额是页面必需内容，
+    # 不能因为快照尚未预热就静默删行。
+    return _request_window_snapshots(oauth_manager.list_accounts())
+
+
+def _converge_cached_quota_state() -> None:
+    """保留旧列表进入时基于本地配额缓存立即收敛账号状态的行为。"""
+    accounts = oauth_manager.list_accounts()
+    for account_key in _refreshable_account_keys_for_ui(accounts):
+        try:
+            oauth_manager.evaluate_and_toggle_by_cached_quota(account_key)
+        except Exception as exc:
+            print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
+
+
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
+    # 这是本地状态收敛，不查统计库也不访问网络；即使统计快照还在预热，
+    # 也不能丢掉旧版进入列表时立即禁用/恢复账号的语义。
+    _converge_cached_quota_state()
+    if not _list_snapshot_ready():
+        if cb_id is not None:
+            ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    accounts = oauth_manager.list_accounts()
-    initial_keys = _initial_update_keys_for_ui(accounts)
-    if initial_keys:
-        # 初次没有 usage cache 时，先把当前面板切成进度面板，后台逐账号更新；
-        # 这样 callback 立刻返回，不会因为账号多/接口慢导致 TG 超时。
-        keys = _refreshable_account_keys_for_ui(accounts) or initial_keys
-        initial_items = [
-            _progress_account_block(ak, idx, "  等待更新...")
-            for idx, ak in enumerate(keys, 1)
-        ]
-        ui.edit(chat_id, message_id, _build_oauth_update_panel(initial_items))
-        _start_oauth_update_panel(
-            chat_id, message_id, keys, page=page, filter_key=filter_key,
-            final_target_message_id=message_id, background=True,
-        )
-        return
-    text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
+    menu_cache.begin_view(chat_id, message_id)
+    text, kb = _render_cached_list(page, filter_key)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def send_new(chat_id: int, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    accounts = oauth_manager.list_accounts()
-    initial_keys = _initial_update_keys_for_ui(accounts)
-    if initial_keys:
-        keys = _refreshable_account_keys_for_ui(accounts) or initial_keys
-        initial_items = [
-            _progress_account_block(ak, idx, "  等待更新...")
-            for idx, ak in enumerate(keys, 1)
-        ]
-        resp = ui.send(chat_id, _build_oauth_update_panel(initial_items))
-        mid = (resp.get("result") or {}).get("message_id") if resp and resp.get("ok") else None
-        if mid is not None:
-            _start_oauth_update_panel(
-                chat_id, int(mid), keys, page=page, filter_key=filter_key,
-                final_target_message_id=int(mid), background=True,
-            )
-            return
-    text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
+    _converge_cached_quota_state()
+    if not _list_snapshot_ready():
+        ui.send(chat_id, menu_cache.initialization_text())
+        return
+    text, kb = _render_cached_list(page, filter_key)
     ui.send(chat_id, text, reply_markup=kb)
 
 
@@ -1996,20 +2065,27 @@ def on_sort_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
 
 # ─── 账户详情 ─────────────────────────────────────────────────────
 
-def _format_month_stats_block(account_key: str) -> str:
-    """本月使用统计：总体 + 按模型展开。无数据时返回空字符串。"""
+def _format_month_stats_block(account_key: str, *,
+                              month_snapshot: dict | None = None,
+                              by_model: list[dict] | None = None,
+                              stats_loading: bool = False) -> str:
+    """本月使用统计：总体来自共享快照，模型明细来自后台对象缓存。"""
     ck = f"oauth:{account_key}"
     since_ts = _this_month_start_ts()
-    try:
-        overall = log_db.tokens_for_channel(ck, since_ts=since_ts)
-    except Exception:
-        return ""
+    if month_snapshot is None:
+        month_snapshot = menu_cache.PERIOD_STATS.peek(
+            ("period", int(since_ts))
+        ).value
+    overall = (((month_snapshot or {}).get("by_channel") or {}).get(ck))
     if not _has_local_usage_or_billing(overall):
         return ""
-    try:
-        by_model = log_db.channel_model_stats(ck, since_ts=since_ts)
-    except Exception:
-        by_model = []
+    model_loading = False
+    if by_model is None:
+        cached_models = menu_cache.DETAIL_STATS.peek(
+            ("oauth-model", account_key, int(since_ts))
+        )
+        by_model = cached_models.value or []
+        model_loading = cached_models.value is None
 
     total = overall["total"]
     succ = overall["success_count"]
@@ -2019,7 +2095,6 @@ def _format_month_stats_block(account_key: str) -> str:
     token_line = f"↑ {ui.fmt_tokens(inp_prompt)} · ↓ {ui.fmt_tokens(out_tok)}"
     if (overall.get("cache_read") or 0) > 0:
         token_line += f" · {ui.fmt_cache_phrase(overall['cache_read'], inp_prompt)}"
-    token_line += f" · 💵 {ui.fmt_cost(overall)}"
 
     lines = [
         "",
@@ -2029,6 +2104,7 @@ def _format_month_stats_block(account_key: str) -> str:
         f"平均 {ui.fmt_tps(overall.get('avg_tps'))} · "
         f"峰值 {ui.fmt_tps(overall.get('max_tps'))} · "
         f"最低 {ui.fmt_tps(overall.get('min_tps'))}",
+        f"累计金额：{ui.fmt_cost(overall)}",
     ]
     if by_model:
         lines.append("")
@@ -2042,7 +2118,6 @@ def _format_month_stats_block(account_key: str) -> str:
             )
             if (ms.get("cache_read") or 0) > 0:
                 model_line += f" · {ui.fmt_cache_phrase(ms['cache_read'], m_prompt)}"
-            model_line += f" · 💵 {ui.fmt_cost(ms)}"
             lines.append(f"  • <code>{model}</code>")
             lines.append(model_line)
             if ms.get("avg_tps") is not None:
@@ -2051,12 +2126,16 @@ def _format_month_stats_block(account_key: str) -> str:
                     f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
                     f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
                 )
+            lines.append(f"    累计金额：{ui.fmt_cost(ms)}")
     return "\n".join(lines)
 
 
 def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL,
                         *, refresh_quota: bool = True,
-                        reset_credit_count_override: int | None = None) -> tuple[Optional[str], Optional[dict]]:
+                        reset_credit_count_override: int | None = None,
+                        month_snapshot: dict | None = None,
+                        model_stats: list[dict] | None = None,
+                        stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_manager.get_account(account_key)
     if acc is None:
         return None, None
@@ -2126,7 +2205,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         f"⚡ 并发上限: <code>{max_cc_label}</code>\n"
         f"⏳ Token: <code>{_fmt_time_full(acc.get('expired'))}</code>\n"
         f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
-        f"<b>📊 使用量</b>\n{_format_usage_block(account_key)}"
+        f"<b>📊 使用量</b>\n{_format_usage_block(account_key, month_snapshot=month_snapshot, stats_loading=stats_loading)}"
     )
     reset_cards_block = (
         _format_reset_credit_cards_block(
@@ -2138,7 +2217,10 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     if reset_cards_block:
         text += "\n\n" + reset_cards_block
 
-    month_block = _format_month_stats_block(account_key)
+    month_block = _format_month_stats_block(
+        account_key, month_snapshot=month_snapshot, by_model=model_stats,
+        stats_loading=stats_loading,
+    )
     if month_block:
         text += "\n" + month_block
 
@@ -2189,31 +2271,70 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     return ui.truncate(text), ui.inline_kb(rows)
 
 
+def _render_cached_detail(account_key: str, page: int, filter_key: str,
+                          *, refresh_quota: bool = False) -> tuple[Optional[str], Optional[dict]]:
+    since = _this_month_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    models = menu_cache.DETAIL_STATS.peek(("oauth-model", account_key, int(since)))
+    return _detail_text_and_kb(
+        account_key, page=page, filter_key=filter_key,
+        refresh_quota=refresh_quota,
+        month_snapshot=period.value,
+        model_stats=models.value,
+        stats_loading=period.value is None or models.value is None,
+    )
+
+
+def _queue_oauth_detail_stats(account_key: str) -> bool:
+    """把缺失/过期的低频详情排入中央队列；返回当前是否已有完整值。"""
+    since = _this_month_start_ts()
+    period_key = ("period", int(since))
+    if menu_cache.PERIOD_STATS.peek(period_key).value is None:
+        return False
+
+    ready = True
+    model_key = ("oauth-model", account_key, int(since))
+    model = menu_cache.DETAIL_STATS.peek(model_key)
+    channel_stats = (
+        (menu_cache.PERIOD_STATS.peek(period_key).value or {}).get("by_channel") or {}
+    ).get(f"oauth:{account_key}")
+    if model.value is None and not int((channel_stats or {}).get("total") or 0):
+        # 本月无调用时，旧详情中的按模型统计完整结果就是空列表。
+        menu_cache.DETAIL_STATS.store(model_key, [])
+        model = menu_cache.DETAIL_STATS.peek(model_key)
+    if model.value is None:
+        ready = False
+    if not model.fresh:
+        menu_cache.DETAIL_STATS.request(
+            model_key,
+            lambda: log_db.channel_model_stats(f"oauth:{account_key}", since_ts=since),
+        )
+
+    account = oauth_manager.get_account(account_key)
+    if not _request_window_snapshots([account] if account else []):
+        ready = False
+    return ready
+
+
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     ak = _resolve_to_account_key(ui.resolve_code(short))
-    if ak is None:
-        ui.answer_cb(cb_id, "短码已失效，请返回重试")
-        show(chat_id, message_id, page=page, filter_key=filter_key)
+    if ak is None or oauth_manager.get_account(ak) is None:
+        ui.answer_cb(cb_id, "账户已不存在，请返回重试")
+        return
+    since = _this_month_start_ts()
+    if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
+        ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
+    # 旧详情中的按模型统计及 5h/7d 本地明细都是既有内容，不允许在
+    # 冷快照时先渲染一个删减版页面。查询仍只排入中央串行调度器。
+    if not _queue_oauth_detail_stats(ak):
+        ui.answer_cb(cb_id, menu_cache.initialization_text())
         return
     ui.answer_cb(cb_id)
-    acc = oauth_manager.get_account(ak)
-    if acc and _should_refresh_account_for_ui(acc) and oauth_manager.provider_of(acc) == "openai" and _needs_initial_oauth_cache_sync_for_ui(ak):
-        ui.edit(chat_id, message_id, _build_oauth_update_panel([
-            _progress_account_block(ak, 1, "  等待更新...")
-        ]))
-        _start_oauth_update_panel(
-            chat_id, message_id, [ak], page=page, filter_key=filter_key,
-            final_target_message_id=message_id, final_detail_account_key=ak, background=True,
-        )
-        return
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
-    if text is None:
-        _, email = _split_ak(ak)
-        ui.edit(chat_id, message_id,
-                f"⚠ 账户 <code>{ui.escape_html(email)}</code> 已不存在",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _page_callback(max(1, int(page or 1)), filter_key))]]))
-        return
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    menu_cache.begin_view(chat_id, message_id)
+    text, kb = _render_cached_detail(ak, page, filter_key, refresh_quota=False)
+    if text is not None:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 刷新 Token ──────────────────────────────────────────────────
@@ -2677,7 +2798,8 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                             final_detail_account_key: str | None = None,
                             delete_progress_later: bool = False,
                             send_fallback_summary: bool = False,
-                            show_transition_hint: bool = True) -> None:
+                            show_transition_hint: bool = True,
+                            view_token: int | None = None) -> None:
     account_keys = [ak for ak in account_keys if ak]
     items = [
         _progress_account_block(ak, idx, "  等待更新...")
@@ -2694,7 +2816,13 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
         if progress_mid == -1:
             return
         try:
-            ui.edit(chat_id, progress_mid, text)
+            if view_token is None:
+                ui.edit(chat_id, progress_mid, text)
+            else:
+                menu_cache.run_if_current(
+                    chat_id, progress_mid, view_token,
+                    lambda: ui.edit(chat_id, progress_mid, text),
+                )
         except Exception:
             pass
 
@@ -2779,9 +2907,26 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
                 refresh_quota=False,
             )
         else:
-            text, kb = _list_text_and_kb(page=page, filter_key=filter_key)
+            text, kb = _render_cached_list(page, filter_key)
         if text and target_mid != -1:
-            ui.edit(chat_id, target_mid, text, reply_markup=kb)
+            edited = True
+            if view_token is None:
+                ui.edit(chat_id, target_mid, text, reply_markup=kb)
+            else:
+                edited = menu_cache.run_if_current(
+                    chat_id, target_mid, view_token,
+                    lambda: ui.edit(chat_id, target_mid, text, reply_markup=kb),
+                )
+            if edited and view_token is not None:
+                if final_detail_account_key is None:
+                    _start_oauth_list_stats_refreshes(
+                        chat_id, target_mid, page, filter_key, view_token,
+                    )
+                else:
+                    _start_oauth_detail_stats_refreshes(
+                        chat_id, target_mid, final_detail_account_key,
+                        page, filter_key, view_token,
+                    )
     except Exception as exc:
         print(f"[oauth_menu] final panel render failed: {exc}")
 
@@ -2807,7 +2952,8 @@ def _start_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: lis
                               delete_progress_later: bool = False,
                               send_fallback_summary: bool = False,
                               show_transition_hint: bool = True,
-                              background: bool = True) -> None:
+                              background: bool = True,
+                              view_token: int | None = None) -> None:
     if not background:
         _run_oauth_update_panel(
             chat_id, progress_mid, account_keys,
@@ -2817,6 +2963,7 @@ def _start_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: lis
             delete_progress_later=delete_progress_later,
             send_fallback_summary=send_fallback_summary,
             show_transition_hint=show_transition_hint,
+            view_token=view_token,
         )
         return
     threading.Thread(
@@ -2830,6 +2977,7 @@ def _start_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: lis
             "delete_progress_later": delete_progress_later,
             "send_fallback_summary": send_fallback_summary,
             "show_transition_hint": show_transition_hint,
+            "view_token": view_token,
         },
         daemon=True,
     ).start()

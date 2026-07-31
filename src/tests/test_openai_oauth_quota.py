@@ -42,7 +42,7 @@ def _import_modules():
     from src.channel.oauth_channel import OAuthChannel
     from src.oauth import openai as openai_provider
     from src.openai.channel.registration import register_factories
-    from src.telegram import states, ui
+    from src.telegram import menu_cache, states, ui
     from src.telegram.menus import oauth_menu, status_menu
     register_factories()
     return {
@@ -52,7 +52,7 @@ def _import_modules():
         "OpenAIOAuthChannel": OpenAIOAuthChannel,
         "OAuthChannel": OAuthChannel,
         "openai_provider": openai_provider,
-        "states": states, "ui": ui,
+        "menu_cache": menu_cache, "states": states, "ui": ui,
         "oauth_menu": oauth_menu, "status_menu": status_menu,
     }
 
@@ -68,6 +68,8 @@ def _setup(m):
     # 清 failover / UI 的跨 test 状态。
     m["failover"]._codex_snapshot_last.clear()
     m["states"].clear_all()
+    since = m["menu_cache"].month_start_ts()
+    m["menu_cache"].PERIOD_STATS.store(("period", int(since)), {})
     # UI list/detail helpers schedule daemon background refreshes in production. In
     # this standalone integration test they race with the next case's isolated
     # config/state, so no-op the schedulers and clear in-flight buckets.
@@ -91,6 +93,11 @@ def _add_openai(m, email="q@openai.test"):
 class _MockResp:
     def __init__(self, headers: dict):
         self.headers = headers
+
+
+def _preheat_oauth_menu_windows(m) -> None:
+    """执行生产调度器使用的窗口预热入口，不手工伪造菜单快照。"""
+    assert m["oauth_menu"].refresh_window_snapshots_now()
 
 
 # ─── state_db write ───────────────────────────────────────────────
@@ -251,6 +258,7 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     })
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
 
+    _preheat_oauth_menu_windows(m)
     rec = _UiRecorder()
     m["ui"].api = rec
     short = m["ui"].register_code("openai:ui@openai.test:acct-ui@openai.test")
@@ -289,6 +297,7 @@ def test_oauth_menu_list_cached_openai_over_dynamic_threshold_auto_disables(m):
         "openai:cached@openai.test:acct-cached@openai.test", snap, norm, email="cached@openai.test",
     )
 
+    _preheat_oauth_menu_windows(m)
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].show(42, 100, "cb")
@@ -321,6 +330,7 @@ def test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled(m):
         "openai:below@openai.test:acct-below@openai.test", snap, norm, email="below@openai.test",
     )
 
+    _preheat_oauth_menu_windows(m)
     rec = _UiRecorder()
     m["ui"].api = rec
     m["oauth_menu"].show(42, 100, "cb")

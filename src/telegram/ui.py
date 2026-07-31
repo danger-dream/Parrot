@@ -511,7 +511,7 @@ def fmt_cost(
     show_source: bool = True,
     decimal_places: int = 2,
 ) -> str:
-    """Format actual/estimated USD cost for the requested UI surface."""
+    """Format the combined USD amount without exposing settlement sources."""
     from .. import config
 
     pricing_cfg = config.get().get("pricing", {})
@@ -525,40 +525,20 @@ def fmt_cost(
         except (TypeError, ValueError, OverflowError):
             return 0
 
-    ticks = nonnegative_int("cost_ticks")
-    actual_ticks = nonnegative_int("actual_cost_ticks")
-    estimated_ticks = nonnegative_int("estimated_cost_ticks")
-    costed = nonnegative_int("costed_success")
-    actual_count = nonnegative_int("actual_costed_success")
-    estimated_count = nonnegative_int("estimated_costed_success")
-    unpriced = nonnegative_int("unpriced_success")
-    if costed <= 0:
-        return (
-            f"未计价（{unpriced} 次）"
-            if unpriced
-            else fmt_usd(0, decimal_places=decimal_places)
+    # ``cost_ticks`` is the authoritative sum of provider-reported and
+    # token-priced amounts.  Keep ``show_source`` for call-site compatibility,
+    # but every Telegram surface now intentionally renders only that total.
+    _ = show_source
+    if "cost_ticks" in data:
+        ticks = nonnegative_int("cost_ticks")
+    else:
+        ticks = nonnegative_int("actual_cost_ticks") + nonnegative_int(
+            "estimated_cost_ticks"
         )
-    amount = fmt_usd(
+    return fmt_usd(
         Decimal(ticks) / Decimal(10_000_000_000),
         decimal_places=decimal_places,
     )
-    if show_source and actual_count > 0 and estimated_count > 0:
-        actual_amount = fmt_usd(
-            Decimal(actual_ticks) / Decimal(10_000_000_000),
-            decimal_places=decimal_places,
-        )
-        estimated_amount = fmt_usd(
-            Decimal(estimated_ticks) / Decimal(10_000_000_000),
-            decimal_places=decimal_places,
-        )
-        amount = f"{amount}（实际 {actual_amount} + 估算 {estimated_amount}）"
-    elif show_source and actual_count > 0:
-        amount = f"实际 {amount}"
-    elif show_source and estimated_count > 0:
-        amount = f"估算 {amount}"
-    if unpriced:
-        amount += f" · {unpriced} 次未计价"
-    return amount
 
 
 def fmt_usd(value, *, decimal_places: int = 2) -> str:
@@ -588,7 +568,7 @@ def cost_metrics_from_row(row: dict | None) -> dict:
 
 
 def fmt_cost_from_row(row: dict | None) -> str:
-    """Format one request row's actual/estimated cost."""
+    """Format one request row's combined cost amount."""
 
     return fmt_cost(cost_metrics_from_row(row))
 
@@ -887,11 +867,12 @@ def log_fast_mode_badge(r: dict) -> str:
     return "⚡ Fast" if log_fast_mode_enabled(r) else ""
 
 
-def fmt_log_entry_body(r: dict) -> str:
+def fmt_log_entry_body(r: dict, *, separate_billing: bool = False) -> str:
     """渲染日志条目的 body 部分。
 
     列表首行只放编号/时间/Key/状态，模型、渠道、Token、耗时、代理分行展示，
-    避免长模型名把 Telegram 单行撑爆。
+    避免长模型名把 Telegram 单行撑爆。最近日志列表保留紧凑金额；嵌入其他
+    统计页面时可将金额独立成行。
     """
     lines: list[str] = []
 
@@ -932,8 +913,12 @@ def fmt_log_entry_body(r: dict) -> str:
         tok = f"↑ {fmt_tokens(inp)} · ↓ {fmt_tokens(r.get('output_tokens'))}"
         if cr > 0:
             tok += f" · {fmt_cache_phrase_from_row(r)}"
-        tok += f" · {fmt_cost(cost_metrics, show_source=False, decimal_places=3)}"
-        lines.append(f"  Token: {tok}")
+        cost_text = fmt_cost(cost_metrics, show_source=False, decimal_places=3)
+        if separate_billing:
+            lines.append(f"  Token: {tok}")
+            lines.append(f"  金额: {cost_text}")
+        else:
+            lines.append(f"  Token: {tok} · {cost_text}")
     elif row_status in ("error", "cancelled") and (
         int(cost_metrics.get("costed_success") or 0) > 0
         or int(cost_metrics.get("unpriced_success") or 0) > 0

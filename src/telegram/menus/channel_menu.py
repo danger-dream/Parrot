@@ -23,7 +23,6 @@ import asyncio
 import math
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from ... import affinity, config, cooldown, load_balancing, log_db, probe, quota_errors, scorer, state_db
@@ -34,7 +33,7 @@ from ...channel.url_utils import (
     split_base_url,
     validate_api_path_for_protocol,
 )
-from .. import states, ui
+from .. import menu_cache, states, ui
 from . import main as main_menu
 
 
@@ -87,11 +86,8 @@ def _compat_feature_status(ch, feature: str) -> str:
     return f"强制 · {len(models)} 个模型"
 
 
-_BJT = timezone(timedelta(hours=8))
-
-
 def _month_start_ts() -> float:
-    return datetime.now(_BJT).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return menu_cache.month_start_ts()
 
 
 # ─── 异步同步桥 ──────────────────────────────────────────────────
@@ -339,7 +335,8 @@ def _callback_payload(short: str, page: int) -> str:
     return f"{short}:{max(1, page)}"
 
 
-def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
+def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
+                      stats_loading: bool = False) -> tuple[str, dict]:
     chans = [ch for ch in registry.all_channels() if ch.type == "api"]
     total = len(chans)
     total_pages = max(1, math.ceil(total / _PAGE_SIZE)) if total else 1
@@ -350,8 +347,7 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
     if total == 0:
         lines.append("\n暂无渠道，点「➕ 添加渠道」创建。")
 
-    # 本月 channel 级加权平均 TPS（按 channel 维度聚合 tokens/denom）
-    month_ts = _month_start_ts()
+    by_channel = (snapshot or {}).get("by_channel") or {}
 
     start = (page - 1) * _PAGE_SIZE
     end = start + _PAGE_SIZE
@@ -361,23 +357,25 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
     current: list[dict] = []
     for idx, ch in enumerate(page_chans, start=start + 1):
         icon, status = _channel_health(ch)
-        try:
-            ch_stats = log_db.tokens_for_channel(ch.key, since_ts=month_ts)
+        ch_stats = by_channel.get(ch.key)
+        if ch_stats is not None:
             ch_tps = ch_stats.get("avg_tps")
             ch_prompt = ui.prompt_total(ch_stats.get("input"), ch_stats.get("cache_creation"), ch_stats.get("cache_read"))
-            ch_cache = f"💵 {ui.fmt_cost(ch_stats)}"
-            if (ch_stats.get("cache_read") or 0) > 0:
-                ch_cache = (
-                    f"{ui.fmt_cache_phrase(ch_stats.get('cache_read'), ch_prompt)}"
-                    f" · {ch_cache}"
-                )
-        except Exception:
+            ch_cache = (
+                ui.fmt_cache_phrase(ch_stats.get("cache_read"), ch_prompt)
+                if (ch_stats.get("cache_read") or 0) > 0 else ""
+            )
+            ch_cost = ui.fmt_cost(ch_stats, decimal_places=3)
+        else:
             ch_tps = None
             ch_cache = ""
+            ch_cost = ""
         summary = _summary_text(ch, tps_v=ch_tps, cache_phrase=ch_cache)
         lines.append("")
         lines.append(f"{idx}. {icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
         lines.append(f"  模型: {len(ch.models)} 个 · {ui.escape_html(summary)}")
+        if ch_cost:
+            lines.append(f"  💵 {ch_cost}")
         short = ui.register_code(ch.display_name)
         current.append(ui.btn(f"{idx}. {icon} {ch.display_name}", f"ch:view:{_callback_payload(short, page)}"))
         if len(current) >= 2:
@@ -406,14 +404,26 @@ def _list_text_and_kb(page: int = 1) -> tuple[str, dict]:
 
 
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
+    since = _month_start_ts()
+    cached = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    if cached.value is None:
+        if cb_id is not None:
+            ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    text, kb = _list_text_and_kb(page=page)
+    menu_cache.begin_view(chat_id, message_id)
+    text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 def send_new(chat_id: int, page: int = 1) -> None:
-    text, kb = _list_text_and_kb(page=page)
+    since = _month_start_ts()
+    cached = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    if cached.value is None:
+        ui.send(chat_id, menu_cache.initialization_text())
+        return
+    text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
     ui.send(chat_id, text, reply_markup=kb)
 
 
@@ -671,17 +681,18 @@ def on_sort_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
 
 # ─── 渠道详情 ─────────────────────────────────────────────────────
 
-def _channel_model_lines(ch) -> list[str]:
+def _channel_model_lines(ch, model_stats: list[dict] | None = None,
+                         *, stats_loading: bool = False) -> list[str]:
     lines = []
     now = int(time.time() * 1000)
     perfs = {s["model"]: s for s in scorer.snapshot() if s["channel_key"] == ch.key}
     cd_map = {e["model"]: e for e in cooldown.active_entries() if e["channel_key"] == ch.key}
 
-    # 本月每个 model 的 TPS / 次数
-    try:
-        model_stats = log_db.channel_model_stats(ch.key, since_ts=_month_start_ts())
-    except Exception:
-        model_stats = []
+    # 本月每个 model 的 TPS / 次数只读后台缓存。
+    if model_stats is None:
+        cached = menu_cache.DETAIL_STATS.peek(("channel-model", ch.key, int(_month_start_ts())))
+        model_stats = cached.value or []
+        stats_loading = stats_loading or cached.value is None
     stats_by_model = {s["final_model"]: s for s in model_stats}
 
     for m in ch.models:
@@ -731,18 +742,20 @@ def _channel_model_lines(ch) -> list[str]:
             token_line = f"    ↑ {ui.fmt_tokens(m_prompt)} · ↓ {ui.fmt_tokens(ms.get('output'))}"
             if (ms.get("cache_read") or 0) > 0:
                 token_line += f" · {ui.fmt_cache_phrase(ms.get('cache_read'), m_prompt)}"
-            token_line += f" · 💵 {ui.fmt_cost(ms)}"
             lines.append(token_line)
-        if ms and ms.get("avg_tps") is not None:
-            lines.append(
-                f"    ⚡ TPS: 平均 {ui.fmt_tps(ms['avg_tps'])} · "
-                f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
-                f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
-            )
+            if ms.get("avg_tps") is not None:
+                lines.append(
+                    f"    ⚡ TPS: 平均 {ui.fmt_tps(ms['avg_tps'])} · "
+                    f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
+                    f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
+                )
+            lines.append(f"    💵 {ui.fmt_cost(ms, decimal_places=3)}")
     return lines
 
 
-def _detail_text_and_kb(name: str, page: int = 1) -> tuple[Optional[str], Optional[dict]]:
+def _detail_text_and_kb(name: str, page: int = 1, *,
+                        model_stats: list[dict] | None = None,
+                        stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
     ch = registry.get_channel(f"api:{name}")
     if ch is None or ch.type != "api":
         return None, None
@@ -780,7 +793,7 @@ def _detail_text_and_kb(name: str, page: int = 1) -> tuple[Optional[str], Option
         "",
         f"<b>📋 模型 ({len(ch.models)} 个)</b>",
     ]
-    lines.extend(_channel_model_lines(ch))
+    lines.extend(_channel_model_lines(ch, model_stats, stats_loading=stats_loading))
 
     # 亲和绑定数
     bound = sum(1 for v in affinity.snapshot().values() if v["channel_key"] == ch.key)
@@ -808,13 +821,38 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id, page=page)
         return
-    ui.answer_cb(cb_id)
-    text, kb = _detail_text_and_kb(name, page=page)
-    if text is None:
-        ui.edit(chat_id, message_id, f"⚠ 渠道 <code>{ui.escape_html(name)}</code> 不存在",
-                reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _page_callback(page))]]))
+    ch = registry.get_channel(f"api:{name}")
+    if ch is None:
+        ui.answer_cb(cb_id, "渠道不存在")
         return
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    since = _month_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    if period.value is None:
+        ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
+    detail_key = ("channel-model", ch.key, int(since))
+    cached = menu_cache.DETAIL_STATS.peek(detail_key)
+    channel_stats = (period.value.get("by_channel") or {}).get(ch.key)
+    if cached.value is None and not int((channel_stats or {}).get("total") or 0):
+        # 本月无调用时，每模型统计的完整结果就是空列表。
+        menu_cache.DETAIL_STATS.store(detail_key, [])
+        cached = menu_cache.DETAIL_STATS.peek(detail_key)
+    if not cached.fresh:
+        menu_cache.DETAIL_STATS.request(
+            detail_key, lambda: log_db.channel_model_stats(ch.key, since_ts=since),
+        )
+    # 旧详情页中的每模型调用量、Token、缓存、TPS 都是原有内容；冷快照时
+    # 保持列表页不动，不能先打开一个把这些字段删掉的残缺详情。
+    if cached.value is None:
+        ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
+    ui.answer_cb(cb_id)
+    menu_cache.begin_view(chat_id, message_id)
+    text, kb = _detail_text_and_kb(
+        name, page=page, model_stats=cached.value,
+    )
+    if text is not None:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 启停 / 清错误 / 清亲和 / 删除 ───────────────────────────────

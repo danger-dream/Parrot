@@ -118,14 +118,17 @@ def m(request):
 def _restore_telegram_ui_globals():
     """测试间恢复 telegram.ui 的猴补/全局状态，避免跨文件污染。"""
     try:
-        from src.telegram import ui
+        from src.telegram import menu_cache, ui
     except Exception:
+        menu_cache = None
         ui = None
 
     if ui is None:
         yield
         return
 
+    if menu_cache is not None:
+        menu_cache.reset_for_tests()
     orig_api = ui.api
     orig_session = getattr(ui, "_session", None)
     orig_bot_token = getattr(ui, "_bot_token", "")
@@ -141,6 +144,8 @@ def _restore_telegram_ui_globals():
         ui._session = orig_session
         ui._bot_token = orig_bot_token
         ui._admin_ids = set(orig_admin_ids)
+        if menu_cache is not None:
+            menu_cache.reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

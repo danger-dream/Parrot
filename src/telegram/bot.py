@@ -19,7 +19,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import states, ui
+from . import menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
     logs_menu, mapping_menu, media_logs_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
@@ -105,6 +105,8 @@ def start() -> None:
     # 安装 notifier 钩子（把服务事件转发给 admin）
     ui.install_notify_handler()
 
+    # 统计快照由唯一的中央 timed scheduler 主动预热；不占用 polling 线程。
+    menu_cache.start()
     _running = True
     _thread = threading.Thread(target=_poll_loop, daemon=True, name="tg-bot-poll")
     _thread.start()
@@ -115,6 +117,8 @@ def stop() -> None:
     global _running
     _running = False
     ui.close_session()
+    # 唤醒 timed wait，并等待当前串行统计任务自然收尾。
+    menu_cache.stop()
 
 
 def _drop_pending_updates() -> None:
@@ -222,6 +226,9 @@ def _handle_callback(cb: dict) -> None:
     if not ui.is_admin(chat_id):
         ui.answer_cb(cb_id, "⛔ 无权限")
         return
+
+    # 任意新 callback 都让该消息此前的后台统计更新失效，防止旧页面覆盖新菜单。
+    menu_cache.begin_view(chat_id, msg_id)
 
     # 主菜单
     if data == "menu:main":

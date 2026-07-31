@@ -39,7 +39,7 @@ class ApiRecorder:
 def _import_modules():
     from src import config, log_db, state_db
     from src.channel import registry
-    from src.telegram import bot, states, ui
+    from src.telegram import bot, menu_cache, states, ui
     from src.telegram.menus import apikey_menu, oauth_menu, xai_imagine_menu
 
     return {
@@ -48,6 +48,7 @@ def _import_modules():
         "state_db": state_db,
         "registry": registry,
         "bot": bot,
+        "menu_cache": menu_cache,
         "states": states,
         "ui": ui,
         "apikey_menu": apikey_menu,
@@ -88,6 +89,8 @@ def _setup(m) -> ApiRecorder:
         })
 
     m["config"].update(_reset)
+    since = m["menu_cache"].month_start_ts()
+    m["menu_cache"].PERIOD_STATS.store(("period", int(since)), {})
     recorder = ApiRecorder()
     m["ui"].api = recorder
     return recorder

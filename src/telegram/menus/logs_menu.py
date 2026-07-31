@@ -13,6 +13,7 @@ callback_data：
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from ... import config, log_db, oauth_manager
@@ -651,11 +652,85 @@ def _append_round_detail(lines: list[str], p: dict, *, nested: bool = True) -> N
         )
 
 
+_BILLING_COMPONENTS = (
+    ("input_tokens", "input_per_token", "输入"),
+    ("output_tokens", "output_per_token", "输出"),
+    ("cache_creation_tokens", "cache_write_per_token", "缓存写入"),
+    ("cache_read_tokens", "cache_read_per_token", "缓存读取"),
+)
+
+
+def _fmt_price_per_million(price_per_token: object) -> str | None:
+    try:
+        value = Decimal(str(price_per_token)) * Decimal(1_000_000)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    text = format(value, ",f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"${text}/M"
+
+
+def _attempt_cost_formula(attempt: dict) -> str | None:
+    if str(attempt.get("cost_source") or "") != "estimated":
+        return None
+    try:
+        snapshot = json.loads(attempt.get("pricing_snapshot_json") or "")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+
+    terms: list[str] = []
+    for token_key, price_key, label in _BILLING_COMPONENTS:
+        try:
+            tokens = int(attempt.get(token_key) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        price = _fmt_price_per_million(snapshot.get(price_key))
+        if tokens > 0 and price is not None and price != "$0/M":
+            terms.append(f"{label} {tokens:,} × {price}")
+    return " + ".join(terms) or None
+
+
+def _billing_detail_lines(cost_metrics: dict, attempts: list[dict]) -> list[str]:
+    total = ui.fmt_cost(cost_metrics, decimal_places=3)
+    priced = [
+        row for row in attempts
+        if isinstance(row, dict)
+        and row.get("cost_ticks") is not None
+        and str(row.get("cost_source") or "") in {"actual", "estimated"}
+    ]
+    if len(priced) == 1:
+        formula = _attempt_cost_formula(priced[0])
+        return [f"💵 {total}" + (f" = {formula}" if formula else "")]
+
+    lines = [f"💵 {total}"]
+    for index, row in enumerate(priced, start=1):
+        try:
+            ticks = max(0, int(row.get("cost_ticks") or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        amount = ui.fmt_usd(
+            Decimal(ticks) / Decimal(10_000_000_000), decimal_places=3,
+        )
+        order = row.get("attempt_order") or index
+        line = f"  尝试 {order}: {amount}"
+        formula = _attempt_cost_formula(row)
+        if formula:
+            line += f" = {formula}"
+        lines.append(line)
+    return lines
+
+
 def _render_detail(detail: dict) -> str:
     log = detail.get("log") or {}
     chain = detail.get("retry_chain") or []
     proxy_chain = detail.get("proxy_chain") or []
     local_web_log = detail.get("local_web_log") or []
+    billing_attempts = detail.get("billing_attempts") or []
 
     rid = _detail_inline(log.get("request_id"))
     created = ui.fmt_bjt_ts(log.get("created_at"), "%Y-%m-%d %H:%M:%S")
@@ -713,13 +788,15 @@ def _render_detail(detail: dict) -> str:
         token_line = f"↑ {ui.fmt_tokens(ui.prompt_total_from_row(log))} | ↓ {ui.fmt_tokens(log.get('output_tokens'))}"
         if (log.get("cache_read_tokens") or 0) > 0:
             token_line += f" | {ui.fmt_cache_phrase_from_row(log)}"
-        token_line += f" | 💵 {ui.fmt_cost(cost_metrics)}"
         lines.append(token_line)
+        lines.extend(["", "<b>计费</b>"])
+        lines.extend(_billing_detail_lines(cost_metrics, billing_attempts))
     elif status in ("error", "cancelled") and (
         int(cost_metrics.get("costed_success") or 0) > 0
         or int(cost_metrics.get("unpriced_success") or 0) > 0
     ):
-        lines.extend(["", "<b>计费</b>", f"💵 {ui.fmt_cost(cost_metrics)}"])
+        lines.extend(["", "<b>计费</b>"])
+        lines.extend(_billing_detail_lines(cost_metrics, billing_attempts))
 
     lines.extend(["", "<b>请求总览</b>"])
     if log.get("final_round_id"):

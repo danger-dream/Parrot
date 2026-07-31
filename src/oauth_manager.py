@@ -2747,8 +2747,8 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
             line = f"💎 月度统计: ↑ {cache_display.fmt_tokens(prompt)} · ↓ {cache_display.fmt_tokens(ts['output'])}"
             if (ts.get("cache_read") or 0) > 0:
                 line += f" · {cache_display.cache_read_phrase(ts['cache_read'], prompt)}"
-            line += f" · 💵 {telegram_ui.fmt_cost(ts)}"
             parts.append(line)
+            parts.append(f"💵 {telegram_ui.fmt_cost(ts)}")
     except Exception as exc:
         print(f"[oauth] monthly stats lookup failed: {exc}")
     return "\n".join(parts)

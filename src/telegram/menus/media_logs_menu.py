@@ -365,7 +365,7 @@ def _render_detail(row: dict) -> str:
         lines.append(f"{label}: <code>{_fmt_ms(row.get('duration_ms'))}</code>")
     cost = _fmt_cost_ticks(row.get("cost_usd_ticks"))
     if cost != "-":
-        lines.append(f"实际费用: <code>{cost}</code>")
+        lines.append(f"金额: <code>{cost}</code>")
     if row.get("http_status"):
         lines.append(f"HTTP 状态: <code>{_int(row.get('http_status'))}</code>")
     if row.get("upstream_status"):

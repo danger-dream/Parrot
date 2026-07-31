@@ -29,11 +29,11 @@ def _import_modules():
     if root not in sys.path:
         sys.path.insert(0, root)
     from src import config, log_db, oauth_manager, state_db
-    from src.telegram import bot, states, ui
+    from src.telegram import bot, menu_cache, states, ui
     from src.telegram.menus import logs_menu, stats_menu, proxy_menu
     return {
         "config": config, "log_db": log_db, "oauth_manager": oauth_manager, "state_db": state_db,
-        "bot": bot, "states": states, "ui": ui,
+        "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
         "logs_menu": logs_menu, "stats_menu": stats_menu, "proxy_menu": proxy_menu,
     }
 
@@ -45,8 +45,18 @@ class ApiRecorder:
         self.calls.append((method, dict(data) if data else {}))
         return {"ok": True, "result": {}}
     def by(self, m): return [d for mm, d in self.calls if mm == m]
-    def last(self, m):
-        l = self.by(m); return l[-1] if l else None
+    def last(self, method):
+        deadline = time.time() + 5
+        while True:
+            calls = self.by(method)
+            item = calls[-1] if calls else None
+            text = str((item or {}).get("text") or "")
+            loading = any(marker in text for marker in (
+                "正在加载，完成后", "统计正在加载", "统计加载中", "历史统计加载中",
+            ))
+            if not loading or time.time() >= deadline:
+                return item
+            time.sleep(0.01)
     def clear(self):
         self.calls.clear()
 
@@ -92,7 +102,20 @@ def _setup(m):
     m["states"].clear_all()
 
 
+def _seed_stats_snapshots(m) -> None:
+    """测试显式模拟中央预热及 3/7 天低频队列已完成。"""
+    stats = m["stats_menu"]
+    cache = m["menu_cache"]
+    for period in ("0", "3", "7", "month"):
+        since = stats._since_ts(period)
+        cache.PERIOD_STATS.store(
+            stats._period_cache_key(period, since),
+            m["log_db"].stats_period_snapshot(since),
+        )
+
+
 def _install_recorder(m):
+    _seed_stats_snapshots(m)
     rec = ApiRecorder()
     m["ui"].api = rec
     return rec
@@ -171,13 +194,13 @@ def test_fmt_helpers(m):
         "cost_ticks": 123_450_000_000,
         "costed_success": 1,
         "unpriced_success": 2,
-    }) == "$12.35 · 2 次未计价"
+    }) == "$12.35"
     assert ui.fmt_cost({
         "cost_ticks": 123_450_000_000,
         "estimated_cost_ticks": 123_450_000_000,
         "estimated_costed_success": 1,
         "costed_success": 1,
-    }) == "估算 $12.35"
+    }) == "$12.35"
     assert ui.fmt_cost({
         "cost_ticks": 150_000_000_000,
         "actual_cost_ticks": 50_000_000_000,
@@ -185,7 +208,7 @@ def test_fmt_helpers(m):
         "actual_costed_success": 1,
         "estimated_costed_success": 2,
         "costed_success": 3,
-    }) == "$15.00（实际 $5.00 + 估算 $10.00）"
+    }) == "$15.00"
     assert "≈" not in ui.fmt_cost({
         "cost_ticks": 123_450_000_000,
         "estimated_cost_ticks": 123_450_000_000,
@@ -232,7 +255,8 @@ def test_stats_overall(m):
     # 亲和命中率（2/5 = 40%），缓存 token 率（1400/3250 = 43.1%）
     assert "40.0%" in text
     assert "缓存 1.4K (43.1%)" in text
-    assert " · 💵 " in text
+    assert "累计金额 " in text
+    assert " · 💵 " not in text
     assert "≈" not in text
     assert "cache" not in text
     print("  [PASS] stats overall with counts + flags")
@@ -274,7 +298,12 @@ def test_stats_cost_estimate_and_unknown_coverage(m):
     rec = _install_recorder(m)
     m["stats_menu"].show(42, 100, "cb")
     text = rec.last("editMessageText")["text"]
-    assert "💵 估算 $68.50" in text
+    assert "累计金额 $68.500" in text
+    assert "账号/渠道类型:" not in text
+    assert "估算" not in text and "实际" not in text and "未计价" not in text
+    assert "↑ 3.0M · ↓ 1.0M · 💵" not in text
+    assert "Token: ↑ 3.0M · ↓ 1.0M · 缓存 1.0M (33.3%) · $68.500" in text
+    assert "\n  金额:" not in text
     assert "≈" not in text
 
 
@@ -305,7 +334,7 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
     assert overall["costed_success"] == 1
     assert overall["unpriced_success"] == 0
     row = m["log_db"].recent_logs(limit=1)[0]
-    assert m["ui"].fmt_cost_from_row(row) == "实际 $0.01"
+    assert m["ui"].fmt_cost_from_row(row) == "$0.01"
 
     rec = _install_recorder(m)
     m["stats_menu"].show(42, 100, "cb")
@@ -314,7 +343,7 @@ def test_stats_prefers_xai_actual_cost_ticks(m):
     assert "≈" not in text
 
 
-def test_stats_labels_mixed_actual_and_estimated_cost(m):
+def test_stats_ui_combines_actual_and_estimated_cost(m):
     _setup(m)
     _insert_success(
         m,
@@ -345,7 +374,7 @@ def test_stats_labels_mixed_actual_and_estimated_cost(m):
     assert overall["cost_ticks"] == 10_000_000_000
     assert overall["actual_costed_success"] == 1
     assert overall["estimated_costed_success"] == 1
-    assert m["ui"].fmt_cost(overall) == "$1.00（实际 $0.50 + 估算 $0.50）"
+    assert m["ui"].fmt_cost(overall) == "$1.00"
 
 
 def test_stats_downstream_fast_intent_does_not_invent_priority_pricing(m):
@@ -423,7 +452,7 @@ def test_ambiguous_legacy_cached_usage_is_explicitly_unpriced(m):
     assert result["overall"]["costed_success"] == 0
     assert result["overall"]["unpriced_success"] == 1
     row = m["log_db"].recent_logs(limit=1)[0]
-    assert m["ui"].fmt_cost_from_row(row) == "未计价（1 次）"
+    assert m["ui"].fmt_cost_from_row(row) == "$0.00"
 
 
 def test_ambiguous_anthropic_cache_write_ttl_does_not_hide_other_costs(m):
@@ -489,7 +518,7 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     assert m["log_db"].cost_for_log(row)["cost_ticks"] == expected
     detail = m["log_db"].log_detail("cost-everywhere")
     assert m["log_db"].cost_for_log(detail["log"])["cost_ticks"] == expected
-    assert m["ui"].fmt_cost_from_row(row) == "估算 $68.50"
+    assert m["ui"].fmt_cost_from_row(row) == "$68.50"
 
     # OAuth token 刷新通知也是 Telegram 展示面，月度缓存旁必须有金额。
     _insert_success(
@@ -507,7 +536,8 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     notice = m["oauth_manager"]._build_refresh_notice(
         "openai:notice@example.test:acct", usage_flat=None,
     )
-    assert "缓存 1.0M (33.3%) · 💵 估算 $68.50" in notice
+    assert "缓存 1.0M (33.3%)\n💵 $68.50" in notice
+    assert "缓存 1.0M (33.3%) · 💵" not in notice
     assert "≈" not in notice
 
     # 金额与缓存命中是独立维度；无 cache_read 时仍必须展示金额。
@@ -526,7 +556,7 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     no_cache_notice = m["oauth_manager"]._build_refresh_notice(
         "openai:no-cache@example.test:acct", usage_flat=None,
     )
-    assert "月度统计: ↑ 1.0M · ↓ 1.0M · 💵 估算 $55.00" in no_cache_notice
+    assert "月度统计: ↑ 1.0M · ↓ 1.0M\n💵 $55.00" in no_cache_notice
 
     # 一个账号仅承担 failover 的前置已计费 attempt 时，request_log 的最终
     # channel total 为 0；通知仍不能因此隐藏它的 Token/金额。
@@ -578,7 +608,47 @@ def test_cost_available_to_all_request_and_window_cache_surfaces(m):
     attempt_notice = m["oauth_manager"]._build_refresh_notice(
         "openai:attempt-only@example.test:acct", usage_flat=None,
     )
-    assert "月度统计: ↑ 1.0M · ↓ 1.0M · 💵 估算 $11.00" in attempt_notice
+    assert "月度统计: ↑ 1.0M · ↓ 1.0M\n💵 $11.00" in attempt_notice
+
+
+def test_log_detail_shows_three_decimal_cost_formula_from_frozen_attempt(m):
+    _setup(m)
+    ld = m["log_db"]
+    handle = ld.insert_pending(
+        "cost-formula", "127.0.0.1", "priced-key", "gpt-5.6-sol", True,
+        msg_count=1, tool_count=0, request_headers={},
+        request_body={"model": "gpt-5.6-sol"}, ingress_protocol="responses",
+    )
+    attempt = ld.record_retry_attempt(
+        handle, 1, "api:Priced", "api", "gpt-5.6-sol", time.time(),
+        upstream_protocol="openai-responses",
+    )
+    ld.mark_retry_attempt_dispatch(attempt, {"model": "gpt-5.6-sol"})
+    body = json.dumps({
+        "usage": {
+            "input_tokens": 258_000,
+            "output_tokens": 1_200,
+            "input_tokens_details": {"cached_tokens": 254_700},
+        }
+    })
+    ld.finish_success(
+        handle, "api:Priced", "api", "gpt-5.6-sol",
+        input_tokens=3_300, output_tokens=1_200,
+        cache_creation_tokens=0, cache_read_tokens=254_700,
+        response_body=body, upstream_protocol="openai-responses",
+        usage_observed=True,
+    )
+    ld.update_retry_attempt(attempt, outcome="success", ended_at=time.time())
+
+    detail = ld.log_detail("cost-formula")
+    assert len(detail["billing_attempts"]) == 1
+    text = m["logs_menu"]._render_detail(detail)
+    assert "<b>计费</b>" in text
+    assert (
+        "💵 $0.180 = 输入 3,300 × $5/M + 输出 1,200 × $30/M"
+        " + 缓存读取 254,700 × $0.5/M"
+    ) in text
+    assert "\n💵 $0.18\n" not in text
 
 
 def test_cache_miss_write_sample_includes_request_cost(m):
@@ -596,7 +666,8 @@ def test_cache_miss_write_sample_includes_request_cost(m):
     )
     summary = m["log_db"].stats_summary(0)
     text = m["stats_menu"]._section_cache_misses(summary["recent_cache_misses"])
-    assert "写 1.0M · 💵 估算 $67.50" in text
+    assert "写 1.0M · msgs 3 · tools 0\n  💵 $67.50" in text
+    assert "写 1.0M · 💵" not in text
     assert "≈" not in text
 
 
@@ -642,7 +713,8 @@ def test_stats_group_by_channel(m):
     assert ">A<" in text and ">B<" in text   # <code>A</code> / <code>B</code>
     assert "命中请求" in text
     assert "缓存 100 (31.2%)" in text
-    assert " · 💵 " in text
+    assert "累计金额 " in text
+    assert " · 💵 " not in text
     # 当前选中维度按钮应有 ✓ 标记
     btns_labels = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row if "text" in b]
     assert any("渠道 ✓" in l for l in btns_labels)
@@ -714,7 +786,11 @@ def test_logs_list(m):
     assert "down" in text
 
     assert "最近日志 · 请求日志 · 第 1/1 页 · 共 3 条" in text
-    assert "Token: ↑ 160 · ↓ 20 · 缓存 50 (31.2%) · " in text
+    compact_log_lines = [line for line in text.splitlines() if "Token: ↑ 160 · ↓ 20" in line]
+    assert compact_log_lines
+    assert all("缓存 50 (31.2%) · " in line for line in compact_log_lines)
+    assert all("$" in line for line in compact_log_lines)
+    assert "金额:" not in text
     assert "💵" not in text
     assert "耗时: 连接 150ms · 首字 600ms · 总 3.0s" in text
 

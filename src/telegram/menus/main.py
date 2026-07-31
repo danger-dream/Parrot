@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from ... import __version__, affinity, concurrency, config, load_balancing, log_db, oauth_manager, public_ip, state_db
+from ... import __version__, affinity, concurrency, config, load_balancing, oauth_manager, public_ip, state_db
 from ...oauth_ids import account_key as _account_key
 from ...channel import registry
-from .. import ui
+from .. import menu_cache, ui
 
 
 def _kb() -> dict:
@@ -26,13 +26,6 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
     # 使用 oauth_manager.list_accounts() 作为唯一数据源。
     # Claude/OpenAI 走窗口配额；Grok/xAI 走官方月度 billing percent。
     accounts = oauth_manager.list_accounts()
-    account_keys = [
-        _account_key(a) for a in accounts
-        if a.get("email") and not a.get("disabled_reason")
-        and oauth_manager.provider_of(a) in ("claude", "openai", "xai")
-    ]
-    if account_keys:
-        oauth_manager.ensure_quota_fresh_sync(account_keys)
     n = 0
     for acc in accounts:
         email = acc.get("email")
@@ -67,8 +60,8 @@ def _first_run_banner() -> str:
     )
 
 
-def _overview() -> str:
-    """主菜单顶部的服务一览。"""
+def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = False) -> str:
+    """主菜单顶部的服务一览；慢统计只能来自进程内快照。"""
     cfg = config.get()
     oauth_accounts = cfg.get("oauthAccounts") or []
     api_channels = cfg.get("channels") or []
@@ -139,7 +132,7 @@ def _overview() -> str:
     lines.append("─" * 18)
     lines.extend(_address_block(port))
     lines.append("")
-    lines.extend(_lifetime_stats_block())
+    lines.extend(_lifetime_stats_block(lifetime_stats, loading=lifetime_loading))
 
     return "\n".join(lines)
 
@@ -177,27 +170,25 @@ def _address_block(port: int) -> list[str]:
     return out
 
 
-def _lifetime_stats_block() -> list[str]:
-    """累计统计：每次显示主菜单都现查（跨所有月份的 logs/*.db）。"""
-    try:
-        s = log_db.stats_lifetime()
-    except Exception:
+def _lifetime_stats_block(s: dict | None = None, *, loading: bool = False) -> list[str]:
+    """累计统计：只渲染缓存快照，绝不在 polling 线程查库。"""
+    if s is None:
         s = {"total": 0, "input_tokens": 0, "output_tokens": 0,
              "cache_creation": 0, "cache_read": 0}
     total_in = ui.prompt_total(s.get("input_tokens"), s.get("cache_creation"), s.get("cache_read"))
     out_tok = s.get("output_tokens") or 0
-    lines = [
-        "📊 <b>累计统计</b>",
-        f"  总调用 <code>{s.get('total', 0):,}</code> 次",
+    token_line = (
         f"  总 Tokens <code>{ui.fmt_tokens(total_in + out_tok)}</code> "
         f"(↑ {ui.fmt_tokens(total_in)} ↓ {ui.fmt_tokens(out_tok)})"
-        f" · 💵 {ui.fmt_cost(s)}",
-    ]
+    )
     if (s.get("cache_read") or 0) > 0:
-        lines.append(
-            f"  {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}"
-        )
-    return lines
+        token_line += f" · {ui.fmt_cache_phrase(s.get('cache_read'), total_in)}"
+    return [
+        "📊 <b>累计统计</b>",
+        f"  总调用 <code>{s.get('total', 0):,}</code> 次",
+        token_line,
+        f"  累计金额 {ui.fmt_cost(s)}",
+    ]
 
 
 def _maybe_suffix_status_banner(text: str) -> str:
@@ -229,7 +220,7 @@ def _maybe_suffix_status_banner(text: str) -> str:
     return text + "\n\n" + "\n".join(extras)
 
 
-def _compose_text() -> str:
+def _compose_text(lifetime_stats: dict | None = None, *, lifetime_loading: bool = False) -> str:
     cfg = config.get()
     empty = (
         not (cfg.get("oauthAccounts") or [])
@@ -238,17 +229,28 @@ def _compose_text() -> str:
     )
     if empty:
         return _maybe_suffix_status_banner(_first_run_banner())
-    return _maybe_suffix_status_banner(_overview())
+    return _maybe_suffix_status_banner(
+        _overview(lifetime_stats, lifetime_loading=lifetime_loading)
+    )
 
 
 def show(chat_id: int) -> None:
-    """命令入口：send 一条新消息。"""
-    ui.send(chat_id, _compose_text(), reply_markup=_kb())
+    """命令入口：有快照就完整发送；冷启动只发送简短提示。"""
+    lifetime = menu_cache.LIFETIME_STATS.peek("lifetime")
+    if lifetime.value is None:
+        ui.send(chat_id, menu_cache.initialization_text())
+        return
+    ui.send(chat_id, _compose_text(lifetime.value), reply_markup=_kb())
 
 
-def show_edit(chat_id: int, message_id: int) -> None:
-    """回调入口：edit 同一条消息。"""
-    ui.edit(chat_id, message_id, _compose_text(), reply_markup=_kb())
+def show_edit(chat_id: int, message_id: int) -> bool:
+    """回调入口：只用最近成功快照一次性渲染，冷缓存保持原页。"""
+    lifetime = menu_cache.LIFETIME_STATS.peek("lifetime")
+    if lifetime.value is None:
+        return False
+    menu_cache.begin_view(chat_id, message_id)
+    ui.edit(chat_id, message_id, _compose_text(lifetime.value), reply_markup=_kb())
+    return True
 
 
 def welcome(chat_id: int) -> None:
@@ -281,5 +283,7 @@ def on_menu_command(chat_id: int) -> None:
 # ─── 回调：回到主菜单 ─────────────────────────────────────────────
 
 def handle_back(chat_id: int, message_id: int, cb_id: str) -> None:
+    if not show_edit(chat_id, message_id):
+        ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
     ui.answer_cb(cb_id)
-    show_edit(chat_id, message_id)

@@ -12,13 +12,11 @@ callback_data：`stats:view:<period>:<dim>`
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
 
 from ... import concurrency, config, log_db
-from .. import ui
+from .. import menu_cache, ui
 
 
-_BJT = timezone(timedelta(hours=8))
 _VALID_PERIODS = ("0", "3", "7", "month")
 _VALID_DIMS = ("all", "channel", "model", "apikey")
 
@@ -27,18 +25,15 @@ _DIM_LABELS = {"all": "汇总", "channel": "按渠道", "model": "按模型", "a
 
 
 def _since_ts(period: str) -> float:
-    now = time.time()
     if period == "0":
-        today = datetime.now(_BJT).replace(hour=0, minute=0, second=0, microsecond=0)
-        return today.timestamp()
+        return menu_cache.today_start_ts()
     if period == "month":
-        month_start = datetime.now(_BJT).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return month_start.timestamp()
+        return menu_cache.month_start_ts()
     try:
         days = int(period)
     except Exception:
         days = 3
-    return now - days * 86400
+    return time.time() - days * 86400
 
 
 # ─── 共用渲染片段 ─────────────────────────────────────────────────
@@ -56,8 +51,8 @@ def _ch_short_name(key: str) -> str:
     return ui.channel_display_name(key, with_family=True)
 
 
-def _fmt_cost(metrics: dict) -> str:
-    return ui.fmt_cost(metrics)
+def _fmt_cost(metrics: dict, *, decimal_places: int = 2) -> str:
+    return ui.fmt_cost(metrics, decimal_places=decimal_places)
 
 
 def _section_overall(overall: dict) -> str:
@@ -88,7 +83,6 @@ def _section_overall(overall: dict) -> str:
     token_line = f"↑ {ui.fmt_tokens(total_inp)} | ↓ {ui.fmt_tokens(raw_out)}"
     if raw_cr > 0:
         token_line += f" | {ui.fmt_cache_phrase(raw_cr, total_inp)}"
-    token_line += f" | 💵 {_fmt_cost(overall)}"
 
     lines = [
         "<b>Tokens:</b>",
@@ -120,6 +114,11 @@ def _section_overall(overall: dict) -> str:
             "<b>亲和:</b>",
             f"命中率 {ui.fmt_rate(affinity_hits, total)} ({affinity_hits}/{total})",
         ]
+    lines += [
+        "",
+        "<b>金额:</b>",
+        f"累计金额 {_fmt_cost(overall)}",
+    ]
     return "\n".join(lines)
 
 
@@ -154,51 +153,6 @@ def _render_model_channels(items: list[dict], limit: int = 3) -> str:
     return line
 
 
-def _channel_provider_bucket(channel_key: str) -> str:
-    key = str(channel_key or "")
-    if key.startswith("oauth:"):
-        try:
-            from ...oauth_ids import provider_from_channel_key
-            prov = provider_from_channel_key(key)
-        except Exception:
-            prov = ""
-        if prov == "xai":
-            return f"{ui.provider_tag('xai')} OAuth"
-        if prov == "openai":
-            return f"{ui.provider_tag('openai')} OAuth"
-        if prov == "claude":
-            return f"{ui.provider_tag('claude')} OAuth"
-        return "🔐 OAuth"
-    if key.startswith("api:"):
-        return "🔀 API 渠道"
-    return "其他"
-
-
-def _provider_split_line_from_channels(groups: list[dict]) -> str:
-    totals: dict[str, int] = {}
-    for g in groups or []:
-        k = g.get("key") or "?"
-        if k == "?":
-            continue
-        label = _channel_provider_bucket(k)
-        total = int(((g.get("metrics") or {}).get("total")) or 0)
-        if total <= 0:
-            continue
-        totals[label] = totals.get(label, 0) + total
-    if not totals:
-        return ""
-    order = [
-        f"{ui.provider_tag('openai')} OAuth",
-        f"{ui.provider_tag('xai')} OAuth",
-        "🔀 API 渠道",
-        f"{ui.provider_tag('claude')} OAuth",
-        "🔐 OAuth",
-        "其他",
-    ]
-    parts = [f"{label} {totals[label]} 次" for label in order if totals.get(label)]
-    return "账号/渠道类型: " + " · ".join(parts)
-
-
 def _summary_dim_block(title: str, groups: list[dict], render_key,
                        extra_line=None) -> str:
     """汇总视图里某个维度的 Top 块（紧凑两行/条）。
@@ -224,12 +178,12 @@ def _summary_dim_block(title: str, groups: list[dict], render_key,
         )
         if cr > 0:
             line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
-        line += f" · 💵 {_fmt_cost(m)}"
         out.append(line)
         if extra_line is not None:
             extra = extra_line(g["key"])
             if extra:
                 out.append(f"  {extra}")
+        out.append(f"  累计金额 {_fmt_cost(m)}")
     return "\n".join(out)
 
 
@@ -269,7 +223,6 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key,
         token_line = f"  ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
         if cr > 0:
             token_line += f" · {ui.fmt_cache_phrase(cr, prompt)}"
-        token_line += f" · 💵 {_fmt_cost(m)}"
         out.append(token_line)
         out.append(f"  命中请求 {hit}/{succ} ({ui.fmt_rate(hit, succ)})")
         if avg_conn is not None or avg_first is not None:
@@ -279,6 +232,7 @@ def _expanded_dim_block(title: str, groups: list[dict], render_key,
                 f"  ⚡ TPS: 平均 {ui.fmt_tps(avg_tps)} · "
                 f"峰值 {ui.fmt_tps(max_tps)} · 最低 {ui.fmt_tps(min_tps)}"
             )
+        out.append(f"  累计金额 {_fmt_cost(m)}")
     return "\n".join(out)
 
 
@@ -299,9 +253,10 @@ def _section_cache_misses(misses: list[dict]) -> str:
         out.append(f"\n<code>[{ts}]</code> {model} / {key}")
         out.append(f"  渠道: <code>{ch_disp}</code>")
         out.append(
-            f"  ↑{ui.fmt_tokens(inp)} · 写 {ui.fmt_tokens(write)} · "
-            f"💵 {ui.fmt_cost_from_row(r)} · msgs {msgs} · tools {tools}"
+            f"  ↑{ui.fmt_tokens(inp)} · 写 {ui.fmt_tokens(write)}"
+            f" · msgs {msgs} · tools {tools}"
         )
+        out.append(f"  💵 {ui.fmt_cost_from_row(r)}")
     return "\n".join(out)
 
 
@@ -361,11 +316,10 @@ def _section_overall_compact(overall: dict) -> str:
         + (f" · ⏳ {pend}" if pend else "")
         + f" · 成功率 {ui.fmt_rate(succ, total)}",
     ]
-    # Tokens 行
+    # Tokens 行；金额由家族区块在运行指标之后单独展示。
     lines.append(
         f"↑ {ui.fmt_tokens(total_inp)} · ↓ {ui.fmt_tokens(raw_out)}"
         + (f" · {ui.fmt_cache_phrase(raw_cr, total_inp)}" if raw_cr else "")
-        + f" · 💵 {_fmt_cost(overall)}"
     )
     # 耗时 / 速度
     timing_bits = []
@@ -401,10 +355,7 @@ def _section_family(family: str, result: dict,
 
     tag = ui.family_tag(family)
     parts = [f"<b>{tag}</b>", _section_overall_compact(overall)]
-    if family == "openai":
-        split = _provider_split_line_from_channels(result.get("by_channel") or [])
-        if split:
-            parts.append(split)
+    parts.append(f"累计金额 {_fmt_cost(overall, decimal_places=3)}")
 
     if show_by_channel:
         by_channel = _strip_unknown(result.get("by_channel") or [])
@@ -683,72 +634,90 @@ def _maybe_suffix_status_banner(text: str) -> str:
     return text + "\n\n" + "\n".join(extras)
 
 
-def _compose(period: str, dim: str) -> tuple[str, dict]:
-    """统一渲染：返回 (text, kb)。失败时返回错误页 (text, kb)。"""
+def _slice_result(result: dict, dim: str, *, family: bool = False) -> dict:
+    """从完整 period 快照切出旧 UI 所需的 Top 3 / Top 10。"""
+    out = dict(result or {})
+    for name, dim_name in (
+        ("by_channel", "channel"), ("by_model", "model"), ("by_apikey", "apikey"),
+    ):
+        limit = 3 if family or dim == "all" or dim != dim_name else 10
+        out[name] = list((result or {}).get(name) or [])[:limit]
+    return out
+
+
+def _compose_snapshot(snapshot: dict, period: str, dim: str) -> tuple[str, dict]:
     if period not in _VALID_PERIODS:
         period = "0"
     if dim not in _VALID_DIMS:
         dim = "all"
-    since = _since_ts(period)
-    try:
-        # 汇总视图：所有维度只取 Top 3；专题视图：对应维度展开 Top 10
-        result = log_db.stats_summary(
-            since_ts=since,
-            group_by=(None if dim == "all" else dim),
-            summary_top_limit=3,
-            group_limit=10,
-        )
-    except Exception as exc:
-        return (
-            f"❌ 统计查询失败: <code>{ui.escape_html(str(exc))}</code>",
-            ui.inline_kb([ui.back_to_main_row()]),
-        )
-    # "按模型 Top"/专题需要补 model → 渠道列表
-    model_channels: dict[str, list[dict]] = {}
-    if dim in ("all", "model"):
-        try:
-            model_channels = log_db.channels_by_requested_model(since)
-        except Exception as exc:
-            print(f"[stats] channels_by_requested_model failed: {exc}")
-            model_channels = {}
-
-    # 汇总视图：额外跑两次 family 聚合（含完整 overall / by_channel / by_model），
-    # 同时算出每个 api_key 在两家族的次数拆分，供 Key Top 展示小字。
-    family_results: dict = {}
-    key_family_split: dict = {}
+    result = _slice_result(snapshot.get("summary") or {}, dim)
+    model_channels = snapshot.get("model_channels") or {}
+    family_results = {
+        fam: _slice_result(value or {}, dim, family=True)
+        for fam, value in (snapshot.get("families") or {}).items()
+    }
+    key_family_split: dict[str, list[int]] = {}
     if dim == "all":
         for fam in ("anthropic", "openai"):
-            try:
-                family_results[fam] = log_db.stats_summary(
-                    since_ts=since, family=fam, summary_top_limit=3,
-                )
-            except Exception as exc:
-                print(f"[stats] family={fam} failed: {exc}")
-                family_results[fam] = None
-        # 计算每个 Key 在两家族的请求数
-        for fam in ("anthropic", "openai"):
-            fr = family_results.get(fam) or {}
-            for g in (fr.get("by_apikey") or []):
-                k = g.get("key") or "?"
-                if k == "?":
+            for group in (family_results.get(fam) or {}).get("by_apikey") or []:
+                key = group.get("key") or "?"
+                if key == "?":
                     continue
-                cur = key_family_split.setdefault(k, [0, 0])  # [anthropic, openai]
-                cur[0 if fam == "anthropic" else 1] = int((g.get("metrics") or {}).get("total") or 0)
-
+                current = key_family_split.setdefault(key, [0, 0])
+                current[0 if fam == "anthropic" else 1] = int(
+                    (group.get("metrics") or {}).get("total") or 0
+                )
     text = (
-        _render_overall(result, period, model_channels,
-                        family_results=family_results,
-                        key_family_split=key_family_split) if dim == "all"
+        _render_overall(
+            result, period, model_channels,
+            family_results=family_results,
+            key_family_split=key_family_split,
+        )
+        if dim == "all"
         else _render_expanded(result, period, dim, model_channels)
     )
     return ui.truncate(text), _kb(period, dim)
 
 
+def _period_cache_key(period: str, since: float) -> tuple:
+    if period in ("0", "month"):
+        return "period", int(since)
+    return "rolling-period", period
+
+
+def _error_page(exc: Exception) -> tuple[str, dict]:
+    return (
+        f"❌ 统计查询失败: <code>{ui.escape_html(str(exc))}</code>",
+        ui.inline_kb([ui.back_to_main_row()]),
+    )
+
+
 def view(chat_id: int, message_id: int, cb_id: str,
          period: str = "0", dim: str = "all") -> None:
+    period = period if period in _VALID_PERIODS else "0"
+    dim = dim if dim in _VALID_DIMS else "all"
+    since = _since_ts(period)
+    key = _period_cache_key(period, since)
+    cached = menu_cache.PERIOD_STATS.peek(key)
+    if cached.value is None:
+        # 今日/本月由主动预热负责；3/7 天只排入同一个串行队列。
+        if period not in ("0", "month"):
+            menu_cache.PERIOD_STATS.request(
+                key, lambda: log_db.stats_period_snapshot(since),
+            )
+            ui.answer_cb(cb_id, "统计正在准备，请稍后再试")
+        else:
+            ui.answer_cb(cb_id, menu_cache.initialization_text())
+        return
+
     ui.answer_cb(cb_id)
-    text, kb = _compose(period, dim)
+    menu_cache.begin_view(chat_id, message_id)
+    text, kb = _compose_snapshot(cached.value, period, dim)
     ui.edit(chat_id, message_id, _maybe_suffix_status_banner(text), reply_markup=kb)
+    if period not in ("0", "month") and not cached.fresh:
+        menu_cache.PERIOD_STATS.request(
+            key, lambda: log_db.stats_period_snapshot(since),
+        )
 
 
 def show(chat_id: int, message_id: int, cb_id: str) -> None:
@@ -756,8 +725,14 @@ def show(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def send_new(chat_id: int) -> None:
-    """命令入口：直接 send 一条新消息。"""
-    text, kb = _compose("0", "all")
+    """命令入口：有今日快照就完整发送；冷启动不安排二次编辑。"""
+    period, dim = "0", "all"
+    since = _since_ts(period)
+    cached = menu_cache.PERIOD_STATS.peek(_period_cache_key(period, since))
+    if cached.value is None:
+        ui.send(chat_id, menu_cache.initialization_text())
+        return
+    text, kb = _compose_snapshot(cached.value, period, dim)
     ui.send(chat_id, _maybe_suffix_status_banner(text), reply_markup=kb)
 
 

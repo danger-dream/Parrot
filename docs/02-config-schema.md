@@ -380,7 +380,7 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 
 新请求在每次上游尝试 dispatch 时按真实 scope、客户端可见 model 和出站真实 model 解析有效元数据绑定，并冻结其 models.dev provider/model、费率与目录版本；之后配置或目录更新不会重算该结算。没有有效绑定或绑定记录没有可用 Token 价格时保持 `unpriced`。只有没有尝试账本的历史请求才会按当前有效绑定做兼容估算。xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该次尝试的真实上游金额。长上下文阶梯按**单次请求**的 `input + cache creation + cache read` 判断；当前结算结构只支持一档 context tier，目录若为同一模型提供多档阈值则该模型 fail-closed 为未计价。`experimental.modes.fast.cost` 是完整替换价，不与标准长上下文价叠加；没有响应/真实出站 fast 事实时不会从下游 intent 臆测加速价，实际为 priority/fast 但目录没有对应 tariff、或上游返回 `flex` 等未知计费档位时同样保持未计价。数据库只保存缓存写入总 Token、没有保存 Anthropic 5 分钟 / 1 小时 TTL 拆分，因此 Claude 请求只要包含 cache creation 就标记为“未计价”。目录若要求单独计费 reasoning/audio Token、但价格与聚合 input/output 不同，也会保持未计价，避免用缺失的 Token 维度生成假精确金额。
 
-Telegram 界面统一显示为两位小数且不加约等号，并区分“实际”“估算”和两者混合金额；所有展示 Token 缓存的统计/日志位置都会同步显示金额。models.dev 价格与 xAI 实际费用均以 USD 计价，因此 Parrot 不做实时汇率换算。无绑定、绑定失效或目录无价格的模型会计入“未计价”请求数，不会按 `$0` 混入总金额。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，Parrot 会将该请求标记为“未计价”，避免重复收费。
+Telegram 界面只显示合并后的 USD 金额，不展示金额来源分类或未计价次数；统计页面保留两位小数，最近日志紧凑列表保留三位小数，均不加约等号。models.dev 计价结果与 xAI 上游金额会直接合并到同一个总额，内部仍保留各自结算来源及无法计价记录，以保证账本和聚合口径不变。Parrot 不做实时汇率换算。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，内部不会把它作为已知金额计入总额。
 
 ### 超时语义（关键）
 
