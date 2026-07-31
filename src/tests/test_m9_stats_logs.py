@@ -1806,6 +1806,9 @@ def test_log_db_migrates_proxy_columns_on_old_schema(m):
     ld = m["log_db"]
     ld.init()
     conn = ld._get_conn()
+    # This test replaces retry_chain and therefore must not leave settlement rows
+    # pointing at ids from the table being discarded.
+    conn.execute("DELETE FROM upstream_attempt_usage")
     # Simulate an old monthly DB where request_log/retry_chain existed before proxy columns.
     conn.execute("ALTER TABLE request_log RENAME TO request_log_new")
     conn.execute("ALTER TABLE retry_chain RENAME TO retry_chain_new")

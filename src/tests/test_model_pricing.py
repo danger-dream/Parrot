@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 
-from src import model_pricing
+from src import model_metadata, model_pricing
 
 
 def test_bundled_gpt56_prices_and_cache_components():
@@ -435,6 +436,87 @@ def test_estimate_rejects_costs_outside_sqlite_integer_range():
         "too-expensive", input_tokens=1_000_000,
         pricing_settings=pricing_settings,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_startup_metadata_sync_uses_local_then_refreshed_catalog(monkeypatch):
+    events: list[str] = []
+    sync_number = 0
+
+    def fake_sync():
+        nonlocal sync_number
+        sync_number += 1
+        events.append(f"sync-{sync_number}")
+        return {
+            "scanned": 2,
+            "created": ["model-a"] if sync_number == 1 else [],
+            "updated": ["model-b"] if sync_number == 2 else [],
+            "unchanged": [],
+            "unmatched": [],
+        }
+
+    async def fake_refresh_once(*, force=False, client=None):
+        assert force is False and client is None
+        events.append("refresh")
+        return True
+
+    monkeypatch.setattr(model_metadata, "auto_sync_metadata", fake_sync)
+    monkeypatch.setattr(model_pricing, "refresh_once", fake_refresh_once)
+
+    await model_pricing.startup_metadata_sync()
+
+    assert events == ["sync-1", "refresh", "sync-2"]
+
+
+@pytest.mark.asyncio
+async def test_startup_metadata_sync_keeps_local_bindings_when_remote_fails(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    def fake_sync():
+        events.append("sync-local")
+        return {
+            "scanned": 1,
+            "created": ["model-a"],
+            "updated": [],
+            "unchanged": [],
+            "unmatched": [],
+        }
+
+    async def fail_refresh_once(*, force=False, client=None):
+        events.append("refresh-failed")
+        raise OSError("offline")
+
+    monkeypatch.setattr(model_metadata, "auto_sync_metadata", fake_sync)
+    monkeypatch.setattr(model_pricing, "refresh_once", fail_refresh_once)
+
+    await model_pricing.startup_metadata_sync()
+
+    assert events == ["sync-local", "refresh-failed"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_uses_one_task_for_startup_sync_and_periodic_wait(
+    monkeypatch,
+):
+    events: list[str] = []
+
+    async def fake_startup_sync():
+        events.append("startup-sync")
+
+    async def stop_at_sleep(seconds):
+        assert seconds > 0
+        events.append("periodic-wait")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(model_pricing, "startup_metadata_sync", fake_startup_sync)
+    monkeypatch.setattr(model_pricing.asyncio, "sleep", stop_at_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await model_pricing.refresh_loop()
+
+    assert events == ["startup-sync", "periodic-wait"]
 
 
 @pytest.mark.asyncio

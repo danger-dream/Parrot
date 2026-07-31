@@ -371,6 +371,7 @@ async def read_until_first_responses_ws_visible_event(
     start_time: float | None = None,
     start_monotonic: float | None = None,
     parse_wrapped_errors: bool = False,
+    commit_retryable_errors: bool = False,
     timeout_detail_mode: str = "event",
     timeout_label_seconds: float | int | None = None,
     use_tracker_error_detail: bool = False,
@@ -384,6 +385,21 @@ async def read_until_first_responses_ws_visible_event(
     logging, cooldown/scorer, affinity, and local result mapping.
     """
     result = ResponsesWsPreVisibleResult()
+    pending_bytes = 0
+
+    def append_pending(data: str | bytes) -> bool:
+        """Bound metadata buffered before the irreversible output boundary."""
+        nonlocal pending_bytes
+        size = ws_frame_size(data)
+        if len(result.pending) >= 1_024 or pending_bytes + size > 8 * 1024 * 1024:
+            result.pending.clear()
+            result.outcome = "transport_error"
+            result.http_status = 502
+            result.error_detail = "pre-visible websocket buffer limit exceeded"
+            return False
+        result.pending.append(data)
+        pending_bytes += size
+        return True
 
     while True:
         try:
@@ -419,8 +435,12 @@ async def read_until_first_responses_ws_visible_event(
                     result.http_status = maybe_error.get("status")
                     result.error_code = str(maybe_error.get("code") or "") or None
                     result.error_detail = maybe_error.get("message") or data[:2000]
-                    if not is_retryable_responses_ws_error_before_accept(maybe_error):
-                        result.pending.append(data)
+                    if (
+                        commit_retryable_errors
+                        or not is_retryable_responses_ws_error_before_accept(maybe_error)
+                    ):
+                        if not append_pending(data):
+                            return result
                         result.closed_after_accept = True
                     return result
 
@@ -443,7 +463,8 @@ async def read_until_first_responses_ws_visible_event(
                         or protocol_errors.responses_max_output_context_error_message()
                     )
                 if event_type == "response.failed":
-                    result.pending.append(data)
+                    if not append_pending(data):
+                        return result
                     result.stream_started = True
                     result.closed_after_accept = True
                 return result
@@ -454,11 +475,13 @@ async def read_until_first_responses_ws_visible_event(
                     result.outcome = "blacklist_hit"
                     result.error_detail = f"blacklist: {bl_hit}"
                     return result
-                result.pending.append(data)
+                if not append_pending(data):
+                    return result
                 result.visible_frame = data
                 return result
 
-            result.pending.append(data)
+            if not append_pending(data):
+                return result
             if getattr(tracker, "response_completed", False):
                 if timing is not None:
                     timing.mark_io_complete()
@@ -469,7 +492,8 @@ async def read_until_first_responses_ws_visible_event(
         else:
             # Binary frames are real downstream payload. They cannot be inspected
             # by the text blacklist, but they define the irreversible boundary.
-            result.pending.append(data)
+            if not append_pending(data):
+                return result
             result.visible_frame = data
             return result
 

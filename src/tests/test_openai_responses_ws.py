@@ -35,7 +35,10 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import affinity, config, cooldown, failover, fingerprint, log_db, scorer, state_db, upstream
+    from src import (
+        affinity, apikey_limiter, concurrency, config, cooldown, failover,
+        fingerprint, log_db, scorer, state_db, upstream,
+    )
     from src.channel import registry
     from src.openai.channel.registration import register_factories
     from src.openai.channel.api_channel import OpenAIApiChannel
@@ -44,6 +47,8 @@ def _import_modules():
     register_factories()
     return {
         "affinity": affinity,
+        "apikey_limiter": apikey_limiter,
+        "concurrency": concurrency,
         "config": config,
         "cooldown": cooldown,
         "failover": failover,
@@ -136,6 +141,8 @@ class FakeWebSocket:
         self.close_calls: list[tuple[int, str]] = []
         self.accepted = False
         self._closed = asyncio.Event()
+        self._relay_wait_cancelled = False
+        self._terminal_seen = False
 
     async def accept(self):
         self.accepted = True
@@ -150,14 +157,32 @@ class FakeWebSocket:
             return {"type": "websocket.receive", "text": text}
         if self._extra_receive:
             return self._extra_receive.pop(0)
+        if self._terminal_seen:
+            self._terminal_seen = False
+            return {"type": "websocket.disconnect", "code": 1000}
+        if self._relay_wait_cancelled:
+            self._relay_wait_cancelled = False
+            return {"type": "websocket.disconnect", "code": 1000}
         # A real connected client blocks here; an immediate synthetic disconnect
-        # races the new owned per-frame timing task and can cancel a healthy
-        # upstream before its terminal frame. ``close()`` releases this waiter.
-        await self._closed.wait()
+        # races the owned per-frame timing task and can cancel a healthy upstream.
+        try:
+            await self._closed.wait()
+        except asyncio.CancelledError:
+            if self._terminal_seen:
+                self._relay_wait_cancelled = True
+            raise
         return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_text(self, text: str):
         self.sent_texts.append(text)
+        try:
+            event_type = json.loads(text).get("type")
+        except Exception:
+            event_type = None
+        if event_type in {
+            "response.completed", "response.failed", "response.incomplete",
+        }:
+            self._terminal_seen = True
 
     async def send_bytes(self, data: bytes):
         self.sent_texts.append(data.decode("utf-8"))
@@ -167,6 +192,65 @@ class FakeWebSocket:
         self._closed.set()
         from starlette.websockets import WebSocketState
         self.application_state = WebSocketState.DISCONNECTED
+
+
+class SequentialFakeWebSocket(FakeWebSocket):
+    """Send the next create only after the active receive task is cancelled."""
+
+    def __init__(self, first_obj: dict[str, Any], *next_objs: dict[str, Any]):
+        super().__init__(first_obj)
+        self._next_texts = [json.dumps(obj) for obj in next_objs]
+
+    async def send_text(self, text: str):
+        await super().send_text(text)
+        try:
+            event_type = json.loads(text).get("type")
+        except Exception:
+            event_type = None
+        if event_type in {
+            "response.completed", "response.failed", "response.incomplete",
+            "error",
+        }:
+            self._terminal_seen = True
+
+    async def receive(self):
+        if (
+            self._first_text is None
+            and self._next_texts
+            and (self._relay_wait_cancelled or self._terminal_seen)
+        ):
+            self._relay_wait_cancelled = False
+            self._terminal_seen = False
+            text = self._next_texts.pop(0)
+            return {"type": "websocket.receive", "text": text}
+        if (
+            self._first_text is None
+            and not self._next_texts
+            and self._terminal_seen
+        ):
+            self._terminal_seen = False
+            return {"type": "websocket.disconnect", "code": 1000}
+        return await super().receive()
+
+
+class IdleBetweenTurnsFakeWebSocket(FakeWebSocket):
+    """Keep the client socket open after one terminal response for inspection."""
+
+    def __init__(self, first_obj: dict[str, Any]):
+        super().__init__(first_obj)
+        self.waiting_between_turns = asyncio.Event()
+        self.disconnect_between_turns = asyncio.Event()
+
+    async def receive(self):
+        if self._first_text is not None:
+            return await super().receive()
+        if self._relay_wait_cancelled or self._terminal_seen:
+            self._relay_wait_cancelled = False
+            self._terminal_seen = False
+            self.waiting_between_turns.set()
+            await self.disconnect_between_turns.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+        return await super().receive()
 
 
 class FakeUpstreamWebSocket:
@@ -442,7 +526,7 @@ async def test_responses_ws_routes_maps_model_and_relays(monkeypatch, m):
         "upstream_protocol": "openai-responses",
     }
     assert frozen["tariff"] is not None
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -550,7 +634,7 @@ async def test_responses_ws_blacklist_before_first_visible_fails_over(monkeypatc
     assert json.loads(good.sent[0])["model"] == "real-model"
     assert [json.loads(t)["response"]["id"] for t in ws.sent_texts if json.loads(t)["type"] == "response.created"] == ["good"]
     assert any(json.loads(t).get("delta") == "ok" for t in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -610,12 +694,12 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     assert upstream_first["stream"] is True
     assert upstream_first["input"] == [{"type": "message", "role": "user", "content": "hello"}]
     assert upstream_first["client_metadata"] == {"a": "b"}
-    # Without client_metadata identity anchors there is no response-side mapping to restore,
-    # so this legacy transform smoke test only requires session/thread headers to be isolated.
-    assert upstream_first["prompt_cache_key"] == "shared-anchor"
+    # Frame and handshake identities share the same isolated session anchor.
+    assert upstream_first["prompt_cache_key"] == captured["headers"]["session-id"]
+    assert upstream_first["prompt_cache_key"] != "shared-anchor"
     assert captured["headers"]["session-id"] != "shared-anchor"
     assert "temperature" not in upstream_first
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -637,7 +721,7 @@ async def test_responses_ws_accepts_explicit_session_headers(monkeypatch, m):
 
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -671,7 +755,7 @@ async def test_responses_ws_forwards_terminal_only_completed_response(monkeypatc
     ]
     completed = json.loads(ws.sent_texts[-1])
     assert completed["response"]["output"][0]["content"][0]["text"] == "done"
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
     row = _last_request_log(m)
     assert row["status"] == "success"
     assert row["input_tokens"] == row["output_tokens"] == 1
@@ -842,7 +926,7 @@ async def test_responses_ws_error_after_metadata_before_visible_fails_over(monke
     assert "error" not in sent_types
     assert [json.loads(t).get("response", {}).get("id") for t in ws.sent_texts if json.loads(t)["type"] == "response.created"] == ["good"]
     assert any(json.loads(t).get("delta") == "ok" for t in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
     row = _last_request_log(m)
     attempts = _attempt_usage(m, row["request_id"])
     assert [item["attempt_order"] for item in attempts] == [1, 2]
@@ -895,7 +979,7 @@ async def test_responses_ws_transient_retries_same_candidate_and_honors_retry_af
     assert len(connect_calls) == 2
     assert observed_retry_after == [4.0]
     assert any(json.loads(text).get("delta") == "ok" for text in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
     row = _last_request_log(m)
     assert row["status"] == "success"
     assert row["retry_count"] == 1
@@ -1017,7 +1101,7 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
 
     assert recorded["channel"] == ch.key
     assert recorded["headers"]["x-codex-primary-used-percent"] == "12"
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 
@@ -1221,7 +1305,7 @@ async def test_responses_ws_proxy_chain_falls_back_before_first_event(monkeypatc
     assert rounds[0]["round_id"] != rounds[1]["round_id"]
     assert all(item["ended_at"] is not None for item in rounds)
     assert rounds[-1]["round_id"] == row["final_round_id"]
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 
 @pytest.mark.asyncio
@@ -1349,7 +1433,7 @@ async def test_responses_ws_filters_non_responses_channels_without_scoring_failu
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
     row = _last_request_log(m)
     assert row["status"] == "success"
     assert row["final_channel_key"] == good.key
@@ -1377,7 +1461,7 @@ async def test_responses_ws_stream_error_after_visible_logs_and_cools_down(monke
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
     assert any(json.loads(t)["type"] == "response.output_text.delta" for t in ws.sent_texts)
-    assert ws.close_calls[-1][0] == 1011
+    assert not ws.close_calls
     row = _last_request_log(m)
     assert row["status"] == "error"
     assert row["final_channel_key"] == "api:ws-upstream"
@@ -1532,7 +1616,7 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
     assert "raw-pck" in first_downstream["delta"]
     assert "turn-raw" in first_downstream["delta"]
     assert "003" not in first_downstream["delta"]  # guard against obvious isolated-session leakage
-    assert ws.close_calls[-1][0] == 1000
+    assert not ws.close_calls
 
 @pytest.mark.asyncio
 async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch, m):
@@ -2163,7 +2247,7 @@ async def test_responses_ws_large_terminal_frame_keeps_billing_evidence(
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_rejects_second_create_without_second_upstream_call(
+async def test_responses_ws_rejects_overlapping_create_without_stopping_active_turn(
     monkeypatch, m,
 ):
     _setup(m)
@@ -2187,15 +2271,12 @@ async def test_responses_ws_rejects_second_create_without_second_upstream_call(
             self.sent: list[str] = []
             self.response = SimpleNamespace(headers={})
             self._recv_count = 0
-            self._second_sent = asyncio.Event()
 
         async def send(self, data, text=None):
             del text
             if isinstance(data, bytes):
                 data = data.decode("utf-8")
             self.sent.append(data)
-            if len(self.sent) > 1:
-                self._second_sent.set()
 
         async def recv(self):
             if self._recv_count == 0:
@@ -2206,10 +2287,13 @@ async def test_responses_ws_rejects_second_create_without_second_upstream_call(
                     "content_index": 0,
                     "delta": "partial",
                 })
-            await self._second_sent.wait()
+            await asyncio.sleep(0.01)
             return json.dumps({
                 "type": "response.completed",
-                "response": {"id": "should-not-complete", "output": [], "usage": {}},
+                "response": {
+                    "id": "first-completes", "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
             })
 
         async def close(self, *args, **kwargs):
@@ -2229,14 +2313,383 @@ async def test_responses_ws_rejects_second_create_without_second_upstream_call(
         json.loads(text).get("code") == "invalid_request_error"
         for text in ws.sent_texts
     )
-    assert ws.close_calls[-1][0] == 4400
+    assert not ws.close_calls
     row = _last_request_log(m)
-    assert row["status"] == "error"
-    assert row["http_status"] == 400
+    assert row["status"] == "success"
     assert len(_retry_chain(m, row["request_id"])) == 1
     attempts = _attempt_usage(m, row["request_id"])
     assert len(attempts) == 1
-    assert attempts[0]["outcome"] == "request_invalid"
+    assert attempts[0]["outcome"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_accepts_sequential_creates_with_one_ledger_row_each(
+    monkeypatch, m,
+):
+    _setup(m)
+    _make_channel(m)
+    conn = m["log_db"]._get_conn()
+    request_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM request_log"
+    ).fetchone()[0]
+    retry_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM retry_chain"
+    ).fetchone()[0]
+    attempt_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM upstream_attempt_usage"
+    ).fetchone()[0]
+    overall_before = m["log_db"].stats_summary(
+        0, summary_top_limit=0
+    )["overall"]
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "test-model",
+            "previous_response_id": "resp_first",
+            "input": "second", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": "resp_first"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "one"},
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }},
+        {"type": "response.created", "response": {"id": "resp_second"}},
+        {"type": "response.output_text.delta", "output_index": 0,
+         "content_index": 0, "delta": "two"},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [],
+            "usage": {"input_tokens": 5, "output_tokens": 4},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert len(fake_upstream.sent) == 2
+    first_wire, second_wire = map(json.loads, fake_upstream.sent)
+    assert first_wire["model"] == second_wire["model"] == "real-model"
+    assert second_wire["previous_response_id"] == "resp_first"
+    rows = conn.execute(
+        "SELECT * FROM request_log WHERE id>? ORDER BY id",
+        (request_id_before,),
+    ).fetchall()
+    chain = conn.execute(
+        "SELECT * FROM retry_chain WHERE id>? ORDER BY id",
+        (retry_id_before,),
+    ).fetchall()
+    attempts = conn.execute(
+        "SELECT * FROM upstream_attempt_usage WHERE id>? ORDER BY id",
+        (attempt_id_before,),
+    ).fetchall()
+    assert len(rows) == len(chain) == len(attempts) == 2
+    assert [row["status"] for row in rows] == ["success", "success"]
+    assert [
+        (row["input_tokens"], row["output_tokens"]) for row in rows
+    ] == [(3, 2), (5, 4)]
+    assert [a["outcome"] for a in attempts] == ["success", "success"]
+    assert [a["upstream_protocol"] for a in attempts] == [
+        "openai-responses", "openai-responses",
+    ]
+    assert [
+        (a["input_tokens"], a["output_tokens"]) for a in attempts
+    ] == [(3, 2), (5, 4)]
+    overall = m["log_db"].stats_summary(0, summary_top_limit=0)["overall"]
+    assert overall["total"] - overall_before["total"] == 2
+    assert (
+        overall["total_input_tokens"] - overall_before["total_input_tokens"],
+        overall["total_output_tokens"] - overall_before["total_output_tokens"],
+    ) == (8, 6)
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_releases_capacity_while_waiting_between_turns(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg["apiKeyConcurrency"] = {
+        "enabled": True,
+        "defaultMaxConcurrent": 1,
+        "defaultMaxQueue": 0,
+        "defaultQueueWaitSeconds": 0,
+    }
+    cfg["concurrency"].update({
+        "enabled": True,
+        "defaultMaxConcurrent": 1,
+        "queueWaitSeconds": 1,
+    })
+    ch = _make_channel(m, extra={"maxConcurrent": 1})
+    ws = IdleBetweenTurnsFakeWebSocket({
+        "type": "response.create", "model": "test-model",
+        "input": "first", "stream": True,
+    })
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    handler_task = asyncio.create_task(
+        m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.wait_for(ws.waiting_between_turns.wait(), timeout=2)
+        assert not handler_task.done()
+        assert m["apikey_limiter"].key_snapshot("ws-key")["in_flight"] == 0
+        channel_rows = {
+            row["channel_key"]: row
+            for row in m["concurrency"].snapshot()
+        }
+        assert channel_rows[ch.key]["in_flight"] == 0
+    finally:
+        ws.disconnect_between_turns.set()
+        await asyncio.wait_for(handler_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_translates_and_reacquires_capacity_for_each_turn(
+    monkeypatch, m,
+):
+    _setup(m)
+    ch = _make_channel(m)
+    translated_inputs: list[str] = []
+    api_key_acquires: list[str] = []
+    channel_acquires: list[str] = []
+
+    original_api_key_acquire = m["apikey_limiter"].acquire
+    original_channel_try_acquire = m["concurrency"].try_acquire
+
+    async def tracked_api_key_acquire(key_name, *args, **kwargs):
+        api_key_acquires.append(str(key_name or ""))
+        return await original_api_key_acquire(key_name, *args, **kwargs)
+
+    async def tracked_channel_try_acquire(channel_key):
+        channel_acquires.append(channel_key)
+        return await original_channel_try_acquire(channel_key)
+
+    async def fake_translate(body, *, ingress_protocol, route=None):
+        assert ingress_protocol == "responses"
+        translated_inputs.append(body["input"])
+        translated = dict(body)
+        translated["input"] = f"translated:{body['input']}"
+        return translated
+
+    monkeypatch.setattr(
+        m["responses_ws"].apikey_limiter, "acquire", tracked_api_key_acquire,
+    )
+    monkeypatch.setattr(
+        m["responses_ws"].concurrency, "try_acquire", tracked_channel_try_acquire,
+    )
+    monkeypatch.setattr(
+        m["responses_ws"].translation, "translate_body", fake_translate,
+    )
+
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "second", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert translated_inputs == ["first", "second"]
+    assert [json.loads(payload)["input"] for payload in fake_upstream.sent] == [
+        "translated:first", "translated:second",
+    ]
+    assert api_key_acquires == ["ws-key", "ws-key"]
+    assert channel_acquires == [ch.key, ch.key]
+    assert m["apikey_limiter"].key_snapshot("ws-key")["in_flight"] == 0
+    channel_rows = {
+        row["channel_key"]: row for row in m["concurrency"].snapshot()
+    }
+    assert channel_rows[ch.key]["in_flight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_sequential_turn_can_change_to_supported_model(
+    monkeypatch, m,
+):
+    cfg = _setup(m)
+    cfg["apiKeys"]["ws-key"]["allowedModels"].append("other-model")
+    _make_channel(m, extra={"models": [
+        {"alias": "test-model", "real": "real-model"},
+        {"alias": "other-model", "real": "other-real-model"},
+    ]})
+    conn = m["log_db"]._get_conn()
+    request_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM request_log"
+    ).fetchone()[0]
+    retry_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM retry_chain"
+    ).fetchone()[0]
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "other-model",
+            "input": "second", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert [json.loads(payload)["model"] for payload in fake_upstream.sent] == [
+        "real-model", "other-real-model",
+    ]
+    rows = conn.execute(
+        "SELECT requested_model, final_model FROM request_log "
+        "WHERE id>? ORDER BY id",
+        (request_id_before,),
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("test-model", "real-model"),
+        ("other-model", "other-real-model"),
+    ]
+    retry_rows = conn.execute(
+        "SELECT model, client_visible_model FROM retry_chain "
+        "WHERE id>? ORDER BY id",
+        (retry_id_before,),
+    ).fetchall()
+    assert [tuple(row) for row in retry_rows] == [
+        ("real-model", "test-model"),
+        ("other-real-model", "other-model"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_failed_turn_can_continue_sequentially(
+    monkeypatch, m,
+):
+    _setup(m)
+    _make_channel(m)
+    conn = m["log_db"]._get_conn()
+    request_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM request_log"
+    ).fetchone()[0]
+    attempt_id_before = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM upstream_attempt_usage"
+    ).fetchone()[0]
+    ws = SequentialFakeWebSocket(
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "first", "stream": True,
+        },
+        {
+            "type": "response.create", "model": "test-model",
+            "input": "recover", "stream": True,
+        },
+    )
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.failed", "response": {
+            "id": "resp_failed",
+            "error": {"code": "server_error", "message": "turn failed"},
+            "usage": {"input_tokens": 2, "output_tokens": 0},
+        }},
+        {"type": "response.completed", "response": {
+            "id": "resp_recovered", "output": [],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    rows = conn.execute(
+        "SELECT * FROM request_log WHERE id>? ORDER BY id",
+        (request_id_before,),
+    ).fetchall()
+    attempts = conn.execute(
+        "SELECT * FROM upstream_attempt_usage WHERE id>? ORDER BY id",
+        (attempt_id_before,),
+    ).fetchall()
+    assert [row["status"] for row in rows] == ["error", "success"]
+    assert len(fake_upstream.sent) == len(attempts) == 2
+    assert [a["outcome"] for a in attempts] == [
+        "stream_upstream_error", "success",
+    ]
+    assert [
+        (a["input_tokens"], a["output_tokens"]) for a in attempts
+    ] == [(2, 0), (3, 1)]
+    assert not ws.close_calls
+
+
+@pytest.mark.asyncio
+async def test_responses_ws_previsible_metadata_buffer_is_bounded(m):
+    _setup(m)
+    from src.transports.ws_runtime import (
+        read_until_first_responses_ws_visible_event,
+    )
+
+    upstream = FakeUpstreamWebSocket([
+        {"type": "response.created", "response": {"id": f"r-{idx}"}}
+        for idx in range(1_025)
+    ])
+    result = await read_until_first_responses_ws_visible_event(
+        upstream,
+        m["responses_ws"]._WsTracker(),
+        channel_key="api:ws-upstream",
+        deadline_ts=0,
+        first_wait=5,
+        idle_timeout=5,
+    )
+
+    assert result.outcome == "transport_error"
+    assert result.http_status == 502
+    assert result.error_detail == "pre-visible websocket buffer limit exceeded"
+    assert result.pending == []
 
 
 @pytest.mark.asyncio

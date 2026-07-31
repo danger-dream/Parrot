@@ -613,8 +613,8 @@ def test_partial_attempt_ledger_keeps_missing_dispatched_attempt_unpriced(m):
     apikey_models = {
         row["final_model"]: row for row in ld.apikey_model_stats("k", 0)
     }
-    assert set(apikey_models) == {"gpt-5.6-sol"}
-    assert apikey_models["gpt-5.6-sol"]["costed_success"] == 1
+    assert set(apikey_models) == {"gpt-5.6-luna", "gpt-5.6-sol"}
+    assert apikey_models["gpt-5.6-luna"]["costed_success"] == 1
     assert apikey_models["gpt-5.6-sol"]["unpriced_success"] == 1
 
 
@@ -1052,6 +1052,56 @@ def test_anthropic_outbound_speed_fast_freezes_models_dev_fast_tariff(m):
     assert row["cost_ticks"] == expected.total_ticks
 
 
+def test_anthropic_response_service_tier_does_not_override_fast_speed(m):
+    _setup(m); ld = m["log_db"]; mp = m["model_pricing"]
+    channel = "oauth:anthropic:user@example.com"
+    _pending(ld, "claude-fast-tier", "claude-opus-4-6")
+    aid = _attempt(
+        ld, "claude-fast-tier", 1, channel, "oauth",
+        "claude-opus-4-6", 1.0, protocol="anthropic",
+    )
+    _dispatch(
+        ld, aid, "claude-opus-4-6", service_tier="auto", speed="fast",
+    )
+    body = json.dumps({
+        "service_tier": "standard",
+        "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
+    })
+    ld.finish_success(
+        "claude-fast-tier", channel, "oauth", "claude-opus-4-6",
+        input_tokens=100_000, output_tokens=100_000,
+        response_body=body, upstream_protocol="anthropic",
+    )
+    row = ld._get_conn().execute(
+        "SELECT service_tier,outbound_service_tier,upstream_protocol,"
+        "cost_source,cost_ticks FROM upstream_attempt_usage "
+        "WHERE retry_attempt_id=?", (aid.row_id,),
+    ).fetchone()
+    expected = mp.estimate_cost(
+        "anthropic/claude-opus-4-6",
+        input_tokens=100_000, output_tokens=100_000, priority=True,
+    )
+    standard = mp.estimate_cost(
+        "anthropic/claude-opus-4-6",
+        input_tokens=100_000, output_tokens=100_000, priority=False,
+    )
+    assert expected is not None and standard is not None
+    assert ld._outbound_service_tier(
+        {"service_tier": "auto", "speed": "fast"},
+        upstream_protocol="anthropic",
+    ) == "fast"
+    assert ld._outbound_service_tier({"speed": "fast"}) is None
+    assert ld._outbound_service_tier(
+        {"service_tier": "auto", "speed": "fast"},
+        upstream_protocol="openai-responses",
+    ) == "auto"
+    assert tuple(row[:4]) == (
+        "standard", "fast", "anthropic", "estimated",
+    )
+    assert row["cost_ticks"] == expected.total_ticks
+    assert row["cost_ticks"] != standard.total_ticks
+
+
 def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "multi")
@@ -1124,6 +1174,61 @@ def test_multi_attempt_and_compact_segments_aggregate_to_root(m):
         }
 
 
+def test_cross_protocol_attempts_keep_family_stats_separate(m):
+    _setup(m); ld = m["log_db"]
+    _pending(ld, "cross-family", "gpt-5.6-sol")
+    anthropic_channel = "oauth:anthropic:user@example.com"
+    first = _attempt(
+        ld, "cross-family", 1, anthropic_channel, "oauth",
+        "claude-opus-4-6", 1.0, protocol="anthropic",
+    )
+    _dispatch(ld, first, "claude-opus-4-6")
+    ld.update_retry_attempt(
+        first, outcome="http_error", ended_at=2.0,
+        response_body=json.dumps({
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+        }),
+    )
+    second = _attempt(
+        ld, "cross-family", 2, "api:B", "api",
+        "gpt-5.6-sol", 3.0, protocol="openai-responses",
+    )
+    _dispatch(ld, second, "gpt-5.6-sol")
+    final_body = json.dumps({
+        "usage": {"input_tokens": 200, "output_tokens": 20},
+    })
+    ld.finish_success(
+        "cross-family", "api:B", "api", "gpt-5.6-sol",
+        input_tokens=200, output_tokens=20, response_body=final_body,
+        retry_count=1, upstream_protocol="openai-responses",
+    )
+
+    anthropic = ld.stats_summary(
+        0, family="anthropic", summary_top_limit=20,
+    )["overall"]
+    openai = ld.stats_summary(
+        0, family="openai", summary_top_limit=20,
+    )["overall"]
+    assert (
+        anthropic["total"], anthropic["total_input_tokens"],
+        anthropic["total_output_tokens"], anthropic["costed_success"],
+    ) == (0, 100, 10, 1)
+    assert (
+        openai["total"], openai["total_input_tokens"],
+        openai["total_output_tokens"], openai["costed_success"],
+    ) == (1, 200, 20, 1)
+
+    model_channels = ld.channels_by_requested_model(0)
+    channel_facts = {
+        (item["key"], item["upstream_protocol"])
+        for item in model_channels["gpt-5.6-sol"]
+    }
+    assert channel_facts == {
+        (anthropic_channel, "anthropic"),
+        ("api:B", "openai-responses"),
+    }
+
+
 def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
     _setup(m); ld = m["log_db"]
     _pending(ld, "model-split", "gpt-5.6-luna")
@@ -1153,11 +1258,18 @@ def test_attempt_model_token_and_cost_breakdowns_use_the_same_attempt_keys(m):
     assert channel_a["gpt-5.6-luna"]["costed_success"] == 1
     assert (channel_b["gpt-5.6-sol"]["input"], channel_b["gpt-5.6-sol"]["output"]) == (20, 2)
     assert channel_b["gpt-5.6-sol"]["costed_success"] == 1
-    # API-key model details are explicitly grouped by the request's final_model,
-    # while channel details use each channel attempt's actual model.
-    assert set(by_apikey) == {"gpt-5.6-sol"}
-    assert (by_apikey["gpt-5.6-sol"]["input"], by_apikey["gpt-5.6-sol"]["output"]) == (30, 3)
-    assert by_apikey["gpt-5.6-sol"]["costed_success"] == 2
+    # API Key 的 Token 与金额都按每次真实上游 attempt 的模型归类。
+    assert set(by_apikey) == {"gpt-5.6-luna", "gpt-5.6-sol"}
+    assert (
+        by_apikey["gpt-5.6-luna"]["input"],
+        by_apikey["gpt-5.6-luna"]["output"],
+    ) == (10, 1)
+    assert by_apikey["gpt-5.6-luna"]["costed_success"] == 1
+    assert (
+        by_apikey["gpt-5.6-sol"]["input"],
+        by_apikey["gpt-5.6-sol"]["output"],
+    ) == (20, 2)
+    assert by_apikey["gpt-5.6-sol"]["costed_success"] == 1
 
 
 def test_token_surfaces_show_cost_without_cache_hit(m):

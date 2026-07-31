@@ -2072,16 +2072,65 @@ def refresh_remote_catalog_sync() -> bool:
     return asyncio.run(_run())
 
 
-async def refresh_loop() -> None:
-    """后台更新循环。任何异常只记一行日志，不影响代理请求。"""
+async def _auto_sync_startup_metadata(catalog_source: str) -> dict[str, Any]:
+    """Bind visible models from the current catalog without blocking startup."""
 
-    while True:
+    from . import model_metadata
+
+    result = await asyncio.to_thread(model_metadata.auto_sync_metadata)
+    print(
+        f"[Metadata] startup sync ({catalog_source}): "
+        f"scanned={int(result.get('scanned') or 0)} "
+        f"created={len(result.get('created') or [])} "
+        f"updated={len(result.get('updated') or [])} "
+        f"unchanged={len(result.get('unchanged') or [])} "
+        f"unmatched={len(result.get('unmatched') or [])}"
+    )
+    return result
+
+
+async def startup_metadata_sync() -> None:
+    """One non-blocking startup workflow: local bindings, refresh, then reconcile."""
+
+    try:
+        await _auto_sync_startup_metadata("local")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[Metadata] startup local sync failed: {exc}")
+
+    refreshed = False
+    try:
+        refreshed = await refresh_once()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[Pricing] refresh failed, keeping {_catalog_source} catalog: {exc}")
+
+    if refreshed:
         try:
-            await refresh_once()
+            await _auto_sync_startup_metadata("remote")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"[Pricing] refresh failed, keeping {_catalog_source} catalog: {exc}")
+            print(f"[Metadata] startup remote sync failed: {exc}")
+
+
+async def refresh_loop() -> None:
+    """后台更新循环。启动同步和周期刷新共用这一个任务。"""
+
+    first_iteration = True
+    while True:
+        if first_iteration:
+            await startup_metadata_sync()
+            first_iteration = False
+        else:
+            try:
+                await refresh_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[Pricing] refresh failed, keeping {_catalog_source} catalog: {exc}")
         pricing_cfg = config.get().get("pricing", {})
         raw_hours = pricing_cfg.get("refreshHours", 24) if isinstance(pricing_cfg, Mapping) else 24
         try:
