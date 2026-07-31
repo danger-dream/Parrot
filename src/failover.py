@@ -1179,9 +1179,16 @@ async def _run_compact_direct_rescue_with_compression_model(
         window = model_metadata.context_window(
             compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
         )
+        trigger = model_metadata.compact_trigger_tokens(
+            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+        )
+        safe_limit = model_metadata.safe_prompt_limit(
+            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+        )
         return (
             None,
-            f"compression model {compression_model} context not enough: "
+            f"compression model {compression_model} prompt exceeds compact limit: "
+            f"prompt={prompt_tokens} limit={safe_limit} trigger={trigger} "
             f"required={required} window={window}",
         )
 

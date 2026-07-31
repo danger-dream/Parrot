@@ -50,7 +50,7 @@ class ModelInventoryItem:
 
 # Legacy input normalization remains available for config migration/tests, but
 # normalized user values are never a runtime metadata source after this refactor.
-_INT_KEYS = {"contextWindow", "maxOutputTokens"}
+_INT_KEYS = {"contextWindow", "maxOutputTokens", "compactTriggerTokens"}
 _FLOAT_KEYS = {
     "inputPricePer1M", "outputPricePer1M",
     "cacheReadPricePer1M", "cacheWritePricePer1M",
@@ -65,6 +65,9 @@ _FIELD_ALIASES = {
     "context_length": "contextWindow", "maxOutput": "maxOutputTokens",
     "max_output": "maxOutputTokens", "max_output_tokens": "maxOutputTokens",
     "maxTokens": "maxOutputTokens", "max_tokens": "maxOutputTokens",
+    "compact_trigger_tokens": "compactTriggerTokens",
+    "compactThreshold": "compactTriggerTokens",
+    "compression_threshold": "compactTriggerTokens",
     "canVision": "vision", "can_vision": "vision", "image": "vision",
     "images": "vision", "visionSupport": "vision", "supportsImages": "vision",
     "input_price": "inputPricePer1M", "input_price_per_1m": "inputPricePer1M",
@@ -616,6 +619,17 @@ def max_output_tokens(
     ).get("maxOutputTokens"))
 
 
+def compact_trigger_tokens(
+    model: Any,
+    *,
+    scope_key: str | None = None,
+    outbound_model: str | None = None,
+) -> int | None:
+    return _to_int(get_metadata(
+        model, scope_key=scope_key, outbound_model=outbound_model,
+    ).get("compactTriggerTokens"))
+
+
 def _compact_rescue_int(key: str, default: int) -> int:
     root = config.get().get("compactRescue") or {}
     if not isinstance(root, Mapping):
@@ -654,7 +668,11 @@ def safe_prompt_limit(
         return None
     buffer = compact_buffer_tokens() if buffer_tokens is None else max(0, int(buffer_tokens))
     reserve = summary_reserve_tokens(model, scope_key=scope_key, outbound_model=outbound_model)
-    return max(0, window - reserve - buffer)
+    hard_limit = max(0, window - reserve - buffer)
+    trigger = compact_trigger_tokens(
+        model, scope_key=scope_key, outbound_model=outbound_model,
+    )
+    return min(hard_limit, trigger) if trigger is not None else hard_limit
 
 
 def required_context_for_compact(
@@ -678,11 +696,8 @@ def can_fit_for_compact(
     outbound_model: str | None = None,
     buffer_tokens: int | None = None,
 ) -> bool:
-    window = context_window(model, scope_key=scope_key, outbound_model=outbound_model)
-    if window is None:
-        return False
-    required = required_context_for_compact(
-        prompt_tokens, model, scope_key=scope_key, outbound_model=outbound_model,
+    limit = safe_prompt_limit(
+        model, scope_key=scope_key, outbound_model=outbound_model,
         buffer_tokens=buffer_tokens,
     )
-    return window >= required
+    return limit is not None and max(0, int(prompt_tokens)) <= limit

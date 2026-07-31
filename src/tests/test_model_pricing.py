@@ -532,7 +532,7 @@ async def test_refresh_fetches_both_models_dev_sources_and_writes_one_atomic_bun
     assert cache.read_bytes() == before
 
     model_pricing.reset_for_tests()
-    model_pricing.initialize()
+    assert model_pricing.reload_local_catalog() is True
     assert model_pricing.catalog_status()["source"] == "cache"
     estimate = model_pricing.estimate_cost(
         "provider/m0", input_tokens=1_000_000,

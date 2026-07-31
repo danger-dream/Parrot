@@ -168,6 +168,45 @@ def _catalog_positive_int(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _first_context_tier_threshold(cost: Any) -> int | None:
+    """Return the first valid models.dev context-price tier threshold."""
+    if not isinstance(cost, Mapping):
+        return None
+    tiers = cost.get("tiers")
+    if not isinstance(tiers, list):
+        return None
+    thresholds: list[int] = []
+    for item in tiers:
+        if not isinstance(item, Mapping):
+            continue
+        tier = item.get("tier")
+        if not isinstance(tier, Mapping) or str(tier.get("type") or "context") != "context":
+            continue
+        threshold = _catalog_positive_int(tier.get("size"))
+        if (
+            threshold is None
+            or _catalog_number(item.get("input")) is None
+            or _catalog_number(item.get("output")) is None
+        ):
+            continue
+        thresholds.append(threshold)
+    return min(thresholds) if thresholds else None
+
+
+def _default_compact_trigger_tokens(
+    context_window: int | None,
+    max_output_tokens: int | None,
+) -> int | None:
+    """Derive the compact boundary when models.dev has no context-price tier."""
+    if (
+        context_window is None
+        or max_output_tokens is None
+        or context_window <= max_output_tokens
+    ):
+        return None
+    return ((context_window - max_output_tokens) * 4) // 5
+
+
 def _strict_nonnegative_int(value: Any) -> int | None:
     """Parse one billing integer without coercing corruption to zero."""
 
@@ -573,6 +612,44 @@ def initialize() -> None:
         raise RuntimeError(f"failed to load model pricing catalog: {last_error}")
 
 
+def reload_local_catalog() -> bool:
+    """Reload the last successfully saved models.dev bundle.
+
+    A missing or invalid cache leaves the currently active in-memory catalog
+    untouched.  This is used by the manual metadata sync path so matching is
+    always performed from the local last-known-good bundle, never directly from
+    a partially downloaded response.
+    """
+
+    global _catalog, _catalog_aliases, _catalog_providers, _catalog_models
+    global _catalog_provider_names, _canonical_official_models
+    global _initialized, _catalog_source, _catalog_revision
+    cache_path = os.path.join(config.DATA_DIR, _CACHE_FILENAME)
+    try:
+        api_payload, models_payload = _catalog_payload_parts(_load_json(cache_path))
+        parsed, aliases, providers = _parse_models_dev_catalog(
+            api_payload, models_payload
+        )
+        metadata_models, provider_names, official_models = (
+            _parse_models_dev_metadata_indexes(api_payload, models_payload)
+        )
+        revision = _catalog_revision_for_payloads(api_payload, models_payload)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+    with _lock:
+        _catalog = parsed
+        _catalog_aliases = aliases
+        _catalog_providers = providers
+        _catalog_models = metadata_models
+        _catalog_provider_names = provider_names
+        _canonical_official_models = official_models
+        _catalog_source = "cache"
+        _catalog_revision = revision
+        _initialized = True
+    return True
+
+
 def reset_for_tests() -> None:
     global _catalog, _catalog_aliases, _catalog_providers, _catalog_models
     global _catalog_provider_names, _canonical_official_models
@@ -636,6 +713,10 @@ def catalog_metadata(provider_model: str) -> dict[str, Any] | None:
                 break
     context = _catalog_positive_int(limit.get("context"))
     output = _catalog_positive_int(limit.get("output"))
+    cost = raw.get("cost") if isinstance(raw.get("cost"), Mapping) else None
+    compact_trigger = _first_context_tier_threshold(cost)
+    if compact_trigger is None:
+        compact_trigger = _default_compact_trigger_tokens(context, output)
     result: dict[str, Any] = {
         "name": str(raw.get("name") or raw.get("id") or provider_model),
         "description": str(raw.get("description") or ""),
@@ -652,12 +733,16 @@ def catalog_metadata(provider_model: str) -> dict[str, Any] | None:
         "modalities": copy.deepcopy(dict(modalities)),
         "releaseDate": str(raw.get("release_date") or ""),
         # Preserve the complete catalog pricing object for display/consumers.
-        "cost": copy.deepcopy(raw.get("cost")) if isinstance(raw.get("cost"), Mapping) else None,
+        "cost": copy.deepcopy(cost),
     }
     if context is not None:
         result["contextWindow"] = context
     if output is not None:
         result["maxOutputTokens"] = output
+    if compact_trigger is not None:
+        # An explicit context-price tier wins. Without one, reserve the model's
+        # maximum output and use 80% of the remaining input capacity.
+        result["compactTriggerTokens"] = compact_trigger
     return result
 
 
@@ -686,6 +771,31 @@ def catalog_provider_models(provider_id: str) -> list[dict[str, Any]]:
             }
             for key in keys
         ]
+
+
+def catalog_models() -> list[dict[str, str]]:
+    """Return lightweight descriptors for every exact models.dev model.
+
+    Telegram's metadata-binding picker uses this single snapshot to rank exact
+    same-name candidates and to filter the catalog without repeatedly scanning
+    every provider.  Persisted bindings still use the exact ``key`` identity.
+    """
+
+    if not _ensure_catalog():
+        return []
+    with _lock:
+        result: list[dict[str, str]] = []
+        for key in sorted(_catalog_models):
+            provider, model_id = key.split("/", 1)
+            raw = _catalog_models[key]
+            result.append({
+                "key": key,
+                "id": model_id,
+                "name": str(raw.get("name") or model_id),
+                "provider_id": provider,
+                "provider_name": _catalog_provider_names.get(provider, provider),
+            })
+        return result
 
 
 def canonical_official_model(model: str) -> str | None:
@@ -1837,13 +1947,19 @@ async def _download_catalog_bounded(client: Any, url: str, budget: int) -> bytes
         return b"".join(chunks)
 
 
-async def refresh_once() -> bool:
-    """Refresh both models.dev catalogs and atomically replace one gzip bundle."""
+async def refresh_once(*, force: bool = False, client: Any = None) -> bool:
+    """Refresh both models.dev catalogs and atomically replace one gzip bundle.
+
+    ``force`` is reserved for the user-triggered metadata sync action.  It
+    bypasses the background ``autoUpdate`` switch because clicking that action
+    is an explicit request to refresh the local catalog first.
+    """
 
     pricing_cfg = config.get().get("pricing", {})
-    if (
-        not isinstance(pricing_cfg, Mapping)
-        or not pricing_cfg.get("enabled", True)
+    if not isinstance(pricing_cfg, Mapping):
+        pricing_cfg = {}
+    if not force and (
+        not pricing_cfg.get("enabled", True)
         or not pricing_cfg.get("autoUpdate", True)
     ):
         return False
@@ -1851,9 +1967,9 @@ async def refresh_once() -> bool:
     models_url = str(pricing_cfg.get("modelsUrl") or _DEFAULT_MODELS_URL).strip()
     if not url.startswith("https://") or not models_url.startswith("https://"):
         raise ValueError("pricing.sourceUrl and pricing.modelsUrl must use https://")
-    from . import upstream
-
-    client = upstream.get_client()
+    if client is None:
+        from . import upstream
+        client = upstream.get_client()
     # Sequential streaming naturally closes a failed/oversized response before
     # the peer starts, and the second source receives only the shared remainder.
     raw_api = await _download_catalog_bounded(
@@ -1939,6 +2055,21 @@ async def refresh_once() -> bool:
         _catalog_revision = revision
         _initialized = True
     return True
+
+
+def refresh_remote_catalog_sync() -> bool:
+    """Fetch models.dev with a loop-local client for a synchronous worker."""
+
+    async def _run() -> bool:
+        from . import network
+
+        client = network.async_client(timeout=20.0, http2=False)
+        try:
+            return await refresh_once(force=True, client=client)
+        finally:
+            await client.aclose()
+
+    return asyncio.run(_run())
 
 
 async def refresh_loop() -> None:

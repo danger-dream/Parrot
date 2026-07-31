@@ -58,9 +58,14 @@ def test_model_metadata_safe_limit_and_independent_compression_model():
 
     metadata = model_metadata.get_metadata("gpt-5.5")
     assert model_metadata.context_window("gpt-5.5") == metadata["contextWindow"]
-    assert model_metadata.safe_prompt_limit("gpt-5.5") == (
-        metadata["contextWindow"] - 20000 - 20000
+    assert model_metadata.compact_trigger_tokens("gpt-5.5") == metadata["compactTriggerTokens"]
+    expected_limit = min(
+        metadata["compactTriggerTokens"],
+        metadata["contextWindow"] - 20000 - 20000,
     )
+    assert model_metadata.safe_prompt_limit("gpt-5.5") == expected_limit
+    assert model_metadata.can_fit_for_compact("gpt-5.5", expected_limit)
+    assert not model_metadata.can_fit_for_compact("gpt-5.5", expected_limit + 1)
     assert model_metadata.get_compression_model() == "gpt-5.5"
     assert "inputPricePer1M" not in metadata
     assert isinstance(metadata["cost"], dict)
@@ -159,7 +164,7 @@ def test_image_base64_is_not_counted_as_text_tokens():
     assert token_counter.count_request_tokens(body, model="deepseek-v4-pro") < 100
 
 
-def test_bound_compression_model_can_fit_replayed_compact_shape():
+def test_bound_compression_model_respects_compact_trigger_for_replayed_shape():
     config.update(lambda c: c.update({
         "modelBindings": {
             "defaults": {"gpt-5.5": {"target": "openai/gpt-5.5", "source": "test"}},
@@ -177,7 +182,8 @@ def test_bound_compression_model_can_fit_replayed_compact_shape():
     direct_body["max_tokens"] = model_metadata.summary_reserve_tokens("gpt-5.5")
     prompt_tokens = token_counter.count_request_tokens(direct_body, model="gpt-5.5")
     assert prompt_tokens < model_metadata.context_window("gpt-5.5")
-    assert model_metadata.can_fit_for_compact("gpt-5.5", prompt_tokens)
+    assert prompt_tokens > model_metadata.compact_trigger_tokens("gpt-5.5")
+    assert not model_metadata.can_fit_for_compact("gpt-5.5", prompt_tokens)
 
 
 def test_compact_split_defaults_to_configured_token_chunks(monkeypatch):
@@ -326,32 +332,39 @@ async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     assert binding.tariff is not None
 
 
-def test_context_guard_skips_claude_code_compact_requests():
-    from server import _anthropic_to_openai_context_preflight
+def test_context_guard_uses_compact_trigger_and_skips_compact_requests(monkeypatch):
+    import server
 
-    config.update(
-        lambda c: c.__setitem__(
-            "modelMetadata",
-            {"gpt-5.5": {"contextWindow": 273_000, "maxOutputTokens": 20_000}},
-        )
+    config.update(lambda c: c.update({
+        "modelBindings": {
+            "defaults": {"gpt-5.5": {"target": "openai/gpt-5.5", "source": "test"}},
+            "scoped": {},
+        },
+        "modelMetadata": {},
+    }))
+    trigger = model_metadata.compact_trigger_tokens("gpt-5.5")
+    assert trigger is not None and trigger < model_metadata.context_window("gpt-5.5")
+    monkeypatch.setattr(
+        server.token_counter, "count_request_tokens",
+        lambda body, model=None: trigger + 1,
     )
     compact_prompt = (
         "CRITICAL: Respond with text only. Create a detailed summary of the conversation so far. "
         "Your summary should include the following sections. After compaction continue."
     )
-    huge_text = ("用户请求：请继续修改文件 /opt/project/src/main.py，并保留所有错误、路径、命令。\n" * 260_000)
     compact_body = {
         "model": "gpt-5.5",
-        "messages": [
-            {"role": "user", "content": huge_text},
-            {"role": "user", "content": compact_prompt},
-        ],
+        "messages": [{"role": "user", "content": compact_prompt}],
     }
     normal_body = {
         "model": "gpt-5.5",
-        "messages": [{"role": "user", "content": huge_text}],
+        "messages": [{"role": "user", "content": "继续处理当前任务"}],
     }
 
     assert compact_rescue.is_claude_code_compact_request(compact_body)
-    assert _anthropic_to_openai_context_preflight(compact_body, _DummyScheduleResult()) is None
-    assert _anthropic_to_openai_context_preflight(normal_body, _DummyScheduleResult()) is not None
+    assert server._anthropic_to_openai_context_preflight(
+        compact_body, _DummyScheduleResult(),
+    ) is None
+    assert server._anthropic_to_openai_context_preflight(
+        normal_body, _DummyScheduleResult(),
+    ) is not None
