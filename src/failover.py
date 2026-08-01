@@ -4506,6 +4506,15 @@ async def _consume_stream(
 
     # 3. 通过检查 → 开始向下游发 ★
     state: dict = {"finalized": False}
+    stream_resources_closed = False
+
+    async def _close_stream_resources() -> None:
+        nonlocal stream_resources_closed
+        if stream_resources_closed:
+            return
+        await _safe_exit(ctx)
+        await _close_proxy_client(proxy_client)
+        stream_resources_closed = True
 
     def _responses_terminal_received() -> bool:
         """Responses 的显式终态就是 I/O 边界，不再额外等待 HTTP EOF。
@@ -4807,6 +4816,16 @@ async def _consume_stream(
             timing_snapshot, "client_disconnected", "client disconnected",
         )
 
+    async def _finalize_terminal_success() -> list[bytes]:
+        """Persist success and release upstream resources before terminal output."""
+
+        terminal_chunks: list[bytes] = []
+        if stream_translator is not None:
+            terminal_chunks = list(stream_translator.close())
+        await await_ws_owned(_finalize_success())
+        await _close_stream_resources()
+        return terminal_chunks
+
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""
         if state["finalized"]:
@@ -4835,10 +4854,9 @@ async def _consume_stream(
                 )
                 return
 
-            for out in first_downstream_chunks:
-                yield out
-
             if getattr(tracker, "saw_stream_error", False):
+                for out in first_downstream_chunks:
+                    yield out
                 msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
                 await await_ws_owned(_emit_error_and_finalize(
                     "api_error", msg,
@@ -4846,12 +4864,23 @@ async def _consume_stream(
                 ))
                 return
 
-            # Responses 已在首个下游 chunk 中给出显式终态时直接收尾；否则继续
-            # 读取。普通 Chat/Anthropic 仍保留原有 EOF/终态生成规则。
-            upstream_terminal = _responses_terminal_received()
+            # Responses 客户端可以在读到 response.completed 后立即返回工具调用，
+            # 不再继续拉取 HTTP EOF，也不一定显式关闭 body iterator。因此显式
+            # 终态必须先完成 Store / retry / request_log 落账，再把终态帧交给下游；
+            # 否则生成器会永久停在 yield，最终被 stale cleaner 误标成 crash。
+            if _responses_terminal_received():
+                terminal_chunks = await _finalize_terminal_success()
+                for out in first_downstream_chunks:
+                    yield out
+                for out in terminal_chunks:
+                    yield out
+                return
+
+            for out in first_downstream_chunks:
+                yield out
 
             # 后续 chunk，带 first-byte / idle / total 超时
-            while not upstream_terminal:
+            while True:
                 step = await read_next_stream_step(
                     aiter=aiter,
                     channel=ch,
@@ -4902,14 +4931,13 @@ async def _consume_stream(
                     yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
                     return
 
-                for out in step.downstream_chunks:
-                    yield out
-
                 # 上游在 stream 中途给出终态错误（Responses event:error /
                 # response.failed，或 Chat/Anthropic error chunk）时，下游通常会在
                 # 收到错误帧后立即断开。这里先把上游原始错误帧转发出去，再落库真实
                 # 错误并结束，避免被 finally/CancelledError 误标成 client disconnected。
                 if getattr(tracker, "saw_stream_error", False):
+                    for out in step.downstream_chunks:
+                        yield out
                     msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
                     await await_ws_owned(_emit_error_and_finalize(
                         "api_error", msg,
@@ -4918,7 +4946,15 @@ async def _consume_stream(
                     return
 
                 if _responses_terminal_received():
-                    upstream_terminal = True
+                    terminal_chunks = await _finalize_terminal_success()
+                    for out in step.downstream_chunks:
+                        yield out
+                    for out in terminal_chunks:
+                        yield out
+                    return
+
+                for out in step.downstream_chunks:
+                    yield out
 
             if not getattr(tracker, "saw_stream_end", False):
                 # A transport EOF after visible output cannot be retried without
@@ -4963,8 +4999,7 @@ async def _consume_stream(
             ))
             raise
         finally:
-            await _safe_exit(ctx)
-            await _close_proxy_client(proxy_client)
+            await _close_stream_resources()
 
     sresp = StreamingResponse(
         stream_generator(),

@@ -456,6 +456,60 @@ def _responses_sse_response(text="ws over sse ok"):
     return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
 
 
+def _responses_sse_function_call_response():
+    output = {
+        "type": "function_call",
+        "id": "fc_sse",
+        "call_id": "call_sse",
+        "name": "lookup",
+        "arguments": '{"q":"ping"}',
+        "status": "completed",
+    }
+    payload = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "sequence_number": 1,
+            "response": {"id": "resp_sse_tool", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {**output, "arguments": "", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item_id": "fc_sse",
+            "name": "lookup",
+            "arguments": output["arguments"],
+        }),
+        _responses_sse_event("response.output_item.done", {
+            "type": "response.output_item.done",
+            "sequence_number": 4,
+            "output_index": 0,
+            "item": output,
+        }),
+        _responses_sse_event("response.completed", {
+            "type": "response.completed",
+            "sequence_number": 5,
+            "response": {
+                "id": "resp_sse_tool",
+                "status": "completed",
+                "output": [output],
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": 4,
+                    "total_tokens": 11,
+                    "input_tokens_details": {"cached_tokens": 2},
+                },
+            },
+        }),
+    ])
+    return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+
 def _chat_sse_response(text="openai chat stream ok"):
     payload = b"".join([
         b'data: {"id":"chatcmpl_sse","object":"chat.completion.chunk","created":1,"model":"gpt-real","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
@@ -3129,6 +3183,184 @@ async def test_native_responses_stream_response_is_saved_for_previous_response_i
         {"type": "input_text", "text": "stream seed"},
     ]}]
     assert rec.output_items[0]["content"][0]["text"] == "native stream stored"
+
+
+async def test_native_responses_function_call_stream_finishes_request_log(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    expected_body = _responses_sse_function_call_response().content
+
+    def handler(req: httpx.Request):
+        assert str(req.url) == "https://responses-stream-tool.example/v1/responses"
+        return httpx.Response(
+            200,
+            content=expected_body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    router.register("https://responses-stream-tool.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-stream-tool",
+            "https://responses-stream-tool.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    resp, mc = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": True,
+        "input": "call lookup",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "description": "Lookup a value",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+        }],
+    })
+    text = await _consume_streaming_to_string(resp)
+    await mc.aclose()
+
+    assert "event: response.completed" in text
+    assert text.encode("utf-8") == expected_body
+    row = m["log_db"]._get_conn().execute(
+        """SELECT request_id, status, http_status, error_message,
+                  input_tokens, output_tokens, cache_read_tokens, usage_observed
+             FROM request_log ORDER BY id DESC LIMIT 1"""
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "success"
+    assert row["http_status"] == 200
+    assert row["error_message"] is None
+    assert (row["input_tokens"], row["output_tokens"], row["cache_read_tokens"]) == (5, 4, 2)
+    assert row["usage_observed"] == 1
+
+    conn = m["log_db"]._get_conn()
+    retry = conn.execute(
+        "SELECT id, outcome FROM retry_chain WHERE request_id=?",
+        (row["request_id"],),
+    ).fetchone()
+    assert retry is not None
+    assert retry["outcome"] == "success"
+    settlement = conn.execute(
+        """SELECT outcome, usage_observed, input_tokens, output_tokens,
+                  cache_read_tokens, dispatch_state
+             FROM upstream_attempt_usage WHERE retry_attempt_id=?""",
+        (retry["id"],),
+    ).fetchone()
+    assert settlement is not None
+    assert dict(settlement) == {
+        "outcome": "success",
+        "usage_observed": 1,
+        "input_tokens": 5,
+        "output_tokens": 4,
+        "cache_read_tokens": 2,
+        "dispatch_state": "sent",
+    }
+    detail = conn.execute(
+        "SELECT response_body FROM request_detail WHERE request_id=?",
+        (row["request_id"],),
+    ).fetchone()
+    assert detail is not None
+    assert detail["response_body"].encode("utf-8") == expected_body
+
+
+async def test_native_responses_function_call_is_logged_before_terminal_event_is_yielded(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    router.register(
+        "https://responses-stream-tool-terminal.example",
+        lambda req: _responses_sse_function_call_response(),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-stream-tool-terminal",
+            "https://responses-stream-tool-terminal.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    resp, mc = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": True,
+        "input": "call lookup",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    })
+    iterator = resp.body_iterator
+    emitted = b""
+    for _ in range(20):
+        chunk = await asyncio.wait_for(anext(iterator), timeout=1.0)
+        emitted += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        if b"event: response.completed" in emitted:
+            break
+
+    assert b"event: response.completed" in emitted
+    row = m["log_db"]._get_conn().execute(
+        "SELECT status, http_status FROM request_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert dict(row) == {"status": "success", "http_status": 200}
+
+    await iterator.aclose()
+    await mc.aclose()
+
+
+async def test_native_responses_function_call_releases_upstream_before_terminal_yield(m):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    hanging = TerminalThenHangByteStream(_responses_sse_function_call_response().content)
+    router.register(
+        "https://responses-stream-tool-release.example",
+        lambda req: httpx.Response(
+            200,
+            stream=hanging,
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            "responses-stream-tool-release",
+            "https://responses-stream-tool-release.example",
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+        ),
+    ])
+
+    resp, mc = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": True,
+        "input": "call lookup",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    })
+    iterator = resp.body_iterator
+    emitted = b""
+    for _ in range(20):
+        chunk = await asyncio.wait_for(anext(iterator), timeout=1.0)
+        emitted += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        if b"event: response.completed" in emitted:
+            break
+
+    assert b"event: response.completed" in emitted
+    assert hanging.closed.is_set()
+
+    await iterator.aclose()
+    await mc.aclose()
 
 
 async def test_responses_client_text_instruction_items_to_openai_chat_fake_upstream(m):
