@@ -108,7 +108,11 @@ DEFAULT_REDUCE_PROMPT = (
     '9. Optional Next Step\n'
     '\n'
     'Durable context excerpts:\n'
-    '{summaries}'
+    '{summaries}\n'
+    '\n'
+    'CRITICAL CURRENT-STATE CHECKPOINT (authoritative latest segment):\n'
+    '{latest_summary}\n'
+    'The checkpoint is intentionally repeated from the final segment. Its latest user request, current work, pending tasks, and immediate next step MUST control final sections 7-9 even when older segments are much longer. Do not mention this repetition or checkpoint in the final summary.'
 )
 
 
@@ -325,19 +329,105 @@ def _tool_result_ids(message: Any) -> list[str]:
     return ids
 
 
+def _compact_prompt_start(text: str) -> int | None:
+    """Return the compact-instruction start offset when all markers match."""
+    low = str(text or "").lower()
+    markers = compact_markers()
+    positions = [low.find(marker) for marker in markers]
+    if not positions or any(pos < 0 for pos in positions):
+        return None
+    return min(positions)
+
+
+def _without_compact_instruction(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Strip compact instructions while preserving user text in the same turn.
+
+    Claude Code can append the compact instruction as a second text block in
+    the user's latest request. Dropping that whole message loses the current
+    task. Standalone compact messages still disappear completely.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        start = _compact_prompt_start(content)
+        if start is None:
+            return message
+        prefix = content[:start].rstrip()
+        if not prefix:
+            return None
+        out = copy.deepcopy(message)
+        out["content"] = prefix
+        return out
+
+    if not isinstance(content, list):
+        return None
+
+    # Locate the text block where the compact instruction begins. In normal
+    # Claude Code requests this is a dedicated block immediately after the
+    # actual user text. The fallback supports custom marker sets as well.
+    marker_block = -1
+    marker_offset = -1
+    markers = compact_markers()
+    for block_idx, block in enumerate(content):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        block_text = str(block.get("text") or "")
+        start = _compact_prompt_start(block_text)
+        if start is not None:
+            marker_block, marker_offset = block_idx, start
+            break
+        low = block_text.lower()
+        positions = [low.find(marker) for marker in markers if low.find(marker) >= 0]
+        if positions:
+            marker_block, marker_offset = block_idx, min(positions)
+            break
+
+    if marker_block < 0:
+        # The full message matched but markers were split across unusual block
+        # boundaries. Preserve blocks before the first marker-bearing text
+        # block when possible; otherwise retain the old safe behavior.
+        return None
+
+    kept = copy.deepcopy(content[:marker_block])
+    marker = content[marker_block]
+    prefix = str(marker.get("text") or "")[:marker_offset].rstrip()
+    if prefix:
+        prefix_block = copy.deepcopy(marker)
+        prefix_block["text"] = prefix
+        kept.append(prefix_block)
+    # Non-text blocks after the compact text remain historical context; later
+    # text blocks are compact-instruction continuation and are intentionally
+    # omitted.
+    kept.extend(
+        copy.deepcopy(block)
+        for block in content[marker_block + 1:]
+        if not (isinstance(block, dict) and block.get("type") == "text")
+    )
+    if not kept:
+        return None
+    out = copy.deepcopy(message)
+    out["content"] = kept
+    return out
+
+
 def _history_without_compact_prompt(messages: list[Any]) -> list[Any]:
     if not messages:
         return []
     # Claude Code's compact prompt is normally near the tail, but another
-    # system reminder may be appended after it. Remove only the compact prompt
-    # message from the history being summarized; reduce uses that prompt.
+    # system reminder may be appended after it. Strip only the compact
+    # instruction; preserve any real user request sharing that message.
     for idx in range(len(messages) - 1, max(-1, len(messages) - 8), -1):
         msg = messages[idx]
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         text = _text_from_content(msg.get("content"))
-        if all(marker in text.lower() for marker in compact_markers()):
-            return messages[:idx] + messages[idx + 1:]
+        if _compact_prompt_start(text) is None:
+            continue
+        replacement = _without_compact_instruction(msg)
+        out = list(messages[:idx])
+        if replacement is not None:
+            out.append(replacement)
+        out.extend(messages[idx + 1:])
+        return out
     return messages
 
 
@@ -395,8 +485,9 @@ def _compact_source_prompt(messages: list[Any]) -> str:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         text = _text_from_content(msg.get("content"))
-        if all(marker in text.lower() for marker in compact_markers()):
-            return text
+        start = _compact_prompt_start(text)
+        if start is not None:
+            return text[start:]
     return ""
 
 
@@ -534,11 +625,12 @@ def build_reduce_summary_body(original_body: dict[str, Any], segment_summaries: 
     base["max_tokens"] = reduce_max_tokens()
     base.pop("max_output_tokens", None)
     prompt = _compact_source_prompt(original_body.get("messages") or [])
+    non_empty_summaries = [summary.strip() for summary in segment_summaries if summary.strip()]
     summaries = "\n\n".join(
-        f"## Segment {i + 1}\n{summary.strip()}"
-        for i, summary in enumerate(segment_summaries)
-        if summary.strip()
+        f"## Segment {i + 1}\n{summary}"
+        for i, summary in enumerate(non_empty_summaries)
     )
+    latest_summary = non_empty_summaries[-1] if non_empty_summaries else ""
     base["messages"] = [{
         "role": "user",
         "content": [{
@@ -546,6 +638,7 @@ def build_reduce_summary_body(original_body: dict[str, Any], segment_summaries: 
             "text": _render_template(settings()["reducePrompt"], {
                 "compact_prompt": prompt,
                 "summaries": summaries,
+                "latest_summary": latest_summary,
             }),
         }],
     }]

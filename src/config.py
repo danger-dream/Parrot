@@ -81,7 +81,11 @@ COMPACT_RESCUE_DEFAULT_REDUCE_PROMPT = (
     '9. Optional Next Step\n'
     '\n'
     'Durable context excerpts:\n'
-    '{summaries}'
+    '{summaries}\n'
+    '\n'
+    'CRITICAL CURRENT-STATE CHECKPOINT (authoritative latest segment):\n'
+    '{latest_summary}\n'
+    'The checkpoint is intentionally repeated from the final segment. Its latest user request, current work, pending tasks, and immediate next step MUST control final sections 7-9 even when older segments are much longer. Do not mention this repetition or checkpoint in the final summary.'
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

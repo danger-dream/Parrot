@@ -147,3 +147,69 @@ def test_map_reduce_bodies_strip_top_controls_and_preserve_segment_messages():
     assert "Original compact instruction" in rendered
     assert "CRITICAL: Respond with TEXT ONLY" in rendered
     assert "latest user request and latest unfinished/current work have highest priority" in rendered
+    assert "CRITICAL CURRENT-STATE CHECKPOINT" in rendered
+    assert rendered.count("<segment_summary>B</segment_summary>") == 2
+
+
+def test_mixed_user_and_compact_text_blocks_preserve_latest_request():
+    latest_request = "按照你的理解改个T-170我看看"
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "older request"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": latest_request},
+                {"type": "text", "text": _compact_prompt()},
+            ],
+        },
+        {"role": "system", "content": "trailing reminder"},
+    ]
+
+    history = compact_rescue._history_without_compact_prompt(messages)
+    assert len(history) == 3
+    assert history[1] == {
+        "role": "user",
+        "content": [{"type": "text", "text": latest_request}],
+    }
+    assert history[2]["content"] == "trailing reminder"
+    assert compact_rescue._compact_source_prompt(messages) == _compact_prompt()
+
+    body = {"messages": messages}
+    direct = compact_rescue.build_direct_summary_body(body, model="m", max_tokens=100)
+    prompt = direct["messages"][0]["content"][0]["text"]
+    transcript = prompt.split("Transcript:\n", 1)[1]
+    assert latest_request in transcript
+    assert "older request" in transcript
+    assert "trailing reminder" in transcript
+    assert "CRITICAL: Respond with TEXT ONLY" not in transcript
+
+
+def test_mixed_single_string_preserves_prefix_and_isolates_compact_prompt():
+    latest_request = "接着审核5.5，把最后来做图纸的修正。"
+    messages = [{
+        "role": "user",
+        "content": latest_request + "\n\n" + _compact_prompt(),
+    }]
+
+    history = compact_rescue._history_without_compact_prompt(messages)
+    assert history == [{"role": "user", "content": latest_request}]
+    assert compact_rescue._compact_source_prompt(messages) == _compact_prompt()
+
+
+def test_standalone_compact_message_is_removed_but_tool_result_is_preserved():
+    messages = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "Read", "input": {}}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+                {"type": "text", "text": _compact_prompt()},
+            ],
+        },
+    ]
+
+    history = compact_rescue._history_without_compact_prompt(messages)
+    assert len(history) == 2
+    assert history[1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+    ]
