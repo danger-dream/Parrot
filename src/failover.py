@@ -1687,6 +1687,7 @@ async def run_failover(
                     retry_attempt_id=attempt_id,
                     start_monotonic=start_monotonic,
                     attempt_start_monotonic=attempt_started_monotonic,
+                    terminal_release=_release_once,
                 )
         except BaseException:
             _release_once()
@@ -3827,6 +3828,7 @@ async def _try_channel(
     retry_attempt_id: int | None = None,
     start_monotonic: float | None = None,
     attempt_start_monotonic: float | None = None,
+    terminal_release=None,
 ) -> AttemptResult:
     if start_monotonic is None:
         start_monotonic = time.monotonic()
@@ -4070,6 +4072,7 @@ async def _try_channel(
             start_monotonic=start_monotonic,
             attempt_start_monotonic=attempt_start_monotonic,
             cancel_state=cancel_state,
+            terminal_release=terminal_release,
         )
         result = _attach_retry_after_from_response(result, upstream_resp)
         if not result.stream_started:
@@ -4471,6 +4474,7 @@ async def _consume_stream(
     start_monotonic: float | None = None,
     attempt_start_monotonic: float | None = None,
     cancel_state: dict[str, Any] | None = None,
+    terminal_release=None,
 ) -> AttemptResult:
     if start_monotonic is None:
         start_monotonic = time.monotonic()
@@ -4507,6 +4511,7 @@ async def _consume_stream(
     # 3. 通过检查 → 开始向下游发 ★
     state: dict = {"finalized": False}
     stream_resources_closed = False
+    terminal_slot_released = False
 
     async def _close_stream_resources() -> None:
         nonlocal stream_resources_closed
@@ -4515,6 +4520,22 @@ async def _consume_stream(
         await _safe_exit(ctx)
         await _close_proxy_client(proxy_client)
         stream_resources_closed = True
+
+    def _release_terminal_slot_once() -> None:
+        nonlocal terminal_slot_released
+        if terminal_slot_released or terminal_release is None:
+            return
+        terminal_slot_released = True
+        try:
+            terminal_release()
+        except Exception:
+            pass
+
+    async def _close_terminal_resources_and_release() -> None:
+        try:
+            await _close_stream_resources()
+        finally:
+            _release_terminal_slot_once()
 
     def _responses_terminal_received() -> bool:
         """Responses 的显式终态就是 I/O 边界，不再额外等待 HTTP EOF。
@@ -4526,6 +4547,12 @@ async def _consume_stream(
         return (
             ch_proto == "openai-responses"
             and bool(getattr(tracker, "saw_stream_end", False))
+        )
+
+    def _responses_terminal_error_received() -> bool:
+        return (
+            _responses_terminal_received()
+            and bool(getattr(tracker, "saw_stream_error", False))
         )
 
     def _finish_stream_timing(outcome: str, error_detail: str | None = None):
@@ -4823,8 +4850,14 @@ async def _consume_stream(
         if stream_translator is not None:
             terminal_chunks = list(stream_translator.close())
         await await_ws_owned(_finalize_success())
-        await _close_stream_resources()
+        await _close_terminal_resources_and_release()
         return terminal_chunks
+
+    async def _finalize_terminal_error(err_type: str, message: str, outcome: str) -> None:
+        """Persist an explicit Responses error and release resources before output."""
+
+        await await_ws_owned(_emit_error_and_finalize(err_type, message, outcome))
+        await _close_terminal_resources_and_release()
 
     async def stream_generator():
         """把首包 + 后续 chunk 转发给下游，同时在中途错误时用 SSE error event 收尾。"""
@@ -4841,11 +4874,11 @@ async def _consume_stream(
                     getattr(tracker, "stream_error_message", None)
                     or protocol_errors.responses_max_output_context_error_message()
                 )
-                await await_ws_owned(_emit_error_and_finalize(
+                await _finalize_terminal_error(
                     errors.ErrType.INVALID_REQUEST,
                     msg,
                     outcome="request_invalid",
-                ))
+                )
                 yield _sse_error_for_ingress(
                     ingress_protocol,
                     errors.ErrType.INVALID_REQUEST,
@@ -4855,13 +4888,21 @@ async def _consume_stream(
                 return
 
             if getattr(tracker, "saw_stream_error", False):
-                for out in first_downstream_chunks:
-                    yield out
                 msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-                await await_ws_owned(_emit_error_and_finalize(
-                    "api_error", msg,
-                    outcome="stream_upstream_error",
-                ))
+                if _responses_terminal_error_received():
+                    await _finalize_terminal_error(
+                        "api_error", msg,
+                        outcome="stream_upstream_error",
+                    )
+                    for out in first_downstream_chunks:
+                        yield out
+                else:
+                    for out in first_downstream_chunks:
+                        yield out
+                    await await_ws_owned(_emit_error_and_finalize(
+                        "api_error", msg,
+                        outcome="stream_upstream_error",
+                    ))
                 return
 
             # Responses 客户端可以在读到 response.completed 后立即返回工具调用，
@@ -4905,11 +4946,18 @@ async def _consume_stream(
                     else:
                         err_type = errors.ErrType.API
                     msg = step.message or "stream error"
-                    await await_ws_owned(_emit_error_and_finalize(
-                        err_type,
-                        msg,
-                        outcome=step.outcome or "transport_error",
-                    ))
+                    if _responses_terminal_error_received():
+                        await _finalize_terminal_error(
+                            err_type,
+                            msg,
+                            outcome=step.outcome or "transport_error",
+                        )
+                    else:
+                        await await_ws_owned(_emit_error_and_finalize(
+                            err_type,
+                            msg,
+                            outcome=step.outcome or "transport_error",
+                        ))
                     yield _sse_error_for_ingress(
                         ingress_protocol,
                         err_type,
@@ -4931,18 +4979,25 @@ async def _consume_stream(
                     yield _sse_error_for_ingress(ingress_protocol, errors.ErrType.API, msg)
                     return
 
-                # 上游在 stream 中途给出终态错误（Responses event:error /
-                # response.failed，或 Chat/Anthropic error chunk）时，下游通常会在
-                # 收到错误帧后立即断开。这里先把上游原始错误帧转发出去，再落库真实
-                # 错误并结束，避免被 finally/CancelledError 误标成 client disconnected。
+                # Responses 的显式错误终态与 completed 一样，是客户端停止读取的
+                # 正常边界：必须先落库、关闭上游并释放渠道 slot，再原样转发终态。
+                # 非终态 event:error 及 Chat/Anthropic error chunk 保持原有时序。
                 if getattr(tracker, "saw_stream_error", False):
-                    for out in step.downstream_chunks:
-                        yield out
                     msg = getattr(tracker, "stream_error_message", None) or "upstream stream error"
-                    await await_ws_owned(_emit_error_and_finalize(
-                        "api_error", msg,
-                        outcome="stream_upstream_error",
-                    ))
+                    if _responses_terminal_error_received():
+                        await _finalize_terminal_error(
+                            "api_error", msg,
+                            outcome="stream_upstream_error",
+                        )
+                        for out in step.downstream_chunks:
+                            yield out
+                    else:
+                        for out in step.downstream_chunks:
+                            yield out
+                        await await_ws_owned(_emit_error_and_finalize(
+                            "api_error", msg,
+                            outcome="stream_upstream_error",
+                        ))
                     return
 
                 if _responses_terminal_received():

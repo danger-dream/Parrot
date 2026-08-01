@@ -118,15 +118,16 @@ class ChunkedByteStream(httpx.AsyncByteStream):
 
 
 class TerminalThenHangByteStream(httpx.AsyncByteStream):
-    """Yield one complete Responses payload but deliberately never send EOF."""
+    """Yield complete Responses payload chunk(s) but deliberately never send EOF."""
 
-    def __init__(self, payload: bytes):
-        self.payload = payload
+    def __init__(self, payload: bytes | list[bytes]):
+        self.payloads = [payload] if isinstance(payload, bytes) else list(payload)
         self.release = asyncio.Event()
         self.closed = asyncio.Event()
 
     async def __aiter__(self):
-        yield self.payload
+        for payload in self.payloads:
+            yield payload
         await self.release.wait()
 
     async def aclose(self):
@@ -3335,6 +3336,7 @@ async def test_native_responses_function_call_releases_upstream_before_terminal_
             protocol="openai-responses",
             alias="gpt-5",
             real="gpt-real",
+            extra={"maxConcurrent": 1},
         ),
     ])
 
@@ -3348,6 +3350,13 @@ async def test_native_responses_function_call_releases_upstream_before_terminal_
             "parameters": {"type": "object", "properties": {}},
         }],
     })
+    channel_key = "api:responses-stream-tool-release"
+    channel_rows = {
+        row["channel_key"]: row
+        for row in m["failover"].concurrency.snapshot()
+    }
+    assert channel_rows[channel_key]["in_flight"] == 1
+
     iterator = resp.body_iterator
     emitted = b""
     for _ in range(20):
@@ -3358,6 +3367,145 @@ async def test_native_responses_function_call_releases_upstream_before_terminal_
 
     assert b"event: response.completed" in emitted
     assert hanging.closed.is_set()
+    channel_rows = {
+        row["channel_key"]: row
+        for row in m["failover"].concurrency.snapshot()
+    }
+    assert channel_rows[channel_key]["in_flight"] == 0
+
+    await iterator.aclose()
+    await mc.aclose()
+
+
+@pytest.mark.parametrize("terminal_kind", ["failed", "incomplete"])
+async def test_native_responses_error_terminal_finalizes_before_yield(m, terminal_kind):
+    _setup(m)
+    _install_keys(m, _default_key())
+    router = MockRouter()
+    channel_name = f"responses-stream-{terminal_kind}-terminal"
+    base_url = f"https://{channel_name}.example"
+    response_id = f"resp_{terminal_kind}_terminal"
+    visible_prefix = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created",
+            "sequence_number": 1,
+            "response": {"id": response_id, "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": f"msg_{terminal_kind}",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+        }),
+        _responses_sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "sequence_number": 3,
+            "item_id": f"msg_{terminal_kind}",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "partial output",
+        }),
+    ])
+    if terminal_kind == "failed":
+        terminal_payload = _responses_sse_event("response.failed", {
+            "type": "response.failed",
+            "sequence_number": 4,
+            "response": {
+                "id": response_id,
+                "status": "failed",
+                "error": {"code": "server_error", "message": "generation failed"},
+                "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            },
+        })
+        expected_output = b"event: response.failed"
+        expected_http_status = 200
+        expected_error = "generation failed"
+        expected_retry_outcome = "stream_upstream_error"
+    else:
+        terminal_payload = _responses_sse_event("response.incomplete", {
+            "type": "response.incomplete",
+            "sequence_number": 4,
+            "response": {
+                "id": response_id,
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            },
+        })
+        expected_output = b"context_length_exceeded"
+        expected_http_status = 400
+        expected_error = "max_output_tokens"
+        expected_retry_outcome = "request_invalid"
+
+    hanging = TerminalThenHangByteStream([visible_prefix, terminal_payload])
+    router.register(
+        base_url,
+        lambda req: httpx.Response(
+            200,
+            stream=hanging,
+            headers={"content-type": "text/event-stream"},
+        ),
+    )
+    _install_channels(m, [
+        _make_openai_channel(
+            channel_name,
+            base_url,
+            protocol="openai-responses",
+            alias="gpt-5",
+            real="gpt-real",
+            extra={"maxConcurrent": 1},
+        ),
+    ])
+
+    resp, mc = await _call_openai_handler(m, router, "responses", {
+        "model": "gpt-5",
+        "stream": True,
+        "input": "produce a terminal error",
+    })
+    channel_key = f"api:{channel_name}"
+    channel_rows = {
+        row["channel_key"]: row
+        for row in m["failover"].concurrency.snapshot()
+    }
+    assert channel_rows[channel_key]["in_flight"] == 1
+
+    iterator = resp.body_iterator
+    emitted = b""
+    for _ in range(20):
+        chunk = await asyncio.wait_for(anext(iterator), timeout=1.0)
+        emitted += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        if expected_output in emitted:
+            break
+
+    assert expected_output in emitted
+    row = m["log_db"]._get_conn().execute(
+        """SELECT request_id, status, http_status, error_message
+             FROM request_log ORDER BY id DESC LIMIT 1"""
+    ).fetchone()
+    assert row is not None
+    assert row["status"] == "error"
+    assert row["http_status"] == expected_http_status
+    assert expected_error in row["error_message"]
+    retry = m["log_db"]._get_conn().execute(
+        "SELECT outcome FROM retry_chain WHERE request_id=?",
+        (row["request_id"],),
+    ).fetchone()
+    assert retry is not None
+    assert retry["outcome"] == expected_retry_outcome
+    assert hanging.closed.is_set()
+    channel_rows = {
+        item["channel_key"]: item
+        for item in m["failover"].concurrency.snapshot()
+    }
+    assert channel_rows[channel_key]["in_flight"] == 0
 
     await iterator.aclose()
     await mc.aclose()
