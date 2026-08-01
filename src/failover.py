@@ -2155,6 +2155,7 @@ async def run_failover(
                             retry_attempt_id=attempt_id,
                             start_monotonic=start_monotonic,
                             attempt_start_monotonic=attempt_started_monotonic2,
+                            terminal_release=_release_q,
                         )
                 except BaseException:
                     _release_q()
