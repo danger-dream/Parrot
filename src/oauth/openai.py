@@ -1105,17 +1105,14 @@ def parse_rate_limit_headers(headers: Any) -> dict | None:
     return snap
 
 
-def normalize_codex_snapshot(snap: dict) -> dict:
-    """把 primary/secondary 映射到 5h/7d。参考 sub2api `Normalize()`。
+def codex_snapshot_window_map(snap: dict) -> dict[str, str]:
+    """Map Codex primary/secondary headers to semantic 5h/7d windows.
 
-    策略：有 window_minutes 时，较小窗口归为 5h、较大归为 7d；只有一边
-    window_minutes 时按 ≤360 min 判 5h。两边都缺 → 回落把 primary 当 7d。
-    返回 {"five_hour_util", "five_hour_reset_sec", "seven_day_util", ...}
-    （沿用现有 `oauth_quota_cache.five_hour_*` 列名，避免多套展示逻辑）。
+    Keep this mapping in one place: quota persistence and recovery must agree
+    about which fresh WHAM window can supersede each response-header window.
     """
-    p_win = snap.get("primary_window_min")
-    s_win = snap.get("secondary_window_min")
-
+    p_win = _coerce_int(snap.get("primary_window_min"))
+    s_win = _coerce_int(snap.get("secondary_window_min"))
     use_5h_from_primary = False
     if p_win is not None and s_win is not None:
         if p_win < s_win:
@@ -1136,6 +1133,21 @@ def normalize_codex_snapshot(snap: dict) -> dict:
         pass        # 两边都没有 window_min：回落
 
     if use_5h_from_primary:
+        return {"primary": "five_hour", "secondary": "seven_day"}
+    return {"primary": "seven_day", "secondary": "five_hour"}
+
+
+def normalize_codex_snapshot(snap: dict) -> dict:
+    """把 primary/secondary 映射到 5h/7d。参考 sub2api `Normalize()`。
+
+    策略：有 window_minutes 时，较小窗口归为 5h、较大归为 7d；只有一边
+    window_minutes 时按 ≤360 min 判 5h。两边都缺 → 回落把 primary 当 7d。
+    返回 {"five_hour_util", "five_hour_reset_sec", "seven_day_util", ...}
+    （沿用现有 `oauth_quota_cache.five_hour_*` 列名，避免多套展示逻辑）。
+    """
+    window_map = codex_snapshot_window_map(snap)
+
+    if window_map["primary"] == "five_hour":
         five_util, five_reset = snap.get("primary_used_pct"), snap.get("primary_reset_sec")
         seven_util, seven_reset = snap.get("secondary_used_pct"), snap.get("secondary_reset_sec")
     else:

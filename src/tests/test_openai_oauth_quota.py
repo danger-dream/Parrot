@@ -506,6 +506,395 @@ def test_openai_quota_ignores_expired_codex_snapshot_missing_reset(m):
     print("  [PASS] OpenAI quota ignores stale Codex over-threshold snapshot without reset")
 
 
+def _save_codex_over_threshold_snapshot(
+    m,
+    key,
+    email,
+    *,
+    primary_pct=95,
+    primary_window_min=10080,
+    primary_reset_after="604800",
+    secondary_pct=0,
+    secondary_window_min=300,
+    secondary_reset_after="18000",
+):
+    """Persist a Codex response-header snapshot that is over threshold."""
+    headers = {
+        "x-codex-primary-used-percent": str(primary_pct),
+        "x-codex-primary-window-minutes": str(primary_window_min),
+        "x-codex-secondary-used-percent": str(secondary_pct),
+        "x-codex-secondary-window-minutes": str(secondary_window_min),
+    }
+    if primary_reset_after is not None:
+        headers["x-codex-primary-reset-after-seconds"] = str(primary_reset_after)
+    if secondary_reset_after is not None:
+        headers["x-codex-secondary-reset-after-seconds"] = str(secondary_reset_after)
+    snap = m["openai_provider"].parse_rate_limit_headers(headers)
+    assert snap is not None
+    m["state_db"].quota_save_openai_snapshot(
+        key, snap, m["openai_provider"].normalize_codex_snapshot(snap), email=email,
+    )
+
+
+def _set_quota_timestamps(m, key, *, passive_ms, usage_ms):
+    conn = m["state_db"]._get_conn()
+    conn.execute(
+        "UPDATE oauth_quota_cache SET last_passive_update_at=?, fetched_at=? "
+        "WHERE account_key=?",
+        (passive_ms, usage_ms, key),
+    )
+    conn.commit()
+
+
+def test_openai_quota_resumes_when_fresh_wham_supersedes_codex_snapshot(m):
+    """An early upstream reset must not stay blocked by an older header snapshot.
+
+    Regression: the cached snapshot predicted its reset as
+    ``last_passive_update_at + reset_after_seconds``, i.e. a full 7d window. When
+    OpenAI resets the window early, WHAM reports 0% while that prediction is
+    still in the future, so the account stayed quota-disabled for days.
+    """
+    _setup(m)
+    email = "early-reset@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    _save_codex_over_threshold_snapshot(m, key, email)
+
+    now = m["state_db"].now_ms()
+    # Header snapshot sampled a day ago; WHAM refreshed just now.
+    _set_quota_timestamps(m, key, passive_ms=now - 24 * 3600 * 1000, usage_ms=now)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, _low_wham(), threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "resumed", result
+    assert result["any_over"] is False, result
+    assert result["hit_windows"] == [], result
+    assert acc.get("enabled") is True, acc
+    assert acc.get("disabled_reason") is None, acc
+    assert acc.get("disabled_until") is None, acc
+    print("  [PASS] OpenAI quota resumes when fresh WHAM supersedes Codex snapshot")
+
+
+def test_openai_quota_keeps_boundary_codex_snapshot_authoritative(m):
+    """Near-simultaneous WHAM/Codex data must still let the snapshot win.
+
+    This is the original guard: WHAM can briefly report low usage right after a
+    Codex response header said the window is exhausted. Only clearly older
+    snapshots may be discarded.
+    """
+    _setup(m)
+    email = "boundary@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    _save_codex_over_threshold_snapshot(m, key, email)
+
+    now = m["state_db"].now_ms()
+    # WHAM is newer, but only by a minute: inside the boundary margin.
+    _set_quota_timestamps(m, key, passive_ms=now - 60 * 1000, usage_ms=now)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, _low_wham(), threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "still_over_quota", result
+    assert result["any_over"] is True, result
+    assert "codex primary 95%" in result["hit_windows"], result
+    assert acc.get("enabled") is False, acc
+    assert acc.get("disabled_reason") == "quota", acc
+    print("  [PASS] OpenAI quota keeps boundary Codex snapshot authoritative")
+
+
+def test_openai_quota_keeps_old_7d_codex_hit_when_wham_only_has_low_5h(m):
+    """A low WHAM 5h window cannot supersede a missing WHAM 7d window."""
+    _setup(m)
+    email = "partial-wham-7d@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    _save_codex_over_threshold_snapshot(m, key, email)
+
+    now = m["state_db"].now_ms()
+    _set_quota_timestamps(m, key, passive_ms=now - 24 * 3600 * 1000, usage_ms=now)
+    usage = _low_wham()
+    usage["seven_day"] = {}
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, usage, threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "still_over_quota", result
+    assert "codex primary 95%" in result["hit_windows"], result
+    assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    print("  [PASS] low WHAM 5h cannot clear an old Codex 7d hit")
+
+
+def test_openai_quota_keeps_old_5h_codex_hit_when_wham_only_has_low_7d(m):
+    """A low WHAM 7d window cannot supersede a missing WHAM 5h window."""
+    _setup(m)
+    email = "partial-wham-5h@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    _save_codex_over_threshold_snapshot(
+        m,
+        key,
+        email,
+        primary_pct=0,
+        secondary_pct=95,
+    )
+
+    now = m["state_db"].now_ms()
+    _set_quota_timestamps(m, key, passive_ms=now - 3600 * 1000, usage_ms=now)
+    usage = _low_wham()
+    usage["five_hour"] = {}
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, usage, threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "still_over_quota", result
+    assert "codex secondary 95%" in result["hit_windows"], result
+    assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    print("  [PASS] low WHAM 7d cannot clear an old Codex 5h hit")
+
+
+def test_codex_window_supersede_requires_active_newer_wham(m):
+    """Missing, stale, boundary-new and non-WHAM evidence remains fail-closed."""
+    _setup(m)
+    email = "supersede-gates@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    _save_codex_over_threshold_snapshot(m, key, email)
+    om = m["oauth_manager"]
+    now = m["state_db"].now_ms()
+    margin = om._CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS
+
+    for passive_ms, usage_ms, usage in (
+        (None, now, _low_wham()),
+        (now, 0, _low_wham()),
+        (now, now - margin, _low_wham()),
+        (now - margin + 1, now, _low_wham()),
+        (now - margin, now, {**_low_wham(), "openai": {"source": "cache"}}),
+    ):
+        _set_quota_timestamps(m, key, passive_ms=passive_ms, usage_ms=usage_ms)
+        hit = om._cached_openai_codex_quota_hit(key, 95, usage)
+        assert hit["any_over"] is True, (passive_ms, usage_ms, usage, hit)
+
+    _set_quota_timestamps(m, key, passive_ms=now - margin, usage_ms=now)
+    hit = om._cached_openai_codex_quota_hit(key, 95, _low_wham())
+    assert hit["any_over"] is False, hit
+
+    for invalid in (-1, float("nan"), False, "not-a-number"):
+        usage = _low_wham()
+        usage["seven_day"] = {"utilization": invalid}
+        hit = om._cached_openai_codex_quota_hit(key, 95, usage)
+        assert hit["any_over"] is True, (invalid, hit)
+    print("  [PASS] Codex supersede requires active WHAM and the full time margin")
+
+
+def test_quota_monitor_resumes_openai_after_early_upstream_reset(m):
+    """End-to-end monitor tick: save fresh WHAM, then resume the account."""
+    import asyncio
+
+    _setup(m)
+    email = "monitor-early-reset@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    _save_codex_over_threshold_snapshot(m, key, email)
+
+    now = m["state_db"].now_ms()
+    _set_quota_timestamps(m, key, passive_ms=now - 24 * 3600 * 1000, usage_ms=now - 24 * 3600 * 1000)
+
+    async def _fake_fetch_usage(account_key):
+        assert account_key == key, account_key
+        return _low_wham()
+
+    original = m["oauth_manager"].fetch_usage
+    m["oauth_manager"].fetch_usage = _fake_fetch_usage
+    try:
+        out = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    finally:
+        m["oauth_manager"].fetch_usage = original
+
+    acc = m["oauth_manager"].get_account(key)
+    assert out.get(email) == "resumed", out
+    assert acc.get("enabled") is True, acc
+    assert acc.get("disabled_reason") is None, acc
+    row = m["state_db"].quota_load(key)
+    # The monitor writes fresh WHAM usage; the old header snapshot columns stay
+    # but no longer veto recovery.
+    assert row["fetched_at"] > row["last_passive_update_at"], row
+    print("  [PASS] quota_monitor resumes OpenAI account after early upstream reset")
+
+
+def test_new_codex_hit_survives_sqlite_snapshot_write_failure(m):
+    """A real-time high header must survive an auxiliary SQLite write failure."""
+    import asyncio
+
+    _setup(m)
+    email = "snapshot-write-failure@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    _save_codex_over_threshold_snapshot(m, key, email)
+    now = m["state_db"].now_ms()
+    _set_quota_timestamps(
+        m, key, passive_ms=now - 24 * 3600 * 1000, usage_ms=now - 24 * 3600 * 1000,
+    )
+
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(key))
+    response = _MockResp({
+        "x-codex-primary-used-percent": "99",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-after-seconds": "604800",
+        "x-codex-secondary-used-percent": "0",
+        "x-codex-secondary-window-minutes": "300",
+    })
+    original_save = m["state_db"].quota_save_openai_snapshot
+
+    def _locked(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    m["state_db"].quota_save_openai_snapshot = _locked
+    try:
+        m["failover"]._maybe_record_codex_snapshot(ch, response)
+    finally:
+        m["state_db"].quota_save_openai_snapshot = original_save
+
+    acc = m["oauth_manager"].get_account(key)
+    assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    assert acc.get("quota_observation_generation") == 1, acc
+    observation = acc.get("quota_observation") or {}
+    assert observation.get("source") == "openai_codex_headers", observation
+    assert observation.get("snapshot", {}).get("primary_used_pct") == 99.0, observation
+    disk_acc = _disk_account(m["config"], email)
+    assert disk_acc.get("quota_observation_generation") == 1, disk_acc
+    assert key not in m["failover"]._codex_snapshot_last
+
+    # A monitor tick writes fresh low WHAM data, updating fetched_at but leaving
+    # the old SQLite Codex columns. The newer persistent observation must still
+    # win the boundary.
+    usage = _low_wham()
+    original_fetch = m["oauth_manager"].fetch_usage
+
+    async def _fetch(account_key):
+        assert account_key == key, account_key
+        return usage
+
+    m["oauth_manager"].fetch_usage = _fetch
+    try:
+        out = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    finally:
+        m["oauth_manager"].fetch_usage = original_fetch
+
+    acc = m["oauth_manager"].get_account(key)
+    assert out.get(email) == "still_over_quota", out
+    hit = m["oauth_manager"]._cached_openai_codex_quota_hit(key, 95, usage)
+    assert "codex primary 99%" in hit["hit_windows"], hit
+    assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+
+    # Once complete WHAM evidence is genuinely newer than the persistent
+    # observation, recovery is allowed and consumes the observation without
+    # resetting the monotonic generation.
+    def _age_observation(c):
+        target = next(a for a in c["oauthAccounts"] if a.get("email") == email)
+        target["quota_observation"]["observed_at"] = (
+            m["state_db"].now_ms() - 24 * 3600 * 1000
+        )
+
+    m["config"].update(_age_observation)
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, usage, threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "resumed", result
+    assert acc["enabled"] is True and acc.get("disabled_reason") is None, acc
+    assert acc.get("quota_observation") is None, acc
+    assert acc.get("quota_observation_generation") == 1, acc
+    print("  [PASS] real-time Codex hit survives SQLite snapshot write failure")
+
+
+def test_new_codex_hit_during_recovery_fails_generation_cas(m):
+    """A high header arriving after evaluation but before enable must win."""
+    _setup(m)
+    email = "recovery-cas@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    m["oauth_manager"].set_disabled_by_quota(key, "2099-01-01T00:00:00Z")
+    _save_codex_over_threshold_snapshot(m, key, email)
+    now = m["state_db"].now_ms()
+    _set_quota_timestamps(m, key, passive_ms=now - 24 * 3600 * 1000, usage_ms=now)
+
+    snap = m["openai_provider"].parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "99",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-after-seconds": "604800",
+    })
+    original_clear = m["oauth_manager"]._clear_oauth_runtime_state
+
+    def _clear_then_observe(*args, **kwargs):
+        out = original_clear(*args, **kwargs)
+        m["failover"]._maybe_auto_disable_by_codex_snapshot(key, email, snap)
+        return out
+
+    m["oauth_manager"]._clear_oauth_runtime_state = _clear_then_observe
+    try:
+        result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+            key, _low_wham(), threshold=95, fresh=True,
+        )
+    finally:
+        m["oauth_manager"]._clear_oauth_runtime_state = original_clear
+
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "quota_observation_conflict", result
+    assert result["error_code"] == "account_state_conflict", result
+    assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    assert acc.get("quota_observation_generation") == 2, acc
+    assert (acc.get("quota_observation") or {}).get("snapshot", {}).get(
+        "primary_used_pct"
+    ) == 99.0, acc
+    print("  [PASS] recovery enable CAS rejects a newer Codex observation")
+
+
+def test_codex_observation_generation_isolated_per_workspace(m):
+    """Same-email OpenAI workspaces must never share recovery generations."""
+    _setup(m)
+    email = "shared-workspaces@openai.test"
+    for workspace in ("workspace-a", "workspace-b"):
+        m["oauth_manager"].add_account({
+            "email": email,
+            "provider": "openai",
+            "access_token": f"at-{workspace}",
+            "refresh_token": f"rt-{workspace}",
+            "id_token": "h.p.s",
+            "chatgpt_account_id": workspace,
+            "workspace_id": workspace,
+            "plan_type": "team",
+        })
+    key_a = f"openai:{email}:workspace-a"
+    key_b = f"openai:{email}:workspace-b"
+    snap = m["openai_provider"].parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "99",
+        "x-codex-primary-window-minutes": "10080",
+        "x-codex-primary-reset-after-seconds": "604800",
+    })
+
+    m["failover"]._maybe_auto_disable_by_codex_snapshot(key_a, email, snap)
+
+    acc_a = m["oauth_manager"].get_account(key_a)
+    acc_b = m["oauth_manager"].get_account(key_b)
+    assert acc_a["enabled"] is False and acc_a["disabled_reason"] == "quota", acc_a
+    assert acc_a.get("quota_observation_generation") == 1, acc_a
+    assert acc_b["enabled"] is True and acc_b.get("disabled_reason") is None, acc_b
+    assert acc_b.get("quota_observation_generation") is None, acc_b
+    assert acc_b.get("quota_observation") is None, acc_b
+    print("  [PASS] Codex observation generations stay isolated per workspace")
+
+
 def test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until(m):
     """Fresh low usage must override an obsolete predicted disabled_until."""
     _setup(m)
@@ -1221,6 +1610,15 @@ def main():
         test_oauth_menu_refresh_usage_openai_auto_disables_over_quota,
         test_openai_quota_resume_respects_active_codex_snapshot,
         test_openai_quota_ignores_expired_codex_snapshot_missing_reset,
+        test_openai_quota_resumes_when_fresh_wham_supersedes_codex_snapshot,
+        test_openai_quota_keeps_boundary_codex_snapshot_authoritative,
+        test_openai_quota_keeps_old_7d_codex_hit_when_wham_only_has_low_5h,
+        test_openai_quota_keeps_old_5h_codex_hit_when_wham_only_has_low_7d,
+        test_codex_window_supersede_requires_active_newer_wham,
+        test_quota_monitor_resumes_openai_after_early_upstream_reset,
+        test_new_codex_hit_survives_sqlite_snapshot_write_failure,
+        test_new_codex_hit_during_recovery_fails_generation_cas,
+        test_codex_observation_generation_isolated_per_workspace,
         test_openai_quota_resume_uses_fresh_usage_over_future_disabled_until,
         test_quota_monitor_notifies_when_openai_quota_really_resumes,
         test_openai_plan_workspace_label_disambiguates_same_email,

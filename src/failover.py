@@ -259,7 +259,8 @@ def forget_anthropic_snapshot(account_key_or_email: str) -> None:
 #   - Anthropic: surpassed-threshold=true OR utilization>=1.0（任一窗口）
 #   - OpenAI  : primary/secondary used_percent ≥ disableThresholdPercent (default 95)
 #
-# 幂等：账号已是 disabled_reason="quota" 时不重复置位。
+# 幂等：账号已是 disabled_reason="quota" 时不重复通知或移动恢复时间，但仍
+# 持久化最新 observation generation，供并发恢复 CAS 使用。
 # auth_error / user 禁用的账号不碰（保留原始禁用原因）。
 
 
@@ -334,7 +335,7 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
     from . import oauth_manager
 
     acc = oauth_manager.get_account(account_key)
-    if acc is None or acc.get("disabled_reason"):
+    if acc is None or acc.get("disabled_reason") not in (None, "quota"):
         return
 
     threshold = _get_quota_disable_threshold_pct()
@@ -378,9 +379,18 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
         latest_iso = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
-        oauth_manager.set_disabled_by_quota(account_key, latest_iso)
+        disable_result = oauth_manager.set_disabled_by_quota(
+            account_key,
+            latest_iso,
+            observation=oauth_manager.codex_quota_observation(snap),
+        )
     except Exception as exc:
         print(f"[failover] auto-disable (codex) failed for {account_key}: {exc}")
+        return
+
+    # A quota-disabled account still records a new generation/observation for
+    # recovery CAS, but only the transition from enabled emits a notification.
+    if (disable_result or {}).get("state") != "disabled":
         return
 
     try:
