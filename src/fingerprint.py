@@ -286,6 +286,7 @@ def stable_openai_affinity_key(
     requested_model = str(model or "").strip()
     if not identifier or kind not in (
         "session-id", "prompt_cache_key", "claude-code-session-id",
+        "claude-code-agent-id",
     ):
         return None
     if protocol not in ("chat", "responses") or not requested_model:

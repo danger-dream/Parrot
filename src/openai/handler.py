@@ -247,22 +247,40 @@ def _stable_prompt_cache_key(
     return f"{_auto_prompt_cache_prefix()}:stable:{digest}"
 
 
-def _claude_code_session_prompt_cache_key(
+def _effective_claude_code_stable_identity(
     claude_code_session_id: str | None,
+    claude_code_agent_id: str | None,
+) -> tuple[str, str]:
+    """选择 Claude Code 稳定链身份；孤立 agent ID 不创建 Claude 会话链。"""
+    session_id = str(claude_code_session_id or "").strip()
+    if not session_id:
+        return "", ""
+    agent_id = str(claude_code_agent_id or "").strip()
+    if agent_id:
+        return "claude-code-agent-id", agent_id
+    return "claude-code-session-id", session_id
+
+
+def _claude_code_identity_prompt_cache_key(
+    claude_code_session_id: str | None,
+    claude_code_agent_id: str | None = None,
     *,
     api_key_name: str,
     client_ip: str,
     model: str,
     ingress_protocol: str,
 ) -> str | None:
-    """从 Claude Code 原生会话 ID 派生稳定的 prompt cache key。
+    """从 Claude Code effective identity 派生稳定的 prompt cache key。
 
+    父 session 存在且 agent ID 非空时仅使用裸 agent ID；否则沿用父 session。
     原始 header 不进入 PCK 或上游 payload；同时沿用 stable anchor 的调用方
-    隔离维度，避免不同 Key/IP/模型/入口共用缓存路由。只要该 header 存在，
-    它就优先于内容派生的 stable anchor，避免同一 Claude Code 会话中途换 key。
+    隔离维度，避免不同 Key/IP/模型/入口共用缓存路由。Claude identity 优先于
+    内容派生的 stable anchor，避免同一 Claude Code 链中途换 key。
     """
-    session_id = str(claude_code_session_id or "").strip()
-    if not session_id:
+    identity_kind, identity = _effective_claude_code_stable_identity(
+        claude_code_session_id, claude_code_agent_id,
+    )
+    if not identity:
         return None
     material = {
         "v": 1,
@@ -270,11 +288,17 @@ def _claude_code_session_prompt_cache_key(
         "client_ip": client_ip or "",
         "model": model or "",
         "ingress_protocol": ingress_protocol or "",
-        "claude_code_session_id": session_id,
     }
+    if identity_kind == "claude-code-agent-id":
+        material["claude_code_agent_id"] = identity
+        identity_label = "claude-agent"
+    else:
+        # 保持无 agent 请求既有的 hash 材料和 key 命名完全不变。
+        material["claude_code_session_id"] = identity
+        identity_label = "claude-session"
     raw = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-    return f"{_auto_prompt_cache_prefix()}:claude-session:{digest}"
+    return f"{_auto_prompt_cache_prefix()}:{identity_label}:{digest}"
 
 
 def _maybe_apply_auto_prompt_cache_key(
@@ -286,13 +310,14 @@ def _maybe_apply_auto_prompt_cache_key(
     model: str = "",
     ingress_protocol: str = "chat",
     claude_code_session_id: str | None = None,
+    claude_code_agent_id: str | None = None,
 ) -> str | None:
     """OpenAI 协议专用：下游未传 prompt_cache_key 时自动补一个。
 
-    优先级：下游显式值 → fingerprint 亲和链值 → Claude Code session key →
+    优先级：下游显式值 → fingerprint 亲和链值 → Claude Code identity key →
     稳定 anchor key → 随机兜底。成功响应后由 failover 把最终 key 绑定到
-    fp_write。Claude Code 的原生 session ID 必须先于内容 anchor，避免第二条
-    user/tool 回灌出现后在同一会话中切换 prompt_cache_key。
+    fp_write。Claude Code 的 effective identity 必须先于内容 anchor，避免第二条
+    user/tool 回灌出现后在同一稳定链中切换 prompt_cache_key。
     """
     if not isinstance(body, dict):
         return None
@@ -313,8 +338,9 @@ def _maybe_apply_auto_prompt_cache_key(
             if val:
                 key = val
     if not key:
-        key = _claude_code_session_prompt_cache_key(
+        key = _claude_code_identity_prompt_cache_key(
             claude_code_session_id,
+            claude_code_agent_id,
             api_key_name=api_key_name,
             client_ip=client_ip,
             model=model,
@@ -349,8 +375,9 @@ def _openai_http_affinity_keys(
     """Return ``(effective, legacy_transcript)`` OpenAI affinity keys.
 
     A stable ``session-id`` header wins over a client-explicit
-    ``prompt_cache_key``, followed by Claude Code's native session header.  When
-    none exists the historical transcript fingerprint remains authoritative.
+    ``prompt_cache_key``, followed by Claude Code's effective identity.  A child
+    agent ID replaces its parent session ID only when both headers exist.  When no
+    stable identity exists the historical transcript fingerprint remains authoritative.
     Stable identifiers are hashed with the API-key tenant/protocol/model boundary
     before they are used as affinity keys.
     """
@@ -367,6 +394,12 @@ def _openai_http_affinity_keys(
     claude_code_session_id = str(
         headers.get("x-claude-code-session-id") or ""
     ).strip()
+    claude_code_agent_id = str(
+        headers.get("x-claude-code-agent-id") or ""
+    ).strip()
+    claude_identity_kind, claude_identity = _effective_claude_code_stable_identity(
+        claude_code_session_id, claude_code_agent_id,
+    )
     explicit_pck = ""
     client_fields = body.get("_client_body_fields")
     if (
@@ -379,10 +412,8 @@ def _openai_http_affinity_keys(
         stable_kind, stable_value = "session-id", session_id
     elif explicit_pck:
         stable_kind, stable_value = "prompt_cache_key", explicit_pck
-    elif claude_code_session_id:
-        stable_kind, stable_value = (
-            "claude-code-session-id", claude_code_session_id,
-        )
+    elif claude_identity:
+        stable_kind, stable_value = claude_identity_kind, claude_identity
     else:
         stable_kind, stable_value = "", ""
     stable = fingerprint.stable_openai_affinity_key(
@@ -528,8 +559,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     body["_api_key_name"] = key_name or ""
 
     # 5. fingerprint_query（会话亲和）。稳定 session-id header 优先，其次
-    # 下游显式 prompt_cache_key、Claude Code session；没有稳定标识时保持
-    # 旧 transcript fingerprint。
+    # 下游显式 prompt_cache_key、Claude Code effective identity；没有稳定标识时
+    # 保持旧 transcript fingerprint。
     fp_query, legacy_fp_query = _openai_http_affinity_keys(
         request.headers,
         body,
@@ -559,6 +590,7 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         model=model,
         ingress_protocol=ingress_protocol,
         claude_code_session_id=request.headers.get("x-claude-code-session-id"),
+        claude_code_agent_id=request.headers.get("x-claude-code-agent-id"),
     )
 
     # 6. pending 日志；剥掉下划线前缀的内部 metadata（_api_key_name 等）后再落盘

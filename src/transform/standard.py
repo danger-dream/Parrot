@@ -2,7 +2,7 @@
 
 保留：
   - `system` 字段原样透传（不转 user+assistant 对）
-  - cache_control 统一管理（剥离客户端 + 代理打 4 个 1h ephemeral 断点）
+  - cache_control 按 section 补缺（保留客户端断点，总数最多 4 个）
 
 不做：
   - CC 伪装（cc_version / metadata / beta 头 / 工具名混淆 / CCH 签名）
@@ -17,13 +17,12 @@ from .cc_mimicry import (
     _strip_assistant_thinking_blocks,
     _strip_message_cache_control,
     _strip_tool_cache_control,
-    add_cache_breakpoints,
     apply_opus_adaptive_thinking,
 )
 
 
 def standard_transform(body: dict) -> dict:
-    """把下游请求体转换为"标准 Anthropic 但打了 cache 断点"的 payload。
+    """把下游请求体转换为按 section 补齐 cache 断点的标准 Anthropic payload。
 
     入参 body 来自客户端；函数内不修改原对象。
     返回纯 dict（未序列化为 bytes）。
@@ -34,7 +33,6 @@ def standard_transform(body: dict) -> dict:
     messages = _strip_assistant_thinking_blocks(messages)
     if not explicit_cache_control:
         messages = _strip_message_cache_control(messages)
-        messages = add_cache_breakpoints(messages)
 
     payload: dict = {
         "model": body["model"],
@@ -43,20 +41,9 @@ def standard_transform(body: dict) -> dict:
         "stream": body.get("stream", False),
     }
 
-    # system 字段：原样保留；若是 list，末 block 打 ephemeral 1h 断点
+    # system 字段先原样保留；最终按 section 补齐缺失的缓存断点。
     if "system" in body:
-        user_system = body["system"]
-        if isinstance(user_system, list) and user_system and not explicit_cache_control:
-            sys_blocks = [dict(b) if isinstance(b, dict) else b for b in user_system]
-            if isinstance(sys_blocks[-1], dict):
-                sys_blocks[-1] = {
-                    **sys_blocks[-1],
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                }
-            payload["system"] = sys_blocks
-        else:
-            # 字符串或空 list，原样
-            payload["system"] = user_system
+        payload["system"] = body["system"]
 
     top_cache = cache_hints.top_level_cache_control(body)
     if top_cache:
@@ -84,13 +71,9 @@ def standard_transform(body: dict) -> dict:
             [dict(t) for t in body["tools"]],
             preserve_cache_control=explicit_cache_control,
         )
-        if not explicit_cache_control:
-            tools[-1] = {
-                **tools[-1],
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            }
         payload["tools"] = tools
 
+    cache_hints.apply_anthropic_block_cache_breakpoints(payload)
     apply_opus_adaptive_thinking(payload, body.get("model", ""))
 
     return payload

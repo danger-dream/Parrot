@@ -355,10 +355,33 @@ def _preserve_function_call_output_attachments(chat_payload: dict, input_items: 
         _fail("Responses function_call_output attachments could not be preserved on Anthropic bridge", param="input")
 
 
+def _preserve_deferred_tool_loading(chat_payload: dict, response_tools: Any) -> None:
+    """Carry Responses defer_loading through the intermediate Chat tool shape."""
+    chat_tools = chat_payload.get("tools")
+    if not isinstance(chat_tools, list) or not isinstance(response_tools, list):
+        return
+    deferred_by_name = {
+        str(tool.get("name") or ""): tool["defer_loading"]
+        for tool in response_tools
+        if (
+            isinstance(tool, dict)
+            and tool.get("type") == "function"
+            and isinstance(tool.get("defer_loading"), bool)
+            and str(tool.get("name") or "")
+        )
+    }
+    for target in chat_tools:
+        if not isinstance(target, dict):
+            continue
+        function = target.get("function")
+        name = str(function.get("name") or "") if isinstance(function, dict) else ""
+        if name in deferred_by_name:
+            target["defer_loading"] = deferred_by_name[name]
+
+
 def translate_request(body: dict, *, api_key_name: str = "", store_enabled: bool = True) -> dict:
     guard_request(body, store_enabled=store_enabled)
     bridge_body = dict(body)
-    cache_control = cache_hints.anthropic_cache_control_from_openai(body)
     # Do not let the intermediate Responses→Chat payload reintroduce cache hints
     # as if they were user-supplied Chat fields; translate them once after
     # composition instead.
@@ -378,13 +401,13 @@ def translate_request(body: dict, *, api_key_name: str = "", store_enabled: bool
     input_items = responses_to_chat.resolve_input_items(bridge_body, api_key_name=api_key_name)
     input_items = _normalize_custom_tool_history(input_items)
     chat_payload = responses_to_chat.translate_request_from_input_items(bridge_body, input_items)
+    _preserve_deferred_tool_loading(chat_payload, bridge_body.get("tools"))
     _preserve_function_call_output_attachments(chat_payload, input_items)
     # chat_to_anthropic runs its own guard too; this is intentional because it
     # catches fields introduced by the Responses→Chat mapping (response_format,
     # reasoning_effort, etc.) before anything reaches Anthropic upstream.
     payload = chat_to_anthropic.translate_request(chat_payload, allow_file_url_documents=True)
-    if cache_control and not payload.get("cache_control"):
-        payload["cache_control"] = cache_control
+    cache_hints.apply_openai_cache_to_anthropic_payload(body, payload)
     return common.filter_anthropic_bridge_payload(payload)
 
 

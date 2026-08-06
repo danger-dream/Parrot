@@ -526,6 +526,99 @@ def _chat_sse_response(text="openai chat stream ok"):
     return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
 
 
+def _chat_sse_reasoning_function_call_response(reasoning: str, call_id: str):
+    chunks = [
+        {
+            "id": "chatcmpl_reasoning_tool", "object": "chat.completion.chunk",
+            "created": 1, "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl_reasoning_tool", "object": "chat.completion.chunk",
+            "created": 1, "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl_reasoning_tool", "object": "chat.completion.chunk",
+            "created": 1, "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0, "id": call_id, "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"ping\"}"},
+                }]},
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_tokens": 8, "completion_tokens": 6, "total_tokens": 14,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            },
+        },
+    ]
+    payload = b"".join(
+        b"data: " + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+        for chunk in chunks
+    ) + b"data: [DONE]\n\n"
+    return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+
+def _responses_sse_reasoning_function_call_response(reasoning: str, call_id: str):
+    reasoning_item = {
+        "type": "reasoning", "id": "rs_replay", "status": "completed",
+        "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}],
+    }
+    function_item = {
+        "type": "function_call", "id": "fc_replay", "call_id": call_id,
+        "name": "lookup", "arguments": "{\"q\":\"ping\"}", "status": "completed",
+    }
+    payload = b"".join([
+        _responses_sse_event("response.created", {
+            "type": "response.created", "sequence_number": 1,
+            "response": {"id": "resp_reasoning_tool", "status": "in_progress"},
+        }),
+        _responses_sse_event("response.output_item.added", {
+            "type": "response.output_item.added", "sequence_number": 2,
+            "output_index": 0,
+            "item": {**reasoning_item, "status": "in_progress", "content": []},
+        }),
+        _responses_sse_event("response.reasoning_text.delta", {
+            "type": "response.reasoning_text.delta", "sequence_number": 3,
+            "output_index": 0, "content_index": 0, "item_id": "rs_replay",
+            "delta": reasoning,
+        }),
+        _responses_sse_event("response.output_item.done", {
+            "type": "response.output_item.done", "sequence_number": 4,
+            "output_index": 0, "item": reasoning_item,
+        }),
+        _responses_sse_event("response.output_item.added", {
+            "type": "response.output_item.added", "sequence_number": 5,
+            "output_index": 1,
+            "item": {**function_item, "status": "in_progress", "arguments": ""},
+        }),
+        _responses_sse_event("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done", "sequence_number": 6,
+            "output_index": 1, "item_id": "fc_replay",
+            "name": "lookup", "arguments": function_item["arguments"],
+        }),
+        _responses_sse_event("response.output_item.done", {
+            "type": "response.output_item.done", "sequence_number": 7,
+            "output_index": 1, "item": function_item,
+        }),
+        _responses_sse_event("response.completed", {
+            "type": "response.completed", "sequence_number": 8,
+            "response": {
+                "id": "resp_reasoning_tool", "status": "completed",
+                "model": "deepseek-v4-flash", "output": [reasoning_item, function_item],
+                "usage": {
+                    "input_tokens": 8, "output_tokens": 6, "total_tokens": 14,
+                    "input_tokens_details": {"cached_tokens": 0},
+                },
+            },
+        }),
+    ])
+    return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+
 def _anthropic_sse_response(text="anthropic stream ok"):
     def ev(name: str, payload: dict) -> bytes:
         return (
@@ -1243,6 +1336,145 @@ async def test_anthropic_client_to_openai_responses_stream_fake_upstream(m):
     assert '"type":"content_block_delta"' in text
     assert '"text":"responses stream pong"' in text
     assert '"stop_reason":"end_turn"' in text
+
+
+async def test_deepseek_chat_stream_reasoning_is_automatically_cached_and_replayed(m):
+    from src.openai import deepseek_reasoning
+
+    _setup(m)
+    _install_keys(m, _default_key())
+    deepseek_reasoning.clear()
+    router = MockRouter()
+    reasoning = "\n  exact chat replay reasoning  \n"
+    call_id = "call_chat_auto_replay"
+
+    def handler(req: httpx.Request):
+        payload = _json_request(req)
+        assert payload["model"] == "deepseek-v4-flash"
+        assert payload["thinking"] == {"type": "enabled"}
+        if len(router.requests) == 1:
+            assert not any(message.get("tool_calls") for message in payload["messages"])
+            return _chat_sse_reasoning_function_call_response(reasoning, call_id)
+
+        assistant = next(
+            message for message in payload["messages"]
+            if any(call.get("id") == call_id for call in message.get("tool_calls") or [])
+        )
+        assert assistant["reasoning_content"] == reasoning
+        return _chat_sse_response("chat replay complete")
+
+    router.register("https://deepseek-chat-replay.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "DeepSeek Chat Replay", "https://deepseek-chat-replay.example",
+            protocol="openai-chat", alias="deepseek-v4-flash", real="deepseek-v4-flash",
+        ),
+    ])
+    tools = [{"name": "lookup", "input_schema": {"type": "object"}}]
+    first_body = {
+        "model": "deepseek-v4-flash", "stream": True, "max_tokens": 256,
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "tool_choice": {"type": "auto"}, "tools": tools,
+        "messages": [{"role": "user", "content": "look it up"}],
+    }
+    first_response, first_client, _ = await _call_anthropic_core(m, router, first_body)
+    first_text = await _consume_streaming_to_string(first_response)
+    await first_client.aclose()
+    assert call_id in first_text
+    assert deepseek_reasoning.has_replay_for_tool_call(call_id, model="deepseek-v4-flash")
+
+    await asyncio.sleep(0.002)
+    second_body = {
+        "model": "deepseek-v4-flash", "stream": True, "max_tokens": 256,
+        "tool_choice": {"type": "auto"}, "tools": tools,
+        "messages": [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": call_id, "name": "lookup", "input": {"q": "ping"},
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": call_id, "content": "result",
+            }]},
+        ],
+    }
+    second_response, second_client, _ = await _call_anthropic_core(m, router, second_body)
+    second_text = await _consume_streaming_to_string(second_response)
+    await second_client.aclose()
+
+    assert second_response.status_code == 200
+    assert "chat replay complete" in second_text
+    assert len(router.requests) == 2
+
+
+async def test_deepseek_responses_stream_reasoning_is_automatically_cached_and_replayed(m):
+    from src.openai import deepseek_reasoning
+
+    _setup(m)
+    _install_keys(m, _default_key())
+    deepseek_reasoning.clear()
+    router = MockRouter()
+    reasoning = "\n  exact responses replay reasoning  \n"
+    call_id = "call_responses_auto_replay"
+
+    def handler(req: httpx.Request):
+        payload = _json_request(req)
+        assert payload["model"] == "deepseek-v4-flash"
+        assert payload["reasoning"] == {"effort": "high"}
+        if len(router.requests) == 1:
+            assert not any(item.get("type") == "function_call" for item in payload["input"])
+            return _responses_sse_reasoning_function_call_response(reasoning, call_id)
+
+        function_index = next(
+            index for index, item in enumerate(payload["input"])
+            if item.get("type") == "function_call" and item.get("call_id") == call_id
+        )
+        assert payload["input"][function_index - 1]["type"] == "reasoning"
+        assert payload["input"][function_index - 1]["content"] == [
+            {"type": "reasoning_text", "text": reasoning},
+        ]
+        return _responses_sse_response("responses replay complete")
+
+    router.register("https://deepseek-responses-replay.example", handler)
+    _install_channels(m, [
+        _make_openai_channel(
+            "DeepSeek Responses Replay", "https://deepseek-responses-replay.example",
+            protocol="openai-responses", alias="deepseek-v4-flash", real="deepseek-v4-flash",
+        ),
+    ])
+    tools = [{"name": "lookup", "input_schema": {"type": "object"}}]
+    first_body = {
+        "model": "deepseek-v4-flash", "stream": True, "max_tokens": 256,
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "tool_choice": {"type": "auto"}, "tools": tools,
+        "messages": [{"role": "user", "content": "look it up"}],
+    }
+    first_response, first_client, _ = await _call_anthropic_core(m, router, first_body)
+    first_text = await _consume_streaming_to_string(first_response)
+    await first_client.aclose()
+    assert call_id in first_text
+    assert deepseek_reasoning.has_replay_for_tool_call(call_id, model="deepseek-v4-flash")
+
+    await asyncio.sleep(0.002)
+    second_body = {
+        "model": "deepseek-v4-flash", "stream": True, "max_tokens": 256,
+        "tool_choice": {"type": "auto"}, "tools": tools,
+        "messages": [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": call_id, "name": "lookup", "input": {"q": "ping"},
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": call_id, "content": "result",
+            }]},
+        ],
+    }
+    second_response, second_client, _ = await _call_anthropic_core(m, router, second_body)
+    second_text = await _consume_streaming_to_string(second_response)
+    await second_client.aclose()
+
+    assert second_response.status_code == 200
+    assert "responses replay complete" in second_text
+    assert len(router.requests) == 2
 
 
 async def test_responses_terminal_event_finishes_without_waiting_for_http_eof(m):
@@ -4392,6 +4624,7 @@ async def test_responses_client_safe_custom_tool_history_to_anthropic_fake_upstr
             "type": "tool_result",
             "tool_use_id": "call_1",
             "content": "ok",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         }]},
     ]
 

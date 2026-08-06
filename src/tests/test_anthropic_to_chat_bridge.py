@@ -549,7 +549,7 @@ def test_openai_api_channel_maps_anthropic_cache_to_openai_prompt_cache():
     assert "cache_control" not in payload
 
 
-def test_deepseek_anthropic_bridge_disables_default_thinking_and_allows_forced_tool():
+def test_deepseek_anthropic_bridge_does_not_treat_omission_as_disable():
     ch = OpenAIApiChannel({
         "name": "DeepSeek",
         "baseUrl": "https://api.deepseek.com",
@@ -563,9 +563,13 @@ def test_deepseek_anthropic_bridge_disables_default_thinking_and_allows_forced_t
         "tool_choice": {"type": "tool", "name": "lookup"},
     }
 
+    with pytest.raises(GuardError) as exc_info:
+        asyncio.run(ch.build_upstream_request(body, "deepseek-v4-flash", ingress_protocol="anthropic"))
+    assert "explicitly disable thinking" in exc_info.value.message
+
+    body["thinking"] = {"type": "disabled"}
     req = asyncio.run(ch.build_upstream_request(body, "deepseek-v4-flash", ingress_protocol="anthropic"))
     payload = json.loads(req.body)
-
     assert payload["thinking"] == {"type": "disabled"}
     assert payload["tool_choice"] == {"type": "function", "function": {"name": "lookup"}}
 

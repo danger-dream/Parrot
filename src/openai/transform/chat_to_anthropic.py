@@ -404,6 +404,8 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]]:
         }
         if fn.get("description") is not None:
             anth_tool["description"] = str(fn.get("description") or "")
+        if isinstance(tool.get("defer_loading"), bool):
+            anth_tool["defer_loading"] = tool["defer_loading"]
         out.append(anth_tool)
     return out
 

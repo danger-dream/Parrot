@@ -77,7 +77,72 @@ def test_translate_request_maps_openai_prompt_cache_hints_to_anthropic_cache_con
         "prompt_cache_retention": "24h",
     })
 
-    assert out["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    assert out["cache_control"] == cache_control
+    assert out["messages"][0]["content"][-1]["cache_control"] == cache_control
+
+
+def test_translate_request_adds_anthropic_block_breakpoints_and_skips_deferred_tools():
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    body = {
+        "messages": [
+            {"role": "system", "content": "stable system"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "resident", "parameters": {"type": "object"}},
+                "defer_loading": False,
+            },
+            {
+                "type": "function",
+                "function": {"name": "deferred", "parameters": {"type": "object"}},
+                "defer_loading": True,
+            },
+        ],
+        "prompt_cache_key": "stable-key",
+        "prompt_cache_retention": "24h",
+    }
+
+    out = chat_to_anthropic.translate_request(body)
+
+    assert out["cache_control"] == cache_control
+    assert out["system"][-1]["cache_control"] == cache_control
+    assert out["tools"][0]["defer_loading"] is False
+    assert out["tools"][0]["cache_control"] == cache_control
+    assert out["tools"][1]["defer_loading"] is True
+    assert "cache_control" not in out["tools"][1]
+    assert [
+        "cache_control" in message["content"][-1]
+        for message in out["messages"]
+    ] == [False, False, True, False, True]
+
+
+def test_translate_request_does_not_put_tool_breakpoint_when_all_tools_are_deferred():
+    out = chat_to_anthropic.translate_request({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "deferred_1", "parameters": {"type": "object"}},
+                "defer_loading": True,
+            },
+            {
+                "type": "function",
+                "function": {"name": "deferred_2", "parameters": {"type": "object"}},
+                "defer_loading": True,
+            },
+        ],
+        "prompt_cache_key": "stable-key",
+    })
+
+    assert all(tool["defer_loading"] is True for tool in out["tools"])
+    assert all("cache_control" not in tool for tool in out["tools"])
 
 
 def test_translate_request_preserves_url_image():
@@ -357,7 +422,11 @@ def test_translate_request_uses_anthropic_output_whitelist_for_chat_controls():
     out = chat_to_anthropic.translate_request(body)
 
     assert set(out) <= common.ANTHROPIC_BRIDGE_REQ_ALLOWED
-    assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert out["messages"] == [{"role": "user", "content": [{
+        "type": "text",
+        "text": "hi",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }]}]
     assert out["stop_sequences"] == ["END"]
 
 
@@ -402,7 +471,10 @@ def test_translate_request_strips_chat_options_without_anthropic_equivalent(fiel
     body = {"messages": [{"role": "user", "content": "hi"}], field: value}
     out = chat_to_anthropic.translate_request(body)
 
-    assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    block = {"type": "text", "text": "hi"}
+    if field in {"prompt_cache_key", "prompt_cache_retention"}:
+        block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    assert out["messages"] == [{"role": "user", "content": [block]}]
     if field == "service_tier":
         assert "service_tier" not in out
     else:
@@ -446,7 +518,11 @@ def test_translate_request_allows_internal_prompt_cache_hints():
 
     out = chat_to_anthropic.translate_request(body)
 
-    assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert out["messages"] == [{"role": "user", "content": [{
+        "type": "text",
+        "text": "hi",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }]}]
     assert "prompt_cache_key" not in out
 
 

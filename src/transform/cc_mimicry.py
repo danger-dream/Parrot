@@ -675,8 +675,7 @@ def transform_request(body, email="", session_id=None):
     messages = _strip_assistant_thinking_blocks(messages)
     if not explicit_cache_control:
         messages = _strip_message_cache_control(messages)
-        messages = add_cache_breakpoints(messages)
-    system_blocks = build_system_blocks(messages, inject_cache=not explicit_cache_control)
+    system_blocks = build_system_blocks(messages, inject_cache=False)
     model = body.get("model", "claude-sonnet-4-20250514")
 
     # 动态工具名映射（tools > 5 时触发）
@@ -708,14 +707,12 @@ def transform_request(body, email="", session_id=None):
         for t in tools:
             if isinstance(t, dict) and "name" in t:
                 t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
-        if not explicit_cache_control:
-            tools[-1] = dict(tools[-1])
-            tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         payload["tools"] = tools
 
     top_cache = cache_hints.top_level_cache_control(body)
     if top_cache:
         payload["cache_control"] = top_cache
+    cache_hints.apply_anthropic_block_cache_breakpoints(payload)
 
     # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
     # 否则会吞掉下游强制/禁用工具的意图。抓包未含此字段是会话未用到，非协议禁止。

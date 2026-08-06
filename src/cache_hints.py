@@ -21,6 +21,8 @@ from typing import Any
 
 _CACHE_KEY_PREFIX = "parrot:cache:v1"
 _SESSION_ID_RE = re.compile(r"session[_-]?id['\"=:\s]+([A-Za-z0-9_.:-]{8,})", re.IGNORECASE)
+_ANTHROPIC_EPHEMERAL_1H = {"type": "ephemeral", "ttl": "1h"}
+_ANTHROPIC_EPHEMERAL_5M = {"type": "ephemeral"}
 
 
 def _canon(value: Any) -> Any:
@@ -109,6 +111,166 @@ def _iter_content_blocks(content: Any):
         for block in content:
             if isinstance(block, dict):
                 yield block
+
+
+def _inject_anthropic_message_cache_control(
+    message: dict[str, Any],
+    cache_control: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one message with a breakpoint on its final content block."""
+    message = dict(message)
+    content = message.get("content")
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        blocks = list(content)
+        blocks[-1] = {**blocks[-1], "cache_control": dict(cache_control)}
+        message["content"] = blocks
+    elif isinstance(content, str):
+        message["content"] = [{
+            "type": "text",
+            "text": content,
+            "cache_control": dict(cache_control),
+        }]
+    return message
+
+
+def _cache_controls_in_value(value: Any):
+    if isinstance(value, dict):
+        cache_control = value.get("cache_control")
+        if isinstance(cache_control, dict):
+            yield cache_control
+        for key in ("content", "source"):
+            yield from _cache_controls_in_value(value.get(key))
+    elif isinstance(value, list):
+        for item in value:
+            yield from _cache_controls_in_value(item)
+
+
+def _anthropic_block_cache_controls(payload: dict[str, Any]):
+    yield from _cache_controls_in_value(payload.get("system"))
+    for tool in payload.get("tools") or []:
+        if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict):
+            yield tool["cache_control"]
+    for message in payload.get("messages") or []:
+        if isinstance(message, dict):
+            yield from _cache_controls_in_value(message.get("content"))
+
+
+def apply_anthropic_tools_cache_breakpoint(
+    tools: Any,
+    *,
+    cache_control: dict[str, Any] | None = None,
+) -> bool:
+    """Put one tool breakpoint on the last persistent Anthropic tool.
+
+    A deferred tool is loaded on demand and must not become the cache boundary.
+    Existing explicit tool breakpoints are preserved; when every tool is
+    deferred there is no valid tool breakpoint to add.
+    """
+    if not isinstance(tools, list) or not tools:
+        return False
+    if any(
+        isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict)
+        for tool in tools
+    ):
+        return False
+    for index in range(len(tools) - 1, -1, -1):
+        tool = tools[index]
+        if not isinstance(tool, dict) or tool.get("defer_loading") is True:
+            continue
+        tools[index] = {
+            **tool,
+            "cache_control": dict(cache_control or _ANTHROPIC_EPHEMERAL_1H),
+        }
+        return True
+    return False
+
+
+def apply_anthropic_block_cache_breakpoints(
+    payload: dict[str, Any],
+    *,
+    max_breakpoints: int = 4,
+) -> None:
+    """Fill missing Anthropic cache sections without exceeding four blocks.
+
+    Breakpoint priority follows the prompt prefix order: final persistent tool,
+    final system block, final message, then the second-to-last user turn. An
+    existing breakpoint suppresses auto-injection only in its own section, not
+    in unrelated sections. Existing client controls are never moved or removed.
+    """
+    if not isinstance(payload, dict) or max_breakpoints <= 0:
+        return
+
+    existing = list(_anthropic_block_cache_controls(payload))
+    remaining = max_breakpoints - len(existing)
+    if remaining <= 0:
+        return
+
+    tools = payload.get("tools")
+    tool_controls = [
+        tool["cache_control"]
+        for tool in tools or []
+        if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict)
+    ]
+    if not tool_controls and apply_anthropic_tools_cache_breakpoint(tools):
+        remaining -= 1
+        tool_controls = list(_anthropic_block_cache_controls({"tools": tools}))
+    if remaining <= 0:
+        return
+    short_ttl_seen = any(control.get("ttl") != "1h" for control in tool_controls)
+
+    system = payload.get("system")
+    system_controls = list(_cache_controls_in_value(system))
+    if not system_controls and isinstance(system, list) and system and isinstance(system[-1], dict):
+        cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else _ANTHROPIC_EPHEMERAL_1H
+        blocks = list(system)
+        blocks[-1] = {**blocks[-1], "cache_control": dict(cache_control)}
+        payload["system"] = blocks
+        system = blocks
+        system_controls = [dict(cache_control)]
+        remaining -= 1
+    if remaining <= 0:
+        return
+    short_ttl_seen = short_ttl_seen or any(
+        control.get("ttl") != "1h" for control in system_controls
+    )
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return
+    message_controls = [
+        control
+        for message in messages
+        if isinstance(message, dict)
+        for control in _cache_controls_in_value(message.get("content"))
+    ]
+    if message_controls:
+        return
+
+    cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else _ANTHROPIC_EPHEMERAL_1H
+    target_indices: list[int] = []
+    if isinstance(messages[-1], dict):
+        target_indices.append(len(messages) - 1)
+    if len(messages) >= 4:
+        user_count = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, dict) and message.get("role") == "user":
+                user_count += 1
+                if user_count == 2:
+                    target_indices.append(index)
+                    break
+
+    messages = list(messages)
+    for index in target_indices:
+        if remaining <= 0:
+            break
+        updated = _inject_anthropic_message_cache_control(
+            messages[index], cache_control,
+        )
+        if _has_block_cache_control(updated.get("content")):
+            messages[index] = updated
+            remaining -= 1
+    payload["messages"] = messages
 
 
 def _has_block_cache_control(value: Any) -> bool:
@@ -318,8 +480,11 @@ def anthropic_cache_control_from_openai(body: dict[str, Any] | None) -> dict[str
 
 
 def apply_openai_cache_to_anthropic_payload(source_body: dict[str, Any] | None, payload: dict[str, Any]) -> None:
-    if not isinstance(payload, dict) or payload.get("cache_control"):
+    if not isinstance(payload, dict):
         return
     cc = anthropic_cache_control_from_openai(source_body)
-    if cc:
+    if not cc:
+        return
+    if not payload.get("cache_control"):
         payload["cache_control"] = cc
+    apply_anthropic_block_cache_breakpoints(payload)

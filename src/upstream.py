@@ -531,6 +531,7 @@ class ChatSSEAssistantBuilder:
         self._buf = b""
         self._role = "assistant"
         self._content_parts: list[str] = []
+        self._reasoning_parts: list[str] = []
         self._refusal_parts: list[str] = []
         # tool_calls 按 index 聚合，保留首次的 id/name，arguments 拼接
         self._tool_calls: dict[int, dict] = {}
@@ -563,6 +564,9 @@ class ChatSSEAssistantBuilder:
         content = delta.get("content")
         if isinstance(content, str) and content:
             self._content_parts.append(content)
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            self._reasoning_parts.append(reasoning)
         refusal = delta.get("refusal")
         if isinstance(refusal, str) and refusal:
             self._refusal_parts.append(refusal)
@@ -588,6 +592,8 @@ class ChatSSEAssistantBuilder:
     def get_assistant(self) -> dict:
         msg: dict = {"role": self._role}
         msg["content"] = "".join(self._content_parts) or None
+        if self._reasoning_parts:
+            msg["reasoning_content"] = "".join(self._reasoning_parts)
         if self._refusal_parts:
             msg["refusal"] = "".join(self._refusal_parts)
         if self._tool_calls:

@@ -43,6 +43,50 @@ def test_translate_request_composes_responses_input_to_anthropic_messages():
     ]
 
 
+def test_translate_request_adds_anthropic_block_breakpoints_and_preserves_deferred_tools():
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    body = {
+        "model": "resp-model",
+        "instructions": "stable system",
+        "input": [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "resident",
+                "parameters": {"type": "object"},
+                "defer_loading": False,
+            },
+            {
+                "type": "function",
+                "name": "deferred",
+                "parameters": {"type": "object"},
+                "defer_loading": True,
+            },
+        ],
+        "prompt_cache_key": "stable-key",
+        "prompt_cache_retention": "24h",
+    }
+
+    out = responses_to_anthropic.translate_request(body)
+
+    assert out["cache_control"] == cache_control
+    assert out["system"][-1]["cache_control"] == cache_control
+    assert out["tools"][0]["defer_loading"] is False
+    assert out["tools"][0]["cache_control"] == cache_control
+    assert out["tools"][1]["defer_loading"] is True
+    assert "cache_control" not in out["tools"][1]
+    assert [
+        "cache_control" in message["content"][-1]
+        for message in out["messages"]
+    ] == [False, False, True, False, True]
+
+
 def test_translate_request_preserves_easy_input_string_messages_after_tool_history():
     """Hermes may append local fallback messages as EasyInputMessage strings."""
     body = {
@@ -470,7 +514,11 @@ def test_translate_request_uses_anthropic_output_whitelist_for_responses_control
     out = responses_to_anthropic.translate_request(body)
 
     assert set(out) <= common.ANTHROPIC_BRIDGE_REQ_ALLOWED
-    assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert out["messages"] == [{"role": "user", "content": [{
+        "type": "text",
+        "text": "hi",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }]}]
     assert out["metadata"] == {"user_id": "safe-user-1"}
     assert "service_tier" not in out
 
@@ -527,7 +575,10 @@ def test_translate_request_strips_responses_options_without_anthropic_equivalent
     body = {"model": "m", "input": "hi", field: value}
     out = responses_to_anthropic.translate_request(body)
 
-    assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    block = {"type": "text", "text": "hi"}
+    if field in {"prompt_cache_key", "prompt_cache_retention"}:
+        block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    assert out["messages"] == [{"role": "user", "content": [block]}]
     assert field not in out
 
 
@@ -567,7 +618,11 @@ def test_translate_request_allows_internal_prompt_cache_hints():
 
     out = responses_to_anthropic.translate_request(body)
 
-    assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    assert out["messages"] == [{"role": "user", "content": [{
+        "type": "text",
+        "text": "hi",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }]}]
     assert "prompt_cache_key" not in out
 
 

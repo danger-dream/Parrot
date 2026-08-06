@@ -75,7 +75,11 @@ def _responses_body() -> dict:
 def test_stable_session_affinity_crosses_tool_transcript_and_is_isolated(m):
     handler = m["handler"]
     fingerprint = m["fingerprint"]
-    headers = {"session-id": "stable-session-raw-value"}
+    headers = {
+        "session-id": "stable-session-raw-value",
+        "x-claude-code-session-id": "claude-parent-must-not-win",
+        "x-claude-code-agent-id": "claude-agent-must-not-win",
+    }
     first = _responses_body()
     second = _responses_body()
     second["input"] = [
@@ -148,6 +152,64 @@ def test_claude_code_session_is_stable_affinity_across_tool_transcripts(m):
     assert claude_session_id not in early_key
 
 
+def test_claude_code_agent_is_effective_stable_affinity_identity(m):
+    handler = m["handler"]
+    fingerprint = m["fingerprint"]
+    parent = "123e4567-e89b-12d3-a456-426614174000"
+    other_parent = "223e4567-e89b-12d3-a456-426614174000"
+    agent_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    agent_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    early_body = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "bootstrap"},
+    ]}
+    tool_body = {"model": "gpt-5.5", "messages": [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "bootstrap"},
+        {"role": "assistant", "content": "calling tool"},
+        {"role": "tool", "content": "tool result"},
+        {"role": "user", "content": "continue"},
+    ]}
+
+    def _key(session_id, agent_id, body, client_ip):
+        effective, _ = handler._openai_http_affinity_keys(
+            {
+                "x-claude-code-session-id": session_id,
+                "x-claude-code-agent-id": agent_id,
+            },
+            body,
+            api_key_name="tenant-a",
+            client_ip=client_ip,
+            model="gpt-5.5",
+            ingress_protocol="chat",
+        )
+        return effective
+
+    first_a = _key(parent, agent_a, early_body, "192.0.2.10")
+    next_a = _key(parent, agent_a, tool_body, "198.51.100.20")
+    first_b = _key(parent, agent_b, early_body, "192.0.2.10")
+    switched_back_a = _key(parent, agent_a, early_body, "203.0.113.30")
+    same_agent_other_parent = _key(other_parent, agent_a, early_body, "203.0.113.40")
+
+    expected_a = fingerprint.stable_openai_affinity_key(
+        "tenant-a", "chat", "gpt-5.5", "claude-code-agent-id", agent_a,
+    )
+    assert first_a == next_a == switched_back_a == same_agent_other_parent == expected_a
+    assert first_a != first_b
+    assert first_a.startswith("openai-session-v1:")
+    assert parent not in first_a and agent_a not in first_a
+
+    orphan_effective, orphan_legacy = handler._openai_http_affinity_keys(
+        {"x-claude-code-agent-id": agent_a},
+        tool_body,
+        api_key_name="tenant-a",
+        client_ip="192.0.2.10",
+        model="gpt-5.5",
+        ingress_protocol="chat",
+    )
+    assert orphan_effective == orphan_legacy
+
+
 def test_explicit_prompt_cache_key_then_legacy_fallback_and_exact_bridge(m):
     _setup_affinity(m)
     handler = m["handler"]
@@ -155,10 +217,17 @@ def test_explicit_prompt_cache_key_then_legacy_fallback_and_exact_bridge(m):
 
     explicit_body = {"model": "gpt-5.5", "input": "hi", "prompt_cache_key": "explicit-pck"}
     stable, legacy = handler._openai_http_affinity_keys(
-        {}, explicit_body, api_key_name="tenant", client_ip="203.0.113.2",
+        {
+            "x-claude-code-session-id": "claude-parent-must-not-win",
+            "x-claude-code-agent-id": "claude-agent-must-not-win",
+        },
+        explicit_body,
+        api_key_name="tenant", client_ip="203.0.113.2",
         model="gpt-5.5", ingress_protocol="responses",
     )
-    assert stable and stable.startswith("openai-session-v1:")
+    assert stable == m["fingerprint"].stable_openai_affinity_key(
+        "tenant", "responses", "gpt-5.5", "prompt_cache_key", "explicit-pck",
+    )
     assert legacy is None
     assert "explicit-pck" not in stable
 

@@ -250,6 +250,94 @@ def test_restore_tool_name_field_in_incomplete_sse_json(m):
 
 
 
+def test_anthropic_tool_cache_breakpoint_uses_last_non_deferred_tool(m):
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"name": "resident_1", "input_schema": {"type": "object"}},
+            {"name": "resident_2", "input_schema": {"type": "object"}},
+            {"name": "deferred", "input_schema": {"type": "object"}, "defer_loading": True},
+        ],
+    }
+    all_deferred_body = {
+        **body,
+        "tools": [
+            {"name": "deferred_1", "input_schema": {"type": "object"}, "defer_loading": True},
+            {"name": "deferred_2", "input_schema": {"type": "object"}, "defer_loading": True},
+        ],
+    }
+
+    payloads = [
+        m["standard"].standard_transform(body),
+        m["cc_mimicry"].transform_request(body, session_id="s")[0],
+    ]
+    all_deferred_payloads = [
+        m["standard"].standard_transform(all_deferred_body),
+        m["cc_mimicry"].transform_request(all_deferred_body, session_id="s")[0],
+    ]
+
+    for payload in payloads:
+        assert "cache_control" not in payload["tools"][0]
+        assert payload["tools"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert payload["tools"][2]["defer_loading"] is True
+        assert "cache_control" not in payload["tools"][2]
+    for payload in all_deferred_payloads:
+        assert all(tool["defer_loading"] is True for tool in payload["tools"])
+        assert all("cache_control" not in tool for tool in payload["tools"])
+
+
+def test_anthropic_cache_breakpoints_fill_missing_tool_section_up_to_four(m):
+    five_minute = {"type": "ephemeral"}
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "system": [
+            {"type": "text", "text": "system 1", "cache_control": five_minute},
+            {"type": "text", "text": "system 2", "cache_control": five_minute},
+        ],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "u1"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
+            {"role": "user", "content": [{
+                "type": "text",
+                "text": "u2",
+                "cache_control": five_minute,
+            }]},
+        ],
+        "tools": [
+            {"name": "resident", "input_schema": {"type": "object"}},
+            {"name": "deferred", "input_schema": {"type": "object"}, "defer_loading": True},
+        ],
+    }
+
+    payload = m["standard"].standard_transform(body)
+
+    assert payload["tools"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in payload["tools"][1]
+    assert sum("cache_control" in block for block in payload["system"]) == 2
+    assert sum(
+        "cache_control" in block
+        for message in payload["messages"]
+        for block in message["content"]
+    ) == 1
+
+    at_limit = {
+        **body,
+        "messages": [
+            {"role": "user", "content": [{
+                "type": "text", "text": "u1", "cache_control": five_minute,
+            }]},
+            {"role": "user", "content": [{
+                "type": "text", "text": "u2", "cache_control": five_minute,
+            }]},
+        ],
+    }
+    limited_payload = m["standard"].standard_transform(at_limit)
+    assert all("cache_control" not in tool for tool in limited_payload["tools"])
+
+
 def test_anthropic_tool_namespace_type_is_stripped_like_claude_code(m):
     cc = m["cc_mimicry"]
     std = m["standard"]

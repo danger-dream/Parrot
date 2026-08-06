@@ -128,29 +128,91 @@ class OpenAIApiChannel(Channel):
     def _apply_deepseek_anthropic_bridge_compat(self, source_body: dict, payload: dict, resolved_model: str) -> None:
         if not self._is_deepseek(resolved_model):
             return
+        # Restore provider reasoning before deciding the current turn's thinking
+        # mode.  Claude Code tool-result subturns commonly omit the top-level
+        # thinking field; omission is continuation, not an instruction to erase
+        # the reasoning chain.
+        deepseek_reasoning.inject_into_chat_payload(payload, model=resolved_model)
         thinking_type = self._anthropic_thinking_type(source_body)
-        explicit_thinking = thinking_type is not None
+        thinking_enabled = thinking_type != "disabled"
         forced_tool_choice = self._tool_choice_forces_tool(payload.get("tool_choice"))
 
-        if explicit_thinking and thinking_type != "disabled" and forced_tool_choice:
+        if thinking_enabled:
+            missing_replay = deepseek_reasoning.missing_chat_tool_call_ids(
+                payload, model=resolved_model,
+            )
+            if missing_replay:
+                raise guard.GuardError(
+                    400,
+                    "invalid_request_error",
+                    f"DeepSeek Chat thinking history is missing exact reasoning_content replay for {len(missing_replay)} tool call(s)",
+                    param="messages",
+                    scope="candidate",
+                )
+
+        if thinking_enabled and forced_tool_choice:
             raise guard.GuardError(
                 400,
                 "invalid_request_error",
-                "DeepSeek thinking mode does not support forced/required tool_choice; use tool_choice=auto or disable thinking",
+                "DeepSeek thinking mode does not support forced/required tool_choice; use tool_choice=auto or explicitly disable thinking",
                 param="tool_choice",
                 scope="request",
             )
 
-        if thinking_type == "disabled" or not explicit_thinking:
-            # Anthropic Messages default semantics are visible-answer first.  If
-            # the caller did not explicitly request thinking, disable DeepSeek's
-            # default thinking mode to avoid burning the whole output budget in
-            # reasoning_content and to keep forced tool_choice usable.
-            payload["thinking"] = {"type": "disabled"}
-        elif thinking_type in ("enabled", "adaptive"):
-            payload["thinking"] = {"type": "enabled"}
+        # DeepSeek thinking is enabled by default.  Only an explicit Anthropic
+        # thinking.type=disabled request is allowed to turn it off.
+        payload["thinking"] = {
+            "type": "enabled" if thinking_enabled else "disabled",
+        }
 
-        deepseek_reasoning.inject_into_chat_payload(payload)
+    @staticmethod
+    def _normalize_deepseek_responses_effort(value: object) -> str:
+        effort = str(value or "").strip().lower()
+        # DeepSeek Responses accepts none/low/high/max.  Map the generic OpenAI
+        # bridge vocabulary to the nearest provider-preserving level.
+        if effort == "medium":
+            return "high"
+        if effort == "xhigh":
+            return "max"
+        if effort in ("none", "low", "high", "max"):
+            return effort
+        return "high"
+
+    def _apply_deepseek_anthropic_responses_compat(
+        self, source_body: dict, payload: dict, resolved_model: str,
+    ) -> None:
+        if not self._is_deepseek(resolved_model):
+            return
+        deepseek_reasoning.inject_into_responses_payload(payload, model=resolved_model)
+        thinking_type = self._anthropic_thinking_type(source_body)
+        thinking_enabled = thinking_type != "disabled"
+        if thinking_enabled:
+            missing_replay = deepseek_reasoning.missing_responses_tool_call_ids(
+                payload, model=resolved_model,
+            )
+            if missing_replay:
+                raise guard.GuardError(
+                    400,
+                    "invalid_request_error",
+                    f"DeepSeek Responses thinking history is missing exact reasoning_text replay for {len(missing_replay)} tool call(s)",
+                    param="messages",
+                    scope="candidate",
+                )
+        if thinking_enabled and self._tool_choice_forces_tool(payload.get("tool_choice")):
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                "DeepSeek thinking mode does not support forced/required tool_choice; use tool_choice=auto or explicitly disable thinking",
+                param="tool_choice",
+                scope="request",
+            )
+        if not thinking_enabled:
+            payload["reasoning"] = {"effort": "none"}
+            return
+        current = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else {}
+        payload["reasoning"] = {
+            "effort": self._normalize_deepseek_responses_effort(current.get("effort")),
+        }
 
     def supports_model(self, requested_model: str) -> Optional[str]:
         for m in self.models:
@@ -249,6 +311,7 @@ class OpenAIApiChannel(Channel):
             api_key_name=body.get("_parrot_api_key_name"),
             client_ip=body.get("_parrot_client_ip"),
         )
+        self._apply_deepseek_anthropic_responses_compat(body, payload, resolved_model)
         self._apply_compatibility(payload, resolved_model)
         return UpstreamRequest(
             url=resolve_upstream_url(self.base_url, self.api_path, "/v1/responses"),
@@ -371,10 +434,15 @@ class OpenAIApiChannel(Channel):
 
     async def restore_response(self, chunk: bytes,
                                dynamic_map: Optional[dict] = None) -> bytes:
-        # OpenAI 家族不做工具名还原，原样返回
+        # OpenAI 家族不做工具名还原，原样返回。非流式 DeepSeek 响应在此
+        # 缓存；SSE 流由 failover 在收到明确终态后从 builder 缓存。
         if self._is_deepseek():
             try:
-                deepseek_reasoning.cache_from_chat_response(json.loads(chunk))
+                obj = json.loads(chunk)
+                if self.protocol == "openai-responses":
+                    deepseek_reasoning.cache_from_responses_response(obj)
+                else:
+                    deepseek_reasoning.cache_from_chat_response(obj)
             except Exception:
                 pass
         return chunk

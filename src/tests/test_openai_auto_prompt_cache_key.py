@@ -136,10 +136,76 @@ def test_auto_prompt_cache_key_uses_claude_session_in_random_fallback(m):
     )
 
     assert key1 == key2
-    assert key1.startswith("parrot:auto:v1:claude-session:")
+    assert key1 == "parrot:auto:v1:claude-session:ff656c68a3d7c959842f2f02ddfe0157"
     assert session_id not in key1
     assert key1 != changed_session
     assert key1 != changed_ip
+
+
+def test_auto_prompt_cache_key_uses_bare_claude_agent_identity(m):
+    _setup(m)
+
+    def _body():
+        return {"model": "gpt-5.5", "messages": [
+            {"role": "system", "content": "same system"},
+            {"role": "user", "content": "single bootstrap user"},
+        ]}
+
+    parent = "123e4567-e89b-12d3-a456-426614174000"
+    other_parent = "223e4567-e89b-12d3-a456-426614174000"
+    agent_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    agent_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def _key(session_id, agent_id):
+        return m["handler"]._maybe_apply_auto_prompt_cache_key(
+            _body(), fp_query=None, api_key_name="alice", client_ip="1.2.3.4",
+            model="gpt-5.5", ingress_protocol="chat",
+            claude_code_session_id=session_id,
+            claude_code_agent_id=agent_id,
+        )
+
+    first_a = _key(parent, agent_a)
+    next_a = _key(parent, agent_a)
+    first_b = _key(parent, agent_b)
+    switched_back_a = _key(parent, agent_a)
+    same_agent_other_parent = _key(other_parent, agent_a)
+
+    assert first_a == next_a == switched_back_a == same_agent_other_parent
+    assert first_a != first_b
+    assert first_a.startswith("parrot:auto:v1:claude-agent:")
+    assert first_b.startswith("parrot:auto:v1:claude-agent:")
+    assert parent not in first_a and agent_a not in first_a
+
+
+def test_auto_prompt_cache_key_ignores_orphan_claude_agent_id(m):
+    _setup(m)
+
+    def _body():
+        return {"model": "gpt-5.5", "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "bootstrap"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "real task"},
+        ]}
+
+    common = {
+        "fp_query": None,
+        "api_key_name": "alice",
+        "client_ip": "1.2.3.4",
+        "model": "gpt-5.5",
+        "ingress_protocol": "chat",
+    }
+    orphan_agent_key = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        _body(),
+        claude_code_agent_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        **common,
+    )
+    no_claude_headers_key = m["handler"]._maybe_apply_auto_prompt_cache_key(
+        _body(), **common,
+    )
+
+    assert orphan_agent_key == no_claude_headers_key
+    assert orphan_agent_key.startswith("parrot:auto:v1:stable:")
 
 
 def test_auto_prompt_cache_key_claude_session_precedes_stable_anchor(m):
@@ -191,7 +257,10 @@ def test_handler_forwards_claude_session_header_to_pck_resolver(m):
         host = "1.2.3.4"
 
     class _Request:
-        headers = _Headers({"x-claude-code-session-id": "session-from-header"})
+        headers = _Headers({
+            "x-claude-code-session-id": "session-from-header",
+            "x-claude-code-agent-id": "agent-from-header",
+        })
         client = _Client()
 
         async def body(self):
@@ -222,6 +291,7 @@ def test_handler_forwards_claude_session_header_to_pck_resolver(m):
         handler._maybe_apply_auto_prompt_cache_key = original_resolver
 
     assert captured["claude_code_session_id"] == "session-from-header"
+    assert captured["claude_code_agent_id"] == "agent-from-header"
 
 
 def test_auto_prompt_cache_key_stable_fallback_isolated_by_client_ip(m):
@@ -256,6 +326,7 @@ def test_auto_prompt_cache_key_respects_downstream_value(m):
     key = m["handler"]._maybe_apply_auto_prompt_cache_key(
         body, fp_query="fp-any",
         claude_code_session_id="123e4567-e89b-12d3-a456-426614174000",
+        claude_code_agent_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     )
 
     assert key == "client-key"

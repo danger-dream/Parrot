@@ -55,7 +55,7 @@ def _import_modules():
         OpenAIOAuthChannel, CODEX_UPSTREAM_URL, CODEX_CLI_USER_AGENT,
     )
     from src.openai.channel.registration import register_factories
-    from src.openai import reasoning_replay
+    from src.openai import handler, reasoning_replay
     from src.openai.transform import codex_oauth_transform as transform
     # 必须注册 openai API factory 否则 config 里的 openai-* api channel 会走错分支
     register_factories()
@@ -67,6 +67,7 @@ def _import_modules():
         "CODEX_UPSTREAM_URL": CODEX_UPSTREAM_URL,
         "CODEX_CLI_USER_AGENT": CODEX_CLI_USER_AGENT,
         "transform": transform,
+        "handler": handler,
         "reasoning_replay": reasoning_replay,
     }
 
@@ -828,6 +829,69 @@ def test_session_id_isolation_with_prompt_cache_key(m):
     print("  [PASS] session_id: api_key_name-based isolation, conversation_id removed")
 
 
+def test_claude_agent_prompt_cache_key_drives_oauth_session_id(m):
+    _setup(m)
+    _add_openai_acc(m)
+
+    def _enable_auto_pck(c):
+        auto = c.setdefault("openai", {}).setdefault("autoPromptCacheKey", {})
+        auto["enabled"] = True
+        auto["prefix"] = "parrot:auto:v1"
+
+    m["config"].update(_enable_auto_pck)
+    handler = m["handler"]
+    channel = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+    )
+    parent = "123e4567-e89b-12d3-a456-426614174000"
+    agent_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    agent_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def _pck(agent_id):
+        body = {
+            "model": "gpt-5.1",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        }
+        return handler._maybe_apply_auto_prompt_cache_key(
+            body,
+            fp_query=None,
+            api_key_name="alice",
+            client_ip="192.0.2.10",
+            model="gpt-5.1",
+            ingress_protocol="responses",
+            claude_code_session_id=parent,
+            claude_code_agent_id=agent_id,
+        )
+
+    pck_a1 = _pck(agent_a)
+    pck_a2 = _pck(agent_a)
+    pck_b = _pck(agent_b)
+    assert pck_a1 == pck_a2
+    assert pck_a1 != pck_b
+
+    async def _request(pck):
+        return await channel.build_upstream_request(
+            {
+                "model": "gpt-5.1",
+                "input": "hi",
+                "prompt_cache_key": pck,
+                "_api_key_name": "alice",
+            },
+            "gpt-5.1",
+            ingress_protocol="responses",
+        )
+
+    req_a1 = asyncio.run(_request(pck_a1))
+    req_a2 = asyncio.run(_request(pck_a2))
+    req_b = asyncio.run(_request(pck_b))
+    sid_a1 = req_a1.headers.get("session_id")
+    sid_a2 = req_a2.headers.get("session_id")
+    sid_b = req_b.headers.get("session_id")
+    assert sid_a1 and sid_b
+    assert sid_a1 == sid_a2
+    assert sid_a1 != sid_b
+
+
 def test_session_id_isolation_disabled(m):
     """isolateSessionId=False 时不写 session_id / conversation_id 头。"""
     _setup(m)
@@ -984,6 +1048,7 @@ def main():
         test_registry_dispatches_by_provider,
         test_openai_oauth_channel_max_concurrent,
         test_session_id_isolation_with_prompt_cache_key,
+        test_claude_agent_prompt_cache_key_drives_oauth_session_id,
         test_session_id_isolation_disabled,
         test_force_codex_cli_switch,
         test_openai_oauth_legacy_provider_runtime_fallback_when_short_config_default,
