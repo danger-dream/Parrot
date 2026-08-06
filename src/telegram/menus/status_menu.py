@@ -181,7 +181,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
     """OAuth 账户用量 >= threshold 的告警条目（按 provider 读不同的 util 字段）。
 
     Anthropic 账户的指标维度：5h / 7d / Sonnet / Opus
-    OpenAI   账户的指标维度：5h / 7d（normalize_codex_snapshot 写入通用列）
+    OpenAI   账户的指标维度：5h / 7d / 30d（normalize_codex_snapshot 写入通用列）
                            + codex_primary / codex_secondary（codex 专属，更精细）
     """
     out: list[str] = []

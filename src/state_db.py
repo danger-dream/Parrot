@@ -5,6 +5,7 @@
 thread-local，WAL 模式。
 """
 
+import json
 import os
 import sqlite3
 import threading
@@ -101,7 +102,8 @@ def _schema_sql() -> str:
       extra_used       REAL,
       extra_limit      REAL,
       extra_util       REAL,
-      raw_data         TEXT
+      raw_data         TEXT,
+      codex_window_observations TEXT
     );
 
     CREATE TABLE IF NOT EXISTS network_check_status (
@@ -644,6 +646,7 @@ _OAUTH_QUOTA_CACHE_EXTRA_COLUMNS: list[tuple[str, str]] = [
     ("codex_secondary_reset_sec",       "INTEGER"),
     ("codex_secondary_window_min",      "INTEGER"),
     ("codex_primary_over_secondary_pct", "REAL"),
+    ("codex_window_observations",        "TEXT"),
 ]
 
 
@@ -1453,15 +1456,17 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
       {primary_used_pct / primary_reset_sec / primary_window_min /
        secondary_* / primary_over_secondary_pct / fetched_at (ms)}
     normalized: src.oauth.openai.normalize_codex_snapshot 的返回值
-      {five_hour_util / five_hour_reset_sec / seven_day_util / seven_day_reset_sec}
+      {five_hour_util / five_hour_reset_sec / seven_day_util / seven_day_reset_sec /
+       thirty_day_util / thirty_day_reset_sec}（只含本次实际观测到的语义窗口）
       None 时自动 normalize（便于调用方省事）。
 
-    复用现有 five_hour_util / seven_day_util 列：status_menu 的配额预警与
-    主菜单热账户计数无需区分 provider，直接读这两个字段即可。
+    复用现有 five_hour_util / seven_day_util / thirty_day_util 列。只更新本次
+    snapshot 实际包含的语义窗口，避免普通 5h/7d 响应头清空主动 WHAM 的
+    30d 数据，也避免 5h/30d 响应头清空仍有效的 7d 数据。
     """
     # 容错：调用方可能只给 snap，normalized 由本函数补
+    from .oauth import openai as _openai_provider
     if normalized is None:
-        from .oauth import openai as _openai_provider
         normalized = _openai_provider.normalize_codex_snapshot(snap)
 
     now = int(time.time())
@@ -1478,58 +1483,78 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
         target_email = email
         if target_email is None:
             target_email = _quota_display_email(target_account_key)
-        values = (
-            target_email,
-            fetched_at,
-            passive_ts,
-            normalized.get("five_hour_util"),
-            _reset_iso(normalized.get("five_hour_reset_sec")),
-            normalized.get("seven_day_util"),
-            _reset_iso(normalized.get("seven_day_reset_sec")),
-            snap.get("primary_used_pct"),
-            snap.get("primary_reset_sec"),
-            snap.get("primary_window_min"),
-            snap.get("secondary_used_pct"),
-            snap.get("secondary_reset_sec"),
-            snap.get("secondary_window_min"),
-            snap.get("primary_over_secondary_pct"),
+        semantic_fields = (
+            ("five_hour_util", "five_hour_util", False),
+            ("five_hour_reset", "five_hour_reset_sec", True),
+            ("seven_day_util", "seven_day_util", False),
+            ("seven_day_reset", "seven_day_reset_sec", True),
+            ("thirty_day_util", "thirty_day_util", False),
+            ("thirty_day_reset", "thirty_day_reset_sec", True),
         )
+        semantic_values = [
+            (column, _reset_iso(normalized.get(key)) if is_reset else normalized.get(key))
+            for column, key, is_reset in semantic_fields
+            if key in normalized
+        ]
+        raw_values = (
+            ("codex_primary_used_pct", snap.get("primary_used_pct")),
+            ("codex_primary_reset_sec", snap.get("primary_reset_sec")),
+            ("codex_primary_window_min", snap.get("primary_window_min")),
+            ("codex_secondary_used_pct", snap.get("secondary_used_pct")),
+            ("codex_secondary_reset_sec", snap.get("secondary_reset_sec")),
+            ("codex_secondary_window_min", snap.get("secondary_window_min")),
+            ("codex_primary_over_secondary_pct", snap.get("primary_over_secondary_pct")),
+        )
+        incoming_observations = _openai_provider.codex_snapshot_window_observations(snap)
         row = conn.execute(
-            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
+            "SELECT account_key, codex_window_observations "
+            "FROM oauth_quota_cache WHERE account_key=?",
             (target_account_key,),
         ).fetchone()
+        existing_observations = {}
+        if row is not None and row["codex_window_observations"]:
+            try:
+                existing_observations = json.loads(row["codex_window_observations"])
+            except (TypeError, ValueError):
+                existing_observations = {}
+        merged_observations = _openai_provider.merge_codex_window_observations(
+            existing_observations,
+            incoming_observations,
+        )
+        observations_json = (
+            json.dumps(merged_observations, ensure_ascii=False, separators=(",", ":"),
+                       sort_keys=True)
+            if merged_observations else None
+        )
         if row is None:
+            columns = ["account_key", "email", "fetched_at", "last_passive_update_at"]
+            values = [target_account_key, target_email, fetched_at, passive_ts]
+            for column, value in (*semantic_values, *raw_values):
+                columns.append(column)
+                values.append(value)
+            if observations_json is not None:
+                columns.append("codex_window_observations")
+                values.append(observations_json)
+            placeholders = ",".join("?" for _ in columns)
             conn.execute(
-                """INSERT INTO oauth_quota_cache
-                   (account_key, email, fetched_at, last_passive_update_at,
-                    five_hour_util, five_hour_reset,
-                    seven_day_util, seven_day_reset,
-                    sonnet_util, sonnet_reset,
-                    opus_util, opus_reset,
-                    extra_used, extra_limit, extra_util, raw_data,
-                    codex_primary_used_pct, codex_primary_reset_sec, codex_primary_window_min,
-                    codex_secondary_used_pct, codex_secondary_reset_sec, codex_secondary_window_min,
-                    codex_primary_over_secondary_pct)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    target_account_key,
-                ) + values[:7] + (
-                    None, None,        # sonnet —— OpenAI 无此维度
-                    None, None,        # opus   —— 同上
-                    None, None, None,  # extra_* —— Claude 专属
-                    None,              # raw_data（响应头体积较小，不存）
-                ) + values[7:],
+                f"INSERT INTO oauth_quota_cache ({','.join(columns)}) "
+                f"VALUES ({placeholders})",
+                values,
             )
         else:
+            updates = [
+                ("email", target_email),
+                ("fetched_at", fetched_at),
+                ("last_passive_update_at", passive_ts),
+                *semantic_values,
+                *raw_values,
+            ]
+            if incoming_observations:
+                updates.append(("codex_window_observations", observations_json))
             conn.execute(
-                """UPDATE oauth_quota_cache SET
-                     email=?, fetched_at=?, last_passive_update_at=?,
-                     five_hour_util=?, five_hour_reset=?,
-                     seven_day_util=?, seven_day_reset=?,
-                     codex_primary_used_pct=?, codex_primary_reset_sec=?, codex_primary_window_min=?,
-                     codex_secondary_used_pct=?, codex_secondary_reset_sec=?, codex_secondary_window_min=?,
-                     codex_primary_over_secondary_pct=?
-                   WHERE account_key=?""",
-                values + (target_account_key,),
+                f"UPDATE oauth_quota_cache SET "
+                f"{', '.join(f'{column}=?' for column, _ in updates)} "
+                "WHERE account_key=?",
+                [value for _, value in updates] + [target_account_key],
             )
     _commit_quota_write(account_key, write)
