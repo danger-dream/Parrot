@@ -65,6 +65,7 @@ WHAM_RESET_CREDIT_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit
 _WHAM_USAGE_TIMEOUT = 30.0
 _WHAM_RESET_CREDIT_LIST_TIMEOUT = 5.0
 _WHAM_RESET_CREDIT_TIMEOUT = 10.0
+_MONTHLY_QUOTA_WINDOW_THRESHOLD_SECONDS = 8 * 86400
 
 
 # ─── mock 开关（与 oauth_manager.mock_mode_enabled 同语义） ────────
@@ -599,7 +600,7 @@ def _wham_window_looks_monthly(win: dict) -> bool:
     """Return True when a WHAM window is clearly longer than a weekly quota."""
     sec = _coerce_int(win.get("limit_window_seconds"))
     if sec is not None:
-        return sec > 8 * 86400
+        return sec > _MONTHLY_QUOTA_WINDOW_THRESHOLD_SECONDS
 
     resets_at = win.get("resets_at")
     if isinstance(resets_at, str) and resets_at:
@@ -607,7 +608,9 @@ def _wham_window_looks_monthly(win: dict) -> bool:
             from datetime import datetime, timezone
 
             dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-            return (dt - datetime.now(timezone.utc)).total_seconds() > 8 * 86400
+            return (
+                dt - datetime.now(timezone.utc)
+            ).total_seconds() > _MONTHLY_QUOTA_WINDOW_THRESHOLD_SECONDS
         except Exception:
             return False
     return False
@@ -635,7 +638,30 @@ def normalize_wham_usage(payload: dict) -> dict:
     five_hour: dict = {}
     seven_day: dict = {}
     thirty_day: dict = {}
-    if len(windows) >= 2:
+    monthly_windows = [item for item in windows if _wham_window_looks_monthly(item[2])]
+    if monthly_windows:
+        # A payload can contain 5h+30d or 7d+30d. Classify the monthly window
+        # before applying the legacy small/large 5h/7d ordering; otherwise the
+        # large window is mislabeled as 7d. If malformed input repeats a monthly
+        # semantic, retain the higher utilization fail-closed.
+        monthly = max(
+            monthly_windows,
+            key=lambda item: float(item[2].get("utilization") or 0),
+        )
+        thirty_day = dict(monthly[2])
+        remaining = [item for item in windows if item not in monthly_windows]
+        if remaining:
+            name, sec, block = remaining[0]
+            if sec is not None:
+                if sec <= 6 * 3600:
+                    five_hour = dict(block)
+                else:
+                    seven_day = dict(block)
+            elif name == "primary_window":
+                five_hour = dict(block)
+            else:
+                seven_day = dict(block)
+    elif len(windows) >= 2:
         # 有窗口长度时，小窗口归 5h，大窗口归 7d。缺长度的排到后面；
         # 两个都缺时按 wham 当前语义 fallback：primary=5h、secondary=7d。
         if any(sec is not None for _, sec, _ in windows):
@@ -656,13 +682,6 @@ def normalize_wham_usage(payload: dict) -> dict:
             five_hour = dict(block)
         else:
             seven_day = dict(block)
-
-    # Preserve the original 5h/7d mapping above. Add only one extra case: when
-    # WHAM returns no 5h window and the sole large window is clearly ~30d, expose
-    # it separately instead of showing it as a misleading 7d quota.
-    if not five_hour and seven_day and _wham_window_looks_monthly(seven_day):
-        thirty_day = dict(seven_day)
-        seven_day = {}
 
     if thirty_day.get("limit_window_seconds") is not None:
         thirty_day["window_seconds"] = thirty_day.get("limit_window_seconds")
@@ -1078,7 +1097,7 @@ def parse_rate_limit_headers(headers: Any) -> dict | None:
       primary_used_pct / primary_reset_sec / primary_window_min
       secondary_used_pct / secondary_reset_sec / secondary_window_min
       primary_over_secondary_pct
-    这些原样落库到 oauth_quota_cache，同时调 Normalize 映射到 5h/7d。
+    这些原样落库到 oauth_quota_cache，同时调 Normalize 映射到 5h/7d/30d。
     """
     if headers is None:
         return None
@@ -1106,13 +1125,29 @@ def parse_rate_limit_headers(headers: Any) -> dict | None:
 
 
 def codex_snapshot_window_map(snap: dict) -> dict[str, str]:
-    """Map Codex primary/secondary headers to semantic 5h/7d windows.
+    """Map Codex primary/secondary headers to semantic 5h/7d/30d windows.
 
     Keep this mapping in one place: quota persistence and recovery must agree
     about which fresh WHAM window can supersede each response-header window.
+    WHAM treats windows longer than eight days as monthly; use the same boundary
+    here so observed 43200/43800-minute Codex windows map to ``thirty_day``
+    instead of being mislabeled as ``seven_day``.
     """
     p_win = _coerce_int(snap.get("primary_window_min"))
     s_win = _coerce_int(snap.get("secondary_window_min"))
+    monthly_min = _MONTHLY_QUOTA_WINDOW_THRESHOLD_SECONDS // 60
+    p_monthly = p_win is not None and p_win > monthly_min
+    s_monthly = s_win is not None and s_win > monthly_min
+
+    if p_monthly or s_monthly:
+        if p_monthly and s_monthly:
+            return {"primary": "thirty_day", "secondary": "thirty_day"}
+        if p_monthly:
+            secondary = "five_hour" if s_win is None or s_win <= 360 else "seven_day"
+            return {"primary": "thirty_day", "secondary": secondary}
+        primary = "five_hour" if p_win is None or p_win <= 360 else "seven_day"
+        return {"primary": primary, "secondary": "thirty_day"}
+
     use_5h_from_primary = False
     if p_win is not None and s_win is not None:
         if p_win < s_win:
@@ -1138,25 +1173,43 @@ def codex_snapshot_window_map(snap: dict) -> dict[str, str]:
 
 
 def normalize_codex_snapshot(snap: dict) -> dict:
-    """把 primary/secondary 映射到 5h/7d。参考 sub2api `Normalize()`。
+    """把 primary/secondary 映射到 5h/7d/30d。参考 sub2api `Normalize()`。
 
     策略：有 window_minutes 时，较小窗口归为 5h、较大归为 7d；只有一边
-    window_minutes 时按 ≤360 min 判 5h。两边都缺 → 回落把 primary 当 7d。
-    返回 {"five_hour_util", "five_hour_reset_sec", "seven_day_util", ...}
-    （沿用现有 `oauth_quota_cache.five_hour_*` 列名，避免多套展示逻辑）。
+    window_minutes 时按 ≤360 min 判 5h。超过 8 天的已知长窗口归为 30d；
+    两边都缺 → 回落把 primary 当 7d。返回各实际出现语义窗口的 ``*_util``
+    与 ``*_reset_sec`` 字段，沿用 oauth_quota_cache 的通用列名。
     """
     window_map = codex_snapshot_window_map(snap)
 
-    if window_map["primary"] == "five_hour":
-        five_util, five_reset = snap.get("primary_used_pct"), snap.get("primary_reset_sec")
-        seven_util, seven_reset = snap.get("secondary_used_pct"), snap.get("secondary_reset_sec")
-    else:
-        five_util, five_reset = snap.get("secondary_used_pct"), snap.get("secondary_reset_sec")
-        seven_util, seven_reset = snap.get("primary_used_pct"), snap.get("primary_reset_sec")
+    normalized: dict[str, Any] = {}
+    for raw_name in ("primary", "secondary"):
+        semantic = window_map[raw_name]
+        util_key = f"{semantic}_util"
+        reset_key = f"{semantic}_reset_sec"
+        util = snap.get(f"{raw_name}_used_pct")
+        reset = snap.get(f"{raw_name}_reset_sec")
+        if util is None and reset is None:
+            # window_min identifies semantics but is not quota evidence by
+            # itself. Do not erase a fresher active WHAM value when utilization
+            # and reset headers are both absent.
+            continue
 
-    return {
-        "five_hour_util": five_util,
-        "five_hour_reset_sec": five_reset,
-        "seven_day_util": seven_util,
-        "seven_day_reset_sec": seven_reset,
-    }
+        # Duplicate semantic windows are malformed but possible. Keep the
+        # higher utilization fail-closed instead of letting field order lower
+        # the persisted quota evidence.
+        current = normalized.get(util_key)
+        if util is not None and (util_key not in normalized or current is None):
+            normalized[util_key] = util
+            normalized[reset_key] = reset
+        elif util is not None:
+            try:
+                replace = float(util) > float(current)
+            except (TypeError, ValueError):
+                replace = False
+            if replace:
+                normalized[util_key] = util
+                normalized[reset_key] = reset
+        elif reset_key not in normalized:
+            normalized[reset_key] = reset
+    return normalized

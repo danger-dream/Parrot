@@ -1511,7 +1511,11 @@ def _codex_window_candidates(account_key: str, row: dict) -> dict[str, list[dict
     semantic window rather than allowing one newly observed window to erase an
     older, still-relevant other window.
     """
-    grouped: dict[str, list[dict]] = {"five_hour": [], "seven_day": []}
+    grouped: dict[str, list[dict]] = {
+        "five_hour": [],
+        "seven_day": [],
+        "thirty_day": [],
+    }
 
     def add(snapshot: dict | None, observed_ms: int | None, *, row_fallback: dict | None = None):
         if not isinstance(snapshot, dict):
@@ -1565,8 +1569,7 @@ def _fresh_wham_window_utils(usage: dict | None) -> dict[str, float | None]:
     if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
         return {}
 
-    def explicit_util(name: str) -> float | None:
-        block = usage.get(name) if isinstance(usage, dict) else None
+    def explicit_util(block: dict | None) -> float | None:
         raw = block.get("utilization") if isinstance(block, dict) else None
         if isinstance(raw, bool) or raw is None:
             return None
@@ -1579,8 +1582,9 @@ def _fresh_wham_window_utils(usage: dict | None) -> dict[str, float | None]:
         return value
 
     return {
-        "five_hour": explicit_util("five_hour"),
-        "seven_day": explicit_util("seven_day"),
+        "five_hour": explicit_util(usage.get("five_hour")),
+        "seven_day": explicit_util(usage.get("seven_day")),
+        "thirty_day": explicit_util(openai.get("thirty_day")),
     }
 
 
@@ -1597,7 +1601,7 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
 
     A Codex window is superseded only when active WHAM usage is clearly newer
     *and* contains the corresponding semantic window explicitly below threshold.
-    Missing 5h/7d evidence never clears the other window. A persistent config
+    Missing 5h/7d/30d evidence never clears another window. A persistent config
     observation closes the safety gap when auxiliary SQLite snapshot writes fail
     and also provides the generation used by the final account-enable CAS.
     """
