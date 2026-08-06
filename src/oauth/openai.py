@@ -23,6 +23,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import secrets
 import time
@@ -1170,6 +1171,129 @@ def codex_snapshot_window_map(snap: dict) -> dict[str, str]:
     if use_5h_from_primary:
         return {"primary": "five_hour", "secondary": "seven_day"}
     return {"primary": "seven_day", "secondary": "five_hour"}
+
+
+_CODEX_SEMANTIC_WINDOWS = ("five_hour", "seven_day", "thirty_day")
+
+
+def sanitize_codex_window_observations(value: Any) -> dict[str, dict]:
+    """Return valid per-semantic Codex evidence from persisted JSON/config."""
+    if not isinstance(value, dict):
+        return {}
+
+    sanitized: dict[str, dict] = {}
+    for semantic in _CODEX_SEMANTIC_WINDOWS:
+        raw = value.get(semantic)
+        if not isinstance(raw, dict):
+            continue
+
+        raw_name = raw.get("raw_name")
+        if raw_name not in ("primary", "secondary"):
+            continue
+        used_pct = raw.get("used_pct")
+        if isinstance(used_pct, bool):
+            continue
+        try:
+            used_pct = float(used_pct)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(used_pct):
+            continue
+
+        observed_at = raw.get("observed_at")
+        if isinstance(observed_at, bool):
+            continue
+        try:
+            observed_at = int(observed_at)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if observed_at < 0:
+            continue
+
+        item: dict[str, int | float | str] = {
+            "raw_name": raw_name,
+            "used_pct": used_pct,
+            "observed_at": observed_at,
+        }
+        for field in ("reset_sec", "window_min"):
+            field_value = raw.get(field)
+            if field_value is None or isinstance(field_value, bool):
+                continue
+            try:
+                field_value = int(field_value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if field_value >= 0:
+                item[field] = field_value
+        sanitized[semantic] = item
+    return sanitized
+
+
+def merge_codex_window_observations(*values: Any) -> dict[str, dict]:
+    """Merge partial Codex snapshots without erasing unobserved windows."""
+    merged: dict[str, dict] = {}
+    for value in values:
+        for semantic, candidate in sanitize_codex_window_observations(value).items():
+            current = merged.get(semantic)
+            if (
+                current is None
+                or candidate["observed_at"] >= current["observed_at"]
+            ):
+                merged[semantic] = candidate
+    return merged
+
+
+def codex_snapshot_window_observations(
+    snap: dict, *, observed_at: Any = None,
+) -> dict[str, dict]:
+    """Normalize one raw Codex snapshot into timestamped semantic evidence."""
+    if not isinstance(snap, dict):
+        return {}
+    if observed_at is None:
+        observed_at = snap.get("fetched_at")
+    if isinstance(observed_at, bool):
+        return {}
+    try:
+        observed_at = int(observed_at)
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    if observed_at < 0:
+        return {}
+
+    window_map = codex_snapshot_window_map(snap)
+    observations: dict[str, dict] = {}
+    for raw_name in ("primary", "secondary"):
+        used_pct = snap.get(f"{raw_name}_used_pct")
+        if isinstance(used_pct, bool):
+            continue
+        try:
+            used_pct = float(used_pct)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(used_pct):
+            continue
+
+        item: dict[str, int | float | str] = {
+            "raw_name": raw_name,
+            "used_pct": used_pct,
+            "observed_at": observed_at,
+        }
+        for suffix in ("reset_sec", "window_min"):
+            raw_value = snap.get(f"{raw_name}_{suffix}")
+            if raw_value is None or isinstance(raw_value, bool):
+                continue
+            try:
+                raw_value = int(raw_value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if raw_value >= 0:
+                item[suffix] = raw_value
+
+        semantic = window_map[raw_name]
+        current = observations.get(semantic)
+        if current is None or used_pct > current["used_pct"]:
+            observations[semantic] = item
+    return observations
 
 
 def normalize_codex_snapshot(snap: dict) -> dict:

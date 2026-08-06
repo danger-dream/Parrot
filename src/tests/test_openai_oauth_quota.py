@@ -593,12 +593,7 @@ def test_openai_quota_ignores_expired_codex_snapshot_missing_reset(m):
         key, snap, m["openai_provider"].normalize_codex_snapshot(snap), email=email,
     )
     old_ms = m["state_db"].now_ms() - 11 * 60 * 1000
-    conn = m["state_db"]._get_conn()
-    conn.execute(
-        "UPDATE oauth_quota_cache SET fetched_at=?, last_passive_update_at=? WHERE account_key=?",
-        (old_ms, old_ms, key),
-    )
-    conn.commit()
+    _set_quota_timestamps(m, key, passive_ms=old_ms, usage_ms=old_ms)
 
     wham_below_threshold = {
         "five_hour": {"utilization": 1.0, "resets_at": "2099-01-01T00:01:00Z"},
@@ -649,11 +644,18 @@ def _save_codex_over_threshold_snapshot(
 
 
 def _set_quota_timestamps(m, key, *, passive_ms, usage_ms):
+    row = m["state_db"].quota_load(key) or {}
+    observations_json = row.get("codex_window_observations")
+    if observations_json and passive_ms is not None:
+        observations = json.loads(observations_json)
+        for window in observations.values():
+            window["observed_at"] = passive_ms
+        observations_json = json.dumps(observations)
     conn = m["state_db"]._get_conn()
     conn.execute(
-        "UPDATE oauth_quota_cache SET last_passive_update_at=?, fetched_at=? "
-        "WHERE account_key=?",
-        (passive_ms, usage_ms, key),
+        "UPDATE oauth_quota_cache SET last_passive_update_at=?, fetched_at=?, "
+        "codex_window_observations=? WHERE account_key=?",
+        (passive_ms, usage_ms, observations_json, key),
     )
     conn.commit()
 
@@ -755,6 +757,74 @@ def test_openai_quota_keeps_30d_codex_hit_without_matching_wham_window(m):
     assert "codex primary 95%" in result["hit_windows"], result
     assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
     print("  [PASS] 5h/7d WHAM evidence cannot clear a Codex 30d hit")
+
+
+def test_partial_codex_snapshots_preserve_unobserved_30d_recovery_evidence(m):
+    """A later 5h/7d snapshot must not erase an active 30d Codex hit."""
+    _setup(m)
+    email = "partial-codex-preserves-30d@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+
+    monthly = m["openai_provider"].parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "96",
+        "x-codex-primary-reset-after-seconds": "2592000",
+        "x-codex-primary-window-minutes": "43800",
+        "x-codex-secondary-used-percent": "10",
+        "x-codex-secondary-reset-after-seconds": "18000",
+        "x-codex-secondary-window-minutes": "300",
+    })
+    assert monthly is not None
+    m["failover"]._maybe_auto_disable_by_codex_snapshot(key, email, monthly)
+    m["state_db"].quota_save_openai_snapshot(key, monthly, email=email)
+
+    weekly = m["openai_provider"].parse_rate_limit_headers({
+        "x-codex-primary-used-percent": "97",
+        "x-codex-primary-reset-after-seconds": "18000",
+        "x-codex-primary-window-minutes": "300",
+        "x-codex-secondary-used-percent": "10",
+        "x-codex-secondary-reset-after-seconds": "604800",
+        "x-codex-secondary-window-minutes": "10080",
+    })
+    assert weekly is not None
+    m["failover"]._maybe_auto_disable_by_codex_snapshot(key, email, weekly)
+    m["state_db"].quota_save_openai_snapshot(key, weekly, email=email)
+
+    now = m["state_db"].now_ms()
+    old_ms = now - m["oauth_manager"]._CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS - 60_000
+    _set_quota_timestamps(m, key, passive_ms=old_ms, usage_ms=now)
+
+    def _age_observation(c):
+        target = next(a for a in c["oauthAccounts"] if a.get("email") == email)
+        observation = target.get("quota_observation") or {}
+        observation["observed_at"] = old_ms
+        for window in (observation.get("windows") or {}).values():
+            window["observed_at"] = old_ms
+
+    m["config"].update(_age_observation)
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key, _low_wham(), threshold=95, fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "still_over_quota", result
+    assert any("96%" in hit for hit in result["hit_windows"]), result
+    assert acc["enabled"] is False and acc["disabled_reason"] == "quota", acc
+    observation = acc.get("quota_observation") or {}
+    assert observation.get("windows", {}).get("thirty_day", {}).get("used_pct") == 96.0
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        key,
+        _low_wham(
+            thirty_day={"utilization": 0.0, "resets_at": "2099-02-01T00:00:00Z"},
+        ),
+        threshold=95,
+        fresh=True,
+    )
+    acc = m["oauth_manager"].get_account(key)
+    assert result["action"] == "resumed", result
+    assert acc["enabled"] is True and acc.get("disabled_reason") is None, acc
+    print("  [PASS] partial Codex snapshots preserve unobserved 30d recovery evidence")
 
 
 def test_openai_quota_keeps_boundary_codex_snapshot_authoritative(m):
@@ -981,9 +1051,11 @@ def test_new_codex_hit_survives_sqlite_snapshot_write_failure(m):
     # resetting the monotonic generation.
     def _age_observation(c):
         target = next(a for a in c["oauthAccounts"] if a.get("email") == email)
-        target["quota_observation"]["observed_at"] = (
-            m["state_db"].now_ms() - 24 * 3600 * 1000
-        )
+        observation = target["quota_observation"]
+        old_ms = m["state_db"].now_ms() - 24 * 3600 * 1000
+        observation["observed_at"] = old_ms
+        for window in (observation.get("windows") or {}).values():
+            window["observed_at"] = old_ms
 
     m["config"].update(_age_observation)
     result = m["oauth_manager"].evaluate_and_toggle_by_usage(

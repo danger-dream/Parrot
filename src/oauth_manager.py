@@ -1458,7 +1458,49 @@ def codex_quota_observation(snap: dict) -> dict:
         "source": _CODEX_OBSERVATION_SOURCE,
         "observed_at": observed_at,
         "snapshot": sanitized,
+        "windows": openai_provider.codex_snapshot_window_observations(
+            sanitized, observed_at=observed_at,
+        ),
     }
+
+
+def _codex_windows_from_observation(observation: dict | None) -> dict[str, dict]:
+    if not isinstance(observation, dict):
+        return {}
+    if observation.get("source") != _CODEX_OBSERVATION_SOURCE:
+        return {}
+    stored = openai_provider.sanitize_codex_window_observations(
+        observation.get("windows"),
+    )
+    legacy = openai_provider.codex_snapshot_window_observations(
+        observation.get("snapshot") or {},
+        observed_at=observation.get("observed_at"),
+    )
+    return openai_provider.merge_codex_window_observations(stored, legacy)
+
+
+def _merge_codex_quota_observations(*observations: dict | None) -> dict | None:
+    valid = [
+        observation for observation in observations
+        if isinstance(observation, dict)
+        and observation.get("source") == _CODEX_OBSERVATION_SOURCE
+    ]
+    if not valid:
+        return None
+
+    latest = valid[0]
+    latest_ms = _ms_timestamp(latest.get("observed_at"))
+    for observation in valid[1:]:
+        observed_ms = _ms_timestamp(observation.get("observed_at"))
+        if observed_ms is not None and (latest_ms is None or observed_ms >= latest_ms):
+            latest = observation
+            latest_ms = observed_ms
+
+    merged = copy.deepcopy(latest)
+    merged["windows"] = openai_provider.merge_codex_window_observations(
+        *(_codex_windows_from_observation(observation) for observation in valid),
+    )
+    return merged
 
 
 def _codex_cached_reset_ms(row: dict, base_ms: int | None,
@@ -1490,17 +1532,16 @@ def _codex_snapshot_from_quota_row(row: dict) -> dict:
     }
 
 
-def _persistent_codex_observation(account_key: str) -> tuple[dict | None, int | None]:
+def _persistent_codex_observation(account_key: str) -> dict | None:
     acc = get_account(account_key)
     observation = acc.get(_QUOTA_OBSERVATION_FIELD) if isinstance(acc, dict) else None
     if not isinstance(observation, dict):
-        return None, None
+        return None
     if observation.get("source") != _CODEX_OBSERVATION_SOURCE:
-        return None, None
-    snapshot = observation.get("snapshot")
-    if not isinstance(snapshot, dict):
-        return None, None
-    return snapshot, _ms_timestamp(observation.get("observed_at"))
+        return None
+    if not _codex_windows_from_observation(observation):
+        return None
+    return observation
 
 
 def _codex_window_candidates(account_key: str, row: dict) -> dict[str, list[dict]]:
@@ -1545,13 +1586,36 @@ def _codex_window_candidates(account_key: str, row: dict) -> dict[str, list[dict
                 "reset_ms": reset_ms,
             })
 
+    def add_windows(windows: dict | None):
+        for semantic, item in openai_provider.sanitize_codex_window_observations(
+            windows,
+        ).items():
+            observed_ms = _ms_timestamp(item.get("observed_at"))
+            reset_ms = _codex_cached_reset_ms(
+                item, observed_ms, "reset_sec",
+            )
+            grouped[semantic].append({
+                "raw_name": item["raw_name"],
+                "semantic": semantic,
+                "pct": item["used_pct"],
+                "observed_ms": observed_ms,
+                "reset_ms": reset_ms,
+            })
+
     add(
         _codex_snapshot_from_quota_row(row),
         _ms_timestamp(row.get("last_passive_update_at")),
         row_fallback=row,
     )
-    persistent_snapshot, persistent_ms = _persistent_codex_observation(account_key)
-    add(persistent_snapshot, persistent_ms)
+    sqlite_observations = row.get("codex_window_observations")
+    if isinstance(sqlite_observations, str):
+        try:
+            sqlite_observations = json.loads(sqlite_observations)
+        except (TypeError, ValueError):
+            sqlite_observations = {}
+    add_windows(sqlite_observations)
+    persistent_observation = _persistent_codex_observation(account_key)
+    add_windows(_codex_windows_from_observation(persistent_observation))
 
     # Known timestamps are comparable, so only the newest observation for that
     # semantic window remains relevant. Timestamp-less legacy evidence stays as
@@ -2546,7 +2610,13 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None, *,
             next_generation = (current_generation if current_generation is not None else 0) + 1
             acc[_QUOTA_OBSERVATION_GENERATION_FIELD] = next_generation
             if isinstance(observation, dict):
-                acc[_QUOTA_OBSERVATION_FIELD] = copy.deepcopy(observation)
+                merged_observation = _merge_codex_quota_observations(
+                    acc.get(_QUOTA_OBSERVATION_FIELD),
+                    observation,
+                )
+                acc[_QUOTA_OBSERVATION_FIELD] = copy.deepcopy(
+                    merged_observation or observation,
+                )
 
             if current_enabled:
                 acc["enabled"] = False

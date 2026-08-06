@@ -5,6 +5,7 @@
 thread-local，WAL 模式。
 """
 
+import json
 import os
 import sqlite3
 import threading
@@ -101,7 +102,8 @@ def _schema_sql() -> str:
       extra_used       REAL,
       extra_limit      REAL,
       extra_util       REAL,
-      raw_data         TEXT
+      raw_data         TEXT,
+      codex_window_observations TEXT
     );
 
     CREATE TABLE IF NOT EXISTS network_check_status (
@@ -644,6 +646,7 @@ _OAUTH_QUOTA_CACHE_EXTRA_COLUMNS: list[tuple[str, str]] = [
     ("codex_secondary_reset_sec",       "INTEGER"),
     ("codex_secondary_window_min",      "INTEGER"),
     ("codex_primary_over_secondary_pct", "REAL"),
+    ("codex_window_observations",        "TEXT"),
 ]
 
 
@@ -1462,8 +1465,8 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
     30d 数据，也避免 5h/30d 响应头清空仍有效的 7d 数据。
     """
     # 容错：调用方可能只给 snap，normalized 由本函数补
+    from .oauth import openai as _openai_provider
     if normalized is None:
-        from .oauth import openai as _openai_provider
         normalized = _openai_provider.normalize_codex_snapshot(snap)
 
     now = int(time.time())
@@ -1502,16 +1505,36 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
             ("codex_secondary_window_min", snap.get("secondary_window_min")),
             ("codex_primary_over_secondary_pct", snap.get("primary_over_secondary_pct")),
         )
+        incoming_observations = _openai_provider.codex_snapshot_window_observations(snap)
         row = conn.execute(
-            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
+            "SELECT account_key, codex_window_observations "
+            "FROM oauth_quota_cache WHERE account_key=?",
             (target_account_key,),
         ).fetchone()
+        existing_observations = {}
+        if row is not None and row["codex_window_observations"]:
+            try:
+                existing_observations = json.loads(row["codex_window_observations"])
+            except (TypeError, ValueError):
+                existing_observations = {}
+        merged_observations = _openai_provider.merge_codex_window_observations(
+            existing_observations,
+            incoming_observations,
+        )
+        observations_json = (
+            json.dumps(merged_observations, ensure_ascii=False, separators=(",", ":"),
+                       sort_keys=True)
+            if merged_observations else None
+        )
         if row is None:
             columns = ["account_key", "email", "fetched_at", "last_passive_update_at"]
             values = [target_account_key, target_email, fetched_at, passive_ts]
             for column, value in (*semantic_values, *raw_values):
                 columns.append(column)
                 values.append(value)
+            if observations_json is not None:
+                columns.append("codex_window_observations")
+                values.append(observations_json)
             placeholders = ",".join("?" for _ in columns)
             conn.execute(
                 f"INSERT INTO oauth_quota_cache ({','.join(columns)}) "
@@ -1526,6 +1549,8 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
                 *semantic_values,
                 *raw_values,
             ]
+            if incoming_observations:
+                updates.append(("codex_window_observations", observations_json))
             conn.execute(
                 f"UPDATE oauth_quota_cache SET "
                 f"{', '.join(f'{column}=?' for column, _ in updates)} "
