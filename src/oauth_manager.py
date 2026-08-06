@@ -1618,12 +1618,22 @@ def _codex_window_candidates(account_key: str, row: dict) -> dict[str, list[dict
     add_windows(_codex_windows_from_observation(persistent_observation))
 
     # Known timestamps are comparable, so only the newest observation for that
-    # semantic window remains relevant. Timestamp-less legacy evidence stays as
+    # semantic window remains relevant. SQLite and config observations can be
+    # written from consecutive responses in the same millisecond while SQLite
+    # is throttled; break those ties fail-closed by keeping the higher
+    # utilization, then the later reset. Timestamp-less legacy evidence stays as
     # an additional fail-closed candidate until its absolute reset expires.
     for semantic, candidates in tuple(grouped.items()):
         unknown = [item for item in candidates if item["observed_ms"] is None]
         known = [item for item in candidates if item["observed_ms"] is not None]
-        newest = max(known, key=lambda item: item["observed_ms"]) if known else None
+        newest = max(
+            known,
+            key=lambda item: (
+                item["observed_ms"],
+                item["pct"],
+                item["reset_ms"] if item["reset_ms"] is not None else -1,
+            ),
+        ) if known else None
         grouped[semantic] = unknown + ([newest] if newest is not None else [])
     return grouped
 

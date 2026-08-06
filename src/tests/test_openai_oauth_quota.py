@@ -827,6 +827,82 @@ def test_partial_codex_snapshots_preserve_unobserved_30d_recovery_evidence(m):
     print("  [PASS] partial Codex snapshots preserve unobserved 30d recovery evidence")
 
 
+def test_same_millisecond_config_over_limit_wins_throttled_sqlite(m, monkeypatch):
+    """A same-ms config hit must not be hidden by the throttled SQLite low value."""
+    import asyncio
+
+    _setup(m)
+    email = "same-ms-cross-source@openai.test"
+    key = f"openai:{email}:acct-{email}"
+    _add_openai(m, email)
+    channel = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(key))
+
+    # Response snapshots use millisecond timestamps. Keep two otherwise normal
+    # consecutive observations in the same millisecond so the regression is
+    # deterministic rather than scheduler-dependent.
+    observed_ms = m["state_db"].now_ms()
+    real_parse = m["openai_provider"].parse_rate_limit_headers
+
+    def parse_at_same_millisecond(headers):
+        snapshot = real_parse(headers)
+        if snapshot is not None:
+            snapshot["fetched_at"] = observed_ms
+        return snapshot
+
+    monkeypatch.setattr(
+        m["openai_provider"], "parse_rate_limit_headers", parse_at_same_millisecond,
+    )
+
+    def response(utilization):
+        return _MockResp({
+            "x-codex-primary-used-percent": str(utilization),
+            "x-codex-primary-reset-after-seconds": "2592000",
+            "x-codex-primary-window-minutes": "43800",
+            "x-codex-secondary-used-percent": "10",
+            "x-codex-secondary-reset-after-seconds": "18000",
+            "x-codex-secondary-window-minutes": "300",
+        })
+
+    # 94% is persisted to SQLite. The immediately following 96% observation is
+    # saved to config and disables the account, while the SQLite snapshot write
+    # is correctly throttled for 30 seconds.
+    m["failover"]._maybe_record_codex_snapshot(channel, response(94))
+    first_row = m["state_db"].quota_load(key)
+    assert first_row["thirty_day_util"] == 94.0, first_row
+
+    m["failover"]._maybe_record_codex_snapshot(channel, response(96))
+    throttled_row = m["state_db"].quota_load(key)
+    account = m["oauth_manager"].get_account(key)
+    assert throttled_row["thirty_day_util"] == 94.0, throttled_row
+    assert account["enabled"] is False and account["disabled_reason"] == "quota", account
+    assert (
+        account.get("quota_observation", {})
+        .get("windows", {})
+        .get("thirty_day", {})
+        .get("used_pct")
+    ) == 96.0, account
+
+    candidates = m["oauth_manager"]._codex_window_candidates(key, throttled_row)
+    assert len(candidates["thirty_day"]) == 1, candidates
+    assert candidates["thirty_day"][0]["pct"] == 96.0, candidates
+
+    # Fresh WHAM has no matching 30d evidence. The config 96% observation must
+    # therefore keep the account disabled; the stale SQLite 94% must not win the
+    # equal-timestamp tie and allow recovery.
+    usage = _low_wham()
+
+    async def fetch_usage(account_key):
+        assert account_key == key, account_key
+        return usage
+
+    monkeypatch.setattr(m["oauth_manager"], "fetch_usage", fetch_usage)
+    outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
+    account = m["oauth_manager"].get_account(key)
+    assert outcomes[email] == "still_over_quota", outcomes
+    assert account["enabled"] is False and account["disabled_reason"] == "quota", account
+    print("  [PASS] same-ms config high value wins throttled SQLite low value")
+
+
 def test_openai_quota_keeps_boundary_codex_snapshot_authoritative(m):
     """Near-simultaneous WHAM/Codex data must still let the snapshot win.
 
