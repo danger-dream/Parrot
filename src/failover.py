@@ -57,6 +57,7 @@ from .protocols.runtime import (
     apply_non_stream_response_translator,
     bounded_account_quota_error,
     configured_transient_retry_delays,
+    connection_lifecycle_outcome,
     failover_final_http_status,
     is_context_1m_credit_error,
     is_responses_ws_visible_event_type,
@@ -3383,11 +3384,11 @@ async def _consume_oauth_responses_ws_non_stream(
                 error_detail=step.error_detail,
                 http_status=504,
             ))
-        if step.outcome == "upstream_closed":
+        if step.outcome in ("upstream_closed", "connection_lifecycle"):
             return await finalize_terminal_error(AttemptResult(
-                outcome="upstream_closed",
+                outcome=step.outcome,
                 error_detail=step.error_detail or "upstream websocket closed",
-                http_status=502,
+                http_status=(502 if step.outcome == "upstream_closed" else None),
             ))
         if step.outcome == "stream_upstream_error":
             return await finalize_terminal_error(AttemptResult(
@@ -3758,8 +3759,12 @@ async def _consume_oauth_responses_ws_stream(
                         err.error_detail or step.outcome,
                     )
                     return
-                if step.outcome == "upstream_closed":
-                    err = AttemptResult(outcome="upstream_closed", error_detail=step.error_detail, http_status=502)
+                if step.outcome in ("upstream_closed", "connection_lifecycle"):
+                    err = AttemptResult(
+                        outcome=step.outcome,
+                        error_detail=step.error_detail,
+                        http_status=(502 if step.outcome == "upstream_closed" else None),
+                    )
                     await await_ws_owned(finalize_error(err))
                     yield _sse_error_for_ingress("responses", errors.ErrType.API, err.error_detail or "upstream websocket closed")
                     return
@@ -3808,10 +3813,11 @@ async def _consume_oauth_responses_ws_stream(
             raise
         except Exception as exc:
             if not state["finalized"]:
+                lifecycle = connection_lifecycle_outcome(exc)
                 await await_ws_owned(finalize_error(AttemptResult(
-                    outcome="transport_error",
+                    outcome=lifecycle or "transport_error",
                     error_detail=f"websocket stream error: {exc}"[:2000],
-                    http_status=502,
+                    http_status=None if lifecycle else 502,
                 )))
             raise
         finally:
@@ -4130,8 +4136,9 @@ async def _try_channel(
         except Exception:
             pass
         await _close_proxy_client(_proxy_client)
+        lifecycle = connection_lifecycle_outcome(exc)
         result = AttemptResult(
-            outcome="transport_error",
+            outcome=lifecycle or "transport_error",
             error_detail=f"unexpected: {exc}",
         )
         return _finalize_http_attempt(opened, result)
@@ -4582,6 +4589,9 @@ async def _consume_stream(
             and bool(getattr(tracker, "saw_stream_error", False))
         )
 
+    def _chat_done_received() -> bool:
+        return ch_proto == "openai-chat" and bool(getattr(tracker, "done_received", False))
+
     def _finish_stream_timing(outcome: str, error_detail: str | None = None):
         if timing is None:
             return None
@@ -4953,6 +4963,11 @@ async def _consume_stream(
 
             for out in first_downstream_chunks:
                 yield out
+            if _chat_done_received():
+                terminal_chunks = await _finalize_terminal_success()
+                for out in terminal_chunks:
+                    yield out
+                return
 
             # 后续 chunk，带 first-byte / idle / total 超时
             while True:
@@ -4969,6 +4984,7 @@ async def _consume_stream(
                     timing=timing,
                     round_timeouts=round_timeouts,
                     translator_ctx=translator_ctx,
+                    upstream_status=upstream_status,
                 )
                 if step.kind == "end":
                     break
@@ -5044,6 +5060,11 @@ async def _consume_stream(
 
                 for out in step.downstream_chunks:
                     yield out
+                if _chat_done_received():
+                    terminal_chunks = await _finalize_terminal_success()
+                    for out in terminal_chunks:
+                        yield out
+                    return
 
             if not getattr(tracker, "saw_stream_end", False):
                 # A transport EOF after visible output cannot be retried without
@@ -5084,7 +5105,11 @@ async def _consume_stream(
         except BaseException as exc:
             await await_ws_owned(_emit_error_and_finalize(
                 "api_error", f"stream error: {exc}",
-                outcome="transport_error",
+                outcome=connection_lifecycle_outcome(
+                    exc,
+                    http_status=upstream_status,
+                    http_phase="response_body",
+                ) or "transport_error",
             ))
             raise
         finally:

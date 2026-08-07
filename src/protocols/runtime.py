@@ -19,6 +19,9 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+import httpcore
+import httpx
+
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
 from .commit_gate import is_responses_visible_event_type
@@ -144,6 +147,7 @@ def make_stream_translator(translator_ctx: Optional[dict]):
             channel_key=translator_ctx.get("channel_key"),
             current_input_items=translator_ctx.get("current_input_items"),
             request_body=translator_ctx.get("request_body"),
+            namespace_tool_map=translator_ctx.get("namespace_tool_map"),
         )
     return None
 
@@ -185,6 +189,7 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
             api_key_name=translator_ctx.get("api_key_name"),
             channel_key=translator_ctx.get("channel_key"),
             current_input_items=translator_ctx.get("current_input_items"),
+            namespace_tool_map=translator_ctx.get("namespace_tool_map"),
         )
     return obj
 
@@ -379,6 +384,7 @@ OUTCOMES_NO_COOLDOWN = frozenset({
     "candidate_guard",
     "request_invalid",
     "client_disconnected",
+    "connection_lifecycle",
 })
 
 
@@ -388,7 +394,63 @@ def should_cooldown(outcome: str) -> bool:
 
 def should_record_failure(outcome: str) -> bool:
     """Whether an unsuccessful attempt should affect channel health scoring."""
-    return outcome != "candidate_guard"
+    return outcome not in {
+        "candidate_guard", "request_invalid", "client_disconnected",
+        "connection_lifecycle",
+    }
+
+
+_HTTP_NO_RESPONSE_DISCONNECT_DETAIL = (
+    "Server disconnected without sending a response."
+)
+
+
+def is_connection_lifecycle_error(
+    exc: BaseException | None = None,
+    *,
+    http_status: int | None = None,
+    http_phase: str | None = None,
+    ws_close_code: int | None = None,
+) -> bool:
+    """Identify only typed, verified transport lifecycle outcomes.
+
+    WebSocket close codes are an independent adapter-owned signal.  HTTP is
+    deliberately narrower: only a typed httpx/httpcore RemoteProtocolError at
+    the pre-header phase with the exact httpcore HTTP/1.1 no-response detail is
+    health-neutral.  Protocol/framing errors and generic EOF-like exceptions
+    remain transport failures.
+    """
+    if ws_close_code is not None:
+        return int(ws_close_code) in {1000, 1001, 1006}
+    if http_status is not None or http_phase != "pre_headers" or exc is None:
+        return False
+
+    candidates = (exc, exc.__cause__)
+    return any(
+        isinstance(candidate, (httpx.RemoteProtocolError, httpcore.RemoteProtocolError))
+        and str(candidate) == _HTTP_NO_RESPONSE_DISCONNECT_DETAIL
+        for candidate in candidates
+        if candidate is not None
+    )
+
+
+def connection_lifecycle_outcome(
+    exc: BaseException | None = None,
+    *,
+    http_status: int | None = None,
+    http_phase: str | None = None,
+    ws_close_code: int | None = None,
+) -> str | None:
+    return (
+        "connection_lifecycle"
+        if is_connection_lifecycle_error(
+            exc,
+            http_status=http_status,
+            http_phase=http_phase,
+            ws_close_code=ws_close_code,
+        )
+        else None
+    )
 
 
 DEFAULT_TRANSIENT_RETRY_DELAYS_S = (0.75, 1.75)
@@ -672,7 +734,7 @@ def failover_final_http_status(result: Any | None) -> int:
         "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
     ):
         return 504
-    if outcome in ("connect_error", "transport_error"):
+    if outcome in ("connect_error", "transport_error", "connection_lifecycle"):
         return 502
     if outcome == "candidate_guard":
         return int(getattr(result, "http_status", None) or 400)
@@ -709,7 +771,7 @@ def responses_ws_http_status_from_attempt(result: Any | None) -> int:
         "connect_timeout", "first_byte_timeout", "idle_timeout", "total_timeout",
     ):
         return 504
-    if outcome in ("connect_error", "transport_error", "upstream_closed", "closed_before_first_byte"):
+    if outcome in ("connect_error", "transport_error", "connection_lifecycle", "upstream_closed", "closed_before_first_byte"):
         return 502
     if outcome == "client_disconnected":
         return 499
@@ -933,32 +995,50 @@ def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
     return result
 
 
-def _structured_http_request_invalid_error_info(
+def _structured_request_invalid_error_info(
     result: AttemptResult,
 ) -> tuple[str | None, str] | None:
-    """Return safe code/message for an explicit pre-commit HTTP 400 input error."""
-    if result.outcome != "http_error" or result.http_status != 400:
+    """Return code/message only for an explicit structured request fault."""
+    status = result.http_status
+    if status is not None and status not in {200, 400, 409, 413, 422} and status < 500:
         return None
     raw = str(result.error_detail or "").strip()
-    prefix = "HTTP 400:"
-    if raw.startswith(prefix):
-        raw = raw[len(prefix):].lstrip()
+    start = raw.find("{")
+    if start < 0:
+        return None
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw[start:])
     except Exception:
         return None
     return protocol_errors.request_invalid_error_info(payload)
 
 
 def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
-    if is_invalid_encrypted_content_error(result.error_detail):
-        return _mark_request_invalid(result, 400)
-    if is_context_length_exceeded_error(result.error_detail):
-        return _mark_request_invalid(result, _request_invalid_status(result))
-    request_error = _structured_http_request_invalid_error_info(result)
+    request_error = _structured_request_invalid_error_info(result)
     if request_error is not None:
         result.error_code, result.error_detail = request_error
-        return _mark_request_invalid(result, 400)
+        if protocol_errors.is_context_length_code_or_message(
+            result.error_code, result.error_detail,
+        ):
+            result.error_code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+            context_detail = str(result.error_detail or "")
+            if protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE not in context_detail:
+                context_detail = (
+                    f"{protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE}: {context_detail}"
+                )
+            result.error_detail = protocol_errors.context_length_error_message_for_claude_code(
+                context_detail,
+            )
+        return _mark_request_invalid(result, _request_invalid_status(result))
+    # Text-only compatibility recognizers are limited to status-less and client
+    # 4xx attempts.  In particular, ordinary 5xx messages never become request
+    # faults without an explicit structured code/type.
+    status = result.http_status
+    text_classification_allowed = status is None or status in {200, 400, 409, 413, 422}
+    if text_classification_allowed and is_invalid_encrypted_content_error(result.error_detail):
+        return _mark_request_invalid(result, _request_invalid_status(result))
+    if text_classification_allowed and is_context_length_exceeded_error(result.error_detail):
+        return _mark_request_invalid(result, _request_invalid_status(result))
     return result
 
 

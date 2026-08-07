@@ -152,6 +152,12 @@ def _chunks_have_downstream_event(chunks: Iterable[bytes], protocol: str, *, inc
                 return True
             continue
         for block in events:
+            if protocol == "openai-chat" and any(
+                line.strip().startswith(b"data:")
+                and line.strip()[5:].strip() == b"[DONE]"
+                for line in block.splitlines()
+            ):
+                return True
             event_name, data = upstream.parse_sse_event_bytes(block)
             if is_sse_downstream_visible_event(event_name, data, protocol):
                 return True

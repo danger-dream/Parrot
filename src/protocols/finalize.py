@@ -83,7 +83,11 @@ def error_plan(
     clear_reasoning_replay: bool = False,
 ) -> FinalizePlan:
     if failure_policy == "post_commit_stream":
-        record_failure = True
+        # A committed partial response remains an error, but request faults and
+        # connection lifecycle ends are not evidence of unhealthy credentials.
+        record_failure = outcome not in {
+            "request_invalid", "client_disconnected", "connection_lifecycle",
+        }
     elif failure_policy == "cooldown_only":
         record_failure = should_cooldown(outcome)
     else:

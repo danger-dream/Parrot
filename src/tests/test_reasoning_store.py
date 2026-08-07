@@ -98,7 +98,7 @@ def test_reasoning_replay_module_is_runtime_contract():
     rr.clear()
 
 
-def test_invalid_encrypted_content_is_request_invalid_not_channel_failure():
+def test_unstructured_5xx_invalid_encrypted_content_is_not_request_fault():
     import src.failover as f
 
     result = f.AttemptResult(
@@ -110,9 +110,9 @@ def test_invalid_encrypted_content_is_request_invalid_not_channel_failure():
         http_status=503,
     )
     out = f._request_invalid_result_if_needed(result)
-    assert out.outcome == "request_invalid"
-    assert out.http_status == 400
-    assert not f._should_cooldown(out.outcome)
+    assert out.outcome == "stream_upstream_error"
+    assert out.http_status == 503
+    assert f._should_cooldown(out.outcome)
 
 
 def test_invalid_encrypted_content_clears_replay_scope():
@@ -212,7 +212,6 @@ def test_structured_request_invalid_http_classification_keeps_retryable_and_ambi
 
     cases = [
         (429, '{"error":{"type":"invalid_request_error","code":"invalid_value","param":"input","message":"bad"}}'),
-        (503, '{"error":{"type":"invalid_request_error","code":"invalid_value","param":"input","message":"bad"}}'),
         (400, '{"error":{"type":"api_error","code":"upstream_rejected","message":"channel failure"}}'),
         (400, "not json"),
     ]

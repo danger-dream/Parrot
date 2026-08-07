@@ -17,6 +17,7 @@ import websockets
 from .. import blacklist
 from ..protocols import errors as protocol_errors
 from ..protocols.runtime import (
+    connection_lifecycle_outcome,
     is_responses_ws_visible_event_type,
     is_retryable_responses_ws_error_before_accept,
     parse_wrapped_responses_ws_error,
@@ -415,6 +416,19 @@ async def read_until_first_responses_ws_visible_event(
             result.outcome = "transport_timeout"
             result.error_detail = "websocket transport timeout before first frame"
             return result
+        except websockets.ConnectionClosed as exc:
+            if timing is not None:
+                timing.mark_io_complete()
+            close_code = int(exc.rcvd.code if exc.rcvd else 1000)
+            result.outcome = (
+                connection_lifecycle_outcome(exc, ws_close_code=close_code)
+                or "upstream_closed"
+            )
+            result.http_status = None
+            result.error_detail = f"upstream websocket closed: {exc}"
+            result.close_code = close_code
+            result.close_reason = str(exc.rcvd.reason if exc.rcvd else "")
+            return result
 
         if result.first_packet_ms is None and timing is not None:
             result.first_packet_ms = timing.snapshot().first_byte_ms
@@ -564,9 +578,12 @@ async def read_next_responses_ws_step(
             )
         detail = closed_error_detail if closed_error_detail is not None else f"upstream websocket closed: {exc}"
         return ResponsesWsReadStep(
-            outcome="upstream_closed",
+            outcome=(
+                connection_lifecycle_outcome(exc, ws_close_code=close_code)
+                or "upstream_closed"
+            ),
             error_detail=detail,
-            http_status=502,
+            http_status=None,
             close_code=close_code,
             close_reason=close_reason,
         )

@@ -43,9 +43,8 @@ def guard_request(body: dict, *, allow_file_url_documents: bool = False) -> None
     # the output allowlist instead of guarded here.  Hard schema enforcement or
     # provider-specific policy must be modeled outside this generic fallback.
     # If both legacy function_call and tool_choice are present, prefer
-    # tool_choice later and ignore the legacy hint.  This matches CPA-style
-    # normalizers: unsupported/duplicate request controls should not block the
-    # core message payload.
+    # tool_choice later and ignore the legacy hint. Unsupported or duplicate
+    # request controls should not block the core message payload.
     # Response metadata / sampling hints with no Anthropic bridge field are
     # ignored: response_format/logprobs/top_logprobs, modalities/audio output
     # hints, penalties, seed, prediction, verbosity, logit_bias, store,
@@ -303,6 +302,12 @@ def _convert_messages(
     system: list[dict[str, str]] = []
     id_map: dict[str, str] = {}
 
+    def append_turn(role: str, content: list[dict[str, Any]]) -> None:
+        if out and out[-1].get("role") == role:
+            out[-1]["content"].extend(content)
+        else:
+            out.append({"role": role, "content": content})
+
     for msg in messages or []:
         if not isinstance(msg, dict):
             _fail("messages must contain objects", param="messages")
@@ -320,17 +325,14 @@ def _convert_messages(
             raw_id = str(msg.get("tool_call_id") or "")
             tool_use_id = id_map.get(raw_id) or _sanitize_tool_use_id(raw_id)
             id_map[raw_id] = tool_use_id
-            out.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": _tool_result_content(
-                        msg.get("content"),
-                        allow_file_url_documents=allow_file_url_documents,
-                    ),
-                }],
-            })
+            append_turn("user", [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": _tool_result_content(
+                    msg.get("content"),
+                    allow_file_url_documents=allow_file_url_documents,
+                ),
+            }])
             continue
 
         if role not in ("user", "assistant"):
@@ -382,7 +384,7 @@ def _convert_messages(
                 })
         if not content:
             content = [{"type": "text", "text": ""}]
-        out.append({"role": role, "content": content})
+        append_turn(role, content)
 
     if not out and system:
         out.append({"role": "user", "content": [{"type": "text", "text": ""}]})

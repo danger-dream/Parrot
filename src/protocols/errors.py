@@ -29,6 +29,7 @@ ErrorCategory = Literal[
     "transport",
     "blacklist",
     "client_cancelled",
+    "connection_lifecycle",
 ]
 
 
@@ -257,6 +258,36 @@ def legacy_openai_error_type_for_http_status(status: int) -> str:
 
 
 def classify_attempt_outcome(outcome: str, http_status: int | None) -> NormalizedError:
+    if outcome == "request_invalid":
+        status = int(http_status or 400)
+        base = normalize_http_status(status, message=outcome, raw={"outcome": outcome})
+        return NormalizedError(
+            category=base.category,
+            http_status=status,
+            upstream_code=None,
+            message=outcome,
+            retryable_before_commit=False,
+            retryable_after_commit=False,
+            should_cooldown=False,
+            should_score_failure=False,
+            should_refresh_oauth=False,
+            request_fixup=None,
+            raw={"outcome": outcome},
+        )
+    if outcome == "connection_lifecycle" and http_status is None:
+        return NormalizedError(
+            category="connection_lifecycle",
+            http_status=502,
+            upstream_code=None,
+            message=outcome,
+            retryable_before_commit=True,
+            retryable_after_commit=False,
+            should_cooldown=False,
+            should_score_failure=False,
+            should_refresh_oauth=False,
+            request_fixup=None,
+            raw={"outcome": outcome},
+        )
     if http_status is not None:
         return normalize_http_status(http_status, message=outcome, raw={"outcome": outcome})
     if outcome in (
@@ -308,10 +339,24 @@ def classify_attempt_outcome(outcome: str, http_status: int | None) -> Normalize
 
 
 _REQUEST_INVALID_ERROR_TYPES = frozenset({
+    "invalid_prompt",
     "invalid_request_error",
     "invalid_request",
+    "bad_request_error",
+    "request_too_large",
+    "invalid_value",
+    "unsupported_value",
+    "context_length_exceeded",
+    "message_too_big",
+    "string_above_max_length",
+    "previous_response_not_found",
+    "cyber_policy",
 })
 _REQUEST_INVALID_INPUT_CODES = frozenset({
+    "invalid_prompt",
+    "invalid_request_error",
+    "invalid_request",
+    "bad_request_error",
     "invalid_value",
     "invalid_type",
     "invalid_input",
@@ -321,7 +366,15 @@ _REQUEST_INVALID_INPUT_CODES = frozenset({
     "invalid_base64",
     "missing_required_parameter",
     "unsupported_value",
+    "context_length_exceeded",
+    "message_too_big",
+    "string_above_max_length",
+    "previous_response_not_found",
+    "cyber_policy",
 })
+_REQUEST_ERROR_WRAPPER_KEYS = (
+    "error", "response", "detail", "details", "body", "cause",
+)
 _REQUEST_INPUT_PARAM_ROOTS = frozenset({
     "input",
     "messages",
@@ -347,37 +400,43 @@ def request_invalid_error_info(payload: Any) -> tuple[str | None, str] | None:
     if not isinstance(payload, dict):
         return None
 
-    err: Any = payload
-    if isinstance(payload.get("error"), dict):
-        err = payload["error"]
-    elif isinstance(payload.get("response"), dict) and isinstance(payload["response"].get("error"), dict):
-        err = payload["response"]["error"]
-    if not isinstance(err, dict):
-        return None
+    def candidates(value: Any, depth: int = 0):
+        if depth > 5 or not isinstance(value, dict):
+            return
+        yield value
+        for key in _REQUEST_ERROR_WRAPPER_KEYS:
+            child = value.get(key)
+            if isinstance(child, dict):
+                yield from candidates(child, depth + 1)
+            elif isinstance(child, list):
+                for item in child[:20]:
+                    if isinstance(item, dict):
+                        yield from candidates(item, depth + 1)
 
-    error_type = str(err.get("type") or err.get("error_type") or "").strip().lower()
-    raw_code = err.get("code")
-    code = str(raw_code).strip()[:128] if raw_code is not None else None
-    code_key = str(code or "").lower()
-    raw_param = err.get("param")
-    param = str(raw_param).strip() if raw_param is not None else ""
-    param_root = re.split(r"[.\[]", param.lower(), maxsplit=1)[0]
-    param_is_input = param_root in _REQUEST_INPUT_PARAM_ROOTS
+    for err in candidates(payload):
+        error_type = str(err.get("type") or err.get("error_type") or "").strip().lower()
+        raw_code = err.get("code")
+        code = str(raw_code).strip()[:128] if raw_code is not None else None
+        code_key = str(code or "").lower()
+        raw_param = err.get("param")
+        param = str(raw_param).strip() if raw_param is not None else ""
+        param_root = re.split(r"[.\[]", param.lower(), maxsplit=1)[0]
+        param_is_input = param_root in _REQUEST_INPUT_PARAM_ROOTS
 
-    if error_type:
-        if error_type not in _REQUEST_INVALID_ERROR_TYPES:
-            return None
-        # A structured invalid-request type is sufficient when no narrower code
-        # is supplied.  If a code is present, require known input semantics or
-        # an explicit client-input parameter so model/channel errors fail closed.
-        if code and code_key not in _REQUEST_INVALID_INPUT_CODES and not param_is_input:
-            return None
-    elif code_key not in _REQUEST_INVALID_INPUT_CODES or not param_is_input:
-        return None
+        explicit_code = code_key in _REQUEST_INVALID_INPUT_CODES
+        explicit_type = error_type in _REQUEST_INVALID_ERROR_TYPES
+        if not explicit_code and not explicit_type:
+            continue
+        # Generic invalid-request types with a narrower unknown code may be
+        # channel/model errors.  Keep those fail-closed unless the parameter is
+        # unmistakably part of client input.
+        if explicit_type and code and not explicit_code and not param_is_input:
+            continue
 
-    raw_message = err.get("message") or err.get("reason") or "invalid request"
-    message = str(raw_message).strip()[:2000] or "invalid request"
-    return code, message
+        raw_message = err.get("message") or err.get("reason") or "invalid request"
+        message = str(raw_message).strip()[:2000] or "invalid request"
+        return code or (error_type if error_type else None), message
+    return None
 
 
 def extract_error_info(payload: Any, fallback: str = "upstream stream error") -> tuple[str | None, str]:

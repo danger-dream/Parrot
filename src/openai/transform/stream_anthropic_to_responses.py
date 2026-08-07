@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
 from .common import build_response_skeleton, build_response_usage
+from .responses_to_anthropic import NamespaceToolMap
 from ...protocols.usage import legacy_usage_from_anthropic_json
 
 
@@ -142,6 +143,7 @@ class StreamTranslator:
         channel_key: Optional[str] = None,
         current_input_items: Optional[list] = None,
         request_body: Optional[dict] = None,
+        namespace_tool_map: NamespaceToolMap | None = None,
         created_ts: Optional[int] = None,
     ):
         self.state = _State(
@@ -155,6 +157,7 @@ class StreamTranslator:
         self._store_api_key_name = api_key_name
         self._store_channel_key = channel_key
         self._store_current_input = current_input_items
+        self._namespace_tool_map = namespace_tool_map
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
@@ -232,7 +235,7 @@ class StreamTranslator:
                     "type": "response.output_item.added",
                     "sequence_number": self.state.next_seq(),
                     "output_index": st.output_index,
-                    "item": {"id": f"fc_{st.id}", "type": "function_call", "status": "in_progress", "arguments": "", "call_id": st.id, "name": st.name},
+                    "item": self._tool_output_item(st, status="in_progress", value=""),
                 })
             return
 
@@ -259,8 +262,14 @@ class StreamTranslator:
                 part = delta.get("partial_json")
                 if isinstance(part, str) and part:
                     st.args += part
-                    yield _emit("response.function_call_arguments.delta", {
-                        "type": "response.function_call_arguments.delta",
+                    identity = self._tool_identity(st)
+                    event = (
+                        "response.custom_tool_call_input.delta"
+                        if identity is not None and identity.kind == "custom"
+                        else "response.function_call_arguments.delta"
+                    )
+                    yield _emit(event, {
+                        "type": event,
                         "sequence_number": self.state.next_seq(),
                         "item_id": f"fc_{st.id or 'call'}",
                         "output_index": st.output_index,
@@ -354,13 +363,24 @@ class StreamTranslator:
     def _finish_tool(self, st: _ToolState) -> Iterator[bytes]:
         st.done = True
         args = st.args or "{}"
-        yield _emit("response.function_call_arguments.done", {
-            "type": "response.function_call_arguments.done",
-            "sequence_number": self.state.next_seq(),
-            "item_id": f"fc_{st.id}",
-            "output_index": st.output_index,
-            "arguments": args,
-        })
+        identity = self._tool_identity(st)
+        if identity is not None and identity.kind == "custom":
+            yield _emit("response.custom_tool_call_input.done", {
+                "type": "response.custom_tool_call_input.done",
+                "sequence_number": self.state.next_seq(),
+                "item_id": f"fc_{st.id}",
+                "output_index": st.output_index,
+                "input": args,
+            })
+        else:
+            yield _emit("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "sequence_number": self.state.next_seq(),
+                "item_id": f"fc_{st.id}",
+                "output_index": st.output_index,
+                "arguments": args,
+                "name": identity.child_name if identity is not None else (st.name or "tool"),
+            })
         yield _emit("response.output_item.done", {
             "type": "response.output_item.done",
             "sequence_number": self.state.next_seq(),
@@ -386,8 +406,27 @@ class StreamTranslator:
     def _output_text(self) -> str:
         return "".join(self.state.text_parts)
 
-    def _tool_output_item(self, st: _ToolState) -> dict:
-        return {"id": f"fc_{st.id}", "type": "function_call", "status": "completed", "arguments": st.args or "{}", "call_id": st.id, "name": st.name or "tool"}
+    def _tool_identity(self, st: _ToolState):
+        if self._namespace_tool_map is None:
+            return None
+        return self._namespace_tool_map.identity_for_flat(st.name)
+
+    def _tool_output_item(
+        self, st: _ToolState, *, status: str = "completed", value: str | None = None,
+    ) -> dict:
+        identity = self._tool_identity(st)
+        name = identity.child_name if identity is not None else (st.name or "tool")
+        item = {
+            "id": f"fc_{st.id}", "type": "function_call", "status": status,
+            "arguments": st.args or "{}" if value is None else value,
+            "call_id": st.id, "name": name,
+        }
+        if identity is not None and identity.namespace is not None:
+            item["namespace"] = identity.namespace
+        if identity is not None and identity.kind == "custom":
+            item["type"] = "custom_tool_call"
+            item["input"] = item.pop("arguments")
+        return item
 
     def _collect_output_items(self) -> list[dict]:
         items: list[dict] = []

@@ -604,7 +604,8 @@ def translate_response(chat: dict, *, model: str,
                        previous_response_id: Optional[str] = None,
                        api_key_name: Optional[str] = None,
                        channel_key: Optional[str] = None,
-                       current_input_items: Optional[list] = None) -> dict:
+                       current_input_items: Optional[list] = None,
+                       output_item_transform=None) -> dict:
     """Chat 非流式 JSON → Responses 非流式 JSON。
 
     当 `current_input_items` 非 None 且 `api_key_name` 非空时，把本次响应
@@ -681,6 +682,9 @@ def translate_response(chat: dict, *, model: str,
         })
 
     status, incomplete = _finish_reason_to_status(finish_reason, bool(msg.get("tool_calls")))
+
+    if output_item_transform is not None:
+        output_items = [output_item_transform(item) for item in output_items]
 
     output_text = "".join(
         c["text"] for it in output_items if it.get("type") == "message"

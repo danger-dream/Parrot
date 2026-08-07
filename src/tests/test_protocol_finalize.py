@@ -64,7 +64,7 @@ def test_runtime_error_plan_matches_attempt_health_policy():
     assert guard.record_cooldown_error is False
 
     invalid = finalize.error_plan("request_invalid", failure_policy="runtime")
-    assert invalid.record_failure is True
+    assert invalid.record_failure is False
     assert invalid.record_cooldown_error is False
 
     upstream = finalize.error_plan("stream_upstream_error", failure_policy="runtime")
@@ -72,13 +72,19 @@ def test_runtime_error_plan_matches_attempt_health_policy():
     assert upstream.record_cooldown_error is True
 
 
-def test_post_commit_stream_errors_always_record_failed_attempt():
+def test_post_commit_stream_errors_record_failure_except_health_neutral_outcomes():
     plan = finalize.error_plan("candidate_guard", failure_policy="post_commit_stream")
 
     assert plan.terminal == "error"
     assert plan.log_error is True
     assert plan.record_failure is True
     assert plan.record_cooldown_error is False
+
+    for outcome in ("request_invalid", "connection_lifecycle"):
+        neutral = finalize.error_plan(outcome, failure_policy="post_commit_stream")
+        assert neutral.terminal == "error"
+        assert neutral.record_failure is False
+        assert neutral.record_cooldown_error is False
 
 
 def test_cooldown_only_error_policy_preserves_oauth_ws_legacy_behavior():

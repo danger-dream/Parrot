@@ -63,8 +63,10 @@ class OAuthChannel(Channel):
             previous_response_id = requested_body.get("previous_response_id")
             current_input_items = responses_to_anthropic.resolve_current_input_items(requested_body)
             responses_request_body = dict(requested_body)
+            namespace_tool_map = responses_to_anthropic.NamespaceToolMap()
             requested_body = responses_to_anthropic.translate_request(
                 requested_body, api_key_name=api_key_name, store_enabled=_store.is_enabled(),
+                namespace_tool_map=namespace_tool_map,
             )
             translator_ctx = {
                 "ingress": "responses",
@@ -76,6 +78,7 @@ class OAuthChannel(Channel):
                 "channel_key": self.key,
                 "current_input_items": current_input_items,
                 "request_body": responses_request_body,
+                "namespace_tool_map": namespace_tool_map,
             }
         elif ingress_protocol != "anthropic":
             raise ValueError(

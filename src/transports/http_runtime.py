@@ -21,7 +21,12 @@ from .. import blacklist, log_db, upstream
 from ..providers import registry as provider_registry
 from ..protocols import errors as protocol_errors
 from ..protocols.commit_gate import SseCommitGate
-from ..protocols.runtime import AttemptResult, make_stream_translator, toolkit_for_channel
+from ..protocols.runtime import (
+    AttemptResult,
+    connection_lifecycle_outcome,
+    make_stream_translator,
+    toolkit_for_channel,
+)
 from .base import metadata_from_response
 from .http import HttpStreamRequest, open_stream
 from .policy import proxy_byte_snapshot, proxy_route_kwargs
@@ -264,6 +269,8 @@ async def read_http_error_response(
 ) -> AttemptResult:
     """Read and normalize a non-2xx/3xx response under round deadlines."""
 
+    status = response.status_code
+    status_outcome = "http_auth_error" if status in (401, 403) else "http_error"
     try:
         raw = await _read_response_bytes(
             response, timing, round_timeouts, partial_state,
@@ -275,8 +282,9 @@ async def read_http_error_response(
         await close_response_context(ctx)
         up, down = proxy_byte_snapshot(proxy_bytes)
         return _with_timing(timing, AttemptResult(
-            outcome=exc.outcome,
-            error_detail=f"{exc.outcome} reading HTTP error body",
+            outcome=status_outcome,
+            http_status=status,
+            error_detail=f"HTTP {status}: {exc.outcome} reading error body",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
@@ -285,8 +293,9 @@ async def read_http_error_response(
         await close_response_context(ctx)
         up, down = proxy_byte_snapshot(proxy_bytes)
         return _with_timing(timing, AttemptResult(
-            outcome=classify_httpx_timeout(exc),
-            error_detail=f"read HTTP error body timeout: {exc}",
+            outcome=status_outcome,
+            http_status=status,
+            error_detail=f"HTTP {status}: error body read timeout: {exc}",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
@@ -295,19 +304,19 @@ async def read_http_error_response(
         await close_response_context(ctx)
         up, down = proxy_byte_snapshot(proxy_bytes)
         return _with_timing(timing, AttemptResult(
-            outcome="transport_error",
-            error_detail=f"read http error body: {exc}",
+            outcome=status_outcome,
+            http_status=status,
+            error_detail=f"HTTP {status}: error body read failed: {exc}",
             proxy_name=proxy_name,
             proxy_bytes_up=up,
             proxy_bytes_down=down,
         ))
 
     err_text = raw.decode("utf-8", errors="replace")
-    status = response.status_code
     await close_response_context(ctx)
 
     up, down = proxy_byte_snapshot(proxy_bytes)
-    outcome = "http_auth_error" if status in (401, 403) else "http_error"
+    outcome = status_outcome
     return _with_timing(timing, AttemptResult(
         outcome=outcome,
         http_status=status,
@@ -359,7 +368,12 @@ async def read_non_stream_body(
         await close_response_context(ctx)
         return HttpBodyReadResult(
             error=_with_timing(timing, AttemptResult(
-                outcome="transport_error",
+                outcome=connection_lifecycle_outcome(
+                    exc,
+                    http_status=response.status_code,
+                    http_phase="response_body",
+                ) or "transport_error",
+                http_status=response.status_code,
                 error_detail=f"read non-stream body: {exc}",
             ))
         )
@@ -438,7 +452,12 @@ async def aggregate_stream_as_non_stream_response(
         await close_response_context(ctx)
         return StreamAsNonStreamResult(
             error=_with_timing(timing, AttemptResult(
-                outcome="transport_error",
+                outcome=connection_lifecycle_outcome(
+                    exc,
+                    http_status=response.status_code,
+                    http_phase="response_body",
+                ) or "transport_error",
+                http_status=response.status_code,
                 error_detail=f"first byte transport: {exc} [stream-only→non-stream]",
             ))
         )
@@ -561,7 +580,12 @@ async def aggregate_stream_as_non_stream_response(
             await close_response_context(ctx)
             return StreamAsNonStreamResult(
                 error=with_partial_billing(_with_timing(timing, AttemptResult(
-                    outcome="transport_error",
+                    outcome=connection_lifecycle_outcome(
+                        exc,
+                        http_status=response.status_code,
+                        http_phase="response_body",
+                    ) or "transport_error",
+                    http_status=response.status_code,
                     error_detail=f"read SSE chunk: {exc} [stream-only→non-stream]",
                 )))
             )
@@ -690,6 +714,11 @@ async def _read_until_first_downstream_chunk(
             raise RuntimeError(f"response restoration failed: {exc}") from exc
 
     async def feed_restored(restored: bytes) -> tuple[list[bytes], dict | None]:
+        relay_filter = getattr(tracker, "filter_relay_chunk", None)
+        if relay_filter is not None:
+            restored = relay_filter(restored)
+            if not restored:
+                return [], None
         tracker.feed(restored)
         builder.feed(restored)
         result = commit_gate.feed(restored)
@@ -750,6 +779,7 @@ async def prepare_stream_response_start(
         return HttpStreamStartResult(
             error=_with_timing(timing, AttemptResult(
                 outcome="closed_before_first_byte",
+                http_status=response.status_code,
                 error_detail="upstream closed stream before first byte",
             ))
         )
@@ -765,7 +795,12 @@ async def prepare_stream_response_start(
         await close_response_context(ctx)
         return HttpStreamStartResult(
             error=_with_timing(timing, AttemptResult(
-                outcome="transport_error",
+                outcome=connection_lifecycle_outcome(
+                    exc,
+                    http_status=response.status_code,
+                    http_phase="response_body",
+                ) or "transport_error",
+                http_status=response.status_code,
                 error_detail=f"first byte transport: {exc}",
             ))
         )
@@ -794,7 +829,7 @@ async def prepare_stream_response_start(
         result.usage_observed = bool(getattr(tracker, "usage_observed", False))
         return result
 
-    if ch_proto == "openai-responses" or stream_translator is not None:
+    if ch_proto in ("openai-chat", "openai-responses") or stream_translator is not None:
         try:
             first_downstream_chunks, pre_visible_error = await _read_until_first_downstream_chunk(
                 aiter,
@@ -826,6 +861,7 @@ async def prepare_stream_response_start(
             return HttpStreamStartResult(
                 error=_with_timing(timing, _attach_precommit_response(AttemptResult(
                     outcome="closed_before_first_byte",
+                    http_status=response.status_code,
                     error_detail="upstream closed stream before first downstream chunk",
                 )))
             )
@@ -841,7 +877,12 @@ async def prepare_stream_response_start(
             await close_response_context(ctx)
             return HttpStreamStartResult(
                 error=_with_timing(timing, _attach_precommit_response(AttemptResult(
-                    outcome="transport_error",
+                    outcome=connection_lifecycle_outcome(
+                        exc,
+                        http_status=response.status_code,
+                        http_phase="response_body",
+                    ) or "transport_error",
+                    http_status=response.status_code,
                     error_detail=f"first downstream chunk transport: {exc}",
                 )))
             )
@@ -907,8 +948,11 @@ async def prepare_stream_response_start(
                     translator_ctx=translator_ctx,
                 )))
             )
-        # Record the restored bytes before classifying a first-event error so
-        # pre-commit upstream error payloads follow the same persistence path.
+        # Record only protocol-visible bytes.  Chat's DONE relay filter also
+        # drops any same-batch events after the terminal marker.
+        relay_filter = getattr(tracker, "filter_relay_chunk", None)
+        if relay_filter is not None:
+            first_chunk_restored = relay_filter(first_chunk_restored)
         tracker.feed(first_chunk_restored)
         builder.feed(first_chunk_restored)
         first_event = toolkit["first_event_parser"](first_chunk_restored)
@@ -971,6 +1015,7 @@ async def read_next_stream_step(
     timing: HttpAttemptTiming | None = None,
     round_timeouts: RoundTimeouts | None = None,
     translator_ctx: dict | None = None,
+    upstream_status: int | None = None,
 ) -> HttpStreamReadStep:
     """Read and normalize one post-commit HTTP SSE stream step."""
     while True:
@@ -1000,7 +1045,11 @@ async def read_next_stream_step(
                 kind="error",
                 err_type="api_error",
                 message=f"stream transport error: {exc}",
-                outcome="transport_error",
+                outcome=connection_lifecycle_outcome(
+                    exc,
+                    http_status=upstream_status,
+                    http_phase="response_body",
+                ) or "transport_error",
             )
 
         try:
@@ -1022,6 +1071,11 @@ async def read_next_stream_step(
                 message=f"response restoration failed: {exc}"[:2000],
                 outcome="transform_error",
             )
+        relay_filter = getattr(tracker, "filter_relay_chunk", None)
+        if relay_filter is not None:
+            restored = relay_filter(restored)
+            if not restored:
+                continue
         tracker.feed(restored)
         builder.feed(restored)
         if stream_translator is not None:
@@ -1330,7 +1384,9 @@ async def open_response_with_proxy_chain(
                 connector.stats.total_failures += 1
                 connector.stats.last_error = str(exc)[:200]
             last_pre_header = _with_timing(timing, _attempt_result(
-                "transport_error",
+                connection_lifecycle_outcome(
+                    exc, http_phase="pre_headers",
+                ) or "transport_error",
                 f"send build error: {exc}",
                 bucket=proxy_bytes,
                 proxy_name=proxy_name_used,
@@ -1424,7 +1480,9 @@ async def open_response_with_proxy_chain(
                 proxy_client=proxy_client,
                 proxy_attempt_id=proxy_attempt_id,
                 timing=timing,
-                outcome="transport_error",
+                outcome=connection_lifecycle_outcome(
+                    exc, http_phase="pre_headers",
+                ) or "transport_error",
                 detail=detail,
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,

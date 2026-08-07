@@ -141,8 +141,10 @@ def test_translate_request_preserves_parallel_tool_calls():
             {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "x"}},
             {"type": "tool_use", "id": "call_2", "name": "search", "input": {"q": "y"}},
         ]},
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "result x"}]},
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_2", "content": "result y"}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "result x"},
+            {"type": "tool_result", "tool_use_id": "call_2", "content": "result y"},
+        ]},
     ]
 
 
@@ -214,10 +216,13 @@ def test_translate_request_resolves_local_item_reference():
 
     out = responses_to_anthropic.translate_request(body)
 
-    assert out["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "remember"}]},
-        {"role": "user", "content": [{"type": "text", "text": "remember"}]},
-    ]
+    assert out["messages"] == [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "remember"},
+            {"type": "text", "text": "remember"},
+        ],
+    }]
 
 
 def test_translate_request_preserves_safe_custom_tool_history():
@@ -230,7 +235,6 @@ def test_translate_request_preserves_safe_custom_tool_history():
                 {"type": "input_file", "filename": "result.txt", "file_data": "data:text/plain;base64,b2s="},
             ]},
         ],
-        "tools": [{"type": "custom", "name": "shell"}],
     }
 
     out = responses_to_anthropic.translate_request(body)
@@ -253,6 +257,93 @@ def test_translate_request_preserves_safe_custom_tool_history():
         }]},
     ]
     assert "tools" not in out
+
+
+def test_translate_request_flattens_namespace_and_maps_history():
+    body = {
+        "model": "resp-model",
+        "input": [
+            {"type": "function_call", "call_id": "direct", "name": "lookup", "arguments": "{}"},
+            {
+                "type": "function_call",
+                "call_id": "namespaced",
+                "namespace": "db",
+                "name": "lookup",
+                "arguments": "{\"id\":1}",
+            },
+            {"type": "function_call_output", "call_id": "direct", "output": "direct result"},
+            {"type": "function_call_output", "call_id": "namespaced", "output": "namespace result"},
+        ],
+        "tools": [
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {
+                "type": "namespace",
+                "name": "db",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Namespaced lookup",
+                    "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}},
+                }],
+            },
+        ],
+    }
+
+    out = responses_to_anthropic.translate_request(body)
+
+    assert [tool["name"] for tool in out["tools"]] == ["lookup", "db__lookup"]
+    assert [block["name"] for block in out["messages"][0]["content"]] == ["lookup", "db__lookup"]
+    assert [block["tool_use_id"] for block in out["messages"][1]["content"]] == ["direct", "namespaced"]
+
+
+def test_translate_request_rejects_guessed_namespaced_tool_choice():
+    with pytest.raises(GuardError, match="namespaced Responses allowed_tools"):
+        responses_to_anthropic.translate_request({
+            "model": "m", "input": "x",
+            "tools": [{"type": "namespace", "name": "db", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            ]}],
+            "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": [
+                {"type": "namespace", "name": "db"},
+            ]},
+        })
+
+
+def test_translate_request_namespace_generated_name_avoids_real_direct_collision_stably():
+    body = {
+        "model": "resp-model",
+        "input": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "namespace": "db",
+            "name": "lookup",
+            "arguments": "{}",
+        }],
+        "tools": [
+            {"type": "function", "name": "db__lookup", "parameters": {"type": "object"}},
+            {"type": "namespace", "name": "db", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            ]},
+        ],
+    }
+
+    first = responses_to_anthropic.translate_request(body)
+    second = responses_to_anthropic.translate_request(body)
+    mapped = first["tools"][1]["name"]
+
+    assert first["tools"][0]["name"] == "db__lookup"
+    assert mapped != "db__lookup"
+    assert mapped == second["tools"][1]["name"]
+    assert first["messages"][0]["content"][0]["name"] == mapped
+
+
+def test_translate_request_rejects_freeform_custom_tool_declaration():
+    with pytest.raises(GuardError, match="freeform custom tool declarations"):
+        responses_to_anthropic.translate_request({
+            "model": "resp-model",
+            "input": "run",
+            "tools": [{"type": "custom", "name": "shell", "format": {"type": "text"}}],
+        })
 
 
 def test_translate_request_preserves_responses_image_input():
@@ -459,8 +550,7 @@ def test_translate_request_preserves_previous_response_id_function_output_attach
                     "title": "remote.pdf",
                 },
             ],
-        }]},
-        {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+        }, {"type": "text", "text": "continue"}]},
     ]
 
 
@@ -477,20 +567,16 @@ def test_translate_request_allows_noop_text_format():
     assert "text" not in out
 
 
-def test_translate_request_strips_responses_only_controls_and_tool_declarations():
+def test_translate_request_strips_responses_only_controls():
     out = responses_to_anthropic.translate_request({
         "model": "m",
         "background": False,
         "reasoning": {"effort": "high"},
         "text": {"format": {"type": "json_schema"}},
         "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
-        "tools": [{"type": "custom", "name": "shell"}],
-        "tool_choice": {"type": "custom", "name": "shell"},
     })
 
     assert out["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
-    assert "tools" not in out
-    assert "tool_choice" not in out
     assert "thinking" not in out
 
 
@@ -754,3 +840,199 @@ def test_failover_non_stream_translator_returns_responses_response():
     assert out["object"] == "response"
     assert out["output_text"] == "ok"
     assert out["output"][0]["type"] == "message"
+
+
+def _sse_objects(chunks):
+    out = []
+    for chunk in chunks:
+        for line in chunk.decode().splitlines():
+            if line.startswith("data: "):
+                out.append(json.loads(line[6:]))
+    return out
+
+
+def test_namespace_plan_restores_non_stream_parallel_direct_and_namespaced():
+    plan = responses_to_anthropic.NamespaceToolMap()
+    wire = responses_to_anthropic.translate_request({
+        "model": "m", "input": "go", "tools": [
+            {"type": "function", "name": "db__lookup", "parameters": {"type": "object"}},
+            {"type": "namespace", "name": "db", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            ]},
+        ],
+    }, namespace_tool_map=plan)
+    generated = wire["tools"][1]["name"]
+    assert generated != "db__lookup" and len(generated) <= 64
+    anthropic = {
+        "type": "message", "role": "assistant", "stop_reason": "tool_use",
+        "content": [
+            {"type": "tool_use", "id": "d", "name": "db__lookup", "input": {}},
+            {"type": "tool_use", "id": "n", "name": generated, "input": {"x": 1}},
+        ], "usage": {},
+    }
+    output = responses_to_anthropic.translate_response(
+        anthropic, model="m", namespace_tool_map=plan,
+    )["output"]
+    assert [(x["name"], x.get("namespace")) for x in output] == [
+        ("db__lookup", None), ("lookup", "db"),
+    ]
+    assert generated not in json.dumps(output)
+
+
+def test_previous_response_history_undeclared_namespace_avoids_current_direct_name(monkeypatch):
+    from src.openai import store
+    history = [{
+        "type": "function_call", "call_id": "old", "namespace": "db",
+        "name": "lookup", "arguments": "{}",
+    }]
+    monkeypatch.setattr(store, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        store, "expand_history",
+        lambda response_id, api_key_name="": history,
+    )
+    plan = responses_to_anthropic.NamespaceToolMap()
+    wire = responses_to_anthropic.translate_request({
+        "model": "m", "previous_response_id": "resp_old", "input": [], "tools": [
+            {"type": "function", "name": "db__lookup", "parameters": {"type": "object"}},
+        ],
+    }, api_key_name="key", namespace_tool_map=plan)
+    historical_flat = wire["messages"][0]["content"][0]["name"]
+    assert historical_flat != "db__lookup"
+    assert plan.identity_for_flat(historical_flat).namespace == "db"
+
+
+def test_namespace_long_and_sanitized_names_are_bounded_and_reversible():
+    plan = responses_to_anthropic.NamespaceToolMap()
+    namespace, child = "space." + "n" * 90, "child/" + "x" * 90
+    wire = responses_to_anthropic.translate_request({
+        "model": "m", "input": "go", "tools": [{
+            "type": "namespace", "name": namespace, "tools": [{
+                "type": "function", "name": child, "parameters": {"type": "object"},
+            }],
+        }],
+    }, namespace_tool_map=plan)
+    flat = wire["tools"][0]["name"]
+    assert len(flat) <= 64 and "." not in flat and "/" not in flat
+    identity = plan.identity_for_flat(flat)
+    assert (identity.namespace, identity.child_name) == (namespace, child)
+
+
+def test_namespace_stream_restores_only_schema_authorized_locations():
+    from src.openai.transform.stream_anthropic_to_responses import StreamTranslator
+    plan = responses_to_anthropic.NamespaceToolMap()
+    flat = plan.flat_name("function", "db", "lookup")
+    tr = StreamTranslator(model="m", namespace_tool_map=plan, created_ts=1)
+    chunks = []
+    chunks += list(tr.feed((
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"tool_use","id":"call_1","name":"' + flat + '","input":{}}}\n\n'
+    ).encode()))
+    chunks += list(tr.feed(
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":1}"}}\n\n'
+    ))
+    chunks += list(tr.feed(
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    ))
+    chunks += list(tr.close())
+    events = _sse_objects(chunks)
+    added = next(x for x in events if x["type"] == "response.output_item.added")["item"]
+    arg_delta = next(x for x in events if x["type"] == "response.function_call_arguments.delta")
+    arg_done = next(x for x in events if x["type"] == "response.function_call_arguments.done")
+    done = next(x for x in events if x["type"] == "response.output_item.done")["item"]
+    completed = next(x for x in events if x["type"] == "response.completed")["response"]["output"][0]
+    assert (added["namespace"], added["name"]) == ("db", "lookup")
+    assert (done["namespace"], done["name"]) == ("db", "lookup")
+    assert (completed["namespace"], completed["name"]) == ("db", "lookup")
+    assert arg_done["name"] == "lookup" and "namespace" not in arg_done
+    assert "namespace" not in arg_delta
+    assert flat not in json.dumps(events)
+
+
+def test_namespace_non_stream_store_receives_restored_outward_pair(monkeypatch):
+    from src.openai import store
+    saved = {}
+    monkeypatch.setattr(store, "is_enabled", lambda: True)
+    monkeypatch.setattr(store, "save", lambda **kw: saved.update(kw))
+    plan = responses_to_anthropic.NamespaceToolMap()
+    flat = plan.flat_name("function", "db", "lookup")
+    responses_to_anthropic.translate_response({
+        "type": "message", "role": "assistant", "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "id": "c", "name": flat, "input": {}}],
+        "usage": {},
+    }, model="m", api_key_name="key", current_input_items=[], namespace_tool_map=plan)
+    assert saved["output_items"][0]["name"] == "lookup"
+    assert saved["output_items"][0]["namespace"] == "db"
+
+
+def test_namespace_custom_declaration_and_namespaced_selector_are_guarded():
+    with pytest.raises(GuardError, match="namespace freeform custom"):
+        responses_to_anthropic.translate_request({
+            "model": "m", "input": "go", "tools": [{
+                "type": "namespace", "name": "shells", "tools": [{
+                    "type": "custom", "name": "shell", "format": {"type": "text"},
+                }],
+            }],
+        })
+
+
+def test_api_channel_namespace_context_drives_runtime_non_stream_restore():
+    from src.protocols.runtime import apply_non_stream_response_translator
+    ch = ApiChannel({
+        "name": "anth-ns", "baseUrl": "https://api.example.com", "apiKey": "sk",
+        "protocol": "anthropic", "cc_mimicry": False,
+        "models": [{"alias": "m", "real": "real"}],
+    })
+    req = asyncio.run(ch.build_upstream_request({
+        "model": "m", "input": "go", "tools": [{
+            "type": "namespace", "name": "db", "tools": [{
+                "type": "function", "name": "lookup", "parameters": {"type": "object"},
+            }],
+        }],
+    }, "real", ingress_protocol="responses"))
+    flat = json.loads(req.body)["tools"][0]["name"]
+    out = apply_non_stream_response_translator({
+        "type": "message", "role": "assistant", "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "id": "c", "name": flat, "input": {}}],
+        "usage": {},
+    }, req.translator_ctx)
+    assert out["output"][0]["name"] == "lookup"
+    assert out["output"][0]["namespace"] == "db"
+
+
+def test_oauth_channel_carries_same_request_namespace_plan(monkeypatch):
+    from src.channel.oauth_channel import OAuthChannel
+    from src import oauth_manager
+    async def token(_key):
+        return "token"
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
+    ch = OAuthChannel({"email": "a@example.com", "provider": "anthropic"}, ["m"])
+    req = asyncio.run(ch.build_upstream_request({
+        "model": "m", "input": "go", "tools": [{
+            "type": "namespace", "name": "db", "tools": [{
+                "type": "function", "name": "lookup", "parameters": {"type": "object"},
+            }],
+        }],
+    }, "m", ingress_protocol="responses"))
+    plan = req.translator_ctx["namespace_tool_map"]
+    assert isinstance(plan, responses_to_anthropic.NamespaceToolMap)
+    assert any(x.namespace == "db" and x.child_name == "lookup" for x in plan.by_flat_name.values())
+
+
+def test_namespaced_custom_json_history_is_reversible_but_declaration_remains_guarded():
+    plan = responses_to_anthropic.NamespaceToolMap()
+    wire = responses_to_anthropic.translate_request({
+        "model": "m", "input": [{
+            "type": "custom_tool_call", "call_id": "old", "namespace": "shells",
+            "name": "shell", "input": {"cmd": "pwd"},
+        }],
+    }, namespace_tool_map=plan)
+    flat = wire["messages"][0]["content"][0]["name"]
+    assert flat != "shell"
+    restored = responses_to_anthropic.translate_response({
+        "type": "message", "role": "assistant", "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "id": "c", "name": flat, "input": {"cmd": "ls"}}],
+        "usage": {},
+    }, model="m", namespace_tool_map=plan)["output"][0]
+    assert restored["type"] == "custom_tool_call"
+    assert (restored["namespace"], restored["name"]) == ("shells", "shell")
+    assert restored["input"] == '{"cmd":"ls"}'

@@ -478,11 +478,9 @@ def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) ->
         if typ == "item_reference":
             if not preserve_references:
                 continue
-            ref = dict(item)
-            ref_id = _first_non_empty_string(ref.get("id"))
-            if ref_id.startswith("call_"):
-                ref["id"] = _fix_call_id_prefix(ref_id)
-            filtered.append(ref)
+            # This is an existing/server item identity, not a call_id.  Responses
+            # accepts an opaque string here, so preserve it exactly.
+            filtered.append(dict(item))
             continue
 
         new_item = dict(item)

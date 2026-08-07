@@ -4,16 +4,18 @@ Phase 8 fourth path: Responses ingress → Anthropic upstream, non-stream only.
 This module intentionally composes the already-tested Responses↔Chat and
 Chat↔Anthropic translators instead of duplicating the whole mapping table.
 
-Compatibility policy matches CPA/cc-switch style request normalizers: preserve
-input/function-call/tool-result content; map known controls; strip unsupported
-Responses request hints and tool declarations.  Guard only stateful history or
-content parts that would be corrupted if ignored.
+Compatibility policy preserves input/function-call/tool-result content, maps
+known controls, and strips unsupported Responses request hints. Stateful history
+or content parts that would be corrupted are rejected explicitly.
 """
 
 from __future__ import annotations
 
-import json
 import copy
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ... import cache_hints
@@ -23,6 +25,137 @@ from . import chat_to_anthropic, common, guard, responses_to_chat
 def _fail(message: str, *, param: str | None = None) -> None:
     raise guard.GuardError(400, "invalid_request_error", message, param=param)
 
+
+_TOOL_NAME_BAD = re.compile(r"[^a-zA-Z0-9_-]")
+_TOOL_NAME_MAX = 64
+
+@dataclass(frozen=True)
+class ToolWireIdentity:
+    kind: str
+    namespace: str | None
+    child_name: str
+
+@dataclass
+class NamespaceToolMap:
+    """Per-request reversible Responses identity to Anthropic flat-name plan."""
+    by_flat_name: dict[str, ToolWireIdentity] = field(default_factory=dict)
+    by_identity: dict[ToolWireIdentity, str] = field(default_factory=dict)
+
+    def reserve_direct(self, kind: str, name: str) -> None:
+        identity = ToolWireIdentity(kind, None, name)
+        if name in self.by_flat_name or identity in self.by_identity:
+            _fail(f"duplicate or colliding Responses tool declaration {name!r}", param="tools")
+        self.by_flat_name[name] = identity
+        self.by_identity[identity] = name
+
+    def flat_name(self, kind: str, namespace: str, child_name: str) -> str:
+        identity = ToolWireIdentity(kind, namespace, child_name)
+        if identity in self.by_identity:
+            return self.by_identity[identity]
+        raw = f"{namespace}__{child_name}"
+        base = _TOOL_NAME_BAD.sub("_", raw).strip("_") or "namespaced_tool"
+        digest = hashlib.sha256(f"{kind}\0{namespace}\0{child_name}".encode()).hexdigest()[:10]
+        if len(base) > _TOOL_NAME_MAX:
+            base = f"{base[:_TOOL_NAME_MAX - 12]}__{digest}"
+        candidate = base
+        if candidate in self.by_flat_name:
+            candidate = f"{base[:_TOOL_NAME_MAX - 12]}__{digest}"
+        suffix = 2
+        while candidate in self.by_flat_name:
+            tail = f"_{suffix}"
+            candidate = f"{base[:_TOOL_NAME_MAX-len(tail)]}{tail}"
+            suffix += 1
+        self.by_flat_name[candidate] = identity
+        self.by_identity[identity] = candidate
+        return candidate
+
+    def identity_for_flat(self, name: str) -> ToolWireIdentity | None:
+        return self.by_flat_name.get(name)
+
+def _flatten_response_tools(tools: Any, plan: NamespaceToolMap) -> list[dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+    # Reserve every direct name first, including names that historical namespace
+    # calls must avoid even when that namespace child is no longer declared.
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        typ = tool.get("type")
+        if typ in (None, "function", "custom"):
+            name = str(tool.get("name") or "")
+            if not name:
+                _fail("Responses tools require a non-empty name", param="tools")
+            plan.reserve_direct("custom" if typ == "custom" else "function", name)
+    flattened: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        typ = tool.get("type")
+        if typ in (None, "function"):
+            flattened.append(copy.deepcopy(tool)); continue
+        if typ == "custom":
+            _fail("Responses freeform custom tool declarations cannot be represented by Anthropic JSON-schema tools", param="tools")
+        if typ != "namespace":
+            continue
+        namespace, children = str(tool.get("name") or ""), tool.get("tools")
+        if not namespace or not isinstance(children, list):
+            _fail("Responses namespace tools require a non-empty name and tools array", param="tools")
+        seen: set[ToolWireIdentity] = set()
+        for child in children:
+            if not isinstance(child, dict):
+                _fail("Responses namespace children must be tool objects", param="tools")
+            kind, child_name = str(child.get("type") or "function"), str(child.get("name") or "")
+            if not child_name:
+                _fail("Responses namespace children require a non-empty name", param="tools")
+            identity = ToolWireIdentity(kind, namespace, child_name)
+            if identity in seen or identity in plan.by_identity:
+                _fail(f"duplicate Responses namespace tool {namespace}.{child_name}", param="tools")
+            seen.add(identity)
+            if kind == "custom":
+                _fail("Responses namespace freeform custom tool declarations cannot be represented by Anthropic JSON-schema tools", param="tools")
+            if kind != "function":
+                _fail("Responses namespace children must be function or custom tools", param="tools")
+            flat = copy.deepcopy(child); flat["type"] = "function"; flat["name"] = plan.flat_name(kind, namespace, child_name)
+            flattened.append(flat)
+    return flattened
+
+def _map_namespaced_history(items: list, plan: NamespaceToolMap) -> list:
+    out: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") not in ("function_call", "custom_tool_call"):
+            out.append(item); continue
+        namespace = item.get("namespace")
+        if not isinstance(namespace, str) or not namespace:
+            out.append(item); continue
+        normalized = copy.deepcopy(item)
+        kind = "custom" if item.get("type") == "custom_tool_call" else "function"
+        normalized["name"] = plan.flat_name(kind, namespace, str(item.get("name") or ""))
+        normalized.pop("namespace", None); out.append(normalized)
+    return out
+
+def _guard_namespaced_tool_choice(choice: Any) -> None:
+    if not isinstance(choice, dict):
+        return
+    if choice.get("namespace"):
+        _fail("namespaced Responses tool_choice is not supported on Anthropic bridge", param="tool_choice")
+    selected = choice.get("tools") if choice.get("type") == "allowed_tools" else None
+    if isinstance(selected, list) and any(isinstance(x, dict) and (x.get("type") == "namespace" or x.get("namespace")) for x in selected):
+        _fail("namespaced Responses allowed_tools selection is not supported on Anthropic bridge", param="tool_choice")
+
+def restore_output_item(item: dict, plan: NamespaceToolMap | None) -> dict:
+    if plan is None or not isinstance(item, dict) or item.get("type") not in ("function_call", "custom_tool_call"):
+        return item
+    identity = plan.identity_for_flat(str(item.get("name") or ""))
+    if identity is None:
+        return item
+    out = copy.deepcopy(item); out["name"] = identity.child_name
+    if identity.namespace is not None: out["namespace"] = identity.namespace
+    else: out.pop("namespace", None)
+    if identity.kind == "custom":
+        out["type"] = "custom_tool_call"
+        if "arguments" in out: out["input"] = out.pop("arguments")
+    else: out["type"] = "function_call"
+    return out
 
 def _custom_tool_label(body: dict) -> str | None:
     # Custom tool declarations are capabilities and can be stripped.  Historical
@@ -379,29 +512,30 @@ def _preserve_deferred_tool_loading(chat_payload: dict, response_tools: Any) -> 
             target["defer_loading"] = deferred_by_name[name]
 
 
-def translate_request(body: dict, *, api_key_name: str = "", store_enabled: bool = True) -> dict:
+def translate_request(
+    body: dict, *, api_key_name: str = "", store_enabled: bool = True,
+    namespace_tool_map: NamespaceToolMap | None = None,
+) -> dict:
     guard_request(body, store_enabled=store_enabled)
     bridge_body = dict(body)
+    plan = namespace_tool_map if namespace_tool_map is not None else NamespaceToolMap()
     # Do not let the intermediate Responses→Chat payload reintroduce cache hints
     # as if they were user-supplied Chat fields; translate them once after
     # composition instead.
     bridge_body.pop("prompt_cache_key", None)
     bridge_body.pop("prompt_cache_retention", None)
+    flattened_tools = _flatten_response_tools(bridge_body.get("tools"), plan)
     if isinstance(bridge_body.get("tools"), list):
-        # Keep only function tools for the existing Responses→Chat→Anthropic
-        # composition.  Hosted/custom tool declarations are capability hints;
-        # dropping them is preferable to rejecting the request.
-        bridge_body["tools"] = [
-            tool for tool in bridge_body["tools"]
-            if isinstance(tool, dict) and tool.get("type") in (None, "function")
-        ]
+        bridge_body["tools"] = flattened_tools
     choice = bridge_body.get("tool_choice")
+    _guard_namespaced_tool_choice(choice)
     if isinstance(choice, dict) and choice.get("type") not in (None, "function", "allowed_tools"):
         bridge_body.pop("tool_choice", None)
     input_items = responses_to_chat.resolve_input_items(bridge_body, api_key_name=api_key_name)
+    input_items = _map_namespaced_history(input_items, plan)
     input_items = _normalize_custom_tool_history(input_items)
     chat_payload = responses_to_chat.translate_request_from_input_items(bridge_body, input_items)
-    _preserve_deferred_tool_loading(chat_payload, bridge_body.get("tools"))
+    _preserve_deferred_tool_loading(chat_payload, flattened_tools)
     _preserve_function_call_output_attachments(chat_payload, input_items)
     # chat_to_anthropic runs its own guard too; this is intentional because it
     # catches fields introduced by the Responses→Chat mapping (response_format,
@@ -419,6 +553,7 @@ def translate_response(
     api_key_name: Optional[str] = None,
     channel_key: Optional[str] = None,
     current_input_items: Optional[list] = None,
+    namespace_tool_map: NamespaceToolMap | None = None,
 ) -> dict:
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
     return responses_to_chat.translate_response(
@@ -428,4 +563,8 @@ def translate_response(
         api_key_name=api_key_name,
         channel_key=channel_key,
         current_input_items=current_input_items,
+        output_item_transform=(
+            (lambda item: restore_output_item(item, namespace_tool_map))
+            if namespace_tool_map is not None else None
+        ),
     )

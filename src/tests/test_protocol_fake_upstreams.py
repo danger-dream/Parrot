@@ -4231,13 +4231,10 @@ async def test_responses_client_local_item_reference_to_anthropic_fake_upstream(
     assert resp.status_code == 200
     assert json.loads(resp.body)["output_text"] == "local ref anthropic pong"
     msgs = captured["payload"]["messages"]
-    assert [msg["role"] for msg in msgs] == ["user", "user"]
-    assert [
-        [{k: part[k] for k in ("type", "text")} for part in msg["content"]]
-        for msg in msgs
-    ] == [
-        [{"type": "text", "text": "remember this"}],
-        [{"type": "text", "text": "remember this"}],
+    assert [msg["role"] for msg in msgs] == ["user"]
+    assert [{k: part[k] for k in ("type", "text")} for part in msgs[0]["content"]] == [
+        {"type": "text", "text": "remember this"},
+        {"type": "text", "text": "remember this"},
     ]
 
 
@@ -4378,7 +4375,7 @@ async def test_chat_client_multiturn_tool_result_to_anthropic_fake_upstream(m):
         payload = _json_request(req)
         assert payload["model"] == "claude-real"
         msgs = payload["messages"]
-        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user", "user"]
+        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user"]
         assert msgs[0]["content"][0] == {"type": "text", "text": "hi"}
         assert msgs[1]["content"] == [
             {"type": "text", "text": "need tool"},
@@ -4387,7 +4384,7 @@ async def test_chat_client_multiturn_tool_result_to_anthropic_fake_upstream(m):
         assert {k: msgs[2]["content"][0][k] for k in ("type", "tool_use_id", "content")} == {
             "type": "tool_result", "tool_use_id": "call_1", "content": "result x",
         }
-        assert {k: msgs[3]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+        assert {k: msgs[2]["content"][1][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
         return _anthropic_response("chat history client pong")
 
     router.register("https://anthropic-history.example", handler)
@@ -4425,14 +4422,14 @@ async def test_chat_client_safe_custom_tool_history_to_anthropic_fake_upstream(m
         payload = _json_request(req)
         assert payload["model"] == "claude-real"
         msgs = payload["messages"]
-        assert [msg["role"] for msg in msgs] == ["assistant", "user", "user"]
+        assert [msg["role"] for msg in msgs] == ["assistant", "user"]
         assert msgs[0]["content"] == [
             {"type": "tool_use", "id": "call_1", "name": "shell", "input": {"cmd": "pwd"}},
         ]
         assert {k: msgs[1]["content"][0][k] for k in ("type", "tool_use_id", "content")} == {
             "type": "tool_result", "tool_use_id": "call_1", "content": "ok",
         }
-        assert {k: msgs[2]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+        assert {k: msgs[1]["content"][1][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
         return _anthropic_response("chat custom history pong")
 
     router.register("https://anthropic-chat-custom-history.example", handler)
@@ -4475,13 +4472,13 @@ async def test_responses_client_multiturn_tool_result_to_anthropic_fake_upstream
         payload = _json_request(req)
         assert payload["model"] == "claude-real"
         msgs = payload["messages"]
-        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user", "user"]
+        assert [msg["role"] for msg in msgs] == ["user", "assistant", "user"]
         assert msgs[0]["content"][0] == {"type": "text", "text": "hi"}
         assert msgs[1]["content"] == [{"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": "x"}}]
         assert {k: msgs[2]["content"][0][k] for k in ("type", "tool_use_id", "content")} == {
             "type": "tool_result", "tool_use_id": "call_1", "content": "result x",
         }
-        assert {k: msgs[3]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+        assert {k: msgs[2]["content"][1][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
         return _anthropic_response("responses history client pong")
 
     router.register("https://anthropic-history.example", handler)
@@ -4606,7 +4603,6 @@ async def test_responses_client_safe_custom_tool_history_to_anthropic_fake_upstr
             {"type": "custom_tool_call", "call_id": "call_1", "name": "shell", "input": {"cmd": "pwd"}},
             {"type": "custom_tool_call_output", "call_id": "call_1", "output": "ok"},
         ],
-        "tools": [{"type": "custom", "name": "shell"}],
     }
     resp, mc = await _call_openai_handler(m, router, "responses", body)
     await mc.aclose()
@@ -4693,7 +4689,7 @@ async def test_responses_client_previous_response_tool_result_attachments_to_ant
     assert resp.status_code == 200
     assert json.loads(resp.body)["output_text"] == "responses stored tool attachments pong"
     msgs = captured["payload"]["messages"]
-    assert [msg["role"] for msg in msgs] == ["assistant", "user", "user"]
+    assert [msg["role"] for msg in msgs] == ["assistant", "user"]
     assert msgs[0]["content"] == [{"type": "tool_use", "id": "call_1", "name": "inspect", "input": {}}]
     assert msgs[1]["content"][0] == {
         "type": "tool_result",
@@ -4713,7 +4709,7 @@ async def test_responses_client_previous_response_tool_result_attachments_to_ant
             },
         ],
     }
-    assert {k: msgs[2]["content"][0][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
+    assert {k: msgs[1]["content"][1][k] for k in ("type", "text")} == {"type": "text", "text": "continue"}
 
 
 async def test_chat_client_to_anthropic_stream_fake_upstream(m):

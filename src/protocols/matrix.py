@@ -383,10 +383,13 @@ def _responses_stateful_input_item_label(body: dict[str, Any]) -> str | None:
 def _responses_custom_tool_label(body: dict[str, Any]) -> str | None:
     """Return the first Responses custom-tool shape that needs replay/guarding.
 
-    Responses `custom` tool declarations are capability hints and can be
-    stripped on Anthropic fallback.  Historical custom tool calls are safe for
-    Anthropic only when their input is an object that can become tool_use.input.
+    Freeform custom declarations have no equivalent Anthropic JSON-schema tool.
+    Historical custom calls remain safe when their input is an object that can
+    become tool_use.input.
     """
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict) and tool.get("type") == "custom":
+            return "custom_tool_declaration"
     for item in _responses_input_like_items(body):
         if not isinstance(item, dict):
             continue

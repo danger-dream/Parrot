@@ -466,7 +466,11 @@ class ChatSSEUsageTracker:
         self._usage_acc = UsageAccumulator()
         self.usage = self._usage_acc.legacy_dict()
         self._chunks: list[bytes] = []
+        self._record_buf = b""
         self._buf = b""
+        self._relay_buf = b""
+        self._relay_done_received = False
+        self._done_received = False
         # Chat 流的收尾标记：[DONE] 或任一 choice 带 finish_reason。
         # 两者都足以说明上游完成了本次生成；若 client 之后断开日志归 success。
         self.saw_stream_end = False
@@ -474,10 +478,35 @@ class ChatSSEUsageTracker:
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
 
+    def filter_relay_chunk(self, chunk_bytes: bytes) -> bytes:
+        """Return complete Chat SSE events through the first protocol DONE."""
+        if not chunk_bytes or self._relay_done_received:
+            return b""
+        self._relay_buf += chunk_bytes
+        self._relay_buf, blocks = _split_sse_events_bytes(self._relay_buf)
+        accepted: list[bytes] = []
+        for block in blocks:
+            accepted.append(block + b"\n\n")
+            if any(line.strip().startswith(b"data:") and line.strip()[5:].strip() == b"[DONE]" for line in block.splitlines()):
+                self._relay_done_received = True
+                self._relay_buf = b""
+                break
+        return b"".join(accepted)
+
+    @property
+    def done_received(self) -> bool:
+        return self._relay_done_received
+
     def feed(self, chunk_bytes: bytes) -> None:
-        if not chunk_bytes:
+        if not chunk_bytes or self._done_received:
             return
-        self._chunks.append(chunk_bytes)
+        self._record_buf += chunk_bytes
+        self._record_buf, record_blocks = _split_sse_events_bytes(self._record_buf)
+        for block in record_blocks:
+            self._chunks.append(block + b"\n\n")
+            if any(line.strip().startswith(b"data:") and line.strip()[5:].strip() == b"[DONE]" for line in block.splitlines()):
+                self._record_buf = b""
+                break
         self._buf += chunk_bytes
         self._buf, lines = _iter_sse_data_lines(self._buf)
         for data in lines:
@@ -485,7 +514,9 @@ class ChatSSEUsageTracker:
                 continue
             if data == "[DONE]":
                 self.saw_stream_end = True
-                continue
+                self._done_received = True
+                self._buf = b""
+                break
             try:
                 evt = json.loads(data)
             except Exception:
@@ -537,15 +568,20 @@ class ChatSSEAssistantBuilder:
         self._tool_calls: dict[int, dict] = {}
         self._finish_reason: Optional[str] = None
         self._got_any = False
+        self._done_received = False
 
     def feed(self, chunk: bytes) -> None:
-        if not chunk:
+        if not chunk or self._done_received:
             return
         self._buf += chunk
         self._buf, lines = _iter_sse_data_lines(self._buf)
         for data in lines:
-            if not data or data == "[DONE]":
+            if not data:
                 continue
+            if data == "[DONE]":
+                self._done_received = True
+                self._buf = b""
+                break
             try:
                 evt = json.loads(data)
             except Exception:

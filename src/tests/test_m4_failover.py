@@ -951,6 +951,10 @@ async def test_responses_precommit_eof_persists_received_sse(m):
     assert log["log"]["error_message"] == "upstream closed stream before first downstream chunk"
     assert log["retry_chain"][0]["outcome"] == "closed_before_first_byte"
     assert log["detail"]["response_body"] == expected
+    assert m["cooldown"].is_blocked("api:chA", "gpt-5.5")
+    stats = m["scorer"].get_stats("api:chA", "gpt-5.5")
+    assert stats["total_requests"] == 1
+    assert stats["success_count"] == 0
     print("  [PASS] pre-commit EOF retains received SSE in error log")
 
 
@@ -982,6 +986,7 @@ async def test_responses_context_length_before_visible_chunk_short_circuits_fail
     assert log["retry_chain"][0]["outcome"] == "request_invalid"
     assert "context_length_exceeded" in log["log"]["error_message"]
     assert not m["cooldown"].is_blocked("api:chA", "gpt-5.5")
+    assert m["scorer"].get_stats("api:chA", "gpt-5.5") is None
     print("  [PASS] responses metadata→context overflow before visible chunk → request_invalid 400 without failover")
 
 

@@ -991,13 +991,14 @@ def test_matrix_allows_internal_prompt_cache_hints_to_anthropic():
         )
         assert plan.required_transforms == ["anthropic_to_chat" if upstream == "openai-chat" else "anthropic_to_responses"]
 
-    assert DEFAULT_MATRIX.plan(
-        "responses", "anthropic",
-        features=extract_request_features(
-            "responses",
-            {"input": "hi", "tools": [{"type": "custom", "name": "shell"}]},
-        ),
-    ).required_transforms == ["responses_to_anthropic"]
+    with pytest.raises(ProtocolGuardError, match="custom_tool_declaration"):
+        DEFAULT_MATRIX.plan(
+            "responses", "anthropic",
+            features=extract_request_features(
+                "responses",
+                {"input": "hi", "tools": [{"type": "custom", "name": "shell"}]},
+            ),
+        )
 
     assert DEFAULT_MATRIX.plan(
         "responses", "anthropic",

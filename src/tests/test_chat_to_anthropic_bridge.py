@@ -245,6 +245,43 @@ def test_translate_request_preserves_parallel_tool_calls():
     ]
 
 
+def test_translate_request_merges_logical_turns_and_parallel_tool_results():
+    body = {
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "second"},
+                {"type": "file", "file": {"filename": "note.txt", "file_data": "data:text/plain;base64,b2s="}},
+            ]},
+            {"role": "assistant", "reasoning_content": "internal", "content": "answer"},
+            {"role": "assistant", "content": "more", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "one", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "two", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "one result"},
+            {"role": "tool", "tool_call_id": "call_2", "content": [
+                {"type": "text", "text": "two result"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next"},
+        ],
+    }
+
+    out = chat_to_anthropic.translate_request(body)
+
+    assert [message["role"] for message in out["messages"]] == ["user", "assistant", "user", "assistant", "user"]
+    assert [block["type"] for block in out["messages"][0]["content"]] == ["text", "text", "document"]
+    assert [block["type"] for block in out["messages"][1]["content"]] == ["text", "text", "tool_use", "tool_use"]
+    assert [block["type"] for block in out["messages"][2]["content"]] == ["tool_result", "tool_result"]
+    assert out["messages"][2]["content"][1]["content"][1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+    }
+    assert out["messages"][3]["content"] == [{"type": "text", "text": "done"}]
+    assert out["messages"][4]["content"] == [{"type": "text", "text": "next"}]
+
+
 def test_translate_request_preserves_safe_custom_tool_call_history():
     body = {
         "messages": [

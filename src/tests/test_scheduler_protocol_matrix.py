@@ -130,7 +130,7 @@ def test_filter_candidates_records_guard_reason_for_non_user_anthropic_image(mon
     assert result.guard_error == "Anthropic→OpenAI Chat image input is only enabled for user messages: assistant:image"
 
 
-def test_responses_custom_tool_keeps_anthropic_fallback_and_native_candidate(monkeypatch):
+def test_responses_custom_tool_declaration_keeps_only_native_candidate(monkeypatch):
     channels = [_ch("a", "anthropic"), _ch("r", "openai-responses")]
     monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)
     monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
@@ -139,11 +139,13 @@ def test_responses_custom_tool_keeps_anthropic_fallback_and_native_candidate(mon
     body = {"model": "m", "input": "hi", "tools": [{"type": "custom", "name": "shell"}]}
     available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
 
-    assert [ch.key for ch, _ in available] == ["a", "r"]
+    assert [ch.key for ch, _ in available] == ["r"]
     assert saturated == []
     assert ("r", "real") in plans
-    assert plans[("a", "real")].required_transforms == ["responses_to_anthropic"]
-    assert guards == []
+    assert ("a", "real") not in plans
+    assert guards == [
+        "OpenAI Responses→Anthropic custom tools/calls are not enabled yet: custom_tool_declaration",
+    ]
 
 
 def test_responses_safe_custom_tool_history_keeps_anthropic_fallback(monkeypatch):

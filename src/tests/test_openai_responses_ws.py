@@ -2718,15 +2718,17 @@ async def test_http_responses_oauth_ws_non_stream_close_before_terminal_is_error
         m, ch, {"model": "test-model", "stream": False, "input": "hello"},
     )
 
-    assert resp.status_code == 503
+    assert resp.status_code == 502
     detail = m["log_db"].log_detail(rid)
     assert detail["log"]["status"] == "error"
     assert "partial" in (detail["detail"].get("response_body") or "")
     attempts = _attempt_usage(m, rid)
     assert len(attempts) == 1
-    assert attempts[0]["outcome"] == "upstream_closed"
+    assert attempts[0]["outcome"] == "connection_lifecycle"
     assert attempts[0]["usage_observed"] == 0
     assert attempts[0]["cost_source"] == "unpriced"
+    assert not m["cooldown"].is_blocked(ch.key, "test-model")
+    assert m["scorer"].get_stats(ch.key, "test-model") is None
 
 
 @pytest.mark.asyncio

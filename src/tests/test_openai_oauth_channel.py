@@ -227,7 +227,7 @@ def test_transform_tool_choice_and_input_refs(m):
     items = out["input"]
     types = [i.get("type") for i in items if isinstance(i, dict)]
     assert "reasoning" not in types
-    assert any(i.get("type") == "item_reference" and i.get("id") == "fc1" for i in items)
+    assert any(i.get("type") == "item_reference" and i.get("id") == "call_1" for i in items)
     fc = next(i for i in items if i.get("type") == "function_call")
     assert fc["call_id"] == "fc1"
     fco = next(i for i in items if i.get("type") == "function_call_output")
