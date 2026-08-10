@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import threading
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -79,15 +80,16 @@ def _make_session() -> httpx.Client:
 
 
 def rebuild_session() -> None:
-    """连续失败后调用，重建 httpx 会话。"""
+    """重建 httpx 会话；不在 session 锁内执行可能阻塞的 close。"""
     global _session
+    replacement = _make_session()
     with _session_lock:
-        try:
-            if _session is not None:
-                _session.close()
-        except Exception:
-            pass
-        _session = _make_session()
+        previous, _session = _session, replacement
+    try:
+        if previous is not None:
+            previous.close()
+    except Exception:
+        pass
 
 
 def _get_session() -> httpx.Client:
@@ -135,6 +137,31 @@ def _strip_html_tags(text: str) -> str:
     return out
 
 
+def _exception_has_errno(exc: BaseException, target_errno: int) -> bool:
+    """Inspect an exception's explicit cause/context chain without looping."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(current, "errno", None) == target_errno:
+            return True
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _recover_eaddrnotavail(exc: BaseException) -> bool:
+    if not _exception_has_errno(exc, errno.EADDRNOTAVAIL):
+        return False
+    network.invalidate_dns_cache("api.telegram.org")
+    rebuild_session()
+    return True
+
+
 def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
     """调用一次 Bot API。
 
@@ -155,7 +182,15 @@ def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
             resp = session.post(url, json=data)
         result = resp.json()
     except Exception as exc:
-        print(f"[tg] api {method} failed: {exc}")
+        if _exception_has_errno(exc, errno.EADDRNOTAVAIL):
+            try:
+                _recover_eaddrnotavail(exc)
+                print(f"[tg] api {method} failed: local address unavailable; DNS cache invalidated and session rebuilt")
+            except Exception as recovery_exc:
+                # Keep this log credential-safe: exception strings can contain request URLs.
+                print(f"[tg] api {method} recovery failed: {type(recovery_exc).__name__}")
+        else:
+            print(f"[tg] api {method} failed: {exc}")
         return None
 
     if not isinstance(result, dict) or result.get("ok"):

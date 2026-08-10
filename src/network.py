@@ -218,6 +218,18 @@ def clear_dns_cache() -> None:
         _CACHE.clear()
 
 
+def invalidate_dns_cache(host: str) -> int:
+    """Invalidate cached answers for one hostname and return the removed count."""
+    normalized = (host or "").lower().strip().strip("[]")
+    if not normalized:
+        return 0
+    with _LOCK:
+        keys = [key for key in _CACHE if key[0] == normalized]
+        for key in keys:
+            _CACHE.pop(key, None)
+    return len(keys)
+
+
 def dns_cache_entries() -> list[dict]:
     """Snapshot of current DNS cache. Returns list of:
     {host, family, servers, ips, expires_at_epoch, ttl_remaining_seconds}
@@ -402,6 +414,27 @@ def _query_with_server(spec: DnsServerSpec, host: str, qtype: str, timeout: floa
     raise ValueError(f"unsupported DNS server kind: {spec.kind}")
 
 
+def _is_address_usable(ip: str) -> bool:
+    """Return whether the host has a route/source address for this IP family.
+
+    Connecting an unbound UDP socket performs only a local route lookup; it does
+    not send traffic.  In particular, this rejects AAAA answers on IPv4-only
+    hosts while retaining them on hosts with working IPv6 configuration.
+    """
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    target = (ip, 9, 0, 0) if family == socket.AF_INET6 else (ip, 9)
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            sock.connect(target)
+            source = sock.getsockname()[0]
+            return not ipaddress.ip_address(source).is_unspecified
+        finally:
+            sock.close()
+    except OSError:
+        return False
+
+
 def resolve_host(host: str, *, family: int = socket.AF_UNSPEC,
                  servers: Optional[list[str]] = None,
                  timeout: Optional[float] = None,
@@ -431,10 +464,13 @@ def resolve_host(host: str, *, family: int = socket.AF_UNSPEC,
             if cached and cached[0] > now:
                 return list(cached[1])
 
-    ips: list[str] = []
+    # Keep families separate: one successful AAAA query must not hide a failed
+    # A query (or vice versa) and prematurely stop fallback to later resolvers.
+    ips_by_family: dict[int, list[str]] = {fam: [] for fam, _ in qfamilies}
     errors: list[str] = []
+    requested_families = {fam for fam, _ in qfamilies}
     for spec in specs:
-        for _fam, qtype in qfamilies:
+        for query_family, qtype in qfamilies:
             try:
                 response = _query_with_server(spec, host, qtype, timeout)
                 rcode = response.rcode()
@@ -447,14 +483,17 @@ def resolve_host(host: str, *, family: int = socket.AF_UNSPEC,
                         continue
                     for ans in rrset:
                         ip = ans.to_text().strip()
-                        if ip and ip not in ips:
-                            ips.append(ip)
+                        family_ips = ips_by_family[query_family]
+                        if ip and ip not in family_ips and _is_address_usable(ip):
+                            family_ips.append(ip)
             except Exception as exc:
                 errors.append(f"{spec.raw} {qtype}: {exc}")
-        if ips:
+        if all(ips_by_family[fam] for fam in requested_families):
             break
+
+    ips = [ip for fam, _qtype in qfamilies for ip in ips_by_family[fam]]
     if not ips:
-        raise OSError(f"DNS resolve failed for {host}: {'; '.join(errors) or 'no answers'}")
+        raise OSError(f"DNS resolve failed for {host}: {'; '.join(errors) or 'no usable answers'}")
     if use_cache and cache_ttl > 0:
         with _LOCK:
             _CACHE[key] = (now + cache_ttl, list(ips))
