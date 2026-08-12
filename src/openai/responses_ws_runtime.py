@@ -19,6 +19,7 @@ from .codex_constants import (
     RESPONSES_WEBSOCKETS_BETA,
     codex_model_uses_responses_lite,
 )
+from .codex_device_fingerprint import apply_device_fingerprint
 from .codex_identity_confuse import (
     ConfuseState,
     confuse_client_metadata,
@@ -206,6 +207,13 @@ def prepare_oauth_responses_ws_request_parts(
         headers = confuse_identity_headers(headers, identity_state, session_prompt_cache_key=sid)
     else:
         headers = drop_headers_case_insensitive(headers, {"conversation_id", "conversation-id"})
+
+    installation_id = str(getattr(channel, "codex_device_installation_id", "") or "")
+    if installation_id:
+        identity_state.override_installation_for_upstream(installation_id)
+        headers, frame_obj = apply_device_fingerprint(
+            headers, frame_obj, installation_id, create_client_metadata=True,
+        )
 
     frame = json.dumps(frame_obj, ensure_ascii=False, separators=(",", ":"))
     return ws_url, headers, frame, identity_state

@@ -1,6 +1,6 @@
 """Anthropic 响应头被动采样测试。
 
-覆盖（2026-04-20 新增能力，参考 sub2api ratelimit_service.go）：
+覆盖 Anthropic 响应头被动采样能力：
 
   - src/anthropic/rate_limit_headers.py
       * parse_rate_limit_headers: 5h/7d util/reset 解析
@@ -187,7 +187,7 @@ def test_window_exceeded_util_ge_one(m):
 
 
 def test_window_exceeded_util_float_epsilon(m):
-    """0.9999999 应被视为超限（sub2api isAnthropicWindowExceeded 同款容差）。"""
+    """0.9999999 应在既定浮点容差内视为超限。"""
     assert m["rlh"].is_window_exceeded({
         "anthropic-ratelimit-unified-5h-utilization": "0.9999999999",
     }, "5h") is True

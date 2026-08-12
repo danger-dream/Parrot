@@ -38,6 +38,7 @@ from .. import (
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
+from .transform.common import normalize_chat_reasoning_alias
 from .transform.guard import GuardError, guard_chat_ingress, guard_responses_ingress
 from .transform.responses_to_chat import resolve_current_input_items
 
@@ -494,6 +495,9 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "request body must be a JSON object",
         )
+    if ingress_protocol == "chat":
+        normalize_chat_reasoning_alias(body)
+
     # Preserve the original client-provided field set before Parrot mutates the
     # body (default model, internal _api_key_name, auto prompt_cache_key, ...).
     # Cross-protocol guards use this to reject user-explicit fields that have no

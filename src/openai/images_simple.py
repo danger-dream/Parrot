@@ -4,7 +4,7 @@
   POST /v1/images/generate  {prompt, size?}
   POST /v1/images/edit      {prompt, image, size?}
 
-内部按 CLIProxyAPI 的 Codex Responses + image_generation tool 方案调用 ChatGPT。
+内部通过 Codex Responses 的 image_generation tool 调用 ChatGPT。
 """
 
 from __future__ import annotations
@@ -161,8 +161,7 @@ def _candidate_accounts() -> list[dict]:
     return [x for x in list_image_accounts(include_disabled=False)]
 
 
-# OpenAI Images API 兼容入口透传到 image_generation tool 的字段集合。
-# 与 sub2api 对齐：见 sub2api/backend/internal/service/openai_images_responses.go::buildOpenAIImagesResponsesRequest
+# OpenAI Images API 兼容入口允许透传到 image_generation tool 的字段集合。
 _NATIVE_TOOL_STR_FIELDS = (
     "size", "quality", "background", "output_format",
     "moderation", "style",
@@ -180,7 +179,7 @@ def _build_payload(*, action: str, prompt: str, main_model: str, tool_model: str
         "model": tool_model,
     }
     if size is not None and str(size).strip():
-        # 对齐 CPA：用户传了才放进 tool；不传就完全不传递。
+        # 只有用户显式提供 size 时才发送，避免改变上游默认值。
         tool["size"] = str(size).strip()
 
     if native_options:
@@ -552,7 +551,7 @@ def _normalize_image_input(value: str, *, max_bytes: int) -> str:
         if approx > max_bytes:
             raise ValueError(f"image is too large; max {max_bytes} bytes")
         return "data:image/png;base64," + compact
-    # CPA 支持 URL 透传，这里也允许 http(s) URL。
+    # 允许直接透传 http(s) 图片 URL。
     if s.startswith("http://") or s.startswith("https://"):
         return s
     raise ValueError("image must be data URL, raw base64, or http(s) URL")

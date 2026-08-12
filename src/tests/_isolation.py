@@ -26,7 +26,7 @@ def isolate() -> str:
     if os.environ.get("PARROT_TEST_ISOLATED") != "1":
         raise RuntimeError(
             "test isolation must be installed before importing src; "
-            "use python3 src/tests/isolated_pytest.py"
+            "use ./venv/bin/python src/tests/isolated_pytest.py"
         )
     root = Path(os.environ["PARROT_TEST_ROOT"]).resolve()
     data_dir = Path(os.environ["ANTHROPIC_PROXY_DATA_DIR"]).resolve()

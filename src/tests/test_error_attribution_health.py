@@ -19,11 +19,64 @@ from src.protocols.runtime import (
     connection_lifecycle_outcome,
     is_connection_lifecycle_error,
     request_invalid_result_if_needed,
+    retry_after_cooldown_until,
     should_cooldown,
     should_record_failure,
 )
 from src.transports import http_runtime
 from src.transports.ws_runtime import read_next_responses_ws_step
+
+
+@pytest.mark.parametrize("status", [400, 409, 413, 422])
+def test_plain_ambiguous_client_status_remains_retryable_upstream_failure(status):
+    result = AttemptResult(
+        outcome="http_error",
+        http_status=status,
+        error_detail=f"HTTP {status}: non-standard rejection",
+    )
+
+    normalized = request_invalid_result_if_needed(result)
+
+    assert normalized.outcome == "http_error"
+    assert normalized.http_status == status
+    assert normalized.error_code is None
+    assert should_cooldown(normalized.outcome) is True
+    assert should_record_failure(normalized.outcome) is True
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 429])
+def test_authoritative_auth_payment_rate_status_beats_invalid_request_body(status):
+    result = AttemptResult(
+        outcome="http_error",
+        http_status=status,
+        error_detail='{"error":{"type":"invalid_request_error","message":"bad"}}',
+    )
+    assert request_invalid_result_if_needed(result).outcome == "http_error"
+
+
+def test_413_rate_limit_signal_remains_retryable_upstream_failure():
+    result = AttemptResult(
+        outcome="http_error",
+        http_status=413,
+        error_detail="HTTP 413: tokens per minute exceeded; retry later",
+    )
+
+    normalized = request_invalid_result_if_needed(result)
+
+    assert normalized.outcome == "http_error"
+    assert normalized.http_status == 413
+    assert should_cooldown(normalized.outcome) is True
+    assert should_record_failure(normalized.outcome) is True
+
+
+def test_retry_after_deadline_is_bounded_and_invalid_is_ignored():
+    now = 1_700_000_000.0
+    assert retry_after_cooldown_until("5", now_ts=now) == 1_700_000_005_000
+    assert retry_after_cooldown_until("999999", now_ts=now) == 1_700_000_060_000
+    assert retry_after_cooldown_until("not-a-date", now_ts=now) is None
+    assert retry_after_cooldown_until(
+        "Tue, 14 Nov 2023 22:13:30 GMT", now_ts=now,
+    ) == 1_700_000_010_000
 
 
 @pytest.mark.parametrize("status", [400, 409, 413, 422])

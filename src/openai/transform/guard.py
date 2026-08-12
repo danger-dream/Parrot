@@ -199,12 +199,10 @@ def _function_call_output_part_unsupported_for_chat(output: Any) -> str | None:
     if not isinstance(output, list):
         return None
     for part in output:
-        if isinstance(part, str):
-            continue
         if not isinstance(part, dict):
             return type(part).__name__
         typ = part.get("type")
-        if typ in ("input_text", "output_text", "text"):
+        if typ in ("input_text", "output_text", "text", "input_image", "input_file"):
             continue
         return str(typ or "object")
     return None

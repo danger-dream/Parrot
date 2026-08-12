@@ -191,7 +191,7 @@ def test_transform_legacy_functions(m):
     assert "functions" not in out
     assert "function_call" not in out
     # 经过 _convert_legacy_tools + _normalize_codex_tools 两步后：
-    # tools 都是 responses-style（顶层有 name），function 子对象可能仍在（sub2api 行为）
+    # tools 都是 Responses-style（顶层有 name），兼容残留 function 子对象。
     assert isinstance(out["tools"], list) and len(out["tools"]) == 2
     names = sorted(t.get("name") for t in out["tools"])
     assert names == ["f1", "f2"], f"got top-level names: {names}"
@@ -207,7 +207,7 @@ def test_transform_legacy_functions(m):
 
 
 def test_transform_tool_choice_and_input_refs(m):
-    """OAuth Codex transform: tool_choice / item refs / call ids 按 sub2api 兼容。"""
+    """OAuth Codex transform 规范化 tool_choice、item 引用与 call ID。"""
     t = m["transform"]
     body = {
         "model": "gpt-5.1",
@@ -250,14 +250,14 @@ def test_transform_tool_choice_and_input_refs(m):
     })
     assert out3["tool_choice"] == "auto"
 
-    # sub2api 对齐：tool_search_output 是工具续链 item，call_id 应保留并规范化。
+    # tool_search_output 是工具续链 item，call_id 应保留并规范化。
     out4 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1",
         "input": [{"type": "tool_search_output", "call_id": "call_search_1", "output": "ok"}],
     })
     assert out4["input"][0]["call_id"] == "fcsearch_1"
 
-    # sub2api 对齐：local_shell_call / tool_search_call 不主动补 name。
+    # local_shell_call / tool_search_call 不主动补 name。
     out5 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1",
         "input": [
@@ -746,7 +746,7 @@ def test_channel_anthropic_ingress_metadata_session_replay(m):
     print("  [PASS] channel: anthropic metadata session injects reasoning replay")
 
 
-def test_channel_missing_chatgpt_account_id_legacy_keeps_working(m):
+def test_channel_missing_chatgpt_account_id_uses_refresh_identity_on_first_request(m):
     _setup(m)
     _add_openai_acc(m, email="no-acct@x", chatgpt_account_id="")
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:no-acct@x"))
@@ -754,9 +754,15 @@ def test_channel_missing_chatgpt_account_id_legacy_keeps_working(m):
         {"model": "gpt-5.1", "input": "hi"}, "gpt-5.1",
         ingress_protocol="responses",
     ))
-    assert "chatgpt-account-id" not in req.headers
+    persisted = m["oauth_manager"].get_account(ch.account_key)
+    installation_id = persisted["codexDeviceInstallationId"]
+    assert req.headers["chatgpt-account-id"] == persisted["workspace_id"]
+    assert req.headers["x-codex-installation-id"] == installation_id
+    assert json.loads(req.body)["client_metadata"][
+        "x-codex-installation-id"
+    ] == installation_id
     assert req.headers["authorization"].startswith("Bearer ")
-    print("  [PASS] channel: legacy missing chatgpt_account_id keeps working without header")
+    print("  [PASS] channel: first refresh request uses committed workspace/device identity")
 
 
 # ─── registry 分派 ───────────────────────────────────────────────

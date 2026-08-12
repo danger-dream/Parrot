@@ -1062,6 +1062,106 @@ async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "expected_status", "expected_close"),
+    [
+        ([401, 401], 401, 4401),
+        ([401, 403], 403, 4403),
+        ([403, 401], 403, 4403),
+        ([402, 402], 402, 4400),
+        ([429, 429], 429, 4429),
+        ([401, 429], 503, 4500),
+        ([500, 429], 503, 4500),
+    ],
+)
+async def test_responses_ws_exhausted_candidates_use_finite_terminal_rule_and_safe_error(
+    monkeypatch, m, statuses, expected_status, expected_close,
+):
+    cfg = _setup(m)
+    cfg["retry"] = {
+        "transient": {"enabled": False},
+        "recovery": {"oauthRefresh": False},
+    }
+    channels = [m["OpenAIApiChannel"]({
+        "name": f"terminal-{idx}-{status}",
+        "type": "api",
+        "baseUrl": f"https://terminal-{idx}.example",
+        "apiKey": f"up-key-{idx}",
+        "protocol": "openai-responses",
+        "models": [{"alias": "test-model", "real": "real-model"}],
+        "enabled": True,
+    }) for idx, status in enumerate(statuses)]
+    with m["registry"]._lock:
+        m["registry"]._channels = {ch.key: ch for ch in channels}
+
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model", "input": "hello",
+        "stream": True,
+    })
+    await ws.accept()
+    request_id = f"responses-ws-terminal-{'-'.join(map(str, statuses))}"
+    body = {"model": "test-model", "input": "hello", "stream": True}
+    started_at = time.time()
+    started_monotonic = time.monotonic()
+    m["log_db"].insert_pending(
+        request_id, "1.2.3.4", "ws-key", "test-model", True,
+        1, 0, {}, body, ingress_protocol="responses_ws",
+    )
+    sensitive_detail = (
+        "Bearer secret-bearer api_key=sk-sensitive access_token=access-secret "
+        "refresh_token=refresh-secret credential=password "
+        "email=user@example.com proxy authorization=proxy-secret"
+    )
+
+    async def fake_try(_websocket, **kwargs):
+        idx = channels.index(kwargs["ch"])
+        status = statuses[idx]
+        outcome = "http_auth_error" if status in (401, 403) else "http_error"
+        return m["responses_ws"]._WsAttemptResult(
+            outcome=outcome, http_status=status,
+            error_detail=sensitive_detail if idx == len(channels) - 1 else f"HTTP {status}",
+        )
+
+    from src.scheduler import ScheduleResult
+    route = ScheduleResult(
+        candidates=[(ch, "real-model") for ch in channels], saturated=[],
+        affinity_hit=False, fp_query=None, client_key="client:1",
+    )
+    monkeypatch.setattr(m["responses_ws"], "_try_ws_channel", fake_try)
+    accepted = await m["responses_ws"]._run_ws_failover(
+        ws,
+        first_obj={"type": "response.create", **body},
+        schedule_result=route,
+        body=body,
+        request_id=request_id,
+        api_key_name="ws-key",
+        client_ip="1.2.3.4",
+        start_time=started_at,
+        start_monotonic=started_monotonic,
+        fp_query=None,
+    )
+
+    assert accepted is True
+    row = dict(m["log_db"]._get_conn().execute(
+        "SELECT * FROM request_log WHERE request_id=?", (request_id,),
+    ).fetchone())
+    assert row["http_status"] == expected_status
+    assert ws.close_calls[-1][0] == expected_close
+    downstream = " ".join(ws.sent_texts + [ws.close_calls[-1][1]]).lower()
+    for secret in (
+        "secret-bearer", "sk-sensitive", "access-secret", "refresh-secret",
+        "password", "user@example.com", "proxy-secret",
+    ):
+        assert secret not in downstream
+    error_frames = [json.loads(text) for text in ws.sent_texts if json.loads(text).get("type") == "error"]
+    assert len(error_frames) == 1
+    assert error_frames[0]["message"] == ws.close_calls[-1][1]
+    attempts = _retry_chain(m, request_id)
+    assert len(attempts) == len(statuses)
+    assert attempts[-1]["error_detail"] == sensitive_detail
+
+
+@pytest.mark.asyncio
 async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypatch, m):
     _setup(m)
     ch = m["OpenAIOAuthChannel"]({
@@ -2667,6 +2767,35 @@ async def test_responses_ws_failed_turn_can_continue_sequentially(
 
 
 @pytest.mark.asyncio
+async def test_responses_ws_close_1009_is_request_too_large_and_safe(m):
+    _setup(m)
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+    from src.transports.ws_runtime import (
+        read_until_first_responses_ws_visible_event,
+    )
+
+    class TooLargeUpstream(FakeUpstreamWebSocket):
+        async def recv(self):
+            raise ConnectionClosed(Close(1009, "secret upstream reason"), None)
+
+    result = await read_until_first_responses_ws_visible_event(
+        TooLargeUpstream([]),
+        m["responses_ws"]._WsTracker(),
+        channel_key="api:ws-upstream",
+        deadline_ts=0,
+        first_wait=5,
+        idle_timeout=5,
+    )
+
+    assert result.outcome == "request_invalid"
+    assert result.http_status == 413
+    assert result.error_code == "message_too_big"
+    assert result.error_detail == "upstream rejected request: message too big"
+    assert "secret" not in result.error_detail
+
+
+@pytest.mark.asyncio
 async def test_responses_ws_previsible_metadata_buffer_is_bounded(m):
     _setup(m)
     from src.transports.ws_runtime import (
@@ -2984,3 +3113,70 @@ def test_responses_ws_uses_remote_dns_for_socks5(m):
     _setup(m)
     assert m["responses_ws"]._socks5h_url("socks5://127.0.0.1:1080") == "socks5h://127.0.0.1:1080"
     assert m["responses_ws"]._socks5h_url("socks5h://127.0.0.1:1080") == "socks5h://127.0.0.1:1080"
+
+@pytest.mark.asyncio
+async def test_responses_ws_html403_skips_refresh_health_and_exhausts_with_safe_403(monkeypatch, m):
+    cfg = _setup(m)
+    monkeypatch.setitem(
+        cfg, "retry",
+        {"transient": {"enabled": False}, "recovery": {"oauthRefresh": True}},
+    )
+    channels = [
+        _make_oauth_channel_for_failover(m, name=f"html403-{idx}@example.com")
+        for idx in range(2)
+    ]
+    with m["registry"]._lock:
+        m["registry"]._channels = {ch.key: ch for ch in channels}
+
+    ws = FakeWebSocket({
+        "type": "response.create", "model": "test-model", "input": "hello", "stream": True,
+    })
+    await ws.accept()
+    request_id = "responses-ws-html403-protection"
+    body = {"model": "test-model", "input": "hello", "stream": True}
+    started_at = time.time()
+    started_monotonic = time.monotonic()
+    m["log_db"].insert_pending(
+        request_id, "1.2.3.4", "ws-key", "test-model", True,
+        1, 0, {}, body, ingress_protocol="responses_ws",
+    )
+    calls = []
+
+    async def fake_try(_websocket, **kwargs):
+        calls.append(kwargs["ch"].key)
+        return m["responses_ws"]._WsAttemptResult(
+            outcome="http_auth_error", http_status=403,
+            error_detail="HTTP 403: <html>Bearer secret user@example.com</html>",
+            openai_oauth_html_403=True,
+        )
+
+    async def must_not_refresh(_account_key):
+        raise AssertionError("HTML403 must not force refresh")
+
+    from src.scheduler import ScheduleResult
+    route = ScheduleResult(
+        candidates=[(ch, "real-model") for ch in channels], saturated=[],
+        affinity_hit=False, fp_query=None, client_key="client:1",
+    )
+    monkeypatch.setattr(m["responses_ws"], "_try_ws_channel", fake_try)
+    monkeypatch.setattr(m["responses_ws"].oauth_manager, "force_refresh", must_not_refresh)
+    accepted = await m["responses_ws"]._run_ws_failover(
+        ws, first_obj={"type": "response.create", **body}, schedule_result=route,
+        body=body, request_id=request_id, api_key_name="ws-key", client_ip="1.2.3.4",
+        start_time=started_at, start_monotonic=started_monotonic, fp_query=None,
+    )
+
+    assert accepted is True
+    assert calls == [ch.key for ch in channels]
+    row = dict(m["log_db"]._get_conn().execute(
+        "SELECT * FROM request_log WHERE request_id=?", (request_id,),
+    ).fetchone())
+    assert row["http_status"] == 403
+    assert row["retry_count"] == 2
+    downstream = " ".join(ws.sent_texts + [ws.close_calls[-1][1]]).lower()
+    assert "upstream candidates failed" in downstream
+    assert "denied permission" not in downstream
+    assert "<html" not in downstream and "secret" not in downstream and "example.com" not in downstream
+    for ch in channels:
+        assert m["cooldown"].get_state(ch.key, "real-model") is None
+        assert m["scorer"].get_stats(ch.key, "real-model") is None

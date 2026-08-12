@@ -478,6 +478,9 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
             if _canonical_key(acc) != old_key:
                 continue
             acc.update(new)
+            if _acc_provider(acc) == "openai":
+                from .openai.codex_device_fingerprint import normalize_account_device
+                normalize_account_device(acc)
             if acc.get("disabled_reason") == "auth_error":
                 acc["disabled_reason"] = None
                 acc["disabled_until"] = None
@@ -1738,7 +1741,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
           - 若 Codex 没有活动的超限快照，且本轮新鲜有效 usage 全部低于阈值，
             说明上游窗口已经重置；直接恢复并清除旧 disabled_until。旧时间只是
             上次超限时的预测，不能覆盖更新后的上游事实。
-          - Grok 账号使用官方 billing 月度快照，fresh usage 低于阈值即可恢复。
+          - Grok 账号使用官方 billing 当前周期快照，fresh usage 低于阈值即可恢复。
           - 其他账号是 quota 禁用：set_enabled(True) 自动恢复。
           - 账号未禁用：无事发生
 
@@ -1764,7 +1767,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         account_key = canonical
     provider = provider_of(account_key)
     utils = extract_utils_percent(usage)
-    window_labels = ["5h", "7d", "月度" if provider == "xai" else "30d", "sonnet", "opus"]
+    window_labels = ["5h", "周额度" if provider == "xai" else "7d", "30d", "sonnet", "opus"]
     hit_windows = [lbl for lbl, u in zip(window_labels, utils)
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)
@@ -2194,6 +2197,8 @@ def bootstrap_openai_workspace_key_migration() -> dict:
 
 
 def _openai_metadata_patch(entry: dict) -> dict:
+    from .openai.codex_device_fingerprint import normalize_account_device
+
     patch: dict[str, Any] = {
         "id_token": entry.get("id_token", "") or "",
         "chatgpt_account_id": entry.get("chatgpt_account_id", "") or "",
@@ -2204,7 +2209,14 @@ def _openai_metadata_patch(entry: dict) -> dict:
         "plan_type": entry.get("plan_type", "") or "",
         "subscription_expires_at": entry.get("subscription_expires_at", "") or "",
     }
-    return patch
+    if "codexDeviceInstallationId" in entry:
+        patch["codexDeviceInstallationId"] = entry.get("codexDeviceInstallationId")
+    if "codexDeviceConvergenceEnabled" in entry:
+        patch["codexDeviceConvergenceEnabled"] = entry.get("codexDeviceConvergenceEnabled")
+    candidate = {"provider": "openai", **patch}
+    normalize_account_device(candidate)
+    candidate.pop("provider", None)
+    return candidate
 
 
 def add_account(entry: dict) -> None:
@@ -2219,8 +2231,9 @@ def _add_account_serialized(entry: dict) -> None:
     支持可选字段：
       - provider: "claude" (默认) / "openai" / "xai"
       - id_token / chatgpt_account_id / workspace_id / workspace_name /
-        workspace_type / organization_id / plan_type / subscription_expires_at
-        (OpenAI 专属)
+        workspace_type / organization_id / plan_type / subscription_expires_at /
+        codexDeviceInstallationId / codexDeviceConvergenceEnabled
+        (OpenAI 专属；有 workspace 时默认开启并生成 UUIDv4；显式 false 关闭)
       - id_token / subject / sub / base_url / token_endpoint / redirect_uri
         (xAI 专属)
     """
@@ -2343,11 +2356,27 @@ def _add_account_serialized(entry: dict) -> None:
                 )
             keep_models = target.get("models")
             keep_max = target.get("maxConcurrent")
+            keep_device_id = target.get("codexDeviceInstallationId")
+            keep_device_enabled = target.get("codexDeviceConvergenceEnabled")
             target.update(normalized)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
+            # Same canonical OpenAI workspace reimport preserves omitted
+            # device identity and explicit opt-out state.
+            if (
+                provider == "openai"
+                and "codexDeviceInstallationId" not in entry
+                and keep_device_id is not None
+            ):
+                target["codexDeviceInstallationId"] = keep_device_id
+            if (
+                provider == "openai"
+                and "codexDeviceConvergenceEnabled" not in entry
+                and keep_device_enabled is not None
+            ):
+                target["codexDeviceConvergenceEnabled"] = keep_device_enabled
             if rename_new_key:
                 fam = "openai" if _is_openai_family_provider(provider) else "anthropic"
                 _rename_priority_orders_in_config(
@@ -2698,8 +2727,8 @@ def _clear_oauth_runtime_state(canonical: str, *, clear_quota_cache: bool,
 def reset_quota(account_key: str) -> dict:
     """Manually clear local quota/cooldown state for one OAuth account.
 
-    This mirrors CLIProxyAPI's ResetQuota semantics: it does not reset upstream
-    limits, but clears Parrot's local quota-disabled state and model cooldown so
+    This does not reset upstream limits; it only clears Parrot's local
+    quota-disabled state and model cooldown so
     the account can participate in routing again. User-disabled and auth_error
     accounts are intentionally left untouched. A quota-disabled account is only
     enabled after every required local blocker was durably cleared.

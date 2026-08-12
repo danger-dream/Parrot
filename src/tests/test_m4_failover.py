@@ -115,6 +115,16 @@ def http_500():
     return httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "oops"}})
 
 
+def http_402(secret: str = "sk-never-leak"):
+    return httpx.Response(402, json={
+        "error": {
+            "type": "billing_error",
+            "code": "insufficient_balance",
+            "message": f"balance exhausted credential={secret}",
+        },
+    })
+
+
 def http_channel_400():
     return httpx.Response(400, json={
         "type": "error",
@@ -566,6 +576,36 @@ async def test_all_fail_503(m):
     assert log["log"]["status"] == "error"
     assert len(log["retry_chain"]) == 2
     print("  [PASS] all_fail → 503")
+
+
+async def test_402_switches_candidate_and_all_402_preserves_terminal_status(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: http_402())
+    router.register("https://chb", lambda r: json_ok_response())
+    chA = _make_channel(m, "chA", "https://cha")
+    chB = _make_channel(m, "chB", "https://chb")
+    _install_channels(m, [chA, chB])
+    body = {"model": "glm-5", "stream": False, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    assert resp.status_code == 200
+    await mc.aclose()
+    assert m["cooldown"].is_blocked("api:chA", "glm-5")
+    assert not m["cooldown"].is_blocked("api:chB", "glm-5")
+
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: http_402("first-secret"))
+    router.register("https://chb", lambda r: http_402("second-secret"))
+    _install_channels(m, [chA, chB])
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    assert resp.status_code == 402
+    text = resp.body.decode()
+    assert "balance_exhausted" in text
+    assert "first-secret" not in text and "second-secret" not in text
+    await mc.aclose()
 
 
 async def test_channel_semantic_400_still_switches_and_cools_down(m):

@@ -4,8 +4,8 @@ The OAuth provider itself lives in ``src.oauth.xai``.  This channel exposes the
 account as an OpenAI Responses-family upstream and sends requests to
 ``https://api.x.ai/v1/responses`` with the OAuth access token.
 
-xAI's HTTP Responses path is treated as SSE-only, matching CLIProxyAPI's native
-xAI executor.  Non-stream downstream calls are therefore handled by Parrot's
+xAI's HTTP Responses path is treated as SSE-only. Non-stream downstream calls
+are therefore handled by Parrot's
 existing upstream-stream-only aggregation path.
 """
 
@@ -60,8 +60,8 @@ def _isolate_session_id(api_key_name: str, raw: str) -> str:
 def _sanitize_xai_payload(payload: dict, *, stream: bool = True) -> dict:
     """Apply conservative xAI Responses HTTP compatibility tweaks.
 
-    These mirror the safe subset observed in CLIProxyAPI's xAI executor without
-    importing its larger tool/reasoning normalization layer.  xAI documents
+    Keep only the conservative fields required by the xAI Responses HTTP path.
+    xAI documents
     ``stream_options.include_usage`` as the REST/SSE path for receiving the
     final usage/cost block, so keep only that safe stream option and force it on
     for Parrot accounting.

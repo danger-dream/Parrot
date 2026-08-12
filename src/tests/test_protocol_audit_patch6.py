@@ -103,6 +103,57 @@ def test_bug3_function_call_output_array_flattens_to_text(m):
     assert " more" in tool_msgs[0]["content"]
 
 
+@pytest.mark.parametrize("output, expected", [
+    ("plain", "plain"),
+    (None, ""),
+    ([], ""),
+    ({"ok": True, "文字": "值"}, '{"ok": true, "文字": "值"}'),
+    (42, "42"),
+    ('{"already": "json"}', '{"already": "json"}'),
+    ([{"type": "input_text", "text": "a"},
+      {"type": "text", "text": "b"}], "ab"),
+])
+def test_tool_output_plain_object_stringified_and_text_only(m, output, expected):
+    assert m["responses_to_chat"]._flatten_function_call_output(output) == expected
+
+
+@pytest.mark.parametrize("attachment", [
+    {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "high"},
+    {"type": "input_file", "file_id": "file_1", "filename": "报告.pdf"},
+])
+def test_tool_output_attachment_serializes_entire_array_stably(m, attachment):
+    r2c = m["responses_to_chat"]
+    output = [{"type": "input_text", "text": "prefix"}, attachment]
+    flattened = r2c._flatten_function_call_output(output)
+    assert isinstance(flattened, str)
+    assert json.loads(flattened) == output
+    assert "prefix" in flattened
+    assert "报告" in flattened if "filename" in attachment else "a.png" in flattened
+    assert flattened == r2c._flatten_function_call_output(output)
+
+
+def test_assistant_content_and_adjacent_calls_merge_but_not_across_boundary(m):
+    r2c = m["responses_to_chat"]
+    body = {"model": "x", "input": [
+        {"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "prefix"},
+            {"type": "refusal", "refusal": "no"},
+        ]},
+        {"type": "function_call", "call_id": "f1", "name": "fn", "arguments": "{}"},
+        {"type": "custom_tool_call", "call_id": "c1", "name": "dsl", "input": "raw"},
+        {"type": "message", "role": "user", "content": "boundary"},
+        {"type": "function_call", "call_id": "f2", "name": "later", "arguments": "{}"},
+    ]}
+    msgs = r2c.translate_request(body)["messages"]
+    assert msgs[0]["role"] == "assistant"
+    assert msgs[0]["content"] == "prefix"
+    assert msgs[0]["refusal"] == "no"
+    assert [tc["id"] for tc in msgs[0]["tool_calls"]] == ["f1", "c1"]
+    assert msgs[1]["role"] == "user"
+    assert msgs[2]["role"] == "assistant"
+    assert [tc["id"] for tc in msgs[2]["tool_calls"]] == ["f2"]
+
+
 # ───────── #6 input_audio 在 r2c 保真桥接 ─────────
 
 

@@ -64,10 +64,12 @@ from .protocols.runtime import (
     json_error_for_ingress,
     make_stream_translator,
     parse_retry_after_seconds,
+    retry_after_cooldown_until,
     prepare_non_stream_response,
     recovery_retry_allowed,
     is_context_length_exceeded_error,
     is_invalid_encrypted_content_error,
+    is_html_error_document,
     retryable_transient_error_kind,
     responses_ws_error_detail,
     transient_retry_allowed,
@@ -118,8 +120,8 @@ from .transports import policy as transport_policy
 # ─── OpenAI Codex 响应头 snapshot 节流 ───────────────────────────
 #
 # ChatGPT internal API 把 rate-limit 放在每次请求的 response header 里，没有
-# 独立 usage 端点。为避免每次请求都写一次 state_db，按 email 30s 节流（与
-# sub2api openAICodexSnapshotPersistMinInterval 对齐）。吞掉所有异常，不影响主链路。
+# 独立 usage 端点。为避免每次请求都写一次 state_db，按账号 30s 节流。
+# 快照持久化属于旁路能力，异常不得影响主请求链路。
 
 _CODEX_SNAPSHOT_WRITE_INTERVAL_S = 30.0
 _codex_snapshot_last: dict[str, float] = {}
@@ -175,8 +177,8 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
 
 # ─── Anthropic 响应头被动采样 snapshot 节流 ──────────────────────
 #
-# 参考 sub2api ratelimit_service.go::UpdateSessionWindow。Anthropic 在每次
-# 成功响应的响应头里带 5h/7d rate-limit utilization，比主动拉 /api/oauth/usage
+# Anthropic 在每次成功响应的响应头里带 5h/7d rate-limit utilization，
+# 比主动拉 /api/oauth/usage
 # 新鲜得多且无 rate-limit 成本。与 Codex 节流机制对称：按 account_key 30s
 # 节流，避免每次请求都写 state_db。
 #
@@ -762,7 +764,7 @@ _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECA
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"']+")
 _SECRET_RE = re.compile(r"(?i)\b(?:sk|sess|key)-[A-Za-z0-9_-]{8,}\b")
 _FIELD_SECRET_RE = re.compile(
-    r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"
+    r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|credential)"
     r"\s*[:=]\s*[^\s,;]+"
 )
 
@@ -835,8 +837,10 @@ def _structured_attempt_error(
         or _FIELD_SECRET_RE.search(code)
     ):
         code = None
-    if quota is not None:
-        classification = "quota_exhausted"
+    if result.openai_oauth_html_403:
+        classification = "upstream_http_error"
+    elif quota is not None:
+        classification = quota["classification"]
     elif result.outcome in ("request_invalid", "guard_error", "candidate_guard"):
         classification = "invalid_request"
     elif status == 401:
@@ -870,11 +874,16 @@ def _structured_attempt_error(
         "status": status,
         "classification": classification,
         "code": code,
-        "message": _sanitize_upstream_message(
-            quota.get("message") if quota is not None else detail
+        "message": (
+            "Upstream returned an HTTP 403 response"
+            if result.openai_oauth_html_403
+            else _sanitize_upstream_message(
+                quota.get("message") if quota is not None else detail
+            )
         ),
         "retryable": retryable,
         "retry_scope": retry_scope,
+        "openai_oauth_html_403": result.openai_oauth_html_403,
     }
 
 
@@ -892,6 +901,7 @@ def _structured_failure_details(attempts: list[dict]) -> dict:
         }]
     priority = {
         "invalid_request": 100,
+        "balance_exhausted": 96,
         "quota_exhausted": 95,
         "authentication_error": 90,
         "permission_error": 85,
@@ -912,7 +922,7 @@ def _structured_failure_details(attempts: list[dict]) -> dict:
     # Attempt entries describe Parrot's internal candidate progression.  The
     # terminal root cause instead tells the downstream whether replaying the
     # whole Parrot request is useful after every candidate has been exhausted.
-    if root_cause.get("classification") == "quota_exhausted":
+    if root_cause.get("classification") in {"balance_exhausted", "quota_exhausted"}:
         root_cause.update(retryable=False, retry_scope="none")
     elif bool(root_attempt.get("retryable")):
         root_cause.update(retryable=True, retry_scope="request")
@@ -1045,6 +1055,8 @@ def _attach_retry_after_from_response(
     parsed = parse_retry_after_seconds(raw)
     if parsed is not None:
         result.retry_after_seconds = parsed
+        if result.http_status == 429:
+            result.cooldown_until = retry_after_cooldown_until(raw)
     return result
 
 
@@ -1990,6 +2002,7 @@ async def run_failover(
             _recovery_retry_allowed("oauthRefresh", cfg)
             and ch.type == "oauth"
             and result.http_status in (401, 403)
+            and not result.openai_oauth_html_403
             and quota_exhaustion is None
             and ch.key not in refreshed_once
         ):
@@ -2092,17 +2105,19 @@ async def run_failover(
                 )
                 continue
 
-        # 普通失败处理
-        plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
-        finalize_policy.apply_error_health_effects(
-            plan,
-            scorer=scorer,
-            cooldown=cooldown,
-            channel_key=ch.key,
-            model=resolved_model,
-            error_detail=result.error_detail,
-            connect_ms=_scorer_connect_ms(result),
-        )
+        # 普通失败处理；HTML 403 只推进候选，不归咎账号或渠道健康。
+        if not result.openai_oauth_html_403:
+            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            finalize_policy.apply_error_health_effects(
+                plan,
+                scorer=scorer,
+                cooldown=cooldown,
+                channel_key=ch.key,
+                model=resolved_model,
+                error_detail=result.error_detail,
+                connect_ms=_scorer_connect_ms(result),
+                cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
+            )
         retry_count += 1
         idx += 1
 
@@ -2261,16 +2276,18 @@ async def run_failover(
                         ),
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
-                plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
-                finalize_policy.apply_error_health_effects(
-                    plan,
-                    scorer=scorer,
-                    cooldown=cooldown,
-                    channel_key=ch.key,
-                    model=resolved_model,
-                    error_detail=result.error_detail,
-                    connect_ms=_scorer_connect_ms(result),
-                )
+                if not result.openai_oauth_html_403:
+                    plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+                    finalize_policy.apply_error_health_effects(
+                        plan,
+                        scorer=scorer,
+                        cooldown=cooldown,
+                        channel_key=ch.key,
+                        model=resolved_model,
+                        error_detail=result.error_detail,
+                        connect_ms=_scorer_connect_ms(result),
+                        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
+                    )
                 retry_count += 1
             else:
                 # 队列超时 → 直接返回 429 rate_limit_error，不混入上游失败
@@ -2301,6 +2318,21 @@ async def run_failover(
     #   - 最后一次是连接/首字/总超时 → 504 timeout_error
     #   - 最后一次是连接/传输错误 → 502 api_error
     status = failover_final_http_status(last_result)
+    classifications = {
+        str(item.get("classification") or "") for item in structured_attempts
+    }
+    if structured_attempts and all(
+        bool(item.get("openai_oauth_html_403")) for item in structured_attempts
+    ):
+        status = 403
+        err_type = "api_error"
+    elif structured_attempts and classifications <= {"authentication_error", "permission_error"}:
+        statuses = {item.get("status") for item in structured_attempts}
+        status = 401 if statuses == {401} else 403
+    elif structured_attempts and classifications == {"balance_exhausted"}:
+        status = 402
+    elif structured_attempts and classifications == {"rate_limit_error"}:
+        status = 429
     if last_result and last_result.outcome == "candidate_guard":
         status = int(last_result.http_status or 400)
         err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(status)
@@ -2804,7 +2836,10 @@ async def _build_oauth_responses_ws_upstream_request(
 ) -> tuple[str, dict[str, str], str, Optional[dict], ConfuseState]:
     # 复用 OAuth channel 的鉴权 / session 隔离 / header 构造；只把 URL 改成 WS，
     # body 用 response.create frame 单独生成，避免把 HTTP JSON body 直接发成 WS frame。
-    req = await ch.build_upstream_request(body, resolved_model, ingress_protocol="responses")
+    req = await ch.build_upstream_request(
+        body, resolved_model, ingress_protocol="responses",
+        defer_device_fingerprint=True,
+    )
     ws_url, headers, frame, identity_state = prepare_oauth_responses_ws_request_parts(
         req,
         body,
@@ -3056,6 +3091,10 @@ async def _try_openai_oauth_responses_ws_channel(
                 outcome="http_auth_error" if status in (401, 403) else "http_error",
                 error_detail=detail,
                 http_status=status,
+                openai_oauth_html_403=(
+                    status == 403
+                    and is_html_error_document(getattr(invalid_response, "body", None))
+                ),
                 proxy_name=proxy_name,
             )
             last_error = _attach_retry_after_from_response(last_error, invalid_response)
@@ -3082,6 +3121,10 @@ async def _try_openai_oauth_responses_ws_channel(
         if connector is not None and last_error is not None:
             connector.stats.total_failures += 1
             connector.stats.last_error = (last_error.error_detail or last_error.outcome)[:200]
+        # A typed HTML403 is an account-protection signal: advance the outer
+        # candidate exactly once rather than trying another proxy route.
+        if last_error is not None and last_error.openai_oauth_html_403:
+            return last_error
         # Do not replay one logical retry row over another proxy route after a
         # create frame may have reached the upstream.
         if last_error is not None and route_state["dispatched"]:
@@ -4054,6 +4097,11 @@ async def _try_channel(
                 partial_state=cancel_state,
             )
             result = _attach_retry_after_from_response(result, upstream_resp)
+            result.openai_oauth_html_403 = (
+                isinstance(ch, OpenAIOAuthChannel)
+                and result.http_status == 403
+                and is_html_error_document(result.full_response_text)
+            )
             result = _request_invalid_result_if_needed(result)
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)

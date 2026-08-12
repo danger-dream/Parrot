@@ -47,6 +47,8 @@ class R2CState:
     fc_output_index_to_tc_index: dict[int, int] = field(default_factory=dict)
     fc_name_by_tc_index: dict[int, str] = field(default_factory=dict)
     fc_call_id_by_tc_index: dict[int, str] = field(default_factory=dict)
+    custom_output_index_to_tc_index: dict[int, int] = field(default_factory=dict)
+    custom_input_by_tc_index: dict[int, str] = field(default_factory=dict)
     next_tc_index: int = 0
     # 下游 chat assistant 累积（供 MS-7 亲和 fingerprint_write_chat 使用）
     chat_text_parts: list = field(default_factory=list)
@@ -245,6 +247,10 @@ class StreamTranslator:
             yield from self._on_fc_args_delta(data or {})
         elif event_name == "response.function_call_arguments.done":
             yield from self._on_fc_args_done(data or {})
+        elif event_name == "response.custom_tool_call_input.delta":
+            yield from self._on_custom_input_delta(data or {})
+        elif event_name == "response.custom_tool_call_input.done":
+            yield from self._on_custom_input_done(data or {})
         elif event_name == "response.output_text.annotation.added":
             yield from self._on_annotation_added(data or {})
         elif event_name == "response.completed":
@@ -278,6 +284,8 @@ class StreamTranslator:
             return
         if item_type == "function_call":
             yield from self._ensure_function_call_started(data, item)
+        elif item_type == "custom_tool_call":
+            yield from self._ensure_custom_tool_call_started(data, item)
 
     def _ensure_function_call_started(self, data: dict, item: dict) -> Iterator[bytes]:
         """Register and emit a Chat tool-call start exactly once.
@@ -309,6 +317,28 @@ class StreamTranslator:
             }],
         })
 
+    def _ensure_custom_tool_call_started(self, data: dict, item: dict) -> Iterator[bytes]:
+        """Register and emit a Responses custom tool call exactly once."""
+        output_index = int(data.get("output_index", 0))
+        if output_index in self.state.custom_output_index_to_tc_index:
+            return
+        tc_index = self.state.next_tc_index
+        self.state.next_tc_index += 1
+        self.state.custom_output_index_to_tc_index[output_index] = tc_index
+        call_id = item.get("call_id") or item.get("id") or _gen_id("call_")
+        name = item.get("name") or ""
+        self.state.fc_call_id_by_tc_index[tc_index] = call_id
+        self.state.fc_name_by_tc_index[tc_index] = name
+        yield from self._ensure_role_sent()
+        yield _mk_chunk(self.state, delta={
+            "tool_calls": [{
+                "index": tc_index,
+                "id": call_id,
+                "type": "custom",
+                "custom": {"name": name, "input": ""},
+            }],
+        })
+
     def _on_output_item_done(self, data: dict) -> Iterator[bytes]:
         """Use the complete terminal item as a last-resort content snapshot."""
         item = data.get("item") or {}
@@ -316,6 +346,10 @@ class StreamTranslator:
         if item_type == "function_call":
             yield from self._ensure_function_call_started(data, item)
             yield from self._emit_terminal_fc_args_tail(data, item.get("arguments"))
+            return
+        if item_type == "custom_tool_call":
+            yield from self._ensure_custom_tool_call_started(data, item)
+            yield from self._emit_terminal_custom_input_tail(data, item.get("input"))
             return
         if item_type != "message":
             return
@@ -493,6 +527,41 @@ class StreamTranslator:
     def _on_fc_args_done(self, data: dict) -> Iterator[bytes]:
         yield from self._emit_terminal_fc_args_tail(data, data.get("arguments"))
 
+    def _on_custom_input_delta(self, data: dict) -> Iterator[bytes]:
+        output_index = int(data.get("output_index", 0))
+        tc_index = self.state.custom_output_index_to_tc_index.get(output_index)
+        if tc_index is None:
+            return
+        text = data.get("delta")
+        if not isinstance(text, str):
+            return
+        self.state.custom_input_by_tc_index[tc_index] = (
+            self.state.custom_input_by_tc_index.get(tc_index, "") + text
+        )
+        yield _mk_chunk(self.state, delta={"tool_calls": [{
+            "index": tc_index, "custom": {"input": text},
+        }]})
+
+    def _emit_terminal_custom_input_tail(self, data: dict, full_input: Any) -> Iterator[bytes]:
+        if not isinstance(full_input, str):
+            return
+        output_index = int(data.get("output_index", 0))
+        tc_index = self.state.custom_output_index_to_tc_index.get(output_index)
+        if tc_index is None:
+            return
+        emitted = self.state.custom_input_by_tc_index.get(tc_index, "")
+        if not full_input.startswith(emitted):
+            return
+        tail = full_input[len(emitted):]
+        self.state.custom_input_by_tc_index[tc_index] = full_input
+        if tail:
+            yield _mk_chunk(self.state, delta={"tool_calls": [{
+                "index": tc_index, "custom": {"input": tail},
+            }]})
+
+    def _on_custom_input_done(self, data: dict) -> Iterator[bytes]:
+        yield from self._emit_terminal_custom_input_tail(data, data.get("input"))
+
     def _on_annotation_added(self, data: dict) -> Iterator[bytes]:
         """02-bug-findings #35: 累积 annotation 到 state；chat 流没有
         annotation 增量事件，annotation 在 close() 之前由 get_downstream_chat_assistant
@@ -507,9 +576,39 @@ class StreamTranslator:
 
     def _on_completed(self, data: dict) -> Iterator[bytes]:
         resp = data.get("response") or {}
+        # The terminal response snapshot may be the only carrier of function
+        # arguments or custom tool input. Repair either kind before locking
+        # terminal state.
+        for snapshot_index, item in enumerate(resp.get("output") or []):
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type not in ("function_call", "custom_tool_call"):
+                continue
+            # Detailed events and the terminal output array may use
+            # different/sparse output indexes. Match an existing call by its
+            # Responses call id so the snapshot cannot open a duplicate.
+            item_call_id = item.get("call_id") or item.get("id")
+            output_index = snapshot_index
+            index_map = (self.state.fc_output_index_to_tc_index
+                         if item_type == "function_call"
+                         else self.state.custom_output_index_to_tc_index)
+            for known_output_index, tc_index in index_map.items():
+                if self.state.fc_call_id_by_tc_index.get(tc_index) == item_call_id:
+                    output_index = known_output_index
+                    break
+            item_data = {"output_index": output_index, "item": item}
+            if item_type == "function_call":
+                if output_index not in self.state.fc_output_index_to_tc_index:
+                    yield from self._ensure_function_call_started(item_data, item)
+                yield from self._emit_terminal_fc_args_tail(item_data, item.get("arguments"))
+            else:
+                yield from self._ensure_custom_tool_call_started(item_data, item)
+                yield from self._emit_terminal_custom_input_tail(item_data, item.get("input"))
         self.state.terminal_status = "completed"
         self.state.usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else None
-        fallback = "tool_calls" if self.state.fc_output_index_to_tc_index else "stop"
+        fallback = ("tool_calls" if (self.state.fc_output_index_to_tc_index
+                                     or self.state.custom_output_index_to_tc_index) else "stop")
         self.state.finish_reason = _finish_reason_for_responses(resp, fallback=fallback)
         # An empty but completed Responses result is valid.  Emit a normal Chat
         # role chunk so the commit gate does not turn it into a fake pre-first-
@@ -568,19 +667,31 @@ class StreamTranslator:
             msg["refusal"] = "".join(self.state.chat_refusal_parts)
         if self.state.annotations:
             msg["annotations"] = list(self.state.annotations)
-        if self.state.fc_output_index_to_tc_index:
+        all_tc_indices = (set(self.state.fc_output_index_to_tc_index.values())
+                          | set(self.state.custom_output_index_to_tc_index.values()))
+        if all_tc_indices:
+            custom_indices = set(self.state.custom_output_index_to_tc_index.values())
             tcs: list[dict] = []
-            for tc_index in sorted(set(self.state.fc_output_index_to_tc_index.values())):
-                tcs.append({
-                    "id": self.state.fc_call_id_by_tc_index.get(tc_index, ""),
-                    "type": "function",
-                    "function": {
-                        "name": self.state.fc_name_by_tc_index.get(tc_index, ""),
-                        "arguments": self.state.fc_args_by_tc_index.get(tc_index, ""),
-                    },
-                })
-            if tcs:
-                msg["tool_calls"] = tcs
+            for tc_index in sorted(all_tc_indices):
+                if tc_index in custom_indices:
+                    tcs.append({
+                        "id": self.state.fc_call_id_by_tc_index.get(tc_index, ""),
+                        "type": "custom",
+                        "custom": {
+                            "name": self.state.fc_name_by_tc_index.get(tc_index, ""),
+                            "input": self.state.custom_input_by_tc_index.get(tc_index, ""),
+                        },
+                    })
+                else:
+                    tcs.append({
+                        "id": self.state.fc_call_id_by_tc_index.get(tc_index, ""),
+                        "type": "function",
+                        "function": {
+                            "name": self.state.fc_name_by_tc_index.get(tc_index, ""),
+                            "arguments": self.state.fc_args_by_tc_index.get(tc_index, ""),
+                        },
+                    })
+            msg["tool_calls"] = tcs
         return msg
 
     def _on_error(self, event_name: str, data: dict) -> Iterator[bytes]:
@@ -629,7 +740,8 @@ def _finish_reason_for_responses(resp: dict, *, fallback: str) -> str:
         output = resp.get("output") or []
         if isinstance(output, list):
             for it in output:
-                if isinstance(it, dict) and it.get("type") == "function_call":
+                if (isinstance(it, dict)
+                        and it.get("type") in ("function_call", "custom_tool_call")):
                     return "tool_calls"
         # Detailed item events may contain a function call while the completed
         # snapshot omits output.  Keep the caller's state-derived fallback

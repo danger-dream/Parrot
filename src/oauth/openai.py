@@ -33,7 +33,7 @@ from urllib.parse import urlencode
 from .. import network
 
 
-# ─── OAuth 常量（与 sub2api 对齐，来源 Codex CLI 官方）────────────
+# ─── OAuth 常量（Codex CLI 授权协议）──────────────────────────────
 
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
@@ -48,7 +48,7 @@ SCOPES_AUTHORIZE = (
 # 历史 SCOPES_REFRESH 仅在 mockMode 下作为响应里的占位字段使用。
 SCOPES_REFRESH = "openid profile email"
 
-# 固定的 Codex CLI User-Agent。与 sub2api 最新 Codex 上游请求指纹保持一致。
+# 固定的 Codex CLI User-Agent，集中由 codex_constants 维护。
 from ..openai.codex_constants import CODEX_CLI_USER_AGENT as USER_AGENT, CODEX_ORIGINATOR
 
 # 运行期请求超时（换 token / 刷 token）。
@@ -82,7 +82,8 @@ def _mock_id_token(email: str | None = None, *, account_id: str | None = None,
                    org_id: str | None = None) -> str:
     """为 mockMode 构造一个合法结构的 id_token（3 段 base64）。
 
-    payload 包含 sub2api 需要的所有字段，签名部分留空（我们本来也不验签）。
+    payload 包含 Parrot 测试和账户解析所需字段；签名部分留空，因为 mock
+    路径只验证结构，不做 JWT 验签。
     """
     header = {"alg": "none", "typ": "JWT"}
     if not email:
@@ -1297,7 +1298,7 @@ def codex_snapshot_window_observations(
 
 
 def normalize_codex_snapshot(snap: dict) -> dict:
-    """把 primary/secondary 映射到 5h/7d/30d。参考 sub2api `Normalize()`。
+    """把 primary/secondary 响应头窗口映射到 5h/7d/30d。
 
     策略：有 window_minutes 时，较小窗口归为 5h、较大归为 7d；只有一边
     window_minutes 时按 ≤360 min 判 5h。超过 8 天的已知长窗口归为 30d；

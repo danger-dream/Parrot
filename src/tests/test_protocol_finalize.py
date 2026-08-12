@@ -57,6 +57,27 @@ def test_success_plan_records_success_clears_cooldown_and_writes_affinity():
     assert plan.record_cooldown_error is False
 
 
+def test_explicit_cooldown_deadline_is_forwarded_only_for_cooldown_plan():
+    class ExplicitCooldown(_Cooldown):
+        def record_error(self, channel_key, model, error_detail=None, *, cooldown_until=None):
+            self.errors.append((channel_key, model, error_detail, cooldown_until))
+
+    cd = ExplicitCooldown()
+    finalize.apply_error_health_effects(
+        finalize.error_plan("http_error"),
+        scorer=_Scorer(), cooldown=cd, channel_key="api:a", model="m",
+        error_detail="rate limited", cooldown_until=1_700_000_005_000,
+    )
+    assert cd.errors == [("api:a", "m", "rate limited", 1_700_000_005_000)]
+
+    finalize.apply_error_health_effects(
+        finalize.error_plan("request_invalid"),
+        scorer=_Scorer(), cooldown=cd, channel_key="api:b", model="m",
+        cooldown_until=1_700_000_005_000,
+    )
+    assert len(cd.errors) == 1
+
+
 def test_runtime_error_plan_matches_attempt_health_policy():
     guard = finalize.error_plan("candidate_guard", failure_policy="runtime")
     assert guard.log_error is True

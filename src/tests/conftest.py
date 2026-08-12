@@ -10,7 +10,8 @@ import socket
 def _validate_import_time_isolation() -> None:
     if os.environ.get("PARROT_TEST_ISOLATED") != "1":
         raise RuntimeError(
-            "pytest must be launched via: python3 src/tests/isolated_pytest.py <test args>"
+            "pytest must be launched via: "
+            "./venv/bin/python src/tests/isolated_pytest.py <test args>"
         )
     root_raw = os.environ.get("PARROT_TEST_ROOT") or ""
     root = Path(root_raw)

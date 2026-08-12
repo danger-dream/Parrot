@@ -83,18 +83,19 @@ def test_chat_json_missing_usage_returns_zero():
     assert out == {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
 
 
-def test_chat_json_cached_greater_than_prompt_clamped():
-    """异常情况：cached > prompt，结果被 clamp 到 0，不出现负数。"""
+def test_chat_json_cached_greater_than_prompt_is_rejected():
+    """cached > prompt is malformed and must not become contradictory usage."""
     resp = {
         "usage": {
             "prompt_tokens": 100,
             "completion_tokens": 10,
-            "prompt_tokens_details": {"cached_tokens": 500},  # 畸形数据
+            "prompt_tokens_details": {"cached_tokens": 500},
         }
     }
     out = extract_usage_chat_json(resp)
-    assert out["input_tokens"] == 0, out  # max(0, 100-500)
-    assert out["cache_read"] == 500
+    assert out == {
+        "input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════

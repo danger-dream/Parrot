@@ -104,6 +104,7 @@ def test_xai_pkce_login_url_and_mock_token(m):
     assert "api%3Aaccess" in url
     assert "code_challenge_method=S256" in url
     assert "plan=generic" in url
+    assert "referrer=parrot" in url
 
     tok = p.exchange_code_sync("mock-code", verifier)
     assert tok["access_token"].startswith("mock-xai-access-")
@@ -244,6 +245,12 @@ def test_xai_cli_billing_usage_parse_and_quota_shape(m, monkeypatch):
             }})
         if "format=credits" in url:
             return Resp({"config": {
+                "creditUsagePercent": 70,
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-08-06T06:54:28+00:00",
+                    "end": "2026-08-13T06:54:28+00:00",
+                },
                 "onDemandUsed": {"val": 0},
                 "prepaidBalance": {"val": 0},
                 "isUnifiedBillingUser": True,
@@ -271,17 +278,20 @@ def test_xai_cli_billing_usage_parse_and_quota_shape(m, monkeypatch):
     monkeypatch.setattr(p.network, "get_sync", fake_get)
     usage = p.fetch_cli_billing_usage_sync("at-xai")
     billing = usage["xai"]["billing"]
-    assert billing["monthly_limit"] == 15000
-    assert billing["used"] == 2
-    assert billing["remaining"] == 14998
-    assert billing["used_percent"] == pytest.approx(2 / 15000 * 100)
+    assert billing["period_type"] == "USAGE_PERIOD_TYPE_WEEKLY"
+    assert billing["used_percent"] == 70
+    assert billing["remaining_percent"] == 30
+    assert billing["period_start"] == "2026-08-06T06:54:28+00:00"
+    assert billing["period_end"] == "2026-08-13T06:54:28+00:00"
+    assert billing["auto_top_up"] == {"monthly_limit": 15000, "used": 2}
     assert usage["xai"]["user"]["subscription_tier"] == "GrokPro"
     assert usage["xai"]["settings"]["default_model"] == "grok-4-5"
     flat = om.flatten_usage(usage)
-    assert flat["thirty_day_util"] == pytest.approx(2 / 15000 * 100)
-    assert flat["thirty_day_reset"] == "2026-08-01T00:00:00+00:00"
+    assert flat["seven_day_util"] == 70
+    assert flat["seven_day_reset"] == "2026-08-13T06:54:28+00:00"
+    assert flat["thirty_day_util"] is None
+    assert flat["thirty_day_reset"] is None
     assert flat["five_hour_util"] is None
-    assert flat["seven_day_util"] is None
 
 
 def test_xai_quota_resume_uses_fresh_billing_even_before_period_end(m):
@@ -304,7 +314,8 @@ def test_xai_quota_resume_uses_fresh_billing_even_before_period_end(m):
         "seven_day": {},
         "seven_day_sonnet": {},
         "seven_day_opus": {},
-        "openai": {"thirty_day": {"utilization": 10.0, "resets_at": future}},
+        "openai": {"thirty_day": {}},
+        "seven_day": {"utilization": 10.0, "resets_at": future},
         "extra_usage": {"is_enabled": False},
         "xai": {"source": "cli-chat-proxy", "quota_supported": True},
     }
@@ -313,6 +324,123 @@ def test_xai_quota_resume_uses_fresh_billing_even_before_period_end(m):
     acc = om.get_account("xai:sub-1")
     assert acc["enabled"] is True
     assert acc.get("disabled_reason") is None
+
+
+def test_xai_weekly_quota_disables_until_official_reset(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    future = _future_expired(86400 * 5)
+    om.add_account({
+        "provider": "xai",
+        "email": "weekly@example.test",
+        "subject": "weekly-sub",
+        "access_token": "at-xai",
+        "refresh_token": "rt-xai",
+        "expired": _future_expired(),
+        "enabled": True,
+    })
+    usage = {
+        "five_hour": {},
+        "seven_day": {"utilization": 96.0, "resets_at": future},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "openai": {"thirty_day": {}},
+        "extra_usage": {"is_enabled": False},
+        "xai": {"source": "cli-chat-proxy", "quota_supported": True},
+    }
+    result = om.evaluate_and_toggle_by_usage(
+        "xai:weekly-sub", usage, threshold=95, fresh=True,
+    )
+    assert result["action"] == "disabled"
+    assert result["hit_windows"] == ["周额度"]
+    assert result["disabled_until"] == future
+    acc = om.get_account("xai:weekly-sub")
+    assert acc["enabled"] is False
+    assert acc["disabled_reason"] == "quota"
+    assert acc["disabled_until"] == future
+
+
+def test_xai_missing_credit_percent_does_not_fall_back_to_legacy_monthly(m, monkeypatch):
+    _setup(m)
+    p = m["xai_provider"]
+    monkeypatch.setattr(p, "_mock_mode_enabled", lambda: False)
+
+    def fake_json(_token, path, timeout=None):
+        if "format=auto-topup" in path:
+            return {"config": {"monthlyLimit": {"val": 0}, "used": {"val": 0}}}
+        if "format=credits" in path:
+            return {"config": {"currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-08-06T06:54:28+00:00",
+                "end": "2026-08-13T06:54:28+00:00",
+            }}}
+        return {}
+
+    monkeypatch.setattr(p, "_cli_get_json_sync", fake_json)
+    usage = p.fetch_cli_billing_usage_sync("at-xai")
+    billing = usage["xai"]["billing"]
+    assert billing["used_percent"] is None
+    assert billing["remaining_percent"] is None
+    assert usage["seven_day"] == {}
+    assert usage["openai"]["thirty_day"] == {}
+
+
+def test_xai_weekly_official_block_and_local_monthly_label(m):
+    _setup(m)
+    account_key = "xai:render-sub"
+    raw = {
+        "xai": {
+            "source": "cli-chat-proxy",
+            "quota_supported": True,
+            "billing": {
+                "period_type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "used_percent": 70,
+                "remaining_percent": 30,
+                "period_start": "2026-08-06T06:54:28+00:00",
+                "period_end": "2026-08-13T06:54:28+00:00",
+            },
+            "settings": {},
+        }
+    }
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "seven_day_util": 70,
+        "seven_day_reset": "2026-08-13T06:54:28+00:00",
+        "raw_data": json.dumps(raw),
+    }, email="render@example.test")
+
+    summary = m["oauth_menu"]._format_xai_official_block(account_key, detail=False)
+    detail = m["oauth_menu"]._format_xai_official_block(account_key, detail=True)
+    local = m["oauth_menu"]._format_xai_spend_block(
+        account_key, detail=False,
+        month_stats={"input": 10, "output": 2, "cache_creation": 0, "cache_read": 0},
+    )
+    assert "周额度: 剩余 30.00% · 已用 70.00%" in summary
+    assert "周额度: 剩余 <code>30.00%</code> · 已用 <code>70.00%</code>" in detail
+    assert "0 / 0" not in summary + detail
+    assert "月额度" not in summary + detail
+    assert "本地月度" in local
+    assert "本月经 Parrot" not in local
+
+
+def test_xai_unknown_weekly_percent_is_explicit(m):
+    _setup(m)
+    account_key = "xai:unknown-sub"
+    raw = {"xai": {"source": "cli-chat-proxy", "billing": {
+        "period_type": "USAGE_PERIOD_TYPE_WEEKLY",
+        "used_percent": None,
+        "remaining_percent": None,
+        "period_start": "2026-08-06T06:54:28+00:00",
+        "period_end": "2026-08-13T06:54:28+00:00",
+    }, "settings": {}}}
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "raw_data": json.dumps(raw),
+    }, email="unknown@example.test")
+    text = m["oauth_menu"]._format_xai_official_block(account_key, detail=True)
+    assert "周额度: <i>上游未返回额度百分比</i>" in text
+    assert "0 / 0" not in text
+    assert "月额度" not in text
 
 
 def test_xai_channel_request_shape_and_provider_capabilities(m):

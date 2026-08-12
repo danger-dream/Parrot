@@ -1,7 +1,6 @@
 """xAI / Grok OAuth provider.
 
-This module mirrors the OAuth flow implemented by CLIProxyAPI's native xAI
-support:
+This module implements the xAI public OAuth flow:
   - issuer/discovery: https://auth.x.ai/.well-known/openid-configuration
   - public client id: b1a00492-073a-47ea-816f-4c329264a828
   - scopes: openid profile email offline_access grok-cli:access api:access
@@ -247,8 +246,8 @@ async def discover() -> dict:
 def pkce_generate() -> tuple[str, str]:
     """Return ``(code_verifier, code_challenge)`` for xAI OAuth.
 
-    CLIProxyAPI uses 96 random bytes for the verifier before base64url-no-pad,
-    which produces a 128 character verifier.
+    Use 96 random bytes before base64url-no-pad, producing a 128-character
+    verifier within the PKCE length limit.
     """
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(96)).rstrip(b"=").decode()
     digest = hashlib.sha256(verifier.encode()).digest()
@@ -279,7 +278,7 @@ def build_login_url(
         "state": state,
         "nonce": nonce,
         "plan": "generic",
-        "referrer": "cli-proxy-api",
+        "referrer": "parrot",
     }
     return f"{endpoint}?{urlencode(params)}"
 
@@ -536,17 +535,15 @@ def _history_items(raw_history: Any) -> list[dict[str, Any]]:
 
 def _mock_cli_billing_usage() -> dict:
     usage = empty_usage()
-    usage["openai"] = {"thirty_day": {"utilization": 0.0, "resets_at": None}}
     usage["xai"] = {
         "source": "mock",
         "quota_supported": True,
         "billing": {
-            "monthly_limit": 0,
-            "used": 0,
-            "remaining": None,
+            "period_type": None,
             "used_percent": None,
-            "billing_period_start": None,
-            "billing_period_end": None,
+            "remaining_percent": None,
+            "period_start": None,
+            "period_end": None,
         },
         "user": {"has_grok_code_access": True, "subscription_tier": "Mock"},
         "settings": {"allow_access": True, "subscription_tier_display": "Mock"},
@@ -557,10 +554,11 @@ def _mock_cli_billing_usage() -> dict:
 def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     """Fetch Grok CLI official billing/subscription snapshot.
 
-    Main quota signal comes from ``/v1/billing?format=auto-topup``.  The returned
-    structure keeps Claude/OpenAI-compatible empty windows, maps the monthly
-    credit utilization to ``openai.thirty_day`` for the shared quota monitor, and
-    stores the detailed xAI payload under ``xai`` for UI rendering.
+    The subscription quota signal comes from ``/v1/billing?format=credits``.
+    ``config.creditUsagePercent`` and ``config.currentPeriod`` are normalized
+    under ``xai.billing``; a weekly period is also exposed as the shared
+    ``seven_day`` window for quota monitoring.  Deprecated ``monthlyLimit`` /
+    ``used`` fields from auto-topup are not treated as subscription quota.
     """
     if _mock_mode_enabled():
         return _mock_cli_billing_usage()
@@ -591,23 +589,29 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     auto_cfg = auto.get("config") if isinstance(auto.get("config"), dict) else {}
     credits_cfg = credits.get("config") if isinstance(credits, dict) and isinstance(credits.get("config"), dict) else {}
 
-    monthly_limit = _num_val(auto_cfg.get("monthlyLimit") or auto_cfg.get("monthly_limit"))
-    used = _num_val(
+    # auto-topup has separate payment-cap semantics.  Its legacy monthlyLimit /
+    # used fields are intentionally not used as the subscription quota signal.
+    auto_top_up_limit = _num_val(auto_cfg.get("monthlyLimit") or auto_cfg.get("monthly_limit"))
+    auto_top_up_used = _num_val(
         auto_cfg.get("used")
         or auto_cfg.get("totalUsed")
         or auto_cfg.get("total_used")
         or auto_cfg.get("includedUsed")
         or auto_cfg.get("included_used")
     )
-    remaining = None
-    used_percent = None
-    if monthly_limit is not None and monthly_limit > 0 and used is not None:
-        remaining = max(0.0, monthly_limit - used)
-        used_percent = max(0.0, min(100.0, used / monthly_limit * 100.0))
 
-    period_start = auto_cfg.get("billingPeriodStart") or auto_cfg.get("billing_period_start")
-    period_end = auto_cfg.get("billingPeriodEnd") or auto_cfg.get("billing_period_end")
     current_period = credits_cfg.get("currentPeriod") if isinstance(credits_cfg.get("currentPeriod"), dict) else {}
+    period_type = str(current_period.get("type") or "").strip() or None
+    period_start = current_period.get("start")
+    period_end = current_period.get("end")
+    used_percent = _num_val(
+        credits_cfg.get("creditUsagePercent")
+        if credits_cfg.get("creditUsagePercent") is not None
+        else credits_cfg.get("credit_usage_percent")
+    )
+    if used_percent is not None:
+        used_percent = max(0.0, min(100.0, used_percent))
+    remaining_percent = None if used_percent is None else 100.0 - used_percent
 
     on_demand_cap = _num_val(auto_cfg.get("onDemandCap") or auto_cfg.get("on_demand_cap"))
     if on_demand_cap is None:
@@ -624,20 +628,20 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
         "source": "cli-chat-proxy",
         "quota_supported": True,
         "billing": {
-            "monthly_limit": _clean_num(monthly_limit),
-            "used": _clean_num(used),
-            "remaining": _clean_num(remaining),
+            "period_type": period_type,
             "used_percent": used_percent,
-            "billing_period_start": period_start,
-            "billing_period_end": period_end,
+            "remaining_percent": remaining_percent,
+            "period_start": period_start,
+            "period_end": period_end,
             "on_demand_cap": _clean_num(on_demand_cap),
             "on_demand_used": _clean_num(on_demand_used),
             "prepaid_balance": _clean_num(prepaid_balance),
             "is_unified_billing_user": credits_cfg.get("isUnifiedBillingUser"),
             "top_up_method": credits_cfg.get("topUpMethod"),
-            "credits_period_type": current_period.get("type") if isinstance(current_period, dict) else None,
-            "credits_period_start": current_period.get("start") if isinstance(current_period, dict) else None,
-            "credits_period_end": current_period.get("end") if isinstance(current_period, dict) else None,
+            "auto_top_up": {
+                "monthly_limit": _clean_num(auto_top_up_limit),
+                "used": _clean_num(auto_top_up_used),
+            },
             "history": _history_items(auto_cfg.get("history")),
         },
         "user": {
@@ -670,16 +674,16 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     if errors:
         xai["errors"] = errors
 
-    thirty_day = {}
-    if used_percent is not None:
-        thirty_day = {"utilization": used_percent, "resets_at": period_end}
+    weekly = {}
+    if period_type == "USAGE_PERIOD_TYPE_WEEKLY" and used_percent is not None:
+        weekly = {"utilization": used_percent, "resets_at": period_end}
 
     return {
         "five_hour": {},
-        "seven_day": {},
+        "seven_day": weekly,
         "seven_day_sonnet": {},
         "seven_day_opus": {},
-        "openai": {"thirty_day": thirty_day},
+        "openai": {"thirty_day": {}},
         "extra_usage": {"is_enabled": bool(on_demand_cap and on_demand_cap > 0)},
         "xai": xai,
     }

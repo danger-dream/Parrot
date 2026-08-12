@@ -198,6 +198,8 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
 class AttemptResult:
     outcome: str
     success: bool = False
+    # Narrow upstream account-protection fact; set only by typed OpenAI OAuth call sites.
+    openai_oauth_html_403: bool = False
     stream_started: bool = False
     response: Any = None
     http_status: Optional[int] = None
@@ -225,6 +227,8 @@ class AttemptResult:
     error_code: Optional[str] = None
     # Parsed upstream Retry-After value, bounded before it reaches retry sleeps.
     retry_after_seconds: Optional[float] = None
+    # Explicit epoch-millisecond cooldown derived only from an authoritative 429.
+    cooldown_until: Optional[int] = None
     usage: dict = field(default_factory=lambda: {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -546,6 +550,19 @@ def parse_retry_after_seconds(
     return max(0.0, min(delay, ceiling))
 
 
+def retry_after_cooldown_until(
+    value: Any,
+    *,
+    now_ts: float | None = None,
+) -> int | None:
+    """Convert a valid bounded Retry-After value to an epoch-ms deadline."""
+    base = time.time() if now_ts is None else float(now_ts)
+    delay = parse_retry_after_seconds(value, now_ts=base)
+    if delay is None:
+        return None
+    return int((base + delay) * 1000)
+
+
 _RETRYABLE_TRANSIENT_OUTCOMES = frozenset({
     "http_error",
     "upstream_error_json",
@@ -606,14 +623,15 @@ def _upstream_error_identity(result: AttemptResult) -> tuple[str, str, bool]:
 def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
     """Recognize only explicit account/billing exhaustion signals.
 
-    Generic 403/429 responses deliberately remain unclassified so their existing
-    OAuth refresh and retry behaviour is unchanged.
+    HTTP 402 is authoritative balance exhaustion. Generic 403/429 responses
+    deliberately remain unclassified so their existing OAuth refresh and retry
+    behaviour is unchanged.
     """
     try:
         status = int(getattr(result, "http_status", None) or 0)
     except (TypeError, ValueError):
         return None
-    if status not in (403, 429):
+    if status not in (402, 403, 429):
         return None
 
     detail = str(getattr(result, "error_detail", "") or "").strip()[:4000]
@@ -631,7 +649,7 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
                 message = str(error_obj.get("message") or obj.get("message") or detail)
     low = " ".join((error_type, error_code, message.lower(), detail.lower()))
 
-    matched = False
+    matched = status == 402
     if status == 429:
         matched = error_code in {
             "quota_exhausted",
@@ -678,8 +696,8 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
     if not matched:
         return None
     return {
-        "classification": "quota_exhausted",
-        "code": error_code or error_type,
+        "classification": "balance_exhausted" if status == 402 else "quota_exhausted",
+        "code": error_code or error_type or ("payment_required" if status == 402 else ""),
         "message": message,
     }
 
@@ -723,6 +741,26 @@ def is_retryable_overload_error(channel: Any, result: AttemptResult) -> bool:
     return retryable_transient_error_kind(channel, result) in {
         "openaiServerOverloaded", "claudeOverloaded", "xaiUnavailable",
     }
+
+
+def is_html_error_document(body: Any) -> bool:
+    """Return whether a readable body begins with an HTML document marker.
+
+    Provider/channel identity and HTTP status intentionally stay at call sites.
+    Content-Type is deliberately irrelevant: mislabeled JSON must not match and
+    HTML remains detectable when the header is absent or wrong.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            text = bytes(body).decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    elif isinstance(body, str):
+        text = body
+    else:
+        return False
+    prefix = text.lstrip("\ufeff\t\n\r\v\f ").casefold()
+    return prefix.startswith("<!doctype html") or prefix.startswith("<html")
 
 
 def failover_final_http_status(result: Any | None) -> int:
@@ -1014,6 +1052,13 @@ def _structured_request_invalid_error_info(
 
 
 def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
+    # Candidate-local guards retain their established alternate-candidate path.
+    if result.outcome in {"candidate_guard", "guard_error"}:
+        return result
+    # Authentication, payment, and rate-limit statuses are authoritative and
+    # cannot be stolen by generic body markers.
+    if result.http_status in {401, 402, 403, 429}:
+        return result
     request_error = _structured_request_invalid_error_info(result)
     if request_error is not None:
         result.error_code, result.error_detail = request_error
@@ -1030,9 +1075,11 @@ def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
                 context_detail,
             )
         return _mark_request_invalid(result, _request_invalid_status(result))
-    # Text-only compatibility recognizers are limited to status-less and client
-    # 4xx attempts.  In particular, ordinary 5xx messages never become request
-    # faults without an explicit structured code/type.
+    # Text-only compatibility recognizers are limited to status-less and the
+    # request-like HTTP statuses accepted above. Status alone is deliberately
+    # insufficient: 400/409/413/422 are all used by compatible upstreams for
+    # ambiguous channel/state/rate failures. In particular, ordinary 5xx
+    # messages never become request faults without an explicit structured marker.
     status = result.http_status
     text_classification_allowed = status is None or status in {200, 400, 409, 413, 422}
     if text_classification_allowed and is_invalid_encrypted_content_error(result.error_detail):

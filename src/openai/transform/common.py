@@ -476,6 +476,20 @@ def sse_done_chat() -> bytes:
     return b"data: [DONE]\n\n"
 
 
+def normalize_chat_reasoning_alias(body: Any) -> None:
+    """Canonicalize assistant ``reasoning`` strings at Chat ingress in place."""
+    if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+        return
+    for message in body["messages"]:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        canonical = message.get("reasoning_content")
+        alias = message.get("reasoning")
+        if not isinstance(canonical, str) and isinstance(alias, str):
+            message["reasoning_content"] = alias
+        message.pop("reasoning", None)
+
+
 # ─── usage 归一 ──────────────────────────────────────────────────
 #
 # 与 src/upstream.py 的 extract_usage_*_json 保持一致形状（4 键 anthropic 风味），

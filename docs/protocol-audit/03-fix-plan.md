@@ -377,7 +377,7 @@ async def test_round_trip_chat_upstream_responses_client():
 
 #### 5.2.3 Codex OAuth 回归
 
-`codex_oauth_transform.py` 不在审计重点，但 patch 3 会改 _flatten_tool —— 跑一下 sub2api 录的真实 fixture 防回归。
+`codex_oauth_transform.py` 不在审计重点，但 patch 3 会改 `_flatten_tool`，因此需要运行现有真实协议 fixture 防回归。
 
 ### 5.3 结合 spec 的合约测试
 

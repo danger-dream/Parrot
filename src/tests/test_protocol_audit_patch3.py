@@ -184,7 +184,7 @@ def test_guard_allows_max_tool_calls_when_routing_responses_to_chat(m):
     assert "max_tool_calls" not in out
 
 
-def test_guard_rejects_function_call_output_attachments_when_routing_responses_to_chat(m):
+def test_guard_allows_function_call_output_attachments_when_routing_responses_to_chat(m):
     g = m["guard"]
     body = {
         "model": "x",
@@ -195,11 +195,7 @@ def test_guard_rejects_function_call_output_attachments_when_routing_responses_t
         }],
     }
 
-    with pytest.raises(g.GuardError) as ei:
-        g.guard_responses_to_chat(body)
-
-    assert "function_call_output" in ei.value.message
-    assert "input_image" in ei.value.message
+    g.guard_responses_to_chat(body)
 
 
 def test_guard_rejects_input_file_url_when_routing_responses_to_chat(m):
@@ -330,7 +326,7 @@ def test_responses_custom_tool_call_output_text_parts_to_chat(m):
     assert tools[0].get("content") == "hello world"
 
 
-def test_guard_rejects_custom_tool_call_output_attachments_when_routing_responses_to_chat(m):
+def test_guard_allows_custom_tool_call_output_attachments_when_routing_responses_to_chat(m):
     g = m["guard"]
     body = {
         "model": "x",
@@ -341,11 +337,51 @@ def test_guard_rejects_custom_tool_call_output_attachments_when_routing_response
         }],
     }
 
-    with pytest.raises(g.GuardError) as ei:
-        g.guard_responses_to_chat(body)
+    g.guard_responses_to_chat(body)
 
-    assert "custom_tool_call_output" in ei.value.message
-    assert "input_image" in ei.value.message
+
+def test_guard_rejects_unknown_or_non_object_tool_output_parts(m):
+    g = m["guard"]
+    for part in ({"type": "future_part", "value": "x"}, "bare text", 7):
+        body = {"model": "x", "input": [{
+            "type": "function_call_output", "call_id": "c1", "output": [part],
+        }]}
+        with pytest.raises(g.GuardError):
+            g.guard_responses_to_chat(body)
+
+
+def test_custom_nonstream_responses_to_chat_preserves_order_and_finish_reason(m):
+    c2r = m["chat_to_responses"]
+    resp = {"id": "resp_1", "status": "completed", "output": [
+        {"type": "custom_tool_call", "id": "ctc_1", "call_id": "custom_1",
+         "name": "dsl", "input": "raw"},
+        {"type": "function_call", "id": "fc_1", "call_id": "function_1",
+         "name": "fn", "arguments": "{}"},
+    ]}
+    out = c2r.translate_response(resp, model="x")
+    choice = out["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"] == [
+        {"id": "custom_1", "type": "custom",
+         "custom": {"name": "dsl", "input": "raw"}},
+        {"id": "function_1", "type": "function",
+         "function": {"name": "fn", "arguments": "{}"}},
+    ]
+
+
+def test_custom_nonstream_chat_to_responses_preserves_content_and_call(m):
+    r2c = m["responses_to_chat"]
+    chat = {"choices": [{"finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": "prefix", "tool_calls": [{
+            "id": "custom_1", "type": "custom",
+            "custom": {"name": "dsl", "input": "raw"},
+        }],
+    }}]}
+    output = r2c.translate_response(chat, model="x")["output"]
+    assert [item["type"] for item in output] == ["message", "custom_tool_call"]
+    assert output[0]["content"][0]["text"] == "prefix"
+    assert output[1]["call_id"] == "custom_1"
+    assert output[1]["input"] == "raw"
 
 
 # ───────── #30 FunctionTool.strict 必填默认 ─────────

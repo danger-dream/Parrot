@@ -11,7 +11,7 @@
 - 入参完整解析 OpenAI 标准字段（JSON + multipart）
 - Grok Imagine 支持原生 ``n<=10``、URL/Base64 响应和最多 3 张编辑参考图
 - GPT/Codex 管线的 ``n>1`` 显式降为 1，响应里带 ``parrot_warning``
-- GPT/Codex 的 ``response_format=url`` 回填 data URL（同 sub2api）
+- GPT/Codex 的 ``response_format=url`` 回填 data URL
 - ``model``/``quality``/``background``/``output_format``/``moderation``/``style``/
   ``output_compression``/``partial_images``/``mask`` 透传到 image_generation tool
 - ``generate`` 入口收到 ``mask`` 时记录 warning 日志（mask 仅 edit 有意义）

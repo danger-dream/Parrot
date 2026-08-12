@@ -438,7 +438,7 @@ def translate_response(resp: dict, *, model: str) -> dict:
     """
     output = list(resp.get("output") or [])
     content_text = resp.get("output_text") or _gather_output_text(output)
-    tool_calls = _gather_function_calls(output)
+    tool_calls = _gather_tool_calls(output)
     refusal = _gather_refusal(output)
     reasoning_text = _gather_reasoning_summary(output)
     logprobs = _gather_logprobs(output)
@@ -509,20 +509,34 @@ def _gather_annotations(output: list) -> list[dict]:
     return out
 
 
-def _gather_function_calls(output: list) -> list[dict]:
+def _gather_tool_calls(output: list) -> list[dict]:
+    """Collect function/custom calls in Responses output order."""
     out: list[dict] = []
     for item in output:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type not in ("function_call", "custom_tool_call"):
             continue
         call_id = item.get("call_id") or item.get("id") or _gen_id("call_")
-        out.append({
-            "id": call_id,
-            "type": "function",
-            "function": {
-                "name": item.get("name") or "",
-                "arguments": item.get("arguments") or "",
-            },
-        })
+        if item_type == "custom_tool_call":
+            out.append({
+                "id": call_id,
+                "type": "custom",
+                "custom": {
+                    "name": item.get("name") or "",
+                    "input": item.get("input") or "",
+                },
+            })
+        else:
+            out.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": item.get("name") or "",
+                    "arguments": item.get("arguments") or "",
+                },
+            })
     return out
 
 

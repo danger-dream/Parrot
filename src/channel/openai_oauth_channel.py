@@ -1,7 +1,7 @@
 """OpenAI OAuth (Codex / ChatGPT) 渠道。
 
 对接 ChatGPT internal API `https://chatgpt.com/backend-api/codex/responses`。
-参考 sub2api 的 openai_gateway_service.buildUpstreamRequest（OAuth 分支）。
+实现 ChatGPT Codex OAuth 上游所需的请求转换、鉴权与响应处理。
 
 默认服务本家族入口（openai-chat / openai-responses）；Phase 8 起，当
 ProtocolMatrix 判定请求能力可安全表达时，也允许 Anthropic 入口先翻译成
@@ -31,6 +31,10 @@ from typing import Optional
 from .. import cache_hints, config, network, oauth_manager
 from ..providers import registry as provider_registry
 from ..openai import reasoning_replay
+from ..openai.codex_device_fingerprint import (
+    apply_device_fingerprint,
+    canonical_uuid4,
+)
 from ..openai.transform import (
     anthropic_to_responses,
     chat_to_responses,
@@ -75,7 +79,7 @@ def _provider_cfg() -> dict:
 def _isolate_session_id(api_key_name: str, raw: str) -> str:
     """把 api_key_name 混入 raw，防止不同 API Key 的会话粘性交叉污染。
 
-    与 sub2api isolateOpenAISessionID 语义等价：前缀 "k<key>:" + raw，
+    使用带 API Key 身份前缀的原始会话锚点，
     做 sha256 取前 16 hex 字符。我们用 sha256 而非 xxhash（无新依赖）。
     """
     if not raw:
@@ -218,6 +222,15 @@ class OpenAIOAuthChannel(Channel):
             account.get("workspace_id") or account.get("chatgpt_account_id") or ""
         )
         self.plan_type = str(account.get("plan_type") or "")
+        device_enabled = account.get("codexDeviceConvergenceEnabled") is not False
+        self.codex_device_installation_id = (
+            canonical_uuid4(account.get("codexDeviceInstallationId"))
+            if device_enabled else ""
+        )
+        if self.codex_device_installation_id and not self.chatgpt_account_id:
+            raise ValueError(
+                "codexDeviceInstallationId requires a nonempty OpenAI workspace/chatgpt account ID"
+            )
 
         # 账户 models 优先级：
         #   1) 账户 entry 自带 models（TG 面板里手动填的）
@@ -261,6 +274,7 @@ class OpenAIOAuthChannel(Channel):
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "responses",
+        defer_device_fingerprint: bool = False,
     ) -> UpstreamRequest:
         if ingress_protocol not in ("anthropic", "chat", "responses"):
             raise ValueError(
@@ -382,10 +396,48 @@ class OpenAIOAuthChannel(Channel):
             translator_ctx["codex_reasoning_replay"] = replay_scope
             translator_ctx["codex_reasoning_replay_injected"] = replay_injected
 
-        # Step E: 拿 access_token（会在此触发 refresh if 过期）
+        # Step E: 拿 access_token（会在此触发 refresh if 过期）。旧账号可能在
+        # 这次 refresh 中才首次取得 workspace，并由 oauth_manager 同事务生成设备
+        # UUID；当前 Channel 是 refresh 前的快照，因此必须重新读取已提交账户，
+        # 让第一条请求就使用新 workspace/device，而不是等下一次 registry 调度。
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        from .. import channel_state
+        current_account_key = self.account_key
+        resolved_channel_key = channel_state.resolve(self.key)
+        if resolved_channel_key.startswith("oauth:"):
+            current_account_key = resolved_channel_key[len("oauth:"):]
+        current_account = oauth_manager.get_account(current_account_key)
+        current_workspace_id = self.chatgpt_account_id
+        current_device_installation_id = self.codex_device_installation_id
+        if current_account is not None:
+            current_workspace_id = str(
+                current_account.get("workspace_id")
+                or current_account.get("chatgpt_account_id")
+                or ""
+            )
+            device_enabled = (
+                current_account.get("codexDeviceConvergenceEnabled") is not False
+            )
+            current_device_installation_id = (
+                canonical_uuid4(current_account.get("codexDeviceInstallationId"))
+                if device_enabled else ""
+            )
+            if current_device_installation_id and not current_workspace_id:
+                raise ValueError(
+                    "codexDeviceInstallationId requires a nonempty "
+                    "OpenAI workspace/chatgpt account ID"
+                )
+            # Deferred WS builders read the channel after this method returns.
+            # Refresh-derived identity must therefore update this live snapshot as
+            # well as the local HTTP variables, so the very first WS request is
+            # converged too.
+            self.chatgpt_account_id = current_workspace_id
+            self.workspace_id = current_workspace_id
+            self.codex_device_installation_id = current_device_installation_id
 
         headers = self._build_headers(access_token)
+        if current_workspace_id:
+            headers["chatgpt-account-id"] = current_workspace_id
         if codex_model_uses_responses_lite(payload.get("model") or resolved_model):
             headers[CODEX_RESPONSES_LITE_HEADER] = "true"
         # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
@@ -402,6 +454,20 @@ class OpenAIOAuthChannel(Channel):
 
         # Delete deprecated conversation_id header if present.
         headers.pop("conversation_id", None)
+
+        # Realtime calls _build_headers() directly, so installation identity is
+        # deliberately finalized here only for Codex Responses HTTP.  Applicability
+        # follows the final upstream transport, not the accepted ingress shape:
+        # responses, chat, and anthropic all reach the same HTTP endpoint here.
+        # WS paths defer until after their existing identity-confuse/session updates.
+        if (
+            current_device_installation_id
+            and not defer_device_fingerprint
+        ):
+            headers, payload = apply_device_fingerprint(
+                headers, payload, current_device_installation_id,
+                create_client_metadata=True,
+            )
 
         return UpstreamRequest(
             url=str(_provider_cfg().get("codexUpstreamUrl") or CODEX_UPSTREAM_URL),
@@ -423,7 +489,7 @@ class OpenAIOAuthChannel(Channel):
     async def probe_usage(self, *, timeout_s: float = 20.0) -> dict:
         """主动发一条最小 codex 请求，读响应头更新 Codex 用量 snapshot。
 
-        对齐 sub2api account_test_service 的做法：构造一个"hi" 级别的小请求，
+        构造一条最小请求，只读取响应头中的用量快照，
         拿到响应头即可 close 流，不等完整回复。响应头里的 x-codex-* 字段喂给
         state_db.quota_save_openai_snapshot，相当于"显式刷新一次用量"。
 

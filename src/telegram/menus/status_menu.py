@@ -224,8 +224,8 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                 "Opus": row.get("opus_util"),
             }
         elif provider == "xai":
-            # Grok/xAI: 官方 billing 月度额度百分比映射到通用 30d 列。
-            utils = {"月度": row.get("thirty_day_util")}
+            # Grok/xAI: 官方 weekly credits 映射到通用 7d 缓存列。
+            utils = {"周额度": row.get("seven_day_util")}
         else:
             continue
         hot = [(k, v) for k, v in utils.items() if v is not None and v >= threshold_pct]

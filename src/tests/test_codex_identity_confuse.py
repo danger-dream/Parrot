@@ -1,7 +1,7 @@
 """Codex Identity Confuse 单元测试。
 
 覆盖：
-- UUID 混淆算法与 CLIProxyAPI 对齐
+- UUID 混淆算法的确定性和命名空间
 - client_metadata 混淆
 - headers 混淆
 - turn-metadata JSON 内部字段混淆
@@ -73,12 +73,9 @@ class TestConfuseUUID:
         """value 为空时原样返回。"""
         assert _confuse_uuid("auth", "kind", "") == ""
 
-    def test_alignment_with_cpa(self):
-        """与 CLIProxyAPI 算法对齐验证：
-        name = "cli-proxy-api:codex:identity-confuse:{kind}:{auth_id}:{value}"
-        uuid5(NAMESPACE_OID, name)
-        """
-        name = "cli-proxy-api:codex:identity-confuse:installation:test-auth:test-install"
+    def test_parrot_namespace_contract(self):
+        """Parrot 命名空间必须稳定地参与 UUID5 派生。"""
+        name = "parrot:codex:identity-confuse:installation:test-auth:test-install"
         expected = str(uuid.uuid5(uuid.NAMESPACE_OID, name))
         actual = _confuse_uuid("test-auth", "installation", "test-install")
         assert actual == expected

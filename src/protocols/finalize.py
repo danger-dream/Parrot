@@ -156,12 +156,19 @@ def apply_error_health_effects(
     model: str,
     error_detail: str | None = None,
     connect_ms: int | None = None,
+    cooldown_until: int | None = None,
 ) -> None:
     """Apply error scorer/cooldown effects for a precomputed plan."""
     if plan.record_cooldown_error:
         _run_health_effect(
             "record_cooldown_error",
-            lambda: cooldown.record_error(channel_key, model, error_detail),
+            lambda: (
+                cooldown.record_error(
+                    channel_key, model, error_detail, cooldown_until=cooldown_until,
+                )
+                if cooldown_until is not None
+                else cooldown.record_error(channel_key, model, error_detail)
+            ),
         )
     if plan.record_failure:
         _run_health_effect(

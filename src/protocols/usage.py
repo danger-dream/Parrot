@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Callable
 
 
 _MAX_USAGE_INTEGER = (1 << 63) - 1
@@ -60,6 +60,46 @@ def _strict_fields(usage_obj: Any, names: tuple[str, ...]) -> tuple[dict[str, in
 
 CACHE_CREATION_5M_KEY = "cache_creation_5m"
 CACHE_CREATION_1H_KEY = "cache_creation_1h"
+
+
+def openai_envelope_containers(obj: Any) -> tuple[dict, ...]:
+    """Return OpenAI envelope containers in authoritative precedence order."""
+    if not isinstance(obj, dict):
+        return ()
+    containers = [obj]
+    response = obj.get("response")
+    if isinstance(response, dict):
+        containers.append(response)
+    data = obj.get("data")
+    if isinstance(data, dict):
+        containers.append(data)
+        data_response = data.get("response")
+        if isinstance(data_response, dict):
+            containers.append(data_response)
+    return tuple(containers)
+
+
+def select_openai_usage(
+    obj: Any,
+    validator: Callable[[Any], tuple[bool, bool]],
+) -> tuple[dict | None, bool]:
+    """Select one whole usage object without cross-envelope field merging.
+
+    ``validator`` returns ``(observed, valid)``. Malformed higher-priority
+    candidates fall through; invalid is reported only when no valid/observed
+    candidate exists and at least one candidate was malformed.
+    """
+    saw_invalid = False
+    for container in openai_envelope_containers(obj):
+        if "usage" not in container:
+            continue
+        usage = container.get("usage")
+        observed, valid = validator(usage)
+        if observed and valid and isinstance(usage, dict):
+            return usage, False
+        if not valid:
+            saw_invalid = True
+    return None, saw_invalid
 
 
 def anthropic_cache_creation_split(usage_obj: Any) -> tuple[int, int] | None:
@@ -264,6 +304,7 @@ class UsageAccumulator:
         if cached > prompt_total:
             self._reject()
             return
+        self.usage_invalid = False
         self.usage = Usage(
             input_tokens=prompt_total - cached,
             output_tokens=parsed.get(output_name, 0),
@@ -314,29 +355,32 @@ def legacy_usage_from_anthropic_json(obj: Any) -> dict[str, int]:
     return result
 
 
+def _select_usage_with_accumulator(obj: Any, setter_name: str) -> UsageAccumulator:
+    def validate(candidate: Any) -> tuple[bool, bool]:
+        trial = UsageAccumulator()
+        getattr(trial, setter_name)(candidate)
+        return trial.usage_observed, not trial.usage_invalid
+
+    selected, invalid = select_openai_usage(obj, validate)
+    acc = UsageAccumulator()
+    if selected is not None:
+        getattr(acc, setter_name)(selected)
+    elif invalid:
+        acc._reject()
+    return acc
+
+
+def select_openai_chat_usage(obj: Any) -> UsageAccumulator:
+    return _select_usage_with_accumulator(obj, "set_from_openai_chat_usage")
+
+
+def select_openai_responses_usage(obj: Any) -> UsageAccumulator:
+    return _select_usage_with_accumulator(obj, "set_from_openai_responses_usage")
+
+
 def legacy_usage_from_openai_chat_json(obj: Any) -> dict[str, int]:
-    usage = obj.get("usage") if isinstance(obj, dict) else None
-    usage = usage if isinstance(usage, dict) else {}
-    details = usage.get("prompt_tokens_details") or {}
-    cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
-    prompt = _to_int(usage.get("prompt_tokens"))
-    return {
-        "input_tokens": max(0, prompt - cached),
-        "output_tokens": _to_int(usage.get("completion_tokens")),
-        "cache_creation": 0,
-        "cache_read": cached,
-    }
+    return select_openai_chat_usage(obj).legacy_dict()
 
 
 def legacy_usage_from_openai_responses_json(obj: Any) -> dict[str, int]:
-    usage = obj.get("usage") if isinstance(obj, dict) else None
-    usage = usage if isinstance(usage, dict) else {}
-    details = usage.get("input_tokens_details") or {}
-    cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
-    prompt = _to_int(usage.get("input_tokens"))
-    return {
-        "input_tokens": max(0, prompt - cached),
-        "output_tokens": _to_int(usage.get("output_tokens")),
-        "cache_creation": 0,
-        "cache_read": cached,
-    }
+    return select_openai_responses_usage(obj).legacy_dict()

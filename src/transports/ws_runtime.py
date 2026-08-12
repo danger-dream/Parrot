@@ -137,6 +137,7 @@ class ResponsesWsReadStep:
     event_type: str = ""
     outcome: str | None = None
     error_detail: str = ""
+    error_code: Optional[str] = None
     http_status: Optional[int] = None
     skip_downstream: bool = False
     response_completed: bool = False
@@ -420,12 +421,18 @@ async def read_until_first_responses_ws_visible_event(
             if timing is not None:
                 timing.mark_io_complete()
             close_code = int(exc.rcvd.code if exc.rcvd else 1000)
-            result.outcome = (
-                connection_lifecycle_outcome(exc, ws_close_code=close_code)
-                or "upstream_closed"
-            )
-            result.http_status = None
-            result.error_detail = f"upstream websocket closed: {exc}"
+            if close_code == 1009:
+                result.outcome = "request_invalid"
+                result.http_status = 413
+                result.error_code = "message_too_big"
+                result.error_detail = "upstream rejected request: message too big"
+            else:
+                result.outcome = (
+                    connection_lifecycle_outcome(exc, ws_close_code=close_code)
+                    or "upstream_closed"
+                )
+                result.http_status = None
+                result.error_detail = f"upstream websocket closed: {exc}"
             result.close_code = close_code
             result.close_reason = str(exc.rcvd.reason if exc.rcvd else "")
             return result
@@ -575,6 +582,15 @@ async def read_next_responses_ws_step(
                 response_failed=True,
                 close_code=close_code,
                 close_reason=close_reason,
+            )
+        if close_code == 1009:
+            return ResponsesWsReadStep(
+                outcome="request_invalid",
+                error_detail="upstream rejected request: message too big",
+                error_code="message_too_big",
+                http_status=413,
+                close_code=close_code,
+                close_reason=close_reason[:123],
             )
         detail = closed_error_detail if closed_error_detail is not None else f"upstream websocket closed: {exc}"
         return ResponsesWsReadStep(

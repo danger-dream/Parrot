@@ -23,11 +23,11 @@
   - `input[]` 里的 role=system 消息提取到 `instructions`（上游 input 不接受
     system role）
 
-工具调用续链现在按 sub2api 的 OAuth transform 做最小兼容：过滤 store=false
-上游无法解析的 reasoning/item_reference/id，规范化 call_id 与 tool_choice，避免
+工具调用续链会过滤 store=false 上游无法解析的 reasoning/item_reference/id，
+并规范化 call_id 与 tool_choice，避免
 ChatGPT internal Codex endpoint 把本地响应 ID 当成持久化引用去查。
 
-历史：早期版本（v0.4.x ~ v0.5.x）从 sub2api 移植了一张 _CODEX_MODEL_MAP 翻译表，
+历史：早期版本（v0.4.x ~ v0.5.x）维护过一张 _CODEX_MODEL_MAP 翻译表，
 把各种别名（gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等）映射到上游规范名，
 并带了"未识别名字 → 降级成 gpt-5.1"的兜底。v0.6.x 起移除：
   1) Parrot 的 channel 层已经用账号 `models` + `defaultModels` 做了白名单，
@@ -45,7 +45,7 @@ from typing import Any
 from ..codex_constants import codex_model_uses_responses_lite
 
 
-# ─── 默认 instructions（仅一行，与 sub2api applyInstructions 对齐）──
+# ─── 默认 instructions（仅在请求未提供有效文本时兜底）─────────────
 
 _DEFAULT_INSTRUCTIONS = "You are a helpful coding assistant."
 
@@ -182,13 +182,13 @@ def _normalize_codex_tools(body: dict) -> bool:
     """把 chat-style `{type:"function", function:{name,...}}` 拍平为 Responses-style
     `{type:"function", name, parameters, ...}`（顶层字段）。
 
-    移植自 sub2api openai_codex_transform.go:normalizeCodexTools。原因：codex
-    endpoint 走 Responses API 协议，工具定义必须是顶层 name/parameters；若收到
+    Codex endpoint 使用 Responses API 工具结构，定义必须是顶层
+    name/parameters；若收到
     ChatCompletions 历史格式会 400。本函数在 transform 末尾统一做一次，不管
     下游走哪条 ingress 都兜底。
 
-    返回是否动过 body。副作用：丢弃无效的 function tool（hasFunction 为假且
-    顶层无 name 的条目），这与 sub2api 行为一致。
+    返回是否动过 body。副作用：丢弃既没有顶层 name、也没有合法 function
+    对象的无效 function tool。
     """
     raw_tools = body.get("tools")
     if not isinstance(raw_tools, list):
@@ -213,7 +213,7 @@ def _normalize_codex_tools(body: dict) -> bool:
         # ChatCompletions-style：{type:"function", function:{name, parameters, ...}}
         function_obj = tool.get("function")
         if not isinstance(function_obj, dict):
-            # 既无顶层 name 又无 function 对象 → 丢弃（与 sub2api 一致）
+            # 既无顶层 name 又无 function 对象，无法表达有效工具，直接丢弃。
             modified = True
             continue
         # 把 function.* 拍平到顶层（不覆盖已有的顶层同名字段）
@@ -634,7 +634,7 @@ def apply_codex_oauth_transform(
     # 5.5) store=false 兼容：过滤 reasoning/item_reference/id，规范化 call_id。
     _normalize_codex_input(body)
 
-    # 6) instructions 兜底（sub2api 行为：空 → 一行 fallback）
+    # 6) instructions 为空时注入一行稳定的兜底文本。
     if _is_empty_str(body.get("instructions")):
         body["instructions"] = (
             default_instructions.strip()

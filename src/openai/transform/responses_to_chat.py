@@ -388,7 +388,10 @@ def _input_items_to_messages(items: list) -> list:
                     continue
                 if bridge:
                     msg_out["reasoning_content"] = bridge_text or ""
-                messages.append(msg_out)
+                # Keep the assistant message pending so immediately following
+                # function/custom calls remain in the same Chat assistant turn.
+                # Any intervening message/tool-output item flushes it below.
+                pending_assistant = msg_out
             else:
                 # 非 assistant 的 message（user/system/tool）跳轮新上下文，
                 # 丢弃残留的 reasoning（避免给下一次 assistant 带上上轮的思考）
@@ -486,6 +489,12 @@ def _flatten_function_call_output(output) -> str:
     if isinstance(output, str):
         return output
     if isinstance(output, list):
+        # Chat tool messages cannot represent Responses image/file parts as
+        # multimodal content.  Preserve the complete legal Responses value in
+        # a deterministic JSON string instead of silently dropping structure.
+        if any(isinstance(p, dict) and p.get("type") in ("input_image", "input_file")
+               for p in output):
+            return json.dumps(output, ensure_ascii=False, separators=(",", ":"))
         parts: list[str] = []
         for p in output:
             if isinstance(p, dict):
@@ -494,7 +503,6 @@ def _flatten_function_call_output(output) -> str:
                     txt = p.get("text")
                     if isinstance(txt, str):
                         parts.append(txt)
-                # 其他 part type（image/file）丢失文本表示，跳过
             elif isinstance(p, str):
                 parts.append(p)
         return "".join(parts)
@@ -667,15 +675,27 @@ def translate_response(chat: dict, *, model: str,
             "content": [refusal_part],
         })
 
-    # tool_calls → function_call items
+    # tool_calls → function/custom call items
     for tc in msg.get("tool_calls") or []:
         if not isinstance(tc, dict):
+            continue
+        call_id = tc.get("id") or _gen_id("call_")
+        if tc.get("type") == "custom":
+            custom = tc.get("custom") or {}
+            output_items.append({
+                "type": "custom_tool_call",
+                "id": _gen_id("ctc_"),
+                "call_id": call_id,
+                "name": custom.get("name") or "",
+                "input": custom.get("input") or "",
+                "status": "completed",
+            })
             continue
         fn = tc.get("function") or {}
         output_items.append({
             "type": "function_call",
             "id": _gen_id("fc_"),
-            "call_id": tc.get("id") or _gen_id("call_"),
+            "call_id": call_id,
             "name": fn.get("name") or "",
             "arguments": fn.get("arguments") or "",
             "status": "completed",

@@ -425,8 +425,8 @@ def prepare_openai_responses_local_web_tools(body: dict[str, Any] | None) -> boo
       named ``web_search`` so any upstream model can request it; Parrot then runs
       AnySearch and appends ``function_call_output`` items.
     * ``tool_search`` is preserved for Codex-native routing. ``image_generation``
-      is still dropped à la CLIProxyAPI's xAI normalizer: it is not web search
-      and is not safe to forward to arbitrary upstreams.
+      is dropped because it is not web search and isn't safe to forward to
+      arbitrary upstreams.
 
     Returns True when a web_search tool was converted and a local web loop should
     be active for the request.

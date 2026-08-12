@@ -70,6 +70,17 @@
     }
   ],
 
+  // OpenAI OAuth workspace 账户的 Codex device-only 收敛默认开启：
+  // "codexDeviceInstallationId": "123e4567-e89b-42d3-a456-426614174000",
+  // "codexDeviceConvergenceEnabled": false  // 仅显式退出时配置
+  // 启动迁移及新账户原子写入会为已知 workspace_id/chatgpt_account_id 的账户
+  // 生成并持久化随机规范 RFC4122 UUIDv4；同 workspace 重导入/刷新保留它。
+  // 显式 false 会保留已有 UUID 以便可逆重启用；缺少 workspace 的账户不参与。
+  // 缺失或空 UUID 在默认开启状态下都会生成；唯一关闭方式是显式 false。
+  // 其他无效 UUID fail-closed，不静默重生成。
+  // 该值仅作用于既有冻结的 Codex Responses installation carriers，
+  // 不扩展到 session/full 或非 OpenAI OAuth 渠道。
+
   // ─── 第三方 API 渠道列表 ───
   "channels": [
     {

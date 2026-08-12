@@ -38,6 +38,7 @@ from .. import (
 )
 from ..channel.base import Channel, UpstreamRequest
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
+from .codex_device_fingerprint import apply_device_fingerprint
 from .codex_identity_confuse import (
     ConfuseState,
     confuse_client_metadata,
@@ -54,7 +55,9 @@ from ..protocols.runtime import (
     format_responses_ws_error,
     is_responses_ws_visible_event_type,
     is_retryable_responses_ws_error_before_accept,
+    is_html_error_document,
     parse_retry_after_seconds,
+    retry_after_cooldown_until,
     parse_wrapped_responses_ws_error,
     recovery_retry_allowed,
     responses_ws_http_status_from_attempt,
@@ -129,12 +132,15 @@ _WsProxyBytes = WsProxyBytes
 class _WsAttemptResult:
     ok: bool = False
     connected: bool = False
+    # Narrow typed OpenAI OAuth upstream account-protection fact.
+    openai_oauth_html_403: bool = False
     closed_after_accept: bool = False
     outcome: str = "transport_error"
     error_detail: str = ""
     error_code: Optional[str] = None
     http_status: Optional[int] = None
     retry_after_seconds: Optional[float] = None
+    cooldown_until: Optional[int] = None
     round_id: Optional[str] = None
     connect_ms: Optional[int] = None
     first_byte_ms: Optional[int] = None
@@ -230,6 +236,8 @@ def _retry_after_from_headers(headers: Any) -> float | None:
 def _attach_ws_retry_after(result: _WsAttemptResult, headers: Any) -> _WsAttemptResult:
     if result.retry_after_seconds is None:
         result.retry_after_seconds = _retry_after_from_headers(headers)
+    if result.http_status == 429 and result.retry_after_seconds is not None:
+        result.cooldown_until = retry_after_cooldown_until(result.retry_after_seconds)
     return result
 
 
@@ -708,6 +716,7 @@ async def _run_ws_failover(
     retry_count = 0
     attempt_order = 0
     last_result: Optional[_WsAttemptResult] = None
+    failed_candidate_statuses: list[int] = []
     last_ch: Optional[Channel] = None
     last_model: Optional[str] = None
     accepted = websocket.application_state == WebSocketState.CONNECTED
@@ -792,8 +801,17 @@ async def _run_ws_failover(
             return accepted
         if result.outcome == "request_invalid":
             msg = result.error_detail or protocol_errors.responses_max_output_context_error_message()
-            await _send_context_length_error_frame(websocket, msg)
-            await _close_downstream(websocket, 4400, _trim_reason(msg))
+            if result.http_status == 413:
+                await _send_request_invalid_error_frame(
+                    websocket, msg, code="message_too_big",
+                )
+            else:
+                await _send_context_length_error_frame(websocket, msg)
+            await _close_downstream(
+                websocket,
+                _ws_close_code_for_http(int(result.http_status or 400)),
+                _trim_reason(msg),
+            )
             if not result.request_finalized:
                 await _finalize_ws_attempt_after_accept(
                     result, ch, resolved_model, request_id, retry_count,
@@ -805,6 +823,7 @@ async def _run_ws_failover(
             recovery_retry_allowed("oauthRefresh", cfg)
             and ch.type == "oauth"
             and result.http_status in (401, 403)
+            and not result.openai_oauth_html_403
             and ch.key not in refreshed_once
         ):
             refreshed_once.add(ch.key)
@@ -855,15 +874,23 @@ async def _run_ws_failover(
                 )
                 continue
 
-        finalize_policy.apply_error_health_effects(
-            finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
-            scorer=scorer,
-            cooldown=cooldown,
-            channel_key=ch.key,
-            model=resolved_model,
-            error_detail=result.error_detail,
-            connect_ms=result.connect_ms,
+        # Same-candidate OAuth/transient retries reach this point only once, so
+        # the terminal aggregate counts actual failed candidates rather than
+        # transport rounds. Zero denotes the narrow generic HTML403 marker.
+        failed_candidate_statuses.append(
+            0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
         )
+        if not result.openai_oauth_html_403:
+            finalize_policy.apply_error_health_effects(
+                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                scorer=scorer,
+                cooldown=cooldown,
+                channel_key=ch.key,
+                model=resolved_model,
+                error_detail=result.error_detail,
+                connect_ms=result.connect_ms,
+                cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
+            )
         retry_count += 1
         idx += 1
 
@@ -956,23 +983,37 @@ async def _run_ws_failover(
                         result.error_detail
                         or protocol_errors.responses_max_output_context_error_message()
                     )
-                    await _send_context_length_error_frame(websocket, msg)
-                    await _close_downstream(websocket, 4400, _trim_reason(msg))
+                    if result.http_status == 413:
+                        await _send_request_invalid_error_frame(
+                            websocket, msg, code="message_too_big",
+                        )
+                    else:
+                        await _send_context_length_error_frame(websocket, msg)
+                    await _close_downstream(
+                        websocket,
+                        _ws_close_code_for_http(int(result.http_status or 400)),
+                        _trim_reason(msg),
+                    )
                     if not result.request_finalized:
                         await _finalize_ws_attempt_after_accept(
                             result, ch, resolved_model, request_id, retry_count,
                             affinity_hit, start_time, start_monotonic,
                         )
                     return accepted
-                finalize_policy.apply_error_health_effects(
-                    finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
-                    scorer=scorer,
-                    cooldown=cooldown,
-                    channel_key=ch.key,
-                    model=resolved_model,
-                    error_detail=result.error_detail,
-                    connect_ms=result.connect_ms,
+                failed_candidate_statuses.append(
+                    0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
                 )
+                if not result.openai_oauth_html_403:
+                    finalize_policy.apply_error_health_effects(
+                        finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                        scorer=scorer,
+                        cooldown=cooldown,
+                        channel_key=ch.key,
+                        model=resolved_model,
+                        error_detail=result.error_detail,
+                        connect_ms=result.connect_ms,
+                        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
+                    )
                 retry_count += 1
             else:
                 msg = f"All candidate channels saturated; queue wait {queue_wait_s:.0f}s timed out."
@@ -986,7 +1027,15 @@ async def _run_ws_failover(
                 return accepted
 
     err = (last_result.error_detail if last_result else "no candidates") or "unknown"
-    http_status = _http_status_from_ws_outcome(last_result)
+    http_status = _aggregate_failed_candidate_status(failed_candidate_statuses)
+    all_html403 = bool(failed_candidate_statuses) and set(failed_candidate_statuses) == {0}
+    downstream_message = (
+        "Upstream candidates failed"
+        if all_html403
+        else _safe_terminal_failure_message(
+            http_status, attempted=bool(failed_candidate_statuses),
+        )
+    )
     await asyncio.to_thread(
         log_db.finish_error,
         request_id, err[:4000], retry_count,
@@ -1010,7 +1059,10 @@ async def _run_ws_failover(
         proxy_bytes_up=(last_result.proxy_bytes.up if last_result else None),
         proxy_bytes_down=(last_result.proxy_bytes.down if last_result else None),
     )
-    await _close_downstream(websocket, _ws_close_code_for_http(http_status), err)
+    await _send_terminal_error_frame(websocket, downstream_message, http_status)
+    await _close_downstream(
+        websocket, _ws_close_code_for_http(http_status), downstream_message,
+    )
     return accepted
 
 
@@ -1530,6 +1582,11 @@ async def _try_ws_channel(
                 outcome="http_auth_error" if status in (401, 403) else "http_error",
                 error_detail=detail,
                 http_status=status or None,
+                openai_oauth_html_403=(
+                    isinstance(ch, OpenAIOAuthChannel)
+                    and status == 403
+                    and is_html_error_document(getattr(invalid_response, "body", None))
+                ),
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
                 upstream_protocol=ch_proto,
@@ -1566,6 +1623,10 @@ async def _try_ws_channel(
         if connector is not None and last_error is not None:
             connector.stats.total_failures += 1
             connector.stats.last_error = (last_error.error_detail or last_error.outcome)[:200]
+        # A typed HTML403 advances the outer candidate exactly once; don't
+        # repeat the same account over another proxy route.
+        if last_error is not None and last_error.openai_oauth_html_403:
+            return last_error
         # Once a create frame may have left Parrot, retrying another proxy route
         # would create a second billable upstream request under one ledger row.
         if last_error is not None and route_state["dispatched"]:
@@ -1706,6 +1767,7 @@ async def _try_sse_channel(
             error_detail=error.error_detail,
             error_code=error.error_code,
             http_status=error.http_status,
+            openai_oauth_html_403=error.openai_oauth_html_403,
             retry_after_seconds=error.retry_after_seconds,
             round_id=error.round_id,
             connect_ms=error.connect_ms,
@@ -1839,6 +1901,11 @@ async def _try_sse_channel(
             outcome=outcome,
             error_detail=f"HTTP {status}: {detail}"[:2000],
             http_status=status,
+            openai_oauth_html_403=(
+                isinstance(ch, OpenAIOAuthChannel)
+                and status == 403
+                and is_html_error_document(body_bytes)
+            ),
             response_text=response_text,
             proxy_name=opened.proxy_name,
             proxy_bytes=proxy_bytes,
@@ -1972,6 +2039,7 @@ async def _try_sse_channel(
                 model=resolved_model,
                 error_detail=result.error_detail,
                 connect_ms=result.connect_ms,
+                cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
             )
             await await_ws_owned(asyncio.to_thread(
                 log_db.finish_error,
@@ -2366,6 +2434,11 @@ async def _relay_ws_session(
             _identity_confuse_state = ConfuseState(
                 enabled=True, auth_id=api_key_name,
             )
+        downstream_header_installation = str(
+            (translator_ctx or {}).get("_codex_downstream_installation_id") or ""
+        ).strip()
+        if downstream_header_installation and not _identity_confuse_state.original_installation_id:
+            _identity_confuse_state.original_installation_id = downstream_header_installation
     identity_session["state"] = _identity_confuse_state
 
     def _apply_identity_confuse_to_frame(obj: dict) -> dict:
@@ -2497,6 +2570,7 @@ async def _relay_ws_session(
                 model=resolved_model,
                 error_detail=result.error_detail,
                 connect_ms=result.connect_ms,
+                cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
             )
             await await_ws_owned(asyncio.to_thread(
                 log_db.finish_error,
@@ -2535,6 +2609,14 @@ async def _relay_ws_session(
     try:
         first_upstream_obj = _map_ws_create_frame_for_upstream(first_obj, resolved_model, channel=ch)
         first_upstream_obj = _apply_identity_confuse_to_frame(first_upstream_obj)
+        installation_id = str(getattr(ch, "codex_device_installation_id", "") or "")
+        if installation_id:
+            _identity_confuse_state.override_installation_for_upstream(installation_id)
+            identity_session["state"] = _identity_confuse_state
+            _, first_upstream_obj = apply_device_fingerprint(
+                {}, first_upstream_obj, installation_id,
+                create_client_metadata=True,
+            )
         log_db.update_pending_fast_mode_from_upstream(request_id, first_upstream_obj)
         payload_to_send: str | bytes = _dump_frame(first_upstream_obj)
         if retry_attempt_id is not None:
@@ -2731,11 +2813,21 @@ async def _relay_ws_session(
                 return
             if step.outcome == "request_invalid":
                 result.outcome = "request_invalid"
-                result.http_status = 400
+                result.http_status = int(step.http_status or 400)
+                result.error_code = step.error_code
                 result.error_detail = step.error_detail or protocol_errors.responses_max_output_context_error_message()
-                await _send_context_length_error_frame(websocket, result.error_detail)
+                if result.http_status == 413:
+                    await _send_request_invalid_error_frame(
+                        websocket, result.error_detail, code="message_too_big",
+                    )
+                else:
+                    await _send_context_length_error_frame(websocket, result.error_detail)
                 if close_downstream_on_terminal:
-                    await _close_downstream(websocket, 4400, _trim_reason(result.error_detail))
+                    await _close_downstream(
+                        websocket,
+                        _ws_close_code_for_http(result.http_status),
+                        _trim_reason(result.error_detail),
+                    )
                 return
             if step.data is not None and not step.skip_downstream:
                 await _send_downstream(websocket, step.data)
@@ -2814,7 +2906,10 @@ async def _build_ws_upstream_request(
     if isinstance(ch, OpenAIOAuthChannel):
         # Reuse the OAuth channel's Codex transform/header logic. This returns
         # an HTTP UpstreamRequest; for WS we only need its URL base + headers.
-        req = await ch.build_upstream_request(body, resolved_model, ingress_protocol="responses")
+        req = await ch.build_upstream_request(
+            body, resolved_model, ingress_protocol="responses",
+            defer_device_fingerprint=True,
+        )
         ws_url = _http_url_to_ws(req.url)
         headers = _merge_ws_headers(req.headers, websocket)
         # Codex WebSocket uses the same session/thread identity header names as
@@ -2851,7 +2946,20 @@ async def _build_ws_upstream_request(
             # Codex CLI only sends session-id / thread-id (hyphenated).
             for _ck in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
                 del headers[_ck]
-        return UpstreamRequest(url=ws_url, headers=headers, body=b"", translator_ctx=req.translator_ctx)
+        installation_id = str(getattr(ch, "codex_device_installation_id", "") or "")
+        translator_ctx = dict(req.translator_ctx or {})
+        downstream_installation = ""
+        for key, value in websocket.headers.items():
+            if str(key).lower() == "x-codex-installation-id":
+                downstream_installation = str(value).strip()
+                break
+        if downstream_installation:
+            translator_ctx["_codex_downstream_installation_id"] = downstream_installation
+        if installation_id:
+            headers, _ = apply_device_fingerprint(
+                headers, None, installation_id, create_client_metadata=False,
+            )
+        return UpstreamRequest(url=ws_url, headers=headers, body=b"", translator_ctx=translator_ctx)
 
     # Third-party OpenAI Responses API channel. Only same-protocol channels are
     # valid here; chat upstream cannot speak Responses WS.
@@ -2981,6 +3089,7 @@ async def _finalize_ws_attempt_after_accept(
         model=resolved_model,
         error_detail=result.error_detail,
         connect_ms=result.connect_ms,
+        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
     )
     await asyncio.shield(asyncio.to_thread(
         log_db.finish_error,
@@ -3122,6 +3231,31 @@ async def _send_context_length_error_frame(websocket: WebSocket, message: str) -
     )
 
 
+async def _send_terminal_error_frame(
+    websocket: WebSocket, message: str, http_status: int,
+) -> None:
+    if websocket.application_state == WebSocketState.DISCONNECTED:
+        return
+    error_type = (
+        "authentication_error" if http_status == 401 else
+        "permission_error" if http_status == 403 else
+        "payment_required" if http_status == 402 else
+        "rate_limit_error" if http_status == 429 else
+        "api_error"
+    )
+    try:
+        await _send_downstream(websocket, _dump_frame({
+            "type": "error",
+            "code": error_type,
+            "message": message,
+            "param": None,
+            "sequence_number": 0,
+            "error_type": error_type,
+        }))
+    except Exception:
+        pass
+
+
 async def _close_downstream(websocket: WebSocket, code: int, reason: str = "") -> None:
     if websocket.application_state == WebSocketState.DISCONNECTED:
         return
@@ -3227,6 +3361,36 @@ def _invalid_status_detail(exc: InvalidStatus) -> str:
 
 def _http_status_from_ws_outcome(result: Optional[_WsAttemptResult]) -> int:
     return responses_ws_http_status_from_attempt(result)
+
+
+def _aggregate_failed_candidate_status(statuses: list[int]) -> int:
+    """Apply finite terminal rules; zero is the narrow HTML403 generic marker."""
+    if not statuses:
+        return 503
+    if set(statuses) == {0}:
+        return 403
+    unique = {status for status in statuses if status != 0}
+    if unique == {401}:
+        return 401
+    if unique <= {401, 403}:
+        return 403
+    if unique == {402}:
+        return 402
+    if unique == {429}:
+        return 429
+    return 503
+
+
+def _safe_terminal_failure_message(http_status: int, *, attempted: bool) -> str:
+    if not attempted:
+        return "No upstream candidates are available"
+    summaries = {
+        401: "All upstream candidates rejected authentication",
+        402: "All upstream candidates reported insufficient balance",
+        403: "All upstream candidates denied permission",
+        429: "All upstream candidates are rate limited",
+    }
+    return summaries.get(http_status, "Upstream candidates failed")
 
 
 def _ws_close_code_for_http(status: int) -> int:

@@ -587,7 +587,7 @@ def test_openai_workspace_key_migration_skips_ambiguous_email(m):
 # ==============================================================
 # flatten_usage 单位透传（2026-04-20 朋友反馈的 1%→100% bug 防回退）
 #
-# 参考实现：sub2api backend/internal/service/account_usage_service.go::buildUsageInfo
+# 上游账户用量的百分比字段应保持 0..100 单位。
 # （line 1208: Utilization: resp.FiveHour.Utilization 直接透传）。
 # Anthropic /api/oauth/usage JSON body 返回的 utilization 已经是 0..100 百分比，
 # 不应再做任何 × 100 或启发式单位换算。
@@ -607,8 +607,8 @@ def test_flatten_usage_one_percent_stays_one_percent(m):
     print("  [PASS] flatten_usage: 1.0 stays 1% (not 100%)")
 
 
-def test_flatten_usage_matches_sub2api_typical_values(m):
-    """对齐 sub2api 产线实际值：5.0 → 5%、65.2 → 65.2%、99.9 → 99.9%。"""
+def test_flatten_usage_preserves_percentage_units(m):
+    """百分比值按 0..100 单位透传：5.0 → 5%，65.2 → 65.2%。"""
     for input_util, expected in [(5.0, 5.0), (65.2, 65.2), (99.9, 99.9)]:
         out = m["oauth_manager"].flatten_usage({
             "five_hour": {"utilization": input_util, "resets_at": "x"},
@@ -757,9 +757,9 @@ def main():
         test_openai_workspace_key_migration_unique_rows_and_config,
         test_openai_workspace_key_migration_later_unique_mapping_still_runs,
         test_openai_workspace_key_migration_skips_ambiguous_email,
-        # flatten_usage 单位透传（2026-04-20 朋友反馈 + sub2api 对齐）
+        # flatten_usage 保持上游 0..100 百分比单位。
         test_flatten_usage_one_percent_stays_one_percent,
-        test_flatten_usage_matches_sub2api_typical_values,
+        test_flatten_usage_preserves_percentage_units,
         test_flatten_usage_full_hundred_percent,
         test_flatten_usage_zero,
         test_flatten_usage_fractional_sub_one,

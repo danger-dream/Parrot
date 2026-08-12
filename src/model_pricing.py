@@ -25,7 +25,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 
 from . import config
-from .protocols.usage import anthropic_cache_creation_split
+from .protocols.usage import anthropic_cache_creation_split, openai_envelope_containers
 
 TICKS_PER_USD = 10_000_000_000
 _DEFAULT_SOURCE_URL = "https://models.dev/api.json"
@@ -1712,16 +1712,18 @@ def _billing_candidates(obj: Mapping[str, Any]):
     terminal = not event_type or event_type in {
         "response.completed", "response.failed", "response.incomplete",
     }
-    yield obj, terminal
     response = obj.get("response")
-    if isinstance(response, Mapping):
-        yield response, terminal
+    for container in openai_envelope_containers(obj):
+        # Official actual cost remains trusted only at root/response, never data.
+        trusted_cost_container = container is obj or (
+            isinstance(response, Mapping) and container is response
+        )
+        yield container, bool(terminal and trusted_cost_container)
+    # Anthropic message usage remains supported, but does not interrupt the
+    # fixed OpenAI root/response/data/data.response precedence chain.
     message = obj.get("message")
     if isinstance(message, Mapping):
         yield message, False
-    data = obj.get("data")
-    if isinstance(data, Mapping):
-        yield data, False
 
 
 def normalize_response_billing(response_body: Any) -> NormalizedBilling:
@@ -1735,15 +1737,29 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
     actual_ticks: int | None = None
 
     for obj in _strict_response_objects(response_body):
+        usage_selected = False
+        tier_selected = False
         for candidate, allow_actual_cost in _billing_candidates(obj):
-            tier = candidate.get("service_tier")
-            if isinstance(tier, str) and tier.strip():
-                service_tier = tier.strip().lower()
-            elif "service_tier" in candidate and tier is not None:
-                tier_invalid = True
-            if "usage" not in candidate:
-                continue
+            # Anthropic's message envelope is usage-only. OpenAI tier evidence is
+            # selected independently in root > response > data > data.response order.
+            is_message = candidate is obj.get("message")
+            if not tier_selected and not is_message:
+                tier = candidate.get("service_tier")
+                if isinstance(tier, str) and tier.strip():
+                    service_tier = tier.strip().lower()
+                    tier_selected = True
+                    tier_invalid = False
+                elif "service_tier" in candidate and tier is not None:
+                    tier_invalid = True
             usage = candidate.get("usage")
+            if allow_actual_cost and isinstance(usage, Mapping) and "cost_in_usd_ticks" in usage:
+                value = _strict_nonnegative_int(usage.get("cost_in_usd_ticks"))
+                if value is not None:
+                    actual_ticks = value
+                else:
+                    usage_invalid = True
+            if "usage" not in candidate or usage_selected:
+                continue
             if not isinstance(usage, Mapping):
                 usage_invalid = True
                 continue
@@ -1873,15 +1889,9 @@ def normalize_response_billing(response_body: Any) -> NormalizedBilling:
                     cache_creation_1h = next_cache_creation_1h
                     observed = True
                     usage_invalid = False
+                    usage_selected = True
                 else:
                     usage_invalid = True
-            if allow_actual_cost and "cost_in_usd_ticks" in usage:
-                value = _strict_nonnegative_int(usage.get("cost_in_usd_ticks"))
-                if value is not None:
-                    actual_ticks = value
-                else:
-                    usage_invalid = True
-
     return NormalizedBilling(
         usage_observed=bool(observed and not usage_invalid and not tier_invalid),
         usage_invalid=bool(usage_invalid or tier_invalid),

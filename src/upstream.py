@@ -24,6 +24,8 @@ from .protocols.usage import (
     legacy_usage_from_anthropic_json,
     legacy_usage_from_openai_chat_json,
     legacy_usage_from_openai_responses_json,
+    select_openai_chat_usage,
+    select_openai_responses_usage,
     zero_legacy_usage,
 )
 
@@ -532,11 +534,11 @@ class ChatSSEUsageTracker:
                         if isinstance(ch, dict) and ch.get("finish_reason"):
                             self.saw_stream_end = True
                             break
-                u = evt.get("usage")
-                if isinstance(u, dict):
-                    # 见文件顶部「语义对齐」说明：OpenAI 的 prompt_tokens 含
-                    # cache，此处扣除后落库，保持与 Anthropic 语义一致。
-                    self._usage_acc.set_from_openai_chat_usage(u)
+                selected = select_openai_chat_usage(evt)
+                if selected.usage_observed or selected.usage_invalid:
+                    # A later terminal event may replace earlier nonterminal evidence;
+                    # precedence is applied only within this event object.
+                    self._usage_acc = selected
                     self.usage = self._usage_acc.legacy_dict()
 
     @property
@@ -762,10 +764,9 @@ class ResponsesSSEUsageTracker:
             elif event_name == "response.completed":
                 self.saw_stream_end = True
             if event_name in ("response.completed", "response.failed", "response.incomplete"):
-                resp = data.get("response") if isinstance(data, dict) else None
-                if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
-                    # 见文件顶部「语义对齐」说明：扣掉缓存命中部分后落库。
-                    self._usage_acc.set_from_openai_responses_usage(resp["usage"])
+                selected = select_openai_responses_usage(data)
+                if selected.usage_observed or selected.usage_invalid:
+                    self._usage_acc = selected
                     self.usage = self._usage_acc.legacy_dict()
 
     @property

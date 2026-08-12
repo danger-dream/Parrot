@@ -642,6 +642,20 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
     return False
 
 
+def _normalize_codex_device_accounts(cfg: dict) -> bool:
+    """Persist default-on installation IDs for eligible legacy OpenAI workspaces."""
+    from .openai.codex_device_fingerprint import normalize_account_device
+
+    changed = False
+    accounts = cfg.get("oauthAccounts") or []
+    if not isinstance(accounts, list):
+        return False
+    for account in accounts:
+        if isinstance(account, dict) and normalize_account_device(account):
+            changed = True
+    return changed
+
+
 def _normalize_pricing_sources(cfg: dict) -> bool:
     """Move the former built-in LiteLLM URL to the models.dev API schema.
 
@@ -738,6 +752,9 @@ def _load_from_disk() -> dict:
     if _normalize_pricing_sources(merged):
         changed = True
         print("[config] migrated built-in pricing source from LiteLLM to models.dev")
+    if _normalize_codex_device_accounts(merged):
+        changed = True
+        print("[config] backfilled default-on Codex device installation identities")
     if changed:
         _write_atomic(merged)
     return merged

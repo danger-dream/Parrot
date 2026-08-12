@@ -472,7 +472,7 @@ def _fake_usage(util_percent: float, resets_at_future_seconds: int = 3600):
     """构造一个 Anthropic /oauth/usage 响应，所有窗口利用率相同。
 
     2026-04-20: Anthropic /api/oauth/usage JSON body 的 utilization 就是 0..100
-    百分比（对齐 sub2api 产线实现），直接传入 util_percent 即可，不再除 100。
+    百分比，直接传入 util_percent 即可，不再除以 100。
     """
     reset = (datetime.now(timezone.utc) + timedelta(seconds=resets_at_future_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
     util = float(util_percent)  # 直接透传 0..100 百分比

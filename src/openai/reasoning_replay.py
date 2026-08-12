@@ -76,8 +76,8 @@ def _decode_base64url(raw: str) -> bytes | None:
 def is_valid_gpt_reasoning_signature(raw: str) -> bool:
     """Validate the Fernet-like transport shape used by Codex encrypted_content.
 
-    This mirrors CLIProxyAPI's signature.InspectGPTReasoningSignature: it is a
-    shape check only, not decryptability proof.  Invalid values are not cached
+    This is a transport-shape check only, not decryptability proof. Invalid
+    values are not cached
     so replay cannot poison the next request with obviously bad EC.
     """
     sig = _clean_str(raw)
@@ -148,7 +148,7 @@ def get(
         if not entry:
             return []
         _, items = entry
-        # Sliding TTL: touch on read, same as CLIProxyAPI.
+        # Sliding TTL: refresh the entry timestamp on every successful read.
         _entries[key] = (_now(), items)
         _entries.move_to_end(key)
         return _clone_items(items)

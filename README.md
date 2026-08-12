@@ -127,6 +127,8 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 # 需要运行测试时再安装开发依赖
 ./venv/bin/pip install -r requirements-dev.txt
+# 测试必须经隔离入口启动；用系统 python3 启动同一脚本也会自动切换到此 venv
+./venv/bin/python src/tests/isolated_pytest.py src/tests -q
 
 # 编辑 config.json（首次启动会自动生成模板）
 ./venv/bin/python server.py
@@ -365,6 +367,7 @@ JSON 请求体：
 - 详情页：三家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
+- OpenAI OAuth 的 Codex `device-only` installation 收敛对已知 workspace 默认开启：升级启动及新账户写入会原子持久化随机 UUIDv4，同 workspace 重导入/刷新保持稳定；缺少 workspace 不参与。可用账户字段 `codexDeviceConvergenceEnabled: false` 显式退出（保留 UUID，重启用时复用）；无效 UUID 会阻止加载而不会静默换号。范围仍仅限 installation carriers，不启用 session/full。
 - 账户设置中的媒体入口明确拆分：
   - 「🖼 GPT 图片设置」管理 GPT/Codex 图片模型、缓存和图片专用账号禁用列表；
   - 「🎨 Grok Imagine」管理 xAI 图片/视频模型、视频任务绑定时长和媒体请求超时，并显示图片模型路由边界；

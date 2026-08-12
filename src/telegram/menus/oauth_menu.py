@@ -786,11 +786,12 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
 
     billing = xai.get("billing") if isinstance(xai.get("billing"), dict) else {}
     settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
-    used = billing.get("used")
-    limit = billing.get("monthly_limit")
-    remaining = billing.get("remaining")
+    period_type = billing.get("period_type")
     pct = billing.get("used_percent")
-    period_end = billing.get("billing_period_end")
+    remaining_pct = billing.get("remaining_percent")
+    period_start = billing.get("period_start")
+    period_end = billing.get("period_end")
+    quota_label = "周额度" if period_type == "USAGE_PERIOD_TYPE_WEEKLY" else "官方额度"
 
     def _pct_text(value) -> str:
         try:
@@ -799,27 +800,24 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
             return "?"
 
     if not detail:
-        if limit not in (None, "") and used not in (None, ""):
+        if pct is not None:
             reset = _format_bjt(period_end) if period_end else "?"
             return (
-                f"📊 额度: 剩余 {_fmt_credit_amount(remaining)} / "
-                f"{_fmt_credit_amount(limit)} · 已用 {_pct_text(pct)} · "
-                f"重置 {ui.escape_html(reset)}"
+                f"📊 {quota_label}: 剩余 {_pct_text(remaining_pct)} · "
+                f"已用 {_pct_text(pct)} · 重置 {ui.escape_html(reset)}"
             )
-        return "📊 额度: <i>上游未返回月额度</i>"
+        return f"📊 {quota_label}: <i>上游未返回额度百分比</i>"
 
     lines = ["<b>📊 官方账单</b>"]
-    if limit not in (None, "") and used not in (None, ""):
+    if pct is not None:
         lines.append(
-            f"月额度: <code>{_fmt_credit_amount(used)} / {_fmt_credit_amount(limit)}</code> credits"
-            f"（剩 {_fmt_credit_amount(remaining)}，已用 {_pct_text(pct)}）"
+            f"{quota_label}: 剩余 <code>{_pct_text(remaining_pct)}</code>"
+            f" · 已用 <code>{_pct_text(pct)}</code>"
         )
     else:
-        lines.append("月额度: <i>上游未返回</i>")
-    start = billing.get("billing_period_start")
-    end = billing.get("billing_period_end")
-    if start or end:
-        lines.append(f"账期: <code>{_format_bjt(start)}</code> → <code>{_format_bjt(end)}</code>")
+        lines.append(f"{quota_label}: <i>上游未返回额度百分比</i>")
+    if period_start or period_end:
+        lines.append(f"账期: <code>{_format_bjt(period_start)}</code> → <code>{_format_bjt(period_end)}</code>")
     if billing.get("on_demand_cap") is not None or billing.get("on_demand_used") is not None:
         lines.append(
             f"按需: 上限 <code>{_fmt_credit_amount(billing.get('on_demand_cap'))}</code>"
@@ -1006,7 +1004,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             lines.extend(plan_line.splitlines())
 
     # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
-    # 展示官方月度额度 + Parrot 本地累计金额/token。
+    # 展示官方当前周期额度 + Parrot 本地累计金额/token。
     _now_ts = time.time()
     if prov == "xai":
         lines.extend(_format_xai_official_block(ak, detail=False).splitlines())

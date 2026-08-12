@@ -7,7 +7,7 @@
 - 发往上游的 Codex 身份字段统一改成隔离后的 session key / UUID5 派生值
 - 混淆对象：installation-id、turn-metadata 内部的 turn_id/window_id/prompt_cache_key、
   x-codex-window-id header、thread-id header、x-client-request-id header
-- 混淆算法：SHA1-based UUID5（与 CLIProxyAPI 对齐，使用 OID namespace）
+- 混淆算法：使用 OID namespace 的 SHA1-based UUID5
 - 响应方向：把混淆值还原为原始值返回给客户端
 """
 
@@ -18,19 +18,18 @@ import uuid
 from dataclasses import dataclass, field
 
 
-# UUID5 namespace — 与 CLIProxyAPI 对齐（使用 OID namespace）
+# UUID5 namespace：使用标准 OID namespace。
 _NAMESPACE = uuid.NAMESPACE_OID
 
 
 def _confuse_uuid(auth_id: str, kind: str, value: str) -> str:
     """生成混淆后的 UUID 字符串。
 
-    算法：uuid5(NAMESPACE_OID, "cli-proxy-api:codex:identity-confuse:{kind}:{auth_id}:{value}")
-    与 CLIProxyAPI 的 codexIdentityConfuseUUID 完全对齐。
+    算法：uuid5(NAMESPACE_OID, "parrot:codex:identity-confuse:{kind}:{auth_id}:{value}")。
     """
     if not auth_id or not value:
         return value
-    name = f"cli-proxy-api:codex:identity-confuse:{kind}:{auth_id.strip()}:{value.strip()}"
+    name = f"parrot:codex:identity-confuse:{kind}:{auth_id.strip()}:{value.strip()}"
     return str(uuid.uuid5(_NAMESPACE, name))
 
 
@@ -56,6 +55,11 @@ class ConfuseState:
     # installation_id
     original_installation_id: str = ""
     confused_installation_id: str = ""
+
+    def override_installation_for_upstream(self, installation_id: str) -> None:
+        """Map an upstream account installation back only to a real downstream value."""
+        if self.original_installation_id:
+            self.confused_installation_id = installation_id
 
     def confuse_turn_id(self, turn_id: str) -> str:
         """混淆 turn_id，去重复映射。"""
@@ -171,7 +175,7 @@ def confuse_headers(headers: dict | None, state: ConfuseState,
 def confuse_response_payload(data: bytes, state: ConfuseState) -> bytes:
     """把响应里的原始身份值替换成混淆值。
 
-    对齐 CLIProxyAPI 的 applyCodexIdentityConfuseResponsePayload：记录/审计上游响应时
+    记录或审计上游响应时，先把原始身份值替换成请求期混淆值，
     不暴露原始 prompt_cache_key / turn_id。Parrot 下游发送前再调用 expose 还原。
     """
     if not state.enabled or not data:
@@ -242,7 +246,7 @@ def _confuse_turn_metadata_str(raw: str, state: ConfuseState,
 
 
 def _replace_bytes(data: bytes, from_val: str, to_val: str) -> bytes:
-    """字节级替换，与 CLIProxyAPI 的 replaceCodexIdentityResponsePayload 对齐。"""
+    """对非空且不同的身份值执行确定性字节级替换。"""
     if not from_val or not to_val or from_val == to_val:
         return data
     from_bytes = from_val.encode("utf-8")

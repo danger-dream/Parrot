@@ -1,9 +1,8 @@
 """Anthropic 响应头 rate-limit 解析器（被动采样）。
 
-参考 sub2api `backend/internal/service/ratelimit_service.go::UpdateSessionWindow`
-的被动采样实现 + `calculateAnthropic429ResetTime` / `isAnthropicWindowExceeded`。
+根据 Anthropic 实际响应头做被动采样，并提供窗口超限判断。
 
-响应头契约（来自 sub2api 注释 + 实际抓包）：
+响应头契约：
   - anthropic-ratelimit-unified-5h-utilization     0..1 小数
   - anthropic-ratelimit-unified-7d-utilization     0..1 小数
   - anthropic-ratelimit-unified-{5h,7d}-reset      Unix 秒（兼容毫秒：值 >1e11 自动 / 1000）
@@ -11,8 +10,8 @@
   - anthropic-ratelimit-unified-5h-status          "allowed" / "allowed_warning" / ...
 
 关键单位陷阱：**响应头单位 0..1（小数），与 `/api/oauth/usage` JSON body 的
-0..100 百分比单位不同**。sub2api 内部也是两套独立存储（UsageInfo vs account.Extra），
-Parrot 对齐这个边界——被动采样写 5h/7d（转成 0..100 存到 oauth_quota_cache 的
+0..100 百分比单位不同**。Parrot 明确隔离两种数据源：被动采样只写
+5h/7d（转成 0..100 存到 oauth_quota_cache 的
 公共列），不触碰 sonnet/opus/extra（那些只有主动拉 /api/oauth/usage 才有）。
 
 ⚠ 严格不要把响应头采样结果当作"全量 usage"使用，它缺 sonnet/opus/extra 维度。
@@ -40,7 +39,7 @@ def _parse_util_fraction(raw: Any) -> float | None:
 def _parse_reset_iso(raw: Any) -> str | None:
     """Unix 秒（兼容毫秒自动除以 1000）→ ISO8601 UTC 字符串。
 
-    sub2api `UpdateSessionWindow` line 1118 对 >1e11 的值自动识别为毫秒时间戳。
+    大于 1e11 的值按毫秒时间戳兼容处理。
     """
     if raw is None or raw == "":
         return None
@@ -125,7 +124,7 @@ def parse_rate_limit_headers(headers: Mapping[str, Any]) -> dict | None:
     return patch
 
 
-# ─── 超限检测（sub2api isAnthropicWindowExceeded 对齐） ──────────
+# ─── 超限检测 ────────────────────────────────────────────────────
 
 def is_window_exceeded(headers: Mapping[str, Any], window: str) -> bool:
     """给定 window='5h' 或 '7d'，判断该窗口是否已触发 rate limit。

@@ -665,6 +665,8 @@ def test_tg_openai_add_via_pkce(m):
     assert acc["email"].startswith("mock-openai-") and acc["email"].endswith("@local")
     assert acc["chatgpt_account_id"]
     assert acc["plan_type"] == "plus"
+    import uuid
+    assert uuid.UUID(acc["codexDeviceInstallationId"]).version == 4
     # state 已消费
     assert m["states"].get_state(42) is None
     print("  [PASS] tg openai add via PKCE (mock) → account saved with provider=openai")
@@ -706,8 +708,10 @@ def test_tg_openai_add_via_rt(m):
     acc = openai_accs[0]
     # source=rt 分支
     assert "rt" in sent["text"]
-    # id_token 落库
+    # id_token 与默认开启的 workspace-scoped device identity 一并落库
     assert acc.get("id_token")
+    import uuid
+    assert uuid.UUID(acc["codexDeviceInstallationId"]).version == 4
     print("  [PASS] tg openai add via refresh_token (mock) → account saved")
 
 
