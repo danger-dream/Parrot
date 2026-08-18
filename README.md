@@ -368,6 +368,7 @@ JSON 请求体：
 - 每条账户显示：状态图标 / 过期时间 / 5h 7d 用量 / 月度统计 / 冷却中的模型
 - 详情页：三家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
+- Cursor「模型目录」每页紧凑展示 6 个 canonical 模型及上下文/推理能力，使用编号按钮进入单模型详情；原生变体只保留给内部自动映射，不再铺满列表。存在独立 Max Context 档位的模型可按账号持久化默认开关，下游显式 true/false 仍可逐请求覆盖。
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
 - OpenAI OAuth 的 Codex `device-only` installation 收敛对已知 workspace 默认开启：升级启动及新账户写入会原子持久化随机 UUIDv4，同 workspace 重导入/刷新保持稳定；缺少 workspace 不参与。可用账户字段 `codexDeviceConvergenceEnabled: false` 显式退出（保留 UUID，重启用时复用）；无效 UUID 会阻止加载而不会静默换号。范围仍仅限 installation carriers，不启用 session/full。
 - 账户设置中的媒体入口明确拆分：

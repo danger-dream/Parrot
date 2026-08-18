@@ -12,6 +12,7 @@ from ..cursor_bridge import runtime as cursor_runtime
 from ..openai.channel.api_channel import OpenAIApiChannel
 from ..openai.transform import anthropic_to_chat, guard
 from ..providers import registry as provider_registry
+from ..transform import cc_mimicry
 from .base import ChannelDisplay, UpstreamRequest
 
 
@@ -81,6 +82,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
             self.max_concurrent = 0
 
         self._records = cursor_catalog.catalog_records(account)
+        self._max_context_defaults = oauth_manager.cursor_max_context_models(account)
         models = [str(item.get("id") or "") for item in self._records if item.get("id")]
         if not models:
             models = [str(item) for item in account.get("models") or [] if str(item)]
@@ -113,6 +115,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
         except (TypeError, ValueError):
             self.max_concurrent = 0
         self._records = cursor_catalog.catalog_records(account)
+        self._max_context_defaults = oauth_manager.cursor_max_context_models(account)
         self.models = list(dict.fromkeys(models))
 
     def _record(self, model: str) -> dict[str, Any] | None:
@@ -129,6 +132,26 @@ class CursorOAuthChannel(OpenAIApiChannel):
 
     def cursor_metadata(self, model: str) -> dict[str, Any]:
         return cursor_catalog.metadata_from_record(self._record(model))
+
+    @staticmethod
+    def _context_limits(record: dict[str, Any] | None) -> tuple[int, int]:
+        source = record or {}
+        normal = int(source.get("context_window") or 0)
+        maximum = int(source.get("context_window_max_mode") or normal or 0)
+        return normal, maximum
+
+    def has_separate_max_context(self, model: str) -> bool:
+        normal, maximum = self._context_limits(self._record(model))
+        return maximum > normal > 0
+
+    def uses_max_context(self, body: dict, model: str) -> bool:
+        """Resolve downstream tri-state over the persisted account/model default."""
+        if not self.has_separate_max_context(model):
+            return False
+        override = body.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
+        if isinstance(override, bool):
+            return override
+        return model in self._max_context_defaults
 
     async def _build_anthropic_cursor_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
         # target_model=None avoids applying generic OpenAI-only model-name
@@ -243,10 +266,22 @@ class CursorOAuthChannel(OpenAIApiChannel):
         ) or resolved_model
         payload["model"] = actual_model
 
-        wants_long = bool(requested_body.get("_parrot_wants_context_1m"))
-        normal_context = int(record.get("context_window") or 0)
-        max_context = int(record.get("context_window_max_mode") or 0)
-        if wants_long and max_context > normal_context:
+        override = requested_body.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
+        normal_context, max_context = self._context_limits(record)
+        if (
+            override is True
+            and normal_context < cc_mimicry.ONE_M_CONTEXT_TOKENS
+            and max_context <= normal_context
+        ):
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                f"Cursor model {resolved_model!r} does not expose a separate Max Context tier",
+                param="model",
+                scope="candidate",
+            )
+        wants_long = self.uses_max_context(requested_body, resolved_model)
+        if wants_long:
             payload["cursor_long_context"] = True
 
         # Standard clients can supply a stable cache/user key; tool-result turns

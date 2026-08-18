@@ -50,7 +50,7 @@ from src.transform.cc_mimicry import (
     PARROT_WANTS_CONTEXT_1M_KEY,
     PARROT_WANTS_FAST_MODE_KEY,
     parse_beta_header,
-    request_wants_context_1m,
+    request_context_1m_override,
     request_wants_fast_mode,
     strip_context_1m_model_marker,
 )
@@ -607,6 +607,17 @@ def _first_route_channel_and_model(result) -> tuple[object | None, str | None]:
     return None, None
 
 
+def _channel_uses_max_context(ch: object, body: dict, resolved_model: str | None) -> bool:
+    """Whether this candidate will use its account/model Max Context tier."""
+    check = getattr(ch, "uses_max_context", None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check(body, str(resolved_model or "")))
+    except Exception:
+        return False
+
+
 def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
     """Return context overflow info for Anthropic→OpenAI cross-family calls.
 
@@ -629,6 +640,7 @@ def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
         metadata_model,
         scope_key=str(getattr(ch, "key", "") or ""),
         outbound_model=str(resolved_model or ""),
+        use_max_context=_channel_uses_max_context(ch, body, resolved_model),
     )
     if not metadata_model or safe_limit is None or safe_limit <= 0:
         return None
@@ -964,7 +976,7 @@ async def proxy_messages(request: Request):
 
     model = body.get("model")
     body["_client_visible_model"] = str(model or "").strip()
-    explicit_context_1m = request_wants_context_1m(
+    explicit_context_1m = request_context_1m_override(
         body,
         downstream_betas=downstream_betas,
         original_model=original_model,
@@ -977,8 +989,8 @@ async def proxy_messages(request: Request):
     body[PARROT_DOWNSTREAM_BETAS_KEY] = downstream_betas
     if isinstance(original_model, str) and original_model.strip():
         body[PARROT_ORIGINAL_MODEL_KEY] = original_model.strip()
-    # True = 下游显式要求 1M；None = 交给 Parrot 默认策略（目前仅 Opus 4.x 默认开启）。
-    body[PARROT_WANTS_CONTEXT_1M_KEY] = explicit_context_1m or None
+    # True/False = 下游显式覆盖；None = 交给渠道/模型默认策略。
+    body[PARROT_WANTS_CONTEXT_1M_KEY] = explicit_context_1m
     # True = 下游显式要求 Claude Fast mode；None = 不启用。
     body[PARROT_WANTS_FAST_MODE_KEY] = explicit_fast_mode or None
     if not model:

@@ -788,15 +788,19 @@ _STAINLESS_HEADERS = {
 
 _CONTEXT_1M_MODEL_MARKER_RE = re.compile(
     # Claude Code 官方模型选择器使用 `sonnet[1m]` / `opus[1m]`，并在出站前
-    # 把 bracket marker 从 body.model 剥掉；`-1m` / `context-1m` 是 Parrot 兼容扩展。
+    # 把 bracket marker 从 body.model 剥掉；`-1m` / `context-1m` / Cursor
+    # sidecar 的 `~1000000` 都是 Parrot 兼容扩展。
     r"\[(?:1|2)m\]|"
-    r"(^|[-_./:\s])(?:1m|1000k|1000000)(?:$|[-_./:\s])|"
+    r"(^|[~\-_./:\s])(?:1m|1000k|1000000)(?:$|[~\-_./:\s])|"
     r"1m[-_\s]?context|context[-_\s]?1m",
     re.I,
 )
 
 _CONTEXT_1M_MODEL_SUFFIX_RE = re.compile(
-    r"(?:\[(?:1|2)m\]|[-_./:\s]context[-_\s]?1m|[-_./:\s]1m[-_\s]?context|[-_./:\s]1m)$",
+    r"(?:\[(?:1|2)m\]|"
+    r"[-_./:\s]context[-_\s]?1m|"
+    r"[-_./:\s]1m[-_\s]?context|"
+    r"[~\-_./:\s](?:1m|1000k|1000000))$",
     re.I,
 )
 
@@ -870,6 +874,16 @@ def _value_requests_1m_context(value) -> bool:
     return bool(_CONTEXT_1M_MODEL_MARKER_RE.search(text))
 
 
+def _value_disables_1m_context(value) -> bool:
+    """Whether an explicit boolean-style downstream control disables 1M."""
+    if value is False:
+        return True
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value <= 0
+    text = str(value or "").strip().lower()
+    return text in {"0", "false", "off", "no", "disable", "disabled", "normal", "standard"}
+
+
 def _model_name_requests_context_1m(model) -> bool:
     return bool(_CONTEXT_1M_MODEL_MARKER_RE.search(str(model or "")))
 
@@ -933,6 +947,32 @@ def request_wants_context_1m(body=None, *, downstream_betas=None,
         if _model_name_requests_context_1m(candidate):
             return True
     return False
+
+
+def request_context_1m_override(body=None, *, downstream_betas=None,
+                                original_model=None, resolved_model=None) -> bool | None:
+    """Return an explicit per-request 1M override, or ``None`` when absent.
+
+    Positive model/header/window signals enable 1M.  A boolean-style body flag
+    such as ``long_context=false`` explicitly disables an account/model default.
+    The private Parrot field is authoritative on retries and translated rounds.
+    """
+    if isinstance(body, dict):
+        internal = body.get(PARROT_WANTS_CONTEXT_1M_KEY)
+        if isinstance(internal, bool):
+            return internal
+    if request_wants_context_1m(
+        body,
+        downstream_betas=downstream_betas,
+        original_model=original_model,
+        resolved_model=resolved_model,
+    ):
+        return True
+    if isinstance(body, dict):
+        for key in _CONTEXT_1M_FLAG_FIELDS:
+            if key in body and _value_disables_1m_context(body[key]):
+                return False
+    return None
 
 
 def should_default_context_1m(model) -> bool:

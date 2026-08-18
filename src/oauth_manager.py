@@ -2421,6 +2421,7 @@ def _add_account_serialized(entry: dict) -> None:
         (OpenAI 专属；有 workspace 时默认开启并生成 UUIDv4；显式 false 关闭)
       - id_token / subject / sub / base_url / token_endpoint / redirect_uri
         (xAI 专属)
+      - cursor_max_context_models（Cursor 每账号 canonical 模型的 Max Context 默认值）
     """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
@@ -2485,6 +2486,13 @@ def _add_account_serialized(entry: dict) -> None:
             "billing_cycle_end": entry.get("billing_cycle_end") or "",
             "last_model_sync": entry.get("last_model_sync") or "",
         })
+        # Omitted on re-login means preserve the existing local preference.
+        if "cursor_max_context_models" in entry:
+            normalized["cursor_max_context_models"] = sorted({
+                str(model).strip()
+                for model in entry.get("cursor_max_context_models") or []
+                if str(model).strip()
+            })
     # Claude 专属字段（套餐/订阅信息，来自 /api/oauth/profile）
     elif provider == "claude":
         for k in ("plan_type", "rate_limit_tier", "billing_type",
@@ -3387,6 +3395,62 @@ async def cursor_model_sync_loop() -> None:
         except Exception as exc:
             print(f"[cursor] model sync loop failed: {exc}")
             await asyncio.sleep(300)
+
+
+def cursor_max_context_models(account_or_key: dict | str) -> set[str]:
+    """Return per-account canonical models that default to Cursor Max Context."""
+    account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
+    if not isinstance(account, dict) or provider_of(account) != "cursor":
+        return set()
+    return {
+        str(model).strip()
+        for model in account.get("cursor_max_context_models") or []
+        if str(model).strip()
+    }
+
+
+def cursor_max_context_default(account_or_key: dict | str, model: str) -> bool:
+    return str(model or "").strip() in cursor_max_context_models(account_or_key)
+
+
+def set_cursor_max_context_default(account_key: str, model: str, enabled: bool) -> bool:
+    """Persist one Cursor account/model Max Context default.
+
+    Only canonical models whose account catalog advertises a strictly larger
+    ``context_window_max_mode`` can be toggled.  Returns the saved state.
+    """
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    account = get_account(canonical)
+    if account is None or provider_of(account) != "cursor":
+        raise ValueError("Cursor account not found")
+    model_id = str(model or "").strip()
+    record = next((
+        item for item in ((account.get("cursor_model_catalog") or {}).get("models") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip() == model_id
+    ), None)
+    if record is None:
+        raise ValueError(f"Cursor model not found: {model_id}")
+    normal_context = int(record.get("context_window") or 0)
+    max_context = int(record.get("context_window_max_mode") or 0)
+    if max_context <= normal_context:
+        raise ValueError(f"Cursor model has no separate Max Context tier: {model_id}")
+    wanted = bool(enabled)
+
+    def mutate(cfg):
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) != canonical:
+                continue
+            selected = cursor_max_context_models(item)
+            if wanted:
+                selected.add(model_id)
+            else:
+                selected.discard(model_id)
+            item["cursor_max_context_models"] = sorted(selected)
+            return
+        raise ValueError("Cursor account not found")
+
+    config.update(mutate, skip_if_unchanged=True)
+    return wanted
 
 
 def update_models(account_key: str, models: list[str]) -> None:

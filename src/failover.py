@@ -692,6 +692,16 @@ def _channel_forces_context_1m(ch: Channel, resolved_model: str) -> bool:
     return bool(callable(check) and check(resolved_model))
 
 
+def _channel_uses_max_context(ch: Channel | None, body: dict, resolved_model: str) -> bool:
+    check = getattr(ch, "uses_max_context", None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check(body, resolved_model))
+    except Exception:
+        return False
+
+
 def _proxy_route_kwargs(ch: Channel, resolved_model: str) -> dict:
     return transport_policy.proxy_route_kwargs(ch, resolved_model)
 
@@ -1211,22 +1221,35 @@ async def _run_compact_direct_rescue_with_compression_model(
     direct_body["_client_visible_model"] = compression_model
 
     prompt_tokens = token_counter.count_request_tokens(direct_body, model=compression_model)
+    use_max_context = _channel_uses_max_context(
+        metadata_channel, body, str(metadata_outbound or compression_model),
+    )
     if not model_metadata.can_fit_for_compact(
         compression_model, prompt_tokens,
         scope_key=scope_key, outbound_model=metadata_outbound,
+        use_max_context=use_max_context,
     ):
         required = model_metadata.required_context_for_compact(
             prompt_tokens, compression_model,
             scope_key=scope_key, outbound_model=metadata_outbound,
         )
         window = model_metadata.context_window(
-            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+            compression_model,
+            scope_key=scope_key,
+            outbound_model=metadata_outbound,
+            use_max_context=use_max_context,
         )
         trigger = model_metadata.compact_trigger_tokens(
-            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+            compression_model,
+            scope_key=scope_key,
+            outbound_model=metadata_outbound,
+            use_max_context=use_max_context,
         )
         safe_limit = model_metadata.safe_prompt_limit(
-            compression_model, scope_key=scope_key, outbound_model=metadata_outbound,
+            compression_model,
+            scope_key=scope_key,
+            outbound_model=metadata_outbound,
+            use_max_context=use_max_context,
         )
         return (
             None,
@@ -1375,6 +1398,9 @@ async def _run_compact_map_reduce_rescue(
         active_model,
         scope_key=active_scope,
         outbound_model=str(active_outbound or ""),
+        use_max_context=_channel_uses_max_context(
+            active_channel, body, str(active_outbound or active_model),
+        ),
     )
     segment_target = compact_rescue.chunk_target_tokens()
     if map_reduce_route is not None and bound_prompt_limit is not None:

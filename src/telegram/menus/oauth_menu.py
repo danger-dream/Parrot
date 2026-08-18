@@ -1337,7 +1337,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         _models_line(xai_models),
         "",
         f"{_provider_tag('cursor')} <b>账号自动模型</b> ({len(cursor_models)} / {len(cursor_accounts)} 个账号):",
-        "<i>按账号 AvailableModels 自动同步；在账号详情查看原生变体</i>",
+        "<i>按账号 AvailableModels 自动同步；在账号详情浏览模型能力并设置 Max Context 默认值</i>",
         "",
         "🎨 <b>媒体能力</b>",
         f"GPT / Codex 图片: {gpt_images_status}",
@@ -2315,15 +2315,11 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     elif prov == "xai":
         provider_line = _format_xai_provider_line(account_key, detail=True)
     elif prov == "cursor":
-        records = ((acc.get("cursor_model_catalog") or {}).get("models") or [])
-        variants = sum(
-            len(item.get("legacy_slugs") or []) for item in records if isinstance(item, dict)
-        )
         profile_name = str(acc.get("cursor_profile_name") or "").strip()
         provider_line = (
             (f"👤 姓名: <code>{ui.escape_html(profile_name)}</code>\n" if profile_name else "")
             + f"🏷️ 套餐: <code>{ui.escape_html(str(acc.get('plan_type') or 'Cursor'))}</code>\n"
-            f"🧬 模型目录: <code>{len(acc.get('models') or [])} canonical / {variants} 原生变体</code>\n"
+            f"🧬 模型目录: <code>{len(acc.get('models') or [])} 个可用模型</code>\n"
             f"📚 元数据: <code>Cursor AvailableModels（账号专属）</code>\n"
         )
     else:
@@ -2389,7 +2385,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     ]
     if prov == "cursor":
         rows.append([ui.provider_button(
-            "🧬 Cursor 模型与原生变体",
+            "🧬 Cursor 模型目录",
             f"oa:cursor_models:{short}:1",
             "cursor",
         )])
@@ -2629,64 +2625,208 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
-# ─── Cursor 模型目录 / 原生变体 ───────────────────────────────────
+# ─── Cursor 模型目录 / 单模型 Max Context 默认值 ──────────────────
 
 
-def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+_CURSOR_MODEL_PAGE_SIZE = 6
+_CURSOR_MODEL_REF_SEP = "\x1f"
+
+
+def _cursor_model_records(acc: dict) -> list[dict]:
+    return [
+        item for item in ((acc.get("cursor_model_catalog") or {}).get("models") or [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+
+def _cursor_model_ref(account_key: str, model_id: str) -> str:
+    return ui.register_code(
+        f"{account_key}{_CURSOR_MODEL_REF_SEP}{str(model_id or '').strip()}"
+    )
+
+
+def _resolve_cursor_model_ref(ref: str) -> tuple[str, dict, dict] | None:
+    raw = ui.resolve_code(str(ref or "")) or ""
+    if _CURSOR_MODEL_REF_SEP not in raw:
+        return None
+    account_key, model_id = raw.split(_CURSOR_MODEL_REF_SEP, 1)
+    account_key = _resolve_to_account_key(account_key) or ""
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+        return None
+    record = next((
+        item for item in _cursor_model_records(acc)
+        if str(item.get("id") or "") == model_id
+    ), None)
+    return (account_key, acc, record) if record is not None else None
+
+
+def _cursor_model_page_payload(payload: str) -> tuple[str, int]:
     short, _, page_s = str(payload or "").partition(":")
     try:
         page = max(1, int(page_s or 1))
     except ValueError:
         page = 1
+    return short, page
+
+
+def _cursor_model_detail_payload(payload: str) -> tuple[str, int]:
+    ref, _, page_s = str(payload or "").partition(":")
+    try:
+        page = max(1, int(page_s or 1))
+    except ValueError:
+        page = 1
+    return ref, page
+
+
+def _cursor_effort_text(item: dict) -> str:
+    efforts = [
+        str(value).strip() for value in item.get("reasoning_efforts") or []
+        if str(value).strip()
+    ]
+    return "、".join(efforts)
+
+
+def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _cursor_model_page_payload(payload)
     account_key = _resolve_to_account_key(ui.resolve_code(short))
     acc = oauth_manager.get_account(account_key) if account_key else None
     if acc is None or oauth_manager.provider_of(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户或短码已失效")
         return
-    records = [
-        item for item in ((acc.get("cursor_model_catalog") or {}).get("models") or [])
-        if isinstance(item, dict) and item.get("id")
-    ]
-    page_size = 2
-    total_pages = max(1, math.ceil(len(records) / page_size))
+    records = _cursor_model_records(acc)
+    total_pages = max(1, math.ceil(len(records) / _CURSOR_MODEL_PAGE_SIZE))
     page = min(page, total_pages)
-    start = (page - 1) * page_size
-    selected = records[start:start + page_size]
+    start = (page - 1) * _CURSOR_MODEL_PAGE_SIZE
+    selected = records[start:start + _CURSOR_MODEL_PAGE_SIZE]
     lines = [
         f"🧬 <b>{ui.escape_html(_account_display(acc))} · Cursor 模型目录</b>",
-        f"canonical <b>{len(records)}</b> 个 · 第 <b>{page}/{total_pages}</b> 页",
-        "<i>下游调用 canonical id；Parrot 按 reasoning/fast/thinking 参数自动选择下列真实 Cursor id。</i>",
+        f"共 <b>{len(records)}</b> 个可用模型 · 第 <b>{page}/{total_pages}</b> 页",
     ]
-    for item in selected:
+    for offset, item in enumerate(selected, start=1):
+        display_index = start + offset
+        model_id = str(item.get("id") or "")
+        name = str(item.get("name") or model_id)
         context = int(item.get("context_window") or 0)
-        max_context = int(item.get("context_window_max_mode") or 0)
-        limits = f"{ui.fmt_tokens(context)}"
-        if max_context > context:
-            limits += f" / Max {ui.fmt_tokens(max_context)}"
+        effort_text = _cursor_effort_text(item)
         lines.extend([
             "",
-            f"<b>{ui.escape_html(str(item.get('name') or item.get('id')))}</b>",
-            f"下游：<code>{ui.escape_html(item.get('id'))}</code>",
-            f"上下文：<code>{limits}</code> · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
-            "Cursor 原生变体：",
+            f"<b>{display_index}. {ui.escape_html(name)}</b> · <code>{ui.escape_html(model_id)}</code>",
+            f"上下文：<code>{ui.fmt_tokens(context)}</code> · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
         ])
-        slugs = [str(value) for value in item.get("legacy_slugs") or [] if str(value)]
-        if slugs:
-            lines.extend(f"  • <code>{ui.escape_html(slug)}</code>" for slug in slugs)
-        else:
-            lines.append("  • <i>canonical id（无展开变体）</i>")
+        if effort_text:
+            lines.append(f"支持思考档位：{ui.escape_html(effort_text)}")
+
     rows: list[list[dict]] = []
-    nav: list[dict] = []
-    if page > 1:
-        nav.append(ui.btn("⬅ 上一页", f"oa:cursor_models:{short}:{page - 1}"))
-    if page < total_pages:
-        nav.append(ui.btn("下一页 ➡", f"oa:cursor_models:{short}:{page + 1}"))
-    if nav:
-        rows.append(nav)
+    detail_buttons: list[dict] = []
+    for offset, item in enumerate(selected, start=1):
+        display_index = start + offset
+        ref = _cursor_model_ref(account_key, str(item.get("id") or ""))
+        detail_buttons.append(ui.btn(
+            f"📄 #{display_index}", f"oa:cursor_model:{ref}:{page}",
+        ))
+        if len(detail_buttons) == 3:
+            rows.append(detail_buttons)
+            detail_buttons = []
+    if detail_buttons:
+        rows.append(detail_buttons)
+
+    prev_page = max(1, page - 1)
+    next_page = min(total_pages, page + 1)
+    rows.append([
+        ui.btn("🏠 首页", f"oa:cursor_models:{short}:1"),
+        ui.btn("◀ 上一页", f"oa:cursor_models:{short}:{prev_page}"),
+        ui.btn(f"{page}/{total_pages}", f"oa:cursor_models:{short}:{page}"),
+        ui.btn("下一页 ▶", f"oa:cursor_models:{short}:{next_page}"),
+    ])
     rows.append([ui.btn("🔄 刷新额度与模型", f"oa:refresh_usage:{short}:1")])
     rows.append([ui.btn("◀ 返回账户详情", f"oa:view:{short}:1")])
-    ui.answer_cb(cb_id)
+    if cb_id:
+        ui.answer_cb(cb_id)
     ui.edit(chat_id, message_id, ui.truncate("\n".join(lines)), reply_markup=ui.inline_kb(rows))
+
+
+def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    ref, page = _cursor_model_detail_payload(payload)
+    resolved = _resolve_cursor_model_ref(ref)
+    if resolved is None:
+        ui.answer_cb(cb_id, "Cursor 模型或短码已失效")
+        return
+    account_key, acc, item = resolved
+    model_id = str(item.get("id") or "")
+    name = str(item.get("name") or model_id)
+    context = int(item.get("context_window") or 0)
+    max_context = int(item.get("context_window_max_mode") or context)
+    max_output = int(item.get("max_tokens") or 0)
+    has_separate_max = max_context > context > 0
+    default_max = oauth_manager.cursor_max_context_default(acc, model_id)
+    variants = [value for value in item.get("variants") or [] if isinstance(value, dict)]
+    supports_fast = any(bool(value.get("fast")) for value in variants)
+    supports_thinking = any(bool(value.get("thinking")) for value in variants)
+    effort_text = _cursor_effort_text(item)
+
+    lines = [
+        f"🧬 <b>{ui.escape_html(name)}</b>",
+        f"账户：<code>{ui.escape_html(_account_display(acc))}</code>",
+        f"模型：<code>{ui.escape_html(model_id)}</code>",
+        "",
+        f"普通上下文：<code>{ui.fmt_tokens(context)}</code>",
+    ]
+    if has_separate_max:
+        lines.append(f"Max Context：<code>{ui.fmt_tokens(max_context)}</code>")
+    elif context >= 1_000_000:
+        lines.append(f"Max Context：<code>{ui.fmt_tokens(context)}</code>（默认即为最大上下文）")
+    if max_output:
+        lines.append(f"最大输出：<code>{ui.fmt_tokens(max_output)}</code>")
+    lines.extend([
+        f"推理：{'✅' if item.get('reasoning') else '—'}",
+        f"图片上游：{'✅' if item.get('supports_images') else '—'}",
+        f"Thinking：{'✅' if supports_thinking else '—'}",
+        f"Fast：{'✅' if supports_fast else '—'}",
+    ])
+    if effort_text:
+        lines.append(f"支持思考档位：{ui.escape_html(effort_text)}")
+    lines.append("")
+    rows: list[list[dict]] = []
+    if has_separate_max:
+        lines.extend([
+            f"Max Context 默认：<b>{'已开启' if default_max else '已关闭'}</b>",
+            "<i>下游显式 true/false 优先；下游未指定时采用这里保存的默认值。</i>",
+        ])
+        action = "关闭" if default_max else "开启"
+        rows.append([ui.provider_button(
+            f"{'🟢' if default_max else '⬛'} 点击{action} Max Context",
+            f"oa:cursor_maxctx:{ref}:{page}",
+            "cursor",
+        )])
+    else:
+        lines.append("<i>该模型没有可单独切换的 Max Context 档位。</i>")
+
+    account_short = ui.register_code(account_key)
+    rows.append([ui.btn(f"◀ 返回第 {page} 页", f"oa:cursor_models:{account_short}:{page}")])
+    if cb_id:
+        ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, ui.truncate("\n".join(lines)), reply_markup=ui.inline_kb(rows))
+
+
+def on_cursor_max_context_toggle(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    ref, page = _cursor_model_detail_payload(payload)
+    resolved = _resolve_cursor_model_ref(ref)
+    if resolved is None:
+        ui.answer_cb(cb_id, "Cursor 模型或短码已失效")
+        return
+    account_key, acc, item = resolved
+    model_id = str(item.get("id") or "")
+    current = oauth_manager.cursor_max_context_default(acc, model_id)
+    try:
+        saved = oauth_manager.set_cursor_max_context_default(
+            account_key, model_id, not current,
+        )
+    except ValueError as exc:
+        ui.answer_cb(cb_id, str(exc), show_alert=True)
+        return
+    ui.answer_cb(cb_id, f"Max Context 默认已{'开启' if saved else '关闭'}")
+    on_cursor_model_detail(chat_id, message_id, "", f"{ref}:{page}")
 
 
 # ─── 清错误 / 清亲和 ─────────────────────────────────────────────
@@ -5040,6 +5180,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data.startswith("oa:cursor_models:"):
         on_cursor_models(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:cursor_model:"):
+        on_cursor_model_detail(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:cursor_maxctx:"):
+        on_cursor_max_context_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
     if data.startswith("oa:clear_errors:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

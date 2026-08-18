@@ -50,7 +50,7 @@ class ModelInventoryItem:
 
 # Legacy input normalization remains available for config migration/tests, but
 # normalized user values are never a runtime metadata source after this refactor.
-_INT_KEYS = {"contextWindow", "maxOutputTokens", "compactTriggerTokens"}
+_INT_KEYS = {"contextWindow", "contextWindowMaxMode", "maxOutputTokens", "compactTriggerTokens"}
 _FLOAT_KEYS = {
     "inputPricePer1M", "outputPricePer1M",
     "cacheReadPricePer1M", "cacheWritePricePer1M",
@@ -62,7 +62,11 @@ _FIELD_ALIASES = {
     "context_window": "contextWindow", "context_window_tokens": "contextWindow",
     "context": "contextWindow", "max_context": "contextWindow",
     "max_context_tokens": "contextWindow", "contextLength": "contextWindow",
-    "context_length": "contextWindow", "maxOutput": "maxOutputTokens",
+    "context_length": "contextWindow",
+    "context_window_max_mode": "contextWindowMaxMode",
+    "max_context_window": "contextWindowMaxMode",
+    "max_context_window_tokens": "contextWindowMaxMode",
+    "maxOutput": "maxOutputTokens",
     "max_output": "maxOutputTokens", "max_output_tokens": "maxOutputTokens",
     "maxTokens": "maxOutputTokens", "max_tokens": "maxOutputTokens",
     "compact_trigger_tokens": "compactTriggerTokens",
@@ -685,10 +689,17 @@ def context_window(
     *,
     scope_key: str | None = None,
     outbound_model: str | None = None,
+    use_max_context: bool = False,
 ) -> int | None:
-    return _to_int(get_metadata(
+    metadata = get_metadata(
         model, scope_key=scope_key, outbound_model=outbound_model,
-    ).get("contextWindow"))
+    )
+    normal = _to_int(metadata.get("contextWindow"))
+    if use_max_context:
+        maximum = _to_int(metadata.get("contextWindowMaxMode"))
+        if maximum is not None and (normal is None or maximum > normal):
+            return maximum
+    return normal
 
 
 def max_output_tokens(
@@ -707,10 +718,18 @@ def compact_trigger_tokens(
     *,
     scope_key: str | None = None,
     outbound_model: str | None = None,
+    use_max_context: bool = False,
 ) -> int | None:
-    return _to_int(get_metadata(
+    metadata = get_metadata(
         model, scope_key=scope_key, outbound_model=outbound_model,
-    ).get("compactTriggerTokens"))
+    )
+    if use_max_context:
+        normal = _to_int(metadata.get("contextWindow"))
+        maximum = _to_int(metadata.get("contextWindowMaxMode"))
+        if maximum is not None and (normal is None or maximum > normal):
+            output = _to_int(metadata.get("maxOutputTokens")) or 0
+            return max(1, int(max(1, maximum - output) * 0.8))
+    return _to_int(metadata.get("compactTriggerTokens"))
 
 
 def _compact_rescue_int(key: str, default: int) -> int:
@@ -745,15 +764,24 @@ def safe_prompt_limit(
     scope_key: str | None = None,
     outbound_model: str | None = None,
     buffer_tokens: int | None = None,
+    use_max_context: bool = False,
 ) -> int | None:
-    window = context_window(model, scope_key=scope_key, outbound_model=outbound_model)
+    window = context_window(
+        model,
+        scope_key=scope_key,
+        outbound_model=outbound_model,
+        use_max_context=use_max_context,
+    )
     if window is None:
         return None
     buffer = compact_buffer_tokens() if buffer_tokens is None else max(0, int(buffer_tokens))
     reserve = summary_reserve_tokens(model, scope_key=scope_key, outbound_model=outbound_model)
     hard_limit = max(0, window - reserve - buffer)
     trigger = compact_trigger_tokens(
-        model, scope_key=scope_key, outbound_model=outbound_model,
+        model,
+        scope_key=scope_key,
+        outbound_model=outbound_model,
+        use_max_context=use_max_context,
     )
     return min(hard_limit, trigger) if trigger is not None else hard_limit
 
@@ -778,9 +806,10 @@ def can_fit_for_compact(
     scope_key: str | None = None,
     outbound_model: str | None = None,
     buffer_tokens: int | None = None,
+    use_max_context: bool = False,
 ) -> bool:
     limit = safe_prompt_limit(
         model, scope_key=scope_key, outbound_model=outbound_model,
-        buffer_tokens=buffer_tokens,
+        buffer_tokens=buffer_tokens, use_max_context=use_max_context,
     )
     return limit is not None and max(0, int(prompt_tokens)) <= limit

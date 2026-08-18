@@ -38,6 +38,14 @@ from .. import (
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
+from ..transform.cc_mimicry import (
+    PARROT_DOWNSTREAM_BETAS_KEY,
+    PARROT_ORIGINAL_MODEL_KEY,
+    PARROT_WANTS_CONTEXT_1M_KEY,
+    parse_beta_header,
+    request_context_1m_override,
+    strip_context_1m_model_marker,
+)
 from .transform.common import normalize_chat_reasoning_alias
 from .transform.guard import GuardError, guard_chat_ingress, guard_responses_ingress
 from .transform.responses_to_chat import resolve_current_input_items
@@ -73,6 +81,34 @@ def _count_msg_tool(body: dict, ingress_protocol: str) -> tuple[int, int]:
         return 0, tool_count
     # string input：一条
     return 1, tool_count
+
+
+def _normalize_model_context_controls(
+    body: dict,
+    ingress_line: str,
+    *,
+    downstream_betas: list[str] | None = None,
+) -> str:
+    """Normalize model mapping plus explicit Max Context signals for OpenAI ingress."""
+    original_model = body.get("model")
+    model_mapping.apply_default(body, ingress_line)
+    model_mapping.apply_mapping(body, ingress_line)
+    stripped_model = strip_context_1m_model_marker(body.get("model"))
+    if stripped_model != body.get("model"):
+        body["model"] = stripped_model
+        model_mapping.apply_mapping(body, ingress_line)
+    model = str(body.get("model") or "").strip()
+    body["_client_visible_model"] = model
+    body[PARROT_DOWNSTREAM_BETAS_KEY] = list(downstream_betas or [])
+    if isinstance(original_model, str) and original_model.strip():
+        body[PARROT_ORIGINAL_MODEL_KEY] = original_model.strip()
+    body[PARROT_WANTS_CONTEXT_1M_KEY] = request_context_1m_override(
+        body,
+        downstream_betas=downstream_betas,
+        original_model=original_model,
+        resolved_model=model,
+    )
+    return model
 
 
 def _has_xai_oauth_candidate(model: str | None) -> bool:
@@ -507,18 +543,19 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 2.1 模型映射 / 入口默认模型：
     #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
     #     - body.model 命中别名 → 改写成真实名（只解一层）
-    #     后续白名单/调度/channel 全按真实名走。
+    #     - `[1m]` / `~1000000` 等显式 Max Context marker 在映射前后归一
+    #     后续白名单/调度/channel 全按 canonical 名走，1M 意图单独保存。
     #     ingress_protocol 这里是 "chat"/"responses"，需要转成配置里的
     #     完整 ingress line 名。
     _ingress_line = (
         "openai-chat" if ingress_protocol == "chat" else "openai-responses"
     )
-    model_mapping.apply_default(body, _ingress_line)
-    model_mapping.apply_mapping(body, _ingress_line)
-    body["_client_visible_model"] = str(body.get("model") or "").strip()
+    downstream_betas = parse_beta_header(request.headers.get("anthropic-beta"))
+    model = _normalize_model_context_controls(
+        body, _ingress_line, downstream_betas=downstream_betas,
+    )
 
     # 3. model 白名单
-    model = body.get("model")
     if not model:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "model is required",
