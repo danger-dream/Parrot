@@ -35,7 +35,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors, oauth_manager, state_db
+from ... import (
+    affinity, config, cooldown, cursor_reconcile, load_balancing, log_db,
+    oauth_errors, oauth_manager, state_db,
+)
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
 from ...oauth import cursor as cursor_provider, openai as openai_provider, xai as xai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
@@ -978,6 +981,18 @@ def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str
     return "\n".join(lines) if lines else "📊 Cursor 额度: <i>无有效数据</i>"
 
 
+def _format_cursor_local_cost(stats: dict | None, *, model_row: bool = False) -> str:
+    data = stats if isinstance(stats, dict) else {}
+    actual = int(data.get("actual_costed_success") or 0)
+    unpriced = int(data.get("unpriced_success") or 0)
+    if actual > 0:
+        amount = ui.fmt_cost(data)
+        if unpriced > 0:
+            return f"{amount}（官方已对账 {actual} 次 · 待对账 {unpriced} 次）"
+        return f"{amount}（Cursor 官方事件）"
+    return "未计价" if model_row else "未计价（Cursor 官方账单见上方）"
+
+
 def _has_local_usage_or_billing(stats: dict | None) -> bool:
     if not isinstance(stats, dict):
         return False
@@ -1149,7 +1164,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
         if prov == "cursor":
-            lines.append("💵 未计价（Cursor 官方账单见上方）")
+            lines.append(f"💵 {_format_cursor_local_cost(ts)}")
         else:
             lines.append(f"💵 {ui.fmt_cost(ts)}")
 
@@ -2206,7 +2221,7 @@ def _format_month_stats_block(account_key: str, *,
         f"峰值 {ui.fmt_tps(overall.get('max_tps'))} · "
         f"最低 {ui.fmt_tps(overall.get('min_tps'))}",
         (
-            "累计金额：未计价（Cursor 官方账单见上方）"
+            f"累计金额：{_format_cursor_local_cost(overall)}"
             if is_cursor else f"累计金额：{ui.fmt_cost(overall)}"
         ),
     ]
@@ -2231,7 +2246,7 @@ def _format_month_stats_block(account_key: str, *,
                     f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
                 )
             lines.append(
-                "    累计金额：未计价"
+                f"    累计金额：{_format_cursor_local_cost(ms, model_row=True)}"
                 if is_cursor else f"    累计金额：{ui.fmt_cost(ms)}"
             )
     return "\n".join(lines)
@@ -2536,6 +2551,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     quota_action = _evaluate_quota_action(ak, usage_result)
     metadata_action = None
+    cursor_event_action = None
     if provider == "openai":
         metadata_action = _run_sync(oauth_manager.ensure_openai_metadata_fresh(
             ak, force=True, min_interval_seconds=0, timeout_s=5.0,
@@ -2544,6 +2560,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         metadata_action = _run_sync(oauth_manager.refresh_cursor_models(
             ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
+        cursor_event_action = _run_sync(cursor_reconcile.sync_account(ak, force=True))
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
     if not text:
@@ -2579,6 +2596,16 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += "\n⚠️ 模型目录本次同步失败，保留原目录"
         elif isinstance(metadata_action, dict) and metadata_action.get("action") in {"error", "timeout", "fetch_empty"}:
             head += "\n⚠️ 额度已更新，但模型目录本次同步失败，保留原目录"
+        if isinstance(cursor_event_action, dict):
+            matched = int(cursor_event_action.get("matched") or 0)
+            refreshed = int(cursor_event_action.get("refreshed") or 0)
+            pending = int(cursor_event_action.get("pending") or 0)
+            if matched:
+                head += f"\n🧾 官方缓存/金额事件已回填: <code>{matched} 条</code>"
+            elif refreshed:
+                head += f"\n🧾 官方事件已复核: <code>{refreshed} 条</code>"
+            elif pending:
+                head += "\n⏳ 官方事件尚未到达，后台会继续自动对账"
         if quota_action and quota_action.get("action") == "cursor_pool_cooldown":
             head += f"\n🟠 已按额度池冷却 <code>{int(quota_action.get('cooled_models') or 0)}</code> 个模型"
         elif quota_action and quota_action.get("action") == "cursor_pool_recovered":

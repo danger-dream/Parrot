@@ -372,7 +372,14 @@
     "bridgePort": 0,
     "maxRetries": 2,
     "requestTimeoutSeconds": 300,
-    "modelSyncHours": 6
+    "modelSyncHours": 6,
+    "eventSyncEnabled": true,
+    "eventSyncSeconds": 30,
+    "eventLookbackSeconds": 900,
+    "eventPageSize": 1000,
+    "eventMaxPages": 20,
+    "eventLegacyMatchSeconds": 5,
+    "eventToolSettleSeconds": 120
   },
   "openai": {
     "store": {

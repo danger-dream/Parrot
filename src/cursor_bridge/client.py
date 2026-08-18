@@ -95,6 +95,7 @@ class CursorClient:
         self.request_timeout_s = request_timeout_s
         self._session_factory = session_factory or CursorSession
         self._sleep = sleeper
+        self._conversation_lock = threading.RLock()
         self._conversations: dict[str, ConversationState] = {}
 
     @property
@@ -117,8 +118,15 @@ class CursorClient:
                 self._access_token = access_token
                 self._expires_at_ms = token_expiry_ms(access_token)
 
+    def conversation_id(self, session_id: str) -> str:
+        """Return the upstream Cursor conversation ID for an active bridge turn."""
+        with self._conversation_lock:
+            state = self._conversations.get(str(session_id or ""))
+            return str(state.conversation_id if state is not None else "")
+
     def discard_conversation(self, session_id: str, *, cancel: bool = False) -> None:
-        state = self._conversations.pop(str(session_id or ""), None)
+        with self._conversation_lock:
+            state = self._conversations.pop(str(session_id or ""), None)
         if state is None or state.live is None:
             return
         if cancel:
@@ -128,7 +136,10 @@ class CursorClient:
         state.live = None
 
     def close(self) -> None:
-        for state in self._conversations.values():
+        with self._conversation_lock:
+            states = list(self._conversations.values())
+            self._conversations.clear()
+        for state in states:
             if state.live is not None:
                 state.live.close()
                 state.live = None
@@ -162,7 +173,8 @@ class CursorClient:
         selected = select_tools_for_choice(tools or [], tool_choice)
         mcp_tools = build_mcp_tools(selected)
         enabled = enabled_tool_names(mcp_tools)
-        state = self._conversations.setdefault(key, ConversationState())
+        with self._conversation_lock:
+            state = self._conversations.setdefault(key, ConversationState())
 
         resumed = bool(parsed.tool_results and state.live is not None and state.live.alive)
         if resumed:

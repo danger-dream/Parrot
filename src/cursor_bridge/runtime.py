@@ -24,6 +24,7 @@ from .errors import CursorError
 
 _ACCOUNT_HEADER = "X-Parrot-Cursor-Account"
 _SESSION_HEADER = "X-Parrot-Cursor-Session"
+_CONVERSATION_HEADER = "X-Parrot-Cursor-Conversation-Id"
 
 
 class _Server(ThreadingHTTPServer):
@@ -185,11 +186,20 @@ class _Handler(BaseHTTPRequestHandler):
     def runtime(self) -> CursorBridgeRuntime:
         return self.server.runtime
 
-    def _json(self, status: int, payload: dict[str, Any]) -> None:
+    def _json(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        for name, value in (headers or {}).items():
+            if value:
+                self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -247,6 +257,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_request"}})
             return
 
+        conversation_id = client.conversation_id(session_id)
+        conversation_headers = (
+            {_CONVERSATION_HEADER: conversation_id} if conversation_id else {}
+        )
+
         if isinstance(result, dict):
             message = (((result.get("choices") or [{}])[0] or {}).get("message") or {})
             tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
@@ -255,13 +270,15 @@ class _Handler(BaseHTTPRequestHandler):
                     self.runtime.register_tool_call(account_key, session_id, str(call.get("id") or ""))
             if not tool_calls:
                 self.runtime.finish_session(account_key, session_id)
-            self._json(200, result)
+            self._json(200, result, headers=conversation_headers)
             return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
+        for name, value in conversation_headers.items():
+            self.send_header(name, value)
         self.end_headers()
         paused_for_tools = False
         try:
@@ -323,6 +340,7 @@ def drop_account(account_key: str) -> None:
 __all__ = [
     "_ACCOUNT_HEADER",
     "_SESSION_HEADER",
+    "_CONVERSATION_HEADER",
     "base_url",
     "bearer_secret",
     "drop_account",

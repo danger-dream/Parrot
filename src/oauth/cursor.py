@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 import httpx
@@ -27,7 +28,11 @@ from ..cursor_bridge.auth import (
     token_expiry_ms,
 )
 from ..cursor_bridge.catalog import build_catalog
-from ..cursor_bridge.constants import CURSOR_CLIENT_VERSION, CURSOR_WEB_PROFILE_URL
+from ..cursor_bridge.constants import (
+    CURSOR_CLIENT_VERSION,
+    CURSOR_USAGE_EVENTS_URL,
+    CURSOR_WEB_PROFILE_URL,
+)
 from ..cursor_bridge.errors import (
     CursorAuthError,
     CursorError,
@@ -176,6 +181,159 @@ def fetch_profile_sync(access_token: str, *, account_key: str = "") -> dict[str,
     if not isinstance(raw, dict):
         raise CursorError("Cursor 账号资料格式无效", code="profile_invalid", status=502)
     return _normalize_profile(raw)
+
+
+def _event_nonnegative_int(value: Any) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _event_nonnegative_decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
+def _normalize_usage_event(raw: dict[str, Any]) -> dict[str, Any] | None:
+    conversation_id = _profile_text(raw.get("conversationId"))
+    model = _profile_text(raw.get("model"))
+    timestamp_ms = _event_nonnegative_int(raw.get("timestamp"))
+    if not conversation_id or not model or timestamp_ms <= 0:
+        return None
+    token_usage = raw.get("tokenUsage") if isinstance(raw.get("tokenUsage"), dict) else {}
+    charged_cents = _event_nonnegative_decimal(raw.get("chargedCents"))
+    is_chargeable = (
+        raw.get("isChargeable") if isinstance(raw.get("isChargeable"), bool) else None
+    )
+    cost_ticks = (
+        int(
+            (charged_cents * Decimal(100_000_000)).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP,
+            )
+        )
+        if charged_cents is not None
+        else 0 if is_chargeable is False else None
+    )
+    event_identity = json.dumps(
+        {
+            "conversation_id": conversation_id,
+            "timestamp_ms": timestamp_ms,
+            "model": model,
+            "kind": _profile_text(raw.get("kind")),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "event_key": hashlib.sha256(event_identity.encode("utf-8")).hexdigest(),
+        "conversation_id": conversation_id,
+        "timestamp_ms": timestamp_ms,
+        "model": model,
+        "kind": _profile_text(raw.get("kind")),
+        "input_tokens": _event_nonnegative_int(token_usage.get("inputTokens")),
+        "output_tokens": _event_nonnegative_int(token_usage.get("outputTokens")),
+        "cache_creation_tokens": _event_nonnegative_int(token_usage.get("cacheWriteTokens")),
+        "cache_read_tokens": _event_nonnegative_int(token_usage.get("cacheReadTokens")),
+        "charged_cents": float(charged_cents) if charged_cents is not None else None,
+        "cost_ticks": cost_ticks,
+        "request_units": (
+            float(value) if (value := _event_nonnegative_decimal(raw.get("requestsCosts"))) is not None
+            else None
+        ),
+        "is_chargeable": is_chargeable,
+        "is_headless": raw.get("isHeadless") if isinstance(raw.get("isHeadless"), bool) else None,
+    }
+
+
+def fetch_usage_events_sync(
+    access_token: str,
+    *,
+    start_ms: int,
+    end_ms: int,
+    account_key: str = "",
+    page_size: int = 1000,
+    max_pages: int = 20,
+) -> list[dict[str, Any]]:
+    """Fetch normalized Cursor dashboard events for exact conversation reconciliation."""
+    if _mock_mode_enabled():
+        return []
+    start = max(0, int(start_ms))
+    end = max(start, int(end_ms))
+    size = max(1, min(1000, int(page_size or 1000)))
+    pages = max(1, min(200, int(max_pages or 20)))
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Cookie": web_session_cookie(access_token),
+        "Origin": "https://cursor.com",
+        "Referer": "https://cursor.com/dashboard/usage",
+        "User-Agent": f"cursor-agent/{CURSOR_CLIENT_VERSION.removeprefix('cli-')}",
+    }
+    deduped: dict[str, dict[str, Any]] = {}
+    try:
+        with _http_client(account_key=account_key, timeout=30.0) as client:
+            for page in range(1, pages + 1):
+                response = client.post(
+                    CURSOR_USAGE_EVENTS_URL,
+                    headers=headers,
+                    json={
+                        "startDate": str(start),
+                        "endDate": str(end),
+                        "page": page,
+                        "pageSize": size,
+                    },
+                )
+                if response.status_code in {401, 403}:
+                    raise CursorAuthError(
+                        f"Cursor usage events 未授权 ({response.status_code})"
+                    )
+                if not response.is_success:
+                    raise classify_cursor_failure(
+                        f"Cursor usage events 返回 HTTP {response.status_code}",
+                        http_status=response.status_code,
+                    )
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise CursorError(
+                        "Cursor usage events 不是有效 JSON",
+                        code="usage_events_invalid",
+                        status=502,
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise CursorError(
+                        "Cursor usage events 格式无效",
+                        code="usage_events_invalid",
+                        status=502,
+                    )
+                raw_events = payload.get("usageEventsDisplay")
+                raw_events = raw_events if isinstance(raw_events, list) else []
+                for raw in raw_events:
+                    if not isinstance(raw, dict):
+                        continue
+                    normalized = _normalize_usage_event(raw)
+                    if normalized is not None:
+                        deduped[normalized["event_key"]] = normalized
+                total = _event_nonnegative_int(payload.get("totalUsageEventsCount"))
+                if not raw_events or len(raw_events) < size or len(deduped) >= total:
+                    break
+    except httpx.TimeoutException as exc:
+        raise CursorTimeoutError("Cursor usage events 请求超时") from exc
+    except CursorError:
+        raise
+    except httpx.HTTPError as exc:
+        raise classify_cursor_failure("Cursor usage events 请求失败") from exc
+    return sorted(deduped.values(), key=lambda event: int(event["timestamp_ms"]))
 
 
 def expiry_iso(token: str) -> str:
@@ -399,6 +557,7 @@ __all__ = [
     "expiry_iso",
     "fetch_model_catalog_sync",
     "fetch_profile_sync",
+    "fetch_usage_events_sync",
     "fetch_models_sync",
     "fetch_usage",
     "fetch_usage_sync",

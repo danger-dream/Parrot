@@ -468,6 +468,26 @@ def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
     assert "    累计金额：未计价" in detail_text
     assert "$0.00" not in detail_text
 
+    reconciled = {
+        **metrics,
+        "cost_ticks": 1_234_567_890,
+        "actual_cost_ticks": 1_234_567_890,
+        "actual_costed_success": 2,
+        "costed_success": 2,
+        "unpriced_success": 0,
+    }
+    actual_snapshot = {"by_channel": {channel_key: reconciled}}
+    actual_list = oauth_menu._format_account_block(
+        account, month_snapshot=actual_snapshot,
+    )
+    assert "💵 $0.12（Cursor 官方事件）" in actual_list
+    actual_detail = oauth_menu._format_month_stats_block(
+        account_key,
+        month_snapshot=actual_snapshot,
+        by_model=[{"final_model": "composer-2.5", **reconciled}],
+    )
+    assert "累计金额：$0.12（Cursor 官方事件）" in actual_detail
+
 
 def test_cursor_telegram_badge_uses_custom_emoji():
     emoji_id = "6062261319426390107"

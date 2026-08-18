@@ -210,7 +210,9 @@ def _schema_sql() -> str:
       binding_source TEXT,
       binding_json TEXT,
       binding_version TEXT,
-      binding_revision TEXT
+      binding_revision TEXT,
+      -- Cursor internal bridge response fact; never forwarded downstream.
+      cursor_conversation_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_retry_req ON retry_chain(request_id);
 
@@ -249,7 +251,22 @@ def _schema_sql() -> str:
       pricing_version       TEXT,
       cost_source           TEXT NOT NULL,
       cost_ticks            INTEGER,
-      settled_at            REAL NOT NULL
+      settled_at            REAL NOT NULL,
+      -- Post-settlement Cursor dashboard reconciliation. Original realtime usage
+      -- and pricing facts above remain immutable.
+      cursor_conversation_id TEXT,
+      cursor_event_key       TEXT,
+      cursor_event_timestamp_ms INTEGER,
+      cursor_event_model     TEXT,
+      cursor_event_kind      TEXT,
+      cursor_event_input_tokens INTEGER,
+      cursor_event_output_tokens INTEGER,
+      cursor_event_cache_creation_tokens INTEGER,
+      cursor_event_cache_read_tokens INTEGER,
+      cursor_event_cost_ticks INTEGER,
+      cursor_event_request_units REAL,
+      cursor_event_reconciled_at REAL,
+      cursor_event_superseded INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_attempt_usage_root ON upstream_attempt_usage(root_request_id);
     CREATE INDEX IF NOT EXISTS idx_attempt_usage_channel ON upstream_attempt_usage(channel_key);
@@ -461,7 +478,15 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
           upstream_protocol TEXT,
           dispatch_state TEXT NOT NULL DEFAULT 'unknown',
           pricing_snapshot_json TEXT, pricing_version TEXT,
-          cost_source TEXT NOT NULL, cost_ticks INTEGER, settled_at REAL NOT NULL
+          cost_source TEXT NOT NULL, cost_ticks INTEGER, settled_at REAL NOT NULL,
+          cursor_conversation_id TEXT, cursor_event_key TEXT,
+          cursor_event_timestamp_ms INTEGER, cursor_event_model TEXT,
+          cursor_event_kind TEXT, cursor_event_input_tokens INTEGER,
+          cursor_event_output_tokens INTEGER,
+          cursor_event_cache_creation_tokens INTEGER,
+          cursor_event_cache_read_tokens INTEGER, cursor_event_cost_ticks INTEGER,
+          cursor_event_request_units REAL, cursor_event_reconciled_at REAL,
+          cursor_event_superseded INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_attempt_usage_root ON upstream_attempt_usage(root_request_id);
         CREATE INDEX IF NOT EXISTS idx_attempt_usage_channel ON upstream_attempt_usage(channel_key);
@@ -504,6 +529,19 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
             ("cost_source", "ALTER TABLE upstream_attempt_usage ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'unpriced'"),
             ("cost_ticks", "ALTER TABLE upstream_attempt_usage ADD COLUMN cost_ticks INTEGER"),
             ("settled_at", "ALTER TABLE upstream_attempt_usage ADD COLUMN settled_at REAL NOT NULL DEFAULT 0"),
+            ("cursor_conversation_id", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_conversation_id TEXT"),
+            ("cursor_event_key", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_key TEXT"),
+            ("cursor_event_timestamp_ms", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_timestamp_ms INTEGER"),
+            ("cursor_event_model", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_model TEXT"),
+            ("cursor_event_kind", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_kind TEXT"),
+            ("cursor_event_input_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_input_tokens INTEGER"),
+            ("cursor_event_output_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_output_tokens INTEGER"),
+            ("cursor_event_cache_creation_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_cache_creation_tokens INTEGER"),
+            ("cursor_event_cache_read_tokens", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_cache_read_tokens INTEGER"),
+            ("cursor_event_cost_ticks", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_cost_ticks INTEGER"),
+            ("cursor_event_request_units", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_request_units REAL"),
+            ("cursor_event_reconciled_at", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_reconciled_at REAL"),
+            ("cursor_event_superseded", "ALTER TABLE upstream_attempt_usage ADD COLUMN cursor_event_superseded INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in attempt_usage_cols:
                 conn.execute(ddl)
@@ -512,6 +550,15 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_usage_root ON upstream_attempt_usage(root_request_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_usage_channel ON upstream_attempt_usage(channel_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_usage_model ON upstream_attempt_usage(model)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attempt_cursor_conversation "
+        "ON upstream_attempt_usage(channel_key, cursor_conversation_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_attempt_cursor_event "
+        "ON upstream_attempt_usage(cursor_event_key) "
+        "WHERE cursor_event_key IS NOT NULL"
+    )
     # retry_chain migration
     retry_cols = {row[1] for row in conn.execute("PRAGMA table_info(retry_chain)").fetchall()}
     if retry_cols and "proxy_name" not in retry_cols:
@@ -549,11 +596,15 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
             "upstream_protocol", "client_visible_model",
             "binding_provider_id", "binding_model_id",
             "binding_pricing_key", "binding_source", "binding_json",
-            "binding_version", "binding_revision",
+            "binding_version", "binding_revision", "cursor_conversation_id",
         ):
             if col not in retry_cols:
                 conn.execute(f"ALTER TABLE retry_chain ADD COLUMN {col} TEXT")
                 changed = True
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_retry_cursor_conversation "
+            "ON retry_chain(channel_key, cursor_conversation_id)"
+        )
 
     proxy_cols = {row[1] for row in conn.execute("PRAGMA table_info(proxy_chain)").fetchall()}
     if not proxy_cols:
@@ -1734,6 +1785,28 @@ def mark_retry_attempt_dispatch(
         conn.commit()
 
 
+def set_retry_attempt_cursor_conversation_id(
+    attempt_id: int | RowLogHandle,
+    conversation_id: str,
+) -> bool:
+    """Persist one trusted Cursor bridge response conversation ID before settlement."""
+    value = str(conversation_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", value):
+        return False
+    handle = _row_handle(attempt_id, table="retry_chain")
+    with _write_lock:
+        conn = _get_conn_for_ref(handle.db)
+        cur = conn.execute(
+            """UPDATE retry_chain
+                  SET cursor_conversation_id=?
+                WHERE id=? AND channel_key LIKE 'oauth:cursor:%'
+                  AND (cursor_conversation_id IS NULL OR cursor_conversation_id='')""",
+            (value, handle.row_id),
+        )
+        conn.commit()
+        return bool(cur.rowcount)
+
+
 def _billing_root_request_id(call_request_id: str) -> str:
     """Map Compact's internal call ids back to the downstream request."""
 
@@ -1991,8 +2064,8 @@ def _settle_retry_attempt_locked(
             cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens,
             service_tier, outbound_service_tier, upstream_protocol, dispatch_state,
             pricing_snapshot_json, pricing_version,
-            cost_source, cost_ticks, settled_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            cost_source, cost_ticks, settled_at, cursor_conversation_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             int(attempt_id), root_request_id, str(attempt["request_id"]),
             int(attempt["attempt_order"] or 0), str(attempt["channel_key"] or ""),
@@ -2009,6 +2082,10 @@ def _settle_retry_attempt_locked(
             tokens[3], tier, outbound_tier, upstream_protocol or None, dispatch_state,
             pricing_snapshot_json, pricing_version,
             cost_source, cost_ticks, time.time(),
+            (
+                str(attempt["cursor_conversation_id"] or "").strip() or None
+                if "cursor_conversation_id" in attempt_keys else None
+            ),
         ),
     )
     if final and actual_tier:
@@ -2128,6 +2205,353 @@ def update_retry_attempt(
                 usage=usage, usage_observed=usage_observed, final=False,
             )
         conn.commit()
+
+
+def _cursor_log_refs_since(since_ts: float) -> list[LogDbRef]:
+    if _log_dir is None:
+        raise RuntimeError("log_db.init() not called")
+    start_month = datetime.fromtimestamp(float(since_ts), tz=_BJT).strftime("%Y-%m")
+    refs = [
+        LogDbRef(month=month, path=path)
+        for month, path in _monthly_log_files()
+        if month >= start_month
+    ]
+    current_path, current_month = _current_db_path()
+    if not any(ref.path == current_path for ref in refs):
+        refs.append(LogDbRef(month=current_month, path=current_path))
+    refs.sort(key=lambda ref: ref.month)
+    return refs
+
+
+def cursor_reconciliation_targets(account_key: str, *, since_ts: float) -> dict[str, Any]:
+    """Return unresolved Cursor attempts that justify one dashboard poll."""
+    channel_key = f"oauth:{str(account_key or '').strip()}"
+    total = exact = legacy = recent_reconciled = 0
+    min_created: float | None = None
+    with _write_lock:
+        for ref in _cursor_log_refs_since(since_ts):
+            conn = _get_conn_for_ref(ref)
+            if not _cursor_reconciliation_ready(conn):
+                continue
+            row = conn.execute(
+                """SELECT
+                          SUM(CASE WHEN COALESCE(a.cursor_event_key,'')=''
+                                   THEN 1 ELSE 0 END) AS total,
+                          SUM(CASE WHEN COALESCE(a.cursor_conversation_id,'')<>''
+                                    AND COALESCE(a.cursor_event_key,'')=''
+                                   THEN 1 ELSE 0 END) AS exact_count,
+                          SUM(CASE WHEN COALESCE(a.cursor_conversation_id,'')=''
+                                    AND COALESCE(a.cursor_event_key,'')=''
+                                   THEN 1 ELSE 0 END) AS legacy_count,
+                          SUM(CASE WHEN COALESCE(a.cursor_event_key,'')<>''
+                                   THEN 1 ELSE 0 END) AS reconciled_count,
+                          MIN(CASE WHEN COALESCE(a.cursor_event_key,'')=''
+                                   THEN r.created_at ELSE NULL END) AS min_created
+                     FROM upstream_attempt_usage a
+                     JOIN request_log r ON r.request_id=a.root_request_id
+                    WHERE a.channel_key=? AND r.created_at>=?
+                      AND COALESCE(a.cursor_event_superseded,0)=0
+                      AND a.outcome='success'""",
+                (channel_key, float(since_ts)),
+            ).fetchone()
+            total += int((row["total"] if row else 0) or 0)
+            exact += int((row["exact_count"] if row else 0) or 0)
+            legacy += int((row["legacy_count"] if row else 0) or 0)
+            recent_reconciled += int((row["reconciled_count"] if row else 0) or 0)
+            if row and row["min_created"] is not None:
+                value = float(row["min_created"])
+                min_created = value if min_created is None else min(min_created, value)
+    return {
+        "total": total,
+        "exact": exact,
+        "legacy": legacy,
+        "recent_reconciled": recent_reconciled,
+        "min_created_at": min_created,
+    }
+
+
+def _cursor_attempt_actual_model(row: dict[str, Any]) -> str:
+    try:
+        payload = json.loads(row.get("binding_json") or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    dispatch = payload.get("dispatch") if isinstance(payload, dict) else {}
+    if isinstance(dispatch, dict):
+        model = str(dispatch.get("outbound_model_id") or "").strip()
+        if model:
+            return model
+    return str(row.get("model") or "").strip()
+
+
+def reconcile_cursor_usage_events(
+    account_key: str,
+    events: list[dict[str, Any]],
+    *,
+    since_ts: float,
+    legacy_match_seconds: float = 5.0,
+    tool_settle_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Idempotently attach normalized official events to immutable live attempts."""
+    channel_key = f"oauth:{str(account_key or '').strip()}"
+    normalized_events = [
+        dict(event) for event in events
+        if isinstance(event, dict)
+        and event.get("event_key")
+        and event.get("conversation_id")
+        and event.get("timestamp_ms")
+        and event.get("model")
+    ]
+    normalized_events.sort(key=lambda event: int(event["timestamp_ms"]))
+    if not normalized_events:
+        return {"matched": 0, "exact": 0, "legacy": 0, "superseded": 0}
+
+    matched = exact = legacy = superseded = ambiguous = refreshed = moved = 0
+    now = time.time()
+    with _write_lock:
+        rows: list[dict[str, Any]] = []
+        conns: dict[str, sqlite3.Connection] = {}
+        for ref in _cursor_log_refs_since(since_ts):
+            conn = _get_conn_for_ref(ref)
+            conns[ref.path] = conn
+            if not _cursor_reconciliation_ready(conn):
+                continue
+            fetched = conn.execute(
+                """SELECT a.*, r.created_at, r.requested_model, r.api_key_name
+                     FROM upstream_attempt_usage a
+                     JOIN request_log r ON r.request_id=a.root_request_id
+                    WHERE a.channel_key=? AND r.created_at>=?
+                      AND a.outcome='success'
+                    ORDER BY r.created_at, a.id""",
+                (channel_key, float(since_ts)),
+            ).fetchall()
+            for raw in fetched:
+                item = dict(raw)
+                item["_path"] = ref.path
+                item["actual_model"] = _cursor_attempt_actual_model(item)
+                rows.append(item)
+
+        existing_event_rows = {
+            str(row.get("cursor_event_key") or ""): row for row in rows
+            if row.get("cursor_event_key")
+        }
+        existing_event_keys = set(existing_event_rows)
+        available_events = [
+            event for event in normalized_events
+            if str(event["event_key"]) not in existing_event_keys
+        ]
+        assigned_event_keys: set[str] = set()
+
+        def assign(row: dict[str, Any], event: dict[str, Any], *, legacy_match: bool) -> None:
+            nonlocal matched, exact, legacy
+            conn = conns[row["_path"]]
+            event_key = str(event["event_key"])
+            conversation_id = str(event["conversation_id"])
+            conn.execute(
+                """UPDATE upstream_attempt_usage SET
+                       cursor_conversation_id=?, cursor_event_key=?,
+                       cursor_event_timestamp_ms=?, cursor_event_model=?,
+                       cursor_event_kind=?, cursor_event_input_tokens=?,
+                       cursor_event_output_tokens=?,
+                       cursor_event_cache_creation_tokens=?,
+                       cursor_event_cache_read_tokens=?, cursor_event_cost_ticks=?,
+                       cursor_event_request_units=?, cursor_event_reconciled_at=?,
+                       cursor_event_superseded=0
+                     WHERE id=?""",
+                (
+                    conversation_id, event_key, int(event["timestamp_ms"]),
+                    str(event.get("model") or ""), str(event.get("kind") or ""),
+                    int(event.get("input_tokens") or 0),
+                    int(event.get("output_tokens") or 0),
+                    int(event.get("cache_creation_tokens") or 0),
+                    int(event.get("cache_read_tokens") or 0),
+                    event.get("cost_ticks"), event.get("request_units"), now,
+                    int(row["id"]),
+                ),
+            )
+            conn.execute(
+                """UPDATE retry_chain SET cursor_conversation_id=?
+                     WHERE id=? AND (cursor_conversation_id IS NULL OR cursor_conversation_id='')""",
+                (conversation_id, int(row["retry_attempt_id"])),
+            )
+            row["cursor_event_key"] = event_key
+            row["cursor_conversation_id"] = conversation_id
+            assigned_event_keys.add(event_key)
+            matched += 1
+            if legacy_match:
+                legacy += 1
+            else:
+                exact += 1
+
+        # Cursor may publish a provisional event and refine its fractional cost or
+        # Token split later. Refresh already-linked rows by stable event key.
+        for event in normalized_events:
+            event_key = str(event["event_key"])
+            row = existing_event_rows.get(event_key)
+            if row is None:
+                continue
+            conn = conns[row["_path"]]
+            cur = conn.execute(
+                """UPDATE upstream_attempt_usage SET
+                       cursor_event_timestamp_ms=?, cursor_event_model=?,
+                       cursor_event_kind=?, cursor_event_input_tokens=?,
+                       cursor_event_output_tokens=?,
+                       cursor_event_cache_creation_tokens=?,
+                       cursor_event_cache_read_tokens=?, cursor_event_cost_ticks=?,
+                       cursor_event_request_units=?, cursor_event_reconciled_at=?
+                     WHERE id=?""",
+                (
+                    int(event["timestamp_ms"]), str(event.get("model") or ""),
+                    str(event.get("kind") or ""), int(event.get("input_tokens") or 0),
+                    int(event.get("output_tokens") or 0),
+                    int(event.get("cache_creation_tokens") or 0),
+                    int(event.get("cache_read_tokens") or 0),
+                    event.get("cost_ticks"), event.get("request_units"), now,
+                    int(row["id"]),
+                ),
+            )
+            refreshed += int(cur.rowcount or 0)
+
+        # A tool continuation can be registered after the single official event
+        # was already linked to its first HTTP turn. After a grace period, move
+        # that one event to the latest turn and supersede every partial row. If a
+        # second official event exists we do not collapse anything.
+        settle_grace = max(15.0, min(900.0, float(tool_settle_seconds or 120.0)))
+        event_conversations = {
+            str(event["conversation_id"]) for event in normalized_events
+        }
+        for conversation_id in sorted(event_conversations):
+            official = [
+                event for event in normalized_events
+                if str(event["conversation_id"]) == conversation_id
+            ]
+            owners = [
+                row for row in rows
+                if str(row.get("cursor_conversation_id") or "") == conversation_id
+                and row.get("cursor_event_key")
+                and not bool(row.get("cursor_event_superseded"))
+            ]
+            pending_rows = [
+                row for row in rows
+                if str(row.get("cursor_conversation_id") or "") == conversation_id
+                and not row.get("cursor_event_key")
+                and not bool(row.get("cursor_event_superseded"))
+            ]
+            if len(official) != 1 or len(owners) != 1 or not pending_rows:
+                continue
+            newest_pending = max(
+                pending_rows,
+                key=lambda row: (float(row.get("created_at") or 0), int(row["id"])),
+            )
+            terminal_time = float(
+                newest_pending.get("settled_at")
+                or newest_pending.get("created_at")
+                or 0
+            )
+            if terminal_time > now - settle_grace:
+                continue
+            old_owner = owners[0]
+            rows_to_exclude = [old_owner] + [
+                row for row in pending_rows if row is not newest_pending
+            ]
+            for row in rows_to_exclude:
+                conns[row["_path"]].execute(
+                    """UPDATE upstream_attempt_usage SET
+                           cursor_event_key=NULL, cursor_event_timestamp_ms=NULL,
+                           cursor_event_model=NULL, cursor_event_kind=NULL,
+                           cursor_event_input_tokens=NULL,
+                           cursor_event_output_tokens=NULL,
+                           cursor_event_cache_creation_tokens=NULL,
+                           cursor_event_cache_read_tokens=NULL,
+                           cursor_event_cost_ticks=NULL,
+                           cursor_event_request_units=NULL,
+                           cursor_event_superseded=1,
+                           cursor_event_reconciled_at=?
+                         WHERE id=?""",
+                    (now, int(row["id"])),
+                )
+                row["cursor_event_key"] = None
+                row["cursor_event_superseded"] = 1
+                superseded += 1
+            assign(newest_pending, official[0], legacy_match=False)
+            moved += 1
+
+        # Exact conversation joins. Multiple downstream tool turns can share one
+        # Cursor conversation and produce one final official event; attach it to
+        # the latest turn and exclude earlier partial turns from billing totals.
+        conversations = {
+            str(event["conversation_id"]) for event in available_events
+        }
+        for conversation_id in sorted(conversations):
+            conv_events = [
+                event for event in available_events
+                if str(event["conversation_id"]) == conversation_id
+                and str(event["event_key"]) not in assigned_event_keys
+            ]
+            conv_rows = [
+                row for row in rows
+                if str(row.get("cursor_conversation_id") or "") == conversation_id
+                and not row.get("cursor_event_key")
+                and not bool(row.get("cursor_event_superseded"))
+            ]
+            if not conv_events or not conv_rows:
+                continue
+            conv_events.sort(key=lambda event: int(event["timestamp_ms"]))
+            conv_rows.sort(key=lambda row: (float(row.get("created_at") or 0), int(row["id"])))
+            selected_rows = conv_rows[-len(conv_events):]
+            selected_events = conv_events[-len(selected_rows):]
+            for row, event in zip(selected_rows, selected_events):
+                assign(row, event, legacy_match=False)
+            if len(conv_events) == 1 and len(conv_rows) > 1:
+                selected_ids = {
+                    (str(row["_path"]), int(row["id"])) for row in selected_rows
+                }
+                for row in conv_rows:
+                    if (str(row["_path"]), int(row["id"])) in selected_ids:
+                        continue
+                    conns[row["_path"]].execute(
+                        """UPDATE upstream_attempt_usage
+                              SET cursor_event_superseded=1,
+                                  cursor_event_reconciled_at=?
+                            WHERE id=? AND COALESCE(cursor_event_key,'')=''""",
+                        (now, int(row["id"])),
+                    )
+                    row["cursor_event_superseded"] = 1
+                    superseded += 1
+
+        # Upgrade-era rows predate the internal response header. Backfill only a
+        # unique exact-native-model candidate within a narrow timestamp window.
+        tolerance = max(0.5, min(30.0, float(legacy_match_seconds or 5.0)))
+        for event in available_events:
+            event_key = str(event["event_key"])
+            if event_key in assigned_event_keys:
+                continue
+            event_ts = float(event["timestamp_ms"]) / 1000.0
+            candidates = [
+                row for row in rows
+                if not row.get("cursor_event_key")
+                and not bool(row.get("cursor_event_superseded"))
+                and not str(row.get("cursor_conversation_id") or "")
+                and row.get("actual_model") == str(event.get("model") or "")
+                and abs(float(row.get("created_at") or 0) - event_ts) <= tolerance
+            ]
+            if len(candidates) == 1:
+                assign(candidates[0], event, legacy_match=True)
+            elif len(candidates) > 1:
+                ambiguous += 1
+
+        for conn in conns.values():
+            conn.commit()
+
+    return {
+        "matched": matched,
+        "exact": exact,
+        "legacy": legacy,
+        "superseded": superseded,
+        "ambiguous": ambiguous,
+        "refreshed": refreshed,
+        "moved": moved,
+        "events": len(normalized_events),
+    }
 
 
 def record_proxy_attempt(
@@ -2597,6 +3021,15 @@ def _estimate_cost_into(bucket: dict, row, *, row_count: int, pricing_settings) 
 
 
 def _add_attempt_cost_row(bucket: dict, row) -> None:
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    if "cursor_event_superseded" in keys and bool(row["cursor_event_superseded"]):
+        return
+    if "cursor_event_key" in keys and row["cursor_event_key"]:
+        if row["cursor_event_cost_ticks"] is not None:
+            _add_cost(bucket, int(row["cursor_event_cost_ticks"] or 0), 1, actual=True)
+        else:
+            _add_unpriced(bucket, 1)
+        return
     source = str(row["cost_source"] or "unpriced")
     if source == "actual":
         _add_cost(bucket, int(row["cost_ticks"] or 0), 1, actual=True)
@@ -2628,6 +3061,92 @@ def _attempt_table_ready(conn: sqlite3.Connection) -> bool:
     return _ATTEMPT_USAGE_REQUIRED_COLUMNS.issubset(
         _table_columns(conn, "upstream_attempt_usage")
     )
+
+
+_CURSOR_RECONCILIATION_COLUMNS = {
+    "cursor_conversation_id", "cursor_event_key", "cursor_event_timestamp_ms",
+    "cursor_event_model", "cursor_event_kind", "cursor_event_input_tokens",
+    "cursor_event_output_tokens", "cursor_event_cache_creation_tokens",
+    "cursor_event_cache_read_tokens", "cursor_event_cost_ticks",
+    "cursor_event_request_units", "cursor_event_reconciled_at",
+    "cursor_event_superseded",
+}
+
+
+def _cursor_reconciliation_ready(conn: sqlite3.Connection) -> bool:
+    return _CURSOR_RECONCILIATION_COLUMNS.issubset(
+        _table_columns(conn, "upstream_attempt_usage")
+    )
+
+
+def _effective_attempt_exprs(
+    conn: sqlite3.Connection,
+    *,
+    alias: str = "a",
+) -> dict[str, str]:
+    prefix = f"{alias}." if alias else ""
+    if not _cursor_reconciliation_ready(conn):
+        return {
+            "included": "1",
+            "usage_observed": f"{prefix}usage_observed",
+            "input": f"{prefix}input_tokens",
+            "output": f"{prefix}output_tokens",
+            "cache_creation": f"{prefix}cache_creation_tokens",
+            "cache_read": f"{prefix}cache_read_tokens",
+        }
+    superseded = f"COALESCE({prefix}cursor_event_superseded,0)=1"
+    reconciled = f"COALESCE({prefix}cursor_event_key,'')<>''"
+
+    def token(official: str, live: str) -> str:
+        return (
+            f"CASE WHEN {superseded} THEN 0 "
+            f"WHEN {reconciled} THEN COALESCE({prefix}{official},0) "
+            f"ELSE COALESCE({prefix}{live},0) END"
+        )
+
+    return {
+        "included": f"CASE WHEN {superseded} THEN 0 ELSE 1 END",
+        "usage_observed": (
+            f"CASE WHEN {superseded} THEN 0 WHEN {reconciled} THEN 1 "
+            f"ELSE COALESCE({prefix}usage_observed,0) END"
+        ),
+        "input": token("cursor_event_input_tokens", "input_tokens"),
+        "output": token("cursor_event_output_tokens", "output_tokens"),
+        "cache_creation": token(
+            "cursor_event_cache_creation_tokens", "cache_creation_tokens",
+        ),
+        "cache_read": token("cursor_event_cache_read_tokens", "cache_read_tokens"),
+    }
+
+
+def _effective_attempt_row(row: sqlite3.Row | dict) -> dict[str, Any]:
+    out = dict(row)
+    if bool(out.get("cursor_event_superseded")):
+        out.update({
+            "usage_observed": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "cost_source": "excluded",
+            "cost_ticks": None,
+        })
+        return out
+    if out.get("cursor_event_key"):
+        out.update({
+            "usage_observed": 1,
+            "input_tokens": int(out.get("cursor_event_input_tokens") or 0),
+            "output_tokens": int(out.get("cursor_event_output_tokens") or 0),
+            "cache_creation_tokens": int(
+                out.get("cursor_event_cache_creation_tokens") or 0
+            ),
+            "cache_read_tokens": int(out.get("cursor_event_cache_read_tokens") or 0),
+            "cost_source": (
+                "actual" if out.get("cursor_event_cost_ticks") is not None else "unpriced"
+            ),
+            "cost_ticks": out.get("cursor_event_cost_ticks"),
+        })
+    return out
 
 
 def _final_observed_attempt_sql(
@@ -2808,7 +3327,7 @@ def _accumulate_filtered_costs(
             "a.channel_key=?" if where.strip() == "final_channel_key=?" else where
         )
         rows = conn.execute(
-            f"""SELECT a.cost_source, a.cost_ticks
+            f"""SELECT a.*
                 FROM upstream_attempt_usage a
                 JOIN request_log ON request_log.request_id=a.root_request_id
                 WHERE ({attempt_where}) AND request_log.created_at >= ?
@@ -2956,7 +3475,7 @@ def _accumulate_grouped_costs(
     if _attempt_rows_exist(conn):
         attempt_where = "a.channel_key=?" if channel_attempts else where
         rows = conn.execute(
-            f"""SELECT {attempt_group_expr} AS grp_key, a.cost_source, a.cost_ticks
+            f"""SELECT {attempt_group_expr} AS grp_key, a.*
                 FROM upstream_attempt_usage a
                 JOIN request_log ON request_log.request_id=a.root_request_id
                 WHERE ({attempt_where}) AND request_log.created_at >= ?""",
@@ -3101,7 +3620,7 @@ def _attempt_cost_for_request(request_id: str, created_at: Any = None) -> dict |
             conn = _get_conn()
         rows = (
             conn.execute(
-                """SELECT cost_source, cost_ticks FROM upstream_attempt_usage
+                """SELECT * FROM upstream_attempt_usage
                    WHERE root_request_id=? ORDER BY id""",
                 (request_id,),
             ).fetchall()
@@ -3548,13 +4067,17 @@ def _attempt_token_delta_for_filter(
     else:
         attempt_where = where.replace("api_key_name", "request_log.api_key_name")
         attempt_where = attempt_where.replace("requested_model", "request_log.requested_model")
+    effective = _effective_attempt_exprs(conn, alias="a")
     new = conn.execute(
-        f"""SELECT SUM(a.input_tokens) AS inp, SUM(a.output_tokens) AS outp,
-                   SUM(a.cache_creation_tokens) AS cc, SUM(a.cache_read_tokens) AS cr
+        f"""SELECT SUM({effective['input']}) AS inp,
+                   SUM({effective['output']}) AS outp,
+                   SUM({effective['cache_creation']}) AS cc,
+                   SUM({effective['cache_read']}) AS cr
             FROM upstream_attempt_usage a
             JOIN request_log ON request_log.request_id=a.root_request_id
             WHERE {attempt_where} AND request_log.created_at >= ?
-              AND a.usage_observed=1
+              AND ({effective['usage_observed']})=1
+              AND ({effective['included']})=1
               AND COALESCE(a.call_request_id, '')<>''""",
         where_args + (since_ts,),
     ).fetchone()
@@ -3588,14 +4111,18 @@ def _replace_model_tokens_with_attempts(
             GROUP BY model""",
         where_args + (since_ts,),
     ).fetchall()
+    effective = _effective_attempt_exprs(conn, alias="a")
     new_rows = conn.execute(
         f"""SELECT {attempt_group_expr} AS model,
-                   SUM(a.input_tokens) AS inp, SUM(a.output_tokens) AS outp,
-                   SUM(a.cache_creation_tokens) AS cc, SUM(a.cache_read_tokens) AS cr
+                   SUM({effective['input']}) AS inp,
+                   SUM({effective['output']}) AS outp,
+                   SUM({effective['cache_creation']}) AS cc,
+                   SUM({effective['cache_read']}) AS cr
             FROM upstream_attempt_usage a
             JOIN request_log ON request_log.request_id=a.root_request_id
             WHERE {attempt_where} AND request_log.created_at>=?
-              AND a.usage_observed=1
+              AND ({effective['usage_observed']})=1
+              AND ({effective['included']})=1
               AND COALESCE(a.call_request_id, '')<>''
             GROUP BY model""",
         where_args + (since_ts,),
@@ -3651,6 +4178,10 @@ def _replace_summary_tokens_with_attempts(
         target_overall["total_output_tokens"] += sign * vals[1]
         target_overall["total_cache_creation"] += sign * vals[2]
         target_overall["total_cache_read"] += sign * vals[3]
+        if vals[2] > 0:
+            target_overall["success_with_cache_write"] += sign
+        if vals[3] > 0:
+            target_overall["success_with_cache_hit"] += sign
         for bucket in (
             target_channels.setdefault(row["channel_key"] or "?", _new_group_agg()),
             target_models.setdefault(row["model_key"] or "?", _new_group_agg()),
@@ -3660,6 +4191,10 @@ def _replace_summary_tokens_with_attempts(
             bucket["total_output_tokens"] += sign * vals[1]
             bucket["total_cache_creation"] += sign * vals[2]
             bucket["total_cache_read"] += sign * vals[3]
+            if vals[2] > 0:
+                bucket["write_requests"] += sign
+            if vals[3] > 0:
+                bucket["hit_requests"] += sign
 
     all_targets = (overall, by_channel, by_model, by_apikey)
     for row in roots:
@@ -3669,16 +4204,19 @@ def _replace_summary_tokens_with_attempts(
             apply_root(row, -1, family_targets[fam])
 
     attempt_protocol_expr = _attempt_protocol_expr(conn)
+    effective = _effective_attempt_exprs(conn, alias="a")
     attempts = conn.execute(
         f"""SELECT a.channel_key, request_log.requested_model AS model_key,
                    request_log.api_key_name AS apikey_key,
                    {attempt_protocol_expr} AS family_protocol,
-                   a.input_tokens AS inp, a.output_tokens AS outp,
-                   a.cache_creation_tokens AS cc, a.cache_read_tokens AS cr
+                   {effective['input']} AS inp, {effective['output']} AS outp,
+                   {effective['cache_creation']} AS cc,
+                   {effective['cache_read']} AS cr
             FROM upstream_attempt_usage a
             JOIN request_log ON request_log.request_id=a.root_request_id
             WHERE request_log.created_at >= ?{_attempt_family_where(conn, family)}
-              AND a.usage_observed=1
+              AND ({effective['usage_observed']})=1
+              AND ({effective['included']})=1
               AND COALESCE(a.call_request_id, '')<>''""",
         args,
     ).fetchall()
@@ -4751,6 +5289,55 @@ def _sanitize_request_timing(row: object) -> dict:
     return item
 
 
+def _overlay_cursor_events_on_logs(
+    conn: sqlite3.Connection,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not items or not _cursor_reconciliation_ready(conn):
+        return items
+    request_ids = [
+        str(item.get("request_id") or "") for item in items
+        if str(item.get("final_channel_key") or "").startswith("oauth:cursor:")
+        and item.get("request_id")
+    ]
+    if not request_ids:
+        return items
+    placeholders = ",".join("?" for _ in request_ids)
+    rows = conn.execute(
+        f"SELECT * FROM upstream_attempt_usage WHERE root_request_id IN ({placeholders})",
+        request_ids,
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["root_request_id"]), []).append(
+            _effective_attempt_row(row)
+        )
+    for item in items:
+        attempts = grouped.get(str(item.get("request_id") or ""), [])
+        if not attempts or not any(
+            row.get("cursor_event_key") or row.get("cursor_event_superseded")
+            for row in attempts
+        ):
+            continue
+        observed = [
+            row for row in attempts
+            if bool(row.get("usage_observed")) and row.get("cost_source") != "excluded"
+        ]
+        item.update({
+            "input_tokens": sum(int(row.get("input_tokens") or 0) for row in observed),
+            "output_tokens": sum(int(row.get("output_tokens") or 0) for row in observed),
+            "cache_creation_tokens": sum(
+                int(row.get("cache_creation_tokens") or 0) for row in observed
+            ),
+            "cache_read_tokens": sum(
+                int(row.get("cache_read_tokens") or 0) for row in observed
+            ),
+            "usage_observed": 1 if observed else 0,
+            "cursor_event_reconciled": True,
+        })
+    return items
+
+
 def _sanitize_retry_timing(row: object) -> dict:
     item = dict(row)
     item["connect_ms"] = compatible_connect_ms(
@@ -4793,7 +5380,9 @@ def recent_logs(
     sql = f"SELECT {_compatible_recent_cols(conn)} FROM request_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
     vals.extend([lim, off])
     rows = conn.execute(sql, vals).fetchall()
-    return [_sanitize_request_timing(r) for r in rows]
+    return _overlay_cursor_events_on_logs(
+        conn, [_sanitize_request_timing(r) for r in rows],
+    )
 
 
 def recent_logs_count(
@@ -4875,22 +5464,40 @@ def log_detail(request_id: str) -> dict:
         (request_id,),
     ).fetchall()
     billing_rows = _get_conn().execute(
-        """SELECT attempt_order, input_tokens, output_tokens,
-                  cache_creation_tokens, cache_creation_5m_tokens,
-                  cache_creation_1h_tokens, cache_read_tokens,
-                  pricing_snapshot_json, cost_source, cost_ticks
-             FROM upstream_attempt_usage
+        """SELECT * FROM upstream_attempt_usage
             WHERE root_request_id=?
             ORDER BY settled_at ASC, id ASC""",
         (request_id,),
     ).fetchall()
+    effective_billing = [_effective_attempt_row(row) for row in billing_rows]
+    rendered_log = _sanitize_request_timing(log_row) if log_row else None
+    if rendered_log and any(
+        row.get("cursor_event_key") or row.get("cursor_event_superseded")
+        for row in effective_billing
+    ):
+        observed = [
+            row for row in effective_billing
+            if bool(row.get("usage_observed")) and row.get("cost_source") != "excluded"
+        ]
+        rendered_log.update({
+            "input_tokens": sum(int(row.get("input_tokens") or 0) for row in observed),
+            "output_tokens": sum(int(row.get("output_tokens") or 0) for row in observed),
+            "cache_creation_tokens": sum(
+                int(row.get("cache_creation_tokens") or 0) for row in observed
+            ),
+            "cache_read_tokens": sum(
+                int(row.get("cache_read_tokens") or 0) for row in observed
+            ),
+            "usage_observed": 1 if observed else 0,
+            "cursor_event_reconciled": True,
+        })
     return {
-        "log": _sanitize_request_timing(log_row) if log_row else None,
+        "log": rendered_log,
         "detail": dict(detail_row) if detail_row else None,
         "retry_chain": [_sanitize_retry_timing(r) for r in chain_rows],
         "proxy_chain": [_sanitize_proxy_timing(r) for r in proxy_rows],
         "local_web_log": [dict(r) for r in local_web_rows],
-        "billing_attempts": [dict(r) for r in billing_rows],
+        "billing_attempts": effective_billing,
     }
 
 
@@ -4980,7 +5587,7 @@ def _accumulate_usage_costs(
     if _attempt_rows_exist(conn):
         attempt_protocol_expr = _attempt_protocol_expr(conn)
         attempt_rows = conn.execute(
-            f"""SELECT a.cost_source, a.cost_ticks, a.service_tier,
+            f"""SELECT a.*,
                        COALESCE(a.channel_key, request_log.final_channel_key, '?') AS channel_key,
                        COALESCE(request_log.requested_model, '?') AS model_key,
                        COALESCE(request_log.api_key_name, '?') AS apikey_key,
@@ -5439,15 +6046,28 @@ def stats_summary(
             ).fetchall():
                 recent_errors.append(dict(r))
 
-            for r in conn.execute(
+            recent_rows = conn.execute(
                 f"""SELECT {_compatible_recent_cols(conn, include_cost=include_cost)}
                    FROM request_log WHERE created_at >= ?{_family_where(family)}
                    ORDER BY created_at DESC LIMIT 3""",
                 (since_ts, *_family_params(family)),
-            ).fetchall():
-                recent_calls.append(_sanitize_request_timing(r))
+            ).fetchall()
+            recent_calls.extend(_overlay_cursor_events_on_logs(
+                conn, [_sanitize_request_timing(row) for row in recent_rows],
+            ))
 
             # 最近未命中样本（cc-proxy 同款）：成功但 cache_read_tokens=0。
+            # Cursor official events arrive after settlement, so a reconciled hit
+            # must override the realtime AgentService zero here as well.
+            cursor_hit_exclusion = ""
+            if _cursor_reconciliation_ready(conn):
+                cursor_hit_exclusion = (
+                    " AND NOT EXISTS (SELECT 1 FROM upstream_attempt_usage cua "
+                    "WHERE cua.root_request_id=request_log.request_id "
+                    "AND COALESCE(cua.cursor_event_superseded,0)=0 "
+                    "AND COALESCE(cua.cursor_event_key,'')<>'' "
+                    "AND COALESCE(cua.cursor_event_cache_read_tokens,0)>0)"
+                )
             # pricing 关闭时不能为了菜单读取任何响应正文。
             recent_pricing_exprs = _request_pricing_exprs(conn)
             has_request_detail = "request_detail" in _existing_tables(conn)
@@ -5477,6 +6097,7 @@ def stats_summary(
                    FROM request_log
                    WHERE created_at >= ?{_family_where(family)}
                      AND status='success' AND cache_read_tokens=0
+                     {cursor_hit_exclusion}
                    ORDER BY created_at DESC LIMIT 3""",
                 (since_ts, *_family_params(family)),
             ).fetchall():

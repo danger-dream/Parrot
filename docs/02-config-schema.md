@@ -270,7 +270,14 @@
     "bridgePort": 0,                  // 0 = 每次启动自动选择空闲端口
     "maxRetries": 2,
     "requestTimeoutSeconds": 300,
-    "modelSyncHours": 6               // 每账号 canonical 模型目录刷新间隔
+    "modelSyncHours": 6,              // 每账号 canonical 模型目录刷新间隔
+    "eventSyncEnabled": true,          // 通过 Cursor Web usage events 后置对账
+    "eventSyncSeconds": 30,            // 有待对账请求时的轮询间隔
+    "eventLookbackSeconds": 900,       // 常规轮询重叠窗口，容纳事件延迟/修订
+    "eventPageSize": 1000,
+    "eventMaxPages": 20,
+    "eventLegacyMatchSeconds": 5,      // 升级前日志仅在时间+原生模型唯一时回填
+    "eventToolSettleSeconds": 120      // 工具续轮单事件归并等待时间
   },
 
   // ─── 调度算法 / 负载均衡 ───
@@ -396,7 +403,7 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - `defaults`：键为客户端可见模型名/渠道 alias，值只保存 models.dev `provider/model` identity 与来源；不复制全量目录记录。
 - `scoped`：先按稳定 scope key（`api:<name>` / `oauth:<provider>:<identity>`），再按客户端可见模型名索引；API alias 同时保存当时的 `outboundModel`，alias 被改指后旧专属绑定不再误用。
 - 普通渠道有效解析固定为 `scoped > default > none`。context window、max output、压缩阈值、能力展示和估算价格均从该绑定指向的同一份 models.dev 目录取得；没有有效绑定时保持无元数据/未计价，不按 provider 或模型前缀猜测。压缩阈值优先取 models.dev 第一档 context 价格阶梯的起点；没有该阶梯时按 `floor((contextWindow - maxOutputTokens) × 80%)` 计算。
-- Cursor OAuth scope 是有意设计的例外，固定优先级为 `Cursor AvailableModels > scoped > default > none`。它按账号自动生成只读 `cursor/<canonical-id>` 元数据，使用 Cursor 返回的 normal/max context 与 legacy slugs；不允许手动改绑/删除，也不拿同名 models.dev 限制覆盖。Cursor 压缩阈值保守按该账号 `floor((contextWindow - maxOutputTokens) × 80%)` 计算。Cursor 当前不返回可冻结的逐请求 tariff，因此计费保持未计价，账号总额度单独来自 Cursor DashboardService。
+- Cursor OAuth scope 是有意设计的例外，固定优先级为 `Cursor AvailableModels > scoped > default > none`。它按账号自动生成只读 `cursor/<canonical-id>` 元数据，使用 Cursor 返回的 normal/max context 与 legacy slugs；不允许手动改绑/删除，也不拿同名 models.dev 限制覆盖。Cursor 压缩阈值保守按该账号 `floor((contextWindow - maxOutputTokens) × 80%)` 计算。AgentService 实时 usage 不含缓存拆分或逐请求 tariff；Parrot 会从内部 bridge 捕获上游 `conversationId`，再以该 ID 对账 Cursor Web usage event，后置回填官方 input/output/cache-write/cache-read 与 `chargedCents`。事件到达前保持未计价，绝不套用 models.dev 或按时间猜测；账号总额度仍单独以 Cursor DashboardService 为准。
 - Telegram「自动同步元数据」会先拉取最新的 `api.json` 与 `models.json`：两份均下载、校验成功后原子保存为本地 gzip 目录；任一拉取失败则保留并继续使用上次成功保存的本地目录。随后从该本地目录扫描每个 OAuth/API scope 的已有客户端模型，去重后只按 `models.json` canonical 官方根与 `api.json` 的 exact 同名记录建立/更新默认绑定，不覆盖专属绑定。专属流程按 OAuth/API 账户或渠道 → 该 scope 内模型 → exact 同名候选优先选择；找不到合适候选时才按名称筛选或浏览 provider 与其模型。
 - `compressionModel` 是独立的客户端可见模型名。运行时按实际 compact 路由解析相同的有效绑定来取得 context、max output 和压缩阈值；普通请求的 compact 预检、直连压缩判断和 map-reduce 分段目标都会使用该阈值。旧 `modelMetadata[*].compressionModel=true` 会一次性迁移，旧手工元数据只有 exact canonical 命中时才迁成默认绑定。
 

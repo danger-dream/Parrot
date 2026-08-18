@@ -732,7 +732,9 @@ def _billing_detail_lines(cost_metrics: dict, attempts: list[dict]) -> list[str]
     ]
     if len(priced) == 1:
         formula = _attempt_cost_formula(priced[0])
-        return [f"💵 {total}" + (f" = {formula}" if formula else "")]
+        cursor_official = bool(priced[0].get("cursor_event_key"))
+        suffix = "（Cursor 官方事件）" if cursor_official else ""
+        return [f"💵 {total}{suffix}" + (f" = {formula}" if formula else "")]
 
     lines = [f"💵 {total}"]
     for index, row in enumerate(priced, start=1):
@@ -816,6 +818,8 @@ def _render_detail(detail: dict) -> str:
         if (log.get("cache_read_tokens") or 0) > 0:
             token_line += f" | {ui.fmt_cache_phrase_from_row(log)}"
         lines.append(token_line)
+        if log.get("cursor_event_reconciled"):
+            lines.append("来源: <code>Cursor 官方 usage event</code>")
         lines.extend(["", "<b>计费</b>"])
         lines.extend(_billing_detail_lines(cost_metrics, billing_attempts))
     elif status in ("error", "cancelled") and (
