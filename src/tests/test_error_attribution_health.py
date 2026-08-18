@@ -121,6 +121,7 @@ def test_structured_request_fault_preserves_supported_client_status(status):
         "string_above_max_length",
         "previous_response_not_found",
         "cyber_policy",
+        "1301",
     ],
 )
 def test_explicit_structured_request_markers_override_wrapping_5xx(marker):
@@ -137,6 +138,55 @@ def test_explicit_structured_request_markers_override_wrapping_5xx(marker):
     assert normalized.error_code == marker
     assert should_cooldown(normalized.outcome) is False
     assert should_record_failure(normalized.outcome) is False
+
+
+def test_zhipu_1301_http_400_is_request_invalid_and_not_a_channel_fault():
+    message = (
+        "[1301][系统检测到输入或生成内容可能包含不安全或敏感内容，"
+        "请您避免输入易产生敏感内容的提示语，感谢您的配合。][req-1]"
+    )
+    result = AttemptResult(
+        outcome="http_error",
+        http_status=400,
+        error_detail="HTTP 400: " + json.dumps({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "1301",
+                "message": message,
+            },
+            "request_id": "req-1",
+        }, ensure_ascii=False),
+    )
+
+    normalized = request_invalid_result_if_needed(result)
+
+    assert normalized.outcome == "request_invalid"
+    assert normalized.http_status == 400
+    assert normalized.error_code == "1301"
+    assert normalized.error_detail == message
+    assert should_cooldown(normalized.outcome) is False
+    assert should_record_failure(normalized.outcome) is False
+
+
+def test_zhipu_1301_stream_message_without_json_is_request_invalid():
+    message = (
+        "[1301][系统检测到输入或生成内容可能包含不安全或敏感内容，"
+        "请您避免输入易产生敏感内容的提示语，感谢您的配合。][req-1]"
+    )
+    result = AttemptResult(
+        outcome="upstream_error_json",
+        http_status=200,
+        error_detail=message,
+    )
+
+    normalized = request_invalid_result_if_needed(result)
+
+    assert normalized.outcome == "request_invalid"
+    assert normalized.http_status == 400
+    assert normalized.error_code == "1301"
+    assert normalized.error_detail == message
+    assert should_cooldown(normalized.outcome) is False
 
 
 def test_plain_or_message_only_5xx_remains_upstream_failure():

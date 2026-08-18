@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from src.failover import _structured_attempt_error, _structured_failure_details
+from src.failover import (
+    _sanitize_upstream_message,
+    _structured_attempt_error,
+    _structured_failure_details,
+)
 from src.openai.responses_ws import (
     _WsAttemptResult,
     _aggregate_failed_candidate_status,
@@ -55,6 +61,21 @@ def test_marker_is_generic_sanitized_http_failure_not_permission():
     assert attempt["classification"] == "upstream_http_error"
     assert attempt["message"] == "Upstream returned an HTTP 403 response"
     assert "example" not in _structured_failure_details([attempt])["summary"]
+
+
+def test_sanitize_keeps_zhipu_1301_bracket_message():
+    message = (
+        "[1301][系统检测到输入或生成内容可能包含不安全或敏感内容，"
+        "请您避免输入易产生敏感内容的提示语，感谢您的配合。][req-1]"
+    )
+    raw = (
+        "HTTP 400: "
+        + '{"type":"error","error":{"type":"invalid_request_error","code":"1301","message":'
+        + json.dumps(message, ensure_ascii=False)
+        + "}}"
+    )
+    assert _sanitize_upstream_message(raw) == message
+    assert _sanitize_upstream_message(message) == message
 
 
 def test_structured_plain_403_is_unchanged_permission_failure():

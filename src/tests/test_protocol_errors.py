@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
@@ -103,6 +104,44 @@ def test_request_invalid_error_info_fails_closed_for_channel_or_ambiguous_400_bo
             "message": "configured upstream model does not exist",
         }
     }) is None
+    assert errors.request_invalid_error_info({
+        "error": {
+            "type": "invalid_request_error",
+            "code": "1310",
+            "message": "[1310][您已达到每周/每月使用上限，您的限额将在 2099-01-01 00:00:00 重置。]",
+        }
+    }) is None
+
+
+def test_zhipu_1301_content_policy_is_an_explicit_request_fault():
+    message = (
+        "[1301][系统检测到输入或生成内容可能包含不安全或敏感内容，"
+        "请您避免输入易产生敏感内容的提示语，感谢您的配合。][req-1]"
+    )
+    payload = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "1301",
+            "message": message,
+        },
+        "request_id": "req-1",
+    }
+
+    assert errors.request_invalid_error_info(payload) == ("1301", message)
+    assert errors.is_zhipu_content_policy_code_or_message("1301", "unrelated") is True
+    assert errors.is_zhipu_content_policy_code_or_message(None, message) is True
+    assert errors.is_zhipu_content_policy_code_or_message(None, "[1310][每周/每月使用上限]") is False
+
+    chat = runtime.json_error_for_ingress(
+        "chat", 400, "invalid_request_error", message, code="1301",
+    )
+    chat_body = chat.body.decode() if isinstance(chat.body, (bytes, bytearray)) else chat.body
+    chat_payload = json.loads(chat_body)
+    assert chat.status_code == 400
+    assert chat_payload["error"]["code"] == "1301"
+    assert chat_payload["error"]["message"] == message
+    assert chat_payload["error"]["type"] == "invalid_request_error"
 
 
 def test_context_length_errors_are_formatted_for_claude_code_compact():

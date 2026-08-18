@@ -1074,6 +1074,10 @@ def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
             result.error_detail = protocol_errors.context_length_error_message_for_claude_code(
                 context_detail,
             )
+        elif protocol_errors.is_zhipu_content_policy_code_or_message(
+            result.error_code, result.error_detail,
+        ):
+            result.error_code = protocol_errors.ZHIPU_CONTENT_POLICY_CODE
         return _mark_request_invalid(result, _request_invalid_status(result))
     # Text-only compatibility recognizers are limited to status-less and the
     # request-like HTTP statuses accepted above. Status alone is deliberately
@@ -1085,6 +1089,11 @@ def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
     if text_classification_allowed and is_invalid_encrypted_content_error(result.error_detail):
         return _mark_request_invalid(result, _request_invalid_status(result))
     if text_classification_allowed and is_context_length_exceeded_error(result.error_detail):
+        return _mark_request_invalid(result, _request_invalid_status(result))
+    if text_classification_allowed and protocol_errors.is_zhipu_content_policy_code_or_message(
+        result.error_code, result.error_detail,
+    ):
+        result.error_code = protocol_errors.ZHIPU_CONTENT_POLICY_CODE
         return _mark_request_invalid(result, _request_invalid_status(result))
     return result
 

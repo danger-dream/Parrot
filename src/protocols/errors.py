@@ -352,6 +352,11 @@ _REQUEST_INVALID_ERROR_TYPES = frozenset({
     "previous_response_not_found",
     "cyber_policy",
 })
+ZHIPU_CONTENT_POLICY_CODE = "1301"
+_ZHIPU_CONTENT_POLICY_MESSAGE_MARKERS = (
+    "[1301]",
+    "系统检测到输入或生成内容可能包含不安全或敏感",
+)
 _REQUEST_INVALID_INPUT_CODES = frozenset({
     "invalid_prompt",
     "invalid_request_error",
@@ -371,6 +376,7 @@ _REQUEST_INVALID_INPUT_CODES = frozenset({
     "string_above_max_length",
     "previous_response_not_found",
     "cyber_policy",
+    ZHIPU_CONTENT_POLICY_CODE,
 })
 _REQUEST_ERROR_WRAPPER_KEYS = (
     "error", "response", "detail", "details", "body", "cause",
@@ -387,6 +393,18 @@ _REQUEST_INPUT_PARAM_ROOTS = frozenset({
     "max_tokens",
     "max_output_tokens",
 })
+
+
+def is_zhipu_content_policy_code_or_message(code: Any = None, message: Any = None) -> bool:
+    """Return True for Zhipu 1301 content-policy rejections of the prompt itself.
+
+    The same user content will fail on every Zhipu channel, so this must not be
+    treated as a retryable upstream/channel fault.
+    """
+    if str(code or "").strip() == ZHIPU_CONTENT_POLICY_CODE:
+        return True
+    text = str(message or "")
+    return any(marker in text for marker in _ZHIPU_CONTENT_POLICY_MESSAGE_MARKERS)
 
 
 def request_invalid_error_info(payload: Any) -> tuple[str | None, str] | None:

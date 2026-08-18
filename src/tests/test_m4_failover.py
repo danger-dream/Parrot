@@ -136,6 +136,33 @@ def http_channel_400():
     })
 
 
+ZHIPU_1301_MESSAGE = (
+    "[1301][系统检测到输入或生成内容可能包含不安全或敏感内容，"
+    "请您避免输入易产生敏感内容的提示语，感谢您的配合。][req-1]"
+)
+
+
+def zhipu_1301_http_400():
+    return httpx.Response(400, json={
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "1301",
+            "message": ZHIPU_1301_MESSAGE,
+        },
+        "request_id": "req-1",
+    })
+
+
+def sse_first_event_zhipu_1301_error():
+    payload = (
+        b'data: {"type":"error","error":{"type":"invalid_request_error","code":"1301",'
+        b'"message":' + json.dumps(ZHIPU_1301_MESSAGE, ensure_ascii=False).encode("utf-8") + b'}}\n\n'
+    )
+    return httpx.Response(200, content=payload,
+                          headers={"content-type": "text/event-stream"})
+
+
 def openai_context_length_error():
     return httpx.Response(200, json={
         "error": {
@@ -662,6 +689,40 @@ async def test_context_length_error_short_circuits_failover(m):
     print("  [PASS] context_length_exceeded → request_invalid 400 without failover")
 
 
+async def test_zhipu_1301_content_policy_short_circuits_failover(m):
+    _setup(m)
+    router = MockRouter()
+    chb_calls = {"count": 0}
+
+    def chb_handler(req):
+        chb_calls["count"] += 1
+        return json_ok_response()
+
+    router.register("https://cha", lambda r: zhipu_1301_http_400())
+    router.register("https://chb", chb_handler)
+    chA = _make_channel(m, "chA", "https://cha")
+    chB = _make_channel(m, "chB", "https://chb")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "glm-5", "stream": False, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    assert resp.status_code == 400, f"expected 400, got {resp.status_code} body={getattr(resp, 'body', b'')[:500]!r}"
+    await mc.aclose()
+
+    payload = json.loads(resp.body)
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["code"] == "1301"
+    assert payload["error"]["message"] == ZHIPU_1301_MESSAGE
+    assert chb_calls["count"] == 0
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["status"] == "error", log["log"]
+    assert len(log["retry_chain"]) == 1
+    assert log["retry_chain"][0]["outcome"] == "request_invalid"
+    assert not m["cooldown"].is_blocked("api:chA", "glm-5")
+    print("  [PASS] zhipu 1301 → request_invalid 400 without failover")
+
+
 async def test_invalid_encrypted_content_retries_same_channel_without_ec(m):
     _setup(m)
     router = MockRouter()
@@ -851,6 +912,37 @@ async def test_stream_context_length_first_event_short_circuits_failover(m):
     assert "prompt is too long" in log["log"]["error_message"]
     assert not m["cooldown"].is_blocked("api:chA", "glm-5")
     print("  [PASS] stream context overflow first event → request_invalid 400 without failover")
+
+
+async def test_stream_zhipu_1301_first_event_short_circuits_failover(m):
+    _setup(m)
+    router = MockRouter()
+    chb_calls = {"count": 0}
+
+    def chb_handler(req):
+        chb_calls["count"] += 1
+        return sse_ok()
+
+    router.register("https://cha", lambda r: sse_first_event_zhipu_1301_error())
+    router.register("https://chb", chb_handler)
+    chA = _make_channel(m, "chA", "https://cha")
+    chB = _make_channel(m, "chB", "https://chb")
+    _install_channels(m, [chA, chB])
+
+    body = {"model": "glm-5", "stream": True, "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]}
+    resp, rid, sr, mc = await _call_proxy(m, router, body)
+    assert resp.status_code == 400, f"expected 400, got {resp.status_code} body={getattr(resp, 'body', b'')[:500]!r}"
+    await mc.aclose()
+
+    payload = json.loads(resp.body)
+    assert payload["error"]["code"] == "1301"
+    assert payload["error"]["message"] == ZHIPU_1301_MESSAGE
+    assert chb_calls["count"] == 0
+    log = m["log_db"].log_detail(rid)
+    assert log["retry_chain"][0]["outcome"] == "request_invalid"
+    assert not m["cooldown"].is_blocked("api:chA", "glm-5")
+    print("  [PASS] stream first-event 1301 → request_invalid 400 without failover")
 
 
 async def test_stream_midstream_error_logs_upstream_error(m):
@@ -1238,9 +1330,11 @@ async def amain():
         test_all_fail_503,
         test_channel_semantic_400_still_switches_and_cools_down,
         test_context_length_error_short_circuits_failover,
+        test_zhipu_1301_content_policy_short_circuits_failover,
         test_stream_success_full_forward,
         test_stream_first_event_error_switches,
         test_stream_context_length_first_event_short_circuits_failover,
+        test_stream_zhipu_1301_first_event_short_circuits_failover,
         test_stream_midstream_error_logs_upstream_error,
         test_responses_error_before_visible_chunk_switches,
         test_responses_chunked_metadata_error_before_visible_chunk_switches,

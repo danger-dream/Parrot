@@ -799,8 +799,14 @@ def _sanitize_upstream_message(value: Any) -> str:
             code_message = "Upstream returned an error"
             break
         code_message = str(next_value)
-    if code_message.lstrip().startswith(("{", "[")):
-        code_message = "Upstream returned an error"
+    leftover = code_message.lstrip()
+    if leftover.startswith(("{", "[")):
+        try:
+            parsed = json.loads(leftover)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            code_message = "Upstream returned an error"
     code_message = _BEARER_RE.sub("Bearer [redacted]", code_message)
     code_message = _FIELD_SECRET_RE.sub("credential=[redacted]", code_message)
     code_message = _SECRET_RE.sub("[redacted credential]", code_message)
