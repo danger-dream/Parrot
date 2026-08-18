@@ -2295,8 +2295,10 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         variants = sum(
             len(item.get("legacy_slugs") or []) for item in records if isinstance(item, dict)
         )
+        profile_name = str(acc.get("cursor_profile_name") or "").strip()
         provider_line = (
-            f"🏷️ 套餐: <code>{ui.escape_html(str(acc.get('plan_type') or 'Cursor'))}</code>\n"
+            (f"👤 姓名: <code>{ui.escape_html(profile_name)}</code>\n" if profile_name else "")
+            + f"🏷️ 套餐: <code>{ui.escape_html(str(acc.get('plan_type') or 'Cursor'))}</code>\n"
             f"🧬 模型目录: <code>{len(acc.get('models') or [])} canonical / {variants} 原生变体</code>\n"
             f"📚 元数据: <code>Cursor AvailableModels（账号专属）</code>\n"
         )
@@ -2481,6 +2483,8 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         ))
         if isinstance(sync_result, dict) and sync_result.get("action") == "updated":
             model_sync_note = f" · 模型 {int(sync_result.get('models') or 0)} 个"
+        elif isinstance(sync_result, dict) and sync_result.get("action") == "profile_updated":
+            model_sync_note = " · 账号资料已同步（模型保留原目录）"
         elif isinstance(sync_result, (dict, Exception)):
             model_sync_note = " · 模型同步失败（保留原目录）"
 
@@ -2558,6 +2562,11 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         head = "✅ 已更新 Cursor 套餐额度"
         if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
             head += f"\n🧬 模型目录已同步: <code>{int(metadata_action.get('models') or 0)} 个</code>"
+            if metadata_action.get("profile_updated"):
+                head += "\n👤 账号邮箱与姓名已同步"
+        elif isinstance(metadata_action, dict) and metadata_action.get("action") == "profile_updated":
+            head += "\n👤 账号邮箱与姓名已同步"
+            head += "\n⚠️ 模型目录本次同步失败，保留原目录"
         elif isinstance(metadata_action, dict) and metadata_action.get("action") in {"error", "timeout", "fetch_empty"}:
             head += "\n⚠️ 额度已更新，但模型目录本次同步失败，保留原目录"
         if quota_action and quota_action.get("action") == "cursor_pool_cooldown":
@@ -3741,6 +3750,17 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         )
         return
 
+    profile: dict = {}
+    profile_error: Exception | None = None
+    try:
+        profile = cursor_provider.fetch_profile_sync(
+            tokens.access_token, account_key=f"cursor:{subject}",
+        )
+    except Exception as exc:
+        # Profile is display metadata; keep login usable when cursor.com has a
+        # temporary failure and retry on the next model/profile sync.
+        profile_error = exc
+
     usage: dict | None = None
     usage_error: Exception | None = None
     try:
@@ -3750,10 +3770,13 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
 
     cursor_usage = (usage or {}).get("cursor") if isinstance(usage, dict) else {}
     cursor_usage = cursor_usage if isinstance(cursor_usage, dict) else {}
-    email = cursor_provider.account_label(subject)
+    profile_email = str(profile.get("email") or "").strip()
+    email = profile_email or cursor_provider.account_label(subject)
     plan = str(cursor_usage.get("plan_name") or cursor_usage.get("individual_membership_type") or "Cursor")
     short_subject = hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8]
-    label = f"Cursor {plan} · {short_subject}" if plan and plan != "Cursor" else f"Cursor · {short_subject}"
+    label = email if profile_email else (
+        f"Cursor {plan} · {short_subject}" if plan and plan != "Cursor" else f"Cursor · {short_subject}"
+    )
     expired = datetime.fromtimestamp(tokens.expires_at_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     entry = {
         "email": email,
@@ -3762,6 +3785,11 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         "type": "cursor",
         "subject": subject,
         "sub": subject,
+        "cursor_profile_name": str(profile.get("name") or "").strip(),
+        "cursor_profile_id": str(profile.get("id") or "").strip(),
+        "cursor_email_verified": (
+            profile.get("email_verified") if isinstance(profile.get("email_verified"), bool) else None
+        ),
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
         "expired": expired,
@@ -3809,6 +3837,12 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         )
     if usage_error is not None:
         quota_line += "\n⚠️ 用量接口本次未完整返回，Token 和模型已保存。"
+    profile_line = ""
+    profile_name = str(profile.get("name") or "").strip()
+    if profile_name:
+        profile_line = f"姓名: <code>{ui.escape_html(profile_name)}</code>\n"
+    if profile_error is not None:
+        profile_line += "⚠️ 账号资料本次未获取，暂用内部标识；下次模型同步会重试。\n"
     title = "Cursor OAuth 账户已更新" if existed else "Cursor OAuth 账户已添加"
     lb_hint = (
         "\n已加入 OpenAI 家族负载均衡队列末尾，可在负载均衡菜单调整优先级。"
@@ -3819,6 +3853,7 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         message_id,
         f"✅ {_provider_tag('cursor')} <b>{title}</b>\n\n"
         f"账户: <code>{ui.escape_html(label)}</code>\n"
+        f"{profile_line}"
         f"套餐: <code>{ui.escape_html(plan)}</code>\n"
         f"模型: <code>{len(models)} 个 canonical 模型</code>\n"
         f"原生变体: <code>{sum(len(item.get('legacy_slugs') or []) for item in records or [] if isinstance(item, dict))} 个</code>\n"

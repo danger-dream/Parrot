@@ -27,6 +27,13 @@ from ..cursor_bridge.auth import (
     token_expiry_ms,
 )
 from ..cursor_bridge.catalog import build_catalog
+from ..cursor_bridge.constants import CURSOR_CLIENT_VERSION, CURSOR_WEB_PROFILE_URL
+from ..cursor_bridge.errors import (
+    CursorAuthError,
+    CursorError,
+    CursorTimeoutError,
+    classify_cursor_failure,
+)
 from ..cursor_bridge.models import CursorModel, list_cursor_models
 from ..cursor_bridge.usage import CursorUsage, fetch_cursor_usage
 
@@ -97,6 +104,78 @@ def subject_from_access_token(token: str) -> str:
 def account_label(subject: str) -> str:
     digest = hashlib.sha256(str(subject or "cursor").encode("utf-8")).hexdigest()[:10]
     return f"cursor-{digest}@local"
+
+
+def web_session_cookie(access_token: str) -> str:
+    """Build Cursor's first-party Web session cookie from a CLI access token."""
+    subject = subject_from_access_token(access_token)
+    user_id = subject.rsplit("|", 1)[-1].strip() if subject else ""
+    if not user_id:
+        raise CursorAuthError("Cursor access token 缺少 Web session user id")
+    return f"WorkosCursorSessionToken={user_id}%3A%3A{access_token}"
+
+
+def _profile_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_profile(raw: dict[str, Any]) -> dict[str, Any]:
+    profile = {
+        "id": _profile_text(raw.get("id") or raw.get("userId")),
+        "sub": _profile_text(raw.get("sub")),
+        "email": _profile_text(raw.get("email")),
+        "name": _profile_text(raw.get("name")),
+        "email_verified": (
+            raw.get("email_verified")
+            if isinstance(raw.get("email_verified"), bool)
+            else None
+        ),
+    }
+    if not profile["id"] and not profile["email"]:
+        raise CursorError("Cursor 账号资料缺少稳定用户 ID 和邮箱", code="profile_invalid", status=502)
+    return profile
+
+
+def fetch_profile_sync(access_token: str, *, account_key: str = "") -> dict[str, Any]:
+    """Fetch Cursor Web account identity (email/name) using the CLI OAuth token."""
+    if _mock_mode_enabled():
+        subject = subject_from_access_token(access_token) or "cursor-mock-user"
+        return {
+            "id": subject,
+            "sub": subject,
+            "email": "cursor-mock@example.test",
+            "name": "Cursor Mock",
+            "email_verified": True,
+        }
+
+    headers = {
+        "Accept": "application/json",
+        "Cookie": web_session_cookie(access_token),
+        "User-Agent": f"cursor-agent/{CURSOR_CLIENT_VERSION.removeprefix('cli-')}",
+    }
+    try:
+        with _http_client(account_key=account_key, timeout=20.0) as client:
+            response = client.get(CURSOR_WEB_PROFILE_URL, headers=headers)
+    except httpx.TimeoutException as exc:
+        raise CursorTimeoutError("Cursor 账号资料请求超时") from exc
+    except httpx.HTTPError as exc:
+        raise classify_cursor_failure("Cursor 账号资料请求失败") from exc
+    if response.status_code in {401, 403}:
+        raise CursorAuthError(f"Cursor 账号资料未授权 ({response.status_code})")
+    if not response.is_success:
+        raise classify_cursor_failure(
+            f"Cursor 账号资料接口返回 HTTP {response.status_code}",
+            http_status=response.status_code,
+        )
+    try:
+        raw = response.json()
+    except ValueError as exc:
+        raise CursorError(
+            "Cursor 账号资料不是有效 JSON", code="profile_invalid", status=502,
+        ) from exc
+    if not isinstance(raw, dict):
+        raise CursorError("Cursor 账号资料格式无效", code="profile_invalid", status=502)
+    return _normalize_profile(raw)
 
 
 def expiry_iso(token: str) -> str:
@@ -319,6 +398,7 @@ __all__ = [
     "decode_access_claims",
     "expiry_iso",
     "fetch_model_catalog_sync",
+    "fetch_profile_sync",
     "fetch_models_sync",
     "fetch_usage",
     "fetch_usage_sync",
@@ -327,4 +407,5 @@ __all__ = [
     "poll_login_once",
     "refresh_sync",
     "subject_from_access_token",
+    "web_session_cookie",
 ]

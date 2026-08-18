@@ -2471,6 +2471,13 @@ def _add_account_serialized(entry: dict) -> None:
             "subject": subject,
             "sub": subject,
             "label": entry.get("label") or entry.get("email") or "Cursor",
+            "cursor_profile_name": entry.get("cursor_profile_name") or "",
+            "cursor_profile_id": entry.get("cursor_profile_id") or "",
+            "cursor_email_verified": (
+                entry.get("cursor_email_verified")
+                if isinstance(entry.get("cursor_email_verified"), bool)
+                else None
+            ),
             "cursor_model_catalog": copy.deepcopy(entry.get("cursor_model_catalog") or {}),
             "plan_type": entry.get("plan_type") or "",
             "subscription_status": entry.get("subscription_status") or "",
@@ -2579,6 +2586,13 @@ def _add_account_serialized(entry: dict) -> None:
             keep_enabled = target.get("enabled")
             keep_disabled_reason = target.get("disabled_reason")
             keep_disabled_until = target.get("disabled_until")
+            keep_cursor_profile = {
+                key: target.get(key)
+                for key in (
+                    "email", "label", "cursor_profile_name",
+                    "cursor_profile_id", "cursor_email_verified",
+                )
+            }
             target.update(normalized)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
@@ -2588,6 +2602,14 @@ def _add_account_serialized(entry: dict) -> None:
                 target["enabled"] = keep_enabled
                 target["disabled_reason"] = keep_disabled_reason
                 target["disabled_until"] = keep_disabled_until
+            if (
+                provider == "cursor"
+                and not entry.get("cursor_profile_id")
+                and keep_cursor_profile.get("cursor_profile_id")
+            ):
+                # A transient cursor.com profile failure during re-login must not
+                # replace previously verified identity metadata with a hash label.
+                target.update(keep_cursor_profile)
             # Same canonical OpenAI workspace reimport preserves omitted
             # device identity and explicit opt-out state.
             if (
@@ -3244,27 +3266,75 @@ def refresh_cursor_models_sync(
     access_token = str(acc.get("access_token") or "")
     if not access_token:
         return {"action": "skipped_no_access_token", "account_key": account_key}
-    catalog = cursor_provider.fetch_model_catalog_sync(access_token)
-    records = (catalog.get("models") or []) if isinstance(catalog, dict) else []
-    models = [str(item.get("id") or "") for item in records if isinstance(item, dict) and item.get("id")]
-    if not models:
-        return {"action": "fetch_empty", "account_key": account_key}
-    fetched_at = str(catalog.get("fetched_at") or _format_utc(datetime.now(timezone.utc)))
+    catalog: dict[str, Any] = {}
+    models: list[str] = []
+    fetched_at = ""
+    model_error: Exception | None = None
+    model_error_name = ""
+    try:
+        catalog = cursor_provider.fetch_model_catalog_sync(access_token)
+        records = (catalog.get("models") or []) if isinstance(catalog, dict) else []
+        models = [
+            str(item.get("id") or "")
+            for item in records
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if models:
+            fetched_at = str(
+                catalog.get("fetched_at") or _format_utc(datetime.now(timezone.utc))
+            )
+        else:
+            model_error_name = "fetch_empty"
+    except Exception as exc:
+        model_error = exc
+        model_error_name = type(exc).__name__
+
+    profile: dict[str, Any] = {}
+    profile_error = ""
+    try:
+        profile = cursor_provider.fetch_profile_sync(access_token, account_key=account_key)
+    except Exception as exc:
+        # Models and account identity are independent last-known-good data. A
+        # failure in either source must not discard a successful refresh of the other.
+        profile_error = type(exc).__name__
+
+    if not models and not profile:
+        if model_error is not None:
+            raise model_error
+        return {
+            "action": "fetch_empty",
+            "account_key": account_key,
+            "profile_error": profile_error,
+        }
+
+    profile_email = str(profile.get("email") or "").strip()
 
     def mutate(current_cfg):
         for item in current_cfg.get("oauthAccounts", []):
             if _canonical_key(item) == account_key:
-                item["models"] = list(dict.fromkeys(models))
-                item["cursor_model_catalog"] = copy.deepcopy(catalog)
-                item["last_model_sync"] = fetched_at
+                if models:
+                    item["models"] = list(dict.fromkeys(models))
+                    item["cursor_model_catalog"] = copy.deepcopy(catalog)
+                    item["last_model_sync"] = fetched_at
+                if profile:
+                    if profile_email:
+                        item["email"] = profile_email
+                        item["label"] = profile_email
+                    item["cursor_profile_name"] = str(profile.get("name") or "").strip()
+                    item["cursor_profile_id"] = str(profile.get("id") or "").strip()
+                    verified = profile.get("email_verified")
+                    item["cursor_email_verified"] = verified if isinstance(verified, bool) else None
                 return
 
     config.update(mutate)
     return {
-        "action": "updated",
+        "action": "updated" if models else "profile_updated",
         "account_key": account_key,
         "models": len(models),
         "fetched_at": fetched_at,
+        "model_error": model_error_name,
+        "profile_updated": bool(profile),
+        "profile_error": profile_error,
     }
 
 

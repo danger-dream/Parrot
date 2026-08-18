@@ -33,7 +33,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 |------|------|------|
 | 🅰 Anthropic OAuth | Claude Code 官方账户 | 完整 CC 伪装（指纹 / CCH / 工具名混淆 / cache 断点），与 cc-proxy 同源移植 |
 | 🅾 OpenAI OAuth (Codex) | ChatGPT Plus/Pro/Enterprise | 对接 `chatgpt.com/backend-api/codex/responses`，SSE 聚合、rate-limit 头自动解析 |
-| 🖱️ Cursor OAuth | Cursor 个人/团队订阅 | 浏览器 PKCE 登录，自动同步套餐额度、canonical 模型与 200+ 原生变体；通过私有 AgentService bridge 同时服务 Chat / Responses / Anthropic 入口 |
+| 🖱️ Cursor OAuth | Cursor 个人/团队订阅 | 浏览器 PKCE 登录，自动同步真实邮箱/姓名、套餐额度、canonical 模型与 200+ 原生变体；通过私有 AgentService bridge 同时服务 Chat / Responses / Anthropic 入口 |
 | 🔀 第三方 API 渠道 | 智谱 / 天翼云 / 京东云 / 讯飞星辰 / 任何 Anthropic 或 OpenAI 兼容服务 | 可开关 CC 伪装；按 `protocol` 决定走哪种请求构造器 |
 
 **家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。

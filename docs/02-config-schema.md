@@ -82,9 +82,12 @@
   // 不扩展到 session/full 或非 OpenAI OAuth 渠道。
 
   // Cursor 账户由 TG「Cursor 登录」自动写入：provider/type=cursor；subject/sub
-  // 来自 Access Token JWT；models 是下游可见 canonical ids；cursor_model_catalog
-  // 保存该账号 AvailableModels 的上下文、Max Context 和真实 legacy_slugs。
-  // 这些账号专属元数据不写入 modelBindings，也不继承 models.dev。
+  // 来自 Access Token JWT，并始终作为稳定内部主键。Parrot 会用同一 Token 合成
+  // Cursor Web 会话并调用 /api/auth/me，同步真实 email、姓名、用户 ID 与邮箱验证状态；
+  // Web 资料临时失败时只回退哈希展示名，不阻断登录或覆盖此前已验证资料。
+  // models 是下游可见 canonical ids；cursor_model_catalog 保存该账号 AvailableModels
+  // 的上下文、Max Context 和真实 legacy_slugs。这些账号专属元数据不写入
+  // modelBindings，也不继承 models.dev。
 
   // ─── 第三方 API 渠道列表 ───
   "channels": [

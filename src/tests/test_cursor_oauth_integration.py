@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
+
+import httpx
 
 from ._isolation import isolate
 
@@ -289,6 +292,108 @@ def test_cursor_quota_cools_only_affected_pool_and_recovers():
     assert not cooldown.is_blocked(channel_key, "composer-2.5")
 
 
+def test_cursor_web_profile_uses_synthesized_workos_cookie(monkeypatch):
+    config.update(lambda cfg: cfg.setdefault("oauth", {}).__setitem__("mockMode", False))
+    token = cursor_provider._mock_jwt("auth0|user_profile", int(time.time() * 1000) + 3600_000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://cursor.com/api/auth/me"
+        assert request.headers["cookie"] == (
+            f"WorkosCursorSessionToken=user_profile%3A%3A{token}"
+        )
+        return httpx.Response(200, json={
+            "id": "user_profile",
+            "sub": "auth0|user_profile",
+            "email": "real-cursor@example.com",
+            "email_verified": True,
+            "name": "Cursor User",
+        })
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        cursor_provider,
+        "_http_client",
+        lambda **_kwargs: httpx.Client(transport=transport),
+    )
+    profile = cursor_provider.fetch_profile_sync(token, account_key="cursor:auth0|user_profile")
+    assert profile == {
+        "id": "user_profile",
+        "sub": "auth0|user_profile",
+        "email": "real-cursor@example.com",
+        "name": "Cursor User",
+        "email_verified": True,
+    }
+
+
+def test_cursor_model_refresh_updates_real_profile_without_changing_subject(monkeypatch):
+    _install_account()
+    monkeypatch.setattr(cursor_provider, "fetch_model_catalog_sync", lambda _token: _catalog())
+    monkeypatch.setattr(cursor_provider, "fetch_profile_sync", lambda *_args, **_kwargs: {
+        "id": "cursor-web-user-1",
+        "sub": "cursor-user-1",
+        "email": "real-cursor@example.com",
+        "name": "Cursor User",
+        "email_verified": True,
+    })
+
+    result = oauth_manager.refresh_cursor_models_sync(
+        "cursor:cursor-user-1", force=True, min_interval_seconds=0,
+    )
+    account = oauth_manager.get_account("cursor:cursor-user-1")
+    assert result["profile_updated"] is True
+    assert account["subject"] == "cursor-user-1"
+    assert account["email"] == "real-cursor@example.com"
+    assert account["label"] == "real-cursor@example.com"
+    assert account["cursor_profile_name"] == "Cursor User"
+    assert account["cursor_profile_id"] == "cursor-web-user-1"
+    assert account["cursor_email_verified"] is True
+
+
+def test_cursor_profile_refresh_survives_model_catalog_timeout(monkeypatch):
+    _install_account()
+
+    def model_timeout(_token):
+        raise TimeoutError("AvailableModels timed out")
+
+    monkeypatch.setattr(cursor_provider, "fetch_model_catalog_sync", model_timeout)
+    monkeypatch.setattr(cursor_provider, "fetch_profile_sync", lambda *_args, **_kwargs: {
+        "id": "cursor-web-user-1",
+        "sub": "cursor-user-1",
+        "email": "real-cursor@example.com",
+        "name": "Cursor User",
+        "email_verified": True,
+    })
+
+    result = oauth_manager.refresh_cursor_models_sync(
+        "cursor:cursor-user-1", force=True, min_interval_seconds=0,
+    )
+    account = oauth_manager.get_account("cursor:cursor-user-1")
+    assert result["action"] == "profile_updated"
+    assert result["model_error"] == "TimeoutError"
+    assert account["models"] == ["claude-fable-5", "composer-2.5", "gpt-5.5"]
+    assert account["email"] == "real-cursor@example.com"
+    assert account["cursor_profile_name"] == "Cursor User"
+
+
+def test_cursor_relogin_profile_failure_preserves_verified_display_identity():
+    account = _account()
+    account.update({
+        "email": "real-cursor@example.com",
+        "label": "real-cursor@example.com",
+        "cursor_profile_name": "Cursor User",
+        "cursor_profile_id": "cursor-web-user-1",
+        "cursor_email_verified": True,
+    })
+    oauth_manager.add_account(account)
+
+    fallback = _account()
+    oauth_manager.add_account(fallback)
+    saved = oauth_manager.get_account("cursor:cursor-user-1")
+    assert saved["email"] == "real-cursor@example.com"
+    assert saved["label"] == "real-cursor@example.com"
+    assert saved["cursor_profile_id"] == "cursor-web-user-1"
+
+
 def test_cursor_retry_log_exposes_native_outbound_variant():
     binding_json = json.dumps({
         "schema": 1,
@@ -318,6 +423,9 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     ]
     assert len(accounts) == 1
     assert accounts[0]["subject"] == "cursor-mock-user"
+    assert accounts[0]["email"] == "cursor-mock@example.test"
+    assert accounts[0]["label"] == "cursor-mock@example.test"
+    assert accounts[0]["cursor_profile_name"] == "Cursor Mock"
     assert accounts[0]["models"] == ["claude-fable-5", "composer-2.5"]
     assert accounts[0]["cursor_model_catalog"]["models"]
     assert states.get_state(321) is None

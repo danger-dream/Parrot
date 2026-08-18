@@ -11,6 +11,7 @@ CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll"
 CURSOR_REFRESH_URL = "https://api2.cursor.sh/auth/exchange_user_api_key"
 CURSOR_USAGE_URL = "https://api2.cursor.sh/auth/usage"
 CURSOR_STRIPE_PROFILE_URL = "https://api2.cursor.sh/auth/full_stripe_profile"
+CURSOR_WEB_PROFILE_URL = "https://cursor.com/api/auth/me"
 CURSOR_PERIOD_USAGE_PATH = "/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
 CURSOR_PLAN_INFO_PATH = "/aiserver.v1.DashboardService/GetPlanInfo"
 
