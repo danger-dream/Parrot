@@ -67,6 +67,27 @@ def _resolve_to_account_key(resolved):
         return None
 
 
+def _account_key_from_short(short: str) -> str | None:
+    """Resolve an OAuth account code even after a process restart.
+
+    ``ui.register_code`` is deterministic but its reverse map is in-memory.  Old
+    Telegram messages survive restarts, so reconstruct the mapping from current
+    account keys instead of falsely reporting that the account was deleted.
+    """
+    account_key = _resolve_to_account_key(ui.resolve_code(str(short or "")))
+    if account_key and oauth_manager.get_account(account_key) is not None:
+        return account_key
+    wanted = str(short or "")
+    for account in oauth_manager.list_accounts():
+        candidate = oauth_manager.get_account_key(account)
+        if ui.register_code(candidate) == wanted:
+            return candidate
+        email = str(account.get("email") or "")
+        if email and ui.register_code(email) == wanted:
+            return oauth_manager.get_account_key(account)
+    return None
+
+
 def _account_display(acc: dict) -> str:
     return str(acc.get("label") or acc.get("email") or "?")
 
@@ -2456,7 +2477,7 @@ def _queue_oauth_detail_stats(account_key: str) -> bool:
 
 
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None or oauth_manager.get_account(ak) is None:
         ui.answer_cb(cb_id, "账户已不存在，请返回重试")
         return
@@ -2479,7 +2500,7 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1
 # ─── 刷新 Token ──────────────────────────────────────────────────
 
 def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -2522,7 +2543,7 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
 # ─── 刷新用量 / 重置卡 ─────────────────────────────────────────────
 
 def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -2646,7 +2667,22 @@ def _cursor_model_ref(account_key: str, model_id: str) -> str:
 
 
 def _resolve_cursor_model_ref(ref: str) -> tuple[str, dict, dict] | None:
-    raw = ui.resolve_code(str(ref or "")) or ""
+    wanted = str(ref or "")
+    raw = ui.resolve_code(wanted) or ""
+    if _CURSOR_MODEL_REF_SEP not in raw:
+        # Model detail buttons from an older process still carry a deterministic
+        # hash. Rebuild the reverse mapping from the live Cursor catalogs.
+        for account in oauth_manager.list_accounts():
+            if oauth_manager.provider_of(account) != "cursor":
+                continue
+            account_key = oauth_manager.get_account_key(account)
+            for item in _cursor_model_records(account):
+                model_id = str(item.get("id") or "")
+                if _cursor_model_ref(account_key, model_id) == wanted:
+                    raw = f"{account_key}{_CURSOR_MODEL_REF_SEP}{model_id}"
+                    break
+            if _CURSOR_MODEL_REF_SEP in raw:
+                break
     if _CURSOR_MODEL_REF_SEP not in raw:
         return None
     account_key, model_id = raw.split(_CURSOR_MODEL_REF_SEP, 1)
@@ -2689,7 +2725,7 @@ def _cursor_effort_text(item: dict) -> str:
 
 def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     short, page = _cursor_model_page_payload(payload)
-    account_key = _resolve_to_account_key(ui.resolve_code(short))
+    account_key = _account_key_from_short(short)
     acc = oauth_manager.get_account(account_key) if account_key else None
     if acc is None or oauth_manager.provider_of(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户或短码已失效")
@@ -2708,11 +2744,18 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         model_id = str(item.get("id") or "")
         name = str(item.get("name") or model_id)
         context = int(item.get("context_window") or 0)
+        max_context = int(item.get("context_window_max_mode") or context)
+        default_max = (
+            max_context > context > 0
+            and oauth_manager.cursor_max_context_default(acc, model_id)
+        )
+        effective_context = max_context if default_max else context
+        context_suffix = "（Max Context 默认）" if default_max else ""
         effort_text = _cursor_effort_text(item)
         lines.extend([
             "",
             f"<b>{display_index}. {ui.escape_html(name)}</b> · <code>{ui.escape_html(model_id)}</code>",
-            f"上下文：<code>{ui.fmt_tokens(context)}</code> · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
+            f"上下文：<code>{ui.fmt_tokens(effective_context)}</code>{context_suffix} · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
         ])
         if effort_text:
             lines.append(f"支持思考档位：{ui.escape_html(effort_text)}")
@@ -2765,17 +2808,23 @@ def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: s
     supports_thinking = any(bool(value.get("thinking")) for value in variants)
     effort_text = _cursor_effort_text(item)
 
+    effective_context = max_context if has_separate_max and default_max else context
     lines = [
         f"🧬 <b>{ui.escape_html(name)}</b>",
         f"账户：<code>{ui.escape_html(_account_display(acc))}</code>",
         f"模型：<code>{ui.escape_html(model_id)}</code>",
         "",
-        f"普通上下文：<code>{ui.fmt_tokens(context)}</code>",
     ]
     if has_separate_max:
-        lines.append(f"Max Context：<code>{ui.fmt_tokens(max_context)}</code>")
-    elif context >= 1_000_000:
-        lines.append(f"Max Context：<code>{ui.fmt_tokens(context)}</code>（默认即为最大上下文）")
+        lines.extend([
+            f"默认上下文：<code>{ui.fmt_tokens(effective_context)}</code>（Max Context {'已开启' if default_max else '已关闭'}）",
+            f"普通上下文：<code>{ui.fmt_tokens(context)}</code>",
+            f"Max Context：<code>{ui.fmt_tokens(max_context)}</code>",
+        ])
+    else:
+        lines.append(f"上下文：<code>{ui.fmt_tokens(context)}</code>")
+        if context >= 1_000_000:
+            lines.append("<i>该模型默认即为最大上下文。</i>")
     if max_output:
         lines.append(f"最大输出：<code>{ui.fmt_tokens(max_output)}</code>")
     lines.extend([
@@ -2832,7 +2881,7 @@ def on_cursor_max_context_toggle(chat_id: int, message_id: int, cb_id: str, payl
 # ─── 清错误 / 清亲和 ─────────────────────────────────────────────
 
 def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -2845,7 +2894,7 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page:
 
 def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
                        page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id)
         return
@@ -3060,7 +3109,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
 
 
 def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -3076,7 +3125,7 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, pag
 # ─── 启用 / 禁用 ──────────────────────────────────────────────────
 
 def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -3102,7 +3151,7 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
 # ─── 删除（二次确认） ─────────────────────────────────────────────
 
 def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -3123,7 +3172,7 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
 
 
 def on_delete_exec(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         show(chat_id, message_id, page=page, filter_key=filter_key)
@@ -4961,7 +5010,7 @@ def on_invalid_remove_start(chat_id: int, message_id: int, cb_id: str) -> None:
 
 
 def on_invalid_remove_toggle(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return
@@ -5270,7 +5319,7 @@ def handle_document_state(chat_id: int, action: str, msg: dict) -> bool:
 # ─── 并发上限编辑 ─────────────────────────────────────────────────
 
 def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak = _resolve_to_account_key(ui.resolve_code(short))
+    ak = _account_key_from_short(short)
     if ak is None:
         ui.answer_cb(cb_id, "短码已失效")
         return

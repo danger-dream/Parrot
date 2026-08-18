@@ -786,6 +786,7 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
     oauth_menu.on_cursor_models(1, 2, "cb-list", f"{account_short}:1")
     assert "共 <b>7</b> 个可用模型 · 第 <b>1/2</b> 页" in captured["text"]
     assert "1. Claude Fable 5" in captured["text"]
+    assert "上下文：<code>1.0M</code>（Max Context 默认）" in captured["text"]
     assert "支持思考档位：low、medium、high、max" in captured["text"]
     assert "Cursor 原生变体" not in captured["text"]
     assert "claude-fable-5-thinking-medium" not in captured["text"]
@@ -803,6 +804,7 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
 
     detail_payload = details[0]["callback_data"].split(":", 2)[2]
     oauth_menu.on_cursor_model_detail(1, 2, "cb-detail", detail_payload)
+    assert "默认上下文：<code>1.0M</code>（Max Context 已开启）" in captured["text"]
     assert "普通上下文：<code>300.0K</code>" in captured["text"]
     assert "Max Context：<code>1.0M</code>" in captured["text"]
     assert "Max Context 默认：<b>已开启</b>" in captured["text"]
@@ -824,5 +826,24 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
     assert oauth_manager.cursor_max_context_disabled_models(
         "cursor:cursor-user-1",
     ) == {"claude-fable-5"}
+    assert "默认上下文：<code>300.0K</code>（Max Context 已关闭）" in captured["text"]
     assert "Max Context 默认：<b>已关闭</b>" in captured["text"]
     assert any("Max Context 默认已关闭" in answer for answer in answers)
+
+
+def test_cursor_account_and_model_codes_survive_process_restart():
+    account = _account()
+    oauth_manager.add_account(account)
+    account_key = "cursor:cursor-user-1"
+    account_short = ui.register_code(account_key)
+    model_ref = oauth_menu._cursor_model_ref(account_key, "claude-fable-5")
+
+    # Simulate a Parrot restart: Telegram keeps old buttons, reverse map is gone.
+    with ui._code_lock:
+        ui._code_to_name.clear()
+
+    assert oauth_menu._account_key_from_short(account_short) == account_key
+    resolved = oauth_menu._resolve_cursor_model_ref(model_ref)
+    assert resolved is not None
+    assert resolved[0] == account_key
+    assert resolved[2]["id"] == "claude-fable-5"
