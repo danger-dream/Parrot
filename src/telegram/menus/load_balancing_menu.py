@@ -19,28 +19,34 @@ from ...oauth_ids import provider_from_channel_key
 from .. import states, ui
 
 
-_FAMILY_NAMES = {
-    "anthropic": "Anthropic 协议",
-    "openai": "OpenAI、Grok 与 Cursor 协议",
-}
-_FAMILY_PROVIDERS = {
-    "anthropic": ("claude",),
-    "openai": ("openai", "xai", "cursor"),
+_FAMILY_PROVIDER_LABELS = {
+    "anthropic": (("claude", "Anthropic"),),
+    "openai": (
+        ("openai", "OpenAI"),
+        ("xai", "Grok"),
+        ("cursor", "Cursor"),
+    ),
 }
 
 
 def _family_label(family: str, *, rich: bool = True) -> str:
-    name = _FAMILY_NAMES.get(family, family)
-    providers = _FAMILY_PROVIDERS.get(family, ())
-    if not rich or not providers:
-        return name
-    icons = " ".join(ui.provider_custom_emoji_html(provider) for provider in providers)
-    return f"{icons} {ui.escape_html(name)}"
+    providers = _FAMILY_PROVIDER_LABELS.get(family, ())
+    if not providers:
+        return ui.escape_html(family) if rich else family
+    parts = []
+    for provider, label in providers:
+        if rich:
+            parts.append(
+                f"{ui.provider_custom_emoji_html(provider)} {ui.escape_html(label)}"
+            )
+        else:
+            parts.append(label)
+    return "、".join(parts) + " 协议"
 
 
 def _family_button(family: str, callback_data: str) -> dict:
-    providers = _FAMILY_PROVIDERS.get(family, ())
-    custom_id = ui.provider_custom_emoji_id(providers[0]) if providers else ""
+    providers = _FAMILY_PROVIDER_LABELS.get(family, ())
+    custom_id = ui.provider_custom_emoji_id(providers[0][0]) if providers else ""
     return ui.btn(
         _family_label(family, rich=False),
         callback_data,

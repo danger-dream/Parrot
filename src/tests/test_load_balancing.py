@@ -151,15 +151,20 @@ def test_load_balancing_uses_custom_icons_without_slash_joining(m):
     openai = next(button for button in buttons if button.get("callback_data") == "lb:fam:openai")
     assert anthropic["text"] == "Anthropic 协议"
     assert anthropic["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("claude")
-    assert openai["text"] == "OpenAI、Grok 与 Cursor 协议"
+    assert openai["text"] == "OpenAI、Grok、Cursor 协议"
     assert "/" not in openai["text"]
     assert openai["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
 
     rich_openai = lb._family_label("openai")
-    for provider in ("openai", "xai", "cursor"):
-        assert ui.provider_custom_emoji_id(provider) in rich_openai
+    assert rich_openai == (
+        f"{ui.provider_custom_emoji_html('openai')} OpenAI、"
+        f"{ui.provider_custom_emoji_html('xai')} Grok、"
+        f"{ui.provider_custom_emoji_html('cursor')} Cursor 协议"
+    )
     assert "🅾️/𝕏" not in rich_openai
-    assert ui.provider_custom_emoji_id("claude") in lb._family_label("anthropic")
+    assert lb._family_label("anthropic") == (
+        f"{ui.provider_custom_emoji_html('claude')} Anthropic 协议"
+    )
 
     for provider in ("openai", "xai", "cursor", "claude"):
         channel = SimpleNamespace(type="oauth", key=f"oauth:{provider}:identity")
