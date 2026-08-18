@@ -735,7 +735,7 @@ def test_stats_group_by_channel(m):
     text = edit["text"]
     assert "按渠道 — 今天" in text
     # 渠道展示用 emoji + short name（去掉 oauth:/api: 前缀），更人性化
-    assert "🔀" in text
+    assert "📡" in text
     assert ">A<" in text and ">B<" in text   # <code>A</code> / <code>B</code>
     assert "命中请求" in text
     assert "缓存 100 (31.2%)" in text

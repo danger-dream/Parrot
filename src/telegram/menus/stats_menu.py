@@ -42,7 +42,7 @@ def _channel_icon(key: str) -> str:
     if key.startswith("oauth:"):
         return "🔐"
     if key.startswith("api:"):
-        return "🔀"
+        return "📡"
     return "•"
 
 

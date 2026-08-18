@@ -102,7 +102,7 @@ def _problem_channels() -> list[str]:
         short = ui.escape_html(ui.channel_display_name(ch.key, with_family=False))
         provider_icon = ui.channel_provider_custom_emoji_html(ch.key)
         icon = f"{provider_icon} 🔐" if provider_icon else (
-            "🔐" if ch.type == "oauth" else "🔀"
+            "🔐" if ch.type == "oauth" else "📡"
         )
         if not ch.enabled or ch.disabled_reason == "user":
             out.append(f"• {icon} {short} — 手动禁用")
@@ -352,7 +352,7 @@ def _render_fastest_family(fam: str, items: list, tps_map: dict) -> list[str]:
         short = ui.channel_display_name(ck, with_family=False)
         provider_icon = ui.channel_provider_custom_emoji_html(ck)
         ico = f"{provider_icon} 🔐" if provider_icon else (
-            "🔐" if ck.startswith("oauth:") else "🔀"
+            "🔐" if ck.startswith("oauth:") else "📡"
         )
         # 名称一行
         out.append(

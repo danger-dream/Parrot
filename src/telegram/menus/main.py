@@ -13,7 +13,7 @@ def _kb() -> dict:
         [ui.btn("📈 统计汇总", "menu:stats"),
          ui.btn("📋 最近日志", "menu:logs")],
         [ui.btn("🔐 管理 OAuth", "menu:oauth"),
-         ui.btn("🔀 管理渠道", "menu:channel")],
+         ui.btn("📡 管理渠道", "menu:channel")],
         [ui.btn("🤖 模型管理", "map:show"),
          ui.btn("⚖️ 负载均衡", "menu:loadbalancing")],
         [ui.btn("🔑 管理 APIKEY", "menu:apikey"),
@@ -54,7 +54,7 @@ def _first_run_banner() -> str:
         "⚠ <b>首次使用检测</b>\n\n"
         "请按以下步骤快速启用服务：\n"
         "1️⃣ 「🔐 管理 OAuth」→ 登录获取 Token\n"
-        "    或「🔀 渠道管理」→ 添加第三方 API 渠道\n"
+        "    或「📡 渠道管理」→ 添加第三方 API 渠道\n"
         "2️⃣ 发送 /keys → 创建下游调用用的 API Key\n"
         "3️⃣ 下游客户端配置代理 URL 即可使用\n"
     )
@@ -99,7 +99,7 @@ def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = Fa
         + (f" · 🔒 配额 {oauth_quota}" if oauth_quota else "")
         + (f" · 🚫 用户 {oauth_user}" if oauth_user else "")
         + (f" · ❌ 认证失败 {oauth_auth_err}" if oauth_auth_err else ""),
-        f"🔀 API 渠道: {api_enabled}/{len(api_channels)} 可用 · registry {total_registered}",
+        f"📡 API 渠道: {api_enabled}/{len(api_channels)} 可用 · registry {total_registered}",
         f"🔑 下游 Key: {len(api_keys)} 个 · 🔗 亲和绑定 {affinity.count()}",
     ]
 
@@ -263,7 +263,7 @@ def welcome(chat_id: int) -> None:
         "👋 <b>欢迎使用 Parrot · 多家族 AI 协议代理</b>\n\n"
         "<b>快速开始：</b>\n"
         "1️⃣ 「🔐 管理 OAuth」→「➕ 新增账户」添加 Claude OAuth\n"
-        "2️⃣ 「🔀 渠道管理」→「➕ 添加渠道」接入第三方云平台\n"
+        "2️⃣ 「📡 渠道管理」→「➕ 添加渠道」接入第三方云平台\n"
         "3️⃣ 发送 /keys 创建代理 Key 供下游使用\n\n"
         "👇 点击下方任意菜单进入管理面板。"
     )

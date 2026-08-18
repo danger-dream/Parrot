@@ -187,7 +187,7 @@ def test_load_balancing_priority_uses_unified_model_and_channel_axes():
                 load_balancing_menu._channel_icon(channel)
             )
         api_channel = SimpleNamespace(type="api", key="api:test")
-        assert load_balancing_menu._channel_icon(api_channel) == "🔀"
+        assert load_balancing_menu._channel_icon(api_channel) == "📡"
         assert load_balancing_menu._channel_icon(
             api_channel, model_context=True,
         ) == "🤖"

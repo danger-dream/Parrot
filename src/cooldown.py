@@ -247,7 +247,7 @@ def record_error(channel_key: str, model: str, message: str | None = None,
             f"渠道: <code>{ek(channel_key)}</code> ({ek(model)})\n"
             f"累计失败 {new_count} 次\n"
             f"最后错误: <code>{ek((message or '?')[:200])}</code>\n"
-            "如需恢复请到「🔀 渠道管理」点「🧹 清错误」"
+            "如需恢复请到「📡 渠道管理」点「🧹 清错误」"
         )
     return result
 

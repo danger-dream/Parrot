@@ -186,7 +186,7 @@ def test_priority_main_menu_uses_model_and_channel_axes_not_families(m):
     assert "lb:models:1" in callbacks
     assert "lb:channels" in callbacks
     assert "🤖 按模型调整优先级" in labels
-    assert "🔀 按渠道/账户调整优先级" in labels
+    assert "📡 按渠道/账户调整优先级" in labels
     assert not any(str(value).startswith("lb:fam:") for value in callbacks)
     assert "Anthropic 协议" not in text
     assert "OpenAI、Grok、Cursor 协议" not in text
@@ -202,7 +202,7 @@ def test_unified_channel_editor_keeps_existing_move_reset_and_save_controls(m):
     m["lb_menu"]._start_channels(42, 100, "cb")
     edit = recorder.last("editMessageText")
     assert edit and "按渠道/账户调整优先级" in edit["text"]
-    assert "1. 🔀" in edit["text"]
+    assert "1. 📡" in edit["text"]
     assert "api:anth" not in edit["text"]  # human display names, not internal keys
     labels = [
         button["text"]

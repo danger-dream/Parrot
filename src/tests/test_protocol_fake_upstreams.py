@@ -2312,7 +2312,7 @@ def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monk
     assert "2026-07-26 10:01:10" in text
     assert "仅跳过" in text and "不是手动禁用" in text
     button = kwargs["reply_markup"]["inline_keyboard"][0][0]
-    assert button["text"] == "🔀 查看渠道详情"
+    assert button["text"] == "📡 查看渠道详情"
     assert button["callback_data"].startswith("ch:view:")
 
 

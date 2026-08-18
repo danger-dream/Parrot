@@ -2345,7 +2345,7 @@ def _show_concurrency(chat_id: int, message_id: int, cb_id: str) -> None:
         lines.append("<i>暂无活跃渠道记录（服务启动后还没处理过请求）。</i>")
 
     lines.append("")
-    lines.append("<i>提示：每个渠道的 <code>maxConcurrent</code> 在「🔀 渠道管理」"
+    lines.append("<i>提示：每个渠道的 <code>maxConcurrent</code> 在「📡 渠道管理」"
                  "或「🔐 管理 OAuth」对应渠道的详情页设置。</i>")
 
     kb = ui.inline_kb([

@@ -39,7 +39,7 @@ def _channel_icon(ch, *, model_context: bool = False) -> str:
         if provider in {"openai", "xai", "cursor", "claude"}:
             return f"{ui.provider_custom_emoji_html(provider)} 🔐"
         return "✉ 🔐"
-    return "🤖" if model_context else "🔀"
+    return "🤖" if model_context else "📡"
 
 
 def _status_text(ch) -> str:
@@ -175,7 +175,7 @@ def _main_text_and_kb() -> tuple[str, dict]:
             "请选择调整方式",
         ])
         rows.append([ui.btn("🤖 按模型调整优先级", "lb:models:1")])
-        rows.append([ui.btn("🔀 按渠道/账户调整优先级", "lb:channels")])
+        rows.append([ui.btn("📡 按渠道/账户调整优先级", "lb:channels")])
         rows.append([ui.btn("🧹 清除全部亲和", "lb:aff_all")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return "\n".join(lines), ui.inline_kb(rows)
@@ -231,7 +231,7 @@ def _edit_title(data: dict) -> str:
     kind = data.get("kind")
     models = list(data.get("models") or [])
     if kind == "channels":
-        return "🔀 <b>按渠道/账户调整优先级</b>"
+        return "📡 <b>按渠道/账户调整优先级</b>"
     if kind == "model" and models:
         return f"🤖 <b>{ui.escape_html(models[0])} · 模型专属优先级</b>"
     return f"🤖 <b>批量模型优先级 · 已选 {len(models)} 个模型</b>"

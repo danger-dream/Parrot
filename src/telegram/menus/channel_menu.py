@@ -377,7 +377,7 @@ def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
     page = max(1, min(int(page or 1), total_pages))
     page_info = f" | 第 {page}/{total_pages} 页" if total_pages > 1 else ""
 
-    lines = [f"🔀 <b>渠道管理</b>", f"共 {total} 个{page_info}"]
+    lines = [f"📡 <b>渠道管理</b>", f"共 {total} 个{page_info}"]
     if total == 0:
         lines.append("\n暂无渠道，点「➕ 添加渠道」创建。")
 

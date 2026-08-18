@@ -34,7 +34,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 | 🅰 Anthropic OAuth | Claude Code 官方账户 | 完整 CC 伪装（指纹 / CCH / 工具名混淆 / cache 断点），与 cc-proxy 同源移植 |
 | 🅾 OpenAI OAuth (Codex) | ChatGPT Plus/Pro/Enterprise | 对接 `chatgpt.com/backend-api/codex/responses`，SSE 聚合、rate-limit 头自动解析 |
 | 🖱️ Cursor OAuth | Cursor 个人/团队订阅 | 浏览器 PKCE 登录，自动同步真实邮箱/姓名、套餐额度、canonical 模型与 200+ 原生变体；通过私有 AgentService bridge 同时服务 Chat / Responses / Anthropic 入口 |
-| 🔀 第三方 API 渠道 | 智谱 / 天翼云 / 京东云 / 讯飞星辰 / 任何 Anthropic 或 OpenAI 兼容服务 | 可开关 CC 伪装；按 `protocol` 决定走哪种请求构造器 |
+| 📡 第三方 API 渠道 | 智谱 / 天翼云 / 京东云 / 讯飞星辰 / 任何 Anthropic 或 OpenAI 兼容服务 | 可开关 CC 伪装；按 `protocol` 决定走哪种请求构造器 |
 
 **家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。
 
@@ -227,7 +227,7 @@ curl http://<server>:22122/v1/images/edit \
                              │
          ┌───────────────────┼───────────────────────┐
          ▼                   ▼                       ▼
-  🅰 Anthropic OAuth    🅾 OpenAI OAuth         🔀 Third-party API
+  🅰 Anthropic OAuth    🅾 OpenAI OAuth         📡 Third-party API
   (Claude Code CC伪装)  (chatgpt.com/codex)     (智谱/天翼云/京东云/讯飞…)
          │                   │                       │
          ▼                   ▼                       ▼
@@ -341,7 +341,7 @@ JSON 请求体：
 
 ```
 [📈 统计汇总]   [📋 最近日志]
-[🔐 管理 OAuth] [🔀 管理渠道]
+[🔐 管理 OAuth] [📡 管理渠道]
 [🔁 模型映射]   [⚖️ 负载均衡]
 [⚙ 系统设置]   [❓ 帮助]
 ```
@@ -358,7 +358,7 @@ JSON 请求体：
 - `💬 请求日志`：普通文本 / Responses / Chat / WS 请求，详情包含完整重试链和请求/响应 body；
 - `🎞 多媒体日志`：统一展示 GPT/Grok 图片生成与编辑、Grok 视频生成/编辑/延长。视频后续轮询只更新同一任务，详情显示进度、最终状态、OAuth 账号、耗时和 xAI 实际费用。
 
-### 🔀 渠道管理
+### 📡 渠道管理
 添加向导（4 步 + 测试面板）、渠道详情、编辑、测试模型（单/全部）。
 
 > **Base URL 自适应**（v0.5.0+）：默认填上游域名即可，代理按协议追加 `/v1/messages`、`/v1/chat/completions`、`/v1/responses`。若上游接口挂在非标准路径（如智谱 Coding Plan 的 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），直接把**完整调用路径**贴进来，向导会自动拆分为 `baseUrl + apiPath` 存储，协议不匹配时给出交互式选择（采用识别到的协议 / 坚持当前协议清空路径 / 返回修改）。
@@ -720,8 +720,8 @@ Parrot/
 ## 🔍 故障排查
 
 ### `/health` 显示 `error` 或 `degraded`
-- **error**：无启用渠道 → 加至少一个渠道（TG bot「🔀 渠道管理」或「🔐 管理 OAuth」）
-- **degraded**：有渠道但全部冷却 → 「🔀 渠道管理」→「🧹 清全部错误」，或 TG bot 的「🔐 管理 OAuth」→「🧹 清除所有账户错误」
+- **error**：无启用渠道 → 加至少一个渠道（TG bot「📡 渠道管理」或「🔐 管理 OAuth」）
+- **degraded**：有渠道但全部冷却 → 「📡 渠道管理」→「🧹 清全部错误」，或 TG bot 的「🔐 管理 OAuth」→「🧹 清除所有账户错误」
 
 ### 下游返回 503 `No available channels for model: xxx`
 该模型在所有启用渠道里都不存在。检查：

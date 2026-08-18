@@ -1028,7 +1028,7 @@ def _notify_zhipu_quota_cooldown(ch: Channel, model: str, reset_ms: int) -> None
             from .telegram import ui as telegram_ui
             short = telegram_ui.register_code(channel_name)
             reply_markup = telegram_ui.inline_kb([
-                [telegram_ui.btn("🔀 查看渠道详情", f"ch:view:{short}:1")],
+                [telegram_ui.btn("📡 查看渠道详情", f"ch:view:{short}:1")],
             ])
         except Exception:
             reply_markup = None
