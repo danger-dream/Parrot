@@ -33,13 +33,13 @@ def _all_channels() -> list:
     return list(registry.all_channels())
 
 
-def _channel_icon(ch) -> str:
+def _channel_icon(ch, *, model_context: bool = False) -> str:
     if ch.type == "oauth":
         provider = provider_from_channel_key(ch.key)
         if provider in {"openai", "xai", "cursor", "claude"}:
             return f"{ui.provider_custom_emoji_html(provider)} 🔐"
         return "✉ 🔐"
-    return "🔀"
+    return "🤖" if model_context else "🔀"
 
 
 def _status_text(ch) -> str:
@@ -69,21 +69,24 @@ def _compact_channel_label(ch) -> str:
     return ui.channel_display_name(ch.key, with_family=False)
 
 
-def _format_item_line(idx: int, key: str) -> str:
+def _format_item_line(idx: int, key: str, *, model_context: bool = False) -> str:
     ch = registry.get_channel(key)
     if ch is None:
         return f"{idx}. <code>{ui.escape_html(key)}</code> ⚠ 已不存在"
     display = ui.channel_display_name(ch.key, with_family=False)
     return (
-        f"{idx}. {_channel_icon(ch)} <code>{ui.escape_html(display)}</code> "
+        f"{idx}. {_channel_icon(ch, model_context=model_context)} <code>{ui.escape_html(display)}</code> "
         f"{ui.escape_html(_status_text(ch))}"
     )
 
 
-def _format_order_lines(keys: list[str]) -> list[str]:
+def _format_order_lines(keys: list[str], *, model_context: bool = False) -> list[str]:
     if not keys:
         return ["<i>当前没有可排序的账户/渠道。</i>"]
-    return [_format_item_line(i, key) for i, key in enumerate(keys, start=1)]
+    return [
+        _format_item_line(i, key, model_context=model_context)
+        for i, key in enumerate(keys, start=1)
+    ]
 
 
 def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
@@ -258,7 +261,7 @@ def _edit_text_and_kb(data: dict) -> tuple[str, dict]:
         ])
     lines.extend([
         "当前账户/渠道:",
-        *_format_order_lines(draft),
+        *_format_order_lines(draft, model_context=(kind != "channels")),
         "",
         "请先勾选序号，再使用置顶、置底、上移、下移。",
         "“还原”恢复进入本页时的已保存/有效顺序；完成后必须点击保存。",
@@ -528,7 +531,8 @@ def _order_input_start(chat_id: int, message_id: int, cb_id: str) -> None:
     states.set_state(chat_id, "lb_order_input", {"edit": data})
     draft = list(data.get("draft") or [])
     lines = [
-        _edit_title(data), "", "当前账户/渠道:", *_format_order_lines(draft), "",
+        _edit_title(data), "", "当前账户/渠道:",
+        *_format_order_lines(draft, model_context=(data.get("kind") != "channels")), "",
         "请回复完整的新序号排列，例如：", "2,1,3...",
     ]
     ui.answer_cb(cb_id)

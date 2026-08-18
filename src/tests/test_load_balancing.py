@@ -202,6 +202,7 @@ def test_unified_channel_editor_keeps_existing_move_reset_and_save_controls(m):
     m["lb_menu"]._start_channels(42, 100, "cb")
     edit = recorder.last("editMessageText")
     assert edit and "按渠道/账户调整优先级" in edit["text"]
+    assert "1. 🔀" in edit["text"]
     assert "api:anth" not in edit["text"]  # human display names, not internal keys
     labels = [
         button["text"]
@@ -313,6 +314,7 @@ def test_single_model_clear_restores_unified_default(m):
         42, 100, "cb", m["lb_menu"]._model_code("m"), 1,
     )
     assert m["states"].get_state(42)["data"]["draft"] == ["api:b", "api:a"]
+    assert "1. 🤖" in recorder.last("editMessageText")["text"]
     m["lb_menu"]._clear_single_model(42, 100, "cb")
     assert not m["load_balancing"].has_model_priority("m")
     assert m["states"].get_state(42)["data"]["draft"] == ["api:a", "api:b"]

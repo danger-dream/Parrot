@@ -186,5 +186,10 @@ def test_load_balancing_priority_uses_unified_model_and_channel_axes():
             assert ui.provider_custom_emoji_id(provider) in (
                 load_balancing_menu._channel_icon(channel)
             )
+        api_channel = SimpleNamespace(type="api", key="api:test")
+        assert load_balancing_menu._channel_icon(api_channel) == "🔀"
+        assert load_balancing_menu._channel_icon(
+            api_channel, model_context=True,
+        ) == "🤖"
     finally:
         config.update(lambda cfg: cfg.__setitem__("channelSelection", previous))
