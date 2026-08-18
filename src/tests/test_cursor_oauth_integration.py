@@ -557,27 +557,31 @@ def test_cursor_login_menu_has_url_done_and_cancel_buttons(monkeypatch):
 def test_cursor_max_context_default_persists_and_survives_relogin():
     oauth_manager.add_account(_account())
     account_key = "cursor:cursor-user-1"
-    assert not oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
-
-    assert oauth_manager.set_cursor_max_context_default(
-        account_key, "claude-fable-5", True,
-    ) is True
+    # Every account model with a distinct Max Context tier defaults on.
     assert oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
-    with pytest.raises(ValueError, match="no separate Max Context"):
-        oauth_manager.set_cursor_max_context_default(account_key, "composer-2.5", True)
 
-    # Re-login payload omits local UI preferences; the saved default must survive.
-    oauth_manager.add_account(_account())
-    assert oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
     assert oauth_manager.set_cursor_max_context_default(
         account_key, "claude-fable-5", False,
     ) is False
     assert not oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
+    assert oauth_manager.cursor_max_context_disabled_models(account_key) == {
+        "claude-fable-5",
+    }
+    with pytest.raises(ValueError, match="no separate Max Context"):
+        oauth_manager.set_cursor_max_context_default(account_key, "composer-2.5", True)
+
+    # Re-login payload omits local UI preferences; the disabled exception survives.
+    oauth_manager.add_account(_account())
+    assert not oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
+    assert oauth_manager.set_cursor_max_context_default(
+        account_key, "claude-fable-5", True,
+    ) is True
+    assert oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
+    assert oauth_manager.cursor_max_context_disabled_models(account_key) == set()
 
 
 def test_cursor_max_context_tri_state_applies_to_all_three_ingress(monkeypatch):
     account = _account()
-    account["cursor_max_context_models"] = ["claude-fable-5"]
     config.update(lambda cfg: cfg.update({
         "oauthAccounts": [account],
         "oauth": {"mockMode": True},
@@ -801,7 +805,7 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
     oauth_menu.on_cursor_model_detail(1, 2, "cb-detail", detail_payload)
     assert "普通上下文：<code>300.0K</code>" in captured["text"]
     assert "Max Context：<code>1.0M</code>" in captured["text"]
-    assert "Max Context 默认：<b>已关闭</b>" in captured["text"]
+    assert "Max Context 默认：<b>已开启</b>" in captured["text"]
     assert "Cursor 原生变体" not in captured["text"]
     detail_buttons = [
         button for row in captured["reply_markup"]["inline_keyboard"] for button in row
@@ -814,8 +818,11 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
 
     toggle_payload = toggle["callback_data"].split(":", 2)[2]
     oauth_menu.on_cursor_max_context_toggle(1, 2, "cb-toggle", toggle_payload)
-    assert oauth_manager.cursor_max_context_default(
+    assert not oauth_manager.cursor_max_context_default(
         "cursor:cursor-user-1", "claude-fable-5",
     )
-    assert "Max Context 默认：<b>已开启</b>" in captured["text"]
-    assert any("Max Context 默认已开启" in answer for answer in answers)
+    assert oauth_manager.cursor_max_context_disabled_models(
+        "cursor:cursor-user-1",
+    ) == {"claude-fable-5"}
+    assert "Max Context 默认：<b>已关闭</b>" in captured["text"]
+    assert any("Max Context 默认已关闭" in answer for answer in answers)

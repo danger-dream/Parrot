@@ -2421,7 +2421,7 @@ def _add_account_serialized(entry: dict) -> None:
         (OpenAI 专属；有 workspace 时默认开启并生成 UUIDv4；显式 false 关闭)
       - id_token / subject / sub / base_url / token_endpoint / redirect_uri
         (xAI 专属)
-      - cursor_max_context_models（Cursor 每账号 canonical 模型的 Max Context 默认值）
+      - cursor_max_context_disabled_models（Cursor 每账号显式关闭 Max Context 的例外）
     """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
@@ -2487,10 +2487,10 @@ def _add_account_serialized(entry: dict) -> None:
             "last_model_sync": entry.get("last_model_sync") or "",
         })
         # Omitted on re-login means preserve the existing local preference.
-        if "cursor_max_context_models" in entry:
-            normalized["cursor_max_context_models"] = sorted({
+        if "cursor_max_context_disabled_models" in entry:
+            normalized["cursor_max_context_disabled_models"] = sorted({
                 str(model).strip()
-                for model in entry.get("cursor_max_context_models") or []
+                for model in entry.get("cursor_max_context_disabled_models") or []
                 if str(model).strip()
             })
     # Claude 专属字段（套餐/订阅信息，来自 /api/oauth/profile）
@@ -3397,16 +3397,37 @@ async def cursor_model_sync_loop() -> None:
             await asyncio.sleep(300)
 
 
-def cursor_max_context_models(account_or_key: dict | str) -> set[str]:
-    """Return per-account canonical models that default to Cursor Max Context."""
+def _cursor_max_context_capable_models(account: dict) -> set[str]:
+    capable: set[str] = set()
+    for record in ((account.get("cursor_model_catalog") or {}).get("models") or []):
+        if not isinstance(record, dict):
+            continue
+        model_id = str(record.get("id") or "").strip()
+        normal = int(record.get("context_window") or 0)
+        maximum = int(record.get("context_window_max_mode") or normal or 0)
+        if model_id and maximum > normal > 0:
+            capable.add(model_id)
+    return capable
+
+
+def cursor_max_context_disabled_models(account_or_key: dict | str) -> set[str]:
+    """Return explicit per-account exceptions to the default-on Max Context policy."""
     account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
     if not isinstance(account, dict) or provider_of(account) != "cursor":
         return set()
     return {
         str(model).strip()
-        for model in account.get("cursor_max_context_models") or []
+        for model in account.get("cursor_max_context_disabled_models") or []
         if str(model).strip()
     }
+
+
+def cursor_max_context_models(account_or_key: dict | str) -> set[str]:
+    """Return capable models whose default-on Max Context policy is active."""
+    account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
+    if not isinstance(account, dict) or provider_of(account) != "cursor":
+        return set()
+    return _cursor_max_context_capable_models(account) - cursor_max_context_disabled_models(account)
 
 
 def cursor_max_context_default(account_or_key: dict | str, model: str) -> bool:
@@ -3440,12 +3461,15 @@ def set_cursor_max_context_default(account_key: str, model: str, enabled: bool) 
         for item in cfg.get("oauthAccounts", []):
             if _canonical_key(item) != canonical:
                 continue
-            selected = cursor_max_context_models(item)
+            disabled = cursor_max_context_disabled_models(item)
             if wanted:
-                selected.add(model_id)
+                disabled.discard(model_id)
             else:
-                selected.discard(model_id)
-            item["cursor_max_context_models"] = sorted(selected)
+                disabled.add(model_id)
+            item["cursor_max_context_disabled_models"] = sorted(disabled)
+            # One unpublished implementation briefly stored an enabled-list.
+            # Default-on semantics supersede it; remove the stale field on write.
+            item.pop("cursor_max_context_models", None)
             return
         raise ValueError("Cursor account not found")
 
