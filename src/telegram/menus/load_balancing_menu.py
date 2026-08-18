@@ -19,10 +19,33 @@ from ...oauth_ids import provider_from_channel_key
 from .. import states, ui
 
 
-_FAMILY_LABELS = {
-    "anthropic": f"{ui.provider_icon('claude')} Anthropic 协议",
-    "openai": f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok 协议",
+_FAMILY_NAMES = {
+    "anthropic": "Anthropic 协议",
+    "openai": "OpenAI、Grok 与 Cursor 协议",
 }
+_FAMILY_PROVIDERS = {
+    "anthropic": ("claude",),
+    "openai": ("openai", "xai", "cursor"),
+}
+
+
+def _family_label(family: str, *, rich: bool = True) -> str:
+    name = _FAMILY_NAMES.get(family, family)
+    providers = _FAMILY_PROVIDERS.get(family, ())
+    if not rich or not providers:
+        return name
+    icons = " ".join(ui.provider_custom_emoji_html(provider) for provider in providers)
+    return f"{icons} {ui.escape_html(name)}"
+
+
+def _family_button(family: str, callback_data: str) -> dict:
+    providers = _FAMILY_PROVIDERS.get(family, ())
+    custom_id = ui.provider_custom_emoji_id(providers[0]) if providers else ""
+    return ui.btn(
+        _family_label(family, rich=False),
+        callback_data,
+        icon_custom_emoji_id=custom_id,
+    )
 
 _MODE_LABELS = {
     "smart": "智能调度",
@@ -48,15 +71,9 @@ def _normalized_keys(family: str) -> list[str]:
 
 def _channel_icon(ch) -> str:
     if ch.type == "oauth":
-        prov = provider_from_channel_key(ch.key)
-        if prov == "openai":
-            return f"{ui.provider_icon('openai')} 🔐"
-        if prov == "xai":
-            return f"{ui.provider_icon('xai')} 🔐"
-        if prov == "cursor":
-            return f"{ui.provider_icon('cursor')} 🔐"
-        if prov == "claude":
-            return f"{ui.provider_icon('claude')} 🔐"
+        provider = provider_from_channel_key(ch.key)
+        if provider in {"openai", "xai", "cursor", "claude"}:
+            return f"{ui.provider_custom_emoji_html(provider)} 🔐"
         return "✉ 🔐"
     return "🔀"
 
@@ -156,8 +173,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
     ]]
     if mode == "priority":
         lines.extend(["", "请选择要调整的协议类型"])
-        rows.append([ui.btn(f"{ui.provider_icon('claude')} Anthropic 协议", "lb:fam:anthropic")])
-        rows.append([ui.btn(f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok 协议", "lb:fam:openai")])
+        rows.append([_family_button("anthropic", "lb:fam:anthropic")])
+        rows.append([_family_button("openai", "lb:fam:openai")])
         rows.append([ui.btn("🧹 清除全部亲和", "lb:aff_all")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return "\n".join(lines), ui.inline_kb(rows)
@@ -189,7 +206,7 @@ def _on_mode(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
 # ─── 优先级编辑 ───────────────────────────────────────────────────
 
 def _edit_text_and_kb(family: str, draft: list[str], selected: set[int]) -> tuple[str, dict]:
-    title = f"{_FAMILY_LABELS.get(family, family)}调度优先级"
+    title = f"{_family_label(family)} · 调度优先级"
     lines = [
         f"{title}",
         "",
@@ -357,7 +374,7 @@ def _save(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id, "已保存")
     ui.edit(
         chat_id, message_id,
-        f"✅ 已保存 {_FAMILY_LABELS.get(family, family)}调度优先级。",
+        f"✅ 已保存 {_family_label(family)} · 调度优先级。",
         reply_markup=ui.inline_kb([
             [ui.btn("继续调整", f"lb:fam:{family}"), ui.btn("返回负载均衡", "menu:loadbalancing")],
             [ui.btn("🏠 主菜单", "menu:main")],
@@ -382,7 +399,7 @@ def _bulk_start(chat_id: int, message_id: int, cb_id: str) -> None:
     draft = list(data.get("draft") or [])
     states.set_state(chat_id, "lb_bulk_input", {"family": family, "draft": draft})
     lines = [
-        f"{_FAMILY_LABELS.get(family, family)}调度优先级",
+        f"{_family_label(family)} · 调度优先级",
         "",
         "当前账户/渠道:",
         *_format_order_lines(draft),
@@ -470,7 +487,7 @@ def _bulk_save(chat_id: int, message_id: int, cb_id: str) -> None:
     load_balancing.save_family_order(family, draft)
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
-    ui.edit(chat_id, message_id, f"✅ 已保存 {_FAMILY_LABELS.get(family, family)}批量优先级设置。",
+    ui.edit(chat_id, message_id, f"✅ 已保存 {_family_label(family)} · 批量优先级设置。",
             reply_markup=ui.inline_kb([[ui.btn("返回负载均衡", "menu:loadbalancing"), ui.btn("🏠 主菜单", "menu:main")]]))
 
 
@@ -536,7 +553,7 @@ def _aff_confirm_family(chat_id: int, message_id: int, cb_id: str, family: str) 
     ui.edit(
         chat_id, message_id,
         (
-            f"⚠️ 确认清除【<b>{_FAMILY_LABELS.get(family, family)}</b>】的所有亲和绑定？\n"
+            f"⚠️ 确认清除【{_family_label(family)}】的所有亲和绑定？\n"
             "仅清除本协议下所有渠道的 fp 亲和 + client 软亲和。"
         ),
         reply_markup=ui.inline_kb([

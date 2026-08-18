@@ -218,8 +218,9 @@
   },
 
   // ─── Telegram UI 展示增强 ───
-  // providerCustomEmoji 只用于消息正文 HTML（<tg-emoji>），可稳定显示 Telegram custom emoji；
-  // providerBtnEmoji 用于 inline keyboard / code block / 纯文本兜底，因为按钮不支持 rich entity。
+  // providerCustomEmoji 用于消息正文 HTML（<tg-emoji>），也可传给 Telegram
+  // InlineKeyboardButton.icon_custom_emoji_id；providerBtnEmoji 用于 code block、
+  // 不设置按钮 icon 字段时及旧客户端的纯文本兜底。
   "telegramUi": {
     "providerCustomEmoji": {
       "openai": "5861557411784957025",

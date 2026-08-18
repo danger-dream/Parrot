@@ -411,14 +411,23 @@ def _truncate_btn_label(label: str, limit: int = BTN_LABEL_LIMIT) -> str:
     return label[:limit - 1] + "…"
 
 
-def btn(text: str, callback_data: str) -> dict:
+def btn(
+    text: str,
+    callback_data: str,
+    *,
+    icon_custom_emoji_id: str | None = None,
+) -> dict:
     # 自动保护：label 超长截断，callback_data 超长直接 assert（开发期暴露 bug）
     if callback_data and len(callback_data.encode("utf-8")) > BTN_CALLBACK_LIMIT:
         raise ValueError(
             f"callback_data too long ({len(callback_data)}B): {callback_data[:40]}... "
             f"— 用短码替代"
         )
-    return {"text": _truncate_btn_label(text), "callback_data": callback_data}
+    button = {"text": _truncate_btn_label(text), "callback_data": callback_data}
+    custom_id = str(icon_custom_emoji_id or "").strip()
+    if custom_id:
+        button["icon_custom_emoji_id"] = custom_id
+    return button
 
 
 def btn_url(text: str, url: str) -> dict:

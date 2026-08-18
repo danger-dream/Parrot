@@ -453,8 +453,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "recentCalls": True,   # 最近调用
         },
     },
-    # Telegram UI 展示增强。providerCustomEmoji 只用于消息正文 HTML；
-    # providerBtnEmoji 用于 inline keyboard / 纯文本兜底。
+    # Telegram UI 展示增强。providerCustomEmoji 用于消息正文 HTML，也可作为
+    # InlineKeyboardButton.icon_custom_emoji_id；providerBtnEmoji 是纯文本兜底。
     "telegramUi": {
         "providerCustomEmoji": {
             "openai": "5861557411784957025",

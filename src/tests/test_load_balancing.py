@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 
 def _import_modules():
@@ -136,6 +137,33 @@ def test_normalize_and_init(m):
     assert cfg["channelSelection"] == "priority"
     assert cfg["loadBalancing"]["initialized"] is True
     print("  [PASS] normalize + priority init")
+
+
+def test_load_balancing_uses_custom_icons_without_slash_joining(m):
+    _setup(m)
+    m["config"].update(lambda cfg: cfg.__setitem__("channelSelection", "priority"))
+    lb = m["lb_menu"]
+    ui = m["ui"]
+
+    _text, keyboard = lb._main_text_and_kb()
+    buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+    anthropic = next(button for button in buttons if button.get("callback_data") == "lb:fam:anthropic")
+    openai = next(button for button in buttons if button.get("callback_data") == "lb:fam:openai")
+    assert anthropic["text"] == "Anthropic 协议"
+    assert anthropic["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("claude")
+    assert openai["text"] == "OpenAI、Grok 与 Cursor 协议"
+    assert "/" not in openai["text"]
+    assert openai["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
+
+    rich_openai = lb._family_label("openai")
+    for provider in ("openai", "xai", "cursor"):
+        assert ui.provider_custom_emoji_id(provider) in rich_openai
+    assert "🅾️/𝕏" not in rich_openai
+    assert ui.provider_custom_emoji_id("claude") in lb._family_label("anthropic")
+
+    for provider in ("openai", "xai", "cursor", "claude"):
+        channel = SimpleNamespace(type="oauth", key=f"oauth:{provider}:identity")
+        assert ui.provider_custom_emoji_id(provider) in lb._channel_icon(channel)
 
 
 def test_button_rows_and_preview(m):
