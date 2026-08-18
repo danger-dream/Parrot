@@ -619,10 +619,6 @@ def _provider_tag(provider: str | None, *, full: bool = False, rich: bool = True
     return ui.provider_tag(provider, full=full, rich=rich)
 
 
-def _provider_icon(provider: str | None) -> str:
-    return ui.provider_icon(provider)
-
-
 def _provider_label(provider: str | None, *, full: bool = False) -> str:
     return ui.provider_label(provider, full=full)
 
@@ -1359,11 +1355,11 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
     ])
     rows = [
-        [ui.btn("✏ Claude 模型", "odm:edit:anthropic"),
-         ui.btn("✏ OpenAI 模型", "odm:edit:openai"),
-         ui.btn("✏ Grok 文本", "odm:edit:xai")],
-        [ui.btn("🖼 GPT 图片设置", "img:show"),
-         ui.btn("🎨 Grok Imagine", "xim:show")],
+        [ui.provider_button("✏ Claude 模型", "odm:edit:anthropic", "claude"),
+         ui.provider_button("✏ OpenAI 模型", "odm:edit:openai", "openai"),
+         ui.provider_button("✏ Grok 文本", "odm:edit:xai", "xai")],
+        [ui.provider_button("🖼 GPT 图片设置", "img:show", "openai"),
+         ui.provider_button("🎨 Grok Imagine", "xim:show", "xai")],
         [ui.btn("📈 配额监控", "oa:quota"),
          ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
         [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle")],
@@ -1763,10 +1759,13 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
             email = _account_display(acc)
             ak = _account_key(acc)
             short = ui.register_code(ak)
-            prov = oauth_manager.provider_of(acc)
-            tag = _provider_icon(prov)
+            provider = oauth_manager.provider_of(acc)
             num = start + offset + 1
-            row_btns.append(ui.btn(f"{num}. {tag} {email}", f"oa:view:{_callback_payload(short, page, filter_key)}"))
+            row_btns.append(ui.provider_button(
+                f"{num}. {email}",
+                f"oa:view:{_callback_payload(short, page, filter_key)}",
+                provider,
+            ))
         rows.append(row_btns)
 
     # 翻页/排序：当前列表只有一页时不显示。
@@ -1951,7 +1950,7 @@ def _sort_item_line(idx: int, account_key: str) -> str:
         return f"{idx}. <code>{ui.escape_html(account_key)}</code> ⚠ 已不存在"
     email = str(acc.get("email") or oauth_manager.account_key_to_email(account_key) or "?")
     prov = oauth_manager.provider_of(acc)
-    tag = _provider_icon(prov)
+    tag = _provider_tag(prov)
     status = "enabled" if acc.get("enabled", True) and not acc.get("disabled_reason") else (acc.get("disabled_reason") or "disabled")
     suffix = _openai_workspace_label(acc, force=True) if prov == "openai" else ""
     suffix_text = f" · {suffix}" if suffix else ""
@@ -2389,7 +2388,11 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
          ui.btn(usage_btn_label,   f"oa:refresh_usage:{payload}")],
     ]
     if prov == "cursor":
-        rows.append([ui.btn("🧬 Cursor 模型与原生变体", f"oa:cursor_models:{short}:1")])
+        rows.append([ui.provider_button(
+            "🧬 Cursor 模型与原生变体",
+            f"oa:cursor_models:{short}:1",
+            "cursor",
+        )])
     if prov == "openai":
         rows.append([
             ui.btn("⚡ 并发上限", f"oa:emax:{payload}"),
@@ -3461,17 +3464,17 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')} / {_provider_tag('openai')} / {_provider_tag('xai')} / {_provider_tag('cursor')}",
+        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')}、{_provider_tag('openai')}、{_provider_tag('xai')}、{_provider_tag('cursor')}",
         reply_markup=ui.inline_kb([
-            [ui.btn(f"{_provider_icon('claude')} Claude 登录获取 Token", "oa:login")],
-            [ui.btn(f"{_provider_icon('claude')} Claude 手动设置 JSON", "oa:set_json")],
-            [ui.btn(f"{_provider_icon('openai')} OpenAI 登录获取 Token", "oa:login:openai")],
-            [ui.btn(f"{_provider_icon('openai')} OpenAI 粘贴 refresh_token", "oa:set_rt:openai")],
-            [ui.btn(f"{_provider_icon('xai')} Grok 登录获取 Token", "oa:login:xai")],
-            [ui.btn(f"{_provider_icon('xai')} Grok 粘贴 refresh_token", "oa:set_rt:xai")],
-            [ui.btn(f"{_provider_icon('cursor')} Cursor 登录", "oa:login:cursor")],
-            [ui.btn(f"📦 {_provider_icon('openai')} OpenAI 导入 Sub2API 文件", "oa:import:sub2api")],
-            [ui.btn(f"🗂 {_provider_icon('openai')} OpenAI 导入 CPA 文件", "oa:import:cpa")],
+            [ui.provider_button("Claude 登录获取 Token", "oa:login", "claude")],
+            [ui.provider_button("Claude 手动设置 JSON", "oa:set_json", "claude")],
+            [ui.provider_button("OpenAI 登录获取 Token", "oa:login:openai", "openai")],
+            [ui.provider_button("OpenAI 粘贴 refresh_token", "oa:set_rt:openai", "openai")],
+            [ui.provider_button("Grok 登录获取 Token", "oa:login:xai", "xai")],
+            [ui.provider_button("Grok 粘贴 refresh_token", "oa:set_rt:xai", "xai")],
+            [ui.provider_button("Cursor 登录", "oa:login:cursor", "cursor")],
+            [ui.provider_button("📦 OpenAI 导入 Sub2API 文件", "oa:import:sub2api", "openai")],
+            [ui.provider_button("🗂 OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
             [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),
@@ -3724,7 +3727,7 @@ def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str) -> None:
         message_id,
         text,
         reply_markup=ui.inline_kb([
-            [ui.btn_url("🌐 打开 Cursor 登录页", params.login_url)],
+            [ui.provider_url_button("打开 Cursor 登录页", params.login_url, "cursor")],
             [ui.btn("✅ 已登录", "oa:login:cursor:done"), ui.btn("❌ 取消", "oa:add")],
         ]),
     )
@@ -3917,7 +3920,7 @@ _OA_NAV_OPENAI = {"back_label": "◀ 返回新增账户", "back_callback": "oa:a
 def _build_openai_login_text_and_kb(url: str) -> tuple[str, dict]:
     """构建 OpenAI 登录页的文本和键盘（复用于首次生成和重新生成）。"""
     text = (
-        f"请在浏览器打开以下链接登录 {_provider_tag('openai')} / ChatGPT 账号：\n\n"
+        f"请在浏览器打开以下链接登录 {_provider_tag('openai')}（ChatGPT）账号：\n\n"
         f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
         "👇 长按下方地址可复制（推荐用隐私浏览器打开）：\n"
         f"<code>{ui.escape_html(url)}</code>\n\n"
@@ -4535,7 +4538,7 @@ def on_import_openai_start(chat_id: int, message_id: int, cb_id: str, kind: str)
         f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户</b>\n\n"
         "请上传 <code>.zip</code> / <code>.json</code> 文件，或直接粘贴 JSON 文本。\n\n"
         "我会只提取 <code>email</code> 与 <code>refresh_token</code>，随后复用"
-        f"「{_provider_icon('openai')} OpenAI 粘贴 refresh_token」逻辑刷新并导入。\n\n"
+        f"「{ui.provider_tag('openai')} 粘贴 refresh_token」逻辑刷新并导入。\n\n"
         "<i>导入前会先展示识别到的邮箱列表，请确认后再写入配置。</i>",
         reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "oa:import_cancel")]]),
     )

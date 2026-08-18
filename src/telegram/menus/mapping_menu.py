@@ -61,22 +61,17 @@ _CODE_LINE: dict[str, str] = {v: k for k, v in _LINE_CODE.items()}
 
 _LINE_ICON: dict[str, str] = {
     model_mapping.GLOBAL_MAPPING_LINE: "🔁",
-    "anthropic":        ui.provider_icon("claude"),
-    "openai-chat":      f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}",
-    "openai-responses": f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}",
 }
 
 
-def _line_body_icon(line: str) -> str:
-    if line == "anthropic":
-        return ui.provider_custom_emoji_html("claude")
-    if line in ("openai-chat", "openai-responses"):
-        return f"{ui.provider_custom_emoji_html('openai')}/{ui.provider_custom_emoji_html('xai')}"
-    return _LINE_ICON.get(line, "🔁")
-
-
 def _line_body_label(line: str) -> str:
-    return f"{_line_body_icon(line)} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}"
+    if line == "anthropic":
+        return f"{ui.family_tag('anthropic')} (/v1/messages)"
+    if line == "openai-chat":
+        return f"{ui.family_tag('openai')} Chat (/v1/chat/completions)"
+    if line == "openai-responses":
+        return f"{ui.family_tag('openai')} Responses (/v1/responses)"
+    return f"{_LINE_ICON.get(line, '🔁')} {ui.escape_html(model_mapping.INGRESS_LABEL[line])}"
 
 
 def _code_of_line(line: str) -> str:
@@ -101,7 +96,7 @@ def _overview_text() -> str:
         f"🗜 压缩模型：<code>{ui.escape_html(compact)}</code>",
         f"🧩 分段目标：<code>{compact_rescue.chunk_target_tokens():,}</code> tokens",
         "",
-        "<i>模型映射按模型名全局生效，不再区分 Anthropic / OpenAI & Grok 入口。</i>",
+        f"<i>模型映射按模型名全局生效，不再区分 {ui.family_tag('anthropic')} / {ui.family_tag('openai')} 入口。</i>",
     ]
     return "\n".join(lines)
 
@@ -131,11 +126,10 @@ def send_new(chat_id: int) -> None:
 # ─── Level 2 单条 line 的管理页 ────────────────────────────────────
 
 def _line_text(line: str) -> str:
-    label = model_mapping.INGRESS_LABEL[line]
     default = model_mapping.get_default_model(line)
     mp = model_mapping.get_ingress_map(line)
     out = [
-        f"{_line_body_icon(line)} <b>{ui.escape_html(label)}</b>",
+        _line_body_label(line),
         "",
         f"默认模型: <code>{ui.escape_html(default) if default else '(未设置)'}</code>",
         f"映射 ({len(mp)}):",
@@ -206,8 +200,7 @@ def _show_item(
     ui.answer_cb(cb_id)
     lc = _code_of_line(line)
     text = (
-        f"{_line_body_icon(line)} <b>映射条目 · "
-        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"{_line_body_label(line)} · <b>映射条目</b>\n\n"
         f"别名: <code>{ui.escape_html(alias)}</code>\n"
         f"真实: <code>{ui.escape_html(real)}</code>\n\n"
         "请选择操作:"
@@ -245,8 +238,7 @@ def _start_edit_alias(
     states.set_state(chat_id, f"map_alias_edit:{lc}:{alias_code}")
     ui.edit(
         chat_id, message_id,
-        f"{_line_body_icon(line)} <b>修改别名 · "
-        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"{_line_body_label(line)} · <b>修改别名</b>\n\n"
         f"当前别名: <code>{ui.escape_html(alias)}</code> → "
         f"<code>{ui.escape_html(mp[alias])}</code>\n\n"
         "请输入<b>新别名</b>(保持真实模型不变):",
@@ -359,8 +351,7 @@ def _edit_edit_real_picker(
     total = len(models)
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     text = (
-        f"{_line_body_icon(line)} <b>修改真实模型 · "
-        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"{_line_body_label(line)} · <b>修改真实模型</b>\n\n"
         f"别名: <code>{ui.escape_html(alias)}</code>\n"
         f"当前真实: <code>{ui.escape_html(current)}</code>\n\n"
         "请选择新的真实模型:\n"
@@ -418,8 +409,7 @@ def _start_add(chat_id: int, message_id: int, cb_id: str, line: str) -> None:
     states.set_state(chat_id, f"map_alias_input:{lc}")
     ui.edit(
         chat_id, message_id,
-        f"{_line_body_icon(line)} <b>新增映射 · "
-        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"{_line_body_label(line)} · <b>新增映射</b>\n\n"
         "请输入<b>别名</b>(客户端请求时传递的模型名):\n"
         "例如: <code>gpt-5.5</code>、<code>my-fast-model</code>\n\n"
         "<i>规则: 别名不能与任何真实模型重名, 也不能与该入口已有别名重复。</i>",
@@ -506,8 +496,7 @@ def _send_real_picker_for_add(
 def _picker_text_add(line: str, alias: str, page: int, total: int) -> str:
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     return (
-        f"{_line_body_icon(line)} <b>新增映射 · "
-        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"{_line_body_label(line)} · <b>新增映射</b>\n\n"
         f"别名 <code>{ui.escape_html(alias)}</code> → 请选择真实模型:\n\n"
         f"<i>第 {page + 1}/{total_pages} 页, 共 {total} 个可选模型。</i>"
     )
@@ -555,8 +544,7 @@ def _picker_text_default(line: str, page: int, total: int) -> str:
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     current = model_mapping.get_default_model(line)
     return (
-        f"{_line_body_icon(line)} <b>设置默认模型 · "
-        f"{ui.escape_html(model_mapping.INGRESS_LABEL[line])}</b>\n\n"
+        f"{_line_body_label(line)} · <b>设置默认模型</b>\n\n"
         f"当前: <code>{ui.escape_html(current) if current else '(未设置)'}</code>\n\n"
         "请点击一个真实模型作为默认:\n"
         f"<i>第 {page + 1}/{total_pages} 页, 共 {total} 个可选模型。</i>"
@@ -890,12 +878,16 @@ def _scope_label(scope: str | None, labels: Mapping[str, str] | None = None) -> 
     return values.get(scope, scope)
 
 
-def _scope_icon(scope_type: str, scope_key: str) -> str:
+def _scope_provider(scope_type: str, scope_key: str) -> str:
     if scope_type != "oauth":
-        return "🔌"
+        return ""
     parts = scope_key.split(":", 2)
-    provider = parts[1] if len(parts) > 1 else "oauth"
-    return ui.provider_icon(provider)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def _scope_icon(scope_type: str, scope_key: str) -> str:
+    provider = _scope_provider(scope_type, scope_key)
+    return ui.provider_custom_emoji_html(provider) if provider else "🔌"
 
 
 def _metadata_item_lines(
@@ -1297,9 +1289,13 @@ def _show_scope_picker(
             scope=scope, model="__scope__", flow="add",
             scope_kind=kind, scope_page=page,
         )
+        provider = _scope_provider(values[0].scope_type, scope)
         item_buttons.append(ui.btn(
-            f"{offset}. {icon} {_short_button_label(label, 20)}",
+            f"{offset}. {_short_button_label(label, 20)}",
             f"map:meta_models:{code}:0",
+            icon_custom_emoji_id=(
+                ui.provider_custom_emoji_id(provider) if provider else None
+            ),
         ))
     if not visible:
         lines.append(f"<i>当前没有已配置的{title}。</i>")

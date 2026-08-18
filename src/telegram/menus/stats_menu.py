@@ -48,7 +48,14 @@ def _channel_icon(key: str) -> str:
 
 def _ch_short_name(key: str) -> str:
     """Human-facing channel name; never expose OpenAI workspace ids."""
-    return ui.channel_display_name(key, with_family=True)
+    return ui.channel_display_name(key, with_family=False)
+
+
+def _channel_identity_icon(key: str) -> str:
+    provider_icon = ui.channel_provider_custom_emoji_html(key)
+    if provider_icon:
+        return f"{provider_icon} 🔐"
+    return _channel_icon(key)
 
 
 def _fmt_cost(metrics: dict, *, decimal_places: int = 2) -> str:
@@ -276,11 +283,9 @@ def _section_recent_calls(calls: list[dict]) -> str:
 # ─── 家族分段（新）────────────────────────────────────────────────
 
 def _protocol_icon(proto: str | None) -> str:
-    """根据 upstream_protocol 返回家族图标（recent_calls / recent_errors 末尾展示）。"""
+    """根据 upstream_protocol 返回消息正文 rich 家族标签。"""
     fam = ui.family_of(proto)
-    if not fam:
-        return ""
-    return ui.FAMILY_ICON.get(fam, "")
+    return ui.family_tag(fam) if fam else ""
 
 
 def _section_overall_compact(overall: dict) -> str:
@@ -363,7 +368,7 @@ def _section_family(family: str, result: dict,
             block = _summary_dim_block(
                 "按渠道 Top",
                 by_channel[:3],
-                lambda k: f"{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
+                lambda k: f"{_channel_identity_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>",
             )
             parts.append("")
             parts.append(block)
@@ -388,12 +393,12 @@ def _section_family(family: str, result: dict,
 
 
 def _render_key_family_split(apikey: str, anth_total: int, oai_total: int) -> str:
-    """按 Key Top 每条的家族细分小字：🅰 X 次 · 🅾 Y 次"""
+    """按 Key Top 每条的 rich 家族细分。"""
     bits = []
     if anth_total > 0:
-        bits.append(f"{ui.provider_icon('claude')} {anth_total} 次")
+        bits.append(f"{ui.family_tag('anthropic')} {anth_total} 次")
     if oai_total > 0:
-        bits.append(f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} {oai_total} 次")
+        bits.append(f"{ui.family_tag('openai')} {oai_total} 次")
     return " · ".join(bits)
 
 
@@ -408,13 +413,13 @@ def _render_overall(result: dict, period: str,
     布局：
       📊 统计 — 今天
       ──────────────
-      🅰 Anthropic            ← 家族段（overall 精简 + by_channel/by_model Top3）
+      [Anthropic rich tag]    ← 家族段（overall 精简 + by_channel/by_model Top3）
       ...
       ──────────────
-      🅾 OpenAI               ← 家族段（同上）
+      [OpenAI rich tag]       ← 家族段（同上，含 Grok/Cursor）
       ...
       ──────────────
-      按 Key Top              ← 跨家族，每条带 🅰/🅾 拆分小字
+      按 Key Top              ← 跨家族，每条带 rich 家族拆分
       最近未命中样本 / 最近调用（跨家族，每条带家族图标）
     """
     sep = "─" * 18
@@ -499,14 +504,18 @@ def _render_overall(result: dict, period: str,
 
 
 def _channel_family_icon(channel_key: str) -> str:
-    """用 registry 查出渠道的上游协议，转成家族图标（🅰/🅾）。查不到返回空串。"""
+    """Return a rich provider/family tag for statistics message bodies."""
+    provider_icon = ui.channel_provider_custom_emoji_html(channel_key)
+    if provider_icon:
+        provider = ui.channel_provider(channel_key)
+        return f"{provider_icon} {ui.escape_html(ui.provider_label(provider))}"
     try:
         from ...channel import registry
         ch = registry.get_channel(channel_key)
         if ch is not None:
             fam = ui.family_of(getattr(ch, "protocol", None))
             if fam:
-                return ui.FAMILY_ICON.get(fam, "")
+                return ui.family_tag(fam)
     except Exception:
         pass
     return ""
@@ -540,9 +549,14 @@ def _render_expanded(result: dict, period: str, dim: str,
         groups = _strip_unknown(result.get("by_channel") or [])
 
         def _rk_ch(k: str) -> str:
-            fam_i = _channel_family_icon(k)
+            # OAuth rows already have an exact provider icon; API rows only know
+            # their protocol family and therefore use the family tag.
+            fam_i = "" if ui.channel_provider(k) else _channel_family_icon(k)
             fam_prefix = f"{fam_i} " if fam_i else ""
-            return f"{fam_prefix}{_channel_icon(k)} <code>{ui.escape_html(_ch_short_name(k))}</code>"
+            return (
+                f"{fam_prefix}{_channel_identity_icon(k)} "
+                f"<code>{ui.escape_html(_ch_short_name(k))}</code>"
+            )
 
         block = _expanded_dim_block(
             f"按渠道（Top {len(groups)}）", groups, _rk_ch,

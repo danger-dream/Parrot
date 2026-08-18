@@ -43,12 +43,6 @@ _FAM_LABEL = {
     "openai":    "OpenAI OAuth",
     "xai":       "Grok OAuth",
 }
-_FAM_ICON = {
-    "anthropic": ui.provider_icon("claude"),
-    "openai":    ui.provider_icon("openai"),
-    "xai":       ui.provider_icon("xai"),
-}
-
 _FAM_PROVIDER = {
     "anthropic": "claude",
     "openai":    "openai",
@@ -64,11 +58,11 @@ def _fam_body_label(family: str, *, bold: bool = True) -> str:
 
 def _ingress_body_label(ingress: str) -> str:
     if ingress == "anthropic":
-        return f"{ui.provider_custom_emoji_html('claude')} Anthropic (/v1/messages)"
+        return f"{ui.family_tag('anthropic')} (/v1/messages)"
     if ingress == "openai-chat":
-        return f"{ui.provider_custom_emoji_html('openai')}/{ui.provider_custom_emoji_html('xai')} OpenAI & Grok Chat (/v1/chat/completions)"
+        return f"{ui.family_tag('openai')} Chat (/v1/chat/completions)"
     if ingress == "openai-responses":
-        return f"{ui.provider_custom_emoji_html('openai')}/{ui.provider_custom_emoji_html('xai')} OpenAI & Grok Responses (/v1/responses)"
+        return f"{ui.family_tag('openai')} Responses (/v1/responses)"
     return ui.escape_html(ingress)
 
 
@@ -131,7 +125,7 @@ def _scan_references(family: str, removed: set[str]) -> dict:
       anthropic → ingressDefaultModel["anthropic"] + modelMapping["anthropic"]
       openai/xai → ingressDefaultModel["openai-chat"/"openai-responses"]
                 + modelMapping["openai-chat"/"openai-responses"]
-    API Key 白名单本身无家族概念 — OpenAI & Grok 家族模型可能和 Anthropic 模型
+    API Key 白名单本身无家族概念 — OpenAI/Grok/Cursor 家族模型可能和 Anthropic 模型
     同名吗? 实践上不会(Claude vs GPT 名字不会碰撞), 但为求精确, 只在白名单里
     按 "模型名是否在 removed 集合内" 做命中, 不分家族。
 
@@ -205,12 +199,6 @@ def _has_any_refs(refs: dict) -> bool:
 
 
 # ─── 保存与清理 ──────────────────────────────────────────────────
-
-_INGRESS_LABEL = {
-    "anthropic":        "Anthropic (/v1/messages)",
-    "openai-chat":      "OpenAI Chat (/v1/chat/completions)",
-    "openai-responses": "OpenAI Responses (/v1/responses)",
-}
 
 
 def _commit_save(
@@ -323,9 +311,9 @@ def _overview_text() -> str:
 
 def _overview_kb() -> dict:
     return ui.inline_kb([
-        [ui.btn(f"✏ 修改 {ui.provider_icon('claude')} Claude", "odm:edit:anthropic"),
-         ui.btn(f"✏ 修改 {ui.provider_icon('openai')} OpenAI",    "odm:edit:openai")],
-        [ui.btn(f"✏ 修改 {ui.provider_icon('xai')} Grok",      "odm:edit:xai")],
+        [ui.provider_button("✏ 修改 Claude", "odm:edit:anthropic", "claude"),
+         ui.provider_button("✏ 修改 OpenAI", "odm:edit:openai", "openai")],
+        [ui.provider_button("✏ 修改 Grok", "odm:edit:xai", "xai")],
         [ui.btn("◀ 返回主菜单", "menu:main")],
     ])
 
@@ -544,7 +532,7 @@ def _send_saved_result(
             )
             for row in summary["mappings_removed"]:
                 lines.append(
-                    f"  • {_INGRESS_LABEL.get(row['ingress'], row['ingress'])}:"
+                    f"  • {_ingress_body_label(row['ingress'])}:"
                     f" <code>{ui.escape_html(row['alias'])}</code>"
                 )
         if summary["defaults_cleared"]:

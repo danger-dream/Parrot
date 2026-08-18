@@ -2002,8 +2002,16 @@ def _show_monitor_core(chat_id: int, message_id: int, cb_id: str) -> None:
     for k in ("openai", "claude", "cloudflare"):
         lines.append(f"{_mon_core_label(k, rich=True)}: <code>{_mon_on(bool(core.get(k)))}</code>")
     rows = [
-        [ui.btn(ui.provider_icon("openai") + " OpenAI " + ("关" if core.get("openai") else "开"), "sys:mon:core_toggle:openai")],
-        [ui.btn(ui.provider_icon("claude") + " Claude " + ("关" if core.get("claude") else "开"), "sys:mon:core_toggle:claude")],
+        [ui.provider_button(
+            "OpenAI " + ("关" if core.get("openai") else "开"),
+            "sys:mon:core_toggle:openai",
+            "openai",
+        )],
+        [ui.provider_button(
+            "Claude " + ("关" if core.get("claude") else "开"),
+            "sys:mon:core_toggle:claude",
+            "claude",
+        )],
         [ui.btn("Cloudflare " + ("关" if core.get("cloudflare") else "开"), "sys:mon:core_toggle:cloudflare")],
         [ui.btn("◀ 返回网络检测", "sys:mon:show")],
     ]
@@ -2042,7 +2050,7 @@ def _show_monitor_channels(chat_id: int, message_id: int, cb_id: str) -> None:
         for ch in channels[:30]:
             on = bool(by_key.get(ch.key, False))
             label = ui.escape_html(getattr(ch, "display_name", ch.key))
-            # 家族 badge: · 🅰 Anthropic / 🅾 OpenAI
+            # API 渠道无法锁定具体 Provider；展示它兼容的协议家族 rich tag。
             try:
                 fam = load_balancing.family_for_channel(ch)
             except Exception:

@@ -88,8 +88,16 @@ def _main_text_and_kb() -> tuple[str, dict]:
         [ui.btn(f"{'🟢 已开启' if enabled else '🔴 已关闭'} · 切换", "stat:toggle_enabled")],
     ]
     rows.append([
-        ui.btn(("✅ " if "claude" in targets else "⬛ ") + status_monitor._provider_icon("claude") + " Claude", "stat:toggle_tgt:claude"),
-        ui.btn(("✅ " if "openai" in targets else "⬛ ") + status_monitor._provider_icon("openai") + " OpenAI", "stat:toggle_tgt:openai"),
+        ui.provider_button(
+            ("✅ " if "claude" in targets else "⬛ ") + "Claude",
+            "stat:toggle_tgt:claude",
+            "claude",
+        ),
+        ui.provider_button(
+            ("✅ " if "openai" in targets else "⬛ ") + "OpenAI",
+            "stat:toggle_tgt:openai",
+            "openai",
+        ),
         ui.btn(("✅ " if "cloudflare" in targets else "⬛ ") + "Cloudflare", "stat:toggle_tgt:cloudflare"),
     ])
     rows.append([

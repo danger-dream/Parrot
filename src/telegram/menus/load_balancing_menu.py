@@ -19,39 +19,12 @@ from ...oauth_ids import provider_from_channel_key
 from .. import states, ui
 
 
-_FAMILY_PROVIDER_LABELS = {
-    "anthropic": (("claude", "Anthropic"),),
-    "openai": (
-        ("openai", "OpenAI"),
-        ("xai", "Grok"),
-        ("cursor", "Cursor"),
-    ),
-}
-
-
 def _family_label(family: str, *, rich: bool = True) -> str:
-    providers = _FAMILY_PROVIDER_LABELS.get(family, ())
-    if not providers:
-        return ui.escape_html(family) if rich else family
-    parts = []
-    for provider, label in providers:
-        if rich:
-            parts.append(
-                f"{ui.provider_custom_emoji_html(provider)} {ui.escape_html(label)}"
-            )
-        else:
-            parts.append(label)
-    return "、".join(parts) + " 协议"
+    return ui.family_tag(family, rich=rich, suffix=" 协议")
 
 
 def _family_button(family: str, callback_data: str) -> dict:
-    providers = _FAMILY_PROVIDER_LABELS.get(family, ())
-    custom_id = ui.provider_custom_emoji_id(providers[0][0]) if providers else ""
-    return ui.btn(
-        _family_label(family, rich=False),
-        callback_data,
-        icon_custom_emoji_id=custom_id,
-    )
+    return ui.family_button(family, callback_data, suffix=" 协议")
 
 _MODE_LABELS = {
     "smart": "智能调度",

@@ -430,8 +430,17 @@ def btn(
     return button
 
 
-def btn_url(text: str, url: str) -> dict:
-    return {"text": text, "url": url}
+def btn_url(
+    text: str,
+    url: str,
+    *,
+    icon_custom_emoji_id: str | None = None,
+) -> dict:
+    button = {"text": _truncate_btn_label(text), "url": url}
+    custom_id = str(icon_custom_emoji_id or "").strip()
+    if custom_id:
+        button["icon_custom_emoji_id"] = custom_id
+    return button
 
 
 # ─── 通用导航 / 确认按钮 ─────────────────────────────────────────
@@ -687,8 +696,16 @@ def family_of(protocol: Optional[str]) -> Optional[str]:
     return None
 
 
-FAMILY_ICON = {"anthropic": "🅰️", "openai": "🅾️/𝕏/🖱️"}
-FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI, Grok & Cursor"}
+FAMILY_ICON = {"anthropic": "🅰️", "openai": "🅾️"}
+FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI、Grok、Cursor"}
+FAMILY_PROVIDER_LABELS = {
+    "anthropic": (("claude", "Anthropic"),),
+    "openai": (
+        ("openai", "OpenAI"),
+        ("xai", "Grok"),
+        ("cursor", "Cursor"),
+    ),
+}
 
 PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️"}
 PROVIDER_CUSTOM_EMOJI = {
@@ -757,6 +774,82 @@ def provider_tag(provider: str | None, *, full: bool = False, rich: bool = True)
     return f"{icon} {escape_html(label) if rich else label}" if label else icon
 
 
+def provider_button(text: str, callback_data: str, provider: str | None) -> dict:
+    """Inline button with the provider's real Telegram custom emoji icon."""
+    return btn(
+        text,
+        callback_data,
+        icon_custom_emoji_id=provider_custom_emoji_id(provider),
+    )
+
+
+def provider_url_button(text: str, url: str, provider: str | None) -> dict:
+    return btn_url(
+        text,
+        url,
+        icon_custom_emoji_id=provider_custom_emoji_id(provider),
+    )
+
+
+def family_label(family: str | None) -> str:
+    pairs = FAMILY_PROVIDER_LABELS.get(str(family or ""), ())
+    if not pairs:
+        return str(family or "")
+    return "、".join(label for _provider, label in pairs)
+
+
+def family_tag(
+    family: str | None,
+    *,
+    rich: bool = True,
+    suffix: str = "",
+) -> str:
+    pairs = FAMILY_PROVIDER_LABELS.get(str(family or ""), ())
+    if not pairs:
+        raw = str(family or "")
+        return (escape_html(raw) if rich else raw) + suffix
+    parts = []
+    for provider, label in pairs:
+        icon = (
+            provider_custom_emoji_html(provider)
+            if rich else provider_btn_emoji(provider)
+        )
+        parts.append(f"{icon} {escape_html(label) if rich else label}")
+    return "、".join(parts) + suffix
+
+
+def family_button(
+    family: str,
+    callback_data: str,
+    *,
+    suffix: str = "",
+) -> dict:
+    pairs = FAMILY_PROVIDER_LABELS.get(family, ())
+    provider = pairs[0][0] if pairs else None
+    return provider_button(family_label(family) + suffix, callback_data, provider)
+
+
+def channel_provider(channel_key: str | None) -> str:
+    key = str(channel_key or "")
+    if not key.startswith("oauth:"):
+        return ""
+    try:
+        from ..oauth_ids import provider_from_channel_key
+        return str(provider_from_channel_key(key) or "")
+    except Exception:
+        return ""
+
+
+def channel_provider_custom_emoji_id(channel_key: str | None) -> str:
+    provider = channel_provider(channel_key)
+    return provider_custom_emoji_id(provider) if provider else ""
+
+
+def channel_provider_custom_emoji_html(channel_key: str | None) -> str:
+    provider = channel_provider(channel_key)
+    return provider_custom_emoji_html(provider) if provider else ""
+
+
 def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
     """Human-facing channel name for TG UI.
 
@@ -811,17 +904,6 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
     if ":" in key:
         return key.split(":", 1)[1]
     return key
-
-
-def family_tag(family: Optional[str]) -> str:
-    """统一的家族前缀标签，保持纯文本，适用于按钮/日志/code block。"""
-    if not family:
-        return ""
-    if family == "anthropic":
-        return f"{provider_icon('claude')} {FAMILY_LABEL.get(family, family)}"
-    if family == "openai":
-        return f"{provider_icon('openai')}/{provider_icon('xai')}/{provider_icon('cursor')} {FAMILY_LABEL.get(family, family)}"
-    return f"{FAMILY_ICON.get(family, '?')} {FAMILY_LABEL.get(family, family)}"
 
 
 # ─── 通知钩子：把 notifier.notify 转发到管理员 ──────────────────
@@ -939,8 +1021,11 @@ def fmt_log_entry_body(r: dict, *, separate_billing: bool = False) -> str:
 
     # 渠道
     if r.get("final_channel_key"):
-        ch_short = escape_html(channel_display_name(r["final_channel_key"], with_family=False))
-        ch_line = f"  渠道: <code>{ch_short}</code>"
+        channel_key = r["final_channel_key"]
+        ch_short = escape_html(channel_display_name(channel_key, with_family=False))
+        provider_icon = channel_provider_custom_emoji_html(channel_key)
+        prefix = f"{provider_icon} " if provider_icon else ""
+        ch_line = f"  渠道: {prefix}<code>{ch_short}</code>"
         if r.get("retry_count"):
             ch_line += f"（重试 {r['retry_count']} 次）"
         if r.get("affinity_hit"):

@@ -100,7 +100,10 @@ def _problem_channels() -> list[str]:
 
     for ch in chs:
         short = ui.escape_html(ui.channel_display_name(ch.key, with_family=False))
-        icon = "🔐" if ch.type == "oauth" else "🔀"
+        provider_icon = ui.channel_provider_custom_emoji_html(ch.key)
+        icon = f"{provider_icon} 🔐" if provider_icon else (
+            "🔐" if ch.type == "oauth" else "🔀"
+        )
         if not ch.enabled or ch.disabled_reason == "user":
             out.append(f"• {icon} {short} — 手动禁用")
             continue
@@ -347,7 +350,10 @@ def _render_fastest_family(fam: str, items: list, tps_map: dict) -> list[str]:
         medal = medals[idx] if idx < len(medals) else f"{idx + 1}."
         ck, m = key.split("|", 1)
         short = ui.channel_display_name(ck, with_family=False)
-        ico = "🔐" if ck.startswith("oauth:") else "🔀"
+        provider_icon = ui.channel_provider_custom_emoji_html(ck)
+        ico = f"{provider_icon} 🔐" if provider_icon else (
+            "🔐" if ck.startswith("oauth:") else "🔀"
+        )
         # 名称一行
         out.append(
             f"{medal} {ico} <code>{ui.escape_html(short)}</code> ({ui.escape_html(m)})"
@@ -438,7 +444,13 @@ def _concurrency_block(cc_cfg: dict) -> list[str]:
             else:
                 icon = "🟢"
         wait_part = f" · 排队 <b>{wt}</b>" if wt > 0 else ""
-        out.append(f"  {icon} <code>{ui.escape_html(ui.channel_display_name(ck, with_family=True))}</code> · {usage}{wait_part}")
+        provider_icon = ui.channel_provider_custom_emoji_html(ck)
+        provider_prefix = f"{provider_icon} " if provider_icon else ""
+        display = ui.channel_display_name(ck, with_family=False)
+        out.append(
+            f"  {icon} {provider_prefix}<code>{ui.escape_html(display)}</code>"
+            f" · {usage}{wait_part}"
+        )
     if len(interesting) > 10:
         out.append(f"  <i>...还有 {len(interesting) - 10} 个未列出</i>")
     return out

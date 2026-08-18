@@ -149,19 +149,19 @@ def _address_block(port: int) -> list[str]:
     out += [
         "",
         "📍 <b>接口地址</b> (POST)",
-        f"  {ui.provider_tag('claude', full=True)}",
+        f"  {ui.family_tag('anthropic')}",
         f"    本地 <code>http://127.0.0.1:{port}/v1/messages</code>",
     ]
     if pub:
         out.append(f"    公网 <code>http://{pub}:{port}/v1/messages</code>")
     out += [
-        f"  {ui.provider_tag('openai')} Chat",
+        f"  {ui.family_tag('openai')} Chat",
         f"    本地 <code>http://127.0.0.1:{port}/v1/chat/completions</code>",
     ]
     if pub:
         out.append(f"    公网 <code>http://{pub}:{port}/v1/chat/completions</code>")
     out += [
-        f"  {ui.provider_tag('openai')} Responses",
+        f"  {ui.family_tag('openai')} Responses",
         f"    本地 <code>http://127.0.0.1:{port}/v1/responses</code>",
     ]
     if pub:

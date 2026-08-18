@@ -212,7 +212,7 @@ def _display_index(page: int, idx: int) -> int:
 
 def _option_label(kind: str, value: str) -> str:
     if kind == "channel":
-        name = ui.channel_display_name(value, with_family=True)
+        name = ui.channel_display_name(value, with_family=False)
         if str(value or "").startswith("oauth:"):
             return f"🔐 {name}"
         return f"📡 {name}"
@@ -498,7 +498,15 @@ def _filter_menu_kb(kind: str, base: dict, draft: dict) -> dict:
         mark = "✅ " if value in selected else ""
         code = _filter_state_code(kind, base, draft)
         v_code = ui.register_code(value)
-        buttons.append(ui.btn(mark + label, f"logs:ftoggle:{kind}:{v_code}:{code}"))
+        callback = f"logs:ftoggle:{kind}:{v_code}:{code}"
+        if kind == "channel" and ui.channel_provider(value):
+            buttons.append(ui.btn(
+                mark + label,
+                callback,
+                icon_custom_emoji_id=ui.channel_provider_custom_emoji_id(value),
+            ))
+        else:
+            buttons.append(ui.btn(mark + label, callback))
     _append_button_grid(rows, buttons, cols=2 if kind == "channel" else 3)
     code = _filter_state_code(kind, base, draft)
     rows.append([
@@ -776,9 +784,12 @@ def _render_detail(detail: dict) -> str:
         f"请求模型: <code>{ui.escape_html(_detail_inline(log.get('requested_model')))}</code>",
     ]
     if log.get("final_channel_key"):
-        final_ch = ui.channel_display_name(log["final_channel_key"], with_family=True)
+        channel_key = log["final_channel_key"]
+        final_ch = ui.channel_display_name(channel_key, with_family=False)
+        provider_icon = ui.channel_provider_custom_emoji_html(channel_key)
+        prefix = f"{provider_icon} " if provider_icon else ""
         lines.append(
-            f"最终渠道: <code>{ui.escape_html(_detail_inline(final_ch))}</code>"
+            f"最终渠道: {prefix}<code>{ui.escape_html(_detail_inline(final_ch))}</code>"
             f" / <code>{ui.escape_html(_detail_inline(log.get('final_model')))}</code>"
         )
     if log.get("proxy_name"):
@@ -858,7 +869,12 @@ def _render_detail(detail: dict) -> str:
         lines.append("  (无渠道尝试记录)")
     for c in chain:
         order = c.get("attempt_order") or "?"
-        ch = ui.escape_html(_detail_inline(ui.channel_display_name(c.get("channel_key") or "?", with_family=True)))
+        channel_key = c.get("channel_key") or "?"
+        ch = ui.escape_html(_detail_inline(
+            ui.channel_display_name(channel_key, with_family=False)
+        ))
+        provider_icon = ui.channel_provider_custom_emoji_html(channel_key)
+        provider_prefix = f"{provider_icon} " if provider_icon else ""
         model_raw = _detail_inline(c.get("model"))
         outbound_model = _attempt_outbound_model(c)
         model = ui.escape_html(
@@ -869,7 +885,10 @@ def _render_detail(detail: dict) -> str:
         mark = _retry_chain_mark(outcome)
         label = ui.escape_html(_retry_chain_label(outcome))
         proxy_tag = f" 🔀 {ui.escape_html(_detail_inline(c['proxy_name']))}" if c.get("proxy_name") else ""
-        lines.append(f"  {mark} <b>尝试 {order}.</b> <code>{ch}</code> / <code>{model}</code>{proxy_tag} — {label}")
+        lines.append(
+            f"  {mark} <b>尝试 {order}.</b> {provider_prefix}<code>{ch}</code>"
+            f" / <code>{model}</code>{proxy_tag} — {label}"
+        )
         if c.get("final_round_id"):
             lines.append(f"     · 终止轮次 <code>{ui.escape_html(_detail_inline(c['final_round_id']))}</code>")
         child_rounds = rounds_by_attempt.pop(str(c.get("id")), [])

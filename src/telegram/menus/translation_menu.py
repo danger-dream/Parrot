@@ -127,25 +127,14 @@ def _channel_scope_items() -> list[tuple[str, str]]:
         if not key:
             continue
         typ = str(getattr(ch, "type", "") or "")
-        proto = str(getattr(ch, "protocol", "anthropic") or "anthropic")
-        icon = "👤" if typ == "oauth" else "🔑"
         if typ == "oauth":
-            provider = str(getattr(ch, "provider", "") or "")
-            if not provider and key.startswith("oauth:"):
-                try:
-                    from ... import oauth_manager
-                    provider = oauth_manager.provider_of(key[len("oauth:"):])
-                except Exception:
-                    provider = ""
-            icon += ui.provider_icon(provider or ("claude" if proto == "anthropic" else "openai"))
             label = ui.channel_display_name(key, with_family=False)
         else:
-            if proto == "anthropic":
-                icon += ui.provider_icon("claude")
-            elif proto.startswith("openai"):
-                icon += f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}"
-            label = str(getattr(ch, "display_name", "") or getattr(ch, "name", "") or key)
-        items.append((key, f"{icon} {label}"))
+            # API channels can emulate multiple providers; keep a generic key icon.
+            label = "🔑 " + str(
+                getattr(ch, "display_name", "") or getattr(ch, "name", "") or key
+            )
+        items.append((key, label))
     return items
 
 
@@ -542,7 +531,11 @@ def _show_scope_channels(chat_id: int, message_id: int, cb_id: str, page: int = 
         lines.append("已选：")
         for key in sorted(selected):
             label = known.get(key, key)
-            lines.append(f"• {ui.escape_html(label)} <code>{ui.escape_html(key)}</code>")
+            provider_icon = ui.channel_provider_custom_emoji_html(key)
+            prefix = f"{provider_icon} " if provider_icon else ""
+            lines.append(
+                f"• {prefix}{ui.escape_html(label)} <code>{ui.escape_html(key)}</code>"
+            )
     if items:
         lines.append(f"\n第 {page + 1}/{total_pages} 页 · 共 {total} 个渠道/账号")
     else:
@@ -552,7 +545,13 @@ def _show_scope_channels(chat_id: int, message_id: int, cb_id: str, page: int = 
     for key, label in page_items:
         mark = "✅ " if key in selected else "▫️ "
         code = ui.register_code(f"tl:scope:channel:{key}")
-        rows.append([ui.btn(mark + label, f"tl:scope:channel:{code}")])
+        rows.append([ui.btn(
+            mark + label,
+            f"tl:scope:channel:{code}",
+            icon_custom_emoji_id=(
+                ui.channel_provider_custom_emoji_id(key) or None
+            ),
+        )])
 
     nav: list[dict] = []
     if page > 0:

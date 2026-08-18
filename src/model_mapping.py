@@ -62,8 +62,8 @@ INGRESS_FAMILY: dict[str, str] = {
 #: 友好显示名 (TG 菜单用)
 INGRESS_LABEL: dict[str, str] = {
     "anthropic":        "Anthropic (/v1/messages)",
-    "openai-chat":      "OpenAI & Grok Chat (/v1/chat/completions)",
-    "openai-responses": "OpenAI & Grok Responses (/v1/responses)",
+    "openai-chat":      "OpenAI、Grok、Cursor Chat (/v1/chat/completions)",
+    "openai-responses": "OpenAI、Grok、Cursor Responses (/v1/responses)",
     GLOBAL_MAPPING_LINE: "全局模型映射",
 }
 

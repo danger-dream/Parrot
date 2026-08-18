@@ -43,17 +43,12 @@ def _oauth_provider_for_channel(ch) -> str:
 
 
 def _oauth_provider_icon(ch) -> str:
-    return ui.provider_icon(_oauth_provider_for_channel(ch))
+    return ui.provider_custom_emoji_html(_oauth_provider_for_channel(ch))
 
 
-def _route_model_icon(model: str) -> str:
-    m = str(model or "").lower()
-    if m.startswith(("claude", "anthropic")):
-        return ui.provider_icon("claude")
-    if m.startswith(("grok", "xai")):
-        return ui.provider_icon("xai")
-    if m.startswith(("gpt", "o1", "o3", "o4")):
-        return ui.provider_icon("openai")
+def _route_model_icon(_model: str) -> str:
+    # Model aliases can route across providers; never infer a provider logo from
+    # a model-name prefix.
     return "🤖"
 
 
@@ -895,7 +890,11 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     model_count = len(r.get("models") or {})
 
     # 功能路由摘要
-    func_keys = {"telegram": "Telegram", "oauth_anthropic": "Anthropic 家族", "oauth_openai": "OpenAI & Grok 家族"}
+    func_keys = {
+        "telegram": "Telegram",
+        "oauth_anthropic": ui.family_tag("anthropic", suffix=" 家族"),
+        "oauth_openai": ui.family_tag("openai", suffix=" 家族"),
+    }
     func_lines = []
     for k, label in func_keys.items():
         v = r.get(k)
@@ -1020,14 +1019,14 @@ def _show_func_routing(chat_id: int, message_id: int, cb_id: str) -> None:
         ui.answer_cb(cb_id)
     r = pm.get_routing()
     funcs = [
-        ("telegram", "📱 Telegram", "📱 Telegram", "Bot 所有功能调用"),
-        ("oauth_anthropic", f"{ui.provider_tag('claude', full=True)} 家族", f"{ui.provider_icon('claude')} Anthropic 家族", "OAuth、登录/刷新、渠道请求、测试、/v1/messages"),
-        ("oauth_openai", f"{ui.provider_tag('openai')}/{ui.provider_tag('xai')} 家族", f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok 家族", "OAuth、登录/刷新、渠道请求、测试、OpenAI-style / Grok 入口"),
+        ("telegram", "📱 Telegram", None, "Bot 所有功能调用"),
+        ("oauth_anthropic", ui.family_tag("anthropic", suffix=" 家族"), "anthropic", "OAuth、登录/刷新、渠道请求、测试、/v1/messages"),
+        ("oauth_openai", ui.family_tag("openai", suffix=" 家族"), "openai", "OAuth、登录/刷新、渠道请求、测试、OpenAI-style 入口"),
     ]
     lines = ["📡 <b>功能路由</b>", "",
              "<i>家族级默认出口；账号/渠道/模型未命中时走这里，未设置则走默认路由。</i>",
-             f"<i>Telegram / {ui.provider_tag('claude', full=True)} 家族 / {ui.provider_tag('openai')}/{ui.provider_tag('xai')} 家族均支持代理组、代理、直连、默认。</i>", ""]
-    for key, label, _btn_label, desc in funcs:
+             f"<i>Telegram、{ui.family_tag('anthropic', suffix=' 家族')}、{ui.family_tag('openai', suffix=' 家族')}均支持代理组、代理、直连、默认。</i>", ""]
+    for key, label, _family, desc in funcs:
         val = r.get(key)
         route = f"<code>{ui.escape_html(str(val))}</code>" if val else "<i>默认</i>"
         lines.append(f"{label}  {desc}")
@@ -1035,9 +1034,12 @@ def _show_func_routing(chat_id: int, message_id: int, cb_id: str) -> None:
         lines.append("")
 
     rows = []
-    for key, _label, btn_label, _ in funcs:
-        short = btn_label.split(" ", 1)[-1]
-        rows.append([ui.btn(f"✏️ {short}", f"px:rt_pick:{key}")])
+    for key, _label, family, _ in funcs:
+        callback = f"px:rt_pick:{key}"
+        if family:
+            rows.append([ui.family_button(family, callback, suffix=" 家族")])
+        else:
+            rows.append([ui.btn("✏️ Telegram", callback)])
     rows.append([ui.btn("◀ 返回路由规则", "px:routing")])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
 
@@ -1069,11 +1071,13 @@ def _show_account_routing(chat_id: int, message_id: int, cb_id: str,
 
     rows = []
     for i, c in enumerate(chs):
-        icon = _oauth_provider_icon(c)
+        provider = _oauth_provider_for_channel(c)
         route = acct_cfg.get(c.key)
         tag = f" [{route}]" if route else ""
         display = ui.channel_display_name(c.key, with_family=False)
-        rows.append([ui.btn(f"{icon} {display}{tag}", f"px:rt_item:a:{i}")])
+        rows.append([ui.provider_button(
+            f"{display}{tag}", f"px:rt_item:a:{i}", provider,
+        )])
 
     rows.append([ui.btn("◀ 返回路由规则", "px:routing")])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))

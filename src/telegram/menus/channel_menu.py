@@ -37,14 +37,48 @@ from .. import menu_cache, states, ui
 from . import main as main_menu
 
 
-# 渠道协议取值与展示标签。OpenAI-style 协议家族同时承载 OpenAI API 和 xAI/Grok 兼容入口。
+# 渠道协议取值与纯文本标签；消息正文和按钮图标由下方 helper 统一生成。
 PROTOCOL_CHOICES: list[tuple[str, str]] = [
-    ("anthropic",        f"{ui.provider_icon('claude')} Anthropic (/v1/messages)"),
-    ("openai-chat",      f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok Chat (/v1/chat/completions)"),
-    ("openai-responses", f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')} OpenAI & Grok Responses (/v1/responses)"),
+    ("anthropic", "Anthropic (/v1/messages)"),
+    ("openai-chat", "OpenAI、Grok、Cursor Chat (/v1/chat/completions)"),
+    ("openai-responses", "OpenAI、Grok、Cursor Responses (/v1/responses)"),
 ]
 
 _PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}
+_PROTOCOL_FAMILY = {
+    "anthropic": "anthropic",
+    "openai-chat": "openai",
+    "openai-responses": "openai",
+}
+
+
+def _protocol_body_label(protocol: str) -> str:
+    family = _PROTOCOL_FAMILY.get(protocol)
+    if protocol == "openai-chat":
+        return f"{ui.family_tag(family)} Chat (/v1/chat/completions)"
+    if protocol == "openai-responses":
+        return f"{ui.family_tag(family)} Responses (/v1/responses)"
+    if protocol == "anthropic":
+        return f"{ui.family_tag(family)} (/v1/messages)"
+    return ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))
+
+
+def _protocol_button(protocol: str, callback_data: str, *, prefix: str = "") -> dict:
+    family = _PROTOCOL_FAMILY.get(protocol, "")
+    suffix = (
+        " Chat (/v1/chat/completions)" if protocol == "openai-chat"
+        else " Responses (/v1/responses)" if protocol == "openai-responses"
+        else " (/v1/messages)" if protocol == "anthropic"
+        else ""
+    )
+    if prefix:
+        provider = "claude" if family == "anthropic" else "openai" if family else None
+        return ui.provider_button(
+            prefix + ui.family_label(family) + suffix,
+            callback_data,
+            provider,
+        )
+    return ui.family_button(family, callback_data, suffix=suffix)
 
 
 def _protocol_of(ch) -> str:
@@ -474,7 +508,7 @@ def _sort_item_line(idx: int, name: str) -> str:
         return f"{idx}. <code>{ui.escape_html(name)}</code> ⚠ 已不存在"
     icon, status = _channel_health(ch)
     protocol = _protocol_of(ch)
-    proto_label = ui.provider_icon("claude") if protocol == "anthropic" else f"{ui.provider_icon('openai')}/{ui.provider_icon('xai')}"
+    proto_label = _protocol_body_label(protocol)
     return (
         f"{idx}. {icon} {proto_label} <code>{ui.escape_html(ch.display_name)}</code> "
         f"{ui.escape_html(status)}"
@@ -775,7 +809,7 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
     ]
     # 只在非 anthropic 时显示协议行，避免对现有 anthropic 渠道造成视觉噪声
     if protocol != "anthropic":
-        lines.append(f"🔌 协议: <code>{ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))}</code>")
+        lines.append(f"🔌 协议: {_protocol_body_label(protocol)}")
     lines += [
         f"🎭 CC 伪装: <code>{'开启' if ch.cc_mimicry else '关闭'}</code>",
         "🧩 兼容剔除: "
@@ -1035,7 +1069,7 @@ def wiz_on_url_input(chat_id: int, text: str) -> None:
 
 
 def _wiz_send_protocol_panel(chat_id: int) -> None:
-    rows = [[ui.btn(label, f"chw:proto:{proto}")] for proto, label in PROTOCOL_CHOICES]
+    rows = [[_protocol_button(proto, f"chw:proto:{proto}")] for proto, _label in PROTOCOL_CHOICES]
     rows.append(_WIZ_NAV)
     state = states.get_state(chat_id) or {}
     data = state.get("data") or {}
@@ -1049,16 +1083,16 @@ def _wiz_send_protocol_panel(chat_id: int) -> None:
             "✅ URL 已设置（检测到完整路径，已自动拆分）\n"
             f"     • baseUrl: <code>{ui.escape_html(data.get('baseUrl',''))}</code>\n"
             f"     • apiPath: <code>{ui.escape_html(api_path)}</code>\n"
-            f"     • 建议协议: <b>{ui.escape_html(detected_label)}</b>\n\n"
+            f"     • 建议协议: {_protocol_body_label(detected) if detected else ui.escape_html(detected_label)}\n\n"
         )
     ui.send(
         chat_id,
         head +
         "➕ <b>添加渠道（3/5）</b>\n\n"
         "请选择该渠道的上游协议：\n\n"
-        f"• {ui.provider_tag('claude', full=True)} — 对接 Claude 风格 <code>/v1/messages</code>，支持 CC 伪装（默认）\n"
-        f"• {ui.provider_tag('openai')} Chat — 对接 <code>/v1/chat/completions</code> 兼容上游（DeepSeek、智谱等）\n"
-        f"• {ui.provider_tag('openai')} Responses — 对接 <code>/v1/responses</code>（gpt-5 / o 系列 / 新 Responses API）",
+        f"• {ui.family_tag('anthropic')} — 对接 Claude 风格 <code>/v1/messages</code>，支持 CC 伪装（默认）\n"
+        f"• {ui.family_tag('openai')} Chat — 对接 <code>/v1/chat/completions</code> 兼容上游（DeepSeek、智谱等）\n"
+        f"• {ui.family_tag('openai')} Responses — 对接 <code>/v1/responses</code>（gpt-5 / o 系列 / 新 Responses API）",
         reply_markup=ui.inline_kb(rows),
     )
 
@@ -1069,7 +1103,7 @@ def _wiz_proceed_to_key_step(chat_id: int, message_id: int, data: dict, protocol
     states.set_state(chat_id, "ch_wiz_key", data)
     ui.edit(
         chat_id, message_id,
-        f"✅ 协议：<code>{ui.escape_html(_PROTOCOL_LABEL[protocol])}</code>\n\n"
+        f"✅ 协议：{_protocol_body_label(protocol)}\n\n"
         "➕ <b>添加渠道（4/5）</b>\n\n请输入该渠道的 API Key：",
         reply_markup=ui.inline_kb([_WIZ_NAV]),
     )
@@ -1094,13 +1128,17 @@ def wiz_on_protocol_select(chat_id: int, message_id: int, cb_id: str, protocol: 
         ui.edit(
             chat_id, message_id,
             "⚠ <b>协议与路径不匹配</b>\n\n"
-            f"您选择的协议：<code>{ui.escape_html(chosen_label)}</code>\n"
+            f"您选择的协议：{_protocol_body_label(protocol)}\n"
             f"识别到的路径：<code>{ui.escape_html(api_path)}</code>\n"
-            f"路径对应协议：<b>{ui.escape_html(detected_label)}</b>\n\n"
+            f"路径对应协议：{_protocol_body_label(detected)}\n\n"
             "如何处理？",
             reply_markup=ui.inline_kb([
-                [ui.btn(f"✅ 使用 {detected_label}（推荐）", f"chw:proto_adopt:{detected}")],
-                [ui.btn(f"⚠ 坚持 {chosen_label}，清空自定义路径", f"chw:proto_force:{protocol}")],
+                [_protocol_button(
+                    detected, f"chw:proto_adopt:{detected}", prefix="✅ 使用 ",
+                )],
+                [_protocol_button(
+                    protocol, f"chw:proto_force:{protocol}", prefix="⚠ 坚持 ",
+                )],
                 [ui.btn("◀ 返回修改 URL", "chw:back_to_url")],
             ]),
         )
@@ -1888,9 +1926,11 @@ def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     current = _protocol_of(ch)
     api_path = getattr(ch, "api_path", None)
     rows: list[list[dict]] = []
-    for proto, label in PROTOCOL_CHOICES:
+    for proto, _label in PROTOCOL_CHOICES:
         marker = "● " if proto == current else ""
-        rows.append([ui.btn(f"{marker}{label}", f"ch:seproto:{short}:{proto}")])
+        rows.append([_protocol_button(
+            proto, f"ch:seproto:{short}:{proto}", prefix=marker,
+        )])
     rows.append([ui.btn("◀ 返回编辑", f"ch:edit:{short}")])
     extra = ""
     if api_path:
@@ -1902,8 +1942,9 @@ def on_edit_protocol(chat_id: int, message_id: int, cb_id: str, short: str) -> N
     ui.edit(
         chat_id, message_id,
         f"🔌 <b>切换协议 [{ui.escape_html(ch.display_name)}]</b>\n\n"
-        f"当前：<code>{ui.escape_html(_PROTOCOL_LABEL.get(current, current))}</code>\n\n"
-        "<i>切换到 OpenAI & Grok 家族会自动关闭 CC 伪装；切回 Anthropic 将恢复。\n"
+        f"当前：{_protocol_body_label(current)}\n\n"
+        f"<i>切换到 {ui.family_tag('openai')} 家族会自动关闭 CC 伪装；"
+        f"切回 {ui.family_tag('anthropic')} 将恢复。\n"
         "注意：切换协议不自动更新 Base URL / API Key / 模型列表，请按需要另行修改。</i>"
         + extra,
         reply_markup=ui.inline_kb(rows),
