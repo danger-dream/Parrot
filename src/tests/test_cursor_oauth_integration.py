@@ -432,6 +432,43 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     assert "Cursor OAuth 账户已添加" in edits[-1][0]
 
 
+def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
+    account = _install_account()
+    account_key = "cursor:cursor-user-1"
+    channel_key = f"oauth:{account_key}"
+    metrics = {
+        "total": 2,
+        "success_count": 2,
+        "error_count": 0,
+        "input": 1_000,
+        "output": 200,
+        "cache_creation": 0,
+        "cache_read": 500,
+        "avg_tps": 20.0,
+        "max_tps": 30.0,
+        "min_tps": 10.0,
+        "cost_ticks": 0,
+        "costed_success": 0,
+        "unpriced_success": 2,
+    }
+    snapshot = {"by_channel": {channel_key: metrics}}
+
+    list_text = oauth_menu._format_account_block(account, month_snapshot=snapshot)
+    assert "💎 月度:" in list_text
+    assert "⚡ TPS:" in list_text
+    assert "💵 未计价（Cursor 官方账单见上方）" in list_text
+    assert "💵 $0.00" not in list_text
+
+    detail_text = oauth_menu._format_month_stats_block(
+        account_key,
+        month_snapshot=snapshot,
+        by_model=[{"final_model": "composer-2.5", **metrics}],
+    )
+    assert "累计金额：未计价（Cursor 官方账单见上方）" in detail_text
+    assert "    累计金额：未计价" in detail_text
+    assert "$0.00" not in detail_text
+
+
 def test_cursor_telegram_badge_uses_custom_emoji():
     emoji_id = "6062261319426390107"
     assert config.get()["telegramUi"]["providerCustomEmoji"]["cursor"] == emoji_id

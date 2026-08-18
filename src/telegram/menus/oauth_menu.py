@@ -1148,7 +1148,10 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
-        lines.append(f"💵 {ui.fmt_cost(ts)}")
+        if prov == "cursor":
+            lines.append("💵 未计价（Cursor 官方账单见上方）")
+        else:
+            lines.append(f"💵 {ui.fmt_cost(ts)}")
 
     # 冷却状态
     from ... import cooldown as _cd
@@ -2176,6 +2179,7 @@ def _format_month_stats_block(account_key: str, *,
     overall = (((month_snapshot or {}).get("by_channel") or {}).get(ck))
     if not _has_local_usage_or_billing(overall):
         return ""
+    is_cursor = oauth_manager.provider_of(account_key) == "cursor"
     model_loading = False
     if by_model is None:
         cached_models = menu_cache.DETAIL_STATS.peek(
@@ -2201,7 +2205,10 @@ def _format_month_stats_block(account_key: str, *,
         f"平均 {ui.fmt_tps(overall.get('avg_tps'))} · "
         f"峰值 {ui.fmt_tps(overall.get('max_tps'))} · "
         f"最低 {ui.fmt_tps(overall.get('min_tps'))}",
-        f"累计金额：{ui.fmt_cost(overall)}",
+        (
+            "累计金额：未计价（Cursor 官方账单见上方）"
+            if is_cursor else f"累计金额：{ui.fmt_cost(overall)}"
+        ),
     ]
     if by_model:
         lines.append("")
@@ -2223,7 +2230,10 @@ def _format_month_stats_block(account_key: str, *,
                     f"峰值 {ui.fmt_tps(ms.get('max_tps'))} · "
                     f"最低 {ui.fmt_tps(ms.get('min_tps'))}"
                 )
-            lines.append(f"    累计金额：{ui.fmt_cost(ms)}")
+            lines.append(
+                "    累计金额：未计价"
+                if is_cursor else f"    累计金额：{ui.fmt_cost(ms)}"
+            )
     return "\n".join(lines)
 
 
