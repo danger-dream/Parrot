@@ -8,7 +8,7 @@ from ._isolation import isolate
 
 isolate()
 
-from src import config, cooldown, model_metadata, oauth_manager, state_db  # noqa: E402
+from src import config, cooldown, model_metadata, notifier, oauth_manager, state_db  # noqa: E402
 from src.channel.cursor_oauth_channel import CursorOAuthChannel  # noqa: E402
 from src.cursor_bridge import catalog as cursor_catalog  # noqa: E402
 from src.cursor_bridge import runtime as cursor_runtime  # noqa: E402
@@ -322,6 +322,14 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     assert accounts[0]["cursor_model_catalog"]["models"]
     assert states.get_state(321) is None
     assert "Cursor OAuth 账户已添加" in edits[-1][0]
+
+
+def test_cursor_telegram_badge_uses_custom_emoji():
+    emoji_id = "6062261319426390107"
+    assert config.get()["telegramUi"]["providerCustomEmoji"]["cursor"] == emoji_id
+    assert ui.provider_custom_emoji_id("cursor") == emoji_id
+    assert f'emoji-id="{emoji_id}"' in ui.provider_tag("cursor")
+    assert f'emoji-id="{emoji_id}"' in notifier.provider_tag("cursor")
 
 
 def test_cursor_login_menu_has_url_done_and_cancel_buttons(monkeypatch):

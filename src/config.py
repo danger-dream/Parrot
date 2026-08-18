@@ -460,6 +460,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "openai": "5861557411784957025",
             "claude": "5872779796257184592",
             "xai": "5819115571463068721",
+            "cursor": "6062261319426390107",
         },
         "providerBtnEmoji": {
             "openai": "🅾️",
