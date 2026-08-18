@@ -11,7 +11,8 @@
     回滚后健康验证/ROLLBACK 标记/不使用 rename）
   - stage_update：备份失败 / 拉取失败 / 成功进 staged（全 mock 外部命令）
   - 并发锁：stage 持锁时再次 stage 被拒
-  - confirm_restart / cancel_staged 的状态前置校验
+  - confirm_restart 的严格 checkpoint、在线备份、完整性验证与 fail-closed 重启门控
+  - cancel_staged 的状态前置校验
   - 备份列表 list_backups / 清理 _prune_backups
 
 运行：
@@ -26,6 +27,7 @@ from src.tests import _isolation
 _tmpdir = _isolation.isolate()
 
 import json
+import sqlite3
 import subprocess
 import time
 
@@ -458,3 +460,125 @@ class TestConcurrencyLock:
         ok, detail = updater.cancel_staged()
         assert ok is False
         assert "staged" in detail
+
+
+# ─── 重启前 state.db fail-closed 护栏 ─────────────────────────────
+
+class TestRestartDatabaseGuard:
+    def _stage_bare_update(self, backup_ref: str = "src-test-guard") -> None:
+        updater.save_state(
+            stage=updater.STAGE_STAGED,
+            mode=updater.MODE_BARE,
+            backup_ref=backup_ref,
+            from_version="0.30.0",
+            target_tag="v0.30.1",
+        )
+
+    def test_success_creates_verified_online_backup_before_restart(self, monkeypatch):
+        self._stage_bare_update()
+        state_db.schema_meta_set("restart_guard_probe", "preserved")
+        restart_calls = []
+        monkeypatch.setattr(
+            updater,
+            "_src_restart",
+            lambda: restart_calls.append("restart") or (True, "scheduled"),
+        )
+
+        ok, detail = updater.confirm_restart()
+
+        assert ok is True, detail
+        assert restart_calls == ["restart"]
+        assert updater.load_state()["stage"] == updater.STAGE_RESTARTING
+        backup_path = updater._state_db_restart_backup_path({"backup_ref": "src-test-guard"})
+        assert _os.path.isfile(backup_path)
+        conn = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+        try:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            row = conn.execute(
+                "SELECT value FROM schema_meta WHERE key='restart_guard_probe'"
+            ).fetchone()
+            assert row == ("preserved",)
+            # Recovery snapshot deliberately remains staged; only the live DB is
+            # advanced to restarting after backup verification succeeds.
+            stage = conn.execute(
+                "SELECT stage FROM app_self_update WHERE id=1"
+            ).fetchone()
+            assert stage == (updater.STAGE_STAGED,)
+        finally:
+            conn.close()
+
+    def test_checkpoint_failure_blocks_restart_and_keeps_staged(self, monkeypatch):
+        self._stage_bare_update("src-checkpoint-fail")
+        restart_calls = []
+        monkeypatch.setattr(
+            state_db,
+            "checkpoint",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("busy=1")),
+        )
+        monkeypatch.setattr(
+            updater,
+            "_src_restart",
+            lambda: restart_calls.append("restart") or (True, "scheduled"),
+        )
+
+        ok, detail = updater.confirm_restart()
+
+        assert ok is False
+        assert "state database protection failed" in detail
+        assert "busy=1" in detail
+        assert restart_calls == []
+        assert updater.load_state()["stage"] == updater.STAGE_STAGED
+
+    def test_backup_or_integrity_failure_blocks_restart(self, monkeypatch):
+        self._stage_bare_update("src-backup-fail")
+        restart_calls = []
+        monkeypatch.setattr(state_db, "checkpoint", lambda **kwargs: (0, 7, 7))
+        monkeypatch.setattr(
+            state_db,
+            "online_backup",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("integrity_check failed")
+            ),
+        )
+        monkeypatch.setattr(
+            updater,
+            "_src_restart",
+            lambda: restart_calls.append("restart") or (True, "scheduled"),
+        )
+
+        ok, detail = updater.confirm_restart()
+
+        assert ok is False
+        assert "integrity_check failed" in detail
+        assert restart_calls == []
+        assert updater.load_state()["stage"] == updater.STAGE_STAGED
+
+    def test_restarting_state_checkpoint_failure_also_blocks_restart(self, monkeypatch):
+        self._stage_bare_update("src-final-checkpoint-fail")
+        checkpoint_calls = []
+        restart_calls = []
+
+        def fake_checkpoint(**kwargs):
+            checkpoint_calls.append(kwargs)
+            if len(checkpoint_calls) == 2:
+                raise RuntimeError("final checkpoint busy")
+            return (0, 3, 3)
+
+        monkeypatch.setattr(state_db, "checkpoint", fake_checkpoint)
+        monkeypatch.setattr(state_db, "online_backup", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(
+            updater,
+            "_src_restart",
+            lambda: restart_calls.append("restart") or (True, "scheduled"),
+        )
+
+        ok, detail = updater.confirm_restart()
+
+        assert ok is False
+        assert "final checkpoint busy" in detail
+        assert checkpoint_calls == [
+            {"mode": "FULL", "strict": True},
+            {"mode": "FULL", "strict": True},
+        ]
+        assert restart_calls == []
+        assert updater.load_state()["stage"] == updater.STAGE_STAGED

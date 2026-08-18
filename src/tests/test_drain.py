@@ -63,3 +63,44 @@ def test_drain_aware_server_signal_waits_before_should_exit():
         assert srv.should_exit is True
 
     asyncio.run(scenario())
+
+
+def test_shutdown_finalizes_state_db_with_strict_full_checkpoint(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        parrot_server.state_db,
+        "checkpoint",
+        lambda **kwargs: calls.append(("checkpoint", kwargs)) or (0, 8, 8),
+    )
+    monkeypatch.setattr(
+        parrot_server.state_db,
+        "close",
+        lambda: calls.append(("close", {})),
+    )
+
+    assert parrot_server._finalize_state_db() is True
+    assert calls == [
+        ("checkpoint", {"mode": "FULL", "strict": True}),
+        ("close", {}),
+    ]
+
+
+def test_shutdown_closes_state_db_even_when_checkpoint_fails(monkeypatch):
+    calls = []
+
+    def fail_checkpoint(**kwargs):
+        calls.append(("checkpoint", kwargs))
+        raise RuntimeError("busy")
+
+    monkeypatch.setattr(parrot_server.state_db, "checkpoint", fail_checkpoint)
+    monkeypatch.setattr(
+        parrot_server.state_db,
+        "close",
+        lambda: calls.append(("close", {})),
+    )
+
+    assert parrot_server._finalize_state_db() is False
+    assert calls == [
+        ("checkpoint", {"mode": "FULL", "strict": True}),
+        ("close", {}),
+    ]

@@ -738,12 +738,104 @@ def optional_write_timeout(timeout_ms: int = 100):
                     _local.conn = None
 
 
-def checkpoint() -> None:
-    conn = _get_conn()
+def checkpoint(*, mode: str = "TRUNCATE", strict: bool = False) -> tuple[int, int, int]:
+    """Checkpoint the state WAL and report ``(busy, log, checkpointed)``.
+
+    Periodic maintenance uses the default TRUNCATE mode.  Restart guards use
+    ``mode="FULL", strict=True`` so a busy or incomplete checkpoint becomes a
+    hard failure instead of being silently ignored.
+    """
+    normalized = str(mode or "TRUNCATE").strip().upper()
+    if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+        raise ValueError(f"unsupported WAL checkpoint mode: {mode}")
+    with _write_lock:
+        row = _get_conn().execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
+    if row is None or len(row) < 3:
+        raise RuntimeError(f"WAL checkpoint {normalized} returned no status")
+    result = (int(row[0]), int(row[1]), int(row[2]))
+    busy, log_pages, checkpointed_pages = result
+    if strict and (busy != 0 or checkpointed_pages != log_pages):
+        raise RuntimeError(
+            f"WAL checkpoint {normalized} incomplete: "
+            f"busy={busy}, log={log_pages}, checkpointed={checkpointed_pages}"
+        )
+    return result
+
+
+def online_backup(destination: str, *, verify: bool = True) -> str:
+    """Create an atomic SQLite Online Backup of the live state database.
+
+    The source connection remains online while SQLite copies a consistent
+    snapshot (including committed WAL content).  The completed temporary copy
+    is integrity-checked before it atomically replaces ``destination``.
+    """
+    if _db_path is None:
+        raise RuntimeError("state_db.init() not called")
+    source_path = os.path.abspath(_db_path)
+    destination = os.path.abspath(destination)
+    if source_path == destination:
+        raise ValueError("state database backup destination equals source")
+    os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
+    tmp = f"{destination}.tmp-{os.getpid()}-{threading.get_ident()}"
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        with _write_lock:
+            target = sqlite3.connect(tmp, timeout=10)
+            try:
+                _get_conn().backup(target)
+                target.commit()
+            finally:
+                target.close()
+
+        if verify:
+            check_conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=10)
+            try:
+                rows = check_conn.execute("PRAGMA integrity_check").fetchall()
+            finally:
+                check_conn.close()
+            checks = [str(row[0]) for row in rows]
+            if checks != ["ok"]:
+                detail = "; ".join(checks[:5]) or "no result"
+                raise RuntimeError(f"state database backup integrity_check failed: {detail}")
+
+        # Close+fsync makes the verified snapshot durable before publishing it.
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, destination)
+        try:
+            dir_fd = os.open(os.path.dirname(destination) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Some filesystems do not permit directory fsync; the database file
+            # itself is already synced and remains a valid recovery snapshot.
+            pass
+        return destination
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def close() -> None:
+    """Close this thread's state connection after final shutdown checkpoint."""
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        return
+    try:
+        conn.close()
+    finally:
+        _local.conn = None
 
 
 def now_ms() -> int:

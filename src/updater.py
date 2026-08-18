@@ -28,6 +28,7 @@
 - 所有外部命令参数固定，无字符串拼接注入面。
 - 源码形态有未提交改动 → 拒绝更新（避免 reset 吃掉本地改动）。
 - 全局更新锁，防并发重复触发。
+- 重启前 state.db 必须通过严格 checkpoint、在线备份和完整性验证；失败则拒绝重启。
 - 重启后健康检查失败 → 自动回滚到备份。
 """
 
@@ -1006,10 +1007,43 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
         _op_lock.release()
 
 
-def confirm_restart() -> tuple[bool, str]:
-    """第二阶段：用户确认后重启生效。重启前置位 restarting，新进程起来后 resume。
+def _state_db_restart_backup_path(st: dict) -> str:
+    """Return a traversal-safe backup path tied to the staged release backup."""
+    raw_ref = str(st.get("backup_ref") or "").strip()
+    safe_ref = "".join(ch for ch in raw_ref if ch.isalnum() or ch in "._-")[:160]
+    if not safe_ref:
+        safe_ref = f"update-{time.strftime('%Y%m%d-%H%M%S')}"
+    return os.path.join(_backup_root(), safe_ref + ".state.db")
 
-    用 _op_lock 防止「连点两次确认」触发两次重启/重建（TOCTOU）。
+
+def _prepare_state_db_restart(st: dict) -> tuple[str, tuple[int, int, int]]:
+    """Checkpoint, online-backup and verify state.db before any restart."""
+    checkpoint_result = state_db.checkpoint(mode="FULL", strict=True)
+    destination = _state_db_restart_backup_path(st)
+    state_db.online_backup(destination, verify=True)
+    return destination, checkpoint_result
+
+
+def _restart_guard_failed(detail: str) -> tuple[bool, str]:
+    """Keep a staged update recoverable when database protection fails closed."""
+    public_detail = f"state database protection failed: {detail}"
+    append_update_log(f"❌ 重启前数据库保护失败，已阻止重启：{detail}")
+    try:
+        save_state(stage=STAGE_STAGED, message=f"数据库保护失败，已阻止重启: {detail}")
+    except Exception as state_exc:
+        append_update_log(f"⚠️ staged 状态回写失败：{state_exc}")
+    _emit(
+        STAGE_STAGED,
+        "❌ state.db 检查点、在线备份或完整性验证失败，已阻止重启。\n"
+        f"详情：{detail}",
+    )
+    return False, public_detail
+
+
+def confirm_restart() -> tuple[bool, str]:
+    """第二阶段：数据库保护成功后才允许重启并由新进程 resume。
+
+    用 _op_lock 防止「连点两次确认」触发两次备份或重启（TOCTOU）。
     """
     if not _op_lock.acquire(blocking=False):
         return False, "另一个更新操作正在进行中"
@@ -1018,41 +1052,55 @@ def confirm_restart() -> tuple[bool, str]:
         if st.get("stage") != STAGE_STAGED:
             return False, f"当前不在 staged 态（{st.get('stage')}），无法确认重启"
         mode = st.get("mode") or _detect_mode()
-        save_state(stage=STAGE_RESTARTING, message="用户已确认，正在重启生效")
+
+        # Fail closed：严格 FULL checkpoint → SQLite Online Backup → backup
+        # integrity_check。任何一步失败都保持 staged，不派发重启。
+        try:
+            db_backup, checkpoint_result = _prepare_state_db_restart(st)
+        except Exception as exc:
+            return _restart_guard_failed(str(exc))
+        busy, log_pages, checkpointed_pages = checkpoint_result
+        append_update_log(
+            "✅ state.db 重启保护完成："
+            f"checkpoint={busy}|{log_pages}|{checkpointed_pages}; backup={db_backup}"
+        )
+
+        # 备份保留 staged 状态，便于恢复；随后持久化 restarting，并再次严格
+        # checkpoint，确保新进程一定能读取到 resume 标记。
+        try:
+            save_state(stage=STAGE_RESTARTING, message="用户已确认，正在重启生效")
+            state_db.checkpoint(mode="FULL", strict=True)
+        except Exception as exc:
+            return _restart_guard_failed(f"persist restarting state: {exc}")
+
+        _emit(STAGE_RESTARTING, "🔄 数据库保护完成，正在重启生效 …")
+        if mode == MODE_DOCKER:
+            # 取备份 digest 传给 sidecar，供健康检查失败时自动回滚
+            backup_digest = ""
+            bref = st.get("backup_ref") or ""
+            if bref:
+                mp = os.path.join(_backup_root(), bref + ".json")
+                if os.path.exists(mp):
+                    try:
+                        with open(mp, encoding="utf-8") as f:
+                            backup_digest = (json.load(f) or {}).get("digest", "") or ""
+                    except Exception:
+                        pass
+            # 清掉上一次的结果标记，避免误读
+            try:
+                os.remove(os.path.join(config.DATA_DIR, ".update_result"))
+            except Exception:
+                pass
+            ok, detail = _docker_sidecar_recreate(backup_digest=backup_digest)
+        else:
+            ok, detail = _src_restart()
+        if not ok:
+            save_state(stage=STAGE_FAILED, message=f"重启触发失败: {detail}")
+            _emit(STAGE_FAILED, f"❌ 重启触发失败：{detail}")
+            return False, detail
+        return True, detail
     finally:
         _op_lock.release()
-    # 关键：重启会立刻 SIGTERM 当前进程，必须先把 state.db 的 WAL 落盘，
-    # 否则新进程读不到 restarting 态，resume 不会触发。
-    try:
-        state_db.checkpoint()
-    except Exception as exc:
-        print(f"[updater] checkpoint before restart failed: {exc}")
-    _emit(STAGE_RESTARTING, "🔄 正在重启生效 …")
-    if mode == MODE_DOCKER:
-        # 取备份 digest 传给 sidecar，供健康检查失败时自动回滚
-        backup_digest = ""
-        bref = st.get("backup_ref") or ""
-        if bref:
-            mp = os.path.join(_backup_root(), bref + ".json")
-            if os.path.exists(mp):
-                try:
-                    with open(mp, encoding="utf-8") as f:
-                        backup_digest = (json.load(f) or {}).get("digest", "") or ""
-                except Exception:
-                    pass
-        # 清掉上一次的结果标记，避免误读
-        try:
-            os.remove(os.path.join(config.DATA_DIR, ".update_result"))
-        except Exception:
-            pass
-        ok, detail = _docker_sidecar_recreate(backup_digest=backup_digest)
-    else:
-        ok, detail = _src_restart()
-    if not ok:
-        save_state(stage=STAGE_FAILED, message=f"重启触发失败: {detail}")
-        _emit(STAGE_FAILED, f"❌ 重启触发失败：{detail}")
-        return False, detail
-    return True, detail
 
 
 def cancel_staged() -> tuple[bool, str]:
@@ -1281,7 +1329,7 @@ def _prune_backups() -> None:
         metas.sort(reverse=True)  # 时间戳在文件名里，逆序=最新在前
         for old in metas[keep:]:
             ref = old[:-5]
-            for ext in (".json", ".tar.gz"):
+            for ext in (".json", ".tar.gz", ".state.db"):
                 p = os.path.join(root, ref + ext)
                 if os.path.exists(p):
                     try:

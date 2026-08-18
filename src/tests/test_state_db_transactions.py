@@ -171,3 +171,54 @@ def test_rollback_failure_discards_thread_connection_and_next_call_recovers(m):
         if getattr(state_db._local, "conn", None) is None:
             state_db._get_conn()
         state_db.error_delete(channel_key, model)
+
+
+def test_strict_checkpoint_reports_complete_status(m):
+    state_db = m["state_db"]
+    state_db.init()
+    state_db.schema_meta_set("checkpoint-probe", "ready")
+
+    busy, log_pages, checkpointed_pages = state_db.checkpoint(mode="FULL", strict=True)
+
+    assert busy == 0
+    assert checkpointed_pages == log_pages
+
+
+def test_strict_checkpoint_rejects_busy_or_incomplete_result(m, monkeypatch):
+    state_db = m["state_db"]
+
+    class _Cursor:
+        @staticmethod
+        def fetchone():
+            return (1, 9, 4)
+
+    class _BusyConnection:
+        @staticmethod
+        def execute(sql):
+            assert sql == "PRAGMA wal_checkpoint(FULL)"
+            return _Cursor()
+
+    monkeypatch.setattr(state_db, "_get_conn", lambda: _BusyConnection())
+
+    with pytest.raises(RuntimeError, match=r"busy=1, log=9, checkpointed=4"):
+        state_db.checkpoint(mode="FULL", strict=True)
+
+
+def test_online_backup_is_consistent_and_integrity_checked(m, tmp_path):
+    state_db = m["state_db"]
+    state_db.init()
+    state_db.schema_meta_set("online-backup-probe", "preserved")
+    destination = tmp_path / "state-online-backup.db"
+
+    result = state_db.online_backup(str(destination), verify=True)
+
+    assert result == str(destination)
+    assert destination.is_file()
+    conn = sqlite3.connect(f"file:{destination}?mode=ro", uri=True)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert conn.execute(
+            "SELECT value FROM schema_meta WHERE key='online-backup-probe'"
+        ).fetchone() == ("preserved",)
+    finally:
+        conn.close()

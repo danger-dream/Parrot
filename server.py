@@ -105,6 +105,27 @@ async def _wal_checkpoint_loop():
             print(f"[translation] checkpoint failed: {e}")
 
 
+def _finalize_state_db() -> bool:
+    """Run the final strict state checkpoint and close the main-thread handle."""
+    ok = False
+    try:
+        busy, log_pages, checkpointed_pages = state_db.checkpoint(mode="FULL", strict=True)
+        print(
+            "[state_db] shutdown checkpoint complete: "
+            f"{busy}|{log_pages}|{checkpointed_pages}"
+        )
+        ok = True
+    except Exception as exc:
+        print(f"[state_db] shutdown checkpoint failed: {exc}")
+    finally:
+        try:
+            state_db.close()
+        except Exception as exc:
+            print(f"[state_db] shutdown close failed: {exc}")
+            ok = False
+    return ok
+
+
 async def _stale_pending_loop():
     while True:
         await asyncio.sleep(300)
@@ -336,6 +357,7 @@ async def lifespan(app: FastAPI):
         tgbot.stop()
         await upstream.close_client()
         cursor_bridge_runtime.stop()
+        _finalize_state_db()
 
 
 app = FastAPI(lifespan=lifespan)
