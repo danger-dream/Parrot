@@ -478,6 +478,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "channelSelection": "smart",  # "smart" | "order" | "priority"
     "loadBalancing": {
         "initialized": False,
+        # Priority 主配置：统一账户/渠道默认顺序 + canonical 模型专属覆盖。
+        "channelPriorityOrder": [],
+        "modelPriorityOrders": {},
+        # 旧版家族顺序仅用于平滑迁移/降级兼容，新 UI 不再编辑。
         "priorityOrders": {
             "anthropic": [],
             "openai": [],

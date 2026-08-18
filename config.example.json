@@ -303,6 +303,8 @@
   "channelSelection": "smart",
   "loadBalancing": {
     "initialized": false,
+    "channelPriorityOrder": [],
+    "modelPriorityOrders": {},
     "priorityOrders": {
       "anthropic": [],
       "openai": []

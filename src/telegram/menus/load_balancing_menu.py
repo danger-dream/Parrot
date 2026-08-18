@@ -1,10 +1,12 @@
-"""负载均衡菜单：调度算法选择 + priority 优先级编辑。
+"""负载均衡菜单：调度算法、统一渠道顺序与模型专属优先级。
 
-callback_data 前缀：`lb:...`
-状态机 action：
-  - `lb_edit`       优先级调整草稿（按钮多选/移动）
-  - `lb_bulk_input` 等待用户输入完整序号排列
-  - `lb_bulk_preview` 历史兼容：批量预览待保存
+Priority 模式不再按协议家族拆分。Telegram 提供两条配置路径：
+
+- 按渠道/账户调整：所有 live 渠道的统一默认顺序；
+- 按模型调整：canonical client model 的专属顺序，优先于统一顺序。
+
+批量模型选择一次展示全部模型（不分页）；确认后对所选模型支持渠道取并集，
+用与单模型/渠道相同的移动编辑器排序，保存时按每个模型真实支持范围过滤。
 """
 
 from __future__ import annotations
@@ -13,39 +15,22 @@ import math
 import re
 from typing import Optional
 
-from ... import affinity, config, load_balancing
+from ... import affinity, config, load_balancing, model_mapping
 from ...channel import registry
 from ...oauth_ids import provider_from_channel_key
 from .. import states, ui
-
-
-def _family_label(family: str, *, rich: bool = True) -> str:
-    return ui.family_tag(family, rich=rich, suffix=" 协议")
-
-
-def _family_button(family: str, callback_data: str) -> dict:
-    return ui.family_button(family, callback_data, suffix=" 协议")
 
 _MODE_LABELS = {
     "smart": "智能调度",
     "order": "顺序调度",
     "priority": "优先级调度",
 }
-
-_MODE_DESCS = {
-    "smart": "按滑动窗口评分 + 20% 探索率排序",
-    "order": "按配置顺序依次尝试",
-    "priority": "按用户自行设定的优先级",
-}
+_MODEL_PAGE_SIZE = 6
+_MODEL_REF_PREFIX = "lb:model:"
 
 
-def _channels_for_family(family: str) -> list:
-    return [ch for ch in registry.all_channels() if load_balancing.family_for_channel(ch) == family]
-
-
-def _normalized_keys(family: str) -> list[str]:
-    live = [ch.key for ch in _channels_for_family(family)]
-    return load_balancing.normalize_order_for_family(family, live)
+def _all_channels() -> list:
+    return list(registry.all_channels())
 
 
 def _channel_icon(ch) -> str:
@@ -72,6 +57,18 @@ def _status_text(ch) -> str:
     return f"⚠ {reason}"
 
 
+def _compact_channel_label(ch) -> str:
+    if ch.type == "oauth":
+        provider = provider_from_channel_key(ch.key)
+        same_provider = [
+            item for item in _all_channels()
+            if item.type == "oauth" and provider_from_channel_key(item.key) == provider
+        ]
+        if len(same_provider) == 1:
+            return ui.provider_label(provider)
+    return ui.channel_display_name(ch.key, with_family=False)
+
+
 def _format_item_line(idx: int, key: str) -> str:
     ch = registry.get_channel(key)
     if ch is None:
@@ -85,75 +82,97 @@ def _format_item_line(idx: int, key: str) -> str:
 
 def _format_order_lines(keys: list[str]) -> list[str]:
     if not keys:
-        return ["<i>当前没有该协议类型的账户/渠道。</i>"]
+        return ["<i>当前没有可排序的账户/渠道。</i>"]
     return [_format_item_line(i, key) for i, key in enumerate(keys, start=1)]
 
 
 def _split_number_rows(n: int, max_cols: int = 6) -> list[list[int]]:
-    """把 1..n 智能拆成按钮行。
-
-    每行不超过 max_cols；行数尽量少；各行尽量均衡，避免最后一行孤零零一个。
-    """
     if n <= 0:
         return []
     rows_count = math.ceil(n / max_cols)
     base = n // rows_count
     extra = n % rows_count
     rows: list[list[int]] = []
-    cur = 1
-    for r in range(rows_count):
-        size = base + (1 if r < extra else 0)
-        rows.append(list(range(cur, cur + size)))
-        cur += size
+    current = 1
+    for row_index in range(rows_count):
+        size = base + (1 if row_index < extra else 0)
+        rows.append(list(range(current, current + size)))
+        current += size
     return rows
 
 
-def _state_data(chat_id: int) -> Optional[dict]:
-    st = states.get_state(chat_id)
-    if not st:
-        return None
-    data = st.get("data") or {}
-    if st.get("action") not in ("lb_edit", "lb_bulk_input", "lb_bulk_preview"):
-        return None
-    return data
+def _client_models() -> list[str]:
+    models: set[str] = set()
+    mapping = model_mapping.get_ingress_map(model_mapping.GLOBAL_MAPPING_LINE)
+    for ch in _all_channels():
+        try:
+            values = ch.list_client_models()
+        except Exception:
+            values = getattr(ch, "models", []) or []
+        for model in values or []:
+            value = str(model or "").strip()
+            if value:
+                models.add(str(mapping.get(value) or value).strip())
+    return sorted(models, key=lambda value: value.lower())
 
 
-def _selection_set(data: dict) -> set[int]:
-    return {int(x) for x in (data.get("selected") or [])}
+def _channels_for_model(model: str) -> list:
+    result = []
+    for ch in _all_channels():
+        try:
+            if ch.supports_model(model) is not None:
+                result.append(ch)
+        except Exception:
+            continue
+    return result
 
 
-def _set_edit_state(chat_id: int, family: str, draft: list[str],
-                    selected: Optional[set[int]] = None) -> None:
-    states.set_state(chat_id, "lb_edit", {
-        "family": family,
-        "draft": list(draft),
-        "selected": sorted(selected or []),
-    })
+def _effective_model_keys(model: str) -> list[str]:
+    channels = _channels_for_model(model)
+    return load_balancing.effective_order_for_model(model, channels)
 
 
-# ─── 一级菜单 ─────────────────────────────────────────────────────
+def _model_code(model: str) -> str:
+    return ui.register_code(_MODEL_REF_PREFIX + str(model or ""))
+
+
+def _resolve_model_code(code: str) -> str | None:
+    raw = ui.resolve_code(str(code or "")) or ""
+    if raw.startswith(_MODEL_REF_PREFIX):
+        model = raw[len(_MODEL_REF_PREFIX):]
+        return model if model in set(_client_models()) else None
+    wanted = str(code or "")
+    for model in _client_models():
+        if _model_code(model) == wanted:
+            return model
+    return None
+
+
+# ─── 调度模式一级页 ───────────────────────────────────────────────
+
 
 def _main_text_and_kb() -> tuple[str, dict]:
     mode = (config.get().get("channelSelection") or "smart").lower()
-    lines = [
-        "⚖️ <b>负载均衡</b>",
-        "",
-        "当前调度算法:",
-    ]
-    for m in ("smart", "order", "priority"):
-        prefix = "✅ " if mode == m else ""
-        lines.append(f"{prefix}{_MODE_LABELS[m]}（{_MODE_DESCS[m]}）")
+    lines = ["⚖️ <b>负载均衡</b>", "", "当前调度算法:"]
+    for value in ("smart", "order", "priority"):
+        prefix = "✅ " if mode == value else ""
+        lines.append(
+            f"{prefix}{_MODE_LABELS[value]}（{load_balancing.mode_description(value)}）"
+        )
     lines.extend(["", "请选择调度算法"])
-
-    rows = [[
+    rows: list[list[dict]] = [[
         ui.btn(f"智能调度{' √' if mode == 'smart' else ''}", "lb:mode:smart"),
         ui.btn(f"顺序调度{' √' if mode == 'order' else ''}", "lb:mode:order"),
         ui.btn(f"优先级{' √' if mode == 'priority' else ''}", "lb:mode:priority"),
     ]]
     if mode == "priority":
-        lines.extend(["", "请选择要调整的协议类型"])
-        rows.append([_family_button("anthropic", "lb:fam:anthropic")])
-        rows.append([_family_button("openai", "lb:fam:openai")])
+        lines.extend([
+            "",
+            "优先级层级：<b>模型专属顺序 &gt; 统一渠道/账户顺序</b>",
+            "请选择调整方式",
+        ])
+        rows.append([ui.btn("🤖 按模型调整优先级", "lb:models:1")])
+        rows.append([ui.btn("🔀 按渠道/账户调整优先级", "lb:channels")])
         rows.append([ui.btn("🧹 清除全部亲和", "lb:aff_all")])
     rows.append([ui.btn("◀ 返回主菜单", "menu:main")])
     return "\n".join(lines), ui.inline_kb(rows)
@@ -162,13 +181,13 @@ def _main_text_and_kb() -> tuple[str, dict]:
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    text, kb = _main_text_and_kb()
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    text, keyboard = _main_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=keyboard)
 
 
 def send_new(chat_id: int) -> None:
-    text, kb = _main_text_and_kb()
-    ui.send(chat_id, text, reply_markup=kb)
+    text, keyboard = _main_text_and_kb()
+    ui.send(chat_id, text, reply_markup=keyboard)
 
 
 def _on_mode(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
@@ -182,29 +201,75 @@ def _on_mode(chat_id: int, message_id: int, cb_id: str, mode: str) -> None:
     show(chat_id, message_id)
 
 
-# ─── 优先级编辑 ───────────────────────────────────────────────────
+# ─── 通用顺序编辑器 ───────────────────────────────────────────────
 
-def _edit_text_and_kb(family: str, draft: list[str], selected: set[int]) -> tuple[str, dict]:
-    title = f"{_family_label(family)} · 调度优先级"
+
+def _edit_state(chat_id: int) -> dict | None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "lb_edit":
+        return None
+    return dict(state.get("data") or {})
+
+
+def _store_edit_state(chat_id: int, data: dict) -> None:
+    normalized = dict(data)
+    normalized["draft"] = list(data.get("draft") or [])
+    normalized["initial"] = list(data.get("initial") or normalized["draft"])
+    normalized["selected"] = sorted({int(value) for value in data.get("selected") or []})
+    normalized["models"] = [str(model) for model in data.get("models") or []]
+    states.set_state(chat_id, "lb_edit", normalized)
+
+
+def _selection_set(data: dict) -> set[int]:
+    return {int(value) for value in data.get("selected") or []}
+
+
+def _edit_title(data: dict) -> str:
+    kind = data.get("kind")
+    models = list(data.get("models") or [])
+    if kind == "channels":
+        return "🔀 <b>按渠道/账户调整优先级</b>"
+    if kind == "model" and models:
+        return f"🤖 <b>{ui.escape_html(models[0])} · 模型专属优先级</b>"
+    return f"🤖 <b>批量模型优先级 · 已选 {len(models)} 个模型</b>"
+
+
+def _edit_text_and_kb(data: dict) -> tuple[str, dict]:
+    draft = list(data.get("draft") or [])
+    selected = _selection_set(data)
+    kind = data.get("kind") or "channels"
+    models = list(data.get("models") or [])
     lines = [
-        f"{title}",
+        _edit_title(data),
         "",
+    ]
+    if kind == "model" and models:
+        inherited = not load_balancing.has_model_priority(models[0])
+        lines.append(
+            "当前来源：<b>统一渠道/账户顺序（尚无模型专属覆盖）</b>"
+            if inherited else "当前来源：<b>模型专属顺序</b>"
+        )
+        lines.append("")
+    elif kind == "models_batch":
+        lines.extend([
+            "所选模型：" + "、".join(f"<code>{ui.escape_html(model)}</code>" for model in models),
+            "<i>保存时会按每个模型的真实支持范围过滤此渠道并集。</i>",
+            "",
+        ])
+    lines.extend([
         "当前账户/渠道:",
         *_format_order_lines(draft),
         "",
-        "调整方式:",
-        "请在下方先勾选要调整的账户/渠道序号",
-        "然后点击上移、下移按钮完成顺序调整",
-        "若调整出错可点击还原按钮还原最后一次保存状态",
-        "！！！调整完成后务必点击保存设置按钮",
-    ]
+        "请先勾选序号，再使用置顶、置底、上移、下移。",
+        "“还原”恢复进入本页时的已保存/有效顺序；完成后必须点击保存。",
+    ])
 
     rows: list[list[dict]] = []
-    for nums in _split_number_rows(len(draft)):
+    for numbers in _split_number_rows(len(draft)):
         row = []
-        for n in nums:
-            label = f"{n} ✅" if n in selected else str(n)
-            row.append(ui.btn(label, f"lb:sel:{n}"))
+        for number in numbers:
+            label = f"{number} ✅" if number in selected else str(number)
+            row.append(ui.btn(label, f"lb:sel:{number}"))
         rows.append(row)
     if draft:
         rows.append([
@@ -214,97 +279,120 @@ def _edit_text_and_kb(family: str, draft: list[str], selected: set[int]) -> tupl
             ui.btn("⬇ 下移", "lb:mv:down"),
         ])
     rows.append([ui.btn("还原", "lb:reset"), ui.btn("保存设置", "lb:save")])
-    rows.append([ui.btn("批量设置", "lb:bulk"),
-                 ui.btn("🧹 清除本协议全部亲和", f"lb:aff_fam:{family}")])
-    rows.append([ui.btn("◀ 返回主菜单", "menu:main"), ui.btn("取消", "lb:cancel")])
+    rows.append([ui.btn("⌨ 输入完整顺序", "lb:order_input")])
+    if kind == "model" and models:
+        rows.append([ui.btn("🧹 清除模型专属顺序", "lb:model_clear")])
+    if kind == "channels":
+        rows.append([ui.btn("🧹 清除全部亲和", "lb:aff_all")])
+    rows.append([ui.btn("◀ 返回", "lb:cancel"), ui.btn("🏠 主菜单", "menu:main")])
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
-def _show_edit(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
-    data = _state_data(chat_id)
+def _show_edit(chat_id: int, message_id: int, cb_id: str | None = None) -> None:
+    data = _edit_state(chat_id)
     if cb_id is not None:
         ui.answer_cb(cb_id)
     if not data:
         show(chat_id, message_id)
         return
-    family = data.get("family") or "anthropic"
-    draft = list(data.get("draft") or [])
-    selected = _selection_set(data)
-    text, kb = _edit_text_and_kb(family, draft, selected)
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    text, keyboard = _edit_text_and_kb(data)
+    ui.edit(chat_id, message_id, text, reply_markup=keyboard)
 
 
-def _start_family(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
-    if family not in load_balancing.FAMILIES:
-        ui.answer_cb(cb_id, "无效协议类型")
-        return
-    draft = _normalized_keys(family)
-    _set_edit_state(chat_id, family, draft)
+def _start_channels(chat_id: int, message_id: int, cb_id: str) -> None:
+    draft = load_balancing.normalize_channel_order()
+    _store_edit_state(chat_id, {
+        "kind": "channels", "draft": draft, "initial": draft, "selected": [],
+    })
     _show_edit(chat_id, message_id, cb_id)
 
 
-def _toggle_select(chat_id: int, message_id: int, cb_id: str, idx_str: str) -> None:
-    data = _state_data(chat_id)
+def _start_model(
+    chat_id: int,
+    message_id: int,
+    cb_id: str,
+    model_code: str,
+    page: int,
+) -> None:
+    model = _resolve_model_code(model_code)
+    if not model:
+        ui.answer_cb(cb_id, "模型短码已失效", show_alert=True)
+        return
+    draft = _effective_model_keys(model)
+    _store_edit_state(chat_id, {
+        "kind": "model",
+        "models": [model],
+        "draft": draft,
+        "initial": draft,
+        "selected": [],
+        "return_page": max(1, int(page or 1)),
+    })
+    _show_edit(chat_id, message_id, cb_id)
+
+
+def _toggle_select(chat_id: int, message_id: int, cb_id: str, raw_index: str) -> None:
+    data = _edit_state(chat_id)
     if not data:
         ui.answer_cb(cb_id, "会话已失效")
         show(chat_id, message_id)
         return
     draft = list(data.get("draft") or [])
     try:
-        idx = int(idx_str)
+        index = int(raw_index)
     except ValueError:
         ui.answer_cb(cb_id, "无效序号")
         return
-    if idx < 1 or idx > len(draft):
+    if index < 1 or index > len(draft):
         ui.answer_cb(cb_id, "序号越界")
         return
     selected = _selection_set(data)
-    if idx in selected:
-        selected.remove(idx)
+    if index in selected:
+        selected.remove(index)
     else:
-        selected.add(idx)
-    _set_edit_state(chat_id, data.get("family") or "anthropic", draft, selected)
+        selected.add(index)
+    data["selected"] = sorted(selected)
+    _store_edit_state(chat_id, data)
     _show_edit(chat_id, message_id, cb_id)
 
 
 def _move_top(draft: list[str], selected: set[int]) -> list[str]:
-    idxs = [i - 1 for i in sorted(selected)]
-    chosen = [draft[i] for i in idxs]
-    rest = [x for i, x in enumerate(draft) if i not in idxs]
+    indexes = [index - 1 for index in sorted(selected)]
+    chosen = [draft[index] for index in indexes]
+    rest = [value for index, value in enumerate(draft) if index not in indexes]
     return chosen + rest
 
 
 def _move_bottom(draft: list[str], selected: set[int]) -> list[str]:
-    idxs = [i - 1 for i in sorted(selected)]
-    chosen = [draft[i] for i in idxs]
-    rest = [x for i, x in enumerate(draft) if i not in idxs]
+    indexes = [index - 1 for index in sorted(selected)]
+    chosen = [draft[index] for index in indexes]
+    rest = [value for index, value in enumerate(draft) if index not in indexes]
     return rest + chosen
 
 
 def _move_up(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
-    arr = list(draft)
-    sel = {i - 1 for i in selected}
-    for i in range(1, len(arr)):
-        if i in sel and (i - 1) not in sel:
-            arr[i - 1], arr[i] = arr[i], arr[i - 1]
-            sel.remove(i)
-            sel.add(i - 1)
-    return arr, {i + 1 for i in sel}
+    result = list(draft)
+    zero_based = {index - 1 for index in selected}
+    for index in range(1, len(result)):
+        if index in zero_based and index - 1 not in zero_based:
+            result[index - 1], result[index] = result[index], result[index - 1]
+            zero_based.remove(index)
+            zero_based.add(index - 1)
+    return result, {index + 1 for index in zero_based}
 
 
 def _move_down(draft: list[str], selected: set[int]) -> tuple[list[str], set[int]]:
-    arr = list(draft)
-    sel = {i - 1 for i in selected}
-    for i in range(len(arr) - 2, -1, -1):
-        if i in sel and (i + 1) not in sel:
-            arr[i + 1], arr[i] = arr[i], arr[i + 1]
-            sel.remove(i)
-            sel.add(i + 1)
-    return arr, {i + 1 for i in sel}
+    result = list(draft)
+    zero_based = {index - 1 for index in selected}
+    for index in range(len(result) - 2, -1, -1):
+        if index in zero_based and index + 1 not in zero_based:
+            result[index + 1], result[index] = result[index], result[index + 1]
+            zero_based.remove(index)
+            zero_based.add(index + 1)
+    return result, {index + 1 for index in zero_based}
 
 
-def _move(chat_id: int, message_id: int, cb_id: str, op: str) -> None:
-    data = _state_data(chat_id)
+def _move(chat_id: int, message_id: int, cb_id: str, operation: str) -> None:
+    data = _edit_state(chat_id)
     if not data:
         ui.answer_cb(cb_id, "会话已失效")
         show(chat_id, message_id)
@@ -314,231 +402,393 @@ def _move(chat_id: int, message_id: int, cb_id: str, op: str) -> None:
     if not selected:
         ui.answer_cb(cb_id, "请先勾选序号")
         return
-    if op == "top":
-        new_draft = _move_top(draft, selected)
-        new_sel = set(range(1, len(selected) + 1))
-    elif op == "bottom":
-        new_draft = _move_bottom(draft, selected)
-        start = len(new_draft) - len(selected) + 1
-        new_sel = set(range(start, len(new_draft) + 1))
-    elif op == "up":
-        new_draft, new_sel = _move_up(draft, selected)
-    elif op == "down":
-        new_draft, new_sel = _move_down(draft, selected)
+    if operation == "top":
+        draft = _move_top(draft, selected)
+        selected = set(range(1, len(selected) + 1))
+    elif operation == "bottom":
+        draft = _move_bottom(draft, selected)
+        start = len(draft) - len(selected) + 1
+        selected = set(range(start, len(draft) + 1))
+    elif operation == "up":
+        draft, selected = _move_up(draft, selected)
+    elif operation == "down":
+        draft, selected = _move_down(draft, selected)
     else:
         ui.answer_cb(cb_id, "未知移动操作")
         return
-    _set_edit_state(chat_id, data.get("family") or "anthropic", new_draft, new_sel)
+    data["draft"] = draft
+    data["selected"] = sorted(selected)
+    _store_edit_state(chat_id, data)
     _show_edit(chat_id, message_id, cb_id)
 
 
 def _reset(chat_id: int, message_id: int, cb_id: str) -> None:
-    data = _state_data(chat_id)
-    family = (data or {}).get("family") or "anthropic"
-    _set_edit_state(chat_id, family, _normalized_keys(family))
-    ui.answer_cb(cb_id, "已还原最后一次保存状态")
+    data = _edit_state(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        return
+    data["draft"] = list(data.get("initial") or [])
+    data["selected"] = []
+    _store_edit_state(chat_id, data)
+    ui.answer_cb(cb_id, "已还原进入本页时的顺序")
     _show_edit(chat_id, message_id)
 
 
 def _save(chat_id: int, message_id: int, cb_id: str) -> None:
-    data = _state_data(chat_id)
+    data = _edit_state(chat_id)
     if not data:
         ui.answer_cb(cb_id, "会话已失效")
         show(chat_id, message_id)
         return
-    family = data.get("family") or "anthropic"
+    kind = data.get("kind")
     draft = list(data.get("draft") or [])
-    load_balancing.save_family_order(family, draft)
+    models = list(data.get("models") or [])
+    if kind == "channels":
+        load_balancing.save_channel_order(draft)
+        success = "✅ 已保存统一渠道/账户优先级。"
+        back = "lb:channels"
+    else:
+        orders: dict[str, list[str]] = {}
+        for model in models:
+            supported = {ch.key for ch in _channels_for_model(model)}
+            orders[model] = [key for key in draft if key in supported]
+        load_balancing.save_model_orders(orders)
+        success = f"✅ 已保存 {len(models)} 个模型的专属优先级。"
+        back = f"lb:models:{max(1, int(data.get('return_page') or 1))}"
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
-    ui.edit(
-        chat_id, message_id,
-        f"✅ 已保存 {_family_label(family)} · 调度优先级。",
-        reply_markup=ui.inline_kb([
-            [ui.btn("继续调整", f"lb:fam:{family}"), ui.btn("返回负载均衡", "menu:loadbalancing")],
-            [ui.btn("🏠 主菜单", "menu:main")],
-        ]),
-    )
-
-
-def _cancel(chat_id: int, message_id: int, cb_id: str) -> None:
-    states.pop_state(chat_id)
-    show(chat_id, message_id, cb_id)
-
-
-# ─── 批量设置 ─────────────────────────────────────────────────────
-
-def _bulk_start(chat_id: int, message_id: int, cb_id: str) -> None:
-    data = _state_data(chat_id)
-    if not data:
-        ui.answer_cb(cb_id, "会话已失效")
-        show(chat_id, message_id)
-        return
-    family = data.get("family") or "anthropic"
-    draft = list(data.get("draft") or [])
-    states.set_state(chat_id, "lb_bulk_input", {"family": family, "draft": draft})
-    lines = [
-        f"{_family_label(family)} · 调度优先级",
-        "",
-        "当前账户/渠道:",
-        *_format_order_lines(draft),
-        "",
-        "当前顺序为:",
-        ",".join(str(i) for i in range(1, len(draft) + 1)) or "-",
-        "",
-        "请回复新的顺序，例如:",
-        "2,1,3...",
-    ]
-    ui.answer_cb(cb_id)
-    ui.edit(chat_id, message_id, ui.truncate("\n".join(lines)), reply_markup=ui.inline_kb([
-        [ui.btn("◀ 返回主菜单", "menu:main"), ui.btn("取消", "lb:bulk_cancel")],
+    ui.edit(chat_id, message_id, success, reply_markup=ui.inline_kb([
+        [ui.btn("继续调整", back), ui.btn("返回负载均衡", "menu:loadbalancing")],
+        [ui.btn("🏠 主菜单", "menu:main")],
     ]))
 
 
-def _parse_order_input(text: str, n: int) -> tuple[Optional[list[int]], Optional[str]]:
-    nums_raw = [x for x in re.split(r"[\s,，;；]+", (text or "").strip()) if x]
-    if not nums_raw:
+def _cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _edit_state(chat_id) or {}
+    kind = data.get("kind")
+    page = max(1, int(data.get("return_page") or 1))
+    states.pop_state(chat_id)
+    if kind in {"model", "models_batch"}:
+        _show_models(chat_id, message_id, cb_id, page)
+    else:
+        show(chat_id, message_id, cb_id)
+
+
+def _clear_single_model(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _edit_state(chat_id)
+    models = list((data or {}).get("models") or [])
+    if not data or data.get("kind") != "model" or len(models) != 1:
+        ui.answer_cb(cb_id, "会话已失效")
+        return
+    removed = load_balancing.clear_model_orders(models)
+    model = models[0]
+    draft = _effective_model_keys(model)
+    data["draft"] = draft
+    data["initial"] = draft
+    data["selected"] = []
+    _store_edit_state(chat_id, data)
+    ui.answer_cb(cb_id, "已恢复统一渠道默认" if removed else "当前已继承统一默认")
+    _show_edit(chat_id, message_id)
+
+
+# ─── 完整序号输入（通用编辑器）────────────────────────────────────
+
+
+def _parse_order_input(text: str, size: int) -> tuple[list[int] | None, str | None]:
+    raw_values = [
+        value for value in re.split(r"[\s,，;；]+", (text or "").strip())
+        if value
+    ]
+    if not raw_values:
         return None, "请输入序号列表。"
-    nums: list[int] = []
+    numbers: list[int] = []
     bad: list[str] = []
-    for raw in nums_raw:
+    for raw in raw_values:
         try:
-            nums.append(int(raw))
+            numbers.append(int(raw))
         except ValueError:
             bad.append(raw)
     if bad:
         return None, "存在非法项: " + ", ".join(bad[:10])
-    if any(x < 1 or x > n for x in nums):
-        bad_nums = [str(x) for x in nums if x < 1 or x > n]
-        return None, "序号越界: " + ", ".join(bad_nums[:10])
-    dup = sorted({x for x in nums if nums.count(x) > 1})
-    if dup:
-        return None, "存在重复序号: " + ", ".join(str(x) for x in dup)
-    missing = [x for x in range(1, n + 1) if x not in nums]
+    if any(number < 1 or number > size for number in numbers):
+        return None, "序号越界。"
+    if len(set(numbers)) != len(numbers):
+        return None, "存在重复序号。"
+    missing = [number for number in range(1, size + 1) if number not in numbers]
     if missing:
-        return None, "缺少序号: " + ", ".join(str(x) for x in missing)
-    if len(nums) != n:
-        return None, f"需要完整排列 {n} 个序号，当前 {len(nums)} 个。"
-    return nums, None
+        return None, "缺少序号: " + ", ".join(str(number) for number in missing[:10])
+    return numbers, None
 
 
-def _bulk_preview(chat_id: int, order: list[int]) -> None:
-    """批量输入成功后只更新草稿，不直接保存配置。"""
-    st = states.get_state(chat_id)
-    data = (st.get("data") or {}) if st else {}
-    family = data.get("family") or "anthropic"
+def _order_input_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _edit_state(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效")
+        return
+    states.set_state(chat_id, "lb_order_input", {"edit": data})
     draft = list(data.get("draft") or [])
-    new_draft = [draft[i - 1] for i in order]
-    _set_edit_state(chat_id, family, new_draft)
-    text, kb = _edit_text_and_kb(family, new_draft, set())
-    text = (
-        "✅ 批量设置已应用到草稿（尚未保存）。\n"
-        "请确认顺序后点击「保存设置」。\n\n"
-        + text
-    )
-    ui.send(chat_id, ui.truncate(text), reply_markup=kb)
+    lines = [
+        _edit_title(data), "", "当前账户/渠道:", *_format_order_lines(draft), "",
+        "请回复完整的新序号排列，例如：", "2,1,3...",
+    ]
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, ui.truncate("\n".join(lines)), reply_markup=ui.inline_kb([
+        [ui.btn("取消输入", "lb:order_cancel")],
+    ]))
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
-    if action != "lb_bulk_input":
+    if action != "lb_order_input":
         return False
-    st = states.get_state(chat_id)
-    data = (st.get("data") or {}) if st else {}
+    state = states.get_state(chat_id)
+    data = dict(((state or {}).get("data") or {}).get("edit") or {})
     draft = list(data.get("draft") or [])
-    order, err = _parse_order_input(text, len(draft))
-    if err:
-        ui.send(chat_id, f"❌ {ui.escape_html(err)}\n请重新输入：")
+    order, error = _parse_order_input(text, len(draft))
+    if error:
+        ui.send(chat_id, f"❌ {ui.escape_html(error)}\n请重新输入：")
         return True
     assert order is not None
-    _bulk_preview(chat_id, order)
+    data["draft"] = [draft[index - 1] for index in order]
+    data["selected"] = []
+    _store_edit_state(chat_id, data)
+    preview, keyboard = _edit_text_and_kb(data)
+    ui.send(
+        chat_id,
+        "✅ 新顺序已应用到草稿（尚未保存）。\n\n" + preview,
+        reply_markup=keyboard,
+    )
     return True
 
 
-def _bulk_save(chat_id: int, message_id: int, cb_id: str) -> None:
-    st = states.get_state(chat_id)
-    if not st or st.get("action") != "lb_bulk_preview":
-        ui.answer_cb(cb_id, "会话已失效")
-        show(chat_id, message_id)
-        return
-    data = st.get("data") or {}
-    family = data.get("family") or "anthropic"
-    draft = list(data.get("draft") or [])
-    load_balancing.save_family_order(family, draft)
-    states.pop_state(chat_id)
-    ui.answer_cb(cb_id, "已保存")
-    ui.edit(chat_id, message_id, f"✅ 已保存 {_family_label(family)} · 批量优先级设置。",
-            reply_markup=ui.inline_kb([[ui.btn("返回负载均衡", "menu:loadbalancing"), ui.btn("🏠 主菜单", "menu:main")]]))
-
-
-def _bulk_retry(chat_id: int, message_id: int, cb_id: str) -> None:
-    st = states.get_state(chat_id)
-    if not st or st.get("action") != "lb_bulk_preview":
-        ui.answer_cb(cb_id, "会话已失效")
-        show(chat_id, message_id)
-        return
-    data = st.get("data") or {}
-    family = data.get("family") or "anthropic"
-    previous = list(data.get("previous") or data.get("draft") or [])
-    states.set_state(chat_id, "lb_edit", {"family": family, "draft": previous, "selected": []})
-    _bulk_start(chat_id, message_id, cb_id)
-
-
-def _bulk_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
-    st = states.get_state(chat_id)
-    if not st:
+def _order_input_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    state = states.get_state(chat_id)
+    data = dict(((state or {}).get("data") or {}).get("edit") or {})
+    if not data:
         show(chat_id, message_id, cb_id)
         return
-    data = st.get("data") or {}
-    family = data.get("family") or "anthropic"
-    draft = list(data.get("previous") or data.get("draft") or _normalized_keys(family))
-    _set_edit_state(chat_id, family, draft)
+    _store_edit_state(chat_id, data)
     _show_edit(chat_id, message_id, cb_id)
 
 
-# ─── 清除亲和（二次确认） ─────────────────────────────────────────
+# ─── 模型列表（6 个/页）────────────────────────────────────────────
+
+
+def _model_summary_line(model: str) -> str:
+    keys = _effective_model_keys(model)
+    labels = []
+    for key in keys:
+        ch = registry.get_channel(key)
+        labels.append(_compact_channel_label(ch) if ch is not None else key)
+    source = "专属" if load_balancing.has_model_priority(model) else "默认"
+    text = f"渠道（{source}）：" + (" → ".join(labels) if labels else "无可用渠道")
+    return text if len(text) <= 420 else text[:419] + "…"
+
+
+def _models_text_and_kb(page: int) -> tuple[str, dict]:
+    models = _client_models()
+    total_pages = max(1, math.ceil(len(models) / _MODEL_PAGE_SIZE))
+    page = max(1, min(int(page or 1), total_pages))
+    start = (page - 1) * _MODEL_PAGE_SIZE
+    visible = models[start:start + _MODEL_PAGE_SIZE]
+    lines = [
+        "🤖 <b>按模型调整优先级</b>",
+        f"共 <b>{len(models)}</b> 个模型 · 第 <b>{page}/{total_pages}</b> 页",
+        "<i>模型专属顺序优先于统一渠道/账户顺序。</i>",
+    ]
+    for offset, model in enumerate(visible, start=1):
+        index = start + offset
+        lines.extend([
+            "",
+            f"<b>{index}.</b> <code>{ui.escape_html(model)}</code>",
+            ui.escape_html(_model_summary_line(model)),
+        ])
+
+    rows: list[list[dict]] = []
+    detail_buttons: list[dict] = []
+    for offset, model in enumerate(visible, start=1):
+        index = start + offset
+        detail_buttons.append(ui.btn(
+            f"📄 #{index}", f"lb:model:{_model_code(model)}:{page}",
+        ))
+        if len(detail_buttons) == 3:
+            rows.append(detail_buttons)
+            detail_buttons = []
+    if detail_buttons:
+        rows.append(detail_buttons)
+    previous = max(1, page - 1)
+    following = min(total_pages, page + 1)
+    rows.append([
+        ui.btn("🏠 首页", "lb:models:1"),
+        ui.btn("◀ 上一页", f"lb:models:{previous}"),
+        ui.btn(f"{page}/{total_pages}", f"lb:models:{page}"),
+        ui.btn("下一页 ▶", f"lb:models:{following}"),
+    ])
+    rows.append([ui.btn("☑ 批量修改模型优先级", "lb:model_bulk")])
+    rows.append([ui.btn("◀ 返回负载均衡", "menu:loadbalancing")])
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def _show_models(
+    chat_id: int,
+    message_id: int,
+    cb_id: str | None,
+    page: int,
+) -> None:
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, keyboard = _models_text_and_kb(page)
+    ui.edit(chat_id, message_id, text, reply_markup=keyboard)
+
+
+# ─── 批量模型选择（明确不分页）────────────────────────────────────
+
+
+def _bulk_selection_state(chat_id: int) -> dict | None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "lb_model_select":
+        return None
+    return dict(state.get("data") or {})
+
+
+def _render_bulk_selection(chat_id: int) -> tuple[str, dict]:
+    data = _bulk_selection_state(chat_id) or {"selected_models": []}
+    selected = {str(model) for model in data.get("selected_models") or []}
+    models = _client_models()
+    selected_ordered = [model for model in models if model in selected]
+    lines = [
+        "☑ <b>批量修改模型优先级</b>",
+        f"共 <b>{len(models)}</b> 个模型 · 已选择 <b>{len(selected_ordered)}</b> 个",
+        "<i>本页一次展示全部模型，不分页。确认后将所选模型的可用渠道取并集进行排序。</i>",
+    ]
+    if selected_ordered:
+        lines.extend(["", "已选择：" + "、".join(
+            f"<code>{ui.escape_html(model)}</code>" for model in selected_ordered
+        )])
+    buttons = [
+        ui.btn(
+            ("✅ " if model in selected else "▫️ ") + model,
+            f"lb:model_pick:{_model_code(model)}",
+        )
+        for model in models
+    ]
+    rows: list[list[dict]] = []
+    for index in range(0, len(buttons), 2):
+        rows.append(buttons[index:index + 2])
+    rows.append([
+        ui.btn(f"✅ 确认（{len(selected_ordered)}）", "lb:model_bulk_confirm"),
+        ui.btn("❌ 取消", "lb:model_bulk_cancel"),
+    ])
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def _start_model_bulk(chat_id: int, message_id: int, cb_id: str) -> None:
+    states.set_state(chat_id, "lb_model_select", {"selected_models": []})
+    text, keyboard = _render_bulk_selection(chat_id)
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, text, reply_markup=keyboard)
+
+
+def _toggle_bulk_model(
+    chat_id: int,
+    message_id: int,
+    cb_id: str,
+    model_code: str,
+) -> None:
+    data = _bulk_selection_state(chat_id)
+    model = _resolve_model_code(model_code)
+    if data is None or not model:
+        ui.answer_cb(cb_id, "批量选择状态已失效", show_alert=True)
+        return
+    selected = {str(value) for value in data.get("selected_models") or []}
+    if model in selected:
+        selected.remove(model)
+    else:
+        selected.add(model)
+    states.set_state(chat_id, "lb_model_select", {
+        "selected_models": sorted(selected, key=str.lower),
+    })
+    text, keyboard = _render_bulk_selection(chat_id)
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, text, reply_markup=keyboard)
+
+
+def _confirm_model_bulk(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _bulk_selection_state(chat_id)
+    models = sorted(
+        {str(model) for model in (data or {}).get("selected_models") or []},
+        key=str.lower,
+    )
+    if not models:
+        ui.answer_cb(cb_id, "请至少选择一个模型", show_alert=True)
+        return
+    union: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        for key in _effective_model_keys(model):
+            if key not in seen:
+                union.append(key)
+                seen.add(key)
+    _store_edit_state(chat_id, {
+        "kind": "models_batch",
+        "models": models,
+        "draft": union,
+        "initial": union,
+        "selected": [],
+        "return_page": 1,
+    })
+    _show_edit(chat_id, message_id, cb_id)
+
+
+def _cancel_model_bulk(chat_id: int, message_id: int, cb_id: str) -> None:
+    states.pop_state(chat_id)
+    _show_models(chat_id, message_id, cb_id, 1)
+
+
+# ─── 亲和清理 ─────────────────────────────────────────────────────
+
 
 def _aff_confirm_all(chat_id: int, message_id: int, cb_id: str) -> None:
     fp_total = affinity.count()
-    cli_total = affinity.client_count()
+    client_total = affinity.client_count()
     ui.answer_cb(cb_id)
     ui.edit(
-        chat_id, message_id,
+        chat_id,
+        message_id,
         (
-            "⚠️ 确认清除【<b>全部协议</b>】的所有亲和绑定？\n"
-            f"当前内存计数：fp <b>{fp_total}</b> 、 client <b>{cli_total}</b>\n"
-            "此操作会同时清 fp 亲和与 client 软亲和，下一次调度将从头选。"
+            "⚠️ 确认清除全部渠道的所有亲和绑定？\n"
+            f"当前内存计数：fp <b>{fp_total}</b>、client <b>{client_total}</b>\n"
+            "此操作会同时清 fp 亲和与 client 软亲和。"
         ),
-        reply_markup=ui.inline_kb([
-            [ui.btn("✅ 确认清除全部", "lb:aff_all_exec"),
-             ui.btn("❌ 取消", "menu:loadbalancing")],
-        ]),
+        reply_markup=ui.inline_kb([[
+            ui.btn("✅ 确认清除全部", "lb:aff_all_exec"),
+            ui.btn("❌ 取消", "menu:loadbalancing"),
+        ]]),
     )
 
 
 def _aff_exec_all(chat_id: int, message_id: int, cb_id: str) -> None:
     fp_total = affinity.count()
-    cli_total = affinity.client_count()
+    client_total = affinity.client_count()
     affinity.delete_all()
     affinity.client_delete_all()
-    ui.answer_cb(cb_id, f"已清 fp {fp_total}、client {cli_total}")
+    ui.answer_cb(cb_id, f"已清 fp {fp_total}、client {client_total}")
     show(chat_id, message_id)
 
 
 def _aff_confirm_family(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
+    """旧 Telegram 消息兼容入口；新 UI 不再按家族展示。"""
     if family not in load_balancing.FAMILIES:
         ui.answer_cb(cb_id, "无效协议类型")
         return
     ui.answer_cb(cb_id)
     ui.edit(
-        chat_id, message_id,
-        (
-            f"⚠️ 确认清除【{_family_label(family)}】的所有亲和绑定？\n"
-            "仅清除本协议下所有渠道的 fp 亲和 + client 软亲和。"
-        ),
-        reply_markup=ui.inline_kb([
-            [ui.btn("✅ 确认清除", f"lb:aff_fam_exec:{family}"),
-             ui.btn("❌ 取消", f"lb:fam:{family}")],
-        ]),
+        chat_id,
+        message_id,
+        f"⚠️ 确认清除旧版 {ui.escape_html(family)} 家族的所有亲和绑定？",
+        reply_markup=ui.inline_kb([[
+            ui.btn("✅ 确认清除", f"lb:aff_fam_exec:{family}"),
+            ui.btn("❌ 取消", "menu:loadbalancing"),
+        ]]),
     )
 
 
@@ -546,24 +796,47 @@ def _aff_exec_family(chat_id: int, message_id: int, cb_id: str, family: str) -> 
     if family not in load_balancing.FAMILIES:
         ui.answer_cb(cb_id, "无效协议类型")
         return
-    fp_cnt = affinity.delete_by_protocol(family)
-    cli_cnt = affinity.client_delete_by_protocol(family)
-    ui.answer_cb(cb_id, f"已清 fp {fp_cnt}、client {cli_cnt}")
-    # 清完后重新进入该协议的编辑页（重新拉 draft，避免重复 answer cb）
-    draft = _normalized_keys(family)
-    _set_edit_state(chat_id, family, draft)
-    _show_edit(chat_id, message_id, cb_id=None)
+    fp_count = affinity.delete_by_protocol(family)
+    client_count = affinity.client_delete_by_protocol(family)
+    ui.answer_cb(cb_id, f"已清 fp {fp_count}、client {client_count}")
+    show(chat_id, message_id)
 
 
-# ─── 路由 ─────────────────────────────────────────────────────────
+# ─── callback 路由 ─────────────────────────────────────────────────
+
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
     if data == "menu:loadbalancing":
         show(chat_id, message_id, cb_id); return True
     if data.startswith("lb:mode:"):
         _on_mode(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data == "lb:channels":
+        _start_channels(chat_id, message_id, cb_id); return True
     if data.startswith("lb:fam:"):
-        _start_family(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+        # 旧消息兼容：原家族按钮统一进入全渠道编辑器。
+        _start_channels(chat_id, message_id, cb_id); return True
+    if data.startswith("lb:models:"):
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            page = 1
+        _show_models(chat_id, message_id, cb_id, page); return True
+    if data.startswith("lb:model:"):
+        payload = data.split(":", 2)[2]
+        code, _, page_raw = payload.partition(":")
+        try:
+            page = int(page_raw or 1)
+        except ValueError:
+            page = 1
+        _start_model(chat_id, message_id, cb_id, code, page); return True
+    if data == "lb:model_bulk":
+        _start_model_bulk(chat_id, message_id, cb_id); return True
+    if data.startswith("lb:model_pick:"):
+        _toggle_bulk_model(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1]); return True
+    if data == "lb:model_bulk_confirm":
+        _confirm_model_bulk(chat_id, message_id, cb_id); return True
+    if data == "lb:model_bulk_cancel":
+        _cancel_model_bulk(chat_id, message_id, cb_id); return True
     if data.startswith("lb:sel:"):
         _toggle_select(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("lb:mv:"):
@@ -572,16 +845,14 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         _reset(chat_id, message_id, cb_id); return True
     if data == "lb:save":
         _save(chat_id, message_id, cb_id); return True
+    if data == "lb:model_clear":
+        _clear_single_model(chat_id, message_id, cb_id); return True
     if data == "lb:cancel":
         _cancel(chat_id, message_id, cb_id); return True
-    if data == "lb:bulk":
-        _bulk_start(chat_id, message_id, cb_id); return True
-    if data == "lb:bulk_save":
-        _bulk_save(chat_id, message_id, cb_id); return True
-    if data == "lb:bulk_retry":
-        _bulk_retry(chat_id, message_id, cb_id); return True
-    if data == "lb:bulk_cancel":
-        _bulk_cancel(chat_id, message_id, cb_id); return True
+    if data in {"lb:order_input", "lb:bulk"}:
+        _order_input_start(chat_id, message_id, cb_id); return True
+    if data in {"lb:order_cancel", "lb:bulk_cancel"}:
+        _order_input_cancel(chat_id, message_id, cb_id); return True
     if data == "lb:aff_all":
         _aff_confirm_all(chat_id, message_id, cb_id); return True
     if data == "lb:aff_all_exec":

@@ -399,7 +399,8 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 ### ⚖️ 负载均衡
 - `smart` 智能调度：按滑动窗口评分 + 探索率排序
 - `order` 顺序调度：按 config 渠道定义顺序依次尝试
-- `priority` 优先级调度：按用户在 TG 菜单保存的 Anthropic / OpenAI 协议队列依次尝试
+- `priority` 优先级调度：不再按协议家族拆分；TG 提供“按渠道/账户”统一默认顺序和“按模型”canonical 专属顺序，模型专属优先级高于统一渠道优先级，转换层会先过滤不兼容候选
+- 按模型页面 6 个/页展示当前有效渠道顺序；支持单模型编辑，以及不分页的一次性全模型多选批量修改。批量渠道并集保存时会按每个模型真实支持范围过滤
 - 亲和优先于负载均衡：绑定目标仍可用就继续用；不可用时才由当前算法选接班渠道。
 
 ### 🔁 模型映射 & 默认模型
@@ -513,7 +514,7 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
   },
   "notifications": { "enabled": true, "events": { ... } },
   "channelSelection": "smart",
-  "loadBalancing": { "initialized": false, "priorityOrders": { "anthropic": [], "openai": [] } },
+  "loadBalancing": { "initialized": false, "channelPriorityOrder": [], "modelPriorityOrders": {}, "priorityOrders": { "anthropic": [], "openai": [] } },
   "cchMode": "disabled",
   "telegram": { "botToken": "...", "adminIds": [123] }
 }

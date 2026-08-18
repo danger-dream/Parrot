@@ -194,7 +194,9 @@ def _eligible_oauth_channels(model: str | None) -> list[OpenAIOAuthChannel]:
     if selection == "smart":
         candidates = scorer.sort_by_score(candidates)
     elif selection == "priority":
-        candidates = load_balancing.sort_candidates_by_priority(candidates, config.get())
+        candidates = load_balancing.sort_candidates_by_priority(
+            candidates, config.get(), requested_model=str(model or marker),
+        )
     return [channel for channel, _marker in candidates]
 
 

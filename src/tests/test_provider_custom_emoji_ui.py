@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from ._isolation import isolate
 
@@ -167,9 +168,23 @@ def test_all_runtime_menus_avoid_plain_provider_icons_and_slash_joining():
     assert failures == []
 
 
-def test_load_balancing_uses_central_family_contract():
-    expected = ui.family_tag("openai", suffix=" 协议")
-    assert load_balancing_menu._family_label("openai") == expected
-    assert load_balancing_menu._family_button("openai", "cb") == ui.family_button(
-        "openai", "cb", suffix=" 协议",
-    )
+def test_load_balancing_priority_uses_unified_model_and_channel_axes():
+    from src import config
+
+    previous = config.get().get("channelSelection")
+    try:
+        config.update(lambda cfg: cfg.__setitem__("channelSelection", "priority"))
+        text, keyboard = load_balancing_menu._main_text_and_kb()
+        buttons = [button for row in keyboard["inline_keyboard"] for button in row]
+        callbacks = {button.get("callback_data") for button in buttons}
+        assert "lb:models:1" in callbacks
+        assert "lb:channels" in callbacks
+        assert not any(str(value).startswith("lb:fam:") for value in callbacks)
+        assert "模型专属顺序 &gt; 统一渠道/账户顺序" in text
+        for provider in PROVIDERS:
+            channel = SimpleNamespace(type="oauth", key=f"oauth:{provider}:identity")
+            assert ui.provider_custom_emoji_id(provider) in (
+                load_balancing_menu._channel_icon(channel)
+            )
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("channelSelection", previous))

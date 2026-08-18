@@ -32,8 +32,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from src import (
     __version__, drain,
     affinity, apikey_limiter, auth, compact_rescue, config, cooldown, cursor_reconcile,
-    errors, failover, fingerprint, image_db, log_db, model_mapping, model_metadata,
-    model_pricing, network,
+    errors, failover, fingerprint, image_db, load_balancing, log_db,
+    model_mapping, model_metadata, model_pricing, network,
     network_monitor, notifier, oauth_manager, probe, public_ip, scheduler, scorer,
     state_db, status_monitor, token_counter, translation, update_checker, updater,
     upstream,
@@ -247,8 +247,18 @@ async def lifespan(app: FastAPI):
     from src.cursor_bridge import runtime as cursor_bridge_runtime
     cursor_bridge_runtime.ensure_started()
 
-    # 渠道注册表 + 热加载钩子
+    # 渠道注册表 + priority 统一顺序迁移 + 热加载钩子。
     registry.rebuild_from_config()
+    _lb_cfg = config.get()
+    if (
+        str(_lb_cfg.get("channelSelection") or "smart").lower() == "priority"
+        and not ((_lb_cfg.get("loadBalancing") or {}).get("channelPriorityOrder") or [])
+    ):
+        migrated_order = load_balancing.initialize_priority_orders()
+        print(
+            f"[load-balancing] migrated legacy family priorities to "
+            f"{len(migrated_order)} unified channel entries"
+        )
     registry.install_config_reload_hook()
 
     # httpx 客户端

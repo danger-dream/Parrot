@@ -362,21 +362,10 @@ def _remaining_str(iso_or_none: str | None) -> str:
 
 def _rename_priority_orders_in_config(cfg: dict, old_channel_key: str,
                                       new_channel_key: str, family: str) -> None:
-    """Rename one priority key inside the caller's atomic config mutation."""
-    lb = cfg.setdefault("loadBalancing", {})
-    orders = lb.setdefault("priorityOrders", {})
-    for current_family in ("anthropic", "openai"):
-        result: list[str] = []
-        seen: set[str] = set()
-        for key in list(orders.get(current_family) or []):
-            if current_family == family and key == old_channel_key:
-                key = new_channel_key
-            elif key in (old_channel_key, new_channel_key) and current_family != family:
-                continue
-            if key not in seen:
-                result.append(key)
-                seen.add(key)
-        orders[current_family] = result
+    """Rename one key in unified/model orders and legacy family compatibility."""
+    load_balancing.mutate_channel_renamed(
+        cfg, old_channel_key, new_channel_key, family,
+    )
 
 
 def _rename_runtime_oauth_identity(old_account_key: str, new_account_key: str, *,
@@ -465,8 +454,8 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
         return False
 
     old_acc_snapshot = copy.deepcopy(old_acc) if old_acc is not None else None
-    old_priority_orders = copy.deepcopy(
-        config.get().get("loadBalancing", {}).get("priorityOrders", {})
+    old_load_balancing = copy.deepcopy(
+        config.get().get("loadBalancing", {})
     )
     target_email = str(old_acc.get("email") or account_key_to_email(target_key))
     old_key = _canonical_key(old_acc)
@@ -517,9 +506,7 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
                 if _canonical_key(acc) == new_key:
                     accounts[index] = copy.deepcopy(old_acc_snapshot)
                     break
-        cfg.setdefault("loadBalancing", {})["priorityOrders"] = copy.deepcopy(
-            old_priority_orders
-        )
+        cfg["loadBalancing"] = copy.deepcopy(old_load_balancing)
 
     if old_key and new_key and old_key != new_key:
         _rename_runtime_oauth_identity(
@@ -2309,23 +2296,31 @@ def bootstrap_openai_workspace_key_migration() -> dict:
                 config_stats["accounts_patched"] += 1
 
         lb = c.setdefault("loadBalancing", {})
-        po = lb.setdefault("priorityOrders", {})
-        for fam in ("anthropic", "openai"):
-            arr = list(po.get(fam) or [])
-            new_arr: list[str] = []
+
+        def expand_order(values) -> list[str]:
+            result: list[str] = []
             seen: set[str] = set()
-            for key in arr:
+            for key in list(values or []):
                 expanded = priority_expansion.get(key)
                 if expanded is None:
                     expanded = [channel_mapping.get(key, key)]
                 for candidate_key in expanded:
                     new_key = str(candidate_key or "")
                     if new_key and new_key not in seen:
-                        new_arr.append(new_key)
+                        result.append(new_key)
                         seen.add(new_key)
                 if expanded != [key]:
                     config_stats["priority_entries"] += 1
-            po[fam] = new_arr
+            return result
+
+        po = lb.setdefault("priorityOrders", {})
+        for fam in ("anthropic", "openai"):
+            po[fam] = expand_order(po.get(fam) or [])
+        if isinstance(lb.get("channelPriorityOrder"), list):
+            lb["channelPriorityOrder"] = expand_order(lb["channelPriorityOrder"])
+        model_orders = lb.setdefault("modelPriorityOrders", {})
+        for model, order in list(model_orders.items()):
+            model_orders[model] = expand_order(order)
 
         images = c.setdefault("images", {})
         disabled = list(images.get("disabledAccounts") or [])
@@ -2552,8 +2547,8 @@ def _add_account_serialized(entry: dict) -> None:
             if account is not existing_target and _canonical_key(account) == normalized_key:
                 raise ValueError(f"OAuth account identity already exists: {normalized_key}")
     existing_snapshot = copy.deepcopy(existing_target) if existing_target else None
-    old_priority_orders = copy.deepcopy(
-        config.get().get("loadBalancing", {}).get("priorityOrders", {})
+    old_load_balancing = copy.deepcopy(
+        config.get().get("loadBalancing", {})
     )
 
     def mutate(cfg):
@@ -2651,9 +2646,7 @@ def _add_account_serialized(entry: dict) -> None:
                 if _canonical_key(account) == rename_new_key:
                     accounts[index] = copy.deepcopy(existing_snapshot)
                     break
-        cfg.setdefault("loadBalancing", {})["priorityOrders"] = copy.deepcopy(
-            old_priority_orders
-        )
+        cfg["loadBalancing"] = copy.deepcopy(old_load_balancing)
 
     if rename_new_key:
         _rename_runtime_oauth_identity(

@@ -287,9 +287,13 @@
   "channelSelection": "smart",      // "smart" | "order" | "priority"
   "loadBalancing": {
     "initialized": false,
-    "priorityOrders": {
-      "anthropic": [],               // priority 模式下 Anthropic 家族渠道 key 顺序
-      "openai": []                   // priority 模式下 OpenAI 家族渠道 key 顺序
+    "channelPriorityOrder": [],       // 所有 OAuth账户/API渠道的统一默认顺序
+    "modelPriorityOrders": {           // canonical 模型专属顺序，优先于统一顺序
+      "glm-5.2": ["api:智谱 Max", "oauth:cursor:subject"]
+    },
+    "priorityOrders": {                // 旧版家族顺序，仅迁移/降级兼容
+      "anthropic": [],
+      "openai": []
     }
   },
 

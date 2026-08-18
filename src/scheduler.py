@@ -265,8 +265,12 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         candidates = scorer.sort_by_score(candidates)
         saturated = scorer.sort_by_score(saturated)
     elif mode == "priority":
-        candidates = load_balancing.sort_candidates_by_priority(candidates, cfg)
-        saturated = load_balancing.sort_candidates_by_priority(saturated, cfg)
+        candidates = load_balancing.sort_candidates_by_priority(
+            candidates, cfg, requested_model=requested_model,
+        )
+        saturated = load_balancing.sort_candidates_by_priority(
+            saturated, cfg, requested_model=requested_model,
+        )
     # "order" 模式：按注册表原始顺序（config 中定义的顺序）
 
     candidates, affinity_hit = _apply_affinity(candidates, fp_query,

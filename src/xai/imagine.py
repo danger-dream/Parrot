@@ -516,7 +516,9 @@ def _eligible_channels(kind: str, model: str) -> list[XAIOAuthChannel]:
     if selection == "smart":
         candidates = scorer.sort_by_score(candidates)
     elif selection == "priority":
-        candidates = load_balancing.sort_candidates_by_priority(candidates, config.get())
+        candidates = load_balancing.sort_candidates_by_priority(
+            candidates, config.get(), requested_model=model,
+        )
     return [channel for channel, _resolved in candidates]
 
 
