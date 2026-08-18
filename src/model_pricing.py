@@ -1020,7 +1020,7 @@ def build_pricing_binding(
         typed = channel_normalized.split(":", 2)
         if len(typed) == 3 and typed[2]:
             candidate = _normalize_provider_id(typed[1])
-            if candidate in {"anthropic", "openai", "xai"}:
+            if candidate in {"anthropic", "openai", "xai", "cursor"}:
                 oauth_provider = candidate
 
     from . import model_metadata

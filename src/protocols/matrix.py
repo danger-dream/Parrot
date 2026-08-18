@@ -1160,7 +1160,10 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
         transports.discard("http-json")
     native_state: set[str] = set()
     if protocol == "openai-chat":
-        native_state.update({"multi_candidate", "file_id", "audio"})
+        if not (ch_type == "oauth" and provider == "cursor"):
+            native_state.update({"multi_candidate", "file_id", "audio"})
+        else:
+            native_state.update({"prompt_cache_key"})
     elif protocol == "openai-responses":
         if ch_type == "oauth" and provider == "xai":
             native_state.update({

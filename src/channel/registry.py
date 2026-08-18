@@ -14,6 +14,7 @@ from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
 from .compatibility import normalize_mode, normalize_models
+from .cursor_oauth_channel import CursorOAuthChannel
 from .oauth_channel import OAuthChannel
 from .openai_oauth_channel import OpenAIOAuthChannel
 from .xai_oauth_channel import XAIOAuthChannel
@@ -60,6 +61,8 @@ def _rebuild_from_config_locked() -> None:
                 ch = OpenAIOAuthChannel(acc)
             elif provider == "xai":
                 ch = XAIOAuthChannel(acc)
+            elif provider == "cursor":
+                ch = CursorOAuthChannel(acc)
             else:
                 ch = OAuthChannel(acc, default_models)
             if channel_state.is_retired_source(ch.key):

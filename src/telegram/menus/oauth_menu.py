@@ -13,6 +13,8 @@ callback_data 前缀：`oa:...`
 状态机 action（xAI）：
   - `oa_xai_code`             ：等待用户粘贴 xAI / Grok OAuth 回调 URL
   - `oa_xai_rt`               ：等待用户粘贴 refresh_token 字符串
+状态机 action（Cursor）：
+  - `oa_cursor_login`         ：保存浏览器 PKCE 轮询会话，等待“已登录”按钮
 
 注意：本模块所有 OAuth 远端交互都走 `oauth_manager` / `src.oauth.*`，已经有
 mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CALLS=1）。
@@ -21,6 +23,7 @@ mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CAL
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -34,7 +37,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ... import affinity, config, cooldown, load_balancing, log_db, oauth_errors, oauth_manager, state_db
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
-from ...oauth import openai as openai_provider, xai as xai_provider
+from ...oauth import cursor as cursor_provider, openai as openai_provider, xai as xai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import menu_cache, states, ui
 from . import main as main_menu
@@ -59,6 +62,10 @@ def _resolve_to_account_key(resolved):
         return oauth_manager.resolve_account_key(resolved)
     except oauth_manager.AmbiguousOAuthAccountKey:
         return None
+
+
+def _account_display(acc: dict) -> str:
+    return str(acc.get("label") or acc.get("email") or "?")
 
 
 def _account_email(account_key: str) -> str:
@@ -904,6 +911,73 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False,
             lines.append("🚀 服务层级: " + " · ".join(parts))
     return "\n".join(lines)
 
+def _cursor_raw_from_row(row: dict | None) -> dict:
+    if not isinstance(row, dict):
+        return {}
+    raw = row.get("raw_data")
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    cursor = payload.get("cursor") if isinstance(payload, dict) else None
+    return cursor if isinstance(cursor, dict) else {}
+
+
+def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str:
+    row = state_db.quota_load(account_key)
+    cursor = _cursor_raw_from_row(row)
+    if not cursor:
+        return "📊 Cursor 额度: <i>尚未获取</i>"
+
+    def money(cents) -> str:
+        try:
+            return f"${float(cents) / 100:.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    used = cursor.get("total_spend_cents")
+    limit = cursor.get("limit_cents")
+    remaining = cursor.get("remaining_cents")
+    total_util = cursor.get("total_utilization")
+    auto_util = cursor.get("auto_percent_used")
+    api_util = cursor.get("api_percent_used")
+    reset = cursor.get("billing_cycle_end")
+
+    lines: list[str] = []
+    if limit is not None:
+        if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+            lines.append(
+                f"💳 包含额度: 剩余 <b>{money(remaining)}</b> / {money(limit)}"
+                + (f" ({_usage_display_percent(total_util):.2f}%)" if total_util is not None else "")
+            )
+        else:
+            lines.append(
+                f"💳 包含额度: 已用 <b>{money(used)}</b> / {money(limit)}"
+                + (f" ({_usage_display_percent(total_util):.2f}%)" if total_util is not None else "")
+            )
+    if auto_util is not None:
+        lines.append(f"🧭 Cursor Models / Auto: {_format_usage_value_html(auto_util, decimals=2)}")
+    if api_util is not None:
+        lines.append(f"🧩 Other Models / API: {_format_usage_value_html(api_util, decimals=2)}")
+    if reset:
+        lines.append(f"🔄 周期重置: <code>{_fmt_time_full(reset)}</code>")
+    status = cursor.get("subscription_status")
+    if detail and status:
+        lines.append(f"📋 订阅状态: <code>{ui.escape_html(status)}</code>")
+    spend = cursor.get("spend_limit") if isinstance(cursor.get("spend_limit"), dict) else {}
+    if detail and spend.get("limit_cents") is not None:
+        lines.append(
+            f"💰 额外消费上限: {money(spend.get('limit_cents'))} · "
+            f"剩余 {money(spend.get('remaining_cents'))}"
+        )
+    if row and row.get("fetched_at"):
+        dt = datetime.fromtimestamp(row["fetched_at"] / 1000, tz=_BJT)
+        lines.append(f"<i>更新于 {dt.strftime('%H:%M:%S')}</i>")
+    return "\n".join(lines) if lines else "📊 Cursor 额度: <i>无有效数据</i>"
+
+
 def _has_local_usage_or_billing(stats: dict | None) -> bool:
     if not isinstance(stats, dict):
         return False
@@ -957,7 +1031,7 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str,
 def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                           stats_loading: bool = False) -> str:
     """列表中每条 OAuth 账号的统一多行展示块。"""
-    email = acc.get("email", "?")
+    email = _account_display(acc)
     ak = _account_key(acc)
     icon = _status_icon(acc)
     reason = acc.get("disabled_reason")
@@ -1002,11 +1076,23 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         plan_line = _format_xai_provider_line(ak, detail=False)
         if plan_line:
             lines.extend(plan_line.splitlines())
+    elif prov == "cursor":
+        plan = str(acc.get("plan_type") or "Cursor")
+        records = ((acc.get("cursor_model_catalog") or {}).get("models") or [])
+        variants = sum(
+            len(item.get("legacy_slugs") or []) for item in records if isinstance(item, dict)
+        )
+        lines.append(
+            f"🏷️ 套餐: <code>{ui.escape_html(plan)}</code> · "
+            f"模型 <code>{len(acc.get('models') or [])}</code> · 变体 <code>{variants}</code>"
+        )
 
     # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
     # 展示官方当前周期额度 + Parrot 本地累计金额/token。
     _now_ts = time.time()
-    if prov == "xai":
+    if prov == "cursor":
+        lines.extend(_format_cursor_usage_block(ak, detail=False).splitlines())
+    elif prov == "xai":
         lines.extend(_format_xai_official_block(ak, detail=False).splitlines())
         month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{ak}")
         lines.extend(_format_xai_spend_block(
@@ -1084,6 +1170,8 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
 def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
                         stats_loading: bool = False) -> str:
     provider = oauth_manager.provider_of(account_key)
+    if provider == "cursor":
+        return _format_cursor_usage_block(account_key, detail=True)
     if provider == "xai":
         month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{account_key}")
         return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(
@@ -1198,6 +1286,14 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     openai_models = _default_models_for_settings("openai")
     xai_models = _default_models_for_settings("xai")
     cfg = config.get()
+    cursor_accounts = [
+        acc for acc in cfg.get("oauthAccounts", [])
+        if oauth_manager.provider_of(acc) == "cursor"
+    ]
+    cursor_models = sorted({
+        str(model) for acc in cursor_accounts for model in acc.get("models") or []
+        if str(model)
+    })
     xai_cfg = cfg.get("xaiOAuth") if isinstance(cfg.get("xaiOAuth"), dict) else {}
     xai_image_models = xai_cfg.get("imageModels") if isinstance(xai_cfg.get("imageModels"), list) else []
     xai_video_models = xai_cfg.get("videoModels") if isinstance(xai_cfg.get("videoModels"), list) else []
@@ -1225,6 +1321,9 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         "",
         f"{_provider_tag('xai')} <b>文本模型</b> ({len(xai_models)}):",
         _models_line(xai_models),
+        "",
+        f"{_provider_tag('cursor')} <b>账号自动模型</b> ({len(cursor_models)} / {len(cursor_accounts)} 个账号):",
+        "<i>按账号 AvailableModels 自动同步；在账号详情查看原生变体</i>",
         "",
         "🎨 <b>媒体能力</b>",
         f"GPT / Codex 图片: {gpt_images_status}",
@@ -1643,7 +1742,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
     for idx in range(0, len(page_accs), 2):
         row_btns: list[dict] = []
         for offset, acc in enumerate(page_accs[idx:idx + 2], start=idx):
-            email = acc.get("email", "?")
+            email = _account_display(acc)
             ak = _account_key(acc)
             short = ui.register_code(ak)
             prov = oauth_manager.provider_of(acc)
@@ -2137,7 +2236,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     acc = oauth_manager.get_account(account_key)
     if acc is None:
         return None, None
-    email = acc.get("email", "?")
+    email = _account_display(acc)
 
     if refresh_quota and _should_refresh_account_for_ui(acc):
         try:
@@ -2191,6 +2290,16 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             provider_line += f"📅 开始: <code>{_format_bjt(sub_created)}</code>\n"
     elif prov == "xai":
         provider_line = _format_xai_provider_line(account_key, detail=True)
+    elif prov == "cursor":
+        records = ((acc.get("cursor_model_catalog") or {}).get("models") or [])
+        variants = sum(
+            len(item.get("legacy_slugs") or []) for item in records if isinstance(item, dict)
+        )
+        provider_line = (
+            f"🏷️ 套餐: <code>{ui.escape_html(str(acc.get('plan_type') or 'Cursor'))}</code>\n"
+            f"🧬 模型目录: <code>{len(acc.get('models') or [])} canonical / {variants} 原生变体</code>\n"
+            f"📚 元数据: <code>Cursor AvailableModels（账号专属）</code>\n"
+        )
     else:
         provider_line = ""
     max_cc = int(acc.get("maxConcurrent", 0) or 0)
@@ -2243,11 +2352,17 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             text += f" (累计失败 {e['error_count']} 次)\n"
 
     payload = _callback_payload(short, page, filter_key)
-    usage_btn_label = "📊 刷新账单" if prov == "xai" else "📊 刷新用量/重置卡"
+    usage_btn_label = (
+        "📊 刷新 Cursor 用量" if prov == "cursor"
+        else "📊 刷新账单" if prov == "xai"
+        else "📊 刷新用量/重置卡"
+    )
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
          ui.btn(usage_btn_label,   f"oa:refresh_usage:{payload}")],
     ]
+    if prov == "cursor":
+        rows.append([ui.btn("🧬 Cursor 模型与原生变体", f"oa:cursor_models:{short}:1")])
     if prov == "openai":
         rows.append([
             ui.btn("⚡ 并发上限", f"oa:emax:{payload}"),
@@ -2359,10 +2474,20 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
     else:
         _evaluate_quota_action(ak, usage_result)
 
+    model_sync_note = ""
+    if provider == "cursor":
+        sync_result = _run_sync(oauth_manager.refresh_cursor_models(
+            ak, force=True, min_interval_seconds=0, timeout_s=30.0,
+        ))
+        if isinstance(sync_result, dict) and sync_result.get("action") == "updated":
+            model_sync_note = f" · 模型 {int(sync_result.get('models') or 0)} 个"
+        elif isinstance(sync_result, (dict, Exception)):
+            model_sync_note = " · 模型同步失败（保留原目录）"
+
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key)
     if text:
         ui.edit(chat_id, message_id,
-                "✅ Token 已刷新\n\n" + text,
+                f"✅ Token 已刷新{model_sync_note}\n\n" + text,
                 reply_markup=kb)
 
 
@@ -2379,6 +2504,8 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
     elif provider == "xai":
         ui.answer_cb(cb_id, "拉取 Grok 官方账单...")
+    elif provider == "cursor":
+        ui.answer_cb(cb_id, "拉取 Cursor 额度和模型目录...")
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
@@ -2398,6 +2525,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     if provider == "openai":
         metadata_action = _run_sync(oauth_manager.ensure_openai_metadata_fresh(
             ak, force=True, min_interval_seconds=0, timeout_s=5.0,
+        ))
+    elif provider == "cursor":
+        metadata_action = _run_sync(oauth_manager.refresh_cursor_models(
+            ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
@@ -2423,6 +2554,17 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         elif quota_action and quota_action.get("action") == "resumed":
             head += "\n♻ 额度已恢复，已自动解除配额禁用"
         ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+    elif provider == "cursor":
+        head = "✅ 已更新 Cursor 套餐额度"
+        if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
+            head += f"\n🧬 模型目录已同步: <code>{int(metadata_action.get('models') or 0)} 个</code>"
+        elif isinstance(metadata_action, dict) and metadata_action.get("action") in {"error", "timeout", "fetch_empty"}:
+            head += "\n⚠️ 额度已更新，但模型目录本次同步失败，保留原目录"
+        if quota_action and quota_action.get("action") == "cursor_pool_cooldown":
+            head += f"\n🟠 已按额度池冷却 <code>{int(quota_action.get('cooled_models') or 0)}</code> 个模型"
+        elif quota_action and quota_action.get("action") == "cursor_pool_recovered":
+            head += f"\n♻️ 已恢复 <code>{int(quota_action.get('recovered_models') or 0)}</code> 个模型"
+        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
     elif provider == "xai":
         head = "✅ 已更新 Grok 官方账单"
         if quota_action and quota_action.get("action") == "disabled":
@@ -2436,6 +2578,66 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
     else:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+# ─── Cursor 模型目录 / 原生变体 ───────────────────────────────────
+
+
+def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, _, page_s = str(payload or "").partition(":")
+    try:
+        page = max(1, int(page_s or 1))
+    except ValueError:
+        page = 1
+    account_key = _resolve_to_account_key(ui.resolve_code(short))
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+        ui.answer_cb(cb_id, "Cursor 账户或短码已失效")
+        return
+    records = [
+        item for item in ((acc.get("cursor_model_catalog") or {}).get("models") or [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+    page_size = 2
+    total_pages = max(1, math.ceil(len(records) / page_size))
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    selected = records[start:start + page_size]
+    lines = [
+        f"🧬 <b>{ui.escape_html(_account_display(acc))} · Cursor 模型目录</b>",
+        f"canonical <b>{len(records)}</b> 个 · 第 <b>{page}/{total_pages}</b> 页",
+        "<i>下游调用 canonical id；Parrot 按 reasoning/fast/thinking 参数自动选择下列真实 Cursor id。</i>",
+    ]
+    for item in selected:
+        context = int(item.get("context_window") or 0)
+        max_context = int(item.get("context_window_max_mode") or 0)
+        limits = f"{ui.fmt_tokens(context)}"
+        if max_context > context:
+            limits += f" / Max {ui.fmt_tokens(max_context)}"
+        lines.extend([
+            "",
+            f"<b>{ui.escape_html(str(item.get('name') or item.get('id')))}</b>",
+            f"下游：<code>{ui.escape_html(item.get('id'))}</code>",
+            f"上下文：<code>{limits}</code> · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
+            "Cursor 原生变体：",
+        ])
+        slugs = [str(value) for value in item.get("legacy_slugs") or [] if str(value)]
+        if slugs:
+            lines.extend(f"  • <code>{ui.escape_html(slug)}</code>" for slug in slugs)
+        else:
+            lines.append("  • <i>canonical id（无展开变体）</i>")
+    rows: list[list[dict]] = []
+    nav: list[dict] = []
+    if page > 1:
+        nav.append(ui.btn("⬅ 上一页", f"oa:cursor_models:{short}:{page - 1}"))
+    if page < total_pages:
+        nav.append(ui.btn("下一页 ➡", f"oa:cursor_models:{short}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ui.btn("🔄 刷新额度与模型", f"oa:refresh_usage:{short}:1")])
+    rows.append([ui.btn("◀ 返回账户详情", f"oa:view:{short}:1")])
+    ui.answer_cb(cb_id)
+    ui.edit(chat_id, message_id, ui.truncate("\n".join(lines)), reply_markup=ui.inline_kb(rows))
 
 
 # ─── 清错误 / 清亲和 ─────────────────────────────────────────────
@@ -3213,7 +3415,7 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')} / {_provider_tag('openai')} / {_provider_tag('xai')}",
+        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')} / {_provider_tag('openai')} / {_provider_tag('xai')} / {_provider_tag('cursor')}",
         reply_markup=ui.inline_kb([
             [ui.btn(f"{_provider_icon('claude')} Claude 登录获取 Token", "oa:login")],
             [ui.btn(f"{_provider_icon('claude')} Claude 手动设置 JSON", "oa:set_json")],
@@ -3221,6 +3423,7 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.btn(f"{_provider_icon('openai')} OpenAI 粘贴 refresh_token", "oa:set_rt:openai")],
             [ui.btn(f"{_provider_icon('xai')} Grok 登录获取 Token", "oa:login:xai")],
             [ui.btn(f"{_provider_icon('xai')} Grok 粘贴 refresh_token", "oa:set_rt:xai")],
+            [ui.btn(f"{_provider_icon('cursor')} Cursor 登录", "oa:login:cursor")],
             [ui.btn(f"📦 {_provider_icon('openai')} OpenAI 导入 Sub2API 文件", "oa:import:sub2api")],
             [ui.btn(f"🗂 {_provider_icon('openai')} OpenAI 导入 CPA 文件", "oa:import:cpa")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
@@ -3436,6 +3639,193 @@ def on_set_json_input(chat_id: int, text: str) -> None:
         if load_balancing.is_initialized() else ""
     )
     ui.send_result(chat_id, f"✅ 已添加 <code>{ui.escape_html(data['email'])}</code>{lb_hint}", **nav)
+
+
+# ─── Cursor 浏览器 PKCE 登录（按钮轮询）────────────────────────────
+
+
+_OA_NAV_CURSOR = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+
+
+def on_login_cursor_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    try:
+        params = cursor_provider.generate_login()
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            _oauth_error_html(exc, provider="cursor", operation="exchange_code"),
+            **_OA_NAV_CURSOR,
+        )
+        return
+    states.set_state(chat_id, "oa_cursor_login", {
+        "uuid": params.uuid,
+        "verifier": params.verifier,
+        "created_at": time.time(),
+        "login_url": params.login_url,
+    })
+    text = (
+        f"请在浏览器打开以下链接登录 {_provider_tag('cursor', full=True)}：\n\n"
+        f"<a href=\"{ui.escape_html(params.login_url)}\">📱 点此打开 Cursor 登录页</a>\n\n"
+        "完成登录后回到这里点击 <b>✅ 已登录</b>。Parrot 会自动获取并保存 "
+        "Access Token、Refresh Token、套餐额度和当前账号可用模型。\n\n"
+        "👇 长按也可复制登录地址：\n"
+        f"<code>{ui.escape_html(params.login_url)}</code>\n\n"
+        "<i>如果仍提示未登录，请等待几秒后再次点击；登录会话 15 分钟内有效。</i>"
+    )
+    ui.edit(
+        chat_id,
+        message_id,
+        text,
+        reply_markup=ui.inline_kb([
+            [ui.btn_url("🌐 打开 Cursor 登录页", params.login_url)],
+            [ui.btn("✅ 已登录", "oa:login:cursor:done"), ui.btn("❌ 取消", "oa:add")],
+        ]),
+    )
+
+
+def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "oa_cursor_login":
+        ui.answer_cb(cb_id, "登录会话已失效，请重新发起", show_alert=True)
+        return
+    data = state.get("data") or {}
+    if time.time() - float(data.get("created_at") or 0) > 15 * 60:
+        states.pop_state(chat_id)
+        ui.answer_cb(cb_id, "登录会话已过期，请重新生成", show_alert=True)
+        ui.edit(
+            chat_id, message_id,
+            "❌ Cursor 登录会话已过期，请重新发起登录。",
+            reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]),
+        )
+        return
+
+    try:
+        tokens = cursor_provider.poll_login_once(
+            str(data.get("uuid") or ""),
+            str(data.get("verifier") or ""),
+        )
+    except cursor_provider.CursorAuthPending:
+        ui.answer_cb(cb_id, "Cursor 尚未确认登录，请完成浏览器登录后再点", show_alert=True)
+        return
+    except Exception as exc:
+        ui.answer_cb(cb_id, "获取 Cursor Token 失败", show_alert=True)
+        ui.edit(
+            chat_id,
+            message_id,
+            _oauth_error_html(exc, provider="cursor", operation="exchange_code"),
+            reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:login:cursor"), ui.btn("❌ 取消", "oa:add")]]),
+        )
+        return
+
+    ui.answer_cb(cb_id, "登录成功，正在同步额度和模型...")
+    try:
+        subject = cursor_provider.subject_from_access_token(tokens.access_token)
+        if not subject:
+            raise ValueError("Cursor access token 缺少稳定 subject")
+        catalog = cursor_provider.fetch_model_catalog_sync(tokens.access_token)
+        records = catalog.get("models") if isinstance(catalog, dict) else None
+        models = [
+            str(item.get("id") or "") for item in records or []
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if not models:
+            raise ValueError("Cursor AvailableModels 未返回可用模型")
+    except Exception as exc:
+        ui.edit(
+            chat_id,
+            message_id,
+            f"❌ Cursor 登录已完成，但模型同步失败。\n"
+            f"{_oauth_error_html(exc, provider='cursor', operation='fetch_models')}",
+            reply_markup=ui.inline_kb([[ui.btn("🔄 重试获取", "oa:login:cursor:done"), ui.btn("❌ 取消", "oa:add")]]),
+        )
+        return
+
+    usage: dict | None = None
+    usage_error: Exception | None = None
+    try:
+        usage = cursor_provider.fetch_usage_sync(tokens.access_token)
+    except Exception as exc:
+        usage_error = exc
+
+    cursor_usage = (usage or {}).get("cursor") if isinstance(usage, dict) else {}
+    cursor_usage = cursor_usage if isinstance(cursor_usage, dict) else {}
+    email = cursor_provider.account_label(subject)
+    plan = str(cursor_usage.get("plan_name") or cursor_usage.get("individual_membership_type") or "Cursor")
+    short_subject = hashlib.sha256(subject.encode("utf-8")).hexdigest()[:8]
+    label = f"Cursor {plan} · {short_subject}" if plan and plan != "Cursor" else f"Cursor · {short_subject}"
+    expired = datetime.fromtimestamp(tokens.expires_at_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {
+        "email": email,
+        "label": label,
+        "provider": "cursor",
+        "type": "cursor",
+        "subject": subject,
+        "sub": subject,
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,
+        "expired": expired,
+        "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "enabled": True,
+        "disabled_reason": None,
+        "disabled_until": None,
+        "models": list(dict.fromkeys(models)),
+        "cursor_model_catalog": catalog,
+        "last_model_sync": str(catalog.get("fetched_at") or ""),
+        "plan_type": plan,
+        "subscription_status": cursor_usage.get("subscription_status") or "",
+        "billing_cycle_start": cursor_usage.get("billing_cycle_start") or "",
+        "billing_cycle_end": cursor_usage.get("billing_cycle_end") or "",
+    }
+    account_key = _account_key(entry)
+    existed = oauth_manager.get_account(account_key) is not None
+    try:
+        oauth_manager.add_account(entry)
+        if usage is not None:
+            save_error = _save_usage_to_quota_cache(account_key, usage, email=email)
+            if save_error is not None:
+                usage_error = save_error
+            else:
+                _evaluate_quota_action(account_key, usage)
+    except Exception as exc:
+        ui.edit(
+            chat_id,
+            message_id,
+            f"❌ 保存 Cursor 账户失败：<code>{ui.escape_html(str(exc))[:500]}</code>",
+            reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]),
+        )
+        return
+
+    states.pop_state(chat_id)
+    raw_total = cursor_usage.get("total_spend_cents")
+    raw_limit = cursor_usage.get("limit_cents")
+    raw_remaining = cursor_usage.get("remaining_cents")
+    quota_line = "额度: <code>暂未获取，稍后可在账户详情刷新</code>"
+    if raw_limit is not None:
+        quota_line = (
+            f"额度: <code>已用 ${float(raw_total or 0) / 100:.2f} / ${float(raw_limit) / 100:.2f}"
+            + (f" · 剩余 ${float(raw_remaining) / 100:.2f}" if raw_remaining is not None else "")
+            + "</code>"
+        )
+    if usage_error is not None:
+        quota_line += "\n⚠️ 用量接口本次未完整返回，Token 和模型已保存。"
+    title = "Cursor OAuth 账户已更新" if existed else "Cursor OAuth 账户已添加"
+    lb_hint = (
+        "\n已加入 OpenAI 家族负载均衡队列末尾，可在负载均衡菜单调整优先级。"
+        if not existed and load_balancing.is_initialized() else ""
+    )
+    ui.edit(
+        chat_id,
+        message_id,
+        f"✅ {_provider_tag('cursor')} <b>{title}</b>\n\n"
+        f"账户: <code>{ui.escape_html(label)}</code>\n"
+        f"套餐: <code>{ui.escape_html(plan)}</code>\n"
+        f"模型: <code>{len(models)} 个 canonical 模型</code>\n"
+        f"原生变体: <code>{sum(len(item.get('legacy_slugs') or []) for item in records or [] if isinstance(item, dict))} 个</code>\n"
+        f"{quota_line}\n"
+        f"Token: <code>{_fmt_time_full(expired)}</code>{lb_hint}",
+        reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
+    )
 
 
 # ─── OpenAI PKCE 登录 ──────────────────────────────────────────────
@@ -4515,6 +4905,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "oa:set_json":
         on_set_json_start(chat_id, message_id, cb_id)
         return True
+    if data == "oa:login:cursor":
+        on_login_cursor_start(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:login:cursor:done":
+        on_login_cursor_done(chat_id, message_id, cb_id)
+        return True
     if data == "oa:login:openai":
         on_login_openai_start(chat_id, message_id, cb_id)
         return True
@@ -4566,6 +4962,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("oa:refresh_usage:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
         on_refresh_usage(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        return True
+    if data.startswith("oa:cursor_models:"):
+        on_cursor_models(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
     if data.startswith("oa:clear_errors:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

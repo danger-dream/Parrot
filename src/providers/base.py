@@ -15,6 +15,7 @@ from .capabilities import (
     ANTHROPIC_OAUTH_CAPABILITIES,
     ANTHROPIC_STANDARD_CAPABILITIES,
     CC_MIMICRY_CAPABILITIES,
+    CURSOR_OAUTH_CAPABILITIES,
     OPENAI_API_CAPABILITIES,
     OPENAI_CODEX_CAPABILITIES,
     XAI_OAUTH_CAPABILITIES,
@@ -83,6 +84,11 @@ class AnthropicOAuthAdapter(ProviderAdapter):
 class OpenAIApiAdapter(ProviderAdapter):
     name = "openai-api"
     capabilities = OPENAI_API_CAPABILITIES
+
+
+class CursorOAuthAdapter(ProviderAdapter):
+    name = "cursor-oauth"
+    capabilities = CURSOR_OAUTH_CAPABILITIES
 
 
 class OpenAICodexAdapter(ProviderAdapter):

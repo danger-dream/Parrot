@@ -249,17 +249,69 @@ def _record_for(
     )
 
 
+def _cursor_native_binding(
+    model: str,
+    *,
+    scope_key: str | None,
+    outbound_model: str | None,
+) -> MetadataBinding | None:
+    """Return account-native Cursor metadata for one Cursor OAuth scope.
+
+    Cursor model limits and variant capabilities are account-specific and must
+    not inherit a same-named models.dev record.  This resolver intentionally
+    precedes both persisted scoped and default bindings.
+    """
+    scope = normalize_model_name(scope_key)
+    if not scope.startswith("oauth:cursor:"):
+        return None
+    account_key = scope[len("oauth:"):]
+    try:
+        from .cursor_bridge.catalog import find_record, metadata_from_record
+        from .oauth_ids import account_key as make_account_key
+
+        account = next(
+            (
+                item for item in config.get().get("oauthAccounts", [])
+                if make_account_key(item) == account_key
+            ),
+            None,
+        )
+        record = find_record(account, model) if account is not None else None
+        metadata = metadata_from_record(record)
+    except Exception:
+        return None
+    if not metadata:
+        return None
+    return MetadataBinding(
+        client_visible_model=model,
+        target=f"cursor/{model}",
+        provider_id="cursor",
+        catalog_model_id=model,
+        scope_key=scope,
+        outbound_model=normalize_model_name(outbound_model) or model,
+        source="cursor.AvailableModels",
+        metadata=metadata,
+    )
+
+
 def resolve_binding(
     client_visible_model: Any,
     *,
     scope_key: str | None = None,
     outbound_model: str | None = None,
 ) -> MetadataBinding | None:
-    """Resolve effective metadata as ``scoped > default > none``."""
+    """Resolve effective metadata as ``Cursor-native > scoped > default > none``."""
     model = normalize_model_name(client_visible_model)
     scope = normalize_model_name(scope_key) or None
     if not model:
         return None
+    cursor_binding = _cursor_native_binding(
+        model,
+        scope_key=scope,
+        outbound_model=outbound_model,
+    )
+    if cursor_binding is not None:
+        return cursor_binding
     cfg = config.get()
     defaults, scoped = _binding_roots(cfg)
     if scope:
@@ -382,6 +434,30 @@ def list_bindings() -> list[MetadataBinding]:
             )
             if binding:
                 result.append(binding)
+
+    # Cursor account metadata is generated from each account's live model
+    # catalog and is read-only in the binding UI. Include it in the scoped view
+    # without persisting duplicate modelBindings entries.
+    existing = {(item.scope_key, item.client_visible_model) for item in result}
+    try:
+        cursor_items = [
+            item for item in inventory_items()
+            if item.scope_key.startswith("oauth:cursor:")
+        ]
+    except Exception:
+        cursor_items = []
+    for item in cursor_items:
+        key = (item.scope_key, item.client_visible_model)
+        if key in existing:
+            continue
+        binding = _cursor_native_binding(
+            item.client_visible_model,
+            scope_key=item.scope_key,
+            outbound_model=item.outbound_model,
+        )
+        if binding is not None:
+            result.append(binding)
+            existing.add(key)
     return sorted(result, key=lambda item: (item.scope_key or "", item.client_visible_model))
 
 
@@ -479,6 +555,10 @@ def auto_sync_metadata(
     """Create/update canonical exact default bindings for all visible models."""
     inventory = list(items if items is not None else inventory_items())
     visible_models = sorted({item.client_visible_model for item in inventory if item.client_visible_model})
+    scopes_by_model: dict[str, set[str]] = {}
+    for item in inventory:
+        if item.client_visible_model:
+            scopes_by_model.setdefault(item.client_visible_model, set()).add(item.scope_key)
     cfg = config.get()
     defaults, _ = _binding_roots(cfg)
     changes: dict[str, dict[str, str]] = {}
@@ -487,6 +567,9 @@ def auto_sync_metadata(
     unchanged: list[str] = []
     unmatched: list[str] = []
     for model in visible_models:
+        scopes = scopes_by_model.get(model) or set()
+        if scopes and all(scope.startswith("oauth:cursor:") for scope in scopes):
+            continue
         target = model_pricing.canonical_official_model(model)
         if target is None:
             unmatched.append(model)

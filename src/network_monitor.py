@@ -38,7 +38,7 @@ def _has_family_account(family: str) -> bool:
     # 看 OAuth 账号
     for acc in cfg_data.get("oauthAccounts", []) or []:
         prov = (acc.get("provider") or "").lower()
-        if family == "openai" and prov in ("openai", "xai"):
+        if family == "openai" and prov in ("openai", "xai", "cursor"):
             return True
         if family == "anthropic" and prov in ("", "anthropic", "claude"):
             return True
@@ -411,6 +411,8 @@ def _parse_host_port(url: str) -> tuple[str, int]:
 
 def _channel_probe_url(ch) -> str:
     if getattr(ch, "type", "") == "oauth":
+        if getattr(ch, "provider", "") == "cursor":
+            return "https://api2.cursor.sh/aiserver.v1.AiService/AvailableModels"
         if getattr(ch, "protocol", "anthropic") == "openai-responses":
             return "https://chatgpt.com/backend-api/codex/responses"
         return "https://api.anthropic.com/api/oauth/usage"

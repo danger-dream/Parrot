@@ -1,6 +1,9 @@
 fastapi>=0.110
 uvicorn>=0.29
 httpx[socks]>=0.27
+# Cursor OAuth AgentService bridge (protobuf over bidirectional HTTP/2).
+protobuf>=5
+h2>=4.2
 xxhash>=3.4
 dnspython>=2.6
 packaging>=23

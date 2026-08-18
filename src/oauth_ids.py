@@ -9,6 +9,8 @@ entry.workspace_id，缺失时回退 entry.chatgpt_account_id。两者都缺失�
 才回退旧的 ``openai:<email>``，保证老配置继续可用。
 xAI 使用 ``xai:<subject>``；缺 subject 的导入/旧数据回退到
 ``xai:<email>``。历史临时格式 ``xai:<email>:<subject>`` 仍在解析路径兼容。
+Cursor 使用 access-token JWT 的稳定 ``sub``：``cursor:<subject>``；缺失时
+回退到账户展示 email。
 
 调用约定
 --------
@@ -74,6 +76,19 @@ def xai_subject(acc: dict) -> str:
     return ""
 
 
+def cursor_subject(acc: dict) -> str:
+    """Cursor JWT subject used as the stable account identity."""
+    for key in ("subject", "sub"):
+        value = str(acc.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def cursor_composite_identity(acc: dict) -> str:
+    return cursor_subject(acc) or str(acc.get("email") or "").strip()
+
+
 def xai_composite_identity(acc: dict) -> str:
     """xAI provider-local identity string: `subject` when possible.
 
@@ -94,6 +109,8 @@ def account_identity(acc: dict) -> str:
         return openai_composite_identity(acc)
     if provider == "xai":
         return xai_composite_identity(acc)
+    if provider == "cursor":
+        return cursor_composite_identity(acc)
     return email
 
 
@@ -165,4 +182,4 @@ def is_account_key(value: Any) -> bool:
     if not isinstance(value, str) or ":" not in value:
         return False
     prov = value.split(":", 1)[0]
-    return _normalize_provider(prov) == prov and prov in ("claude", "openai", "xai")
+    return _normalize_provider(prov) == prov and prov in ("claude", "openai", "xai", "cursor")

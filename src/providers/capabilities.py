@@ -156,6 +156,22 @@ OPENAI_API_CAPABILITIES = ProviderCapabilities(
 )
 
 
+CURSOR_OAUTH_CAPABILITIES = ProviderCapabilities(
+    adapter_name="cursor-oauth",
+    family="openai",
+    protocols=frozenset({"openai-chat"}),
+    transports=frozenset({"http", "sse"}),
+    passthrough_request_fields={"openai-chat": CHAT_REQ_ALLOWED},
+    native_state=frozenset({
+        "cursor_agent_session",
+        "cursor_model_parameters",
+        "mcp_tool_resume",
+        "reasoning_content",
+    }),
+    notes=("Cursor OAuth AgentService exposed through Parrot's private OpenAI Chat bridge",),
+)
+
+
 OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
     adapter_name="openai-codex",
     family="openai",

@@ -9,7 +9,7 @@
 > 像鹦鹉学舌一样，把下游客户端的请求转发到多个上游，自动挑最快的、故障切到备用。
 > 双家族（Anthropic / OpenAI）、三种入口协议、多种上游协议，还能家族内互转。
 
-Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**。你手上有一堆 Claude OAuth 账号、ChatGPT Plus OAuth 账号、第三方 GLM / Codex Coding Plan，不想维护 3 套代理 + 3 套统计 + 3 个 TG Bot；Parrot 把它们统一抽象成「渠道」，配上评分调度、故障转移、会话亲和、OAuth 自动刷新、Telegram 图形面板。
+Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**。你手上有一堆 Claude OAuth 账号、ChatGPT Plus OAuth 账号、Cursor 订阅账号、第三方 GLM / Codex Coding Plan，不想维护多套代理、统计和 TG Bot；Parrot 把它们统一抽象成「渠道」，配上评分调度、故障转移、会话亲和、OAuth 自动刷新、Telegram 图形面板。
 
 ---
 
@@ -33,6 +33,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 |------|------|------|
 | 🅰 Anthropic OAuth | Claude Code 官方账户 | 完整 CC 伪装（指纹 / CCH / 工具名混淆 / cache 断点），与 cc-proxy 同源移植 |
 | 🅾 OpenAI OAuth (Codex) | ChatGPT Plus/Pro/Enterprise | 对接 `chatgpt.com/backend-api/codex/responses`，SSE 聚合、rate-limit 头自动解析 |
+| 🖱️ Cursor OAuth | Cursor 个人/团队订阅 | 浏览器 PKCE 登录，自动同步套餐额度、canonical 模型与 200+ 原生变体；通过私有 AgentService bridge 同时服务 Chat / Responses / Anthropic 入口 |
 | 🔀 第三方 API 渠道 | 智谱 / 天翼云 / 京东云 / 讯飞星辰 / 任何 Anthropic 或 OpenAI 兼容服务 | 可开关 CC 伪装；按 `protocol` 决定走哪种请求构造器 |
 
 **家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。
@@ -47,7 +48,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 - **错误阶梯冷却**：`[1, 3, 5, 10, 15, 0]` 分钟，成功一次清零；OAuth 渠道带宽容次数（`oauthGraceCount: 3`）避免偶发抖动误冷却；并带两层爆发保护（阶梯推进最小间隔 `cooldownLadderMinIntervalSeconds` + 永久冷却最小累计 `cooldownPermanentMinAgeSeconds`），挡住客户端秒级重试把渠道打穿
 - **渠道并发限制**（v0.2.0）：每个渠道可配 `maxConcurrent`，同一时刻只放行这么多个在途请求；其余候选**进 FIFO 排队**直到有位置或 `queueWaitSeconds` 超时（429）；TG 主菜单 overview 实时显示 `在途 / 排队 / 追踪渠道数`
 - **会话亲和**：双层指纹 = `hash(api_key | ip | 倒数两条消息)`；session 级 TTL 30min、client 级 soft 回退 TTL 120min（无历史也能命中最近用过的渠道）
-- **OAuth 配额监控**：Claude 账户拉 `/api/oauth/usage`；OpenAI 账户解析 Codex `rate-limit` 响应头；阈值自动禁用/恢复
+- **OAuth 配额监控**：Claude 账户拉 `/api/oauth/usage`；OpenAI 账户解析 Codex `rate-limit` 响应头；Cursor 拉 DashboardService 套餐/额度并区分 Cursor Models 与 Other Models 两个池，按池冷却/恢复对应模型，不粗暴禁用整个账号
 - **评分调度**：滑动窗口 EMA 延迟 + 失败惩罚；带 20% 探索率避免赢家通吃
 - **模型映射 & 入口默认模型**：三条入口（anthropic / openai-chat / openai-responses）各自独立维护 `别名 → 真实模型` 表和默认模型；下游客户端发别名、代理改写成真实名再走调度，上游发新模型时**改 TG bot 即生效，无需重启客户端**
 - **出站网络设置**：支持在 TG「系统设置 → 网络设置」里配置 DNS 与 SOCKS5。DNS 默认 `8.8.8.8`，首次启动可从系统 DNS 同步一次；DNS 支持普通 IP/域名、DoT（`dot://...`）和 DoH（`https://.../dns-query`），DNS 服务器域名本身用系统 DNS 解析避免套娃。启用 SOCKS5 后所有出站 HTTP 请求走 SOCKS5，代理地址若为域名则使用配置 DNS 解析，保存前会检测并二次确认。内置「网络检测」后台监控，可按间隔检测 DNS / SOCKS5 / 渠道 TCP 连通性 / OpenAI、Claude、Cloudflare 核心上游，并在失败/恢复边沿各通知一次。
@@ -349,7 +350,7 @@ JSON 请求体：
 - 维度：汇总（两家族分段）/ 按渠道 / 按模型 / 按 Key
 - **汇总视图**：先 🅰 Anthropic 段（overall + 按渠道 Top3 + 按模型 Top3），后 🅾 OpenAI 段（同上，完整含重试/亲和）；底部跨家族按 Key Top + 最近调用（带家族图标）+ 未命中样本
 - **专题视图**：按渠道 / 按模型 Top10，每条前缀 🅰/🅾 家族图标
-- **模型元数据与金额统计**：客户端可见模型通过默认或 scope 专属 binding 精确绑定到 [models.dev](https://models.dev) `provider/model`；上下文、最大输出、能力与完整价格均来自绑定指向的同一目录记录，专属优先于默认，无绑定不猜测 provider。Telegram 支持 canonical exact 自动同步，以及 OAuth/API scope → 现有模型 → provider → 目录模型的专属绑定流程；压缩模型独立设置并按实际 compact 路由解析相同 binding limits。每次真实上游尝试在 dispatch 时冻结输入 / 输出 / 缓存写入 / 缓存读取 Token 的 USD 费率，支持单档长上下文阶梯、OpenAI Priority 与 Anthropic Fast 完整替换价；xAI 响应若返回可信的 `cost_in_usd_ticks` 则优先采用真实金额。界面区分实际、估算、混合与未计价；无绑定、缺失 usage、无法确认旧 Token 口径、Claude 缓存写入 TTL 不可区分、多档 context tier、缺失 Priority/Fast tariff、未知 service tier，或日志缺少独立 reasoning/audio Token 维度时都会 fail-closed 为“未计价”，不会静默按 `$0` 或错误档位处理。models.dev 与 xAI 实际费用均为 USD，不做实时汇率换算。
+- **模型元数据与金额统计**：普通渠道的客户端可见模型通过默认或 scope 专属 binding 精确绑定到 [models.dev](https://models.dev) `provider/model`；上下文、最大输出、能力与完整价格均来自绑定指向的同一目录记录，专属优先于默认，无绑定不猜测 provider。Cursor OAuth 是明确例外：其账号 scope 永远优先使用该账号实时 `AvailableModels` 返回的上下文、Max Context、推理档位与原生变体，绝不套用同名 models.dev 限制；当前 Cursor bridge 未实现 SelectedImage，因此有效元数据会如实标记图片输入不可用。Telegram 支持 canonical exact 自动同步，以及 OAuth/API scope → 现有模型 → provider → 目录模型的专属绑定流程；压缩模型独立设置并按实际 compact 路由解析相同 binding limits。每次真实上游尝试在 dispatch 时冻结输入 / 输出 / 缓存写入 / 缓存读取 Token 的 USD 费率，支持单档长上下文阶梯、OpenAI Priority 与 Anthropic Fast 完整替换价；xAI 响应若返回可信的 `cost_in_usd_ticks` 则优先采用真实金额。界面区分实际、估算、混合与未计价；无绑定、缺失 usage、无法确认旧 Token 口径、Claude 缓存写入 TTL 不可区分、多档 context tier、缺失 Priority/Fast tariff、未知 service tier，或日志缺少独立 reasoning/audio Token 维度时都会 fail-closed 为“未计价”，不会静默按 `$0` 或错误档位处理。models.dev 与 xAI 实际费用均为 USD，不做实时汇率换算。
 
 ### 📋 最近日志
 页面可在两类日志之间切换：
@@ -362,7 +363,7 @@ JSON 请求体：
 > **Base URL 自适应**（v0.5.0+）：默认填上游域名即可，代理按协议追加 `/v1/messages`、`/v1/chat/completions`、`/v1/responses`。若上游接口挂在非标准路径（如智谱 Coding Plan 的 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），直接把**完整调用路径**贴进来，向导会自动拆分为 `baseUrl + apiPath` 存储，协议不匹配时给出交互式选择（采用识别到的协议 / 坚持当前协议清空路径 / 返回修改）。
 
 ### 🔐 管理 OAuth
-- ➕ 新增账户：支持 Claude / OpenAI / Grok；各家按现有登录或 refresh_token 流程接入
+- ➕ 新增账户：支持 Claude / OpenAI / Grok / Cursor；Cursor 显示可点击的浏览器登录链接，完成后点「已登录」即可自动获取并持久化 Token、套餐额度、账号模型和原生变体
 - 每条账户显示：状态图标 / 过期时间 / 5h 7d 用量 / 月度统计 / 冷却中的模型
 - 详情页：三家族统一布局（提供者 / 计划 / 过期 / 上次刷新 / 使用量 / 月度）
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
@@ -651,7 +652,7 @@ Parrot/
     ├── failover.py              ← 故障转移 + upstream_stream_only SSE 聚合
     ├── blacklist.py
     ├── probe.py
-    ├── oauth_manager.py         ← 多 OAuth 账户管理（Claude + OpenAI）
+    ├── oauth_manager.py         ← 多 OAuth 账户管理（Claude + OpenAI + Grok + Cursor）
     ├── upstream.py              ← httpx client + SSE 工具 + 家族 Builder
     ├── notifier.py
     ├── transform/
@@ -661,10 +662,13 @@ Parrot/
     │   ├── base.py              ← upstream_stream_only 抽象
     │   ├── oauth_channel.py     ← Anthropic OAuth 渠道
     │   ├── openai_oauth_channel.py ← OpenAI Codex OAuth 渠道
+    │   ├── cursor_oauth_channel.py ← Cursor OAuth + canonical→原生变体渠道
     │   ├── api_channel.py       ← Anthropic 协议第三方 API 渠道
     │   └── registry.py
     ├── oauth/
-    │   └── openai.py            ← OpenAI OAuth refresh + 限额头解析
+    │   ├── openai.py            ← OpenAI OAuth refresh + 限额头解析
+    │   └── cursor.py            ← Cursor 登录轮询、刷新、额度与模型同步
+    ├── cursor_bridge/           ← Cursor H2/protobuf AgentService 私有 bridge
     ├── openai/                  ← OpenAI 协议子树（4700+ 行）
     │   ├── handler.py           ← chat/completions + responses 入口
     │   ├── images_simple.py     ← Parrot 简化图片生成/编辑接口
@@ -680,7 +684,7 @@ Parrot/
             ├── stats_menu.py    ← 家族化汇总 + 专题 + Key 家族拆分
             ├── logs_menu.py
             ├── channel_menu.py
-            ├── oauth_menu.py    ← 支持 Claude + OpenAI + Grok OAuth 管理
+            ├── oauth_menu.py    ← 支持 Claude + OpenAI + Grok + Cursor OAuth 管理
             ├── apikey_menu.py   ← API Key 模型 / 图片 / 视频权限
             ├── image_menu.py    ← GPT/Codex 图片配置 / 缓存设置
             ├── xai_imagine_menu.py ← Grok Imagine 图片 / 视频设置

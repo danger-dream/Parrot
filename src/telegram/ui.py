@@ -678,19 +678,19 @@ def family_of(protocol: Optional[str]) -> Optional[str]:
     return None
 
 
-FAMILY_ICON = {"anthropic": "🅰️", "openai": "🅾️/𝕏"}
-FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI & Grok"}
+FAMILY_ICON = {"anthropic": "🅰️", "openai": "🅾️/𝕏/🖱️"}
+FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI, Grok & Cursor"}
 
-PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏"}
+PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️"}
 PROVIDER_CUSTOM_EMOJI = {
     "claude": "5872779796257184592",
     "anthropic": "5872779796257184592",
     "openai": "5861557411784957025",
     "xai": "5819115571463068721",
 }
-PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦"}
-PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok"}
-PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok"}
+PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️"}
+PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor"}
+PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth"}
 
 
 def _provider_key(provider: str | None) -> str:
@@ -761,8 +761,11 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
             from .. import oauth_manager
             acc = oauth_manager.get_account(account_key)
             if acc is not None:
-                name = str(acc.get("email") or "?")
                 provider = oauth_manager.provider_of(acc)
+                name = str(
+                    (acc.get("label") or acc.get("email") or "?")
+                    if provider == "cursor" else (acc.get("email") or "?")
+                )
                 if provider == "openai":
                     same_email_count = sum(
                         1 for item in oauth_manager.list_accounts()
@@ -807,7 +810,7 @@ def family_tag(family: Optional[str]) -> str:
     if family == "anthropic":
         return f"{provider_icon('claude')} {FAMILY_LABEL.get(family, family)}"
     if family == "openai":
-        return f"{provider_icon('openai')}/{provider_icon('xai')} {FAMILY_LABEL.get(family, family)}"
+        return f"{provider_icon('openai')}/{provider_icon('xai')}/{provider_icon('cursor')} {FAMILY_LABEL.get(family, family)}"
     return f"{FAMILY_ICON.get(family, '?')} {FAMILY_LABEL.get(family, family)}"
 
 

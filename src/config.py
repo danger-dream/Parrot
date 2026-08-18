@@ -465,6 +465,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "openai": "🅾️",
             "claude": "🅰️",
             "xai": "𝕏",
+            "cursor": "🖱️",
         },
     },
     "oauth": {
@@ -556,6 +557,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaultModels": [
             "grok-4.5",
         ],
+    },
+    # Cursor OAuth / AgentService 私有 bridge。模型清单和上下文限制按账号
+    # AvailableModels 自动同步，不使用 models.dev 元数据。
+    "cursorOAuth": {
+        "bridgeHost": "127.0.0.1",
+        "bridgePort": 0,
+        "maxRetries": 2,
+        "requestTimeoutSeconds": 300,
+        "modelSyncHours": 6,
     },
     # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）
     "openai": {

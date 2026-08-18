@@ -367,6 +367,13 @@
       "grok-4.5"
     ]
   },
+  "cursorOAuth": {
+    "bridgeHost": "127.0.0.1",
+    "bridgePort": 0,
+    "maxRetries": 2,
+    "requestTimeoutSeconds": 300,
+    "modelSyncHours": 6
+  },
   "openai": {
     "store": {
       "enabled": true,
@@ -412,7 +419,8 @@
     "providerBtnEmoji": {
       "openai": "🅾️",
       "claude": "🅰️",
-      "xai": "𝕏"
+      "xai": "𝕏",
+      "cursor": "🖱️"
     }
   }
 }

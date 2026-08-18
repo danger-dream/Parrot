@@ -32,13 +32,13 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
         if not email:
             continue
         provider = oauth_manager.provider_of(acc)
-        if provider not in ("claude", "openai", "xai"):
+        if provider not in ("claude", "openai", "xai", "cursor"):
             continue
         ak = _account_key(acc)
         row = state_db.quota_load(ak)
         if not row:
             continue
-        if provider == "xai":
+        if provider in {"xai", "cursor"}:
             utils = [row.get("thirty_day_util")]
         else:
             utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",

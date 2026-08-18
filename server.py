@@ -241,6 +241,11 @@ async def lifespan(app: FastAPI):
     from src.openai import store as openai_store
     openai_store.init()
 
+    # Cursor OAuth channels reuse the normal HTTP/SSE failover path through a
+    # process-private loopback bridge. It must exist before registry construction.
+    from src.cursor_bridge import runtime as cursor_bridge_runtime
+    cursor_bridge_runtime.ensure_started()
+
     # 渠道注册表 + 热加载钩子
     registry.rebuild_from_config()
     registry.install_config_reload_hook()
@@ -290,6 +295,7 @@ async def lifespan(app: FastAPI):
     if os.environ.get("PARROT_NO_REFRESH") != "1":
         _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
         _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
+        _background_tasks.append(asyncio.create_task(oauth_manager.cursor_model_sync_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
@@ -317,6 +323,7 @@ async def lifespan(app: FastAPI):
         await apikey_limiter.shutdown_spooling()
         tgbot.stop()
         await upstream.close_client()
+        cursor_bridge_runtime.stop()
 
 
 app = FastAPI(lifespan=lifespan)

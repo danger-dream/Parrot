@@ -1816,6 +1816,7 @@ def _source_label(source: str) -> str:
     return {
         "auto": "自动同步", "manual": "手动绑定",
         "legacy": "旧配置迁移", "config": "配置文件",
+        "cursor.AvailableModels": "Cursor 账号自动同步",
     }.get(str(source or "").strip(), str(source or "未知"))
 
 
@@ -1875,7 +1876,10 @@ def _show_meta_item(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
     raw = model_pricing.catalog_model(binding.target) or {}
     cost = meta.get("cost") if isinstance(meta.get("cost"), Mapping) else {}
     name = str(meta.get("name") or binding.client_visible_model)
-    kind = "专属元数据" if binding.scope_key else "默认元数据"
+    kind = (
+        "Cursor 自动元数据" if binding.source == "cursor.AvailableModels"
+        else "专属元数据" if binding.scope_key else "默认元数据"
+    )
     lines = [
         "🧾 <b>模型元数据详情</b>", "",
         f"<b>{ui.escape_html(kind)}</b> · {ui.escape_html(_source_label(binding.source))}",
@@ -1894,6 +1898,12 @@ def _show_meta_item(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
     lines.extend([
         "", "📐 <b>模型限制</b>",
         f"上下文：{_fmt_limit(meta.get('contextWindow'))} Tokens",
+    ])
+    if meta.get("contextWindowMaxMode"):
+        lines.append(
+            f"Cursor Max 上下文：{_fmt_limit(meta.get('contextWindowMaxMode'))} Tokens"
+        )
+    lines.extend([
         (
             f"压缩阈值：{compact_trigger} Tokens"
             if compact_trigger != "—" else "压缩阈值：按上下文容量"
@@ -1925,13 +1935,19 @@ def _show_meta_item(chat_id: int, message_id: int, cb_id: str, code: str) -> Non
         outbound=binding.outbound_model,
         **{key: value for key, value in (selection or {}).items() if key not in {"scope", "model", "outbound"}},
     )
-    kb = ui.inline_kb([
-        [
-            ui.btn("✏ 更换绑定", f"map:meta_candidates:{update_code}:0"),
-            ui.btn("🗑 删除绑定", f"map:meta_del:{update_code}"),
-        ],
-        _meta_bottom_row("返回元数据列表", _detail_back_callback(selection or {})),
-    ])
+    if binding.source == "cursor.AvailableModels":
+        kb = ui.inline_kb([
+            [ui.btn("🔄 到 OAuth 账户刷新模型", "menu:oauth")],
+            _meta_bottom_row("返回元数据列表", _detail_back_callback(selection or {})),
+        ])
+    else:
+        kb = ui.inline_kb([
+            [
+                ui.btn("✏ 更换绑定", f"map:meta_candidates:{update_code}:0"),
+                ui.btn("🗑 删除绑定", f"map:meta_del:{update_code}"),
+            ],
+            _meta_bottom_row("返回元数据列表", _detail_back_callback(selection or {})),
+        ])
     ui.answer_cb(cb_id)
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=kb)
 

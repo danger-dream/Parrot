@@ -53,6 +53,8 @@ def _channel_icon(ch) -> str:
             return f"{ui.provider_icon('openai')} 🔐"
         if prov == "xai":
             return f"{ui.provider_icon('xai')} 🔐"
+        if prov == "cursor":
+            return f"{ui.provider_icon('cursor')} 🔐"
         if prov == "claude":
             return f"{ui.provider_icon('claude')} 🔐"
         return "✉ 🔐"

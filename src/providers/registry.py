@@ -7,6 +7,7 @@ Selection is intentionally lightweight and mirrors today's Channel classes:
 - OpenAI API channels                  → OpenAI API
 - OpenAI OAuth/Codex channels          → OpenAI Codex
 - xAI OAuth/Grok channels              → xAI OAuth
+- Cursor OAuth/AgentService channels    → Cursor OAuth
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from .base import (
     AnthropicOAuthAdapter,
     AnthropicStandardAdapter,
     CcMimicryAdapter,
+    CursorOAuthAdapter,
     OpenAIApiAdapter,
     OpenAICodexAdapter,
     XAIOAuthAdapter,
@@ -28,6 +30,7 @@ _ANTHROPIC_STANDARD = AnthropicStandardAdapter()
 _CC_MIMICRY = CcMimicryAdapter()
 _ANTHROPIC_OAUTH = AnthropicOAuthAdapter()
 _OPENAI_API = OpenAIApiAdapter()
+_CURSOR_OAUTH = CursorOAuthAdapter()
 _OPENAI_CODEX = OpenAICodexAdapter()
 _XAI_OAUTH = XAIOAuthAdapter()
 
@@ -37,9 +40,14 @@ def adapter_for_channel(channel) -> ProviderAdapter:
     ch_type = getattr(channel, "type", "api")
 
     if protocol.startswith("openai-"):
-        if ch_type == "oauth" and getattr(channel, "provider", "") == "xai":
-            return _XAI_OAUTH
-        return _OPENAI_CODEX if ch_type == "oauth" else _OPENAI_API
+        if ch_type == "oauth":
+            provider = getattr(channel, "provider", "")
+            if provider == "xai":
+                return _XAI_OAUTH
+            if provider == "cursor":
+                return _CURSOR_OAUTH
+            return _OPENAI_CODEX
+        return _OPENAI_API
 
     if ch_type == "oauth":
         return _ANTHROPIC_OAUTH

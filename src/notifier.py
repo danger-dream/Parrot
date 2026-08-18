@@ -39,15 +39,15 @@ def escape_html(s) -> str:
                   .replace(">", "&gt;"))
 
 
-_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏"}
+_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️"}
 _PROVIDER_CUSTOM_EMOJI = {
     "claude": "5872779796257184592",
     "anthropic": "5872779796257184592",
     "openai": "5861557411784957025",
     "xai": "5819115571463068721",
 }
-_PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦"}
-_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok"}
+_PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️"}
+_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor"}
 
 
 def _provider_key(provider: str | None) -> str:

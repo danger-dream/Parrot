@@ -36,10 +36,12 @@ from .oauth import (
 )
 from .oauth_ids import (
     account_key as _account_key,
+    cursor_subject as _cursor_subject,
     openai_workspace_id as _openai_workspace_id,
     split_account_key as _split_ak,
     xai_subject as _xai_subject,
 )
+from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
 from .transform.cc_mimicry import CLI_USER_AGENT
@@ -93,8 +95,12 @@ def _is_xai_acc(acc: dict) -> bool:
     return _acc_provider(acc) == "xai"
 
 
+def _is_cursor_acc(acc: dict) -> bool:
+    return _acc_provider(acc) == "cursor"
+
+
 def _is_openai_family_provider(provider: str) -> bool:
-    return provider in ("openai", "xai")
+    return provider in ("openai", "xai", "cursor")
 
 
 def _canonical_key(acc: dict) -> str:
@@ -141,6 +147,16 @@ def _matching_accounts_for_key(key: str) -> list[dict]:
                     or _openai_workspace_id(acc) == identity
                     or str(acc.get("chatgpt_account_id") or "") == identity
                     or str(acc.get("workspace_id") or "") == identity
+                )
+            ]
+        if provider == "cursor":
+            return [
+                acc for acc in accounts
+                if _is_cursor_acc(acc)
+                and (
+                    _canonical_key(acc) == key
+                    or _cursor_subject(acc) == identity
+                    or str(acc.get("email") or "") == identity
                 )
             ]
         if provider == "xai":
@@ -252,6 +268,8 @@ def account_key_to_email(account_key: str) -> str:
     except AmbiguousOAuthAccountKey:
         acc = None
     if acc is not None:
+        if _acc_provider(acc) == "cursor":
+            return str(acc.get("label") or acc.get("email") or "")
         return str(acc.get("email") or "")
     provider, identity = _split_ak(account_key)
     if provider in ("openai", "xai") and ":" in identity:
@@ -650,6 +668,10 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                 email=email,
                 subject=_xai_subject(acc) or None,
             )
+        elif provider == "cursor":
+            data = cursor_provider.refresh_sync(
+                acc["refresh_token"], account_key=account_key,
+            )
         elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
         else:
@@ -744,6 +766,17 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
             for k in ("subject", "sub", "base_url", "token_endpoint", "redirect_uri"):
                 if data.get(k):
                     new_fields[k] = data[k]
+
+        # Cursor: subject is the stable account key. Refresh must not silently
+        # move an existing account to another identity, but metadata-poor legacy
+        # entries may be completed once.
+        if provider == "cursor":
+            refreshed_subject = cursor_provider.subject_from_access_token(
+                new_fields["access_token"]
+            )
+            if refreshed_subject and not _cursor_subject(acc):
+                new_fields["subject"] = refreshed_subject
+                new_fields["sub"] = refreshed_subject
 
         # Claude: refresh 后 best-effort 拉 profile 更新套餐信息
         if provider == "claude":
@@ -932,6 +965,7 @@ async def fetch_usage(account_key: str) -> dict:
       - Claude / Anthropic: 调 /api/oauth/usage（零 token 成本，JSON body）
       - OpenAI (Codex)    : 调 ChatGPT backend-api/wham/usage（零 Codex 请求成本）
       - xAI / Grok        : 调 Grok CLI proxy billing/user/settings（零模型 token 成本）
+      - Cursor            : 调 DashboardService/GetCurrentPeriodUsage 等零模型端点
 
     返回：与 Anthropic 原生 `/oauth/usage` JSON 结构兼容的 dict（顶层含
     five_hour / seven_day / ...），让 extract_utils_percent / latest_reset_iso / flatten_usage
@@ -944,6 +978,9 @@ async def fetch_usage(account_key: str) -> dict:
 
     if provider == "xai":
         return await xai_provider.fetch_cli_billing_usage(access_token)
+
+    if provider == "cursor":
+        return await cursor_provider.fetch_usage(access_token, account_key=account_key)
 
     if provider != "openai":
         # Claude 路径：直接走 /api/oauth/usage
@@ -1291,7 +1328,17 @@ def usage_from_quota_row(row: dict) -> dict:
     def _block(util, reset):
         return {"utilization": util, "resets_at": reset} if util is not None else {}
 
-    return {
+    raw_cursor = None
+    raw_data = row.get("raw_data")
+    if isinstance(raw_data, str) and raw_data:
+        try:
+            raw_payload = json.loads(raw_data)
+            candidate = raw_payload.get("cursor") if isinstance(raw_payload, dict) else None
+            raw_cursor = candidate if isinstance(candidate, dict) else None
+        except Exception:
+            raw_cursor = None
+
+    result = {
         "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
         "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")),
         "openai": {
@@ -1306,6 +1353,9 @@ def usage_from_quota_row(row: dict) -> dict:
             "utilization": row.get("extra_util") or 0,
         },
     }
+    if raw_cursor is not None:
+        result["cursor"] = raw_cursor
+    return result
 
 
 def evaluate_and_toggle_by_cached_quota(account_key: str,
@@ -1328,6 +1378,10 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
         except Exception:
             threshold = 95.0
     usage = usage_from_quota_row(row)
+    if provider_of(account_key) == "cursor" and isinstance(usage.get("cursor"), dict):
+        return evaluate_and_toggle_by_usage(
+            account_key, usage, threshold=threshold, fresh=False,
+        )
     utils = extract_utils_percent(usage)
     if not any(u is not None and u >= threshold for u in utils):
         return {"action": "cached_below_threshold", "utils": utils,
@@ -1723,6 +1777,128 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
     }
 
 
+def _evaluate_cursor_model_pools(
+    account_key: str,
+    account: dict,
+    usage: dict,
+    *,
+    threshold: float,
+    fresh: bool,
+) -> dict:
+    """Cool only models belonging to an exhausted Cursor billing pool."""
+    from . import cooldown
+    from .cursor_bridge.catalog import catalog_records, is_cursor_first_party_model
+
+    cursor = usage.get("cursor") if isinstance(usage, dict) else None
+    if not isinstance(cursor, dict):
+        return {
+            "action": "cursor_quota_unknown",
+            "utils": [], "any_over": False, "hit_windows": [],
+            "disabled_until": None, "cooled_models": 0, "recovered_models": 0,
+        }
+
+    def pct(name: str) -> float | None:
+        try:
+            value = float(cursor.get(name))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and 0 <= value <= 100 else None
+
+    auto_pct = pct("auto_percent_used")
+    api_pct = pct("api_percent_used")
+    reset_iso = str(cursor.get("billing_cycle_end") or "") or None
+    reset_dt = _parse_iso(reset_iso)
+    reset_ms = int(reset_dt.timestamp() * 1000) if reset_dt is not None else None
+    now_ms = int(time.time() * 1000)
+    if reset_ms is not None and reset_ms <= now_ms:
+        reset_ms = None
+
+    auto_bucket = cursor.get("auto_bucket_models") or []
+    records = catalog_records(account)
+    cooled = 0
+    recovered = 0
+    over_pools: list[str] = []
+    channel_key = f"oauth:{account_key}"
+
+    for record in records:
+        model = str(record.get("id") or "")
+        if not model:
+            continue
+        pool = "cursor_models" if is_cursor_first_party_model(record, auto_bucket) else "other_models"
+        utilization = auto_pct if pool == "cursor_models" else api_pct
+        over = utilization is not None and utilization >= threshold
+        state = cooldown.get_state(channel_key, model) or {}
+        previous_message = str(state.get("last_error_message") or "")
+        owned = '"code":"cursor_quota_pool"' in previous_message or "cursor_quota_pool" in previous_message
+        same_pool = f'"pool":"{pool}"' in previous_message
+
+        if over:
+            if pool not in over_pools:
+                over_pools.append(pool)
+            # A percentage without a bounded reset must not create an indefinite
+            # model freeze. Real 429 responses still follow normal cooldown.
+            if reset_ms is None:
+                continue
+            if owned and same_pool and cooldown.is_blocked(channel_key, model):
+                continue
+            message = json.dumps({
+                "error": {
+                    "code": "cursor_quota_pool",
+                    "message": "Cursor billing pool reached configured threshold",
+                    "pool": pool,
+                    "utilization": utilization,
+                    "resets_at": reset_iso,
+                }
+            }, ensure_ascii=False, separators=(",", ":"))
+            cooldown.record_error(
+                channel_key, model, message, cooldown_until=reset_ms,
+            )
+            cooled += 1
+        elif fresh and owned:
+            cooldown.clear(
+                channel_key, model=model, notify_recovered=False,
+            )
+            recovered += 1
+
+    if cooled:
+        try:
+            notifier.notify_event(
+                "quota_cooldown",
+                "🟠 <b>Cursor 模型池已进入额度冷却</b>\n"
+                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('cursor')}\n"
+                f"额度池: <code>{notifier.escape_html(' / '.join(over_pools))}</code>\n"
+                f"冷却模型: <code>{cooled}</code>\n"
+                f"恢复时间: <code>{notifier.escape_html(_to_bjt(reset_iso))}</code>"
+            )
+        except Exception:
+            pass
+        action = "cursor_pool_cooldown"
+    elif recovered:
+        try:
+            notifier.notify_event(
+                "quota_resumed",
+                "♻️ <b>Cursor 模型池额度已恢复</b>\n"
+                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('cursor')}\n"
+                f"恢复模型: <code>{recovered}</code>"
+            )
+        except Exception:
+            pass
+        action = "cursor_pool_recovered"
+    elif over_pools:
+        action = "cursor_pool_still_cooling"
+    else:
+        action = "cursor_pool_available"
+    return {
+        "action": action,
+        "utils": [auto_pct, api_pct],
+        "any_over": bool(over_pools),
+        "hit_windows": over_pools,
+        "disabled_until": reset_iso if over_pools else None,
+        "cooled_models": cooled,
+        "recovered_models": recovered,
+    }
+
+
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
                                  fresh: bool = True) -> dict:
@@ -1782,6 +1958,15 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": f"noop_{reason}", "utils": utils, "any_over": any_over,
                 "hit_windows": hit_windows,
                 "disabled_until": acc.get("disabled_until")}
+
+    if provider == "cursor":
+        return _evaluate_cursor_model_pools(
+            account_key,
+            acc,
+            usage,
+            threshold=float(threshold),
+            fresh=fresh,
+        )
 
     # WHAM's explicit gate is authoritative even when its percentage windows
     # are absent or temporarily report a low number.  In particular, never turn
@@ -2229,7 +2414,7 @@ def _add_account_serialized(entry: dict) -> None:
     """entry 需至少含 email / access_token / refresh_token。
 
     支持可选字段：
-      - provider: "claude" (默认) / "openai" / "xai"
+      - provider: "claude" (默认) / "openai" / "xai" / "cursor"
       - id_token / chatgpt_account_id / workspace_id / workspace_name /
         workspace_type / organization_id / plan_type / subscription_expires_at /
         codexDeviceInstallationId / codexDeviceConvergenceEnabled
@@ -2255,7 +2440,7 @@ def _add_account_serialized(entry: dict) -> None:
         "refresh_token": entry["refresh_token"],
         "expired": entry.get("expired", ""),
         "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-        "type": entry.get("type", provider if provider in ("openai", "xai") else "claude"),
+        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor") else "claude"),
         "enabled": entry.get("enabled", True),
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
@@ -2278,6 +2463,21 @@ def _add_account_serialized(entry: dict) -> None:
             "token_endpoint": entry.get("token_endpoint") or xai_provider.token_url(),
             "redirect_uri": entry.get("redirect_uri") or xai_provider.redirect_uri(),
         })
+    # Cursor 专属字段。模型目录来自该账号自己的 AvailableModels，不能
+    # 与 models.dev 元数据合并，否则上下文和变体限制会失真。
+    elif provider == "cursor":
+        subject = str(entry.get("subject") or entry.get("sub") or "")
+        normalized.update({
+            "subject": subject,
+            "sub": subject,
+            "label": entry.get("label") or entry.get("email") or "Cursor",
+            "cursor_model_catalog": copy.deepcopy(entry.get("cursor_model_catalog") or {}),
+            "plan_type": entry.get("plan_type") or "",
+            "subscription_status": entry.get("subscription_status") or "",
+            "billing_cycle_start": entry.get("billing_cycle_start") or "",
+            "billing_cycle_end": entry.get("billing_cycle_end") or "",
+            "last_model_sync": entry.get("last_model_sync") or "",
+        })
     # Claude 专属字段（套餐/订阅信息，来自 /api/oauth/profile）
     elif provider == "claude":
         for k in ("plan_type", "rate_limit_tier", "billing_type",
@@ -2287,6 +2487,15 @@ def _add_account_serialized(entry: dict) -> None:
                 normalized[k] = entry[k]
 
     normalized_key = _account_key(normalized)
+
+    def _matches_cursor_target(acc: dict) -> bool:
+        if _acc_provider(acc) != "cursor":
+            return False
+        old_subject = _cursor_subject(acc)
+        new_subject = _cursor_subject(normalized)
+        if old_subject and new_subject:
+            return old_subject == new_subject
+        return str(acc.get("email") or "") == email
 
     def _matches_xai_target(acc: dict) -> bool:
         if _acc_provider(acc) != "xai":
@@ -2309,6 +2518,10 @@ def _add_account_serialized(entry: dict) -> None:
                 break
         elif provider == "xai":
             if _matches_xai_target(a):
+                existing_target = a
+                break
+        elif provider == "cursor":
+            if _matches_cursor_target(a):
                 existing_target = a
                 break
         elif a.get("email") == email and _acc_provider(a) == provider:
@@ -2343,6 +2556,11 @@ def _add_account_serialized(entry: dict) -> None:
                 if _matches_xai_target(a):
                     target = a
                     break
+        elif provider == "cursor":
+            for a in accounts:
+                if _matches_cursor_target(a):
+                    target = a
+                    break
         else:
             for a in accounts:
                 if a.get("email") == email and _acc_provider(a) == provider:
@@ -2350,7 +2568,7 @@ def _add_account_serialized(entry: dict) -> None:
                     break
 
         if target is not None:
-            if provider not in ("openai", "xai"):
+            if provider not in ("openai", "xai", "cursor"):
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
@@ -2358,11 +2576,18 @@ def _add_account_serialized(entry: dict) -> None:
             keep_max = target.get("maxConcurrent")
             keep_device_id = target.get("codexDeviceInstallationId")
             keep_device_enabled = target.get("codexDeviceConvergenceEnabled")
+            keep_enabled = target.get("enabled")
+            keep_disabled_reason = target.get("disabled_reason")
+            keep_disabled_until = target.get("disabled_until")
             target.update(normalized)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
+            if provider == "cursor" and keep_disabled_reason in {"user", "quota"}:
+                target["enabled"] = keep_enabled
+                target["disabled_reason"] = keep_disabled_reason
+                target["disabled_until"] = keep_disabled_until
             # Same canonical OpenAI workspace reimport preserves omitted
             # device identity and explicit opt-out state.
             if (
@@ -2520,6 +2745,12 @@ def _delete_account_serialized(account_key: str) -> None:
                 pass
             # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
             forget_openai_probe(cleanup_key)
+            if cleanup_key.startswith("cursor:"):
+                try:
+                    from .cursor_bridge import runtime as cursor_bridge_runtime
+                    cursor_bridge_runtime.drop_account(cleanup_key)
+                except Exception:
+                    pass
 
 
 _EXPECTED_REASON_UNSET = object()
@@ -2984,6 +3215,110 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
         print(f"[oauth] ensure_openai_metadata_fresh_sync error: {exc}")
 
 
+def refresh_cursor_models_sync(
+    account_key: str,
+    *,
+    force: bool = False,
+    min_interval_seconds: int | None = None,
+) -> dict:
+    """Refresh one Cursor account's canonical models and native metadata."""
+    canonical = _resolve_existing_account_key(account_key)
+    if canonical:
+        account_key = canonical
+    acc = get_account(account_key)
+    if acc is None:
+        return {"action": "noop_missing", "account_key": account_key}
+    if provider_of(acc) != "cursor":
+        return {"action": "noop_not_cursor", "account_key": _canonical_key(acc)}
+
+    cfg = config.get().get("cursorOAuth") or {}
+    if min_interval_seconds is None:
+        min_interval_seconds = int(float(cfg.get("modelSyncHours", 6) or 6) * 3600)
+    if not force:
+        last = _parse_iso(acc.get("last_model_sync"))
+        if last is not None:
+            age = (datetime.now(timezone.utc) - last.astimezone(timezone.utc)).total_seconds()
+            if age < max(0, int(min_interval_seconds)):
+                return {"action": "skipped_fresh", "account_key": account_key, "age_seconds": int(age)}
+
+    access_token = str(acc.get("access_token") or "")
+    if not access_token:
+        return {"action": "skipped_no_access_token", "account_key": account_key}
+    catalog = cursor_provider.fetch_model_catalog_sync(access_token)
+    records = (catalog.get("models") or []) if isinstance(catalog, dict) else []
+    models = [str(item.get("id") or "") for item in records if isinstance(item, dict) and item.get("id")]
+    if not models:
+        return {"action": "fetch_empty", "account_key": account_key}
+    fetched_at = str(catalog.get("fetched_at") or _format_utc(datetime.now(timezone.utc)))
+
+    def mutate(current_cfg):
+        for item in current_cfg.get("oauthAccounts", []):
+            if _canonical_key(item) == account_key:
+                item["models"] = list(dict.fromkeys(models))
+                item["cursor_model_catalog"] = copy.deepcopy(catalog)
+                item["last_model_sync"] = fetched_at
+                return
+
+    config.update(mutate)
+    return {
+        "action": "updated",
+        "account_key": account_key,
+        "models": len(models),
+        "fetched_at": fetched_at,
+    }
+
+
+async def refresh_cursor_models(
+    account_key: str,
+    *,
+    force: bool = False,
+    min_interval_seconds: int | None = None,
+    timeout_s: float = 30.0,
+) -> dict:
+    try:
+        account_key = _resolve_existing_account_key_or_raise(account_key)
+        await ensure_valid_token(account_key)
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                refresh_cursor_models_sync,
+                account_key,
+                force=force,
+                min_interval_seconds=min_interval_seconds,
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        return {"action": "timeout", "account_key": account_key}
+    except Exception as exc:
+        return {"action": "error", "account_key": account_key, "error": str(exc)}
+
+
+async def cursor_model_sync_once(*, force: bool = False) -> list[dict]:
+    keys = [
+        _account_key(acc) for acc in list_accounts()
+        if provider_of(acc) == "cursor" and acc.get("enabled", True)
+    ]
+    if not keys:
+        return []
+    return await asyncio.gather(*[
+        refresh_cursor_models(key, force=force) for key in keys
+    ])
+
+
+async def cursor_model_sync_loop() -> None:
+    while True:
+        try:
+            cfg = config.get().get("cursorOAuth") or {}
+            interval = max(300, int(float(cfg.get("modelSyncHours", 6) or 6) * 3600))
+            await cursor_model_sync_once(force=False)
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[cursor] model sync loop failed: {exc}")
+            await asyncio.sleep(300)
+
+
 def update_models(account_key: str, models: list[str]) -> None:
     canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
@@ -3095,7 +3430,7 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
     # 用量
     if prov == "openai":
         parts.append("📊 用量: <i>由响应头更新（无独立端点）</i>")
-    elif prov == "xai":
+    elif prov in {"xai", "cursor"}:
         td_util = (usage_flat or {}).get("thirty_day_util") if usage_flat else None
         td_reset = (usage_flat or {}).get("thirty_day_reset") if usage_flat else None
         if td_util is not None:
@@ -3164,7 +3499,10 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         if not email:
             continue
         ak = _account_key(acc)
-        disp = email  # 通知里仍用 email 作人类可读
+        disp = (
+            str(acc.get("label") or email)
+            if provider_of(acc) == "cursor" else email
+        )
         if not acc.get("enabled", True):
             out[email] = "skipped:disabled"
             continue
@@ -3235,6 +3573,9 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             elif provider_of(ak) == "openai":
                 _rf_pl = acc.get("plan_type") or ""
                 _rf_plan_tag = f"\n{notifier.provider_tag('openai')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
+            elif provider_of(ak) == "cursor":
+                _rf_pl = acc.get("plan_type") or ""
+                _rf_plan_tag = f"\n{notifier.provider_tag('cursor')} · {notifier.escape_html(_rf_pl)}" if _rf_pl else ""
             notifier.notify_event(
                 "oauth_refresh_failed",
                 "⚠ <b>OAuth Token 刷新失败</b>\n"
@@ -3301,6 +3642,8 @@ async def quota_monitor_once() -> dict:
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('openai')} {notifier.escape_html(_label)}" if _label else ""
         elif provider == "xai":
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
+        elif provider == "cursor":
+            _plan_tag = f"\n{notifier.provider_tag('cursor')} · {notifier.escape_html(str(acc.get('plan_type') or 'Cursor'))}"
 
         if action in ("disabled", "wham_limit_disabled"):
             latest_reset = result["disabled_until"]

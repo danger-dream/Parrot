@@ -189,7 +189,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
     account_keys = [
         _account_key(a) for a in cfg.get("oauthAccounts", [])
         if a.get("email") and not a.get("disabled_reason")
-        and oauth_manager.provider_of(a) in ("claude", "openai", "xai")
+        and oauth_manager.provider_of(a) in ("claude", "openai", "xai", "cursor")
     ]
     if account_keys:
         oauth_manager.ensure_quota_fresh_sync(account_keys)
@@ -226,6 +226,15 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
         elif provider == "xai":
             # Grok/xAI: 官方 weekly credits 映射到通用 7d 缓存列。
             utils = {"周额度": row.get("seven_day_util")}
+        elif provider == "cursor":
+            usage = oauth_manager.usage_from_quota_row(row)
+            cursor = usage.get("cursor") if isinstance(usage.get("cursor"), dict) else {}
+            utils = {
+                "总额度": cursor.get("total_utilization"),
+                "Cursor Models": cursor.get("auto_percent_used"),
+                "Other Models": cursor.get("api_percent_used"),
+            }
+            email = str(acc.get("label") or email)
         else:
             continue
         hot = [(k, v) for k, v in utils.items() if v is not None and v >= threshold_pct]

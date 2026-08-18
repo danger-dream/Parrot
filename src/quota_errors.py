@@ -102,8 +102,16 @@ def zhipu_1310_reset_ms(
     return reset_ms
 
 
+def is_cursor_pool_quota_message(detail: str | None) -> bool:
+    code, _message = _error_fields(detail)
+    return code == "cursor_quota_pool" or "cursor_quota_pool" in str(detail or "")
+
+
 def active_quota_cooldown(entry: dict | None, *, now_ms: int | None = None) -> bool:
-    if not isinstance(entry, dict) or not is_zhipu_1310_message(entry.get("last_error_message")):
+    if not isinstance(entry, dict):
+        return False
+    detail = entry.get("last_error_message")
+    if not (is_zhipu_1310_message(detail) or is_cursor_pool_quota_message(detail)):
         return False
     try:
         until = int(entry.get("cooldown_until"))

@@ -1116,7 +1116,13 @@ def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[
     Direct remains the normal default when no new-proxy route exists.  Once a
     non-direct route is configured, parser/connector failures are fail-closed
     unless the user explicitly enabled ``routing.directFallback``.
+
+    Process-private loopback bridges are never sent through an external model
+    proxy. Their own provider transport owns any upstream routing policy.
     """
+    if bool(getattr(channel, "internal_loopback", False)):
+        return [("direct", None)], None
+
     from ..proxy import manager as pm
 
     configured = False
@@ -1305,6 +1311,21 @@ async def open_response_with_proxy_chain(
         route_log_name = str(route_name) if connector is not None else "direct"
         proxy_bytes = _new_proxy_bytes()
         client = upstream.get_client()
+        if bool(getattr(channel, "internal_loopback", False)):
+            # The shared client may carry legacy SOCKS settings. A process-local
+            # bridge must always use a short-lived trust_env=False direct client.
+            proxy_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=round_timeouts.connection + 0.5,
+                    read=max(330.0, round_timeouts.total + 1.0),
+                    write=30.0,
+                    pool=round_timeouts.connection + 0.5,
+                ),
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                trust_env=False,
+                http2=False,
+            )
+            client = proxy_client
         proxy_attempt_id = None
         proxy_attempt_order += 1
         proxy_started_at = time.time()

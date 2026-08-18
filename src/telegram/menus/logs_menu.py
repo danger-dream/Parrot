@@ -41,6 +41,19 @@ def _retry_chain_mark(outcome: str) -> str:
     return "❌"
 
 
+def _attempt_outbound_model(attempt: dict) -> str:
+    raw = attempt.get("binding_json")
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return ""
+    dispatch = payload.get("dispatch") if isinstance(payload, dict) else None
+    value = dispatch.get("outbound_model_id") if isinstance(dispatch, dict) else None
+    return str(value or "").strip()
+
+
 def _retry_chain_label(outcome: str) -> str:
     labels = {
         "success": "成功",
@@ -842,7 +855,12 @@ def _render_detail(detail: dict) -> str:
     for c in chain:
         order = c.get("attempt_order") or "?"
         ch = ui.escape_html(_detail_inline(ui.channel_display_name(c.get("channel_key") or "?", with_family=True)))
-        model = ui.escape_html(_detail_inline(c.get("model")))
+        model_raw = _detail_inline(c.get("model"))
+        outbound_model = _attempt_outbound_model(c)
+        model = ui.escape_html(
+            f"{model_raw} → {outbound_model}"
+            if outbound_model and outbound_model != model_raw else model_raw
+        )
         outcome = _detail_inline(c.get("outcome"))
         mark = _retry_chain_mark(outcome)
         label = ui.escape_html(_retry_chain_label(outcome))
