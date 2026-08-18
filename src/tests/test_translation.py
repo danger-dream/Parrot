@@ -39,7 +39,9 @@ from src.channel import registry
 
 @pytest.fixture(autouse=True)
 def _fresh_translation():
-    """每个测试前重置翻译层状态。"""
+    """每个测试前重置翻译层状态，并恢复临时渠道注册表。"""
+    with registry._lock:
+        previous_channels = dict(registry._channels)
     translation.init()
     translation.clear_cache()
     translation._consecutive_failures = 0
@@ -63,6 +65,8 @@ def _fresh_translation():
     }))
     yield
     translation.clear_cache()
+    with registry._lock:
+        registry._channels = previous_channels
 
 
 # ─── 缓存层 ──────────────────────────────────────────────────────
