@@ -488,6 +488,9 @@ def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
     )
     assert "累计金额：$0.12（Cursor 官方事件）" in actual_detail
 
+    mixed = {**reconciled, "unpriced_success": 1}
+    assert "另 1 次未计价" in oauth_menu._format_cursor_local_cost(mixed)
+
 
 def test_cursor_telegram_badge_uses_custom_emoji():
     emoji_id = "6062261319426390107"

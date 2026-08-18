@@ -988,7 +988,7 @@ def _format_cursor_local_cost(stats: dict | None, *, model_row: bool = False) ->
     if actual > 0:
         amount = ui.fmt_cost(data)
         if unpriced > 0:
-            return f"{amount}（官方已对账 {actual} 次 · 待对账 {unpriced} 次）"
+            return f"{amount}（官方已对账 {actual} 次 · 另 {unpriced} 次未计价）"
         return f"{amount}（Cursor 官方事件）"
     return "未计价" if model_row else "未计价（Cursor 官方账单见上方）"
 
