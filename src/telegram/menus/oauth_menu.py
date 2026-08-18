@@ -975,7 +975,7 @@ def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str
             f"💰 额外消费上限: {money(spend.get('limit_cents'))} · "
             f"剩余 {money(spend.get('remaining_cents'))}"
         )
-    if row and row.get("fetched_at"):
+    if detail and row and row.get("fetched_at"):
         dt = datetime.fromtimestamp(row["fetched_at"] / 1000, tz=_BJT)
         lines.append(f"<i>更新于 {dt.strftime('%H:%M:%S')}</i>")
     return "\n".join(lines) if lines else "📊 Cursor 额度: <i>无有效数据</i>"

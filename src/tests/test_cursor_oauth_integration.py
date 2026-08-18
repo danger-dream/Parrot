@@ -432,6 +432,30 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     assert "Cursor OAuth 账户已添加" in edits[-1][0]
 
 
+def test_cursor_quota_updated_at_is_detail_only(monkeypatch):
+    row = {
+        "fetched_at": 1_787_046_392_000,
+        "raw_data": json.dumps({
+            "cursor": {
+                "limit_cents": 40_000,
+                "remaining_cents": 39_330,
+                "total_spend_cents": 670,
+                "total_utilization": 1.675,
+                "billing_cycle_end": "2026-09-16T15:56:39Z",
+            },
+        }),
+    }
+    monkeypatch.setattr(state_db, "quota_load", lambda _account_key: row)
+    list_block = oauth_menu._format_cursor_usage_block(
+        "cursor:cursor-user-1", detail=False,
+    )
+    detail_block = oauth_menu._format_cursor_usage_block(
+        "cursor:cursor-user-1", detail=True,
+    )
+    assert "更新于" not in list_block
+    assert "更新于" in detail_block
+
+
 def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
     account = _install_account()
     account_key = "cursor:cursor-user-1"
