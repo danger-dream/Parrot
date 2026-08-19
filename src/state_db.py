@@ -5,12 +5,15 @@
 thread-local，WAL 模式。
 """
 
+import fcntl
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Iterable
 
 from . import config
@@ -21,6 +24,68 @@ _local = threading.local()
 _write_lock = threading.RLock()
 _initialized = False
 _db_path: str | None = None
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_corruption_event = threading.Event()
+_corruption_lock = threading.Lock()
+_corruption_reason = ""
+_recovery_restart_requested = False
+_bootstrap_recovery_report: dict[str, Any] | None = None
+
+
+def _record_corruption_reason(reason: str) -> None:
+    global _corruption_reason
+    with _corruption_lock:
+        if not _corruption_event.is_set():
+            _corruption_reason = str(reason or "state database corruption")
+            print(f"[state_db] corruption detected: {_corruption_reason}")
+        _corruption_event.set()
+
+
+def _mark_database_error(exc: BaseException) -> None:
+    """Record only SQLite corruption/not-a-database failures for the watchdog."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    base_code = (int(code) & 0xFF) if isinstance(code, int) else None
+    message = str(exc).strip()
+    lowered = message.lower()
+    if base_code not in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB} and not any(
+        marker in lowered
+        for marker in ("file is not a database", "database disk image is malformed")
+    ):
+        return
+    _record_corruption_reason(message or type(exc).__name__)
+
+
+class _StateConnection(sqlite3.Connection):
+    """Connection that reports corruption from normal state reads and writes."""
+
+    def execute(self, *args, **kwargs):
+        try:
+            return super().execute(*args, **kwargs)
+        except sqlite3.DatabaseError as exc:
+            _mark_database_error(exc)
+            raise
+
+    def executemany(self, *args, **kwargs):
+        try:
+            return super().executemany(*args, **kwargs)
+        except sqlite3.DatabaseError as exc:
+            _mark_database_error(exc)
+            raise
+
+    def executescript(self, *args, **kwargs):
+        try:
+            return super().executescript(*args, **kwargs)
+        except sqlite3.DatabaseError as exc:
+            _mark_database_error(exc)
+            raise
+
+    def commit(self):
+        try:
+            return super().commit()
+        except sqlite3.DatabaseError as exc:
+            _mark_database_error(exc)
+            raise
 
 
 def _resolve_db_path() -> str:
@@ -129,6 +194,216 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_expires ON xai_video_jobs(expires_at);
     CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_channel ON xai_video_jobs(channel_key);
     """
+
+
+def _readonly_uri(path: str) -> str:
+    return Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+
+
+def _validate_sqlite_file(
+    path: str, *, unavailable_is_invalid: bool = False
+) -> tuple[bool, str]:
+    """Validate one closed SQLite file without creating or modifying it.
+
+    A busy/permission/I/O failure is not proof of corruption.  Live database
+    validation therefore raises instead of quarantining a possibly healthy
+    file; backup discovery may opt into treating unavailable candidates as
+    unusable and continue to an older snapshot.
+    """
+    if not os.path.exists(path):
+        return False, "database file is missing"
+    if not os.path.isfile(path):
+        return False, "database path is not a regular file"
+    try:
+        if os.path.getsize(path) == 0:
+            return False, "database file is empty"
+        with open(path, "rb") as f:
+            header = f.read(len(_SQLITE_MAGIC))
+        if header != _SQLITE_MAGIC:
+            return False, f"invalid SQLite header: {header[:8].hex()}"
+        conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=10)
+        try:
+            rows = conn.execute("PRAGMA quick_check(1)").fetchall()
+        finally:
+            conn.close()
+        checks = [str(row[0]) for row in rows]
+        if checks != ["ok"]:
+            return False, "; ".join(checks[:5]) or "quick_check returned no result"
+        return True, "ok"
+    except (OSError, sqlite3.DatabaseError) as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        base_code = (int(code) & 0xFF) if isinstance(code, int) else None
+        lowered = str(exc).lower()
+        if base_code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB} or any(
+            marker in lowered
+            for marker in ("file is not a database", "database disk image is malformed")
+        ):
+            return False, str(exc) or type(exc).__name__
+        if unavailable_is_invalid:
+            return False, str(exc) or type(exc).__name__
+        raise RuntimeError(f"state database validation unavailable: {exc}") from exc
+
+
+def _state_backup_candidates(source_path: str) -> list[str]:
+    root = os.path.join(config.DATA_DIR, "backups")
+    if not os.path.isdir(root):
+        return []
+    source_abs = os.path.abspath(source_path)
+    candidates: set[str] = set()
+    for pattern in ("*.state.db", "state-db-pre-*.db"):
+        for path in Path(root).glob(pattern):
+            candidate = os.path.abspath(str(path))
+            if candidate != source_abs and os.path.isfile(candidate):
+                candidates.add(candidate)
+    return sorted(candidates, key=lambda path: os.path.getmtime(path), reverse=True)
+
+
+def _fsync_file_and_parent(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def bootstrap_recover() -> dict[str, Any] | None:
+    """Before opening state.db, preserve and recover an invalid database.
+
+    A verified update-time Online Backup is preferred.  Without one, the
+    corrupt runtime-state database is quarantined and ``init()`` creates a new
+    database; authoritative config, request logs and response stores are not
+    part of state.db.
+    """
+    global _bootstrap_recovery_report, _corruption_reason
+    path = os.path.abspath(_resolve_db_path())
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lock_path = path + ".recovery.lock"
+    with open(lock_path, "a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        sidecars = [path + "-wal", path + "-shm"]
+        if not os.path.exists(path) and not any(os.path.exists(p) for p in sidecars):
+            _bootstrap_recovery_report = None
+            return None
+
+        valid, reason = _validate_sqlite_file(path)
+        if valid:
+            _bootstrap_recovery_report = None
+            return None
+
+        backup_root = os.path.join(config.DATA_DIR, "backups")
+        os.makedirs(backup_root, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        quarantine = os.path.join(backup_root, f"state-db-corrupt-{ts}-{os.getpid()}")
+        os.makedirs(quarantine, mode=0o700, exist_ok=False)
+        preserved: list[str] = []
+        for source in (path, *sidecars):
+            if not os.path.exists(source):
+                continue
+            destination = os.path.join(quarantine, os.path.basename(source))
+            shutil.move(source, destination)
+            preserved.append(destination)
+
+        restored_from = ""
+        for candidate in _state_backup_candidates(path):
+            candidate_ok, _candidate_reason = _validate_sqlite_file(
+                candidate, unavailable_is_invalid=True
+            )
+            if not candidate_ok:
+                continue
+            tmp = f"{path}.recover-{os.getpid()}.tmp"
+            try:
+                shutil.copy2(candidate, tmp)
+                copied_ok, copied_reason = _validate_sqlite_file(tmp)
+                if not copied_ok:
+                    raise RuntimeError(f"copied backup validation failed: {copied_reason}")
+                os.chmod(tmp, 0o600)
+                _fsync_file_and_parent(tmp)
+                os.replace(tmp, path)
+                _fsync_file_and_parent(path)
+                restored_from = candidate
+                break
+            finally:
+                try:
+                    os.remove(tmp)
+                except FileNotFoundError:
+                    pass
+
+        report: dict[str, Any] = {
+            "reason": reason,
+            "database": path,
+            "quarantine": quarantine,
+            "preserved": preserved,
+            "action": "restored" if restored_from else "recreated",
+            "restored_from": restored_from or None,
+            "timestamp": ts,
+        }
+        manifest = os.path.join(quarantine, "RECOVERY.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        _bootstrap_recovery_report = report
+        with _corruption_lock:
+            _corruption_reason = ""
+            _corruption_event.clear()
+        print(
+            f"[state_db] invalid database preserved at {quarantine}; "
+            f"action={report['action']} restored_from={restored_from or '-'} reason={reason}"
+        )
+        return dict(report)
+
+
+def bootstrap_recovery_report() -> dict[str, Any] | None:
+    return dict(_bootstrap_recovery_report) if _bootstrap_recovery_report else None
+
+
+def runtime_corruption_reason() -> str:
+    """Return a corruption reason recorded by SQLite or a header probe."""
+    if _corruption_event.is_set():
+        with _corruption_lock:
+            return _corruption_reason or "state database corruption"
+    path = _db_path
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(len(_SQLITE_MAGIC))
+    except OSError as exc:
+        _record_corruption_reason(f"state database header read failed: {exc}")
+    else:
+        if header != _SQLITE_MAGIC:
+            _record_corruption_reason(f"invalid SQLite header: {header[:8].hex()}")
+    if _corruption_event.is_set():
+        with _corruption_lock:
+            return _corruption_reason or "state database corruption"
+    return ""
+
+
+def request_recovery_restart(reason: str) -> None:
+    global _recovery_restart_requested
+    _record_corruption_reason(reason)
+    _recovery_restart_requested = True
+
+
+def recovery_restart_requested() -> bool:
+    return _recovery_restart_requested
+
+
+def _reset_recovery_state_for_tests() -> None:
+    global _corruption_reason, _recovery_restart_requested, _bootstrap_recovery_report
+    with _corruption_lock:
+        _corruption_reason = ""
+        _corruption_event.clear()
+    _recovery_restart_requested = False
+    _bootstrap_recovery_report = None
 
 
 def init() -> None:
@@ -667,7 +942,7 @@ def _get_conn() -> sqlite3.Connection:
     if getattr(_local, "conn", None) is None:
         if _db_path is None:
             raise RuntimeError("state_db.init() not called")
-        conn = sqlite3.connect(_db_path, timeout=10)
+        conn = sqlite3.connect(_db_path, timeout=10, factory=_StateConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")

@@ -104,3 +104,62 @@ def test_shutdown_closes_state_db_even_when_checkpoint_fails(monkeypatch):
         ("checkpoint", {"mode": "FULL", "strict": True}),
         ("close", {}),
     ]
+
+
+def test_recovery_restart_preserves_corrupt_db_without_final_checkpoint(monkeypatch):
+    calls = []
+    parrot_server.state_db._reset_recovery_state_for_tests()
+    parrot_server.state_db.request_recovery_restart("file is not a database")
+    monkeypatch.setattr(
+        parrot_server.state_db,
+        "checkpoint",
+        lambda **kwargs: calls.append(("checkpoint", kwargs)),
+    )
+    monkeypatch.setattr(
+        parrot_server.state_db,
+        "close",
+        lambda: calls.append(("close", {})),
+    )
+    try:
+        assert parrot_server._finalize_state_db() is True
+        assert calls == []
+    finally:
+        parrot_server.state_db._reset_recovery_state_for_tests()
+
+
+def test_state_db_health_loop_requests_graceful_recovery_restart(monkeypatch):
+    calls = []
+    parrot_server.state_db._reset_recovery_state_for_tests()
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(parrot_server.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(
+        parrot_server.state_db,
+        "runtime_corruption_reason",
+        lambda: "file is not a database",
+    )
+    monkeypatch.setattr(
+        parrot_server.notifier,
+        "notify_event",
+        lambda event, text: calls.append(("notify", event, text)),
+    )
+    monkeypatch.setattr(
+        parrot_server.drain,
+        "begin",
+        lambda reason: calls.append(("drain", reason)),
+    )
+    monkeypatch.setattr(
+        parrot_server.os,
+        "kill",
+        lambda pid, sig: calls.append(("kill", pid, sig)),
+    )
+    try:
+        asyncio.run(parrot_server._state_db_health_loop())
+        assert parrot_server.state_db.recovery_restart_requested() is True
+        assert calls[0][0:2] == ("notify", "database_recovery")
+        assert ("drain", "state_db_corruption") in calls
+        assert ("kill", parrot_server.os.getpid(), signal.SIGTERM) in calls
+    finally:
+        parrot_server.state_db._reset_recovery_state_for_tests()

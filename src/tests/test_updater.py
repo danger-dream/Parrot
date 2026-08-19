@@ -273,6 +273,74 @@ class TestUpdateLog:
 
 # ─── sidecar 脚本生成（关键安全要素）──────────────────────────────
 
+
+def _run_fake_sidecar_script(tmp_path, monkeypatch, *, stay_running: bool = False):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    state = tmp_path / "docker-state"
+    state.write_text("true")
+    command_log = tmp_path / "docker-commands.log"
+    docker = bindir / "docker"
+    docker.write_text(
+        """#!/bin/sh
+set -eu
+echo "$*" >> "$FAKE_DOCKER_LOG"
+state="$(cat "$FAKE_DOCKER_STATE")"
+if [ "$1" = "compose" ]; then
+  if [ "${2:-}" = "config" ] && [ "${3:-}" = "--services" ]; then echo parrot; exit 0; fi
+  if [ "${2:-}" = "config" ]; then exit 0; fi
+  if [ "${2:-}" = "up" ]; then echo true > "$FAKE_DOCKER_STATE"; exit 0; fi
+fi
+if [ "$1" = "inspect" ]; then
+  if [ "$state" = "absent" ]; then exit 1; fi
+  if [ "${2:-}" = "-f" ]; then echo "$state"; fi
+  exit 0
+fi
+if [ "$1" = "kill" ]; then
+  if [ "${FAKE_STAY_RUNNING:-0}" != "1" ]; then echo false > "$FAKE_DOCKER_STATE"; fi
+  exit 0
+fi
+if [ "$1" = "rm" ]; then
+  [ "$state" != "true" ] || exit 1
+  echo absent > "$FAKE_DOCKER_STATE"
+  exit 0
+fi
+if [ "$1" = "exec" ] || [ "$1" = "tag" ] || [ "$1" = "logs" ]; then exit 0; fi
+exit 1
+"""
+    )
+    docker.chmod(0o755)
+    sleep = bindir / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n")
+    sleep.chmod(0o755)
+    (tmp_path / "data").mkdir()
+
+    cfg = updater._cfg()
+    cfg.update({
+        "composeDir": str(tmp_path),
+        "composeService": "parrot",
+        "containerName": "parrot",
+        "image": "ghcr.io/danger-dream/parrot:latest",
+        "gracefulStopSeconds": 10,
+        "healthTimeoutSeconds": 30,
+    })
+    monkeypatch.setattr(updater, "_cfg", lambda: cfg)
+    script = updater._compose_up_inner(backup_digest="sha256:old")
+    env = dict(_os.environ)
+    env.update({
+        "PATH": str(bindir) + _os.pathsep + env.get("PATH", ""),
+        "FAKE_DOCKER_STATE": str(state),
+        "FAKE_DOCKER_LOG": str(command_log),
+        "FAKE_STAY_RUNNING": "1" if stay_running else "0",
+    })
+    result = subprocess.run(
+        ["sh", "-c", script], cwd=tmp_path, env=env, text=True,
+        capture_output=True, timeout=10,
+    )
+    commands = command_log.read_text().splitlines()
+    return result, commands, state.read_text().strip(), tmp_path / "data" / ".update_result"
+
+
 class TestComposeUpInner:
     def test_contains_safety_elements(self):
         config.update(lambda c: c["updateChecker"].__setitem__("runtimeMode", "docker"))
@@ -280,11 +348,11 @@ class TestComposeUpInner:
         script = updater._compose_up_inner(backup_digest="sha256:deadbeef")
         # 校验 compose 合法
         assert "docker compose config" in script
-        # service 名预检必须在 rm 旧容器之前完成；配置失配时不能先停服务再 no such service
+        # service 名预检必须在停止旧容器之前完成；配置失配时不能先停服务再 no such service
         assert "docker compose config --services" in script
         assert "resolve_service" in script
         assert "com.docker.compose.service" in script
-        assert script.index("\nresolve_service\n") < script.index("# ③ stop+rm")
+        assert script.index("\nresolve_service\n") < script.index("# ③ SIGTERM")
         # 重建/回滚都使用解析后的 service，而不是把可能过期的配置值写死进 compose up
         assert 'docker compose up -d --force-recreate "$SVC"' in script
         # 健康门控
@@ -298,8 +366,60 @@ class TestComposeUpInner:
         assert "ROLLBACK_FAILED" in script
         # 成功标记
         assert "OK" in script
-        # 关键：不再使用 rename 留存（会被 compose label 误重建）
+        # 关键：不用 rename 留存，也不强制移除运行中的 Parrot。
         assert "rename" not in script
+        assert 'docker kill --signal=TERM "$NAME"' in script
+        assert 'docker rm "$NAME"' in script
+        assert 'docker rm -f "$NAME"' not in script
+        assert "拒绝使用 SIGKILL" in script
+
+    def test_generated_sidecar_gracefully_stops_before_remove_and_recreate(
+        self, tmp_path, monkeypatch
+    ):
+        result, commands, state, result_file = _run_fake_sidecar_script(
+            tmp_path, monkeypatch
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        term_index = commands.index("kill --signal=TERM parrot")
+        rm_index = commands.index("rm parrot")
+        up_index = commands.index("compose up -d --force-recreate parrot")
+        assert term_index < rm_index < up_index
+        assert all("rm -f" not in command for command in commands)
+        assert state == "true"
+        assert result_file.read_text().strip() == "OK"
+
+    def test_generated_sidecar_aborts_instead_of_force_killing_on_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        result, commands, state, result_file = _run_fake_sidecar_script(
+            tmp_path, monkeypatch, stay_running=True
+        )
+        assert result.returncode != 0
+        assert "kill --signal=TERM parrot" in commands
+        assert "rm parrot" not in commands
+        assert not any(command.startswith("compose up") for command in commands)
+        assert all("rm -f" not in command for command in commands)
+        assert state == "true"
+        assert result_file.read_text().strip() == "ROLLBACK"
+
+    def test_graceful_stop_timeout_follows_drain_timeout(self, monkeypatch):
+        cfg = updater._cfg()
+        cfg["gracefulStopSeconds"] = 57
+        monkeypatch.setattr(updater, "_cfg", lambda: cfg)
+        script = updater._compose_up_inner(backup_digest="sha256:x")
+        assert "等待 Parrot 优雅退出（最多 57s）" in script
+        assert "容器未在 57s 内优雅退出" in script
+
+    def test_deploy_script_never_force_removes_parrot(self):
+        root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+        path = _os.path.join(root, "deploy.sh")
+        if not _os.path.exists(path):
+            pytest.skip("deploy.sh is intentionally excluded from the runtime image")
+        with open(path, encoding="utf-8") as f:
+            deploy = f.read()
+        assert "graceful_remove_container" in deploy
+        assert "docker kill --signal=TERM" in deploy
+        assert "docker rm -f" not in deploy
 
     def test_health_tries_from_config(self):
         config.update(lambda c: c["updateChecker"].__setitem__("healthTimeoutSeconds", 30))

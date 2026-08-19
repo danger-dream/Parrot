@@ -107,7 +107,9 @@ def _backup_root() -> str:
 # ─── 配置 ────────────────────────────────────────────────────────
 
 def _cfg() -> dict:
-    uc = config.get().get("updateChecker") or {}
+    root = config.get()
+    uc = root.get("updateChecker") or {}
+    shutdown = root.get("shutdown") or {}
     return {
         "autoUpdate": bool(uc.get("autoUpdate", False)),
         "repo": str(uc.get("repo") or "danger-dream/Parrot").strip(),
@@ -118,6 +120,9 @@ def _cfg() -> dict:
         "image": str(uc.get("image") or "ghcr.io/danger-dream/parrot:latest").strip(),
         "keepBackups": int(uc.get("keepBackups", 5) or 5),
         "healthTimeoutSeconds": int(uc.get("healthTimeoutSeconds", 90) or 90),
+        "gracefulStopSeconds": max(
+            10, min(600, int(shutdown.get("drainTimeoutSeconds", 80) or 80) + 20)
+        ),
         "updaterImage": str(uc.get("updaterImage") or "docker:cli").strip(),
     }
 
@@ -652,8 +657,8 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     """sidecar 内执行的"重建 + 健康门控 + 自动回滚"脚本。
 
     docker 自更新的两个固有难题，都在 sidecar 侧解决：
-    1) 名字冲突：发起更新时旧容器仍在跑，compose up 撞名 → 先 `docker rm -f` 旧容器
-       （秒级停机，单实例自更新的固有代价）。
+    1) 名字冲突：发起更新时旧容器仍在跑，compose up 会撞名 → 先发送 SIGTERM，
+       等待 Parrot 排空请求并完成数据库收尾，再移除已停止的旧容器。
     2) 新容器崩溃谁来回滚：新版若起不来，容器内的 resume 跑不了 → 由 sidecar 承担
        健康检查；失败则把 image tag 指回备份 digest 并重建旧版，写回滚标记到 data。
 
@@ -668,6 +673,7 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     cdir = _docker_compose_dir()
     flag_dir = f"{cdir}/data"   # sidecar 挂的是 composeDir:composeDir，真实路径在这
     tries = max(10, min(60, int(cfg.get("healthTimeoutSeconds", 90) or 90) // 3))
+    stop_tries = max(10, min(600, int(cfg.get("gracefulStopSeconds", 100) or 100)))
     log = f"{flag_dir}/.update_log"
 
     # 这些值来自用户部署环境/config，虽然正常情况下只会是 parrot/镜像名/绝对路径，
@@ -683,7 +689,7 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
     # 零裸奔重建策略（修订版，避开 rename+compose label 冲突）：
     #   ① 先 `compose config` 校验 compose 合法——不合法直接放弃，**完全不动旧容器**。
     #   ② 旧容器的镜像 digest 已在 stage 阶段备份（backup_digest）= 回滚锚点。
-    #   ③ stop+rm 旧容器 → compose up 起新容器（compose 靠 service label 管理，
+    #   ③ SIGTERM + 等待退出 + rm 已停止容器 → compose up 起新容器（compose 靠 service label 管理，
     #      不能用 rename 留存——rename 后 compose 仍能通过 label 找回它并误重建）。
     #   ④ 健康门控。
     #   ⑤ 失败：把镜像 tag 指回备份 digest，compose up 重建旧版本，并**再次健康验证**，
@@ -706,6 +712,34 @@ wait_health() {{
     if health_ok; then ok=1; break; fi
   done
   return $([ "$ok" = "1" ] && echo 0 || echo 1)
+}}
+container_running() {{
+  [ "$(docker inspect -f '{{{{.State.Running}}}}' "$NAME" 2>/dev/null || true)" = "true" ]
+}}
+graceful_remove() {{
+  if ! docker inspect "$NAME" >/dev/null 2>&1; then return 0; fi
+  if container_running; then
+    logln "向容器发送 SIGTERM，等待 Parrot 优雅退出（最多 {stop_tries}s）…"
+    if ! docker kill --signal=TERM "$NAME" >/dev/null 2>&1; then
+      logln "❌ 无法向容器发送 SIGTERM；拒绝强制移除"
+      return 1
+    fi
+    stopped=0
+    for i in $(seq 1 {stop_tries}); do
+      if ! container_running; then stopped=1; break; fi
+      sleep 1
+    done
+    if [ "$stopped" != "1" ]; then
+      logln "❌ 容器未在 {stop_tries}s 内优雅退出；拒绝使用 SIGKILL"
+      return 1
+    fi
+  fi
+  if ! docker rm "$NAME" >/dev/null 2>&1; then
+    logln "❌ 已停止容器无法安全移除"
+    return 1
+  fi
+  logln "✅ 旧容器已优雅停止并移除"
+  return 0
 }}
 service_exists() {{
   printf '%s\n' "$SERVICES" | grep -Fx -- "$1" >/dev/null 2>&1
@@ -755,7 +789,11 @@ fail_rollback() {{
   else
     logln "⚠️ 无备份 digest，无法回滚镜像"
   fi
-  docker rm -f "$NAME" 2>/dev/null || true
+  if ! graceful_remove; then
+    logln "❌ 无法安全移除失败容器，停止回滚以保护数据库"
+    echo "ROLLBACK_FAILED" > "$FLAG_DIR/.update_result" 2>/dev/null || true
+    exit 1
+  fi
   RB_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
   echo "$RB_OUT" | tail -10 >> "$LOG" 2>/dev/null || true
   logln "回滚重建完成，验证健康…"
@@ -783,8 +821,12 @@ logln "✅ compose 校验通过（备份 digest=$BACKUP_DIGEST）"
 #    这一步必须在 rm 旧容器前完成，避免 service 名失配时先停服务再报 no such service。
 resolve_service
 logln "使用 compose service=$SVC"
-# ③ stop+rm 旧容器（镜像 digest 已备份，可回滚），compose up 新容器
-docker rm -f "$NAME" 2>/dev/null || true
+# ③ SIGTERM + 等待优雅退出后移除旧容器；任何失败都拒绝 SIGKILL。
+if ! graceful_remove; then
+  logln "❌ 旧容器未能安全停止，已中止更新"
+  echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
+  exit 1
+fi
 logln "启动新容器…"
 UP_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
 UP_RC=$?

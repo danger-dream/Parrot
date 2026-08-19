@@ -18,6 +18,7 @@ import asyncio
 import os
 import json
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -84,6 +85,26 @@ async def _throttled_notify(alert_key: str, text: str) -> None:
 _background_tasks: list[asyncio.Task] = []
 
 
+async def _state_db_health_loop():
+    """Restart gracefully when state.db reports corruption or loses its header."""
+    while True:
+        await asyncio.sleep(2)
+        reason = await asyncio.to_thread(state_db.runtime_corruption_reason)
+        if not reason:
+            continue
+        state_db.request_recovery_restart(reason)
+        print(f"[state_db] requesting graceful recovery restart: {reason}")
+        notifier.notify_event(
+            "database_recovery",
+            "⚠️ <b>state.db 损坏，正在自动恢复</b>\n"
+            f"原因：<code>{notifier.escape_html(reason)}</code>\n"
+            "Parrot 将优雅退出，并在重新启动时保全损坏文件后恢复健康备份或重建运行状态库。",
+        )
+        drain.begin("state_db_corruption")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+
+
 async def _wal_checkpoint_loop():
     while True:
         await asyncio.sleep(300)
@@ -106,7 +127,13 @@ async def _wal_checkpoint_loop():
 
 
 def _finalize_state_db() -> bool:
-    """Run the final strict state checkpoint and close the main-thread handle."""
+    """Finalize state.db, preserving corrupt files for bootstrap recovery."""
+    if state_db.recovery_restart_requested():
+        # Do not let a final checkpoint rewrite the damaged header before the
+        # next process can quarantine db/wal/shm. os.execv closes descriptors
+        # without running another SQLite transaction.
+        print("[state_db] recovery restart pending; preserving db/wal/shm without checkpoint")
+        return True
     ok = False
     try:
         busy, log_pages, checkpointed_pages = state_db.checkpoint(mode="FULL", strict=True)
@@ -174,8 +201,15 @@ async def lifespan(app: FastAPI):
     network.init()
     network.bootstrap_system_dns_once()
 
-    # 持久化层
+    # 持久化层。state.db 是可重建运行状态；打开任何连接前先校验，损坏时
+    # 自动保全 db/wal/shm 并恢复最近一次更新备份（无备份则创建新库）。
+    state_recovery = state_db.bootstrap_recover()
     state_db.init()
+    if state_recovery:
+        # Update-time backups intentionally capture STAGED before restarting.
+        # After automatic database recovery that stale state must not ask the
+        # user to confirm the same restart again.
+        updater.reset_state()
     log_db.init()
     image_db.init()
     translation.init()
@@ -307,6 +341,22 @@ async def lifespan(app: FastAPI):
         tgbot.init(tg_token, tg_admins)
         tgbot.start()
 
+    if state_recovery:
+        action = state_recovery.get("action")
+        restored = state_recovery.get("restored_from")
+        result_text = (
+            f"已恢复健康备份：<code>{notifier.escape_html(str(restored))}</code>"
+            if action == "restored" and restored
+            else "没有可用健康备份，已创建新的运行状态库"
+        )
+        notifier.notify_event(
+            "database_recovery",
+            "✅ <b>state.db 已自动恢复</b>\n"
+            f"检测原因：<code>{notifier.escape_html(str(state_recovery.get('reason') or 'unknown'))}</code>\n"
+            f"{result_text}\n"
+            f"原文件已保全至：<code>{notifier.escape_html(str(state_recovery.get('quarantine') or ''))}</code>",
+        )
+
     print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
     print(f"  device_id: {DEVICE_ID[:16]}...")
     print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
@@ -319,6 +369,7 @@ async def lifespan(app: FastAPI):
     print(f"  timeouts: {cfg.get('timeouts')}")
     print(f"  telegram: {'enabled' if tg_token else 'disabled'} ({len(tg_admins)} admin(s))")
 
+    _background_tasks.append(asyncio.create_task(_state_db_health_loop()))
     _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
     _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
     _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
@@ -1248,6 +1299,9 @@ def main() -> None:
     )
     server = _DrainAwareServer(uvicorn_config)
     asyncio.run(_serve_with_graceful_drain(server))
+    if state_db.recovery_restart_requested():
+        print("[state_db] graceful shutdown complete; restarting for automatic recovery")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,37 @@ confirm_tty() {
     done
 }
 
+# 已运行的 Parrot 必须先收到 SIGTERM 并完成数据库收尾。绝不使用 rm -f；
+# 超时后中止部署，由管理员检查仍未退出的容器。
+graceful_remove_container() {
+    local name="$1" timeout="${PARROT_GRACEFUL_STOP_SECONDS:-120}" stopped=0
+    [[ -z "$name" ]] && return 0
+    docker inspect "$name" >/dev/null 2>&1 || return 0
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]]; then
+        info "向旧容器发送 SIGTERM，等待 Parrot 优雅退出（最多 ${timeout}s）..."
+        docker kill --signal=TERM "$name" >/dev/null 2>&1 || {
+            err "无法向旧容器发送 SIGTERM，已中止；不会强制删除"
+            return 1
+        }
+        for _ in $(seq 1 "$timeout"); do
+            if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" != "true" ]]; then
+                stopped=1
+                break
+            fi
+            sleep 1
+        done
+        if [[ $stopped -ne 1 ]]; then
+            err "旧容器未在 ${timeout}s 内优雅退出，已中止；不会使用 SIGKILL"
+            return 1
+        fi
+    fi
+    docker rm "$name" >/dev/null 2>&1 || {
+        err "旧容器已停止但无法安全移除，已中止"
+        return 1
+    }
+    ok "旧容器已优雅停止并移除"
+}
+
 # ─── 项目信息 ──────────────────────────────────────────────────
 print_banner() {
     cat <<'EOF'
@@ -263,7 +294,7 @@ start_and_verify() {
     local _cname
     _cname="$(grep -oP 'container_name:\s*\K\S+' "$INSTALL_DIR/docker-compose.yml" 2>/dev/null | head -1)"
     if [[ "$MODE" != "fresh" && -n "$_cname" ]]; then
-        docker rm -f "$_cname" >/dev/null 2>&1 || true
+        graceful_remove_container "$_cname" || return 1
     fi
     docker compose up -d
 
@@ -496,7 +527,9 @@ PYEDIT
     local _cname
     _cname="$(grep -oP 'container_name:\s*\K\S+' "$compose" 2>/dev/null | head -1)"
     docker compose pull || { err "镜像拉取失败"; return 1; }
-    [[ -n "$_cname" ]] && docker rm -f "$_cname" >/dev/null 2>&1 || true
+    if [[ -n "$_cname" ]]; then
+        graceful_remove_container "$_cname" || return 1
+    fi
     docker compose up -d || { err "容器启动失败"; return 1; }
     # 宿主映射端口（compose ports 的左值）
     local _hport
