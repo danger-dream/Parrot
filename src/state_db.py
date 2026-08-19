@@ -285,7 +285,9 @@ def bootstrap_recover() -> dict[str, Any] | None:
     global _bootstrap_recovery_report, _corruption_reason
     path = os.path.abspath(_resolve_db_path())
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    lock_path = path + ".recovery.lock"
+    backup_root = os.path.join(config.DATA_DIR, "backups")
+    os.makedirs(backup_root, exist_ok=True)
+    lock_path = os.path.join(backup_root, ".state-db-recovery.lock")
     with open(lock_path, "a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         sidecars = [path + "-wal", path + "-shm"]
@@ -298,8 +300,6 @@ def bootstrap_recover() -> dict[str, Any] | None:
             _bootstrap_recovery_report = None
             return None
 
-        backup_root = os.path.join(config.DATA_DIR, "backups")
-        os.makedirs(backup_root, exist_ok=True)
         ts = time.strftime("%Y%m%d-%H%M%S")
         quarantine = os.path.join(backup_root, f"state-db-corrupt-{ts}-{os.getpid()}")
         os.makedirs(quarantine, mode=0o700, exist_ok=False)

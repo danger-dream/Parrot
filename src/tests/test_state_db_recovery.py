@@ -161,7 +161,9 @@ def test_validation_unavailable_never_quarantines_live_database(
         state_db.bootstrap_recover()
 
     assert db_path.read_bytes() == before
-    assert not (db_path.parent / "backups").exists()
+    backups = db_path.parent / "backups"
+    assert backups.is_dir()
+    assert list(backups.glob("state-db-corrupt-*")) == []
 
 
 def test_runtime_header_corruption_requests_recovery_restart(recovery_env):
