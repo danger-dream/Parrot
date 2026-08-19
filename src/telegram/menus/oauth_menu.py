@@ -2741,6 +2741,37 @@ def _cursor_disable_state(chat_id: int) -> dict | None:
     return state.get("data") or {}
 
 
+def _parse_cursor_disable_payload(payload: str) -> tuple[str, str]:
+    short, _sep, rest = str(payload or "").partition(":")
+    return short, rest
+
+
+def _load_cursor_disable_state(chat_id: int, short: str) -> dict | None:
+    """Return the disable editor state, rebuilding it after a process restart.
+
+    Draft selections live in memory.  After restart the Telegram message still
+    carries the account short code, so we reconstruct from the persisted
+    disabled-model set instead of treating the page as dead.
+    """
+    account_key = _account_key_from_short(short)
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+        return None
+    existing = _cursor_disable_state(chat_id)
+    existing_key = _resolve_to_account_key((existing or {}).get("account_key"))
+    if existing and existing_key == account_key:
+        return existing
+    available = {str(item.get("id") or "") for item in _cursor_model_records(acc)}
+    selected = oauth_manager.cursor_disabled_models(acc) & available
+    _set_cursor_disable_state(
+        chat_id,
+        account_key,
+        page=max(1, int((existing or {}).get("page") or 1)),
+        selected=selected,
+    )
+    return _cursor_disable_state(chat_id)
+
+
 def _set_cursor_disable_state(
     chat_id: int,
     account_key: str,
@@ -2781,22 +2812,23 @@ def _cursor_disable_text_and_kb(data: dict) -> tuple[str, dict] | None:
             f"<code>{ui.escape_html(model_id)}</code>"
         )
 
+    short = ui.register_code(account_key)
     rows: list[list[dict]] = []
     for numbers in _split_number_rows(len(records)):
         rows.append([
             ui.btn(
                 f"{number} {'🚫' if str(records[number - 1].get('id') or '') in selected else '✅'}",
-                f"oa:cursor_dis_sel:{number}",
+                f"oa:cursor_dis_sel:{short}:{number}",
             )
             for number in numbers
         ])
     if records:
         rows.append([
-            ui.btn("全选", "oa:cursor_dis_all"),
-            ui.btn("清空", "oa:cursor_dis_clear"),
+            ui.btn("全选", f"oa:cursor_dis_all:{short}"),
+            ui.btn("清空", f"oa:cursor_dis_clear:{short}"),
         ])
-    rows.append([ui.btn("💾 保存禁用设置", "oa:cursor_dis_save")])
-    rows.append([ui.btn("◀ 取消并返回", "oa:cursor_dis_cancel")])
+    rows.append([ui.btn("💾 保存禁用设置", f"oa:cursor_dis_save:{short}")])
+    rows.append([ui.btn("◀ 取消并返回", f"oa:cursor_dis_cancel:{short}")])
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
@@ -2832,9 +2864,14 @@ def on_cursor_disable_start(
 
 
 def on_cursor_disable_select(
-    chat_id: int, message_id: int, cb_id: str, index_text: str
+    chat_id: int, message_id: int, cb_id: str, payload: str
 ) -> None:
-    data = _cursor_disable_state(chat_id)
+    short, index_text = _parse_cursor_disable_payload(payload)
+    if not index_text and short.isdigit():
+        data = _cursor_disable_state(chat_id)
+        index_text = short
+    else:
+        data = _load_cursor_disable_state(chat_id, short)
     if not data:
         ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
         return
@@ -2861,9 +2898,11 @@ def on_cursor_disable_select(
 
 
 def on_cursor_disable_set_all(
-    chat_id: int, message_id: int, cb_id: str, *, selected_all: bool
+    chat_id: int, message_id: int, cb_id: str, *, selected_all: bool,
+    payload: str = "",
 ) -> None:
-    data = _cursor_disable_state(chat_id)
+    short, _rest = _parse_cursor_disable_payload(payload)
+    data = _load_cursor_disable_state(chat_id, short) if short else _cursor_disable_state(chat_id)
     if not data:
         ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
         return
@@ -2882,8 +2921,11 @@ def on_cursor_disable_set_all(
     _show_cursor_disable(chat_id, message_id, cb_id)
 
 
-def on_cursor_disable_save(chat_id: int, message_id: int, cb_id: str) -> None:
-    data = _cursor_disable_state(chat_id)
+def on_cursor_disable_save(
+    chat_id: int, message_id: int, cb_id: str, payload: str = "",
+) -> None:
+    short, _rest = _parse_cursor_disable_payload(payload)
+    data = _load_cursor_disable_state(chat_id, short) if short else _cursor_disable_state(chat_id)
     if not data:
         ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
         return
@@ -2902,9 +2944,12 @@ def on_cursor_disable_save(chat_id: int, message_id: int, cb_id: str) -> None:
     on_cursor_models(chat_id, message_id, "", f"{short}:{page}")
 
 
-def on_cursor_disable_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
-    data = _cursor_disable_state(chat_id) or {}
-    account_key = _resolve_to_account_key(data.get("account_key"))
+def on_cursor_disable_cancel(
+    chat_id: int, message_id: int, cb_id: str, payload: str = "",
+) -> None:
+    short, _rest = _parse_cursor_disable_payload(payload)
+    data = (_load_cursor_disable_state(chat_id, short) if short else _cursor_disable_state(chat_id)) or {}
+    account_key = _resolve_to_account_key(data.get("account_key")) or _account_key_from_short(short)
     page = max(1, int(data.get("page") or 1))
     states.pop_state(chat_id)
     if not account_key:
@@ -5436,19 +5481,27 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_cursor_disable_start(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
     if data.startswith("oa:cursor_dis_sel:"):
-        on_cursor_disable_select(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
+        on_cursor_disable_select(chat_id, message_id, cb_id, data.split(":", 2)[2])
         return True
-    if data == "oa:cursor_dis_all":
-        on_cursor_disable_set_all(chat_id, message_id, cb_id, selected_all=True)
+    if data == "oa:cursor_dis_all" or data.startswith("oa:cursor_dis_all:"):
+        payload = data.split(":", 2)[2] if data.startswith("oa:cursor_dis_all:") else ""
+        on_cursor_disable_set_all(
+            chat_id, message_id, cb_id, selected_all=True, payload=payload,
+        )
         return True
-    if data == "oa:cursor_dis_clear":
-        on_cursor_disable_set_all(chat_id, message_id, cb_id, selected_all=False)
+    if data == "oa:cursor_dis_clear" or data.startswith("oa:cursor_dis_clear:"):
+        payload = data.split(":", 2)[2] if data.startswith("oa:cursor_dis_clear:") else ""
+        on_cursor_disable_set_all(
+            chat_id, message_id, cb_id, selected_all=False, payload=payload,
+        )
         return True
-    if data == "oa:cursor_dis_save":
-        on_cursor_disable_save(chat_id, message_id, cb_id)
+    if data == "oa:cursor_dis_save" or data.startswith("oa:cursor_dis_save:"):
+        payload = data.split(":", 2)[2] if data.startswith("oa:cursor_dis_save:") else ""
+        on_cursor_disable_save(chat_id, message_id, cb_id, payload)
         return True
-    if data == "oa:cursor_dis_cancel":
-        on_cursor_disable_cancel(chat_id, message_id, cb_id)
+    if data == "oa:cursor_dis_cancel" or data.startswith("oa:cursor_dis_cancel:"):
+        payload = data.split(":", 2)[2] if data.startswith("oa:cursor_dis_cancel:") else ""
+        on_cursor_disable_cancel(chat_id, message_id, cb_id, payload)
         return True
     if data.startswith("oa:cursor_model:"):
         on_cursor_model_detail(chat_id, message_id, cb_id, data.split(":", 2)[2])

@@ -912,12 +912,21 @@ def test_cursor_batch_disable_menu_persists_and_can_reenable(monkeypatch):
         if item["id"] == "gpt-5.5"
     )
     assert oauth_menu.handle_callback(
-        10, 20, "cb-select", f"oa:cursor_dis_sel:{gpt_index}"
+        10, 20, "cb-select", f"oa:cursor_dis_sel:{account_short}:{gpt_index}"
     ) is True
     assert oauth_menu._cursor_disable_state(10)["selected"] == ["gpt-5.5"]
     assert "将禁用 <b>1</b> 个" in captured["text"]
+    button_data = [
+        button["callback_data"]
+        for row in ((captured.get("reply_markup") or {}).get("inline_keyboard") or [])
+        for button in row
+    ]
+    assert f"oa:cursor_dis_sel:{account_short}:{gpt_index}" in button_data
+    assert f"oa:cursor_dis_save:{account_short}" in button_data
 
-    assert oauth_menu.handle_callback(10, 20, "cb-save", "oa:cursor_dis_save") is True
+    assert oauth_menu.handle_callback(
+        10, 20, "cb-save", f"oa:cursor_dis_save:{account_short}"
+    ) is True
     assert states.get_state(10) is None
     assert oauth_manager.cursor_disabled_models(account_key) == {"gpt-5.5"}
     assert "已禁用 <b>1</b> 个" in captured["text"]
@@ -940,6 +949,49 @@ def test_cursor_batch_disable_menu_persists_and_can_reenable(monkeypatch):
     oauth_menu.on_cursor_disable_select(10, 20, "cb-enable", str(gpt_index))
     oauth_menu.on_cursor_disable_save(10, 20, "cb-save-enable")
     assert oauth_manager.cursor_disabled_models(account_key) == set()
+
+
+def test_cursor_batch_disable_survives_process_restart(monkeypatch):
+    oauth_manager.add_account(_account())
+    account_key = "cursor:cursor-user-1"
+    account_short = ui.register_code(account_key)
+    oauth_manager.set_cursor_disabled_models(account_key, {"gpt-5.5"})
+    captured: dict = {}
+    answers: list[str] = []
+    monkeypatch.setattr(
+        ui,
+        "answer_cb",
+        lambda *_args, **_kwargs: answers.append(
+            str(_args[1] if len(_args) > 1 else "")
+        ),
+    )
+    monkeypatch.setattr(ui, "edit", lambda *_args, **kwargs: captured.update({
+        "text": _args[2], "reply_markup": kwargs.get("reply_markup"),
+    }))
+
+    states.clear_all()
+    with ui._code_lock:
+        ui._code_to_name.clear()
+
+    records = oauth_menu._cursor_model_records(oauth_manager.get_account(account_key))
+    composer_index = next(
+        index for index, item in enumerate(records, start=1)
+        if item["id"] == "composer-2.5"
+    )
+    assert oauth_menu.handle_callback(
+        10, 20, "cb-after-restart",
+        f"oa:cursor_dis_sel:{account_short}:{composer_index}",
+    ) is True
+    assert "会话已失效" not in "".join(answers)
+    assert set(oauth_menu._cursor_disable_state(10)["selected"]) == {
+        "gpt-5.5", "composer-2.5",
+    }
+    assert oauth_menu.handle_callback(
+        10, 20, "cb-save-after-restart", f"oa:cursor_dis_save:{account_short}",
+    ) is True
+    assert oauth_manager.cursor_disabled_models(account_key) == {
+        "gpt-5.5", "composer-2.5",
+    }
 
 
 def test_cursor_disabled_model_disappears_from_registry_and_load_balancing():
