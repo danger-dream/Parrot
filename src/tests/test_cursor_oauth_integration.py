@@ -244,6 +244,41 @@ def test_cursor_channel_maps_chat_and_anthropic_controls(monkeypatch):
     assert responses_req.translator_ctx["response_translator"] == "responses_to_chat"
 
 
+def test_cursor_channel_does_not_claim_image_transport():
+    from src.protocols.matrix import capabilities_for_channel
+
+    channel = CursorOAuthChannel(_install_account())
+    caps = capabilities_for_channel(channel)
+    assert caps.supports_images is False
+    assert channel.cursor_metadata("claude-fable-5")["vision"] is False
+
+
+def test_cursor_build_request_rejects_image_blocks(monkeypatch):
+    account = _install_account()
+
+    async def valid_token(_account_key):
+        return account["access_token"]
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    channel = CursorOAuthChannel(account)
+
+    with pytest.raises(GuardError) as exc:
+        asyncio.run(channel.build_upstream_request(
+            {
+                "model": "claude-fable-5",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                ]}],
+            },
+            "claude-fable-5",
+            ingress_protocol="chat",
+        ))
+    assert exc.value.scope == "candidate"
+    assert exc.value.status == 400
+    assert "image input is not available" in exc.value.message
+
+
 def test_cursor_usage_normalization_uses_cents_not_reported_total_percent():
     raw = CursorUsage(
         plan_name="Ultra",

@@ -141,6 +141,7 @@ class ChannelCapabilities:
     protocol: str
     transports: frozenset[str] = frozenset()
     native_state: frozenset[str] = frozenset()
+    supports_images: bool = True
     raw: dict[str, Any] | None = None
 
 
@@ -1155,12 +1156,13 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
     protocol = getattr(channel, "protocol", "anthropic")
     ch_type = getattr(channel, "type", "api")
     provider = getattr(channel, "provider", "")
+    is_cursor = ch_type == "oauth" and provider == "cursor"
     transports: set[str] = {"http-sse", "http-json"}
     if bool(getattr(channel, "upstream_stream_only", False)):
         transports.discard("http-json")
     native_state: set[str] = set()
     if protocol == "openai-chat":
-        if not (ch_type == "oauth" and provider == "cursor"):
+        if not is_cursor:
             native_state.update({"multi_candidate", "file_id", "audio"})
         else:
             native_state.update({"prompt_cache_key"})
@@ -1198,6 +1200,8 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
         protocol=protocol,
         transports=frozenset(transports),
         native_state=frozenset(native_state),
+        # Cursor's AgentService bridge still has no SelectedImage transport.
+        supports_images=not is_cursor,
     )
 
 
@@ -1308,6 +1312,8 @@ class ProtocolMatrix:
         upstream = upstream_protocol or "anthropic"
         capabilities = capabilities or _default_capabilities_for_protocol(upstream)
         f = features or RequestFeatures()
+        if f.has_images and not capabilities.supports_images:
+            raise ProtocolGuardError("target route does not support image input")
 
         ingress_family = protocol_family(ingress)
         upstream_family = protocol_family(upstream)

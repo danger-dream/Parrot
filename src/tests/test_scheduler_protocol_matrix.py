@@ -15,8 +15,10 @@ class FakeChannel(SimpleNamespace):
         return self.real if requested_model == self.alias else None
 
 
-def _ch(key, protocol, alias="m", real="real", type="api"):
-    return FakeChannel(key=key, protocol=protocol, alias=alias, real=real, type=type)
+def _ch(key, protocol, alias="m", real="real", type="api", provider=""):
+    return FakeChannel(
+        key=key, protocol=protocol, alias=alias, real=real, type=type, provider=provider,
+    )
 
 
 def test_schedule_explains_disabled_and_cooldown_exclusions(monkeypatch):
@@ -598,3 +600,43 @@ def test_anthropic_thinking_disabled_can_fallback_to_openai_candidates(monkeypat
     assert ("c", "real") in plans
     assert ("r", "real") in plans
     assert guards == []
+
+
+def test_filter_candidates_excludes_cursor_from_image_requests(monkeypatch):
+    cursor = _ch("oauth:cursor", "openai-chat", type="oauth", provider="cursor")
+    openai = _ch("oauth:openai", "openai-responses", type="oauth", provider="openai")
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: [cursor, openai])
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    text_body = {"model": "m", "input": "hello"}
+    available, _, _, guards = scheduler._filter_candidates("m", "responses", body=text_body)
+    assert [ch.key for ch, _ in available] == ["oauth:cursor", "oauth:openai"]
+    assert guards == []
+
+    image_body = {"model": "m", "input": [{"type": "message", "role": "user", "content": [
+        {"type": "input_image", "image_url": "https://example.com/a.png"},
+        {"type": "input_text", "text": "what is this"},
+    ]}]}
+    available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=image_body)
+    assert [ch.key for ch, _ in available] == ["oauth:openai"]
+    assert saturated == []
+    assert ("oauth:openai", "real") in plans
+    assert ("oauth:cursor", "real") not in plans
+    assert guards == ["target route does not support image input"]
+
+    result = scheduler.schedule(image_body, api_key_name="k", client_ip="127.0.0.1", ingress_protocol="responses")
+    assert [ch.key for ch, _ in result.candidates] == ["oauth:openai"]
+    assert result.guard_error == "target route does not support image input"
+
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: [cursor])
+    cursor_only = scheduler.schedule(
+        image_body, api_key_name="k", client_ip="127.0.0.1", ingress_protocol="responses",
+    )
+    assert not cursor_only
+    assert cursor_only.guard_error == "target route does not support image input"
+    assert cursor_only.exclusions == [{
+        "channel": "oauth:cursor",
+        "reason": "protocol_guard",
+        "detail": "target route does not support image input",
+    }]

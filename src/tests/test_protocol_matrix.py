@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from src.protocols.matrix import (
@@ -1019,3 +1021,42 @@ def test_matrix_allows_internal_prompt_cache_hints_to_anthropic():
                 {"input": [{"type": "custom_tool_call", "call_id": "c1", "name": "shell", "input": "raw text"}]},
             ),
         )
+
+
+def test_matrix_rejects_images_when_channel_cannot_transport_them():
+    from src.protocols.matrix import capabilities_for_channel, extract_request_features
+
+    chat_image = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+    ]}]}
+    responses_image = {"input": [{"type": "message", "role": "user", "content": [
+        {"type": "input_image", "image_url": "https://example.com/a.png"},
+    ]}]}
+    no_images = ChannelCapabilities(protocol="openai-chat", supports_images=False)
+
+    assert DEFAULT_MATRIX.plan(
+        "chat", "openai-chat",
+        features=extract_request_features("chat", chat_image),
+    ).cost == 0
+    with pytest.raises(ProtocolGuardError, match="does not support image input"):
+        DEFAULT_MATRIX.plan(
+            "chat", "openai-chat",
+            features=extract_request_features("chat", chat_image),
+            capabilities=no_images,
+        )
+    with pytest.raises(ProtocolGuardError, match="does not support image input"):
+        DEFAULT_MATRIX.plan(
+            "responses", "openai-chat",
+            features=extract_request_features("responses", responses_image),
+            capabilities=no_images,
+        )
+
+    cursor = SimpleNamespace(protocol="openai-chat", type="oauth", provider="cursor")
+    openai_chat = SimpleNamespace(protocol="openai-chat", type="api", provider="openai")
+    assert capabilities_for_channel(cursor).supports_images is False
+    assert capabilities_for_channel(openai_chat).supports_images is True
+    assert DEFAULT_MATRIX.plan(
+        "chat", "openai-chat",
+        features=extract_request_features("chat", {"messages": [{"role": "user", "content": "hi"}]}),
+        capabilities=capabilities_for_channel(cursor),
+    ).cost == 0
