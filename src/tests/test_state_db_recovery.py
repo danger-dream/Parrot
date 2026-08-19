@@ -166,17 +166,72 @@ def test_validation_unavailable_never_quarantines_live_database(
     assert list(backups.glob("state-db-corrupt-*")) == []
 
 
-def test_runtime_header_corruption_requests_recovery_restart(recovery_env):
+def test_runtime_probe_does_not_open_live_database(recovery_env, monkeypatch):
     state_db, _data_dir, db_path = recovery_env
     state_db.init()
-    with open(db_path, "r+b") as f:
-        f.seek(0)
-        f.write(b"broken header!!!")
-        f.flush()
-        os.fsync(f.fileno())
+    opened: list[str] = []
+    real_open = open
 
+    def wrapped(path, *args, **kwargs):
+        if os.path.abspath(str(path)) == os.path.abspath(str(db_path)):
+            opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", wrapped)
+    assert state_db.runtime_corruption_reason() == ""
+    assert opened == []
+
+
+def test_runtime_probe_only_returns_recorded_sqlite_errors(recovery_env):
+    state_db, _data_dir, db_path = recovery_env
+    state_db.init()
+
+    assert state_db.runtime_corruption_reason() == ""
+    state_db._record_corruption_reason("database disk image is malformed")
     reason = state_db.runtime_corruption_reason()
     state_db.request_recovery_restart(reason)
 
-    assert "invalid SQLite header" in reason
+    assert reason == "database disk image is malformed"
     assert state_db.recovery_restart_requested() is True
+
+
+def test_sqlite_notadb_is_recorded_from_connection_wrapper(recovery_env):
+    state_db, _data_dir, db_path = recovery_env
+    state_db.init()
+    state_db.close()
+    db_path.write_bytes(b"broken header!!!")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        state_db._get_conn()
+
+    reason = state_db.runtime_corruption_reason()
+    assert reason
+    assert any(
+        marker in reason.lower()
+        for marker in ("not a database", "malformed", "corrupt")
+    )
+
+
+def test_existing_wal_database_is_converted_to_delete(recovery_env):
+    state_db, _data_dir, db_path = recovery_env
+    conn = sqlite3.connect(db_path)
+    try:
+        assert str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower() == "wal"
+        conn.execute("CREATE TABLE recovery_probe (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO recovery_probe(value) VALUES ('wal-source')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = state_db.bootstrap_recover()
+    state_db.init()
+
+    assert report is None
+    mode = state_db._get_conn().execute("PRAGMA journal_mode").fetchone()[0]
+    assert str(mode).lower() == "delete"
+    assert not os.path.exists(str(db_path) + "-wal")
+    row = state_db._get_conn().execute(
+        "SELECT value FROM recovery_probe"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "wal-source"

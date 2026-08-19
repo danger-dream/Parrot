@@ -6,8 +6,7 @@
 - **openai_response_store.db** — OpenAI `previous_response_id` history（TTL 清理）
 - **logs/YYYY-MM.db** — 业务日志，**按月分库**（请求流水、重试链、完整 body）
 
-各库均启用 WAL 模式。OpenAI history 与 `state.db` 分库，避免大表清理长时间
-占用轻量状态写锁；旧版 `state.db.openai_response_store` 只用于升级后的只读 fallback。
+`state.db` 使用 rollback journal（`journal_mode=DELETE`）：它体积小、写入已由全局锁串行，避开 SQLite 3.51.2 及更早版本在多连接并发写入/checkpoint 时的 WAL-reset 损坏竞态。高吞吐日志、图片、翻译缓存与独立 OpenAI Store 继续使用各自的 WAL 数据库。OpenAI history 与 `state.db` 分库，避免大表清理长时间占用轻量状态写锁；旧版 `state.db.openai_response_store` 只用于升级后的只读 fallback，旧表不存在或损坏时会熔断该 fallback，不阻断新 Store 写入。
 
 ## 3.1 state.db Schema
 

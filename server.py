@@ -109,10 +109,6 @@ async def _wal_checkpoint_loop():
     while True:
         await asyncio.sleep(300)
         try:
-            state_db.checkpoint()
-        except Exception as e:
-            print(f"[state_db] checkpoint failed: {e}")
-        try:
             log_db.checkpoint()
         except Exception as e:
             print(f"[log_db] checkpoint failed: {e}")
@@ -127,30 +123,19 @@ async def _wal_checkpoint_loop():
 
 
 def _finalize_state_db() -> bool:
-    """Finalize state.db, preserving corrupt files for bootstrap recovery."""
+    """Close state.db cleanly, preserving corrupt files for bootstrap recovery."""
     if state_db.recovery_restart_requested():
-        # Do not let a final checkpoint rewrite the damaged header before the
-        # next process can quarantine db/wal/shm. os.execv closes descriptors
-        # without running another SQLite transaction.
-        print("[state_db] recovery restart pending; preserving db/wal/shm without checkpoint")
+        # Do not let connection teardown rewrite damaged evidence before the
+        # next process can quarantine db/journal remnants.
+        print("[state_db] recovery restart pending; preserving database evidence")
         return True
-    ok = False
     try:
-        busy, log_pages, checkpointed_pages = state_db.checkpoint(mode="FULL", strict=True)
-        print(
-            "[state_db] shutdown checkpoint complete: "
-            f"{busy}|{log_pages}|{checkpointed_pages}"
-        )
-        ok = True
+        state_db.close()
+        print("[state_db] shutdown connection closed")
+        return True
     except Exception as exc:
-        print(f"[state_db] shutdown checkpoint failed: {exc}")
-    finally:
-        try:
-            state_db.close()
-        except Exception as exc:
-            print(f"[state_db] shutdown close failed: {exc}")
-            ok = False
-    return ok
+        print(f"[state_db] shutdown close failed: {exc}")
+        return False
 
 
 async def _stale_pending_loop():
@@ -238,13 +223,14 @@ async def lifespan(app: FastAPI):
 
     # 联合主键迁移：email → account_key (=f"{provider}:{email}")。幂等，已迁移过直接跳过。
     try:
-        # 迁移前备份 state.db 做保险（已存在备份则不覆盖）
-        import os as _os, shutil as _shutil
+        # 迁移前用 SQLite Online Backup 做保险（已存在备份则不覆盖）。
+        # 禁止 shutil.copy2 活库：那会绕过 SQLite 并可能丢掉 POSIX 锁。
+        import os as _os
         _src = state_db._db_path
         _bak = (_src or "") + ".pre_composite_key.bak"
         if _src and _os.path.exists(_src) and not _os.path.exists(_bak):
             try:
-                _shutil.copy2(_src, _bak)
+                state_db.online_backup(_bak, verify=True)
                 print(f"[state_db] backup created: {_bak}")
             except Exception as _exc:
                 print(f"[state_db] backup failed (continuing): {_exc}")

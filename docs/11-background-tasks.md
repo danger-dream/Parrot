@@ -6,7 +6,7 @@
 
 | 任务 | 周期 | 模块 | 作用 |
 |---|---|---|---|
-| WAL checkpoint | 300s | `server.py` / `state_db` / `log_db` | 防 WAL 文件膨胀 |
+| WAL checkpoint | 300s | `server.py` / `log_db` / `image_db` / `translation` | 防高吞吐数据库 WAL 文件膨胀；`state.db` 为兼容 no-op |
 | Stale pending 清理 | 300s | `log_db` | 清理进程崩溃遗留的 pending 记录 |
 | Affinity 过期清理 | 300s | `affinity` | 清理 30min 以上未使用的亲和记录 |
 | OAuth token 主动刷新 | 60s | `oauth_manager` | 剩余 < 10min 的 token 提前刷新 |
@@ -20,16 +20,12 @@ async def wal_checkpoint_loop():
     while True:
         await asyncio.sleep(300)
         try:
-            state_db.checkpoint()
-        except Exception as e:
-            print(f"[state_db] checkpoint failed: {e}")
-        try:
             log_db.checkpoint()
         except Exception as e:
             print(f"[log_db] checkpoint failed: {e}")
 ```
 
-`checkpoint()` 内部：`conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")`。
+日志、图片与翻译缓存的 `checkpoint()` 执行相应 WAL checkpoint。`state.db` 已固定使用 rollback journal，后台循环不再对它做 checkpoint；`state_db.checkpoint()` 仅保留兼容 no-op。
 
 ## 11.3 Stale pending 清理
 

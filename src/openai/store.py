@@ -70,6 +70,7 @@ _write_lock = threading.RLock()
 _initialized = False
 _db_path: Optional[str] = None
 _legacy_db_path: Optional[str] = None
+_legacy_disabled_reason = ""
 _DEFAULT_DB_NAME = "openai_response_store.db"
 _logger = logging.getLogger(__name__)
 _cleanup_warning_lock = threading.Lock()
@@ -231,6 +232,27 @@ def _close_local_connection(name: str) -> None:
     setattr(_local, f"{name}_path", None)
 
 
+def _disable_legacy_fallback(reason: str) -> None:
+    global _legacy_disabled_reason
+    if not _legacy_disabled_reason:
+        _legacy_disabled_reason = str(reason or "legacy state store unavailable")
+        _logger.warning(
+            "legacy state.db Response Store fallback disabled: %s",
+            _legacy_disabled_reason,
+        )
+    _close_local_connection("legacy_conn")
+
+
+def _is_corrupt_database_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    base_code = (int(code) & 0xFF) if isinstance(code, int) else None
+    lowered = str(exc).lower()
+    return base_code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB} or any(
+        marker in lowered
+        for marker in ("file is not a database", "database disk image is malformed")
+    )
+
+
 def _rollback_failed_write(conn: sqlite3.Connection) -> None:
     try:
         conn.rollback()
@@ -274,6 +296,8 @@ def _get_conn() -> sqlite3.Connection:
 
 def _get_legacy_conn() -> Optional[sqlite3.Connection]:
     """Open legacy state.db read-only, without creating a missing file."""
+    if _legacy_disabled_reason:
+        return None
     path = _legacy_db_path
     if not path or (_db_path and _paths_same_file(path, _db_path)):
         _close_local_connection("legacy_conn")
@@ -292,15 +316,17 @@ def _get_legacy_conn() -> Optional[sqlite3.Connection]:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=1000")
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             if conn is not None:
                 try:
                     conn.close()
                 except sqlite3.Error:
                     pass
-            # A file removed between the existence check and connect is a
-            # clean legacy miss. Permission/I/O/corruption failures must stay
-            # observable instead of being rewritten as response-id 404.
+            # The legacy table is optional compatibility data. Corruption in
+            # state.db must not prevent writes to the healthy independent Store.
+            if _is_corrupt_database_error(exc):
+                _disable_legacy_fallback(str(exc))
+                return None
             if not _legacy_regular_file_exists(path):
                 return None
             raise
@@ -327,7 +353,7 @@ CREATE INDEX IF NOT EXISTS idx_resp_store_key     ON openai_response_store(api_k
 
 
 def init() -> None:
-    global _initialized, _db_path, _legacy_db_path
+    global _initialized, _db_path, _legacy_db_path, _legacy_disabled_reason
     resolved = _resolve_db_path()
     legacy = _resolve_legacy_db_path()
     if _initialized and _db_path == resolved and _legacy_db_path == legacy:
@@ -336,6 +362,7 @@ def init() -> None:
         _close_local_connection("conn")
     if _legacy_db_path != legacy:
         _close_local_connection("legacy_conn")
+        _legacy_disabled_reason = ""
     _db_path = resolved
     _legacy_db_path = legacy
     _prepare_private_db_path(_db_path)
@@ -454,9 +481,13 @@ def _legacy_lookup(response_id: str) -> Optional[sqlite3.Row]:
             (response_id,),
         ).fetchone()
     except sqlite3.OperationalError as exc:
-        # A pre-store state.db legitimately has no such table. Other SQLite
-        # failures are service errors, not proof that the response id is absent.
         if "no such table: openai_response_store" in str(exc).lower():
+            _disable_legacy_fallback("legacy table does not exist")
+            return None
+        raise
+    except sqlite3.DatabaseError as exc:
+        if _is_corrupt_database_error(exc):
+            _disable_legacy_fallback(str(exc))
             return None
         raise
 
@@ -624,8 +655,10 @@ async def cleanup_loop() -> None:
 
 def _reset_for_test(*, reinitialize: bool = False) -> None:
     """仅清新库；reinitialize=True 时关闭 thread-local 连接并重置初始化状态。"""
-    global _initialized, _db_path, _legacy_db_path, _last_cleanup_warning_at
+    global _initialized, _db_path, _legacy_db_path, _legacy_disabled_reason
+    global _last_cleanup_warning_at
     _last_cleanup_warning_at = 0.0
+    _legacy_disabled_reason = ""
     if _initialized and not reinitialize:
         conn = _get_conn()
         with _write_lock:

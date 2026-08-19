@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import threading
 
 import pytest
 
@@ -173,35 +174,41 @@ def test_rollback_failure_discards_thread_connection_and_next_call_recovers(m):
         state_db.error_delete(channel_key, model)
 
 
-def test_strict_checkpoint_reports_complete_status(m):
+def test_state_db_uses_rollback_journal_and_checkpoint_is_safe_noop(m):
     state_db = m["state_db"]
     state_db.init()
     state_db.schema_meta_set("checkpoint-probe", "ready")
 
-    busy, log_pages, checkpointed_pages = state_db.checkpoint(mode="FULL", strict=True)
+    mode = state_db._get_conn().execute("PRAGMA journal_mode").fetchone()[0]
+    result = state_db.checkpoint(mode="FULL", strict=True)
 
-    assert busy == 0
-    assert checkpointed_pages == log_pages
+    assert str(mode).lower() == "delete"
+    assert result == (0, 0, 0)
 
 
-def test_strict_checkpoint_rejects_busy_or_incomplete_result(m, monkeypatch):
+def test_worker_connections_only_verify_delete_mode(m):
     state_db = m["state_db"]
+    state_db.init()
+    modes = []
+    errors = []
 
-    class _Cursor:
-        @staticmethod
-        def fetchone():
-            return (1, 9, 4)
+    def worker():
+        try:
+            conn = state_db._get_conn()
+            modes.append(str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower())
+            state_db.close()
+        except Exception as exc:
+            errors.append(exc)
 
-    class _BusyConnection:
-        @staticmethod
-        def execute(sql):
-            assert sql == "PRAGMA wal_checkpoint(FULL)"
-            return _Cursor()
+    workers = [threading.Thread(target=worker) for _ in range(16)]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join()
 
-    monkeypatch.setattr(state_db, "_get_conn", lambda: _BusyConnection())
-
-    with pytest.raises(RuntimeError, match=r"busy=1, log=9, checkpointed=4"):
-        state_db.checkpoint(mode="FULL", strict=True)
+    assert errors == []
+    assert modes == ["delete"] * 16
+    assert not os.path.exists(state_db._db_path + "-wal")
 
 
 def test_online_backup_is_consistent_and_integrity_checked(m, tmp_path):

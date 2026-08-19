@@ -454,6 +454,21 @@ def test_legacy_sqlite_failure_is_not_rewritten_as_404(isolated_store, monkeypat
     assert raised.value.err_type == "server_error"
 
 
+def test_corrupt_legacy_state_does_not_block_independent_store(isolated_store):
+    root, _cfg = isolated_store
+    (root / "state.db").write_bytes(b"SQLit-corrupt-legacy")
+
+    store.save(
+        "new-response", None,
+        api_key_name="key-a", model="gpt-test", channel_key="oauth:test",
+        input_items=[{"role": "user", "content": "hi"}], output_items=[],
+    )
+
+    saved = store.lookup("new-response", api_key_name="key-a")
+    assert saved.model == "gpt-test"
+    assert store._legacy_disabled_reason
+
+
 def test_cleanup_expired_is_bounded_and_commits_each_batch(isolated_store):
     for i in range(7):
         _save(f"expired-{i}")

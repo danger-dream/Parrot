@@ -65,7 +65,7 @@ def test_drain_aware_server_signal_waits_before_should_exit():
     asyncio.run(scenario())
 
 
-def test_shutdown_finalizes_state_db_with_strict_full_checkpoint(monkeypatch):
+def test_shutdown_closes_state_db_without_checkpoint(monkeypatch):
     calls = []
     monkeypatch.setattr(
         parrot_server.state_db,
@@ -79,34 +79,19 @@ def test_shutdown_finalizes_state_db_with_strict_full_checkpoint(monkeypatch):
     )
 
     assert parrot_server._finalize_state_db() is True
-    assert calls == [
-        ("checkpoint", {"mode": "FULL", "strict": True}),
-        ("close", {}),
-    ]
+    assert calls == [("close", {})]
 
 
-def test_shutdown_closes_state_db_even_when_checkpoint_fails(monkeypatch):
-    calls = []
+def test_shutdown_reports_close_failure(monkeypatch):
+    def fail_close():
+        raise RuntimeError("close failed")
 
-    def fail_checkpoint(**kwargs):
-        calls.append(("checkpoint", kwargs))
-        raise RuntimeError("busy")
-
-    monkeypatch.setattr(parrot_server.state_db, "checkpoint", fail_checkpoint)
-    monkeypatch.setattr(
-        parrot_server.state_db,
-        "close",
-        lambda: calls.append(("close", {})),
-    )
+    monkeypatch.setattr(parrot_server.state_db, "close", fail_close)
 
     assert parrot_server._finalize_state_db() is False
-    assert calls == [
-        ("checkpoint", {"mode": "FULL", "strict": True}),
-        ("close", {}),
-    ]
 
 
-def test_recovery_restart_preserves_corrupt_db_without_final_checkpoint(monkeypatch):
+def test_recovery_restart_preserves_corrupt_db_without_close(monkeypatch):
     calls = []
     parrot_server.state_db._reset_recovery_state_for_tests()
     parrot_server.state_db.request_recovery_restart("file is not a database")

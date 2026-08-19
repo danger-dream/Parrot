@@ -2,7 +2,8 @@
 
 保存渠道性能/冷却、会话亲和、OAuth 配额、网络检查，以及 xAI 异步视频
 任务的短期账号绑定。全表写操作由单一 `_write_lock` 序列化；连接采用
-thread-local，WAL 模式。
+thread-local。该小型运行状态库使用 rollback journal，避免旧 SQLite 的
+WAL-reset 数据竞争损坏；高吞吐日志与 Response Store 仍使用各自独立数据库。
 """
 
 import fcntl
@@ -24,6 +25,7 @@ _local = threading.local()
 _write_lock = threading.RLock()
 _initialized = False
 _db_path: str | None = None
+_journal_mode_ready = False
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _corruption_event = threading.Event()
@@ -217,6 +219,11 @@ def _validate_sqlite_file(
     try:
         if os.path.getsize(path) == 0:
             return False, "database file is empty"
+        # Closed-file only. A raw open()/close() on a live database drops
+        # POSIX advisory locks for every connection in this process
+        # (https://sqlite.org/howtocorrupt.html#unlockandclose).  Rejecting
+        # a garbage header here also avoids letting SQLite rewrite -wal/-shm
+        # evidence before quarantine.
         with open(path, "rb") as f:
             header = f.read(len(_SQLITE_MAGIC))
         if header != _SQLITE_MAGIC:
@@ -274,6 +281,20 @@ def _fsync_file_and_parent(path: str) -> None:
         pass
 
 
+def _ensure_rollback_journal(path: str) -> None:
+    """Convert a closed state database off WAL before worker connections open."""
+    conn = sqlite3.connect(path, timeout=10)
+    try:
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        mode = str(row[0] if row is not None else "").strip().lower()
+        if mode != "delete":
+            raise RuntimeError(
+                f"state.db requires journal_mode=DELETE, got {mode or '?'}"
+            )
+    finally:
+        conn.close()
+
+
 def bootstrap_recover() -> dict[str, Any] | None:
     """Before opening state.db, preserve and recover an invalid database.
 
@@ -297,6 +318,7 @@ def bootstrap_recover() -> dict[str, Any] | None:
 
         valid, reason = _validate_sqlite_file(path)
         if valid:
+            _ensure_rollback_journal(path)
             _bootstrap_recovery_report = None
             return None
 
@@ -328,13 +350,15 @@ def bootstrap_recover() -> dict[str, Any] | None:
                 _fsync_file_and_parent(tmp)
                 os.replace(tmp, path)
                 _fsync_file_and_parent(path)
+                _ensure_rollback_journal(path)
                 restored_from = candidate
                 break
             finally:
-                try:
-                    os.remove(tmp)
-                except FileNotFoundError:
-                    pass
+                for temporary in (tmp, tmp + "-wal", tmp + "-shm"):
+                    try:
+                        os.remove(temporary)
+                    except FileNotFoundError:
+                        pass
 
         report: dict[str, Any] = {
             "reason": reason,
@@ -366,21 +390,13 @@ def bootstrap_recovery_report() -> dict[str, Any] | None:
 
 
 def runtime_corruption_reason() -> str:
-    """Return a corruption reason recorded by SQLite or a header probe."""
-    if _corruption_event.is_set():
-        with _corruption_lock:
-            return _corruption_reason or "state database corruption"
-    path = _db_path
-    if not path:
-        return ""
-    try:
-        with open(path, "rb") as f:
-            header = f.read(len(_SQLITE_MAGIC))
-    except OSError as exc:
-        _record_corruption_reason(f"state database header read failed: {exc}")
-    else:
-        if header != _SQLITE_MAGIC:
-            _record_corruption_reason(f"invalid SQLite header: {header[:8].hex()}")
+    """Return a corruption reason already recorded by live SQLite operations.
+
+    This must never open or close the live database file. A raw
+    ``open()/close()`` on an already-open SQLite file drops POSIX advisory
+    locks for every connection in this process and can itself corrupt the
+    database (https://sqlite.org/howtocorrupt.html#unlockandclose).
+    """
     if _corruption_event.is_set():
         with _corruption_lock:
             return _corruption_reason or "state database corruption"
@@ -399,16 +415,18 @@ def recovery_restart_requested() -> bool:
 
 def _reset_recovery_state_for_tests() -> None:
     global _corruption_reason, _recovery_restart_requested, _bootstrap_recovery_report
+    global _journal_mode_ready
     with _corruption_lock:
         _corruption_reason = ""
         _corruption_event.clear()
     _recovery_restart_requested = False
     _bootstrap_recovery_report = None
+    _journal_mode_ready = False
 
 
 def init() -> None:
     """启动时调用。确保当前连接的 schema 始终升级到最新版本。"""
-    global _initialized, _db_path
+    global _initialized, _db_path, _journal_mode_ready
     resolved = _resolve_db_path()
     if _db_path != resolved:
         old = getattr(_local, "conn", None)
@@ -419,6 +437,7 @@ def init() -> None:
                 pass
             _local.conn = None
         _db_path = resolved
+        _journal_mode_ready = False
     os.makedirs(os.path.dirname(_db_path) or ".", exist_ok=True)
     conn = _get_conn()
     with _write_lock:
@@ -431,7 +450,11 @@ def init() -> None:
             _rollback_failed_write(conn)
             raise
     if not _initialized:
-        print(f"[state_db] Using {_db_path}")
+        mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        print(
+            f"[state_db] Using {_db_path} "
+            f"(sqlite={sqlite3.sqlite_version}, journal={mode})"
+        )
     _initialized = True
 
 
@@ -939,16 +962,30 @@ def _migrate_oauth_quota_cache_openai_cols(conn: sqlite3.Connection) -> None:
 
 
 def _get_conn() -> sqlite3.Connection:
+    global _journal_mode_ready
     if getattr(_local, "conn", None) is None:
         if _db_path is None:
             raise RuntimeError("state_db.init() not called")
         conn = sqlite3.connect(_db_path, timeout=10, factory=_StateConnection)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA wal_autocheckpoint=1000")
-        conn.execute("PRAGMA journal_size_limit=1048576")
-        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            conn.row_factory = sqlite3.Row
+            # SQLite <=3.51.2 has an upstream WAL-reset race when multiple
+            # connections write/checkpoint concurrently. state.db is small and
+            # all its writes are already serialized, so rollback journal is the
+            # safer and sufficient mode. Only the first startup connection may
+            # change the persistent mode; worker connections merely verify it.
+            with _write_lock:
+                pragma = "PRAGMA journal_mode=DELETE" if not _journal_mode_ready else "PRAGMA journal_mode"
+                row = conn.execute(pragma).fetchone()
+                mode = str(row[0] if row is not None else "").strip().lower()
+                if mode != "delete":
+                    raise RuntimeError(f"state.db requires journal_mode=DELETE, got {mode or '?'}")
+                _journal_mode_ready = True
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        except BaseException:
+            conn.close()
+            raise
         _local.conn = conn
     return _local.conn
 
@@ -1014,27 +1051,16 @@ def optional_write_timeout(timeout_ms: int = 100):
 
 
 def checkpoint(*, mode: str = "TRUNCATE", strict: bool = False) -> tuple[int, int, int]:
-    """Checkpoint the state WAL and report ``(busy, log, checkpointed)``.
-
-    Periodic maintenance uses the default TRUNCATE mode.  Restart guards use
-    ``mode="FULL", strict=True`` so a busy or incomplete checkpoint becomes a
-    hard failure instead of being silently ignored.
-    """
+    """Compatibility no-op: state.db deliberately does not use WAL anymore."""
     normalized = str(mode or "TRUNCATE").strip().upper()
     if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
         raise ValueError(f"unsupported WAL checkpoint mode: {mode}")
+    # Opening/verifying the connection is still useful for strict restart
+    # guards, but executing wal_checkpoint would reintroduce the vulnerable
+    # checkpoint path this database intentionally avoids.
     with _write_lock:
-        row = _get_conn().execute(f"PRAGMA wal_checkpoint({normalized})").fetchone()
-    if row is None or len(row) < 3:
-        raise RuntimeError(f"WAL checkpoint {normalized} returned no status")
-    result = (int(row[0]), int(row[1]), int(row[2]))
-    busy, log_pages, checkpointed_pages = result
-    if strict and (busy != 0 or checkpointed_pages != log_pages):
-        raise RuntimeError(
-            f"WAL checkpoint {normalized} incomplete: "
-            f"busy={busy}, log={log_pages}, checkpointed={checkpointed_pages}"
-        )
-    return result
+        _get_conn().execute("SELECT 1").fetchone()
+    return (0, 0, 0)
 
 
 def online_backup(destination: str, *, verify: bool = True) -> str:

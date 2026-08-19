@@ -627,13 +627,14 @@ class TestRestartDatabaseGuard:
         finally:
             conn.close()
 
-    def test_checkpoint_failure_blocks_restart_and_keeps_staged(self, monkeypatch):
-        self._stage_bare_update("src-checkpoint-fail")
+    def test_confirm_restart_does_not_run_wal_checkpoint(self, monkeypatch):
+        self._stage_bare_update("src-no-checkpoint")
+        checkpoint_calls = []
         restart_calls = []
         monkeypatch.setattr(
             state_db,
             "checkpoint",
-            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("busy=1")),
+            lambda **kwargs: checkpoint_calls.append(kwargs) or (0, 0, 0),
         )
         monkeypatch.setattr(
             updater,
@@ -643,16 +644,14 @@ class TestRestartDatabaseGuard:
 
         ok, detail = updater.confirm_restart()
 
-        assert ok is False
-        assert "state database protection failed" in detail
-        assert "busy=1" in detail
-        assert restart_calls == []
-        assert updater.load_state()["stage"] == updater.STAGE_STAGED
+        assert ok is True, detail
+        assert checkpoint_calls == []
+        assert restart_calls == ["restart"]
+        assert updater.load_state()["stage"] == updater.STAGE_RESTARTING
 
     def test_backup_or_integrity_failure_blocks_restart(self, monkeypatch):
         self._stage_bare_update("src-backup-fail")
         restart_calls = []
-        monkeypatch.setattr(state_db, "checkpoint", lambda **kwargs: (0, 7, 7))
         monkeypatch.setattr(
             state_db,
             "online_backup",
@@ -670,35 +669,5 @@ class TestRestartDatabaseGuard:
 
         assert ok is False
         assert "integrity_check failed" in detail
-        assert restart_calls == []
-        assert updater.load_state()["stage"] == updater.STAGE_STAGED
-
-    def test_restarting_state_checkpoint_failure_also_blocks_restart(self, monkeypatch):
-        self._stage_bare_update("src-final-checkpoint-fail")
-        checkpoint_calls = []
-        restart_calls = []
-
-        def fake_checkpoint(**kwargs):
-            checkpoint_calls.append(kwargs)
-            if len(checkpoint_calls) == 2:
-                raise RuntimeError("final checkpoint busy")
-            return (0, 3, 3)
-
-        monkeypatch.setattr(state_db, "checkpoint", fake_checkpoint)
-        monkeypatch.setattr(state_db, "online_backup", lambda *args, **kwargs: args[0])
-        monkeypatch.setattr(
-            updater,
-            "_src_restart",
-            lambda: restart_calls.append("restart") or (True, "scheduled"),
-        )
-
-        ok, detail = updater.confirm_restart()
-
-        assert ok is False
-        assert "final checkpoint busy" in detail
-        assert checkpoint_calls == [
-            {"mode": "FULL", "strict": True},
-            {"mode": "FULL", "strict": True},
-        ]
         assert restart_calls == []
         assert updater.load_state()["stage"] == updater.STAGE_STAGED
