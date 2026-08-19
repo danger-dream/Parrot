@@ -82,10 +82,18 @@ class CursorOAuthChannel(OpenAIApiChannel):
             self.max_concurrent = 0
 
         self._records = cursor_catalog.catalog_records(account)
+        self._disabled_models = oauth_manager.cursor_disabled_models(account)
         self._max_context_defaults = oauth_manager.cursor_max_context_models(account)
-        models = [str(item.get("id") or "") for item in self._records if item.get("id")]
-        if not models:
-            models = [str(item) for item in account.get("models") or [] if str(item)]
+        catalog_models = [
+            str(item.get("id") or "") for item in self._records if item.get("id")
+        ]
+        if catalog_models:
+            models = [model for model in catalog_models if model not in self._disabled_models]
+        else:
+            models = [
+                str(item) for item in account.get("models") or []
+                if str(item) and str(item) not in self._disabled_models
+            ]
         self.models = list(dict.fromkeys(models))
 
         # Reuse the mature OpenAI Chat request/response implementation while
@@ -115,6 +123,7 @@ class CursorOAuthChannel(OpenAIApiChannel):
         except (TypeError, ValueError):
             self.max_concurrent = 0
         self._records = cursor_catalog.catalog_records(account)
+        self._disabled_models = oauth_manager.cursor_disabled_models(account)
         self._max_context_defaults = oauth_manager.cursor_max_context_models(account)
         self.models = list(dict.fromkeys(models))
 
@@ -186,6 +195,14 @@ class CursorOAuthChannel(OpenAIApiChannel):
         *,
         ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
+        if resolved_model not in self.models:
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                f"Cursor model is disabled or unavailable for this account: {resolved_model!r}",
+                param="model",
+                scope="candidate",
+            )
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
         cursor_runtime.update_account(self.account_key, access_token)
 

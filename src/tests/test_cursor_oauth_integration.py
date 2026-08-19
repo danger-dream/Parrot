@@ -15,6 +15,7 @@ from ._isolation import isolate
 isolate()
 
 from src import config, cooldown, model_metadata, notifier, oauth_manager, state_db  # noqa: E402
+from src.channel import registry  # noqa: E402
 from src.channel.cursor_oauth_channel import CursorOAuthChannel  # noqa: E402
 from src.cursor_bridge import agent_pb2  # noqa: E402
 from src.cursor_bridge import catalog as cursor_catalog  # noqa: E402
@@ -29,7 +30,7 @@ from src.cursor_bridge.usage import (  # noqa: E402
 from src.oauth import cursor as cursor_provider  # noqa: E402
 from src.openai.transform.guard import GuardError  # noqa: E402
 from src.telegram import states, ui  # noqa: E402
-from src.telegram.menus import logs_menu, oauth_menu  # noqa: E402
+from src.telegram.menus import load_balancing_menu, logs_menu, oauth_menu  # noqa: E402
 from src.transform import cc_mimicry  # noqa: E402
 
 
@@ -784,7 +785,7 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
 
     account_short = ui.register_code("cursor:cursor-user-1")
     oauth_menu.on_cursor_models(1, 2, "cb-list", f"{account_short}:1")
-    assert "共 <b>7</b> 个可用模型 · 第 <b>1/2</b> 页" in captured["text"]
+    assert "共 <b>7</b> 个模型 · 已禁用 <b>0</b> 个 · 第 <b>1/2</b> 页" in captured["text"]
     assert "1. Claude Fable 5" in captured["text"]
     assert "上下文：<code>1.0M</code>（Max Context 默认）" in captured["text"]
     assert "支持思考档位：low、medium、high、max" in captured["text"]
@@ -800,6 +801,13 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
     ]
     assert [button["text"] for button in details] == [
         "📄 #1", "📄 #2", "📄 #3", "📄 #4", "📄 #5", "📄 #6",
+    ]
+    refresh_row = next(
+        row for row in captured["reply_markup"]["inline_keyboard"]
+        if row and row[0].get("text") == "🔄 刷新额度与模型"
+    )
+    assert [button.get("text") for button in refresh_row] == [
+        "🔄 刷新额度与模型", "🚫 批量禁用",
     ]
 
     detail_payload = details[0]["callback_data"].split(":", 2)[2]
@@ -829,6 +837,152 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
     assert "默认上下文：<code>300.0K</code>（Max Context 已关闭）" in captured["text"]
     assert "Max Context 默认：<b>已关闭</b>" in captured["text"]
     assert any("Max Context 默认已关闭" in answer for answer in answers)
+
+
+def test_cursor_disabled_models_filter_channel_and_survive_refresh_and_relogin(
+    monkeypatch,
+):
+    oauth_manager.add_account(_account())
+    account_key = "cursor:cursor-user-1"
+
+    saved = oauth_manager.set_cursor_disabled_models(account_key, {"gpt-5.5"})
+    assert saved == {"gpt-5.5"}
+    assert oauth_manager.cursor_disabled_models(account_key) == {"gpt-5.5"}
+
+    account = oauth_manager.get_account(account_key)
+    channel = CursorOAuthChannel(account)
+    assert "gpt-5.5" not in channel.list_client_models()
+    assert channel.supports_model("gpt-5.5") is None
+    assert channel.supports_model("claude-fable-5") == "claude-fable-5"
+    with pytest.raises(GuardError, match="disabled or unavailable"):
+        asyncio.run(channel.build_upstream_request(
+            {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+            "gpt-5.5",
+            ingress_protocol="chat",
+        ))
+
+    # Normal model refresh and re-login payloads omit this local preference.
+    monkeypatch.setattr(cursor_provider, "fetch_model_catalog_sync", lambda _token: _catalog())
+    monkeypatch.setattr(cursor_provider, "fetch_profile_sync", lambda *_args, **_kwargs: {})
+    refreshed = oauth_manager.refresh_cursor_models_sync(
+        account_key, force=True, min_interval_seconds=0,
+    )
+    assert refreshed["action"] == "updated"
+    assert oauth_manager.cursor_disabled_models(account_key) == {"gpt-5.5"}
+    oauth_manager.add_account(_account())
+    assert oauth_manager.cursor_disabled_models(account_key) == {"gpt-5.5"}
+    with pytest.raises(ValueError, match="Cursor model not found"):
+        oauth_manager.set_cursor_disabled_models(account_key, {"not-in-catalog"})
+
+    all_models = set(oauth_manager.get_account(account_key)["models"])
+    oauth_manager.set_cursor_disabled_models(account_key, all_models)
+    assert CursorOAuthChannel(oauth_manager.get_account(account_key)).list_client_models() == []
+
+    assert oauth_manager.set_cursor_disabled_models(account_key, set()) == set()
+    assert CursorOAuthChannel(oauth_manager.get_account(account_key)).supports_model(
+        "gpt-5.5"
+    ) == "gpt-5.5"
+
+
+def test_cursor_batch_disable_menu_persists_and_can_reenable(monkeypatch):
+    oauth_manager.add_account(_account())
+    account_key = "cursor:cursor-user-1"
+    account_short = ui.register_code(account_key)
+    captured: dict = {}
+    answers: list[str] = []
+    monkeypatch.setattr(
+        ui,
+        "answer_cb",
+        lambda *_args, **_kwargs: answers.append(
+            str(_args[1] if len(_args) > 1 else "")
+        ),
+    )
+    monkeypatch.setattr(ui, "edit", lambda *_args, **kwargs: captured.update({
+        "text": _args[2], "reply_markup": kwargs.get("reply_markup"),
+    }))
+
+    assert oauth_menu.handle_callback(
+        10, 20, "cb-start", f"oa:cursor_disable:{account_short}:1"
+    ) is True
+    state = oauth_menu._cursor_disable_state(10)
+    assert state and state["selected"] == []
+    records = oauth_menu._cursor_model_records(oauth_manager.get_account(account_key))
+    gpt_index = next(
+        index for index, item in enumerate(records, start=1)
+        if item["id"] == "gpt-5.5"
+    )
+    assert oauth_menu.handle_callback(
+        10, 20, "cb-select", f"oa:cursor_dis_sel:{gpt_index}"
+    ) is True
+    assert oauth_menu._cursor_disable_state(10)["selected"] == ["gpt-5.5"]
+    assert "将禁用 <b>1</b> 个" in captured["text"]
+
+    assert oauth_menu.handle_callback(10, 20, "cb-save", "oa:cursor_dis_save") is True
+    assert states.get_state(10) is None
+    assert oauth_manager.cursor_disabled_models(account_key) == {"gpt-5.5"}
+    assert "已禁用 <b>1</b> 个" in captured["text"]
+    assert "GPT-5.5</b> · <code>gpt-5.5</code> · 🚫 <b>已禁用</b>" in captured["text"]
+    assert any("已禁用 1 个 Cursor 模型" in answer for answer in answers)
+    gpt_ref = oauth_menu._cursor_model_ref(account_key, "gpt-5.5")
+    oauth_menu.on_cursor_model_detail(10, 20, "cb-detail", f"{gpt_ref}:1")
+    assert "使用状态：🚫 已禁用" in captured["text"]
+
+    # Reopening starts from the persisted set; deselect + save restores use.
+    oauth_menu.on_cursor_disable_start(10, 20, "cb-reopen", f"{account_short}:1")
+    assert oauth_menu._cursor_disable_state(10)["selected"] == ["gpt-5.5"]
+    oauth_menu.on_cursor_disable_set_all(10, 20, "cb-all", selected_all=True)
+    assert set(oauth_menu._cursor_disable_state(10)["selected"]) == {
+        item["id"] for item in records
+    }
+    oauth_menu.on_cursor_disable_set_all(10, 20, "cb-clear", selected_all=False)
+    assert oauth_menu._cursor_disable_state(10)["selected"] == []
+    oauth_menu.on_cursor_disable_select(10, 20, "cb-reselect", str(gpt_index))
+    oauth_menu.on_cursor_disable_select(10, 20, "cb-enable", str(gpt_index))
+    oauth_menu.on_cursor_disable_save(10, 20, "cb-save-enable")
+    assert oauth_manager.cursor_disabled_models(account_key) == set()
+
+
+def test_cursor_disabled_model_disappears_from_registry_and_load_balancing():
+    oauth_manager.add_account(_account())
+    account_key = "cursor:cursor-user-1"
+    oauth_manager.set_cursor_disabled_models(account_key, {"gpt-5.5"})
+    try:
+        registry.rebuild_from_config()
+        channel = registry.get_channel("oauth:cursor:cursor-user-1")
+        assert channel is not None
+        assert channel.supports_model("gpt-5.5") is None
+        assert channel not in load_balancing_menu._channels_for_model("gpt-5.5")
+        assert "gpt-5.5" not in load_balancing_menu._client_models()
+        assert channel in load_balancing_menu._channels_for_model("claude-fable-5")
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("oauthAccounts", []))
+        registry.rebuild_from_config()
+
+
+def test_cursor_model_disable_is_scoped_to_one_account():
+    first = _account()
+    second = _account()
+    second.update({
+        "email": "cursor-second@local",
+        "label": "Cursor Second",
+        "subject": "cursor-user-2",
+        "sub": "cursor-user-2",
+        "access_token": "test-access-2",
+        "refresh_token": "test-refresh-2",
+    })
+    oauth_manager.add_account(first)
+    oauth_manager.add_account(second)
+    oauth_manager.set_cursor_disabled_models("cursor:cursor-user-1", {"gpt-5.5"})
+    try:
+        registry.rebuild_from_config()
+        candidates = load_balancing_menu._channels_for_model("gpt-5.5")
+        keys = {channel.key for channel in candidates}
+        assert "oauth:cursor:cursor-user-1" not in keys
+        assert "oauth:cursor:cursor-user-2" in keys
+        assert "gpt-5.5" in load_balancing_menu._client_models()
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("oauthAccounts", []))
+        registry.rebuild_from_config()
 
 
 def test_cursor_account_and_model_codes_survive_process_restart():

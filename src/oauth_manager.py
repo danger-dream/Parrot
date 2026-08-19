@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from . import cache_display, config, load_balancing, network, notifier, oauth_errors, state_db
 from .oauth import (
@@ -2417,6 +2417,7 @@ def _add_account_serialized(entry: dict) -> None:
       - id_token / subject / sub / base_url / token_endpoint / redirect_uri
         (xAI 专属)
       - cursor_max_context_disabled_models（Cursor 每账号显式关闭 Max Context 的例外）
+      - cursor_disabled_models（Cursor 每账号禁用的 canonical 模型）
     """
     required = ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
@@ -2486,6 +2487,12 @@ def _add_account_serialized(entry: dict) -> None:
             normalized["cursor_max_context_disabled_models"] = sorted({
                 str(model).strip()
                 for model in entry.get("cursor_max_context_disabled_models") or []
+                if str(model).strip()
+            })
+        if "cursor_disabled_models" in entry:
+            normalized["cursor_disabled_models"] = sorted({
+                str(model).strip()
+                for model in entry.get("cursor_disabled_models") or []
                 if str(model).strip()
             })
     # Claude 专属字段（套餐/订阅信息，来自 /api/oauth/profile）
@@ -3388,6 +3395,47 @@ async def cursor_model_sync_loop() -> None:
         except Exception as exc:
             print(f"[cursor] model sync loop failed: {exc}")
             await asyncio.sleep(300)
+
+
+def cursor_disabled_models(account_or_key: dict | str) -> set[str]:
+    """Return canonical models disabled for one Cursor account."""
+    account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
+    if not isinstance(account, dict) or provider_of(account) != "cursor":
+        return set()
+    return {
+        str(model).strip()
+        for model in account.get("cursor_disabled_models") or []
+        if str(model).strip()
+    }
+
+
+def set_cursor_disabled_models(account_key: str, models: Iterable[str]) -> set[str]:
+    """Persist the exact disabled canonical-model set for one Cursor account."""
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    account = get_account(canonical)
+    if account is None or provider_of(account) != "cursor":
+        raise ValueError("Cursor account not found")
+    available = {
+        str(item.get("id") or "").strip()
+        for item in ((account.get("cursor_model_catalog") or {}).get("models") or [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    wanted = {
+        str(model).strip() for model in models or [] if str(model).strip()
+    }
+    unknown = sorted(wanted - available)
+    if unknown:
+        raise ValueError(f"Cursor model not found: {unknown[0]}")
+
+    def mutate(cfg):
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) == canonical:
+                item["cursor_disabled_models"] = sorted(wanted)
+                return
+        raise ValueError("Cursor account not found")
+
+    config.update(mutate, skip_if_unchanged=True)
+    return set(wanted)
 
 
 def _cursor_max_context_capable_models(account: dict) -> set[str]:

@@ -2337,10 +2337,20 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         provider_line = _format_xai_provider_line(account_key, detail=True)
     elif prov == "cursor":
         profile_name = str(acc.get("cursor_profile_name") or "").strip()
+        cursor_model_ids = {
+            str(item.get("id") or "") for item in _cursor_model_records(acc)
+        }
+        if not cursor_model_ids:
+            cursor_model_ids = {
+                str(model) for model in acc.get("models") or [] if str(model)
+            }
+        cursor_disabled = oauth_manager.cursor_disabled_models(acc) & cursor_model_ids
+        cursor_available = max(0, len(cursor_model_ids) - len(cursor_disabled))
+        disabled_suffix = f" · 禁用 {len(cursor_disabled)}" if cursor_disabled else ""
         provider_line = (
             (f"👤 姓名: <code>{ui.escape_html(profile_name)}</code>\n" if profile_name else "")
             + f"🏷️ 套餐: <code>{ui.escape_html(str(acc.get('plan_type') or 'Cursor'))}</code>\n"
-            f"🧬 模型目录: <code>{len(acc.get('models') or [])} 个可用模型</code>\n"
+            f"🧬 模型目录: <code>{cursor_available} 个可用模型{disabled_suffix}</code>\n"
             f"📚 元数据: <code>Cursor AvailableModels（账号专属）</code>\n"
         )
     else:
@@ -2651,6 +2661,7 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
 
 _CURSOR_MODEL_PAGE_SIZE = 6
 _CURSOR_MODEL_REF_SEP = "\x1f"
+_CURSOR_DISABLE_ACTION = "oa_cursor_disable"
 
 
 def _cursor_model_records(acc: dict) -> list[dict]:
@@ -2723,6 +2734,187 @@ def _cursor_effort_text(item: dict) -> str:
     return "、".join(efforts)
 
 
+def _cursor_disable_state(chat_id: int) -> dict | None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != _CURSOR_DISABLE_ACTION:
+        return None
+    return state.get("data") or {}
+
+
+def _set_cursor_disable_state(
+    chat_id: int,
+    account_key: str,
+    *,
+    page: int,
+    selected: set[str],
+) -> None:
+    states.set_state(chat_id, _CURSOR_DISABLE_ACTION, {
+        "account_key": account_key,
+        "page": max(1, int(page or 1)),
+        "selected": sorted(selected),
+    })
+
+
+def _cursor_disable_text_and_kb(data: dict) -> tuple[str, dict] | None:
+    account_key = _resolve_to_account_key(data.get("account_key"))
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+        return None
+    records = _cursor_model_records(acc)
+    available = {str(item.get("id") or "") for item in records}
+    selected = {
+        str(model) for model in data.get("selected") or [] if str(model) in available
+    }
+    lines = [
+        f"🚫 <b>{ui.escape_html(_account_display(acc))} · 批量禁用模型</b>",
+        f"共 <b>{len(records)}</b> 个模型 · 将禁用 <b>{len(selected)}</b> 个",
+        "",
+        "点击序号切换状态，保存后立即从该 Cursor 账户的调度候选中移除。",
+        "再次进入并取消选择即可恢复使用。",
+    ]
+    for index, item in enumerate(records, start=1):
+        model_id = str(item.get("id") or "")
+        name = str(item.get("name") or model_id)
+        status = "🚫" if model_id in selected else "✅"
+        lines.append(
+            f"{index}. {status} <b>{ui.escape_html(name)}</b> · "
+            f"<code>{ui.escape_html(model_id)}</code>"
+        )
+
+    rows: list[list[dict]] = []
+    for numbers in _split_number_rows(len(records)):
+        rows.append([
+            ui.btn(
+                f"{number} {'🚫' if str(records[number - 1].get('id') or '') in selected else '✅'}",
+                f"oa:cursor_dis_sel:{number}",
+            )
+            for number in numbers
+        ])
+    if records:
+        rows.append([
+            ui.btn("全选", "oa:cursor_dis_all"),
+            ui.btn("清空", "oa:cursor_dis_clear"),
+        ])
+    rows.append([ui.btn("💾 保存禁用设置", "oa:cursor_dis_save")])
+    rows.append([ui.btn("◀ 取消并返回", "oa:cursor_dis_cancel")])
+    return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
+
+
+def _show_cursor_disable(
+    chat_id: int, message_id: int, cb_id: str | None = None
+) -> None:
+    data = _cursor_disable_state(chat_id)
+    rendered = _cursor_disable_text_and_kb(data or {}) if data else None
+    if rendered is None:
+        ui.answer_cb(cb_id or "", "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
+        return
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    text, kb = rendered
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_cursor_disable_start(
+    chat_id: int, message_id: int, cb_id: str, payload: str
+) -> None:
+    short, page = _cursor_model_page_payload(payload)
+    account_key = _account_key_from_short(short)
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+        ui.answer_cb(cb_id, "Cursor 账户或短码已失效", show_alert=True)
+        return
+    available = {str(item.get("id") or "") for item in _cursor_model_records(acc)}
+    selected = oauth_manager.cursor_disabled_models(acc) & available
+    _set_cursor_disable_state(
+        chat_id, account_key, page=page, selected=selected,
+    )
+    _show_cursor_disable(chat_id, message_id, cb_id)
+
+
+def on_cursor_disable_select(
+    chat_id: int, message_id: int, cb_id: str, index_text: str
+) -> None:
+    data = _cursor_disable_state(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
+        return
+    account_key = _resolve_to_account_key(data.get("account_key"))
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    records = _cursor_model_records(acc) if acc else []
+    try:
+        index = int(index_text)
+    except ValueError:
+        index = 0
+    if index < 1 or index > len(records):
+        ui.answer_cb(cb_id, "模型序号已失效", show_alert=True)
+        return
+    model_id = str(records[index - 1].get("id") or "")
+    selected = {str(model) for model in data.get("selected") or []}
+    if model_id in selected:
+        selected.remove(model_id)
+    else:
+        selected.add(model_id)
+    _set_cursor_disable_state(
+        chat_id, account_key, page=int(data.get("page") or 1), selected=selected,
+    )
+    _show_cursor_disable(chat_id, message_id, cb_id)
+
+
+def on_cursor_disable_set_all(
+    chat_id: int, message_id: int, cb_id: str, *, selected_all: bool
+) -> None:
+    data = _cursor_disable_state(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
+        return
+    account_key = _resolve_to_account_key(data.get("account_key"))
+    acc = oauth_manager.get_account(account_key) if account_key else None
+    if acc is None or oauth_manager.provider_of(acc) != "cursor":
+        ui.answer_cb(cb_id, "Cursor 账户已不存在", show_alert=True)
+        return
+    selected = (
+        {str(item.get("id") or "") for item in _cursor_model_records(acc)}
+        if selected_all else set()
+    )
+    _set_cursor_disable_state(
+        chat_id, account_key, page=int(data.get("page") or 1), selected=selected,
+    )
+    _show_cursor_disable(chat_id, message_id, cb_id)
+
+
+def on_cursor_disable_save(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _cursor_disable_state(chat_id)
+    if not data:
+        ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
+        return
+    account_key = _resolve_to_account_key(data.get("account_key"))
+    page = max(1, int(data.get("page") or 1))
+    try:
+        saved = oauth_manager.set_cursor_disabled_models(
+            account_key or "", data.get("selected") or [],
+        )
+    except ValueError as exc:
+        ui.answer_cb(cb_id, str(exc), show_alert=True)
+        return
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id, f"已禁用 {len(saved)} 个 Cursor 模型")
+    short = ui.register_code(account_key)
+    on_cursor_models(chat_id, message_id, "", f"{short}:{page}")
+
+
+def on_cursor_disable_cancel(chat_id: int, message_id: int, cb_id: str) -> None:
+    data = _cursor_disable_state(chat_id) or {}
+    account_key = _resolve_to_account_key(data.get("account_key"))
+    page = max(1, int(data.get("page") or 1))
+    states.pop_state(chat_id)
+    if not account_key:
+        ui.answer_cb(cb_id, "会话已失效", show_alert=True)
+        return
+    ui.answer_cb(cb_id)
+    short = ui.register_code(account_key)
+    on_cursor_models(chat_id, message_id, "", f"{short}:{page}")
+
+
 def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     short, page = _cursor_model_page_payload(payload)
     account_key = _account_key_from_short(short)
@@ -2731,13 +2923,17 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         ui.answer_cb(cb_id, "Cursor 账户或短码已失效")
         return
     records = _cursor_model_records(acc)
+    disabled_models = oauth_manager.cursor_disabled_models(acc)
+    disabled_count = sum(
+        1 for item in records if str(item.get("id") or "") in disabled_models
+    )
     total_pages = max(1, math.ceil(len(records) / _CURSOR_MODEL_PAGE_SIZE))
     page = min(page, total_pages)
     start = (page - 1) * _CURSOR_MODEL_PAGE_SIZE
     selected = records[start:start + _CURSOR_MODEL_PAGE_SIZE]
     lines = [
         f"🧬 <b>{ui.escape_html(_account_display(acc))} · Cursor 模型目录</b>",
-        f"共 <b>{len(records)}</b> 个可用模型 · 第 <b>{page}/{total_pages}</b> 页",
+        f"共 <b>{len(records)}</b> 个模型 · 已禁用 <b>{disabled_count}</b> 个 · 第 <b>{page}/{total_pages}</b> 页",
     ]
     for offset, item in enumerate(selected, start=1):
         display_index = start + offset
@@ -2752,9 +2948,10 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         effective_context = max_context if default_max else context
         context_suffix = "（Max Context 默认）" if default_max else ""
         effort_text = _cursor_effort_text(item)
+        disabled_suffix = " · 🚫 <b>已禁用</b>" if model_id in disabled_models else ""
         lines.extend([
             "",
-            f"<b>{display_index}. {ui.escape_html(name)}</b> · <code>{ui.escape_html(model_id)}</code>",
+            f"<b>{display_index}. {ui.escape_html(name)}</b> · <code>{ui.escape_html(model_id)}</code>{disabled_suffix}",
             f"上下文：<code>{ui.fmt_tokens(effective_context)}</code>{context_suffix} · 推理 {'✅' if item.get('reasoning') else '—'} · 图片上游 {'✅' if item.get('supports_images') else '—'}",
         ])
         if effort_text:
@@ -2782,7 +2979,10 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         ui.btn(f"{page}/{total_pages}", f"oa:cursor_models:{short}:{page}"),
         ui.btn("下一页 ▶", f"oa:cursor_models:{short}:{next_page}"),
     ])
-    rows.append([ui.btn("🔄 刷新额度与模型", f"oa:refresh_usage:{short}:1")])
+    rows.append([
+        ui.btn("🔄 刷新额度与模型", f"oa:refresh_usage:{short}:1"),
+        ui.btn("🚫 批量禁用", f"oa:cursor_disable:{short}:{page}"),
+    ])
     rows.append([ui.btn("◀ 返回账户详情", f"oa:view:{short}:1")])
     if cb_id:
         ui.answer_cb(cb_id)
@@ -2798,6 +2998,7 @@ def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: s
     account_key, acc, item = resolved
     model_id = str(item.get("id") or "")
     name = str(item.get("name") or model_id)
+    model_disabled = model_id in oauth_manager.cursor_disabled_models(acc)
     context = int(item.get("context_window") or 0)
     max_context = int(item.get("context_window_max_mode") or context)
     max_output = int(item.get("max_tokens") or 0)
@@ -2813,6 +3014,7 @@ def on_cursor_model_detail(chat_id: int, message_id: int, cb_id: str, payload: s
         f"🧬 <b>{ui.escape_html(name)}</b>",
         f"账户：<code>{ui.escape_html(_account_display(acc))}</code>",
         f"模型：<code>{ui.escape_html(model_id)}</code>",
+        f"使用状态：{'🚫 已禁用' if model_disabled else '✅ 已启用'}",
         "",
     ]
     if has_separate_max:
@@ -5229,6 +5431,24 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data.startswith("oa:cursor_models:"):
         on_cursor_models(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:cursor_disable:"):
+        on_cursor_disable_start(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("oa:cursor_dis_sel:"):
+        on_cursor_disable_select(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
+        return True
+    if data == "oa:cursor_dis_all":
+        on_cursor_disable_set_all(chat_id, message_id, cb_id, selected_all=True)
+        return True
+    if data == "oa:cursor_dis_clear":
+        on_cursor_disable_set_all(chat_id, message_id, cb_id, selected_all=False)
+        return True
+    if data == "oa:cursor_dis_save":
+        on_cursor_disable_save(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:cursor_dis_cancel":
+        on_cursor_disable_cancel(chat_id, message_id, cb_id)
         return True
     if data.startswith("oa:cursor_model:"):
         on_cursor_model_detail(chat_id, message_id, cb_id, data.split(":", 2)[2])
