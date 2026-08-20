@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+import pytest
 from datetime import datetime, timedelta, timezone
 
 
@@ -35,18 +36,25 @@ def _import_modules():
     if root not in sys.path:
         sys.path.insert(0, root)
     from src import (
-        affinity, config, cooldown, log_db, probe, scorer, state_db,
+        affinity, channel_state, config, cooldown, log_db, probe, scorer, state_db,
     )
     from src.channel import registry, api_channel
     from src.telegram import bot, menu_cache, states, ui
-    from src.telegram.menus import channel_menu, main as main_menu, status_menu
+    from src.telegram.menus import channel_menu, channel_wizard, main as main_menu, status_menu
     return {
-        "affinity": affinity, "config": config, "cooldown": cooldown,
+        "affinity": affinity, "channel_state": channel_state,
+        "config": config, "cooldown": cooldown,
         "log_db": log_db, "probe": probe, "scorer": scorer, "state_db": state_db,
         "registry": registry, "api_channel": api_channel,
         "bot": bot, "menu_cache": menu_cache, "states": states, "ui": ui,
-        "channel_menu": channel_menu, "main_menu": main_menu, "status_menu": status_menu,
+        "channel_menu": channel_menu, "channel_wizard": channel_wizard,
+        "main_menu": main_menu, "status_menu": status_menu,
     }
+
+
+@pytest.fixture
+def m():
+    return _import_modules()
 
 
 class ApiRecorder:
@@ -108,6 +116,9 @@ def _setup(m):
     m["states"].clear_all()
     # 测试场景下让"后台 worker 任务"立即同步执行，便于断言后续状态
     m["channel_menu"]._SYNC_SPAWN = True
+    async def _discovery_unavailable(*args, **kwargs):
+        raise m["channel_wizard"].ModelsDiscoveryError("测试中禁用外部网络")
+    m["channel_wizard"].discover_models = _discovery_unavailable
     m["registry"].rebuild_from_config()
 
 
@@ -468,6 +479,47 @@ def test_delete_channel_cascades(m):
     print("  [PASS] delete cascades across state.db")
 
 
+def test_wizard_save_recreates_deleted_same_name(m):
+    """用户实测场景：删除后，TG 向导可立即保存同显示名称的新 generation。"""
+    _setup(m)
+    _install_recorder(m)
+    _add_channel(m, "智谱 Max")
+    old_channel = m["registry"].get_channel("api:智谱 Max")
+    old_generation = m["channel_state"].effect_key(old_channel)
+    _insert_channel_success(m, "智谱 Max", "before-recreate")
+    assert m["log_db"].tokens_for_channel("api:智谱 Max", 0)["total"] == 1
+    assert m["registry"].delete_api_channel("智谱 Max")
+
+    data = {
+        "name": "智谱 Max",
+        "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+        "apiPath": None,
+        "apiKey": "sk-testkey-longenough",
+        "protocol": "anthropic",
+        "models": [{"real": "glm-5", "alias": "glm-5"}],
+        "cc_mimicry": True,
+        "test_results": {"glm-5": (True, 12, None)},
+    }
+    m["states"].set_state(42, "ch_wiz_test", data)
+    m["channel_menu"].wiz_save(42, 100, "cb")
+
+    new_channel = m["registry"].get_channel("api:智谱 Max")
+    assert new_channel is not None
+    new_generation = m["channel_state"].effect_key(new_channel)
+    assert new_generation != old_generation
+    _insert_channel_success(m, "智谱 Max", "after-recreate")
+    totals = m["log_db"].tokens_for_channel("api:智谱 Max", 0)
+    models = m["log_db"].channel_model_stats("api:智谱 Max", 0)
+    assert totals["total"] == 2
+    assert totals["input"] == 200
+    assert len(models) == 1 and models[0]["total"] == 2
+    # generation/state key is internal-only and must never become a public stats dimension.
+    assert m["log_db"].tokens_for_channel(old_generation, 0)["total"] == 0
+    assert m["log_db"].tokens_for_channel(new_generation, 0)["total"] == 0
+    assert m["states"].get_state(42) is None
+    print("  [PASS] TG wizard delete → same-name save keeps api:<name> historical stats")
+
+
 def test_add_wizard_happy_path_save_ok(m):
     """完整向导：name → URL → Key → models → 测试（mock 成功）→ 保存。"""
     _setup(m)
@@ -489,7 +541,11 @@ def test_add_wizard_happy_path_save_ok(m):
     assert m["states"].get_state(42)["action"] == "ch_wiz_key"
 
     cm.wiz_on_key_input(42, "sk-testkey-longenough")
-    assert m["states"].get_state(42)["action"] == "ch_wiz_models"
+    # 自动发现失败后直接进入可输入状态，不再要求额外点击“手动输入”。
+    manual_state = m["states"].get_state(42)
+    assert manual_state["action"] == "ch_wiz_models"
+    assert manual_state["data"]["models_source"] == "manual"
+    assert manual_state["data"]["discovery_retry_available"] is True
 
     cm.wiz_on_models_input(42, "GLM-5:glm-5, GLM-Turbo:glm-turbo")
     assert m["states"].get_state(42)["action"] == "ch_wiz_test"
@@ -525,7 +581,9 @@ def test_add_wizard_partial_ok_saves_and_marks_failed_as_cooldown(m):
     cm.wiz_start(42, 100, "cb")
     cm.wiz_on_name_input(42, "mixed")
     cm.wiz_on_url_input(42, "https://m.example.com/v")
+    cm.wiz_on_protocol_select(42, 100, "cb", "anthropic")
     cm.wiz_on_key_input(42, "sk-long-enough")
+    m["channel_wizard"].wiz_manual(42, 100, "cb")
     cm.wiz_on_models_input(42, "A:a, B:b")
 
     # a 成功 b 失败
@@ -552,7 +610,9 @@ def test_add_wizard_all_fail_cannot_save(m):
     cm.wiz_start(42, 100, "cb")
     cm.wiz_on_name_input(42, "bad")
     cm.wiz_on_url_input(42, "https://b.example.com/v")
+    cm.wiz_on_protocol_select(42, 100, "cb", "anthropic")
     cm.wiz_on_key_input(42, "sk-long-enough")
+    m["channel_wizard"].wiz_manual(42, 100, "cb")
     cm.wiz_on_models_input(42, "X")
     _set_probe_result(m, lambda c, mdl: (False, 50, "down"))
 
@@ -574,7 +634,9 @@ def test_add_wizard_skip_test(m):
     cm.wiz_start(42, 100, "cb")
     cm.wiz_on_name_input(42, "skipme")
     cm.wiz_on_url_input(42, "https://s.example.com/v")
+    cm.wiz_on_protocol_select(42, 100, "cb", "anthropic")
     cm.wiz_on_key_input(42, "sk-long-enough")
+    m["channel_wizard"].wiz_manual(42, 100, "cb")
     cm.wiz_on_models_input(42, "p1, p2:alias2")
 
     cm.wiz_skip_test(42, 100, "cb")
@@ -623,6 +685,7 @@ def test_add_wizard_input_validation(m):
     cm.wiz_on_key_input(42, "x")
     assert m["states"].get_state(42)["action"] == "ch_wiz_key"
     cm.wiz_on_key_input(42, "sk-long-enough")
+    m["channel_wizard"].wiz_manual(42, 100, "cb")
     # Models 校验
     cm.wiz_on_models_input(42, "a:x, b:x")  # 重复别名
     assert m["states"].get_state(42)["action"] == "ch_wiz_models"
@@ -839,6 +902,7 @@ def main():
         test_toggle_clear_errors_clear_affinity,
         test_global_clear,
         test_delete_channel_cascades,
+        test_wizard_save_recreates_deleted_same_name,
         test_add_wizard_happy_path_save_ok,
         test_add_wizard_partial_ok_saves_and_marks_failed_as_cooldown,
         test_add_wizard_all_fail_cannot_save,

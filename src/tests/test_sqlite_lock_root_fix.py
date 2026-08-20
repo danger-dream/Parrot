@@ -1254,6 +1254,10 @@ def test_api_channel_rename_preserves_state_with_real_reload_callback():
 
     config.update(seed)
     registry.rebuild_from_config()
+    legacy_generation = channel_state.effect_key(registry.get_channel(old_key))
+    assert not config.get()["channels"][0].get("generationId")
+    registry.rebuild_from_config()
+    assert channel_state.effect_key(registry.get_channel(old_key)) == legacy_generation
     scorer.record_success(old_key, "model", 1, 2, 3)
     cooldown.record_error(
         old_key, "model", "keep", cooldown_until=state_db.now_ms() + 60_000,
@@ -1276,6 +1280,8 @@ def test_api_channel_rename_preserves_state_with_real_reload_callback():
         config._reload_callbacks.remove(callback)
 
     assert snapshots == [([new_name], [new_key])]
+    assert config.get()["channels"][0]["generationId"] == channel_state.generation_id(legacy_generation)
+    assert channel_state.effect_key(registry.get_channel(new_key)) == legacy_generation
     assert scorer.get_stats(old_key, "model") is None
     assert scorer.get_stats(new_key, "model") is not None
     assert cooldown.get_state(new_key, "model") is not None
@@ -1809,7 +1815,9 @@ def test_api_delete_holds_serialized_lifecycle_through_cascade(monkeypatch):
         "cc_mimicry": True, "enabled": True,
     }
     config.update(lambda cfg: cfg.__setitem__("channels", [dict(entry)]))
-    registry.rebuild_from_config(); scorer.record_success(key, "old", 1, 2, 3)
+    registry.rebuild_from_config()
+    old_generation = channel_state.effect_key(registry.get_channel(key))
+    scorer.record_success(old_generation, "old", 1, 2, 3)
     entered = threading.Event(); allow = threading.Event(); add_done = threading.Event()
     results = []; errors: list[BaseException] = []
     real_clear = scorer.clear_stats
@@ -1830,7 +1838,8 @@ def test_api_delete_holds_serialized_lifecycle_through_cascade(monkeypatch):
     def add_worker():
         try:
             registry.add_api_channel(dict(entry))
-            scorer.record_success(key, "new", 4, 5, 6)
+            new_channel = registry.get_channel(key)
+            scorer.record_success(channel_state.effect_key(new_channel), "new", 4, 5, 6)
         except BaseException as exc:
             errors.append(exc)
         finally:
@@ -1844,12 +1853,12 @@ def test_api_delete_holds_serialized_lifecycle_through_cascade(monkeypatch):
     allow.set(); first.join(5); second.join(5)
 
     assert results == [True]
-    assert len(errors) == 1
-    assert isinstance(errors[0], ValueError)
-    assert "restart before reusing" in str(errors[0])
-    assert registry.get_channel(key) is None
+    assert errors == []
+    new_channel = registry.get_channel(key)
+    assert new_channel is not None
+    assert channel_state.effect_key(new_channel) != old_generation
     assert scorer.get_stats(key, "old") is None
-    assert scorer.get_stats(key, "new") is None
+    assert scorer.get_stats(key, "new") is not None
 
 
 def test_registry_stale_cleanup_clears_scorer_and_cooldown_memory_and_db(monkeypatch):
@@ -1999,13 +2008,15 @@ def test_api_delete_is_one_config_snapshot_and_drops_late_generation_writes():
 
     config.update(seed)
     registry.rebuild_from_config()
-    scorer.record_success(key, "model", 1, 2, 3)
+    old_channel = registry.get_channel(key)
+    old_generation = channel_state.effect_key(old_channel)
+    scorer.record_success(old_generation, "model", 1, 2, 3)
     cooldown.record_error(key, "model", "old")
     affinity.upsert(f"fp-{suffix}", key, "model")
     affinity.client_upsert(f"client-{suffix}", key, "model")
     with concurrency._slots_guard:
-        concurrency._slots[key] = concurrency.ChannelSlot(
-            key=key, max_concurrent=1, in_flight=1,
+        concurrency._slots[old_generation] = concurrency.ChannelSlot(
+            key=old_generation, max_concurrent=1, in_flight=1,
         )
     snapshots = []
 
@@ -2022,24 +2033,39 @@ def test_api_delete_is_one_config_snapshot_and_drops_late_generation_writes():
         config._reload_callbacks.remove(callback)
 
     assert snapshots == [([], [])]
-    assert channel_state.is_deleted(key)
+    assert channel_state.is_deleted(old_generation)
+    assert not channel_state.is_deleted(key)
 
     # Simulate completion side effects from a request holding the old Channel.
-    scorer.record_success(key, "late", 4, 5, 6)
-    scorer.record_failure(key, "late", 4)
-    assert cooldown.record_error(key, "late", "late") == {}
-    affinity.upsert(f"late-fp-{suffix}", key, "late")
-    affinity.client_upsert(f"late-client-{suffix}", key, "late")
+    scorer.record_success(old_generation, "late", 4, 5, 6)
+    scorer.record_failure(old_generation, "late", 4)
+    assert cooldown.record_error(old_generation, "late", "late") == {}
+    affinity.upsert(f"late-fp-{suffix}", old_generation, "late")
+    affinity.client_upsert(f"late-client-{suffix}", old_generation, "late")
     assert scorer.get_stats(key, "late") is None
     assert cooldown.get_state(key, "late") is None
     assert affinity.get(f"late-fp-{suffix}") is None
     assert affinity.client_get(f"late-client-{suffix}") is None
     assert state_db.perf_load(key, "late") is None
     assert state_db.error_load(key, "late") is None
-    concurrency.release(key)
-    assert channel_state.is_deleted(key)
-    with pytest.raises(ValueError, match="restart before reusing"):
-        registry.add_api_channel(dict(entry))
+    concurrency.release(old_generation)
+    registry.add_api_channel(dict(entry))
+    new_channel = registry.get_channel(key)
+    new_generation = channel_state.effect_key(new_channel)
+    assert new_channel is not None
+    assert new_generation != old_generation
+    registry.rebuild_from_config()
+    assert channel_state.effect_key(registry.get_channel(key)) == new_generation
+    stored_entry = next(c for c in config.get()["channels"] if c["name"] == name)
+    assert stored_entry.get("generationId")
+    scorer.record_success(new_generation, "new", 7, 8, 9)
+    cooldown.record_error(new_generation, "new", "new")
+    affinity.upsert(f"new-fp-{suffix}", new_generation, "new")
+    affinity.client_upsert(f"new-client-{suffix}", new_generation, "new")
+    assert scorer.get_stats(key, "new") is not None
+    assert cooldown.get_state(key, "new") is not None
+    assert affinity.get(f"new-fp-{suffix}")["channel_key"] == key
+    assert affinity.client_get(f"new-client-{suffix}")["channel_key"] == key
 
 
 def test_legacy_email_delete_cleans_all_accounts_atomically_and_blocks_late_quota():
@@ -2131,13 +2157,16 @@ def test_failed_delete_config_write_restores_generation_reusability(monkeypatch)
         "cc_mimicry": True, "enabled": True,
     }
     config.update(lambda cfg: cfg.__setitem__("channels", [dict(entry)]))
+    registry.rebuild_from_config()
+    original_generation = channel_state.effect_key(registry.get_channel(key))
     monkeypatch.setattr(
         config, "_write_atomic",
         lambda _cfg: (_ for _ in ()).throw(OSError("write failed")),
     )
     with pytest.raises(OSError, match="write failed"):
         registry.delete_api_channel(name)
-    assert not channel_state.is_deleted(key)
+    assert not channel_state.is_deleted(original_generation)
+    assert channel_state.effect_key(registry.get_channel(key)) == original_generation
     assert any(
         channel.get("name") == name
         for channel in config.get().get("channels", [])
@@ -2159,23 +2188,24 @@ def test_delete_without_tracked_slot_keeps_process_lifetime_tombstone():
     }
     config.update(lambda cfg: cfg.__setitem__("channels", [dict(entry)]))
     registry.rebuild_from_config()
+    old_generation = channel_state.effect_key(registry.get_channel(key))
     with concurrency._slots_guard:
-        concurrency._slots.pop(key, None)
+        concurrency._slots.pop(old_generation, None)
 
     assert registry.delete_api_channel(name)
-    assert channel_state.is_deleted(key)
+    assert channel_state.is_deleted(old_generation)
 
     # A request may have selected the channel before deletion but not reached
     # concurrency acquire yet (or concurrency may be disabled). Its late side
     # effects must remain rejected even though no slot existed at delete time.
-    scorer.record_success(key, "late", 1, 2, 3)
-    cooldown.record_error(key, "late", "late")
-    affinity.upsert(f"late-no-slot-{suffix}", key, "late")
+    scorer.record_success(old_generation, "late", 1, 2, 3)
+    cooldown.record_error(old_generation, "late", "late")
+    affinity.upsert(f"late-no-slot-{suffix}", old_generation, "late")
     assert scorer.get_stats(key, "late") is None
     assert cooldown.get_state(key, "late") is None
     assert affinity.get(f"late-no-slot-{suffix}") is None
-    with pytest.raises(ValueError, match="restart before reusing"):
-        registry.add_api_channel(dict(entry))
+    registry.add_api_channel(dict(entry))
+    assert registry.get_channel(key) is not None
 
 
 def test_delete_renamed_destination_waits_for_old_generation_to_drain():
@@ -2196,29 +2226,28 @@ def test_delete_renamed_destination_waits_for_old_generation_to_drain():
     }
     config.update(lambda cfg: cfg.__setitem__("channels", [dict(entry)]))
     registry.rebuild_from_config()
+    old_generation = channel_state.effect_key(registry.get_channel(old_key))
     with concurrency._slots_guard:
-        concurrency._slots[old_key] = concurrency.ChannelSlot(
-            key=old_key, max_concurrent=1, in_flight=1,
+        concurrency._slots[old_generation] = concurrency.ChannelSlot(
+            key=old_generation, max_concurrent=1, in_flight=1,
         )
 
     registry.update_api_channel(old_name, {"name": new_name})
     assert channel_state.resolve(old_key) == new_key
     assert registry.delete_api_channel(new_name)
-    assert channel_state.is_deleted(new_key)
+    assert channel_state.is_deleted(old_generation)
 
-    # The request acquired before rename still reports using old_key. It must
-    # resolve to the deleted destination and be ignored until old_key drains.
-    scorer.record_success(old_key, "late", 1, 2, 3)
-    cooldown.record_error(old_key, "late", "late")
-    affinity.upsert(f"late-fp-{suffix}", old_key, "late")
+    # The request retains its generation across rename and delete.
+    scorer.record_success(old_generation, "late", 1, 2, 3)
+    cooldown.record_error(old_generation, "late", "late")
+    affinity.upsert(f"late-fp-{suffix}", old_generation, "late")
     assert scorer.get_stats(new_key, "late") is None
     assert cooldown.get_state(new_key, "late") is None
     assert affinity.get(f"late-fp-{suffix}") is None
 
-    concurrency.release(old_key)
-    assert channel_state.is_deleted(new_key)
-    with pytest.raises(ValueError, match="restart before reusing"):
-        registry.add_api_channel(dict(entry, name=new_name))
+    concurrency.release(old_generation)
+    registry.add_api_channel(dict(entry, name=new_name))
+    assert registry.get_channel(new_key) is not None
 
 
 @pytest.mark.asyncio
@@ -2244,35 +2273,50 @@ async def test_delete_cancels_pre_acquire_waiter_and_rejects_disabled_limit_path
 
     config.update(seed)
     registry.rebuild_from_config()
-    assert await concurrency.try_acquire(key)
+    old_generation = channel_state.effect_key(registry.get_channel(key))
+    assert await concurrency.try_acquire(old_generation)
     waiter = asyncio.create_task(
-        concurrency.acquire_from_candidates([(key, "old-credential")], 5),
+        concurrency.acquire_from_candidates([(old_generation, "old-credential")], 5),
     )
     for _ in range(20):
         await asyncio.sleep(0)
         with concurrency._slots_guard:
-            slot = concurrency._slots.get(key)
+            slot = concurrency._slots.get(old_generation)
             if slot is not None and slot.waiters:
                 break
     with concurrency._slots_guard:
-        assert len(concurrency._slots[key].waiters) == 1
+        assert len(concurrency._slots[old_generation].waiters) == 1
 
     assert registry.delete_api_channel(name)
     result = await asyncio.wait_for(waiter, timeout=1)
     assert result is None
-    assert not await concurrency.try_acquire(key)
+    assert not await concurrency.try_acquire(old_generation)
 
     # The generation check must run before the old "limits disabled => True"
     # shortcut as well.
     config.update(
         lambda cfg: cfg.setdefault("concurrency", {}).__setitem__("enabled", False)
     )
-    assert not await concurrency.try_acquire(key)
+    assert not await concurrency.try_acquire(old_generation)
 
-    concurrency.release(key)
     config.update(
         lambda cfg: cfg.setdefault("concurrency", {}).__setitem__("enabled", True)
     )
+    registry.add_api_channel(dict(entry))
+    new_channel = registry.get_channel(key)
+    new_generation = channel_state.effect_key(new_channel)
+    assert new_generation != old_generation
+    assert await concurrency.try_acquire(new_generation)
+    with concurrency._slots_guard:
+        assert concurrency._slots[new_generation].in_flight == 1
+    # The old completion drains only its retired slot; it cannot decrement or
+    # wake the replacement generation.
+    concurrency.release(old_generation)
+    with concurrency._slots_guard:
+        assert concurrency._slots[new_generation].in_flight == 1
+    concurrency.release(new_generation)
+    with concurrency._slots_guard:
+        assert concurrency._slots[new_generation].in_flight == 0
 
 
 @pytest.mark.asyncio

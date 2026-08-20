@@ -68,6 +68,8 @@ class ApiChannel(Channel):
         # 运行期若非空 → 直接 `base_url + api_path`；否则走 default `/v1/xxx` 拼接。
         self.api_path = entry.get("apiPath") or None
         self.api_key = entry.get("apiKey", "")
+        self.provider_id = entry.get("providerId") or None
+        self.provider_preset_id = entry.get("providerPresetId") or None
         self.models: list[dict] = list(entry.get("models") or [])
         self.cc_mimicry = bool(entry.get("cc_mimicry", True))
         self.enabled = bool(entry.get("enabled", True))

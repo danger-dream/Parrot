@@ -244,6 +244,8 @@ def record_success(channel_key: str, model: str,
                    connect_ms: Optional[float], first_byte_ms: Optional[float],
                    total_ms: Optional[float]) -> None:
     with _mutation_lock:
+        if channel_state.is_deleted(channel_key):
+            return
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return
@@ -290,6 +292,8 @@ def _record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -
 
 def record_failure(channel_key: str, model: str, connect_ms: Optional[float]) -> None:
     with _mutation_lock:
+        if channel_state.is_deleted(channel_key):
+            return
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return

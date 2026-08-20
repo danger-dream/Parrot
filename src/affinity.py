@@ -126,6 +126,8 @@ def upsert(fingerprint: Optional[str], channel_key: str, model: str,
         return
     now = state_db.now_ms()
     with _mutation_lock:
+        if channel_state.is_deleted(channel_key):
+            return
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return
@@ -381,6 +383,8 @@ def client_upsert(client_key: str, channel_key: str, model: str) -> None:
         return
     now = state_db.now_ms()
     with _client_mutation_lock:
+        if channel_state.is_deleted(channel_key):
+            return
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return

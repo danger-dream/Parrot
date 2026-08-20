@@ -144,6 +144,138 @@ def _run_sync(coro):
         return exc
 
 
+def _overwrite_summary(entry: dict) -> str:
+    provider = oauth_manager.provider_of(entry)
+    label = str(entry.get("label") or entry.get("email") or "?")
+    lines = [
+        "检测到相同身份的 OAuth 账户。是否用本次登录结果覆盖凭据和最新资料？",
+        "",
+        f"Provider: <code>{ui.escape_html(provider)}</code>",
+        f"账户: <code>{ui.escape_html(label)}</code>",
+    ]
+    if provider == "openai":
+        workspace = entry.get("workspace_name") or entry.get("workspace_type") or entry.get("workspace_id")
+        if workspace:
+            lines.append(f"工作区: <code>{ui.escape_html(str(workspace))}</code>")
+    plan = entry.get("plan_type")
+    if plan:
+        lines.append(f"套餐: <code>{ui.escape_html(str(plan))}</code>")
+    lines.extend(("", "取消或会话过期不会修改现有账户。"))
+    return "\n".join(lines)
+
+
+def _persist_new_or_stage_overwrite(
+    chat_id: int, entry: dict, *, source: str, usage: dict | None = None,
+    message_id: int | None = None,
+) -> str:
+    """Add a new identity immediately, or stage an exact-identity overwrite."""
+    provider = oauth_manager.provider_of(entry)
+    email = str(entry.get("email") or "")
+    configured = oauth_manager.list_accounts()
+    if provider == "openai" and not _openai_workspace_id(entry):
+        raise ValueError("OpenAI token 缺少 workspace identity，无法安全判断账户")
+    if provider in ("xai", "cursor"):
+        incoming_subject = str(entry.get("subject") or entry.get("sub") or "")
+        for account in configured:
+            if oauth_manager.provider_of(account) != provider or str(account.get("email") or "") != email:
+                continue
+            old_subject = str(account.get("subject") or account.get("sub") or "")
+            if bool(old_subject) != bool(incoming_subject):
+                raise ValueError(f"{provider} legacy email fallback 会改变 canonical identity，请先移除或迁移旧账户")
+    duplicate = oauth_manager.find_exact_identity(entry)
+    if duplicate is None:
+        added = oauth_manager.add_account_if_identity_absent(entry)
+        if added.get("status") != "added":
+            raise RuntimeError("账户在保存前已并发出现，请重新登录确认")
+        return "added"
+    target_key, _snapshot = duplicate
+    nonce = secrets.token_urlsafe(12)
+    states.set_state(chat_id, "oa_oauth_overwrite_confirm", {
+        "nonce": nonce,
+        "target_key": target_key,
+        "provider": oauth_manager.provider_of(entry),
+        "entry": entry,
+        "source": source,
+        "usage": usage,
+    })
+    markup = ui.inline_kb([[
+        ui.btn("✅ 覆盖", f"oa:overwrite:confirm:{nonce}"),
+        ui.btn("❌ 取消", f"oa:overwrite:cancel:{nonce}"),
+    ]])
+    text = _overwrite_summary(entry)
+    if message_id is None:
+        ui.send_result(chat_id, text, extra_rows=[[
+            ui.btn("✅ 覆盖", f"oa:overwrite:confirm:{nonce}"),
+            ui.btn("❌ 取消", f"oa:overwrite:cancel:{nonce}"),
+        ]], back_label="◀ 返回新增账户", back_callback="oa:add")
+    else:
+        ui.edit(chat_id, message_id, text, reply_markup=markup)
+    return "staged"
+
+
+def _overwrite_state(chat_id: int, nonce: str, *, consume: bool) -> dict | None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != "oa_oauth_overwrite_confirm":
+        return None
+    data = state.get("data") or {}
+    if not secrets.compare_digest(str(data.get("nonce") or ""), str(nonce or "")):
+        return None
+    if consume:
+        state = states.pop_state(chat_id)
+        return (state or {}).get("data") or None
+    return data
+
+
+def on_oauth_overwrite_cancel(chat_id: int, message_id: int, cb_id: str, nonce: str) -> None:
+    data = _overwrite_state(chat_id, nonce, consume=True)
+    if data is None:
+        ui.answer_cb(cb_id, "确认会话已失效，请重新登录", show_alert=True)
+        return
+    ui.answer_cb(cb_id, "已取消")
+    ui.edit(chat_id, message_id, "✅ 已取消覆盖，现有账户未作任何修改。",
+            reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]]))
+
+
+def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce: str) -> None:
+    # Consume before touching config so double-click can never repeat a replace.
+    data = _overwrite_state(chat_id, nonce, consume=True)
+    if data is None:
+        ui.answer_cb(cb_id, "确认会话已失效，请重新登录", show_alert=True)
+        return
+    entry = data.get("entry") or {}
+    target_key = str(data.get("target_key") or "")
+    result = oauth_manager.replace_exact_identity(target_key, entry)
+    if result.get("status") != "replaced":
+        ui.answer_cb(cb_id, "账户已变化，请重新登录", show_alert=True)
+        ui.edit(chat_id, message_id, "❌ 目标账户已消失或身份发生变化；未写入本次登录结果。",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:add")]]))
+        return
+
+    provider = str(data.get("provider") or oauth_manager.provider_of(entry))
+    usage = data.get("usage")
+    quota_note = ""
+    if provider == "cursor" and isinstance(usage, dict):
+        error = _save_usage_to_quota_cache(target_key, usage, email=entry.get("email") or "")
+        if error is None:
+            _evaluate_quota_action(target_key, usage)
+        else:
+            quota_note = "\n⚠️ 新额度快照保存失败，可稍后手动刷新。"
+    elif provider == "openai":
+        fetched = _fetch_and_save_usage_sync(target_key, email=entry.get("email") or "")
+        if isinstance(fetched, Exception):
+            quota_note = "\n⚠️ 新额度快照获取失败，可稍后手动刷新。"
+        else:
+            _evaluate_quota_action(target_key, fetched)
+    ui.answer_cb(cb_id, "覆盖成功")
+    ui.edit(
+        chat_id, message_id,
+        f"✅ {_provider_tag(provider)} <b>OAuth 账户已覆盖</b>\n\n"
+        f"账户: <code>{ui.escape_html(str(entry.get('label') or entry.get('email') or '?'))}</code>\n"
+        "账户主键、历史统计、优先级和用户设置均保持不变。" + quota_note,
+        reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
+    )
+
+
 def _oauth_error_html(exc, *, provider: str, operation: str, indent: str = "") -> str:
     """OAuth 错误的用户友好 HTML 文案；禁止把 raw httpx 异常直出到 TG。"""
     return oauth_errors.format_oauth_error_html(
@@ -4014,7 +4146,7 @@ def on_login_code_input(chat_id: int, text: str) -> None:
 
     if not email:
         # 给用户一个兜底的唯一名
-        email = f"unnamed-{int(datetime.now().timestamp())}@local"
+        email = f"unnamed-{secrets.token_hex(8)}@local"
 
     expires_in = int(tok_resp.get("expires_in", 28800))
     new_expired = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4034,11 +4166,15 @@ def on_login_code_input(chat_id: int, text: str) -> None:
         **claude_plan_info,
     }
     try:
-        oauth_manager.add_account(entry)
+        save_action = _persist_new_or_stage_overwrite(
+            chat_id, entry, source="Claude OAuth 登录",
+        )
     except Exception as exc:
         ui.send_result(chat_id,
                        f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
                        **nav)
+        return
+    if save_action == "staged":
         return
 
     lb_hint = (
@@ -4112,11 +4248,15 @@ def on_set_json_input(chat_id: int, text: str) -> None:
         "models": list(data.get("models") or []),
     }
     try:
-        oauth_manager.add_account(entry)
+        save_action = _persist_new_or_stage_overwrite(
+            chat_id, entry, source="Claude 手动 JSON",
+        )
     except Exception as exc:
         ui.send_result(chat_id,
                        f"❌ 保存失败: <code>{ui.escape_html(str(exc))}</code>",
                        **nav)
+        return
+    if save_action == "staged":
         return
 
     lb_hint = (
@@ -4282,9 +4422,14 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         "billing_cycle_end": cursor_usage.get("billing_cycle_end") or "",
     }
     account_key = _account_key(entry)
-    existed = oauth_manager.get_account(account_key) is not None
+    existed = False  # duplicate returns above and is rendered by the confirmation callback
     try:
-        oauth_manager.add_account(entry)
+        save_action = _persist_new_or_stage_overwrite(
+            chat_id, entry, source="Cursor 浏览器登录", usage=usage,
+            message_id=message_id,
+        )
+        if save_action == "staged":
+            return
         if usage is not None:
             save_error = _save_usage_to_quota_cache(account_key, usage, email=email)
             if save_error is not None:
@@ -4664,38 +4809,28 @@ def _upsert_openai_account_entry(entry: dict, *, preserve_existing_settings: boo
 
 
 def _save_openai_entry_with_duplicate_policy(entry: dict) -> tuple[str, str]:
-    """保存 OpenAI 账号；重复账号按 token 有效性决策。
+    """Compatibility helper for non-interactive callers; never overwrite a duplicate.
 
-    规则：同 workspace 已存在时更新；否则同 email 仅在唯一时作为旧数据兼容：
-      - 现有有效、新 token 有效：保留现有（并写回刷新后的 token），跳过新 token
-      - 现有无效、新 token 有效：用新 token 替换现有账号
-      - 不存在：新增
+    Production Telegram paths stage duplicates through
+    ``_persist_new_or_stage_overwrite``.  Keeping this helper fail-closed prevents
+    old call sites/tests from reviving token-validity based skip/replace behavior.
     """
-    email = entry.get("email", "")
-    existing = _find_openai_existing_for_entry(entry)
-    if not existing:
-        oauth_manager.add_account(entry)
-        return "added", "新增"
-
-    existing_entry, _, existing_err = _refresh_openai_rt_to_entry(
-        existing.get("refresh_token", ""),
-        email_hint=email,
-        workspace_id=_openai_workspace_id(existing),
-        org_id=existing.get("organization_id") or "",
-    )
-    if existing_entry is not None:
-        _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)
-        return "skipped", "现有 token 有效，已保留现有账号"
-
-    _upsert_openai_account_entry(entry, preserve_existing_settings=True)
-    return "replaced", "现有 token 无效，已用新 token 替换"
+    if oauth_manager.find_exact_identity(entry) is not None:
+        return "duplicate", "需要用户确认覆盖"
+    oauth_manager.add_account(entry)
+    return "added", "新增"
 
 
 def _finish_openai_add(chat_id: int, tok: dict, *, source: str) -> None:
     """共用保存路径：从 token 解 email/workspace → 按重复策略保存 → 回报。"""
     try:
         entry, meta = _openai_token_to_entry(tok)
-        action, action_msg = _save_openai_entry_with_duplicate_policy(entry)
+        action = _persist_new_or_stage_overwrite(
+            chat_id, entry, source=source,
+        )
+        if action == "staged":
+            return
+        action_msg = "新增"
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -4924,8 +5059,12 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
     try:
         entry, meta = _xai_token_to_entry(tok)
         ak = _account_key(entry)
-        existed = oauth_manager.get_account(ak) is not None
-        oauth_manager.add_account(entry)
+        save_action = _persist_new_or_stage_overwrite(
+            chat_id, entry, source=source,
+        )
+        if save_action == "staged":
+            return
+        existed = False
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -5078,126 +5217,93 @@ def _format_import_error(exc: Exception | None) -> str:
     return str(exc)[:240]
 
 
-def _import_candidate_with_policy(item: dict) -> tuple[str, str, str]:
-    """导入单个候选；返回 (status, email, message)。
+def _stage_openai_import_candidates(items: list[dict]) -> dict:
+    """Refresh/classify candidates without persistent writes."""
+    staged = {"new": [], "duplicate": [], "failed": []}
+    seen: set[str] = set()
+    for item in items:
+        hint, rt = str(item.get("email") or "").strip(), str(item.get("refresh_token") or "").strip()
+        if not rt:
+            staged["failed"].append((hint or "?", "缺少 refresh_token")); continue
+        entry, meta, error = _refresh_openai_rt_to_entry(rt, email_hint=hint)
+        if entry is None:
+            staged["failed"].append((hint or "?", _format_import_error(error))); continue
+        if not _openai_workspace_id(entry):
+            staged["failed"].append((entry.get("email") or hint or "?", "token 缺少 canonical workspace identity")); continue
+        key = _account_key(entry)
+        if key in seen:
+            staged["failed"].append((entry.get("email") or hint or "?", "同批 canonical identity 重复，已去重")); continue
+        seen.add(key)
+        record = {"account_key": key, "entry": entry, "meta": meta}
+        staged["duplicate" if oauth_manager.find_exact_identity(entry) else "new"].append(record)
+    return staged
 
-    新 token 保存/替换成功后会 best-effort 拉一次 wham/usage 写 quota cache；
-    失败不影响账号导入，只把提示拼进 message。
-    """
-    email_hint = str(item.get("email") or "").strip()
-    rt = str(item.get("refresh_token") or "").strip()
-    if not rt:
-        return "failed", email_hint or "?", "缺少 refresh_token"
 
-    entry, meta, import_err = _refresh_openai_rt_to_entry(rt, email_hint=email_hint)
-    if entry is not None:
-        action, msg = _save_openai_entry_with_duplicate_policy(entry)
-        workspace = meta.get("workspace_name") or meta.get("workspace_type") or "workspace"
-        plan = meta.get("plan_type") or "?"
-        quota_msg = ""
-        saved = _find_openai_existing_for_entry(entry)
-        if saved is not None:
-            ak = _account_key(saved)
-            usage = _fetch_and_save_usage_sync(ak, email=saved.get("email") or entry.get("email") or email_hint)
-            if isinstance(usage, Exception):
-                quota_msg = "；额度未获取成功"
-                print(f"[oauth_menu] openai import usage fetch failed for {ak}: {usage}")
-            else:
-                _evaluate_quota_action(ak, usage)
-                quota_msg = "；额度已获取"
-        return action, meta.get("email") or entry.get("email") or email_hint, f"{workspace} / {plan}；{msg}{quota_msg}"
+def _commit_staged_openai_import(staged: dict) -> dict:
+    result = {"added": [], "replaced": [], "failed": list(staged.get("failed") or [])}
+    for record in staged.get("new") or []:
+        entry = record["entry"]
+        added = oauth_manager.add_account_if_identity_absent(entry)
+        if added.get("status") != "added":
+            result["failed"].append((entry.get("email") or "?", "账户已并发出现，请重新导入确认")); continue
+        result["added"].append(entry.get("email") or "?")
+        usage = _fetch_and_save_usage_sync(record["account_key"], email=entry.get("email") or "")
+        if not isinstance(usage, Exception):
+            _evaluate_quota_action(record["account_key"], usage)
+    for record in staged.get("duplicate") or []:
+        entry = record["entry"]
+        replacement = oauth_manager.replace_exact_identity(record["account_key"], entry)
+        if replacement.get("status") != "replaced":
+            result["failed"].append((entry.get("email") or "?", "目标账户已变化，请重新导入确认")); continue
+        result["replaced"].append(entry.get("email") or "?")
+        usage = _fetch_and_save_usage_sync(record["account_key"], email=entry.get("email") or "")
+        if not isinstance(usage, Exception):
+            _evaluate_quota_action(record["account_key"], usage)
+    return result
 
-    # 新 token 无效时，还没有可信 workspace identity，只能做 legacy 兜底：
-    # 同邮箱恰好一个账号时，验证现有 token；多 workspace 时 _find_openai_account_by_email
-    # 会返回 None，避免 Personal/Team 串号。
-    existing = _find_openai_account_by_email(email_hint)
-    if existing is not None:
-        existing_entry, _, existing_err = _refresh_openai_rt_to_entry(
-            existing.get("refresh_token", ""),
-            email_hint=email_hint,
-            workspace_id=_openai_workspace_id(existing),
-            org_id=existing.get("organization_id") or "",
-        )
-        if existing_entry is not None:
-            _upsert_openai_account_entry(existing_entry, preserve_existing_settings=True)
-            quota_msg = ""
-            refreshed = _find_openai_existing_for_entry(existing_entry)
-            if refreshed is not None:
-                ak = _account_key(refreshed)
-                usage = _fetch_and_save_usage_sync(ak, email=refreshed.get("email") or email_hint)
-                if isinstance(usage, Exception):
-                    quota_msg = "；额度未获取成功"
-                    print(f"[oauth_menu] openai import existing usage fetch failed for {ak}: {usage}")
-                else:
-                    _evaluate_quota_action(ak, usage)
-                    quota_msg = "；额度已获取"
-            return "skipped", email_hint, "导入 token 无效，现有 token 有效，已保留现有账号" + quota_msg
-        return "failed", email_hint, (
-            "导入 token 与现有 token 均无效；"
-            f"导入错误: {_format_import_error(import_err)}；现有错误: {_format_import_error(existing_err)}"
-        )
 
-    return "failed", email_hint or "?", _format_import_error(import_err)
+def _render_openai_import_result(chat_id: int, message_id: int, label: str, result: dict) -> None:
+    failed = result.get("failed") or []
+    lines = [f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户完成</b>", "",
+             f"✅ 新增 {len(result.get('added') or [])} 个", f"🔁 覆盖 {len(result.get('replaced') or [])} 个",
+             f"❌ 失败 {len(failed)} 个"]
+    lines += [f"• <code>{ui.escape_html(str(e))}</code>：{ui.escape_html(str(m))}" for e, m in failed[:20]]
+    ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]))
 
 
 def on_import_openai_exec(chat_id: int, message_id: int, cb_id: str) -> None:
     state = states.pop_state(chat_id)
     if not state or state.get("action") != "oa_openai_import_confirm":
-        ui.answer_cb(cb_id, "导入会话已失效", show_alert=True)
-        return
-    data = state.get("data") or {}
-    kind = data.get("kind", "")
+        ui.answer_cb(cb_id, "导入会话已失效", show_alert=True); return
+    data = state.get("data") or {}; kind = data.get("kind", ""); items = list(data.get("items") or [])
     label = _OPENAI_IMPORT_LABELS.get(kind, kind.upper())
-    items = list(data.get("items") or [])
     if not items:
-        ui.answer_cb(cb_id, "没有可导入账号", show_alert=True)
+        ui.answer_cb(cb_id, "没有可导入账号", show_alert=True); return
+    ui.answer_cb(cb_id, "正在解析候选…")
+    staged = _stage_openai_import_candidates(items)
+    if staged["duplicate"]:
+        nonce = secrets.token_urlsafe(12)
+        states.set_state(chat_id, "oa_openai_import_overwrite_confirm", {"nonce": nonce, "kind": kind, "staged": staged})
+        ui.edit(chat_id, message_id,
+                f"<b>{label} 导入二次确认</b>\n\n新增 <b>{len(staged['new'])}</b>、覆盖 <b>{len(staged['duplicate'])}</b>、失败 <b>{len(staged['failed'])}</b>。\n取消将整批零写入。是否提交？",
+                reply_markup=ui.inline_kb([[ui.btn("✅ 提交", f"oa:import_overwrite:confirm:{nonce}"), ui.btn("❌ 取消", f"oa:import_overwrite:cancel:{nonce}")]]))
         return
+    _render_openai_import_result(chat_id, message_id, label, _commit_staged_openai_import(staged))
 
-    ui.answer_cb(cb_id, "开始导入…")
-    ui.edit(chat_id, message_id, f"正在导入 {_provider_tag('openai')} {label} 账户，共 {len(items)} 个，请稍等…")
 
-    buckets = {"added": [], "replaced": [], "skipped": [], "failed": []}
-    for item in items:
-        status, email, msg = _import_candidate_with_policy(item)
-        buckets.setdefault(status, []).append((email, msg))
-
-    lines = [f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户完成</b>", ""]
-    if buckets["added"]:
-        lines.append(f"✅ 新增 {len(buckets['added'])} 个")
-        for email, _ in buckets["added"][:20]:
-            lines.append(f"• <code>{ui.escape_html(email)}</code>")
-        if len(buckets["added"]) > 20:
-            lines.append(f"• ... 另有 {len(buckets['added']) - 20} 个")
-        lines.append("")
-    if buckets["replaced"]:
-        lines.append(f"🔁 替换 {len(buckets['replaced'])} 个（现有 token 无效，已用导入 token）")
-        for email, _ in buckets["replaced"][:20]:
-            lines.append(f"• <code>{ui.escape_html(email)}</code>")
-        if len(buckets["replaced"]) > 20:
-            lines.append(f"• ... 另有 {len(buckets['replaced']) - 20} 个")
-        lines.append("")
-    if buckets["skipped"]:
-        lines.append(f"⚠️ 跳过 {len(buckets['skipped'])} 个")
-        for email, msg in buckets["skipped"][:20]:
-            lines.append(f"• <code>{ui.escape_html(email)}</code>：{ui.escape_html(msg)}")
-        if len(buckets["skipped"]) > 20:
-            lines.append(f"• ... 另有 {len(buckets['skipped']) - 20} 个")
-        lines.append("")
-    if buckets["failed"]:
-        lines.append(f"❌ 失败 {len(buckets['failed'])} 个")
-        for email, msg in buckets["failed"][:20]:
-            lines.append(f"• <code>{ui.escape_html(email)}</code>：{ui.escape_html(msg)}")
-        if len(buckets["failed"]) > 20:
-            lines.append(f"• ... 另有 {len(buckets['failed']) - 20} 个")
-        lines.append("")
-    if not any(buckets.values()):
-        lines.append("没有账号被处理。")
-
-    ui.edit(
-        chat_id, message_id,
-        "\n".join(lines).rstrip(),
-        reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
-    )
+def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce: str, *, confirm: bool) -> None:
+    state = states.get_state(chat_id)
+    data = (state.get("data") or {}) if state and state.get("action") == "oa_openai_import_overwrite_confirm" else {}
+    if not data or not secrets.compare_digest(str(data.get("nonce") or ""), str(nonce or "")):
+        ui.answer_cb(cb_id, "导入确认已失效，请重新导入", show_alert=True); return
+    states.pop_state(chat_id)
+    if not confirm:
+        ui.answer_cb(cb_id, "已取消，整批未写入")
+        ui.edit(chat_id, message_id, "✅ 已取消导入，所有候选均未写入。", reply_markup=ui.inline_kb([[ui.btn("◀ 返回新增账户", "oa:add")]])); return
+    result = _commit_staged_openai_import(data.get("staged") or {})
+    label = _OPENAI_IMPORT_LABELS.get(data.get("kind", ""), str(data.get("kind") or "").upper())
+    ui.answer_cb(cb_id, "导入完成")
+    _render_openai_import_result(chat_id, message_id, label, result)
 
 
 # ─── 移除失效账户 ─────────────────────────────────────────────────
@@ -5448,6 +5554,18 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data == "oa:import_exec":
         on_import_openai_exec(chat_id, message_id, cb_id)
+        return True
+    if data.startswith("oa:import_overwrite:confirm:"):
+        on_import_openai_overwrite(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1], confirm=True)
+        return True
+    if data.startswith("oa:import_overwrite:cancel:"):
+        on_import_openai_overwrite(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1], confirm=False)
+        return True
+    if data.startswith("oa:overwrite:confirm:"):
+        on_oauth_overwrite_confirm(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
+        return True
+    if data.startswith("oa:overwrite:cancel:"):
+        on_oauth_overwrite_cancel(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
         return True
     if data == "oa:invalid:list":
         on_invalid_remove_start(chat_id, message_id, cb_id)

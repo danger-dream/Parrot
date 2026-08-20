@@ -25,7 +25,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from ... import affinity, config, cooldown, load_balancing, log_db, probe, quota_errors, scorer, state_db
+from ... import affinity, channel_state, config, cooldown, load_balancing, log_db, probe, quota_errors, scorer, state_db
 from ...channel import api_channel, registry
 from ...channel.compatibility import FORCE_MODE, normalize_mode, normalize_models
 from ...channel.url_utils import (
@@ -1270,28 +1270,9 @@ def _wiz_test_kb(data: dict) -> dict:
 
 
 def _wiz_test_intro(data: dict) -> str:
-    header = (
-        "🧪 <b>渠道测试</b>\n\n"
-        f"渠道: <code>{ui.escape_html(data['name'])}</code>\n"
-        f"模型: {len(data['models'])} 个\n\n"
-        "请选择模型进行联通性测试。至少有一个模型测试成功才能保存渠道。\n"
-        "<i>（若跳过测试，全部模型默认标记为可用，由后台探测机制处理后续）</i>"
-    )
-    results = data.get("test_results") or {}
-    if results:
-        header += "\n\n<b>测试结果</b>:"
-        for m in data["models"]:
-            real = m["real"]
-            r = results.get(real)
-            if r is None:
-                continue
-            ok, elapsed, reason = r
-            name = m["alias"]
-            if ok:
-                header += f"\n  ✅ <code>{ui.escape_html(name)}</code> — 耗时 {elapsed}ms"
-            else:
-                header += f"\n  ❌ <code>{ui.escape_html(name)}</code> — {ui.escape_html((reason or '')[:80])}"
-    return header
+    """渲染与测试键盘同页的有界结果正文。"""
+    from . import channel_wizard
+    return channel_wizard.test_intro(data)
 
 
 def _wiz_send_test_panel(chat_id: int, data: dict) -> None:
@@ -1331,7 +1312,9 @@ def _make_temp_channel(data: dict):
         "apiKey": data["apiKey"],
         "protocol": protocol,
         "models": data["models"],
-        "cc_mimicry": protocol == "anthropic",
+        "cc_mimicry": bool(data.get("cc_mimicry", protocol == "anthropic")),
+        "providerId": data.get("providerId"),
+        "providerPresetId": data.get("providerPresetId"),
         "enabled": True,
     }
     if data.get("apiPath"):
@@ -1508,7 +1491,9 @@ def wiz_skip_test(chat_id: int, message_id: int, cb_id: str) -> None:
             "apiKey": data["apiKey"],
             "protocol": protocol,
             "models": data["models"],
-            "cc_mimicry": protocol == "anthropic",
+            "cc_mimicry": bool(data.get("cc_mimicry", protocol == "anthropic")),
+            "providerId": data.get("providerId"),
+            "providerPresetId": data.get("providerPresetId"),
             "enabled": True,
         })
     except Exception as exc:
@@ -1552,7 +1537,9 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
             "apiKey": data["apiKey"],
             "protocol": protocol,
             "models": data["models"],
-            "cc_mimicry": protocol == "anthropic",
+            "cc_mimicry": bool(data.get("cc_mimicry", protocol == "anthropic")),
+            "providerId": data.get("providerId"),
+            "providerPresetId": data.get("providerPresetId"),
             "enabled": True,
         })
     except Exception as exc:
@@ -1561,12 +1548,15 @@ def wiz_save(chat_id: int, message_id: int, cb_id: str) -> None:
         return
 
     # 失败的模型：记入初始冷却（errorWindows[0]，默认 1 分钟）
-    # 避免启用即被调度到；冷却期到后 probe 会自动重测
+    # 避免启用即被调度到；冷却期到后 probe 会自动重测。使用刚创建
+    # Channel 的 generation identity，确保与所有 attempt 副作用同一门禁。
+    saved_channel = registry.get_channel(f"api:{data['name']}")
+    saved_state_key = channel_state.effect_key(saved_channel) if saved_channel else f"api:{data['name']}"
     for m in data["models"]:
         real = m["real"]
         r = results.get(real)
         if r and not r[0]:
-            cooldown.record_error(f"api:{data['name']}", real, f"initial probe failed: {r[2]}")
+            cooldown.record_error(saved_state_key, real, f"initial probe failed: {r[2]}")
 
     states.pop_state(chat_id)
     ui.answer_cb(cb_id, "已保存")
@@ -2286,6 +2276,17 @@ def handle_edit_text(chat_id: int, action: str, text: str) -> bool:
     return False
 
 
+# 分级 provider / models discovery 向导覆盖旧的手填实现；保留本文件中的测试/保存流程。
+from . import channel_wizard as _channel_wizard
+wiz_on_name_input = _channel_wizard.wiz_on_name_input
+wiz_on_url_input = _channel_wizard.wiz_on_url_input
+wiz_on_protocol_select = _channel_wizard.wiz_on_protocol_select
+wiz_on_key_input = _channel_wizard.wiz_on_key_input
+wiz_on_models_input = _channel_wizard.wiz_on_models_input
+wiz_back_to_url = _channel_wizard.wiz_back_to_url
+wiz_back_to_models = _channel_wizard.wiz_back_to_models
+_wiz_test_kb = _channel_wizard.test_kb
+
 # ─── 路由分发 ─────────────────────────────────────────────────────
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
@@ -2322,6 +2323,26 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     # 向导
     if data == "chw:start":  wiz_start(chat_id, message_id, cb_id); return True
     if data == "chw:cancel": wiz_cancel(chat_id, message_id, cb_id); return True
+    if data == "chw:noop": ui.answer_cb(cb_id); return True
+    if data.startswith("chw:brands:"):
+        _channel_wizard.wiz_show_brands(chat_id, message_id, cb_id, int(data.rsplit(":", 1)[1])); return True
+    if data.startswith("chw:brand:"):
+        parts = data.split(":"); _channel_wizard.wiz_select_brand(chat_id, message_id, cb_id, int(parts[2]), int(parts[3])); return True
+    if data.startswith("chw:preset:"):
+        _channel_wizard.wiz_select_preset(chat_id, message_id, cb_id, int(data.rsplit(":", 1)[1])); return True
+    if data == "chw:preset_back": _channel_wizard.wiz_preset_back(chat_id, message_id, cb_id); return True
+    if data == "chw:manual": _channel_wizard.wiz_manual(chat_id, message_id, cb_id); return True
+    if data == "chw:key_back": _channel_wizard.wiz_key_back(chat_id, message_id, cb_id); return True
+    if data == "chw:discover_retry": _channel_wizard.wiz_discovery_retry(chat_id, message_id, cb_id); return True
+    if data.startswith("chw:mp:"):
+        _channel_wizard.wiz_model_page(chat_id, message_id, cb_id, int(data.rsplit(":", 1)[1])); return True
+    if data.startswith("chw:mt:"):
+        parts = data.split(":"); _channel_wizard.wiz_model_toggle(chat_id, message_id, cb_id, int(parts[2]), int(parts[3])); return True
+    if data == "chw:mall": _channel_wizard.wiz_model_bulk(chat_id, message_id, cb_id, False); return True
+    if data == "chw:minvert": _channel_wizard.wiz_model_bulk(chat_id, message_id, cb_id, True); return True
+    if data == "chw:mconfirm": _channel_wizard.wiz_model_confirm(chat_id, message_id, cb_id); return True
+    if data.startswith("chw:tp:"):
+        _channel_wizard.wiz_test_page(chat_id, message_id, cb_id, int(data.rsplit(":", 1)[1])); return True
     if data == "chw:back":   wiz_back_to_models(chat_id, message_id, cb_id); return True
     if data == "chw:test_all": wiz_test_all(chat_id, message_id, cb_id); return True
     if data == "chw:skip_test": wiz_skip_test(chat_id, message_id, cb_id); return True

@@ -33,7 +33,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
-    affinity, apikey_limiter, auth, blacklist, concurrency, config, cooldown, fingerprint, local_web_tools,
+    affinity, apikey_limiter, auth, blacklist, channel_state, concurrency, config, cooldown, fingerprint, local_web_tools,
     log_db, model_mapping, model_pricing, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest
@@ -727,7 +727,7 @@ async def _run_ws_failover(
         attempt_order += 1
         last_ch, last_model = ch, resolved_model
 
-        acquired = await concurrency.try_acquire(ch.key)
+        acquired = await concurrency.try_acquire(channel_state.effect_key(ch))
         if not acquired:
             saturated_extras.append((ch, resolved_model))
             idx += 1
@@ -746,7 +746,7 @@ async def _run_ws_failover(
 
         turn_capacity = _WsTurnCapacity(
             api_key_lease=api_key_lease,
-            channel_key=ch.key,
+            channel_key=channel_state.effect_key(ch),
             channel_held=True,
         )
         try:
@@ -885,7 +885,7 @@ async def _run_ws_failover(
                 finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
                 scorer=scorer,
                 cooldown=cooldown,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 model=resolved_model,
                 error_detail=result.error_detail,
                 connect_ms=result.connect_ms,
@@ -911,7 +911,8 @@ async def _run_ws_failover(
         queue_timeout = queue_wait_s  # queue wait is outside every upstream round
         if queue_timeout > 0:
             acquired = await concurrency.acquire_from_candidates(
-                [(ch.key, (ch, m)) for ch, m in saturated_all], queue_timeout,
+                [(channel_state.effect_key(ch), (ch, m)) for ch, m in saturated_all],
+                queue_timeout,
             )
             if acquired is not None:
                 _ch_key, payload = acquired
@@ -928,7 +929,7 @@ async def _run_ws_failover(
                 )
                 turn_capacity = _WsTurnCapacity(
                     api_key_lease=api_key_lease,
-                    channel_key=ch.key,
+                    channel_key=channel_state.effect_key(ch),
                     channel_held=True,
                 )
                 try:
@@ -1008,7 +1009,7 @@ async def _run_ws_failover(
                         finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
                         scorer=scorer,
                         cooldown=cooldown,
-                        channel_key=ch.key,
+                        channel_key=channel_state.effect_key(ch),
                         model=resolved_model,
                         error_detail=result.error_detail,
                         connect_ms=result.connect_ms,
@@ -1398,7 +1399,7 @@ async def _try_ws_channel(
                 _sync_translated_body_to_ws_create(first_obj, body)
 
                 channel_acquired = await turn_capacity.acquire_channel(
-                    ch.key,
+                    channel_state.effect_key(ch),
                     queue_wait_seconds=queue_wait_s,
                 )
                 if not channel_acquired:
@@ -1989,7 +1990,7 @@ async def _try_sse_channel(
                 finalize_policy.success_plan(),
                 scorer=scorer,
                 cooldown=cooldown,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 model=resolved_model,
                 connect_ms=result.connect_ms,
                 first_byte_ms=result.first_byte_ms,
@@ -2001,7 +2002,7 @@ async def _try_sse_channel(
                 body=body,
                 response_id=result.response_id,
                 output_items=result.output_items,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 resolved_model=resolved_model,
                 client_key=client_key,
                 translator_ctx=result.translator_ctx,
@@ -2035,7 +2036,7 @@ async def _try_sse_channel(
                 finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
                 scorer=scorer,
                 cooldown=cooldown,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 model=resolved_model,
                 error_detail=result.error_detail,
                 connect_ms=result.connect_ms,
@@ -2520,7 +2521,7 @@ async def _relay_ws_session(
                 finalize_policy.success_plan(),
                 scorer=scorer,
                 cooldown=cooldown,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 model=resolved_model,
                 connect_ms=result.connect_ms,
                 first_byte_ms=result.first_byte_ms,
@@ -2532,7 +2533,7 @@ async def _relay_ws_session(
                 body=body,
                 response_id=result.response_id,
                 output_items=result.output_items,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 resolved_model=resolved_model,
                 client_key=client_key,
                 translator_ctx=result.translator_ctx,
@@ -2566,7 +2567,7 @@ async def _relay_ws_session(
                 finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
                 scorer=scorer,
                 cooldown=cooldown,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 model=resolved_model,
                 error_detail=result.error_detail,
                 connect_ms=result.connect_ms,
@@ -3085,7 +3086,7 @@ async def _finalize_ws_attempt_after_accept(
         plan,
         scorer=scorer,
         cooldown=cooldown,
-        channel_key=ch.key,
+        channel_key=channel_state.effect_key(ch),
         model=resolved_model,
         error_detail=result.error_detail,
         connect_ms=result.connect_ms,
@@ -3131,6 +3132,9 @@ def _write_responses_affinity(
     translator_ctx: Optional[dict] = None,
 ) -> None:
     try:
+        if channel_state.is_deleted(channel_key):
+            return
+        channel_key = channel_state.resolve(channel_key)
         cur_input = resolve_current_input_items(body or {})
         fp_write = fingerprint.fingerprint_write_responses(
             api_key_name or "", client_ip or "", cur_input, output_items,

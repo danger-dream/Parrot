@@ -595,8 +595,10 @@ def test_scheduler_saturated_split(m):
     reg.rebuild_from_config()
 
     async def run():
-        # 占满 sat1
-        assert await c.try_acquire("api:sat1") is True
+        # 占满 sat1 的当前 generation slot（public key 仍用于断言/UI）。
+        sat1 = reg.get_channel("api:sat1")
+        assert sat1 is not None
+        assert await c.try_acquire(sat1.state_key) is True
         res = sch.schedule(
             {"model": "mx", "messages": []},
             api_key_name="kx",

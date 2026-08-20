@@ -51,6 +51,8 @@ class OpenAIApiChannel(Channel):
         # 并拆分存到这里。运行期非空 → `base_url + api_path`；否则走 default `/v1/xxx`。
         self.api_path = entry.get("apiPath") or None
         self.api_key = entry.get("apiKey", "")
+        self.provider_id = entry.get("providerId") or None
+        self.provider_preset_id = entry.get("providerPresetId") or None
         self.models: list[dict] = list(entry.get("models") or [])
         self.enabled = bool(entry.get("enabled", True))
         self.disabled_reason = entry.get("disabled_reason")

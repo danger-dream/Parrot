@@ -98,19 +98,30 @@
     {
       "name": "智谱Coding Plan Max",   // 唯一标识
       "type": "api",
-      "baseUrl": "https://coding.example.com/anthropic",  // 不带尾斜杠，自动裁剪
+      "generationId": "<opaque-id>",   // 内部代际身份；新增渠道自动生成，普通 reload/rename 保持
+      "baseUrl": "https://open.bigmodel.cn", // resolved 主机/基础路径，不带尾斜杠
       "apiKey": "sk-xxx",
+      "providerId": "zhipu",          // 可选：内置目录品牌身份；缺失表示 custom/旧渠道
+      "providerPresetId": "coding-cn", // 可选：具体 preset 身份
+      "protocol": "anthropic",
+      "apiPath": "/api/anthropic/v1/messages", // preset/完整 endpoint 拆分后的可选路径
       "models": [
         { "real": "GLM-5", "alias": "glm-5" },
         { "real": "GLM-5-Turbo", "alias": "glm-5-turbo" }
       ],
       "enabled": true,
       "disabled_reason": null,       // null | "user"（API 渠道不会触发 quota）
-      "cc_mimicry": true,            // 默认 true，用户可切换
+      "cc_mimicry": true,            // custom Anthropic 默认 true；preset 仅按目录显式值，OpenAI 恒 false
       "omitTemperature": false        // 默认 false。开启后向上游发送前剔除 temperature 字段，
                                        // 兼容废弃 temperature 的第三方中转（如某些 claude-opus-4-7 转发）
     }
   ],
+
+  // providerId/providerPresetId 只记录向导选择身份。运行时始终使用已保存的
+  // baseUrl/apiPath；目录更新不会自动重写已有渠道。未知身份也不会禁用渠道。
+  // generationId 不参与 UI 名称、路由 key 或日志 identity，只用于隔离 delete 前后的
+  // 在途副作用和 concurrency slot。旧配置缺失时会获得进程内稳定的兼容代际；普通
+  // reload 不会换代，后续编辑/rename 会把该代际写回配置。delete → add 同名会生成新值。
 
   // ─── 上游超时（秒） ───
   "timeouts": {

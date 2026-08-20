@@ -19,7 +19,7 @@ from typing import Awaitable, Callable, Optional
 
 import httpx
 
-from . import config, cooldown, network, quota_errors
+from . import channel_state, config, cooldown, network, quota_errors
 from .channel import registry
 from .channel.base import Channel
 
@@ -270,7 +270,7 @@ async def recovery_run_once() -> int:
 
         ok, elapsed_ms, reason = await probe_channel_model(ch, entry["model"], timeout_s=timeout_s)
         if ok:
-            cooldown.clear(ch.key, entry["model"])
+            cooldown.clear(channel_state.effect_key(ch), entry["model"])
             cleared += 1
             print(f"[probe] cleared cooldown for {ch.key}:{entry['model']} ({elapsed_ms}ms)")
         else:
@@ -282,7 +282,10 @@ async def recovery_run_once() -> int:
                     bjt = timezone(timedelta(hours=8))
                     reset_str = datetime.fromtimestamp(reset_ms / 1000, tz=bjt).strftime("%H:%M:%S")
                     print(f"[probe] rate-limited {ch.key}:{entry['model']} — reset at {reset_str} (≈{remain_min:.0f}m)")
-                    cooldown.record_error(ch.key, entry["model"], reason, cooldown_until=reset_ms)
+                    cooldown.record_error(
+                        channel_state.effect_key(ch), entry["model"], reason,
+                        cooldown_until=reset_ms,
+                    )
                     continue
 
             # 其他失败：只打日志，不额外记 cooldown（本身就在 cooldown 中）

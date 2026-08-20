@@ -106,7 +106,7 @@ def test_parse_sub2api_export_json(m):
     assert items[0].email == "a@example.com"
 
 
-def test_import_duplicate_both_valid_keeps_existing(m):
+def test_import_duplicate_requires_confirmation_without_refreshing_existing(m):
     _setup(m)
     oauth_menu = m["oauth_menu"]
     provider = m["openai_provider"]
@@ -123,8 +123,8 @@ def test_import_duplicate_both_valid_keeps_existing(m):
 
     action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry)
 
-    assert action == "skipped"
-    assert "现有 token 有效" in msg
+    assert action == "duplicate"
+    assert "确认覆盖" in msg
     acc = om.get_account("openai:same@example.com:acct-same")
     assert acc is not None
     # 验证现有账号仍可用且没有被替换为导入 token。
@@ -155,7 +155,7 @@ def test_import_same_email_different_workspace_adds_new_account(m):
     assert len(accounts) == 2
 
 
-def test_import_duplicate_existing_invalid_replaces_with_imported(m, monkeypatch):
+def test_import_duplicate_existing_invalid_still_requires_confirmation(m, monkeypatch):
     _setup(m)
     oauth_menu = m["oauth_menu"]
     provider = m["openai_provider"]
@@ -184,11 +184,11 @@ def test_import_duplicate_existing_invalid_replaces_with_imported(m, monkeypatch
     assert err is None
     action, msg = oauth_menu._save_openai_entry_with_duplicate_policy(new_entry)
 
-    assert action == "replaced"
-    assert "现有 token 无效" in msg
+    assert action == "duplicate"
+    assert "确认覆盖" in msg
     acc = om.get_account("openai:same@example.com:acct-same")
     assert acc is not None
-    assert acc["refresh_token"] == "new-good-refresh-token-yyyyyyyy"
+    assert acc["refresh_token"] == "old-bad-refresh-token-xxxxxxxx"
 
 
 def test_import_candidate_invalid_new_keeps_valid_existing(m, monkeypatch):
@@ -213,14 +213,14 @@ def test_import_candidate_invalid_new_keeps_valid_existing(m, monkeypatch):
 
     monkeypatch.setattr(provider, "refresh_sync", fake_refresh)
 
-    status, email, msg = oauth_menu._import_candidate_with_policy({
+    staged = oauth_menu._stage_openai_import_candidates([{
         "email": "same@example.com",
         "refresh_token": "new-bad-refresh-token-yyyyyyyy",
-    })
+    }])
 
-    assert status == "skipped"
-    assert email == "same@example.com"
-    assert "现有 token 有效" in msg
+    assert not staged["new"]
+    assert not staged["duplicate"]
+    assert staged["failed"][0][0] == "same@example.com"
     acc = om.get_account("openai:same@example.com:acct-same")
     assert acc is not None
     assert acc["refresh_token"] == "old-good-refresh-token-xxxxxxxx"
@@ -302,3 +302,43 @@ def test_openai_import_text_preview_sets_confirm_state(m):
     assert "导入" in sent["text"]
     assert "Sub2API 账户" in sent["text"]
     assert "<tg-emoji" in sent["text"]
+
+
+def test_mixed_batch_stages_without_writes_deduplicates_and_commits_after_confirm(m, monkeypatch):
+    _setup(m)
+    menu, provider, om = m["oauth_menu"], m["openai_provider"], m["oauth_manager"]
+    old_tok = provider._mock_token_response("dup@example.com", workspace_id="ws-dup")
+    old_tok["refresh_token"] = "old-refresh"
+    old_entry, _ = menu._openai_token_to_entry(old_tok)
+    om.add_account(old_entry)
+    baseline = json.loads(json.dumps(m["config"].get()))
+
+    def refresh(rt, *, email_hint="", workspace_id="", org_id=""):
+        if rt == "bad":
+            return None, None, RuntimeError("bad token")
+        workspace = "ws-dup" if rt == "dup" else "ws-new"
+        email = "dup@example.com" if rt == "dup" else "new@example.com"
+        tok = provider._mock_token_response(email, workspace_id=workspace)
+        tok["refresh_token"] = f"{rt}-refreshed"
+        entry, meta = menu._openai_token_to_entry(tok)
+        return entry, meta, None
+
+    monkeypatch.setattr(menu, "_refresh_openai_rt_to_entry", refresh)
+    monkeypatch.setattr(menu, "_fetch_and_save_usage_sync", lambda *a, **kw: RuntimeError("offline"))
+    staged = menu._stage_openai_import_candidates([
+        {"email": "new@example.com", "refresh_token": "new"},
+        {"email": "dup@example.com", "refresh_token": "dup"},
+        {"email": "new@example.com", "refresh_token": "new"},
+        {"email": "bad@example.com", "refresh_token": "bad"},
+    ])
+    assert len(staged["new"]) == 1
+    assert len(staged["duplicate"]) == 1
+    assert len(staged["failed"]) == 2
+    assert m["config"].get() == baseline
+
+    result = menu._commit_staged_openai_import(staged)
+    assert len(result["added"]) == 1
+    assert len(result["replaced"]) == 1
+    assert len(result["failed"]) == 2
+    assert om.get_account("openai:dup@example.com:ws-dup")["refresh_token"] == "dup-refreshed"
+    assert om.get_account("openai:new@example.com:ws-new") is not None

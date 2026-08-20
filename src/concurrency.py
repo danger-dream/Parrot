@@ -69,7 +69,7 @@ def _get_channel_max(ch_key: str) -> int:
     cfg = config.get()
     cc_cfg = cfg.get("concurrency") or {}
     default_max = int(cc_cfg.get("defaultMaxConcurrent", 0))
-    ch = registry.get_channel(ch_key)
+    ch = registry.get_channel(channel_state.resolve(ch_key))
     if ch is None:
         return default_max
     mc = getattr(ch, "max_concurrent", 0)
@@ -110,7 +110,7 @@ def _is_deleted_generation_locked(ch_key: str) -> bool:
     upstream call with credentials removed from config.
     """
     deleted_target = _deleted_retire_targets.get(ch_key)
-    if deleted_target is not None:
+    if deleted_target is not None or channel_state.is_deleted(ch_key):
         return True
     resolved = channel_state.resolve(ch_key)
     return (

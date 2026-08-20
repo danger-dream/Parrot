@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import threading
+import uuid
 from typing import Optional
 
 from .. import affinity, channel_state, config, cooldown, load_balancing, scorer, state_db
@@ -77,8 +78,14 @@ def _rebuild_from_config_locked() -> None:
         cls = _channel_factories.get(proto, ApiChannel)
         try:
             ch = cls(entry)
-            if channel_state.is_retired_source(ch.key):
-                print(f"[registry] skip reused retired channel key: {ch.key}")
+            ch.state_key = channel_state.register_api_generation(
+                ch.key, entry.get("generationId"),
+            )
+            if (
+                channel_state.is_deleted(ch.state_key)
+                or channel_state.is_retired_source(ch.key)
+            ):
+                print(f"[registry] skip retired API channel generation: {ch.key}")
                 continue
             new[ch.key] = ch
         except Exception as exc:
@@ -252,8 +259,9 @@ def _add_api_channel_serialized(entry: dict) -> dict:
     name = entry.get("name")
     if not name:
         raise ValueError("channel name is required")
+    # Rename sources remain aliases and cannot be reused safely. Deleted API
+    # generations no longer tombstone this logical display key.
     channel_state.assert_reusable(f"api:{name}")
-
     protocol = entry.get("protocol") or "anthropic"
     # openai-* 渠道不走 Claude Code 伪装，强制 False
     default_cc = True if protocol == "anthropic" else False
@@ -284,11 +292,17 @@ def _add_api_channel_serialized(entry: dict) -> dict:
         normalized = {
             "name": name,
             "type": "api",
+            # Stable across normal reload/backup/restore; replaced only by a
+            # real delete + add lifecycle.
+            "generationId": uuid.uuid4().hex,
             "baseUrl": split_base,
             "apiKey": entry.get("apiKey", ""),
             "protocol": protocol,
+            "providerId": entry.get("providerId") or None,
+            "providerPresetId": entry.get("providerPresetId") or None,
             "models": list(entry.get("models") or []),
-            "cc_mimicry": bool(entry.get("cc_mimicry", default_cc)),
+            "cc_mimicry": (bool(entry.get("cc_mimicry", default_cc))
+                            if protocol == "anthropic" else False),
             "omitTemperature": bool(entry.get("omitTemperature", False)),
             "omitThinking": bool(entry.get("omitThinking", False)),
             "context1mMode": normalize_mode(entry.get("context1mMode")),
@@ -301,6 +315,11 @@ def _add_api_channel_serialized(entry: dict) -> dict:
         }
         if split_path:
             normalized["apiPath"] = split_path
+        # custom/旧渠道不写空身份字段；未知非空身份仍原样保留，不影响运行时。
+        if not normalized["providerId"]:
+            normalized.pop("providerId")
+        if not normalized["providerPresetId"]:
+            normalized.pop("providerPresetId")
         channels.append(normalized)
     config.update(_mutate)
     load_balancing.sync_channel_added(
@@ -336,6 +355,10 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
         {},
     )
     old_entry_snapshot = copy.deepcopy(old_entry)
+    current_channel = get_channel(old_key)
+    current_generation_id = channel_state.generation_id(
+        channel_state.effect_key(current_channel)
+    ) if current_channel is not None else None
     old_priority_orders = copy.deepcopy(
         config.get().get("loadBalancing", {}).get("priorityOrders", {})
     )
@@ -350,6 +373,10 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
                 break
         if target is None:
             raise KeyError(f"channel not found: {name}")
+        # Editing/renaming a legacy entry upgrades it in-place to the stable
+        # generation already owned by its live Channel object.
+        if not target.get("generationId") and current_generation_id:
+            target["generationId"] = current_generation_id
 
         # 改名前置检查
         if "name" in patch and patch["name"] != name:
@@ -401,6 +428,16 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
 
         if "apiKey" in patch:
             target["apiKey"] = patch["apiKey"]
+        if "providerId" in patch:
+            if patch["providerId"]:
+                target["providerId"] = str(patch["providerId"])
+            else:
+                target.pop("providerId", None)
+        if "providerPresetId" in patch:
+            if patch["providerPresetId"]:
+                target["providerPresetId"] = str(patch["providerPresetId"])
+            else:
+                target.pop("providerPresetId", None)
         if "models" in patch:
             target["models"] = list(patch["models"] or [])
         if "cc_mimicry" in patch:
@@ -492,6 +529,8 @@ def _delete_api_channel_serialized(name: str) -> bool:
     ):
         return False
     found = {"ok": False}
+    current = get_channel(key)
+    generation_key = channel_state.effect_key(current) if current is not None else key
 
     def _mutate(cfg):
         channels = cfg.get("channels", [])
@@ -507,22 +546,25 @@ def _delete_api_channel_serialized(name: str) -> bool:
     # scorer/cooldown/affinity side effects must not recreate deleted state.
     from .. import affinity, concurrency, cooldown, scorer
     with channel_state.mutation_lock:
-        generation_keys = sorted(channel_state.alias_sources(key)) + [key]
+        # The runtime generation, not the public display key, is retired.
+        # A same-name add receives a different generation and is immediately
+        # reusable, while already-selected old Channel objects keep this key.
+        generation_keys = [generation_key]
         frozen_limits = {
-            generation_key: concurrency.capture_rename_limit(generation_key)
-            for generation_key in generation_keys
+            retired_key: concurrency.capture_rename_limit(retired_key)
+            for retired_key in generation_keys
         }
-        channel_state.retire_deleted(key)
+        channel_state.retire_deleted(generation_key)
         try:
             config.update(_mutate)
         except BaseException:
-            channel_state.restore_deleted(key)
+            channel_state.restore_deleted(generation_key)
             raise
-        for generation_key in generation_keys:
+        for retired_key in generation_keys:
             concurrency.retire_channel(
-                generation_key,
-                frozen_max=frozen_limits[generation_key],
-                deleted_target=key,
+                retired_key,
+                frozen_max=frozen_limits[retired_key],
+                deleted_target=retired_key,
             )
         scorer.clear_stats(key)
         cooldown.clear(key, notify_recovered=False, resolve_alias=False)

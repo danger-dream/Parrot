@@ -17,6 +17,56 @@ mutation_lock = threading.RLock()
 _transition_keys: set[str] = set()
 _aliases: dict[str, str] = {}
 _deleted_keys: set[str] = set()
+# API channels keep their public/logical key (``api:<name>``), while request
+# attempts carry an opaque generation key.  Generation keys resolve to the
+# logical key only while their generation is live; a deleted generation is
+# tombstoned independently, so a same-name replacement cannot accept its late
+# writes.
+_generation_targets: dict[str, str] = {}
+_legacy_api_generations: dict[str, str] = {}
+_GENERATION_PREFIX = "api-generation:"
+
+
+def register_api_generation(channel_key: str, generation_id: str | None) -> str:
+    """Return a stable process-local attempt identity for one API config entry.
+
+    New entries persist ``generationId``.  Legacy entries without it receive a
+    stable identity for this process (ordinary registry rebuilds reuse it).
+    """
+    import uuid
+
+    with mutation_lock:
+        generation = str(generation_id or "").strip()
+        if not generation:
+            generation = _legacy_api_generations.setdefault(
+                channel_key, uuid.uuid4().hex,
+            )
+        generation_key = f"{_GENERATION_PREFIX}{generation}"
+        existing = _generation_targets.get(generation_key)
+        if (
+            existing is not None
+            and existing != channel_key
+            and resolve(existing) != channel_key
+        ):
+            raise ValueError(f"duplicate API channel generationId: {generation}")
+        _generation_targets[generation_key] = channel_key
+        return generation_key
+
+
+def effect_key(channel) -> str:
+    """Identity used by attempt-scoped health, affinity and concurrency writes."""
+    return str(getattr(channel, "state_key", None) or channel.key)
+
+
+def _direct_target(channel_key: str) -> str:
+    return _generation_targets.get(channel_key, channel_key)
+
+
+def generation_id(channel_key: str) -> str | None:
+    """Extract the persisted opaque id from an API attempt identity."""
+    if channel_key.startswith(_GENERATION_PREFIX):
+        return channel_key[len(_GENERATION_PREFIX):] or None
+    return None
 
 
 @contextmanager
@@ -42,9 +92,16 @@ def resolve(channel_key: str) -> str:
     with mutation_lock:
         current = channel_key
         seen: set[str] = set()
-        while current in _aliases and current not in seen:
+        while current not in seen:
             seen.add(current)
-            current = _aliases[current]
+            targeted = _direct_target(current)
+            if targeted != current:
+                current = targeted
+                continue
+            if current in _aliases:
+                current = _aliases[current]
+                continue
+            break
         return current
 
 

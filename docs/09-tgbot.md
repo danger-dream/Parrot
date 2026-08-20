@@ -208,54 +208,19 @@ Grok Imagine 页面同时展示模型路由：已配置的 `grok-imagine-image*`
 - 「禁用/启用」→ 切换 `enabled`，`disabled_reason = "user"`（或 null）
 - 「删除」→ 二次确认 → `delete_channel(name)` + state_db 清理
 
-### 9.3.3 添加渠道（向导）
+### 9.3.3 添加渠道（5 步向导）
 
-点「➕ 添加渠道」→ 进入 4 步向导：
+1. **名称（1/5）**：非空、最长 64 字符且不得与已有渠道重名。
+2. **URL / 提供商（2/5）**：同页既可输入 custom Base URL，也可从品牌（每页 10 个）→ preset 两级目录选择模板；单 preset 品牌直接应用。preset 保存其身份，但同时立即把所选完整 request endpoint 拆为 resolved `baseUrl/apiPath`。
+3. **协议（3/5）**：custom 可选 Anthropic、OpenAI Chat、OpenAI Responses，并保留完整路径冲突确认；preset 只显示自身声明的协议，单协议直接跳过此页。
+4. **API Key（4/5）**：校验后进入独立 loading 状态，异步请求模型列表。请求禁用重定向、限制响应体与时长，不向 UI/日志回显 Key 或上游响应正文；取消、重试、返回 Key 或新会话会使迟到结果失效。
+5. **模型（5/5）**：发现结果稳定去重并每页显示 10 个，支持跨页多选、完整结果全选/反选；至少选择一项才能确认。发现失败或空结果可重试、返回修改 Key 或复用 `parse_models_input()` 手填。preset 精确使用目录 `models_url`，缺失/失败且存在 `static_models` 时改用静态列表；custom 按同源 `/v1/models` 规则推导。
 
-#### 步骤 1：输入名称
-
-```
-请输入渠道名称（如：智谱Coding Plan Max）
-当前不可包含换行。可含空格。
-```
-
-验证：非空、不重复。
-
-#### 步骤 2：输入 URL
-
-```
-请输入该渠道兼容 Anthropic 的基础 URL。
-示例：https://coding.example.com/anthropic
-代理会在此 URL 末尾追加 /v1/messages。
-```
-
-验证：以 `http://` 或 `https://` 开头；末尾斜杠自动裁剪。
-
-#### 步骤 3：输入 API Key
-
-```
-请输入该渠道的 API Key：
-```
-
-验证：非空。
-
-#### 步骤 4：输入模型列表
-
-```
-请输入该渠道支持的模型列表。
-格式：<真实模型名>[:别名][,或;分割]
-示例：
-  GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo
-  gpt-5.4; gpt-5.3-codex:codex
-
-注：不写别名则别名=真实名；别名不可重复。
-```
-
-验证：用 `parse_models_input` 解析，任何报错都回显给用户并继续等待输入。
+模型确认后仍进入原测试/保存面板。该面板的单模型按钮也每页最多 10 个；“测试全部”“跳过测试”“保存”和“返回模型选择/手填”语义不变。
 
 #### 完成 → 渠道测试面板
 
-向导填完 4 步后，**暂不保存**，先弹测试面板：
+向导完成第 5 步模型选择/手填后，**暂不保存**，先弹测试面板：
 
 ```
 ╔══════════════════════════════╗
@@ -275,7 +240,7 @@ Grok Imagine 页面同时展示模型路由：已配置的 `grok-imagine-image*`
 - 点单个模型 → 执行单次测试
 - 点「测试全部模型」→ 顺序测试所有模型
 - 点「跳过」→ 直接保存渠道，所有模型初始标记为"可用"（不触发 cooldown 初始化）
-- 点「返回上一步」→ 回到步骤 4 允许修改模型列表
+- 点「返回模型选择/手填」→ 回到第 5 步的发现结果选择页或手填页
 - 点「取消添加」→ 丢弃向导数据
 
 测试进行中，**在同一条 TG 消息上持续编辑**（避免刷屏）：
@@ -634,7 +599,17 @@ Tokens:
 
 选择 `priority` 后可分别进入 Anthropic / OpenAI & Grok 协议优先级编辑页，使用序号勾选、置顶/置底/上移/下移和批量设置调整队列；选中按钮显示为 `3 ✅`。
 
-## 9.8 权限与状态管理
+## 9.8 OAuth 重复身份覆盖确认
+
+所有生产 OAuth 新增入口（Claude、OpenAI/Codex、xAI/Grok、Cursor）在完整解析 token/profile 后按 canonical identity 检查重复。不同 identity 直接新增；相同 identity 不再自动跳过、刷新旧 token 或覆盖，而是显示“覆盖 / 取消”确认。
+
+- callback 只携带固定动作和短随机 nonce，不携带 token、email 或 profile 文本；候选凭据只暂存在当前 chat 的 10 分钟内存 state。
+- 取消、过期、旧按钮和重复点击均不修改配置、quota、负载均衡或历史统计。
+- 确认会先消费 state，再原子校验 expected/current/incoming 三个 canonical key 完全一致，并原地更新原数组项；目标消失或 identity 改变时要求重新登录。
+- 覆盖保留 `oauth:<account_key>`、数组位置、优先级、并发/启停设置及 provider 本地偏好；只有确认成功后的新用量 observation 才更新 quota。
+- Sub2API / CPA 批量导入在首层文件确认后仅刷新并内存分组；存在重复时追加“新增 N / 覆盖 M / 失败 K”整批确认，取消整批零写入。
+
+## 9.9 权限与状态管理
 
 ### Admin 检查
 

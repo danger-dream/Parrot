@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import affinity, concurrency, config, cooldown, fingerprint, load_balancing, scorer
+from . import affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, scorer
 from .channel import registry
 from .channel.base import Channel
 from .protocols.matrix import (
@@ -139,7 +139,7 @@ def _filter_candidates(requested_model: str,
                 "detail": detail,
             })
             continue
-        if concurrency.is_saturated(ch.key):
+        if concurrency.is_saturated(channel_state.effect_key(ch)):
             excluded.append({"channel": ch.key, "reason": "saturated"})
             saturated.append((ch, resolved))
             continue

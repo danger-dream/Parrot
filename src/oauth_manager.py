@@ -2399,10 +2399,129 @@ def _openai_metadata_patch(entry: dict) -> dict:
     return candidate
 
 
+def find_exact_identity(entry: dict) -> tuple[str, dict] | None:
+    """Return the configured account whose canonical identity exactly matches ``entry``.
+
+    This is intentionally stricter than the legacy add-account matching rules: a
+    subject/email fallback that would change the canonical key is not a duplicate.
+    The returned account is a snapshot and must not be mutated by callers.
+    """
+    provider = _normalize_provider(entry.get("provider"))
+    if provider not in _VALID_PROVIDERS:
+        raise ValueError(f"unsupported provider: {entry.get('provider')!r}")
+    incoming_key = _canonical_key({**entry, "provider": provider})
+    if not incoming_key.partition(":")[2]:
+        return None
+    matches = [
+        account for account in config.get().get("oauthAccounts", [])
+        if _acc_provider(account) == provider and _canonical_key(account) == incoming_key
+    ]
+    if len(matches) > 1:
+        raise AmbiguousOAuthAccountKey(incoming_key)
+    if not matches:
+        return None
+    return incoming_key, copy.deepcopy(matches[0])
+
+
+def replace_exact_identity(expected_account_key: str, entry: dict) -> dict:
+    """Atomically replace credentials/profile for one unchanged OAuth identity.
+
+    No delete, rename, state cleanup, log migration or LB publication occurs.  A
+    stale confirmation therefore fails closed instead of becoming an add/rename.
+    """
+    provider = _normalize_provider(entry.get("provider"))
+    incoming = copy.deepcopy(entry)
+    incoming["provider"] = provider
+    required = ("email", "access_token", "refresh_token")
+    missing = [key for key in required if not incoming.get(key)]
+    if missing:
+        raise ValueError(f"missing required fields: {missing}")
+    incoming_key = _canonical_key(incoming)
+    if expected_account_key != incoming_key:
+        return {"status": "identity_conflict", "account_key": expected_account_key}
+
+    result = {"status": "missing", "account_key": expected_account_key}
+    with config.serialized_updates():
+        def mutate(cfg):
+            accounts = cfg.setdefault("oauthAccounts", [])
+            indexes = [
+                index for index, account in enumerate(accounts)
+                if _canonical_key(account) == expected_account_key
+            ]
+            if not indexes:
+                return
+            if len(indexes) != 1:
+                result["status"] = "identity_conflict"
+                return
+            index = indexes[0]
+            current = accounts[index]
+            current_key = _canonical_key(current)
+            if (
+                current_key != expected_account_key
+                or _acc_provider(current) != provider
+                or incoming_key != expected_account_key
+            ):
+                result["status"] = "identity_conflict"
+                return
+
+            # Preserve every field not supplied by the fresh observation, then
+            # explicitly protect user settings from login defaults.  A successful
+            # interactive login recovers an account that was auto-disabled only
+            # because its previous credential failed authentication.
+            replacement = copy.deepcopy(current)
+            replacement.update(incoming)
+            if "maxConcurrent" in current:
+                replacement["maxConcurrent"] = copy.deepcopy(current["maxConcurrent"])
+            if current.get("disabled_reason") == "auth_error":
+                replacement["enabled"] = True
+                replacement["disabled_reason"] = None
+                replacement["disabled_until"] = None
+            else:
+                for key in ("enabled", "disabled_reason", "disabled_until"):
+                    if key in current:
+                        replacement[key] = copy.deepcopy(current[key])
+            if provider != "cursor" or not incoming.get("models"):
+                if "models" in current:
+                    replacement["models"] = copy.deepcopy(current["models"])
+            if provider == "openai":
+                for key in ("codexDeviceInstallationId", "codexDeviceConvergenceEnabled"):
+                    if key not in entry and key in current:
+                        replacement[key] = copy.deepcopy(current[key])
+            if provider == "cursor":
+                for key in ("cursor_max_context_disabled_models", "cursor_disabled_models"):
+                    if key not in entry and key in current:
+                        replacement[key] = copy.deepcopy(current[key])
+                if not entry.get("cursor_profile_id") and current.get("cursor_profile_id"):
+                    for key in ("email", "label", "cursor_profile_name", "cursor_profile_id", "cursor_email_verified"):
+                        if key in current:
+                            replacement[key] = copy.deepcopy(current[key])
+            if _canonical_key(replacement) != expected_account_key:
+                result["status"] = "identity_conflict"
+                return
+            accounts[index] = replacement
+            result.update(status="replaced", index=index, account=copy.deepcopy(replacement))
+
+        config.update(mutate)
+    return result
+
+
 def add_account(entry: dict) -> None:
     """Serialize target resolution, snapshots, config publication, and state rename."""
     with config.serialized_updates():
         _add_account_serialized(entry)
+
+
+def add_account_if_identity_absent(entry: dict) -> dict:
+    """Atomically add only while the incoming canonical identity is still absent."""
+    incoming_key = _canonical_key(entry)
+    with config.serialized_updates():
+        if any(
+            _canonical_key(account) == incoming_key
+            for account in config.get().get("oauthAccounts", [])
+        ):
+            return {"status": "identity_conflict", "account_key": incoming_key}
+        _add_account_serialized(entry)
+    return {"status": "added", "account_key": incoming_key}
 
 
 def _add_account_serialized(entry: dict) -> None:

@@ -163,6 +163,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     now = _now_ms()
 
     with _lock:
+        if channel_state.is_deleted(channel_key):
+            return {}
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return {}
@@ -272,6 +274,11 @@ def clear(channel_key: str, model: Optional[str] = None, *,
     now = _now_ms()
     recovered: list[tuple[str, str, bool]] = []   # (ck, model, was_permanent)
     with _lock:
+        # Attempt completion uses the default resolving path and must be gated.
+        # Lifecycle maintenance passes resolve_alias=False after tombstoning so
+        # it can still atomically delete the retired generation's logical rows.
+        if resolve_alias and channel_state.is_deleted(channel_key):
+            return
         if resolve_alias:
             channel_key = channel_state.resolve(channel_key)
         if model is None:

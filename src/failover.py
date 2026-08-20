@@ -26,7 +26,7 @@ from websockets.exceptions import InvalidStatus
 import threading
 
 from . import (
-    affinity, blacklist, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
+    affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
     local_web_tools, log_db, model_metadata, model_pricing, notifier, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
@@ -518,6 +518,10 @@ def _maybe_save_native_responses_store(
     """
     if not api_key_name or not isinstance(response_obj, dict):
         return
+    if channel_key and channel_state.is_deleted(channel_key):
+        return
+    if channel_key:
+        channel_key = channel_state.resolve(channel_key)
     response_id = response_obj.get("id")
     output_items = response_obj.get("output")
     if not isinstance(response_id, str) or not response_id:
@@ -1698,7 +1702,7 @@ async def run_failover(
         last_ch_protocol = getattr(ch, "protocol", "anthropic")
 
         # 并发 slot 获取（快速路径；filter 过但竞态满了 → 放到 saturated 备选）
-        acquired = await concurrency.try_acquire(ch.key)
+        acquired = await concurrency.try_acquire(channel_state.effect_key(ch))
         if not acquired:
             # 竞态：filter 时还有位置，现在满了 → 作为排队备选
             # 注：_filter_candidates 已把饱和的挑走，这里主要兜底并发 filter 后瞬间占满的情况
@@ -1720,7 +1724,7 @@ async def run_failover(
             log_db.update_pending(request_id, proxy_name=_attempt_proxy)
 
         release_done = False
-        def _release_once(_key=ch.key):
+        def _release_once(_key=channel_state.effect_key(ch)):
             nonlocal release_done
             if release_done:
                 return
@@ -1946,7 +1950,7 @@ async def run_failover(
             # the stable session owner.  Streaming success rebinds on completion.
             if result.success and not result.stream_started and fp_query:
                 affinity.upsert(
-                    fp_query, ch.key, resolved_model,
+                    fp_query, channel_state.effect_key(ch), resolved_model,
                     prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
                 )
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
@@ -2093,14 +2097,14 @@ async def run_failover(
             plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
             if plan.record_cooldown_error:
                 cooldown.record_error(
-                    ch.key,
+                    channel_state.effect_key(ch),
                     resolved_model,
                     result.error_detail,
                     cooldown_until=quota_reset_ms,
                 )
             if plan.record_failure:
                 scorer.record_failure(
-                    ch.key,
+                    channel_state.effect_key(ch),
                     resolved_model,
                     connect_ms=_scorer_connect_ms(result),
                 )
@@ -2144,7 +2148,7 @@ async def run_failover(
                 plan,
                 scorer=scorer,
                 cooldown=cooldown,
-                channel_key=ch.key,
+                channel_key=channel_state.effect_key(ch),
                 model=resolved_model,
                 error_detail=result.error_detail,
                 connect_ms=_scorer_connect_ms(result),
@@ -2174,7 +2178,9 @@ async def run_failover(
         # Queue wait is outside every upstream round and cannot consume a round total budget.
         queue_timeout = queue_wait_s
         if queue_timeout > 0:
-            candidate_keys: list[tuple[str, object]] = [(ch.key, (ch, m)) for ch, m in saturated_all]
+            candidate_keys: list[tuple[str, object]] = [
+                (channel_state.effect_key(ch), (ch, m)) for ch, m in saturated_all
+            ]
             acquired = await concurrency.acquire_from_candidates(candidate_keys, queue_timeout)
             if acquired is not None:
                 _ch_key, payload = acquired
@@ -2192,7 +2198,7 @@ async def run_failover(
                     client_visible_model=client_visible_model,
                 )
                 release_done2 = False
-                def _release_q(_key=ch.key):
+                def _release_q(_key=channel_state.effect_key(ch)):
                     nonlocal release_done2
                     if release_done2:
                         return
@@ -2270,7 +2276,7 @@ async def run_failover(
                 if result.success or result.stream_started:
                     if result.success and not result.stream_started and fp_query:
                         affinity.upsert(
-                            fp_query, ch.key, resolved_model,
+                            fp_query, channel_state.effect_key(ch), resolved_model,
                             prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
                         )
                     _attach_release_to_response(result.response, _release_q)
@@ -2314,7 +2320,7 @@ async def run_failover(
                         plan,
                         scorer=scorer,
                         cooldown=cooldown,
-                        channel_key=ch.key,
+                        channel_key=channel_state.effect_key(ch),
                         model=resolved_model,
                         error_detail=result.error_detail,
                         connect_ms=_scorer_connect_ms(result),
@@ -3506,7 +3512,7 @@ async def _consume_oauth_responses_ws_non_stream(
         finalize_policy.success_plan(),
         scorer=scorer,
         cooldown=cooldown,
-        channel_key=ch.key,
+        channel_key=channel_state.effect_key(ch),
         model=resolved_model,
         connect_ms=connect_ms,
         first_byte_ms=first_byte_ms,
@@ -3575,7 +3581,7 @@ async def _finalize_oauth_ws_error(
         plan,
         scorer=scorer,
         cooldown=cooldown,
-        channel_key=ch.key,
+        channel_key=channel_state.effect_key(ch),
         model=resolved_model,
         error_detail=result.error_detail,
         connect_ms=connect_ms,
@@ -3703,7 +3709,7 @@ async def _consume_oauth_responses_ws_stream(
             finalize_policy.success_plan(),
             scorer=scorer,
             cooldown=cooldown,
-            channel_key=ch.key,
+            channel_key=channel_state.effect_key(ch),
             model=resolved_model,
             connect_ms=connect_ms,
             first_byte_ms=first_byte_ms,
@@ -4334,7 +4340,7 @@ async def _consume_non_stream(
         finalize_policy.success_plan(),
         scorer=scorer,
         cooldown=cooldown,
-        channel_key=ch.key,
+        channel_key=channel_state.effect_key(ch),
         model=resolved_model,
         connect_ms=connect_ms,
         first_byte_ms=first_byte_ms,
@@ -4370,7 +4376,7 @@ async def _consume_non_stream(
             obj,
             body=body,
             api_key_name=api_key_name,
-            channel_key=ch.key,
+            channel_key=channel_state.effect_key(ch),
             model=resolved_model,
         )
 
@@ -4380,7 +4386,7 @@ async def _consume_non_stream(
     # 亲和写入（按 ingress 选 fingerprint_write 的参数空间与函数）
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
-                                ch.key, resolved_model,
+                                channel_state.effect_key(ch), resolved_model,
                                 client_key=client_key, fp_query=fp_query)
 
     response = JSONResponse(
@@ -4473,7 +4479,7 @@ async def _consume_stream_as_non_stream(
         finalize_policy.success_plan(),
         scorer=scorer,
         cooldown=cooldown,
-        channel_key=ch.key,
+        channel_key=channel_state.effect_key(ch),
         model=resolved_model,
         connect_ms=connect_ms,
         first_byte_ms=first_byte_ms,
@@ -4517,7 +4523,7 @@ async def _consume_stream_as_non_stream(
     # 亲和写入（与 _consume_non_stream 一致）
     _write_affinity_non_stream(ingress_protocol, api_key_name, client_ip,
                                 messages, assistant_msg, body, out_obj,
-                                ch.key, resolved_model,
+                                channel_state.effect_key(ch), resolved_model,
                                 client_key=client_key, fp_query=fp_query)
 
     response = JSONResponse(
@@ -4741,7 +4747,7 @@ async def _consume_stream(
             ),
             scorer=scorer,
             cooldown=cooldown,
-            channel_key=ch.key,
+            channel_key=channel_state.effect_key(ch),
             model=resolved_model,
             connect_ms=connect_ms,
             first_byte_ms=first_byte_ms,
@@ -4764,7 +4770,7 @@ async def _consume_stream(
                         native_response_obj,
                         body=body,
                         api_key_name=api_key_name,
-                        channel_key=ch.key,
+                        channel_key=channel_state.effect_key(ch),
                         model=resolved_model,
                     )
             except Exception:
@@ -4844,17 +4850,19 @@ async def _consume_stream(
         prompt_cache_key = _openai_prompt_cache_key_from_body(ingress_protocol, body)
         if fp_query:
             affinity.upsert(
-                fp_query, ch.key, resolved_model,
+                fp_query, channel_state.effect_key(ch), resolved_model,
                 prompt_cache_key=prompt_cache_key,
             )
         if fp_write:
             affinity.upsert(
-                fp_write, ch.key, resolved_model,
+                fp_write, channel_state.effect_key(ch), resolved_model,
                 prompt_cache_key=prompt_cache_key,
             )
         # 同步更新 client-level soft affinity
         if client_key:
-            affinity.client_upsert(client_key, ch.key, resolved_model)
+            affinity.client_upsert(
+                client_key, channel_state.effect_key(ch), resolved_model,
+            )
 
         # shield：客户端断开导致的 CancelledError 不应中断 DB 写入，否则
         # 日志会残留 pending。(参见 _finalize_client_cancelled 早退守卫)
@@ -4897,7 +4905,7 @@ async def _consume_stream(
             plan,
             scorer=scorer,
             cooldown=cooldown,
-            channel_key=ch.key,
+            channel_key=channel_state.effect_key(ch),
             model=resolved_model,
             error_detail=message,
             connect_ms=connect_ms,
