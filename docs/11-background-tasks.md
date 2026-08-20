@@ -288,3 +288,9 @@ async def lifespan(app: FastAPI):
 ```
 
 所有循环都有 `try/except Exception` 包着，一个任务挂了不影响其他；但 `asyncio.CancelledError` 不捕获（允许 cancel 正常退出）。
+
+## API Provider usage refresh
+
+API Provider usage 使用独立 daemon worker、每账户 single-flight 与全局 3 并发限制，不进入 Telegram 本地 SQL stats coordinator。固定 endpoint 请求有超时、TTL/手动最小间隔与 429/5xx 退避；智谱三个 endpoint 每轮各请求至多一次，partial success 保存成功分项，同时刷新 deadline 与持久 `retry_after` 服从失败分项的有效上游退避。渠道删除或 Key/Provider/Preset 变化后，仅当旧 HMAC account identity 已无其他存活渠道共享时删除其缓存和 runtime；该清理与 worker 写入由同一生命周期锁串行化，迟到成功或失败都不能重建孤儿缓存。该功能仅展示，不自动禁用渠道，也不改变 scorer/cooldown/generation/statistics。
+
+服务启动时，`server.py` 会在渠道 registry 构建完成、Telegram Bot 启动之前调用 `provider_usage.schedule_startup_refresh()`，按上游账户去重并将所有受支持渠道排入后台刷新。该调用只排队、不等待 Provider 网络，因此不会阻塞 FastAPI/TG 启动；`PARROT_NO_REFRESH=1` 时与 OAuth 主动刷新一起跳过。列表和详情仍保留访问触发刷新，作为 TTL 到期及启动预热失败后的补充路径。

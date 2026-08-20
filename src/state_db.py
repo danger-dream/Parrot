@@ -173,6 +173,16 @@ def _schema_sql() -> str:
       codex_window_observations TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS api_provider_usage_cache (
+      account_id       TEXT PRIMARY KEY,
+      adapter_id       TEXT NOT NULL,
+      snapshot_json    TEXT,
+      fetched_at       INTEGER,
+      last_error       TEXT,
+      error_at         INTEGER,
+      retry_after      INTEGER
+    );
+
     CREATE TABLE IF NOT EXISTS network_check_status (
       key          TEXT PRIMARY KEY,
       label        TEXT NOT NULL,
@@ -1665,6 +1675,56 @@ def _quota_display_email(account_key: str) -> str:
     if provider in {"openai", "xai"} and ":" in identity:
         return identity.split(":", 1)[0]
     return identity
+
+def provider_usage_load(account_id: str) -> dict | None:
+    """读取独立 API Provider usage cache；account_id 是安装级 HMAC。"""
+    row = _get_conn().execute(
+        "SELECT * FROM api_provider_usage_cache WHERE account_id=?", (account_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def provider_usage_save_success(account_id: str, adapter_id: str, snapshot: dict,
+                                retry_after: int | None = None) -> None:
+    """成功（含明确 partial）替换快照；partial 可保留上游退避。"""
+    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    fetched_at = now_ms()
+    def write(conn):
+        conn.execute(
+            """INSERT INTO api_provider_usage_cache
+               (account_id,adapter_id,snapshot_json,fetched_at,last_error,error_at,retry_after)
+               VALUES (?,?,?,?,NULL,NULL,?)
+               ON CONFLICT(account_id) DO UPDATE SET
+                 adapter_id=excluded.adapter_id,snapshot_json=excluded.snapshot_json,
+                 fetched_at=excluded.fetched_at,last_error=NULL,error_at=NULL,
+                 retry_after=excluded.retry_after""",
+            (account_id, adapter_id, payload, fetched_at, retry_after),
+        )
+    _commit_write(write)
+
+
+def provider_usage_save_error(account_id: str, adapter_id: str, error: str,
+                              retry_after: int | None = None) -> None:
+    """记录脱敏错误，保留旧成功快照。"""
+    error_at = now_ms()
+    def write(conn):
+        conn.execute(
+            """INSERT INTO api_provider_usage_cache
+               (account_id,adapter_id,snapshot_json,fetched_at,last_error,error_at,retry_after)
+               VALUES (?,?,NULL,NULL,?,?,?)
+               ON CONFLICT(account_id) DO UPDATE SET
+                 adapter_id=excluded.adapter_id,last_error=excluded.last_error,
+                 error_at=excluded.error_at,retry_after=excluded.retry_after""",
+            (account_id, adapter_id, str(error)[:160], error_at, retry_after),
+        )
+    _commit_write(write)
+
+
+def provider_usage_delete(account_id: str) -> None:
+    _commit_write(lambda conn: conn.execute(
+        "DELETE FROM api_provider_usage_cache WHERE account_id=?", (account_id,),
+    ))
+
 
 def quota_save(account_key: str, data: dict[str, Any],
                *, email: str | None = None) -> None:

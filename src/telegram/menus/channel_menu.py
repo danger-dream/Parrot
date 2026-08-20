@@ -23,9 +23,11 @@ import asyncio
 import math
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from ... import affinity, channel_state, config, cooldown, load_balancing, log_db, probe, quota_errors, scorer, state_db
+from ... import affinity, channel_state, config, cooldown, load_balancing, log_db, probe, provider_usage, quota_errors, scorer, state_db
 from ...channel import api_channel, registry
 from ...channel.compatibility import FORCE_MODE, normalize_mode, normalize_models
 from ...channel.url_utils import (
@@ -247,31 +249,40 @@ def _channel_health(ch) -> tuple[str, str]:
     return "🔴", f"近期 {worst:.0f}%"
 
 
-def _summary_text(ch, tps_v: Optional[float] = None, cache_phrase: str = "") -> str:
-    """列表行上的简短摘要（success_rate · avg_first_byte · sum_requests · 本月 TPS · 缓存）。"""
-    key = ch.key
-    total_req = 0
-    avg_fb: list[float] = []
-    rate_str = "—"
-    best = 0
-    for stat in scorer.snapshot():
-        if stat["channel_key"] != key:
-            continue
-        total_req += stat["total_requests"]
-        if stat["avg_first_byte_ms"]:
-            avg_fb.append(stat["avg_first_byte_ms"])
-        if stat["recent_requests"] > 0:
-            rate = (stat["recent_success_count"] / stat["recent_requests"]) * 100
-            if rate > best:
-                best = rate
-                rate_str = f"{rate:.0f}%"
-    fb_str = f"{int(sum(avg_fb) / len(avg_fb))}ms" if avg_fb else "—"
-    core = f"{rate_str} · {fb_str} · {total_req} 次"
-    if tps_v is not None:
-        core += f" · ⚡ {ui.fmt_tps(tps_v)}"
-    if cache_phrase:
-        core += f" · {cache_phrase}"
-    return core
+def _channel_monthly_lines(ch: Any, stats: dict | None) -> list[str]:
+    """渠道列表中的 OAuth 风格本地月度统计块；所有指标使用同一月度口径。"""
+    lines = [f"🏷️ 模型：<code>{len(ch.models)}</code> 个"]
+    if not isinstance(stats, dict) or int(stats.get("total") or 0) <= 0:
+        lines.append("💎 Parrot 月度：<i>暂无调用</i>")
+        return lines
+
+    total = int(stats.get("total") or 0)
+    success = int(stats.get("success_count") or 0)
+    errors = int(stats.get("error_count") or 0)
+    prompt = ui.prompt_total(
+        stats.get("input"), stats.get("cache_creation"), stats.get("cache_read"),
+    )
+    monthly = f"💎 Parrot 月度：↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(stats.get('output'))}"
+    if (stats.get("cache_read") or 0) > 0:
+        monthly += f" · {ui.fmt_cache_phrase(stats.get('cache_read'), prompt)}"
+    lines.append(monthly)
+
+    rate = success / total * 100 if total > 0 else 0.0
+    requests = f"📨 请求：{total:,} 次 · 成功率 {rate:.1f}%"
+    if errors > 0:
+        requests += f" · 失败 {errors:,} 次"
+    lines.append(requests)
+
+    if stats.get("avg_tps") is not None:
+        tps = f"⚡ TPS：平均 {ui.fmt_tps(stats.get('avg_tps'))}"
+        if stats.get("max_tps") is not None:
+            tps += f" · 峰值 {ui.fmt_tps(stats.get('max_tps'))}"
+        if stats.get("min_tps") is not None:
+            tps += f" · 最低 {ui.fmt_tps(stats.get('min_tps'))}"
+        lines.append(tps)
+
+    lines.append(f"💵 费用：{ui.fmt_cost(stats, decimal_places=3)}")
+    return lines
 
 
 def _mask_key(key: str) -> str:
@@ -282,9 +293,220 @@ def _mask_key(key: str) -> str:
     return key[:6] + "***" + key[-4:]
 
 
+_USAGE_BJT = timezone(timedelta(hours=8))
+
+
+def _usage_dt(value: Any) -> datetime | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        if abs(number) >= 100_000_000_000:
+            return datetime.fromtimestamp(number / 1000, _USAGE_BJT)
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    text = str(value).strip().replace(" UTC", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_USAGE_BJT)
+        return dt.astimezone(_USAGE_BJT)
+    except ValueError:
+        return None
+
+
+def _usage_time(ms: Any, *, detail: bool = False) -> str:
+    dt = _usage_dt(ms)
+    if not dt:
+        return "未知"
+    if dt.date() == datetime.now(_USAGE_BJT).date():
+        return ("今天 " if detail else "") + dt.strftime("%H:%M")
+    return dt.strftime("%m-%d %H:%M")
+
+
+def _usage_updated(ms: Any) -> str:
+    dt = _usage_dt(ms)
+    return dt.strftime("%H:%M:%S") if dt else "未知"
+
+
+def _usage_number(value: Any, *, compact: bool = False) -> str:
+    try:
+        n = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return ui.escape_html(str(value if value is not None else "?"))
+    if compact and abs(n) >= 1000:
+        return ui.escape_html(ui.fmt_tokens(float(n)))
+    if n == n.to_integral_value():
+        return f"{int(n):,}"
+    return f"{n.normalize():f}"
+
+
+def _usage_value(item: dict) -> str:
+    value = _usage_number(item.get("value"))
+    currency = ui.escape_html(str(item.get("currency") or ""))
+    return f"{value} {currency}".strip()
+
+
+def _usage_item(items: list[dict], item_id: str, *old_labels: str) -> dict | None:
+    return next((x for x in items if x.get("id") == item_id), None) or next(
+        (x for x in items if x.get("label") in old_labels), None)
+
+
+def _window_pct(item: dict) -> float | None:
+    pct = item.get("used_percent")
+    if isinstance(pct, (int, float)): return float(pct)
+    try:
+        total, used = Decimal(str(item.get("total"))), Decimal(str(item.get("used")))
+        return float(used / total * 100) if total else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _window_line(item: dict, *, detail: bool, icon: str = "📊") -> str:
+    label = ui.escape_html(str(item.get("label") or "额度窗口"))
+    pct = _window_pct(item)
+    used, total = item.get("used"), item.get("total")
+    if used is not None and total is not None and item.get("id") == "mcp_month":
+        core = f"已用 <b>{_usage_number(used)} / {_usage_number(total)}</b>"
+        if pct is not None: core += f"（{pct:g}%）"
+    elif pct is not None:
+        core = f"已用 <b>{pct:g}%</b>"
+    elif used is not None and total is not None:
+        core = f"已用 <b>{_usage_number(used)} / {_usage_number(total)}</b>"
+    else:
+        core = ui.escape_html(str(item.get("status") or "已获取"))
+    reset = item.get("reset_at") or item.get("end_at")
+    if reset:
+        core += f" · 重置 <code>{_usage_time(reset, detail=detail)}</code>"
+    return f"{icon} {label}：{core}"
+
+
+def _status_text(status: str | None, *, has_snapshot: bool = False) -> str | None:
+    if has_snapshot:
+        return {"partial": "⚠️ 部分数据暂未获取",
+                "stale_error": "⚠️ 最近一次更新失败，当前显示上次数据"}.get(status)
+    return {"error": "⚠️ 上游用量获取失败"}.get(status)
+
+
+def _usage_summary(ch) -> str | None:
+    if provider_usage.spec_for(ch) is None:
+        return None
+    view = provider_usage.cached(ch)
+    status, snap = view.get("status"), view.get("snapshot") or {}
+    if not snap:
+        return _status_text(status) or "上游用量尚未获取"
+    source = snap.get("source") or view.get("source")
+    if source == "zhipu-coding" and not snap.get("version"):
+        return "上游额度暂无法展示"
+    lines: list[str] = []
+    if source == "zhipu-coding":
+        windows = snap.get("windows") or []
+        for item_id, old, icon in (("tokens_5h", "5 小时额度", "📊"), ("tokens_7d", "7 天额度", "📅"), ("mcp_month", "月 MCP 额度", "🛠")):
+            item = _usage_item(windows, item_id, old)
+            if item: lines.append(_window_line(item, detail=False, icon=icon))
+    elif source == "openrouter":
+        balances = snap.get("balances") or []
+        remaining, limit = _usage_item(balances, "key_remaining", "Key 剩余额度"), _usage_item(balances, "key_limit", "Key 额度上限")
+        if remaining:
+            core = f"🔑 Key 剩余：<b>{_usage_value(remaining)}</b>"
+            if limit: core += f" / {_usage_value(limit)}"
+            lines.append(core)
+        usage = []
+        for item_id, label in (("usage_daily", "今日用量"), ("usage_weekly", "本周用量"), ("usage_monthly", "本月用量")):
+            item = _usage_item(balances, item_id, label)
+            if item: usage.append(f"{label.replace('用量', '')} {_usage_value(item)}")
+        if usage: lines.append("📈 " + " · ".join(usage))
+    elif snap.get("balances"):
+        balances = snap.get("balances") or []
+        primary = _usage_item(balances, "available", "可用余额") or _usage_item(balances, "total", "总余额") or balances[0]
+        lines.append(f"💰 {ui.escape_html(str(primary.get('label') or '余额'))}：<b>{_usage_value(primary)}</b>")
+        total = _usage_item(balances, "total", "总余额")
+        if total and total is not primary: lines[0] += f" / 总额 {_usage_value(total)}"
+    else:
+        for item in (snap.get("windows") or [])[:2]:
+            lines.append(_window_line(item, detail=False))
+    warning = _status_text(status, has_snapshot=True)
+    if warning: lines.insert(0, warning)
+    return "\n".join(lines or ["📊 上游额度已获取"])
+
+
+def _usage_detail_lines(ch) -> list[str]:
+    if provider_usage.spec_for(ch) is None:
+        return ["<b>☁️ 上游账户额度</b>", "当前 Provider/Preset 暂不支持只读查询。"]
+    view = provider_usage.cached(ch)
+    status, snap = view.get("status"), view.get("snapshot") or {}
+    lines = ["<b>☁️ 上游账户额度</b>"]
+    warning = _status_text(status, has_snapshot=True)
+    if warning: lines.append(warning)
+    if not snap:
+        lines.append(_status_text(status) or "上游用量尚未获取")
+        if view.get("error"): lines.append(f"错误：{ui.escape_html(str(view['error']))}")
+        return lines
+    source = snap.get("source") or view.get("source")
+    if source == "zhipu-coding" and not snap.get("version"):
+        lines.append("当前上游额度数据暂无法展示。")
+    elif source == "zhipu-coding":
+        windows = snap.get("windows") or []
+        for item_id, old, icon in (("tokens_5h", "5 小时额度", "⏱"), ("tokens_7d", "7 天额度", "📅"), ("mcp_month", "月 MCP 额度", "🛠")):
+            item = _usage_item(windows, item_id, old)
+            if item:
+                line = _window_line(item, detail=True, icon=icon)
+                if item_id == "mcp_month" and " · 重置 " in line:
+                    line = line.replace(" · 重置 ", "\n   重置 ")
+                lines.append(line)
+        counters = snap.get("counters") or []
+        model_items = [x for x in counters if x.get("group") == "model"]
+        if model_items:
+            lines += ["", "<b>📈 近 24 小时模型用量</b>"]
+            calls = _usage_item(model_items, "model_calls", "模型调用总数")
+            tokens = _usage_item(model_items, "trend_tokens", "Token 用量合计")
+            if calls: lines.append(f"模型调用：<code>{_usage_number(calls.get('value'))} 次</code>")
+            if tokens: lines.append(f"Token 用量：<code>{_usage_number(tokens.get('value'), compact=True)}</code>")
+            dist = [x for x in model_items if x.get("kind") == "distribution" or str(x.get("label", "")).startswith("模型 ·")][:8]
+            denom = Decimal(str(dist[0].get("distribution_total"))) if dist and dist[0].get("distribution_total") is not None else sum((Decimal(str(x.get("value") or 0)) for x in dist), Decimal(0))
+            if dist and denom:
+                bits = [f"{ui.escape_html(str(x.get('label')).removeprefix('模型 · '))} {Decimal(str(x.get('value'))) / denom * 100:.1f}%" for x in dist]
+                lines.append("模型分布：" + " · ".join(bits))
+            if "model_scope_mismatch" in (snap.get("notices") or []):
+                lines.append("<i>上游趋势总量与模型分项为不同统计口径，未直接相加。</i>")
+        tool_items = [x for x in counters if x.get("group") == "tool"]
+        if tool_items:
+            lines += ["", "<b>🔧 近 24 小时工具调用</b>"]
+            for item in tool_items[:9]:
+                try:
+                    if Decimal(str(item.get("value"))) == 0: continue
+                except (InvalidOperation, ValueError):
+                    continue
+                lines.append(f"{ui.escape_html(str(item.get('label')))}：<code>{_usage_number(item.get('value'))} 次</code>")
+    elif source == "openrouter":
+        balances = snap.get("balances") or []
+        remaining, limit = _usage_item(balances, "key_remaining", "Key 剩余额度"), _usage_item(balances, "key_limit", "Key 额度上限")
+        if remaining: lines.append(f"🔑 Key 剩余额度：<code>{_usage_value(remaining)}</code>" + (f" / <code>{_usage_value(limit)}</code>" if limit else ""))
+        for item_id, label in (("usage_daily", "今日用量"), ("usage_weekly", "本周用量"), ("usage_monthly", "本月用量"), ("usage_total", "累计用量"), ("byok_usage", "BYOK 用量")):
+            item = _usage_item(balances, item_id, label)
+            if item: lines.append(f"📈 {label}：<code>{_usage_value(item)}</code>")
+    elif snap.get("balances"):
+        for item in snap.get("balances") or []:
+            lines.append(f"💰 {ui.escape_html(str(item.get('label') or '余额'))}：<code>{_usage_value(item)}</code>")
+    else:
+        for item in snap.get("windows") or []:
+            lines.append(_window_line(item, detail=True))
+    for notice in snap.get("notices") or []:
+        if notice != "model_scope_mismatch" and not str(notice).startswith("额度重置:"):
+            lines.append(f"<i>{ui.escape_html(str(notice))}</i>")
+    if view.get("fetched_at"): lines += ["", f"<i>更新于 {_usage_updated(view['fetched_at'])}</i>"]
+    if view.get("error"): lines.append(f"错误：{ui.escape_html(str(view['error']))}")
+    return lines
+
+
+def _schedule_usage(channels: list[Any], *, force: bool = False) -> None:
+    for ch in channels:
+        provider_usage.schedule_refresh(ch, force=force)
+
+
 # ─── 渠道列表 ─────────────────────────────────────────────────────
 
-_PAGE_SIZE = 6
+_PAGE_SIZE = 4
 
 
 def _page_callback(page: int) -> str:
@@ -392,24 +614,14 @@ def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
     for idx, ch in enumerate(page_chans, start=start + 1):
         icon, status = _channel_health(ch)
         ch_stats = by_channel.get(ch.key)
-        if ch_stats is not None:
-            ch_tps = ch_stats.get("avg_tps")
-            ch_prompt = ui.prompt_total(ch_stats.get("input"), ch_stats.get("cache_creation"), ch_stats.get("cache_read"))
-            ch_cache = (
-                ui.fmt_cache_phrase(ch_stats.get("cache_read"), ch_prompt)
-                if (ch_stats.get("cache_read") or 0) > 0 else ""
-            )
-            ch_cost = ui.fmt_cost(ch_stats, decimal_places=3)
-        else:
-            ch_tps = None
-            ch_cache = ""
-            ch_cost = ""
-        summary = _summary_text(ch, tps_v=ch_tps, cache_phrase=ch_cache)
         lines.append("")
         lines.append(f"{idx}. {icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
-        lines.append(f"  模型: {len(ch.models)} 个 · {ui.escape_html(summary)}")
-        if ch_cost:
-            lines.append(f"  💵 {ch_cost}")
+        local_lines = _channel_monthly_lines(ch, ch_stats)
+        lines.append("  " + local_lines[0])
+        usage_line = _usage_summary(ch)
+        if usage_line:
+            lines.extend("  " + line for line in usage_line.splitlines())
+        lines.extend("  " + line for line in local_lines[1:])
         short = ui.register_code(ch.display_name)
         current.append(ui.btn(f"{idx}. {icon} {ch.display_name}", f"ch:view:{_callback_payload(short, page)}"))
         if len(current) >= 2:
@@ -449,6 +661,8 @@ def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int =
     menu_cache.begin_view(chat_id, message_id)
     text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
+    # 页面已经完成渲染后才排队；Provider 网络永不位于 Telegram handler 等待路径。
+    _schedule_usage([ch for ch in registry.all_channels() if ch.type == "api"][(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
 
 
 def send_new(chat_id: int, page: int = 1) -> None:
@@ -459,6 +673,7 @@ def send_new(chat_id: int, page: int = 1) -> None:
         return
     text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
     ui.send(chat_id, text, reply_markup=kb)
+    _schedule_usage([ch for ch in registry.all_channels() if ch.type == "api"][(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
 
 
 # ─── 渠道排序 ─────────────────────────────────────────────────────
@@ -825,6 +1040,11 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
         f"⚡ 并发上限: <code>{getattr(ch, 'max_concurrent', 0) or '默认'}</code>",
         f"{'✅' if enabled else '⬛'} 状态: <code>{'enabled' if enabled else (ch.disabled_reason or 'disabled')}</code>",
         "",
+    ]
+    lines.extend(_usage_detail_lines(ch))
+    lines += [
+        "",
+        "<b>📈 Parrot 本地统计</b>",
         f"<b>📋 模型 ({len(ch.models)} 个)</b>",
     ]
     lines.extend(_channel_model_lines(ch, model_stats, stats_loading=stats_loading))
@@ -841,6 +1061,10 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
         [ui.btn("🧪 测试模型", f"ch:test:{short}"), ui.btn("✏ 编辑", f"ch:edit:{short}")],
         [ui.btn("🧹 清错误", f"ch:clear_errors:{payload}"),
          ui.btn("🔗 清亲和", f"ch:clear_affinity:{payload}")],
+    ]
+    if provider_usage.spec_for(ch) is not None:
+        rows.append([ui.btn("🔄 刷新上游用量", f"ch:usage:{payload}")])
+    rows += [
         [ui.btn(toggle_label, f"ch:toggle:{payload}"),
          ui.btn("🗑 删除", f"ch:del:{payload}")],
         [ui.btn("◀ 返回列表", _page_callback(page))],
@@ -887,6 +1111,20 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     )
     if text is not None:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
+        provider_usage.schedule_refresh(ch)
+
+
+def on_usage_refresh(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
+    short, page = _split_short_page(payload)
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None:
+        ui.answer_cb(cb_id, "渠道不存在")
+        return
+    queued = provider_usage.schedule_refresh(ch, force=True)
+    ui.answer_cb(cb_id, "已请求更新" if queued else "暂时无需重复更新")
+    text, kb = _detail_text_and_kb(name, page=page)
+    if text: ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 启停 / 清错误 / 清亲和 / 删除 ───────────────────────────────
@@ -2359,6 +2597,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         wiz_on_protocol_select(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
 
     # 渠道详情相关
+    if data.startswith("ch:usage:"):
+        on_usage_refresh(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:view:"):
         on_view(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:toggle:"):

@@ -141,35 +141,31 @@ Grok Imagine 页面同时展示模型路由：已配置的 `grok-imagine-image*`
 ### 9.3.1 列表视图
 
 ```
-╔═══════════════════════════════╗
-║    📡 渠道管理                 ║
-╠═══════════════════════════════╣
-║ 共 3 个渠道，3 正常
-║ 
-║ 1. ✅ 智谱 Coding Plan Max
-║    总用量(30d): ↑ 1.45B | ↓ 124.21M
-║              cache 1.30B (96.1%)
-║    模型: glm-5, glm-5-turbo
-║ 
-║ 2. ✅ 百度 Coding Plan 公司号
-║    总用量(30d): ↑ 300M | ↓ 45M
-║              cache 280M (92.1%)
-║    模型: ernie-bot-5, ernie-bot-4
-║ 
-║ 3. 🔒 阿里云 Coding Plan Pro [永久冻结]
-║    总用量(30d): ↑ 12M | ↓ 1.2M
-║    模型: qwen-plus
-╚═══════════════════════════════╝
-[ 智谱 Coding Plan Max ]
-[ 百度 Coding Plan 公司号 ]
-[ 阿里云 Coding Plan Pro ]
+📡 渠道管理
+共 3 个 | 第 1/1 页
+
+1. 🟢 智谱 Coding Plan Max — 正常
+  🏷️ 模型：2 个
+  📊 5h：已用 74% · 重置 19:38
+  📅 7d：已用 23% · 重置 08-23 10:01
+  🛠 MCP 月度：已用 233 / 4,000（5%）· 重置 09-12 10:01
+  💎 Parrot 月度：↑ 660.4M · ↓ 1.4M · 缓存 379.4M（57.4%）
+  📨 请求：3,692 次 · 成功率 99.6% · 失败 13 次
+  ⚡ TPS：平均 78.5 t/s · 峰值 341 t/s · 最低 0.5 t/s
+  💵 费用：$495.384
+
+2. 🟢 自定义渠道 — 正常
+  🏷️ 模型：5 个
+  💎 Parrot 月度：暂无调用
+
+[ 智谱 Coding Plan Max ][ 自定义渠道 ]
 ─────────────────────────
 [ ➕ 添加渠道 ][ 🧹 清除错误 ]
 [ 🔗 清空全部亲和绑定          ]
 [       ◀ 返回主菜单          ]
 ```
 
-> 注：渠道总用量按"当月 log.db"聚合。
+渠道列表每页 4 个。第一行健康状态来自 scorer/cooldown；上游额度与 Parrot 本地月度统计分行显示，不再把近期成功率、近期样本、月度 TPS、缓存和费用混成同一摘要。本地月度请求、Token、缓存、TPS 与费用均来自同一份当月 `log.db` 共享快照；无本月调用时只显示“暂无调用”。
 
 ### 9.3.2 渠道详情
 
@@ -657,3 +653,7 @@ if len(text) > 3900:
 - 适用于：第三方 Claude 中转对新模型废弃 `temperature` 参数（典型报错 `temperature is deprecated for this model`）。
 - 只对当前渠道生效，其他渠道仍按原行为透传 temperature。
 
+
+## API 渠道上游额度/用量
+
+渠道列表先显示独立缓存的一行摘要，详情将「上游账户额度/用量」与「Parrot 本地统计」分区。仅 `providerId + providerPresetId` 命中固定 adapter registry 时支持查询；旧渠道和自定义渠道不会按名称或 URL 猜测。首版固定支持 13 个 preset：智谱 `coding-cn/coding-global`，Kimi `code/api-cn/api-global`，DeepSeek `standard`，OpenRouter `standard`，MiniMax `api-cn/api-global/token-cn/token-global`，SiliconFlow `api-cn/api-global`。进入列表/详情及“刷新上游用量”回调都只渲染已有数据并异步请求更新，Telegram handler 不等待 Provider 网络。已有数据时不向用户暴露缓存过期、后台刷新等实现状态；尚无数据时显示中性的“上游用量尚未获取”，保留旧值时仍可提示最近一次更新失败。智谱模型与工具统计按实际查询区间统一标为“近 24 小时”。回调只携带渠道短码和页码。

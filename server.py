@@ -35,7 +35,7 @@ from src import (
     affinity, apikey_limiter, auth, compact_rescue, config, cooldown, cursor_reconcile,
     errors, failover, fingerprint, image_db, load_balancing, log_db,
     model_mapping, model_metadata, model_pricing, network,
-    network_monitor, notifier, oauth_manager, probe, public_ip, scheduler, scorer,
+    network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, scheduler, scorer,
     state_db, status_monitor, token_counter, translation, update_checker, updater,
     upstream,
 )
@@ -302,6 +302,18 @@ async def lifespan(app: FastAPI):
         )
     registry.install_config_reload_hook()
 
+    # API Provider 用量在 Telegram 启动前启动唯一 coordinator 并预热一次。
+    # 预热只进入共享队列，不等待网络；禁用语义与 OAuth 主动刷新一致。
+    if provider_usage.is_enabled():
+        await provider_usage.start()
+        _provider_usage_startup = provider_usage.schedule_startup_refresh()
+        print(
+            "[provider_usage] startup refresh: "
+            f"channels={_provider_usage_startup['supported_channels']} "
+            f"accounts={_provider_usage_startup['supported_accounts']} "
+            f"scheduled={_provider_usage_startup['scheduled_accounts']}"
+        )
+
     # httpx 客户端
     upstream.create_client()
     try:
@@ -392,6 +404,8 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         await apikey_limiter.shutdown_spooling()
         tgbot.stop()
+        # Provider workers 可能写 state.db，必须先于数据库关闭完整停止。
+        await provider_usage.stop()
         await upstream.close_client()
         cursor_bridge_runtime.stop()
         _finalize_state_db()

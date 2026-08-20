@@ -292,3 +292,7 @@ usage 不得估成 0。xAI 上游返回的实际费用可以在 Token usage 缺�
 
 月度数据库使用增量迁移：旧请求记录继续可读；新增请求摘要/尝试账本字段和索引时，
 不会改写历史 Token 语义。
+
+## API Provider 上游用量缓存
+
+`api_provider_usage_cache` 与 `oauth_quota_cache` 独立。主键 `account_id` 是安装级随机密钥 HMAC（输入包含固定 adapter/product/host scope 与渠道 Key），不会保存明文 Key或普通裸 hash；同一 Key 在同一产品/区域复用时共享快照，不同区域或产品不会合并。表中只保存白名单归一化 JSON、成功时间、脱敏错误与退避截止时间，不保存 Authorization、完整响应或 PII。成功（含明确 partial）替换快照；partial 中失败分项的有效上游退避仍写入 `retry_after`，全失败则保留最后成功值。删除或修改渠道身份时，最后一个共享旧账户的 live 渠道消失后同步删除旧缓存。

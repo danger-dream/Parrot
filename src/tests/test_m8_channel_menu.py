@@ -264,9 +264,12 @@ def test_list_empty_and_populated(m):
     assert "共 2 个" in last["text"]
     assert "chA" in last["text"]
     assert "chB" in last["text"]
-    assert "缓存 50 (31.2%)" in last["text"]
-    assert "\n  💵 $0.000" in last["text"]
-    assert "缓存 50 (31.2%) · 💵" not in last["text"]
+    assert "🏷️ 模型：<code>1</code> 个" in last["text"]
+    assert "💎 Parrot 月度：↑ 160 · ↓ 20 · 缓存 50 (31.2%)" in last["text"]
+    assert "📨 请求：1 次 · 成功率 100.0%" in last["text"]
+    assert "⚡ TPS：平均" in last["text"]
+    assert "💵 费用：$0.000" in last["text"]
+    assert "💎 Parrot 月度：<i>暂无调用</i>" in last["text"]
     assert "≈" not in last["text"]
     print("  [PASS] list empty + populated")
 
@@ -281,8 +284,8 @@ def test_list_pagination_and_detail_return_page(m):
     cm.show(42, 100, page=1)
     page1 = rec.last("editMessageText")
     assert page1 and "共 8 个 | 第 1/2 页" in page1["text"]
-    assert "chan-00" in page1["text"] and "chan-05" in page1["text"]
-    assert "chan-06" not in page1["text"]
+    assert "chan-00" in page1["text"] and "chan-03" in page1["text"]
+    assert "chan-04" not in page1["text"]
     page1_btns = [
         b["callback_data"]
         for row in page1["reply_markup"]["inline_keyboard"]
@@ -297,7 +300,7 @@ def test_list_pagination_and_detail_return_page(m):
     cm.show(42, 100, page=2)
     page2 = rec.last("editMessageText")
     assert page2 and "共 8 个 | 第 2/2 页" in page2["text"]
-    assert "chan-06" in page2["text"] and "chan-07" in page2["text"]
+    assert "chan-04" in page2["text"] and "chan-07" in page2["text"]
     assert "chan-00" not in page2["text"]
     page2_btns = [
         b["callback_data"]
@@ -312,7 +315,7 @@ def test_list_pagination_and_detail_return_page(m):
     rec.clear()
     cm.on_view(42, 100, "cb", detail_payload)
     detail = rec.last("editMessageText")
-    assert detail and "chan-06" in detail["text"]
+    assert detail and "chan-04" in detail["text"]
     detail_btns = [
         b["callback_data"]
         for row in detail["reply_markup"]["inline_keyboard"]
@@ -940,3 +943,29 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_supported_provider_usage_list_detail_are_cache_only(m, monkeypatch):
+    _setup(m)
+    m["registry"].add_api_channel({
+        "name": "DeepSeek quota", "baseUrl": "https://api.deepseek.com",
+        "apiKey": "sk-live-not-used", "providerId": "deepseek",
+        "providerPresetId": "standard", "models": [{"real": "deepseek-chat", "alias": "deepseek-chat"}],
+        "cc_mimicry": False, "enabled": True,
+    })
+    ch = m["registry"].get_channel("api:DeepSeek quota")
+    pu = m["channel_menu"].provider_usage
+    monkeypatch.setattr(pu, "cached", lambda channel: {"status": "fresh", "fetched_at": 1000,
+        "snapshot": {"source": "deepseek", "balances": [{"label": "总余额", "value": "8.80", "currency": "CNY"}],
+                     "windows": [], "counters": [], "notices": ["账户可用"], "partial": False}})
+    called = []
+    monkeypatch.setattr(pu, "schedule_refresh", lambda channel, **kwargs: called.append((channel.key, kwargs)) or True)
+    text, _ = m["channel_menu"]._list_text_and_kb(snapshot={"by_channel": {}})
+    assert "💰 总余额：<b>8.8 CNY</b>" in text
+    detail, kb = m["channel_menu"]._detail_text_and_kb(ch.display_name, model_stats=[])
+    assert "上游账户额度" in detail and "Parrot 本地统计" in detail
+    assert detail.index("上游账户额度") < detail.index("Parrot 本地统计")
+    callbacks = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
+    usage_cb = next(x for x in callbacks if x.startswith("ch:usage:"))
+    assert len(usage_cb.encode()) <= 64 and "deepseek" not in usage_cb and "sk-live" not in usage_cb
+    assert called == []  # pure render path never performs or schedules network itself

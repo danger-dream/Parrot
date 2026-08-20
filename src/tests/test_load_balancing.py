@@ -16,7 +16,7 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import affinity, concurrency, config, load_balancing, scheduler, state_db
+    from src import affinity, channel_state, concurrency, config, load_balancing, scheduler, state_db
     from src.channel import registry
     from src.openai.channel.registration import register_factories
     from src.telegram import states, ui
@@ -29,6 +29,7 @@ def _import_modules():
         "scheduler": scheduler,
         "state_db": state_db,
         "registry": registry,
+        "channel_state": channel_state,
         "register_factories": register_factories,
         "states": states,
         "ui": ui,
@@ -352,13 +353,15 @@ def test_priority_sorts_available_and_saturated_separately(m):
     m["load_balancing"].save_channel_order(["api:a", "api:b"])
     m["config"].update(lambda cfg: cfg.__setitem__("channelSelection", "priority"))
 
-    assert asyncio.run(m["concurrency"].try_acquire("api:a")) is True
+    channel = m["registry"].get_channel("api:a")
+    effect_key = m["channel_state"].effect_key(channel)
+    assert asyncio.run(m["concurrency"].try_acquire(effect_key)) is True
     try:
         result = _schedule(m, "m")
         assert _candidate_keys(result) == ["api:b"]
         assert [channel.key for channel, _model in result.saturated] == ["api:a"]
     finally:
-        m["concurrency"].release("api:a")
+        m["concurrency"].release(effect_key)
 
 
 def test_model_codes_survive_restart(m):

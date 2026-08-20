@@ -356,6 +356,8 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
     )
     old_entry_snapshot = copy.deepcopy(old_entry)
     current_channel = get_channel(old_key)
+    from .. import provider_usage
+    old_usage_account_id = provider_usage.account_id(current_channel) if current_channel is not None else None
     current_generation_id = channel_state.generation_id(
         channel_state.effect_key(current_channel)
     ) if current_channel is not None else None
@@ -513,6 +515,7 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
         raise exc
 
     rebuild_from_config()
+    provider_usage.cleanup_account_if_orphaned(old_usage_account_id)
     return {"name": new_name}
 
 
@@ -530,6 +533,8 @@ def _delete_api_channel_serialized(name: str) -> bool:
         return False
     found = {"ok": False}
     current = get_channel(key)
+    from .. import provider_usage
+    old_usage_account_id = provider_usage.account_id(current) if current is not None else None
     generation_key = channel_state.effect_key(current) if current is not None else key
 
     def _mutate(cfg):
@@ -571,4 +576,5 @@ def _delete_api_channel_serialized(name: str) -> bool:
         affinity.delete_by_channel(key)
         affinity.client_delete_by_channel(key)
         rebuild_from_config()
+        provider_usage.cleanup_account_if_orphaned(old_usage_account_id)
     return True
