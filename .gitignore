@@ -31,6 +31,9 @@ logs/
 images/
 *.log
 
+# models.dev 本地目录缓存（运行时生成，不要提交）
+models_dev_catalog.json.gz
+
 # 设备/实例身份
 .anthropic_proxy_ids.json
 
