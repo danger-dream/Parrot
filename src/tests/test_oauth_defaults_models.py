@@ -1,11 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+
+import pytest
 
 from src import config, state_db
 from src.models_discovery import ModelsDiscoveryError
 from src.telegram import states, ui
 from src.telegram.menus import oauth_defaults_menu
+
+_MUTATED_TOP_KEYS = (
+    "oauthDefaultModels",
+    "oauthAccounts",
+    "apiKeys",
+    "modelMapping",
+    "ingressDefaultModel",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_oauth_defaults_config():
+    """本文件会改家族默认模型，测完必须还原，避免污染后续 Channel 回落测试。"""
+    before = config.get()
+    snapshot = {key: copy.deepcopy(before.get(key)) for key in _MUTATED_TOP_KEYS}
+    openai_models = copy.deepcopy((before.get("openaiOAuth") or {}).get("defaultModels"))
+    xai_models = copy.deepcopy((before.get("xaiOAuth") or {}).get("defaultModels"))
+    yield
+
+    def restore(cfg):
+        for key, value in snapshot.items():
+            cfg[key] = copy.deepcopy(value)
+        cfg.setdefault("openaiOAuth", {})["defaultModels"] = copy.deepcopy(openai_models)
+        cfg.setdefault("xaiOAuth", {})["defaultModels"] = copy.deepcopy(xai_models)
+
+    config.update(restore)
 
 
 def _reset():
