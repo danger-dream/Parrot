@@ -22,7 +22,8 @@
        - 清默认: 清除 ingressDefaultModel[line]
 
 callback_data 前缀: `odm:...`
-状态机 action: `odm_edit:<family>`
+状态机 action:
+  - `odm_discovery` / `odm_model_select` / `odm_edit:<family>`
 pending 保存: cfg["_odm_pending"]["<family>"] = {"new": [...], "old": [...]}
   (下划线前缀 → 配置 sanitize 时如果需要可剥离; 当前版本不在 save/load
   做 sanitize, 但保存策略仍在持久前 pop)
@@ -30,19 +31,27 @@ pending 保存: cfg["_odm_pending"]["<family>"] = {"new": [...], "old": [...]}
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
+import threading
+import time
 
 from ... import config
+from ...models_discovery import ModelsDiscoveryError, discover_models
+from ...oauth_ids import account_key as _account_key
 from .. import states, ui
 
 
 _FAMILIES: tuple[str, ...] = ("anthropic", "openai", "xai")
 
 _FAM_LABEL = {
-    "anthropic": "Anthropic OAuth",
-    "openai":    "OpenAI OAuth",
-    "xai":       "Grok OAuth",
+    "anthropic": "Claude",
+    "openai":    "OpenAI",
+    "xai":       "Grok",
 }
+PAGE = 10
+_SYNC_SPAWN = False
 _FAM_PROVIDER = {
     "anthropic": "claude",
     "openai":    "openai",
@@ -290,35 +299,135 @@ def _commit_save(
 
 # ─── Level 1 总览 ─────────────────────────────────────────────────
 
+def _spawn_async_task(coro_factory, name: str = "odm-task") -> None:
+    if _SYNC_SPAWN:
+        try:
+            asyncio.run(coro_factory())
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        return
+
+    def _runner():
+        try:
+            asyncio.run(coro_factory())
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    threading.Thread(target=_runner, daemon=True, name=name).start()
+
+
+def _bounds(n, page):
+    pages = max(1, math.ceil(n / PAGE))
+    page = max(0, min(int(page), pages - 1))
+    return page, page * PAGE, pages
+
+
+def abandon_edit(chat_id: int) -> None:
+    st = states.get_state(chat_id)
+    if not st:
+        return
+    action = str(st.get("action") or "")
+    if action in ("odm_discovery", "odm_model_select") or action.startswith("odm_edit:"):
+        states.pop_state(chat_id)
+
+
+def _cursor_account_count() -> int:
+    from ... import oauth_manager
+    return sum(
+        1 for acc in (config.get().get("oauthAccounts") or [])
+        if isinstance(acc, dict) and oauth_manager.provider_of(acc) == "cursor"
+    )
+
+
+def _static_models(family: str) -> list[str]:
+    defaults = config.DEFAULT_CONFIG
+    if family == "anthropic":
+        raw = defaults.get("oauthDefaultModels") or []
+    elif family == "xai":
+        raw = (defaults.get("xaiOAuth") or {}).get("defaultModels") or []
+    else:
+        raw = (defaults.get("openaiOAuth") or {}).get("defaultModels") or []
+    return [str(x) for x in raw if str(x).strip()]
+
+
+def _has_live_endpoint(family: str) -> bool:
+    return family == "xai"
+
+
+def _xai_models_url() -> str:
+    raw = config.get().get("xaiOAuth")
+    cfg = raw if isinstance(raw, dict) else {}
+    base = str(cfg.get("apiBaseUrl") or cfg.get("baseUrl") or "https://api.x.ai/v1").rstrip("/")
+    return base if base.endswith("/models") else base + "/models"
+
+
+def _first_enabled_account_key(provider: str) -> str | None:
+    from ... import oauth_manager
+    for acc in config.get().get("oauthAccounts") or []:
+        if not isinstance(acc, dict):
+            continue
+        if oauth_manager.provider_of(acc) != provider:
+            continue
+        if acc.get("enabled", True) and not acc.get("disabled_reason"):
+            try:
+                return _account_key(acc)
+            except Exception:
+                continue
+    return None
+
+
+def _filter_xai_text_models(ids: list[str]) -> list[str]:
+    out: list[str] = []
+    for mid in ids:
+        low = mid.lower()
+        if low.startswith("grok-imagine") or "imagine-image" in low or "imagine-video" in low:
+            continue
+        out.append(mid)
+    return out
+
+
+def _merge_ids(ids: list[str], existing: list[str]) -> list[str]:
+    merged = list(dict.fromkeys(ids))
+    for mid in existing:
+        if mid and mid not in merged:
+            merged.append(mid)
+    return merged
+
+
 def _overview_text() -> str:
     lines = [
-        "🧩 <b>OAuth 默认模型配置</b>",
+        "🧩 <b>OAuth 模型目录</b>",
         "",
-        "<i>OAuth 账户 entry 未填写 <code>models</code> 时回落到这里。改动热生效, 无需重启。</i>",
+        "这里改的是家族共用白名单。",
+        "账号自己没填模型时，全部回落到这份列表。",
+        "Cursor 仍按账号自动同步，不在这里改。",
         "",
     ]
     for fam in _FAMILIES:
         models = _read_list(fam)
-        lines.append(f"{_fam_body_label(fam)} ({len(models)}):")
-        if models:
-            joined = ", ".join(ui.escape_html(m) for m in models)
-            lines.append(f"<code>{joined}</code>")
-        else:
-            lines.append("<i>(空)</i>")
-        lines.append("")
-    return "\n".join(lines).rstrip()
+        lines.append(f"{_fam_body_label(fam)}  {len(models)} 个已启用")
+    cursor_n = _cursor_account_count()
+    lines.append(f"{ui.provider_tag('cursor')}  账号详情里看目录")
+    if cursor_n:
+        lines[-1] += f"（{cursor_n} 个账号）"
+    return "\n".join(lines)
 
 
 def _overview_kb() -> dict:
     return ui.inline_kb([
-        [ui.provider_button("✏ 修改 Claude", "odm:edit:anthropic", "claude"),
-         ui.provider_button("✏ 修改 OpenAI", "odm:edit:openai", "openai")],
-        [ui.provider_button("✏ 修改 Grok", "odm:edit:xai", "xai")],
-        [ui.btn("◀ 返回主菜单", "menu:main")],
+        [
+            ui.provider_button("Claude", "odm:edit:anthropic", "claude"),
+            ui.provider_button("OpenAI", "odm:edit:openai", "openai"),
+            ui.provider_button("Grok", "odm:edit:xai", "xai"),
+        ],
+        [ui.btn("◀ 返回账户设置", "oa:settings")],
     ])
 
 
 def show(chat_id: int, message_id: int, cb_id: str) -> None:
+    abandon_edit(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(chat_id, message_id, _overview_text(), reply_markup=_overview_kb())
 
@@ -327,29 +436,348 @@ def send_new(chat_id: int) -> None:
     ui.send(chat_id, _overview_text(), reply_markup=_overview_kb())
 
 
-# ─── Level 2 编辑页 (进入状态机) ──────────────────────────────────
+# ─── Level 2 发现 / 多选 / 手填 ──────────────────────────────────
+
+def _manual_panel(chat_id: int, message_id, data: dict) -> None:
+    family = data["family"]
+    data["models_mode"] = "manual"
+    data["models_source"] = "manual"
+    states.set_state(chat_id, f"odm_edit:{family}", data)
+    prefix = ""
+    if data.get("discovery_error"):
+        prefix = ("⚠️ <b>自动获取模型失败，已切换为手动输入</b>\n\n"
+                  f"原因：{ui.escape_html(str(data['discovery_error']))}\n\n")
+    elif data.get("manual_notice"):
+        prefix = f"ℹ️ {ui.escape_html(str(data['manual_notice']))}\n\n"
+    current = ", ".join(data.get("existing_models") or [])
+    current_line = f"当前：<code>{ui.escape_html(current)}</code>\n\n" if current else "当前：<i>(空)</i>\n\n"
+    text = (
+        prefix + f"✏ <b>修改</b> {_fam_body_label(family)} <b>默认模型</b>\n\n"
+        + current_line +
+        "请输入新的模型列表，逗号/换行分隔。\n"
+        "发送 <code>-</code> 或 <code>empty</code> 则清空。\n\n"
+        "<i>若删除的模型仍被 API Key / 映射 / 入口默认引用，保存前会再确认。</i>"
+    )
+    rows = []
+    if data.get("discovery_retry_available"):
+        rows.append([ui.btn("🔄 重试自动获取", "odm:retry"),
+                     ui.btn("◀ 返回目录", "odm:show")])
+    elif data.get("discovered_models"):
+        rows.append([ui.btn("◀ 返回模型选择", "odm:backsel"),
+                     ui.btn("◀ 返回目录", "odm:show")])
+    else:
+        rows.append([ui.btn("◀ 返回目录", "odm:show")])
+    kb = ui.inline_kb(rows)
+    if message_id is None:
+        ui.send(chat_id, text, reply_markup=kb)
+    else:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _enter_select(chat_id, message_id, data, ids, *, source, error=None, retry=False):
+    existing = data.get("existing_models") or []
+    merged = _merge_ids(ids, existing)
+    existing_set = set(existing)
+    data.update(
+        discovered_models=merged,
+        selected_models=[mid for mid in merged if mid in existing_set],
+        model_page=0,
+        models_mode="discovered",
+        models_source=source,
+        discovery_retry_available=bool(retry),
+    )
+    data.pop("manual_notice", None)
+    if error:
+        data["discovery_error"] = str(error)
+    else:
+        data.pop("discovery_error", None)
+    states.set_state(chat_id, "odm_model_select", data)
+    _render_models(chat_id, message_id, data)
+
+
+def _model_kb(data):
+    models = data["discovered_models"]
+    selected = set(data.get("selected_models") or [])
+    page, start, pages = _bounds(len(models), data.get("model_page", 0))
+    data["model_page"] = page
+    existing = set(data.get("existing_models") or [])
+    rows = []
+    for i, mid in enumerate(models[start:start + PAGE], start):
+        mark = "✅ " if mid in selected else "⬜ "
+        suffix = ""
+        if mid not in existing:
+            suffix = " · 新" if data.get("models_source") == "live" else " · 参考"
+        rows.append([ui.btn(mark + mid + suffix, f"odm:t:{i}:{page}")])
+    if pages > 1:
+        rows.append([
+            ui.btn("◀", f"odm:p:{page-1}"),
+            ui.btn(f"{page+1}/{pages}", "odm:noop"),
+            ui.btn("▶", f"odm:p:{page+1}"),
+        ])
+    rows += [[ui.btn("✅ 全选", "odm:all"), ui.btn("🔄 反选", "odm:inv")],
+             [ui.btn(f"确认保存（{len(selected)}）", "odm:ok")]]
+    if data.get("discovery_retry_available"):
+        rows.append([ui.btn("✍️ 手动输入", "odm:manual"),
+                     ui.btn("🔄 重试实时获取", "odm:retry")])
+    else:
+        rows.append([ui.btn("✍️ 手动输入", "odm:manual")])
+    rows.append([ui.btn("◀ 返回目录", "odm:show")])
+    return ui.inline_kb(rows)
+
+
+def _render_models(chat_id, message_id, data):
+    count = len(data["discovered_models"])
+    if data.get("models_source") == "static":
+        if data.get("discovery_error"):
+            head = ("⚠️ <b>实时模型列表获取失败</b>\n\n"
+                    f"原因：{ui.escape_html(str(data['discovery_error']))}\n\n"
+                    f"当前显示 {count} 个内置参考模型，可能不是最新版本。")
+        else:
+            head = f"ℹ️ 当前显示 {count} 个内置参考模型，可能不是最新版本。"
+    else:
+        head = f"✅ 已从上游获取 {count} 个模型"
+    text = (head + f"\n\n✏ <b>修改</b> {_fam_body_label(data['family'])} <b>默认模型</b>\n\n"
+            "已启用会预勾；新模型默认不勾。本地有、参考/上游没有的继续留着。")
+    if message_id is None:
+        ui.send(chat_id, text, reply_markup=_model_kb(data))
+    else:
+        ui.edit(chat_id, message_id, text, reply_markup=_model_kb(data))
+
+
+async def _discover_family_models(family: str):
+    static = _static_models(family)
+    error = None
+    ids: list[str] = []
+    source = "live"
+    retry = _has_live_endpoint(family)
+    try:
+        if family == "xai":
+            account_key = _first_enabled_account_key("xai")
+            if not account_key:
+                raise ModelsDiscoveryError("没有可用的 Grok 账户用于拉取模型")
+            from ... import oauth_manager
+            try:
+                token = await oauth_manager.ensure_valid_token(account_key)
+            except Exception:
+                raise ModelsDiscoveryError("无法获取 Grok 访问令牌") from None
+            ids = _filter_xai_text_models(await discover_models(_xai_models_url(), token))
+            if not ids:
+                raise ModelsDiscoveryError("上游未返回可用文本模型")
+        elif static:
+            ids = list(static)
+            source = "static"
+            retry = False
+        else:
+            raise ModelsDiscoveryError("该提供商未公开模型列表")
+    except ModelsDiscoveryError as exc:
+        error = str(exc)
+        if static:
+            ids = list(static)
+            source = "static"
+    return ids, source, error, retry
+
+
+def _start_discovery(chat_id, message_id, data):
+    generation = time.time_ns()
+    data["discovery_generation"] = generation
+    states.set_state(chat_id, "odm_discovery", data)
+
+    async def run():
+        ids, source, error, retry = await _discover_family_models(data["family"])
+        cur = states.get_state(chat_id)
+        if (not cur or cur.get("action") != "odm_discovery"
+                or (cur.get("data") or {}).get("discovery_generation") != generation):
+            return
+        current = cur["data"]
+        if ids:
+            _enter_select(
+                chat_id, message_id, current, ids, source=source,
+                error=error if source == "static" else None,
+                retry=bool(error and retry),
+            )
+        else:
+            current["discovery_error"] = error or "上游未返回可用模型"
+            current["discovery_retry_available"] = retry
+            current.pop("manual_notice", None)
+            _manual_panel(chat_id, message_id, current)
+
+    _spawn_async_task(run, name=f"odm-models-{chat_id}")
+
 
 def _start_edit(chat_id: int, message_id: int, cb_id: str, family: str) -> None:
     if family not in _FAMILIES:
         ui.answer_cb(cb_id, "未知家族")
         return
     ui.answer_cb(cb_id)
-    states.set_state(chat_id, f"odm_edit:{family}")
-    current = _read_list(family)
-    current_line = ", ".join(current) if current else "(空)"
-    text = (
-        f"✏ <b>修改</b> {_fam_body_label(family)} <b>默认模型</b>\n\n"
-        f"当前列表 ({len(current)}, 点击可复制作为起点):\n"
-        f"<code>{ui.escape_html(current_line)}</code>\n\n"
-        "请直接发送<b>新的模型列表</b>:\n"
-        "  • 用英文逗号 <code>,</code> 或换行分隔多个模型名\n"
-        "  • 前后空白会自动忽略、重复自动去重\n"
-        "  • 发送 <code>-</code> 或 <code>empty</code> 则清空为 <code>[]</code>\n\n"
-        "<i>提示: 发送消息后若检测到删除, 会弹确认页告知你哪些 API Key / "
-        "映射 / 默认模型会受影响。</i>"
+    existing = _read_list(family)
+    data = {
+        "family": family,
+        "existing_models": existing,
+        "selected_models": list(existing),
+    }
+    static = _static_models(family)
+    if not _has_live_endpoint(family):
+        if static:
+            _enter_select(chat_id, message_id, data, static, source="static")
+        else:
+            data["manual_notice"] = "该提供商未公开模型列表，已直接进入手动输入。"
+            _manual_panel(chat_id, message_id, data)
+        return
+    ui.edit(
+        chat_id, message_id,
+        "🔄 <b>正在发现模型…</b>\n\n请稍候，可随时取消。",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "odm:show")]]),
     )
-    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb([
-        [ui.btn("❌ 取消", "oa:settings")],
+    _start_discovery(chat_id, message_id, data)
+
+
+def _select_state(chat_id):
+    st = states.get_state(chat_id)
+    if not st or st.get("action") != "odm_model_select":
+        return None
+    return st.get("data") or {}
+
+
+def _model_page(chat_id, message_id, cb_id, page):
+    data = _select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    page, _, _ = _bounds(len(data["discovered_models"]), page)
+    data["model_page"] = page
+    states.set_state(chat_id, "odm_model_select", data)
+    ui.answer_cb(cb_id)
+    _render_models(chat_id, message_id, data)
+
+
+def _model_toggle(chat_id, message_id, cb_id, idx, page):
+    data = _select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    try:
+        model = data["discovered_models"][idx]
+    except IndexError:
+        ui.answer_cb(cb_id, "模型快照已失效")
+        return
+    selected = data.setdefault("selected_models", [])
+    selected.remove(model) if model in selected else selected.append(model)
+    data["model_page"] = page
+    states.set_state(chat_id, "odm_model_select", data)
+    ui.answer_cb(cb_id)
+    _render_models(chat_id, message_id, data)
+
+
+def _model_bulk(chat_id, message_id, cb_id, invert):
+    data = _select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    selected = set(data.get("selected_models") or [])
+    data["selected_models"] = (
+        [m for m in data["discovered_models"] if m not in selected]
+        if invert else list(data["discovered_models"])
+    )
+    states.set_state(chat_id, "odm_model_select", data)
+    ui.answer_cb(cb_id)
+    _render_models(chat_id, message_id, data)
+
+
+def _model_confirm(chat_id, message_id, cb_id):
+    data = _select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    selected = set(data.get("selected_models") or [])
+    new_models = [mid for mid in data["discovered_models"] if mid in selected]
+    _apply_new_models(chat_id, data["family"], new_models, cb_id=cb_id)
+
+
+def _model_manual(chat_id, message_id, cb_id):
+    state = states.get_state(chat_id)
+    action = (state or {}).get("action") or ""
+    if not state or (
+        action not in ("odm_model_select", "odm_discovery")
+        and not action.startswith("odm_edit:")
+    ):
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    ui.answer_cb(cb_id)
+    _manual_panel(chat_id, message_id, state["data"])
+
+
+def _model_back_select(chat_id, message_id, cb_id):
+    state = states.get_state(chat_id)
+    if not state or not (state.get("data") or {}).get("discovered_models"):
+        ui.answer_cb(cb_id, "没有可返回的选择页")
+        return
+    ui.answer_cb(cb_id)
+    data = state["data"]
+    states.set_state(chat_id, "odm_model_select", data)
+    _render_models(chat_id, message_id, data)
+
+
+def _discovery_retry(chat_id, message_id, cb_id):
+    state = states.get_state(chat_id)
+    action = (state or {}).get("action") or ""
+    if not state or (
+        action not in ("odm_model_select", "odm_discovery")
+        and not action.startswith("odm_edit:")
+    ):
+        ui.answer_cb(cb_id, "当前不能重试", show_alert=True)
+        return
+    data = state["data"]
+    if not data.get("discovery_retry_available") and action != "odm_discovery":
+        ui.answer_cb(cb_id, "该提供商没有可重试的模型接口", show_alert=True)
+        return
+    ui.answer_cb(cb_id, "正在重试")
+    ui.edit(chat_id, message_id, "🔄 <b>正在发现模型…</b>",
+            reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "odm:show")]]))
+    _start_discovery(chat_id, message_id, data)
+
+
+def _apply_new_models(chat_id: int, family: str, new_models: list[str], *, cb_id: str | None = None) -> None:
+    if len(new_models) > 200:
+        if cb_id:
+            ui.answer_cb(cb_id, "列表过长", show_alert=True)
+        else:
+            ui.send(chat_id, f"❌ 列表过长 ({len(new_models)} 项), 最多 200 个模型。请精简后重发:")
+        return
+    for m in new_models:
+        if any(c in m for c in ("\\", " ", "\x00")):
+            msg = (f"❌ 非法模型名: <code>{ui.escape_html(m)}</code>"
+                   " (不能含空格 / 反斜杠 / 控制字符)。请重新输入:")
+            if cb_id:
+                ui.answer_cb(cb_id, "非法模型名", show_alert=True)
+            else:
+                ui.send(chat_id, msg)
+            return
+
+    old_models = _read_list(family)
+    removed = set(old_models) - set(new_models)
+    refs = _scan_references(family, removed) if removed else {}
+    if not removed or not _has_any_refs(refs):
+        _commit_save(family, new_models, removed, cleanup=False)
+        states.pop_state(chat_id)
+        if cb_id:
+            ui.answer_cb(cb_id)
+        _send_saved_result(chat_id, family, new_models, summary=None)
+        return
+
+    pending_code = ui.register_code(
+        "odm:pending:" + json.dumps({
+            "family": family,
+            "new":    new_models,
+            "removed": sorted(removed),
+        }, ensure_ascii=False)
+    )
+    states.pop_state(chat_id)
+    if cb_id:
+        ui.answer_cb(cb_id)
+    ui.send(chat_id, _render_confirm(family, new_models, removed, refs), reply_markup=ui.inline_kb([
+        [ui.btn("✅ 继续保存 (保留引用)", f"odm:commit:{pending_code}:keep")],
+        [ui.btn("🧹 保存并清理全部引用", f"odm:commit:{pending_code}:clean")],
+        [ui.btn("❌ 取消", "odm:show")],
     ]))
 
 
@@ -369,60 +797,7 @@ def _on_edit_input(chat_id: int, action: str, text: str) -> None:
         new_models: list[str] = []
     else:
         new_models = _parse_input(raw)
-
-    if len(new_models) > 200:
-        ui.send(chat_id,
-                f"❌ 列表过长 ({len(new_models)} 项), 最多 200 个模型。"
-                "请精简后重发:")
-        return
-    for m in new_models:
-        if any(c in m for c in ("\\", " ", "\x00")):
-            ui.send(
-                chat_id,
-                f"❌ 非法模型名: <code>{ui.escape_html(m)}</code>"
-                " (不能含空格 / 反斜杠 / 控制字符)。请重新输入:",
-            )
-            return
-
-    old_models = _read_list(family)
-    removed = set(old_models) - set(new_models)
-
-    # 无删除 → 直接保存, 跳过确认
-    if not removed:
-        _commit_save(family, new_models, set(), cleanup=False)
-        states.pop_state(chat_id)
-        _send_saved_result(chat_id, family, new_models, summary=None)
-        return
-
-    # 有删除 → 扫引用
-    refs = _scan_references(family, removed)
-
-    if not _has_any_refs(refs):
-        # 无引用, 直接保存不弹确认
-        _commit_save(family, new_models, removed, cleanup=False)
-        states.pop_state(chat_id)
-        _send_saved_result(chat_id, family, new_models, summary=None)
-        return
-
-    # 有引用 → 弹确认页, 把 pending 存进 cfg (可在重启/超时后恢复)
-    pending_code = ui.register_code(
-        "odm:pending:" + json.dumps({
-            "family": family,
-            "new":    new_models,
-            "removed": sorted(removed),
-        }, ensure_ascii=False)
-    )
-    states.pop_state(chat_id)  # 状态机结束, 用 pending_code 接力
-
-    text = _render_confirm(family, new_models, removed, refs)
-    kb = ui.inline_kb([
-        [ui.btn("✅ 继续保存 (保留引用)",
-                f"odm:commit:{pending_code}:keep")],
-        [ui.btn("🧹 保存并清理全部引用",
-                f"odm:commit:{pending_code}:clean")],
-        [ui.btn("❌ 取消", "oa:settings")],
-    ])
-    ui.send(chat_id, text, reply_markup=kb)
+    _apply_new_models(chat_id, family, new_models)
 
 
 def _render_confirm(
@@ -549,6 +924,7 @@ def _send_saved_result(
     parts.append("<i>热生效 — 现有 OAuth 渠道实例已重建。</i>")
     ui.send_result(
         chat_id, "\n\n".join(parts),
+        extra_rows=[[ui.btn("◀ 返回模型目录", "odm:show")]],
         back_label="◀ 返回 OAuth 设置",
         back_callback="oa:settings",
     )
@@ -607,6 +983,29 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str,
         family = parts[2] if len(parts) > 2 else ""
         _start_edit(chat_id, message_id, cb_id, family)
         return True
+    if action == "noop":
+        ui.answer_cb(cb_id); return True
+    if action == "all":
+        _model_bulk(chat_id, message_id, cb_id, False); return True
+    if action == "inv":
+        _model_bulk(chat_id, message_id, cb_id, True); return True
+    if action == "ok":
+        _model_confirm(chat_id, message_id, cb_id); return True
+    if action == "manual":
+        _model_manual(chat_id, message_id, cb_id); return True
+    if action == "retry":
+        _discovery_retry(chat_id, message_id, cb_id); return True
+    if action == "backsel":
+        _model_back_select(chat_id, message_id, cb_id); return True
+    if action == "p":
+        _model_page(chat_id, message_id, cb_id, int(parts[2]) if len(parts) > 2 else 0); return True
+    if action == "t":
+        if len(parts) < 4:
+            ui.answer_cb(cb_id, "非法 callback"); return True
+        _model_toggle(
+            chat_id, message_id, cb_id,
+            int(parts[2]), int(parts[3]),
+        ); return True
     if action == "commit":
         # odm:commit:<pending_code>:<mode>
         if len(parts) < 4:

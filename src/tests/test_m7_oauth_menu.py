@@ -441,9 +441,8 @@ def test_settings_usage_display_mode_toggle(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     settings = rec.last("editMessageText")
     assert settings and "OAuth 账户设置" in settings["text"]
-    assert "Claude <b>可用模型</b>" in settings["text"]
-    assert "OpenAI <b>可用模型</b>" in settings["text"]
-    assert "Grok <b>文本模型</b>" in settings["text"]
+    assert "OAuth 模型目录" in settings["text"]
+    assert "按账号自动同步" in settings["text"]
     assert "🎨 <b>媒体能力</b>" in settings["text"]
     assert "GPT / Codex 图片:" in settings["text"]
     assert "Grok Imagine: 图片 <b>2</b> · 视频 <b>2</b>" in settings["text"]
@@ -456,9 +455,10 @@ def test_settings_usage_display_mode_toggle(m):
     assert "状态: 🚫 已停用" in settings["text"]
     keyboard = settings["reply_markup"]["inline_keyboard"]
     texts = [b["text"] for row in keyboard for b in row]
-    assert [b["text"] for b in keyboard[0]] == ["✏ Claude 模型", "✏ OpenAI 模型", "✏ Grok 文本"]
-    assert "🖼 GPT 图片设置" in texts
-    assert "🎨 Grok Imagine" in texts
+    assert [b["text"] for b in keyboard[0]] == ["🧩 模型目录", "📈 配额监控"]
+    assert [b["text"] for b in keyboard[1]] == ["GPT 图片", "Grok 图片"]
+    assert "GPT 图片" in texts
+    assert "Grok 图片" in texts
     assert "📈 配额监控" in texts
     assert "🎭 CCH模式：开启" in texts
     assert "📊 显示: 剩余用量" in texts

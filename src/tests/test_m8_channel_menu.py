@@ -378,6 +378,53 @@ def test_channel_sort_reorders_config(m):
     print("  [PASS] channel sort reorders config")
 
 
+def test_channel_sort_keeps_name_first_with_compact_protocol(m):
+    _setup(m)
+    _add_channel(m, "智谱 Max")
+    from src.openai.channel.api_channel import OpenAIApiChannel
+    m["registry"].register_channel_factory("openai-chat", OpenAIApiChannel)
+    m["registry"].register_channel_factory("openai-responses", OpenAIApiChannel)
+    m["registry"].add_api_channel({
+        "name": "CPA",
+        "baseUrl": "https://example.com/v1",
+        "apiKey": "sk-testkey12345",
+        "protocol": "openai-responses",
+        "models": [{"real": "gpt-5", "alias": "gpt-5"}],
+        "enabled": True,
+    })
+    m["registry"].add_api_channel({
+        "name": "Kimi",
+        "baseUrl": "https://example.com/v1",
+        "apiKey": "sk-testkey12345",
+        "protocol": "openai-chat",
+        "models": [{"real": "kimi", "alias": "kimi"}],
+        "enabled": True,
+    })
+    rec = _install_recorder(m)
+    cm = m["channel_menu"]
+
+    assert cm.handle_callback(42, 100, "cb", "ch:sort:1") is True
+    sort_page = rec.last("editMessageText")
+    assert sort_page
+    text = sort_page["text"]
+    ui = m["ui"]
+
+    assert ui.family_tag("openai") not in text
+    assert "/v1/messages" not in text
+    assert "/v1/chat/completions" not in text
+    assert "/v1/responses" not in text
+
+    zhipu = next(line for line in text.splitlines() if "智谱 Max" in line)
+    cpa = next(line for line in text.splitlines() if ">CPA<" in line or "CPA" in line)
+    kimi = next(line for line in text.splitlines() if "Kimi" in line)
+    assert zhipu.index("智谱 Max") < zhipu.index("Anthropic"), zhipu
+    assert cpa.index("CPA") < cpa.index("Responses"), cpa
+    assert kimi.index("Kimi") < kimi.index("Chat"), kimi
+    assert "Grok" not in text and "Cursor" not in text
+    assert "🤖" not in text
+    print("  [PASS] channel sort compact protocol, name first")
+
+
 def test_detail_renders(m):
     _setup(m)
     _add_channel(m, "chA", models=[

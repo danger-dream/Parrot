@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import re
 import threading
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Optional
@@ -774,10 +775,32 @@ def provider_tag(provider: str | None, *, full: bool = False, rich: bool = True)
     return f"{icon} {escape_html(label) if rich else label}" if label else icon
 
 
+_STATUS_BUTTON_PREFIXES = (
+    "✅", "❌", "⬛", "🟢", "🔴", "⚪️", "⚪", "⚫", "⬜", "☑️", "✔️",
+)
+_LEADING_DECORATIVE_EMOJI_RE = re.compile(
+    r"^(?:[\u2300-\u23FF\u2600-\u27BF\u2B00-\u2BFF\U0001F300-\U0001FAFF]"
+    r"[\uFE0F\u200D]*)+\s*"
+)
+
+
+def _provider_button_text(text: str) -> str:
+    """Brand custom icon already occupies the button icon slot.
+
+    Decorative leading emoji would stack a second icon; keep status/toggle marks.
+    """
+    raw = str(text or "")
+    stripped = raw.lstrip()
+    if any(stripped.startswith(prefix) for prefix in _STATUS_BUTTON_PREFIXES):
+        return raw
+    rest = _LEADING_DECORATIVE_EMOJI_RE.sub("", stripped, count=1).strip()
+    return rest or raw
+
+
 def provider_button(text: str, callback_data: str, provider: str | None) -> dict:
     """Inline button with the provider's real Telegram custom emoji icon."""
     return btn(
-        text,
+        _provider_button_text(text),
         callback_data,
         icon_custom_emoji_id=provider_custom_emoji_id(provider),
     )
@@ -785,7 +808,7 @@ def provider_button(text: str, callback_data: str, provider: str | None) -> dict
 
 def provider_url_button(text: str, url: str, provider: str | None) -> dict:
     return btn_url(
-        text,
+        _provider_button_text(text),
         url,
         icon_custom_emoji_id=provider_custom_emoji_id(provider),
     )

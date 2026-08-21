@@ -379,10 +379,14 @@ def test_xai_missing_credit_percent_does_not_fall_back_to_legacy_monthly(m, monk
     monkeypatch.setattr(p, "_cli_get_json_sync", fake_json)
     usage = p.fetch_cli_billing_usage_sync("at-xai")
     billing = usage["xai"]["billing"]
-    assert billing["used_percent"] is None
-    assert billing["remaining_percent"] is None
-    assert usage["seven_day"] == {}
+    assert billing["used_percent"] == 0.0
+    assert billing["remaining_percent"] == 100.0
+    assert usage["seven_day"] == {
+        "utilization": 0.0,
+        "resets_at": "2026-08-13T06:54:28+00:00",
+    }
     assert usage["openai"]["thirty_day"] == {}
+    assert billing["auto_top_up"] == {"monthly_limit": 0, "used": 0}
 
 
 def test_xai_weekly_official_block_and_local_monthly_label(m):
@@ -423,7 +427,7 @@ def test_xai_weekly_official_block_and_local_monthly_label(m):
     assert "本月经 Parrot" not in local
 
 
-def test_xai_unknown_weekly_percent_is_explicit(m):
+def test_xai_missing_weekly_percent_means_unused(m):
     _setup(m)
     account_key = "xai:unknown-sub"
     raw = {"xai": {"source": "cli-chat-proxy", "billing": {
@@ -437,10 +441,43 @@ def test_xai_unknown_weekly_percent_is_explicit(m):
         "fetched_at": m["state_db"].now_ms(),
         "raw_data": json.dumps(raw),
     }, email="unknown@example.test")
+    summary = m["oauth_menu"]._format_xai_official_block(account_key, detail=False)
     text = m["oauth_menu"]._format_xai_official_block(account_key, detail=True)
-    assert "周额度: <i>上游未返回额度百分比</i>" in text
+    assert "周额度: 剩余 100.00% · 已用 0.00%" in summary
+    assert "周额度: 剩余 <code>100.00%</code> · 已用 <code>0.00%</code>" in text
+    assert "上游未返回额度百分比" not in summary + text
     assert "0 / 0" not in text
     assert "月额度" not in text
+
+
+def test_xai_credits_fetch_error_stays_unknown(m, monkeypatch):
+    _setup(m)
+    p = m["xai_provider"]
+    monkeypatch.setattr(p, "_mock_mode_enabled", lambda: False)
+
+    def fake_json(_token, path, timeout=None):
+        if "format=auto-topup" in path:
+            return {"config": {"monthlyLimit": {"val": 0}, "used": {"val": 0}}}
+        if "format=credits" in path:
+            raise RuntimeError("credits down")
+        return {}
+
+    monkeypatch.setattr(p, "_cli_get_json_sync", fake_json)
+    usage = p.fetch_cli_billing_usage_sync("at-xai")
+    billing = usage["xai"]["billing"]
+    assert billing["used_percent"] is None
+    assert billing["remaining_percent"] is None
+    assert usage["seven_day"] == {}
+    assert "credits" in (usage["xai"].get("errors") or {})
+
+    account_key = "xai:credits-error"
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "raw_data": json.dumps(usage),
+    }, email="error@example.test")
+    text = m["oauth_menu"]._format_xai_official_block(account_key, detail=True)
+    assert "上游未返回额度百分比" in text
+    assert "已用 0.00%" not in text
 
 
 def test_xai_channel_request_shape_and_provider_capabilities(m):

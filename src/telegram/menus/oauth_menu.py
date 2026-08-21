@@ -937,6 +937,27 @@ def _format_xai_provider_line(account_key: str, *, detail: bool = False) -> str:
     return "\n".join(lines) + ("\n" if lines and detail else "")
 
 
+def _xai_used_remaining_percent(xai: dict, billing: dict) -> tuple[object, object]:
+    """Map official Grok billing to used/remaining percent.
+
+    A successful credits snapshot that has a billing window but no
+    ``creditUsagePercent`` means unused quota (0% used / 100% remaining).
+    Credits fetch failures stay unknown.
+    """
+    pct = billing.get("used_percent")
+    remaining = billing.get("remaining_percent")
+    errors = xai.get("errors") if isinstance(xai.get("errors"), dict) else {}
+    if pct is None and not errors.get("credits"):
+        if billing.get("period_type") or billing.get("period_start") or billing.get("period_end"):
+            return 0.0, 100.0
+    if pct is not None and remaining is None:
+        try:
+            remaining = 100.0 - float(pct)
+        except (TypeError, ValueError):
+            remaining = None
+    return pct, remaining
+
+
 def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str:
     row = state_db.quota_load(account_key)
     xai = _xai_raw_from_row(row)
@@ -946,8 +967,7 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
     billing = xai.get("billing") if isinstance(xai.get("billing"), dict) else {}
     settings = xai.get("settings") if isinstance(xai.get("settings"), dict) else {}
     period_type = billing.get("period_type")
-    pct = billing.get("used_percent")
-    remaining_pct = billing.get("remaining_percent")
+    pct, remaining_pct = _xai_used_remaining_percent(xai, billing)
     period_start = billing.get("period_start")
     period_end = billing.get("period_end")
     quota_label = "周额度" if period_type == "USAGE_PERIOD_TYPE_WEEKLY" else "官方额度"
@@ -1457,10 +1477,6 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         acc for acc in cfg.get("oauthAccounts", [])
         if oauth_manager.provider_of(acc) == "cursor"
     ]
-    cursor_models = sorted({
-        str(model) for acc in cursor_accounts for model in acc.get("models") or []
-        if str(model)
-    })
     xai_cfg = cfg.get("xaiOAuth") if isinstance(cfg.get("xaiOAuth"), dict) else {}
     xai_image_models = xai_cfg.get("imageModels") if isinstance(xai_cfg.get("imageModels"), list) else []
     xai_video_models = xai_cfg.get("videoModels") if isinstance(xai_cfg.get("videoModels"), list) else []
@@ -1472,25 +1488,14 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     cch_enabled = _cch_enabled()
     cch_action = "关闭" if cch_enabled else "开启"
 
-    def _models_line(models: list[str]) -> str:
-        if not models:
-            return "<i>(空)</i>"
-        return ui.escape_html(", ".join(models))
-
     text = "\n".join([
         "⚙️ <b>OAuth 账户设置</b>",
         "",
-        f"{_provider_tag('claude')} <b>可用模型</b> ({len(anthropic_models)}):",
-        _models_line(anthropic_models),
-        "",
-        f"{_provider_tag('openai')} <b>可用模型</b> ({len(openai_models)}):",
-        _models_line(openai_models),
-        "",
-        f"{_provider_tag('xai')} <b>文本模型</b> ({len(xai_models)}):",
-        _models_line(xai_models),
-        "",
-        f"{_provider_tag('cursor')} <b>账号自动模型</b> ({len(cursor_models)} / {len(cursor_accounts)} 个账号):",
-        "<i>按账号 AvailableModels 自动同步；在账号详情浏览模型能力并设置 Max Context 默认值</i>",
+        "🧩 <b>OAuth 模型目录</b>",
+        f"  {_provider_tag('claude')}  {len(anthropic_models)} 个 · "
+        f"{_provider_tag('openai')}  {len(openai_models)} 个 · "
+        f"{_provider_tag('xai')}  {len(xai_models)} 个",
+        f"  {_provider_tag('cursor')} 按账号自动同步（{len(cursor_accounts)} 个账号）",
         "",
         "🎨 <b>媒体能力</b>",
         f"GPT / Codex 图片: {gpt_images_status}",
@@ -1508,14 +1513,12 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
     ])
     rows = [
-        [ui.provider_button("✏ Claude 模型", "odm:edit:anthropic", "claude"),
-         ui.provider_button("✏ OpenAI 模型", "odm:edit:openai", "openai"),
-         ui.provider_button("✏ Grok 文本", "odm:edit:xai", "xai")],
-        [ui.provider_button("🖼 GPT 图片设置", "img:show", "openai"),
-         ui.provider_button("🎨 Grok Imagine", "xim:show", "xai")],
-        [ui.btn("📈 配额监控", "oa:quota"),
-         ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
-        [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle")],
+        [ui.btn("🧩 模型目录", "odm:show"),
+         ui.btn("📈 配额监控", "oa:quota")],
+        [ui.provider_button("GPT 图片", "img:show", "openai"),
+         ui.provider_button("Grok 图片", "xim:show", "xai")],
+        [ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle"),
+         ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle")],
         [ui.btn("🏠 返回主菜单", "menu:main"),
          ui.btn("◀ 返回OAuth账户", "menu:oauth")],
     ]
@@ -1523,6 +1526,8 @@ def _settings_text_and_kb() -> tuple[str, dict]:
 
 
 def on_settings(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
+    from . import oauth_defaults_menu
+    oauth_defaults_menu.abandon_edit(chat_id)
     if cb_id is not None:
         ui.answer_cb(cb_id)
     text, kb = _settings_text_and_kb()
@@ -2548,7 +2553,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     ]
     if prov == "cursor":
         rows.append([ui.provider_button(
-            "🧬 Cursor 模型目录",
+            "Cursor 模型目录",
             f"oa:cursor_models:{short}:1",
             "cursor",
         )])
@@ -4041,8 +4046,8 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.provider_button("Grok 登录获取 Token", "oa:login:xai", "xai")],
             [ui.provider_button("Grok 粘贴 refresh_token", "oa:set_rt:xai", "xai")],
             [ui.provider_button("Cursor 登录", "oa:login:cursor", "cursor")],
-            [ui.provider_button("📦 OpenAI 导入 Sub2API 文件", "oa:import:sub2api", "openai")],
-            [ui.provider_button("🗂 OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
+            [ui.provider_button("OpenAI 导入 Sub2API 文件", "oa:import:sub2api", "openai")],
+            [ui.provider_button("OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
             [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),

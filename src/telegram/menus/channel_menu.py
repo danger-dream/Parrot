@@ -1,6 +1,6 @@
 """渠道管理菜单（沿用 openai-proxy 的风格：健康图标 + 详情排版）。
 
-callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）
+callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）；`ch:mdl:...`（编辑模型）
 
 状态机 action（添加向导）：
   - `ch_wiz_name`     步骤 1/5：输入名称
@@ -15,6 +15,7 @@ callback_data 前缀：`ch:...`（渠道）；`chw:...`（添加向导）
   - `ch_edit_url:<short>`
   - `ch_edit_key:<short>`
   - `ch_edit_models:<short>`
+  - `ch_edit_discovery` / `ch_edit_model_select` / `ch_edit_models`（编辑模型发现/多选/手填）
 """
 
 from __future__ import annotations
@@ -63,6 +64,17 @@ def _protocol_body_label(protocol: str) -> str:
     if protocol == "anthropic":
         return f"{ui.family_tag(family)} (/v1/messages)"
     return ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))
+
+
+def _protocol_compact_label(protocol: str) -> str:
+    """排序等紧凑列表用：短名即可，不带品牌图标、不展开家族、不带路径。"""
+    if protocol == "openai-chat":
+        return "Chat"
+    if protocol == "openai-responses":
+        return "Responses"
+    if protocol == "anthropic":
+        return "Anthropic"
+    return ui.escape_html(protocol)
 
 
 def _protocol_button(protocol: str, callback_data: str, *, prefix: str = "") -> dict:
@@ -723,10 +735,9 @@ def _sort_item_line(idx: int, name: str) -> str:
         return f"{idx}. <code>{ui.escape_html(name)}</code> ⚠ 已不存在"
     icon, status = _channel_health(ch)
     protocol = _protocol_of(ch)
-    proto_label = _protocol_body_label(protocol)
     return (
-        f"{idx}. {icon} {proto_label} <code>{ui.escape_html(ch.display_name)}</code> "
-        f"{ui.escape_html(status)}"
+        f"{idx}. {icon} <code>{ui.escape_html(ch.display_name)}</code> · "
+        f"{_protocol_compact_label(protocol)} · {ui.escape_html(status)}"
     )
 
 
@@ -1920,6 +1931,9 @@ def on_test_all(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 # ─── 编辑（文本输入） ─────────────────────────────────────────────
 
 def on_edit_menu(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    st = states.get_state(chat_id)
+    if st and st.get("action") in ("ch_edit_models", "ch_edit_model_select", "ch_edit_discovery"):
+        states.pop_state(chat_id)
     ui.answer_cb(cb_id)
     name = ui.resolve_code(short)
     ch = registry.get_channel(f"api:{name}") if name else None
@@ -2299,9 +2313,8 @@ def on_edit_key(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 
 
 def on_edit_models(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
-    ui.answer_cb(cb_id)
-    _edit_prompt(chat_id, message_id, short, "models",
-                 "请输入新的模型列表（格式 <code>真实名[:别名]</code>，逗号/分号分隔）：")
+    from . import channel_wizard
+    channel_wizard.edit_start_models(chat_id, message_id, cb_id, short)
 
 
 def on_edit_max_concurrent(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
@@ -2637,6 +2650,25 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         on_edit_key(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:emodels:"):
         on_edit_models(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data == "ch:mdl:noop":
+        ui.answer_cb(cb_id); return True
+    if data == "ch:mdl:all":
+        _channel_wizard.edit_model_bulk(chat_id, message_id, cb_id, False); return True
+    if data == "ch:mdl:inv":
+        _channel_wizard.edit_model_bulk(chat_id, message_id, cb_id, True); return True
+    if data == "ch:mdl:ok":
+        _channel_wizard.edit_model_confirm(chat_id, message_id, cb_id); return True
+    if data == "ch:mdl:manual":
+        _channel_wizard.edit_model_manual(chat_id, message_id, cb_id); return True
+    if data == "ch:mdl:retry":
+        _channel_wizard.edit_discovery_retry(chat_id, message_id, cb_id); return True
+    if data == "ch:mdl:backsel":
+        _channel_wizard.edit_model_back_select(chat_id, message_id, cb_id); return True
+    if data.startswith("ch:mdl:p:"):
+        _channel_wizard.edit_model_page(chat_id, message_id, cb_id, int(data.rsplit(":", 1)[1])); return True
+    if data.startswith("ch:mdl:t:"):
+        parts = data.split(":")
+        _channel_wizard.edit_model_toggle(chat_id, message_id, cb_id, int(parts[3]), int(parts[4])); return True
     if data.startswith("ch:ecc:"):
         on_edit_cc_toggle(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
     if data.startswith("ch:cmp:"):

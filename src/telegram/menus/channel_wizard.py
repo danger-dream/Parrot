@@ -4,7 +4,7 @@ import math
 import time
 
 from ... import config
-from ...channel import api_channel
+from ...channel import api_channel, registry
 from ...channel.url_utils import detect_suffix_protocol, split_base_url
 from ...models_discovery import ModelsDiscoveryError, derive_custom_models_url, discover_models
 from ...providers.catalog import PROVIDER_CATALOG, get_preset
@@ -227,29 +227,44 @@ def wiz_on_key_input(chat_id, text):
     start_discovery(chat_id, ((msg or {}).get("result") or {}).get("message_id"), data)
 
 
+async def _discover_model_ids(data):
+    preset = get_preset(data.get("providerId") or "", data.get("providerPresetId") or "")
+    error = None
+    ids: list[str] = []
+    source = "live"
+    try:
+        if preset and preset.models_url:
+            ids = await discover_models(
+                preset.models_url, data["apiKey"],
+                auth=preset.models_auth, parser=preset.models_parser,
+            )
+        elif preset and preset.static_models:
+            ids = list(preset.static_models)
+            source = "static"
+        elif preset:
+            raise ModelsDiscoveryError("该提供商未公开模型列表")
+        else:
+            ids = await discover_models(
+                derive_custom_models_url(data["baseUrl"], data.get("apiPath")),
+                data["apiKey"],
+            )
+    except ModelsDiscoveryError as exc:
+        error = str(exc)
+        if preset and preset.static_models:
+            ids = list(preset.static_models)
+            source = "static"
+    retry = bool((preset and preset.models_url) or not preset)
+    return ids, source, error, retry
+
+
 def start_discovery(chat_id, message_id, data):
     generation = time.time_ns(); data["discovery_generation"] = generation
     states.set_state(chat_id, "ch_wiz_discovery", data)
-    preset = get_preset(data.get("providerId", ""), data.get("providerPresetId", ""))
     async def run():
-        error = None; ids = []; source = "live"
-        try:
-            if preset and preset.models_url:
-                ids = await discover_models(preset.models_url, data["apiKey"], auth=preset.models_auth, parser=preset.models_parser)
-            elif preset and preset.static_models:
-                ids = list(preset.static_models); source = "static"
-            elif preset:
-                raise ModelsDiscoveryError("该提供商未公开模型列表")
-            else:
-                ids = await discover_models(derive_custom_models_url(data["baseUrl"], data.get("apiPath")), data["apiKey"])
-        except ModelsDiscoveryError as exc:
-            error = str(exc)
-            if preset and preset.static_models:
-                ids = list(preset.static_models); source = "static"
+        ids, source, error, retry = await _discover_model_ids(data)
         cur = states.get_state(chat_id)
         if not cur or cur.get("action") != "ch_wiz_discovery" or cur["data"].get("discovery_generation") != generation: return
         current = cur["data"]
-        retry = bool((preset and preset.models_url) or not preset)
         if ids:
             _enter_model_select(chat_id, message_id, current, ids, source=source,
                                 error=error if source == "static" else None,
@@ -436,3 +451,315 @@ def wiz_back_to_models(chat_id, message_id, cb_id):
     if data.get("models_mode") == "discovered" and data.get("discovered_models"):
         states.set_state(chat_id, "ch_wiz_model_select", data); render_models(chat_id, message_id, data)
     else: manual_panel(chat_id, message_id, data)
+
+
+def _existing_model_rows(ch) -> list[dict]:
+    rows = []
+    for item in ch.models or []:
+        real = str((item or {}).get("real") or "").strip()
+        alias = str((item or {}).get("alias") or real).strip() or real
+        if real:
+            rows.append({"real": real, "alias": alias})
+    return rows
+
+
+def _merge_discovered(ids: list[str], existing: list[dict]) -> list[str]:
+    merged = list(dict.fromkeys(ids))
+    for item in existing:
+        real = item.get("real")
+        if real and real not in merged:
+            merged.append(real)
+    return merged
+
+
+def _edit_channel_data(ch, short: str) -> dict:
+    existing = _existing_model_rows(ch)
+    data = {
+        "short": short,
+        "name": ch.display_name,
+        "apiKey": ch.api_key,
+        "baseUrl": ch.base_url,
+        "apiPath": getattr(ch, "api_path", None),
+        "providerId": getattr(ch, "provider_id", None),
+        "providerPresetId": getattr(ch, "provider_preset_id", None),
+        "existing_models": existing,
+        "selected_models": [item["real"] for item in existing],
+    }
+    return data
+
+
+def _edit_current_models_text(data: dict) -> str:
+    parts = []
+    for item in data.get("existing_models") or []:
+        real, alias = item.get("real") or "", item.get("alias") or ""
+        if not real:
+            continue
+        parts.append(real if alias in ("", real) else f"{real}:{alias}")
+    return ", ".join(parts)
+
+
+def edit_manual_panel(chat_id, message_id, data):
+    data["models_mode"] = "manual"
+    data["models_source"] = "manual"
+    states.set_state(chat_id, "ch_edit_models", data)
+    prefix = ""
+    if data.get("discovery_error"):
+        prefix = ("⚠️ <b>自动获取模型失败，已切换为手动输入</b>\n\n"
+                  f"原因：{ui.escape_html(str(data['discovery_error']))}\n\n")
+    elif data.get("manual_notice"):
+        prefix = f"ℹ️ {ui.escape_html(str(data['manual_notice']))}\n\n"
+    current = _edit_current_models_text(data)
+    current_line = f"当前：<code>{ui.escape_html(current)}</code>\n\n" if current else ""
+    text = (prefix + f"✏ <b>编辑模型 [{ui.escape_html(data['name'])}]</b>\n\n"
+            + current_line +
+            "请输入新的模型列表。格式 <code>真实名[:别名]</code>，以 ,/，/;/； 分隔。\n\n"
+            "不写别名则别名=真实名；别名不可重复。")
+    rows = []
+    if data.get("discovery_retry_available"):
+        rows.append([ui.btn("🔄 重试自动获取", "ch:mdl:retry"),
+                     ui.btn("◀ 返回编辑", f"ch:edit:{data['short']}")])
+    elif data.get("discovered_models"):
+        rows.append([ui.btn("◀ 返回模型选择", "ch:mdl:backsel"),
+                     ui.btn("◀ 返回编辑", f"ch:edit:{data['short']}")])
+    else:
+        rows.append([ui.btn("◀ 返回编辑", f"ch:edit:{data['short']}")])
+    kb = ui.inline_kb(rows)
+    if message_id is None:
+        ui.send(chat_id, text, reply_markup=kb)
+    else:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _edit_enter_select(chat_id, message_id, data, ids, *, source, error=None, retry=False):
+    existing = data.get("existing_models") or []
+    merged = _merge_discovered(ids, existing)
+    existing_ids = {item["real"] for item in existing}
+    selected = [mid for mid in merged if mid in existing_ids]
+    data.update(
+        discovered_models=merged,
+        selected_models=selected,
+        model_page=0,
+        models_mode="discovered",
+        models_source=source,
+        discovery_retry_available=bool(retry),
+    )
+    data.pop("manual_notice", None)
+    if error:
+        data["discovery_error"] = str(error)
+    else:
+        data.pop("discovery_error", None)
+    states.set_state(chat_id, "ch_edit_model_select", data)
+    edit_render_models(chat_id, message_id, data)
+
+
+def edit_model_kb(data):
+    models = data["discovered_models"]
+    selected = set(data.get("selected_models", []))
+    page, start, pages = _bounds(len(models), data.get("model_page", 0))
+    data["model_page"] = page
+    existing_ids = {item["real"] for item in data.get("existing_models") or []}
+    rows = []
+    for i, mid in enumerate(models[start:start + PAGE], start):
+        mark = "✅ " if mid in selected else "⬜ "
+        suffix = ""
+        if mid not in existing_ids:
+            suffix = " · 新" if data.get("models_source") == "live" else " · 参考"
+        rows.append([ui.btn(mark + mid + suffix, f"ch:mdl:t:{i}:{page}")])
+    if pages > 1:
+        rows.append([ui.btn("◀", f"ch:mdl:p:{page-1}"), ui.btn(f"{page+1}/{pages}", "ch:mdl:noop"),
+                     ui.btn("▶", f"ch:mdl:p:{page+1}")])
+    rows += [[ui.btn("✅ 全选", "ch:mdl:all"), ui.btn("🔄 反选", "ch:mdl:inv")],
+             [ui.btn(f"确认保存（{len(selected)}）", "ch:mdl:ok")]]
+    if data.get("discovery_retry_available"):
+        rows.append([ui.btn("✍️ 手动输入最新模型", "ch:mdl:manual"),
+                     ui.btn("🔄 重试实时获取", "ch:mdl:retry")])
+    else:
+        rows.append([ui.btn("✍️ 手动输入最新模型", "ch:mdl:manual")])
+    rows.append([ui.btn("◀ 返回编辑", f"ch:edit:{data['short']}")])
+    return ui.inline_kb(rows)
+
+
+def edit_render_models(chat_id, message_id, data):
+    count = len(data["discovered_models"])
+    if data.get("models_source") == "static":
+        if data.get("discovery_error"):
+            head = ("⚠️ <b>实时模型列表获取失败</b>\n\n"
+                    f"原因：{ui.escape_html(str(data['discovery_error']))}\n\n"
+                    f"当前显示 {count} 个内置参考模型，可能不是最新版本。")
+        else:
+            head = f"ℹ️ 当前显示 {count} 个内置参考模型，可能不是最新版本。"
+    else:
+        head = f"✅ 已从上游获取 {count} 个模型"
+    text = (head + f"\n\n✏ <b>编辑模型 [{ui.escape_html(data['name'])}]</b>\n\n"
+            "请选择要启用的模型（可跨页多选），也可以手动输入最新模型名：")
+    if message_id is None:
+        ui.send(chat_id, text, reply_markup=edit_model_kb(data))
+    else:
+        ui.edit(chat_id, message_id, text, reply_markup=edit_model_kb(data))
+
+
+def edit_start_models(chat_id, message_id, cb_id, short):
+    name = ui.resolve_code(short)
+    ch = registry.get_channel(f"api:{name}") if name else None
+    if ch is None or ch.type != "api":
+        ui.answer_cb(cb_id, "渠道不存在")
+        return
+    ui.answer_cb(cb_id)
+    data = _edit_channel_data(ch, short)
+    preset = get_preset(data.get("providerId") or "", data.get("providerPresetId") or "")
+    if preset and not preset.models_url:
+        data.pop("discovery_error", None)
+        data["discovery_retry_available"] = False
+        if preset.static_models:
+            _edit_enter_select(chat_id, message_id, data, list(preset.static_models), source="static")
+        else:
+            data["manual_notice"] = "该提供商未公开模型列表，已直接进入手动输入。"
+            edit_manual_panel(chat_id, message_id, data)
+        return
+    ui.edit(
+        chat_id, message_id,
+        "🔄 <b>正在发现模型…</b>\n\n请稍候，可随时取消。",
+        reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"ch:edit:{short}")]]),
+    )
+    edit_start_discovery(chat_id, message_id, data)
+
+
+def edit_start_discovery(chat_id, message_id, data):
+    generation = time.time_ns()
+    data["discovery_generation"] = generation
+    states.set_state(chat_id, "ch_edit_discovery", data)
+
+    async def run():
+        ids, source, error, retry = await _discover_model_ids(data)
+        cur = states.get_state(chat_id)
+        if (not cur or cur.get("action") != "ch_edit_discovery"
+                or cur["data"].get("discovery_generation") != generation):
+            return
+        current = cur["data"]
+        if ids:
+            _edit_enter_select(
+                chat_id, message_id, current, ids, source=source,
+                error=error if source == "static" else None,
+                retry=bool(error and retry),
+            )
+        else:
+            current["discovery_error"] = error or "上游未返回可用模型"
+            current["discovery_retry_available"] = retry
+            current.pop("manual_notice", None)
+            edit_manual_panel(chat_id, message_id, current)
+
+    _cm()._spawn_async_task(run, name=f"edit-models-{chat_id}")
+
+
+def _edit_select_state(chat_id):
+    st = states.get_state(chat_id)
+    if not st or st.get("action") != "ch_edit_model_select":
+        return None
+    return st.get("data") or {}
+
+
+def edit_model_page(chat_id, message_id, cb_id, page):
+    data = _edit_select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    page, _, _ = _bounds(len(data["discovered_models"]), page)
+    data["model_page"] = page
+    states.set_state(chat_id, "ch_edit_model_select", data)
+    ui.answer_cb(cb_id)
+    edit_render_models(chat_id, message_id, data)
+
+
+def edit_model_toggle(chat_id, message_id, cb_id, idx, page):
+    data = _edit_select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    try:
+        model = data["discovered_models"][idx]
+    except IndexError:
+        ui.answer_cb(cb_id, "模型快照已失效")
+        return
+    selected = data.setdefault("selected_models", [])
+    selected.remove(model) if model in selected else selected.append(model)
+    data["model_page"] = page
+    states.set_state(chat_id, "ch_edit_model_select", data)
+    ui.answer_cb(cb_id)
+    edit_render_models(chat_id, message_id, data)
+
+
+def edit_model_bulk(chat_id, message_id, cb_id, invert):
+    data = _edit_select_state(chat_id)
+    if data is None:
+        return
+    selected = set(data.get("selected_models", []))
+    data["selected_models"] = (
+        [m for m in data["discovered_models"] if m not in selected]
+        if invert else list(data["discovered_models"])
+    )
+    states.set_state(chat_id, "ch_edit_model_select", data)
+    ui.answer_cb(cb_id)
+    edit_render_models(chat_id, message_id, data)
+
+
+def edit_model_confirm(chat_id, message_id, cb_id):
+    data = _edit_select_state(chat_id)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    selected = set(data.get("selected_models") or [])
+    if not selected:
+        ui.answer_cb(cb_id, "请至少选择一个模型", show_alert=True)
+        return
+    alias_map = {item["real"]: item["alias"] for item in data.get("existing_models") or []}
+    models = [{"real": mid, "alias": alias_map.get(mid, mid)} for mid in data["discovered_models"] if mid in selected]
+    ok, result = _cm()._do_edit(chat_id, data["short"], "models", models)
+    if not ok:
+        ui.answer_cb(cb_id, "保存失败", show_alert=True)
+        ui.send(chat_id, f"❌ {ui.escape_html(result)}")
+        return
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id)
+    ui.send_result(
+        chat_id, f"✅ 模型列表已更新（{len(models)} 个）",
+        extra_rows=[
+            [ui.btn("◀ 返回渠道详情", f"ch:view:{data['short']}")],
+            [ui.btn("📋 返回渠道列表", "menu:channel")],
+        ],
+        back_label="🏠 返回主菜单", back_callback="menu:main",
+    )
+
+
+def edit_model_manual(chat_id, message_id, cb_id):
+    state = states.get_state(chat_id)
+    if not state or state.get("action") not in ("ch_edit_model_select", "ch_edit_models", "ch_edit_discovery"):
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    ui.answer_cb(cb_id)
+    edit_manual_panel(chat_id, message_id, state["data"])
+
+
+def edit_model_back_select(chat_id, message_id, cb_id):
+    state = states.get_state(chat_id)
+    if not state or not (state.get("data") or {}).get("discovered_models"):
+        ui.answer_cb(cb_id, "没有可返回的选择页")
+        return
+    ui.answer_cb(cb_id)
+    data = state["data"]
+    states.set_state(chat_id, "ch_edit_model_select", data)
+    edit_render_models(chat_id, message_id, data)
+
+
+def edit_discovery_retry(chat_id, message_id, cb_id):
+    state = states.get_state(chat_id)
+    if not state or state.get("action") not in ("ch_edit_models", "ch_edit_model_select", "ch_edit_discovery"):
+        ui.answer_cb(cb_id, "当前不能重试", show_alert=True)
+        return
+    data = state["data"]
+    if not data.get("discovery_retry_available") and state.get("action") != "ch_edit_discovery":
+        ui.answer_cb(cb_id, "该提供商没有可重试的模型接口", show_alert=True)
+        return
+    ui.answer_cb(cb_id, "正在重试")
+    ui.edit(chat_id, message_id, "🔄 <b>正在发现模型…</b>",
+            reply_markup=ui.inline_kb([[ui.btn("❌ 取消", f"ch:edit:{data['short']}")]]))
+    edit_start_discovery(chat_id, message_id, data)

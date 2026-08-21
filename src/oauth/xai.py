@@ -559,6 +559,10 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     under ``xai.billing``; a weekly period is also exposed as the shared
     ``seven_day`` window for quota monitoring.  Deprecated ``monthlyLimit`` /
     ``used`` fields from auto-topup are not treated as subscription quota.
+
+    A successful credits payload that includes the current period but omits
+    ``creditUsagePercent`` means unused quota (0% used / 100% remaining).
+    Credits fetch failures must not be interpreted as 0%.
     """
     if _mock_mode_enabled():
         return _mock_cli_billing_usage()
@@ -611,6 +615,10 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     )
     if used_percent is not None:
         used_percent = max(0.0, min(100.0, used_percent))
+    elif credits_err is None and current_period:
+        # Successful credits response with a billing window but no usage
+        # fields: the pool is unused, not unknown.
+        used_percent = 0.0
     remaining_percent = None if used_percent is None else 100.0 - used_percent
 
     on_demand_cap = _num_val(auto_cfg.get("onDemandCap") or auto_cfg.get("on_demand_cap"))

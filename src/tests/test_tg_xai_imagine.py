@@ -110,13 +110,13 @@ def test_oauth_settings_exposes_distinct_gpt_and_grok_media_entries(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     message = recorder.last("editMessageText")
     assert message is not None
-    assert "Grok <b>文本模型</b>" in message["text"]
+    assert "OAuth 模型目录" in message["text"]
     assert "🎨 <b>媒体能力</b>" in message["text"]
     assert "Grok Imagine: 图片 <b>2</b> · 视频 <b>2</b>" in message["text"]
 
     callbacks = {button["text"]: button["callback_data"] for button in _buttons(message)}
-    assert callbacks["🖼 GPT 图片设置"] == "img:show"
-    assert callbacks["🎨 Grok Imagine"] == "xim:show"
+    assert callbacks["GPT 图片"] == "img:show"
+    assert callbacks["Grok 图片"] == "xim:show"
 
 
 def test_grok_imagine_menu_renders_and_persists_existing_config_fields(m):

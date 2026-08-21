@@ -402,3 +402,216 @@ def test_late_discovery_generation_cannot_overwrite(monkeypatch):
     asyncio.run(factories[0]())
     state = states.get_state(8)
     assert state["action"] == "ch_wiz_key" and "discovered_models" not in state["data"]
+
+
+def _reset_api_channels():
+    state_db.init()
+    def clear(c):
+        c["channels"] = []
+    config.update(clear)
+    registry.rebuild_from_config()
+
+
+def _add_edit_channel(**extra):
+    _reset_api_channels()
+    entry = {
+        "name": "edit-ch",
+        "baseUrl": "https://x.test",
+        "apiKey": "secret-key",
+        "protocol": "anthropic",
+        "models": [
+            {"real": "old-a", "alias": "alias-a"},
+            {"real": "local-only", "alias": "kept"},
+        ],
+    }
+    entry.update(extra)
+    registry.add_api_channel(entry)
+    return channel_wizard.ui.register_code("edit-ch")
+
+
+def _patch_wizard_ui(monkeypatch):
+    edits, sends, answers, results = [], [], [], []
+    monkeypatch.setattr(channel_wizard.ui, "edit", lambda *a, **k: edits.append((a, k)) or {"ok": True})
+    monkeypatch.setattr(channel_wizard.ui, "send", lambda *a, **k: sends.append((a, k)) or {"ok": True, "result": {"message_id": 9}})
+    monkeypatch.setattr(channel_wizard.ui, "answer_cb", lambda *a, **k: answers.append((a, k)))
+    monkeypatch.setattr(channel_wizard.ui, "send_result", lambda *a, **k: results.append((a, k)))
+    return edits, sends, answers, results
+
+
+def test_edit_model_callbacks_are_routed(monkeypatch):
+    hits = []
+    monkeypatch.setattr(channel_wizard, "edit_start_models", lambda *a, **k: hits.append(("start", a)))
+    monkeypatch.setattr(channel_wizard, "edit_model_confirm", lambda *a, **k: hits.append(("ok", a)))
+    monkeypatch.setattr(channel_wizard, "edit_model_toggle", lambda *a, **k: hits.append(("toggle", a)))
+    monkeypatch.setattr(channel_menu.ui, "answer_cb", lambda *a, **k: None)
+    assert channel_menu.handle_callback(7, 99, "cb", "ch:emodels:abcd") is True
+    assert hits[-1] == ("start", (7, 99, "cb", "abcd"))
+    assert channel_menu.handle_callback(7, 99, "cb", "ch:mdl:ok") is True
+    assert hits[-1][0] == "ok"
+    assert channel_menu.handle_callback(7, 99, "cb", "ch:mdl:t:3:1") is True
+    assert hits[-1] == ("toggle", (7, 99, "cb", 3, 1))
+    assert channel_menu.handle_callback(7, 99, "cb", "ch:mdl:noop") is True
+
+
+def test_edit_live_discovery_prechecks_existing_and_keeps_local(monkeypatch):
+    from types import SimpleNamespace
+    short = _add_edit_channel(providerId="p", providerPresetId="q")
+    edits, *_ = _patch_wizard_ui(monkeypatch)
+    preset = SimpleNamespace(
+        models_url="https://x.test/models", models_auth="bearer",
+        models_parser="openai-data-id", static_models=(),
+    )
+    monkeypatch.setattr(channel_wizard, "get_preset", lambda *a: preset)
+    async def live(*a, **k):
+        return ["old-a", "new-b"]
+    monkeypatch.setattr(channel_wizard, "discover_models", live)
+    monkeypatch.setattr(channel_menu, "_SYNC_SPAWN", True)
+    states.clear_all()
+    channel_wizard.edit_start_models(7, 99, "cb", short)
+    state = states.get_state(7)
+    assert state["action"] == "ch_edit_model_select"
+    assert state["data"]["discovered_models"] == ["old-a", "new-b", "local-only"]
+    assert state["data"]["selected_models"] == ["old-a", "local-only"]
+    assert state["data"]["models_source"] == "live"
+    assert "已从上游获取 3 个模型" in edits[-1][0][2]
+    labels = [b["text"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    assert any(text.startswith("✅ old-a") for text in labels)
+    assert any("⬜ new-b · 新" in text for text in labels)
+    assert any(text.startswith("✅ local-only") for text in labels)
+    callbacks = [b["callback_data"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    assert "ch:mdl:ok" in callbacks and "ch:mdl:manual" in callbacks
+    assert "ch:mdl:retry" not in callbacks
+
+
+def test_edit_static_preset_skips_loading(monkeypatch):
+    from types import SimpleNamespace
+    short = _add_edit_channel(providerId="p", providerPresetId="q")
+    edits, *_ = _patch_wizard_ui(monkeypatch)
+    preset = SimpleNamespace(
+        models_url=None, models_auth="bearer",
+        models_parser="openai-data-id", static_models=("k3", "old-a"),
+    )
+    monkeypatch.setattr(channel_wizard, "get_preset", lambda *a: preset)
+    async def unexpected(*a, **k):
+        raise AssertionError("static preset must not fetch")
+    monkeypatch.setattr(channel_wizard, "discover_models", unexpected)
+    states.clear_all()
+    channel_wizard.edit_start_models(7, 99, "cb", short)
+    state = states.get_state(7)
+    assert state["action"] == "ch_edit_model_select"
+    assert state["data"]["models_source"] == "static"
+    assert state["data"]["discovered_models"] == ["k3", "old-a", "local-only"]
+    assert state["data"]["selected_models"] == ["old-a", "local-only"]
+    assert all("正在发现模型" not in str(call[0]) for call in edits)
+    assert "内置参考模型" in edits[-1][0][2]
+    callbacks = [b["callback_data"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    assert "ch:mdl:manual" in callbacks and "ch:mdl:retry" not in callbacks
+
+
+def test_edit_preset_without_models_goes_manual(monkeypatch):
+    from types import SimpleNamespace
+    short = _add_edit_channel(providerId="p", providerPresetId="q")
+    edits, *_ = _patch_wizard_ui(monkeypatch)
+    preset = SimpleNamespace(
+        models_url=None, models_auth="bearer",
+        models_parser="openai-data-id", static_models=(),
+    )
+    monkeypatch.setattr(channel_wizard, "get_preset", lambda *a: preset)
+    async def unexpected(*a, **k):
+        raise AssertionError("provider preset must not derive an undocumented /models URL")
+    monkeypatch.setattr(channel_wizard, "discover_models", unexpected)
+    states.clear_all()
+    channel_wizard.edit_start_models(7, 99, "cb", short)
+    state = states.get_state(7)
+    assert state["action"] == "ch_edit_models"
+    assert state["data"]["models_source"] == "manual"
+    assert state["data"]["discovery_retry_available"] is False
+    assert "已直接进入手动输入" in edits[-1][0][2]
+    assert "正在发现模型" not in edits[-1][0][2]
+    assert "old-a:alias-a" in edits[-1][0][2]
+
+
+def test_edit_live_failure_falls_back_to_static(monkeypatch):
+    from types import SimpleNamespace
+    short = _add_edit_channel(providerId="p", providerPresetId="q")
+    edits, *_ = _patch_wizard_ui(monkeypatch)
+    preset = SimpleNamespace(
+        models_url="https://x.test/models", models_auth="bearer",
+        models_parser="openai-data-id", static_models=("fallback-a", "old-a"),
+    )
+    monkeypatch.setattr(channel_wizard, "get_preset", lambda *a: preset)
+    async def fail(*a, **k):
+        raise ModelsDiscoveryError("safe failure")
+    monkeypatch.setattr(channel_wizard, "discover_models", fail)
+    monkeypatch.setattr(channel_menu, "_SYNC_SPAWN", True)
+    states.clear_all()
+    channel_wizard.edit_start_models(7, 99, "cb", short)
+    state = states.get_state(7)
+    assert state["action"] == "ch_edit_model_select"
+    assert state["data"]["discovered_models"] == ["fallback-a", "old-a", "local-only"]
+    assert state["data"]["models_source"] == "static"
+    assert state["data"]["discovery_error"] == "safe failure"
+    assert state["data"]["discovery_retry_available"] is True
+    assert "可能不是最新版本" in edits[-1][0][2]
+    callbacks = [b["callback_data"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+    assert "ch:mdl:manual" in callbacks and "ch:mdl:retry" in callbacks
+
+
+def test_edit_custom_channel_uses_derived_models_url(monkeypatch):
+    short = _add_edit_channel()
+    _patch_wizard_ui(monkeypatch)
+    seen = {}
+    async def live(url, key, **k):
+        seen["url"] = url
+        seen["key"] = key
+        return ["old-a"]
+    monkeypatch.setattr(channel_wizard, "discover_models", live)
+    monkeypatch.setattr(channel_menu, "_SYNC_SPAWN", True)
+    states.clear_all()
+    channel_wizard.edit_start_models(7, 99, "cb", short)
+    assert seen == {"url": "https://x.test/v1/models", "key": "secret-key"}
+    state = states.get_state(7)
+    assert state["action"] == "ch_edit_model_select"
+    assert state["data"]["models_source"] == "live"
+    assert state["data"]["discovered_models"] == ["old-a", "local-only"]
+
+
+def test_edit_confirm_preserves_aliases_and_saves(monkeypatch):
+    short = _add_edit_channel()
+    _patch_wizard_ui(monkeypatch)
+    states.clear_all()
+    states.set_state(7, "ch_edit_model_select", {
+        "short": short,
+        "name": "edit-ch",
+        "discovered_models": ["old-a", "new-b", "local-only"],
+        "selected_models": ["old-a", "local-only"],
+        "existing_models": [
+            {"real": "old-a", "alias": "alias-a"},
+            {"real": "local-only", "alias": "kept"},
+        ],
+    })
+    channel_wizard.edit_model_confirm(7, 99, "cb")
+    entry = config.get()["channels"][0]
+    assert entry["models"] == [
+        {"real": "old-a", "alias": "alias-a"},
+        {"real": "local-only", "alias": "kept"},
+    ]
+    assert states.get_state(7) is None
+
+
+def test_edit_menu_invalidates_inflight_discovery(monkeypatch):
+    short = _add_edit_channel(providerId="p", providerPresetId="q")
+    factories = []
+    monkeypatch.setattr(channel_menu, "_spawn_async_task", lambda factory, name="": factories.append(factory))
+    _patch_wizard_ui(monkeypatch)
+    states.clear_all()
+    data = channel_wizard._edit_channel_data(registry.get_channel("api:edit-ch"), short)
+    channel_wizard.edit_start_discovery(7, 99, data)
+    assert states.get_state(7)["action"] == "ch_edit_discovery"
+    channel_menu.on_edit_menu(7, 99, "cb", short)
+    assert states.get_state(7) is None
+    async def late(*a, **k):
+        return ["late-model"]
+    monkeypatch.setattr(channel_wizard, "discover_models", late)
+    asyncio.run(factories[0]())
+    assert states.get_state(7) is None

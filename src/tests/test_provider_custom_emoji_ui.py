@@ -29,6 +29,10 @@ def test_provider_and_family_helpers_emit_custom_icons():
         button = ui.provider_button("Provider", "cb", provider)
         assert button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id(provider)
         assert ui.provider_custom_emoji_id(provider) in ui.provider_tag(provider)
+    assert ui.provider_button("✏ Claude", "cb", "claude")["text"] == "Claude"
+    assert ui.provider_button("🖼 GPT 图片", "cb", "openai")["text"] == "GPT 图片"
+    assert ui.provider_button("✅ Claude", "cb", "claude")["text"] == "✅ Claude"
+    assert ui.provider_button("1. a@x.com", "cb", "xai")["text"] == "1. a@x.com"
 
     assert ui.family_tag("anthropic") == (
         f"{ui.provider_custom_emoji_html('claude')} Anthropic"
