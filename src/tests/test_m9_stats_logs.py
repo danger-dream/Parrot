@@ -1136,6 +1136,83 @@ def test_logs_detail_with_execution_chain(m):
     print("  [PASS] logs detail with execution chain")
 
 
+def test_log_detail_body_buttons_follow_storage_policy_and_row_data(m):
+    _setup(m)
+    original = m["config"].get().get("logStoreBodies", True) is not False
+
+    def labels(edit):
+        return [
+            button["text"]
+            for row in edit["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+
+    try:
+        # A historical row with stored content shows both controls while storage
+        # is enabled.
+        m["config"].update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+        stored_rid = "BODY-buttons-stored"
+        m["log_db"].insert_pending(
+            stored_rid, "1.1.1.1", "k1", "gpt-test", True, 1, 0,
+            {"authorization": "Bearer redacted"},
+            {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        m["log_db"].finish_success(
+            stored_rid, "api:A", "api", "gpt-test",
+            response_body='{"id":"response-stored"}', http_status=200,
+        )
+        rec = _install_recorder(m)
+        m["logs_menu"].show_detail(
+            42, 100, "cb", m["ui"].register_code(stored_rid),
+        )
+        assert "📨 请求 Body" in labels(rec.last("editMessageText"))
+        assert "📬 响应" in labels(rec.last("editMessageText"))
+
+        # Turning storage off hides both controls even for historical rows whose
+        # bodies still exist; the toggle never deletes those historical values.
+        m["config"].update(lambda cfg: cfg.__setitem__("logStoreBodies", False))
+        rec.clear()
+        m["logs_menu"].show_detail(
+            42, 100, "cb", m["ui"].register_code(stored_rid),
+        )
+        current_labels = labels(rec.last("editMessageText"))
+        assert "📨 请求 Body" not in current_labels
+        assert "📬 响应" not in current_labels
+        stored_detail = m["log_db"].log_detail(stored_rid)["detail"]
+        assert stored_detail["request_body"] is not None
+        assert stored_detail["response_body"] is not None
+
+        # A row created while storage is disabled has NULL bodies. Re-enabling
+        # later must not expose unusable controls for that historical row.
+        hidden_rid = "BODY-buttons-hidden"
+        m["log_db"].insert_pending(
+            hidden_rid, "1.1.1.1", "k1", "gpt-test", True, 1, 0,
+            {"authorization": "Bearer not-stored"},
+            {"model": "gpt-test", "messages": [{"role": "user", "content": "secret"}]},
+        )
+        m["log_db"].finish_success(
+            hidden_rid, "api:A", "api", "gpt-test",
+            response_body='{"id":"response-not-stored"}', http_status=200,
+        )
+        hidden_detail = m["log_db"].log_detail(hidden_rid)["detail"]
+        assert hidden_detail["request_body"] is None
+        assert hidden_detail["response_body"] is None
+
+        m["config"].update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+        rec.clear()
+        m["logs_menu"].show_detail(
+            42, 100, "cb", m["ui"].register_code(hidden_rid),
+        )
+        current_labels = labels(rec.last("editMessageText"))
+        assert "📨 请求 Body" not in current_labels
+        assert "📬 响应" not in current_labels
+    finally:
+        m["config"].update(
+            lambda cfg: cfg.__setitem__("logStoreBodies", original)
+        )
+    print("  [PASS] log detail body buttons follow policy and stored row data")
+
+
 def test_log_inspector_localizes_pretty_json_and_redacts_encrypted(m):
     from src.telegram import log_inspector
     body = {

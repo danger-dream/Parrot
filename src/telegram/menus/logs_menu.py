@@ -995,17 +995,27 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str,
         ui.edit(chat_id, message_id, f"⚠ 未找到 <code>{ui.escape_html(rid)}</code>",
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回列表", _list_cb(list_state))]]))
         return
-    body_short = ui.register_code("logbody:" + rid)
-    resp_short = ui.register_code("logresp:" + rid)
     detail_pages = _render_detail_pages(detail)
     detail_page = max(1, min(int(detail_page or 1), len(detail_pages)))
     text = detail_pages[detail_page - 1]
     if len(detail_pages) > 1:
         text += f"\n\n<i>详情第 {detail_page}/{len(detail_pages)} 页</i>"
-    rows = [[
-        ui.btn("📨 请求 Body", f"logs:body:{body_short}:{list_code}"),
-        ui.btn("📬 响应", f"logs:response:{resp_short}:{list_code}"),
-    ]]
+    rows: list[list[dict]] = []
+    if config.get().get("logStoreBodies", True) is not False:
+        stored_detail = detail.get("detail") or {}
+        body_row: list[dict] = []
+        if isinstance(stored_detail, dict) and stored_detail.get("request_body") is not None:
+            body_short = ui.register_code("logbody:" + rid)
+            body_row.append(ui.btn(
+                "📨 请求 Body", f"logs:body:{body_short}:{list_code}",
+            ))
+        if isinstance(stored_detail, dict) and stored_detail.get("response_body") is not None:
+            resp_short = ui.register_code("logresp:" + rid)
+            body_row.append(ui.btn(
+                "📬 响应", f"logs:response:{resp_short}:{list_code}",
+            ))
+        if body_row:
+            rows.append(body_row)
     if len(detail_pages) > 1:
         nav = []
         if detail_page > 1:

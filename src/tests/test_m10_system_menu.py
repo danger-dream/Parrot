@@ -465,6 +465,56 @@ def test_log_retention_two_confirm_flow(m):
     print("  [PASS] log retention two-confirm flow")
 
 
+def test_log_body_storage_toggle_from_retention_menu(m):
+    _reset(m)
+    rec = _install(m)
+    sm = m["system_menu"]
+    original = m["config"].get().get("logStoreBodies", True) is not False
+    try:
+        m["config"].update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+        sm._show_retention(42, 100, "cb")
+        page = rec.last("editMessageText")
+        assert "保存完整请求：<code>开启</code>" in page["text"]
+        assert "切换只影响后续新请求" in page["text"]
+        buttons = [
+            button
+            for row in page["reply_markup"]["inline_keyboard"]
+            for button in row
+        ]
+        toggle = next(
+            button for button in buttons
+            if button["callback_data"] == "sys:retention:toggle_bodies"
+        )
+        assert toggle["text"] == "☑ 保存完整请求"
+
+        rec.clear()
+        assert sm.handle_callback(
+            42, 100, "cb", "sys:retention:toggle_bodies",
+        ) is True
+        assert m["config"].get()["logStoreBodies"] is False
+        page = rec.last("editMessageText")
+        assert "保存完整请求：<code>关闭</code>" in page["text"]
+        toggle = next(
+            button
+            for row in page["reply_markup"]["inline_keyboard"]
+            for button in row
+            if button["callback_data"] == "sys:retention:toggle_bodies"
+        )
+        assert toggle["text"] == "☐ 保存完整请求"
+
+        rec.clear()
+        assert sm.handle_callback(
+            42, 100, "cb", "sys:retention:toggle_bodies",
+        ) is True
+        assert m["config"].get()["logStoreBodies"] is True
+        assert "保存完整请求：<code>开启</code>" in rec.last("editMessageText")["text"]
+    finally:
+        m["config"].update(
+            lambda cfg: cfg.__setitem__("logStoreBodies", original)
+        )
+    print("  [PASS] log body storage toggle from retention menu")
+
+
 def test_log_retention_days_mode_can_update_day_value(m):
     _reset(m)
     rec = _install(m)
@@ -562,6 +612,7 @@ def main():
         test_blacklist_by_channel,
         test_ws_mode_menu_and_toggle,
         test_log_retention_two_confirm_flow,
+        test_log_body_storage_toggle_from_retention_menu,
         test_log_retention_days_mode_can_update_day_value,
         test_router_dispatch,
         test_text_state_dispatch_to_system,

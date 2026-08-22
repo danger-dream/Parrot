@@ -490,7 +490,9 @@ def _pop_retention_pending(code: str, chat_id: int, kind: str | None = None) -> 
 
 
 def _retention_menu_text_kb() -> tuple[str, dict]:
-    policy = log_db.retention_policy()
+    cfg = config.get()
+    policy = log_db.retention_policy(cfg)
+    store_bodies = cfg.get("logStoreBodies", True) is not False
     if policy["mode"] == "days":
         policy_lines = [
             "当前留存模式：<code>按天留存</code>",
@@ -502,6 +504,12 @@ def _retention_menu_text_kb() -> tuple[str, dict]:
         "🗃 <b>请求日志数据留存</b>",
         "",
         *policy_lines,
+        f"保存完整请求：<code>{'开启' if store_bodies else '关闭'}</code>",
+        "",
+        "<b>完整请求保存</b>",
+        "• 开启：保存请求 Headers、请求 Body 和响应正文",
+        "• 关闭：只保留摘要、Token、金额、重试、渠道与代理统计",
+        "• 切换只影响后续新请求，不会删除或补写历史正文",
         "",
         "<b>清理范围</b>",
         "• 请求摘要与其统计来源",
@@ -524,12 +532,28 @@ def _retention_menu_text_kb() -> tuple[str, dict]:
         ])
     else:
         rows.append([ui.btn("⏰ 设置按天数留存", "sys:retention:days")])
+    rows.append([ui.btn(
+        f"{'☑' if store_bodies else '☐'} 保存完整请求",
+        "sys:retention:toggle_bodies",
+    )])
     rows.append([ui.btn("◀ 返回系统设置", "menu:settings")])
     return "\n".join(lines), ui.inline_kb(rows)
 
 
 def _show_retention(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
+    text, kb = _retention_menu_text_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _toggle_log_store_bodies(chat_id: int, message_id: int, cb_id: str) -> None:
+    current = config.get().get("logStoreBodies", True) is not False
+    new_value = not current
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", new_value))
+    ui.answer_cb(
+        cb_id,
+        "已开启完整请求保存" if new_value else "已关闭完整请求保存",
+    )
     text, kb = _retention_menu_text_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -2122,6 +2146,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         _edit_retention_days(chat_id, message_id, cb_id); return True
     if data == "sys:retention:forever":
         _set_retention_forever(chat_id, message_id, cb_id); return True
+    if data == "sys:retention:toggle_bodies":
+        _toggle_log_store_bodies(chat_id, message_id, cb_id); return True
     if data == "sys:retention:cancel_input":
         _cancel_retention(chat_id, message_id, cb_id); return True
     if data == "sys:retention:noop":
