@@ -488,6 +488,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "logDir": "logs",
+    # 是否把完整请求头、请求正文和响应正文写入 request_detail。
+    # 关闭后仍保留请求摘要、token、成本、渠道、重试和代理链统计。
+    "logStoreBodies": True,
     # 请求业务日志留存：forever = 永久保留；days = 仅保留最近 N 天（N >= 1）。
     # 无效/缺失配置在运行时 fail-closed 为 forever，避免升级或手工编辑误删日志。
     "logRetention": {

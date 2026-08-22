@@ -311,6 +311,7 @@
     }
   },
   "logDir": "logs",
+  "logStoreBodies": true,
   "logRetention": {
     "mode": "forever",
     "days": null
