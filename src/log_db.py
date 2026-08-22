@@ -106,6 +106,12 @@ def _resolve_log_dir() -> str:
     return os.path.join(config.DATA_DIR, rel)
 
 
+def _store_log_bodies() -> bool:
+    """Return whether full request/response payloads may be persisted."""
+
+    return config.get().get("logStoreBodies", True) is not False
+
+
 def _schema_sql() -> str:
     return """
     CREATE TABLE IF NOT EXISTS request_log (
@@ -1591,6 +1597,7 @@ def insert_pending(
 ) -> RequestLogHandle:
     created = time.time() if created_at is None else float(created_at)
     handle = RequestLogHandle(request_id=request_id, db=_db_ref_for_timestamp(created))
+    store_bodies = _store_log_bodies()
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         conn.execute(
@@ -1615,8 +1622,8 @@ def insert_pending(
                VALUES (?,?,?)""",
             (
                 request_id,
-                json.dumps(request_headers, ensure_ascii=False) if request_headers else None,
-                json.dumps(request_body, ensure_ascii=False) if request_body else None,
+                json.dumps(request_headers, ensure_ascii=False) if store_bodies and request_headers else None,
+                json.dumps(request_body, ensure_ascii=False) if store_bodies and request_body else None,
             ),
         )
         conn.commit()
@@ -2800,7 +2807,7 @@ def finish_success(
                 handle.request_id,
             ),
         )
-        if response_body is not None:
+        if response_body is not None and _store_log_bodies():
             conn.execute(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
                 (response_body, handle.request_id),
@@ -2881,7 +2888,7 @@ def finish_error(
                 handle.request_id,
             ),
         )
-        if response_body is not None:
+        if response_body is not None and _store_log_bodies():
             conn.execute(
                 "UPDATE request_detail SET response_body=? WHERE request_id=?",
                 (response_body, handle.request_id),
