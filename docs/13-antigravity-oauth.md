@@ -196,7 +196,23 @@ SSE 文本是增量还是累计，必须用真实录制 fixture 确认，不能�
 5. 流式 + Chat/Anthropic 回译
 6. quota 冷却与通知
 
-## 12. 对照资源
+## 12. 实打结论（soarsky，未 refresh）
+
+pong 不够。加深后确认：
+
+- 多轮文本：`user/model/user` 历史能保住，模型能回放约定口令
+- 流式：candidates 是累计快照；`GeminiStreamToResponses` 只发 suffix，1–12 + `STREAM-DONE` 拼装正确
+- `gpt-oss-120b-medium`：能给出完整说明性回答
+- 出图：`gemini-3.1-flash-image` 还原为 `output_image` data URL，不再塞进 `output_text`
+- 工具闭环原先 400：回传缺 `thoughtSignature`（Gemini）和 `functionCall.id`（Claude `tool_use.id`）
+  - 还原时保留 native `functionCall.id` 与 part 级 `thoughtSignature`
+  - 回传时写回 `functionCall.id` / `functionResponse.id`
+  - 无签名的**每个 model turn 第一个** functionCall 补 `skip_thought_signature_validator`（对齐 CPA）
+  - 修完后 Gemini / Claude 工具闭环都能吃到 tool result 并给出最终答案
+
+`6768656` 仍跳过。远端不推。
+
+## 13. 对照资源
 
 - CPA 源码：`/opt/workspace/CLIProxyAPI`
 - CPA 部署：`/opt/docker/cpa`，容器 `cpa`，UI `http://10.0.9.2:8317`

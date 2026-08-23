@@ -22,6 +22,7 @@ from ..oauth import antigravity as ag_provider
 
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
+SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 
 
 def _gen_id(prefix: str) -> str:
@@ -53,6 +54,51 @@ def _parse_args(raw: Any) -> dict[str, Any]:
             return {"_raw": raw}
         return parsed if isinstance(parsed, dict) else {"_raw": raw}
     return {}
+
+
+def _part_thought_signature(part: dict) -> str:
+    for key in ("thoughtSignature", "thought_signature", "encrypted_content"):
+        value = part.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for nested_key in ("functionCall", "function_call", "functionResponse", "function_response"):
+        nested = part.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        for key in ("thoughtSignature", "thought_signature"):
+            value = nested.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _sanitize_thought_signatures(request: dict) -> None:
+    """Match CPA: only the first functionCall in a model turn may get the bypass."""
+    contents = request.get("contents")
+    if not isinstance(contents, list):
+        return
+    for content in contents:
+        if not isinstance(content, dict) or content.get("role") != "model":
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        first_function_call = True
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if part.get("functionResponse") or part.get("function_response"):
+                part.pop("thoughtSignature", None)
+                part.pop("thought_signature", None)
+                continue
+            if not (part.get("functionCall") or part.get("function_call")):
+                continue
+            if first_function_call:
+                first_function_call = False
+                if not _part_thought_signature(part):
+                    part["thoughtSignature"] = SKIP_THOUGHT_SIGNATURE
+                continue
+            # Parallel siblings stay unsigned, matching native Gemini history.
 
 
 def _delta_from_snapshot(previous: str, current: str) -> str:
@@ -238,15 +284,17 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
             name = str(item.get("name") or "")
             if call_id and name:
                 call_names[call_id] = name
-            contents.append({
-                "role": "model",
-                "parts": [{
-                    "functionCall": {
-                        "name": name,
-                        "args": _parse_args(item.get("arguments")),
-                    }
-                }],
-            })
+            function_call: dict[str, Any] = {
+                "name": name,
+                "args": _parse_args(item.get("arguments")),
+            }
+            if call_id:
+                function_call["id"] = call_id
+            part = {"functionCall": function_call}
+            signature = _part_thought_signature(item)
+            if signature:
+                part["thoughtSignature"] = signature
+            contents.append({"role": "model", "parts": [part]})
             continue
 
         if typ == "function_call_output":
@@ -262,14 +310,15 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
                 response = output
             else:
                 response = {"result": output}
+            function_response: dict[str, Any] = {
+                "name": name,
+                "response": response if isinstance(response, dict) else {"result": response},
+            }
+            if call_id:
+                function_response["id"] = call_id
             contents.append({
                 "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        "name": name,
-                        "response": response if isinstance(response, dict) else {"result": response},
-                    }
-                }],
+                "parts": [{"functionResponse": function_response}],
             })
             continue
 
@@ -377,6 +426,8 @@ def wrap_cloud_code(
             if not gen:
                 request.pop("generationConfig", None)
 
+    _sanitize_thought_signatures(request)
+
     envelope = {
         "project": project_id,
         "model": model,
@@ -467,14 +518,19 @@ def gemini_parts_to_output_items(parts: list[Any]) -> list[dict[str, Any]]:
             call_index += 1
             name = str(call.get("name") or "")
             args = call.get("args") if "args" in call else call.get("arguments")
-            items.append({
+            native_id = str(call.get("id") or "").strip()
+            item = {
                 "type": "function_call",
                 "id": _gen_id("fc_"),
-                "call_id": f"call_{call_index}",
+                "call_id": native_id or f"call_{call_index}",
                 "name": name,
                 "arguments": _as_json_str(args if args is not None else {}),
                 "status": "completed",
-            })
+            }
+            signature = _part_thought_signature(part)
+            if signature:
+                item["encrypted_content"] = signature
+            items.append(item)
             continue
         if part.get("thought") is True:
             flush_text()
@@ -693,7 +749,11 @@ class GeminiStreamToResponses:
             if not isinstance(part, dict):
                 continue
             if part.get("functionCall") or part.get("function_call"):
-                yield from self._on_function_call(fc_seen, part.get("functionCall") or part.get("function_call") or {})
+                yield from self._on_function_call(
+                    fc_seen,
+                    part.get("functionCall") or part.get("function_call") or {},
+                    signature=_part_thought_signature(part),
+                )
                 fc_seen += 1
                 continue
             if part.get("thought") is True:
@@ -799,6 +859,8 @@ class GeminiStreamToResponses:
                 "arguments": item["arguments"],
                 "status": "completed",
             }
+            if item.get("signature"):
+                completed["encrypted_content"] = item["signature"]
             yield _emit("response.output_item.done", {
                 "type": "response.output_item.done",
                 "sequence_number": self._next_seq(),
@@ -913,19 +975,21 @@ class GeminiStreamToResponses:
             "delta": delta,
         })
 
-    def _on_function_call(self, index: int, call: dict) -> Iterator[bytes]:
+    def _on_function_call(self, index: int, call: dict, *, signature: str = "") -> Iterator[bytes]:
         yield from self._close_text()
         yield from self._close_reasoning()
         name = str(call.get("name") or "")
         args = _as_json_str(call.get("args") if "args" in call else call.get("arguments") or {})
         item = self.fc_items.get(index)
         if item is None:
+            native_id = str(call.get("id") or "").strip()
             item = {
                 "id": _gen_id("fc_"),
-                "call_id": f"call_{index + 1}",
+                "call_id": native_id or f"call_{index + 1}",
                 "output_index": self._alloc_index(),
                 "name": name,
                 "arguments": "",
+                "signature": signature,
             }
             self.fc_items[index] = item
             self.seen_fc_args[index] = ""

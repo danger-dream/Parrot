@@ -301,7 +301,9 @@ def test_responses_to_gemini_multiturn_and_tools(m):
     roles = [c["role"] for c in gemini["contents"]]
     assert roles == ["user", "model", "model", "user", "user"]
     assert gemini["contents"][2]["parts"][0]["functionCall"]["name"] == "lookup"
+    assert gemini["contents"][2]["parts"][0]["functionCall"]["id"] == "call_1"
     assert gemini["contents"][3]["parts"][0]["functionResponse"]["name"] == "lookup"
+    assert gemini["contents"][3]["parts"][0]["functionResponse"]["id"] == "call_1"
     assert gemini["tools"][0]["functionDeclarations"][0]["name"] == "lookup"
     assert gemini["generationConfig"]["temperature"] == 0.2
     assert gemini["generationConfig"]["maxOutputTokens"] == 128
@@ -427,6 +429,48 @@ def test_function_call_roundtrip_and_channel_envelope(m):
     assert restored["output"][0]["type"] == "function_call"
     assert restored["output"][0]["name"] == "lookup"
     assert json.loads(restored["output"][0]["arguments"]) == {"q": "x"}
+
+
+def test_tool_history_preserves_id_and_thought_signature(m):
+    codec = m["codec"]
+    restored = codec.gemini_to_responses({
+        "candidates": [{
+            "content": {"parts": [{
+                "thoughtSignature": "native-sig-1234567890ab",
+                "functionCall": {"id": "tool-77", "name": "lookup", "args": {"q": "x"}},
+            }]},
+            "finishReason": "STOP",
+        }]
+    }, model="gemini-3-flash")
+    item = restored["output"][0]
+    assert item["call_id"] == "tool-77"
+    assert item["encrypted_content"] == "native-sig-1234567890ab"
+
+    replay = codec.responses_to_gemini({
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            item,
+            {"type": "function_call_output", "call_id": item["call_id"], "output": "{\"ok\":true}"},
+        ]
+    })
+    call_part = replay["contents"][1]["parts"][0]
+    resp_part = replay["contents"][2]["parts"][0]
+    assert call_part["functionCall"]["id"] == "tool-77"
+    assert call_part["thoughtSignature"] == "native-sig-1234567890ab"
+    assert resp_part["functionResponse"]["id"] == "tool-77"
+
+    unsigned = codec.wrap_cloud_code({
+        "contents": [{
+            "role": "model",
+            "parts": [
+                {"functionCall": {"id": "a", "name": "first", "args": {}}},
+                {"functionCall": {"id": "b", "name": "second", "args": {}}},
+            ],
+        }]
+    }, model="gemini-3-flash", project_id="proj-x")
+    parts = unsigned["request"]["contents"][0]["parts"]
+    assert parts[0]["thoughtSignature"] == codec.SKIP_THOUGHT_SIGNATURE
+    assert "thoughtSignature" not in parts[1]
 
 
 class _ApiRecorder:
