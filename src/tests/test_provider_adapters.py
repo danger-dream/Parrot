@@ -32,6 +32,7 @@ def test_adapter_selection_matches_existing_channel_kinds():
     assert registry.adapter_for_channel(FakeChannel(protocol="openai-chat", type="api", cc_mimicry=False)).name == "openai-api"
     assert registry.adapter_for_channel(FakeChannel(protocol="openai-responses", type="oauth", cc_mimicry=False)).name == "openai-codex"
     assert registry.adapter_for_channel(FakeChannel(protocol="openai-responses", type="oauth", provider="xai")).name == "xai-oauth"
+    assert registry.adapter_for_channel(FakeChannel(protocol="openai-responses", type="oauth", provider="antigravity")).name == "antigravity-oauth"
 
 
 def test_provider_capabilities_expose_protocols_and_state_boundaries():

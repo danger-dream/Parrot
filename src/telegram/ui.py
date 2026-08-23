@@ -698,17 +698,18 @@ def family_of(protocol: Optional[str]) -> Optional[str]:
 
 
 FAMILY_ICON = {"anthropic": "🅰️", "openai": "🅾️"}
-FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI、Grok、Cursor"}
+FAMILY_LABEL = {"anthropic": "Anthropic", "openai": "OpenAI、Grok、Cursor、Antigravity"}
 FAMILY_PROVIDER_LABELS = {
     "anthropic": (("claude", "Anthropic"),),
     "openai": (
         ("openai", "OpenAI"),
         ("xai", "Grok"),
         ("cursor", "Cursor"),
+        ("antigravity", "Antigravity"),
     ),
 }
 
-PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️"}
+PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨"}
 PROVIDER_CUSTOM_EMOJI = {
     "claude": "5872779796257184592",
     "anthropic": "5872779796257184592",
@@ -716,9 +717,9 @@ PROVIDER_CUSTOM_EMOJI = {
     "xai": "5819115571463068721",
     "cursor": "6062261319426390107",
 }
-PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️"}
-PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor"}
-PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth"}
+PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
+PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity"}
+PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth", "antigravity": "Antigravity"}
 
 
 def _provider_key(provider: str | None) -> str:

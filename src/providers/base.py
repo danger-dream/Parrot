@@ -14,6 +14,7 @@ from typing import Optional, Protocol
 from .capabilities import (
     ANTHROPIC_OAUTH_CAPABILITIES,
     ANTHROPIC_STANDARD_CAPABILITIES,
+    ANTIGRAVITY_OAUTH_CAPABILITIES,
     CC_MIMICRY_CAPABILITIES,
     CURSOR_OAUTH_CAPABILITIES,
     OPENAI_API_CAPABILITIES,
@@ -21,6 +22,7 @@ from .capabilities import (
     XAI_OAUTH_CAPABILITIES,
     ProviderCapabilities,
 )
+from . import antigravity_codec
 
 
 class RestorableChannel(Protocol):
@@ -99,3 +101,15 @@ class OpenAICodexAdapter(ProviderAdapter):
 class XAIOAuthAdapter(ProviderAdapter):
     name = "xai-oauth"
     capabilities = XAI_OAUTH_CAPABILITIES
+
+
+class AntigravityOAuthAdapter(ProviderAdapter):
+    name = "antigravity-oauth"
+    capabilities = ANTIGRAVITY_OAUTH_CAPABILITIES
+
+    async def restore_response_bytes(self, chunk: bytes, ctx: ProviderAttemptContext) -> bytes:
+        translator_ctx = ctx.translator_ctx if ctx is not None else None
+        converter = None
+        if isinstance(translator_ctx, dict):
+            converter = translator_ctx.get("antigravity_stream")
+        return antigravity_codec.restore_antigravity_bytes(chunk, converter=converter)

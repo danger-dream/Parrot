@@ -413,6 +413,8 @@ def _channel_probe_url(ch) -> str:
     if getattr(ch, "type", "") == "oauth":
         if getattr(ch, "provider", "") == "cursor":
             return "https://api2.cursor.sh/aiserver.v1.AiService/AvailableModels"
+        if getattr(ch, "provider", "") == "antigravity":
+            return "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
         if getattr(ch, "protocol", "anthropic") == "openai-responses":
             return "https://chatgpt.com/backend-api/codex/responses"
         return "https://api.anthropic.com/api/oauth/usage"

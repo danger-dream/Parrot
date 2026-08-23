@@ -13,6 +13,8 @@ callback_data 前缀：`oa:...`
 状态机 action（xAI）：
   - `oa_xai_code`             ：等待用户粘贴 xAI / Grok OAuth 回调 URL
   - `oa_xai_rt`               ：等待用户粘贴 refresh_token 字符串
+状态机 action（Antigravity）：
+  - `oa_antigravity_code`     ：等待用户粘贴 Google / Antigravity 回调 URL
 状态机 action（Cursor）：
   - `oa_cursor_login`         ：保存浏览器 PKCE 轮询会话，等待“已登录”按钮
 
@@ -40,7 +42,7 @@ from ... import (
     oauth_errors, oauth_manager, state_db,
 )
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
-from ...oauth import cursor as cursor_provider, openai as openai_provider, xai as xai_provider
+from ...oauth import antigravity as antigravity_provider, cursor as cursor_provider, openai as openai_provider, xai as xai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
 from .. import menu_cache, states, ui
 from . import main as main_menu
@@ -157,6 +159,10 @@ def _overwrite_summary(entry: dict) -> str:
         workspace = entry.get("workspace_name") or entry.get("workspace_type") or entry.get("workspace_id")
         if workspace:
             lines.append(f"工作区: <code>{ui.escape_html(str(workspace))}</code>")
+    if provider == "antigravity":
+        project_id = str(entry.get("project_id") or entry.get("projectId") or "").strip()
+        if project_id:
+            lines.append(f"Project: <code>{ui.escape_html(project_id)}</code>")
     plan = entry.get("plan_type")
     if plan:
         lines.append(f"套餐: <code>{ui.escape_html(str(plan))}</code>")
@@ -582,6 +588,14 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
     ):
         if row.get(key) is not None:
             return True
+    try:
+        raw = json.loads(row.get("raw_data") or "{}")
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        ag = raw.get("antigravity")
+        if isinstance(ag, dict) and ag.get("quota_supported"):
+            return True
     return False
 
 
@@ -614,6 +628,8 @@ def _needs_oauth_cache_refresh_for_ui(account_key: str) -> bool:
 
     stale = _quota_cache_is_stale_for_ui(row)
     if prov == "xai" and not _quota_cache_has_usage_signal(row):
+        return True
+    if prov == "antigravity" and not _quota_cache_has_usage_signal(row):
         return True
     if prov == "openai":
         count = _openai_reset_credit_count_from_row(row)
@@ -870,6 +886,59 @@ def _fmt_credit_amount(v) -> str:
     if abs(x - int(x)) < 1e-9:
         return f"{int(x):,}"
     return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def _antigravity_raw_from_row(row: dict | None) -> dict:
+    if not row or not row.get("raw_data"):
+        return {}
+    try:
+        raw = json.loads(row.get("raw_data") or "{}")
+    except Exception:
+        return {}
+    block = raw.get("antigravity") if isinstance(raw, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def _antigravity_raw(account_key: str) -> dict:
+    return _antigravity_raw_from_row(state_db.quota_load(account_key))
+
+
+def _format_antigravity_credits_block(account_key: str, *, detail: bool = False) -> str:
+    """Independent credits block. Never invent percent windows or currency."""
+    row = state_db.quota_load(account_key)
+    block = _antigravity_raw_from_row(row)
+    acc = oauth_manager.get_account(account_key) or {}
+    project_id = str(acc.get("project_id") or acc.get("projectId") or "").strip()
+    if not block:
+        lines = ["🚀 Antigravity · 未知", "Credits: <i>尚未获取</i>"]
+        if detail and project_id:
+            lines.append(f"Project: <code>{ui.escape_html(project_id)}</code>")
+        return "\n".join(lines)
+
+    tier = str(block.get("tier") or "").strip() or "未知"
+    lines = [f"🚀 Antigravity · {ui.escape_html(tier)}"]
+    if block.get("known"):
+        amount = block.get("credit_amount")
+        minimum = block.get("minimum_credit_amount")
+        available = bool(block.get("available"))
+        amount_txt = _fmt_credit_amount(amount)
+        min_txt = _fmt_credit_amount(minimum)
+        status = "可用" if available else "已耗尽"
+        lines.append(f"Credits: {amount_txt}（最低 {min_txt}）· {status}")
+    else:
+        lines.append("Credits: <i>未知</i>")
+    if detail:
+        if project_id:
+            lines.append(f"Project: <code>{ui.escape_html(project_id)}</code>")
+        fetched = row.get("fetched_at") if row else None
+        if fetched:
+            try:
+                fetched_iso = datetime.fromtimestamp(int(fetched) / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                fetched_iso = ""
+            if fetched_iso:
+                lines.append(f"刷新: <code>{_fmt_time_full(fetched_iso)}</code>")
+    return "\n".join(lines)
 
 
 def _xai_raw_from_row(row: dict | None) -> dict:
@@ -1270,6 +1339,10 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             f"🏷️ 套餐: <code>{ui.escape_html(plan)}</code> · "
             f"模型 <code>{len(acc.get('models') or [])}</code> · 变体 <code>{variants}</code>"
         )
+    elif prov == "antigravity":
+        project_id = str(acc.get("project_id") or acc.get("projectId") or "").strip()
+        if project_id:
+            lines.append(f"🏷️ Project: <code>{ui.escape_html(project_id)}</code>")
 
     # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
     # 展示官方当前周期额度 + Parrot 本地累计金额/token。
@@ -1282,6 +1355,8 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         lines.extend(_format_xai_spend_block(
             ak, detail=False, month_stats=month_stats, stats_loading=stats_loading,
         ).splitlines())
+    elif prov == "antigravity":
+        lines.extend(_format_antigravity_credits_block(ak, detail=False).splitlines())
     elif row:
         fh_util = row.get("five_hour_util")
         sd_util = row.get("seven_day_util")
@@ -1359,6 +1434,8 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
     provider = oauth_manager.provider_of(account_key)
     if provider == "cursor":
         return _format_cursor_usage_block(account_key, detail=True)
+    if provider == "antigravity":
+        return _format_antigravity_credits_block(account_key, detail=True)
     if provider == "xai":
         month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{account_key}")
         return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(
@@ -2472,6 +2549,11 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             provider_line += f"📅 开始: <code>{_format_bjt(sub_created)}</code>\n"
     elif prov == "xai":
         provider_line = _format_xai_provider_line(account_key, detail=True)
+    elif prov == "antigravity":
+        project_id = str(acc.get("project_id") or acc.get("projectId") or "").strip()
+        provider_line = (
+            f"🏷️ Project: <code>{ui.escape_html(project_id or '?')}</code>\n"
+        )
     elif prov == "cursor":
         profile_name = str(acc.get("cursor_profile_name") or "").strip()
         cursor_model_ids = {
@@ -2545,6 +2627,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     usage_btn_label = (
         "📊 刷新 Cursor 用量" if prov == "cursor"
         else "📊 刷新账单" if prov == "xai"
+        else "📊 刷新 Credits" if prov == "antigravity"
         else "📊 刷新用量/重置卡"
     )
     rows = [
@@ -4037,7 +4120,7 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
     ui.edit(
         chat_id, message_id,
-        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')}、{_provider_tag('openai')}、{_provider_tag('xai')}、{_provider_tag('cursor')}",
+        f"<b>新增 OAuth 账户</b>\n请选择类型：\n\n{_provider_tag('claude')}、{_provider_tag('openai')}、{_provider_tag('xai')}、{_provider_tag('cursor')}、{_provider_tag('antigravity')}",
         reply_markup=ui.inline_kb([
             [ui.provider_button("Claude 登录获取 Token", "oa:login", "claude")],
             [ui.provider_button("Claude 手动设置 JSON", "oa:set_json", "claude")],
@@ -4046,6 +4129,7 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.provider_button("Grok 登录获取 Token", "oa:login:xai", "xai")],
             [ui.provider_button("Grok 粘贴 refresh_token", "oa:set_rt:xai", "xai")],
             [ui.provider_button("Cursor 登录", "oa:login:cursor", "cursor")],
+            [ui.provider_button("Antigravity 登录获取 Token", "oa:login:antigravity", "antigravity")],
             [ui.provider_button("OpenAI 导入 Sub2API 文件", "oa:import:sub2api", "openai")],
             [ui.provider_button("OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
@@ -5097,6 +5181,160 @@ def _finish_xai_add(chat_id: int, tok: dict, *, source: str) -> None:
     )
 
 
+# ─── Antigravity / Google OAuth 登录 ───────────────────────────────
+
+_OA_NAV_ANTIGRAVITY = {"back_label": "◀ 返回新增账户", "back_callback": "oa:add"}
+
+
+def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
+    redirect = antigravity_provider.redirect_uri()
+    text = (
+        f"请在浏览器打开以下链接登录 {_provider_tag('antigravity', full=True)} 账号：\n\n"
+        f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
+        "👇 长按下方地址可复制：\n"
+        f"<code>{ui.escape_html(url)}</code>\n\n"
+        f"登录后浏览器会跳到 <code>{ui.escape_html(redirect)}?code=...&amp;state=...</code>"
+        "（页面显示无法访问属正常，Parrot 不会监听这个端口）。\n"
+        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
+        "<i>（登录会话 30 分钟内有效）</i>"
+    )
+    kb = ui.inline_kb([
+        [ui.btn("🔄 重新生成登录地址", "oa:login:antigravity:regen")],
+        [ui.btn("❌ 取消", "oa:add")],
+    ])
+    return text, kb
+
+
+def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str) -> None:
+    ui.answer_cb(cb_id)
+    state = secrets.token_urlsafe(32)
+    url = antigravity_provider.build_login_url(state)
+    states.set_state(chat_id, "oa_antigravity_code", {
+        "state": state,
+        "token_endpoint": antigravity_provider.token_url(),
+        "redirect_uri": antigravity_provider.redirect_uri(),
+    })
+    text, kb = _build_antigravity_login_text_and_kb(url)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_login_antigravity_regen(chat_id: int, message_id: int, cb_id: str) -> None:
+    on_login_antigravity_start(chat_id, message_id, cb_id)
+
+
+def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
+    state = states.pop_state(chat_id)
+    if not state or state.get("action") != "oa_antigravity_code":
+        ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_OA_NAV_ANTIGRAVITY)
+        return
+    data = state.get("data") or {}
+    try:
+        parsed = antigravity_provider.parse_callback_url(text)
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 没有抽到 code：<code>{ui.escape_html(str(exc))[:300]}</code>",
+            **_OA_NAV_ANTIGRAVITY,
+        )
+        return
+    code = parsed.get("code") or ""
+    recv_state = parsed.get("state") or ""
+    orig_state = data.get("state", "")
+    if recv_state and orig_state and recv_state != orig_state:
+        ui.send_result(
+            chat_id,
+            f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
+            f"期望 <code>{ui.escape_html(orig_state[:16])}...</code>。"
+            "可能是会话错乱，请重新发起登录流程。",
+            **_OA_NAV_ANTIGRAVITY,
+        )
+        return
+    try:
+        tok = antigravity_provider.complete_login_sync(
+            code,
+            redirect_uri=data.get("redirect_uri") or antigravity_provider.redirect_uri(),
+            token_endpoint=data.get("token_endpoint") or antigravity_provider.token_url(),
+        )
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            _oauth_error_html(exc, provider="antigravity", operation="exchange_code"),
+            **_OA_NAV_ANTIGRAVITY,
+        )
+        return
+    _finish_antigravity_add(chat_id, tok, source="login")
+
+
+def _antigravity_token_to_entry(tok: dict) -> tuple[dict, dict]:
+    email = str(tok.get("email") or "").strip()
+    project_id = str(tok.get("project_id") or tok.get("projectId") or "").strip()
+    if not email:
+        raise ValueError("Antigravity 登录结果缺少 email")
+    if not project_id:
+        raise ValueError("Antigravity 登录结果缺少 project_id")
+    expires_in = int(tok.get("expires_in", 3600) or 3600)
+    new_expired = (
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {
+        "email": email,
+        "provider": "antigravity",
+        "access_token": tok.get("access_token", ""),
+        "refresh_token": tok.get("refresh_token", ""),
+        "expired": new_expired,
+        "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "antigravity",
+        "enabled": True,
+        "disabled_reason": None,
+        "disabled_until": None,
+        "models": [],
+        "project_id": project_id,
+        "base_url": tok.get("base_url") or tok.get("baseUrl") or antigravity_provider.api_base_url(),
+        "token_endpoint": tok.get("token_endpoint") or antigravity_provider.token_url(),
+        "redirect_uri": tok.get("redirect_uri") or antigravity_provider.redirect_uri(),
+    }
+    meta = {"email": email, "project_id": project_id, "expired": new_expired}
+    return entry, meta
+
+
+def _finish_antigravity_add(chat_id: int, tok: dict, *, source: str) -> None:
+    try:
+        entry, meta = _antigravity_token_to_entry(tok)
+        save_action = _persist_new_or_stage_overwrite(
+            chat_id, entry, source=source,
+        )
+        if save_action == "staged":
+            return
+        existed = False
+    except Exception as exc:
+        ui.send_result(
+            chat_id,
+            f"❌ 保存失败: <code>{ui.escape_html(str(exc))[:500]}</code>",
+            **_OA_NAV_ANTIGRAVITY,
+        )
+        return
+
+    title = (
+        f"✅ {ui.provider_custom_emoji_html('antigravity')} <b>Antigravity OAuth 账户已更新</b>"
+        if existed else
+        f"✅ {ui.provider_custom_emoji_html('antigravity')} <b>Antigravity OAuth 账户已添加</b>"
+    )
+    lb_hint = (
+        "\n已加入负载均衡优先级队列末尾，如需调整请进入「负载均衡」。"
+        if not existed and load_balancing.is_initialized() else ""
+    )
+    ui.send_result(
+        chat_id,
+        f"{title}\n\n"
+        f"Email: <code>{ui.escape_html(meta.get('email') or entry.get('email') or '')}</code>\n"
+        f"Project: <code>{ui.escape_html(meta.get('project_id') or '')}</code>\n"
+        f"过期: <code>{_fmt_time_full(meta.get('expired'))}</code>\n"
+        "额度: <code>Credits 将在账户详情中刷新</code>\n"
+        f"来源: <code>{ui.escape_html(source)}</code>{lb_hint}",
+        **_OA_NAV_ANTIGRAVITY,
+    )
+
+
 # ─── OpenAI 批量导入（Sub2API / CPA）───────────────────────────────
 
 _OPENAI_IMPORT_LABELS = {
@@ -5551,6 +5789,12 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "oa:set_rt:xai":
         on_set_rt_xai_start(chat_id, message_id, cb_id)
         return True
+    if data == "oa:login:antigravity":
+        on_login_antigravity_start(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:login:antigravity:regen":
+        on_login_antigravity_regen(chat_id, message_id, cb_id)
+        return True
     if data.startswith("oa:import:"):
         on_import_openai_start(chat_id, message_id, cb_id, data.rsplit(":", 1)[-1])
         return True
@@ -5689,6 +5933,9 @@ def handle_text_state(chat_id: int, action: str, text: str) -> bool:
         return True
     if action == "oa_xai_rt":
         on_set_rt_xai_input(chat_id, text)
+        return True
+    if action == "oa_antigravity_code":
+        on_login_antigravity_code_input(chat_id, text)
         return True
     if action == "oa_openai_import":
         on_import_openai_text_input(chat_id, text)

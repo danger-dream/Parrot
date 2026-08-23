@@ -4,6 +4,7 @@
   - Anthropic OAuth → cfg["oauthDefaultModels"] (顶层 list[str])
   - OpenAI    OAuth → cfg["openaiOAuth"]["defaultModels"]
   - Grok/xAI  OAuth → cfg["xaiOAuth"]["defaultModels"]
+  - Antigravity OAuth → cfg["antigravityOAuth"]["defaultModels"]
 
 语义: OAuth 账户 entry 未手动填 models 时的回落列表。改完走 `config.update`
 自动触发 registry 重建, 热生效。
@@ -43,12 +44,13 @@ from ...oauth_ids import account_key as _account_key
 from .. import states, ui
 
 
-_FAMILIES: tuple[str, ...] = ("anthropic", "openai", "xai")
+_FAMILIES: tuple[str, ...] = ("anthropic", "openai", "xai", "antigravity")
 
 _FAM_LABEL = {
     "anthropic": "Claude",
     "openai":    "OpenAI",
     "xai":       "Grok",
+    "antigravity": "Antigravity",
 }
 PAGE = 10
 _SYNC_SPAWN = False
@@ -56,6 +58,7 @@ _FAM_PROVIDER = {
     "anthropic": "claude",
     "openai":    "openai",
     "xai":       "xai",
+    "antigravity": "antigravity",
 }
 
 
@@ -83,6 +86,8 @@ def _read_list(family: str) -> list[str]:
         raw = cfg.get("oauthDefaultModels") or []
     elif family == "xai":
         raw = (cfg.get("xaiOAuth") or {}).get("defaultModels") or []
+    elif family == "antigravity":
+        raw = (cfg.get("antigravityOAuth") or {}).get("defaultModels") or []
     else:
         raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
     return [str(x) for x in raw if isinstance(x, str) and x.strip()]
@@ -94,6 +99,8 @@ def _write_list(family: str, models: list[str]) -> None:
             cfg["oauthDefaultModels"] = list(models)
         elif family == "xai":
             cfg.setdefault("xaiOAuth", {})["defaultModels"] = list(models)
+        elif family == "antigravity":
+            cfg.setdefault("antigravityOAuth", {})["defaultModels"] = list(models)
         else:
             cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(models)
     config.update(_mutate)
@@ -132,7 +139,7 @@ def _scan_references(family: str, removed: set[str]) -> dict:
 
     只关心与 `family` 相关的入口:
       anthropic → ingressDefaultModel["anthropic"] + modelMapping["anthropic"]
-      openai/xai → ingressDefaultModel["openai-chat"/"openai-responses"]
+      openai/xai/antigravity → ingressDefaultModel["openai-chat"/"openai-responses"]
                 + modelMapping["openai-chat"/"openai-responses"]
     API Key 白名单本身无家族概念 — OpenAI/Grok/Cursor 家族模型可能和 Anthropic 模型
     同名吗? 实践上不会(Claude vs GPT 名字不会碰撞), 但为求精确, 只在白名单里
@@ -153,6 +160,7 @@ def _scan_references(family: str, removed: set[str]) -> dict:
         "anthropic": {"anthropic"},
         "openai":    {"openai-chat", "openai-responses"},
         "xai":       {"openai-chat", "openai-responses"},
+        "antigravity": {"openai-chat", "openai-responses"},
     }
     ingresses = fam_ingress.get(family, set())
 
@@ -235,6 +243,7 @@ def _commit_save(
         "anthropic": {"anthropic"},
         "openai":    {"openai-chat", "openai-responses"},
         "xai":       {"openai-chat", "openai-responses"},
+        "antigravity": {"openai-chat", "openai-responses"},
     }
     ingresses = fam_ingress.get(family, set())
 
@@ -244,6 +253,8 @@ def _commit_save(
             cfg["oauthDefaultModels"] = list(new_models)
         elif family == "xai":
             cfg.setdefault("xaiOAuth", {})["defaultModels"] = list(new_models)
+        elif family == "antigravity":
+            cfg.setdefault("antigravityOAuth", {})["defaultModels"] = list(new_models)
         else:
             cfg.setdefault("openaiOAuth", {})["defaultModels"] = list(new_models)
 
@@ -347,6 +358,8 @@ def _static_models(family: str) -> list[str]:
         raw = defaults.get("oauthDefaultModels") or []
     elif family == "xai":
         raw = (defaults.get("xaiOAuth") or {}).get("defaultModels") or []
+    elif family == "antigravity":
+        raw = (defaults.get("antigravityOAuth") or {}).get("defaultModels") or []
     else:
         raw = (defaults.get("openaiOAuth") or {}).get("defaultModels") or []
     return [str(x) for x in raw if str(x).strip()]
@@ -422,6 +435,7 @@ def _overview_kb() -> dict:
             ui.provider_button("OpenAI", "odm:edit:openai", "openai"),
             ui.provider_button("Grok", "odm:edit:xai", "xai"),
         ],
+        [ui.provider_button("Antigravity", "odm:edit:antigravity", "antigravity")],
         [ui.btn("◀ 返回账户设置", "oa:settings")],
     ])
 

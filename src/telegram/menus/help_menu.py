@@ -15,7 +15,7 @@ _HELP_TEXT = (
     "📈 统计汇总 — 按时间×维度查看 token 用量、缓存、金额、重试、亲和；汇总页两家族分段\n"
     "📋 最近日志 — 可切换请求日志与多媒体日志；分别查看重试链或图片/视频任务详情\n"
     "📡 管理渠道 — 第三方 API 渠道增删改、测试、清错误/亲和\n"
-    "🔐 管理 OAuth — OAuth 账户登录、刷新、配额查看（Anthropic、OpenAI、Grok、Cursor）\n"
+    "🔐 管理 OAuth — OAuth 账户登录、刷新、配额查看（Anthropic、OpenAI、Grok、Cursor、Antigravity）\n"
     "⚖️ 负载均衡 — 智能/顺序/优先级调度与优先级队列\n"
     "🔑 API Key — 下游客户端使用的代理 Key，发送 /keys 管理\n"
     "⚙ 系统设置 — 超时 / 错误阶梯 / 评分 / 亲和 / CCH / 黑名单\n\n"
@@ -24,7 +24,8 @@ _HELP_TEXT = (
     f"{ui.provider_tag('claude')}：claude-opus / claude-sonnet 等 Claude 家族；入口 /v1/messages\n"
     f"{ui.provider_tag('openai')}：gpt-5.x / gpt-5.x-codex 等 GPT 家族；入口 /v1/chat/completions 或 /v1/responses\n"
     f"{ui.provider_tag('xai')}：grok-4.5 等 xAI/Grok 家族；入口同为 OpenAI-style /v1/responses，但账号/provider 独立显示\n"
-    f"{ui.provider_tag('cursor')}：Cursor 订阅模型；经 OpenAI-style Chat / Responses 或 Anthropic 入口调用\n\n"
+    f"{ui.provider_tag('cursor')}：Cursor 订阅模型；经 OpenAI-style Chat / Responses 或 Anthropic 入口调用\n"
+    f"{ui.provider_tag('antigravity')}：Google 账号 / Code Assist 模型；入口同为 OpenAI-style，账号独立显示\n\n"
 
     "<b>渠道状态图标</b>\n"
     "✅ 可用 · ⬛ 已禁用 · 🟢 健康 · 🟡 一般 · 🔴 异常\n"

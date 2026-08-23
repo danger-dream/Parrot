@@ -43,8 +43,8 @@ from . import main as main_menu
 # 渠道协议取值与纯文本标签；消息正文和按钮图标由下方 helper 统一生成。
 PROTOCOL_CHOICES: list[tuple[str, str]] = [
     ("anthropic", "Anthropic (/v1/messages)"),
-    ("openai-chat", "OpenAI、Grok、Cursor Chat (/v1/chat/completions)"),
-    ("openai-responses", "OpenAI、Grok、Cursor Responses (/v1/responses)"),
+    ("openai-chat", "OpenAI、Grok、Cursor、Antigravity Chat (/v1/chat/completions)"),
+    ("openai-responses", "OpenAI、Grok、Cursor、Antigravity Responses (/v1/responses)"),
 ]
 
 _PROTOCOL_LABEL = {p: label for p, label in PROTOCOL_CHOICES}

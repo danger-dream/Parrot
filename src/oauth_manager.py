@@ -36,11 +36,13 @@ from .oauth import (
 )
 from .oauth_ids import (
     account_key as _account_key,
+    antigravity_project_id as _antigravity_project_id,
     cursor_subject as _cursor_subject,
     openai_workspace_id as _openai_workspace_id,
     split_account_key as _split_ak,
     xai_subject as _xai_subject,
 )
+from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
@@ -99,8 +101,12 @@ def _is_cursor_acc(acc: dict) -> bool:
     return _acc_provider(acc) == "cursor"
 
 
+def _is_antigravity_acc(acc: dict) -> bool:
+    return _acc_provider(acc) == "antigravity"
+
+
 def _is_openai_family_provider(provider: str) -> bool:
-    return provider in ("openai", "xai", "cursor")
+    return provider in ("openai", "xai", "cursor", "antigravity")
 
 
 def _canonical_key(acc: dict) -> str:
@@ -176,6 +182,21 @@ def _matching_accounts_for_key(key: str) -> list[dict]:
                     acc.get("email") == identity
                     or _xai_subject(acc) == identity
                 )
+            ]
+        if provider == "antigravity":
+            parts = identity.split(":", 1)
+            if len(parts) == 2:
+                email, project_id = parts[0], parts[1]
+                return [
+                    acc for acc in accounts
+                    if _is_antigravity_acc(acc)
+                    and str(acc.get("email") or "") == email
+                    and _antigravity_project_id(acc) == project_id
+                ]
+            return [
+                acc for acc in accounts
+                if _is_antigravity_acc(acc)
+                and str(acc.get("email") or "") == identity
             ]
         return [
             acc for acc in accounts
@@ -272,7 +293,7 @@ def account_key_to_email(account_key: str) -> str:
             return str(acc.get("label") or acc.get("email") or "")
         return str(acc.get("email") or "")
     provider, identity = _split_ak(account_key)
-    if provider in ("openai", "xai") and ":" in identity:
+    if provider in ("openai", "xai", "antigravity") and ":" in identity:
         return identity.split(":", 1)[0]
     return identity
 
@@ -659,6 +680,13 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
             data = cursor_provider.refresh_sync(
                 acc["refresh_token"], account_key=account_key,
             )
+        elif provider == "antigravity":
+            data = antigravity_provider.refresh_sync(
+                acc["refresh_token"],
+                token_endpoint=acc.get("token_endpoint") or None,
+                email=email,
+                project_id=_antigravity_project_id(acc) or None,
+            )
         elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
         else:
@@ -751,6 +779,13 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                 except Exception as exc:
                     print(f"[oauth] xai refresh: id_token decode failed for {email}: {exc}")
             for k in ("subject", "sub", "base_url", "token_endpoint", "redirect_uri"):
+                if data.get(k):
+                    new_fields[k] = data[k]
+
+        # Antigravity: refresh must never rewrite project_id. The Cloud Code
+        # project is part of the canonical account key.
+        if provider == "antigravity":
+            for k in ("base_url", "token_endpoint", "redirect_uri"):
                 if data.get(k):
                     new_fields[k] = data[k]
 
@@ -968,6 +1003,9 @@ async def fetch_usage(account_key: str) -> dict:
 
     if provider == "cursor":
         return await cursor_provider.fetch_usage(access_token, account_key=account_key)
+
+    if provider == "antigravity":
+        return await antigravity_provider.fetch_usage(access_token)
 
     if provider != "openai":
         # Claude 路径：直接走 /api/oauth/usage
@@ -1886,6 +1924,87 @@ def _evaluate_cursor_model_pools(
     }
 
 
+def _evaluate_antigravity_credits(
+    account_key: str,
+    acc: dict,
+    usage: dict,
+    *,
+    fresh: bool,
+    expected_quota_generation,
+) -> dict:
+    """Credits are a boolean pool, not Anthropic-style percent windows.
+
+    unknown / fetch-failed must not disable or resume. Exhausted credits have
+    no reset time; recovery waits for a later known+available snapshot.
+    """
+    utils = [None, None, None, None, None]
+    block = usage.get("antigravity") if isinstance(usage, dict) else None
+    known = isinstance(block, dict) and bool(block.get("known"))
+    available = bool(block.get("available")) if known else False
+    reason = acc.get("disabled_reason")
+    base = {
+        "utils": utils,
+        "any_over": False,
+        "hit_windows": [],
+        "disabled_until": acc.get("disabled_until"),
+    }
+    if not known:
+        if reason == "quota":
+            return {**base, "action": "quota_unknown_keep_disabled"}
+        return {**base, "action": "kept_enabled"}
+    if not available:
+        hits = ["Credits"]
+        if reason == "quota":
+            return {**base, "action": "still_over_quota", "any_over": True, "hit_windows": hits}
+        try:
+            disable_result = set_disabled_by_quota(account_key, None)
+        except Exception as exc:
+            print(f"[oauth] evaluate antigravity disable failed for {account_key}: {exc}")
+            return {**base, "action": "disable_failed", "any_over": True, "hit_windows": hits}
+        disable_state = (disable_result or {}).get("state")
+        if disable_state != "disabled":
+            return {
+                **base,
+                "action": (
+                    "still_over_quota"
+                    if disable_state == "already_quota_disabled"
+                    else disable_state or "disable_failed"
+                ),
+                "any_over": True,
+                "hit_windows": hits,
+                "disabled_until": (disable_result or {}).get("disabled_until"),
+                "disabled_reason": (disable_result or {}).get("disabled_reason"),
+                "error_code": "account_state_conflict",
+            }
+        return {**base, "action": "disabled", "any_over": True, "hit_windows": hits, "disabled_until": None}
+    if reason == "quota":
+        if not fresh:
+            return {**base, "action": "quota_stale_keep_disabled"}
+        if expected_quota_generation is None:
+            return {
+                **base,
+                "action": "resume_failed",
+                "error_code": "quota_observation_generation_invalid",
+            }
+        try:
+            enable_result = set_enabled(
+                account_key, True, expected_disabled_reason="quota",
+                expected_quota_observation_generation=expected_quota_generation,
+            )
+        except Exception as exc:
+            print(f"[oauth] evaluate antigravity resume failed for {account_key}: {exc}")
+            return {**base, "action": "resume_failed"}
+        enable_state = (enable_result or {}).get("state")
+        if enable_state != "enabled":
+            return {
+                **base,
+                "action": enable_state or "resume_failed",
+                "error_code": "account_state_conflict",
+            }
+        return {**base, "action": "resumed", "disabled_until": None}
+    return {**base, "action": "kept_enabled"}
+
+
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                                  *, threshold: float | None = None,
                                  fresh: bool = True) -> dict:
@@ -1953,6 +2072,15 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             usage,
             threshold=float(threshold),
             fresh=fresh,
+        )
+
+    if provider == "antigravity":
+        return _evaluate_antigravity_credits(
+            account_key,
+            acc,
+            usage,
+            fresh=fresh,
+            expected_quota_generation=expected_quota_generation,
         )
 
     # WHAM's explicit gate is authoritative even when its percentage windows
@@ -2528,7 +2656,7 @@ def _add_account_serialized(entry: dict) -> None:
     """entry 需至少含 email / access_token / refresh_token。
 
     支持可选字段：
-      - provider: "claude" (默认) / "openai" / "xai" / "cursor"
+      - provider: "claude" (默认) / "openai" / "xai" / "cursor" / "antigravity"
       - id_token / chatgpt_account_id / workspace_id / workspace_name /
         workspace_type / organization_id / plan_type / subscription_expires_at /
         codexDeviceInstallationId / codexDeviceConvergenceEnabled
@@ -2556,7 +2684,7 @@ def _add_account_serialized(entry: dict) -> None:
         "refresh_token": entry["refresh_token"],
         "expired": entry.get("expired", ""),
         "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor") else "claude"),
+        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity") else "claude"),
         "enabled": entry.get("enabled", True),
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
@@ -2578,6 +2706,17 @@ def _add_account_serialized(entry: dict) -> None:
             "base_url": entry.get("base_url") or entry.get("baseUrl") or xai_provider.api_base_url(),
             "token_endpoint": entry.get("token_endpoint") or xai_provider.token_url(),
             "redirect_uri": entry.get("redirect_uri") or xai_provider.redirect_uri(),
+        })
+    # Antigravity 专属字段。project_id 是身份主键的一部分，缺了不许保存。
+    elif provider == "antigravity":
+        project_id = _antigravity_project_id(entry)
+        if not project_id:
+            raise ValueError("antigravity account requires project_id")
+        normalized.update({
+            "project_id": project_id,
+            "base_url": entry.get("base_url") or entry.get("baseUrl") or antigravity_provider.api_base_url(),
+            "token_endpoint": entry.get("token_endpoint") or antigravity_provider.token_url(),
+            "redirect_uri": entry.get("redirect_uri") or antigravity_provider.redirect_uri(),
         })
     # Cursor 专属字段。模型目录来自该账号自己的 AvailableModels，不能
     # 与 models.dev 元数据合并，否则上下文和变体限制会失真。
@@ -2645,6 +2784,14 @@ def _add_account_serialized(entry: dict) -> None:
         # sharing an email never collapse into one account.
         return str(acc.get("email") or "") == email
 
+    def _matches_antigravity_target(acc: dict) -> bool:
+        if _acc_provider(acc) != "antigravity":
+            return False
+        return (
+            str(acc.get("email") or "") == email
+            and _antigravity_project_id(acc) == _antigravity_project_id(normalized)
+        )
+
     added = {"v": False}
     existing_target = None
     for a in config.get().get("oauthAccounts", []):
@@ -2654,6 +2801,10 @@ def _add_account_serialized(entry: dict) -> None:
                 break
         elif provider == "xai":
             if _matches_xai_target(a):
+                existing_target = a
+                break
+        elif provider == "antigravity":
+            if _matches_antigravity_target(a):
                 existing_target = a
                 break
         elif provider == "cursor":
@@ -2692,6 +2843,11 @@ def _add_account_serialized(entry: dict) -> None:
                 if _matches_xai_target(a):
                     target = a
                     break
+        elif provider == "antigravity":
+            for a in accounts:
+                if _matches_antigravity_target(a):
+                    target = a
+                    break
         elif provider == "cursor":
             for a in accounts:
                 if _matches_cursor_target(a):
@@ -2704,7 +2860,7 @@ def _add_account_serialized(entry: dict) -> None:
                     break
 
         if target is not None:
-            if provider not in ("openai", "xai", "cursor"):
+            if provider not in ("openai", "xai", "cursor", "antigravity"):
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
@@ -3962,6 +4118,8 @@ async def quota_monitor_once() -> dict:
             _plan_tag = f"\n{notifier.provider_custom_emoji_html('xai')} Grok"
         elif provider == "cursor":
             _plan_tag = f"\n{notifier.provider_tag('cursor')} · {notifier.escape_html(str(acc.get('plan_type') or 'Cursor'))}"
+        elif provider == "antigravity":
+            _plan_tag = f"\n{notifier.provider_custom_emoji_html('antigravity')} Antigravity"
 
         if action in ("disabled", "wham_limit_disabled"):
             latest_reset = result["disabled_until"]

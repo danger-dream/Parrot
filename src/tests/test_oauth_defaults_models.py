@@ -26,6 +26,7 @@ def _restore_oauth_defaults_config():
     snapshot = {key: copy.deepcopy(before.get(key)) for key in _MUTATED_TOP_KEYS}
     openai_models = copy.deepcopy((before.get("openaiOAuth") or {}).get("defaultModels"))
     xai_models = copy.deepcopy((before.get("xaiOAuth") or {}).get("defaultModels"))
+    antigravity_models = copy.deepcopy((before.get("antigravityOAuth") or {}).get("defaultModels"))
     yield
 
     def restore(cfg):
@@ -33,6 +34,7 @@ def _restore_oauth_defaults_config():
             cfg[key] = copy.deepcopy(value)
         cfg.setdefault("openaiOAuth", {})["defaultModels"] = copy.deepcopy(openai_models)
         cfg.setdefault("xaiOAuth", {})["defaultModels"] = copy.deepcopy(xai_models)
+        cfg.setdefault("antigravityOAuth", {})["defaultModels"] = copy.deepcopy(antigravity_models)
 
     config.update(restore)
 
@@ -44,6 +46,7 @@ def _reset():
         cfg["oauthDefaultModels"] = ["claude-old", "claude-keep"]
         cfg.setdefault("openaiOAuth", {})["defaultModels"] = ["gpt-keep"]
         cfg.setdefault("xaiOAuth", {})["defaultModels"] = ["grok-4.5", "grok-local"]
+        cfg.setdefault("antigravityOAuth", {})["defaultModels"] = ["gemini-3.7-flash-high"]
         cfg["oauthAccounts"] = []
         cfg["apiKeys"] = {}
         cfg["modelMapping"] = {"global": {}}
@@ -66,7 +69,13 @@ def test_overview_buttons_use_provider_custom_icons():
     assert kb[0][0]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("claude")
     assert kb[0][1]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
     assert kb[0][2]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("xai")
-    assert kb[1][0]["callback_data"] == "oa:settings"
+    assert [b["text"] for b in kb[1]] == ["Antigravity"]
+    expected_ag_icon = ui.provider_custom_emoji_id("antigravity")
+    if expected_ag_icon:
+        assert kb[1][0]["icon_custom_emoji_id"] == expected_ag_icon
+    else:
+        assert "icon_custom_emoji_id" not in kb[1][0]
+    assert kb[2][0]["callback_data"] == "oa:settings"
 
 
 def test_claude_skips_live_and_uses_static(monkeypatch):

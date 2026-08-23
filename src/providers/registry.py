@@ -8,6 +8,7 @@ Selection is intentionally lightweight and mirrors today's Channel classes:
 - OpenAI OAuth/Codex channels          → OpenAI Codex
 - xAI OAuth/Grok channels              → xAI OAuth
 - Cursor OAuth/AgentService channels    → Cursor OAuth
+- Antigravity OAuth channels           → Antigravity OAuth
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Optional
 from .base import (
     AnthropicOAuthAdapter,
     AnthropicStandardAdapter,
+    AntigravityOAuthAdapter,
     CcMimicryAdapter,
     CursorOAuthAdapter,
     OpenAIApiAdapter,
@@ -33,6 +35,7 @@ _OPENAI_API = OpenAIApiAdapter()
 _CURSOR_OAUTH = CursorOAuthAdapter()
 _OPENAI_CODEX = OpenAICodexAdapter()
 _XAI_OAUTH = XAIOAuthAdapter()
+_ANTIGRAVITY_OAUTH = AntigravityOAuthAdapter()
 
 
 def adapter_for_channel(channel) -> ProviderAdapter:
@@ -46,6 +49,8 @@ def adapter_for_channel(channel) -> ProviderAdapter:
                 return _XAI_OAUTH
             if provider == "cursor":
                 return _CURSOR_OAUTH
+            if provider == "antigravity":
+                return _ANTIGRAVITY_OAUTH
             return _OPENAI_CODEX
         return _OPENAI_API
 

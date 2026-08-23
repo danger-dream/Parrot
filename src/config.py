@@ -461,12 +461,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "claude": "5872779796257184592",
             "xai": "5819115571463068721",
             "cursor": "6062261319426390107",
+            "antigravity": "",
         },
         "providerBtnEmoji": {
             "openai": "🅾️",
             "claude": "🅰️",
             "xai": "𝕏",
             "cursor": "🖱️",
+            "antigravity": "✨",
         },
     },
     "oauth": {
@@ -564,6 +566,44 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mediaRequestTimeoutSeconds": 180,
         "defaultModels": [
             "grok-4.5",
+        ],
+    },
+    # Antigravity / Google Code Assist OAuth。client/scope/UA 对齐 CPA
+    # internal/auth/antigravity；模型目录对齐 CPA models.json 的 antigravity 段。
+    # 出图模型单独放 imageModels，不能混进 defaultModels 文本调度器。
+    "antigravityOAuth": {
+        "clientId": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+        "clientSecret": "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",
+        "redirectUri": "http://localhost:51121/oauth-callback",
+        "scope": (
+            "https://www.googleapis.com/auth/cloud-platform "
+            "https://www.googleapis.com/auth/userinfo.email "
+            "https://www.googleapis.com/auth/userinfo.profile "
+            "https://www.googleapis.com/auth/cclog "
+            "https://www.googleapis.com/auth/experimentsandconfigs"
+        ),
+        "authorizationEndpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenEndpoint": "https://oauth2.googleapis.com/token",
+        "userinfoEndpoint": "https://www.googleapis.com/oauth2/v2/userinfo?alt=json",
+        "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
+        "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
+        "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
+        "imageModels": [
+            "gemini-3.1-flash-image",
+        ],
+        "defaultModels": [
+            "gemini-3.7-flash-high",
+            "gemini-3.6-flash-high",
+            "gemini-3-flash",
+            "gemini-3-flash-agent",
+            "gemini-pro-agent",
+            "gemini-3.1-pro-low",
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash-low",
+            "gemini-3.5-flash-extra-low",
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6",
+            "gpt-oss-120b-medium",
         ],
     },
     # Cursor OAuth / AgentService 私有 bridge。模型清单和上下文限制按账号

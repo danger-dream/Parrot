@@ -40,10 +40,11 @@ def test_provider_and_family_helpers_emit_custom_icons():
     assert ui.family_tag("openai") == (
         f"{ui.provider_custom_emoji_html('openai')} OpenAI、"
         f"{ui.provider_custom_emoji_html('xai')} Grok、"
-        f"{ui.provider_custom_emoji_html('cursor')} Cursor"
+        f"{ui.provider_custom_emoji_html('cursor')} Cursor、"
+        f"{ui.provider_custom_emoji_html('antigravity')} Antigravity"
     )
     openai_button = ui.family_button("openai", "family", suffix=" 协议")
-    assert openai_button["text"] == "OpenAI、Grok、Cursor 协议"
+    assert openai_button["text"] == "OpenAI、Grok、Cursor、Antigravity 协议"
     assert openai_button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
 
 
@@ -71,10 +72,15 @@ def test_oauth_and_status_buttons_use_provider_custom_icons(monkeypatch):
         "oa:login:xai": "xai",
         "oa:set_rt:xai": "xai",
         "oa:login:cursor": "cursor",
+        "oa:login:antigravity": "antigravity",
     }
     for callback, provider in expected.items():
         button = next(item for item in buttons if item.get("callback_data") == callback)
-        assert button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id(provider)
+        expected_id = ui.provider_custom_emoji_id(provider)
+        if expected_id:
+            assert button["icon_custom_emoji_id"] == expected_id
+        else:
+            assert "icon_custom_emoji_id" not in button
 
     _text, keyboard = status_alert_menu._main_text_and_kb()
     status_buttons = [

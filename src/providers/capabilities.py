@@ -205,3 +205,20 @@ XAI_OAUTH_CAPABILITIES = ProviderCapabilities(
     }),
     notes=("xAI/Grok OAuth uses https://api.x.ai/v1/responses with Bearer OAuth, SSE, and native web_search",),
 )
+
+
+ANTIGRAVITY_OAUTH_CAPABILITIES = ProviderCapabilities(
+    adapter_name="antigravity-oauth",
+    family="openai",
+    protocols=frozenset({"openai-responses"}),
+    transports=frozenset({"http", "sse"}),
+    passthrough_request_fields={"openai-responses": RESPONSES_REQ_ALLOWED},
+    native_state=frozenset({
+        "thought_signature_replay",
+        "session_id",
+    }),
+    notes=(
+        "Antigravity OAuth uses Cloud Code generateContent; Gemini JSON/SSE is "
+        "restored to standard Responses before the toolkit",
+    ),
+)

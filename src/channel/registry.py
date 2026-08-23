@@ -18,6 +18,7 @@ from .compatibility import normalize_mode, normalize_models
 from .cursor_oauth_channel import CursorOAuthChannel
 from .oauth_channel import OAuthChannel
 from .openai_oauth_channel import OpenAIOAuthChannel
+from .antigravity_oauth_channel import AntigravityOAuthChannel
 from .xai_oauth_channel import XAIOAuthChannel
 from .url_utils import (
     normalize_api_path,
@@ -62,6 +63,8 @@ def _rebuild_from_config_locked() -> None:
                 ch = OpenAIOAuthChannel(acc)
             elif provider == "xai":
                 ch = XAIOAuthChannel(acc)
+            elif provider == "antigravity":
+                ch = AntigravityOAuthChannel(acc)
             elif provider == "cursor":
                 ch = CursorOAuthChannel(acc)
             else:

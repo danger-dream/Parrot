@@ -39,7 +39,7 @@ def escape_html(s) -> str:
                   .replace(">", "&gt;"))
 
 
-_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️"}
+_PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨"}
 _PROVIDER_CUSTOM_EMOJI = {
     "claude": "5872779796257184592",
     "anthropic": "5872779796257184592",
@@ -47,8 +47,8 @@ _PROVIDER_CUSTOM_EMOJI = {
     "xai": "5819115571463068721",
     "cursor": "6062261319426390107",
 }
-_PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️"}
-_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor"}
+_PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
+_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity"}
 
 
 def _provider_key(provider: str | None) -> str:

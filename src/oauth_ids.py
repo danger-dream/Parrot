@@ -11,6 +11,8 @@ xAI 使用 ``xai:<subject>``；缺 subject 的导入/旧数据回退到
 ``xai:<email>``。历史临时格式 ``xai:<email>:<subject>`` 仍在解析路径兼容。
 Cursor 使用 access-token JWT 的稳定 ``sub``：``cursor:<subject>``；缺失时
 回退到账户展示 email。
+Antigravity 使用 ``antigravity:{email}:{project_id}``；缺 project_id 的
+条目不能作为正式身份保存。
 
 调用约定
 --------
@@ -89,6 +91,25 @@ def cursor_composite_identity(acc: dict) -> str:
     return cursor_subject(acc) or str(acc.get("email") or "").strip()
 
 
+def antigravity_project_id(acc: dict) -> str:
+    """Cloud Code ``cloudaicompanionProject`` used as part of the account key."""
+    return str(acc.get("project_id") or acc.get("projectId") or "").strip()
+
+
+def antigravity_composite_identity(acc: dict) -> str:
+    """Antigravity provider-local identity: ``email:project_id``.
+
+    ``project_id`` is required for a stable key. Email-only fallback exists
+    only so a malformed entry can still be diagnosed; ``add_account`` must
+    reject a missing project_id instead of persisting that fallback.
+    """
+    email = str(acc.get("email") or "").strip()
+    project_id = antigravity_project_id(acc)
+    if email and project_id:
+        return f"{email}:{project_id}"
+    return email
+
+
 def xai_composite_identity(acc: dict) -> str:
     """xAI provider-local identity string: `subject` when possible.
 
@@ -111,6 +132,8 @@ def account_identity(acc: dict) -> str:
         return xai_composite_identity(acc)
     if provider == "cursor":
         return cursor_composite_identity(acc)
+    if provider == "antigravity":
+        return antigravity_composite_identity(acc)
     return email
 
 
@@ -182,4 +205,6 @@ def is_account_key(value: Any) -> bool:
     if not isinstance(value, str) or ":" not in value:
         return False
     prov = value.split(":", 1)[0]
-    return _normalize_provider(prov) == prov and prov in ("claude", "openai", "xai", "cursor")
+    return _normalize_provider(prov) == prov and prov in (
+        "claude", "openai", "xai", "cursor", "antigravity",
+    )
