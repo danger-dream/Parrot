@@ -409,6 +409,38 @@ def test_cached_content_tokens_map_to_responses_usage(m):
     )
     assert other["request"]["sessionId"] != first["request"]["sessionId"]
 
+    pinned = codec.wrap_cloud_code(
+        codec.responses_to_gemini({
+            "instructions": "stable prefix",
+            "input": [{"type": "message", "role": "user", "content": "same first turn"}],
+        }),
+        model="gemini-3-flash",
+        project_id="proj-x",
+        session_id="client-session-a",
+    )
+    pinned_again = codec.wrap_cloud_code(
+        codec.responses_to_gemini({
+            "instructions": "stable prefix",
+            "input": [{"type": "message", "role": "user", "content": "different first turn"}],
+        }),
+        model="gemini-3-flash",
+        project_id="proj-x",
+        session_id="client-session-a",
+    )
+    other_session = codec.wrap_cloud_code(
+        codec.responses_to_gemini({
+            "instructions": "stable prefix",
+            "input": [{"type": "message", "role": "user", "content": "same first turn"}],
+        }),
+        model="gemini-3-flash",
+        project_id="proj-x",
+        session_id="client-session-b",
+    )
+    assert pinned["request"]["sessionId"] == pinned_again["request"]["sessionId"]
+    assert pinned["request"]["sessionId"] != first["request"]["sessionId"]
+    assert pinned["request"]["sessionId"] != other_session["request"]["sessionId"]
+    assert pinned["request"]["sessionId"].startswith("-")
+
 
 def test_function_call_roundtrip_and_channel_envelope(m):
     _setup(m)
@@ -472,6 +504,30 @@ def test_function_call_roundtrip_and_channel_envelope(m):
     assert restored["output"][0]["type"] == "function_call"
     assert restored["output"][0]["name"] == "lookup"
     assert json.loads(restored["output"][0]["arguments"]) == {"q": "x"}
+
+    same_key_a = asyncio.run(ch.build_upstream_request({
+        "model": "gemini-3.7-flash-high",
+        "prompt_cache_key": "conv-1",
+        "input": [{"type": "message", "role": "user", "content": "first opening"}],
+        "stream": False,
+    }, "gemini-3.7-flash-high", ingress_protocol="responses"))
+    same_key_b = asyncio.run(ch.build_upstream_request({
+        "model": "gemini-3.7-flash-high",
+        "prompt_cache_key": "conv-1",
+        "input": [{"type": "message", "role": "user", "content": "different opening"}],
+        "stream": False,
+    }, "gemini-3.7-flash-high", ingress_protocol="responses"))
+    other_key = asyncio.run(ch.build_upstream_request({
+        "model": "gemini-3.7-flash-high",
+        "prompt_cache_key": "conv-2",
+        "input": [{"type": "message", "role": "user", "content": "first opening"}],
+        "stream": False,
+    }, "gemini-3.7-flash-high", ingress_protocol="responses"))
+    sid_a = json.loads(same_key_a.body)["request"]["sessionId"]
+    sid_b = json.loads(same_key_b.body)["request"]["sessionId"]
+    sid_c = json.loads(other_key.body)["request"]["sessionId"]
+    assert sid_a == sid_b
+    assert sid_a != sid_c
 
 
 def test_tool_history_preserves_id_and_thought_signature(m):

@@ -43,6 +43,28 @@ def _wants_stream(body: dict) -> bool:
     return bool(body.get("stream"))
 
 
+def _session_anchor(requested_body: dict, payload: dict) -> str:
+    """Same idea as OpenAI session_id / xAI x-grok-conv-id: pin the conversation.
+
+    Prefer the client/prompt cache key over hashing the first user text. The
+    first-user fallback changes whenever the opening turn changes, which breaks
+    Antigravity session affinity for Claude Code / Responses clients.
+    """
+    for source in (payload, requested_body):
+        if not isinstance(source, dict):
+            continue
+        key = str(source.get("prompt_cache_key") or "").strip()
+        if key:
+            return key
+        metadata = source.get("metadata")
+        if isinstance(metadata, dict):
+            for field in ("session_id", "sessionId"):
+                value = str(metadata.get(field) or "").strip()
+                if value:
+                    return value
+    return str(cache_hints.anthropic_session_id(requested_body) or "").strip()
+
+
 class AntigravityOAuthChannel(Channel):
     """provider='antigravity' OAuth account, exposed as openai-responses."""
 
@@ -182,6 +204,7 @@ class AntigravityOAuthChannel(Channel):
             model=resolved_model,
             project_id=self.project_id,
             stream=stream,
+            session_id=_session_anchor(requested_body, payload),
         )
         translator_ctx["antigravity_stream"] = antigravity_codec.GeminiStreamToResponses(
             model=resolved_model,

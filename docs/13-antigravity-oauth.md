@@ -214,10 +214,10 @@ pong 不够。加深后确认：
 
 缓存（soarsky 实打）：
 
-- Gemini `cachedContentTokenCount` 已映射到 Responses `usage.input_tokens_details.cached_tokens`；Parrot 归一后 `cache_read` 会从 `input_tokens` 里扣掉。实测命中：`prompt=7931` → `cache_read=4076`，`input=3855`。
-- 这是上游隐式缓存，不是 Anthropic `cache_control` / OpenAI `prompt_cache_key`。`cache_control` 不会弄坏请求，但不会变成 Gemini 字段。
-- `sessionId` 仍按 CPA：对第一段 user 文本做稳定哈希。同一首轮不变则 session 不变。
-- 隐式命中不稳定：约 3.6k/4.8k prompt 的原样连打没有 `cachedContentTokenCount`；约 7.9k 的相同 system+user 才看到一次命中。换掉最后一轮 user 不会共享缓存。
+- Gemini `cachedContentTokenCount` 已映射到 Responses `usage.input_tokens_details.cached_tokens`；Parrot 归一后 `cache_read` 会从 `input_tokens` 里扣掉。
+- 连续 4 轮、约 7.2k prompt：单轮命中卡在约 4070 token（≈56%）。这是上游隐式缓存按约 4096 一块切，不是 session 每轮都变。约 3.5k 前缀连续 5 轮是 0%。
+- `sessionId` 已改成对齐 OpenAI / Grok：优先 `prompt_cache_key` / 客户端 session，不再只哈希第一段 user 文本。钉住后第 1 轮也能命中，4 轮合计从 42.2% 升到 56.2%；单轮天花板没有突破 4096。
+- Anthropic `cache_control` 不会变成 Gemini 字段；Claude 入口仍会经 `cache_hints` 补 `prompt_cache_key`，再写成 Antigravity sessionId。
 
 ## 13. 对照资源
 

@@ -375,6 +375,16 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
     return out
 
 
+def format_session_id(anchor: str) -> str:
+    """Map a client conversation anchor to Antigravity's negative int64 sessionId."""
+    text = str(anchor or "").strip()
+    if not text:
+        return ""
+    digest = hashlib.sha256(f"parrot:antigravity:session\x00{text}".encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+    return f"-{value}"
+
+
 def _stable_session_id(gemini: dict) -> str:
     contents = gemini.get("contents")
     if isinstance(contents, list):
@@ -402,6 +412,7 @@ def wrap_cloud_code(
     model: str,
     project_id: str,
     stream: bool = False,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Wrap a Gemini generateContent body in the Cloud Code envelope (CPA geminiToAntigravity)."""
     request = dict(gemini or {})
@@ -409,7 +420,7 @@ def wrap_cloud_code(
     request.pop("safetySettings", None)
     request.pop("safety_settings", None)
     if not request.get("sessionId") and not is_image_model(model):
-        request["sessionId"] = _stable_session_id(request)
+        request["sessionId"] = format_session_id(session_id) or _stable_session_id(request)
 
     image = is_image_model(model)
     claude = "claude" in str(model or "").lower()
