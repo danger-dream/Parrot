@@ -212,6 +212,13 @@ pong 不够。加深后确认：
 
 `6768656` 仍跳过。远端不推。
 
+缓存（soarsky 实打）：
+
+- Gemini `cachedContentTokenCount` 已映射到 Responses `usage.input_tokens_details.cached_tokens`；Parrot 归一后 `cache_read` 会从 `input_tokens` 里扣掉。实测命中：`prompt=7931` → `cache_read=4076`，`input=3855`。
+- 这是上游隐式缓存，不是 Anthropic `cache_control` / OpenAI `prompt_cache_key`。`cache_control` 不会弄坏请求，但不会变成 Gemini 字段。
+- `sessionId` 仍按 CPA：对第一段 user 文本做稳定哈希。同一首轮不变则 session 不变。
+- 隐式命中不稳定：约 3.6k/4.8k prompt 的原样连打没有 `cachedContentTokenCount`；约 7.9k 的相同 system+user 才看到一次命中。换掉最后一轮 user 不会共享缓存。
+
 ## 13. 对照资源
 
 - CPA 源码：`/opt/workspace/CLIProxyAPI`

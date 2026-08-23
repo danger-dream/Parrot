@@ -367,6 +367,49 @@ def test_gemini_json_and_sse_restore(m):
     assert '"delta":"B"' in both
 
 
+def test_cached_content_tokens_map_to_responses_usage(m):
+    codec = m["codec"]
+    out = codec.gemini_to_responses({
+        "response": {
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}]},
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5000,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 5008,
+                "cachedContentTokenCount": 4500,
+            },
+        }
+    }, model="gemini-3-flash")
+    assert out["usage"]["input_tokens"] == 5000
+    assert out["usage"]["input_tokens_details"]["cached_tokens"] == 4500
+
+    from src.protocols.usage import select_openai_responses_usage
+    legacy = select_openai_responses_usage(out).legacy_dict()
+    assert legacy["cache_read"] == 4500
+    assert legacy["input_tokens"] == 500
+    assert legacy["input_tokens"] + legacy["cache_read"] == 5000
+
+    gemini = codec.responses_to_gemini({
+        "instructions": "stable prefix",
+        "input": [{"type": "message", "role": "user", "content": "same first turn"}],
+    })
+    first = codec.wrap_cloud_code(gemini, model="gemini-3-flash", project_id="proj-x")
+    second = codec.wrap_cloud_code(gemini, model="gemini-3-flash", project_id="proj-x")
+    assert first["request"]["sessionId"] == second["request"]["sessionId"]
+    other = codec.wrap_cloud_code(
+        codec.responses_to_gemini({
+            "instructions": "stable prefix",
+            "input": [{"type": "message", "role": "user", "content": "different first turn"}],
+        }),
+        model="gemini-3-flash",
+        project_id="proj-x",
+    )
+    assert other["request"]["sessionId"] != first["request"]["sessionId"]
+
+
 def test_function_call_roundtrip_and_channel_envelope(m):
     _setup(m)
     codec = m["codec"]
