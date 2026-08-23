@@ -159,13 +159,34 @@ SSE 文本是增量还是累计，必须用真实录制 fixture 确认，不能�
 
 429：
 
-- `<3s`：同账户短重试
-- `3s–5m`：账户+模型冷却
-- `QUOTA_EXHAUSTED` / `≥5m` / `INSUFFICIENT_G1_CREDITS_BALANCE`：整账户 `disabled_reason=quota`
+- `<3s`：同账户短重试（受请求 deadline、全请求共享 `retry.transient.maxExtraAttempts` 和 `antigravityRateLimit` 开关约束）
+- `3s–5m`：账户+模型冷却，不在请求协程中 sleep
+- `QUOTA_EXHAUSTED` / `≥5m` / `INSUFFICIENT_G1_CREDITS_BALANCE`：整账户 `disabled_reason=quota`，推进 quota observation generation
+- parser/策略均以 `provider=antigravity` 为边界；普通 5xx、auth、支付错误不会进入该状态机
 
 `loadCodeAssist` 至少 10 分钟节流。`known=false` 不恢复、不当 0%。
 
 联调拉 credits 用当前 access_token，不 refresh。
+
+## 7.1 OpenAI Images API 参数矩阵
+
+公开入口保持 `POST /v1/images/generations`（及无 `/v1` 的兼容路由），仅当 `model` 命中 Antigravity `imageModels` 时选择该账号池；编辑路由明确拒绝。
+
+| OpenAI 参数 | Antigravity 行为 |
+|---|---|
+| `model` | 必须命中账号/全局 `imageModels`；选择仍服从 enabled、quota disabled、并发和 `(账号,模型)` cooldown |
+| `prompt` | Gemini user text part |
+| `n` | `generationConfig.candidateCount`，支持 1–4；响应逐 candidate 恢复 inlineData |
+| `size=auto/1024x1024/1536x1024/1024x1536` | 默认 / `imageConfig.aspectRatio=1:1/3:2/2:3`；其他值 400 |
+| `quality=auto/standard/hd/high` | 默认 / `imageSize=1K/2K`；其他值 400 |
+| `response_format=b64_json/url` | 原始 base64 / 带实际上游 MIME 的 data URL |
+| `output_format` | 上游实测不保证请求格式（可返回 JPEG），因此任何显式值均 400，不伪装支持 |
+| `style/background/moderation/input_fidelity/output_compression/partial_images` | 400 unsupported，不静默忽略 |
+| edits、mask、输入参考图 | 当前 Antigravity Images 路径 400 unsupported |
+
+响应体硬上限 110 MiB、总请求超时 180 秒；上游 `usageMetadata` 原样放入 `usage`。
+
+Chat/Responses 中普通远程 `input_image` 只允许 HTTPS；每跳 DNS/redirect 都校验公网地址，允许 JPEG/PNG/WebP/GIF，校验 MIME+magic，单文件原始数据上限 100 MiB（base64 后约 133.4 MiB 请求内存），超限或下载失败明确拒绝。
 
 ## 8. TG
 

@@ -21,7 +21,7 @@ from src.telegram.menus import (  # noqa: E402
 )
 
 
-PROVIDERS = ("claude", "openai", "xai", "cursor")
+PROVIDERS = ("claude", "openai", "xai", "cursor", "antigravity")
 
 
 def test_provider_and_family_helpers_emit_custom_icons():

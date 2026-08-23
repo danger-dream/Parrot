@@ -19,6 +19,7 @@ from .protocols.matrix import (
     extract_request_features,
 )
 from .protocols.runtime import retry_body_without_encrypted_content
+from .openai import compaction_owner
 
 
 class ScheduleResult:
@@ -232,12 +233,16 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         if owner_resolved_model and owner_resolved_model == bound_model:
             bound_channel_key = candidate_key
 
-    # Opaque encrypted reasoning is portable only to its exact bound owner.
-    # Without ownership proof every candidate must receive a stripped copy; this
-    # is a safe account switch, not a request-format error.
-    portable_body, encrypted_content_count = retry_body_without_encrypted_content(body)
-    if encrypted_content_count <= 0:
-        portable_body = None
+    # A complete Codex compaction is indivisible opaque owner state.  Unlike
+    # ordinary reasoning EC it must never enter the portable/stripping path.
+    compaction_refs = compaction_owner.complete_refs(body)
+    portable_body: Optional[dict] = None
+    if compaction_refs:
+        encrypted_content_count = 0
+    else:
+        portable_body, encrypted_content_count = retry_body_without_encrypted_content(body)
+        if encrypted_content_count <= 0:
+            portable_body = None
 
     exclusions: list[dict] = []
     candidates, saturated, route_plans, guard_errors = _filter_candidates(
@@ -248,6 +253,43 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
         bound_channel_key=bound_channel_key,
         portable_body=portable_body,
     )
+    if compaction_refs:
+        eligible_channels = [ch for ch, _ in candidates + saturated]
+        try:
+            owner = compaction_owner.select_owner(
+                compaction_refs,
+                eligible_channels,
+                exact_channel_key=bound_channel_key,
+                live_channels=registry.all_channels(),
+            )
+        except compaction_owner.CompactionRouteError as exc:
+            guard_errors.append(str(exc))
+            return ScheduleResult(
+                [], fp_query, False,
+                client_key=client_key,
+                guard_errors=guard_errors,
+                exclusions=exclusions,
+                encrypted_content_count=0,
+            )
+        owner_available = [(ch, model) for ch, model in candidates if ch is owner]
+        owner_saturated = [(ch, model) for ch, model in saturated if ch is owner]
+        if not owner_available and not owner_saturated:
+            guard_errors.append(
+                "compaction_owner_unavailable: the recorded or bootstrap OpenAI OAuth owner is unavailable"
+            )
+            return ScheduleResult(
+                [], fp_query, False,
+                client_key=client_key,
+                guard_errors=guard_errors,
+                exclusions=exclusions,
+                encrypted_content_count=0,
+            )
+        candidates, saturated = owner_available, owner_saturated
+        bound_channel_key = owner.key
+        route_plans = {
+            key: plan for key, plan in route_plans.items() if key[0] == owner.key
+        }
+
     if not candidates and not saturated:
         return ScheduleResult(
             [], fp_query, False,

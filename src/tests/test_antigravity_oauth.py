@@ -14,6 +14,7 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -210,6 +211,24 @@ def test_credits_unknown_is_not_zero_and_does_not_resume(m):
     assert parsed["known"] is False
     assert parsed["tier"] == "pro"
 
+    live_unknown = ag.parse_credits({
+        "currentTier": {"id": "standard-tier", "name": "Antigravity"},
+        "paidTier": {
+            "id": "g1-pro-tier",
+            "name": "Google AI Pro",
+            "description": "Google AI Pro",
+            "availableCredits": [{
+                "creditType": "GOOGLE_ONE_AI",
+                "minimumCreditAmountForUsage": "50",
+            }],
+        },
+    })
+    assert live_unknown["known"] is False
+    assert live_unknown["tier"] == "g1-pro-tier"
+    assert live_unknown["tier_name"] == "Google AI Pro"
+    assert live_unknown["minimum_credit_amount"] == 50.0
+    assert live_unknown.get("credit_amount") is None
+
     parsed = ag.parse_credits({
         "paidTier": {
             "id": "pro",
@@ -275,7 +294,10 @@ def test_mock_usage_and_fetch_dispatch(m):
     usage = m["ag"].fetch_usage_sync("at")
     assert usage["antigravity"]["known"] is True
     assert usage["antigravity"]["available"] is True
-    assert usage["five_hour"] == {}
+    # mock 模式下 quota summary 返回模拟分组，填充标准 5h/7d 窗口
+    assert usage["five_hour"]["utilization"] == 25.0
+    assert usage["seven_day"]["utilization"] == 10.0
+    assert usage["antigravity"].get("quota_groups")
 
     import asyncio
     fetched = asyncio.run(om.fetch_usage("antigravity:u@gmail.com:proj-u"))
@@ -725,7 +747,8 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
             "antigravity": {
                 "known": True,
                 "quota_supported": True,
-                "tier": "GOOGLE_ONE_AI",
+                "tier": "g1-pro-tier",
+                "tier_name": "Google AI Pro",
                 "credit_amount": 12,
                 "minimum_credit_amount": 1,
                 "available": True,
@@ -733,10 +756,108 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
         }),
     }, email="cred@gmail.com")
     text = m["oauth_menu"]._format_antigravity_credits_block(ak, detail=True)
-    assert "Credits: 12（最低 1）· 可用" in text
+    assert "🪙 Credits: 12（最低 1） · 可用" in text
     assert "5h" not in text
     assert "$" not in text
-    assert "Project: <code>proj-cred</code>" in text
+    listing = m["oauth_menu"]._format_account_block(m["oauth_manager"].get_account(ak))
+    assert "🏷️ 套餐: <code>Google AI Pro</code>" in listing
+    assert "🪙 Credits: 12（最低 1） · 可用" in listing
+    assert "💎 月度: <i>暂无本地请求</i>" in listing
+    used = m["oauth_menu"]._format_account_block(
+        m["oauth_manager"].get_account(ak),
+        month_snapshot={
+            "by_channel": {
+                f"oauth:{ak}": {
+                    "total": 3,
+                    "success_count": 3,
+                    "error_count": 0,
+                    "input": 1000,
+                    "output": 200,
+                    "cache_creation": 0,
+                    "cache_read": 400,
+                    "avg_tps": 12.5,
+                    "max_tps": 30.0,
+                    "min_tps": 2.0,
+                    "costed_success": 1,
+                    "unpriced_success": 0,
+                }
+            }
+        },
+    )
+    assert "💎 月度:" in used
+    assert "⚡ TPS:" in used
+    assert "💵" in used
+    assert "暂无本地请求" not in used
+    detail, _kb = m["oauth_menu"]._detail_text_and_kb(ak, refresh_quota=False)
+    assert detail is not None
+    assert "🏷️ 套餐: <code>Google AI Pro</code>" in detail
+    assert "Project: <code>proj-cred</code>" in detail
+    assert "🧬 模型目录:" in detail
+    assert "个文本" in detail
+    assert "⚡ 本月使用统计" in detail
+    assert "暂无本地请求" in detail
+
+
+def test_refresh_notice_uses_antigravity_credits(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account_if_identity_absent({
+        "provider": "antigravity",
+        "email": "notice@gmail.com",
+        "project_id": "proj-notice",
+        "access_token": "at",
+        "refresh_token": "rt",
+        "expired": _future_expired(),
+        "enabled": True,
+    })
+    ak = "antigravity:notice@gmail.com:proj-notice"
+
+    unknown = om._build_refresh_notice(ak, None, usage={
+        "antigravity": {
+            "known": False,
+            "quota_supported": True,
+            "tier": "g1-pro-tier",
+            "tier_name": "Google AI Pro",
+            "minimum_credit_amount": 50,
+        }
+    })
+    assert "📊" not in unknown
+    assert "Credits" not in unknown
+    assert "套餐:" not in unknown
+    assert "g1-pro-tier" not in unknown
+    assert "本次未拉取到" not in unknown
+    assert "5h" not in unknown
+    assert "7d" not in unknown
+
+    fallback = om._build_refresh_notice(ak, None, usage={
+        "antigravity": {
+            "known": False,
+            "quota_supported": True,
+            "tier": "g1-pro-tier",
+        }
+    })
+    assert "📊" not in fallback
+    assert "Credits" not in fallback
+
+    known = om._build_refresh_notice(ak, None, usage={
+        "antigravity": {
+            "known": True,
+            "quota_supported": True,
+            "tier": "g1-pro-tier",
+            "tier_name": "Google AI Pro",
+            "credit_amount": 12,
+            "minimum_credit_amount": 1,
+            "available": True,
+        }
+    })
+    assert "📊 Credits: 12（最低 1） · 可用" in known
+    assert "套餐:" not in known
+    assert "本次未拉取到" not in known
+
+    failed = om._build_refresh_notice(ak, None)
+    assert "📊" not in failed
+    assert "获取失败" not in failed
+    assert "本次未拉取到" not in failed
 
 
 def test_cpa_type_field_imports_as_antigravity(m):
@@ -916,7 +1037,9 @@ def test_antigravity_429_reads_retry_delay_and_quota_reason(m):
             }
         }),
     )
-    attached = _attach_retry_after_from_response(result, None)
+    attached = _attach_retry_after_from_response(
+        result, None, SimpleNamespace(provider="antigravity"),
+    )
     assert attached.retry_after_seconds == 12
     assert attached.cooldown_until is not None
 
@@ -929,3 +1052,221 @@ def test_antigravity_429_reads_retry_delay_and_quota_reason(m):
     classified = bounded_account_quota_error(exhausted)
     assert classified is not None
     assert classified["classification"] == "quota_exhausted"
+
+
+def _add_ag_account(om, email="state@gmail.com", project="proj-state", **extra):
+    account = {
+        "provider": "antigravity", "email": email, "project_id": project,
+        "access_token": "at", "refresh_token": "rt", "expired": _future_expired(),
+        "enabled": True,
+    }
+    account.update(extra)
+    om.add_account(account)
+    return f"antigravity:{email}:{project}"
+
+
+def test_antigravity_windows_and_credits_share_quota_state_machine(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    ak = _add_ag_account(om)
+    exhausted_window = {
+        "antigravity": {"known": False, "quota_supported": True},
+        "five_hour": {"utilization": 96, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 20, "resets_at": "2099-01-07T00:00:00Z"},
+    }
+    first = om.evaluate_and_toggle_by_usage(ak, exhausted_window, threshold=95, fresh=True)
+    assert first["action"] == "disabled"
+    assert first["hit_windows"] == ["5h"]
+    assert first["disabled_until"] == "2099-01-01T00:00:00Z"
+    assert om.get_account(ak)["disabled_reason"] == "quota"
+    assert om.evaluate_and_toggle_by_usage(ak, exhausted_window, threshold=95)["action"] == "still_over_quota"
+
+    # Credits success is not proof that an independently exhausted 5h/weekly
+    # window recovered when retrieveUserQuotaSummary failed in this refresh.
+    partial = {
+        "antigravity": {
+            "known": True,
+            "available": True,
+            "quota_error": {"kind": "server_error", "http_status": 503},
+        },
+    }
+    assert om.evaluate_and_toggle_by_usage(
+        ak, partial, threshold=95, fresh=True,
+    )["action"] == "quota_partial_keep_disabled"
+    assert om.get_account(ak)["enabled"] is False
+
+    recovered = {
+        "antigravity": {"known": False, "quota_supported": True},
+        "five_hour": {"utilization": 5}, "seven_day": {"utilization": 10},
+    }
+    assert om.evaluate_and_toggle_by_usage(ak, recovered, threshold=95, fresh=False)["action"] == "quota_stale_keep_disabled"
+    assert om.evaluate_and_toggle_by_usage(ak, recovered, threshold=95, fresh=True)["action"] == "resumed"
+    assert om.get_account(ak)["enabled"] is True
+
+    # Either reliable source can gate routing; an available Credits pool cannot
+    # override an exhausted window, and low windows cannot override exhausted Credits.
+    over_with_credits = {**exhausted_window, "antigravity": {"known": True, "available": True}}
+    assert om.evaluate_and_toggle_by_usage(ak, over_with_credits, threshold=95)["action"] == "disabled"
+    low_exhausted_credits = {**recovered, "antigravity": {"known": True, "available": False}}
+    result = om.evaluate_and_toggle_by_usage(ak, low_exhausted_credits, threshold=95)
+    assert result["action"] == "still_over_quota"
+    assert result["hit_windows"] == ["Credits"]
+    assert result["disabled_until"] == "2099-01-01T00:00:00Z"  # existing target is not moved
+
+
+def test_antigravity_manual_disable_is_never_overwritten(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    ak = _add_ag_account(om, email="manual@gmail.com", project="manual", enabled=False,
+                         disabled_reason="user")
+    available = {"antigravity": {"known": True, "available": True},
+                 "five_hour": {"utilization": 0}, "seven_day": {"utilization": 0}}
+    assert om.evaluate_and_toggle_by_usage(ak, available, fresh=True)["action"] == "noop_user"
+    assert om.get_account(ak)["enabled"] is False
+    assert om.get_account(ak)["disabled_reason"] == "user"
+
+
+class _QuotaResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _QuotaHttpError(Exception):
+    def __init__(self, status_code, payload):
+        super().__init__(f"HTTP {status_code}")
+        self.response = _QuotaResponse(status_code, payload)
+
+
+@pytest.mark.parametrize("status,kind", [
+    (401, "unauthorized"), (403, "forbidden"), (429, "rate_limited"), (503, "server_error"),
+])
+def test_quota_summary_http_errors_are_structured(m, status, kind):
+    error = m["ag"]._safe_quota_error(_QuotaHttpError(status, {
+        "error": {"code": status, "status": "PERMISSION_DENIED", "message": "safe message"}
+    }))
+    assert error["kind"] == kind
+    assert error["http_status"] == status
+    assert error["message"] == "safe message"
+
+
+def test_quota_summary_validation_timeout_and_network_are_safe(m):
+    validation = m["ag"]._safe_quota_error(_QuotaHttpError(403, {"error": {
+        "code": 403, "status": "PERMISSION_DENIED", "message": "VALIDATION_REQUIRED https://secret.example/token",
+        "details": [{"reason": "VALIDATION_REQUIRED", "metadata": {"validation_url": "https://secret.example/token"}}],
+    }}))
+    assert validation["kind"] == "validation_required"
+    assert validation["validation_required"] is True
+    assert validation["hint"]
+    assert "secret.example" not in json.dumps(validation)
+    assert m["ag"]._safe_quota_error(TimeoutError("slow"))["kind"] == "timeout"
+    assert m["ag"]._safe_quota_error(ConnectionError("offline"))["kind"] == "network"
+
+
+def test_antigravity_partial_cache_and_error_ui(m):
+    _setup(m)
+    om, db, menu = m["oauth_manager"], m["state_db"], m["oauth_menu"]
+    ak = _add_ag_account(om, email="partial@gmail.com", project="partial")
+    groups = [{"display_name": "Gemini", "buckets": [{
+        "window": "5h", "remaining_fraction": .5, "reset_time": "2099-01-01T00:00:00Z"
+    }]}]
+    old = {"antigravity": {"known": False, "quota_groups": groups}}
+    db.quota_save(ak, om.flatten_usage(old), email="partial@gmail.com")
+    partial = {"antigravity": {"known": True, "available": True,
+                                "quota_error": {"kind": "rate_limited", "http_status": 429}}}
+    merged = om.preserve_antigravity_cached_summary(ak, partial)
+    assert merged["antigravity"]["quota_groups"] == groups
+    assert merged["antigravity"]["quota_groups_stale"] is True
+    db.quota_save(ak, om.flatten_usage(merged), email="partial@gmail.com")
+    detail = menu._format_antigravity_credits_block(ak, detail=True)
+    assert "旧数据已保留" in detail
+    assert "429" in detail
+    assert "403/校验" not in detail
+
+
+def test_antigravity_telegram_list_and_detail_stay_within_limit(m):
+    _setup(m)
+    om, db, menu = m["oauth_manager"], m["state_db"], m["oauth_menu"]
+    groups = []
+    for gi in range(18):
+        groups.append({
+            "display_name": f"Upstream group {gi} " + ("模型" * 24),
+            "buckets": [{
+                "window": window, "remaining_fraction": .42,
+                "reset_time": "2099-01-01T00:00:00Z",
+            } for window in ("5h", "weekly", "daily")],
+        })
+    keys = []
+    for idx in range(4):
+        ak = _add_ag_account(om, email=f"boundary{idx}@gmail.com", project=f"p{idx}")
+        keys.append(ak)
+        usage = {"antigravity": {"known": True, "available": True,
+                                  "tier_name": "Google AI Pro", "credit_amount": 10,
+                                  "minimum_credit_amount": 1, "quota_groups": groups}}
+        db.quota_save(ak, om.flatten_usage(usage), email=f"boundary{idx}@gmail.com")
+    list_text, _ = menu._list_text_and_kb(page=1, month_snapshot={"by_channel": {}})
+    detail_text, _ = menu._detail_text_and_kb(keys[0], refresh_quota=False,
+                                               month_snapshot={"by_channel": {}})
+    assert len(list_text) <= m["ui"].TG_MSG_LIMIT
+    assert len(detail_text) <= m["ui"].TG_MSG_LIMIT
+    assert "其余配额组已省略" in list_text
+    assert "其余配额组已省略" in detail_text
+
+
+@pytest.mark.parametrize("usage,expected,unexpected", [
+    ({"antigravity": {"known": True, "available": True, "quota_groups": [
+        {"display_name": "Gemini", "buckets": [{"window": "5h", "remaining_fraction": .8}]}
+    ]}}, "均已更新", "部分成功"),
+    ({"antigravity": {"known": True, "available": True,
+                       "quota_error": {"kind": "server_error", "http_status": 503}}},
+     "部分成功", "均已更新"),
+    ({"antigravity": {"known": False,
+                       "quota_error": {"kind": "timeout"}}},
+     "未获取到有效 quota 数据", "✅"),
+])
+def test_antigravity_manual_refresh_feedback(m, monkeypatch, usage, expected, unexpected):
+    _setup(m)
+    om, menu = m["oauth_manager"], m["oauth_menu"]
+    ak = _add_ag_account(om, email="refresh@gmail.com", project="refresh")
+    recorder = _ApiRecorder()
+    m["ui"].api = recorder
+    monkeypatch.setattr(menu, "_account_key_from_short", lambda _short: ak)
+    monkeypatch.setattr(menu, "_fetch_and_save_usage_result_sync",
+                        lambda *_args, **_kwargs: {"usage": usage})
+    monkeypatch.setattr(menu, "_detail_text_and_kb",
+                        lambda *_args, **_kwargs: ("DETAIL", {"inline_keyboard": []}))
+    menu.on_refresh_usage(1, 10, "cb", "short")
+    rendered = (recorder.last("editMessageText") or {}).get("text", "")
+    assert expected in rendered
+    assert unexpected not in rendered
+    assert "403/校验要求" not in rendered
+
+
+def test_quota_summary_failure_does_not_break_credits_success(m, monkeypatch):
+    ag = m["ag"]
+    monkeypatch.setattr(ag, "load_code_assist_sync", lambda _token: {"paidTier": {
+        "id": "pro", "availableCredits": [{"creditType": "GOOGLE_ONE_AI",
+        "creditAmount": "12", "minimumCreditAmountForUsage": "1"}],
+    }})
+    monkeypatch.setattr(ag, "fetch_quota_summary_sync",
+                        lambda _token: (_ for _ in ()).throw(TimeoutError("slow endpoint")))
+    usage = ag.fetch_usage_sync("token-not-logged")
+    assert usage["antigravity"]["known"] is True
+    assert usage["antigravity"]["available"] is True
+    assert usage["antigravity"]["quota_error"]["kind"] == "timeout"
+    assert not usage["five_hour"]
+    assert not usage["seven_day"]
+
+
+def test_quota_error_ui_distinguishes_validation_and_http_classes(m):
+    menu = m["oauth_menu"]
+    assert "Google 账号验证" in menu._ag_quota_error_html({"kind": "validation_required"})
+    assert "401" in menu._ag_quota_error_html({"kind": "unauthorized"})
+    assert "403" in menu._ag_quota_error_html({"kind": "forbidden"})
+    assert "429" in menu._ag_quota_error_html({"kind": "rate_limited"})
+    assert "5xx" in menu._ag_quota_error_html({"kind": "server_error"})
+    assert "超时" in menu._ag_quota_error_html({"kind": "timeout"})
+    assert "网络" in menu._ag_quota_error_html({"kind": "network"})

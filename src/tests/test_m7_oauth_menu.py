@@ -446,6 +446,8 @@ def test_settings_usage_display_mode_toggle(m):
     assert "🎨 <b>媒体能力</b>" in settings["text"]
     assert "GPT / Codex 图片:" in settings["text"]
     assert "Grok Imagine: 图片 <b>2</b> · 视频 <b>2</b>" in settings["text"]
+    assert "Antigravity" in settings["text"]
+    assert "Antigravity 出图:" in settings["text"]
     assert "tg-emoji" in settings["text"]
     assert "📊 <b>用量显示模式</b>" in settings["text"]
     assert "当前模式: 已使用量" in settings["text"]

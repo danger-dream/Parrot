@@ -372,10 +372,10 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
 
         if typ == "reasoning":
             text = _text_from_content(item.get("summary") or item.get("content"))
-            if not text:
+            signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
+            if not text and not signature:
                 continue
             part: dict[str, Any] = {"text": text, "thought": True}
-            signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
             if signature:
                 part["thoughtSignature"] = signature
             contents.append({"role": "model", "parts": [part]})

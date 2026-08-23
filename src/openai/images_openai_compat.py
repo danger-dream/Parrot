@@ -31,6 +31,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .. import apikey_limiter, auth, errors
+from ..antigravity import images as antigravity_images
 from ..xai import imagine as xai_imagine
 from .images_simple import (
     UpstreamImageError,
@@ -436,9 +437,18 @@ async def _run_handler(request: Request, *, action: str) -> JSONResponse:
             param="image",
         )
 
-    # The standard Images routes are shared.  Only explicitly configured Grok
-    # Imagine models select xAI; every other model keeps the existing GPT/Codex
-    # image pipeline unchanged.
+    # The standard Images routes are shared. Explicitly configured provider
+    # media models select their native OAuth runtime; all other models retain
+    # the existing GPT/Codex image pipeline.
+    if antigravity_images.is_antigravity_image_model(parsed.model):
+        assert key_name is not None
+        return await antigravity_images.handle_image(
+            parsed, action=action, key_name=key_name, allowed_models=allowed_models,
+        )
+    if antigravity_images.looks_like_antigravity_image_model(parsed.model):
+        return _bad_request(
+            f"unsupported Antigravity image model {parsed.model!r}", param="model",
+        )
     if xai_imagine.is_xai_image_model(parsed.model):
         assert key_name is not None
         return await xai_imagine.handle_image(

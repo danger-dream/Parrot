@@ -660,7 +660,10 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     ws = FakeWebSocket({
         "type": "response.create",
         "model": "test-model",
-        "input": "hello",
+        "input": [
+            {"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"},
+            {"type": "message", "role": "user", "content": "hello"},
+        ],
         "stream": True,
         "temperature": 0.9,
         "prompt_cache_key": "shared-anchor",
@@ -668,7 +671,9 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     })
     fake_upstream = FakeUpstreamWebSocket([
         {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
-        {"type": "response.completed", "response": {"id": "resp_o", "output": [], "usage": {}}},
+        {"type": "response.completed", "response": {"id": "resp_o", "output": [
+            {"type": "compaction", "id": "cmp_downstream_out", "encrypted_content": "downstream-out-cipher"},
+        ], "usage": {}}},
     ])
 
     captured: dict[str, Any] = {}
@@ -692,7 +697,10 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     assert upstream_first["model"] == "test-model"
     assert upstream_first["store"] is False
     assert upstream_first["stream"] is True
-    assert upstream_first["input"] == [{"type": "message", "role": "user", "content": "hello"}]
+    assert upstream_first["input"] == [
+        {"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"},
+        {"type": "message", "role": "user", "content": "hello"},
+    ]
     assert upstream_first["client_metadata"] == {"a": "b"}
     # Frame and handshake identities share the same isolated session anchor.
     assert upstream_first["prompt_cache_key"] == captured["headers"]["session-id"]
@@ -700,6 +708,12 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     assert captured["headers"]["session-id"] != "shared-anchor"
     assert "temperature" not in upstream_first
     assert not ws.close_calls
+    for value in (
+        {"input": [{"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"}]},
+        {"output": [{"type": "compaction", "id": "cmp_downstream_out", "encrypted_content": "downstream-out-cipher"}]},
+    ):
+        ref = m["responses_ws"].compaction_owner.complete_refs(value)[0]
+        assert m["state_db"].compaction_owner_load(ref.compaction_id, ref.content_digest)
 
 
 @pytest.mark.asyncio
@@ -1719,7 +1733,7 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
     assert not ws.close_calls
 
 @pytest.mark.asyncio
-async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch, m):
+async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch, caplog, m):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
@@ -1734,7 +1748,10 @@ async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch,
         {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
         {"type": "response.completed", "response": {
             "id": "resp_http_ws",
-            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "output": [
+                {"type": "compaction", "id": "cmp_ws_nonstream_out", "encrypted_content": "ws-nonstream-out-cipher"},
+                {"type": "message", "content": [{"type": "output_text", "text": "ok"}]},
+            ],
             "usage": {"input_tokens": 4, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 1}},
         }},
     ])
@@ -1747,18 +1764,26 @@ async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch,
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
     monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
-    body = {"model": "test-model", "stream": False, "input": "hello", "prompt_cache_key": "anchor"}
-    resp, rid = await _call_failover_responses(m, ch, body)
+    body = {"model": "test-model", "stream": False, "input": [
+        {"type": "compaction", "id": "cmp_ws_nonstream_in", "encrypted_content": "ws-nonstream-in-cipher"},
+        {"type": "message", "role": "user", "content": "hello"},
+    ], "prompt_cache_key": "anchor"}
+    resp, rid = await _call_failover_responses(
+        m, ch, body, bound_channel_key=ch.key,
+    )
 
     assert resp.status_code == 200
-    assert json.loads(resp.body)["output"][0]["content"][0]["text"] == "ok"
+    assert json.loads(resp.body)["output"][1]["content"][0]["text"] == "ok"
+    for value in (body, json.loads(resp.body)):
+        ref = m["responses_ws"].compaction_owner.complete_refs(value)[0]
+        assert m["state_db"].compaction_owner_load(ref.compaction_id, ref.content_digest)
     assert captured["url"] == "wss://chatgpt.com/backend-api/codex/responses"
     assert captured["headers"]["OpenAI-Beta"] == "responses_websockets=2026-02-06"
     assert captured["headers"]["session-id"] == captured["headers"]["thread-id"]
     sent = json.loads(fake_ws.sent[0])
     assert sent["type"] == "response.create"
     assert sent["store"] is False and sent["stream"] is True
-    assert sent["input"] == [{"type": "message", "role": "user", "content": "hello"}]
+    assert sent["input"] == body["input"]
     row = m["log_db"].log_detail(rid)["log"]
     assert row["status"] == "success"
     assert row["final_channel_key"] == ch.key
@@ -1768,9 +1793,34 @@ async def test_http_responses_uses_oauth_ws_when_enabled_non_stream(monkeypatch,
     assert row["input_tokens"] == 3
     assert row["cache_read_tokens"] == 1
 
+    # Owner storage is auxiliary: DB failure cannot overturn this successful
+    # non-stream response or its success log.
+    monkeypatch.setattr(
+        m["state_db"], "compaction_owner_upsert",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("owner db unavailable")),
+    )
+    fake_ws = FakeOAuthHttpWs([{"type": "response.completed", "response": {
+        "id": "resp_db_failure", "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }}])
+    failed_persist_body = {"model": "test-model", "stream": False, "input": [
+        {"type": "compaction", "id": "cmp_db_failure_nonstream", "encrypted_content": "db-failure-nonstream"},
+    ]}
+    with caplog.at_level("WARNING", logger="src.openai.compaction_owner"):
+        response, failure_rid = await _call_failover_responses(
+            m, ch, failed_persist_body, bound_channel_key=ch.key,
+        )
+    assert response.status_code == 200
+    assert m["log_db"].log_detail(failure_rid)["log"]["status"] == "success"
+    assert any(
+        r.message == "codex_compaction_owner_persist_failed"
+        and r.path == "oauth_upstream_ws_non_stream"
+        for r in caplog.records
+    )
+
 
 @pytest.mark.asyncio
-async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch, m):
+async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch, caplog, m):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
@@ -1784,7 +1834,10 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
         {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
         {"type": "response.completed", "response": {
             "id": "resp_stream",
-            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "output": [
+                {"type": "compaction", "id": "cmp_ws_stream_out", "encrypted_content": "ws-stream-out-cipher"},
+                {"type": "message", "content": [{"type": "output_text", "text": "ok"}]},
+            ],
             "usage": {"input_tokens": 2, "output_tokens": 1},
         }},
     ])
@@ -1794,12 +1847,15 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
     monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
-    body = {"model": "test-model", "stream": True, "input": "hello", "prompt_cache_key": "anchor"}
+    body = {"model": "test-model", "stream": True, "input": [
+        {"type": "compaction", "id": "cmp_ws_stream_in", "encrypted_content": "ws-stream-in-cipher"},
+        {"type": "message", "role": "user", "content": "hello"},
+    ], "prompt_cache_key": "anchor"}
     stable_fp = "stable-oauth-ws-complete"
     old_owner = "oauth:old-owner"
     m["affinity"].upsert(stable_fp, old_owner, "test-model")
     resp, rid = await _call_failover_responses(
-        m, ch, body, fp_query=stable_fp, bound_channel_key=old_owner,
+        m, ch, body, fp_query=stable_fp, bound_channel_key=ch.key,
     )
     assert resp.status_code == 200
     assert m["affinity"].get(stable_fp)["channel_key"] == old_owner
@@ -1815,6 +1871,35 @@ async def test_http_responses_oauth_ws_stream_converts_frames_to_sse(monkeypatch
     assert row["http_status"] == 200
     assert row["upstream_protocol"] == "openai-responses"
     assert row["upstream_transport"] == "ws"
+    for value in (body, {"output": [{"type": "compaction", "id": "cmp_ws_stream_out", "encrypted_content": "ws-stream-out-cipher"}]}):
+        ref = m["responses_ws"].compaction_owner.complete_refs(value)[0]
+        assert m["state_db"].compaction_owner_load(ref.compaction_id, ref.content_digest)
+
+    # Once stream bytes are delivered, owner DB failure remains observable but
+    # cannot fabricate an error terminal or error log.
+    monkeypatch.setattr(
+        m["state_db"], "compaction_owner_upsert",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("owner db unavailable")),
+    )
+    fake_ws = FakeOAuthHttpStreamWs([{"type": "response.completed", "response": {
+        "id": "resp_stream_db_failure", "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }}])
+    failure_body = {"model": "test-model", "stream": True, "input": [
+        {"type": "compaction", "id": "cmp_db_failure_stream", "encrypted_content": "db-failure-stream"},
+    ]}
+    with caplog.at_level("WARNING", logger="src.openai.compaction_owner"):
+        response, failure_rid = await _call_failover_responses(
+            m, ch, failure_body, bound_channel_key=ch.key,
+        )
+        stream_text = b"".join([chunk async for chunk in response.body_iterator]).decode()
+    assert "response.completed" in stream_text
+    assert m["log_db"].log_detail(failure_rid)["log"]["status"] == "success"
+    assert any(
+        r.message == "codex_compaction_owner_persist_failed"
+        and r.path == "oauth_upstream_ws_stream_finalize"
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio

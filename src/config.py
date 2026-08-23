@@ -217,6 +217,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "openaiServerError": True,
                 "claudeOverloaded": True,
                 "xaiUnavailable": True,
+                "antigravityRateLimit": True,
             },
         },
         "recovery": {
@@ -461,7 +462,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "claude": "5872779796257184592",
             "xai": "5819115571463068721",
             "cursor": "6062261319426390107",
-            "antigravity": "",
+            "antigravity": "6077644693984779782",
         },
         "providerBtnEmoji": {
             "openai": "🅾️",

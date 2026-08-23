@@ -1166,6 +1166,7 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
             print(f"[oauth] ensure_quota_fresh failed for {account_key}: {exc}")
             return False
         try:
+            usage = preserve_antigravity_cached_summary(account_key, usage)
             state_db.quota_save(account_key, flatten_usage(usage),
                                 email=account_key_to_email(account_key))
         except Exception as exc:
@@ -1207,6 +1208,23 @@ def ensure_quota_fresh_sync(account_keys: list[str] | str, *,
 
 
 # ─── 配额缓存辅助 ─────────────────────────────────────────────────
+
+def preserve_antigravity_cached_summary(account_key: str, usage: dict) -> dict:
+    """On summary-only failure retain old display data, never as fresh signals."""
+    if provider_of(account_key) != "antigravity" or not isinstance(usage, dict):
+        return usage
+    block = usage.get("antigravity")
+    if not isinstance(block, dict) or not block.get("quota_error") or block.get("quota_groups"):
+        return usage
+    row = state_db.quota_load(account_key)
+    raw = _raw_usage_from_flat(row) if isinstance(row, dict) else {}
+    old = raw.get("antigravity") if isinstance(raw.get("antigravity"), dict) else {}
+    groups = old.get("quota_groups")
+    if isinstance(groups, list) and groups:
+        block["quota_groups"] = groups
+        block["quota_groups_stale"] = True
+    return usage
+
 
 def flatten_usage(usage: dict) -> dict:
     """把 /api/oauth/usage 返回的嵌套结构展平，便于写 state_db.oauth_quota_cache。
@@ -1929,80 +1947,75 @@ def _evaluate_antigravity_credits(
     acc: dict,
     usage: dict,
     *,
+    threshold: float,
     fresh: bool,
     expected_quota_generation,
 ) -> dict:
-    """Credits are a boolean pool, not Anthropic-style percent windows.
-
-    unknown / fetch-failed must not disable or resume. Exhausted credits have
-    no reset time; recovery waits for a later known+available snapshot.
-    """
-    utils = [None, None, None, None, None]
+    """Combine reliable Credits and 5h/weekly signals into one quota gate."""
+    utils = extract_utils_percent(usage)
     block = usage.get("antigravity") if isinstance(usage, dict) else None
-    known = isinstance(block, dict) and bool(block.get("known"))
-    available = bool(block.get("available")) if known else False
+    credits_known = isinstance(block, dict) and bool(block.get("known"))
+    credits_available = bool(block.get("available")) if credits_known else None
+    summary_failed = isinstance(block, dict) and isinstance(block.get("quota_error"), dict)
+    window_hits = [label for label, util in zip(("5h", "7d"), utils[:2])
+                   if util is not None and util >= threshold]
+    has_window_signal = any(util is not None for util in utils[:2])
+    hits = list(window_hits)
+    if credits_known and not credits_available:
+        hits.append("Credits")
+    any_over = bool(hits)
+    has_reliable_signal = credits_known or has_window_signal
     reason = acc.get("disabled_reason")
-    base = {
-        "utils": utils,
-        "any_over": False,
-        "hit_windows": [],
-        "disabled_until": acc.get("disabled_until"),
-    }
-    if not known:
+    base = {"utils": utils, "any_over": any_over, "hit_windows": hits,
+            "disabled_until": acc.get("disabled_until")}
+
+    if any_over:
         if reason == "quota":
-            return {**base, "action": "quota_unknown_keep_disabled"}
-        return {**base, "action": "kept_enabled"}
-    if not available:
-        hits = ["Credits"]
-        if reason == "quota":
-            return {**base, "action": "still_over_quota", "any_over": True, "hit_windows": hits}
+            return {**base, "action": "still_over_quota"}
+        latest_reset = None if "Credits" in hits else reset_iso_for_hit_windows(usage, threshold)
         try:
-            disable_result = set_disabled_by_quota(account_key, None)
+            disable_result = set_disabled_by_quota(account_key, latest_reset)
         except Exception as exc:
             print(f"[oauth] evaluate antigravity disable failed for {account_key}: {exc}")
-            return {**base, "action": "disable_failed", "any_over": True, "hit_windows": hits}
+            return {**base, "action": "disable_failed", "disabled_until": latest_reset}
         disable_state = (disable_result or {}).get("state")
         if disable_state != "disabled":
-            return {
-                **base,
-                "action": (
-                    "still_over_quota"
-                    if disable_state == "already_quota_disabled"
-                    else disable_state or "disable_failed"
-                ),
-                "any_over": True,
-                "hit_windows": hits,
-                "disabled_until": (disable_result or {}).get("disabled_until"),
-                "disabled_reason": (disable_result or {}).get("disabled_reason"),
-                "error_code": "account_state_conflict",
-            }
-        return {**base, "action": "disabled", "any_over": True, "hit_windows": hits, "disabled_until": None}
-    if reason == "quota":
-        if not fresh:
-            return {**base, "action": "quota_stale_keep_disabled"}
-        if expected_quota_generation is None:
-            return {
-                **base,
-                "action": "resume_failed",
-                "error_code": "quota_observation_generation_invalid",
-            }
-        try:
-            enable_result = set_enabled(
-                account_key, True, expected_disabled_reason="quota",
-                expected_quota_observation_generation=expected_quota_generation,
-            )
-        except Exception as exc:
-            print(f"[oauth] evaluate antigravity resume failed for {account_key}: {exc}")
-            return {**base, "action": "resume_failed"}
-        enable_state = (enable_result or {}).get("state")
-        if enable_state != "enabled":
-            return {
-                **base,
-                "action": enable_state or "resume_failed",
-                "error_code": "account_state_conflict",
-            }
-        return {**base, "action": "resumed", "disabled_until": None}
-    return {**base, "action": "kept_enabled"}
+            return {**base,
+                    "action": ("still_over_quota" if disable_state == "already_quota_disabled"
+                               else disable_state or "disable_failed"),
+                    "disabled_until": (disable_result or {}).get("disabled_until"),
+                    "disabled_reason": (disable_result or {}).get("disabled_reason"),
+                    "error_code": "account_state_conflict"}
+        return {**base, "action": "disabled", "disabled_until": latest_reset}
+
+    if reason != "quota":
+        return {**base, "action": "kept_enabled"}
+    # Credits and 5h/weekly are independent gates.  A successful Credits read
+    # cannot prove that a previously exhausted window recovered when the quota
+    # summary endpoint failed in this refresh.  Keep the account disabled until
+    # a fresh window snapshot is available again.
+    if summary_failed and not has_window_signal:
+        return {**base, "action": "quota_partial_keep_disabled"}
+    if not has_reliable_signal:
+        return {**base, "action": "quota_unknown_keep_disabled"}
+    if not fresh:
+        return {**base, "action": "quota_stale_keep_disabled"}
+    if expected_quota_generation is None:
+        return {**base, "action": "resume_failed",
+                "error_code": "quota_observation_generation_invalid"}
+    try:
+        enable_result = set_enabled(
+            account_key, True, expected_disabled_reason="quota",
+            expected_quota_observation_generation=expected_quota_generation,
+        )
+    except Exception as exc:
+        print(f"[oauth] evaluate antigravity resume failed for {account_key}: {exc}")
+        return {**base, "action": "resume_failed"}
+    enable_state = (enable_result or {}).get("state")
+    if enable_state != "enabled":
+        return {**base, "action": enable_state or "resume_failed",
+                "error_code": "account_state_conflict"}
+    return {**base, "action": "resumed", "disabled_until": None}
 
 
 def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
@@ -2079,6 +2092,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
             account_key,
             acc,
             usage,
+            threshold=float(threshold),
             fresh=fresh,
             expected_quota_generation=expected_quota_generation,
         )
@@ -3889,7 +3903,93 @@ def exchange_code(code: str, code_verifier: str, state: str) -> dict:
 
 # ─── 后台循环的 "once" 单步实现 ─────────────────────────────────
 
-def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
+def _raw_usage_from_flat(usage_flat: dict | None) -> dict:
+    if not isinstance(usage_flat, dict):
+        return {}
+    raw = usage_flat.get("raw_data")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _refresh_notice_window_lines(usage_flat: dict | None) -> list[str]:
+    if not usage_flat:
+        return []
+    lines: list[str] = []
+    fh_util = usage_flat.get("five_hour_util")
+    sd_util = usage_flat.get("seven_day_util")
+    if fh_util is not None:
+        lines.append(
+            f"📊 5h 用量: <b>{fh_util:.0f}%</b>"
+            f" | 重置: <code>{_to_bjt(usage_flat.get('five_hour_reset'))}</code>"
+        )
+    if sd_util is not None:
+        lines.append(
+            f"📊 7d 用量: <b>{sd_util:.0f}%</b>"
+            f" | 重置: <code>{_to_bjt(usage_flat.get('seven_day_reset'))}</code>"
+        )
+    return lines
+
+
+def _refresh_notice_usage_lines(
+    provider: str, usage_flat: dict | None, *, usage: dict | None = None,
+) -> list[str]:
+    """Refresh-toast usage lines. Omit the row when upstream gave no number."""
+    raw = usage if isinstance(usage, dict) else _raw_usage_from_flat(usage_flat)
+    if provider == "openai":
+        return _refresh_notice_window_lines(usage_flat)
+    if provider == "antigravity":
+        block = raw.get("antigravity") if isinstance(raw.get("antigravity"), dict) else {}
+        if not block.get("known"):
+            return []
+        text = antigravity_provider.format_credits_usage_text(block)
+        return [f"📊 Credits: {notifier.escape_html(text)}"]
+    if provider == "xai":
+        billing = ((raw.get("xai") or {}).get("billing")
+                   if isinstance(raw.get("xai"), dict) else None)
+        billing = billing if isinstance(billing, dict) else {}
+        used = billing.get("used_percent")
+        reset = billing.get("period_end") or (usage_flat or {}).get("seven_day_reset")
+        if used is None:
+            used = (usage_flat or {}).get("seven_day_util")
+        try:
+            used_n = max(0.0, min(100.0, float(used))) if used is not None else None
+        except (TypeError, ValueError):
+            used_n = None
+        if used_n is None:
+            return []
+        line = f"📊 官方额度: <b>{used_n:.2f}%</b> 已用"
+        if reset:
+            line += f" | 重置: <code>{_to_bjt(reset)}</code>"
+        return [line]
+    if provider == "cursor":
+        cursor = raw.get("cursor") if isinstance(raw.get("cursor"), dict) else {}
+        used = cursor.get("total_utilization")
+        if used is None:
+            used = (usage_flat or {}).get("thirty_day_util")
+        reset = cursor.get("billing_cycle_end") or (usage_flat or {}).get("thirty_day_reset")
+        try:
+            used_n = max(0.0, min(100.0, float(used))) if used is not None else None
+        except (TypeError, ValueError):
+            used_n = None
+        if used_n is None:
+            return []
+        line = f"📊 Cursor 额度: <b>{used_n:.2f}%</b>"
+        if reset:
+            line += f" | 重置: <code>{_to_bjt(reset)}</code>"
+        return [line]
+    return _refresh_notice_window_lines(usage_flat)
+
+
+def _build_refresh_notice(
+    account_key: str, usage_flat: dict | None, *, usage: dict | None = None,
+) -> str:
     """构造 OAuth Token 刷新成功通知文案（中文 + HTML + 北京时间 + 用量摘要）。"""
     email = account_key_to_email(account_key)
     prov = provider_of(account_key)
@@ -3901,38 +4001,7 @@ def _build_refresh_notice(account_key: str, usage_flat: dict | None) -> str:
         f"新过期时间: <code>{_to_bjt(new_exp)}</code>"
         f" (剩 {_remaining_str(new_exp)})",
     ]
-    # 用量
-    if prov == "openai":
-        parts.append("📊 用量: <i>由响应头更新（无独立端点）</i>")
-    elif prov in {"xai", "cursor"}:
-        td_util = (usage_flat or {}).get("thirty_day_util") if usage_flat else None
-        td_reset = (usage_flat or {}).get("thirty_day_reset") if usage_flat else None
-        if td_util is not None:
-            parts.append(
-                f"📊 月度额度: <b>{td_util:.2f}%</b>"
-                f" | 重置: <code>{_to_bjt(td_reset)}</code>"
-            )
-        else:
-            parts.append("📊 月度额度: <i>本次未拉取到</i>")
-    elif usage_flat:
-        fh_util = usage_flat.get("five_hour_util")
-        sd_util = usage_flat.get("seven_day_util")
-        if fh_util is not None:
-            fh_reset = usage_flat.get("five_hour_reset")
-            parts.append(
-                f"📊 5h 用量: <b>{fh_util:.0f}%</b>"
-                f" | 重置: <code>{_to_bjt(fh_reset)}</code>"
-            )
-        if sd_util is not None:
-            sd_reset = usage_flat.get("seven_day_reset")
-            parts.append(
-                f"📊 7d 用量: <b>{sd_util:.0f}%</b>"
-                f" | 重置: <code>{_to_bjt(sd_reset)}</code>"
-            )
-        if fh_util is None and sd_util is None:
-            parts.append("📊 用量: <i>本次未拉取到</i>")
-    else:
-        parts.append("📊 用量: <i>获取失败（不影响 token 刷新）</i>")
+    parts.extend(_refresh_notice_usage_lines(prov, usage_flat, usage=usage))
 
     # 月度统计
     try:
@@ -4011,18 +4080,21 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             await force_refresh(ak)
             out[email] = "refreshed"
             usage_flat: dict | None = None
+            usage: dict | None = None
             try:
                 usage = await fetch_usage(ak)
                 usage_flat = flatten_usage(usage)
                 # 统一用 quota_save 写入；OpenAI 主动拉取来自 wham/usage，
                 # 不覆盖响应头实时采样保存在 codex_* 列里的细节。
+                usage = preserve_antigravity_cached_summary(ak, usage)
+                usage_flat = flatten_usage(usage)
                 state_db.quota_save(ak, usage_flat, email=email)
             except Exception as exc:
                 print(f"[oauth] usage fetch after refresh failed for {ak}: {exc}")
 
             notifier.notify_event(
                 "oauth_refreshed",
-                _build_refresh_notice(ak, usage_flat),
+                _build_refresh_notice(ak, usage_flat, usage=usage),
                 auto_delete_seconds=180,
             )
         except Exception as exc:
@@ -4092,6 +4164,7 @@ async def quota_monitor_once() -> dict:
             out[email] = f"fetch_failed:{exc}"
             continue
 
+        usage = preserve_antigravity_cached_summary(ak, usage)
         state_db.quota_save(ak, flatten_usage(usage), email=email)
 
         # OpenAI quota 恢复必须有本轮主动 fetch_usage 拿到的窗口数据；空 usage

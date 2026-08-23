@@ -205,6 +205,18 @@ def _schema_sql() -> str:
     );
     CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_expires ON xai_video_jobs(expires_at);
     CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_channel ON xai_video_jobs(channel_key);
+
+    CREATE TABLE IF NOT EXISTS codex_compaction_owners (
+      compaction_id  TEXT NOT NULL,
+      content_digest TEXT NOT NULL,
+      owner_key      TEXT NOT NULL,
+      owner_identity TEXT NOT NULL,
+      created_at     INTEGER NOT NULL,
+      last_used      INTEGER NOT NULL,
+      PRIMARY KEY (compaction_id, content_digest)
+    );
+    CREATE INDEX IF NOT EXISTS idx_compaction_owner_identity
+      ON codex_compaction_owners(owner_identity);
     """
 
 
@@ -2011,3 +2023,56 @@ def quota_save_openai_snapshot(account_key: str, snap: dict,
                 [value for _, value in updates] + [target_account_key],
             )
     _commit_quota_write(account_key, write)
+
+# ─── Codex compaction ownership (durable, no affinity TTL) ─────────
+
+def compaction_owner_load(compaction_id: str, content_digest: str) -> dict | None:
+    row = _get_conn().execute(
+        """SELECT compaction_id, content_digest, owner_key, owner_identity,
+                  created_at, last_used
+           FROM codex_compaction_owners
+           WHERE compaction_id=? AND content_digest=?""",
+        (compaction_id, content_digest),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def compaction_owner_upsert(compaction_id: str, content_digest: str,
+                            owner_key: str, owner_identity: str,
+                            *, used_at: int | None = None,
+                            compatible_identities: set[str] | None = None) -> dict:
+    """Record an owner, allowing only explicitly proven identity migration."""
+    ts = used_at if used_at is not None else now_ms()
+    with _write_lock:
+        conn = _get_conn()
+        try:
+            row = conn.execute(
+                """SELECT owner_key, owner_identity FROM codex_compaction_owners
+                   WHERE compaction_id=? AND content_digest=?""",
+                (compaction_id, content_digest),
+            ).fetchone()
+            if (
+                row is not None
+                and row["owner_identity"] != owner_identity
+                and row["owner_identity"] not in (compatible_identities or set())
+            ):
+                raise ValueError("compaction owner conflict")
+            if row is None:
+                conn.execute(
+                    """INSERT INTO codex_compaction_owners
+                       (compaction_id, content_digest, owner_key, owner_identity,
+                        created_at, last_used) VALUES (?,?,?,?,?,?)""",
+                    (compaction_id, content_digest, owner_key, owner_identity, ts, ts),
+                )
+            else:
+                conn.execute(
+                    """UPDATE codex_compaction_owners
+                       SET owner_key=?, owner_identity=?, last_used=?
+                       WHERE compaction_id=? AND content_digest=?""",
+                    (owner_key, owner_identity, ts, compaction_id, content_digest),
+                )
+            conn.commit()
+        except BaseException:
+            _rollback_failed_write(conn)
+            raise
+    return compaction_owner_load(compaction_id, content_digest) or {}

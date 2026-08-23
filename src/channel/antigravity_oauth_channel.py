@@ -15,7 +15,7 @@ from .. import cache_hints, config, oauth_manager
 from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
 from ..openai.transform import anthropic_to_responses, chat_to_responses, guard
-from ..providers import antigravity_codec, registry as provider_registry
+from ..providers import antigravity_codec, remote_image, registry as provider_registry
 from .base import Channel, ChannelDisplay, UpstreamRequest
 
 
@@ -146,6 +146,10 @@ class AntigravityOAuthChannel(Channel):
             )
 
         stream = _wants_stream(requested_body)
+        # Gemini inlineData cannot consume ordinary remote URLs.  Resolve them at
+        # this provider boundary so other bridges retain their existing policy.
+        if ingress_protocol in ("chat", "responses"):
+            requested_body = await remote_image.inline_remote_images(requested_body)
         translator_ctx: Optional[dict]
         if ingress_protocol == "responses":
             if str(requested_body.get("previous_response_id") or "").strip():
@@ -193,6 +197,9 @@ class AntigravityOAuthChannel(Channel):
                 "response_translator": "anthropic_to_responses",
                 "model_for_response": resolved_model,
                 "request_body": requested_body,
+                # Provider-scoped opt-in: no other Responses upstream may expose
+                # opaque reasoning material as Anthropic thinking blocks.
+                "antigravity_anthropic_reasoning_bridge": True,
             }
 
         payload["model"] = resolved_model

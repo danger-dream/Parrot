@@ -101,6 +101,16 @@ def _stop_reason(status: Optional[str], incomplete_reason: Optional[str], *, saw
 
 
 @dataclass
+class _ReasoningState:
+    key: str
+    block_index: int
+    thinking: str = ""
+    signature: str = ""
+    started: bool = False
+    stopped: bool = False
+
+
+@dataclass
 class _ToolState:
     key: str
     block_index: int
@@ -123,6 +133,11 @@ class _State:
     next_block_index: int = 0
     text_parts: list[str] = field(default_factory=list)
     tools: dict[str, _ToolState] = field(default_factory=dict)
+    reasoning: dict[str, _ReasoningState] = field(default_factory=dict)
+    output_index_to_reasoning_key: dict[int, str] = field(default_factory=dict)
+    item_id_to_reasoning_key: dict[str, str] = field(default_factory=dict)
+    active_reasoning_key: Optional[str] = None
+    seen_reasoning_signatures: set[str] = field(default_factory=set)
     output_index_to_key: dict[int, str] = field(default_factory=dict)
     item_id_to_key: dict[str, str] = field(default_factory=dict)
     last_tool_key: Optional[str] = None
@@ -147,6 +162,7 @@ class StreamTranslator:
         created_ts: Optional[int] = None,
         optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
         request_body: dict[str, Any] | None = None,
+        allow_reasoning_bridge: bool = False,
     ):
         self.state = _State(
             message_id=_gen_id("msg_"),
@@ -160,6 +176,7 @@ class StreamTranslator:
                     request_body.get("tools") if isinstance(request_body, dict) else None
                 )
             )
+        self.allow_reasoning_bridge = bool(allow_reasoning_bridge)
         self._buf = b""
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
@@ -183,6 +200,7 @@ class StreamTranslator:
         if not self.state.message_started:
             yield from self._emit_message_start()
         yield from self._stop_text_if_needed()
+        yield from self._stop_all_reasoning()
         yield from self._stop_all_tools()
         yield _emit("message_delta", {
             "type": "message_delta",
@@ -228,6 +246,13 @@ class StreamTranslator:
             part = data.get("part") if isinstance(data.get("part"), dict) else {}
             if part.get("type") in ("output_text", "refusal"):
                 yield from self._ensure_text_block()
+            return
+
+        if event_name == "response.reasoning_summary_text.delta":
+            if self.allow_reasoning_bridge:
+                delta = data.get("delta")
+                if isinstance(delta, str) and delta:
+                    yield from self._emit_reasoning_delta(self._reasoning_for_event(data), delta)
             return
 
         if event_name in ("response.output_text.delta", "response.refusal.delta"):
@@ -286,8 +311,18 @@ class StreamTranslator:
 
     def _on_output_item_added(self, data: dict, item: dict) -> Iterator[bytes]:
         item_type = item.get("type")
+        if item_type == "reasoning" and self.allow_reasoning_bridge:
+            st = self._reasoning_for_item(data, item)
+            st.signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
+            # Delay block_start until readable thinking arrives.  If the item is
+            # signature-only, output_item.done must use redacted_thinking rather
+            # than an empty ordinary thinking block.
+            return
         if item_type != "function_call":
             return
+        signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
+        if self.allow_reasoning_bridge and signature and signature not in self.state.seen_reasoning_signatures:
+            yield from self._emit_redacted_reasoning(signature)
         key = self._key_from_item_event(data, item)
         st = self._tool_state(key)
         self._update_tool_metadata(st, data, item, key)
@@ -295,8 +330,25 @@ class StreamTranslator:
 
     def _on_output_item_done(self, data: dict, item: dict) -> Iterator[bytes]:
         item_type = item.get("type")
+        if item_type == "reasoning" and self.allow_reasoning_bridge:
+            st = self._reasoning_for_item(data, item)
+            summary = item.get("summary") if isinstance(item.get("summary"), list) else []
+            final_text = "".join(str(p.get("text") or "") for p in summary if isinstance(p, dict))
+            if final_text.startswith(st.thinking):
+                yield from self._emit_reasoning_delta(st, final_text[len(st.thinking):])
+            st.signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or st.signature).strip()
+            if not st.thinking and st.signature:
+                st.stopped = True
+                self.state.active_reasoning_key = None
+                yield from self._emit_redacted_reasoning(st.signature, block_index=st.block_index)
+            else:
+                yield from self._stop_reasoning(st)
+            return
         if item_type != "function_call":
             return
+        signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
+        if self.allow_reasoning_bridge and signature and signature not in self.state.seen_reasoning_signatures:
+            yield from self._emit_redacted_reasoning(signature)
         key = self._key_from_item_event(data, item)
         st = self._tool_state(key)
         self._update_tool_metadata(st, data, item, key)
@@ -354,6 +406,7 @@ class StreamTranslator:
     def _ensure_text_block(self) -> Iterator[bytes]:
         if not self.state.message_started:
             yield from self._emit_message_start()
+        yield from self._stop_active_reasoning()
         if self.state.text_started and not self.state.text_stopped:
             return
         self.state.text_index = self.state.alloc_index() if self.state.text_index < 0 else self.state.text_index
@@ -387,6 +440,90 @@ class StreamTranslator:
             self.state.text_stopped = True
             yield _emit("content_block_stop", {"type": "content_block_stop", "index": self.state.text_index})
 
+    def _reasoning_for_item(self, data: dict, item: dict) -> _ReasoningState:
+        oi = data.get("output_index")
+        item_id = item.get("id") or data.get("item_id")
+        if isinstance(oi, int):
+            key = self.state.output_index_to_reasoning_key.get(oi) or f"oi:{oi}"
+            self.state.output_index_to_reasoning_key[oi] = key
+        elif isinstance(item_id, str) and item_id:
+            key = self.state.item_id_to_reasoning_key.get(item_id) or f"id:{item_id}"
+        else:
+            key = self.state.active_reasoning_key or f"fallback:{len(self.state.reasoning)}"
+        if isinstance(item_id, str) and item_id:
+            self.state.item_id_to_reasoning_key[item_id] = key
+        st = self.state.reasoning.get(key)
+        if st is None:
+            st = _ReasoningState(key=key, block_index=self.state.alloc_index())
+            self.state.reasoning[key] = st
+        self.state.active_reasoning_key = key
+        return st
+
+    def _reasoning_for_event(self, data: dict) -> _ReasoningState:
+        return self._reasoning_for_item(data, {"id": data.get("item_id")})
+
+    def _start_reasoning_if_needed(self, st: _ReasoningState) -> Iterator[bytes]:
+        if st.started:
+            return
+        if not self.state.message_started:
+            yield from self._emit_message_start()
+        yield from self._stop_text_if_needed()
+        st.started = True
+        yield _emit("content_block_start", {
+            "type": "content_block_start", "index": st.block_index,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        })
+
+    def _emit_reasoning_delta(self, st: _ReasoningState, delta: str) -> Iterator[bytes]:
+        if not delta or st.stopped:
+            return
+        yield from self._start_reasoning_if_needed(st)
+        st.thinking += delta
+        yield _emit("content_block_delta", {
+            "type": "content_block_delta", "index": st.block_index,
+            "delta": {"type": "thinking_delta", "thinking": delta},
+        })
+
+    def _stop_reasoning(self, st: _ReasoningState) -> Iterator[bytes]:
+        if st.stopped:
+            return
+        yield from self._start_reasoning_if_needed(st)
+        if st.signature:
+            self.state.seen_reasoning_signatures.add(st.signature)
+            yield _emit("content_block_delta", {
+                "type": "content_block_delta", "index": st.block_index,
+                "delta": {"type": "signature_delta", "signature": st.signature},
+            })
+        st.stopped = True
+        if self.state.active_reasoning_key == st.key:
+            self.state.active_reasoning_key = None
+        yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
+
+    def _stop_active_reasoning(self) -> Iterator[bytes]:
+        key = self.state.active_reasoning_key
+        if key and key in self.state.reasoning:
+            yield from self._stop_reasoning(self.state.reasoning[key])
+
+    def _stop_all_reasoning(self) -> Iterator[bytes]:
+        for st in sorted(self.state.reasoning.values(), key=lambda value: value.block_index):
+            if not st.stopped:
+                yield from self._stop_reasoning(st)
+
+    def _emit_redacted_reasoning(self, signature: str, *, block_index: int | None = None) -> Iterator[bytes]:
+        if not signature or signature in self.state.seen_reasoning_signatures:
+            return
+        if not self.state.message_started:
+            yield from self._emit_message_start()
+        yield from self._stop_text_if_needed()
+        yield from self._stop_active_reasoning()
+        idx = self.state.alloc_index() if block_index is None else block_index
+        self.state.seen_reasoning_signatures.add(signature)
+        yield _emit("content_block_start", {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "redacted_thinking", "data": signature},
+        })
+        yield _emit("content_block_stop", {"type": "content_block_stop", "index": idx})
+
     def _tool_state(self, key: str) -> _ToolState:
         st = self.state.tools.get(key)
         if st is None:
@@ -401,6 +538,7 @@ class StreamTranslator:
         if not self.state.message_started:
             yield from self._emit_message_start()
         yield from self._stop_text_if_needed()
+        yield from self._stop_active_reasoning()
         st.id = st.id or _gen_id("call_")
         name = st.name or "tool"
         st.started = True
@@ -501,9 +639,14 @@ class StreamTranslator:
         return self._tool_state(key)
 
     def get_downstream_anthropic_assistant(self) -> dict:
-        blocks: list[dict[str, Any]] = []
+        indexed: list[tuple[int, dict[str, Any]]] = []
         if self.state.text_parts:
-            blocks.append({"type": "text", "text": "".join(self.state.text_parts)})
+            indexed.append((self.state.text_index, {"type": "text", "text": "".join(self.state.text_parts)}))
+        for st in self.state.reasoning.values():
+            if st.signature and st.thinking:
+                indexed.append((st.block_index, {"type": "thinking", "thinking": st.thinking, "signature": st.signature}))
+            elif st.signature:
+                indexed.append((st.block_index, {"type": "redacted_thinking", "data": st.signature}))
         ordered = sorted(self.state.tools.values(), key=lambda t: t.block_index)
         for st in ordered:
             if st.started:
@@ -518,5 +661,5 @@ class StreamTranslator:
                     parsed,
                     self.optional_empty_string_fields_by_tool,
                 )
-                blocks.append({"type": "tool_use", "id": st.id, "name": st.name or "tool", "input": parsed})
-        return {"role": "assistant", "content": blocks}
+                indexed.append((st.block_index, {"type": "tool_use", "id": st.id, "name": st.name or "tool", "input": parsed}))
+        return {"role": "assistant", "content": [block for _, block in sorted(indexed, key=lambda pair: pair[0])]}

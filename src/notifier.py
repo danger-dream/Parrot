@@ -46,6 +46,7 @@ _PROVIDER_CUSTOM_EMOJI = {
     "openai": "5861557411784957025",
     "xai": "5819115571463068721",
     "cursor": "6062261319426390107",
+    "antigravity": "6077644693984779782",
 }
 _PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
 _PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity"}

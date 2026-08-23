@@ -24,6 +24,7 @@ import httpx
 
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
+from ..providers.antigravity_errors import parse_antigravity_429
 from .commit_gate import is_responses_visible_event_type
 from . import errors as protocol_errors
 from . import registry as protocol_registry
@@ -131,7 +132,11 @@ def make_stream_translator(translator_ctx: Optional[dict]):
         return _C2A(model=model)
     if name == "anthropic_to_responses":
         from ..openai.transform.stream_responses_to_anthropic import StreamTranslator as _R2A
-        return _R2A(model=model, request_body=translator_ctx.get("request_body"))
+        return _R2A(
+            model=model,
+            request_body=translator_ctx.get("request_body"),
+            allow_reasoning_bridge=bool(translator_ctx.get("antigravity_anthropic_reasoning_bridge")),
+        )
     if name == "chat_to_anthropic":
         from ..openai.transform.stream_anthropic_to_chat import StreamTranslator as _A2C
         return _A2C(
@@ -179,7 +184,12 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
         return _t4(obj, model=model)
     if name == "anthropic_to_responses":
         from ..openai.transform.anthropic_to_responses import translate_response as _t5
-        return _t5(obj, model=model, request_body=translator_ctx.get("request_body"))
+        return _t5(
+            obj,
+            model=model,
+            request_body=translator_ctx.get("request_body"),
+            allow_reasoning_bridge=bool(translator_ctx.get("antigravity_anthropic_reasoning_bridge")),
+        )
     if name == "responses_to_anthropic":
         from ..openai.transform.responses_to_anthropic import translate_response as _t6
         return _t6(
@@ -724,6 +734,17 @@ def retryable_transient_error_kind(channel: Any, result: AttemptResult) -> str |
         status = 0
     error_type, error_code, structured = _upstream_error_identity(result)
 
+    # Cloud Code RetryInfo below three seconds is explicitly safe for a bounded
+    # same-owner retry. Longer delays are handled as model cooldown/quota state.
+    if status == 429 and str(getattr(channel, "provider", "")) == "antigravity":
+        google = parse_antigravity_429(
+            getattr(result, "full_response_text", None) or getattr(result, "error_detail", None)
+        )
+        delay = google.get("retry_after")
+        if (not google.get("quota_exhausted") and
+                str(google.get("reason") or "").upper() == "RATE_LIMIT_EXCEEDED" and
+                isinstance(delay, (int, float)) and delay < 3):
+            return "antigravityRateLimit"
     # xAI's REST 503 is the counterpart of its SDK UNAVAILABLE signal.  Check it
     # before generic OpenAI-compatible ``server_error`` classification.
     if status == 503 and _is_xai_channel(channel):

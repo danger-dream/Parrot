@@ -33,7 +33,7 @@ from . import (
 from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
-from .openai import deepseek_reasoning, reasoning_replay
+from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
 from .openai.codex_identity_confuse import ConfuseState
 from .openai.responses_ws_runtime import (
     build_oauth_responses_ws_frame,
@@ -667,6 +667,17 @@ def _retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
     return retry_body_without_encrypted_content(body)
 
 
+def _invalid_ec_cleanup_retry_allowed(body: dict, message: str, cfg: dict,
+                                      already_retried: bool) -> bool:
+    """Compaction is indivisible; reasoning-only EC keeps legacy recovery."""
+    return bool(
+        _recovery_retry_allowed("invalidEncryptedContent", cfg)
+        and _is_invalid_encrypted_content_error(message)
+        and not compaction_owner.has_complete_compaction(body)
+        and not already_retried
+    )
+
+
 def _attempt_body_for_channel(
     body: dict,
     channel_key: str,
@@ -674,6 +685,12 @@ def _attempt_body_for_channel(
     portable_body: Optional[dict] = None,
 ) -> dict:
     """Return the body safe for one candidate without mutating request state."""
+    if compaction_owner.has_complete_compaction(body):
+        if not bound_channel_key or channel_key != bound_channel_key:
+            raise compaction_owner.CompactionRouteError(
+                "compaction_owner_mismatch", "refusing to send compaction without its exact owner",
+            )
+        return body
     if channel_key == bound_channel_key:
         return body
     if portable_body is not None:
@@ -1066,6 +1083,7 @@ def _pick_upstream_headers(resp: httpx.Response) -> dict:
 def _attach_retry_after_from_response(
     result: AttemptResult,
     response: httpx.Response | None,
+    channel: Channel | None = None,
 ) -> AttemptResult:
     if result.retry_after_seconds is None and response is not None:
         try:
@@ -1077,15 +1095,17 @@ def _attach_retry_after_from_response(
             result.retry_after_seconds = parsed
             if result.http_status == 429:
                 result.cooldown_until = retry_after_cooldown_until(raw)
-    google = parse_antigravity_429(result.full_response_text or result.error_detail)
-    if google.get("quota_exhausted") and not result.error_code:
-        result.error_code = str(google.get("reason") or "quota_exhausted")
-    delay = google.get("retry_after")
-    if result.retry_after_seconds is None and isinstance(delay, (int, float)):
-        result.retry_after_seconds = parse_retry_after_seconds(delay)
-        if result.http_status == 429:
-            cooldown_s = min(float(delay), 300.0)
-            result.cooldown_until = int((time.time() + cooldown_s) * 1000)
+    if str(getattr(channel, "provider", "")) == "antigravity" and result.http_status == 429:
+        google = parse_antigravity_429(result.full_response_text or result.error_detail)
+        if google.get("quota_exhausted") and not result.error_code:
+            result.error_code = str(google.get("reason") or "quota_exhausted")
+        delay = google.get("retry_after")
+        if result.retry_after_seconds is None and isinstance(delay, (int, float)):
+            result.retry_after_seconds = parse_retry_after_seconds(delay)
+            # Short delays are consumed by same-owner retry and must not park the
+            # model. Medium delays become an exact non-blocking model cooldown.
+            if 3 <= float(delay) < 300:
+                result.cooldown_until = int((time.time() + float(delay)) * 1000)
     return result
 
 
@@ -1585,7 +1605,8 @@ async def run_failover(
         getattr(schedule_result, "encrypted_content_count", 0) or 0
     )
     portable_body: Optional[dict] = None
-    if encrypted_content_count > 0:
+    request_has_compaction = compaction_owner.has_complete_compaction(body)
+    if encrypted_content_count > 0 and not request_has_compaction:
         stripped_body, removed_ec = _retry_body_without_encrypted_content(body)
         if removed_ec > 0:
             portable_body = stripped_body
@@ -1974,6 +1995,28 @@ async def run_failover(
         # 非成功：立即释放 slot，进入下一候选
         _release_once()
 
+        # Antigravity's explicit quota reasons (or RetryInfo >=5 minutes) are
+        # account-wide, not a model-local throttle. Advance the existing quota
+        # observation generation before moving to another candidate so recovery
+        # cannot race a newer exhaustion observation.
+        if (
+            str(getattr(ch, "provider", "")) == "antigravity"
+            and result.http_status == 429
+        ):
+            google_quota = parse_antigravity_429(
+                result.full_response_text or result.error_detail
+            )
+            if google_quota.get("quota_exhausted"):
+                account_key = getattr(ch, "account_key", None)
+                if account_key:
+                    try:
+                        oauth_manager.set_disabled_by_quota(account_key, None)
+                    except Exception as exc:
+                        print(f"[failover] Antigravity quota disable failed for {account_key}: {exc}")
+                retry_count += 1
+                idx += 1
+                continue
+
         # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
         if result.outcome == "guard_error":
             status = int(result.http_status or 400)
@@ -1996,10 +2039,8 @@ async def run_failover(
         # 让下游 transcript owner 在成功响应中拿到新的 EC；失败则返回 400。
         if result.outcome == "request_invalid":
             msg = result.error_detail or "invalid request"
-            if (
-                _recovery_retry_allowed("invalidEncryptedContent", cfg)
-                and _is_invalid_encrypted_content_error(msg)
-                and not retried_without_encrypted_content
+            if _invalid_ec_cleanup_retry_allowed(
+                body, msg, cfg, retried_without_encrypted_content,
             ):
                 cleared_replay = _maybe_clear_codex_reasoning_replay(result.translator_ctx)
                 retry_body, removed_ec = _retry_body_without_encrypted_content(body)
@@ -3027,8 +3068,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 on_dispatch=lambda: route_state.__setitem__("dispatched", True),
             )
             result = _attach_retry_after_from_response(
-                result,
-                getattr(upstream_ws, "response", None),
+                result, getattr(upstream_ws, "response", None), ch,
             )
             if result.stream_started and isinstance(result.response, StreamingResponse):
                 # The post-commit generator owns WS + round terminalization.
@@ -3144,7 +3184,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 ),
                 proxy_name=proxy_name,
             )
-            last_error = _attach_retry_after_from_response(last_error, invalid_response)
+            last_error = _attach_retry_after_from_response(last_error, invalid_response, ch)
         except Exception as exc:
             connected = timing.connection_complete
             last_error = AttemptResult(
@@ -3528,6 +3568,9 @@ async def _consume_oauth_responses_ws_non_stream(
         total_ms=total_ms,
     )
     out_obj = _apply_non_stream_response_translator(obj, translator_ctx or {})
+    compaction_owner.persist_observed_safe(
+        ch, body, obj, path="oauth_upstream_ws_non_stream",
+    )
     _write_affinity_non_stream(
         "responses", api_key_name, client_ip, messages,
         {"role": "assistant", "content": obj.get("output") or []},
@@ -3723,6 +3766,10 @@ async def _consume_oauth_responses_ws_stream(
             connect_ms=connect_ms,
             first_byte_ms=first_byte_ms,
             total_ms=total_ms,
+        )
+        compaction_owner.persist_observed_safe(
+            ch, body, tracker.to_full_json(fallback_model=resolved_model),
+            path="oauth_upstream_ws_stream_finalize",
         )
         _write_affinity_non_stream(
             "responses", api_key_name, client_ip, messages,
@@ -4157,7 +4204,7 @@ async def _try_channel(
                 translator_ctx=upstream_req.translator_ctx,
                 partial_state=cancel_state,
             )
-            result = _attach_retry_after_from_response(result, upstream_resp)
+            result = _attach_retry_after_from_response(result, upstream_resp, ch)
             result.openai_oauth_html_403 = (
                 isinstance(ch, OpenAIOAuthChannel)
                 and result.http_status == 403
@@ -4186,7 +4233,7 @@ async def _try_channel(
                 start_monotonic=start_monotonic,
                 cancel_state=cancel_state,
             )
-            result = _attach_retry_after_from_response(result, upstream_resp)
+            result = _attach_retry_after_from_response(result, upstream_resp, ch)
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
             return result
@@ -4214,7 +4261,7 @@ async def _try_channel(
             cancel_state=cancel_state,
             terminal_release=terminal_release,
         )
-        result = _attach_retry_after_from_response(result, upstream_resp)
+        result = _attach_retry_after_from_response(result, upstream_resp, ch)
         if not result.stream_started:
             result = _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
@@ -4356,6 +4403,10 @@ async def _consume_non_stream(
         total_ms=round_total_ms,
     )
 
+    # Owner persistence is auxiliary to the successful upstream response. A DB
+    # failure is warned but must not turn this non-stream response into an error.
+    compaction_owner.persist_observed_safe(ch, body, obj, path="http_non_stream")
+
     # 落库（用**上游原始响应体**，方便排错；翻译后的下游响应体由 JSONResponse 现场构造）
     await asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
@@ -4495,6 +4546,9 @@ async def _consume_stream_as_non_stream(
         total_ms=round_total_ms,
     )
 
+    compaction_owner.persist_observed_safe(
+        ch, body, obj, path="http_sse_aggregate",
+    )
     await asyncio.to_thread(
         log_db.finish_success, request_id, ch.key, ch.type, resolved_model,
         input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"],
@@ -4772,6 +4826,9 @@ async def _consume_stream(
         if upstream_protocol == "openai-responses" and hasattr(builder, "to_full_json"):
             try:
                 native_response_obj = builder.to_full_json(fallback_model=resolved_model)
+                compaction_owner.persist_observed_safe(
+                    ch, body, native_response_obj, path="http_sse_stream_finalize",
+                )
                 _maybe_cache_deepseek_reasoning(ch, resolved_model, native_response_obj)
                 _maybe_cache_codex_reasoning_replay(translator_ctx, native_response_obj)
                 if ingress_protocol == "responses":

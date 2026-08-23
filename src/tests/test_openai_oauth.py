@@ -388,16 +388,24 @@ def test_refresh_notice_openai_wording(m):
         "chatgpt_account_id": "acct-1",
     })
     txt = om._build_refresh_notice("openai:a@x.com:acct-1", usage_flat=None)
-    assert "响应头" in txt, txt
+    assert "📊" not in txt, txt
     assert "获取失败" not in txt
-    # Claude 账户仍走老文案
     om.add_account({
         "email": "nr2@claude.test", "provider": "claude",
         "access_token": "x", "refresh_token": "x",
     })
     txt2 = om._build_refresh_notice("nr2@claude.test", usage_flat=None)
-    assert "获取失败" in txt2
-    print("  [PASS] _build_refresh_notice: openai gets header-path wording")
+    assert "📊" not in txt2
+    assert "获取失败" not in txt2
+    txt3 = om._build_refresh_notice("nr2@claude.test", usage_flat={
+        "five_hour_util": 12.0,
+        "five_hour_reset": "2026-08-23T12:00:00Z",
+        "seven_day_util": 34.0,
+        "seven_day_reset": "2026-08-30T12:00:00Z",
+    })
+    assert "5h 用量" in txt3
+    assert "7d 用量" in txt3
+    print("  [PASS] _build_refresh_notice: empty quota is omitted")
 
 
 def test_openai_refresh_updates_id_token_metadata(m):

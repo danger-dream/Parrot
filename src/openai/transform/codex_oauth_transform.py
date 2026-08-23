@@ -475,6 +475,13 @@ def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) ->
             filtered.append(rs)
             continue
 
+        # Codex compaction is an indivisible owner-bound artifact.  Its id and
+        # encrypted_content are both required for replay and must survive even
+        # when ordinary server-side item references are disabled (store=false).
+        if typ == "compaction":
+            filtered.append(dict(item))
+            continue
+
         if typ == "item_reference":
             if not preserve_references:
                 continue

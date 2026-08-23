@@ -299,6 +299,7 @@ def _replace_last_with_oauth_error(
 
 def _save_usage_to_quota_cache(ak: str, usage: dict, *, email: str | None = None):
     try:
+        usage = oauth_manager.preserve_antigravity_cached_summary(ak, usage)
         state_db.quota_save(
             ak, oauth_manager.flatten_usage(usage),
             email=email if email is not None else _account_email(ak),
@@ -903,33 +904,114 @@ def _antigravity_raw(account_key: str) -> dict:
     return _antigravity_raw_from_row(state_db.quota_load(account_key))
 
 
+_WINDOW_LABELS = {"5h": "5小时", "weekly": "每周", "daily": "每日", "monthly": "每月"}
+
+
+def _ag_window_label(window: str) -> str:
+    return _WINDOW_LABELS.get(str(window or "").strip(), str(window or "").strip() or "窗口")
+
+
+def _ag_remaining_html(frac: float | None) -> str:
+    if frac is None:
+        return "<i>未知</i>"
+    pct = max(0.0, min(100.0, frac * 100.0))
+    return f"剩余 <b>{pct:.2f}%</b>"
+
+
+_AG_GROUP_SHORT = {
+    "gemini models": "Gemini",
+    "claude and gpt models": "Claude/GPT",
+}
+
+
+def _ag_group_short(name: str) -> str:
+    key = str(name or "").strip().lower()
+    return _AG_GROUP_SHORT.get(key, str(name or "").strip() or "?")
+
+
+def _ag_window_short(window: str) -> str:
+    labels = {"5h": "5h", "weekly": "周", "daily": "日", "monthly": "月"}
+    return labels.get(str(window or "").strip(), str(window or "").strip() or "?")
+
+
+def _ag_quota_error_html(error: object) -> str:
+    if not isinstance(error, dict):
+        return "模型配额刷新失败"
+    labels = {
+        "validation_required": "需完成 Google 账号验证",
+        "unauthorized": "认证已失效（401）",
+        "forbidden": "访问被拒绝（403）",
+        "rate_limited": "请求过于频繁（429）",
+        "server_error": "Google 服务暂时异常（5xx）",
+        "timeout": "请求超时",
+        "network": "网络连接失败",
+    }
+    label = labels.get(str(error.get("kind") or ""))
+    if label:
+        return label
+    status = error.get("http_status")
+    return f"HTTP {int(status)}" if isinstance(status, int) else "模型配额刷新失败"
+
+
+def _format_antigravity_quota_groups(account_key: str, *, detail: bool) -> list[str]:
+    """Render retrieveUserQuotaSummary groups; mirrors Claude/OpenAI 📊 window style."""
+    block = _antigravity_raw(account_key)
+    groups = block.get("quota_groups") if isinstance(block, dict) else None
+    error = block.get("quota_error") if isinstance(block, dict) else None
+    if not isinstance(groups, list) or not groups:
+        if error:
+            return [f"⚠️ 模型配额: <i>{ui.escape_html(_ag_quota_error_html(error))}</i>"]
+        return []
+    # 列表与详情一致：分组 + 窗口剩余 + 重置时间（无描述行）
+    lines: list[str] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        buckets = [b for b in (group.get("buckets") or []) if isinstance(b, dict)]
+        if not buckets:
+            continue
+        name = ui.escape_html(str(group.get("display_name") or "").strip() or "?")
+        lines.append(f"📊 <b>{name}</b>")
+        for bucket in buckets:
+            window = _ag_window_label(bucket.get("window"))
+            remaining = _ag_remaining_html(bucket.get("remaining_fraction"))
+            reset = bucket.get("reset_time")
+            line = f"　· {window}: {remaining}"
+            if reset:
+                line += f" · 重置 <code>{_fmt_time_full(reset)}</code>"
+            lines.append(line)
+    if error:
+        prefix = "旧数据已保留；" if block.get("quota_groups_stale") else ""
+        lines.append(f"⚠️ 模型配额: <i>{ui.escape_html(prefix + _ag_quota_error_html(error))}</i>")
+    # Keep complete HTML lines. Four-account pages must stay under Telegram's
+    # 4096-character hard limit even if Google adds more groups/buckets.
+    budget = 2600 if detail else 650
+    bounded: list[str] = []
+    used = 0
+    suffix = "　… <i>其余配额组已省略</i>"
+    for line in lines:
+        extra = len(line) + (1 if bounded else 0)
+        if used + extra + len(suffix) > budget:
+            bounded.append(suffix)
+            break
+        bounded.append(line)
+        used += extra
+    return bounded
+
+
 def _format_antigravity_credits_block(account_key: str, *, detail: bool = False) -> str:
-    """Independent credits block. Never invent percent windows or currency."""
+    """Credits line + quota window groups. Never invent percent windows or currency."""
     row = state_db.quota_load(account_key)
     block = _antigravity_raw_from_row(row)
-    acc = oauth_manager.get_account(account_key) or {}
-    project_id = str(acc.get("project_id") or acc.get("projectId") or "").strip()
-    if not block:
-        lines = ["🚀 Antigravity · 未知", "Credits: <i>尚未获取</i>"]
-        if detail and project_id:
-            lines.append(f"Project: <code>{ui.escape_html(project_id)}</code>")
-        return "\n".join(lines)
-
-    tier = str(block.get("tier") or "").strip() or "未知"
-    lines = [f"🚀 Antigravity · {ui.escape_html(tier)}"]
+    lines = []
+    groups_lines = _format_antigravity_quota_groups(account_key, detail=detail)
+    if groups_lines:
+        lines.extend(groups_lines)
+    # Credits 仅在拿到确定余额时展示；Pro 订阅档上游常态不返回 creditAmount
     if block.get("known"):
-        amount = block.get("credit_amount")
-        minimum = block.get("minimum_credit_amount")
-        available = bool(block.get("available"))
-        amount_txt = _fmt_credit_amount(amount)
-        min_txt = _fmt_credit_amount(minimum)
-        status = "可用" if available else "已耗尽"
-        lines.append(f"Credits: {amount_txt}（最低 {min_txt}）· {status}")
-    else:
-        lines.append("Credits: <i>未知</i>")
+        usage = antigravity_provider.format_credits_usage_text(block)
+        lines.append(f"🪙 Credits: {ui.escape_html(usage)}")
     if detail:
-        if project_id:
-            lines.append(f"Project: <code>{ui.escape_html(project_id)}</code>")
         fetched = row.get("fetched_at") if row else None
         if fetched:
             try:
@@ -938,6 +1020,8 @@ def _format_antigravity_credits_block(account_key: str, *, detail: bool = False)
                 fetched_iso = ""
             if fetched_iso:
                 lines.append(f"刷新: <code>{_fmt_time_full(fetched_iso)}</code>")
+    if not lines:
+        lines = ["📊 用量: <i>尚未获取</i>"]
     return "\n".join(lines)
 
 
@@ -1340,9 +1424,12 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             f"模型 <code>{len(acc.get('models') or [])}</code> · 变体 <code>{variants}</code>"
         )
     elif prov == "antigravity":
-        project_id = str(acc.get("project_id") or acc.get("projectId") or "").strip()
-        if project_id:
-            lines.append(f"🏷️ Project: <code>{ui.escape_html(project_id)}</code>")
+        plan = antigravity_provider.credits_tier_label(_antigravity_raw(ak)) or "?"
+        text_n, image_n = _antigravity_catalog_counts(acc)
+        bits = [f"套餐: <code>{ui.escape_html(plan)}</code>", f"模型 <code>{text_n}</code>"]
+        if image_n:
+            bits.append(f"出图 <code>{image_n}</code>")
+        lines.append("🏷️ " + " · ".join(bits))
 
     # 用量（5h / 7d）。Claude/OpenAI 百分比来自上游全局配额；Grok
     # 展示官方当前周期额度 + Parrot 本地累计金额/token。
@@ -1395,7 +1482,23 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
 
     # 月度统计来自所有菜单共享的一次批量快照。
     ts = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{ak}")
-    if prov != "xai" and _has_local_usage_or_billing(ts):
+    if prov == "antigravity":
+        if _has_local_usage_or_billing(ts):
+            prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
+            stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
+            if (ts.get("cache_read") or 0) > 0:
+                stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
+            lines.append(stat_line)
+            if ts.get("avg_tps") is not None:
+                lines.append(
+                    f"⚡ TPS: 平均 {ui.fmt_tps(ts.get('avg_tps'))} · "
+                    f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
+                    f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
+                )
+            lines.append(f"💵 {ui.fmt_cost(ts)}")
+        else:
+            lines.append("💎 月度: <i>暂无本地请求</i>")
+    elif prov != "xai" and _has_local_usage_or_billing(ts):
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
         stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
@@ -1516,11 +1619,34 @@ def _default_models_for_settings(family: str) -> list[str]:
         raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
     elif family == "xai":
         raw = (cfg.get("xaiOAuth") or {}).get("defaultModels") or []
+    elif family == "antigravity":
+        raw = (cfg.get("antigravityOAuth") or {}).get("defaultModels") or []
     else:
         raw = cfg.get("oauthDefaultModels") or []
     if not isinstance(raw, list):
         return []
     return [str(x) for x in raw if str(x).strip()]
+
+
+def _antigravity_image_models_for_settings() -> list[str]:
+    cfg = config.get().get("antigravityOAuth")
+    raw = cfg.get("imageModels") if isinstance(cfg, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [str(x) for x in raw if str(x).strip()]
+
+
+def _antigravity_catalog_counts(acc: dict) -> tuple[int, int]:
+    models = acc.get("models")
+    if not isinstance(models, list) or not any(str(item).strip() for item in models):
+        models = _default_models_for_settings("antigravity")
+    text_n = len([item for item in models if str(item).strip()])
+    if "imageModels" in acc:
+        images = acc.get("imageModels") if isinstance(acc.get("imageModels"), list) else []
+    else:
+        images = _antigravity_image_models_for_settings()
+    image_n = len([item for item in images if str(item).strip()])
+    return text_n, image_n
 
 
 def _quota_monitor_values() -> tuple[bool, int, float]:
@@ -1549,6 +1675,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     anthropic_models = _default_models_for_settings("anthropic")
     openai_models = _default_models_for_settings("openai")
     xai_models = _default_models_for_settings("xai")
+    antigravity_models = _default_models_for_settings("antigravity")
     cfg = config.get()
     cursor_accounts = [
         acc for acc in cfg.get("oauthAccounts", [])
@@ -1557,6 +1684,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     xai_cfg = cfg.get("xaiOAuth") if isinstance(cfg.get("xaiOAuth"), dict) else {}
     xai_image_models = xai_cfg.get("imageModels") if isinstance(xai_cfg.get("imageModels"), list) else []
     xai_video_models = xai_cfg.get("videoModels") if isinstance(xai_cfg.get("videoModels"), list) else []
+    antigravity_image_models = _antigravity_image_models_for_settings()
     images_cfg = cfg.get("images") if isinstance(cfg.get("images"), dict) else {}
     gpt_images_status = "✅ 已启用" if images_cfg.get("enabled", True) else "🚫 已停用"
     mode_label = _usage_display_label()
@@ -1572,11 +1700,13 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"  {_provider_tag('claude')}  {len(anthropic_models)} 个 · "
         f"{_provider_tag('openai')}  {len(openai_models)} 个 · "
         f"{_provider_tag('xai')}  {len(xai_models)} 个",
-        f"  {_provider_tag('cursor')} 按账号自动同步（{len(cursor_accounts)} 个账号）",
+        f"  {_provider_tag('antigravity')}  {len(antigravity_models)} 个 · "
+        f"{_provider_tag('cursor')} 按账号自动同步（{len(cursor_accounts)} 个账号）",
         "",
         "🎨 <b>媒体能力</b>",
         f"GPT / Codex 图片: {gpt_images_status}",
         f"Grok Imagine: 图片 <b>{len(xai_image_models)}</b> · 视频 <b>{len(xai_video_models)}</b>",
+        f"Antigravity 出图: <b>{len(antigravity_image_models)}</b>",
         "",
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
         f"当前模式: {_cch_status_label()}",
@@ -2427,6 +2557,8 @@ def _format_month_stats_block(account_key: str, *,
         ).value
     overall = (((month_snapshot or {}).get("by_channel") or {}).get(ck))
     if not _has_local_usage_or_billing(overall):
+        if oauth_manager.provider_of(account_key) == "antigravity":
+            return "\n<b>⚡ 本月使用统计</b>\n<i>暂无本地请求</i>"
         return ""
     is_cursor = oauth_manager.provider_of(account_key) == "cursor"
     model_loading = False
@@ -2551,8 +2683,15 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         provider_line = _format_xai_provider_line(account_key, detail=True)
     elif prov == "antigravity":
         project_id = str(acc.get("project_id") or acc.get("projectId") or "").strip()
+        text_n, image_n = _antigravity_catalog_counts(acc)
+        catalog = f"{text_n} 个文本"
+        if image_n:
+            catalog += f" · {image_n} 个出图"
+        plan = antigravity_provider.credits_tier_label(_antigravity_raw(account_key)) or "?"
         provider_line = (
+            f"🏷️ 套餐: <code>{ui.escape_html(plan)}</code>\n"
             f"🏷️ Project: <code>{ui.escape_html(project_id or '?')}</code>\n"
+            f"🧬 模型目录: <code>{catalog}</code>\n"
         )
     elif prov == "cursor":
         profile_name = str(acc.get("cursor_profile_name") or "").strip()
@@ -2785,6 +2924,8 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         ui.answer_cb(cb_id, "拉取 Grok 官方账单...")
     elif provider == "cursor":
         ui.answer_cb(cb_id, "拉取 Cursor 额度和模型目录...")
+    elif provider == "antigravity":
+        ui.answer_cb(cb_id, "拉取 Antigravity quota summary / Credits...")
     else:
         ui.answer_cb(cb_id, "拉取中...")
 
@@ -2868,6 +3009,30 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
         elif quota_action and quota_action.get("action") == "still_over_quota":
             hit = " / ".join(quota_action.get("hit_windows") or []) or "?"
+            head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "resumed":
+            head += "\n♻ 额度已恢复，已自动解除配额禁用"
+        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+    elif provider == "antigravity":
+        block = usage_result.get("antigravity") if isinstance(usage_result.get("antigravity"), dict) else {}
+        summary_ok = bool(block.get("quota_groups")) and not block.get("quota_error")
+        credits_ok = bool(block.get("known"))
+        quota_error = block.get("quota_error")
+        if summary_ok and credits_ok:
+            head = "✅ Quota summary 与 Credits 均已更新"
+        elif summary_ok:
+            head = "⚠️ Quota summary 已更新；Credits 未返回有效数值（部分成功）"
+        elif credits_ok:
+            detail = _ag_quota_error_html(quota_error) if quota_error else "quota summary 无有效数据"
+            head = f"⚠️ Credits 已更新；Quota summary 失败（{ui.escape_html(detail)}，部分成功）"
+        else:
+            detail = _ag_quota_error_html(quota_error) if quota_error else "上游未返回有效数据"
+            head = f"❌ 未获取到有效 quota 数据（{ui.escape_html(detail)}）"
+        if quota_action and quota_action.get("action") == "disabled":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "Credits"
+            head += f"\n🔒 已自动标记为配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
+        elif quota_action and quota_action.get("action") == "still_over_quota":
+            hit = " / ".join(quota_action.get("hit_windows") or []) or "Credits"
             head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
         elif quota_action and quota_action.get("action") == "resumed":
             head += "\n♻ 额度已恢复，已自动解除配额禁用"

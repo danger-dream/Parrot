@@ -294,6 +294,53 @@ def test_xai_cli_billing_usage_parse_and_quota_shape(m, monkeypatch):
     assert flat["five_hour_util"] is None
 
 
+def test_refresh_notice_uses_xai_official_billing(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account({
+        "provider": "xai",
+        "email": "notice@x.ai",
+        "subject": "notice-sub",
+        "access_token": "at",
+        "refresh_token": "rt",
+        "expired": _future_expired(),
+        "enabled": True,
+    })
+    ak = "xai:notice-sub"
+    billed = om._build_refresh_notice(
+        ak,
+        {"thirty_day_util": None},
+        usage={
+            "xai": {
+                "billing": {
+                    "used_percent": 70.0,
+                    "period_end": "2026-08-13T06:54:28+00:00",
+                }
+            }
+        },
+    )
+    assert "官方额度" in billed
+    assert "70.00%" in billed
+    assert "本次未拉取到" not in billed
+    assert "月度额度" not in billed
+    assert "5h" not in billed
+
+    unknown = om._build_refresh_notice(
+        ak,
+        {"thirty_day_util": None},
+        usage={"xai": {"billing": {"used_percent": None}}},
+    )
+    assert "官方额度" not in unknown
+    assert "📊" not in unknown
+    assert "本次未拉取到" not in unknown
+
+    failed = om._build_refresh_notice(ak, None)
+    assert "官方额度" not in failed
+    assert "📊" not in failed
+    assert "获取失败" not in failed
+    assert "本次未拉取到" not in failed
+
+
 def test_xai_quota_resume_uses_fresh_billing_even_before_period_end(m):
     _setup(m)
     om = m["oauth_manager"]

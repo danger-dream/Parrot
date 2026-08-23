@@ -301,6 +301,7 @@ def _thinking_to_reasoning_item(block: dict[str, Any]) -> dict[str, Any] | None:
     text = str(block.get("thinking") or block.get("text") or "")
     signature = str(
         block.get("signature")
+        or block.get("data")
         or block.get("encrypted_content")
         or block.get("thoughtSignature")
         or ""
@@ -623,7 +624,10 @@ def _anthropic_usage_from_responses(resp: dict) -> dict[str, int]:
     }
 
 
-def translate_response(resp: dict, *, model: str = "", request_body: dict[str, Any] | None = None) -> dict:
+def translate_response(
+    resp: dict, *, model: str = "", request_body: dict[str, Any] | None = None,
+    allow_reasoning_bridge: bool = False,
+) -> dict:
     output = resp.get("output") if isinstance(resp.get("output"), list) else []
     optional_empty_string_fields_by_tool = (
         common.optional_empty_string_fields_by_tool_from_anthropic_tools(request_body.get("tools"))
@@ -631,18 +635,34 @@ def translate_response(resp: dict, *, model: str = "", request_body: dict[str, A
     )
     content: list[dict[str, Any]] = []
 
+    # The legacy bridge intentionally keeps its historical text aggregation and
+    # reasoning omission.  Antigravity opts into the ordered reasoning bridge
+    # below because Cloud Code signatures must survive Anthropic tool replay.
     text = resp.get("output_text")
-    if isinstance(text, str) and text:
-        content.append({"type": "text", "text": text})
-    else:
-        gathered = _gather_output_text(output)
-        if gathered:
-            content.append({"type": "text", "text": "".join(gathered)})
+    if not allow_reasoning_bridge:
+        if isinstance(text, str) and text:
+            content.append({"type": "text", "text": text})
+        else:
+            gathered = _gather_output_text(output)
+            if gathered:
+                content.append({"type": "text", "text": "".join(gathered)})
 
+    seen_signatures: set[str] = set()
     for item in output:
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "function_call":
+        if allow_reasoning_bridge and item.get("type") == "message":
+            parts = item.get("content") if isinstance(item.get("content"), list) else []
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") in ("output_text", "refusal"):
+                    value = part.get("text") or part.get("refusal")
+                    if isinstance(value, str) and value:
+                        content.append({"type": "text", "text": value})
+        elif item.get("type") == "function_call":
+            signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
+            if allow_reasoning_bridge and signature and signature not in seen_signatures:
+                content.append({"type": "redacted_thinking", "data": signature})
+                seen_signatures.add(signature)
             content.append({
                 "type": "tool_use",
                 "id": str(item.get("call_id") or item.get("id") or _gen_id("call_")),
@@ -654,9 +674,20 @@ def translate_response(resp: dict, *, model: str = "", request_body: dict[str, A
                 ),
             })
         elif item.get("type") == "reasoning":
-            # Do not expose reasoning summaries as Anthropic thinking until a
-            # deliberate reasoning bridge + capability guard is enabled.
-            continue
+            if not allow_reasoning_bridge:
+                continue
+            signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
+            summary = item.get("summary") if isinstance(item.get("summary"), list) else []
+            thinking = "".join(
+                str(part.get("text") or "") for part in summary
+                if isinstance(part, dict) and part.get("type") in ("summary_text", "text")
+            )
+            if signature and thinking:
+                content.append({"type": "thinking", "thinking": thinking, "signature": signature})
+                seen_signatures.add(signature)
+            elif signature:
+                content.append({"type": "redacted_thinking", "data": signature})
+                seen_signatures.add(signature)
 
     has_tool_use = any(block.get("type") == "tool_use" for block in content)
     return {

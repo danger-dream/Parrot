@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 import time
 from typing import Any
@@ -54,6 +55,13 @@ DEFAULT_USER_AGENT = f"antigravity/hub/{DEFAULT_HUB_VERSION} {DEFAULT_HUB_PLATFO
 NODE_API_CLIENT_UA = "google-api-nodejs-client/10.3.0"
 GOOG_API_CLIENT_UA = "gl-node/22.21.1"
 CREDIT_TYPE = "GOOGLE_ONE_AI"
+TIER_LABELS = {
+    "g1-pro-tier": "Google AI Pro",
+    "g1-ultra-tier": "Google AI Ultra",
+    "free-tier": "免费档",
+    "standard-tier": "Antigravity",
+    "mock-tier": "Mock",
+}
 
 _TOKEN_HTTP_TIMEOUT = 120.0
 _API_HTTP_TIMEOUT = 30.0
@@ -205,6 +213,14 @@ def stream_generate_content_url() -> str:
 
 def load_code_assist_url() -> str:
     return f"{api_base_url()}/{API_VERSION}:loadCodeAssist"
+
+
+def retrieve_user_quota_url() -> str:
+    return f"{api_base_url()}/{API_VERSION}:retrieveUserQuota"
+
+
+def retrieve_user_quota_summary_url() -> str:
+    return f"{api_base_url()}/{API_VERSION}:retrieveUserQuotaSummary"
 
 
 def onboard_user_url() -> str:
@@ -631,6 +647,7 @@ def parse_credits(load_resp: Any) -> dict[str, Any]:
 
     Plan rule (deliberately stricter than CPA): a missing/non-array
     ``availableCredits`` is *unknown*, not ``available=false``.
+    Google often returns paid-tier name + minimum without ``creditAmount``.
     """
     if not isinstance(load_resp, dict):
         return {"known": False, "quota_supported": True, "source": "loadCodeAssist"}
@@ -639,17 +656,25 @@ def parse_credits(load_resp: Any) -> dict[str, Any]:
         paid = {}
     current_tier = load_resp.get("currentTier")
     current_tier_id = ""
+    current_tier_name = ""
     if isinstance(current_tier, dict):
         current_tier_id = str(current_tier.get("id") or "").strip()
+        current_tier_name = str(current_tier.get("name") or "").strip()
     tier = str(paid.get("id") or current_tier_id or "").strip()
+    tier_name = str(paid.get("name") or current_tier_name or "").strip() or None
+    tier_description = str(paid.get("description") or "").strip() or None
     credits = paid.get("availableCredits")
+    unknown = {
+        "known": False,
+        "quota_supported": True,
+        "source": "loadCodeAssist",
+        "tier": tier or None,
+        "tier_name": tier_name,
+        "tier_description": tier_description,
+    }
     if not isinstance(credits, list):
-        return {
-            "known": False,
-            "quota_supported": True,
-            "source": "loadCodeAssist",
-            "tier": tier or None,
-        }
+        return unknown
+    seen_minimum = None
     for item in credits:
         if not isinstance(item, dict):
             continue
@@ -657,6 +682,8 @@ def parse_credits(load_resp: Any) -> dict[str, Any]:
             continue
         amount = _num(item.get("creditAmount"))
         minimum = _num(item.get("minimumCreditAmountForUsage"))
+        if minimum is not None and seen_minimum is None:
+            seen_minimum = minimum
         if amount is None or minimum is None:
             continue
         return {
@@ -664,17 +691,17 @@ def parse_credits(load_resp: Any) -> dict[str, Any]:
             "quota_supported": True,
             "source": "loadCodeAssist",
             "tier": tier or None,
+            "tier_name": tier_name,
+            "tier_description": tier_description,
             "credit_type": CREDIT_TYPE,
             "credit_amount": amount,
             "minimum_credit_amount": minimum,
             "available": amount >= minimum,
         }
-    return {
-        "known": False,
-        "quota_supported": True,
-        "source": "loadCodeAssist",
-        "tier": tier or None,
-    }
+    if seen_minimum is not None:
+        unknown["credit_type"] = CREDIT_TYPE
+        unknown["minimum_credit_amount"] = seen_minimum
+    return unknown
 
 
 def empty_usage() -> dict:
@@ -692,13 +719,214 @@ def empty_usage() -> dict:
     }
 
 
+def credits_tier_label(block: dict | None) -> str:
+    """Human-readable plan name. Prefer Google's paidTier.name over the raw id."""
+    if not isinstance(block, dict):
+        return ""
+    name = str(block.get("tier_name") or "").strip()
+    if name:
+        return name
+    tier_id = str(block.get("tier") or "").strip()
+    if not tier_id:
+        return ""
+    return TIER_LABELS.get(tier_id, "")
+
+
+def format_credit_amount(value: object) -> str:
+    if value is None:
+        return "?"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if abs(number - int(number)) < 1e-9:
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+def format_credits_usage_text(block: dict | None) -> str:
+    """Compact Credits wording, same shape as other OAuth 📊 lines."""
+    if not isinstance(block, dict) or not block:
+        return "尚未获取"
+    if block.get("known"):
+        status = "可用" if block.get("available") else "已耗尽"
+        return (
+            f"{format_credit_amount(block.get('credit_amount'))}"
+            f"（最低 {format_credit_amount(block.get('minimum_credit_amount'))}）"
+            f" · {status}"
+        )
+    minimum = block.get("minimum_credit_amount")
+    if minimum is not None:
+        return f"上游未返回剩余额度（最低 {format_credit_amount(minimum)}）"
+    return "上游未返回剩余额度"
+
+
+# ─── quota buckets（retrieveUserQuota 家族） ─────────────────────
+
+
+def _parse_reset_time(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text.endswith("Z") or "+" in text[10:] else text
+
+
+def parse_quota_summary(summary_resp: Any) -> list[dict[str, Any]]:
+    """Parse retrieveUserQuotaSummary into display-friendly group dicts.
+
+    Each group: {display_name, description, buckets: [{bucket_id, window,
+    display_name, reset_time, remaining_fraction, description}]}.
+    Missing fields are dropped, never invented.
+    """
+    if not isinstance(summary_resp, dict):
+        return []
+    groups_out: list[dict[str, Any]] = []
+    for raw_group in summary_resp.get("groups") or []:
+        if not isinstance(raw_group, dict):
+            continue
+        buckets_out = []
+        for raw in raw_group.get("buckets") or []:
+            if not isinstance(raw, dict):
+                continue
+            bucket = {
+                "bucket_id": str(raw.get("bucketId") or "").strip(),
+                "window": str(raw.get("window") or "").strip(),
+                "display_name": str(raw.get("displayName") or "").strip(),
+                "reset_time": _parse_reset_time(raw.get("resetTime")),
+                "remaining_fraction": _num(raw.get("remainingFraction")),
+                "description": str(raw.get("description") or "").strip(),
+            }
+            if bucket["remaining_fraction"] is None:
+                continue
+            buckets_out.append(bucket)
+        if not buckets_out:
+            continue
+        groups_out.append({
+            "display_name": str(raw_group.get("displayName") or "").strip() or "?",
+            "description": str(raw_group.get("description") or "").strip(),
+            "buckets": buckets_out,
+        })
+    return groups_out
+
+
+def _worst_window(groups: list[dict], window: str) -> tuple[float | None, str | None]:
+    """Return (min remaining fraction, its reset time) across groups for a window."""
+    worst: float | None = None
+    worst_reset: str | None = None
+    for group in groups:
+        for bucket in group.get("buckets") or []:
+            if bucket.get("window") != window:
+                continue
+            frac = bucket.get("remaining_fraction")
+            if frac is None:
+                continue
+            if worst is None or frac < worst:
+                worst = frac
+                reset = bucket.get("reset_time") or ""
+                worst_reset = reset or worst_reset
+    if worst is None:
+        return None, None
+    return worst, worst_reset
+
+
+def _safe_quota_error(exc: Exception) -> dict[str, Any]:
+    """Return a cache/UI-safe classification without tokens or validation URLs."""
+    response = getattr(exc, "response", None)
+    http_status = getattr(response, "status_code", None)
+    payload: Any = None
+    if response is not None:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    error = error if isinstance(error, dict) else {}
+    status = str(error.get("status") or "").strip() or None
+    code = error.get("code")
+    if http_status is None and isinstance(code, int):
+        http_status = code
+    message = str(error.get("message") or "").strip()
+    reasons: list[str] = []
+    for detail in error.get("details") or []:
+        if not isinstance(detail, dict):
+            continue
+        for candidate in (detail.get("reason"), (detail.get("metadata") or {}).get("reason")
+                          if isinstance(detail.get("metadata"), dict) else None):
+            value = str(candidate or "").strip().upper()
+            if value and value not in reasons:
+                reasons.append(value)
+    validation = (
+        status == "VALIDATION_REQUIRED"
+        or "VALIDATION_REQUIRED" in reasons
+        or "VALIDATION_REQUIRED" in message.upper()
+    )
+    name = type(exc).__name__.lower()
+    if validation:
+        kind = "validation_required"
+    elif http_status == 401:
+        kind = "unauthorized"
+    elif http_status == 403:
+        kind = "forbidden"
+    elif http_status == 429:
+        kind = "rate_limited"
+    elif isinstance(http_status, int) and http_status >= 500:
+        kind = "server_error"
+    elif isinstance(exc, TimeoutError) or "timeout" in name:
+        kind = "timeout"
+    elif http_status is not None:
+        kind = "http_error"
+    else:
+        kind = "network"
+    # Google messages occasionally embed a one-shot validation URL. Never cache it.
+    safe_message = re.sub(r"https?://\S+", "[链接已隐藏]", message)[:240] or None
+    out = {
+        "kind": kind,
+        "http_status": http_status if isinstance(http_status, int) else None,
+        "status": status,
+        "code": code if isinstance(code, (int, str)) else None,
+        "message": safe_message,
+        "validation_required": validation,
+    }
+    if validation:
+        out["hint"] = "需先在 Google 完成账号验证后重试"
+    return {key: value for key, value in out.items() if value is not None}
+
+
+def fetch_quota_summary_sync(access_token: str) -> list[dict[str, Any]]:
+    """Call v1internal:retrieveUserQuotaSummary. Empty list on failure-safe absence."""
+    token = str(access_token or "").strip()
+    if not token:
+        raise ValueError("antigravity retrieveUserQuotaSummary: missing access token")
+    if _mock_mode_enabled():
+        return [{
+            "display_name": "Gemini Models",
+            "description": "Mock group",
+            "buckets": [
+                {"bucket_id": "gemini-5h", "window": "5h", "display_name": "Five Hour Limit Remaining",
+                 "reset_time": "2099-01-01T00:00:00Z", "remaining_fraction": 0.75, "description": "mock"},
+                {"bucket_id": "gemini-weekly", "window": "weekly", "display_name": "Weekly Limit Remaining",
+                 "reset_time": "2099-01-07T00:00:00Z", "remaining_fraction": 0.9, "description": "mock"},
+            ],
+        }]
+    resp = network.post_sync(
+        retrieve_user_quota_summary_url(),
+        json={},
+        headers=_auth_headers(token),
+        timeout=_API_HTTP_TIMEOUT,
+        proxy_purpose="oauth_antigravity",
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return parse_quota_summary(data if isinstance(data, dict) else {})
+
+
 def _usage_from_credits(credits: dict) -> dict:
-    usage = empty_usage()
+    usage = empty_usage() or {}
     usage["antigravity"] = {
         "source": credits.get("source") or "loadCodeAssist",
         "quota_supported": True,
         "known": bool(credits.get("known")),
         "tier": credits.get("tier"),
+        "tier_name": credits.get("tier_name"),
+        "tier_description": credits.get("tier_description"),
         "credit_type": credits.get("credit_type") or CREDIT_TYPE,
         "credit_amount": credits.get("credit_amount"),
         "minimum_credit_amount": credits.get("minimum_credit_amount"),
@@ -708,18 +936,33 @@ def _usage_from_credits(credits: dict) -> dict:
 
 
 def fetch_usage_sync(access_token: str) -> dict:
-    if _mock_mode_enabled():
-        return _usage_from_credits({
-            "known": True,
-            "source": "mock",
-            "tier": "Mock",
-            "credit_type": CREDIT_TYPE,
-            "credit_amount": 100.0,
-            "minimum_credit_amount": 1.0,
-            "available": True,
-        })
     load_resp = load_code_assist_sync(access_token)
-    return _usage_from_credits(parse_credits(load_resp))
+    usage = _usage_from_credits(parse_credits(load_resp))
+    # Best-effort quota summary; failure here must not break credits usage.
+    try:
+        groups = fetch_quota_summary_sync(access_token)
+    except Exception as exc:
+        groups = []
+        usage["antigravity"]["quota_error"] = _safe_quota_error(exc)
+    if groups:
+        usage["antigravity"]["quota_groups"] = groups
+        # Fill standard 5h/7d windows (min remaining across groups) so
+        # generic UI / disable-evaluation paths keep working.
+        fh_frac, fh_reset = _worst_window(groups, "5h")
+        wk_frac, wk_reset = _worst_window(groups, "weekly")
+        if fh_frac is not None:
+            usage["five_hour"] = {
+                "utilization": round((1.0 - fh_frac) * 100.0, 4),
+                "resets_at": fh_reset,
+                "remaining_fraction": fh_frac,
+            }
+        if wk_frac is not None:
+            usage["seven_day"] = {
+                "utilization": round((1.0 - wk_frac) * 100.0, 4),
+                "resets_at": wk_reset,
+                "remaining_fraction": wk_frac,
+            }
+    return usage
 
 
 async def fetch_usage(access_token: str) -> dict:

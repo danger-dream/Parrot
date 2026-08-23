@@ -38,6 +38,7 @@ from .. import (
 )
 from ..channel.base import Channel, UpstreamRequest
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
+from . import compaction_owner
 from .codex_device_fingerprint import apply_device_fingerprint
 from .codex_identity_confuse import (
     ConfuseState,
@@ -2007,6 +2008,10 @@ async def _try_sse_channel(
                 client_key=client_key,
                 translator_ctx=result.translator_ctx,
             )
+            compaction_owner.persist_observed_safe(
+                ch, body, {"output": result.output_items},
+                path=f"downstream_responses_ws_{result.upstream_transport}_finalize",
+            )
             await await_ws_owned(asyncio.to_thread(
                 log_db.finish_success,
                 request_id, ch.key, ch.type, resolved_model,
@@ -2537,6 +2542,10 @@ async def _relay_ws_session(
                 resolved_model=resolved_model,
                 client_key=client_key,
                 translator_ctx=result.translator_ctx,
+            )
+            compaction_owner.persist_observed_safe(
+                ch, body, {"output": result.output_items},
+                path=f"downstream_responses_ws_{result.upstream_transport}_finalize",
             )
             await await_ws_owned(asyncio.to_thread(
                 log_db.finish_success,

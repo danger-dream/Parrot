@@ -70,12 +70,27 @@ def test_overview_buttons_use_provider_custom_icons():
     assert kb[0][1]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
     assert kb[0][2]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("xai")
     assert [b["text"] for b in kb[1]] == ["Antigravity"]
-    expected_ag_icon = ui.provider_custom_emoji_id("antigravity")
-    if expected_ag_icon:
-        assert kb[1][0]["icon_custom_emoji_id"] == expected_ag_icon
-    else:
-        assert "icon_custom_emoji_id" not in kb[1][0]
+    assert kb[1][0]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("antigravity")
+    assert kb[1][0]["icon_custom_emoji_id"] == "6077644693984779782"
     assert kb[2][0]["callback_data"] == "oa:settings"
+
+
+def test_account_settings_summary_lists_antigravity_catalog():
+    from src.telegram.menus import oauth_menu
+
+    _reset()
+    assert oauth_menu._default_models_for_settings("antigravity") == ["gemini-3.7-flash-high"]
+    assert "claude-old" not in oauth_menu._default_models_for_settings("antigravity")
+    text, _kb = oauth_menu._settings_text_and_kb()
+    ag_at = text.index("Antigravity")
+    assert "1 个" in text[ag_at:ag_at + 40]
+    assert "Antigravity 出图:" in text
+    acc = {
+        "provider": "antigravity",
+        "email": "ag@example.com",
+        "project_id": "proj-1",
+    }
+    assert oauth_menu._antigravity_catalog_counts(acc)[0] == 1
 
 
 def test_claude_skips_live_and_uses_static(monkeypatch):
