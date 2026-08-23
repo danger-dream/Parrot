@@ -141,7 +141,11 @@ Adapter 在 toolkit 前：Gemini JSON/SSE → 标准 Responses。
 
 必做：多轮文本、function calling 闭环、非流式、流式、finishReason、usageMetadata。  
 后置但不许从 v1 目录拿掉：图片、structured output、同账号 thought signature。  
-Matrix 现有 guard（Anthropic thinking、hosted tools、file_id、audio、`n>1`）保持。
+Matrix 对 hosted tools、`file_id`、audio、`n>1` 仍保持。Antigravity 入口会：
+- 洗 Claude 工具 schema（VALIDATED + sanitize）
+- 把历史 `thinking` / `redacted_thinking` 转成 thought part
+- Claude-on-Antigravity 用 `thinkingBudget`，Gemini 仍用 `thinkingLevel`
+- `input_file` / PDF 转 `inlineData`
 
 SSE 文本是增量还是累计，必须用真实录制 fixture 确认，不能猜。
 
@@ -218,7 +222,10 @@ pong 不够。加深后确认：
 - 连续 4 轮、约 7.2k prompt：单轮命中卡在约 4070 token（≈56%）。这是上游隐式缓存按约 4096 一块切，不是 session 每轮都变。约 3.5k 前缀连续 5 轮是 0%。
 - `sessionId` 已改成对齐 OpenAI / Grok：优先 `prompt_cache_key` / 客户端 session，不再只哈希第一段 user 文本。钉住后第 1 轮也能命中，4 轮合计从 42.2% 升到 56.2%；单轮天花板没有突破 4096。
 - Anthropic `cache_control` 不会变成 Gemini 字段；Claude 入口仍会经 `cache_hints` 补 `prompt_cache_key`，再写成 Antigravity sessionId。
-- Anthropic 顶层 `thinking` / `output_config.effort`：Antigravity channel 会 `allow_reasoning_effort`，映射到 `reasoning.effort` → Gemini `thinkingLevel`。历史消息里的 `thinking` / `redacted_thinking` 块仍不转。
+- Anthropic 顶层 `thinking` / `output_config.effort`：Antigravity channel 会 `allow_reasoning_effort`。Gemini 走 `thinkingLevel`；Claude-on-Antigravity 走 `thinkingBudget`（保留原始 `budget_tokens`）。
+- 历史 `thinking` / `redacted_thinking` 仅在 Antigravity 路径转成 Responses `reasoning` + Gemini thought part；其它 Responses 上游仍拒绝。
+- Claude 工具 schema 会按 CPA 清洗；`input_file` / PDF 会进 `inlineData`。
+- 运行时 429 会读 Google `RetryDelay` / `QUOTA_EXHAUSTED` / `INSUFFICIENT_G1_CREDITS_BALANCE`，不再只认 HTTP `Retry-After` 头。
 
 ## 13. 对照资源
 

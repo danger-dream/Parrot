@@ -19,6 +19,7 @@ import uuid
 from typing import Any, Iterator
 
 from ..oauth import antigravity as ag_provider
+from . import antigravity_schema
 
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
@@ -101,6 +102,33 @@ def _sanitize_thought_signatures(request: dict) -> None:
             # Parallel siblings stay unsigned, matching native Gemini history.
 
 
+def _sanitize_request_schemas(request: dict, *, model: str) -> None:
+    require_placeholder = antigravity_schema.uses_antigravity_schema(model)
+    tools = request.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            decls = tool.get("functionDeclarations") or tool.get("function_declarations")
+            if not isinstance(decls, list):
+                continue
+            for decl in decls:
+                if not isinstance(decl, dict):
+                    continue
+                for key in ("parameters", "parametersJsonSchema", "parameters_json_schema"):
+                    schema = decl.get(key)
+                    if isinstance(schema, dict):
+                        decl[key] = antigravity_schema.clean_tool_schema(
+                            schema, require_placeholder=require_placeholder,
+                        )
+    gen = request.get("generationConfig") or request.get("generation_config")
+    if isinstance(gen, dict):
+        for key in ("responseSchema", "responseJsonSchema", "response_schema", "response_json_schema"):
+            schema = gen.get(key)
+            if isinstance(schema, dict):
+                gen[key] = antigravity_schema.clean_response_schema(schema)
+
+
 def _delta_from_snapshot(previous: str, current: str) -> str:
     if current.startswith(previous):
         return current[len(previous):]
@@ -155,6 +183,9 @@ def _part_from_content_item(item: Any) -> dict[str, Any] | None:
         inline = _inline_data_from_url(url)
         if inline:
             return {"inlineData": inline}
+    file_part = _file_part_from_content_item(item, typ)
+    if file_part:
+        return file_part
     if item.get("inlineData") or item.get("inline_data"):
         raw = item.get("inlineData") or item.get("inline_data")
         if isinstance(raw, dict) and raw.get("data"):
@@ -167,6 +198,46 @@ def _part_from_content_item(item: Any) -> dict[str, Any] | None:
     return None
 
 
+def _mime_from_filename(name: str) -> str:
+    lowered = str(name or "").strip().lower()
+    if lowered.endswith(".pdf"):
+        return "application/pdf"
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    if lowered.endswith(".gif"):
+        return "image/gif"
+    if lowered.endswith(".txt"):
+        return "text/plain"
+    if lowered.endswith((".html", ".htm")):
+        return "text/html"
+    return "application/octet-stream"
+
+
+def _file_part_from_content_item(item: dict, typ: str) -> dict[str, Any] | None:
+    if typ not in {"input_file", "file"} and not item.get("file_data") and not item.get("file_url"):
+        return None
+    filename = str(item.get("filename") or item.get("name") or "")
+    file_data = item.get("file_data") or item.get("fileData")
+    if isinstance(file_data, str) and file_data.strip():
+        data = file_data.strip()
+        inline = _inline_data_from_url(data)
+        if inline:
+            return {"inlineData": inline}
+        return {"inlineData": {"mimeType": _mime_from_filename(filename), "data": data}}
+    file_url = item.get("file_url") or item.get("fileUrl")
+    if isinstance(file_url, str) and file_url.strip():
+        url = file_url.strip()
+        inline = _inline_data_from_url(url)
+        if inline:
+            return {"inlineData": inline}
+        return {"fileData": {"mimeType": _mime_from_filename(filename), "fileUri": url}}
+    return None
+
+
 def _thinking_config(payload: dict) -> dict[str, Any] | None:
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, dict):
@@ -174,6 +245,9 @@ def _thinking_config(payload: dict) -> dict[str, Any] | None:
     effort = str(reasoning.get("effort") or "").strip().lower()
     if not effort or effort == "none":
         return None
+    model = str(payload.get("model") or "")
+    if "claude" in model.lower():
+        return _claude_thinking_budget(payload, reasoning, effort)
     mapping = {
         "minimal": "minimal",
         "low": "low",
@@ -185,6 +259,34 @@ def _thinking_config(payload: dict) -> dict[str, Any] | None:
     if not level:
         return None
     return {"thinkingLevel": level}
+
+
+def _claude_thinking_budget(payload: dict, reasoning: dict, effort: str) -> dict[str, Any] | None:
+    raw = reasoning.get("budget_tokens")
+    try:
+        budget = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        budget = None
+    if budget is None:
+        budget = {
+            "minimal": 1024,
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384,
+            "xhigh": 32768,
+        }.get(effort)
+    if budget is None:
+        return None
+    max_out = payload.get("max_output_tokens")
+    try:
+        max_tokens = int(max_out) if max_out is not None else 64000
+    except (TypeError, ValueError):
+        max_tokens = 64000
+    if max_tokens > 0 and budget >= max_tokens:
+        budget = max_tokens - 1
+    if budget < 1024:
+        return None
+    return {"thinkingBudget": min(budget, 64000)}
 
 
 def _structured_output(payload: dict) -> tuple[str | None, dict | None]:
@@ -341,7 +443,12 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
             decl["description"] = str(fn.get("description") or tool.get("description") or "")
         params = fn.get("parameters") or tool.get("parameters")
         if isinstance(params, dict):
-            decl["parameters"] = params
+            decl["parameters"] = antigravity_schema.clean_tool_schema(
+                params,
+                require_placeholder=antigravity_schema.uses_antigravity_schema(
+                    str(payload.get("model") or "")
+                ),
+            )
         declarations.append(decl)
     if declarations:
         tools_out.append({"functionDeclarations": declarations})
@@ -360,7 +467,7 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
     if mime:
         generation["responseMimeType"] = mime
     if schema:
-        generation["responseSchema"] = schema
+        generation["responseSchema"] = antigravity_schema.clean_response_schema(schema)
 
     out: dict[str, Any] = {"contents": contents}
     if system_parts:
@@ -430,6 +537,14 @@ def wrap_cloud_code(
             fcc = tool_config.setdefault("functionCallingConfig", {})
             if isinstance(fcc, dict) and not fcc.get("mode"):
                 fcc["mode"] = "VALIDATED"
+        gen = request.get("generationConfig")
+        thinking = gen.get("thinkingConfig") if isinstance(gen, dict) else None
+        if isinstance(thinking, dict) and thinking.get("thinkingBudget") is not None:
+            if not isinstance(gen, dict):
+                gen = {}
+                request["generationConfig"] = gen
+            if gen.get("maxOutputTokens") is None:
+                gen["maxOutputTokens"] = 64000
     else:
         gen = request.get("generationConfig")
         if isinstance(gen, dict):
@@ -437,6 +552,7 @@ def wrap_cloud_code(
             if not gen:
                 request.pop("generationConfig", None)
 
+    _sanitize_request_schemas(request, model=model)
     _sanitize_thought_signatures(request)
 
     envelope = {

@@ -3,7 +3,7 @@
 Phase 8 third path: Anthropic ingress → OpenAI Responses upstream.  Supported
 now: text/image/document input, function tools, assistant tool_use, user
 tool_result, and narrow streaming output translation.  Guarded for now:
-thinking/reasoning (unless the caller opts in), citation/stateful documents,
+thinking/reasoning (unless the caller opts in, including history blocks), citation/stateful documents,
 built-in Anthropic tools, and stateful Responses concepts.
 """
 
@@ -32,7 +32,12 @@ def _json_dumps(value: Any, *, sort_keys: bool = False) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=sort_keys)
 
 
-def guard_request(body: dict, *, target_model: str | None = None) -> None:
+def guard_request(
+    body: dict,
+    *,
+    target_model: str | None = None,
+    allow_thinking_history: bool = False,
+) -> None:
     if not isinstance(body, dict):
         _fail("request body must be a JSON object")
     if body.get("thinking") is not None and not common.anthropic_thinking_is_disabled(body):
@@ -67,6 +72,8 @@ def guard_request(body: dict, *, target_model: str | None = None) -> None:
             if typ in ("text", "image", "document", "tool_use"):
                 continue
             if typ in ("thinking", "redacted_thinking"):
+                if allow_thinking_history:
+                    continue
                 _fail("thinking/redacted_thinking cannot be safely converted to Responses yet", param="messages")
             _fail(f"unsupported Anthropic content block for Responses bridge: {typ!r}", param="messages")
 
@@ -290,7 +297,36 @@ def _tool_result_output(block: dict[str, Any]) -> str | list[dict[str, Any]]:
     return _json_dumps(content)
 
 
-def _messages_to_input_items(messages: Any, *, codex_oauth: bool = False) -> list[dict[str, Any]]:
+def _thinking_to_reasoning_item(block: dict[str, Any]) -> dict[str, Any] | None:
+    text = str(block.get("thinking") or block.get("text") or "")
+    signature = str(
+        block.get("signature")
+        or block.get("encrypted_content")
+        or block.get("thoughtSignature")
+        or ""
+    ).strip()
+    if block.get("type") == "redacted_thinking" and not text:
+        text = ""
+    if not text and not signature:
+        return None
+    item: dict[str, Any] = {
+        "type": "reasoning",
+        "id": _gen_id("rs_"),
+        "summary": [{"type": "summary_text", "text": text}] if text else [],
+        "status": "completed",
+    }
+    if signature:
+        item["encrypted_content"] = signature
+        item["thoughtSignature"] = signature
+    return item
+
+
+def _messages_to_input_items(
+    messages: Any,
+    *,
+    codex_oauth: bool = False,
+    allow_thinking_history: bool = False,
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -345,7 +381,14 @@ def _messages_to_input_items(messages: Any, *, codex_oauth: bool = False) -> lis
                     "output": _tool_result_output(block),
                 })
             elif typ in ("thinking", "redacted_thinking"):
-                _fail("thinking/redacted_thinking cannot be safely converted to Responses yet", param="messages")
+                if not allow_thinking_history:
+                    _fail("thinking/redacted_thinking cannot be safely converted to Responses yet", param="messages")
+                if role != "assistant":
+                    _fail("thinking content is only supported in assistant messages on Responses bridge", param="messages")
+                _flush_message(items, role, parts)
+                reasoning = _thinking_to_reasoning_item(block)
+                if reasoning:
+                    items.append(reasoning)
             else:
                 _fail(f"unsupported Anthropic content block for Responses bridge: {typ!r}", param="messages")
         _flush_message(items, role, parts)
@@ -444,9 +487,17 @@ def translate_request(
     codex_oauth: bool = False,
     allow_reasoning_effort: bool = False,
 ) -> dict:
-    guard_request(body, target_model=target_model)
+    guard_request(
+        body,
+        target_model=target_model,
+        allow_thinking_history=allow_reasoning_effort,
+    )
     payload: dict[str, Any] = {
-        "input": _messages_to_input_items(body.get("messages") or [], codex_oauth=codex_oauth),
+        "input": _messages_to_input_items(
+            body.get("messages") or [],
+            codex_oauth=codex_oauth,
+            allow_thinking_history=allow_reasoning_effort,
+        ),
         "stream": bool(body.get("stream")),
     }
     instructions = _system_to_instructions(body.get("system"))
@@ -477,7 +528,12 @@ def translate_request(
                 param="thinking",
                 scope="candidate",
             )
-        payload["reasoning"] = {"effort": effort}
+        reasoning: dict[str, Any] = {"effort": effort}
+        if allow_reasoning_effort:
+            budget = common.anthropic_thinking_budget_tokens(body)
+            if budget is not None:
+                reasoning["budget_tokens"] = budget
+        payload["reasoning"] = reasoning
     ok, service_tier = common.map_anthropic_service_tier_to_openai(
         body.get("service_tier"),
         codex_oauth=codex_oauth,

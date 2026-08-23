@@ -570,6 +570,16 @@ def test_anthropic_thinking_maps_to_gemini_thinking_level(m):
     }, "gemini-3-flash", ingress_protocol="anthropic"))
     assert json.loads(high.body)["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "high"
 
+    claude = asyncio.run(ch.build_upstream_request({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 4096,
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+        "messages": [{"role": "user", "content": "hi"}],
+    }, "claude-sonnet-4-6", ingress_protocol="anthropic"))
+    claude_thinking = json.loads(claude.body)["request"]["generationConfig"]["thinkingConfig"]
+    assert claude_thinking["thinkingBudget"] == 2048
+    assert "thinkingLevel" not in claude_thinking
+
 
 def test_tool_history_preserves_id_and_thought_signature(m):
     codec = m["codec"]
@@ -769,3 +779,153 @@ def test_image_inline_data_restores_as_output_image(m):
     assert kinds == ["output_text", "output_image"]
     assert urls == ["data:image/png;base64,AAA"]
     assert restored["output_text"] == "here"
+
+
+def test_claude_tool_schema_is_sanitized(m):
+    from src.providers import antigravity_schema
+
+    cleaned = antigravity_schema.clean_tool_schema({
+        "type": "object",
+        "title": "Lookup",
+        "$schema": "https://json-schema.org/draft/07/schema#",
+        "additionalProperties": False,
+        "properties": {
+            "q": {"type": "string", "format": "email", "minLength": 2, "enum": ["a", "b"]},
+            "flag": {"const": True},
+        },
+        "anyOf": [{"type": "object"}, {"type": "null"}],
+    }, require_placeholder=True)
+    assert "$schema" not in cleaned
+    assert "additionalProperties" not in cleaned
+    assert "enum" not in cleaned["properties"]["q"]
+    assert "format" not in cleaned["properties"]["q"]
+    assert "const" not in cleaned["properties"]["flag"]
+    assert "Allowed:" in cleaned["properties"]["q"]["description"]
+
+    empty = antigravity_schema.clean_tool_schema({"type": "object"}, require_placeholder=True)
+    assert empty["properties"]["reason"]["type"] == "string"
+    assert empty["required"] == ["reason"]
+
+    env = m["codec"].wrap_cloud_code({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "tools": [{
+            "functionDeclarations": [{
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string", "format": "uuid"}},
+                    "additionalProperties": False,
+                },
+            }],
+        }],
+    }, model="claude-sonnet-4-6", project_id="proj-x")
+    params = env["request"]["tools"][0]["functionDeclarations"][0]["parameters"]
+    assert "additionalProperties" not in params
+    assert "format" not in params["properties"]["q"]
+
+
+def test_anthropic_thinking_history_replays_as_thought(m):
+    from src.openai.transform import anthropic_to_responses
+    from src.openai.transform.guard import GuardError
+
+    history = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 4096,
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig-history-1234567890"},
+                {"type": "text", "text": "ok"},
+            ]},
+            {"role": "user", "content": "again"},
+        ],
+    }
+    with pytest.raises(GuardError, match="thinking/redacted_thinking"):
+        anthropic_to_responses.translate_request(history, target_model="claude-sonnet-4-6")
+    mapped = anthropic_to_responses.translate_request(
+        history, target_model="claude-sonnet-4-6", allow_reasoning_effort=True,
+    )
+    assert mapped["reasoning"]["budget_tokens"] == 2048
+    kinds = [item.get("type") for item in mapped["input"]]
+    assert "reasoning" in kinds
+    thought = next(item for item in mapped["input"] if item["type"] == "reasoning")
+    assert thought["encrypted_content"] == "sig-history-1234567890"
+
+    gemini = m["codec"].responses_to_gemini({**mapped, "model": "claude-sonnet-4-6"})
+    thought_part = gemini["contents"][1]["parts"][0]
+    assert thought_part["thought"] is True
+    assert thought_part["thoughtSignature"] == "sig-history-1234567890"
+    assert thought_part["text"] == "plan"
+
+
+def test_input_file_becomes_inline_data(m):
+    gemini = m["codec"].responses_to_gemini({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "read this"},
+                {"type": "input_file", "filename": "note.pdf", "file_data": "JVBERi0x"},
+            ],
+        }],
+    })
+    parts = gemini["contents"][0]["parts"]
+    assert parts[0]["text"] == "read this"
+    assert parts[1]["inlineData"]["mimeType"] == "application/pdf"
+    assert parts[1]["inlineData"]["data"] == "JVBERi0x"
+
+
+def test_antigravity_429_reads_retry_delay_and_quota_reason(m):
+    from src.failover import _attach_retry_after_from_response
+    from src.protocols.runtime import AttemptResult, bounded_account_quota_error
+    from src.providers.antigravity_errors import parse_antigravity_429
+
+    rate = parse_antigravity_429({
+        "error": {
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1.5s"},
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED"},
+            ],
+        }
+    })
+    assert rate["retry_after"] == 1.5
+    assert rate["quota_exhausted"] is False
+
+    quota = parse_antigravity_429({
+        "error": {
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "QUOTA_EXHAUSTED"},
+            ],
+        }
+    })
+    assert quota["quota_exhausted"] is True
+
+    result = AttemptResult(
+        outcome="http_error",
+        http_status=429,
+        full_response_text=json.dumps({
+            "error": {
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "12s"},
+                    {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED"},
+                ],
+            }
+        }),
+    )
+    attached = _attach_retry_after_from_response(result, None)
+    assert attached.retry_after_seconds == 12
+    assert attached.cooldown_until is not None
+
+    exhausted = AttemptResult(
+        outcome="http_error",
+        http_status=429,
+        error_code="QUOTA_EXHAUSTED",
+        error_detail="INSUFFICIENT_G1_CREDITS_BALANCE",
+    )
+    classified = bounded_account_quota_error(exhausted)
+    assert classified is not None
+    assert classified["classification"] == "quota_exhausted"

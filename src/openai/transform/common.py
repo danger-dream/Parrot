@@ -227,6 +227,21 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None, *, target_mo
     return "high"
 
 
+def anthropic_thinking_budget_tokens(body: dict[str, Any] | None) -> int | None:
+    """Return the raw Anthropic thinking.budget_tokens when it is a valid int."""
+    if not isinstance(body, dict):
+        return None
+    thinking = body.get("thinking")
+    if not isinstance(thinking, dict):
+        return None
+    raw = thinking.get("budget_tokens")
+    try:
+        budget = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+    return budget if budget is not None and budget >= 0 else None
+
+
 def anthropic_reasoning_config_is_mappable(body: dict[str, Any] | None, *, target_model: str | None = None) -> bool:
     """Whether top-level Anthropic reasoning controls can be represented.
 

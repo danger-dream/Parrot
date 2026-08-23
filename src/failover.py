@@ -48,6 +48,7 @@ from .openai.responses_ws_runtime import (
 from .proxy.connector import SOCKS5Connector, SS2022Connector
 from .oauth import openai as openai_provider
 from .providers import registry as provider_registry
+from .providers.antigravity_errors import parse_antigravity_429
 from .protocols import finalize as finalize_policy
 from .protocols import errors as protocol_errors
 from .protocols.runtime import (
@@ -1066,17 +1067,25 @@ def _attach_retry_after_from_response(
     result: AttemptResult,
     response: httpx.Response | None,
 ) -> AttemptResult:
-    if result.retry_after_seconds is not None or response is None:
-        return result
-    try:
-        raw = response.headers.get("Retry-After")
-    except Exception:
-        raw = None
-    parsed = parse_retry_after_seconds(raw)
-    if parsed is not None:
-        result.retry_after_seconds = parsed
+    if result.retry_after_seconds is None and response is not None:
+        try:
+            raw = response.headers.get("Retry-After")
+        except Exception:
+            raw = None
+        parsed = parse_retry_after_seconds(raw)
+        if parsed is not None:
+            result.retry_after_seconds = parsed
+            if result.http_status == 429:
+                result.cooldown_until = retry_after_cooldown_until(raw)
+    google = parse_antigravity_429(result.full_response_text or result.error_detail)
+    if google.get("quota_exhausted") and not result.error_code:
+        result.error_code = str(google.get("reason") or "quota_exhausted")
+    delay = google.get("retry_after")
+    if result.retry_after_seconds is None and isinstance(delay, (int, float)):
+        result.retry_after_seconds = parse_retry_after_seconds(delay)
         if result.http_status == 429:
-            result.cooldown_until = retry_after_cooldown_until(raw)
+            cooldown_s = min(float(delay), 300.0)
+            result.cooldown_until = int((time.time() + cooldown_s) * 1000)
     return result
 
 

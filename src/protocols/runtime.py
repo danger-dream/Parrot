@@ -653,12 +653,14 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
     if status == 429:
         matched = error_code in {
             "quota_exhausted",
+            "QUOTA_EXHAUSTED",
             "insufficient_quota",
             "billing_hard_limit_reached",
             "billing_limit_reached",
             "billing_not_active",
             "credits_exhausted",
             "credit_balance_exhausted",
+            "INSUFFICIENT_G1_CREDITS_BALANCE",
         } or error_type in {"insufficient_quota", "billing_error"}
         if not matched:
             matched = any(marker in low for marker in (
@@ -672,6 +674,10 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
                 "not enough credits",
                 "credit balance is too low",
                 "usage credits are required",
+                "quota_exhausted",
+                "quota exhausted",
+                "insufficient_g1_credits_balance",
+                "insufficient g1 credits",
             ))
     elif status == 403:
         matched = error_code in {
