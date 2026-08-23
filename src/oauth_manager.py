@@ -86,7 +86,7 @@ class AmbiguousOAuthAccountKey(ValueError):
 
 
 def _acc_provider(acc: dict) -> str:
-    return _normalize_provider(acc.get("provider") or _DEFAULT_PROVIDER)
+    return _normalize_provider(acc.get("provider") or acc.get("type") or _DEFAULT_PROVIDER)
 
 
 def _is_openai_acc(acc: dict) -> bool:
@@ -2672,9 +2672,9 @@ def _add_account_serialized(entry: dict) -> None:
         raise ValueError(f"missing required fields: {missing}")
 
     email = entry["email"]
-    provider = _normalize_provider(entry.get("provider"))
+    provider = _normalize_provider(entry.get("provider") or entry.get("type"))
     if provider not in _VALID_PROVIDERS:
-        raise ValueError(f"unsupported provider: {entry.get('provider')!r}")
+        raise ValueError(f"unsupported provider: {entry.get('provider') or entry.get('type')!r}")
 
     # 规范化字段
     normalized = {

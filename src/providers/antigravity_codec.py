@@ -427,12 +427,17 @@ def _finish_to_status(reason: str | None) -> tuple[str, dict | None]:
     return "completed", None
 
 
-def _inline_to_text(part: dict) -> str:
+def _inline_image_part(part: dict) -> dict[str, Any] | None:
     inline = part.get("inlineData") or part.get("inline_data") or {}
     if not isinstance(inline, dict) or not inline.get("data"):
-        return ""
-    mime = str(inline.get("mimeType") or inline.get("mime_type") or "application/octet-stream")
-    return f"data:{mime};base64,{inline['data']}"
+        return None
+    mime = str(inline.get("mimeType") or inline.get("mime_type") or "image/png")
+    if mime and not mime.startswith("image/"):
+        return None
+    return {
+        "type": "output_image",
+        "image_url": f"data:{mime};base64,{inline['data']}",
+    }
 
 
 def gemini_parts_to_output_items(parts: list[Any]) -> list[dict[str, Any]]:
@@ -488,9 +493,16 @@ def gemini_parts_to_output_items(parts: list[Any]) -> list[dict[str, Any]]:
         if part.get("text"):
             text_buf.append(str(part.get("text") or ""))
             continue
-        image_text = _inline_to_text(part)
-        if image_text:
-            text_buf.append(image_text)
+        image = _inline_image_part(part)
+        if image:
+            flush_text()
+            items.append({
+                "type": "message",
+                "id": _gen_id("msg_"),
+                "role": "assistant",
+                "status": "completed",
+                "content": [image],
+            })
     flush_text()
     return items
 
@@ -690,9 +702,9 @@ class GeminiStreamToResponses:
             if part.get("text"):
                 yield from self._on_text(str(part.get("text") or ""))
                 continue
-            image_text = _inline_to_text(part)
-            if image_text:
-                yield from self._on_text(image_text)
+            image = _inline_image_part(part)
+            if image:
+                yield from self._on_image(image)
         if self.finish_reason:
             yield from self._finalize()
 
@@ -836,6 +848,31 @@ class GeminiStreamToResponses:
             "delta": delta,
             "logprobs": [],
         })
+
+    def _on_image(self, image: dict[str, Any]) -> Iterator[bytes]:
+        yield from self._close_reasoning()
+        yield from self._close_text()
+        item = {
+            "type": "message",
+            "id": _gen_id("msg_"),
+            "role": "assistant",
+            "status": "completed",
+            "content": [image],
+        }
+        output_index = self._alloc_index()
+        yield _emit("response.output_item.added", {
+            "type": "response.output_item.added",
+            "sequence_number": self._next_seq(),
+            "output_index": output_index,
+            "item": item,
+        })
+        yield _emit("response.output_item.done", {
+            "type": "response.output_item.done",
+            "sequence_number": self._next_seq(),
+            "output_index": output_index,
+            "item": item,
+        })
+        self.closed_items.append(item)
 
     def _on_thought(self, text: str, signature: str) -> Iterator[bytes]:
         delta = _delta_from_snapshot(self.seen_thought, text)

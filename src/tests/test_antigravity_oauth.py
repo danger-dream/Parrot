@@ -543,3 +543,45 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
     assert "5h" not in text
     assert "$" not in text
     assert "Project: <code>proj-cred</code>" in text
+
+
+def test_cpa_type_field_imports_as_antigravity(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account({
+        "type": "antigravity",
+        "email": "cpa@gmail.com",
+        "project_id": "proj-cpa",
+        "access_token": "at-cpa",
+        "refresh_token": "rt-cpa",
+        "expired": _future_expired(),
+        "disabled": False,
+    })
+    acc = om.get_account("antigravity:cpa@gmail.com:proj-cpa")
+    assert acc is not None
+    assert acc["provider"] == "antigravity"
+    assert acc["project_id"] == "proj-cpa"
+    assert om.provider_of(acc) == "antigravity"
+
+
+def test_image_inline_data_restores_as_output_image(m):
+    codec = m["codec"]
+    restored = codec.gemini_to_responses({
+        "candidates": [{
+            "content": {"parts": [
+                {"text": "here"},
+                {"inlineData": {"mimeType": "image/png", "data": "AAA"}},
+            ]},
+            "finishReason": "STOP",
+        }],
+    }, model="gemini-3.1-flash-image")
+    kinds = []
+    urls = []
+    for item in restored["output"]:
+        for part in item.get("content") or []:
+            kinds.append(part.get("type"))
+            if part.get("type") == "output_image":
+                urls.append(part.get("image_url"))
+    assert kinds == ["output_text", "output_image"]
+    assert urls == ["data:image/png;base64,AAA"]
+    assert restored["output_text"] == "here"
