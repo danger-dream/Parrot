@@ -3,8 +3,8 @@
 Phase 8 third path: Anthropic ingress → OpenAI Responses upstream.  Supported
 now: text/image/document input, function tools, assistant tool_use, user
 tool_result, and narrow streaming output translation.  Guarded for now:
-thinking/reasoning, citation/stateful documents, built-in Anthropic tools, and
-stateful Responses concepts.
+thinking/reasoning (unless the caller opts in), citation/stateful documents,
+built-in Anthropic tools, and stateful Responses concepts.
 """
 
 from __future__ import annotations
@@ -442,6 +442,7 @@ def translate_request(
     *,
     target_model: str | None = None,
     codex_oauth: bool = False,
+    allow_reasoning_effort: bool = False,
 ) -> dict:
     guard_request(body, target_model=target_model)
     payload: dict[str, Any] = {
@@ -466,7 +467,11 @@ def translate_request(
         payload["metadata"] = body.get("metadata")
     effort = common.resolve_anthropic_reasoning_effort(body, target_model=target_model)
     if effort:
-        if target_model and not common.supports_reasoning_effort(target_model):
+        if (
+            target_model
+            and not allow_reasoning_effort
+            and not common.supports_reasoning_effort(target_model)
+        ):
             _fail(
                 f"target OpenAI Responses model {target_model!r} does not support reasoning.effort",
                 param="thinking",

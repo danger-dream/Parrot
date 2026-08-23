@@ -218,6 +218,7 @@ pong 不够。加深后确认：
 - 连续 4 轮、约 7.2k prompt：单轮命中卡在约 4070 token（≈56%）。这是上游隐式缓存按约 4096 一块切，不是 session 每轮都变。约 3.5k 前缀连续 5 轮是 0%。
 - `sessionId` 已改成对齐 OpenAI / Grok：优先 `prompt_cache_key` / 客户端 session，不再只哈希第一段 user 文本。钉住后第 1 轮也能命中，4 轮合计从 42.2% 升到 56.2%；单轮天花板没有突破 4096。
 - Anthropic `cache_control` 不会变成 Gemini 字段；Claude 入口仍会经 `cache_hints` 补 `prompt_cache_key`，再写成 Antigravity sessionId。
+- Anthropic 顶层 `thinking` / `output_config.effort`：Antigravity channel 会 `allow_reasoning_effort`，映射到 `reasoning.effort` → Gemini `thinkingLevel`。历史消息里的 `thinking` / `redacted_thinking` 块仍不转。
 
 ## 13. 对照资源
 

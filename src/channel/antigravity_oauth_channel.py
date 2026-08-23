@@ -178,6 +178,7 @@ class AntigravityOAuthChannel(Channel):
                 requested_body,
                 target_model=resolved_model,
                 codex_oauth=False,
+                allow_reasoning_effort=True,
             )
             cache_hints.apply_anthropic_cache_to_openai_payload(
                 requested_body,

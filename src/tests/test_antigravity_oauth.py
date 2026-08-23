@@ -530,6 +530,47 @@ def test_function_call_roundtrip_and_channel_envelope(m):
     assert sid_a != sid_c
 
 
+def test_anthropic_thinking_maps_to_gemini_thinking_level(m):
+    _setup(m)
+    from src.openai.transform import anthropic_to_responses
+    from src.openai.transform.guard import GuardError
+
+    thinking_body = {
+        "model": "gemini-3-flash",
+        "max_tokens": 32,
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    with pytest.raises(GuardError, match="does not support reasoning.effort"):
+        anthropic_to_responses.translate_request(
+            thinking_body, target_model="gemini-3-flash",
+        )
+    mapped = anthropic_to_responses.translate_request(
+        thinking_body, target_model="gemini-3-flash", allow_reasoning_effort=True,
+    )
+    assert mapped["reasoning"]["effort"] == "low"
+
+    om = m["oauth_manager"]
+    om.add_account({
+        "provider": "antigravity",
+        "email": "think@gmail.com",
+        "project_id": "proj-think",
+        "access_token": "at-think",
+        "refresh_token": "rt-think",
+        "expired": _future_expired(),
+        "models": ["gemini-3-flash", "claude-sonnet-4-6"],
+    })
+    ch = m["AntigravityOAuthChannel"](om.get_account("antigravity:think@gmail.com:proj-think"))
+    import asyncio
+    low = asyncio.run(ch.build_upstream_request(thinking_body, "gemini-3-flash", ingress_protocol="anthropic"))
+    assert json.loads(low.body)["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
+    high = asyncio.run(ch.build_upstream_request({
+        **thinking_body,
+        "thinking": {"type": "enabled", "budget_tokens": 20000},
+    }, "gemini-3-flash", ingress_protocol="anthropic"))
+    assert json.loads(high.body)["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "high"
+
+
 def test_tool_history_preserves_id_and_thought_signature(m):
     codec = m["codec"]
     restored = codec.gemini_to_responses({
