@@ -25,6 +25,7 @@ mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CAL
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -39,7 +40,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ... import (
     affinity, config, cooldown, cursor_reconcile, load_balancing, log_db,
-    oauth_errors, oauth_manager, state_db,
+    notifier, oauth_errors, oauth_manager, state_db,
 )
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
 from ...oauth import antigravity as antigravity_provider, cursor as cursor_provider, openai as openai_provider, xai as xai_provider
@@ -146,13 +147,86 @@ def _run_sync(coro):
         return exc
 
 
+def _message_id_from_response(response) -> int | None:
+    if not isinstance(response, dict):
+        return None
+    payload = response.get("result") if isinstance(response.get("result"), dict) else response
+    try:
+        return int(payload.get("message_id")) if payload.get("message_id") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _foreground_account_model_sync(
+    chat_id: int, account_key: str, *, provider: str, label: str,
+    message_id: int | None = None,
+) -> dict:
+    """Show progress and wait at most 20s without cancelling the 45s worker."""
+    progress = (
+        "🔄 <b>正在同步模型，请稍候…</b>\n\n"
+        f"类型: <code>{ui.escape_html(notifier.provider_label(provider))}</code>\n"
+        f"账户: <code>{ui.escape_html(label)}</code>"
+    )
+    progress_id = message_id
+    if progress_id is None:
+        progress_id = _message_id_from_response(ui.send(chat_id, progress))
+    else:
+        ui.edit(chat_id, progress_id, progress)
+
+    selection_before = oauth_manager.account_model_selection(account_key)
+    future = oauth_manager.start_account_model_refresh(account_key)
+
+    def finish() -> None:
+        try:
+            result = future.result(timeout=oauth_manager.OAUTH_MODEL_SYNC_FOREGROUND_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            result = {"action": "foreground_timeout", "account_key": account_key}
+        except Exception as exc:
+            result = {"action": "error", "account_key": account_key, "error": str(exc)}
+
+        try:
+            selection = oauth_manager.account_model_selection(account_key)
+        except ValueError:
+            # The user may remove the account while discovery is in flight.
+            return
+        action = str(result.get("action") or "error")
+        if action == "updated" and int(result.get("models") or len(selection.get("models") or [])) > 0:
+            count = int(result.get("models") or len(selection.get("models") or []))
+            status = f"✅ 已同步模型 <code>{count}</code> 个，当前使用账户模型。"
+        elif action == "foreground_timeout":
+            source = "继续使用上次账户模型" if not selection_before.get("fallback") else "当前使用默认模型"
+            status = f"⏱ 模型同步超时，任务将在后台继续；{source}。"
+        else:
+            source = "继续使用上次账户模型" if not selection.get("fallback") else "当前使用默认模型"
+            error = str(result.get("error") or action)[:180]
+            status = (
+                f"⚠️ 模型同步失败：<code>{ui.escape_html(error)}</code>\n"
+                f"后台将静默重试，{source}。"
+            )
+        final = progress + "\n\n" + status
+        nav_markup = ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]])
+        try:
+            if progress_id is not None:
+                ui.edit(chat_id, progress_id, final, reply_markup=nav_markup)
+            else:
+                ui.send(chat_id, final, reply_markup=nav_markup)
+        except Exception as exc:
+            print(f"[oauth] model sync UI update failed: {type(exc).__name__}")
+
+    # Never hold the single Telegram polling/update thread during the 20-second
+    # UX window.  This worker owns only the progress message; config was saved
+    # before this helper was called and the underlying refresh has its own 45s bound.
+    threading.Thread(target=finish, daemon=True, name="oauth-model-sync-ui").start()
+    return {"action": "started", "account_key": account_key, "future": future}
+
+
 def _overwrite_summary(entry: dict) -> str:
     provider = oauth_manager.provider_of(entry)
     label = str(entry.get("label") or entry.get("email") or "?")
     lines = [
         "检测到相同身份的 OAuth 账户。是否用本次登录结果覆盖凭据和最新资料？",
         "",
-        f"Provider: <code>{ui.escape_html(provider)}</code>",
+        f"类型: <code>{ui.escape_html(provider)}</code>",
         f"账户: <code>{ui.escape_html(label)}</code>",
     ]
     if provider == "openai":
@@ -193,6 +267,12 @@ def _persist_new_or_stage_overwrite(
         added = oauth_manager.add_account_if_identity_absent(entry)
         if added.get("status") != "added":
             raise RuntimeError("账户在保存前已并发出现，请重新登录确认")
+        key = _account_key(entry)
+        _foreground_account_model_sync(
+            chat_id, key, provider=provider,
+            label=str(entry.get("label") or entry.get("email") or key),
+            message_id=message_id,
+        )
         return "added"
     target_key, _snapshot = duplicate
     nonce = secrets.token_urlsafe(12)
@@ -258,6 +338,11 @@ def on_oauth_overwrite_confirm(chat_id: int, message_id: int, cb_id: str, nonce:
         return
 
     provider = str(data.get("provider") or oauth_manager.provider_of(entry))
+    _foreground_account_model_sync(
+        chat_id, target_key, provider=provider,
+        label=str(entry.get("label") or entry.get("email") or target_key),
+        message_id=message_id,
+    )
     usage = data.get("usage")
     quota_note = ""
     if provider == "cursor" and isinstance(usage, dict):
@@ -1696,7 +1781,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     text = "\n".join([
         "⚙️ <b>OAuth 账户设置</b>",
         "",
-        "🧩 <b>OAuth 模型目录</b>",
+        "🧬 <b>默认模型</b>",
         f"  {_provider_tag('claude')}  {len(anthropic_models)} 个 · "
         f"{_provider_tag('openai')}  {len(openai_models)} 个 · "
         f"{_provider_tag('xai')}  {len(xai_models)} 个",
@@ -1720,7 +1805,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
     ])
     rows = [
-        [ui.btn("🧩 模型目录", "odm:show"),
+        [ui.btn("🧬 默认模型", "odm:show"),
          ui.btn("📈 配额监控", "oa:quota")],
         [ui.provider_button("GPT 图片", "img:show", "openai"),
          ui.provider_button("Grok 图片", "xim:show", "xai")],
@@ -2744,7 +2829,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
     short = ui.register_code(account_key)
     enabled = acc.get("enabled", True) and not acc.get("disabled_reason")
-    toggle_label = "🚫 禁用" if enabled else "✅ 启用"
+    toggle_label = "⏸ 停用账户" if enabled else "▶️ 启用账户"
 
     # 显示当前模型的冷却状态
     ck = f"oauth:{account_key}"
@@ -2763,40 +2848,30 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
             text += f" (累计失败 {e['error_count']} 次)\n"
 
     payload = _callback_payload(short, page, filter_key)
-    usage_btn_label = (
-        "📊 刷新 Cursor 用量" if prov == "cursor"
-        else "📊 刷新账单" if prov == "xai"
-        else "📊 刷新 Credits" if prov == "antigravity"
-        else "📊 刷新用量/重置卡"
-    )
     rows = [
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
-         ui.btn(usage_btn_label,   f"oa:refresh_usage:{payload}")],
+         ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")],
     ]
-    if prov == "cursor":
-        rows.append([ui.provider_button(
-            "Cursor 模型目录",
-            f"oa:cursor_models:{short}:1",
-            "cursor",
-        )])
-    if prov == "openai":
-        rows.append([
-            ui.btn("⚡ 并发上限", f"oa:emax:{payload}"),
-            ui.btn("♻️ 重置次数", f"oa:reset_quota_ask:{payload}"),
-        ])
-    elif acc.get("disabled_reason") == "quota":
-        rows.append([ui.btn("♻️ 清本地配额禁用", f"oa:reset_quota:{payload}")])
+    # All five OAuth providers enter the same model-management experience.
+    # Legacy oa:cursor_* handlers remain below for already-sent messages.
+    manage_models_cb = f"oam:open:{short}:1:{max(1, int(page or 1))}:{filter_key}"
     rows += [
-        [ui.btn("🧹 清模型错误", f"oa:clear_errors:{payload}"),
+        [ui.btn("🧬 管理模型", manage_models_cb),
+         ui.btn("🚦 并发上限", f"oa:emax:{payload}")],
+        [ui.btn("🧹 清模型故障", f"oa:clear_errors:{payload}"),
          ui.btn("🔗 清亲和绑定", f"oa:clear_affinity:{payload}")],
+        [ui.btn(toggle_label, f"oa:toggle:{payload}"),
+         ui.btn("🗑 删除账户", f"oa:delete_ask:{payload}")],
     ]
-    if prov != "openai":
-        rows.append([ui.btn("⚡ 并发上限", f"oa:emax:{payload}")])
-    rows += [
-        [ui.btn(toggle_label,     f"oa:toggle:{payload}"),
-         ui.btn("🗑 删除",         f"oa:delete_ask:{payload}")],
-        [ui.btn("◀ 返回 OAuth 列表", _page_callback(max(1, int(page or 1)), filter_key))],
-    ]
+    if prov == "openai":
+        rows.append([ui.btn("♻️ 重置额度", f"oa:reset_quota_ask:{payload}")])
+    elif acc.get("disabled_reason") == "quota":
+        # Context-only recovery action; it does not disturb the normal fixed rows.
+        rows.append([ui.btn("♻️ 清本地配额禁用", f"oa:reset_quota:{payload}")])
+    rows.append([
+        ui.btn("🏠 主菜单", "menu:main"),
+        ui.btn("◀ 返回列表", _page_callback(max(1, int(page or 1)), filter_key)),
+    ])
     return ui.truncate(text), ui.inline_kb(rows)
 
 
@@ -3050,10 +3125,14 @@ _CURSOR_DISABLE_ACTION = "oa_cursor_disable"
 
 
 def _cursor_model_records(acc: dict) -> list[dict]:
-    return [
+    records = [
         item for item in ((acc.get("cursor_model_catalog") or {}).get("models") or [])
         if isinstance(item, dict) and item.get("id")
     ]
+    disabled = oauth_manager.cursor_disabled_models(acc)
+    records.sort(key=lambda item: str(item.get("name") or item.get("id") or "").casefold())
+    records.sort(key=lambda item: str(item.get("id") or "") in disabled)
+    return records
 
 
 def _cursor_model_ref(account_key: str, model_id: str) -> str:
@@ -3146,13 +3225,15 @@ def _load_cursor_disable_state(chat_id: int, short: str) -> dict | None:
     existing_key = _resolve_to_account_key((existing or {}).get("account_key"))
     if existing and existing_key == account_key:
         return existing
-    available = {str(item.get("id") or "") for item in _cursor_model_records(acc)}
+    models = [str(item.get("id") or "") for item in _cursor_model_records(acc)]
+    available = set(models)
     selected = oauth_manager.cursor_disabled_models(acc) & available
     _set_cursor_disable_state(
         chat_id,
         account_key,
         page=max(1, int((existing or {}).get("page") or 1)),
         selected=selected,
+        models=models,
     )
     return _cursor_disable_state(chat_id)
 
@@ -3163,10 +3244,12 @@ def _set_cursor_disable_state(
     *,
     page: int,
     selected: set[str],
+    models: list[str],
 ) -> None:
     states.set_state(chat_id, _CURSOR_DISABLE_ACTION, {
         "account_key": account_key,
         "page": max(1, int(page or 1)),
+        "models": list(models),
         "selected": sorted(selected),
     })
 
@@ -3176,38 +3259,35 @@ def _cursor_disable_text_and_kb(data: dict) -> tuple[str, dict] | None:
     acc = oauth_manager.get_account(account_key) if account_key else None
     if acc is None or oauth_manager.provider_of(acc) != "cursor":
         return None
-    records = _cursor_model_records(acc)
-    available = {str(item.get("id") or "") for item in records}
+    models = [str(model) for model in data.get("models") or [] if str(model)]
+    available = set(models)
     selected = {
         str(model) for model in data.get("selected") or [] if str(model) in available
     }
     lines = [
         f"🚫 <b>{ui.escape_html(_account_display(acc))} · 批量禁用模型</b>",
-        f"共 <b>{len(records)}</b> 个模型 · 将禁用 <b>{len(selected)}</b> 个",
+        f"共 <b>{len(models)}</b> 个模型 · 将禁用 <b>{len(selected)}</b> 个",
         "",
         "点击序号切换状态，保存后立即从该 Cursor 账户的调度候选中移除。",
         "再次进入并取消选择即可恢复使用。",
     ]
-    for index, item in enumerate(records, start=1):
-        model_id = str(item.get("id") or "")
-        name = str(item.get("name") or model_id)
+    for index, model_id in enumerate(models, start=1):
         status = "🚫" if model_id in selected else "✅"
         lines.append(
-            f"{index}. {status} <b>{ui.escape_html(name)}</b> · "
-            f"<code>{ui.escape_html(model_id)}</code>"
+            f"{index}. {status} <code>{ui.escape_html(model_id)}</code>"
         )
 
     short = ui.register_code(account_key)
     rows: list[list[dict]] = []
-    for numbers in _split_number_rows(len(records)):
+    for numbers in _split_number_rows(len(models)):
         rows.append([
             ui.btn(
-                f"{number} {'🚫' if str(records[number - 1].get('id') or '') in selected else '✅'}",
+                f"{number} {'🚫' if models[number - 1] in selected else '✅'}",
                 f"oa:cursor_dis_sel:{short}:{number}",
             )
             for number in numbers
         ])
-    if records:
+    if models:
         rows.append([
             ui.btn("全选", f"oa:cursor_dis_all:{short}"),
             ui.btn("清空", f"oa:cursor_dis_clear:{short}"),
@@ -3240,10 +3320,11 @@ def on_cursor_disable_start(
     if acc is None or oauth_manager.provider_of(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户或短码已失效", show_alert=True)
         return
-    available = {str(item.get("id") or "") for item in _cursor_model_records(acc)}
+    models = [str(item.get("id") or "") for item in _cursor_model_records(acc)]
+    available = set(models)
     selected = oauth_manager.cursor_disabled_models(acc) & available
     _set_cursor_disable_state(
-        chat_id, account_key, page=page, selected=selected,
+        chat_id, account_key, page=page, selected=selected, models=models,
     )
     _show_cursor_disable(chat_id, message_id, cb_id)
 
@@ -3261,23 +3342,23 @@ def on_cursor_disable_select(
         ui.answer_cb(cb_id, "会话已失效，请重新进入 Cursor 模型目录", show_alert=True)
         return
     account_key = _resolve_to_account_key(data.get("account_key"))
-    acc = oauth_manager.get_account(account_key) if account_key else None
-    records = _cursor_model_records(acc) if acc else []
+    models = [str(model) for model in data.get("models") or [] if str(model)]
     try:
         index = int(index_text)
     except ValueError:
         index = 0
-    if index < 1 or index > len(records):
+    if index < 1 or index > len(models):
         ui.answer_cb(cb_id, "模型序号已失效", show_alert=True)
         return
-    model_id = str(records[index - 1].get("id") or "")
+    model_id = models[index - 1]
     selected = {str(model) for model in data.get("selected") or []}
     if model_id in selected:
         selected.remove(model_id)
     else:
         selected.add(model_id)
     _set_cursor_disable_state(
-        chat_id, account_key, page=int(data.get("page") or 1), selected=selected,
+        chat_id, account_key, page=int(data.get("page") or 1),
+        selected=selected, models=models,
     )
     _show_cursor_disable(chat_id, message_id, cb_id)
 
@@ -3296,12 +3377,11 @@ def on_cursor_disable_set_all(
     if acc is None or oauth_manager.provider_of(acc) != "cursor":
         ui.answer_cb(cb_id, "Cursor 账户已不存在", show_alert=True)
         return
-    selected = (
-        {str(item.get("id") or "") for item in _cursor_model_records(acc)}
-        if selected_all else set()
-    )
+    models = [str(model) for model in data.get("models") or [] if str(model)]
+    selected = set(models) if selected_all else set()
     _set_cursor_disable_state(
-        chat_id, account_key, page=int(data.get("page") or 1), selected=selected,
+        chat_id, account_key, page=int(data.get("page") or 1),
+        selected=selected, models=models,
     )
     _show_cursor_disable(chat_id, message_id, cb_id)
 
@@ -3319,6 +3399,7 @@ def on_cursor_disable_save(
     try:
         saved = oauth_manager.set_cursor_disabled_models(
             account_key or "", data.get("selected") or [],
+            visible_models=data.get("models") or [],
         )
     except ValueError as exc:
         ui.answer_cb(cb_id, str(exc), show_alert=True)
@@ -3393,9 +3474,9 @@ def on_cursor_models(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         display_index = start + offset
         ref = _cursor_model_ref(account_key, str(item.get("id") or ""))
         detail_buttons.append(ui.btn(
-            f"📄 #{display_index}", f"oa:cursor_model:{ref}:{page}",
+            str(display_index), f"oa:cursor_model:{ref}:{page}",
         ))
-        if len(detail_buttons) == 3:
+        if len(detail_buttons) == 6:
             rows.append(detail_buttons)
             detail_buttons = []
     if detail_buttons:
@@ -4597,28 +4678,23 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         )
         return
 
-    ui.answer_cb(cb_id, "登录成功，正在同步额度和模型...")
+    ui.answer_cb(cb_id, "登录成功，正在保存账户...")
     try:
         subject = cursor_provider.subject_from_access_token(tokens.access_token)
         if not subject:
             raise ValueError("Cursor access token 缺少稳定 subject")
-        catalog = cursor_provider.fetch_model_catalog_sync(tokens.access_token)
-        records = catalog.get("models") if isinstance(catalog, dict) else None
-        models = [
-            str(item.get("id") or "") for item in records or []
-            if isinstance(item, dict) and item.get("id")
-        ]
-        if not models:
-            raise ValueError("Cursor AvailableModels 未返回可用模型")
     except Exception as exc:
         ui.edit(
-            chat_id,
-            message_id,
-            f"❌ Cursor 登录已完成，但模型同步失败。\n"
-            f"{_oauth_error_html(exc, provider='cursor', operation='fetch_models')}",
-            reply_markup=ui.inline_kb([[ui.btn("🔄 重试获取", "oa:login:cursor:done"), ui.btn("❌ 取消", "oa:add")]]),
+            chat_id, message_id,
+            _oauth_error_html(exc, provider="cursor", operation="exchange_code"),
+            reply_markup=ui.inline_kb([[ui.btn("◀ 重新登录", "oa:login:cursor"), ui.btn("❌ 取消", "oa:add")]]),
         )
         return
+    # AvailableModels is deliberately fetched only after the account has been
+    # atomically saved, by the same bounded/single-flight path as all providers.
+    catalog: dict = {}
+    records: list[dict] = []
+    models: list[str] = []
 
     profile: dict = {}
     profile_error: Exception | None = None
@@ -4699,43 +4775,9 @@ def on_login_cursor_done(chat_id: int, message_id: int, cb_id: str) -> None:
         )
         return
 
+    # The shared helper already owns this message's visible progress and final
+    # sync result.  Returning here keeps the polling thread free.
     states.pop_state(chat_id)
-    raw_total = cursor_usage.get("total_spend_cents")
-    raw_limit = cursor_usage.get("limit_cents")
-    raw_remaining = cursor_usage.get("remaining_cents")
-    quota_line = "额度: <code>暂未获取，稍后可在账户详情刷新</code>"
-    if raw_limit is not None:
-        quota_line = (
-            f"额度: <code>已用 ${float(raw_total or 0) / 100:.2f} / ${float(raw_limit) / 100:.2f}"
-            + (f" · 剩余 ${float(raw_remaining) / 100:.2f}" if raw_remaining is not None else "")
-            + "</code>"
-        )
-    if usage_error is not None:
-        quota_line += "\n⚠️ 用量接口本次未完整返回，Token 和模型已保存。"
-    profile_line = ""
-    profile_name = str(profile.get("name") or "").strip()
-    if profile_name:
-        profile_line = f"姓名: <code>{ui.escape_html(profile_name)}</code>\n"
-    if profile_error is not None:
-        profile_line += "⚠️ 账号资料本次未获取，暂用内部标识；下次模型同步会重试。\n"
-    title = "Cursor OAuth 账户已更新" if existed else "Cursor OAuth 账户已添加"
-    lb_hint = (
-        "\n已加入 OpenAI 家族负载均衡队列末尾，可在负载均衡菜单调整优先级。"
-        if not existed and load_balancing.is_initialized() else ""
-    )
-    ui.edit(
-        chat_id,
-        message_id,
-        f"✅ {_provider_tag('cursor')} <b>{title}</b>\n\n"
-        f"账户: <code>{ui.escape_html(label)}</code>\n"
-        f"{profile_line}"
-        f"套餐: <code>{ui.escape_html(plan)}</code>\n"
-        f"模型: <code>{len(models)} 个 canonical 模型</code>\n"
-        f"原生变体: <code>{sum(len(item.get('legacy_slugs') or []) for item in records or [] if isinstance(item, dict))} 个</code>\n"
-        f"{quota_line}\n"
-        f"Token: <code>{_fmt_time_full(expired)}</code>{lb_hint}",
-        reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]),
-    )
 
 
 # ─── OpenAI PKCE 登录 ──────────────────────────────────────────────
@@ -5648,13 +5690,14 @@ def _stage_openai_import_candidates(items: list[dict]) -> dict:
 
 
 def _commit_staged_openai_import(staged: dict) -> dict:
-    result = {"added": [], "replaced": [], "failed": list(staged.get("failed") or [])}
+    result = {"added": [], "replaced": [], "failed": list(staged.get("failed") or []), "model_sync_keys": []}
     for record in staged.get("new") or []:
         entry = record["entry"]
         added = oauth_manager.add_account_if_identity_absent(entry)
         if added.get("status") != "added":
             result["failed"].append((entry.get("email") or "?", "账户已并发出现，请重新导入确认")); continue
         result["added"].append(entry.get("email") or "?")
+        result["model_sync_keys"].append(record["account_key"])
         usage = _fetch_and_save_usage_sync(record["account_key"], email=entry.get("email") or "")
         if not isinstance(usage, Exception):
             _evaluate_quota_action(record["account_key"], usage)
@@ -5664,17 +5707,65 @@ def _commit_staged_openai_import(staged: dict) -> dict:
         if replacement.get("status") != "replaced":
             result["failed"].append((entry.get("email") or "?", "目标账户已变化，请重新导入确认")); continue
         result["replaced"].append(entry.get("email") or "?")
+        result["model_sync_keys"].append(record["account_key"])
         usage = _fetch_and_save_usage_sync(record["account_key"], email=entry.get("email") or "")
         if not isinstance(usage, Exception):
             _evaluate_quota_action(record["account_key"], usage)
     return result
 
 
+def _wait_import_model_sync(chat_id: int, message_id: int, result: dict) -> None:
+    keys = list(dict.fromkeys(result.get("model_sync_keys") or []))
+    if not keys:
+        result["model_sync"] = {"success": 0, "failed": 0, "background": 0}
+        return
+    ui.edit(
+        chat_id, message_id,
+        f"🔄 <b>正在同步模型，请稍候…</b>\n\n类型: <code>OpenAI</code>\n"
+        f"进度: <code>0 / {len(keys)}</code>（最多并发 3）",
+    )
+    futures = [oauth_manager.start_account_model_refresh(key) for key in keys]
+    done, pending = concurrent.futures.wait(
+        futures, timeout=oauth_manager.OAUTH_MODEL_SYNC_FOREGROUND_TIMEOUT_SECONDS,
+    )
+    success = failed = 0
+    for future in done:
+        try:
+            refresh = future.result()
+            if refresh.get("action") == "updated" and int(refresh.get("models") or 0) > 0:
+                success += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    result["model_sync"] = {"success": success, "failed": failed, "background": len(pending)}
+
+
 def _render_openai_import_result(chat_id: int, message_id: int, label: str, result: dict) -> None:
+    if "model_sync" not in result and result.get("model_sync_keys"):
+        ui.edit(
+            chat_id, message_id,
+            f"🔄 <b>正在同步模型，请稍候…</b>\n\n类型: <code>OpenAI</code>\n"
+            f"进度: <code>0 / {len(set(result.get('model_sync_keys') or []))}</code>（最多并发 3）",
+        )
+        def finish_import_sync() -> None:
+            _wait_import_model_sync(chat_id, message_id, result)
+            _render_openai_import_result(chat_id, message_id, label, result)
+        threading.Thread(
+            target=finish_import_sync, daemon=True, name="oauth-import-model-sync-ui",
+        ).start()
+        return
+    if "model_sync" not in result:
+        result["model_sync"] = {"success": 0, "failed": 0, "background": 0}
     failed = result.get("failed") or []
     lines = [f"<b>导入</b> {_provider_tag('openai')} <b>{label} 账户完成</b>", "",
              f"✅ 新增 {len(result.get('added') or [])} 个", f"🔁 覆盖 {len(result.get('replaced') or [])} 个",
              f"❌ 失败 {len(failed)} 个"]
+    sync = result.get("model_sync") or {}
+    lines.append(
+        f"模型同步：成功 {int(sync.get('success') or 0)}，失败 {int(sync.get('failed') or 0)}，"
+        f"后台继续 {int(sync.get('background') or 0)}"
+    )
     lines += [f"• <code>{ui.escape_html(str(e))}</code>：{ui.escape_html(str(m))}" for e, m in failed[:20]]
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]]))
 

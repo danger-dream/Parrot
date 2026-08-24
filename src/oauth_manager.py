@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import concurrent.futures
 import hashlib
 import json
 import math
@@ -29,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from . import cache_display, config, load_balancing, network, notifier, oauth_errors, state_db
+from . import oauth_model_discovery
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
@@ -64,6 +66,17 @@ OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference "
     "user:sessions:claude_code user:mcp_servers user:file_upload"
 )
+
+# OAuth model-catalog maintenance policy.  These are intentionally code-level
+# constants: the timings are operational invariants, not user-facing tuning.
+OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS = 6 * 60 * 60
+OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS = 15 * 60
+OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS = 60
+OAUTH_MODEL_SYNC_STARTUP_DELAY_SECONDS = 2
+OAUTH_MODEL_SYNC_MAX_CONCURRENCY = 3
+OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS = 45.0
+OAUTH_MODEL_SYNC_FOREGROUND_TIMEOUT_SECONDS = 20.0
+OAUTH_MODEL_CHANGE_LIST_LIMIT = 10
 
 
 # ─── 开发期 mock 开关 ────────────────────────────────────────────
@@ -2703,10 +2716,30 @@ def _add_account_serialized(entry: dict) -> None:
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
         "models": entry.get("models") or [],
+        # Small allow-listed provider-neutral LKG metadata. Defaults never own
+        # this field; an absent field remains backward compatible.
+        "account_model_catalog": copy.deepcopy(entry.get("account_model_catalog") or {}),
+        # Non-Cursor account model policy. ``models`` remains the canonical LKG
+        # ID list for backward compatibility; user disablement is independent.
+        "disabledModels": sorted({
+            str(model).strip() for model in entry.get("disabledModels") or []
+            if str(model).strip()
+        }),
+        "last_model_sync": entry.get("last_model_sync") or "",
+        "last_model_sync_source": entry.get("last_model_sync_source") or "",
+        "last_model_sync_error": entry.get("last_model_sync_error") or "",
+        "last_model_sync_attempt": entry.get("last_model_sync_attempt") or "",
         # §9-1：存登录响应的 scope（空格分隔），供 refresh 时带真实 scope；
         # 老账号缺省空串，refresh 时回退完整六项 OAUTH_SCOPES。
         "scopes": entry.get("scopes", "") or "",
     }
+    if provider == "cursor":
+        # Cursor keeps its existing dedicated catalog/disable schema.
+        normalized.pop("disabledModels", None)
+        for key in (
+            "last_model_sync_source", "last_model_sync_error", "last_model_sync_attempt",
+        ):
+            normalized.pop(key, None)
     # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
     if provider == "openai":
         normalized.update(_openai_metadata_patch(entry))
@@ -2879,6 +2912,15 @@ def _add_account_serialized(entry: dict) -> None:
                     f"account already exists: provider={provider} email={email}"
                 )
             keep_models = target.get("models")
+            keep_model_policy = {
+                key: copy.deepcopy(target.get(key))
+                for key in (
+                    "disabledModels", "account_model_catalog", "cursor_model_catalog",
+                    "cursor_disabled_models", "cursor_max_context_disabled_models",
+                    "last_model_sync", "last_model_sync_source",
+                    "last_model_sync_error", "last_model_sync_attempt",
+                ) if key in target
+            }
             keep_max = target.get("maxConcurrent")
             keep_device_id = target.get("codexDeviceInstallationId")
             keep_device_enabled = target.get("codexDeviceConvergenceEnabled")
@@ -2895,6 +2937,9 @@ def _add_account_serialized(entry: dict) -> None:
             target.update(normalized)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
+            for key, value in keep_model_policy.items():
+                if key not in entry:
+                    target[key] = value
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
             if provider == "cursor" and keep_disabled_reason in {"user", "quota"}:
@@ -3534,11 +3579,403 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
         print(f"[oauth] ensure_openai_metadata_fresh_sync error: {exc}")
 
 
+def _provider_default_models(provider: str) -> tuple[list[str], str]:
+    """Return configured stateless fallback, then built-in fallback if empty."""
+    cfg = config.get()
+    section = {
+        "openai": "openaiOAuth",
+        "xai": "xaiOAuth",
+        "antigravity": "antigravityOAuth",
+    }.get(provider)
+    if provider == "claude":
+        configured = cfg.get("oauthDefaultModels")
+        built_in = config.DEFAULT_CONFIG.get("oauthDefaultModels") or []
+    else:
+        configured = (cfg.get(section) or {}).get("defaultModels") if section else []
+        built_in = ((config.DEFAULT_CONFIG.get(section) or {}).get("defaultModels") or []) if section else []
+    models = list(dict.fromkeys(
+        str(model).strip() for model in configured or [] if str(model).strip()
+    ))
+    if models:
+        return models, "default:configured"
+    return list(dict.fromkeys(
+        str(model).strip() for model in built_in if str(model).strip()
+    )), "default:built-in"
+
+
+def account_disabled_models(account_or_key: dict | str) -> set[str]:
+    account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
+    if not isinstance(account, dict):
+        return set()
+    field = "cursor_disabled_models" if provider_of(account) == "cursor" else "disabledModels"
+    return {str(model).strip() for model in account.get(field) or [] if str(model).strip()}
+
+
+def account_model_records(account_or_key: dict | str) -> list[dict]:
+    """Expose provider-neutral, ID-scoped records without decorating fallbacks."""
+    account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
+    if not isinstance(account, dict):
+        return []
+    if provider_of(account) == "cursor":
+        raw = ((account.get("cursor_model_catalog") or {}).get("models") or [])
+        records = []
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("id"): continue
+            records.append({
+                "id": str(item["id"]), "name": item.get("name"),
+                "description": item.get("tagline"), "contextWindow": item.get("context_window"),
+                "contextWindowMaxMode": item.get("context_window_max_mode"),
+                "maxOutputTokens": item.get("max_tokens"), "reasoning": item.get("reasoning"),
+                "reasoningEfforts": list(item.get("reasoning_efforts") or []),
+                "supportsImages": item.get("supports_images"), "aliases": list(item.get("aliases") or []),
+            })
+        return records
+    raw = ((account.get("account_model_catalog") or {}).get("models") or [])
+    return [copy.deepcopy(item) for item in raw if isinstance(item, dict) and str(item.get("id") or "").strip()]
+
+
+def account_model_selection(account_or_key: dict | str) -> dict:
+    """Resolve one account's selected source without adding runtime state."""
+    account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
+    if not isinstance(account, dict):
+        raise ValueError("OAuth account not found")
+    provider = provider_of(account)
+    models = list(dict.fromkeys(
+        str(model).strip() for model in account.get("models") or [] if str(model).strip()
+    ))
+    if models:
+        source = str(account.get("last_model_sync_source") or "lkg:legacy-config")
+        fallback = False
+    else:
+        models, source = _provider_default_models(provider)
+        fallback = True
+    disabled = account_disabled_models(account)
+    return {
+        "models": models,
+        "effective_models": [model for model in models if model not in disabled],
+        "disabled_models": disabled,
+        "source": source,
+        "fallback": fallback,
+        "synced_at": str(account.get("last_model_sync") or ""),
+        "attempted_at": str(account.get("last_model_sync_attempt") or ""),
+        "error": str(account.get("last_model_sync_error") or ""),
+        # Metadata is only attached to IDs in the account LKG. Stateless
+        # configured/built-in fallbacks intentionally return no records.
+        "records": account_model_records(account) if not fallback else [],
+    }
+
+
+def set_account_model_disabled(account_key: str, model: str, disabled: bool) -> bool:
+    """Atomically persist one non-Cursor user preference; hidden IDs are retained."""
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    model_id = str(model or "").strip()
+    account = get_account(canonical)
+    if not model_id or not isinstance(account, dict):
+        raise ValueError("OAuth account/model required")
+    selected = set(account_model_selection(account)["models"])
+    if model_id not in selected:
+        raise ValueError(f"OAuth account model not found: {model_id}")
+    wanted = bool(disabled)
+
+    def mutate(cfg):
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) != canonical:
+                continue
+            values = account_disabled_models(item)
+            if wanted:
+                values.add(model_id)
+            else:
+                values.discard(model_id)
+            field = "cursor_disabled_models" if provider_of(item) == "cursor" else "disabledModels"
+            item[field] = sorted(values)
+            return
+        raise ValueError("OAuth account not found")
+
+    config.update(mutate, skip_if_unchanged=True)
+    return wanted
+
+
+def set_account_disabled_models(
+    account_key: str,
+    models: Iterable[str],
+    *,
+    visible_models: Iterable[str] | None = None,
+) -> set[str]:
+    """Persist one batch draft while retaining disabled IDs outside its snapshot.
+
+    ``visible_models`` is the catalog snapshot shown by the Telegram editor. A
+    background catalog refresh may add/remove IDs while that draft is open, so
+    saving may replace only the snapshot's scope. Hidden disabled IDs remain in
+    config and apply again if an upstream model later reappears.
+    """
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    account = get_account(canonical)
+    if not isinstance(account, dict):
+        raise ValueError("OAuth account required")
+
+    visible = {
+        str(model).strip() for model in (
+            visible_models if visible_models is not None
+            else account_model_selection(account)["models"]
+        )
+        if str(model).strip()
+    }
+    selected = {
+        str(model).strip() for model in models or [] if str(model).strip()
+    }
+    unknown = sorted(selected - visible)
+    if unknown:
+        raise ValueError(f"OAuth account model not in editor snapshot: {unknown[0]}")
+    saved: set[str] = set()
+
+    def mutate(cfg):
+        nonlocal saved
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) != canonical:
+                continue
+            hidden = account_disabled_models(item) - visible
+            saved = hidden | selected
+            field = "cursor_disabled_models" if provider_of(item) == "cursor" else "disabledModels"
+            item[field] = sorted(saved)
+            return
+        raise ValueError("OAuth account not found")
+
+    config.update(mutate, skip_if_unchanged=True)
+    return set(saved)
+
+
+_model_discovery_flights: dict[str, concurrent.futures.Future] = {}
+_model_discovery_tasks_guard = threading.Lock()
+# The gate is shared by scheduler, manual refreshes and foreground account-add
+# workers, so the limit is truly process-wide rather than per event loop.
+# The network executor itself is the process-wide gate. A timed-out/cancelled
+# coroutine cannot free a slot while its non-cancellable thread is still alive.
+_model_discovery_network_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=OAUTH_MODEL_SYNC_MAX_CONCURRENCY, thread_name_prefix="oauth-model-network",
+)
+_model_discovery_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=OAUTH_MODEL_SYNC_MAX_CONCURRENCY, thread_name_prefix="oauth-model-sync",
+)
+
+
+def _discovery_generation(account: dict) -> str:
+    raw = "\0".join((
+        _canonical_key(account), provider_of(account),
+        str(account.get("access_token") or ""),
+        str(account.get("project_id") or account.get("workspace_id") or ""),
+    ))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _safe_discovery_error(exc: BaseException | str) -> str:
+    """Return a bounded credential-free error summary suitable for config/UI."""
+    if isinstance(exc, BaseException):
+        return type(exc).__name__
+    text = str(exc or "discovery failed")
+    return text if text in {"timeout", "empty catalog", "fetch_empty"} else "discovery failed"
+
+
+def _persist_model_discovery_failure(account_key: str, generation: str, error: str) -> bool:
+    now = _format_utc(datetime.now(timezone.utc))
+    changed = {"value": False}
+
+    def mutate(cfg):
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) == account_key and _discovery_generation(item) == generation:
+                item["last_model_sync_attempt"] = now
+                item["last_model_sync_error"] = str(error or "discovery failed")[:500]
+                changed["value"] = True
+                return
+
+    config.update(mutate, skip_if_unchanged=True)
+    return changed["value"]
+
+
+async def _discover_account_models_once(account_key: str, *, timeout_s: float) -> dict:
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    deadline = time.monotonic() + max(0.001, float(timeout_s))
+    initial = copy.deepcopy(get_account(canonical))
+    if not isinstance(initial, dict):
+        return {"action": "stale", "account_key": canonical}
+    initial_generation = _discovery_generation(initial)
+    try:
+        await ensure_valid_token(canonical)
+    except asyncio.TimeoutError:
+        _persist_model_discovery_failure(canonical, initial_generation, "timeout")
+        return {"action": "timeout", "account_key": canonical}
+    except Exception as exc:
+        error = _safe_discovery_error(exc)
+        _persist_model_discovery_failure(canonical, initial_generation, error)
+        return {"action": "error", "account_key": canonical, "error": error}
+
+    # Refresh may atomically replace the token. All discovery and persistence
+    # below must therefore use a fresh snapshot/generation, never the old one.
+    account = copy.deepcopy(get_account(canonical))
+    if not isinstance(account, dict):
+        return {"action": "stale", "account_key": canonical}
+    provider = provider_of(account)
+    if mock_mode_enabled():
+        return {"action": "network_disabled", "account_key": canonical}
+    generation = _discovery_generation(account)
+    remaining_s = deadline - time.monotonic()
+    if remaining_s <= 0:
+        _persist_model_discovery_failure(canonical, generation, "timeout")
+        return {"action": "timeout", "account_key": canonical}
+    loop = asyncio.get_running_loop()
+    try:
+        if provider == "cursor":
+            result = await loop.run_in_executor(
+                _model_discovery_network_executor,
+                lambda: refresh_cursor_models_sync(
+                    canonical, force=True, timeout_s=remaining_s,
+                    expected_generation=generation,
+                ),
+            )
+            return result
+        result = await loop.run_in_executor(
+            _model_discovery_network_executor,
+            lambda: oauth_model_discovery.discover(
+                copy.deepcopy(account), timeout=remaining_s,
+            ),
+        )
+        if time.monotonic() >= deadline:
+            _persist_model_discovery_failure(canonical, generation, "timeout")
+            return {"action": "timeout", "account_key": canonical}
+    except (asyncio.TimeoutError, TimeoutError):
+        _persist_model_discovery_failure(canonical, generation, "timeout")
+        return {"action": "timeout", "account_key": canonical}
+    except Exception as exc:
+        error = _safe_discovery_error(exc)
+        _persist_model_discovery_failure(canonical, generation, error)
+        return {"action": "error", "account_key": canonical, "error": error}
+
+    models = list(dict.fromkeys(str(model).strip() for model in result.models if str(model).strip()))
+    if not models:
+        _persist_model_discovery_failure(canonical, generation, "empty catalog")
+        return {"action": "empty", "account_key": canonical}
+    now = _format_utc(datetime.now(timezone.utc))
+    saved = {"value": False}
+
+    def mutate(cfg):
+        for item in cfg.get("oauthAccounts", []):
+            if _canonical_key(item) != canonical or _discovery_generation(item) != generation:
+                continue
+            # Atomic LKG replacement: IDs, allow-listed metadata and sync facts
+            # are committed by one config mutation. Errors/empty never reach here.
+            item["models"] = models
+            item["account_model_catalog"] = copy.deepcopy(getattr(result, "catalog", {}) or {})
+            item["last_model_sync"] = now
+            item["last_model_sync_attempt"] = now
+            item["last_model_sync_source"] = result.source
+            item["last_model_sync_error"] = ""
+            saved["value"] = True
+            return
+
+    config.update(mutate, skip_if_unchanged=True)
+    return {
+        "action": "updated" if saved["value"] else "stale",
+        "account_key": canonical, "models": len(models), "source": result.source,
+        "fetched_at": now,
+    }
+
+
+def _model_ids(account: dict | None) -> list[str]:
+    if not isinstance(account, dict):
+        return []
+    return list(dict.fromkeys(
+        str(model).strip() for model in account.get("models") or [] if str(model).strip()
+    ))
+
+
+def _normalize_model_refresh_result(canonical: str, before: dict | None, result: dict) -> dict:
+    """Attach catalog-delta facts without exposing account credentials."""
+    after = get_account(canonical)
+    old_ids = _model_ids(before)
+    new_ids = _model_ids(after)
+    old_set, new_set = set(old_ids), set(new_ids)
+    normalized = dict(result or {})
+    normalized.update({
+        "account_key": canonical,
+        "old_model_ids": old_ids,
+        "new_model_ids": new_ids,
+        "added": [model for model in new_ids if model not in old_set],
+        "removed": [model for model in old_ids if model not in new_set],
+        "had_success_baseline": bool((before or {}).get("last_model_sync")),
+    })
+    normalized["changed"] = bool(normalized["added"] or normalized["removed"])
+    return normalized
+
+
+async def refresh_account_models(
+    account_key: str, *, timeout_s: float = OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS,
+) -> dict:
+    """Cross-event-loop single-flight with identity/token generation gating."""
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    owner = False
+    with _model_discovery_tasks_guard:
+        flight = _model_discovery_flights.get(canonical)
+        if flight is None or flight.done():
+            flight = concurrent.futures.Future()
+            _model_discovery_flights[canonical] = flight
+            owner = True
+    if not owner:
+        return await asyncio.wrap_future(flight)
+    before = copy.deepcopy(get_account(canonical))
+    generation = _discovery_generation(before or {})
+    try:
+        result = await _discover_account_models_once(canonical, timeout_s=timeout_s)
+        # Cursor's native fetch owns its LKG, but the unified scheduler owns
+        # retry metadata so all five providers obey the same backoff policy.
+        if provider_of(before or {}) == "cursor":
+            if result.get("action") == "updated" and int(result.get("models") or 0) > 0:
+                now = str(result.get("fetched_at") or _format_utc(datetime.now(timezone.utc)))
+                def mark_cursor_success(cfg):
+                    for item in cfg.get("oauthAccounts", []):
+                        if _canonical_key(item) == canonical and _discovery_generation(item) == generation:
+                            item["last_model_sync"] = now
+                            item["last_model_sync_attempt"] = now
+                            item["last_model_sync_source"] = "upstream:cursor"
+                            item["last_model_sync_error"] = ""
+                            return
+                config.update(mark_cursor_success, skip_if_unchanged=True)
+            elif result.get("action") in {"timeout", "error", "fetch_empty", "profile_updated"}:
+                _persist_model_discovery_failure(
+                    canonical, generation,
+                    str(result.get("error") or result.get("model_error") or result.get("action")),
+                )
+        normalized = _normalize_model_refresh_result(canonical, before, result)
+        flight.set_result(normalized)
+        return normalized
+    except BaseException as exc:
+        flight.set_exception(exc)
+        try:
+            flight.exception()
+        except BaseException:
+            pass
+        raise
+    finally:
+        with _model_discovery_tasks_guard:
+            if _model_discovery_flights.get(canonical) is flight:
+                _model_discovery_flights.pop(canonical, None)
+
+
+def start_account_model_refresh(
+    account_key: str, *, timeout_s: float = OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS,
+) -> concurrent.futures.Future:
+    """Start a non-cancelling worker suitable for a bounded foreground wait."""
+    canonical = _resolve_existing_account_key_or_raise(account_key)
+    return _model_discovery_executor.submit(
+        lambda: asyncio.run(refresh_account_models(canonical, timeout_s=timeout_s))
+    )
+
+
 def refresh_cursor_models_sync(
     account_key: str,
     *,
     force: bool = False,
     min_interval_seconds: int | None = None,
+    timeout_s: float = OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS,
+    expected_generation: str | None = None,
 ) -> dict:
     """Refresh one Cursor account's canonical models and native metadata."""
     canonical = _resolve_existing_account_key(account_key)
@@ -3560,6 +3997,14 @@ def refresh_cursor_models_sync(
             if age < max(0, int(min_interval_seconds)):
                 return {"action": "skipped_fresh", "account_key": account_key, "age_seconds": int(age)}
 
+    generation = expected_generation or _discovery_generation(acc)
+    deadline = time.monotonic() + max(0.001, float(timeout_s))
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("Cursor model discovery deadline exhausted")
+        return value
+
     access_token = str(acc.get("access_token") or "")
     if not access_token:
         return {"action": "skipped_no_access_token", "account_key": account_key}
@@ -3569,7 +4014,15 @@ def refresh_cursor_models_sync(
     model_error: Exception | None = None
     model_error_name = ""
     try:
-        catalog = cursor_provider.fetch_model_catalog_sync(access_token)
+        budget = remaining()
+        try:
+            catalog = cursor_provider.fetch_model_catalog_sync(access_token, timeout=budget)
+        except TypeError as exc:
+            if "unexpected keyword argument 'timeout'" not in str(exc):
+                raise
+            # Compatibility for injected/legacy callables; elapsed deadline is
+            # still checked before any config mutation.
+            catalog = cursor_provider.fetch_model_catalog_sync(access_token)
         records = (catalog.get("models") or []) if isinstance(catalog, dict) else []
         models = [
             str(item.get("id") or "")
@@ -3589,7 +4042,17 @@ def refresh_cursor_models_sync(
     profile: dict[str, Any] = {}
     profile_error = ""
     try:
-        profile = cursor_provider.fetch_profile_sync(access_token, account_key=account_key)
+        budget = remaining()
+        try:
+            profile = cursor_provider.fetch_profile_sync(
+                access_token, account_key=account_key, timeout=budget,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'timeout'" not in str(exc):
+                raise
+            profile = cursor_provider.fetch_profile_sync(
+                access_token, account_key=account_key,
+            )
     except Exception as exc:
         # Models and account identity are independent last-known-good data. A
         # failure in either source must not discard a successful refresh of the other.
@@ -3604,15 +4067,23 @@ def refresh_cursor_models_sync(
             "profile_error": profile_error,
         }
 
+    if time.monotonic() >= deadline:
+        return {"action": "timeout", "account_key": account_key}
     profile_email = str(profile.get("email") or "").strip()
 
     def mutate(current_cfg):
         for item in current_cfg.get("oauthAccounts", []):
-            if _canonical_key(item) == account_key:
+            if (
+                _canonical_key(item) == account_key
+                and _discovery_generation(item) == generation
+            ):
                 if models:
                     item["models"] = list(dict.fromkeys(models))
                     item["cursor_model_catalog"] = copy.deepcopy(catalog)
                     item["last_model_sync"] = fetched_at
+                    item["last_model_sync_source"] = "upstream:cursor"
+                    item["last_model_sync_attempt"] = fetched_at
+                    item["last_model_sync_error"] = ""
                 if profile:
                     if profile_email:
                         item["email"] = profile_email
@@ -3642,48 +4113,143 @@ async def refresh_cursor_models(
     min_interval_seconds: int | None = None,
     timeout_s: float = 30.0,
 ) -> dict:
+    """Compatibility entry point using the same lifecycle-bound network worker."""
     try:
         account_key = _resolve_existing_account_key_or_raise(account_key)
-        await ensure_valid_token(account_key)
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                refresh_cursor_models_sync,
-                account_key,
-                force=force,
-                min_interval_seconds=min_interval_seconds,
-            ),
-            timeout=timeout_s,
-        )
-    except asyncio.TimeoutError:
-        return {"action": "timeout", "account_key": account_key}
+        if not force:
+            account = get_account(account_key)
+            last = _parse_iso((account or {}).get("last_model_sync"))
+            interval = min_interval_seconds
+            if interval is None:
+                cfg = config.get().get("cursorOAuth") or {}
+                interval = int(float(cfg.get("modelSyncHours", 6) or 6) * 3600)
+            if last is not None:
+                age = (datetime.now(timezone.utc) - last.astimezone(timezone.utc)).total_seconds()
+                if age < max(0, int(interval)):
+                    return {"action": "skipped_fresh", "account_key": account_key, "age_seconds": int(age)}
+        return await _discover_account_models_once(account_key, timeout_s=timeout_s)
     except Exception as exc:
-        return {"action": "error", "account_key": account_key, "error": str(exc)}
+        error = _safe_discovery_error(exc)
+        return {"action": "error", "account_key": account_key, "error": error}
 
 
-async def cursor_model_sync_once(*, force: bool = False) -> list[dict]:
-    keys = [
-        _account_key(acc) for acc in list_accounts()
-        if provider_of(acc) == "cursor" and acc.get("enabled", True)
+def _model_catalog_complete(account: dict, model_ids: Iterable[str]) -> bool:
+    """Whether the provider-native catalog has a metadata record for every ID."""
+    catalog_key = "cursor_model_catalog" if provider_of(account) == "cursor" else "account_model_catalog"
+    catalog = account.get(catalog_key)
+    records = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(records, list):
+        return False
+    catalog_ids = {
+        str(record.get("id") or "").strip()
+        for record in records
+        if isinstance(record, dict) and str(record.get("id") or "").strip()
+    }
+    return set(model_ids).issubset(catalog_ids)
+
+
+def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
+    """Whether IDs/metadata are missing, stale, or a failed attempt may be retried."""
+    now = now or datetime.now(timezone.utc)
+    last_success = _parse_iso(account.get("last_model_sync"))
+    last_attempt = _parse_iso(account.get("last_model_sync_attempt"))
+    failed = bool(account.get("last_model_sync_error"))
+    if failed and last_attempt is not None:
+        return (now - last_attempt.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS
+    model_ids = _model_ids(account)
+    if not model_ids or last_success is None or not _model_catalog_complete(account, model_ids):
+        return True
+    return (now - last_success.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS
+
+
+def _format_model_change_notification(account: dict, result: dict) -> str:
+    def lines(title: str, values: list[str]) -> list[str]:
+        shown = values[:OAUTH_MODEL_CHANGE_LIST_LIMIT]
+        out = [f"<b>{title} {len(values)}</b>"]
+        out.extend(f"• <code>{notifier.escape_html(value)}</code>" for value in shown)
+        if len(values) > len(shown):
+            out.append(f"• 另有 {len(values) - len(shown)} 项")
+        return out
+
+    provider = provider_of(account)
+    label = str(account.get("label") or account.get("email") or _account_key(account))
+    parts = [
+        "🔄 <b>OAuth 账户模型目录已变化</b>",
+        f"账户: <code>{notifier.escape_html(label)}</code>",
+        f"类型: <code>{notifier.escape_html(notifier.provider_label(provider))}</code>",
     ]
-    if not keys:
-        return []
-    return await asyncio.gather(*[
-        refresh_cursor_models(key, force=force) for key in keys
-    ])
+    added, removed = list(result.get("added") or []), list(result.get("removed") or [])
+    if added:
+        parts.extend(lines("新增", added))
+    if removed:
+        parts.extend(lines("删除", removed))
+    return "\n".join(parts)
 
 
-async def cursor_model_sync_loop() -> None:
+async def oauth_model_sync_once(
+    *, force: bool = False, notify_changes: bool = True,
+    account_keys: Iterable[str] | None = None, trigger: str = "background",
+) -> list[dict]:
+    """Refresh due OAuth catalogs with one global concurrency bound."""
+    requested = set(account_keys or []) if account_keys is not None else None
+    accounts = [copy.deepcopy(acc) for acc in list_accounts()]
+    selected: list[tuple[str, dict]] = []
+    for account in accounts:
+        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor"}:
+            continue
+        key = _account_key(account)
+        if requested is not None and key not in requested:
+            continue
+        if force or _model_sync_due(account):
+            selected.append((key, account))
+    semaphore = asyncio.Semaphore(OAUTH_MODEL_SYNC_MAX_CONCURRENCY)
+
+    async def run(key: str, snapshot: dict) -> dict:
+        async with semaphore:
+            try:
+                result = await refresh_account_models(
+                    key, timeout_s=OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                result = {"action": "error", "account_key": key, "error": str(exc)}
+        if (
+            notify_changes and trigger == "background"
+            and result.get("action") == "updated"
+            and result.get("had_success_baseline") and result.get("changed")
+        ):
+            try:
+                notifier.notify(_format_model_change_notification(snapshot, result))
+            except Exception as exc:
+                print(f"[oauth] model change notification failed: {type(exc).__name__}")
+        return result
+
+    return await asyncio.gather(*(run(key, account) for key, account in selected))
+
+
+async def oauth_model_sync_loop() -> None:
+    """Non-blocking startup/periodic maintenance loop for all OAuth providers."""
+    await asyncio.sleep(OAUTH_MODEL_SYNC_STARTUP_DELAY_SECONDS)
     while True:
         try:
-            cfg = config.get().get("cursorOAuth") or {}
-            interval = max(300, int(float(cfg.get("modelSyncHours", 6) or 6) * 3600))
-            await cursor_model_sync_once(force=False)
-            await asyncio.sleep(interval)
+            await oauth_model_sync_once(trigger="background", notify_changes=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"[cursor] model sync loop failed: {exc}")
-            await asyncio.sleep(300)
+            print(f"[oauth] model sync loop failed: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS)
+
+
+async def cursor_model_sync_once(*, force: bool = False) -> list[dict]:
+    """Compatibility wrapper; Cursor is now owned by the unified scheduler."""
+    keys = [_account_key(acc) for acc in list_accounts() if provider_of(acc) == "cursor"]
+    return await oauth_model_sync_once(
+        force=force, notify_changes=False, account_keys=keys, trigger="compat-cursor",
+    )
+
+
+async def cursor_model_sync_loop() -> None:
+    """Compatibility entry point; do not register alongside the unified loop."""
+    await oauth_model_sync_loop()
 
 
 def cursor_disabled_models(account_or_key: dict | str) -> set[str]:
@@ -3698,16 +4264,26 @@ def cursor_disabled_models(account_or_key: dict | str) -> set[str]:
     }
 
 
-def set_cursor_disabled_models(account_key: str, models: Iterable[str]) -> set[str]:
-    """Persist the exact disabled canonical-model set for one Cursor account."""
+def set_cursor_disabled_models(
+    account_key: str,
+    models: Iterable[str],
+    *,
+    visible_models: Iterable[str] | None = None,
+) -> set[str]:
+    """Edit one frozen visible snapshot while retaining hidden disabled IDs."""
     canonical = _resolve_existing_account_key_or_raise(account_key)
     account = get_account(canonical)
     if account is None or provider_of(account) != "cursor":
         raise ValueError("Cursor account not found")
-    available = {
+    current_available = {
         str(item.get("id") or "").strip()
         for item in ((account.get("cursor_model_catalog") or {}).get("models") or [])
         if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    available = {
+        str(model).strip() for model in (
+            visible_models if visible_models is not None else current_available
+        ) if str(model).strip()
     }
     wanted = {
         str(model).strip() for model in models or [] if str(model).strip()
@@ -3716,15 +4292,20 @@ def set_cursor_disabled_models(account_key: str, models: Iterable[str]) -> set[s
     if unknown:
         raise ValueError(f"Cursor model not found: {unknown[0]}")
 
+    saved: set[str] = set()
+
     def mutate(cfg):
+        nonlocal saved
         for item in cfg.get("oauthAccounts", []):
             if _canonical_key(item) == canonical:
-                item["cursor_disabled_models"] = sorted(wanted)
+                saved = cursor_disabled_models(item) - available
+                saved |= wanted
+                item["cursor_disabled_models"] = sorted(saved)
                 return
         raise ValueError("Cursor account not found")
 
     config.update(mutate, skip_if_unchanged=True)
-    return set(wanted)
+    return set(saved)
 
 
 def _cursor_max_context_capable_models(account: dict) -> set[str]:

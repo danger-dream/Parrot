@@ -141,7 +141,9 @@ def _normalize_profile(raw: dict[str, Any]) -> dict[str, Any]:
     return profile
 
 
-def fetch_profile_sync(access_token: str, *, account_key: str = "") -> dict[str, Any]:
+def fetch_profile_sync(
+    access_token: str, *, account_key: str = "", timeout: float = 20.0,
+) -> dict[str, Any]:
     """Fetch Cursor Web account identity (email/name) using the CLI OAuth token."""
     if _mock_mode_enabled():
         subject = subject_from_access_token(access_token) or "cursor-mock-user"
@@ -159,7 +161,7 @@ def fetch_profile_sync(access_token: str, *, account_key: str = "") -> dict[str,
         "User-Agent": f"cursor-agent/{CURSOR_CLIENT_VERSION.removeprefix('cli-')}",
     }
     try:
-        with _http_client(account_key=account_key, timeout=20.0) as client:
+        with _http_client(account_key=account_key, timeout=max(0.001, float(timeout))) as client:
             response = client.get(CURSOR_WEB_PROFILE_URL, headers=headers)
     except httpx.TimeoutException as exc:
         raise CursorTimeoutError("Cursor 账号资料请求超时") from exc
@@ -385,18 +387,19 @@ def _mock_models() -> list[CursorModel]:
     ]
 
 
-def fetch_models_sync(access_token: str) -> list[CursorModel]:
+def fetch_models_sync(access_token: str, *, timeout: float | None = None) -> list[CursorModel]:
     if _mock_mode_enabled():
         return _mock_models()
     return list_cursor_models(
         access_token,
         include_hidden=False,
         use_model_parameters=True,
+        timeout_s=timeout,
     )
 
 
-def fetch_model_catalog_sync(access_token: str) -> dict[str, Any]:
-    return build_catalog(fetch_models_sync(access_token))
+def fetch_model_catalog_sync(access_token: str, *, timeout: float | None = None) -> dict[str, Any]:
+    return build_catalog(fetch_models_sync(access_token, timeout=timeout))
 
 
 def _normalize_iso(value: Any) -> str | None:

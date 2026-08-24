@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install test dependencies
-        run: python -m pip install -r requirements.txt pytest
+        run: python -m pip install -r requirements.txt pytest pytest-asyncio
       - name: Compile and import
         run: |
           python -m compileall -q server.py src

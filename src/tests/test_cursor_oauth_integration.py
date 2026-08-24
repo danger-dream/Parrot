@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ from src.cursor_bridge.usage import (  # noqa: E402
 from src.oauth import cursor as cursor_provider  # noqa: E402
 from src.openai.transform.guard import GuardError  # noqa: E402
 from src.telegram import states, ui  # noqa: E402
-from src.telegram.menus import load_balancing_menu, logs_menu, oauth_menu  # noqa: E402
+from src.telegram.menus import load_balancing_menu, logs_menu, oauth_account_models_menu, oauth_menu  # noqa: E402
 from src.transform import cc_mimicry  # noqa: E402
 
 
@@ -122,6 +123,7 @@ def setup_function(_function):
     config.update(lambda cfg: cfg.update({
         "oauthAccounts": [],
         "oauth": {"mockMode": True},
+        "modelBindings": {"defaults": {}, "scoped": {}},
     }))
 
 
@@ -146,23 +148,34 @@ def test_cursor_variant_resolution_uses_real_native_slug_shapes():
     ) == "gpt-5.5-extra-high-fast"
 
 
-def test_cursor_native_metadata_precedes_models_dev_and_uses_account_limits():
+def test_cursor_models_dev_common_override_keeps_native_transport_metadata():
     account = _install_account()
     scope = "oauth:cursor:cursor-user-1"
+    config.update(lambda cfg: cfg.update(modelBindings={
+        "defaults": {},
+        "scoped": {scope: {"claude-fable-5": {
+            "target": "302ai/chatgpt-4o-latest", "source": "manual",
+            "outboundModel": "claude-fable-5",
+        }}},
+    }))
     binding = model_metadata.resolve_binding(
         "claude-fable-5",
         scope_key=scope,
         outbound_model="claude-fable-5-thinking-medium",
     )
     assert binding is not None
-    assert binding.source == "cursor.AvailableModels"
-    assert binding.target == "cursor/claude-fable-5"
-    assert binding.metadata["contextWindow"] == 300_000
+    assert binding.authority == "models.dev" and binding.scope_key == scope
+    assert binding.target == "302ai/chatgpt-4o-latest"
+    assert binding.metadata["contextWindow"] == 128_000
     assert binding.metadata["contextWindowMaxMode"] == 1_000_000
-    assert binding.metadata["maxOutputTokens"] == 64_000
-    assert binding.metadata["vision"] is False
+    assert binding.metadata["maxOutputTokens"] == 16_384
+    assert binding.metadata["vision"] is True
     assert binding.metadata["cursorUpstreamVision"] is True
     assert "claude-fable-5-thinking-medium" in binding.metadata["variants"]
+    assert model_metadata.context_window(
+        "claude-fable-5", scope_key=scope,
+        outbound_model="claude-fable-5-thinking-medium", use_max_context=True,
+    ) == 1_000_000
 
     result = model_metadata.auto_sync_metadata([
         model_metadata.ModelInventoryItem(
@@ -452,10 +465,13 @@ def test_cursor_retry_log_exposes_native_outbound_variant():
 
 def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatch):
     edits: list[tuple[str, dict | None]] = []
+    finished = threading.Event()
     monkeypatch.setattr(ui, "answer_cb", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ui, "edit", lambda *args, **kwargs: edits.append((
-        args[2], kwargs.get("reply_markup"),
-    )))
+    def edit(*args, **kwargs):
+        edits.append((args[2], kwargs.get("reply_markup")))
+        if "后台将静默重试" in args[2]:
+            finished.set()
+    monkeypatch.setattr(ui, "edit", edit)
 
     oauth_menu.on_login_cursor_start(321, 654, "cb-start")
     oauth_menu.on_login_cursor_done(321, 654, "cb-done")
@@ -469,10 +485,16 @@ def test_cursor_login_button_completes_and_saves_account_in_mock_mode(monkeypatc
     assert accounts[0]["email"] == "cursor-mock@example.test"
     assert accounts[0]["label"] == "cursor-mock@example.test"
     assert accounts[0]["cursor_profile_name"] == "Cursor Mock"
-    assert accounts[0]["models"] == ["claude-fable-5", "composer-2.5"]
-    assert accounts[0]["cursor_model_catalog"]["models"]
+    # mockMode prohibits every upstream model request.  The identity is saved
+    # first with an empty catalog and the shared UI worker reports fallback;
+    # production discovery follows the same path with mocked provider calls in
+    # the dedicated model-sync tests.
+    assert accounts[0]["models"] == []
+    assert accounts[0]["cursor_model_catalog"] == {}
     assert states.get_state(321) is None
-    assert "Cursor OAuth 账户已添加" in edits[-1][0]
+    assert any("正在同步模型，请稍候" in text for text, _ in edits)
+    assert finished.wait(1)
+    assert "后台将静默重试" in edits[-1][0]
 
 
 def test_cursor_quota_updated_at_is_detail_only(monkeypatch):
@@ -786,11 +808,72 @@ def test_cursor_max_context_metadata_and_preflight_use_one_million(monkeypatch):
     ) is None
 
 
-def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch):
+def test_cursor_new_entry_and_unified_rich_detail_keep_max_context():
+    oauth_manager.add_account(_account())
+    account_key = "cursor:cursor-user-1"
+    _account_text, account_kb = oauth_menu._detail_text_and_kb(account_key, refresh_quota=False)
+    manage = next(button for row in account_kb["inline_keyboard"] for button in row if button["text"] == "🧬 管理模型")
+    assert manage["callback_data"].startswith("oam:open:")
+
+    text, kb = oauth_account_models_menu.render(account_key)
+    assert "Cursor 模型目录" not in text and "刷新额度与模型" not in text
+    assert "<code>claude-fable-5</code>" in text and "上下文：300K · 🧠" in text
+    assert "思考档位：low、medium、high、max" in text
+    detail, detail_kb = oauth_account_models_menu._detail_render(
+        account_key, "claude-fable-5", model_page=1, account_page=1, filter_key="all",
+    )
+    assert "完整 ID: <code>claude-fable-5</code>" in detail
+    assert "Max Context: <code>1.0M</code>" in detail
+    labels = [button["text"] for row in detail_kb["inline_keyboard"] for button in row]
+    assert "🚫 停用模型" in labels and "关闭 Max Context" in labels
+    oauth_manager.set_account_model_disabled(account_key, "claude-fable-5", True)
+    assert oauth_manager.cursor_disabled_models(account_key) == {"claude-fable-5"}
+    oauth_manager.set_cursor_max_context_default(account_key, "claude-fable-5", False)
+    assert not oauth_manager.cursor_max_context_default(account_key, "claude-fable-5")
+
+
+def test_cursor_max_context_button_uses_native_catalog_when_effective_context_reaches_max(monkeypatch):
+    oauth_manager.add_account(_account())
+    account_key = "cursor:cursor-user-1"
+    model = "claude-fable-5"
+    scope = f"oauth:{account_key}"
+    config.update(lambda cfg: cfg.update(modelBindings={
+        "defaults": {},
+        "scoped": {scope: {model: {
+            "target": "demo/effective-max",
+            "source": "manual",
+            "outboundModel": model,
+        }}},
+    }))
+    monkeypatch.setattr(
+        model_metadata.model_pricing, "catalog_metadata",
+        lambda target: {"contextWindow": 1_000_000} if target == "demo/effective-max" else None,
+    )
+
+    detail, detail_kb = oauth_account_models_menu._detail_render(
+        account_key, model, model_page=1, account_page=1, filter_key="all",
+    )
+    buttons = [button for row in detail_kb["inline_keyboard"] for button in row]
+    max_button = next(button for button in buttons if button["text"] == "关闭 Max Context")
+    assert "上下文: <code>1.0M</code>" in detail
+    assert "Max Context: <code>1.0M</code>" in detail
+    assert max_button["callback_data"].startswith("oam:maxctx:")
+
+    answers = []
+    monkeypatch.setattr(oauth_account_models_menu.ui, "answer_cb", lambda _cb, text="": answers.append(text))
+    monkeypatch.setattr(oauth_account_models_menu.ui, "edit", lambda *args, **kwargs: None)
+    assert oauth_account_models_menu.handle_callback(
+        1, 2, "cb", max_button["callback_data"],
+    )
+    assert not oauth_manager.cursor_max_context_default(account_key, model)
+    assert answers == ["Max Context 已关闭"]
+
+
+def test_cursor_model_catalog_uses_six_per_page_and_six_columns(monkeypatch):
     account = _account()
     records = account["cursor_model_catalog"]["models"]
     template = copy.deepcopy(records[-1])
-    for index in range(4):
+    for index in range(10):
         extra = copy.deepcopy(template)
         extra.update({
             "id": f"test-model-{index}",
@@ -820,7 +903,8 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
 
     account_short = ui.register_code("cursor:cursor-user-1")
     oauth_menu.on_cursor_models(1, 2, "cb-list", f"{account_short}:1")
-    assert "共 <b>7</b> 个模型 · 已禁用 <b>0</b> 个 · 第 <b>1/2</b> 页" in captured["text"]
+    assert "共 <b>13</b> 个模型 · 已禁用 <b>0</b> 个 · 第 <b>1/3</b> 页" in captured["text"]
+    assert "13. " not in captured["text"]
     assert "1. Claude Fable 5" in captured["text"]
     assert "上下文：<code>1.0M</code>（Max Context 默认）" in captured["text"]
     assert "支持思考档位：low、medium、high、max" in captured["text"]
@@ -835,8 +919,13 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
         if str(button.get("callback_data") or "").startswith("oa:cursor_model:")
     ]
     assert [button["text"] for button in details] == [
-        "📄 #1", "📄 #2", "📄 #3", "📄 #4", "📄 #5", "📄 #6",
+        str(index) for index in range(1, 7)
     ]
+    detail_rows = [
+        row for row in captured["reply_markup"]["inline_keyboard"]
+        if row and str(row[0].get("callback_data") or "").startswith("oa:cursor_model:")
+    ]
+    assert [len(row) for row in detail_rows] == [6]
     refresh_row = next(
         row for row in captured["reply_markup"]["inline_keyboard"]
         if row and row[0].get("text") == "🔄 刷新额度与模型"
@@ -872,6 +961,16 @@ def test_cursor_model_catalog_uses_six_per_page_and_numbered_details(monkeypatch
     assert "默认上下文：<code>300.0K</code>（Max Context 已关闭）" in captured["text"]
     assert "Max Context 默认：<b>已关闭</b>" in captured["text"]
     assert any("Max Context 默认已关闭" in answer for answer in answers)
+
+    oauth_menu.on_cursor_models(1, 2, "cb-page-2", f"{account_short}:2")
+    assert "第 <b>2/3</b> 页" in captured["text"]
+    page2_details = [
+        button for row in captured["reply_markup"]["inline_keyboard"] for button in row
+        if str(button.get("callback_data") or "").startswith("oa:cursor_model:")
+    ]
+    assert [button["text"] for button in page2_details] == ["7", "8", "9", "10", "11", "12"]
+    oauth_menu.on_cursor_models(1, 2, "cb-page-3", f"{account_short}:3")
+    assert "第 <b>3/3</b> 页" in captured["text"]
 
 
 def test_cursor_disabled_models_filter_channel_and_survive_refresh_and_relogin(
@@ -917,6 +1016,17 @@ def test_cursor_disabled_models_filter_channel_and_survive_refresh_and_relogin(
     assert CursorOAuthChannel(oauth_manager.get_account(account_key)).supports_model(
         "gpt-5.5"
     ) == "gpt-5.5"
+
+
+def test_cursor_model_records_sort_name_then_disabled_last():
+    account = _account()
+    account["cursor_model_catalog"]["models"] = list(reversed(
+        account["cursor_model_catalog"]["models"]
+    ))
+    account["cursor_disabled_models"] = ["composer-2.5"]
+    assert [item["id"] for item in oauth_menu._cursor_model_records(account)] == [
+        "claude-fable-5", "gpt-5.5", "composer-2.5",
+    ]
 
 
 def test_cursor_batch_disable_menu_persists_and_can_reenable(monkeypatch):
@@ -1088,3 +1198,40 @@ def test_cursor_account_and_model_codes_survive_process_restart():
     assert resolved is not None
     assert resolved[0] == account_key
     assert resolved[2]["id"] == "claude-fable-5"
+
+
+def test_cursor_bulk_editor_freezes_order_and_visible_snapshot(monkeypatch):
+    account = _account()
+    account["cursor_disabled_models"] = ["hidden-old"]
+    oauth_manager.add_account(account)
+    account_key = "cursor:cursor-user-1"
+    original = [str(item["id"]) for item in oauth_menu._cursor_model_records(account)]
+    assert len(original) >= 2
+    chat_id = 8675309
+    oauth_menu._set_cursor_disable_state(
+        chat_id, account_key, page=1, selected=set(), models=original,
+    )
+
+    # A background sync adds and reorders the live catalog while the old
+    # Telegram editor remains open. Number 2 must still mean snapshot ID 2.
+    def reorder(cfg):
+        item = cfg["oauthAccounts"][0]
+        records = list(reversed(item["cursor_model_catalog"]["models"]))
+        records.insert(0, {"id": "new-after-open", "name": "New"})
+        item["cursor_model_catalog"]["models"] = records
+        item["cursor_disabled_models"].append("new-after-open")
+    config.update(reorder)
+
+    monkeypatch.setattr(oauth_menu.ui, "answer_cb", lambda *a, **k: None)
+    monkeypatch.setattr(oauth_menu.ui, "edit", lambda *a, **k: None)
+    oauth_menu.on_cursor_disable_select(chat_id, 1, "cb", "2")
+    data = oauth_menu._cursor_disable_state(chat_id)
+    assert data["models"] == original
+    assert data["selected"] == [original[1]]
+    rendered, _kb = oauth_menu._cursor_disable_text_and_kb(data)
+    assert f"2. 🚫 <code>{original[1]}</code>" in rendered
+
+    monkeypatch.setattr(oauth_menu, "on_cursor_models", lambda *a, **k: None)
+    oauth_menu.on_cursor_disable_save(chat_id, 1, "cb")
+    saved = oauth_manager.cursor_disabled_models(account_key)
+    assert saved == {"hidden-old", "new-after-open", original[1]}

@@ -441,7 +441,7 @@ def test_settings_usage_display_mode_toggle(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     settings = rec.last("editMessageText")
     assert settings and "OAuth 账户设置" in settings["text"]
-    assert "OAuth 模型目录" in settings["text"]
+    assert "默认模型" in settings["text"]
     assert "按账号自动同步" in settings["text"]
     assert "🎨 <b>媒体能力</b>" in settings["text"]
     assert "GPT / Codex 图片:" in settings["text"]
@@ -457,7 +457,7 @@ def test_settings_usage_display_mode_toggle(m):
     assert "状态: 🚫 已停用" in settings["text"]
     keyboard = settings["reply_markup"]["inline_keyboard"]
     texts = [b["text"] for row in keyboard for b in row]
-    assert [b["text"] for b in keyboard[0]] == ["🧩 模型目录", "📈 配额监控"]
+    assert [b["text"] for b in keyboard[0]] == ["🧬 默认模型", "📈 配额监控"]
     assert [b["text"] for b in keyboard[1]] == ["GPT 图片", "Grok 图片"]
     assert "GPT 图片" in texts
     assert "Grok 图片" in texts
@@ -734,9 +734,8 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     assert "Codex 原始窗口" not in detail["text"]
     detail_rows = detail["reply_markup"]["inline_keyboard"]
     action_row = next(row for row in detail_rows if any(b.get("callback_data", "").startswith("oa:reset_quota_ask:") for b in row))
-    assert [b["text"] for b in action_row] == ["⚡ 并发上限", "♻️ 重置次数"]
-    assert action_row[0]["callback_data"].startswith("oa:emax:")
-    assert action_row[1]["callback_data"].startswith("oa:reset_quota_ask:")
+    assert [b["text"] for b in action_row] == ["♻️ 重置额度"]
+    assert action_row[0]["callback_data"].startswith("oa:reset_quota_ask:")
 
     # 不是 OpenAI OAuth 账号时，即使构造 reset-count callback，也只清 loading、不弹提示、不改页面。
     _setup(m)
@@ -896,7 +895,7 @@ def test_openai_official_reset_credit_ask_and_confirm(m):
         for b in row if "callback_data" in b
     ]
     action_row = next(row for row in detail["reply_markup"]["inline_keyboard"] if any(b.get("callback_data", "").startswith("oa:reset_quota_ask:") for b in row))
-    assert [b["text"] for b in action_row] == ["⚡ 并发上限", "♻️ 重置次数"]
+    assert [b["text"] for b in action_row] == ["♻️ 重置额度"]
     ask_cb = next(x for x in flat if x.startswith("oa:reset_quota_ask:"))
 
     # 旧按钮/直达回调不能绕过二次确认直接消耗官方 reset credit。

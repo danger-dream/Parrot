@@ -240,11 +240,20 @@ class OpenAIOAuthChannel(Channel):
         # 只要列出对外暴露的名字即可。
         models = account.get("models") or []
         if models:
-            self.models = list(models)
+            selected_models = list(models)
         elif default_models:
-            self.models = list(default_models)
+            selected_models = list(default_models)
         else:
-            self.models = list(_provider_cfg().get("defaultModels") or [])
+            selected_models = list(
+                _provider_cfg().get("defaultModels")
+                or (config.DEFAULT_CONFIG.get("openaiOAuth") or {}).get("defaultModels")
+                or []
+            )
+        disabled_models = {
+            str(model).strip() for model in account.get("disabledModels") or []
+            if str(model).strip()
+        }
+        self.models = [model for model in selected_models if model not in disabled_models]
 
     # ─── 模型查询 ─────────────────────────────────────────────
 

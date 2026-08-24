@@ -32,8 +32,14 @@ class OAuthChannel(Channel):
         except (TypeError, ValueError):
             self.max_concurrent = 0
 
+        # Account LKG is authoritative; provider defaults are fallback only.
         models = account.get("models") or []
-        self.models: list[str] = list(models) if models else list(default_models)
+        selected = list(models) if models else list(default_models)
+        disabled = {
+            str(model).strip() for model in account.get("disabledModels") or []
+            if str(model).strip()
+        }
+        self.models: list[str] = [model for model in selected if model not in disabled]
 
     def supports_model(self, requested_model: str) -> Optional[str]:
         return requested_model if requested_model in self.models else None

@@ -109,11 +109,16 @@ class AntigravityOAuthChannel(Channel):
 
         models = account.get("models") or []
         if models:
-            self.models = list(models)
+            selected_models = list(models)
         elif default_models:
-            self.models = list(default_models)
+            selected_models = list(default_models)
         else:
-            self.models = list(cfg.get("defaultModels") or ag_provider.default_models())
+            selected_models = list(cfg.get("defaultModels") or ag_provider.default_models())
+        disabled_models = {
+            str(model).strip() for model in account.get("disabledModels") or []
+            if str(model).strip()
+        }
+        self.models = [model for model in selected_models if model not in disabled_models]
 
         image_models = (
             account.get("imageModels")

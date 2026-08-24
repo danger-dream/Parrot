@@ -110,7 +110,7 @@ def test_oauth_settings_exposes_distinct_gpt_and_grok_media_entries(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     message = recorder.last("editMessageText")
     assert message is not None
-    assert "OAuth 模型目录" in message["text"]
+    assert "默认模型" in message["text"]
     assert "🎨 <b>媒体能力</b>" in message["text"]
     assert "Grok Imagine: 图片 <b>2</b> · 视频 <b>2</b>" in message["text"]
 

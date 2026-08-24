@@ -52,7 +52,7 @@ _FAM_LABEL = {
     "xai":       "Grok",
     "antigravity": "Antigravity",
 }
-PAGE = 10
+PAGE = 12
 _SYNC_SPAWN = False
 _FAM_PROVIDER = {
     "anthropic": "claude",
@@ -411,16 +411,16 @@ def _merge_ids(ids: list[str], existing: list[str]) -> list[str]:
 
 def _overview_text() -> str:
     lines = [
-        "🧩 <b>OAuth 模型目录</b>",
+        "🧬 <b>默认模型</b>",
         "",
-        "这里改的是家族共用白名单。",
-        "账号自己没填模型时，全部回落到这份列表。",
+        "这里维护各 Provider 的普通模型 ID 字符串列表。",
+        "仅当某个 OAuth 账户没有可用的实时/LKG 目录时，才作为该账户的无状态兜底；账户故障不会反向修改此列表。",
         "Cursor 仍按账号自动同步，不在这里改。",
         "",
     ]
     for fam in _FAMILIES:
         models = _read_list(fam)
-        lines.append(f"{_fam_body_label(fam)}  {len(models)} 个已启用")
+        lines.append(f"{_fam_body_label(fam)}  {len(models)} 个默认模型")
     cursor_n = _cursor_account_count()
     lines.append(f"{ui.provider_tag('cursor')}  账号详情里看目录")
     if cursor_n:
@@ -490,8 +490,11 @@ def _manual_panel(chat_id: int, message_id, data: dict) -> None:
 
 def _enter_select(chat_id, message_id, data, ids, *, source, error=None, retry=False):
     existing = data.get("existing_models") or []
-    merged = _merge_ids(ids, existing)
     existing_set = set(existing)
+    merged = sorted(_merge_ids(ids, existing), key=str.casefold)
+    # Stable second pass: enabled defaults first, disabled candidates last;
+    # toggling a draft does not reshuffle indices until the editor is reopened.
+    merged.sort(key=lambda model: model not in existing_set)
     data.update(
         discovered_models=merged,
         selected_models=[mid for mid in merged if mid in existing_set],
@@ -514,19 +517,20 @@ def _model_kb(data):
     selected = set(data.get("selected_models") or [])
     page, start, pages = _bounds(len(models), data.get("model_page", 0))
     data["model_page"] = page
-    existing = set(data.get("existing_models") or [])
-    rows = []
-    for i, mid in enumerate(models[start:start + PAGE], start):
-        mark = "✅ " if mid in selected else "⬜ "
-        suffix = ""
-        if mid not in existing:
-            suffix = " · 新" if data.get("models_source") == "live" else " · 参考"
-        rows.append([ui.btn(mark + mid + suffix, f"odm:t:{i}:{page}")])
+    rows: list[list[dict]] = []
+    number_row: list[dict] = []
+    for i, _mid in enumerate(models[start:start + PAGE], start):
+        number_row.append(ui.btn(str(i + 1), f"odm:t:{i}:{page}"))
+        if len(number_row) == 6:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
     if pages > 1:
         rows.append([
-            ui.btn("◀", f"odm:p:{page-1}"),
+            ui.btn("⬅ 上一页" if page > 0 else "◁ 上一页", f"odm:p:{page-1}" if page > 0 else "odm:noop"),
             ui.btn(f"{page+1}/{pages}", "odm:noop"),
-            ui.btn("▶", f"odm:p:{page+1}"),
+            ui.btn("➡ 下一页" if page + 1 < pages else "下一页 ▷", f"odm:p:{page+1}" if page + 1 < pages else "odm:noop"),
         ])
     rows += [[ui.btn("✅ 全选", "odm:all"), ui.btn("🔄 反选", "odm:inv")],
              [ui.btn(f"确认保存（{len(selected)}）", "odm:ok")]]
@@ -540,7 +544,8 @@ def _model_kb(data):
 
 
 def _render_models(chat_id, message_id, data):
-    count = len(data["discovered_models"])
+    models = data["discovered_models"]
+    count = len(models)
     if data.get("models_source") == "static":
         if data.get("discovery_error"):
             head = ("⚠️ <b>实时模型列表获取失败</b>\n\n"
@@ -550,8 +555,29 @@ def _render_models(chat_id, message_id, data):
             head = f"ℹ️ 当前显示 {count} 个内置参考模型，可能不是最新版本。"
     else:
         head = f"✅ 已从上游获取 {count} 个模型"
-    text = (head + f"\n\n✏ <b>修改</b> {_fam_body_label(data['family'])} <b>默认模型</b>\n\n"
-            "已启用会预勾；新模型默认不勾。本地有、参考/上游没有的继续留着。")
+    page, start, pages = _bounds(count, data.get("model_page", 0))
+    data["model_page"] = page
+    selected = set(data.get("selected_models") or [])
+    existing = set(data.get("existing_models") or [])
+    lines = [
+        head,
+        "",
+        f"✏ <b>修改</b> {_fam_body_label(data['family'])} <b>默认模型</b>",
+        f"第 <b>{page+1}/{pages}</b> 页 · 每页最多 <b>{PAGE}</b> 项",
+        "点击下方数字切换是否加入默认模型列表；翻页会保留草稿。",
+        "",
+    ]
+    for i, mid in enumerate(models[start:start + PAGE], start):
+        is_selected = mid in selected
+        suffix = ""
+        if mid not in existing:
+            suffix = " · 新" if data.get("models_source") == "live" else " · 参考"
+        lines.append(
+            f"{i+1}. {'✅' if is_selected else '⬜'} "
+            f"<code>{ui.escape_html(mid)}</code> - "
+            f"{'已加入' if is_selected else '未加入'}{suffix}"
+        )
+    text = ui.truncate("\n".join(lines))
     if message_id is None:
         ui.send(chat_id, text, reply_markup=_model_kb(data))
     else:

@@ -150,11 +150,65 @@ def test_grok_live_success_filters_imagine_and_prechecks(monkeypatch):
     state = states.get_state(7)
     assert state["action"] == "odm_model_select"
     assert state["data"]["models_source"] == "live"
-    assert state["data"]["discovered_models"] == ["grok-4.5", "grok-4.5-fast", "grok-local"]
+    assert state["data"]["discovered_models"] == ["grok-4.5", "grok-local", "grok-4.5-fast"]
     assert state["data"]["selected_models"] == ["grok-4.5", "grok-local"]
     assert "已从上游获取 3 个模型" in edits[-1][0][2]
+    text = edits[-1][0][2]
     labels = [b["text"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
-    assert any("⬜ grok-4.5-fast · 新" in text for text in labels)
+    assert "3. ⬜ <code>grok-4.5-fast</code> - 未加入 · 新" in text
+    assert labels[:3] == ["1", "2", "3"]
+    # Draft toggles keep the initial enabled-first/name order stable so model
+    # indices do not jump while the user is selecting.
+    oauth_defaults_menu._model_toggle(7, 99, "cb", 2, 0)
+    assert states.get_state(7)["data"]["discovered_models"] == [
+        "grok-4.5", "grok-local", "grok-4.5-fast",
+    ]
+
+
+def test_default_model_selector_uses_twelve_per_page_and_six_columns(monkeypatch):
+    _reset()
+    edits, *_ = _patch_ui(monkeypatch)
+    ids = [f"model-{index:02d}" for index in range(23)]
+    oauth_defaults_menu._enter_select(
+        7, 99,
+        {"family": "xai", "existing_models": ["model-03", "model-20"]},
+        ids, source="live",
+    )
+    text = edits[-1][0][2]
+    kb = edits[-1][1]["reply_markup"]
+    buttons = [button for row in kb["inline_keyboard"] for button in row]
+    model_buttons = [
+        button for button in buttons
+        if str(button.get("callback_data") or "").startswith("odm:t:")
+    ]
+    assert "第 <b>1/2</b> 页 · 每页最多 <b>12</b> 项" in text
+    assert len(model_buttons) == 12
+    assert [button["text"] for button in model_buttons] == [
+        str(index) for index in range(1, 13)
+    ]
+    number_rows = [
+        row for row in kb["inline_keyboard"]
+        if row and str(row[0].get("callback_data") or "").startswith("odm:t:")
+    ]
+    assert [len(row) for row in number_rows] == [6, 6]
+    assert any(
+        str(button.get("callback_data") or "").startswith("odm:p:")
+        for button in buttons
+    )
+    assert states.get_state(7)["data"]["model_page"] == 0
+
+    oauth_defaults_menu._model_page(7, 99, "cb", 1)
+    text2 = edits[-1][0][2]
+    kb2 = edits[-1][1]["reply_markup"]
+    model_buttons2 = [
+        button for row in kb2["inline_keyboard"] for button in row
+        if str(button.get("callback_data") or "").startswith("odm:t:")
+    ]
+    assert "第 <b>2/2</b> 页 · 每页最多 <b>12</b> 项" in text2
+    assert [button["text"] for button in model_buttons2] == [
+        str(index) for index in range(13, 24)
+    ]
+    assert states.get_state(7)["data"]["model_page"] == 1
 
 
 def test_confirm_saves_selected_without_reference_prompt(monkeypatch):

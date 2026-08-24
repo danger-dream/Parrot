@@ -317,7 +317,7 @@ async def lifespan(app: FastAPI):
     if os.environ.get("PARROT_NO_REFRESH") != "1":
         _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
         _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
-        _background_tasks.append(asyncio.create_task(oauth_manager.cursor_model_sync_loop()))
+        _background_tasks.append(asyncio.create_task(oauth_manager.oauth_model_sync_loop()))
         _background_tasks.append(asyncio.create_task(cursor_reconcile.sync_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))

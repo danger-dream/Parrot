@@ -55,7 +55,11 @@ def rebuild_from_config() -> None:
 def _rebuild_from_config_locked() -> None:
     """根据当前 config 重建所有渠道实例。"""
     cfg = config.get()
-    default_models = list(cfg.get("oauthDefaultModels") or [])
+    default_models = list(
+        cfg.get("oauthDefaultModels")
+        or config.DEFAULT_CONFIG.get("oauthDefaultModels")
+        or []
+    )
 
     new: dict[str, Channel] = {}
 

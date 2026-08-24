@@ -5,9 +5,10 @@ Persistent configuration stores only binding identities:
 ``modelBindings.defaults[client model] -> provider/model``
 ``modelBindings.scoped[scope key][client model] -> provider/model``
 
-The catalog record itself always comes from :mod:`model_pricing`, which owns the
-single bundled/cache/remote models.dev catalog lifecycle. Effective resolution
-is strictly scoped, then default, then none.
+The models.dev catalog record comes from :mod:`model_pricing`, which owns the
+single bundled/cache/remote catalog lifecycle.  For OAuth account scopes,
+account/LKG catalog metadata is the final fallback after explicit scoped and
+default bindings. Cursor protocol mechanics remain an account-native overlay.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ class MetadataBinding:
     outbound_model: str | None
     source: str
     metadata: Mapping[str, Any]
+    authority: str = "models.dev"
 
     @property
     def kind(self) -> str:
@@ -234,7 +236,10 @@ def _record_for(
     # was selected. If that channel alias is later repointed, it no longer
     # applies and the resolver may continue to the default binding.
     known = normalize_model_name(known_outbound_model) or None
-    if scope_key and saved_outbound and known and saved_outbound != known:
+    if (
+        scope_key and not scope_key.startswith("oauth:cursor:")
+        and saved_outbound and known and saved_outbound != known
+    ):
         return None
     metadata = model_pricing.catalog_metadata(target)
     if metadata is None and not allow_missing_catalog:
@@ -253,48 +258,115 @@ def _record_for(
     )
 
 
-def _cursor_native_binding(
-    model: str,
-    *,
-    scope_key: str | None,
-    outbound_model: str | None,
-) -> MetadataBinding | None:
-    """Return account-native Cursor metadata for one Cursor OAuth scope.
+def _oauth_account_record(
+    model: str, *, scope_key: str | None, outbound_model: str | None,
+) -> tuple[Mapping[str, Any], str] | None:
+    """Return a record only from the account's current real/LKG directory.
 
-    Cursor model limits and variant capabilities are account-specific and must
-    not inherit a same-named models.dev record.  This resolver intentionally
-    precedes both persisted scoped and default bindings.
+    An empty ``models`` list means the account is using a stateless provider
+    fallback (or, for Cursor, has no directory).  In that state an old catalog
+    must never decorate fallback IDs.
     """
     scope = normalize_model_name(scope_key)
-    if not scope.startswith("oauth:cursor:"):
+    if not scope.startswith("oauth:"):
         return None
-    account_key = scope[len("oauth:"):]
+    wanted_key = scope[len("oauth:"):]
     try:
-        from .cursor_bridge.catalog import find_record, metadata_from_record
         from .oauth_ids import account_key as make_account_key
 
-        account = next(
-            (
-                item for item in config.get().get("oauthAccounts", [])
-                if make_account_key(item) == account_key
-            ),
-            None,
-        )
-        record = find_record(account, model) if account is not None else None
-        metadata = metadata_from_record(record)
+        account = next((item for item in config.get().get("oauthAccounts", [])
+                        if make_account_key(item) == wanted_key), None)
     except Exception:
         return None
+    models = {normalize_model_name(item) for item in (account or {}).get("models") or []}
+    if not account or not models:
+        return None
+    candidate = model if model in models else normalize_model_name(outbound_model)
+    if not candidate or candidate not in models:
+        return None
+    provider = str(account.get("provider") or account.get("type") or "").strip().lower()
+    if provider == "cursor":
+        try:
+            from .cursor_bridge.catalog import find_record
+            record = find_record(account, candidate)
+        except Exception:
+            record = None
+    else:
+        records = ((account.get("account_model_catalog") or {}).get("models") or [])
+        record = next((item for item in records if isinstance(item, Mapping)
+                       and normalize_model_name(item.get("id")) == candidate), None)
+    return (record, provider) if isinstance(record, Mapping) else None
+
+
+def _upstream_metadata(record: Mapping[str, Any], provider: str) -> dict[str, Any]:
+    """Map normalized OAuth records to effective generic metadata explicitly."""
+    if provider == "cursor":
+        from .cursor_bridge.catalog import metadata_from_record
+        return metadata_from_record(record)
+    result = dict(record)
+    result.update(normalize_metadata(dict(record)))
+    modalities = [str(item) for item in record.get("inputModalities") or [] if str(item)]
+    if "vision" not in result:
+        if "supportsImages" in record:
+            parsed = _to_bool(record.get("supportsImages"))
+            if parsed is not None:
+                result["vision"] = parsed
+        elif modalities:
+            result["vision"] = "image" in {item.lower() for item in modalities}
+    return result
+
+
+def _merge_effective_metadata(
+    binding_metadata: Mapping[str, Any], native: tuple[Mapping[str, Any], str] | None,
+) -> dict[str, Any]:
+    """Merge descriptive gaps while keeping every bound generic field authoritative."""
+    upstream = _upstream_metadata(*native) if native else {}
+    result = dict(upstream)
+    result.update(dict(binding_metadata))
+    # Canonical vision is the effective capability. Do not leave contradictory
+    # upstream aliases that could make the Telegram UI (or a future consumer)
+    # turn an explicit models.dev false back into true.
+    if "vision" in result:
+        vision = bool(result["vision"])
+        result["supportsImages"] = vision
+        if not vision and isinstance(result.get("inputModalities"), list):
+            result["inputModalities"] = [
+                item for item in result["inputModalities"]
+                if str(item).lower() != "image"
+            ]
+    # Cursor's long-context limit is transport capability, unlike its normal
+    # context/output/effort fields. Preserve it for use_max_context safety even
+    # when a models.dev binding supplies the common fields.
+    if native and native[1] == "cursor":
+        cursor_metadata = _upstream_metadata(*native)
+        if "contextWindowMaxMode" in cursor_metadata:
+            result["contextWindowMaxMode"] = cursor_metadata["contextWindowMaxMode"]
+        for key in ("variants", "supportsFast", "supportsThinking", "cursorUpstreamVision", "aliases"):
+            if key in cursor_metadata:
+                result[key] = cursor_metadata[key]
+    return result
+
+
+def _account_native_binding(
+    model: str, *, scope_key: str | None, outbound_model: str | None,
+) -> MetadataBinding | None:
+    native = _oauth_account_record(model, scope_key=scope_key, outbound_model=outbound_model)
+    if native is None:
+        return None
+    record, provider = native
+    metadata = _upstream_metadata(record, provider)
     if not metadata:
         return None
     return MetadataBinding(
         client_visible_model=model,
-        target=f"cursor/{model}",
-        provider_id="cursor",
+        target=f"{provider or 'upstream'}/{model}",
+        provider_id=provider or "upstream",
         catalog_model_id=model,
-        scope_key=scope,
+        scope_key=normalize_model_name(scope_key) or None,
         outbound_model=normalize_model_name(outbound_model) or model,
-        source="cursor.AvailableModels",
+        source="cursor.AvailableModels" if provider == "cursor" else "account_model_catalog",
         metadata=metadata,
+        authority="account-upstream",
     )
 
 
@@ -304,18 +376,12 @@ def resolve_binding(
     scope_key: str | None = None,
     outbound_model: str | None = None,
 ) -> MetadataBinding | None:
-    """Resolve effective metadata as ``Cursor-native > scoped > default > none``."""
+    """Resolve ``scoped > default > legacy > account/LKG > none`` metadata."""
     model = normalize_model_name(client_visible_model)
     scope = normalize_model_name(scope_key) or None
     if not model:
         return None
-    cursor_binding = _cursor_native_binding(
-        model,
-        scope_key=scope,
-        outbound_model=outbound_model,
-    )
-    if cursor_binding is not None:
-        return cursor_binding
+    native = _oauth_account_record(model, scope_key=scope, outbound_model=outbound_model)
     cfg = config.get()
     defaults, scoped = _binding_roots(cfg)
     if scope:
@@ -326,22 +392,32 @@ def resolve_binding(
                 known_outbound_model=outbound_model,
             )
             if binding is not None:
-                return binding
+                return MetadataBinding(
+                    **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
+                )
     if model in defaults:
         binding = _record_for(
             model, defaults.get(model), scope_key=None,
             known_outbound_model=None,
         )
         if binding is not None:
-            return binding
+            return MetadataBinding(
+                **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
+            )
     # Read-through compatibility before the one-time startup migration has run.
     legacy_target = _legacy_default_target(model, cfg)
     if legacy_target:
-        return _record_for(
+        binding = _record_for(
             model, {"target": legacy_target, "source": "legacy"},
             scope_key=None, known_outbound_model=None,
         )
-    return None
+        if binding is not None:
+            return MetadataBinding(
+                **{**binding.__dict__, "metadata": _merge_effective_metadata(binding.metadata, native)}
+            )
+    return _account_native_binding(
+        model, scope_key=scope, outbound_model=outbound_model,
+    )
 
 
 def set_binding(
@@ -454,7 +530,7 @@ def list_bindings() -> list[MetadataBinding]:
         key = (item.scope_key, item.client_visible_model)
         if key in existing:
             continue
-        binding = _cursor_native_binding(
+        binding = _account_native_binding(
             item.client_visible_model,
             scope_key=item.scope_key,
             outbound_model=item.outbound_model,

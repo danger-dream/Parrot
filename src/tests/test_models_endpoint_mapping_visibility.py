@@ -9,6 +9,7 @@ from ._isolation import isolate
 isolate()
 
 import server as parrot_server  # noqa: E402
+from src import config  # noqa: E402
 
 
 def _request() -> Request:
@@ -73,3 +74,38 @@ def test_models_endpoint_does_not_expose_global_alias_with_missing_target(monkey
 
     assert ids == ["real-present", "usable"]
     assert "stale" not in ids
+
+
+def test_models_endpoint_isolated_from_oauth_catalog_and_metadata_bindings(monkeypatch):
+    monkeypatch.setattr(
+        parrot_server.auth, "validate", lambda headers: ("test-key", None, None),
+    )
+    monkeypatch.setattr(
+        parrot_server.registry, "available_models", lambda: ["routable-only"],
+    )
+    monkeypatch.setattr(parrot_server.model_mapping, "get_global_map", lambda: {})
+    monkeypatch.setattr(
+        parrot_server.model_metadata, "resolve_binding",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("/v1/models must not resolve metadata")
+        ),
+    )
+    config.update(lambda cfg: cfg.update({
+        "oauthAccounts": [{
+            "provider": "openai", "email": "metadata@example.com",
+            "models": ["catalog-only"],
+            "account_model_catalog": {"models": [{
+                "id": "catalog-only", "contextWindow": 872_000,
+            }]},
+        }],
+        "modelBindings": {
+            "defaults": {"binding-only": {"target": "openai/gpt-5.4"}},
+            "scoped": {},
+        },
+    }))
+
+    payload = asyncio.run(parrot_server.list_models(_request()))
+
+    assert [item["id"] for item in payload["data"]] == ["routable-only"]
+    assert set(payload) == {"data", "first_id", "last_id", "has_more"}
+    assert set(payload["data"][0]) == {"type", "id", "display_name", "created_at"}

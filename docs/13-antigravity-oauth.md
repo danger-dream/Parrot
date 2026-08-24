@@ -87,8 +87,7 @@ channel.key  = oauth:antigravity:{email}:{project_id}
 
 ## 5. 模型与调用
 
-权威目录：CPA `internal/registry/models/models.json` 的 `antigravity` 段（13 个）。  
-`fetchAvailableModels` 只补 Web Search capability，不换目录。
+账户模型目录以该账户的 `fetchAvailableModels` 实时返回为权威来源，并保存最后一次成功目录（LKG）。上游结果中的 IDE 内部/实验项 `chat_20706`、`chat_23310`、`tab_flash_lite_preview`、`tab_jump_flash_lite_preview`、`gemini-2.5-flash-thinking`、`gemini-2.5-pro` 不进入普通文本调度；`antigravityOAuth.imageModels` 中的图片模型继续走独立图片能力。其余上游返回项全部进入该账户文本目录，不能与 `defaultModels` 合并、取交集或按它过滤。
 
 | 上游 ID | 处理 |
 |---|---|
@@ -97,7 +96,7 @@ channel.key  = oauth:antigravity:{email}:{project_id}
 | `claude-opus-4-6-thinking` / `claude-sonnet-4-6` | 仍走 Antigravity 信封；Claude 工具 schema 按 CPA 做 VALIDATED / sanitize |
 | `gpt-oss-120b-medium` | 同 agent 信封，能力按模型而不是按 Google |
 
-默认模型：`antigravityOAuth.defaultModels`，不要复用顶层 `oauthDefaultModels`。
+默认模型：`antigravityOAuth.defaultModels`，不要复用顶层 `oauthDefaultModels`。它只是账户实时目录和 LKG 都不可得时使用的无状态字符串兜底，不代表账户真实能力，也不约束成功发现的账户目录。
 
 最小请求（对齐 CPA：generate/stream 走 daily，loadCodeAssist 走 prod）：
 

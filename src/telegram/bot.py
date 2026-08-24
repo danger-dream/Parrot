@@ -22,7 +22,8 @@ from typing import Optional
 from . import menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
-    logs_menu, mapping_menu, media_logs_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
+    logs_menu, mapping_menu, media_logs_menu, oauth_account_models_menu,
+    oauth_defaults_menu, oauth_menu, proxy_menu,
     stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
     xai_imagine_menu,
 )
@@ -245,6 +246,8 @@ def _handle_callback(cb: dict) -> None:
 
     # OAuth 管理菜单
     if oauth_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+    if oauth_account_models_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
     # GPT/Codex 图片生成设置

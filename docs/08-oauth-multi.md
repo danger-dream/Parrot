@@ -26,11 +26,30 @@ OAuth 账户在 `config.json.oauthAccounts` 数组中，每条结构：
   "enabled": true,
   "disabled_reason": null,    // null | "user" | "quota" | "auth_error"
   "disabled_until": null,     // quota 模式下为 resets_at（最大）
-  "models": [...]             // 空则用 oauthDefaultModels
+  "models": [...],            // 账户最近一次成功发现的目录（LKG ID list）
+  "disabledModels": [...],    // 非 Cursor：本账户由用户停用的模型 ID
+  "last_model_sync": "2026-08-24T02:00:00Z",
+  "last_model_sync_source": "upstream:anthropic"
 }
 ```
 
-账户身份用 `email` 作为唯一键（渠道 `key = "oauth:" + email`）。
+账户身份使用 Provider 的 canonical account key（部分 Provider 还包含 workspace、subject 或 project）。
+
+### 账户模型目录
+
+非 Cursor 账户会自动从各自上游发现模型。成功、有效且非空的结果在同一次配置 mutation 中原子替换 `models`（LKG）、白名单化的 `account_model_catalog` 富元数据和同步字段；错误、超时、鉴权失败、非法 schema 或成功空目录都保留旧 LKG（包括元数据）。OpenAI 原始目录中的 instructions/messages 等大字段不会持久化。Cursor 不迁移既有格式，继续使用 `cursor_model_catalog`。**模型 ID 目录**的选择顺序为：实时成功结果 / LKG → Provider 配置的默认 `list[str]` → 程序内置默认。默认模型列表只是无状态字符串兜底，不拥有或推断元数据，不与成功账户目录合并，也不记录账户的可用、冷却或冻结状态。Cursor 没有静态默认目录：没有 LKG 时为 0 个可路由模型，直到同步成功。
+
+**通用生效元数据**与 ID 目录是两件事。运行时和 Telegram 共同通过 `src/model_metadata.py` 解析：当前账户/渠道 scoped models.dev binding → 全局 default binding → legacy binding 兼容 → 当前 OAuth 账户真实/LKG 目录中同 ID 的上游 metadata → 无 metadata。用户 binding 始终优先；后台目录同步只更新账户目录和账户 catalog，绝不写入或覆盖 `modelBindings`。binding 已明确的通用字段逐字段压过上游值（包括 `vision=false` 压过 `supportsImages=true`/image modality），上游只补充 binding 缺少的名称、描述或能力字段。无 LKG 而使用默认 ID 时可以使用 models.dev binding，但绝不从陈旧 `account_model_catalog` 装饰该 ID。
+
+Cursor 的真实 variant/legacy slug、Fast/Thinking 组合、server model、Max Context 可切换能力及其原生上限属于 **transport metadata**，继续直接来自 `cursor_model_catalog`；models.dev 可以覆盖普通 context、max output、vision、reasoning efforts 等通用字段。`contextWindowMaxMode` 作为长上下文安全预算所需的协议例外保留 Cursor 原生值，确保 Max Context toggle 和 `use_max_context=True` 不退化。
+
+`/v1/models` 是第四个独立边界：它只从启用渠道 registry 汇总可路由 ID，再应用 `allowedModels` 和 global `model_mapping` aliases；不解析、不返回 account/models.dev metadata，binding 不能新增 ID，响应 schema 不扩展。
+
+有效路由模型为所选目录减去该账户的停用集合（非 Cursor 为 `disabledModels`，Cursor 为 `cursor_disabled_models`），之后再应用已有 cooldown/permanent/整账户状态。Token 刷新、重新登录、导入覆盖和模型故障清理都不会解除这些停用记录。Telegram 普通账户模型浏览页（含 Cursor）统一按最多 6 项分页，主名称始终显示可复制的完整模型 ID，并只在上游字段已知时展示上下文、推理/Thinking、图片输入和思考档位；正文编号对应纯数字按钮，每行最多 6 个，并支持单模型启停；批量禁用页仍一次展示完整模型快照、不分页，以每行 3 个数字按钮编辑草稿，只有确认保存时才一次性写入。默认模型多选页使用与普通模型浏览相同的正文编号、每行 6 个纯数字按钮和每页 12 项分页，翻页保留草稿。保存只替换该编辑快照覆盖的模型，当前目录之外的历史停用 ID 会继续保留，模型以后重新出现时仍保持停用。模型展示先按名称不区分大小写排序，再稳定按状态分组为可用、冷却、冻结、手动停用；默认模型选择页采用已启用在前、未启用置底，Cursor 目录也采用名称排序后将手动禁用项置底。批量草稿只在进入时排序，编辑过程中不移动序号。Cursor 继续使用专属 AvailableModels catalog、`cursor_disabled_models` 和 Max Context 逻辑；新入口使用统一列表/详情/同步文案，旧 callback handler 只为已发送消息兼容保留。
+
+有 LKG 的同步失败会在账户模型页提示正在使用上次成功目录、错误摘要和上次成功时间；非 Cursor 首次失败会提示正在使用默认模型；Cursor 首次失败会提示没有可用账户目录且后台会重试。统一后台循环覆盖 Claude、OpenAI、xAI、Antigravity 和 Cursor：服务 ready 后异步启动，缺目录立即同步，成功目录每 6 小时刷新，失败每 15 分钟重试；升级后若现有 `models` 尚未被对应账户 metadata catalog 完整覆盖，即使上次成功仍在 6 小时内也会立即回填。全进程模型发现并发上限为 3，同账户使用 single-flight。新增、覆盖和批量导入先原子保存，再显示“正在同步模型”并前台等待最多 20 秒；45 秒的底层任务不因前台超时取消，超时项继续在后台完成。
+
+首次成功（包括只有 legacy `models`、没有 `last_model_sync` 的账户）只建立通知基线。仅后台周期同步在已有成功基线后发现真实增删时发送一次管理员通知；手动 force sync、新增账户首次同步、失败、空结果和无变化均不发送增删通知。通知列表逐类最多显示 10 项并进行 HTML 转义。
 
 ## 8.2 oauth_manager 模块
 

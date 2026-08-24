@@ -78,6 +78,7 @@ def list_cursor_models(
     *,
     include_hidden: bool = False,
     use_model_parameters: bool = True,
+    timeout_s: float | None = None,
 ) -> list[CursorModel]:
     """Return the account-specific canonical Cursor model catalog.
 
@@ -91,7 +92,10 @@ def list_cursor_models(
         include_hidden_models=include_hidden,
         use_model_parameters=use_model_parameters,
     )
-    payload = unary_rpc(AVAILABLE_MODELS_PATH, access_token, request.SerializeToString())
+    rpc_kwargs = {"timeout_s": max(0.001, float(timeout_s))} if timeout_s is not None else {}
+    payload = unary_rpc(
+        AVAILABLE_MODELS_PATH, access_token, request.SerializeToString(), **rpc_kwargs,
+    )
     decoded = _decode_models(payload)
     if decoded is None:
         return []

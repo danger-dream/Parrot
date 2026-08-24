@@ -583,3 +583,98 @@ def test_metadata_detail_returns_to_original_category_and_page(monkeypatch):
     assert [len(row) for row in rows] == [2, 2]
     assert rows[-1][0]["text"] == "🏠 返回主菜单"
     assert rows[-1][1]["callback_data"] == "map:meta_view:d:1"
+
+
+def test_oauth_effective_metadata_scoped_default_upstream_and_vision_false(monkeypatch):
+    scope = "oauth:openai:a@example.com:ws"
+    upstream = {
+        "id": "account-model", "name": "Upstream display",
+        "description": "upstream description", "contextWindow": 872_000,
+        "maxOutputTokens": 90_000, "supportsImages": True,
+        "inputModalities": ["text", "image"], "reasoningEfforts": ["high"],
+    }
+    config.update(lambda cfg: cfg.update({
+        "oauthAccounts": [{
+            "provider": "openai", "email": "a@example.com", "workspace_id": "ws",
+            "models": ["account-model"],
+            "account_model_catalog": {"models": [upstream]},
+        }],
+        "modelBindings": {
+            "defaults": {"account-model": {"target": "demo/default", "source": "manual"}},
+            "scoped": {scope: {"account-model": {
+                "target": "demo/scoped", "source": "manual",
+                "outboundModel": "account-model",
+            }}},
+        },
+        "modelMetadata": {},
+    }))
+    metadata = {
+        "demo/default": {"contextWindow": 400_000, "vision": True},
+        "demo/scoped": {
+            "contextWindow": 200_000, "maxOutputTokens": 20_000,
+            "vision": False, "reasoningEfforts": ["low", "medium"],
+        },
+    }
+    monkeypatch.setattr(model_pricing, "catalog_metadata", lambda target: metadata.get(target))
+
+    scoped = model_metadata.resolve_binding(
+        "account-model", scope_key=scope, outbound_model="account-model",
+    )
+    assert scoped is not None and scoped.target == "demo/scoped"
+    assert scoped.metadata["contextWindow"] == 200_000
+    assert scoped.metadata["maxOutputTokens"] == 20_000
+    assert scoped.metadata["vision"] is False
+    assert scoped.metadata["supportsImages"] is False
+    assert scoped.metadata["inputModalities"] == ["text"]
+    assert scoped.metadata["reasoningEfforts"] == ["low", "medium"]
+    assert scoped.metadata["description"] == "upstream description"
+
+    config.update(lambda cfg: cfg["modelBindings"]["scoped"].clear())
+    default = model_metadata.resolve_binding(
+        "account-model", scope_key=scope, outbound_model="account-model",
+    )
+    assert default is not None and default.target == "demo/default"
+    assert default.metadata["contextWindow"] == 400_000
+
+    config.update(lambda cfg: cfg["modelBindings"]["defaults"].clear())
+    native = model_metadata.resolve_binding(
+        "account-model", scope_key=scope, outbound_model="account-model",
+    )
+    assert native is not None and native.authority == "account-upstream"
+    assert native.metadata["contextWindow"] == 872_000
+    assert native.metadata["vision"] is True
+
+
+def test_oauth_default_fallback_binding_never_uses_stale_account_catalog(monkeypatch):
+    scope = "oauth:openai:a@example.com:ws"
+    config.update(lambda cfg: cfg.update({
+        "oauthAccounts": [{
+            "provider": "openai", "email": "a@example.com", "workspace_id": "ws",
+            "models": [],
+            "account_model_catalog": {"models": [{
+                "id": "fallback-model", "contextWindow": 872_000,
+                "supportsImages": True,
+            }]},
+        }],
+        "modelBindings": {
+            "defaults": {"fallback-model": {"target": "demo/default", "source": "manual"}},
+            "scoped": {},
+        },
+        "modelMetadata": {},
+    }))
+    monkeypatch.setattr(
+        model_pricing, "catalog_metadata",
+        lambda target: {"contextWindow": 400_000, "vision": False}
+        if target == "demo/default" else None,
+    )
+    bound = model_metadata.resolve_binding(
+        "fallback-model", scope_key=scope, outbound_model="fallback-model",
+    )
+    assert bound is not None and bound.metadata == {
+        "contextWindow": 400_000, "vision": False,
+        "supportsImages": False,
+    }
+    config.update(lambda cfg: cfg["modelBindings"]["defaults"].clear())
+    assert model_metadata.resolve_binding(
+        "fallback-model", scope_key=scope, outbound_model="fallback-model",
+    ) is None
