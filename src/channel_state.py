@@ -196,7 +196,7 @@ def rename_with_config(*, old_channel_key: str, new_channel_key: str,
             config.update(rollback_mutator)
             raise
 
-        # The state.db transaction above is the only persistence commit.
+        # The StateStore snapshots transaction above is the only persistence commit.
         # Install generation routing first, then attempt every deterministic
         # memory publication.  A broken publisher stays loud but cannot let
         # late old-generation writes recreate old state or lose concurrency

@@ -84,7 +84,7 @@ def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = Fa
     total_registered = len(chs)
 
     listen = cfg.get("listen") or {}
-    port = listen.get("port", 18082)
+    port = listen.get("port", 22122)
     cch = cfg.get("cchMode", "disabled")
     mode = load_balancing.display_mode(cfg.get("channelSelection", "smart"))
 

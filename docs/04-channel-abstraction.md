@@ -297,9 +297,9 @@ def parse_models_input(raw: str) -> list[dict]:
 
 ## 4.7 渠道增删改查的一致性
 
-添加/编辑/删除渠道时必须同步清理 state.db 相关表：
+添加/编辑/删除渠道时必须同步清理 StateStore 相关域：
 
-| 操作 | state.db 需要做 |
+| 操作 | StateStore 需要做 |
 |---|---|
 | 新增 | 无（新渠道无历史） |
 | 重命名（改 name/email） | 通过 `channel_state.rename_with_config()` 串行配置/reload、单个 DB 事务和内存镜像发布 |
@@ -311,7 +311,7 @@ def parse_models_input(raw: str) -> list[dict]:
 
 ```python
 def _sync_state_db_with_channels():
-    """config 重建后，清理 state.db 中已不存在的 channel_key 记录。"""
+    """config 重建后，清理 StateStore 中已不存在的 channel_key 记录。"""
     live_keys = channel_state.include_transitions(set(_channels.keys()))
     # 所有带内存镜像的状态都通过模块层清理。scorer 在可选 DB 写
     # 不可用时会保留 memory-only 评分，因此 stale 集取 DB∪内存。
@@ -330,7 +330,7 @@ def _sync_state_db_with_channels():
     affinity.client_delete_stale_channels(live_keys)
 ```
 
-这样渠道删除后，state.db 不会遗留孤儿数据。
+这样渠道删除后，runtime JSON snapshot 不会遗留孤儿数据。
 
 运行期改名后，旧 key 会在当前进程内保留为 late-write alias：改名前已经在途的请求仍把评分、冷却和两类 affinity 写到新 key。旧 concurrency slot 按旧 key 原地排空，并冻结改名前的 `maxConcurrent`；即使 slot 先清除、稍后才有旧请求进入，也继续使用冻结值。为避免字符串 key 无法区分旧/新 generation，当前进程内禁止立刻重新创建同名旧 key；重启后不存在旧在途请求和 alias，才可安全复用。
 

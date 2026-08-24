@@ -328,6 +328,8 @@
     "overrides": {}
   },
   "stateDbPath": "state.db",
+  "runtimeStatePath": "runtime-cache.json",
+  "durableStatePath": "durable-state.json",
   "openaiOAuth": {
     "forceCodexCLI": true,
     "enableTLSFingerprint": false,

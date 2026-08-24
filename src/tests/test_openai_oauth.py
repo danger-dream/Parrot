@@ -272,17 +272,11 @@ def test_accounts_check_selects_current_workspace_by_identity(m):
 
 # ─── state_db schema 迁移 ────────────────────────────────────────
 
-def test_state_db_openai_cols_migration(m):
-    st = m["state_db"]
-    st.init()
-    conn = st._get_conn()
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
-    for expected in ("codex_primary_used_pct", "codex_secondary_used_pct",
-                     "codex_primary_window_min", "codex_primary_over_secondary_pct"):
-        assert expected in cols, f"missing column: {expected}"
-    # 幂等：再调一次迁移不抛
-    st._migrate_oauth_quota_cache_openai_cols(conn)
-    print("  [PASS] state_db oauth_quota_cache codex_* columns migrated & idempotent")
+def test_state_store_openai_quota_shape(m):
+    st=m["state_db"];st.init();st.quota_save_openai_snapshot("openai:shape@test", {"primary_used_pct":1,"primary_window_min":300})
+    row=st.quota_load("openai:shape@test")
+    for expected in ("codex_primary_used_pct","codex_secondary_used_pct","codex_primary_window_min","codex_primary_over_secondary_pct"):
+        assert expected in row
 
 
 # ─── oauth_manager: provider field ────────────────────────────────
@@ -751,7 +745,7 @@ def main():
         test_parse_rate_limit_headers,
         test_normalize_reverse_case,
         test_accounts_check_extracts_plan_and_subscription,
-        test_state_db_openai_cols_migration,
+        test_state_store_openai_quota_shape,
         test_add_account_openai_provider,
         test_add_account_claude_default_provider,
         test_migrate_provider_field_idempotent,

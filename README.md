@@ -526,19 +526,19 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 > `apiKeys.*.allowVideos` **默认关闭** —— 视频费用较高，需在 TG「🔑 管理 API Key」里为获准的下游 Key 单独开启，并可配合 `allowedModels` 限定视频模型。
 
-> **旧版本升级无需手工迁移：**启动时会保留既有 API Key、`allowedModels`、`allowImages`、OAuth 账号及全部 token，只为缺失字段补上 Imagine 默认配置，并将历史 Key 的 `allowVideos` 设为 `false`。`state.db` 会幂等新增 `xai_video_jobs`；既有 `image_logs.db` 会原地补充多媒体字段，历史 GPT 图片记录自动按 `provider=openai`、`media_type=image` 解释，不删除、不改名、不清空。若要开放视频，升级后再按 Key 显式开启即可。
+> **旧版本升级无需手工迁移：**启动时会保留既有 API Key、`allowedModels`、`allowImages`、OAuth 账号及全部 token，只为缺失字段补上 Imagine 默认配置，并将历史 Key 的 `allowVideos` 设为 `false`。旧版 `state.db` 中的 `xai_video_jobs` 会只读迁移到 `durable-state.json`；既有 `image_logs.db` 会原地补充多媒体字段，历史 GPT 图片记录自动按 `provider=openai`、`media_type=image` 解释，不删除、不改名、不清空。若要开放视频，升级后再按 Key 显式开启即可。
 
 > API Key 请求排队时，小于 `queuedBodySpoolThresholdBytes` 的待回放 body 保留在内存；超过阈值后自动转入数据目录下固定的 `queued-body-spool/` 私有临时目录。内存预算沿用 `defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes`；磁盘临时数据另由 `defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 约束，成功、失败、取消或断开后都会关闭并删除。
 
 > `images.cacheRetentionDays=0` 表示不按时间清理；`images.cacheMaxBytes=0` 表示不按空间清理。相对 `cachePath` 会落在数据目录下，Parrot 会阻止相对路径逃逸。
 
-**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `openai.store.dbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
+**不可热加载字段**（改后需重启容器）：`listen.host` / `listen.port` / `stateDbPath` / `runtimeStatePath` / `durableStatePath` / `openai.store.dbPath` / `logDir` / `telegram.botToken` / `telegram.adminIds`。
 
 ---
 
 ## 🛠 运维
 
-所有持久化数据集中在 `<安装目录>/data/`：`config.json` / `state.db` / `openai_response_store.db` / `image_logs.db` / `logs/` / `images/` / `.anthropic_proxy_ids.json`。
+所有持久化数据集中在可写的 `<安装目录>/data/`：`config.json` / `runtime-cache.json` / `durable-state.json` / `state-migration.json` / 只读保留的旧版 `state.db` / `openai_response_store.db` / `image_logs.db` / `logs/` / `images/` / `.anthropic_proxy_ids.json`。
 
 ### 启动 / 停止 / 重启 / 状态（Docker Compose）
 
@@ -582,11 +582,11 @@ GPT/Grok 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`�
 
 ### 状态数据
 
-`data/state.db`（SQLite）：performance_stats / channel_errors / cache_affinities / oauth_quota_cache 等轻量运行时状态，永久保留。
+`data/runtime-cache.json` 保存可重建的评分、冷却、亲和与配额缓存；`data/durable-state.json` 同步保存 updater、状态通知、视频任务与 compaction owner 等必须持久化状态。两者都是带 schema、单调 generation 和 checksum 的 0600 原子快照，并保留一份已验证 `.bak`。`state-migration.json` 最后写入，记录旧库规范路径、主文件及 WAL/SHM/journal 指纹和成功快照 generation。
 
-`data/openai_response_store.db`（SQLite）：`previous_response_id` history 表
-`openai_response_store`。升级自旧版本时不在线迁移旧表；新库 miss 会只读回退
-`state.db`，让旧 id 在原 TTL 内继续可用。
+`stateDbPath` 仅指向旧版只读迁移源；`runtimeStatePath` / `durableStatePath` 的默认值和相对路径始终位于可写 `DATA_DIR`，与绝对旧库所在目录无关。首次升级会在 0700 私有临时目录复制完整 SQLite 文件集并恢复 WAL/hot journal；源文件不 checkpoint、不改名、不删除。若旧版本回滚后再次写入健康的 `state.db`，下一次升级会发现指纹变化、备份当前 JSON、重新导入两份快照并最后更新 manifest。若变化后的旧库损坏或不可读，现有 verified JSON 继续权威生效，不会被任何历史备份覆盖，source revision/manifest 保持未推进并在每次重启重新检查，直到源被修复、移除或归档。请在确认不再降级前保留旧库及 sidecar/历史备份。
+
+`data/openai_response_store.db`（SQLite）独立保存 `previous_response_id` history。旧版嵌入 `state.db` 的响应按源指纹执行 `INSERT OR IGNORE`；缺表或损坏只跳过该可选导入，不阻断独立 Store。
 
 ### 配置备份
 
@@ -630,7 +630,10 @@ Parrot/
 ├── requirements.txt
 ├── data/                        ← 运行时持久化（容器挂载点；源码模式不存在）
 │   ├── config.json              ← 唯一配置文件
-│   ├── state.db                 ← 运行时状态（永久）
+│   ├── runtime-cache.json       ← 可重建运行时状态快照
+│   ├── durable-state.json       ← 必须持久化状态快照
+│   ├── state-migration.json     ← 旧库源指纹与迁移 generation
+│   ├── state.db                 ← 只读保留的旧版迁移源（兼容降级）
 │   ├── openai_response_store.db ← previous_response_id history（TTL）
 │   ├── image_logs.db            ← 图片/视频统一多媒体任务日志（兼容旧图片历史）
 │   ├── logs/YYYY-MM.db          ← 按月分库业务日志
@@ -640,7 +643,9 @@ Parrot/
     ├── config.py                ← 配置加载/保存/热加载
     ├── auth.py                  ← 下游 API Key 验证
     ├── errors.py                ← 标准错误响应
-    ├── state_db.py              ← state.db 读写
+    ├── state_store.py           ← JSON 快照、原子安装与单实例锁
+    ├── state_migration.py       ← 旧 SQLite 文件集私有副本迁移
+    ├── state_db.py              ← 后端中立业务状态门面
     ├── channel_state.py         ← 运行期渠道改名的配置/DB/内存原子协调
     ├── sqlite_errors.py         ← SQLite 可用性错误精确分类
     ├── log_db.py                ← 按月日志库读写 + 跨月聚合（支持 family 过滤）

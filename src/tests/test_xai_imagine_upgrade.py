@@ -17,7 +17,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_old_state_db_is_upgraded_in_place_without_losing_existing_rows(tmp_path):
+def test_old_state_db_is_migrated_read_only_without_losing_existing_rows(tmp_path):
     data_dir = tmp_path / "legacy-data"
     data_dir.mkdir()
     config_path = data_dir / "config.json"
@@ -90,22 +90,13 @@ from src import config, state_db
 
 state_db.init()
 
-conn = sqlite3.connect(state_path)
-row = conn.execute(
-    "SELECT total_requests, success_count, last_updated "
-    "FROM performance_stats WHERE channel_key=? AND model=?",
-    ("legacy-channel", "legacy-model"),
-).fetchone()
-assert row == (9, 8, 123456), row
-
-table = conn.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='xai_video_jobs'"
-).fetchone()
-assert table == ("xai_video_jobs",), table
-columns = [row[1] for row in conn.execute("PRAGMA table_info(xai_video_jobs)")]
-assert columns == [
-    "request_id", "channel_key", "api_key_name", "model", "created_at", "expires_at"
-], columns
+row = state_db.perf_load("legacy-channel", "legacy-model")
+assert row["total_requests"] == 9 and row["success_count"] == 8 and row["last_updated"] == 123456, row
+assert os.path.isfile(os.path.join(os.environ["ANTHROPIC_PROXY_DATA_DIR"], "runtime-cache.json"))
+# Legacy SQLite remains byte-for-byte in its old shape; startup does not add tables.
+conn = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True)
+table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='xai_video_jobs'").fetchone()
+assert table is None
 conn.close()
 
 loaded = config.get()

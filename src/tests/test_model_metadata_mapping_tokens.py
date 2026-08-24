@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from types import SimpleNamespace
@@ -86,7 +87,17 @@ def test_model_metadata_default_reasoning_must_be_supported():
         raise AssertionError("expected invalid default reasoning effort")
 
 
-def test_global_model_mapping_overrides_legacy_ingress_mapping():
+@pytest.fixture
+def _restore_model_mapping(request):
+    before = copy.deepcopy(config.get().get("modelMapping"))
+    request.addfinalizer(
+        lambda: config.update(
+            lambda c: c.__setitem__("modelMapping", copy.deepcopy(before))
+        )
+    )
+
+
+def test_global_model_mapping_overrides_legacy_ingress_mapping(_restore_model_mapping):
     config.update(
         lambda c: c.__setitem__(
             "modelMapping",
@@ -104,6 +115,69 @@ def test_global_model_mapping_overrides_legacy_ingress_mapping():
     body = {"model": "any"}
     assert model_mapping.apply_mapping(body, "openai-chat") == ("any", "model")
     assert body["model"] == "model"
+
+
+def test_strict_global_map_excludes_legacy_ingress_aliases(_restore_model_mapping):
+    config.update(
+        lambda c: c.__setitem__(
+            "modelMapping",
+            {
+                "global": {"shared": "real-shared"},
+                "anthropic": {"claude": "claude-real"},
+                "openai-chat": {"chat-only": "chat-real"},
+            },
+        )
+    )
+
+    assert model_mapping.get_global_map() == {"shared": "real-shared"}
+    # 统一管理 UI 仍能看到旧条目并迁移/删除；这不代表它们会被 /v1/models 暴露。
+    assert model_mapping.get_ingress_map(model_mapping.GLOBAL_MAPPING_LINE) == {
+        "claude": "claude-real",
+        "chat-only": "chat-real",
+        "shared": "real-shared",
+    }
+
+
+def test_global_mapping_delete_cascades_same_alias_from_legacy_lines(
+    _restore_model_mapping,
+):
+    config.update(
+        lambda c: c.__setitem__(
+            "modelMapping",
+            {
+                "global": {"stale": "global-real", "keep": "keep-real"},
+                "anthropic": {"stale": "anthropic-real", "a": "a-real"},
+                "openai-chat": {"stale": "chat-real"},
+                "openai-responses": {"stale": "responses-real"},
+            },
+        )
+    )
+
+    assert model_mapping.remove_mapping(model_mapping.GLOBAL_MAPPING_LINE, "stale")
+    root = config.get()["modelMapping"]
+    assert all("stale" not in (root.get(line) or {}) for line in (
+        model_mapping.GLOBAL_MAPPING_LINE, *model_mapping.INGRESS_LINES,
+    ))
+    assert root["global"]["keep"] == "keep-real"
+    assert root["anthropic"]["a"] == "a-real"
+
+
+def test_setting_global_mapping_removes_legacy_duplicate(_restore_model_mapping):
+    config.update(
+        lambda c: c.__setitem__(
+            "modelMapping",
+            {
+                "anthropic": {"move": "old-anthropic"},
+                "openai-chat": {"move": "old-chat"},
+            },
+        )
+    )
+
+    model_mapping.set_mapping(model_mapping.GLOBAL_MAPPING_LINE, "move", "new-global")
+    root = config.get()["modelMapping"]
+    assert root["global"]["move"] == "new-global"
+    assert "move" not in root["anthropic"]
+    assert "move" not in root["openai-chat"]
 
 
 def test_token_counter_counts_payload_tokens_not_raw_message_count():

@@ -55,11 +55,10 @@ def _import_modules():
 def _setup(m):
     state_db = m["state_db"]
     state_db.init()
-    conn = state_db._get_conn()
-    conn.execute("DELETE FROM oauth_quota_cache")
-    conn.execute("DELETE FROM performance_stats")
-    conn.execute("DELETE FROM channel_errors")
-    conn.commit()
+    for row in state_db.quota_load_all():
+        state_db.quota_delete(row["account_key"])
+    state_db.perf_delete()
+    state_db.error_delete()
 
     def clear_accounts(c):
         c["oauthAccounts"] = []
@@ -203,12 +202,9 @@ def test_quota_monitor_resumes_openai_despite_old_passive_timestamp(m):
         "seven_day_util": 20.0,
     }, email="resume-passive@o.io")
     old_ms = m["state_db"].now_ms() - 10 * 60 * 1000
-    conn = m["state_db"]._get_conn()
-    conn.execute(
-        "UPDATE oauth_quota_cache SET last_passive_update_at=? WHERE account_key=?",
-        (old_ms, ak),
+    m["state_db"].quota_set_observation_times(
+        ak, last_passive_update_at=old_ms,
     )
-    conn.commit()
 
     outcomes = asyncio.run(m["oauth_manager"].quota_monitor_once())
     acc_after = m["oauth_manager"].get_account(ak)

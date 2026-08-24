@@ -4,7 +4,7 @@
 - 默认 1 小时拉一次 `https://api.github.com/repos/<repo>/releases`，
   按 `prerelease + draft` 标志过滤，挑最高 semver 当 latest。
 - 与本地 `__version__` 比对：latest > local 才算"有新版"。
-- 持久化：state.db 单行 `app_update_state` 记录最新一次结果；
+- 持久化：StateStore snapshots 单行 `app_update_state` 记录最新一次结果；
   `notified_for` 字段记录"已经推过通知的版本号"，避免重复推。
 - 忽略列表：`config.updateChecker.ignoredVersions`（TG 操作时写入），
   存在该版本时不 banner / 不推。
@@ -63,67 +63,31 @@ def clear_ignored() -> None:
     _set_ignored([])
 
 
-# ─── state.db schema ─────────────────────────────────────────────
+# ─── StateStore durable state ────────────────────────────────────
 
 
 def _ensure_schema() -> None:
-    sql = """
-    CREATE TABLE IF NOT EXISTS app_update_state (
-      repo                 TEXT PRIMARY KEY,
-      latest_version       TEXT,
-      latest_name          TEXT,
-      latest_url           TEXT,
-      latest_body          TEXT,
-      latest_published_at  TEXT,
-      latest_prerelease    INTEGER DEFAULT 0,
-      notified_for         TEXT,
-      checked_at           INTEGER
-    );
-    """
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.executescript(sql)
-        conn.commit()
+    """Compatibility no-op; StateStore owns its versioned schema."""
 
 
 def _load_state(repo: str) -> Optional[dict]:
-    conn = state_db._get_conn()
-    row = conn.execute(
-        "SELECT repo, latest_version, latest_name, latest_url, latest_body, "
-        "latest_published_at, latest_prerelease, notified_for, checked_at "
-        "FROM app_update_state WHERE repo=?",
-        (repo,),
-    ).fetchone()
-    if not row:
-        return None
-    return {
-        "repo": row[0],
-        "latest_version": row[1],
-        "latest_name": row[2],
-        "latest_url": row[3],
-        "latest_body": row[4],
-        "latest_published_at": row[5],
-        "latest_prerelease": bool(row[6]),
-        "notified_for": row[7],
-        "checked_at": row[8],
-    }
+    row = state_db.update_state_load(repo)
+    if row is not None:
+        row["latest_prerelease"] = bool(row.get("latest_prerelease"))
+    return row
 
 
 def _save_state(repo: str, *, latest_version: Optional[str], latest_name: Optional[str],
                 latest_url: Optional[str], latest_body: Optional[str],
                 latest_published_at: Optional[str], latest_prerelease: bool,
                 notified_for: Optional[str]) -> None:
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.execute(
-            "INSERT OR REPLACE INTO app_update_state(repo, latest_version, latest_name, "
-            "latest_url, latest_body, latest_published_at, latest_prerelease, "
-            "notified_for, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (repo, latest_version, latest_name, latest_url, latest_body,
-             latest_published_at, 1 if latest_prerelease else 0,
-             notified_for, int(time.time())),
-        )
-        conn.commit()
+    state_db.update_state_save(repo, {
+        "latest_version": latest_version, "latest_name": latest_name,
+        "latest_url": latest_url, "latest_body": latest_body,
+        "latest_published_at": latest_published_at,
+        "latest_prerelease": 1 if latest_prerelease else 0,
+        "notified_for": notified_for,
+    })
 
 
 # ─── 内存缓存（供 banner / 菜单读）────────────────────────────────

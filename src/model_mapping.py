@@ -38,7 +38,7 @@ TG bot 菜单通过 `get_ingress_map` / `set_mapping` / `set_default` 等辅助
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional
 
 from . import config
 
@@ -94,11 +94,25 @@ def _flat_legacy_root(root: dict) -> dict[str, str]:
 
 # ─── 读 ───────────────────────────────────────────────────────────
 
+def get_global_map() -> dict[str, str]:
+    """只读真正全局生效的 alias→real 映射。
+
+    结构化配置只读取 ``modelMapping.global``，绝不把旧 ingress 专属映射
+    混入。可选的旧扁平结构本身没有入口边界，按全局映射兼容。
+    """
+    root = _root_mapping()
+    flat = _flat_legacy_root(root)
+    if flat:
+        return flat
+    return _coerce_str_map(root.get(GLOBAL_MAPPING_LINE))
+
+
 def get_ingress_map(ingress: str) -> dict[str, str]:
     """读 alias→real 映射表(返回副本,调用方随便改不影响 cache)。
 
-    - ingress == "global": 仅返回新全局映射；若没有 global, 会把旧三条
-      per-ingress 映射合并给 UI 展示。
+    - ingress == "global": 给统一管理 UI 返回 legacy 三条入口与新 global
+      的合并视图，global 优先。这样旧映射不会因已有 global 条目而被隐藏，
+      可在新 UI 中迁移或删除。
     - ingress 为运行时入口: 返回 legacy specific + global, global 优先。
     """
     if ingress not in INGRESS_LINES and ingress != GLOBAL_MAPPING_LINE:
@@ -110,11 +124,10 @@ def get_ingress_map(ingress: str) -> dict[str, str]:
 
     global_map = _coerce_str_map(root.get(GLOBAL_MAPPING_LINE))
     if ingress == GLOBAL_MAPPING_LINE:
-        if global_map:
-            return global_map
         merged: dict[str, str] = {}
         for line in INGRESS_LINES:
             merged.update(_coerce_str_map(root.get(line)))
+        merged.update(global_map)
         return merged
 
     merged = _coerce_str_map(root.get(ingress))
@@ -182,6 +195,46 @@ def apply_mapping(body: dict, ingress: str) -> Optional[tuple[str, str]]:
 
 # ─── 写 (给 TG bot 菜单用) ────────────────────────────────────────
 
+def _structured_root_for_write(cfg: dict) -> dict:
+    """返回可写的结构化 modelMapping root，并无损迁移旧扁平结构。"""
+    raw = cfg.get("modelMapping")
+    root = raw if isinstance(raw, dict) else {}
+    flat = _flat_legacy_root(root)
+    if flat:
+        root = {GLOBAL_MAPPING_LINE: flat}
+        cfg["modelMapping"] = root
+    elif root is not raw:
+        cfg["modelMapping"] = root
+    return root
+
+
+def remove_aliases_from_config(
+    cfg: dict, aliases: Iterable[str],
+) -> list[tuple[str, str]]:
+    """从 config 候选快照的所有映射线删除指定 alias key。
+
+    供渠道模型列表更新/删除在同一次 ``config.update`` 中做原子级联。
+    返回实际删除的 ``(line, alias)``，不会自行写盘。
+    """
+    wanted = {
+        str(alias).strip() for alias in aliases
+        if isinstance(alias, str) and str(alias).strip()
+    }
+    if not wanted:
+        return []
+    root = _structured_root_for_write(cfg)
+    removed: list[tuple[str, str]] = []
+    for line_key in (GLOBAL_MAPPING_LINE, *INGRESS_LINES):
+        line = root.get(line_key)
+        if not isinstance(line, dict):
+            continue
+        for alias in sorted(wanted):
+            if alias in line:
+                del line[alias]
+                removed.append((line_key, alias))
+    return removed
+
+
 def set_mapping(ingress: str, alias: str, real: str) -> None:
     """新增或覆盖一条别名→真实名映射。"""
     if ingress not in INGRESS_LINES and ingress != GLOBAL_MAPPING_LINE:
@@ -194,11 +247,15 @@ def set_mapping(ingress: str, alias: str, real: str) -> None:
         raise ValueError("alias must differ from real model name")
 
     def _mutate(cfg: dict) -> None:
-        root = cfg.setdefault("modelMapping", {})
-        if not isinstance(root, dict):
-            root = {}
-            cfg["modelMapping"] = root
+        root = _structured_root_for_write(cfg)
         line_key = GLOBAL_MAPPING_LINE if ingress == GLOBAL_MAPPING_LINE else ingress
+        if ingress == GLOBAL_MAPPING_LINE:
+            # 统一 UI 接管该 alias 后清掉同名 legacy 副本，避免以后删除 global
+            # 时旧入口映射再次显现。
+            for legacy_line in INGRESS_LINES:
+                line = root.get(legacy_line)
+                if isinstance(line, dict):
+                    line.pop(alias, None)
         line = root.setdefault(line_key, {})
         if not isinstance(line, dict):
             line = {}
@@ -208,7 +265,11 @@ def set_mapping(ingress: str, alias: str, real: str) -> None:
 
 
 def remove_mapping(ingress: str, alias: str) -> bool:
-    """删一条映射; 返回 True 表示确实删了。"""
+    """删一条映射; 返回 True 表示确实删了。
+
+    统一 UI 的 global 删除会同时清掉同名 legacy ingress 条目，确保用户
+    删除后不会因旧兼容配置重新出现；指定 legacy ingress 时仍只删该入口。
+    """
     if ingress not in INGRESS_LINES and ingress != GLOBAL_MAPPING_LINE:
         return False
     alias = (alias or "").strip()
@@ -217,9 +278,11 @@ def remove_mapping(ingress: str, alias: str) -> bool:
     removed = [False]
 
     def _mutate(cfg: dict) -> None:
-        root = cfg.get("modelMapping") or {}
-        line_key = GLOBAL_MAPPING_LINE if ingress == GLOBAL_MAPPING_LINE else ingress
-        line = root.get(line_key) if isinstance(root, dict) else None
+        if ingress == GLOBAL_MAPPING_LINE:
+            removed[0] = bool(remove_aliases_from_config(cfg, {alias}))
+            return
+        root = _structured_root_for_write(cfg)
+        line = root.get(ingress)
         if isinstance(line, dict) and alias in line:
             del line[alias]
             removed[0] = True

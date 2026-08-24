@@ -9,7 +9,7 @@
 - **cc-proxy 保持不变**，作为历史版本保留，随时可回滚。
 - **anthropic-proxy 是新项目**，目录：`/opt/src-space/anthropic-proxy/`。
 - **CC 伪装代码 100% 移植**（见文档 05），OAuth 链路行为与 cc-proxy 完全一致。
-- 默认端口 `18082`，与 cc-proxy 的 `18081` 并存。
+- fresh install 默认端口 `22122`；已有配置显式设置的其他端口保持不变。
 
 ## 1.2 功能对比
 
@@ -34,7 +34,7 @@
 | 日志重试链 | ❌ | ✅ |
 | 配置热加载 | ✅ | ✅ |
 | 按月分库日志 | ✅ | ✅（保留） |
-| 状态数据库 | ❌ | ✅（state.db 永久） |
+| 统一状态存储 | ❌ | ✅（JSON 快照 + 旧库迁移） |
 
 ## 1.3 目录结构
 
@@ -56,7 +56,10 @@ anthropic-proxy/
 │   └── 12-milestones.md
 │
 ├── config.json                       # 唯一配置文件（含所有 OAuth 账号、渠道、密钥、调参）
-├── state.db                          # 运行时状态（perf_stats / cooldown / affinity / quota_cache）
+├── runtime-cache.json                # 可重建运行时状态
+├── durable-state.json                # 必须持久化状态
+├── state-migration.json              # 旧库迁移清单
+├── state.db                          # 只读保留的旧版迁移源
 ├── openai_response_store.db          # previous_response_id history（TTL 清理）
 ├── logs/
 │   ├── 2026-04.db                    # 当月业务日志
@@ -73,7 +76,9 @@ anthropic-proxy/
     ├── auth.py                       # 下游 API Key 验证
     ├── errors.py                     # Anthropic 标准错误响应
     │
-    ├── state_db.py                   # state.db 的所有读写接口
+    ├── state_store.py                # JSON 快照、事务与单实例锁
+    ├── state_migration.py            # WAL/hot-journal 安全旧库迁移
+    ├── state_db.py                   # 后端中立业务状态接口
     ├── channel_state.py              # 运行期渠道改名的配置/DB/内存协调锁
     ├── sqlite_errors.py              # SQLite 可用性错误分类（不吞编程/Schema 错误）
     ├── log_db.py                     # 按月日志库的所有读写接口
@@ -137,7 +142,7 @@ auth → fingerprint → scheduler → failover → upstream
 
 底层基础模块（被多处依赖）：
 - `config.py`：所有其他模块读取配置的单一入口
-- `state_db.py`：scorer / cooldown / affinity / oauth_manager 的持久化后端
+- `state_store.py` / `state_db.py`：scorer / cooldown / affinity / oauth_manager 的统一状态后端
 - `log_db.py`：failover / server.py 的请求日志写入
 - `errors.py`：所有出错路径的返回格式构造器
 
@@ -145,7 +150,7 @@ auth → fingerprint → scheduler → failover → upstream
 
 启动阶段（`lifespan` 中）：
 1. 加载 config.json，验证必填字段
-2. 初始化 state.db（建表、清理过期亲和）
+2. 校验状态路径、取得单 writer 锁、加载 JSON，并按 manifest 迁移旧 state.db 文件集
 3. 初始化当月 log.db、清理 stale pending
 4. 加载内存缓存：perf_stats、error_state、affinity
 5. 构造 httpx 共享 AsyncClient
@@ -161,7 +166,7 @@ auth → fingerprint → scheduler → failover → upstream
 关闭阶段：
 1. 取消所有后台任务
 2. 关闭 httpx client
-3. 关闭 DB 连接（WAL checkpoint）
+3. 严格刷写并关闭 JSON StateStore；随后关闭日志、图片和独立 Store 等数据库连接，并按各自策略完成 checkpoint
 
 ## 1.6 与 cc-proxy 的迁移关系
 

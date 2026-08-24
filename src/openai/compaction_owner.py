@@ -188,7 +188,7 @@ def select_owner(refs: list[CompactionRef], channels: Iterable[Any],
             )
         owner = resolved[0]
         # Adopt rows written by the old key+workspace hash only after a unique
-        # live channel proves the alias. This preserves existing state.db rows.
+        # live channel proves the alias. This preserves existing StateStore snapshots rows.
         for ref, row in zip(refs, stored):
             if row and row["owner_identity"] != owner_identity(owner):
                 state_db.compaction_owner_upsert(

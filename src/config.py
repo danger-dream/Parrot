@@ -100,7 +100,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.environ.get("ANTHROPIC_PROXY_CONFIG") or os.path.join(DATA_DIR, "config.json")
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "listen": {"host": "0.0.0.0", "port": 18082},
+    "listen": {"host": "0.0.0.0", "port": 22122},
     "apiKeys": {},
     # 下游 API Key 级并发限制默认值；单 Key 可用 apiKeys.<name>.limits 覆盖。
     "apiKeyConcurrency": {
@@ -513,7 +513,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "aliases": {},
         "overrides": {},
     },
+    # Legacy read-only migration source. Normal runtime uses the two JSON paths.
     "stateDbPath": "state.db",
+    "runtimeStatePath": "runtime-cache.json",
+    "durableStatePath": "durable-state.json",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {
         "forceCodexCLI": True,

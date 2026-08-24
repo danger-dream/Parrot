@@ -112,12 +112,8 @@ def test_durable_owner_survives_affinity_expiry_and_connection_restart(monkeypat
     monkeypatch.setattr(state_db, "now_ms", real_now_ms)
     assert affinity.get("expired-session") is None
 
-    # Simulate a new process connection: close thread-local connection and init again.
-    conn = getattr(state_db._local, "conn", None)
-    if conn is not None:
-        conn.close()
-    state_db._local.conn = None
-    state_db._initialized = False
+    # Simulate a process restart through the public lifecycle only.
+    state_db.close()
     state_db.init()
 
     configure_scheduler(monkeypatch, [other, owner])

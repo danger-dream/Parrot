@@ -1,7 +1,7 @@
 """Parrot 主入口（多家族 AI 协议代理）。
 
 启动时：
-  - 加载配置、state.db、logs/YYYY-MM.db
+  - 加载配置、StateStore snapshots、logs/YYYY-MM.db
   - 从持久化状态恢复 affinity / cooldown / scorer 内存表
   - 构建渠道注册表并挂 config 重载钩子
   - 构造 httpx AsyncClient
@@ -85,26 +85,6 @@ async def _throttled_notify(alert_key: str, text: str) -> None:
 _background_tasks: list[asyncio.Task] = []
 
 
-async def _state_db_health_loop():
-    """Restart gracefully when state.db reports corruption or loses its header."""
-    while True:
-        await asyncio.sleep(2)
-        reason = await asyncio.to_thread(state_db.runtime_corruption_reason)
-        if not reason:
-            continue
-        state_db.request_recovery_restart(reason)
-        print(f"[state_db] requesting graceful recovery restart: {reason}")
-        notifier.notify_event(
-            "database_recovery",
-            "⚠️ <b>state.db 损坏，正在自动恢复</b>\n"
-            f"原因：<code>{notifier.escape_html(reason)}</code>\n"
-            "Parrot 将优雅退出，并在重新启动时保全损坏文件后恢复健康备份或重建运行状态库。",
-        )
-        drain.begin("state_db_corruption")
-        os.kill(os.getpid(), signal.SIGTERM)
-        return
-
-
 async def _wal_checkpoint_loop():
     while True:
         await asyncio.sleep(300)
@@ -122,19 +102,14 @@ async def _wal_checkpoint_loop():
             print(f"[translation] checkpoint failed: {e}")
 
 
-def _finalize_state_db() -> bool:
-    """Close state.db cleanly, preserving corrupt files for bootstrap recovery."""
-    if state_db.recovery_restart_requested():
-        # Do not let connection teardown rewrite damaged evidence before the
-        # next process can quarantine db/journal remnants.
-        print("[state_db] recovery restart pending; preserving database evidence")
-        return True
+def _finalize_state_store() -> bool:
+    """Flush and close the public state facade without knowing file details."""
     try:
-        state_db.close()
-        print("[state_db] shutdown connection closed")
-        return True
+        result = state_db.close()
+        print("[state_store] shutdown snapshots flushed")
+        return result
     except Exception as exc:
-        print(f"[state_db] shutdown close failed: {exc}")
+        print(f"[state_store] shutdown close failed: {exc}")
         return False
 
 
@@ -182,19 +157,13 @@ async def _affinity_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 出站网络层必须最先初始化，确保后续 OAuth/TG/status/update 等请求都走统一 DNS/代理。
+    # Validate paths, acquire the single-writer lock, and complete any legacy
+    # transition before mutable/network lifecycle setup begins.
+    state_db.init()
+
+    # 出站网络层必须在任何后续 OAuth/TG/status/update 请求前初始化。
     network.init()
     network.bootstrap_system_dns_once()
-
-    # 持久化层。state.db 是可重建运行状态；打开任何连接前先校验，损坏时
-    # 自动保全 db/wal/shm 并恢复最近一次更新备份（无备份则创建新库）。
-    state_recovery = state_db.bootstrap_recover()
-    state_db.init()
-    if state_recovery:
-        # Update-time backups intentionally capture STAGED before restarting.
-        # After automatic database recovery that stale state must not ask the
-        # user to confirm the same restart again.
-        updater.reset_state()
     log_db.init()
     image_db.init()
     translation.init()
@@ -223,17 +192,6 @@ async def lifespan(app: FastAPI):
 
     # 联合主键迁移：email → account_key (=f"{provider}:{email}")。幂等，已迁移过直接跳过。
     try:
-        # 迁移前用 SQLite Online Backup 做保险（已存在备份则不覆盖）。
-        # 禁止 shutil.copy2 活库：那会绕过 SQLite 并可能丢掉 POSIX 锁。
-        import os as _os
-        _src = state_db._db_path
-        _bak = (_src or "") + ".pre_composite_key.bak"
-        if _src and _os.path.exists(_src) and not _os.path.exists(_bak):
-            try:
-                state_db.online_backup(_bak, verify=True)
-                print(f"[state_db] backup created: {_bak}")
-            except Exception as _exc:
-                print(f"[state_db] backup failed (continuing): {_exc}")
         _ck_result = oauth_manager.bootstrap_composite_key_migration()
         if _ck_result.get("skipped"):
             print(f"[oauth] composite-key migration: skipped ({_ck_result.get('reason')})")
@@ -268,7 +226,7 @@ async def lifespan(app: FastAPI):
         print(f"[oauth] openai workspace-key migration FAILED: {_exc}")
         raise
 
-    # 内存表从 state.db 恢复
+    # Domain mirrors restore from the authoritative in-memory StateStore
     affinity.init()
     affinity.client_init()
     cooldown.init()
@@ -279,7 +237,7 @@ async def lifespan(app: FastAPI):
     from src.openai.channel.registration import register_factories as _openai_register_factories
     _openai_register_factories()
 
-    # OpenAI previous_response_id Store（独立 SQLite；旧 state.db 只读兼容）
+    # OpenAI previous_response_id Store（independent SQLite）
     from src.openai import store as openai_store
     openai_store.init()
 
@@ -339,22 +297,6 @@ async def lifespan(app: FastAPI):
         tgbot.init(tg_token, tg_admins)
         tgbot.start()
 
-    if state_recovery:
-        action = state_recovery.get("action")
-        restored = state_recovery.get("restored_from")
-        result_text = (
-            f"已恢复健康备份：<code>{notifier.escape_html(str(restored))}</code>"
-            if action == "restored" and restored
-            else "没有可用健康备份，已创建新的运行状态库"
-        )
-        notifier.notify_event(
-            "database_recovery",
-            "✅ <b>state.db 已自动恢复</b>\n"
-            f"检测原因：<code>{notifier.escape_html(str(state_recovery.get('reason') or 'unknown'))}</code>\n"
-            f"{result_text}\n"
-            f"原文件已保全至：<code>{notifier.escape_html(str(state_recovery.get('quarantine') or ''))}</code>",
-        )
-
     print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
     print(f"  device_id: {DEVICE_ID[:16]}...")
     print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
@@ -367,7 +309,6 @@ async def lifespan(app: FastAPI):
     print(f"  timeouts: {cfg.get('timeouts')}")
     print(f"  telegram: {'enabled' if tg_token else 'disabled'} ({len(tg_admins)} admin(s))")
 
-    _background_tasks.append(asyncio.create_task(_state_db_health_loop()))
     _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
     _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
     _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
@@ -404,11 +345,11 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         await apikey_limiter.shutdown_spooling()
         tgbot.stop()
-        # Provider workers 可能写 state.db，必须先于数据库关闭完整停止。
+        # Provider workers may mutate state; stop them before the final snapshot.
         await provider_usage.stop()
         await upstream.close_client()
         cursor_bridge_runtime.stop()
-        _finalize_state_db()
+        _finalize_state_store()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -823,23 +764,22 @@ async def list_models(request: Request):
     else:
         visible = all_models
 
-    # 把 modelMapping 里的别名也当成可用模型暴露出去:
-    # 条件 = 别名指向的真实模型也在 visible 集合里 (否则客户端调不通,
-    # 暴露就是坑)。API Key 不再按协议入口过滤，模型权限仍由 allowedModels 控制。
+    # 共享的 /v1/models 不知道客户端后续会调用 messages/chat/responses
+    # 中的哪一个入口，因此只能额外暴露真正跨入口生效的 global 别名。
+    # legacy anthropic/openai-* 专属别名仍可在各自入口使用，但不能混入
+    # 这份共享清单，否则客户端会看到在其他入口无法路由的模型名。
     visible_set = set(visible)
     alias_seen: set[str] = set()
-    for _line in model_mapping.INGRESS_LINES:
-        _mp = model_mapping.get_ingress_map(_line)
-        for _alias, _real in _mp.items():
-            if _alias in visible_set or _alias in alias_seen:
-                continue
-            if _real not in visible_set:
-                continue
-            # Key 有白名单时, 别名必须显式授权 (白名单按真名语义, 但下游看到的
-            # 是别名, 这里做 strict 检查: 白名单里如果没别名就不暴露)
-            if allowed_models and _alias not in set(allowed_models):
-                continue
-            alias_seen.add(_alias)
+    for _alias, _real in model_mapping.get_global_map().items():
+        if _alias in visible_set:
+            continue
+        if _real not in visible_set:
+            continue
+        # Key 有白名单时, 别名必须显式授权 (白名单按真名语义, 但下游看到的
+        # 是别名, 这里做 strict 检查: 白名单里如果没别名就不暴露)
+        if allowed_models and _alias not in allowed_set:
+            continue
+        alias_seen.add(_alias)
     if alias_seen:
         visible = sorted(visible_set | alias_seen)
 
@@ -1299,9 +1239,6 @@ def main() -> None:
     )
     server = _DrainAwareServer(uvicorn_config)
     asyncio.run(_serve_with_graceful_drain(server))
-    if state_db.recovery_restart_requested():
-        print("[state_db] graceful shutdown complete; restarting for automatic recovery")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

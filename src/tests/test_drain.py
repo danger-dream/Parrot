@@ -65,86 +65,18 @@ def test_drain_aware_server_signal_waits_before_should_exit():
     asyncio.run(scenario())
 
 
-def test_shutdown_closes_state_db_without_checkpoint(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        parrot_server.state_db,
-        "checkpoint",
-        lambda **kwargs: calls.append(("checkpoint", kwargs)) or (0, 8, 8),
-    )
-    monkeypatch.setattr(
-        parrot_server.state_db,
-        "close",
-        lambda: calls.append(("close", {})),
-    )
-
-    assert parrot_server._finalize_state_db() is True
-    assert calls == [("close", {})]
+def test_shutdown_closes_state_store(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(parrot_server.state_db,"close",lambda: calls.append("close") or True)
+    assert parrot_server._finalize_state_store() is True
+    assert calls==["close"]
 
 
 def test_shutdown_reports_close_failure(monkeypatch):
-    def fail_close():
-        raise RuntimeError("close failed")
-
-    monkeypatch.setattr(parrot_server.state_db, "close", fail_close)
-
-    assert parrot_server._finalize_state_db() is False
+    def fail_close(): raise RuntimeError("close failed")
+    monkeypatch.setattr(parrot_server.state_db,"close",fail_close)
+    assert parrot_server._finalize_state_store() is False
 
 
-def test_recovery_restart_preserves_corrupt_db_without_close(monkeypatch):
-    calls = []
-    parrot_server.state_db._reset_recovery_state_for_tests()
-    parrot_server.state_db.request_recovery_restart("file is not a database")
-    monkeypatch.setattr(
-        parrot_server.state_db,
-        "checkpoint",
-        lambda **kwargs: calls.append(("checkpoint", kwargs)),
-    )
-    monkeypatch.setattr(
-        parrot_server.state_db,
-        "close",
-        lambda: calls.append(("close", {})),
-    )
-    try:
-        assert parrot_server._finalize_state_db() is True
-        assert calls == []
-    finally:
-        parrot_server.state_db._reset_recovery_state_for_tests()
-
-
-def test_state_db_health_loop_requests_graceful_recovery_restart(monkeypatch):
-    calls = []
-    parrot_server.state_db._reset_recovery_state_for_tests()
-
-    async def no_wait(_seconds):
-        return None
-
-    monkeypatch.setattr(parrot_server.asyncio, "sleep", no_wait)
-    monkeypatch.setattr(
-        parrot_server.state_db,
-        "runtime_corruption_reason",
-        lambda: "file is not a database",
-    )
-    monkeypatch.setattr(
-        parrot_server.notifier,
-        "notify_event",
-        lambda event, text: calls.append(("notify", event, text)),
-    )
-    monkeypatch.setattr(
-        parrot_server.drain,
-        "begin",
-        lambda reason: calls.append(("drain", reason)),
-    )
-    monkeypatch.setattr(
-        parrot_server.os,
-        "kill",
-        lambda pid, sig: calls.append(("kill", pid, sig)),
-    )
-    try:
-        asyncio.run(parrot_server._state_db_health_loop())
-        assert parrot_server.state_db.recovery_restart_requested() is True
-        assert calls[0][0:2] == ("notify", "database_recovery")
-        assert ("drain", "state_db_corruption") in calls
-        assert ("kill", parrot_server.os.getpid(), signal.SIGTERM) in calls
-    finally:
-        parrot_server.state_db._reset_recovery_state_for_tests()
+def test_server_has_no_state_corruption_restart_watchdog():
+    assert not hasattr(parrot_server,"_state_db_health_loop")

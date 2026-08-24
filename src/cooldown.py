@@ -3,7 +3,7 @@
 阶梯默认 [1, 3, 5, 10, 15, 0] 分钟；`0` = 永久拉黑（cooldown_until = -1）。
 连续失败 → 递进下一阶；成功一次 → 计数清零。
 
-内存 + state.db 双层。init() 启动时从 state.db 恢复。
+内存 + StateStore snapshots 双层。init() 启动时从 StateStore snapshots 恢复。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Optional
 from . import channel_state, config, notifier, quota_errors, state_db
 
 
-_INF = -1  # state.db 中用 -1 表示永久
+_INF = -1  # StateStore snapshots 中用 -1 表示永久
 
 _lock = channel_state.mutation_lock
 _entries: dict[tuple[str, str], dict] = {}  # (channel_key, model) -> state
@@ -77,7 +77,7 @@ def init() -> None:
             }
     _initialized = True
     suffix = f"; upgraded {upgraded_quota} Zhipu quota cooldown(s)" if upgraded_quota else ""
-    print(f"[cooldown] loaded {len(rows)} entries from state.db{suffix}")
+    print(f"[cooldown] loaded {len(rows)} entries from StateStore snapshots{suffix}")
 
 
 def _windows() -> list[int]:

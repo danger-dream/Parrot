@@ -232,25 +232,8 @@ def _close_local_connection(name: str) -> None:
     setattr(_local, f"{name}_path", None)
 
 
-def _disable_legacy_fallback(reason: str) -> None:
-    global _legacy_disabled_reason
-    if not _legacy_disabled_reason:
-        _legacy_disabled_reason = str(reason or "legacy state store unavailable")
-        _logger.warning(
-            "legacy state.db Response Store fallback disabled: %s",
-            _legacy_disabled_reason,
-        )
-    _close_local_connection("legacy_conn")
 
 
-def _is_corrupt_database_error(exc: BaseException) -> bool:
-    code = getattr(exc, "sqlite_errorcode", None)
-    base_code = (int(code) & 0xFF) if isinstance(code, int) else None
-    lowered = str(exc).lower()
-    return base_code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB} or any(
-        marker in lowered
-        for marker in ("file is not a database", "database disk image is malformed")
-    )
 
 
 def _rollback_failed_write(conn: sqlite3.Connection) -> None:
@@ -294,45 +277,6 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-def _get_legacy_conn() -> Optional[sqlite3.Connection]:
-    """Open legacy state.db read-only, without creating a missing file."""
-    if _legacy_disabled_reason:
-        return None
-    path = _legacy_db_path
-    if not path or (_db_path and _paths_same_file(path, _db_path)):
-        _close_local_connection("legacy_conn")
-        return None
-    if not _legacy_regular_file_exists(path):
-        _close_local_connection("legacy_conn")
-        return None
-    conn = getattr(_local, "legacy_conn", None)
-    if conn is not None and getattr(_local, "legacy_conn_path", None) != path:
-        _close_local_connection("legacy_conn")
-        conn = None
-    if conn is None:
-        try:
-            uri = f"{Path(path).resolve().as_uri()}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=1)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA query_only=ON")
-            conn.execute("PRAGMA busy_timeout=1000")
-        except sqlite3.Error as exc:
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-            # The legacy table is optional compatibility data. Corruption in
-            # state.db must not prevent writes to the healthy independent Store.
-            if _is_corrupt_database_error(exc):
-                _disable_legacy_fallback(str(exc))
-                return None
-            if not _legacy_regular_file_exists(path):
-                return None
-            raise
-        _local.legacy_conn = conn
-        _local.legacy_conn_path = path
-    return conn
 
 
 _SCHEMA = """
@@ -349,7 +293,53 @@ CREATE TABLE IF NOT EXISTS openai_response_store (
 );
 CREATE INDEX IF NOT EXISTS idx_resp_store_expires ON openai_response_store(expires_at);
 CREATE INDEX IF NOT EXISTS idx_resp_store_key     ON openai_response_store(api_key_name);
+CREATE TABLE IF NOT EXISTS store_migrations (
+  name TEXT PRIMARY KEY,
+  completed_at REAL NOT NULL
+);
 """
+
+
+def _migrate_legacy_responses(conn: sqlite3.Connection) -> None:
+    """Import each conclusively inspected legacy source revision once, optionally."""
+    try:
+        # Report lookup, imports and fingerprinting are all optional inspection.
+        from .. import state_db
+        from ..state_migration import inspect_legacy, source_fingerprint
+        report = state_db.migration_report() or {}
+        current = source_fingerprint(_legacy_db_path or "")
+        source = report.get("source") or {}
+        if source.get("canonical_path") != current.get("canonical_path") or source.get("revision") != current.get("revision"):
+            report = {}; source = current
+        revision = str(source.get("revision") or "")
+        if not revision: return
+        marker = f"legacy-state-response-store-v2:{revision}"
+        if conn.execute("SELECT 1 FROM store_migrations WHERE name=?", (marker,)).fetchone(): return
+        if report.get("status") in {"healthy", "backup", "missing"} and "responses" in report:
+            rows = report["responses"]
+        elif report.get("status") == "rebuilt-empty":
+            print(f"[openai.store] skipped optional legacy response import: "
+                  f"{report.get('corrupt_reason') or 'legacy source was not fully inspected'}")
+            return
+        else:
+            inspected = inspect_legacy(_legacy_db_path or "")
+            rows = inspected["responses"]
+        if rows:
+            conn.executemany(
+                """INSERT OR IGNORE INTO openai_response_store
+                   (response_id,parent_id,api_key_name,model,channel_key,created_at,
+                    expires_at,input_items,output_items) VALUES (?,?,?,?,?,?,?,?,?)""",
+                [tuple(row.get(k) for k in ("response_id","parent_id","api_key_name","model",
+                       "channel_key","created_at","expires_at","input_items","output_items"))
+                 for row in rows],
+            )
+        conn.execute("INSERT INTO store_migrations(name,completed_at) VALUES (?,?)", (marker, time.time()))
+        conn.commit()
+    except Exception as exc:
+        # The independent response Store remains available. No false marker is
+        # committed for a source revision that was not completely inspected.
+        conn.rollback()
+        print(f"[openai.store] optional legacy response import skipped: {exc}")
 
 
 def init() -> None:
@@ -371,6 +361,7 @@ def init() -> None:
         try:
             conn.executescript(_SCHEMA)
             conn.commit()
+            _migrate_legacy_responses(conn)
             _validate_private_store_files()
         except BaseException:
             _rollback_failed_write(conn)
@@ -378,7 +369,7 @@ def init() -> None:
     was_initialized = _initialized
     _initialized = True
     if not was_initialized:
-        print(f"[openai_store] Using {_db_path} (legacy fallback: {_legacy_db_path})")
+        print(f"[openai_store] Using {_db_path} (legacy migration complete)")
 
 
 def _store_cfg() -> dict:
@@ -435,13 +426,6 @@ def save(response_id: str, parent_id: Optional[str], *,
                 "SELECT api_key_name FROM openai_response_store WHERE response_id=?",
                 (response_id,),
             ).fetchone()
-            if local_owner is None:
-                legacy = _legacy_lookup(response_id)
-                if (
-                    legacy is not None
-                    and legacy["api_key_name"] != (api_key_name or "")
-                ):
-                    raise ResponseIdConflict(response_id)
             cur = conn.execute(
                 """INSERT INTO openai_response_store
                    (response_id, parent_id, api_key_name, model, channel_key,
@@ -471,25 +455,6 @@ def save(response_id: str, parent_id: Optional[str], *,
             raise
 
 
-def _legacy_lookup(response_id: str) -> Optional[sqlite3.Row]:
-    conn = _get_legacy_conn()
-    if conn is None:
-        return None
-    try:
-        return conn.execute(
-            "SELECT * FROM openai_response_store WHERE response_id=?",
-            (response_id,),
-        ).fetchone()
-    except sqlite3.OperationalError as exc:
-        if "no such table: openai_response_store" in str(exc).lower():
-            _disable_legacy_fallback("legacy table does not exist")
-            return None
-        raise
-    except sqlite3.DatabaseError as exc:
-        if _is_corrupt_database_error(exc):
-            _disable_legacy_fallback(str(exc))
-            return None
-        raise
 
 
 def _row_to_response(row: sqlite3.Row, response_id: str, api_key_name: str) -> StoredResponse:
@@ -523,8 +488,6 @@ def lookup(response_id: str, *, api_key_name: str) -> StoredResponse:
         "SELECT * FROM openai_response_store WHERE response_id=?",
         (response_id,),
     ).fetchone()
-    if row is None:
-        row = _legacy_lookup(response_id)
     if row is None:
         raise ResponseNotFound(response_id)
     return _row_to_response(row, response_id, api_key_name)

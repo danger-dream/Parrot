@@ -221,7 +221,7 @@ def record_failure(channel_key, model, connect_ms):
 
 ```python
 def schedule(body: dict, api_key_name: str, client_ip: str) -> ScheduleResult:
-    """同步函数：纯内存 + state.db 读，无 I/O 阻塞点。"""
+    """同步函数：读取 StateStore 内存镜像，无 I/O 阻塞点。"""
     requested_model = body.get("model")
     if not requested_model:
         return ScheduleResult([], None, False)

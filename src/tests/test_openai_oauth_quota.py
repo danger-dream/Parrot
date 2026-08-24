@@ -651,13 +651,10 @@ def _set_quota_timestamps(m, key, *, passive_ms, usage_ms):
         for window in observations.values():
             window["observed_at"] = passive_ms
         observations_json = json.dumps(observations)
-    conn = m["state_db"]._get_conn()
-    conn.execute(
-        "UPDATE oauth_quota_cache SET last_passive_update_at=?, fetched_at=?, "
-        "codex_window_observations=? WHERE account_key=?",
-        (passive_ms, usage_ms, observations_json, key),
+    m["state_db"].quota_set_observation_times(
+        key, last_passive_update_at=passive_ms, fetched_at=usage_ms,
+        codex_window_observations=observations_json,
     )
-    conn.commit()
 
 
 def test_openai_quota_resumes_when_fresh_wham_supersedes_codex_snapshot(m):

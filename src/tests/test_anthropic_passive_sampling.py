@@ -55,11 +55,10 @@ def _import_modules():
 def _setup(m):
     state_db = m["state_db"]
     state_db.init()
-    conn = state_db._get_conn()
-    conn.execute("DELETE FROM oauth_quota_cache")
-    conn.execute("DELETE FROM performance_stats")
-    conn.execute("DELETE FROM channel_errors")
-    conn.commit()
+    for row in state_db.quota_load_all():
+        state_db.quota_delete(row["account_key"])
+    state_db.perf_delete()
+    state_db.error_delete()
 
     def clear_accounts(c):
         c["oauthAccounts"] = []
@@ -404,10 +403,7 @@ def test_record_snapshot_skips_non_oauth_channel(m):
     })
     m["failover"]._maybe_record_anthropic_snapshot(_FakeApiCh(), resp)
     # state_db 不应有任何 oauth_quota_cache 行
-    rows = m["state_db"]._get_conn().execute(
-        "SELECT COUNT(*) AS c FROM oauth_quota_cache"
-    ).fetchone()
-    assert rows["c"] == 0
+    assert m["state_db"].quota_load_all() == []
     print("  [PASS] _maybe_record_anthropic_snapshot: skips non-OAuthChannel")
 
 

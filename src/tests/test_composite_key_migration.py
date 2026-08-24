@@ -52,13 +52,11 @@ def _setup(m):
     """每个测试前清配置 + 清 state.db 相关表。"""
     state_db = m["state_db"]
     state_db.init()
-    # 清所有 oauth / channel 表，避免跨测试污染
-    conn = state_db._get_conn()
-    conn.execute("DELETE FROM oauth_quota_cache")
-    conn.execute("DELETE FROM performance_stats")
-    conn.execute("DELETE FROM channel_errors")
-    conn.execute("DELETE FROM cache_affinities")
-    conn.commit()
+    # 清所有 oauth / channel 状态，避免跨测试污染
+    for row in state_db.quota_load_all():
+        state_db.quota_delete(row["account_key"])
+    state_db.perf_delete(); state_db.error_delete(); state_db.affinity_delete()
+    state_db.client_affinity_delete(); state_db.schema_meta_delete(state_db.COMPOSITE_KEY_FLAG)
 
     def clear_accounts(c):
         c["oauthAccounts"] = []
@@ -122,106 +120,37 @@ def test_channel_key_roundtrip(m):
 # ==============================================================
 
 def test_migration_idempotent_when_flag_set(m):
-    _setup(m)
-    sdb = m["state_db"]
-    # 先手动置 flag
-    sdb.schema_meta_set(sdb.COMPOSITE_KEY_FLAG, sdb.COMPOSITE_KEY_VERSION)
-    stats = sdb.run_composite_key_migration({"a@b.c": "claude:a@b.c"})
+    _setup(m); sdb=m["state_db"]
+    sdb.schema_meta_set(sdb.COMPOSITE_KEY_FLAG,sdb.COMPOSITE_KEY_VERSION)
+    stats=sdb.run_composite_key_migration({"a@b.c":"claude:a@b.c"})
     assert stats["skipped"] is True
-    assert stats["reason"] == "flag already set"
-    print("  [PASS] migration skipped when flag already set")
 
 
-def test_migration_noop_on_fresh_schema(m):
-    """新装库：schema 已是新格式（account_key 列存在）→ 只补 flag、不动表结构。"""
-    _setup(m)
-    sdb = m["state_db"]
-    # 手动清 flag 但保留 account_key 列（模拟 "之前迁过但 flag 丢" 场景）
-    conn = sdb._get_conn()
-    conn.execute("DELETE FROM schema_meta WHERE key=?", (sdb.COMPOSITE_KEY_FLAG,))
-    conn.commit()
-    stats = sdb.run_composite_key_migration({})
-    assert stats["skipped"] is True, stats
-    assert "account_key column already exists" in stats["reason"], stats
-    # flag 应被补上
-    assert sdb.composite_key_migration_done() is True
-    print("  [PASS] migration backfills flag when account_key col already exists")
+def test_migration_orphan_cleanup_deletes_only_exact_bare_storage_key(m):
+    _setup(m); sdb=m["state_db"]
+    email = "shared@example.com"
+    sdb.quota_save(email, {"five_hour_util": 99.0}, email=email)
+    sdb.quota_save("claude:" + email, {"five_hour_util": 10.0}, email=email)
+    sdb.quota_save("openai:" + email + ":workspace", {"five_hour_util": 20.0}, email=email)
+    sdb.run_composite_key_migration({})
+    keys = {row["account_key"] for row in sdb.quota_load_all()}
+    assert email not in keys
+    assert "claude:" + email in keys
+    assert "openai:" + email + ":workspace" in keys
 
 
-def test_migration_transforms_legacy_schema(m):
-    """老 schema（email PK，无 account_key 列）+ 有数据 → 迁移成功。"""
-    _setup(m)
-    sdb = m["state_db"]
-    conn = sdb._get_conn()
-
-    # 构造"老 schema"：drop 当前表，建回老格式
-    conn.execute("DROP TABLE IF EXISTS oauth_quota_cache")
-    conn.execute(
-        "CREATE TABLE oauth_quota_cache ("
-        "email TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL,"
-        "five_hour_util REAL, seven_day_util REAL)"
-    )
-    conn.execute(
-        "INSERT INTO oauth_quota_cache (email, fetched_at, five_hour_util, seven_day_util) "
-        "VALUES (?,?,?,?)",
-        ("x@y.com", 1000, 15.0, 30.0),
-    )
-    # channel_key 构造几条 "oauth:<email>" 老格式
-    conn.execute(
-        "INSERT INTO performance_stats (channel_key, model, last_updated) VALUES (?,?,?)",
-        ("oauth:x@y.com", "claude-opus-4-7", 1000),
-    )
-    conn.execute(
-        "INSERT INTO channel_errors (channel_key, model) VALUES (?,?)",
-        ("oauth:x@y.com", "claude-opus-4-7"),
-    )
-    # 清 flag 让迁移真的跑
-    conn.execute("DELETE FROM schema_meta WHERE key=?", (sdb.COMPOSITE_KEY_FLAG,))
-    conn.commit()
-
-    stats = sdb.run_composite_key_migration({"x@y.com": "claude:x@y.com"})
-    assert stats["skipped"] is False, stats
-    assert stats["migrated_quota_rows"] == 1, stats
-    assert stats["migrated_channel_rows"] >= 2, stats
-
-    # 验证新表结构
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
-    assert "account_key" in cols and "email" in cols, cols
-    row = sdb.quota_load("claude:x@y.com")
-    assert row and row["email"] == "x@y.com" and row["five_hour_util"] == 15.0, row
-
-    # channel_key 已升级
-    rs = conn.execute("SELECT channel_key FROM performance_stats").fetchall()
-    ks = [r["channel_key"] for r in rs]
-    assert "oauth:claude:x@y.com" in ks, ks
-    assert "oauth:x@y.com" not in ks, ks
-
-    # flag 已打
-    assert sdb.composite_key_migration_done() is True
-    print("  [PASS] migration transforms legacy schema + updates channel_key prefix")
-
-
-def test_migration_drops_orphan_rows(m):
-    """email_to_key 里没有的行（已删账户的孤儿 quota）应在迁移中被丢弃。"""
-    _setup(m)
-    sdb = m["state_db"]
-    conn = sdb._get_conn()
-    conn.execute("DROP TABLE IF EXISTS oauth_quota_cache")
-    conn.execute(
-        "CREATE TABLE oauth_quota_cache (email TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL)"
-    )
-    conn.execute("INSERT INTO oauth_quota_cache (email, fetched_at) VALUES (?,?)", ("live@x.com", 1))
-    conn.execute("INSERT INTO oauth_quota_cache (email, fetched_at) VALUES (?,?)", ("gone@x.com", 2))
-    conn.execute("DELETE FROM schema_meta WHERE key=?", (sdb.COMPOSITE_KEY_FLAG,))
-    conn.commit()
-
-    sdb.run_composite_key_migration({"live@x.com": "claude:live@x.com"})
-    rows = sdb.quota_load("claude:live@x.com")
-    assert rows is not None
-    # orphan 丢弃
-    cnt = conn.execute("SELECT COUNT(*) AS c FROM oauth_quota_cache").fetchone()["c"]
-    assert cnt == 1, cnt
-    print("  [PASS] migration drops orphan rows not in email_to_key mapping")
+def test_migration_renames_rows_and_drops_bare_orphan(m):
+    _setup(m); sdb=m["state_db"]
+    sdb.quota_save("x@y.com", {"five_hour_util":15.0})
+    sdb.quota_save("gone@y.com", {"five_hour_util":99.0})
+    sdb.perf_save("oauth:x@y.com","model",{"last_updated":1})
+    sdb.error_save("oauth:x@y.com","model",1,None,None)
+    stats=sdb.run_composite_key_migration({"x@y.com":"claude:x@y.com"})
+    assert stats["skipped"] is False
+    assert stats["migrated_quota_rows"]==1 and stats["migrated_channel_rows"]==2
+    assert sdb.quota_load("claude:x@y.com")["five_hour_util"]==15.0
+    assert all(r["channel_key"]=="oauth:claude:x@y.com" for r in sdb.perf_load_all()+sdb.error_load_all())
+    assert not any(r["account_key"]=="gone@y.com" for r in sdb.quota_load_all())
 
 
 # ==============================================================
@@ -466,12 +395,10 @@ def test_openai_workspace_key_migration_unique_rows_and_config(m):
 
     # state rows
     sdb.quota_save_openai_snapshot("openai:uniq@openai.test", {"primary_used_pct": 42, "primary_window_min": 10080}, email="uniq@openai.test")
-    conn = sdb._get_conn()
-    conn.execute("INSERT INTO performance_stats (channel_key, model, last_updated) VALUES (?,?,?)", ("oauth:openai:uniq@openai.test", "gpt-5", 1))
-    conn.execute("INSERT INTO channel_errors (channel_key, model) VALUES (?,?)", ("oauth:openai:uniq@openai.test", "gpt-5"))
-    conn.execute("INSERT INTO cache_affinities (fingerprint, channel_key, model, last_used, created_at) VALUES (?,?,?,?,?)", ("fp", "oauth:openai:uniq@openai.test", "gpt-5", 1, 1))
-    conn.execute("INSERT INTO client_affinities (client_key, channel_key, model, last_used, created_at) VALUES (?,?,?,?,?)", ("client", "oauth:openai:uniq@openai.test", "gpt-5", 1, 1))
-    conn.commit()
+    sdb.perf_save("oauth:openai:uniq@openai.test", "gpt-5", {"last_updated": 1})
+    sdb.error_save("oauth:openai:uniq@openai.test", "gpt-5", 0, None, None)
+    sdb.affinity_upsert("fp", "oauth:openai:uniq@openai.test", "gpt-5", 1)
+    sdb.client_affinity_upsert("client", "oauth:openai:uniq@openai.test", "gpt-5", 1)
 
     # log rows
     from src import log_db, image_db
@@ -494,10 +421,7 @@ def test_openai_workspace_key_migration_unique_rows_and_config(m):
     assert stats["mapping_count"] == 3, stats
     assert sdb.quota_load("openai:uniq@openai.test:acct-uniq")["email"] == "uniq@openai.test"
     # quota_load 允许 legacy openai:<email> 在唯一 email 时兜底解析；底层 PK 必须已迁移。
-    assert conn.execute(
-        "SELECT COUNT(*) FROM oauth_quota_cache WHERE account_key=?",
-        ("openai:uniq@openai.test",),
-    ).fetchone()[0] == 0
+    assert not any(r["account_key"] == "openai:uniq@openai.test" for r in sdb.quota_load_all())
     assert all(r["channel_key"] == "oauth:openai:uniq@openai.test:acct-uniq" for r in sdb.perf_load_all())
     assert all(r["channel_key"] == "oauth:openai:uniq@openai.test:acct-uniq" for r in sdb.error_load_all())
     assert all(r["channel_key"] == "oauth:openai:uniq@openai.test:acct-uniq" for r in sdb.affinity_load_all())
@@ -549,11 +473,7 @@ def test_openai_workspace_key_migration_later_unique_mapping_still_runs(m):
     assert stats["mapping_count"] == 6, stats
     assert stats["state"]["skipped"] is False, stats
     assert sdb.quota_load("openai:second@openai.test:acct-second")["email"] == "second@openai.test"
-    conn = sdb._get_conn()
-    assert conn.execute(
-        "SELECT COUNT(*) FROM oauth_quota_cache WHERE account_key=?",
-        ("openai:second@openai.test",),
-    ).fetchone()[0] == 0
+    assert not any(r["account_key"] == "openai:second@openai.test" for r in sdb.quota_load_all())
     print("  [PASS] openai workspace-key migration can process later unique mappings")
 
 

@@ -111,6 +111,7 @@ def _setup(m):
 
     def _r(c):
         c["channels"] = []
+        c["modelMapping"] = {"global": {}}
         c.setdefault("scoring", {})["explorationRate"] = 0.0
     m["config"].update(_r)
     m["states"].clear_all()
@@ -783,6 +784,58 @@ def test_edit_fields(m):
     entry = next(c for c in m["config"].get()["channels"] if c["name"] == "newname")
     assert entry["cc_mimicry"] is False
     print("  [PASS] edit name/url/key/models/cc_mimicry")
+
+
+def test_edit_models_cascades_removed_alias_from_all_model_mapping_lines(m):
+    _setup(m)
+    _add_channel(
+        m, "mapped",
+        models=[
+            {"real": "real-stale", "alias": "stale"},
+            {"real": "real-keep", "alias": "keep"},
+        ],
+    )
+
+    def seed(cfg):
+        cfg["modelMapping"] = {
+            "global": {"stale": "target-g", "unrelated": "target-u"},
+            "anthropic": {"stale": "target-a", "keep": "target-k"},
+            "openai-chat": {"stale": "target-c"},
+            "openai-responses": {"stale": "target-r"},
+        }
+    m["config"].update(seed)
+
+    m["registry"].update_api_channel(
+        "mapped", {"models": [{"real": "real-keep", "alias": "keep"}]},
+    )
+    root = m["config"].get()["modelMapping"]
+    assert all("stale" not in (root.get(line) or {}) for line in (
+        "global", "anthropic", "openai-chat", "openai-responses",
+    ))
+    assert root["global"]["unrelated"] == "target-u"
+    assert root["anthropic"]["keep"] == "target-k"
+    print("  [PASS] removed channel alias cascades modelMapping")
+
+
+def test_delete_channel_cascades_its_alias_from_model_mapping(m):
+    _setup(m)
+    _add_channel(m, "mapped-delete", models=[{"real": "real-old", "alias": "old"}])
+    m["config"].update(
+        lambda cfg: cfg.__setitem__(
+            "modelMapping",
+            {
+                "global": {"old": "target", "keep": "keep-target"},
+                "anthropic": {"old": "legacy-target"},
+            },
+        )
+    )
+
+    assert m["registry"].delete_api_channel("mapped-delete")
+    root = m["config"].get()["modelMapping"]
+    assert "old" not in root["global"]
+    assert "old" not in root["anthropic"]
+    assert root["global"]["keep"] == "keep-target"
+    print("  [PASS] channel deletion cascades modelMapping aliases")
 
 
 def test_channel_compatibility_menu_and_model_scope(m):

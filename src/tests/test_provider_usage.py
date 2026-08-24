@@ -34,8 +34,8 @@ def _ch(provider="deepseek", preset="standard", key="secret-key", name="one"):
 @pytest.fixture(autouse=True)
 def setup(m):
     m["state_db"].init()
-    m["state_db"]._get_conn().execute("DELETE FROM api_provider_usage_cache")
-    m["state_db"]._get_conn().commit()
+    for row in m["state_db"].provider_usage_load_all():
+        m["state_db"].provider_usage_delete(row["account_id"])
     with m["provider_usage"]._GUARD:
         m["provider_usage"]._INFLIGHT.clear()
         m["provider_usage"]._RUNTIME.clear()
@@ -399,7 +399,7 @@ def test_no_refresh_disables_server_mount_helper_and_lifecycle_order(m, monkeypa
     assert source.index("await provider_usage.start()") < source.index("provider_usage.schedule_startup_refresh()")
     assert source.index("provider_usage.schedule_startup_refresh()") < source.index("tgbot.start()")
     stop_pos = source.index("await provider_usage.stop()")
-    assert stop_pos < source.index("_finalize_state_db()", stop_pos)
+    assert stop_pos < source.index("_finalize_state_store()", stop_pos)
 
 
 @pytest.mark.asyncio
@@ -569,8 +569,7 @@ async def test_worker_success_error_and_retry_update_deadline_preserve_stale(m, 
     await pu.start()
     try:
         # Existing success is force-refreshable after manual minimum, while stale survives error.
-        db._get_conn().execute("UPDATE api_provider_usage_cache SET fetched_at=? WHERE account_id=?", (int(time.time() * 1000) - 9000, error_aid))
-        db._get_conn().commit()
+        db.provider_usage_set_fetched_at(error_aid, int(time.time() * 1000) - 9000)
         assert pu.schedule_refresh(success_ch)
         assert pu.schedule_refresh(error_ch, force=True)
         for _ in range(100):

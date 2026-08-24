@@ -110,7 +110,7 @@ print_banner() {
   仓库 : https://github.com/danger-dream/Parrot
   镜像 : ghcr.io/danger-dream/parrot:latest
   端口 : 22122 (默认)
-  数据 : <安装目录>/data (config.json / state.db / logs/)
+  数据 : <安装目录>/data (config.json / runtime-cache.json / durable-state.json / state-migration.json / 旧 state.db / logs/)
 
 EOF
 }

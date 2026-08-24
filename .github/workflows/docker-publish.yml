@@ -12,7 +12,27 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/parrot
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Compile and import
+        run: |
+          python -m compileall -q server.py src
+          python -c "import server; from src import state_db; from src.state_store import StateStore"
+      - name: Full isolated regression
+        run: python src/tests/isolated_pytest.py -q
+
   build-and-push:
+    needs: quality
     runs-on: ubuntu-latest
     permissions:
       contents: read

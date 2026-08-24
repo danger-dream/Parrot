@@ -26,6 +26,19 @@ state.db.pre_composite_key.bak
 *.db-shm
 *.db-wal
 
+# JSON StateStore 运行快照、备份、锁及崩溃残留临时文件
+/runtime-cache.json
+/runtime-cache.json.bak
+/runtime-cache.json.lock
+/runtime-cache.json.*.tmp
+/durable-state.json
+/durable-state.json.bak
+/durable-state.json.lock
+/durable-state.json.*.tmp
+/state-migration.json
+/state-migration.json.lock
+/state-migration.json.*.tmp
+
 # 运行日志 / 图片缓存
 logs/
 images/

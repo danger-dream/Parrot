@@ -2278,7 +2278,7 @@ def migrate_provider_field() -> int:
 
 
 def bootstrap_composite_key_migration() -> dict:
-    """启动时调用，幂等执行 state.db 的联合主键迁移。
+    """启动时调用，幂等执行 StateStore snapshots 的联合主键迁移。
 
     依赖：`migrate_provider_field()` 已经跑过（保证每条 account 都有 provider）。
     行为：按当前 config 构建 email→account_key 映射，委托 state_db 执行。

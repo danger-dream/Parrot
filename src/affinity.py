@@ -1,10 +1,10 @@
 """亲和绑定：fingerprint → (channel_key, model)。
 
-内存 + state.db 双层：
+内存 + StateStore snapshots 双层：
   - 内存：快速查找
-  - state.db：重启恢复
+  - StateStore snapshots：重启恢复
 
-首次调用 init() 从 state.db 全量加载到内存。成功路径的 upsert 先持久化再
+首次调用 init() 从 StateStore snapshots 全量加载到内存。成功路径的 upsert 先持久化再
 发布到内存；SQLite 可用性失败时跳过内存更新，避免进程状态与重启状态分叉。
 过期清理由后台 loop 调用 cleanup()。
 """
@@ -61,7 +61,7 @@ def _persist_optional(name: str, effect) -> bool:
 
 
 def init() -> None:
-    """从 state.db 加载全部亲和记录到内存。"""
+    """从 StateStore snapshots 加载全部亲和记录到内存。"""
     global _initialized
     with _mutation_lock:
         if _initialized:
@@ -77,7 +77,7 @@ def init() -> None:
                     "prompt_cache_key": row.get("prompt_cache_key"),
                 }
         _initialized = True
-    print(f"[affinity] loaded {len(rows)} entries from state.db")
+    print(f"[affinity] loaded {len(rows)} entries from StateStore snapshots")
 
 
 def _ttl_ms() -> int:
@@ -117,7 +117,7 @@ def get(fingerprint: Optional[str]) -> Optional[dict]:
 
 def upsert(fingerprint: Optional[str], channel_key: str, model: str,
            prompt_cache_key: Optional[str] = None) -> None:
-    """插入或更新绑定。内存 + state.db 双写。
+    """插入或更新绑定。内存 + StateStore snapshots 双写。
 
     prompt_cache_key 仅供 OpenAI 协议自动补 `prompt_cache_key` 使用；
     传 None 表示保留旧值，不影响 Anthropic/其他协议的亲和语义。
@@ -326,7 +326,7 @@ def _client_ttl_ms() -> int:
 
 
 def client_init() -> None:
-    """从 state.db 加载全部 client 亲和记录到内存。"""
+    """从 StateStore snapshots 加载全部 client 亲和记录到内存。"""
     global _client_initialized
     with _client_mutation_lock:
         if _client_initialized:
@@ -341,7 +341,7 @@ def client_init() -> None:
                     "last_used": row["last_used"],
                 }
         _client_initialized = True
-    print(f"[affinity] loaded {len(rows)} client entries from state.db")
+    print(f"[affinity] loaded {len(rows)} client entries from StateStore snapshots")
 
 
 def make_client_key(api_key_name: str, client_ip: str, model: str) -> str:
@@ -378,7 +378,7 @@ def client_get(client_key: str) -> Optional[dict]:
 
 
 def client_upsert(client_key: str, channel_key: str, model: str) -> None:
-    """插入或更新 client 绑定。内存 + state.db 双写。"""
+    """插入或更新 client 绑定。内存 + StateStore snapshots 双写。"""
     if not client_key:
         return
     now = state_db.now_ms()

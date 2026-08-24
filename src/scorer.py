@@ -41,7 +41,7 @@ _last_persist_warning_at = 0.0
 _PERSIST_WARNING_INTERVAL_SECONDS = 60.0
 
 # Old rows aggregated the superseded physical-connect meaning.  A deployment
-# must explicitly activate this version after reviewing production state.db;
+# must explicitly activate this version after reviewing production StateStore snapshots;
 # until then init() neutralizes old connect EMA in memory and never writes DB.
 TIMING_SEMANTICS_META_KEY = "scorer.timing_semantics_version"
 TIMING_SEMANTICS_VERSION = "upstream-round-v2"
@@ -107,7 +107,7 @@ def init() -> None:
             }
     _initialized = True
     suffix = "" if stored_version == TIMING_SEMANTICS_VERSION else " (legacy connect EMA neutralized in memory)"
-    print(f"[scorer] loaded {len(rows)} entries from state.db{suffix}")
+    print(f"[scorer] loaded {len(rows)} entries from StateStore snapshots{suffix}")
 
 
 def _get(channel_key: str, model: str) -> Optional[dict]:

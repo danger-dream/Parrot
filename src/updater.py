@@ -4,7 +4,7 @@
 - update_checker：只负责"发现新版"（拉 GitHub Release、比对版本、banner、推送通知）。
 - updater（本模块）：负责"执行更新"——备份 → 拉取 → 等用户二次确认 → 重启生效 → 健康校验/回滚。
 
-核心设计：持久化状态机（state.db 单行 `app_self_update`），跨重启不丢。
+核心设计：持久化状态机（StateStore snapshots 单行 `app_self_update`），跨重启不丢。
 交互流程（双重确认）：
 
     [检测到新版] → 通知带按钮 [🚀 更新] [🔕 忽略]
@@ -28,7 +28,7 @@
 - 所有外部命令参数固定，无字符串拼接注入面。
 - 源码形态有未提交改动 → 拒绝更新（避免 reset 吃掉本地改动）。
 - 全局更新锁，防并发重复触发。
-- 重启前 state.db 必须完成 SQLite Online Backup 和完整性验证；失败则拒绝重启。
+- 重启前 StateStore 必须严格 flush 并验证 runtime/durable JSON snapshots；失败则拒绝重启。
 - 重启后健康检查失败 → 自动回滚到备份。
 """
 
@@ -127,7 +127,7 @@ def _cfg() -> dict:
     }
 
 
-# ─── 状态机持久化（state.db 单行）───────────────────────────────
+# ─── 状态机持久化（StateStore durable domain）────────────────────
 
 # 状态机阶段：
 #   idle          空闲
@@ -151,72 +151,18 @@ STAGE_ROLLED_BACK = "rolled_back"
 
 
 def _ensure_schema() -> None:
-    sql = """
-    CREATE TABLE IF NOT EXISTS app_self_update (
-      id              INTEGER PRIMARY KEY CHECK (id=1),
-      stage           TEXT,
-      mode            TEXT,
-      from_version    TEXT,
-      to_version      TEXT,
-      target_tag      TEXT,
-      backup_ref      TEXT,
-      message         TEXT,
-      chat_id         INTEGER,
-      notify_msg_id   INTEGER,
-      updated_at      INTEGER
-    );
-    """
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.executescript(sql)
-        conn.commit()
+    """Compatibility no-op; StateStore owns its versioned schema."""
 
 
 def load_state() -> dict:
     try:
-        _ensure_schema()
+        return state_db.updater_load()
     except Exception:
         return {"stage": STAGE_IDLE}
-    conn = state_db._get_conn()
-    row = conn.execute(
-        "SELECT stage, mode, from_version, to_version, target_tag, backup_ref, "
-        "message, chat_id, notify_msg_id, updated_at FROM app_self_update WHERE id=1"
-    ).fetchone()
-    if not row:
-        return {"stage": STAGE_IDLE}
-    return {
-        "stage": row[0] or STAGE_IDLE,
-        "mode": row[1],
-        "from_version": row[2],
-        "to_version": row[3],
-        "target_tag": row[4],
-        "backup_ref": row[5],
-        "message": row[6],
-        "chat_id": row[7],
-        "notify_msg_id": row[8],
-        "updated_at": row[9],
-    }
 
 
 def save_state(**fields) -> None:
-    _ensure_schema()
-    cur = load_state()
-    cur.update(fields)
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.execute(
-            "INSERT OR REPLACE INTO app_self_update("
-            "id, stage, mode, from_version, to_version, target_tag, backup_ref, "
-            "message, chat_id, notify_msg_id, updated_at) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                cur.get("stage"), cur.get("mode"), cur.get("from_version"),
-                cur.get("to_version"), cur.get("target_tag"), cur.get("backup_ref"),
-                cur.get("message"), cur.get("chat_id"), cur.get("notify_msg_id"),
-                int(time.time()),
-            ),
-        )
-        conn.commit()
+    state_db.updater_save(fields)
 
 
 def reset_state() -> None:
@@ -292,7 +238,7 @@ def _run(cmd: list[str], *, cwd: Optional[str] = None, timeout: int = 300) -> tu
 
 def _health_url() -> str:
     cfg = config.get()
-    port = (cfg.get("listen") or {}).get("port", 18082)
+    port = (cfg.get("listen") or {}).get("port", 22122)
     return f"http://127.0.0.1:{port}/health"
 
 
@@ -408,7 +354,7 @@ def _src_restart() -> tuple[bool, str]:
         # detached：systemctl restart 会 SIGTERM 当前进程，但命令本身由 systemd 执行，
         # 即使当前进程被杀，重启动作照常完成。用 Popen 不等待。
         try:
-            # 延迟一拍再触发，确保 state.db 事务提交 + 当前 TG 响应发出
+            # 延迟一拍再触发，确保 StateStore snapshots 事务提交 + 当前 TG 响应发出
             def _delayed_systemctl():
                 time.sleep(1.5)
                 subprocess.Popen(
@@ -658,7 +604,7 @@ def _compose_up_inner(backup_digest: str = "", health_port: int = 0) -> str:
 
     docker 自更新的两个固有难题，都在 sidecar 侧解决：
     1) 名字冲突：发起更新时旧容器仍在跑，compose up 会撞名 → 先发送 SIGTERM，
-       等待 Parrot 排空请求并完成数据库收尾，再移除已停止的旧容器。
+       等待 Parrot 排空请求并完成 StateStore 快照收尾，再移除已停止的旧容器。
     2) 新容器崩溃谁来回滚：新版若起不来，容器内的 resume 跑不了 → 由 sidecar 承担
        健康检查；失败则把 image tag 指回备份 digest 并重建旧版，写回滚标记到 data。
 
@@ -1049,20 +995,10 @@ def stage_update(target_tag: str, *, chat_id: Optional[int] = None,
         _op_lock.release()
 
 
-def _state_db_restart_backup_path(st: dict) -> str:
-    """Return a traversal-safe backup path tied to the staged release backup."""
-    raw_ref = str(st.get("backup_ref") or "").strip()
-    safe_ref = "".join(ch for ch in raw_ref if ch.isalnum() or ch in "._-")[:160]
-    if not safe_ref:
-        safe_ref = f"update-{time.strftime('%Y%m%d-%H%M%S')}"
-    return os.path.join(_backup_root(), safe_ref + ".state.db")
-
-
-def _prepare_state_db_restart(st: dict) -> str:
-    """Create and verify a consistent state.db Online Backup before restart."""
-    destination = _state_db_restart_backup_path(st)
-    state_db.online_backup(destination, verify=True)
-    return destination
+def _prepare_state_restart(st: dict) -> str:
+    """Synchronously install and verify all pending StateStore snapshots."""
+    state_db.flush(strict=True)
+    return "verified StateStore snapshots"
 
 
 def _restart_guard_failed(detail: str) -> tuple[bool, str]:
@@ -1075,7 +1011,7 @@ def _restart_guard_failed(detail: str) -> tuple[bool, str]:
         append_update_log(f"⚠️ staged 状态回写失败：{state_exc}")
     _emit(
         STAGE_STAGED,
-        "❌ state.db 在线备份或完整性验证失败，已阻止重启。\n"
+        "❌ 状态快照写入或完整性验证失败，已阻止重启。\n"
         f"详情：{detail}",
     )
     return False, public_detail
@@ -1094,22 +1030,20 @@ def confirm_restart() -> tuple[bool, str]:
             return False, f"当前不在 staged 态（{st.get('stage')}），无法确认重启"
         mode = st.get("mode") or _detect_mode()
 
-        # Fail closed：SQLite Online Backup → backup integrity_check。state.db
-        # 使用 rollback journal，不再执行任何 WAL checkpoint。
+        # Fail closed: both snapshots must be installed and read-back verified.
         try:
-            db_backup = _prepare_state_db_restart(st)
+            snapshot_status = _prepare_state_restart(st)
         except Exception as exc:
             return _restart_guard_failed(str(exc))
-        append_update_log(f"✅ state.db 重启保护完成：backup={db_backup}")
+        append_update_log(f"✅ 状态快照重启保护完成：{snapshot_status}")
 
-        # 备份保留 staged 状态，便于恢复；rollback journal + synchronous=FULL
-        # 保证随后 restarting 事务提交后可由新进程读取。
+        # Durable StateStore guarantees the restarting state is verified before return.
         try:
             save_state(stage=STAGE_RESTARTING, message="用户已确认，正在重启生效")
         except Exception as exc:
             return _restart_guard_failed(f"persist restarting state: {exc}")
 
-        _emit(STAGE_RESTARTING, "🔄 数据库保护完成，正在重启生效 …")
+        _emit(STAGE_RESTARTING, "🔄 状态快照保护完成，正在重启生效 …")
         if mode == MODE_DOCKER:
             # 取备份 digest 传给 sidecar，供健康检查失败时自动回滚
             backup_digest = ""

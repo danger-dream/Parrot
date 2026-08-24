@@ -1,6 +1,6 @@
 """渠道注册表：从 config 构造所有 Channel 实例，并在 config 热加载时重建。
 
-同时负责 state.db 的级联清理（删除孤儿渠道的历史数据）。
+同时负责 StateStore snapshots 的级联清理（删除孤儿渠道的历史数据）。
 """
 
 from __future__ import annotations
@@ -10,7 +10,10 @@ import threading
 import uuid
 from typing import Optional
 
-from .. import affinity, channel_state, config, cooldown, load_balancing, scorer, state_db
+from .. import (
+    affinity, channel_state, config, cooldown, load_balancing, model_mapping,
+    scorer, state_db,
+)
 from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
 from .base import Channel
@@ -102,7 +105,7 @@ def _rebuild_from_config_locked() -> None:
 
 
 def _sync_state_db_with_channels() -> None:
-    """清理 state.db 和内存镜像中不再存在的 channel_key。"""
+    """清理 StateStore snapshots 和内存镜像中不再存在的 channel_key。"""
     with channel_state.mutation_lock:
         with _lock:
             live_keys = channel_state.include_transitions(set(_channels.keys()))
@@ -125,7 +128,7 @@ def _sync_state_db_with_channels() -> None:
             if row["channel_key"] not in live_keys
         }
         for channel_key in stale_errors:
-            # cooldown 的内存态与 state.db 必须通过同一个提交点删除。
+            # cooldown 的内存态与 StateStore snapshots 必须通过同一个提交点删除。
             # resolve_alias=False 清理的就是被判定为 stale 的旧 generation。
             cooldown.clear(
                 channel_key, notify_recovered=False, resolve_alias=False,
@@ -240,6 +243,20 @@ def install_config_reload_hook() -> None:
 
 # ─── 添加 / 更新 / 删除 API 渠道 ─────────────────────────────────
 
+def _client_model_aliases(models) -> set[str]:
+    """从 API 渠道 models 配置提取客户端可见 alias。"""
+    aliases: set[str] = set()
+    for item in models or []:
+        if isinstance(item, dict):
+            value = item.get("alias") or item.get("real")
+        else:
+            # 兼容极老的字符串模型项；ApiChannel 正常配置使用 dict。
+            value = item
+        if isinstance(value, str) and value.strip():
+            aliases.add(value.strip())
+    return aliases
+
+
 def add_api_channel(entry: dict) -> dict:
     with config.serialized_updates():
         return _add_api_channel_serialized(entry)
@@ -342,7 +359,7 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
     """
     编辑渠道。patch 可含 name/baseUrl/apiKey/models/cc_mimicry/enabled/apiPath/protocol，
     以及 omitTemperature/omitThinking/context1m*/fast* 兼容策略字段。
-    改名时自动在 state.db / scorer / affinity 上级联。
+    改名时自动在 StateStore snapshots / scorer / affinity 上级联。
     返回更新后的 entry；若渠道不存在返回 None。
 
     baseUrl / apiPath / protocol 联动规则：
@@ -444,7 +461,12 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
             else:
                 target.pop("providerPresetId", None)
         if "models" in patch:
+            old_aliases = _client_model_aliases(target.get("models"))
             target["models"] = list(patch["models"] or [])
+            removed_aliases = old_aliases - _client_model_aliases(target["models"])
+            # 渠道模型编辑与 modelMapping 清理必须同一次落盘：用户删掉或
+            # 改名的客户端 alias 不能继续被独立映射配置重新暴露。
+            model_mapping.remove_aliases_from_config(cfg, removed_aliases)
         if "cc_mimicry" in patch:
             target["cc_mimicry"] = bool(patch["cc_mimicry"])
         if "omitTemperature" in patch:
@@ -544,7 +566,11 @@ def _delete_api_channel_serialized(name: str) -> bool:
         channels = cfg.get("channels", [])
         for i, c in enumerate(channels):
             if c.get("name") == name:
+                removed_aliases = _client_model_aliases(c.get("models"))
                 channels.pop(i)
+                # 删除整条渠道也等价于删除其中的客户端 alias；同步清掉所有
+                # modelMapping 同名 key，防止以后目标模型重新出现时旧名复活。
+                model_mapping.remove_aliases_from_config(cfg, removed_aliases)
                 found["ok"] = True
                 load_balancing.mutate_channels_removed(cfg, {key})
                 return

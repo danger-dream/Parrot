@@ -221,11 +221,8 @@ class TestIsBusy:
         # 模拟一个很久以前进入 restarting 的卡死状态
         updater.save_state(stage=updater.STAGE_RESTARTING)
         # 手动把 updated_at 改老（超过自愈阈值）
-        conn = state_db._get_conn()
         old_ts = int(time.time()) - (updater._STALE_INTERMEDIATE_SECONDS + 100)
-        with state_db._write_lock:
-            conn.execute("UPDATE app_self_update SET updated_at=? WHERE id=1", (old_ts,))
-            conn.commit()
+        state_db.updater_save({"updated_at": old_ts})
         # is_busy 触发自愈 → 复位为 failed → 不再 busy
         assert updater.is_busy() is False
         assert updater.load_state()["stage"] == updater.STAGE_FAILED
@@ -233,11 +230,8 @@ class TestIsBusy:
     def test_staged_does_not_self_heal(self):
         # staged 等用户确认，可以等很久，不应超时自愈
         updater.save_state(stage=updater.STAGE_STAGED)
-        conn = state_db._get_conn()
         old_ts = int(time.time()) - (updater._STALE_INTERMEDIATE_SECONDS + 100)
-        with state_db._write_lock:
-            conn.execute("UPDATE app_self_update SET updated_at=? WHERE id=1", (old_ts,))
-            conn.commit()
+        state_db.updater_save({"updated_at": old_ts})
         assert updater.is_busy() is True
         assert updater.load_state()["stage"] == updater.STAGE_STAGED
 
@@ -594,48 +588,25 @@ class TestRestartDatabaseGuard:
             target_tag="v0.30.1",
         )
 
-    def test_success_creates_verified_online_backup_before_restart(self, monkeypatch):
+    def test_success_flushes_verified_snapshots_before_restart(self, monkeypatch):
         self._stage_bare_update()
-        state_db.schema_meta_set("restart_guard_probe", "preserved")
         restart_calls = []
+        flush_calls = []
+        real_flush = state_db.flush
+        monkeypatch.setattr(state_db, "flush", lambda **kw: flush_calls.append(kw) or real_flush(**kw))
         monkeypatch.setattr(
-            updater,
-            "_src_restart",
+            updater, "_src_restart",
             lambda: restart_calls.append("restart") or (True, "scheduled"),
         )
-
         ok, detail = updater.confirm_restart()
-
         assert ok is True, detail
+        assert flush_calls == [{"strict": True}]
         assert restart_calls == ["restart"]
         assert updater.load_state()["stage"] == updater.STAGE_RESTARTING
-        backup_path = updater._state_db_restart_backup_path({"backup_ref": "src-test-guard"})
-        assert _os.path.isfile(backup_path)
-        conn = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
-        try:
-            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-            row = conn.execute(
-                "SELECT value FROM schema_meta WHERE key='restart_guard_probe'"
-            ).fetchone()
-            assert row == ("preserved",)
-            # Recovery snapshot deliberately remains staged; only the live DB is
-            # advanced to restarting after backup verification succeeds.
-            stage = conn.execute(
-                "SELECT stage FROM app_self_update WHERE id=1"
-            ).fetchone()
-            assert stage == (updater.STAGE_STAGED,)
-        finally:
-            conn.close()
 
     def test_confirm_restart_does_not_run_wal_checkpoint(self, monkeypatch):
         self._stage_bare_update("src-no-checkpoint")
-        checkpoint_calls = []
         restart_calls = []
-        monkeypatch.setattr(
-            state_db,
-            "checkpoint",
-            lambda **kwargs: checkpoint_calls.append(kwargs) or (0, 0, 0),
-        )
         monkeypatch.setattr(
             updater,
             "_src_restart",
@@ -645,7 +616,6 @@ class TestRestartDatabaseGuard:
         ok, detail = updater.confirm_restart()
 
         assert ok is True, detail
-        assert checkpoint_calls == []
         assert restart_calls == ["restart"]
         assert updater.load_state()["stage"] == updater.STAGE_RESTARTING
 
@@ -654,9 +624,9 @@ class TestRestartDatabaseGuard:
         restart_calls = []
         monkeypatch.setattr(
             state_db,
-            "online_backup",
+            "flush",
             lambda *args, **kwargs: (_ for _ in ()).throw(
-                RuntimeError("integrity_check failed")
+                RuntimeError("snapshot verification failed")
             ),
         )
         monkeypatch.setattr(
@@ -668,6 +638,6 @@ class TestRestartDatabaseGuard:
         ok, detail = updater.confirm_restart()
 
         assert ok is False
-        assert "integrity_check failed" in detail
+        assert "snapshot verification failed" in detail
         assert restart_calls == []
         assert updater.load_state()["stage"] == updater.STAGE_STAGED

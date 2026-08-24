@@ -4,7 +4,7 @@ Runs lightweight connectivity checks for DNS, SOCKS5, configured API channels,
 and core upstreams. Notifications are edge-triggered:
 - ok/unknown -> failed: send one failure notification
 - failed -> ok: send one recovery notification
-Persistent status is stored in state.db so menus can show banners and details.
+Persistent status is stored in StateStore snapshots so menus can show banners and details.
 """
 
 from __future__ import annotations
@@ -462,7 +462,7 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
         round_generation = None
 
     if not c.get("enabled", True):
-        # 总开关关了：清掉 state.db 里所有遗留状态，避免主菜单 banner 永久红
+        # 总开关关了：清掉 StateStore snapshots 里所有遗留状态，避免主菜单 banner 永久红
         if save:
             with _monitor_lifecycle_lock:
                 if (
@@ -479,7 +479,7 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
         return []
     timeout = float(c.get("timeoutSeconds", 5) or 5)
     out: list[CheckResult] = []
-    # 本轮预期会被检测的 key 集合：跑完后用它清理 state.db 里不再被检测的残留
+    # 本轮预期会被检测的 key 集合：跑完后用它清理 StateStore snapshots 里不再被检测的残留
     # （删账户/删渠道/关开关后，对应 key 不再进 run_once，需主动清旧 ok=false 记录）
     expected_keys: set[str] = set()
 
@@ -532,7 +532,7 @@ async def run_once(*, save: bool = True) -> list[CheckResult]:
                 return out
             for res in out:
                 _save_result(res)
-            # 清掉 state.db 里所有不在本轮 expected_keys 中的残留
+            # 清掉 StateStore snapshots 里所有不在本轮 expected_keys 中的残留
             # 覆盖场景：删 OAuth 账户、删 API 渠道、关单项检测、关总开关
             try:
                 state_db.network_check_delete_stale(expected_keys)

@@ -5,7 +5,7 @@
 实现要点：
 - 三家都用 Atlassian Statuspage，`/api/v2/incidents.json` 接口字段一致；
   无官方 webhook，所以走 polling。
-- 用 state.db 一张 `status_seen_updates` 表按 `incident_update_id` 去重。
+- 用 StateStore snapshots 一张 `status_seen_updates` 表按 `incident_update_id` 去重。
 - 启动时**不补推历史**：把当前所有现存 update 直接标记为 seen，避免重启时刷屏。
   但仍把"当前 unresolved incident"记录在内存，恢复时给老大补一条恢复通知。
 - 推送复用 notifier.notify_event("status_alert", ...) 走现有总开关 + 事件开关 + TG 通道。
@@ -116,47 +116,20 @@ def _cfg() -> dict:
     }
 
 
-# ─── state.db schema ──────────────────────────────────────────────
+# ─── StateStore durable state ─────────────────────────────────────
 
 
 def _ensure_schema() -> None:
-    """幂等创建 status_seen_updates + status_muted_incidents。"""
-    sql = """
-    CREATE TABLE IF NOT EXISTS status_seen_updates (
-      provider       TEXT NOT NULL,
-      update_id      TEXT NOT NULL,
-      incident_id    TEXT NOT NULL,
-      status         TEXT,
-      seen_at        INTEGER NOT NULL,
-      PRIMARY KEY (provider, update_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS status_muted_incidents (
-      provider       TEXT NOT NULL,
-      incident_id    TEXT NOT NULL,
-      name           TEXT,
-      muted_at       INTEGER NOT NULL,
-      PRIMARY KEY (provider, incident_id)
-    );
-    """
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.executescript(sql)
-        conn.commit()
+    """Compatibility no-op; StateStore owns its versioned schema."""
 
 
 def _load_seen(provider: str) -> set[str]:
-    conn = state_db._get_conn()
-    rows = conn.execute(
-        "SELECT update_id FROM status_seen_updates WHERE provider=?",
-        (provider,),
-    ).fetchall()
-    return {row[0] for row in rows}
+    return state_db.status_seen_load(provider)
 
 
 # ─── Mute（屏蔽某条 incident）─────────────────────────────────────
 #
-# 内存缓存 + state.db 双写。粒度 (provider, incident_id)；被 mute 的 incident
+# 内存缓存 + StateStore snapshots 双写。粒度 (provider, incident_id)；被 mute 的 incident
 # 不进 banner、不推任何 update、不推 resolved。statuspage 历史滚出后由
 # cleanup_stale_mutes 自动清掉，避免堆积。
 
@@ -169,14 +142,11 @@ def _load_muted_into_memory() -> None:
     global _mute_loaded
     if _mute_loaded:
         return
-    conn = state_db._get_conn()
-    rows = conn.execute(
-        "SELECT provider, incident_id FROM status_muted_incidents"
-    ).fetchall()
+    rows = state_db.status_muted_load_all()
     with _mute_lock:
         _muted.clear()
-        for r in rows:
-            _muted.setdefault(r[0], set()).add(r[1])
+        for row in rows:
+            _muted.setdefault(row["provider"], set()).add(row["incident_id"])
     _mute_loaded = True
 
 
@@ -190,14 +160,7 @@ def mute_incident(provider: str, incident_id: str, name: str = "") -> None:
     _load_muted_into_memory()
     with _mute_lock:
         _muted.setdefault(provider, set()).add(incident_id)
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.execute(
-            "INSERT OR REPLACE INTO status_muted_incidents(provider, incident_id, name, muted_at) "
-            "VALUES (?, ?, ?, ?)",
-            (provider, incident_id, name or "", int(time.time())),
-        )
-        conn.commit()
+    state_db.status_muted_save(provider, incident_id, name)
     # 立即从活跃表里抽走，避免 banner / 当前活跃区还显示
     with _active_lock:
         _active.get(provider, {}).pop(incident_id, None)
@@ -209,27 +172,13 @@ def unmute_incident(provider: str, incident_id: str) -> None:
         bucket = _muted.get(provider)
         if bucket:
             bucket.discard(incident_id)
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.execute(
-            "DELETE FROM status_muted_incidents WHERE provider=? AND incident_id=?",
-            (provider, incident_id),
-        )
-        conn.commit()
+    state_db.status_muted_delete(provider, incident_id)
 
 
 def list_muted() -> list[dict]:
     """返回所有当前被屏蔽的 incident 记录（含 name / muted_at）。"""
     _load_muted_into_memory()
-    conn = state_db._get_conn()
-    rows = conn.execute(
-        "SELECT provider, incident_id, name, muted_at "
-        "FROM status_muted_incidents ORDER BY muted_at DESC"
-    ).fetchall()
-    return [
-        {"provider": r[0], "incident_id": r[1], "name": r[2], "muted_at": r[3]}
-        for r in rows
-    ]
+    return state_db.status_muted_load_all()
 
 
 def _cleanup_stale_mutes(live_ids_by_provider: dict[str, set[str]]) -> int:
@@ -237,41 +186,18 @@ def _cleanup_stale_mutes(live_ids_by_provider: dict[str, set[str]]) -> int:
 
     live_ids_by_provider: 各 provider 当前 incidents.json 返回的 incident_id 集合。
     """
-    conn = state_db._get_conn()
-    removed = 0
-    with state_db._write_lock:
-        for provider, live_ids in live_ids_by_provider.items():
-            rows = conn.execute(
-                "SELECT incident_id FROM status_muted_incidents WHERE provider=?",
-                (provider,),
-            ).fetchall()
-            stale = [r[0] for r in rows if r[0] not in live_ids]
-            if not stale:
-                continue
-            conn.executemany(
-                "DELETE FROM status_muted_incidents WHERE provider=? AND incident_id=?",
-                [(provider, iid) for iid in stale],
-            )
-            removed += len(stale)
-            with _mute_lock:
+    removed = state_db.status_muted_cleanup(live_ids_by_provider)
+    if removed:
+        with _mute_lock:
+            for provider, live_ids in live_ids_by_provider.items():
                 bucket = _muted.get(provider)
                 if bucket:
-                    for iid in stale:
-                        bucket.discard(iid)
-        if removed:
-            conn.commit()
+                    bucket.intersection_update(live_ids)
     return removed
 
 
 def _mark_seen(provider: str, update_id: str, incident_id: str, status: Optional[str]) -> None:
-    conn = state_db._get_conn()
-    with state_db._write_lock:
-        conn.execute(
-            "INSERT OR IGNORE INTO status_seen_updates(provider, update_id, incident_id, status, seen_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (provider, update_id, incident_id, status, int(time.time())),
-        )
-        conn.commit()
+    state_db.status_seen_mark(provider, update_id, incident_id, status)
 
 
 # ─── 内存快照（供 banner / 菜单查询）─────────────────────────────

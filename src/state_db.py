@@ -1,2078 +1,474 @@
-"""state.db —— 运行时状态持久化。
+"""Compatibility-named public facade for the unified :class:`StateStore`.
 
-保存渠道性能/冷却、会话亲和、OAuth 配额、网络检查，以及 xAI 异步视频
-任务的短期账号绑定。全表写操作由单一 `_write_lock` 序列化；连接采用
-thread-local。该小型运行状态库使用 rollback journal，避免旧 SQLite 的
-WAL-reset 数据竞争损坏；高吞吐日志与 Response Store 仍使用各自独立数据库。
+There is no database connection, SQL, or file path exposed here.  The module
+keeps the established domain API while all state ownership and persistence live
+in one StateStore instance.
 """
-
-import fcntl
+from __future__ import annotations
 import json
 import os
-import shutil
-import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Iterable
 
 from . import config
+from .state_store import StateStore, validate_distinct_paths
 
-_local = threading.local()
-# 可重入：_get_conn 在创建新连接时自身也要持锁做 CREATE TABLE，
-# 而上层写函数往往先取锁再调 _get_conn；非重入锁会死锁。
-_write_lock = threading.RLock()
-_initialized = False
-_db_path: str | None = None
-_journal_mode_ready = False
+_store: StateStore | None = None
+_init_lock = threading.Lock()
+_migration_report: dict[str, Any] | None = None
 
-_SQLITE_MAGIC = b"SQLite format 3\x00"
-_corruption_event = threading.Event()
-_corruption_lock = threading.Lock()
-_corruption_reason = ""
-_recovery_restart_requested = False
-_bootstrap_recovery_report: dict[str, Any] | None = None
-
-
-def _record_corruption_reason(reason: str) -> None:
-    global _corruption_reason
-    with _corruption_lock:
-        if not _corruption_event.is_set():
-            _corruption_reason = str(reason or "state database corruption")
-            print(f"[state_db] corruption detected: {_corruption_reason}")
-        _corruption_event.set()
-
-
-def _mark_database_error(exc: BaseException) -> None:
-    """Record only SQLite corruption/not-a-database failures for the watchdog."""
-    code = getattr(exc, "sqlite_errorcode", None)
-    base_code = (int(code) & 0xFF) if isinstance(code, int) else None
-    message = str(exc).strip()
-    lowered = message.lower()
-    if base_code not in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB} and not any(
-        marker in lowered
-        for marker in ("file is not a database", "database disk image is malformed")
-    ):
-        return
-    _record_corruption_reason(message or type(exc).__name__)
-
-
-class _StateConnection(sqlite3.Connection):
-    """Connection that reports corruption from normal state reads and writes."""
-
-    def execute(self, *args, **kwargs):
-        try:
-            return super().execute(*args, **kwargs)
-        except sqlite3.DatabaseError as exc:
-            _mark_database_error(exc)
-            raise
-
-    def executemany(self, *args, **kwargs):
-        try:
-            return super().executemany(*args, **kwargs)
-        except sqlite3.DatabaseError as exc:
-            _mark_database_error(exc)
-            raise
-
-    def executescript(self, *args, **kwargs):
-        try:
-            return super().executescript(*args, **kwargs)
-        except sqlite3.DatabaseError as exc:
-            _mark_database_error(exc)
-            raise
-
-    def commit(self):
-        try:
-            return super().commit()
-        except sqlite3.DatabaseError as exc:
-            _mark_database_error(exc)
-            raise
-
-
-def _resolve_db_path() -> str:
+def _paths() -> tuple[str, str, str]:
     cfg = config.get()
-    rel = cfg.get("stateDbPath", "state.db")
-    if os.path.isabs(rel):
-        return rel
-    # Relative paths anchor to DATA_DIR (container: /app/data; source install: BASE_DIR).
-    return os.path.join(config.DATA_DIR, rel)
+    old = str(cfg.get("stateDbPath") or "state.db")
+    legacy = old if os.path.isabs(old) else os.path.join(config.DATA_DIR, old)
+    def resolve(name: str, default: str) -> str:
+        value = str(cfg.get(name) or default)
+        return value if os.path.isabs(value) else os.path.join(config.DATA_DIR, value)
+    return resolve("runtimeStatePath", "runtime-cache.json"), resolve("durableStatePath", "durable-state.json"), legacy
+
+def get_store() -> StateStore:
+    if _store is None: raise RuntimeError("state store not started")
+    return _store
+
+def _manifest_path(runtime: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(runtime)), "state-migration.json")
 
 
-def _schema_sql() -> str:
-    return """
-    CREATE TABLE IF NOT EXISTS performance_stats (
-      channel_key          TEXT NOT NULL,
-      model                TEXT NOT NULL,
-      total_requests       INTEGER DEFAULT 0,
-      success_count        INTEGER DEFAULT 0,
-      recent_requests      INTEGER DEFAULT 0,
-      recent_success_count INTEGER DEFAULT 0,
-      avg_connect_ms       REAL DEFAULT 0,
-      avg_first_byte_ms    REAL DEFAULT 0,
-      avg_total_ms         REAL DEFAULT 0,
-      last_updated         INTEGER NOT NULL,
-      PRIMARY KEY (channel_key, model)
-    );
-    CREATE INDEX IF NOT EXISTS idx_perf_updated ON performance_stats(last_updated);
-
-    CREATE TABLE IF NOT EXISTS channel_errors (
-      channel_key        TEXT NOT NULL,
-      model              TEXT NOT NULL,
-      error_count        INTEGER DEFAULT 0,
-      cooldown_until     INTEGER,
-      last_error_message TEXT,
-      last_error_at      INTEGER,
-      PRIMARY KEY (channel_key, model)
-    );
-    CREATE INDEX IF NOT EXISTS idx_cooldown ON channel_errors(cooldown_until);
-
-    CREATE TABLE IF NOT EXISTS cache_affinities (
-      fingerprint       TEXT PRIMARY KEY,
-      channel_key       TEXT NOT NULL,
-      model             TEXT NOT NULL,
-      last_used         INTEGER NOT NULL,
-      created_at        INTEGER NOT NULL,
-      prompt_cache_key  TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_affinity_used ON cache_affinities(last_used);
-    CREATE INDEX IF NOT EXISTS idx_affinity_channel ON cache_affinities(channel_key);
-
-    CREATE TABLE IF NOT EXISTS client_affinities (
-      client_key   TEXT PRIMARY KEY,
-      channel_key  TEXT NOT NULL,
-      model        TEXT NOT NULL,
-      last_used    INTEGER NOT NULL,
-      created_at   INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_client_aff_used ON client_affinities(last_used);
-    CREATE INDEX IF NOT EXISTS idx_client_aff_channel ON client_affinities(channel_key);
-
-    CREATE TABLE IF NOT EXISTS schema_meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS oauth_quota_cache (
-      account_key      TEXT PRIMARY KEY,
-      email            TEXT NOT NULL,
-      fetched_at       INTEGER NOT NULL,
-      last_passive_update_at INTEGER,
-      five_hour_util   REAL,
-      five_hour_reset  TEXT,
-      seven_day_util   REAL,
-      seven_day_reset  TEXT,
-      sonnet_util      REAL,
-      sonnet_reset     TEXT,
-      opus_util        REAL,
-      opus_reset       TEXT,
-      extra_used       REAL,
-      extra_limit      REAL,
-      extra_util       REAL,
-      raw_data         TEXT,
-      codex_window_observations TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS api_provider_usage_cache (
-      account_id       TEXT PRIMARY KEY,
-      adapter_id       TEXT NOT NULL,
-      snapshot_json    TEXT,
-      fetched_at       INTEGER,
-      last_error       TEXT,
-      error_at         INTEGER,
-      retry_after      INTEGER
-    );
-
-    CREATE TABLE IF NOT EXISTS network_check_status (
-      key          TEXT PRIMARY KEY,
-      label        TEXT NOT NULL,
-      category     TEXT NOT NULL,
-      ok           INTEGER NOT NULL,
-      detail       TEXT,
-      latency_ms   INTEGER,
-      checked_at   INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_network_check_category ON network_check_status(category);
-    CREATE INDEX IF NOT EXISTS idx_network_check_ok ON network_check_status(ok);
-
-    CREATE TABLE IF NOT EXISTS xai_video_jobs (
-      request_id   TEXT PRIMARY KEY,
-      channel_key  TEXT NOT NULL,
-      api_key_name TEXT NOT NULL,
-      model        TEXT NOT NULL,
-      created_at   INTEGER NOT NULL,
-      expires_at   INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_expires ON xai_video_jobs(expires_at);
-    CREATE INDEX IF NOT EXISTS idx_xai_video_jobs_channel ON xai_video_jobs(channel_key);
-
-    CREATE TABLE IF NOT EXISTS codex_compaction_owners (
-      compaction_id  TEXT NOT NULL,
-      content_digest TEXT NOT NULL,
-      owner_key      TEXT NOT NULL,
-      owner_identity TEXT NOT NULL,
-      created_at     INTEGER NOT NULL,
-      last_used      INTEGER NOT NULL,
-      PRIMARY KEY (compaction_id, content_digest)
-    );
-    CREATE INDEX IF NOT EXISTS idx_compaction_owner_identity
-      ON codex_compaction_owners(owner_identity);
-    """
-
-
-def _readonly_uri(path: str) -> str:
-    return Path(os.path.abspath(path)).as_uri() + "?mode=ro"
-
-
-def _validate_sqlite_file(
-    path: str, *, unavailable_is_invalid: bool = False
-) -> tuple[bool, str]:
-    """Validate one closed SQLite file without creating or modifying it.
-
-    A busy/permission/I/O failure is not proof of corruption.  Live database
-    validation therefore raises instead of quarantining a possibly healthy
-    file; backup discovery may opt into treating unavailable candidates as
-    unusable and continue to an older snapshot.
-    """
-    if not os.path.exists(path):
-        return False, "database file is missing"
-    if not os.path.isfile(path):
-        return False, "database path is not a regular file"
+def _read_manifest(path: str) -> dict[str, Any] | None:
     try:
-        if os.path.getsize(path) == 0:
-            return False, "database file is empty"
-        # Closed-file only. A raw open()/close() on a live database drops
-        # POSIX advisory locks for every connection in this process
-        # (https://sqlite.org/howtocorrupt.html#unlockandclose).  Rejecting
-        # a garbage header here also avoids letting SQLite rewrite -wal/-shm
-        # evidence before quarantine.
-        with open(path, "rb") as f:
-            header = f.read(len(_SQLITE_MAGIC))
-        if header != _SQLITE_MAGIC:
-            return False, f"invalid SQLite header: {header[:8].hex()}"
-        conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=10)
-        try:
-            rows = conn.execute("PRAGMA quick_check(1)").fetchall()
-        finally:
-            conn.close()
-        checks = [str(row[0]) for row in rows]
-        if checks != ["ok"]:
-            return False, "; ".join(checks[:5]) or "quick_check returned no result"
-        return True, "ok"
-    except (OSError, sqlite3.DatabaseError) as exc:
-        code = getattr(exc, "sqlite_errorcode", None)
-        base_code = (int(code) & 0xFF) if isinstance(code, int) else None
-        lowered = str(exc).lower()
-        if base_code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB} or any(
-            marker in lowered
-            for marker in ("file is not a database", "database disk image is malformed")
-        ):
-            return False, str(exc) or type(exc).__name__
-        if unavailable_is_invalid:
-            return False, str(exc) or type(exc).__name__
-        raise RuntimeError(f"state database validation unavailable: {exc}") from exc
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) and value.get("version") == 2 else None
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        print(f"[state_store] migration manifest ignored ({path}): {exc}")
+        return None
 
 
-def _state_backup_candidates(source_path: str) -> list[str]:
-    root = os.path.join(config.DATA_DIR, "backups")
-    if not os.path.isdir(root):
-        return []
-    source_abs = os.path.abspath(source_path)
-    candidates: set[str] = set()
-    for pattern in ("*.state.db", "state-db-pre-*.db"):
-        for path in Path(root).glob(pattern):
-            candidate = os.path.abspath(str(path))
-            if candidate != source_abs and os.path.isfile(candidate):
-                candidates.add(candidate)
-    return sorted(candidates, key=lambda path: os.path.getmtime(path), reverse=True)
-
-
-def _fsync_file_and_parent(path: str) -> None:
-    fd = os.open(path, os.O_RDONLY)
+def _write_manifest(path: str, value: dict[str, Any]) -> None:
+    directory = os.path.dirname(path) or "."
+    temp = path + f".{os.getpid()}.{threading.get_ident()}.tmp"
+    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":")) + "\n").encode()
     try:
-        os.fsync(fd)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded); handle.flush(); os.fsync(handle.fileno())
+        with open(temp, "r", encoding="utf-8") as handle:
+            if json.load(handle) != value: raise RuntimeError("manifest verification mismatch")
+        os.replace(temp, path); os.chmod(path, 0o600)
+        dfd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
     finally:
-        os.close(fd)
-    try:
-        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+        try: os.unlink(temp)
+        except FileNotFoundError: pass
 
 
-def _ensure_rollback_journal(path: str) -> None:
-    """Convert a closed state database off WAL before worker connections open."""
-    conn = sqlite3.connect(path, timeout=10)
-    try:
-        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-        mode = str(row[0] if row is not None else "").strip().lower()
-        if mode != "delete":
-            raise RuntimeError(
-                f"state.db requires journal_mode=DELETE, got {mode or '?'}"
-            )
-    finally:
-        conn.close()
+def migration_report() -> dict[str, Any] | None:
+    return json.loads(json.dumps(_migration_report)) if _migration_report else None
 
 
-def bootstrap_recover() -> dict[str, Any] | None:
-    """Before opening state.db, preserve and recover an invalid database.
-
-    A verified update-time Online Backup is preferred.  Without one, the
-    corrupt runtime-state database is quarantined and ``init()`` creates a new
-    database; authoritative config, request logs and response stores are not
-    part of state.db.
-    """
-    global _bootstrap_recovery_report, _corruption_reason
-    path = os.path.abspath(_resolve_db_path())
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    backup_root = os.path.join(config.DATA_DIR, "backups")
-    os.makedirs(backup_root, exist_ok=True)
-    lock_path = os.path.join(backup_root, ".state-db-recovery.lock")
-    with open(lock_path, "a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        sidecars = [path + "-wal", path + "-shm"]
-        if not os.path.exists(path) and not any(os.path.exists(p) for p in sidecars):
-            _bootstrap_recovery_report = None
-            return None
-
-        valid, reason = _validate_sqlite_file(path)
-        if valid:
-            _ensure_rollback_journal(path)
-            _bootstrap_recovery_report = None
-            return None
-
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        quarantine = os.path.join(backup_root, f"state-db-corrupt-{ts}-{os.getpid()}")
-        os.makedirs(quarantine, mode=0o700, exist_ok=False)
-        preserved: list[str] = []
-        for source in (path, *sidecars):
-            if not os.path.exists(source):
-                continue
-            destination = os.path.join(quarantine, os.path.basename(source))
-            shutil.move(source, destination)
-            preserved.append(destination)
-
-        restored_from = ""
-        for candidate in _state_backup_candidates(path):
-            candidate_ok, _candidate_reason = _validate_sqlite_file(
-                candidate, unavailable_is_invalid=True
-            )
-            if not candidate_ok:
-                continue
-            tmp = f"{path}.recover-{os.getpid()}.tmp"
-            try:
-                shutil.copy2(candidate, tmp)
-                copied_ok, copied_reason = _validate_sqlite_file(tmp)
-                if not copied_ok:
-                    raise RuntimeError(f"copied backup validation failed: {copied_reason}")
-                os.chmod(tmp, 0o600)
-                _fsync_file_and_parent(tmp)
-                os.replace(tmp, path)
-                _fsync_file_and_parent(path)
-                _ensure_rollback_journal(path)
-                restored_from = candidate
-                break
-            finally:
-                for temporary in (tmp, tmp + "-wal", tmp + "-shm"):
-                    try:
-                        os.remove(temporary)
-                    except FileNotFoundError:
-                        pass
-
-        report: dict[str, Any] = {
-            "reason": reason,
-            "database": path,
-            "quarantine": quarantine,
-            "preserved": preserved,
-            "action": "restored" if restored_from else "recreated",
-            "restored_from": restored_from or None,
-            "timestamp": ts,
-        }
-        manifest = os.path.join(quarantine, "RECOVERY.json")
-        with open(manifest, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        _bootstrap_recovery_report = report
-        with _corruption_lock:
-            _corruption_reason = ""
-            _corruption_event.clear()
-        print(
-            f"[state_db] invalid database preserved at {quarantine}; "
-            f"action={report['action']} restored_from={restored_from or '-'} reason={reason}"
-        )
-        return dict(report)
-
-
-def bootstrap_recovery_report() -> dict[str, Any] | None:
-    return dict(_bootstrap_recovery_report) if _bootstrap_recovery_report else None
-
-
-def runtime_corruption_reason() -> str:
-    """Return a corruption reason already recorded by live SQLite operations.
-
-    This must never open or close the live database file. A raw
-    ``open()/close()`` on an already-open SQLite file drops POSIX advisory
-    locks for every connection in this process and can itself corrupt the
-    database (https://sqlite.org/howtocorrupt.html#unlockandclose).
-    """
-    if _corruption_event.is_set():
-        with _corruption_lock:
-            return _corruption_reason or "state database corruption"
-    return ""
-
-
-def request_recovery_restart(reason: str) -> None:
-    global _recovery_restart_requested
-    _record_corruption_reason(reason)
-    _recovery_restart_requested = True
-
-
-def recovery_restart_requested() -> bool:
-    return _recovery_restart_requested
-
-
-def _reset_recovery_state_for_tests() -> None:
-    global _corruption_reason, _recovery_restart_requested, _bootstrap_recovery_report
-    global _journal_mode_ready
-    with _corruption_lock:
-        _corruption_reason = ""
-        _corruption_event.clear()
-    _recovery_restart_requested = False
-    _bootstrap_recovery_report = None
-    _journal_mode_ready = False
+def _verified_snapshot_generations(runtime: str, durable: str) -> dict[str, int]:
+    verified: dict[str, int] = {}
+    for kind, path in (("runtime", runtime), ("durable", durable)):
+        generations = []
+        for candidate in (path, path + ".bak"):
+            try: generations.append(StateStore.read_snapshot(candidate, kind)[0])
+            except Exception: pass
+        if generations: verified[kind] = max(generations)
+    return verified
 
 
 def init() -> None:
-    """启动时调用。确保当前连接的 schema 始终升级到最新版本。"""
-    global _initialized, _db_path, _journal_mode_ready
-    resolved = _resolve_db_path()
-    if _db_path != resolved:
-        old = getattr(_local, "conn", None)
-        if old is not None:
+    global _store, _migration_report
+    with _init_lock:
+        if _store is not None and _store.health()["started"]: return
+        runtime, durable, legacy = _paths()
+        manifest_path = _manifest_path(runtime)
+        artifacts = StateStore.artifact_paths(runtime, durable, manifest_path)
+        artifacts.update({"stateDbPath": legacy, "stateDbWal": legacy + "-wal",
+                          "stateDbShm": legacy + "-shm", "stateDbJournal": legacy + "-journal"})
+        validate_distinct_paths(artifacts)
+        for path in (runtime, durable):
+            parent = os.path.dirname(os.path.abspath(path)) or "."
+            if not os.path.exists(parent): os.makedirs(parent, mode=0o700, exist_ok=True)
+            if not os.path.isdir(parent) or not os.access(parent, os.W_OK | os.X_OK):
+                raise PermissionError(
+                    f"state path parent is not writable: {parent}; mount DATA_DIR writable "
+                    "or grant the Parrot process access to the custom absolute path")
+        store = StateStore(runtime, durable, manifest_path=manifest_path)
+        store.start()
+        try:
+            from .state_migration import LegacyUnavailable, inspect_with_recovery, source_fingerprint
+            manifest = _read_manifest(manifest_path)
+            verified = _verified_snapshot_generations(runtime, durable)
             try:
-                old.close()
-            except Exception:
-                pass
-            _local.conn = None
-        _db_path = resolved
-        _journal_mode_ready = False
-    os.makedirs(os.path.dirname(_db_path) or ".", exist_ok=True)
-    conn = _get_conn()
-    with _write_lock:
-        try:
-            conn.executescript(_schema_sql())
-            _migrate_affinity_prompt_cache_key_col(conn)
-            _migrate_oauth_quota_cache_openai_cols(conn)
-            conn.commit()
+                current = source_fingerprint(legacy)
+            except LegacyUnavailable as exc:
+                if not verified: raise
+                _migration_report = {"status": "source-unavailable", "path": legacy, "error": str(exc)}
+                print(f"[state_store] legacy source unavailable; retaining verified JSON; path={legacy} error={exc}")
+                _store = store
+                return
+            recorded = (manifest or {}).get("snapshot_generations") or {}
+            snapshots_cover_manifest = bool(recorded and all(
+                kind in verified and isinstance(generation, int) and verified[kind] >= generation
+                for kind, generation in recorded.items()))
+            unchanged = bool(manifest and snapshots_cover_manifest and
+                             manifest.get("source", {}).get("revision") == current.get("revision"))
+            if unchanged:
+                _migration_report = {"status": "unchanged", "source": current,
+                                     "manifest": manifest_path}
+            else:
+                report = inspect_with_recovery(legacy, config.DATA_DIR)
+                _migration_report = report
+                status = report["status"]
+                if verified and status in {"backup", "rebuilt-empty"}:
+                    # Historical backups are initialization-only. A failed changed
+                    # source must remain pending and can never roll verified JSON back.
+                    print(f"[state_store] changed legacy source is unusable; retaining verified JSON; "
+                          f"path={legacy} reason={report.get('corrupt_reason')}")
+                elif verified and status == "missing":
+                    value = {"schema": "parrot-state-migration", "version": 2,
+                             "source": report["source"], "status": "snapshot-only-missing-source",
+                             "snapshot_generations": verified, "completed_at": int(time.time())}
+                    _write_manifest(manifest_path, value)
+                    print(f"[state_store] legacy source missing; retained verified JSON generations={verified}")
+                else:
+                    generations = store.install_migration(report["state"])
+                    value = {"schema": "parrot-state-migration", "version": 2,
+                             "source": report["source"], "status": status,
+                             "snapshot_generations": generations, "completed_at": int(time.time())}
+                    if report.get("backup"):
+                        value["backup"] = report["backup"]
+                        value["corrupt_reason"] = report.get("corrupt_reason")
+                    _write_manifest(manifest_path, value)
+                    print(f"[state_store] installed legacy revision {report['source']['revision'][:12]} "
+                          f"status={status} generations={generations}")
+            _store = store
         except BaseException:
-            _rollback_failed_write(conn)
-            raise
-    if not _initialized:
-        mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        print(
-            f"[state_db] Using {_db_path} "
-            f"(sqlite={sqlite3.sqlite_version}, journal={mode})"
-        )
-    _initialized = True
-
-
-# ================================================================
-# 幂等迁移：cache_affinities 增加 OpenAI prompt_cache_key
-# ================================================================
-
-def _migrate_affinity_prompt_cache_key_col(conn: sqlite3.Connection) -> None:
-    """老库升级：为 OpenAI 自动 prompt_cache_key 绑定补充可空列。
-
-    该列只被 OpenAI 协议使用；Anthropic/其他协议的亲和绑定保持 NULL，
-    不改变既有调度语义。
-    """
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(cache_affinities)")}
-    if "prompt_cache_key" not in cols:
-        conn.execute("ALTER TABLE cache_affinities ADD COLUMN prompt_cache_key TEXT")
-
-
-# ================================================================
-# schema_meta 读写 —— 保存线上迁移版本号 / 一次性 flag 等
-# ================================================================
-
-def schema_meta_get(key: str) -> str | None:
-    row = _get_conn().execute(
-        "SELECT value FROM schema_meta WHERE key=?", (key,),
-    ).fetchone()
-    return row["value"] if row else None
-
-
-def schema_meta_set(key: str, value: str) -> None:
-    def write(conn):
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-            (key, value),
-        )
-    _commit_write(write)
-
-
-# ================================================================
-# 幂等迁移：将 oauth 相关主键从 email 升级为 account_key = provider:email
-# 调用方：oauth_manager.bootstrap_composite_key_migration()（启动时）
-# ================================================================
-
-COMPOSITE_KEY_VERSION = "1"
-COMPOSITE_KEY_FLAG = "oauth_composite_key_version"
-
-
-def composite_key_migration_done() -> bool:
-    return schema_meta_get(COMPOSITE_KEY_FLAG) == COMPOSITE_KEY_VERSION
-
-
-def _oauth_quota_has_account_key_col(conn: sqlite3.Connection) -> bool:
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
-    return "account_key" in cols
-
-
-def run_composite_key_migration(email_to_key: dict[str, str]) -> dict:
-    """幂等执行一次主键迁移。
-
-    返回统计 dict：
-      {"migrated_quota_rows", "migrated_channel_rows", "skipped", "reason"}
-    """
-    stats = {
-        "migrated_quota_rows": 0,
-        "migrated_channel_rows": 0,
-        "skipped": False,
-        "reason": "",
-    }
-    conn = _get_conn()
-    if composite_key_migration_done():
-        stats["skipped"] = True
-        stats["reason"] = "flag already set"
-        return stats
-
-    with _write_lock:
-        # 之前迁移过但 flag 丢失：直接补标记
-        if _oauth_quota_has_account_key_col(conn):
-            schema_meta_set(COMPOSITE_KEY_FLAG, COMPOSITE_KEY_VERSION)
-            stats["skipped"] = True
-            stats["reason"] = "account_key column already exists; flag backfilled"
-            return stats
-
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-
-            # 重建 oauth_quota_cache：保留所有旧列 + 新增 account_key PK
-            old_cols = [
-                r["name"]
-                for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")
-            ]
-            conn.execute("ALTER TABLE oauth_quota_cache RENAME TO oauth_quota_cache_old")
-            other_cols = [c for c in old_cols if c != "email"]
-            new_col_defs = ["account_key TEXT PRIMARY KEY", "email TEXT NOT NULL"]
-            old_types = {
-                r["name"]: r["type"]
-                for r in conn.execute("PRAGMA table_info(oauth_quota_cache_old)")
-            }
-            for c in other_cols:
-                new_col_defs.append(f"{c} {old_types.get(c, 'TEXT')}")
-            conn.execute(
-                f"CREATE TABLE oauth_quota_cache ({', '.join(new_col_defs)})"
-            )
-
-            # 迁数据
-            moved = 0
-            cursor = conn.execute("SELECT * FROM oauth_quota_cache_old")
-            for row in cursor.fetchall():
-                old_email = row["email"]
-                ak = email_to_key.get(old_email)
-                if not ak:
-                    continue
-                insert_cols = ["account_key", "email"] + other_cols
-                placeholders = ",".join(["?"] * len(insert_cols))
-                values = [ak, old_email] + [row[c] for c in other_cols]
-                conn.execute(
-                    f"INSERT OR REPLACE INTO oauth_quota_cache ({','.join(insert_cols)}) "
-                    f"VALUES ({placeholders})",
-                    values,
-                )
-                moved += 1
-            stats["migrated_quota_rows"] = moved
-            conn.execute("DROP TABLE oauth_quota_cache_old")
-
-            # UPDATE channel_key：oauth:<email> → oauth:<provider>:<email>
-            ch_migrated = 0
-            for old_email, ak in email_to_key.items():
-                old_ck = f"oauth:{old_email}"
-                new_ck = f"oauth:{ak}"
-                if old_ck == new_ck:
-                    continue
-                ch_migrated += _rename_channel_key_no_commit(conn, old_ck, new_ck)
-            stats["migrated_channel_rows"] = ch_migrated
-
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-                (COMPOSITE_KEY_FLAG, COMPOSITE_KEY_VERSION),
-            )
-            conn.execute("COMMIT")
-        except Exception as exc:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise RuntimeError(f"composite key migration failed: {exc}") from exc
-
-    return stats
-
-def _rename_performance_stats_channel_key_no_commit(
-    conn: sqlite3.Connection,
-    old_key: str,
-    new_key: str,
-) -> int:
-    """Rename performance_stats channel_key safely.
-
-    performance_stats has PRIMARY KEY(channel_key, model), so if both old_key
-    and new_key already have the same model row, a direct UPDATE would violate
-    the unique constraint. For conflicts, keep the newer row and delete old.
-    """
-    if old_key == new_key:
-        return 0
-
-    # 冲突行：old_key 和 new_key 下有相同 model。
-    # 这里保留 last_updated 更新的那条；如果 old 更新，则用 old 覆盖 new。
-    cur = conn.execute(
-        """
-        UPDATE performance_stats AS dst
-        SET
-          total_requests = src.total_requests,
-          success_count = src.success_count,
-          recent_requests = src.recent_requests,
-          recent_success_count = src.recent_success_count,
-          avg_connect_ms = src.avg_connect_ms,
-          avg_first_byte_ms = src.avg_first_byte_ms,
-          avg_total_ms = src.avg_total_ms,
-          last_updated = src.last_updated
-        FROM performance_stats AS src
-        WHERE dst.channel_key = ?
-          AND src.channel_key = ?
-          AND dst.model = src.model
-          AND src.last_updated > dst.last_updated
-        """,
-        (new_key, old_key),
-    )
-    updated_conflicts = int(cur.rowcount or 0)
-
-    # 删除所有会冲突的 old_key 行
-    cur = conn.execute(
-        """
-        DELETE FROM performance_stats
-        WHERE channel_key = ?
-          AND model IN (
-            SELECT model
-            FROM performance_stats
-            WHERE channel_key = ?
-          )
-        """,
-        (old_key, new_key),
-    )
-    deleted_conflicts = int(cur.rowcount or 0)
-
-    # 剩下不会冲突的 old_key 行正常改名
-    cur = conn.execute(
-        """
-        UPDATE performance_stats
-        SET channel_key = ?
-        WHERE channel_key = ?
-        """,
-        (new_key, old_key),
-    )
-    renamed = int(cur.rowcount or 0)
-
-    return updated_conflicts + deleted_conflicts + renamed
-
-def _rename_channel_key_no_commit(conn: sqlite3.Connection, old_key: str, new_key: str) -> int:
-    """Rename all persisted channel mirrors inside the caller's transaction.
-
-    Startup migrations call this directly; runtime renames call it through
-    ``rename_runtime_channel_state`` and publish memory under channel_state's
-    shared lifecycle lock.
-    """
-    if old_key == new_key:
-        return 0
-    count = 0
-    # performance_stats 有 PRIMARY KEY(channel_key, model)，需先合并再改名。
-    count += _rename_performance_stats_channel_key_no_commit(conn, old_key, new_key)
-    # channel_errors 同样有 PRIMARY KEY(channel_key, model)。运行时 cooldown
-    # 的既有语义是 old key 获胜；迁移路径保持一致，先删除冲突的新 key 行。
-    cur = conn.execute(
-        """
-        DELETE FROM channel_errors
-        WHERE channel_key = ?
-          AND model IN (
-            SELECT model FROM channel_errors WHERE channel_key = ?
-          )
-        """,
-        (new_key, old_key),
-    )
-    count += int(cur.rowcount or 0)
-    cur = conn.execute(
-        "UPDATE channel_errors SET channel_key=? WHERE channel_key=?",
-        (new_key, old_key),
-    )
-    count += int(cur.rowcount or 0)
-
-    # affinity 表的主键是 fingerprint/client_key，channel_key 本身不唯一。
-    for table in ("cache_affinities", "client_affinities"):
-        try:
-            cur = conn.execute(
-                f"UPDATE {table} SET channel_key=? WHERE channel_key=?",
-                (new_key, old_key),
-            )
-            count += int(cur.rowcount or 0)
-        except sqlite3.OperationalError as exc:
-            # Older DBs may not have client_affinities yet.  Other I/O/schema
-            # failures must abort the migration instead of becoming a miss.
-            if "no such table" not in str(exc).lower():
-                raise
-    return count
-
-
-def _quota_rename_account_key_no_commit(conn: sqlite3.Connection,
-                                        old_key: str, new_key: str, *,
-                                        email: str | None = None) -> int:
-    if not old_key or not new_key or old_key == new_key:
-        return 0
-    if email is None:
-        email = new_key.split(":", 1)[1] if ":" in new_key else new_key
-    old = conn.execute(
-        "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-        (old_key,),
-    ).fetchone()
-    if old is None:
-        return 0
-    new = conn.execute(
-        "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-        (new_key,),
-    ).fetchone()
-    if new is not None:
-        old_ts = max(int(old["fetched_at"] or 0), int(old["last_passive_update_at"] or 0))
-        new_ts = max(int(new["fetched_at"] or 0), int(new["last_passive_update_at"] or 0))
-        if old_ts > new_ts:
-            cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-            values = [
-                new_key if c == "account_key"
-                else email if c == "email"
-                else old[c]
-                for c in cols
-            ]
-            assignments = ",".join([f"{c}=?" for c in cols])
-            conn.execute(
-                f"UPDATE oauth_quota_cache SET {assignments} WHERE account_key=?",
-                values + [new_key],
-            )
-        conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
-        return 0
-    cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-    placeholders = ",".join(["?"] * len(cols))
-    values = [
-        new_key if c == "account_key"
-        else email if c == "email"
-        else old[c]
-        for c in cols
-    ]
-    conn.execute(
-        f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
-        values,
-    )
-    conn.execute("DELETE FROM oauth_quota_cache WHERE account_key=?", (old_key,))
-    return 1
-
-
-def quota_rename_account_key(old_key: str, new_key: str, *, email: str | None = None) -> int:
-    """Rename oauth_quota_cache primary key without changing quota contents."""
-    return _commit_write(
-        lambda conn: _quota_rename_account_key_no_commit(
-            conn, old_key, new_key, email=email,
-        )
-    )
-
-
-def rename_runtime_channel_state(old_channel_key: str, new_channel_key: str, *,
-                                 old_account_key: str | None = None,
-                                 new_account_key: str | None = None,
-                                 email: str | None = None) -> int:
-    """Atomically rename every persisted mirror for one live channel."""
-    if old_channel_key == new_channel_key:
-        return 0
-
-    def write(conn: sqlite3.Connection) -> int:
-        changed = _rename_channel_key_no_commit(conn, old_channel_key, new_channel_key)
-        if old_account_key and new_account_key and old_account_key != new_account_key:
-            changed += _quota_rename_account_key_no_commit(
-                conn, old_account_key, new_account_key, email=email,
-            )
-        return changed
-
-    return _commit_write(write)
-
-
-OPENAI_WORKSPACE_KEY_VERSION = "1"
-OPENAI_WORKSPACE_KEY_FLAG = "openai_workspace_key_version"
-
-
-def openai_workspace_key_migration_done() -> bool:
-    return schema_meta_get(OPENAI_WORKSPACE_KEY_FLAG) == OPENAI_WORKSPACE_KEY_VERSION
-
-
-def openai_workspace_key_migration_scope_done(scope_key: str) -> bool:
-    """Return whether one concrete OpenAI legacy→workspace mapping was migrated."""
-    return schema_meta_get(scope_key) == OPENAI_WORKSPACE_KEY_VERSION
-
-
-def run_openai_workspace_key_migration(old_to_new: dict[str, dict[str, str]], *,
-                                        scope_key: str | None = None) -> dict:
-    """Idempotently migrate OpenAI state keys from legacy to composite identity.
-
-    `old_to_new` maps old account_key (`openai:<email>` or historical
-    `openai:<workspace_id>` / `openai:<email>:<workspace_id>:<chatgpt_account_id>`)
-    to a dict containing `new` (`openai:<email>:<workspace_id>`) and display `email`.
-    The caller only includes unique mappings, so ambiguous rows are deliberately
-    left untouched.
-    """
-    stats = {
-        "quota_rows": 0,
-        "channel_rows": 0,
-        "skipped": False,
-        "reason": "",
-    }
-    if not old_to_new:
-        stats["skipped"] = True
-        stats["reason"] = "no eligible mappings"
-        return stats
-    flag_key = scope_key or OPENAI_WORKSPACE_KEY_FLAG
-    done = (
-        openai_workspace_key_migration_scope_done(flag_key)
-        if scope_key else openai_workspace_key_migration_done()
-    )
-    if done:
-        stats["skipped"] = True
-        stats["reason"] = "flag already set"
-        return stats
-
-    with _write_lock:
-        conn = _get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for old_key, meta in old_to_new.items():
-                new_key = str(meta.get("new") or "")
-                email = str(meta.get("email") or "")
-                if not old_key or not new_key or old_key == new_key:
-                    continue
-                old_ck = f"oauth:{old_key}"
-                new_ck = f"oauth:{new_key}"
-                stats["channel_rows"] += _rename_channel_key_no_commit(conn, old_ck, new_ck)
-
-                old = conn.execute(
-                    "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-                    (old_key,),
-                ).fetchone()
-                if old is not None:
-                    new = conn.execute(
-                        "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-                        (new_key,),
-                    ).fetchone()
-                    if new is not None:
-                        old_ts = max(int(old["fetched_at"] or 0), int(old["last_passive_update_at"] or 0))
-                        new_ts = max(int(new["fetched_at"] or 0), int(new["last_passive_update_at"] or 0))
-                        if old_ts > new_ts:
-                            cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-                            values = [
-                                new_key if c == "account_key"
-                                else email if c == "email"
-                                else old[c]
-                                for c in cols
-                            ]
-                            assignments = ",".join([f"{c}=?" for c in cols])
-                            conn.execute(
-                                f"UPDATE oauth_quota_cache SET {assignments} WHERE account_key=?",
-                                values + [new_key],
-                            )
-                        conn.execute(
-                            "DELETE FROM oauth_quota_cache WHERE account_key=?",
-                            (old_key,),
-                        )
-                    else:
-                        cols = [r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")]
-                        placeholders = ",".join(["?"] * len(cols))
-                        values = [
-                            new_key if c == "account_key"
-                            else email if c == "email"
-                            else old[c]
-                            for c in cols
-                        ]
-                        conn.execute(
-                            f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
-                            values,
-                        )
-                        conn.execute(
-                            "DELETE FROM oauth_quota_cache WHERE account_key=?",
-                            (old_key,),
-                        )
-                        stats["quota_rows"] += 1
-
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-                (flag_key, OPENAI_WORKSPACE_KEY_VERSION),
-            )
-            conn.execute("COMMIT")
-        except Exception as exc:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise RuntimeError(f"openai workspace key migration failed: {exc}") from exc
-    return stats
-
-
-
-# oauth_quota_cache 在几个里程碑里逐步加过列：
-# - 统一 quota 视图：five_hour_* / seven_day_* / sonnet_* / opus_* / extra_* / raw_data
-# - 2026-04-20 被动采样：last_passive_update_at
-# - OpenAI Codex 快照：codex_primary_* / codex_secondary_* / codex_primary_over_secondary_pct
-#
-# 某些测试会手动重建老 schema（只保留 email/fetched_at 或少数字段）再继续复用同一
-# 进程里的 state_db 模块；因此 init() 必须能对"已存在但缺列"的表做幂等补齐，
-# 不能只依赖 CREATE TABLE IF NOT EXISTS。
-_OAUTH_QUOTA_CACHE_EXTRA_COLUMNS: list[tuple[str, str]] = [
-    ("five_hour_util",                   "REAL"),
-    ("five_hour_reset",                  "TEXT"),
-    ("seven_day_util",                   "REAL"),
-    ("seven_day_reset",                  "TEXT"),
-    ("thirty_day_util",                  "REAL"),
-    ("thirty_day_reset",                 "TEXT"),
-    ("sonnet_util",                      "REAL"),
-    ("sonnet_reset",                     "TEXT"),
-    ("opus_util",                        "REAL"),
-    ("opus_reset",                       "TEXT"),
-    ("extra_used",                       "REAL"),
-    ("extra_limit",                      "REAL"),
-    ("extra_util",                       "REAL"),
-    ("raw_data",                         "TEXT"),
-    ("last_passive_update_at",          "INTEGER"),
-    ("codex_primary_used_pct",          "REAL"),
-    ("codex_primary_reset_sec",         "INTEGER"),
-    ("codex_primary_window_min",        "INTEGER"),
-    ("codex_secondary_used_pct",        "REAL"),
-    ("codex_secondary_reset_sec",       "INTEGER"),
-    ("codex_secondary_window_min",      "INTEGER"),
-    ("codex_primary_over_secondary_pct", "REAL"),
-    ("codex_window_observations",        "TEXT"),
-]
-
-
-def _migrate_oauth_quota_cache_openai_cols(conn: sqlite3.Connection) -> None:
-    existing = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_quota_cache)")}
-    for col, col_type in _OAUTH_QUOTA_CACHE_EXTRA_COLUMNS:
-        if col in existing:
-            continue
-        try:
-            conn.execute(f"ALTER TABLE oauth_quota_cache ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError as exc:
-            # 并发启动下可能被另一进程抢跑；忽略 "duplicate column name"
-            if "duplicate column name" not in str(exc).lower():
-                raise
-
-
-def _get_conn() -> sqlite3.Connection:
-    global _journal_mode_ready
-    if getattr(_local, "conn", None) is None:
-        if _db_path is None:
-            raise RuntimeError("state_db.init() not called")
-        conn = sqlite3.connect(_db_path, timeout=10, factory=_StateConnection)
-        try:
-            conn.row_factory = sqlite3.Row
-            # SQLite <=3.51.2 has an upstream WAL-reset race when multiple
-            # connections write/checkpoint concurrently. state.db is small and
-            # all its writes are already serialized, so rollback journal is the
-            # safer and sufficient mode. Only the first startup connection may
-            # change the persistent mode; worker connections merely verify it.
-            with _write_lock:
-                pragma = "PRAGMA journal_mode=DELETE" if not _journal_mode_ready else "PRAGMA journal_mode"
-                row = conn.execute(pragma).fetchone()
-                mode = str(row[0] if row is not None else "").strip().lower()
-                if mode != "delete":
-                    raise RuntimeError(f"state.db requires journal_mode=DELETE, got {mode or '?'}")
-                _journal_mode_ready = True
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("PRAGMA busy_timeout=5000")
-        except BaseException:
-            conn.close()
-            raise
-        _local.conn = conn
-    return _local.conn
-
-
-def _rollback_failed_write(conn: sqlite3.Connection) -> None:
-    """Rollback one failed write, discarding an unusable thread connection."""
-    try:
-        conn.rollback()
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        finally:
-            if getattr(_local, "conn", None) is conn:
-                _local.conn = None
-
-
-def _commit_write(effect):
-    """Run one state mutation with rollback-safe transaction handling."""
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            result = effect(conn)
-            conn.commit()
-            return result
-        except BaseException:
-            _rollback_failed_write(conn)
+            store.close()
             raise
 
+def flush(*, strict: bool = False) -> bool: return get_store().flush(strict=strict)
+def checkpoint(*, mode: str = "TRUNCATE", strict: bool = False) -> tuple[int, int, int]:
+    """Deprecated SQLite-shaped compatibility shim; flush verified JSON."""
+    get_store().flush(strict=strict)
+    return (0, 0, 0)
+def online_backup(destination: str, *, verify: bool = True) -> str:
+    raise NotImplementedError(
+        "online_backup() retired with SQLite state; copy verified runtime/durable "
+        "JSON snapshots and state-migration.json instead")
+def health() -> dict[str, Any]: return get_store().health()
+def close() -> bool:
+    global _store
+    if _store is None: return True
+    try: return _store.close()
+    finally: _store = None
 
+def now_ms() -> int: return int(time.time() * 1000)
 @contextmanager
 def optional_write_timeout(timeout_ms: int = 100):
-    """Temporarily bound an auxiliary state write's SQLite lock wait.
-
-    The global write lock keeps the connection-local PRAGMA change from
-    leaking into another state mutation. Nested state writers are safe because
-    ``_write_lock`` is re-entrant.
-    """
-    bounded = max(1, min(int(timeout_ms), 5_000))
-    if _db_path is None:
-        # Preserve the original initialization error at the actual write site;
-        # this context manager itself must not become a new prerequisite.
+    # Historical callers used this before state initialization; keep it optional.
+    if _store is None:
         yield
-        return
-    with _write_lock:
-        conn = _get_conn()
-        row = conn.execute("PRAGMA busy_timeout").fetchone()
-        previous = int(row[0] if row is not None else 5_000)
-        conn.execute(f"PRAGMA busy_timeout={bounded}")
-        try:
-            yield
-        finally:
-            if getattr(_local, "conn", None) is conn:
-                try:
-                    conn.execute(f"PRAGMA busy_timeout={previous}")
-                except sqlite3.Error:
-                    try:
-                        conn.close()
-                    except sqlite3.Error:
-                        pass
-                    _local.conn = None
-
-
-def checkpoint(*, mode: str = "TRUNCATE", strict: bool = False) -> tuple[int, int, int]:
-    """Compatibility no-op: state.db deliberately does not use WAL anymore."""
-    normalized = str(mode or "TRUNCATE").strip().upper()
-    if normalized not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
-        raise ValueError(f"unsupported WAL checkpoint mode: {mode}")
-    # Opening/verifying the connection is still useful for strict restart
-    # guards, but executing wal_checkpoint would reintroduce the vulnerable
-    # checkpoint path this database intentionally avoids.
-    with _write_lock:
-        _get_conn().execute("SELECT 1").fetchone()
-    return (0, 0, 0)
-
-
-def online_backup(destination: str, *, verify: bool = True) -> str:
-    """Create an atomic SQLite Online Backup of the live state database.
-
-    The source connection remains online while SQLite copies a consistent
-    snapshot (including committed WAL content).  The completed temporary copy
-    is integrity-checked before it atomically replaces ``destination``.
-    """
-    if _db_path is None:
-        raise RuntimeError("state_db.init() not called")
-    source_path = os.path.abspath(_db_path)
-    destination = os.path.abspath(destination)
-    if source_path == destination:
-        raise ValueError("state database backup destination equals source")
-    os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
-    tmp = f"{destination}.tmp-{os.getpid()}-{threading.get_ident()}"
-    try:
-        try:
-            os.remove(tmp)
-        except FileNotFoundError:
-            pass
-        with _write_lock:
-            target = sqlite3.connect(tmp, timeout=10)
-            try:
-                _get_conn().backup(target)
-                target.commit()
-            finally:
-                target.close()
-
-        if verify:
-            check_conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=10)
-            try:
-                rows = check_conn.execute("PRAGMA integrity_check").fetchall()
-            finally:
-                check_conn.close()
-            checks = [str(row[0]) for row in rows]
-            if checks != ["ok"]:
-                detail = "; ".join(checks[:5]) or "no result"
-                raise RuntimeError(f"state database backup integrity_check failed: {detail}")
-
-        # Close+fsync makes the verified snapshot durable before publishing it.
-        fd = os.open(tmp, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, destination)
-        try:
-            dir_fd = os.open(os.path.dirname(destination) or ".", os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Some filesystems do not permit directory fsync; the database file
-            # itself is already synced and remains a valid recovery snapshot.
-            pass
-        return destination
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def close() -> None:
-    """Close this thread's state connection after final shutdown checkpoint."""
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        return
-    try:
-        conn.close()
-    finally:
-        _local.conn = None
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-# ─── network_check_status ───────────────────────────────────────
-
-def network_check_save(row: dict[str, Any]) -> None:
-    def write(conn):
-        conn.execute(
-            """INSERT OR REPLACE INTO network_check_status
-               (key, label, category, ok, detail, latency_ms, checked_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (
-                str(row.get("key") or ""),
-                str(row.get("label") or row.get("key") or ""),
-                str(row.get("category") or "other"),
-                1 if row.get("ok") else 0,
-                str(row.get("detail") or ""),
-                row.get("latency_ms"),
-                int(row.get("checked_at") or now_ms()),
-            ),
-        )
-    _commit_write(write)
-
-
-def network_check_load(key: str) -> dict | None:
-    row = _get_conn().execute(
-        "SELECT * FROM network_check_status WHERE key=?", (key,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def network_check_load_all() -> list[dict]:
-    rows = _get_conn().execute(
-        "SELECT * FROM network_check_status ORDER BY category, key",
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def network_check_delete(key: str) -> None:
-    _commit_write(
-        lambda conn: conn.execute(
-            "DELETE FROM network_check_status WHERE key=?", (key,),
-        )
-    )
-
-
-def network_check_delete_stale(live_keys: set[str]) -> None:
-    def write(conn):
-        rows = conn.execute("SELECT key FROM network_check_status").fetchall()
-        for r in rows:
-            if r["key"] not in live_keys:
-                conn.execute("DELETE FROM network_check_status WHERE key=?", (r["key"],))
-    _commit_write(write)
-
-
-# ─── xAI Imagine video job bindings ───────────────────────────────
-
-def xai_video_job_save(
-    request_id: str,
-    *,
-    channel_key: str,
-    api_key_name: str,
-    model: str,
-    ttl_seconds: int,
-) -> None:
-    """Persist the OAuth/API-key identity needed to poll one async video job."""
-    created_at = now_ms()
-    expires_at = created_at + max(1, int(ttl_seconds)) * 1000
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            conn.execute("DELETE FROM xai_video_jobs WHERE expires_at<=?", (created_at,))
-            conn.execute(
-                """INSERT OR REPLACE INTO xai_video_jobs
-                   (request_id, channel_key, api_key_name, model, created_at, expires_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (
-                    request_id,
-                    channel_key,
-                    api_key_name,
-                    model,
-                    created_at,
-                    expires_at,
-                ),
-            )
-            conn.commit()
-        except Exception:
-            _rollback_failed_write(conn)
-            raise
-
-
-def xai_video_job_load(request_id: str) -> dict | None:
-    """Load a live binding; expired rows are removed atomically on access."""
-    now = now_ms()
-    row = _get_conn().execute(
-        "SELECT * FROM xai_video_jobs WHERE request_id=?", (request_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    if int(row["expires_at"] or 0) > now:
-        return dict(row)
-    xai_video_job_delete(request_id)
-    return None
-
-
-def xai_video_job_delete(request_id: str | None = None) -> None:
-    with _write_lock:
-        conn = _get_conn()
-        if request_id:
-            conn.execute("DELETE FROM xai_video_jobs WHERE request_id=?", (request_id,))
-        else:
-            conn.execute("DELETE FROM xai_video_jobs")
-        conn.commit()
-
-
-def xai_video_job_cleanup(now: int | None = None) -> int:
-    with _write_lock:
-        conn = _get_conn()
-        cur = conn.execute(
-            "DELETE FROM xai_video_jobs WHERE expires_at<=?",
-            (int(now if now is not None else now_ms()),),
-        )
-        conn.commit()
-        return int(cur.rowcount or 0)
-
-
-# ─── performance_stats ────────────────────────────────────────────
-
-def perf_save(channel_key: str, model: str, stats: dict[str, Any]) -> None:
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            conn.execute(
-                """INSERT OR REPLACE INTO performance_stats
-                   (channel_key, model, total_requests, success_count,
-                    recent_requests, recent_success_count,
-                    avg_connect_ms, avg_first_byte_ms, avg_total_ms, last_updated)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    channel_key, model,
-                    int(stats.get("total_requests", 0)),
-                    int(stats.get("success_count", 0)),
-                    int(stats.get("recent_requests", 0)),
-                    int(stats.get("recent_success_count", 0)),
-                    float(stats.get("avg_connect_ms", 0.0)),
-                    float(stats.get("avg_first_byte_ms", 0.0)),
-                    float(stats.get("avg_total_ms", 0.0)),
-                    int(stats.get("last_updated", now_ms())),
-                ),
-            )
-            conn.commit()
-        except sqlite3.Error:
-            _rollback_failed_write(conn)
-            raise
-
-
-def perf_load(channel_key: str, model: str) -> dict | None:
-    row = _get_conn().execute(
-        "SELECT * FROM performance_stats WHERE channel_key=? AND model=?",
-        (channel_key, model),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def perf_load_all() -> list[dict]:
-    rows = _get_conn().execute("SELECT * FROM performance_stats").fetchall()
-    return [dict(r) for r in rows]
-
-
-def perf_delete(channel_key: str | None = None, model: str | None = None) -> None:
-    def write(conn):
-        if channel_key and model:
-            conn.execute(
-                "DELETE FROM performance_stats WHERE channel_key=? AND model=?",
-                (channel_key, model),
-            )
-        elif channel_key:
-            conn.execute(
-                "DELETE FROM performance_stats WHERE channel_key=?",
-                (channel_key,),
-            )
-        else:
-            conn.execute("DELETE FROM performance_stats")
-    _commit_write(write)
-
-
-def perf_rename_channel(old_key: str, new_key: str) -> None:
-    if old_key == new_key:
-        return
-    def write(conn):
-        _rename_performance_stats_channel_key_no_commit(conn, old_key, new_key)
-    _commit_write(write)
-
-
-# ─── channel_errors ───────────────────────────────────────────────
-
-def error_save(channel_key: str, model: str, error_count: int,
-               cooldown_until: int | None, message: str | None) -> None:
-    """cooldown_until: None/正数 毫秒时间戳; -1 = 永久。"""
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            conn.execute(
-                """INSERT OR REPLACE INTO channel_errors
-                   (channel_key, model, error_count, cooldown_until, last_error_message, last_error_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (channel_key, model, error_count, cooldown_until, message, now_ms()),
-            )
-            conn.commit()
-        except Exception:
-            _rollback_failed_write(conn)
-            raise
-
-
-def error_load(channel_key: str, model: str) -> dict | None:
-    row = _get_conn().execute(
-        "SELECT * FROM channel_errors WHERE channel_key=? AND model=?",
-        (channel_key, model),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def error_load_all() -> list[dict]:
-    rows = _get_conn().execute("SELECT * FROM channel_errors").fetchall()
-    return [dict(r) for r in rows]
-
-
-def error_delete(channel_key: str | None = None, model: str | None = None) -> None:
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            if channel_key and model:
-                conn.execute(
-                    "DELETE FROM channel_errors WHERE channel_key=? AND model=?",
-                    (channel_key, model),
-                )
-            elif channel_key:
-                conn.execute(
-                    "DELETE FROM channel_errors WHERE channel_key=?",
-                    (channel_key,),
-                )
-            else:
-                conn.execute("DELETE FROM channel_errors")
-            conn.commit()
-        except Exception:
-            _rollback_failed_write(conn)
-            raise
-
-
-def error_rename_channel(old_key: str, new_key: str) -> None:
-    if old_key == new_key:
-        return
-    def write(conn):
-        # Only conflicting models are replaced by old-key state.  Models that
-        # exist solely on the destination identity must survive the merge.
-        conn.execute(
-            """
-            DELETE FROM channel_errors
-            WHERE channel_key=?
-              AND model IN (
-                SELECT model FROM channel_errors WHERE channel_key=?
-              )
-            """,
-            (new_key, old_key),
-        )
-        conn.execute(
-            "UPDATE channel_errors SET channel_key=? WHERE channel_key=?",
-            (new_key, old_key),
-        )
-    _commit_write(write)
-
-
-# ─── cache_affinities ─────────────────────────────────────────────
-
-def affinity_upsert(fingerprint: str, channel_key: str, model: str,
-                    last_used: int | None = None,
-                    prompt_cache_key: str | None = None) -> None:
-    ts = last_used if last_used is not None else now_ms()
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            # 先尝试更新；若未命中则插入。prompt_cache_key=None 表示不改
-            # 既有值，避免非 OpenAI 协议/老调用路径清空 OpenAI 会话缓存绑定。
-            if prompt_cache_key is not None:
-                cur = conn.execute(
-                    """UPDATE cache_affinities
-                       SET channel_key=?, model=?, last_used=?, prompt_cache_key=?
-                       WHERE fingerprint=?""",
-                    (channel_key, model, ts, prompt_cache_key, fingerprint),
-                )
-            else:
-                cur = conn.execute(
-                    """UPDATE cache_affinities
-                       SET channel_key=?, model=?, last_used=?
-                       WHERE fingerprint=?""",
-                    (channel_key, model, ts, fingerprint),
-                )
-            if cur.rowcount == 0:
-                conn.execute(
-                    """INSERT INTO cache_affinities
-                       (fingerprint, channel_key, model, last_used, created_at, prompt_cache_key)
-                       VALUES (?,?,?,?,?,?)""",
-                    (fingerprint, channel_key, model, ts, ts, prompt_cache_key),
-                )
-            conn.commit()
-        except sqlite3.Error:
-            _rollback_failed_write(conn)
-            raise
-
-
-def affinity_touch(fingerprint: str, last_used: int | None = None) -> None:
-    ts = last_used if last_used is not None else now_ms()
-    def write(conn):
-        conn.execute(
-            "UPDATE cache_affinities SET last_used=? WHERE fingerprint=?",
-            (ts, fingerprint),
-        )
-    _commit_write(write)
-
-
-def affinity_load(fingerprint: str) -> dict | None:
-    row = _get_conn().execute(
-        "SELECT * FROM cache_affinities WHERE fingerprint=?",
-        (fingerprint,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def affinity_load_all() -> list[dict]:
-    rows = _get_conn().execute("SELECT * FROM cache_affinities").fetchall()
-    return [dict(r) for r in rows]
-
-
-def affinity_delete(fingerprint: str | None = None) -> None:
-    def write(conn):
-        if fingerprint:
-            conn.execute(
-                "DELETE FROM cache_affinities WHERE fingerprint=?",
-                (fingerprint,),
-            )
-        else:
-            conn.execute("DELETE FROM cache_affinities")
-    _commit_write(write)
-
-
-def affinity_delete_by_channel(channel_key: str) -> None:
-    def write(conn):
-        conn.execute(
-            "DELETE FROM cache_affinities WHERE channel_key=?",
-            (channel_key,),
-        )
-    _commit_write(write)
-
-
-def affinity_delete_stale_channels(live_keys: Iterable[str]) -> None:
-    """删除不在 live_keys 中的所有渠道对应的亲和记录。"""
-    live_set = set(live_keys)
-    def write(conn):
-        rows = conn.execute(
-            "SELECT DISTINCT channel_key FROM cache_affinities"
-        ).fetchall()
-        stale = [r["channel_key"] for r in rows if r["channel_key"] not in live_set]
-        for k in stale:
-            conn.execute(
-                "DELETE FROM cache_affinities WHERE channel_key=?", (k,)
-            )
-    _commit_write(write)
-
-
-def affinity_rename_channel(old_key: str, new_key: str) -> None:
-    if old_key == new_key:
-        return
-    def write(conn):
-        conn.execute(
-            "UPDATE cache_affinities SET channel_key=? WHERE channel_key=?",
-            (new_key, old_key),
-        )
-    _commit_write(write)
-
-
-def affinity_cleanup(ttl_ms: int, *, cutoff_ms: int | None = None) -> int:
-    """清理 last_used 早于 now-ttl 的记录。返回清理条数。"""
-    cutoff = cutoff_ms if cutoff_ms is not None else now_ms() - ttl_ms
-    def write(conn):
-        cur = conn.execute(
-            "DELETE FROM cache_affinities WHERE last_used < ?",
-            (cutoff,),
-        )
-        return cur.rowcount
-    return _commit_write(write)
-
-
-# ─── client_affinities ─────────────────────────────────────────────
-
-def client_affinity_upsert(client_key: str, channel_key: str, model: str,
-                           last_used: int | None = None) -> None:
-    ts = last_used if last_used is not None else now_ms()
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            cur = conn.execute(
-                """UPDATE client_affinities
-                   SET channel_key=?, model=?, last_used=?
-                   WHERE client_key=?""",
-                (channel_key, model, ts, client_key),
-            )
-            if cur.rowcount == 0:
-                conn.execute(
-                    """INSERT INTO client_affinities
-                       (client_key, channel_key, model, last_used, created_at)
-                       VALUES (?,?,?,?,?)""",
-                    (client_key, channel_key, model, ts, ts),
-                )
-            conn.commit()
-        except sqlite3.Error:
-            _rollback_failed_write(conn)
-            raise
-
-
-def client_affinity_load_all() -> list[dict]:
-    rows = _get_conn().execute("SELECT * FROM client_affinities").fetchall()
-    return [dict(r) for r in rows]
-
-
-def client_affinity_delete(client_key: str | None = None) -> None:
-    def write(conn):
-        if client_key:
-            conn.execute(
-                "DELETE FROM client_affinities WHERE client_key=?",
-                (client_key,),
-            )
-        else:
-            conn.execute("DELETE FROM client_affinities")
-    _commit_write(write)
-
-
-def client_affinity_delete_by_channel(channel_key: str) -> None:
-    def write(conn):
-        conn.execute(
-            "DELETE FROM client_affinities WHERE channel_key=?",
-            (channel_key,),
-        )
-    _commit_write(write)
-
-
-def client_affinity_delete_stale_channels(live_keys: Iterable[str]) -> None:
-    live_set = set(live_keys)
-    def write(conn):
-        rows = conn.execute(
-            "SELECT DISTINCT channel_key FROM client_affinities"
-        ).fetchall()
-        stale = [r["channel_key"] for r in rows if r["channel_key"] not in live_set]
-        for k in stale:
-            conn.execute(
-                "DELETE FROM client_affinities WHERE channel_key=?", (k,)
-            )
-    _commit_write(write)
-
-
-def client_affinity_rename_channel(old_key: str, new_key: str) -> None:
-    if old_key == new_key:
-        return
-    def write(conn):
-        conn.execute(
-            "UPDATE client_affinities SET channel_key=? WHERE channel_key=?",
-            (new_key, old_key),
-        )
-    _commit_write(write)
-
-
-def client_affinity_cleanup(ttl_ms: int, *, cutoff_ms: int | None = None) -> int:
-    cutoff = cutoff_ms if cutoff_ms is not None else now_ms() - ttl_ms
-    def write(conn):
-        cur = conn.execute(
-            "DELETE FROM client_affinities WHERE last_used < ?",
-            (cutoff,),
-        )
-        return cur.rowcount
-    return _commit_write(write)
-
-
-# ─── oauth_quota_cache ────────────────────────────────────────────
-
-def _commit_quota_write(account_key: str, effect):
-    """Commit one quota-cache write against the current OAuth generation.
-
-    A request that started before an identity rename still carries the old
-    account key.  Resolve that generation while holding the shared lifecycle
-    lock so it updates the renamed row instead of recreating a stale one.  The
-    same lock makes the tombstone check atomic with deletion cleanup: once a
-    delete starts, no late quota write can slip in after its final DELETE.
-    """
-    from . import channel_state
-
-    with channel_state.mutation_lock:
-        source_channel_key = f"oauth:{account_key}"
-        target_channel_key = channel_state.resolve(source_channel_key)
-        if (
-            channel_state.is_deleted(source_channel_key)
-            or channel_state.is_deleted(target_channel_key)
-        ):
-            return None
-        prefix = "oauth:"
-        target_account_key = (
-            target_channel_key[len(prefix):]
-            if target_channel_key.startswith(prefix)
-            else account_key
-        )
-        with optional_write_timeout():
-            return _commit_write(
-                lambda conn: effect(conn, target_account_key)
-            )
-
-
-def _quota_display_email(account_key: str) -> str:
-    """Best-effort email fallback for canonical and legacy quota keys."""
-    if ":" not in account_key:
-        return account_key
-    provider, identity = account_key.split(":", 1)
-    # OpenAI canonical keys are provider:email:workspace. Historical xAI
-    # keys can also be provider:email:subject. The email is the first identity
-    # component; Claude remains provider:email.
-    if provider in {"openai", "xai"} and ":" in identity:
-        return identity.split(":", 1)[0]
-    return identity
-
-def provider_usage_load(account_id: str) -> dict | None:
-    """读取独立 API Provider usage cache；account_id 是安装级 HMAC。"""
-    row = _get_conn().execute(
-        "SELECT * FROM api_provider_usage_cache WHERE account_id=?", (account_id,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def provider_usage_save_success(account_id: str, adapter_id: str, snapshot: dict,
-                                retry_after: int | None = None) -> None:
-    """成功（含明确 partial）替换快照；partial 可保留上游退避。"""
-    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
-    fetched_at = now_ms()
-    def write(conn):
-        conn.execute(
-            """INSERT INTO api_provider_usage_cache
-               (account_id,adapter_id,snapshot_json,fetched_at,last_error,error_at,retry_after)
-               VALUES (?,?,?,?,NULL,NULL,?)
-               ON CONFLICT(account_id) DO UPDATE SET
-                 adapter_id=excluded.adapter_id,snapshot_json=excluded.snapshot_json,
-                 fetched_at=excluded.fetched_at,last_error=NULL,error_at=NULL,
-                 retry_after=excluded.retry_after""",
-            (account_id, adapter_id, payload, fetched_at, retry_after),
-        )
-    _commit_write(write)
-
-
-def provider_usage_save_error(account_id: str, adapter_id: str, error: str,
-                              retry_after: int | None = None) -> None:
-    """记录脱敏错误，保留旧成功快照。"""
-    error_at = now_ms()
-    def write(conn):
-        conn.execute(
-            """INSERT INTO api_provider_usage_cache
-               (account_id,adapter_id,snapshot_json,fetched_at,last_error,error_at,retry_after)
-               VALUES (?,?,NULL,NULL,?,?,?)
-               ON CONFLICT(account_id) DO UPDATE SET
-                 adapter_id=excluded.adapter_id,last_error=excluded.last_error,
-                 error_at=excluded.error_at,retry_after=excluded.retry_after""",
-            (account_id, adapter_id, str(error)[:160], error_at, retry_after),
-        )
-    _commit_write(write)
-
-
-def provider_usage_delete(account_id: str) -> None:
-    _commit_write(lambda conn: conn.execute(
-        "DELETE FROM api_provider_usage_cache WHERE account_id=?", (account_id,),
-    ))
-
-
-def quota_save(account_key: str, data: dict[str, Any],
-               *, email: str | None = None) -> None:
-    """按 account_key=f"{provider}:{email}" 写入 quota。
-
-    若调用方未显式提供 email，则按 "provider:email" 拆出 email 作显示列兜底。
-    """
-    def write(conn, target_account_key: str):
-        target_email = email
-        if target_email is None:
-            target_email = _quota_display_email(target_account_key)
-        values = (
-            target_email,
-            int(data.get("fetched_at", now_ms())),
-            data.get("five_hour_util"),
-            data.get("five_hour_reset"),
-            data.get("seven_day_util"),
-            data.get("seven_day_reset"),
-            data.get("thirty_day_util"),
-            data.get("thirty_day_reset"),
-            data.get("sonnet_util"),
-            data.get("sonnet_reset"),
-            data.get("opus_util"),
-            data.get("opus_reset"),
-            data.get("extra_used"),
-            data.get("extra_limit"),
-            data.get("extra_util"),
-            data.get("raw_data"),
-        )
-        row = conn.execute(
-            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
-            (target_account_key,),
-        ).fetchone()
-        if row is None:
-            conn.execute(
-                """INSERT INTO oauth_quota_cache
-                   (account_key, email, fetched_at,
-                    five_hour_util, five_hour_reset,
-                    seven_day_util, seven_day_reset,
-                    thirty_day_util, thirty_day_reset,
-                    sonnet_util, sonnet_reset,
-                    opus_util, opus_reset,
-                    extra_used, extra_limit, extra_util,
-                    raw_data)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (target_account_key,) + values,
-            )
-        else:
-            conn.execute(
-                """UPDATE oauth_quota_cache SET
-                     email=?, fetched_at=?,
-                     five_hour_util=?, five_hour_reset=?,
-                     seven_day_util=?, seven_day_reset=?,
-                     thirty_day_util=?, thirty_day_reset=?,
-                     sonnet_util=?, sonnet_reset=?,
-                     opus_util=?, opus_reset=?,
-                     extra_used=?, extra_limit=?, extra_util=?,
-                     raw_data=?
-                   WHERE account_key=?""",
-                values + (target_account_key,),
-            )
-    _commit_quota_write(account_key, write)
-
-
-def quota_load(account_key_or_email: str) -> dict | None:
-    """按 account_key 精确匹配；若入参不含 ":" 则回退到 email 列查找（兼容）。
-
-    若三段式 account_key 没命中（例如调用方早期写入时用了裸 email 作 PK），再兜底
-    用拆出的 email 按 email 列查一次，最大程度向后兼容。
-    """
-    if ":" in account_key_or_email:
-        row = _get_conn().execute(
-            "SELECT * FROM oauth_quota_cache WHERE account_key=?",
-            (account_key_or_email,),
-        ).fetchone()
-        if row is None:
-            # 兜底：老数据可能以裸 email 作 PK 写入
-            email = account_key_or_email.split(":", 1)[1]
-            rows = _get_conn().execute(
-                "SELECT * FROM oauth_quota_cache WHERE email=?",
-                (email,),
-            ).fetchall()
-            row = rows[0] if len(rows) == 1 else None
     else:
-        rows = _get_conn().execute(
-            "SELECT * FROM oauth_quota_cache WHERE email=?",
-            (account_key_or_email,),
-        ).fetchall()
-        row = rows[0] if len(rows) == 1 else None
-    return dict(row) if row else None
+        with _store.optional_write_timeout(timeout_ms): yield
 
+def _key(*parts: Any) -> str: return "\x1f".join(str(p) for p in parts)
+def _get(domain: str, key: str): return get_store().get(domain, key)
+def _all(domain: str): return get_store().values(domain)
+def _mut(domain: str, fn, *, strict: bool | None=None): return get_store()._mutate(domain, fn, strict=strict)
 
-def quota_load_all() -> list[dict]:
-    rows = _get_conn().execute("SELECT * FROM oauth_quota_cache").fetchall()
-    return [dict(r) for r in rows]
+COMPOSITE_KEY_FLAG = "oauth_composite_key_v1"
+COMPOSITE_KEY_VERSION = "1"
+def schema_meta_get(key: str) -> str | None:
+    row=_get("schema_meta",key); return row.get("value") if row else None
+def schema_meta_delete(key:str)->None:_mut("schema_meta",lambda d:d.pop(key,None))
+def schema_meta_set(key: str,value: str)->None:
+    _mut("schema_meta",lambda d:d.__setitem__(key,{"key":key,"value":value}))
+def composite_key_migration_done()->bool:return schema_meta_get("oauth_composite_key_v1")=="1"
+def openai_workspace_key_migration_done()->bool:return schema_meta_get("openai_workspace_key_v1")=="1"
+def openai_workspace_key_migration_scope_done(scope_key:str)->bool:return schema_meta_get(f"openai_workspace_key_v2:{scope_key}")=="1"
 
+def network_check_save(row:dict[str,Any])->None:
+    key=str(row.get("key") or ""); val={"key":key,"label":str(row.get("label") or key),"category":str(row.get("category") or "other"),"ok":1 if row.get("ok") else 0,"detail":str(row.get("detail") or ""),"latency_ms":row.get("latency_ms"),"checked_at":int(row.get("checked_at") or now_ms())}
+    _mut("network_check_status",lambda d:d.__setitem__(key,val))
+def network_check_load(key:str):return _get("network_check_status",key)
+def network_check_load_all():return sorted(_all("network_check_status"),key=lambda r:(r.get("category",""),r.get("key","")))
+def network_check_delete(key:str)->None:_mut("network_check_status",lambda d:d.pop(key,None))
+def network_check_delete_stale(live_keys:set[str])->None:_mut("network_check_status",lambda d:[d.pop(k,None) for k in list(d) if k not in live_keys])
 
-def quota_delete(account_key_or_email: str) -> None:
-    def write(conn):
-        if ":" in account_key_or_email:
-            conn.execute(
-                "DELETE FROM oauth_quota_cache WHERE account_key=?",
-                (account_key_or_email,),
-            )
-            # Historical OpenAI keys could be stored with account_key=email after
-            # early schema upgrades. Keep this as a best-effort cleanup only.
-            prov, identity = account_key_or_email.split(":", 1)
-            if prov == "openai":
-                conn.execute(
-                    "DELETE FROM oauth_quota_cache WHERE account_key=?",
-                    (identity,),
-                )
-        else:
-            conn.execute(
-                "DELETE FROM oauth_quota_cache WHERE email=?",
-                (account_key_or_email,),
-            )
-    _commit_write(write)
+def xai_video_job_save(request_id:str,*,channel_key:str,api_key_name:str,model:str,ttl_seconds:int)->None:
+    ts=now_ms(); exp=ts+max(1,int(ttl_seconds))*1000
+    def op(d):
+        for k,r in list(d.items()):
+            if int(r.get("expires_at") or 0)<=ts:d.pop(k,None)
+        d[request_id]={"request_id":request_id,"channel_key":channel_key,"api_key_name":api_key_name,"model":model,"created_at":ts,"expires_at":exp}
+    _mut("xai_video_jobs",op,strict=True)
+def xai_video_job_load(request_id:str):
+    row=_get("xai_video_jobs",request_id)
+    if row and int(row.get("expires_at") or 0)>now_ms():return row
+    if row:xai_video_job_delete(request_id)
+    return None
+def xai_video_job_delete(request_id:str|None=None)->None:_mut("xai_video_jobs",lambda d:d.pop(request_id,None) if request_id else d.clear(),strict=True)
+def xai_video_job_cleanup(now:int|None=None)->int:
+    cutoff=int(now if now is not None else now_ms())
+    def op(d):
+        keys=[k for k,r in d.items() if int(r.get("expires_at") or 0)<=cutoff]
+        for k in keys:d.pop(k,None)
+        return len(keys)
+    return _mut("xai_video_jobs",op,strict=True)
 
+def perf_save(channel_key:str,model:str,stats:dict[str,Any])->None:
+    row={"channel_key":channel_key,"model":model,"total_requests":int(stats.get("total_requests",0)),"success_count":int(stats.get("success_count",0)),"recent_requests":int(stats.get("recent_requests",0)),"recent_success_count":int(stats.get("recent_success_count",0)),"avg_connect_ms":float(stats.get("avg_connect_ms",0)),"avg_first_byte_ms":float(stats.get("avg_first_byte_ms",0)),"avg_total_ms":float(stats.get("avg_total_ms",0)),"last_updated":int(stats.get("last_updated",now_ms()))}
+    _mut("performance_stats",lambda d:d.__setitem__(_key(channel_key,model),row))
+def perf_load(channel_key:str,model:str):return _get("performance_stats",_key(channel_key,model))
+def perf_load_all():return _all("performance_stats")
+def perf_delete(channel_key:str|None=None,model:str|None=None)->None:
+    _mut("performance_stats",lambda d:[d.pop(k,None) for k,r in list(d.items()) if channel_key is None or (r.get("channel_key")==channel_key and (model is None or r.get("model")==model))])
 
-def quota_patch_passive(account_key: str, patch: dict,
-                        *, email: str | None = None) -> None:
-    """从 Anthropic 响应头采集到的 5h/7d 字段，只更新自己那段。
+def _rename_rows(domain:str,old:str,new:str,*,replace_conflicts:bool=False)->None:
+    def op(d):
+        moving=[(k,r) for k,r in list(d.items()) if r.get("channel_key")==old]
+        for k,r in moving:
+            nr=dict(r);nr["channel_key"]=new
+            nk=_key(new,nr["model"]) if domain in ("performance_stats","channel_errors") else k
+            if replace_conflicts or nk not in d:d[nk]=nr
+            d.pop(k,None)
+    _mut(domain,op)
+def perf_rename_channel(old_key:str,new_key:str)->None:
+    if old_key!=new_key:_rename_rows("performance_stats",old_key,new_key,replace_conflicts=True)
 
-    与 `quota_save` 的区别：
-      - quota_save 走 INSERT OR REPLACE，写全字段（主动拉 /api/oauth/usage）
-      - quota_patch_passive 走 UPDATE（或 INSERT 兜底），**只动 patch 里列出的列**
-        ；绝不覆盖 sonnet/opus/extra/raw_data（那些响应头没有，保留主动拉的值）
+def error_save(channel_key:str,model:str,error_count:int,cooldown_until:int|None,message:str|None)->None:
+    row={"channel_key":channel_key,"model":model,"error_count":error_count,"cooldown_until":cooldown_until,"last_error_message":message,"last_error_at":now_ms()}
+    _mut("channel_errors",lambda d:d.__setitem__(_key(channel_key,model),row))
+def error_load(channel_key:str,model:str):return _get("channel_errors",_key(channel_key,model))
+def error_load_all():return _all("channel_errors")
+def error_delete(channel_key:str|None=None,model:str|None=None)->None:
+    _mut("channel_errors",lambda d:[d.pop(k,None) for k,r in list(d.items()) if channel_key is None or (r.get("channel_key")==channel_key and (model is None or r.get("model")==model))])
+def error_rename_channel(old_key:str,new_key:str)->None:
+    if old_key!=new_key:_rename_rows("channel_errors",old_key,new_key,replace_conflicts=True)
 
-    patch 的 key 必须在白名单内：
-      five_hour_util / five_hour_reset / seven_day_util / seven_day_reset
-    其他 key 会被忽略（保护主动拉写入的字段）。
+def affinity_upsert(fingerprint:str,channel_key:str,model:str,last_used:int|None=None,prompt_cache_key:str|None=None)->None:
+    ts=last_used if last_used is not None else now_ms()
+    def op(d):
+        old=d.get(fingerprint); row=dict(old or {"fingerprint":fingerprint,"created_at":ts,"prompt_cache_key":None});row.update(channel_key=channel_key,model=model,last_used=ts)
+        if prompt_cache_key is not None:row["prompt_cache_key"]=prompt_cache_key
+        d[fingerprint]=row
+    _mut("cache_affinities",op)
+def affinity_touch(fingerprint:str,last_used:int|None=None)->None:
+    ts=last_used if last_used is not None else now_ms();_mut("cache_affinities",lambda d:d.get(fingerprint,{}).__setitem__("last_used",ts) if fingerprint in d else None)
+def affinity_load(fingerprint:str):return _get("cache_affinities",fingerprint)
+def affinity_load_all():return _all("cache_affinities")
+def affinity_delete(fingerprint:str|None=None)->None:_mut("cache_affinities",lambda d:d.pop(fingerprint,None) if fingerprint else d.clear())
+def affinity_delete_by_channel(channel_key:str)->None:_delete_by_channel("cache_affinities",channel_key)
+def affinity_delete_stale_channels(live_keys:Iterable[str])->None:_delete_stale("cache_affinities",live_keys)
+def affinity_rename_channel(old_key:str,new_key:str)->None:
+    if old_key!=new_key:_rename_rows("cache_affinities",old_key,new_key)
+def affinity_cleanup(ttl_ms:int,*,cutoff_ms:int|None=None)->int:return _cleanup("cache_affinities",cutoff_ms if cutoff_ms is not None else now_ms()-ttl_ms)
 
-    若 account_key 行不存在（新账号从未主动拉过），插入一条**只含白名单字段**
-    的行，其余字段全为 NULL，fetched_at=0 作为"未主动同步过"的哨兵值。
-    """
-    ALLOWED = {"five_hour_util", "five_hour_reset",
-               "seven_day_util", "seven_day_reset"}
-    safe = {k: v for k, v in patch.items() if k in ALLOWED}
-    if not safe:
-        return
-    now_ms_val = now_ms()
+def client_affinity_upsert(client_key:str,channel_key:str,model:str,last_used:int|None=None)->None:
+    ts=last_used if last_used is not None else now_ms()
+    def op(d):
+        row=dict(d.get(client_key) or {"client_key":client_key,"created_at":ts});row.update(channel_key=channel_key,model=model,last_used=ts);d[client_key]=row
+    _mut("client_affinities",op)
+def client_affinity_load_all():return _all("client_affinities")
+def client_affinity_delete(client_key:str|None=None)->None:_mut("client_affinities",lambda d:d.pop(client_key,None) if client_key else d.clear())
+def client_affinity_delete_by_channel(channel_key:str)->None:_delete_by_channel("client_affinities",channel_key)
+def client_affinity_delete_stale_channels(live_keys:Iterable[str])->None:_delete_stale("client_affinities",live_keys)
+def client_affinity_rename_channel(old_key:str,new_key:str)->None:
+    if old_key!=new_key:_rename_rows("client_affinities",old_key,new_key)
+def client_affinity_cleanup(ttl_ms:int,*,cutoff_ms:int|None=None)->int:return _cleanup("client_affinities",cutoff_ms if cutoff_ms is not None else now_ms()-ttl_ms)
+def _delete_by_channel(domain,key):_mut(domain,lambda d:[d.pop(k,None) for k,r in list(d.items()) if r.get("channel_key")==key])
+def _delete_stale(domain,live):
+    live=set(live);_mut(domain,lambda d:[d.pop(k,None) for k,r in list(d.items()) if r.get("channel_key") not in live])
+def _cleanup(domain,cutoff):
+    def op(d):
+        keys=[k for k,r in d.items() if int(r.get("last_used") or 0)<cutoff]
+        for k in keys:d.pop(k,None)
+        return len(keys)
+    return _mut(domain,op)
 
-    def write(conn, target_account_key: str):
-        target_email = email
-        if target_email is None:
-            target_email = _quota_display_email(target_account_key)
-        row = conn.execute(
-            "SELECT account_key FROM oauth_quota_cache WHERE account_key=?",
-            (target_account_key,),
-        ).fetchone()
-        if row is None:
-            # 不存在 → INSERT 一条，只带白名单字段，其他 NULL
-            cols = ["account_key", "email", "fetched_at", "last_passive_update_at"]
-            vals = [target_account_key, target_email, 0, now_ms_val]
-            for k, v in safe.items():
-                cols.append(k)
-                vals.append(v)
-            placeholders = ",".join(["?"] * len(cols))
-            conn.execute(
-                f"INSERT INTO oauth_quota_cache ({','.join(cols)}) VALUES ({placeholders})",
-                vals,
-            )
-        else:
-            # 存在 → UPDATE 白名单字段 + last_passive_update_at
-            set_parts = [f"{k}=?" for k in safe.keys()]
-            set_parts.append("last_passive_update_at=?")
-            vals = list(safe.values()) + [now_ms_val, target_account_key]
-            conn.execute(
-                f"UPDATE oauth_quota_cache SET {', '.join(set_parts)} WHERE account_key=?",
-                vals,
-            )
-    _commit_quota_write(account_key, write)
+def provider_usage_load(account_id:str):return _get("api_provider_usage_cache",account_id)
+def provider_usage_load_all():return _all("api_provider_usage_cache")
+def provider_usage_set_fetched_at(account_id:str,fetched_at:int)->None:
+    _mut("api_provider_usage_cache",lambda d:d.get(account_id,{}).__setitem__("fetched_at",fetched_at) if account_id in d else None)
+def provider_usage_save_success(account_id:str,adapter_id:str,snapshot:dict,retry_after:int|None=None)->None:
+    row={"account_id":account_id,"adapter_id":adapter_id,"snapshot_json":json.dumps(snapshot,ensure_ascii=False,separators=(",",":")),"fetched_at":now_ms(),"last_error":None,"error_at":None,"retry_after":retry_after};_mut("api_provider_usage_cache",lambda d:d.__setitem__(account_id,row))
+def provider_usage_save_error(account_id:str,adapter_id:str,error:str,retry_after:int|None=None)->None:
+    def op(d):
+        row=dict(d.get(account_id) or {"account_id":account_id,"snapshot_json":None,"fetched_at":None});row.update(adapter_id=adapter_id,last_error=str(error)[:160],error_at=now_ms(),retry_after=retry_after);d[account_id]=row
+    _mut("api_provider_usage_cache",op)
+def provider_usage_delete(account_id:str)->None:_mut("api_provider_usage_cache",lambda d:d.pop(account_id,None))
 
+_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations")
+def _quota_defaults(row:dict[str,Any])->dict[str,Any]:return {column:row.get(column) for column in _QUOTA_COLUMNS}
 
-def quota_save_openai_snapshot(account_key: str, snap: dict,
-                               normalized: dict | None = None,
-                               *, email: str | None = None) -> None:
-    """OpenAI (Codex) 专用：保存从响应头解析出的限额 snapshot。
+def _quota_display_email(account_key:str)->str:
+    if ":" not in account_key:return account_key
+    provider,identity=account_key.split(":",1)
+    return identity.split(":",1)[0] if provider in {"openai","xai"} and ":" in identity else identity
+def quota_load(account_key_or_email:str):
+    exact=_get("oauth_quota_cache",account_key_or_email)
+    if exact:return exact
+    email=account_key_or_email.split(":",1)[1] if ":" in account_key_or_email else account_key_or_email
+    rows=[r for r in _all("oauth_quota_cache") if r.get("email")==email]
+    return rows[0] if len(rows)==1 else None
+def quota_load_all():return _all("oauth_quota_cache")
+def quota_set_observation_times(account_key:str,*,last_passive_update_at:int|None=None,fetched_at:int|None=None,codex_window_observations:str|None=None)->None:
+    """Explicit maintenance interface used when correcting observation clocks."""
+    def op(d):
+        row=d.get(account_key)
+        if row is None:return
+        if last_passive_update_at is not None:row["last_passive_update_at"]=last_passive_update_at
+        if fetched_at is not None:row["fetched_at"]=fetched_at
+        if codex_window_observations is not None:row["codex_window_observations"]=codex_window_observations
+    _mut("oauth_quota_cache",op)
+def _quota_write(account_key:str, operation):
+    from . import channel_state
+    with channel_state.mutation_lock:
+        source=f"oauth:{account_key}"; target=channel_state.resolve(source)
+        if channel_state.is_deleted(source) or channel_state.is_deleted(target): return None
+        resolved=target[len("oauth:"):] if target.startswith("oauth:") else account_key
+        return _mut("oauth_quota_cache",lambda d:operation(d,resolved))
 
-    snap: src.oauth.openai.parse_rate_limit_headers 的返回值
-      {primary_used_pct / primary_reset_sec / primary_window_min /
-       secondary_* / primary_over_secondary_pct / fetched_at (ms)}
-    normalized: src.oauth.openai.normalize_codex_snapshot 的返回值
-      {five_hour_util / five_hour_reset_sec / seven_day_util / seven_day_reset_sec /
-       thirty_day_util / thirty_day_reset_sec}（只含本次实际观测到的语义窗口）
-      None 时自动 normalize（便于调用方省事）。
-
-    复用现有 five_hour_util / seven_day_util / thirty_day_util 列。只更新本次
-    snapshot 实际包含的语义窗口，避免普通 5h/7d 响应头清空主动 WHAM 的
-    30d 数据，也避免 5h/30d 响应头清空仍有效的 7d 数据。
-    """
-    # 容错：调用方可能只给 snap，normalized 由本函数补
-    from .oauth import openai as _openai_provider
-    if normalized is None:
-        normalized = _openai_provider.normalize_codex_snapshot(snap)
-
-    now = int(time.time())
-    fetched_at = int(snap.get("fetched_at") or now_ms())
-
-    def _reset_iso(sec: int | None) -> str | None:
-        if sec is None:
-            return None
-        ts = now + max(0, int(sec))
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-
-    passive_ts = fetched_at
-    def write(conn, target_account_key: str):
-        target_email = email
-        if target_email is None:
-            target_email = _quota_display_email(target_account_key)
-        semantic_fields = (
-            ("five_hour_util", "five_hour_util", False),
-            ("five_hour_reset", "five_hour_reset_sec", True),
-            ("seven_day_util", "seven_day_util", False),
-            ("seven_day_reset", "seven_day_reset_sec", True),
-            ("thirty_day_util", "thirty_day_util", False),
-            ("thirty_day_reset", "thirty_day_reset_sec", True),
-        )
-        semantic_values = [
-            (column, _reset_iso(normalized.get(key)) if is_reset else normalized.get(key))
-            for column, key, is_reset in semantic_fields
-            if key in normalized
-        ]
-        raw_values = (
-            ("codex_primary_used_pct", snap.get("primary_used_pct")),
-            ("codex_primary_reset_sec", snap.get("primary_reset_sec")),
-            ("codex_primary_window_min", snap.get("primary_window_min")),
-            ("codex_secondary_used_pct", snap.get("secondary_used_pct")),
-            ("codex_secondary_reset_sec", snap.get("secondary_reset_sec")),
-            ("codex_secondary_window_min", snap.get("secondary_window_min")),
-            ("codex_primary_over_secondary_pct", snap.get("primary_over_secondary_pct")),
-        )
-        incoming_observations = _openai_provider.codex_snapshot_window_observations(snap)
-        row = conn.execute(
-            "SELECT account_key, codex_window_observations "
-            "FROM oauth_quota_cache WHERE account_key=?",
-            (target_account_key,),
-        ).fetchone()
-        existing_observations = {}
-        if row is not None and row["codex_window_observations"]:
-            try:
-                existing_observations = json.loads(row["codex_window_observations"])
-            except (TypeError, ValueError):
-                existing_observations = {}
-        merged_observations = _openai_provider.merge_codex_window_observations(
-            existing_observations,
-            incoming_observations,
-        )
-        observations_json = (
-            json.dumps(merged_observations, ensure_ascii=False, separators=(",", ":"),
-                       sort_keys=True)
-            if merged_observations else None
-        )
-        if row is None:
-            columns = ["account_key", "email", "fetched_at", "last_passive_update_at"]
-            values = [target_account_key, target_email, fetched_at, passive_ts]
-            for column, value in (*semantic_values, *raw_values):
-                columns.append(column)
-                values.append(value)
-            if observations_json is not None:
-                columns.append("codex_window_observations")
-                values.append(observations_json)
-            placeholders = ",".join("?" for _ in columns)
-            conn.execute(
-                f"INSERT INTO oauth_quota_cache ({','.join(columns)}) "
-                f"VALUES ({placeholders})",
-                values,
-            )
-        else:
-            updates = [
-                ("email", target_email),
-                ("fetched_at", fetched_at),
-                ("last_passive_update_at", passive_ts),
-                *semantic_values,
-                *raw_values,
-            ]
-            if incoming_observations:
-                updates.append(("codex_window_observations", observations_json))
-            conn.execute(
-                f"UPDATE oauth_quota_cache SET "
-                f"{', '.join(f'{column}=?' for column, _ in updates)} "
-                "WHERE account_key=?",
-                [value for _, value in updates] + [target_account_key],
-            )
-    _commit_quota_write(account_key, write)
-
-# ─── Codex compaction ownership (durable, no affinity TTL) ─────────
-
-def compaction_owner_load(compaction_id: str, content_digest: str) -> dict | None:
-    row = _get_conn().execute(
-        """SELECT compaction_id, content_digest, owner_key, owner_identity,
-                  created_at, last_used
-           FROM codex_compaction_owners
-           WHERE compaction_id=? AND content_digest=?""",
-        (compaction_id, content_digest),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def compaction_owner_upsert(compaction_id: str, content_digest: str,
-                            owner_key: str, owner_identity: str,
-                            *, used_at: int | None = None,
-                            compatible_identities: set[str] | None = None) -> dict:
-    """Record an owner, allowing only explicitly proven identity migration."""
-    ts = used_at if used_at is not None else now_ms()
-    with _write_lock:
-        conn = _get_conn()
-        try:
-            row = conn.execute(
-                """SELECT owner_key, owner_identity FROM codex_compaction_owners
-                   WHERE compaction_id=? AND content_digest=?""",
-                (compaction_id, content_digest),
-            ).fetchone()
-            if (
-                row is not None
-                and row["owner_identity"] != owner_identity
-                and row["owner_identity"] not in (compatible_identities or set())
-            ):
-                raise ValueError("compaction owner conflict")
-            if row is None:
-                conn.execute(
-                    """INSERT INTO codex_compaction_owners
-                       (compaction_id, content_digest, owner_key, owner_identity,
-                        created_at, last_used) VALUES (?,?,?,?,?,?)""",
-                    (compaction_id, content_digest, owner_key, owner_identity, ts, ts),
-                )
+def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None)->None:
+    cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","extra_used","extra_limit","extra_util","raw_data")
+    def op(d,target):
+        row=_quota_defaults(dict(d.get(target) or {}));row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))});row.update({k:data.get(k) for k in cols});d[target]=row
+    _quota_write(account_key,op)
+def quota_delete(value:str)->None:
+    from . import channel_state
+    with channel_state.mutation_lock:
+        def op(d):
+            if ":" in value:
+                d.pop(value,None)
+                if value.startswith("openai:"):d.pop(value.split(":",1)[1],None)
             else:
-                conn.execute(
-                    """UPDATE codex_compaction_owners
-                       SET owner_key=?, owner_identity=?, last_used=?
-                       WHERE compaction_id=? AND content_digest=?""",
-                    (owner_key, owner_identity, ts, compaction_id, content_digest),
-                )
-            conn.commit()
-        except BaseException:
-            _rollback_failed_write(conn)
-            raise
-    return compaction_owner_load(compaction_id, content_digest) or {}
+                for k,r in list(d.items()):
+                    if r.get("email")==value:d.pop(k,None)
+        _mut("oauth_quota_cache",op)
+def quota_patch_passive(account_key:str,patch:dict,*,email:str|None=None)->None:
+    safe={k:v for k,v in patch.items() if k in {"five_hour_util","five_hour_reset","seven_day_util","seven_day_reset"}}
+    if not safe:return
+    def op(d,target):
+        row=_quota_defaults(dict(d.get(target) or {"account_key":target,"email":email or _quota_display_email(target),"fetched_at":0}));row.update(safe);row["last_passive_update_at"]=now_ms();d[target]=row
+    _quota_write(account_key,op)
+def quota_save_openai_snapshot(account_key:str,snap:dict,normalized:dict|None=None,*,email:str|None=None)->None:
+    from .oauth import openai as provider
+    if normalized is None:normalized=provider.normalize_codex_snapshot(snap)
+    fetched=int(snap.get("fetched_at") or now_ms()); now=int(time.time())
+    def reset(sec):return None if sec is None else time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(now+max(0,int(sec))))
+    mapping=(("five_hour_util","five_hour_util",False),("five_hour_reset","five_hour_reset_sec",True),("seven_day_util","seven_day_util",False),("seven_day_reset","seven_day_reset_sec",True),("thirty_day_util","thirty_day_util",False),("thirty_day_reset","thirty_day_reset_sec",True))
+    raw=(("codex_primary_used_pct","primary_used_pct"),("codex_primary_reset_sec","primary_reset_sec"),("codex_primary_window_min","primary_window_min"),("codex_secondary_used_pct","secondary_used_pct"),("codex_secondary_reset_sec","secondary_reset_sec"),("codex_secondary_window_min","secondary_window_min"),("codex_primary_over_secondary_pct","primary_over_secondary_pct"))
+    def op(d,target):
+        row=_quota_defaults(dict(d.get(target) or {"account_key":target}));row.update(account_key=target,email=email or _quota_display_email(target),fetched_at=fetched,last_passive_update_at=fetched)
+        for col,key,is_reset in mapping:
+            if key in normalized:row[col]=reset(normalized.get(key)) if is_reset else normalized.get(key)
+        for col,key in raw:row[col]=snap.get(key)
+        incoming=provider.codex_snapshot_window_observations(snap)
+        if incoming:
+            try:existing=json.loads(row.get("codex_window_observations") or "{}")
+            except (TypeError,ValueError):existing={}
+            merged=provider.merge_codex_window_observations(existing,incoming);row["codex_window_observations"]=json.dumps(merged,ensure_ascii=False,separators=(",",":"),sort_keys=True)
+        d[target]=row
+    _quota_write(account_key,op)
+
+def quota_rename_account_key(old_key:str,new_key:str,*,email:str|None=None)->int:
+    if old_key==new_key:return 0
+    from . import channel_state
+    with channel_state.mutation_lock:
+        if channel_state.is_deleted(f"oauth:{old_key}") or channel_state.is_deleted(f"oauth:{new_key}"): return 0
+        def op(d):
+            old=d.pop(old_key,None)
+            if not old:return 0
+            target=dict(d.get(new_key) or {});target.update(old);target["account_key"]=new_key
+            if email is not None:target["email"]=email
+            d[new_key]=target;return 1
+        return _mut("oauth_quota_cache",op)
+def run_composite_key_migration(email_to_key:dict[str,str])->dict[str,Any]:
+    if composite_key_migration_done():return {"skipped":True,"reason":"flag already set","migrated_quota_rows":0,"migrated_channel_rows":0}
+    quota_rows=0;channel_rows=0
+    for email,new_account in email_to_key.items():
+        quota_rows+=quota_rename_account_key(email,new_account,email=email)
+        old_channel=f"oauth:{email}";new_channel=f"oauth:{new_account}"
+        before=sum(r.get("channel_key")==old_channel for domain in (perf_load_all(),error_load_all(),affinity_load_all(),client_affinity_load_all()) for r in domain)
+        rename_runtime_channel_state(old_channel,new_channel)
+        channel_rows+=before
+    # Bare-email rows not represented by live config are legacy orphans.
+    for row in quota_load_all():
+        orphan = str(row.get("account_key") or "")
+        if ":" not in orphan and orphan not in email_to_key:
+            # Delete the exact storage key. Public quota_delete(email) deliberately
+            # retains its email-wide semantics for user-requested cleanup.
+            _mut("oauth_quota_cache", lambda d, key=orphan: d.pop(key, None))
+    schema_meta_set(COMPOSITE_KEY_FLAG,COMPOSITE_KEY_VERSION)
+    return {"skipped":False,"migrated_quota_rows":quota_rows,"migrated_channel_rows":channel_rows}
+def run_openai_workspace_key_migration(old_to_new:dict[str,dict[str,str]],*,scope_key:str|None=None)->dict[str,Any]:
+    flag=f"openai_workspace_key_v2:{scope_key}" if scope_key else "openai_workspace_key_v1"
+    if schema_meta_get(flag)=="1":return {"skipped":True,"reason":"mapping scope already migrated","quota_rows":0,"channel_rows":0}
+    quota_rows=0;channel_rows=0
+    for old,spec in old_to_new.items():
+        new=spec.get("new") or old
+        quota_rows+=quota_rename_account_key(old,new,email=spec.get("email"))
+        old_channel=f"oauth:{old}";new_channel=f"oauth:{new}"
+        before=sum(r.get("channel_key")==old_channel for domain in (perf_load_all(),error_load_all(),affinity_load_all(),client_affinity_load_all()) for r in domain)
+        rename_runtime_channel_state(old_channel,new_channel);channel_rows+=before
+    schema_meta_set(flag,"1");return {"skipped":False,"quota_rows":quota_rows,"channel_rows":channel_rows}
+
+def rename_runtime_channel_state(old_channel_key:str,new_channel_key:str,*,old_account_key:str|None=None,new_account_key:str|None=None,email:str|None=None)->None:
+    domains=("performance_stats","channel_errors","cache_affinities","client_affinities","oauth_quota_cache")
+    def op(data):
+        if old_channel_key!=new_channel_key:
+            for domain in domains[:4]:
+                bucket=data[domain]
+                for key,row in list(bucket.items()):
+                    if row.get("channel_key")!=old_channel_key:continue
+                    moved=dict(row);moved["channel_key"]=new_channel_key
+                    target=_key(new_channel_key,moved["model"]) if domain in ("performance_stats","channel_errors") else key
+                    bucket[target]=moved;bucket.pop(key,None)
+        if old_account_key and new_account_key and old_account_key!=new_account_key:
+            bucket=data["oauth_quota_cache"];row=bucket.pop(old_account_key,None)
+            if row:
+                target=dict(bucket.get(new_account_key) or {});target.update(row);target["account_key"]=new_account_key
+                if email is not None:target["email"]=email
+                bucket[new_account_key]=target
+    get_store()._mutate_many(domains,op,strict=False)
+
+def compaction_owner_load(compaction_id:str,content_digest:str):return _get("codex_compaction_owners",_key(compaction_id,content_digest))
+def compaction_owner_upsert(compaction_id:str,content_digest:str,owner_key:str,owner_identity:str,*,used_at:int|None=None,compatible_identities:set[str]|None=None)->dict:
+    ts=used_at if used_at is not None else now_ms(); key=_key(compaction_id,content_digest)
+    def op(d):
+        old=d.get(key)
+        if old and old.get("owner_identity")!=owner_identity and old.get("owner_identity") not in (compatible_identities or set()):raise ValueError("compaction owner conflict")
+        row=dict(old or {"compaction_id":compaction_id,"content_digest":content_digest,"created_at":ts});row.update(owner_key=owner_key,owner_identity=owner_identity,last_used=ts);d[key]=row;return row
+    return _mut("codex_compaction_owners",op,strict=True)
+
+# Explicit durable interfaces used by updater/checker/status monitor.
+def updater_load()->dict:
+    row=_get("app_self_update","1") or {}
+    row.pop("id",None); row["stage"]=row.get("stage") or "idle"
+    return row
+def updater_save(fields:dict[str,Any])->None:
+    def op(d):row=dict(d.get("1") or {"id":1});row.update(fields);row["updated_at"]=int(fields.get("updated_at",time.time()));d["1"]=row
+    _mut("app_self_update",op,strict=True)
+def update_state_load(repo:str):return _get("app_update_state",repo)
+def update_state_save(repo:str,row:dict[str,Any])->None:_mut("app_update_state",lambda d:d.__setitem__(repo,{**row,"repo":repo,"checked_at":int(time.time())}),strict=True)
+def status_seen_load(provider:str)->set[str]:return {r["update_id"] for r in _all("status_seen_updates") if r.get("provider")==provider}
+def status_seen_mark(provider:str,update_id:str,incident_id:str,status:str|None)->None:
+    key=_key(provider,update_id);_mut("status_seen_updates",lambda d:d.setdefault(key,{"provider":provider,"update_id":update_id,"incident_id":incident_id,"status":status,"seen_at":int(time.time())}),strict=True)
+def status_muted_load_all()->list[dict]:return sorted(_all("status_muted_incidents"),key=lambda r:r.get("muted_at",0),reverse=True)
+def status_muted_save(provider:str,incident_id:str,name:str="")->None:
+    key=_key(provider,incident_id);_mut("status_muted_incidents",lambda d:d.__setitem__(key,{"provider":provider,"incident_id":incident_id,"name":name or "","muted_at":int(time.time())}),strict=True)
+def status_muted_delete(provider:str,incident_id:str)->None:_mut("status_muted_incidents",lambda d:d.pop(_key(provider,incident_id),None),strict=True)
+def status_muted_cleanup(live_ids_by_provider:dict[str,set[str]])->int:
+    def op(d):
+        keys=[k for k,r in d.items() if r.get("provider") in live_ids_by_provider and r.get("incident_id") not in live_ids_by_provider[r["provider"]]]
+        for k in keys:d.pop(k,None)
+        return len(keys)
+    return _mut("status_muted_incidents",op,strict=True)

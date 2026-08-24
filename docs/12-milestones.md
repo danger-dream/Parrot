@@ -1,5 +1,7 @@
 # 12 — 实施里程碑
 
+> 历史说明：下文早期里程碑中的 `state.db`、WAL checkpoint 和数据库双层描述记录当时实现；当前应用状态由内存 StateStore 与 verified runtime/durable JSON snapshots 持有，SQLite 仅保留为只读升级源及独立业务日志/response Store。
+
 按模块独立可验证拆分。每个里程碑完成后应有可运行的增量，避免"全部做完再测"。
 
 ## 0 — 贯穿所有里程碑的硬约束：OAuth 不做主动测试
