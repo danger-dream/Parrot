@@ -240,9 +240,9 @@ async def open_socket_via_ss2022(
         raise OSError("websocket URL missing host")
     port = p.port or (443 if p.scheme == "wss" else 80)
 
-    from ..proxy.ss2022 import SS2022Connection
+    from ..proxy.ss2022 import create_ss_connection
 
-    conn = SS2022Connection(
+    conn = create_ss_connection(
         connector.cipher,
         connector.password,
         connector.server,

@@ -13,6 +13,7 @@ from typing import Optional
 from ... import config, oauth_manager
 from ...proxy import manager as pm
 from ...proxy.connector import parse_proxy_url, _mask_url
+from ...proxy.ss2022 import ss_family_label
 from ...channel import registry
 from .. import states, ui
 
@@ -87,9 +88,17 @@ def _valid_name(s: str) -> bool:
 def _proxy_detail_line(c) -> str:
     """Return a non-redundant proxy detail line for Telegram lists."""
     if c.type == "ss2022":
-        server = ui.escape_html(getattr(c, "server", ""))
-        port = ui.escape_html(getattr(c, "port", ""))
-        return f"📍 SS2022 · <code>{server}:{port}</code>"
+        server = ui.escape_html(str(getattr(c, "server", "")))
+        port = ui.escape_html(str(getattr(c, "port", "")))
+        cipher = str(getattr(c, "cipher", "") or "")
+        label = ss_family_label(cipher) if cipher else "SS2022"
+        if cipher:
+            return (
+                f"📍 {ui.escape_html(label)} · "
+                f"<code>{ui.escape_html(cipher)}</code> · "
+                f"<code>{server}:{port}</code>"
+            )
+        return f"📍 {ui.escape_html(label)} · <code>{server}:{port}</code>"
     if c.type == "socks5":
         url = ui.escape_html(_mask_url(getattr(c, "url", "")))
         return f"📍 SOCKS5 · <code>{url}</code>"
@@ -378,11 +387,14 @@ def _add_start(chat_id: int, message_id: int, cb_id: str) -> None:
         chat_id, message_id,
         "➕ <b>添加代理</b>\n\n"
         "请输入代理地址（URL 格式）：\n\n"
-        "🔒 <b>SS2022</b>\n"
-        "<code>ss://&lt;base64&gt;@host:port#名称</code>\n\n"
+        "🔒 <b>Shadowsocks</b>\n"
+        "<code>ss://&lt;base64&gt;@host:port#名称</code>\n"
+        "<code>ss://method:password@host:port#名称</code>\n"
+        "SS2022 或 <code>chacha20-ietf-poly1305</code> / "
+        "<code>aes-256-gcm</code> / <code>aes-128-gcm</code>\n\n"
         "🧦 <b>SOCKS5</b>\n"
         "<code>socks5://[user:pass@]host:port#名称</code>\n\n"
-        "<i>URL 中 # 后面的名称可选；如未包含会要求输入。</i>",
+        "<i>URL 中 # 后面的名称可选；如未包含会要求输入。不支持 SIP003 插件。</i>",
         reply_markup=ui.inline_kb([[ui.btn("❌ 取消", "px:show")]]),
     )
 

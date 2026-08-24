@@ -19,7 +19,13 @@ from urllib.parse import urlparse
 import httpcore
 import httpx
 
-from .ss2022 import SS2022Connection, SS2022Error, parse_ss_url
+from .ss2022 import (
+    SSError,
+    create_ss_connection,
+    is_supported_ss_cipher,
+    parse_ss_url,
+    ss_family_label,
+)
 
 
 # ── Errors ───────────────────────────────────────────────────────
@@ -248,7 +254,7 @@ class SS2022DuplexBridge:
     pump tasks, and the raw ``SS2022Connection``.
     """
 
-    def __init__(self, conn: SS2022Connection, *, byte_counter: Any = None):
+    def __init__(self, conn: Any, *, byte_counter: Any = None):
         self._conn = conn
         self._byte_counter = byte_counter
         self._loop = asyncio.get_running_loop()
@@ -274,7 +280,7 @@ class SS2022DuplexBridge:
     @classmethod
     async def create(
         cls,
-        conn: SS2022Connection,
+        conn: Any,
         *,
         byte_counter: Any = None,
     ) -> "SS2022DuplexBridge":
@@ -481,7 +487,7 @@ class _SS2022Stream(httpcore.AsyncNetworkStream):
     upgrade (start_tls), so we don't need to implement HTTP parsing ourselves.
     """
 
-    def __init__(self, conn: SS2022Connection):
+    def __init__(self, conn: Any):
         self._conn = conn
         self._closed = False
 
@@ -637,15 +643,15 @@ class _SS2022Backend(httpcore.AsyncNetworkBackend):
                           timeout: float | None = None,
                           local_address: str | None = None,
                           socket_options=None) -> httpcore.AsyncNetworkStream:
-        conn = SS2022Connection(
+        conn = create_ss_connection(
             self._cipher, self._password, self._server, self._port,
             timing=self._timing,
         )
         try:
             await conn.connect(host, port, timeout=timeout or 8.0)
-        except (ConnectionError, TimeoutError, OSError, SS2022Error) as e:
+        except (ConnectionError, TimeoutError, OSError, SSError) as e:
             raise httpcore.ConnectError(
-                f"SS2022 {self._server}:{self._port}: {e}") from e
+                f"SS {self._server}:{self._port}: {e}") from e
         return _SS2022Stream(conn)
 
     async def connect_unix_socket(self, path, timeout=None, socket_options=None):
@@ -658,6 +664,8 @@ class _SS2022Backend(httpcore.AsyncNetworkBackend):
 class SS2022Connector(Connector):
     def __init__(self, name: str, server: str, port: int,
                  cipher: str, password: str):
+        if not is_supported_ss_cipher(cipher):
+            raise ValueError(f"unsupported cipher: {cipher}")
         super().__init__(name, "ss2022")
         self.server = server
         self.port = port
@@ -665,7 +673,7 @@ class SS2022Connector(Connector):
         self.password = password
 
     def display(self) -> str:
-        return f"{self.name} (SS2022) {self.server}:{self.port}"
+        return f"{self.name} ({ss_family_label(self.cipher)}) {self.server}:{self.port}"
 
     def config_dict(self) -> dict:
         return {
