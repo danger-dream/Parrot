@@ -4,7 +4,8 @@
   - codex_oauth_transform.apply_codex_oauth_transform 的强制改造语义：
     store=false / stream=true / 不支持字段剥离 / 模型名规范化 / input 字符串
     包成消息数组 / input 里 system 提 instructions / instructions 兜底 /
-    legacy functions-function_call 转换
+    legacy functions-function_call 转换 / Responses Lite 把 tools 挪进
+    additional_tools 后仍保留 parallel_tool_calls=false
   - 模型名直接透传（v0.6+ 移除别名映射）
   - registry.rebuild_from_config 按 provider 分派 OAuth 渠道
   - OpenAIOAuthChannel.build_upstream_request：
@@ -316,6 +317,43 @@ def test_transform_normalizes_chat_style_tools(m):
     print("  [PASS] transform: chat-style tools flattened; invalid dropped; non-function preserved")
 
 
+def _additional_tools_from_input(body: dict) -> list:
+    for item in body.get("input") or []:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            tools = item.get("tools")
+            return tools if isinstance(tools, list) else []
+    return []
+
+
+def test_transform_responses_lite_keeps_parallel_tool_calls_for_additional_tools(m):
+    """Lite 把顶层 tools 挪进 additional_tools 后，必须保住 parallel_tool_calls=false。
+
+    对齐 sub2api 0.1.181：只认顶层 tools 的清理会把刚钉上的 false 删掉，
+    上游默认 true，Lite 会 400：
+    X-OpenAI-Internal-Codex-Responses-Lite requires parallel_tool_calls to be false.
+    """
+    t = m["transform"]
+    cases = {
+        "function": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+        "namespace": [{
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [{"type": "function", "name": "spawn_agent"}],
+        }],
+    }
+    for label, tools in cases.items():
+        out = t.apply_codex_oauth_transform({
+            "model": "gpt-5.6-luna",
+            "input": "hi",
+            "tools": tools,
+            "parallel_tool_calls": True,
+        })
+        assert "tools" not in out, label
+        assert out["parallel_tool_calls"] is False, label
+        assert _additional_tools_from_input(out) == tools, label
+    print("  [PASS] transform: Responses Lite keeps parallel_tool_calls=false with additional_tools")
+
+
 def test_channel_model_passthrough(m):
     """v0.6.x 起：账号 models 列表中的名字原样透传给上游，transform 不做别名映射。"""
     _setup(m)
@@ -470,6 +508,31 @@ def test_channel_responses_ingress_gpt56_enables_responses_lite(m):
     assert payload["input"][1]["content"][0]["type"] == "input_text"
     assert payload["input"][2] == {"type": "message", "role": "user", "content": "hi"}
     print("  [PASS] channel: GPT-5.6 enables Codex Responses Lite")
+
+
+def test_channel_responses_lite_keeps_parallel_tool_calls_for_additional_tools(m):
+    """Channel 发出的 Lite 请求在 tools 已进 additional_tools 后仍带 parallel_tool_calls=false。"""
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    tools = [{"type": "function", "name": "shell", "parameters": {"type": "object"}}]
+    req = asyncio.run(ch.build_upstream_request(
+        {
+            "model": "gpt-5.6-luna",
+            "input": "hi",
+            "tools": tools,
+            "parallel_tool_calls": True,
+        },
+        "gpt-5.6-luna",
+        ingress_protocol="responses",
+    ))
+    h = {k.lower(): v for k, v in req.headers.items()}
+    payload = json.loads(req.body)
+    assert h["x-openai-internal-codex-responses-lite"] == "true"
+    assert "tools" not in payload
+    assert payload["parallel_tool_calls"] is False
+    assert _additional_tools_from_input(payload) == tools
+    print("  [PASS] channel: Responses Lite keeps parallel_tool_calls=false with additional_tools")
 
 
 def test_channel_responses_ingress_replay_scope_and_injection(m):
@@ -1036,11 +1099,13 @@ def main():
         test_transform_legacy_functions,
         test_transform_tool_choice_and_input_refs,
         test_transform_normalizes_chat_style_tools,
+        test_transform_responses_lite_keeps_parallel_tool_calls_for_additional_tools,
         test_channel_model_passthrough,
         test_transform_model_passthrough,
         test_channel_basic,
         test_channel_default_models_fallback,
         test_channel_responses_ingress,
+        test_channel_responses_lite_keeps_parallel_tool_calls_for_additional_tools,
         test_channel_responses_ingress_replay_scope_and_injection,
         test_channel_chat_ingress_translator,
         test_channel_previous_response_id_rejected,
