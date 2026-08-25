@@ -92,7 +92,7 @@ def _catalog(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema": 1, "models": records}
 
 
-def discover_openai(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult:
+def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token:
@@ -112,7 +112,7 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryRes
     if workspace:
         headers["ChatGPT-Account-ID"] = workspace
     payload = _json_object(network.get_sync(
-        url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_openai",
+        url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_openai", proxy_channel=proxy_channel,
     ))
     records = payload.get("models")
     if not isinstance(records, list):
@@ -149,7 +149,7 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryRes
     return DiscoveryResult(models, _catalog(normalized), "upstream:codex")
 
 
-def discover_claude(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult:
+def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token:
@@ -168,7 +168,7 @@ def discover_claude(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryRes
             raise ValueError("Claude model catalog pagination loop")
         seen_urls.add(url)
         payload = _json_object(network.get_sync(
-            url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_anthropic",
+            url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_anthropic", proxy_channel=proxy_channel,
         ))
         data = payload.get("data")
         if not isinstance(data, list):
@@ -227,14 +227,14 @@ def _xai_is_text(record: dict) -> bool:
     return False
 
 
-def discover_xai(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult:
+def discover_xai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token: raise ValueError("missing access token")
     base = str(account.get("base_url") or account.get("baseUrl") or xai_provider.api_base_url()).rstrip("/")
     if not base.endswith("/v1"): base += "/v1"
     headers = {"authorization": f"Bearer {token}", "accept": "application/json"}
-    payload = _json_object(network.get_sync(base + "/language-models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai"))
+    payload = _json_object(network.get_sync(base + "/language-models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
     records = payload.get("data", payload.get("models"))
     if not isinstance(records, list): raise ValueError("xAI model catalog has invalid schema")
     records = [item for item in records if isinstance(item, dict)]
@@ -242,7 +242,7 @@ def discover_xai(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult
     if not models: raise ValueError("xAI model catalog has no verified language models")
     enrichment: dict[str, dict] = {}
     try:
-        extra = _json_object(network.get_sync(base + "/models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai"))
+        extra = _json_object(network.get_sync(base + "/models", headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_xai", proxy_channel=proxy_channel))
         values = extra.get("data", extra.get("models"))
         if isinstance(values, list): enrichment = {str(i.get("id") or i.get("name") or ""): i for i in values if isinstance(i, dict)}
     except Exception: pass
@@ -261,8 +261,8 @@ def discover_xai(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult
 
 
 _ANTIGRAVITY_EXCLUDED_CATALOG_IDS = frozenset({
-    # Antigravity IDE-internal/experimental entries excluded by the current CPA
-    # catalog generator. They are not ordinary requestable account models.
+    # Antigravity IDE-internal/experimental entries.
+    # They are not ordinary requestable account models.
     "chat_20706",
     "chat_23310",
     "tab_flash_lite_preview",
@@ -311,7 +311,7 @@ def _antigravity_is_text(record: dict, image_model_ids: set[str]) -> bool:
     return True
 
 
-def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult:
+def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     project_id = str(account.get("project_id") or account.get("projectId") or "")
@@ -331,7 +331,7 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT) -> Discove
             payload = _json_object(network.post_sync(
                 base.rstrip("/") + "/v1internal:fetchAvailableModels",
                 headers=headers, json=body, timeout=deadline.remaining(),
-                proxy_purpose="oauth_antigravity",
+                proxy_purpose="oauth_antigravity", proxy_channel=proxy_channel,
             ))
             raw = payload.get("models")
             if not isinstance(raw, dict):
@@ -361,11 +361,16 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT) -> Discove
     raise last_error or ValueError("Antigravity model discovery failed")
 
 
-def discover_cursor(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult:
+def discover_cursor(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     token = str(account.get("access_token") or "")
     if not token:
         raise ValueError("missing access token")
-    payload = cursor_provider.fetch_model_catalog_sync(token)
+    if proxy_channel:
+        payload = cursor_provider.fetch_model_catalog_sync(
+            token, account_key=proxy_channel.removeprefix("oauth:"),
+        )
+    else:
+        payload = cursor_provider.fetch_model_catalog_sync(token)
     records = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(records, list):
         raise ValueError("Cursor model catalog has invalid schema")
@@ -384,11 +389,11 @@ ADAPTERS: dict[str, Callable[..., DiscoveryResult]] = {
 }
 
 
-def discover(account: dict, *, timeout: float = _TIMEOUT) -> DiscoveryResult:
+def discover(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     from .oauth import normalize_provider
     provider = normalize_provider(account.get("provider") or account.get("type"))
     try:
         adapter = ADAPTERS[provider]
     except KeyError as exc:
         raise ValueError(f"unsupported OAuth model provider: {provider}") from exc
-    return adapter(account, timeout=timeout)
+    return adapter(account, timeout=timeout, proxy_channel=proxy_channel)

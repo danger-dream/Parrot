@@ -387,7 +387,8 @@ def _mock_models() -> list[CursorModel]:
     ]
 
 
-def fetch_models_sync(access_token: str, *, timeout: float | None = None) -> list[CursorModel]:
+def fetch_models_sync(access_token: str, *, timeout: float | None = None,
+                      account_key: str = "") -> list[CursorModel]:
     if _mock_mode_enabled():
         return _mock_models()
     return list_cursor_models(
@@ -395,11 +396,16 @@ def fetch_models_sync(access_token: str, *, timeout: float | None = None) -> lis
         include_hidden=False,
         use_model_parameters=True,
         timeout_s=timeout,
+        account_key=account_key,
+        channel_key=f"oauth:{account_key}" if account_key else "",
     )
 
 
-def fetch_model_catalog_sync(access_token: str, *, timeout: float | None = None) -> dict[str, Any]:
-    return build_catalog(fetch_models_sync(access_token, timeout=timeout))
+def fetch_model_catalog_sync(access_token: str, *, timeout: float | None = None,
+                             account_key: str = "") -> dict[str, Any]:
+    return build_catalog(fetch_models_sync(
+        access_token, timeout=timeout, account_key=account_key,
+    ))
 
 
 def _normalize_iso(value: Any) -> str | None:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -187,7 +188,7 @@ def _post_token_form(data: dict) -> dict:
     return resp.json()
 
 
-def _post_token_json(data: dict) -> dict:
+def _post_token_json(data: dict, *, proxy_channel: str = "") -> dict:
     """同步 POST application/json 到 token 端点。
 
     Codex 当前的 refresh_token 走 JSON
@@ -204,6 +205,7 @@ def _post_token_json(data: dict) -> dict:
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
         proxy_purpose="oauth_openai",
+        proxy_channel=proxy_channel,
     )
     resp.raise_for_status()
     return resp.json()
@@ -351,7 +353,7 @@ def _candidate_matches(info: dict, *, workspace_id: str = "", org_id: str = "") 
     return False
 
 
-def _fetch_accounts_check_payload_sync(access_token: str) -> dict | None:
+def _fetch_accounts_check_payload_sync(access_token: str, *, proxy_channel: str = "") -> dict | None:
     if not access_token or _mock_mode_enabled():
         return None
     try:
@@ -366,6 +368,7 @@ def _fetch_accounts_check_payload_sync(access_token: str) -> dict | None:
             },
             timeout=_ACCOUNTS_CHECK_TIMEOUT,
             proxy_purpose="oauth_openai",
+            proxy_channel=proxy_channel,
         )
         resp.raise_for_status()
         return resp.json()
@@ -445,7 +448,8 @@ def _select_accounts_check_candidate(candidates: list[dict], *, workspace_id: st
 
 def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
                               workspace_id: str | None = None,
-                              email: str | None = None) -> dict | None:
+                              email: str | None = None,
+                              proxy_channel: str = "") -> dict | None:
     """调用 ChatGPT accounts/check 补全 plan / subscription 信息。
 
     这是 best-effort 辅助能力：失败、结构不符合预期、无 plan 时均返回 None，
@@ -453,7 +457,7 @@ def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
     """
     org_id = str(org_id or _extract_org_id_from_token(access_token) or "")
     workspace_id = str(workspace_id or "")
-    payload = _fetch_accounts_check_payload_sync(access_token)
+    payload = _fetch_accounts_check_payload_sync(access_token, proxy_channel=proxy_channel)
     if not payload:
         return None
     candidates = _accounts_check_candidates(payload, email=email)
@@ -465,7 +469,8 @@ def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
 
 
 def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
-                               org_id: str | None = None) -> dict:
+                               org_id: str | None = None,
+                               proxy_channel: str = "") -> dict:
     """用 accounts/check 补全 token 响应中的 plan / subscription 信息。"""
     if not isinstance(data, dict) or not data.get("access_token"):
         return data
@@ -488,6 +493,7 @@ def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
         org_id=selected_org_id,
         workspace_id=selected_workspace_id,
         email=selected_email,
+        proxy_channel=proxy_channel,
     )
     if not info:
         return data
@@ -527,7 +533,8 @@ async def exchange_code(code: str, code_verifier: str,
 
 def refresh_sync(refresh_token: str, *, email: str | None = None,
                  workspace_id: str | None = None,
-                 org_id: str | None = None) -> dict:
+                 org_id: str | None = None,
+                 account_key: str = "") -> dict:
     """同步版：用 refresh_token 换新 access_token。
 
     email 仅用于 mockMode 伪造 id_token 时保持 email 一致，真实 HTTP 不用。
@@ -535,11 +542,13 @@ def refresh_sync(refresh_token: str, *, email: str | None = None,
     if _mock_mode_enabled():
         return _mock_token_response(email, workspace_id=workspace_id, org_id=org_id)
     # 与 codex-rs/login/src/auth/manager.rs:817 对齐：refresh 走 JSON，仅 3 字段，不带 scope。
+    proxy_channel = f"oauth:{account_key}" if account_key else ""
     return enrich_token_response_sync(_post_token_json({
         "client_id": CLIENT_ID,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-    }), workspace_id=workspace_id, org_id=org_id)
+    }, proxy_channel=proxy_channel), workspace_id=workspace_id, org_id=org_id,
+        proxy_channel=proxy_channel)
 
 
 async def refresh(refresh_token: str, *, email: str | None = None,
@@ -789,7 +798,8 @@ def _mock_rate_limit_reset_credits_payload() -> dict:
     }
 
 
-def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -> dict:
+def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None,
+                          account_key: str = "") -> dict:
     """主动拉 ChatGPT/Codex quota。
 
     失败会抛异常；调用方必须把失败视为“额度未知”，不能用旧/空数据恢复
@@ -816,15 +826,29 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None) -
         headers=headers,
         timeout=_WHAM_USAGE_TIMEOUT,
         proxy_purpose="oauth_openai",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     return normalize_wham_usage(resp.json())
 
 
-async def fetch_wham_usage(access_token: str, *, account_id: str | None = None) -> dict:
-    return await asyncio.to_thread(
-        fetch_wham_usage_sync, access_token, account_id=account_id,
-    )
+async def fetch_wham_usage(access_token: str, *, account_id: str | None = None,
+                           account_key: str = "") -> dict:
+    kwargs = {"account_id": account_id}
+    try:
+        params = inspect.signature(fetch_wham_usage_sync).parameters.values()
+        accepts_account_key = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD or
+            (p.name == "account_key" and p.kind is not inspect.Parameter.POSITIONAL_ONLY)
+            for p in params
+        )
+    except (TypeError, ValueError):
+        # Opaque extension/builtin: prefer one modern invocation over a
+        # potentially duplicated request triggered by catching TypeError.
+        accepts_account_key = True
+    if accepts_account_key:
+        kwargs["account_key"] = account_key
+    return await asyncio.to_thread(fetch_wham_usage_sync, access_token, **kwargs)
 
 
 def _normalize_reset_credit_timestamp(value: Any) -> str | None:
@@ -870,7 +894,8 @@ def normalize_rate_limit_reset_credits(payload: dict) -> dict:
 
 
 def fetch_rate_limit_reset_credits_sync(access_token: str, *,
-                                        account_id: str | None = None) -> dict:
+                                        account_id: str | None = None,
+                                        account_key: str = "") -> dict:
     """Fetch available OpenAI/Codex reset-credit cards from ChatGPT WHAM.
 
     This mirrors openai/codex `list_rate_limit_reset_credits`: Parrot uses its
@@ -898,15 +923,18 @@ def fetch_rate_limit_reset_credits_sync(access_token: str, *,
         headers=headers,
         timeout=_WHAM_RESET_CREDIT_LIST_TIMEOUT,
         proxy_purpose="oauth_openai",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     return normalize_rate_limit_reset_credits(resp.json())
 
 
 async def fetch_rate_limit_reset_credits(access_token: str, *,
-                                         account_id: str | None = None) -> dict:
+                                         account_id: str | None = None,
+                                         account_key: str = "") -> dict:
     return await asyncio.to_thread(
-        fetch_rate_limit_reset_credits_sync, access_token, account_id=account_id,
+        fetch_rate_limit_reset_credits_sync, access_token,
+        account_id=account_id, account_key=account_key,
     )
 
 

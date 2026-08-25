@@ -286,7 +286,7 @@ def build_login_url(
 # ─── token exchange / refresh ────────────────────────────────────
 
 
-def _post_token_form(token_endpoint: str, data: dict) -> dict:
+def _post_token_form(token_endpoint: str, data: dict, *, proxy_channel: str = "") -> dict:
     resp = network.post_sync(
         validate_oauth_endpoint(token_endpoint or _token_url(), "token_endpoint"),
         data=data,
@@ -297,6 +297,7 @@ def _post_token_form(token_endpoint: str, data: dict) -> dict:
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
         proxy_purpose="oauth_xai",
+        proxy_channel=proxy_channel,
     )
     resp.raise_for_status()
     return resp.json()
@@ -372,6 +373,7 @@ def refresh_sync(
     token_endpoint: str | None = None,
     email: str | None = None,
     subject: str | None = None,
+    account_key: str = "",
 ) -> dict:
     if _mock_mode_enabled():
         return _mock_token_response(email, subject=subject)
@@ -380,7 +382,7 @@ def refresh_sync(
         "grant_type": "refresh_token",
         "client_id": _client_id(),
         "refresh_token": refresh_token,
-    })
+    }, proxy_channel=f"oauth:{account_key}" if account_key else "")
     return _attach_identity_fields(
         data, token_endpoint=endpoint, email=email, subject=subject,
     )
@@ -486,25 +488,34 @@ def _clean_num(v: float | None) -> int | float | None:
 
 
 def _cli_get_json_sync(access_token: str, path_and_query: str,
-                       *, timeout: float | None = None) -> dict:
-    resp = network.get_sync(
-        _cli_proxy_url(path_and_query),
-        headers={
+                       *, timeout: float | None = None,
+                       account_key: str = "") -> dict:
+    request_kwargs = {
+        "headers": {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
             "User-Agent": f"grok-cli/{cli_client_version()}",
             "x-grok-client-version": cli_client_version(),
         },
-        timeout=_CLI_HTTP_TIMEOUT if timeout is None else timeout,
-        proxy_purpose="oauth_xai",
-    )
+        "timeout": _CLI_HTTP_TIMEOUT if timeout is None else timeout,
+        "proxy_purpose": "oauth_xai",
+    }
+    if account_key:
+        request_kwargs["proxy_channel"] = f"oauth:{account_key}"
+    resp = network.get_sync(_cli_proxy_url(path_and_query), **request_kwargs)
     resp.raise_for_status()
     data = resp.json()
     return data if isinstance(data, dict) else {}
 
 
-def _optional_cli_get_json_sync(access_token: str, path_and_query: str) -> tuple[dict | None, str | None]:
+def _optional_cli_get_json_sync(access_token: str, path_and_query: str,
+                                *, account_key: str = "") -> tuple[dict | None, str | None]:
     try:
+        if account_key:
+            return _cli_get_json_sync(
+                access_token, path_and_query, timeout=_CLI_OPTIONAL_HTTP_TIMEOUT,
+                account_key=account_key,
+            ), None
         return _cli_get_json_sync(
             access_token, path_and_query, timeout=_CLI_OPTIONAL_HTTP_TIMEOUT,
         ), None
@@ -551,7 +562,7 @@ def _mock_cli_billing_usage() -> dict:
     return usage
 
 
-def fetch_cli_billing_usage_sync(access_token: str) -> dict:
+def fetch_cli_billing_usage_sync(access_token: str, *, account_key: str = "") -> dict:
     """Fetch Grok CLI official billing/subscription snapshot.
 
     The subscription quota signal comes from ``/v1/billing?format=credits``.
@@ -567,7 +578,12 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     if _mock_mode_enabled():
         return _mock_cli_billing_usage()
 
-    auto = _cli_get_json_sync(access_token, "/billing?format=auto-topup")
+    if account_key:
+        auto = _cli_get_json_sync(
+            access_token, "/billing?format=auto-topup", account_key=account_key,
+        )
+    else:
+        auto = _cli_get_json_sync(access_token, "/billing?format=auto-topup")
     optional_paths = {
         "credits": "/billing?format=credits",
         "user": "/user?include=subscription",
@@ -576,7 +592,14 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     optional_results: dict[str, tuple[dict | None, str | None]] = {}
     with ThreadPoolExecutor(max_workers=len(optional_paths)) as pool:
         futures = {
-            pool.submit(_optional_cli_get_json_sync, access_token, path): name
+            (
+                pool.submit(
+                    _optional_cli_get_json_sync, access_token, path,
+                    account_key=account_key,
+                )
+                if account_key else
+                pool.submit(_optional_cli_get_json_sync, access_token, path)
+            ): name
             for name, path in optional_paths.items()
         }
         for fut in as_completed(futures):
@@ -697,8 +720,10 @@ def fetch_cli_billing_usage_sync(access_token: str) -> dict:
     }
 
 
-async def fetch_cli_billing_usage(access_token: str) -> dict:
-    return await asyncio.to_thread(fetch_cli_billing_usage_sync, access_token)
+async def fetch_cli_billing_usage(access_token: str, *, account_key: str = "") -> dict:
+    return await asyncio.to_thread(
+        fetch_cli_billing_usage_sync, access_token, account_key=account_key,
+    )
 
 
 def empty_usage() -> dict:

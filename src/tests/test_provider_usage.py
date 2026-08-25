@@ -292,7 +292,7 @@ async def test_singleflight_same_key_and_lifecycle_late_result(m, monkeypatch):
     ch1, ch2 = _ch(name="one"), _ch(name="two")
     calls = []
     gate = asyncio.Event()
-    async def fake_fetch(spec, key):
+    async def fake_fetch(spec, key, *, channel_key=""):
         calls.append((spec.adapter, key))
         await gate.wait()
         return {"source": spec.adapter, "balances": [], "windows": [], "counters": [], "notices": [], "partial": False}
@@ -323,7 +323,7 @@ async def test_singleflight_same_key_and_lifecycle_late_result(m, monkeypatch):
         # 迟到失败同样不得创建 error-only 行。
         failed = _ch(key="late-error", name="late-error")
         failed_aid = pu.account_id(failed)
-        async def fail_fetch(spec, key):
+        async def fail_fetch(spec, key, *, channel_key=""):
             raise RuntimeError("上游服务暂时不可用")
         monkeypatch.setattr(pu, "fetch", fail_fetch)
         assert pu.schedule_refresh(failed)
@@ -363,7 +363,7 @@ def test_startup_refresh_schedules_each_supported_account_once(m, monkeypatch):
 async def test_schedule_returns_before_slow_provider(m, monkeypatch):
     pu = m["provider_usage"]
     gate = asyncio.Event()
-    async def slow_fetch(spec, key):
+    async def slow_fetch(spec, key, *, channel_key=""):
         await gate.wait()
         return {"source": spec.adapter, "balances": [], "windows": [], "counters": [], "notices": [], "partial": False}
     monkeypatch.setattr(pu, "fetch", slow_fetch)
@@ -407,7 +407,7 @@ async def test_single_queue_one_scheduler_three_workers_idempotent_and_threadsaf
     pu = m["provider_usage"]
     gate = asyncio.Event()
     calls = []
-    async def fake_fetch(spec, key):
+    async def fake_fetch(spec, key, *, channel_key=""):
         calls.append(key)
         await gate.wait()
         return {"source": spec.adapter, "balances": [], "windows": [], "counters": [], "notices": [], "partial": False}
@@ -455,7 +455,7 @@ async def test_fixed_three_worker_concurrency_limit(m, monkeypatch):
     pu = m["provider_usage"]
     gate = asyncio.Event()
     active = maximum = completed = 0
-    async def fake_fetch(spec, key):
+    async def fake_fetch(spec, key, *, channel_key=""):
         nonlocal active, maximum, completed
         active += 1
         maximum = max(maximum, active)
@@ -505,7 +505,7 @@ async def test_startup_preheat_uses_shared_queue_dedupes_and_respects_retry(m, m
     backed_aid = pu.account_id(backed_off)
     db.provider_usage_save_error(backed_aid, "deepseek", "上游请求频率受限", int(time.time() * 1000) + 120_000)
     calls = []
-    async def fake_fetch(spec, key):
+    async def fake_fetch(spec, key, *, channel_key=""):
         calls.append(key)
         return {"source": spec.adapter, "balances": [], "windows": [], "counters": [], "notices": [], "partial": False}
     monkeypatch.setattr(pu, "fetch", fake_fetch)
@@ -531,7 +531,7 @@ async def test_ttl_scan_is_memory_only_after_first_seen_and_due_only(m, monkeypa
     ch = _ch("openrouter", "standard", key="ttl")
     monkeypatch.setattr(pu, "_live_channels", lambda: [ch])
     gate = asyncio.Event()
-    async def fake_fetch(spec, key):
+    async def fake_fetch(spec, key, *, channel_key=""):
         await gate.wait()
         return {"source": spec.adapter, "balances": [], "windows": [], "counters": [], "notices": [], "partial": False}
     monkeypatch.setattr(pu, "fetch", fake_fetch)
@@ -560,7 +560,7 @@ async def test_worker_success_error_and_retry_update_deadline_preserve_stale(m, 
     error_aid = pu.account_id(error_ch)
     db.provider_usage_save_success(error_aid, "deepseek", stale)
     response = __import__("httpx").Response(429, headers={"Retry-After": "120"}, request=__import__("httpx").Request("GET", "https://example.invalid"))
-    async def fake_fetch(spec, key):
+    async def fake_fetch(spec, key, *, channel_key=""):
         if key == "error":
             raise __import__("httpx").HTTPStatusError("limited", request=response.request, response=response)
         return {"source": spec.adapter, "balances": [], "windows": [], "counters": [], "notices": [], "partial": False}

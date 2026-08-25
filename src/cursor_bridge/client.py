@@ -85,8 +85,12 @@ class CursorClient:
         request_timeout_s: float = REQUEST_TIMEOUT_S,
         session_factory: SessionFactory | None = None,
         sleeper: Callable[[float], None] = time.sleep,
+        account_key: str = "",
+        channel_key: str = "",
     ) -> None:
         self._access_token = access_token
+        self.account_key = account_key
+        self.channel_key = channel_key or (f"oauth:{account_key}" if account_key else "")
         self._refresh_token = refresh_token
         self._expires_at_ms = token_expiry_ms(access_token)
         self._token_lock = threading.RLock()
@@ -145,7 +149,11 @@ class CursorClient:
                 state.live = None
 
     def list_models(self) -> list[CursorModel]:
-        return list_cursor_models(self.access_token)
+        return list_cursor_models(
+            self.access_token,
+            account_key=self.account_key,
+            channel_key=self.channel_key,
+        )
 
     def usage(self) -> CursorUsage:
         return fetch_cursor_usage(self.access_token)
@@ -261,6 +269,9 @@ class CursorClient:
             enabled_tools=enabled,
             cloud_rule=parsed.system_prompt or None,
             on_checkpoint=lambda blob, target=state: setattr(target, "checkpoint", blob),
+            account_key=self.account_key,
+            channel_key=self.channel_key,
+            model=model_id,
         )
         state.live = session
         return session

@@ -25,6 +25,7 @@ from ..protocols.runtime import (
 )
 from ..proxy.connector import (
     DirectConnector,
+    ProxyConnectError,
     SOCKS5Connector,
     SS2022Connector,
     SS2022DuplexBridge,
@@ -304,7 +305,9 @@ async def connect_upstream_ws(
                 )
                 raise
             return ManagedWsConnection(ws, bridge)
-        return await connect(url, proxy=None, **kwargs)
+        raise ProxyConnectError(
+            f"unsupported WebSocket connector: {type(connector).__name__}"
+        )
 
     if timing is not None and round_timeouts is not None:
         ws = await timing.wait_for(_connect_once(), round_timeouts)

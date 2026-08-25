@@ -79,6 +79,8 @@ def list_cursor_models(
     include_hidden: bool = False,
     use_model_parameters: bool = True,
     timeout_s: float | None = None,
+    account_key: str = "",
+    channel_key: str = "",
 ) -> list[CursorModel]:
     """Return the account-specific canonical Cursor model catalog.
 
@@ -94,7 +96,13 @@ def list_cursor_models(
     )
     rpc_kwargs = {"timeout_s": max(0.001, float(timeout_s))} if timeout_s is not None else {}
     payload = unary_rpc(
-        AVAILABLE_MODELS_PATH, access_token, request.SerializeToString(), **rpc_kwargs,
+        AVAILABLE_MODELS_PATH,
+        access_token,
+        request.SerializeToString(),
+        account_key=account_key,
+        channel_key=channel_key,
+        purpose="oauth_cursor",
+        **rpc_kwargs,
     )
     decoded = _decode_models(payload)
     if decoded is None:

@@ -96,7 +96,7 @@ class AntigravityOAuthChannel(Channel):
             or ""
         ).rstrip("/")
         # Login identity may persist prod cloudcode-pa as base_url for
-        # loadCodeAssist. Generate/stream follow CPA and use daily first.
+        # loadCodeAssist. Generate/stream use daily first.
         prod = str(cfg.get("apiBaseUrl") or ag_provider.api_base_url()).rstrip("/")
         account_base = str(account.get("base_url") or account.get("baseUrl") or "").rstrip("/")
         if not stored_base and account_base and account_base != prod:

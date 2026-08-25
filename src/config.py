@@ -572,8 +572,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "grok-4.5",
         ],
     },
-    # Antigravity / Google Code Assist OAuth。client/scope/UA 对齐 CPA
-    # internal/auth/antigravity；模型目录对齐 CPA models.json 的 antigravity 段。
+    # Antigravity / Google Code Assist OAuth。
     # 出图模型单独放 imageModels，不能混进 defaultModels 文本调度器。
     "antigravityOAuth": {
         "clientId": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",

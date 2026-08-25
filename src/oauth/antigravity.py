@@ -1,6 +1,6 @@
 """Antigravity / Google Code Assist OAuth provider.
 
-Aligned with CPA ``internal/auth/antigravity`` (v7.2.140):
+OAuth contract:
 
   - Google authorization-code flow, **no PKCE**
   - authorize: https://accounts.google.com/o/oauth2/v2/auth
@@ -47,8 +47,8 @@ API_ENDPOINT = "https://cloudcode-pa.googleapis.com"
 DAILY_API_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com"
 API_VERSION = "v1internal"
 
-# CPA floor is 2.9.1: Cloud Code rejects newer models below 2.9.0.
-# Impersonate the official hub family UA, including CPA's hub platform.
+# Cloud Code rejects newer models below 2.9.0; hub UA floor is 2.9.1.
+# Impersonate the official hub family UA and platform.
 DEFAULT_HUB_VERSION = "2.9.1"
 DEFAULT_HUB_PLATFORM = "darwin/arm64"
 DEFAULT_USER_AGENT = f"antigravity/hub/{DEFAULT_HUB_VERSION} {DEFAULT_HUB_PLATFORM}"
@@ -199,7 +199,7 @@ def image_models() -> list[str]:
 
 
 def request_api_base_url() -> str:
-    """CPA generateContent default: daily first, prod reserved for loadCodeAssist."""
+    """generateContent default: daily first, prod reserved for loadCodeAssist."""
     return daily_api_base_url()
 
 
@@ -280,7 +280,7 @@ def parse_callback_url(raw: str) -> dict[str, str]:
 # ─── token exchange / refresh ───────────────────────────────────
 
 
-def _post_token_form(token_endpoint: str, data: dict) -> dict:
+def _post_token_form(token_endpoint: str, data: dict, *, proxy_channel: str = "") -> dict:
     resp = network.post_sync(
         token_endpoint,
         data=data,
@@ -291,6 +291,7 @@ def _post_token_form(token_endpoint: str, data: dict) -> dict:
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
         proxy_purpose="oauth_antigravity",
+        proxy_channel=proxy_channel,
     )
     resp.raise_for_status()
     payload = resp.json()
@@ -377,6 +378,7 @@ def refresh_sync(
     token_endpoint: str | None = None,
     email: str | None = None,
     project_id: str | None = None,
+    account_key: str = "",
 ) -> dict:
     if _mock_mode_enabled():
         return _mock_token_response(email, project_id=project_id)
@@ -386,7 +388,7 @@ def refresh_sync(
         "client_id": client_id(),
         "client_secret": client_secret(),
         "refresh_token": refresh_token,
-    })
+    }, proxy_channel=f"oauth:{account_key}" if account_key else "")
     return _attach_identity_fields(
         data,
         token_endpoint=endpoint,
@@ -415,7 +417,7 @@ async def refresh(
 
 
 def extract_project_id(data: Any) -> str:
-    """CPA ``extractCloudaicompanionProject``: cloudaicompanionProject / projectId / project."""
+    """Read cloudaicompanionProject / projectId / project."""
     if not isinstance(data, dict):
         return ""
     for key in ("cloudaicompanionProject", "projectId", "project"):
@@ -487,7 +489,7 @@ async def fetch_userinfo(access_token: str) -> dict:
     return await asyncio.to_thread(fetch_userinfo_sync, access_token)
 
 
-def load_code_assist_sync(access_token: str) -> dict:
+def load_code_assist_sync(access_token: str, *, account_key: str = "") -> dict:
     if _mock_mode_enabled():
         return {
             "cloudaicompanionProject": f"mock-project-{secrets.token_hex(4)}",
@@ -509,6 +511,7 @@ def load_code_assist_sync(access_token: str) -> dict:
         headers=_auth_headers(token),
         timeout=_API_HTTP_TIMEOUT,
         proxy_purpose="oauth_antigravity",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     data = resp.json()
@@ -645,7 +648,7 @@ def _num(value: Any) -> float | None:
 def parse_credits(load_resp: Any) -> dict[str, Any]:
     """Parse loadCodeAssist credits.
 
-    Plan rule (deliberately stricter than CPA): a missing/non-array
+    Plan rule: a missing/non-array
     ``availableCredits`` is *unknown*, not ``available=false``.
     Google often returns paid-tier name + minimum without ``creditAmount``.
     """
@@ -890,7 +893,7 @@ def _safe_quota_error(exc: Exception) -> dict[str, Any]:
     return {key: value for key, value in out.items() if value is not None}
 
 
-def fetch_quota_summary_sync(access_token: str) -> list[dict[str, Any]]:
+def fetch_quota_summary_sync(access_token: str, *, account_key: str = "") -> list[dict[str, Any]]:
     """Call v1internal:retrieveUserQuotaSummary. Empty list on failure-safe absence."""
     token = str(access_token or "").strip()
     if not token:
@@ -912,6 +915,7 @@ def fetch_quota_summary_sync(access_token: str) -> list[dict[str, Any]]:
         headers=_auth_headers(token),
         timeout=_API_HTTP_TIMEOUT,
         proxy_purpose="oauth_antigravity",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     data = resp.json()
@@ -935,12 +939,18 @@ def _usage_from_credits(credits: dict) -> dict:
     return usage
 
 
-def fetch_usage_sync(access_token: str) -> dict:
-    load_resp = load_code_assist_sync(access_token)
+def fetch_usage_sync(access_token: str, *, account_key: str = "") -> dict:
+    load_resp = (
+        load_code_assist_sync(access_token, account_key=account_key)
+        if account_key else load_code_assist_sync(access_token)
+    )
     usage = _usage_from_credits(parse_credits(load_resp))
     # Best-effort quota summary; failure here must not break credits usage.
     try:
-        groups = fetch_quota_summary_sync(access_token)
+        groups = (
+            fetch_quota_summary_sync(access_token, account_key=account_key)
+            if account_key else fetch_quota_summary_sync(access_token)
+        )
     except Exception as exc:
         groups = []
         usage["antigravity"]["quota_error"] = _safe_quota_error(exc)
@@ -965,5 +975,7 @@ def fetch_usage_sync(access_token: str) -> dict:
     return usage
 
 
-async def fetch_usage(access_token: str) -> dict:
-    return await asyncio.to_thread(fetch_usage_sync, access_token)
+async def fetch_usage(access_token: str, *, account_key: str = "") -> dict:
+    return await asyncio.to_thread(
+        fetch_usage_sync, access_token, account_key=account_key,
+    )

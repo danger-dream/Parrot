@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import datetime
+import ipaddress
 import os
 import socket
+import ssl
 import struct
+import threading
 import time
 
+import httpx
 import pytest
 
 from src.proxy.connector import (
@@ -404,6 +410,255 @@ async def test_ss2022_httpx_regression():
         await origin.wait_closed()
 
 
+async def _run_in_test_thread(func):
+    outcome = []
+    loop = asyncio.get_running_loop()
+    done = asyncio.Event()
+
+    def run():
+        try:
+            outcome.append((True, func()))
+        except BaseException as exc:
+            outcome.append((False, exc))
+        finally:
+            loop.call_soon_threadsafe(done.set)
+
+    thread = threading.Thread(
+        target=run, name="ss2022-test-caller", daemon=True,
+    )
+    thread.start()
+    await asyncio.wait_for(done.wait(), timeout=10)
+    thread.join(1)
+    assert not thread.is_alive(), "sync SS2022 test caller did not exit"
+    ok, value = outcome[0]
+    if not ok:
+        raise value
+    return value
+
+
+async def test_ss2022_sync_httpx_tunnel_and_worker_close():
+    origin, origin_port = await _start_http_origin()
+    cipher = "2022-blake3-aes-128-gcm"
+    password = base64.urlsafe_b64encode(os.urandom(16)).decode()
+    proxy, proxy_port = await _start_ss_proxy(
+        lambda r, w: _handle_ss2022_client(r, w, cipher, password)
+    )
+    connector = SS2022Connector("offline-ss", "127.0.0.1", proxy_port, cipher, password)
+
+    def request():
+        client = connector.create_sync_httpx_client()
+        try:
+            response = client.get(f"http://127.0.0.1:{origin_port}/")
+            assert isinstance(response, httpx.Response)
+            assert response.status_code == 200
+            assert response.text == "ok-ss"
+        finally:
+            client.close()
+            client.close()
+
+    try:
+        await _run_in_test_thread(request)
+        assert not any(
+            thread.name == "ss2022-sync-worker" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+    finally:
+        proxy.close()
+        origin.close()
+        await proxy.wait_closed()
+        await origin.wait_closed()
+
+
+async def test_ss2022_sync_read_timeout_and_connect_error():
+    async def slow_origin(reader, writer):
+        await reader.read(4096)
+        await asyncio.sleep(1)
+        writer.close()
+
+    origin = await asyncio.start_server(slow_origin, "127.0.0.1", 0)
+    origin_port = origin.sockets[0].getsockname()[1]
+    cipher = "2022-blake3-aes-128-gcm"
+    password = base64.urlsafe_b64encode(os.urandom(16)).decode()
+    proxy, proxy_port = await _start_ss_proxy(
+        lambda r, w: _handle_ss2022_client(r, w, cipher, password)
+    )
+    connector = SS2022Connector("offline-ss", "127.0.0.1", proxy_port, cipher, password)
+
+    def timeout_request():
+        with connector.create_sync_httpx_client(
+            timeout=httpx.Timeout(2, read=0.05)
+        ) as client:
+            with pytest.raises(httpx.ReadTimeout):
+                client.get(f"http://127.0.0.1:{origin_port}/")
+
+    try:
+        await _run_in_test_thread(timeout_request)
+        bad = SS2022Connector("offline-ss", "127.0.0.1", 1, cipher, password)
+
+        def bad_request():
+            with bad.create_sync_httpx_client(timeout=0.1) as client:
+                client.get(f"http://127.0.0.1:{origin_port}/")
+
+        with pytest.raises(httpx.ConnectError):
+            await _run_in_test_thread(bad_request)
+    finally:
+        proxy.close()
+        origin.close()
+        await proxy.wait_closed()
+        await origin.wait_closed()
+
+
+async def _start_h2_tls_origin(tmp_path):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    from h2.config import H2Configuration
+    from h2.connection import H2Connection
+    from h2.events import RequestReceived, StreamEnded
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    context.set_alpn_protocols(["h2"])
+
+    async def handle(reader, writer):
+        conn = H2Connection(config=H2Configuration(client_side=False))
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        try:
+            while True:
+                data = await reader.read(65535)
+                if not data:
+                    return
+                events = conn.receive_data(data)
+                for event in events:
+                    if isinstance(event, RequestReceived):
+                        conn.send_headers(event.stream_id, [
+                            (":status", "200"),
+                            ("content-length", "5"),
+                        ])
+                    if isinstance(event, StreamEnded):
+                        conn.send_data(event.stream_id, b"ok-h2", end_stream=True)
+                writer.write(conn.data_to_send())
+                await writer.drain()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=context)
+    return server, server.sockets[0].getsockname()[1]
+
+
+async def test_ss2022_sync_tls_and_http2(tmp_path):
+    origin, origin_port = await _start_h2_tls_origin(tmp_path)
+    cipher = "2022-blake3-aes-128-gcm"
+    password = base64.urlsafe_b64encode(os.urandom(16)).decode()
+    proxy, proxy_port = await _start_ss_proxy(
+        lambda r, w: _handle_ss2022_client(r, w, cipher, password)
+    )
+    connector = SS2022Connector("offline-ss", "127.0.0.1", proxy_port, cipher, password)
+
+    def rejected_certificate_request():
+        with connector.create_sync_httpx_client(http2=True) as client:
+            client.get(f"https://127.0.0.1:{origin_port}/")
+
+    def request():
+        with connector.create_sync_httpx_client(http2=True, verify=False) as client:
+            response = client.get(f"https://127.0.0.1:{origin_port}/")
+            assert response.http_version == "HTTP/2"
+            assert response.text == "ok-h2"
+
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await _run_in_test_thread(rejected_certificate_request)
+        await _run_in_test_thread(request)
+    finally:
+        proxy.close()
+        origin.close()
+        await proxy.wait_closed()
+        await origin.wait_closed()
+
+
+async def test_ss2022_sync_raw_http_and_eight_client_concurrency_cleanup():
+    baseline_workers = sum(
+        t.name == "ss2022-sync-worker" and t.is_alive()
+        for t in threading.enumerate()
+    )
+    baseline_fds = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+    origin, origin_port = await _start_http_origin()
+    cipher = "2022-blake3-aes-128-gcm"
+    password = base64.urlsafe_b64encode(os.urandom(16)).decode()
+    proxy, proxy_port = await _start_ss_proxy(
+        lambda r, w: _handle_ss2022_client(r, w, cipher, password)
+    )
+    connector = SS2022Connector("offline-ss", "127.0.0.1", proxy_port, cipher, password)
+
+    def raw_request():
+        stream = connector.open_sync_stream("127.0.0.1", origin_port, timeout=2)
+        try:
+            stream.sendall(b"GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n")
+            data = bytearray()
+            while True:
+                chunk = stream.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+            assert b"ok-ss" in data
+        finally:
+            stream.close()
+            stream.close()
+
+    def one_client():
+        with connector.create_sync_httpx_client(timeout=2) as client:
+            assert client.get(f"http://127.0.0.1:{origin_port}/").text == "ok-ss"
+
+    try:
+        await _run_in_test_thread(raw_request)
+        await asyncio.gather(*(_run_in_test_thread(one_client) for _ in range(8)))
+    finally:
+        proxy.close()
+        origin.close()
+        await proxy.wait_closed()
+        await origin.wait_closed()
+
+    deadline = asyncio.get_running_loop().time() + 2
+    while True:
+        workers = sum(
+            t.name == "ss2022-sync-worker" and t.is_alive()
+            for t in threading.enumerate()
+        )
+        current_fds = len(os.listdir("/proc/self/fd")) if baseline_fds is not None else None
+        if workers == baseline_workers and (current_fds is None or current_fds <= baseline_fds + 2):
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            pytest.fail(f"resources did not return to baseline: workers={workers}, fds={current_fds}")
+        await asyncio.sleep(0.01)
+
+
 def test_encode_addr_ipv4_roundtrip():
     raw = encode_addr("127.0.0.1", 8080)
     host, port, rest = _parse_socks_addr(raw)
@@ -437,3 +692,83 @@ async def test_aead_wrong_password_fails_closed():
         origin.close()
         await proxy.wait_closed()
         await origin.wait_closed()
+
+
+async def test_ss2022_single_sync_client_reuses_keepalive_connection_and_cleans_resources():
+    baseline_workers = sum(
+        t.name == "ss2022-sync-worker" and t.is_alive()
+        for t in threading.enumerate()
+    )
+    baseline_fds = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+    accepts = 0
+    requests = 0
+
+    async def keepalive_origin(reader, writer):
+        nonlocal accepts, requests
+        accepts += 1
+        try:
+            while True:
+                try:
+                    headers = await reader.readuntil(b"\r\n\r\n")
+                except (asyncio.IncompleteReadError, ConnectionError):
+                    return
+                if not headers:
+                    return
+                requests += 1
+                body = f"request-{requests}".encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\nConnection: keep-alive\r\n\r\n"
+                    + body
+                )
+                await writer.drain()
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    origin = await asyncio.start_server(keepalive_origin, "127.0.0.1", 0)
+    origin_port = origin.sockets[0].getsockname()[1]
+    cipher = "2022-blake3-aes-128-gcm"
+    password = base64.urlsafe_b64encode(os.urandom(16)).decode()
+    proxy, proxy_port = await _start_ss_proxy(
+        lambda r, w: _handle_ss2022_client(r, w, cipher, password)
+    )
+    connector = SS2022Connector("offline-ss", "127.0.0.1", proxy_port, cipher, password)
+
+    def two_requests_one_client():
+        client = connector.create_sync_httpx_client(timeout=2)
+        try:
+            first = client.get(f"http://127.0.0.1:{origin_port}/one")
+            second = client.get(f"http://127.0.0.1:{origin_port}/two")
+            assert first.text == "request-1"
+            assert second.text == "request-2"
+        finally:
+            client.close()
+            client.close()
+
+    try:
+        await _run_in_test_thread(two_requests_one_client)
+        assert accepts == 1
+        assert requests == 2
+    finally:
+        proxy.close()
+        origin.close()
+        await proxy.wait_closed()
+        await origin.wait_closed()
+
+    deadline = asyncio.get_running_loop().time() + 2
+    while True:
+        workers = sum(
+            t.name == "ss2022-sync-worker" and t.is_alive()
+            for t in threading.enumerate()
+        )
+        current_fds = len(os.listdir("/proc/self/fd")) if baseline_fds is not None else None
+        if workers == baseline_workers and (current_fds is None or current_fds <= baseline_fds + 2):
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            pytest.fail(
+                f"keepalive resources did not return: workers={workers}, fds={current_fds}"
+            )
+        await asyncio.sleep(0.01)

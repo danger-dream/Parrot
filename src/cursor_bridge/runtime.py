@@ -101,6 +101,8 @@ class CursorBridgeRuntime:
                     refresh_token=None,
                     max_retries=int(cfg.get("maxRetries", 2) or 2),
                     request_timeout_s=float(cfg.get("requestTimeoutSeconds", 300) or 300),
+                    account_key=account_key,
+                    channel_key=f"oauth:{account_key}",
                 )
                 self._clients[account_key] = client
             else:

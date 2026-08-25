@@ -429,13 +429,29 @@ def _channel_probe_url(ch) -> str:
     return resolve_upstream_url(base, api_path, default)
 
 
+def _routed_tcp_connect(host: str, port: int, timeout: float, *,
+                        purpose: str, channel_key: str = "") -> int:
+    t0 = time.time()
+    stream = network.open_sync_stream(
+        host, port, timeout=timeout,
+        proxy_purpose=purpose,
+        proxy_channel=channel_key,
+    )
+    try:
+        return int((time.time() - t0) * 1000)
+    finally:
+        stream.close()
+
+
 def _channel_check(ch, timeout: float) -> CheckResult:
     label = f"渠道 {getattr(ch, 'display_name', getattr(ch, 'key', 'unknown'))}"
     key = f"channel:{ch.key}"
     try:
         url = _channel_probe_url(ch)
         host, port = _parse_host_port(url)
-        latency = _tcp_connect(host, port, timeout)
+        latency = _routed_tcp_connect(
+            host, port, timeout, purpose="channel_monitor", channel_key=ch.key,
+        )
         return CheckResult(key, label, "channel", True, f"{host}:{port}", latency)
     except Exception as exc:
         return CheckResult(key, label, "channel", False, str(exc)[:180])
@@ -445,7 +461,9 @@ def _core_check(name: str, timeout: float) -> CheckResult:
     label, url = _CORE_TARGETS[name]
     try:
         host, port = _parse_host_port(url)
-        latency = _tcp_connect(host, port, timeout)
+        latency = _routed_tcp_connect(
+            host, port, timeout, purpose="core_monitor",
+        )
         return CheckResult(f"core:{name}", label, "core", True, f"{host}:{port}", latency)
     except Exception as exc:
         return CheckResult(f"core:{name}", label, "core", False, str(exc)[:180])

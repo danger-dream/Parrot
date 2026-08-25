@@ -5,6 +5,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import threading
@@ -17,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from . import state_db
+from . import network, state_db
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,19 @@ _LIFECYCLE_LOCK = threading.RLock()
 _SECRET_LOCK = threading.Lock()
 _SECRET_CACHE: bytes | None = None
 _INFLIGHT: set[str] = set()
+
+
+def _supports_keyword(callable_obj, keyword: str) -> bool | None:
+    """Preflight legacy signatures without catching callable-body TypeError."""
+    try:
+        params = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD or
+        (param.name == keyword and param.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for param in params
+    )
 _RUNTIME: dict[str, dict[str, int]] = {}
 _LOOP: asyncio.AbstractEventLoop | None = None
 _QUEUE: asyncio.Queue | None = None
@@ -72,6 +86,7 @@ class RefreshJob:
     account_id: str
     spec: AdapterSpec
     key: str
+    channel_key: str
     generation: int
 
 
@@ -443,10 +458,14 @@ async def _get(client: httpx.AsyncClient, url: str, key: str, *, raw_auth: bool 
     return response.json()
 
 
-async def fetch(spec: AdapterSpec, key: str) -> dict:
+async def fetch(spec: AdapterSpec, key: str, *, channel_key: str = "") -> dict:
     """执行一次固定端点只读刷新。"""
     base = f"https://{spec.host}"
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with network.async_client(
+        timeout=_TIMEOUT,
+        proxy_purpose="provider_usage",
+        proxy_channel=channel_key,
+    ) as client:
         if spec.adapter == "zhipu-coding":
             now = datetime.now(timezone(timedelta(hours=8)))
             start = now - timedelta(hours=24)
@@ -544,7 +563,8 @@ def schedule_refresh(channel: Any, *, force: bool = False) -> bool:
     spec = spec_for(channel)
     aid = account_id(channel, spec) if spec else None
     key = str(getattr(channel, "api_key", "") or "")
-    if not spec or not aid or not key:
+    channel_key = str(getattr(channel, "key", "") or "")
+    if not spec or not aid or not key or not channel_key:
         return False
     now_ms = int(time.time() * 1000)
     with _GUARD:
@@ -567,7 +587,7 @@ def schedule_refresh(channel: Any, *, force: bool = False) -> bool:
         runtime["last_attempt"] = now_ms
         generation = _GENERATION
     try:
-        loop.call_soon_threadsafe(_enqueue_reserved, RefreshJob(aid, spec, key, generation))
+        loop.call_soon_threadsafe(_enqueue_reserved, RefreshJob(aid, spec, key, channel_key, generation))
     except RuntimeError:
         with _GUARD:
             _INFLIGHT.discard(aid)
@@ -582,7 +602,12 @@ async def _worker(worker_id: int) -> None:
         job: RefreshJob = await queue.get()
         try:
             try:
-                snap = await fetch(job.spec, job.key)
+                if _supports_keyword(fetch, "channel_key") is False:
+                    snap = await fetch(job.spec, job.key)
+                else:
+                    snap = await fetch(
+                        job.spec, job.key, channel_key=job.channel_key,
+                    )
                 now_ms = int(time.time() * 1000)
                 retry_seconds = int(snap.pop("_retry_after_seconds", 0) or 0)
                 retry_at = now_ms + retry_seconds * 1000 if retry_seconds else 0

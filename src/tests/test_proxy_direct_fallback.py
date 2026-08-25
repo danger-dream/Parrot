@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from src import network
 from src.network import _configured_proxy_chain_or_none
 from src.proxy.connector import ProxyConnectError
 from src.proxy import manager as pm
@@ -18,6 +20,7 @@ class _Channel:
 class _Connector:
     def __init__(self, type_: str):
         self.type = type_
+        self.url = "socks5://127.0.0.1:1080"
 
 
 def _patch_proxy_manager(monkeypatch, *, chain: list[str], connectors: dict[str, object],
@@ -118,3 +121,70 @@ def test_network_helper_does_not_silently_fall_back_when_disabled(monkeypatch):
             proxy_channel=_Channel.key,
             proxy_model="gpt-test",
         )
+
+
+def test_sync_client_selects_ss2022_factory(monkeypatch):
+    expected = httpx.Client()
+
+    class SyncConnector(_Connector):
+        def create_sync_httpx_client(self, **kwargs):
+            assert kwargs["http2"] is True
+            assert kwargs["timeout"] == 3
+            return expected
+
+    connector = SyncConnector("ss2022")
+    monkeypatch.setattr(
+        network,
+        "_configured_proxy_chain_or_none",
+        lambda **_kwargs: [("offline-ss", connector)],
+    )
+    try:
+        assert network.sync_client(timeout=3, http2=True) is expected
+    finally:
+        expected.close()
+
+
+@pytest.mark.parametrize("type_", ["direct", "socks5"])
+def test_sync_client_direct_and_socks5_regression(monkeypatch, type_):
+    connector = _Connector(type_)
+    monkeypatch.setattr(
+        network,
+        "_configured_proxy_chain_or_none",
+        lambda **_kwargs: [(type_, connector)],
+    )
+    with network.sync_client() as client:
+        assert isinstance(client, httpx.Client)
+
+
+def test_sync_client_unknown_connector_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        network,
+        "_configured_proxy_chain_or_none",
+        lambda **_kwargs: [("unknown", _Connector("unknown"))],
+    )
+    with pytest.raises(ProxyConnectError, match="no sync-compatible target"):
+        network.sync_client()
+
+
+def test_sync_client_uses_enabled_fallback_after_ss2022_factory_error(monkeypatch):
+    class BrokenSyncConnector(_Connector):
+        def create_sync_httpx_client(self, **_kwargs):
+            raise RuntimeError("offline construction failure")
+
+    chain = [
+        ("offline-ss", BrokenSyncConnector("ss2022")),
+        ("direct", _Connector("direct")),
+    ]
+    monkeypatch.setattr(
+        network,
+        "_configured_proxy_chain_or_none",
+        lambda **_kwargs: chain,
+    )
+    with network.sync_client() as client:
+        assert isinstance(client, httpx.Client)
+
+
+def test_target_supports_sync_includes_ss2022(monkeypatch):
+    monkeypatch.setattr(pm, "_expand_target", lambda _target: ["offline-ss"])
+    monkeypatch.setattr(pm, "get_connector", lambda _name: _Connector("ss2022"))
+    assert pm.target_supports_sync("offline-ss") is True

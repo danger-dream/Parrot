@@ -9,6 +9,7 @@ import socket
 import ssl
 from typing import Any
 
+import httpcore
 import pytest
 import websockets
 
@@ -227,7 +228,7 @@ async def test_http_tls_handshake_timeout_closes_writer_bridge_and_raw_conn(monk
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
 
-    with pytest.raises((TimeoutError, ConnectionError, ssl.SSLError)):
+    with pytest.raises(httpcore.ConnectTimeout, match="TLS handshake timeout"):
         await stream.start_tls(
             context,
             server_hostname="example.invalid",

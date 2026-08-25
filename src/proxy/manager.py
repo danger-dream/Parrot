@@ -278,16 +278,12 @@ def resolve_proxy_chain(*, channel_key: str = "", model: str = "",
 
 
 def target_supports_sync(target: str | list[str]) -> bool:
-    """Return True if a target can be used by sync httpx callers.
-
-    Sync callers currently support direct and SOCKS5. SS2022 is implemented as
-    an async httpcore backend and is only available for model/upstream requests.
-    """
+    """Return True if a target can be used by sync httpx callers."""
     for name in _expand_target(target):
         conn = get_connector(name)
         if conn is None:
             continue
-        if conn.type in ("direct", "socks5"):
+        if conn.type in ("direct", "socks5", "ss2022"):
             return True
     return False
 

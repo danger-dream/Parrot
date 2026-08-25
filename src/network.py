@@ -640,6 +640,152 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
         return None
 
 
+def open_sync_stream(host: str, port: int, *, timeout: float,
+                     proxy_purpose: str = "", proxy_channel: str = "",
+                     proxy_model: str = ""):
+    """Open a routed synchronous byte stream, failing closed for configured routes."""
+    chain = _configured_proxy_chain_or_none(
+        proxy_purpose=proxy_purpose,
+        proxy_channel=proxy_channel,
+        proxy_model=proxy_model,
+    )
+    if chain is None:
+        proxy = active_socks5_url()
+        if proxy:
+            from .proxy.connector import SOCKS5Connector
+            return SOCKS5Connector("legacy-socks5", proxy).open_sync_stream(
+                host, port, timeout=timeout,
+            )
+        from .proxy.connector import DirectConnector
+        return DirectConnector().open_sync_stream(host, port, timeout=timeout)
+
+    from .proxy.connector import ProxyConnectError
+    errors: list[str] = []
+    for name, connector in chain:
+        try:
+            return connector.open_sync_stream(host, port, timeout=timeout)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    raise ProxyConnectError(
+        "configured proxy route could not open stream"
+        + (f": {'; '.join(errors)}" if errors else "")
+    )
+
+
+def _capture_client_route(client):
+    """Freeze httpx's URL mount selection before replacing the primary transport."""
+    default = client._transport
+    mounts = list(client._mounts.items())
+
+    def resolve(url):
+        for pattern, transport in mounts:
+            if pattern.matches(url):
+                return transport
+        return default
+
+    transports = []
+    for transport in [default, *(item[1] for item in mounts)]:
+        if transport is not None and all(transport is not seen for seen in transports):
+            transports.append(transport)
+    return resolve, transports
+
+
+class _RouteFailoverSyncTransport(httpx.BaseTransport):
+    """Try only explicit route candidates after a pre-request connect failure."""
+
+    def __init__(self, candidates):
+        self._candidates = candidates
+        self._closed = False
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        last_exc: Exception | None = None
+        for _name, resolve, _owned in self._candidates:
+            try:
+                return resolve(request.url).handle_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                # HTTPTransport raises these before request headers/body are sent,
+                # so retrying the same request does not replay application data.
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        first_exc: BaseException | None = None
+        closed = []
+        for _name, _resolve, owned in self._candidates:
+            for transport in owned:
+                if any(transport is seen for seen in closed):
+                    continue
+                closed.append(transport)
+                try:
+                    transport.close()
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+        if first_exc is not None:
+            raise first_exc
+
+
+class _RouteFailoverAsyncTransport(httpx.AsyncBaseTransport):
+    """Async counterpart of :class:`_RouteFailoverSyncTransport`."""
+
+    def __init__(self, candidates):
+        self._candidates = candidates
+        self._closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        last_exc: Exception | None = None
+        for _name, resolve, _owned in self._candidates:
+            try:
+                return await resolve(request.url).handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        first_exc: BaseException | None = None
+        closed = []
+        for _name, _resolve, owned in self._candidates:
+            for transport in owned:
+                if any(transport is seen for seen in closed):
+                    continue
+                closed.append(transport)
+                try:
+                    await transport.aclose()
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+        if first_exc is not None:
+            raise first_exc
+
+
+def _install_sync_route_failover(
+    clients: list[tuple[str, httpx.Client]],
+) -> httpx.Client:
+    primary = clients[0][1]
+    routes = [(name, *_capture_client_route(client)) for name, client in clients]
+    primary._mounts = {}
+    primary._transport = _RouteFailoverSyncTransport(routes)
+    return primary
+
+
+def _install_async_route_failover(
+    clients: list[tuple[str, httpx.AsyncClient]],
+) -> httpx.AsyncClient:
+    primary = clients[0][1]
+    routes = [(name, *_capture_client_route(client)) for name, client in clients]
+    primary._mounts = {}
+    primary._transport = _RouteFailoverAsyncTransport(routes)
+    return primary
+
+
 def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                  http2: bool = False,
                  proxy_purpose: str = "",
@@ -660,18 +806,23 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
     )
     if chain is not None:
         from .proxy.connector import ProxyConnectError
-        last_exc: Exception | None = None
+        clients: list[tuple[str, httpx.AsyncClient]] = []
+        errors: list[str] = []
         for pname, conn in chain:
             try:
-                return conn.create_httpx_client(
+                client = conn.create_httpx_client(
                     timeout=timeout, limits=limits, http2=http2,
                     byte_counter=byte_counter, **kwargs,
                 )
+                clients.append((pname, client))
             except Exception as exc:
-                last_exc = exc
+                errors.append(f"{pname}: {exc}")
                 print(f"[proxy] async client construction failed for {pname}: {exc}")
+        if clients:
+            return _install_async_route_failover(clients)
         raise ProxyConnectError(
-            f"configured proxy route has no usable async client: {last_exc or 'unknown error'}"
+            "configured proxy route has no usable async client"
+            + (f": {'; '.join(errors)}" if errors else "")
         )
 
     # No configured new-proxy route: preserve legacy SOCKS5/default behavior.
@@ -694,12 +845,7 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                 proxy_channel: str = "",
                 proxy_model: str = "",
                 **kwargs) -> httpx.Client:
-    """Create a sync HTTP client.
-
-    Sync callers support direct and SOCKS5. SS2022 is async-only; if a route
-    resolves to SS2022 we keep scanning the target chain for a sync-capable
-    fallback, then fall back to legacy socks5.
-    """
+    """Create a sync HTTP client through direct, SOCKS5, or SS2022 routes."""
     opts = dict(kwargs)
     if timeout is not None:
         opts["timeout"] = timeout
@@ -714,19 +860,32 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
     )
     if chain is not None:
         from .proxy.connector import ProxyConnectError
-        unsupported: list[str] = []
+        clients: list[tuple[str, httpx.Client]] = []
+        errors: list[str] = []
         for pname, conn in chain:
-            if conn.type == "direct":
-                opts.setdefault("trust_env", False)
-                return httpx.Client(**opts)
-            if conn.type == "socks5":
-                opts["proxy"] = conn.url
-                opts["trust_env"] = False
-                return httpx.Client(**opts)
-            unsupported.append(str(pname))
+            try:
+                candidate_opts = dict(opts)
+                if conn.type == "direct":
+                    candidate_opts.pop("proxy", None)
+                    candidate_opts["trust_env"] = False
+                    client = httpx.Client(**candidate_opts)
+                elif conn.type == "socks5":
+                    candidate_opts["proxy"] = conn.url
+                    candidate_opts["trust_env"] = False
+                    client = httpx.Client(**candidate_opts)
+                elif conn.type == "ss2022":
+                    client = conn.create_sync_httpx_client(**candidate_opts)
+                else:
+                    errors.append(f"{pname}: unsupported type {conn.type}")
+                    continue
+                clients.append((pname, client))
+            except Exception as exc:
+                errors.append(f"{pname}: {exc}")
+        if clients:
+            return _install_sync_route_failover(clients)
         raise ProxyConnectError(
             "configured proxy route has no sync-compatible target"
-            + (f": {', '.join(unsupported)}" if unsupported else "")
+            + (f": {'; '.join(errors)}" if errors else "")
         )
 
     proxy = active_socks5_url()

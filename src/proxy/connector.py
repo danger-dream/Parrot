@@ -8,9 +8,11 @@ built-in proxy support; Direct is just a plain client.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import socket
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -18,6 +20,7 @@ from urllib.parse import urlparse
 
 import httpcore
 import httpx
+import socksio
 
 from .ss2022 import (
     SSError,
@@ -157,6 +160,16 @@ class Connector:
                             http2: bool = False, timing=None, **kw) -> httpx.AsyncClient:
         raise NotImplementedError
 
+    def create_sync_httpx_client(self, *, timeout: httpx.Timeout | None = None,
+                                 limits: httpx.Limits | None = None,
+                                 http2: bool = False, timing=None,
+                                 **kw) -> httpx.Client:
+        raise NotImplementedError
+
+    def open_sync_stream(self, host: str, port: int, *, timeout: float):
+        """Open a synchronous byte stream to an upstream target."""
+        raise NotImplementedError
+
     async def test_connectivity(self, *, timeout: float = 8.0) -> dict:
         t0 = time.time()
         self.stats.total_attempts += 1
@@ -179,6 +192,45 @@ class Connector:
             return {"ok": False, "ip": "", "latency_ms": lat, "error": str(e)[:200]}
 
 
+class SyncRoutedStream:
+    """Socket-like facade over an httpcore synchronous network stream."""
+
+    def __init__(self, stream, *, timeout: float, close_owner=None):
+        self._stream = stream
+        self._timeout = timeout
+        self._close_owner = close_owner
+        self._closed = False
+
+    def settimeout(self, timeout: float | None) -> None:
+        self._timeout = timeout
+
+    def recv(self, size: int) -> bytes:
+        return self._stream.read(size, timeout=self._timeout)
+
+    def sendall(self, data: bytes) -> None:
+        self._stream.write(data, timeout=self._timeout)
+
+    def start_tls(self, context: ssl.SSLContext, *, server_hostname: str):
+        self._stream = self._stream.start_tls(
+            context, server_hostname=server_hostname, timeout=self._timeout,
+        )
+        return self
+
+    def selected_alpn_protocol(self) -> str | None:
+        ssl_object = self._stream.get_extra_info("ssl_object")
+        return ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._stream.close()
+        finally:
+            if self._close_owner is not None:
+                self._close_owner()
+
+
 # ── Direct connector ─────────────────────────────────────────────
 
 class DirectConnector(Connector):
@@ -190,6 +242,10 @@ class DirectConnector(Connector):
 
     def config_dict(self) -> dict:
         return {"type": "direct"}
+
+    def open_sync_stream(self, host: str, port: int, *, timeout: float):
+        stream = httpcore.SyncBackend().connect_tcp(host, port, timeout=timeout)
+        return SyncRoutedStream(stream, timeout=timeout)
 
     def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
         kw.setdefault("timeout", httpx.Timeout(10))
@@ -216,6 +272,80 @@ class SOCKS5Connector(Connector):
 
     def config_dict(self) -> dict:
         return {"type": "socks5", "url": self.url}
+
+    def open_sync_stream(self, host: str, port: int, *, timeout: float):
+        parsed = urlparse(self.url)
+        if not parsed.hostname or not parsed.port:
+            raise ProxyConnectError("invalid SOCKS5 proxy URL")
+        stream = httpcore.SyncBackend().connect_tcp(parsed.hostname, parsed.port, timeout=timeout)
+        routed = SyncRoutedStream(stream, timeout=timeout)
+        proto = socksio.SOCKS5Connection()
+        methods = [socksio.SOCKS5AuthMethod.NO_AUTH_REQUIRED]
+        if parsed.username is not None:
+            methods.append(socksio.SOCKS5AuthMethod.USERNAME_PASSWORD)
+        def read_exact(size: int) -> bytes:
+            chunks = bytearray()
+            while len(chunks) < size:
+                chunk = routed.recv(size - len(chunks))
+                if not chunk:
+                    raise ProxyConnectError("SOCKS5 proxy closed during handshake")
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        try:
+            proto.send(socksio.SOCKS5AuthMethodsRequest(methods))
+            routed.sendall(proto.data_to_send())
+            method_reply = read_exact(2)
+            if method_reply[0] != 5:
+                raise ProxyConnectError(
+                    f"invalid SOCKS5 method reply version: {method_reply[0]}"
+                )
+            reply = proto.receive_data(method_reply)
+            if reply.method == socksio.SOCKS5AuthMethod.USERNAME_PASSWORD:
+                from urllib.parse import unquote
+                proto.send(socksio.SOCKS5UsernamePasswordRequest(
+                    unquote(parsed.username or "").encode(),
+                    unquote(parsed.password or "").encode(),
+                ))
+                routed.sendall(proto.data_to_send())
+                auth = proto.receive_data(read_exact(2))
+                if not auth.success:
+                    raise ProxyConnectError("SOCKS5 authentication failed")
+            elif reply.method != socksio.SOCKS5AuthMethod.NO_AUTH_REQUIRED:
+                raise ProxyConnectError("SOCKS5 proxy rejected authentication methods")
+            proto.send(socksio.SOCKS5CommandRequest(
+                socksio.SOCKS5Command.CONNECT,
+                socksio.SOCKS5AType.DOMAIN_NAME,
+                host.encode("idna"),
+                port,
+            ))
+            routed.sendall(proto.data_to_send())
+            head = read_exact(4)
+            if head[0] != 5:
+                raise ProxyConnectError(
+                    f"invalid SOCKS5 CONNECT reply version: {head[0]}"
+                )
+            if head[2] != 0:
+                raise ProxyConnectError(
+                    f"invalid SOCKS5 CONNECT reserved byte: {head[2]}"
+                )
+            atype = head[3]
+            if atype == 1:
+                tail = read_exact(4 + 2)
+            elif atype == 4:
+                tail = read_exact(16 + 2)
+            elif atype == 3:
+                length = read_exact(1)
+                tail = length + read_exact(length[0] + 2)
+            else:
+                raise ProxyConnectError(f"invalid SOCKS5 reply address type: {atype}")
+            connected = proto.receive_data(head + tail)
+            if connected.reply_code != socksio.SOCKS5ReplyCode.SUCCEEDED:
+                raise ProxyConnectError(f"SOCKS5 CONNECT failed: {connected.reply_code.name}")
+            return routed
+        except BaseException:
+            routed.close()
+            raise
 
     def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
         kw.setdefault("timeout", httpx.Timeout(10))
@@ -541,6 +671,14 @@ class _SS2022Stream(httpcore.AsyncNetworkStream):
             # Ownership transferred when open_connection received sock=. It must
             # unregister/close that socket; the bridge only closes its own peer.
             await bridge.aclose(cause=exc, direction="tls_handshake_error")
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if isinstance(exc, asyncio.TimeoutError):
+                raise httpcore.ConnectTimeout("SS2022 TLS handshake timeout") from exc
+            if isinstance(exc, (ssl.SSLError, ConnectionError, OSError)):
+                raise httpcore.ConnectError(
+                    f"SS2022 TLS handshake failed: {exc}"
+                ) from exc
             raise
         return _TLSOverSS2022Stream(reader, writer, bridge)
 
@@ -661,6 +799,166 @@ class _SS2022Backend(httpcore.AsyncNetworkBackend):
         await asyncio.sleep(seconds)
 
 
+class _SS2022LoopWorker:
+    """Own one event loop used by a synchronous SS2022 HTTP transport."""
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._started = threading.Event()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="ss2022-sync-worker",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started.wait()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._started.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.close()
+
+    def submit(self, awaitable):
+        with self._lock:
+            if self._closed:
+                if asyncio.iscoroutine(awaitable):
+                    awaitable.close()
+                raise RuntimeError("SS2022 sync worker is closed")
+            future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
+        try:
+            return future.result()
+        except concurrent.futures.CancelledError as exc:
+            raise RuntimeError("SS2022 sync operation was cancelled") from exc
+        except BaseException:
+            # If the synchronous caller is cancelled/interrupted, propagate that
+            # cancellation onto the worker loop instead of orphaning the task.
+            future.cancel()
+            raise
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if threading.current_thread() is not self._thread:
+            self._thread.join()
+
+
+class _SyncSS2022Stream(httpcore.NetworkStream):
+    """Run an async SS2022 network stream on its transport's loop worker."""
+
+    def __init__(self, worker: _SS2022LoopWorker, stream: httpcore.AsyncNetworkStream):
+        self._worker = worker
+        self._stream = stream
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if self._closed:
+            return b""
+        return self._worker.submit(self._stream.read(max_bytes, timeout=timeout))
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        if self._closed:
+            raise httpcore.WriteError("connection closed")
+        self._worker.submit(self._stream.write(buffer, timeout=timeout))
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._worker.submit(self._stream.aclose())
+
+    def start_tls(self, ssl_context: ssl.SSLContext,
+                  server_hostname: str | None = None,
+                  timeout: float | None = None) -> httpcore.NetworkStream:
+        with self._lock:
+            if self._closed:
+                raise httpcore.ConnectError("SS2022 stream is closed")
+            stream = self._worker.submit(self._stream.start_tls(
+                ssl_context,
+                server_hostname=server_hostname,
+                timeout=timeout,
+            ))
+            # The async plain stream transfers connection ownership to the TLS
+            # stream. Mark this facade closed without closing the new owner.
+            self._closed = True
+        return _SyncSS2022Stream(self._worker, stream)
+
+    def get_extra_info(self, info: str) -> object:
+        async def get_info():
+            return self._stream.get_extra_info(info)
+
+        return self._worker.submit(get_info())
+
+
+class _SyncSS2022Backend(httpcore.NetworkBackend):
+    """Synchronous httpcore backend backed by the existing async SS protocol."""
+
+    def __init__(self, worker: _SS2022LoopWorker, async_backend: _SS2022Backend):
+        self._worker = worker
+        self._async_backend = async_backend
+
+    def connect_tcp(self, host: str, port: int,
+                    timeout: float | None = None,
+                    local_address: str | None = None,
+                    socket_options=None) -> httpcore.NetworkStream:
+        stream = self._worker.submit(self._async_backend.connect_tcp(
+            host,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        ))
+        return _SyncSS2022Stream(self._worker, stream)
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        return self._worker.submit(self._async_backend.connect_unix_socket(
+            path, timeout=timeout, socket_options=socket_options,
+        ))
+
+    def sleep(self, seconds: float) -> None:
+        self._worker.submit(self._async_backend.sleep(seconds))
+
+
+class _SyncSS2022Transport(httpx.BaseTransport):
+    """Close the HTTP pool before stopping its dedicated event-loop worker."""
+
+    def __init__(self, transport: httpx.HTTPTransport, worker: _SS2022LoopWorker):
+        self._transport = transport
+        self._worker = worker
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._transport.handle_request(request)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._transport.close()
+        finally:
+            self._worker.close()
+
+
 class SS2022Connector(Connector):
     def __init__(self, name: str, server: str, port: int,
                  cipher: str, password: str):
@@ -713,6 +1011,58 @@ class SS2022Connector(Connector):
         if byte_counter is not None:
             transport = CountingAsyncTransport(transport, self._counting_callback(byte_counter))
         return httpx.AsyncClient(transport=transport, trust_env=False, **kw)
+
+    def open_sync_stream(self, host: str, port: int, *, timeout: float):
+        worker = _SS2022LoopWorker()
+        try:
+            backend = _SyncSS2022Backend(worker, _SS2022Backend(
+                self.cipher, self.password, self.server, self.port,
+            ))
+            stream = backend.connect_tcp(host, port, timeout=timeout)
+            return SyncRoutedStream(stream, timeout=timeout, close_owner=worker.close)
+        except BaseException:
+            worker.close()
+            raise
+
+    def create_sync_httpx_client(self, *, timing=None, **kw) -> httpx.Client:
+        kw.setdefault("timeout", httpx.Timeout(10))
+        limits = kw.pop("limits", None)
+        http2 = bool(kw.pop("http2", False))
+        verify = kw.pop("verify", True)
+        cert = kw.pop("cert", None)
+        worker = _SS2022LoopWorker()
+        try:
+            async_backend = _SS2022Backend(
+                self.cipher, self.password, self.server, self.port, timing=timing,
+            )
+            backend = _SyncSS2022Backend(worker, async_backend)
+            transport_options = {
+                "http2": http2,
+                "verify": verify,
+                "cert": cert,
+                "trust_env": False,
+            }
+            if limits is not None:
+                transport_options["limits"] = limits
+            base_transport = httpx.HTTPTransport(**transport_options)
+            old_pool = base_transport._pool
+            base_transport._pool = httpcore.ConnectionPool(
+                ssl_context=old_pool._ssl_context,
+                network_backend=backend,
+                max_connections=old_pool._max_connections,
+                max_keepalive_connections=old_pool._max_keepalive_connections,
+                keepalive_expiry=old_pool._keepalive_expiry,
+                http1=old_pool._http1,
+                http2=http2,
+                retries=old_pool._retries,
+                local_address=old_pool._local_address,
+                socket_options=old_pool._socket_options,
+            )
+            transport = _SyncSS2022Transport(base_transport, worker)
+            return httpx.Client(transport=transport, trust_env=False, **kw)
+        except BaseException:
+            worker.close()
+            raise
 
 
 # ── Factory ──────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 """Parse Antigravity / Cloud Code 429 bodies.
 
 Google puts RetryDelay and the real reason in ``error.details``, not in the
-HTTP Retry-After header. CPA splits:
+HTTP Retry-After header. Split:
 
 - ``RATE_LIMIT_EXCEEDED`` + delay < 3s → same-account short retry
 - delay 3s–5m → account+model cooldown

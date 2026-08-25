@@ -38,6 +38,104 @@ def _import_modules():
     return {"config": config, "network_monitor": network_monitor, "state_db": state_db}
 
 
+def test_routed_channel_and_core_monitor_are_connect_close_only(m, monkeypatch):
+    """Probe routing is observable and incurs no HTTP/model payload write."""
+    from types import SimpleNamespace
+
+    nm = m["network_monitor"]
+    opens = []
+
+    class RecordingStream:
+        def __init__(self, close_error=None):
+            self.close_error = close_error
+            self.closed = 0
+            self.writes = []
+        def close(self):
+            self.closed += 1
+            if self.close_error:
+                raise self.close_error
+        def write(self, payload):
+            self.writes.append(payload)
+            pytest.fail("monitor must never write an HTTP/model payload")
+        send = write
+
+    streams = []
+    def open_stream(host, port, **kwargs):
+        opens.append((host, port, kwargs))
+        stream = RecordingStream()
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(nm.network, "open_sync_stream", open_stream)
+    channel = SimpleNamespace(
+        key="oauth:acct", display_name="acct", type="oauth",
+        provider="openai", protocol="openai-responses",
+    )
+    channel_result = nm._channel_check(channel, 3)
+    core_result = nm._core_check("openai", 4)
+
+    assert channel_result.ok and core_result.ok
+    assert opens[0][2] == {
+        "timeout": 3, "proxy_purpose": "channel_monitor",
+        "proxy_channel": "oauth:acct",
+    }
+    assert opens[1][2] == {
+        "timeout": 4, "proxy_purpose": "core_monitor", "proxy_channel": "",
+    }
+    assert all(stream.closed == 1 and stream.writes == [] for stream in streams)
+
+
+def test_monitor_open_parse_and_close_failures_are_failed_results(m, monkeypatch):
+    from types import SimpleNamespace
+
+    nm = m["network_monitor"]
+    channel = SimpleNamespace(
+        key="api:bad", display_name="bad", type="api", base_url="not-a-url",
+        api_path=None, protocol="anthropic",
+    )
+    parsed = nm._channel_check(channel, 1)
+    assert not parsed.ok and "host" in parsed.detail
+
+    monkeypatch.setattr(
+        nm.network, "open_sync_stream",
+        lambda *_a, **_k: (_ for _ in ()).throw(ConnectionError("route failed")),
+    )
+    failed_open = nm._core_check("openai", 1)
+    assert not failed_open.ok and failed_open.detail == "route failed"
+
+    class CloseFails:
+        def close(self):
+            raise RuntimeError("close failed")
+        def write(self, _payload):
+            pytest.fail("monitor must never write")
+        send = write
+
+    monkeypatch.setattr(nm.network, "open_sync_stream", lambda *_a, **_k: CloseFails())
+    failed_close = nm._core_check("openai", 1)
+    assert not failed_close.ok and failed_close.detail == "close failed"
+
+
+def test_monitor_explicit_network_fallback_remains_connect_only(m, monkeypatch):
+    """A network-layer fallback may select direct, but monitor still only closes."""
+    nm = m["network_monitor"]
+    events = []
+
+    class FallbackStream:
+        selected_route = "direct-fallback"
+        def close(self): events.append("close")
+        def write(self, _payload): pytest.fail("fallback probe wrote payload")
+        send = write
+
+    def simulated_network_boundary(*_args, **kwargs):
+        events.append((kwargs["proxy_purpose"], kwargs["proxy_channel"], "fallback"))
+        return FallbackStream()
+
+    monkeypatch.setattr(nm.network, "open_sync_stream", simulated_network_boundary)
+    result = nm._core_check("cloudflare", 2)
+    assert result.ok
+    assert events == [("core_monitor", "", "fallback"), "close"]
+
+
 def test_monitor_interval_minimum(m):
     nm = m["network_monitor"]
     nm.update_settings(lambda mon: mon.__setitem__("intervalSeconds", 1))

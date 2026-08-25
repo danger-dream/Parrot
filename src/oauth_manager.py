@@ -19,6 +19,7 @@ import base64
 import copy
 import concurrent.futures
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -77,6 +78,34 @@ OAUTH_MODEL_SYNC_MAX_CONCURRENCY = 3
 OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS = 45.0
 OAUTH_MODEL_SYNC_FOREGROUND_TIMEOUT_SECONDS = 20.0
 OAUTH_MODEL_CHANGE_LIST_LIMIT = 10
+
+
+def _supports_keyword(callable_obj, keyword: str) -> bool | None:
+    """Return whether a callable accepts *keyword*; None means unknowable.
+
+    Compatibility is decided before invocation so a TypeError raised inside the
+    callable can never trigger a second request. ``inspect.signature`` handles
+    Python functions, bound methods, partials and signature-aware mocks.  For
+    opaque builtins/extensions we keep the modern call (None) and propagate its
+    error rather than risk duplicate side effects.
+    """
+    try:
+        params = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD or
+        (param.name == keyword and param.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for param in params
+    )
+
+
+def _compatible_kwargs(callable_obj, **kwargs) -> dict:
+    """Drop only keywords that an inspectable legacy callable cannot accept."""
+    return {
+        key: value for key, value in kwargs.items()
+        if _supports_keyword(callable_obj, key) is not False
+    }
 
 
 # ─── 开发期 mock 开关 ────────────────────────────────────────────
@@ -555,7 +584,8 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
     return True
 
 
-def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None) -> dict:
+def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None,
+                            proxy_channel: str = "") -> dict:
     body = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -572,6 +602,7 @@ def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None) 
         },
         timeout=30,
         proxy_purpose="oauth_anthropic",
+        proxy_channel=proxy_channel,
     )
     resp.raise_for_status()
     return resp.json()
@@ -600,7 +631,8 @@ def _raise_last_refresh_error(errors: list[BaseException]) -> None:
     raise RuntimeError("Claude OAuth refresh compatibility failed: " + ", ".join(summary))
 
 
-def _do_refresh_http(refresh_token: str, scopes: str = "") -> dict:
+def _do_refresh_http(refresh_token: str, scopes: str = "", *,
+                     account_key: str = "") -> dict:
     """Claude OAuth refresh 兼容层。
 
     旧账号没有登录响应 scope，沿用已验证的 api.anthropic.com + no-scope；
@@ -618,7 +650,10 @@ def _do_refresh_http(refresh_token: str, scopes: str = "") -> dict:
     errors: list[BaseException] = []
     for name, url, cand_scope in candidates:
         try:
-            data = _post_refresh_candidate(url, refresh_token, scope=cand_scope)
+            data = _post_refresh_candidate(
+                url, refresh_token, scope=cand_scope,
+                proxy_channel=f"oauth:{account_key}" if account_key else "",
+            )
             if errors:
                 print(f"[oauth] Claude refresh fallback succeeded via {name}")
             return data
@@ -678,7 +713,7 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         provider = provider_of(acc)
         if provider == "openai":
             data = openai_provider.refresh_sync(
-                acc["refresh_token"], email=email,
+                acc["refresh_token"], email=email, account_key=account_key,
                 workspace_id=acc.get("workspace_id") or acc.get("chatgpt_account_id") or None,
                 org_id=acc.get("organization_id") or None,
             )
@@ -688,6 +723,7 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                 token_endpoint=acc.get("token_endpoint") or None,
                 email=email,
                 subject=_xai_subject(acc) or None,
+                account_key=account_key,
             )
         elif provider == "cursor":
             data = cursor_provider.refresh_sync(
@@ -699,11 +735,14 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
                 token_endpoint=acc.get("token_endpoint") or None,
                 email=email,
                 project_id=_antigravity_project_id(acc) or None,
+                account_key=account_key,
             )
         elif mock_mode_enabled():
             data = _do_refresh_mock(acc["refresh_token"])
         else:
-            data = _do_refresh_http(acc["refresh_token"], acc.get("scopes", ""))
+            data = _do_refresh_http(
+                acc["refresh_token"], acc.get("scopes", ""), account_key=account_key,
+            )
 
         new_expired = datetime.now(timezone.utc) + timedelta(
             seconds=int(data.get("expires_in", 28800))
@@ -816,7 +855,9 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         # Claude: refresh 后 best-effort 拉 profile 更新套餐信息
         if provider == "claude":
             try:
-                profile = _profile_sync(new_fields["access_token"])
+                profile = _profile_sync(
+                    new_fields["access_token"], account_key=account_key,
+                )
                 plan_info = extract_claude_plan_info(profile)
                 for k, v in plan_info.items():
                     if v not in (None, ""):
@@ -871,7 +912,7 @@ def _mock_usage() -> dict:
     }
 
 
-def _profile_sync(access_token: str) -> dict:
+def _profile_sync(access_token: str, *, account_key: str = "") -> dict:
     if mock_mode_enabled():
         return _mock_profile()
     resp = network.get_sync(
@@ -883,12 +924,13 @@ def _profile_sync(access_token: str) -> dict:
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def _usage_sync(access_token: str) -> dict:
+def _usage_sync(access_token: str, *, account_key: str = "") -> dict:
     """调 Anthropic /api/oauth/usage 拿 usage 数据。"""
     if mock_mode_enabled():
         return _mock_usage()
@@ -903,6 +945,7 @@ def _usage_sync(access_token: str) -> dict:
         },
         timeout=30,
         proxy_purpose="oauth_anthropic",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     return resp.json()
@@ -1012,17 +1055,23 @@ async def fetch_usage(account_key: str) -> dict:
     access_token = await ensure_valid_token(account_key)
 
     if provider == "xai":
-        return await xai_provider.fetch_cli_billing_usage(access_token)
+        return await xai_provider.fetch_cli_billing_usage(
+            access_token, account_key=account_key,
+        )
 
     if provider == "cursor":
         return await cursor_provider.fetch_usage(access_token, account_key=account_key)
 
     if provider == "antigravity":
-        return await antigravity_provider.fetch_usage(access_token)
+        return await antigravity_provider.fetch_usage(
+            access_token, account_key=account_key,
+        )
 
     if provider != "openai":
         # Claude 路径：直接走 /api/oauth/usage
-        return await asyncio.to_thread(_usage_sync, access_token)
+        return await asyncio.to_thread(
+            _usage_sync, access_token, account_key=account_key,
+        )
 
     # OpenAI 路径：主动 quota 走 ChatGPT 私有 wham/usage。业务响应头里的
     # x-codex-* 仍由 failover/images/ws 实时采样，不在这里发最小 Codex 请求。
@@ -1031,7 +1080,11 @@ async def fetch_usage(account_key: str) -> dict:
     # 因 refresh_token 被上游轮换/吊销而误报 401。
     acc = get_account(account_key) or {}
     account_id = _openai_workspace_id(acc) or None
-    return await openai_provider.fetch_wham_usage(access_token, account_id=account_id)
+    kwargs = _compatible_kwargs(
+        openai_provider.fetch_wham_usage,
+        account_id=account_id, account_key=account_key,
+    )
+    return await openai_provider.fetch_wham_usage(access_token, **kwargs)
 
 
 async def fetch_openai_rate_limit_reset_credits(account_key: str) -> dict:
@@ -1042,8 +1095,12 @@ async def fetch_openai_rate_limit_reset_credits(account_key: str) -> dict:
     acc = get_account(account_key) or {}
     access_token = await ensure_valid_token(account_key)
     account_id = _openai_workspace_id(acc) or None
+    kwargs = _compatible_kwargs(
+        openai_provider.fetch_rate_limit_reset_credits,
+        account_id=account_id, account_key=account_key,
+    )
     return await openai_provider.fetch_rate_limit_reset_credits(
-        access_token, account_id=account_id,
+        access_token, **kwargs,
     )
 
 
@@ -3510,11 +3567,17 @@ def refresh_openai_metadata_sync(account_key: str, *,
     if expired is not None and (expired - datetime.now(timezone.utc)).total_seconds() <= 60:
         return {"action": "skipped_token_expiring", "account_key": canonical}
 
+    metadata_kwargs = {
+        "org_id": acc.get("organization_id") or None,
+        "workspace_id": _openai_workspace_id(acc) or None,
+        "email": str(acc.get("email") or "") or None,
+    }
+    metadata_kwargs.update(_compatible_kwargs(
+        openai_provider.fetch_accounts_check_sync,
+        proxy_channel=f"oauth:{canonical}",
+    ))
     info = openai_provider.fetch_accounts_check_sync(
-        access_token,
-        org_id=acc.get("organization_id") or None,
-        workspace_id=_openai_workspace_id(acc) or None,
-        email=str(acc.get("email") or "") or None,
+        access_token, **metadata_kwargs,
     )
     if not info:
         return {"action": "fetch_no_metadata", "account_key": canonical}
@@ -3832,11 +3895,17 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
                 ),
             )
             return result
+        def discover_with_context():
+            snapshot = copy.deepcopy(account)
+            kwargs = _compatible_kwargs(
+                oauth_model_discovery.discover,
+                timeout=remaining_s, proxy_channel=f"oauth:{canonical}",
+            )
+            return oauth_model_discovery.discover(snapshot, **kwargs)
+
         result = await loop.run_in_executor(
             _model_discovery_network_executor,
-            lambda: oauth_model_discovery.discover(
-                copy.deepcopy(account), timeout=remaining_s,
-            ),
+            discover_with_context,
         )
         if time.monotonic() >= deadline:
             _persist_model_discovery_failure(canonical, generation, "timeout")
@@ -4015,14 +4084,13 @@ def refresh_cursor_models_sync(
     model_error_name = ""
     try:
         budget = remaining()
-        try:
-            catalog = cursor_provider.fetch_model_catalog_sync(access_token, timeout=budget)
-        except TypeError as exc:
-            if "unexpected keyword argument 'timeout'" not in str(exc):
-                raise
-            # Compatibility for injected/legacy callables; elapsed deadline is
-            # still checked before any config mutation.
-            catalog = cursor_provider.fetch_model_catalog_sync(access_token)
+        catalog = cursor_provider.fetch_model_catalog_sync(
+            access_token,
+            **_compatible_kwargs(
+                cursor_provider.fetch_model_catalog_sync,
+                timeout=budget, account_key=account_key,
+            ),
+        )
         records = (catalog.get("models") or []) if isinstance(catalog, dict) else []
         models = [
             str(item.get("id") or "")
@@ -4043,16 +4111,13 @@ def refresh_cursor_models_sync(
     profile_error = ""
     try:
         budget = remaining()
-        try:
-            profile = cursor_provider.fetch_profile_sync(
-                access_token, account_key=account_key, timeout=budget,
-            )
-        except TypeError as exc:
-            if "unexpected keyword argument 'timeout'" not in str(exc):
-                raise
-            profile = cursor_provider.fetch_profile_sync(
-                access_token, account_key=account_key,
-            )
+        profile = cursor_provider.fetch_profile_sync(
+            access_token,
+            **_compatible_kwargs(
+                cursor_provider.fetch_profile_sync,
+                account_key=account_key, timeout=budget,
+            ),
+        )
     except Exception as exc:
         # Models and account identity are independent last-known-good data. A
         # failure in either source must not discard a successful refresh of the other.

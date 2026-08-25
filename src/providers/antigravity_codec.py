@@ -74,7 +74,7 @@ def _part_thought_signature(part: dict) -> str:
 
 
 def _sanitize_thought_signatures(request: dict) -> None:
-    """Match CPA: only the first functionCall in a model turn may get the bypass."""
+    """Only the first functionCall in a model turn may get the bypass."""
     contents = request.get("contents")
     if not isinstance(contents, list):
         return
@@ -521,7 +521,7 @@ def wrap_cloud_code(
     stream: bool = False,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Wrap a Gemini generateContent body in the Cloud Code envelope (CPA geminiToAntigravity)."""
+    """Wrap a Gemini generateContent body in the Cloud Code envelope."""
     request = dict(gemini or {})
     request.pop("model", None)
     request.pop("safetySettings", None)

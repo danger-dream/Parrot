@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import socket
 import ssl
 import threading
 import time
@@ -20,7 +19,6 @@ from h2.events import (
     StreamReset,
     WindowUpdated,
 )
-from h2.exceptions import StreamClosedError
 
 from .constants import (
     CONNECT_TIMEOUT_S,
@@ -114,11 +112,20 @@ class CursorH2Stream:
         host: str = CURSOR_API_HOST,
         port: int = 443,
         timeout_s: float = CONNECT_TIMEOUT_S,
+        *,
+        account_key: str = "",
+        channel_key: str = "",
+        model: str = "",
+        purpose: str = "oauth_cursor",
     ) -> None:
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
-        self._sock: ssl.SSLSocket | None = None
+        self.account_key = account_key
+        self.channel_key = channel_key or (f"oauth:{account_key}" if account_key else "")
+        self.model = model
+        self.purpose = purpose
+        self._sock = None
         self._conn: H2Connection | None = None
         self._stream_id: int | None = None
         self._lock = threading.RLock()
@@ -134,29 +141,51 @@ class CursorH2Stream:
         return self._status
 
     def open(self, headers: list[tuple[str, str]], initial_body: bytes = b"", *, end_stream: bool = False) -> None:
+        from .. import network
+
         context = ssl.create_default_context()
         context.set_alpn_protocols(["h2"])
-        raw = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
-        sock = context.wrap_socket(raw, server_hostname=self.host)
+        raw = network.open_sync_stream(
+            self.host,
+            self.port,
+            timeout=self.timeout_s,
+            proxy_purpose=self.purpose,
+            proxy_channel=self.channel_key,
+            proxy_model=self.model,
+        )
+        try:
+            sock = raw.start_tls(context, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
         if sock.selected_alpn_protocol() != "h2":
+            negotiated = sock.selected_alpn_protocol()
             sock.close()
-            raise H2Error(f"ALPN negotiated {sock.selected_alpn_protocol()!r}, expected h2")
+            raise H2Error(f"ALPN negotiated {negotiated!r}, expected h2")
         sock.settimeout(SOCKET_RECV_POLL_S)
         config = H2Configuration(client_side=True, header_encoding="utf-8")
-        conn = H2Connection(config=config)
-        conn.initiate_connection()
-        stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, headers, end_stream=end_stream and not initial_body)
-        sock.sendall(conn.data_to_send())
-        self._sock = sock
-        self._conn = conn
-        self._stream_id = stream_id
-        self._reader = threading.Thread(target=self._read_loop, name="cursor-h2-reader", daemon=True)
-        self._reader.start()
-        if initial_body or (end_stream and initial_body):
-            self.write(initial_body, end_stream=end_stream)
-        elif end_stream:
-            self.write(b"", end_stream=True)
+        try:
+            conn = H2Connection(config=config)
+            conn.initiate_connection()
+            stream_id = conn.get_next_available_stream_id()
+            conn.send_headers(stream_id, headers, end_stream=end_stream and not initial_body)
+            sock.sendall(conn.data_to_send())
+            self._sock = sock
+            self._conn = conn
+            self._stream_id = stream_id
+            self._reader = threading.Thread(target=self._read_loop, name="cursor-h2-reader", daemon=True)
+            self._reader.start()
+            if initial_body:
+                self.write(initial_body, end_stream=end_stream)
+            elif end_stream:
+                self.write(b"", end_stream=True)
+        except BaseException:
+            self._closed.set()
+            sock.close()
+            reader = self._reader
+            if reader is not None and reader is not threading.current_thread():
+                reader.join(timeout=max(0.1, SOCKET_RECV_POLL_S * 2))
+            raise
 
     def write(self, data: bytes, *, end_stream: bool = False) -> None:
         if self._closed.is_set() or self._conn is None or self._stream_id is None or self._sock is None:
@@ -168,7 +197,7 @@ class CursorH2Stream:
                 self._pending_end = True
             try:
                 self._flush_outbound_locked()
-            except (OSError, StreamClosedError) as exc:
+            except Exception as exc:  # h2 or routed transport write failure
                 self._incoming.put(("error", str(exc).encode("utf-8")))
                 self.close()
 
@@ -189,12 +218,15 @@ class CursorH2Stream:
                 with self._lock:
                     conn.close_connection()
                     self._sendall_locked(conn.data_to_send())
-            except OSError:
+            except Exception:  # routed streams may expose backend-specific I/O errors
                 pass
             try:
                 sock.close()
-            except OSError:
+            except Exception:  # routed streams may expose backend-specific close errors
                 pass
+        reader = self._reader
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=max(0.1, SOCKET_RECV_POLL_S * 2))
         self._incoming.put(("closed", b""))
 
     def _sendall_locked(self, payload: bytes) -> None:
@@ -241,7 +273,9 @@ class CursorH2Stream:
                 chunk = self._sock.recv(65535)
             except TimeoutError:
                 continue
-            except OSError:
+            except Exception as exc:  # routed streams may wrap socket I/O errors
+                if not self._closed.is_set():
+                    self._incoming.put(("error", str(exc).encode("utf-8")))
                 break
             if not chunk:
                 break
@@ -269,15 +303,16 @@ class CursorH2Stream:
                     elif isinstance(event, WindowUpdated):
                         try:
                             self._flush_outbound_locked()
-                        except (OSError, StreamClosedError) as exc:
+                        except Exception as exc:  # h2 or routed transport write failure
                             self._incoming.put(("error", str(exc).encode("utf-8")))
-                            self._closed.set()
                             break
                 try:
                     pending = self._conn.data_to_send()
                     if pending:
                         self._sendall_locked(pending)
-                except OSError:
+                except Exception as exc:  # routed streams may wrap socket I/O errors
+                    if not self._closed.is_set():
+                        self._incoming.put(("error", str(exc).encode("utf-8")))
                     break
         self._incoming.put(("closed", b""))
 
@@ -292,9 +327,11 @@ class CursorH2Stream:
             kind, payload = item
             if kind == "data":
                 chunks.append(payload)
-            elif kind in {"end", "closed"}:
+            elif kind == "end":
                 ended = True
                 break
+            elif kind == "closed":
+                raise H2Error("connection closed before end of stream", status=self._status)
             elif kind == "error":
                 raise H2Error(payload.decode("utf-8", errors="replace"), status=self._status)
         if not ended:
@@ -304,8 +341,17 @@ class CursorH2Stream:
         return b"".join(chunks)
 
 
-def unary_rpc(path: str, access_token: str, body: bytes, *, timeout_s: float = UNARY_RPC_TIMEOUT_S) -> bytes:
-    stream = CursorH2Stream(timeout_s=min(timeout_s, CONNECT_TIMEOUT_S))
+def unary_rpc(path: str, access_token: str, body: bytes, *,
+              timeout_s: float = UNARY_RPC_TIMEOUT_S,
+              account_key: str = "", channel_key: str = "",
+              model: str = "", purpose: str = "oauth_cursor") -> bytes:
+    stream = CursorH2Stream(
+        timeout_s=min(timeout_s, CONNECT_TIMEOUT_S),
+        account_key=account_key,
+        channel_key=channel_key,
+        model=model,
+        purpose=purpose,
+    )
     try:
         stream.open(
             cursor_headers(path=path, access_token=access_token, content_type="application/proto"),

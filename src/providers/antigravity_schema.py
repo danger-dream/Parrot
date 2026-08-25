@@ -1,7 +1,6 @@
 """Sanitize JSON schemas before they reach Antigravity / Cloud Code.
 
-CPA's cleaner is large because it hit production 400s from Claude VALIDATED
-mode and proto-JSON. This is the subset that actually prevents those failures:
+This subset prevents production 400s from Claude VALIDATED mode and proto-JSON:
 
 - drop keywords Gemini rejects (title/const/$ref/anyOf leftovers, constraints)
 - flatten anyOf/oneOf and merge allOf

@@ -67,6 +67,9 @@ class CursorSession:
         enabled_tools: set[str],
         cloud_rule: str | None,
         on_checkpoint: Callable[[bytes], None] | None = None,
+        account_key: str = "",
+        channel_key: str = "",
+        model: str = "",
     ) -> None:
         self.access_token = access_token
         self.request_bytes = request_bytes
@@ -78,13 +81,20 @@ class CursorSession:
         self.state = StreamState()
         self.events: Queue[SessionEvent] = Queue()
         self.alive = True
+        self._stop = threading.Event()
         self.done_sent = False
         self.batch_state: Literal["streaming", "collecting", "flushed"] = "streaming"
         self.pending_execs: list[PendingExec] = []
         self._flushed: list[PendingExec] = []
         self._timer_phase: Literal["thinking", "streaming"] = "thinking"
         self._inactivity_deadline = time.monotonic() + INACTIVITY_THINKING_S
-        self._stream = CursorH2Stream(timeout_s=CONNECT_TIMEOUT_S)
+        self._stream = CursorH2Stream(
+            timeout_s=CONNECT_TIMEOUT_S,
+            account_key=account_key,
+            channel_key=channel_key,
+            model=model,
+            purpose="oauth_cursor",
+        )
         self._parser = ConnectFrameParser(self._on_frame, self._on_end_stream)
         self._worker = threading.Thread(target=self._run, name="cursor-session", daemon=True)
         self._heartbeat = threading.Thread(target=self._heartbeat_loop, name="cursor-heartbeat", daemon=True)
@@ -150,12 +160,18 @@ class CursorSession:
         self.close()
 
     def close(self) -> None:
-        if not self.alive:
-            return
+        was_alive = self.alive
         self.alive = False
-        self._stream.close()
-        if not self.done_sent:
+        self._stop.set()
+        if was_alive and not self.done_sent:
+            # Publish the intentional close before transport EOF can race the worker's
+            # fallback "bridge connection lost" result.
             self._push_done(SessionEvent(type="done", error="session closed"))
+        self._stream.close()
+        current = threading.current_thread()
+        for thread in (self._worker, self._heartbeat):
+            if thread is not current and thread.is_alive():
+                thread.join(timeout=1.0)
 
     def _run(self) -> None:
         try:
@@ -188,9 +204,9 @@ class CursorSession:
         except Exception as exc:  # noqa: BLE001
             self._fail(str(exc), http_status=self._stream.status)
         finally:
-            if self.alive:
-                self.alive = False
-                self._stream.close()
+            self.alive = False
+            self._stop.set()
+            self._stream.close()
             if not self.done_sent:
                 if self.pending_execs:
                     self._fail("session closed with pending tool calls")
@@ -203,7 +219,8 @@ class CursorSession:
 
     def _heartbeat_loop(self) -> None:
         while self.alive:
-            time.sleep(HEARTBEAT_INTERVAL_S)
+            if self._stop.wait(HEARTBEAT_INTERVAL_S):
+                return
             if not self.alive:
                 return
             payload = agent_pb2.AgentClientMessage(client_heartbeat=agent_pb2.ClientHeartbeat())
