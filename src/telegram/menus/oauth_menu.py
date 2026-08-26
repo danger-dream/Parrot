@@ -946,21 +946,20 @@ def _usage_progress_bar(util, *, width: int = _USAGE_BAR_WIDTH) -> str:
     return _USAGE_BAR_FILLED * filled + _USAGE_BAR_EMPTY * (width - filled)
 
 
-def _format_usage_line_text(label: str, util, reset) -> Optional[str]:
+def _format_usage_line_text(label: str, util, reset, *, bar: bool = False) -> Optional[str]:
     if util is None:
         return None
-    return (
-        f"{label}: {_format_usage_value_text(util)} "
-        f"{_usage_progress_bar(util)} (重置: {_format_reset_text(reset)})"
-    )
+    extra = f" <code>{_usage_progress_bar(util)}</code>" if bar else ""
+    return f"{label}: {_format_usage_value_text(util)}{extra} (重置: {_format_reset_text(reset)})"
 
 
-def _format_usage_line_html(label: str, util, reset) -> Optional[str]:
+def _format_usage_line_html(label: str, util, reset, *, bar: bool = False) -> Optional[str]:
     if util is None:
         return None
+    extra = f" <code>{_usage_progress_bar(util)}</code>" if bar else ""
     return (
-        f"{label}: {_format_usage_value_html(util)} "
-        f"<code>{_usage_progress_bar(util)}</code> · 重置 <code>{_fmt_time_full(reset)}</code>"
+        f"{label}: {_format_usage_value_html(util)}{extra} "
+        f"· 重置 <code>{_fmt_time_full(reset)}</code>"
     )
 
 
@@ -1595,7 +1594,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 lines.append(line)
         fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
         if prov == "claude" and fable_util is not None:
-            line = _format_usage_line_html("📖 Fable 7d", fable_util, fable_reset)
+            line = _format_usage_line_html(
+                "📖 Fable 7d", fable_util, fable_reset, bar=True,
+            )
             if line:
                 lines.append(line)
         if fh_util is None and sd_util is None and td_util is None and fable_util is None:
@@ -1684,16 +1685,17 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
         "seven_day_util": 7 * 86400,
     }
     usage_rows = [
-        ("⏱ 5h", row.get("five_hour_util"), row.get("five_hour_reset"), "five_hour_util"),
-        ("📅 7d", row.get("seven_day_util"), row.get("seven_day_reset"), "seven_day_util"),
-        ("📆 30d", row.get("thirty_day_util"), row.get("thirty_day_reset"), "thirty_day_util"),
-        ("🤖 Sonnet 7d", row.get("sonnet_util"), row.get("sonnet_reset"), None),
-        ("🧠 Opus 7d", row.get("opus_util"), row.get("opus_reset"), None),
+        ("⏱ 5h", row.get("five_hour_util"), row.get("five_hour_reset"), "five_hour_util", False),
+        ("📅 7d", row.get("seven_day_util"), row.get("seven_day_reset"), "seven_day_util", False),
+        ("📆 30d", row.get("thirty_day_util"), row.get("thirty_day_reset"), "thirty_day_util", False),
+        ("🤖 Sonnet 7d", row.get("sonnet_util"), row.get("sonnet_reset"), None, False),
+        ("🧠 Opus 7d", row.get("opus_util"), row.get("opus_reset"), None, False),
     ]
-    fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
-    usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None))
-    for label, util, reset, util_k in usage_rows:
-        line = _format_usage_line_text(label, util, reset)
+    if provider == "claude":
+        fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
+        usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None, True))
+    for label, util, reset, util_k, bar in usage_rows:
+        line = _format_usage_line_text(label, util, reset, bar=bar)
         if line:
             out.append(line)
             if util_k in _detail_window_seconds:

@@ -1307,10 +1307,11 @@ def _is_fable_model_label(value: str) -> bool:
     label = _normalize_quota_model_label(value)
     if not label:
         return False
-    if "fable" in label:
+    tokens = label.split()
+    if "fable" in tokens:
         return True
-    compact = label.replace(" ", "")
-    return compact in {"f5", "claudef5"} or compact.endswith("f5")
+    compact = "".join(tokens)
+    return compact in {"f5", "claudef5", "claudefable", "claudefable5"}
 
 
 def fable_usage_block(usage: dict | None) -> dict:
@@ -4656,6 +4657,7 @@ def _refresh_notice_window_lines(usage_flat: dict | None) -> list[str]:
     lines: list[str] = []
     fh_util = usage_flat.get("five_hour_util")
     sd_util = usage_flat.get("seven_day_util")
+    fb_util = usage_flat.get("fable_util")
     if fh_util is not None:
         lines.append(
             f"📊 5h 用量: <b>{fh_util:.0f}%</b>"
@@ -4665,6 +4667,11 @@ def _refresh_notice_window_lines(usage_flat: dict | None) -> list[str]:
         lines.append(
             f"📊 7d 用量: <b>{sd_util:.0f}%</b>"
             f" | 重置: <code>{_to_bjt(usage_flat.get('seven_day_reset'))}</code>"
+        )
+    if fb_util is not None:
+        lines.append(
+            f"📖 Fable 7d: <b>{fb_util:.0f}%</b>"
+            f" | 重置: <code>{_to_bjt(usage_flat.get('fable_reset'))}</code>"
         )
     return lines
 

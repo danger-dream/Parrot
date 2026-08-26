@@ -667,6 +667,13 @@ def test_flatten_usage_reads_fable_from_weekly_scoped_limit(m):
             "scope": {"model": {"display_name": "F5"}},
         }],
     })[5] == 6.0
+    assert m["oauth_manager"].fable_usage_block({
+        "limits": [{
+            "kind": "weekly_scoped",
+            "percent": 99,
+            "scope": {"model": {"display_name": "claude-opus-4-5"}},
+        }],
+    }) == {}
     print("  [PASS] flatten_usage: Claude Fable / F5 weekly_scoped limit")
 
 
