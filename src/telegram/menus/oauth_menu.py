@@ -670,10 +670,12 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
         return False
     for key in (
         "five_hour_util", "seven_day_util", "thirty_day_util",
-        "sonnet_util", "opus_util", "extra_util",
+        "sonnet_util", "opus_util", "fable_util", "extra_util",
     ):
         if row.get(key) is not None:
             return True
+    if oauth_manager.fable_from_quota_row(row)[0] is not None:
+        return True
     try:
         raw = json.loads(row.get("raw_data") or "{}")
     except Exception:
@@ -929,6 +931,36 @@ def _format_usage_value_text(util, *, decimals: int = 0) -> str:
     pct = _usage_display_percent(util)
     label = "剩余" if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else "已用"
     return f"{label} {pct:.{decimals}f}%"
+
+
+_USAGE_BAR_WIDTH = 10
+_USAGE_BAR_FILLED = "█"
+_USAGE_BAR_EMPTY = "░"
+
+
+def _usage_progress_bar(util, *, width: int = _USAGE_BAR_WIDTH) -> str:
+    """Black/white quota bar matching Telegram's monochrome text style."""
+    pct = _usage_display_percent(util)
+    filled = int((pct * width + 50) // 100)
+    filled = max(0, min(width, filled))
+    return _USAGE_BAR_FILLED * filled + _USAGE_BAR_EMPTY * (width - filled)
+
+
+def _format_usage_line_text(label: str, util, reset, *, bar: bool = False) -> Optional[str]:
+    if util is None:
+        return None
+    extra = f" <code>{_usage_progress_bar(util)}</code>" if bar else ""
+    return f"{label}: {_format_usage_value_text(util)}{extra} (重置: {_format_reset_text(reset)})"
+
+
+def _format_usage_line_html(label: str, util, reset, *, bar: bool = False) -> Optional[str]:
+    if util is None:
+        return None
+    extra = f" <code>{_usage_progress_bar(util)}</code>" if bar else ""
+    return (
+        f"{label}: {_format_usage_value_html(util)}{extra} "
+        f"· 重置 <code>{_fmt_time_full(reset)}</code>"
+    )
 
 
 def _quota_window_since_ts(reset_iso: str | None, window_seconds: int, *, now_ts: float | None = None) -> float:
@@ -1534,7 +1566,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         sd_util = row.get("seven_day_util")
         if fh_util is not None:
             reset = row.get("five_hour_reset")
-            lines.append(f"📊 5h: {_format_usage_value_html(fh_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
+            line = _format_usage_line_html("📊 5h", fh_util, reset)
+            if line:
+                lines.append(line)
             since_ts = _quota_window_since_ts(reset, 5 * 3600, now_ts=_now_ts)
             _d = _window_usage_detail(
                 ak, since_ts, _USAGE_DETAIL_INDENT_LIST, "5h",
@@ -1543,7 +1577,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 lines.append(_d)
         if sd_util is not None:
             reset = row.get("seven_day_reset")
-            lines.append(f"📊 7d: {_format_usage_value_html(sd_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
+            line = _format_usage_line_html("📊 7d", sd_util, reset)
+            if line:
+                lines.append(line)
             since_ts = _quota_window_since_ts(reset, 7 * 86400, now_ts=_now_ts)
             _d = _window_usage_detail(
                 ak, since_ts, _USAGE_DETAIL_INDENT_LIST, "7d",
@@ -1553,8 +1589,17 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         td_util = row.get("thirty_day_util")
         if td_util is not None:
             reset = row.get("thirty_day_reset")
-            lines.append(f"📊 30d: {_format_usage_value_html(td_util)} · 重置 <code>{_fmt_time_full(reset)}</code>")
-        if fh_util is None and sd_util is None and td_util is None:
+            line = _format_usage_line_html("📊 30d", td_util, reset)
+            if line:
+                lines.append(line)
+        fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
+        if prov == "claude" and fable_util is not None:
+            line = _format_usage_line_html(
+                "📖 Fable 7d", fable_util, fable_reset, bar=True,
+            )
+            if line:
+                lines.append(line)
+        if fh_util is None and sd_util is None and td_util is None and fable_util is None:
             if prov == "xai":
                 lines.append("📊 官方额度: <i>尚未获取</i>")
             else:
@@ -1633,30 +1678,29 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
     if not row:
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
 
-    def _line(label: str, util, reset) -> Optional[str]:
-        if util is None:
-            return None
-        return f"{label}: {_format_usage_value_text(util)} (重置: {_format_reset_text(reset)})"
-
     out = []
     _now_ts = time.time()
     _detail_window_seconds = {
         "five_hour_util": 5 * 3600,
         "seven_day_util": 7 * 86400,
     }
-    for label, util_k, reset_k in (
-        ("⏱ 5h", "five_hour_util", "five_hour_reset"),
-        ("📅 7d", "seven_day_util", "seven_day_reset"),
-        ("📆 30d", "thirty_day_util", "thirty_day_reset"),
-        ("🤖 Sonnet 7d", "sonnet_util", "sonnet_reset"),
-        ("🧠 Opus 7d", "opus_util", "opus_reset"),
-    ):
-        line = _line(label, row.get(util_k), row.get(reset_k))
+    usage_rows = [
+        ("⏱ 5h", row.get("five_hour_util"), row.get("five_hour_reset"), "five_hour_util", False),
+        ("📅 7d", row.get("seven_day_util"), row.get("seven_day_reset"), "seven_day_util", False),
+        ("📆 30d", row.get("thirty_day_util"), row.get("thirty_day_reset"), "thirty_day_util", False),
+        ("🤖 Sonnet 7d", row.get("sonnet_util"), row.get("sonnet_reset"), None, False),
+        ("🧠 Opus 7d", row.get("opus_util"), row.get("opus_reset"), None, False),
+    ]
+    if provider == "claude":
+        fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
+        usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None, True))
+    for label, util, reset, util_k, bar in usage_rows:
+        line = _format_usage_line_text(label, util, reset, bar=bar)
         if line:
             out.append(line)
             if util_k in _detail_window_seconds:
                 since_ts = _quota_window_since_ts(
-                    row.get(reset_k), _detail_window_seconds[util_k], now_ts=_now_ts,
+                    reset, _detail_window_seconds[util_k], now_ts=_now_ts,
                 )
                 window_name = "5h" if util_k == "five_hour_util" else "7d"
                 _d = _window_usage_detail(
@@ -4127,7 +4171,7 @@ def _refresh_all_usage_summary(usage: dict | None, *, provider: str,
     if not isinstance(usage, dict):
         return "无数据"
     utils = oauth_manager.extract_utils_percent(usage)
-    tags = ["5h", "7d", "30d", "sonnet", "opus"]
+    tags = ["5h", "7d", "30d", "sonnet", "opus", "fable"]
     parts = []
     for tag, util in zip(tags, utils):
         if util is None:

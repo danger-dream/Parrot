@@ -1258,6 +1258,46 @@ def test_router_dispatch(m):
     print("  [PASS] bot routing: menu:oauth / oa:view")
 
 
+def test_claude_fable_quota_renders_progress_bar(m):
+    _setup(m)
+    _add_fake_account(m, "fable@x.com")
+    reset = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    usage = {
+        "five_hour": {"utilization": 2.0, "resets_at": None},
+        "seven_day": {"utilization": 37.0, "resets_at": reset},
+        "seven_day_sonnet": None,
+        "seven_day_opus": None,
+        "limits": [{
+            "kind": "weekly_scoped",
+            "percent": 6,
+            "resets_at": reset,
+            "scope": {"model": {"display_name": "Fable"}},
+        }],
+    }
+    m["state_db"].quota_save(
+        "fable@x.com",
+        m["oauth_manager"].flatten_usage(usage),
+        email="fable@x.com",
+    )
+
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "📖 Fable 7d: 已用 <b>6%</b> <code>█░░░░░░░░░</code>" in list_text
+    assert "📊 5h: 已用 <b>2%</b> · 重置" in list_text
+    assert "📊 5h: 已用 <b>2%</b> <code>" not in list_text
+
+    rec.clear()
+    short = m["ui"].register_code("fable@x.com")
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "📖 Fable 7d: 已用 6% <code>█░░░░░░░░░</code>" in detail_text
+    assert "⏱ 5h: 已用 2% (重置: 上游未返回)" in detail_text
+    assert "🤖 Sonnet 7d" not in detail_text
+    assert "🧠 Opus 7d" not in detail_text
+    print("  [PASS] Claude Fable / F5 quota renders with black/white bar")
+
+
 # ─── main ────────────────────────────────────────────────────────
 
 def main():
@@ -1291,6 +1331,7 @@ def main():
         test_invalid_remove_select_and_delete,
         test_add_menu_cancel_buttons,
         test_router_dispatch,
+        test_claude_fable_quota_renders_progress_bar,
     ]
 
     passed = 0

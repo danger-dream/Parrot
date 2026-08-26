@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS oauth_quota_cache (
   sonnet_reset     TEXT,
   opus_util        REAL,
   opus_reset       TEXT,
+  fable_util       REAL,
+  fable_reset      TEXT,
   extra_used       REAL,
   extra_limit      REAL,
   extra_util       REAL,
