@@ -28,7 +28,7 @@ import hashlib
 import json
 from typing import Optional
 
-from .. import cache_hints, config, network, oauth_manager
+from .. import cache_hints, config, model_metadata, model_pricing, network, oauth_manager
 from ..providers import registry as provider_registry
 from ..openai import reasoning_replay
 from ..openai.codex_device_fingerprint import (
@@ -42,6 +42,7 @@ from ..openai.transform import (
     guard,
 )
 from .base import Channel, ChannelDisplay, UpstreamRequest
+from .compatibility import apply_reasoning_effort_capability
 
 
 def _provider_cfg() -> dict:
@@ -355,6 +356,20 @@ class OpenAIOAuthChannel(Channel):
         payload = provider_registry.filter_request_payload(
             self,
             payload,
+            protocol="openai-responses",
+        )
+        metadata = model_metadata.get_metadata(
+            requested_body.get("model") or resolved_model,
+            scope_key=self.key,
+            outbound_model=resolved_model,
+        )
+        efforts = metadata.get("reasoningEfforts")
+        if not efforts:
+            official = model_pricing.catalog_metadata(f"openai/{resolved_model}") or {}
+            efforts = official.get("reasoningEfforts")
+        apply_reasoning_effort_capability(
+            payload,
+            efforts,
             protocol="openai-responses",
         )
 

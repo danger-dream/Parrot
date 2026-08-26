@@ -17,6 +17,7 @@ isolate()
 
 from src import config, cooldown, model_metadata, notifier, oauth_manager, state_db  # noqa: E402
 from src.channel import registry  # noqa: E402
+from src.channel.compatibility import apply_reasoning_effort_capability  # noqa: E402
 from src.channel.cursor_oauth_channel import CursorOAuthChannel  # noqa: E402
 from src.cursor_bridge import agent_pb2  # noqa: E402
 from src.cursor_bridge import catalog as cursor_catalog  # noqa: E402
@@ -52,6 +53,7 @@ def _catalog() -> dict:
                 "claude-fable-5-medium",
                 "claude-fable-5-thinking-medium",
                 "claude-fable-5-thinking-high",
+                "claude-fable-5-thinking-xhigh",
                 "claude-fable-5-thinking-max",
             ),
             default_on=True,
@@ -141,11 +143,61 @@ def test_cursor_variant_resolution_uses_real_native_slug_shapes():
         records["claude-fable-5"], reasoning_effort="low", thinking=False,
     ) == "claude-fable-5-low"
     assert cursor_catalog.resolve_variant(
+        records["claude-fable-5"], reasoning_effort="xhigh", thinking=True,
+    ) == "claude-fable-5-thinking-xhigh"
+    assert cursor_catalog.resolve_variant(
+        records["claude-fable-5"], reasoning_effort="max", thinking=True,
+    ) == "claude-fable-5"
+    assert cursor_catalog.resolve_variant(
         records["composer-2.5"], fast=True,
     ) == "composer-2.5-fast"
     assert cursor_catalog.resolve_variant(
         records["gpt-5.5"], reasoning_effort="xhigh", fast=True,
     ) == "gpt-5.5-extra-high-fast"
+
+
+def test_cursor_max_suffix_is_max_mode_not_reasoning_metadata():
+    record = next(item for item in _catalog()["models"] if item["id"] == "claude-fable-5")
+    max_variant = next(item for item in record["variants"] if item["id"].endswith("-max"))
+    metadata = cursor_catalog.metadata_from_record(record)
+
+    assert max_variant["max_mode"] is True
+    assert max_variant["effort"] is None
+    assert record["reasoning_efforts"] == ["low", "medium", "high", "xhigh"]
+    assert metadata["reasoningEfforts"] == ["low", "medium", "high", "xhigh"]
+    assert metadata["contextWindow"] == 300_000
+    assert metadata["contextWindowMaxMode"] == 1_000_000
+
+    stale = copy.deepcopy(record)
+    stale["reasoning_efforts"] = ["low", "medium", "high", "xhigh", "max"]
+    for variant in stale["variants"]:
+        variant.pop("max_mode", None)
+        if variant["id"].endswith("-max"):
+            variant["effort"] = "max"
+    corrected = cursor_catalog.catalog_records({"schema": 1, "models": [stale]})[0]
+    corrected_max = next(item for item in corrected["variants"] if item["id"].endswith("-max"))
+    assert corrected["reasoning_efforts"] == ["low", "medium", "high", "xhigh"]
+    assert corrected_max["effort"] is None
+    assert corrected_max["max_mode"] is True
+
+    unknown = cursor_catalog.record_from_model(CursorModel(
+        id="unknown-cursor-model",
+        name="Unknown Cursor model",
+        reasoning=True,
+        context_window=200_000,
+        max_tokens=32_000,
+        supports_images=False,
+        supports_max_mode=True,
+        legacy_slugs=("unknown-cursor-model-max",),
+    ))
+    payload = {"reasoning_effort": "max"}
+    assert apply_reasoning_effort_capability(
+        payload, unknown["reasoning_efforts"], protocol="openai-chat",
+    ) is False
+    assert payload["reasoning_effort"] == "max"
+    assert cursor_catalog.resolve_variant(
+        unknown, reasoning_effort="max", thinking=True,
+    ) == "unknown-cursor-model"
 
 
 def test_cursor_models_dev_common_override_keeps_native_transport_metadata():
@@ -240,6 +292,37 @@ def test_cursor_channel_maps_chat_and_anthropic_controls(monkeypatch):
     assert anthropic_body["reasoning_effort"] == "medium"
     assert anthropic_body["model"] == "claude-fable-5-thinking-medium"
     assert anthropic_req.translator_ctx["response_translator"] == "anthropic_to_chat"
+
+    explicit_max_req = asyncio.run(channel.build_upstream_request(
+        {
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "maximum"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "stream": True,
+        },
+        "claude-fable-5",
+        ingress_protocol="anthropic",
+    ))
+    explicit_max_body = json.loads(explicit_max_req.body)
+    assert explicit_max_body["reasoning_effort"] == "xhigh"
+    assert explicit_max_body["model"] == "claude-fable-5-thinking-xhigh"
+    assert explicit_max_req.translator_ctx["cursor_actual_model"] == "claude-fable-5-thinking-xhigh"
+
+    explicit_xhigh_req = asyncio.run(channel.build_upstream_request(
+        {
+            "model": "claude-fable-5",
+            "messages": [{"role": "user", "content": "extra high"}],
+            "thinking": {"type": "enabled"},
+            "output_config": {"effort": "xhigh"},
+            "stream": True,
+        },
+        "claude-fable-5",
+        ingress_protocol="anthropic",
+    ))
+    explicit_xhigh_body = json.loads(explicit_xhigh_req.body)
+    assert explicit_xhigh_body["reasoning_effort"] == "xhigh"
+    assert explicit_xhigh_body["model"] == "claude-fable-5-thinking-xhigh"
 
     responses_req = asyncio.run(channel.build_upstream_request(
         {
@@ -569,13 +652,15 @@ def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
     actual_list = oauth_menu._format_account_block(
         account, month_snapshot=actual_snapshot,
     )
-    assert "💵 $0.12（Cursor 官方事件）" in actual_list
+    assert "💵 $0.12" in actual_list
+    assert "Cursor 官方事件" not in actual_list
     actual_detail = oauth_menu._format_month_stats_block(
         account_key,
         month_snapshot=actual_snapshot,
         by_model=[{"final_model": "composer-2.5", **reconciled}],
     )
-    assert "累计金额：$0.12（Cursor 官方事件）" in actual_detail
+    assert "累计金额：$0.12" in actual_detail
+    assert "Cursor 官方事件" not in actual_detail
 
     mixed = {**reconciled, "unpriced_success": 1}
     assert "另 1 次未计价" in oauth_menu._format_cursor_local_cost(mixed)
@@ -733,6 +818,26 @@ def test_cursor_long_context_reaches_requested_model_protobuf():
     ]
 
 
+def test_cursor_builder_keeps_max_mode_separate_from_reasoning_effort():
+    raw = build_run_request_bytes(
+        model_id="claude-fable-5-thinking-max",
+        system_prompt="",
+        user_text="hello",
+        turns=[],
+        conversation_id="conv-max-mode",
+        checkpoint=None,
+        mcp_tools=[],
+        long_context=False,
+    )
+    message = agent_pb2.AgentClientMessage()
+    message.ParseFromString(raw)
+    run = message.run_request
+    assert run.requested_model.model_id == "claude-fable-5-thinking"
+    assert run.requested_model.max_mode is True
+    assert run.model_details.max_mode is True
+    assert list(run.requested_model.parameters) == []
+
+
 def test_cursor_context_markers_and_openai_ingress_normalization():
     from src.openai import handler as openai_handler
 
@@ -818,7 +923,8 @@ def test_cursor_new_entry_and_unified_rich_detail_keep_max_context():
     text, kb = oauth_account_models_menu.render(account_key)
     assert "Cursor 模型目录" not in text and "刷新额度与模型" not in text
     assert "<code>claude-fable-5</code>" in text and "上下文：300K · 🧠" in text
-    assert "思考档位：low、medium、high、max" in text
+    assert "思考档位：low、medium、high、xhigh" in text
+    assert "思考档位：low、medium、high、xhigh、max" not in text
     detail, detail_kb = oauth_account_models_menu._detail_render(
         account_key, "claude-fable-5", model_page=1, account_page=1, filter_key="all",
     )
@@ -907,7 +1013,8 @@ def test_cursor_model_catalog_uses_six_per_page_and_six_columns(monkeypatch):
     assert "13. " not in captured["text"]
     assert "1. Claude Fable 5" in captured["text"]
     assert "上下文：<code>1.0M</code>（Max Context 默认）" in captured["text"]
-    assert "支持思考档位：low、medium、high、max" in captured["text"]
+    assert "支持思考档位：low、medium、high、xhigh" in captured["text"]
+    assert "支持思考档位：low、medium、high、xhigh、max" not in captured["text"]
     assert "Cursor 原生变体" not in captured["text"]
     assert "claude-fable-5-thinking-medium" not in captured["text"]
 

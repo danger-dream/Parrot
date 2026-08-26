@@ -563,10 +563,10 @@ def test_anthropic_thinking_maps_to_gemini_thinking_level(m):
         "thinking": {"type": "enabled", "budget_tokens": 2048},
         "messages": [{"role": "user", "content": "hi"}],
     }
-    with pytest.raises(GuardError, match="does not support reasoning.effort"):
-        anthropic_to_responses.translate_request(
-            thinking_body, target_model="gemini-3-flash",
-        )
+    generic = anthropic_to_responses.translate_request(
+        thinking_body, target_model="gemini-3-flash",
+    )
+    assert generic["reasoning"]["effort"] == "low"
     mapped = anthropic_to_responses.translate_request(
         thinking_body, target_model="gemini-3-flash", allow_reasoning_effort=True,
     )

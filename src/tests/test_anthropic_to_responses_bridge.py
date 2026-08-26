@@ -262,7 +262,7 @@ def test_translate_request_maps_reasoning_effort_and_service_tier():
         "output_config": {"effort": "max"},
         "service_tier": "auto",
     }, target_model="gpt-5-codex", codex_oauth=True)
-    assert codex["reasoning"] == {"effort": "xhigh"}
+    assert codex["reasoning"] == {"effort": "max"}
     assert codex["service_tier"] == "priority"
 
     standard_codex = anthropic_to_responses.translate_request({
@@ -292,11 +292,11 @@ def test_translate_request_guards_unmappable_reasoning_controls():
         "thinking": {"type": "disabled"},
     }, target_model="gpt-5")
     assert "reasoning" not in disabled
-    with pytest.raises(GuardError):
-        anthropic_to_responses.translate_request({
-            "messages": [],
-            "thinking": {"type": "enabled"},
-        }, target_model="gpt-4o")
+    generic = anthropic_to_responses.translate_request({
+        "messages": [],
+        "thinking": {"type": "enabled"},
+    }, target_model="gpt-4o")
+    assert generic["reasoning"] == {"effort": "high"}
 
 
 def test_translate_request_ignores_claude_code_clear_thinking_context_management():
@@ -552,7 +552,7 @@ def test_openai_api_channel_builds_anthropic_to_responses_request():
     assert req.url == "https://api.example.com/v1/responses"
     assert payload["model"] == "gpt-5"
     assert payload["max_output_tokens"] == 10
-    assert payload["reasoning"] == {"effort": "xhigh"}
+    assert payload["reasoning"] == {"effort": "max"}
     assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
     assert "_api_key_name" not in payload
     assert req.translator_ctx["response_translator"] == "anthropic_to_responses"

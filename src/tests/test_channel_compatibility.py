@@ -15,6 +15,7 @@ import pytest
 
 from src import failover
 from src.channel.api_channel import ApiChannel
+from src.openai.channel import api_channel as openai_api_channel
 from src.openai.channel.api_channel import OpenAIApiChannel
 from src.transform import cc_mimicry
 
@@ -213,6 +214,68 @@ async def test_openai_omit_fields_runs_after_provider_compatibility():
     payload = json.loads(req.body)
     assert "temperature" not in payload
     assert "thinking" not in payload
+
+
+@pytest.mark.parametrize(
+    ("protocol", "payload", "effort_path"),
+    [
+        ("openai-chat", {"reasoning_effort": "max"}, ("reasoning_effort",)),
+        ("openai-responses", {"reasoning": {"effort": "max"}}, ("reasoning", "effort")),
+    ],
+)
+def test_openai_model_capability_boundary_maps_only_authoritative_xhigh_only_models(
+    monkeypatch, protocol: str, payload: dict, effort_path: tuple[str, ...],
+):
+    ch = _openai_channel(protocol)
+
+    def effort_value(body: dict) -> str:
+        value = body
+        for key in effort_path:
+            value = value[key]
+        return value
+
+    monkeypatch.setattr(
+        openai_api_channel.model_metadata,
+        "get_metadata",
+        lambda *_args, **_kwargs: {"reasoningEfforts": ["low", "high", "xhigh"]},
+    )
+    ch._apply_compatibility(payload, "gpt-5.4", requested_model="fast")
+    assert effort_value(payload) == "xhigh"
+
+    supports_max = (
+        {"reasoning_effort": "max"} if protocol == "openai-chat"
+        else {"reasoning": {"effort": "max"}}
+    )
+    monkeypatch.setattr(
+        openai_api_channel.model_metadata,
+        "get_metadata",
+        lambda *_args, **_kwargs: {"reasoningEfforts": ["xhigh", "max"]},
+    )
+    ch._apply_compatibility(supports_max, "provider-max", requested_model="fast")
+    assert effort_value(supports_max) == "max"
+
+    unknown = (
+        {"reasoning_effort": "max"} if protocol == "openai-chat"
+        else {"reasoning": {"effort": "max"}}
+    )
+    monkeypatch.setattr(
+        openai_api_channel.model_metadata,
+        "get_metadata",
+        lambda *_args, **_kwargs: {},
+    )
+    ch._apply_compatibility(unknown, "unknown-model", requested_model="fast")
+    assert effort_value(unknown) == "max"
+
+
+def test_official_openai_boundary_uses_models_dev_reasoning_efforts():
+    ch = _openai_channel("openai-chat", providerId="openai")
+    known = {"reasoning_effort": "max"}
+    ch._apply_compatibility(known, "gpt-5.4", requested_model="fast")
+    assert known["reasoning_effort"] == "xhigh"
+
+    unknown = {"reasoning_effort": "max"}
+    ch._apply_compatibility(unknown, "future-unknown", requested_model="fast")
+    assert unknown["reasoning_effort"] == "max"
 
 
 def test_forced_1m_disables_the_opposite_direction_fallback():

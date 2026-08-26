@@ -1069,7 +1069,7 @@ async def test_fast_log_follows_final_http_failover_candidate(m):
     assert row["fast_mode"] == 0
 
 
-async def test_candidate_scoped_reasoning_guard_falls_through_to_supported_model(m):
+async def test_unknown_model_reasoning_is_preserved_and_transport_can_fall_through(m):
     _setup(m)
     router = MockRouter()
 
@@ -1112,8 +1112,12 @@ async def test_candidate_scoped_reasoning_guard_falls_through_to_supported_model
     assert resp.status_code == 200, resp.body.decode()
     out = json.loads(resp.body)
     assert out["content"] == [{"type": "text", "text": "candidate guard fell through"}]
-    assert len(router.requests) == 1
-    assert str(router.requests[0].url) == "https://reasoning-good.example/v1/chat/completions"
+    # No provider/model capability metadata was supplied for gpt-4o, so the
+    # generic translator preserves reasoning and the normal transport fallback
+    # (rather than a model-name guess) reaches the second candidate.
+    assert len(router.requests) == 2
+    assert str(router.requests[0].url) == "https://reasoning-bad.example/v1/chat/completions"
+    assert str(router.requests[1].url) == "https://reasoning-good.example/v1/chat/completions"
 
 
 async def test_anthropic_client_multiturn_tool_result_to_openai_chat_fake_upstream(m):

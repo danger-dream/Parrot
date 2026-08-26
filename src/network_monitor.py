@@ -259,8 +259,13 @@ def _dns_check(timeout: float) -> CheckResult:
 
 def _safe_socks5_error(exc: Exception) -> str:
     """Return a useful error category without echoing proxy URLs/credentials."""
-    if isinstance(exc, TimeoutError):
-        return "超时"
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (TimeoutError, httpx.TimeoutException)):
+            return "超时"
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
     return type(exc).__name__
 
 

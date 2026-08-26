@@ -661,15 +661,17 @@ def open_sync_stream(host: str, port: int, *, timeout: float,
 
     from .proxy.connector import ProxyConnectError
     errors: list[str] = []
+    last_error: Exception | None = None
     for name, connector in chain:
         try:
             return connector.open_sync_stream(host, port, timeout=timeout)
         except Exception as exc:
+            last_error = exc
             errors.append(f"{name}: {exc}")
     raise ProxyConnectError(
         "configured proxy route could not open stream"
         + (f": {'; '.join(errors)}" if errors else "")
-    )
+    ) from last_error
 
 
 def _capture_client_route(client):

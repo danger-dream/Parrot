@@ -39,7 +39,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from ... import (
-    affinity, config, cooldown, cursor_reconcile, load_balancing, log_db,
+    affinity, config, cooldown, load_balancing, log_db,
     notifier, oauth_errors, oauth_manager, state_db,
 )
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
@@ -1395,8 +1395,8 @@ def _format_cursor_local_cost(stats: dict | None, *, model_row: bool = False) ->
     if actual > 0:
         amount = ui.fmt_cost(data)
         if unpriced > 0:
-            return f"{amount}（官方已对账 {actual} 次 · 另 {unpriced} 次未计价）"
-        return f"{amount}（Cursor 官方事件）"
+            return f"{amount}（Parrot 已计价 {actual} 次 · 另 {unpriced} 次未计价）"
+        return amount
     return "未计价" if model_row else "未计价（Cursor 官方账单见上方）"
 
 
@@ -3017,7 +3017,6 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     quota_action = _evaluate_quota_action(ak, usage_result)
     metadata_action = None
-    cursor_event_action = None
     if provider == "openai":
         metadata_action = _run_sync(oauth_manager.ensure_openai_metadata_fresh(
             ak, force=True, min_interval_seconds=0, timeout_s=5.0,
@@ -3026,7 +3025,6 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         metadata_action = _run_sync(oauth_manager.refresh_cursor_models(
             ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
-        cursor_event_action = _run_sync(cursor_reconcile.sync_account(ak, force=True))
 
     text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
     if not text:
@@ -3062,16 +3060,6 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += "\n⚠️ 模型目录本次同步失败，保留原目录"
         elif isinstance(metadata_action, dict) and metadata_action.get("action") in {"error", "timeout", "fetch_empty"}:
             head += "\n⚠️ 额度已更新，但模型目录本次同步失败，保留原目录"
-        if isinstance(cursor_event_action, dict):
-            matched = int(cursor_event_action.get("matched") or 0)
-            refreshed = int(cursor_event_action.get("refreshed") or 0)
-            pending = int(cursor_event_action.get("pending") or 0)
-            if matched:
-                head += f"\n🧾 官方缓存/金额事件已回填: <code>{matched} 条</code>"
-            elif refreshed:
-                head += f"\n🧾 官方事件已复核: <code>{refreshed} 条</code>"
-            elif pending:
-                head += "\n⏳ 官方事件尚未到达，后台会继续自动对账"
         if quota_action and quota_action.get("action") == "cursor_pool_cooldown":
             head += f"\n🟠 已按额度池冷却 <code>{int(quota_action.get('cooled_models') or 0)}</code> 个模型"
         elif quota_action and quota_action.get("action") == "cursor_pool_recovered":

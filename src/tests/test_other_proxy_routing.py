@@ -95,6 +95,24 @@ def test_routed_stream_fails_closed_without_direct(monkeypatch):
         network.open_sync_stream("upstream.invalid", 443, timeout=1)
 
 
+def test_routed_stream_timeout_keeps_proxy_failover_contract_and_cause(monkeypatch):
+    timeout = TimeoutError("route timed out")
+
+    class TimedOut:
+        def open_sync_stream(self, *args, **kwargs):
+            raise timeout
+
+    monkeypatch.setattr(
+        network,
+        "_configured_proxy_chain_or_none",
+        lambda **kwargs: [("socks5", TimedOut()), ("ss2022", TimedOut())],
+    )
+    with pytest.raises(ProxyConnectError, match="configured proxy route") as caught:
+        network.open_sync_stream("upstream.invalid", 443, timeout=1)
+
+    assert caught.value.__cause__ is timeout
+
+
 def test_routed_stream_continues_explicit_chain(monkeypatch):
     calls = []
     winner = object()

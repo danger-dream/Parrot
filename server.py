@@ -32,7 +32,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src import (
     __version__, drain,
-    affinity, apikey_limiter, auth, compact_rescue, config, cooldown, cursor_reconcile,
+    affinity, apikey_limiter, auth, compact_rescue, config, cooldown,
     errors, failover, fingerprint, image_db, load_balancing, log_db,
     model_mapping, model_metadata, model_pricing, network,
     network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, scheduler, scorer,
@@ -318,7 +318,6 @@ async def lifespan(app: FastAPI):
         _background_tasks.append(asyncio.create_task(oauth_manager.proactive_refresh_loop()))
         _background_tasks.append(asyncio.create_task(oauth_manager.quota_monitor_loop()))
         _background_tasks.append(asyncio.create_task(oauth_manager.oauth_model_sync_loop()))
-        _background_tasks.append(asyncio.create_task(cursor_reconcile.sync_loop()))
     _background_tasks.append(asyncio.create_task(probe.recovery_loop()))
     _background_tasks.append(asyncio.create_task(status_monitor.monitor_loop()))
     _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))

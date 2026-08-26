@@ -50,11 +50,6 @@ def _valid_effort(value: Any, default: str) -> str:
     return effort if effort in _OPENAI_REASONING_EFFORTS else default
 
 
-def _valid_bigmodel_effort(value: Any, default: str) -> str:
-    effort = str(value or "").strip().lower()
-    return effort if effort in _BIGMODEL_REASONING_EFFORTS else default
-
-
 def _glm_version(model: str | None) -> tuple[int, int | None] | None:
     name = str(model or "").strip().lower()
     m = _GLM_VERSION_RE.match(name)
@@ -163,29 +158,23 @@ def supports_reasoning_effort(model: str | None) -> bool:
 def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None, *, target_model: str | None = None) -> str | None:
     """Map Anthropic thinking/output_config effort to OpenAI reasoning effort.
 
-    Priority and thresholds intentionally follow cc-switch for OpenAI targets:
-    - output_config.effort: low/medium/high pass through, max -> xhigh
-    - thinking.type=adaptive -> xhigh
-    - thinking.type=enabled uses budget_tokens: <4000 low, <16000 medium,
-      otherwise high; no budget defaults to high.
-    - disabled/unknown/absent does not produce an effort.
+    Explicit ``output_config.effort`` is protocol data and is preserved without
+    consulting the target model.  Provider/model capability compatibility is a
+    later request-boundary responsibility.  Existing inferred defaults remain:
+    adaptive uses the configured default (xhigh), while enabled budgets map to
+    low/medium/high thresholds.
 
-    BigModel GLM-5.2+ accepts a wider effort vocabulary, including `max`, so
-    preserve `max` instead of downgrading it to OpenAI's `xhigh` alias.
+    ``target_model`` remains accepted for API compatibility but intentionally
+    does not influence this protocol translation.
     """
     if not isinstance(body, dict):
         return None
     cfg = _reasoning_cfg()
-    bigmodel_effort = supports_bigmodel_reasoning_effort(target_model)
     output_config = body.get("output_config")
     if isinstance(output_config, dict):
         raw_effort = output_config.get("effort")
         effort = str(raw_effort).strip().lower() if isinstance(raw_effort, str) else ""
-        if bigmodel_effort and effort in _BIGMODEL_REASONING_EFFORTS:
-            return effort
-        if effort == "max":
-            return _valid_effort(cfg.get("maxEffort"), "xhigh")
-        if effort in _OPENAI_REASONING_EFFORTS:
+        if effort in _BIGMODEL_REASONING_EFFORTS:
             return effort
 
     thinking = body.get("thinking")
@@ -193,8 +182,6 @@ def resolve_anthropic_reasoning_effort(body: dict[str, Any] | None, *, target_mo
         return None
     typ = str(thinking.get("type") or "").strip().lower()
     if typ == "adaptive":
-        if bigmodel_effort:
-            return _valid_bigmodel_effort(cfg.get("adaptiveEffort"), "max")
         return _valid_effort(cfg.get("adaptiveEffort"), "xhigh")
     if typ != "enabled":
         return None

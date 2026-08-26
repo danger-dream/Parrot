@@ -8,7 +8,8 @@ import json
 import pytest
 
 from src.openai.channel.api_channel import OpenAIApiChannel
-from src.openai.transform import anthropic_to_chat
+from src import log_db
+from src.openai.transform import anthropic_to_chat, common
 from src.openai.transform.guard import GuardError
 from src.protocols.matrix import DEFAULT_MATRIX, ProtocolGuardError, extract_request_features
 
@@ -145,6 +146,14 @@ def test_translate_request_strips_anthropic_cache_control_blocks():
     assert "cache_control" not in json.dumps(out)
 
 
+def test_explicit_max_is_protocol_data_and_logging_keeps_user_value():
+    body = {"output_config": {"effort": "max"}}
+    assert common.resolve_anthropic_reasoning_effort(body) == "max"
+    assert common.resolve_anthropic_reasoning_effort(body, target_model="gpt-5.4") == "max"
+    assert common.resolve_anthropic_reasoning_effort(body, target_model="unknown-upstream") == "max"
+    assert log_db.extract_reasoning_effort(body, "anthropic") == "max"
+
+
 def test_protocol_bridge_default_reasoning_and_service_tier_baseline():
     # Baseline before making protocolBridge configurable: keep current thresholds
     # and service_tier mappings exactly the same by default.
@@ -168,7 +177,7 @@ def test_protocol_bridge_default_reasoning_and_service_tier_baseline():
     }, target_model="gpt-5")["reasoning_effort"] == "xhigh"
     assert anthropic_to_chat.translate_request({
         "messages": [], "output_config": {"effort": "max"},
-    }, target_model="gpt-5")["reasoning_effort"] == "xhigh"
+    }, target_model="gpt-5")["reasoning_effort"] == "max"
     assert anthropic_to_chat.translate_request({
         "messages": [], "output_config": {"effort": "max"},
     }, target_model="glm-5.2")["reasoning_effort"] == "max"
@@ -215,9 +224,10 @@ def test_protocol_bridge_custom_config_overrides_reasoning_service_tier_and_loca
     assert anthropic_to_chat.translate_request({
         "messages": [], "thinking": {"type": "adaptive"},
     }, target_model="gpt-5")["reasoning_effort"] == "medium"
+    # Historical maxEffort config no longer overrides explicit protocol data.
     assert anthropic_to_chat.translate_request({
         "messages": [], "output_config": {"effort": "max"},
-    }, target_model="gpt-5")["reasoning_effort"] == "high"
+    }, target_model="gpt-5")["reasoning_effort"] == "max"
     assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "auto"})["service_tier"] == "default"
 
     web_search = anthropic_to_chat.translate_request({
@@ -241,7 +251,7 @@ def test_translate_request_maps_reasoning_effort_and_service_tier():
         "service_tier": "standard_only",
     }, target_model="gpt-5")
 
-    assert out["reasoning_effort"] == "xhigh"
+    assert out["reasoning_effort"] == "max"
     assert out["service_tier"] == "default"
 
     adaptive = anthropic_to_chat.translate_request({
@@ -273,11 +283,11 @@ def test_translate_request_guards_unmappable_reasoning_controls():
         "thinking": {"type": "disabled"},
     }, target_model="gpt-5")
     assert "reasoning_effort" not in disabled
-    with pytest.raises(GuardError):
-        anthropic_to_chat.translate_request({
-            "messages": [],
-            "thinking": {"type": "enabled"},
-        }, target_model="gpt-4o")
+    generic = anthropic_to_chat.translate_request({
+        "messages": [],
+        "thinking": {"type": "enabled"},
+    }, target_model="gpt-4o")
+    assert generic["reasoning_effort"] == "high"
 
     glm = anthropic_to_chat.translate_request({
         "messages": [],

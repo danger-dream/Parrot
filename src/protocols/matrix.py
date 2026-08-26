@@ -559,7 +559,7 @@ def _resolve_anthropic_reasoning_effort(body: dict[str, Any]) -> str | None:
         raw_effort = output_config.get("effort")
         effort = str(raw_effort).strip().lower() if isinstance(raw_effort, str) else ""
         if effort == "max":
-            return _valid_effort(cfg.get("maxEffort"), "xhigh")
+            return "max"
         if effort in _OPENAI_REASONING_EFFORTS:
             return effort
     thinking = body.get("thinking")

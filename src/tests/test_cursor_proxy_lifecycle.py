@@ -41,12 +41,13 @@ class ScriptedH2Stream:
     """Socket-like routed stream backed by a real server-side h2 state machine."""
 
     def __init__(self, *, status: int = 200, response: bytes = b"reply",
-                 mode: str = "unary", alpn: str = "h2") -> None:
+                 mode: str = "unary", alpn: str = "h2", poll_timeouts: int = 0) -> None:
         self.status = status
         self.response = response
         self.mode = mode
         self.alpn = alpn
         self.timeout = 0.5
+        self.poll_timeouts = poll_timeouts
         self.closed = False
         self.close_count = 0
         self.server_hostname = ""
@@ -119,6 +120,9 @@ class ScriptedH2Stream:
 
     def recv(self, _size: int) -> bytes:
         with self._condition:
+            if self.poll_timeouts:
+                self.poll_timeouts -= 1
+                raise TimeoutError("scripted poll timeout")
             deadline = time.monotonic() + self.timeout
             while not self._incoming and not self.closed:
                 remaining = deadline - time.monotonic()
@@ -221,6 +225,16 @@ def test_h2_recv_poll_close_and_double_close(monkeypatch):
     assert stream.read(timeout=0.02) is None
     stream.close()
     stream.close()
+    assert routed.close_count == 1
+    _wait_no_cursor_threads()
+
+
+def test_h2_reader_survives_poll_timeout_and_reads_following_data(monkeypatch):
+    routed = ScriptedH2Stream(response=b"after-timeout", poll_timeouts=1)
+    monkeypatch.setattr(network, "open_sync_stream", lambda *args, **kwargs: routed)
+
+    assert unary_rpc("/test.Poll", "token", b"request", timeout_s=1) == b"after-timeout"
+    assert routed.poll_timeouts == 0
     assert routed.close_count == 1
     _wait_no_cursor_threads()
 

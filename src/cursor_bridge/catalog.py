@@ -26,7 +26,10 @@ _EFFORT_CANONICAL = {
     "extra_high": "xhigh",
     "max": "max",
 }
-_EFFORT_TOKENS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+# Cursor's legacy ``*-max`` suffix is Max Mode / Max Context, not a
+# reasoning-effort level. Explicit downstream max remains accepted by
+# normalize_effort(), but it is never inferred from a Cursor slug.
+_EFFORT_TOKENS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 _CURSOR_FIRST_PARTY = frozenset({"composer-2.5", "grok-4.5", "grok-4.6"})
 
 
@@ -60,6 +63,7 @@ def _variant_traits(slug: str) -> dict[str, Any]:
     parts = [part for part in str(slug or "").lower().split("-") if part]
     fast = "fast" in parts
     thinking = "thinking" in parts
+    max_mode = "max" in parts
     effort: str | None = None
     for index, token in enumerate(parts):
         if token == "extra" and index + 1 < len(parts) and parts[index + 1] == "high":
@@ -73,16 +77,22 @@ def _variant_traits(slug: str) -> dict[str, Any]:
         "effort": effort,
         "fast": fast,
         "thinking": thinking,
+        "max_mode": max_mode,
     }
 
 
-def record_from_model(model: CursorModel) -> dict[str, Any]:
-    variants = [_variant_traits(slug) for slug in model.legacy_slugs if str(slug or "").strip()]
+def _derive_variant_metadata(legacy_slugs: Iterable[Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    variants = [_variant_traits(str(slug)) for slug in legacy_slugs if str(slug or "").strip()]
     efforts: list[str] = []
     for item in variants:
         effort = item.get("effort")
         if effort and effort not in efforts:
             efforts.append(effort)
+    return variants, efforts
+
+
+def record_from_model(model: CursorModel) -> dict[str, Any]:
+    variants, efforts = _derive_variant_metadata(model.legacy_slugs)
     return {
         "id": model.id,
         "name": model.name,
@@ -125,7 +135,21 @@ def catalog_records(account_or_catalog: Mapping[str, Any] | None) -> list[dict[s
     if not isinstance(catalog, Mapping) and isinstance(source, Mapping) and source.get("schema") == 1:
         catalog = source
     values = catalog.get("models") if isinstance(catalog, Mapping) else None
-    return [dict(item) for item in values or [] if isinstance(item, Mapping) and item.get("id")]
+    records: list[dict[str, Any]] = []
+    for item in values or []:
+        if not isinstance(item, Mapping) or not item.get("id"):
+            continue
+        record = dict(item)
+        # Persisted schema-1 catalogs may contain the historical false max
+        # effort and variants without max_mode. Re-derive these two fields from
+        # authoritative legacy slugs at every read; no catalog refresh or
+        # configuration rewrite is required for the corrected runtime view.
+        if "legacy_slugs" in record:
+            variants, efforts = _derive_variant_metadata(record.get("legacy_slugs") or [])
+            record["variants"] = variants
+            record["reasoning_efforts"] = efforts
+        records.append(record)
+    return records
 
 
 def find_record(account_or_catalog: Mapping[str, Any] | None, model_id: str) -> dict[str, Any] | None:
@@ -148,11 +172,13 @@ def _effort_preferences(effort: str | None) -> tuple[str | None, ...]:
     if effort == "medium":
         return ("medium", None, "low", "high")
     if effort == "high":
-        return ("high", "medium", "xhigh", "max", None)
+        return ("high", "medium", "xhigh", None)
     if effort == "xhigh":
-        return ("xhigh", "max", "high", "medium", None)
+        return ("xhigh", "high", "medium", None)
     if effort == "max":
-        return ("max", "xhigh", "high", "medium", None)
+        # Capability adaptation belongs at the authoritative provider/model
+        # boundary. The resolver must not guess xhigh or select Max Mode.
+        return ("max",)
     return (effort, None)
 
 
@@ -175,7 +201,10 @@ def resolve_variant(
         return ""
     base = str(record.get("id") or "").strip()
     effort = normalize_effort(reasoning_effort)
-    variants = [dict(item) for item in record.get("variants") or [] if isinstance(item, Mapping) and item.get("id")]
+    variants = [
+        dict(item) for item in record.get("variants") or []
+        if isinstance(item, Mapping) and item.get("id") and not item.get("max_mode")
+    ]
     if not base or not variants or (effort is None and not fast and thinking is None):
         return base
 

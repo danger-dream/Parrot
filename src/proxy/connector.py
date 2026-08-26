@@ -205,15 +205,24 @@ class SyncRoutedStream:
         self._timeout = timeout
 
     def recv(self, size: int) -> bytes:
-        return self._stream.read(size, timeout=self._timeout)
+        try:
+            return self._stream.read(size, timeout=self._timeout)
+        except httpcore.ReadTimeout as exc:
+            raise TimeoutError(str(exc)) from exc
 
     def sendall(self, data: bytes) -> None:
-        self._stream.write(data, timeout=self._timeout)
+        try:
+            self._stream.write(data, timeout=self._timeout)
+        except httpcore.WriteTimeout as exc:
+            raise TimeoutError(str(exc)) from exc
 
     def start_tls(self, context: ssl.SSLContext, *, server_hostname: str):
-        self._stream = self._stream.start_tls(
-            context, server_hostname=server_hostname, timeout=self._timeout,
-        )
+        try:
+            self._stream = self._stream.start_tls(
+                context, server_hostname=server_hostname, timeout=self._timeout,
+            )
+        except httpcore.ConnectTimeout as exc:
+            raise TimeoutError(str(exc)) from exc
         return self
 
     def selected_alpn_protocol(self) -> str | None:
@@ -244,7 +253,10 @@ class DirectConnector(Connector):
         return {"type": "direct"}
 
     def open_sync_stream(self, host: str, port: int, *, timeout: float):
-        stream = httpcore.SyncBackend().connect_tcp(host, port, timeout=timeout)
+        try:
+            stream = httpcore.SyncBackend().connect_tcp(host, port, timeout=timeout)
+        except httpcore.ConnectTimeout as exc:
+            raise TimeoutError(str(exc)) from exc
         return SyncRoutedStream(stream, timeout=timeout)
 
     def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
@@ -277,7 +289,12 @@ class SOCKS5Connector(Connector):
         parsed = urlparse(self.url)
         if not parsed.hostname or not parsed.port:
             raise ProxyConnectError("invalid SOCKS5 proxy URL")
-        stream = httpcore.SyncBackend().connect_tcp(parsed.hostname, parsed.port, timeout=timeout)
+        try:
+            stream = httpcore.SyncBackend().connect_tcp(
+                parsed.hostname, parsed.port, timeout=timeout,
+            )
+        except httpcore.ConnectTimeout as exc:
+            raise TimeoutError(str(exc)) from exc
         routed = SyncRoutedStream(stream, timeout=timeout)
         proto = socksio.SOCKS5Connection()
         methods = [socksio.SOCKS5AuthMethod.NO_AUTH_REQUIRED]
@@ -787,9 +804,14 @@ class _SS2022Backend(httpcore.AsyncNetworkBackend):
         )
         try:
             await conn.connect(host, port, timeout=timeout or 8.0)
-        except (ConnectionError, TimeoutError, OSError, SSError) as e:
+        except TimeoutError as exc:
+            raise httpcore.ConnectTimeout(
+                f"SS {self._server}:{self._port}: {exc}"
+            ) from exc
+        except (ConnectionError, OSError, SSError) as exc:
             raise httpcore.ConnectError(
-                f"SS {self._server}:{self._port}: {e}") from e
+                f"SS {self._server}:{self._port}: {exc}"
+            ) from exc
         return _SS2022Stream(conn)
 
     async def connect_unix_socket(self, path, timeout=None, socket_options=None):
@@ -1020,6 +1042,9 @@ class SS2022Connector(Connector):
             ))
             stream = backend.connect_tcp(host, port, timeout=timeout)
             return SyncRoutedStream(stream, timeout=timeout, close_owner=worker.close)
+        except httpcore.ConnectTimeout as exc:
+            worker.close()
+            raise TimeoutError(str(exc)) from exc
         except BaseException:
             worker.close()
             raise

@@ -19,7 +19,9 @@ from src.proxy.connector import (
     ProxyConnectError,
     SOCKS5Connector,
     SyncRoutedStream,
+    SS2022Connector,
     SS2022DuplexBridge,
+    _SS2022Backend,
     _SS2022LoopWorker,
     _SS2022Stream,
     _SyncSS2022Stream,
@@ -131,9 +133,102 @@ def test_socks5_eof_each_handshake_stage_closes_once(monkeypatch, stage):
 
 def test_socks5_timeout_closes_once(monkeypatch):
     core = ScriptedSocksStream(timeout_stage=1)
-    with pytest.raises(httpcore.ReadTimeout):
+    with pytest.raises(TimeoutError) as caught:
         _open_socks(monkeypatch, core)
+    assert isinstance(caught.value.__cause__, httpcore.ReadTimeout)
     assert core.close_calls == 1
+
+
+def test_sync_routed_stream_translates_read_timeout_and_preserves_cause():
+    core = ScriptedSocksStream(timeout_stage=0)
+    stream = SyncRoutedStream(core, timeout=0.5)
+
+    with pytest.raises(TimeoutError, match="script timeout") as caught:
+        stream.recv(1)
+
+    assert type(caught.value) is TimeoutError
+    assert isinstance(caught.value.__cause__, httpcore.ReadTimeout)
+
+
+def test_sync_routed_stream_preserves_non_timeout_read_errors():
+    failure = RuntimeError("script failure")
+
+    class FailingStream:
+        def read(self, _size, timeout=None):
+            raise failure
+
+    stream = SyncRoutedStream(FailingStream(), timeout=0.5)
+    with pytest.raises(RuntimeError, match="script failure") as caught:
+        stream.recv(1)
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize(
+    ("operation", "core_timeout"),
+    [
+        ("write", httpcore.WriteTimeout("write timed out")),
+        ("tls", httpcore.ConnectTimeout("handshake timed out")),
+    ],
+)
+def test_sync_routed_stream_translates_write_and_tls_timeouts(operation, core_timeout):
+    class FailingStream:
+        def write(self, _data, timeout=None):
+            raise core_timeout
+
+        def start_tls(self, *_args, **_kwargs):
+            raise core_timeout
+
+    stream = SyncRoutedStream(FailingStream(), timeout=0.5)
+    with pytest.raises(TimeoutError, match="timed out") as caught:
+        if operation == "write":
+            stream.sendall(b"payload")
+        else:
+            stream.start_tls(ssl.create_default_context(), server_hostname="example.test")
+
+    assert type(caught.value) is TimeoutError
+    assert caught.value.__cause__ is core_timeout
+
+
+@pytest.mark.parametrize("operation", ["write", "tls"])
+def test_sync_routed_stream_preserves_non_timeout_write_and_tls_errors(operation):
+    failure = ssl.SSLError("protocol failure") if operation == "tls" else RuntimeError("write failure")
+
+    class FailingStream:
+        def write(self, _data, timeout=None):
+            raise failure
+
+        def start_tls(self, *_args, **_kwargs):
+            raise failure
+
+    stream = SyncRoutedStream(FailingStream(), timeout=0.5)
+    with pytest.raises(type(failure)) as caught:
+        if operation == "write":
+            stream.sendall(b"payload")
+        else:
+            stream.start_tls(ssl.create_default_context(), server_hostname="example.test")
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        DirectConnector(),
+        SOCKS5Connector("socks", "socks5://proxy.invalid:1080"),
+    ],
+    ids=["direct", "socks5"],
+)
+def test_direct_and_socks5_tcp_connect_timeout_is_builtin_with_cause(monkeypatch, connector):
+    failure = httpcore.ConnectTimeout("tcp timed out")
+    monkeypatch.setattr(
+        "src.proxy.connector.httpcore.SyncBackend.connect_tcp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(TimeoutError, match="tcp timed out") as caught:
+        connector.open_sync_stream("example.test", 443, timeout=0.1)
+
+    assert type(caught.value) is TimeoutError
+    assert caught.value.__cause__ is failure
 
 
 def test_socks5_proxy_tcp_connect_failure_has_no_stream_to_leak(monkeypatch):
@@ -429,6 +524,50 @@ def test_socks5_oversized_target_domain_fails_and_closes_once(monkeypatch):
     with pytest.raises(Exception):
         _open_socks(monkeypatch, core, host=oversized)
     assert core.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ss2022_backend_classifies_connect_timeout_without_misclassifying_errors(monkeypatch):
+    class FailingConnection:
+        async def connect(self, *_args, **_kwargs):
+            raise TimeoutError("SS dial timed out")
+
+    monkeypatch.setattr("src.proxy.connector.create_ss_connection", lambda *_a, **_k: FailingConnection())
+    backend = _SS2022Backend("cipher", "password", "proxy.invalid", 8388)
+    with pytest.raises(httpcore.ConnectTimeout, match="SS dial timed out") as caught:
+        await backend.connect_tcp("example.test", 443, timeout=0.1)
+    assert isinstance(caught.value.__cause__, TimeoutError)
+
+    failure = OSError("connection refused")
+
+    class RefusedConnection:
+        async def connect(self, *_args, **_kwargs):
+            raise failure
+
+    monkeypatch.setattr("src.proxy.connector.create_ss_connection", lambda *_a, **_k: RefusedConnection())
+    with pytest.raises(httpcore.ConnectError, match="connection refused") as refused:
+        await backend.connect_tcp("example.test", 443, timeout=0.1)
+    assert type(refused.value) is httpcore.ConnectError
+    assert refused.value.__cause__ is failure
+
+
+def test_ss2022_sync_connect_timeout_is_builtin_and_closes_worker(monkeypatch):
+    baseline_workers = _worker_count()
+    failure = httpcore.ConnectTimeout("SS connect timed out")
+
+    async def fail_connect(self, *_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(_SS2022Backend, "connect_tcp", fail_connect)
+    connector = SS2022Connector(
+        "ss", "proxy.invalid", 8388, "2022-blake3-aes-128-gcm", "password",
+    )
+    with pytest.raises(TimeoutError, match="SS connect timed out") as caught:
+        connector.open_sync_stream("example.test", 443, timeout=0.1)
+
+    assert type(caught.value) is TimeoutError
+    assert caught.value.__cause__ is failure
+    assert _worker_count() == baseline_workers
 
 
 class _BlockingRawSSStream:

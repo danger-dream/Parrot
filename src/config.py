@@ -617,15 +617,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "maxRetries": 2,
         "requestTimeoutSeconds": 300,
         "modelSyncHours": 6,
-        # Cursor AgentService 的实时 usage 不含缓存拆分和实际金额；后台用
-        # conversationId 对账 cursor.com 官方 usage events。
-        "eventSyncEnabled": True,
-        "eventSyncSeconds": 30,
-        "eventLookbackSeconds": 900,
-        "eventPageSize": 1000,
-        "eventMaxPages": 20,
-        "eventLegacyMatchSeconds": 5,
-        "eventToolSettleSeconds": 120,
     },
     # OpenAI 支持相关默认值（只在 /v1/chat/completions、/v1/responses 入口或 openai-* 渠道上生效）
     "openai": {

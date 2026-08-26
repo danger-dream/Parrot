@@ -393,12 +393,6 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
             payload[key] = body.get(key)
     effort = common.resolve_anthropic_reasoning_effort(body, target_model=target_model)
     if effort:
-        if target_model and not common.supports_reasoning_effort(target_model):
-            _fail(
-                f"target OpenAI Chat model {target_model!r} does not support reasoning_effort",
-                param="thinking",
-                scope="candidate",
-            )
         payload["reasoning_effort"] = effort
     ok, service_tier = common.map_anthropic_service_tier_to_openai(body.get("service_tier"))
     if service_tier:

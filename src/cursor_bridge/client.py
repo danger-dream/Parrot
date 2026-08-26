@@ -122,12 +122,6 @@ class CursorClient:
                 self._access_token = access_token
                 self._expires_at_ms = token_expiry_ms(access_token)
 
-    def conversation_id(self, session_id: str) -> str:
-        """Return the upstream Cursor conversation ID for an active bridge turn."""
-        with self._conversation_lock:
-            state = self._conversations.get(str(session_id or ""))
-            return str(state.conversation_id if state is not None else "")
-
     def discard_conversation(self, session_id: str, *, cancel: bool = False) -> None:
         with self._conversation_lock:
             state = self._conversations.pop(str(session_id or ""), None)

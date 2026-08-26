@@ -14,6 +14,7 @@ from ..openai.transform import anthropic_to_chat, guard
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry
 from .base import ChannelDisplay, UpstreamRequest
+from .compatibility import apply_reasoning_effort_capability
 
 
 def _request_api_key_name(body: dict) -> str:
@@ -263,6 +264,15 @@ class CursorOAuthChannel(OpenAIApiChannel):
                 param="messages",
                 scope="candidate",
             )
+
+        # Generic protocol translation preserves explicit max. Only here, with
+        # the concrete Cursor account model and AvailableModels-derived effort
+        # metadata known, may an xhigh-only model adapt max to xhigh.
+        apply_reasoning_effort_capability(
+            payload,
+            record.get("reasoning_efforts"),
+            protocol="openai-chat",
+        )
 
         service_tier = str(payload.get("service_tier") or "").strip().lower()
         wants_fast = service_tier in {"priority", "fast"} or requested_body.get("_parrot_wants_fast_mode") is True

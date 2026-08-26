@@ -136,6 +136,24 @@ def test_monitor_explicit_network_fallback_remains_connect_only(m, monkeypatch):
     assert events == [("core_monitor", "", "fallback"), "close"]
 
 
+def test_safe_socks5_error_classifies_timeout_without_exposing_details(m):
+    import httpx
+
+    nm = m["network_monitor"]
+    assert nm._safe_socks5_error(TimeoutError("secret endpoint")) == "超时"
+    assert nm._safe_socks5_error(httpx.ConnectTimeout("secret proxy URL")) == "超时"
+
+    try:
+        try:
+            raise TimeoutError("inner timeout")
+        except TimeoutError as exc:
+            raise RuntimeError("wrapped route failure") from exc
+    except RuntimeError as wrapped:
+        assert nm._safe_socks5_error(wrapped) == "超时"
+
+    assert nm._safe_socks5_error(ConnectionRefusedError("refused")) == "ConnectionRefusedError"
+
+
 def test_monitor_interval_minimum(m):
     nm = m["network_monitor"]
     nm.update_settings(lambda mon: mon.__setitem__("intervalSeconds", 1))

@@ -519,16 +519,6 @@ def translate_request(
         payload["metadata"] = body.get("metadata")
     effort = common.resolve_anthropic_reasoning_effort(body, target_model=target_model)
     if effort:
-        if (
-            target_model
-            and not allow_reasoning_effort
-            and not common.supports_reasoning_effort(target_model)
-        ):
-            _fail(
-                f"target OpenAI Responses model {target_model!r} does not support reasoning.effort",
-                param="thinking",
-                scope="candidate",
-            )
         reasoning: dict[str, Any] = {"effort": effort}
         if allow_reasoning_effort:
             budget = common.anthropic_thinking_budget_tokens(body)

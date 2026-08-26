@@ -50,3 +50,42 @@ def apply_forced_openai_fast_mode(
     if forced:
         payload["service_tier"] = "priority"
     return forced
+
+
+def apply_reasoning_effort_capability(
+    payload: dict,
+    reasoning_efforts: Any,
+    *,
+    protocol: str,
+) -> bool:
+    """At a concrete provider/model boundary, adapt explicit unsupported max.
+
+    A non-empty ``reasoning_efforts`` list is authoritative model metadata.  We
+    only map ``max`` when that list explicitly omits max and includes xhigh.
+    Empty/missing metadata is unknown and therefore preserves the request.
+    """
+    if not isinstance(reasoning_efforts, (list, tuple, set)):
+        return False
+    supported = {
+        str(value or "").strip().lower() for value in reasoning_efforts
+        if str(value or "").strip()
+    }
+    if not supported or "max" in supported or "xhigh" not in supported:
+        return False
+
+    if protocol == "openai-chat":
+        if str(payload.get("reasoning_effort") or "").strip().lower() != "max":
+            return False
+        payload["reasoning_effort"] = "xhigh"
+        return True
+
+    if protocol == "openai-responses":
+        reasoning = payload.get("reasoning")
+        if not isinstance(reasoning, dict):
+            return False
+        if str(reasoning.get("effort") or "").strip().lower() != "max":
+            return False
+        reasoning["effort"] = "xhigh"
+        return True
+
+    return False

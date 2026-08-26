@@ -4173,20 +4173,6 @@ async def _try_channel(
     _proxy_client = opened.proxy_client
 
     try:
-        # Cursor's loopback bridge returns the exact upstream conversation ID in
-        # an internal-only header. Persist it before body consumption/settlement
-        # so a delayed dashboard event can be joined without time/model guessing.
-        if retry_attempt_id is not None and getattr(ch, "provider", "") == "cursor":
-            conversation_id = str(
-                upstream_resp.headers.get("X-Parrot-Cursor-Conversation-Id") or ""
-            ).strip()
-            if conversation_id:
-                await asyncio.to_thread(
-                    log_db.set_retry_attempt_cursor_conversation_id,
-                    retry_attempt_id,
-                    conversation_id,
-                )
-
         # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次
         _maybe_record_codex_snapshot(ch, upstream_resp)
         _maybe_record_anthropic_snapshot(ch, upstream_resp)
