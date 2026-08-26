@@ -640,6 +640,53 @@ def test_usage_from_quota_row_preserves_openai_thirty_day(m):
     assert m["oauth_manager"].extract_utils_percent(usage)[:3] == [None, None, 1.0]
     print("  [PASS] usage_from_quota_row: preserves OpenAI 30d quota")
 
+
+def test_flatten_usage_reads_fable_from_weekly_scoped_limit(m):
+    reset = "2026-08-30T10:00:00.161832+00:00"
+    out = m["oauth_manager"].flatten_usage({
+        "five_hour": {"utilization": 2.0, "resets_at": None},
+        "seven_day": {"utilization": 37.0, "resets_at": reset},
+        "seven_day_sonnet": None,
+        "seven_day_opus": None,
+        "limits": [{
+            "kind": "weekly_scoped",
+            "percent": 6,
+            "resets_at": reset,
+            "scope": {"model": {"id": None, "display_name": "Fable"}},
+        }],
+    })
+    assert out["fable_util"] == 6.0
+    assert out["fable_reset"] == reset
+    assert out["sonnet_util"] is None
+    assert out["opus_util"] is None
+    assert m["oauth_manager"].extract_utils_percent({
+        "limits": [{
+            "kind": "weekly_scoped",
+            "percent": 6,
+            "resets_at": reset,
+            "scope": {"model": {"display_name": "F5"}},
+        }],
+    })[5] == 6.0
+    print("  [PASS] flatten_usage: Claude Fable / F5 weekly_scoped limit")
+
+
+def test_usage_from_quota_row_reads_fable_from_raw_limits(m):
+    reset = "2026-08-30T10:00:00Z"
+    usage = m["oauth_manager"].usage_from_quota_row({
+        "five_hour_util": 2.0,
+        "seven_day_util": 37.0,
+        "sonnet_util": None,
+        "opus_util": None,
+        "raw_data": (
+            '{"limits":[{"kind":"weekly_scoped","percent":6,'
+            '"resets_at":"2026-08-30T10:00:00Z",'
+            '"scope":{"model":{"display_name":"Fable"}}}]}'
+        ),
+    })
+    assert usage["seven_day_fable"]["utilization"] == 6.0
+    assert usage["seven_day_fable"]["resets_at"] == reset
+    print("  [PASS] usage_from_quota_row: Fable fallback from raw limits")
+
 # ==============================================================
 # main
 # ==============================================================
@@ -687,6 +734,8 @@ def main():
         test_flatten_usage_preserves_resets_and_extra,
         test_flatten_usage_preserves_openai_thirty_day,
         test_usage_from_quota_row_preserves_openai_thirty_day,
+        test_flatten_usage_reads_fable_from_weekly_scoped_limit,
+        test_usage_from_quota_row_reads_fable_from_raw_limits,
     ]
     passed = 0
     failed = 0
