@@ -1423,57 +1423,79 @@ def _is_fable_model_label(value: str) -> bool:
     return compact in {"f5", "claudef5", "claudefable", "claudefable5"}
 
 
+def _fable_scoped_candidates(
+    usage: dict | None, *, include_inactive: bool,
+) -> tuple[bool, list[tuple[int, float, float, int, dict]]]:
+    """Collect ranked Claude Fable / F5 weekly scoped limit windows."""
+    data = usage if isinstance(usage, dict) else {}
+    candidates: list[tuple[int, float, float, int, dict]] = []
+    saw_scoped_fable = False
+    limits = data.get("limits")
+    if not isinstance(limits, list):
+        return False, candidates
+    for index, item in enumerate(limits):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        if kind not in {"weekly_scoped", "seven_day_scoped"}:
+            continue
+        scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        name = str(model.get("display_name") or model.get("id") or "")
+        if not _is_fable_model_label(name):
+            continue
+        saw_scoped_fable = True
+        if item.get("is_active") is False and not include_inactive:
+            continue
+        raw_util = item.get("utilization")
+        if raw_util is None:
+            raw_util = item.get("percent")
+        try:
+            utilization = float(raw_util)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(utilization):
+            continue
+        utilization = max(0.0, min(100.0, utilization))
+        reset = item.get("resets_at")
+        reset_dt = _parse_iso(reset)
+        reset_rank = reset_dt.timestamp() if reset_dt is not None else -1.0
+        candidates.append((
+            1 if item.get("is_active") is True else 0,
+            reset_rank,
+            utilization,
+            -index,
+            {"utilization": utilization, "resets_at": reset},
+        ))
+    return saw_scoped_fable, candidates
+
+
+def _pick_fable_candidate(
+    candidates: list[tuple[int, float, float, int, dict]],
+) -> dict:
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda candidate: candidate[:4])[4]
+
+
 def fable_usage_block(usage: dict | None) -> dict:
     """Extract the active Claude Fable / F5 weekly quota window.
 
     Newer /api/oauth/usage payloads keep Sonnet/Opus null and put Fable on
     ``limits[]`` as ``weekly_scoped`` (``scope.model.display_name = Fable``).
-    Explicitly inactive entries are historical and must not drive live display
-    or routing.  If more than one viable entry is returned, prefer an explicitly
-    active entry, then the latest reset, then the highest utilization.  Older or
-    mock payloads may still expose ``seven_day_fable`` as a fallback.
+    Explicitly inactive entries are historical and must not drive routing or
+    model cooldown.  If more than one viable entry is returned, prefer an
+    explicitly active entry, then the latest reset, then the highest
+    utilization.  Older or mock payloads may still expose ``seven_day_fable``
+    as a fallback.  Telegram display uses ``fable_display_block`` so a lone
+    inactive scoped window can still be shown.
     """
     data = usage if isinstance(usage, dict) else {}
-    candidates: list[tuple[int, float, float, int, dict]] = []
-    saw_scoped_fable = False
-    limits = data.get("limits")
-    if isinstance(limits, list):
-        for index, item in enumerate(limits):
-            if not isinstance(item, dict):
-                continue
-            kind = str(item.get("kind") or "")
-            if kind not in {"weekly_scoped", "seven_day_scoped"}:
-                continue
-            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
-            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
-            name = str(model.get("display_name") or model.get("id") or "")
-            if not _is_fable_model_label(name):
-                continue
-            saw_scoped_fable = True
-            if item.get("is_active") is False:
-                continue
-            raw_util = item.get("utilization")
-            if raw_util is None:
-                raw_util = item.get("percent")
-            try:
-                utilization = float(raw_util)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(utilization):
-                continue
-            utilization = max(0.0, min(100.0, utilization))
-            reset = item.get("resets_at")
-            reset_dt = _parse_iso(reset)
-            reset_rank = reset_dt.timestamp() if reset_dt is not None else -1.0
-            candidates.append((
-                1 if item.get("is_active") is True else 0,
-                reset_rank,
-                utilization,
-                -index,
-                {"utilization": utilization, "resets_at": reset},
-            ))
+    saw_scoped_fable, candidates = _fable_scoped_candidates(
+        data, include_inactive=False,
+    )
     if candidates:
-        return max(candidates, key=lambda candidate: candidate[:4])[4]
+        return _pick_fable_candidate(candidates)
     if saw_scoped_fable:
         return {}
 
@@ -1487,8 +1509,45 @@ def fable_usage_block(usage: dict | None) -> dict:
     return {}
 
 
+def fable_display_block(usage: dict | None) -> dict:
+    """Quota window for Telegram / refresh copy.
+
+    Prefer the live active Fable pool used by routing.  Anthropic currently
+    returns the Fable weekly scoped cap with ``is_active: false`` even when it
+    is the only Fable window and still has percent + reset; show that instead of
+    hiding the row.  Inactive entries never override an active scoped window.
+    """
+    data = usage if isinstance(usage, dict) else {}
+    active = fable_usage_block(data)
+    if active:
+        return active
+    _saw, inactive = _fable_scoped_candidates(data, include_inactive=True)
+    if inactive:
+        return _pick_fable_candidate(inactive)
+    direct = data.get("seven_day_fable")
+    if isinstance(direct, dict) and direct.get("utilization") is not None:
+        return direct
+    return {}
+
+
+def _fable_util_from_block(block: dict | None) -> tuple[float | None, str | None]:
+    if not block or block.get("utilization") is None:
+        return None, None
+    try:
+        value = float(block["utilization"])
+    except (TypeError, ValueError):
+        return None, None
+    if math.isnan(value) or math.isinf(value):
+        return None, None
+    return max(0.0, min(100.0, value)), block.get("resets_at")
+
+
 def fable_from_quota_row(row: dict | None) -> tuple[float | None, str | None]:
-    """Return (util%, resets_at) for Fable, including raw_data fallback."""
+    """Return active (util%, resets_at) for Fable, including raw_data fallback.
+
+    This path is for routing, cooldown and cached reconstruction.  UI should
+    call ``fable_display_from_quota_row`` so inactive scoped windows remain visible.
+    """
     if not isinstance(row, dict):
         return None, None
     util = row.get("fable_util")
@@ -1502,16 +1561,17 @@ def fable_from_quota_row(row: dict | None) -> tuple[float | None, str | None]:
                 value = None
             else:
                 return max(0.0, min(100.0, value)), row.get("fable_reset")
-    block = fable_usage_block(_raw_usage_from_flat(row))
-    if not block or block.get("utilization") is None:
+    return _fable_util_from_block(fable_usage_block(_raw_usage_from_flat(row)))
+
+
+def fable_display_from_quota_row(row: dict | None) -> tuple[float | None, str | None]:
+    """Return Fable (util%, resets_at) for Telegram list/detail/refresh copy."""
+    if not isinstance(row, dict):
         return None, None
-    try:
-        value = float(block["utilization"])
-    except (TypeError, ValueError):
-        return None, None
-    if math.isnan(value) or math.isinf(value):
-        return None, None
-    return max(0.0, min(100.0, value)), block.get("resets_at")
+    active_util, active_reset = fable_from_quota_row(row)
+    if active_util is not None:
+        return active_util, active_reset
+    return _fable_util_from_block(fable_display_block(_raw_usage_from_flat(row)))
 
 
 def flatten_usage(usage: dict) -> dict:
@@ -4925,7 +4985,7 @@ def _refresh_notice_window_lines(usage_flat: dict | None) -> list[str]:
     lines: list[str] = []
     fh_util = usage_flat.get("five_hour_util")
     sd_util = usage_flat.get("seven_day_util")
-    fb_util = usage_flat.get("fable_util")
+    fb_util, fb_reset = fable_display_from_quota_row(usage_flat)
     if fh_util is not None:
         lines.append(
             f"📊 5h 用量: <b>{fh_util:.0f}%</b>"
@@ -4939,7 +4999,7 @@ def _refresh_notice_window_lines(usage_flat: dict | None) -> list[str]:
     if fb_util is not None:
         lines.append(
             f"📖 Fable 7d: <b>{fb_util:.0f}%</b>"
-            f" | 重置: <code>{_to_bjt(usage_flat.get('fable_reset'))}</code>"
+            f" | 重置: <code>{_to_bjt(fb_reset)}</code>"
         )
     return lines
 

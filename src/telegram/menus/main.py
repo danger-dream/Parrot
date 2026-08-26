@@ -43,7 +43,7 @@ def _quota_hot_count(threshold_pct: float = 80.0) -> int:
         else:
             utils = [row.get(k) for k in ("five_hour_util", "seven_day_util",
                                            "thirty_day_util", "sonnet_util", "opus_util")]
-            utils.append(oauth_manager.fable_from_quota_row(row)[0])
+            utils.append(oauth_manager.fable_display_from_quota_row(row)[0])
         if any(u is not None and u >= threshold_pct for u in utils):
             n += 1
     return n

@@ -220,7 +220,7 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
             }
         elif provider == "claude":
             # Anthropic: 5h / 7d / Sonnet / Opus / Fable
-            fable_util, _fable_reset = oauth_manager.fable_from_quota_row(row)
+            fable_util, _fable_reset = oauth_manager.fable_display_from_quota_row(row)
             utils = {
                 "5h": row.get("five_hour_util"),
                 "7d": row.get("seven_day_util"),

@@ -1559,6 +1559,40 @@ def test_claude_fable_quota_renders_progress_bar(m):
     print("  [PASS] Claude Fable / F5 quota renders with black/white bar")
 
 
+def test_claude_fable_quota_renders_inactive_scoped_window(m):
+    _setup(m)
+    _add_fake_account(m, "fable-inactive@x.com")
+    reset = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    usage = {
+        "five_hour": {"utilization": 0.0, "resets_at": None},
+        "seven_day": {"utilization": 38.0, "resets_at": reset},
+        "seven_day_sonnet": None,
+        "seven_day_opus": None,
+        "limits": [{
+            "kind": "weekly_scoped",
+            "is_active": False,
+            "percent": 6,
+            "resets_at": reset,
+            "scope": {"model": {"display_name": "Fable"}},
+        }],
+    }
+    m["state_db"].quota_save(
+        "fable-inactive@x.com",
+        m["oauth_manager"].flatten_usage(usage),
+        email="fable-inactive@x.com",
+    )
+    rec = _install_recorder(m)
+    m["oauth_menu"].show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "📖 Fable 7d: 已用 <code>█░░░░░░░░░</code> <b>6%</b>（剩 " in list_text
+    rec.clear()
+    short = m["ui"].register_code("fable-inactive@x.com")
+    m["oauth_menu"].on_view(42, 100, "cb", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "📖 Fable 7d: 已用 6% <code>█░░░░░░░░░</code>" in detail_text
+    print("  [PASS] Claude Fable inactive scoped window still renders")
+
+
 def test_non_claude_detail_ignores_stale_fable_fields(m):
     _setup(m)
     _add_openai_fake_account(m, "stale-fable@x.com")
@@ -1618,6 +1652,7 @@ def main():
         test_add_menu_cancel_buttons,
         test_router_dispatch,
         test_claude_fable_quota_renders_progress_bar,
+        test_claude_fable_quota_renders_inactive_scoped_window,
         test_non_claude_detail_ignores_stale_fable_fields,
     ]
 
