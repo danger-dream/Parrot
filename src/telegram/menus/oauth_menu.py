@@ -1743,8 +1743,9 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
         ("🤖 Sonnet 7d", row.get("sonnet_util"), row.get("sonnet_reset"), None),
         ("🧠 Opus 7d", row.get("opus_util"), row.get("opus_reset"), None),
     ]
-    fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
-    usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None))
+    if provider == "claude":
+        fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
+        usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None))
     for label, util, reset, util_k in usage_rows:
         line = _format_usage_line_text(label, util, reset)
         if line:

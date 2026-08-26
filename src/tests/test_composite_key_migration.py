@@ -667,6 +667,11 @@ def test_flatten_usage_reads_fable_from_weekly_scoped_limit(m):
             "scope": {"model": {"display_name": "F5"}},
         }],
     })[5] == 6.0
+    matcher = m["oauth_manager"]._is_fable_model_label
+    for label in ("Fable", "Claude Fable", "F5", "Claude-F5", "claude-fable-5"):
+        assert matcher(label), label
+    for label in ("notfable", "claude-f5-preview", "claude-opus-4-5"):
+        assert not matcher(label), label
     print("  [PASS] flatten_usage: Claude Fable / F5 weekly_scoped limit")
 
 

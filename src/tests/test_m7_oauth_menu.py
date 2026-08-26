@@ -1559,6 +1559,27 @@ def test_claude_fable_quota_renders_progress_bar(m):
     print("  [PASS] Claude Fable / F5 quota renders with black/white bar")
 
 
+def test_non_claude_detail_ignores_stale_fable_fields(m):
+    _setup(m)
+    _add_openai_fake_account(m, "stale-fable@x.com")
+    account_key = _account_key_for(m, "stale-fable@x.com")
+    reset = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    usage = {
+        "five_hour": {"utilization": 12.0, "resets_at": reset},
+        "seven_day_fable": {"utilization": 99.0, "resets_at": reset},
+    }
+    m["state_db"].quota_save(
+        account_key,
+        m["oauth_manager"].flatten_usage(usage),
+        email="stale-fable@x.com",
+    )
+
+    detail_text = m["oauth_menu"]._format_usage_block(account_key)
+    assert "⏱ 5h: 已用 12%" in detail_text
+    assert "Fable" not in detail_text
+    print("  [PASS] non-Claude detail ignores stale Fable quota fields")
+
+
 # ─── main ────────────────────────────────────────────────────────
 
 def main():
@@ -1597,6 +1618,7 @@ def main():
         test_add_menu_cancel_buttons,
         test_router_dispatch,
         test_claude_fable_quota_renders_progress_bar,
+        test_non_claude_detail_ignores_stale_fable_fields,
     ]
 
     passed = 0

@@ -396,10 +396,14 @@ def test_refresh_notice_openai_wording(m):
         "five_hour_reset": "2026-08-23T12:00:00Z",
         "seven_day_util": 34.0,
         "seven_day_reset": "2026-08-30T12:00:00Z",
+        "fable_util": 56.0,
+        "fable_reset": "2026-09-02T12:00:00Z",
     })
     assert "5h 用量" in txt3
     assert "7d 用量" in txt3
-    print("  [PASS] _build_refresh_notice: empty quota is omitted")
+    assert "Fable 7d: <b>56%</b>" in txt3
+    assert "2026-09-02 20:00:00" in txt3
+    print("  [PASS] _build_refresh_notice: empty quota is omitted; Claude includes Fable")
 
 
 def test_openai_refresh_updates_id_token_metadata(m):
