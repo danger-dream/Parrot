@@ -436,6 +436,33 @@ def test_xai_missing_credit_percent_does_not_fall_back_to_legacy_monthly(m, monk
     assert billing["auto_top_up"] == {"monthly_limit": 0, "used": 0}
 
 
+def test_xai_list_plan_omits_code_badge_but_detail_keeps_access(m):
+    _setup(m)
+    account_key = "xai:plan-copy"
+    raw = {"xai": {
+        "source": "cli-chat-proxy",
+        "user": {
+            "subscription_tier": "SuperGrokPro",
+            "has_grok_code_access": True,
+        },
+        "settings": {
+            "subscription_tier_display": "SuperGrok Heavy",
+            "allow_access": True,
+        },
+    }}
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "raw_data": json.dumps(raw),
+    }, email="plan@example.test")
+
+    summary = m["oauth_menu"]._format_xai_provider_line(account_key, detail=False)
+    detail = m["oauth_menu"]._format_xai_provider_line(account_key, detail=True)
+    assert summary == "🏷 套餐: SuperGrokPro / SuperGrok Heavy"
+    assert "Grok Code 可用" not in summary
+    assert "🏷 套餐: <code>SuperGrokPro / SuperGrok Heavy</code>" in detail
+    assert "Grok Code 可用" in detail
+
+
 def test_xai_weekly_official_block_and_local_monthly_label(m):
     _setup(m)
     account_key = "xai:render-sub"
@@ -466,8 +493,11 @@ def test_xai_weekly_official_block_and_local_monthly_label(m):
         account_key, detail=False,
         month_stats={"input": 10, "output": 2, "cache_creation": 0, "cache_read": 0},
     )
-    assert "周额度: 剩余 30.00% · 已用 70.00%" in summary
+    assert "周额度: 已用 <code>███████░░░</code> <b>70.00%</b>" in summary
+    assert "剩余" not in summary and "· 已用" not in summary and "· 重置" not in summary
+    assert "（" in summary and "2026-08-13" not in summary
     assert "周额度: 剩余 <code>30.00%</code> · 已用 <code>70.00%</code>" in detail
+    assert "2026-08-13" in detail
     assert "0 / 0" not in summary + detail
     assert "月额度" not in summary + detail
     assert "本地月度" in local
@@ -490,7 +520,8 @@ def test_xai_missing_weekly_percent_means_unused(m):
     }, email="unknown@example.test")
     summary = m["oauth_menu"]._format_xai_official_block(account_key, detail=False)
     text = m["oauth_menu"]._format_xai_official_block(account_key, detail=True)
-    assert "周额度: 剩余 100.00% · 已用 0.00%" in summary
+    assert "周额度: 已用 <code>░░░░░░░░░░</code> <b>0.00%</b>" in summary
+    assert "剩余" not in summary and "· 已用" not in summary
     assert "周额度: 剩余 <code>100.00%</code> · 已用 <code>0.00%</code>" in text
     assert "上游未返回额度百分比" not in summary + text
     assert "0 / 0" not in text

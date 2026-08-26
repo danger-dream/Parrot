@@ -112,6 +112,7 @@ def _setup(m):
     def _r(c):
         c["channels"] = []
         c["modelMapping"] = {"global": {}}
+        c["quotaProgressBar"] = True
         c.setdefault("scoring", {})["explorationRate"] = 0.0
     m["config"].update(_r)
     m["states"].clear_all()
@@ -1069,3 +1070,44 @@ def test_supported_provider_usage_list_detail_are_cache_only(m, monkeypatch):
     usage_cb = next(x for x in callbacks if x.startswith("ch:usage:"))
     assert len(usage_cb.encode()) <= 64 and "deepseek" not in usage_cb and "sk-live" not in usage_cb
     assert called == []  # pure render path never performs or schedules network itself
+
+
+def test_quota_progress_bar_applies_to_channel_list_and_detail(m, monkeypatch):
+    _setup(m)
+    m["registry"].add_api_channel({
+        "name": "Zhipu quota", "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+        "apiKey": "sk-live-not-used", "providerId": "zhipu",
+        "providerPresetId": "coding-cn", "models": [{"real": "glm-5", "alias": "glm-5"}],
+        "cc_mimicry": False, "enabled": True,
+    })
+    ch = m["registry"].get_channel("api:Zhipu quota")
+    snapshot = {
+        "source": "zhipu-coding",
+        "version": 2,
+        "windows": [
+            {"id": "tokens_5h", "label": "5 小时额度", "used_percent": 20, "reset_at": None},
+            {"id": "tokens_7d", "label": "7 天额度", "used_percent": 70, "reset_at": None},
+            {"id": "mcp_month", "label": "月 MCP 额度", "used": 3, "total": 10, "reset_at": None},
+        ],
+        "balances": [], "counters": [], "notices": [], "partial": False,
+    }
+    pu = m["channel_menu"].provider_usage
+    monkeypatch.setattr(
+        pu, "cached",
+        lambda channel: {"status": "fresh", "fetched_at": 1000, "snapshot": snapshot},
+    )
+
+    list_text, _ = m["channel_menu"]._list_text_and_kb(snapshot={"by_channel": {}})
+    detail_text, _ = m["channel_menu"]._detail_text_and_kb(ch.display_name, model_stats=[])
+    assert "📊 5 小时额度：已用 <b>20%</b> <code>██░░░░░░░░</code>" in list_text
+    assert "📅 7 天额度：已用 <b>70%</b> <code>███████░░░</code>" in list_text
+    assert "⏱ 5 小时额度：已用 <b>20%</b> <code>██░░░░░░░░</code>" in detail_text
+    assert "🛠 月 MCP 额度：已用 <b>3 / 10</b>（30%） <code>███░░░░░░░</code>" in detail_text
+
+    m["config"].update(lambda c: c.__setitem__("quotaProgressBar", False))
+    list_hidden, _ = m["channel_menu"]._list_text_and_kb(snapshot={"by_channel": {}})
+    detail_hidden, _ = m["channel_menu"]._detail_text_and_kb(ch.display_name, model_stats=[])
+    hidden = list_hidden + "\n" + detail_hidden
+    assert "5 小时额度：已用 <b>20%</b>" in hidden
+    assert "月 MCP 额度：已用 <b>3 / 10</b>（30%）" in hidden
+    assert "█" not in hidden and "░" not in hidden

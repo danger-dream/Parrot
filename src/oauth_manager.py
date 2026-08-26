@@ -1142,6 +1142,113 @@ def attach_openai_reset_credit_details_to_usage(
     return out
 
 
+def _openai_reset_credit_count_from_usage(usage: dict | None) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    openai = usage.get("openai")
+    summary = openai.get("rate_limit_reset_credits") if isinstance(openai, dict) else None
+    if not isinstance(summary, dict):
+        summary = usage.get("rate_limit_reset_credits")
+    if not isinstance(summary, dict):
+        return None
+    try:
+        return int(summary.get("available_count"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _openai_reset_credit_details_from_usage(usage: dict | None) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+    openai = usage.get("openai")
+    details = openai.get("rate_limit_reset_credit_details") if isinstance(openai, dict) else None
+    if not isinstance(details, dict):
+        details = usage.get("rate_limit_reset_credit_details")
+    return details if isinstance(details, dict) else None
+
+
+def _cached_openai_reset_credit_details(account_key: str) -> dict | None:
+    try:
+        row = state_db.quota_load(account_key) or {}
+        raw = json.loads(row.get("raw_data") or "{}")
+    except Exception:
+        return None
+    return _openai_reset_credit_details_from_usage(raw)
+
+
+def preserve_openai_reset_credit_details(account_key: str, usage: dict) -> dict:
+    """Keep the last card list when a summary refresh cannot update details.
+
+    WHAM ``/usage`` only includes ``available_count``. A temporary failure of
+    the separate reset-credit endpoint must not let that summary-only response
+    erase a previously cached card list. The new usage count remains
+    authoritative, so stale details never overwrite it.
+    """
+    if provider_of(account_key) != "openai" or not isinstance(usage, dict):
+        return usage
+    if _openai_reset_credit_details_from_usage(usage) is not None:
+        return usage
+    old_details = _cached_openai_reset_credit_details(account_key)
+    if old_details is None:
+        return usage
+    return attach_openai_reset_credit_details_to_usage(
+        usage, old_details, sync_available_count=False,
+    )
+
+
+async def enrich_openai_reset_credit_details(account_key: str, usage: dict) -> dict:
+    """Attach a fresh OpenAI reset-card list to one usage snapshot.
+
+    A known zero count needs no second request; storing an explicit empty detail
+    snapshot also clears cards that were available in an older refresh.
+    """
+    account_key = _resolve_existing_account_key_or_raise(account_key)
+    if provider_of(account_key) != "openai" or not isinstance(usage, dict):
+        return usage
+    count = _openai_reset_credit_count_from_usage(usage)
+    if count is not None and count <= 0:
+        return attach_openai_reset_credit_details_to_usage(
+            usage, {"available_count": count, "data": []},
+            sync_available_count=False,
+        )
+    details = await fetch_openai_rate_limit_reset_credits(account_key)
+    return attach_openai_reset_credit_details_to_usage(
+        usage, details, sync_available_count=(count is None),
+    )
+
+
+async def fetch_usage_snapshot(account_key: str, *,
+                               usage_timeout_s: float | None = None,
+                               detail_timeout_s: float | None = None) -> dict:
+    """Fetch usage plus provider-specific detail data for one cache snapshot.
+
+    OpenAI exposes reset-card rows through a second endpoint. All routine
+    refresh paths use this helper so startup/monitor/access refreshes cannot
+    overwrite those rows with a summary-only ``/usage`` payload.
+    """
+    account_key = _resolve_existing_account_key_or_raise(account_key)
+    usage_coro = fetch_usage(account_key)
+    usage = (
+        await asyncio.wait_for(usage_coro, timeout=usage_timeout_s)
+        if usage_timeout_s is not None else await usage_coro
+    )
+    usage = preserve_antigravity_cached_summary(account_key, usage)
+    if provider_of(account_key) != "openai":
+        return usage
+
+    try:
+        detail_coro = enrich_openai_reset_credit_details(account_key, usage)
+        return (
+            await asyncio.wait_for(detail_coro, timeout=detail_timeout_s)
+            if detail_timeout_s is not None else await detail_coro
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[oauth] reset-credit detail refresh failed for {account_key}: {exc}")
+        return preserve_openai_reset_credit_details(account_key, usage)
+
+
 def _synthesize_openai_usage_from_row(row: dict) -> dict:
     """把 OpenAI codex snapshot 行映射到 Anthropic 风格 usage dict。
 
@@ -1230,7 +1337,9 @@ async def ensure_quota_fresh(account_key: str, *, timeout_s: float = 5.0) -> boo
                 if age_s < throttle_s:
                     return False
         try:
-            usage = await asyncio.wait_for(fetch_usage(account_key), timeout=timeout_s)
+            usage = await fetch_usage_snapshot(
+                account_key, usage_timeout_s=timeout_s, detail_timeout_s=timeout_s,
+            )
         except asyncio.TimeoutError:
             print(f"[oauth] ensure_quota_fresh timeout ({timeout_s}s): {account_key}")
             return False
@@ -3738,7 +3847,7 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     # the windows are below threshold before Parrot auto-resumes a quota-disabled
     # account. If this fetch fails, keep the local restriction in place.
     try:
-        usage = await fetch_usage(canonical)
+        usage = await fetch_usage_snapshot(canonical)
     except Exception as exc:
         out["refresh_error"] = str(exc)
         out["quota_action"] = {"action": "refresh_failed_keep_disabled"}
@@ -4973,7 +5082,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             usage_flat: dict | None = None
             usage: dict | None = None
             try:
-                usage = await fetch_usage(ak)
+                usage = await fetch_usage_snapshot(ak)
                 usage_flat = flatten_usage(usage)
                 # 统一用 quota_save 写入；OpenAI 主动拉取来自 wham/usage，
                 # 不覆盖响应头实时采样保存在 codex_* 列里的细节。
@@ -5050,7 +5159,7 @@ async def quota_monitor_once() -> dict:
 
         reason_before = acc.get("disabled_reason")
         try:
-            usage = await fetch_usage(ak)
+            usage = await fetch_usage_snapshot(ak)
         except Exception as exc:
             out[email] = f"fetch_failed:{exc}"
             continue
@@ -5116,6 +5225,40 @@ async def quota_monitor_once() -> dict:
     return out
 
 
+async def preload_openai_reset_credit_details_once() -> dict[str, str]:
+    """Warm OpenAI usage/card caches once without delaying app readiness.
+
+    ``quota_monitor_loop`` owns this one-shot work, so no second scheduler or
+    thread is introduced. It also runs when periodic quota monitoring is off;
+    the process-wide ``PARROT_NO_REFRESH`` startup guard still skips the whole
+    loop when operators explicitly disable refreshes.
+    """
+    out: dict[str, str] = {}
+    for acc in list_accounts()[:]:
+        if provider_of(acc) != "openai":
+            continue
+        email = str(acc.get("email") or "")
+        if not email:
+            continue
+        ak = _account_key(acc)
+        reason = acc.get("disabled_reason")
+        if reason in ("user", "auth_error"):
+            out[ak] = f"skipped:{reason}"
+            continue
+        try:
+            usage = await fetch_usage_snapshot(
+                ak, usage_timeout_s=5.0, detail_timeout_s=5.0,
+            )
+            state_db.quota_save(ak, flatten_usage(usage), email=email)
+            out[ak] = "refreshed"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            out[ak] = f"failed:{type(exc).__name__}"
+            print(f"[oauth] startup quota preload failed for {ak}: {exc}")
+    return out
+
+
 async def proactive_refresh_loop() -> None:
     """后台任务：初次等 30s，之后每 60s 触发一次 refresh_once。"""
     await asyncio.sleep(30)
@@ -5128,7 +5271,23 @@ async def proactive_refresh_loop() -> None:
 
 
 async def quota_monitor_loop() -> None:
-    """后台任务：初次等 45s（避开 refresh 第一轮）；之后按配置间隔。"""
+    """后台任务：启动时预热 OpenAI 卡片明细，之后按配置监控额度。"""
+    try:
+        startup = await preload_openai_reset_credit_details_once()
+        refreshed = sum(value == "refreshed" for value in startup.values())
+        failed = sum(value.startswith("failed:") for value in startup.values())
+        skipped = len(startup) - refreshed - failed
+        if startup:
+            print(
+                "[oauth] startup quota preload: "
+                f"refreshed={refreshed} skipped={skipped} failed={failed}"
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[oauth_manager] startup quota preload error: {exc}")
+
+    # Preserve the original stagger before the first quota-state evaluation.
     await asyncio.sleep(45)
     while True:
         cfg = config.get()

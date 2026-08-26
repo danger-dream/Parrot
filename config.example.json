@@ -194,6 +194,7 @@
     }
   },
   "cchMode": "disabled",
+  "quotaProgressBar": true,
   "oauthDefaultModels": [
     "claude-opus-4-5",
     "claude-opus-4-6",

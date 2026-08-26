@@ -81,6 +81,7 @@ def _setup(m):
         c.setdefault("oauth", {})["mockMode"] = True
         c["oauthAccounts"] = []
         c["oauthUsageDisplayMode"] = "used"
+        c["quotaProgressBar"] = True
         c["cchMode"] = "disabled"
         c.setdefault("quotaMonitor", {})["enabled"] = False
         c.setdefault("quotaMonitor", {})["intervalSeconds"] = 60
@@ -328,8 +329,8 @@ def test_view_detail_with_quota_cache(m):
     m["oauth_menu"].on_view(42, 100, "cb", short)
     last = rec.last("editMessageText")
     assert last and "alice@x.com" in last["text"]
-    assert "5h: 已用 12% █░░░░░░░░░" in last["text"]
-    assert "7d: 已用 45% █████░░░░░" in last["text"]
+    assert "5h: 已用 12% <code>█░░░░░░░░░</code>" in last["text"]
+    assert "7d: 已用 45% <code>█████░░░░░</code>" in last["text"]
     assert "缓存 50 (31.2%)" in last["text"]
     assert "均 " in last["text"] and " · $0.000" in last["text"]
     assert "累计金额：$0.00" in last["text"]
@@ -413,17 +414,17 @@ def test_missing_reset_shows_upstream_not_returned(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📊 5h: 已用 <b>0%</b> <code>░░░░░░░░░░</code> · 重置 <code>?</code>" in list_text
-    assert "📊 7d: 已用 <b>45%</b> <code>█████░░░░░</code> · 重置 <code>?</code>" in list_text
+    assert "📊 5h: 已用 <code>░░░░░░░░░░</code> <b>0%</b>（上游未返回）" in list_text
+    assert "📊 7d: 已用 <code>█████░░░░░</code> <b>45%</b>（上游未返回）" in list_text
 
     rec.clear()
     short = m["ui"].register_code("missing-reset@x.com")
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert "⏱ 5h: 已用 0% ░░░░░░░░░░ (重置: 上游未返回)" in detail_text
-    assert "📅 7d: 已用 45% █████░░░░░ (重置: 上游未返回)" in detail_text
-    assert "🤖 Sonnet 7d: 已用 0% ░░░░░░░░░░ (重置: 上游未返回)" in detail_text
-    assert "🧠 Opus 7d: 已用 0% ░░░░░░░░░░ (重置: 上游未返回)" in detail_text
+    assert "⏱ 5h: 已用 0% <code>░░░░░░░░░░</code> (重置: 上游未返回)" in detail_text
+    assert "📅 7d: 已用 45% <code>█████░░░░░</code> (重置: 上游未返回)" in detail_text
+    assert "🤖 Sonnet 7d: 已用 0% <code>░░░░░░░░░░</code> (重置: 上游未返回)" in detail_text
+    assert "🧠 Opus 7d: 已用 0% <code>░░░░░░░░░░</code> (重置: 上游未返回)" in detail_text
     print("  [PASS] missing reset renders current list fallback + 上游未返回 in detail")
 
 
@@ -476,16 +477,230 @@ def test_settings_usage_display_mode_toggle(m):
     rec.clear()
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📊 5h: 剩余 <b>80%</b> <code>████████░░</code>" in list_text
-    assert "📊 7d: 剩余 <b>40%</b> <code>████░░░░░░</code>" in list_text
+    assert "📊 5h: 剩余 <code>████████░░</code> <b>80%</b>（上游未返回）" in list_text
+    assert "📊 7d: 剩余 <code>████░░░░░░</code> <b>40%</b>（上游未返回）" in list_text
 
     rec.clear()
     short = m["ui"].register_code("mode@x.com")
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert "⏱ 5h: 剩余 80% ████████░░" in detail_text
-    assert "📅 7d: 剩余 40% ████░░░░░░" in detail_text
+    assert "⏱ 5h: 剩余 80% <code>████████░░</code>" in detail_text
+    assert "📅 7d: 剩余 40% <code>████░░░░░░</code>" in detail_text
     print("  [PASS] OAuth settings toggles usage display mode and persists config")
+
+
+def test_quota_progress_bar_toggle_applies_to_oauth_list_and_detail(m):
+    _setup(m)
+    _add_fake_account(m, "progress@x.com")
+    m["state_db"].quota_save("progress@x.com", {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 20.0, "five_hour_reset": None,
+        "seven_day_util": 60.0, "seven_day_reset": None,
+        "extra_used": 2.5, "extra_limit": 10.0, "extra_util": 25.0,
+        "raw_data": "{}",
+    })
+    rec = _install_recorder(m)
+    om = m["oauth_menu"]
+
+    om.on_settings(42, 100, "cb-settings")
+    settings = rec.last("editMessageText")
+    keyboard = settings["reply_markup"]["inline_keyboard"]
+    progress_row = next(
+        row for row in keyboard
+        if any(b.get("callback_data") == "oa:progress_bar:toggle" for b in row)
+    )
+    assert [b["text"] for b in progress_row] == ["🎭 CCH模式：开启", "☑ 进度条"]
+    assert "黑白进度条: 开启" in settings["text"]
+
+    rec.clear()
+    om.show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "📊 5h: 已用 <code>██░░░░░░░░</code> <b>20%</b>（上游未返回）" in list_text
+    assert "📊 7d: 已用 <code>██████░░░░</code> <b>60%</b>（上游未返回）" in list_text
+
+    rec.clear()
+    short = m["ui"].register_code("progress@x.com")
+    om.on_view(42, 100, "cb-view", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "⏱ 5h: 已用 20% <code>██░░░░░░░░</code>" in detail_text
+    assert "💰 额外: 已用 $2.50 / $10.00 (25.0%) <code>███░░░░░░░</code>" in detail_text
+
+    rec.clear()
+    assert om.handle_callback(42, 100, "cb-progress", "oa:progress_bar:toggle") is True
+    assert m["config"].get()["quotaProgressBar"] is False
+    toggled = rec.last("editMessageText")
+    assert "黑白进度条: 关闭" in toggled["text"]
+    assert any(
+        b["text"] == "☐ 进度条"
+        for row in toggled["reply_markup"]["inline_keyboard"] for b in row
+    )
+
+    rec.clear()
+    om.show(42, 100)
+    list_text = rec.last("editMessageText")["text"]
+    assert "📊 5h: 已用 <b>20%</b>（上游未返回）" in list_text
+    assert "█" not in list_text and "░" not in list_text
+
+    rec.clear()
+    om.on_view(42, 100, "cb-view", short)
+    detail_text = rec.last("editMessageText")["text"]
+    assert "⏱ 5h: 已用 20% (重置:" in detail_text
+    assert "💰 额外: 已用 $2.50 / $10.00 (25.0%)" in detail_text
+    assert "█" not in detail_text and "░" not in detail_text
+
+
+def test_provider_specific_oauth_quota_percentages_share_progress_bar(m):
+    _setup(m)
+    now_ms = m["state_db"].now_ms()
+    m["state_db"].quota_save("cursor:progress", {
+        "fetched_at": now_ms,
+        "raw_data": json.dumps({"cursor": {
+            "limit_cents": 10000,
+            "remaining_cents": 7500,
+            "total_spend_cents": 2500,
+            "total_utilization": 25,
+            "auto_percent_used": 40,
+            "api_percent_used": 90,
+        }}),
+    })
+    m["state_db"].quota_save("xai:progress", {
+        "fetched_at": now_ms,
+        "raw_data": json.dumps({"xai": {
+            "source": "cli-chat-proxy",
+            "billing": {
+                "period_type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "used_percent": 70,
+                "remaining_percent": 30,
+            },
+            "settings": {},
+        }}),
+    })
+    m["state_db"].quota_save("antigravity:progress", {
+        "fetched_at": now_ms,
+        "raw_data": json.dumps({"antigravity": {
+            "known": False,
+            "quota_groups": [{
+                "display_name": "Gemini Models",
+                "buckets": [{
+                    "window": "5h", "remaining_fraction": 0.42,
+                    "reset_time": "2099-01-01T00:00:00Z",
+                }],
+            }],
+        }}),
+    })
+    om = m["oauth_menu"]
+
+    cursor_list = om._format_cursor_usage_block("cursor:progress", detail=False)
+    cursor_detail = om._format_cursor_usage_block("cursor:progress", detail=True)
+    assert "包含额度: 已用 <code>███░░░░░░░</code> <b>25.00%</b>（$25.00 / $100.00）" in cursor_list
+    assert "🧭 Cursor: 已用 <code>████░░░░░░</code> <b>40.00%</b>" in cursor_list
+    assert "🧩 Other: 已用 <code>█████████░</code> <b>90.00%</b>" in cursor_list
+    assert "Cursor Models / Auto: 已用 <b>40.00%</b> <code>████░░░░░░</code>" in cursor_detail
+    assert "Other Models / API: 已用 <b>90.00%</b> <code>█████████░</code>" in cursor_detail
+
+    xai_list = om._format_xai_official_block("xai:progress", detail=False)
+    xai_detail = om._format_xai_official_block("xai:progress", detail=True)
+    assert "已用 <code>███████░░░</code> <b>70.00%</b>（上游未返回）" in xai_list
+    assert "剩余" not in xai_list
+    assert "已用 <code>70.00%</code> <code>███████░░░</code>" in xai_detail
+    spend_stats = {
+        "input": 10, "output": 2, "cache_creation": 0, "cache_read": 0,
+        "service_tier_counts": {"default": 3},
+    }
+    xai_spend_list = om._format_xai_spend_block(
+        "xai:progress", detail=False, month_stats=spend_stats,
+    )
+    xai_spend_detail = om._format_xai_spend_block(
+        "xai:progress", detail=True, month_stats=spend_stats,
+    )
+    assert "🚀 服务层级" not in xai_spend_list
+    assert "🚀 服务层级: default 3 次" in xai_spend_detail
+
+    ag_list = om._format_antigravity_credits_block("antigravity:progress", detail=False)
+    ag_detail = om._format_antigravity_credits_block("antigravity:progress", detail=True)
+    assert om._AG_QUOTA_BUCKET_INDENT == "\u00a0" * 4
+    assert "已用 <code>██████░░░░</code> <b>58.00%</b>（剩 " in ag_list
+    assert f"\n{om._AG_QUOTA_BUCKET_INDENT}· 5小时:" in ag_list
+    assert "\n　· 5小时:" not in ag_list
+    assert "剩余" not in ag_list
+    assert "· 重置" not in ag_list and "2099-01-01" not in ag_list
+    assert "已用 <b>58.00%</b> <code>██████░░░░</code> · 重置" in ag_detail
+    assert f"\n{om._AG_QUOTA_BUCKET_INDENT}· 5小时:" in ag_detail
+    assert "\n　· 5小时:" not in ag_detail
+    assert "剩余" not in ag_detail
+    assert "2099-01-01" in ag_detail
+
+    m["config"].update(lambda c: c.__setitem__("oauthUsageDisplayMode", "remaining"))
+    ag_remaining_list = om._format_antigravity_credits_block(
+        "antigravity:progress", detail=False,
+    )
+    ag_remaining_detail = om._format_antigravity_credits_block(
+        "antigravity:progress", detail=True,
+    )
+    assert "剩余 <code>████░░░░░░</code> <b>42.00%</b>（剩 " in ag_remaining_list
+    assert "已用" not in ag_remaining_list
+    assert "剩余 <b>42.00%</b> <code>████░░░░░░</code> · 重置" in ag_remaining_detail
+    assert "已用" not in ag_remaining_detail
+
+    m["config"].update(lambda c: (
+        c.__setitem__("oauthUsageDisplayMode", "used"),
+        c.__setitem__("quotaProgressBar", False),
+    ))
+    hidden = "\n".join([
+        om._format_cursor_usage_block("cursor:progress", detail=False),
+        om._format_xai_official_block("xai:progress", detail=True),
+        om._format_antigravity_credits_block("antigravity:progress", detail=True),
+    ])
+    assert "25.00%" in hidden and "70.00%" in hidden and "58.00%" in hidden
+    assert "█" not in hidden and "░" not in hidden
+
+
+def test_oauth_list_uses_compact_relative_quota_copy_text(m):
+    _setup(m)
+    email = "compact-copy@openai.test"
+    _add_openai_fake_account(m, email)
+    now = datetime.now(timezone.utc)
+    subscription_expiry = (now + timedelta(days=22, hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    quota_reset = (now + timedelta(hours=2, minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _configure(cfg):
+        cfg["oauthUsageDisplayMode"] = "remaining"
+        for account in cfg.get("oauthAccounts") or []:
+            if account.get("email") == email:
+                account["subscription_expires_at"] = subscription_expiry
+
+    m["config"].update(_configure)
+    account_key = _account_key_for(m, email)
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 25.0,
+        "five_hour_reset": quota_reset,
+        "raw_data": "{}",
+    })
+    stats = {
+        "total": 1, "success_count": 1, "error_count": 0,
+        "input": 100, "output": 20, "cache_creation": 10, "cache_read": 50,
+        "avg_tps": 12.5, "max_tps": 12.5, "min_tps": 12.5,
+        "cost_ticks": 1_000_000, "costed_success": 1,
+    }
+    om = m["oauth_menu"]
+    m["menu_cache"].WINDOW_STATS.store(
+        om._window_stats_cache_key(account_key, "5h"), stats,
+    )
+    account = m["oauth_manager"].get_account(account_key)
+    list_text = om._format_account_block(account, month_snapshot={"by_channel": {}})
+
+    assert "📅 套餐到期: <code>" in list_text
+    assert "📅 到期:" not in list_text
+    assert "📊 5h: 剩余 <code>████████░░</code> <b>75%</b>（剩 " in list_text
+    assert "· 重置" not in list_text
+    assert om._format_bjt(quota_reset) not in list_text
+    assert "\n" + ("\u00a0" * 7) + "↑160 ↓20" in list_text
+    assert "\n\t↑160 ↓20" not in list_text
+
+    detail_text = om._format_usage_block(account_key)
+    assert f"重置: {om._format_bjt(quota_reset)}" in detail_text
+    assert "⏱ 5h: 剩余 75% <code>████████░░</code>" in detail_text
 
 
 def test_settings_cch_and_quota_monitor_controls(m):
@@ -791,6 +1006,55 @@ def test_openai_reset_credit_count_display_in_list_and_detail(m):
     assert detail0 and "♻️ 官方重置次数: <code>0 次</code>" in detail0["text"]
     assert "♻️ 官方重置卡" not in detail0["text"]
     print("  [PASS] openai reset credits shown in list/detail; list hides 0")
+
+
+def test_openai_usage_refresh_saves_reset_card_details_in_quota_cache(m):
+    """手动/后台 usage 刷新应与启动、周期路径使用相同的卡片 enrichment。"""
+    _setup(m)
+    _add_openai_fake_account(m, "refresh-cards@x.com", plan_type="pro")
+    ak = _account_key_for(m, "refresh-cards@x.com")
+    om = m["oauth_manager"]
+    original_usage = om.fetch_usage
+    original_details = om.fetch_openai_rate_limit_reset_credits
+
+    async def fake_usage(_account_key):
+        return {
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-09-01T00:00:00Z"},
+            "seven_day": {"utilization": 20.0, "resets_at": "2026-09-07T00:00:00Z"},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "extra_usage": {"is_enabled": False},
+            "openai": {"rate_limit_reset_credits": {"available_count": 1}},
+        }
+
+    async def fake_details(_account_key):
+        return {
+            "available_count": 1,
+            "data": [{
+                "id": "menu-refresh-card",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "expires_at": "2026-09-30T00:00:00Z",
+            }],
+        }
+
+    om.fetch_usage = fake_usage
+    om.fetch_openai_rate_limit_reset_credits = fake_details
+    try:
+        result = m["oauth_menu"]._fetch_and_save_usage_result_sync(
+            ak, email="refresh-cards@x.com",
+        )
+    finally:
+        om.fetch_usage = original_usage
+        om.fetch_openai_rate_limit_reset_credits = original_details
+
+    assert result.get("error") is None
+    row = m["state_db"].quota_load(ak)
+    raw = json.loads(row["raw_data"])
+    details = raw["openai"]["rate_limit_reset_credit_details"]
+    assert details["available_count"] == 1
+    assert details["data"][0]["id"] == "menu-refresh-card"
+    print("  [PASS] UI usage refresh saves reset-card details in the shared quota cache")
 
 
 def test_quota_disabled_openai_missing_cache_list_does_not_auto_refresh(m):
@@ -1283,13 +1547,13 @@ def test_claude_fable_quota_renders_progress_bar(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📖 Fable 7d: 已用 <b>6%</b> <code>█░░░░░░░░░</code>" in list_text
+    assert "📖 Fable 7d: 已用 <code>█░░░░░░░░░</code> <b>6%</b>（剩 " in list_text
 
     rec.clear()
     short = m["ui"].register_code("fable@x.com")
     m["oauth_menu"].on_view(42, 100, "cb", short)
     detail_text = rec.last("editMessageText")["text"]
-    assert "📖 Fable 7d: 已用 6% █░░░░░░░░░" in detail_text
+    assert "📖 Fable 7d: 已用 6% <code>█░░░░░░░░░</code>" in detail_text
     assert "🤖 Sonnet 7d" not in detail_text
     assert "🧠 Opus 7d" not in detail_text
     print("  [PASS] Claude Fable / F5 quota renders with black/white bar")
@@ -1308,6 +1572,9 @@ def main():
         test_oauth_sort_reorders_accounts,
         test_view_detail_with_quota_cache,
         test_settings_usage_display_mode_toggle,
+        test_quota_progress_bar_toggle_applies_to_oauth_list_and_detail,
+        test_provider_specific_oauth_quota_percentages_share_progress_bar,
+        test_oauth_list_uses_compact_relative_quota_copy_text,
         test_settings_cch_and_quota_monitor_controls,
         test_refresh_token_updates_access_and_usage,
         test_refresh_usage_only,
@@ -1315,6 +1582,7 @@ def main():
         test_reset_quota_button_and_callback,
         test_quota_window_since_uses_reset_minus_window_with_fallback,
         test_openai_reset_credit_count_display_in_list_and_detail,
+        test_openai_usage_refresh_saves_reset_card_details_in_quota_cache,
         test_openai_reset_credit_cards_block_uses_post_consume_count_override,
         test_openai_official_reset_credit_ask_and_confirm,
         test_delete_flow,

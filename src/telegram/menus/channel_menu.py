@@ -380,9 +380,10 @@ def _window_line(item: dict, *, detail: bool, icon: str = "📊") -> str:
     used, total = item.get("used"), item.get("total")
     if used is not None and total is not None and item.get("id") == "mcp_month":
         core = f"已用 <b>{_usage_number(used)} / {_usage_number(total)}</b>"
-        if pct is not None: core += f"（{pct:g}%）"
+        if pct is not None:
+            core += f"（{pct:g}%）{ui.quota_progress_html(pct)}"
     elif pct is not None:
-        core = f"已用 <b>{pct:g}%</b>"
+        core = f"已用 <b>{pct:g}%</b>{ui.quota_progress_html(pct)}"
     elif used is not None and total is not None:
         core = f"已用 <b>{_usage_number(used)} / {_usage_number(total)}</b>"
     else:

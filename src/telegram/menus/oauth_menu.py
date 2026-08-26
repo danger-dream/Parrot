@@ -426,26 +426,22 @@ def _fetch_and_save_usage_result_sync(ak: str, *, email: str | None = None, on_s
         count = _openai_reset_credit_count_from_usage(usage)
         if count is None or count > 0:
             _stage("reset_start", usage)
-            details = _run_sync(oauth_manager.fetch_openai_rate_limit_reset_credits(ak))
-            if isinstance(details, Exception):
-                detail_error = details
-                old_details = _openai_reset_credit_details_from_row(state_db.quota_load(ak))
-                if old_details is not None:
-                    usage = oauth_manager.attach_openai_reset_credit_details_to_usage(
-                        usage, old_details, sync_available_count=False,
-                    )
-                    save_err = _save_usage_to_quota_cache(ak, usage, email=email)
-                    if save_err is not None:
-                        return {"error": save_err}
-                _stage("reset_error", detail_error)
-            elif isinstance(details, dict):
-                usage = oauth_manager.attach_openai_reset_credit_details_to_usage(usage, details)
-                save_err = _save_usage_to_quota_cache(ak, usage, email=email)
-                if save_err is not None:
-                    return {"error": save_err}
-                _stage("reset_done", details)
+        enriched = _run_sync(oauth_manager.enrich_openai_reset_credit_details(ak, usage))
+        if isinstance(enriched, Exception):
+            detail_error = enriched
+            usage = oauth_manager.preserve_openai_reset_credit_details(ak, usage)
+            details = _openai_reset_credit_details_from_usage(usage)
+            save_err = _save_usage_to_quota_cache(ak, usage, email=email)
+            if save_err is not None:
+                return {"error": save_err}
+            _stage("reset_error", detail_error)
         else:
-            _stage("reset_done", {"available_count": count, "data": []})
+            usage = enriched
+            details = _openai_reset_credit_details_from_usage(usage)
+            save_err = _save_usage_to_quota_cache(ak, usage, email=email)
+            if save_err is not None:
+                return {"error": save_err}
+            _stage("reset_done", details or {"available_count": count, "data": []})
 
     return {"usage": usage, "reset_credit_details": details, "reset_credit_error": detail_error}
 
@@ -885,13 +881,9 @@ def _this_month_start_ts() -> float:
     return menu_cache.month_start_ts()
 
 
-# 用量明细行缩进：让明细对齐上一行 5h/7d 的数字（emoji 占位用空格补齐）。
-# 列表页主行是 "  📊 5h"，详情页主行是 "⏱ 5h"，两处 emoji 前缀宽度不同，
-# 缩进常量分开调；TG 比例字体下 emoji 非整数字宽，最终以真机为准微调。
-# 明细行缩进：HTML parse_mode 会吃掉行首普通空格，必须用 NBSP(U+00A0) 才稳定缩进。
-# 列表页主行是 "  📊 5h"，明细行对齐到「5」需要 NBSP×9（真机校准，emoji 宽度非整数倍）。
+# Telegram HTML 会移除行首普通空格、Tab 和全角空格；子级行必须用 NBSP。
+# 5h/7d 列表与详情均恢复真机校准后的七格缩进。
 _USAGE_DETAIL_INDENT_LIST = "\u00a0" * 7
-# 详情页主行是 "⏱ 5h"（无前导空格、emoji 不同），单独校准。
 _USAGE_DETAIL_INDENT_BLOCK = "\u00a0" * 7
 
 _USAGE_DISPLAY_USED = "used"
@@ -933,34 +925,42 @@ def _format_usage_value_text(util, *, decimals: int = 0) -> str:
     return f"{label} {pct:.{decimals}f}%"
 
 
+def _format_usage_value_bar_first_html(util, *, decimals: int = 0) -> str:
+    """Compact list value: label → progress bar → percentage."""
+    pct = _usage_display_percent(util)
+    label = "剩余" if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else "已用"
+    return (
+        f"{label}{ui.quota_progress_html(pct)} "
+        f"<b>{pct:.{decimals}f}%</b>"
+    )
+
+
 _USAGE_BAR_WIDTH = 10
-_USAGE_BAR_FILLED = "█"
-_USAGE_BAR_EMPTY = "░"
 
 
 def _usage_progress_bar(util, *, width: int = _USAGE_BAR_WIDTH) -> str:
-    """Black/white quota bar matching Telegram's monochrome text style."""
-    pct = _usage_display_percent(util)
-    filled = int((pct * width + 50) // 100)
-    filled = max(0, min(width, filled))
-    return _USAGE_BAR_FILLED * filled + _USAGE_BAR_EMPTY * (width - filled)
+    """Black/white quota bar using the current used/remaining display mode."""
+    return ui.quota_progress_bar(_usage_display_percent(util), width=width)
 
 
 def _format_usage_line_text(label: str, util, reset) -> Optional[str]:
     if util is None:
         return None
     return (
-        f"{label}: {_format_usage_value_text(util)} "
-        f"{_usage_progress_bar(util)} (重置: {_format_reset_text(reset)})"
+        f"{label}: {_format_usage_value_text(util)}"
+        f"{ui.quota_progress_html(_usage_display_percent(util), width=_USAGE_BAR_WIDTH)} "
+        f"(重置: {_format_reset_text(reset)})"
     )
 
 
 def _format_usage_line_html(label: str, util, reset) -> Optional[str]:
+    """Compact OAuth list quota line; details keep the full reset timestamp."""
     if util is None:
         return None
+    reset_status = _format_remaining(reset) if reset else "上游未返回"
     return (
-        f"{label}: {_format_usage_value_html(util)} "
-        f"<code>{_usage_progress_bar(util)}</code> · 重置 <code>{_fmt_time_full(reset)}</code>"
+        f"{label}: {_format_usage_value_bar_first_html(util)}"
+        f"（{ui.escape_html(reset_status)}）"
     )
 
 
@@ -1023,17 +1023,28 @@ def _antigravity_raw(account_key: str) -> dict:
 
 
 _WINDOW_LABELS = {"5h": "5小时", "weekly": "每周", "daily": "每日", "monthly": "每月"}
+# Telegram-safe indentation for quota buckets under each Antigravity model group.
+_AG_QUOTA_BUCKET_INDENT = "\u00a0" * 4
 
 
 def _ag_window_label(window: str) -> str:
     return _WINDOW_LABELS.get(str(window or "").strip(), str(window or "").strip() or "窗口")
 
 
-def _ag_remaining_html(frac: float | None) -> str:
+def _ag_quota_value_html(frac: float | None, *, compact: bool = False) -> str:
+    """Render Antigravity's remaining fraction in the selected usage mode."""
     if frac is None:
         return "<i>未知</i>"
-    pct = max(0.0, min(100.0, frac * 100.0))
-    return f"剩余 <b>{pct:.2f}%</b>"
+    remaining_pct = max(0.0, min(100.0, frac * 100.0))
+    if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+        label = "剩余"
+        pct = remaining_pct
+    else:
+        label = "已用"
+        pct = 100.0 - remaining_pct
+    if compact:
+        return f"{label}{ui.quota_progress_html(pct)} <b>{pct:.2f}%</b>"
+    return f"{label} <b>{pct:.2f}%</b>{ui.quota_progress_html(pct)}"
 
 
 _AG_GROUP_SHORT = {
@@ -1092,11 +1103,16 @@ def _format_antigravity_quota_groups(account_key: str, *, detail: bool) -> list[
         lines.append(f"📊 <b>{name}</b>")
         for bucket in buckets:
             window = _ag_window_label(bucket.get("window"))
-            remaining = _ag_remaining_html(bucket.get("remaining_fraction"))
+            value = _ag_quota_value_html(
+                bucket.get("remaining_fraction"), compact=not detail,
+            )
             reset = bucket.get("reset_time")
-            line = f"　· {window}: {remaining}"
+            line = f"{_AG_QUOTA_BUCKET_INDENT}· {window}: {value}"
             if reset:
-                line += f" · 重置 <code>{_fmt_time_full(reset)}</code>"
+                if detail:
+                    line += f" · 重置 <code>{_fmt_time_full(reset)}</code>"
+                else:
+                    line += f"（{ui.escape_html(_format_remaining(reset))}）"
             lines.append(line)
     if error:
         prefix = "旧数据已保留；" if block.get("quota_groups_stale") else ""
@@ -1195,16 +1211,16 @@ def _format_xai_provider_line(account_key: str, *, detail: bool = False) -> str:
         return ""
     lines: list[str] = []
     tier = _xai_tier_label(xai)
-    access = _xai_access_parts(xai)
     if tier:
         if detail:
             lines.append(f"🏷 套餐: <code>{ui.escape_html(tier)}</code>")
         else:
-            code_part = " · ✅ Grok Code 可用" if "Grok Code 可用" in access else ""
-            lines.append(f"🏷 套餐: {ui.escape_html(tier)}{code_part}")
-    if detail and access:
-        icon = "⚠" if any(str(x).startswith("⚠") for x in access) else "✅"
-        lines.append(f"{icon} 访问: <code>{ui.escape_html(' · '.join(access))}</code>")
+            lines.append(f"🏷 套餐: {ui.escape_html(tier)}")
+    if detail:
+        access = _xai_access_parts(xai)
+        if access:
+            icon = "⚠" if any(str(x).startswith("⚠") for x in access) else "✅"
+            lines.append(f"{icon} 访问: <code>{ui.escape_html(' · '.join(access))}</code>")
     return "\n".join(lines) + ("\n" if lines and detail else "")
 
 
@@ -1251,18 +1267,26 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
 
     if not detail:
         if pct is not None:
-            reset = _format_bjt(period_end) if period_end else "?"
+            reset_status = _format_remaining(period_end) if period_end else "上游未返回"
             return (
-                f"📊 {quota_label}: 剩余 {_pct_text(remaining_pct)} · "
-                f"已用 {_pct_text(pct)} · 重置 {ui.escape_html(reset)}"
+                f"📊 {quota_label}: {_format_usage_value_bar_first_html(pct, decimals=2)}"
+                f"（{ui.escape_html(reset_status)}）"
             )
         return f"📊 {quota_label}: <i>上游未返回额度百分比</i>"
+
+    remaining_progress = ""
+    used_progress = ""
+    if pct is not None:
+        if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+            remaining_progress = ui.quota_progress_html(remaining_pct)
+        else:
+            used_progress = ui.quota_progress_html(pct)
 
     lines = ["<b>📊 官方账单</b>"]
     if pct is not None:
         lines.append(
-            f"{quota_label}: 剩余 <code>{_pct_text(remaining_pct)}</code>"
-            f" · 已用 <code>{_pct_text(pct)}</code>"
+            f"{quota_label}: 剩余 <code>{_pct_text(remaining_pct)}</code>{remaining_progress}"
+            f" · 已用 <code>{_pct_text(pct)}</code>{used_progress}"
         )
     else:
         lines.append(f"{quota_label}: <i>上游未返回额度百分比</i>")
@@ -1337,7 +1361,7 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False,
     lines.append(money_line)
 
     tier_counts = month.get("service_tier_counts") or {}
-    if isinstance(tier_counts, dict) and tier_counts:
+    if detail and isinstance(tier_counts, dict) and tier_counts:
         parts = []
         for key in ("priority", "default"):
             n = int(tier_counts.get(key) or 0)
@@ -1390,20 +1414,47 @@ def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str
 
     lines: list[str] = []
     if limit is not None:
-        if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
+        remaining_mode = _usage_display_mode() == _USAGE_DISPLAY_REMAINING
+        selected_amount = remaining if remaining_mode else used
+        if detail:
+            amount_label = "剩余" if remaining_mode else "已用"
+            line = f"💳 包含额度: {amount_label} <b>{money(selected_amount)}</b> / {money(limit)}"
+            if total_util is not None:
+                line += (
+                    f" ({_usage_display_percent(total_util):.2f}%)"
+                    f"{ui.quota_progress_html(_usage_display_percent(total_util))}"
+                )
+            lines.append(line)
+        elif total_util is not None:
             lines.append(
-                f"💳 包含额度: 剩余 <b>{money(remaining)}</b> / {money(limit)}"
-                + (f" ({_usage_display_percent(total_util):.2f}%)" if total_util is not None else "")
+                f"💳 包含额度: {_format_usage_value_bar_first_html(total_util, decimals=2)}"
+                f"（{money(selected_amount)} / {money(limit)}）"
+            )
+        else:
+            amount_label = "剩余" if remaining_mode else "已用"
+            lines.append(
+                f"💳 包含额度: {amount_label} <b>{money(selected_amount)} / {money(limit)}</b>"
+            )
+    if auto_util is not None:
+        if detail:
+            lines.append(
+                f"🧭 Cursor Models / Auto: {_format_usage_value_html(auto_util, decimals=2)}"
+                f"{ui.quota_progress_html(_usage_display_percent(auto_util))}"
             )
         else:
             lines.append(
-                f"💳 包含额度: 已用 <b>{money(used)}</b> / {money(limit)}"
-                + (f" ({_usage_display_percent(total_util):.2f}%)" if total_util is not None else "")
+                f"🧭 Cursor: {_format_usage_value_bar_first_html(auto_util, decimals=2)}"
             )
-    if auto_util is not None:
-        lines.append(f"🧭 Cursor Models / Auto: {_format_usage_value_html(auto_util, decimals=2)}")
     if api_util is not None:
-        lines.append(f"🧩 Other Models / API: {_format_usage_value_html(api_util, decimals=2)}")
+        if detail:
+            lines.append(
+                f"🧩 Other Models / API: {_format_usage_value_html(api_util, decimals=2)}"
+                f"{ui.quota_progress_html(_usage_display_percent(api_util))}"
+            )
+        else:
+            lines.append(
+                f"🧩 Other: {_format_usage_value_bar_first_html(api_util, decimals=2)}"
+            )
     if reset:
         lines.append(f"🔄 周期重置: <code>{_fmt_time_full(reset)}</code>")
     status = cursor.get("subscription_status")
@@ -1522,7 +1573,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             lines.append("🏷 " + " · ".join(plan_parts))
         sub_exp = acc.get("subscription_expires_at") or ""
         if sub_exp:
-            lines.append(f"📅 到期: <code>{_fmt_time_full(sub_exp)}</code>")
+            lines.append(f"📅 套餐到期: <code>{_fmt_time_full(sub_exp)}</code>")
     elif prov == "claude":
         cl_label = oauth_manager.claude_plan_label(acc)
         if cl_label:
@@ -1640,7 +1691,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
             )
         if prov == "cursor":
-            lines.append(f"💵 {_format_cursor_local_cost(ts)}")
+            # 列表只展示真实可用的本地金额；“未计价”属于诊断状态，留在详情页。
+            if int(ts.get("actual_costed_success") or 0) > 0:
+                lines.append(f"💵 {_format_cursor_local_cost(ts)}")
         else:
             lines.append(f"💵 {ui.fmt_cost(ts)}")
 
@@ -1713,9 +1766,17 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
     if ex_limit and ex_limit > 0:
         if _usage_display_mode() == _USAGE_DISPLAY_REMAINING:
             remaining = max(0.0, float(ex_limit) - float(ex_used or 0))
-            out.append(f"💰 额外: 剩余 ${remaining:.2f} / ${ex_limit:.2f} ({_usage_display_percent(ex_util):.1f}%)")
+            out.append(
+                f"💰 额外: 剩余 ${remaining:.2f} / ${ex_limit:.2f} "
+                f"({_usage_display_percent(ex_util):.1f}%)"
+                f"{ui.quota_progress_html(_usage_display_percent(ex_util))}"
+            )
         else:
-            out.append(f"💰 额外: 已用 ${ex_used or 0:.2f} / ${ex_limit:.2f} ({_usage_display_percent(ex_util):.1f}%)")
+            out.append(
+                f"💰 额外: 已用 ${ex_used or 0:.2f} / ${ex_limit:.2f} "
+                f"({_usage_display_percent(ex_util):.1f}%)"
+                f"{ui.quota_progress_html(_usage_display_percent(ex_util))}"
+            )
 
     fetched = row.get("fetched_at")
     if fetched:
@@ -1819,6 +1880,8 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
     cch_enabled = _cch_enabled()
     cch_action = "关闭" if cch_enabled else "开启"
+    progress_enabled = ui.quota_progress_enabled()
+    progress_status = "开启" if progress_enabled else "关闭"
 
     text = "\n".join([
         "⚙️ <b>OAuth 账户设置</b>",
@@ -1840,6 +1903,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         "",
         "📊 <b>用量显示模式</b>",
         f"当前模式: {mode_label}",
+        f"黑白进度条: {progress_status}",
         "",
         "📈 <b>OAuth 配额监控</b>",
         f"状态: {quota_status}",
@@ -1851,8 +1915,9 @@ def _settings_text_and_kb() -> tuple[str, dict]:
          ui.btn("📈 配额监控", "oa:quota")],
         [ui.provider_button("GPT 图片", "img:show", "openai"),
          ui.provider_button("Grok 图片", "xim:show", "xai")],
-        [ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle"),
-         ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle")],
+        [ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
+        [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
+         ui.btn("☑ 进度条" if progress_enabled else "☐ 进度条", "oa:progress_bar:toggle")],
         [ui.btn("🏠 返回主菜单", "menu:main"),
          ui.btn("◀ 返回OAuth账户", "menu:oauth")],
     ]
@@ -1885,6 +1950,14 @@ def on_toggle_cch_mode(chat_id: int, message_id: int, cb_id: str) -> None:
     new_mode = "disabled" if _cch_enabled() else "dynamic"
     config.update(lambda c: c.__setitem__("cchMode", new_mode))
     ui.answer_cb(cb_id, "CCH 已开启" if new_mode == "dynamic" else "CCH 已关闭")
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_toggle_quota_progress_bar(chat_id: int, message_id: int, cb_id: str) -> None:
+    new_value = not ui.quota_progress_enabled()
+    config.update(lambda c: c.__setitem__("quotaProgressBar", new_value))
+    ui.answer_cb(cb_id, "黑白进度条已开启" if new_value else "黑白进度条已关闭")
     text, kb = _settings_text_and_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -5988,6 +6061,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data == "oa:cch_toggle":
         on_toggle_cch_mode(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:progress_bar:toggle":
+        on_toggle_quota_progress_bar(chat_id, message_id, cb_id)
         return True
     if data == "oa:quota":
         on_quota_menu(chat_id, message_id, cb_id)

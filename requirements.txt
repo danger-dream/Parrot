@@ -16,6 +16,9 @@ tiktoken>=0.12.0
 # (AsyncNetworkStream/AsyncNetworkBackend/AsyncConnectionPool). Currently pulled in via httpx,
 # but we import its API directly, so pin it explicitly.
 httpcore>=1.0,<2
+# socksio: imported directly in src/proxy/connector.py for SOCKS5 handshakes.
+# httpx[socks] currently pulls it in, but Parrot uses its API directly.
+socksio>=1.0,<2
 # starlette: imported directly in src/openai/responses_ws.py (WebSocketDisconnect/WebSocketState).
 # Pulled in via fastapi, but we use its API directly, so declare it explicitly.
 starlette>=0.46

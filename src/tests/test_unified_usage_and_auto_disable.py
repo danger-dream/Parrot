@@ -216,6 +216,128 @@ def test_quota_monitor_resumes_openai_despite_old_passive_timestamp(m):
     print("  [PASS] quota_monitor_once: old passive timestamp does not block OpenAI resume")
 
 
+def _openai_usage_with_reset_count(count: int) -> dict:
+    return {
+        "five_hour": {"utilization": 10.0, "resets_at": "2026-09-01T00:00:00Z"},
+        "seven_day": {"utilization": 20.0, "resets_at": "2026-09-07T00:00:00Z"},
+        "seven_day_sonnet": {},
+        "seven_day_opus": {},
+        "extra_usage": {"is_enabled": False},
+        "openai": {"rate_limit_reset_credits": {"available_count": count}},
+    }
+
+
+def test_quota_monitor_refreshes_and_preserves_openai_reset_card_details(m):
+    """周期 usage 刷新应同步卡片；明细端点失败时不能擦掉旧卡片。"""
+    _setup(m)
+    _add_openai(m, "cards-monitor@o.io")
+    om = m["oauth_manager"]
+    ak = "openai:cards-monitor@o.io:acct-123"
+    original_usage = om.fetch_usage
+    original_details = om.fetch_openai_rate_limit_reset_credits
+
+    async def fake_usage(_account_key):
+        return _openai_usage_with_reset_count(1)
+
+    async def fresh_details(_account_key):
+        return {
+            "available_count": 1,
+            "data": [{
+                "id": "card-monitor-1",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "expires_at": "2026-09-30T00:00:00Z",
+            }],
+        }
+
+    om.fetch_usage = fake_usage
+    om.fetch_openai_rate_limit_reset_credits = fresh_details
+    try:
+        asyncio.run(om.quota_monitor_once())
+        first = json.loads(m["state_db"].quota_load(ak)["raw_data"])
+        first_details = first["openai"]["rate_limit_reset_credit_details"]
+        assert first_details["data"][0]["id"] == "card-monitor-1"
+
+        async def failed_details(_account_key):
+            raise RuntimeError("synthetic reset-card outage")
+
+        om.fetch_openai_rate_limit_reset_credits = failed_details
+        asyncio.run(om.quota_monitor_once())
+        second = json.loads(m["state_db"].quota_load(ak)["raw_data"])
+        assert second["openai"]["rate_limit_reset_credits"]["available_count"] == 1
+        assert second["openai"]["rate_limit_reset_credit_details"] == first_details
+    finally:
+        om.fetch_usage = original_usage
+        om.fetch_openai_rate_limit_reset_credits = original_details
+    print("  [PASS] quota monitor refreshes cards and preserves them on detail failure")
+
+
+def test_openai_zero_reset_count_skips_card_endpoint(m):
+    """明确为 0 次时保存空详情，不再调用没有必要的卡片端点。"""
+    _setup(m)
+    _add_openai(m, "zero-cards@o.io")
+    om = m["oauth_manager"]
+    ak = "openai:zero-cards@o.io:acct-123"
+    original_usage = om.fetch_usage
+    original_details = om.fetch_openai_rate_limit_reset_credits
+    detail_calls = []
+
+    async def fake_usage(_account_key):
+        return _openai_usage_with_reset_count(0)
+
+    async def should_not_fetch(_account_key):
+        detail_calls.append(_account_key)
+        raise AssertionError("zero reset count must skip detail endpoint")
+
+    om.fetch_usage = fake_usage
+    om.fetch_openai_rate_limit_reset_credits = should_not_fetch
+    try:
+        usage = asyncio.run(om.fetch_usage_snapshot(ak))
+    finally:
+        om.fetch_usage = original_usage
+        om.fetch_openai_rate_limit_reset_credits = original_details
+    assert detail_calls == []
+    details = usage["openai"]["rate_limit_reset_credit_details"]
+    assert details["available_count"] == 0 and details["data"] == []
+    print("  [PASS] zero reset count stores empty details without a second request")
+
+
+def test_startup_preloads_openai_reset_cards_when_monitor_disabled(m):
+    """周期监控关闭时，启动 one-shot 仍应非阻塞预热 OpenAI 卡片缓存。"""
+    _setup(m)
+    _add_openai(m, "cards-startup@o.io")
+    om = m["oauth_manager"]
+    ak = "openai:cards-startup@o.io:acct-123"
+    old_enabled = bool((m["config"].get().get("quotaMonitor") or {}).get("enabled", True))
+    m["config"].update(
+        lambda c: c.setdefault("quotaMonitor", {}).__setitem__("enabled", False)
+    )
+    original_snapshot = om.fetch_usage_snapshot
+    calls = []
+
+    async def fake_snapshot(account_key, **_kwargs):
+        calls.append(account_key)
+        return om.attach_openai_reset_credit_details_to_usage(
+            _openai_usage_with_reset_count(1),
+            {"available_count": 1, "data": [{"id": "startup-card"}]},
+            sync_available_count=False,
+        )
+
+    om.fetch_usage_snapshot = fake_snapshot
+    try:
+        result = asyncio.run(om.preload_openai_reset_credit_details_once())
+    finally:
+        om.fetch_usage_snapshot = original_snapshot
+        m["config"].update(
+            lambda c: c.setdefault("quotaMonitor", {}).__setitem__("enabled", old_enabled)
+        )
+    assert result[ak] == "refreshed"
+    assert calls == [ak]
+    raw = json.loads(m["state_db"].quota_load(ak)["raw_data"])
+    assert raw["openai"]["rate_limit_reset_credit_details"]["data"][0]["id"] == "startup-card"
+    print("  [PASS] startup preload runs even when periodic quota monitor is disabled")
+
+
 # ==============================================================
 # C. 响应头超限自动禁用 - Anthropic
 # ==============================================================
@@ -994,6 +1116,9 @@ def main():
         # B. quota_monitor_once 对齐
         test_quota_monitor_processes_openai_accounts,
         test_quota_monitor_resumes_openai_despite_old_passive_timestamp,
+        test_quota_monitor_refreshes_and_preserves_openai_reset_card_details,
+        test_openai_zero_reset_count_skips_card_endpoint,
+        test_startup_preloads_openai_reset_cards_when_monitor_disabled,
         # C. Anthropic 自动禁用
         test_anthropic_auto_disable_surpassed_threshold,
         test_anthropic_auto_disable_util_ge_one,

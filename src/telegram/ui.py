@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import math
 import re
 import threading
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -535,6 +536,40 @@ def fmt_tokens(n) -> str:
 
 def fmt_rate(num, denom) -> str:
     return cache_display.fmt_rate(num, denom)
+
+
+_QUOTA_PROGRESS_WIDTH = 10
+_QUOTA_PROGRESS_FILLED = "█"
+_QUOTA_PROGRESS_EMPTY = "░"
+
+
+def quota_progress_enabled() -> bool:
+    """Whether quota percentages include the shared monochrome progress bar."""
+    from .. import config
+
+    return bool(config.get().get("quotaProgressBar", True))
+
+
+def quota_progress_bar(percent, *, width: int = _QUOTA_PROGRESS_WIDTH) -> str:
+    """Render a clamped monochrome bar for an already display-oriented percent."""
+    try:
+        pct = float(percent)
+    except (TypeError, ValueError, OverflowError):
+        pct = 0.0
+    if not math.isfinite(pct):
+        pct = 0.0
+    pct = max(0.0, min(100.0, pct))
+    width = max(1, int(width))
+    filled = int((pct * width + 50) // 100)
+    filled = max(0, min(width, filled))
+    return _QUOTA_PROGRESS_FILLED * filled + _QUOTA_PROGRESS_EMPTY * (width - filled)
+
+
+def quota_progress_html(percent, *, width: int = _QUOTA_PROGRESS_WIDTH) -> str:
+    """Return one HTML progress-bar suffix, or an empty string when disabled."""
+    if not quota_progress_enabled():
+        return ""
+    return f" <code>{quota_progress_bar(percent, width=width)}</code>"
 
 
 def prompt_total(input_tokens=0, cache_creation=0, cache_read=0) -> int:
