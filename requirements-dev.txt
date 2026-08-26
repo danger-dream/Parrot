@@ -6,3 +6,5 @@
 # pytest: used only under src/tests/ (no production code imports it).
 pytest>=8.0
 pytest-asyncio>=1.0
+# anyio: imported directly by src/tests/live_openai_probe.py for its blocking ASGI portal.
+anyio>=4.0,<5
