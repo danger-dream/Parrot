@@ -70,8 +70,6 @@ CREATE TABLE IF NOT EXISTS oauth_quota_cache (
   sonnet_reset     TEXT,
   opus_util        REAL,
   opus_reset       TEXT,
-  fable_util       REAL,
-  fable_reset      TEXT,
   extra_used       REAL,
   extra_limit      REAL,
   extra_util       REAL,
@@ -114,6 +112,8 @@ def rename_runtime_channel_state(old_channel_key, new_channel_key, ...)
 ```
 
 状态 API 保持历史业务返回值，但不暴露 SQLite。运行期渠道改名与配额响应由 `src/channel_state.py` 的生命周期锁协调；同 kind JSON 安装另由 StateStore 锁串行。rename/delete 的 alias 与 tombstone 检查在状态候选生成前完成，迟到响应只会写当前 generation，删除后的迟到写被丢弃。
+
+当前 `runtime-cache.json` 的 OAuth quota row 可在历史字段之外继续扩展；例如 Claude Fable scoped 配额使用 `fable_util` / `fable_reset`。这些是当前后端中立状态字段，不属于上方历史 SQLite `state.db` 的物理列；旧库升级时可从 `raw_data` 只读迁移并在后续刷新中写入 JSON 状态。
 
 ## 3.2 logs/YYYY-MM.db Schema
 

@@ -38,12 +38,13 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, cooldown, oauth_manager, state_db, failover
+    from src import config, cooldown, oauth_manager, scheduler, state_db, failover
     from src.channel import oauth_channel, openai_oauth_channel, registry
     return {
         "config": config,
         "cooldown": cooldown,
         "oauth_manager": oauth_manager,
+        "scheduler": scheduler,
         "state_db": state_db,
         "failover": failover,
         "OAuthChannel": oauth_channel.OAuthChannel,
@@ -87,10 +88,11 @@ def _add_openai(m, email="o@openai.test", plan_type="plus"):
     })
 
 
-def _add_claude(m, email="c@claude.test"):
+def _add_claude(m, email="c@claude.test", *, models=None):
     m["oauth_manager"].add_account({
         "email": email, "provider": "claude",
         "access_token": "c-at", "refresh_token": "c-rt",
+        "models": list(models or []),
     })
 
 
@@ -269,6 +271,117 @@ def test_anthropic_no_auto_disable_when_below_limit(m):
     assert acc_after.get("disabled_reason") is None
     assert acc_after["enabled"] is True
     print("  [PASS] anthropic: below limit → no auto-disable")
+
+
+def test_claude_fable_scoped_quota_only_cools_fable_model(m):
+    _setup(m)
+    email = "fable-pool@c.io"
+    account_key = f"claude:{email}"
+    channel_key = f"oauth:{account_key}"
+    _add_claude(
+        m,
+        email,
+        models=["claude-fable-5", "claude-sonnet-4-6"],
+    )
+    m["registry"].rebuild_from_config()
+    reset = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400))
+
+    def usage(percent, *, active=True):
+        return {
+            "five_hour": {"utilization": 20, "resets_at": None},
+            "seven_day": {"utilization": 50, "resets_at": None},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "limits": [{
+                "kind": "weekly_scoped",
+                "is_active": active,
+                "percent": percent,
+                "resets_at": reset,
+                "scope": {"model": {"display_name": "Fable"}},
+            }],
+        }
+
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        account_key, usage(100), threshold=95, fresh=True,
+    )
+    account = m["oauth_manager"].get_account(account_key)
+    assert result["action"] == "claude_fable_model_cooldown", result
+    assert result["hit_windows"] == ["fable"] and result["cooled_models"] == 1
+    assert account["enabled"] is True and account.get("disabled_reason") is None
+    assert m["cooldown"].is_blocked(channel_key, "claude-fable-5")
+    assert not m["cooldown"].is_blocked(channel_key, "claude-sonnet-4-6")
+
+    fable_schedule = m["scheduler"].schedule(
+        {"model": "claude-fable-5", "messages": [{"role": "user", "content": "hi"}]},
+        "test-key", "127.0.0.1",
+    )
+    sonnet_schedule = m["scheduler"].schedule(
+        {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
+        "test-key", "127.0.0.1",
+    )
+    assert channel_key not in {
+        ch.key for ch, _ in fable_schedule.candidates + fable_schedule.saturated
+    }
+    assert channel_key in {
+        ch.key for ch, _ in sonnet_schedule.candidates + sonnet_schedule.saturated
+    }
+
+    recovered = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        account_key, usage(10), threshold=95, fresh=True,
+    )
+    assert recovered["action"] == "claude_fable_model_recovered", recovered
+    assert not m["cooldown"].is_blocked(channel_key, "claude-fable-5")
+
+    inactive = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        account_key, usage(100, active=False), threshold=95, fresh=True,
+    )
+    assert inactive["action"] == "kept_enabled", inactive
+    assert not m["cooldown"].is_blocked(channel_key, "claude-fable-5")
+    assert m["oauth_manager"].get_account(account_key)["enabled"] is True
+    print("  [PASS] Claude Fable scoped quota cools only Fable and respects active scope")
+
+
+def test_claude_account_quota_reset_excludes_fable_subcap(m):
+    _setup(m)
+    email = "fable-and-account@c.io"
+    account_key = f"claude:{email}"
+    _add_claude(
+        m,
+        email,
+        models=["claude-fable-5", "claude-sonnet-4-6"],
+    )
+    account_reset = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600),
+    )
+    fable_reset = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400),
+    )
+    result = m["oauth_manager"].evaluate_and_toggle_by_usage(
+        account_key,
+        {
+            "five_hour": {"utilization": 96, "resets_at": account_reset},
+            "seven_day": {"utilization": 50, "resets_at": None},
+            "seven_day_sonnet": {},
+            "seven_day_opus": {},
+            "limits": [{
+                "kind": "weekly_scoped",
+                "is_active": True,
+                "percent": 100,
+                "resets_at": fable_reset,
+                "scope": {"model": {"display_name": "Fable"}},
+            }],
+        },
+        threshold=95,
+        fresh=True,
+    )
+    account = m["oauth_manager"].get_account(account_key)
+    assert result["action"] == "disabled", result
+    assert result["hit_windows"] == ["5h"], result
+    assert result["disabled_until"] == account_reset, result
+    assert account["enabled"] is False and account["disabled_reason"] == "quota"
+    assert account["disabled_until"] == account_reset
+    assert m["cooldown"].is_blocked(f"oauth:{account_key}", "claude-fable-5")
+    print("  [PASS] Claude account reset excludes later Fable model sub-cap reset")
 
 
 def test_anthropic_auto_disable_idempotent_for_already_disabled(m):
@@ -885,6 +998,8 @@ def main():
         test_anthropic_auto_disable_surpassed_threshold,
         test_anthropic_auto_disable_util_ge_one,
         test_anthropic_no_auto_disable_when_below_limit,
+        test_claude_fable_scoped_quota_only_cools_fable_model,
+        test_claude_account_quota_reset_excludes_fable_subcap,
         test_anthropic_auto_disable_idempotent_for_already_disabled,
         test_anthropic_auth_error_not_touched,
         # C2. OpenAI 自动禁用

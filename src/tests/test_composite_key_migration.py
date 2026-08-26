@@ -687,6 +687,49 @@ def test_usage_from_quota_row_reads_fable_from_raw_limits(m):
     assert usage["seven_day_fable"]["resets_at"] == reset
     print("  [PASS] usage_from_quota_row: Fable fallback from raw limits")
 
+
+def test_fable_usage_selects_active_scoped_entry(m):
+    usage = {
+        "seven_day_fable": {
+            "utilization": 100,
+            "resets_at": "2030-09-01T00:00:00Z",
+        },
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "is_active": False,
+                "percent": 99,
+                "resets_at": "2030-08-31T00:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}},
+            },
+            {
+                "kind": "weekly_scoped",
+                "percent": 88,
+                "resets_at": "2030-09-02T00:00:00Z",
+                "scope": {"model": {"display_name": "Claude F5 legacy"}},
+            },
+            {
+                "kind": "weekly_scoped",
+                "is_active": True,
+                "percent": 12,
+                "resets_at": "2030-08-30T10:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}},
+            },
+        ],
+    }
+    block = m["oauth_manager"].fable_usage_block(usage)
+    assert block == {
+        "utilization": 12.0,
+        "resets_at": "2030-08-30T10:00:00Z",
+    }
+    assert m["oauth_manager"].flatten_usage(usage)["fable_util"] == 12.0
+
+    inactive_only = dict(usage)
+    inactive_only["limits"] = [usage["limits"][0]]
+    assert m["oauth_manager"].fable_usage_block(inactive_only) == {}
+    assert m["oauth_manager"].flatten_usage(inactive_only)["fable_util"] is None
+    print("  [PASS] Fable usage: inactive/history entries cannot shadow active scope")
+
 # ==============================================================
 # main
 # ==============================================================
@@ -736,6 +779,7 @@ def main():
         test_usage_from_quota_row_preserves_openai_thirty_day,
         test_flatten_usage_reads_fable_from_weekly_scoped_limit,
         test_usage_from_quota_row_reads_fable_from_raw_limits,
+        test_fable_usage_selects_active_scoped_entry,
     ]
     passed = 0
     failed = 0

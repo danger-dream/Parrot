@@ -1303,48 +1303,77 @@ def _normalize_quota_model_label(value: str) -> str:
 
 
 def _is_fable_model_label(value: str) -> bool:
-    """Match Claude Fable / F5 labels from usage.limits scoped windows."""
+    """Match Claude Fable / F5 labels and configured model IDs."""
     label = _normalize_quota_model_label(value)
     if not label:
         return False
     if "fable" in label:
         return True
     compact = label.replace(" ", "")
-    return compact in {"f5", "claudef5"} or compact.endswith("f5")
+    return compact == "f5" or compact.startswith("claudef5")
 
 
 def fable_usage_block(usage: dict | None) -> dict:
-    """Extract the Claude Fable / F5 weekly quota window.
+    """Extract the active Claude Fable / F5 weekly quota window.
 
     Newer /api/oauth/usage payloads keep Sonnet/Opus null and put Fable on
     ``limits[]`` as ``weekly_scoped`` (``scope.model.display_name = Fable``).
-    Older or mock payloads may still expose ``seven_day_fable``.
+    Explicitly inactive entries are historical and must not drive live display
+    or routing.  If more than one viable entry is returned, prefer an explicitly
+    active entry, then the latest reset, then the highest utilization.  Older or
+    mock payloads may still expose ``seven_day_fable`` as a fallback.
     """
     data = usage if isinstance(usage, dict) else {}
-    direct = data.get("seven_day_fable")
-    if isinstance(direct, dict) and direct.get("utilization") is not None:
-        return direct
-
+    candidates: list[tuple[int, float, float, int, dict]] = []
+    saw_scoped_fable = False
     limits = data.get("limits")
-    if not isinstance(limits, list):
+    if isinstance(limits, list):
+        for index, item in enumerate(limits):
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "")
+            if kind not in {"weekly_scoped", "seven_day_scoped"}:
+                continue
+            scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+            model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+            name = str(model.get("display_name") or model.get("id") or "")
+            if not _is_fable_model_label(name):
+                continue
+            saw_scoped_fable = True
+            if item.get("is_active") is False:
+                continue
+            raw_util = item.get("utilization")
+            if raw_util is None:
+                raw_util = item.get("percent")
+            try:
+                utilization = float(raw_util)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(utilization):
+                continue
+            utilization = max(0.0, min(100.0, utilization))
+            reset = item.get("resets_at")
+            reset_dt = _parse_iso(reset)
+            reset_rank = reset_dt.timestamp() if reset_dt is not None else -1.0
+            candidates.append((
+                1 if item.get("is_active") is True else 0,
+                reset_rank,
+                utilization,
+                -index,
+                {"utilization": utilization, "resets_at": reset},
+            ))
+    if candidates:
+        return max(candidates, key=lambda candidate: candidate[:4])[4]
+    if saw_scoped_fable:
         return {}
-    for item in limits:
-        if not isinstance(item, dict):
-            continue
-        kind = str(item.get("kind") or "")
-        if kind not in {"weekly_scoped", "seven_day_scoped"}:
-            continue
-        scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
-        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
-        name = str(model.get("display_name") or model.get("id") or "")
-        if not _is_fable_model_label(name):
-            continue
-        util = item.get("utilization")
-        if util is None:
-            util = item.get("percent")
-        if util is None:
-            continue
-        return {"utilization": util, "resets_at": item.get("resets_at")}
+
+    direct = data.get("seven_day_fable")
+    if (
+        isinstance(direct, dict)
+        and direct.get("is_active") is not False
+        and direct.get("utilization") is not None
+    ):
+        return direct
     return {}
 
 
@@ -1468,7 +1497,6 @@ def latest_reset_iso(usage: dict) -> str | None:
         ((usage.get("openai") or {}).get("thirty_day") or {}),
         usage.get("seven_day_sonnet") or {},
         usage.get("seven_day_opus") or {},
-        fable_usage_block(usage),
     ):
         dt = _parse_iso(obj.get("resets_at"))
         if dt is not None:
@@ -1495,7 +1523,6 @@ def reset_iso_for_hit_windows(usage: dict, threshold: float) -> str | None:
         ((usage.get("openai") or {}).get("thirty_day") or {}),
         usage.get("seven_day_sonnet") or {},
         usage.get("seven_day_opus") or {},
-        fable_usage_block(usage),
     ):
         util = obj.get("utilization")
         if util is None:
@@ -2098,6 +2125,119 @@ def _evaluate_cursor_model_pools(
     }
 
 
+def _claude_fable_models(account: dict) -> list[str]:
+    """Return configured Claude models governed by the Fable scoped quota."""
+    selected = account.get("models") or config.get().get("oauthDefaultModels") or []
+    return sorted({
+        model.strip()
+        for model in selected
+        if isinstance(model, str)
+        and model.strip()
+        and _is_fable_model_label(model)
+    })
+
+
+def _evaluate_claude_fable_pool(
+    account_key: str,
+    account: dict,
+    usage: dict,
+    *,
+    threshold: float,
+    fresh: bool,
+) -> dict:
+    """Cool only Fable models when the Claude weekly scoped pool is exhausted."""
+    from . import cooldown
+
+    block = fable_usage_block(usage)
+    flat = flatten_usage(usage)
+    utilization = flat.get("fable_util")
+    reset_iso = str(block.get("resets_at") or "") or None
+    reset_dt = _parse_iso(reset_iso)
+    reset_ms = int(reset_dt.timestamp() * 1000) if reset_dt is not None else None
+    now_ms = int(time.time() * 1000)
+    if reset_ms is not None and reset_ms <= now_ms:
+        reset_ms = None
+
+    models = _claude_fable_models(account)
+    over = utilization is not None and utilization >= threshold
+    channel_key = f"oauth:{account_key}"
+    cooled = 0
+    recovered = 0
+
+    for model in models:
+        state = cooldown.get_state(channel_key, model) or {}
+        previous_message = str(state.get("last_error_message") or "")
+        owned = (
+            '"code":"claude_fable_quota"' in previous_message
+            or "claude_fable_quota" in previous_message
+        )
+        if over:
+            # A scoped percentage without a bounded reset remains visible and
+            # alertable, but must not create an indefinite model freeze.
+            if reset_ms is None:
+                continue
+            if owned and cooldown.is_blocked(channel_key, model):
+                continue
+            message = json.dumps({
+                "error": {
+                    "code": "claude_fable_quota",
+                    "message": "Claude Fable scoped quota reached configured threshold",
+                    "scope": "fable",
+                    "utilization": utilization,
+                    "resets_at": reset_iso,
+                }
+            }, ensure_ascii=False, separators=(",", ":"))
+            cooldown.record_error(
+                channel_key, model, message, cooldown_until=reset_ms,
+            )
+            cooled += 1
+        elif utilization is not None and fresh and owned:
+            cooldown.clear(
+                channel_key, model=model, notify_recovered=False,
+            )
+            recovered += 1
+
+    if cooled:
+        try:
+            notifier.notify_event(
+                "quota_cooldown",
+                "🟠 <b>Claude Fable 模型已进入额度冷却</b>\n"
+                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('claude')}\n"
+                f"冷却模型: <code>{cooled}</code>\n"
+                f"恢复时间: <code>{notifier.escape_html(_to_bjt(reset_iso))}</code>"
+            )
+        except Exception:
+            pass
+        action = "claude_fable_model_cooldown"
+    elif recovered:
+        try:
+            notifier.notify_event(
+                "quota_resumed",
+                "♻️ <b>Claude Fable 模型额度已恢复</b>\n"
+                f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('claude')}\n"
+                f"恢复模型: <code>{recovered}</code>"
+            )
+        except Exception:
+            pass
+        action = "claude_fable_model_recovered"
+    elif over and models and reset_ms is not None:
+        action = "claude_fable_model_still_cooling"
+    elif over:
+        action = "claude_fable_quota_alert"
+    else:
+        action = "claude_fable_available"
+    return {
+        "action": action,
+        "utils": [utilization],
+        "any_over": over,
+        "hit_windows": ["fable"] if over else [],
+        "disabled_until": reset_iso if over else None,
+        "cooled_models": cooled,
+        "recovered_models": recovered,
+        "quota_signal_known": utilization is not None,
+    }
+
+
 def _evaluate_antigravity_credits(
     account_key: str,
     acc: dict,
@@ -2181,9 +2321,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
 
     规则：
       • disabled_reason in ("user", "auth_error") → 完全不碰（手动禁用永远不自动恢复）
-      • 任一窗口 util ≥ threshold → 需要禁用
+      • 任一账号级窗口 util ≥ threshold → 需要禁用
           - 账号已是 quota 禁用：保持不动（不刷新 disabled_until，避免目标移动）
           - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
+      • Claude Fable scoped 窗口只冷却该账号的 Fable 模型，不禁用整个账号
       • 所有窗口 util < threshold → 可用
           - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
@@ -2218,8 +2359,10 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         account_key = canonical
     provider = provider_of(account_key)
     utils = extract_utils_percent(usage)
-    window_labels = ["5h", "周额度" if provider == "xai" else "7d", "30d", "sonnet", "opus", "fable"]
-    hit_windows = [lbl for lbl, u in zip(window_labels, utils)
+    # Fable is a model-scoped weekly sub-cap.  It is evaluated separately below
+    # and must never participate in the account-level disable decision.
+    window_labels = ["5h", "周额度" if provider == "xai" else "7d", "30d", "sonnet", "opus"]
+    hit_windows = [lbl for lbl, u in zip(window_labels, utils[:5])
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)
 
@@ -2233,6 +2376,16 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         return {"action": f"noop_{reason}", "utils": utils, "any_over": any_over,
                 "hit_windows": hit_windows,
                 "disabled_until": acc.get("disabled_until")}
+
+    fable_pool_result = None
+    if provider == "claude":
+        fable_pool_result = _evaluate_claude_fable_pool(
+            account_key,
+            acc,
+            usage,
+            threshold=float(threshold),
+            fresh=fresh,
+        )
 
     if provider == "cursor":
         return _evaluate_cursor_model_pools(
@@ -2402,6 +2555,12 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
                 "disabled_reason": (enable_result or {}).get("disabled_reason"),
                 "error_code": "account_state_conflict",
                 "runtime_state": runtime_state}
+    if fable_pool_result and (
+        fable_pool_result.get("any_over")
+        or fable_pool_result.get("cooled_models")
+        or fable_pool_result.get("recovered_models")
+    ):
+        return {**fable_pool_result, "utils": utils}
     return {"action": "kept_enabled", "utils": utils, "any_over": False,
             "hit_windows": [], "disabled_until": None}
 
