@@ -306,7 +306,7 @@ def provider_usage_save_error(account_id:str,adapter_id:str,error:str,retry_afte
     _mut("api_provider_usage_cache",op)
 def provider_usage_delete(account_id:str)->None:_mut("api_provider_usage_cache",lambda d:d.pop(account_id,None))
 
-_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations")
+_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations")
 def _quota_defaults(row:dict[str,Any])->dict[str,Any]:return {column:row.get(column) for column in _QUOTA_COLUMNS}
 
 def _quota_display_email(account_key:str)->str:
@@ -338,7 +338,7 @@ def _quota_write(account_key:str, operation):
         return _mut("oauth_quota_cache",lambda d:operation(d,resolved))
 
 def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None)->None:
-    cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","extra_used","extra_limit","extra_util","raw_data")
+    cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data")
     def op(d,target):
         row=_quota_defaults(dict(d.get(target) or {}));row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))});row.update({k:data.get(k) for k in cols});d[target]=row
     _quota_write(account_key,op)

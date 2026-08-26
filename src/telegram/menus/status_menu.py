@@ -219,12 +219,14 @@ def _quota_warnings(threshold_pct: float = 80.0) -> list[str]:
                 "Secondary": row.get("codex_secondary_used_pct"),
             }
         elif provider == "claude":
-            # Anthropic: 5h / 7d / Sonnet / Opus（原行为）
+            # Anthropic: 5h / 7d / Sonnet / Opus / Fable
+            fable_util, _fable_reset = oauth_manager.fable_from_quota_row(row)
             utils = {
                 "5h": row.get("five_hour_util"),
                 "7d": row.get("seven_day_util"),
                 "Sonnet": row.get("sonnet_util"),
                 "Opus": row.get("opus_util"),
+                "Fable": fable_util,
             }
         elif provider == "xai":
             # Grok/xAI: 官方 weekly credits 映射到通用 7d 缓存列。

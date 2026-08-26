@@ -908,6 +908,7 @@ def _mock_usage() -> dict:
         "seven_day": {"utilization": 0.0, "resets_at": None},
         "seven_day_sonnet": {"utilization": 0.0, "resets_at": None},
         "seven_day_opus": {"utilization": 0.0, "resets_at": None},
+        "seven_day_fable": {},
         "extra_usage": {"is_enabled": False, "used_credits": 0, "monthly_limit": 0, "utilization": 0},
     }
 
@@ -1157,6 +1158,7 @@ def _synthesize_openai_usage_from_row(row: dict) -> dict:
         "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")) or {},
         "seven_day_sonnet": {},
         "seven_day_opus": {},
+        "seven_day_fable": {},
         "extra_usage": {"is_enabled": False},
     }
 
@@ -1296,6 +1298,83 @@ def preserve_antigravity_cached_summary(account_key: str, usage: dict) -> dict:
     return usage
 
 
+def _normalize_quota_model_label(value: str) -> str:
+    return " ".join(str(value or "").lower().replace("_", " ").replace("-", " ").split())
+
+
+def _is_fable_model_label(value: str) -> bool:
+    """Match Claude Fable / F5 labels from usage.limits scoped windows."""
+    label = _normalize_quota_model_label(value)
+    if not label:
+        return False
+    if "fable" in label:
+        return True
+    compact = label.replace(" ", "")
+    return compact in {"f5", "claudef5"} or compact.endswith("f5")
+
+
+def fable_usage_block(usage: dict | None) -> dict:
+    """Extract the Claude Fable / F5 weekly quota window.
+
+    Newer /api/oauth/usage payloads keep Sonnet/Opus null and put Fable on
+    ``limits[]`` as ``weekly_scoped`` (``scope.model.display_name = Fable``).
+    Older or mock payloads may still expose ``seven_day_fable``.
+    """
+    data = usage if isinstance(usage, dict) else {}
+    direct = data.get("seven_day_fable")
+    if isinstance(direct, dict) and direct.get("utilization") is not None:
+        return direct
+
+    limits = data.get("limits")
+    if not isinstance(limits, list):
+        return {}
+    for item in limits:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        if kind not in {"weekly_scoped", "seven_day_scoped"}:
+            continue
+        scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        name = str(model.get("display_name") or model.get("id") or "")
+        if not _is_fable_model_label(name):
+            continue
+        util = item.get("utilization")
+        if util is None:
+            util = item.get("percent")
+        if util is None:
+            continue
+        return {"utilization": util, "resets_at": item.get("resets_at")}
+    return {}
+
+
+def fable_from_quota_row(row: dict | None) -> tuple[float | None, str | None]:
+    """Return (util%, resets_at) for Fable, including raw_data fallback."""
+    if not isinstance(row, dict):
+        return None, None
+    util = row.get("fable_util")
+    if util is not None:
+        try:
+            value = float(util)
+        except (TypeError, ValueError):
+            value = None
+        else:
+            if math.isnan(value) or math.isinf(value):
+                value = None
+            else:
+                return max(0.0, min(100.0, value)), row.get("fable_reset")
+    block = fable_usage_block(_raw_usage_from_flat(row))
+    if not block or block.get("utilization") is None:
+        return None, None
+    try:
+        value = float(block["utilization"])
+    except (TypeError, ValueError):
+        return None, None
+    if math.isnan(value) or math.isinf(value):
+        return None, None
+    return max(0.0, min(100.0, value)), block.get("resets_at")
+
+
 def flatten_usage(usage: dict) -> dict:
     """把 /api/oauth/usage 返回的嵌套结构展平，便于写 state_db.oauth_quota_cache。
 
@@ -1338,6 +1417,7 @@ def flatten_usage(usage: dict) -> dict:
     td = ((usage.get("openai") or {}).get("thirty_day") or {})
     sds = usage.get("seven_day_sonnet") or {}
     sdo = usage.get("seven_day_opus") or {}
+    sdf = fable_usage_block(usage)
     extra = usage.get("extra_usage") or {}
 
     return {
@@ -1352,6 +1432,8 @@ def flatten_usage(usage: dict) -> dict:
         "sonnet_reset": sds.get("resets_at"),
         "opus_util": _util_pct(sdo),
         "opus_reset": sdo.get("resets_at"),
+        "fable_util": _util_pct(sdf),
+        "fable_reset": sdf.get("resets_at"),
         "extra_used": _safe_float(extra.get("used_credits")) / 100.0,
         "extra_limit": _safe_float(extra.get("monthly_limit")) / 100.0,
         "extra_util": _util_pct(extra),
@@ -1360,7 +1442,7 @@ def flatten_usage(usage: dict) -> dict:
 
 
 def extract_utils_percent(usage: dict) -> list[float | None]:
-    """返回 [five_hour, seven_day, 30d, sonnet, opus] 的百分比（None 表示该指标缺失）。"""
+    """返回 [five_hour, seven_day, 30d, sonnet, opus, fable] 的百分比（None 表示该指标缺失）。"""
     flat = flatten_usage(usage)
     return [
         flat["five_hour_util"],
@@ -1368,6 +1450,7 @@ def extract_utils_percent(usage: dict) -> list[float | None]:
         flat.get("thirty_day_util"),
         flat["sonnet_util"],
         flat["opus_util"],
+        flat.get("fable_util"),
     ]
 
 
@@ -1385,6 +1468,7 @@ def latest_reset_iso(usage: dict) -> str | None:
         ((usage.get("openai") or {}).get("thirty_day") or {}),
         usage.get("seven_day_sonnet") or {},
         usage.get("seven_day_opus") or {},
+        fable_usage_block(usage),
     ):
         dt = _parse_iso(obj.get("resets_at"))
         if dt is not None:
@@ -1411,6 +1495,7 @@ def reset_iso_for_hit_windows(usage: dict, threshold: float) -> str | None:
         ((usage.get("openai") or {}).get("thirty_day") or {}),
         usage.get("seven_day_sonnet") or {},
         usage.get("seven_day_opus") or {},
+        fable_usage_block(usage),
     ):
         util = obj.get("utilization")
         if util is None:
@@ -1459,6 +1544,7 @@ def usage_from_quota_row(row: dict) -> dict:
         },
         "seven_day_sonnet": _block(row.get("sonnet_util"), row.get("sonnet_reset")),
         "seven_day_opus": _block(row.get("opus_util"), row.get("opus_reset")),
+        "seven_day_fable": _block(*(fable_from_quota_row(row))),
         "extra_usage": {
             "is_enabled": bool(row.get("extra_limit")),
             "used_credits": row.get("extra_used") or 0,
@@ -2114,7 +2200,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
       "action": "noop_user"|"noop_auth_error"|"disabled"|"still_over_quota"|
                 "wham_limit_disabled"|"wham_limit_keep_disabled"|
                 "resumed"|"kept_enabled"|"disable_failed"|"resume_failed"|"noop_missing",
-      "utils": [5h, 7d, 30d, sonnet, opus],   # None 表示该指标缺失
+      "utils": [5h, 7d, 30d, sonnet, opus, fable],   # None 表示该指标缺失
       "any_over": bool,
       "hit_windows": ["5h", "7d", ...],   # util ≥ threshold 的窗口标签
       "disabled_until": str|None,
@@ -2132,7 +2218,7 @@ def evaluate_and_toggle_by_usage(account_key: str, usage: dict,
         account_key = canonical
     provider = provider_of(account_key)
     utils = extract_utils_percent(usage)
-    window_labels = ["5h", "周额度" if provider == "xai" else "7d", "30d", "sonnet", "opus"]
+    window_labels = ["5h", "周额度" if provider == "xai" else "7d", "30d", "sonnet", "opus", "fable"]
     hit_windows = [lbl for lbl, u in zip(window_labels, utils)
                    if u is not None and u >= threshold]
     any_over = bool(hit_windows)
