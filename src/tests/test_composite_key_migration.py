@@ -733,7 +733,65 @@ def test_fable_usage_selects_active_scoped_entry(m):
     inactive_only["limits"] = [usage["limits"][0]]
     assert m["oauth_manager"].fable_usage_block(inactive_only) == {}
     assert m["oauth_manager"].flatten_usage(inactive_only)["fable_util"] is None
+    assert m["oauth_manager"].fable_display_block(inactive_only) == {
+        "utilization": 99.0,
+        "resets_at": "2030-08-31T00:00:00Z",
+    }
+    assert m["oauth_manager"].fable_display_block(usage) == {
+        "utilization": 12.0,
+        "resets_at": "2030-08-30T10:00:00Z",
+    }
     print("  [PASS] Fable usage: inactive/history entries cannot shadow active scope")
+
+
+def test_fable_display_falls_back_to_inactive_scoped_window(m):
+    reset = "2026-08-30T09:59:59.911926+00:00"
+    usage = {
+        "five_hour": {"utilization": 0.0, "resets_at": None},
+        "seven_day": {"utilization": 38.0, "resets_at": reset},
+        "seven_day_sonnet": None,
+        "seven_day_opus": None,
+        "limits": [
+            {
+                "kind": "session",
+                "percent": 0,
+                "is_active": False,
+                "scope": None,
+            },
+            {
+                "kind": "weekly_all",
+                "percent": 38,
+                "is_active": True,
+                "resets_at": reset,
+                "scope": None,
+            },
+            {
+                "kind": "weekly_scoped",
+                "percent": 6,
+                "is_active": False,
+                "resets_at": reset,
+                "scope": {"model": {"id": None, "display_name": "Fable"}},
+            },
+        ],
+    }
+    assert m["oauth_manager"].fable_usage_block(usage) == {}
+    assert m["oauth_manager"].flatten_usage(usage)["fable_util"] is None
+    assert m["oauth_manager"].fable_display_block(usage) == {
+        "utilization": 6.0,
+        "resets_at": reset,
+    }
+    row = {
+        "five_hour_util": 0.0,
+        "seven_day_util": 38.0,
+        "fable_util": None,
+        "fable_reset": None,
+        "raw_data": m["oauth_manager"].flatten_usage(usage)["raw_data"],
+    }
+    assert m["oauth_manager"].fable_from_quota_row(row) == (None, None)
+    util, shown_reset = m["oauth_manager"].fable_display_from_quota_row(row)
+    assert util == 6.0
+    assert shown_reset == reset
+    print("  [PASS] Fable display: inactive-only scoped window stays visible")
 
 # ==============================================================
 # main
@@ -785,6 +843,7 @@ def main():
         test_flatten_usage_reads_fable_from_weekly_scoped_limit,
         test_usage_from_quota_row_reads_fable_from_raw_limits,
         test_fable_usage_selects_active_scoped_entry,
+        test_fable_display_falls_back_to_inactive_scoped_window,
     ]
     passed = 0
     failed = 0

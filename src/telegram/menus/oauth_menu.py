@@ -670,7 +670,7 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
     ):
         if row.get(key) is not None:
             return True
-    if oauth_manager.fable_from_quota_row(row)[0] is not None:
+    if oauth_manager.fable_display_from_quota_row(row)[0] is not None:
         return True
     try:
         raw = json.loads(row.get("raw_data") or "{}")
@@ -1644,7 +1644,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
             line = _format_usage_line_html("📊 30d", td_util, reset)
             if line:
                 lines.append(line)
-        fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
+        fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
         if prov == "claude" and fable_util is not None:
             line = _format_usage_line_html("📖 Fable 7d", fable_util, fable_reset)
             if line:
@@ -1744,7 +1744,7 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
         ("🧠 Opus 7d", row.get("opus_util"), row.get("opus_reset"), None),
     ]
     if provider == "claude":
-        fable_util, fable_reset = oauth_manager.fable_from_quota_row(row)
+        fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
         usage_rows.append(("📖 Fable 7d", fable_util, fable_reset, None))
     for label, util, reset, util_k in usage_rows:
         line = _format_usage_line_text(label, util, reset)
