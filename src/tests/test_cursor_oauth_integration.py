@@ -626,7 +626,7 @@ def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
     snapshot = {"by_channel": {channel_key: metrics}}
 
     list_text = oauth_menu._format_account_block(account, month_snapshot=snapshot)
-    assert "💎 月度:" in list_text
+    assert "💎 本地自然月:" in list_text
     assert "⚡ TPS:" in list_text
     assert "💵 未计价（Cursor 官方账单见上方）" not in list_text
     assert "💵 $0.00" not in list_text
@@ -652,7 +652,7 @@ def test_cursor_local_monthly_stats_show_unpriced_instead_of_false_zero():
     actual_list = oauth_menu._format_account_block(
         account, month_snapshot=actual_snapshot,
     )
-    assert "💵 $0.12" in actual_list
+    assert "💵 自然月 $0.12" in actual_list
     assert "Cursor 官方事件" not in actual_list
     actual_detail = oauth_menu._format_month_stats_block(
         account_key,

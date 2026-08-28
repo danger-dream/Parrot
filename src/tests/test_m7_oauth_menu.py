@@ -167,6 +167,7 @@ def _add_fake_account(m, email, **kw):
         "last_refresh": kw.get("last_refresh",
                                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
         "type": "claude",
+        "subscription_created_at": kw.get("subscription_created_at", ""),
         "enabled": kw.get("enabled", True),
         "disabled_reason": kw.get("disabled_reason"),
         "disabled_until": kw.get("disabled_until"),
@@ -193,6 +194,7 @@ def _add_openai_fake_account(m, email, **kw):
         "workspace_id": kw.get("workspace_id", "acct-123"),
         "organization_id": kw.get("organization_id", "org-x"),
         "plan_type": kw.get("plan_type", "plus"),
+        "subscription_expires_at": kw.get("subscription_expires_at", ""),
         "enabled": kw.get("enabled", True),
         "disabled_reason": kw.get("disabled_reason"),
         "disabled_until": kw.get("disabled_until"),
@@ -345,6 +347,85 @@ def test_view_detail_with_quota_cache(m):
     assert any(x.startswith("oa:toggle:") for x in flat)
     assert any(x.startswith("oa:delete_ask:") for x in flat)
     print("  [PASS] oauth detail (含 quota 缓存渲染)")
+
+
+def test_oauth_detail_cold_start_does_not_cache_false_empty_models(m, monkeypatch):
+    """总体快照未就绪时不能把按模型统计永久污染成新鲜空列表。"""
+    _setup(m)
+    now = datetime.now(timezone.utc)
+    email = "cold-detail-models@openai.test"
+    _add_openai_fake_account(
+        m, email,
+        subscription_expires_at=(now + timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    account_key = _account_key_for(m, email)
+    om = m["oauth_menu"]
+    cache = m["menu_cache"]
+    account = m["oauth_manager"].get_account(account_key)
+    local_period = om._oauth_local_period(account, now=now)
+    model_key = ("oauth-model", account_key, int(local_period["since"]))
+    holder = {"aggregate_ready": False, "stats": None}
+
+    cache.DETAIL_STATS.clear()
+    monkeypatch.setattr(om, "_oauth_local_period", lambda *args, **kwargs: local_period)
+    monkeypatch.setattr(
+        om, "_request_window_snapshots",
+        lambda accounts: holder["aggregate_ready"],
+    )
+    monkeypatch.setattr(
+        om, "_account_period_stats",
+        lambda *args, **kwargs: holder["stats"],
+    )
+
+    assert om._queue_oauth_detail_stats(account_key) is False
+    cold = cache.DETAIL_STATS.peek(model_key)
+    assert cold.value is None
+    assert cold.refreshing is False
+
+    # 模拟旧竞态遗留的新鲜 []；总体一旦证明有请求，必须强制修复而非当成完整结果。
+    cache.DETAIL_STATS.store(model_key, [])
+    holder.update({"aggregate_ready": True, "stats": {"total": 5}})
+    assert om._queue_oauth_detail_stats(account_key) is False
+    repairing = cache.DETAIL_STATS.peek(model_key)
+    assert repairing.value == []
+    assert repairing.refreshing is True
+
+
+def test_oauth_model_preheat_forces_repair_of_false_empty_cache(m, monkeypatch):
+    """后台预热也必须覆盖“总体有调用、模型缓存却为空”的矛盾状态。"""
+    _setup(m)
+    now = datetime.now(timezone.utc)
+    email = "preheat-models@openai.test"
+    _add_openai_fake_account(
+        m, email,
+        subscription_expires_at=(now + timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    account_key = _account_key_for(m, email)
+    om = m["oauth_menu"]
+    cache = m["menu_cache"]
+    account = m["oauth_manager"].get_account(account_key)
+    local_period = om._oauth_local_period(account, now=now)
+    model_key = ("oauth-model", account_key, int(local_period["since"]))
+
+    cache.PERIOD_STATS.store(
+        ("period", int(cache.month_start_ts())),
+        {"by_channel": {}, "by_apikey": {}},
+    )
+    cache.WINDOW_STATS.store(
+        om._window_stats_cache_key(account_key, "account-period"),
+        {"total": 5},
+    )
+    cache.DETAIL_STATS.store(model_key, [])
+    requests = []
+
+    def capture_request(key, loader, **kwargs):
+        requests.append((key, kwargs))
+        return cache.DETAIL_STATS.peek(key)
+
+    monkeypatch.setattr(cache.DETAIL_STATS, "request", capture_request)
+    assert cache._queue_model_detail_snapshots() is True
+    matching = [item for item in requests if item[0] == model_key]
+    assert matching and matching[-1][1].get("force") is True
 
 
 def test_openai_window_cost_is_inline_three_decimals_and_detail_uses_amount_label(m):
@@ -653,6 +734,230 @@ def test_provider_specific_oauth_quota_percentages_share_progress_bar(m):
     ])
     assert "25.00%" in hidden and "70.00%" in hidden and "58.00%" in hidden
     assert "█" not in hidden and "░" not in hidden
+
+
+def test_oauth_list_week_projection_uses_only_week_percent_and_week_stats(m):
+    _setup(m)
+    email = "weekly-projection@claude.test"
+    _add_fake_account(m, email)
+    account_key = _account_key_for(m, email)
+    reset = (datetime.now(timezone.utc) + timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "five_hour_util": 50.0,
+        "five_hour_reset": reset,
+        "seven_day_util": 25.0,
+        "seven_day_reset": reset,
+        "raw_data": "{}",
+    })
+    om = m["oauth_menu"]
+    m["menu_cache"].WINDOW_STATS.store(
+        om._window_stats_cache_key(account_key, "5h"),
+        {"input": 900_000, "output": 100_000, "cache_creation": 0,
+         "cache_read": 0, "cost_ticks": 1_000_000_000_000,
+         "costed_success": 1},
+    )
+    week_stats = {
+        "total": 1, "success_count": 1, "error_count": 0,
+        "input": 400, "output": 200, "cache_creation": 100, "cache_read": 300,
+        "avg_tps": 50.7, "max_tps": 50.7, "min_tps": 50.7,
+        "cost_ticks": 15_000_000_000, "costed_success": 1,
+        "actual_cost_ticks": 0, "estimated_cost_ticks": 15_000_000_000,
+        "unpriced_success": 0,
+    }
+    m["menu_cache"].WINDOW_STATS.store(
+        om._window_stats_cache_key(account_key, "7d"), week_stats,
+    )
+    month_stats = dict(week_stats, cost_ticks=120_000_000_000)
+    text = om._format_account_block(
+        m["oauth_manager"].get_account(account_key),
+        month_snapshot={"by_channel": {f"oauth:{account_key}": month_stats}},
+    )
+    assert "↑800 ↓200 · 缓存 300 (37.5%) · 均 50.7 t/s · $1.500" in text
+    assert "💵 自然月 $12.00 · 周额度预测：4.0K · $6.00" in text
+    assert "4.0M" not in text  # 5h stats must never enter the weekly projection.
+
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "seven_day_util": 0.0,
+        "seven_day_reset": reset,
+        "raw_data": "{}",
+    })
+    zero_text = om._format_period_cost_with_week_projection(
+        account_key, month_stats, "自然月",
+    )
+    assert zero_text == "💵 自然月 $12.00"
+
+
+def test_openai_list_and_detail_use_inferred_subscription_period_without_dates(m):
+    _setup(m)
+    now = datetime.now(timezone.utc)
+    expiry = now + timedelta(days=21)
+    expiry_iso = expiry.strftime("%Y-%m-%dT%H:%M:%SZ")
+    email = "period-openai@example.test"
+    _add_openai_fake_account(
+        m, email, plan_type="pro", subscription_expires_at=expiry_iso,
+    )
+    account_key = _account_key_for(m, email)
+    reset = (now + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "seven_day_util": 20.0,
+        "seven_day_reset": reset,
+        "raw_data": "{}",
+    })
+    om = m["oauth_menu"]
+    account = m["oauth_manager"].get_account(account_key)
+    period = om._oauth_local_period(account, now=now)
+    assert period["source"] == "openai_inferred_subscription"
+    expected_start = om._shift_calendar_month(expiry, -1)
+    assert abs(period["since"] - expected_start.timestamp()) < 1.0
+
+    period_stats = {
+        "total": 10, "success_count": 10, "error_count": 0,
+        "input": 6_000, "output": 300, "cache_creation": 0, "cache_read": 5_000,
+        "avg_tps": 40.0, "max_tps": 60.0, "min_tps": 20.0,
+        "cost_ticks": 400_000_000_000, "costed_success": 10,
+        "actual_cost_ticks": 0, "estimated_cost_ticks": 400_000_000_000,
+        "unpriced_success": 0,
+    }
+    week_stats = {
+        **period_stats,
+        "input": 1_000, "output": 100, "cache_read": 900,
+        "cost_ticks": 20_000_000_000,
+        "estimated_cost_ticks": 20_000_000_000,
+    }
+    om_cache = m["menu_cache"].WINDOW_STATS
+    om_cache.store(om._window_stats_cache_key(account_key, "account-period"), period_stats)
+    om_cache.store(om._window_stats_cache_key(account_key, "7d"), week_stats)
+    natural_stats = {**period_stats, "cost_ticks": 900_000_000_000}
+    natural_snapshot = {"by_channel": {f"oauth:{account_key}": natural_stats}}
+
+    listing = om._format_account_block(account, month_snapshot=natural_snapshot)
+    assert "💎 套餐本期: ↑ 11.0K · ↓ 300" in listing
+    assert "💵 本期 $40.00 · 周额度预测：10.0K · $10.00" in listing
+    assert "$90.00" not in listing
+    for line in listing.splitlines():
+        if "套餐本期" in line or "💵 本期" in line:
+            assert "2026-" not in line and "起）" not in line
+            assert "推定" not in line and "本期约" not in line
+
+    detail = om._format_month_stats_block(
+        account_key,
+        month_snapshot=natural_snapshot,
+        by_model=[{"final_model": "gpt-test", **period_stats}],
+    )
+    assert "⚡ 套餐本期使用统计" in detail
+    assert "推定" not in detail
+    assert "累计金额：$40.00" in detail
+    assert "$90.00" not in detail
+    assert "本月使用统计" not in detail
+
+    specs = om._oauth_window_specs([account])
+    account_period = next(
+        item for item in specs
+        if item[0] == om._window_stats_cache_key(account_key, "account-period")
+    )
+    assert abs(account_period[2] - expected_start.timestamp()) < 1.0
+
+
+def test_claude_and_cursor_account_period_resolution(m):
+    _setup(m)
+    om = m["oauth_menu"]
+
+    claude_email = "period-claude@example.test"
+    _add_fake_account(
+        m, claude_email, subscription_created_at="2026-01-31T10:00:00Z",
+    )
+    claude = m["oauth_manager"].get_account(_account_key_for(m, claude_email))
+    claude_period = om._oauth_local_period(
+        claude, now=datetime(2026, 3, 15, tzinfo=timezone.utc),
+    )
+    assert claude_period["source"] == "claude_inferred_subscription"
+    assert datetime.fromtimestamp(
+        claude_period["since"], timezone.utc,
+    ) == datetime(2026, 2, 28, 10, 0, tzinfo=timezone.utc)
+    assert claude_period["usage_label"] == "套餐本期"
+    assert "2026" not in claude_period["usage_label"]
+
+    cursor = {
+        "email": "period-cursor@example.test", "provider": "cursor", "type": "cursor",
+        "subject": "period-cursor", "sub": "period-cursor",
+        "billing_cycle_start": "2026-08-16T15:56:39Z",
+        "billing_cycle_end": "2026-09-16T15:56:39Z",
+    }
+    cursor_period = om._oauth_local_period(
+        cursor, row={}, now=datetime(2026, 8, 28, tzinfo=timezone.utc),
+    )
+    assert cursor_period["source"] == "cursor_official_billing"
+    assert datetime.fromtimestamp(
+        cursor_period["since"], timezone.utc,
+    ) == datetime(2026, 8, 16, 15, 56, 39, tzinfo=timezone.utc)
+    assert cursor_period["usage_label"] == "账单本期"
+
+
+def test_grok_list_adds_exact_week_detail_and_projection(m):
+    _setup(m)
+    email = "weekly-grok@example.test"
+    subject = "weekly-grok-sub"
+    account = {
+        "email": email, "provider": "xai", "type": "xai",
+        "access_token": "xai-at", "refresh_token": "xai-rt",
+        "expired": (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "subject": subject, "sub": subject, "enabled": True,
+        "disabled_reason": None, "models": ["grok-code-fast-1"],
+    }
+    m["config"].update(lambda cfg: cfg.setdefault("oauthAccounts", []).append(account))
+    account_key = f"xai:{subject}"
+    now = datetime.now(timezone.utc)
+    period_start = now - timedelta(hours=11)
+    period_end = now + timedelta(days=6, hours=13)
+    m["state_db"].quota_save(account_key, {
+        "fetched_at": m["state_db"].now_ms(),
+        "seven_day_util": 20.0,
+        "seven_day_reset": period_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "raw_data": json.dumps({"xai": {
+            "source": "cli-chat-proxy",
+            "billing": {
+                "period_type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "used_percent": 20.0,
+                "remaining_percent": 80.0,
+                "period_start": period_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "period_end": period_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "user": {"subscription_tier": "SuperGrokPro"},
+            "settings": {"subscription_tier_display": "SuperGrok Heavy"},
+        }}),
+    })
+    om = m["oauth_menu"]
+    week_stats = {
+        "total": 2, "success_count": 2, "error_count": 0,
+        "input": 1_000, "output": 100, "cache_creation": 0, "cache_read": 900,
+        "avg_tps": 50.7, "max_tps": 55.0, "min_tps": 45.0,
+        "cost_ticks": 20_000_000_000, "costed_success": 2,
+        "actual_cost_ticks": 20_000_000_000, "estimated_cost_ticks": 0,
+        "unpriced_success": 0,
+    }
+    m["menu_cache"].WINDOW_STATS.store(
+        om._window_stats_cache_key(account_key, "7d"), week_stats,
+    )
+    month_stats = dict(week_stats, input=10_000, output=500, cache_read=9_000,
+                       cost_ticks=806_900_000_000)
+    text = om._format_account_block(
+        m["oauth_manager"].get_account(account_key),
+        month_snapshot={"by_channel": {f"oauth:{account_key}": month_stats}},
+    )
+    assert "📊 周额度:" in text
+    assert "↑1.9K ↓100 · 缓存 900 (47.4%) · 均 50.7 t/s · $2.000" in text
+    # Grok's only authoritative account period is the official week; the
+    # unrelated natural-month snapshot must not enter either local total.
+    assert "💎 本周: ↑ 1.9K · ↓ 100" in text
+    assert "💵 本周 $2.00 · 周额度预测：10.0K · $10.00" in text
+    assert "$80.69" not in text
+
+    specs = om._oauth_window_specs([m["oauth_manager"].get_account(account_key)])
+    weekly = next(item for item in specs if item[0] == om._window_stats_cache_key(account_key, "7d"))
+    assert abs(weekly[2] - period_start.timestamp()) < 1.0
 
 
 def test_oauth_list_uses_compact_relative_quota_copy_text(m):

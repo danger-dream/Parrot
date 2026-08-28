@@ -762,7 +762,7 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
     listing = m["oauth_menu"]._format_account_block(m["oauth_manager"].get_account(ak))
     assert "🏷️ 套餐: <code>Google AI Pro</code>" in listing
     assert "🪙 Credits: 12（最低 1） · 可用" in listing
-    assert "💎 月度: <i>暂无本地请求</i>" in listing
+    assert "💎 本地自然月: <i>暂无本地请求</i>" in listing
     used = m["oauth_menu"]._format_account_block(
         m["oauth_manager"].get_account(ak),
         month_snapshot={
@@ -784,7 +784,7 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
             }
         },
     )
-    assert "💎 月度:" in used
+    assert "💎 本地自然月:" in used
     assert "⚡ TPS:" in used
     assert "💵" in used
     assert "暂无本地请求" not in used
@@ -794,7 +794,7 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
     assert "Project: <code>proj-cred</code>" in detail
     assert "🧬 模型目录:" in detail
     assert "个文本" in detail
-    assert "⚡ 本月使用统计" in detail
+    assert "⚡ 本地自然月使用统计" in detail
     assert "暂无本地请求" in detail
 
 

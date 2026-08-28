@@ -25,6 +25,7 @@ mockMode 保护（`config.oauth.mockMode=true` 或 env DISABLE_OAUTH_NETWORK_CAL
 from __future__ import annotations
 
 import asyncio
+import calendar
 import concurrent.futures
 import hashlib
 import json
@@ -35,6 +36,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -881,6 +883,119 @@ def _this_month_start_ts() -> float:
     return menu_cache.month_start_ts()
 
 
+def _shift_calendar_month(value: datetime, months: int) -> datetime:
+    """Shift an aware datetime by calendar months while preserving wall time."""
+    month_index = value.year * 12 + value.month - 1 + int(months)
+    year, zero_month = divmod(month_index, 12)
+    month = zero_month + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _monthly_cycle_from_anchor(anchor: datetime, now: datetime) -> tuple[datetime, datetime]:
+    """Return the inferred monthly anniversary cycle containing ``now``."""
+    month_delta = (now.year - anchor.year) * 12 + now.month - anchor.month
+    start = _shift_calendar_month(anchor, month_delta)
+    if start > now:
+        month_delta -= 1
+        start = _shift_calendar_month(anchor, month_delta)
+    return start, _shift_calendar_month(anchor, month_delta + 1)
+
+
+def _natural_month_local_period(now: datetime | None = None) -> dict:
+    """Explicit reporting fallback; never present a natural month as provider billing."""
+    if now is None:
+        since = _this_month_start_ts()
+    else:
+        local = now.astimezone(_BJT)
+        since = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return {
+        "since": since,
+        "usage_label": "本地自然月",
+        "money_label": "自然月",
+        "detail_title": "本地自然月使用统计",
+        "stats_window": None,
+        "source": "natural_month",
+    }
+
+
+def _oauth_local_period(account: dict | str, *, row: dict | None = None,
+                        now: datetime | None = None) -> dict:
+    """Resolve the honest local-stat period for one OAuth account.
+
+    Provider period fields win. OpenAI/Claude may use an explicitly labelled
+    monthly inference when upstream exposes only one subscription anchor. If no
+    common account period exists, keep the old natural-month report but label it
+    as an independent local reporting interval rather than a quota/billing cycle.
+    """
+    if isinstance(account, str):
+        account_key = account
+        acc = oauth_manager.get_account(account_key) or {}
+    else:
+        acc = account if isinstance(account, dict) else {}
+        account_key = _account_key(acc) if acc else ""
+    provider = oauth_manager.provider_of(acc or account_key)
+    row = state_db.quota_load(account_key) if row is None and account_key else row
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+    def parse_time(value) -> datetime | None:
+        parsed = _parse_iso(str(value or ""))
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    period_start: datetime | None = None
+    source = ""
+    if provider == "openai":
+        expiry = parse_time(acc.get("subscription_expires_at"))
+        if expiry is not None:
+            start = _shift_calendar_month(expiry, -1)
+            if start <= now <= expiry + timedelta(minutes=5):
+                period_start = start
+                source = "openai_inferred_subscription"
+    elif provider == "claude":
+        anchor = parse_time(acc.get("subscription_created_at"))
+        if anchor is not None and anchor <= now:
+            period_start, _ = _monthly_cycle_from_anchor(anchor, now)
+            source = "claude_inferred_subscription"
+    elif provider == "xai":
+        billing = _xai_raw_from_row(row).get("billing") or {}
+        start = parse_time(billing.get("period_start"))
+        end = parse_time(billing.get("period_end"))
+        if start is not None and end is not None and end > start:
+            period_start = start
+        elif billing.get("period_type") == "USAGE_PERIOD_TYPE_WEEKLY" and start is not None:
+            period_start = start
+        if period_start is not None:
+            source = "xai_official_week"
+    elif provider == "cursor":
+        cursor = _cursor_raw_from_row(row)
+        start = parse_time(acc.get("billing_cycle_start") or cursor.get("billing_cycle_start"))
+        if start is not None:
+            period_start = start
+            source = "cursor_official_billing"
+
+    if period_start is None:
+        return _natural_month_local_period(now)
+    labels = {
+        "openai": ("套餐本期", "本期", "套餐本期使用统计", "account-period"),
+        "claude": ("套餐本期", "本期", "套餐本期使用统计", "account-period"),
+        "xai": ("本周", "本周", "本周使用统计", "7d"),
+        "cursor": ("账单本期", "账单本期", "账单本期使用统计", "account-period"),
+    }
+    usage_label, money_label, detail_title, stats_window = labels[provider]
+    return {
+        "since": period_start.timestamp(),
+        "usage_label": usage_label,
+        "money_label": money_label,
+        "detail_title": detail_title,
+        "stats_window": stats_window,
+        "source": source,
+    }
+
+
 # Telegram HTML 会移除行首普通空格、Tab 和全角空格；子级行必须用 NBSP。
 # 5h/7d 列表与详情均恢复真机校准后的七格缩进。
 _USAGE_DETAIL_INDENT_LIST = "\u00a0" * 7
@@ -1005,6 +1120,79 @@ def _fmt_credit_amount(v) -> str:
     if abs(x - int(x)) < 1e-9:
         return f"{int(x):,}"
     return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict | None:
+    """Estimate one full weekly OAuth quota from this week's local usage.
+
+    The denominator is strictly the provider's shared seven-day/weekly quota
+    percentage.  The numerator is the matching ``WINDOW_STATS`` 7d snapshot;
+    monthly totals and 5h/30d percentages must never enter this calculation.
+    """
+    if oauth_manager.provider_of(account_key) not in {"claude", "openai", "xai"}:
+        return None
+    row = state_db.quota_load(account_key) if row is None else row
+    if not isinstance(row, dict):
+        return None
+    try:
+        used_percent = float(row.get("seven_day_util"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(used_percent) or used_percent <= 0 or used_percent > 100:
+        return None
+
+    stats = menu_cache.WINDOW_STATS.peek(
+        _window_stats_cache_key(account_key, "7d")
+    ).value
+    if not isinstance(stats, dict):
+        return None
+    prompt = ui.prompt_total(
+        stats.get("input") or 0,
+        stats.get("cache_creation") or 0,
+        stats.get("cache_read") or 0,
+    )
+    used_tokens = prompt + int(stats.get("output") or 0)
+    if used_tokens <= 0:
+        return None
+
+    denominator = Decimal(str(used_percent))
+    projected_tokens = int(
+        (Decimal(used_tokens) * Decimal(100) / denominator).to_integral_value(
+            rounding=ROUND_HALF_UP,
+        )
+    )
+    result = {"tokens": projected_tokens, "cost_text": None}
+
+    pricing_cfg = config.get().get("pricing", {})
+    pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
+        pricing_cfg.get("enabled", True)
+    )
+    try:
+        cost_ticks = max(0, int(stats.get("cost_ticks") or 0))
+        costed_success = max(0, int(stats.get("costed_success") or 0))
+    except (TypeError, ValueError, OverflowError):
+        cost_ticks = costed_success = 0
+    if pricing_enabled and (cost_ticks > 0 or costed_success > 0):
+        projected_ticks = int(
+            (Decimal(cost_ticks) * Decimal(100) / denominator).to_integral_value(
+                rounding=ROUND_HALF_UP,
+            )
+        )
+        result["cost_text"] = ui.fmt_cost({"cost_ticks": projected_ticks})
+    return result
+
+
+def _format_period_cost_with_week_projection(account_key: str, period_stats: dict | None,
+                                                money_label: str) -> str:
+    """Render the account-period amount plus the strictly weekly projection."""
+    line = f"💵 {money_label} {ui.fmt_cost(period_stats)}"
+    projection = _weekly_quota_projection(account_key)
+    if projection is None:
+        return line
+    line += f" · 周额度预测：{ui.fmt_tokens(projection['tokens'])}"
+    if projection.get("cost_text"):
+        line += f" · {projection['cost_text']}"
+    return line
 
 
 def _antigravity_raw_from_row(row: dict | None) -> dict:
@@ -1321,32 +1509,39 @@ def _format_xai_official_block(account_key: str, *, detail: bool = False) -> str
 
 def _format_xai_spend_block(account_key: str, *, detail: bool = False,
                             month_stats: dict | None = None,
+                            period: dict | None = None,
                             stats_loading: bool = False) -> str:
-    """Grok/xAI OAuth 本地花费块。
-
-    只展示 Parrot 本地上游尝试累计的金额与 Token，不做预算、进度条或
-    百分比；不同结算来源在界面中统一合并为一个金额。
-    """
-    ck = f"oauth:{account_key}"
-    since_ts = _this_month_start_ts()
+    """Grok/xAI OAuth 本地花费块，严格跟随官方当前 usage period。"""
+    row = state_db.quota_load(account_key)
+    period = period or _oauth_local_period(account_key, row=row)
     pricing_cfg = config.get().get("pricing", {})
     pricing_enabled = not isinstance(pricing_cfg, dict) or bool(
         pricing_cfg.get("enabled", True)
     )
     if month_stats is None:
-        snapshot = menu_cache.PERIOD_STATS.peek(("period", int(since_ts))).value or {}
-        month_stats = (snapshot.get("by_channel") or {}).get(ck)
+        snapshot = None
+        if not period.get("stats_window"):
+            snapshot = menu_cache.PERIOD_STATS.peek(
+                ("period", int(period["since"]))
+            ).value or {}
+        month_stats = _account_period_stats(
+            account_key, period, month_snapshot=snapshot,
+        )
     month = month_stats or {}
     prompt = ui.prompt_total(month.get("input") or 0, month.get("cache_creation") or 0, month.get("cache_read") or 0)
     output = int(month.get("output") or 0)
     cache_read = int(month.get("cache_read") or 0)
 
-    money_line = (
-        f"💵 本地计费: {ui.fmt_cost(month)}"
-        if pricing_enabled
-        else "💵 本地计费: 已关闭"
-    )
-    usage_line = f"💎 本地月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
+    if detail:
+        money_line = (
+            f"💵 {period['money_label']}: {ui.fmt_cost(month)}"
+            if pricing_enabled else f"💵 {period['money_label']}: 已关闭"
+        )
+    else:
+        money_line = _format_period_cost_with_week_projection(
+            account_key, month, period["money_label"],
+        )
+    usage_line = f"💎 {period['usage_label']}: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(output)}"
     if cache_read > 0:
         usage_line += f" · {ui.fmt_cache_phrase(cache_read, prompt)}"
 
@@ -1505,6 +1700,19 @@ def _window_stats_cache_key(account_key: str, window_name: str) -> tuple:
     return "oauth-window", account_key, window_name
 
 
+def _account_period_stats(account_key: str, period: dict, *,
+                          month_snapshot: dict | None = None) -> dict | None:
+    """Read the cached local aggregate matching ``period`` exactly."""
+    stats_window = period.get("stats_window")
+    if stats_window:
+        value = menu_cache.WINDOW_STATS.peek(
+            _window_stats_cache_key(account_key, str(stats_window))
+        ).value
+        return value if isinstance(value, dict) else None
+    value = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{account_key}")
+    return value if isinstance(value, dict) else None
+
+
 def _window_usage_detail(account_key: str, since_ts: float, indent: str,
                          window_name: str, stats: dict | None = None, *,
                          stats_loading: bool = False) -> Optional[str]:
@@ -1529,7 +1737,7 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str,
         parts.append(ui.fmt_cache_phrase(s["cache_read"], prompt))
     if s.get("avg_tps") is not None:
         parts.append(f"均 {ui.fmt_tps(s.get('avg_tps'))}")
-    if oauth_manager.provider_of(account_key) in {"claude", "openai"}:
+    if oauth_manager.provider_of(account_key) in {"claude", "openai", "xai"}:
         parts.append(ui.fmt_cost(s, decimal_places=3))
     return indent + " · ".join(parts)
 
@@ -1557,6 +1765,10 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     prov_tag = " " + _provider_tag(prov) if prov else ""
     lines = [f"{icon} <code>{ui.escape_html(email)}</code>{prov_tag}{tag}"]
     row = state_db.quota_load(ak)
+    local_period = _oauth_local_period(acc, row=row)
+    period_stats = _account_period_stats(
+        ak, local_period, month_snapshot=month_snapshot,
+    )
 
     # 套餐行
     if prov == "openai":
@@ -1607,9 +1819,17 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         lines.extend(_format_cursor_usage_block(ak, detail=False).splitlines())
     elif prov == "xai":
         lines.extend(_format_xai_official_block(ak, detail=False).splitlines())
-        month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{ak}")
+        if row and row.get("seven_day_util") is not None:
+            reset = row.get("seven_day_reset")
+            since_ts = _quota_window_since_ts(reset, 7 * 86400, now_ts=_now_ts)
+            detail_line = _window_usage_detail(
+                ak, since_ts, _USAGE_DETAIL_INDENT_LIST, "7d",
+            )
+            if detail_line:
+                lines.append(detail_line)
         lines.extend(_format_xai_spend_block(
-            ak, detail=False, month_stats=month_stats, stats_loading=stats_loading,
+            ak, detail=False, month_stats=period_stats, period=local_period,
+            stats_loading=stats_loading,
         ).splitlines())
     elif prov == "antigravity":
         lines.extend(_format_antigravity_credits_block(ak, detail=False).splitlines())
@@ -1660,12 +1880,13 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         else:
             lines.append("📊 用量: <i>尚未获取</i>")
 
-    # 月度统计来自所有菜单共享的一次批量快照。
-    ts = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{ak}")
+    # 本地累计严格使用该账户的实际/推定周期；无统一 Provider 周期时才保留
+    # 明确标注的“本地自然月”，不再把自然月冒充套餐或账单周期。
+    ts = period_stats
     if prov == "antigravity":
         if _has_local_usage_or_billing(ts):
             prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
-            stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
+            stat_line = f"💎 {local_period['usage_label']}: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
             if (ts.get("cache_read") or 0) > 0:
                 stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
             lines.append(stat_line)
@@ -1675,12 +1896,12 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                     f"峰值 {ui.fmt_tps(ts.get('max_tps'))} · "
                     f"最低 {ui.fmt_tps(ts.get('min_tps'))}"
                 )
-            lines.append(f"💵 {ui.fmt_cost(ts)}")
+            lines.append(f"💵 {local_period['money_label']} {ui.fmt_cost(ts)}")
         else:
-            lines.append("💎 月度: <i>暂无本地请求</i>")
+            lines.append(f"💎 {local_period['usage_label']}: <i>暂无本地请求</i>")
     elif prov != "xai" and _has_local_usage_or_billing(ts):
         prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
-        stat_line = f"💎 月度: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
+        stat_line = f"💎 {local_period['usage_label']}: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
         if (ts.get("cache_read") or 0) > 0:
             stat_line += f" · {ui.fmt_cache_phrase(ts['cache_read'], prompt)}"
         lines.append(stat_line)
@@ -1693,9 +1914,13 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         if prov == "cursor":
             # 列表只展示真实可用的本地金额；“未计价”属于诊断状态，留在详情页。
             if int(ts.get("actual_costed_success") or 0) > 0:
-                lines.append(f"💵 {_format_cursor_local_cost(ts)}")
+                lines.append(
+                    f"💵 {local_period['money_label']} {_format_cursor_local_cost(ts)}"
+                )
         else:
-            lines.append(f"💵 {ui.fmt_cost(ts)}")
+            lines.append(_format_period_cost_with_week_projection(
+                ak, ts, local_period["money_label"],
+            ))
 
     # 冷却状态
     from ... import cooldown as _cd
@@ -1717,16 +1942,21 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
 def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
                         stats_loading: bool = False) -> str:
     provider = oauth_manager.provider_of(account_key)
+    row = state_db.quota_load(account_key)
+    account = oauth_manager.get_account(account_key) or account_key
+    local_period = _oauth_local_period(account, row=row)
+    period_stats = _account_period_stats(
+        account_key, local_period, month_snapshot=month_snapshot,
+    )
     if provider == "cursor":
         return _format_cursor_usage_block(account_key, detail=True)
     if provider == "antigravity":
         return _format_antigravity_credits_block(account_key, detail=True)
     if provider == "xai":
-        month_stats = ((month_snapshot or {}).get("by_channel") or {}).get(f"oauth:{account_key}")
         return _format_xai_official_block(account_key, detail=True) + "\n\n" + _format_xai_spend_block(
-            account_key, detail=True, month_stats=month_stats, stats_loading=stats_loading,
+            account_key, detail=True, month_stats=period_stats, period=local_period,
+            stats_loading=stats_loading,
         )
-    row = state_db.quota_load(account_key)
     if not row:
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
 
@@ -2371,6 +2601,13 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
     for account in accounts:
         account_key = _account_key(account)
         row = state_db.quota_load(account_key)
+        local_period = _oauth_local_period(account, row=row)
+        if local_period.get("stats_window") == "account-period":
+            specs.append((
+                _window_stats_cache_key(account_key, "account-period"),
+                account_key,
+                float(local_period["since"]),
+            ))
         if not row:
             continue
         for window_name, util_key, reset_key, seconds in (
@@ -2380,6 +2617,12 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
             if row.get(util_key) is None:
                 continue
             since = _quota_window_since_ts(row.get(reset_key), seconds, now_ts=now_ts)
+            if window_name == "7d" and oauth_manager.provider_of(account_key) == "xai":
+                billing = (_xai_raw_from_row(row).get("billing") or {})
+                if billing.get("period_type") == "USAGE_PERIOD_TYPE_WEEKLY":
+                    period_start = _parse_iso(billing.get("period_start"))
+                    if period_start is not None:
+                        since = period_start.timestamp()
             specs.append((
                 _window_stats_cache_key(account_key, window_name), account_key, since,
             ))
@@ -2387,7 +2630,7 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
 
 
 def refresh_window_snapshots_now() -> bool:
-    """由唯一统计调度线程同步刷新所有 OAuth 5h/7d 本地明细。"""
+    """由唯一统计调度线程刷新 OAuth quota 窗口与账户周期累计。"""
     ok = True
     for key, account_key, since in _oauth_window_specs(oauth_manager.list_accounts()):
         ok = menu_cache.WINDOW_STATS.refresh_now(
@@ -2400,7 +2643,7 @@ def refresh_window_snapshots_now() -> bool:
 
 
 def _request_window_snapshots(accounts: list[dict]) -> bool:
-    """请求缺失/过期窗口快照，并返回旧页面所需快照是否均已存在。"""
+    """请求缺失/过期的 quota/账户周期快照，并返回是否均已存在。"""
     ready = True
     for key, account_key, since in _oauth_window_specs(accounts):
         cached = menu_cache.WINDOW_STATS.peek(key)
@@ -2428,7 +2671,7 @@ def _list_snapshot_ready() -> bool:
     since = _this_month_start_ts()
     if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
         return False
-    # OAuth 列表原来显示的 5h/7d 本地 Token、缓存、TPS、金额是页面必需内容，
+    # 5h/7d 与账户本期 Token、缓存、TPS、金额都是页面必需内容，
     # 不能因为快照尚未预热就静默删行。
     return _request_window_snapshots(oauth_manager.list_accounts())
 
@@ -2749,17 +2992,21 @@ def _format_month_stats_block(account_key: str, *,
                               month_snapshot: dict | None = None,
                               by_model: list[dict] | None = None,
                               stats_loading: bool = False) -> str:
-    """本月使用统计：总体来自共享快照，模型明细来自后台对象缓存。"""
-    ck = f"oauth:{account_key}"
-    since_ts = _this_month_start_ts()
-    if month_snapshot is None:
+    """账户周期使用统计：总体与按模型明细必须使用同一个起点。"""
+    account = oauth_manager.get_account(account_key) or account_key
+    row = state_db.quota_load(account_key)
+    local_period = _oauth_local_period(account, row=row)
+    since_ts = float(local_period["since"])
+    if month_snapshot is None and not local_period.get("stats_window"):
         month_snapshot = menu_cache.PERIOD_STATS.peek(
             ("period", int(since_ts))
         ).value
-    overall = (((month_snapshot or {}).get("by_channel") or {}).get(ck))
+    overall = _account_period_stats(
+        account_key, local_period, month_snapshot=month_snapshot,
+    )
     if not _has_local_usage_or_billing(overall):
         if oauth_manager.provider_of(account_key) == "antigravity":
-            return "\n<b>⚡ 本月使用统计</b>\n<i>暂无本地请求</i>"
+            return f"\n<b>⚡ {local_period['detail_title']}</b>\n<i>暂无本地请求</i>"
         return ""
     is_cursor = oauth_manager.provider_of(account_key) == "cursor"
     model_loading = False
@@ -2781,7 +3028,7 @@ def _format_month_stats_block(account_key: str, *,
 
     lines = [
         "",
-        "<b>⚡ 本月使用统计</b>",
+        f"<b>⚡ {local_period['detail_title']}</b>",
         f"总体: {total} 次 · ✅ {succ} · ❌ {err}",
         token_line,
         f"平均 {ui.fmt_tps(overall.get('avg_tps'))} · "
@@ -2993,46 +3240,81 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
 def _render_cached_detail(account_key: str, page: int, filter_key: str,
                           *, refresh_quota: bool = False) -> tuple[Optional[str], Optional[dict]]:
-    since = _this_month_start_ts()
-    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    account = oauth_manager.get_account(account_key) or account_key
+    row = state_db.quota_load(account_key)
+    local_period = _oauth_local_period(account, row=row)
+    since = float(local_period["since"])
+    natural = menu_cache.PERIOD_STATS.peek(("period", int(_this_month_start_ts())))
     models = menu_cache.DETAIL_STATS.peek(("oauth-model", account_key, int(since)))
+    aggregate = _account_period_stats(
+        account_key, local_period, month_snapshot=natural.value,
+    )
     return _detail_text_and_kb(
         account_key, page=page, filter_key=filter_key,
         refresh_quota=refresh_quota,
-        month_snapshot=period.value,
+        month_snapshot=natural.value,
         model_stats=models.value,
-        stats_loading=period.value is None or models.value is None,
+        stats_loading=aggregate is None or models.value is None,
     )
 
 
 def _queue_oauth_detail_stats(account_key: str) -> bool:
-    """把缺失/过期的低频详情排入中央队列；返回当前是否已有完整值。"""
-    since = _this_month_start_ts()
-    period_key = ("period", int(since))
-    if menu_cache.PERIOD_STATS.peek(period_key).value is None:
+    """把账户周期总体/按模型统计排入中央队列；返回快照是否完整。"""
+    account = oauth_manager.get_account(account_key)
+    if account is None:
         return False
+    row = state_db.quota_load(account_key)
+    local_period = _oauth_local_period(account, row=row)
+    since = float(local_period["since"])
 
-    ready = True
+    ready = _request_window_snapshots([account])
+    natural_snapshot = None
+    if not local_period.get("stats_window"):
+        natural_key = ("period", int(_this_month_start_ts()))
+        natural_snapshot = menu_cache.PERIOD_STATS.peek(natural_key).value
+        if natural_snapshot is None:
+            ready = False
+    channel_stats = _account_period_stats(
+        account_key, local_period, month_snapshot=natural_snapshot,
+    )
+    # A shared natural-month snapshot with no channel row is a complete empty
+    # result. Dedicated per-account windows, however, must materialize a dict.
+    aggregate_ready = (
+        channel_stats is not None
+        if local_period.get("stats_window")
+        else natural_snapshot is not None
+    )
+    if not aggregate_ready:
+        ready = False
+    total_calls = int((channel_stats or {}).get("total") or 0)
+
     model_key = ("oauth-model", account_key, int(since))
     model = menu_cache.DETAIL_STATS.peek(model_key)
-    channel_stats = (
-        (menu_cache.PERIOD_STATS.peek(period_key).value or {}).get("by_channel") or {}
-    ).get(f"oauth:{account_key}")
-    if model.value is None and not int((channel_stats or {}).get("total") or 0):
-        # 本月无调用时，旧详情中的按模型统计完整结果就是空列表。
+    if model.value is None and aggregate_ready and total_calls == 0:
+        # 只有总体快照已明确证明本期无调用时，空模型列表才是完整结果。
+        # 冷启动时 aggregate 尚未就绪，绝不能用 [] 污染五分钟模型缓存。
         menu_cache.DETAIL_STATS.store(model_key, [])
         model = menu_cache.DETAIL_STATS.peek(model_key)
-    if model.value is None:
+
+    invalid_empty = (
+        total_calls > 0
+        and isinstance(model.value, list)
+        and not model.value
+    )
+    if model.value is None or invalid_empty:
         ready = False
-    if not model.fresh:
+    if invalid_empty or (
+        not model.fresh
+        and (model.value is not None or (aggregate_ready and total_calls > 0))
+    ):
         menu_cache.DETAIL_STATS.request(
             model_key,
-            lambda: log_db.channel_model_stats(f"oauth:{account_key}", since_ts=since),
+            lambda start=since: log_db.channel_model_stats(
+                f"oauth:{account_key}", since_ts=start,
+            ),
+            # 修复旧进程/早点击留下的新鲜空缓存；有总体调用时 [] 不可能是完整模型结果。
+            force=invalid_empty,
         )
-
-    account = oauth_manager.get_account(account_key)
-    if not _request_window_snapshots([account] if account else []):
-        ready = False
     return ready
 
 
@@ -3041,12 +3323,8 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1
     if ak is None or oauth_manager.get_account(ak) is None:
         ui.answer_cb(cb_id, "账户已不存在，请返回重试")
         return
-    since = _this_month_start_ts()
-    if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
-    # 旧详情中的按模型统计及 5h/7d 本地明细都是既有内容，不允许在
-    # 冷快照时先渲染一个删减版页面。查询仍只排入中央串行调度器。
+    # 详情中的账户周期总体、按模型统计及 5h/7d 本地明细必须同时就绪；
+    # 冷快照时不先渲染一个口径不完整的页面。查询仍只排入中央串行调度器。
     if not _queue_oauth_detail_stats(ak):
         ui.answer_cb(cb_id, menu_cache.initialization_text())
         return

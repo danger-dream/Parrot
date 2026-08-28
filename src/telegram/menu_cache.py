@@ -328,7 +328,8 @@ PERIOD_STATS = SWRCache(60.0)
 LIFETIME_STATS = SWRCache(120.0)
 # 账户/渠道/Key 的按模型明细变化频率低，后台每 5 分钟统一刷新。
 DETAIL_STATS = SWRCache(300.0)
-# OAuth 5h/7d 本地窗口随时间滚动，单独按 60 秒维护，不能与模型明细共用 TTL。
+# OAuth quota 窗口及账户套餐/账单周期累计随时间变化，单独按 60 秒维护，
+# 不能与模型明细共用 TTL。
 WINDOW_STATS = SWRCache(60.0)
 HISTORY_TOTALS = SWRCache(300.0)
 BACKGROUND_JOBS = SWRCache(60.0)
@@ -363,7 +364,7 @@ def _refresh_lifetime() -> bool:
 
 
 def _refresh_oauth_windows() -> bool:
-    """主动维护 OAuth 列表/详情原有的 5h、7d 本地 Token 与金额行。"""
+    """主动维护 OAuth quota 窗口与账户周期 Token/金额快照。"""
     from .menus import oauth_menu
 
     return oauth_menu.refresh_window_snapshots_now()
@@ -384,8 +385,9 @@ def _queue_model_detail_snapshots() -> bool:
     这里只发现任务并入队，不执行 SQL、不创建线程。真正的查询仍由同一个
     ``tg-stats-scheduler`` 在后续循环中逐个串行执行。
     """
-    from .. import config, log_db, oauth_manager
+    from .. import config, log_db, oauth_manager, state_db
     from ..oauth_ids import account_key as oauth_account_key
+    from .menus import oauth_menu
 
     since = month_start_ts()
     period = PERIOD_STATS.peek(("period", int(since))).value
@@ -398,13 +400,43 @@ def _queue_model_detail_snapshots() -> bool:
     def _has_calls(stats: Any) -> bool:
         return isinstance(stats, dict) and int(stats.get("total") or 0) > 0
 
-    # OAuth 账户与 API 渠道都使用 channel_model_stats；无本月调用时直接存空
-    # 结果，保持旧页面“完整但无统计行”的语义，同时避免无意义查询。
-    channel_keys: list[str] = []
+    # OAuth 详情必须按各账号自己的 provider/billing 周期预热；不能继续
+    # 沿用自然月 key，否则首次进入详情会显示另一统计口径或等待二次点击。
     for account in oauth_manager.list_accounts():
-        key = oauth_account_key(account)
-        if key:
-            channel_keys.append(f"oauth:{key}")
+        account_key = oauth_account_key(account)
+        if not account_key:
+            continue
+        try:
+            row = state_db.quota_load(account_key)
+        except RuntimeError:
+            # Test/bootstrap callers may start the stats scheduler before the
+            # durable state store; account metadata can still resolve a period.
+            row = {}
+        local_period = oauth_menu._oauth_local_period(account, row=row)
+        account_since = float(local_period["since"])
+        key = ("oauth-model", account_key, int(account_since))
+        account_stats = oauth_menu._account_period_stats(
+            account_key, local_period, month_snapshot=period,
+        )
+        if account_stats is None and local_period.get("stats_window"):
+            # The higher-priority OAuth-window job will populate the aggregate;
+            # do not cache a false empty model result before that happens.
+            continue
+        if not _has_calls(account_stats):
+            DETAIL_STATS.store(key, [])
+            continue
+        cached_models = DETAIL_STATS.peek(key).value
+        DETAIL_STATS.request(
+            key,
+            lambda target=account_key, start=account_since: log_db.channel_model_stats(
+                f"oauth:{target}", since_ts=start,
+            ),
+            # 总体已有调用时，空模型列表只能是冷启动竞态留下的无效快照。
+            force=isinstance(cached_models, list) and not cached_models,
+        )
+
+    # Ordinary API channels remain natural-month reports.
+    channel_keys: list[str] = []
     for channel in config.get().get("channels") or []:
         if not isinstance(channel, dict):
             continue
@@ -418,10 +450,6 @@ def _queue_model_detail_snapshots() -> bool:
             continue
         seen_channels.add(channel_key)
         key = ("channel-model", channel_key, int(since))
-        # OAuth 菜单沿用既有 oauth-model key；渠道菜单沿用 channel-model key。
-        if channel_key.startswith("oauth:"):
-            account_key = channel_key[len("oauth:"):]
-            key = ("oauth-model", account_key, int(since))
         if not _has_calls(by_channel.get(channel_key)):
             DETAIL_STATS.store(key, [])
             continue

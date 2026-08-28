@@ -463,7 +463,7 @@ def test_xai_list_plan_omits_code_badge_but_detail_keeps_access(m):
     assert "Grok Code 可用" in detail
 
 
-def test_xai_weekly_official_block_and_local_monthly_label(m):
+def test_xai_weekly_official_block_and_local_week_label(m):
     _setup(m)
     account_key = "xai:render-sub"
     raw = {
@@ -500,8 +500,9 @@ def test_xai_weekly_official_block_and_local_monthly_label(m):
     assert "2026-08-13" in detail
     assert "0 / 0" not in summary + detail
     assert "月额度" not in summary + detail
-    assert "本地月度" in local
-    assert "本月经 Parrot" not in local
+    assert "💎 本周:" in local
+    assert "💵 本周 $0.00" in local
+    assert "月度" not in local
 
 
 def test_xai_missing_weekly_percent_means_unused(m):
@@ -730,7 +731,7 @@ def test_xai_cost_aggregation_from_sse_usage(m):
     text = m["oauth_menu"]._format_xai_spend_block(
         "xai:cost-sub", detail=True, month_stats=s,
     )
-    assert "💵 本地计费: $0.00" in text
+    assert "💵 自然月: $0.00" in text
     assert "实际" not in text and "估算" not in text and "未计价" not in text
     assert "缓存 128 (56.6%)" in text
     assert "≈" not in text
@@ -780,7 +781,7 @@ def test_xai_cost_disabled_does_not_read_response_body(m):
         text = m["oauth_menu"]._format_xai_spend_block(
             "xai:cost-disabled", detail=True
         )
-        assert "本地计费: 已关闭" in text
+        assert "自然月: 已关闭" in text
     finally:
         conn.set_trace_callback(None)
         m["config"].update(
