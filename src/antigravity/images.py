@@ -179,7 +179,7 @@ async def handle_image(parsed: Any, *, action: str, key_name: str, allowed_model
             if status == 200:
                 try: payload = _decode(json.loads(raw), model=model, response_format=parsed.response_format)
                 except Exception as exc: return errors.json_error_openai(502, errors.ErrTypeOpenAI.SERVER, str(exc))
-                cooldown.clear(key, model)
+                cooldown.clear_on_success(key, model)
                 return JSONResponse(payload)
             detail = raw.decode("utf-8", "replace")[:4000]
             last = errors.json_error_openai(status if 400 <= status < 600 else 502, errors.ErrTypeOpenAI.RATE_LIMIT if status == 429 else errors.ErrTypeOpenAI.SERVER, detail)

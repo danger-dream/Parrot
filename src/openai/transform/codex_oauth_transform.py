@@ -11,7 +11,7 @@
   - 删除 Responses API 里上游不支持的字段：max_output_tokens /
     max_completion_tokens / temperature / top_p / frequency_penalty /
     presence_penalty / prompt_cache_retention / user / metadata /
-    safety_identifier / stream_options
+    safety_identifier
   - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
@@ -24,8 +24,8 @@
     system role）
 
 工具调用续链会过滤 store=false 上游无法解析的 reasoning/item_reference/id，
-并规范化 call_id 与 tool_choice，避免
-ChatGPT internal Codex endpoint 把本地响应 ID 当成持久化引用去查。
+并规范化 tool_choice；call_id 是官方协议的不透明关联键，始终原样保留，
+避免 ChatGPT internal Codex endpoint 把本地响应 ID 当成持久化引用去查。
 
 历史：早期版本（v0.4.x ~ v0.5.x）维护过一张 _CODEX_MODEL_MAP 翻译表，
 把各种别名（gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等）映射到上游规范名，
@@ -63,13 +63,17 @@ _STRIP_FIELDS_FOR_CODEX = (
     "user",
     "metadata",
     "safety_identifier",
-    "stream_options",
     # `background=false` is semantically equivalent to the Codex synchronous
     # stream path; `background=true` is rejected before this transform.
     "background",
-    # OAuth Codex 强制 store=false，不能把 Responses 持久化引用直传给上游。
+    # OAuth Codex HTTP/SSE 强制 store=false，不能把 Responses 持久化引用直传
+    # 给上游。原生 Responses WebSocket v2 例外：官方协议用它续接同一条 WS。
     "previous_response_id",
 )
+
+_CODEX_TRANSPORT_HTTP = "http"
+_CODEX_TRANSPORT_WEBSOCKET = "websocket"
+_CODEX_TRANSPORTS = frozenset({_CODEX_TRANSPORT_HTTP, _CODEX_TRANSPORT_WEBSOCKET})
 
 
 def _is_empty_str(value: Any) -> bool:
@@ -372,14 +376,6 @@ def _needs_tool_continuation(body: dict) -> bool:
     return False
 
 
-def _fix_call_id_prefix(call_id: str) -> str:
-    if not call_id or call_id.startswith("fc"):
-        return call_id
-    if call_id.startswith("call_"):
-        return "fc" + call_id[len("call_"):]
-    return "fc_" + call_id
-
-
 def _normalize_codex_tool_role_messages(input_items: list[Any]) -> tuple[list[Any], bool]:
     """把 role=tool 的 message 规范成 function_call_output。"""
     modified = False
@@ -451,7 +447,12 @@ def _normalize_codex_message_content_text(input_items: list[Any]) -> tuple[list[
     return out, modified
 
 
-def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) -> list[Any]:
+def _filter_codex_input(
+    input_items: list[Any],
+    *,
+    preserve_references: bool,
+    preserve_reasoning_ids: bool = False,
+) -> list[Any]:
     filtered: list[Any] = []
     for item in input_items:
         if not isinstance(item, dict):
@@ -469,9 +470,11 @@ def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) ->
             if not (isinstance(enc, str) and enc.strip()):
                 continue
             rs = dict(item)
-            # store=false 上游不接受持久化 reasoning id / rs_* 引用，剥掉避免上游
-            # 按 ID 查持久化存储而 404；encrypted_content 自带续链信息，无需 id。
-            rs.pop("id", None)
+            # HTTP/SSE store=false 上游不接受持久化 reasoning id / rs_* 引用，
+            # 剥掉避免按 ID 查存储而 404。原生 WS v2 则保留官方 frame identity，
+            # 供同一连接内 previous_response_id 续接。
+            if not preserve_reasoning_ids:
+                rs.pop("id", None)
             filtered.append(rs)
             continue
 
@@ -498,10 +501,9 @@ def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) ->
                 call_id = _first_non_empty_string(new_item.get("id"))
                 if call_id:
                     new_item["call_id"] = call_id
-            if call_id:
-                fixed = _fix_call_id_prefix(call_id)
-                if fixed != call_id:
-                    new_item["call_id"] = fixed
+            # Responses call_id is an opaque correlation key.  In particular,
+            # values that don't start with ``fc`` must still link a call to its
+            # function_call_output exactly as supplied by the client/provider.
         else:
             new_item.pop("call_id", None)
 
@@ -519,7 +521,11 @@ def _filter_codex_input(input_items: list[Any], *, preserve_references: bool) ->
     return filtered
 
 
-def _normalize_codex_input(body: dict) -> bool:
+def _normalize_codex_input(
+    body: dict,
+    *,
+    preserve_references: bool = False,
+) -> bool:
     inp = body.get("input")
     if not isinstance(inp, list):
         return False
@@ -530,7 +536,8 @@ def _normalize_codex_input(body: dict) -> bool:
     modified = modified or changed
     filtered = _filter_codex_input(
         normalized,
-        preserve_references=_needs_tool_continuation(body),
+        preserve_references=(preserve_references or _needs_tool_continuation(body)),
+        preserve_reasoning_ids=preserve_references,
     )
     if filtered != inp:
         modified = True
@@ -538,31 +545,64 @@ def _normalize_codex_input(body: dict) -> bool:
     return modified
 
 
-def _apply_responses_lite_body(body: dict) -> None:
+def _has_responses_lite_input_prefix(raw_input: Any) -> bool:
+    """Return whether input already starts with the official Lite tools prefix."""
+    if not isinstance(raw_input, list) or not raw_input:
+        return False
+    first = raw_input[0]
+    return bool(
+        isinstance(first, dict)
+        and first.get("type") == "additional_tools"
+        and first.get("role") == "developer"
+    )
+
+
+def _apply_responses_lite_body(
+    body: dict,
+    *,
+    add_input_prefix: bool = True,
+    existing_prefix_is_authoritative: bool = False,
+) -> None:
     """Adapt Codex request body to official Responses Lite wire shape.
 
     Codex models.json marks GPT-5.6 variants with ``use_responses_lite=true``.
     The official client moves tools and instructions into developer input items,
     clears top-level instructions/tools, and disables parallel tool calls.
+
+    Native Responses WebSocket v2 frames are special: official Codex has already
+    built this prefix on a full/warmup frame, while an incremental frame refers to
+    it through ``previous_response_id``.  ``add_input_prefix=False`` therefore
+    retains the incremental input exactly. ``existing_prefix_is_authoritative``
+    makes only the explicit native-WS path idempotent; HTTP keeps its historical
+    transform behavior.
     """
     tools = body.pop("tools", None)
     if not isinstance(tools, list):
         tools = []
 
     instructions = body.get("instructions")
-    prefix: list[dict[str, Any]] = [
-        {"type": "additional_tools", "role": "developer", "tools": tools}
-    ]
-    if isinstance(instructions, str) and instructions.strip():
-        prefix.append({
-            "type": "message",
-            "role": "developer",
-            "content": [{"type": "input_text", "text": instructions}],
-        })
-
     _coerce_input_to_list(body)
     existing_input = body.get("input")
-    body["input"] = prefix + (existing_input if isinstance(existing_input, list) else [])
+    if not isinstance(existing_input, list):
+        existing_input = []
+
+    if add_input_prefix and not (
+        existing_prefix_is_authoritative
+        and _has_responses_lite_input_prefix(existing_input)
+    ):
+        prefix: list[dict[str, Any]] = [
+            {"type": "additional_tools", "role": "developer", "tools": tools}
+        ]
+        if isinstance(instructions, str) and instructions.strip():
+            prefix.append({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": instructions}],
+            })
+        body["input"] = prefix + existing_input
+    else:
+        body["input"] = existing_input
+
     body["instructions"] = ""
     body["parallel_tool_calls"] = False
     reasoning = body.get("reasoning")
@@ -578,6 +618,7 @@ def apply_codex_oauth_transform(
     resolved_model: str | None = None,
     session_key: str | None = None,
     default_instructions: str | None = None,
+    transport: str = _CODEX_TRANSPORT_HTTP,
 ) -> dict:
     """就地改造 body，返回同一对象。
 
@@ -587,7 +628,13 @@ def apply_codex_oauth_transform(
         transform **原样透传**给上游，不做任何别名映射。
       session_key: 历史兼容参数。v0.21.3 起 encrypted_content 只做透明透传，
         不再由 Parrot 维护本地 replay/backfill，因此这里不再使用。
+      transport: ``http`` 保持 OAuth store=false 的 HTTP/SSE 规则；
+        ``websocket`` 启用官方 Responses WebSocket v2 的续接语义。
     """
+    if transport not in _CODEX_TRANSPORTS:
+        raise ValueError(f"unsupported Codex Responses transport: {transport!r}")
+    native_responses_ws = transport == _CODEX_TRANSPORT_WEBSOCKET
+
     # 1) 模型名：**直接透传**。resolved_model 已由账号 supports_model 把关；
     #    不做任何别名/兜底映射，避免新模型未登记被错误降级。
     if resolved_model:
@@ -613,8 +660,11 @@ def apply_codex_oauth_transform(
         _inc = list(_inc) + ["reasoning.encrypted_content"]
     body["include"] = _inc
 
-    # 3) 剥不支持字段
+    # 3) 剥不支持字段。previous_response_id 只属于 HTTP/SSE store=false
+    # 限制；原生 WS v2 在同一连接内用它引用上一轮 response。
     for k in _STRIP_FIELDS_FOR_CODEX:
+        if native_responses_ws and k == "previous_response_id":
+            continue
         body.pop(k, None)
 
     # 4) legacy functions / function_call → tools / tool_choice
@@ -638,18 +688,38 @@ def apply_codex_oauth_transform(
         else:
             body["instructions"] = f"{orig}\n\n{sys_text}"
 
-    # 5.5) store=false 兼容：过滤 reasoning/item_reference/id，规范化 call_id。
-    _normalize_codex_input(body)
+    # 5.5) HTTP/SSE store=false 兼容：过滤持久化引用。原生 WS v2 的 item
+    # identity 属于连接内 previous_response_id 续接协议，必须保留。
+    _normalize_codex_input(body, preserve_references=native_responses_ws)
 
-    # 6) instructions 为空时注入一行稳定的兜底文本。
-    if _is_empty_str(body.get("instructions")):
+    # 6) instructions 为空时注入一行稳定的兜底文本。官方 Lite WS full
+    # frame 已把 instructions 放进 developer prefix；incremental frame 则通过
+    # previous_response_id 引用该 prefix。两者都不能再次注入默认 instructions。
+    responses_lite = codex_model_uses_responses_lite(body.get("model"))
+    lite_ws_incremental = bool(
+        native_responses_ws
+        and responses_lite
+        and _first_non_empty_string(body.get("previous_response_id"))
+    )
+    lite_ws_prefixed = bool(
+        native_responses_ws
+        and responses_lite
+        and _has_responses_lite_input_prefix(body.get("input"))
+    )
+    if _is_empty_str(body.get("instructions")) and not (
+        lite_ws_incremental or lite_ws_prefixed
+    ):
         body["instructions"] = (
             default_instructions.strip()
             if isinstance(default_instructions, str) and default_instructions.strip()
             else _DEFAULT_INSTRUCTIONS
         )
 
-    if codex_model_uses_responses_lite(body.get("model")):
-        _apply_responses_lite_body(body)
+    if responses_lite:
+        _apply_responses_lite_body(
+            body,
+            add_input_prefix=not lite_ws_incremental,
+            existing_prefix_is_authoritative=lite_ws_prefixed,
+        )
 
     return body

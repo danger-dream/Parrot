@@ -1,7 +1,7 @@
 """错误阶梯冷却：`(channel_key, model)` 独立计数。
 
 阶梯默认 [1, 3, 5, 10, 15, 0] 分钟；`0` = 永久拉黑（cooldown_until = -1）。
-连续失败 → 递进下一阶；成功一次 → 计数清零。
+连续失败 → 递进下一阶；普通请求成功会清理 grace/已到期错误，但不会提前解除仍生效的冷却。
 
 内存 + StateStore snapshots 双层。init() 启动时从 StateStore snapshots 恢复。
 """
@@ -90,7 +90,8 @@ def _grace_count(channel_key: str) -> int:
     """OAuth 渠道的"宽容次数"：前 N 次失败不入冷却，只累计计数。
 
     避免单 OAuth 账号因偶发 timeout 就被冷却（导致所有 Claude 模型不可用）。
-    第 N+1 次失败起按 errorWindows 阶梯。成功一次仍清零计数（沿用现有逻辑）。
+    第 N+1 次失败起按 errorWindows 阶梯。普通成功会清理 grace 计数；若已进入
+    active cooldown，则保留到自然到期，避免在途成功提前重开渠道。
     API 渠道不启用 grace（失败第一次就进冷却）。
     """
     if channel_key.startswith("oauth:"):
@@ -260,6 +261,36 @@ def _was_actively_blocked(state: dict, now: int) -> bool:
     if cd is None:
         return False
     return cd == _INF or cd > now
+
+
+def clear_on_success(channel_key: str, model: str) -> bool:
+    """Silently clear non-blocking error state after an ordinary request success.
+
+    A request that succeeds while a cooldown is still active was already in
+    flight before that cooldown committed.  It is not proof that the rate or
+    health incident recovered, so it must neither reopen the channel early nor
+    emit ``channel_recovered``.  Grace-only and naturally expired entries are
+    safe to remove; an explicit recovery probe or operator action must use
+    :func:`clear` to override an active cooldown.
+
+    Returns ``True`` only when an existing non-blocking entry was removed.
+    """
+    now = _now_ms()
+    with _lock:
+        if channel_state.is_deleted(channel_key):
+            return False
+        channel_key = channel_state.resolve(channel_key)
+        if channel_state.is_deleted(channel_key):
+            return False
+        key = (channel_key, model)
+        entry = _entries.get(key)
+        if entry is None or _was_actively_blocked(entry, now):
+            return False
+        # Keep the same DB-before-memory commit ordering as clear().
+        with state_db.optional_write_timeout():
+            state_db.error_delete(channel_key, model)
+        _entries.pop(key, None)
+        return True
 
 
 def clear(channel_key: str, model: Optional[str] = None, *,

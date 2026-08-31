@@ -18,6 +18,7 @@ from .. import blacklist
 from ..protocols import errors as protocol_errors
 from ..protocols.runtime import (
     connection_lifecycle_outcome,
+    is_responses_ws_dispatch_commit_event_type,
     is_responses_ws_visible_event_type,
     is_retryable_responses_ws_error_before_accept,
     parse_wrapped_responses_ws_error,
@@ -128,6 +129,10 @@ class ResponsesWsPreVisibleResult:
     http_status: Optional[int] = None
     first_packet_ms: Optional[int] = None
     stream_started: bool = False
+    # Dispatch commitment is independent from user-visible output. In
+    # particular, response.created commits the logical request without becoming
+    # visible_frame.
+    dispatch_committed: bool = False
     closed_after_accept: bool = False
     ok: bool = False
 
@@ -143,8 +148,18 @@ class ResponsesWsReadStep:
     skip_downstream: bool = False
     response_completed: bool = False
     response_failed: bool = False
+    response_incomplete: bool = False
     close_code: int = 1000
     close_reason: str = ""
+
+
+def _connection_closed_code(exc: websockets.ConnectionClosed) -> int:
+    """Return the peer close code, preserving abnormal 1006 without rcvd."""
+    if exc.rcvd is not None:
+        return int(exc.rcvd.code)
+    # websockets represents an abnormal/no-frame closure with rcvd=None; avoid
+    # the deprecated ConnectionClosed.code compatibility property.
+    return 1006
 
 
 def socks5h_url(url: str) -> str:
@@ -406,6 +421,12 @@ async def read_until_first_responses_ws_visible_event(
         pending_bytes += size
         return True
 
+    def preserve_dispatch_commit() -> None:
+        if result.dispatch_committed:
+            # Existing callers use closed_after_accept as their no-failover
+            # boundary. Keep it set while retaining the independent fact above.
+            result.closed_after_accept = True
+
     while True:
         try:
             data = await _next_nonempty_ws_frame(
@@ -414,16 +435,18 @@ async def read_until_first_responses_ws_visible_event(
         except BusinessTimeoutError as exc:
             result.outcome = exc.outcome
             result.error_detail = exc.outcome
+            preserve_dispatch_commit()
             return result
         except asyncio.TimeoutError:
             # Compatibility fallback for callers not yet supplying a round.
             result.outcome = "transport_timeout"
             result.error_detail = "websocket transport timeout before first frame"
+            preserve_dispatch_commit()
             return result
         except websockets.ConnectionClosed as exc:
             if timing is not None:
                 timing.mark_io_complete()
-            close_code = int(exc.rcvd.code if exc.rcvd else 1000)
+            close_code = _connection_closed_code(exc)
             if close_code == 1009:
                 result.outcome = "request_invalid"
                 result.http_status = 413
@@ -438,6 +461,7 @@ async def read_until_first_responses_ws_visible_event(
                 result.error_detail = f"upstream websocket closed: {exc}"
             result.close_code = close_code
             result.close_reason = str(exc.rcvd.reason if exc.rcvd else "")
+            preserve_dispatch_commit()
             return result
 
         if result.first_packet_ms is None and timing is not None:
@@ -451,6 +475,10 @@ async def read_until_first_responses_ws_visible_event(
             # response body for usage/service-tier/actual-cost extraction.
             event_type = ws_event_type(data)
             tracker.feed_text(data)
+            # response.created proves the upstream accepted and instantiated this
+            # logical request, but remains metadata buffered from the client.
+            if is_responses_ws_dispatch_commit_event_type(event_type) and not is_responses_ws_visible_event_type(event_type):
+                result.dispatch_committed = True
 
             if parse_wrapped_errors:
                 maybe_error = parse_wrapped_responses_ws_error(data)
@@ -460,12 +488,15 @@ async def read_until_first_responses_ws_visible_event(
                     result.error_code = str(maybe_error.get("code") or "") or None
                     result.error_detail = maybe_error.get("message") or data[:2000]
                     if (
-                        commit_retryable_errors
+                        result.dispatch_committed
+                        or commit_retryable_errors
                         or not is_retryable_responses_ws_error_before_accept(maybe_error)
                     ):
                         if not append_pending(data):
+                            preserve_dispatch_commit()
                             return result
                         result.closed_after_accept = True
+                    preserve_dispatch_commit()
                     return result
 
             if getattr(tracker, "response_failed", False):
@@ -473,13 +504,20 @@ async def read_until_first_responses_ws_visible_event(
                     timing.mark_io_complete()
                 result.outcome = "stream_upstream_error" if event_type == "response.failed" else "upstream_error_json"
                 result.error_code = getattr(tracker, "stream_error_code", None)
+                if getattr(tracker, "request_failed", False):
+                    result.outcome = "request_rejected"
+                    result.http_status = 400
                 if use_tracker_error_detail:
                     result.error_detail = getattr(tracker, "stream_error_message", None) or data[:2000]
                 else:
                     status, detail = responses_ws_error_detail(data)
                     result.http_status = status
                     result.error_detail = detail
-                if getattr(tracker, "stream_error_code", None) == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE:
+                is_context_error = (
+                    getattr(tracker, "stream_error_code", None)
+                    == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
+                )
+                if is_context_error:
                     result.outcome = "request_invalid"
                     result.http_status = 400
                     result.error_detail = (
@@ -487,10 +525,32 @@ async def read_until_first_responses_ws_visible_event(
                         or protocol_errors.responses_max_output_context_error_message()
                     )
                 if event_type == "response.failed":
+                    result.dispatch_committed = True
+                if event_type == "response.failed" or (
+                    result.dispatch_committed and not is_context_error
+                ):
                     if not append_pending(data):
+                        preserve_dispatch_commit()
                         return result
-                    result.stream_started = True
+                    result.stream_started = event_type == "response.failed"
                     result.closed_after_accept = True
+                preserve_dispatch_commit()
+                return result
+
+            if getattr(tracker, "response_incomplete", False):
+                if timing is not None:
+                    timing.mark_io_complete()
+                result.outcome = "response_incomplete"
+                result.http_status = 400
+                reason = protocol_errors.responses_incomplete_reason(
+                    getattr(tracker, "last_event", None)
+                )
+                result.error_detail = f"response incomplete: {reason or 'unknown reason'}"
+                result.dispatch_committed = True
+                if not append_pending(data):
+                    preserve_dispatch_commit()
+                    return result
+                result.closed_after_accept = True
                 return result
 
             if is_responses_ws_visible_event_type(event_type):
@@ -498,27 +558,36 @@ async def read_until_first_responses_ws_visible_event(
                 if bl_hit:
                     result.outcome = "blacklist_hit"
                     result.error_detail = f"blacklist: {bl_hit}"
+                    preserve_dispatch_commit()
                     return result
+                result.dispatch_committed = True
                 if not append_pending(data):
+                    preserve_dispatch_commit()
                     return result
                 result.visible_frame = data
+                result.closed_after_accept = True
                 return result
 
             if not append_pending(data):
+                preserve_dispatch_commit()
                 return result
             if getattr(tracker, "response_completed", False):
                 if timing is not None:
                     timing.mark_io_complete()
                 result.ok = True
                 result.outcome = "success"
+                result.dispatch_committed = True
                 result.closed_after_accept = True
                 return result
         else:
             # Binary frames are real downstream payload. They cannot be inspected
             # by the text blacklist, but they define the irreversible boundary.
+            result.dispatch_committed = True
             if not append_pending(data):
+                preserve_dispatch_commit()
                 return result
             result.visible_frame = data
+            result.closed_after_accept = True
             return result
 
 
@@ -558,7 +627,7 @@ async def read_next_responses_ws_step(
     except websockets.ConnectionClosed as exc:
         if timing is not None:
             timing.mark_io_complete()
-        close_code = int(exc.rcvd.code if exc.rcvd else 1000)
+        close_code = _connection_closed_code(exc)
         close_reason = str(exc.rcvd.reason if exc.rcvd else "")
         if getattr(tracker, "response_completed", False):
             return ResponsesWsReadStep(
@@ -572,6 +641,7 @@ async def read_next_responses_ws_step(
                 getattr(tracker, "stream_error_code", None)
                 == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
             )
+            request_failed = bool(getattr(tracker, "request_failed", False))
             error_detail = getattr(tracker, "stream_error_message", None)
             if not error_detail:
                 error_detail = (
@@ -579,10 +649,26 @@ async def read_next_responses_ws_step(
                     if is_context_error else "upstream stream error"
                 )
             return ResponsesWsReadStep(
-                outcome="request_invalid" if is_context_error else "stream_upstream_error",
+                outcome=(
+                    "request_invalid" if is_context_error else
+                    "request_rejected" if request_failed else
+                    "stream_upstream_error"
+                ),
                 error_detail=error_detail,
-                http_status=400 if is_context_error else 503,
+                http_status=400 if (is_context_error or request_failed) else 503,
                 response_failed=True,
+                close_code=close_code,
+                close_reason=close_reason,
+            )
+        if getattr(tracker, "response_incomplete", False):
+            reason = protocol_errors.responses_incomplete_reason(
+                getattr(tracker, "last_event", None)
+            )
+            return ResponsesWsReadStep(
+                outcome="response_incomplete",
+                error_detail=f"response incomplete: {reason or 'unknown reason'}",
+                http_status=400,
+                response_incomplete=True,
                 close_code=close_code,
                 close_reason=close_reason,
             )
@@ -637,11 +723,29 @@ async def read_next_responses_ws_step(
                 )
                 step.http_status = 400
                 step.skip_downstream = True
+            elif getattr(tracker, "request_failed", False):
+                step.outcome = "request_rejected"
+                step.error_detail = (
+                    getattr(tracker, "stream_error_message", None)
+                    or "request rejected by upstream policy"
+                )
+                step.http_status = 400
             else:
                 step.outcome = "stream_upstream_error"
                 step.error_detail = getattr(tracker, "stream_error_message", None) or "upstream stream error"
                 step.http_status = 503
             step.response_failed = True
+            return step
+        if getattr(tracker, "response_incomplete", False):
+            if timing is not None:
+                timing.mark_io_complete()
+            reason = protocol_errors.responses_incomplete_reason(
+                getattr(tracker, "last_event", None)
+            )
+            step.outcome = "response_incomplete"
+            step.error_detail = f"response incomplete: {reason or 'unknown reason'}"
+            step.http_status = 400
+            step.response_incomplete = True
             return step
         if check_blacklist and not blacklist_before_error:
             bl_hit = blacklist.match(data, channel_key)

@@ -285,19 +285,32 @@ class OpenAIOAuthChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "responses",
         defer_device_fingerprint: bool = False,
+        responses_transport: str = "http",
     ) -> UpstreamRequest:
         if ingress_protocol not in ("anthropic", "chat", "responses"):
             raise ValueError(
                 "OpenAIOAuthChannel only serves anthropic / openai-chat / openai-responses "
                 f"ingress; got {ingress_protocol!r}. ProtocolMatrix should have guarded this route."
             )
+        if responses_transport not in ("http", "websocket"):
+            raise ValueError(
+                f"unsupported OpenAI OAuth Responses transport: {responses_transport!r}"
+            )
+        if responses_transport == "websocket" and ingress_protocol != "responses":
+            raise ValueError(
+                "OpenAI OAuth native Responses WebSocket requires responses ingress"
+            )
 
         # Step A: 准备 Responses shape
         # OAuth HTTP SSE 上游被强制 store=false，不能让 previous_response_id
         # 直接穿透到 chatgpt.com，否则上游会按持久化响应查找并 404。
-        # Parrot 当前的本地 previous_response_id store 只在跨变体翻译路径展开，
-        # 本 Codex OAuth 同协议路径先明确拒绝，避免隐式丢上下文。
-        if ingress_protocol == "responses" and str(requested_body.get("previous_response_id") or "").strip():
+        # 原生 Responses WebSocket v2 是显式例外：同一 WS 内官方 Codex 用
+        # previous_response_id 续接预热/上一轮 response。
+        if (
+            responses_transport == "http"
+            and ingress_protocol == "responses"
+            and str(requested_body.get("previous_response_id") or "").strip()
+        ):
             raise ValueError(
                 "previous_response_id is not supported on OpenAI OAuth Codex route "
                 "because upstream is forced to store=false; use prompt_cache_key/session_id "
@@ -406,6 +419,7 @@ class OpenAIOAuthChannel(Channel):
             payload,
             resolved_model=resolved_model,
             default_instructions=_provider_cfg().get("defaultInstructions"),
+            transport=responses_transport,
         )
 
         # Step D: transform 后 input 已规范成 Responses list，再插入 replay items。

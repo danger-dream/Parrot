@@ -97,7 +97,6 @@ from .handler import (
     _maybe_apply_auto_prompt_cache_key,
     _model_never_supported,
     _sanitize_headers,
-    _store_enabled,
 )
 from .responses_ws_runtime import (
     dump_frame,
@@ -136,6 +135,8 @@ class _WsAttemptResult:
     # Narrow typed OpenAI OAuth upstream account-protection fact.
     openai_oauth_html_403: bool = False
     closed_after_accept: bool = False
+    # Upstream dispatch commitment is distinct from client-visible output.
+    dispatch_committed: bool = False
     outcome: str = "transport_error"
     error_detail: str = ""
     error_code: Optional[str] = None
@@ -340,15 +341,19 @@ def _sync_http_proxy_bytes(result_bytes: _WsProxyBytes, opened) -> None:
 class _WsTracker:
     """Collect usage/output metadata from upstream WS text frames."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, normalize_max_output_incomplete: bool = True) -> None:
+        self.normalize_max_output_incomplete = normalize_max_output_incomplete
         self.usage = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0, "cache_read": 0}
         self.usage_observed = False
         self.actual_service_tier: Optional[str] = None
         self.actual_cost_ticks: Optional[int] = None
         self._billing_event_type: Optional[str] = None
         self.response_completed = False
+        self.response_incomplete = False
         self.response_id: Optional[str] = None
         self.response_failed = False
+        self.request_failed = False
+        self.last_event: dict[str, Any] | None = None
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
         self.response_text_parts: list[str] = []
@@ -367,6 +372,7 @@ class _WsTracker:
             return
         if not isinstance(evt, dict):
             return
+        self.last_event = evt
         typ = str(evt.get("type") or "")
         response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
         usage_present = "usage" in evt or (
@@ -401,13 +407,28 @@ class _WsTracker:
             self.response_failed = True
             self.stream_error_message = _format_ws_error(evt)
             self.stream_error_code = protocol_errors.extract_error_info(evt)[0]
+            request_failure = protocol_errors.responses_request_failure_info(evt)
+            if request_failure is not None:
+                self.request_failed = True
+                self.stream_error_code, request_message = request_failure
+                self.stream_error_message = request_message
         elif typ == "response.incomplete":
-            if protocol_errors.is_responses_max_output_incomplete(evt):
+            if (
+                self.normalize_max_output_incomplete
+                and protocol_errors.is_responses_max_output_incomplete(evt)
+            ):
                 self.response_failed = True
                 self.stream_error_code = protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
                 self.stream_error_message = protocol_errors.responses_max_output_context_error_message(
                     protocol_errors.responses_incomplete_reason(evt)
                 )
+            elif not self.normalize_max_output_incomplete:
+                # Native Codex OAuth WS exposes every incomplete terminal event
+                # verbatim, but internally settles it as an unsuccessful,
+                # health-neutral request and never writes affinity/LastResponse.
+                self.response_incomplete = True
+                reason = protocol_errors.responses_incomplete_reason(evt)
+                self.stream_error_message = f"response incomplete: {reason or 'unknown reason'}"
             else:
                 self.response_completed = True
         elif typ == "response.completed":
@@ -551,7 +572,9 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         return
 
     try:
-        guard_responses_ingress(body, store_enabled=_store_enabled())
+        # previous_response_id is native upstream-WS state, independent of
+        # Parrot's optional local HTTP response store.
+        guard_responses_ingress(body, store_enabled=True)
     except GuardError as ge:
         await websocket.close(code=_ws_close_code_for_http(ge.status), reason=_trim_reason(ge.message))
         return
@@ -791,6 +814,16 @@ async def _run_ws_failover(
             usage_observed=result.usage_observed,
         )
 
+        if result.outcome == "client_disconnected":
+            # Cancellation is request-global. Never dispatch the abandoned
+            # response.create to another candidate account.
+            if not result.request_finalized:
+                await _finalize_ws_attempt_after_accept(
+                    result, ch, resolved_model, request_id, retry_count,
+                    affinity_hit, start_time, start_monotonic,
+                )
+                result.request_finalized = True
+            return accepted
         if result.ok:
             return accepted
         if result.closed_after_accept:
@@ -804,7 +837,7 @@ async def _run_ws_failover(
             msg = result.error_detail or protocol_errors.responses_max_output_context_error_message()
             if result.http_status == 413:
                 await _send_request_invalid_error_frame(
-                    websocket, msg, code="message_too_big",
+                    websocket, msg, code="message_too_big", status=413,
                 )
             else:
                 await _send_context_length_error_frame(websocket, msg)
@@ -971,6 +1004,14 @@ async def _run_ws_failover(
                     usage=result.usage,
                     usage_observed=result.usage_observed,
                 )
+                if result.outcome == "client_disconnected":
+                    if not result.request_finalized:
+                        await _finalize_ws_attempt_after_accept(
+                            result, ch, resolved_model, request_id, retry_count,
+                            affinity_hit, start_time, start_monotonic,
+                        )
+                        result.request_finalized = True
+                    return accepted
                 if result.ok:
                     return accepted
                 if result.closed_after_accept:
@@ -987,7 +1028,7 @@ async def _run_ws_failover(
                     )
                     if result.http_status == 413:
                         await _send_request_invalid_error_frame(
-                            websocket, msg, code="message_too_big",
+                            websocket, msg, code="message_too_big", status=413,
                         )
                     else:
                         await _send_context_length_error_frame(websocket, msg)
@@ -1295,7 +1336,8 @@ async def _try_ws_channel(
                         relay_result.ok
                         or relay_result.outcome in {
                             "stream_upstream_error", "upstream_error_json",
-                            "request_invalid",
+                            "request_invalid", "request_rejected",
+                            "response_incomplete",
                         }
                     )
                 )
@@ -1937,6 +1979,7 @@ async def _try_sse_channel(
     tracker = _WsTracker()
     pending: list[str] = []
     committed = False
+    dispatch_committed = False
     buf = b""
     aiter = response.aiter_bytes()
     round_terminalized = False
@@ -2101,30 +2144,38 @@ async def _try_sse_channel(
                         await _close_downstream(websocket, 1000, "")
                         return await finalize_and_return()
                     return await finalize_and_return()
-                result.outcome = "upstream_closed" if committed else "closed_before_first_byte"
+                result.outcome = "upstream_closed" if (committed or dispatch_committed) else "closed_before_first_byte"
                 result.error_detail = "upstream SSE ended before response.completed"
-                if committed:
+                if committed or dispatch_committed:
+                    if not committed:
+                        await commit_pending()
                     await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                     return await finalize_and_return()
                 return sync_tracker_result()
             except BusinessTimeoutError as exc:
                 result.outcome = exc.outcome
                 result.error_detail = exc.outcome
-                if committed:
+                if committed or dispatch_committed:
+                    if not committed:
+                        await commit_pending()
                     await _close_downstream(websocket, 4504, result.error_detail)
                     return await finalize_and_return()
                 return sync_tracker_result()
             except httpx.TimeoutException as exc:
                 result.outcome = "transport_timeout"
                 result.error_detail = f"upstream SSE transport timeout: {exc}"
-                if committed:
+                if committed or dispatch_committed:
+                    if not committed:
+                        await commit_pending()
                     await _close_downstream(websocket, 4504, result.error_detail)
                     return await finalize_and_return()
                 return sync_tracker_result()
             except Exception as exc:
-                result.outcome = "transport_error" if committed else "closed_before_first_byte"
+                result.outcome = "transport_error" if (committed or dispatch_committed) else "closed_before_first_byte"
                 result.error_detail = f"read upstream SSE: {exc}"[:2000]
-                if committed:
+                if committed or dispatch_committed:
+                    if not committed:
+                        await commit_pending()
                     await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                     return await finalize_and_return()
                 return sync_tracker_result()
@@ -2143,6 +2194,8 @@ async def _try_sse_channel(
                 frame_text = _dump_frame(data)
                 tracker.feed_text(frame_text)
                 event_type = _ws_event_type(frame_text)
+                if event_type == "response.created":
+                    dispatch_committed = True
                 if tracker.response_completed and opened.timing is not None:
                     opened.timing.mark_io_complete()
 
@@ -2152,15 +2205,17 @@ async def _try_sse_channel(
                     is_context_error = (
                         tracker.stream_error_code == protocol_errors.CONTEXT_LENGTH_EXCEEDED_CODE
                     )
+                    is_request_failure = tracker.request_failed
                     result.outcome = (
                         "request_invalid" if is_context_error
+                        else "request_rejected" if is_request_failure
                         else "stream_upstream_error" if event_type == "response.failed"
                         else "upstream_error_json"
                     )
-                    result.http_status = 400 if is_context_error else result.http_status
+                    result.http_status = 400 if (is_context_error or is_request_failure) else result.http_status
                     result.error_code = tracker.stream_error_code
                     result.error_detail = tracker.stream_error_message or frame_text[:2000]
-                    if event_type == "response.failed" or committed or is_context_error:
+                    if event_type == "response.failed" or committed or dispatch_committed or is_context_error:
                         if not committed:
                             if not is_context_error:
                                 pending.append(frame_text)
@@ -2183,7 +2238,9 @@ async def _try_sse_channel(
                     if bl_hit:
                         result.outcome = "blacklist_hit"
                         result.error_detail = f"blacklist: {bl_hit}"
-                        if committed:
+                        if committed or dispatch_committed:
+                            if not committed:
+                                await commit_pending()
                             await _close_downstream(websocket, 1011, _trim_reason(result.error_detail))
                             return await finalize_and_return()
                         return sync_tracker_result()
@@ -2346,7 +2403,9 @@ async def _receive_next_response_create(
             )
             continue
         try:
-            guard_responses_ingress(body, store_enabled=_store_enabled())
+            # Sequential WS v2 continuation is owned by the active upstream
+            # connection, not by Parrot's optional local HTTP response store.
+            guard_responses_ingress(body, store_enabled=True)
         except GuardError as exc:
             await _send_request_invalid_error_frame(
                 websocket, exc.message, param=None,
@@ -2413,7 +2472,12 @@ async def _relay_ws_session(
     allow_failover_before_visible: bool = True,
     identity_session: dict[str, Any] | None = None,
 ) -> _WsAttemptResult:
-    tracker = _WsTracker()
+    tracker = _WsTracker(
+        # Preserve the global HTTP/SSE and ordinary WS compatibility behavior.
+        # Only native Codex OAuth Responses WS transparently relays max-output
+        # incomplete without synthesizing context_length_exceeded.
+        normalize_max_output_incomplete=not isinstance(ch, OpenAIOAuthChannel),
+    )
     result = _WsAttemptResult(
         connected=True,
         outcome="connected",
@@ -2759,9 +2823,9 @@ async def _relay_ws_session(
         active_downstream_task.cancel()
         await asyncio.gather(active_downstream_task, return_exceptions=True)
         if result.ok or result.closed_after_accept:
-            # A terminal Responses frame can contain the complete output even
-            # when no delta/item event preceded it. It is not a failover commit
-            # boundary, but once accepted it still must reach the downstream.
+            # A terminal Responses frame can contain complete output without a
+            # preceding delta. Buffered metadata also includes response.created,
+            # which commits dispatch without being classified as visible output.
             if pending_visible:
                 result.closed_after_accept = True
                 _apply_ws_snapshot(result, timing, terminal=False)
@@ -2770,13 +2834,39 @@ async def _relay_ws_session(
                         websocket,
                         _identity_expose_frame(item, _identity_confuse_state),
                     )
-            if close_downstream_on_terminal:
+            if result.outcome == "request_invalid":
+                if result.http_status == 413:
+                    await _send_request_invalid_error_frame(
+                        websocket, result.error_detail, code="message_too_big", status=413,
+                    )
+                else:
+                    await _send_context_length_error_frame(
+                        websocket, result.error_detail,
+                    )
+            # Per-request typed errors can usually leave the persistent upstream
+            # socket reusable. A committed context/size failure is closed here so
+            # both peers receive an unambiguous turn termination; transport and
+            # blacklist failures also destroy the session.
+            must_close_connection = bool(
+                result.outcome in {
+                    "connection_lifecycle", "upstream_closed", "blacklist_hit",
+                    "transport_error", "transport_timeout", "first_byte_timeout",
+                    "connection_timeout", "idle_timeout", "total_timeout",
+                }
+                or result.outcome == "request_invalid"
+            )
+            if close_downstream_on_terminal or must_close_connection:
                 if result.ok:
                     await _close_downstream(websocket, 1000, "")
                 else:
+                    close_code = _ws_close_code_for_http(
+                        _http_status_from_ws_outcome(result)
+                    )
+                    if result.outcome == "connection_lifecycle":
+                        close_code = 1011
                     await _close_downstream(
                         websocket,
-                        _ws_close_code_for_http(_http_status_from_ws_outcome(result)),
+                        close_code,
                         _trim_reason(result.error_detail or result.outcome),
                     )
             return await finalize_accepted_request()
@@ -2811,10 +2901,16 @@ async def _relay_ws_session(
                 result.error_detail = step.error_detail
                 await _close_downstream(websocket, 4504, result.error_detail)
                 return
-            if step.outcome == "upstream_closed":
-                result.outcome = "upstream_closed"
+            if step.outcome in ("upstream_closed", "connection_lifecycle"):
+                result.outcome = step.outcome
                 result.error_detail = step.error_detail
-                await _close_downstream(websocket, step.close_code, step.close_reason)
+                # 1006 is reserved and cannot be sent in a close frame.
+                downstream_close_code = (
+                    step.close_code if step.close_code in (1000, 1001) else 1011
+                )
+                await _close_downstream(
+                    websocket, downstream_close_code, step.close_reason,
+                )
                 return
             if step.outcome == "blacklist_hit":
                 result.outcome = "blacklist_hit"
@@ -2828,11 +2924,13 @@ async def _relay_ws_session(
                 result.error_detail = step.error_detail or protocol_errors.responses_max_output_context_error_message()
                 if result.http_status == 413:
                     await _send_request_invalid_error_frame(
-                        websocket, result.error_detail, code="message_too_big",
+                        websocket, result.error_detail, code="message_too_big", status=413,
                     )
                 else:
                     await _send_context_length_error_frame(websocket, result.error_detail)
-                if close_downstream_on_terminal:
+                if close_downstream_on_terminal or (
+                    step.data is None and result.http_status == 413
+                ):
                     await _close_downstream(
                         websocket,
                         _ws_close_code_for_http(result.http_status),
@@ -2841,8 +2939,12 @@ async def _relay_ws_session(
                 return
             if step.data is not None and not step.skip_downstream:
                 await _send_downstream(websocket, step.data)
-            if step.outcome == "stream_upstream_error":
-                result.outcome = "stream_upstream_error"
+            if step.outcome in {
+                "stream_upstream_error", "request_rejected", "response_incomplete",
+            }:
+                result.outcome = step.outcome
+                result.error_code = step.error_code
+                result.http_status = step.http_status
                 result.error_detail = step.error_detail
                 close_code = 1011 if step.data is not None else step.close_code
                 close_reason = _trim_reason(result.error_detail) if step.data is not None else step.close_reason
@@ -2919,6 +3021,7 @@ async def _build_ws_upstream_request(
         req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol="responses",
             defer_device_fingerprint=True,
+            responses_transport="websocket",
         )
         ws_url = _http_url_to_ws(req.url)
         headers = _merge_ws_headers(req.headers, websocket)
@@ -3125,6 +3228,11 @@ async def _finalize_ws_attempt_after_accept(
         proxy_name=result.proxy_name,
         proxy_bytes_up=result.proxy_bytes.up,
         proxy_bytes_down=result.proxy_bytes.down,
+        status=(
+            "cancelled"
+            if result.outcome in ("cancelled", "client_disconnected")
+            else "error"
+        ),
     ))
 
 
@@ -3220,12 +3328,20 @@ async def _send_request_invalid_error_frame(
     *,
     code: str = "invalid_request_error",
     param: str | None = None,
+    status: int = 400,
 ) -> None:
     if websocket.application_state == WebSocketState.DISCONNECTED:
         return
     try:
         await _send_downstream(websocket, _dump_frame({
             "type": "error",
+            "status": int(status),
+            "error": {
+                "type": "invalid_request_error",
+                "code": code,
+                "message": message,
+            },
+            # Compatibility fields for older Parrot/OpenAI-compatible clients.
             "code": code,
             "message": message,
             "param": param,
@@ -3259,6 +3375,12 @@ async def _send_terminal_error_frame(
     try:
         await _send_downstream(websocket, _dump_frame({
             "type": "error",
+            "status": int(http_status),
+            "error": {
+                "type": error_type,
+                "code": error_type,
+                "message": message,
+            },
             "code": error_type,
             "message": message,
             "param": None,
@@ -3346,6 +3468,8 @@ async def _recv_until_first_visible_ws_event(
         result.error_detail = step.error_detail
         result.error_code = step.error_code
         result.http_status = step.http_status
+    if step.dispatch_committed:
+        result.dispatch_committed = True
     if step.closed_after_accept:
         result.closed_after_accept = True
     return step.visible_frame

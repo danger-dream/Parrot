@@ -36,7 +36,7 @@ class _Cooldown:
         self.cleared = []
         self.errors = []
 
-    def clear(self, channel_key, model):
+    def clear_on_success(self, channel_key, model):
         self.cleared.append((channel_key, model))
 
     def record_error(self, channel_key, model, error_detail=None):

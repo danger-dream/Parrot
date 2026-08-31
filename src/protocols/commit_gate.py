@@ -108,6 +108,16 @@ def is_responses_visible_event_type(event_type: str | None) -> bool:
     return bool(event_type) and event_type in upstream.RESPONSES_VISIBLE_EVENTS
 
 
+def is_responses_dispatch_commit_event_type(event_type: str | None) -> bool:
+    """Whether an upstream Responses event proves the logical request was created.
+
+    ``response.created`` isn't user-visible output, but replaying the same create
+    on another account after observing it can duplicate execution and billing.
+    Visible events necessarily imply the same dispatch commitment.
+    """
+    return event_type == "response.created" or is_responses_visible_event_type(event_type)
+
+
 def is_sse_downstream_visible_event(event_name: str | None, data: dict | None, protocol: str) -> bool:
     """Whether an upstream SSE event should cross the commit boundary."""
     if protocol == "openai-responses":

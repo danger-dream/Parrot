@@ -35,6 +35,32 @@ ErrorCategory = Literal[
 
 CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
 RESPONSES_MAX_OUTPUT_INCOMPLETE_REASONS = frozenset({"max_output_tokens", "max_tokens"})
+# Official Codex maps these response.failed codes to request/policy errors rather
+# than provider-health failures. Keep this allowlist exact; generic stream/server
+# failures must remain eligible for ordinary health and retry handling.
+RESPONSES_REQUEST_FAILURE_CODES = frozenset({
+    "invalid_prompt",
+    "bio_policy",
+    "cyber_policy",
+    "misalignment_policy_violation",
+})
+
+
+def responses_request_failure_info(payload: Any) -> tuple[str, str] | None:
+    """Return an exact request/policy ``response.failed`` classification."""
+    if not isinstance(payload, dict) or payload.get("type") != "response.failed":
+        return None
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return None
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = str(error.get("code") or "").strip().lower()
+    if code not in RESPONSES_REQUEST_FAILURE_CODES:
+        return None
+    message = str(error.get("message") or "").strip() or "request rejected by upstream policy"
+    return code, message[:2000]
 
 
 def responses_incomplete_reason(payload: Any) -> str | None:
@@ -351,6 +377,8 @@ _REQUEST_INVALID_ERROR_TYPES = frozenset({
     "string_above_max_length",
     "previous_response_not_found",
     "cyber_policy",
+    "bio_policy",
+    "misalignment_policy_violation",
 })
 ZHIPU_CONTENT_POLICY_CODE = "1301"
 _ZHIPU_CONTENT_POLICY_MESSAGE_MARKERS = (
@@ -376,6 +404,8 @@ _REQUEST_INVALID_INPUT_CODES = frozenset({
     "string_above_max_length",
     "previous_response_not_found",
     "cyber_policy",
+    "bio_policy",
+    "misalignment_policy_violation",
     ZHIPU_CONTENT_POLICY_CODE,
 })
 _REQUEST_ERROR_WRAPPER_KEYS = (

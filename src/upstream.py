@@ -131,6 +131,10 @@ RESPONSES_VISIBLE_EVENTS = frozenset({
     "response.reasoning_summary_text.delta",
     "response.reasoning_text.delta",
     "response.function_call_arguments.delta",
+    "response.custom_tool_call_input.delta",
+    # output_item.done can be the first complete assistant/tool payload when a
+    # provider omits delta events; it is visible output, not terminal metadata.
+    "response.output_item.done",
     "response.output_text.annotation.added",
     "response.web_search_call.in_progress",
     "response.web_search_call.searching",

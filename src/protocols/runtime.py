@@ -25,7 +25,10 @@ import httpx
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
 from ..providers.antigravity_errors import parse_antigravity_429
-from .commit_gate import is_responses_visible_event_type
+from .commit_gate import (
+    is_responses_dispatch_commit_event_type,
+    is_responses_visible_event_type,
+)
 from . import errors as protocol_errors
 from . import registry as protocol_registry
 
@@ -397,6 +400,8 @@ OUTCOMES_NO_COOLDOWN = frozenset({
     "guard_error",
     "candidate_guard",
     "request_invalid",
+    "request_rejected",
+    "response_incomplete",
     "client_disconnected",
     "connection_lifecycle",
 })
@@ -409,8 +414,8 @@ def should_cooldown(outcome: str) -> bool:
 def should_record_failure(outcome: str) -> bool:
     """Whether an unsuccessful attempt should affect channel health scoring."""
     return outcome not in {
-        "candidate_guard", "request_invalid", "client_disconnected",
-        "connection_lifecycle",
+        "candidate_guard", "request_invalid", "request_rejected",
+        "response_incomplete", "client_disconnected", "connection_lifecycle",
     }
 
 
@@ -820,7 +825,10 @@ def upstream_ws_http_status_from_attempt(result: Any) -> int:
         return 504
     if outcome in ("blacklist_hit", "upstream_error_json", "stream_upstream_error"):
         return 503
-    if outcome in ("guard_error", "candidate_guard", "request_invalid"):
+    if outcome in (
+        "guard_error", "candidate_guard", "request_invalid",
+        "request_rejected", "response_incomplete",
+    ):
         return 400
     return 502
 
@@ -840,7 +848,10 @@ def responses_ws_http_status_from_attempt(result: Any | None) -> int:
         return 502
     if outcome == "client_disconnected":
         return 499
-    if outcome in ("guard_error", "candidate_guard", "request_invalid"):
+    if outcome in (
+        "guard_error", "candidate_guard", "request_invalid",
+        "request_rejected", "response_incomplete",
+    ):
         return 400
     return 503
 
@@ -946,6 +957,10 @@ def is_retryable_responses_ws_error_before_accept(err: dict) -> bool:
 
 def is_responses_ws_visible_event_type(event_type: str | None) -> bool:
     return is_responses_visible_event_type(event_type)
+
+
+def is_responses_ws_dispatch_commit_event_type(event_type: str | None) -> bool:
+    return is_responses_dispatch_commit_event_type(event_type)
 
 
 def is_invalid_encrypted_content_error(error_detail: Optional[str]) -> bool:

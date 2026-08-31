@@ -124,8 +124,9 @@ def test_transform_basic(m):
     assert out["stream"] is True                   # 强制
     for k in ("temperature", "top_p", "max_output_tokens",
               "frequency_penalty", "presence_penalty", "prompt_cache_retention",
-              "user", "metadata", "safety_identifier", "stream_options", "background"):
+              "user", "metadata", "safety_identifier", "background"):
         assert k not in out, f"{k} should be stripped"
+    assert out["stream_options"] == {"include_usage": True}
     assert out["input"] == [{"type": "message", "role": "user", "content": "hi"}]
     assert out["instructions"] == "You are a helpful coding assistant."
     print("  [PASS] transform: basic forced flags + strip + model normalize")
@@ -230,9 +231,9 @@ def test_transform_tool_choice_and_input_refs(m):
     assert "reasoning" not in types
     assert any(i.get("type") == "item_reference" and i.get("id") == "call_1" for i in items)
     fc = next(i for i in items if i.get("type") == "function_call")
-    assert fc["call_id"] == "fc1"
+    assert fc["call_id"] == "call_1"
     fco = next(i for i in items if i.get("type") == "function_call_output")
-    assert fco["call_id"] == "fc1" and fco["output"] == "ok"
+    assert fco["call_id"] == "call_1" and fco["output"] == "ok"
     msg = next(i for i in items if i.get("type") == "message")
     assert msg["content"][0]["text"] == '{"hello":"world"}'
 
@@ -251,12 +252,12 @@ def test_transform_tool_choice_and_input_refs(m):
     })
     assert out3["tool_choice"] == "auto"
 
-    # tool_search_output 是工具续链 item，call_id 应保留并规范化。
+    # tool_search_output 是工具续链 item，opaque call_id 必须原样保留。
     out4 = t.apply_codex_oauth_transform({
         "model": "gpt-5.1",
         "input": [{"type": "tool_search_output", "call_id": "call_search_1", "output": "ok"}],
     })
-    assert out4["input"][0]["call_id"] == "fcsearch_1"
+    assert out4["input"][0]["call_id"] == "call_search_1"
 
     # local_shell_call / tool_search_call 不主动补 name。
     out5 = t.apply_codex_oauth_transform({
@@ -268,7 +269,21 @@ def test_transform_tool_choice_and_input_refs(m):
     })
     assert "name" not in out5["input"][0]
     assert "name" not in out5["input"][1]
-    print("  [PASS] transform: tool_choice + item_reference/call_id/id normalization")
+    # 非 fc/call 前缀也必须保持同一个不透明关联键。
+    opaque = "opaque:key/7"
+    out6 = t.apply_codex_oauth_transform({
+        "model": "gpt-5.1",
+        "input": [
+            {"type": "function_call", "call_id": opaque, "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": opaque, "output": "linked"},
+        ],
+        "tools": [{"type": "function", "name": "lookup"}],
+    })
+    linked = [item for item in out6["input"] if item.get("type") in {
+        "function_call", "function_call_output",
+    }]
+    assert [item["call_id"] for item in linked] == [opaque, opaque]
+    print("  [PASS] transform: tool_choice + opaque call_id/item reference semantics")
 
 
 def test_transform_normalizes_chat_style_tools(m):
@@ -484,13 +499,38 @@ def test_channel_responses_ingress(m):
     print("  [PASS] channel: responses ingress → full codex request shape")
 
 
-def test_channel_responses_ingress_gpt56_enables_responses_lite(m):
+def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
     _setup(m)
-    _add_openai_acc(m)
+    models = [
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest",
+        "codex-auto-review", "gpt-5.6-future-variant",
+    ]
+    _add_openai_acc(m, models=models)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
-    body = {"model": "gpt-5.6-luna", "input": "hi", "stream": False}
-    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.6-luna",
-                                                ingress_protocol="responses"))
+    for model in models:
+        body = {"model": model, "input": "hi", "stream": False}
+        req = asyncio.run(ch.build_upstream_request(
+            body, model, ingress_protocol="responses",
+        ))
+        h = {k.lower(): v for k, v in req.headers.items()}
+        payload = json.loads(req.body)
+        assert h["x-openai-internal-codex-responses-lite"] == "true", model
+        assert payload["model"] == model
+        assert payload["parallel_tool_calls"] is False
+        assert payload["input"][0]["type"] == "additional_tools"
+
+    # Explicit catalog matching must not turn unrelated models into Lite.
+    non_lite = m["transform"].apply_codex_oauth_transform({
+        "model": "gpt-daybreak-green-latest", "input": "hi",
+    })
+    assert non_lite["instructions"] != ""
+    assert non_lite["input"][0]["type"] == "message"
+
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5.6-luna", "input": "hi", "stream": False},
+        "gpt-5.6-luna", ingress_protocol="responses",
+    ))
     h = {k.lower(): v for k, v in req.headers.items()}
     assert h["version"] == "0.144.0"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
@@ -507,7 +547,7 @@ def test_channel_responses_ingress_gpt56_enables_responses_lite(m):
     assert payload["input"][1]["role"] == "developer"
     assert payload["input"][1]["content"][0]["type"] == "input_text"
     assert payload["input"][2] == {"type": "message", "role": "user", "content": "hi"}
-    print("  [PASS] channel: GPT-5.6 enables Codex Responses Lite")
+    print("  [PASS] channel: official Responses Lite catalog + future GPT-5.6 prefix")
 
 
 def test_channel_responses_lite_keeps_parallel_tool_calls_for_additional_tools(m):
@@ -630,6 +670,28 @@ def test_channel_filters_translated_payload_before_codex_transform(m, monkeypatc
     assert "_api_key_name" not in payload
 
 
+def test_channel_preserves_official_responses_stream_and_access_fields(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+    )
+    official_fields = {
+        "stream_options": {"include_obfuscation": True},
+        "access_programs": {"trusted_access_for_cyber": True},
+    }
+    for transport in ("http", "websocket"):
+        req = asyncio.run(ch.build_upstream_request(
+            {"model": "gpt-5.1", "input": "hi", **official_fields},
+            "gpt-5.1",
+            ingress_protocol="responses",
+            responses_transport=transport,
+        ))
+        payload = json.loads(req.body)
+        assert payload["stream_options"] == official_fields["stream_options"]
+        assert payload["access_programs"] == official_fields["access_programs"]
+
+
 def test_channel_previous_response_id_rejected(m):
     """OAuth Codex HTTP SSE route store=false：previous_response_id 不允许直透。"""
     _setup(m)
@@ -644,6 +706,30 @@ def test_channel_previous_response_id_rejected(m):
     except ValueError as exc:
         assert "previous_response_id" in str(exc) and "store=false" in str(exc), str(exc)
     print("  [PASS] channel: previous_response_id rejected on OAuth store=false route")
+
+
+def test_channel_previous_response_id_allowed_for_native_responses_ws(m):
+    """显式 native WS transport 允许首个 create 用 previous_response_id 续接。"""
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    req = asyncio.run(ch.build_upstream_request(
+        {
+            "model": "gpt-5.1",
+            "input": [{"type": "message", "role": "user", "content": "delta"}],
+            "previous_response_id": "resp_ws_previous",
+        },
+        "gpt-5.1",
+        ingress_protocol="responses",
+        responses_transport="websocket",
+    ))
+    payload = json.loads(req.body)
+    assert payload["previous_response_id"] == "resp_ws_previous"
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": "delta"}
+    ]
+    assert payload["store"] is False
+    assert payload["stream"] is True
 
 
 def test_channel_codex_rejects_unsupported_responses_server_state(m):

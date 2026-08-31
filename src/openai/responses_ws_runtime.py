@@ -143,6 +143,7 @@ def build_oauth_responses_ws_frame(body: dict, resolved_model: str, *, channel=N
     payload = codex_oauth_transform.apply_codex_oauth_transform(
         payload,
         resolved_model=resolved_model,
+        transport="websocket",
     )
     payload["type"] = "response.create"
     _mark_codex_responses_lite_frame(payload, resolved_model)
@@ -303,7 +304,11 @@ def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> 
     if channel is not None:
         apply_forced_openai_fast_mode(channel, out, model)
     if isinstance(channel, OpenAIOAuthChannel):
-        out = codex_oauth_transform.apply_codex_oauth_transform(out, resolved_model=model)
+        out = codex_oauth_transform.apply_codex_oauth_transform(
+            out,
+            resolved_model=model,
+            transport="websocket",
+        )
         _mark_codex_responses_lite_frame(out, model)
     if typ:
         out["type"] = typ

@@ -262,7 +262,7 @@ async def test_images_real_route_antigravity_wire_and_slot(monkeypatch, response
     ch = AntigravityOAuthChannel({"email": "fake@example.com", "project_id": "p", "imageModels": [model]})
     monkeypatch.setattr(images.registry, "all_channels", lambda: [ch])
     monkeypatch.setattr(images.cooldown, "is_blocked", lambda *a: False)
-    monkeypatch.setattr(images.cooldown, "clear", lambda *a: None)
+    monkeypatch.setattr(images.cooldown, "clear_on_success", lambda *a: None)
     acquired, released, capture = [], [], {}
     async def acquire(key): acquired.append(key); return True
     monkeypatch.setattr(images.concurrency, "try_acquire", acquire)
@@ -411,7 +411,7 @@ async def test_images_route_uses_google_429_short_retry_and_quota_disable(monkey
     })
     monkeypatch.setattr(images.registry, "all_channels", lambda: [ch])
     monkeypatch.setattr(images.cooldown, "is_blocked", lambda *a: False)
-    monkeypatch.setattr(images.cooldown, "clear", lambda *a: None)
+    monkeypatch.setattr(images.cooldown, "clear_on_success", lambda *a: None)
     recorded_errors, sleeps, disabled = [], [], []
     monkeypatch.setattr(
         images.cooldown, "record_error",

@@ -398,7 +398,7 @@ async def test_responses_ws_close_without_terminal_is_lifecycle_not_http_error()
 
     assert step.outcome == "connection_lifecycle"
     assert step.http_status is None
-    assert step.close_code == 1000
+    assert step.close_code == 1006
 
 
 def test_lifecycle_is_retryable_before_commit_but_health_neutral_after_commit():

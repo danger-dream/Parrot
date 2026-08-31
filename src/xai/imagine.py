@@ -548,7 +548,7 @@ async def _request_upstream(
 
 def _record_upstream_status(channel: XAIOAuthChannel, model: str, status: int) -> None:
     if 200 <= status < 300:
-        cooldown.clear(channel.key, model)
+        cooldown.clear_on_success(channel.key, model)
     elif status in _EXPLICIT_SAFE_FAILOVER_STATUSES or status >= 500:
         cooldown.record_error(channel.key, model, f"xAI Imagine HTTP {status}")
 

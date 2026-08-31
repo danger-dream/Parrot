@@ -25,13 +25,21 @@ CODEX_CLI_USER_AGENT = (
 # Responses WebSocket beta header（codex-rs/core/src/client.rs）
 RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06"
 
-# Responses Lite 标记（GPT-5.6 系列 models.json: use_responses_lite=true）
+# Responses Lite 标记（官方 models.json: use_responses_lite=true）。
+# 保留 gpt-5.6-* 前缀以兼容该系列后续变体；非该前缀的 Lite 模型必须显式登记。
 CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 CODEX_RESPONSES_LITE_WS_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 CODEX_RESPONSES_LITE_MODEL_PREFIXES = ("gpt-5.6-",)
+CODEX_RESPONSES_LITE_MODELS = frozenset({
+    "gpt-daybreak-blue-latest",
+    "gpt-daybreak-red-latest",
+    "codex-auto-review",
+})
 
 
 def codex_model_uses_responses_lite(model: str | None) -> bool:
     """Return whether official Codex marks this model as Responses Lite."""
     m = str(model or "").strip().lower()
-    return any(m.startswith(prefix) for prefix in CODEX_RESPONSES_LITE_MODEL_PREFIXES)
+    return m in CODEX_RESPONSES_LITE_MODELS or any(
+        m.startswith(prefix) for prefix in CODEX_RESPONSES_LITE_MODEL_PREFIXES
+    )

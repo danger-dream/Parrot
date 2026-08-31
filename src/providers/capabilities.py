@@ -37,7 +37,7 @@ RESPONSES_REQ_ALLOWED: frozenset[str] = frozenset({
     "store", "metadata", "prompt", "background",
     "service_tier", "user", "safety_identifier",
     "prompt_cache_key", "prompt_cache_retention",
-    "client_metadata",
+    "client_metadata", "access_programs",
 })
 
 

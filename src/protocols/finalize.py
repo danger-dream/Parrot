@@ -144,7 +144,14 @@ def apply_success_health_effects(
             ),
         )
     if plan.clear_cooldown:
-        _run_health_effect("clear_cooldown", lambda: cooldown.clear(channel_key, model))
+        # An ordinary success can belong to a request that was already in flight
+        # when another request committed a cooldown.  It may clear grace/expired
+        # state, but must not reopen an actively blocked channel or announce a
+        # recovery that hasn't been verified.
+        _run_health_effect(
+            "clear_cooldown",
+            lambda: cooldown.clear_on_success(channel_key, model),
+        )
 
 
 def apply_error_health_effects(

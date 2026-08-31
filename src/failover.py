@@ -2724,6 +2724,8 @@ class _WsResponsesTracker:
         self._billing_event_type: Optional[str] = None
         self.response_completed = False
         self.response_failed = False
+        self.request_failed = False
+        self.last_event: dict[str, Any] | None = None
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
         self._frames: list[str] = []
@@ -2743,6 +2745,7 @@ class _WsResponsesTracker:
         if not isinstance(evt, dict):
             self._frames.append(text)
             return
+        self.last_event = evt
         typ = str(evt.get("type") or "")
         if typ == "codex.rate_limits":
             _maybe_record_codex_rate_limits_event(self.channel, evt)
@@ -2781,6 +2784,10 @@ class _WsResponsesTracker:
             self.response_failed = True
             _status, self.stream_error_message = _ws_error_detail(text)
             self.stream_error_code = None
+            request_failure = protocol_errors.responses_request_failure_info(evt)
+            if request_failure is not None:
+                self.request_failed = True
+                self.stream_error_code, self.stream_error_message = request_failure
         elif typ == "response.incomplete":
             if protocol_errors.is_responses_max_output_incomplete(evt):
                 self.response_failed = True
@@ -3401,7 +3408,10 @@ async def _recv_oauth_ws_until_visible(
         error_detail=step.error_detail,
         error_code=step.error_code,
         http_status=step.http_status,
-        stream_started=step.stream_started,
+        # response.created commits upstream dispatch even though it isn't
+        # downstream-visible output. Treat a later error as committed so the
+        # outer scheduler cannot replay the logical request on another account.
+        stream_started=(step.stream_started or step.dispatch_committed),
     ), step.first_packet_ms
 
 
@@ -3520,11 +3530,11 @@ async def _consume_oauth_responses_ws_non_stream(
                 error_detail=step.error_detail or "upstream websocket closed",
                 http_status=(502 if step.outcome == "upstream_closed" else None),
             ))
-        if step.outcome == "stream_upstream_error":
+        if step.outcome in ("stream_upstream_error", "request_rejected"):
             return await finalize_terminal_error(AttemptResult(
-                outcome="stream_upstream_error",
+                outcome=step.outcome,
                 error_detail=step.error_detail or "upstream stream error",
-                http_status=503,
+                http_status=400 if step.outcome == "request_rejected" else 503,
             ))
         if step.outcome == "request_invalid":
             return await finalize_terminal_error(AttemptResult(
@@ -3856,10 +3866,15 @@ async def _consume_oauth_responses_ws_stream(
                         protocol_errors.responses_max_output_context_error_message()
                         if is_context_error else "upstream stream error"
                     )
+                    is_request_failure = tracker.request_failed
                     await await_ws_owned(finalize_error(AttemptResult(
-                        outcome="request_invalid" if is_context_error else "stream_upstream_error",
+                        outcome=(
+                            "request_invalid" if is_context_error else
+                            "request_rejected" if is_request_failure else
+                            "stream_upstream_error"
+                        ),
                         error_detail=msg,
-                        http_status=400 if is_context_error else 503,
+                        http_status=400 if (is_context_error or is_request_failure) else 503,
                     )))
                     if is_context_error:
                         yield _sse_error_for_ingress(
@@ -3932,11 +3947,11 @@ async def _consume_oauth_responses_ws_stream(
                     out = _ws_json_to_responses_sse(_identity_expose_frame(step.data, identity_state))
                     if out is not None:
                         yield out
-                if step.outcome == "stream_upstream_error":
+                if step.outcome in ("stream_upstream_error", "request_rejected"):
                     await await_ws_owned(finalize_error(AttemptResult(
-                        outcome="stream_upstream_error",
+                        outcome=step.outcome,
                         error_detail=step.error_detail or "upstream stream error",
-                        http_status=503,
+                        http_status=400 if step.outcome == "request_rejected" else 503,
                     )))
                     return
                 if step.outcome == "success":
