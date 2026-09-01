@@ -942,7 +942,7 @@ def _usage_sync(access_token: str, *, account_key: str = "") -> dict:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.156",
+            "User-Agent": "claude-code/2.1.251",
         },
         timeout=30,
         proxy_purpose="oauth_anthropic",
@@ -996,7 +996,7 @@ def _bootstrap_sync(access_token: str) -> dict:
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.156",
+            "User-Agent": "claude-code/2.1.251",
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",

@@ -32,7 +32,7 @@ from .. import config as _ap_config
 # 所以 BASE_DIR = cc_mimicry.py 所在目录向上两级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CC_VERSION = "2.1.156"
+CC_VERSION = "2.1.251"
 FINGERPRINT_SALT = "59cf53e54c78"
 CC_ENTRYPOINT = "sdk-cli"
 USER_TYPE = "external"
