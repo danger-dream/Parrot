@@ -28,18 +28,68 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
     def get(url, **kwargs):
         seen.update(url=url, **kwargs)
         return Response({"models": [
-            {"slug": "gpt-visible", "visibility": "list"},
+            {
+                "slug": "gpt-visible",
+                "visibility": "list",
+                "service_tiers": [
+                    {"id": "priority", "name": "Fast", "description": "1.5x", "secret": "drop"},
+                    {"id": "ultrafast", "name": "Ultrafast"},
+                    {"id": "ultrafast", "name": "duplicate"},
+                    {"id": "hyperspeed", "name": "Hyperspeed"},
+                    {"name": "missing-id"},
+                ],
+                "minimal_client_version": "0.144.0",
+                "additional_speed_tiers": ["fast"],
+                "available_in_plans": ["plus", "pro"],  # not an entitlement signal; dropped
+            },
+            {"slug": "gpt-no-tiers", "visibility": "list", "service_tiers": []},
             {"slug": "gpt-hidden", "visibility": "hide"},
         ]})
     monkeypatch.setattr(oauth_model_discovery.network, "get_sync", get)
     result = oauth_model_discovery.discover_openai({
         "access_token": "tok", "workspace_id": "ws",
     })
-    assert result.models == ["gpt-visible"]
-    assert seen["url"].startswith("https://chatgpt.com/backend-api/codex/models?client_version=")
+    assert result.models == ["gpt-visible", "gpt-no-tiers"]
+    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.144.0"
     assert seen["headers"]["authorization"] == "Bearer tok"
     assert seen["headers"]["ChatGPT-Account-ID"] == "ws"
     assert seen["headers"]["originator"] == "codex_cli_rs"
+    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.144.0 ")
+    assert result.catalog["models"] == [{
+        "id": "gpt-visible",
+        "serviceTiers": [
+            {"id": "priority", "name": "Fast", "description": "1.5x"},
+            {"id": "ultrafast", "name": "Ultrafast"},
+            {"id": "hyperspeed", "name": "Hyperspeed"},
+        ],
+        "minimalClientVersion": "0.144.0",
+        "additionalSpeedTiers": ["fast"],
+    }, {
+        "id": "gpt-no-tiers",
+        "serviceTiers": [],
+    }]
+
+
+def test_openai_codex_client_version_config_drives_catalog_query_and_ua(monkeypatch):
+    seen = {}
+    original = copy.deepcopy(config.get().get("openaiOAuth") or {})
+    try:
+        config.update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
+            "codexCliVersion": "0.150.1",
+        }))
+        monkeypatch.setattr(
+            oauth_model_discovery.network,
+            "get_sync",
+            lambda url, **kwargs: seen.update(url=url, **kwargs) or Response({
+                "models": [{"slug": "gpt-future", "visibility": "list"}],
+            }),
+        )
+        result = oauth_model_discovery.discover_openai({"access_token": "tok"})
+        assert result.models == ["gpt-future"]
+        assert seen["url"].endswith("?client_version=0.150.1")
+        assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.150.1 ")
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("openaiOAuth", original))
 
 
 def test_claude_headers_pagination_and_empty_error(monkeypatch):
@@ -550,14 +600,32 @@ def test_xai_enrichment_failure_is_nonfatal(monkeypatch):
 async def test_metadata_atomic_persistence_and_failed_sync_preserves_lkg(monkeypatch, account_config):
     monkeypatch.setattr(oauth_manager, "mock_mode_enabled", lambda: False)
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", lambda key: _async_value("ta"))
-    rich = {"schema": 1, "models": [{"id": "rich-id", "name": "Pretty Alias", "contextWindow": 1000000, "reasoning": True, "supportsImages": True, "reasoningEfforts": ["low", "medium", "high"]}]}
+    rich = {"schema": 1, "models": [{
+        "id": "rich-id", "name": "Pretty Alias", "contextWindow": 1000000,
+        "reasoning": True, "supportsImages": True,
+        "reasoningEfforts": ["low", "medium", "high"],
+        "serviceTiers": [
+            {"id": "priority", "name": "Fast"},
+            {"id": "ultrafast", "name": "Ultrafast"},
+            {"id": "hyperspeed", "name": "Hyperspeed"},
+        ],
+        "minimalClientVersion": "0.150.0",
+    }]}
     monkeypatch.setattr(oauth_manager.oauth_model_discovery, "discover", lambda *a, **k: oauth_model_discovery.DiscoveryResult(["rich-id"], rich, "upstream:test"))
     await oauth_manager.refresh_account_models("openai:a@x:ws-a")
     saved = oauth_manager.get_account("openai:a@x:ws-a")
     assert saved["models"] == ["rich-id"] and saved["account_model_catalog"] == rich
     text, kb = oauth_account_models_menu.render("openai:a@x:ws-a")
     assert "<code>rich-id</code>" in text and "Pretty Alias</code> -" not in text
-    assert "上下文：1.0M · 🧠 · 🖼" in text and "思考档位：low、medium、high" in text
+    assert "上下文：1.0M · 🧠 · 🖼 · ⚡ Ultra" in text and "思考档位：low、medium、high" in text
+    detail, _ = oauth_account_models_menu._detail_render(
+        "openai:a@x:ws-a", "rich-id", model_page=1, account_page=1, filter_key="all",
+    )
+    assert (
+        "服务档位（账户目录）: "
+        "<code>Fast (priority)、Ultrafast、Hyperspeed</code>"
+    ) in detail
+    assert "最低 Codex CLI: <code>0.150.0</code>" in detail
     assert all(len(str(b.get("callback_data") or "").encode()) <= 64 for row in kb["inline_keyboard"] for b in row)
     monkeypatch.setattr(oauth_manager.oauth_model_discovery, "discover", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("down")))
     await oauth_manager.refresh_account_models("openai:a@x:ws-a")

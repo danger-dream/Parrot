@@ -1445,6 +1445,8 @@ def test_extract_fast_mode_variants(m):
     ld = m["log_db"]
     assert ld.extract_fast_mode({"speed": "fast"}, "anthropic") is True
     assert ld.extract_fast_mode({"service_tier": "priority"}, "responses") is True
+    assert ld.extract_fast_mode({"service_tier": "ultrafast"}, "responses") is True
+    assert ld.extract_fast_mode({"service_tier": "hyperspeed"}, "responses") is False
     assert ld.extract_fast_mode({}, "anthropic", {"anthropic-beta": "foo,fast-mode-2026-02-01"}) is True
     assert ld.extract_fast_mode({"service_tier": "default"}, "responses") is False
     print("  [PASS] fast mode extraction variants")
@@ -1477,7 +1479,19 @@ def test_fast_mode_badge_in_recent_logs_and_detail(m):
     edit = rec.last("editMessageText")
     assert edit is not None
     assert "模式：⚡ Fast" in edit["text"]
-    print("  [PASS] Fast mode badge in logs list + detail")
+    assert m["ui"].log_fast_mode_badge({
+        "fast_mode": 1,
+        "actual_service_tier": "ultrafast",
+    }) == "⚡ Ultrafast"
+    assert m["ui"].log_fast_mode_badge({
+        "fast_mode": 0,
+        "actual_service_tier": "hyperspeed",
+    }) == "🎚 Tier: hyperspeed"
+    assert m["ui"].log_fast_mode_badge({
+        "fast_mode": 0,
+        "actual_service_tier": "future<tier>",
+    }) == "🎚 Tier: future&lt;tier&gt;"
+    print("  [PASS] Fast/Ultrafast/generic service-tier badge in logs list + detail")
 
 
 def test_openai_workspace_id_hidden_in_stats_and_logs(m):

@@ -521,6 +521,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "durableStatePath": "durable-state.json",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
     "openaiOAuth": {
+        # 所有 Codex models/HTTP/WS 指纹的唯一版本来源。未来官方提高
+        # minimal_client_version 时只需改配置，不需要修改 Parrot 源码。
+        "codexCliVersion": "0.144.0",
         "forceCodexCLI": True,
         "enableTLSFingerprint": False,
         "isolateSessionId": True,

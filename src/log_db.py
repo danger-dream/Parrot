@@ -5910,19 +5910,22 @@ def extract_fast_mode(
     ingress_protocol: str = "anthropic",
     headers: dict | None = None,
 ) -> bool:
-    """Return whether the downstream request explicitly requested Fast mode.
+    """Return whether the downstream explicitly requested accelerated routing.
 
     Anthropic Fast mode is represented by ``speed=fast`` plus the
-    ``fast-mode-2026-02-01`` beta header.  OpenAI-family latency equivalent is
-    ``service_tier=priority``.  Internal Parrot hints are accepted so logging can
-    run before/after bridge transforms without losing the flag.
+    ``fast-mode-2026-02-01`` beta header.  OpenAI-family acceleration is
+    ``service_tier=priority`` (Fast) or ``service_tier=ultrafast``.  The summary
+    column remains boolean for schema compatibility; ``actual_service_tier``
+    preserves the exact tier observed from the upstream response.
     """
     if isinstance(body, dict):
         if body.get("_parrot_wants_fast_mode") is True:
             return True
         if str(body.get("speed") or "").strip().lower() == "fast":
             return True
-        if str(body.get("service_tier") or "").strip().lower() == "priority":
+        if str(body.get("service_tier") or "").strip().lower() in {
+            "priority", "ultrafast",
+        }:
             return True
         for key in (
             "betas", "anthropic_beta", "anthropic-beta", "anthropic_betas",

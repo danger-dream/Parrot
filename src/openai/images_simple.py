@@ -39,10 +39,15 @@ from .. import (
 from ..oauth import normalize_provider
 from ..oauth import openai as openai_provider
 from ..oauth_ids import account_key as make_account_key
+from .codex_constants import (
+    CODEX_ORIGINATOR,
+    CODEX_ROUTING_HINT_HEADER,
+    build_codex_routing_hint,
+    codex_cli_user_agent,
+    codex_cli_version,
+)
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
-CODEX_USER_AGENT = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
-CODEX_ORIGINATOR = "codex-tui"
 
 _DEFAULTS = {
     "enabled": True,
@@ -222,17 +227,26 @@ def _build_payload(*, action: str, prompt: str, main_model: str, tool_model: str
     }
 
 
-def _build_headers(access_token: str, account_id: str) -> dict[str, str]:
-    return {
+def _build_headers(
+    access_token: str,
+    account_id: str,
+    model: str | None = None,
+) -> dict[str, str]:
+    headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {access_token}",
-        "User-Agent": CODEX_USER_AGENT,
+        "User-Agent": codex_cli_user_agent(),
+        "Version": codex_cli_version(),
         "Session_id": str(uuid.uuid4()),
         "Accept": "text/event-stream",
         "Connection": "Keep-Alive",
         "Originator": CODEX_ORIGINATOR,
         "Chatgpt-Account-Id": account_id,
     }
+    routing_hint = build_codex_routing_hint(model)
+    if routing_hint:
+        headers[CODEX_ROUTING_HINT_HEADER] = routing_hint
+    return headers
 
 
 def _classify_error(status: int, body: str, *, retry_after: int | None = None) -> UpstreamImageError:
@@ -372,7 +386,7 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
         raise UpstreamImageError("OpenAI OAuth account missing chatgpt_account_id/workspace_id", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
 
     access_token = await (oauth_manager.force_refresh(ak) if refresh_first else oauth_manager.ensure_valid_token(ak))
-    headers = _build_headers(access_token, account_id)
+    headers = _build_headers(access_token, account_id, str(payload.get("model") or ""))
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     by_index: dict[int, dict] = {}

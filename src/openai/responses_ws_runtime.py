@@ -12,11 +12,11 @@ from ..openai.transform import codex_oauth_transform
 from ..providers import registry as provider_registry
 from ..transports.ws_runtime import http_url_to_ws
 from .codex_constants import (
-    CODEX_CLI_USER_AGENT,
-    CODEX_CLI_VERSION,
     CODEX_ORIGINATOR,
     CODEX_RESPONSES_LITE_WS_METADATA_KEY,
     RESPONSES_WEBSOCKETS_BETA,
+    codex_cli_user_agent,
+    codex_cli_version,
     codex_model_uses_responses_lite,
 )
 from .codex_device_fingerprint import apply_device_fingerprint
@@ -71,9 +71,12 @@ def merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]:
         out[str(k)] = str(v)
     out["OpenAI-Beta"] = RESPONSES_WEBSOCKETS_BETA
     out.setdefault("originator", CODEX_ORIGINATOR)
-    out.setdefault("version", CODEX_CLI_VERSION)
+    out.setdefault("version", codex_cli_version())
+    # The channel-built header already used the same provider-config snapshot.
+    # Preserve it across canonical casing instead of reverting to a static UA.
+    configured_ua = get_header_case_insensitive(out, "user-agent")
     out = drop_headers_case_insensitive(out, {"user-agent"})
-    out["User-Agent"] = CODEX_CLI_USER_AGENT
+    out["User-Agent"] = configured_ua or codex_cli_user_agent()
 
     sid = out.get("session-id") or out.get("session_id")
     tid = out.get("thread-id") or sid
@@ -225,6 +228,7 @@ def merge_responses_ws_headers(
     downstream_headers,
     *,
     forward_client_headers: set[str],
+    preserve_upstream_user_agent: bool = False,
 ) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in (upstream_headers or {}).items():
@@ -237,8 +241,10 @@ def merge_responses_ws_headers(
 
     out["OpenAI-Beta"] = RESPONSES_WEBSOCKETS_BETA
     out.setdefault("originator", CODEX_ORIGINATOR)
-    out.setdefault("version", CODEX_CLI_VERSION)
-    out.setdefault("User-Agent", CODEX_CLI_USER_AGENT)
+    out.setdefault("version", codex_cli_version())
+    configured_ua = get_header_case_insensitive(out, "user-agent")
+    out = drop_headers_case_insensitive(out, {"user-agent"})
+    out["User-Agent"] = configured_ua or codex_cli_user_agent()
 
     incoming_sid = downstream_headers.get("session-id") or downstream_headers.get("session_id")
     incoming_tid = (
@@ -257,7 +263,7 @@ def merge_responses_ws_headers(
             out[name] = val
 
     ua = downstream_headers.get("user-agent")
-    if ua and "codex" in ua.lower():
+    if not preserve_upstream_user_agent and ua and "codex" in ua.lower():
         out["User-Agent"] = ua
     for key in [k for k in list(out) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
         del out[key]

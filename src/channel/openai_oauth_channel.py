@@ -103,11 +103,16 @@ def _request_api_key_name(body: dict) -> str:
 
 CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
 from ..openai.codex_constants import (
-    CODEX_CLI_VERSION,
     CODEX_CLI_USER_AGENT,
     CODEX_ORIGINATOR,
     CODEX_RESPONSES_LITE_HEADER,
+    CODEX_ROUTING_HINT_HEADER,
+    build_codex_routing_hint,
+    codex_cli_user_agent,
+    codex_cli_version,
     codex_model_uses_responses_lite,
+    codex_version_meets_minimum,
+    normalize_codex_service_tier,
 )
 
 _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
@@ -255,6 +260,14 @@ class OpenAIOAuthChannel(Channel):
             if str(model).strip()
         }
         self.models = [model for model in selected_models if model not in disabled_models]
+        catalog_records = (
+            (account.get("account_model_catalog") or {}).get("models") or []
+        )
+        self._account_model_records = {
+            str(item.get("id") or "").strip(): dict(item)
+            for item in catalog_records
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
 
     # ─── 模型查询 ─────────────────────────────────────────────
 
@@ -279,6 +292,34 @@ class OpenAIOAuthChannel(Channel):
     def list_client_models(self) -> list[str]:
         return list(self.models)
 
+    def service_tier_catalog_status(
+        self,
+        model: str,
+        service_tier: str | None,
+    ) -> str:
+        """Return ``advertised``, ``not_advertised``, ``standard`` or ``unknown``.
+
+        The account-scoped authenticated Codex ``/models`` response is the only
+        official preflight signal for service tiers.  Older/failed catalogs did
+        not persist ``serviceTiers``; those remain unknown and are allowed to
+        reach the upstream for backward compatibility.
+        """
+        tier = str(service_tier or "").strip().lower()
+        if not tier or tier in {"default", "auto"}:
+            return "standard"
+        record = self._account_model_records.get(str(model or "").strip())
+        if not isinstance(record, dict) or "serviceTiers" not in record:
+            return "unknown"
+        tiers = record.get("serviceTiers")
+        if not isinstance(tiers, list):
+            return "unknown"
+        advertised = {
+            str(item.get("id") or "").strip().lower()
+            for item in tiers
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        return "advertised" if tier in advertised else "not_advertised"
+
     # ─── 请求构造 ─────────────────────────────────────────────
 
     async def build_upstream_request(
@@ -300,6 +341,9 @@ class OpenAIOAuthChannel(Channel):
             raise ValueError(
                 "OpenAI OAuth native Responses WebSocket requires responses ingress"
             )
+        # One immutable provider-config snapshot keeps models/headers/UA coherent
+        # even if a hot reload lands while this request is being constructed.
+        prov_cfg = _provider_cfg()
 
         # Step A: 准备 Responses shape
         # OAuth HTTP SSE 上游被强制 store=false，不能让 previous_response_id
@@ -418,9 +462,57 @@ class OpenAIOAuthChannel(Channel):
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload,
             resolved_model=resolved_model,
-            default_instructions=_provider_cfg().get("defaultInstructions"),
+            default_instructions=prov_cfg.get("defaultInstructions"),
             transport=responses_transport,
         )
+        model_id = str(payload.get("model") or resolved_model).strip()
+        model_record = self._account_model_records.get(model_id)
+        minimum_client_version = (
+            str(model_record.get("minimalClientVersion") or "").strip()
+            if isinstance(model_record, dict) else ""
+        )
+        effective_client_version = codex_cli_version(prov_cfg)
+        if (
+            minimum_client_version
+            and codex_version_meets_minimum(
+                effective_client_version, minimum_client_version,
+            ) is False
+        ):
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                f"Configured Codex CLI version {effective_client_version!r} is below "
+                f"model {model_id!r} minimum {minimum_client_version!r}",
+                param="model",
+                scope="candidate",
+            )
+
+        raw_service_tier = payload.get("service_tier")
+        service_tier = ""
+        if raw_service_tier is not None:
+            normalized_tier = normalize_codex_service_tier(raw_service_tier)
+            if normalized_tier is None:
+                raise guard.GuardError(
+                    400,
+                    "invalid_request_error",
+                    "service_tier must be a nonempty safe ASCII token",
+                    param="service_tier",
+                    scope="request",
+                )
+            payload["service_tier"] = normalized_tier
+            service_tier = normalized_tier.lower()
+        if self.service_tier_catalog_status(
+            payload.get("model") or resolved_model,
+            service_tier,
+        ) == "not_advertised":
+            raise guard.GuardError(
+                400,
+                "invalid_request_error",
+                f"OpenAI OAuth account catalog does not advertise service tier "
+                f"{service_tier!r} for model {resolved_model!r}",
+                param="service_tier",
+                scope="candidate",
+            )
 
         # Step D: transform 后 input 已规范成 Responses list，再插入 replay items。
         replay_injected = reasoning_replay.inject_replay_items(payload, replay_scope)
@@ -473,14 +565,13 @@ class OpenAIOAuthChannel(Channel):
             self.workspace_id = current_workspace_id
             self.codex_device_installation_id = current_device_installation_id
 
-        headers = self._build_headers(access_token)
+        headers = self._build_headers(access_token, provider_config=prov_cfg)
         if current_workspace_id:
             headers["chatgpt-account-id"] = current_workspace_id
         if codex_model_uses_responses_lite(payload.get("model") or resolved_model):
             headers[CODEX_RESPONSES_LITE_HEADER] = "true"
         # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
         # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
-        prov_cfg = _provider_cfg()
         if prov_cfg.get("isolateSessionId", True):
             api_key_name = _request_api_key_name(requested_body)
             prompt_cache_key = str(payload.get("prompt_cache_key") or "").strip()
@@ -507,8 +598,19 @@ class OpenAIOAuthChannel(Channel):
                 create_client_metadata=True,
             )
 
+        # Official Codex sends this on both HTTP requests and WebSocket
+        # handshakes.  The WS bridge reuses these headers when it dials the
+        # upstream, so one authoritative construction keeps both transports in
+        # sync with the final transformed model/tier.
+        routing_hint = build_codex_routing_hint(
+            payload.get("model") or resolved_model,
+            payload.get("service_tier"),
+        )
+        if routing_hint:
+            headers[CODEX_ROUTING_HINT_HEADER] = routing_hint
+
         return UpstreamRequest(
-            url=str(_provider_cfg().get("codexUpstreamUrl") or CODEX_UPSTREAM_URL),
+            url=str(prov_cfg.get("codexUpstreamUrl") or CODEX_UPSTREAM_URL),
             headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,
@@ -647,15 +749,21 @@ class OpenAIOAuthChannel(Channel):
             headers.pop(name, None)
         return headers
 
-    def _build_headers(self, access_token: str) -> dict[str, str]:
-        prov_cfg = _provider_cfg()
+    def _build_headers(
+        self,
+        access_token: str,
+        *,
+        provider_config: dict | None = None,
+    ) -> dict[str, str]:
+        prov_cfg = provider_config if isinstance(provider_config, dict) else _provider_cfg()
+        client_version = codex_cli_version(prov_cfg)
         headers = {
             # Host 头：httpx 通常会按 URL 自动设置，这里显式兜底保险
             "host": "chatgpt.com",
             "authorization": f"Bearer {access_token}",
             "openai-beta": "responses=experimental",
             "originator": CODEX_ORIGINATOR,
-            "version": CODEX_CLI_VERSION,
+            "version": client_version,
             "accept": "text/event-stream",
             "content-type": "application/json",
             # x-client-request-id: set downstream by session/identity-confuse logic;
@@ -665,5 +773,5 @@ class OpenAIOAuthChannel(Channel):
             headers["chatgpt-account-id"] = self.chatgpt_account_id
         # forceCodexCLI=True（默认）→ 强制伪装 UA；False 则不设，交给 httpx 默认
         if prov_cfg.get("forceCodexCLI", True):
-            headers["user-agent"] = CODEX_CLI_USER_AGENT
+            headers["user-agent"] = codex_cli_user_agent(prov_cfg)
         return headers

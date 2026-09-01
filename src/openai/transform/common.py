@@ -24,7 +24,11 @@ _OPENAI_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", 
 _BIGMODEL_REASONING_EFFORTS: frozenset[str] = frozenset({
     "none", "minimal", "low", "medium", "high", "xhigh", "max",
 })
-_OPENAI_SERVICE_TIERS: frozenset[str] = frozenset({"auto", "default", "flex", "priority"})
+# Explicit cross-family compatibility only. Native OpenAI/Codex paths treat
+# catalog-advertised service-tier IDs as opaque safe tokens and never use this set.
+_ANTHROPIC_TO_OPENAI_COMPAT_SERVICE_TIERS: frozenset[str] = frozenset({
+    "auto", "default", "flex", "priority", "ultrafast",
+})
 _ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
 _PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
@@ -395,7 +399,7 @@ def map_anthropic_service_tier_to_openai(value: Any, *, codex_oauth: bool = Fals
         return True, "priority" if codex_oauth else "auto"
     if tier == "standard_only":
         return True, None if codex_oauth else "default"
-    if tier in _OPENAI_SERVICE_TIERS:
+    if tier in _ANTHROPIC_TO_OPENAI_COMPAT_SERVICE_TIERS:
         if codex_oauth and tier == "default":
             return True, None
         return True, tier

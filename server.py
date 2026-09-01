@@ -44,6 +44,7 @@ from src.client_ip import get_client_ip
 from datetime import datetime, timezone
 from src.telegram import bot as tgbot
 from src.protocols import errors as protocol_errors
+from src.openai.codex_constants import codex_cli_version
 from src.transform.cc_mimicry import (
     DEVICE_ID,
     PARROT_DOWNSTREAM_BETAS_KEY,
@@ -304,6 +305,7 @@ async def lifespan(app: FastAPI):
     print(f"  oauth_accounts: {len(cfg.get('oauthAccounts', []))}")
     print(f"  api_channels: {len(cfg.get('channels', []))}")
     print(f"  registry: {registry.channel_count()} channels")
+    print(f"  codex_cli_version: {codex_cli_version()}")
     print(f"  cch_mode: {cfg.get('cchMode')}")
     print(f"  oauth_mock: {cfg.get('oauth', {}).get('mockMode', False)}")
     print(f"  timeouts: {cfg.get('timeouts')}")

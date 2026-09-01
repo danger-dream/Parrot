@@ -1054,6 +1054,15 @@ def log_fast_mode_enabled(r: dict) -> bool:
 
 
 def log_fast_mode_badge(r: dict) -> str:
+    """Render known speed tiers specially and unknown tiers without guessing."""
+    raw_tier = str(r.get("actual_service_tier") or "").strip()
+    tier = raw_tier.lower()
+    if tier == "ultrafast":
+        return "⚡ Ultrafast"
+    if tier in {"priority", "fast"}:
+        return "⚡ Fast"
+    if tier and tier not in {"auto", "default", "standard", "standard_only"}:
+        return f"🎚 Tier: {escape_html(raw_tier)}"
     return "⚡ Fast" if log_fast_mode_enabled(r) else ""
 
 

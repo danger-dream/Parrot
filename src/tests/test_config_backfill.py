@@ -86,6 +86,7 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["anysearch"]["maxFetchUrlChars"] == 250
             assert cfg["anysearch"]["requireKnownUrlForFetch"] is True
             assert cfg["anysearch"]["maxConcurrentToolCalls"] == 0
+            assert cfg["openaiOAuth"]["codexCliVersion"] == "0.144.0"
             assert cfg["openaiOAuth"]["forceCodexCLI"] is False
             assert cfg["openaiOAuth"]["defaultModels"] == ["legacy-model"]
             assert cfg["openaiOAuth"]["codexUpstreamUrl"].startswith("https://chatgpt.com/")

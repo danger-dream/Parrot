@@ -35,6 +35,8 @@ import json
 import os
 import sys
 
+import pytest
+
 
 def _valid_encrypted_content(seed: int = 1) -> str:
     payload = bytearray(1 + 8 + 16 + 16 + 32)
@@ -55,6 +57,7 @@ def _import_modules():
     from src.channel.openai_oauth_channel import (
         OpenAIOAuthChannel, CODEX_UPSTREAM_URL, CODEX_CLI_USER_AGENT,
     )
+    from src.openai.codex_constants import build_codex_routing_hint
     from src.openai.channel.registration import register_factories
     from src.openai import handler, reasoning_replay
     from src.openai.transform import codex_oauth_transform as transform
@@ -67,6 +70,7 @@ def _import_modules():
         "OpenAIOAuthChannel": OpenAIOAuthChannel,
         "CODEX_UPSTREAM_URL": CODEX_UPSTREAM_URL,
         "CODEX_CLI_USER_AGENT": CODEX_CLI_USER_AGENT,
+        "build_codex_routing_hint": build_codex_routing_hint,
         "transform": transform,
         "handler": handler,
         "reasoning_replay": reasoning_replay,
@@ -94,6 +98,8 @@ def _add_openai_acc(m, email="o@openai.test", **kw):
         "plan_type": kw.get("plan_type", "plus"),
         "models": kw.get("models") or ["gpt-5.1", "gpt-5.1-codex"],
     }
+    if "account_model_catalog" in kw:
+        entry["account_model_catalog"] = kw["account_model_catalog"]
     m["oauth_manager"].add_account(entry)
 
 
@@ -490,6 +496,7 @@ def test_channel_responses_ingress(m):
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
     assert h.get("host") == "chatgpt.com"
+    assert h["x-codex-routing-hint"] == "model=gpt-5.1"
     payload = json.loads(req.body)
     assert payload["model"] == "gpt-5.1"
     assert payload["store"] is False
@@ -497,6 +504,153 @@ def test_channel_responses_ingress(m):
     assert "temperature" not in payload
     assert "x-openai-internal-codex-responses-lite" not in h
     print("  [PASS] channel: responses ingress → full codex request shape")
+
+
+def test_channel_service_tier_routing_hint_matches_final_http_payload(m):
+    _setup(m)
+    _add_openai_acc(m, models=["gpt-5.6-sol"])
+    ch = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+    )
+    for service_tier in ("priority", "ultrafast", "hyperspeed"):
+        req = asyncio.run(ch.build_upstream_request(
+            {
+                "model": "gpt-5.6-sol",
+                "input": "hi",
+                "service_tier": service_tier,
+            },
+            "gpt-5.6-sol",
+            ingress_protocol="responses",
+        ))
+        payload = json.loads(req.body)
+        headers = {str(k).lower(): str(v) for k, v in req.headers.items()}
+        assert payload["service_tier"] == service_tier
+        assert headers["x-codex-routing-hint"] == (
+            f"model=gpt-5.6-sol;tier={service_tier}"
+        )
+
+    build = m["build_codex_routing_hint"]
+    assert build("gpt-5.6-sol", "default") == "model=gpt-5.6-sol"
+    assert build("gpt-5.6-sol", "bad\r\ntier") == "model=gpt-5.6-sol"
+    assert build("bad\r\nmodel", "priority") is None
+
+
+def test_codex_identity_helpers_fail_closed_to_verified_default():
+    from src.openai import codex_constants as constants
+
+    assert constants.codex_cli_version({"codexCliVersion": "0.150.1"}) == "0.150.1"
+    assert constants.codex_cli_version({"codexCliVersion": "bad\r\nvalue"}) == "0.144.0"
+    assert constants.codex_cli_user_agent({"codexCliVersion": "0.150.1"}).startswith(
+        "codex_cli_rs/0.150.1 "
+    )
+    assert constants.codex_version_meets_minimum("0.150.1", "0.150.0") is True
+    assert constants.codex_version_meets_minimum("0.149.9", "0.150.0") is False
+    assert constants.codex_version_meets_minimum("unknown", "0.150.0") is None
+    assert constants.normalize_codex_service_tier("hyperspeed") == "hyperspeed"
+    assert constants.normalize_codex_service_tier("bad\r\ntier") is None
+
+
+def test_channel_service_tier_uses_account_catalog_as_candidate_preflight(m):
+    _setup(m)
+    _add_openai_acc(
+        m,
+        models=["gpt-5.6-sol"],
+        account_model_catalog={"schema": 1, "models": [{
+            "id": "gpt-5.6-sol",
+            "serviceTiers": [
+                {"id": "priority", "name": "Fast"},
+                {"id": "hyperspeed", "name": "Hyperspeed"},
+            ],
+        }]},
+    )
+    ch = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+    )
+    assert ch.service_tier_catalog_status("gpt-5.6-sol", "priority") == "advertised"
+    assert ch.service_tier_catalog_status("gpt-5.6-sol", "hyperspeed") == "advertised"
+    assert ch.service_tier_catalog_status("gpt-5.6-sol", "ultrafast") == "not_advertised"
+    assert ch.service_tier_catalog_status("gpt-5.6-sol", "default") == "standard"
+    assert ch.service_tier_catalog_status("unknown-model", "ultrafast") == "unknown"
+
+    with pytest.raises(Exception, match="does not advertise service tier 'ultrafast'") as exc_info:
+        asyncio.run(ch.build_upstream_request(
+            {
+                "model": "gpt-5.6-sol",
+                "input": "hi",
+                "service_tier": "ultrafast",
+            },
+            "gpt-5.6-sol",
+            ingress_protocol="responses",
+        ))
+    assert getattr(exc_info.value, "scope", None) == "candidate"
+    assert getattr(exc_info.value, "param", None) == "service_tier"
+
+    req = asyncio.run(ch.build_upstream_request(
+        {
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "service_tier": "hyperspeed",
+        },
+        "gpt-5.6-sol",
+        ingress_protocol="responses",
+    ))
+    assert json.loads(req.body)["service_tier"] == "hyperspeed"
+    assert req.headers["x-codex-routing-hint"].endswith(";tier=hyperspeed")
+
+    with pytest.raises(Exception, match="safe ASCII token") as invalid_info:
+        asyncio.run(ch.build_upstream_request(
+            {
+                "model": "gpt-5.6-sol",
+                "input": "hi",
+                "service_tier": "bad\r\ntier",
+            },
+            "gpt-5.6-sol",
+            ingress_protocol="responses",
+        ))
+    assert getattr(invalid_info.value, "scope", None) == "request"
+
+
+def test_channel_codex_version_config_drives_http_identity_and_minimum_guard(m):
+    _setup(m)
+    original = dict(m["config"].get().get("openaiOAuth") or {})
+    try:
+        m["config"].update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
+            "codexCliVersion": "0.150.1",
+        }))
+        _add_openai_acc(
+            m,
+            models=["gpt-future"],
+            account_model_catalog={"schema": 1, "models": [{
+                "id": "gpt-future",
+                "minimalClientVersion": "0.150.0",
+                "serviceTiers": [{"id": "hyperspeed", "name": "Hyperspeed"}],
+            }]},
+        )
+        ch = m["OpenAIOAuthChannel"](
+            m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+        )
+        req = asyncio.run(ch.build_upstream_request(
+            {"model": "gpt-future", "input": "hi", "service_tier": "hyperspeed"},
+            "gpt-future",
+            ingress_protocol="responses",
+        ))
+        headers = {str(key).lower(): str(value) for key, value in req.headers.items()}
+        assert headers["version"] == "0.150.1"
+        assert headers["user-agent"].startswith("codex_cli_rs/0.150.1 ")
+
+        m["config"].update(lambda cfg: cfg["openaiOAuth"].update({
+            "codexCliVersion": "0.149.9",
+        }))
+        with pytest.raises(Exception, match="below model .* minimum") as exc_info:
+            asyncio.run(ch.build_upstream_request(
+                {"model": "gpt-future", "input": "hi", "service_tier": "hyperspeed"},
+                "gpt-future",
+                ingress_protocol="responses",
+            ))
+        assert getattr(exc_info.value, "scope", None) == "candidate"
+        assert getattr(exc_info.value, "param", None) == "model"
+    finally:
+        m["config"].update(lambda cfg: cfg.__setitem__("openaiOAuth", original))
 
 
 def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):

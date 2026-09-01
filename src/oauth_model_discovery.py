@@ -15,7 +15,9 @@ from .oauth import cursor as cursor_provider
 from .oauth import xai as xai_provider
 from .oauth_ids import openai_workspace_id
 from .openai.codex_constants import (
-    CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION, CODEX_ORIGINATOR,
+    CODEX_ORIGINATOR,
+    build_codex_cli_user_agent,
+    codex_cli_version,
 )
 
 _TIMEOUT = 20.0
@@ -67,6 +69,28 @@ def _strings(value: Any) -> list[str]:
     return _unique(value) if isinstance(value, list) else []
 
 
+def _service_tiers(value: Any) -> list[dict[str, str]]:
+    """Keep only public service-tier capability fields from an account catalog."""
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        tier_id = str(raw.get("id") or "").strip().lower()
+        if not tier_id or tier_id in seen:
+            continue
+        item = {"id": tier_id}
+        for key in ("name", "description"):
+            text = str(raw.get(key) or "").strip()
+            if text:
+                item[key] = text
+        result.append(item)
+        seen.add(tier_id)
+    return result
+
+
 def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> dict[str, Any]:
     """Build the small provider-neutral persisted UI record (allow-list only)."""
     result: dict[str, Any] = {"id": str(model_id).strip()}
@@ -76,7 +100,16 @@ def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> di
         if target in {"contextWindow", "contextWindowMaxMode", "maxOutputTokens"}:
             value = _positive(value)
             if value is None: continue
-        elif target in {"inputModalities", "outputModalities", "reasoningEfforts", "aliases"}:
+        elif target == "serviceTiers":
+            if not isinstance(value, list):
+                continue
+            # Preserve an explicit empty list: for a successful authenticated
+            # account catalog it means the model advertised no service tier.
+            value = _service_tiers(value)
+        elif target in {
+            "inputModalities", "outputModalities", "reasoningEfforts", "aliases",
+            "additionalSpeedTiers",
+        }:
             value = _strings(value)
             if not value: continue
         elif target in {"reasoning", "supportsImages", "supportsThinking"}:
@@ -97,14 +130,15 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     token = str(account.get("access_token") or "")
     if not token:
         raise ValueError("missing access token")
+    client_version = codex_cli_version()
     url = (
         "https://chatgpt.com/backend-api/codex/models"
-        f"?client_version={CODEX_CLI_VERSION}"
+        f"?client_version={client_version}"
     )
     headers = {
         "authorization": f"Bearer {token}",
         "accept": "application/json",
-        "user-agent": CODEX_CLI_USER_AGENT,
+        "user-agent": build_codex_cli_user_agent(client_version),
         "originator": CODEX_ORIGINATOR,
         "origin": "https://chatgpt.com",
     }
@@ -145,6 +179,10 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
             "reasoningEfforts": ("supported_reasoning_levels", "reasoning_levels", "reasoning_efforts", "reasoningEfforts"),
             "defaultReasoningEffort": ("default_reasoning_level", "defaultReasoningEffort"),
             "supportsImages": ("supports_images", "supportsImages"), "createdAt": ("created_at", "createdAt"),
+            "serviceTiers": ("service_tiers", "serviceTiers"),
+            "defaultServiceTier": ("default_service_tier", "defaultServiceTier"),
+            "minimalClientVersion": ("minimal_client_version", "minimalClientVersion"),
+            "additionalSpeedTiers": ("additional_speed_tiers", "additionalSpeedTiers"),
         }))
     return DiscoveryResult(models, _catalog(normalized), "upstream:codex")
 

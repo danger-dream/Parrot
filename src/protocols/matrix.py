@@ -38,7 +38,11 @@ _RESPONSES_BUILTIN_INPUT_ITEM_TYPES = frozenset({
 })
 
 _OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
-_OPENAI_SERVICE_TIERS = frozenset({"auto", "default", "flex", "priority"})
+# Cross-family Anthropic→OpenAI compatibility only. Native OpenAI/Codex
+# service tiers are opaque catalog capabilities and are not enumerated here.
+_ANTHROPIC_TO_OPENAI_COMPAT_SERVICE_TIERS = frozenset({
+    "auto", "default", "flex", "priority", "ultrafast",
+})
 
 
 def _protocol_bridge_cfg() -> dict[str, Any]:
@@ -640,7 +644,10 @@ def _anthropic_service_tier_is_mappable(value: Any) -> bool:
     mapping = _tier_mapping("anthropicToOpenAI")
     if tier in mapping:
         return True
-    return tier in {"auto", "standard_only"} or tier in _OPENAI_SERVICE_TIERS
+    return (
+        tier in {"auto", "standard_only"}
+        or tier in _ANTHROPIC_TO_OPENAI_COMPAT_SERVICE_TIERS
+    )
 
 
 def _openai_service_tier_is_mappable_to_anthropic(value: Any) -> bool:

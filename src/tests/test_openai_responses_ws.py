@@ -777,9 +777,16 @@ async def test_responses_ws_previsible_client_disconnect_stops_all_candidate_dis
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(monkeypatch, m):
+@pytest.mark.parametrize("service_tier", ["ultrafast", "hyperspeed"])
+async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
+    monkeypatch, m, service_tier,
+):
     cfg = _setup(m)
-    cfg["oauth"] = {"providers": {"openai": {"forceCodexCLI": True, "isolateSessionId": True}}}
+    cfg["openaiOAuth"] = {
+        "codexCliVersion": "0.150.1",
+        "forceCodexCLI": True,
+        "isolateSessionId": True,
+    }
     ch = m["OpenAIOAuthChannel"]({
         "email": "u@example.com",
         "provider": "openai",
@@ -805,6 +812,7 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
         ],
         "stream": True,
         "temperature": 0.9,
+        "service_tier": service_tier,
         "prompt_cache_key": "shared-anchor",
         "client_metadata": {"a": "b"},
     })
@@ -821,6 +829,9 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
         assert url == "wss://chatgpt.com/backend-api/codex/responses"
         assert headers["authorization"] == "Bearer tok"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
+        assert headers["x-codex-routing-hint"] == f"model=test-model;tier={service_tier}"
+        assert headers["version"] == "0.150.1"
+        assert headers["User-Agent"].startswith("codex_cli_rs/0.150.1 ")
         assert headers["session-id"] == headers["thread-id"]
         # Codex CLI only uses hyphenated session-id; underscore variants must not be sent.
         assert "session_id" not in headers
@@ -836,6 +847,7 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(mon
     assert upstream_first["model"] == "test-model"
     assert upstream_first["store"] is False
     assert upstream_first["stream"] is True
+    assert upstream_first["service_tier"] == service_tier
     assert upstream_first["input"] == [
         {"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"},
         {"type": "message", "role": "user", "content": "hello"},

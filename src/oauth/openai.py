@@ -49,8 +49,8 @@ SCOPES_AUTHORIZE = (
 # 历史 SCOPES_REFRESH 仅在 mockMode 下作为响应里的占位字段使用。
 SCOPES_REFRESH = "openid profile email"
 
-# 固定的 Codex CLI User-Agent，集中由 codex_constants 维护。
-from ..openai.codex_constants import CODEX_CLI_USER_AGENT as USER_AGENT, CODEX_ORIGINATOR
+# Codex CLI identity is resolved per request so provider config hot reloads stay coherent.
+from ..openai.codex_constants import CODEX_ORIGINATOR, codex_cli_user_agent
 
 # 运行期请求超时（换 token / 刷 token）。
 _TOKEN_HTTP_TIMEOUT = 120.0
@@ -177,7 +177,7 @@ def _post_token_form(data: dict) -> dict:
         headers={
             "content-type": "application/x-www-form-urlencoded",
             "accept": "application/json",
-            "user-agent": USER_AGENT,
+            "user-agent": codex_cli_user_agent(),
             # 与 codex-rs/login/src/auth/default_client.rs:234 对齐：Codex HTTP 都带 originator
             "originator": CODEX_ORIGINATOR,
         },
@@ -200,7 +200,7 @@ def _post_token_json(data: dict, *, proxy_channel: str = "") -> dict:
         headers={
             "content-type": "application/json",
             "accept": "application/json",
-            "user-agent": USER_AGENT,
+            "user-agent": codex_cli_user_agent(),
             "originator": CODEX_ORIGINATOR,
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
@@ -364,7 +364,7 @@ def _fetch_accounts_check_payload_sync(access_token: str, *, proxy_channel: str 
                 "origin": "https://chatgpt.com",
                 "referer": "https://chatgpt.com/",
                 "accept": "application/json",
-                "user-agent": USER_AGENT,
+                "user-agent": codex_cli_user_agent(),
             },
             timeout=_ACCOUNTS_CHECK_TIMEOUT,
             proxy_purpose="oauth_openai",
@@ -811,7 +811,7 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None,
     headers = {
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
-        "user-agent": USER_AGENT,
+        "user-agent": codex_cli_user_agent(),
         "origin": "https://chatgpt.com",
         "referer": "https://chatgpt.com/codex/settings/usage",
     }
@@ -911,7 +911,7 @@ def fetch_rate_limit_reset_credits_sync(access_token: str, *,
     headers = {
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
-        "user-agent": USER_AGENT,
+        "user-agent": codex_cli_user_agent(),
         "origin": "https://chatgpt.com",
         "referer": "https://chatgpt.com/codex/settings/usage",
     }
@@ -970,7 +970,7 @@ def consume_rate_limit_reset_credit_sync(access_token: str, *,
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
         "content-type": "application/json",
-        "user-agent": USER_AGENT,
+        "user-agent": codex_cli_user_agent(),
         "origin": "https://chatgpt.com",
         "referer": "https://chatgpt.com/codex/settings/usage",
     }

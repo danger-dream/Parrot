@@ -16,6 +16,7 @@ from typing import Optional
 
 from ... import affinity, apikey_limiter, concurrency, config, cooldown, load_balancing, log_db, oauth_manager, quota_errors, scorer, state_db
 from ...oauth_ids import account_key as _account_key
+from ...openai.codex_constants import codex_cli_version
 from ...channel import registry
 from .. import ui
 
@@ -478,6 +479,7 @@ def _compose() -> tuple[str, dict]:
         "📊 <b>状态总览</b>",
         sep,
         f"🕐 运行: <code>{uptime}</code> · ⚙ 选路: <code>{mode}</code> · 🔗 亲和: <code>{affinity.count()}</code>",
+        f"🧬 Codex CLI: <code>v{ui.escape_html(codex_cli_version())}</code>",
     ]
 
     # 渠道：双家族各一行

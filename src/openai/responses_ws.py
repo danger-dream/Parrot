@@ -3024,7 +3024,11 @@ async def _build_ws_upstream_request(
             responses_transport="websocket",
         )
         ws_url = _http_url_to_ws(req.url)
-        headers = _merge_ws_headers(req.headers, websocket)
+        headers = _merge_ws_headers(
+            req.headers,
+            websocket,
+            preserve_upstream_user_agent=True,
+        )
         # Codex WebSocket uses the same session/thread identity header names as
         # official codex-rs. Keep old HTTP headers too for compatibility with the
         # internal endpoint while adding the WS names.
@@ -3086,11 +3090,17 @@ async def _build_ws_upstream_request(
     )
 
 
-def _merge_ws_headers(upstream_headers: dict[str, str], websocket: WebSocket) -> dict[str, str]:
+def _merge_ws_headers(
+    upstream_headers: dict[str, str],
+    websocket: WebSocket,
+    *,
+    preserve_upstream_user_agent: bool = False,
+) -> dict[str, str]:
     return merge_responses_ws_headers(
         upstream_headers,
         websocket.headers,
         forward_client_headers=_FORWARD_CLIENT_HEADERS,
+        preserve_upstream_user_agent=preserve_upstream_user_agent,
     )
 
 

@@ -79,6 +79,26 @@ def _effective_map(account_key: str, models: list[str]) -> dict[str, model_metad
             if (binding := _effective_binding(account_key, model)) is not None}
 
 
+def _service_tier_text(record: dict | None) -> str:
+    if not isinstance(record, dict) or "serviceTiers" not in record:
+        return ""
+    tiers = record.get("serviceTiers")
+    if not isinstance(tiers, list):
+        return ""
+    labels: list[str] = []
+    for item in tiers:
+        if not isinstance(item, dict):
+            continue
+        tier_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if tier_id:
+            if name and name.lower() != tier_id.lower():
+                labels.append(f"{name} ({tier_id})")
+            else:
+                labels.append(name or tier_id)
+    return "、".join(labels) if labels else "仅标准"
+
+
 def _summary_lines(record: dict | None) -> list[str]:
     if not record: return []
     facts = []
@@ -91,6 +111,13 @@ def _summary_lines(record: dict | None) -> list[str]:
     if vision is True or (vision is None and (
         record.get("supportsImages") is True or "image" in input_modalities
     )): facts.append("🖼")
+    service_tier_ids = {
+        str(item.get("id") or "").strip().lower()
+        for item in record.get("serviceTiers") or []
+        if isinstance(item, dict)
+    }
+    if "ultrafast" in service_tier_ids:
+        facts.append("⚡ Ultra")
     lines = [" · ".join(facts)] if facts else []
     if efforts: lines.append("思考档位：" + "、".join(efforts))
     return lines
@@ -476,6 +503,8 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
         ("最大输出", _format_tokens(record.get("maxOutputTokens"))),
         ("输入模态", "、".join(record.get("inputModalities") or [])), ("输出模态", "、".join(record.get("outputModalities") or [])),
         ("思考档位", "、".join(record.get("reasoningEfforts") or [])), ("别名", "、".join(record.get("aliases") or [])),
+        ("服务档位（账户目录）", _service_tier_text(record)),
+        ("最低 Codex CLI", record.get("minimalClientVersion")),
     ]
     for label, value in detail_fields:
         if value: lines.append(f"{label}: <code>{ui.escape_html(str(value))}</code>")

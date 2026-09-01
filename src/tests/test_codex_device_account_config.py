@@ -330,7 +330,7 @@ async def test_translated_http_finalization_preserves_noninstallation_identity_f
         f"identity-{ingress_protocol}@example.test", f"ws-{ingress_protocol}",
         codexDeviceInstallationId=DEVICE_A,
     ))
-    monkeypatch.setattr(enabled, "_build_headers", lambda _token: {
+    monkeypatch.setattr(enabled, "_build_headers", lambda _token, **_kwargs: {
         "session-id": "SESSION",
         "thread-id": "THREAD",
         "x-codex-turn-metadata": json.dumps({

@@ -221,6 +221,9 @@ def test_protocol_bridge_default_codex_service_tier_baseline():
     assert anthropic_to_responses.translate_request({
         "messages": [], "service_tier": "standard_only",
     }, codex_oauth=False)["service_tier"] == "default"
+    assert anthropic_to_responses.translate_request({
+        "messages": [], "service_tier": "ultrafast",
+    }, codex_oauth=True)["service_tier"] == "ultrafast"
 
 
 def test_protocol_bridge_custom_codex_service_tier(monkeypatch):
@@ -462,6 +465,12 @@ def test_matrix_allows_safe_anthropic_to_responses_and_guards_unsafe_cases():
     service_tier = {"messages": [{"role": "user", "content": "hi"}], "service_tier": "auto"}
     service_plan = DEFAULT_MATRIX.plan("anthropic", "openai-responses", features=extract_request_features("anthropic", service_tier))
     assert service_plan.required_transforms == ["anthropic_to_responses"]
+    ultrafast = {"messages": [{"role": "user", "content": "hi"}], "service_tier": "ultrafast"}
+    ultrafast_plan = DEFAULT_MATRIX.plan(
+        "anthropic", "openai-responses",
+        features=extract_request_features("anthropic", ultrafast),
+    )
+    assert ultrafast_plan.required_transforms == ["anthropic_to_responses"]
 
     document = {"messages": [{"role": "user", "content": [
         {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AAAA"}},
