@@ -49,7 +49,7 @@ from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
-from .transform.cc_mimicry import CLI_USER_AGENT
+from .transform.cc_mimicry import CLI_USER_AGENT, CODE_USER_AGENT
 
 
 # ─── 常量 ────────────────────────────────────────────────────────
@@ -942,7 +942,7 @@ def _usage_sync(access_token: str, *, account_key: str = "") -> dict:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.156",
+            "User-Agent": CODE_USER_AGENT,
         },
         timeout=30,
         proxy_purpose="oauth_anthropic",
@@ -996,7 +996,7 @@ def _bootstrap_sync(access_token: str) -> dict:
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.156",
+            "User-Agent": CODE_USER_AGENT,
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",

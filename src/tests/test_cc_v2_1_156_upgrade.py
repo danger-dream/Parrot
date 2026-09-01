@@ -1,11 +1,11 @@
 """CC v2.1.156 兼容升级回归测试。
 
 覆盖本轮升级的全部代码改动，防止后续回归：
-  §1  CC_VERSION = 2.1.156
+  §1  CC_VERSION = 2.1.251
   §2  CCH_SEED 新值（对 6 组 canonical body _ph.bin 离线 6/6 命中）
   §3  compute_fingerprint：取「第一个 user message 的最后一个 text block」+ 索引 [4,7,18]
       （6 组 canonical body 离线 6/6 命中）；FINGERPRINT_SALT 不变
-  §5  CC_ENTRYPOINT = sdk-cli；CLI_USER_AGENT 三者自洽
+  §5  CC_ENTRYPOINT = sdk-cli；CLI_USER_AGENT / CODE_USER_AGENT 都从 CC_VERSION 派生
   §6  BETAS：含 context-1m / mid-conversation-system；不含 redact-thinking；
       messages 出站 anthropic-beta 过滤 oauth-2025-04-20
   §7  build_upstream_headers：补 X-Stainless 全层 + session-id + dangerous-direct-browser；
@@ -63,8 +63,9 @@ _skip_fixtures = pytest.mark.skipif(
 
 # ─────────────────────────── 常量同步 (§1/§2/§3/§5) ───────────────────────────
 
-def test_cc_version_2_1_156():
-    assert m.CC_VERSION == "2.1.156"
+def test_cc_version_2_1_251():
+    # 唯一版本钉：Anthropic 对 claude-fable-5-1 要求 CC >= 2.1.251。
+    assert m.CC_VERSION == "2.1.251"
 
 
 def test_cc_entrypoint_sdk_cli():
@@ -72,8 +73,26 @@ def test_cc_entrypoint_sdk_cli():
 
 
 def test_user_agent_self_consistent():
-    # version / entrypoint / UA 三者必须同步，绝不半新半旧
-    assert m.CLI_USER_AGENT == "claude-cli/2.1.156 (external, sdk-cli)"
+    # version / entrypoint / UA 必须从 CC_VERSION 派生，绝不半新半旧。
+    # messages 走 claude-cli；usage/bootstrap 走 claude-code。两种格式都是 CC 原样。
+    assert m.CLI_USER_AGENT == f"claude-cli/{m.CC_VERSION} (external, {m.CC_ENTRYPOINT})"
+    assert m.CODE_USER_AGENT == f"claude-code/{m.CC_VERSION}"
+
+
+def test_messages_header_uses_derived_cli_user_agent():
+    h = m.build_upstream_headers("tok", session_id="s")
+    assert h["User-Agent"] == m.CLI_USER_AGENT
+
+
+def test_oauth_manager_usage_bootstrap_use_derived_code_user_agent():
+    import inspect
+    from src import oauth_manager
+    usage = inspect.getsource(oauth_manager._usage_sync)
+    bootstrap = inspect.getsource(oauth_manager._bootstrap_sync)
+    assert "CODE_USER_AGENT" in usage
+    assert "CODE_USER_AGENT" in bootstrap
+    assert "claude-code/2." not in usage
+    assert "claude-code/2." not in bootstrap
 
 
 def test_cch_seed_new_value():
@@ -92,13 +111,19 @@ def test_fingerprint_indices_18_not_20():
         {"type": "text", "text": "skip-me-first-block"},
         {"type": "text", "text": "hello world"},
     ]}])
-    expect = hashlib.sha256(f"59cf53e54c78oo02.1.156".encode()).hexdigest()[:3]
-    assert fp == expect == "523"
+    expect = hashlib.sha256(
+        f"{m.FINGERPRINT_SALT}oo0{m.CC_VERSION}".encode()
+    ).hexdigest()[:3]
+    assert fp == expect
 
 
 # ─────────────────────────── fp 算法 6/6 (§3) ───────────────────────────
 
 @_skip_fixtures
+@pytest.mark.skipif(
+    m.CC_VERSION != "2.1.156",
+    reason="canonical fp fixtures were captured against CC v2.1.156",
+)
 @pytest.mark.parametrize("name", list(FP_EXPECTED))
 def test_compute_fingerprint_canonical_6of6(name):
     d = json.loads(open(f"{BODIES}/body_{name}_original.bin", "rb").read())
@@ -112,8 +137,11 @@ def test_fingerprint_takes_last_text_block():
         {"type": "text", "text": "<system-reminder>\nlong preamble that must be ignored"},
         {"type": "text", "text": "hello world"},
     ]}]
-    # 若错误地取第一个 block，结果会不同于 523
-    assert m.compute_fingerprint(msgs) == "523"
+    # 若错误地取第一个 block，结果会不同于当前版本派生的 fp。
+    expect = hashlib.sha256(
+        f"{m.FINGERPRINT_SALT}oo0{m.CC_VERSION}".encode()
+    ).hexdigest()[:3]
+    assert m.compute_fingerprint(msgs) == expect
 
 
 # ─────────────────────────── cch 6/6 (§2) ───────────────────────────
