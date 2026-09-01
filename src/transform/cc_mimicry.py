@@ -67,6 +67,7 @@ PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
 ONE_M_CONTEXT_TOKENS = 1_000_000
 
 CLI_USER_AGENT = f"claude-cli/{CC_VERSION} ({USER_TYPE}, {CC_ENTRYPOINT})"
+CODE_USER_AGENT = f"claude-code/{CC_VERSION}"
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 
