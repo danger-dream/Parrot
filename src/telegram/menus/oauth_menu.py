@@ -1721,9 +1721,10 @@ def _window_usage_detail(account_key: str, since_ts: float, indent: str,
 
     返回已缩进的单行文本；窗口内没有本地请求时返回 None（不堆空行）。
 
-    口径提醒：上一行 5h/7d 百分比是上游账号「全局」配额用量；这里的
-    tokens / 缓存 / 平均 TPS 只统计走 Parrot 的本地日志。账号若在别处也被
-    使用，两者会对不上，属预期，不是 bug。
+    口径提醒：5h/7d 百分比是上游账号「全局」配额用量；Fable 7d 是模型池
+    scoped 配额。这里的 tokens / 缓存 / 平均 TPS 只统计走 Parrot 的本地日志，
+    Fable 明细还会限定到该账号配置的 Fable 模型。账号若在别处也被使用，
+    上游百分比与本地明细会对不上，属预期，不是 bug。
     """
     if stats is None:
         key = _window_stats_cache_key(account_key, window_name)
@@ -1867,9 +1868,15 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
                 lines.append(line)
         fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
         if prov == "claude" and fable_util is not None:
-            line = _format_usage_line_html("📖 Fable 7d", fable_util, fable_reset)
+            line = _format_usage_line_html("📊 Fable 7d", fable_util, fable_reset)
             if line:
                 lines.append(line)
+            since_ts = _quota_window_since_ts(fable_reset, 7 * 86400, now_ts=_now_ts)
+            _d = _window_usage_detail(
+                ak, since_ts, _USAGE_DETAIL_INDENT_LIST, "fable-7d",
+            )
+            if _d:
+                lines.append(_d)
         if fh_util is None and sd_util is None and td_util is None and fable_util is None:
             if prov == "xai":
                 lines.append("📊 官方额度: <i>尚未获取</i>")
@@ -2601,6 +2608,7 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
     now_ts = time.time()
     for account in accounts:
         account_key = _account_key(account)
+        provider = oauth_manager.provider_of(account_key)
         row = state_db.quota_load(account_key)
         local_period = _oauth_local_period(account, row=row)
         if local_period.get("stats_window") == "account-period":
@@ -2618,7 +2626,7 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
             if row.get(util_key) is None:
                 continue
             since = _quota_window_since_ts(row.get(reset_key), seconds, now_ts=now_ts)
-            if window_name == "7d" and oauth_manager.provider_of(account_key) == "xai":
+            if window_name == "7d" and provider == "xai":
                 billing = (_xai_raw_from_row(row).get("billing") or {})
                 if billing.get("period_type") == "USAGE_PERIOD_TYPE_WEEKLY":
                     period_start = _parse_iso(billing.get("period_start"))
@@ -2627,7 +2635,23 @@ def _oauth_window_specs(accounts: list[dict]) -> list[tuple[tuple, str, float]]:
             specs.append((
                 _window_stats_cache_key(account_key, window_name), account_key, since,
             ))
+        if provider == "claude":
+            fable_util, fable_reset = oauth_manager.fable_display_from_quota_row(row)
+            if fable_util is not None:
+                since = _quota_window_since_ts(fable_reset, 7 * 86400, now_ts=now_ts)
+                specs.append((
+                    _window_stats_cache_key(account_key, "fable-7d"), account_key, since,
+                ))
     return specs
+
+
+def _load_oauth_window_stats(account_key: str, since: float, window_name: str) -> dict:
+    if window_name == "fable-7d":
+        account = oauth_manager.get_account(account_key) or {}
+        return log_db.tokens_for_channel_models(
+            f"oauth:{account_key}", oauth_manager.claude_fable_models(account), since,
+        )
+    return log_db.tokens_for_channel(f"oauth:{account_key}", since_ts=since)
 
 
 def refresh_window_snapshots_now() -> bool:
@@ -2636,8 +2660,8 @@ def refresh_window_snapshots_now() -> bool:
     for key, account_key, since in _oauth_window_specs(oauth_manager.list_accounts()):
         ok = menu_cache.WINDOW_STATS.refresh_now(
             key,
-            lambda target=account_key, start=since: log_db.tokens_for_channel(
-                f"oauth:{target}", since_ts=start,
+            lambda target=account_key, start=since, window=str(key[-1]): _load_oauth_window_stats(
+                target, start, window,
             ),
         ) and ok
     return ok
@@ -2653,8 +2677,8 @@ def _request_window_snapshots(accounts: list[dict]) -> bool:
         if not cached.fresh:
             menu_cache.WINDOW_STATS.request(
                 key,
-                lambda target=account_key, start=since: log_db.tokens_for_channel(
-                    f"oauth:{target}", since_ts=start,
+                lambda target=account_key, start=since, window=str(key[-1]): _load_oauth_window_stats(
+                    target, start, window,
                 ),
             )
     return ready
@@ -2672,7 +2696,7 @@ def _list_snapshot_ready() -> bool:
     since = _this_month_start_ts()
     if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
         return False
-    # 5h/7d 与账户本期 Token、缓存、TPS、金额都是页面必需内容，
+    # 5h/7d、Fable 7d 与账户本期 Token、缓存、TPS、金额都是页面必需内容，
     # 不能因为快照尚未预热就静默删行。
     return _request_window_snapshots(oauth_manager.list_accounts())
 

@@ -120,8 +120,8 @@ def _seed_common_snapshots(m) -> None:
     for key, account_key, window_since in m["oauth_menu"]._oauth_window_specs(accounts):
         cache.WINDOW_STATS.store(
             key,
-            m["log_db"].tokens_for_channel(
-                f"oauth:{account_key}", since_ts=window_since,
+            m["oauth_menu"]._load_oauth_window_stats(
+                account_key, window_since, str(key[-1]),
             ),
         )
 
@@ -171,7 +171,7 @@ def _add_fake_account(m, email, **kw):
         "enabled": kw.get("enabled", True),
         "disabled_reason": kw.get("disabled_reason"),
         "disabled_until": kw.get("disabled_until"),
-        "models": [],
+        "models": kw.get("models", []),
     }
     def _m(cfg):
         cfg.setdefault("oauthAccounts", []).append(acc)
@@ -1829,7 +1829,9 @@ def test_router_dispatch(m):
 
 def test_claude_fable_quota_renders_progress_bar(m):
     _setup(m)
-    _add_fake_account(m, "fable@x.com")
+    _add_fake_account(
+        m, "fable@x.com", models=["claude-fable-5", "claude-mythos-5"],
+    )
     reset = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     usage = {
         "five_hour": {"utilization": 2.0, "resets_at": None},
@@ -1848,11 +1850,29 @@ def test_claude_fable_quota_renders_progress_bar(m):
         m["oauth_manager"].flatten_usage(usage),
         email="fable@x.com",
     )
+    _insert_oauth_success(
+        m, "fable@x.com", request_id="fable-r1", model="claude-fable-5",
+    )
+    _insert_oauth_success(
+        m, "fable@x.com", request_id="mythos-r1", model="claude-mythos-5",
+    )
 
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📖 Fable 7d: 已用 <code>█░░░░░░░░░</code> <b>6%</b>（剩 " in list_text
+    assert "📊 Fable 7d: 已用 <code>█░░░░░░░░░</code> <b>6%</b>（剩 " in list_text
+    assert "📖 Fable 7d" not in list_text
+    lines = list_text.splitlines()
+    fable_index = next(i for i, line in enumerate(lines) if "📊 Fable 7d:" in line)
+    assert "↑160 ↓20" in lines[fable_index + 1]
+    assert "↑320 ↓40" not in lines[fable_index + 1]
+    fable_stats = m["log_db"].tokens_for_channel_models(
+        f"oauth:{_account_key_for(m, 'fable@x.com')}", ["claude-fable-5"], 0,
+    )
+    assert fable_stats["input"] == 100
+    assert fable_stats["output"] == 20
+    assert fable_stats["cache_creation"] == 10
+    assert fable_stats["cache_read"] == 50
 
     rec.clear()
     short = m["ui"].register_code("fable@x.com")
@@ -1889,7 +1909,7 @@ def test_claude_fable_quota_renders_inactive_scoped_window(m):
     rec = _install_recorder(m)
     m["oauth_menu"].show(42, 100)
     list_text = rec.last("editMessageText")["text"]
-    assert "📖 Fable 7d: 已用 <code>█░░░░░░░░░</code> <b>6%</b>（剩 " in list_text
+    assert "📊 Fable 7d: 已用 <code>█░░░░░░░░░</code> <b>6%</b>（剩 " in list_text
     rec.clear()
     short = m["ui"].register_code("fable-inactive@x.com")
     m["oauth_menu"].on_view(42, 100, "cb", short)

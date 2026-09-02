@@ -2307,6 +2307,11 @@ def _claude_fable_models(account: dict) -> list[str]:
     })
 
 
+def claude_fable_models(account: dict) -> list[str]:
+    """Public read-only view of models governed by Claude's Fable quota."""
+    return _claude_fable_models(account)
+
+
 def _evaluate_claude_fable_pool(
     account_key: str,
     account: dict,

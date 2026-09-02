@@ -3876,15 +3876,11 @@ def _new_token_stats_agg() -> dict:
     return bucket
 
 
-def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
-    """跨月按 final_model 分组聚合某渠道下每个模型的统计（含 TPS）。
-
-    用于渠道详情/ OAuth 账户详情的"按模型展开"视图。
-    每条 dict 含 final_model + tokens_for_channel 的所有字段。
-    """
+def _channel_model_stats_raw(channel_key: str, since_ts: float) -> dict[str, dict]:
+    """Return per-model raw aggregates before TPS finalization."""
     by_model: dict[str, dict] = {}
     if _log_dir is None or not os.path.isdir(_log_dir):
-        return []
+        return by_model
 
     for conn, close_fn in _iter_month_conns_all(since_ts):
         try:
@@ -3941,15 +3937,57 @@ def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
                 close_fn()
             except Exception:
                 pass
+    return by_model
 
+
+def _merge_token_stats_agg(target: dict, source: dict) -> None:
+    for key in (
+        "total", "success_count", "error_count",
+        "input", "output", "cache_creation", "cache_read",
+        "tps_num_tokens", "tps_denom_ms",
+        "cost_ticks", "actual_cost_ticks", "estimated_cost_ticks",
+        "actual_costed_success", "estimated_costed_success",
+        "costed_success", "unpriced_success",
+    ):
+        target[key] = int(target.get(key) or 0) + int(source.get(key) or 0)
+    for key, pick in (("max_tps", max), ("min_tps", min)):
+        value = source.get(key)
+        if value is None:
+            continue
+        current = target.get(key)
+        target[key] = float(value) if current is None else pick(float(current), float(value))
+
+
+def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
+    """跨月按 final_model 分组聚合某渠道下每个模型的统计（含 TPS）。
+
+    用于渠道详情/ OAuth 账户详情的"按模型展开"视图。
+    每条 dict 含 final_model + tokens_for_channel 的所有字段。
+    """
     out = []
-    for model, raw in by_model.items():
+    for model, raw in _channel_model_stats_raw(channel_key, since_ts).items():
         d = _pack_stats(raw)
         d["final_model"] = model
         out.append(d)
     # 按请求量降序；方便 UI 直接渲染
     out.sort(key=lambda x: x["total"], reverse=True)
     return out
+
+
+def tokens_for_channel_models(channel_key: str, models: list[str], since_ts: float) -> dict:
+    """Aggregate one channel's actual per-attempt usage for selected models."""
+    wanted = {
+        model.strip().casefold()
+        for model in models
+        if isinstance(model, str) and model.strip()
+    }
+    merged = _new_token_stats_agg()
+    if not wanted:
+        return _pack_stats(merged)
+    for model, raw in _channel_model_stats_raw(channel_key, since_ts).items():
+        if str(model).casefold() in wanted:
+            _merge_token_stats_agg(merged, raw)
+    return _pack_stats(merged)
 
 
 def apikey_model_stats(api_key_name: str, since_ts: float) -> list[dict]:
