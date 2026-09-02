@@ -37,7 +37,10 @@ INACTIVITY_FLUSHED_S = 10 * 60.0
 CONNECT_TIMEOUT_S = 15.0
 UNARY_RPC_TIMEOUT_S = 20.0
 REQUEST_TIMEOUT_S = 300.0
-SOCKET_RECV_POLL_S = 0.5
+# Cursor serializes SSL_read/SSL_write to avoid CPython/OpenSSL data races.  A
+# short bounded recv keeps queued H2 writes and close() responsive without
+# concurrent access to the same SSLSocket.
+SOCKET_RECV_POLL_S = 0.1
 
 MAX_EFFECTIVE_PROMPT_BYTES = 100_000
 DEFAULT_CONTEXT_WINDOW = 200_000

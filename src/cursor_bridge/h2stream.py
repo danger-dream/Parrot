@@ -129,6 +129,14 @@ class CursorH2Stream:
         self._conn: H2Connection | None = None
         self._stream_id: int | None = None
         self._lock = threading.RLock()
+        # CPython's SSLSocket cannot safely run recv/send concurrently on the
+        # same OpenSSL SSL object (cpython#151508/#143756).  H2 state and TLS I/O
+        # need separate locks: callers may queue frames while the reader owns a
+        # blocking recv, but only one thread may enter the routed TLS stream.
+        self._io_lock = threading.RLock()
+        # A waiting writer gets priority after the current bounded recv returns;
+        # otherwise the reader can immediately reacquire an unfair Lock forever.
+        self._io_write_pending = threading.Event()
         self._incoming: Queue[tuple[str, bytes]] = Queue()
         self._reader: threading.Thread | None = None
         self._closed = threading.Event()
@@ -181,7 +189,8 @@ class CursorH2Stream:
                 self.write(b"", end_stream=True)
         except BaseException:
             self._closed.set()
-            sock.close()
+            with self._io_lock:
+                sock.close()
             reader = self._reader
             if reader is not None and reader is not threading.current_thread():
                 reader.join(timeout=max(0.1, SOCKET_RECV_POLL_S * 2))
@@ -221,7 +230,8 @@ class CursorH2Stream:
             except Exception:  # routed streams may expose backend-specific I/O errors
                 pass
             try:
-                sock.close()
+                with self._io_lock:
+                    sock.close()
             except Exception:  # routed streams may expose backend-specific close errors
                 pass
         reader = self._reader
@@ -232,11 +242,18 @@ class CursorH2Stream:
     def _sendall_locked(self, payload: bytes) -> None:
         if not payload or self._sock is None:
             return
-        self._sock.settimeout(self.timeout_s)
+        # `_lock` serializes H2Connection state; `_io_lock` independently
+        # serializes the underlying SSL object against `_read_loop.recv()`.
+        self._io_write_pending.set()
         try:
-            self._sock.sendall(payload)
+            with self._io_lock:
+                self._sock.settimeout(self.timeout_s)
+                try:
+                    self._sock.sendall(payload)
+                finally:
+                    self._sock.settimeout(SOCKET_RECV_POLL_S)
         finally:
-            self._sock.settimeout(SOCKET_RECV_POLL_S)
+            self._io_write_pending.clear()
 
     def _flush_outbound_locked(self) -> None:
         conn = self._conn
@@ -270,7 +287,18 @@ class CursorH2Stream:
         assert self._conn is not None
         while not self._closed.is_set():
             try:
-                chunk = self._sock.recv(65535)
+                # SSL_read and SSL_write mutate shared OpenSSL record-layer
+                # state.  Keep recv outside the H2 state lock, but under the
+                # dedicated TLS I/O lock used by send/close.  Yield to a writer
+                # that arrived during the previous bounded recv so it cannot
+                # starve behind immediate reader reacquisition.
+                if self._io_write_pending.is_set():
+                    time.sleep(0)
+                    continue
+                with self._io_lock:
+                    if self._io_write_pending.is_set():
+                        continue
+                    chunk = self._sock.recv(65535)
             except TimeoutError:
                 continue
             except Exception as exc:  # routed streams may wrap socket I/O errors

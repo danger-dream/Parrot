@@ -410,6 +410,53 @@ def test_model_unary_signature_carries_catalog_context(monkeypatch):
     assert seen["timeout_s"] == 0.2
 
 
+def test_cursor_tls_io_serializes_recv_and_send():
+    """The reader and writers must never enter one routed TLS stream together."""
+
+    class BlockingStream:
+        def __init__(self):
+            self.recv_entered = threading.Event()
+            self.release_recv = threading.Event()
+            self.send_entered = threading.Event()
+            self.sent: list[bytes] = []
+            self.timeout = None
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def recv(self, _size):
+            self.recv_entered.set()
+            assert self.release_recv.wait(1)
+            return b""
+
+        def sendall(self, data):
+            self.send_entered.set()
+            self.sent.append(data)
+
+    stream = CursorH2Stream()
+    routed = BlockingStream()
+    stream._sock = routed
+    # `_read_loop` only needs a non-None connection when recv returns EOF.
+    stream._conn = object()  # type: ignore[assignment]
+    reader = threading.Thread(target=stream._read_loop, name="tls-serialization-reader")
+    writer = threading.Thread(target=lambda: stream._sendall_locked(b"frame"), name="tls-serialization-writer")
+    reader.start()
+    assert routed.recv_entered.wait(1)
+    writer.start()
+    try:
+        # Without the TLS I/O lock, sendall enters immediately while recv is
+        # blocked, reproducing CPython/OpenSSL's unsafe concurrent access.
+        assert not routed.send_entered.wait(0.05)
+    finally:
+        routed.release_recv.set()
+    reader.join(timeout=1)
+    writer.join(timeout=1)
+    assert not reader.is_alive()
+    assert not writer.is_alive()
+    assert routed.send_entered.is_set()
+    assert routed.sent == [b"frame"]
+
+
 def _create_server_context(tmp_path) -> ssl.SSLContext:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
