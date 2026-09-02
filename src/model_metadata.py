@@ -263,9 +263,9 @@ def _oauth_account_record(
 ) -> tuple[Mapping[str, Any], str] | None:
     """Return a record only from the account's current real/LKG directory.
 
-    An empty ``models`` list means the account is using a stateless provider
-    fallback (or, for Cursor, has no directory).  In that state an old catalog
-    must never decorate fallback IDs.
+    An ID must exist in both the account's selected ``models`` list and its
+    provider-native catalog. This prevents either a legacy list or a stale
+    catalog from independently decorating a model after discovery has failed.
     """
     scope = normalize_model_name(scope_key)
     if not scope.startswith("oauth:"):
@@ -332,7 +332,7 @@ def _merge_effective_metadata(
     if native and native[1] == "cursor":
         result = dict(binding_metadata)
         cursor_transport_keys = (
-            "name", "family", "vision", "cursorUpstreamVision", "reasoning",
+            "name", "family", "vision", "supportsImages", "cursorUpstreamVision", "reasoning",
             "reasoningEfforts", "defaultReasoningEffort", "toolCall",
             "structuredOutput", "temperature", "modalities", "contextWindow",
             "contextWindowMaxMode", "maxOutputTokens", "compactTriggerTokens",
@@ -400,6 +400,11 @@ def resolve_binding(
     if not model:
         return None
     native = _oauth_account_record(model, scope_key=scope, outbound_model=outbound_model)
+    # A Cursor account without a matching AvailableModels record is not a
+    # routable/capability source. Fail closed before scoped/default/legacy
+    # models.dev bindings can reintroduce stale transport limits or features.
+    if scope and scope.startswith("oauth:cursor:") and native is None:
+        return None
     cfg = config.get()
     defaults, scoped = _binding_roots(cfg)
     if scope:

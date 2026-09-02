@@ -273,6 +273,7 @@ def metadata_from_record(record: Mapping[str, Any] | None) -> dict[str, Any]:
         # AgentService bridge does not yet serialize SelectedImage. Effective
         # Parrot metadata must describe the usable intersection, not overclaim.
         "vision": False,
+        "supportsImages": False,
         "cursorUpstreamVision": bool(record.get("supports_images")),
         "reasoning": bool(record.get("reasoning") or efforts),
         "reasoningEfforts": efforts,

@@ -4095,17 +4095,22 @@ def account_model_records(account_or_key: dict | str) -> list[dict]:
     if not isinstance(account, dict):
         return []
     if provider_of(account) == "cursor":
-        raw = ((account.get("cursor_model_catalog") or {}).get("models") or [])
+        from .cursor_bridge import catalog as cursor_catalog
+
         records = []
-        for item in raw:
-            if not isinstance(item, dict) or not item.get("id"): continue
+        for item in cursor_catalog.catalog_records(account):
+            metadata = cursor_catalog.metadata_from_record(item)
             records.append({
-                "id": str(item["id"]), "name": item.get("name"),
-                "description": item.get("tagline"), "contextWindow": item.get("context_window"),
-                "contextWindowMaxMode": item.get("context_window_max_mode"),
-                "maxOutputTokens": item.get("max_tokens"), "reasoning": item.get("reasoning"),
-                "reasoningEfforts": list(item.get("reasoning_efforts") or []),
-                "supportsImages": item.get("supports_images"), "aliases": list(item.get("aliases") or []),
+                "id": str(item["id"]), "name": metadata.get("name"),
+                "description": metadata.get("description"),
+                "contextWindow": metadata.get("contextWindow"),
+                "contextWindowMaxMode": metadata.get("contextWindowMaxMode"),
+                "maxOutputTokens": metadata.get("maxOutputTokens"),
+                "reasoning": metadata.get("reasoning"),
+                "reasoningEfforts": list(metadata.get("reasoningEfforts") or []),
+                "supportsImages": metadata.get("supportsImages"),
+                "cursorUpstreamVision": metadata.get("cursorUpstreamVision"),
+                "aliases": list(metadata.get("aliases") or []),
             })
         return records
     raw = ((account.get("account_model_catalog") or {}).get("models") or [])
@@ -4118,9 +4123,21 @@ def account_model_selection(account_or_key: dict | str) -> dict:
     if not isinstance(account, dict):
         raise ValueError("OAuth account not found")
     provider = provider_of(account)
-    models = list(dict.fromkeys(
+    records = account_model_records(account)
+    configured_models = list(dict.fromkeys(
         str(model).strip() for model in account.get("models") or [] if str(model).strip()
     ))
+    if provider == "cursor":
+        # Cursor routes only the intersection of the last successful model list
+        # and native catalog. Neither a legacy list nor stale records may revive
+        # a model independently after discovery has failed.
+        native_ids = {
+            str(item.get("id") or "").strip()
+            for item in records if str(item.get("id") or "").strip()
+        }
+        models = [model for model in configured_models if model in native_ids]
+    else:
+        models = configured_models
     if models:
         source = str(account.get("last_model_sync_source") or "lkg:legacy-config")
         fallback = False
@@ -4137,9 +4154,14 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         "synced_at": str(account.get("last_model_sync") or ""),
         "attempted_at": str(account.get("last_model_sync_attempt") or ""),
         "error": str(account.get("last_model_sync_error") or ""),
-        # Metadata is only attached to IDs in the account LKG. Stateless
-        # configured/built-in fallbacks intentionally return no records.
-        "records": account_model_records(account) if not fallback else [],
+        # Cursor records follow the intersection above; other providers retain
+        # their existing account-catalog behavior. Stateless fallbacks expose no
+        # records for any provider.
+        "records": (
+            [item for item in records if str(item.get("id") or "").strip() in models]
+            if provider == "cursor" and not fallback
+            else records if not fallback else []
+        ),
     }
 
 

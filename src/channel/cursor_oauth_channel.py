@@ -85,16 +85,19 @@ class CursorOAuthChannel(OpenAIApiChannel):
         self._records = cursor_catalog.catalog_records(account)
         self._disabled_models = oauth_manager.cursor_disabled_models(account)
         self._max_context_defaults = oauth_manager.cursor_max_context_models(account)
+        # Cursor has no trustworthy static/legacy model fallback. Route only
+        # IDs present in both the last successful model list and native catalog;
+        # either side missing/stale stays fail-closed until discovery succeeds.
+        selected_models = {
+            str(item).strip() for item in account.get("models") or [] if str(item).strip()
+        }
         catalog_models = [
             str(item.get("id") or "") for item in self._records if item.get("id")
         ]
-        if catalog_models:
-            models = [model for model in catalog_models if model not in self._disabled_models]
-        else:
-            models = [
-                str(item) for item in account.get("models") or []
-                if str(item) and str(item) not in self._disabled_models
-            ]
+        models = [
+            model for model in catalog_models
+            if model in selected_models and model not in self._disabled_models
+        ]
         self.models = list(dict.fromkeys(models))
 
         # Reuse the mature OpenAI Chat request/response implementation while

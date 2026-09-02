@@ -156,6 +156,43 @@ def test_cursor_variant_resolution_uses_real_native_slug_shapes():
     ) == "gpt-5.5-extra-high-fast"
 
 
+@pytest.mark.parametrize(
+    ("slug", "effort", "thinking", "fast"),
+    [
+        ("fixture-model-thinking-max", "max", True, False),
+        ("fixture-model-max-thinking", "max", True, False),
+        ("fixture-model-fast-max", "max", False, True),
+        ("fixture-model-max-fast", "max", False, True),
+        ("fixture-model-fast-extra-high", "xhigh", False, True),
+    ],
+)
+def test_cursor_variant_parser_preserves_reverse_and_fast_suffix_orders(
+    slug, effort, thinking, fast,
+):
+    record = cursor_catalog.record_from_model(CursorModel(
+        id="fixture-model",
+        name="Fixture model",
+        reasoning=True,
+        context_window=200_000,
+        max_tokens=32_000,
+        supports_images=False,
+        supports_max_mode=True,
+        legacy_slugs=(slug,),
+    ))
+    assert record["variants"] == [{
+        "id": slug,
+        "effort": effort,
+        "fast": fast,
+        "thinking": thinking,
+    }]
+    assert cursor_catalog.resolve_variant(
+        record,
+        reasoning_effort=effort,
+        thinking=thinking,
+        fast=fast,
+    ) == slug
+
+
 def test_cursor_max_suffix_is_reasoning_effort_independent_from_max_context():
     record = next(item for item in _catalog()["models"] if item["id"] == "claude-fable-5")
     max_variant = next(item for item in record["variants"] if item["id"].endswith("-max"))
@@ -193,6 +230,28 @@ def test_cursor_max_suffix_is_reasoning_effort_independent_from_max_context():
         legacy_slugs=("gpt-5.1-codex-max-high",),
     ))
     assert codex["reasoning_efforts"] == ["high"]
+
+    # Read-time repair must also remove a stale effort invented from the
+    # canonical ``codex-max`` base in an already persisted catalog.
+    stale_codex = copy.deepcopy(codex)
+    stale_codex["reasoning_efforts"] = ["max", "high"]
+    stale_codex["variants"] = [{
+        "id": "gpt-5.1-codex-max-high",
+        "effort": "max",
+        "fast": False,
+        "thinking": False,
+    }]
+    repaired_codex = cursor_catalog.catalog_records({
+        "schema": 1,
+        "models": [stale_codex],
+    })[0]
+    assert repaired_codex["reasoning_efforts"] == ["high"]
+    assert repaired_codex["variants"] == [{
+        "id": "gpt-5.1-codex-max-high",
+        "effort": "high",
+        "fast": False,
+        "thinking": False,
+    }]
 
     unknown = cursor_catalog.record_from_model(CursorModel(
         id="unknown-cursor-model",
@@ -247,11 +306,30 @@ def test_cursor_fable_5_1_exposes_and_routes_real_max_effort():
     metadata = cursor_catalog.metadata_from_record(record)
     assert metadata["contextWindow"] == 300_000
     assert metadata["contextWindowMaxMode"] == 1_000_000
+    assert metadata["vision"] is False
+    assert metadata["supportsImages"] is False
+    assert metadata["cursorUpstreamVision"] is True
 
 
 def test_cursor_models_dev_binding_keeps_cursor_transport_metadata_authoritative():
     account = _install_account()
     scope = "oauth:cursor:cursor-user-1"
+    native = model_metadata.resolve_binding(
+        "claude-fable-5",
+        scope_key=scope,
+        outbound_model="claude-fable-5-thinking-medium",
+    )
+    assert native is not None and native.authority == "account-upstream"
+    assert native.metadata["vision"] is False
+    assert native.metadata["supportsImages"] is False
+    assert native.metadata["cursorUpstreamVision"] is True
+    account_record = next(
+        item for item in oauth_manager.account_model_records(account)
+        if item["id"] == "claude-fable-5"
+    )
+    assert account_record["supportsImages"] is False
+    assert account_record["cursorUpstreamVision"] is True
+
     config.update(lambda cfg: cfg.update(modelBindings={
         "defaults": {},
         "scoped": {scope: {"claude-fable-5": {
@@ -288,6 +366,51 @@ def test_cursor_models_dev_binding_keeps_cursor_transport_metadata_authoritative
     assert result["created"] == []
     assert result["updated"] == []
     assert result["unmatched"] == []
+
+
+@pytest.mark.parametrize("catalog_state", ["empty", "missing-record"])
+def test_cursor_missing_native_record_fails_closed_despite_legacy_model_and_binding(
+    catalog_state,
+):
+    account = _account()
+    if catalog_state == "empty":
+        account["cursor_model_catalog"] = {}
+        expected_models = []
+    else:
+        account["cursor_model_catalog"]["models"] = [
+            item for item in account["cursor_model_catalog"]["models"]
+            if item["id"] == "composer-2.5"
+        ]
+        expected_models = ["composer-2.5"]
+    # Preserve the historical list to reproduce the dangerous mixed state.
+    assert "claude-fable-5" in account["models"]
+    scope = "oauth:cursor:cursor-user-1"
+    config.update(lambda cfg: cfg.update({
+        "oauthAccounts": [account],
+        "modelBindings": {
+            "defaults": {"claude-fable-5": {
+                "target": "302ai/chatgpt-4o-latest",
+                "source": "auto",
+            }},
+            "scoped": {},
+        },
+    }))
+    saved = oauth_manager.get_account("cursor:cursor-user-1")
+
+    selection = oauth_manager.account_model_selection(saved)
+    assert selection["models"] == expected_models
+    assert [item["id"] for item in selection["records"]] == expected_models
+    assert CursorOAuthChannel(saved).list_client_models() == expected_models
+    assert model_metadata.resolve_binding(
+        "claude-fable-5",
+        scope_key=scope,
+        outbound_model="claude-fable-5",
+    ) is None
+    assert model_metadata.get_metadata(
+        "claude-fable-5",
+        scope_key=scope,
+        outbound_model="claude-fable-5",
+    ) == {}
 
 
 def test_cursor_channel_maps_chat_and_anthropic_controls(monkeypatch):
