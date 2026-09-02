@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Optional
 
 from .. import oauth_manager
@@ -51,6 +50,7 @@ class OAuthChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
+        cc_request_context = cc_mimicry.request_context_from(requested_body)
         translator_ctx: Optional[dict] = None
         if ingress_protocol == "chat":
             stream_opts = requested_body.get("stream_options") or {}
@@ -92,6 +92,8 @@ class OAuthChannel(Channel):
                 "ProtocolMatrix should have guarded this route."
             )
 
+        if cc_request_context:
+            requested_body.update(cc_request_context)
         # OAuth：确保 token 有效 → 走完整 CC 伪装 → 拼 OAuth headers
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
 
@@ -101,17 +103,18 @@ class OAuthChannel(Channel):
             protocol="anthropic",
             bridge=translator_ctx is not None,
         )
-        # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
-        sid = str(uuid.uuid4())
+        body_with_model = cc_mimicry.ensure_request_context(body_with_model)
+        sid = body_with_model[cc_mimicry.PARROT_CC_SESSION_ID_KEY]
         payload, dynamic_map = cc_mimicry.transform_request(
-            body_with_model, email=self.email, session_id=sid)
+            body_with_model, email=self.email, session_id=sid, auth_mode="oauth")
         signed = cc_mimicry.sign_body(payload)
         downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
         original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
         wants_context_1m = body_with_model.get(cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY)
         wants_fast_mode = body_with_model.get(cc_mimicry.PARROT_WANTS_FAST_MODE_KEY)
         headers = cc_mimicry.build_upstream_headers(
-            access_token, session_id=sid, model=resolved_model, payload=payload,
+            access_token, session_id=sid, auth_scheme="bearer", auth_mode="oauth",
+            model=resolved_model, payload=payload,
             downstream_betas=downstream_betas, original_model=original_model,
             wants_context_1m=wants_context_1m,
             wants_fast_mode=wants_fast_mode)

@@ -125,7 +125,7 @@ def test_legacy_transform_filters_share_provider_allowlists():
     assert bridge == {"model": "claude", "messages": []}
 
 
-def test_anthropic_bridge_filter_is_provider_capability_not_source_validator():
+def test_cc_v258_bridge_filter_preserves_cc_fields_as_provider_capability():
     anthropic = FakeChannel(protocol="anthropic", type="api", cc_mimicry=True)
     filtered = registry.filter_request_payload(
         anthropic,
@@ -139,7 +139,28 @@ def test_anthropic_bridge_filter_is_provider_capability_not_source_validator():
         protocol="anthropic",
         bridge=True,
     )
-    assert filtered == {"model": "claude", "messages": [], "system": "ok"}
+    assert filtered == {
+        "model": "claude",
+        "messages": [],
+        "system": "ok",
+        "thinking": {"type": "enabled"},
+        "context_management": {"edits": []},
+    }
+
+    standard = FakeChannel(protocol="anthropic", type="api", cc_mimicry=False)
+    standard_filtered = registry.filter_request_payload(
+        standard,
+        {
+            "model": "claude",
+            "messages": [],
+            "system": "ok",
+            "thinking": {"type": "enabled"},
+            "context_management": {"edits": []},
+        },
+        protocol="anthropic",
+        bridge=True,
+    )
+    assert standard_filtered == {"model": "claude", "messages": [], "system": "ok"}
 
 
 def test_anthropic_native_filter_keeps_official_fields_and_drops_foreign_hints():

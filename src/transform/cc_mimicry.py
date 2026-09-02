@@ -1,17 +1,9 @@
-"""CC 伪装（Claude Code CLI 模拟请求构造）。
+"""Claude Code messages mimicry for the empirically verified v2.1.258 wire model.
 
-⚠⚠⚠ 本模块是从 cc-proxy/server.py 的逐字移植 ⚠⚠⚠
-
-任何修改都可能被 Anthropic 侧检测为异常流量导致账号封禁。允许的变动仅限：
-  - 文件头路径 / device_id 文件名（`.cc_proxy_ids.json` → `.anthropic_proxy_ids.json`）
-  - `build_metadata()` 接受 email 参数（原来从全局 oauth 读）
-  - `transform_request()` 接受 email 参数，透传给 `build_metadata()`
-  - 提供 `load_config()` 适配层把 anthropic-proxy 的 `cchMode` / `cchStaticValue`
-    翻译成 cc-proxy 原 key 名（`cch_mode` / `cch_static_value`），这样下面所有
-    函数体可以保留读 `cch_mode` 的原样写法，无需改动。
-
-其它所有常量、随机种子、hash 算法、字节级边界、函数体逻辑 100% 与 cc-proxy 一致。
-对比测试（tests/compare_transform.py）逐字节校验。
+The protocol-critical pieces in this module (fingerprint, billing attribution,
+CCH hash view, body profiles and headers) are validated against captured
+v2.1.258 fixtures.  Parrot-specific compatibility behaviour remains bounded to
+this transform and private ``_parrot_*`` request context never reaches the wire.
 """
 
 import hashlib
@@ -32,30 +24,68 @@ from .. import config as _ap_config
 # 所以 BASE_DIR = cc_mimicry.py 所在目录向上两级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CC_VERSION = "2.1.156"
+CC_VERSION = "2.1.258"
 FINGERPRINT_SALT = "59cf53e54c78"
+FINGERPRINT_INDICES = (4, 7, 20)
 CC_ENTRYPOINT = "sdk-cli"
 USER_TYPE = "external"
 
-BETAS = [
-    "claude-code-20250219",
-    "fast-mode-2026-02-01",                 # Claude Fast mode：仅显式 speed=fast / 下游 beta 请求时才进 messages
-    "context-1m-2025-08-07",               # 长上下文能力位：显式请求 1M 且模型支持时才进 messages
-    "interleaved-thinking-2025-05-14",
-    "context-management-2025-06-27",       # 仅最终 payload 含 context_management 时带
-    "prompt-caching-scope-2026-01-05",
-    "mid-conversation-system-2026-04-07",  # 模型白名单门控
-    "effort-2025-11-24",
-    "extended-cache-ttl-2025-04-11",       # 与 ttl:"1h" 同生共死
-    "oauth-2025-04-20",                    # OAuth 鉴权层；messages 头拼装时过滤掉（§6/§7）
-]
-
 FAST_MODE_BETA = "fast-mode-2026-02-01"
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
-MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07"
+INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
+THINKING_TOKEN_COUNT_BETA = "thinking-token-count-2026-05-13"
 CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05"
+MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07"
+ADVISOR_TOOL_BETA = "advisor-tool-2026-03-01"
+ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20"
+EFFORT_BETA = "effort-2025-11-24"
+SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01"
+STRUCTURED_OUTPUTS_BETA = "structured-outputs-2025-12-15"
+CACHE_DIAGNOSIS_BETA = "cache-diagnosis-2026-04-07"
 EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 OAUTH_BETA = "oauth-2025-04-20"
+
+# Public compatibility surface: a superset used only when a caller explicitly
+# supplies ``betas=``.  Normal requests select one exact profile below.
+BETAS = [
+    "claude-code-20250219", FAST_MODE_BETA, CONTEXT_1M_BETA,
+    INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
+    MID_CONVERSATION_SYSTEM_BETA, ADVISOR_TOOL_BETA,
+    ADVANCED_TOOL_USE_BETA, EFFORT_BETA, SERVER_SIDE_FALLBACK_BETA,
+    FALLBACK_CREDIT_BETA, STRUCTURED_OUTPUTS_BETA, CACHE_DIAGNOSIS_BETA,
+    EXTENDED_CACHE_TTL_BETA,
+]
+
+_MAIN_BETAS = [
+    "claude-code-20250219", INTERLEAVED_THINKING_BETA,
+    THINKING_TOKEN_COUNT_BETA, CONTEXT_MANAGEMENT_BETA,
+    PROMPT_CACHING_SCOPE_BETA, MID_CONVERSATION_SYSTEM_BETA,
+    ADVANCED_TOOL_USE_BETA, EFFORT_BETA, CACHE_DIAGNOSIS_BETA,
+]
+_FABLE_API_KEY_BETAS = [
+    "claude-code-20250219", INTERLEAVED_THINKING_BETA,
+    THINKING_TOKEN_COUNT_BETA, CONTEXT_MANAGEMENT_BETA,
+    PROMPT_CACHING_SCOPE_BETA, MID_CONVERSATION_SYSTEM_BETA,
+    ADVISOR_TOOL_BETA, ADVANCED_TOOL_USE_BETA, EFFORT_BETA,
+    SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
+    CACHE_DIAGNOSIS_BETA,
+]
+_OPUS_5_BETAS = [
+    "claude-code-20250219", CONTEXT_1M_BETA,
+    INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
+    MID_CONVERSATION_SYSTEM_BETA, ADVISOR_TOOL_BETA,
+    ADVANCED_TOOL_USE_BETA, EFFORT_BETA, FALLBACK_CREDIT_BETA,
+    CACHE_DIAGNOSIS_BETA,
+]
+_SIDE_QUERY_BETAS = [
+    INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
+    CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
+    STRUCTURED_OUTPUTS_BETA, CACHE_DIAGNOSIS_BETA,
+]
 
 # server.py 会把下游 HTTP 头里的 beta / 原始模型名折进 body 的私有字段，
 # 这样调度 / failover / Channel 抽象不用整体改签名；transform_request 不会透传这些字段。
@@ -63,6 +93,13 @@ PARROT_DOWNSTREAM_BETAS_KEY = "_parrot_downstream_betas"
 PARROT_ORIGINAL_MODEL_KEY = "_parrot_original_model"
 PARROT_WANTS_CONTEXT_1M_KEY = "_parrot_wants_context_1m"
 PARROT_WANTS_FAST_MODE_KEY = "_parrot_wants_fast_mode"
+PARROT_CC_SESSION_ID_KEY = "_parrot_claude_code_session_id"
+PARROT_CC_PROMPT_ID_KEY = "_parrot_cc_prompt_id"
+
+CC_REQUEST_CONTEXT_KEYS = frozenset({
+    PARROT_CC_SESSION_ID_KEY,
+    PARROT_CC_PROMPT_ID_KEY,
+})
 
 ONE_M_CONTEXT_TOKENS = 1_000_000
 
@@ -101,11 +138,9 @@ def _load_or_create_device_id():
 DEVICE_ID = _load_or_create_device_id()
 
 
-# ─── load_config 适配层 ──────────────────────────────────────────
-# 下方移植的函数（build_system_blocks / sign_body）原版读的是
-# cc-proxy 的 cfg["cch_mode"] / cfg["cch_static_value"]；
-# 这里提供适配的 load_config() 返回带旧 key 的 dict，
-# 保证下方代码体与 cc-proxy 逐字一致、行为不变。
+# ─── load_config compatibility layer ─────────────────────────────
+# Keep the internal snake_case keys so dynamic/static/disabled semantics remain
+# compatible with existing Parrot configuration and callers.
 
 def load_config():
     cfg = _ap_config.get()
@@ -115,32 +150,102 @@ def load_config():
     }
 
 
-# ─── Fingerprint ───（与 cc-proxy 一字不改）
+# ─── Fingerprint / billing attribution ─────────────────────────────
+
+_SYSTEM_REMINDER_RE = re.compile(
+    r"^\s*<system-reminder>[\s\S]*</system-reminder>\s*$"
+)
+
+
+def select_fingerprint_prompt(messages) -> str:
+    """Return CC v258's first valid text from the first non-meta user turn.
+
+    Explicit ``isMeta`` flags and complete wire ``<system-reminder>`` blocks do
+    not contribute.  A ``<session>...`` side-query block is ordinary text.
+    """
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "user" or msg.get("isMeta") is True:
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            blocks = ({"type": "text", "text": content},)
+        elif isinstance(content, list):
+            blocks = content
+        else:
+            blocks = ()
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "text" or block.get("isMeta") is True:
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if _SYSTEM_REMINDER_RE.fullmatch(text):
+                continue
+            return text
+    return ""
+
+
+def _js_utf16_selected_chars(text: str, indices=FINGERPRINT_INDICES) -> str:
+    raw = text.encode("utf-16-le", errors="surrogatepass")
+    units = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+    selected = []
+    for index in indices:
+        if index >= len(units):
+            selected.append("0")
+            continue
+        unit = units[index]
+        # Selecting one half of a surrogate pair yields a lone JS surrogate.
+        # Node/Bun's UTF-8 encoder hashes that value as U+FFFD.
+        selected.append("\ufffd" if 0xD800 <= unit <= 0xDFFF else chr(unit))
+    return "".join(selected)
+
 
 def compute_fingerprint(messages):
-    # v2.1.156：输入源为「第一个 user message 的最后一个 text content block」
-    # （即实际用户 prompt，跳过前面的 system-reminder block），索引 [4,7,18]。
-    # salt/sha256 不变。6 组 canonical body 离线复核 6/6 命中。
-    prompt_text = ""
-    for msg in messages:
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                prompt_text = content
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        prompt_text = block.get("text", "")   # 取最后一个 text block（不 break）
-            break
-    indices = [4, 7, 18]
-    chars = "".join(prompt_text[i] if i < len(prompt_text) else "0" for i in indices)
-    return hashlib.sha256(f"{FINGERPRINT_SALT}{chars}{CC_VERSION}".encode()).hexdigest()[:3]
+    prompt_text = select_fingerprint_prompt(messages)
+    chars = _js_utf16_selected_chars(prompt_text)
+    material = f"{FINGERPRINT_SALT}{chars}{CC_VERSION}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:3]
 
 
-# ─── System prompt ───（与 cc-proxy 一字不改）
+def _valid_prompt_id(value) -> str | None:
+    text = str(value or "").strip()
+    try:
+        return str(uuid.UUID(text))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
-def build_system_blocks(messages, *, inject_cache=True):
-    fp = compute_fingerprint(messages)
+
+def ensure_request_context(body: dict) -> dict:
+    """Return a shallow request copy with stable logical-request CC context."""
+    out = dict(body or {})
+    sid = str(out.get(PARROT_CC_SESSION_ID_KEY) or "").strip()
+    if not sid:
+        sid = str(uuid.uuid4())
+    out[PARROT_CC_SESSION_ID_KEY] = sid
+    prompt_id = _valid_prompt_id(out.get(PARROT_CC_PROMPT_ID_KEY))
+    out[PARROT_CC_PROMPT_ID_KEY] = prompt_id or str(uuid.uuid4())
+    return out
+
+
+def request_context_from(body: dict) -> dict:
+    return {
+        key: body[key]
+        for key in CC_REQUEST_CONTEXT_KEYS
+        if isinstance(body, dict) and key in body
+    }
+
+
+def build_system_blocks(
+    messages,
+    *,
+    inject_cache=True,
+    fingerprint_value=None,
+    prompt_id=None,
+    workload=None,
+    is_subagent=False,
+    prev_req=None,
+):
+    fp = fingerprint_value or compute_fingerprint(messages)
     version = f"{CC_VERSION}.{fp}"
     cfg = load_config()
     cch_mode = _normalize_cch_mode(cfg.get("cch_mode", "dynamic"))
@@ -151,11 +256,23 @@ def build_system_blocks(messages, *, inject_cache=True):
             parts.append("cch=00000")
         elif cch_mode == "static":
             parts.append(f"cch={_normalize_cch_value(cfg.get('cch_static_value', '00000'))}")
+        if isinstance(workload, str) and workload.strip():
+            parts.append(f"cc_workload={workload.strip()}")
+        if is_subagent is True:
+            parts.append("cc_is_subagent=true")
+        if isinstance(prev_req, str) and re.fullmatch(r"req_[A-Za-z0-9_-]{1,36}", prev_req):
+            parts.append(f"cc_prev_req={prev_req}")
+        valid_prompt_id = _valid_prompt_id(prompt_id)
+        if valid_prompt_id:
+            parts.append(f"cc_prompt_id={valid_prompt_id}")
         attribution = "x-anthropic-billing-header: " + "; ".join(parts) + ";"
         blocks.append({"type": "text", "text": attribution})
-    cc_block = {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+    cc_block = {
+        "type": "text",
+        "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    }
     if inject_cache:
-        cc_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        cc_block["cache_control"] = {"type": "ephemeral"}
     blocks.append(cc_block)
     return blocks
 
@@ -256,7 +373,7 @@ def _normalize_message_for_api(msg):
 def _normalize_messages_for_api(messages):
     return [_normalize_message_for_api(msg) for msg in (messages or [])]
 
-# ─── 缓存断点 ───（与 cc-proxy 一字不改）
+# ─── Cache breakpoints ────────────────────────────────────────────
 
 def _inject_cache_on_msg(msg):
     msg = dict(msg)
@@ -466,19 +583,17 @@ def _strip_assistant_thinking_blocks(messages):
     return result
 
 
-# ─── Metadata ───（仅签名参数化 email；函数体与 cc-proxy 一致）
+# ─── Metadata ──────────────────────────────────────────────────────
 
 def build_metadata(email="", session_id=None):
-    account_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, email)) if email else ""
+    # v258 wire keeps account_uuid empty even when an OAuth account email exists.
     sid = session_id or str(uuid.uuid4())
-    # §8：真实 body metadata.user_id 内含 session_id，且与 header
-    # X-Claude-Code-Session-Id 同值（complete-audit §5.2）。
     return {"user_id": json.dumps(
-        {"device_id": DEVICE_ID, "account_uuid": account_uuid, "session_id": sid},
+        {"device_id": DEVICE_ID, "account_uuid": "", "session_id": sid},
         separators=(",", ":"))}
 
 
-# ─── 工具名重写 ───（与 cc-proxy 一字不改）
+# ─── Tool-name compatibility ──────────────────────────────────────
 
 TOOL_NAME_REWRITES = {"sessions_": "cc_sess_", "session_": "cc_ses_"}  # 静态前缀映射（保留兼容）
 
@@ -664,21 +779,68 @@ def apply_opus_adaptive_thinking(payload, model):
     return payload
 
 
-# ─── 请求转换 ───（仅签名参数化 email；函数体与 cc-proxy 一致）
+# ─── Request body profiles ─────────────────────────────────────────
 
-def transform_request(body, email="", session_id=None):
+_SIDE_QUERY_OUTPUT_CONFIG = {
+    "format": {
+        "type": "json_schema",
+        "schema": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _is_fable_model(model) -> bool:
+    return str(model or "").lower() == "claude-fable-5"
+
+
+def _is_opus_5_model(model) -> bool:
+    value = str(model or "").lower()
+    return value == "claude-opus-5" or value.startswith("claude-opus-5-")
+
+
+def _is_side_query_request(body: dict, model=None, *, messages=None) -> bool:
+    if not str(model or body.get("model") or "").lower().startswith("claude-haiku-"):
+        return False
+    output_config = body.get("output_config")
+    if isinstance(output_config, dict) and isinstance(output_config.get("format"), dict):
+        return True
+    prompt = select_fingerprint_prompt(messages if messages is not None else body.get("messages", []))
+    return prompt.lstrip().startswith("<session>")
+
+
+def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
     explicit_cache_control = cache_hints.has_anthropic_cache_control(body)
-    messages = body.get("messages", [])
-    user_system = body.get("system")
-    messages = inject_user_system_to_messages(messages, user_system)
+    original_messages = body.get("messages", [])
+    fingerprint_value = compute_fingerprint(original_messages)
+    model = body.get("model", "claude-sonnet-4-20250514")
+    side_query = _is_side_query_request(body, model, messages=original_messages)
+    fable_main = _is_fable_model(model) and not side_query
+    # No authoritative OAuth Fable-main body exists.  Preserve explicit fields
+    # there and apply only the observed auth/header differences.
+    auto_profile = not (fable_main and auth_mode == "oauth")
+
+    sid = str(session_id or body.get(PARROT_CC_SESSION_ID_KEY) or "").strip() or str(uuid.uuid4())
+    prompt_id = None if side_query else body.get(PARROT_CC_PROMPT_ID_KEY)
+    if prompt_id is None and not side_query:
+        prompt_id = str(uuid.uuid4())
+
+    messages = inject_user_system_to_messages(original_messages, body.get("system"))
     messages = _normalize_messages_for_api(messages)
     messages = _strip_assistant_thinking_blocks(messages)
     if not explicit_cache_control:
         messages = _strip_message_cache_control(messages)
-    system_blocks = build_system_blocks(messages, inject_cache=False)
-    model = body.get("model", "claude-sonnet-4-20250514")
+    system_blocks = build_system_blocks(
+        original_messages,
+        inject_cache=False,
+        fingerprint_value=fingerprint_value,
+        prompt_id=prompt_id,
+    )
 
-    # 动态工具名映射（tools > 5 时触发）
     dynamic_tool_map = None
     if body.get("tools"):
         raw_tools = body["tools"]
@@ -687,101 +849,191 @@ def transform_request(body, email="", session_id=None):
         if dynamic_tool_map:
             print(f"  [tool] dynamic mapping {len(dynamic_tool_map)} tools")
 
-    # §15.1：严格按 CC v2.1.156 wire order 构造 payload（sign_body 按插入序序列化，
-    # 构造顺序 = wire order）：model, messages, system, tools, metadata,
-    # max_tokens, speed, thinking, context_management, output_config, stream。
-    # §15.2 B2：cc_mimicry 链路不注入 temperature/top_p/top_k（CC body 无此字段）。
-    # §15.2 B3：max_tokens 缺省 64000（CC 默认）。§8 B5：metadata.session_id 与
-    # header X-Claude-Code-Session-Id 同源。
-    payload = {
-        "model": model,
-        "messages": messages,
-        "system": system_blocks,
-    }
+    # v258 insertion order is the wire order.  Optional compatibility fields are
+    # inserted adjacent to their native section and all private fields are consumed.
+    payload = {"model": model, "messages": messages, "system": system_blocks}
 
     if body.get("tools"):
         tools = _strip_tool_cache_control(
             [dict(t) if isinstance(t, dict) else t for t in body["tools"]],
             preserve_cache_control=explicit_cache_control,
         )
-        for t in tools:
-            if isinstance(t, dict) and "name" in t:
-                t["name"] = _sanitize_tool_name(t["name"], dynamic_tool_map)
+        for tool in tools:
+            if isinstance(tool, dict) and "name" in tool:
+                tool["name"] = _sanitize_tool_name(tool["name"], dynamic_tool_map)
         payload["tools"] = tools
 
     top_cache = cache_hints.top_level_cache_control(body)
     if top_cache:
         payload["cache_control"] = top_cache
-    cache_hints.apply_anthropic_block_cache_breakpoints(payload)
+    if not side_query or explicit_cache_control:
+        cache_hints.apply_anthropic_block_cache_breakpoints(
+            payload,
+            default_cache_control={"type": "ephemeral"},
+        )
 
-    # tool_choice：CC 不"主动加"，但客户端显式传入时必须透传（含工具名混淆），
-    # 否则会吞掉下游强制/禁用工具的意图。抓包未含此字段是会话未用到，非协议禁止。
     if "tool_choice" in body:
-        tc = body["tool_choice"]
-        if isinstance(tc, dict) and "name" in tc:
-            tc = dict(tc)
-            tc["name"] = _sanitize_tool_name(tc["name"], dynamic_tool_map)
-        payload["tool_choice"] = tc
+        tool_choice = body["tool_choice"]
+        if isinstance(tool_choice, dict) and "name" in tool_choice:
+            tool_choice = dict(tool_choice)
+            tool_choice["name"] = _sanitize_tool_name(tool_choice["name"], dynamic_tool_map)
+        payload["tool_choice"] = tool_choice
 
-    payload["metadata"] = build_metadata(email, session_id=session_id)
-    payload["max_tokens"] = body.get("max_tokens", 64000)
+    payload["metadata"] = build_metadata(email, session_id=sid)
+    payload["max_tokens"] = body.get("max_tokens", 32000 if side_query else 64000)
 
     if request_wants_fast_mode(body):
         payload["speed"] = "fast"
 
     if "thinking" in body:
         payload["thinking"] = body["thinking"]
+    elif side_query:
+        payload["thinking"] = {"type": "disabled"}
+    elif auto_profile:
+        payload["thinking"] = {"type": "adaptive", "display": "omitted"}
 
     if "context_management" in body:
         payload["context_management"] = body["context_management"]
-    elif "thinking" in body:
-        t = body["thinking"]
-        _thinking_enabled = isinstance(t, dict) and t.get("type") in ("enabled", "adaptive")
-        if _thinking_enabled:
-            payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+    elif not side_query and auto_profile:
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive"):
+            payload["context_management"] = {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}],
+            }
+
+    if "temperature" in body:
+        payload["temperature"] = body["temperature"]
+    elif side_query:
+        payload["temperature"] = 1
+
+    if "fallbacks" in body:
+        payload["fallbacks"] = body["fallbacks"]
+    elif fable_main and auto_profile:
+        payload["fallbacks"] = "default"
 
     if "output_config" in body:
         payload["output_config"] = body["output_config"]
+    elif side_query:
+        payload["output_config"] = json.loads(json.dumps(_SIDE_QUERY_OUTPUT_CONFIG))
+    elif auto_profile:
+        payload["output_config"] = {"effort": "high"}
+
+    if "diagnostics" in body:
+        payload["diagnostics"] = body["diagnostics"]
+    elif not side_query and auto_profile:
+        payload["diagnostics"] = {"previous_message_id": None}
 
     payload["stream"] = body.get("stream", False)
-
-    # apply_opus_adaptive_thinking 会改 thinking 并可能补 output_config，
-    # 必须在 output_config 写入之后调用（§15.2）。
-    apply_opus_adaptive_thinking(payload, model)
-
     return payload, dynamic_tool_map
 
 
-# ─── CCH 签名 ───（与 cc-proxy 一字不改）
+# ─── CCH v258 signature ────────────────────────────────────────────
 
 CCH_SEED = 0x4D659218E32A3268
 CCH_PLACEHOLDER = b"cch=00000"
+_BILLING_PREFIX = "x-anthropic-billing-header: "
+_CCH_IN_BILLING_RE = re.compile(r"(?<=; )cch=[0-9a-f]{5}(?=;)")
+
+
+def _generated_billing_block(payload_dict):
+    system = payload_dict.get("system") if isinstance(payload_dict, dict) else None
+    if not isinstance(system, list) or not system or not isinstance(system[0], dict):
+        return None
+    block = system[0]
+    text = block.get("text")
+    if block.get("type") != "text" or not isinstance(text, str) or not text.startswith(_BILLING_PREFIX):
+        return None
+    return block
+
+
+def _replace_generated_billing_cch(payload_dict, replacement: str):
+    """Copy the payload while changing only Parrot's generated billing block."""
+    billing = _generated_billing_block(payload_dict)
+    if billing is None:
+        return payload_dict
+    text = billing.get("text", "")
+    updated = _CCH_IN_BILLING_RE.sub(f"cch={replacement}", text, count=1)
+    if updated == text:
+        return payload_dict
+    out = dict(payload_dict)
+    system = list(payload_dict["system"])
+    system[0] = {**billing, "text": updated}
+    out["system"] = system
+    return out
+
+
+def _cch_hash_value(value, *, top_level=False):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if top_level and key == "max_tokens":
+                continue
+            if key == "model" and isinstance(item, str):
+                out[key] = ""
+            else:
+                out[key] = _cch_hash_value(item)
+        return out
+    if isinstance(value, list):
+        return [_cch_hash_value(item) for item in value]
+    return value
+
+
+def cch_hash_view(payload_dict) -> bytes:
+    placeholder_payload = _replace_generated_billing_cch(payload_dict, "00000")
+    view = _cch_hash_value(placeholder_payload, top_level=True)
+    return json.dumps(view, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def compute_cch(payload_dict) -> str:
+    digest = xxhash.xxh64(cch_hash_view(payload_dict), seed=CCH_SEED).intdigest()
+    return f"{digest & 0xFFFFF:05x}"
+
+
+def _generated_cch_offset(body_bytes: bytes, payload_dict) -> int | None:
+    billing = _generated_billing_block(payload_dict)
+    system = payload_dict.get("system") if isinstance(payload_dict, dict) else None
+    if billing is None or not isinstance(system, list):
+        return None
+    system_bytes = json.dumps(
+        system, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    field_bytes = b'"system":' + system_bytes
+    field_start = body_bytes.find(field_bytes)
+    marker_offset = field_bytes.find(CCH_PLACEHOLDER)
+    if field_start < 0 or marker_offset < 0:
+        return None
+    return field_start + marker_offset
 
 
 def sign_body(payload_dict):
-    body_bytes = json.dumps(payload_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # Serialize the final wire body exactly once.  Hash normalization is a
+    # separate view and never becomes the transmitted payload.
+    body_bytes = json.dumps(
+        payload_dict, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
     cfg = load_config()
     if _normalize_cch_mode(cfg.get("cch_mode", "dynamic")) != "dynamic":
         return body_bytes
-    if CCH_PLACEHOLDER not in body_bytes:
+    offset = _generated_cch_offset(body_bytes, payload_dict)
+    if offset is None:
         return body_bytes
-    h = xxhash.xxh64(body_bytes, seed=CCH_SEED).intdigest()
-    cch = f"{h & 0xFFFFF:05x}"
-    return body_bytes.replace(CCH_PLACEHOLDER, f"cch={cch}".encode("ascii"), 1)
+    cch = compute_cch(payload_dict).encode("ascii")
+    start = offset + len(b"cch=")
+    # Patch only the located generated block; user message text is untouched and
+    # no post-signature JSON serialization can reorder the wire payload.
+    return body_bytes[:start] + cch + body_bytes[start + 5:]
 
 
-# ─── 上游 headers（OAuth 版本）───（§7.1 据 v2.1.156 源码真相重写）
+# ─── v258 upstream headers ─────────────────────────────────────────
 
-# Stainless SDK 层固定值（@anthropic-ai/sdk 0.94.0 getPlatformProperties 输出，
-# 抓包 67/67 印证）。OS/Arch/Runtime-Version 取 Parrot 实际运行环境（Linux/x64/node）。
 _STAINLESS_HEADERS = {
-    "X-Stainless-Lang": "js",
-    "X-Stainless-Package-Version": "0.94.0",
-    "X-Stainless-OS": "Linux",
     "X-Stainless-Arch": "x64",
-    "X-Stainless-Runtime": "node",
-    "X-Stainless-Runtime-Version": "v24.3.0",
+    "X-Stainless-Lang": "js",
+    "X-Stainless-OS": "Linux",
+    "X-Stainless-Package-Version": "0.112.1",
     "X-Stainless-Retry-Count": "0",
+    "X-Stainless-Runtime": "node",
+    "X-Stainless-Runtime-Version": "v26.3.0",
     "X-Stainless-Timeout": "600",
 }
 
@@ -976,8 +1228,8 @@ def request_context_1m_override(body=None, *, downstream_betas=None,
 
 
 def should_default_context_1m(model) -> bool:
-    """Parrot 默认策略：Opus 4.x 默认 1M；Sonnet 4.x 只在显式 1M 时开启。"""
-    return _is_opus_4_plus_model(model)
+    """v258 capture default: Opus 5 carries context-1m; Opus 4.8 does not."""
+    return _is_opus_5_model(model)
 
 
 def _is_opus_4_plus_model(model) -> bool:
@@ -994,15 +1246,15 @@ def model_supports_context_1m(model) -> bool:
 
 
 def model_supports_mid_conversation_system(model) -> bool:
-    """CC v2.1.156 mid_conversation_system 模型白名单口径。"""
+    """CC v2.1.258 mid-conversation-system compatibility model gate."""
     m = str(model or "").lower()
     if m.startswith("claude-3-"):
         return True
     return m.startswith((
         "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5",
-        "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
+        "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
         "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-sonnet-4-6",
-        "claude-haiku-4-5",
+        "claude-haiku-4-5", "claude-fable-5",
     ))
 
 
@@ -1017,107 +1269,136 @@ def _payload_has_ttl_1h(obj) -> bool:
     return False
 
 
-def _payload_has_context_management(payload) -> bool:
-    return isinstance(payload, dict) and "context_management" in payload and payload.get("context_management") is not None
+def _insert_beta_before(out: list[str], beta: str, before: str) -> None:
+    if beta in out:
+        return
+    try:
+        index = out.index(before)
+    except ValueError:
+        out.append(beta)
+    else:
+        out.insert(index, beta)
+
+
+def _insert_beta_after(out: list[str], beta: str, after: str) -> None:
+    if beta in out:
+        return
+    try:
+        index = out.index(after) + 1
+    except ValueError:
+        index = 0
+    out.insert(index, beta)
+
+
+def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list[str]:
+    side_query = _is_side_query_request(
+        payload or {}, model, messages=(payload or {}).get("messages", []),
+    )
+    if side_query:
+        out = list(_SIDE_QUERY_BETAS)
+    elif _is_fable_model(model):
+        out = list(_FABLE_API_KEY_BETAS)
+    elif _is_opus_5_model(model):
+        out = list(_OPUS_5_BETAS)
+    else:
+        out = list(_MAIN_BETAS)
+
+    if auth_mode == "oauth":
+        # Observed auth difference: advisor remains while API-key-only fallback
+        # betas disappear.  No unknown OAuth Fable body combination is invented.
+        out = [b for b in out if b not in {
+            SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
+        }]
+        _insert_beta_before(
+            out,
+            ADVISOR_TOOL_BETA,
+            STRUCTURED_OUTPUTS_BETA if side_query else ADVANCED_TOOL_USE_BETA,
+        )
+    return out
 
 
 def _messages_betas_for_request(model=None, betas=None, *, payload=None,
                                 downstream_betas=None, original_model=None,
                                 wants_context_1m=None, wants_fast_mode=None,
-                                allow_any_model_context_1m=False):
-    """返回 /v1/messages anthropic-beta 列表。
+                                allow_any_model_context_1m=False,
+                                auth_mode="api_key"):
+    out = _wire_beta_profile(model, payload, auth_mode=auth_mode)
+    if betas is not None:
+        allowed = [b for b in parse_beta_header(betas) if b != OAUTH_BETA]
+        known = set(BETAS)
+        out = [b for b in out if b in allowed]
+        out.extend(b for b in allowed if b not in known and b not in out)
 
-    规则不再是固定全量 join，而是按最终 payload / 模型 / 下游显式能力请求生成：
-      - oauth-2025-04-20 属 token 端点，messages 永远不带；
-      - context-1m：Opus 4.x 默认开启；Sonnet 4.5/4.6 仅在下游显式 1M 信号时开启；
-        需要强制关闭时可传 wants_context_1m=False；
-      - fast-mode：仅在下游显式 speed=fast / fast-mode beta 时开启；
-      - mid-conversation-system 按 CC 模型白名单带；
-      - context-management 仅最终 payload 含 context_management 时带；
-      - extended-cache-ttl 仅最终 payload 含 ttl:"1h" 时带。
-    """
-    beta_list = BETAS if betas is None else betas
     if wants_fast_mode is None:
         wants_fast_mode = request_wants_fast_mode(
             payload if isinstance(payload, dict) else None,
             downstream_betas=downstream_betas,
         )
     if wants_context_1m is None:
-        wants_context_1m = request_wants_context_1m(
+        explicit_context = request_wants_context_1m(
             payload if isinstance(payload, dict) else None,
             downstream_betas=downstream_betas,
             original_model=original_model,
             resolved_model=model,
-        ) or should_default_context_1m(model)
+        )
+        wants_context_1m = explicit_context or should_default_context_1m(model)
+
     allow_context_1m = bool(wants_context_1m) and (
         bool(allow_any_model_context_1m) or model_supports_context_1m(model)
     )
-    allow_fast_mode = bool(wants_fast_mode)
-    allow_mid_conversation = model_supports_mid_conversation_system(model)
-    allow_context_management = True if payload is None else _payload_has_context_management(payload)
-    allow_extended_cache_ttl = True if payload is None else _payload_has_ttl_1h(payload)
+    if not allow_context_1m:
+        out = [b for b in out if b != CONTEXT_1M_BETA]
+    elif betas is None or CONTEXT_1M_BETA in parse_beta_header(betas):
+        _insert_beta_after(out, CONTEXT_1M_BETA, "claude-code-20250219")
 
-    out = []
-    for b in beta_list:
-        if b == OAUTH_BETA:
-            continue
-        if b == FAST_MODE_BETA and not allow_fast_mode:
-            continue
-        if b == CONTEXT_1M_BETA and not allow_context_1m:
-            continue
-        if b == MID_CONVERSATION_SYSTEM_BETA and not allow_mid_conversation:
-            continue
-        if b == CONTEXT_MANAGEMENT_BETA and not allow_context_management:
-            continue
-        if b == EXTENDED_CACHE_TTL_BETA and not allow_extended_cache_ttl:
-            continue
-        out.append(b)
-    return out
+    if wants_fast_mode and (betas is None or FAST_MODE_BETA in parse_beta_header(betas)):
+        _insert_beta_after(out, FAST_MODE_BETA, "claude-code-20250219")
+    else:
+        out = [b for b in out if b != FAST_MODE_BETA]
+
+    if isinstance(payload, dict) and _payload_has_ttl_1h(payload):
+        if betas is None or EXTENDED_CACHE_TTL_BETA in parse_beta_header(betas):
+            _insert_beta_before(out, EXTENDED_CACHE_TTL_BETA, CACHE_DIAGNOSIS_BETA)
+    else:
+        out = [b for b in out if b != EXTENDED_CACHE_TTL_BETA]
+    return list(dict.fromkeys(out))
 
 
 def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_scheme="bearer",
-                           model=None, payload=None, downstream_betas=None,
+                           auth_mode=None, model=None, payload=None, downstream_betas=None,
                            original_model=None, wants_context_1m=None,
                            wants_fast_mode=None, allow_any_model_context_1m=False):
-    """构造 messages 出站 header，对齐 CC v2.1.156 抓包恒定头集合（§7.1）。
+    """Build the ordered v258 application headers for one Messages attempt.
 
-    - session_id: 与 body.metadata.user_id.session_id 同值（§7.4/§8），调用方传入。
-    - betas: 允许调用方传入过滤后的 beta 列表（如 api_channel omit_thinking）；
-      缺省用模块 BETAS。无论如何都会剔除 oauth-2025-04-20（那是 token 端点的 beta）。
-    - payload/model/downstream_betas/original_model/wants_context_1m/wants_fast_mode:
-      用于按最终 body + 模型 + 下游显式能力信号生成 messages beta，避免无条件硬塞能力位。
-    - allow_any_model_context_1m: API 兼容渠道可透传/强制未知模型的 1M 标志；
-      OAuth 官方渠道仍保留模型能力白名单。
-    - auth_scheme: "bearer"(OAuth) 用 Authorization: Bearer；"api_key" 用 x-api-key。
-    注意：x-client-request-id 已删（源码实证 CC 从不在请求发此头，抓包 67/67 无）。
-    Accept-Encoding 只写 gzip,deflate —— 本机 venv 未装 brotli/zstandard，
-    若声明 br/zstd 上游回包会解不开（§7.3）。
+    ``auth_mode`` controls only evidence-backed beta differences; third-party
+    Bearer providers therefore do not silently acquire OAuth-specific behaviour.
+    The initial request UUID is refreshed by ``http_runtime`` at every physical
+    dispatch.  Brotli/zstd are deliberately not advertised without decoders.
     """
     sid = session_id or str(uuid.uuid4())
+    effective_auth_mode = auth_mode or ("oauth" if auth_scheme == "bearer" else "api_key")
     beta_str = ",".join(_messages_betas_for_request(
         model=model, betas=betas, payload=payload,
         downstream_betas=downstream_betas, original_model=original_model,
         wants_context_1m=wants_context_1m,
         wants_fast_mode=wants_fast_mode,
         allow_any_model_context_1m=allow_any_model_context_1m,
+        auth_mode=effective_auth_mode,
     ))
-    headers = {
-        # ── CC 应用层 ──
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": beta_str,
-        "x-app": "cli",
-        "User-Agent": CLI_USER_AGENT,
-        "X-Claude-Code-Session-Id": sid,
-    }
+
+    headers = {"Accept": "application/json"}
+    if auth_scheme != "api_key":
+        headers["Authorization"] = f"Bearer {access_token}"
+    headers["Content-Type"] = "application/json"
+    headers["User-Agent"] = CLI_USER_AGENT
+    headers["X-Claude-Code-Session-Id"] = sid
+    headers.update(_STAINLESS_HEADERS)
+    headers["anthropic-beta"] = beta_str
+    headers["anthropic-dangerous-direct-browser-access"] = "true"
+    headers["anthropic-version"] = "2023-06-01"
     if auth_scheme == "api_key":
         headers["x-api-key"] = access_token
-    else:
-        headers["Authorization"] = f"Bearer {access_token}"
-    # ── Stainless SDK 层 ──
-    headers.update(_STAINLESS_HEADERS)
-    headers["anthropic-dangerous-direct-browser-access"] = "true"
-    # ── 传输层（venv 无 brotli/zstandard，只声明 gzip/deflate）──
+    headers["x-app"] = "cli"
+    headers["x-client-request-id"] = str(uuid.uuid4())
     headers["Accept-Encoding"] = "gzip, deflate"
     return headers

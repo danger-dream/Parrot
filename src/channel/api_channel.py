@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-import uuid
 from typing import Optional
+from urllib.parse import urlparse
 
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic
 from ..providers import registry as provider_registry
@@ -127,6 +127,9 @@ class ApiChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
+        # Logical CC context is created by failover and must survive bridge
+        # translation, whose public payload allowlist intentionally drops private keys.
+        cc_request_context = cc_mimicry.request_context_from(requested_body)
         # Phase 8: OpenAI-family ingress can route to Anthropic upstream through
         # request/response translators while unsafe feature gaps stay guarded by matrix.
         translator_ctx: Optional[dict] = None
@@ -170,6 +173,8 @@ class ApiChannel(Channel):
                 "ProtocolMatrix should have guarded this route."
             )
 
+        if cc_request_context:
+            requested_body.update(cc_request_context)
         body_with_model = provider_registry.filter_request_payload(
             self,
             {**requested_body, "model": resolved_model},
@@ -208,10 +213,16 @@ class ApiChannel(Channel):
 
         dynamic_map: Optional[dict] = None
         if self.cc_mimicry:
-            # §7.4/§8：同一请求一个 session_id，同源喂给 body.metadata 与 header
-            sid = str(uuid.uuid4())
+            body_with_model = cc_mimicry.ensure_request_context(body_with_model)
+            sid = body_with_model[cc_mimicry.PARROT_CC_SESSION_ID_KEY]
+            official_anthropic = (
+                self.provider_id == "anthropic"
+                or urlparse(self.base_url).hostname == "api.anthropic.com"
+            )
+            auth_scheme = "api_key" if official_anthropic else "bearer"
+            auth_mode = "api_key" if official_anthropic else "compatible"
             payload, dynamic_map = cc_mimicry.transform_request(
-                body_with_model, email="", session_id=sid)
+                body_with_model, email="", session_id=sid, auth_mode=auth_mode)
             if self.omit_temperature:
                 payload.pop("temperature", None)
             if self.omit_thinking:
@@ -229,12 +240,15 @@ class ApiChannel(Channel):
             # omit_thinking 时过滤 thinking 类 beta；build_upstream_headers 内部还会
             # 再剔除 oauth-2025-04-20（messages 不带）。§7.5：复用统一 header 构造，
             # 补齐 Stainless 整层 + x-app + session-id，避免两处手拼漂移。
-            # 第三方 API 渠道沿用 Bearer 鉴权（auth_scheme=bearer），不改成 x-api-key。
-            betas = [b for b in cc_mimicry.BETAS
-                     if not self.omit_thinking or "thinking" not in b]
+            # Official Anthropic API keys use x-api-key.  Existing third-party
+            # Anthropic-compatible channels retain their established Bearer shape.
+            betas = None if not self.omit_thinking else [
+                b for b in cc_mimicry.BETAS if "thinking" not in b
+            ]
             headers = cc_mimicry.build_upstream_headers(
                 self.api_key, session_id=sid, betas=betas,
-                auth_scheme="bearer", model=resolved_model, payload=payload,
+                auth_scheme=auth_scheme, auth_mode=auth_mode,
+                model=resolved_model, payload=payload,
                 downstream_betas=downstream_betas, original_model=original_model,
                 wants_context_1m=wants_context_1m,
                 wants_fast_mode=wants_fast_mode,

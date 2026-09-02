@@ -48,6 +48,11 @@ PARROT_INTERNAL_REQ_FIELDS: frozenset[str] = frozenset({
     "_parrot_wants_fast_mode",
 })
 
+CC_REQUEST_CONTEXT_FIELDS: frozenset[str] = frozenset({
+    "_parrot_claude_code_session_id",
+    "_parrot_cc_prompt_id",
+})
+
 
 ANTHROPIC_MESSAGES_REQ_ALLOWED: frozenset[str] = frozenset({
     "model", "messages", "max_tokens",
@@ -65,6 +70,19 @@ ANTHROPIC_BRIDGE_REQ_ALLOWED: frozenset[str] = frozenset({
     "stop_sequences", "stream", "system", "temperature", "tool_choice",
     "tools", "top_p",
 }) | PARROT_INTERNAL_REQ_FIELDS
+
+# v258-only body fields and logical-request context.  Standard Anthropic paths
+# deliberately keep their previous allowlists.
+CC_ANTHROPIC_MESSAGES_REQ_ALLOWED: frozenset[str] = (
+    ANTHROPIC_MESSAGES_REQ_ALLOWED
+    | frozenset({"fallbacks", "diagnostics"})
+    | CC_REQUEST_CONTEXT_FIELDS
+)
+CC_ANTHROPIC_BRIDGE_REQ_ALLOWED: frozenset[str] = (
+    ANTHROPIC_BRIDGE_REQ_ALLOWED
+    | frozenset({"fallbacks", "diagnostics", "thinking", "context_management", "output_config"})
+    | CC_REQUEST_CONTEXT_FIELDS
+)
 
 
 STATEFUL_RESOURCE_REDLINES: frozenset[str] = frozenset({
@@ -113,8 +131,8 @@ CC_MIMICRY_CAPABILITIES = ProviderCapabilities(
     family="anthropic",
     protocols=frozenset({"anthropic"}),
     transports=frozenset({"http", "sse"}),
-    passthrough_request_fields={"anthropic": ANTHROPIC_MESSAGES_REQ_ALLOWED},
-    bridge_request_fields={"anthropic": ANTHROPIC_BRIDGE_REQ_ALLOWED},
+    passthrough_request_fields={"anthropic": CC_ANTHROPIC_MESSAGES_REQ_ALLOWED},
+    bridge_request_fields={"anthropic": CC_ANTHROPIC_BRIDGE_REQ_ALLOWED},
     native_state=frozenset({"cache_control", "claude_code_headers"}),
     notes=("Anthropic-compatible provider with Claude Code mimicry request/response restore",),
 )
@@ -125,8 +143,8 @@ ANTHROPIC_OAUTH_CAPABILITIES = ProviderCapabilities(
     family="anthropic",
     protocols=frozenset({"anthropic"}),
     transports=frozenset({"http", "sse"}),
-    passthrough_request_fields={"anthropic": ANTHROPIC_MESSAGES_REQ_ALLOWED},
-    bridge_request_fields={"anthropic": ANTHROPIC_BRIDGE_REQ_ALLOWED},
+    passthrough_request_fields={"anthropic": CC_ANTHROPIC_MESSAGES_REQ_ALLOWED},
+    bridge_request_fields={"anthropic": CC_ANTHROPIC_BRIDGE_REQ_ALLOWED},
     native_state=frozenset({"cache_control", "claude_code_headers", "oauth_rate_limit_headers"}),
     notes=("Anthropic OAuth always uses CC mimicry and OAuth headers",),
 )

@@ -189,6 +189,7 @@ def apply_anthropic_block_cache_breakpoints(
     payload: dict[str, Any],
     *,
     max_breakpoints: int = 4,
+    default_cache_control: dict[str, Any] | None = None,
 ) -> None:
     """Fill missing Anthropic cache sections without exceeding four blocks.
 
@@ -200,6 +201,7 @@ def apply_anthropic_block_cache_breakpoints(
     if not isinstance(payload, dict) or max_breakpoints <= 0:
         return
 
+    generated_control = dict(default_cache_control or _ANTHROPIC_EPHEMERAL_1H)
     existing = list(_anthropic_block_cache_controls(payload))
     remaining = max_breakpoints - len(existing)
     if remaining <= 0:
@@ -211,7 +213,9 @@ def apply_anthropic_block_cache_breakpoints(
         for tool in tools or []
         if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict)
     ]
-    if not tool_controls and apply_anthropic_tools_cache_breakpoint(tools):
+    if not tool_controls and apply_anthropic_tools_cache_breakpoint(
+        tools, cache_control=generated_control,
+    ):
         remaining -= 1
         tool_controls = list(_anthropic_block_cache_controls({"tools": tools}))
     if remaining <= 0:
@@ -221,7 +225,7 @@ def apply_anthropic_block_cache_breakpoints(
     system = payload.get("system")
     system_controls = list(_cache_controls_in_value(system))
     if not system_controls and isinstance(system, list) and system and isinstance(system[-1], dict):
-        cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else _ANTHROPIC_EPHEMERAL_1H
+        cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else generated_control
         blocks = list(system)
         blocks[-1] = {**blocks[-1], "cache_control": dict(cache_control)}
         payload["system"] = blocks
@@ -246,7 +250,7 @@ def apply_anthropic_block_cache_breakpoints(
     if message_controls:
         return
 
-    cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else _ANTHROPIC_EPHEMERAL_1H
+    cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else generated_control
     target_indices: list[int] = []
     if isinstance(messages[-1], dict):
         target_indices.append(len(messages) - 1)

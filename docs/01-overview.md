@@ -8,7 +8,7 @@
 
 - **cc-proxy 保持不变**，作为历史版本保留，随时可回滚。
 - **anthropic-proxy 是新项目**，目录：`/opt/src-space/anthropic-proxy/`。
-- **CC 伪装代码 100% 移植**（见文档 05），OAuth 链路行为与 cc-proxy 完全一致。
+- **CC 伪装按实证 wire 基线维护**（见文档 05）；当前协议关键行为对齐 Claude Code v2.1.258，旧 cc-proxy 仅作历史回滚参考。
 - fresh install 默认端口 `22122`；已有配置显式设置的其他端口保持不变。
 
 ## 1.2 功能对比
@@ -91,7 +91,7 @@ anthropic-proxy/
     │
     ├── transform/
     │   ├── __init__.py
-    │   ├── cc_mimicry.py             # 从 cc-proxy 原样移植，禁改
+    │   ├── cc_mimicry.py             # v2.1.258 fixture-backed CC wire mimicry
     │   ├── cache_breakpoints.py      # cache_control 统一管理（始终生效）
     │   └── standard.py               # 非 CC 伪装的标准 Anthropic 转换
     │

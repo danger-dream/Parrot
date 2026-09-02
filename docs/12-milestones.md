@@ -1,6 +1,6 @@
 # 12 — 实施里程碑
 
-> 历史说明：下文早期里程碑中的 `state.db`、WAL checkpoint 和数据库双层描述记录当时实现；当前应用状态由内存 StateStore 与 verified runtime/durable JSON snapshots 持有，SQLite 仅保留为只读升级源及独立业务日志/response Store。
+> 历史说明：下文早期里程碑中的 `state.db`、WAL checkpoint、数据库双层和“逐字移植 cc-proxy”描述记录当时实现；当前应用状态由内存 StateStore 与 verified runtime/durable JSON snapshots 持有，SQLite 仅保留为只读升级源及独立业务日志/response Store。CC mimicry 当前以 docs/05 的 v2.1.258 实证 wire/fixture 为准，旧 cc-proxy 不再是协议 oracle。
 
 按模块独立可验证拆分。每个里程碑完成后应有可运行的增量，避免"全部做完再测"。
 
@@ -8,7 +8,7 @@
 
 > ⛔ **开发方（Claude）在任何里程碑的验收中，严禁对真实 OAuth 账号（`api.anthropic.com`）发起测试请求。**
 >
-> 重复的 OAuth 登录与高频同模式调用可能触发 Anthropic 风控。cc-proxy 已在生产环境稳定运行，OAuth 链路行为已被覆盖验证；本项目的 OAuth 相关验证**全部采用离线字节级对比**（见 docs/05 §5.4），不实际调用远端。
+> 重复的 OAuth 登录与高频同模式调用可能触发 Anthropic 风控。本项目的 OAuth/CC 协议验证**全部采用 v2.1.258 本地 fixture 与 fake-upstream**（见 docs/05 §5.7），不实际调用远端。
 >
 > 所有里程碑的"验收"部分凡涉及 OAuth 的，都特指：
 > - 功能代码完整、逻辑清晰、接口合理
@@ -44,7 +44,7 @@
 
 ## M2 — CC 伪装移植 + 渠道抽象
 
-**目标**：把 cc-proxy 的所有转换代码逐字移植到 `src/transform/cc_mimicry.py`，实现 `Channel` 抽象。
+**历史目标**：最初从 cc-proxy 建立 `src/transform/cc_mimicry.py` 与 `Channel` 抽象；当前协议实现已按 v2.1.258 实证基线演进。
 
 **交付**：
 - `src/transform/cc_mimicry.py`：移植清单（docs/05）的全部符号
@@ -55,7 +55,7 @@
 - `src/channel/registry.py`：集中注册 + 重建
 - `src/oauth_manager.py`：`ensure_valid_token` / `force_refresh` / `fetch_usage` / `fetch_profile` / `add_account` / `delete_account` / `set_enabled`
 - 复制 cc-proxy 的 `oauth.json` 条目到 config（手动；仅用于离线签名验证）
-- **离线对比测试**：`tests/compare_transform.py` 用 cc-proxy 历史日志 fixture，验证 OAuthChannel 生成的上游 body 与 cc-proxy 逐字节一致（**不对 api.anthropic.com 发起任何真实请求**）
+- **当前离线测试**：`test_cc_v2_1_258_upgrade.py` 用 v2.1.258 真实 body 与定稿规则验证 CCH/fingerprint/profile；compare 脚本仅是隔离 pytest 兼容入口（**不对 api.anthropic.com 发起任何真实请求**）
 
 **验收**（全部在本地离线完成）：
 - 对比测试通过（签名/headers/body 全一致）— 纯本地

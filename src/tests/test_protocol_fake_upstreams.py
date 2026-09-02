@@ -21,8 +21,10 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -2220,6 +2222,131 @@ async def test_claude_overloaded_529_retries_same_channel_without_health_penalty
     assert outcomes == ["http_error", "http_error", "success"]
     assert m["cooldown"].get_state(route.candidates[0][0].key, "claude-real") is None
     assert m["scorer"].get_stats(route.candidates[0][0].key, "claude-real")["total_requests"] == 1
+
+
+async def test_cc_v258_529_reuses_body_context_and_isolates_concurrent_requests(m, monkeypatch):
+    """Physical retries rotate request IDs while logical CC identity stays stable."""
+    _setup(m)
+    monkeypatch.setattr(m["failover"], "_overload_retry_delay_seconds", lambda _ordinal: 0.0)
+    old_cch = m["config"].get().get("cchMode", "disabled")
+    old_retry = json.loads(json.dumps(m["config"].get().get("retry") or {}))
+    m["config"].update(lambda cfg: cfg.__setitem__("cchMode", "dynamic"))
+    m["config"].update(
+        lambda cfg: cfg.setdefault("retry", {}).setdefault("transient", {}).__setitem__(
+            "maxExtraAttempts", 1,
+        )
+    )
+
+    router = MockRouter()
+    attempts: dict[str, int] = {}
+    captured: dict[str, list[dict]] = {"alpha": [], "bravo": []}
+
+    def handler(req: httpx.Request):
+        wire = _json_request(req)
+        prompt = ""
+        for message in wire.get("messages") or []:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                prompt = content
+            elif isinstance(content, list):
+                prompt = next((
+                    str(block.get("text") or "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ), "")
+            if prompt:
+                break
+        label = "alpha" if "alpha" in prompt else "bravo"
+        billing = wire["system"][0]["text"]
+        prompt_match = re.search(r"cc_prompt_id=([0-9a-f-]{36});", billing)
+        cch_match = re.search(r"cch=([0-9a-f]{5});", billing)
+        captured[label].append({
+            "sha": hashlib.sha256(req.content).hexdigest(),
+            "session": req.headers["x-claude-code-session-id"],
+            "metadata": json.loads(wire["metadata"]["user_id"]),
+            "prompt_id": prompt_match.group(1) if prompt_match else None,
+            "cch": cch_match.group(1) if cch_match else None,
+            "request_id": req.headers["x-client-request-id"],
+            "retry_count": req.headers["x-stainless-retry-count"],
+        })
+        attempts[label] = attempts.get(label, 0) + 1
+        if attempts[label] == 1:
+            return httpx.Response(529, json={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+            })
+        return _anthropic_sse_response(f"{label} recovered")
+
+    router.register("https://cc-v258.example", handler)
+    channel = m["api_channel"].ApiChannel({
+        "name": "cc-v258",
+        "type": "api",
+        "baseUrl": "https://cc-v258.example",
+        "apiKey": "sk-ant-api03-fake",
+        "providerId": "anthropic",
+        "models": [{"real": "claude-fable-5", "alias": "fable"}],
+        "cc_mimicry": True,
+        "enabled": True,
+    })
+    _install_channels(m, [channel])
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(router.handle), timeout=10.0)
+    m["upstream"].set_client(mock_client)
+
+    async def run_one(label: str):
+        body = {
+            "model": "fable",
+            "stream": True,
+            "messages": [{"role": "user", "content": f"{label} lifecycle"}],
+        }
+        request_id = f"cc-v258-{label}-{time.time_ns()}"
+        start = time.time()
+        await asyncio.to_thread(
+            m["log_db"].insert_pending,
+            request_id, "1.2.3.4", "ccp-test", "fable", True, 1, 0, {}, body,
+            ingress_protocol="anthropic",
+        )
+        route = m["scheduler"].schedule(
+            body, api_key_name="ccp-test", client_ip="1.2.3.4",
+            ingress_protocol="anthropic",
+        )
+        assert route
+        response = await m["failover"].run_failover(
+            route, body, request_id, "ccp-test", "1.2.3.4",
+            is_stream=True, start_time=start, ingress_protocol="anthropic",
+        )
+        return await _consume_streaming_to_string(response)
+
+    try:
+        alpha_text, bravo_text = await asyncio.gather(run_one("alpha"), run_one("bravo"))
+        assert "alpha recovered" in alpha_text
+        assert "bravo recovered" in bravo_text
+        assert attempts == {"alpha": 2, "bravo": 2}
+
+        all_request_ids = []
+        for label in ("alpha", "bravo"):
+            records = captured[label]
+            assert len(records) == 2
+            assert len({record["sha"] for record in records}) == 1
+            assert len({record["session"] for record in records}) == 1
+            assert len({record["metadata"]["session_id"] for record in records}) == 1
+            assert records[0]["metadata"]["session_id"] == records[0]["session"]
+            assert records[0]["metadata"]["account_uuid"] == ""
+            assert len({record["prompt_id"] for record in records}) == 1
+            assert len({record["cch"] for record in records}) == 1
+            assert records[0]["prompt_id"] and records[0]["cch"] != "00000"
+            assert {record["retry_count"] for record in records} == {"0"}
+            assert len({record["request_id"] for record in records}) == 2
+            all_request_ids.extend(record["request_id"] for record in records)
+
+        assert captured["alpha"][0]["session"] != captured["bravo"][0]["session"]
+        assert captured["alpha"][0]["prompt_id"] != captured["bravo"][0]["prompt_id"]
+        assert len(set(all_request_ids)) == 4
+    finally:
+        await mock_client.aclose()
+        m["config"].update(lambda cfg: cfg.__setitem__("cchMode", old_cch))
+        m["config"].update(lambda cfg: cfg.__setitem__("retry", old_retry))
 
 
 async def test_xai_direct_503_retries_same_channel_without_health_penalty(m, monkeypatch):

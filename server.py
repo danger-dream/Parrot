@@ -48,6 +48,7 @@ from src.openai.codex_constants import codex_cli_version
 from src.transform.cc_mimicry import (
     DEVICE_ID,
     PARROT_DOWNSTREAM_BETAS_KEY,
+    PARROT_CC_SESSION_ID_KEY,
     PARROT_ORIGINAL_MODEL_KEY,
     PARROT_WANTS_CONTEXT_1M_KEY,
     PARROT_WANTS_FAST_MODE_KEY,
@@ -1058,7 +1059,7 @@ async def proxy_messages(request: Request):
     body["_parrot_client_ip"] = client_ip or ""
     claude_session_id = str(request.headers.get("x-claude-code-session-id") or "").strip()
     if claude_session_id:
-        body["_parrot_claude_code_session_id"] = claude_session_id
+        body[PARROT_CC_SESSION_ID_KEY] = claude_session_id
 
     # 5. 调度
     result = scheduler.schedule(body, api_key_name=key_name, client_ip=client_ip)

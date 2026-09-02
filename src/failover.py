@@ -1594,6 +1594,12 @@ async def run_failover(
         # Legacy callers start outer elapsed at entry; wall time never enters durations.
         start_monotonic = time.monotonic()
     candidates = list(schedule_result.candidates)
+    all_initial_candidates = candidates + list(schedule_result.saturated)
+    if any(bool(getattr(channel, "cc_mimicry", False)) for channel, _model in all_initial_candidates):
+        # One logical request owns one stable CC session/prompt context.  Same-
+        # candidate 529 and OAuth refresh retries rebuild the request but reuse
+        # these private values; no module or Channel instance state is involved.
+        body = cc_mimicry.ensure_request_context(body)
     client_visible_model = str(
         body.get("_client_visible_model") or body.get("model") or ""
     ).strip()

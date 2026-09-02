@@ -180,7 +180,7 @@ class ApiChannel(Channel):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
                 "anthropic-version": "2023-06-01",
-                "anthropic-beta": ",".join(BETAS),  # 同 cc-proxy
+                "anthropic-beta": profile_betas,  # v2.1.258 model/auth profile
             }
         else:
             # 仅走"必要"转换：cache_control 统一管理 + 保留用户 system 字段
@@ -209,16 +209,17 @@ class ApiChannel(Channel):
 
 ### 4.4.1 `cc_mimicry=True` 路径包含
 
-（与 cc-proxy 等价）
-1. `system` 字段 → user+assistant("Understood.") 消息对注入
-2. `cache_control` 统一管理（strip + 重新打 4 个断点）
-3. system_blocks（`cc_version=x.y.fp + cch=?` + "You are Claude Code, ..."）
-4. `metadata = {"user_id": JSON({"device_id","account_uuid"})}`
-5. 工具名混淆（静态前缀 + 动态映射）
-6. CCH 签名（xxhash）
-7. `anthropic-beta` 头完整列表
+以 docs/05 的 v2.1.258 fixture-backed wire 规则为准：
+1. fingerprint 在注入 downstream `system` 之前从原始 user prompt 计算
+2. `system` 字段 → user+assistant("Understood.") 消息对注入，并保留 Parrot cache 管理
+3. system billing block（version / entrypoint / CCH / request-scoped prompt ID）
+4. `metadata.user_id` 包含稳定 device、空 account UUID、与 header 同值的 session ID
+5. 工具名混淆（映射随 `UpstreamRequest` 返回，不存 Channel 实例）
+6. CCH v258 独立 hash view 签名，不发送规范化副本
+7. 按 ordinary/Fable/Opus-5/side-query 与 auth 选择精确 beta profile
+8. 每个实际 HTTP dispatch 刷新 `x-client-request-id`，逻辑 retry 复用 body/session/prompt
 
-但使用 `Authorization: Bearer <api_key>`（而非 OAuth token），目标 URL 也指向 `base_url`。
+官方 Anthropic API key 使用 `x-api-key`；已有第三方兼容渠道保留 Bearer 形态。目标 URL 仍由 `base_url` / `apiPath` 决定。
 
 ### 4.4.2 `cc_mimicry=False` 路径包含
 
@@ -226,7 +227,7 @@ class ApiChannel(Channel):
 1. 不改写 `system` 字段（Anthropic 标准保留）
 2. `cache_control` 统一管理（**始终打开**，见 `docs/05-cc-mimicry.md`）
 3. **不加** metadata / system_blocks / beta 头 / 工具混淆 / CCH
-4. 使用 `x-api-key`（Anthropic 标准 header）或 `Authorization`（由渠道自己约定，目前统一用 `x-api-key`）
+4. 标准路径保持既有 `x-api-key` 行为；CC 路径的官方/第三方 auth 分界见上节
 
 ## 4.5 registry 模块（`src/channel/registry.py`）
 

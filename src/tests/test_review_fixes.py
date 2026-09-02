@@ -270,17 +270,17 @@ def test_anthropic_tool_cache_breakpoint_uses_last_non_deferred_tool(m):
     }
 
     payloads = [
-        m["standard"].standard_transform(body),
-        m["cc_mimicry"].transform_request(body, session_id="s")[0],
+        (m["standard"].standard_transform(body), {"type": "ephemeral", "ttl": "1h"}),
+        (m["cc_mimicry"].transform_request(body, session_id="s")[0], {"type": "ephemeral"}),
     ]
     all_deferred_payloads = [
         m["standard"].standard_transform(all_deferred_body),
         m["cc_mimicry"].transform_request(all_deferred_body, session_id="s")[0],
     ]
 
-    for payload in payloads:
+    for payload, expected_cache_control in payloads:
         assert "cache_control" not in payload["tools"][0]
-        assert payload["tools"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert payload["tools"][1]["cache_control"] == expected_cache_control
         assert payload["tools"][2]["defer_loading"] is True
         assert "cache_control" not in payload["tools"][2]
     for payload in all_deferred_payloads:
@@ -360,12 +360,15 @@ def test_anthropic_tool_namespace_type_is_stripped_like_claude_code(m):
     cc_payload, _ = cc.transform_request(body, session_id="s")
     std_payload = std.standard_transform(body)
 
-    for payload in (cc_payload, std_payload):
+    for payload, expected_cache_control in (
+        (cc_payload, {"type": "ephemeral"}),
+        (std_payload, {"type": "ephemeral", "ttl": "1h"}),
+    ):
         tool = payload["tools"][0]
         assert tool["name"].endswith("browser_open")
         assert tool["description"] == "Open a page"
         assert tool["input_schema"] == {"type": "object", "properties": {"url": {"type": "string"}}}
-        assert tool["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert tool["cache_control"] == expected_cache_control
         assert "type" not in tool
         assert "namespace" not in tool
         assert "extra_client_field" not in tool

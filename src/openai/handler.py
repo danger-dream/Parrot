@@ -40,6 +40,7 @@ from ..client_ip import get_client_ip
 from ..channel import registry
 from ..transform.cc_mimicry import (
     PARROT_DOWNSTREAM_BETAS_KEY,
+    PARROT_CC_SESSION_ID_KEY,
     PARROT_ORIGINAL_MODEL_KEY,
     PARROT_WANTS_CONTEXT_1M_KEY,
     parse_beta_header,
@@ -598,6 +599,11 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 传递 api_key_name 给 OpenAIApiChannel.build_upstream_request（通过 body 内嵌字段）。
     # 下划线前缀 + 不在 CHAT/RESPONSES_REQ_ALLOWED 白名单里 → filter_*_passthrough 不会转发给上游。
     body["_api_key_name"] = key_name or ""
+    claude_session_id = str(
+        request.headers.get("x-claude-code-session-id") or ""
+    ).strip()
+    if claude_session_id:
+        body[PARROT_CC_SESSION_ID_KEY] = claude_session_id
 
     # 5. fingerprint_query（会话亲和）。稳定 session-id header 优先，其次
     # 下游显式 prompt_cache_key、Claude Code effective identity；没有稳定标识时

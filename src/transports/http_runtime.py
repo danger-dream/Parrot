@@ -1275,6 +1275,18 @@ class _LateRoundTiming:
             self.target.record_proxy_tcp(started_at, ended_at)
 
 
+def _headers_for_physical_dispatch(headers) -> dict[str, str]:
+    """Copy headers and refresh attempt-scoped CC values without shared mutation."""
+    out = dict(headers or {})
+    for key in list(out):
+        lowered = str(key).lower()
+        if lowered == "x-client-request-id":
+            out[key] = str(uuid.uuid4())
+        elif lowered == "x-stainless-retry-count":
+            out[key] = "0"
+    return out
+
+
 async def open_response_with_proxy_chain(
     *,
     channel,
@@ -1385,12 +1397,13 @@ async def open_response_with_proxy_chain(
         late_timing.target = timing
 
         try:
+            dispatch_headers = _headers_for_physical_dispatch(upstream_req.headers)
             ctx = open_stream(
                 client,
                 HttpStreamRequest(
                     method=upstream_req.method,
                     url=upstream_req.url,
-                    headers=upstream_req.headers,
+                    headers=dispatch_headers,
                     content=upstream_req.body,
                     connect_timeout=round_timeouts.connection + 0.5,
                     read_timeout=max(330.0, round_timeouts.total + 1.0),
