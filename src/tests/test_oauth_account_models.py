@@ -168,39 +168,129 @@ def test_xai_enrichment_budget_exhaustion_keeps_authoritative_success(monkeypatc
     assert len(calls) == 1
 
 
-def test_antigravity_endpoint_fallback_headers_and_text_filter(monkeypatch):
+def test_antigravity_merges_prod_and_daily_with_daily_metadata_precedence(monkeypatch):
     calls = []
-    def post(url, **kwargs):
-        calls.append((url, kwargs))
-        if len(calls) == 1: return Response({}, 503)
-        return Response({"models": {
-            "gemini-text": {"supportedGenerationMethods": ["generateContent"]},
-            # The real upstream schema omits generic modality metadata. Such an
-            # account model must remain visible instead of being constrained by
-            # the configured stateless fallback list.
-            "new-upstream-text": {"displayName": "New Upstream Text", "maxTokens": 1000000, "maxOutputTokens": 64000, "supportsThinking": True, "supportsImages": True, "tag": "preview"},
+    prod_url = "https://prod.example/base/v1internal:fetchAvailableModels"
+    daily_url = "https://daily.example/base/v1internal:fetchAvailableModels"
+    payloads = {
+        prod_url: {"models": {
+            "shared": {"displayName": "Prod Shared", "maxTokens": 100000},
+            "prod-only": {"displayName": "Prod Only"},
             "gemini-image": {},
             "explicit-image": {"capabilities": ["image"]},
-            "chat_20706": {"isInternal": True},
-            "chat_23310": {"isInternal": True},
-            "tab_flash_lite_preview": {},
-            "tab_jump_flash_lite_preview": {},
-            "gemini-2.5-flash-thinking": {},
-            "gemini-2.5-pro": {},
-        }})
+        }},
+        daily_url: {"models": {
+            "shared": {"displayName": "Daily Shared", "maxTokens": 200000, "supportsThinking": True},
+            "gemini-3.8-flash-low": {"displayName": "Gemini 3.8 Flash Low"},
+            "gemini-3.8-flash-medium": {"displayName": "Gemini 3.8 Flash Medium"},
+            "gemini-3.8-flash-high": {"displayName": "Gemini 3.8 Flash High"},
+            "chat_20706": {},
+        }},
+    }
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if url == prod_url:
+            time.sleep(0.01)
+        return Response(payloads[url])
+
     monkeypatch.setattr(oauth_model_discovery.network, "post_sync", post)
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "api_base_url", lambda: "https://prod.example/base/")
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "daily_api_base_url", lambda: "https://daily.example/base")
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "image_models", lambda: ["gemini-image"])
     monkeypatch.setattr(
         oauth_model_discovery.antigravity_provider,
         "default_models",
         lambda: pytest.fail("account discovery must not read fallback default models"),
     )
+
+    result = oauth_model_discovery.discover_antigravity(
+        {"access_token": "tok", "project_id": "p"}, timeout=0.2, proxy_channel="oauth:test",
+    )
+
+    assert result.models == [
+        "shared", "prod-only", "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
+    ]
+    assert "gemini-3.8-flash" not in result.models
+    assert result.catalog["models"][0] == {
+        "id": "shared", "name": "Daily Shared", "contextWindow": 200000,
+        "reasoning": True, "supportsThinking": True,
+    }
+    assert [url for url, _kwargs in calls] == [prod_url, daily_url]
+    assert 0 < calls[1][1]["timeout"] < calls[0][1]["timeout"] <= 0.2
+    for _url, kwargs in calls:
+        assert kwargs["json"] == {"project": "p"}
+        assert kwargs["headers"]["authorization"] == "Bearer tok"
+        assert kwargs["headers"]["accept"] == "application/json"
+        assert kwargs["headers"]["content-type"] == "application/json"
+        assert kwargs["headers"]["user-agent"]
+        assert kwargs["headers"]["x-goog-api-client"]
+        assert kwargs["proxy_purpose"] == "oauth_antigravity"
+        assert kwargs["proxy_channel"] == "oauth:test"
+
+
+@pytest.mark.parametrize("failed_index", [0, 1])
+@pytest.mark.parametrize("failure_kind", ["http_error", "no_text_models"])
+def test_antigravity_one_unavailable_endpoint_still_uses_the_other(
+    monkeypatch, failed_index, failure_kind,
+):
+    calls = []
+
+    def post(url, **kwargs):
+        call_index = len(calls)
+        calls.append((url, kwargs))
+        if call_index == failed_index:
+            if failure_kind == "http_error":
+                return Response({}, 503)
+            return Response({"models": {
+                "gemini-image": {},
+                "explicit-image": {"type": "image"},
+            }})
+        return Response({"models": {
+            "gemini-text": {"supportedGenerationMethods": ["generateContent"]},
+            # Real upstream records commonly omit generic modality metadata.
+            "new-upstream-text": {"displayName": "New Upstream Text", "maxTokens": 1000000, "maxOutputTokens": 64000, "supportsThinking": True, "supportsImages": True, "tag": "preview"},
+        }})
+
+    monkeypatch.setattr(oauth_model_discovery.network, "post_sync", post)
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "api_base_url", lambda: "https://prod.example")
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "daily_api_base_url", lambda: "https://daily.example")
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "image_models", lambda: ["gemini-image"])
+
     result = oauth_model_discovery.discover_antigravity({"access_token": "tok", "project_id": "p"})
+
     assert result.models == ["gemini-text", "new-upstream-text"]
     assert result.catalog["models"][1] == {"id": "new-upstream-text", "name": "New Upstream Text", "tagline": "preview", "contextWindow": 1000000, "maxOutputTokens": 64000, "reasoning": True, "supportsThinking": True, "supportsImages": True}
-    assert calls[0][0].endswith("/v1internal:fetchAvailableModels")
-    assert calls[1][1]["json"] == {"project": "p"}
-    assert calls[1][1]["headers"]["authorization"] == "Bearer tok"
+    assert [url for url, _kwargs in calls] == [
+        "https://prod.example/v1internal:fetchAvailableModels",
+        "https://daily.example/v1internal:fetchAvailableModels",
+    ]
+
+
+@pytest.mark.parametrize("failure_kind", ["http_error", "no_text_models"])
+def test_antigravity_rejects_when_both_endpoints_are_unavailable(monkeypatch, failure_kind):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        if failure_kind == "http_error":
+            return Response({}, 503)
+        return Response({"models": {
+            "gemini-image": {},
+            "explicit-image": {"capabilities": ["image"]},
+            "chat_20706": {},
+        }})
+
+    monkeypatch.setattr(oauth_model_discovery.network, "post_sync", post)
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "api_base_url", lambda: "https://prod.example")
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "daily_api_base_url", lambda: "https://daily.example")
+    monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "image_models", lambda: ["gemini-image"])
+
+    expected = "HTTP 503" if failure_kind == "http_error" else "no verified text models"
+    with pytest.raises((RuntimeError, ValueError), match=expected):
+        oauth_model_discovery.discover_antigravity({"access_token": "tok", "project_id": "p"})
+    assert len(calls) == 2
 
 
 def test_cursor_adapter_delegates_existing_catalog(monkeypatch):

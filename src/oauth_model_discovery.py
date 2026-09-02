@@ -363,6 +363,8 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
         "x-goog-api-client": antigravity_provider.goog_api_client(),
     }
     body = {"project": project_id}
+    image_model_ids = set(antigravity_provider.image_models())
+    merged: dict[str, dict[str, Any]] = {}
     last_error: Exception | None = None
     for base in (antigravity_provider.api_base_url(), antigravity_provider.daily_api_base_url()):
         try:
@@ -379,7 +381,6 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
                 record = dict(value) if isinstance(value, dict) else {}
                 record.setdefault("id", model_id)
                 records.append(record)
-            image_model_ids = set(antigravity_provider.image_models())
             models = _unique([
                 item["id"] for item in records
                 if _antigravity_is_text(item, image_model_ids)
@@ -387,15 +388,22 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
             if not models:
                 raise ValueError("Antigravity catalog has no verified text models")
             wanted = set(models)
-            normalized = [_record(item["id"], item, {
-                "name": ("displayName", "name"), "description": ("description",), "tagline": ("tag", "tagline"),
-                "contextWindow": ("maxTokens", "contextWindow"), "maxOutputTokens": ("maxOutputTokens",),
-                "reasoning": ("supportsThinking",), "supportsThinking": ("supportsThinking",), "supportsImages": ("supportsImages",),
-                "inputModalities": ("inputModalities",), "outputModalities": ("outputModalities",),
-            }) for item in records if item["id"] in wanted]
-            return DiscoveryResult(models, _catalog(normalized), "upstream:antigravity")
+            for item in records:
+                model_id = item["id"]
+                if model_id not in wanted:
+                    continue
+                # Daily is queried second and refreshes duplicate metadata while
+                # dict assignment preserves the model's first-seen position.
+                merged[model_id] = _record(model_id, item, {
+                    "name": ("displayName", "name"), "description": ("description",), "tagline": ("tag", "tagline"),
+                    "contextWindow": ("maxTokens", "contextWindow"), "maxOutputTokens": ("maxOutputTokens",),
+                    "reasoning": ("supportsThinking",), "supportsThinking": ("supportsThinking",), "supportsImages": ("supportsImages",),
+                    "inputModalities": ("inputModalities",), "outputModalities": ("outputModalities",),
+                })
         except Exception as exc:
             last_error = exc
+    if merged:
+        return DiscoveryResult(list(merged), _catalog(list(merged.values())), "upstream:antigravity")
     raise last_error or ValueError("Antigravity model discovery failed")
 
 
