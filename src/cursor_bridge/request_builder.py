@@ -137,9 +137,11 @@ def build_run_request_bytes(
         if turns:
             effective_system = fold_turns_into_system_prompt(system_prompt, turns)
 
-    has_max_suffix = model_id.endswith("-max")
-    is_max_mode = max_mode or has_max_suffix
-    cursor_model_id = model_id[:-4] if has_max_suffix else model_id
+    # ``-max`` is a real Cursor reasoning-effort suffix, not Max Context.
+    # Preserve the selected wire model verbatim; Max Context is carried only
+    # by the independent max_mode/long_context controls below.
+    cursor_model_id = model_id
+    is_max_mode = bool(max_mode or long_context)
 
     user_message = agent_pb2.UserMessage(text=user_text, message_id=str(uuid.uuid4()))
     request_context = build_request_context(mcp_tools, effective_system or None)

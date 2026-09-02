@@ -319,13 +319,41 @@ def _upstream_metadata(record: Mapping[str, Any], provider: str) -> dict[str, An
 def _merge_effective_metadata(
     binding_metadata: Mapping[str, Any], native: tuple[Mapping[str, Any], str] | None,
 ) -> dict[str, Any]:
-    """Merge descriptive gaps while keeping every bound generic field authoritative."""
+    """Merge catalog pricing/descriptions with account-native capabilities.
+
+    A models.dev binding still owns pricing and descriptive fields. Cursor's
+    account catalog, however, is authoritative for every transport capability:
+    normal/Max Context limits, output limit, effort variants, and the effective
+    image/tool intersection implemented by the bridge. Otherwise an old default
+    binding can hide a newly discovered Cursor capability or bypass a disabled
+    Max Context tier during preflight.
+    """
     upstream = _upstream_metadata(*native) if native else {}
-    result = dict(upstream)
-    result.update(dict(binding_metadata))
+    if native and native[1] == "cursor":
+        result = dict(binding_metadata)
+        cursor_transport_keys = (
+            "name", "family", "vision", "cursorUpstreamVision", "reasoning",
+            "reasoningEfforts", "defaultReasoningEffort", "toolCall",
+            "structuredOutput", "temperature", "modalities", "contextWindow",
+            "contextWindowMaxMode", "maxOutputTokens", "compactTriggerTokens",
+            "metadataSource", "supportsFast", "supportsThinking", "variants",
+            "aliases",
+        )
+        for key in cursor_transport_keys:
+            if key in upstream:
+                result[key] = upstream[key]
+        # Keep a useful models.dev description when Cursor supplies no tagline;
+        # otherwise prefer the account-specific upstream wording.
+        if upstream.get("description"):
+            result["description"] = upstream["description"]
+        for key, value in upstream.items():
+            result.setdefault(key, value)
+    else:
+        result = dict(upstream)
+        result.update(dict(binding_metadata))
+
     # Canonical vision is the effective capability. Do not leave contradictory
-    # upstream aliases that could make the Telegram UI (or a future consumer)
-    # turn an explicit models.dev false back into true.
+    # aliases/modalities that could turn an explicit bridge-level false back on.
     if "vision" in result:
         vision = bool(result["vision"])
         result["supportsImages"] = vision
@@ -334,16 +362,6 @@ def _merge_effective_metadata(
                 item for item in result["inputModalities"]
                 if str(item).lower() != "image"
             ]
-    # Cursor's long-context limit is transport capability, unlike its normal
-    # context/output/effort fields. Preserve it for use_max_context safety even
-    # when a models.dev binding supplies the common fields.
-    if native and native[1] == "cursor":
-        cursor_metadata = _upstream_metadata(*native)
-        if "contextWindowMaxMode" in cursor_metadata:
-            result["contextWindowMaxMode"] = cursor_metadata["contextWindowMaxMode"]
-        for key in ("variants", "supportsFast", "supportsThinking", "cursorUpstreamVision", "aliases"):
-            if key in cursor_metadata:
-                result[key] = cursor_metadata[key]
     return result
 
 

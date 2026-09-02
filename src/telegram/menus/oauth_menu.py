@@ -44,6 +44,7 @@ from ... import (
     affinity, config, cooldown, load_balancing, log_db,
     notifier, oauth_errors, oauth_manager, state_db,
 )
+from ...cursor_bridge import catalog as cursor_model_catalog
 from ...oauth_ids import account_key as _account_key, openai_account_identity_parts as _openai_identity_parts, openai_workspace_id as _openai_workspace_id, split_account_key as _split_ak
 from ...oauth import antigravity as antigravity_provider, cursor as cursor_provider, openai as openai_provider, xai as xai_provider
 from ...oauth.openai_import import OpenAIImportParseError, parse_openai_import_payload
@@ -3507,10 +3508,9 @@ _CURSOR_DISABLE_ACTION = "oa_cursor_disable"
 
 
 def _cursor_model_records(acc: dict) -> list[dict]:
-    records = [
-        item for item in ((acc.get("cursor_model_catalog") or {}).get("models") or [])
-        if isinstance(item, dict) and item.get("id")
-    ]
+    # catalog_records re-derives variant/effort metadata from legacy_slugs so
+    # persisted catalogs written by an older parser are corrected immediately.
+    records = cursor_model_catalog.catalog_records(acc)
     disabled = oauth_manager.cursor_disabled_models(acc)
     records.sort(key=lambda item: str(item.get("name") or item.get("id") or "").casefold())
     records.sort(key=lambda item: str(item.get("id") or "") in disabled)

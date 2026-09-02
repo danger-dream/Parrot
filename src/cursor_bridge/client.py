@@ -253,7 +253,10 @@ class CursorClient:
             checkpoint=state.checkpoint,
             mcp_tools=mcp_tools,
             long_context=long_ctx,
-            max_mode=self.max_mode,
+            # Cursor Max Context is an independent request dimension. Keep the
+            # legacy long_context parameter for compatibility and set the
+            # protocol's explicit Max Mode bit for the same request.
+            max_mode=bool(self.max_mode or long_ctx),
         )
         session = self._session_factory(
             access_token=self.access_token,

@@ -99,11 +99,15 @@ def _service_tier_text(record: dict | None) -> str:
     return "、".join(labels) if labels else "仅标准"
 
 
-def _summary_lines(record: dict | None) -> list[str]:
+def _summary_lines(record: dict | None, *, use_max_context: bool = False) -> list[str]:
     if not record: return []
     facts = []
-    context = _format_tokens(record.get("contextWindow"))
-    if context: facts.append(f"上下文：{context}")
+    normal_context = record.get("contextWindow")
+    maximum_context = record.get("contextWindowMaxMode")
+    context = _format_tokens(maximum_context if use_max_context else normal_context)
+    if context:
+        suffix = "（Max Context 默认）" if use_max_context else ""
+        facts.append(f"上下文：{context}{suffix}")
     efforts = [str(value) for value in record.get("reasoningEfforts") or [] if str(value)]
     if record.get("reasoning") is True or record.get("supportsThinking") is True or efforts: facts.append("🧠")
     input_modalities = {str(value).lower() for value in record.get("inputModalities") or []}
@@ -126,6 +130,8 @@ def _summary_lines(record: dict | None) -> list[str]:
 def _metadata_source_label(binding: model_metadata.MetadataBinding) -> str:
     if binding.authority == "account-upstream":
         return "账户上游目录"
+    if binding.metadata.get("metadataSource") == "cursor.AvailableModels":
+        return "Cursor 账户能力 + models.dev 计价/描述"
     return "models.dev · 账户绑定" if binding.scope_key else "models.dev · 默认绑定"
 
 
@@ -226,7 +232,14 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
         global_index = start + offset + 1
         icon, text, _ = statuses[start + offset]
         lines.append(f"{global_index}. {icon} <code>{ui.escape_html(model)}</code> - {text}")
-        lines.extend(_summary_lines(dict(bindings[model].metadata) if model in bindings else None))
+        use_max_context = bool(
+            provider == "cursor"
+            and oauth_manager.cursor_max_context_default(account, model)
+        )
+        lines.extend(_summary_lines(
+            dict(bindings[model].metadata) if model in bindings else None,
+            use_max_context=use_max_context,
+        ))
         model_ref = ui.register_code(model)
         number_row.append(ui.btn(str(global_index), f"oam:detail:{short}:{model_ref}:{model_page}:{account_page}:{filter_key}"))
         if len(number_row) == 6:

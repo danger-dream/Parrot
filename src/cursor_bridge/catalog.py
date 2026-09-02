@@ -26,10 +26,11 @@ _EFFORT_CANONICAL = {
     "extra_high": "xhigh",
     "max": "max",
 }
-# Cursor's legacy ``*-max`` suffix is Max Mode / Max Context, not a
-# reasoning-effort level. Explicit downstream max remains accepted by
-# normalize_effort(), but it is never inferred from a Cursor slug.
-_EFFORT_TOKENS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+# Cursor's exploded model directory exposes ``max`` as a real reasoning
+# effort above ``xhigh`` (for example ``claude-fable-5-thinking-max``).
+# Max Context is an independent RequestedModel.max_mode/long_context control
+# and must never be inferred from an effort suffix.
+_EFFORT_TOKENS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _CURSOR_FIRST_PARTY = frozenset({"composer-2.5", "grok-4.5", "grok-4.6"})
 
 
@@ -46,7 +47,7 @@ def normalize_effort(value: Any) -> str | None:
     return _EFFORT_CANONICAL.get(text)
 
 
-def _variant_traits(slug: str) -> dict[str, Any]:
+def _variant_traits(slug: str, base_id: str = "") -> dict[str, Any]:
     """Extract flags from real Cursor slugs regardless of suffix ordering.
 
     Cursor currently emits all of these shapes, among others::
@@ -58,12 +59,19 @@ def _variant_traits(slug: str) -> dict[str, Any]:
       gpt-5.5-extra-high-fast
 
     Parsing by repeatedly stripping only the final suffix is therefore unsafe.
+    The canonical base sequence is removed first so a base model such as
+    ``gpt-5.1-codex-max`` does not manufacture a ``max`` effort.
     """
 
     parts = [part for part in str(slug or "").lower().split("-") if part]
+    base_parts = [part for part in str(base_id or "").lower().split("-") if part]
+    if base_parts and len(parts) >= len(base_parts):
+        for index in range(len(parts) - len(base_parts) + 1):
+            if parts[index:index + len(base_parts)] == base_parts:
+                del parts[index:index + len(base_parts)]
+                break
     fast = "fast" in parts
     thinking = "thinking" in parts
-    max_mode = "max" in parts
     effort: str | None = None
     for index, token in enumerate(parts):
         if token == "extra" and index + 1 < len(parts) and parts[index + 1] == "high":
@@ -77,12 +85,16 @@ def _variant_traits(slug: str) -> dict[str, Any]:
         "effort": effort,
         "fast": fast,
         "thinking": thinking,
-        "max_mode": max_mode,
     }
 
 
-def _derive_variant_metadata(legacy_slugs: Iterable[Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    variants = [_variant_traits(str(slug)) for slug in legacy_slugs if str(slug or "").strip()]
+def _derive_variant_metadata(
+    legacy_slugs: Iterable[Any], *, base_id: str = "",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    variants = [
+        _variant_traits(str(slug), base_id)
+        for slug in legacy_slugs if str(slug or "").strip()
+    ]
     efforts: list[str] = []
     for item in variants:
         effort = item.get("effort")
@@ -92,7 +104,9 @@ def _derive_variant_metadata(legacy_slugs: Iterable[Any]) -> tuple[list[dict[str
 
 
 def record_from_model(model: CursorModel) -> dict[str, Any]:
-    variants, efforts = _derive_variant_metadata(model.legacy_slugs)
+    variants, efforts = _derive_variant_metadata(
+        model.legacy_slugs, base_id=model.id,
+    )
     return {
         "id": model.id,
         "name": model.name,
@@ -140,12 +154,14 @@ def catalog_records(account_or_catalog: Mapping[str, Any] | None) -> list[dict[s
         if not isinstance(item, Mapping) or not item.get("id"):
             continue
         record = dict(item)
-        # Persisted schema-1 catalogs may contain the historical false max
-        # effort and variants without max_mode. Re-derive these two fields from
-        # authoritative legacy slugs at every read; no catalog refresh or
-        # configuration rewrite is required for the corrected runtime view.
+        # Re-derive effort/variant fields from authoritative legacy slugs at
+        # every read. This also repairs catalogs written by the historical
+        # parser that mistook a ``-max`` reasoning suffix for Max Context.
         if "legacy_slugs" in record:
-            variants, efforts = _derive_variant_metadata(record.get("legacy_slugs") or [])
+            variants, efforts = _derive_variant_metadata(
+                record.get("legacy_slugs") or [],
+                base_id=str(record.get("id") or ""),
+            )
             record["variants"] = variants
             record["reasoning_efforts"] = efforts
         records.append(record)
@@ -203,7 +219,7 @@ def resolve_variant(
     effort = normalize_effort(reasoning_effort)
     variants = [
         dict(item) for item in record.get("variants") or []
-        if isinstance(item, Mapping) and item.get("id") and not item.get("max_mode")
+        if isinstance(item, Mapping) and item.get("id")
     ]
     if not base or not variants or (effort is None and not fast and thinking is None):
         return base
