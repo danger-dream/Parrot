@@ -229,6 +229,8 @@ class ApiChannel(Channel):
 3. **不加** metadata / system_blocks / beta 头 / 工具混淆 / CCH
 4. 标准路径保持既有 `x-api-key` 行为；CC 路径的官方/第三方 auth 分界见上节
 
+两条 Anthropic 出站路径都会在最终序列化前按上游校验顺序 `tools → system → messages` 检查混合缓存 TTL。若客户端产生非法的“5m 在前、1h 在后”，Parrot 不重排任何内容，而是把最后一个 1h 之前的所有 5m（包括省略 `ttl` 的默认 5m）提升为 1h；合法的 `1h → 5m` 以及单一 TTL 请求保持原样。CC 路径在此修复之后才计算 CCH。
+
 ## 4.5 registry 模块（`src/channel/registry.py`）
 
 ```python

@@ -26,10 +26,11 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    from src import config, state_db
+    from src import cache_hints, config, state_db
     from src.openai.transform import stream_c2r
     from src.transform import cc_mimicry, standard
     return {
+        "cache_hints": cache_hints,
         "config": config,
         "state_db": state_db,
         "stream_c2r": stream_c2r,
@@ -517,3 +518,154 @@ def test_counting_transport_counts_streamed_request_and_response_bytes(m):
         assert seen == {"up": 6, "down": 6}
 
     asyncio.run(main())
+
+
+def test_anthropic_cache_ttl_repair_matches_long_conversation_error_path(m):
+    cache_hints = m["cache_hints"]
+    source_system = [{
+        "type": "text",
+        "text": "stable system",
+        "cache_control": {"type": "ephemeral"},
+    }]
+    source_messages = [
+        {"role": "user", "content": [{"type": "text", "text": f"history-{index}"}]}
+        for index in range(274)
+    ]
+    source_messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "block-0"},
+            {"type": "text", "text": "block-1"},
+            {
+                "type": "text",
+                "text": "block-2",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+        ],
+    })
+    payload = {"system": source_system, "messages": source_messages}
+
+    promoted = cache_hints.promote_anthropic_cache_ttls_for_order(payload)
+
+    assert promoted == 1
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["messages"][274]["content"][2]["cache_control"]["ttl"] == "1h"
+    assert [block["text"] for block in payload["messages"][274]["content"]] == [
+        "block-0", "block-1", "block-2",
+    ]
+    # Repair is copy-on-write: caller-owned source objects remain unchanged.
+    assert source_system[0]["cache_control"] == {"type": "ephemeral"}
+    assert source_messages[274]["content"][2]["cache_control"]["ttl"] == "1h"
+
+
+def test_anthropic_cache_ttl_repair_uses_tools_system_messages_order(m):
+    cache_hints = m["cache_hints"]
+    payload = {
+        "tools": [{
+            "name": "lookup",
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        }],
+        "system": [{
+            "type": "text",
+            "text": "system",
+            "cache_control": {"type": "ephemeral"},
+        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "long breakpoint",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }],
+            },
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "valid short suffix",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                }],
+            },
+        ],
+    }
+
+    promoted = cache_hints.promote_anthropic_cache_ttls_for_order(payload)
+
+    assert promoted == 2
+    assert payload["tools"][0]["cache_control"]["ttl"] == "1h"
+    assert payload["system"][0]["cache_control"]["ttl"] == "1h"
+    assert payload["messages"][0]["content"][0]["cache_control"]["ttl"] == "1h"
+    # A 5m breakpoint after the final 1h is already valid and stays 5m.
+    assert payload["messages"][1]["content"][0]["cache_control"]["ttl"] == "5m"
+
+
+@pytest.mark.parametrize("ttls", [
+    ("1h", "1h", "5m"),
+    ("5m", "5m", "5m"),
+])
+def test_anthropic_cache_ttl_repair_leaves_valid_sequences_unchanged(m, ttls):
+    cache_hints = m["cache_hints"]
+    payload = {
+        "tools": [{"cache_control": {"type": "ephemeral", "ttl": ttls[0]}}],
+        "system": [{"cache_control": {"type": "ephemeral", "ttl": ttls[1]}}],
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": {
+                "type": "ephemeral", "ttl": ttls[2],
+            }}],
+        }],
+    }
+    before = json.loads(json.dumps(payload))
+
+    assert cache_hints.promote_anthropic_cache_ttls_for_order(payload) == 0
+    assert payload == before
+
+
+def test_anthropic_transforms_repair_mixed_ttls_before_cc_signing(m, monkeypatch):
+    cc = m["cc_mimicry"]
+    standard = m["standard"]
+    cache_hints = m["cache_hints"]
+    body = {
+        "model": "claude-fable-5",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": [{
+                "type": "text",
+                "text": "earlier",
+                "cache_control": {"type": "ephemeral"},
+            }]},
+            {"role": "assistant", "content": [{"type": "text", "text": "middle"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "block-0"},
+                {"type": "text", "text": "block-1"},
+                {
+                    "type": "text",
+                    "text": "block-2",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ]},
+        ],
+    }
+
+    monkeypatch.setattr(cc, "load_config", lambda: {"cch_mode": "dynamic"})
+    standard_payload = standard.standard_transform(body)
+    cc_payload, _ = cc.transform_request(body, session_id="stable-session")
+
+    for payload in (standard_payload, cc_payload):
+        controls = list(cache_hints._anthropic_prompt_order_cache_controls(payload))
+        ttls = [control.get("ttl", "5m") for control in controls]
+        assert "1h" in ttls
+        first_five = next((index for index, ttl in enumerate(ttls) if ttl == "5m"), len(ttls))
+        assert all(ttl != "1h" for ttl in ttls[first_five:])
+        assert payload["messages"][0]["content"][0]["cache_control"]["ttl"] == "1h"
+        assert payload["messages"][2]["content"][2]["cache_control"]["ttl"] == "1h"
+
+    # CC repair happened inside transform_request, before sign_body computes CCH.
+    wire_payload = json.loads(cc.sign_body(cc_payload))
+    billing = cc._generated_billing_block(wire_payload)
+    assert billing is not None
+    assert f"cch={cc.compute_cch(wire_payload)};" in billing["text"]
+    # Neither transform may rewrite the caller's request object.
+    assert "ttl" not in body["messages"][0]["content"][0]["cache_control"]

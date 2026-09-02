@@ -924,6 +924,11 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
         payload["diagnostics"] = {"previous_message_id": None}
 
     payload["stream"] = body.get("stream", False)
+    # Anthropic validates mixed prompt-cache TTLs globally as
+    # tools -> system -> messages.  Claude Code can emit an invalid later 1h
+    # breakpoint after an earlier default/explicit 5m breakpoint in long sessions.
+    # Repair before CCH signing without reordering any prompt content.
+    cache_hints.promote_anthropic_cache_ttls_for_order(payload)
     return payload, dynamic_tool_map
 
 

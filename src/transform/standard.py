@@ -74,6 +74,7 @@ def standard_transform(body: dict) -> dict:
         payload["tools"] = tools
 
     cache_hints.apply_anthropic_block_cache_breakpoints(payload)
+    cache_hints.promote_anthropic_cache_ttls_for_order(payload)
     apply_opus_adaptive_thinking(payload, body.get("model", ""))
 
     return payload

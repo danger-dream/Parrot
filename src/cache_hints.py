@@ -13,6 +13,7 @@ keys are hashes of stable prompt prefixes, never raw prompt text.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -153,6 +154,70 @@ def _anthropic_block_cache_controls(payload: dict[str, Any]):
     for message in payload.get("messages") or []:
         if isinstance(message, dict):
             yield from _cache_controls_in_value(message.get("content"))
+
+
+def _anthropic_prompt_order_cache_controls(payload: dict[str, Any]):
+    """Yield block cache controls in Anthropic's validation order.
+
+    Anthropic validates mixed TTLs across the whole prompt in this order:
+    ``tools`` -> ``system`` -> ``messages``.  Do not recurse into arbitrary tool
+    schemas because user JSON Schema examples are not prompt cache controls.
+    """
+    for tool in payload.get("tools") or []:
+        if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict):
+            yield tool["cache_control"]
+    yield from _cache_controls_in_value(payload.get("system"))
+    for message in payload.get("messages") or []:
+        if isinstance(message, dict):
+            yield from _cache_controls_in_value(message.get("content"))
+
+
+def promote_anthropic_cache_ttls_for_order(payload: dict[str, Any]) -> int:
+    """Promote illegal earlier 5m breakpoints to 1h without reordering content.
+
+    Anthropic rejects a 1h cache breakpoint that appears after a 5m breakpoint.
+    Omitted ``ttl`` means the default 5m.  If an invalid mixed sequence exists,
+    every 5m breakpoint before the final 1h breakpoint is promoted to 1h; 5m
+    breakpoints after that point remain unchanged.  Valid and single-TTL prompts
+    are untouched.
+
+    The three prompt sections are copied only when a repair is necessary.  This
+    preserves transform callers' no-input-mutation contract while avoiding a
+    deep copy on the normal path.  Returns the number of promoted breakpoints.
+    """
+    if not isinstance(payload, dict):
+        return 0
+
+    controls = list(_anthropic_prompt_order_cache_controls(payload))
+    last_long = -1
+    for index, control in enumerate(controls):
+        if (
+            str(control.get("type") or "").strip().lower() == "ephemeral"
+            and str(control.get("ttl") or "").strip().lower() == "1h"
+        ):
+            last_long = index
+    if last_long <= 0:
+        return 0
+
+    def is_five_minute(control: dict[str, Any]) -> bool:
+        if str(control.get("type") or "").strip().lower() != "ephemeral":
+            return False
+        return "ttl" not in control or str(control.get("ttl") or "").strip().lower() == "5m"
+
+    if not any(is_five_minute(control) for control in controls[:last_long]):
+        return 0
+
+    for section in ("tools", "system", "messages"):
+        if section in payload:
+            payload[section] = copy.deepcopy(payload[section])
+
+    promoted = 0
+    controls = list(_anthropic_prompt_order_cache_controls(payload))
+    for control in controls[:last_long]:
+        if is_five_minute(control):
+            control["ttl"] = "1h"
+            promoted += 1
+    return promoted
 
 
 def apply_anthropic_tools_cache_breakpoint(
