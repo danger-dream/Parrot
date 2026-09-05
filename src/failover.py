@@ -34,6 +34,10 @@ from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
+from .openai.codex_identity import (
+    capture_turn_state_event,
+    release_request_turn_serialization,
+)
 from .openai.codex_identity_mapper import ProtocolIdentityMap
 from .openai.responses_ws_runtime import (
     build_oauth_responses_ws_frame,
@@ -1761,11 +1765,14 @@ async def run_failover(
             log_db.update_pending(request_id, proxy_name=_attempt_proxy)
 
         release_done = False
+        attempt_body: dict | None = None
         def _release_once(_key=channel_state.effect_key(ch)):
             nonlocal release_done
             if release_done:
                 return
             release_done = True
+            if attempt_body is not None:
+                release_request_turn_serialization(attempt_body)
             concurrency.release(_key)
 
         try:
@@ -1775,6 +1782,7 @@ async def run_failover(
             attempt_body = _attempt_body_for_channel(
                 body, ch.key, bound_channel_key, portable_body,
             )
+            attempt_body["_codex_turn_serialization_required"] = True
             if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
                 attempt_body = dict(attempt_body)
                 attempt_body["stream"] = False
@@ -3427,6 +3435,7 @@ async def _recv_oauth_ws_until_visible(
     proxy_bytes: _WsProxyBytes,
     start_time: float,
     start_monotonic: float,
+    translator_ctx: Optional[dict],
     timing: WsAttemptTiming,
     round_timeouts: RoundTimeouts,
 ) -> tuple[list[str | bytes], Optional[AttemptResult], Optional[int]]:
@@ -3444,6 +3453,7 @@ async def _recv_oauth_ws_until_visible(
         timeout_detail_mode="packet_or_visible",
         timeout_label_seconds=first_wait,
         use_tracker_error_detail=False,
+        on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
         timing=timing,
         round_timeouts=round_timeouts,
     )
@@ -3515,6 +3525,7 @@ async def _consume_oauth_responses_ws_non_stream(
         upstream_ws, tracker, ch=ch, deadline_ts=deadline_ts,
         first_wait=first_wait, idle_timeout=idle_timeout, proxy_bytes=proxy_bytes,
         start_time=start_time, start_monotonic=start_monotonic,
+        translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
     )
     first_byte_ms = timing.snapshot().first_byte_ms
@@ -3558,6 +3569,7 @@ async def _consume_oauth_responses_ws_non_stream(
             proxy_bytes=proxy_bytes,
             closed_error_detail="upstream websocket closed",
             check_blacklist=False,
+            on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
             timing=timing,
             round_timeouts=round_timeouts,
         )
@@ -3756,6 +3768,7 @@ async def _consume_oauth_responses_ws_stream(
         upstream_ws, tracker, ch=ch, deadline_ts=deadline_ts,
         first_wait=first_wait, idle_timeout=idle_timeout, proxy_bytes=proxy_bytes,
         start_time=start_time, start_monotonic=start_monotonic,
+        translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
     )
     first_byte_ms = timing.snapshot().first_byte_ms
@@ -3943,6 +3956,7 @@ async def _consume_oauth_responses_ws_stream(
                     proxy_bytes=proxy_bytes,
                     closed_error_detail="upstream websocket closed",
                     blacklist_before_error=False,
+                    on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
                     timing=timing,
                     round_timeouts=round_timeouts,
                 )

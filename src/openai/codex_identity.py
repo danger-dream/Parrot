@@ -16,9 +16,11 @@ never stored in the logical-session registry and are never projected upstream.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -33,10 +35,60 @@ ID_GENERATION_VERSION = 1
 DEFAULT_PROTOCOL_PROFILE = "rust-v0.153.4"
 _ACCOUNT_CONTEXTS_KEY = "_codex_identity_contexts"
 _NATIVE_IDENTITY_KEY = "_codex_native_identity"
+_TURN_LEASES_KEY = "_codex_turn_serialization_leases"
+TURN_MAPPING_TTL_SECONDS = 30 * 60
+TURN_MAPPING_MAX_ENTRIES = 4096
 
 
 class CodexIdentityError(ValueError):
     """Fail-closed identity validation or ownership error."""
+
+
+@dataclass
+class _ThreadLockEntry:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+class ThreadTurnLease:
+    """One holder/waiter reference in the fine-grained thread turn queue."""
+
+    def __init__(self, key: tuple[str, str], entry: _ThreadLockEntry):
+        self._key = key
+        self._entry = entry
+        self._released = False
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self._key
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._entry.lock.release()
+        with _THREAD_LOCKS_GUARD:
+            self._entry.users -= 1
+            if self._entry.users == 0 and not self._entry.lock.locked():
+                _THREAD_LOCKS.pop(self._key, None)
+
+
+_THREAD_LOCKS: dict[tuple[str, str], _ThreadLockEntry] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+@dataclass
+class _TurnMappingEntry:
+    context: "TurnContext"
+    touched_at: float
+
+
+_TURN_MAPPINGS: dict[tuple[str, str, str, str], _TurnMappingEntry] = {}
+_TURN_MAPPINGS_GUARD = threading.Lock()
 
 
 def _utc_now() -> str:
@@ -248,6 +300,83 @@ class RequestIdentityContext:
         return build_request_identity_snapshot(
             self.account_identity, self.logical_session, self.turn
         )
+
+
+async def acquire_thread_turn(
+    context: RequestIdentityContext,
+) -> ThreadTurnLease:
+    """Queue one upstream turn by canonical owner+thread, never by account alone."""
+    key = (context.account_identity.owner_digest, context.logical_session.root_thread_id)
+    with _THREAD_LOCKS_GUARD:
+        entry = _THREAD_LOCKS.get(key)
+        if entry is None:
+            entry = _ThreadLockEntry(asyncio.Lock())
+            _THREAD_LOCKS[key] = entry
+        entry.users += 1
+    try:
+        await entry.lock.acquire()
+    except BaseException:
+        with _THREAD_LOCKS_GUARD:
+            entry.users -= 1
+            if entry.users == 0 and not entry.lock.locked():
+                _THREAD_LOCKS.pop(key, None)
+        raise
+    return ThreadTurnLease(key, entry)
+
+
+async def acquire_request_turn_serialization(
+    requested_body: MutableMapping[str, Any], context: RequestIdentityContext,
+) -> ThreadTurnLease:
+    """Acquire and remember a request-local lease, then refresh its durable window.
+
+    The refresh happens after queue admission so a request that was waiting behind
+    a successful compaction cannot send the stale pre-compaction window snapshot.
+    """
+    leases = requested_body.setdefault(_TURN_LEASES_KEY, {})
+    if not isinstance(leases, dict):
+        raise CodexIdentityError("invalid internal Codex turn lease map")
+    key = (context.account_identity.owner_digest, context.logical_session.root_thread_id)
+    existing = leases.get(key)
+    if isinstance(existing, ThreadTurnLease) and not existing.released:
+        return existing
+    lease = await acquire_thread_turn(context)
+    try:
+        logical = context.logical_session
+        if logical.durable:
+            row = state_db.codex_logical_session_load(
+                logical.owner_digest,
+                logical.downstream_principal_digest,
+                logical.downstream_anchor_digest,
+            )
+            if not isinstance(row, Mapping):
+                raise CodexIdentityError("durable logical session disappeared before dispatch")
+            context.logical_session = LogicalSession.from_row(row, durable=True)
+        leases[key] = lease
+        return lease
+    except BaseException:
+        lease.release()
+        raise
+
+
+def release_request_turn_serialization(requested_body: Any) -> int:
+    """Release every live turn lease owned by one attempt body; idempotent."""
+    if not isinstance(requested_body, MutableMapping):
+        return 0
+    leases = requested_body.pop(_TURN_LEASES_KEY, None)
+    if not isinstance(leases, dict):
+        return 0
+    released = 0
+    for lease in list(leases.values()):
+        if isinstance(lease, ThreadTurnLease) and not lease.released:
+            lease.release()
+            released += 1
+    return released
+
+
+def active_thread_turn_queue_count() -> int:
+    """Test/diagnostic view: live owner+thread queues, excluding reclaimed entries."""
+    with _THREAD_LOCKS_GUARD:
+        return len(_THREAD_LOCKS)
 
 
 def account_identity_from_account(
@@ -601,6 +730,102 @@ def resolve_downstream_anchor(payload: Mapping[str, Any]) -> tuple[str, str, boo
     return "request", secrets.token_hex(32), False
 
 
+def _downstream_turn_carrier(payload: Mapping[str, Any]) -> str:
+    """Read only turn-id carriers already accepted by the native ingress parsers."""
+    native = payload.get(_NATIVE_IDENTITY_KEY)
+    native_headers = native.get("headers") if isinstance(native, Mapping) else {}
+    native_metadata = native.get("client_metadata") if isinstance(native, Mapping) else {}
+    client_metadata = payload.get("client_metadata")
+    for metadata in (native_metadata, client_metadata):
+        if not isinstance(metadata, Mapping):
+            continue
+        direct = str(metadata.get("turn_id") or "").strip()
+        if direct:
+            return direct
+        nested = str(
+            _parse_turn_metadata(metadata.get("x-codex-turn-metadata")).get("turn_id")
+            or ""
+        ).strip()
+        if nested:
+            return nested
+    if isinstance(native_headers, Mapping):
+        for key, value in native_headers.items():
+            if str(key).lower() == "x-codex-turn-metadata":
+                nested = str(_parse_turn_metadata(value).get("turn_id") or "").strip()
+                if nested:
+                    return nested
+    return ""
+
+
+def _cleanup_turn_mappings_locked(now: float) -> None:
+    expired = [
+        key for key, entry in _TURN_MAPPINGS.items()
+        if now - entry.touched_at >= TURN_MAPPING_TTL_SECONDS
+    ]
+    for key in expired:
+        _TURN_MAPPINGS.pop(key, None)
+    overflow = len(_TURN_MAPPINGS) - TURN_MAPPING_MAX_ENTRIES
+    if overflow > 0:
+        oldest = sorted(_TURN_MAPPINGS, key=lambda key: _TURN_MAPPINGS[key].touched_at)
+        for key in oldest[:overflow]:
+            _TURN_MAPPINGS.pop(key, None)
+
+
+def resolve_turn_context(
+    logical_session: LogicalSession,
+    payload: Mapping[str, Any],
+    *,
+    now_monotonic: float | None = None,
+) -> TurnContext:
+    """Map a trusted native downstream turn carrier to one opaque upstream UUIDv7.
+
+    Raw downstream IDs are hashed for lookup only. A different explicit turn on
+    the same owner/session retires the previous active mapping; otherwise expiry
+    and the hard entry bound reclaim abandoned clients.
+    """
+    downstream_turn = _downstream_turn_carrier(payload)
+    if not downstream_turn:
+        return TurnContext.new(logical_session)
+    now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    digest = scoped_digest("downstream-turn", downstream_turn)
+    scope = (
+        logical_session.owner_digest,
+        logical_session.session_id,
+        logical_session.root_thread_id,
+    )
+    key = (*scope, digest)
+    with _TURN_MAPPINGS_GUARD:
+        _cleanup_turn_mappings_locked(now)
+        existing = _TURN_MAPPINGS.get(key)
+        if existing is not None:
+            existing.touched_at = now
+            return existing.context
+        # A new explicit downstream turn is the observable end of the prior
+        # mapping for this owner+logical thread.
+        for old_key in [candidate for candidate in _TURN_MAPPINGS if candidate[:3] == scope]:
+            _TURN_MAPPINGS.pop(old_key, None)
+        context = TurnContext.new(logical_session)
+        _TURN_MAPPINGS[key] = _TurnMappingEntry(context=context, touched_at=now)
+        _cleanup_turn_mappings_locked(now)
+        return context
+
+
+def next_request_identity_context(
+    previous: RequestIdentityContext, payload: Mapping[str, Any]
+) -> RequestIdentityContext:
+    """Resolve the next WS create as a same-turn continuation or a fresh turn."""
+    return RequestIdentityContext(
+        previous.account_identity,
+        previous.logical_session,
+        resolve_turn_context(previous.logical_session, payload),
+    )
+
+
+def clear_turn_mappings_for_tests() -> None:
+    with _TURN_MAPPINGS_GUARD:
+        _TURN_MAPPINGS.clear()
+
+
 def resolve_request_identity_context(
     account: Mapping[str, Any], requested_body: MutableMapping[str, Any]
 ) -> RequestIdentityContext:
@@ -625,7 +850,9 @@ def resolve_request_identity_context(
         scoped_digest("anchor:" + anchor_kind, anchor_raw),
         durable=durable,
     )
-    context = RequestIdentityContext(identity, logical, TurnContext.new(logical))
+    context = RequestIdentityContext(
+        identity, logical, resolve_turn_context(logical, requested_body)
+    )
     contexts[identity.owner_digest] = context
     return context
 
@@ -742,6 +969,28 @@ def project_snapshot(
     return out_headers, out_payload
 
 
+def capture_turn_state_event(
+    translator_ctx: Mapping[str, Any] | None, frame: str | bytes | Mapping[str, Any]
+) -> bool:
+    """Capture the official event-level ``response.metadata.headers`` carrier."""
+    if isinstance(frame, bytes):
+        try:
+            frame = frame.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    if isinstance(frame, str):
+        try:
+            frame = json.loads(frame)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(frame, Mapping) or frame.get("type") != "response.metadata":
+        return False
+    headers = frame.get("headers")
+    if not isinstance(headers, Mapping):
+        return False
+    return capture_turn_state(translator_ctx, headers)
+
+
 def capture_turn_state(
     translator_ctx: Mapping[str, Any] | None, headers: Any
 ) -> bool:
@@ -762,6 +1011,13 @@ def capture_turn_state(
             values = list(headers.get_all("x-codex-turn-state"))
         except Exception:
             values = []
+        if len(values) == 1:
+            token = str(values[0])
+    elif isinstance(headers, Mapping):
+        values = [
+            value for key, value in headers.items()
+            if str(key).lower() == "x-codex-turn-state"
+        ]
         if len(values) == 1:
             token = str(values[0])
     elif hasattr(headers, "get"):

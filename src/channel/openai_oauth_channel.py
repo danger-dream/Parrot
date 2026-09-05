@@ -32,6 +32,7 @@ from ..providers import registry as provider_registry
 from ..openai import reasoning_replay
 from ..openai.codex_identity import (
     account_identity_from_account,
+    acquire_request_turn_serialization,
     normalize_account_identity,
     project_snapshot,
     resolve_request_identity_context,
@@ -492,6 +493,8 @@ class OpenAIOAuthChannel(Channel):
                 "_parrot_stable_anchor", str(payload.get("prompt_cache_key"))
             )
         identity_context = resolve_request_identity_context(current_account, requested_body)
+        if requested_body.get("_codex_turn_serialization_required") is True:
+            await acquire_request_turn_serialization(requested_body, identity_context)
         identity_snapshot = identity_context.snapshot()
         replay_scope = (
             reasoning_replay.scope_from_payload(

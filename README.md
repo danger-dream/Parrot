@@ -387,7 +387,7 @@ JSON 请求体：
 - 操作：刷新 Token / 刷新用量 / 清模型错误 / 清亲和绑定 / 启停 / 删除
 - Cursor「模型目录」每页紧凑展示 6 个 canonical 模型及上下文/推理能力，使用编号按钮进入单模型详情；原生变体只保留给内部自动映射，不再铺满列表。所有存在独立 Max Context 档位的模型默认开启，单模型开关按账号持久化关闭例外，下游显式 true/false 仍可逐请求覆盖。目录还支持按账号批量禁用模型；禁用项不会注册为该 Cursor 渠道的候选，也不会出现在该账号的负载均衡顺序或被调度使用，重新进入批量页取消选择即可恢复。
 - 底部批量：🔄 刷新全部用量 / 🧹 清除所有账户错误（有冷却才显示）
-- OpenAI OAuth 的 Codex `device-only` installation 收敛对已知 workspace 默认开启：升级启动及新账户写入会原子持久化随机 UUIDv4，同 workspace 重导入/刷新保持稳定；缺少 workspace 不参与。可用账户字段 `codexDeviceConvergenceEnabled: false` 显式退出（保留 UUID，重启用时复用）；无效 UUID 会阻止加载而不会静默换号。范围仍仅限 installation carriers，不启用 session/full。
+- OpenAI OAuth Codex 使用完整的 account/thread/turn/window 应用层身份生命周期：每个 canonical workspace 固定一个 UUIDv4 installation（versioned config + durable tombstone），每个 downstream principal+stable anchor 映射到 owner-scoped durable UUIDv7 logical session/thread；显式 native `turn_id` 的 HTTP/WS continuation 复用同一上游 UUIDv7 与 turn-state，新 turn 清空。相同 owner/thread 的上游 turn 细粒度串行，不同 thread 可并行；确认成功且 owner/session/model 匹配的 compaction response 以 durable CAS 推进 window，失败、retry 或普通 history 截断不推进。`response.created` 或可见输出后禁止跨账号重放。缺少 canonical workspace、profile 不匹配或身份冲突均 fail closed；不存在 `codexDeviceConvergenceEnabled` 退出开关。
 - 账户设置中的媒体入口明确拆分：
   - 「🖼 GPT 图片设置」管理 GPT/Codex 图片模型、缓存和图片专用账号禁用列表；
   - 「🎨 Grok Imagine」管理 xAI 图片/视频模型、视频任务绑定时长和媒体请求超时，并显示图片模型路由边界；

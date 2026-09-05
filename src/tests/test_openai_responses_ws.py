@@ -3315,6 +3315,70 @@ async def test_responses_ws_accepts_sequential_creates_with_one_ledger_row_each(
 
 
 @pytest.mark.asyncio
+async def test_oauth_ws_event_turn_state_replays_for_explicit_continuation_and_clears(
+    monkeypatch, m,
+):
+    _setup(m)
+    ch = _make_oauth_channel_for_failover(m, name="turn-life@example.com")
+
+    async def fake_token(_account_key):
+        return "tok"
+
+    first = {
+        "type": "response.create", "model": "test-model", "input": "first",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn"},
+    }
+    continuation = {
+        "type": "response.create", "model": "test-model", "input": "continue",
+        "previous_response_id": "resp_first",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn"},
+    }
+    new_turn = {
+        "type": "response.create", "model": "test-model", "input": "new",
+        "previous_response_id": "resp_second",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn-2"},
+    }
+    ws = SequentialFakeWebSocket(first, continuation, new_turn)
+    fake_upstream = FakeUpstreamWebSocket([
+        {"type": "response.metadata", "headers": {
+            "x-codex-turn-state": "sticky-event-token",
+        }},
+        {"type": "response.created", "response": {"id": "resp_first"}},
+        {"type": "response.completed", "response": {
+            "id": "resp_first", "output": [], "usage": {},
+        }},
+        {"type": "response.created", "response": {"id": "resp_second"}},
+        {"type": "response.completed", "response": {
+            "id": "resp_second", "output": [], "usage": {},
+        }},
+        {"type": "response.created", "response": {"id": "resp_third"}},
+        {"type": "response.completed", "response": {
+            "id": "resp_third", "output": [], "usage": {},
+        }},
+    ])
+
+    async def fake_connect(*args, **kwargs):
+        return fake_upstream
+
+    monkeypatch.setattr(m["responses_ws"].oauth_manager, "ensure_valid_token", fake_token)
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
+    await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
+
+    assert len(fake_upstream.sent) == 3
+    wire = [json.loads(frame) for frame in fake_upstream.sent]
+    metadata = [frame["client_metadata"] for frame in wire]
+    turns = [json.loads(item["x-codex-turn-metadata"])["turn_id"] for item in metadata]
+    assert turns[0] == turns[1]
+    assert turns[2] != turns[1]
+    assert turns[0] != "native-turn"
+    assert metadata[1]["x-codex-turn-state"] == "sticky-event-token"
+    assert "x-codex-turn-state" not in metadata[2]
+    assert ch.codex_account_identity.owner_digest not in repr(
+        wire[0]["client_metadata"]["x-codex-turn-metadata"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_responses_ws_releases_capacity_while_waiting_between_turns(
     monkeypatch, m,
 ):

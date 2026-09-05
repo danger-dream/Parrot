@@ -1,6 +1,7 @@
 """Acceptance matrix for per-OAuth Codex installation/session/turn identity."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import shutil
@@ -29,9 +30,11 @@ def identity_store(tmp_path, monkeypatch, m):
     )
     store.start()
     monkeypatch.setattr(state_db, "_store", store)
+    m["identity"].clear_turn_mappings_for_tests()
     try:
         yield store, tmp_path
     finally:
+        m["identity"].clear_turn_mappings_for_tests()
         store.close()
         monkeypatch.setattr(state_db, "_store", original)
 
@@ -275,6 +278,141 @@ def test_retry_turn_state_scope_and_failover_owner_isolation(identity_store, m):
     next_a = identity.next_turn_context(ctx_a).snapshot()
     assert next_a.turn_id != first_a.turn_id
     assert next_a.turn_state is None
+
+
+def test_explicit_turn_mapping_continuation_new_turn_ttl_and_owner_isolation(
+    identity_store, m,
+):
+    identity = m["identity"]
+    first_account = _account("workspace-turn-a")
+    second_account = _account("workspace-turn-b")
+    identity.normalize_account_identity(first_account)
+    identity.normalize_account_identity(second_account)
+
+    http_body = {
+        "_api_key_name": "key",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn"},
+    }
+    first = identity.resolve_request_identity_context(first_account, http_body)
+    ws_body = {
+        "_api_key_name": "key",
+        "_codex_native_identity": {
+            "client_metadata": {
+                "session_id": "native-session",
+                "x-codex-turn-metadata": json.dumps({"turn_id": "native-turn"}),
+            },
+            "headers": {},
+        },
+    }
+    continuation = identity.resolve_request_identity_context(first_account, ws_body)
+    assert continuation.logical_session.session_id == first.logical_session.session_id
+    assert continuation.turn is first.turn
+    assert continuation.turn.turn_id != "native-turn"
+    assert _version(continuation.turn.turn_id) == 7
+
+    first.turn.capture_turn_state(
+        "sticky", owner_digest=first.account_identity.owner_digest,
+        turn_id=first.turn.turn_id,
+    )
+    new_turn_body = {
+        "_api_key_name": "key",
+        "client_metadata": {"session_id": "native-session", "turn_id": "native-turn-2"},
+    }
+    new_turn = identity.resolve_request_identity_context(first_account, new_turn_body)
+    assert new_turn.turn.turn_id != first.turn.turn_id
+    assert new_turn.turn.turn_state is None
+
+    other_owner = identity.resolve_request_identity_context(second_account, http_body.copy())
+    assert other_owner.turn.turn_id != first.turn.turn_id
+    assert other_owner.turn.turn_state is None
+
+    identity.clear_turn_mappings_for_tests()
+    logical = first.logical_session
+    ttl_payload = {"client_metadata": {"turn_id": "ttl-turn"}}
+    before_expiry = identity.resolve_turn_context(logical, ttl_payload, now_monotonic=10)
+    same = identity.resolve_turn_context(logical, ttl_payload, now_monotonic=11)
+    expired = identity.resolve_turn_context(
+        logical, ttl_payload,
+        now_monotonic=11 + identity.TURN_MAPPING_TTL_SECONDS,
+    )
+    assert same is before_expiry
+    assert expired.turn_id != before_expiry.turn_id
+
+
+@pytest.mark.asyncio
+async def test_thread_turn_serialization_parallelism_cancellation_and_reclaim(
+    identity_store, m,
+):
+    identity = m["identity"]
+    account = _account("workspace-queue")
+    identity.normalize_account_identity(account)
+    first = identity.resolve_request_identity_context(account, {
+        "_api_key_name": "key", "prompt_cache_key": "thread-a",
+        "_client_body_fields": ["prompt_cache_key"],
+    })
+    same_thread = identity.next_turn_context(first)
+    other_thread = identity.resolve_request_identity_context(account, {
+        "_api_key_name": "key", "prompt_cache_key": "thread-b",
+        "_client_body_fields": ["prompt_cache_key"],
+    })
+
+    first_body: dict = {}
+    first_lease = await identity.acquire_request_turn_serialization(first_body, first)
+    waiter_body: dict = {}
+    waiter = asyncio.create_task(
+        identity.acquire_request_turn_serialization(waiter_body, same_thread)
+    )
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    other_body: dict = {}
+    other_lease = await asyncio.wait_for(
+        identity.acquire_request_turn_serialization(other_body, other_thread),
+        timeout=0.2,
+    )
+    other_lease.release()
+    identity.release_request_turn_serialization(other_body)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    first_lease.release()
+    identity.release_request_turn_serialization(first_body)
+
+    final_body: dict = {}
+    final_lease = await asyncio.wait_for(
+        identity.acquire_request_turn_serialization(final_body, same_thread),
+        timeout=0.2,
+    )
+    final_lease.release()
+    identity.release_request_turn_serialization(final_body)
+    assert identity.active_thread_turn_queue_count() == 0
+
+
+def test_event_level_turn_state_is_exact_turn_and_owner_scoped(identity_store, m):
+    identity = m["identity"]
+    account = _account("workspace-event-state")
+    identity.normalize_account_identity(account)
+    context = identity.resolve_request_identity_context(account, {
+        "_api_key_name": "key", "client_metadata": {
+            "session_id": "session", "turn_id": "turn",
+        },
+    })
+    translator_ctx = {
+        "codex_identity_context": context,
+        "codex_identity_snapshot": context.snapshot(),
+    }
+    assert identity.capture_turn_state_event(translator_ctx, json.dumps({
+        "type": "response.metadata",
+        "headers": {"X-Codex-Turn-State": "event-token"},
+    }))
+    assert context.snapshot().turn_state == "event-token"
+    assert not identity.capture_turn_state_event(translator_ctx, {
+        "type": "codex.response.metadata",
+        "headers": {"x-codex-turn-state": "foreign"},
+    })
+    next_context = identity.next_turn_context(context)
+    assert next_context.snapshot().turn_state is None
 
 
 def test_tombstone_restart_reimport_delete_and_explicit_forget(identity_store, monkeypatch, m):

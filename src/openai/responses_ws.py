@@ -41,9 +41,12 @@ from ..channel.openai_oauth_channel import OpenAIOAuthChannel
 from . import compaction_owner
 from .codex_identity import (
     RequestIdentityContext,
+    acquire_request_turn_serialization,
     capture_turn_state,
-    next_turn_context,
+    capture_turn_state_event,
+    next_request_identity_context,
     project_snapshot,
+    release_request_turn_serialization,
 )
 from .codex_identity_mapper import ProtocolIdentityMap
 from ..client_ip import get_client_ip
@@ -128,6 +131,21 @@ _FORWARD_CLIENT_HEADERS = {
 
 
 _WsProxyBytes = WsProxyBytes
+
+
+def _native_identity_carriers(obj: dict, websocket: WebSocket) -> dict[str, dict]:
+    """Retain only already-supported native lookup carriers, never turn-state."""
+    return {
+        "client_metadata": dict(obj.get("client_metadata") or {})
+        if isinstance(obj.get("client_metadata"), dict) else {},
+        "headers": {
+            str(key): str(value)
+            for key, value in websocket.headers.items()
+            if str(key).lower() in {
+                "session-id", "session_id", "x-codex-turn-metadata",
+            }
+        },
+    }
 
 
 @dataclass
@@ -555,17 +573,9 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
     body = _request_body_from_ws_create(first_obj)
     # Native Codex carriers are lookup anchors only. They are retained under an
     # internal key, hashed by the identity resolver, and never forwarded raw.
-    body["_codex_native_identity"] = {
-        "client_metadata": dict(first_obj.get("client_metadata") or {})
-        if isinstance(first_obj.get("client_metadata"), dict) else {},
-        "headers": {
-            str(key): str(value)
-            for key, value in websocket.headers.items()
-            if str(key).lower() in {
-                "session-id", "session_id", "x-codex-turn-metadata",
-            }
-        },
-    }
+    body["_codex_native_identity"] = _native_identity_carriers(
+        first_obj, websocket
+    )
 
     _ingress_line = "openai-responses"
     model_mapping.apply_default(body, _ingress_line)
@@ -789,6 +799,7 @@ async def _run_ws_failover(
             channel_held=True,
         )
         try:
+            body["_codex_turn_serialization_required"] = True
             result = await _try_ws_channel(
                 websocket, first_obj=first_obj,
                 ch=ch, resolved_model=resolved_model, body=body,
@@ -804,6 +815,7 @@ async def _run_ws_failover(
             )
         finally:
             await turn_capacity.cleanup_after_attempt(api_key_lease)
+            release_request_turn_serialization(body)
 
         if result.proxy_name is None:
             result.proxy_name = attempt_proxy
@@ -986,6 +998,7 @@ async def _run_ws_failover(
                     channel_held=True,
                 )
                 try:
+                    body["_codex_turn_serialization_required"] = True
                     result = await _try_ws_channel(
                         websocket, first_obj=first_obj,
                         ch=ch, resolved_model=resolved_model, body=body,
@@ -1001,6 +1014,7 @@ async def _run_ws_failover(
                     )
                 finally:
                     await turn_capacity.cleanup_after_attempt(api_key_lease)
+                    release_request_turn_serialization(body)
                 if result.proxy_name is None:
                     result.proxy_name = attempt_proxy
                 last_result = result
@@ -1664,6 +1678,9 @@ async def _try_ws_channel(
                 upstream_protocol=ch_proto,
             )
         finally:
+            active_turn_body = relay_state.get("turn_body")
+            if active_turn_body is not None:
+                release_request_turn_serialization(active_turn_body)
             if last_error is not None and not timing.terminal:
                 _persist_ws_route_round(
                     route_attempt_id,
@@ -2404,6 +2421,7 @@ async def _receive_next_response_create(
             )
             continue
         body = _request_body_from_ws_create(obj)
+        body["_codex_native_identity"] = _native_identity_carriers(obj, websocket)
         model_mapping.apply_default(body, "openai-responses")
         model_mapping.apply_mapping(body, "openai-responses")
         body["_client_visible_model"] = str(body.get("model") or "").strip()
@@ -2515,12 +2533,18 @@ async def _relay_ws_session(
             raise ValueError("native Codex WS is missing its identity context")
         previous_context = identity_session.get("context")
         current_context = (
-            next_turn_context(previous_context)
+            next_request_identity_context(previous_context, body)
             if isinstance(previous_context, RequestIdentityContext)
             else base_context
         )
+        if isinstance(previous_context, RequestIdentityContext):
+            body["_codex_turn_serialization_required"] = True
+            await acquire_request_turn_serialization(body, current_context)
         identity_session["context"] = current_context
         identity_snapshot = current_context.snapshot()
+        translator_ctx = dict(translator_ctx or {})
+        translator_ctx["codex_identity_context"] = current_context
+        translator_ctx["codex_identity_snapshot"] = identity_snapshot
         _identity_map = ProtocolIdentityMap.from_request(body, identity_snapshot)
     else:
         identity_snapshot = None
@@ -2551,9 +2575,9 @@ async def _relay_ws_session(
         result.output_items = tracker.get_output_items()
         return result
 
-    # The caller owns cancellation finalization. Expose a synchronous snapshot
-    # closure so it can retain frames observed before this coroutine is
-    # cancelled, without leaking tracker internals into the transport API.
+    # The caller owns cancellation finalization. Expose the active turn body and
+    # a synchronous snapshot so cancellation releases both transport and queue.
+    relay_state["turn_body"] = body
     relay_state["sync_result"] = sync_tracker_result
 
     async def finalize_accepted_request() -> _WsAttemptResult:
@@ -2687,6 +2711,7 @@ async def _relay_ws_session(
                     else "error"
                 ),
             ))
+        release_request_turn_serialization(body)
         return result
 
     # Send first frame upstream before accepting downstream. If upstream rejects
@@ -2767,6 +2792,7 @@ async def _relay_ws_session(
         upstream_ws, tracker, pending_visible, ch.key, first_wait,
         deadline_ts=deadline_ts, idle_timeout=idle_timeout,
         result=result, proxy_bytes=proxy_bytes,
+        translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
         timeout_label_seconds=first_byte_timeout,
         commit_retryable_errors=not allow_failover_before_visible,
@@ -2893,6 +2919,9 @@ async def _relay_ws_session(
                 frame_transform=lambda frame: _identity_expose_frame(frame, _identity_map),
                 skip_event_types=(),
                 blacklist_before_error=True,
+                on_text_frame=lambda frame: capture_turn_state_event(
+                    translator_ctx, frame
+                ),
                 timing=timing,
                 round_timeouts=round_timeouts,
             )
@@ -3425,6 +3454,7 @@ async def _recv_until_first_visible_ws_event(
     idle_timeout: int,
     result: _WsAttemptResult,
     proxy_bytes: _WsProxyBytes,
+    translator_ctx: Optional[dict],
     timing: WsAttemptTiming,
     round_timeouts: RoundTimeouts,
     timeout_label_seconds: float | int | None = None,
@@ -3443,6 +3473,7 @@ async def _recv_until_first_visible_ws_event(
         timeout_detail_mode="event",
         timeout_label_seconds=timeout_label_seconds if timeout_label_seconds is not None else first_wait,
         use_tracker_error_detail=True,
+        on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
         timing=timing,
         round_timeouts=round_timeouts,
     )

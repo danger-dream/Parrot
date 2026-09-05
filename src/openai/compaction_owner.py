@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .. import state_db
-from .codex_identity import RequestIdentityContext, owner_digest_for_workspace
+from .codex_identity import (
+    LogicalSession,
+    RequestIdentityContext,
+    owner_digest_for_workspace,
+    uuid7,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -119,8 +124,64 @@ def _request_scope(identity: str, values: tuple[Any, ...]) -> tuple[str, str]:
     return model, logical_session_id
 
 
+def _request_context(
+    identity: str, values: tuple[Any, ...]
+) -> tuple[int, dict[str, Any], RequestIdentityContext] | None:
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            continue
+        contexts = value.get("_codex_identity_contexts")
+        context = contexts.get(identity) if isinstance(contexts, dict) else None
+        if isinstance(context, RequestIdentityContext):
+            return index, value, context
+    return None
+
+
+def advance_confirmed_compaction_window(
+    ch: Any,
+    values: tuple[Any, ...],
+    response_refs: list[CompactionRef],
+) -> bool:
+    """Advance only for a successful response scoped to this owner/session/model.
+
+    Callers invoke this from their already-established response success boundary.
+    The durable transaction makes duplicate/concurrent processing idempotent.
+    """
+    identity = owner_identity(ch)
+    scoped = _request_context(identity, values)
+    if not identity or scoped is None or not response_refs:
+        return False
+    request_index, request, context = scoped
+    logical = context.logical_session
+    if not logical.durable or logical.owner_digest != identity:
+        return False
+    model = str(request.get("model") or "").strip()
+    if not model:
+        return False
+    for response in values[request_index + 1:]:
+        if not isinstance(response, dict):
+            continue
+        response_model = str(response.get("model") or "").strip()
+        if response_model and response_model != model:
+            return False
+    result = state_db.codex_compaction_confirm_and_advance_window(
+        logical.owner_digest,
+        logical.downstream_principal_digest,
+        logical.downstream_anchor_digest,
+        expected_window_number=logical.window_number,
+        context_window_id=uuid7(),
+        model=model,
+        logical_session_id=logical.session_id,
+        refs=[(ref.compaction_id, ref.content_digest) for ref in response_refs],
+    )
+    row = result.get("logical_session") if isinstance(result, dict) else None
+    if isinstance(row, dict):
+        context.logical_session = LogicalSession.from_row(row, durable=True)
+    return bool(isinstance(result, dict) and result.get("advanced"))
+
+
 def persist_observed(ch: Any, *values: Any) -> int:
-    """Persist complete compactions only after this owner/session/model succeeded."""
+    """Persist compaction ownership and close a confirmed response window."""
     identity = owner_identity(ch)
     if not identity:
         return 0
@@ -131,6 +192,16 @@ def persist_observed(ch: Any, *values: Any) -> int:
             if ref not in seen:
                 refs.append(ref)
                 seen.add(ref)
+    scoped = _request_context(identity, values)
+    response_refs: list[CompactionRef] = []
+    if scoped is not None:
+        request_index = scoped[0]
+        response_seen: set[CompactionRef] = set()
+        for value in values[request_index + 1:]:
+            for ref in complete_refs(value):
+                if ref not in response_seen:
+                    response_refs.append(ref)
+                    response_seen.add(ref)
     model, logical_session_id = _request_scope(identity, values)
     aliases = identity_aliases(ch)
     for ref in refs:
@@ -139,6 +210,7 @@ def persist_observed(ch: Any, *values: Any) -> int:
             compatible_identities=aliases, model=model or None,
             logical_session_id=logical_session_id or None,
         )
+    advance_confirmed_compaction_window(ch, values, response_refs)
     return len(refs)
 
 

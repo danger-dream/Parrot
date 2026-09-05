@@ -395,6 +395,7 @@ async def read_until_first_responses_ws_visible_event(
     timeout_detail_mode: str = "event",
     timeout_label_seconds: float | int | None = None,
     use_tracker_error_detail: bool = False,
+    on_text_frame: Callable[[str], Any] | None = None,
     timing: WsAttemptTiming | None = None,
     round_timeouts: RoundTimeouts | None = None,
 ) -> ResponsesWsPreVisibleResult:
@@ -474,6 +475,8 @@ async def read_until_first_responses_ws_visible_event(
             # classification returns. Attempt settlement relies on the exact
             # response body for usage/service-tier/actual-cost extraction.
             event_type = ws_event_type(data)
+            if on_text_frame is not None:
+                on_text_frame(data)
             tracker.feed_text(data)
             # response.created proves the upstream accepted and instantiated this
             # logical request, but remains metadata buffered from the client.
@@ -604,6 +607,7 @@ async def read_next_responses_ws_step(
     closed_error_detail: str | None = None,
     blacklist_before_error: bool = False,
     check_blacklist: bool = True,
+    on_text_frame: Callable[[str], Any] | None = None,
     timing: WsAttemptTiming | None = None,
     round_timeouts: RoundTimeouts | None = None,
 ) -> ResponsesWsReadStep:
@@ -695,6 +699,8 @@ async def read_next_responses_ws_step(
 
     if proxy_bytes is not None:
         proxy_bytes.count(down=ws_frame_size(data))
+    if isinstance(data, str) and on_text_frame is not None:
+        on_text_frame(data)
     if frame_transform is not None:
         data = frame_transform(data)
 

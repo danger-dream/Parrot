@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -13,7 +15,7 @@ from src.tests import _isolation
 _isolation.isolate()
 
 from src import affinity, scheduler, state_db
-from src.openai import compaction_owner
+from src.openai import codex_identity, compaction_owner
 from src.openai.transform import codex_oauth_transform
 from src import failover
 
@@ -249,6 +251,122 @@ def test_known_disabled_owner_is_unavailable_and_never_switches(monkeypatch):
     route = scheduler.schedule(request, "tenant", "192.0.2.21", ingress_protocol="responses")
     assert not route
     assert route.guard_error.startswith("compaction_owner_unavailable:")
+
+
+def _scoped_compaction_request(owner, *, anchor="window-anchor"):
+    owner_digest = compaction_owner.owner_identity(owner)
+    logical = codex_identity.resolve_logical_session(
+        owner_digest,
+        codex_identity.scoped_digest("principal", "tenant"),
+        codex_identity.scoped_digest("anchor:prompt-cache-key", anchor),
+        durable=True,
+    )
+    identity = codex_identity.AccountIdentity(
+        schema_version=1,
+        id_generation_version=1,
+        protocol_profile="rust-v0.153.4",
+        owner_kind=codex_identity.OWNER_KIND,
+        owner_digest=owner_digest,
+        installation_id=str(uuid.uuid4()),
+        created_at="2026-01-01T00:00:00Z",
+    )
+    context = codex_identity.RequestIdentityContext(
+        identity, logical, codex_identity.TurnContext.new(logical),
+    )
+    request = {
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user", "content": "compact"}],
+        "_codex_identity_contexts": {owner_digest: context},
+    }
+    return request, context
+
+
+def test_confirmed_compaction_advances_window_once_and_history_or_failure_does_not():
+    state_db.init()
+    owner = OAuthChannel("window@example.com", "ws-window")
+    request, context = _scoped_compaction_request(owner)
+    old_snapshot = context.snapshot()
+    history_only = body("cmp_history_only", "history-cipher")
+    history_only["_codex_identity_contexts"] = request["_codex_identity_contexts"]
+
+    # A compaction in request history is not a successful compaction response.
+    compaction_owner.persist_observed(owner, history_only, {"output": []})
+    assert context.logical_session.window_number == 0
+    compaction_owner.persist_observed(owner, request, {
+        "error": {"type": "server_error"},
+    })
+    assert context.logical_session.window_number == 0
+
+    response = {
+        "model": "gpt-5.5",
+        "output": [{
+            "type": "compaction", "id": "cmp_confirmed",
+            "encrypted_content": "confirmed-cipher",
+        }],
+    }
+    compaction_owner.persist_observed(owner, request, response)
+    assert context.logical_session.window_number == 1
+    assert context.snapshot().window_id == f"{old_snapshot.thread_id}:1"
+    assert context.snapshot().context_window_id != old_snapshot.context_window_id
+    assert uuid.UUID(context.snapshot().context_window_id).version == 7
+
+    compaction_owner.persist_observed(owner, request, response)
+    assert context.logical_session.window_number == 1
+    ref = compaction_owner.complete_refs(response)[0]
+    marker = state_db.compaction_owner_load(ref.compaction_id, ref.content_digest)
+    assert marker["window_advanced_from"] == 0
+    assert marker["window_advanced_to"] == 1
+
+
+def test_confirmed_compaction_concurrent_atomic_cas_advances_only_once():
+    state_db.init()
+    owner = OAuthChannel("window-race@example.com", "ws-window-race")
+    request, context = _scoped_compaction_request(owner, anchor="race-anchor")
+    response = {
+        "model": "gpt-5.5",
+        "output": [{
+            "type": "compaction", "id": "cmp_race",
+            "encrypted_content": "race-cipher",
+        }],
+    }
+
+    def finalize(_):
+        local_request = dict(request)
+        local_context = codex_identity.RequestIdentityContext(
+            context.account_identity,
+            context.logical_session,
+            codex_identity.TurnContext.new(context.logical_session),
+        )
+        local_request["_codex_identity_contexts"] = {
+            compaction_owner.owner_identity(owner): local_context,
+        }
+        compaction_owner.persist_observed(owner, local_request, response)
+        return local_context.logical_session.window_number
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        observed = list(pool.map(finalize, range(32)))
+    row = state_db.codex_logical_session_load(
+        context.logical_session.owner_digest,
+        context.logical_session.downstream_principal_digest,
+        context.logical_session.downstream_anchor_digest,
+    )
+    assert row["window_number"] == 1
+    assert set(observed) == {1}
+
+
+def test_compaction_response_model_mismatch_does_not_advance():
+    state_db.init()
+    owner = OAuthChannel("window-model@example.com", "ws-window-model")
+    request, context = _scoped_compaction_request(owner, anchor="model-anchor")
+    response = {
+        "model": "wrong-model",
+        "output": [{
+            "type": "compaction", "id": "cmp_wrong_model",
+            "encrypted_content": "wrong-model-cipher",
+        }],
+    }
+    compaction_owner.persist_observed(owner, request, response)
+    assert context.logical_session.window_number == 0
 
 
 def test_persistence_failure_is_structured_warning_and_non_throwing(caplog, monkeypatch):

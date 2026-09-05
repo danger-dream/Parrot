@@ -492,6 +492,47 @@ def codex_logical_session_delete_owner(owner_digest:str)->int:
         return len(keys)
     return _mut("codex_logical_sessions",op,strict=True)
 
+def codex_compaction_confirm_and_advance_window(owner_digest:str,principal_digest:str,anchor_digest:str,*,expected_window_number:int,context_window_id:str,model:str,logical_session_id:str,refs:list[tuple[str,str]])->dict:
+    """Atomically mark a confirmed compaction response and advance its window once."""
+    session_key=_codex_logical_key(owner_digest,principal_digest,anchor_digest)
+    ref_keys=[_key(compaction_id,content_digest) for compaction_id,content_digest in refs]
+    if not ref_keys:raise ValueError("confirmed compaction requires at least one reference")
+    ts=now_ms()
+    def op(data):
+        sessions=data["codex_logical_sessions"]; owners=data["codex_compaction_owners"]
+        old=sessions.get(session_key)
+        if not old:raise KeyError("Codex logical session not found")
+        if old.get("owner_digest")!=owner_digest or old.get("session_id")!=logical_session_id:
+            raise ValueError("confirmed compaction logical-session scope conflict")
+        rows=[]
+        for ref_key in ref_keys:
+            row=owners.get(ref_key)
+            if not row:raise KeyError("confirmed compaction owner row not found")
+            if row.get("owner_identity")!=owner_digest:
+                raise ValueError("confirmed compaction owner scope conflict")
+            if row.get("logical_session_id")!=logical_session_id:
+                raise ValueError("confirmed compaction logical-session scope conflict")
+            if row.get("model")!=model:
+                raise ValueError("confirmed compaction model scope conflict")
+            rows.append(row)
+        if all(row.get("window_advanced_to") is not None for row in rows):
+            return {"advanced":False,"logical_session":dict(old)}
+        if int(old.get("window_number") or 0)!=int(expected_window_number):
+            raise ValueError("Codex logical-session window CAS conflict")
+        advanced=dict(old)
+        advanced["window_number"]=int(expected_window_number)+1
+        advanced["context_window_id"]=context_window_id
+        advanced["last_used_at"]=ts
+        sessions[session_key]=advanced
+        for ref_key,row in zip(ref_keys,rows):
+            marked=dict(row)
+            marked["window_advanced_from"]=int(expected_window_number)
+            marked["window_advanced_to"]=int(expected_window_number)+1
+            marked["window_advanced_at"]=ts
+            owners[ref_key]=marked
+        return {"advanced":True,"logical_session":advanced}
+    return get_store()._mutate_many(("codex_logical_sessions","codex_compaction_owners"),op,strict=True)
+
 def compaction_owner_load(compaction_id:str,content_digest:str):return _get("codex_compaction_owners",_key(compaction_id,content_digest))
 def compaction_owner_upsert(compaction_id:str,content_digest:str,owner_key:str,owner_identity:str,*,used_at:int|None=None,compatible_identities:set[str]|None=None,model:str|None=None,logical_session_id:str|None=None)->dict:
     ts=used_at if used_at is not None else now_ms(); key=_key(compaction_id,content_digest)
