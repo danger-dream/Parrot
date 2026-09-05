@@ -31,6 +31,7 @@ _isolation.isolate()
 
 import asyncio
 import base64
+import copy
 import json
 import os
 import sys
@@ -370,9 +371,62 @@ def test_transform_responses_lite_keeps_parallel_tool_calls_for_additional_tools
             "parallel_tool_calls": True,
         })
         assert "tools" not in out, label
+        assert out["tool_choice"] == "auto", label
         assert out["parallel_tool_calls"] is False, label
         assert _additional_tools_from_input(out) == tools, label
     print("  [PASS] transform: Responses Lite keeps parallel_tool_calls=false with additional_tools")
+
+
+def test_transform_gpt6_already_lite_http_is_idempotent(m):
+    """An official Lite prefix is authoritative on HTTP, including empty instructions."""
+    official = {
+        "model": "gpt-6-astra",
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "input": [{
+            "type": "additional_tools",
+            "id": "at_official",
+            "role": "developer",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+        }, {
+            "type": "message",
+            "id": "msg_official",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "official instructions"}],
+        }, {
+            "type": "message", "role": "user", "content": "continue",
+        }],
+        "instructions": "",
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "reasoning": {"effort": "medium", "context": "all_turns"},
+    }
+    out = m["transform"].apply_codex_oauth_transform(copy.deepcopy(official))
+    assert out == official
+    again = m["transform"].apply_codex_oauth_transform(out)
+    assert again == official
+    assert sum(
+        item.get("type") == "additional_tools"
+        for item in again["input"] if isinstance(item, dict)
+    ) == 1
+    assert "You are a helpful coding assistant." not in json.dumps(again)
+
+
+def test_transform_ultra_maps_to_wire_safe_xhigh_only(m):
+    """Ultra's active multi-agent behavior is local to Codex; Parrot maps the wire effort."""
+    ultra = m["transform"].apply_codex_oauth_transform({
+        "model": "gpt-6-astra",
+        "input": "hi",
+        "reasoning": {"effort": "ultra"},
+    })
+    assert ultra["reasoning"]["effort"] == "xhigh"
+    ordinary = m["transform"].apply_codex_oauth_transform({
+        "model": "gpt-6-astra",
+        "input": "hi",
+        "reasoning": {"effort": "high"},
+    })
+    assert ordinary["reasoning"]["effort"] == "high"
 
 
 def test_channel_model_passthrough(m):
@@ -489,9 +543,9 @@ def test_channel_responses_ingress(m):
     assert req.translator_ctx is None          # 无 session anchor 时同协议透传无需 ctx
     h = {k.lower(): v for k, v in req.headers.items()}
     assert h["chatgpt-account-id"] == "acct-123"
-    assert h["openai-beta"] == "responses=experimental"
+    assert "openai-beta" not in h
     assert h["originator"] == "codex_cli_rs"
-    assert h["version"] == "0.144.0"
+    assert h["version"] == "0.153.4"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -538,8 +592,10 @@ def test_channel_service_tier_routing_hint_matches_final_http_payload(m):
 def test_codex_identity_helpers_fail_closed_to_verified_default():
     from src.openai import codex_constants as constants
 
+    assert constants.DEFAULT_CODEX_CLI_VERSION == "0.153.4"
+    assert constants.CODEX_CLI_USER_AGENT.startswith("codex_cli_rs/0.153.4 ")
     assert constants.codex_cli_version({"codexCliVersion": "0.150.1"}) == "0.150.1"
-    assert constants.codex_cli_version({"codexCliVersion": "bad\r\nvalue"}) == "0.144.0"
+    assert constants.codex_cli_version({"codexCliVersion": "bad\r\nvalue"}) == "0.153.4"
     assert constants.codex_cli_user_agent({"codexCliVersion": "0.150.1"}).startswith(
         "codex_cli_rs/0.150.1 "
     )
@@ -686,7 +742,7 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
         "gpt-5.6-luna", ingress_protocol="responses",
     ))
     h = {k.lower(): v for k, v in req.headers.items()}
-    assert h["version"] == "0.144.0"
+    assert h["version"] == "0.153.4"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["x-openai-internal-codex-responses-lite"] == "true"
     payload = json.loads(req.body)
@@ -694,6 +750,7 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
     assert payload["store"] is False
     assert payload["stream"] is True
     assert payload["instructions"] == ""
+    assert payload["tool_choice"] == "auto"
     assert payload["parallel_tool_calls"] is False
     assert payload["reasoning"]["context"] == "all_turns"
     assert "tools" not in payload
@@ -724,9 +781,55 @@ def test_channel_responses_lite_keeps_parallel_tool_calls_for_additional_tools(m
     payload = json.loads(req.body)
     assert h["x-openai-internal-codex-responses-lite"] == "true"
     assert "tools" not in payload
+    assert payload["tool_choice"] == "auto"
     assert payload["parallel_tool_calls"] is False
     assert _additional_tools_from_input(payload) == tools
     print("  [PASS] channel: Responses Lite keeps parallel_tool_calls=false with additional_tools")
+
+
+def test_channel_account_catalog_lite_true_false_and_missing_precedence(m):
+    _setup(m)
+    models = ["catalog-lite", "gpt-6-astra", "gpt-5.6-luna", "gpt-6-future"]
+    _add_openai_acc(
+        m,
+        models=models,
+        account_model_catalog={"schema": 1, "models": [
+            {"id": "catalog-lite", "useResponsesLite": True},
+            {"id": "gpt-6-astra", "useResponsesLite": False},
+            {"id": "gpt-5.6-luna"},
+            {"id": "gpt-6-future"},
+        ]},
+    )
+    ch = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+    )
+
+    expected = {
+        "catalog-lite": True,
+        "gpt-6-astra": False,
+        "gpt-5.6-luna": True,
+        "gpt-6-future": False,
+    }
+    for model, is_lite in expected.items():
+        req = asyncio.run(ch.build_upstream_request(
+            {"model": model, "input": "hi"}, model, ingress_protocol="responses",
+        ))
+        headers = {str(key).lower(): str(value) for key, value in req.headers.items()}
+        payload = json.loads(req.body)
+        assert ("x-openai-internal-codex-responses-lite" in headers) is is_lite
+        assert (payload["input"][0]["type"] == "additional_tools") is is_lite
+
+    # A manually configured GPT-6 account with no metadata keeps the exact-ID fallback.
+    _add_openai_acc(m, email="manual@openai.test", models=["gpt-6-astra"])
+    manual = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:manual@openai.test:acct-123")
+    )
+    req = asyncio.run(manual.build_upstream_request(
+        {"model": "gpt-6-astra", "input": "hi"},
+        "gpt-6-astra",
+        ingress_protocol="responses",
+    ))
+    assert req.headers["x-openai-internal-codex-responses-lite"] == "true"
 
 
 def test_channel_responses_ingress_replay_scope_and_injection(m):
@@ -755,6 +858,39 @@ def test_channel_responses_ingress_replay_scope_and_injection(m):
     assert payload["input"][0] == {"type": "reasoning", "summary": [], "content": None, "encrypted_content": encrypted_content}
     assert payload["input"][1] == {"type": "message", "role": "user", "content": "continue"}
     print("  [PASS] channel: responses ingress injects cached reasoning replay")
+
+
+def test_channel_gpt6_replay_keeps_lite_prefix_first(m):
+    _setup(m)
+    _add_openai_acc(m, models=["gpt-6-astra"])
+    rr = m["reasoning_replay"]
+    account_key = "openai:o@openai.test:acct-123"
+    encrypted_content = _valid_encrypted_content(19)
+    rr.cache_items(
+        "gpt-6-astra",
+        "prompt-cache:astra",
+        [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=account_key,
+    )
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
+    req = asyncio.run(ch.build_upstream_request(
+        {
+            "model": "gpt-6-astra",
+            "input": "continue",
+            "prompt_cache_key": "astra",
+        },
+        "gpt-6-astra",
+        ingress_protocol="responses",
+    ))
+    payload = json.loads(req.body)
+    assert payload["input"][0]["type"] == "additional_tools"
+    assert payload["input"][0]["role"] == "developer"
+    assert payload["input"][1]["role"] == "developer"
+    assert payload["input"][2]["type"] == "reasoning"
+    assert payload["input"][2]["encrypted_content"] == encrypted_content
+    assert payload["input"][3] == {
+        "type": "message", "role": "user", "content": "continue",
+    }
 
 
 def test_channel_chat_ingress_translator(m):

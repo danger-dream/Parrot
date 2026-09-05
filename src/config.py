@@ -523,7 +523,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openaiOAuth": {
         # 所有 Codex models/HTTP/WS 指纹的唯一版本来源。未来官方提高
         # minimal_client_version 时只需改配置，不需要修改 Parrot 源码。
-        "codexCliVersion": "0.144.0",
+        "codexCliVersion": "0.153.4",
         "forceCodexCLI": True,
         "enableTLSFingerprint": False,
         "isolateSessionId": True,

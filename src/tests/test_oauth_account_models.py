@@ -50,11 +50,11 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
         "access_token": "tok", "workspace_id": "ws",
     })
     assert result.models == ["gpt-visible", "gpt-no-tiers"]
-    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.144.0"
+    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.153.4"
     assert seen["headers"]["authorization"] == "Bearer tok"
     assert seen["headers"]["ChatGPT-Account-ID"] == "ws"
     assert seen["headers"]["originator"] == "codex_cli_rs"
-    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.144.0 ")
+    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.153.4 ")
     assert result.catalog["models"] == [{
         "id": "gpt-visible",
         "serviceTiers": [
@@ -68,6 +68,83 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
         "id": "gpt-no-tiers",
         "serviceTiers": [],
     }]
+
+
+def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_levels(
+    monkeypatch,
+):
+    payload = {"models": [{
+        "slug": "gpt-6-astra",
+        "visibility": "list",
+        "display_name": "GPT-6-Astra",
+        "description": "Our most capable model for complex, demanding work.",
+        "context_window": 272_000,
+        "max_context_window": 872_000,
+        "input_modalities": ["text", "image"],
+        "support_verbosity": True,
+        "default_verbosity": "low",
+        "tool_mode": "code_mode_only",
+        "shell_type": "unified_exec",
+        "supports_search_tool": True,
+        "multi_agent_version": "v2",
+        "multi_agent_reasoning_effort": "xhigh",
+        "use_responses_lite": True,
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "lighter"},
+            {"effort": "medium", "description": "balanced"},
+            {"effort": "high", "description": "deep"},
+            {"effort": "xhigh", "description": "extra high"},
+            {"effort": "max", "description": "maximum"},
+            {"effort": "ultra", "description": "automatic delegation"},
+        ],
+        "minimal_client_version": "0.153.0",
+        "service_tiers": [{"id": "priority", "name": "Fast"}],
+    }, {
+        "slug": "legacy-reasoning-shape",
+        "visibility": "list",
+        "supported_reasoning_levels": ["low", "high", "low"],
+        "use_responses_lite": False,
+        "support_verbosity": False,
+        "supports_search_tool": False,
+    }]}
+    monkeypatch.setattr(
+        oauth_model_discovery.network, "get_sync",
+        lambda *args, **kwargs: Response(payload),
+    )
+
+    result = oauth_model_discovery.discover_openai({"access_token": "tok"})
+    assert result.client_version == "0.153.4"
+    assert result.models == ["gpt-6-astra", "legacy-reasoning-shape"]
+    astra, legacy = result.catalog["models"]
+    assert astra == {
+        "id": "gpt-6-astra",
+        "name": "GPT-6-Astra",
+        "description": "Our most capable model for complex, demanding work.",
+        "contextWindow": 272_000,
+        "contextWindowMaxMode": 872_000,
+        "inputModalities": ["text", "image"],
+        "reasoningEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        "defaultReasoningEffort": "medium",
+        "serviceTiers": [{"id": "priority", "name": "Fast"}],
+        "minimalClientVersion": "0.153.0",
+        "useResponsesLite": True,
+        "supportVerbosity": True,
+        "defaultVerbosity": "low",
+        "toolMode": "code_mode_only",
+        "shellType": "unified_exec",
+        "supportsSearchTool": True,
+        "multiAgentVersion": "v2",
+        "multiAgentReasoningEffort": "xhigh",
+    }
+    assert legacy == {
+        "id": "legacy-reasoning-shape",
+        "reasoningEfforts": ["low", "high"],
+        "useResponsesLite": False,
+        "supportVerbosity": False,
+        "supportsSearchTool": False,
+    }
+    assert "{'effort':" not in repr(result.catalog)
 
 
 def test_openai_codex_client_version_config_drives_catalog_query_and_ua(monkeypatch):

@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 
-DEFAULT_CODEX_CLI_VERSION = "0.144.0"
+DEFAULT_CODEX_CLI_VERSION = "0.153.4"
 # Backward-compatible immutable aliases for older imports/tests. Production wire
 # builders use ``codex_cli_version()`` / ``codex_cli_user_agent()`` below.
 CODEX_CLI_VERSION = DEFAULT_CODEX_CLI_VERSION
@@ -158,14 +158,24 @@ CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 CODEX_RESPONSES_LITE_WS_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 CODEX_RESPONSES_LITE_MODEL_PREFIXES = ("gpt-5.6-",)
 CODEX_RESPONSES_LITE_MODELS = frozenset({
+    "gpt-6-astra",
     "gpt-daybreak-blue-latest",
     "gpt-daybreak-red-latest",
     "codex-auto-review",
 })
 
 
-def codex_model_uses_responses_lite(model: str | None) -> bool:
-    """Return whether official Codex marks this model as Responses Lite."""
+def codex_model_uses_responses_lite(
+    model: str | None,
+    catalog_value: bool | None = None,
+) -> bool:
+    """Return the account-catalog decision, falling back to known model IDs.
+
+    An explicit authenticated catalog value is authoritative in both directions.
+    The name fallback exists only for old catalogs and manually configured models.
+    """
+    if isinstance(catalog_value, bool):
+        return catalog_value
     m = str(model or "").strip().lower()
     return m in CODEX_RESPONSES_LITE_MODELS or any(
         m.startswith(prefix) for prefix in CODEX_RESPONSES_LITE_MODEL_PREFIXES

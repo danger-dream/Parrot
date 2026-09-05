@@ -1565,11 +1565,32 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     assert "ws_request_header_x_openai_internal_codex_responses_lite" not in codex_mapped.get("client_metadata", {})
 
     codex_lite_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
-        "type": "response.create", "model": "gpt-5.6-luna", "input": "hello",
+        "type": "response.create", "model": "gpt-6-astra", "input": "hello",
         "stream": True, "client_metadata": {"a": "b"},
-    }, "gpt-5.6-luna", channel=oauth)
+    }, "gpt-6-astra", channel=oauth)
     assert codex_lite_mapped["client_metadata"]["a"] == "b"
     assert codex_lite_mapped["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"] == "true"
+    assert codex_lite_mapped["tool_choice"] == "auto"
+    assert codex_lite_mapped["parallel_tool_calls"] is False
+
+    oauth_catalog_false = m["OpenAIOAuthChannel"]({
+        "email": "catalog-false@example.com", "provider": "openai",
+        "accessToken": "tok", "refreshToken": "rt", "expiresAt": 9999999999,
+        "models": ["gpt-6-astra"],
+        "account_model_catalog": {"models": [{
+            "id": "gpt-6-astra", "useResponsesLite": False,
+        }]},
+    })
+    non_lite_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
+        "type": "response.create", "model": "gpt-6-astra", "input": "hello",
+        "stream": True,
+        "client_metadata": {
+            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+        },
+    }, "gpt-6-astra", channel=oauth_catalog_false)
+    assert non_lite_mapped["input"][0]["type"] == "message"
+    assert non_lite_mapped["instructions"] != ""
+    assert "ws_request_header_x_openai_internal_codex_responses_lite" not in non_lite_mapped["client_metadata"]
 
     first_with_previous = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create",
@@ -1600,14 +1621,18 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     ]
     official_warmup = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "input": official_prefix,
         "instructions": "",
         "parallel_tool_calls": False,
         "generate": False,
-    }, "gpt-5.6-luna", channel=oauth)
+    }, "gpt-6-astra", channel=oauth)
     assert official_warmup["generate"] is False
     assert official_warmup["input"] == official_prefix
+    assert official_warmup["instructions"] == ""
+    assert official_warmup["tool_choice"] == "auto"
+    assert official_warmup["parallel_tool_calls"] is False
+    assert official_warmup["reasoning"]["context"] == "all_turns"
     assert sum(
         item.get("type") == "additional_tools"
         for item in official_warmup["input"] if isinstance(item, dict)
@@ -1625,14 +1650,18 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     }]
     official_incremental = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-astra",
         "previous_response_id": "resp_lite_warmup",
         "input": lite_delta,
         "instructions": "",
         "parallel_tool_calls": False,
-    }, "gpt-5.6-luna", channel=oauth)
+    }, "gpt-6-astra", channel=oauth)
     assert official_incremental["previous_response_id"] == "resp_lite_warmup"
     assert official_incremental["input"] == lite_delta
+    assert official_incremental["instructions"] == ""
+    assert official_incremental["tool_choice"] == "auto"
+    assert official_incremental["parallel_tool_calls"] is False
+    assert official_incremental["reasoning"]["context"] == "all_turns"
     assert not any(
         isinstance(item, dict) and (
             item.get("type") == "additional_tools" or item.get("role") == "developer"

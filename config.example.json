@@ -332,6 +332,7 @@
   "runtimeStatePath": "runtime-cache.json",
   "durableStatePath": "durable-state.json",
   "openaiOAuth": {
+    "codexCliVersion": "0.153.4",
     "forceCodexCLI": true,
     "enableTLSFingerprint": false,
     "isolateSessionId": true,

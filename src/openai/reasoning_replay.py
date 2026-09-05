@@ -439,7 +439,12 @@ def _insert_index(input_items: list[Any], replay_items: list[dict[str, Any]]) ->
         if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
             return idx
     for idx, item in enumerate(input_items):
-        if not (isinstance(item, dict) and item.get("type") == "message" and item.get("role") in ("developer", "system")):
+        is_instruction_prefix = bool(
+            isinstance(item, dict)
+            and item.get("role") in ("developer", "system")
+            and item.get("type") in ("message", "additional_tools")
+        )
+        if not is_instruction_prefix:
             return idx
     return len(input_items)
 

@@ -320,6 +320,20 @@ class OpenAIOAuthChannel(Channel):
         }
         return "advertised" if tier in advertised else "not_advertised"
 
+    def responses_lite_catalog_value(self, model: str) -> bool | None:
+        """Return the account catalog's explicit Lite flag, if it has one."""
+        record = self._account_model_records.get(str(model or "").strip())
+        if not isinstance(record, dict):
+            return None
+        value = record.get("useResponsesLite")
+        return value if isinstance(value, bool) else None
+
+    def model_uses_responses_lite(self, model: str) -> bool:
+        """Resolve account-scoped catalog authority before legacy name fallback."""
+        return codex_model_uses_responses_lite(
+            model, self.responses_lite_catalog_value(model),
+        )
+
     # ─── 请求构造 ─────────────────────────────────────────────
 
     async def build_upstream_request(
@@ -459,11 +473,15 @@ class OpenAIOAuthChannel(Channel):
 
         # Step C: codex 兼容改造（store=false 等硬约束）。带 encrypted_content 的
         # replay reasoning 只做透明透传，非法/陈旧 EC 由 failover 清 scope 后降级重试。
+        # The authenticated account catalog is authoritative for Lite, including
+        # explicit false; missing metadata retains the compatibility fallback.
+        responses_lite = self.model_uses_responses_lite(resolved_model)
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload,
             resolved_model=resolved_model,
             default_instructions=prov_cfg.get("defaultInstructions"),
             transport=responses_transport,
+            use_responses_lite=responses_lite,
         )
         model_id = str(payload.get("model") or resolved_model).strip()
         model_record = self._account_model_records.get(model_id)
@@ -568,7 +586,7 @@ class OpenAIOAuthChannel(Channel):
         headers = self._build_headers(access_token, provider_config=prov_cfg)
         if current_workspace_id:
             headers["chatgpt-account-id"] = current_workspace_id
-        if codex_model_uses_responses_lite(payload.get("model") or resolved_model):
+        if responses_lite:
             headers[CODEX_RESPONSES_LITE_HEADER] = "true"
         # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
         # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
@@ -761,7 +779,6 @@ class OpenAIOAuthChannel(Channel):
             # Host 头：httpx 通常会按 URL 自动设置，这里显式兜底保险
             "host": "chatgpt.com",
             "authorization": f"Bearer {access_token}",
-            "openai-beta": "responses=experimental",
             "originator": CODEX_ORIGINATOR,
             "version": client_version,
             "accept": "text/event-stream",

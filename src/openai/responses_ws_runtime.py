@@ -151,8 +151,25 @@ def _filter_responses_payload(
     return filtered
 
 
-def _mark_codex_responses_lite_frame(frame_obj: dict, model: str | None = None) -> None:
-    if not codex_model_uses_responses_lite(model or frame_obj.get("model")):
+def _channel_uses_responses_lite(channel: Any, model: str | None) -> bool:
+    checker = getattr(channel, "model_uses_responses_lite", None)
+    if callable(checker):
+        return bool(checker(str(model or "")))
+    return codex_model_uses_responses_lite(model)
+
+
+def _mark_codex_responses_lite_frame(
+    frame_obj: dict,
+    model: str | None = None,
+    *,
+    use_responses_lite: bool | None = None,
+) -> None:
+    if not codex_model_uses_responses_lite(
+        model or frame_obj.get("model"), use_responses_lite,
+    ):
+        client_metadata = frame_obj.get("client_metadata")
+        if isinstance(client_metadata, dict):
+            client_metadata.pop(CODEX_RESPONSES_LITE_WS_METADATA_KEY, None)
         return
     client_metadata = frame_obj.get("client_metadata")
     if not isinstance(client_metadata, dict):
@@ -165,13 +182,17 @@ def build_oauth_responses_ws_frame(body: dict, resolved_model: str, *, channel=N
     payload = _filter_responses_payload(body, channel=channel, codex=True)
     payload["model"] = resolved_model
     payload.pop("background", None)
+    responses_lite = _channel_uses_responses_lite(channel, resolved_model)
     payload = codex_oauth_transform.apply_codex_oauth_transform(
         payload,
         resolved_model=resolved_model,
         transport="websocket",
+        use_responses_lite=responses_lite,
     )
     payload["type"] = "response.create"
-    _mark_codex_responses_lite_frame(payload, resolved_model)
+    _mark_codex_responses_lite_frame(
+        payload, resolved_model, use_responses_lite=responses_lite,
+    )
     return payload
 
 
@@ -210,7 +231,11 @@ def prepare_oauth_responses_ws_request_parts(
     if frame_obj is None:
         frame_obj = build_oauth_responses_ws_frame(body, resolved_model, channel=channel)
     else:
-        _mark_codex_responses_lite_frame(frame_obj, resolved_model)
+        _mark_codex_responses_lite_frame(
+            frame_obj,
+            resolved_model,
+            use_responses_lite=_channel_uses_responses_lite(channel, resolved_model),
+        )
 
     api_key_name = str((body or {}).get("_api_key_name") or "")
     sid = get_header_case_insensitive(headers, "session-id") or get_header_case_insensitive(headers, "session_id")
@@ -332,12 +357,16 @@ def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> 
     if channel is not None:
         apply_forced_openai_fast_mode(channel, out, model)
     if isinstance(channel, OpenAIOAuthChannel):
+        responses_lite = _channel_uses_responses_lite(channel, model)
         out = codex_oauth_transform.apply_codex_oauth_transform(
             out,
             resolved_model=model,
             transport="websocket",
+            use_responses_lite=responses_lite,
         )
-        _mark_codex_responses_lite_frame(out, model)
+        _mark_codex_responses_lite_frame(
+            out, model, use_responses_lite=responses_lite,
+        )
     if typ:
         out["type"] = typ
     return out

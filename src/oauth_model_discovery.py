@@ -41,6 +41,8 @@ class DiscoveryResult:
     models: list[str]
     catalog: dict[str, Any]
     source: str
+    # Exact client identity used for this fetch, when the provider has one.
+    client_version: str = ""
 
 
 def _unique(values: list[Any]) -> list[str]:
@@ -67,6 +69,21 @@ def _positive(value: Any) -> int | None:
 def _strings(value: Any) -> list[str]:
     if isinstance(value, str): value = [value]
     return _unique(value) if isinstance(value, list) else []
+
+
+def _reasoning_efforts(value: Any) -> list[str]:
+    """Normalize old string arrays and current Codex ``{effort: ...}`` arrays."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    efforts: list[Any] = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get("effort"), str):
+            efforts.append(item["effort"])
+        elif isinstance(item, str):
+            efforts.append(item)
+    return _unique(efforts)
 
 
 def _service_tiers(value: Any) -> list[dict[str, str]]:
@@ -106,13 +123,18 @@ def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> di
             # Preserve an explicit empty list: for a successful authenticated
             # account catalog it means the model advertised no service tier.
             value = _service_tiers(value)
+        elif target == "reasoningEfforts":
+            value = _reasoning_efforts(value)
+            if not value: continue
         elif target in {
-            "inputModalities", "outputModalities", "reasoningEfforts", "aliases",
-            "additionalSpeedTiers",
+            "inputModalities", "outputModalities", "aliases", "additionalSpeedTiers",
         }:
             value = _strings(value)
             if not value: continue
-        elif target in {"reasoning", "supportsImages", "supportsThinking"}:
+        elif target in {
+            "reasoning", "supportsImages", "supportsThinking", "useResponsesLite",
+            "supportVerbosity", "supportsSearchTool",
+        }:
             if not isinstance(value, bool): continue
         elif isinstance(value, str):
             value = value.strip()
@@ -183,8 +205,20 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
             "defaultServiceTier": ("default_service_tier", "defaultServiceTier"),
             "minimalClientVersion": ("minimal_client_version", "minimalClientVersion"),
             "additionalSpeedTiers": ("additional_speed_tiers", "additionalSpeedTiers"),
+            "useResponsesLite": ("use_responses_lite", "useResponsesLite"),
+            "supportVerbosity": ("support_verbosity", "supportVerbosity"),
+            "defaultVerbosity": ("default_verbosity", "defaultVerbosity"),
+            "toolMode": ("tool_mode", "toolMode"),
+            "shellType": ("shell_type", "shellType"),
+            "supportsSearchTool": ("supports_search_tool", "supportsSearchTool"),
+            "multiAgentVersion": ("multi_agent_version", "multiAgentVersion"),
+            "multiAgentReasoningEffort": (
+                "multi_agent_reasoning_effort", "multiAgentReasoningEffort",
+            ),
         }))
-    return DiscoveryResult(models, _catalog(normalized), "upstream:codex")
+    return DiscoveryResult(
+        models, _catalog(normalized), "upstream:codex", client_version,
+    )
 
 
 def discover_claude(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:

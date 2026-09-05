@@ -49,6 +49,7 @@ from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
+from .openai.codex_constants import codex_cli_version
 from .transform.cc_mimicry import CLI_USER_AGENT
 
 
@@ -3220,6 +3221,9 @@ def _add_account_serialized(entry: dict) -> None:
     # OpenAI 专属字段（缺失时保持空串，渲染端按需展示）
     if provider == "openai":
         normalized.update(_openai_metadata_patch(entry))
+        normalized["last_model_sync_client_version"] = str(
+            entry.get("last_model_sync_client_version") or ""
+        )
     # xAI 专属字段（缺失时保持空串；subject 用于稳定 account_key）
     elif provider == "xai":
         subject = str(entry.get("subject") or entry.get("sub") or "")
@@ -3396,6 +3400,7 @@ def _add_account_serialized(entry: dict) -> None:
                     "cursor_disabled_models", "cursor_max_context_disabled_models",
                     "last_model_sync", "last_model_sync_source",
                     "last_model_sync_error", "last_model_sync_attempt",
+                    "last_model_sync_client_version",
                 ) if key in target
             }
             keep_max = target.get("maxConcurrent")
@@ -4264,10 +4269,15 @@ _model_discovery_executor = concurrent.futures.ThreadPoolExecutor(
 
 
 def _discovery_generation(account: dict) -> str:
+    provider = provider_of(account)
+    # A hot Codex identity change invalidates any in-flight model fetch as well
+    # as the six-hour success TTL checked by ``_model_sync_due``.
+    client_identity = codex_cli_version() if provider == "openai" else ""
     raw = "\0".join((
-        _canonical_key(account), provider_of(account),
+        _canonical_key(account), provider,
         str(account.get("access_token") or ""),
         str(account.get("project_id") or account.get("workspace_id") or ""),
+        client_identity,
     ))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -4379,6 +4389,11 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
             item["last_model_sync_attempt"] = now
             item["last_model_sync_source"] = result.source
             item["last_model_sync_error"] = ""
+            if provider == "openai":
+                item["last_model_sync_client_version"] = (
+                    str(getattr(result, "client_version", "") or "")
+                    or codex_cli_version()
+                )
             saved["value"] = True
             return
 
@@ -4663,6 +4678,12 @@ def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
     failed = bool(account.get("last_model_sync_error"))
     if failed and last_attempt is not None:
         return (now - last_attempt.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS
+    if (
+        provider_of(account) == "openai"
+        and str(account.get("last_model_sync_client_version") or "")
+        != codex_cli_version()
+    ):
+        return True
     model_ids = _model_ids(account)
     if not model_ids or last_success is None or not _model_catalog_complete(account, model_ids):
         return True
