@@ -32,34 +32,10 @@ def canonical_uuid4(value: Any) -> str:
 
 
 def normalize_account_device(account: dict) -> bool:
-    """Normalize default-on device state in one OpenAI OAuth config entry.
+    """Compatibility entry point for the versioned per-workspace identity migration."""
+    from .codex_identity import normalize_account_identity
 
-    Missing enablement means on.  Only the explicit boolean ``False`` opts out;
-    a missing or empty installation ID on an enabled workspace is backfilled
-    exactly once. Disabled accounts retain any valid UUID, making re-enable
-    reversible.
-    """
-    provider = str(account.get("provider") or account.get("type") or "").lower()
-    if provider != "openai":
-        return False
-    changed = False
-    raw_id = account.get("codexDeviceInstallationId")
-    explicit_enabled = account.get("codexDeviceConvergenceEnabled")
-    if explicit_enabled is not None and not isinstance(explicit_enabled, bool):
-        raise ValueError("codexDeviceConvergenceEnabled must be a boolean")
-    enabled = explicit_enabled is not False
-    installation_id = canonical_uuid4(raw_id)
-    workspace_id = str(
-        account.get("workspace_id") or account.get("chatgpt_account_id") or ""
-    ).strip()
-    if installation_id and not workspace_id:
-        raise ValueError(
-            "codexDeviceInstallationId requires a nonempty OpenAI workspace/chatgpt account ID"
-        )
-    if enabled and workspace_id and not installation_id:
-        account["codexDeviceInstallationId"] = new_installation_id()
-        changed = True
-    return changed
+    return normalize_account_identity(account)
 
 
 def _set_existing_header(headers: dict[str, str], name: str, value: str) -> None:
@@ -88,11 +64,12 @@ def apply_device_fingerprint(
     installation_id: str,
     *,
     create_client_metadata: bool,
+    direct_installation_header: bool = False,
 ) -> tuple[dict[str, str], dict | None]:
-    """Rewrite only the four authorized Codex installation carriers.
+    """Project an account UUID to metadata and, for compact/realtime, a header.
 
-    The caller supplies an already validated account-scoped UUID.  An existing
-    non-object ``client_metadata`` is a candidate transformation error.
+    Ordinary Responses uses metadata only in the rust-v0.153.4 profile.  The
+    direct header is opt-in for endpoint profiles that define that carrier.
     """
     if not installation_id:
         return headers, payload
@@ -101,7 +78,8 @@ def apply_device_fingerprint(
         key: value for key, value in headers.items()
         if str(key).lower() != INSTALLATION_HEADER
     }
-    out_headers[INSTALLATION_HEADER] = installation_id
+    if direct_installation_header:
+        out_headers[INSTALLATION_HEADER] = installation_id
     for key, raw in list(out_headers.items()):
         if str(key).lower() == TURN_METADATA_HEADER:
             _set_existing_header(

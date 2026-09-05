@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import uuid
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 from src.tests import _isolation
@@ -26,6 +27,9 @@ def reset_accounts():
     states.clear_all()
 
 
+_OPENAI_INSTALLATION = str(uuid.uuid4())
+
+
 def _entry(provider: str) -> dict:
     entry = {
         "provider": provider,
@@ -41,7 +45,7 @@ def _entry(provider: str) -> dict:
     }
     if provider == "openai":
         entry.update(workspace_id="ws-1", chatgpt_account_id="ws-1",
-                     codexDeviceInstallationId="123e4567-e89b-42d3-a456-426614174000",
+                     codexDeviceInstallationId=_OPENAI_INSTALLATION,
                      codexDeviceConvergenceEnabled=False)
     elif provider in ("xai", "cursor"):
         entry.update(subject="subject-1", sub="subject-1")
@@ -96,8 +100,8 @@ def test_exact_replace_preserves_key_position_and_settings(provider):
         assert accounts[1]["cursor_disabled_models"] == ["disabled-local"]
         assert accounts[1]["cursor_max_context_disabled_models"] == ["max-local"]
     if provider == "openai":
-        assert accounts[1]["codexDeviceInstallationId"] == "123e4567-e89b-42d3-a456-426614174000"
-        assert accounts[1]["codexDeviceConvergenceEnabled"] is False
+        assert accounts[1]["codexDeviceInstallationId"] == _OPENAI_INSTALLATION
+        assert "codexDeviceConvergenceEnabled" not in accounts[1]
 
 
 def test_exact_replace_recovers_previous_auth_error_disable():

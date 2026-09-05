@@ -34,7 +34,7 @@ from .channel.base import Channel
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
-from .openai.codex_identity_confuse import ConfuseState
+from .openai.codex_identity_mapper import ProtocolIdentityMap
 from .openai.responses_ws_runtime import (
     build_oauth_responses_ws_frame,
     drop_headers_case_insensitive,
@@ -2904,7 +2904,7 @@ def _hydrate_oauth_ws_attempt_result(
     result: AttemptResult,
     tracker: _WsResponsesTracker,
     *,
-    identity_state: ConfuseState | None = None,
+    identity_state: ProtocolIdentityMap | None = None,
     proxy_name: str | None = None,
     proxy_bytes: _WsProxyBytes | None = None,
     translator_ctx: dict | None = None,
@@ -2952,12 +2952,13 @@ async def _build_oauth_responses_ws_upstream_request(
     ch: OpenAIOAuthChannel,
     body: dict,
     resolved_model: str,
-) -> tuple[str, dict[str, str], str, Optional[dict], ConfuseState]:
+) -> tuple[str, dict[str, str], str, Optional[dict], ProtocolIdentityMap]:
     # 复用 OAuth channel 的鉴权 / session 隔离 / header 构造；只把 URL 改成 WS，
     # body 用 response.create frame 单独生成，避免把 HTTP JSON body 直接发成 WS frame。
     req = await ch.build_upstream_request(
         body, resolved_model, ingress_protocol="responses",
         defer_device_fingerprint=True,
+        responses_transport="websocket",
     )
     ws_url, headers, frame, identity_state = prepare_oauth_responses_ws_request_parts(
         req,
@@ -3064,7 +3065,28 @@ async def _try_openai_oauth_responses_ws_channel(
                 connector.stats.total_successes += 1
                 connector.stats.last_success_ts = time.time()
                 connector.stats.last_latency_ms = int(connect_ms or 0)
-            _maybe_record_codex_ws_snapshot(ch, getattr(upstream_ws, "response", None))
+            ws_response = getattr(upstream_ws, "response", None)
+            _maybe_record_codex_ws_snapshot(ch, ws_response)
+            from .openai.codex_identity import capture_turn_state, project_snapshot
+            if capture_turn_state(
+                translator_ctx,
+                getattr(ws_response, "headers", None),
+            ):
+                identity_context = (translator_ctx or {}).get("codex_identity_context")
+                if identity_context is not None:
+                    refreshed_snapshot = identity_context.snapshot()
+                    frame_obj = json.loads(first_frame)
+                    _, projected_frame = project_snapshot(
+                        refreshed_snapshot,
+                        {},
+                        frame_obj,
+                        direct_installation_header=False,
+                        create_client_metadata=True,
+                    )
+                    assert projected_frame is not None
+                    first_frame = json.dumps(
+                        projected_frame, ensure_ascii=False, separators=(",", ":")
+                    )
             result = await _consume_oauth_responses_ws(
                 upstream_ws,
                 tracker=tracker,
@@ -3275,7 +3297,7 @@ async def _consume_oauth_responses_ws(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -3439,11 +3461,11 @@ async def _recv_oauth_ws_until_visible(
     ), step.first_packet_ms
 
 
-def _identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
+def _identity_expose_frame(data: str | bytes, state: ProtocolIdentityMap) -> str | bytes:
     return identity_expose_frame(data, state)
 
 
-def _identity_log_text(text: str, state: ConfuseState) -> str:
+def _identity_log_text(text: str, state: ProtocolIdentityMap) -> str:
     return identity_log_text(text, state)
 
 
@@ -3478,7 +3500,7 @@ async def _consume_oauth_responses_ws_non_stream(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -3658,7 +3680,7 @@ async def _finalize_oauth_ws_error(
     tracker: _WsResponsesTracker,
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     timing: WsAttemptTiming,
 ) -> None:
     result = _request_invalid_result_if_needed(result)
@@ -3719,7 +3741,7 @@ async def _consume_oauth_responses_ws_stream(
     affinity_hit: int,
     translator_ctx: Optional[dict],
     body: Optional[dict],
-    identity_state: ConfuseState,
+    identity_state: ProtocolIdentityMap,
     client_key: Optional[str],
     proxy_name: Optional[str],
     proxy_bytes: _WsProxyBytes,
@@ -4219,6 +4241,9 @@ async def _try_channel(
         # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次
         _maybe_record_codex_snapshot(ch, upstream_resp)
         _maybe_record_anthropic_snapshot(ch, upstream_resp)
+        if isinstance(ch, OpenAIOAuthChannel):
+            from .openai.codex_identity import capture_turn_state
+            capture_turn_state(upstream_req.translator_ctx, upstream_resp.headers)
 
         # 2. HTTP 状态码检查
         if upstream_resp.status_code >= 400:

@@ -176,11 +176,17 @@ def _make_openai_oauth_channel(email: str = "fake-ws@example.com"):
     return OpenAIOAuthChannel({
         "email": email,
         "provider": "openai",
+        "workspace_id": f"ws-{email}",
+        "chatgpt_account_id": f"ws-{email}",
         "accountKey": f"openai:{email}",
         "accessToken": "tok",
         "refreshToken": "rt",
         "expiresAt": 32503680000,
         "models": ["gpt-5"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "gpt-5", "useResponsesLite": False}],
+        },
     })
 
 
@@ -4878,11 +4884,25 @@ async def test_http_responses_client_to_ws_fake_upstream(monkeypatch, m):
         "concurrency": {"queueWaitSeconds": 1},
         "openai": {"responsesUpstreamWsForOAuth": True},
         "oauth": {"providers": {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}},
-        # This test installs a fake in-memory OAuth channel directly in the
-        # registry; the persisted/configured OAuth account list must remain off.
         "oauthAccounts": [],
     }))
-    _install_channels(m, [_make_openai_oauth_channel("fake-http-ws@example.com")])
+    oauth_channel = _make_openai_oauth_channel("fake-http-ws@example.com")
+    m["config"].update(lambda cfg: cfg.__setitem__("oauthAccounts", [{
+        "email": "fake-http-ws@example.com",
+        "provider": "openai",
+        "workspace_id": "ws-fake-http-ws@example.com",
+        "chatgpt_account_id": "ws-fake-http-ws@example.com",
+        "accessToken": "tok",
+        "refreshToken": "rt",
+        "models": ["gpt-5"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "gpt-5", "useResponsesLite": False}],
+        },
+        "codexIdentity": oauth_channel.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": oauth_channel.codex_device_installation_id,
+    }]))
+    _install_channels(m, [oauth_channel])
 
     async def fake_token(account_key):
         assert account_key.startswith("openai:fake-http-ws@example.com")

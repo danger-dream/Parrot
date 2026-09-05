@@ -35,6 +35,7 @@ import copy
 import json
 import os
 import sys
+import uuid
 
 import pytest
 
@@ -568,7 +569,11 @@ def test_channel_responses_ingress(m):
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1",
                                                 ingress_protocol="responses"))
     assert req.url == m["CODEX_UPSTREAM_URL"]
-    assert req.translator_ctx is None          # 无 session anchor 时同协议透传无需 ctx
+    assert req.translator_ctx is not None
+    identity_context = req.translator_ctx["codex_identity_context"]
+    identity_snapshot = req.translator_ctx["codex_identity_snapshot"]
+    assert identity_context.logical_session.durable is False
+    assert identity_snapshot.installation_id == ch.codex_device_installation_id
     h = {k.lower(): v for k, v in req.headers.items()}
     assert h["chatgpt-account-id"] == "acct-123"
     assert "openai-beta" not in h
@@ -584,6 +589,10 @@ def test_channel_responses_ingress(m):
     assert payload["store"] is False
     assert payload["stream"] is True
     assert "temperature" not in payload
+    assert payload["client_metadata"]["x-codex-installation-id"] == ch.codex_device_installation_id
+    assert payload["client_metadata"]["session_id"] == h["session-id"]
+    assert uuid.UUID(h["session-id"]).version == 7
+    assert "session_id" not in h
     assert "x-openai-internal-codex-responses-lite" not in h
     print("  [PASS] channel: responses ingress → full codex request shape")
 
@@ -916,22 +925,23 @@ def test_channel_responses_ingress_replay_scope_and_injection(m):
     _add_openai_acc(m)
     rr = m["reasoning_replay"]
     account_key = "openai:o@openai.test:acct-123"
-    encrypted_content = _valid_encrypted_content(13)
-    rr.cache_items(
-        "gpt-5.1",
-        "prompt-cache:anchor",
-        [{"type": "reasoning", "encrypted_content": encrypted_content}],
-        account_key=account_key,
-    )
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
     body = {"model": "gpt-5.1", "input": "continue", "prompt_cache_key": "anchor"}
+    probe = asyncio.run(ch.build_upstream_request(
+        copy.deepcopy(body), "gpt-5.1", ingress_protocol="responses",
+    ))
+    replay_scope = probe.translator_ctx["codex_reasoning_replay"]
+    encrypted_content = _valid_encrypted_content(13)
+    rr.cache_items(
+        replay_scope["model"], replay_scope["session_key"],
+        [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=replay_scope["account_key"],
+    )
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
     ctx = req.translator_ctx
-    assert ctx["codex_reasoning_replay"] == {
-        "model": "gpt-5.1",
-        "session_key": "prompt-cache:anchor",
-        "account_key": account_key,
-    }
+    assert ctx["codex_reasoning_replay"] == replay_scope
+    assert replay_scope["owner_digest"] == replay_scope["account_key"]
+    assert replay_scope["session_key"].startswith("logical-session:")
     assert ctx["codex_reasoning_replay_injected"] == 1
     payload = json.loads(req.body)
     assert payload["input"][0] == {"type": "reasoning", "summary": [], "content": None, "encrypted_content": encrypted_content}
@@ -944,22 +954,24 @@ def test_channel_gpt6_replay_keeps_lite_prefix_first(m):
     _add_openai_acc(m, models=["gpt-6-astra"])
     rr = m["reasoning_replay"]
     account_key = "openai:o@openai.test:acct-123"
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
+    body = {
+        "model": "gpt-6-astra",
+        "input": "continue",
+        "prompt_cache_key": "astra",
+    }
+    probe = asyncio.run(ch.build_upstream_request(
+        copy.deepcopy(body), "gpt-6-astra", ingress_protocol="responses",
+    ))
+    replay_scope = probe.translator_ctx["codex_reasoning_replay"]
     encrypted_content = _valid_encrypted_content(19)
     rr.cache_items(
-        "gpt-6-astra",
-        "prompt-cache:astra",
+        replay_scope["model"], replay_scope["session_key"],
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
-        account_key=account_key,
+        account_key=replay_scope["account_key"],
     )
-    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
     req = asyncio.run(ch.build_upstream_request(
-        {
-            "model": "gpt-6-astra",
-            "input": "continue",
-            "prompt_cache_key": "astra",
-        },
-        "gpt-6-astra",
-        ingress_protocol="responses",
+        body, "gpt-6-astra", ingress_protocol="responses",
     ))
     payload = json.loads(req.body)
     assert payload["input"][0]["type"] == "additional_tools"
@@ -1221,13 +1233,15 @@ def test_channel_anthropic_ingress_maps_cache_to_prompt_cache_and_session(m):
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
     payload = json.loads(req.body)
 
-    assert payload["prompt_cache_key"].startswith("parrot:cache:v1:a2o-session:")
+    assert uuid.UUID(payload["prompt_cache_key"]).version == 7
     assert "prompt_cache_retention" not in payload  # Codex endpoint rejects retention; transform strips it.
     assert "metadata" not in payload               # stripped only after deriving the cache/session key.
-    sid = req.headers.get("session_id")
-    assert sid and len(sid) == 16 and all(ch_ in "0123456789abcdef" for ch_ in sid)
+    sid = req.headers.get("session-id")
+    assert sid == payload["prompt_cache_key"]
+    assert payload["client_metadata"]["x-codex-installation-id"] == ch.codex_device_installation_id
+    assert "session_id" not in req.headers
     assert "conversation_id" not in req.headers
-    print("  [PASS] channel: anthropic ingress maps cache_control/session to Codex prompt_cache_key + session_id")
+    print("  [PASS] channel: anthropic ingress maps cache/session anchor to durable Codex UUIDv7")
 
 
 def test_channel_anthropic_ingress_metadata_session_replay(m):
@@ -1235,13 +1249,6 @@ def test_channel_anthropic_ingress_metadata_session_replay(m):
     _add_openai_acc(m)
     rr = m["reasoning_replay"]
     account_key = "openai:o@openai.test:acct-123"
-    encrypted_content = _valid_encrypted_content(17)
-    rr.cache_items(
-        "gpt-5.1",
-        "claude:session-abc",
-        [{"type": "reasoning", "encrypted_content": encrypted_content}],
-        account_key=account_key,
-    )
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account(account_key))
     body = {
         "model": "gpt-5.1",
@@ -1249,13 +1256,21 @@ def test_channel_anthropic_ingress_metadata_session_replay(m):
         "max_tokens": 32,
         "metadata": {"user_id": '{"session_id":"session-abc"}'},
     }
+    probe = asyncio.run(ch.build_upstream_request(
+        copy.deepcopy(body), "gpt-5.1", ingress_protocol="anthropic",
+    ))
+    replay_scope = probe.translator_ctx["codex_reasoning_replay"]
+    encrypted_content = _valid_encrypted_content(17)
+    rr.cache_items(
+        replay_scope["model"], replay_scope["session_key"],
+        [{"type": "reasoning", "encrypted_content": encrypted_content}],
+        account_key=replay_scope["account_key"],
+    )
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
     ctx = req.translator_ctx
-    assert ctx["codex_reasoning_replay"] == {
-        "model": "gpt-5.1",
-        "session_key": "claude:session-abc",
-        "account_key": account_key,
-    }
+    assert ctx["codex_reasoning_replay"] == replay_scope
+    assert replay_scope["owner_digest"] == replay_scope["account_key"]
+    assert replay_scope["session_key"].startswith("logical-session:")
     assert ctx["codex_reasoning_replay_injected"] == 1
     payload = json.loads(req.body)
     assert payload["input"][0]["type"] == "reasoning"
@@ -1275,7 +1290,7 @@ def test_channel_missing_chatgpt_account_id_uses_refresh_identity_on_first_reque
     persisted = m["oauth_manager"].get_account(ch.account_key)
     installation_id = persisted["codexDeviceInstallationId"]
     assert req.headers["chatgpt-account-id"] == persisted["workspace_id"]
-    assert req.headers["x-codex-installation-id"] == installation_id
+    assert "x-codex-installation-id" not in req.headers
     assert json.loads(req.body)["client_metadata"][
         "x-codex-installation-id"
     ] == installation_id
@@ -1323,8 +1338,8 @@ def test_openai_oauth_channel_max_concurrent(m):
     print("  [PASS] OpenAI OAuth channel honors maxConcurrent")
 
 
-def test_session_id_isolation_with_prompt_cache_key(m):
-    """Commit 4: 下游 prompt_cache_key + api_key_name 派生上游 session_id。"""
+def test_logical_session_isolation_with_prompt_cache_key(m):
+    """Principal+anchor choose durable sessions without becoming wire identifiers."""
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
@@ -1340,17 +1355,31 @@ def test_session_id_isolation_with_prompt_cache_key(m):
         "prompt_cache_key": "chat-abc",   # 同一个 cache_key
         "_api_key_name": "user_bob",       # 不同 api_key_name
     }
-    req_a = asyncio.run(ch.build_upstream_request(body_a, "gpt-5.1", ingress_protocol="responses"))
-    req_b = asyncio.run(ch.build_upstream_request(body_b, "gpt-5.1", ingress_protocol="responses"))
-    sid_a = req_a.headers.get("session_id")
-    sid_b = req_b.headers.get("session_id")
+    req_a = asyncio.run(ch.build_upstream_request(
+        copy.deepcopy(body_a), "gpt-5.1", ingress_protocol="responses",
+    ))
+    req_a2 = asyncio.run(ch.build_upstream_request(
+        copy.deepcopy(body_a), "gpt-5.1", ingress_protocol="responses",
+    ))
+    req_b = asyncio.run(ch.build_upstream_request(
+        copy.deepcopy(body_b), "gpt-5.1", ingress_protocol="responses",
+    ))
+    sid_a = req_a.headers.get("session-id")
+    sid_a2 = req_a2.headers.get("session-id")
+    sid_b = req_b.headers.get("session-id")
     assert sid_a and sid_b
-    assert sid_a != sid_b, "相同 prompt_cache_key 的不同 api_key 不应共享 session_id"
-    # conversation_id deprecated — should no longer be present
+    assert sid_a == sid_a2
+    assert sid_a != sid_b, "相同 anchor 的不同 principal 不应共享 logical session"
+    assert uuid.UUID(sid_a).version == 7
+    assert json.loads(req_a.body)["prompt_cache_key"] == sid_a
+    assert json.loads(req_b.body)["prompt_cache_key"] == sid_b
+    assert "session_id" not in req_a.headers
     assert "conversation_id" not in req_a.headers
-    # 长度 16 hex
-    assert len(sid_a) == 16 and all(ch_ in "0123456789abcdef" for ch_ in sid_a)
-    print("  [PASS] session_id: api_key_name-based isolation, conversation_id removed")
+    assert (
+        json.loads(req_a.body)["client_metadata"]["x-codex-installation-id"]
+        == json.loads(req_b.body)["client_metadata"]["x-codex-installation-id"]
+    )
+    print("  [PASS] logical session: principal isolation with stable workspace installation")
 
 
 def test_claude_agent_prompt_cache_key_drives_oauth_session_id(m):
@@ -1408,16 +1437,16 @@ def test_claude_agent_prompt_cache_key_drives_oauth_session_id(m):
     req_a1 = asyncio.run(_request(pck_a1))
     req_a2 = asyncio.run(_request(pck_a2))
     req_b = asyncio.run(_request(pck_b))
-    sid_a1 = req_a1.headers.get("session_id")
-    sid_a2 = req_a2.headers.get("session_id")
-    sid_b = req_b.headers.get("session_id")
+    sid_a1 = req_a1.headers.get("session-id")
+    sid_a2 = req_a2.headers.get("session-id")
+    sid_b = req_b.headers.get("session-id")
     assert sid_a1 and sid_b
     assert sid_a1 == sid_a2
     assert sid_a1 != sid_b
 
 
-def test_session_id_isolation_disabled(m):
-    """isolateSessionId=False 时不写 session_id / conversation_id 头。"""
+def test_legacy_isolate_session_switch_cannot_disable_identity(m):
+    """The removed opt-out cannot suppress mandatory logical-session carriers."""
     _setup(m)
     _add_openai_acc(m)
     def _off(c):
@@ -1430,14 +1459,11 @@ def test_session_id_isolation_disabled(m):
         "prompt_cache_key": "chat-abc", "_api_key_name": "alice",
     }
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
+    assert uuid.UUID(req.headers["session-id"]).version == 7
     assert "session_id" not in req.headers
     assert "conversation_id" not in req.headers
-
-    # 恢复默认
-    def _on(c):
-        c.setdefault("openaiOAuth", {})["isolateSessionId"] = True
-    m["config"].update(_on)
-    print("  [PASS] session_id: isolateSessionId=false disables header injection")
+    assert json.loads(req.body)["prompt_cache_key"] == req.headers["session-id"]
+    print("  [PASS] logical session: obsolete isolateSessionId opt-out ignored")
 
 
 def test_force_codex_cli_switch(m):
@@ -1530,7 +1556,12 @@ def test_config_backfills_openai_oauth_from_legacy_provider(m):
     changed = m["config"]._normalize_openai_oauth_config(merged, raw)
     assert changed is True
     assert merged["openaiOAuth"]["forceCodexCLI"] is False
-    assert merged["openaiOAuth"]["isolateSessionId"] is False
+    assert "isolateSessionId" not in merged["openaiOAuth"]
+    assert merged["openaiOAuth"]["codexIdentity"] == {
+        "mode": "per-oauth-account",
+        "protocolProfile": "rust-v0.153.4",
+        "newIdentityGenerationVersion": 1,
+    }
     assert merged["openaiOAuth"]["defaultModels"] == ["legacy-model"]
     assert merged["openaiOAuth"]["codexUpstreamUrl"].startswith("https://chatgpt.com/")
     print("  [PASS] config: legacy oauth.providers.openai backfills openaiOAuth")

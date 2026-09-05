@@ -223,8 +223,8 @@ def _install_oauth_channel(
         "expired": "2999-01-01T00:00:00Z",
         "models": [],
     }
-    cfg["oauthAccounts"].append(dict(account))
     channel = m["OpenAIOAuthChannel"](account)
+    cfg["oauthAccounts"].append(account)
     with m["registry"]._lock:
         m["registry"]._channels[channel.key] = channel
     return channel
@@ -343,6 +343,7 @@ async def test_oauth_channel_build_realtime_headers_uses_existing_identity(monke
     assert headers["version"]
     from src.openai.codex_constants import codex_cli_user_agent
     assert headers["user-agent"] == codex_cli_user_agent(cfg["openaiOAuth"])
+    assert headers["x-codex-installation-id"] == channel.codex_device_installation_id
     for response_only_header in ("host", "accept", "content-type", "openai-beta"):
         assert response_only_header not in headers
 
@@ -371,7 +372,8 @@ async def test_realtime_ws_injects_oauth_and_relays_text_frames(monkeypatch, m):
         assert headers["chatgpt-account-id"] == "workspace-realtime"
         assert headers["openai-alpha"] == "quicksilver=v1"
         assert headers["x-session-id"] == "rt-session"
-        assert headers["x-codex-installation-id"] == "install-test"
+        assert headers["x-codex-installation-id"] == channel.codex_device_installation_id
+        assert headers["x-codex-installation-id"] != "install-test"
         assert model == "gpt-realtime-1.5"
         return upstream
 

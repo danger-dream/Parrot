@@ -24,16 +24,17 @@ src.oauth.openai.parse_rate_limit_headers 解析头并落库（Commit 3）。
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Optional
 
 from .. import cache_hints, config, model_metadata, model_pricing, network, oauth_manager
 from ..providers import registry as provider_registry
 from ..openai import reasoning_replay
-from ..openai.codex_device_fingerprint import (
-    apply_device_fingerprint,
-    canonical_uuid4,
+from ..openai.codex_identity import (
+    account_identity_from_account,
+    normalize_account_identity,
+    project_snapshot,
+    resolve_request_identity_context,
 )
 from ..openai.transform import (
     anthropic_to_responses,
@@ -67,18 +68,6 @@ def _provider_cfg() -> dict:
         else:
             merged[key] = value
     return merged
-
-
-def _isolate_session_id(api_key_name: str, raw: str) -> str:
-    """把 api_key_name 混入 raw，防止不同 API Key 的会话粘性交叉污染。
-
-    使用带 API Key 身份前缀的原始会话锚点，
-    做 sha256 取前 16 hex 字符。我们用 sha256 而非 xxhash（无新依赖）。
-    """
-    if not raw:
-        return ""
-    material = f"k{api_key_name or '-'}:{raw}".encode("utf-8")
-    return hashlib.sha256(material).hexdigest()[:16]
 
 
 def _request_api_key_name(body: dict) -> str:
@@ -220,15 +209,12 @@ class OpenAIOAuthChannel(Channel):
             account.get("workspace_id") or account.get("chatgpt_account_id") or ""
         )
         self.plan_type = str(account.get("plan_type") or "")
-        device_enabled = account.get("codexDeviceConvergenceEnabled") is not False
+        normalize_account_identity(account)
+        self.codex_account_identity = account_identity_from_account(account, require=False)
         self.codex_device_installation_id = (
-            canonical_uuid4(account.get("codexDeviceInstallationId"))
-            if device_enabled else ""
+            self.codex_account_identity.installation_id
+            if self.codex_account_identity is not None else ""
         )
-        if self.codex_device_installation_id and not self.chatgpt_account_id:
-            raise ValueError(
-                "codexDeviceInstallationId requires a nonempty OpenAI workspace/chatgpt account ID"
-            )
 
         # 账户 models 优先级：
         #   1) 账户 entry 自带 models（TG 面板里手动填的）
@@ -457,13 +443,6 @@ class OpenAIOAuthChannel(Channel):
                 "route this request to an OpenAI API channel."
             )
 
-        # Step B: Codex reasoning replay scope。必须在 codex transform 剥 metadata
-        # 等字段前计算 scope；没有 prompt_cache_key / metadata / Codex
-        # turn/window/session 锚点时不启用，避免跨会话串状态。
-        replay_scope = reasoning_replay.scope_from_payload(
-            resolved_model, payload, account_key=self.account_key,
-        )
-
         # Step B.5: Anthropic ingress 的 cache_control 在 Anthropic→Responses
         # translator 中会被剥离；在进入 Codex transform 前补 OpenAI/Codex 可用
         # 的 prompt_cache_key。放在 replay_scope 之后，避免改变既有 metadata
@@ -477,6 +456,54 @@ class OpenAIOAuthChannel(Channel):
                 client_ip=requested_body.get("_parrot_client_ip"),
             )
 
+        # Resolve/refresh the final candidate before constructing any upstream
+        # identity. A workspace still unknown after refresh fails closed.
+        access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        from .. import channel_state
+        current_account_key = self.account_key
+        resolved_channel_key = channel_state.resolve(self.key)
+        if resolved_channel_key.startswith("oauth:"):
+            current_account_key = resolved_channel_key[len("oauth:"):]
+        current_account = oauth_manager.get_account(current_account_key)
+        if current_account is None:
+            raise ValueError("OpenAI OAuth account disappeared before Codex dispatch")
+        normalize_account_identity(current_account)
+        current_identity = account_identity_from_account(current_account)
+        if current_identity is None:
+            raise ValueError("OpenAI OAuth workspace/account identity is unavailable")
+        current_workspace_id = str(
+            current_account.get("workspace_id")
+            or current_account.get("chatgpt_account_id")
+            or ""
+        ).strip()
+        if not current_workspace_id:
+            raise ValueError(
+                "OpenAI OAuth workspace/account ID is unknown after token refresh"
+            )
+        self.chatgpt_account_id = current_workspace_id
+        self.workspace_id = current_workspace_id
+        self.codex_account_identity = current_identity
+        self.codex_device_installation_id = current_identity.installation_id
+
+        # Anthropic translation may have supplied a stable generated affinity key
+        # only on the translated payload. Keep it internal as an anchor source.
+        if payload.get("prompt_cache_key") and not requested_body.get("prompt_cache_key"):
+            requested_body.setdefault(
+                "_parrot_stable_anchor", str(payload.get("prompt_cache_key"))
+            )
+        identity_context = resolve_request_identity_context(current_account, requested_body)
+        identity_snapshot = identity_context.snapshot()
+        replay_scope = (
+            reasoning_replay.scope_from_payload(
+                resolved_model,
+                payload,
+                owner_digest=current_identity.owner_digest,
+                logical_session_id=identity_context.logical_session.session_id,
+            )
+            if identity_context.logical_session.durable
+            else None
+        )
+
         # Step C: codex 兼容改造（store=false 等硬约束）。带 encrypted_content 的
         # replay reasoning 只做透明透传，非法/陈旧 EC 由 failover 清 scope 后降级重试。
         # The authenticated account catalog is authoritative field-by-field;
@@ -488,15 +515,10 @@ class OpenAIOAuthChannel(Channel):
         if base_instructions is None and isinstance(configured_default, str):
             base_instructions = configured_default.strip() or None
 
-        raw_thread_context = str(payload.get("prompt_cache_key") or "").strip()
-        lite_thread_context = raw_thread_context
-        api_key_name = _request_api_key_name(requested_body)
-        if (
-            raw_thread_context
-            and api_key_name
-            and prov_cfg.get("isolateSessionId", True)
-        ):
-            lite_thread_context = _isolate_session_id(api_key_name, raw_thread_context)
+        # The downstream anchor is lookup-only. Codex receives only the durable
+        # account-scoped logical session UUIDv7 as its cache/thread context.
+        lite_thread_context = identity_snapshot.prompt_cache_key
+        payload["prompt_cache_key"] = identity_snapshot.prompt_cache_key
 
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload,
@@ -567,77 +589,29 @@ class OpenAIOAuthChannel(Channel):
             translator_ctx["codex_reasoning_replay"] = replay_scope
             translator_ctx["codex_reasoning_replay_injected"] = replay_injected
 
-        # Step E: 拿 access_token（会在此触发 refresh if 过期）。旧账号可能在
-        # 这次 refresh 中才首次取得 workspace，并由 oauth_manager 同事务生成设备
-        # UUID；当前 Channel 是 refresh 前的快照，因此必须重新读取已提交账户，
-        # 让第一条请求就使用新 workspace/device，而不是等下一次 registry 调度。
-        access_token = await oauth_manager.ensure_valid_token(self.account_key)
-        from .. import channel_state
-        current_account_key = self.account_key
-        resolved_channel_key = channel_state.resolve(self.key)
-        if resolved_channel_key.startswith("oauth:"):
-            current_account_key = resolved_channel_key[len("oauth:"):]
-        current_account = oauth_manager.get_account(current_account_key)
-        current_workspace_id = self.chatgpt_account_id
-        current_device_installation_id = self.codex_device_installation_id
-        if current_account is not None:
-            current_workspace_id = str(
-                current_account.get("workspace_id")
-                or current_account.get("chatgpt_account_id")
-                or ""
-            )
-            device_enabled = (
-                current_account.get("codexDeviceConvergenceEnabled") is not False
-            )
-            current_device_installation_id = (
-                canonical_uuid4(current_account.get("codexDeviceInstallationId"))
-                if device_enabled else ""
-            )
-            if current_device_installation_id and not current_workspace_id:
-                raise ValueError(
-                    "codexDeviceInstallationId requires a nonempty "
-                    "OpenAI workspace/chatgpt account ID"
-                )
-            # Deferred WS builders read the channel after this method returns.
-            # Refresh-derived identity must therefore update this live snapshot as
-            # well as the local HTTP variables, so the very first WS request is
-            # converged too.
-            self.chatgpt_account_id = current_workspace_id
-            self.workspace_id = current_workspace_id
-            self.codex_device_installation_id = current_device_installation_id
-
         headers = self._build_headers(access_token, provider_config=prov_cfg)
         if current_workspace_id:
             headers["chatgpt-account-id"] = current_workspace_id
         if responses_lite:
             headers[CODEX_RESPONSES_LITE_HEADER] = "true"
-        # session_id / conversation_id 隔离（可配置）：基于 prompt_cache_key
-        # 派生，避免同 OAuth 账户下不同下游 API Key 之间会话粘性碰撞。
-        if prov_cfg.get("isolateSessionId", True):
-            api_key_name = _request_api_key_name(requested_body)
-            prompt_cache_key = str(payload.get("prompt_cache_key") or "").strip()
-            if api_key_name and prompt_cache_key:
-                iso = _isolate_session_id(api_key_name, prompt_cache_key)
-                if iso:
-                    headers["session_id"] = iso
-                    # conversation_id deprecated by Codex — no longer sent.
-
-        # Delete deprecated conversation_id header if present.
-        headers.pop("conversation_id", None)
-
-        # Realtime calls _build_headers() directly, so installation identity is
-        # deliberately finalized here only for Codex Responses HTTP.  Applicability
-        # follows the final upstream transport, not the accepted ingress shape:
-        # responses, chat, and anthropic all reach the same HTTP endpoint here.
-        # WS paths defer until after their existing identity-confuse/session updates.
-        if (
-            current_device_installation_id
-            and not defer_device_fingerprint
-        ):
-            headers, payload = apply_device_fingerprint(
-                headers, payload, current_device_installation_id,
-                create_client_metadata=True,
-            )
+        # HTTP and WS use one authoritative immutable snapshot. Ordinary
+        # Responses carries installation identity in metadata, not a second direct
+        # header; compact/realtime endpoint profiles opt into that carrier.
+        headers, payload = project_snapshot(
+            identity_snapshot,
+            headers,
+            payload,
+            direct_installation_header=False,
+            create_client_metadata=True,
+        )
+        if translator_ctx is None:
+            translator_ctx = {
+                "ingress": ingress_protocol,
+                "upstream_protocol": "openai-responses",
+                "model_for_response": resolved_model,
+            }
+        translator_ctx["codex_identity_context"] = identity_context
+        translator_ctx["codex_identity_snapshot"] = identity_snapshot
 
         # Official Codex sends this on both HTTP requests and WebSocket
         # handshakes.  The WS bridge reuses these headers when it dials the
@@ -788,7 +762,29 @@ class OpenAIOAuthChannel(Channel):
         OAuth channel identity.
         """
         access_token = await oauth_manager.ensure_valid_token(self.account_key)
+        from .. import channel_state
+        resolved = channel_state.resolve(self.key)
+        account_key = resolved[len("oauth:"):] if resolved.startswith("oauth:") else self.account_key
+        account = oauth_manager.get_account(account_key)
+        if account is None:
+            raise ValueError("OpenAI OAuth account disappeared before realtime dispatch")
+        normalize_account_identity(account)
+        identity = account_identity_from_account(account)
+        if identity is None:
+            raise ValueError("OpenAI OAuth workspace/account identity is unavailable")
+        workspace_id = str(
+            account.get("workspace_id") or account.get("chatgpt_account_id") or ""
+        ).strip()
+        if not workspace_id:
+            raise ValueError("OpenAI OAuth workspace/account ID is unknown after token refresh")
+        self.chatgpt_account_id = workspace_id
+        self.workspace_id = workspace_id
+        self.codex_account_identity = identity
+        self.codex_device_installation_id = identity.installation_id
         headers = self._build_headers(access_token)
+        # Realtime's endpoint profile uses the direct installation carrier and
+        # does not borrow Responses session/thread metadata.
+        headers["x-codex-installation-id"] = identity.installation_id
         # These are specific to the SSE Responses endpoint.  Realtime callers
         # supply their own content negotiation / beta headers where needed.
         for name in ("host", "accept", "content-type", "openai-beta"):
@@ -811,8 +807,7 @@ class OpenAIOAuthChannel(Channel):
             "version": client_version,
             "accept": "text/event-stream",
             "content-type": "application/json",
-            # x-client-request-id: set downstream by session/identity-confuse logic;
-            # not included here to avoid sending an empty value if nothing overwrites it.
+            # Request identity is projected after the final OAuth candidate is known.
         }
         if self.chatgpt_account_id:
             headers["chatgpt-account-id"] = self.chatgpt_account_id

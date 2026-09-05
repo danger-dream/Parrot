@@ -525,7 +525,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "openaiOAuth": {
         "forceCodexCLI": True,
         "enableTLSFingerprint": False,
-        "isolateSessionId": True,
+        "codexIdentity": {
+            "mode": "per-oauth-account",
+            "protocolProfile": "rust-v0.153.4",
+            "newIdentityGenerationVersion": 1,
+        },
         "defaultModels": [
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -703,6 +707,10 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
         merged = _deep_merge_defaults(default, legacy)
     else:
         merged = _deep_merge_defaults(default, current)
+    # ``isolateSessionId`` used to gate a downstream-key-derived 16-hex wire ID.
+    # Per-OAuth identity is now invariant, so the obsolete OpenAI switch is
+    # consumed as migration input and removed instead of remaining a fake bypass.
+    merged.pop("isolateSessionId", None)
     if current != merged:
         cfg["openaiOAuth"] = merged
         return True
@@ -710,17 +718,17 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
 
 
 def _normalize_codex_device_accounts(cfg: dict) -> bool:
-    """Persist default-on installation IDs for eligible legacy OpenAI workspaces."""
-    from .openai.codex_device_fingerprint import normalize_account_device
+    """Migrate OpenAI workspaces to versioned, owner-bound Codex identities."""
+    from .openai.codex_identity import normalize_account_identities
 
-    changed = False
-    accounts = cfg.get("oauthAccounts") or []
-    if not isinstance(accounts, list):
-        return False
-    for account in accounts:
-        if isinstance(account, dict) and normalize_account_device(account):
-            changed = True
-    return changed
+    identity_cfg = (cfg.get("openaiOAuth") or {}).get("codexIdentity") or {}
+    profile = str(identity_cfg.get("protocolProfile") or "rust-v0.153.4")
+    generation_version = identity_cfg.get("newIdentityGenerationVersion", 1)
+    return normalize_account_identities(
+        cfg.get("oauthAccounts") or [],
+        protocol_profile=profile,
+        new_identity_generation_version=generation_version,
+    )
 
 
 def _normalize_pricing_sources(cfg: dict) -> bool:
@@ -821,7 +829,7 @@ def _load_from_disk() -> dict:
         print("[config] migrated built-in pricing source from LiteLLM to models.dev")
     if _normalize_codex_device_accounts(merged):
         changed = True
-        print("[config] backfilled default-on Codex device installation identities")
+        print("[config] migrated versioned per-workspace Codex identities")
     if changed:
         _write_atomic(merged)
     return merged

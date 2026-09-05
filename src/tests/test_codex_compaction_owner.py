@@ -78,8 +78,16 @@ def test_single_owner_bootstrap_is_lossless_and_persists(monkeypatch):
     assert upstream_body["input"][1]["encrypted_content"] == "opaque-compaction-ciphertext"
     assert upstream_body["input"][0]["encrypted_content"] == "reasoning-ec"
 
+    monkeypatch.setattr(scheduler.config, "get", lambda: {
+        "openaiOAuth": {
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
+        },
+    })
     transformed = codex_oauth_transform.apply_codex_oauth_transform(
         copy.deepcopy(upstream_body), resolved_model="gpt-5.5",
+        use_responses_lite=False,
+        base_instructions="You are a helpful coding assistant.",
     )
     wire_compaction = next(item for item in transformed["input"] if item.get("type") == "compaction")
     assert wire_compaction == original["input"][1]

@@ -39,6 +39,12 @@ from .. import (
 from ..oauth import normalize_provider
 from ..oauth import openai as openai_provider
 from ..oauth_ids import account_key as make_account_key
+from .codex_identity import (
+    account_identity_from_account,
+    normalize_account_identity,
+    project_snapshot,
+    resolve_request_identity_context,
+)
 from .codex_constants import (
     CODEX_ROUTING_HINT_HEADER,
     build_codex_routing_hint,
@@ -237,7 +243,6 @@ def _build_headers(
         "Authorization": f"Bearer {access_token}",
         "User-Agent": codex_cli_user_agent(),
         "Version": codex_cli_version(),
-        "Session_id": str(uuid.uuid4()),
         "Accept": "text/event-stream",
         "Connection": "Keep-Alive",
         "Originator": codex_originator(),
@@ -378,16 +383,32 @@ def _extract_images(event: dict[str, Any]) -> tuple[list[dict], dict | None, int
 
 async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: int,
                               refresh_first: bool = False) -> tuple[list[dict], dict | None, int]:
-    acc = account_row["account"]
     ak = account_row["account_key"]
     email = account_row.get("email") or ""
-    account_id = str(acc.get("workspace_id") or acc.get("chatgpt_account_id") or acc.get("account_id") or "").strip()
-    if not account_id:
-        raise UpstreamImageError("OpenAI OAuth account missing chatgpt_account_id/workspace_id", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
-
     access_token = await (oauth_manager.force_refresh(ak) if refresh_first else oauth_manager.ensure_valid_token(ak))
+    acc = oauth_manager.get_account(ak)
+    if acc is None:
+        raise UpstreamImageError("OpenAI OAuth account disappeared before image dispatch", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
+    normalize_account_identity(acc)
+    identity = account_identity_from_account(acc)
+    account_id = str(acc.get("workspace_id") or acc.get("chatgpt_account_id") or "").strip()
+    if not account_id or identity is None:
+        raise UpstreamImageError("OpenAI OAuth account missing canonical workspace identity", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
+
+    context = resolve_request_identity_context(acc, payload)
+    snapshot = context.snapshot()
     headers = _build_headers(access_token, account_id, str(payload.get("model") or ""))
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    headers, projected = project_snapshot(
+        snapshot, headers, payload,
+        direct_installation_header=False,
+        create_client_metadata=True,
+    )
+    assert projected is not None
+    wire_payload = {
+        key: value for key, value in projected.items()
+        if not (isinstance(key, str) and key.startswith("_"))
+    }
+    body = json.dumps(wire_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     by_index: dict[int, dict] = {}
     fallback: list[dict] = []
@@ -666,6 +687,7 @@ async def _execute_pipeline(
         size=size, images=input_image_urls or None,
         native_options=native_options, mask_url=mask_url,
     )
+    payload["_api_key_name"] = str(key_name or "")
 
     started = time.time()
     last_err: UpstreamImageError | None = None

@@ -741,7 +741,8 @@ def test_refresh_identity_and_priority_publish_in_one_reload_snapshot():
         "access_token": "test-access-token",
         "refresh_token": "test-refresh-token",
         "id_token": "h.p.s",
-        "chatgpt_account_id": f"acct-old-{suffix}",
+        # Legacy pre-workspace account: first authenticated refresh establishes
+        # the canonical owner and renames its channel generation atomically.
         "models": ["gpt-test"],
         "enabled": True,
     }
@@ -785,7 +786,9 @@ def test_refresh_identity_and_priority_publish_in_one_reload_snapshot():
 
     assert snapshots == [([new_account], [new_channel])]
     assert registry.get_channel(new_channel) is not None
-    assert registry.get_channel(old_channel) is None
+    # The pre-workspace key remains an unambiguous compatibility alias to the
+    # committed canonical workspace generation.
+    assert registry.get_channel(old_channel).key == new_channel
     assert scorer.get_stats(new_channel, "gpt-test") is not None
     assert cooldown.get_state(new_channel, "gpt-test") is not None
     assert affinity.get(f"fp-reload-{suffix}")["channel_key"] == new_channel
@@ -796,7 +799,7 @@ def test_refresh_identity_and_priority_publish_in_one_reload_snapshot():
         lambda cfg: cfg.setdefault("oauthAccounts", []).append(dict(account))
     )
     registry.rebuild_from_config()
-    assert registry.get_channel(old_channel) is None
+    assert registry.get_channel(old_channel).key == new_channel
     oauth_manager.delete_account(old_account)
     assert cooldown.get_state(new_channel, "gpt-test") is not None
     assert [
@@ -819,7 +822,6 @@ def test_oauth_rename_state_failure_rolls_config_back_without_losing_old_state(m
         "access_token": "***",
         "refresh_token": "***",
         "id_token": "***",
-        "chatgpt_account_id": f"old-{suffix}",
         "models": ["model"],
         "enabled": True,
     }
@@ -1065,7 +1067,7 @@ def test_late_refresh_follows_exact_openai_rename_generation(monkeypatch):
     old_account = {
         "email": email, "provider": "openai",
         "access_token": "old-access", "refresh_token": "old-refresh",
-        "chatgpt_account_id": f"old-workspace-{suffix}", "enabled": True,
+        "enabled": True,
     }
     old_key = oauth_manager._canonical_key(old_account)
     new_workspace = f"new-workspace-{suffix}"
@@ -1118,7 +1120,7 @@ def test_late_refresh_follows_exact_openai_rename_generation(monkeypatch):
     assert renamed["provider"] == "openai"
     assert renamed["access_token"] == "late-access"
     assert renamed["refresh_token"] == "late-refresh"
-    assert oauth_manager.get_account(old_key) is None
+    assert oauth_manager.get_account(old_key) is renamed
 
 
 def test_concurrent_reload_waits_until_oauth_state_rename_is_published(monkeypatch):
@@ -1132,7 +1134,6 @@ def test_concurrent_reload_waits_until_oauth_state_rename_is_published(monkeypat
         "provider": "openai",
         "access_token": "***",
         "refresh_token": "***",
-        "chatgpt_account_id": f"old-{suffix}",
         "models": ["model"],
     }
     old_key = oauth_manager._canonical_key(account)

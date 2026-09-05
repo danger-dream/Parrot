@@ -582,6 +582,12 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
         )
     else:
         config.update(mutate)
+    if _acc_provider(old_acc) == "openai":
+        from .openai.codex_identity import register_account_identity
+        refreshed = get_account(new_key)
+        if refreshed is None:
+            raise RuntimeError("refreshed OpenAI account disappeared before identity registration")
+        register_account_identity(refreshed)
     return True
 
 
@@ -3010,7 +3016,7 @@ def bootstrap_openai_workspace_key_migration() -> dict:
 
 
 def _openai_metadata_patch(entry: dict) -> dict:
-    from .openai.codex_device_fingerprint import normalize_account_device
+    from .openai.codex_identity import normalize_account_identity
 
     patch: dict[str, Any] = {
         "id_token": entry.get("id_token", "") or "",
@@ -3024,10 +3030,17 @@ def _openai_metadata_patch(entry: dict) -> dict:
     }
     if "codexDeviceInstallationId" in entry:
         patch["codexDeviceInstallationId"] = entry.get("codexDeviceInstallationId")
-    if "codexDeviceConvergenceEnabled" in entry:
-        patch["codexDeviceConvergenceEnabled"] = entry.get("codexDeviceConvergenceEnabled")
+    if "codexIdentity" in entry:
+        patch["codexIdentity"] = copy.deepcopy(entry.get("codexIdentity"))
     candidate = {"provider": "openai", **patch}
-    normalize_account_device(candidate)
+    identity_cfg = (config.get().get("openaiOAuth") or {}).get("codexIdentity") or {}
+    normalize_account_identity(
+        candidate,
+        protocol_profile=str(identity_cfg.get("protocolProfile") or "rust-v0.153.4"),
+        new_identity_generation_version=identity_cfg.get(
+            "newIdentityGenerationVersion", 1
+        ),
+    )
     candidate.pop("provider", None)
     return candidate
 
@@ -3117,9 +3130,20 @@ def replace_exact_identity(expected_account_key: str, entry: dict) -> dict:
                 if "models" in current:
                     replacement["models"] = copy.deepcopy(current["models"])
             if provider == "openai":
-                for key in ("codexDeviceInstallationId", "codexDeviceConvergenceEnabled"):
+                from .openai.codex_identity import account_identity_from_account
+                replacement.pop("codexDeviceConvergenceEnabled", None)
+                for key in ("codexIdentity", "codexDeviceInstallationId"):
                     if key not in entry and key in current:
                         replacement[key] = copy.deepcopy(current[key])
+                current_identity = account_identity_from_account(current, require=False)
+                replacement_identity = account_identity_from_account(replacement, require=False)
+                if (
+                    current_identity is not None
+                    and replacement_identity is not None
+                    and current_identity.installation_id != replacement_identity.installation_id
+                ):
+                    result["status"] = "identity_conflict"
+                    return
             if provider == "cursor":
                 for key in ("cursor_max_context_disabled_models", "cursor_disabled_models"):
                     if key not in entry and key in current:
@@ -3164,8 +3188,8 @@ def _add_account_serialized(entry: dict) -> None:
       - provider: "claude" (默认) / "openai" / "xai" / "cursor" / "antigravity"
       - id_token / chatgpt_account_id / workspace_id / workspace_name /
         workspace_type / organization_id / plan_type / subscription_expires_at /
-        codexDeviceInstallationId / codexDeviceConvergenceEnabled
-        (OpenAI 专属；有 workspace 时默认开启并生成 UUIDv4；显式 false 关闭)
+        codexIdentity / codexDeviceInstallationId
+        (OpenAI 专属；按 canonical workspace 强制建立 versioned UUIDv4 identity)
       - id_token / subject / sub / base_url / token_endpoint / redirect_uri
         (xAI 专属)
       - cursor_max_context_disabled_models（Cursor 每账号显式关闭 Max Context 的例外）
@@ -3351,6 +3375,32 @@ def _add_account_serialized(entry: dict) -> None:
         for account in config.get().get("oauthAccounts", []):
             if account is not existing_target and _canonical_key(account) == normalized_key:
                 raise ValueError(f"OAuth account identity already exists: {normalized_key}")
+    if provider == "openai":
+        from .openai.codex_identity import (
+            account_identity_from_account,
+            register_account_identity,
+        )
+        incoming_explicit_identity = (
+            "codexIdentity" in entry or "codexDeviceInstallationId" in entry
+        )
+        if existing_target is not None:
+            existing_identity = account_identity_from_account(existing_target, require=False)
+            incoming_identity = account_identity_from_account(normalized, require=False)
+            if (
+                incoming_explicit_identity
+                and existing_identity is not None
+                and incoming_identity is not None
+                and existing_identity.installation_id != incoming_identity.installation_id
+            ):
+                raise ValueError("OpenAI OAuth import cannot rotate an existing Codex identity")
+            if not incoming_explicit_identity and existing_identity is not None:
+                normalized["codexIdentity"] = existing_identity.as_config()
+                normalized["codexDeviceInstallationId"] = existing_identity.installation_id
+        # Claim before credentials are published.  A later config write failure may
+        # leave only the non-secret tombstone, which safely preserves continuity.
+        if account_identity_from_account(normalized, require=False) is not None:
+            register_account_identity(normalized)
+
     existing_snapshot = copy.deepcopy(existing_target) if existing_target else None
     old_load_balancing = copy.deepcopy(
         config.get().get("loadBalancing", {})
@@ -3405,7 +3455,7 @@ def _add_account_serialized(entry: dict) -> None:
             }
             keep_max = target.get("maxConcurrent")
             keep_device_id = target.get("codexDeviceInstallationId")
-            keep_device_enabled = target.get("codexDeviceConvergenceEnabled")
+            keep_codex_identity = copy.deepcopy(target.get("codexIdentity"))
             keep_enabled = target.get("enabled")
             keep_disabled_reason = target.get("disabled_reason")
             keep_disabled_until = target.get("disabled_until")
@@ -3436,8 +3486,8 @@ def _add_account_serialized(entry: dict) -> None:
                 # A transient cursor.com profile failure during re-login must not
                 # replace previously verified identity metadata with a hash label.
                 target.update(keep_cursor_profile)
-            # Same canonical OpenAI workspace reimport preserves omitted
-            # device identity and explicit opt-out state.
+            # Same canonical OpenAI workspace reimport preserves the versioned
+            # identity whenever the import omitted identity state.
             if (
                 provider == "openai"
                 and "codexDeviceInstallationId" not in entry
@@ -3446,10 +3496,10 @@ def _add_account_serialized(entry: dict) -> None:
                 target["codexDeviceInstallationId"] = keep_device_id
             if (
                 provider == "openai"
-                and "codexDeviceConvergenceEnabled" not in entry
-                and keep_device_enabled is not None
+                and "codexIdentity" not in entry
+                and keep_codex_identity is not None
             ):
-                target["codexDeviceConvergenceEnabled"] = keep_device_enabled
+                target["codexIdentity"] = keep_codex_identity
             if rename_new_key:
                 fam = "openai" if _is_openai_family_provider(provider) else "anthropic"
                 _rename_priority_orders_in_config(
@@ -3527,13 +3577,23 @@ def _delete_account_serialized(account_key: str) -> None:
             return True
         return _acc_provider(account) == target_provider
 
-    cleanup_keys = [
-        _canonical_key(account)
+    matched_accounts = [
+        copy.deepcopy(account)
         for account in config.get().get("oauthAccounts", [])
         if matches(account)
     ]
+    cleanup_keys = [_canonical_key(account) for account in matched_accounts]
     if not cleanup_keys:
         return
+    # Preserve only the non-secret owner→installation mapping before credentials
+    # are removed. Failure aborts deletion rather than breaking continuity.
+    from .openai.codex_identity import account_identity_from_account, register_account_identity
+    removed_owner_digests: set[str] = set()
+    for account in matched_accounts:
+        identity = account_identity_from_account(account, require=False)
+        if identity is not None:
+            register_account_identity(account)
+            removed_owner_digests.add(identity.owner_digest)
     channel_keys = {f"oauth:{key}" for key in cleanup_keys}
 
     def mutate(cfg):
@@ -3597,6 +3657,33 @@ def _delete_account_serialized(account_key: str) -> None:
                     cursor_bridge_runtime.drop_account(cleanup_key)
                 except Exception:
                     pass
+
+        # Credential deletion destroys session/reasoning/compaction state but
+        # deliberately retains the owner installation tombstone registered above.
+        from .openai import reasoning_replay
+        for owner_digest in removed_owner_digests:
+            state_db.codex_logical_session_delete_owner(owner_digest)
+            state_db.compaction_owner_delete_owner(owner_digest)
+            reasoning_replay.delete_owner(owner_digest)
+
+
+def forget_codex_identity(owner_digest: str) -> bool:
+    """Explicitly forget a deleted OAuth owner's installation identity.
+
+    This high-risk operation is intentionally not coupled to the existing delete
+    UI. Credentials must be removed first so a live account cannot silently rotate.
+    """
+    from .openai.codex_identity import account_identity_from_account, forget_owner_identity
+    owner = str(owner_digest or "").strip()
+    for account in config.get().get("oauthAccounts", []):
+        if _acc_provider(account) != "openai":
+            continue
+        identity = account_identity_from_account(account, require=False)
+        if identity is not None and identity.owner_digest == owner:
+            raise ValueError("delete OAuth credentials before forgetting Codex identity")
+    from .openai import reasoning_replay
+    reasoning_replay.delete_owner(owner)
+    return forget_owner_identity(owner)
 
 
 _EXPECTED_REASON_UNSET = object()

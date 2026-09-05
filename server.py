@@ -162,6 +162,10 @@ async def lifespan(app: FastAPI):
     # Validate paths, acquire the single-writer lock, and complete any legacy
     # transition before mutable/network lifecycle setup begins.
     state_db.init()
+    # Config migration establishes versioned identities; mirror each one into the
+    # minimal durable tombstone registry before any outbound OAuth traffic.
+    from src.openai.codex_identity import sync_configured_identity_tombstones
+    sync_configured_identity_tombstones(config.get().get("oauthAccounts", []))
 
     # 出站网络层必须在任何后续 OAuth/TG/status/update 请求前初始化。
     network.init()

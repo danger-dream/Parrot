@@ -26,8 +26,9 @@ RUNTIME_DOMAINS = (
     "api_provider_usage_cache", "network_check_status",
 )
 DURABLE_DOMAINS = (
-    "xai_video_jobs", "codex_compaction_owners", "app_self_update",
-    "app_update_state", "status_seen_updates", "status_muted_incidents",
+    "xai_video_jobs", "codex_compaction_owners", "codex_identity_tombstones",
+    "codex_logical_sessions", "app_self_update", "app_update_state",
+    "status_seen_updates", "status_muted_incidents",
 )
 
 

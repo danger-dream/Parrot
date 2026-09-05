@@ -122,6 +122,19 @@ def clear() -> None:
         _entries.clear()
 
 
+def delete_owner(owner_digest: str | None) -> int:
+    """Drop every active replay entry for one canonical OAuth owner digest."""
+    owner = _clean_str(owner_digest)
+    if not owner:
+        return 0
+    marker = "\x00".join(("codex-reasoning-replay", owner, ""))
+    with _lock:
+        keys = [key for key in _entries if key.startswith(marker)]
+        for key in keys:
+            _entries.pop(key, None)
+        return len(keys)
+
+
 def delete(
     model: str | None,
     session_key: str | None,
@@ -330,17 +343,28 @@ def scope_from_payload(
     headers: Any = None,
     *,
     account_key: str | None = None,
+    owner_digest: str | None = None,
+    logical_session_id: str | None = None,
 ) -> dict[str, str] | None:
     model_s = _clean_str(model)
     if not model_s:
         return None
-    session_key = session_key_from_payload(payload) or session_key_from_headers(headers)
+    logical = _clean_str(logical_session_id)
+    session_key = (
+        "logical-session:" + logical
+        if logical
+        else session_key_from_payload(payload) or session_key_from_headers(headers)
+    )
     if not session_key:
         return None
     scope = {"model": model_s, "session_key": session_key}
-    clean_account_key = _clean_str(account_key)
-    if clean_account_key:
-        scope["account_key"] = clean_account_key
+    # New Codex paths use the canonical owner digest. ``account_key`` remains an
+    # input compatibility alias for non-migrated callers/tests only.
+    owner = _clean_str(owner_digest) or _clean_str(account_key)
+    if owner:
+        scope["account_key"] = owner
+        if owner_digest:
+            scope["owner_digest"] = owner
     return scope
 
 

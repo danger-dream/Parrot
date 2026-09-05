@@ -7,11 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..channel.compatibility import apply_forced_openai_fast_mode
-from ..channel.openai_oauth_channel import (
-    OpenAIOAuthChannel,
-    _isolate_session_id,
-    _provider_cfg,
-)
+from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _provider_cfg
 from ..openai.transform import codex_oauth_transform
 from ..providers import registry as provider_registry
 from ..transports.ws_runtime import http_url_to_ws
@@ -24,13 +20,8 @@ from .codex_constants import (
     codex_responses_websocket_beta,
     resolve_codex_model_policy,
 )
-from .codex_device_fingerprint import apply_device_fingerprint
-from .codex_identity_confuse import (
-    ConfuseState,
-    confuse_client_metadata,
-    confuse_headers as confuse_identity_headers,
-    expose_response_payload,
-)
+from .codex_identity import RequestIdentitySnapshot, project_snapshot
+from .codex_identity_mapper import ProtocolIdentityMap, expose_response_payload
 
 
 _OPENAI_RESPONSES_API_CHANNEL = SimpleNamespace(protocol="openai-responses", type="api")
@@ -116,22 +107,11 @@ def merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]:
 
 
 def ensure_oauth_responses_ws_session_headers(headers: dict[str, str], body: dict) -> None:
-    sid = headers.get("session-id") or headers.get("session_id")
-    tid = headers.get("thread-id") or sid
-    if not sid:
-        try:
-            api_key_name = str((body or {}).get("_api_key_name") or "")
-            raw_anchor = str((body or {}).get("prompt_cache_key") or "").strip()
-            if api_key_name and raw_anchor:
-                sid = _isolate_session_id(api_key_name, raw_anchor)
-                tid = sid
-        except Exception:
-            pass
-    if sid:
-        headers.setdefault("session-id", sid)
-    if tid:
-        headers.setdefault("thread-id", tid)
-        headers.setdefault("x-client-request-id", tid)
+    """Retain authoritative UUIDv7 headers and remove only deprecated spellings."""
+    sid = headers.get("session-id")
+    tid = headers.get("thread-id")
+    if sid and tid:
+        headers["x-client-request-id"] = tid
     for key in [k for k in list(headers) if str(k).lower() in ("session_id", "conversation_id", "conversation-id")]:
         del headers[key]
 
@@ -262,7 +242,7 @@ def prepare_oauth_responses_ws_request_parts(
     resolved_model: str,
     *,
     channel=None,
-) -> tuple[str, dict[str, str], str, ConfuseState]:
+) -> tuple[str, dict[str, str], str, ProtocolIdentityMap]:
     ws_url = http_url_to_ws(upstream_req.url)
     headers = merge_oauth_responses_ws_headers(upstream_req.headers)
     ensure_oauth_responses_ws_session_headers(headers, body)
@@ -276,37 +256,20 @@ def prepare_oauth_responses_ws_request_parts(
             use_responses_lite=_channel_uses_responses_lite(channel, resolved_model),
         )
 
-    api_key_name = str((body or {}).get("_api_key_name") or "")
-    sid = get_header_case_insensitive(headers, "session-id") or get_header_case_insensitive(headers, "session_id")
-    raw_anchor = str((body or {}).get("prompt_cache_key") or "").strip()
-    identity_state = ConfuseState()
-    if api_key_name and sid:
-        cm = frame_obj.get("client_metadata") if isinstance(frame_obj.get("client_metadata"), dict) else {}
-        confused_cm, identity_state = confuse_client_metadata(
-            api_key_name,
-            cm,
-            session_prompt_cache_key=sid,
-            original_prompt_cache_key=raw_anchor,
-        )
-        if confused_cm:
-            frame_obj["client_metadata"] = confused_cm
-        elif "client_metadata" in frame_obj:
-            frame_obj.pop("client_metadata", None)
-        if identity_state.confused_prompt_cache_key:
-            frame_obj["prompt_cache_key"] = identity_state.confused_prompt_cache_key
-        headers = confuse_identity_headers(headers, identity_state, session_prompt_cache_key=sid)
-    else:
-        headers = drop_headers_case_insensitive(headers, {"conversation_id", "conversation-id"})
-
-    installation_id = str(getattr(channel, "codex_device_installation_id", "") or "")
-    if installation_id:
-        identity_state.override_installation_for_upstream(installation_id)
-        headers, frame_obj = apply_device_fingerprint(
-            headers, frame_obj, installation_id, create_client_metadata=True,
-        )
-
-    frame = json.dumps(frame_obj, ensure_ascii=False, separators=(",", ":"))
-    return ws_url, headers, frame, identity_state
+    translator_ctx = getattr(upstream_req, "translator_ctx", None) or {}
+    snapshot = translator_ctx.get("codex_identity_snapshot")
+    if not isinstance(snapshot, RequestIdentitySnapshot):
+        raise ValueError("OpenAI OAuth WS request is missing its identity snapshot")
+    headers, projected = project_snapshot(
+        snapshot,
+        headers,
+        frame_obj,
+        direct_installation_header=False,
+        create_client_metadata=True,
+    )
+    assert projected is not None
+    frame = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    return ws_url, headers, frame, ProtocolIdentityMap.from_request(body, snapshot)
 
 
 def merge_responses_ws_headers(
@@ -422,7 +385,7 @@ def dump_frame(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-def identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes:
+def identity_expose_frame(data: str | bytes, state: ProtocolIdentityMap) -> str | bytes:
     if not state.enabled:
         return data
     if isinstance(data, str):
@@ -432,7 +395,7 @@ def identity_expose_frame(data: str | bytes, state: ConfuseState) -> str | bytes
     return data
 
 
-def identity_log_text(text: str, state: ConfuseState) -> str:
+def identity_log_text(text: str, state: ProtocolIdentityMap) -> str:
     if not text or not state.enabled:
         return text
     try:

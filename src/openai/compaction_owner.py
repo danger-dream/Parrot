@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .. import state_db
+from .codex_identity import RequestIdentityContext, owner_digest_for_workspace
 
 _log = logging.getLogger(__name__)
 
@@ -75,18 +76,11 @@ def _workspace(ch: Any) -> str:
 
 
 def owner_identity(ch: Any) -> str:
-    """Canonical account boundary: workspace when known, auth account key otherwise.
-
-    A refresh-derived workspace is copied onto the live channel before a request is
-    dispatched.  Workspace-only canonical identity therefore survives the old
-    channel key, registry rebuilds and canonical key migration, while retaining
-    strict workspace isolation.
-    """
+    """Return the canonical OAuth owner digest; unknown workspaces have no owner."""
     if not is_openai_oauth_channel(ch):
         return ""
     workspace = _workspace(ch)
-    boundary = f"workspace:{workspace}" if workspace else f"account:{getattr(ch, 'account_key', '')}"
-    return _digest_identity({"provider": "openai", "boundary": boundary})
+    return owner_digest_for_workspace(workspace) if workspace else ""
 
 
 def _legacy_identities(ch: Any) -> set[str]:
@@ -111,8 +105,22 @@ def identity_aliases(ch: Any) -> set[str]:
     return ({identity} if identity else set()) | _legacy_identities(ch)
 
 
+def _request_scope(identity: str, values: tuple[Any, ...]) -> tuple[str, str]:
+    model = ""
+    logical_session_id = ""
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        model = model or str(value.get("model") or "").strip()
+        contexts = value.get("_codex_identity_contexts")
+        context = contexts.get(identity) if isinstance(contexts, dict) else None
+        if isinstance(context, RequestIdentityContext):
+            logical_session_id = context.logical_session.session_id
+    return model, logical_session_id
+
+
 def persist_observed(ch: Any, *values: Any) -> int:
-    """Persist complete compactions only after this OAuth owner succeeded."""
+    """Persist complete compactions only after this owner/session/model succeeded."""
     identity = owner_identity(ch)
     if not identity:
         return 0
@@ -123,11 +131,13 @@ def persist_observed(ch: Any, *values: Any) -> int:
             if ref not in seen:
                 refs.append(ref)
                 seen.add(ref)
+    model, logical_session_id = _request_scope(identity, values)
     aliases = identity_aliases(ch)
     for ref in refs:
         state_db.compaction_owner_upsert(
             ref.compaction_id, ref.content_digest, str(ch.key), identity,
-            compatible_identities=aliases,
+            compatible_identities=aliases, model=model or None,
+            logical_session_id=logical_session_id or None,
         )
     return len(refs)
 

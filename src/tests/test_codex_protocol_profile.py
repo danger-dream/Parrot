@@ -13,7 +13,7 @@ from src.tests import _isolation
 
 _isolation.isolate()
 
-from src import config, oauth_manager
+from src import config, oauth_manager, state_db
 from src.channel.openai_oauth_channel import OpenAIOAuthChannel
 from src.openai import codex_constants
 from src.openai.transform import codex_oauth_transform
@@ -63,6 +63,7 @@ def _account(*, model: str, records: list[dict] | None = None) -> dict:
 
 
 def _channel(monkeypatch, *, model: str, records: list[dict] | None = None):
+    state_db.init()
     account = _account(model=model, records=records)
     monkeypatch.setattr(oauth_manager, "list_accounts", lambda: [account])
 
@@ -196,7 +197,11 @@ def test_astra_base_defaults_lite_ids_metadata_and_wire_omission(monkeypatch):
     assert payload["reasoning"] == {"effort": "low", "context": "all_turns"}
     assert payload["text"]["verbosity"] == "low"
 
-    prefix_namespace = uuid.uuid5(uuid.NAMESPACE_OID, "thread-astra-1")
+    # The raw downstream anchor is lookup-only; Lite synthetic IDs use the
+    # account-scoped durable UUIDv7 prompt-cache/session projection.
+    assert payload["prompt_cache_key"] != "thread-astra-1"
+    assert uuid.UUID(payload["prompt_cache_key"]).version == 7
+    prefix_namespace = uuid.uuid5(uuid.NAMESPACE_OID, payload["prompt_cache_key"])
     expected_tools_json = json.dumps(
         body["tools"], ensure_ascii=False, separators=(",", ":")
     )

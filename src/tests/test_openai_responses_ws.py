@@ -17,6 +17,7 @@ import os
 import socket
 import sys
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -406,6 +407,7 @@ class ClockedOAuthHttpStreamWs(FakeOAuthHttpStreamWs):
 def _make_oauth_channel_for_failover(m, *, name="oauth@example.com"):
     account = {
         "email": name, "provider": "openai",
+        "workspace_id": f"ws-{name}", "chatgpt_account_id": f"ws-{name}",
         "access_token": "tok", "refresh_token": "rt",
         "expired": "2999-01-01T00:00:00Z",
         "models": ["test-model"],
@@ -414,8 +416,8 @@ def _make_oauth_channel_for_failover(m, *, name="oauth@example.com"):
             "models": [{"id": "test-model", "useResponsesLite": False}],
         },
     }
-    m["config"]._cache.setdefault("oauthAccounts", [])[:] = [dict(account)]
     ch = m["OpenAIOAuthChannel"](account)
+    m["config"]._cache.setdefault("oauthAccounts", [])[:] = [account]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
     return ch
@@ -801,6 +803,7 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
     ch = m["OpenAIOAuthChannel"]({
         "email": "u@example.com",
         "provider": "openai",
+        "workspace_id": "ws-u", "chatgpt_account_id": "ws-u",
         "accountKey": "openai:u@example.com",
         "accessToken": "tok",
         "refreshToken": "rt",
@@ -811,6 +814,20 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
             "models": [{"id": "test-model", "useResponsesLite": False}],
         },
     })
+    cfg["oauthAccounts"] = [ch.codex_account_identity and {
+        **{
+            "email": "u@example.com", "provider": "openai",
+            "workspace_id": "ws-u", "chatgpt_account_id": "ws-u",
+            "accessToken": "tok", "refreshToken": "rt",
+            "models": ["test-model"],
+            "account_model_catalog": {
+                "schema": 1,
+                "models": [{"id": "test-model", "useResponsesLite": False}],
+            },
+        },
+        "codexIdentity": ch.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": ch.codex_device_installation_id,
+    }]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
 
@@ -867,11 +884,23 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         {"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"},
         {"type": "message", "role": "user", "content": "hello"},
     ]
-    assert upstream_first["client_metadata"] == {"a": "b"}
-    # Frame and handshake identities share the same isolated session anchor.
+    metadata = upstream_first["client_metadata"]
+    turn_metadata = json.loads(metadata["x-codex-turn-metadata"])
+    assert metadata["a"] == "b"
+    assert metadata["x-codex-installation-id"] == ch.codex_device_installation_id
+    assert metadata["session_id"] == captured["headers"]["session-id"]
+    assert metadata["thread_id"] == captured["headers"]["thread-id"]
+    assert metadata["turn_id"] == turn_metadata["turn_id"]
+    assert metadata["x-codex-window-id"] == captured["headers"]["x-codex-window-id"]
+    assert turn_metadata["installation_id"] == ch.codex_device_installation_id
+    assert "prompt_cache_key" not in turn_metadata
+    # Frame and handshake identities are projections of one authoritative snapshot.
     assert upstream_first["prompt_cache_key"] == captured["headers"]["session-id"]
     assert upstream_first["prompt_cache_key"] != "shared-anchor"
     assert captured["headers"]["session-id"] != "shared-anchor"
+    assert uuid.UUID(metadata["session_id"]).version == 7
+    assert uuid.UUID(metadata["turn_id"]).version == 7
+    assert uuid.UUID(turn_metadata["context_window_id"]).version == 7
     assert "temperature" not in upstream_first
     assert not ws.close_calls
     for value in (
@@ -1454,6 +1483,7 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
     ch = m["OpenAIOAuthChannel"]({
         "email": "quota@example.com",
         "provider": "openai",
+        "workspace_id": "ws-quota", "chatgpt_account_id": "ws-quota",
         "accountKey": "openai:quota@example.com",
         "accessToken": "tok",
         "refreshToken": "rt",
@@ -1464,6 +1494,18 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
             "models": [{"id": "test-model", "useResponsesLite": False}],
         },
     })
+    m["config"]._cache["oauthAccounts"] = [{
+        "email": "quota@example.com", "provider": "openai",
+        "workspace_id": "ws-quota", "chatgpt_account_id": "ws-quota",
+        "accessToken": "tok", "refreshToken": "rt",
+        "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
+        "codexIdentity": ch.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": ch.codex_device_installation_id,
+    }]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
 
@@ -1989,7 +2031,7 @@ def test_responses_upstream_ws_config_default_off(m):
 
 
 @pytest.mark.asyncio
-async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores_response(monkeypatch, m):
+async def test_http_responses_oauth_ws_projects_snapshot_and_structurally_restores_response(monkeypatch, m):
     cfg = _setup(m)
     cfg.setdefault("openai", {})["responsesUpstreamWsForOAuth"] = True
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
@@ -2057,7 +2099,7 @@ async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores
     assert sent["prompt_cache_key"] != "shared-anchor"
     assert cm["x-codex-installation-id"] != "inst-real"
     assert cm["x-codex-window-id"] == f"{sent['prompt_cache_key']}:0"
-    assert tm["prompt_cache_key"] == sent["prompt_cache_key"]
+    assert "prompt_cache_key" not in tm
     assert tm["turn_id"] != "turn-real"
     assert tm["window_id"] == f"{sent['prompt_cache_key']}:0"
     assert "conversation_id" not in {k.lower(): v for k, v in captured["headers"].items()}
@@ -2065,22 +2107,35 @@ async def test_http_responses_oauth_ws_identity_confuse_first_frame_and_restores
     obj = json.loads(resp.body)
     assert obj["prompt_cache_key"] == "shared-anchor"
     assert obj["turn_id"] == "turn-real"
-    assert obj["metadata"]["installation"] == "inst-real"
+    # Non-protocol fields are not globally byte-replaced.
+    assert obj["metadata"]["installation"] == ch.codex_device_installation_id
     assert "shared-anchor" in (m["log_db"].log_detail(rid)["detail"].get("response_body") or "")
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_oauth_pending_visible_identity_restored_before_downstream(monkeypatch, m):
+async def test_responses_ws_oauth_does_not_replace_identity_inside_visible_text(monkeypatch, m):
     cfg = _setup(m)
     cfg["oauth"] = {"providers": {"openai": {"forceCodexCLI": True, "isolateSessionId": True}}}
     ch = m["OpenAIOAuthChannel"]({
         "email": "pending@example.com", "provider": "openai",
+        "workspace_id": "ws-pending", "chatgpt_account_id": "ws-pending",
         "access_token": "tok", "refresh_token": "rt", "models": ["test-model"],
         "account_model_catalog": {
             "schema": 1,
             "models": [{"id": "test-model", "useResponsesLite": False}],
         },
     })
+    cfg["oauthAccounts"] = [{
+        "email": "pending@example.com", "provider": "openai",
+        "workspace_id": "ws-pending", "chatgpt_account_id": "ws-pending",
+        "access_token": "tok", "refresh_token": "rt", "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
+        "codexIdentity": ch.codex_account_identity.as_config(),
+        "codexDeviceInstallationId": ch.codex_device_installation_id,
+    }]
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
 
@@ -2123,9 +2178,11 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
     first_downstream = json.loads(ws.sent_texts[0])
     assert first_downstream["type"] == "response.output_text.delta"
-    assert "raw-pck" in first_downstream["delta"]
-    assert "turn-raw" in first_downstream["delta"]
-    assert "003" not in first_downstream["delta"]  # guard against obvious isolated-session leakage
+    assert "raw-pck" not in first_downstream["delta"]
+    assert "turn-raw" not in first_downstream["delta"]
+    session_id, turn_id = first_downstream["delta"].split("|")
+    assert uuid.UUID(session_id).version == 7
+    assert uuid.UUID(turn_id).version == 7
     assert not ws.close_calls
 
 @pytest.mark.asyncio
@@ -2342,12 +2399,25 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
     cfg.setdefault("oauth", {})["providers"] = {"openai": {"isolateSessionId": True, "forceCodexCLI": True}}
     ch = _make_oauth_channel_for_failover(m, name="replay-clear@example.com")
     rr = m["reasoning_replay"]
+    from src.openai.codex_identity import resolve_request_identity_context
+    account = cfg["oauthAccounts"][0]
+    replay_context = resolve_request_identity_context(
+        account,
+        {"prompt_cache_key": "anchor", "_api_key_name": "ws-key"},
+    )
+    replay_scope = rr.scope_from_payload(
+        "test-model",
+        {"prompt_cache_key": "anchor"},
+        owner_digest=replay_context.account_identity.owner_digest,
+        logical_session_id=replay_context.logical_session.session_id,
+    )
+    assert replay_scope is not None
     encrypted_content = _valid_encrypted_content(11)
     rr.cache_items(
-        "test-model",
-        "prompt-cache:anchor",
+        replay_scope["model"],
+        replay_scope["session_key"],
         [{"type": "reasoning", "encrypted_content": encrypted_content}],
-        account_key=ch.account_key,
+        account_key=replay_scope["account_key"],
     )
 
     async def fake_token(account_key):
@@ -2383,7 +2453,10 @@ async def test_http_responses_oauth_ws_invalid_replay_clears_scope_and_retries(m
 
     assert resp.status_code == 200
     assert json.loads(resp.body)["output"][0]["content"][0]["text"] == "ok"
-    assert rr.get("test-model", "prompt-cache:anchor", account_key=ch.account_key) == []
+    assert rr.get(
+        replay_scope["model"], replay_scope["session_key"],
+        account_key=replay_scope["account_key"],
+    ) == []
     assert attempts == []
 
     first_payload = json.loads(bad_ws.sent[0])

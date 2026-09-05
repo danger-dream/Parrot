@@ -336,7 +336,11 @@
     "codexProtocolProfile": "rust-v0.153.4",
     "forceCodexCLI": true,
     "enableTLSFingerprint": false,
-    "isolateSessionId": true,
+    "codexIdentity": {
+      "mode": "per-oauth-account",
+      "protocolProfile": "rust-v0.153.4",
+      "newIdentityGenerationVersion": 1
+    },
     "defaultModels": [
       "gpt-5.2",
       "gpt-5.2-codex",

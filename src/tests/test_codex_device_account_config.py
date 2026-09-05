@@ -24,8 +24,23 @@ def _entry(email: str, workspace: str, **extra):
         "refresh_token": "refresh",
         "workspace_id": workspace,
         "chatgpt_account_id": workspace,
+        "models": ["gpt-test", "gpt-5.1"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [
+                {"id": "gpt-test", "useResponsesLite": False},
+                {"id": "gpt-5.1", "useResponsesLite": False},
+            ],
+        },
         **extra,
     }
+
+
+def _persisted_channel(email: str, workspace: str, **extra) -> OpenAIOAuthChannel:
+    oauth_manager.add_account(_entry(email, workspace, **extra))
+    account = oauth_manager.get_account(f"openai:{email}:{workspace}")
+    assert account is not None
+    return OpenAIOAuthChannel(account)
 
 
 def _assert_uuid4(value: str) -> None:
@@ -33,7 +48,7 @@ def _assert_uuid4(value: str) -> None:
     assert uuid.UUID(value).version == 4
 
 
-def test_import_defaults_on_preserves_identity_and_explicit_off_on_is_reversible():
+def test_import_preserves_identity_and_removes_obsolete_opt_out():
     oauth_manager.add_account(_entry("device-preserve@example.test", "ws-preserve"))
     account = oauth_manager.get_account("openai:device-preserve@example.test:ws-preserve")
     first_id = account["codexDeviceInstallationId"]
@@ -48,16 +63,16 @@ def test_import_defaults_on_preserves_identity_and_explicit_off_on_is_reversible
         codexDeviceConvergenceEnabled=False,
     ))
     account = oauth_manager.get_account("openai:device-preserve@example.test:ws-preserve")
-    assert account["codexDeviceConvergenceEnabled"] is False
+    assert "codexDeviceConvergenceEnabled" not in account
     assert account["codexDeviceInstallationId"] == first_id
-    assert OpenAIOAuthChannel(account).codex_device_installation_id == ""
+    assert OpenAIOAuthChannel(account).codex_device_installation_id == first_id
 
     oauth_manager.add_account(_entry(
         "device-preserve@example.test", "ws-preserve",
         codexDeviceConvergenceEnabled=True,
     ))
     account = oauth_manager.get_account("openai:device-preserve@example.test:ws-preserve")
-    assert account["codexDeviceConvergenceEnabled"] is True
+    assert "codexDeviceConvergenceEnabled" not in account
     assert account["codexDeviceInstallationId"] == first_id
 
 
@@ -116,7 +131,7 @@ async def test_first_request_uses_workspace_and_device_created_during_refresh(mo
     _, headers, frame, _ = prepare_oauth_responses_ws_request_parts(
         deferred, {"model": "gpt-test"}, "gpt-test", channel=channel,
     )
-    assert headers["x-codex-installation-id"] == installation_id
+    assert "x-codex-installation-id" not in headers
     assert json.loads(frame)["client_metadata"][
         "x-codex-installation-id"
     ] == installation_id
@@ -150,7 +165,8 @@ async def test_first_refresh_uses_exact_alias_with_same_email_other_workspace(mo
     existing_account = oauth_manager.get_account(f"openai:{email}:ws-existing")
     new_device = new_account["codexDeviceInstallationId"]
     assert request.headers["chatgpt-account-id"] == "ws-new"
-    assert request.headers["x-codex-installation-id"] == new_device
+    assert "x-codex-installation-id" not in request.headers
+    assert json.loads(request.body)["client_metadata"]["x-codex-installation-id"] == new_device
     assert new_device != existing_account["codexDeviceInstallationId"]
 
 
@@ -179,37 +195,37 @@ def test_input_validation_and_workspace_requirement_fail_closed():
             "device-no-workspace@example.test", "",
             codexDeviceInstallationId=DEVICE_A,
         ))
-    with pytest.raises(ValueError, match="must be a boolean"):
-        oauth_manager.add_account(_entry(
-            "device-invalid-switch@example.test", "ws-invalid-switch",
-            codexDeviceConvergenceEnabled="false",
-        ))
+    oauth_manager.add_account(_entry(
+        "device-obsolete-switch@example.test", "ws-obsolete-switch",
+        codexDeviceConvergenceEnabled="false",
+    ))
+    migrated = oauth_manager.get_account(
+        "openai:device-obsolete-switch@example.test:ws-obsolete-switch"
+    )
+    assert "codexDeviceConvergenceEnabled" not in migrated
+    _assert_uuid4(migrated["codexDeviceInstallationId"])
 
 
-def test_channel_snapshot_reads_persisted_id_and_explicit_off():
-    off = OpenAIOAuthChannel(_entry(
+def test_channel_snapshot_always_reads_persisted_identity():
+    account = _entry(
         "snapshot-off@example.test", "ws-off",
         codexDeviceInstallationId=DEVICE_B,
         codexDeviceConvergenceEnabled=False,
-    ))
-    assert off.codex_device_installation_id == ""
-    enabled = OpenAIOAuthChannel(_entry(
-        "snapshot-on@example.test", "ws-on",
-        codexDeviceInstallationId=DEVICE_A,
-    ))
-    assert enabled.codex_device_installation_id == DEVICE_A
+    )
+    channel = OpenAIOAuthChannel(account)
+    assert "codexDeviceConvergenceEnabled" not in account
+    assert channel.codex_device_installation_id == DEVICE_B
+    assert channel.codex_account_identity.installation_id == DEVICE_B
 
 
 @pytest.mark.asyncio
-async def test_http_all_codex_responses_ingresses_explicit_off_and_realtime_negative(monkeypatch):
+async def test_http_all_codex_responses_ingresses_and_realtime_share_account_identity(monkeypatch):
     async def token(_key):
         return "access"
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
 
-    enabled = OpenAIOAuthChannel(_entry(
-        "http-on@example.test", "ws-http-on",
-        codexDeviceInstallationId=DEVICE_A,
-    ))
+    enabled = _persisted_channel("http-on@example.test", "ws-http-on")
+    installation_id = enabled.codex_device_installation_id
     request = await enabled.build_upstream_request(
         {
             "model": "gpt-test", "input": "hello",
@@ -218,33 +234,20 @@ async def test_http_all_codex_responses_ingresses_explicit_off_and_realtime_nega
         "gpt-test", ingress_protocol="responses",
     )
     payload = json.loads(request.body)
-    assert request.headers["x-codex-installation-id"] == DEVICE_A
-    assert payload["client_metadata"] == {
-        "sentinel": {"deep": "KEEP"},
-        "x-codex-installation-id": DEVICE_A,
-    }
+    assert "x-codex-installation-id" not in request.headers
+    assert payload["client_metadata"]["sentinel"] == {"deep": "KEEP"}
+    assert payload["client_metadata"]["x-codex-installation-id"] == installation_id
+    assert uuid.UUID(payload["client_metadata"]["session_id"]).version == 7
     request_without_metadata = await enabled.build_upstream_request(
         {"model": "gpt-test", "input": "hello"},
         "gpt-test", ingress_protocol="responses",
     )
-    assert json.loads(request_without_metadata.body)["client_metadata"] == {
-        "x-codex-installation-id": DEVICE_A,
-    }
-
-    off = OpenAIOAuthChannel(_entry(
-        "http-off@example.test", "ws-http-off",
-        codexDeviceInstallationId=DEVICE_B,
-        codexDeviceConvergenceEnabled=False,
-    ))
-    request_off = await off.build_upstream_request(
-        {"model": "gpt-test", "input": "hello"},
-        "gpt-test", ingress_protocol="responses",
-    )
-    assert "x-codex-installation-id" not in request_off.headers
-    assert "client_metadata" not in json.loads(request_off.body)
+    assert json.loads(request_without_metadata.body)["client_metadata"][
+        "x-codex-installation-id"
+    ] == installation_id
 
     realtime_headers = await enabled.build_realtime_headers()
-    assert "x-codex-installation-id" not in realtime_headers
+    assert realtime_headers["x-codex-installation-id"] == installation_id
 
     chat_request = await enabled.build_upstream_request(
         {
@@ -257,10 +260,12 @@ async def test_http_all_codex_responses_ingresses_explicit_off_and_realtime_nega
         "gpt-test", ingress_protocol="chat",
     )
     chat_payload = json.loads(chat_request.body)
-    assert chat_request.headers["x-codex-installation-id"] == DEVICE_A
-    assert chat_payload["prompt_cache_key"] == "chat-cache"
+    assert "x-codex-installation-id" not in chat_request.headers
+    assert chat_payload["client_metadata"]["x-codex-installation-id"] == installation_id
+    assert chat_payload["prompt_cache_key"] != "chat-cache"
+    assert uuid.UUID(chat_payload["prompt_cache_key"]).version == 7
     assert chat_payload["reasoning"] == {"effort": "high"}
-    assert chat_request.headers.get("session_id")
+    assert chat_request.headers.get("session-id")
 
     anthropic_body = {
         "model": "gpt-test",
@@ -277,17 +282,18 @@ async def test_http_all_codex_responses_ingresses_explicit_off_and_realtime_nega
         anthropic_body, "gpt-5.1", ingress_protocol="anthropic",
     )
     anthropic_payload = json.loads(anthropic_request.body)
-    assert anthropic_request.headers["x-codex-installation-id"] == DEVICE_A
+    assert "x-codex-installation-id" not in anthropic_request.headers
+    assert anthropic_payload["client_metadata"]["x-codex-installation-id"] == installation_id
     assert anthropic_payload["reasoning"] == {"effort": "high"}
-    assert anthropic_payload["prompt_cache_key"].startswith("parrot:cache:v1:a2o-session:")
+    assert uuid.UUID(anthropic_payload["prompt_cache_key"]).version == 7
     assert "prompt_cache_retention" not in anthropic_payload
-    assert anthropic_request.headers.get("session_id")
+    assert anthropic_request.headers.get("session-id")
     assert anthropic_body["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ingress_protocol", ["chat", "anthropic"])
-async def test_translated_http_finalization_preserves_noninstallation_identity_fields(
+async def test_translated_http_finalization_overrides_all_identity_fields(
     monkeypatch, ingress_protocol,
 ):
     async def token(_key):
@@ -326,10 +332,10 @@ async def test_translated_http_finalization_preserves_noninstallation_identity_f
             lambda *_args, **_kwargs: None,
         )
 
-    enabled = OpenAIOAuthChannel(_entry(
+    enabled = _persisted_channel(
         f"identity-{ingress_protocol}@example.test", f"ws-{ingress_protocol}",
-        codexDeviceInstallationId=DEVICE_A,
-    ))
+    )
+    installation_id = enabled.codex_device_installation_id
     monkeypatch.setattr(enabled, "_build_headers", lambda _token, **_kwargs: {
         "session-id": "SESSION",
         "thread-id": "THREAD",
@@ -343,32 +349,33 @@ async def test_translated_http_finalization_preserves_noninstallation_identity_f
         "gpt-test", ingress_protocol=ingress_protocol,
     )
     payload = json.loads(request.body)
-    assert request.headers["x-codex-installation-id"] == DEVICE_A
-    assert request.headers["session-id"] == "SESSION"
-    assert request.headers["thread-id"] == "THREAD"
-    assert json.loads(request.headers["x-codex-turn-metadata"]) == {
-        "installation_id": DEVICE_A, "turn_id": "TURN",
-    }
-    assert payload["prompt_cache_key"] == "CACHE"
+    assert "x-codex-installation-id" not in request.headers
+    assert request.headers["session-id"] != "SESSION"
+    assert request.headers["thread-id"] == request.headers["session-id"]
+    header_metadata = json.loads(request.headers["x-codex-turn-metadata"])
+    assert header_metadata["installation_id"] == installation_id
+    assert header_metadata["turn_id"] != "TURN"
+    assert uuid.UUID(header_metadata["turn_id"]).version == 7
+    assert payload["prompt_cache_key"] == request.headers["session-id"]
     assert payload["reasoning"] == {"effort": "high"}
     assert payload["client_metadata"]["cache_hint"] == {"ttl": "1h"}
-    assert json.loads(payload["client_metadata"]["x-codex-turn-metadata"]) == {
-        "installation_id": DEVICE_A, "window_id": "WINDOW",
-    }
+    body_metadata = json.loads(payload["client_metadata"]["x-codex-turn-metadata"])
+    assert body_metadata == header_metadata
+    assert body_metadata["window_id"] != "WINDOW"
+    assert payload["client_metadata"]["x-codex-installation-id"] == installation_id
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ingress_protocol", ["responses", "chat", "anthropic"])
-async def test_http_defer_skips_device_finalization_for_every_accepted_ingress(
+async def test_http_defer_compat_still_projects_authoritative_snapshot_for_every_ingress(
     monkeypatch, ingress_protocol,
 ):
     async def token(_key):
         return "access"
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
-    enabled = OpenAIOAuthChannel(_entry(
+    enabled = _persisted_channel(
         f"defer-{ingress_protocol}@example.test", f"ws-defer-{ingress_protocol}",
-        codexDeviceInstallationId=DEVICE_A,
-    ))
+    )
     body = (
         {"model": "gpt-test", "input": "hello"}
         if ingress_protocol == "responses"
@@ -379,6 +386,9 @@ async def test_http_defer_skips_device_finalization_for_every_accepted_ingress(
         defer_device_fingerprint=True,
     )
     assert "x-codex-installation-id" not in request.headers
+    assert json.loads(request.body)["client_metadata"][
+        "x-codex-installation-id"
+    ] == enabled.codex_device_installation_id
 
 
 @pytest.mark.asyncio
@@ -425,10 +435,9 @@ async def test_http_wrong_type_metadata_fails_candidate_transformation(monkeypat
     async def token(_key):
         return "access"
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
-    enabled = OpenAIOAuthChannel(_entry(
+    enabled = _persisted_channel(
         "http-invalid@example.test", "ws-http-invalid",
-        codexDeviceInstallationId=DEVICE_A,
-    ))
+    )
     with pytest.raises(ValueError, match="client_metadata must be an object"):
         await enabled.build_upstream_request(
             {"model": "gpt-test", "input": "hello", "client_metadata": "bad"},
@@ -467,7 +476,14 @@ def test_legacy_config_migration_is_atomic_idempotent_persistent_and_skips_unkno
     _assert_uuid4(accounts["legacy-empty@example.test"]["codexDeviceInstallationId"])
     assert "codexDeviceConvergenceEnabled" not in accounts["legacy-empty@example.test"]
     assert accounts["legacy-known@example.test"]["codexDeviceInstallationId"] == DEVICE_A
+    for email in ("legacy-default@example.test", "legacy-empty@example.test", "legacy-known@example.test"):
+        identity = accounts[email]["codexIdentity"]
+        assert identity["installationId"] == accounts[email]["codexDeviceInstallationId"]
+        assert identity["schemaVersion"] == 1
+        assert identity["idGenerationVersion"] == 1
+        assert identity["ownerKind"] == "chatgpt-account-id"
     assert "codexDeviceInstallationId" not in accounts["legacy-unknown@example.test"]
+    assert "codexIdentity" not in accounts["legacy-unknown@example.test"]
     assert len(writes) == 1
     assert json.loads(path.read_text(encoding="utf-8"))["oauthAccounts"][0][
         "codexDeviceInstallationId"
@@ -495,11 +511,15 @@ def test_invalid_legacy_uuid_aborts_without_replacing_live_config(tmp_path, monk
     assert path.read_text(encoding="utf-8") == original
 
 
-def test_config_reload_preserves_manual_optional_field():
+def test_config_reload_preserves_versioned_identity():
+    installation_id = str(uuid.uuid4())
     oauth_manager.add_account(_entry(
         "device-reload@example.test", "ws-reload",
-        codexDeviceInstallationId=DEVICE_A,
+        codexDeviceInstallationId=installation_id,
     ))
+    before = oauth_manager.get_account("openai:device-reload@example.test:ws-reload")
+    identity_before = dict(before["codexIdentity"])
     config.reload()
     account = oauth_manager.get_account("openai:device-reload@example.test:ws-reload")
-    assert account["codexDeviceInstallationId"] == DEVICE_A
+    assert account["codexDeviceInstallationId"] == installation_id
+    assert account["codexIdentity"] == identity_before

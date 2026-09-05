@@ -169,9 +169,18 @@ async def _build_realtime_headers(
 ) -> dict[str, str]:
     """Build OAuth headers once, then retain only realtime-safe client metadata."""
     headers = await channel.build_realtime_headers()
+    installation_id = str(
+        getattr(channel, "codex_device_installation_id", "") or ""
+    )
     for name, value in downstream_headers.items():
         if _should_forward_realtime_header(str(name)):
             headers[str(name)] = str(value)
+    # The selected OAuth workspace always wins over a downstream carrier.
+    for name in [key for key in headers if str(key).lower() == "x-codex-installation-id"]:
+        headers.pop(name, None)
+    if not installation_id:
+        raise ValueError("OpenAI OAuth realtime identity is unavailable")
+    headers["x-codex-installation-id"] = installation_id
 
     if content_type is not None:
         headers["content-type"] = content_type
