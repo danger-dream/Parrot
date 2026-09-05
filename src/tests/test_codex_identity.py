@@ -49,11 +49,14 @@ def _account(workspace: str, email: str = "same@example.test", **extra):
     }
 
 
+_PROFILE_ID = "rust-v0.153.4"
+
+
 def _version(value: str) -> int:
     return uuid.UUID(value).version
 
 
-def test_account_identity_stable_across_relogin_profile_and_downstream(identity_store, m):
+def test_account_installation_stable_across_profile_migration_and_downstream(identity_store, m):
     identity = m["identity"]
     account = _account("workspace-a")
     assert identity.normalize_account_identity(account, protocol_profile="rust-v0.153.4")
@@ -67,13 +70,16 @@ def test_account_identity_stable_across_relogin_profile_and_downstream(identity_
         codexIdentity=copy.deepcopy(account["codexIdentity"]),
         codexDeviceInstallationId=account["codexDeviceInstallationId"],
     )
-    assert not identity.normalize_account_identity(
+    assert identity.normalize_account_identity(
         relogin,
         protocol_profile="future-profile",
         new_identity_generation_version=99,
     )
     second = identity.account_identity_from_account(relogin)
-    assert second == first
+    assert second is not None
+    assert second.installation_id == first.installation_id
+    assert second.owner_digest == first.owner_digest
+    assert second.protocol_profile == "future-profile"
 
     for principal, anchor in (("key-a", "session-a"), ("key-b", "session-b")):
         body = {
@@ -90,6 +96,7 @@ def test_unsupported_generation_fails_only_when_creating_new_identity(identity_s
     with pytest.raises(ValueError, match="unsupported.*newIdentityGenerationVersion"):
         identity.normalize_account_identity(
             _account("workspace-new-generation"),
+            protocol_profile=_PROFILE_ID,
             new_identity_generation_version=99,
         )
 
@@ -98,8 +105,8 @@ def test_different_workspaces_never_share_installation_and_reject_copy(identity_
     identity = m["identity"]
     first = _account("workspace-a")
     second = _account("workspace-b")
-    identity.normalize_account_identity(first)
-    identity.normalize_account_identity(second)
+    identity.normalize_account_identity(first, protocol_profile=_PROFILE_ID)
+    identity.normalize_account_identity(second, protocol_profile=_PROFILE_ID)
     identity.register_account_identity(first)
     identity.register_account_identity(second)
     assert first["codexDeviceInstallationId"] != second["codexDeviceInstallationId"]
@@ -108,7 +115,7 @@ def test_different_workspaces_never_share_installation_and_reject_copy(identity_
         "workspace-c",
         codexDeviceInstallationId=first["codexDeviceInstallationId"],
     )
-    identity.normalize_account_identity(copied)
+    identity.normalize_account_identity(copied, protocol_profile=_PROFILE_ID)
     with pytest.raises(ValueError, match="another owner"):
         identity.register_account_identity(copied)
 
@@ -119,7 +126,9 @@ def test_duplicate_canonical_owner_converges_or_rejects_conflict(identity_store,
         _account("workspace-shared", email="first@example.test"),
         _account("workspace-shared", email="second@example.test"),
     ]
-    assert identity.normalize_account_identities(accounts)
+    assert identity.normalize_account_identities(
+        accounts, protocol_profile=_PROFILE_ID,
+    )
     assert accounts[0]["codexIdentity"] == accounts[1]["codexIdentity"]
 
     conflicting = copy.deepcopy(accounts)
@@ -128,7 +137,9 @@ def test_duplicate_canonical_owner_converges_or_rejects_conflict(identity_store,
         "installationId"
     ]
     with pytest.raises(ValueError, match="duplicate canonical OpenAI owner"):
-        identity.normalize_account_identities(conflicting)
+        identity.normalize_account_identities(
+            conflicting, protocol_profile=_PROFILE_ID,
+        )
 
 
 def test_unknown_workspace_has_no_fallback_and_fails_closed(identity_store, m):
@@ -143,7 +154,7 @@ def test_unknown_workspace_has_no_fallback_and_fails_closed(identity_store, m):
 def test_logical_session_lifecycle_uuid_versions_and_window_advance(identity_store, m):
     identity = m["identity"]
     account = _account("workspace-a")
-    identity.normalize_account_identity(account)
+    identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
     identity.register_account_identity(account)
 
     def resolve(principal: str, anchor: str):
@@ -203,7 +214,7 @@ def test_atomic_100_concurrent_first_create_has_one_uuid(identity_store, m):
 def test_snapshot_http_ws_parity_no_raw_id_leak_and_official_shapes(identity_store, m):
     identity = m["identity"]
     account = _account("workspace-a")
-    identity.normalize_account_identity(account)
+    identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
     identity.register_account_identity(account)
     raw_key = "downstream-key-name"
     raw_anchor = "downstream-session-id"
@@ -249,8 +260,8 @@ def test_retry_turn_state_scope_and_failover_owner_isolation(identity_store, m):
     identity = m["identity"]
     a = _account("workspace-a")
     b = _account("workspace-b")
-    identity.normalize_account_identity(a)
-    identity.normalize_account_identity(b)
+    identity.normalize_account_identity(a, protocol_profile=_PROFILE_ID)
+    identity.normalize_account_identity(b, protocol_profile=_PROFILE_ID)
     shared_body = {
         "_api_key_name": "key",
         "prompt_cache_key": "same-anchor",
@@ -286,8 +297,8 @@ def test_explicit_turn_mapping_continuation_new_turn_ttl_and_owner_isolation(
     identity = m["identity"]
     first_account = _account("workspace-turn-a")
     second_account = _account("workspace-turn-b")
-    identity.normalize_account_identity(first_account)
-    identity.normalize_account_identity(second_account)
+    identity.normalize_account_identity(first_account, protocol_profile=_PROFILE_ID)
+    identity.normalize_account_identity(second_account, protocol_profile=_PROFILE_ID)
 
     http_body = {
         "_api_key_name": "key",
@@ -345,7 +356,7 @@ async def test_thread_turn_serialization_parallelism_cancellation_and_reclaim(
 ):
     identity = m["identity"]
     account = _account("workspace-queue")
-    identity.normalize_account_identity(account)
+    identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
     first = identity.resolve_request_identity_context(account, {
         "_api_key_name": "key", "prompt_cache_key": "thread-a",
         "_client_body_fields": ["prompt_cache_key"],
@@ -392,7 +403,7 @@ async def test_thread_turn_serialization_parallelism_cancellation_and_reclaim(
 def test_event_level_turn_state_is_exact_turn_and_owner_scoped(identity_store, m):
     identity = m["identity"]
     account = _account("workspace-event-state")
-    identity.normalize_account_identity(account)
+    identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
     context = identity.resolve_request_identity_context(account, {
         "_api_key_name": "key", "client_metadata": {
             "session_id": "session", "turn_id": "turn",
@@ -420,7 +431,7 @@ def test_tombstone_restart_reimport_delete_and_explicit_forget(identity_store, m
     identity = m["identity"]
     state_db = m["state_db"]
     account = _account("workspace-life")
-    identity.normalize_account_identity(account)
+    identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
     first = identity.register_account_identity(account)
     body = {
         "_api_key_name": "key",
@@ -437,7 +448,7 @@ def test_tombstone_restart_reimport_delete_and_explicit_forget(identity_store, m
 
     # Reimport with credentials only restores the same UUIDv4 from the tombstone.
     imported = _account("workspace-life", email="new-label@example.test")
-    identity.normalize_account_identity(imported)
+    identity.normalize_account_identity(imported, protocol_profile=_PROFILE_ID)
     assert imported["codexDeviceInstallationId"] == first.installation_id
 
     # A complete durable-state copy preserves the owner installation across restart.
@@ -455,7 +466,7 @@ def test_tombstone_restart_reimport_delete_and_explicit_forget(identity_store, m
         assert state_db.codex_identity_tombstone_load(first.owner_digest)["installation_id"] == first.installation_id
         assert identity.forget_owner_identity(first.owner_digest)
         forgotten = _account("workspace-life")
-        identity.normalize_account_identity(forgotten)
+        identity.normalize_account_identity(forgotten, protocol_profile=_PROFILE_ID)
         assert forgotten["codexDeviceInstallationId"] != first.installation_id
         assert _version(forgotten["codexDeviceInstallationId"]) == 4
     finally:

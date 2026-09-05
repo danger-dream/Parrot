@@ -12,11 +12,13 @@ from ..openai.transform import codex_oauth_transform
 from ..providers import registry as provider_registry
 from ..transports.ws_runtime import http_url_to_ws
 from .codex_constants import (
+    CODEX_RESPONSES_LITE_HEADER,
     CODEX_RESPONSES_LITE_WS_METADATA_KEY,
     CodexModelPolicy,
     codex_cli_user_agent,
     codex_cli_version,
     codex_originator,
+    codex_protocol_profile,
     codex_responses_websocket_beta,
     resolve_codex_model_policy,
 )
@@ -39,6 +41,12 @@ SKIP_WS_HEADERS = {
     "sec-websocket-protocol",
     "content-length",
     "accept-encoding",
+    # HTTP/SSE negotiation and the real Lite header never belong on a WS
+    # handshake. Lite is represented only in response.create.client_metadata.
+    "accept",
+    "content-type",
+    "origin",
+    CODEX_RESPONSES_LITE_HEADER,
 }
 
 SKIP_OAUTH_WS_HEADERS = set(SKIP_WS_HEADERS) | {"openai-beta"}
@@ -168,6 +176,9 @@ def _codex_transform_policy_kwargs(channel: Any, model: str | None, body: dict) 
         "multi_agent_reasoning_effort": policy.multi_agent_reasoning_effort,
         "lite_thread_context": str((body or {}).get("prompt_cache_key") or "").strip(),
         "use_responses_lite": policy.use_responses_lite,
+        "request_field_policies": dict(
+            codex_protocol_profile(provider_config).request_field_policies
+        ),
     }
 
 

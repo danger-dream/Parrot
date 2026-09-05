@@ -22,6 +22,7 @@ import httpx
 from . import config, network, notifier, state_db
 from .channel import registry
 from .channel.url_utils import resolve_upstream_url
+from .openai.codex_constants import codex_responses_url
 
 
 def _has_family_account(family: str) -> bool:
@@ -421,7 +422,7 @@ def _channel_probe_url(ch) -> str:
         if getattr(ch, "provider", "") == "antigravity":
             return "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
         if getattr(ch, "protocol", "anthropic") == "openai-responses":
-            return "https://chatgpt.com/backend-api/codex/responses"
+            return codex_responses_url()
         return "https://api.anthropic.com/api/oauth/usage"
     base = str(getattr(ch, "base_url", "") or "")
     api_path = getattr(ch, "api_path", None)

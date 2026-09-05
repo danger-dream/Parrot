@@ -51,9 +51,9 @@ from .codex_constants import (
     codex_cli_user_agent,
     codex_cli_version,
     codex_originator,
+    codex_protocol_profile,
+    codex_responses_url,
 )
-
-CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 
 _DEFAULTS = {
     "enabled": True,
@@ -389,7 +389,10 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
     acc = oauth_manager.get_account(ak)
     if acc is None:
         raise UpstreamImageError("OpenAI OAuth account disappeared before image dispatch", 403, errors.ErrTypeOpenAI.PERMISSION, retryable=True, cooldown=True)
-    normalize_account_identity(acc)
+    prov_cfg = config.get().get("openaiOAuth") or {}
+    normalize_account_identity(
+        acc, protocol_profile=codex_protocol_profile(prov_cfg).profile_id,
+    )
     identity = account_identity_from_account(acc)
     account_id = str(acc.get("workspace_id") or acc.get("chatgpt_account_id") or "").strip()
     if not account_id or identity is None:
@@ -422,8 +425,11 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
             proxy_channel=f"oauth:{ak}",
             proxy_model=str(payload.get("model") or ""),
         ) as client:
-            async with client.stream("POST", CODEX_RESPONSES_URL, headers=headers, content=body) as resp:
+            async with client.stream(
+                "POST", codex_responses_url(prov_cfg), headers=headers, content=body,
+            ) as resp:
                 _update_codex_quota(ak, email, resp.headers)
+                oauth_manager.observe_openai_response_metadata(ak, resp.headers)
                 if resp.status_code >= 400:
                     text = await resp.aread()
                     ra_raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")

@@ -1274,7 +1274,9 @@ async def _try_ws_channel(
                 connector.stats.last_latency_ms = int(connect_ms or 0)
             # Headers from a successful WS upgrade carry quota and per-turn state.
             ws_response = getattr(upstream_ws, "response", None)
-            _maybe_record_codex_ws_snapshot(ch, ws_response)
+            _maybe_record_codex_ws_snapshot(
+                ch, ws_response, upstream_req.translator_ctx,
+            )
             capture_turn_state(
                 upstream_req.translator_ctx,
                 getattr(ws_response, "headers", None),
@@ -1403,6 +1405,7 @@ async def _try_ws_channel(
                 while True:
                     next_turn = await _receive_next_response_create(
                         websocket,
+                        channel=ch,
                         allowed_models=allowed_models,
                         api_key_name=api_key_name,
                         client_ip=client_ip,
@@ -2379,6 +2382,7 @@ async def _try_sse_channel(
 async def _receive_next_response_create(
     websocket: WebSocket,
     *,
+    channel: Channel | None,
     allowed_models: list[str] | None,
     api_key_name: str,
     client_ip: str,
@@ -2443,9 +2447,11 @@ async def _receive_next_response_create(
             # Sequential WS v2 continuation is owned by the active upstream
             # connection, not by Parrot's optional local HTTP response store.
             guard_responses_ingress(body, store_enabled=True)
+            if isinstance(channel, OpenAIOAuthChannel):
+                body = channel.apply_request_field_policies(body, "responses")
         except GuardError as exc:
             await _send_request_invalid_error_frame(
-                websocket, exc.message, param=None,
+                websocket, exc.message, param=exc.param,
             )
             continue
         if body.get("background") is True:
@@ -2790,7 +2796,7 @@ async def _relay_ws_session(
     first_wait = round_timeouts.first_byte
     first_read_task = asyncio.create_task(_recv_until_first_visible_ws_event(
         upstream_ws, tracker, pending_visible, ch.key, first_wait,
-        deadline_ts=deadline_ts, idle_timeout=idle_timeout,
+        channel=ch, deadline_ts=deadline_ts, idle_timeout=idle_timeout,
         result=result, proxy_bytes=proxy_bytes,
         translator_ctx=translator_ctx,
         timing=timing, round_timeouts=round_timeouts,
@@ -2919,8 +2925,8 @@ async def _relay_ws_session(
                 frame_transform=lambda frame: _identity_expose_frame(frame, _identity_map),
                 skip_event_types=(),
                 blacklist_before_error=True,
-                on_text_frame=lambda frame: capture_turn_state_event(
-                    translator_ctx, frame
+                on_text_frame=lambda frame: _capture_codex_response_event(
+                    ch, translator_ctx, frame
                 ),
                 timing=timing,
                 round_timeouts=round_timeouts,
@@ -3178,7 +3184,9 @@ def _pick_non_direct_proxy_name(ch: Channel, resolved_model: str) -> str | None:
     return None
 
 
-def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
+def _maybe_record_codex_ws_snapshot(
+    ch: Channel, ws_response: Any, translator_ctx: dict | None = None,
+) -> None:
     if not isinstance(ch, OpenAIOAuthChannel) or ws_response is None:
         return
     try:
@@ -3190,9 +3198,20 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
         # Reuse HTTP failover's response-header path so passive quota snapshot,
         # threshold auto-disable, and notification behavior stay identical.
         fake_resp = type("_WsResp", (), {"headers": headers})()
-        failover._maybe_record_codex_snapshot(ch, fake_resp)
+        failover._maybe_record_codex_snapshot(ch, fake_resp, translator_ctx)
     except Exception as exc:
-        print(f"[responses_ws] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[responses_ws] codex metadata record failed: {type(exc).__name__}")
+
+
+def _capture_codex_response_event(
+    ch: Channel | None, translator_ctx: dict | None, frame: str | bytes,
+) -> bool:
+    captured = capture_turn_state_event(translator_ctx, frame)
+    if isinstance(ch, OpenAIOAuthChannel):
+        oauth_manager.observe_openai_response_event(
+            ch.account_key, frame, translator_ctx,
+        )
+    return captured
 
 
 async def _finalize_ws_attempt_after_accept(
@@ -3450,6 +3469,7 @@ async def _recv_until_first_visible_ws_event(
     channel_key: str,
     first_wait: float,
     *,
+    channel: Channel | None,
     deadline_ts: float,
     idle_timeout: int,
     result: _WsAttemptResult,
@@ -3473,7 +3493,9 @@ async def _recv_until_first_visible_ws_event(
         timeout_detail_mode="event",
         timeout_label_seconds=timeout_label_seconds if timeout_label_seconds is not None else first_wait,
         use_tracker_error_detail=True,
-        on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
+        on_text_frame=lambda frame: _capture_codex_response_event(
+            channel, translator_ctx, frame,
+        ),
         timing=timing,
         round_timeouts=round_timeouts,
     )

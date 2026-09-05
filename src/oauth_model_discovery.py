@@ -8,16 +8,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 from typing import Any, Callable
+from urllib.parse import urlencode
 
-from . import network
+from . import config, network
 from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import xai as xai_provider
 from .oauth_ids import openai_workspace_id
 from .openai.codex_constants import (
-    codex_cli_user_agent,
-    codex_cli_version,
-    codex_originator,
+    codex_models_url,
+    codex_protocol_profile,
 )
 
 _TIMEOUT = 20.0
@@ -41,8 +41,11 @@ class DiscoveryResult:
     models: list[str]
     catalog: dict[str, Any]
     source: str
-    # Exact client identity used for this fetch, when the provider has one.
+    # Exact client/profile identity used for this fetch, when the provider has one.
     client_version: str = ""
+    profile_id: str = ""
+    etag: str = ""
+    not_modified: bool = False
 
 
 def _unique(values: list[Any]) -> list[str]:
@@ -147,29 +150,51 @@ def _catalog(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema": 1, "models": records}
 
 
+def _safe_etag(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 512 or "\r" in text or "\n" in text:
+        return ""
+    return text
+
+
 def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
     deadline = _Deadline(timeout)
     token = str(account.get("access_token") or "")
     if not token:
         raise ValueError("missing access token")
-    client_version = codex_cli_version()
-    url = (
-        "https://chatgpt.com/backend-api/codex/models"
-        f"?client_version={client_version}"
-    )
+    provider_cfg = config.get().get("openaiOAuth") or {}
+    profile = codex_protocol_profile(provider_cfg)
+    client_version = profile.client_version
+    url = f"{codex_models_url(provider_cfg)}?{urlencode({'client_version': client_version})}"
     headers = {
         "authorization": f"Bearer {token}",
         "accept": "application/json",
-        "user-agent": codex_cli_user_agent(),
-        "originator": codex_originator(),
-        "origin": "https://chatgpt.com",
+        "user-agent": profile.user_agent,
+        "originator": profile.originator,
+        "version": client_version,
     }
+    etag = ""
+    if (
+        str(account.get("models_etag_client_version") or "") == client_version
+        and str(account.get("models_etag_profile") or "") == profile.profile_id
+    ):
+        etag = _safe_etag(account.get("models_etag"))
+        if etag:
+            headers["If-None-Match"] = etag
     workspace = openai_workspace_id(account)
     if workspace:
         headers["ChatGPT-Account-ID"] = workspace
-    payload = _json_object(network.get_sync(
+    response = network.get_sync(
         url, headers=headers, timeout=deadline.remaining(), proxy_purpose="oauth_openai", proxy_channel=proxy_channel,
-    ))
+    )
+    response_headers = getattr(response, "headers", {}) or {}
+    response_etag = _safe_etag(response_headers.get("etag")) or etag
+    if getattr(response, "status_code", 200) == 304:
+        return DiscoveryResult(
+            [], {}, "upstream:codex:not-modified", client_version,
+            profile.profile_id, response_etag, True,
+        )
+    payload = _json_object(response)
     records = payload.get("models")
     if not isinstance(records, list):
         raise ValueError("Codex model catalog has invalid models schema")
@@ -218,6 +243,7 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
         }))
     return DiscoveryResult(
         models, _catalog(normalized), "upstream:codex", client_version,
+        profile.profile_id, response_etag, False,
     )
 
 

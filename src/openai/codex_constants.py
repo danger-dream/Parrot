@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 class CodexConfigurationError(ValueError):
@@ -28,6 +29,7 @@ _CODEX_VERSION_RE = re.compile(
 _CODEX_PROFILE_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 _CODEX_COMPONENT_ALLOWED = frozenset("._:/-")
 _PROFILE_ROOT = Path(__file__).with_name("codex_profiles")
+_CURRENT_PROFILE_FILE = _PROFILE_ROOT / "current.json"
 _MAX_PROFILE_BYTES = 1024 * 1024
 _MAX_INSTRUCTIONS_BYTES = 1024 * 1024
 
@@ -51,7 +53,10 @@ class CodexProtocolProfile:
     client_version: str
     originator: str
     user_agent: str
+    backend_base_url: str
+    realtime_websocket_base_url: str
     responses_websocket_beta: str
+    request_field_policies: Mapping[str, str]
     models: Mapping[str, CodexModelPolicy]
 
     def model_policy(self, model: str | None) -> CodexModelPolicy | None:
@@ -86,6 +91,60 @@ def _safe_policy_token(value: Any, *, field: str, optional: bool = False) -> str
     ):
         raise CodexConfigurationError(f"Codex model policy {field} is empty or unsafe")
     return text
+
+
+def _safe_absolute_url(
+    value: Any,
+    *,
+    field: str,
+    schemes: frozenset[str] = frozenset({"http", "https"}),
+) -> str:
+    if not isinstance(value, str):
+        raise CodexConfigurationError(f"Codex profile {field} must be a string")
+    text = value.strip().rstrip("/")
+    parsed = urlsplit(text)
+    if parsed.scheme not in schemes or not parsed.netloc:
+        allowed = "/".join(sorted(schemes))
+        raise CodexConfigurationError(
+            f"Codex profile {field} must be an absolute {allowed} URL"
+        )
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise CodexConfigurationError(
+            f"Codex profile {field} contains unsupported URL components"
+        )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _safe_request_field_policies(value: Any) -> Mapping[str, str]:
+    if not isinstance(value, dict):
+        raise CodexConfigurationError(
+            "Codex profile protocol.requestFieldPolicies must be an object"
+        )
+    allowed_fields = {
+        "max_output_tokens", "max_completion_tokens", "max_tokens",
+        "temperature", "top_p", "frequency_penalty", "presence_penalty",
+        "prompt_cache_retention",
+    }
+    allowed_policies = {"unsupported", "passthrough", "map:max_output_tokens"}
+    policies: dict[str, str] = {}
+    for raw_name, raw_policy in value.items():
+        name = str(raw_name or "").strip()
+        policy = str(raw_policy or "").strip()
+        if (
+            name not in allowed_fields
+            or policy not in allowed_policies
+            or (
+                policy == "map:max_output_tokens"
+                and name not in {
+                    "max_output_tokens", "max_completion_tokens", "max_tokens",
+                }
+            )
+        ):
+            raise CodexConfigurationError(
+                f"Codex profile request field policy is invalid: {name!r}={policy!r}"
+            )
+        policies[name] = policy
+    return policies
 
 
 def _safe_model_id(value: Any) -> str:
@@ -287,12 +346,51 @@ def _load_profile(profile_id: str) -> CodexProtocolProfile:
         client_version=client_version,
         originator=_safe_header_value(identity.get("originator"), field="identity.originator"),
         user_agent=_safe_header_value(identity.get("userAgent"), field="identity.userAgent"),
+        backend_base_url=_safe_absolute_url(
+            protocol.get("backendBaseUrl"), field="protocol.backendBaseUrl",
+        ),
+        realtime_websocket_base_url=_safe_absolute_url(
+            protocol.get("realtimeWebsocketBaseUrl"),
+            field="protocol.realtimeWebsocketBaseUrl",
+        ),
         responses_websocket_beta=_safe_header_value(
             protocol.get("responsesWebsocketBeta"),
             field="protocol.responsesWebsocketBeta",
         ),
+        request_field_policies=_safe_request_field_policies(
+            protocol.get("requestFieldPolicies")
+        ),
         models=models,
     )
+
+
+@lru_cache(maxsize=1)
+def current_codex_protocol_profile() -> CodexProtocolProfile:
+    """Return the packaged release selected by data, never by a Python version literal."""
+    try:
+        raw_bytes = _CURRENT_PROFILE_FILE.read_bytes()
+    except OSError as exc:
+        raise CodexConfigurationError(
+            f"Cannot read current Codex profile manifest: {_CURRENT_PROFILE_FILE}"
+        ) from exc
+    if not raw_bytes or len(raw_bytes) > 16 * 1024:
+        raise CodexConfigurationError("Current Codex profile manifest is empty or too large")
+    try:
+        raw = json.loads(raw_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CodexConfigurationError(
+            "Current Codex profile manifest is not valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
+        raise CodexConfigurationError(
+            "Current Codex profile manifest has unsupported schemaVersion"
+        )
+    profile_id = raw.get("currentProfile")
+    if not isinstance(profile_id, str) or not profile_id.strip():
+        raise CodexConfigurationError(
+            "Current Codex profile manifest must select currentProfile"
+        )
+    return _load_profile(profile_id.strip())
 
 
 def _runtime_provider_config() -> Mapping[str, Any]:
@@ -345,6 +443,53 @@ def codex_responses_websocket_beta(
     provider_config: Mapping[str, Any] | None = None,
 ) -> str:
     return codex_protocol_profile(provider_config).responses_websocket_beta
+
+
+def codex_backend_base_url(
+    provider_config: Mapping[str, Any] | None = None,
+) -> str:
+    """Return the selected Codex backend root; an explicit configured URL wins."""
+    cfg = provider_config if isinstance(provider_config, Mapping) else _runtime_provider_config()
+    raw = cfg.get("codexUpstreamUrl")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return codex_protocol_profile(cfg).backend_base_url
+    url = _safe_absolute_url(raw, field="openaiOAuth.codexUpstreamUrl")
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/responses"):
+        path = path[:-len("/responses")]
+    return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+
+
+def codex_backend_endpoint(
+    path: str,
+    provider_config: Mapping[str, Any] | None = None,
+) -> str:
+    component = str(path or "").strip().strip("/")
+    if not component or any(part in {"", ".", ".."} for part in component.split("/")):
+        raise CodexConfigurationError("Codex backend endpoint path is invalid")
+    return f"{codex_backend_base_url(provider_config)}/{component}"
+
+
+def codex_responses_url(provider_config: Mapping[str, Any] | None = None) -> str:
+    return codex_backend_endpoint("responses", provider_config)
+
+
+def codex_models_url(provider_config: Mapping[str, Any] | None = None) -> str:
+    return codex_backend_endpoint("models", provider_config)
+
+
+def codex_realtime_websocket_base_url(
+    provider_config: Mapping[str, Any] | None = None,
+) -> str:
+    return codex_protocol_profile(provider_config).realtime_websocket_base_url
+
+
+def codex_request_field_policy(
+    field: str,
+    provider_config: Mapping[str, Any] | None = None,
+) -> str | None:
+    return codex_protocol_profile(provider_config).request_field_policies.get(field)
 
 
 def _catalog_token(record: Mapping[str, Any], key: str) -> tuple[bool, str | None]:

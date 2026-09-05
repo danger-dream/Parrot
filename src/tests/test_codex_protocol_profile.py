@@ -147,7 +147,9 @@ def test_raw_new_config_key_wins_over_legacy_even_when_values_look_default():
     config._normalize_openai_oauth_config(merged, raw)
     assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
     assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
-    assert merged["openaiOAuth"]["forceCodexCLI"] is True
+    assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
+    assert "forceCodexCLI" not in merged["openaiOAuth"]
+    assert "forceCodexCLI" not in merged["oauth"]["providers"]["openai"]
 
 
 def test_catalog_lite_overrides_profile_profile_fills_absent_and_unknown_rejects():

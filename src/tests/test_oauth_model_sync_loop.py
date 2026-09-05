@@ -46,6 +46,7 @@ def test_due_requires_complete_provider_native_catalog():
         "models": ["a", "b"],
         "last_model_sync": _iso(-60),
         "last_model_sync_client_version": oauth_manager.codex_cli_version(),
+        "last_model_sync_profile": oauth_manager.codex_protocol_profile().profile_id,
     }
 
     assert oauth_manager._model_sync_due(_account("openai", 1, **fresh), now=now)
@@ -79,10 +80,10 @@ def test_due_empty_stale_and_failed_retry():
     assert oauth_manager._model_sync_due(old_failure, now=now)
 
 
-def test_openai_client_version_change_bypasses_success_ttl(monkeypatch):
+def test_openai_profile_or_client_version_change_bypasses_success_ttl():
     """A fresh complete LKG is stale immediately when Codex identity changes."""
     now = datetime.now(timezone.utc)
-    monkeypatch.setattr(oauth_manager, "codex_cli_version", lambda: "0.153.4")
+    profile = oauth_manager.codex_protocol_profile()
     base = _account(
         "openai",
         1,
@@ -92,9 +93,12 @@ def test_openai_client_version_change_bypasses_success_ttl(monkeypatch):
     )
     assert oauth_manager._model_sync_due(base, now=now)
     base["last_model_sync_client_version"] = "0.152.0"
+    base["last_model_sync_profile"] = profile.profile_id
     assert oauth_manager._model_sync_due(base, now=now)
-    base["last_model_sync_client_version"] = "0.153.4"
+    base["last_model_sync_client_version"] = profile.client_version
     assert not oauth_manager._model_sync_due(base, now=now)
+    base["last_model_sync_profile"] = "stale-profile"
+    assert oauth_manager._model_sync_due(base, now=now)
 
 
 @pytest.mark.asyncio

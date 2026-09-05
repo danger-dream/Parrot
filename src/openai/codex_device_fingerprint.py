@@ -31,11 +31,13 @@ def canonical_uuid4(value: Any) -> str:
     return value
 
 
-def normalize_account_device(account: dict) -> bool:
+def normalize_account_device(account: dict, *, protocol_profile: str) -> bool:
     """Compatibility entry point for the versioned per-workspace identity migration."""
     from .codex_identity import normalize_account_identity
 
-    return normalize_account_identity(account)
+    return normalize_account_identity(
+        account, protocol_profile=protocol_profile,
+    )
 
 
 def _set_existing_header(headers: dict[str, str], name: str, value: str) -> None:
@@ -68,7 +70,7 @@ def apply_device_fingerprint(
 ) -> tuple[dict[str, str], dict | None]:
     """Project an account UUID to metadata and, for compact/realtime, a header.
 
-    Ordinary Responses uses metadata only in the rust-v0.153.4 profile.  The
+    Ordinary Responses uses metadata only in the selected protocol profile. The
     direct header is opt-in for endpoint profiles that define that carrier.
     """
     if not installation_id:

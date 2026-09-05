@@ -843,7 +843,6 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
             {"type": "message", "role": "user", "content": "hello"},
         ],
         "stream": True,
-        "temperature": 0.9,
         "service_tier": service_tier,
         "prompt_cache_key": "shared-anchor",
         "client_metadata": {"a": "b"},
@@ -864,6 +863,10 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         assert headers["x-codex-routing-hint"] == f"model=test-model;tier={service_tier}"
         assert headers["version"] == "0.153.4"
         assert headers["User-Agent"].startswith("codex_cli_rs/0.153.4 ")
+        lowered = {str(key).lower() for key in headers}
+        assert "accept" not in lowered
+        assert "content-type" not in lowered
+        assert "x-openai-internal-codex-responses-lite" not in lowered
         assert headers["session-id"] == headers["thread-id"]
         # Codex CLI only uses hyphenated session-id; underscore variants must not be sent.
         assert "session_id" not in headers
@@ -901,7 +904,6 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
     assert uuid.UUID(metadata["session_id"]).version == 7
     assert uuid.UUID(metadata["turn_id"]).version == 7
     assert uuid.UUID(turn_metadata["context_window_id"]).version == 7
-    assert "temperature" not in upstream_first
     assert not ws.close_calls
     for value in (
         {"input": [{"type": "compaction", "id": "cmp_downstream_in", "encrypted_content": "downstream-in-cipher"}]},
@@ -1513,7 +1515,7 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
         return "tok"
 
     recorded = []
-    def fake_record(channel, response):
+    def fake_record(channel, response, translator_ctx=None):
         recorded.append({
             "channel": channel.key,
             "headers": dict(response.headers),
@@ -1616,14 +1618,13 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     })
     codex_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create", "model": "test-model", "input": "hello",
-        "stream": True, "generate": False, "temperature": 1, "background": False,
+        "stream": True, "generate": False, "background": False,
         "unknown_provider_field": "drop", "_api_key_name": "internal",
     }, "test-model", channel=oauth)
     assert codex_mapped["store"] is False
     assert codex_mapped["stream"] is True
     assert codex_mapped["generate"] is False
     assert codex_mapped["input"] == [{"type": "message", "role": "user", "content": "hello"}]
-    assert "temperature" not in codex_mapped
     assert "background" not in codex_mapped
     assert "unknown_provider_field" not in codex_mapped
     assert "_api_key_name" not in codex_mapped

@@ -87,13 +87,14 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["anysearch"]["maxFetchUrlChars"] == 250
             assert cfg["anysearch"]["requireKnownUrlForFetch"] is True
             assert cfg["anysearch"]["maxConcurrentToolCalls"] == 0
-            # Identity has no Python default: old configs remain visibly incomplete
-            # until an operator selects a matching versioned profile.
-            assert "codexCliVersion" not in cfg["openaiOAuth"]
-            assert "codexProtocolProfile" not in cfg["openaiOAuth"]
-            assert cfg["openaiOAuth"]["forceCodexCLI"] is False
+            # Existing deployments follow the packaged current profile by default;
+            # mutable version/model defaults are not embedded in Python.
+            assert cfg["openaiOAuth"]["codexCliVersion"] == "0.153.4"
+            assert cfg["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
+            assert cfg["openaiOAuth"]["codexProfileAutoUpdate"] is True
+            assert "forceCodexCLI" not in cfg["openaiOAuth"]
             assert cfg["openaiOAuth"]["defaultModels"] == ["legacy-model"]
-            assert cfg["openaiOAuth"]["codexUpstreamUrl"].startswith("https://chatgpt.com/")
+            assert "codexUpstreamUrl" not in cfg["openaiOAuth"]
             assert cfg["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] == 8 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["defaultMaxRequestBodyEvents"] == 4096
             assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodyBytesPerKey"] == 32 * 1024 * 1024
@@ -145,8 +146,9 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["pricing"]["aliases"] == {}
             assert cfg["pricing"]["overrides"] == {}
 
-        # 旧路径保留，不删除用户原配置，方便兼容和人工核对。
+        # 旧路径保留兼容数据，但失效的伪装开关会被清理。
         assert saved["oauth"]["providers"]["openai"]["defaultModels"] == ["legacy-model"]
+        assert "forceCodexCLI" not in saved["oauth"]["providers"]["openai"]
     finally:
         with open(config.path(), "w", encoding="utf-8") as f:
             json.dump(original, f, ensure_ascii=False, indent=2)
@@ -170,9 +172,10 @@ def test_explicit_openai_oauth_key_always_beats_legacy_config():
     }
     merged = config._deep_merge_defaults(config.DEFAULT_CONFIG, raw)
     config._normalize_openai_oauth_config(merged, raw)
-    assert merged["openaiOAuth"]["forceCodexCLI"] is True
-    assert merged["openaiOAuth"]["defaultModels"] == explicit["defaultModels"]
-    assert "codexCliVersion" not in merged["openaiOAuth"]
+    assert "forceCodexCLI" not in merged["openaiOAuth"]
+    assert "defaultModels" not in merged["openaiOAuth"]
+    assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
+    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
 
     # Key presence, not value type, controls precedence.  A malformed explicit
     # value must not silently activate the legacy identity; defaults remain
@@ -183,9 +186,10 @@ def test_explicit_openai_oauth_key_always_beats_legacy_config():
     }
     malformed = config._deep_merge_defaults(config.DEFAULT_CONFIG, malformed_raw)
     config._normalize_openai_oauth_config(malformed, malformed_raw)
-    assert malformed["openaiOAuth"]["forceCodexCLI"] is True
-    assert malformed["openaiOAuth"]["defaultModels"] != ["legacy-model"]
-    assert "codexCliVersion" not in malformed["openaiOAuth"]
+    assert "forceCodexCLI" not in malformed["openaiOAuth"]
+    assert "defaultModels" not in malformed["openaiOAuth"]
+    assert malformed["openaiOAuth"]["codexCliVersion"] == "0.153.4"
+    assert malformed["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
 
 
 def test_pricing_source_migration_only_rewrites_the_former_builtin_default():

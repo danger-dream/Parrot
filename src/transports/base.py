@@ -10,7 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-_FORWARD_HEADER_NAMES = ("content-type", "x-request-id", "request-id")
+_FORWARD_HEADER_NAMES = (
+    "content-type", "x-request-id", "request-id",
+    # Expose the effective upstream model without rewriting requested/billing identity.
+    "openai-model", "x-openai-model",
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,7 @@ class TransportMetadata:
     status_code: int | None = None
     headers: Mapping[str, str] = field(default_factory=dict)
     content_type: str | None = None
+    actual_model: str | None = None
 
     def forward_headers(self) -> dict[str, str]:
         return pick_forward_headers(self.headers)
@@ -58,4 +63,8 @@ def metadata_from_response(resp) -> TransportMetadata:
         status_code=status_i,
         headers=headers,
         content_type=_header_get(headers, "content-type"),
+        actual_model=(
+            _header_get(headers, "openai-model")
+            or _header_get(headers, "x-openai-model")
+        ),
     )

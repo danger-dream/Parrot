@@ -32,7 +32,6 @@ from .. import state_db
 OWNER_KIND = "chatgpt-account-id"
 SCHEMA_VERSION = 1
 ID_GENERATION_VERSION = 1
-DEFAULT_PROTOCOL_PROFILE = "rust-v0.153.4"
 _ACCOUNT_CONTEXTS_KEY = "_codex_identity_contexts"
 _NATIVE_IDENTITY_KEY = "_codex_native_identity"
 _TURN_LEASES_KEY = "_codex_turn_serialization_leases"
@@ -438,7 +437,7 @@ def _tombstone_for_owner(owner_digest: str) -> Mapping[str, Any] | None:
 def normalize_account_identity(
     account: MutableMapping[str, Any],
     *,
-    protocol_profile: str = DEFAULT_PROTOCOL_PROFILE,
+    protocol_profile: str | None = None,
     new_identity_generation_version: int = ID_GENERATION_VERSION,
     allow_legacy_collision_rotation: bool = False,
     used_installations: MutableMapping[str, str] | None = None,
@@ -465,6 +464,13 @@ def normalize_account_identity(
                 "Codex installation identity requires a nonempty OpenAI workspace/account ID"
             )
         return changed
+
+    selected_profile = str(protocol_profile or "").strip()
+    if not selected_profile:
+        raise CodexIdentityError(
+            "Codex identity normalization requires the selected "
+            "openaiOAuth.codexProtocolProfile"
+        )
 
     owner_digest = owner_digest_for_workspace(workspace_id)
     existing_obj = account.get("codexIdentity")
@@ -506,7 +512,7 @@ def normalize_account_identity(
         identity = AccountIdentity(
             schema_version=SCHEMA_VERSION,
             id_generation_version=generation_version,
-            protocol_profile=str(protocol_profile or DEFAULT_PROTOCOL_PROFILE),
+            protocol_profile=selected_profile,
             owner_kind=OWNER_KIND,
             owner_digest=owner_digest,
             installation_id=installation_id,
@@ -516,6 +522,10 @@ def normalize_account_identity(
         changed = True
 
     assert identity is not None
+    if identity.protocol_profile != selected_profile:
+        identity = replace(identity, protocol_profile=selected_profile)
+        account["codexIdentity"] = identity.as_config()
+        changed = True
     if used_installations is not None:
         prior_owner = used_installations.get(identity.installation_id)
         if prior_owner and prior_owner != identity.owner_digest:
@@ -542,7 +552,7 @@ def normalize_account_identity(
 def normalize_account_identities(
     accounts: Any,
     *,
-    protocol_profile: str = DEFAULT_PROTOCOL_PROFILE,
+    protocol_profile: str | None = None,
     new_identity_generation_version: int = ID_GENERATION_VERSION,
 ) -> bool:
     if not isinstance(accounts, list):

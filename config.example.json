@@ -332,27 +332,17 @@
   "runtimeStatePath": "runtime-cache.json",
   "durableStatePath": "durable-state.json",
   "openaiOAuth": {
+    "codexProfileAutoUpdate": true,
     "codexCliVersion": "0.153.4",
     "codexProtocolProfile": "rust-v0.153.4",
-    "forceCodexCLI": true,
-    "enableTLSFingerprint": false,
     "codexIdentity": {
       "mode": "per-oauth-account",
-      "protocolProfile": "rust-v0.153.4",
       "newIdentityGenerationVersion": 1
     },
-    "defaultModels": [
-      "gpt-5.2",
-      "gpt-5.2-codex",
-      "gpt-5.3-codex",
-      "gpt-5.4"
-    ],
-    "codexUpstreamUrl": "https://chatgpt.com/backend-api/codex/responses",
-    "defaultInstructions": "You are a helpful coding assistant.",
     "quotaProbe": {
+      "enabled": false,
       "input": "1",
-      "instructions": "reply ok",
-      "fallbackModel": "gpt-5.2"
+      "instructions": "reply ok"
     }
   },
   "xaiOAuth": {

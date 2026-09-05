@@ -8,10 +8,9 @@
 
   - `store=false` 强制（OAuth 上游对 store=true 报 400）
   - `stream=true` 强制（OAuth 上游仅支持流式 SSE）
-  - 删除 Responses API 里上游不支持的字段：max_output_tokens /
-    max_completion_tokens / temperature / top_p / frequency_penalty /
-    presence_penalty / prompt_cache_retention / user / metadata /
-    safety_identifier
+  - 输出限制/采样/缓存参数按版本化 profile 显式 passthrough/map/reject，
+    绝不静默删除；其余固定不支持字段（user / metadata /
+    safety_identifier）继续剥除
   - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
@@ -47,14 +46,6 @@ from ..codex_constants import codex_model_uses_responses_lite
 
 # 上游 codex endpoint 不认识、必须剥掉的 Responses API 字段。
 _STRIP_FIELDS_FOR_CODEX = (
-    "max_output_tokens",
-    "max_completion_tokens",
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    # 新版 Responses API 的缓存 TTL；Codex endpoint 拒绝 "Unsupported parameter"
-    "prompt_cache_retention",
     # ChatGPT internal Codex endpoint 不接受这些 Responses API 通用字段
     "user",
     "metadata",
@@ -638,6 +629,7 @@ def apply_codex_oauth_transform(
     lite_thread_context: str | None = None,
     transport: str = _CODEX_TRANSPORT_HTTP,
     use_responses_lite: bool | None = None,
+    request_field_policies: dict[str, str] | None = None,
 ) -> dict:
     """就地改造 body，返回同一对象。
 
@@ -653,6 +645,7 @@ def apply_codex_oauth_transform(
       transport: ``http`` 保持 OAuth store=false 的 HTTP/SSE 规则；
         ``websocket`` 启用官方 Responses WebSocket v2 的续接语义。
       use_responses_lite: 账户目录或选中 profile 的显式决策。
+      request_field_policies: 选中 profile 对输出/采样/缓存字段的显式策略。
     """
     if transport not in _CODEX_TRANSPORTS:
         raise ValueError(f"unsupported Codex Responses transport: {transport!r}")
@@ -683,8 +676,32 @@ def apply_codex_oauth_transform(
         _inc = list(_inc) + ["reasoning.encrypted_content"]
     body["include"] = _inc
 
-    # 3) 剥不支持字段。previous_response_id 只属于 HTTP/SSE store=false
-    # 限制；原生 WS v2 在同一连接内用它引用上一轮 response。
+    # 3) Output/sampling/cache controls are profile-owned. Missing policy also
+    # fails closed so a future caller cannot silently lose an explicit limit.
+    policies = request_field_policies or {}
+    controlled_fields = (
+        "max_output_tokens", "max_completion_tokens", "max_tokens",
+        "temperature", "top_p", "frequency_penalty", "presence_penalty",
+        "prompt_cache_retention",
+    )
+    for field in controlled_fields:
+        if field not in body:
+            continue
+        policy = policies.get(field)
+        if policy in (None, "unsupported"):
+            raise ValueError(
+                f"{field} is not supported by the selected Codex protocol profile"
+            )
+        if policy == "map:max_output_tokens":
+            if field != "max_output_tokens" and "max_output_tokens" not in body:
+                body["max_output_tokens"] = body[field]
+            if field != "max_output_tokens":
+                body.pop(field, None)
+        elif policy != "passthrough":
+            raise ValueError(f"invalid Codex request field policy for {field}")
+
+    # Strip fixed unsupported fields. previous_response_id only belongs to the
+    # HTTP/SSE store=false limitation; native WS v2 references the prior response.
     for k in _STRIP_FIELDS_FOR_CODEX:
         if native_responses_ws and k == "previous_response_id":
             continue

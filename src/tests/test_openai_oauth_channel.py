@@ -56,10 +56,12 @@ def _import_modules():
     from src import config, oauth_manager, state_db
     from src.channel import registry
     from src.channel.oauth_channel import OAuthChannel
-    from src.channel.openai_oauth_channel import OpenAIOAuthChannel, CODEX_UPSTREAM_URL
+    from src.channel.openai_oauth_channel import OpenAIOAuthChannel
     from src.openai.codex_constants import (
         build_codex_routing_hint,
         codex_cli_user_agent,
+        codex_protocol_profile,
+        codex_responses_url,
     )
     from src.openai.channel.registration import register_factories
     from src.openai import handler, reasoning_replay
@@ -71,8 +73,9 @@ def _import_modules():
         "registry": registry,
         "OAuthChannel": OAuthChannel,
         "OpenAIOAuthChannel": OpenAIOAuthChannel,
-        "CODEX_UPSTREAM_URL": CODEX_UPSTREAM_URL,
+        "CODEX_UPSTREAM_URL": codex_responses_url(),
         "CODEX_CLI_USER_AGENT": codex_cli_user_agent(),
+        "CODEX_PROFILE_MODELS": tuple(codex_protocol_profile().models),
         "build_codex_routing_hint": build_codex_routing_hint,
         "transform": transform,
         "handler": handler,
@@ -132,12 +135,6 @@ def test_transform_basic(m):
     body = {
         "model": "gpt-5",
         "input": "hi",
-        "temperature": 0.7,
-        "top_p": 1,
-        "max_output_tokens": 100,
-        "frequency_penalty": 0,
-        "presence_penalty": 0,
-        "prompt_cache_retention": "1h",
         "stream": False,
         "store": True,
         "user": "u",
@@ -150,14 +147,31 @@ def test_transform_basic(m):
     assert out["model"] == "gpt-5"                 # 直接透传（不再做别名映射）
     assert out["store"] is False                   # 强制
     assert out["stream"] is True                   # 强制
-    for k in ("temperature", "top_p", "max_output_tokens",
-              "frequency_penalty", "presence_penalty", "prompt_cache_retention",
-              "user", "metadata", "safety_identifier", "background"):
+    for k in ("user", "metadata", "safety_identifier", "background"):
         assert k not in out, f"{k} should be stripped"
     assert out["stream_options"] == {"include_usage": True}
     assert out["input"] == [{"type": "message", "role": "user", "content": "hi"}]
     assert out["instructions"] == "You are a helpful coding assistant."
     print("  [PASS] transform: basic forced flags + strip + model normalize")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_output_tokens", 100),
+    ("max_completion_tokens", 100),
+    ("max_tokens", 100),
+    ("temperature", 0.7),
+    ("top_p", 1),
+    ("frequency_penalty", 0),
+    ("presence_penalty", 0),
+    ("prompt_cache_retention", "1h"),
+])
+def test_transform_rejects_profile_unsupported_controls(m, field, value):
+    with pytest.raises(ValueError, match=field):
+        _apply_transform(
+            m["transform"],
+            {"model": "gpt-5", "input": "hi", field: value},
+            request_field_policies={field: "unsupported"},
+        )
 
 
 def test_transform_keeps_resolved_model(m):
@@ -533,7 +547,7 @@ def test_channel_basic(m):
 
 
 def test_channel_default_models_fallback(m):
-    """账户不设 models → Channel 回落到 config.openaiOAuth.defaultModels"""
+    """账户与配置都不设 models → Channel 使用选中版本化 profile。"""
     _setup(m)
     # 直接调 add_account（不走 _add_openai_acc helper，后者会塞硬编码的 models）
     m["oauth_manager"].add_account({
@@ -545,12 +559,7 @@ def test_channel_default_models_fallback(m):
     })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:no-models@x:acct"))
     models = ch.list_client_models()
-    # 默认模型跟随 Codex 官方目录：GPT-5.6 系列优先，保留旧稳定模型。
-    expected = {
-        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
-        "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
-    }
+    expected = set(m["CODEX_PROFILE_MODELS"])
     assert set(models) == expected, models
     # supports_model 命中
     for m_id in expected:
@@ -558,14 +567,14 @@ def test_channel_default_models_fallback(m):
     # 不在默认列表的别名不会命中（需用户手动补 models）
     assert ch.supports_model("gpt-5") is None
     assert ch.supports_model("gpt-5.1") is None
-    print("  [PASS] channel: default models from openaiOAuth.defaultModels")
+    print("  [PASS] channel: default models from selected Codex profile")
 
 
 def test_channel_responses_ingress(m):
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
-    body = {"model": "gpt-5.1", "input": "hi", "stream": False, "temperature": 0.3}
+    body = {"model": "gpt-5.1", "input": "hi", "stream": False}
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1",
                                                 ingress_protocol="responses"))
     assert req.url == m["CODEX_UPSTREAM_URL"]
@@ -582,13 +591,12 @@ def test_channel_responses_ingress(m):
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
-    assert h.get("host") == "chatgpt.com"
+    assert "host" not in h
     assert h["x-codex-routing-hint"] == "model=gpt-5.1"
     payload = json.loads(req.body)
     assert payload["model"] == "gpt-5.1"
     assert payload["store"] is False
     assert payload["stream"] is True
-    assert "temperature" not in payload
     assert payload["client_metadata"]["x-codex-installation-id"] == ch.codex_device_installation_id
     assert payload["client_metadata"]["session_id"] == h["session-id"]
     assert uuid.UUID(h["session-id"]).version == 7
@@ -834,9 +842,7 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
     assert payload["input"][0]["type"] == "additional_tools"
     assert payload["input"][0]["role"] == "developer"
     assert payload["input"][0]["tools"] == []
-    assert payload["input"][1]["role"] == "developer"
-    assert payload["input"][1]["content"][0]["type"] == "input_text"
-    assert payload["input"][2] == {"type": "message", "role": "user", "content": "hi"}
+    assert payload["input"][1] == {"type": "message", "role": "user", "content": "hi"}
     print("  [PASS] channel: official Responses Lite catalog + future GPT-5.6 prefix")
 
 
@@ -1164,7 +1170,6 @@ def test_channel_anthropic_ingress_translator(m):
     body = {
         "model": "gpt-5.1",
         "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 32,
         "stream": False,
     }
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
@@ -1182,7 +1187,6 @@ def test_channel_anthropic_ingress_translator(m):
     # 再保留 include=reasoning.encrypted_content 透明透传能力。
     assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
     assert payload["include"] == ["reasoning.encrypted_content"]
-    assert "max_output_tokens" not in payload   # Codex transform 会剥不支持字段
     print("  [PASS] channel: anthropic ingress → codex responses translator_ctx")
 
 
@@ -1216,7 +1220,7 @@ def test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache(m):
     print("  [PASS] channel: Anthropic history system stays as developer tail on Codex route")
 
 
-def test_channel_anthropic_ingress_maps_cache_to_prompt_cache_and_session(m):
+def test_channel_anthropic_ingress_rejects_unsupported_cache_retention(m):
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
@@ -1230,18 +1234,13 @@ def test_channel_anthropic_ingress_maps_cache_to_prompt_cache_and_session(m):
         "_parrot_client_ip": "203.0.113.8",
     }
 
-    req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="anthropic"))
-    payload = json.loads(req.body)
-
-    assert uuid.UUID(payload["prompt_cache_key"]).version == 7
-    assert "prompt_cache_retention" not in payload  # Codex endpoint rejects retention; transform strips it.
-    assert "metadata" not in payload               # stripped only after deriving the cache/session key.
-    sid = req.headers.get("session-id")
-    assert sid == payload["prompt_cache_key"]
-    assert payload["client_metadata"]["x-codex-installation-id"] == ch.codex_device_installation_id
-    assert "session_id" not in req.headers
-    assert "conversation_id" not in req.headers
-    print("  [PASS] channel: anthropic ingress maps cache/session anchor to durable Codex UUIDv7")
+    with pytest.raises(Exception, match="prompt_cache_retention") as exc:
+        asyncio.run(ch.build_upstream_request(
+            body, "gpt-5.1", ingress_protocol="anthropic",
+        ))
+    assert getattr(exc.value, "status", None) == 400
+    assert getattr(exc.value, "param", None) == "prompt_cache_retention"
+    print("  [PASS] channel: unsupported translated cache retention returns explicit 400")
 
 
 def test_channel_anthropic_ingress_metadata_session_replay(m):
@@ -1253,7 +1252,6 @@ def test_channel_anthropic_ingress_metadata_session_replay(m):
     body = {
         "model": "gpt-5.1",
         "messages": [{"role": "user", "content": "continue"}],
-        "max_tokens": 32,
         "metadata": {"user_id": '{"session_id":"session-abc"}'},
     }
     probe = asyncio.run(ch.build_upstream_request(
@@ -1466,29 +1464,22 @@ def test_legacy_isolate_session_switch_cannot_disable_identity(m):
     print("  [PASS] logical session: obsolete isolateSessionId opt-out ignored")
 
 
-def test_force_codex_cli_switch(m):
-    """forceCodexCLI=True（默认）写死 codex UA；=False 则不设 UA。"""
+def test_obsolete_force_codex_cli_switch_cannot_disable_identity(m):
+    """The removed escape hatch cannot suppress the profile-owned Codex UA."""
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
 
-    # 默认 True
     body = {"model": "gpt-5.1", "input": "hi"}
     req = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
     assert req.headers.get("user-agent") == m["CODEX_CLI_USER_AGENT"]
 
-    # 关掉
     def _off(c):
         c.setdefault("openaiOAuth", {})["forceCodexCLI"] = False
     m["config"].update(_off)
     req2 = asyncio.run(ch.build_upstream_request(body, "gpt-5.1", ingress_protocol="responses"))
-    assert "user-agent" not in req2.headers
-
-    # 恢复
-    def _on(c):
-        c.setdefault("openaiOAuth", {})["forceCodexCLI"] = True
-    m["config"].update(_on)
-    print("  [PASS] forceCodexCLI switch: True injects UA, False omits it")
+    assert req2.headers.get("user-agent") == m["CODEX_CLI_USER_AGENT"]
+    print("  [PASS] obsolete forceCodexCLI switch cannot disable Codex UA")
 
 
 def test_openai_oauth_explicit_short_config_always_beats_legacy(m):
@@ -1536,8 +1527,8 @@ def test_openai_oauth_short_config_overrides_codex_url_and_default_instructions(
     payload = json.loads(req.body)
     assert req.url == "https://example.test/backend-api/codex/responses"
     assert payload["instructions"] == "Custom default instructions."
-    assert "user-agent" not in req.headers
-    print("  [PASS] openaiOAuth short config overrides Codex URL/instructions/UA")
+    assert req.headers.get("user-agent") == m["CODEX_CLI_USER_AGENT"]
+    print("  [PASS] openaiOAuth short config overrides Codex URL/instructions")
 
 
 def test_config_backfills_openai_oauth_from_legacy_provider(m):
@@ -1555,15 +1546,17 @@ def test_config_backfills_openai_oauth_from_legacy_provider(m):
     merged = m["config"]._deep_merge_defaults(m["config"].DEFAULT_CONFIG, raw)
     changed = m["config"]._normalize_openai_oauth_config(merged, raw)
     assert changed is True
-    assert merged["openaiOAuth"]["forceCodexCLI"] is False
+    assert "forceCodexCLI" not in merged["openaiOAuth"]
     assert "isolateSessionId" not in merged["openaiOAuth"]
     assert merged["openaiOAuth"]["codexIdentity"] == {
         "mode": "per-oauth-account",
-        "protocolProfile": "rust-v0.153.4",
         "newIdentityGenerationVersion": 1,
     }
+    assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
+    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
+    assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
     assert merged["openaiOAuth"]["defaultModels"] == ["legacy-model"]
-    assert merged["openaiOAuth"]["codexUpstreamUrl"].startswith("https://chatgpt.com/")
+    assert "codexUpstreamUrl" not in merged["openaiOAuth"]
     print("  [PASS] config: legacy oauth.providers.openai backfills openaiOAuth")
 
 

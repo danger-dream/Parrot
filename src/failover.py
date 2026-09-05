@@ -135,10 +135,15 @@ _codex_snapshot_lock = threading.Lock()
 _codex_snapshot_inflight: set[str] = set()
 
 
-def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
+def _maybe_record_codex_snapshot(
+    ch: Channel, resp: Any, translator_ctx: dict | None = None,
+) -> None:
     if not isinstance(ch, OpenAIOAuthChannel):
         return
     try:
+        oauth_manager.observe_openai_response_metadata(
+            ch.account_key, resp.headers, translator_ctx,
+        )
         snap = openai_provider.parse_rate_limit_headers(dict(resp.headers))
         if not snap:
             return
@@ -178,7 +183,7 @@ def _maybe_record_codex_snapshot(ch: Channel, resp: Any) -> None:
             with _codex_snapshot_lock:
                 _codex_snapshot_inflight.discard(account_key)
     except Exception as exc:
-        print(f"[failover] codex snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[failover] codex response metadata record failed: {type(exc).__name__}")
 
 
 # ─── Anthropic 响应头被动采样 snapshot 节流 ──────────────────────
@@ -2685,7 +2690,9 @@ async def _connect_oauth_responses_ws(
     )
 
 
-def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
+def _maybe_record_codex_ws_snapshot(
+    ch: Channel, ws_response: Any, translator_ctx: dict | None = None,
+) -> None:
     if not isinstance(ch, OpenAIOAuthChannel) or ws_response is None:
         return
     try:
@@ -2694,9 +2701,9 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
             return
         headers = flatten_ws_response_headers(headers_obj)
         fake_resp = type("_WsResp", (), {"headers": headers})()
-        _maybe_record_codex_snapshot(ch, fake_resp)
+        _maybe_record_codex_snapshot(ch, fake_resp, translator_ctx)
     except Exception as exc:
-        print(f"[failover] codex WS snapshot record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[failover] codex WS metadata record failed: {type(exc).__name__}")
 
 
 def _maybe_record_codex_rate_limits_event(ch: Channel | None, event: dict) -> None:
@@ -2727,7 +2734,18 @@ def _maybe_record_codex_rate_limits_event(ch: Channel | None, event: dict) -> No
                 _maybe_record_codex_snapshot(ch, fake_resp)
                 return
     except Exception as exc:
-        print(f"[failover] codex WS rate_limits event record failed for {getattr(ch, 'email', '?')}: {exc}")
+        print(f"[failover] codex WS rate_limits event record failed: {type(exc).__name__}")
+
+
+def _capture_codex_response_event(
+    ch: Channel | None, translator_ctx: dict | None, frame: str | bytes,
+) -> bool:
+    captured = capture_turn_state_event(translator_ctx, frame)
+    if isinstance(ch, OpenAIOAuthChannel):
+        oauth_manager.observe_openai_response_event(
+            ch.account_key, frame, translator_ctx,
+        )
+    return captured
 
 
 def _frame_size(data: str | bytes) -> int:
@@ -2778,6 +2796,10 @@ class _WsResponsesTracker:
             self._frames.append(text)
             return
         self.last_event = evt
+        if isinstance(self.channel, OpenAIOAuthChannel):
+            oauth_manager.observe_openai_response_event(
+                self.channel.account_key, evt,
+            )
         typ = str(evt.get("type") or "")
         if typ == "codex.rate_limits":
             _maybe_record_codex_rate_limits_event(self.channel, evt)
@@ -3074,7 +3096,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 connector.stats.last_success_ts = time.time()
                 connector.stats.last_latency_ms = int(connect_ms or 0)
             ws_response = getattr(upstream_ws, "response", None)
-            _maybe_record_codex_ws_snapshot(ch, ws_response)
+            _maybe_record_codex_ws_snapshot(ch, ws_response, translator_ctx)
             from .openai.codex_identity import capture_turn_state, project_snapshot
             if capture_turn_state(
                 translator_ctx,
@@ -3453,7 +3475,7 @@ async def _recv_oauth_ws_until_visible(
         timeout_detail_mode="packet_or_visible",
         timeout_label_seconds=first_wait,
         use_tracker_error_detail=False,
-        on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
+        on_text_frame=lambda frame: _capture_codex_response_event(ch, translator_ctx, frame),
         timing=timing,
         round_timeouts=round_timeouts,
     )
@@ -3569,7 +3591,7 @@ async def _consume_oauth_responses_ws_non_stream(
             proxy_bytes=proxy_bytes,
             closed_error_detail="upstream websocket closed",
             check_blacklist=False,
-            on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
+            on_text_frame=lambda frame: _capture_codex_response_event(ch, translator_ctx, frame),
             timing=timing,
             round_timeouts=round_timeouts,
         )
@@ -3956,7 +3978,7 @@ async def _consume_oauth_responses_ws_stream(
                     proxy_bytes=proxy_bytes,
                     closed_error_detail="upstream websocket closed",
                     blacklist_before_error=False,
-                    on_text_frame=lambda frame: capture_turn_state_event(translator_ctx, frame),
+                    on_text_frame=lambda frame: _capture_codex_response_event(ch, translator_ctx, frame),
                     timing=timing,
                     round_timeouts=round_timeouts,
                 )
@@ -4253,7 +4275,7 @@ async def _try_channel(
 
     try:
         # 1.5 响应头 snapshot 采样：成功/失败分支前都先记一次
-        _maybe_record_codex_snapshot(ch, upstream_resp)
+        _maybe_record_codex_snapshot(ch, upstream_resp, upstream_req.translator_ctx)
         _maybe_record_anthropic_snapshot(ch, upstream_resp)
         if isinstance(ch, OpenAIOAuthChannel):
             from .openai.codex_identity import capture_turn_state

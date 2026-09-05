@@ -24,12 +24,15 @@ from .. import apikey_limiter, auth, concurrency, config, errors, load_balancing
 from ..channel import registry
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
 from ..transports import WsProxyBytes, connect_upstream_ws, resolve_ws_route_chain
+from .codex_constants import (
+    codex_backend_base_url,
+    codex_realtime_websocket_base_url,
+)
 
 
 # This is only an internal scheduler/proxy-routing bucket.  It is never sent to
 # the realtime backend and doesn't imply a model mapping.
 _REALTIME_ROUTE_MODEL_PREFIX = "__codex_realtime__"
-_REALTIME_WS_API_BASE_URL = "https://api.openai.com"
 _CALL_BINDING_TTL_SECONDS = 300
 
 # The client bearer is intentionally excluded: Parrot replaces it with the
@@ -103,25 +106,9 @@ def _route_model(model: str | None) -> str:
     return f"{_REALTIME_ROUTE_MODEL_PREFIX}:{normalized[:160]}"
 
 
-def _codex_backend_base_url() -> str:
-    """Return the configured Codex backend root, without its /responses suffix."""
-    raw = str(
-        ((config.get().get("openaiOAuth") or {}).get("codexUpstreamUrl"))
-        or "https://chatgpt.com/backend-api/codex/responses"
-    ).strip()
-    parsed = urlsplit(raw)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError("openaiOAuth.codexUpstreamUrl must be an absolute URL")
-
-    path = parsed.path.rstrip("/")
-    if path.endswith("/responses"):
-        path = path[:-len("/responses")]
-    return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
-
-
 def _realtime_ws_url(path: str, query: str) -> str:
     """Build the OpenAI API URL used by Codex realtime WebSockets."""
-    base = urlsplit(_REALTIME_WS_API_BASE_URL)
+    base = urlsplit(codex_realtime_websocket_base_url())
     if base.scheme == "https":
         scheme = "wss"
     elif base.scheme == "http":
@@ -137,7 +124,7 @@ def _realtime_ws_url(path: str, query: str) -> str:
 
 def _realtime_call_url(query: str) -> str:
     """Build the ChatGPT Codex backend URL used to create WebRTC calls."""
-    base = urlsplit(_codex_backend_base_url())
+    base = urlsplit(codex_backend_base_url())
     if base.scheme not in ("http", "https"):
         raise ValueError(f"unsupported Codex realtime call scheme: {base.scheme}")
 

@@ -132,26 +132,29 @@ python3 -m venv venv
 # 测试必须经隔离入口启动；用系统 python3 启动同一脚本也会自动切换到此 venv
 ./venv/bin/python src/tests/isolated_pytest.py src/tests -q
 
-# 编辑 config.json（首次启动会生成基础配置；使用 OpenAI OAuth 时还须显式选择 Codex profile）
+# 编辑 config.json（首次启动会生成基础配置；OpenAI OAuth 默认跟随打包的当前 Codex profile）
 ./venv/bin/python server.py
 ```
 
-### Codex 协议 profile（OpenAI OAuth 必填）
+### Codex 协议 profile（OpenAI OAuth）
 
-OpenAI OAuth/Codex 没有内置 CLI 版本 fallback。真实 `config.json` 必须显式选择版本和同版本 profile；字段缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed，并在错误中指出配置字段。
+Codex 的版本、User-Agent、端点、WS beta、模型能力和请求字段策略都来自 `src/openai/codex_profiles/`。Python 源码不保存会漂移的 CLI 版本或模型名单。`src/openai/codex_profiles/current.json` 是发布包的当前 profile 指针；默认 `codexProfileAutoUpdate=true`，升级 Parrot 后首次加载配置会自动把真实 `config.json` 的 `codexCliVersion` / `codexProtocolProfile` 迁移为该 profile 的配套值，既有 OAuth installation UUID 不会旋转。
 
 ```json
 {
   "openaiOAuth": {
+    "codexProfileAutoUpdate": true,
     "codexCliVersion": "0.153.4",
     "codexProtocolProfile": "rust-v0.153.4"
   }
 }
 ```
 
-可用 profile 存放在 `src/openai/codex_profiles/`。`codexCliVersion` 必须与选中 profile 的 `clientVersion` 完全一致；升级时应同时添加/审核版本化 profile 并修改这两个配置值，不能只改其中一个。`config.example.json` 展示当前推荐组合，但程序不会把推荐值回填到真实配置，也不会根据源码版本、默认配置值或模型名猜测 Codex 版本。
+需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
 
-模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于通用 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。
+模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前返回明确 400，不会静默删除。
+
+模型目录请求携带同一 profile 的版本身份，并使用 ETag / 304；推理响应中的 `X-Models-Etag` 会触发去抖后的目录刷新，`openai-model` / `x-openai-model` 会作为实际模型观测头透传。
 
 ### 下游客户端接入
 
@@ -521,13 +524,12 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
     "openai-chat":      "gpt-5.4",
     "openai-responses": "gpt-5.4"
   },
-  "providers": {
-    "openai": {
-      "forceCodexCLI": true,
-      "enableTLSFingerprint": false,
-      "isolateSessionId": true,
-      "defaultModels": ["gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"]
-    }
+  "openaiOAuth": {
+    "codexProfileAutoUpdate": true,
+    "codexCliVersion": "0.153.4",
+    "codexProtocolProfile": "rust-v0.153.4",
+    "codexIdentity": { "mode": "per-oauth-account", "newIdentityGenerationVersion": 1 },
+    "quotaProbe": { "enabled": false, "input": "1", "instructions": "reply ok" }
   },
   "notifications": { "enabled": true, "events": { ... } },
   "channelSelection": "smart",
@@ -537,7 +539,7 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 }
 ```
 
-> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 Codex 探测头），频繁请求可能被风控盯上。
+> `quotaMonitor.enabled` **默认关闭** —— 启用后每 N 秒拉一次每个 OAuth 账号的 usage（Claude 走 `/api/oauth/usage`，OpenAI 走 `wham/usage`）。`openaiOAuth.quotaProbe` 是另一个会实际调用模型的诊断入口，默认禁用，只有配置开启且调用方明确请求时才发网。
 
 > `apiKeys.*.allowImages` **默认关闭** —— 新建或历史 API Key 不会自动获得图片生成 / 编辑能力，必须在 TG「🔑 管理 API Key」里显式开启。
 
@@ -748,7 +750,7 @@ Parrot/
 该模型在所有启用渠道里都不存在。检查：
 - 模型名拼写
 - 渠道是否被禁用 / 配额禁用 / auth_error
-- 对 OpenAI OAuth：`gpt-5.2-codex` 对 ChatGPT 账号（Plus/Pro/Enterprise）不支持，会被自动剔除；这种情况返回 404
+- 对 OpenAI OAuth：以该账户最近一次认证 `/models` 目录及选中 Codex profile 为准；源码不维护会过期的型号黑名单
 
 ### 下游返回 403 `Model 'xxx' is not allowed for this API key`
 该 Key 设了模型白名单但请求模型不在里面。去 TG bot「🔑 管理 API Key」→ 编辑 Key 的允许模型。

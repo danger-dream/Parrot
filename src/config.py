@@ -520,33 +520,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "runtimeStatePath": "runtime-cache.json",
     "durableStatePath": "durable-state.json",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
-    # codexCliVersion 与 codexProtocolProfile 故意没有运行时默认值：真实配置
-    # 必须显式提供且相互匹配，否则任何 Codex identity/model 操作都会 fail closed。
+    # 默认跟随 codex_profiles/current.json 指向的已审核 profile，并把配套版本/profile
+    # 写回真实配置。需要人工固定旧版本时可显式设置 codexProfileAutoUpdate=false；
+    # 固定模式下版本/profile 缺失或不匹配会 fail closed。
     "openaiOAuth": {
-        "forceCodexCLI": True,
-        "enableTLSFingerprint": False,
+        "codexProfileAutoUpdate": True,
         "codexIdentity": {
             "mode": "per-oauth-account",
-            "protocolProfile": "rust-v0.153.4",
             "newIdentityGenerationVersion": 1,
         },
-        "defaultModels": [
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.4-mini",
-            "gpt-5.2",
-            "gpt-5.2-codex",
-            "gpt-5.3-codex",
-        ],
-        "codexUpstreamUrl": "https://chatgpt.com/backend-api/codex/responses",
-        "defaultInstructions": "You are a helpful coding assistant.",
         "quotaProbe": {
+            "enabled": False,
             "input": "1",
             "instructions": "reply ok",
-            "fallbackModel": "gpt-5.2",
         },
     },
     # xAI / Grok OAuth 配置。默认值对齐当前 xAI CLI/Grok OAuth；
@@ -685,12 +671,12 @@ def _deep_merge_defaults(base: dict, override: dict) -> dict:
 
 
 def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
-    """把旧版 oauth.providers.openai 自动补齐到新版 openaiOAuth。
+    """Migrate OpenAI OAuth config and select the packaged current Codex profile.
 
-    新配置入口更短：openaiOAuth。为了兼容已经部署的旧 config.json，
-    当原始配置没有写 openaiOAuth 键时，把旧层级的值复制过去并持久化。
-    只要原始配置显式存在新入口（即使值恰好等于默认配置），新入口就始终
-    优先；旧层级保留读取兼容，不删除。
+    ``codexProfileAutoUpdate=true`` (the default) tracks the data-only
+    ``codex_profiles/current.json`` pointer.  This upgrades existing deployments
+    without embedding a release number in Python.  Operators may explicitly pin
+    a reviewed version/profile pair by setting the switch to ``false``.
     """
     raw = raw if isinstance(raw, dict) else {}
     legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
@@ -699,30 +685,56 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
     current = cfg.get("openaiOAuth") if isinstance(cfg.get("openaiOAuth"), dict) else {}
     default = DEFAULT_CONFIG.get("openaiOAuth") if isinstance(DEFAULT_CONFIG.get("openaiOAuth"), dict) else {}
     if "openaiOAuth" in raw:
-        # 新入口键已经存在：只做默认字段补齐，避免旧层级反向覆盖新配置。
-        # 即使显式值类型错误，也不能让 legacy 配置悄悄取代用户的新入口。
         merged = _deep_merge_defaults(default, current)
     elif legacy:
-        # 老配置升级：旧层级覆盖默认值，作为新版 openaiOAuth 初始值。
         merged = _deep_merge_defaults(default, legacy)
     else:
         merged = _deep_merge_defaults(default, current)
-    # ``isolateSessionId`` used to gate a downstream-key-derived 16-hex wire ID.
-    # Per-OAuth identity is now invariant, so the obsolete OpenAI switch is
-    # consumed as migration input and removed instead of remaining a fake bypass.
-    merged.pop("isolateSessionId", None)
+
+    # These switches either bypassed mandatory Codex identity or advertised a
+    # transport fingerprint implementation that never existed.  Remove them from
+    # both accepted OpenAI config paths; xAI's isolateSessionId is unrelated.
+    obsolete_keys = (
+        "forceCodexCLI", "enableTLSFingerprint", "isolateSessionId",
+        "codexDeviceConvergenceEnabled",
+    )
+    changed = False
+    for obsolete in obsolete_keys:
+        merged.pop(obsolete, None)
+        if obsolete in legacy:
+            legacy.pop(obsolete, None)
+            changed = True
+    identity_cfg = merged.get("codexIdentity")
+    if isinstance(identity_cfg, dict):
+        identity_cfg.pop("protocolProfile", None)
+
+    auto_update = merged.get("codexProfileAutoUpdate", True)
+    if not isinstance(auto_update, bool):
+        raise ValueError("openaiOAuth.codexProfileAutoUpdate must be boolean")
+    if auto_update:
+        from .openai.codex_constants import current_codex_protocol_profile
+
+        selected = current_codex_protocol_profile()
+        merged["codexProtocolProfile"] = selected.profile_id
+        merged["codexCliVersion"] = selected.client_version
+
     if current != merged:
         cfg["openaiOAuth"] = merged
-        return True
-    return False
+        changed = True
+    return changed
 
 
 def _normalize_codex_device_accounts(cfg: dict) -> bool:
     """Migrate OpenAI workspaces to versioned, owner-bound Codex identities."""
     from .openai.codex_identity import normalize_account_identities
 
-    identity_cfg = (cfg.get("openaiOAuth") or {}).get("codexIdentity") or {}
-    profile = str(identity_cfg.get("protocolProfile") or "rust-v0.153.4")
+    provider_cfg = cfg.get("openaiOAuth") or {}
+    identity_cfg = provider_cfg.get("codexIdentity") or {}
+    profile = str(provider_cfg.get("codexProtocolProfile") or "").strip()
+    if not profile:
+        # Pinned invalid configs fail closed at Codex dispatch.  Identity
+        # normalization must not invent a release identifier of its own.
+        return False
     generation_version = identity_cfg.get("newIdentityGenerationVersion", 1)
     return normalize_account_identities(
         cfg.get("oauthAccounts") or [],

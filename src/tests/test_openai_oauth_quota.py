@@ -1367,7 +1367,14 @@ def test_probe_usage_writes_snapshot_in_mock_mode(m):
     m["registry"].rebuild_from_config()
     ch = m["registry"].get_channel("oauth:openai:probe@openai.test:acct-probe@openai.test")
     import asyncio
-    res = asyncio.run(ch.probe_usage())
+    gated = asyncio.run(ch.probe_usage(explicit=True))
+    assert gated["ok"] is False
+    m["config"].update(lambda cfg: cfg.setdefault("openaiOAuth", {}).setdefault(
+        "quotaProbe", {},
+    ).update({"enabled": True}))
+    not_explicit = asyncio.run(ch.probe_usage())
+    assert not_explicit["ok"] is False
+    res = asyncio.run(ch.probe_usage(explicit=True))
     assert res["ok"] is True, res
     assert res.get("reason") == "mock"
     row = m["state_db"].quota_load("openai:probe@openai.test:acct-probe@openai.test")
@@ -1376,7 +1383,7 @@ def test_probe_usage_writes_snapshot_in_mock_mode(m):
     assert row["codex_secondary_used_pct"] == 1.0
     assert row["seven_day_util"] == 3.0     # primary window=10080 → 7d
     assert row["five_hour_util"] == 1.0     # secondary window=300 → 5h
-    print("  [PASS] probe_usage(mockMode): synthesized snapshot, no real HTTP")
+    print("  [PASS] probe_usage(mockMode): explicit+enabled gate, snapshot, no HTTP")
 
 
 def test_delete_account_clears_codex_snapshot_throttle(m):

@@ -49,7 +49,11 @@ from .oauth import antigravity as antigravity_provider
 from .oauth import cursor as cursor_provider
 from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
-from .openai.codex_constants import codex_cli_version
+from .openai.codex_constants import (
+    codex_backend_base_url,
+    codex_cli_version,
+    codex_protocol_profile,
+)
 from .transform.cc_mimicry import CLI_USER_AGENT
 
 
@@ -551,7 +555,11 @@ def _save_token_fields_serialized(account_key: str, new: dict) -> bool:
             acc.update(new)
             if _acc_provider(acc) == "openai":
                 from .openai.codex_device_fingerprint import normalize_account_device
-                normalize_account_device(acc)
+                provider_cfg = cfg.get("openaiOAuth") or {}
+                normalize_account_device(
+                    acc,
+                    protocol_profile=codex_protocol_profile(provider_cfg).profile_id,
+                )
             if acc.get("disabled_reason") == "auth_error":
                 acc["disabled_reason"] = None
                 acc["disabled_until"] = None
@@ -3033,10 +3041,11 @@ def _openai_metadata_patch(entry: dict) -> dict:
     if "codexIdentity" in entry:
         patch["codexIdentity"] = copy.deepcopy(entry.get("codexIdentity"))
     candidate = {"provider": "openai", **patch}
-    identity_cfg = (config.get().get("openaiOAuth") or {}).get("codexIdentity") or {}
+    provider_cfg = config.get().get("openaiOAuth") or {}
+    identity_cfg = provider_cfg.get("codexIdentity") or {}
     normalize_account_identity(
         candidate,
-        protocol_profile=str(identity_cfg.get("protocolProfile") or "rust-v0.153.4"),
+        protocol_profile=codex_protocol_profile(provider_cfg).profile_id,
         new_identity_generation_version=identity_cfg.get(
             "newIdentityGenerationVersion", 1
         ),
@@ -3248,6 +3257,16 @@ def _add_account_serialized(entry: dict) -> None:
         normalized["last_model_sync_client_version"] = str(
             entry.get("last_model_sync_client_version") or ""
         )
+        normalized["last_model_sync_profile"] = str(
+            entry.get("last_model_sync_profile") or ""
+        )
+        normalized["models_etag"] = str(entry.get("models_etag") or "")
+        normalized["models_etag_client_version"] = str(
+            entry.get("models_etag_client_version") or ""
+        )
+        normalized["models_etag_profile"] = str(
+            entry.get("models_etag_profile") or ""
+        )
     # xAI 专属字段（缺失时保持空串；subject 用于稳定 account_key）
     elif provider == "xai":
         subject = str(entry.get("subject") or entry.get("sub") or "")
@@ -3450,7 +3469,8 @@ def _add_account_serialized(entry: dict) -> None:
                     "cursor_disabled_models", "cursor_max_context_disabled_models",
                     "last_model_sync", "last_model_sync_source",
                     "last_model_sync_error", "last_model_sync_attempt",
-                    "last_model_sync_client_version",
+                    "last_model_sync_client_version", "last_model_sync_profile",
+                    "models_etag", "models_etag_client_version", "models_etag_profile",
                 ) if key in target
             }
             keep_max = target.get("maxConcurrent")
@@ -4155,7 +4175,7 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
 
 
 def _provider_default_models(provider: str) -> tuple[list[str], str]:
-    """Return configured stateless fallback, then built-in fallback if empty."""
+    """Return an explicit provider fallback; OpenAI falls back only to its profile."""
     cfg = config.get()
     section = {
         "openai": "openaiOAuth",
@@ -4173,6 +4193,13 @@ def _provider_default_models(provider: str) -> tuple[list[str], str]:
     ))
     if models:
         return models, "default:configured"
+    if provider == "openai":
+        try:
+            profile = codex_protocol_profile()
+        except Exception:
+            # Invalid pinned configuration must not revive a mutable Python fallback.
+            return [], "profile:unavailable"
+        return list(profile.models), f"profile:{profile.profile_id}"
     return list(dict.fromkeys(
         str(model).strip() for model in built_in if str(model).strip()
     )), "default:built-in"
@@ -4359,7 +4386,13 @@ def _discovery_generation(account: dict) -> str:
     provider = provider_of(account)
     # A hot Codex identity change invalidates any in-flight model fetch as well
     # as the six-hour success TTL checked by ``_model_sync_due``.
-    client_identity = codex_cli_version() if provider == "openai" else ""
+    if provider == "openai":
+        profile = codex_protocol_profile()
+        client_identity = "\0".join((
+            profile.profile_id, profile.client_version, codex_backend_base_url(),
+        ))
+    else:
+        client_identity = ""
     raw = "\0".join((
         _canonical_key(account), provider,
         str(account.get("access_token") or ""),
@@ -4457,6 +4490,38 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
         _persist_model_discovery_failure(canonical, generation, error)
         return {"action": "error", "account_key": canonical, "error": error}
 
+    if provider == "openai" and getattr(result, "not_modified", False):
+        existing_models = _model_ids(account)
+        if not existing_models or not _model_catalog_complete(account, existing_models):
+            _persist_model_discovery_failure(canonical, generation, "empty catalog")
+            return {"action": "empty", "account_key": canonical}
+        now = _format_utc(datetime.now(timezone.utc))
+        saved = {"value": False}
+
+        def refresh_lkg(cfg):
+            for item in cfg.get("oauthAccounts", []):
+                if _canonical_key(item) != canonical or _discovery_generation(item) != generation:
+                    continue
+                item["last_model_sync"] = now
+                item["last_model_sync_attempt"] = now
+                item["last_model_sync_source"] = result.source
+                item["last_model_sync_error"] = ""
+                item["last_model_sync_client_version"] = str(result.client_version or "")
+                item["last_model_sync_profile"] = str(result.profile_id or "")
+                if str(result.etag or ""):
+                    item["models_etag"] = str(result.etag)
+                    item["models_etag_client_version"] = str(result.client_version or "")
+                    item["models_etag_profile"] = str(result.profile_id or "")
+                saved["value"] = True
+                return
+
+        config.update(refresh_lkg, skip_if_unchanged=True)
+        return {
+            "action": "not_modified" if saved["value"] else "stale",
+            "account_key": canonical, "models": len(existing_models),
+            "source": result.source, "fetched_at": now,
+        }
+
     models = list(dict.fromkeys(str(model).strip() for model in result.models if str(model).strip()))
     if not models:
         _persist_model_discovery_failure(canonical, generation, "empty catalog")
@@ -4477,10 +4542,19 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
             item["last_model_sync_source"] = result.source
             item["last_model_sync_error"] = ""
             if provider == "openai":
-                item["last_model_sync_client_version"] = (
+                result_version = (
                     str(getattr(result, "client_version", "") or "")
                     or codex_cli_version()
                 )
+                result_profile = (
+                    str(getattr(result, "profile_id", "") or "")
+                    or codex_protocol_profile().profile_id
+                )
+                item["last_model_sync_client_version"] = result_version
+                item["last_model_sync_profile"] = result_profile
+                item["models_etag"] = str(getattr(result, "etag", "") or "")
+                item["models_etag_client_version"] = result_version
+                item["models_etag_profile"] = result_profile
             saved["value"] = True
             return
 
@@ -4570,6 +4644,115 @@ async def refresh_account_models(
         with _model_discovery_tasks_guard:
             if _model_discovery_flights.get(canonical) is flight:
                 _model_discovery_flights.pop(canonical, None)
+
+
+_codex_catalog_observation_lock = threading.Lock()
+_codex_catalog_refresh_pending: set[tuple[str, str]] = set()
+_codex_catalog_refresh_last: dict[tuple[str, str], float] = {}
+_CODEX_CATALOG_REFRESH_DEBOUNCE_SECONDS = 60.0
+
+
+def _observed_header(headers: Any, *names: str) -> str:
+    wanted = {name.lower() for name in names}
+    try:
+        items = headers.items()
+    except Exception:
+        return ""
+    for raw_name, raw_value in items:
+        if str(raw_name).lower() not in wanted:
+            continue
+        value = str(raw_value or "").strip()
+        if value and len(value) <= 512 and "\r" not in value and "\n" not in value:
+            return value
+    return ""
+
+
+def observe_openai_response_metadata(
+    account_key: str,
+    headers: Any,
+    translator_ctx: dict | None = None,
+) -> dict[str, Any]:
+    """Capture actual model and schedule one non-blocking catalog refresh on ETag drift."""
+    actual_model = _observed_header(headers, "openai-model", "x-openai-model")
+    if actual_model and isinstance(translator_ctx, dict):
+        translator_ctx["codex_actual_model"] = actual_model
+
+    etag = _observed_header(headers, "x-models-etag")
+    if not etag:
+        return {"actual_model": actual_model, "refresh_scheduled": False}
+    try:
+        canonical = _resolve_existing_account_key_or_raise(account_key)
+        account = get_account(canonical)
+        if not isinstance(account, dict) or provider_of(account) != "openai":
+            return {"actual_model": actual_model, "refresh_scheduled": False}
+        profile = codex_protocol_profile()
+        cached_matches_scope = (
+            str(account.get("models_etag_client_version") or "") == profile.client_version
+            and str(account.get("models_etag_profile") or "") == profile.profile_id
+        )
+        if cached_matches_scope and str(account.get("models_etag") or "") == etag:
+            return {"actual_model": actual_model, "refresh_scheduled": False}
+        generation = _discovery_generation(account)
+        key = (canonical, generation)
+        now = time.monotonic()
+        with _codex_catalog_observation_lock:
+            if (
+                key in _codex_catalog_refresh_pending
+                or now - _codex_catalog_refresh_last.get(key, 0.0)
+                < _CODEX_CATALOG_REFRESH_DEBOUNCE_SECONDS
+            ):
+                return {"actual_model": actual_model, "refresh_scheduled": False}
+            loop = asyncio.get_running_loop()
+            _codex_catalog_refresh_pending.add(key)
+            _codex_catalog_refresh_last[key] = now
+
+        async def refresh_observed_catalog() -> None:
+            try:
+                await refresh_account_models(canonical)
+            except Exception:
+                # Response observation is auxiliary; the existing LKG remains usable.
+                pass
+            finally:
+                with _codex_catalog_observation_lock:
+                    _codex_catalog_refresh_pending.discard(key)
+
+        loop.create_task(
+            refresh_observed_catalog(),
+            name="codex-model-catalog-etag-refresh",
+        )
+        return {"actual_model": actual_model, "refresh_scheduled": True}
+    except Exception:
+        return {"actual_model": actual_model, "refresh_scheduled": False}
+
+
+def observe_openai_response_event(
+    account_key: str,
+    frame: str | bytes | dict,
+    translator_ctx: dict | None = None,
+) -> dict[str, Any]:
+    """Observe official WS response headers without rewriting the frame."""
+    try:
+        if isinstance(frame, bytes):
+            event = json.loads(frame.decode("utf-8"))
+        elif isinstance(frame, str):
+            event = json.loads(frame)
+        else:
+            event = frame
+    except Exception:
+        return {"actual_model": "", "refresh_scheduled": False}
+    if not isinstance(event, dict):
+        return {"actual_model": "", "refresh_scheduled": False}
+    merged: dict[str, Any] = {}
+    top_headers = event.get("headers")
+    if isinstance(top_headers, dict):
+        merged.update(top_headers)
+    response = event.get("response")
+    response_headers = response.get("headers") if isinstance(response, dict) else None
+    if isinstance(response_headers, dict):
+        merged.update(response_headers)
+    if not merged:
+        return {"actual_model": "", "refresh_scheduled": False}
+    return observe_openai_response_metadata(account_key, merged, translator_ctx)
 
 
 def start_account_model_refresh(
@@ -4765,12 +4948,15 @@ def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
     failed = bool(account.get("last_model_sync_error"))
     if failed and last_attempt is not None:
         return (now - last_attempt.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS
-    if (
-        provider_of(account) == "openai"
-        and str(account.get("last_model_sync_client_version") or "")
-        != codex_cli_version()
-    ):
-        return True
+    if provider_of(account) == "openai":
+        profile = codex_protocol_profile()
+        if (
+            str(account.get("last_model_sync_client_version") or "")
+            != profile.client_version
+            or str(account.get("last_model_sync_profile") or "")
+            != profile.profile_id
+        ):
+            return True
     model_ids = _model_ids(account)
     if not model_ids or last_success is None or not _model_catalog_complete(account, model_ids):
         return True
