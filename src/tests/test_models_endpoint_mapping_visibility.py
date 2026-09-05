@@ -33,7 +33,7 @@ def test_models_endpoint_exposes_only_global_mapping_aliases(monkeypatch):
         lambda headers: ("test-key", None, None),
     )
     monkeypatch.setattr(
-        parrot_server.registry, "available_models",
+        parrot_server.registry, "discovery_models",
         lambda: ["claude-opus-4-8", "gpt-5.6-sol"],
     )
     monkeypatch.setattr(
@@ -61,7 +61,7 @@ def test_models_endpoint_does_not_expose_global_alias_with_missing_target(monkey
         lambda headers: ("test-key", None, None),
     )
     monkeypatch.setattr(
-        parrot_server.registry, "available_models",
+        parrot_server.registry, "discovery_models",
         lambda: ["real-present"],
     )
     monkeypatch.setattr(
@@ -81,7 +81,7 @@ def test_models_endpoint_isolated_from_oauth_catalog_and_metadata_bindings(monke
         parrot_server.auth, "validate", lambda headers: ("test-key", None, None),
     )
     monkeypatch.setattr(
-        parrot_server.registry, "available_models", lambda: ["routable-only"],
+        parrot_server.registry, "discovery_models", lambda: ["routable-only"],
     )
     monkeypatch.setattr(parrot_server.model_mapping, "get_global_map", lambda: {})
     monkeypatch.setattr(

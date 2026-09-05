@@ -6,7 +6,7 @@
   - Grok/xAI  OAuth → cfg["xaiOAuth"]["defaultModels"]
   - Antigravity OAuth → cfg["antigravityOAuth"]["defaultModels"]
 
-语义: OAuth 账户 entry 未手动填 models 时的回落列表。改完走 `config.update`
+语义: 公开 /v1/models 的 OAuth 展示选择，同时保留账户无目录时的兜底用途。改完走 `config.update`
 自动触发 registry 重建, 热生效。
 
 ⚠ 删除模型的安全保护:
@@ -414,7 +414,8 @@ def _overview_text() -> str:
         "🧬 <b>默认模型</b>",
         "",
         "这里维护各 Provider 的普通模型 ID 字符串列表。",
-        "仅当某个 OAuth 账户没有可用的实时/LKG 目录时，才作为该账户的无状态兜底；账户故障不会反向修改此列表。",
+        "用于 /v1/models 的 OAuth 展示，仅列出同 Provider 启用账户实际支持的默认 ID；清空后该 Provider 不贡献展示项。",
+        "同时保留账户没有实时/LKG 目录时的无状态兜底用途；不限制已有账户目录中非默认模型的显式调用，账户故障不会反向修改此列表。",
         "Cursor 仍按账号自动同步，不在这里改。",
         "",
     ]
