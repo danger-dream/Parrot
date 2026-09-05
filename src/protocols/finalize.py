@@ -81,7 +81,14 @@ def error_plan(
     *,
     failure_policy: FailurePolicy = "runtime",
     clear_reasoning_replay: bool = False,
+    http_status: int | None = None,
 ) -> FinalizePlan:
+    # A 404 may be tied to request/session state (for example a stale Codex
+    # previous_response_id).  It remains a scored failed attempt, but must not
+    # turn the entire channel/model into a cooldown merely because adapters use
+    # the generic ``http_error`` outcome.
+    record_cooldown_error = should_cooldown(outcome) and http_status != 404
+
     if failure_policy == "post_commit_stream":
         # A committed partial response remains an error, but request faults and
         # connection lifecycle ends are not evidence of unhealthy credentials.
@@ -89,7 +96,7 @@ def error_plan(
             "request_invalid", "client_disconnected", "connection_lifecycle",
         }
     elif failure_policy == "cooldown_only":
-        record_failure = should_cooldown(outcome)
+        record_failure = record_cooldown_error
     else:
         record_failure = should_record_failure(outcome)
 
@@ -97,7 +104,7 @@ def error_plan(
         terminal="error",
         log_error=True,
         record_failure=record_failure,
-        record_cooldown_error=should_cooldown(outcome),
+        record_cooldown_error=record_cooldown_error,
         clear_reasoning_replay=clear_reasoning_replay,
     )
 

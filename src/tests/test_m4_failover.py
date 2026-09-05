@@ -125,6 +125,16 @@ def http_402(secret: str = "sk-never-leak"):
     })
 
 
+def http_404():
+    return httpx.Response(404, json={
+        "error": {
+            "type": "not_found_error",
+            "code": "response_not_found",
+            "message": "The requested response was not found",
+        },
+    })
+
+
 def http_channel_400():
     return httpx.Response(400, json={
         "type": "error",
@@ -603,6 +613,36 @@ async def test_all_fail_503(m):
     assert log["log"]["status"] == "error"
     assert len(log["retry_chain"]) == 2
     print("  [PASS] all_fail → 503")
+
+
+async def test_all_404_preserves_not_found_and_does_not_cool_channels(m):
+    _setup(m)
+    router = MockRouter()
+    router.register("https://cha", lambda r: http_404())
+    router.register("https://chb", lambda r: http_404())
+    chA = _make_openai_channel("chA", "https://cha")
+    chB = _make_openai_channel("chB", "https://chb")
+    _install_channels(m, [chA, chB])
+
+    body = {
+        "model": "gpt-5.5",
+        "stream": False,
+        "input": [{"role": "user", "content": "continue"}],
+    }
+    resp, rid, sr, mc = await _call_proxy(
+        m, router, body, ingress_protocol="responses",
+    )
+    assert resp.status_code == 404
+    payload = json.loads(resp.body)
+    assert payload["error"]["type"] == "not_found_error"
+    assert payload["error"]["details"]["root_cause"]["status"] == 404
+    await mc.aclose()
+
+    assert not m["cooldown"].is_blocked(chA.key, "gpt-5.5")
+    assert not m["cooldown"].is_blocked(chB.key, "gpt-5.5")
+    log = m["log_db"].log_detail(rid)
+    assert log["log"]["http_status"] == 404
+    assert len(log["retry_chain"]) == 2
 
 
 async def test_402_switches_candidate_and_all_402_preserves_terminal_status(m):

@@ -1324,6 +1324,7 @@ async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatc
         ([401, 403], 403, 4403),
         ([403, 401], 403, 4403),
         ([402, 402], 402, 4400),
+        ([404, 404], 404, 4404),
         ([429, 429], 429, 4429),
         ([401, 429], 503, 4500),
         ([500, 429], 503, 4500),
@@ -1415,6 +1416,12 @@ async def test_responses_ws_exhausted_candidates_use_finite_terminal_rule_and_sa
     assert frame["message"] == ws.close_calls[-1][1]
     assert set(frame["error"]) >= {"type", "code", "message"}
     assert frame["error"]["message"] == frame["message"]
+    if set(statuses) == {404}:
+        assert frame["error"]["type"] == "not_found_error"
+        assert all(
+            not m["cooldown"].is_blocked(ch.key, "real-model")
+            for ch in channels
+        )
     parsed = m["responses_ws"]._parse_wrapped_ws_error(json.dumps(frame))
     assert parsed == {
         "status": expected_status,
@@ -1444,10 +1451,12 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
     async def fake_token(account_key):
         return "tok"
 
-    recorded = {}
+    recorded = []
     def fake_record(channel, response):
-        recorded["channel"] = channel.key
-        recorded["headers"] = dict(response.headers)
+        recorded.append({
+            "channel": channel.key,
+            "headers": dict(response.headers),
+        })
 
     monkeypatch.setattr(m["responses_ws"].oauth_manager, "ensure_valid_token", fake_token)
     monkeypatch.setattr(m["failover"], "_maybe_record_codex_snapshot", fake_record)
@@ -1456,7 +1465,12 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
         {"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "ok"},
         {"type": "response.completed", "response": {"id": "resp", "output": [], "usage": {}}},
     ])
-    fake_upstream.response = SimpleNamespace(headers={"x-codex-primary-used-percent": "12"})
+    from websockets.datastructures import Headers
+    upgrade_headers = Headers()
+    upgrade_headers["x-codex-primary-used-percent"] = "12"
+    upgrade_headers["Set-Cookie"] = "session=a"
+    upgrade_headers["Set-Cookie"] = "affinity=b"
+    fake_upstream.response = SimpleNamespace(headers=upgrade_headers)
 
     async def fake_connect(url, *, headers, connector, proxy_bytes, open_timeout, timing=None, round_timeouts=None):
         return fake_upstream
@@ -1464,8 +1478,13 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
     monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", fake_connect)
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
-    assert recorded["channel"] == ch.key
-    assert recorded["headers"]["x-codex-primary-used-percent"] == "12"
+    assert recorded[0]["channel"] == ch.key
+    assert recorded[0]["headers"]["x-codex-primary-used-percent"] == "12"
+    # The HTTP-ingress → upstream-WS path uses the sibling adapter and must
+    # tolerate the same legal repeated Set-Cookie response headers.
+    m["failover"]._maybe_record_codex_ws_snapshot(ch, fake_upstream.response)
+    assert len(recorded) == 2
+    assert recorded[1]["headers"]["x-codex-primary-used-percent"] == "12"
     assert not ws.close_calls
 
 

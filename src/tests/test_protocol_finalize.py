@@ -93,6 +93,20 @@ def test_runtime_error_plan_matches_attempt_health_policy():
     assert upstream.record_cooldown_error is True
 
 
+def test_http_404_is_scored_but_does_not_cool_the_channel():
+    not_found = finalize.error_plan(
+        "http_error", failure_policy="runtime", http_status=404,
+    )
+    assert not_found.record_failure is True
+    assert not_found.record_cooldown_error is False
+
+    server_error = finalize.error_plan(
+        "http_error", failure_policy="runtime", http_status=500,
+    )
+    assert server_error.record_failure is True
+    assert server_error.record_cooldown_error is True
+
+
 def test_post_commit_stream_errors_record_failure_except_health_neutral_outcomes():
     plan = finalize.error_plan("candidate_guard", failure_policy="post_commit_stream")
 

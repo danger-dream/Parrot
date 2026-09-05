@@ -39,6 +39,7 @@ from .openai.responses_ws_runtime import (
     build_oauth_responses_ws_frame,
     drop_headers_case_insensitive,
     ensure_oauth_responses_ws_session_headers,
+    flatten_ws_response_headers,
     get_header_case_insensitive,
     identity_expose_frame,
     identity_log_text,
@@ -2150,7 +2151,11 @@ async def run_failover(
             error_detail=result.error_detail,
         )
         if quota_reset_ms is not None:
-            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            plan = finalize_policy.error_plan(
+                result.outcome,
+                failure_policy="runtime",
+                http_status=result.http_status,
+            )
             if plan.record_cooldown_error:
                 cooldown.record_error(
                     channel_state.effect_key(ch),
@@ -2199,7 +2204,11 @@ async def run_failover(
 
         # 普通失败处理；HTML 403 只推进候选，不归咎账号或渠道健康。
         if not result.openai_oauth_html_403:
-            plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+            plan = finalize_policy.error_plan(
+                result.outcome,
+                failure_policy="runtime",
+                http_status=result.http_status,
+            )
             finalize_policy.apply_error_health_effects(
                 plan,
                 scorer=scorer,
@@ -2371,7 +2380,11 @@ async def run_failover(
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
                 if not result.openai_oauth_html_403:
-                    plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+                    plan = finalize_policy.error_plan(
+                        result.outcome,
+                        failure_policy="runtime",
+                        http_status=result.http_status,
+                    )
                     finalize_policy.apply_error_health_effects(
                         plan,
                         scorer=scorer,
@@ -2420,6 +2433,11 @@ async def run_failover(
     ):
         status = 403
         err_type = "api_error"
+    elif structured_attempts and {
+        item.get("status") for item in structured_attempts
+    } == {404}:
+        status = 404
+        err_type = protocol_errors.legacy_anthropic_error_type_for_http_status(404)
     elif structured_attempts and classifications <= {"authentication_error", "permission_error"}:
         statuses = {item.get("status") for item in structured_attempts}
         status = 401 if statuses == {401} else 403
@@ -2666,7 +2684,7 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
         headers_obj = getattr(ws_response, "headers", None)
         if not headers_obj:
             return
-        headers = {str(k): str(v) for k, v in headers_obj.items()}
+        headers = flatten_ws_response_headers(headers_obj)
         fake_resp = type("_WsResp", (), {"headers": headers})()
         _maybe_record_codex_snapshot(ch, fake_resp)
     except Exception as exc:
@@ -3644,7 +3662,11 @@ async def _finalize_oauth_ws_error(
     timing: WsAttemptTiming,
 ) -> None:
     result = _request_invalid_result_if_needed(result)
-    plan = finalize_policy.error_plan(result.outcome, failure_policy="cooldown_only")
+    plan = finalize_policy.error_plan(
+        result.outcome,
+        failure_policy="cooldown_only",
+        http_status=result.http_status,
+    )
     finalize_policy.apply_error_health_effects(
         plan,
         scorer=scorer,
@@ -4973,7 +4995,11 @@ async def _consume_stream(
         # 不是渠道健康问题，即使在流中途才被上游明确揭示，也按 runtime
         # request_invalid 语义处理，避免误伤渠道评分/冷却。
         failure_policy = "runtime" if outcome == "request_invalid" else "post_commit_stream"
-        plan = finalize_policy.error_plan(outcome, failure_policy=failure_policy)
+        plan = finalize_policy.error_plan(
+            outcome,
+            failure_policy=failure_policy,
+            http_status=(400 if outcome == "request_invalid" else upstream_status),
+        )
         finalize_policy.apply_error_health_effects(
             plan,
             scorer=scorer,

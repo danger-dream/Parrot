@@ -62,6 +62,28 @@ def get_header_case_insensitive(headers: dict[str, str] | None, key: str) -> str
     return ""
 
 
+def flatten_ws_response_headers(headers: Any) -> dict[str, str]:
+    """Flatten WS handshake headers without failing on repeated fields.
+
+    ``websockets.Headers.items()`` raises ``MultipleValuesError`` for legal
+    repeated response fields such as ``Set-Cookie``.  ``raw_items()`` preserves
+    those wire entries; converting the resulting pairs to a plain dict is safe
+    for Codex quota parsing because it reads only single-valued ``x-codex-*``
+    fields.
+    """
+    if headers is None:
+        return {}
+    raw_items = getattr(headers, "raw_items", None)
+    if callable(raw_items):
+        items = raw_items()
+    else:
+        items_method = getattr(headers, "items", None)
+        if not callable(items_method):
+            return {}
+        items = items_method()
+    return {str(key): str(value) for key, value in items}
+
+
 def merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in (headers or {}).items():

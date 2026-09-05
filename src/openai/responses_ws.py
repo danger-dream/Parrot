@@ -100,6 +100,7 @@ from .handler import (
 )
 from .responses_ws_runtime import (
     dump_frame,
+    flatten_ws_response_headers,
     identity_expose_frame,
     identity_log_text,
     loads_frame,
@@ -916,7 +917,11 @@ async def _run_ws_failover(
         )
         if not result.openai_oauth_html_403:
             finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                finalize_policy.error_plan(
+                    result.outcome,
+                    failure_policy="runtime",
+                    http_status=result.http_status,
+                ),
                 scorer=scorer,
                 cooldown=cooldown,
                 channel_key=channel_state.effect_key(ch),
@@ -1048,7 +1053,11 @@ async def _run_ws_failover(
                 )
                 if not result.openai_oauth_html_403:
                     finalize_policy.apply_error_health_effects(
-                        finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                        finalize_policy.error_plan(
+                            result.outcome,
+                            failure_policy="runtime",
+                            http_status=result.http_status,
+                        ),
                         scorer=scorer,
                         cooldown=cooldown,
                         channel_key=channel_state.effect_key(ch),
@@ -2081,7 +2090,11 @@ async def _try_sse_channel(
             ))
         else:
             finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                finalize_policy.error_plan(
+                    result.outcome,
+                    failure_policy="runtime",
+                    http_status=result.http_status,
+                ),
                 scorer=scorer,
                 cooldown=cooldown,
                 channel_key=channel_state.effect_key(ch),
@@ -2637,7 +2650,11 @@ async def _relay_ws_session(
             ))
         else:
             finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(result.outcome, failure_policy="runtime"),
+                finalize_policy.error_plan(
+                    result.outcome,
+                    failure_policy="runtime",
+                    http_status=result.http_status,
+                ),
                 scorer=scorer,
                 cooldown=cooldown,
                 channel_key=channel_state.effect_key(ch),
@@ -3183,7 +3200,7 @@ def _maybe_record_codex_ws_snapshot(ch: Channel, ws_response: Any) -> None:
         headers_obj = getattr(ws_response, "headers", None)
         if not headers_obj:
             return
-        headers = {str(k): str(v) for k, v in headers_obj.items()}
+        headers = flatten_ws_response_headers(headers_obj)
         from .. import failover
         # Reuse HTTP failover's response-header path so passive quota snapshot,
         # threshold auto-disable, and notification behavior stay identical.
@@ -3203,7 +3220,11 @@ async def _finalize_ws_attempt_after_accept(
     start_time: float,
     start_monotonic: float,
 ) -> None:
-    plan = finalize_policy.error_plan(result.outcome, failure_policy="runtime")
+    plan = finalize_policy.error_plan(
+        result.outcome,
+        failure_policy="runtime",
+        http_status=result.http_status,
+    )
     finalize_policy.apply_error_health_effects(
         plan,
         scorer=scorer,
@@ -3379,6 +3400,7 @@ async def _send_terminal_error_frame(
         "authentication_error" if http_status == 401 else
         "permission_error" if http_status == 403 else
         "payment_required" if http_status == 402 else
+        "not_found_error" if http_status == 404 else
         "rate_limit_error" if http_status == 429 else
         "api_error"
     )
@@ -3523,6 +3545,8 @@ def _aggregate_failed_candidate_status(statuses: list[int]) -> int:
         return 403
     if unique == {402}:
         return 402
+    if unique == {404}:
+        return 404
     if unique == {429}:
         return 429
     return 503
@@ -3535,6 +3559,7 @@ def _safe_terminal_failure_message(http_status: int, *, attempted: bool) -> str:
         401: "All upstream candidates rejected authentication",
         402: "All upstream candidates reported insufficient balance",
         403: "All upstream candidates denied permission",
+        404: "All upstream candidates reported the requested resource was not found",
         429: "All upstream candidates are rate limited",
     }
     return summaries.get(http_status, "Upstream candidates failed")

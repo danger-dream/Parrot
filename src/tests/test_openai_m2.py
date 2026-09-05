@@ -424,8 +424,8 @@ async def test_allowed_protocols_legacy_config_is_ignored(m):
 # 以真实上游 mock 验证端到端行为。
 
 
-async def test_no_candidates_family_filtered(m):
-    """Key 无限制，但 ingress=chat 且 registry 里只有 anthropic 渠道 → 无候选 → 404 (model never supported)."""
+async def test_family_translated_all_404_is_preserved(m):
+    """A routed cross-family candidate's upstream 404 remains 404 after exhaustion."""
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -435,10 +435,12 @@ async def test_no_candidates_family_filtered(m):
 
     body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
     resp, mc = await _call_openai_handler(m, router, "chat", body)
-    # model 在 anthropic 渠道中存在 → 不是 NOT_FOUND；是 SERVER/503
-    assert resp.status_code == 503
+    # The model exists and the candidate is attempted through cross-family
+    # translation. Its mock upstream returns 404; an all-404 terminal now keeps
+    # that exact not-found result instead of relabeling it as an internal 503.
+    assert resp.status_code == 404
     await mc.aclose()
-    print("  [PASS] family filter: anthropic-only registry returns 503 for chat ingress")
+    print("  [PASS] cross-family all-404 terminal preserves 404")
 
 
 def test_model_permissions_do_not_depend_on_allowed_protocols(m):
