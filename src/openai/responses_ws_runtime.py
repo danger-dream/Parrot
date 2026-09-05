@@ -7,17 +7,22 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..channel.compatibility import apply_forced_openai_fast_mode
-from ..channel.openai_oauth_channel import OpenAIOAuthChannel, _isolate_session_id
+from ..channel.openai_oauth_channel import (
+    OpenAIOAuthChannel,
+    _isolate_session_id,
+    _provider_cfg,
+)
 from ..openai.transform import codex_oauth_transform
 from ..providers import registry as provider_registry
 from ..transports.ws_runtime import http_url_to_ws
 from .codex_constants import (
-    CODEX_ORIGINATOR,
     CODEX_RESPONSES_LITE_WS_METADATA_KEY,
-    RESPONSES_WEBSOCKETS_BETA,
+    CodexModelPolicy,
     codex_cli_user_agent,
     codex_cli_version,
-    codex_model_uses_responses_lite,
+    codex_originator,
+    codex_responses_websocket_beta,
+    resolve_codex_model_policy,
 )
 from .codex_device_fingerprint import apply_device_fingerprint
 from .codex_identity_confuse import (
@@ -91,8 +96,8 @@ def merge_oauth_responses_ws_headers(headers: dict[str, str]) -> dict[str, str]:
         if lk in SKIP_OAUTH_WS_HEADERS:
             continue
         out[str(k)] = str(v)
-    out["OpenAI-Beta"] = RESPONSES_WEBSOCKETS_BETA
-    out.setdefault("originator", CODEX_ORIGINATOR)
+    out["OpenAI-Beta"] = codex_responses_websocket_beta()
+    out.setdefault("originator", codex_originator())
     out.setdefault("version", codex_cli_version())
     # The channel-built header already used the same provider-config snapshot.
     # Preserve it across canonical casing instead of reverting to a static UA.
@@ -151,11 +156,39 @@ def _filter_responses_payload(
     return filtered
 
 
+def _channel_model_policy(channel: Any, model: str | None) -> CodexModelPolicy:
+    resolver = getattr(channel, "codex_model_policy", None)
+    if callable(resolver):
+        return resolver(str(model or ""), _provider_cfg())
+    return resolve_codex_model_policy(model, provider_config=_provider_cfg())
+
+
 def _channel_uses_responses_lite(channel: Any, model: str | None) -> bool:
-    checker = getattr(channel, "model_uses_responses_lite", None)
-    if callable(checker):
-        return bool(checker(str(model or "")))
-    return codex_model_uses_responses_lite(model)
+    return _channel_model_policy(channel, model).use_responses_lite
+
+
+def _codex_transform_policy_kwargs(channel: Any, model: str | None, body: dict) -> dict:
+    provider_config = _provider_cfg()
+    resolver = getattr(channel, "codex_model_policy", None)
+    if callable(resolver):
+        policy = resolver(str(model or ""), provider_config)
+    else:
+        policy = resolve_codex_model_policy(
+            model, provider_config=provider_config
+        )
+    base_instructions = policy.base_instructions
+    configured_default = provider_config.get("defaultInstructions")
+    if base_instructions is None and isinstance(configured_default, str):
+        base_instructions = configured_default.strip() or None
+    return {
+        "base_instructions": base_instructions,
+        "default_reasoning_effort": policy.default_reasoning_effort,
+        "default_verbosity": policy.default_verbosity,
+        "supported_reasoning_efforts": policy.reasoning_efforts,
+        "multi_agent_reasoning_effort": policy.multi_agent_reasoning_effort,
+        "lite_thread_context": str((body or {}).get("prompt_cache_key") or "").strip(),
+        "use_responses_lite": policy.use_responses_lite,
+    }
 
 
 def _mark_codex_responses_lite_frame(
@@ -164,9 +197,12 @@ def _mark_codex_responses_lite_frame(
     *,
     use_responses_lite: bool | None = None,
 ) -> None:
-    if not codex_model_uses_responses_lite(
-        model or frame_obj.get("model"), use_responses_lite,
-    ):
+    is_lite = (
+        use_responses_lite
+        if isinstance(use_responses_lite, bool)
+        else _channel_uses_responses_lite(None, model or frame_obj.get("model"))
+    )
+    if not is_lite:
         client_metadata = frame_obj.get("client_metadata")
         if isinstance(client_metadata, dict):
             client_metadata.pop(CODEX_RESPONSES_LITE_WS_METADATA_KEY, None)
@@ -182,12 +218,15 @@ def build_oauth_responses_ws_frame(body: dict, resolved_model: str, *, channel=N
     payload = _filter_responses_payload(body, channel=channel, codex=True)
     payload["model"] = resolved_model
     payload.pop("background", None)
-    responses_lite = _channel_uses_responses_lite(channel, resolved_model)
+    transform_policy = _codex_transform_policy_kwargs(
+        channel, resolved_model, payload
+    )
+    responses_lite = transform_policy["use_responses_lite"]
     payload = codex_oauth_transform.apply_codex_oauth_transform(
         payload,
         resolved_model=resolved_model,
         transport="websocket",
-        use_responses_lite=responses_lite,
+        **transform_policy,
     )
     payload["type"] = "response.create"
     _mark_codex_responses_lite_frame(
@@ -286,8 +325,8 @@ def merge_responses_ws_headers(
             continue
         out[str(k)] = str(v)
 
-    out["OpenAI-Beta"] = RESPONSES_WEBSOCKETS_BETA
-    out.setdefault("originator", CODEX_ORIGINATOR)
+    out["OpenAI-Beta"] = codex_responses_websocket_beta()
+    out.setdefault("originator", codex_originator())
     out.setdefault("version", codex_cli_version())
     configured_ua = get_header_case_insensitive(out, "user-agent")
     out = drop_headers_case_insensitive(out, {"user-agent"})
@@ -357,12 +396,13 @@ def map_ws_create_frame_for_upstream(obj: dict, model: str, *, channel=None) -> 
     if channel is not None:
         apply_forced_openai_fast_mode(channel, out, model)
     if isinstance(channel, OpenAIOAuthChannel):
-        responses_lite = _channel_uses_responses_lite(channel, model)
+        transform_policy = _codex_transform_policy_kwargs(channel, model, out)
+        responses_lite = transform_policy["use_responses_lite"]
         out = codex_oauth_transform.apply_codex_oauth_transform(
             out,
             resolved_model=model,
             transport="websocket",
-            use_responses_lite=responses_lite,
+            **transform_policy,
         )
         _mark_codex_responses_lite_frame(
             out, model, use_responses_lite=responses_lite,

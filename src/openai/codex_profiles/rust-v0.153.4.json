@@ -1,0 +1,167 @@
+{
+  "schemaVersion": 1,
+  "id": "rust-v0.153.4",
+  "source": {
+    "codexTag": "rust-v0.153.4",
+    "codexCommit": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+    "modelsSha256": "d7136a413cfac1b5b1686d9e0dcc5c80ca05bebed5e9fc3911376561d0ef6ee8"
+  },
+  "clientVersion": "0.153.4",
+  "identity": {
+    "originator": "codex_cli_rs",
+    "userAgent": "codex_cli_rs/0.153.4 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+  },
+  "protocol": {
+    "responsesWebsocketBeta": "responses_websockets=2026-02-06"
+  },
+  "models": {
+    "gpt-6-astra": {
+      "minimalClientVersion": "0.153.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low",
+      "defaultVerbosity": "low",
+      "multiAgentReasoningEffort": "xhigh",
+      "baseInstructionsFile": "rust-v0.153.4/gpt-6-astra-base-instructions.txt",
+      "baseInstructionsSha256": "152dfaeeb552876190962be1c12c93d426840ff12691f648261554a7675a6698",
+      "sourceModelProfileSha256": "0e43834e3e90ef14610a6365ac153b9f3c15226c5cf18b5cddf885d4308558ba"
+    },
+    "gpt-5.6-sol": {
+      "minimalClientVersion": "0.144.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low",
+      "defaultVerbosity": "low"
+    },
+    "gpt-5.6-terra": {
+      "minimalClientVersion": "0.144.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low"
+    },
+    "gpt-5.6-luna": {
+      "minimalClientVersion": "0.144.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low"
+    },
+    "gpt-daybreak-blue-latest": {
+      "minimalClientVersion": "0.142.2",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low",
+      "defaultVerbosity": "low"
+    },
+    "gpt-daybreak-red-latest": {
+      "minimalClientVersion": "0.142.2",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "high"
+    },
+    "gpt-5.5": {
+      "minimalClientVersion": "0.124.0",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low"
+    },
+    "gpt-5.4": {
+      "minimalClientVersion": "0.98.0",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low"
+    },
+    "gpt-5.4-mini": {
+      "minimalClientVersion": "0.98.0",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "medium"
+    },
+    "gpt-5.2": {
+      "minimalClientVersion": "0.0.1",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low"
+    },
+    "codex-auto-review": {
+      "minimalClientVersion": "0.98.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low"
+    }
+  }
+}

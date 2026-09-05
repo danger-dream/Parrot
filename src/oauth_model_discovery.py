@@ -15,9 +15,9 @@ from .oauth import cursor as cursor_provider
 from .oauth import xai as xai_provider
 from .oauth_ids import openai_workspace_id
 from .openai.codex_constants import (
-    CODEX_ORIGINATOR,
-    build_codex_cli_user_agent,
+    codex_cli_user_agent,
     codex_cli_version,
+    codex_originator,
 )
 
 _TIMEOUT = 20.0
@@ -160,8 +160,8 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     headers = {
         "authorization": f"Bearer {token}",
         "accept": "application/json",
-        "user-agent": build_codex_cli_user_agent(client_version),
-        "originator": CODEX_ORIGINATOR,
+        "user-agent": codex_cli_user_agent(),
+        "originator": codex_originator(),
         "origin": "https://chatgpt.com",
     }
     workspace = openai_workspace_id(account)

@@ -40,11 +40,11 @@ from ..oauth import normalize_provider
 from ..oauth import openai as openai_provider
 from ..oauth_ids import account_key as make_account_key
 from .codex_constants import (
-    CODEX_ORIGINATOR,
     CODEX_ROUTING_HINT_HEADER,
     build_codex_routing_hint,
     codex_cli_user_agent,
     codex_cli_version,
+    codex_originator,
 )
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -240,7 +240,7 @@ def _build_headers(
         "Session_id": str(uuid.uuid4()),
         "Accept": "text/event-stream",
         "Connection": "Keep-Alive",
-        "Originator": CODEX_ORIGINATOR,
+        "Originator": codex_originator(),
         "Chatgpt-Account-Id": account_id,
     }
     routing_hint = build_codex_routing_hint(model)

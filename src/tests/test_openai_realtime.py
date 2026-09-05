@@ -185,6 +185,8 @@ def _setup(m):
         "channels": [],
         "channelSelection": "order",
         "openaiOAuth": {
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
             "codexUpstreamUrl": "https://chatgpt.com/backend-api/codex/responses",
             "forceCodexCLI": True,
         },
@@ -339,7 +341,8 @@ async def test_oauth_channel_build_realtime_headers_uses_existing_identity(monke
     assert headers["chatgpt-account-id"] == "workspace-realtime"
     assert headers["originator"] == "codex_cli_rs"
     assert headers["version"]
-    assert headers["user-agent"] == m["openai_oauth_channel"].CODEX_CLI_USER_AGENT
+    from src.openai.codex_constants import codex_cli_user_agent
+    assert headers["user-agent"] == codex_cli_user_agent(cfg["openaiOAuth"])
     for response_only_header in ("host", "accept", "content-type", "openai-beta"):
         assert response_only_header not in headers
 

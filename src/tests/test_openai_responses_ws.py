@@ -91,6 +91,12 @@ def _setup(m):
         },
         "channels": [],
         "oauthAccounts": [],
+        "openaiOAuth": {
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
+            "forceCodexCLI": True,
+            "isolateSessionId": True,
+        },
         "network": {"routing": {"default": "direct"}},
         "timeouts": {"connect": 5, "firstByte": 5, "idle": 10, "total": 30},
         "concurrency": {"queueWaitSeconds": 1},
@@ -403,6 +409,10 @@ def _make_oauth_channel_for_failover(m, *, name="oauth@example.com"):
         "access_token": "tok", "refresh_token": "rt",
         "expired": "2999-01-01T00:00:00Z",
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     }
     m["config"]._cache.setdefault("oauthAccounts", [])[:] = [dict(account)]
     ch = m["OpenAIOAuthChannel"](account)
@@ -783,7 +793,8 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
 ):
     cfg = _setup(m)
     cfg["openaiOAuth"] = {
-        "codexCliVersion": "0.150.1",
+        "codexCliVersion": "0.153.4",
+        "codexProtocolProfile": "rust-v0.153.4",
         "forceCodexCLI": True,
         "isolateSessionId": True,
     }
@@ -795,6 +806,10 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         "refreshToken": "rt",
         "expiresAt": 9999999999,
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
@@ -830,8 +845,8 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         assert headers["authorization"] == "Bearer tok"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
         assert headers["x-codex-routing-hint"] == f"model=test-model;tier={service_tier}"
-        assert headers["version"] == "0.150.1"
-        assert headers["User-Agent"].startswith("codex_cli_rs/0.150.1 ")
+        assert headers["version"] == "0.153.4"
+        assert headers["User-Agent"].startswith("codex_cli_rs/0.153.4 ")
         assert headers["session-id"] == headers["thread-id"]
         # Codex CLI only uses hyphenated session-id; underscore variants must not be sent.
         assert "session_id" not in headers
@@ -1444,6 +1459,10 @@ async def test_responses_ws_records_quota_snapshot_from_upgrade_headers(monkeypa
         "refreshToken": "rt",
         "expiresAt": 9999999999,
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}
@@ -1548,6 +1567,10 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
         "accountKey": "openai:x@example.com", "accessToken": "tok",
         "refreshToken": "rt", "expiresAt": 9999999999,
         "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
     codex_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create", "model": "test-model", "input": "hello",
@@ -1566,7 +1589,8 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
 
     codex_lite_mapped = m["responses_ws"]._map_ws_create_frame_for_upstream({
         "type": "response.create", "model": "gpt-6-astra", "input": "hello",
-        "stream": True, "client_metadata": {"a": "b"},
+        "stream": True, "prompt_cache_key": "astra-map",
+        "client_metadata": {"a": "b"},
     }, "gpt-6-astra", channel=oauth)
     assert codex_lite_mapped["client_metadata"]["a"] == "b"
     assert codex_lite_mapped["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"] == "true"
@@ -1629,7 +1653,7 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     }, "gpt-6-astra", channel=oauth)
     assert official_warmup["generate"] is False
     assert official_warmup["input"] == official_prefix
-    assert official_warmup["instructions"] == ""
+    assert "instructions" not in official_warmup
     assert official_warmup["tool_choice"] == "auto"
     assert official_warmup["parallel_tool_calls"] is False
     assert official_warmup["reasoning"]["context"] == "all_turns"
@@ -1658,7 +1682,7 @@ def test_map_ws_create_frame_applies_model_guard_and_codex_transform(m):
     }, "gpt-6-astra", channel=oauth)
     assert official_incremental["previous_response_id"] == "resp_lite_warmup"
     assert official_incremental["input"] == lite_delta
-    assert official_incremental["instructions"] == ""
+    assert "instructions" not in official_incremental
     assert official_incremental["tool_choice"] == "auto"
     assert official_incremental["parallel_tool_calls"] is False
     assert official_incremental["reasoning"]["context"] == "all_turns"
@@ -2052,6 +2076,10 @@ async def test_responses_ws_oauth_pending_visible_identity_restored_before_downs
     ch = m["OpenAIOAuthChannel"]({
         "email": "pending@example.com", "provider": "openai",
         "access_token": "tok", "refresh_token": "rt", "models": ["test-model"],
+        "account_model_catalog": {
+            "schema": 1,
+            "models": [{"id": "test-model", "useResponsesLite": False}],
+        },
     })
     with m["registry"]._lock:
         m["registry"]._channels = {ch.key: ch}

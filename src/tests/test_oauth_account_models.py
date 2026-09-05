@@ -147,12 +147,13 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
     assert "{'effort':" not in repr(result.catalog)
 
 
-def test_openai_codex_client_version_config_drives_catalog_query_and_ua(monkeypatch):
+def test_openai_codex_profile_config_drives_catalog_query_and_ua(monkeypatch):
     seen = {}
     original = copy.deepcopy(config.get().get("openaiOAuth") or {})
     try:
         config.update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
-            "codexCliVersion": "0.150.1",
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
         }))
         monkeypatch.setattr(
             oauth_model_discovery.network,
@@ -163,8 +164,8 @@ def test_openai_codex_client_version_config_drives_catalog_query_and_ua(monkeypa
         )
         result = oauth_model_discovery.discover_openai({"access_token": "tok"})
         assert result.models == ["gpt-future"]
-        assert seen["url"].endswith("?client_version=0.150.1")
-        assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.150.1 ")
+        assert seen["url"].endswith("?client_version=0.153.4")
+        assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.153.4 ")
     finally:
         config.update(lambda cfg: cfg.__setitem__("openaiOAuth", original))
 

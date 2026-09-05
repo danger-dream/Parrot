@@ -142,6 +142,10 @@ def main(argv: list[str]) -> int:
         "logDir": str(log_dir),
         "telegram": {"botToken": "", "adminIds": []},
         "oauth": {"mockMode": True},
+        "openaiOAuth": {
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
+        },
         "images": {"dbPath": str(image_path)},
     }
     config_path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2))

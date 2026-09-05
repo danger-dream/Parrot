@@ -17,7 +17,7 @@
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
     gpt-5.6，都原样发出去。需要特殊 wire shape 的新家族在本 transform 中按
     官方 Codex 模型元数据做最小兼容。
-  - `instructions` 空 → 注入默认 "You are a helpful coding assistant."
+  - `instructions` 空 → 仅注入调用方按账户目录/profile 解析出的模型指令
   - legacy `functions` / `function_call` → `tools` / `tool_choice`
   - `input` 是字符串 → 包成 [{type:"message", role:"user", content:<str>}]
   - `input[]` 里的 role=system 消息提取到 `instructions`（上游 input 不接受
@@ -40,14 +40,10 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from ..codex_constants import codex_model_uses_responses_lite
-
-
-# ─── 默认 instructions（仅在请求未提供有效文本时兜底）─────────────
-
-_DEFAULT_INSTRUCTIONS = "You are a helpful coding assistant."
 
 # 上游 codex endpoint 不认识、必须剥掉的 Responses API 字段。
 _STRIP_FIELDS_FOR_CODEX = (
@@ -560,6 +556,7 @@ def _has_responses_lite_input_prefix(raw_input: Any) -> bool:
 def _apply_responses_lite_body(
     body: dict,
     *,
+    thread_context: str | None,
     add_input_prefix: bool = True,
     existing_prefix_is_authoritative: bool = False,
 ) -> None:
@@ -587,20 +584,36 @@ def _apply_responses_lite_body(
         existing_prefix_is_authoritative
         and _has_responses_lite_input_prefix(existing_input)
     ):
-        prefix: list[dict[str, Any]] = [
-            {"type": "additional_tools", "role": "developer", "tools": tools}
-        ]
+        context = str(thread_context or "").strip()
+        if not context:
+            raise ValueError(
+                "Responses Lite prefix generation requires explicit thread/session context"
+            )
+        prefix_namespace = uuid.uuid5(uuid.NAMESPACE_OID, context)
+        tools_json = json.dumps(
+            tools, ensure_ascii=False, separators=(",", ":")
+        )
+        prefix: list[dict[str, Any]] = [{
+            "id": f"at_{uuid.uuid5(prefix_namespace, tools_json)}",
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": tools,
+        }]
         if isinstance(instructions, str) and instructions.strip():
             prefix.append({
+                "id": f"msg_{uuid.uuid5(prefix_namespace, instructions)}",
                 "type": "message",
                 "role": "developer",
                 "content": [{"type": "input_text", "text": instructions}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["model.base_instructions"],
+                },
             })
         body["input"] = prefix + existing_input
     else:
         body["input"] = existing_input
 
-    body["instructions"] = ""
+    body.pop("instructions", None)
     # Official Lite requests always keep automatic tool selection even though the
     # definitions moved out of the top-level ``tools`` field.
     body["tool_choice"] = "auto"
@@ -617,7 +630,12 @@ def apply_codex_oauth_transform(
     *,
     resolved_model: str | None = None,
     session_key: str | None = None,
-    default_instructions: str | None = None,
+    base_instructions: str | None = None,
+    default_reasoning_effort: str | None = None,
+    default_verbosity: str | None = None,
+    supported_reasoning_efforts: tuple[str, ...] | list[str] | None = None,
+    multi_agent_reasoning_effort: str | None = None,
+    lite_thread_context: str | None = None,
     transport: str = _CODEX_TRANSPORT_HTTP,
     use_responses_lite: bool | None = None,
 ) -> dict:
@@ -629,9 +647,12 @@ def apply_codex_oauth_transform(
         transform **原样透传**给上游，不做任何别名映射。
       session_key: 历史兼容参数。v0.21.3 起 encrypted_content 只做透明透传，
         不再由 Parrot 维护本地 replay/backfill，因此这里不再使用。
+      base_instructions/default_*: 调用方按账户目录优先、选中 profile 次之
+        解析出的模型策略；本模块没有模型名或版本 fallback。
+      lite_thread_context: 新建 Lite prefix 时使用的显式线程/会话 namespace。
       transport: ``http`` 保持 OAuth store=false 的 HTTP/SSE 规则；
         ``websocket`` 启用官方 Responses WebSocket v2 的续接语义。
-      use_responses_lite: 账户目录解析后的显式决策；缺省时使用兼容型号表。
+      use_responses_lite: 账户目录或选中 profile 的显式决策。
     """
     if transport not in _CODEX_TRANSPORTS:
         raise ValueError(f"unsupported Codex Responses transport: {transport!r}")
@@ -642,10 +663,7 @@ def apply_codex_oauth_transform(
     if resolved_model:
         body["model"] = resolved_model
     elif _is_empty_str(body.get("model")):
-        # 极端兜底：resolved_model 缺失且 body 里也没 model。正常调用路径
-        # （Channel.build_upstream_request）不会走到这里；测试或误用时
-        # 给个最保守默认避免上游报缺参，上游会按自己白名单决定是否接受。
-        body["model"] = "gpt-5"
+        raise ValueError("Codex request requires an explicit resolved model")
     responses_lite = codex_model_uses_responses_lite(
         body.get("model"), use_responses_lite,
     )
@@ -704,20 +722,47 @@ def apply_codex_oauth_transform(
         body, preserve_references=(native_responses_ws or lite_prefixed),
     )
 
-    # GPT-6-Astra's Ultra option activates local multi-agent orchestration in the
-    # official Codex client. Parrot does not recreate that local capability; it
-    # only sends the wire-safe single-agent effort understood by the upstream.
+    # 5.6) Model defaults only fill omitted caller fields.  Empty/invalid explicit
+    # values remain caller-owned and are left for normal request validation.
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        if "reasoning" not in body and default_reasoning_effort:
+            reasoning = {"effort": default_reasoning_effort}
+            body["reasoning"] = reasoning
+    elif "effort" not in reasoning and default_reasoning_effort:
+        reasoning["effort"] = default_reasoning_effort
+
+    text = body.get("text")
+    if not isinstance(text, dict):
+        if "text" not in body and default_verbosity:
+            body["text"] = {"verbosity": default_verbosity}
+    elif "verbosity" not in text and default_verbosity:
+        text["verbosity"] = default_verbosity
+
+    # Ultra is a local Codex multi-agent choice.  Parrot does not implement that
+    # orchestrator; it may only substitute the model-specific wire effort when
+    # authoritative catalog/profile policy explicitly supplies both capabilities.
     reasoning = body.get("reasoning")
     if (
         isinstance(reasoning, dict)
         and str(reasoning.get("effort") or "").strip().lower() == "ultra"
     ):
-        reasoning["effort"] = "xhigh"
+        supported = {
+            str(value or "").strip().lower()
+            for value in (supported_reasoning_efforts or ())
+            if str(value or "").strip()
+        }
+        target = str(multi_agent_reasoning_effort or "").strip().lower()
+        if "ultra" not in supported or not target or target not in supported:
+            raise ValueError(
+                "reasoning effort 'ultra' requires explicit model-scoped "
+                "reasoningEfforts and multiAgentReasoningEffort policy"
+            )
+        reasoning["effort"] = target
 
-    # 6) instructions 为空时注入一行稳定的兜底文本。Official Lite full
-    # requests already carry instructions in their developer prefix; incremental
-    # WS frames refer to that prefix via previous_response_id. Neither may gain a
-    # fallback instruction on a repeated transform.
+    # 6) Official Lite full requests already carry instructions in their developer
+    # prefix; incremental WS frames refer to that prefix via previous_response_id.
+    # Neither may gain profile instructions on a repeated transform.
     lite_ws_incremental = bool(
         native_responses_ws
         and responses_lite
@@ -726,15 +771,15 @@ def apply_codex_oauth_transform(
     if _is_empty_str(body.get("instructions")) and not (
         lite_ws_incremental or lite_prefixed
     ):
-        body["instructions"] = (
-            default_instructions.strip()
-            if isinstance(default_instructions, str) and default_instructions.strip()
-            else _DEFAULT_INSTRUCTIONS
-        )
+        if isinstance(base_instructions, str) and base_instructions.strip():
+            body["instructions"] = base_instructions
+        else:
+            body.pop("instructions", None)
 
     if responses_lite:
         _apply_responses_lite_body(
             body,
+            thread_context=lite_thread_context,
             add_input_prefix=not lite_ws_incremental,
             existing_prefix_is_authoritative=lite_prefixed,
         )

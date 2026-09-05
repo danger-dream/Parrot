@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -86,7 +87,10 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["anysearch"]["maxFetchUrlChars"] == 250
             assert cfg["anysearch"]["requireKnownUrlForFetch"] is True
             assert cfg["anysearch"]["maxConcurrentToolCalls"] == 0
-            assert cfg["openaiOAuth"]["codexCliVersion"] == "0.153.4"
+            # Identity has no Python default: old configs remain visibly incomplete
+            # until an operator selects a matching versioned profile.
+            assert "codexCliVersion" not in cfg["openaiOAuth"]
+            assert "codexProtocolProfile" not in cfg["openaiOAuth"]
             assert cfg["openaiOAuth"]["forceCodexCLI"] is False
             assert cfg["openaiOAuth"]["defaultModels"] == ["legacy-model"]
             assert cfg["openaiOAuth"]["codexUpstreamUrl"].startswith("https://chatgpt.com/")
@@ -149,6 +153,39 @@ def test_old_config_file_is_backfilled_with_new_defaults():
         config._cache = None
         config._mtime = 0
         config.reload()
+
+
+def test_explicit_openai_oauth_key_always_beats_legacy_config():
+    legacy = {
+        "forceCodexCLI": False,
+        "defaultModels": ["legacy-model"],
+        "codexCliVersion": "0.144.0",
+    }
+
+    # A valid explicit new-path object wins even when its values equal defaults.
+    explicit = copy.deepcopy(config.DEFAULT_CONFIG["openaiOAuth"])
+    raw = {
+        "openaiOAuth": explicit,
+        "oauth": {"providers": {"openai": legacy}},
+    }
+    merged = config._deep_merge_defaults(config.DEFAULT_CONFIG, raw)
+    config._normalize_openai_oauth_config(merged, raw)
+    assert merged["openaiOAuth"]["forceCodexCLI"] is True
+    assert merged["openaiOAuth"]["defaultModels"] == explicit["defaultModels"]
+    assert "codexCliVersion" not in merged["openaiOAuth"]
+
+    # Key presence, not value type, controls precedence.  A malformed explicit
+    # value must not silently activate the legacy identity; defaults remain
+    # intentionally identity-incomplete and later Codex use fails closed.
+    malformed_raw = {
+        "openaiOAuth": None,
+        "oauth": {"providers": {"openai": legacy}},
+    }
+    malformed = config._deep_merge_defaults(config.DEFAULT_CONFIG, malformed_raw)
+    config._normalize_openai_oauth_config(malformed, malformed_raw)
+    assert malformed["openaiOAuth"]["forceCodexCLI"] is True
+    assert malformed["openaiOAuth"]["defaultModels"] != ["legacy-model"]
+    assert "codexCliVersion" not in malformed["openaiOAuth"]
 
 
 def test_pricing_source_migration_only_rewrites_the_former_builtin_default():

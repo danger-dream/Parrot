@@ -283,11 +283,12 @@ def test_codex_image_headers_follow_configured_cli_identity():
     original = dict(config.get().get("openaiOAuth") or {})
     try:
         config.update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
-            "codexCliVersion": "0.150.1",
+            "codexCliVersion": "0.153.4",
+            "codexProtocolProfile": "rust-v0.153.4",
         }))
         headers = images_simple._build_headers("token", "account", "gpt-image-test")
-        assert headers["Version"] == "0.150.1"
-        assert headers["User-Agent"].startswith("codex_cli_rs/0.150.1 ")
+        assert headers["Version"] == "0.153.4"
+        assert headers["User-Agent"].startswith("codex_cli_rs/0.153.4 ")
         assert headers["Originator"] == "codex_cli_rs"
         assert headers["x-codex-routing-hint"] == "model=gpt-image-test"
     finally:

@@ -49,25 +49,17 @@ def _provider_cfg() -> dict:
     """读取 OpenAI OAuth 配置。
 
     新入口：config.openaiOAuth。
-    旧入口：config.oauth.providers.openai 继续兼容；加载旧配置时 config.py 会
-    自动把旧值补齐到 openaiOAuth。这里仍保留运行时 fallback，照顾单测/局部配置。
+    旧入口只在 config.py 读取原始配置时迁移到新入口。运行时始终读取已规范化
+    的新入口，避免用“值是否等于默认配置”猜测用户是否显式配置。
     """
     default = config.DEFAULT_CONFIG.get("openaiOAuth") or {}
     cfg = config.get()
-    legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
     current = cfg.get("openaiOAuth") or {}
     default = default if isinstance(default, dict) else {}
-    legacy = legacy if isinstance(legacy, dict) else {}
     current = current if isinstance(current, dict) else {}
 
     merged = dict(default)
-    # 运行时兼容：如果调用方仍只改旧路径，且 openaiOAuth 还等于默认值，
-    # 旧路径生效；一旦用户显式改了新入口，则新入口优先。
-    if legacy and current == default:
-        source = legacy
-    else:
-        source = current
-    for key, value in source.items():
+    for key, value in current.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             nested = dict(merged.get(key) or {})
             nested.update(value)
@@ -103,16 +95,16 @@ def _request_api_key_name(body: dict) -> str:
 
 CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
 from ..openai.codex_constants import (
-    CODEX_CLI_USER_AGENT,
-    CODEX_ORIGINATOR,
     CODEX_RESPONSES_LITE_HEADER,
     CODEX_ROUTING_HINT_HEADER,
+    CodexModelPolicy,
     build_codex_routing_hint,
     codex_cli_user_agent,
     codex_cli_version,
-    codex_model_uses_responses_lite,
+    codex_originator,
     codex_version_meets_minimum,
     normalize_codex_service_tier,
+    resolve_codex_model_policy,
 )
 
 _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
@@ -328,11 +320,22 @@ class OpenAIOAuthChannel(Channel):
         value = record.get("useResponsesLite")
         return value if isinstance(value, bool) else None
 
-    def model_uses_responses_lite(self, model: str) -> bool:
-        """Resolve account-scoped catalog authority before legacy name fallback."""
-        return codex_model_uses_responses_lite(
-            model, self.responses_lite_catalog_value(model),
-        )
+    def codex_model_policy(
+        self,
+        model: str,
+        provider_config: dict | None = None,
+    ) -> CodexModelPolicy:
+        """Resolve account catalog fields before the selected data profile."""
+        record = self._account_model_records.get(str(model or "").strip())
+        return resolve_codex_model_policy(model, record, provider_config)
+
+    def model_uses_responses_lite(
+        self,
+        model: str,
+        provider_config: dict | None = None,
+    ) -> bool:
+        """Return explicit account/profile Lite policy; unknown models fail closed."""
+        return self.codex_model_policy(model, provider_config).use_responses_lite
 
     # ─── 请求构造 ─────────────────────────────────────────────
 
@@ -429,12 +432,15 @@ class OpenAIOAuthChannel(Channel):
             payload,
             protocol="openai-responses",
         )
+        model_policy = self.codex_model_policy(resolved_model, prov_cfg)
         metadata = model_metadata.get_metadata(
             requested_body.get("model") or resolved_model,
             scope_key=self.key,
             outbound_model=resolved_model,
         )
-        efforts = metadata.get("reasoningEfforts")
+        efforts = list(model_policy.reasoning_efforts)
+        if not efforts:
+            efforts = metadata.get("reasoningEfforts")
         if not efforts:
             official = model_pricing.catalog_metadata(f"openai/{resolved_model}") or {}
             efforts = official.get("reasoningEfforts")
@@ -473,22 +479,39 @@ class OpenAIOAuthChannel(Channel):
 
         # Step C: codex 兼容改造（store=false 等硬约束）。带 encrypted_content 的
         # replay reasoning 只做透明透传，非法/陈旧 EC 由 failover 清 scope 后降级重试。
-        # The authenticated account catalog is authoritative for Lite, including
-        # explicit false; missing metadata retains the compatibility fallback.
-        responses_lite = self.model_uses_responses_lite(resolved_model)
+        # The authenticated account catalog is authoritative field-by-field;
+        # absent fields come from the explicitly selected versioned profile.
+        responses_lite = model_policy.use_responses_lite
+        profile_instructions = model_policy.base_instructions
+        configured_default = prov_cfg.get("defaultInstructions")
+        base_instructions = profile_instructions
+        if base_instructions is None and isinstance(configured_default, str):
+            base_instructions = configured_default.strip() or None
+
+        raw_thread_context = str(payload.get("prompt_cache_key") or "").strip()
+        lite_thread_context = raw_thread_context
+        api_key_name = _request_api_key_name(requested_body)
+        if (
+            raw_thread_context
+            and api_key_name
+            and prov_cfg.get("isolateSessionId", True)
+        ):
+            lite_thread_context = _isolate_session_id(api_key_name, raw_thread_context)
+
         payload = codex_oauth_transform.apply_codex_oauth_transform(
             payload,
             resolved_model=resolved_model,
-            default_instructions=prov_cfg.get("defaultInstructions"),
+            base_instructions=base_instructions,
+            default_reasoning_effort=model_policy.default_reasoning_effort,
+            default_verbosity=model_policy.default_verbosity,
+            supported_reasoning_efforts=model_policy.reasoning_efforts,
+            multi_agent_reasoning_effort=model_policy.multi_agent_reasoning_effort,
+            lite_thread_context=lite_thread_context,
             transport=responses_transport,
             use_responses_lite=responses_lite,
         )
         model_id = str(payload.get("model") or resolved_model).strip()
-        model_record = self._account_model_records.get(model_id)
-        minimum_client_version = (
-            str(model_record.get("minimalClientVersion") or "").strip()
-            if isinstance(model_record, dict) else ""
-        )
+        minimum_client_version = model_policy.minimal_client_version or ""
         effective_client_version = codex_cli_version(prov_cfg)
         if (
             minimum_client_version
@@ -685,8 +708,13 @@ class OpenAIOAuthChannel(Channel):
         # transform（store=false / stream=true / 模型规范化 / instructions 兜底 / ...）
         prov_cfg = _provider_cfg()
         probe_cfg = prov_cfg.get("quotaProbe") if isinstance(prov_cfg.get("quotaProbe"), dict) else {}
-        fallback_model = str(probe_cfg.get("fallbackModel") or "gpt-5.2")
+        fallback_model = str(probe_cfg.get("fallbackModel") or "").strip()
         probe_model = self.models[0] if self.models else fallback_model
+        if not probe_model:
+            return {
+                "ok": False,
+                "reason": "openaiOAuth.quotaProbe.fallbackModel is required when the account has no models",
+            }
         test_body = {
             "model": probe_model,
             "input": str(probe_cfg.get("input") or "1"),
@@ -779,7 +807,7 @@ class OpenAIOAuthChannel(Channel):
             # Host 头：httpx 通常会按 URL 自动设置，这里显式兜底保险
             "host": "chatgpt.com",
             "authorization": f"Bearer {access_token}",
-            "originator": CODEX_ORIGINATOR,
+            "originator": codex_originator(prov_cfg),
             "version": client_version,
             "accept": "text/event-stream",
             "content-type": "application/json",

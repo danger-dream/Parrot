@@ -333,6 +333,7 @@
   "durableStatePath": "durable-state.json",
   "openaiOAuth": {
     "codexCliVersion": "0.153.4",
+    "codexProtocolProfile": "rust-v0.153.4",
     "forceCodexCLI": true,
     "enableTLSFingerprint": false,
     "isolateSessionId": true,

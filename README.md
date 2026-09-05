@@ -132,9 +132,26 @@ python3 -m venv venv
 # 测试必须经隔离入口启动；用系统 python3 启动同一脚本也会自动切换到此 venv
 ./venv/bin/python src/tests/isolated_pytest.py src/tests -q
 
-# 编辑 config.json（首次启动会自动生成模板）
+# 编辑 config.json（首次启动会生成基础配置；使用 OpenAI OAuth 时还须显式选择 Codex profile）
 ./venv/bin/python server.py
 ```
+
+### Codex 协议 profile（OpenAI OAuth 必填）
+
+OpenAI OAuth/Codex 没有内置 CLI 版本 fallback。真实 `config.json` 必须显式选择版本和同版本 profile；字段缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed，并在错误中指出配置字段。
+
+```json
+{
+  "openaiOAuth": {
+    "codexCliVersion": "0.153.4",
+    "codexProtocolProfile": "rust-v0.153.4"
+  }
+}
+```
+
+可用 profile 存放在 `src/openai/codex_profiles/`。`codexCliVersion` 必须与选中 profile 的 `clientVersion` 完全一致；升级时应同时添加/审核版本化 profile 并修改这两个配置值，不能只改其中一个。`config.example.json` 展示当前推荐组合，但程序不会把推荐值回填到真实配置，也不会根据源码版本、默认配置值或模型名猜测 Codex 版本。
+
+模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于通用 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。
 
 ### 下游客户端接入
 

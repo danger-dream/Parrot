@@ -520,10 +520,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "runtimeStatePath": "runtime-cache.json",
     "durableStatePath": "durable-state.json",
     # OpenAI OAuth/Codex 简化配置。旧版 oauth.providers.openai 仍兼容；加载旧配置时会自动补齐到这里。
+    # codexCliVersion 与 codexProtocolProfile 故意没有运行时默认值：真实配置
+    # 必须显式提供且相互匹配，否则任何 Codex identity/model 操作都会 fail closed。
     "openaiOAuth": {
-        # 所有 Codex models/HTTP/WS 指纹的唯一版本来源。未来官方提高
-        # minimal_client_version 时只需改配置，不需要修改 Parrot 源码。
-        "codexCliVersion": "0.153.4",
         "forceCodexCLI": True,
         "enableTLSFingerprint": False,
         "isolateSessionId": True,
@@ -685,8 +684,9 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
     """把旧版 oauth.providers.openai 自动补齐到新版 openaiOAuth。
 
     新配置入口更短：openaiOAuth。为了兼容已经部署的旧 config.json，
-    当用户没有显式写 openaiOAuth 时，把旧层级的值复制过去并持久化。
-    旧层级保留读取兼容，不删除。
+    当原始配置没有写 openaiOAuth 键时，把旧层级的值复制过去并持久化。
+    只要原始配置显式存在新入口（即使值恰好等于默认配置），新入口就始终
+    优先；旧层级保留读取兼容，不删除。
     """
     raw = raw if isinstance(raw, dict) else {}
     legacy = (((cfg.get("oauth") or {}).get("providers") or {}).get("openai") or {})
@@ -694,8 +694,9 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
         legacy = {}
     current = cfg.get("openaiOAuth") if isinstance(cfg.get("openaiOAuth"), dict) else {}
     default = DEFAULT_CONFIG.get("openaiOAuth") if isinstance(DEFAULT_CONFIG.get("openaiOAuth"), dict) else {}
-    if isinstance(raw.get("openaiOAuth"), dict):
-        # 新入口已经存在：只做默认字段补齐，避免旧层级反向覆盖新配置。
+    if "openaiOAuth" in raw:
+        # 新入口键已经存在：只做默认字段补齐，避免旧层级反向覆盖新配置。
+        # 即使显式值类型错误，也不能让 legacy 配置悄悄取代用户的新入口。
         merged = _deep_merge_defaults(default, current)
     elif legacy:
         # 老配置升级：旧层级覆盖默认值，作为新版 openaiOAuth 初始值。
