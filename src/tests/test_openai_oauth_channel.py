@@ -165,12 +165,22 @@ def test_transform_basic(m):
     ("presence_penalty", 0),
     ("prompt_cache_retention", "1h"),
 ])
-def test_transform_rejects_profile_unsupported_controls(m, field, value):
-    with pytest.raises(ValueError, match=field):
+def test_transform_strips_profile_unsupported_controls(m, field, value):
+    out = _apply_transform(
+        m["transform"],
+        {"model": "gpt-5", "input": "hi", field: value},
+        request_field_policies={field: "unsupported"},
+    )
+    assert field not in out
+    assert out["model"] == "gpt-5"
+
+
+def test_transform_missing_field_policy_fails_closed(m):
+    with pytest.raises(ValueError, match="max_output_tokens"):
         _apply_transform(
             m["transform"],
-            {"model": "gpt-5", "input": "hi", field: value},
-            request_field_policies={field: "unsupported"},
+            {"model": "gpt-5", "input": "hi", "max_output_tokens": 100},
+            request_field_policies={},
         )
 
 
@@ -1220,7 +1230,7 @@ def test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache(m):
     print("  [PASS] channel: Anthropic history system stays as developer tail on Codex route")
 
 
-def test_channel_anthropic_ingress_rejects_unsupported_cache_retention(m):
+def test_channel_anthropic_ingress_strips_unsupported_cache_retention(m):
     _setup(m)
     _add_openai_acc(m)
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
@@ -1234,13 +1244,30 @@ def test_channel_anthropic_ingress_rejects_unsupported_cache_retention(m):
         "_parrot_client_ip": "203.0.113.8",
     }
 
-    with pytest.raises(Exception, match="prompt_cache_retention") as exc:
-        asyncio.run(ch.build_upstream_request(
-            body, "gpt-5.1", ingress_protocol="anthropic",
-        ))
-    assert getattr(exc.value, "status", None) == 400
-    assert getattr(exc.value, "param", None) == "prompt_cache_retention"
-    print("  [PASS] channel: unsupported translated cache retention returns explicit 400")
+    req = asyncio.run(ch.build_upstream_request(
+        body, "gpt-5.1", ingress_protocol="anthropic",
+    ))
+    payload = json.loads(req.body)
+    assert "prompt_cache_retention" not in payload
+    assert payload["model"] == "gpt-5.1"
+    print("  [PASS] channel: unsupported translated cache retention is stripped")
+
+
+def test_channel_responses_ingress_strips_unsupported_max_output_tokens(m):
+    _setup(m)
+    _add_openai_acc(m)
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5.1", "input": "hi", "max_output_tokens": 8192, "temperature": 0.2},
+        "gpt-5.1",
+        ingress_protocol="responses",
+    ))
+    payload = json.loads(req.body)
+    assert "max_output_tokens" not in payload
+    assert "temperature" not in payload
+    assert payload["model"] == "gpt-5.1"
+    assert payload["store"] is False
+    print("  [PASS] channel: unsupported max_output_tokens/temperature are stripped")
 
 
 def test_channel_anthropic_ingress_metadata_session_replay(m):
@@ -1610,6 +1637,8 @@ def main():
         test_channel_anthropic_ingress_translator,
         test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache,
         test_channel_anthropic_ingress_maps_cache_to_prompt_cache_and_session,
+        test_channel_anthropic_ingress_strips_unsupported_cache_retention,
+        test_channel_responses_ingress_strips_unsupported_max_output_tokens,
         test_channel_anthropic_ingress_metadata_session_replay,
         test_channel_missing_chatgpt_account_id_legacy_keeps_working,
         test_registry_dispatches_by_provider,

@@ -115,17 +115,22 @@ _CODEX_PROFILE_CONTROLLED_FIELDS = (
 def _apply_explicit_field_policies(
     body: dict, ingress_protocol: str, prov_cfg: dict,
 ) -> dict:
-    """Apply versioned request-field policy before translators can drop controls."""
+    """Apply versioned request-field policy before translators rewrite controls."""
     del ingress_protocol  # policies use the original request keys for every ingress.
-    # Preserve request object identity: turn-serialization leases are attached to
-    # this mapping and must be released by the owning HTTP/WS attempt.
-    out = body
+    # Field policies are candidate-local. Keep the original request (including
+    # its identity contexts and turn leases) owned by the HTTP/WS attempt.
+    out = dict(body)
     policies = codex_protocol_profile(prov_cfg).request_field_policies
     for field in _CODEX_PROFILE_CONTROLLED_FIELDS:
         if field not in out:
             continue
         policy = policies.get(field)
-        if policy in (None, "unsupported"):
+        if policy == "unsupported":
+            # Official Codex wire does not accept these client limits. Drop them
+            # so OpenAI/Anthropic clients keep working; do not 400 the request.
+            out.pop(field, None)
+            continue
+        if policy is None:
             raise guard.GuardError(
                 400,
                 "unsupported_parameter",
@@ -364,7 +369,7 @@ class OpenAIOAuthChannel(Channel):
         ingress_protocol: str,
         provider_config: dict | None = None,
     ) -> dict:
-        """Reject or map explicit controls before any Codex network dispatch."""
+        """Strip, map, or reject explicit controls before any Codex network dispatch."""
         prov_cfg = provider_config if isinstance(provider_config, dict) else _provider_cfg()
         return _apply_explicit_field_policies(body, ingress_protocol, prov_cfg)
 
@@ -392,7 +397,7 @@ class OpenAIOAuthChannel(Channel):
         # One immutable provider-config snapshot keeps models/headers/UA coherent
         # even if a hot reload lands while this request is being constructed.
         prov_cfg = _provider_cfg()
-        requested_body = self.apply_request_field_policies(
+        protocol_body = self.apply_request_field_policies(
             requested_body, ingress_protocol, prov_cfg,
         )
 
@@ -422,14 +427,14 @@ class OpenAIOAuthChannel(Channel):
         if ingress_protocol == "responses":
             payload = provider_registry.filter_request_payload(
                 self,
-                requested_body,
+                protocol_body,
                 protocol="openai-responses",
             )
             translator_ctx = None      # 同协议透传无需响应反向；replay scope 稍后会补进 ctx
         elif ingress_protocol == "chat":
             # chat ingress → responses 上游（同家族跨变体）
-            guard.guard_chat_to_responses(requested_body)
-            payload = chat_to_responses.translate_request(requested_body)
+            guard.guard_chat_to_responses(protocol_body)
+            payload = chat_to_responses.translate_request(protocol_body)
             # 下游 chat 是否显式要求 usage 末帧
             stream_opts = requested_body.get("stream_options") or {}
             include_usage = (
@@ -448,7 +453,7 @@ class OpenAIOAuthChannel(Channel):
             # endpoint 仍会被 apply_codex_oauth_transform 强制 stream=true，由
             # failover 的 upstream_stream_only 聚合路径再反向成 Anthropic message。
             payload = anthropic_to_responses.translate_request(
-                requested_body,
+                protocol_body,
                 target_model=resolved_model,
                 codex_oauth=True,
             )
@@ -506,8 +511,7 @@ class OpenAIOAuthChannel(Channel):
 
         # Cross-protocol translators may create a controlled Responses field
         # (for example prompt_cache_retention). Apply the same profile policy to
-        # the final shape so the public path returns a structured 4xx rather than
-        # a low-level transform error or silent deletion.
+        # the final shape so unsupported controls are stripped before dispatch.
         payload = self.apply_request_field_policies(payload, "responses", prov_cfg)
 
         # Resolve/refresh the final candidate before constructing any upstream

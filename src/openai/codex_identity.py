@@ -440,6 +440,7 @@ def normalize_account_identity(
     protocol_profile: str | None = None,
     new_identity_generation_version: int = ID_GENERATION_VERSION,
     allow_legacy_collision_rotation: bool = False,
+    adopt_preserved_identity: bool = False,
     used_installations: MutableMapping[str, str] | None = None,
 ) -> bool:
     """Migrate/validate one OpenAI account without rotating a valid legacy UUIDv4.
@@ -456,6 +457,26 @@ def normalize_account_identity(
         account.pop("codexDeviceConvergenceEnabled", None)
         changed = True
     workspace_id = workspace_id_from_account(account)
+    if not workspace_id:
+        # Legacy configs may already contain the authoritative workspace inside
+        # an OAuth-issued JWT. Decode locally; never infer it from email or org.
+        from ..oauth.openai import decode_id_token, extract_user_info
+        for token_field in ("access_token", "id_token"):
+            token = account.get(token_field)
+            if not isinstance(token, str) or not token:
+                continue
+            try:
+                info = extract_user_info(decode_id_token(token))
+            except (ValueError, TypeError, AttributeError):
+                continue
+            workspace_id = workspace_id_from_account(info)
+            if workspace_id:
+                account["workspace_id"] = workspace_id
+                account["chatgpt_account_id"] = str(
+                    info.get("chatgpt_account_id") or workspace_id
+                )
+                changed = True
+                break
     if not workspace_id:
         # A legacy account may legitimately await its first successful refresh,
         # but it may not carry an unbound installation identity.
@@ -502,7 +523,7 @@ def normalize_account_identity(
                 version=4,
                 field="tombstone installation_id",
             )
-            if installation_id and installation_id != restored:
+            if installation_id and installation_id != restored and not adopt_preserved_identity:
                 raise CodexIdentityError(
                     "configured installation conflicts with preserved owner tombstone"
                 )
@@ -560,17 +581,21 @@ def normalize_account_identities(
     changed = False
     used: dict[str, str] = {}
     owners: dict[str, AccountIdentity] = {}
-    for account in accounts:
+    # Existing versioned identities win over legacy per-login UUIDs regardless
+    # of config order. Within each group retain original order and credentials.
+    ordered = sorted(
+        (account for account in accounts if isinstance(account, MutableMapping)),
+        key=lambda account: not isinstance(account.get("codexIdentity"), Mapping),
+    )
+    for account in ordered:
         if isinstance(account, MutableMapping):
-            explicit_identity = bool(
-                account.get("codexIdentity")
-                or account.get("codexDeviceInstallationId")
-            )
+            explicit_identity = isinstance(account.get("codexIdentity"), Mapping)
             changed = normalize_account_identity(
                 account,
                 protocol_profile=protocol_profile,
                 new_identity_generation_version=new_identity_generation_version,
                 allow_legacy_collision_rotation=True,
+                adopt_preserved_identity=True,
                 used_installations=used,
             ) or changed
             current = account_identity_from_account(account, require=False)
@@ -582,6 +607,8 @@ def normalize_account_identities(
                     raise CodexIdentityError(
                         "duplicate canonical OpenAI owner has conflicting Codex identities"
                     )
+                # The discarded legacy UUID no longer occupies an owner slot.
+                used.pop(current.installation_id, None)
                 account["codexIdentity"] = prior.as_config()
                 account["codexDeviceInstallationId"] = prior.installation_id
                 current = prior

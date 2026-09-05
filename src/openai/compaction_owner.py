@@ -89,7 +89,7 @@ def owner_identity(ch: Any) -> str:
 
 
 def _legacy_identities(ch: Any) -> set[str]:
-    """Identities emitted by the initial owner algorithm, for in-place adoption."""
+    """Legacy key/workspace and v0.31.13 boundary identities, for unique adoption."""
     if not is_openai_oauth_channel(ch):
         return set()
     account_key = str(getattr(ch, "account_key", ""))
@@ -99,10 +99,20 @@ def _legacy_identities(ch: Any) -> set[str]:
     # deliberately unchanged.  Rebuilt channels use openai:<email>:<workspace>.
     if workspace and account_key.endswith(f":{workspace}"):
         keys.add(account_key[:-(len(workspace) + 1)])
-    return {
+    aliases = {
         _digest_identity({"provider": "openai", "account_key": key, "workspace": ws})
         for key in keys for ws in ({workspace, ""} if workspace else {""})
     }
+    # The published version used a canonical boundary hash, between the initial
+    # key/workspace algorithm and today's owner digest. Keep both migrations.
+    boundaries = {f"account:{key}" for key in keys}
+    if workspace:
+        boundaries.add(f"workspace:{workspace}")
+    aliases.update(
+        _digest_identity({"provider": "openai", "boundary": boundary})
+        for boundary in boundaries
+    )
+    return aliases
 
 
 def identity_aliases(ch: Any) -> set[str]:

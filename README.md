@@ -152,7 +152,7 @@ Codex 的版本、User-Agent、端点、WS beta、模型能力和请求字段策
 
 需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
 
-模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前返回明确 400，不会静默删除。
+模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前剥掉，不会把请求打回客户端；缺失策略仍 fail closed。
 
 模型目录请求携带同一 profile 的版本身份，并使用 ETag / 304；推理响应中的 `X-Models-Etag` 会触发去抖后的目录刷新，`openai-model` / `x-openai-model` 会作为实际模型观测头透传。
 

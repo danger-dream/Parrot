@@ -724,6 +724,40 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
     return changed
 
 
+def _normalize_legacy_codex_catalogs(cfg: dict) -> bool:
+    """Preserve the wire policy of pre-profile, last-known-good model records.
+
+    Released configs did not persist useResponsesLite. The selected profile
+    supplies known policies; older catalog-only models retain standard Responses.
+    This is migration of saved records, not a fallback for newly discovered IDs.
+    """
+    from .openai.codex_constants import codex_protocol_profile
+
+    changed = False
+    for account in cfg.get("oauthAccounts") or []:
+        if not isinstance(account, dict):
+            continue
+        if str(account.get("provider") or account.get("type") or "").lower() != "openai":
+            continue
+        if account.get("codexIdentity") or account.get("last_model_sync_profile"):
+            continue
+        catalog = account.get("account_model_catalog")
+        records = catalog.get("models") if isinstance(catalog, dict) else None
+        if not isinstance(records, list):
+            continue
+        known_ids = set(account.get("models") or [])
+        for record in records:
+            if not isinstance(record, dict) or record.get("id") not in known_ids:
+                continue
+            if "useResponsesLite" in record:
+                continue
+            profile = codex_protocol_profile(cfg.get("openaiOAuth") or {})
+            policy = profile.model_policy(record["id"])
+            record["useResponsesLite"] = policy.use_responses_lite if policy else False
+            changed = True
+    return changed
+
+
 def _normalize_codex_device_accounts(cfg: dict) -> bool:
     """Migrate OpenAI workspaces to versioned, owner-bound Codex identities."""
     from .openai.codex_identity import normalize_account_identities
@@ -818,6 +852,7 @@ def _normalize_api_keys(cfg: dict) -> bool:
 def _load_from_disk() -> dict:
     if not os.path.exists(CONFIG_PATH):
         initial = copy.deepcopy(DEFAULT_CONFIG)
+        _normalize_openai_oauth_config(initial)
         _write_atomic(initial)
         return initial
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -839,6 +874,9 @@ def _load_from_disk() -> dict:
     if _normalize_pricing_sources(merged):
         changed = True
         print("[config] migrated built-in pricing source from LiteLLM to models.dev")
+    if _normalize_legacy_codex_catalogs(merged):
+        changed = True
+        print("[config] preserved legacy Codex catalog wire policies")
     if _normalize_codex_device_accounts(merged):
         changed = True
         print("[config] migrated versioned per-workspace Codex identities")

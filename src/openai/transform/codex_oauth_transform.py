@@ -8,9 +8,9 @@
 
   - `store=false` 强制（OAuth 上游对 store=true 报 400）
   - `stream=true` 强制（OAuth 上游仅支持流式 SSE）
-  - 输出限制/采样/缓存参数按版本化 profile 显式 passthrough/map/reject，
-    绝不静默删除；其余固定不支持字段（user / metadata /
-    safety_identifier）继续剥除
+  - 输出限制/采样/缓存参数按版本化 profile 显式 passthrough/map/strip：
+    unsupported 剥掉，不 400；缺失策略仍 fail closed。其余固定不支持字段
+    （user / metadata / safety_identifier）继续剥除
   - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
     账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
@@ -676,8 +676,9 @@ def apply_codex_oauth_transform(
         _inc = list(_inc) + ["reasoning.encrypted_content"]
     body["include"] = _inc
 
-    # 3) Output/sampling/cache controls are profile-owned. Missing policy also
-    # fails closed so a future caller cannot silently lose an explicit limit.
+    # 3) Output/sampling/cache controls are profile-owned. unsupported strips
+    # the field so Codex-incompatible client limits do not fail the request.
+    # Missing policy still fails closed.
     policies = request_field_policies or {}
     controlled_fields = (
         "max_output_tokens", "max_completion_tokens", "max_tokens",
@@ -688,7 +689,10 @@ def apply_codex_oauth_transform(
         if field not in body:
             continue
         policy = policies.get(field)
-        if policy in (None, "unsupported"):
+        if policy == "unsupported":
+            body.pop(field, None)
+            continue
+        if policy is None:
             raise ValueError(
                 f"{field} is not supported by the selected Codex protocol profile"
             )

@@ -2276,11 +2276,14 @@ async def run_failover(
                     client_visible_model=client_visible_model,
                 )
                 release_done2 = False
+                attempt_body = None
                 def _release_q(_key=channel_state.effect_key(ch)):
                     nonlocal release_done2
                     if release_done2:
                         return
                     release_done2 = True
+                    if attempt_body is not None:
+                        release_request_turn_serialization(attempt_body)
                     concurrency.release(_key)
                 try:
                     candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
@@ -2289,6 +2292,7 @@ async def run_failover(
                     attempt_body = _attempt_body_for_channel(
                         body, ch.key, bound_channel_key, portable_body,
                     )
+                    attempt_body["_codex_turn_serialization_required"] = True
                     if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
                         attempt_body = dict(attempt_body)
                         attempt_body["stream"] = False

@@ -2547,10 +2547,17 @@ async def _relay_ws_session(
             body["_codex_turn_serialization_required"] = True
             await acquire_request_turn_serialization(body, current_context)
         identity_session["context"] = current_context
+        # Success persistence reads the attempt body, including on sequential
+        # creates that don't rebuild the channel request. Share its actual turn
+        # context so confirmed compaction advances this session's next window.
+        body.setdefault("_codex_identity_contexts", {})[
+            current_context.account_identity.owner_digest
+        ] = current_context
         identity_snapshot = current_context.snapshot()
         translator_ctx = dict(translator_ctx or {})
         translator_ctx["codex_identity_context"] = current_context
         translator_ctx["codex_identity_snapshot"] = identity_snapshot
+        result.translator_ctx = translator_ctx
         _identity_map = ProtocolIdentityMap.from_request(body, identity_snapshot)
     else:
         identity_snapshot = None

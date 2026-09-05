@@ -722,7 +722,11 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
         # 双重检查：force 路径不做（强制刷）
         if not force:
             expired = _parse_iso(acc.get("expired"))
-            if expired and (expired - datetime.now(timezone.utc)).total_seconds() >= 300:
+            if (
+                expired
+                and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
+                and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
+            ):
                 return acc["access_token"]
 
         provider = provider_of(acc)
@@ -891,7 +895,8 @@ def _refresh_sync_locked(account_key: str, force: bool) -> str:
 async def ensure_valid_token(account_key: str) -> str:
     """调用方：OAuthChannel.build_upstream_request。
 
-    返回可用的 access_token。剩余 ≥ 5min 直接返回缓存；否则在线程中持锁刷新。
+    返回可用的 access_token。剩余 ≥ 5min 且身份完整时返回缓存；否则持锁刷新。
+    旧 OpenAI 账号缺 workspace 时也需刷新一次，不能因 token 尚有效而跳过补全。
     同一 account_key 的并发请求由 threading.Lock 串行（跨 event loop 安全）。
     """
     account_key = _resolve_existing_account_key_or_raise(account_key)
@@ -900,7 +905,11 @@ async def ensure_valid_token(account_key: str) -> str:
         raise ValueError(f"unknown OAuth account: {account_key}")
 
     expired = _parse_iso(acc.get("expired"))
-    if expired and (expired - datetime.now(timezone.utc)).total_seconds() >= 300:
+    if (
+        expired
+        and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
+        and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
+    ):
         return acc["access_token"]
 
     return await asyncio.to_thread(_refresh_sync_locked, account_key, False)
@@ -3260,6 +3269,8 @@ def _add_account_serialized(entry: dict) -> None:
         normalized["last_model_sync_profile"] = str(
             entry.get("last_model_sync_profile") or ""
         )
+        for field in ("last_model_sync_attempt_client_version", "last_model_sync_attempt_profile"):
+            normalized[field] = str(entry.get(field) or "")
         normalized["models_etag"] = str(entry.get("models_etag") or "")
         normalized["models_etag_client_version"] = str(
             entry.get("models_etag_client_version") or ""
@@ -3470,6 +3481,7 @@ def _add_account_serialized(entry: dict) -> None:
                     "last_model_sync", "last_model_sync_source",
                     "last_model_sync_error", "last_model_sync_attempt",
                     "last_model_sync_client_version", "last_model_sync_profile",
+                    "last_model_sync_attempt_client_version", "last_model_sync_attempt_profile",
                     "models_etag", "models_etag_client_version", "models_etag_profile",
                 ) if key in target
             }
@@ -4419,6 +4431,10 @@ def _persist_model_discovery_failure(account_key: str, generation: str, error: s
             if _canonical_key(item) == account_key and _discovery_generation(item) == generation:
                 item["last_model_sync_attempt"] = now
                 item["last_model_sync_error"] = str(error or "discovery failed")[:500]
+                if provider_of(item) == "openai":
+                    profile = codex_protocol_profile()
+                    item["last_model_sync_attempt_client_version"] = profile.client_version
+                    item["last_model_sync_attempt_profile"] = profile.profile_id
                 changed["value"] = True
                 return
 
@@ -4947,6 +4963,18 @@ def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
     last_attempt = _parse_iso(account.get("last_model_sync_attempt"))
     failed = bool(account.get("last_model_sync_error"))
     if failed and last_attempt is not None:
+        if provider_of(account) == "openai":
+            profile = codex_protocol_profile()
+            # Old-client failures cannot suppress the first upgraded fetch.
+            # Failed-attempt identity is separate from the last successful sync
+            # so another failure still observes the normal retry backoff.
+            if (
+                str(account.get("last_model_sync_attempt_client_version") or "")
+                != profile.client_version
+                or str(account.get("last_model_sync_attempt_profile") or "")
+                != profile.profile_id
+            ):
+                return True
         return (now - last_attempt.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS
     if provider_of(account) == "openai":
         profile = codex_protocol_profile()
