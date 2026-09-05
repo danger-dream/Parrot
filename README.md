@@ -318,8 +318,8 @@ JSON 请求体：
 - 上游已经成功生成图片后，如果本地缓存写入失败，请求仍按成功返回，只是 `cached=false`。
 
 ### `GET /v1/models`
-返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤），Anthropic 标准格式。
-**配置了模型映射的别名也会在这里一同列出**（条件：别名所在入口的家族对该 Key 放行，且别名指向的真实模型本身对该 Key 可见），这样下游客户端直接拉列表就能看到最新别名。
+返回 Anthropic 标准格式的公开模型目录，需 API Key 验证并按其 `allowedModels` 白名单过滤。Claude、OpenAI、xAI、Antigravity OAuth 仅展示 Bot 默认列表中同 Provider 启用且无禁用原因的渠道实际支持的模型；清空默认列表不回退到全部账户目录。API 渠道和 Cursor 保持原目录，结果去重排序；Bot/config 修改立即生效，不限制已有账户目录中非默认模型的显式调用。
+**只额外列出 global 模型映射别名**：目标必须在上述目录中可见；Key 有白名单时，别名和目标都须获准。legacy ingress 专属别名不混入，也不返回账户/models.dev metadata。详见 [OAuth 模型目录边界](docs/08-oauth-multi.md#账户模型目录)。
 
 ### `GET /health`
 运维健康检查（无鉴权）：

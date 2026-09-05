@@ -753,13 +753,13 @@ async def list_models(request: Request):
 
     - 需要 API Key 验证（和 /v1/messages 一致）
     - 若 Key 有 allowedModels 白名单，再和全局模型列表取交集
-    - 否则返回所有启用渠道聚合的去重模型列表
+    - OAuth 按 Bot 默认列表与同渠道支持取交集；API/Cursor 保留原目录
     """
     key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    all_models = registry.available_models()
+    all_models = registry.discovery_models()
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
