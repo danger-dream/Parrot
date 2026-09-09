@@ -338,8 +338,15 @@ JSON 请求体：
 - 上游已经成功生成图片后，如果本地缓存写入失败，请求仍按成功返回，只是 `cached=false`。
 
 ### `GET /v1/models`
-返回当前所有启用渠道聚合的可用模型（按 API Key 白名单过滤），Anthropic 标准格式。
-**配置了模型映射的别名也会在这里一同列出**（条件：别名所在入口的家族对该 Key 放行，且别名指向的真实模型本身对该 Key 可见），这样下游客户端直接拉列表就能看到最新别名。
+需要 API Key 验证，返回去重、排序并按 `allowedModels` 白名单过滤的模型列表，响应格式保持不变。
+
+普通 OAuth 展示由 Bot「设置 → 默认模型」控制：Claude 使用 `oauthDefaultModels`，OpenAI、xAI、Antigravity 分别使用 `openaiOAuth.defaultModels`、`xaiOAuth.defaultModels`、`antigravityOAuth.defaultModels`。仅展示同一启用且未禁用渠道的目录内、通过该渠道支持检查的默认 ID；缺少路由或已停用的模型不会因出现在默认列表而被广告。显式空列表不贡献该 Provider 的普通 OAuth 展示项。缺失字段沿用当前配置正规化行为；最新版 OpenAI 没有内置默认列表，未配置时也不贡献展示项。
+
+API、Cursor 和 WorkBuddy 保留原有目录及原生公共别名（如 `cursor-auto`、`workbuddy-auto`）；后两者不属于这四组普通 OAuth 默认列表。Bot 保存、管理 API 修改与配置热加载在后续请求中生效，无需重启，也不增加缓存。
+
+这是公开发现策略，不是模型调用白名单：账户目录、后台同步和内部 `available_models()` 目录不变，已有目录支持的非默认模型仍可显式调用（继续受 API Key 权限、渠道/模型状态等既有检查约束）。默认列表的账户无目录兜底用途保持不变，不据此生成模型元数据。
+
+**全局模型映射别名也会列出**，前提是真实目标在上述结果中可见，且配置了 `allowedModels` 时别名本身也在白名单内。旧入口级别名不参与展示；绑定或账户元数据不能新增 ID 或扩展响应字段。
 
 ### `GET /health`
 运维健康检查（无鉴权）：

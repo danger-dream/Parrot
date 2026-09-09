@@ -268,7 +268,25 @@ RUNNERS = {"TG-OA-07": _run_oa07, "TG-ODM-01": _run_odm, "TG-OA-SET-01": _run_se
 
 @pytest.mark.parametrize("case", CASES, ids=lambda item: item["caseId"])
 def test_oauth_07_defaults_settings_strict_trace(case, monkeypatch):
-    check_trace(case, RUNNERS[case["capabilityId"]](case, monkeypatch))
+    observed = RUNNERS[case["capabilityId"]](case, monkeypatch)
+    expected = deepcopy(case)
+    if case["caseId"] == "TG-ODM-01.overview":
+        # Preserve the immutable v0.31.13 characterization artifact. This feature
+        # intentionally changes only the explanatory overview text; buttons,
+        # callbacks, payload shape and all side effects still compare strictly.
+        old_text = (
+            "仅当某个 OAuth 账户没有可用的实时/LKG 目录时，才作为该账户的无状态兜底；账户故障不会反向修改此列表。\n"
+            "Cursor 仍按账号自动同步，不在这里改。"
+        )
+        new_text = (
+            "用于 /v1/models 的普通 OAuth 展示，仅列出同 Provider 启用账户实际支持的默认 ID；清空后该 Provider 不贡献展示项。\n"
+            "同时保留账户没有实时/LKG 目录时的无状态兜底用途；不限制已有账户目录中非默认模型的显式调用，账户故障不会反向修改此列表。\n"
+            "Cursor 和 WorkBuddy 保留账号原生目录，不在这里改。"
+        )
+        payload = expected["tgApi"][1]["payload"]
+        assert payload["text"].count(old_text) == 1
+        payload["text"] = payload["text"].replace(old_text, new_text)
+    check_trace(expected, observed)
 
 
 def _source_callback_families():

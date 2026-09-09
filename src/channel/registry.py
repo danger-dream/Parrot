@@ -219,7 +219,7 @@ def channel_count() -> int:
 def available_models() -> list[str]:
     """跨所有启用渠道的客户端可见模型名（去重、排序）。
 
-    用于 `/v1/models` 列表。OAuth 渠道返回真实模型名，API 渠道返回 alias。
+    内部目录，不受公开发现的 OAuth 默认列表限制。OAuth 返回真实模型名或原生别名，API 返回 alias。
     """
     return available_models_for_families(None)
 
@@ -244,6 +244,48 @@ def available_models_for_families(families: Optional[set[str]]) -> list[str]:
         for m in ch.list_client_models():
             if m:
                 models.add(m)
+    return sorted(models)
+
+
+def discovery_models() -> list[str]:
+    """公开 `/v1/models`：普通 OAuth 默认 ID 与同渠道实际支持的 ID 取交集。
+
+    API/Cursor/WorkBuddy 保留原目录；不收窄内部目录或显式路由。
+    每次读取当前配置；缺失项由 config 正规化，显式空列表不做兜底。
+    """
+    cfg = config.get()
+    default_paths = {
+        OAuthChannel: ("oauthDefaultModels",),
+        OpenAIOAuthChannel: ("openaiOAuth", "defaultModels"),
+        XAIOAuthChannel: ("xaiOAuth", "defaultModels"),
+        AntigravityOAuthChannel: ("antigravityOAuth", "defaultModels"),
+    }
+    defaults_by_channel = {}
+    for channel_class, path in default_paths.items():
+        raw = cfg
+        for field in path:
+            raw = raw.get(field) if isinstance(raw, dict) else None
+        defaults_by_channel[channel_class] = (
+            {m for m in raw if isinstance(m, str) and m.strip()}
+            if isinstance(raw, list) else set()
+        )
+
+    models: set[str] = set()
+    for ch in all_channels():
+        if not ch.enabled or ch.disabled_reason:
+            continue
+        listed = ch.list_client_models()
+        for channel_class, defaults in defaults_by_channel.items():
+            if isinstance(ch, channel_class):
+                # Never use another account/provider's route to prove support.
+                listed = [
+                    m for m in listed
+                    if m in defaults and ch.supports_model(m) is not None
+                ]
+                break
+        # Cursor and WorkBuddy own their native catalogs/public route aliases;
+        # neither has an ordinary-default setting in the current schema.
+        models.update(m for m in listed if m)
     return sorted(models)
 
 
