@@ -2274,11 +2274,10 @@ async def run_failover(
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
             _recovery_retry_allowed("oauthRefresh", cfg)
+            and os.environ.get("PARROT_NO_REFRESH") != "1"
             and ch.type == "oauth"
             and result.http_status in (401, 403)
-            and (getattr(ch, "provider", "") != "workbuddy" or (
-                result.http_status == 401 and os.environ.get("PARROT_NO_REFRESH") != "1"
-            ))
+            and (getattr(ch, "provider", "") != "workbuddy" or result.http_status == 401)
             and not result.openai_oauth_html_403
             and quota_exhaustion is None
             and ch.key not in refreshed_once

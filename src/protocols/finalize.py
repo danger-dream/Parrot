@@ -26,6 +26,15 @@ _warning_lock = threading.Lock()
 _last_warning_at: dict[str, float] = {}
 _WARNING_INTERVAL_SECONDS = 60.0
 
+# Transport failures are not evidence of permanently invalid OAuth credentials.
+# Use the attempt outcome, not vendor-controlled error text, for new failures.
+_TRANSIENT_TRANSPORT_OUTCOMES = frozenset({
+    "connection_timeout", "http_connect_timeout", "connect_timeout", "pool_timeout",
+    "write_timeout", "read_timeout", "transport_timeout", "first_byte_timeout",
+    "idle_timeout", "total_timeout", "connect_error", "proxy_connect_error",
+    "transport_error",
+})
+
 
 def _warn_availability_failure(name: str, exc: sqlite3.Error) -> None:
     now = time.monotonic()
@@ -59,6 +68,7 @@ class FinalizePlan:
     write_affinity: bool = False
     cache_reasoning_replay: bool = False
     clear_reasoning_replay: bool = False
+    transient_transport_error: bool = False
 
 
 def success_plan(
@@ -106,6 +116,7 @@ def error_plan(
         record_failure=record_failure,
         record_cooldown_error=record_cooldown_error,
         clear_reasoning_replay=clear_reasoning_replay,
+        transient_transport_error=outcome in _TRANSIENT_TRANSPORT_OUTCOMES,
     )
 
 
@@ -174,15 +185,14 @@ def apply_error_health_effects(
 ) -> None:
     """Apply error scorer/cooldown effects for a precomputed plan."""
     if plan.record_cooldown_error:
+        cooldown_kwargs = {}
+        if cooldown_until is not None:
+            cooldown_kwargs["cooldown_until"] = cooldown_until
+        elif plan.transient_transport_error and channel_key.startswith("oauth:"):
+            cooldown_kwargs["transient_transport"] = True
         _run_health_effect(
             "record_cooldown_error",
-            lambda: (
-                cooldown.record_error(
-                    channel_key, model, error_detail, cooldown_until=cooldown_until,
-                )
-                if cooldown_until is not None
-                else cooldown.record_error(channel_key, model, error_detail)
-            ),
+            lambda: cooldown.record_error(channel_key, model, error_detail, **cooldown_kwargs),
         )
     if plan.record_failure:
         _run_health_effect(

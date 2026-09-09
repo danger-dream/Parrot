@@ -1303,11 +1303,13 @@ async def test_responses_ws_transient_retries_same_candidate_and_honors_retry_af
 
 
 @pytest.mark.asyncio
-async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatch, m):
+@pytest.mark.parametrize("disabled_by", ["config", "environment"])
+async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatch, m, disabled_by):
     cfg = _setup(m)
+    monkeypatch.setenv("PARROT_NO_REFRESH", "1" if disabled_by == "environment" else "0")
     cfg["retry"] = {
         "transient": {"enabled": False},
-        "recovery": {"oauthRefresh": False},
+        "recovery": {"oauthRefresh": disabled_by == "environment"},
     }
     oauth_ch = _make_oauth_channel_for_failover(m, name="no-refresh@example.com")
     api_ch = m["OpenAIApiChannel"]({
@@ -1322,7 +1324,7 @@ async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatc
     await ws.accept()
     first_obj = {"type": "response.create", "model": "test-model", "input": "hello", "stream": True}
     body = {"model": "test-model", "input": "hello", "stream": True}
-    request_id = "responses-ws-oauth-refresh-disabled"
+    request_id = f"responses-ws-oauth-refresh-disabled-{disabled_by}"
     started_at = time.time()
     started_monotonic = time.monotonic()
     m["log_db"].insert_pending(
@@ -1345,8 +1347,11 @@ async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatc
         )
         return m["responses_ws"]._WsAttemptResult(ok=True, outcome="success")
 
+    refresh_calls = []
+
     async def must_not_refresh(_account_key):
-        raise AssertionError("oauthRefresh=false must suppress force_refresh")
+        refresh_calls.append(_account_key)
+        raise AssertionError("disabled refresh must suppress force_refresh")
 
     from src.scheduler import ScheduleResult
     route = ScheduleResult(
@@ -1370,6 +1375,7 @@ async def test_responses_ws_oauth_refresh_setting_can_disable_refresh(monkeypatc
 
     assert accepted is True
     assert calls == [oauth_ch.key, api_ch.key]
+    assert refresh_calls == []
     assert _last_request_log(m)["status"] == "success"
 
 

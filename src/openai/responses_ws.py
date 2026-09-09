@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import time
 import traceback
@@ -1006,6 +1007,7 @@ async def _run_ws_failover(
 
         if (
             recovery_retry_allowed("oauthRefresh", cfg)
+            and os.environ.get("PARROT_NO_REFRESH") != "1"
             and ch.type == "oauth"
             and result.http_status in (401, 403)
             and not result.openai_oauth_html_403

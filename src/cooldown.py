@@ -34,8 +34,9 @@ def init() -> None:
         if isinstance(entry, dict) and entry.get("name")
     }
     upgraded_quota = 0
+    recovered_transport = 0
     with _lock:
-        _entries.clear()
+        loaded_entries = {}
         for row in rows:
             channel_key = row["channel_key"]
             model = row["model"]
@@ -69,14 +70,34 @@ def init() -> None:
                     )
                     upgraded_quota += 1
 
+            # Older versions persisted OAuth network timeouts as permanent.
+            # Only recognizable internal timeout diagnostics qualify; never
+            # infer authentication, quota, operator or unknown errors as healthy.
+            if (
+                cooldown_until == _INF
+                and channel_key.startswith("oauth:")
+                and _legacy_transport_timeout(message)
+            ):
+                cooldown_until = _now_ms() + _transport_retry_minutes() * 60_000
+                state_db.error_save(
+                    channel_key, model, int(row["error_count"] or 0),
+                    cooldown_until, message,
+                )
+                recovered_transport += 1
+
             key = (channel_key, model)
-            _entries[key] = {
+            loaded_entries[key] = {
                 "error_count": int(row["error_count"] or 0),
                 "cooldown_until": cooldown_until,
                 "last_error_message": message,
             }
+        # Publish only after every required migration write succeeds.
+        _entries.clear()
+        _entries.update(loaded_entries)
     _initialized = True
     suffix = f"; upgraded {upgraded_quota} Zhipu quota cooldown(s)" if upgraded_quota else ""
+    if recovered_transport:
+        suffix += f"; scheduled finite retries for {recovered_transport} OAuth transport cooldown(s)"
     print(f"[cooldown] loaded {len(rows)} entries from StateStore snapshots{suffix}")
 
 
@@ -84,6 +105,26 @@ def _windows() -> list[int]:
     cfg = config.get()
     w = cfg.get("errorWindows") or [1, 3, 5, 10, 15, 0]
     return [int(x) for x in w]
+
+
+def _transport_retry_minutes() -> int:
+    """Use the configured finite ceiling, never a permanent transport ban."""
+    return max((value for value in _windows() if value > 0), default=15)
+
+
+def _legacy_transport_timeout(message: str | None) -> bool:
+    # Persisted rows predate typed finalization hints. Fail closed on arbitrary
+    # prose: accept only complete, recognized internal timeout diagnostics.
+    if not isinstance(message, str):
+        return False
+    tokens = {
+        "connection_timeout", "http_connect_timeout", "connect_timeout",
+        "first_byte_timeout", "idle_timeout", "total_timeout",
+        "pool_timeout", "write_timeout", "read_timeout", "transport_timeout",
+    }
+    return message in tokens or message in {
+        f"{token} while opening upstream response" for token in tokens
+    }
 
 
 def _grace_count(channel_key: str) -> int:
@@ -140,7 +181,8 @@ def _permanent_min_age_ms() -> int:
 
 
 def record_error(channel_key: str, model: str, message: str | None = None,
-               *, cooldown_until: int | None = None) -> dict:
+               *, cooldown_until: int | None = None,
+               transient_transport: bool = False) -> dict:
     """记一次失败，按阶梯推进 cooldown_until。返回更新后的状态。
 
     防爆发式冷却三道闸（2026-04-21 新增）：
@@ -153,6 +195,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
          真正持续故障（跨越 5 分钟仍失败）才会永久
 
     调用方显式传 `cooldown_until`（如 429 解析出 reset ms）时，绕过三道闸直接落盘。
+    `transient_transport=True` 仅由内部结果分类传入：OAuth 自动永久档改用
+    最大有限窗口；不覆盖显式期限或已有永久冻结，也不改变 API 渠道策略。
 
     若本次推进让该 (channel, model) **首次进入永久冷却**，触发"channel_permanent"事件通知。
     """
@@ -200,6 +244,11 @@ def record_error(channel_key: str, model: str, message: str | None = None,
             # 显式指定（429 reset）：直接使用，算一次推进
             cooldown_until = explicit_cooldown
             last_advance_at = now
+        elif transient_transport and prev_cd == _INF:
+            # An in-flight network error cannot undo or relabel an existing
+            # permanent/manual freeze. Legacy recovery happens only at init.
+            cooldown_until = prev_cd
+            message = state.get("last_error_message")
         elif already_cooling or too_soon:
             # 不推进阶梯，保留原 cooldown_until
             cooldown_until = prev_cd
@@ -210,6 +259,8 @@ def record_error(channel_key: str, model: str, message: str | None = None,
             # 已超出宽容期：用扣除 grace 后的次数索引 errorWindows
             ladder_idx = min(new_count - 1 - grace, len(windows) - 1)
             minutes = windows[ladder_idx]
+            if minutes == 0 and transient_transport and channel_key.startswith("oauth:"):
+                minutes = _transport_retry_minutes()
             if minutes == 0:
                 # 准备进永久：检查 first_error_at 年龄
                 age_ms = now - first_error_at
