@@ -347,7 +347,7 @@ def test_five_common_callbacks_render_stale_once_without_refresh_redraw(m, monke
     assert len(recorder.edits()) == 5
 
 
-def test_five_common_cold_callbacks_keep_page_and_commands_only_send_hint(m, monkeypatch):
+def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_keep_hint(m, monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(m["ui"], "api", recorder)
     m["config"].update(lambda cfg: cfg.update({
@@ -360,12 +360,15 @@ def test_five_common_cold_callbacks_keep_page_and_commands_only_send_hint(m, mon
     m["oauth_menu"].show(42, 103, "cb-oauth")
     m["apikey_menu"].show(42, 104, "cb-apikey")
 
-    assert recorder.edits() == []
+    assert len(recorder.edits()) == 1
+    assert recorder.edits()[0]["message_id"] == 101
+    assert "完成后自动更新" in recorder.edits()[0]["text"]
     answers = [
         data for method, data in recorder.calls if method == "answerCallbackQuery"
     ]
     assert len(answers) == 5
-    assert all("初始化" in data.get("text", "") for data in answers)
+    assert all("初始化" in data.get("text", "") for data in answers if data["callback_query_id"] != "cb-stats")
+    assert "自动更新" in next(data["text"] for data in answers if data["callback_query_id"] == "cb-stats")
 
     m["main"].show(42)
     m["stats_menu"].send_new(42)
@@ -375,33 +378,34 @@ def test_five_common_cold_callbacks_keep_page_and_commands_only_send_hint(m, mon
     sends = [data for method, data in recorder.calls if method == "sendMessage"]
     assert len(sends) == 5
     assert all("初始化" in data["text"] for data in sends)
-    assert recorder.edits() == []
+    assert len(recorder.edits()) == 1
 
 
-def test_rolling_stats_uses_same_queue_and_never_auto_edits(m, monkeypatch):
+def test_rolling_stats_uses_same_queue_and_auto_edits_cold_page(m, monkeypatch):
     menu_cache = m["menu_cache"]
     recorder = Recorder()
     monkeypatch.setattr(m["ui"], "api", recorder)
     _patch_fast_common_loaders(m, monkeypatch)
 
     m["stats_menu"].view(42, 100, "cb-first", "3", "all")
-    assert recorder.edits() == []
+    assert len(recorder.edits()) == 1
+    assert "正在加载" in recorder.edits()[0]["text"]
     first_answer = [
         data for method, data in recorder.calls if method == "answerCallbackQuery"
     ][-1]
-    assert "准备" in first_answer["text"]
+    assert "完成后自动更新" in first_answer["text"]
 
     menu_cache.start()
     _wait_until(
         lambda: menu_cache.PERIOD_STATS.peek(("rolling-period", "3")).value
         is not None
     )
-    time.sleep(0.05)
-    assert recorder.edits() == []
+    _wait_until(lambda: len(recorder.edits()) == 2)
+    assert "正在加载" not in recorder.edits()[-1]["text"]
 
     m["stats_menu"].view(42, 100, "cb-retry", "3", "all")
-    assert len(recorder.edits()) == 1
-    assert "正在加载" not in recorder.edits()[0]["text"]
+    assert len(recorder.edits()) == 3
+    assert "正在加载" not in recorder.edits()[-1]["text"]
 
 
 def test_bot_lifecycle_starts_and_stops_scheduler(m, monkeypatch):

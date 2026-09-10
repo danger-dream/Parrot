@@ -1,4 +1,4 @@
-"""Strict v0.31.13 characterization traces for TG cache and stats."""
+"""v0.31.13 traces, with explicit 2026-09-10 authorized cold-stats UX deltas."""
 
 from __future__ import annotations
 
@@ -319,9 +319,45 @@ def run_case(case: dict[str, Any], monkeypatch) -> dict[str, Any]:
     return RUNNERS[case["entry"]["scenario"]](case, monkeypatch)
 
 
+# The user authorized loading + automatic completion on 2026-09-10. Keep the
+# historical fixture immutable; only these three cold callback traces change.
+# All warm/stale views, commands, preferences and cache contracts remain strict.
+_COLD_VIEW_DELTAS = {
+    "TG-STATS-01.cold-today-callback": ("0", "今天"),
+    "TG-STATS-01.cold-rolling-loading-queued": ("3", "最近 3 天"),
+    "TG-STATS-01.invalid-view-falls-back-cold-today": ("0", "今天"),
+}
+
+
+def _expected_current_trace(case):
+    if case["caseId"] not in _COLD_VIEW_DELTAS:
+        return case
+    period, label = _COLD_VIEW_DELTAS[case["caseId"]]
+    expected = deepcopy(case)
+    # Reuse the frozen keyboard for this exact period/dimension, not production
+    # rendering code, so the intentional loading change cannot hide button drift.
+    warm = next(item for item in CASES if
+                item["entry"].get("scenario") == "stats_view"
+                and item["entry"]["period"] == period and item["entry"]["dim"] == "all")
+    keyboard = deepcopy(warm["tgApi"][-1]["payload"]["reply_markup"])
+    expected["tgApi"] = [
+        {"method": "answerCallbackQuery", "payload": {
+            "callback_query_id": "cb-stats", "text": "正在统计，完成后自动更新",
+        }},
+        {"method": "editMessageText", "payload": {
+            "chat_id": 42, "message_id": 77,
+            "text": f"📊 <b>统计 — {label}</b>\n\n⏳ 正在加载，完成后自动更新，无需重复点击。",
+            "parse_mode": "HTML", "reply_markup": keyboard,
+        }},
+    ]
+    key = ["period", int(case["initialRuntime"]["todayStart"])] if period == "0" else ["rolling-period", "3"]
+    expected["finalBusinessState"]["enqueued"] = [{"key": key, "generation": 0}]
+    return expected
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["caseId"])
 def test_cache_stats_trace(case, monkeypatch):
-    assert_strict_equal(case, run_case(case, monkeypatch))
+    assert_strict_equal(_expected_current_trace(case), run_case(case, monkeypatch))
 
 
 def test_observability_manifest_and_test_coverage_are_bidirectional():

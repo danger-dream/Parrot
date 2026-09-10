@@ -52,7 +52,8 @@ class SWRCache:
     """线程安全 stale-while-revalidate 缓存。
 
     ``request`` 只把 loader 排入中央协调器，不创建线程。loader 异常不会覆盖
-    上一次成功值。``on_ready`` 仅为低频详情兼容保留；常用菜单不注册回调。
+    上一次成功值。``on_ready`` 用于冷缓存完成后更新当前页面；有旧值的常用
+    菜单仍只渲染一次。``interactive`` 只提升已有任务的优先级，不重复查询。
     """
 
     def __init__(self, ttl_seconds: float):
@@ -60,6 +61,7 @@ class SWRCache:
         self._lock = threading.Lock()
         self._values: dict[Hashable, tuple[Any, float]] = {}
         self._inflight: set[Hashable] = set()
+        self._interactive: set[Hashable] = set()
         self._waiters: dict[
             Hashable,
             dict[Hashable, Callable[[Any, Exception | None], None]],
@@ -84,6 +86,7 @@ class SWRCache:
         subscriber: Hashable | None = None,
         on_ready: Callable[[Any, Exception | None], None] | None = None,
         force: bool = False,
+        interactive: bool = False,
     ) -> CacheRead:
         """读取快照，并把必要的刷新 single-flight 排入中央串行队列。"""
         read, generation, should_enqueue = self._reserve(
@@ -91,6 +94,7 @@ class SWRCache:
             subscriber=subscriber,
             on_ready=on_ready,
             force=force,
+            interactive=interactive,
         )
         if should_enqueue:
             COORDINATOR.enqueue(self, key, loader, generation)
@@ -103,6 +107,7 @@ class SWRCache:
         subscriber: Hashable | None = None,
         on_ready: Callable[[Any, Exception | None], None] | None = None,
         force: bool = False,
+        interactive: bool = False,
     ) -> tuple[CacheRead, int, bool]:
         now = time.monotonic()
         with self._lock:
@@ -110,6 +115,8 @@ class SWRCache:
             fresh = bool(item is not None and now - item[1] < self.ttl_seconds)
             if not force and fresh:
                 return CacheRead(item[0], True, key in self._inflight), self._generation, False
+            if interactive:
+                self._interactive.add(key)
             if on_ready is not None:
                 waiter_key = subscriber if subscriber is not None else object()
                 self._waiters.setdefault(key, {})[waiter_key] = on_ready
@@ -118,6 +125,10 @@ class SWRCache:
                 self._inflight.add(key)
             value = item[0] if item is not None else None
             return CacheRead(value, False, True), self._generation, should_enqueue
+
+    def _is_interactive(self, key: Hashable, generation: int) -> bool:
+        with self._lock:
+            return generation == self._generation and key in self._interactive
 
     def refresh_now(self, key: Hashable, loader: Callable[[], Any]) -> bool:
         """仅供协调器周期任务使用；在当前调度线程同步刷新一个 key。"""
@@ -145,6 +156,7 @@ class SWRCache:
             if error is None:
                 self._values[key] = (value, time.monotonic())
             self._inflight.discard(key)
+            self._interactive.discard(key)
             waiters = list(self._waiters.pop(key, {}).values())
 
         for callback in waiters:
@@ -161,6 +173,7 @@ class SWRCache:
             if generation != self._generation:
                 return
             self._inflight.discard(key)
+            self._interactive.discard(key)
             self._waiters.pop(key, None)
 
     def store(self, key: Hashable, value: Any, *, age_seconds: float = 0) -> None:
@@ -176,6 +189,7 @@ class SWRCache:
             self._generation += 1
             self._values.clear()
             self._inflight.clear()
+            self._interactive.clear()
             self._waiters.clear()
 
 
@@ -287,6 +301,16 @@ class StatsRefreshCoordinator:
                 while self._running:
                     now = time.monotonic()
                     due = [job for job in self._periodic if job.next_due <= now]
+                    # 用户冷缓存请求优先于下一项后台工作，仍不抢占运行中的 SQL。
+                    # 标记随 cache reservation 保存，后台已排队甚至尚未 enqueue
+                    # 的同键任务都能提升优先级，且不会破坏 single-flight。
+                    selected_load = next((
+                        item for item in self._queue
+                        if item.cache._is_interactive(item.key, item.generation)
+                    ), None)
+                    if selected_load is not None:
+                        self._queue.remove(selected_load)
+                        break
                     if due:
                         selected_job = min(due, key=lambda job: (job.priority, job.next_due))
                         # 防止任务执行期间被再次视为到期。
@@ -525,7 +549,7 @@ def run_if_current(
     token: int,
     callback: Callable[[], Any],
 ) -> bool:
-    """与 begin_view 串行执行一次消息更新，供非统计后台交互避免竞态。"""
+    """与 begin_view 串行执行一次消息更新，防止后台结果覆盖新页面。"""
     key = (int(chat_id), int(message_id))
     lock = _message_lock(*key)
     with lock:

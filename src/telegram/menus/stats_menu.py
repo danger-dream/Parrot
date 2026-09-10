@@ -688,6 +688,44 @@ def _error_page(exc: Exception) -> tuple[str, dict]:
     )
 
 
+def _load_cold_view(chat_id: int, message_id: int, cb_id: str,
+                    period: str, dim: str, since: float, key: tuple) -> None:
+    token = menu_cache.begin_view(chat_id, message_id)
+    ui.answer_cb(cb_id, "正在统计，完成后自动更新")
+    loading = (
+        f"📊 <b>统计 — {_PERIOD_LABELS[period]}</b>\n\n"
+        "⏳ 正在加载，完成后自动更新，无需重复点击。"
+    )
+    # 先提交加载页，再订阅完成通知，避免快查询的结果被迟到的加载页盖回。
+    if not menu_cache.run_if_current(
+        chat_id, message_id, token,
+        lambda: ui.edit(chat_id, message_id, loading, reply_markup=_kb(period, dim)),
+    ):
+        return
+
+    def on_ready(snapshot, error) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        if error is not None:
+            text, _ = _error_page(error)
+            kb = _kb(period, dim)  # 查询失败后可直接刷新重试或切换范围。
+        else:
+            text, kb = _compose_snapshot(snapshot, period, dim)
+            text = _maybe_suffix_status_banner(text)
+        menu_cache.run_if_current(
+            chat_id, message_id, token,
+            lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+        )
+
+    cached = menu_cache.PERIOD_STATS.request(
+        key, lambda: _CONTROL.period_snapshot_since(_CONTEXT, since),
+        subscriber=(chat_id, message_id), on_ready=on_ready, interactive=True,
+    )
+    # 周期预热可能在 peek 与订阅之间完成；fresh 分支不会注册回调。
+    if cached.fresh and cached.value is not None:
+        on_ready(cached.value, None)
+
+
 def view(chat_id: int, message_id: int, cb_id: str,
          period: str = "0", dim: str = "all") -> None:
     period = period if period in _VALID_PERIODS else "0"
@@ -696,14 +734,8 @@ def view(chat_id: int, message_id: int, cb_id: str,
     key = _period_cache_key(period, since)
     cached = menu_cache.PERIOD_STATS.peek(key)
     if cached.value is None:
-        # 今日/本月由主动预热负责；3/7 天只排入同一个串行队列。
-        if period not in ("0", "month"):
-            menu_cache.PERIOD_STATS.request(
-                key, lambda: _CONTROL.period_snapshot_since(_CONTEXT, since),
-            )
-            ui.answer_cb(cb_id, "统计正在准备，请稍后再试")
-        else:
-            ui.answer_cb(cb_id, menu_cache.initialization_text())
+        # 今日/本月尚未预热时也能主动加入同一队列，或订阅在途预热结果。
+        _load_cold_view(chat_id, message_id, cb_id, period, dim, since, key)
         return
 
     ui.answer_cb(cb_id)
