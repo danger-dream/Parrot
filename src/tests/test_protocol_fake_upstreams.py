@@ -21,18 +21,42 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
+
+
+@pytest.fixture
+def channel_slots_enabled(tmp_path, monkeypatch):
+    """Slot ownership assertions require accounting, not an inherited WS cache.
+
+    Keep the real config update and its backups private to this test, then
+    restore the caller's matching config path/cache/mtime (even when disabled).
+    """
+    from src import config
+
+    path = tmp_path / "channel-slots-config.json"
+    if Path(config.CONFIG_PATH).exists():
+        shutil.copy2(config.CONFIG_PATH, path)
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(config, "_cache", copy.deepcopy(config._cache))
+    monkeypatch.setattr(config, "_mtime", config._mtime)
+    monkeypatch.setattr(config, "_rejected_rewrite_version", None)
+    monkeypatch.setattr(config, "_reload_callbacks", list(config._reload_callbacks))
+    config.update(lambda cfg: cfg.setdefault("concurrency", {}).__setitem__("enabled", True))
+    assert config.get()["concurrency"]["enabled"] is True
 
 
 def _import_modules():
@@ -3642,7 +3666,7 @@ async def test_native_responses_function_call_is_logged_before_terminal_event_is
     await mc.aclose()
 
 
-async def test_native_responses_function_call_releases_upstream_before_terminal_yield(m):
+async def test_native_responses_function_call_releases_upstream_before_terminal_yield(m, channel_slots_enabled):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -3704,7 +3728,7 @@ async def test_native_responses_function_call_releases_upstream_before_terminal_
 
 
 @pytest.mark.parametrize("terminal_kind", ["failed", "incomplete"])
-async def test_native_responses_error_terminal_finalizes_before_yield(m, terminal_kind):
+async def test_native_responses_error_terminal_finalizes_before_yield(m, terminal_kind, channel_slots_enabled):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()

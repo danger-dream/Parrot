@@ -20,6 +20,7 @@ from src.scheduler import ScheduleResult
 
 from src.tests import conftest as test_conftest
 from src.tests import test_protocol_fake_upstreams as fake
+from src.tests.test_protocol_fake_upstreams import channel_slots_enabled
 
 
 _import_modules = fake._import_modules
@@ -205,7 +206,7 @@ async def test_http_stream_all_log_writes_run_outside_event_loop(monkeypatch, m)
     ],
 )
 async def test_channel_slot_release_survives_real_executor_log_cancellation(
-    monkeypatch, m, transport, saturated, blocked_write,
+    monkeypatch, m, transport, saturated, blocked_write, channel_slots_enabled,
 ):
     """Post-acquire writes, cancellation terminals, and release are ordered once."""
 

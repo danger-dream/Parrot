@@ -758,20 +758,31 @@ def _get_conn_for_ref(ref: LogDbRef) -> sqlite3.Connection:
             cache.pop(ref.path, None)
             conn = None
     if conn is None:
-        # check_same_thread=False 仅用于留存清理在持 _write_lock 时关闭旧月闲置
-        # 连接；正常读写仍按 thread-local 路由，且写操作始终由 _write_lock 串行。
-        conn = sqlite3.connect(ref.path, timeout=10, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        # Journal-mode negotiation is itself a schema-level write. Serialize the
+        # COMPLETE cold open, not just CREATE/migrations: concurrent DELETE→WAL
+        # upgrades can fail immediately with SQLITE_BUSY despite busy_timeout.
         with _write_lock:
-            conn.executescript(_schema_sql())
-            _ensure_migrations(conn)
-            conn.commit()
-        cache[ref.path] = conn
-        with _write_conn_registry_lock:
-            _write_conn_registry.setdefault(ref.path, []).append(conn)
+            with _write_conn_registry_lock:
+                if ref.path in _retired_log_paths:
+                    # Retention may have won while this cold opener waited.
+                    raise RetentionPlanError(f"log database was removed by retention cleanup: {ref.path}")
+            # check_same_thread=False allows retention to close retired idle
+            # connections under this lock; ordinary access remains thread-local.
+            conn = sqlite3.connect(ref.path, timeout=10, check_same_thread=False)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.executescript(_schema_sql())
+                _ensure_migrations(conn)
+                conn.commit()
+            except BaseException:
+                conn.close()
+                raise
+            cache[ref.path] = conn
+            with _write_conn_registry_lock:
+                _write_conn_registry.setdefault(ref.path, []).append(conn)
     # Legacy introspection compatibility only; write routing never reads these.
     _local.conn = conn
     _local.month = ref.month

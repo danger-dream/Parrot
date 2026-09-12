@@ -16,9 +16,12 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import copy
 import json
 import os
+import shutil
 import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -27,6 +30,25 @@ from fastapi.responses import Response
 from starlette.requests import Request
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
+
+
+@pytest.fixture(autouse=True)
+def _isolate_realtime_config(tmp_path, monkeypatch):
+    """Do not leak realtime's disabled limits or synthetic config to later tests.
+
+    Keep account saves and their backups private, then restore the original
+    path together with its matching cache, mtime and reload bookkeeping.
+    """
+    from src import config
+
+    path = tmp_path / "realtime-config.json"
+    if Path(config.CONFIG_PATH).exists():
+        shutil.copy2(config.CONFIG_PATH, path)
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(config, "_cache", copy.deepcopy(config._cache))
+    monkeypatch.setattr(config, "_mtime", config._mtime)
+    monkeypatch.setattr(config, "_rejected_rewrite_version", None)
+    monkeypatch.setattr(config, "_reload_callbacks", list(config._reload_callbacks))
 
 
 _NO_CLIENT_FRAME = object()

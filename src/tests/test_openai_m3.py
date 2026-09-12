@@ -27,6 +27,8 @@ import time
 import httpx
 import pytest
 
+from src.tests._config_isolation import isolated_config
+
 
 def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1018,6 +1020,7 @@ async def test_guard_r2c_builtin_call_in_input(m):
     print("  [PASS] r2c guard: input contains file_search_call → 400")
 
 
+@pytest.mark.usefixtures("isolated_config")
 async def test_http_mapping_freezes_routed_logical_metadata_binding(m):
     """A global alias must bind after mapping, before channel alias resolution."""
     _setup(m)

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from ._isolation import isolate
+from ._config_isolation import isolated_config
 
 isolate()
 
@@ -320,6 +321,7 @@ def test_internal_compact_bodies_cap_output_budget():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_config")
 async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     import server
     from src import model_pricing

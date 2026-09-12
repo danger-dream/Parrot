@@ -39,6 +39,8 @@ import uuid
 
 import pytest
 
+from src.tests._config_isolation import isolated_config
+
 
 def _valid_encrypted_content(seed: int = 1) -> str:
     payload = bytearray(1 + 8 + 16 + 16 + 32)
@@ -1540,6 +1542,7 @@ def test_openai_oauth_explicit_short_config_always_beats_legacy(m):
     print("  [PASS] explicit openaiOAuth wins over legacy regardless of default equality")
 
 
+@pytest.mark.usefixtures("isolated_config")
 def test_openai_oauth_short_config_overrides_codex_url_and_default_instructions(m):
     _setup(m)
     _add_openai_acc(m)
