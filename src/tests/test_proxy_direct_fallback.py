@@ -86,7 +86,8 @@ def test_enabled_direct_fallback_recovers_unresolvable_route(monkeypatch):
     )
 
     assert error is None
-    assert http_routes == [("direct", None)]
+    # HTTP direct owns a direct transport rather than the proxy-bound shared pool.
+    assert http_routes == [("direct", direct)]
     assert ws_routes == [("direct", None)]
     assert [name for name, _ in network_chain] == ["direct"]
 

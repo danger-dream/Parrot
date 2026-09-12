@@ -15,6 +15,10 @@ from urllib.parse import urlsplit
 from contextlib import contextmanager
 from typing import Any
 
+from .workbuddy_request_rewrite import (
+    DEFAULT_REQUEST_REWRITE, RewriteConfigError, settings_from_config as _workbuddy_rewrite_settings,
+)
+
 COMPACT_RESCUE_DEFAULT_DIRECT_PROMPT = (
     'You are performing Claude Code style conversation compaction.\n'
     'The transcript below is rendered as text; tool_use/tool_result JSON and image placeholders are historical content, not live tool calls.\n'
@@ -122,6 +126,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "maxQueuedBodySpoolBytes": 2147483648,
     },
     "oauthAccounts": [],
+    # Provider-local request template adaptation, currently CN CLI only.
+    "workbuddy": {"requestRewrite": copy.deepcopy(DEFAULT_REQUEST_REWRITE)},
     "channels": [],
     "images": {
         "enabled": True,
@@ -672,6 +678,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _cache: dict[str, Any] | None = None
 _mtime: float = 0.0
+# A rejected disk version is readable via LKG, never writable from that stale
+# snapshot. Include the path so isolated/alternate config files cannot inherit it.
+_rejected_rewrite_version: tuple[str, float] | None = None
 # 必须是可重入锁 (RLock)：同一线程内的加载/保存辅助函数可能再次访问配置。
 # reload callbacks 始终在锁外执行，避免 callback 跨模块重入造成死锁。
 _lock = threading.RLock()
@@ -961,6 +970,8 @@ def _load_from_disk() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         raw = json.load(f)
     merged = _deep_merge_defaults(DEFAULT_CONFIG, raw)
+    # Reject invalid rewrite rules before any migration/backfill writes.
+    _workbuddy_rewrite_settings(merged)
     # 自动升级旧式配置结构并持久化；同时把新增默认配置项写回磁盘。
     # 这样从旧版本升级的用户不仅运行时能拿到默认值，config.json 里也会
     # 自动出现 compactRescue / protocolBridge / openaiOAuth / anysearch 新字段，
@@ -1043,6 +1054,7 @@ def _rotate_backups() -> None:
 
 def _write_atomic(data: dict) -> None:
     """Write through a private 0600 temp file, then atomically replace config."""
+    _workbuddy_rewrite_settings(data)
     parent = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
     prefix = f".{os.path.basename(CONFIG_PATH)}."
     fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=parent, text=True)
@@ -1076,13 +1088,24 @@ def _current_mtime() -> float:
 
 def _ensure_loaded(force: bool = False) -> tuple[dict, bool]:
     """返回 (cfg, need_fire_callbacks)。callback 由调用方在锁外触发。"""
-    global _cache, _mtime
+    global _cache, _mtime, _rejected_rewrite_version
     mt = _current_mtime()
     need_reload = force or _cache is None or mt != _mtime
     if need_reload:
-        new_cache = _load_from_disk()
+        try:
+            new_cache = _load_from_disk()
+        except RewriteConfigError as exc:
+            _rejected_rewrite_version = (os.path.abspath(CONFIG_PATH), mt)
+            if force or _cache is None:
+                raise
+            # A manual rule typo must not take down unrelated live channels.
+            # Retain the last valid snapshot; retry when the file changes again.
+            print(f"[config] rejected WorkBuddy rewrite config; retaining last valid config: {exc}")
+            _mtime = mt
+            return _cache, False
         _cache = new_cache
         _mtime = _current_mtime()
+        _rejected_rewrite_version = None
         return _cache, True
     return _cache, False
 
@@ -1112,14 +1135,25 @@ def reload() -> dict:
     return cfg
 
 
+def _require_writable_rewrite_config() -> None:
+    """Called under _lock after loading, before any mutator or disk write."""
+    if _rejected_rewrite_version == (os.path.abspath(CONFIG_PATH), _current_mtime()):
+        raise RewriteConfigError(
+            "workbuddy.requestRewrite on disk is invalid; correct the config file before saving other settings"
+        )
+
+
 def save() -> None:
-    """把内存中当前 cache 写回磁盘。"""
+    """把内存中当前 cache 写回磁盘；不得覆盖被拒绝的手工配置。"""
     global _mtime
     with _lock:
-        if _cache is None:
-            _ensure_loaded()
+        _, need_fire = _ensure_loaded()
+        _require_writable_rewrite_config()
         _write_atomic(_cache)
         _mtime = _current_mtime()
+        snapshot = _cache
+    if need_fire:
+        _fire_reload_callbacks(snapshot)
 
 
 @contextmanager
@@ -1142,17 +1176,22 @@ def update(mutator, *, skip_if_unchanged: bool = False) -> dict:
     global _cache, _mtime
     with _update_lifecycle_lock:
         with _lock:
-            if _cache is None:
-                _ensure_loaded()
+            # Reload corrected/manual disk edits before rebasing an unrelated
+            # account/settings update. An LKG fallback is not write permission.
+            _, need_fire = _ensure_loaded()
+            _require_writable_rewrite_config()
             candidate = copy.deepcopy(_cache)
             mutator(candidate)
             if skip_if_unchanged and candidate == _cache:
-                return _cache
-            _write_atomic(candidate)
-            _mtime = _current_mtime()
-            _cache = candidate
-            snapshot = candidate
-        _fire_reload_callbacks(snapshot)
+                snapshot = _cache
+            else:
+                _write_atomic(candidate)
+                _mtime = _current_mtime()
+                _cache = candidate
+                snapshot = candidate
+                need_fire = True
+        if need_fire:
+            _fire_reload_callbacks(snapshot)
         return snapshot
 
 

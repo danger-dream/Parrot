@@ -16,11 +16,16 @@ PATHS = ["/v1/messages", "/v1/chat/completions", "/v1/responses"]
 
 
 @pytest.fixture
-async def app_client(m):
+async def app_client(m, monkeypatch):
     _setup(m)
     _install_keys(m, _default_key())
     _install_channels(m, [])
-    async with httpx.AsyncClient(
+    # ASGITransport does not run lifespan: explicitly install a ready local
+    # client so these channel/cooldown tests don't report runtime uninitialized.
+    monkeypatch.setattr(m["upstream"], "_client_pool", m["upstream"].SharedClientPool(m["upstream"]._new_client))
+    ready_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    m["upstream"].set_client(ready_client)
+    async with ready_client, httpx.AsyncClient(
         transport=httpx.ASGITransport(app=server.app, raise_app_exceptions=False),
         base_url="http://audit.invalid", headers={"Authorization": "Bearer ccp-test"},
     ) as client:

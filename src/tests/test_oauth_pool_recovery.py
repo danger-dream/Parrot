@@ -35,7 +35,7 @@ def pool_env(monkeypatch, tmp_path):
     config.reload()
     m = fake._import_modules()
     monkeypatch.setattr(m["registry"], "_channels", {})
-    monkeypatch.setattr(m["upstream"], "_client", None)
+    monkeypatch.setattr(m["upstream"], "_client_pool", m["upstream"].SharedClientPool(m["upstream"]._new_client))
     drain.reset_for_tests()
     fake._setup(m)
     yield m

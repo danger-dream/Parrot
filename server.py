@@ -28,6 +28,7 @@ import uvicorn
 from uvicorn.server import HANDLED_SIGNALS
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src import (
@@ -570,7 +571,7 @@ async def lifespan(app: FastAPI):
                 t.cancel()
             await asyncio.gather(*_background_tasks, return_exceptions=True)
             await apikey_limiter.shutdown_spooling()
-            tgbot.stop()
+            await tgbot.stop_async()
             management_close_started = True
             await _close_management_runtime(app)
             # Provider workers may mutate state; stop them before the final snapshot.
@@ -944,7 +945,9 @@ async def health():
       status: ok / degraded / error
       ok 条件：registry 已构建 + 至少一个 enabled 渠道（或 enabled OAuth）
       degraded: 存在 enabled 渠道但全部冷却
-      error: 无任何 enabled 渠道
+      error: 无任何 enabled 渠道，或共享 HTTP 运行时不可用
+      仅运行时不可用时新增 HTTP 503；原渠道/冷却/排空响应语义保持不变。
+      检查本地生命周期状态，不构建客户端、不发起上游探测。
     """
     cfg = config.get()
     chs = registry.all_channels()
@@ -968,8 +971,14 @@ async def health():
             status = "degraded"
     oauth_count = len(cfg.get("oauthAccounts") or [])
     api_count = len(cfg.get("channels") or [])
-    return {
-        "status": "draining" if drain.is_draining() else status,
+    client_state = upstream.client_health()
+    runtime_unavailable = not client_state["ready"]
+    if runtime_unavailable:
+        status = "error"
+    draining = drain.is_draining()
+    result = {
+        "status": "draining" if draining else status,
+        "upstream_client": client_state,
         "drain": drain.status_snapshot(),
         "channels": {
             "total": len(chs),
@@ -982,6 +991,9 @@ async def health():
         "device_id": DEVICE_ID[:16] + "...",
         "version": __version__,
     }
+    if runtime_unavailable and not draining:
+        return JSONResponse(result, status_code=503)
+    return result
 
 
 @app.get("/v1/models")

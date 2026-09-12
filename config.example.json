@@ -33,6 +33,27 @@
     "maxQueuedBodySpoolBytes": 2147483648
   },
   "oauthAccounts": [],
+  "workbuddy": {
+    "requestRewrite": {
+      "enabled": true,
+      "rules": [
+        {
+          "id": "cc-identity",
+          "enabled": true,
+          "scope": "system_prefix_line",
+          "match": "You are Claude Code, Anthropic's official CLI for Claude.",
+          "replace": "You are a coding agent."
+        },
+        {
+          "id": "cc-env-main-branch",
+          "enabled": true,
+          "scope": "system_env_line",
+          "match": "Main branch (you will usually use this for PRs)",
+          "replace": "Main branch (normally used for pull requests)"
+        }
+      ]
+    }
+  },
   "channels": [
     {
       "name": "example-anthropic-compat",

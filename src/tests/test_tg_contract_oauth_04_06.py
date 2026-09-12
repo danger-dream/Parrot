@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -367,7 +368,9 @@ def _run_oa06(case, monkeypatch):
                 def get(self, url):
                     env.events.append(["telegram_file_transport", "fake-session"])
                     return FakeDownloadResponse()
-            monkeypatch.setattr(ui, "_get_session", lambda: FakeDownloadSession())
+            monkeypatch.setattr(
+                ui, "_session_lease", lambda: nullcontext(FakeDownloadSession())
+            )
             msg = {"document": {"file_id": case["entry"].get("fileId", "fake-file"), "file_name": "fake.json"}}
             om.on_import_openai_document_input(42, msg)
         return actual(case, env, state_steps=[env.state_snapshot(op)])

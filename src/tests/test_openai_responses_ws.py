@@ -12,12 +12,15 @@ _isolation.isolate()
 
 import asyncio
 import base64
+import copy
 import json
 import os
+import shutil
 import socket
 import sys
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +29,27 @@ import pytest
 from src.protocols.runtime import parse_wrapped_responses_ws_error
 from src.transports import socks5h_url
 from src.transports import policy as transport_policy
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ws_config(tmp_path, monkeypatch):
+    """Keep synthetic WS caches and account saves inside one test lifecycle.
+
+    _setup(m) is also a public test helper: keep its call/return contract intact.
+    Redirect writes, rather than reloading a file that a WS test may overwrite;
+    monkeypatch restores the original path and its matching cache/mtime together.
+    """
+    from src import config
+
+    path = tmp_path / "ws-config.json"
+    if Path(config.CONFIG_PATH).exists():
+        # Preserve mtime so an existing cache retains its normal reload semantics.
+        shutil.copy2(config.CONFIG_PATH, path)
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(config, "_cache", copy.deepcopy(config._cache))
+    monkeypatch.setattr(config, "_mtime", config._mtime)
+    monkeypatch.setattr(config, "_rejected_rewrite_version", None)
+    monkeypatch.setattr(config, "_reload_callbacks", list(config._reload_callbacks))
 
 
 def _valid_encrypted_content(seed: int = 1) -> str:
@@ -2674,7 +2698,7 @@ async def test_http_responses_oauth_ws_created_error_does_not_cross_candidate(mo
 
     monkeypatch.setattr(m["failover"].oauth_manager, "ensure_valid_token", fake_token)
     monkeypatch.setattr(m["failover"], "_connect_oauth_responses_ws", fake_connect)
-    monkeypatch.setattr(m["upstream"], "get_client", lambda: MockClient())
+    monkeypatch.setattr(m["upstream"], "acquire_client", lambda: SimpleNamespace(client=MockClient(), release=lambda: None))
 
     from src.scheduler import ScheduleResult
     request_id = "http-ws-failover"

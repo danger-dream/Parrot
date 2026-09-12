@@ -347,9 +347,17 @@ def test_overwrite_sync_launch_failure_uses_frozen_callback_failure_order(
         trace.events.append(("api", method, data))
         assert method == "getUpdates"
         assert data == {"offset": 0, "timeout": 30}
-        bot._running = False
         return {"ok": True, "result": [update]}
 
+    def send_then_stop(*args, **kwargs):
+        # End this single-iteration fixture after error handling, not while the
+        # long poll is returning: stopped generations now correctly drop results.
+        try:
+            return trace.send(*args, **kwargs)
+        finally:
+            bot._running = False
+
+    monkeypatch.setattr(ui, "send", send_then_stop)
     monkeypatch.setattr(ui, "is_admin", is_admin)
     monkeypatch.setattr(ui, "api", get_updates)
     monkeypatch.setattr(bot, "_offset", 0)

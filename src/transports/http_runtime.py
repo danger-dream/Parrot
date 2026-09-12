@@ -120,6 +120,27 @@ class HttpStreamReadStep:
         return self.kind == "chunks"
 
 
+class _SharedStreamContext:
+    """Keep the shared pool leased through open, body streaming and cleanup."""
+
+    def __init__(self, request: HttpStreamRequest):
+        self.lease = upstream.acquire_client()
+        try:
+            self.ctx = open_stream(self.lease.client, request)
+        except BaseException:
+            self.lease.release()
+            raise
+
+    async def __aenter__(self):
+        return await self.ctx.__aenter__()
+
+    async def __aexit__(self, *args):
+        try:
+            return await self.ctx.__aexit__(*args)
+        finally:
+            self.lease.release()
+
+
 async def close_response_context(ctx) -> None:
     try:
         await ctx.__aexit__(None, None, None)
@@ -1165,18 +1186,20 @@ def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[
             if connector is None:
                 continue
             if getattr(connector, "type", "") == "direct":
-                route_chain.append(("direct", None))
+                # An explicit direct decision is not the legacy shared route:
+                # the shared client may already be bound to the default proxy.
+                route_chain.append(("direct", connector))
             else:
                 route_chain.append((proxy_name, connector))
 
         if route_chain:
             if pm.direct_fallback_enabled() and not any(name == "direct" for name, _ in route_chain):
-                route_chain.append(("direct", None))
+                route_chain.append(("direct", pm.get_connector("direct")))
             return route_chain, None
 
         if pm.direct_fallback_enabled():
             print(f"[proxy] HTTP route has no usable target; using enabled direct fallback: {chain}")
-            return [("direct", None)], None
+            return [("direct", pm.get_connector("direct"))], None
         return [], AttemptResult(
             outcome="proxy_connect_error",
             error_detail=f"proxy route has no valid target: {chain}",
@@ -1184,7 +1207,7 @@ def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[
     except Exception as exc:
         if pm.direct_fallback_enabled():
             print(f"[proxy] HTTP route resolution failed; using enabled direct fallback: {exc}")
-            return [("direct", None)], None
+            return [("direct", pm.get_connector("direct"))], None
         if configured or pm.has_non_direct_routing_rules():
             return [], AttemptResult(
                 outcome="proxy_connect_error",
@@ -1485,7 +1508,7 @@ async def open_response_with_proxy_chain(
     for route_name, connector in route_chain:
         route_type = getattr(connector, "type", "direct") if connector is not None else "direct"
         proxy_client = None
-        proxy_name_used = str(route_name) if connector is not None else None
+        proxy_name_used = str(route_name) if connector is not None and route_type != "direct" else None
         route_log_name = str(route_name) if connector is not None else "direct"
         proxy_bytes = _new_proxy_bytes()
         owner = _HttpResponseOpenOwner(
@@ -1494,7 +1517,9 @@ async def open_response_with_proxy_chain(
             proxy_name=proxy_name_used,
             proxy_bytes=proxy_bytes,
         )
-        client = upstream.get_client()
+        # Explicit proxy/loopback routes own independent clients. Only the
+        # shared route acquires a pool lease, immediately before stream setup.
+        client = None
         if bool(getattr(channel, "internal_loopback", False)):
             # The shared client may carry legacy SOCKS settings. A process-local
             # bridge must always use a short-lived trust_env=False direct client.
@@ -1637,21 +1662,30 @@ async def open_response_with_proxy_chain(
 
         try:
             dispatch_headers = _headers_for_physical_dispatch(upstream_req.headers)
-            ctx = open_stream(
-                client,
-                HttpStreamRequest(
-                    method=upstream_req.method,
-                    url=upstream_req.url,
-                    headers=dispatch_headers,
-                    content=upstream_req.body,
-                    connect_timeout=round_timeouts.connection + 0.5,
-                    read_timeout=max(330.0, round_timeouts.total + 1.0),
-                    write_timeout=30.0,
-                    pool_timeout=round_timeouts.connection + 0.5,
-                    extensions={"trace": trace_with_dispatch},
-                ),
+            stream_request = HttpStreamRequest(
+                method=upstream_req.method,
+                url=upstream_req.url,
+                headers=dispatch_headers,
+                content=upstream_req.body,
+                connect_timeout=round_timeouts.connection + 0.5,
+                read_timeout=max(330.0, round_timeouts.total + 1.0),
+                write_timeout=30.0,
+                pool_timeout=round_timeouts.connection + 0.5,
+                extensions={"trace": trace_with_dispatch},
+            )
+            ctx = (
+                _SharedStreamContext(stream_request)
+                if client is None else open_stream(client, stream_request)
             )
             owner.ctx = ctx
+        except upstream.ClientUnavailableError:
+            # Keep a local client construction failure outside channel scoring
+            # and cooldown, as the former get_client() failure path did. A later
+            # request can rebuild rather than being filtered out by cooldown.
+            await _await_http_owned(owner.abort(
+                "guard_error", "shared upstream HTTP client unavailable",
+            ))
+            raise
         except Exception as exc:
             last_pre_header = _with_timing(timing, _attempt_result(
                 connection_lifecycle_outcome(

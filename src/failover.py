@@ -76,6 +76,7 @@ from .protocols.runtime import (
     transient_retry_allowed,
     transient_retry_limit,
     request_invalid_result_if_needed,
+    workbuddy_request_rejection,
     retry_body_without_encrypted_content,
     retry_body_without_context_1m,
     sse_error_for_ingress,
@@ -621,8 +622,8 @@ def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
     return result
 
 
-def _request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
-    return request_invalid_result_if_needed(result)
+def _request_invalid_result_if_needed(result: AttemptResult, channel=None) -> AttemptResult:
+    return request_invalid_result_if_needed(result, channel=channel)
 
 
 def _maybe_cache_codex_reasoning_replay(translator_ctx: Optional[dict], response_obj: Any) -> None:
@@ -1920,7 +1921,7 @@ async def run_failover(
                     attempt_start_monotonic=attempt_started_monotonic,
                     terminal_release=_release_once,
                 )
-            result = _request_invalid_result_if_needed(result)
+            result = _request_invalid_result_if_needed(result, ch)
             pending_stream_result = result
             last_result = result
             quota_exhaustion = bounded_account_quota_error(result)
@@ -2518,7 +2519,7 @@ async def run_failover(
                             attempt_start_monotonic=attempt_started_monotonic2,
                             terminal_release=_release_q,
                         )
-                    result = _request_invalid_result_if_needed(result)
+                    result = _request_invalid_result_if_needed(result, ch)
                     pending_stream_result2 = result
                     last_result = result
                     if not result.success and not result.stream_started:
@@ -4584,7 +4585,7 @@ async def _try_channel(
                 and result.http_status == 403
                 and is_html_error_document(result.full_response_text)
             )
-            result = _request_invalid_result_if_needed(result)
+            result = _request_invalid_result_if_needed(result, ch)
             result = await _finalize_http_attempt(opened, result)
             await _close_proxy_client(_proxy_client)
             return result
@@ -5340,9 +5341,21 @@ async def _consume_stream(
         ))
         state["finalized"] = True
 
+    def _workbuddy_stream_rejection():
+        if not getattr(tracker, "saw_stream_error", False):
+            return None
+        return workbuddy_request_rejection(
+            ch, http_status=upstream_status, translator_ctx=translator_ctx,
+        )
+
     async def _emit_error_and_finalize(err_type: str, message: str, outcome: str):
         if state["finalized"]:
             return
+        # Includes cancellation after observing a vendor rejection. An HTTP 200
+        # SSE transport must not turn this request fault into a health failure.
+        rejection = _workbuddy_stream_rejection()
+        if rejection is not None:
+            outcome, message = "request_invalid", rejection[1]
         request_elapsed_ms = _elapsed_ms(start_monotonic)
 
         # 已发首包的普通上游错误视为本次渠道失败；但上下文/请求级错误
@@ -5500,6 +5513,15 @@ async def _consume_stream(
                 )
                 for out in first_downstream_chunks:
                     yield out
+                rejection = _workbuddy_stream_rejection()
+                if rejection is not None and ingress_protocol == "responses":
+                    # Chat→Responses buffers error chunks until close(), which
+                    # is deliberately not a success boundary here. Emit an error
+                    # event directly, preserving the original vendor code.
+                    yield _sse_error_for_ingress(
+                        ingress_protocol, errors.ErrType.INVALID_REQUEST,
+                        rejection[1], code=rejection[0],
+                    )
                 return
 
             # Every explicit terminal frame is a valid client stop boundary,
@@ -5585,6 +5607,12 @@ async def _consume_stream(
                     )
                     for out in step.downstream_chunks:
                         yield out
+                    rejection = _workbuddy_stream_rejection()
+                    if rejection is not None and ingress_protocol == "responses":
+                        yield _sse_error_for_ingress(
+                            ingress_protocol, errors.ErrType.INVALID_REQUEST,
+                            rejection[1], code=rejection[0],
+                        )
                     return
 
                 if _explicit_terminal_received():

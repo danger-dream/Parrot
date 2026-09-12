@@ -60,6 +60,13 @@ _REQUEST_SEQ = itertools.count()
 
 def _set_concurrency_cfg(cfg_mod, *, enabled=True, queue_wait_s=10, default_max=0):
     def _mutate(c):
+        # This suite injects the unconfigured shared MockTransport. A proxy
+        # definition left by another test makes modern explicit-direct routing
+        # own a different client, correctly bypassing that fixture.
+        c.setdefault("network", {}).update(
+            proxies={}, groups={}, routing={"default": "direct"},
+            socks5={"enabled": False, "url": ""},
+        )
         c["concurrency"] = {
             "enabled": enabled,
             "queueWaitSeconds": queue_wait_s,
@@ -70,6 +77,8 @@ def _set_concurrency_cfg(cfg_mod, *, enabled=True, queue_wait_s=10, default_max=
 
 def _reset_slots(c_mod):
     c_mod._slots.clear()
+    # Each async test owns a fresh loop, matching test_concurrency's fixture.
+    c_mod._release_event = asyncio.Event()
 
 
 def _make_anth_channel_with_max(m, name, base_url, max_concurrent):

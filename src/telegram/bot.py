@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from typing import Callable, Optional
 
+from ..async_owned import await_owned
 from . import menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
@@ -33,6 +36,33 @@ from .menus import main as main_menu
 _offset = 0
 _thread: Optional[threading.Thread] = None
 _running = False
+_run_generation = 0
+_stop_event = threading.Event()
+_stop_event.set()
+_lifecycle_lock = threading.Lock()
+_lifecycle_condition = threading.Condition(_lifecycle_lock)
+_starting = False
+_start_done_event = threading.Event()
+_start_done_event.set()
+_stopping = False
+_stop_waiters = 0
+
+
+@dataclass
+class _StopCycle:
+    completion: threading.Event
+    start_done: threading.Event
+    thread: Optional[threading.Thread]
+    error: Optional[BaseException] = None
+
+
+@dataclass(frozen=True)
+class _StopTicket:
+    cycle: _StopCycle
+    owner: bool
+
+
+_stop_cycle: Optional[_StopCycle] = None
 _management_approval_handler: Optional[Callable[[str, int, bool], str]] = None
 
 
@@ -104,56 +134,178 @@ def is_configured() -> bool:
 
 
 def start() -> None:
-    global _thread, _running
+    global _thread, _running, _run_generation, _stop_event
+    global _starting, _start_done_event
     if not is_configured():
         print("[tg] not configured (empty token), skipping start")
         return
-    if _running:
-        return
+    with _lifecycle_lock:
+        if _running or _starting or _stopping:
+            return
+        _starting = True
+        start_done = threading.Event()
+        _start_done_event = start_done
+        _run_generation += 1
+        generation = _run_generation
+        stop_event = threading.Event()
+        _stop_event = stop_event
+        _running = True
+        _thread = None
+    launched = False
+    try:
+        if not _activate_start_generation(generation, stop_event):
+            return
 
-    # 启动时丢弃 TG 服务端积压的 pending updates，避免历史消息被重新回放
-    # （否则 bot 重启后，用户之前发的所有 /start 会全部"重新执行"一遍）。
-    # deleteWebhook + drop_pending_updates=True 对 polling 模式也有效：
-    # 它会清空 update 队列；下一次 getUpdates 只能拿到本次启动后到达的消息。
-    _drop_pending_updates()
+        # Startup calls can be slow. They run without the lifecycle lock, while
+        # stop can invalidate this generation and wait for their leases.
+        _drop_pending_updates()
+        if not _poll_generation_active(generation, stop_event):
+            return
 
-    # 同步命令菜单：必须先 delete 再 set，且必须串行（同步 httpx 自然保证）。
-    # 否则可能出现两种坏情况：
-    #   1. 旧菜单（之前部署/BotFather 手动设过的）残留
-    #   2. 并发触发时 delete 晚于 set 到达，反而把新菜单清空
-    ui.delete_my_commands()
-    ui.set_my_commands([
-        {"command": "start",    "description": "打开管理面板"},
-        {"command": "menu",     "description": "打开管理面板"},
-        {"command": "stats",    "description": "统计汇总"},
-        {"command": "logs",     "description": "最近日志"},
-        {"command": "channels", "description": "渠道管理"},
-        {"command": "oauth",    "description": "管理 OAuth 账户"},
-        {"command": "keys",     "description": "管理 API Key"},
-        {"command": "mapping",  "description": "模型管理"},
-        {"command": "loadbalancing", "description": "负载均衡"},
-        {"command": "proxy",    "description": "代理管理 / 路由规则"},
-        {"command": "settings", "description": "系统设置"},
-        {"command": "help",     "description": "帮助"},
-    ])
+        ui.delete_my_commands()
+        if not _poll_generation_active(generation, stop_event):
+            return
+        ui.set_my_commands([
+            {"command": "start",    "description": "打开管理面板"},
+            {"command": "menu",     "description": "打开管理面板"},
+            {"command": "stats",    "description": "统计汇总"},
+            {"command": "logs",     "description": "最近日志"},
+            {"command": "channels", "description": "渠道管理"},
+            {"command": "oauth",    "description": "管理 OAuth 账户"},
+            {"command": "keys",     "description": "管理 API Key"},
+            {"command": "mapping",  "description": "模型管理"},
+            {"command": "loadbalancing", "description": "负载均衡"},
+            {"command": "proxy",    "description": "代理管理 / 路由规则"},
+            {"command": "settings", "description": "系统设置"},
+            {"command": "help",     "description": "帮助"},
+        ])
+        if not _poll_generation_active(generation, stop_event):
+            return
 
-    # 安装 notifier 钩子（把服务事件转发给 admin）
-    ui.install_notify_handler()
+        ui.install_notify_handler()
+        with _lifecycle_lock:
+            if not _poll_generation_active_locked(generation, stop_event):
+                return
+            # Starting the scheduler and publishing/starting the poll owner are a
+            # short atomic phase relative to stop; no network I/O occurs here.
+            menu_cache.start()
+            poll_thread = threading.Thread(
+                target=lambda: _poll_loop(generation, stop_event),
+                daemon=True,
+                name="tg-bot-poll",
+            )
+            _thread = poll_thread
+            poll_thread.start()
+            launched = True
+        print("[tg] bot started (polling)")
+    finally:
+        with _lifecycle_condition:
+            _starting = False
+            if not launched and generation == _run_generation:
+                _running = False
+                stop_event.set()
+            start_done.set()
+            _lifecycle_condition.notify_all()
 
-    # 统计快照由唯一的中央 timed scheduler 主动预热；不占用 polling 线程。
-    menu_cache.start()
-    _running = True
-    _thread = threading.Thread(target=_poll_loop, daemon=True, name="tg-bot-poll")
-    _thread.start()
-    print("[tg] bot started (polling)")
+
+def _activate_start_generation(
+    generation: int,
+    stop_event: threading.Event,
+) -> bool:
+    """Atomically validate this start generation before activating Telegram I/O."""
+    with _lifecycle_lock:
+        if not _poll_generation_active_locked(generation, stop_event):
+            return False
+        # No network work is performed here. Taking the UI lock under the lifecycle
+        # lock makes activation linearizable with _request_stop's generation change.
+        ui.activate_session()
+        return True
+
+
+def _request_stop() -> _StopTicket:
+    global _running, _run_generation, _stopping
+    global _stop_cycle, _stop_waiters
+    with _lifecycle_condition:
+        if _stopping:
+            assert _stop_cycle is not None
+            _stop_waiters += 1
+            return _StopTicket(_stop_cycle, False)
+
+        _stopping = True
+        _running = False
+        _run_generation += 1
+        _stop_event.set()
+        cycle = _StopCycle(
+            completion=threading.Event(),
+            start_done=_start_done_event,
+            thread=_thread,
+        )
+        _stop_cycle = cycle
+        _stop_waiters = 1
+
+    # New Telegram operations are rejected immediately. Existing leases are not
+    # closed; they drain naturally before their retired clients are closed.
+    try:
+        ui.close_session()
+    except BaseException as exc:
+        cycle.error = exc
+    return _StopTicket(cycle, True)
+
+
+def _leave_stop_cycle(cycle: _StopCycle) -> None:
+    global _stopping, _stop_cycle, _stop_waiters
+    with _lifecycle_condition:
+        _stop_waiters -= 1
+        if _stop_waiters == 0 and _stop_cycle is cycle:
+            _stop_cycle = None
+            _stopping = False
+            _lifecycle_condition.notify_all()
+
+
+def _finish_stop(ticket: _StopTicket) -> None:
+    cycle = ticket.cycle
+    try:
+        if ticket.owner:
+            try:
+                # The start owner may still be between publishing _starting and
+                # activating UI. It must fully leave before shutdown can complete.
+                cycle.start_done.wait()
+                thread = cycle.thread
+                if thread is not None and thread is not threading.current_thread():
+                    join = getattr(thread, "join", None)
+                    if callable(join):
+                        join()
+                ui.wait_session_idle()
+                # Only the cycle owner closes the shared scheduler. Followers wait
+                # for completion, so no late old stop can close a new generation.
+                menu_cache.stop()
+            except BaseException as exc:
+                if cycle.error is None:
+                    cycle.error = exc
+            finally:
+                cycle.completion.set()
+        else:
+            cycle.completion.wait()
+
+        if cycle.error is not None:
+            raise cycle.error
+    finally:
+        _leave_stop_cycle(cycle)
 
 
 def stop() -> None:
-    global _running
-    _running = False
-    ui.close_session()
-    # 唤醒 timed wait，并等待当前串行统计任务自然收尾。
-    menu_cache.stop()
+    """Synchronously stop and drain Telegram work.
+
+    Async owners must use ``await stop_async()`` so thread joins and the menu
+    scheduler's final job cannot block their event loop.
+    """
+    _finish_stop(_request_stop())
+
+
+async def stop_async() -> None:
+    """Complete the owned stop before propagating caller cancellation."""
+    ticket = _request_stop()
+    await await_owned(asyncio.to_thread(_finish_stop, ticket))
 
 
 def _drop_pending_updates() -> None:
@@ -181,29 +333,76 @@ def _drop_pending_updates() -> None:
 
 # ─── 主循环 ───────────────────────────────────────────────────────
 
-def _poll_loop() -> None:
+def _poll_generation_active_locked(
+    generation: int,
+    stop_event: threading.Event,
+) -> bool:
+    return (
+        _running
+        and not stop_event.is_set()
+        and generation == _run_generation
+        and stop_event is _stop_event
+    )
+
+
+def _poll_generation_active(
+    generation: Optional[int],
+    stop_event: Optional[threading.Event],
+) -> bool:
+    # Keep direct test invocation compatible; production threads always carry an
+    # immutable generation/event pair.
+    if generation is None or stop_event is None:
+        return _running
+    with _lifecycle_lock:
+        return _poll_generation_active_locked(generation, stop_event)
+
+
+def _poll_backoff(
+    seconds: float,
+    generation: Optional[int],
+    stop_event: Optional[threading.Event],
+) -> bool:
+    if generation is None or stop_event is None:
+        time.sleep(seconds)
+    else:
+        stop_event.wait(seconds)
+    return _poll_generation_active(generation, stop_event)
+
+
+def _poll_loop(
+    generation: Optional[int] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
     global _offset
     fail_count = 0
     cleanup_counter = 0
-    while _running:
+    while _poll_generation_active(generation, stop_event):
         try:
             result = ui.api("getUpdates", {"offset": _offset, "timeout": 30})
+            # A stop/restart may happen while long polling is blocked. Never act on
+            # that old generation's response or failure after it returns.
+            if not _poll_generation_active(generation, stop_event):
+                return
             if not result or not result.get("ok"):
                 fail_count += 1
                 if fail_count >= 10 and fail_count % 10 == 0:
                     print(f"[tg] {fail_count} consecutive failures, rebuilding session")
                     ui.rebuild_session()
-                time.sleep(min(5 * fail_count, 60))
+                if not _poll_backoff(min(5 * fail_count, 60), generation, stop_event):
+                    return
                 continue
 
             fail_count = 0
             for update in result.get("result", []):
+                if not _poll_generation_active(generation, stop_event):
+                    return
                 _offset = update["update_id"] + 1
                 try:
                     _handle_update(update)
                 except Exception:
                     traceback.print_exc()
-                    # 兜底：给用户回一条消息，避免"无响应"假象
+                    if not _poll_generation_active(generation, stop_event):
+                        return
                     chat_id = _extract_chat_id(update)
                     if chat_id is not None:
                         try:
@@ -211,16 +410,21 @@ def _poll_loop() -> None:
                         except Exception:
                             pass
 
+            if not _poll_generation_active(generation, stop_event):
+                return
             cleanup_counter += 1
             if cleanup_counter >= 50:
                 cleanup_counter = 0
                 states.cleanup()
         except Exception:
+            if not _poll_generation_active(generation, stop_event):
+                return
             fail_count += 1
             if fail_count >= 10 and fail_count % 10 == 0:
                 print(f"[tg] {fail_count} exceptions, rebuilding session")
                 ui.rebuild_session()
-            time.sleep(min(5 * fail_count, 60))
+            if not _poll_backoff(min(5 * fail_count, 60), generation, stop_event):
+                return
 
 
 # ─── 分发 ─────────────────────────────────────────────────────────

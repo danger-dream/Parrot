@@ -414,7 +414,7 @@ def test_bot_lifecycle_starts_and_stops_scheduler(m, monkeypatch):
     _patch_fast_common_loaders(m, monkeypatch)
     monkeypatch.setattr(bot, "is_configured", lambda: True)
     monkeypatch.setattr(bot, "_drop_pending_updates", lambda: None)
-    monkeypatch.setattr(bot, "_poll_loop", lambda: None)
+    monkeypatch.setattr(bot, "_poll_loop", lambda *_args: None)
     monkeypatch.setattr(m["ui"], "delete_my_commands", lambda: None)
     monkeypatch.setattr(m["ui"], "set_my_commands", lambda _commands: None)
     monkeypatch.setattr(m["ui"], "install_notify_handler", lambda: None)

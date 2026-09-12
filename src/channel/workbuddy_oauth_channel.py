@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 
-from .. import cache_hints, model_names, oauth_manager
+from .. import cache_hints, config, model_names, oauth_manager
 from ..oauth.workbuddy import common
 from ..oauth_ids import account_key
 from ..openai.channel.api_channel import OpenAIApiChannel
 from ..openai.transform import anthropic_to_chat, guard
 from ..providers import registry as provider_registry
 from ..providers.workbuddy_codec import WorkBuddyStream
+from ..workbuddy_request_rewrite import rewrite_payload, settings_from_config
 from .base import ChannelDisplay, UpstreamRequest, build_dispatch_metadata
 
 
 CLIENT_IDENTITY = "You are CodeBuddy Code."
+_logger = logging.getLogger(__name__)
 
 
 def add_client_identity(payload: dict) -> None:
@@ -117,6 +120,12 @@ class WorkBuddyOAuthChannel(OpenAIApiChannel):
         if effort is not None and efforts and effort not in efforts:
             raise guard.GuardError(400, "invalid_request_error", "Requested reasoning_effort is not supported by this WorkBuddy model", param="reasoning_effort", scope="candidate")
         normalize_tool_choice(payload)
+        # All ingress protocols have converged to Chat here. Keep adaptation
+        # provider/profile-local and read the current config on every dispatch.
+        if common.realm_of(current) == "cn" and common.profile_of(current) == common.PROFILE:
+            payload, hits = rewrite_payload(payload, settings_from_config(config.get()))
+            for rule_id, count in hits.items():
+                _logger.debug("WorkBuddy request rewrite rule=%s hits=%d", rule_id, count)
         add_client_identity(payload)
         payload["stream"] = True
         payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}

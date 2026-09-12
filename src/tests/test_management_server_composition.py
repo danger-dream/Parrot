@@ -93,7 +93,7 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     assert source.index("image_db.init()") < source.index("translation.init()")
     assert source.index("translation.init()") < source.index("_initialize_management_runtime(app)")
     assert source.index("provider_usage.schedule_startup_refresh()") < source.index("tgbot.start()")
-    stop = source.index("tgbot.stop()")
+    stop = source.index("await tgbot.stop_async()")
     assert stop < source.index("await _close_management_runtime(app)", stop)
     assert source.index("await _close_management_runtime(app)", stop) < source.index(
         "await provider_usage.stop()", stop,
@@ -217,6 +217,9 @@ def test_management_initialization_failure_stays_fail_closed_and_inference_healt
     original = server.app.state.management_runtime
     server.drain.reset_for_tests()
     server.app.state.management_runtime = None
+    # This test intentionally skips lifespan. Model a ready inference runtime
+    # independently of the unavailable management runtime under test.
+    monkeypatch.setattr(server.upstream, "client_health", lambda: {"state": "ready", "ready": True})
     try:
         client = TestClient(server.app)
         management = client.get("/api/management/v1/meta")

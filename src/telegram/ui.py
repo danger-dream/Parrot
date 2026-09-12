@@ -16,10 +16,14 @@ from __future__ import annotations
 import errno
 import hashlib
 import math
+import queue
 import re
 import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import httpx
 
@@ -30,12 +34,39 @@ from .. import cache_display, network
 
 _bot_token: str = ""
 _admin_ids: set[int] = set()
+
+
+@dataclass
+class _SessionHolder:
+    client: httpx.Client
+    generation: int
+    leases: int = 0
+    retired: bool = False
+    close_queued: bool = False
+
+
+class _SessionInactiveError(RuntimeError):
+    pass
+
+
+# ``_session`` remains as a compatibility/debug view of the currently published
+# client.  Ownership, retirement and in-flight accounting live in holders.
 _session: Optional[httpx.Client] = None
+_session_holder: Optional[_SessionHolder] = None
+_session_generation = 0
+_session_enabled = False
 _session_lock = threading.Lock()
+_session_condition = threading.Condition(_session_lock)
+_session_building: set[int] = set()
+_session_holders: dict[int, _SessionHolder] = {}
+_session_close_queue: queue.Queue[httpx.Client] = queue.Queue()
+_session_close_thread: Optional[threading.Thread] = None
+_session_close_thread_lock = threading.Lock()
+_session_pending_closes = 0
 
 
 def configure(bot_token: str, admin_ids: list) -> None:
-    """初始化 bot token 和 admin 白名单。
+    """初始化 bot token/admin 白名单并激活会话租用。
 
     admin_ids 容错：接受 int / 字符串数字 / 字符串混合。所有元素归一化为 int。
     （config.json 里如果误写成 ["123"] 而非 [123] 也能正常工作。）
@@ -49,6 +80,7 @@ def configure(bot_token: str, admin_ids: list) -> None:
         except (TypeError, ValueError):
             print(f"[tg] WARN: ignoring non-numeric adminId: {x!r}")
     _admin_ids = normalized
+    activate_session()
 
 
 def get_token() -> str:
@@ -81,36 +113,217 @@ def _make_session() -> httpx.Client:
     )
 
 
+def _session_close_worker() -> None:
+    global _session_pending_closes
+    while True:
+        client = _session_close_queue.get()
+        try:
+            client.close()
+        except Exception:
+            pass
+        finally:
+            with _session_condition:
+                _session_pending_closes -= 1
+                _session_condition.notify_all()
+            _session_close_queue.task_done()
+
+
+def _reserve_session_close_locked() -> None:
+    global _session_pending_closes
+    _session_pending_closes += 1
+    _session_condition.notify_all()
+
+
+def _queue_session_close(client: httpx.Client) -> None:
+    """Run a previously reserved close without blocking its lifecycle caller."""
+    global _session_close_thread
+    with _session_close_thread_lock:
+        if _session_close_thread is None or not _session_close_thread.is_alive():
+            _session_close_thread = threading.Thread(
+                target=_session_close_worker,
+                daemon=True,
+                name="tg-session-close",
+            )
+            _session_close_thread.start()
+    _session_close_queue.put(client)
+
+
+def _adopt_compat_session_locked() -> Optional[_SessionHolder]:
+    """Adopt direct ``_session`` injection used by legacy tests/tools."""
+    global _session_holder
+    if _session is None:
+        return None
+    holder = _session_holder
+    if holder is not None and holder.client is _session and not holder.retired:
+        return holder
+    holder = _SessionHolder(_session, _session_generation)
+    _session_holder = holder
+    _session_holders[id(holder)] = holder
+    return holder
+
+
+def _retire_current_locked() -> list[httpx.Client]:
+    global _session, _session_holder
+    # Prefer the owned holder even if a legacy test cleared the compatibility
+    # pointer directly; normal production state keeps both pointers aligned.
+    holder = _session_holder
+    if _session is not None:
+        holder = _adopt_compat_session_locked()
+    _session = None
+    _session_holder = None
+    if holder is None or holder.retired:
+        return []
+    holder.retired = True
+    if holder.leases or holder.close_queued:
+        return []
+    holder.close_queued = True
+    _session_holders.pop(id(holder), None)
+    _reserve_session_close_locked()
+    return [holder.client]
+
+
+def _invalidate_session(*, enabled: Optional[bool] = None) -> None:
+    global _session_generation, _session_enabled
+    with _session_condition:
+        _session_generation += 1
+        if enabled is not None:
+            _session_enabled = enabled
+        to_close = _retire_current_locked()
+        _session_condition.notify_all()
+    for client in to_close:
+        _queue_session_close(client)
+
+
+def activate_session() -> None:
+    """Allow new Telegram operations after bot init/start."""
+    global _session_enabled, _session_generation
+    with _session_condition:
+        if not _session_enabled:
+            _session_enabled = True
+            _session_generation += 1
+        _session_condition.notify_all()
+
+
 def rebuild_session() -> None:
-    """重建 httpx 会话；不在 session 锁内执行可能阻塞的 close。"""
-    global _session
-    replacement = _make_session()
-    with _session_lock:
-        previous, _session = _session, replacement
-    try:
-        if previous is not None:
-            previous.close()
-    except Exception:
-        pass
+    """Invalidate the current generation; the next request builds lazily.
 
-
-def _get_session() -> httpx.Client:
-    global _session
-    with _session_lock:
-        if _session is None:
-            _session = _make_session()
-        return _session
+    This function is safe in config callbacks: it performs neither client
+    construction nor synchronous close, and therefore never calls back into
+    config/proxy code while holding the session lock.
+    """
+    _invalidate_session()
 
 
 def close_session() -> None:
-    global _session
-    with _session_lock:
-        if _session is not None:
-            try:
-                _session.close()
-            except Exception:
-                pass
-            _session = None
+    """Reject new operations and retire the current client after leases drain."""
+    _invalidate_session(enabled=False)
+
+
+def _publish_or_discard_session(client: httpx.Client, generation: int) -> Optional[_SessionHolder]:
+    global _session, _session_holder
+    installed: Optional[_SessionHolder] = None
+    with _session_condition:
+        _session_building.discard(generation)
+        if (
+            _session_enabled
+            and generation == _session_generation
+            and _session_holder is None
+            and _session is None
+        ):
+            installed = _SessionHolder(client, generation)
+            _session_holder = installed
+            _session = client
+            _session_holders[id(installed)] = installed
+        else:
+            _reserve_session_close_locked()
+        _session_condition.notify_all()
+    if installed is None:
+        _queue_session_close(client)
+    return installed
+
+
+def _ensure_session_holder() -> _SessionHolder:
+    """Return the current generation, constructing outside every lifecycle lock."""
+    while True:
+        with _session_condition:
+            if not _session_enabled:
+                raise _SessionInactiveError("telegram session is inactive")
+            holder = _adopt_compat_session_locked()
+            if (
+                holder is not None
+                and not holder.retired
+                and holder.generation == _session_generation
+            ):
+                return holder
+            generation = _session_generation
+            if generation in _session_building:
+                _session_condition.wait()
+                continue
+            _session_building.add(generation)
+
+        try:
+            candidate = _make_session()
+        except BaseException:
+            with _session_condition:
+                _session_building.discard(generation)
+                _session_condition.notify_all()
+            raise
+
+        installed = _publish_or_discard_session(candidate, generation)
+        if installed is not None:
+            return installed
+        # A reload/stop raced construction.  Never publish the obsolete client;
+        # retry only when the lifecycle is still active.
+
+
+def _get_session() -> httpx.Client:
+    """Compatibility accessor; production requests must use ``_session_lease``."""
+    return _ensure_session_holder().client
+
+
+@contextmanager
+def _session_lease() -> Iterator[httpx.Client]:
+    holder = _ensure_session_holder()
+    with _session_condition:
+        if holder.retired:
+            # It was invalidated between ensure and lease reservation.
+            holder = None
+        else:
+            holder.leases += 1
+    if holder is None:
+        with _session_lease() as client:
+            yield client
+        return
+    try:
+        yield holder.client
+    finally:
+        to_close: Optional[httpx.Client] = None
+        with _session_condition:
+            holder.leases -= 1
+            if holder.retired and holder.leases == 0 and not holder.close_queued:
+                holder.close_queued = True
+                _session_holders.pop(id(holder), None)
+                _reserve_session_close_locked()
+                to_close = holder.client
+            _session_condition.notify_all()
+        if to_close is not None:
+            _queue_session_close(to_close)
+
+
+def wait_session_idle(timeout: Optional[float] = None) -> bool:
+    """Wait for builders, leases and asynchronous closes without forcing I/O."""
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    with _session_condition:
+        while (
+            _session_building
+            or any(holder.leases for holder in _session_holders.values())
+            or _session_pending_closes
+        ):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            _session_condition.wait(remaining)
+        return True
 
 
 # ─── API 调用 ─────────────────────────────────────────────────────
@@ -164,36 +377,17 @@ def _recover_eaddrnotavail(exc: BaseException) -> bool:
     return True
 
 
-def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
-    """调用一次 Bot API。
-
-    失败行为：
-      - 网络异常 / 无 token → 返回 None，打印日志
-      - TG 返回 `ok=false` 且 description 指向解析错误 → 自动用**纯文本**（无 parse_mode）重发
-      - TG 返回 `ok=false` 且 description 含 "message is not modified" → 视为成功，不打印噪音
-      - 其他 TG 错误 → 打印描述，返回原始 json
-    """
-    if not _bot_token:
-        return None
-    url = f"https://api.telegram.org/bot{_bot_token}/{method}"
-    try:
-        session = _get_session()
-        if data is None:
-            resp = session.get(url)
-        else:
-            resp = session.post(url, json=data)
-        result = resp.json()
-    except Exception as exc:
-        if _exception_has_errno(exc, errno.EADDRNOTAVAIL):
-            try:
-                _recover_eaddrnotavail(exc)
-                print(f"[tg] api {method} failed: local address unavailable; DNS cache invalidated and session rebuilt")
-            except Exception as recovery_exc:
-                # Keep this log credential-safe: exception strings can contain request URLs.
-                print(f"[tg] api {method} recovery failed: {type(recovery_exc).__name__}")
-        else:
-            print(f"[tg] api {method} failed: {exc}")
-        return None
+def _api_on_session(
+    session: httpx.Client,
+    method: str,
+    url: str,
+    data: Optional[dict],
+) -> Optional[dict]:
+    if data is None:
+        resp = session.get(url)
+    else:
+        resp = session.post(url, json=data)
+    result = resp.json()
 
     if not isinstance(result, dict) or result.get("ok"):
         return result
@@ -204,7 +398,7 @@ def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
     if _MSG_NOT_MODIFIED in desc.lower():
         return {"ok": True, "result": {"not_modified": True}}
 
-    # HTML 解析失败 → 退化为纯文本重发
+    # HTML 解析失败 → 在同一租用中退化为纯文本重发。
     if _is_parse_error(desc) and data and data.get("parse_mode") and data.get("text"):
         fallback = dict(data)
         fallback.pop("parse_mode", None)
@@ -215,15 +409,39 @@ def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
             r2 = resp2.json()
             if isinstance(r2, dict) and r2.get("ok"):
                 return r2
-            # 重发仍失败，打印后返回原 result
             print(f"[tg] {method} plain-text retry also failed: {r2}")
         except Exception as exc:
             print(f"[tg] {method} plain-text retry error: {exc}")
         return result
 
-    # 其他错误：打印但返回原始，让调用方决定
     print(f"[tg] {method} not ok: {desc[:200]}")
     return result
+
+
+def api(method: str, data: Optional[dict] = None) -> Optional[dict]:
+    """调用一次 Bot API；配置失效不会重放有副作用请求。"""
+    if not _bot_token:
+        return None
+    url = f"https://api.telegram.org/bot{_bot_token}/{method}"
+    try:
+        with _session_lease() as session:
+            return _api_on_session(session, method, url, data)
+    except _SessionInactiveError:
+        return None
+    except Exception as exc:
+        if _exception_has_errno(exc, errno.EADDRNOTAVAIL):
+            try:
+                _recover_eaddrnotavail(exc)
+                print(
+                    f"[tg] api {method} failed: local address unavailable; "
+                    "DNS cache invalidated and session rebuilt lazily"
+                )
+            except Exception as recovery_exc:
+                # Keep this log credential-safe: exception strings can contain request URLs.
+                print(f"[tg] api {method} recovery failed: {type(recovery_exc).__name__}")
+        else:
+            print(f"[tg] api {method} failed: {exc}")
+        return None
 
 
 # ─── 消息发送辅助 ─────────────────────────────────────────────────
@@ -283,16 +501,18 @@ def download_file(file_id: str, *, max_bytes: int = 10 * 1024 * 1024) -> tuple[b
         pass
 
     url = f"https://api.telegram.org/file/bot{_bot_token}/{file_path}"
-    session = _get_session()
     try:
-        resp = session.get(url)
-        resp.raise_for_status()
+        with _session_lease() as session:
+            resp = session.get(url)
+            resp.raise_for_status()
+            content = resp.content
+    except _SessionInactiveError as exc:
+        raise RuntimeError("download file failed: telegram session is inactive") from exc
     except httpx.HTTPStatusError as exc:
         status = getattr(exc.response, "status_code", "?")
         raise RuntimeError(f"download file failed: HTTP {status}") from exc
     except httpx.RequestError as exc:
         raise RuntimeError(f"download file failed: {type(exc).__name__}") from exc
-    content = resp.content
     if len(content) > max_bytes:
         raise RuntimeError(f"file too large: {len(content)} bytes")
     return content, file_path
@@ -304,14 +524,13 @@ def send_photo(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
         return None
     url = f"https://api.telegram.org/bot{_bot_token}/sendPhoto"
     try:
-        session = _get_session()
-        with open(path, "rb") as f:
+        with _session_lease() as session, open(path, "rb") as f:
             data: dict[str, Any] = {"chat_id": chat_id}
             if caption:
                 data["caption"] = caption
                 data["parse_mode"] = "HTML"
             resp = session.post(url, data=data, files={"photo": (path.rsplit("/", 1)[-1], f)})
-        result = resp.json()
+            result = resp.json()
         if isinstance(result, dict) and result.get("ok"):
             return result
         print(f"[tg] sendPhoto not ok: {str(result)[:200]}")
@@ -327,8 +546,7 @@ def send_video(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
         return None
     url = f"https://api.telegram.org/bot{_bot_token}/sendVideo"
     try:
-        session = _get_session()
-        with open(path, "rb") as f:
+        with _session_lease() as session, open(path, "rb") as f:
             data: dict[str, Any] = {
                 "chat_id": chat_id,
                 "supports_streaming": "true",
@@ -341,7 +559,7 @@ def send_video(chat_id: int, path: str, caption: str = "") -> Optional[dict]:
                 data=data,
                 files={"video": (path.rsplit("/", 1)[-1], f, "video/mp4")},
             )
-        result = resp.json()
+            result = resp.json()
         if isinstance(result, dict) and result.get("ok"):
             return result
         print(f"[tg] sendVideo not ok: {str(result)[:200]}")
@@ -358,16 +576,16 @@ def send_document_bytes(chat_id: int, data_bytes: bytes, *, filename: str,
         return None
     url = f"https://api.telegram.org/bot{_bot_token}/sendDocument"
     try:
-        session = _get_session()
-        data: dict[str, Any] = {"chat_id": chat_id}
-        if caption:
-            data["caption"] = caption
-            data["parse_mode"] = "HTML"
-        resp = session.post(
-            url, data=data,
-            files={"document": (filename, data_bytes, content_type)},
-        )
-        result = resp.json()
+        with _session_lease() as session:
+            data: dict[str, Any] = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption
+                data["parse_mode"] = "HTML"
+            resp = session.post(
+                url, data=data,
+                files={"document": (filename, data_bytes, content_type)},
+            )
+            result = resp.json()
         if isinstance(result, dict) and result.get("ok"):
             return result
         print(f"[tg] sendDocument not ok: {str(result)[:200]}")

@@ -20,6 +20,7 @@ import math
 import os
 import tempfile
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
@@ -2062,17 +2063,18 @@ async def refresh_once(*, force: bool = False, client: Any = None) -> bool:
     models_url = str(pricing_cfg.get("modelsUrl") or _DEFAULT_MODELS_URL).strip()
     if not url.startswith("https://") or not models_url.startswith("https://"):
         raise ValueError("pricing.sourceUrl and pricing.modelsUrl must use https://")
-    if client is None:
-        from . import upstream
-        client = upstream.get_client()
-    # Sequential streaming naturally closes a failed/oversized response before
-    # the peer starts, and the second source receives only the shared remainder.
-    raw_api = await _download_catalog_bounded(
-        client, url, _MAX_REMOTE_CATALOG_BYTES,
-    )
-    raw_models = await _download_catalog_bounded(
-        client, models_url, _MAX_REMOTE_CATALOG_BYTES - len(raw_api),
-    )
+    from . import upstream
+    # Pin the shared client across both downloads, even if config changes while
+    # the first response is streaming. Explicitly supplied clients stay caller-owned.
+    with upstream.client_scope() if client is None else nullcontext(client) as active_client:
+        # Sequential streaming closes a failed/oversized response before the
+        # peer starts, and the second source receives only the shared remainder.
+        raw_api = await _download_catalog_bounded(
+            active_client, url, _MAX_REMOTE_CATALOG_BYTES,
+        )
+        raw_models = await _download_catalog_bounded(
+            active_client, models_url, _MAX_REMOTE_CATALOG_BYTES - len(raw_api),
+        )
     cache_path = os.path.join(config.DATA_DIR, _CACHE_FILENAME)
 
     def parse_and_store() -> tuple[

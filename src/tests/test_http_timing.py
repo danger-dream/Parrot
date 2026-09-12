@@ -194,7 +194,7 @@ def _patch_persistence(monkeypatch):
     monkeypatch.setattr(
         http_runtime.log_db, "update_proxy_attempt", _proxy_update_recorder(updates),
     )
-    monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
+    monkeypatch.setattr(http_runtime.upstream, "acquire_client", lambda: SimpleNamespace(client=object(), release=lambda: None))
     return inserted, updates
 
 

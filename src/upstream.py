@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import copy
 import json
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import httpx
 
 from . import network
+from .upstream_client import SharedClientPool
 from .protocols import errors as protocol_errors
 from .protocols.sse import split_sse_events as _split_sse_events_bytes
 from .protocols.usage import (
@@ -30,61 +32,75 @@ from .protocols.usage import (
 )
 
 
-_client: Optional[httpx.AsyncClient] = None
-
-
-def create_client() -> httpx.AsyncClient:
-    """构造共享 AsyncClient。由 server.py lifespan 调用。"""
-    global _client
-    if _client is not None:
-        return _client
-    _client = network.async_client(
+def _new_client() -> httpx.AsyncClient:
+    return network.async_client(
         timeout=httpx.Timeout(connect=15.0, read=330.0, write=30.0, pool=15.0),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         http2=False,
     )
-    return _client
+
+
+_client_pool = SharedClientPool(_new_client)
+
+
+def create_client() -> httpx.AsyncClient:
+    """Start the shared client runtime on the lifespan's event loop."""
+    return _client_pool.start()
 
 
 def get_client() -> httpx.AsyncClient:
-    if _client is None:
-        raise RuntimeError("upstream.create_client() not called yet")
-    return _client
+    """Lazily rebuild after reload; use client_scope/acquire_client for I/O."""
+    return _client_pool.get()
+
+
+class ClientUnavailableError(RuntimeError):
+    """Local runtime construction failure, not a vendor/channel health event."""
+
+
+def acquire_client():
+    """Pin one generation until the complete response/operation is closed."""
+    try:
+        return _client_pool.acquire()
+    except Exception as exc:
+        # Never let proxy credentials in constructor exceptions reach replies
+        # or the request handler's traceback logger.
+        raise ClientUnavailableError(
+            f"shared upstream HTTP client unavailable ({type(exc).__name__})"
+        ) from None
+
+
+@contextmanager
+def client_scope():
+    lease = acquire_client()
+    try:
+        yield lease.client
+    finally:
+        lease.release()
+
+
+def client_health() -> dict:
+    return _client_pool.snapshot()
 
 
 async def close_client() -> None:
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    """Stop acquisitions and drain retired clients without reopening runtime."""
+    await _client_pool.close()
 
 
 def reset_client_sync() -> None:
-    """Drop shared upstream client after network config changes.
+    """Retire after config changes; in-flight leases keep the old pool alive.
 
-    If called while an event loop is running, close in the background; otherwise
-    close synchronously with asyncio.run. New requests lazily create a fresh
-    client with the latest network settings.
+    Safe from config worker threads. New requests lazily create a client on the
+    owning event loop; old clients close there only after their last lease ends.
     """
-    global _client
-    old = _client
-    _client = None
-    if old is None:
-        return
-    try:
-        import asyncio
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        import asyncio
-        asyncio.run(old.aclose())
-    else:
-        loop.create_task(old.aclose())
+    _client_pool.invalidate()
 
 
 def set_client(client: httpx.AsyncClient) -> None:
-    """用于测试注入（例如 MockTransport 的 client）。"""
-    global _client
-    _client = client
+    """Install an independently owned test fixture (e.g. MockTransport client)."""
+    global _client_pool
+    _client_pool = SharedClientPool(_new_client)
+    _client_pool.install_for_tests(client)
 
 
 # ─── Usage 抽取 ──────────────────────────────────────────────────

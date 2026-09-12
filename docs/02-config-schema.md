@@ -93,6 +93,14 @@
   // Cursor 模型目录「批量禁用」中选定的 canonical ids；它们仍保留在原始目录供
   // 查看和恢复，但不会注册到该账号渠道、进入负载均衡候选或被调度使用。
 
+  // ─── WorkBuddy CN CLI 请求模板适配（完整默认规则见 2.2） ───
+  "workbuddy": {
+    "requestRewrite": {
+      "enabled": true
+      // 未配置 rules：使用两条内置默认规则；显式 rules: []：不做替换。
+    }
+  },
+
   // ─── 第三方 API 渠道列表 ───
   "channels": [
     {
@@ -356,6 +364,52 @@
 待回放 body 不会全部常驻内存：单请求累计正文超过 `queuedBodySpoolThresholdBytes`（默认 1 MiB）时，已缓存和后续正文会迁移到数据目录下固定的 `queued-body-spool/` 私有临时目录。`defaultMaxQueuedBodyBytesPerKey` / `maxQueuedBodyBytes` 继续限制单 Key / 全进程的内存正文与 ASGI 事件开销；`defaultMaxQueuedBodySpoolBytesPerKey` / `maxQueuedBodySpoolBytes` 独立限制临时磁盘，单 Key 还可用 `limits.maxQueuedBodySpoolBytes` 覆盖。任一聚合资源达到上限均返回 429 并带 `Retry-After`；旧配置名 `maxQueuedBodyBytesTotal` 仅在没有公开键 `maxQueuedBodyBytes` 时作为兼容回退。请求获得并发槽位、缓存事件回放完毕后，后续 body 由下游直接读取；成功、异常、等待超时、任务取消、客户端断开、热禁用及 FIFO handoff 都会归零 accounting，并关闭、删除临时文件。
 
 ## 2.2 字段语义详解
+
+### WorkBuddy 模板适配 `workbuddy.requestRewrite`
+
+仅作用于 **WorkBuddy OAuth 中国区 CLI**。Chat / Responses / Anthropic 的请求统一转换成 Chat payload 后、JSON 序列化前应用规则。国际区（CLI/IDE）及其他渠道均不应用；配置无需按模型重复填写。已有 CodeBuddy 身份、角色顺序、分支实际值和其他字段保持不变。
+
+默认配置如下，可直接放在 `config.json` 顶层。新指纹仍位于下面两类模板位置时，只需追加规则，无需改代码或重启：
+
+```json
+{
+  "workbuddy": {
+    "requestRewrite": {
+      "enabled": true,
+      "rules": [
+        {
+          "id": "cc-identity",
+          "enabled": true,
+          "scope": "system_prefix_line",
+          "match": "You are Claude Code, Anthropic's official CLI for Claude.",
+          "replace": "You are a coding agent."
+        },
+        {
+          "id": "cc-env-main-branch",
+          "enabled": true,
+          "scope": "system_env_line",
+          "match": "Main branch (you will usually use this for PRs)",
+          "replace": "Main branch (normally used for pull requests)"
+        }
+      ]
+    }
+  }
+}
+```
+
+- `enabled`：总开关，默认 `true`。每条规则也可单独设置 `enabled: false`（省略时开启）。
+- `rules`：按数组顺序处理，**同一原始行第一条匹配规则生效，不级联替换**。显式列表替代整个默认列表，不与默认规则按 ID 合并；`[]` 禁用所有替换。旧配置缺少该项时自动回填上述默认规则，显式关闭/空列表不被重新启用。
+- `id`：必填且唯一，1–64 位 ASCII 字母/数字/`.`/`_`/`-`，以字母或数字开头。DEBUG 日志仅输出规则 ID 和命中数，不输出正文、match、replace 或账号凭据。
+- `scope: system_prefix_line`：仅每条转换后 `system` 消息的第一条非空行，整行（忽略首尾空白）必须等于 `match`。
+- `scope: system_env_line`：仅完整、独立的 `<env> … </env>` 内的行；整行等于 `match`，或以 `match` 紧接 `:` 开始。只替换匹配部分，冒号后的真实值、原有缩进和换行不变。不处理未闭合/带属性的 env、Markdown 代码围栏、XML 引用、注释或 CDATA 里的 env；行内引用标签同样排除。前面的独立自闭合标签（包括带属性/空白的写法）不会阻止后续正常 bare env 匹配。
+- `match` / `replace`：必填的**字面字符串**，不解释正则或脚本；match 为 1–2048 字符，replace 为 0–4096 字符，不允许换行和控制字符。最多 64 条规则，未知 scope/字段、重复 ID、空 match 等均拒绝。
+- 仅访问 `system` 的字符串或纯文本 content parts，不搜索 developer/user/assistant/tool 消息、工具定义/schema/参数/结果、图片或其他 JSON 字段。混有未知/非文本 part 的 system 消息保守跳过；不跨 part 拼接触发串。未标记为引用、但结构与模板完全相同的文本无法自动辨别来源，应关闭相应规则而不是依赖内容猜测。
+- 适配不修改原始入包；每次派发从原文生成出包副本，不污染重试或其他渠道。保存合法配置后，已有渠道对象的下一次请求即读取新规则；无需重建账号、刷新令牌或重启服务。
+- 通过配置保存函数提交时先校验，失败不写盘、不发布缓存。直接手工编辑出错时，运行中的热加载保留上一份完整有效配置并报错；非法文件修正前，`save/update` 及依赖它们的账号/其他设置保存会明确拒绝，不允许用旧快照覆盖手工修改。修正文件后，下次保存从已修正的完整配置继续，保留其他手工字段并恢复热加载回调；首次启动或显式强制 reload 遇到非法规则则明确报配置错误。不会自动修复或覆盖非法规则。
+
+该功能是定向模板兼容，不保证任意业务正文都能通过上游策略。没有命中或适配后仍被上游明确拒绝时，不扩大改写范围、不循环“清洗到成功”。
+
+**明确拒绝的错误处理（#31）**：仅当 WorkBuddy 返回 HTTP 400，且错误 code 为 `11128`、msg/message 为 `Illegal API invocation from an unapproved channel` 时，按本次请求拒绝直接返回 400、原 code 和该诊断文案，不轮遍账号、不刷新、不增加冷却/grace/失败评分。WorkBuddy SSE 中相同明确错误也按此处理；若下游流已提交，HTTP 状态无法改写，但会发送流内错误，不伪造正常结束。该路径保留原有历史冷却，不自动清除任何条目。未知 400、其他供应商同码，以及 401/403/429、402 余额、404 模型缺失等仍走各自原有策略，不将所有 11128 或所有 4xx 一概认定为请求内容问题。
 
 ### 请求日志留存 `logRetention`
 

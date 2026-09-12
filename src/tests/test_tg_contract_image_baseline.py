@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import json
@@ -128,7 +129,8 @@ def _run(case: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.setattr(states.time, "time", lambda: 1000.0); monkeypatch.setattr(config, "get", lambda: store); monkeypatch.setattr(config, "update", update); monkeypatch.setattr(ui, "api", api); monkeypatch.setattr(images_simple, "settings", lambda: deepcopy(store["images"])); monkeypatch.setattr(images_simple, "list_image_accounts", lambda include_disabled=True: deepcopy(rt.get("accounts", []))); monkeypatch.setattr(image_db, "get_log", get_log)
     existing = set(rt.get("existing", [])); monkeypatch.setattr(menu.os.path, "exists", lambda path: Path(path).name in existing)
     for name in existing: (tmp_path / name).write_bytes(("fake:" + name).encode())
-    monkeypatch.setattr(ui, "_get_session", lambda: _MultipartSession(calls))
+    session = _MultipartSession(calls)
+    monkeypatch.setattr(ui, "_session_lease", lambda: nullcontext(session))
     for tag in rt.get("register", []): ui.register_code(tag)
     initial = case["initialState"]
     if initial: states.set_state(42, initial["action"], deepcopy(initial.get("data") or {}))

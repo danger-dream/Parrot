@@ -399,7 +399,7 @@ def _patch_http_logs(monkeypatch, logs: _StrictLogFakes) -> tuple[Any, Any]:
     update_proxy = logs.update_proxy_attempt
     monkeypatch.setattr(http_runtime.log_db, "record_proxy_attempt", record_proxy)
     monkeypatch.setattr(http_runtime.log_db, "update_proxy_attempt", update_proxy)
-    monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
+    monkeypatch.setattr(http_runtime.upstream, "acquire_client", lambda: SimpleNamespace(client=object(), release=lambda: None))
     return record_proxy, update_proxy
 
 

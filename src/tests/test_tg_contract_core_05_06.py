@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 import errno
 from pathlib import Path
@@ -308,7 +309,7 @@ def _run_download_success(case, monkeypatch):
     })
     session = _MultipartSession(capture, download_content=b"0123456789")
     monkeypatch.setattr(ui, "api", capture.api)
-    monkeypatch.setattr(ui, "_get_session", lambda: session)
+    monkeypatch.setattr(ui, "_session_lease", lambda: nullcontext(session))
     content, file_path = ui.download_file("fake-file-id", max_bytes=10)
     return _actual(
         case,
@@ -338,7 +339,7 @@ def _run_download_error(case, monkeypatch):
 def _run_uploads(case, monkeypatch, tmp_path):
     capture = TraceCapture()
     session = _MultipartSession(capture)
-    monkeypatch.setattr(ui, "_get_session", lambda: session)
+    monkeypatch.setattr(ui, "_session_lease", lambda: nullcontext(session))
     photo = tmp_path / "fake-photo.bin"
     video = tmp_path / "fake-video.mp4"
     photo.write_bytes(b"PNG\x00")
@@ -421,6 +422,14 @@ def _run_eaddr_rebuild(case, monkeypatch):
     monkeypatch.setattr(ui.network, "invalidate_dns_cache", invalidate)
     monkeypatch.setattr(ui, "_make_session", make_session)
     result = ui.send(42, "network failure")
+    # Recovery invalidates without replaying the failed POST. The failed lease
+    # drains first; only the next acquisition lazily builds the current route.
+    assert ui.wait_session_idle(1.0)
+    assert capture.calls == [{
+        "method": "sendMessage",
+        "payload": {"chat_id": 42, "text": "network failure", "parse_mode": "HTML"},
+    }]
+    ui._get_session()
     return _actual(
         case,
         tg_api=capture.calls,

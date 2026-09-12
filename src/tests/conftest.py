@@ -168,6 +168,7 @@ def _restore_telegram_ui_globals():
         menu_cache.reset_for_tests()
     orig_api = ui.api
     orig_session = getattr(ui, "_session", None)
+    orig_session_enabled = getattr(ui, "_session_enabled", False)
     orig_bot_token = getattr(ui, "_bot_token", "")
     orig_admin_ids = set(getattr(ui, "_admin_ids", set()))
     try:
@@ -175,10 +176,14 @@ def _restore_telegram_ui_globals():
     finally:
         try:
             ui.close_session()
+            ui.wait_session_idle(2.0)
         except Exception:
             pass
         ui.api = orig_api
-        ui._session = orig_session
+        with ui._session_condition:
+            ui._session = orig_session
+            ui._session_holder = None
+            ui._session_enabled = orig_session_enabled
         ui._bot_token = orig_bot_token
         ui._admin_ids = set(orig_admin_ids)
         if menu_cache is not None:

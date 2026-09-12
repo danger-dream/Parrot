@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import os as _ap_os
 import sys as _ap_sys
+from contextlib import nullcontext
 
 _ap_sys.path.insert(0, _ap_os.path.dirname(_ap_os.path.dirname(
     _ap_os.path.dirname(_ap_os.path.abspath(__file__))
@@ -39,7 +40,7 @@ def test_nested_eaddrnotavail_invalidates_telegram_and_rebuilds_session_without_
 
     invalidated: list[str] = []
     rebuilt: list[bool] = []
-    monkeypatch.setattr(ui, "_get_session", lambda: _FailingSession())
+    monkeypatch.setattr(ui, "_session_lease", lambda: nullcontext(_FailingSession()))
     monkeypatch.setattr(network, "invalidate_dns_cache", lambda host: invalidated.append(host) or 1)
     monkeypatch.setattr(ui, "rebuild_session", lambda: rebuilt.append(True))
 
@@ -47,7 +48,7 @@ def test_nested_eaddrnotavail_invalidates_telegram_and_rebuilds_session_without_
     assert invalidated == ["api.telegram.org"]
     assert rebuilt == [True]
     output = capsys.readouterr().out
-    assert "DNS cache invalidated and session rebuilt" in output
+    assert "DNS cache invalidated and session rebuilt lazily" in output
     assert secret_token not in output
     assert f"bot{secret_token}" not in output
     assert "https://api.telegram.org/" not in output

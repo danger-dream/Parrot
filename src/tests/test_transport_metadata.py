@@ -124,7 +124,7 @@ def test_http_stream_final_headers_are_business_connection_boundary(monkeypatch)
         "_resolve_http_route_chain",
         lambda channel, model: ([('direct', None)], None),
     )
-    monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
+    monkeypatch.setattr(http_runtime.upstream, "acquire_client", lambda: SimpleNamespace(client=object(), release=lambda: None))
     monkeypatch.setattr(http_runtime, "open_stream", lambda client, request: ctx)
 
     result = asyncio.run(http_runtime.open_response_with_proxy_chain(
@@ -182,7 +182,7 @@ def test_http_response_header_wait_preserves_nearer_total_deadline(monkeypatch):
         "_resolve_http_route_chain",
         lambda channel, model: ([('direct', None)], None),
     )
-    monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
+    monkeypatch.setattr(http_runtime.upstream, "acquire_client", lambda: SimpleNamespace(client=object(), release=lambda: None))
     monkeypatch.setattr(http_runtime, "open_stream", lambda client, request: StalledContext())
 
     result = asyncio.run(http_runtime.open_response_with_proxy_chain(
@@ -224,7 +224,7 @@ def test_http_response_headers_can_open_before_first_byte_timeout(monkeypatch):
         "_resolve_http_route_chain",
         lambda channel, model: ([('direct', None)], None),
     )
-    monkeypatch.setattr(http_runtime.upstream, "get_client", lambda: object())
+    monkeypatch.setattr(http_runtime.upstream, "acquire_client", lambda: SimpleNamespace(client=object(), release=lambda: None))
     monkeypatch.setattr(http_runtime, "open_stream", lambda client, request: ctx)
 
     result = asyncio.run(http_runtime.open_response_with_proxy_chain(
@@ -243,5 +243,5 @@ def test_http_response_headers_can_open_before_first_byte_timeout(monkeypatch):
     ))
 
     assert result.ok
-    assert result.ctx is ctx
+    assert result.ctx.ctx is ctx  # Shared streams now retain a client lease around this exact context.
     assert result.response is response

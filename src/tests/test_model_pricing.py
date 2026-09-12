@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import nullcontext
 
 import pytest
 
@@ -581,7 +582,7 @@ async def test_refresh_fetches_both_models_dev_sources_and_writes_one_atomic_bun
     }
     monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(config, "get", lambda: {"pricing": pricing_cfg})
-    monkeypatch.setattr(upstream, "get_client", lambda: client)
+    monkeypatch.setattr(upstream, "client_scope", lambda: nullcontext(client))
 
     monkeypatch.setattr(
         model_pricing, "_MAX_REMOTE_CATALOG_BYTES",

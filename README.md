@@ -345,7 +345,8 @@ JSON 请求体：
 运维健康检查（无鉴权）：
 ```json
 {
-  "status": "ok",          // ok | degraded | error
+  "status": "ok",          // ok | degraded | error | draining
+  "upstream_client": { "state": "ready", "ready": true },
   "channels": { "total": 13, "enabled": 13, "oauth": 7, "api": 6 },
   "affinity_bound": 64,
   "device_id": "...",
@@ -354,6 +355,12 @@ JSON 请求体：
 ```
 
 ---
+
+## 网络配置热加载与健康状态
+
+修改 DNS 地址、超时、缓存 TTL 或旧版 SOCKS5 开关/地址后，新请求会在主事件循环中按最新配置重建共享 HTTP 客户端；已开始的请求（包括流式响应和模型目录下载）使用原客户端直到结束，再回收旧连接池。保存相同网络设置不重建，停服后不会由请求重新创建客户端。该调整不改变路由优先级、OAuth 刷新或代理故障切换规则。
+
+`/health` 的 `upstream_client` 只反映本地客户端生命周期，不发送 DNS/上游请求，也不进行付费模型探测。`ready` 表示已就绪；`rebuild_pending` 表示网络变更后的正常按需重建状态，仍可接受请求，并不代表已验证新代理可达。客户端未启动、已关闭或构造失败时，返回 `status: error` 和 HTTP 503；构造失败仍允许后续业务请求重试创建。原有渠道无可用/全部冷却的响应规则及 `draining` 排空语义保持不变，健康响应不包含代理凭据或异常原文。
 
 ## OAuth 故障切换与超时恢复
 
@@ -468,7 +475,7 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 `config.json` 是唯一配置来源，运行时自动持久化（tmp + `os.replace` 原子写 + 3 份备份轮转）。
 
-完整字段说明见 `docs/02-config-schema.md` 和 `docs/openai/02-config-schema.md`。关键字段速查：
+完整字段说明见 `docs/02-config-schema.md` 和 `docs/openai/02-config-schema.md`。WorkBuddy 中国区 CLI 的模板兼容规则可通过 `workbuddy.requestRewrite` 配置，默认定向处理已确认的身份句和 `<env>` 主分支模板；支持开关、自定义字面规则及热加载，不修改用户/工具正文。完整示例和匹配边界见 [WorkBuddy 模板适配](docs/02-config-schema.md#workbuddy-模板适配-workbuddyrequestrewrite)。关键字段速查：
 
 ```jsonc
 {

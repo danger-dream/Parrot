@@ -25,6 +25,7 @@ import httpx
 from .. import blacklist, errors
 from ..providers import registry as provider_registry
 from ..providers.antigravity_errors import parse_antigravity_429
+from ..providers.workbuddy_errors import unapproved_channel_error_info
 from .commit_gate import (
     is_responses_dispatch_commit_event_type,
     is_responses_visible_event_type,
@@ -1099,7 +1100,43 @@ def _structured_request_invalid_error_info(
     return protocol_errors.request_invalid_error_info(payload)
 
 
-def request_invalid_result_if_needed(result: AttemptResult) -> AttemptResult:
+def workbuddy_request_rejection(
+    channel,
+    *,
+    http_status: int | None,
+    response_text: str | None = None,
+    translator_ctx: dict | None = None,
+) -> tuple[str, str] | None:
+    """Require provider identity and explicit rejection, never code 11128 alone.
+
+    HTTP rejection is scoped to 400. For a successful SSE transport, trust only
+    the WorkBuddy decoder's per-attempt observation of that exact error frame.
+    Authentication, quota, unknown statuses and other vendors keep their policy.
+    """
+    if getattr(channel, "provider", None) != "workbuddy":
+        return None
+    if http_status == 400:
+        try:
+            payload = json.loads(response_text or "")
+        except (ValueError, TypeError):
+            return None
+        return unapproved_channel_error_info(payload)
+    if http_status is None or http_status == 200:
+        decoder = (translator_ctx or {}).get("workbuddy_stream")
+        return getattr(decoder, "request_rejection", None)
+    return None
+
+
+def request_invalid_result_if_needed(result: AttemptResult, *, channel=None) -> AttemptResult:
+    if not result.success and not result.stream_started:
+        rejection = workbuddy_request_rejection(
+            channel, http_status=result.http_status,
+            response_text=result.full_response_text,
+            translator_ctx=result.translator_ctx,
+        )
+        if rejection is not None:
+            result.error_code, result.error_detail = rejection
+            return _mark_request_invalid(result, 400)
     # Candidate-local guards retain their established alternate-candidate path.
     if result.outcome in {"candidate_guard", "guard_error"}:
         return result

@@ -14,6 +14,7 @@ Network policy:
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import socket
@@ -202,15 +203,38 @@ def dns_cache_ttl() -> int:
         return 300
 
 
-def _signature() -> tuple:
-    s5 = socks5_cfg()
-    return (
-        tuple(dns_servers()),
-        dns_timeout(),
-        dns_cache_ttl(),
-        bool(s5.get("enabled", False)),
-        str(s5.get("url") or ""),
-    )
+def _signature(cfg: dict | None = None) -> tuple:
+    """Fingerprint one published config, not a mix of config generations.
+
+    Temporary DNS test overrides must not invalidate process-wide clients.
+    Dict order is irrelevant; proxy/group candidate list order is significant.
+    Keep proxy credentials out of diagnostic representations of the signature.
+    """
+    current = config.get() if cfg is None else cfg
+    net = current.get("network") or {}
+    dns = net.get("dns") or {}
+    s5 = net.get("socks5") or {}
+    try:
+        servers = tuple(normalize_dns_servers(dns.get("servers") or ["8.8.8.8"]))
+    except (TypeError, ValueError):
+        servers = ("8.8.8.8",)
+    try:
+        timeout = max(0.2, float(dns.get("timeoutSeconds", 3) or 3))
+    except (TypeError, ValueError):
+        timeout = 3.0
+    try:
+        ttl = max(0, int(dns.get("cacheTtlSeconds", 300) or 0))
+    except (TypeError, ValueError):
+        ttl = 300
+    routes = {
+        "legacy_enabled": bool(s5.get("enabled", False)),
+        "legacy_url": str(s5.get("url") or ""),
+        "proxies": net.get("proxies") or {},
+        "groups": net.get("groups") or {},
+        "routing": net.get("routing") or {},
+    }
+    digest = hashlib.sha256(json.dumps(routes, sort_keys=True, separators=(",", ":")).encode()).digest()
+    return servers, timeout, ttl, digest
 
 
 def clear_dns_cache() -> None:
@@ -285,11 +309,13 @@ def on_config_reload(_cfg: dict | None = None) -> None:
 def init() -> None:
     """Install DNS patch and config reload hook. Idempotent."""
     global _PATCHED, _HOOKED, _LAST_SIGNATURE
+    # config.get may fire callbacks; never hold the DNS lock across that call.
+    signature = _signature()
     with _LOCK:
         if not _PATCHED:
             socket.getaddrinfo = _patched_getaddrinfo  # type: ignore[assignment]
             _PATCHED = True
-        _LAST_SIGNATURE = _signature()
+        _LAST_SIGNATURE = signature
         if not _HOOKED:
             config.on_reload(on_config_reload)
             _HOOKED = True

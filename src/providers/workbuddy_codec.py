@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from ..protocols.sse import split_sse_events
+from .workbuddy_errors import unapproved_channel_error_info
 
 
 class WorkBuddyStream:
@@ -11,6 +12,8 @@ class WorkBuddyStream:
         self.buffer = b""
         self.done = False
         self.saw_choice = False
+        # Trusted per-attempt fact; set only after exact vendor-code/message match.
+        self.request_rejection: tuple[str, str] | None = None
 
     @staticmethod
     def _emit(value):
@@ -52,6 +55,15 @@ class WorkBuddyStream:
                     raise ValueError()
                 error = obj.get("error")
                 if error or obj.get("type") == "error" or b"event: error" in event.splitlines() or obj.get("code") not in (None, 0):
+                    rejection = unapproved_channel_error_info(obj)
+                    if rejection is not None:
+                        self.request_rejection = rejection
+                        self.done, self.buffer = True, b""
+                        result.append(self._emit({"error": {
+                            "type": "invalid_request_error", "code": rejection[0],
+                            "message": rejection[1],
+                        }}))
+                        break
                     code = error.get("code") if isinstance(error, dict) else obj.get("code")
                     # Codes carry classification, arbitrary msg/body never does.
                     safe = code if isinstance(code, int) or code in {"context_length_exceeded", "rate_limit_exceeded", "insufficient_quota", "invalid_token"} else "upstream_error"

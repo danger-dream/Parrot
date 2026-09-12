@@ -57,10 +57,10 @@ SEGMENT_ORDER = tuple(SEGMENT_CAPABILITIES)
 EXPECTED_CAPABILITIES = set().union(*SEGMENT_CAPABILITIES.values())
 EXPECTED_CASE_COUNT = 663
 EXPECTED_FIXTURE_SHA256 = {
-    "manifest.jsonl": "a68f37eb211c9606401e93e8f598866afd9e2df7160a30c966f2f030fd568e0c",
+    "manifest.jsonl": "9743317cf7b195623008e9a3aee6e43dd6ca2a74feda544cecf02f78680eef2a",
     "segments/auxiliary.jsonl": "f8ff628ff205ed682b0f7406ddc6f358479a49abe668a8340e012bd8d006dbf9",
     "segments/channels_apikey.jsonl": "12c189f697a1c4868caca3608bdb15185af6959fb0aac5e5a8177be68f624539",
-    "segments/core.jsonl": "78856cde55811d973552b893a7af7d9d2ec982dd2ea87c971df7dd454e06d73b",
+    "segments/core.jsonl": "5cdd2559fc563397ee1b020f4b7067ed68ce4816174fd18e908784ea34598d0b",
     "segments/main_status.jsonl": "32d065524cf3f7e727e8d894cfa552a1293dcee3bf28c50f37b77f67143dbe00",
     "segments/model_routing.jsonl": "6477b4bb46f3874c0f170729cef1ec817099741d9ea065b11ba8e6f9adcf9b6d",
     "segments/oauth.jsonl": "d098f379c7daa7a2e2cc691807a67032d98051849551f531d3acb987e9a8869b",
