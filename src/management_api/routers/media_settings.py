@@ -4,20 +4,32 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Path, Request
+from fastapi import APIRouter, Depends, Header, Path, Query, Request
 
 from src.management_auth.principal import Capability
-from src.management_control import ManagementContext, ManagementErrorCode
+from src.management_control import ManagementContext, ManagementError, ManagementErrorCode
 from src.management_control.auxiliary import AuxiliaryControls
+from src.management_control.models import ModelOwnerRef, ModelSourceType
 
 from ..dependencies import require_capability
 from ..error_mapping import management_error_responses
 from ..schemas.base import DataEnvelope
 from ..schemas.auxiliary_media import (
+    AntigravityMediaAccountOverrideData,
+    AntigravityMediaModelAddRequest,
+    AntigravityMediaModelRenameRequest,
+    AntigravityMediaSettingsData,
+    AntigravityMediaSettingsPatch,
     ImageAccountStateData,
     ImageAccountStatePatch,
     ImageSettingsData,
     ImageSettingsPatch,
+    MediaKind,
+    MediaModelAddRequest,
+    MediaModelMutationData,
+    MediaModelRenameRequest,
+    MediaOwnerData,
+    MediaOwnerType,
     XaiMediaSettingsData,
     XaiMediaSettingsPatch,
 )
@@ -66,13 +78,36 @@ _XAI_EXAMPLE = {
     },
     "meta": {"requestId": "request-example"},
 }
+_MEDIA_MUTATION_EXAMPLE = {
+    "data": {
+        "provider": "xai", "kind": "image",
+        "owner": {"type": "global", "id": None},
+        "modelId": "grok-imagine-image", "models": ["grok-imagine-image"],
+        "status": "added", "revision": "rev_example",
+    },
+    "meta": {"requestId": "request-example"},
+}
+_ANTIGRAVITY_EXAMPLE = {
+    "data": {
+        "imageModels": ["gemini-3.1-flash-image"],
+        "accountOverrides": [{
+            "accountId": "antigravity:account@example.com:project",
+            "imageModels": ["account-image"], "editable": False,
+        }],
+        "revision": "rev_example",
+    },
+    "meta": {"requestId": "request-example"},
+}
 _ERRORS = (
     ManagementErrorCode.SESSION_REQUIRED,
     ManagementErrorCode.SESSION_EXPIRED,
     ManagementErrorCode.ORIGIN_DENIED,
     ManagementErrorCode.CAPABILITY_DENIED,
     ManagementErrorCode.RESOURCE_NOT_FOUND,
+    ManagementErrorCode.RESOURCE_CONFLICT,
+    ManagementErrorCode.CONFIRMATION_REQUIRED,
     ManagementErrorCode.REVISION_CONFLICT,
+    ManagementErrorCode.UNSUPPORTED_VALUE,
     ManagementErrorCode.VALIDATION_FAILED,
     ManagementErrorCode.SERVICE_NOT_READY,
 )
@@ -109,6 +144,44 @@ def _xai(value) -> XaiMediaSettingsData:
         videoModels=list(value.video_models),
         jobTtlSeconds=value.job_ttl_seconds,
         requestTimeoutSeconds=value.request_timeout_seconds,
+        revision=value.revision,
+    )
+
+
+def _owner(value: MediaOwnerData) -> ModelOwnerRef:
+    return ModelOwnerRef(ModelSourceType(value.type.value), value.id)
+
+
+def _owner_query(owner_type: MediaOwnerType, owner_id: str | None) -> ModelOwnerRef:
+    if (
+        (owner_type is MediaOwnerType.GLOBAL and owner_id is not None)
+        or (owner_type is MediaOwnerType.OAUTH and owner_id is None)
+    ):
+        raise ManagementError(ManagementErrorCode.VALIDATION_FAILED)
+    return ModelOwnerRef(ModelSourceType(owner_type.value), owner_id)
+
+
+def _mutation(value) -> MediaModelMutationData:
+    return MediaModelMutationData(
+        provider=value.provider,
+        kind=value.kind.value,
+        owner=MediaOwnerData(type=value.owner.type.value, id=value.owner.id),
+        modelId=value.model_id,
+        models=list(value.models),
+        status=value.status,
+        revision=value.revision,
+    )
+
+
+def _antigravity(value) -> AntigravityMediaSettingsData:
+    return AntigravityMediaSettingsData(
+        imageModels=list(value.image_models),
+        accountOverrides=[
+            AntigravityMediaAccountOverrideData(
+                accountId=account_id, imageModels=list(models), editable=False,
+            )
+            for account_id, models in value.account_overrides
+        ],
         revision=value.revision,
     )
 
@@ -231,3 +304,183 @@ def update_xai_media_settings(
         expected_revision=if_match,
     )
     return DataEnvelope(data=_xai(value), meta=response_meta(request))
+
+
+@router.post(
+    "/xai/media-models/{kind}",
+    operation_id="addXaiMediaModel",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["xai-media"],
+    response_model=DataEnvelope[MediaModelMutationData],
+    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def add_xai_media_model(
+    kind: MediaKind,
+    body: MediaModelAddRequest,
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[MediaModelMutationData]:
+    value = controls.xai_media.add_model(
+        context, kind=kind.value, model_id=body.modelId,
+        expected_revision=if_match,
+    )
+    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
+
+
+@router.patch(
+    "/xai/media-models/{kind}/{modelId:path}",
+    operation_id="renameXaiMediaModel",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["xai-media"],
+    response_model=DataEnvelope[MediaModelMutationData],
+    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def rename_xai_media_model(
+    kind: MediaKind,
+    model_id: Annotated[str, Path(alias="modelId", min_length=1, max_length=128)],
+    body: MediaModelRenameRequest,
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[MediaModelMutationData]:
+    value = controls.xai_media.rename_model(
+        context, kind=kind.value, old_model_id=model_id,
+        new_model_id=body.newModelId, expected_revision=if_match,
+    )
+    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
+
+
+@router.delete(
+    "/xai/media-models/{kind}/{modelId:path}",
+    operation_id="removeXaiMediaModel",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["xai-media"],
+    response_model=DataEnvelope[MediaModelMutationData],
+    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def remove_xai_media_model(
+    kind: MediaKind,
+    model_id: Annotated[str, Path(alias="modelId", min_length=1, max_length=128)],
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.DESTRUCTIVE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[MediaModelMutationData]:
+    value = controls.xai_media.remove_model(
+        context, kind=kind.value, model_id=model_id,
+        expected_revision=if_match,
+    )
+    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
+
+
+@router.get(
+    "/antigravity/media-settings",
+    operation_id="getAntigravityMediaSettings",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["antigravity-media"],
+    response_model=DataEnvelope[AntigravityMediaSettingsData],
+    responses={**success_response(200, _ANTIGRAVITY_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def get_antigravity_media_settings(
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
+) -> DataEnvelope[AntigravityMediaSettingsData]:
+    return DataEnvelope(
+        data=_antigravity(controls.antigravity_media.get_settings(context)),
+        meta=response_meta(request),
+    )
+
+
+@router.patch(
+    "/antigravity/media-settings",
+    operation_id="updateAntigravityMediaSettings",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["antigravity-media"],
+    response_model=DataEnvelope[AntigravityMediaSettingsData],
+    responses={**success_response(200, _ANTIGRAVITY_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def update_antigravity_media_settings(
+    body: AntigravityMediaSettingsPatch,
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[AntigravityMediaSettingsData]:
+    value = controls.antigravity_media.update_settings(
+        context, image_models=body.imageModels, expected_revision=if_match,
+    )
+    return DataEnvelope(data=_antigravity(value), meta=response_meta(request))
+
+
+@router.post(
+    "/antigravity/media-models/image",
+    operation_id="addAntigravityMediaModel",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["antigravity-media"],
+    response_model=DataEnvelope[MediaModelMutationData],
+    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def add_antigravity_media_model(
+    body: AntigravityMediaModelAddRequest,
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[MediaModelMutationData]:
+    value = controls.antigravity_media.add_model(
+        context, owner=_owner(body.owner), model_id=body.modelId,
+        expected_revision=if_match,
+    )
+    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
+
+
+@router.patch(
+    "/antigravity/media-models/image/{modelId:path}",
+    operation_id="renameAntigravityMediaModel",
+    dependencies=[Depends(reject_unknown_query())],
+    tags=["antigravity-media"],
+    response_model=DataEnvelope[MediaModelMutationData],
+    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def rename_antigravity_media_model(
+    model_id: Annotated[str, Path(alias="modelId", min_length=1, max_length=80)],
+    body: AntigravityMediaModelRenameRequest,
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[MediaModelMutationData]:
+    value = controls.antigravity_media.rename_model(
+        context, owner=_owner(body.owner), old_model_id=model_id,
+        new_model_id=body.newModelId, expected_revision=if_match,
+    )
+    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
+
+
+@router.delete(
+    "/antigravity/media-models/image/{modelId:path}",
+    operation_id="removeAntigravityMediaModel",
+    dependencies=[Depends(reject_unknown_query("ownerType", "ownerId"))],
+    tags=["antigravity-media"],
+    response_model=DataEnvelope[MediaModelMutationData],
+    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
+)
+def remove_antigravity_media_model(
+    model_id: Annotated[str, Path(alias="modelId", min_length=1, max_length=80)],
+    request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.DESTRUCTIVE))],
+    owner_type: Annotated[MediaOwnerType, Query(alias="ownerType")],
+    owner_id: Annotated[str | None, Query(alias="ownerId", min_length=1, max_length=512)] = None,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> DataEnvelope[MediaModelMutationData]:
+    owner = _owner_query(owner_type, owner_id)
+    value = controls.antigravity_media.remove_model(
+        context, owner=owner, model_id=model_id,
+        expected_revision=if_match,
+    )
+    return DataEnvelope(data=_mutation(value), meta=response_meta(request))

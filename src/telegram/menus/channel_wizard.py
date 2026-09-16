@@ -45,8 +45,9 @@ def _bounds(n, page):
 def _providers_kb(page=0):
     providers = _catalog().providers
     page, start, pages = _bounds(len(providers), page)
-    rows = [[ui.btn(b.display_name, f"chw:brand:{i}:{page}")]
-            for i, b in enumerate(providers[start:start + PAGE], start)]
+    rows = [[ui.provider_button(
+        b.display_name, f"chw:brand:{i}:{page}", b.id,
+    )] for i, b in enumerate(providers[start:start + PAGE], start)]
     if pages > 1:
         rows.append([ui.btn("◀", f"chw:brands:{page-1}"), ui.btn(f"{page+1}/{pages}", "chw:noop"),
                      ui.btn("▶", f"chw:brands:{page+1}")])
@@ -86,9 +87,16 @@ def wiz_select_brand(chat_id, message_id, cb_id, idx, page):
     if len(brand.presets) == 1:
         ui.answer_cb(cb_id, brand.display_name); _apply_preset(chat_id, message_id, data, idx, 0); return
     data["brand_idx"] = idx; states.set_state(chat_id, "ch_wiz_preset", data); ui.answer_cb(cb_id)
-    rows = [[ui.btn(p.display_name, f"chw:preset:{i}")] for i, p in enumerate(brand.presets)]
+    rows = [[ui.provider_button(
+        p.display_name, f"chw:preset:{i}", brand.id,
+    )] for i, p in enumerate(brand.presets)]
     rows += [[ui.btn("◀ 返回提供商列表", "chw:preset_back")], NAV]
-    ui.edit(chat_id, message_id, f"➕ <b>添加渠道（2/5）</b>\n\n请选择 <b>{ui.escape_html(brand.display_name)}</b> 的方案：",
+    brand_icon = (
+        ui.provider_custom_emoji_html(brand.id)
+        if ui.provider_custom_emoji_id(brand.id) else ""
+    )
+    icon_prefix = f"{brand_icon} " if brand_icon else ""
+    ui.edit(chat_id, message_id, f"➕ <b>添加渠道（2/5）</b>\n\n请选择 {icon_prefix}<b>{ui.escape_html(brand.display_name)}</b> 的方案：",
             reply_markup=ui.inline_kb(rows))
 
 

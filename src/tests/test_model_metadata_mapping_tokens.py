@@ -62,12 +62,15 @@ def test_model_metadata_safe_limit_and_independent_compression_model():
     assert model_metadata.context_window("gpt-5.5") == metadata["contextWindow"]
     assert model_metadata.compact_trigger_tokens("gpt-5.5") == metadata["compactTriggerTokens"]
     expected_limit = min(
-        metadata["compactTriggerTokens"],
-        metadata["contextWindow"] - 20000 - 20000,
+        metadata.get("maxInputTokens", metadata["contextWindow"]),
+        metadata["contextWindow"] - 20000,
     )
     assert model_metadata.safe_prompt_limit("gpt-5.5") == expected_limit
     assert model_metadata.can_fit_for_compact("gpt-5.5", expected_limit)
     assert not model_metadata.can_fit_for_compact("gpt-5.5", expected_limit + 1)
+    assert model_metadata.should_compact(
+        "gpt-5.5", metadata["compactTriggerTokens"],
+    )
     assert model_metadata.get_compression_model() == "gpt-5.5"
     assert "inputPricePer1M" not in metadata
     assert isinstance(metadata["cost"], dict)
@@ -258,7 +261,8 @@ def test_bound_compression_model_respects_compact_trigger_for_replayed_shape():
     prompt_tokens = token_counter.count_request_tokens(direct_body, model="gpt-5.5")
     assert prompt_tokens < model_metadata.context_window("gpt-5.5")
     assert prompt_tokens > model_metadata.compact_trigger_tokens("gpt-5.5")
-    assert not model_metadata.can_fit_for_compact("gpt-5.5", prompt_tokens)
+    assert model_metadata.should_compact("gpt-5.5", prompt_tokens)
+    assert model_metadata.can_fit_for_compact("gpt-5.5", prompt_tokens)
 
 
 def test_compact_split_defaults_to_configured_token_chunks(monkeypatch):
@@ -367,14 +371,14 @@ async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     monkeypatch.setattr(server.auth, "validate", lambda headers: ("test", [], None))
     monkeypatch.setattr(server.log_db, "insert_pending", lambda *args, **kwargs: None)
     monkeypatch.setattr(server.scheduler, "schedule", lambda *args, **kwargs: route)
-    original_safe_prompt_limit = server.model_metadata.safe_prompt_limit
+    original_effective_request_budget = server.model_metadata.effective_request_budget
 
-    def _capture_safe_prompt_limit(model, **kwargs):
+    def _capture_effective_request_budget(model, **kwargs):
         captured["preflight_model"] = model
-        return original_safe_prompt_limit(model, **kwargs)
+        return original_effective_request_budget(model, **kwargs)
 
     monkeypatch.setattr(
-        server.model_metadata, "safe_prompt_limit", _capture_safe_prompt_limit,
+        server.model_metadata, "effective_request_budget", _capture_effective_request_budget,
     )
 
     async def _identity_translate(body, **kwargs):
@@ -408,7 +412,7 @@ async def test_anthropic_http_mapping_binds_final_logical_model(monkeypatch):
     assert binding.tariff is not None
 
 
-def test_context_guard_uses_compact_trigger_and_skips_compact_requests(monkeypatch):
+def test_context_guard_uses_hard_fit_and_skips_compact_requests(monkeypatch):
     import server
 
     config.update(lambda c: c.update({
@@ -420,9 +424,10 @@ def test_context_guard_uses_compact_trigger_and_skips_compact_requests(monkeypat
     }))
     trigger = model_metadata.compact_trigger_tokens("gpt-5.5")
     assert trigger is not None and trigger < model_metadata.context_window("gpt-5.5")
+    counted = {"tokens": trigger + 1}
     monkeypatch.setattr(
         server.token_counter, "count_request_tokens",
-        lambda body, model=None: trigger + 1,
+        lambda body, model=None: counted["tokens"],
     )
     compact_prompt = (
         "CRITICAL: Respond with text only. Create a detailed summary of the conversation so far. "
@@ -441,6 +446,14 @@ def test_context_guard_uses_compact_trigger_and_skips_compact_requests(monkeypat
     assert server._anthropic_to_openai_context_preflight(
         compact_body, _DummyScheduleResult(),
     ) is None
+    assert server._anthropic_to_openai_context_preflight(
+        normal_body, _DummyScheduleResult(),
+    ) is None
+    hard_limit = model_metadata.effective_request_budget(
+        "gpt-5.5", request_shape=normal_body,
+    ).effective_input_budget
+    assert hard_limit is not None and hard_limit > trigger
+    counted["tokens"] = hard_limit + 1
     assert server._anthropic_to_openai_context_preflight(
         normal_body, _DummyScheduleResult(),
     ) is not None

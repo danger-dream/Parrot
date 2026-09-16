@@ -6,7 +6,10 @@ from .control import (
     InventoryRecord,
     MappingControl,
     MappingRecord,
+    MetadataOverridePatch,
     MetadataRecord,
+    MetadataSyncMode,
+    MetadataSyncTarget,
     mapping_control,
 )
 
@@ -16,6 +19,9 @@ __all__ = [
     "InventoryRecord",
     "MappingControl",
     "MappingRecord",
+    "MetadataOverridePatch",
     "MetadataRecord",
+    "MetadataSyncMode",
+    "MetadataSyncTarget",
     "mapping_control",
 ]

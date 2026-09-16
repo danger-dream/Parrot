@@ -243,14 +243,29 @@
   // ─── Telegram UI 展示增强 ───
   // providerCustomEmoji 用于消息正文 HTML（<tg-emoji>），也可传给 Telegram
   // InlineKeyboardButton.icon_custom_emoji_id；providerBtnEmoji 用于 code block、
-  // 不设置按钮 icon 字段时及旧客户端的纯文本兜底。
+  // 不设置按钮 icon 字段时及旧客户端的纯文本兜底。Anthropic/API 与
+  // Claude/OAuth 共用 claude 键，避免旧 claude 自定义覆盖被新增默认遮蔽。
   "telegramUi": {
     "providerCustomEmoji": {
-      "openai": "5861557411784957025",
-      "claude": "5872779796257184592",
-      "xai": "5819115571463068721",
+      "openai": "6141162084857031383",
+      "claude": "6140995813788099525",
+      "antigravity": "6077644693984779782",
       "cursor": "6062261319426390107",
-      "antigravity": "6077644693984779782"
+      "ollama-cloud": "6138524734419116492",
+      "workbuddy": "6120617435214132136",
+      "xai": "6138882363460952713",
+      "kimi": "6140905172798284383",
+      "deepseek": "6138914554240836667",
+      "zhipu": "6140727700454645813",
+      "minimax": "6141114311935796161",
+      "alibaba-bailian": "6138926816372465673",
+      "tencent-cloud": "6140662000339918826",
+      "jd-cloud": "6138855790498291964",
+      "volcengine-ark": "6141018834812806707",
+      "baidu-qianfan": "6138964148228204290",
+      "xiaomi-mimo": "6138428226503975259",
+      "ctyun-xirang": "6138918874977936421",
+      "openrouter": "6140767025175209650"
     },
     "providerBtnEmoji": {
       "openai": "🅾️",
@@ -471,13 +486,57 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - 客户端请求 `model=glm-5` → 匹配 `alias` → 向上游发 `model=GLM-5`（真实名）
 - 客户端请求 `model=GLM-5`（真实名）→ 若 `alias` 列表中无此值，视为不支持（**除非 real==alias 同值**）
 
+### 模型中心状态 `modelCenter`
+
+```json
+"modelCenter": {
+  "schemaVersion": 1,
+  "disabledModels": [],
+  "hiddenModels": [],
+  "apiSourceDisabledModels": {}
+}
+```
+
+- `disabledModels` 保存全局禁用的真实客户端模型 ID，阻止其全部来源候选。恢复全局启用不会清除来源或账户自身的禁用。
+- `hiddenModels` 只控制下游发现结果；别名随目标隐藏。隐藏不撤销 Key 权限，也不禁止合法显式调用；启停和隐藏是两个独立状态。
+- `apiSourceDisabledModels` 保存 API 渠道的可恢复模型禁用，键为内部稳定来源键 `api:<name>`，值为该来源禁用的客户端模型 ID 数组。不删除或重写原路由、出站模型名或元数据。Management API/TG 使用公开 channelId，由共享控制层转换，客户端不要拼接内部键。
+- OAuth 来源仍复用账户既有 `disabledModels` / Cursor 状态，不在此处存第二份。账户禁用、冷却和故障状态继续独立生效。
+- 新配置缺省为空，升级不自动禁用或隐藏任何模型。共享控制层通过 `config.update()` 原子保存；运行时读取同一配置，不以 TG 会话或内存缓存为持久真相。
+- **回退注意**：旧版可能保留这些未知字段，但不会执行新启停/隐藏规则。字段未丢不等于回退后路由仍安全；回退必须同时验证目标代码行为并保留升级前、升级后两份独立配置备份。
+
+### 稀疏手工元数据 `modelMetadataOverrides`
+
+```json
+"modelMetadataOverrides": {
+  "defaults": {
+    "example-model": {
+      "fields": {"contextWindow": 1000000, "cost.input": 0}
+    }
+  },
+  "scoped": {
+    "api:example-channel": {
+      "example-model": {
+        "outboundModel": "upstream-model",
+        "fields": {"contextWindow": 300000}
+      }
+    }
+  }
+}
+```
+
+`defaults` 是真实客户端模型的通用差异，`scoped` 仅保存当前来源修改过的字段，不复制整份通用元数据。来源只覆盖 context=300k 时，价格/输出等仍继承通用及目录基础。`outboundModel` 绑定当时的出站名称；真实出站改名清当前来源旧绑定和覆盖，同名保存、启停、隐藏不清其他层。
+
+16 个字段是 `contextWindow/maxInputTokens/maxOutputTokens/compactTriggerTokens`、`vision/toolCall/structuredOutput/reasoningEfforts/serviceTiers/knowledgeCutoff` 和 `cost.input/output/cacheRead/cacheWrite/longContextInput/longContextOutput`。价格必须为有限非负数，单位为 USD / 1M Token；非有限值在写入前拒绝。持久化价格字段采用点分扁平键，HTTP 的 `set.cost` 则是嵌套对象。原生 serviceTiers 对象保留在账户目录中，有效公共元数据按真实 id 规范化为字符串数组。
+
+键存在即为明确覆盖，`0` 价格、`false` 能力、`[]` 档位不能当缺省。恢复继承必须删除键；整层恢复只删除所选层，不清目录匹配、自动快照或其他来源。有效值同时返回逐字段 `valueSource` 和 `constrainedBy`，未知资料不虚构容量、能力或价格。手工字段可收紧原生限制，不能扩张已知硬上限或开启明确不支持的能力。
+
 ### 模型元数据绑定 `modelBindings` 与压缩模型 `compressionModel`
 
-- `defaults`：键为客户端可见模型名/渠道 alias，值只保存 models.dev `provider/model` identity 与来源；不复制全量目录记录。
+- `defaults`：键为客户端可见模型名/渠道 alias，保存 models.dev `provider/model` identity 与绑定来源。自动同步 binding 可携带 `autoSnapshot.{catalogRevision,catalogSource,metadata,tariff}`，只冻结当前模型的基础元数据和价格，不保存整份候选目录、历史目录树或手工覆盖。
 - `scoped`：先按稳定 scope key（`api:<name>` / `oauth:<provider>:<identity>`），再按客户端可见模型名索引；API alias 同时保存当时的 `outboundModel`，alias 被改指后旧专属绑定不再误用。
-- 普通渠道有效解析固定为 `scoped > default > none`。context window、max output、压缩阈值、能力展示和估算价格均从该绑定指向的同一份 models.dev 目录取得；没有有效绑定时保持无元数据/未计价，不按 provider 或模型前缀猜测。压缩阈值优先取 models.dev 第一档 context 价格阶梯的起点；没有该阶梯时按 `floor((contextWindow - maxOutputTokens) × 80%)` 计算。
-- Cursor OAuth scope 是有意设计的例外，固定优先级为 `Cursor AvailableModels > scoped > default > none`。它按账号自动生成只读 `cursor/<canonical-id>` 元数据，使用 Cursor 返回的 normal/max context 与 legacy slugs；不允许手动改绑/删除，也不拿同名 models.dev 限制覆盖。所有具备独立 Max Context 档位的模型默认开启，TG 单模型开关保存关闭例外；下游显式 true/false 仍优先于账号默认。Cursor 模型目录支持按账号批量禁用 canonical 模型，禁用后该账号的 Channel 不再暴露、排列或调度这些模型；目录刷新和重新登录保留该设置，取消选择即可恢复。普通请求的压缩阈值按 `floor((contextWindow - maxOutputTokens) × 80%)` 计算；启用 Max Context 时，预检、直连压缩和 map-reduce 会改用 `contextWindowMaxMode` 动态重算阈值。`[1m]`、`~1000000`、`-context-1m`、`long_context`、`context_window=1000000` 与 Anthropic context-1m beta 会在三种 HTTP 入口统一归一，映射、白名单和调度仍使用 canonical id。Cursor 请求只记录 AgentService 实时返回的 input/output/cache usage，不抓取或覆盖 Cursor Web usage event；上游未返回缓存拆分时按 0 如实记录，Parrot 日志金额仅为本地实时记录，准确计价以 Cursor 官方为准。账号总额度仍单独以 Cursor DashboardService 为准。Cursor 展开目录中的 `low/medium/high/xhigh/max` 都是 reasoning effort；`*-thinking-max` 必须作为真实模型 ID 原样发送。Max Context 是独立维度，通过 `RequestedModel.max_mode` 和 `long_context` 表达，不得从模型 ID 的 `-max` 后缀推断。
-- Telegram「自动同步元数据」会先拉取最新的 `api.json` 与 `models.json`：两份均下载、校验成功后原子保存为本地 gzip 目录；任一拉取失败则保留并继续使用上次成功保存的本地目录。随后从该本地目录扫描每个 OAuth/API scope 的已有客户端模型，去重后只按 `models.json` canonical 官方根与 `api.json` 的 exact 同名记录建立/更新默认绑定，不覆盖专属绑定。专属流程按 OAuth/API 账户或渠道 → 该 scope 内模型 → exact 同名候选优先选择；找不到合适候选时才按名称筛选或浏览 provider 与其模型。
+- 普通渠道先按 `scoped > default > none` 选择匹配基础，再叠加通用/来源稀疏手工字段，并受服务方原生硬限制约束。自动 binding 优先读自己的 `autoSnapshot`，显式 `tariff=null` 不回退活动目录旧价；旧 binding 缺快照仍读当前活动目录，不因加载而批量迁移。目录明确提供的 `limit.input` 投影为 `maxInputTokens`，与所选 context 约束输入；输出仅按有效 `maxOutputTokens` 独立判断，不从输入预算预扣客户端最大输出。缺少 maxInput 时才从 context 派生输入预算，不能因为显式值恰等于 normal context 就在 Max Context 下扩张。人工收紧 context 不联动降低输出上限；原生最大输出及人工输出收紧仍生效。容量、能力和价格使用同一来源有效解析；未知值保持未知，不按 provider 或模型前缀猜测。目录默认压缩阈值保留既有推导，但最终请求安全预算与触发阈值分开，不能把 Demo 的 80% 当作通用硬容量公式。
+- Cursor OAuth scope 是有意设计的例外，固定优先级为 `Cursor AvailableModels > scoped > default > none`。它按账号自动生成只读 `cursor/<canonical-id>` 匹配基础，使用 Cursor 返回的 normal/max context 与 legacy slugs；不允许手动改绑/删除，也不拿同名 models.dev 限制覆盖。稀疏手工层仍可合法收紧：normal/Max Context 分别与 operator context 上限求交，输出/能力子集不被 native 还原；显式 maxInputTokens 与 compactTriggerTokens 不因 Max Context 扩大。所有具备独立 Max Context 档位的模型默认开启，TG 单模型开关保存关闭例外；下游显式 true/false 仍优先于账号默认。Cursor 模型目录支持按账号批量禁用 canonical 模型，禁用后该账号的 Channel 不再暴露、排列或调度这些模型；目录刷新和重新登录保留该设置，取消选择即可恢复。普通请求的压缩阈值按 `floor((contextWindow - maxOutputTokens) × 80%)` 计算；启用 Max Context 时，预检、直连压缩和 map-reduce 会改用 `contextWindowMaxMode` 动态重算阈值。`[1m]`、`~1000000`、`-context-1m`、`long_context`、`context_window=1000000` 与 Anthropic context-1m beta 会在三种 HTTP 入口统一归一，映射、白名单和调度仍使用 canonical id。Cursor 请求只记录 AgentService 实时返回的 input/output/cache usage，不抓取或覆盖 Cursor Web usage event；上游未返回缓存拆分时按 0 如实记录，Parrot 日志金额仅为本地实时记录，准确计价以 Cursor 官方为准。账号总额度仍单独以 Cursor DashboardService 为准。Cursor 展开目录中的 `low/medium/high/xhigh/max` 都是 reasoning effort；`*-thinking-max` 必须作为真实模型 ID 原样发送。Max Context 是独立维度，通过 `RequestedModel.max_mode` 和 `long_context` 表达，不得从模型 ID 的 `-max` 后缀推断。
+- 元数据同步的 `one/selected/source` 只下载解析临时候选，提交对应 binding 自动快照，不发布活动目录及其磁盘 LKG；未选模型/其他来源的有效元数据、价格及活动目录 revision 必须不变。`full` 和原有后台全量刷新才发布公共目录并协调自动快照；仍遵守 `pricing.autoUpdate/refreshHours`。下载失败保留 LKG；人工匹配、稀疏手工字段与原生硬能力均受保护。full/background 的快照提交对计算输入配置执行 CAS，拒绝覆盖并发保存的 manual。兼容 account/channel/provider 同步省略 If-Match 时仍冻结受理 revision，不暗中改成强制 header。手工匹配仍可按来源模型浏览或查询 exact 候选，不与字段覆盖混用。
 - `compressionModel` 是独立的客户端可见模型名。运行时按实际 compact 路由解析相同的有效绑定来取得 context、max output 和压缩阈值；普通请求的 compact 预检、直连压缩判断和 map-reduce 分段目标都会使用该阈值。旧 `modelMetadata[*].compressionModel=true` 会一次性迁移，旧手工元数据只有 exact canonical 命中时才迁成默认绑定。
 
 ### Token 金额统计 `pricing`
@@ -487,11 +546,22 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 - `sourceUrl`：models.dev 供应商模型与价格目录，默认 `https://models.dev/api.json`，只接受 `https://`。金额只从这里读取，单位为 USD / 1M Token。
 - `modelsUrl`：规范模型身份目录，默认 `https://models.dev/models.json`，只接受 `https://`。该文件不提供价格，仅用于 canonical 官方 exact 同名匹配。
 - `refreshHours`：远端刷新间隔，最小 1 小时。
-- 旧 `channelProviders` / `aliases` / `overrides` 字段可继续留在配置中，避免升级时丢配置；新的 dispatch-time 估算不使用它们绕过元数据绑定，也不接受手工价格覆盖。
+- 旧 `pricing.channelProviders` / `aliases` / `overrides` 字段可继续留在配置中，避免升级时丢配置；dispatch-time 估算不使用这些旧字段绕过元数据绑定。新的手工价格差异仅通过 `modelMetadataOverrides` 的六项价格字段生效，基础 tariff 与自动 binding 快照保持独立。
 
 新请求在每次上游尝试 dispatch 时按真实 scope、客户端可见 model 和出站真实 model 解析有效元数据绑定，并冻结其 models.dev provider/model、费率与目录版本；之后配置或目录更新不会重算该结算。没有有效绑定或绑定记录没有可用 Token 价格时保持 `unpriced`。只有没有尝试账本的历史请求才会按当前有效绑定做兼容估算。xAI OAuth 响应包含 `usage.cost_in_usd_ticks` 时优先采用该次尝试的真实上游金额。长上下文阶梯按**单次请求**的 `input + cache creation + cache read` 判断；当前结算结构只支持一档 context tier，目录若为同一模型提供多档阈值则该模型 fail-closed 为未计价。`experimental.modes.fast.cost` 是完整替换价，不与标准长上下文价叠加；没有响应/真实出站 fast 事实时不会从下游 intent 臆测加速价，实际为 priority/fast 但目录没有对应 tariff、或上游返回 `flex` 等未知计费档位时同样保持未计价。数据库只保存缓存写入总 Token、没有保存 Anthropic 5 分钟 / 1 小时 TTL 拆分，因此 Claude 请求只要包含 cache creation 就标记为“未计价”。目录若要求单独计费 reasoning/audio Token、但价格与聚合 input/output 不同，也会保持未计价，避免用缺失的 Token 维度生成假精确金额。
 
 Telegram 界面只显示合并后的 USD 金额，不展示金额来源分类或未计价次数；统计页面保留两位小数，最近日志紧凑列表保留三位小数，均不加约等号。models.dev 计价结果与 xAI 上游金额会直接合并到同一个总额，内部仍保留各自结算来源及无法计价记录，以保证账本和聚合口径不变。Parrot 不做实时汇率换算。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，内部不会把它作为已知金额计入总额。
+
+### 媒体模型与共享生成缓存
+
+- Grok 图片/视频名单继续分别存于 `xaiOAuth.imageModels/videoModels`，单项增删改名和整组替换由同一控制层写入，保序且不串改另一组。
+- AG 全局图片名单存于 `antigravityOAuth.imageModels`；已有 `oauthAccounts[*].imageModels` 是账户专属覆盖，与同名全局项分离。模型中心只允许编辑 AG 全局范围，专属范围只读；全局清空不清账户专属数据。
+- `images.enabled` 为 GPT/Grok/AG 图片总开关；`images.mainModel/toolModel` 仍仅属于 GPT 图片内部管线，不作为下游缺少 model 的默认值。
+- `images.cacheEnabled` 默认 false。`cachePath` 默认 `images`；相对路径以 `DATA_DIR` 为根且不可逃逸，绝对路径按明确配置使用。缓存目录应专用于媒体，不能与无关文件混放。
+- `images.cacheRetentionDays` 默认 0（永久），`cacheMaxBytes` 默认 1 GiB（0 表示不设聚合上限）。原 GPT/Grok 缓存和新增 AG 图片生成共用这些参数；不新增 AG 独立保留策略。聚合不限不等于取消单文件保护限制。
+- AG 缓存保存已生成的 base64 图片，不修改 `b64_json` 或带 MIME 的 data URL 响应，不增加图片编辑支持。缓存写失败不把成功生成改成失败；统一媒体日志分别保存生成结果与缓存状态/错误类别。
+
+接口、权限、revision、单项 owner 与下载边界见 [模型中心](14-model-center.md#媒体模型与共享缓存)。
 
 ### 超时语义（关键）
 

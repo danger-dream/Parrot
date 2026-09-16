@@ -35,7 +35,7 @@ from src import (
     __version__, drain,
     affinity, apikey_limiter, auth, compact_rescue, config, cooldown,
     errors, failover, fingerprint, image_db, load_balancing, log_db,
-    model_mapping, model_metadata, model_pricing, network,
+    model_mapping, model_metadata, model_pricing, model_state, model_validation, network,
     network_monitor, notifier, oauth_manager, probe, provider_usage, public_ip, scheduler, scorer,
     state_db, status_monitor, token_counter, translation, update_checker, updater,
     upstream,
@@ -116,6 +116,7 @@ def _telegram_control_bindings(controls: ManagementControls):
         (tgbot.menu_cache, "_STATS_CONTROL", observability.stats),
         (tgbot.logs_menu, "_CONTROL", observability.logs),
         (tgbot.media_logs_menu, "_CONTROL", observability.media),
+        (tgbot.model_center_menu, "_CONTROL", controls.models),
         (tgbot.mapping_menu, "mapping_control", controls.mapping),
         (tgbot.mapping_menu, "compact_rescue", controls.mapping),
         (tgbot.load_balancing_menu, "load_balancing_control", controls.load_balancing),
@@ -893,24 +894,32 @@ def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
     """
     if compact_rescue.is_claude_code_compact_request(body):
         return None
-    ch, resolved_model = _first_route_channel_and_model(result)
-    if ch is None:
+    routes = list(getattr(result, "candidates", []) or []) + list(
+        getattr(result, "saturated", []) or []
+    )
+    # This compatibility preflight is request-global. With multiple candidates,
+    # only the final per-candidate wire guard may reject a route: the next one
+    # can have a larger effective budget (including a currently queued route).
+    if len(routes) != 1:
         return None
+    ch, resolved_model = routes[0]
     if getattr(ch, "protocol", "anthropic") == "anthropic":
         return None
     metadata_model = str(
         body.get("_client_visible_model") or body.get("model") or ""
     ).strip()
-    safe_limit = model_metadata.safe_prompt_limit(
+    budget = model_metadata.effective_request_budget(
         metadata_model,
         scope_key=str(getattr(ch, "key", "") or ""),
         outbound_model=str(resolved_model or ""),
+        request_shape=body,
         use_max_context=_channel_uses_max_context(ch, body, resolved_model),
     )
+    safe_limit = budget.effective_input_budget
     if not metadata_model or safe_limit is None or safe_limit <= 0:
         return None
     prompt_tokens = token_counter.count_request_tokens(body, model=metadata_model)
-    if prompt_tokens <= safe_limit:
+    if budget.output_within_limit and prompt_tokens <= safe_limit:
         return None
     msg = protocol_errors.context_length_error_message_for_claude_code(
         "context_length_exceeded: Your input exceeds the context window of this model. "
@@ -1008,7 +1017,10 @@ async def list_models(request: Request):
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    all_models = registry.available_models()
+    all_models = [
+        model for model in registry.available_models()
+        if model_state.is_discovery_visible(model)
+    ]
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
@@ -1233,24 +1245,25 @@ async def proxy_messages(request: Request):
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, "request body must be a JSON object"
         )
-    if body.get("model") is not None and not isinstance(body["model"], str):
+    try:
+        body["model"] = model_validation.require_explicit_model(body)
+    except model_validation.ExplicitModelError as exc:
         return errors.json_error_response(
-            400, errors.ErrType.INVALID_REQUEST, "model must be a string"
+            400, errors.ErrType.INVALID_REQUEST, exc.message,
         )
 
-    # 2.1 保存下游显式能力信号，再做模型映射 / 入口默认模型：
+    # 2.1 保存下游显式能力信号，再做模型映射：
     #     - anthropic-beta 可显式请求 context-1m；
     #     - 原始模型名可能是 `sonnet[1m]` / `*-1m` / `*-context-1m` 这类 1M 别名；
     #     - `max_tokens` 是输出上限，不参与 1M context 判断。
     downstream_betas = parse_beta_header(request.headers.get("anthropic-beta"))
     original_model = body.get("model")
 
-    # 模型映射 / 入口默认模型：
-    #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
+    # 模型映射：
+    #     - body.model 已在上方要求为下游显式非空字符串
     #     - body.model 命中别名 → 改写成真实名（只解一层）
     #     - body.model 带 [1m]/-1m/context-1m → 剥 marker 后再给映射表二次机会
     #     后续白名单/调度/channel 全按真实名走；显式 1M 意图由私有字段单独传递。
-    model_mapping.apply_default(body, "anthropic")
     model_mapping.apply_mapping(body, "anthropic")
     stripped_model = strip_context_1m_model_marker(body.get("model"))
     if stripped_model != body.get("model"):

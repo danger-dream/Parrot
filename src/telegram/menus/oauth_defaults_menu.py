@@ -245,7 +245,7 @@ def _merge_ids(ids: list[str], existing: list[str]) -> list[str]:
 
 def _overview_text() -> str:
     lines = [
-        "🧬 <b>默认模型</b>",
+        "🧬 <b>OAuth 备用模型</b>",
         "",
         "这里维护各 Provider 的普通模型 ID 字符串列表。",
         "仅当某个 OAuth 账户没有可用的实时/LKG 目录时，才作为该账户的无状态兜底；账户故障不会反向修改此列表。",
@@ -254,7 +254,7 @@ def _overview_text() -> str:
     ]
     for fam in _FAMILIES:
         models = _read_list(fam)
-        lines.append(f"{_fam_body_label(fam)}  {len(models)} 个默认模型")
+        lines.append(f"{_fam_body_label(fam)}  {len(models)} 个备用模型")
     cursor_n = _cursor_account_count()
     lines.append(f"{ui.provider_tag('cursor')}  账号详情里看目录")
     if cursor_n:
@@ -270,7 +270,7 @@ def _overview_kb() -> dict:
             ui.provider_button("Grok", "odm:edit:xai", "xai"),
         ],
         [ui.provider_button("Antigravity", "odm:edit:antigravity", "antigravity")],
-        [ui.btn("◀ 返回账户设置", "oa:settings")],
+        [ui.btn("◀ 返回模型设置", "mc:settings")],
     ])
 
 
@@ -300,7 +300,7 @@ def _manual_panel(chat_id: int, message_id, data: dict) -> None:
     current = ", ".join(data.get("existing_models") or [])
     current_line = f"当前：<code>{ui.escape_html(current)}</code>\n\n" if current else "当前：<i>(空)</i>\n\n"
     text = (
-        prefix + f"✏ <b>修改</b> {_fam_body_label(family)} <b>默认模型</b>\n\n"
+        prefix + f"✏ <b>修改</b> {_fam_body_label(family)} <b>备用模型</b>\n\n"
         + current_line +
         "请输入新的模型列表，逗号/换行分隔。\n"
         "发送 <code>-</code> 或 <code>empty</code> 则清空。\n\n"
@@ -396,9 +396,9 @@ def _render_models(chat_id, message_id, data):
     lines = [
         head,
         "",
-        f"✏ <b>修改</b> {_fam_body_label(data['family'])} <b>默认模型</b>",
+        f"✏ <b>修改</b> {_fam_body_label(data['family'])} <b>备用模型</b>",
         f"第 <b>{page+1}/{pages}</b> 页 · 每页最多 <b>{PAGE}</b> 项",
-        "点击下方数字切换是否加入默认模型列表；翻页会保留草稿。",
+        "点击下方数字切换是否加入备用模型列表；翻页会保留草稿。",
         "",
     ]
     for i, mid in enumerate(models[start:start + PAGE], start):
@@ -681,7 +681,7 @@ def _render_confirm(
     family: str, new_models: list[str], removed: set[str], refs: dict,
 ) -> str:
     lines = [
-        f"⚠ <b>确认保存</b> {_fam_body_label(family)} <b>默认模型</b>",
+        f"⚠ <b>确认保存</b> {_fam_body_label(family)} <b>备用模型</b>",
         "",
         f"即将移除 ({len(removed)} 项):",
     ]
@@ -745,7 +745,7 @@ def _send_saved_result(
     chat_id: int, family: str, new_models: list[str],
     summary: dict | None,
 ) -> None:
-    parts = [f"✅ 已保存 {_fam_body_label(family)} 默认模型 "
+    parts = [f"✅ 已保存 {_fam_body_label(family)} 备用模型 "
              f"({len(new_models)} 项)"]
     if new_models:
         joined = ", ".join(ui.escape_html(m) for m in new_models)
@@ -802,8 +802,8 @@ def _send_saved_result(
     ui.send_result(
         chat_id, "\n\n".join(parts),
         extra_rows=[[ui.btn("◀ 返回模型目录", "odm:show")]],
-        back_label="◀ 返回 OAuth 设置",
-        back_callback="oa:settings",
+        back_label="◀ 返回模型设置",
+        back_callback="mc:settings",
     )
 
 

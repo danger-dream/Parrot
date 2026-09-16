@@ -118,6 +118,14 @@ class _AsgiTestClient:
         self._app = app
 
     def post(self, url: str, **kwargs):
+        # Existing success/error fixtures now state the required client model
+        # explicitly. New missing-model cases pass ``explicit_model=None``.
+        explicit_model = kwargs.pop("explicit_model", "dall-e-3")
+        if explicit_model is not None:
+            if isinstance(kwargs.get("json"), dict) and "model" not in kwargs["json"]:
+                kwargs["json"] = {**kwargs["json"], "model": explicit_model}
+            if isinstance(kwargs.get("data"), dict) and "model" not in kwargs["data"]:
+                kwargs["data"] = {**kwargs["data"], "model": explicit_model}
         async def _run():
             transport = httpx.ASGITransport(app=self._app)
             async with httpx.AsyncClient(
@@ -626,6 +634,68 @@ def test_pipeline_success_after_one_failover(monkeypatch):
     assert body["data"][0]["b64_json"] == fake_image["b64_json"]
     # 成功响应不带 Retry-After
     assert "retry-after" not in {k.lower(): v for k, v in r.headers.items()}
+
+
+# ── 显式 model 必填（所有标准/私有创建入口）──────────────────────────────
+
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "/v1/images/generations", "/images/generations",
+        "/v1/images/edits", "/images/edits",
+        "/v1/images/generate", "/v1/images/edit",
+    ],
+)
+@pytest.mark.parametrize("invalid_model", [_ABSENT, None, "", "   ", 7])
+def test_all_image_create_routes_require_explicit_model_before_pipeline(
+    monkeypatch, route, invalid_model,
+):
+    calls = 0
+
+    async def unexpected(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid model must not reach image pipeline")
+
+    monkeypatch.setattr(compat, "_execute_pipeline", unexpected)
+    monkeypatch.setattr(images_simple, "_execute_pipeline", unexpected)
+    payload = {"prompt": "x", "image": "https://example.test/input.png"}
+    if invalid_model is not _ABSENT:
+        payload["model"] = invalid_model
+    response = _make_client(_build_app()).post(
+        route, headers=_auth_headers(), json=payload, explicit_model=None,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    if route.endswith("generations") or route.endswith("edits"):
+        assert response.json()["error"].get("param") == "model"
+    assert calls == 0
+
+
+@pytest.mark.parametrize("route", ["/v1/images/generations", "/v1/images/edits", "/v1/images/generate", "/v1/images/edit"])
+def test_image_multipart_requires_model_before_file_or_pipeline(monkeypatch, route):
+    calls = 0
+
+    async def unexpected(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("missing model must not reach image pipeline")
+
+    monkeypatch.setattr(compat, "_execute_pipeline", unexpected)
+    monkeypatch.setattr(images_simple, "_execute_pipeline", unexpected)
+    response = _make_client(_build_app()).post(
+        route,
+        headers={"Authorization": "Bearer test-token"},
+        data={"prompt": "x"},
+        files={"image": ("in.png", b"not-read", "image/png")},
+        explicit_model=None,
+    )
+    assert response.status_code == 400, response.text
+    assert calls == 0
 
 
 # ── 老入口回归 ────────────────────────────────────────────────────────────

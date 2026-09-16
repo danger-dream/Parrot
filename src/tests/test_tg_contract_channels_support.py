@@ -28,9 +28,31 @@ from src.channel import registry
 from src.openai.channel.api_channel import OpenAIApiChannel
 from src.telegram import menu_cache, states, ui
 from src.telegram.menus import apikey_menu, channel_menu, channel_wizard
+from src.tests.tg_contract import load_jsonl
 
 
+# Keep the v0.31.13 recording immutable; current approved model-center deltas
+# are sparse overlays so every unaffected contract field remains archived data.
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/channels_apikey.jsonl"
+CURRENT_OVERRIDES = (
+    Path(__file__).parent
+    / "fixtures/tg_contract/model-center-2026-09-13/overrides/channels_apikey.jsonl"
+)
+
+
+def current_cases() -> list[dict[str, Any]]:
+    archived = load_jsonl(SEGMENT)
+    overrides = load_jsonl(CURRENT_OVERRIDES) if CURRENT_OVERRIDES.exists() else []
+    archived_ids = {case["caseId"] for case in archived}
+    override_map = {case["caseId"]: case for case in overrides}
+    if len(override_map) != len(overrides):
+        raise AssertionError("duplicate channel contract override caseId")
+    unknown = set(override_map) - archived_ids
+    if unknown:
+        raise AssertionError(f"unknown channel contract overrides: {sorted(unknown)}")
+    return [override_map.get(case["caseId"], case) for case in archived]
+
+
 FAKE_NOW = 1_700_000_000.0
 MONTH_START = 1_698_796_800.0
 CONFIG_KEYS = (
@@ -143,6 +165,10 @@ def _install_config(initial: dict[str, Any]) -> None:
         # Model-permission menus read OAuth models as well as API channels.
         # Accounts left by a prior lifecycle test are not part of this fixture.
         cfg["oauthAccounts"] = deepcopy(initial.get("oauthAccounts", []))
+        # Quota rendering is shared by OAuth/channel menus but is outside this
+        # segment's business snapshot. Pin its production default so preceding
+        # OAuth tests cannot leak a progress-bar preference into strict traces.
+        cfg["quotaProgressBar"] = bool(initial.get("quotaProgressBar", True))
         # This setting participates in generation retirement but is intentionally
         # outside the segment's business-state snapshot. Pin the production
         # default so a prior test cannot change the captured frozen limit.

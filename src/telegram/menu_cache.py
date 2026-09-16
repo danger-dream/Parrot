@@ -46,6 +46,7 @@ class CacheRead:
     value: Any
     fresh: bool
     refreshing: bool
+    error: Exception | None = None
 
 
 class SWRCache:
@@ -60,6 +61,7 @@ class SWRCache:
         self.ttl_seconds = float(ttl_seconds)
         self._lock = threading.Lock()
         self._values: dict[Hashable, tuple[Any, float]] = {}
+        self._errors: dict[Hashable, Exception] = {}
         self._inflight: set[Hashable] = set()
         self._interactive: set[Hashable] = set()
         self._waiters: dict[
@@ -72,11 +74,12 @@ class SWRCache:
         now = time.monotonic()
         with self._lock:
             item = self._values.get(key)
+            error = self._errors.get(key)
             refreshing = key in self._inflight
         if item is None:
-            return CacheRead(None, False, refreshing)
+            return CacheRead(None, False, refreshing, error)
         value, stored_at = item
-        return CacheRead(value, now - stored_at < self.ttl_seconds, refreshing)
+        return CacheRead(value, now - stored_at < self.ttl_seconds, refreshing, error)
 
     def request(
         self,
@@ -112,9 +115,10 @@ class SWRCache:
         now = time.monotonic()
         with self._lock:
             item = self._values.get(key)
+            error = self._errors.get(key)
             fresh = bool(item is not None and now - item[1] < self.ttl_seconds)
             if not force and fresh:
-                return CacheRead(item[0], True, key in self._inflight), self._generation, False
+                return CacheRead(item[0], True, key in self._inflight, error), self._generation, False
             if interactive:
                 self._interactive.add(key)
             if on_ready is not None:
@@ -124,7 +128,7 @@ class SWRCache:
             if should_enqueue:
                 self._inflight.add(key)
             value = item[0] if item is not None else None
-            return CacheRead(value, False, True), self._generation, should_enqueue
+            return CacheRead(value, False, True, error), self._generation, should_enqueue
 
     def _is_interactive(self, key: Hashable, generation: int) -> bool:
         with self._lock:
@@ -155,6 +159,9 @@ class SWRCache:
                 return error is None
             if error is None:
                 self._values[key] = (value, time.monotonic())
+                self._errors.pop(key, None)
+            else:
+                self._errors[key] = error
             self._inflight.discard(key)
             self._interactive.discard(key)
             waiters = list(self._waiters.pop(key, {}).values())
@@ -183,11 +190,13 @@ class SWRCache:
                 value,
                 time.monotonic() - max(0.0, age_seconds),
             )
+            self._errors.pop(key, None)
 
     def clear(self) -> None:
         with self._lock:
             self._generation += 1
             self._values.clear()
+            self._errors.clear()
             self._inflight.clear()
             self._interactive.clear()
             self._waiters.clear()
@@ -385,10 +394,27 @@ def _refresh_common_periods() -> bool:
     return ok
 
 
-def _refresh_lifetime() -> bool:
-    return LIFETIME_STATS.refresh_now(
-        "lifetime", lambda: _STATS_CONTROL.lifetime_snapshot(_CONTEXT),
+def _load_lifetime() -> dict[str, Any]:
+    return _STATS_CONTROL.lifetime_snapshot(_CONTEXT)
+
+
+def request_lifetime(
+    *,
+    subscriber: Hashable | None = None,
+    on_ready: Callable[[Any, Exception | None], None] | None = None,
+) -> CacheRead:
+    """按需提升累计统计预热优先级；调用线程绝不执行统计查询。"""
+    return LIFETIME_STATS.request(
+        "lifetime",
+        _load_lifetime,
+        subscriber=subscriber,
+        on_ready=on_ready,
+        interactive=True,
     )
+
+
+def _refresh_lifetime() -> bool:
+    return LIFETIME_STATS.refresh_now("lifetime", _load_lifetime)
 
 
 def _refresh_oauth_windows() -> bool:

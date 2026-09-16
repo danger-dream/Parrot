@@ -14,7 +14,6 @@ import base64
 import hashlib
 import json
 import mimetypes
-import os
 import re
 import time
 import uuid
@@ -32,6 +31,8 @@ from .. import (
     config,
     errors,
     image_db,
+    media_cache,
+    model_validation,
     network,
     oauth_manager,
     state_db,
@@ -476,103 +477,39 @@ async def _call_upstream_once(account_row: dict, payload: dict, *, timeout_s: in
 
 
 def _cache_root(cfg: dict) -> Path:
-    raw = str(cfg.get("cachePath") or "images").strip() or "images"
-    if os.path.isabs(raw):
-        root = Path(raw).resolve()
-    else:
-        root = (Path(config.DATA_DIR) / raw).resolve()
-        data_root = Path(config.DATA_DIR).resolve()
-        try:
-            root.relative_to(data_root)
-        except ValueError as exc:
-            raise ValueError("cachePath escapes data directory") from exc
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    """Compatibility wrapper for callers sharing the generated-media cache."""
+    return media_cache.cache_root(cfg)
 
 
 def _ext_for(fmt: str) -> str:
-    f = (fmt or "png").lower().strip()
-    if f in {"jpeg", "jpg"}:
-        return "jpg"
-    if f == "webp":
-        return "webp"
-    return "png"
+    return media_cache.extension_for(media_type="image", preferred=fmt)
 
 
 def _save_cached_images(images: list[dict], *, action: str, cfg: dict) -> tuple[list[str], int, int]:
     if not cfg.get("cacheEnabled"):
         return [], 0, 0
-    root = _cache_root(cfg)
-    day = time.strftime("%Y%m%d", time.localtime())
-    out_dir = root / day
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     paths: list[str] = []
     total = 0
+    limit = media_cache.file_limit(cfg)
     for idx, img in enumerate(images):
-        b64 = img.get("b64_json") or ""
-        raw = base64.b64decode(b64, validate=False)
+        raw = media_cache.decode_base64(str(img.get("b64_json") or ""), max_bytes=limit)
         total += len(raw)
-        ext = _ext_for(img.get("output_format") or "png")
-        path = out_dir / f"{action}-{int(time.time())}-{uuid.uuid4().hex[:10]}-{idx}.{ext}"
-        path.write_bytes(raw)
-        paths.append(str(path))
-    _cleanup_cache(root, cfg)
+        paths.append(media_cache.write_bytes(
+            raw,
+            cfg=cfg,
+            provider="openai",
+            media_type="image",
+            action=action,
+            extension=_ext_for(str(img.get("output_format") or "png")),
+            index=idx,
+        ))
+    media_cache.cleanup(_cache_root(cfg), cfg)
     return paths, len(paths), total
 
 
 def _cleanup_cache(root: Path, cfg: dict) -> None:
-    try:
-        retention_days = int(cfg.get("cacheRetentionDays") or 0)
-        max_bytes = int(cfg.get("cacheMaxBytes") or 0)
-    except Exception:
-        retention_days, max_bytes = 0, 0
-    # The same cache is shared by GPT images and xAI Imagine images/videos.
-    suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".m4v"}
-    files: list[Path] = []
-    for p in root.rglob("*"):
-        try:
-            if p.is_file() and not p.is_symlink() and p.suffix.lower() in suffixes:
-                files.append(p)
-        except OSError:
-            continue
-    now = time.time()
-    if retention_days > 0:
-        cutoff = now - retention_days * 86400
-        kept = []
-        for p in files:
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
-                else:
-                    kept.append(p)
-            except OSError:
-                pass
-        files = kept
-    if max_bytes <= 0:
-        return
-    stats = []
-    total = 0
-    for p in files:
-        try:
-            st = p.stat()
-            total += st.st_size
-            stats.append((st.st_mtime, st.st_size, p))
-        except OSError:
-            pass
-    if total <= max_bytes:
-        return
-    stats.sort(key=lambda x: x[0])
-    # 每轮删除最老 20%，若仍超限继续删除。
-    while total > max_bytes and stats:
-        n = max(1, (len(stats) + 4) // 5)
-        batch, stats = stats[:n], stats[n:]
-        for _, sz, p in batch:
-            try:
-                p.unlink(missing_ok=True)
-                total -= sz
-            except OSError:
-                pass
+    """Compatibility wrapper retained for older xAI/tests during migration."""
+    media_cache.cleanup(root, cfg)
 
 
 def _normalize_image_input(value: str, *, max_bytes: int) -> str:
@@ -598,10 +535,13 @@ def _normalize_image_input(value: str, *, max_bytes: int) -> str:
     raise ValueError("image must be data URL, raw base64, or http(s) URL")
 
 
-async def _read_body(request: Request, *, action: str, cfg: dict) -> tuple[str, str | None, str | None]:
+async def _read_body(
+    request: Request, *, action: str, cfg: dict,
+) -> tuple[str, str, str | None, str | None]:
     ctype = (request.headers.get("content-type") or "").lower()
     if ctype.startswith("multipart/form-data"):
         form = await request.form()
+        model = model_validation.require_explicit_model(form)
         prompt = str(form.get("prompt") or "").strip()
         size = str(form.get("size") or "").strip() or None
         image_url = None
@@ -615,7 +555,7 @@ async def _read_body(request: Request, *, action: str, cfg: dict) -> tuple[str, 
                 image_url = f"data:{mt};base64," + base64.b64encode(raw).decode("ascii")
             else:
                 image_url = _normalize_image_input(str(form.get("image") or form.get("image_url") or ""), max_bytes=int(cfg.get("maxInputImageBytes") or _DEFAULTS["maxInputImageBytes"]))
-        return prompt, size, image_url
+        return model, prompt, size, image_url
 
     try:
         body = await request.json()
@@ -628,6 +568,7 @@ async def _read_body(request: Request, *, action: str, cfg: dict) -> tuple[str, 
         raise ValueError(f"invalid json: {exc}") from exc
     if not isinstance(body, dict):
         raise ValueError("request body must be a JSON object")
+    model = model_validation.require_explicit_model(body)
     prompt = str(body.get("prompt") or "").strip()
     size_raw = body.get("size")
     size = str(size_raw).strip() if size_raw is not None and str(size_raw).strip() else None
@@ -637,7 +578,7 @@ async def _read_body(request: Request, *, action: str, cfg: dict) -> tuple[str, 
             str(body.get("image") or body.get("image_url") or ""),
             max_bytes=int(cfg.get("maxInputImageBytes") or _DEFAULTS["maxInputImageBytes"]),
         )
-    return prompt, size, image_url
+    return model, prompt, size, image_url
 
 
 # === pipeline+handlers below ===
@@ -803,17 +744,24 @@ async def _handle(request: Request, *, action: str) -> JSONResponse:
     if not cfg.get("enabled", True):
         return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "image generation is disabled")
 
-    key_name, _, err = auth.validate(request.headers)
+    key_name, allowed_models, err = auth.validate(request.headers)
     if err:
         return _json_error(401, errors.ErrTypeOpenAI.AUTH, err)
     if not auth.images_allowed(key_name):
         return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "this API key is not allowed to use image endpoints")
 
     try:
-        prompt, size, image_url = await _read_body(request, action=action, cfg=cfg)
+        model, prompt, size, image_url = await _read_body(request, action=action, cfg=cfg)
+    except model_validation.ExplicitModelError as exc:
+        return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, exc.message)
     except ValueError as exc:
         return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, str(exc))
 
+    if allowed_models and model not in allowed_models:
+        return _json_error(
+            403, errors.ErrTypeOpenAI.PERMISSION,
+            "model is not allowed for this API key",
+        )
     if not prompt:
         return _json_error(400, errors.ErrTypeOpenAI.INVALID_REQUEST, "prompt is required")
     max_prompt = int(cfg.get("maxPromptChars") or _DEFAULTS["maxPromptChars"])

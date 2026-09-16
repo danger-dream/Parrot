@@ -15,13 +15,15 @@ from src.telegram import states, ui
 from src.telegram.menus import system_menu as sm
 from src.tests.tg_contract import TraceCapture, assert_strict_equal, load_jsonl
 
+from src.tests.tg_contract.current import load_current_jsonl
+
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/system.jsonl"
 SYSTEM_IDS = frozenset(f"TG-SYS-{n:02d}" for n in range(1, 9))
 
 
 def cases_for(*ids: str) -> list[dict[str, Any]]:
     wanted = set(ids)
-    return [case for case in load_jsonl(SEGMENT) if case["capabilityId"] in wanted]
+    return [case for case in load_current_jsonl(SEGMENT) if case["capabilityId"] in wanted]
 
 
 def actual_case(case: dict[str, Any], env: "SystemEnv", exception=None) -> dict[str, Any]:

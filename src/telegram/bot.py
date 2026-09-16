@@ -25,8 +25,8 @@ from ..async_owned import await_owned
 from . import menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
-    logs_menu, mapping_menu, media_logs_menu, oauth_account_models_menu,
-    oauth_defaults_menu, oauth_menu, proxy_menu,
+    logs_menu, mapping_menu, media_logs_menu, model_center_menu,
+    oauth_account_models_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
     stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
     xai_imagine_menu,
 )
@@ -173,7 +173,8 @@ def start() -> None:
             {"command": "channels", "description": "渠道管理"},
             {"command": "oauth",    "description": "管理 OAuth 账户"},
             {"command": "keys",     "description": "管理 API Key"},
-            {"command": "mapping",  "description": "模型管理"},
+            {"command": "models",   "description": "模型中心"},
+            {"command": "mapping",  "description": "模型中心（兼容命令）"},
             {"command": "loadbalancing", "description": "负载均衡"},
             {"command": "proxy",    "description": "代理管理 / 路由规则"},
             {"command": "settings", "description": "系统设置"},
@@ -493,6 +494,8 @@ def _handle_callback(cb: dict) -> None:
         ui.answer_cb(cb_id, "⛔ 无权限")
         return
 
+    # Revoke only model-center input before any early navigation return.
+    model_center_menu.before_callback(chat_id, data)
     # 任意新 callback 都让该消息此前的后台统计更新失效，防止旧页面覆盖新菜单。
     menu_cache.begin_view(chat_id, msg_id)
 
@@ -507,6 +510,10 @@ def _handle_callback(cb: dict) -> None:
 
     # 帮助
     if help_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+
+    # 统一模型中心（必须先于旧模型页兼容 handler）
+    if model_center_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
     # OAuth 管理菜单
@@ -589,6 +596,9 @@ def _handle_message(msg: dict) -> None:
         )
         return
 
+    # Commands leave MC input; /cancel is consumed by its own editor.
+    # Other menus retain their historical command/input semantics.
+    model_center_menu.before_command(chat_id, text)
     # 状态机输入
     state = states.get_state(chat_id)
     print(f"[tg] state for {chat_id}: {_summarize_state(state)}")        # DEBUG
@@ -596,6 +606,9 @@ def _handle_message(msg: dict) -> None:
         action = state.get("action", "")
         if msg.get("document") and oauth_menu.handle_document_state(chat_id, action, msg):
             print(f"[tg] handled document by oauth_menu (action={action})")
+            return
+        if model_center_menu.handle_text_state(chat_id, action, text):
+            print(f"[tg] handled by model_center_menu (action={action})")
             return
         if apikey_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by apikey_menu (action={action})")  # DEBUG
@@ -653,20 +666,21 @@ def _handle_message(msg: dict) -> None:
         logs_menu.send_new(chat_id); return
     if text.startswith("/channels"):
         channel_menu.send_new(chat_id); return
+    # Narrow legacy command must precede the broad /oauth prefix.
+    if text.startswith("/oauth_defaults"):
+        oauth_defaults_menu.send_new(chat_id); return
     if text.startswith("/oauth"):
         oauth_menu.send_new(chat_id); return
     if text.startswith("/keys"):
         apikey_menu.send_new(chat_id); return
     if text.startswith("/settings"):
         system_menu.send_new(chat_id); return
-    if text.startswith("/mapping"):
-        mapping_menu.send_new(chat_id); return
+    if text.startswith("/models") or text.startswith("/mapping"):
+        model_center_menu.send_new(chat_id); return
     if text.startswith("/loadbalancing"):
         load_balancing_menu.send_new(chat_id); return
     if text.startswith("/proxy") or text.startswith("/proxies"):
         ui.send(chat_id, "🔀 代理管理", reply_markup=ui.inline_kb([[ui.btn("打开代理管理", "px:show")]])); return
-    if text.startswith("/oauth_defaults"):
-        oauth_defaults_menu.send_new(chat_id); return
     if text.startswith("/help"):
         help_menu.send_new(chat_id); return
 

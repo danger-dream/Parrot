@@ -383,6 +383,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defaults": {},
         "scoped": {},
     },
+    # Sparse operator fields are separate from catalog matching/snapshots.
+    # Presence is significant: 0/false/[] are values and only explicit unset
+    # restores inheritance.
+    "modelMetadataOverrides": {
+        "defaults": {},
+        "scoped": {},
+    },
+    # Persistent model-center state. OAuth source disablement remains in each
+    # account; this root owns only global and API-channel state.
+    "modelCenter": {
+        "schemaVersion": 1,
+        "disabledModels": [],
+        "hiddenModels": [],
+        "apiSourceDisabledModels": {},
+    },
     # Independent compact-rescue model. Legacy modelMetadata[*].compressionModel
     # is migrated after the bundled/cache models.dev catalog is initialized.
     "compressionModel": "",
@@ -485,12 +500,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # InlineKeyboardButton.icon_custom_emoji_id；providerBtnEmoji 是纯文本兜底。
     "telegramUi": {
         "providerCustomEmoji": {
-            "openai": "5861557411784957025",
-            "claude": "5872779796257184592",
-            "xai": "5819115571463068721",
-            "cursor": "6062261319426390107",
+            "openai": "6141162084857031383",
+            "claude": "6140995813788099525",
             "antigravity": "6077644693984779782",
+            "cursor": "6062261319426390107",
+            "ollama-cloud": "6138524734419116492",
             "workbuddy": "6120617435214132136",
+            "xai": "6138882363460952713",
+            "kimi": "6140905172798284383",
+            "deepseek": "6138914554240836667",
+            "zhipu": "6140727700454645813",
+            "minimax": "6141114311935796161",
+            "alibaba-bailian": "6138926816372465673",
+            "tencent-cloud": "6140662000339918826",
+            "jd-cloud": "6138855790498291964",
+            "volcengine-ark": "6141018834812806707",
+            "baidu-qianfan": "6138964148228204290",
+            "xiaomi-mimo": "6138428226503975259",
+            "ctyun-xirang": "6138918874977936421",
+            "openrouter": "6140767025175209650",
         },
         "providerBtnEmoji": {
             "openai": "🅾️",
@@ -686,6 +714,7 @@ _rejected_rewrite_version: tuple[str, float] | None = None
 _lock = threading.RLock()
 _update_lifecycle_lock = threading.RLock()
 _reload_callbacks: list = []
+_reload_observers = threading.local()
 
 
 def _deep_merge_defaults(base: dict, override: dict) -> dict:
@@ -1110,11 +1139,25 @@ def _ensure_loaded(force: bool = False) -> tuple[dict, bool]:
     return _cache, False
 
 
+@contextmanager
+def observe_reload_failures():
+    """Opt-in, call-local commit feedback; never retain exception/secret text."""
+    failures: list[bool] = []
+    previous = getattr(_reload_observers, "active", ())
+    _reload_observers.active = (*previous, failures)
+    try:
+        yield failures
+    finally:
+        _reload_observers.active = previous
+
+
 def _fire_reload_callbacks(cfg: dict) -> None:
     for cb in list(_reload_callbacks):
         try:
             cb(cfg)
         except Exception as exc:
+            for failures in getattr(_reload_observers, "active", ()):
+                failures.append(True)
             print(f"[config] reload callback failed: {exc}")
 
 

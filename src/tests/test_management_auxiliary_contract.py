@@ -32,6 +32,15 @@ _REQUEST_BODIES = {
     "updateImageSettings": {"enabled": True},
     "updateImageAccountState": {"enabled": True},
     "updateXaiMediaSettings": {"jobTtlSeconds": 7200},
+    "addXaiMediaModel": {"modelId": "grok-new"},
+    "renameXaiMediaModel": {"newModelId": "grok-renamed"},
+    "updateAntigravityMediaSettings": {"imageModels": ["ag-image"]},
+    "addAntigravityMediaModel": {
+        "modelId": "ag-image", "owner": {"type": "global"},
+    },
+    "renameAntigravityMediaModel": {
+        "newModelId": "ag-renamed", "owner": {"type": "global"},
+    },
 }
 _REQUEST_HEADERS = {
     "stageUpdate": {"Idempotency-Key": "stage-one"},
@@ -39,11 +48,20 @@ _REQUEST_HEADERS = {
         "Idempotency-Key": "activate-one",
         "If-Match": "rev_fake",
     },
+    "addXaiMediaModel": {"If-Match": "rev_fake"},
+    "renameXaiMediaModel": {"If-Match": "rev_fake"},
+    "removeXaiMediaModel": {"If-Match": "rev_fake"},
+    "updateAntigravityMediaSettings": {"If-Match": "rev_fake"},
+    "addAntigravityMediaModel": {"If-Match": "rev_fake"},
+    "renameAntigravityMediaModel": {"If-Match": "rev_fake"},
+    "removeAntigravityMediaModel": {"If-Match": "rev_fake"},
 }
 _PATH_VALUES = {
     "{incidentId}": "inc-1",
     "{version}": "0.32.0",
     "{accountId}": "openai%3Auser%40example.com",
+    "{kind}": "image",
+    "{modelId:path}": "model-a",
 }
 
 
@@ -124,6 +142,14 @@ EXPECTED_OPERATION_IDS = {
     "updateImageAccountState",
     "getXaiMediaSettings",
     "updateXaiMediaSettings",
+    "addXaiMediaModel",
+    "renameXaiMediaModel",
+    "removeXaiMediaModel",
+    "getAntigravityMediaSettings",
+    "updateAntigravityMediaSettings",
+    "addAntigravityMediaModel",
+    "renameAntigravityMediaModel",
+    "removeAntigravityMediaModel",
 }
 
 
@@ -171,14 +197,15 @@ def _guard_allowed_names(decorator: ast.Call) -> set[str]:
 
 def test_auxiliary_manifest_has_exactly_one_pre_control_query_guard_per_operation(tmp_path):
     operation_ids = [item["operation_id"] for item in AUXILIARY_OPERATION_MANIFEST]
-    assert len(operation_ids) == 28
+    assert len(operation_ids) == 36
     assert len(set(operation_ids)) == len(operation_ids)
     assert set(operation_ids) == EXPECTED_OPERATION_IDS
 
     app, _, _ = build_auxiliary_app(tmp_path)
     document = app.openapi()
     for item in AUXILIARY_OPERATION_MANIFEST:
-        operation = document["paths"]["/api/management/v1" + item["path"]][item["method"]]
+        openapi_path = item["path"].replace("{modelId:path}", "{modelId}")
+        operation = document["paths"]["/api/management/v1" + openapi_path][item["method"]]
         declared_query = {
             parameter["name"]
             for parameter in operation.get("parameters", [])

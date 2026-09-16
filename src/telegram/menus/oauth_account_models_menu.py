@@ -127,9 +127,9 @@ def _summary_lines(record: dict | None, *, use_max_context: bool = False) -> lis
         record.get("supportsImages") is True or "image" in input_modalities
     )): facts.append("🖼")
     service_tier_ids = {
-        str(item.get("id") or "").strip().lower()
+        str(item.get("id") if isinstance(item, dict) else item).strip().lower()
         for item in record.get("serviceTiers") or []
-        if isinstance(item, dict)
+        if isinstance(item, (str, dict))
     }
     if "ultrafast" in service_tier_ids:
         facts.append("⚡ Ultra")
@@ -521,6 +521,10 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
     disabled = selection["disabled_models"]
     binding = _effective_binding(account_key, model)
     record = dict(binding.metadata) if binding else {}
+    # Effective tiers are canonical IDs; this explicitly-labelled account
+    # catalog row retains the authenticated native display names.
+    native_record = next((item for item in selection.get("records", [])
+                          if item.get("id") == model), record)
     icon, status, fault = _status(account_key, model, disabled)
     state = oauth_control.cooldown_state_snapshot(account_key, model) or {}
     lines = [f"🧬 <b>模型详情</b>", "", f"完整 ID: <code>{ui.escape_html(_model_label(account_key, model))}</code>"]
@@ -531,7 +535,7 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
         ("最大输出", _format_tokens(record.get("maxOutputTokens"))),
         ("输入模态", "、".join(record.get("inputModalities") or [])), ("输出模态", "、".join(record.get("outputModalities") or [])),
         ("思考档位", "、".join(record.get("reasoningEfforts") or [])), ("别名", "、".join(_model_label(account_key, alias) for alias in record.get("aliases") or [])),
-        ("服务档位（账户目录）", _service_tier_text(record)),
+        ("服务档位（账户目录）", _service_tier_text(native_record)),
         ("最低 Codex CLI", record.get("minimalClientVersion")),
     ]
     for label, value in detail_fields:
@@ -566,6 +570,51 @@ def _detail_render(account_key: str, model: str, *, model_page: int,
         rows.append([ui.btn("🧹 清除此模型故障", f"oam:clear:{context}")])
     rows.append([ui.btn("◀ 返回模型列表", _cb(short, model_page, account_page, filter_key))])
     return "\n".join(lines), ui.inline_kb(rows)
+
+
+def redirect_legacy_callback(
+    chat_id: int, message_id: int, cb_id: str, data: str,
+) -> bool:
+    """Translate an old OAM callback to a public source without replaying writes."""
+    if not data.startswith("oam:"):
+        return False
+    if not ui.is_admin(chat_id):
+        ui.answer_cb(cb_id, "⛔ 无权限", show_alert=True)
+        return True
+    if data == "oam:noop":
+        ui.answer_cb(cb_id, "当前页")
+        return True
+    _prefix, _separator, payload = data.partition(":")
+    kind, _separator, raw = payload.partition(":")
+    parts = raw.split(":")
+    list_kinds = {"open", "list", "sync", "bulk", "bpage", "ball", "bclear", "binv", "bsave", "bcancel"}
+    item_kinds = {"detail", "toggle", "clear", "maxctx", "bsel"}
+    if kind in item_kinds and len(parts) == 5:
+        parts = [parts[0], *parts[2:]]
+    elif kind not in list_kinds or len(parts) != 4:
+        ui.answer_cb(cb_id, "页面已过期", show_alert=True)
+        return True
+    try:
+        model_page, account_page = int(parts[1]), int(parts[2])
+        if model_page < 1 or account_page < 1 or not parts[3]:
+            raise ValueError("invalid legacy context")
+    except ValueError:
+        ui.answer_cb(cb_id, "页面已过期", show_alert=True)
+        return True
+    short, filter_key = parts[0], parts[3]
+    account_key = ui.resolve_code(short)
+    account = oauth_control.account_snapshot(account_key) if account_key else None
+    if account is None:
+        ui.answer_cb(cb_id, "页面已过期", show_alert=True)
+        return True
+    public_account_id = oauth_control.account_id_from_entry(account)
+    from . import model_center_menu
+    model_center_menu.open_source(
+        chat_id, message_id, cb_id,
+        source_type="oauth", source_id=public_account_id,
+        origin=f"oa:view:{short}:{account_page}:{filter_key}",
+    )
+    return True
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:

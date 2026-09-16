@@ -11,6 +11,7 @@ from src.channel.antigravity_oauth_channel import AntigravityOAuthChannel
 from src.channel.oauth_channel import OAuthChannel
 from src.channel.openai_oauth_channel import OpenAIOAuthChannel
 from src.channel.xai_oauth_channel import XAIOAuthChannel
+from src.telegram import ui
 from src.telegram.menus import oauth_account_models_menu, oauth_menu
 
 
@@ -706,16 +707,21 @@ def test_oauth_pagination_over_ten_and_fault_clear_keeps_user_disable(monkeypatc
 
 
 def test_detail_fixed_rows_and_openai_reset_wording(account_config):
-    _text, kb = oauth_menu._detail_text_and_kb("openai:a@x:ws-a", refresh_quota=False)
+    _text, kb = oauth_menu._detail_text_and_kb(
+        "openai:a@x:ws-a", refresh_quota=False, actor_chat_id=42,
+    )
     labels = [[button["text"] for button in row] for row in kb["inline_keyboard"]]
     assert labels == [
         ["🔄 刷新 Token", "📊 刷新额度"],
-        ["🧬 管理模型", "🚦 并发上限"],
+        ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"],
         ["⏸ 停用账户", "🗑 删除账户"],
         ["♻️ 重置额度"],
         ["🏠 主菜单", "◀ 返回列表"],
     ]
+    manage = kb["inline_keyboard"][1][0]
+    assert manage["callback_data"].startswith("mc:src:")
+    assert manage["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
     assert "官方重置次数" in _text
 
 
@@ -874,8 +880,10 @@ def test_effective_metadata_ui_matches_runtime_and_reports_authority(monkeypatch
         account_key, "rich-model", model_page=1, account_page=1, filter_key="all",
     )
     assert effective["contextWindow"] == 200_000
-    assert "上下文：200K · 🧠" in listing and "🖼" not in listing
-    assert "思考档位：low" in listing
+    # The legacy account-model page remains a read-only compatibility surface;
+    # the unified model-center detail owns rich effective/provenance rendering.
+    assert "上下文：200K" in listing and "🧠" not in listing and "🖼" not in listing
+    assert "思考档位：low" not in listing
     assert "上下文: <code>200K</code>" in detail
     assert "元数据来源: <code>models.dev · 账户绑定</code>" in detail
     assert not any(

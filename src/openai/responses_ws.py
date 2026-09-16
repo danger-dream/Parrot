@@ -35,7 +35,7 @@ from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
     affinity, apikey_limiter, auth, blacklist, channel_state, concurrency, config, cooldown, fingerprint, local_web_tools,
-    log_db, model_mapping, model_pricing, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
+    log_db, model_mapping, model_pricing, model_validation, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest, build_dispatch_metadata
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -575,15 +575,16 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         first_obj, websocket
     )
 
+    try:
+        body["model"] = model_validation.require_explicit_model(body)
+    except model_validation.ExplicitModelError as exc:
+        await websocket.close(code=4400, reason=_trim_reason(exc.message))
+        return
     _ingress_line = "openai-responses"
-    model_mapping.apply_default(body, _ingress_line)
     model_mapping.apply_mapping(body, _ingress_line)
     body["_client_visible_model"] = str(body.get("model") or "").strip()
 
     model = body.get("model")
-    if not model or not isinstance(model, str):
-        await websocket.close(code=4400, reason="model is required")
-        return
     if allowed_models and model not in allowed_models:
         await websocket.close(
             code=4403,
@@ -854,6 +855,7 @@ async def _run_ws_failover(
     attempt_order = 0
     last_result: Optional[_WsAttemptResult] = None
     failed_candidate_statuses: list[int] = []
+    local_candidate_error: str | None = None
     last_ch: Optional[Channel] = None
     last_model: Optional[str] = None
     accepted = websocket.application_state == WebSocketState.CONNECTED
@@ -1065,9 +1067,12 @@ async def _run_ws_failover(
         # Same-candidate OAuth/transient retries reach this point only once, so
         # the terminal aggregate counts actual failed candidates rather than
         # transport rounds. Zero denotes the narrow generic HTML403 marker.
-        failed_candidate_statuses.append(
-            0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
-        )
+        if result.outcome == "candidate_guard":
+            local_candidate_error = result.error_detail
+        else:
+            failed_candidate_statuses.append(
+                0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
+            )
         if not result.openai_oauth_html_403:
             finalize_policy.apply_error_health_effects(
                 finalize_policy.error_plan(
@@ -1238,9 +1243,12 @@ async def _run_ws_failover(
                             affinity_hit, start_time, start_monotonic,
                         )
                     return accepted
-                failed_candidate_statuses.append(
-                    0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
-                )
+                if result.outcome == "candidate_guard":
+                    local_candidate_error = result.error_detail
+                else:
+                    failed_candidate_statuses.append(
+                        0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
+                    )
                 if not result.openai_oauth_html_403:
                     finalize_policy.apply_error_health_effects(
                         finalize_policy.error_plan(
@@ -1269,7 +1277,8 @@ async def _run_ws_failover(
                 return accepted
 
     err = (last_result.error_detail if last_result else "no candidates") or "unknown"
-    http_status = _aggregate_failed_candidate_status(failed_candidate_statuses)
+    only_local_rejections = local_candidate_error is not None and not failed_candidate_statuses
+    http_status = 400 if only_local_rejections else _aggregate_failed_candidate_status(failed_candidate_statuses)
     all_html403 = bool(failed_candidate_statuses) and set(failed_candidate_statuses) == {0}
     downstream_message = (
         "Upstream candidates failed"
@@ -1278,6 +1287,9 @@ async def _run_ws_failover(
             http_status, attempted=bool(failed_candidate_statuses),
         )
     )
+    if only_local_rejections:
+        # The guard's source/outbound suffix belongs only in the private ledger.
+        downstream_message = (local_candidate_error or "Request exceeds the effective route token budget").split(" source=", 1)[0]
     await asyncio.to_thread(
         log_db.finish_error,
         request_id, err[:4000], retry_count,
@@ -1301,7 +1313,15 @@ async def _run_ws_failover(
         proxy_bytes_up=(last_result.proxy_bytes.up if last_result else None),
         proxy_bytes_down=(last_result.proxy_bytes.down if last_result else None),
     )
-    await _send_terminal_error_frame(websocket, downstream_message, http_status)
+    if only_local_rejections:
+        if "context_length_exceeded" in downstream_message:
+            await _send_context_length_error_frame(websocket, downstream_message)
+        else:
+            await _send_request_invalid_error_frame(
+                websocket, downstream_message, param="max_output_tokens",
+            )
+    else:
+        await _send_terminal_error_frame(websocket, downstream_message, http_status)
     await _close_downstream(
         websocket, _ws_close_code_for_http(http_status), downstream_message,
     )
@@ -1955,9 +1975,19 @@ async def _try_sse_channel(
     proxy_bytes = _WsProxyBytes()
 
     try:
+        from .. import failover as failover_runtime
+
         http_body = dict(body)
         http_body["stream"] = True
+        http_body = failover_runtime._candidate_budget_body(ch, resolved_model, http_body)
         upstream_req = await ch.build_upstream_request(http_body, resolved_model, ingress_protocol="responses")
+        failover_runtime._validate_wire_payload_budget(
+            ch,
+            resolved_model,
+            http_body,
+            upstream_req.body,
+            getattr(upstream_req, "dispatch_metadata", None),
+        )
         await await_ws_owned(asyncio.to_thread(
             log_db.update_pending_fast_mode_from_upstream,
             request_id, upstream_req.body, upstream_req.headers,
@@ -2657,16 +2687,14 @@ async def _receive_next_response_create(
             continue
         body = _request_body_from_ws_create(obj)
         body["_codex_native_identity"] = _native_identity_carriers(obj, websocket)
-        model_mapping.apply_default(body, "openai-responses")
+        try:
+            body["model"] = model_validation.require_explicit_model(body)
+        except model_validation.ExplicitModelError as exc:
+            await _close_downstream(websocket, 4400, exc.message)
+            return None
         model_mapping.apply_mapping(body, "openai-responses")
         body["_client_visible_model"] = str(body.get("model") or "").strip()
         model = body.get("model")
-        if not isinstance(model, str) or not model:
-            await _send_request_invalid_error_frame(
-                websocket, "model is required",
-                param="model",
-            )
-            continue
         if allowed_models and model not in allowed_models:
             await _send_request_invalid_error_frame(
                 websocket,
@@ -2975,6 +3003,16 @@ async def _relay_ws_session(
             first_upstream_obj,
             getattr(ch, "protocol", "openai-responses"),
         )
+        from .. import failover as failover_runtime
+
+        # Clamp an oversized requested output to this route's maxOutputTokens
+        # before the safety-net budget check, mirroring the HTTP paths.
+        first_upstream_obj = failover_runtime._clamp_wire_output_limit(
+            ch, resolved_model, body, first_upstream_obj, dispatch_metadata,
+        )
+        failover_runtime._validate_wire_payload_budget(
+            ch, resolved_model, body, first_upstream_obj, dispatch_metadata,
+        )
         await asyncio.to_thread(
             log_db.record_upstream_dispatch,
             request_id,
@@ -2990,6 +3028,15 @@ async def _relay_ws_session(
             timing=timing,
             round_timeouts=round_timeouts,
         )
+    except GuardError as exc:
+        result.outcome = (
+            "candidate_guard" if getattr(exc, "scope", "request") == "candidate"
+            else "guard_error"
+        )
+        result.error_detail = str(getattr(exc, "message", exc))[:2000]
+        result.http_status = int(getattr(exc, "status", 400))
+        sync_tracker_result()
+        return _apply_ws_snapshot(result, timing, terminal=True)
     except BusinessTimeoutError as exc:
         result.outcome = exc.outcome
         result.error_detail = exc.outcome

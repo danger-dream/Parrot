@@ -104,19 +104,21 @@ def _buttons(message: dict) -> list[dict]:
     ]
 
 
-def test_oauth_settings_exposes_distinct_gpt_and_grok_media_entries(m):
+def test_oauth_settings_does_not_duplicate_model_center_media_entries(m):
     recorder = _setup(m)
 
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     message = recorder.last("editMessageText")
     assert message is not None
-    assert "默认模型" in message["text"]
-    assert "🎨 <b>媒体能力</b>" in message["text"]
-    assert "Grok Imagine: 图片 <b>2</b> · 视频 <b>2</b>" in message["text"]
+    assert "模型目录、备用模型与媒体设置已统一归位到模型中心" in message["text"]
+    assert "默认模型" not in message["text"]
+    assert "🎨 <b>媒体能力</b>" not in message["text"]
+    assert "Grok Imagine:" not in message["text"]
 
     callbacks = {button["text"]: button["callback_data"] for button in _buttons(message)}
-    assert callbacks["GPT 图片"] == "img:show"
-    assert callbacks["Grok 图片"] == "xim:show"
+    assert "GPT 图片" not in callbacks and "Grok 图片" not in callbacks
+    assert callbacks["📈 配额监控"] == "oa:quota"
+    assert callbacks["◀ 返回OAuth账户"] == "menu:oauth"
 
 
 def test_grok_imagine_menu_renders_and_persists_existing_config_fields(m):
@@ -170,7 +172,7 @@ def test_grok_imagine_menu_renders_and_persists_existing_config_fields(m):
     assert m["config"].get()["xaiOAuth"]["mediaRequestTimeoutSeconds"] == 240
 
 
-def test_bot_routes_grok_imagine_callbacks_and_text_state(m):
+def test_bot_redirects_old_grok_callbacks_without_replaying_text_write(m):
     recorder = _setup(m)
     bot = m["bot"]
 
@@ -179,17 +181,20 @@ def test_bot_routes_grok_imagine_callbacks_and_text_state(m):
         "message": {"chat": {"id": 42}, "message_id": 100},
         "data": "xim:show",
     })
-    assert "Grok Imagine 设置" in recorder.last("editMessageText")["text"]
+    assert "模型设置" in recorder.last("editMessageText")["text"]
 
+    before = m["config"].get()["xaiOAuth"]["mediaRequestTimeoutSeconds"]
     bot._handle_callback({
         "id": "cb-timeout",
         "message": {"chat": {"id": 42}, "message_id": 100},
         "data": "xim:edit:timeout",
     })
-    assert m["states"].get_state(42)["action"] == "xim_edit_request_timeout"
+    assert "视频设置" in recorder.last("editMessageText")["text"]
+    assert m["states"].get_state(42) is None
 
+    # Old write intent is never replayed: a following text message is ordinary input.
     bot._handle_message({"chat": {"id": 42}, "text": "5m"})
-    assert m["config"].get()["xaiOAuth"]["mediaRequestTimeoutSeconds"] == 300
+    assert m["config"].get()["xaiOAuth"]["mediaRequestTimeoutSeconds"] == before
     assert m["states"].get_state(42) is None
 
 

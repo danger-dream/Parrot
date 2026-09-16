@@ -50,6 +50,11 @@ class PutMappingRequest(StrictSchema):
     realModel: str = Field(min_length=1, max_length=300)
 
 
+class UpdateMappingRequest(StrictSchema):
+    alias: str = Field(min_length=1, max_length=300)
+    realModel: str = Field(min_length=1, max_length=300)
+
+
 class IngressDefaultData(StrictSchema):
     ingress: Ingress
     modelId: str | None

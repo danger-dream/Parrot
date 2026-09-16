@@ -7,10 +7,9 @@ FastAPI converts these DTOs into public schemas.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
 from typing import Any, Mapping
 
-from src import compact_rescue, config, model_mapping, model_metadata, model_pricing
+from src import compact_rescue, config, model_mapping, model_metadata, model_names, model_pricing
 from src.channel import registry
 from src.management_auth.principal import Capability
 from src.management_control.context import AuditSink, ManagementContext
@@ -24,60 +23,14 @@ from src.management_control.routing_account_ids import (
 from src.oauth_ids import provider_from_channel_key
 
 
-@dataclass(frozen=True, slots=True)
-class MappingRecord:
-    alias: str
-    real_model: str
-    source_line: str
-    revision: str
+from .contracts import (
+    CatalogRecord, IngressDefaultRecord, InventoryRecord, MappingRecord,
+    MetadataOverridePatch, MetadataRecord, MetadataSyncMode, MetadataSyncTarget,
+)
+from .sync import MetadataSyncMixin
 
 
-@dataclass(frozen=True, slots=True)
-class IngressDefaultRecord:
-    ingress: str
-    model_id: str | None
-    revision: str
-
-
-@dataclass(frozen=True, slots=True)
-class InventoryRecord:
-    model_id: str
-    family: str
-    provider: str
-    channel_id: str
-    account_id: str | None
-    outbound_model: str
-    revision: str
-
-
-@dataclass(frozen=True, slots=True)
-class MetadataRecord:
-    model_id: str
-    target: str | None
-    provider_id: str | None
-    catalog_model_id: str | None
-    scope: str
-    scope_id: str | None
-    outbound_model: str | None
-    source: str
-    authority: str
-    effective: Mapping[str, Any]
-    raw: Mapping[str, Any]
-    revision: str
-
-
-@dataclass(frozen=True, slots=True)
-class CatalogRecord:
-    key: str
-    model_id: str
-    name: str
-    provider_id: str
-    provider_name: str
-    metadata: Mapping[str, Any]
-    revision: str
-
-
-class MappingControl(DomainControl):
+class MappingControl(MetadataSyncMixin, DomainControl):
     INGRESS_LINES = model_mapping.INGRESS_LINES
     GLOBAL_MAPPING_LINE = model_mapping.GLOBAL_MAPPING_LINE
     INGRESS_LABEL = model_mapping.INGRESS_LABEL
@@ -175,10 +128,110 @@ class MappingControl(DomainControl):
             raise self._validation("realModel", "SELF_MAPPING", "alias and realModel must differ")
         with config.serialized_updates():
             self._check_revision(expected_revision, self._mapping_revision())
+            if alias in self._configured_model_names():
+                raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
             model_mapping.set_mapping("global", alias, real)
         revision = self._mapping_revision()
         self._audit(actual, "model_mapping.put", alias, "succeeded")
         return MappingRecord(alias, real, "global", revision)
+
+    @staticmethod
+    def _configured_model_names() -> set[str]:
+        cfg = config.get()
+        names: set[str] = set()
+        for channel in cfg.get("channels") or ():
+            if not isinstance(channel, dict):
+                continue
+            for item in channel.get("models") or ():
+                if isinstance(item, dict):
+                    value = item.get("alias") or item.get("real")
+                else:
+                    value = item
+                if isinstance(value, str) and value.strip():
+                    names.add(value.strip())
+        for account in cfg.get("oauthAccounts") or ():
+            if not isinstance(account, dict):
+                continue
+            from src import oauth_manager
+            provider = oauth_manager.provider_of(account)
+            selection = oauth_manager.account_model_selection(account)
+            for value in selection["models"]:
+                if isinstance(value, str) and value.strip():
+                    names.add(model_names.public_id(provider, value.strip()))
+            for value in account.get("imageModels") or ():
+                if isinstance(value, str) and value.strip():
+                    names.add(value.strip())
+        for section, fields in (
+            ("images", ("mainModel", "toolModel")),
+            ("xaiOAuth", ("imageModels", "videoModels")),
+            ("antigravityOAuth", ("imageModels",)),
+        ):
+            values = cfg.get(section) or {}
+            if not isinstance(values, dict):
+                continue
+            for field in fields:
+                raw = values.get(field)
+                raw_values = raw if isinstance(raw, list) else (raw,)
+                for value in raw_values:
+                    if isinstance(value, str) and value.strip():
+                        names.add(value.strip())
+        return names
+
+    def update_mapping(
+        self,
+        context: ManagementContext,
+        old_alias: str,
+        *,
+        new_alias: str,
+        real_model: str,
+        expected_revision: str | None,
+    ) -> MappingRecord:
+        """Atomically rename and/or retarget one global mapping record.
+
+        Only the mapping record is changed. API-key allowlists, defaults, load
+        balancing, compression, metadata and aliases pointing at the old alias are
+        intentionally not rewritten.
+        """
+        actual = self._write(context)
+        old = str(old_alias or "").strip()
+        new = str(new_alias or "").strip()
+        real = str(real_model or "").strip()
+        for path, value in (("oldAlias", old), ("newAlias", new), ("realModel", real)):
+            if not value:
+                raise self._validation(path, "EMPTY", f"{path} must not be empty")
+            if len(value) > 300:
+                raise self._validation(path, "TOO_LONG", f"{path} must not exceed 300 characters")
+        if new == real:
+            raise self._validation("realModel", "SELF_MAPPING", "alias and realModel must differ")
+
+        with config.serialized_updates():
+            self._check_revision(
+                expected_revision, self._mapping_revision(), required=True,
+            )
+            visible = model_mapping.get_ingress_map("global")
+            if old not in visible:
+                raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            if new in self._configured_model_names() or (new != old and new in visible):
+                raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
+
+            def mutate(cfg: dict) -> None:
+                model_mapping.remove_aliases_from_config(cfg, {old})
+                root = model_mapping._structured_root_for_write(cfg)
+                # Taking ownership in global also removes any same-name legacy
+                # shadow. It can only be present for new==old here.
+                if new == old:
+                    model_mapping.remove_aliases_from_config(cfg, {new})
+                line = root.setdefault(model_mapping.GLOBAL_MAPPING_LINE, {})
+                if not isinstance(line, dict):
+                    line = {}
+                    root[model_mapping.GLOBAL_MAPPING_LINE] = line
+                line[new] = real
+
+            config.update(mutate, skip_if_unchanged=True)
+
+        revision = self._mapping_revision()
+        self._audit(actual, "model_mapping.update", old, "succeeded")
+        return MappingRecord(new, real, "global", revision)
 
     def delete_mapping(
         self,
@@ -211,17 +264,15 @@ class MappingControl(DomainControl):
         *,
         expected_revision: str | None = None,
     ) -> IngressDefaultRecord:
-        actual = self._write(context)
+        self._write(context)
         self._validate_ingress(ingress)
-        model_id = str(model_id or "").strip()
-        if model_id not in set(model_mapping.list_available_models_for(ingress)):
-            raise self._validation("modelId", "UNKNOWN_MODEL", "model is not available for ingress")
-        with config.serialized_updates():
-            self._check_revision(expected_revision, self._mapping_revision())
-            model_mapping.set_default(ingress, model_id)
-        record = IngressDefaultRecord(ingress, model_id, self._mapping_revision())
-        self._audit(actual, "ingress_default.put", ingress, "succeeded")
-        return record
+        # Kept as an explicit compatibility endpoint: inference now requires a
+        # client-supplied model, so accepting this write would silently persist
+        # an ineffective setting. GET/DELETE remain available for migration.
+        raise ManagementError(
+            ManagementErrorCode.UNSUPPORTED_VALUE,
+            "ingress default models are no longer used; clients must send model",
+        )
 
     def delete_ingress_default(
         self,
@@ -244,29 +295,6 @@ class MappingControl(DomainControl):
             raise MappingControl._validation(
                 "ingress", "UNSUPPORTED_INGRESS", "unsupported ingress"
             )
-
-    @staticmethod
-    def _metadata_snapshot(inventory: list[Any] | None = None) -> dict[str, Any]:
-        cfg = config.get()
-        items = list(model_metadata.inventory_items()) if inventory is None else inventory
-        return {
-            "modelBindings": cfg.get("modelBindings") or {},
-            "compressionModel": cfg.get("compressionModel") or "",
-            "catalog": model_pricing.catalog_status(),
-            "inventory": [
-                (
-                    item.scope_key,
-                    item.scope_type,
-                    item.client_visible_model,
-                    item.outbound_model,
-                )
-                for item in items
-            ],
-        }
-
-    @classmethod
-    def _metadata_revision(cls, inventory: list[Any] | None = None) -> str:
-        return stable_revision(cls._metadata_snapshot(inventory))
 
     def list_inventory(
         self,
@@ -350,9 +378,19 @@ class MappingControl(DomainControl):
                 authority="none",
                 effective={},
                 raw={},
+                value_source={},
+                constrained_by={},
+                common_override={},
+                source_override={},
                 revision=revision,
             )
-        raw = model_pricing.catalog_model(binding.target) or {}
+        raw = (
+            dict(binding.auto_snapshot.get("metadata") or {})
+            if isinstance(binding.auto_snapshot, Mapping) else
+            model_pricing.catalog_model(binding.target) or {}
+        )
+        if "serviceTiers" in raw:
+            raw = {**raw, "serviceTiers": model_metadata.service_tier_ids(raw["serviceTiers"])}
         binding_scope = "global" if binding.scope_key is None else (
             "oauth" if binding.scope_key.startswith("oauth:") else "api"
         )
@@ -373,6 +411,10 @@ class MappingControl(DomainControl):
             authority=binding.authority,
             effective=dict(binding.metadata),
             raw=dict(raw),
+            value_source=dict(binding.value_source),
+            constrained_by={key: tuple(value) for key, value in binding.constrained_by.items()},
+            common_override=dict(binding.common_override),
+            source_override=dict(binding.source_override),
             revision=revision,
         )
 
@@ -425,7 +467,15 @@ class MappingControl(DomainControl):
                 ))
         else:
             records.extend(
-                self._metadata_record(binding.client_visible_model, binding, revision)
+                self._metadata_record(
+                    binding.client_visible_model,
+                    model_metadata.resolve_binding(
+                        binding.client_visible_model,
+                        scope_key=binding.scope_key,
+                        outbound_model=binding.outbound_model,
+                    ),
+                    revision,
+                )
                 for binding in bindings
             )
             represented_globals = {
@@ -637,6 +687,109 @@ class MappingControl(DomainControl):
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         self._audit(actual, "model_metadata.binding.delete", model_id, "succeeded")
 
+    def _override_scope(
+        self,
+        model_id: str,
+        *,
+        scope: str,
+        account_id: str | None,
+        channel_id: str | None,
+        outbound_model: str | None,
+    ) -> tuple[str | None, str | None, str]:
+        scope_key = self._scope_key(
+            scope, account_id=account_id, channel_id=channel_id,
+        )
+        inventory = list(model_metadata.inventory_items())
+        requested_outbound = str(outbound_model or "").strip() or None
+        if scope_key is None:
+            if requested_outbound is not None:
+                raise self._validation(
+                    "outboundModel", "NOT_ALLOWED",
+                    "global scope does not accept outboundModel",
+                )
+            known = {item.client_visible_model for item in inventory}
+            known.update(item.client_visible_model for item in model_metadata.list_bindings())
+            common, _ = model_metadata.get_override_fields(model_id)
+            if model_id not in known and not common:
+                raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            return None, None, "global"
+        match = next((
+            item for item in inventory
+            if item.scope_key == scope_key and item.client_visible_model == model_id
+        ), None)
+        if match is None:
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        if requested_outbound is not None and requested_outbound != match.outbound_model:
+            raise self._validation(
+                "outboundModel", "OUTBOUND_MISMATCH",
+                "outboundModel does not match the current source model",
+            )
+        return scope_key, match.outbound_model, scope
+
+    def patch_metadata_overrides(
+        self,
+        context: ManagementContext,
+        model_id: str,
+        *,
+        scope: str,
+        account_id: str | None,
+        channel_id: str | None,
+        outbound_model: str | None,
+        patch: MetadataOverridePatch,
+        expected_revision: str | None,
+    ) -> MetadataRecord:
+        actual = self._write(context)
+        scope_key, current_outbound, requested_scope = self._override_scope(
+            model_id, scope=scope, account_id=account_id, channel_id=channel_id,
+            outbound_model=outbound_model,
+        )
+        try:
+            with config.serialized_updates():
+                self._check_revision(
+                    expected_revision, self._metadata_revision(), required=True,
+                )
+                model_metadata.patch_override_fields(
+                    model_id,
+                    scope_key=scope_key,
+                    outbound_model=current_outbound,
+                    set_fields=patch.set_fields,
+                    unset_fields=patch.unset_fields,
+                )
+        except ValueError as exc:
+            raise self._validation("overrides", "INVALID_OVERRIDE", str(exc)) from exc
+        binding = model_metadata.resolve_binding(
+            model_id, scope_key=scope_key, outbound_model=current_outbound,
+        )
+        revision = self._metadata_revision()
+        self._audit(actual, "model_metadata.overrides.patch", model_id, "succeeded")
+        return self._metadata_record(
+            model_id, binding, revision,
+            scope=requested_scope, scope_id=scope_key,
+        )
+
+    def delete_metadata_overrides(
+        self,
+        context: ManagementContext,
+        model_id: str,
+        *,
+        scope: str,
+        account_id: str | None,
+        channel_id: str | None,
+        expected_revision: str | None,
+    ) -> None:
+        actual = self._write(context, Capability.DESTRUCTIVE)
+        scope_key, _, _ = self._override_scope(
+            model_id, scope=scope, account_id=account_id, channel_id=channel_id,
+            outbound_model=None,
+        )
+        with config.serialized_updates():
+            self._check_revision(
+                expected_revision, self._metadata_revision(), required=True,
+            )
+            if not model_metadata.delete_override_layer(model_id, scope_key=scope_key):
+                raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        self._audit(actual, "model_metadata.overrides.delete", model_id, "succeeded")
+
     def search_catalog(
         self,
         context: ManagementContext,
@@ -710,141 +863,6 @@ class MappingControl(DomainControl):
                 raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         self._audit(actual, "compression_model.delete", "compression-model", "succeeded")
 
-    def perform_metadata_sync(self, context: ManagementContext | None = None) -> dict[str, Any]:
-        actual = self._write(context)
-        with self._sync_lock:
-            if self.__class__._sync_running:
-                raise ManagementError(
-                    ManagementErrorCode.OPERATION_ALREADY_RUNNING,
-                    retryable=True,
-                )
-            self.__class__._sync_running = True
-        try:
-            catalog_updated = False
-            try:
-                catalog_updated = model_pricing.refresh_remote_catalog_sync()
-            except Exception as exc:
-                print(f"[metadata] models.dev refresh failed; using local catalog: {exc}")
-            model_pricing.reload_local_catalog()
-            result = dict(model_metadata.auto_sync_metadata())
-            result["catalog"] = "updated" if catalog_updated else "local"
-            self._audit(actual, "model_metadata.sync", "catalog", "succeeded")
-            return result
-        finally:
-            with self._sync_lock:
-                self.__class__._sync_running = False
-
-    def start_metadata_sync(
-        self,
-        context: ManagementContext,
-        *,
-        scope: str = "full",
-        provider_id: str | None = None,
-        account_id: str | None = None,
-        channel_id: str | None = None,
-    ):
-        self._write(context)
-        if self._operation_store is None:
-            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY)
-        account_scope_key = (
-            oauth_channel_key_from_account_id(account_id)
-            if scope == "account" and account_id is not None else account_id
-        )
-        public_account_id = (
-            oauth_account_id_from_channel_key(account_scope_key)
-            if scope == "account" and account_scope_key is not None else account_id
-        )
-        fingerprint = stable_revision({
-            "scope": scope,
-            "providerId": provider_id,
-            "accountId": public_account_id,
-            "channelId": channel_id,
-        })
-        replay = self._idempotent_replay(
-            context,
-            action="model_metadata.sync",
-            fingerprint=fingerprint,
-            operation_store=self._operation_store,
-        )
-        if replay is not None:
-            return replay
-        with self._sync_lock:
-            if self.__class__._sync_running:
-                raise ManagementError(
-                    ManagementErrorCode.OPERATION_ALREADY_RUNNING,
-                    retryable=True,
-                )
-            self.__class__._sync_running = True
-        inventory = list(model_metadata.inventory_items())
-        if scope == "provider":
-            selected = []
-            channels = {channel.key: channel for channel in registry.all_channels()}
-            for item in inventory:
-                channel = channels.get(item.scope_key)
-                provider = str(getattr(channel, "provider", "") or "")
-                provider = provider or provider_from_channel_key(item.scope_key) or ""
-                if provider == provider_id:
-                    selected.append(item)
-            inventory = selected
-        elif scope == "account":
-            inventory = [
-                item for item in inventory
-                if item.scope_key == account_scope_key and item.scope_type == "oauth"
-            ]
-        elif scope == "channel":
-            inventory = [item for item in inventory if item.scope_key == channel_id and item.scope_type == "api"]
-        if scope != "full" and not inventory:
-            with self._sync_lock:
-                self.__class__._sync_running = False
-            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        try:
-            operation = self._operation_store.create(
-                context, kind="model_metadata.sync", cancellable=False
-            )
-            self._remember_idempotency(
-                context,
-                action="model_metadata.sync",
-                fingerprint=fingerprint,
-                operation_id=operation.id,
-            )
-        except Exception:
-            with self._sync_lock:
-                self.__class__._sync_running = False
-            raise
-
-        def worker() -> None:
-            try:
-                self._operation_store.mark_running(operation.id)
-                catalog_updated = False
-                try:
-                    catalog_updated = model_pricing.refresh_remote_catalog_sync()
-                except Exception:
-                    catalog_updated = False
-                model_pricing.reload_local_catalog()
-                result = dict(model_metadata.auto_sync_metadata(inventory))
-                result["catalog"] = "updated" if catalog_updated else "local"
-                result["scope"] = scope
-                self._operation_store.succeed(operation.id, result)
-                self._audit(context, "model_metadata.sync", "catalog", "succeeded")
-            except Exception:
-                self._operation_store.fail(
-                    operation.id,
-                    code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                    message="metadata sync failed",
-                    retryable=True,
-                )
-            finally:
-                with self._sync_lock:
-                    self.__class__._sync_running = False
-
-        try:
-            self._operation_store.submit(operation.id, worker)
-        except Exception:
-            with self._sync_lock:
-                self.__class__._sync_running = False
-            raise
-        return operation
-
     # Telegram compatibility façade. Every call remains a control use case while
     # preserving existing renderer input objects and exact exception behavior.
     def get_ingress_map(self, ingress: str):
@@ -861,7 +879,10 @@ class MappingControl(DomainControl):
 
     def set_mapping(self, ingress: str, alias: str, real: str) -> None:
         actual = self._write(None)
-        model_mapping.set_mapping(ingress, alias, real)
+        with config.serialized_updates():
+            if str(alias or "").strip() in self._configured_model_names():
+                raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
+            model_mapping.set_mapping(ingress, alias, real)
         self._audit(actual, "model_mapping.put", alias, "succeeded")
 
     def remove_mapping(self, ingress: str, alias: str) -> bool:

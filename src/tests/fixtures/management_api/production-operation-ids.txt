@@ -1,6 +1,8 @@
 activateStagedUpdate
+addAntigravityMediaModel
 addChannelBlacklistTerm
 addDefaultBlacklistTerm
+addXaiMediaModel
 bulkReplaceModelChannelOrders
 cancelLogRetentionPlan
 cancelManagementOperation
@@ -41,6 +43,7 @@ deleteInvalidOAuthAccounts
 deleteModelChannelOrder
 deleteModelMapping
 deleteModelMetadataBinding
+deleteModelMetadataOverrides
 deleteOAuthAccount
 deleteProxy
 deleteProxyGroup
@@ -49,6 +52,7 @@ discoverOAuthDefaultModels
 downloadMediaArtifact
 executeOAuthWorkBuddyAction
 getAffinitySettings
+getAntigravityMediaSettings
 getApiKey
 getApiKeyConcurrencySettings
 getApiKeyStats
@@ -73,6 +77,7 @@ getManagementMetadata
 getManagementOperation
 getManagementOverview
 getMediaLog
+getModel
 getModelChannelOrder
 getModelMetadata
 getModelStats
@@ -121,6 +126,7 @@ listMediaLogs
 listModelInventory
 listModelMappings
 listModelMetadata
+listModels
 listNetworkChecks
 listOAuthAccountModels
 listOAuthAccounts
@@ -133,6 +139,7 @@ listStatusIncidents
 listTranslationLanguages
 listUpdateBackups
 muteStatusIncident
+patchModelMetadataOverrides
 planApiKeyRegeneration
 planInvalidOAuthAccountDeletion
 planOAuthQuotaReset
@@ -152,6 +159,10 @@ refreshOAuthUsage
 refreshOAuthWorkBuddyStatus
 refreshStatusAlerts
 regenerateApiKey
+removeAntigravityMediaModel
+removeXaiMediaModel
+renameAntigravityMediaModel
+renameXaiMediaModel
 reorderApiKeys
 reorderChannels
 reorderOAuthAccounts
@@ -164,6 +175,7 @@ resetOAuthQuota
 revokeCurrentManagementSession
 runNetworkMonitor
 searchModelCatalog
+setModelState
 stageUpdate
 startOAuthLoginFlow
 syncModelMetadata
@@ -177,6 +189,7 @@ testTranslation
 unignoreUpdateVersion
 unmuteStatusIncident
 updateAffinitySettings
+updateAntigravityMediaSettings
 updateApiKey
 updateApiKeyConcurrencySettings
 updateCchSettings
@@ -188,6 +201,7 @@ updateImageAccountState
 updateImageSettings
 updateLoadBalancingMode
 updateLogRetentionSettings
+updateModelMapping
 updateNetworkMonitor
 updateNotificationSettings
 updateOAuthAccount

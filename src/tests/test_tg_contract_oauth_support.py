@@ -33,7 +33,14 @@ from src.telegram.menus import oauth_defaults_menu as odm
 from src.telegram.menus import oauth_menu as om
 from src.tests.tg_contract import TraceCapture, assert_strict_equal, load_jsonl
 
+# v0.31.13 remains the immutable historical recording.  Current model-center
+# deltas live in a sparse overlay so unaffected payload/state assertions still
+# come byte-for-byte from that archive.
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/oauth.jsonl"
+CURRENT_OVERRIDES = (
+    Path(__file__).parent
+    / "fixtures/tg_contract/model-center-2026-09-13/overrides/oauth.jsonl"
+)
 ASSIGNED_IDS = frozenset({
     "TG-OA-01", "TG-OA-02", "TG-OA-03", "TG-OA-04", "TG-OA-05",
     "TG-OA-06", "TG-OA-07", "TG-ODM-01", "TG-OA-SET-01",
@@ -280,5 +287,18 @@ def check_trace(case, observed):
     assert_strict_equal(case, observed)
 
 
+def _current_cases():
+    archived = load_jsonl(SEGMENT)
+    overrides = load_jsonl(CURRENT_OVERRIDES) if CURRENT_OVERRIDES.exists() else []
+    archived_ids = {case["caseId"] for case in archived}
+    override_map = {case["caseId"]: case for case in overrides}
+    if len(override_map) != len(overrides):
+        raise AssertionError("duplicate OAuth contract override caseId")
+    unknown = set(override_map) - archived_ids
+    if unknown:
+        raise AssertionError(f"unknown OAuth contract overrides: {sorted(unknown)}")
+    return [override_map.get(case["caseId"], case) for case in archived]
+
+
 def cases_for(*ids):
-    return [case for case in load_jsonl(SEGMENT) if case["capabilityId"] in ids]
+    return [case for case in _current_cases() if case["capabilityId"] in ids]

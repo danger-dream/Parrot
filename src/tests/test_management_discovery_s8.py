@@ -181,7 +181,7 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
     document = app.openapi()
     expected_operations = _openapi_operations(document)
     manifested = set(PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines())
-    assert len(expected_operations) == len(manifested) == 212
+    assert len(expected_operations) == len(manifested) == 226
     assert set(expected_operations) == manifested
 
     with TestClient(app) as client:
@@ -198,7 +198,7 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
     capabilities = capabilities_response.json()["data"]
 
     assert _discovered_actions(capabilities) == expected_operations
-    assert sum(feature["actionCount"] for feature in metadata["features"]) == 212
+    assert sum(feature["actionCount"] for feature in metadata["features"]) == 226
     assert {
         feature["id"]: feature["actionCount"] for feature in metadata["features"]
     } == {
@@ -333,7 +333,7 @@ def test_real_server_app_exposes_the_same_complete_discovery(production_app, mon
     _, runtime = production_app
     document = server.app.openapi()
     expected_operations = _openapi_operations(document)
-    assert len(expected_operations) == 212
+    assert len(expected_operations) == 226
     monkeypatch.setattr(server.app.state, "management_runtime", runtime, raising=False)
 
     client = TestClient(server.app)
@@ -352,7 +352,7 @@ def test_real_server_app_exposes_the_same_complete_discovery(production_app, mon
     assert capabilities_response.status_code == 200, capabilities_response.text
     assert sum(
         item["actionCount"] for item in metadata_response.json()["data"]["features"]
-    ) == 212
+    ) == 226
     assert _discovered_actions(capabilities_response.json()["data"]) == expected_operations
 
 

@@ -99,11 +99,17 @@ async def test_no_candidate_response_and_log_status_match(m, app_client, path, r
 
 @pytest.mark.parametrize("path,ingress", zip(PATHS, ["anthropic", "openai-chat", "openai-responses"]))
 @pytest.mark.parametrize("collection", [None, []], ids=["null", "empty"])
-async def test_empty_collections_and_default_model_semantics_remain(m, app_client, path, ingress, collection):
+async def test_empty_collections_remain_accepted_but_ingress_default_is_not_applied(
+    m, app_client, path, ingress, collection,
+):
     m["config"].update(lambda c: c.update(ingressDefaultModel={ingress: "default-audit-model"}))
-    response = await app_client.post(path, json=body(model=None, messages=collection, tools=collection))
+    response = await app_client.post(
+        path,
+        json=body(model="audit-model", messages=collection, tools=collection),
+    )
     assert response.status_code == 404, response.text
-    assert rows(m)[-1]["requested_model"] == "default-audit-model"
+    assert rows(m)[-1]["requested_model"] == "audit-model"
+    assert m["config"].get()["ingressDefaultModel"] == {ingress: "default-audit-model"}
 
 
 @pytest.mark.parametrize("path", PATHS)

@@ -379,7 +379,7 @@ def test_oauth_menu_detail_openai_shows_provider_and_codex_usage(m):
     assert last, "no editMessageText captured"
     text = last["text"]
     # provider 行：正文使用 Telegram custom emoji HTML + 明文 provider label。
-    assert "tg-emoji" in text and "5861557411784957025" in text and "OpenAI" in text, text[:500]
+    assert "tg-emoji" in text and "6141162084857031383" in text and "OpenAI" in text, text[:500]
     # plan 行
     assert "plus" in text
     # 归一化 5h / 7d
@@ -1461,7 +1461,7 @@ def test_status_menu_quota_warnings_tags_openai(m):
     joined = "\n".join(warnings)
     assert "warn@openai.test" in joined
     # custom emoji + OpenAI 明文标记 openai 账户
-    assert "tg-emoji" in joined and "5861557411784957025" in joined and "OpenAI" in joined, joined
+    assert "tg-emoji" in joined and "6141162084857031383" in joined and "OpenAI" in joined, joined
     print("  [PASS] status_menu _quota_warnings: openai accounts get custom emoji tag")
 
 

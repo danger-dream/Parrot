@@ -20,6 +20,7 @@ from src.management_api import ManagementRuntime, create_management_router, inst
 from src.management_api.routers.load_balancing import router as load_balancing_router
 from src.management_api.routers.mapping import router as mapping_router
 from src.management_api.routers.model_metadata import router as model_metadata_router
+from src.management_api.routers.models import router as models_router
 from src.management_api.routers.proxy import router as proxy_router
 from src.management_auth import (
     ApprovalService,
@@ -34,10 +35,11 @@ from src.management_control import OperationRegistry, OperationStore, StoreAudit
 
 FAKE_KEY = "pmk_" + "P" * 64
 OWNED_OPERATION_IDS = {
-    "listModelMappings", "putModelMapping", "deleteModelMapping",
+    "listModelMappings", "putModelMapping", "updateModelMapping", "deleteModelMapping",
     "getIngressDefaultModel", "putIngressDefaultModel", "deleteIngressDefaultModel",
     "listModelInventory", "listModelMetadata", "getModelMetadata",
     "putModelMetadataBinding", "deleteModelMetadataBinding", "syncModelMetadata",
+    "patchModelMetadataOverrides", "deleteModelMetadataOverrides",
     "searchModelCatalog", "getCompressionModel", "putCompressionModel",
     "deleteCompressionModel", "getLoadBalancing", "updateLoadBalancingMode",
     "getChannelOrder", "replaceChannelOrder", "getModelChannelOrder",
@@ -103,6 +105,7 @@ def domain_client(tmp_path):
     app.include_router(create_management_router((
         mapping_router,
         model_metadata_router,
+        models_router,
         load_balancing_router,
         proxy_router,
     )))
@@ -157,7 +160,7 @@ def test_openapi_matches_owned_operation_manifest(domain_client):
         if set(operation.get("tags") or ()) & OWNED_TAGS
     }
     assert owned == OWNED_OPERATION_IDS
-    assert len(owned) == 40
+    assert len(owned) == 43
 
 
 def test_p5_router_operations_each_call_control_once_with_authorized_context():
@@ -204,7 +207,7 @@ def test_p5_router_operations_each_call_control_once_with_authorized_context():
             assert isinstance(first_argument, ast.Name)
             assert first_argument.id == "context", (relative, node.name)
             operations.append((relative, node.name))
-    assert len(operations) == 40
+    assert len(operations) == 43
 
 
 STRICT_QUERY_CASES = [

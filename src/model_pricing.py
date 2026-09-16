@@ -92,6 +92,21 @@ class PricingSettings:
 
 
 @dataclass(frozen=True)
+class CatalogCandidate:
+    """Parsed models.dev generation that is not active until explicitly published."""
+
+    api_payload: Any
+    models_payload: Any
+    catalog: Mapping[str, PricingEntry]
+    aliases: Mapping[str, str]
+    providers: frozenset[str]
+    metadata_models: Mapping[str, Mapping[str, Any]]
+    provider_names: Mapping[str, str]
+    official_models: Mapping[str, str]
+    revision: str
+
+
+@dataclass(frozen=True)
 class PricingBinding:
     """Immutable dispatch-time route identity and complete tariff snapshot."""
 
@@ -694,11 +709,69 @@ def catalog_model(provider_model: str) -> dict[str, Any] | None:
         return copy.deepcopy(raw) if raw is not None else None
 
 
+def _catalog_metadata_from_raw(
+    provider_model: str, raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    limit = raw.get("limit") if isinstance(raw.get("limit"), Mapping) else {}
+    modalities = raw.get("modalities") if isinstance(raw.get("modalities"), Mapping) else {}
+    input_modalities = modalities.get("input") if isinstance(modalities, Mapping) else []
+    reasoning_efforts: list[str] = []
+    options = raw.get("reasoning_options")
+    if isinstance(options, list):
+        for option in options:
+            if not isinstance(option, Mapping) or option.get("type") != "effort":
+                continue
+            values = option.get("values")
+            if isinstance(values, list):
+                reasoning_efforts = [
+                    str(value).strip().lower() for value in values if str(value).strip()
+                ]
+                break
+    context = _catalog_positive_int(limit.get("context"))
+    output = _catalog_positive_int(limit.get("output"))
+    cost = raw.get("cost") if isinstance(raw.get("cost"), Mapping) else None
+    compact_trigger = _first_context_tier_threshold(cost)
+    if compact_trigger is None:
+        compact_trigger = _default_compact_trigger_tokens(context, output)
+    result: dict[str, Any] = {
+        "name": str(raw.get("name") or raw.get("id") or provider_model),
+        "description": str(raw.get("description") or ""),
+        "family": str(raw.get("family") or ""),
+        "vision": bool(
+            raw.get("attachment") is True
+            or (isinstance(input_modalities, list) and "image" in input_modalities)
+        ),
+        "reasoning": bool(raw.get("reasoning")),
+        "reasoningEfforts": reasoning_efforts,
+        "toolCall": bool(raw.get("tool_call")),
+        "structuredOutput": bool(raw.get("structured_output")),
+        "temperature": bool(raw.get("temperature")),
+        "modalities": copy.deepcopy(dict(modalities)),
+        "inputModalities": copy.deepcopy(list(modalities.get("input") or [])),
+        "outputModalities": copy.deepcopy(list(modalities.get("output") or [])),
+        "releaseDate": str(raw.get("release_date") or ""),
+        "knowledgeCutoff": str(raw.get("knowledge") or raw.get("knowledge_cutoff") or ""),
+        "cost": copy.deepcopy(cost),
+    }
+    if context is not None:
+        result["contextWindow"] = context
+    if output is not None:
+        result["maxOutputTokens"] = output
+    if compact_trigger is not None:
+        result["compactTriggerTokens"] = compact_trigger
+    input_limit = _catalog_positive_int(limit.get("input"))
+    if input_limit is not None:
+        result["maxInputTokens"] = input_limit
+    return result
+
+
 def catalog_metadata(provider_model: str) -> dict[str, Any] | None:
     """Project one exact catalog record into Parrot's runtime metadata shape."""
     raw = catalog_model(provider_model)
     if raw is None:
         return None
+    return _catalog_metadata_from_raw(provider_model, raw)
+
     limit = raw.get("limit") if isinstance(raw.get("limit"), Mapping) else {}
     modalities = raw.get("modalities") if isinstance(raw.get("modalities"), Mapping) else {}
     input_modalities = modalities.get("input") if isinstance(modalities, Mapping) else []
@@ -818,6 +891,25 @@ def catalog_tariff(provider_model: str) -> PricingEntry | None:
         return None
     with _lock:
         return _catalog.get(key)
+
+
+def binding_snapshot(provider_model: str) -> dict[str, Any] | None:
+    """Freeze metadata and tariff from the current active catalog generation."""
+    key = str(provider_model or "").strip().lower()
+    if not key or not _ensure_catalog():
+        return None
+    with _lock:
+        raw = _catalog_models.get(key)
+        if raw is None:
+            return None
+        entry = _catalog.get(key)
+        metadata = _catalog_metadata_from_raw(key, raw)
+        return {
+            "catalogRevision": _catalog_revision,
+            "catalogSource": _catalog_source,
+            "metadata": metadata,
+            "tariff": _pricing_entry_payload(entry) if entry is not None else None,
+        }
 
 
 def _entry_from_override(raw: Any) -> PricingEntry | None:
@@ -966,6 +1058,58 @@ def _pricing_entry_payload(entry: PricingEntry) -> dict[str, Any]:
     return {item.name: getattr(entry, item.name) for item in fields(PricingEntry)}
 
 
+def _tariff_from_metadata_binding(
+    binding: Any,
+    active: tuple[str, PricingEntry, str, str] | None,
+) -> tuple[PricingEntry, str, str] | None:
+    snapshot = binding.auto_snapshot if isinstance(binding.auto_snapshot, Mapping) else None
+    base_entry: PricingEntry | None = None
+    source_revision: str | None = None
+    tariff_source = "metadata-override"
+    if snapshot is not None and isinstance(snapshot.get("tariff"), Mapping):
+        try:
+            base_entry = PricingEntry(**dict(snapshot["tariff"]))
+            source_revision = str(snapshot.get("catalogRevision") or "") or None
+            tariff_source = f"models.dev:{snapshot.get('catalogSource') or 'snapshot'}"
+        except (TypeError, ValueError):
+            base_entry = None
+    # An explicit snapshot owns the generation, including an unpriced tariff.
+    # Only legacy bindings without a snapshot may read the active catalog.
+    if snapshot is None and base_entry is None and active is not None:
+        _, base_entry, tariff_source, source_revision = active
+    override_fields = {
+        **dict(getattr(binding, "common_override", {}) or {}),
+        **dict(getattr(binding, "source_override", {}) or {}),
+    }
+    price_overrides = {key: value for key, value in override_fields.items() if key.startswith("cost.")}
+    if base_entry is None:
+        if snapshot is not None and not price_overrides:
+            return None
+        candidate = _entry_from_models_dev(dict(binding.metadata))
+        if candidate is None:
+            return None
+        base_entry = candidate
+    if price_overrides:
+        values = _pricing_entry_payload(base_entry)
+        field_map = {
+            "cost.input": "input_per_token",
+            "cost.output": "output_per_token",
+            "cost.cacheRead": "cache_read_per_token",
+            "cost.cacheWrite": "cache_write_per_token",
+            "cost.longContextInput": "above_input_per_token",
+            "cost.longContextOutput": "above_output_per_token",
+        }
+        for name, value in price_overrides.items():
+            values[field_map[name]] = float(value) / 1_000_000
+        if any(name.startswith("cost.longContext") for name in price_overrides):
+            values["long_context_input_threshold"] = (
+                values.get("long_context_input_threshold") or 200_000
+            )
+        base_entry = PricingEntry(**values)
+        tariff_source = "metadata-override"
+    return base_entry, tariff_source, source_revision or "override"
+
+
 def _canonical_json(payload: Mapping[str, Any]) -> str:
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"),
@@ -1040,7 +1184,23 @@ def build_pricing_binding(
     tariff: PricingEntry | None = None
     tariff_source: str | None = None
     source_revision: str | None = None
-    if priced is not None:
+    snapshot_or_override = bool(
+        metadata_binding is not None and (
+            metadata_binding.auto_snapshot is not None
+            or any(
+                key.startswith("cost.")
+                for key in (
+                    *metadata_binding.common_override.keys(),
+                    *metadata_binding.source_override.keys(),
+                )
+            )
+        )
+    )
+    if current.enabled and snapshot_or_override and metadata_binding is not None:
+        resolved = _tariff_from_metadata_binding(metadata_binding, priced)
+        if resolved is not None:
+            tariff, tariff_source, source_revision = resolved
+    elif priced is not None:
         pricing_key, tariff, tariff_source, source_revision = priced
 
     payload: dict[str, Any] = {
@@ -2043,6 +2203,83 @@ async def _download_catalog_bounded(client: Any, url: str, budget: int) -> bytes
         return b"".join(chunks)
 
 
+def _candidate_from_payloads(api_payload: Any, models_payload: Any) -> CatalogCandidate:
+    parsed_catalog, aliases, providers = _parse_models_dev_catalog(
+        api_payload, models_payload,
+    )
+    metadata_models, provider_names, official_models = (
+        _parse_models_dev_metadata_indexes(api_payload, models_payload)
+    )
+    if len(parsed_catalog) < 500 or not isinstance(models_payload, Mapping) or len(models_payload) < 100:
+        raise ValueError(f"pricing catalog unexpectedly small: {len(parsed_catalog)}")
+    revision = _catalog_revision_for_payloads(api_payload, models_payload)
+    return CatalogCandidate(
+        api_payload=copy.deepcopy(api_payload),
+        models_payload=copy.deepcopy(models_payload),
+        catalog=dict(parsed_catalog),
+        aliases=dict(aliases),
+        providers=frozenset(providers),
+        metadata_models=copy.deepcopy(metadata_models),
+        provider_names=dict(provider_names),
+        official_models=dict(official_models),
+        revision=revision,
+    )
+
+
+async def fetch_catalog_candidate(*, client: Any = None) -> CatalogCandidate:
+    """Download and parse a bounded generation without cache/global publication."""
+    pricing_cfg = config.get().get("pricing", {})
+    if not isinstance(pricing_cfg, Mapping):
+        pricing_cfg = {}
+    url = str(pricing_cfg.get("sourceUrl") or _DEFAULT_SOURCE_URL).strip()
+    models_url = str(pricing_cfg.get("modelsUrl") or _DEFAULT_MODELS_URL).strip()
+    if not url.startswith("https://") or not models_url.startswith("https://"):
+        raise ValueError("pricing.sourceUrl and pricing.modelsUrl must use https://")
+    from . import upstream
+    with upstream.client_scope() if client is None else nullcontext(client) as active_client:
+        raw_api = await _download_catalog_bounded(active_client, url, _MAX_REMOTE_CATALOG_BYTES)
+        raw_models = await _download_catalog_bounded(
+            active_client, models_url, _MAX_REMOTE_CATALOG_BYTES - len(raw_api),
+        )
+    api_payload = json.loads(raw_api)
+    models_payload = json.loads(raw_models)
+    return await asyncio.to_thread(_candidate_from_payloads, api_payload, models_payload)
+
+
+def fetch_catalog_candidate_sync() -> CatalogCandidate:
+    """Loop-local synchronous façade used by metadata operation workers."""
+    async def _run() -> CatalogCandidate:
+        from . import network
+        client = network.async_client(timeout=20.0, http2=False)
+        try:
+            return await fetch_catalog_candidate(client=client)
+        finally:
+            await client.aclose()
+    return asyncio.run(_run())
+
+
+def candidate_canonical_official_model(
+    candidate: CatalogCandidate, model: str,
+) -> str | None:
+    return candidate.official_models.get(str(model or "").strip().lower())
+
+
+def candidate_binding_snapshot(
+    candidate: CatalogCandidate, provider_model: str,
+) -> dict[str, Any] | None:
+    key = str(provider_model or "").strip().lower()
+    raw = candidate.metadata_models.get(key)
+    if not isinstance(raw, Mapping):
+        return None
+    tariff = candidate.catalog.get(key)
+    return {
+        "catalogRevision": candidate.revision,
+        "catalogSource": "candidate",
+        "metadata": _catalog_metadata_from_raw(key, raw),
+        "tariff": _pricing_entry_payload(tariff) if tariff is not None else None,
+    }
+
+
 async def refresh_once(*, force: bool = False, client: Any = None) -> bool:
     """Refresh both models.dev catalogs and atomically replace one gzip bundle.
 
@@ -2223,7 +2460,9 @@ async def refresh_loop() -> None:
             first_iteration = False
         else:
             try:
-                await refresh_once()
+                refreshed = await refresh_once()
+                if refreshed:
+                    await _auto_sync_startup_metadata("remote")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

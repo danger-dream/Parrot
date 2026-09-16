@@ -12,7 +12,7 @@ from typing import Optional
 
 from .. import (
     affinity, channel_state, config, cooldown, load_balancing, model_mapping,
-    scorer, state_db,
+    model_metadata, model_state, scorer, state_db,
 )
 from ..oauth import normalize_provider as _normalize_provider
 from .api_channel import ApiChannel
@@ -242,8 +242,11 @@ def available_models_for_families(families: Optional[set[str]]) -> list[str]:
             if fam not in families:
                 continue
         for m in ch.list_client_models():
-            if m:
-                models.add(m)
+            if not m or not model_state.is_global_enabled(m):
+                continue
+            if not model_state.is_source_enabled(ch.key, m):
+                continue
+            models.add(m)
     return sorted(models)
 
 
@@ -397,6 +400,9 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
     old_priority_orders = copy.deepcopy(
         config.get().get("loadBalancing", {}).get("priorityOrders", {})
     )
+    old_model_center = copy.deepcopy(config.get().get("modelCenter"))
+    old_model_bindings = copy.deepcopy(config.get().get("modelBindings"))
+    old_model_overrides = copy.deepcopy(config.get().get("modelMetadataOverrides"))
     old_family = load_balancing.family_for_protocol(old_entry.get("protocol", "anthropic"))
 
     def _mutate(cfg):
@@ -474,12 +480,34 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
             else:
                 target.pop("providerPresetId", None)
         if "models" in patch:
-            old_aliases = _client_model_aliases(target.get("models"))
+            old_rows = list(target.get("models") or [])
+            old_aliases = _client_model_aliases(old_rows)
+            old_outbound = {
+                str(row.get("alias") or row.get("real") or "").strip():
+                str(row.get("real") or "").strip()
+                for row in old_rows if isinstance(row, dict)
+            }
             target["models"] = list(patch["models"] or [])
+            new_outbound = {
+                str(row.get("alias") or row.get("real") or "").strip():
+                str(row.get("real") or "").strip()
+                for row in target["models"] if isinstance(row, dict)
+            }
             removed_aliases = old_aliases - _client_model_aliases(target["models"])
+            changed_outbound = {
+                model for model in old_aliases.intersection(new_outbound)
+                if old_outbound.get(model) != new_outbound.get(model)
+            }
+            model_metadata.clear_scoped_metadata_in_config(
+                cfg, old_key, removed_aliases.union(changed_outbound),
+            )
             # 渠道模型编辑与 modelMapping 清理必须同一次落盘：用户删掉或
             # 改名的客户端 alias 不能继续被独立映射配置重新暴露。
             model_mapping.remove_aliases_from_config(cfg, removed_aliases)
+            # Removed public routes cannot retain inaccessible source state.
+            model_state.set_api_source_enabled_in_config(
+                cfg, old_key, removed_aliases, True,
+            )
         if "cc_mimicry" in patch:
             target["cc_mimicry"] = bool(patch["cc_mimicry"])
         if "omitTemperature" in patch:
@@ -523,6 +551,9 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
             load_balancing.mutate_channel_renamed(
                 cfg, old_key, final_key, final_family,
             )
+        if final_key != old_key:
+            model_state.rename_api_source_in_config(cfg, old_key, final_key)
+            model_metadata.rename_scoped_metadata_in_config(cfg, old_key, final_key)
 
     new_name = patch.get("name", name)
     new_key = f"api:{new_name}"
@@ -538,6 +569,18 @@ def _update_api_channel_serialized(name: str, patch: dict) -> dict | None:
         cfg.setdefault("loadBalancing", {})["priorityOrders"] = copy.deepcopy(
             old_priority_orders
         )
+        if old_model_center is None:
+            cfg.pop("modelCenter", None)
+        else:
+            cfg["modelCenter"] = copy.deepcopy(old_model_center)
+        for key, old_value in (
+            ("modelBindings", old_model_bindings),
+            ("modelMetadataOverrides", old_model_overrides),
+        ):
+            if old_value is None:
+                cfg.pop(key, None)
+            else:
+                cfg[key] = copy.deepcopy(old_value)
 
     try:
         if new_key != old_key:
@@ -584,8 +627,10 @@ def _delete_api_channel_serialized(name: str) -> bool:
                 # 删除整条渠道也等价于删除其中的客户端 alias；同步清掉所有
                 # modelMapping 同名 key，防止以后目标模型重新出现时旧名复活。
                 model_mapping.remove_aliases_from_config(cfg, removed_aliases)
+                model_metadata.clear_metadata_scope_in_config(cfg, key)
                 found["ok"] = True
                 load_balancing.mutate_channels_removed(cfg, {key})
+                model_state.remove_api_source_in_config(cfg, key)
                 return
 
     # Config removal, priority removal, and tombstoning are one lifecycle.

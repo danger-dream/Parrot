@@ -319,9 +319,9 @@ def run_case(case: dict[str, Any], monkeypatch) -> dict[str, Any]:
     return RUNNERS[case["entry"]["scenario"]](case, monkeypatch)
 
 
-# The user authorized loading + automatic completion on 2026-09-10. Keep the
-# historical fixture immutable; only these three cold callback traces change.
-# All warm/stale views, commands, preferences and cache contracts remain strict.
+# Keep the historical fixture immutable. Current expectations layer the three
+# approved cold callback traces and the provider custom-emoji ID replacement;
+# all other payload fields, preferences and cache contracts remain strict.
 _COLD_VIEW_DELTAS = {
     "TG-STATS-01.cold-today-callback": ("0", "今天"),
     "TG-STATS-01.cold-rolling-loading-queued": ("3", "最近 3 天"),
@@ -329,29 +329,48 @@ _COLD_VIEW_DELTAS = {
 }
 
 
+_CURRENT_PROVIDER_ICON_IDS = {
+    "5872779796257184592": "6140995813788099525",
+    "5861557411784957025": "6141162084857031383",
+    "5819115571463068721": "6138882363460952713",
+}
+
+
+def _replace_provider_icon_ids(value):
+    if isinstance(value, str):
+        for old, new in _CURRENT_PROVIDER_ICON_IDS.items():
+            value = value.replace(old, new)
+        return value
+    if isinstance(value, list):
+        return [_replace_provider_icon_ids(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_provider_icon_ids(item) for key, item in value.items()}
+    return value
+
+
 def _expected_current_trace(case):
-    if case["caseId"] not in _COLD_VIEW_DELTAS:
-        return case
-    period, label = _COLD_VIEW_DELTAS[case["caseId"]]
     expected = deepcopy(case)
-    # Reuse the frozen keyboard for this exact period/dimension, not production
-    # rendering code, so the intentional loading change cannot hide button drift.
-    warm = next(item for item in CASES if
-                item["entry"].get("scenario") == "stats_view"
-                and item["entry"]["period"] == period and item["entry"]["dim"] == "all")
-    keyboard = deepcopy(warm["tgApi"][-1]["payload"]["reply_markup"])
-    expected["tgApi"] = [
-        {"method": "answerCallbackQuery", "payload": {
-            "callback_query_id": "cb-stats", "text": "正在统计，完成后自动更新",
-        }},
-        {"method": "editMessageText", "payload": {
-            "chat_id": 42, "message_id": 77,
-            "text": f"📊 <b>统计 — {label}</b>\n\n⏳ 正在加载，完成后自动更新，无需重复点击。",
-            "parse_mode": "HTML", "reply_markup": keyboard,
-        }},
-    ]
-    key = ["period", int(case["initialRuntime"]["todayStart"])] if period == "0" else ["rolling-period", "3"]
-    expected["finalBusinessState"]["enqueued"] = [{"key": key, "generation": 0}]
+    if case["caseId"] in _COLD_VIEW_DELTAS:
+        period, label = _COLD_VIEW_DELTAS[case["caseId"]]
+        # Reuse the frozen keyboard for this exact period/dimension, not production
+        # rendering code, so the intentional loading change cannot hide button drift.
+        warm = next(item for item in CASES if
+                    item["entry"].get("scenario") == "stats_view"
+                    and item["entry"]["period"] == period and item["entry"]["dim"] == "all")
+        keyboard = deepcopy(warm["tgApi"][-1]["payload"]["reply_markup"])
+        expected["tgApi"] = [
+            {"method": "answerCallbackQuery", "payload": {
+                "callback_query_id": "cb-stats", "text": "正在统计，完成后自动更新",
+            }},
+            {"method": "editMessageText", "payload": {
+                "chat_id": 42, "message_id": 77,
+                "text": f"📊 <b>统计 — {label}</b>\n\n⏳ 正在加载，完成后自动更新，无需重复点击。",
+                "parse_mode": "HTML", "reply_markup": keyboard,
+            }},
+        ]
+        key = ["period", int(case["initialRuntime"]["todayStart"])] if period == "0" else ["rolling-period", "3"]
+        expected["finalBusinessState"]["enqueued"] = [{"key": key, "generation": 0}]
+    expected["tgApi"] = _replace_provider_icon_ids(expected["tgApi"])
     return expected
 
 

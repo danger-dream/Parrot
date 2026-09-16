@@ -46,9 +46,9 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
     monkeypatch.setattr(app, "include_router", record_direct_mount)
     install_management_routers(app)
 
-    # Foundation plus the 20 ordered domain routers are each mounted on the app;
+    # Foundation plus the 21 ordered domain routers are each mounted on the app;
     # there is no intermediate aggregate router to clone a second time.
-    assert len(included) == 21
+    assert len(included) == 22
     assert all(prefix == "/api/management/v1" for _router, prefix in included)
     # FastAPI may retain nested includes (such as the WorkBuddy router) in
     # router.routes as well as app.routes, rather than flattening them. Count
@@ -60,8 +60,8 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
         for method, operation in path_item.items()
         if method in {"get", "post", "delete", "put", "patch"}
     ]
-    assert len(operations) == 212
-    assert len({(method, path) for method, path, _operation in operations}) == 212
+    assert len(operations) == 226
+    assert len({(method, path) for method, path, _operation in operations}) == 226
     assert {operation for _method, _path, operation in operations} == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
@@ -80,10 +80,10 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     ]
     operation_ids = [operation_id for _method, _path, operation_id in operations]
     method_paths = [(method, path) for method, path, _operation_id in operations]
-    assert len(operations) == 212
-    assert len(set(operation_ids)) == 212
-    assert len(set(method_paths)) == 212
-    assert len({path for _method, path in method_paths}) == 156
+    assert len(operations) == 226
+    assert len(set(operation_ids)) == 226
+    assert len(set(method_paths)) == 226
+    assert len({path for _method, path in method_paths}) == 165
     assert set(operation_ids) == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
@@ -110,6 +110,11 @@ def test_management_initialization_and_shutdown_are_isolated(tmp_path, monkeypat
     assert app.state.management_runtime is runtime
     assert app.state.management_controls is owner
     assert app.state.management_controls_runtime is runtime
+    assert server.tgbot.model_center_menu._CONTROL is owner.models
+    assert owner.models.mapping is owner.mapping
+    assert owner.models.images is owner.auxiliary.images
+    assert owner.models.xai_media is owner.auxiliary.xai_media
+    assert owner.models.antigravity_media is owner.auxiliary.antigravity_media
     assert server.tgbot.mapping_menu.mapping_control is owner.mapping
     assert server.tgbot.system_menu._settings_control is owner.system.settings
     assert server.tgbot.system_menu._runtime_control is owner.system_runtime
@@ -119,6 +124,7 @@ def test_management_initialization_and_shutdown_are_isolated(tmp_path, monkeypat
     asyncio.run(server._close_management_runtime(app))
     assert app.state.management_runtime is None
     assert app.state.management_controls is None
+    assert server.tgbot.model_center_menu._CONTROL is not owner.models
     assert server.tgbot.mapping_menu.mapping_control is not owner.mapping
     assert server.tgbot.system_menu._settings_control is not owner.system.settings
     assert server.tgbot._management_approval_handler is None

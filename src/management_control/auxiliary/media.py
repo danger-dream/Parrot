@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from src import config, image_db
+from src import config, image_db, oauth_manager
 from src.openai import images_simple
 from src.management_auth.principal import Capability
 
 from ..context import AuditSink, ManagementContext
-from ..errors import ManagementError, ManagementErrorCode
+from ..errors import ErrorField, ManagementError, ManagementErrorCode
+from ..models.common import ModelKind, ModelOwnerRef, ModelSourceType
 from .common import (
     ConfigGateway,
     ModuleConfigGateway,
@@ -61,11 +62,54 @@ class XaiMediaSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class AntigravityMediaSettings:
+    image_models: tuple[str, ...]
+    account_overrides: tuple[tuple[str, tuple[str, ...]], ...]
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaModelMutationResult:
+    provider: str
+    kind: ModelKind
+    owner: ModelOwnerRef
+    model_id: str
+    models: tuple[str, ...]
+    status: str
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
 class CachedImageLog:
     id: int
     action: str
     account_email: str
     paths: tuple[str, ...]
+
+
+def _require_revision(expected_revision: str | None, current_revision: str) -> None:
+    if expected_revision is None:
+        raise ManagementError(
+            ManagementErrorCode.CONFIRMATION_REQUIRED,
+            fields=(ErrorField(
+                path="If-Match", code="REQUIRED", message="If-Match is required",
+            ),),
+        )
+    ensure_revision(expected_revision, current_revision)
+
+
+def _media_model(
+    value: Any, field: str = "modelId", *, max_length: int = 128,
+) -> str:
+    if not isinstance(value, str):
+        raise invalid_field(field, "INVALID_MODEL", "model must be a string")
+    name = value.strip()
+    if not name or len(name) > max_length:
+        raise invalid_field(
+            field, "INVALID_MODEL",
+            f"model must contain 1 to {max_length} characters",
+        )
+    return name
 
 
 class MediaGateway(Protocol):
@@ -442,6 +486,117 @@ class XaiMediaControl:
         audit(self._audit_sink, context, action="xai.media-settings.update", target="xai-media")
         return self._dto(self._effective(self._config.get()))
 
+    @staticmethod
+    def _kind(kind: ModelKind | str) -> tuple[ModelKind, str]:
+        try:
+            normalized = kind if isinstance(kind, ModelKind) else ModelKind(str(kind))
+        except ValueError as exc:
+            raise invalid_field("kind", "UNSUPPORTED_KIND", "kind must be image or video") from exc
+        field = {
+            ModelKind.IMAGE: "imageModels",
+            ModelKind.VIDEO: "videoModels",
+        }.get(normalized)
+        if field is None:
+            raise invalid_field("kind", "UNSUPPORTED_KIND", "kind must be image or video")
+        return normalized, field
+
+    def _mutate_model(
+        self,
+        context: ManagementContext,
+        *,
+        kind: ModelKind | str,
+        old_model_id: str | None,
+        new_model_id: str | None,
+        action: str,
+        expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        capability = Capability.DESTRUCTIVE if action == "remove" else Capability.WRITE
+        require(context, capability)
+        normalized_kind, field = self._kind(kind)
+        old_name = _media_model(old_model_id, "modelId") if old_model_id is not None else None
+        new_name = _media_model(
+            new_model_id, "newModelId" if action == "rename" else "modelId",
+        ) if new_model_id is not None else None
+        outcome = [""]
+
+        def mutate(root: dict[str, Any]) -> None:
+            current = self._dto(self._effective(root))
+            _require_revision(expected_revision, current.revision)
+            values = list(current.image_models if normalized_kind is ModelKind.IMAGE else current.video_models)
+            if action == "add":
+                assert new_name is not None
+                if new_name in values:
+                    outcome[0] = "unchanged"
+                else:
+                    if len(values) >= 50:
+                        raise invalid_field(field, "TOO_MANY_MODELS", "at most 50 models are allowed")
+                    values.append(new_name)
+                    outcome[0] = "added"
+            elif action == "rename":
+                assert old_name is not None and new_name is not None
+                if old_name not in values:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+                if old_name == new_name:
+                    outcome[0] = "unchanged"
+                elif new_name in values:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
+                else:
+                    values[values.index(old_name)] = new_name
+                    outcome[0] = "renamed"
+            else:
+                assert old_name is not None
+                if old_name not in values:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+                values.pop(values.index(old_name))
+                outcome[0] = "removed"
+            section = root.get("xaiOAuth")
+            if not isinstance(section, dict):
+                section = {}
+                root["xaiOAuth"] = section
+            section[field] = values
+
+        self._config.update(mutate)
+        current = self.get_settings(context)
+        models = current.image_models if normalized_kind is ModelKind.IMAGE else current.video_models
+        result_model = new_name if action != "remove" else old_name
+        audit(
+            self._audit_sink, context, action=f"xai.media-model.{action}",
+            target=f"{normalized_kind.value}:{result_model}",
+        )
+        return MediaModelMutationResult(
+            provider="xai", kind=normalized_kind,
+            owner=ModelOwnerRef(ModelSourceType.GLOBAL),
+            model_id=str(result_model), models=tuple(models), status=outcome[0],
+            revision=current.revision,
+        )
+
+    def add_model(
+        self, context: ManagementContext, *, kind: ModelKind | str,
+        model_id: str, expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        return self._mutate_model(
+            context, kind=kind, old_model_id=None, new_model_id=model_id,
+            action="add", expected_revision=expected_revision,
+        )
+
+    def rename_model(
+        self, context: ManagementContext, *, kind: ModelKind | str,
+        old_model_id: str, new_model_id: str, expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        return self._mutate_model(
+            context, kind=kind, old_model_id=old_model_id, new_model_id=new_model_id,
+            action="rename", expected_revision=expected_revision,
+        )
+
+    def remove_model(
+        self, context: ManagementContext, *, kind: ModelKind | str,
+        model_id: str, expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        return self._mutate_model(
+            context, kind=kind, old_model_id=model_id, new_model_id=None,
+            action="remove", expected_revision=expected_revision,
+        )
+
     def set_raw_field(self, context: ManagementContext, key: str, value: Any) -> XaiMediaSettings:
         require(context, Capability.WRITE)
 
@@ -455,3 +610,231 @@ class XaiMediaControl:
         self._config.update(mutate)
         audit(self._audit_sink, context, action="xai.media-settings.update", target=key)
         return self._dto(self._effective(self._config.get()))
+
+
+class AntigravityMediaControl:
+    def __init__(
+        self,
+        *,
+        config_gateway: ConfigGateway | None = None,
+        audit_sink: AuditSink | None = None,
+    ) -> None:
+        self._config = config_gateway or ModuleConfigGateway()
+        self._audit_sink = audit_sink
+
+    @staticmethod
+    def _account_overrides(root: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        result: list[tuple[str, tuple[str, ...]]] = []
+        for account in root.get("oauthAccounts") or ():
+            if not isinstance(account, dict) or "imageModels" not in account:
+                continue
+            try:
+                if oauth_manager.provider_of(account) != "antigravity":
+                    continue
+                account_id = oauth_manager.get_account_key(account)
+            except Exception:
+                continue
+            result.append((str(account_id), tuple(string_list(account.get("imageModels")))))
+        return tuple(sorted(result, key=lambda item: item[0]))
+
+    @classmethod
+    def _dto(cls, root: dict[str, Any]) -> AntigravityMediaSettings:
+        section = copy.deepcopy(config.DEFAULT_CONFIG.get("antigravityOAuth") or {})
+        raw = root.get("antigravityOAuth")
+        if isinstance(raw, dict):
+            section.update(copy.deepcopy(raw))
+        stable = {
+            "imageModels": string_list(section.get("imageModels")),
+            "accountOverrides": cls._account_overrides(root),
+        }
+        return AntigravityMediaSettings(
+            image_models=tuple(stable["imageModels"]),
+            account_overrides=stable["accountOverrides"],
+            revision=revision_for(stable),
+        )
+
+    def get_settings(self, context: ManagementContext) -> AntigravityMediaSettings:
+        require(context, Capability.READ)
+        return self._dto(self._config.get())
+
+    @staticmethod
+    def _validate_models(models: Any) -> list[str]:
+        values = string_list(models)
+        if len(values) > 80:
+            raise invalid_field(
+                "imageModels", "TOO_MANY_MODELS", "at most 80 models are allowed",
+            )
+        for index, model in enumerate(values):
+            if len(model) > 80:
+                raise invalid_field(
+                    f"imageModels[{index}]", "MODEL_TOO_LONG",
+                    "model must be at most 80 characters",
+                )
+        return values
+
+    def update_settings(
+        self,
+        context: ManagementContext,
+        *,
+        image_models: tuple[str, ...] | list[str],
+        expected_revision: str | None,
+    ) -> AntigravityMediaSettings:
+        require(context, Capability.WRITE)
+        values = self._validate_models(image_models)
+
+        def mutate(root: dict[str, Any]) -> None:
+            current = self._dto(root)
+            _require_revision(expected_revision, current.revision)
+            section = root.get("antigravityOAuth")
+            if not isinstance(section, dict):
+                section = {}
+                root["antigravityOAuth"] = section
+            section["imageModels"] = list(values)
+
+        self._config.update(mutate)
+        result = self.get_settings(context)
+        audit(
+            self._audit_sink, context,
+            action="antigravity.media-settings.update", target="antigravity-media",
+        )
+        return result
+
+    @staticmethod
+    def _owner_type(owner: ModelOwnerRef) -> ModelSourceType:
+        try:
+            return owner.type if isinstance(owner.type, ModelSourceType) else ModelSourceType(str(owner.type))
+        except (AttributeError, ValueError) as exc:
+            raise invalid_field("owner.type", "UNSUPPORTED_OWNER", "owner must be global or oauth") from exc
+
+    @classmethod
+    def _assert_mutable_owner(cls, root: dict[str, Any], owner: ModelOwnerRef) -> None:
+        owner_type = cls._owner_type(owner)
+        if owner_type is ModelSourceType.GLOBAL:
+            if owner.id not in (None, ""):
+                raise invalid_field("owner.id", "NOT_ALLOWED", "global owner does not accept id")
+            return
+        if owner_type is not ModelSourceType.OAUTH or not str(owner.id or "").strip():
+            raise invalid_field("owner", "UNSUPPORTED_OWNER", "oauth owner requires id")
+        owner_id = str(owner.id)
+        found = False
+        for account in root.get("oauthAccounts") or ():
+            if not isinstance(account, dict):
+                continue
+            try:
+                if (
+                    oauth_manager.provider_of(account) == "antigravity"
+                    and oauth_manager.get_account_key(account) == owner_id
+                    and "imageModels" in account
+                ):
+                    found = True
+                    break
+            except Exception:
+                continue
+        if not found:
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        raise ManagementError(
+            ManagementErrorCode.UNSUPPORTED_VALUE,
+            fields=(ErrorField(
+                path="owner", code="READ_ONLY_SCOPE",
+                message="Antigravity account image models are read-only",
+            ),),
+        )
+
+    def _mutate_model(
+        self,
+        context: ManagementContext,
+        *,
+        owner: ModelOwnerRef,
+        old_model_id: str | None,
+        new_model_id: str | None,
+        action: str,
+        expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        capability = Capability.DESTRUCTIVE if action == "remove" else Capability.WRITE
+        require(context, capability)
+        old_name = _media_model(
+            old_model_id, "modelId", max_length=80,
+        ) if old_model_id is not None else None
+        new_name = _media_model(
+            new_model_id, "newModelId" if action == "rename" else "modelId",
+            max_length=80,
+        ) if new_model_id is not None else None
+        outcome = [""]
+
+        def mutate(root: dict[str, Any]) -> None:
+            self._assert_mutable_owner(root, owner)
+            current = self._dto(root)
+            _require_revision(expected_revision, current.revision)
+            values = list(current.image_models)
+            if action == "add":
+                assert new_name is not None
+                if new_name in values:
+                    outcome[0] = "unchanged"
+                else:
+                    if len(values) >= 80:
+                        raise invalid_field("imageModels", "TOO_MANY_MODELS", "at most 80 models are allowed")
+                    values.append(new_name)
+                    outcome[0] = "added"
+            elif action == "rename":
+                assert old_name is not None and new_name is not None
+                if old_name not in values:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+                if old_name == new_name:
+                    outcome[0] = "unchanged"
+                elif new_name in values:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
+                else:
+                    values[values.index(old_name)] = new_name
+                    outcome[0] = "renamed"
+            else:
+                assert old_name is not None
+                if old_name not in values:
+                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+                values.pop(values.index(old_name))
+                outcome[0] = "removed"
+            section = root.get("antigravityOAuth")
+            if not isinstance(section, dict):
+                section = {}
+                root["antigravityOAuth"] = section
+            section["imageModels"] = values
+
+        self._config.update(mutate)
+        current = self.get_settings(context)
+        result_model = new_name if action != "remove" else old_name
+        audit(
+            self._audit_sink, context,
+            action=f"antigravity.media-model.{action}", target=f"image:{result_model}",
+        )
+        return MediaModelMutationResult(
+            provider="antigravity", kind=ModelKind.IMAGE,
+            owner=ModelOwnerRef(ModelSourceType.GLOBAL),
+            model_id=str(result_model), models=current.image_models,
+            status=outcome[0], revision=current.revision,
+        )
+
+    def add_model(
+        self, context: ManagementContext, *, owner: ModelOwnerRef,
+        model_id: str, expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        return self._mutate_model(
+            context, owner=owner, old_model_id=None, new_model_id=model_id,
+            action="add", expected_revision=expected_revision,
+        )
+
+    def rename_model(
+        self, context: ManagementContext, *, owner: ModelOwnerRef,
+        old_model_id: str, new_model_id: str, expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        return self._mutate_model(
+            context, owner=owner, old_model_id=old_model_id, new_model_id=new_model_id,
+            action="rename", expected_revision=expected_revision,
+        )
+
+    def remove_model(
+        self, context: ManagementContext, *, owner: ModelOwnerRef,
+        model_id: str, expected_revision: str | None,
+    ) -> MediaModelMutationResult:
+        return self._mutate_model(
+            context, owner=owner, old_model_id=model_id, new_model_id=None,
+            action="remove", expected_revision=expected_revision,
+        )

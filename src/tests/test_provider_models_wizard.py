@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -9,7 +11,7 @@ from src.channel import registry
 from src.models_discovery import ModelsDiscoveryError, derive_custom_models_url, discover_models
 from src.providers.catalog import PROVIDER_CATALOG, get_preset
 from src.openai.channel.api_channel import OpenAIApiChannel
-from src.telegram import states
+from src.telegram import states, ui
 from src.telegram.menus import channel_menu, channel_wizard
 
 
@@ -142,6 +144,61 @@ def test_registry_provider_identity_and_runtime_compatibility():
     old = OpenAIApiChannel({"name": "old", "baseUrl": "https://old.test", "apiKey": "key",
         "protocol": "openai-chat", "models": [{"real": "m", "alias": "m"}]})
     assert old.provider_id is None and old.provider_preset_id is None
+
+
+def test_provider_and_preset_picker_buttons_use_catalog_brand_custom_icons(monkeypatch):
+    provided = {
+        "openai", "anthropic", "ollama-cloud", "kimi", "deepseek", "zhipu",
+        "minimax", "alibaba-bailian", "tencent-cloud", "jd-cloud",
+        "volcengine-ark", "baidu-qianfan", "xiaomi-mimo", "ctyun-xirang",
+        "openrouter",
+    }
+    unsupported = {"iflytek", "opencode-go", "siliconflow"}
+    catalog = SimpleNamespace(providers=tuple(PROVIDER_CATALOG))
+    monkeypatch.setattr(channel_wizard, "_catalog", lambda *_args, **_kwargs: catalog)
+
+    buttons = []
+    for page in range(2):
+        keyboard = channel_wizard._providers_kb(page)
+        buttons.extend(
+            button for row in keyboard["inline_keyboard"] for button in row
+            if str(button.get("callback_data", "")).startswith("chw:brand:")
+        )
+    assert len(buttons) == len(PROVIDER_CATALOG)
+    for button in buttons:
+        index = int(button["callback_data"].split(":")[2])
+        brand = PROVIDER_CATALOG[index]
+        assert button["text"] == brand.display_name
+        if brand.id in provided:
+            assert button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id(brand.id)
+        else:
+            assert brand.id in unsupported
+            assert "icon_custom_emoji_id" not in button
+
+    edits = []
+    monkeypatch.setattr(channel_wizard.ui, "answer_cb", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        channel_wizard.ui, "edit",
+        lambda *args, **kwargs: edits.append((args, kwargs)),
+    )
+    openai_index = next(
+        index for index, brand in enumerate(PROVIDER_CATALOG) if brand.id == "openai"
+    )
+    states.set_state(7, "ch_wiz_url", {"name": "brand channel"})
+    channel_wizard.wiz_select_brand(7, 99, "cb", openai_index, 0)
+    text = edits[-1][0][2]
+    preset_buttons = [
+        button for row in edits[-1][1]["reply_markup"]["inline_keyboard"]
+        for button in row
+        if str(button.get("callback_data", "")).startswith("chw:preset:")
+    ]
+    expected = ui.provider_custom_emoji_id("openai")
+    assert expected in text and preset_buttons
+    assert all(button["icon_custom_emoji_id"] == expected for button in preset_buttons)
+    assert [button["text"] for button in preset_buttons] == [
+        preset.display_name for preset in PROVIDER_CATALOG[openai_index].presets
+    ]
+    states.clear_all()
 
 
 def test_provider_selection_protocol_filter_static_models_and_pagination(monkeypatch):

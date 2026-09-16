@@ -523,14 +523,12 @@ def test_settings_usage_display_mode_toggle(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     settings = rec.last("editMessageText")
     assert settings and "OAuth 账户设置" in settings["text"]
-    assert "默认模型" in settings["text"]
-    assert "按账号自动同步" in settings["text"]
-    assert "🎨 <b>媒体能力</b>" in settings["text"]
-    assert "GPT / Codex 图片:" in settings["text"]
-    assert "Grok Imagine: 图片 <b>2</b> · 视频 <b>2</b>" in settings["text"]
-    assert "Antigravity" in settings["text"]
-    assert "Antigravity 出图:" in settings["text"]
-    assert "tg-emoji" in settings["text"]
+    assert "模型目录、备用模型与媒体设置已统一归位到模型中心" in settings["text"]
+    assert "默认模型" not in settings["text"]
+    assert "🎨 <b>媒体能力</b>" not in settings["text"]
+    assert "GPT / Codex 图片:" not in settings["text"]
+    assert "Grok Imagine:" not in settings["text"]
+    assert "Antigravity 出图:" not in settings["text"]
     assert "📊 <b>用量显示模式</b>" in settings["text"]
     assert "当前模式: 已使用量" in settings["text"]
     assert "CCH 模式（Claude Code 伪装）" in settings["text"]
@@ -539,10 +537,17 @@ def test_settings_usage_display_mode_toggle(m):
     assert "状态: 🚫 已停用" in settings["text"]
     keyboard = settings["reply_markup"]["inline_keyboard"]
     texts = [b["text"] for row in keyboard for b in row]
-    assert [b["text"] for b in keyboard[0]] == ["🧬 默认模型", "📈 配额监控"]
-    assert [b["text"] for b in keyboard[1]] == ["GPT 图片", "Grok 图片"]
-    assert "GPT 图片" in texts
-    assert "Grok 图片" in texts
+    assert [[b["text"] for b in row] for row in keyboard] == [
+        ["📈 配额监控"],
+        ["📊 显示: 剩余用量"],
+        ["🎭 CCH模式：开启", "📊 进度条: 开启"],
+        ["🏠 返回主菜单", "◀ 返回OAuth账户"],
+    ]
+    assert keyboard[0][0]["callback_data"] == "oa:quota"
+    assert keyboard[1][0]["callback_data"] == "oa:usage_mode:toggle"
+    assert keyboard[2][0]["callback_data"] == "oa:cch_toggle"
+    assert keyboard[2][1]["callback_data"] == "oa:progress_bar:toggle"
+    assert [b["callback_data"] for b in keyboard[3]] == ["menu:main", "menu:oauth"]
     assert "📈 配额监控" in texts
     assert "🎭 CCH模式：开启" in texts
     assert "📊 显示: 剩余用量" in texts
@@ -590,7 +595,7 @@ def test_quota_progress_bar_toggle_applies_to_oauth_list_and_detail(m):
         row for row in keyboard
         if any(b.get("callback_data") == "oa:progress_bar:toggle" for b in row)
     )
-    assert [b["text"] for b in progress_row] == ["🎭 CCH模式：开启", "☑ 进度条"]
+    assert [b["text"] for b in progress_row] == ["🎭 CCH模式：开启", "📊 进度条: 开启"]
     assert "黑白进度条: 开启" in settings["text"]
 
     rec.clear()
@@ -612,7 +617,7 @@ def test_quota_progress_bar_toggle_applies_to_oauth_list_and_detail(m):
     toggled = rec.last("editMessageText")
     assert "黑白进度条: 关闭" in toggled["text"]
     assert any(
-        b["text"] == "☐ 进度条"
+        b["text"] == "📊 进度条: 关闭"
         for row in toggled["reply_markup"]["inline_keyboard"] for b in row
     )
 

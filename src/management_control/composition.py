@@ -8,6 +8,7 @@ from src.management_auth import ManagementStateStore
 
 from .apikey import ApiKeyControl
 from .auxiliary import (
+    AntigravityMediaControl,
     AuxiliaryControls,
     ImageControl,
     StatusAlertControl,
@@ -19,6 +20,7 @@ from .channels import ChannelControl
 from .context import AuditSink
 from .load_balancing import LoadBalancingControl
 from .mapping import MappingControl
+from .models import ModelCenterControl
 from .network import NetworkControl
 from .oauth import OAuthBackend, OAuthControl
 from .observability import (
@@ -61,6 +63,7 @@ class ManagementControls:
     channels: ChannelControl
     api_keys: ApiKeyControl
     mapping: MappingControl
+    models: ModelCenterControl
     load_balancing: LoadBalancingControl
     proxy: ProxyControl
     observability: ObservabilityControls
@@ -85,27 +88,42 @@ def build_management_controls(
         updates=UpdateControl(audit_sink=audit_sink),
         images=ImageControl(audit_sink=audit_sink),
         xai_media=XaiMediaControl(audit_sink=audit_sink),
+        antigravity_media=AntigravityMediaControl(audit_sink=audit_sink),
     )
     auxiliary.bind_operations(operations, operation_registry)
     retention = RetentionControl(audit_sink=audit_sink)
     settings = SettingsControl(audit_sink=audit_sink)
+    oauth = OAuthControl(
+        backend=OAuthBackend(settings_control=settings), audit_sink=audit_sink,
+    )
+    channels = ChannelControl(
+        operation_registry=operation_registry,
+        operation_store=operations,
+        audit_sink=audit_sink,
+    )
+    mapping = MappingControl(
+        audit_sink=audit_sink,
+        operation_store=operations,
+    )
+    models = ModelCenterControl(
+        mapping=mapping,
+        oauth=oauth,
+        channels=channels,
+        images=auxiliary.images,
+        xai_media=auxiliary.xai_media,
+        antigravity_media=auxiliary.antigravity_media,
+        operations=operations,
+        audit_sink=audit_sink,
+    )
     return ManagementControls(
         audit_sink=audit_sink,
         operations=operations,
         operation_registry=operation_registry,
-        oauth=OAuthControl(
-            backend=OAuthBackend(settings_control=settings), audit_sink=audit_sink,
-        ),
-        channels=ChannelControl(
-            operation_registry=operation_registry,
-            operation_store=operations,
-            audit_sink=audit_sink,
-        ),
+        oauth=oauth,
+        channels=channels,
         api_keys=ApiKeyControl(audit_sink=audit_sink, provenance_store=state_store),
-        mapping=MappingControl(
-            audit_sink=audit_sink,
-            operation_store=operations,
-        ),
+        mapping=mapping,
+        models=models,
         load_balancing=LoadBalancingControl(audit_sink=audit_sink),
         proxy=ProxyControl(
             audit_sink=audit_sink,

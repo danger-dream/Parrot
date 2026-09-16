@@ -36,8 +36,10 @@ def _number(value):
 
 
 def _num(value):
+    # Presentation only: retain raw precision in billing/quota snapshots so a
+    # positive sub-cent balance never becomes an exhausted account.
     value = _number(value)
-    return f"{value:,.2f}".rstrip("0").rstrip(".") if value is not None else "未知"
+    return f"{value:,.2f}" if value is not None else "未知"
 
 
 def _date(value, *, short=False):

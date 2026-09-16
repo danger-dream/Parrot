@@ -34,9 +34,22 @@ def _time(value, realm: str) -> str | None:
 
 
 def normalize_package(raw: dict, realm: str) -> dict:
-    prefix = "CycleCapacity" if any(key in raw for key in ("CycleCapacitySize", "CycleCapacityRemain", "CycleCapacityUsed")) else "Capacity"
-    capacity, remaining, used = (common.number(raw.get(prefix + suffix)) for suffix in ("Size", "Remain", "Used"))
-    reliable = remaining is not None
+    suffixes = ("Size", "Remain", "Used")
+    prefix = "CycleCapacity" if any(
+        "CycleCapacity" + suffix + precision in raw
+        for suffix in suffixes for precision in ("", "Precise")
+    ) else "Capacity"
+    # The integer fields truncate independently (e.g. 412 + 87 != 500).
+    # Prefer the matching precise field, including explicit zero; only an
+    # ABSENT precise field may fall back to the legacy field. Keep precision
+    # for reconciliation, aggregation and quota decisions; round only in UI.
+    values = [common.number(raw.get(prefix + suffix + "Precise")
+                            if prefix + suffix + "Precise" in raw
+                            else raw.get(prefix + suffix)) for suffix in suffixes]
+    capacity, remaining, used = values
+    invalid_precise = any(prefix + suffix + "Precise" in raw and value is None
+                          for suffix, value in zip(suffixes, values))
+    reliable = remaining is not None and not invalid_precise
     if capacity is not None and remaining is not None:
         reliable = reliable and remaining <= capacity
         if used is None and reliable:

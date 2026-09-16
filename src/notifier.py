@@ -41,13 +41,26 @@ def escape_html(s) -> str:
 
 _PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨"}
 _PROVIDER_CUSTOM_EMOJI = {
-    "claude": "5872779796257184592",
-    "anthropic": "5872779796257184592",
-    "openai": "5861557411784957025",
-    "xai": "5819115571463068721",
-    "cursor": "6062261319426390107",
+    "openai": "6141162084857031383",
+    "claude": "6140995813788099525",
+    "anthropic": "6140995813788099525",
     "antigravity": "6077644693984779782",
+    "cursor": "6062261319426390107",
+    "ollama-cloud": "6138524734419116492",
     "workbuddy": "6120617435214132136",
+    "xai": "6138882363460952713",
+    "kimi": "6140905172798284383",
+    "deepseek": "6138914554240836667",
+    "zhipu": "6140727700454645813",
+    "minimax": "6141114311935796161",
+    "alibaba-bailian": "6138926816372465673",
+    "tencent-cloud": "6140662000339918826",
+    "jd-cloud": "6138855790498291964",
+    "volcengine-ark": "6141018834812806707",
+    "baidu-qianfan": "6138964148228204290",
+    "xiaomi-mimo": "6138428226503975259",
+    "ctyun-xirang": "6138918874977936421",
+    "openrouter": "6140767025175209650",
 }
 _PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
 _PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
@@ -77,9 +90,13 @@ def provider_btn_emoji(provider: str | None) -> str:
 
 def provider_custom_emoji_html(provider: str | None) -> str:
     """HTML custom emoji for notification/message body provider badges."""
-    p = _provider_key(provider)
+    raw = str(provider or "").strip().lower()
+    p = _provider_key(raw)
     table = _telegram_ui_provider_table("providerCustomEmoji")
-    custom_id = str(table.get(p) or _PROVIDER_CUSTOM_EMOJI.get(p) or "").strip()
+    custom_id = str(
+        table.get(raw) or table.get(p)
+        or _PROVIDER_CUSTOM_EMOJI.get(raw) or _PROVIDER_CUSTOM_EMOJI.get(p) or ""
+    ).strip()
     if custom_id:
         fallback = _PROVIDER_CUSTOM_FALLBACK.get(p) or provider_btn_emoji(p) or "•"
         return f'<tg-emoji emoji-id="{escape_html(custom_id)}">{escape_html(fallback)}</tg-emoji>'
@@ -93,7 +110,7 @@ def provider_label(provider: str | None) -> str:
 
 def provider_tag(provider: str | None, *, rich: bool = True) -> str:
     p = _provider_key(provider)
-    icon = provider_custom_emoji_html(p) if rich else provider_btn_emoji(p)
+    icon = provider_custom_emoji_html(provider) if rich else provider_btn_emoji(p)
     label = provider_label(p)
     return f"{icon} {escape_html(label) if rich else label}" if label else icon
 

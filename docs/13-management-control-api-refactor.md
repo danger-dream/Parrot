@@ -1,5 +1,7 @@
 # 13. Management Control / Management API 重构实施与验收
 
+> **后续模型中心变更**：本文保留 v0.31.13 管理层迁移的历史基线。模型导航、显式 model、启停/可见性、别名原子编辑等后续有意变更，以 [模型中心使用与兼容说明](14-model-center.md) 为准；原“TG 零变化”要求不用于否定已认可的模型中心交互，其余无关行为仍须保留。
+
 > 状态：**以功能主线为优先的实施与验收文档**
 > 基线：`feature/management-api`，`b8ba47cc7568aee31fc2587354b5bc14d9773c9a`（v0.31.13）  
 > 范围：Shared Management Control、统一管理身份/授权、Management API Adapter，以及 Telegram Adapter 向共享控制层的等价迁移  

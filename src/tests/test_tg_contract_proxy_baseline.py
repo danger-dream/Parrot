@@ -18,6 +18,8 @@ from src.telegram.menus import proxy_menu as menu
 from src.tests.tg_contract import assert_strict_equal, load_jsonl
 
 
+from src.tests.tg_contract.current import load_current_jsonl
+
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/model_routing.jsonl"
 CASE_NAMES = (
     "TG-PX-01.list-mask-pagination-view-expiry",
@@ -337,7 +339,7 @@ def _actual(case_name: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 def _cases():
-    return load_jsonl(SEGMENT) if SEGMENT.exists() else []
+    return load_current_jsonl(SEGMENT) if SEGMENT.exists() else []
 
 
 EXPECTED = {case["caseId"]: case for case in _cases() if case["capabilityId"].startswith("TG-PX-")}

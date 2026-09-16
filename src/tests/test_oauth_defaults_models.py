@@ -72,19 +72,19 @@ def test_overview_buttons_use_provider_custom_icons():
     assert [b["text"] for b in kb[1]] == ["Antigravity"]
     assert kb[1][0]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("antigravity")
     assert kb[1][0]["icon_custom_emoji_id"] == "6077644693984779782"
-    assert kb[2][0]["callback_data"] == "oa:settings"
+    assert kb[2][0]["callback_data"] == "mc:settings"
 
 
-def test_account_settings_summary_lists_antigravity_catalog():
+def test_account_settings_no_longer_duplicates_antigravity_catalog():
     from src.telegram.menus import oauth_menu
 
     _reset()
     assert oauth_menu._default_models_for_settings("antigravity") == ["gemini-3.7-flash-high"]
     assert "claude-old" not in oauth_menu._default_models_for_settings("antigravity")
     text, _kb = oauth_menu._settings_text_and_kb()
-    ag_at = text.index("Antigravity")
-    assert "1 个" in text[ag_at:ag_at + 40]
-    assert "Antigravity 出图:" in text
+    assert "模型目录、备用模型与媒体设置已统一归位到模型中心" in text
+    assert "Antigravity" not in text
+    assert "Antigravity 出图:" not in text
     acc = {
         "provider": "antigravity",
         "email": "ag@example.com",

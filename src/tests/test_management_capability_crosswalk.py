@@ -58,8 +58,37 @@ def test_all_53_tg_capabilities_map_to_the_complete_production_api_surface():
         PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines()
     )
     actual_operations = _management_operation_ids()
-    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 212
+    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 226
     assert mapped_operations == expected_operations == actual_operations
+
+
+def test_model_center_operations_have_explicit_capability_owners():
+    with CROSSWALK.open(encoding="utf-8", newline="") as handle:
+        rows = {row["capabilityId"]: row for row in csv.DictReader(handle, delimiter="\t")}
+
+    expected = {
+        "TG-MAP-01": {
+            "listModels", "getModel", "setModelState", "updateModelMapping",
+        },
+        "TG-MAP-02": {
+            "patchModelMetadataOverrides", "deleteModelMetadataOverrides",
+        },
+        "TG-XIM-01": {
+            "addXaiMediaModel", "renameXaiMediaModel", "removeXaiMediaModel",
+        },
+        "TG-IMG-01": {
+            "getAntigravityMediaSettings", "updateAntigravityMediaSettings",
+            "addAntigravityMediaModel", "renameAntigravityMediaModel",
+            "removeAntigravityMediaModel",
+        },
+    }
+    assert sum(map(len, expected.values())) == 14
+    for capability_id, operations in expected.items():
+        row = rows[capability_id]
+        assert row["coverage"] == "shared"
+        assert operations <= set(row["operationIds"].split(","))
+    assert "ModelCenterControl" in rows["TG-MAP-01"]["owner"]
+    assert "AntigravityMediaControl" in rows["TG-IMG-01"]["owner"]
 
 
 def test_telegram_main_reads_business_state_through_status_control():

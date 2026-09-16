@@ -8,14 +8,10 @@
 ┌────────────────────────────────┐
 │  🤖 anthropic-proxy 管理面板     │
 ├────────────────────────────────┤
-│       📊 统计汇总              │
-│       📋 最近日志              │
-│       🔐 管理 OAuth            │
-│       📡 管理渠道              │
-│       🔁 模型映射              │
-│       ⚖️ 负载均衡              │
-│       ⚙  系统设置              │
-│       ❓ 帮助                  │
+│  📈 统计汇总   │  📋 最近日志   │
+│  🔐 管理 OAuth │  📡 管理渠道   │
+│  🤖 模型中心   │  ⚖️ 负载均衡   │
+│  🔑 管理 APIKEY│  ⚙ 系统设置    │
 └────────────────────────────────┘
 ```
 
@@ -23,11 +19,61 @@
 - `/start`、`/menu`：打开主菜单
 - `/oauth`：OAuth 管理
 - `/channels`：渠道管理
+- `/models`：模型中心
+- `/mapping`：模型中心（兼容命令）
 - `/keys`：API Key 管理
 - `/stats`：统计
 - `/logs`：日志
 - `/loadbalancing`：负载均衡
+- `/proxy`：代理管理 / 路由规则
 - `/settings`：系统设置
+- `/help`：帮助
+
+另保留未列入 setMyCommands 的兼容窄命令 `/oauth_defaults`，用于 OAuth 备用模型；分派判断必须先于宽 `/oauth`。
+
+### 9.1.1 统一模型中心
+
+主菜单「🤖 模型中心」、`/models` 与兼容命令 `/mapping` 打开同一页面。OAuth 账户详情和 API 渠道详情中的「管理模型」会预选对应公开 `accountId` / `channelId`，并记住来源页；模型中心内仍可切换来源，点「返回」回到进入前的账户或渠道详情。按钮和标题优先使用现有 provider custom emoji helper。
+
+模型中心使用与 Management API 相同 lifecycle graph 上的 `controls.models` 及专业 controls；TG 只组装输入和渲染 DTO，不通过 HTTP 调自己、不直接写配置/状态存储，也不自行计算上下文预算或价格。
+
+#### 查询、分页与选择
+
+- 顶部可切换对话、图片、视频和别名；对话模型支持文本、来源（全部 / OAuth 账户 / API 渠道）及状态（全部 / 启用 / 停用 / 下游隐藏）筛选。
+- 列表每页 8 项，序号按钮按 provider 显示 custom emoji；所有 callback 保持在 Telegram 64 字节上限内。长查询、别名、来源或详情正文另有「内容」翻页，HTML 标签、实体和全部正文均保留，每页不超过 3900 字符及 UTF-16 单位；翻正文页不重新解释业务按钮目标。
+- 对话列表先列有启用来源的可用模型，再列停用 / 无可用来源模型；来源筛选下按当前来源判断，排序在分页前完成，各组内仍按模型名稳定排序。管理页保留不可用项供检查和重新启用，下游 `/v1/models` 不列出没有可用来源的模型。
+- 每项只显示有效状态：可用项用 ✅，不可用项用 🚫 加「停用 / 来源停用 / 账户停用 / 渠道停用 / 无来源」等短说明；只有关闭下游展示时追加「已隐藏」。全局开关和来源细节仍在详情页，不把单独的全局开关开误画成实际可用。
+- 多选会跨页保留选择；「全选结果」针对当前完整筛选结果，「反选」和「清空」不只作用于当前页。空选时状态按钮不写入。
+- 「状态」与「对下游」按钮原地生效，不增加确认页。混合值第一次统一为启用 / 显示。按钮渲染时冻结目标布尔值和 revision；重复或旧 callback 不会重新读取后反向翻转，版本变化会要求刷新。若 control 返回 `SAVED_RELOAD_UNCONFIRMED`，明确提示「配置已保存，运行时重载未确认；请刷新状态，勿重放旧操作」，不显示普通成功或建议重试旧写。
+- 来源筛选只限制查询及所选集合。启停在来源页只作用于当前来源；「对下游隐藏 / 展示」始终是全局发现语义（隐藏后不出现在 `/v1/models`，仍可按名称调用），不会带来源 scope。
+
+#### 详情、别名与元数据
+
+普通详情直接显示 control 返回的有效容量、能力与价格，不显示 account-native / catalog-snapshot / native-hard 等内部溯源尾注；未知或空字段不占行，真实 `false` / `0` 不隐藏。来源用服务方及可识别账户 / 渠道名称，分别显示模型、账户 / 渠道的启用状态和当前可路由状态；无 `providerId` 的 API 来源使用中性「API 渠道」，不从协议猜品牌。
+
+别名页每页 8 项；新增或编辑时选择一个真实模型，保存只调用一次原子 mapping mutation，不改真实模型、Key 白名单、负载均衡、压缩设置或历史元数据。取消当前名称输入会回到原草稿；返回别名列表、切换页面或命令离开编辑则撤销整条草稿，其旧保存 / 删除按钮失效。
+
+元数据可在「模型通用值」或某个 OAuth / API 来源层覆盖。未单独设置的字段继续继承；`0`、`false` 和空数组都是明确手工值，不等同于继承。16 项字段各有独立「恢复继承」入口，只 unset 当前字段，不改变其他覆盖；列表输入 `-` 仍表示明确空数组。「全部恢复继承」删除所选层的覆盖；「校正目录匹配」只修正 catalog target，不改真实模型名称。16 个字段分三组：
+
+- 容量：`contextWindow`、`maxInputTokens`、`maxOutputTokens`、`compactTriggerTokens`；
+- 能力：`vision`、`toolCall`、`structuredOutput`、`reasoningEfforts`、`serviceTiers`、`knowledgeCutoff`；
+- 价格：`inputPricePer1M`、`outputPricePer1M`、`cacheReadPricePer1M`、`cacheWritePricePer1M`、`longContextInputPricePer1M`、`longContextOutputPricePer1M`，单位为美元 / 百万 Token。
+
+可同步单项或所选集合的元数据：按钮渲染时即冻结实际模型 / 来源 targets、mapping 控制域 revision 和返回上下文，点击旧按钮不改用当前选择或新 revision；版本冲突要求刷新。也可执行全量元数据同步；来源筛选页另有「同步上游」用于刷新该来源的模型目录。全量元数据同步刷新公共目录并重新匹配，但保留人工匹配、字段手工值和来源单独匹配。长任务通过 operation 页面查询状态。
+
+#### 五类公共模型设置
+
+「模型设置」只包含五个真实目的地：
+
+1. **压缩模型**：从对话模型目录选择，显示目录匹配和 `compactTriggerTokens`；只用于内部上下文压缩，不替代下游请求必填的 `model`。
+2. **OAuth 备用模型**：按 provider 维护备用候选；旧 `/oauth_defaults` 仍可进入。
+3. **同步元数据**：进入公共目录全量同步。
+4. **图片设置**：共享图片接口开关、共享媒体缓存、目录、保留天数和空间上限；下钻 GPT 图片管线、Grok 图片模型、Antigravity 图片模型。
+5. **视频设置**：Grok 视频模型、任务账号关联时长和媒体请求超时。
+
+GPT 图片页把主模型、`image_generation` 工具模型和账号参与开关分开，账号参与只影响 GPT 图片。Grok 图片与视频是两个独立列表：单项新增 / 改名 / 移除和「替换整组」是不同操作，单项操作不重写兄弟项；xAI 每组最多 50 项、每项 128 字符。任务关联时长支持 `s/m/h/d`，请求超时只支持 `s/m/h`。Antigravity 全局图片列表可编辑（最多 80 项、每项 80 字符），OAuth 账户专属图片模型只读，修改全局列表不会覆盖账户专属项。
+
+媒体 TG 页面已接入 production lifecycle 的同一 `controls.models`：真实 TG 单项新增后 Management API 可立即查询，API 单项 / 运行参数修改后 TG 可直接读到，TG「批量编辑」则按整组替换；新建第二套完整 control graph 后仍能读到最终 xAI / Antigravity 设置。该贯通使用真实 controls 与临时隔离持久化，不以 fixture 或 TG→HTTP 自调用代替；逐项命令与结果见本轮 implementation record。
 
 ## 9.2 管理 OAuth
 
@@ -76,6 +122,8 @@
 ║ 💰 额外额度: $0.00 / $50.00
 ╚══════════════════════════════╝
 [ 🔄 刷新 Token  ][ 📊 刷新用量/重置卡 ]
+[ <provider> 管理模型 ][ 🚦 并发上限 ]
+[ 🧹 清模型故障  ][ 🔗 清亲和绑定 ]
 [ 🚫 禁用       ][ 🗑 删除     ]
 [ ◀ 返回 OAuth 菜单              ]
 ```
@@ -83,7 +131,9 @@
 操作：
 - 「刷新 Token」→ 调 `force_refresh(email)` → 显示新过期时间
 - 「刷新用量/重置卡」→ 调 `fetch_usage(email)`；OpenAI 账号同时拉取官方重置卡明细 → 更新显示
-- 「禁用」→ 弹二次确认 → `set_enabled(email, False, reason="user")`
+- 「管理模型」→ 以公开 `accountId` 预选当前 OAuth 来源，进入统一模型中心
+- 「禁用 / 启用」→ 直接切换当前账户状态；按钮依据当前状态变更
+- 「清模型故障 / 清亲和绑定」和并发上限继续保留原专业控制
 - 「删除」→ 弹二次确认 → `delete_account(email)`
 
 禁用状态下显示按钮换成「启用」。
@@ -129,14 +179,11 @@
 
 对每个 OAuth 账户刷新用量；OpenAI 账号会同时刷新官方重置卡次数与卡片明细，并写入同一份 quota cache。完成后刷新列表视图。
 
-### 9.2.5 媒体设置
+### 9.2.5 账户设置与模型入口归位
 
-「⚙️ 账户设置」中的媒体入口分为两条，避免同名图片接口的配置混淆：
+OAuth「⚙️ 账户设置」中的进度条按钮使用固定「📊」图标和当前「开启 / 关闭」文字状态，原地切换及正文进度条效果不变。配额监控仍进入原设置子页，原按钮位置、间隔和阈值入口不变。
 
-- 「🖼 GPT 图片设置」：管理 GPT/Codex 图片模型、缓存与图片账号禁用列表；
-- 「🎨 Grok Imagine」：管理 `xaiOAuth.imageModels`、`videoModels`、`videoJobTtlSeconds` 和 `mediaRequestTimeoutSeconds`。
-
-Grok Imagine 页面同时展示模型路由：已配置的 `grok-imagine-image*` 走 xAI OAuth，其他图片模型仍走 GPT/Codex。修改后通过 `config.update()` 原子保存并热加载。两个设置页均提供「🎞 查看多媒体日志」入口；统计、账号排行和任务详情不再散落在配置页。
+OAuth「⚙️ 账户设置」保留 CCH 模式、用量显示方式、黑白进度条和配额监控等非模型设置，不再重复承载模型目录、备用模型或媒体配置。OAuth 备用模型、图片和视频均从统一模型中心的「模型设置」进入；账户详情的「管理模型」则直接进入预选该账户来源的模型列表。OAuth 刷新、用量、官方重置卡、并发、清故障、亲和、启停、删除、登录 / 导入等既有能力继续保留。
 
 ## 9.3 渠道管理
 
@@ -192,6 +239,7 @@ Grok Imagine 页面同时展示模型路由：已配置的 `grok-imagine-image*`
 ║ 
 ║ 亲和绑定: 3 个会话
 ╚═══════════════════════════════╝
+[ <provider> 管理模型            ]
 [ 🧪 测试模型 ][ ✏ 编辑       ]
 [ 🧹 清错误  ][ 🔗 清亲和绑定 ]
 [ 🚫 禁用    ][ 🗑 删除       ]
@@ -199,6 +247,7 @@ Grok Imagine 页面同时展示模型路由：已配置的 `grok-imagine-image*`
 ```
 
 操作：
+- 「管理模型」→ 以公开 `channelId` 预选当前 API 来源，进入统一模型中心；返回时回到当前渠道详情
 - 「测试模型」→ 打开测试面板（见 9.3.4）
 - 「编辑」→ 修改名称/URL/Key/模型/CC 伪装开关（见 9.3.5）
 - 「清错误」→ `cooldown.clear(channel_key, None)` 清除该渠道所有模型冷却
@@ -621,25 +670,22 @@ if not _is_admin(chat_id):
     send(chat_id, f"⛔ 无权限。你的 Chat ID: {chat_id}")
     return
 ```
-`_is_admin` 从 `config.telegram.adminIds` 取。
+`_is_admin` 从 `config.telegram.adminIds` 取。模型中心不会只信 `bind_telegram_actor()` 生成的 context：每次 callback 和每次等待输入提交都会再次检查管理员 allow-list。
 
 ### user_state TTL
 
-所有"等待用户输入"的状态写入 `_user_states`（dict），TTL 600s，每 50 轮 poll 清理一次。
+所有"等待用户输入"的状态写入 `_user_states`（dict），TTL 600s，每 50 轮 poll 清理一次。模型中心输入支持 `/cancel`、`cancel` 和「取消」；取消、过期输入、其他 chat 的 token 或冲突 revision 都不会写业务状态。真实 Bot callback 分发在主菜单等提前返回之前即撤销 MC 待写输入和 generation；命令离开 MC 同样撤销，之后普通文本不能提交旧编辑。这里只清 MC 状态，不改变其他历史菜单自己的输入语义。
 
-### 长消息截断
+### 长消息限制
 
-TG 单消息 4096 字符限制。所有菜单消息末尾加：
-```python
-if len(text) > 3900:
-    text = text[:3900] + "\n\n... (已截断)"
-```
+TG 单消息上限 4096 字符。模型中心使用实体安全的 HTML 正文分页，拆页时闭合并重开格式标签，保留全部可访问内容和原业务键盘；不能对生成后的 HTML 简单切字符串。历史菜单的各自分页 / 检查器 / 导出策略保持不变，本保证不泛化为对所有旧菜单的重写。
 
 ### 按钮回调数据格式
 
 统一 `<action>:<param1>:<param2>`，长度 ≤ 64 字节。常见：
 - `menu_main`
 - `menu_oauth`、`menu_channel`、`menu_apikey`、`menu_stats`、`menu_logs`、`menu_settings`
+- `mc:*`：模型中心固定动作；长参数、目标布尔值和 revision 存在 chat 绑定的短期冻结 action 中，callback 只携带短 token
 - `oa_view:<email>`、`oa_refresh:<email>`、`oa_del:<email>`、`oa_del_confirm:<email>`、`oa_login`、`oa_set_json`
 - `ch_view:<name>`、`ch_edit:<name>`、`ch_del:<name>`、`ch_test:<name>`、`ch_test_model:<name>:<model>`、`ch_test_all:<name>`
 - `wiz_chan_start`、`wiz_chan_step2`、`wiz_chan_step3`、`wiz_chan_step4`、`wiz_chan_test_model:<model>`、`wiz_chan_test_all`、`wiz_chan_skip_test`、`wiz_chan_save`、`wiz_chan_cancel`、`wiz_chan_back`
@@ -649,7 +695,7 @@ if len(text) > 3900:
 - `sys_timeouts`、`sys_errwin`、`sys_scoring`、`sys_affinity`、`sys_cch`、`sys_blacklist`、`sys_chansel`
 - `back_main`
 
-当名称/模型/email 含冒号或长度超标时，callback_data 中使用 hash 短码（4 字节），服务端用一个短码表映射回实际名。避免直接拼名称导致截断或歧义。
+当名称/模型/email 含冒号或长度超标时，callback_data 中使用 hash 短码（4 字节），服务端用一个短码表映射回实际名。避免直接拼名称导致截断或歧义。旧 `oam:*`、Cursor 模型、`map:*`、`img:*`、`xim:*` callback 由兼容层安全重定向到当前模型中心对应页，不重放旧写意图；OAM 列表格式和带 modelRef / 勾选序号的单项格式分别解析，保留原 accountPage / filter，不能可靠解析时明确提示过期；`/oauth_defaults` 的窄命令判断始终先于宽 `/oauth`。
 
 ### 🌡 剔除 temperature
 

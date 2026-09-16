@@ -15,7 +15,11 @@ from src.management_api.routers.updates import router as updates_router
 from src.management_auth import AuthMethod
 from src.management_control import BoundedAuditSink, OperationRegistry, OperationStore
 from src.management_control.auxiliary import AuxiliaryControls
-from src.management_control.auxiliary.media import ImageControl, XaiMediaControl
+from src.management_control.auxiliary.media import (
+    AntigravityMediaControl,
+    ImageControl,
+    XaiMediaControl,
+)
 from src.management_control.auxiliary.status_alerts import StatusAlertControl
 from src.management_control.auxiliary.translation import (
     TRANSLATION_LANGUAGES,
@@ -332,6 +336,7 @@ class AuxiliaryFixture:
             },
             "images": {},
             "xaiOAuth": {},
+            "antigravityOAuth": {},
         })
         self.translation_gateway = FakeTranslation(self.config)
         self.status_gateway = FakeStatus()
@@ -367,6 +372,10 @@ class AuxiliaryFixture:
             xai_media=XaiMediaControl(
                 config_gateway=self.config,
                 media_gateway=self.media_gateway,
+                audit_sink=self.audit,
+            ),
+            antigravity_media=AntigravityMediaControl(
+                config_gateway=self.config,
                 audit_sink=self.audit,
             ),
         )

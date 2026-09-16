@@ -6,7 +6,6 @@ import asyncio
 import copy
 import hashlib
 import json
-from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -80,7 +79,10 @@ _PROTOCOLS = {item.value for item in ChannelProtocol}
 _HEALTH_ORDER = {value: index for index, value in enumerate(ChannelHealth)}
 
 
-class ChannelControl:
+from .operation_workers import ChannelOperationWorkers
+
+
+class ChannelControl(ChannelOperationWorkers):
     """One business implementation shared by Telegram and Management API."""
 
     def __init__(
@@ -685,6 +687,30 @@ class ChannelControl:
         self._audit(context, "channel.errors.clear", channel_id, "succeeded")
         return ActionResult(affected=before)
 
+    def clear_model_errors(
+        self,
+        context: ManagementContext,
+        channel_id: str,
+        model_id: str,
+    ) -> ActionResult:
+        """Clear cooldown for one public model in one API channel only."""
+        self._authorize(context, Capability.WRITE)
+        channel = self._domain_channel(channel_id)
+        requested = str(model_id or "").strip()
+        outbound = next((
+            model.real for model in channel.models
+            if (model.alias or model.real) == requested
+        ), None)
+        if not outbound:
+            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+        before = sum(
+            1 for row in cooldown.active_entries()
+            if row.get("channel_key") == channel_id and row.get("model") == outbound
+        )
+        cooldown.clear(channel_id, model=outbound)
+        self._audit(context, "channel.model_errors.clear", f"{channel_id}:{requested}", "succeeded")
+        return ActionResult(affected=before)
+
     def clear_all_errors(self, context: ManagementContext) -> ActionResult:
         self._authorize(context, Capability.WRITE)
         before = len(cooldown.active_entries())
@@ -898,101 +924,3 @@ class ChannelControl:
         return operations.create(
             context, kind=_USAGE_KIND, payload={"channel_id": channel_id}, cancellable=False,
         )
-
-    def _retain_task(self, operation_id: str, coroutine: Any) -> None:
-        assert self._operation_store is not None
-        self._operation_store.create_task(operation_id, coroutine)
-
-    def _start_discovery_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        self._retain_task(
-            operation_id,
-            self._run_discovery_operation(operation_id, context, payload),
-        )
-
-    async def _run_discovery_operation(
-        self, operation_id: str, context: ManagementContext, command: DiscoveryCommand
-    ) -> None:
-        assert self._operation_store is not None
-        self._operation_store.mark_running(operation_id)
-        try:
-            result = await self.discover_model_ids(context, command)
-            if not result.models:
-                self._operation_store.fail(
-                    operation_id, code=ManagementErrorCode.UPSTREAM_ERROR,
-                    message=ManagementErrorCode.UPSTREAM_ERROR.value, retryable=result.retry_available,
-                )
-            else:
-                self._operation_store.succeed(operation_id, asdict(result))
-        except ManagementError as exc:
-            self._operation_store.fail(
-                operation_id, code=exc.code, message=exc.code.value, retryable=exc.retryable
-            )
-        except Exception:
-            self._operation_store.fail(
-                operation_id, code=ManagementErrorCode.UPSTREAM_ERROR,
-                message=ManagementErrorCode.UPSTREAM_ERROR.value, retryable=True,
-            )
-
-    def _start_draft_probe_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        self._retain_task(
-            operation_id,
-            self._run_draft_probe_operation(operation_id, context, payload),
-        )
-
-    async def _run_draft_probe_operation(
-        self, operation_id: str, context: ManagementContext, command: DraftProbeCommand
-    ) -> None:
-        assert self._operation_store is not None
-        self._operation_store.mark_running(operation_id)
-        try:
-            result = await self.probe_draft(context, command)
-            public = asdict(result)
-            public["reason"] = None if result.ok else "PROBE_FAILED"
-            self._operation_store.succeed(operation_id, public)
-        except ManagementError as exc:
-            self._operation_store.fail(operation_id, code=exc.code, message=exc.code.value)
-        except Exception:
-            self._operation_store.fail(
-                operation_id, code=ManagementErrorCode.UPSTREAM_ERROR,
-                message=ManagementErrorCode.UPSTREAM_ERROR.value, retryable=True,
-            )
-
-    def _start_diagnostic_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        self._retain_task(
-            operation_id,
-            self._run_diagnostic_operation(operation_id, context, payload),
-        )
-
-    async def _run_diagnostic_operation(
-        self, operation_id: str, context: ManagementContext, payload: dict[str, str]
-    ) -> None:
-        assert self._operation_store is not None
-        self._operation_store.mark_running(operation_id)
-        try:
-            result = await self.probe_existing(
-                context, payload["channel_id"], payload["model"]
-            )
-            public = asdict(result)
-            public["reason"] = None if result.ok else "PROBE_FAILED"
-            self._operation_store.succeed(operation_id, public)
-        except ManagementError as exc:
-            self._operation_store.fail(operation_id, code=exc.code, message=exc.code.value)
-        except Exception:
-            self._operation_store.fail(
-                operation_id, code=ManagementErrorCode.UPSTREAM_ERROR,
-                message=ManagementErrorCode.UPSTREAM_ERROR.value, retryable=True,
-            )
-
-    def _start_usage_owner(self, operation_id: str, context: ManagementContext, payload: Any) -> None:
-        assert self._operation_store is not None
-        self._operation_store.mark_running(operation_id)
-        try:
-            result = self.schedule_provider_usage(context, payload["channel_id"], force=True)
-            self._operation_store.succeed(operation_id, asdict(result))
-        except ManagementError as exc:
-            self._operation_store.fail(operation_id, code=exc.code, message=exc.code.value)
-        except Exception:
-            self._operation_store.fail(
-                operation_id, code=ManagementErrorCode.DEPENDENCY_UNAVAILABLE,
-                message=ManagementErrorCode.DEPENDENCY_UNAVAILABLE.value, retryable=True,
-            )

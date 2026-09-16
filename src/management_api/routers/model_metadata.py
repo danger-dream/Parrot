@@ -12,7 +12,9 @@ from src.management_control.mapping import (
     CatalogRecord,
     InventoryRecord,
     MappingControl,
+    MetadataOverridePatch,
     MetadataRecord,
+    MetadataSyncTarget,
 )
 
 from ..dependencies import (
@@ -43,6 +45,7 @@ from ..schemas.model_metadata import (
     ModelMetadataListEnvelope,
     MetadataPricing,
     MetadataValues,
+    PatchMetadataOverridesRequest,
     PutMetadataBindingRequest,
 )
 
@@ -62,7 +65,11 @@ _COMMON_ERRORS = (
     ManagementErrorCode.SERVICE_NOT_READY,
 )
 _RESOURCE_ERRORS = (*_COMMON_ERRORS, ManagementErrorCode.RESOURCE_NOT_FOUND)
-_MUTATION_ERRORS = (*_RESOURCE_ERRORS, ManagementErrorCode.REVISION_CONFLICT)
+_MUTATION_ERRORS = (
+    *_RESOURCE_ERRORS,
+    ManagementErrorCode.CONFIRMATION_REQUIRED,
+    ManagementErrorCode.REVISION_CONFLICT,
+)
 
 
 def get_metadata_control(
@@ -91,20 +98,29 @@ def _pricing(raw: Mapping[str, Any]) -> MetadataPricing | None:
         output=cost.get("output"),
         cacheRead=cost.get("cache_read") if "cache_read" in cost else cost.get("cacheRead"),
         cacheWrite=cost.get("cache_write") if "cache_write" in cost else cost.get("cacheWrite"),
+        longContextInput=(cost.get("context_over_200k") or {}).get("input") if isinstance(cost.get("context_over_200k"), Mapping) else cost.get("longContextInput"),
+        longContextOutput=(cost.get("context_over_200k") or {}).get("output") if isinstance(cost.get("context_over_200k"), Mapping) else cost.get("longContextOutput"),
     )
 
 
 def _values(raw: Mapping[str, Any]) -> MetadataValues:
+    limit = raw.get("limit") if isinstance(raw.get("limit"), Mapping) else {}
+    modalities = raw.get("modalities") if isinstance(raw.get("modalities"), Mapping) else {}
     return MetadataValues(
-        contextWindow=raw.get("contextWindow") or raw.get("limit", {}).get("context") if isinstance(raw.get("limit"), Mapping) else raw.get("contextWindow"),
+        contextWindow=raw.get("contextWindow") if "contextWindow" in raw else limit.get("context"),
         contextWindowMaxMode=raw.get("contextWindowMaxMode"),
-        maxOutputTokens=raw.get("maxOutputTokens") or raw.get("limit", {}).get("output") if isinstance(raw.get("limit"), Mapping) else raw.get("maxOutputTokens"),
+        maxInputTokens=raw.get("maxInputTokens") if "maxInputTokens" in raw else limit.get("input"),
+        maxOutputTokens=raw.get("maxOutputTokens") if "maxOutputTokens" in raw else limit.get("output"),
         compactTriggerTokens=raw.get("compactTriggerTokens"),
         vision=raw.get("vision") if isinstance(raw.get("vision"), bool) else None,
+        toolCall=raw.get("toolCall") if isinstance(raw.get("toolCall"), bool) else None,
+        structuredOutput=raw.get("structuredOutput") if isinstance(raw.get("structuredOutput"), bool) else None,
         reasoningEfforts=list(raw.get("reasoningEfforts") or []),
+        serviceTiers=list(raw.get("serviceTiers") or []),
+        knowledgeCutoff=raw.get("knowledgeCutoff") or None,
         defaultReasoningEffort=raw.get("defaultReasoningEffort"),
-        inputModalities=list(raw.get("inputModalities") or raw.get("modalities", {}).get("input") or []) if isinstance(raw.get("modalities"), Mapping) else list(raw.get("inputModalities") or []),
-        outputModalities=list(raw.get("outputModalities") or raw.get("modalities", {}).get("output") or []) if isinstance(raw.get("modalities"), Mapping) else list(raw.get("outputModalities") or []),
+        inputModalities=list(raw.get("inputModalities") or modalities.get("input") or []),
+        outputModalities=list(raw.get("outputModalities") or modalities.get("output") or []),
         cost=_pricing(raw),
     )
 
@@ -122,6 +138,10 @@ def _metadata(item: MetadataRecord) -> ModelMetadataData:
         authority=item.authority,
         effective=_values(item.effective),
         raw=_values(item.raw),
+        valueSource=dict(item.value_source),
+        constrainedBy={key: list(value) for key, value in item.constrained_by.items()},
+        commonOverride=dict(item.common_override),
+        sourceOverride=dict(item.source_override),
         revision=item.revision,
     )
 
@@ -229,16 +249,89 @@ def sync_model_metadata(
     request: Request,
     context: WriteContext,
     control: Annotated[MappingControl, Depends(get_metadata_control)],
+    if_match: IfMatch = None,
 ) -> MetadataOperationEnvelope:
     reject_unknown_query_parameters(request)
+    selected = body.mode or body.scope
+    mode = (selected.value if selected is not None else "full")
+    targets = tuple(
+        MetadataSyncTarget(model_id=item.modelId, source=item.source)
+        for item in body.targets
+    )
     operation = control.start_metadata_sync(
         context,
-        scope=body.scope.value,
+        mode=mode,
+        targets=targets,
+        source=body.source,
+        refresh_catalog=body.refreshCatalog,
+        expected_revision=if_match,
+        scope=mode if mode in {"provider", "account", "channel"} else None,
         provider_id=body.providerId,
         account_id=body.accountId,
         channel_id=body.channelId,
     )
     return MetadataOperationEnvelope(data=_operation(operation), meta=_meta(request))
+
+
+@router.patch(
+    "/model-metadata/{modelId:path}/overrides",
+    operation_id="patchModelMetadataOverrides",
+    tags=["management-model-metadata"],
+    response_model=ModelMetadataEnvelope,
+    responses={**_success(200, _METADATA_EXAMPLE), **management_error_responses(*_MUTATION_ERRORS)},
+)
+def patch_model_metadata_overrides(
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
+    body: PatchMetadataOverridesRequest,
+    request: Request,
+    context: WriteContext,
+    control: Annotated[MappingControl, Depends(get_metadata_control)],
+    if_match: IfMatch = None,
+) -> ModelMetadataEnvelope:
+    reject_unknown_query_parameters(request)
+    item = control.patch_metadata_overrides(
+        context,
+        model_id,
+        scope=body.scope.value,
+        account_id=body.accountId,
+        channel_id=body.channelId,
+        outbound_model=body.outboundModel,
+        patch=MetadataOverridePatch(
+            set_fields=body.set.model_dump(exclude_unset=True),
+            unset_fields=tuple(body.unset),
+        ),
+        expected_revision=if_match,
+    )
+    return ModelMetadataEnvelope(data=_metadata(item), meta=_meta(request))
+
+
+@router.delete(
+    "/model-metadata/{modelId:path}/overrides",
+    operation_id="deleteModelMetadataOverrides",
+    tags=["management-model-metadata"],
+    status_code=204,
+    responses={204: {"description": "Override layer deleted"}, **management_error_responses(*_MUTATION_ERRORS)},
+)
+def delete_model_metadata_overrides(
+    model_id: Annotated[str, Path(alias="modelId", max_length=500)],
+    request: Request,
+    context: DestroyContext,
+    control: Annotated[MappingControl, Depends(get_metadata_control)],
+    scope: MetadataScope = MetadataScope.GLOBAL,
+    account_id: Annotated[str | None, Query(alias="accountId", min_length=1, max_length=500)] = None,
+    channel_id: Annotated[str | None, Query(alias="channelId", min_length=1, max_length=500)] = None,
+    if_match: IfMatch = None,
+) -> Response:
+    reject_unknown_query_parameters(request, {"scope", "accountId", "channelId"})
+    control.delete_metadata_overrides(
+        context,
+        model_id,
+        scope=scope.value,
+        account_id=account_id,
+        channel_id=channel_id,
+        expected_revision=if_match,
+    )
+    return Response(status_code=204)
 
 
 @router.put(

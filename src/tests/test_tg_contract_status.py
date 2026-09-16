@@ -1,4 +1,4 @@
-"""Executable, byte-strict v0.31.13 traces for TG-STATUS-01."""
+"""Executable, byte-strict TG-STATUS-01 archive plus current deltas."""
 
 from __future__ import annotations
 
@@ -17,7 +17,26 @@ from src.tests.tg_contract import TraceCapture, assert_strict_equal, load_jsonl
 
 
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/main_status.jsonl"
-CASES = load_jsonl(SEGMENT)
+CURRENT_OVERRIDES = (
+    Path(__file__).parent
+    / "fixtures/tg_contract/model-center-2026-09-13/overrides/main_status.jsonl"
+)
+
+
+def _current_cases() -> list[dict[str, Any]]:
+    archived = load_jsonl(SEGMENT)
+    overrides = load_jsonl(CURRENT_OVERRIDES) if CURRENT_OVERRIDES.exists() else []
+    archived_ids = {case["caseId"] for case in archived}
+    override_map = {case["caseId"]: case for case in overrides}
+    if len(override_map) != len(overrides):
+        raise AssertionError("duplicate main-status contract override caseId")
+    unknown = set(override_map) - archived_ids
+    if unknown:
+        raise AssertionError(f"unknown main-status contract overrides: {sorted(unknown)}")
+    return [override_map.get(case["caseId"], case) for case in archived]
+
+
+CASES = _current_cases()
 STATUS_CASES = [case for case in CASES if case["capabilityId"] == "TG-STATUS-01"]
 
 

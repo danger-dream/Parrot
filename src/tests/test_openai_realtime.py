@@ -575,6 +575,31 @@ async def test_realtime_ws_rejects_invalid_api_key_before_upstream(monkeypatch, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_model", [None, "", "   "])
+async def test_realtime_ws_new_session_requires_model_before_channel_or_upstream(
+    monkeypatch, m, raw_model,
+):
+    _setup(m)
+    calls = 0
+
+    async def unexpected(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("missing model must not select/connect upstream")
+
+    monkeypatch.setattr(m["realtime"], "_acquire_first_available", unexpected)
+    monkeypatch.setattr(m["realtime"], "_connect_realtime_upstream", unexpected)
+    params = {"intent": "quicksilver"}
+    if raw_model is not None:
+        params["model"] = raw_model
+    ws = FakeRealtimeWebSocket(query_params=params, query_string=b"intent=quicksilver")
+    await m["realtime"].handle_realtime_ws(ws, path="/v1/realtime")
+    assert ws.accepted is False
+    assert ws.close_calls == [(4400, "model is required")]
+    assert calls == 0
+
+
+@pytest.mark.asyncio
 async def test_realtime_ws_rejects_disallowed_model_before_upstream(monkeypatch, m):
     cfg = _setup(m)
     cfg["apiKeys"]["realtime-key"]["allowedModels"] = ["allowed-realtime-model"]
@@ -650,6 +675,47 @@ async def test_realtime_call_keeps_backend_body_and_binds_sideband_account(monke
     assert bound_channel is channel
     assert binding is not None
     assert binding.model == "gpt-realtime-1.5"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_model", [None, "", "   ", 9])
+async def test_realtime_call_requires_session_model_before_channel_or_upstream(
+    monkeypatch, m, invalid_model,
+):
+    _setup(m)
+    calls = 0
+
+    async def unexpected(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid session.model must not select upstream")
+
+    monkeypatch.setattr(m["realtime"], "_acquire_first_available", unexpected)
+    body = json.dumps({"sdp": "offer", "session": {"model": invalid_model}}).encode()
+    response = await m["realtime"].handle_realtime_call(_request_for_call(body))
+    assert response.status_code == 400
+    payload = json.loads(response.body)
+    assert payload["error"].get("param") == "session.model"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_realtime_call_requires_session_object_and_model_field(monkeypatch, m):
+    _setup(m)
+    calls = 0
+
+    async def unexpected(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("missing session.model must not select upstream")
+
+    monkeypatch.setattr(m["realtime"], "_acquire_first_available", unexpected)
+    for payload in ({"sdp": "offer"}, {"sdp": "offer", "session": {}}, []):
+        response = await m["realtime"].handle_realtime_call(
+            _request_for_call(json.dumps(payload).encode())
+        )
+        assert response.status_code == 400
+    assert calls == 0
 
 
 @pytest.mark.asyncio

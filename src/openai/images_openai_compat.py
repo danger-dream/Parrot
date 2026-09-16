@@ -30,7 +30,7 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .. import apikey_limiter, auth, errors
+from .. import apikey_limiter, auth, errors, model_validation
 from ..antigravity import images as antigravity_images
 from ..xai import imagine as xai_imagine
 from .images_simple import (
@@ -193,7 +193,7 @@ async def _parse_multipart(
         raise ValueError("invalid prompt: must be a string")
     parsed.prompt = prompt_val.strip()
 
-    parsed.model = _str_or_none(form.get("model"))
+    parsed.model = model_validation.require_explicit_model(form)
     parsed.size = _str_or_none(form.get("size"))
     rf = _str_or_none(form.get("response_format"))
     if rf is not None:
@@ -268,7 +268,7 @@ async def _parse_json(
         raise ValueError("invalid prompt: must be a string")
     parsed.prompt = (raw_prompt or "").strip()
 
-    parsed.model = _str_or_none(body.get("model"))
+    parsed.model = model_validation.require_explicit_model(body)
     parsed.size = _str_or_none(body.get("size"))
     rf = _str_or_none(body.get("response_format"))
     if rf is not None:
@@ -415,9 +415,13 @@ async def _run_handler(request: Request, *, action: str) -> JSONResponse:
 
     try:
         parsed = await _parse_body(request, action=action, cfg=cfg)
+    except model_validation.ExplicitModelError as exc:
+        return _bad_request(exc.message, param=exc.param)
     except ValueError as exc:
         return _bad_request(str(exc))
 
+    if not parsed.model:
+        return _bad_request("model is required", param="model")
     if not parsed.prompt:
         return _bad_request("prompt is required", param="prompt")
 

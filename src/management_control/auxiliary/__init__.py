@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from threading import RLock
 
 from ..operations import OperationRegistry, OperationStore
-from .media import ImageControl, XaiMediaControl
+from .media import (
+    AntigravityMediaControl,
+    AntigravityMediaSettings,
+    ImageControl,
+    MediaModelMutationResult,
+    XaiMediaControl,
+)
 from .status_alerts import StatusAlertControl
 from .translation import TranslationControl
 from .updates import UpdateControl
@@ -22,6 +28,7 @@ class AuxiliaryControls:
     updates: UpdateControl
     images: ImageControl
     xai_media: XaiMediaControl
+    antigravity_media: AntigravityMediaControl
 
     def bind_operations(self, store: OperationStore, registry: OperationRegistry) -> None:
         with _binding_lock:
@@ -44,13 +51,17 @@ def get_auxiliary_controls() -> AuxiliaryControls:
                 updates=UpdateControl(),
                 images=ImageControl(),
                 xai_media=XaiMediaControl(),
+                antigravity_media=AntigravityMediaControl(),
             )
         return _controls
 
 
 __all__ = [
+    "AntigravityMediaControl",
+    "AntigravityMediaSettings",
     "AuxiliaryControls",
     "ImageControl",
+    "MediaModelMutationResult",
     "StatusAlertControl",
     "TranslationControl",
     "UpdateControl",

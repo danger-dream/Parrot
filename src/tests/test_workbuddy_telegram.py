@@ -92,15 +92,21 @@ def test_list_and_detail_keep_baseline_order_stats_and_fixed_buttons(tg, monkeyp
     assert 'emoji-id="6120617435214132136"' in text
     assert buttons(kb)[0]["icon_custom_emoji_id"] == "6120617435214132136"
     assert "Token:" not in text and "UID" not in text and "协议" not in text and "fixture-at" not in text
-    detail, kb = menu._detail_text_and_kb(key, refresh_quota=False, model_stats=[dict(stats, final_model="glm-fixture")])
+    detail, kb = menu._detail_text_and_kb(
+        key, refresh_quota=False, actor_chat_id=42,
+        model_stats=[dict(stats, final_model="glm-fixture")],
+    )
     assert ui.provider_tag("workbuddy") in detail
     assert "总体: 123 次 · ✅ 120 · ❌ 3" in detail
     assert "按模型:" in detail and "glm-fixture" in detail and "缓存" in detail and "峰值" in detail and "累计金额" in detail
     assert "📦 资源包: 1 个" in detail and "🎁 签到: 今日未签到" in detail
     assert [[b["text"] for b in row] for row in kb["inline_keyboard"]][:6] == [
-        ["🔄 刷新 Token", "📊 刷新额度"], ["🧬 管理模型", "🚦 并发上限"],
+        ["🔄 刷新 Token", "📊 刷新额度"], ["管理模型", "🚦 并发上限"],
         ["🧹 清模型故障", "🔗 清亲和绑定"], ["⏸ 停用账户", "🗑 删除账户"],
         ["🎁 签到/领额度"], ["🏠 主菜单", "◀ 返回列表"]]
+    manage = kb["inline_keyboard"][1][0]
+    assert manage["callback_data"].startswith("mc:src:")
+    assert manage["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("workbuddy")
     assert "包 A" in detail and "资源包到期:" in detail
     assert not any(b["text"] == "📦 积分明细" for b in buttons(kb))
     assert ledger["calls"] == 0
@@ -145,7 +151,9 @@ def test_package_pagination_navigation_and_callback_size(tg):
     back = next(b for b in buttons(tg[3][-1][1]) if b["text"] == "◀ 返回列表")
     assert back["callback_data"] == menu._page_callback(3, "quota")
     assert "⏳ Token:" in tg[3][-1][0]
-    assert any(b["text"] == "🧬 管理模型" for b in buttons(tg[3][-1][1]))
+    manage = next(b for b in buttons(tg[3][-1][1]) if b["text"] == "管理模型")
+    assert manage["callback_data"].startswith("mc:src:")
+    assert manage["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("workbuddy")
     assert not any(b["text"] == "📦 积分明细" for b in buttons(tg[3][-1][1]))
     assert ledger["calls"] == 0
 
@@ -163,7 +171,7 @@ def test_activity_page_is_read_only_confirm_cancel_and_single_dispatch(tg):
     open_page(tg, "activity")
     click(tg, "立即签到")
     done_cb = click(tg, "确认执行")
-    assert ledger["calls"] == 1 and "本次获得 3 分" in output[-1][0]
+    assert ledger["calls"] == 1 and "本次获得 3.00 分" in output[-1][0]
     menu.handle_callback(42, 900, "cb", done_cb)
     assert ledger["calls"] == 1
     open_page(tg, "activity")

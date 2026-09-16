@@ -14,6 +14,7 @@ from src.tests.test_management_mapping_support import domain_client, operation_m
 METADATA_OPERATIONS = {
     "listModelInventory", "listModelMetadata", "getModelMetadata",
     "putModelMetadataBinding", "deleteModelMetadataBinding",
+    "patchModelMetadataOverrides", "deleteModelMetadataOverrides",
     "syncModelMetadata", "searchModelCatalog",
 }
 
@@ -26,6 +27,8 @@ METADATA_OPERATIONS = {
         ("get", "/api/management/v1/model-metadata/example", None),
         ("put", "/api/management/v1/model-metadata/example/binding", {"scope": "global", "targetModelId": "p/m", "providerId": "p"}),
         ("delete", "/api/management/v1/model-metadata/example/binding", None),
+        ("patch", "/api/management/v1/model-metadata/example/overrides", {"scope": "global", "set": {"vision": False}}),
+        ("delete", "/api/management/v1/model-metadata/example/overrides?scope=global", None),
         ("post", "/api/management/v1/model-metadata/actions/sync", {"scope": "full"}),
         ("get", "/api/management/v1/model-catalog", None),
     ],
@@ -48,7 +51,7 @@ def test_metadata_openapi_is_typed_and_has_examples(domain_client):
         assert operation["tags"]
         assert operation.get("security") == [{"ManagementSession": []}]
         success = next(value for code, value in operation["responses"].items() if code.startswith("2"))
-        if operation_id == "deleteModelMetadataBinding":
+        if operation_id in {"deleteModelMetadataBinding", "deleteModelMetadataOverrides"}:
             assert success["description"]
         else:
             assert success["content"]["application/json"]["example"]
@@ -125,6 +128,295 @@ def test_inventory_filters_and_total(domain_client, monkeypatch):
     assert len(response.json()["data"]) == 1
     assert response.json()["meta"]["total"] == 3
     assert response.json()["meta"]["hasNext"] is False
+
+
+def test_metadata_override_api_enforces_revision_and_exposes_effective_sources(domain_client):
+    client, _runtime, admin, *_ = domain_client
+    selected = client.get(
+        "/api/management/v1/model-catalog?pageSize=1", headers=admin,
+    ).json()["data"][0]
+    created = client.put(
+        "/api/management/v1/model-metadata/override-demo/binding",
+        headers=admin,
+        json={
+            "scope": "global", "targetModelId": selected["key"],
+            "providerId": selected["providerId"],
+        },
+    )
+    assert created.status_code == 200
+    revision = created.json()["data"]["revision"]
+    body = {
+        "scope": "global",
+        "set": {
+            "contextWindow": 300000, "maxInputTokens": 300000,
+            "maxOutputTokens": 20000, "compactTriggerTokens": 250000,
+            "vision": False, "toolCall": False, "structuredOutput": False,
+            "reasoningEfforts": [], "serviceTiers": [],
+            "knowledgeCutoff": "2026-09",
+            "cost": {
+                "input": 0, "output": 2, "cacheRead": 0,
+                "cacheWrite": 1, "longContextInput": 3,
+                "longContextOutput": 4,
+            },
+        },
+    }
+    before = copy.deepcopy(config.get().get("modelMetadataOverrides"))
+    missing = client.patch(
+        "/api/management/v1/model-metadata/override-demo/overrides",
+        headers=admin, json=body,
+    )
+    assert missing.status_code == 400
+    assert missing.json()["error"]["code"] == "CONFIRMATION_REQUIRED"
+    stale = client.patch(
+        "/api/management/v1/model-metadata/override-demo/overrides",
+        headers={**admin, "If-Match": "rev_stale"}, json=body,
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "REVISION_CONFLICT"
+    assert config.get().get("modelMetadataOverrides") == before
+
+    updated = client.patch(
+        "/api/management/v1/model-metadata/override-demo/overrides",
+        headers={**admin, "If-Match": revision}, json=body,
+    )
+    assert updated.status_code == 200, updated.text
+    data = updated.json()["data"]
+    assert data["effective"]["contextWindow"] == 300000
+    assert data["effective"]["vision"] is False
+    assert data["effective"]["reasoningEfforts"] == []
+    assert data["effective"]["cost"]["input"] == 0
+    assert data["valueSource"]["contextWindow"] == "common-override"
+    assert data["valueSource"]["cost.input"] == "common-override"
+    assert len(data["commonOverride"]) == 16
+
+    listed = client.get(
+        "/api/management/v1/model-metadata?query=override-demo", headers=admin,
+    )
+    assert listed.status_code == 200
+    assert listed.json()["data"][0]["effective"]["contextWindow"] == 300000
+    invalid = client.patch(
+        "/api/management/v1/model-metadata/override-demo/overrides",
+        headers={**admin, "If-Match": data["revision"]},
+        json={"scope": "global", "set": {"contextWindow": None}},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "VALIDATION_FAILED"
+
+    restored = client.patch(
+        "/api/management/v1/model-metadata/override-demo/overrides",
+        headers={**admin, "If-Match": data["revision"]},
+        json={
+            "scope": "global", "set": {},
+            "unset": ["contextWindow", "vision", "cost.input"],
+        },
+    )
+    assert restored.status_code == 200, restored.text
+    restored_data = restored.json()["data"]
+    assert "contextWindow" not in restored_data["commonOverride"]
+    assert "vision" not in restored_data["commonOverride"]
+    assert "cost.input" not in restored_data["commonOverride"]
+    deleted = client.delete(
+        "/api/management/v1/model-metadata/override-demo/overrides?scope=global",
+        headers={**admin, "If-Match": restored_data["revision"]},
+    )
+    assert deleted.status_code == 204
+    assert model_metadata.get_override_fields("override-demo") == ({}, {})
+
+
+def test_selected_sync_operation_is_idempotent_and_keeps_unselected_catalog_metadata_tariff(
+    domain_client, monkeypatch,
+):
+    client, _runtime, admin, *_ = domain_client
+    active_snapshot = model_pricing.binding_snapshot("openai/gpt-5.4")
+    assert active_snapshot is not None
+    other_snapshot = copy.deepcopy(active_snapshot)
+    other_snapshot["catalogRevision"] = "other-frozen"
+    config.update(lambda cfg: cfg.update({
+        "modelBindings": {
+            "defaults": {
+                "selected-model": {
+                    "target": "openai/gpt-5.4", "source": "auto",
+                    "autoSnapshot": copy.deepcopy(active_snapshot),
+                },
+                "other-model": {
+                    "target": "openai/gpt-5.4", "source": "auto",
+                    "autoSnapshot": copy.deepcopy(other_snapshot),
+                },
+            },
+            "scoped": {},
+        },
+        "modelMetadataOverrides": {"defaults": {}, "scoped": {}},
+    }))
+    inventory = [
+        model_metadata.ModelInventoryItem("api:A", "api", "A", "selected-model", "selected-model"),
+        model_metadata.ModelInventoryItem("api:B", "api", "B", "other-model", "other-model"),
+    ]
+    monkeypatch.setattr(model_metadata, "inventory_items", lambda: list(inventory))
+    candidate = SimpleNamespace(revision="candidate-new")
+    candidate_snapshot = copy.deepcopy(active_snapshot)
+    candidate_snapshot["catalogRevision"] = "candidate-new"
+    candidate_snapshot["catalogSource"] = "candidate"
+    candidate_snapshot["metadata"]["contextWindow"] = 333000
+    candidate_snapshot["tariff"]["input_per_token"] = 9 / 1_000_000
+    monkeypatch.setattr(model_pricing, "fetch_catalog_candidate_sync", lambda: candidate)
+    monkeypatch.setattr(
+        model_pricing, "candidate_canonical_official_model",
+        lambda _candidate, _model: "openai/gpt-5.4",
+    )
+    monkeypatch.setattr(
+        model_pricing, "candidate_binding_snapshot",
+        lambda _candidate, _target: copy.deepcopy(candidate_snapshot),
+    )
+
+    current = client.get(
+        "/api/management/v1/model-metadata/selected-model", headers=admin,
+    ).json()["data"]
+    revision = current["revision"]
+    active_status = copy.deepcopy(model_pricing.catalog_status())
+    other_entry = copy.deepcopy(config.get()["modelBindings"]["defaults"]["other-model"])
+    other_effective = copy.deepcopy(model_metadata.get_metadata("other-model"))
+    other_tariff = model_pricing.build_pricing_binding(
+        channel_key="api:B", channel_type="api", upstream_protocol="anthropic",
+        outbound_model_id="other-model", client_visible_model="other-model",
+    ).binding_json
+    body = {
+        "mode": "one", "targets": [{"modelId": "selected-model"}],
+        "refreshCatalog": True,
+    }
+    missing = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={**admin, "Idempotency-Key": "selected-missing"}, json=body,
+    )
+    assert missing.status_code == 400
+    stale = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={
+            **admin, "Idempotency-Key": "selected-stale", "If-Match": "rev_stale",
+        },
+        json=body,
+    )
+    assert stale.status_code == 409
+    response = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={
+            **admin, "Idempotency-Key": "selected-once", "If-Match": revision,
+        },
+        json=body,
+    )
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["data"]["id"]
+    terminal = None
+    for _ in range(100):
+        terminal = client.get(
+            f"/api/management/v1/operations/{operation_id}", headers=admin,
+        ).json()["data"]
+        if terminal["status"] in {"succeeded", "failed"}:
+            break
+        time.sleep(0.005)
+    assert terminal is not None and terminal["status"] == "succeeded"
+    assert terminal["result"]["mode"] == "one"
+    assert terminal["result"]["results"][0]["status"] == "updated"
+    assert terminal["result"]["results"][0]["catalogRevision"] == "candidate-new"
+    assert config.get()["modelBindings"]["defaults"]["selected-model"]["autoSnapshot"]["catalogRevision"] == "candidate-new"
+    assert config.get()["modelBindings"]["defaults"]["other-model"] == other_entry
+    assert model_metadata.get_metadata("other-model") == other_effective
+    assert model_pricing.build_pricing_binding(
+        channel_key="api:B", channel_type="api", upstream_protocol="anthropic",
+        outbound_model_id="other-model", client_visible_model="other-model",
+    ).binding_json == other_tariff
+    assert model_pricing.catalog_status() == active_status
+
+    replay = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={
+            **admin, "Idempotency-Key": "selected-once", "If-Match": revision,
+        },
+        json=body,
+    )
+    assert replay.status_code == 202
+    assert replay.json()["data"]["id"] == operation_id
+    conflict = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={
+            **admin, "Idempotency-Key": "selected-once", "If-Match": revision,
+        },
+        json={"mode": "one", "targets": [{"modelId": "other-model"}]},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "STATE_CONFLICT"
+
+
+def test_selected_sync_rechecks_revision_before_commit_and_enforces_single_running(
+    domain_client, monkeypatch,
+):
+    client, runtime, admin, *_ = domain_client
+    snapshot = model_pricing.binding_snapshot("openai/gpt-5.4")
+    assert snapshot is not None
+    config.update(lambda cfg: cfg.update({
+        "modelBindings": {
+            "defaults": {"drift-model": {
+                "target": "openai/gpt-5.4", "source": "auto",
+                "autoSnapshot": copy.deepcopy(snapshot),
+            }},
+            "scoped": {},
+        },
+        "modelMetadataOverrides": {"defaults": {}, "scoped": {}},
+    }))
+    inventory = [model_metadata.ModelInventoryItem(
+        "api:A", "api", "A", "drift-model", "drift-model",
+    )]
+    monkeypatch.setattr(model_metadata, "inventory_items", lambda: list(inventory))
+    candidate = SimpleNamespace(revision="candidate-drift")
+    changed_snapshot = copy.deepcopy(snapshot)
+    changed_snapshot["catalogRevision"] = "candidate-drift"
+    monkeypatch.setattr(model_pricing, "fetch_catalog_candidate_sync", lambda: candidate)
+    monkeypatch.setattr(
+        model_pricing, "candidate_canonical_official_model",
+        lambda _candidate, _model: "openai/gpt-5.4",
+    )
+    monkeypatch.setattr(
+        model_pricing, "candidate_binding_snapshot",
+        lambda _candidate, _target: copy.deepcopy(changed_snapshot),
+    )
+    workers = []
+    monkeypatch.setattr(
+        runtime.operations, "submit",
+        lambda _operation_id, worker: workers.append(worker),
+    )
+    revision = client.get(
+        "/api/management/v1/model-metadata/drift-model", headers=admin,
+    ).json()["data"]["revision"]
+    body = {"mode": "one", "targets": [{"modelId": "drift-model"}]}
+    started = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={
+            **admin, "Idempotency-Key": "drift-first", "If-Match": revision,
+        },
+        json=body,
+    )
+    assert started.status_code == 202 and len(workers) == 1
+    concurrent = client.post(
+        "/api/management/v1/model-metadata/actions/sync",
+        headers={
+            **admin, "Idempotency-Key": "drift-second", "If-Match": revision,
+        },
+        json=body,
+    )
+    assert concurrent.status_code == 429
+    assert concurrent.json()["error"]["code"] == "OPERATION_ALREADY_RUNNING"
+
+    binding_before = copy.deepcopy(config.get()["modelBindings"])
+    config.update(lambda cfg: cfg["modelMetadataOverrides"]["defaults"].update({
+        "drift-model": {"fields": {"vision": False}},
+    }))
+    workers[0]()
+    operation_id = started.json()["data"]["id"]
+    terminal = client.get(
+        f"/api/management/v1/operations/{operation_id}", headers=admin,
+    ).json()["data"]
+    assert terminal["status"] == "failed"
+    assert terminal["error"]["code"] == "REVISION_CONFLICT"
+    assert config.get()["modelBindings"] == binding_before
 
 
 def test_metadata_sync_returns_202_and_reaches_terminal_without_network(

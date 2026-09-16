@@ -20,7 +20,7 @@ from fastapi.responses import Response
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
 
-from .. import apikey_limiter, auth, concurrency, config, errors, load_balancing, network, scorer
+from .. import apikey_limiter, auth, concurrency, config, errors, load_balancing, model_validation, network, scorer
 from ..channel import registry
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
 from ..transports import WsProxyBytes, connect_upstream_ws, resolve_ws_route_chain
@@ -249,19 +249,23 @@ def _call_id_from_location(location: str | None) -> str:
     return candidate if candidate else ""
 
 
-def _backend_call_model(body: bytes) -> str | None:
-    """Read only the model needed for existing API-key allowlist enforcement."""
+def _backend_call_model(body: bytes) -> tuple[str | None, str | None]:
+    """Validate and extract ``session.model`` without mutating forwarded bytes."""
     try:
         payload = json.loads(body)
     except (TypeError, ValueError, UnicodeDecodeError):
-        return None
+        return None, "request body must be a valid JSON object"
     if not isinstance(payload, dict):
-        return None
+        return None, "request body must be a JSON object"
     session = payload.get("session")
     if not isinstance(session, dict):
-        return None
-    model = session.get("model")
-    return model.strip() if isinstance(model, str) and model.strip() else None
+        return None, "session must be a JSON object containing model"
+    try:
+        return model_validation.require_explicit_model(
+            session, param="session.model",
+        ), None
+    except model_validation.ExplicitModelError as exc:
+        return None, exc.message
 
 
 def _model_allowed(model: str | None, allowed_models: list[str]) -> bool:
@@ -434,6 +438,9 @@ async def handle_realtime_ws(
         # The call-create request already enforced this key's model allowlist.
         selected_model = model or binding.model or None
     else:
+        if not model:
+            await _reject_ws(websocket, 4400, "model is required")
+            return
         if not _model_allowed(model, allowed_models):
             await _reject_ws(websocket, 4403, "model is not allowed for this API key")
             return
@@ -526,7 +533,14 @@ async def handle_realtime_call(request: Request) -> Response:
     assert key_name is not None
 
     body = await request.body()
-    model = _backend_call_model(body)
+    model, model_error = _backend_call_model(body)
+    if model_error:
+        return errors.json_error_openai(
+            400,
+            errors.ErrTypeOpenAI.INVALID_REQUEST,
+            model_error,
+            param="session.model",
+        )
     if not _model_allowed(model, allowed_models):
         return errors.json_error_openai(
             403,

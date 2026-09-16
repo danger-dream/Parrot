@@ -394,6 +394,42 @@ def test_grok_image_model_honors_api_key_model_allowlist(monkeypatch):
 # ── Video endpoints and persistent identity binding ─────────────────────────
 
 
+_ABSENT_MODEL = object()
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/videos", "/v1/videos/generations", "/v1/videos/edits", "/v1/videos/extensions"],
+)
+@pytest.mark.parametrize("invalid_model", [_ABSENT_MODEL, None, "", "   ", {"bad": True}])
+def test_video_create_routes_require_explicit_model_before_log_dispatch_or_binding(
+    monkeypatch, path, invalid_model,
+):
+    effects = {"log": 0, "dispatch": 0, "binding": 0}
+
+    async def start_log(**_kwargs):
+        effects["log"] += 1
+        return 1
+
+    async def dispatch(**_kwargs):
+        effects["dispatch"] += 1
+        raise AssertionError("invalid model must not dispatch")
+
+    def save_binding(*_args, **_kwargs):
+        effects["binding"] += 1
+
+    monkeypatch.setattr(imagine, "_start_media_log", start_log)
+    monkeypatch.setattr(imagine, "_post_with_safe_failover", dispatch)
+    monkeypatch.setattr(state_db, "xai_video_job_save", save_binding)
+    payload = {"prompt": "x", "video": {"url": "https://example.test/input.mp4"}}
+    if invalid_model is not _ABSENT_MODEL:
+        payload["model"] = invalid_model
+    response = _AsgiClient(_build_app()).post(path, headers=_headers(), json=payload)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"].get("param") == "model"
+    assert effects == {"log": 0, "dispatch": 0, "binding": 0}
+
+
 @pytest.mark.parametrize("path", ["/v1/videos", "/v1/videos/generations"])
 def test_video_generation_routes_and_persists_binding(monkeypatch, path):
     channel = _install_channel()

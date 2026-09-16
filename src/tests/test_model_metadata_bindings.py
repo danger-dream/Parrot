@@ -198,16 +198,19 @@ def test_compact_selection_is_independent_and_limits_use_effective_binding():
         (default_metadata["contextWindow"] - default_metadata["maxOutputTokens"]) * 4
     ) // 5
     assert model_metadata.compact_trigger_tokens("compact-alias") == default_trigger
-    assert model_metadata.safe_prompt_limit("compact-alias") == default_trigger
+    default_hard_limit = model_metadata.safe_prompt_limit("compact-alias")
+    assert default_hard_limit is not None and default_hard_limit >= default_trigger
+    assert model_metadata.should_compact("compact-alias", default_trigger)
     assert model_metadata.can_fit_for_compact("compact-alias", default_trigger)
-    assert not model_metadata.can_fit_for_compact("compact-alias", default_trigger + 1)
+    assert not model_metadata.can_fit_for_compact("compact-alias", default_hard_limit + 1)
     scoped_trigger = model_metadata.compact_trigger_tokens(
         "compact-alias", scope_key="oauth:xai:user", outbound_model="grok-real",
     )
     assert scoped_trigger == model_pricing.catalog_metadata("xai/grok-4.5")["compactTriggerTokens"]
-    assert model_metadata.safe_prompt_limit(
+    scoped_hard_limit = model_metadata.safe_prompt_limit(
         "compact-alias", scope_key="oauth:xai:user", outbound_model="grok-real",
-    ) == scoped_trigger
+    )
+    assert scoped_hard_limit is not None and scoped_hard_limit >= scoped_trigger
     assert model_metadata.summary_reserve_tokens(
         "compact-alias", scope_key="oauth:xai:user", outbound_model="grok-real",
     ) <= model_metadata.max_output_tokens(
@@ -626,7 +629,10 @@ def test_oauth_effective_metadata_scoped_default_upstream_and_vision_false(monke
     assert scoped.metadata["vision"] is False
     assert scoped.metadata["supportsImages"] is False
     assert scoped.metadata["inputModalities"] == ["text"]
-    assert scoped.metadata["reasoningEfforts"] == ["low", "medium"]
+    # The bound catalog and provider-native directory disagree; effective
+    # capability is the safe intersection and provenance explains the hard limit.
+    assert scoped.metadata["reasoningEfforts"] == []
+    assert scoped.constrained_by["reasoningEfforts"] == ("native-hard",)
     assert scoped.metadata["description"] == "upstream description"
 
     config.update(lambda cfg: cfg["modelBindings"]["scoped"].clear())

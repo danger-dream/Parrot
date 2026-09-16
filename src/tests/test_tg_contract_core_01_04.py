@@ -22,12 +22,14 @@ from src.tests.tg_contract import (
 
 
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/core.jsonl"
-CASES = load_jsonl(SEGMENT)
+from src.tests.tg_contract.current import load_current_jsonl
+CASES = load_current_jsonl(SEGMENT)
 CASES_01_04 = [case for case in CASES if case["capabilityId"] <= "TG-CORE-04"]
 
 CALLBACK_HANDLERS = [
     ("status", bot.status_menu),
     ("help", bot.help_menu),
+    ("model_center", bot.model_center_menu),
     ("oauth", bot.oauth_menu),
     ("oauth_account_models", bot.oauth_account_models_menu),
     ("image", bot.image_menu),
@@ -56,7 +58,7 @@ COMMAND_TARGETS = {
     "oauth": (bot.oauth_menu, "send_new"),
     "keys": (bot.apikey_menu, "send_new"),
     "settings": (bot.system_menu, "send_new"),
-    "mapping": (bot.mapping_menu, "send_new"),
+    "model_center": (bot.model_center_menu, "send_new"),
     "loadbalancing": (bot.load_balancing_menu, "send_new"),
     "oauth_defaults": (bot.oauth_defaults_menu, "send_new"),
     "help": (bot.help_menu, "send_new"),
@@ -88,6 +90,7 @@ def _actual(
 @pytest.fixture(autouse=True)
 def _reset_tg_globals():
     states.clear_all()
+    bot.model_center_menu.reset_for_tests()
     ui.configure("fake-token-core", [42])
     ui._session = None
     bot._offset = 0

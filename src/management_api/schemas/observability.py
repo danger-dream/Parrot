@@ -491,6 +491,8 @@ class MediaLogData(StrictSchema):
     durationMilliseconds: float | None = None
     costTicks: int = Field(ge=0)
     trafficBytes: int = Field(ge=0)
+    cacheStatus: Literal["disabled", "cached", "failed"] | None = None
+    cacheErrorClass: str | None = None
     createdAt: datetime | None = None
     finishedAt: datetime | None = None
     error: str | None = None
@@ -500,6 +502,7 @@ class MediaLogData(StrictSchema):
         "model": "gpt-image", "action": "generate", "mediaType": "image", "progress": 100,
         "aspectRatio": "1:1", "resolution": "1024x1024", "durationSeconds": None,
         "durationMilliseconds": 1200, "costTicks": 100, "trafficBytes": 2048,
+        "cacheStatus": "cached", "cacheErrorClass": None,
         "createdAt": "2026-01-02T03:04:05Z", "finishedAt": "2026-01-02T03:04:06Z",
         "error": None, "revision": "rev_example",
     }]})

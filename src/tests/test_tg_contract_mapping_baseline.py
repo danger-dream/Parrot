@@ -15,6 +15,8 @@ from src.telegram.menus import mapping_menu
 from src.tests.tg_contract import assert_capability_coverage, assert_strict_equal, load_jsonl
 
 
+from src.tests.tg_contract.current import load_current_jsonl
+
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/model_routing.jsonl"
 CAPABILITIES = {"TG-MAP-01", "TG-MAP-02", "TG-LB-01", "TG-PX-01", "TG-PX-02"}
 MAP_CASE_NAMES = (
@@ -336,7 +338,7 @@ def _actual(case_name: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 def _segment_cases() -> list[dict[str, Any]]:
     if not SEGMENT.exists():
         return []
-    return load_jsonl(SEGMENT)
+    return load_current_jsonl(SEGMENT)
 
 
 CASES = _segment_cases()

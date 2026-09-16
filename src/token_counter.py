@@ -208,8 +208,13 @@ def _collect_tools(tools: Any, segments: list[str]) -> None:
 def request_prompt_segments(body: dict[str, Any] | None) -> list[str]:
     if not isinstance(body, dict):
         return []
+    # Realtime-style response.create frames carry the request under response.
+    nested = body.get("response")
+    if isinstance(nested, dict):
+        body = nested
     segments: list[str] = []
     _collect_content(body.get("system"), segments)
+    _collect_content(body.get("instructions"), segments)
     _collect_messages(body.get("messages"), segments)
     input_value = body.get("input")
     if isinstance(input_value, list):

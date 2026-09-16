@@ -15,8 +15,10 @@ from src.telegram import states, ui
 from src.telegram.menus import translation_menu as menu
 from src.tests.tg_contract import assert_capability_coverage, assert_strict_equal, load_jsonl
 
+from src.tests.tg_contract.current import load_current_jsonl
+
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/auxiliary.jsonl"
-CASES = [c for c in load_jsonl(SEGMENT) if c["capabilityId"] == "TG-TL-01"] if SEGMENT.exists() else []
+CASES = [c for c in load_current_jsonl(SEGMENT) if c["capabilityId"] == "TG-TL-01"] if SEGMENT.exists() else []
 TL = {"enabled": False, "model": "model-a", "fallbackModel": "model-b", "targetLanguage": "English", "prompt": "", "timeoutSeconds": 10, "maxHistoryMessages": 20, "cacheTtlDays": 3, "cachePreloadCount": 100, "failureAlertThreshold": 10, "memoryCacheMaxMb": 100, "memoryCacheTtlSeconds": 7200, "translateSystemMessages": False, "scope": {"models": [], "channels": []}, "modelOverrides": {}}
 BASE = {"translation": TL}
 

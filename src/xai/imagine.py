@@ -10,13 +10,11 @@ and upstream responses as close to their native contracts as possible.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -32,7 +30,9 @@ from .. import (
     cooldown,
     errors,
     load_balancing,
+    media_cache,
     media_db,
+    model_validation,
     network,
     scorer,
     state_db,
@@ -44,15 +44,6 @@ from ..channel.xai_oauth_channel import XAIOAuthChannel
 _IMAGE_MODEL_PREFIX = "grok-imagine-image"
 _EXPLICIT_SAFE_FAILOVER_STATUSES = frozenset({401, 403, 429})
 _MEDIA_CACHE_HARD_FILE_LIMIT = 128 * 1024 * 1024
-_MEDIA_EXTENSIONS = {
-    "image/gif": "gif",
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "video/mp4": "mp4",
-    "video/quicktime": "mov",
-    "video/webm": "webm",
-}
 _HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
     "connection",
     "keep-alive",
@@ -267,26 +258,11 @@ def _media_cache_settings() -> dict[str, Any]:
 
 
 def _media_cache_file_limit(cfg: dict[str, Any]) -> int:
-    try:
-        aggregate_limit = int(cfg.get("cacheMaxBytes") or 0)
-    except (TypeError, ValueError):
-        aggregate_limit = 0
-    if aggregate_limit > 0:
-        return min(aggregate_limit, _MEDIA_CACHE_HARD_FILE_LIMIT)
-    return _MEDIA_CACHE_HARD_FILE_LIMIT
+    return min(media_cache.file_limit(cfg), _MEDIA_CACHE_HARD_FILE_LIMIT)
 
 
 def _decode_media_data_url(value: str, *, max_bytes: int) -> tuple[bytes, str]:
-    header, sep, encoded = str(value or "").partition(",")
-    if not sep or not header.lower().startswith("data:") or ";base64" not in header.lower():
-        raise ValueError("unsupported generated media data URL")
-    if len(encoded) * 3 // 4 > max_bytes:
-        raise ValueError("generated media exceeds cache file limit")
-    raw = base64.b64decode(encoded, validate=False)
-    if len(raw) > max_bytes:
-        raise ValueError("generated media exceeds cache file limit")
-    mime = header[5:].split(";", 1)[0].strip().lower()
-    return raw, mime
+    return media_cache.decode_data_url(value, max_bytes=max_bytes)
 
 
 def _is_allowed_xai_media_url(value: str) -> bool:
@@ -342,14 +318,10 @@ async def _download_xai_media(
 
 
 def _cached_media_extension(*, media_type: str, mime: str, source_url: str) -> str:
-    normalized_mime = str(mime or "").lower()
-    if normalized_mime in _MEDIA_EXTENSIONS:
-        return _MEDIA_EXTENSIONS[normalized_mime]
-    suffix = Path(urlsplit(source_url).path).suffix.lower().lstrip(".")
-    allowed = {"gif", "jpeg", "jpg", "m4v", "mov", "mp4", "png", "webm", "webp"}
-    if suffix in allowed:
-        return "jpg" if suffix == "jpeg" else suffix
-    return "mp4" if media_type == "video" else "jpg"
+    return media_cache.extension_for(
+        media_type=media_type, mime=mime, source_url=source_url,
+        preferred="jpg" if media_type == "image" else "mp4",
+    )
 
 
 def _write_cached_media(
@@ -361,21 +333,15 @@ def _write_cached_media(
     extension: str,
     index: int,
 ) -> str:
-    from ..openai import images_simple
-
-    root = images_simple._cache_root(cfg)
-    day = time.strftime("%Y%m%d", time.localtime())
-    out_dir = root / day
-    out_dir.mkdir(parents=True, exist_ok=True)
-    filename = (
-        f"xai-{media_type}-{action}-{int(time.time())}-"
-        f"{uuid.uuid4().hex[:10]}-{index}.{extension}"
+    return media_cache.write_bytes(
+        raw,
+        cfg=cfg,
+        provider="xai",
+        media_type=media_type,
+        action=action,
+        extension=extension,
+        index=index,
     )
-    path = out_dir / filename
-    temporary = out_dir / f".{filename}.tmp"
-    temporary.write_bytes(raw)
-    os.replace(temporary, path)
-    return str(path)
 
 
 async def _cache_xai_results(
@@ -399,7 +365,7 @@ async def _cache_xai_results(
             if isinstance(b64_value, str) and b64_value:
                 if len(b64_value) * 3 // 4 > max_bytes:
                     raise ValueError("generated media exceeds cache file limit")
-                raw = base64.b64decode(b64_value, validate=False)
+                raw = media_cache.decode_base64(b64_value, max_bytes=max_bytes)
                 mime = str(item.get("mime_type") or "")
             elif source_url:
                 raw, downloaded_mime = await _download_xai_media(
@@ -437,10 +403,8 @@ async def _cache_xai_results(
 
     if paths:
         try:
-            from ..openai import images_simple
-
-            root = images_simple._cache_root(cfg)
-            await asyncio.to_thread(images_simple._cleanup_cache, root, cfg)
+            root = media_cache.cache_root(cfg)
+            await asyncio.to_thread(media_cache.cleanup, root, cfg)
         except Exception as exc:
             print(f"[xai-imagine] media cache cleanup failed type={type(exc).__name__}")
     return paths, total_bytes
@@ -858,13 +822,12 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
     if isinstance(body, Response):
         return body
 
-    model = str(body.get("model") or "").strip()
+    try:
+        model = model_validation.require_explicit_model(body)
+    except model_validation.ExplicitModelError as exc:
+        return _bad_request(exc.message, param=exc.param)
+    body["model"] = model
     configured = video_models()
-    if not model and configured:
-        model = configured[0]
-        body["model"] = model
-    if not model:
-        return _bad_request("model is required", param="model")
     if model not in configured:
         return _bad_request(f"unsupported xAI video model {model!r}", param="model")
     if not _model_allowed(model, allowed_models):

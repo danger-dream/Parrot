@@ -163,7 +163,7 @@ def test_query_progress_result_time_and_error_survive_rerender(tg, monkeypatch, 
             assert "320" not in text and "旧快照" not in text and "部分失败" not in text
             assert "剩余 0" not in text and "计费类型: free" in text
         elif outcome == "known":
-            assert "✅ 已更新积分" in text and "（6 / 10）" in text and "320" not in text
+            assert "✅ 已更新积分" in text and "（6.00 / 10.00）" in text and "320" not in text
         elif outcome == "partial":
             assert "查询部分失败" in text and "积分/资源包" in text and "HTTP 403" in text and "code 1001" in text
             assert "旧快照" in text and "320" in text

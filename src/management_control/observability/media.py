@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any, Iterator
 
 from src import config as config_module
+from src import media_cache
 from src import media_db as media_db_module
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
@@ -80,8 +81,10 @@ class MediaControl:
         self.media_db = media_db
         self.config = config
 
-    @staticmethod
-    def _paths(row: dict[str, Any], *, existing_only: bool = True) -> list[str]:
+    def _paths(
+        self, row: dict[str, Any], *, existing_only: bool = True,
+        enforce_root: bool = True,
+    ) -> list[str]:
         try:
             values = json.loads(row.get("cache_paths") or "[]")
         except Exception:
@@ -89,7 +92,19 @@ class MediaControl:
         if not isinstance(values, list):
             return []
         paths = [path for path in values if isinstance(path, str)]
-        return [path for path in paths if os.path.exists(path)] if existing_only else paths
+        if not existing_only:
+            return paths
+        root = self.config.get()
+        images = root.get("images") if isinstance(root, dict) else None
+        # Test/legacy adapters without cache settings retain metadata-only behavior;
+        # production config always has images settings and enforces containment.
+        if (
+            not enforce_root
+            or not isinstance(images, dict)
+            or "cachePath" not in images
+        ):
+            return [path for path in paths if os.path.isfile(path) and not os.path.islink(path)]
+        return [path for path in paths if media_cache.artifact_path_is_safe(path, images)]
 
     @staticmethod
     def _artifact_id(index: int, path: str) -> str:
@@ -114,6 +129,8 @@ class MediaControl:
             "durationMilliseconds": clean.get("duration_ms"),
             "costTicks": int(clean.get("cost_usd_ticks") or 0),
             "trafficBytes": int(clean.get("image_bytes") or 0),
+            "cacheStatus": str(clean.get("cache_status") or "") or None,
+            "cacheErrorClass": str(clean.get("cache_error_class") or "") or None,
             "createdAt": utc_datetime(clean.get("created_at")),
             "finishedAt": utc_datetime(clean.get("finished_at")),
             "error": clean.get("error_message"),
@@ -312,7 +329,10 @@ class MediaControl:
 
     def existing_paths(self, context: ManagementContext, row: dict[str, Any]) -> list[str]:
         require(context)
-        return self._paths(row)
+        # Telegram's established viewer must remain able to serve legacy cache
+        # rows after an administrator changes cachePath.  Management artifact
+        # endpoints above enforce the current root for every download.
+        return self._paths(row, enforce_root=False)
 
     def fmt_bjt(self, value: Any) -> str:
         return self.media_db.fmt_bjt(value)

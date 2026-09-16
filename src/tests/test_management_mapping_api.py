@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from src import config, model_mapping, model_metadata
@@ -8,7 +10,7 @@ from src.tests.test_management_mapping_support import domain_client, operation_m
 
 
 MAPPING_OPERATIONS = {
-    "listModelMappings", "putModelMapping", "deleteModelMapping",
+    "listModelMappings", "putModelMapping", "updateModelMapping", "deleteModelMapping",
     "getIngressDefaultModel", "putIngressDefaultModel", "deleteIngressDefaultModel",
     "getCompressionModel", "putCompressionModel", "deleteCompressionModel",
 }
@@ -19,6 +21,7 @@ MAPPING_OPERATIONS = {
     [
         ("get", "/api/management/v1/model-mappings", None),
         ("put", "/api/management/v1/model-mappings/alias", {"realModel": "real"}),
+        ("patch", "/api/management/v1/model-mappings/alias", {"alias": "renamed", "realModel": "real"}),
         ("delete", "/api/management/v1/model-mappings/alias", None),
         ("get", "/api/management/v1/ingress-default-models/anthropic", None),
         ("put", "/api/management/v1/ingress-default-models/anthropic", {"modelId": "real"}),
@@ -112,22 +115,29 @@ def test_mapping_validation_has_field_locations(domain_client):
     assert fields and any("unknown" in field["path"] for field in fields)
 
 
-def test_ingress_default_and_compression_use_real_inventory(domain_client, monkeypatch):
-    client, _runtime, admin, *_ = domain_client
+def test_retired_ingress_default_rejects_valid_model_without_write(domain_client, monkeypatch):
+    client, runtime, admin, *_ = domain_client
     monkeypatch.setattr(model_mapping, "list_available_models_for", lambda _ingress: ["real-model"])
-    inventory = model_metadata.ModelInventoryItem(
-        scope_key="api:one", scope_type="api", scope_label="One",
-        client_visible_model="real-model", outbound_model="real-model",
-    )
-    monkeypatch.setattr(model_metadata, "inventory_items", lambda: [inventory])
-
+    before = copy.deepcopy(config.get())
+    audit_before = runtime.state_store.audit_snapshot()
     put_default = client.put(
         "/api/management/v1/ingress-default-models/anthropic",
         headers=admin,
         json={"modelId": "real-model"},
     )
-    assert put_default.status_code == 200
-    assert put_default.json()["data"]["modelId"] == "real-model"
+    assert put_default.status_code == 422
+    assert put_default.json()["error"]["code"] == "UNSUPPORTED_VALUE"
+    assert config.get() == before
+    assert runtime.state_store.audit_snapshot() == audit_before
+
+
+def test_compression_model_uses_real_inventory(domain_client, monkeypatch):
+    client, _runtime, admin, *_ = domain_client
+    inventory = model_metadata.ModelInventoryItem(
+        scope_key="api:one", scope_type="api", scope_label="One",
+        client_visible_model="real-model", outbound_model="real-model",
+    )
+    monkeypatch.setattr(model_metadata, "inventory_items", lambda: [inventory])
     put_compression = client.put(
         "/api/management/v1/compression-model",
         headers=admin,

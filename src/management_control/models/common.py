@@ -20,6 +20,24 @@ from src.management_control.errors import ErrorField, ManagementError, Managemen
 ItemT = TypeVar("ItemT")
 
 
+class ModelKind(str, Enum):
+    CHAT = "chat"
+    IMAGE = "image"
+    VIDEO = "video"
+
+
+class ModelSourceType(str, Enum):
+    GLOBAL = "global"
+    OAUTH = "oauth"
+    API = "api"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOwnerRef:
+    type: ModelSourceType
+    id: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ListPage(Generic[ItemT]):
     items: tuple[ItemT, ...]

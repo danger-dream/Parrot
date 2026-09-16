@@ -1207,8 +1207,10 @@ def test_cursor_max_context_metadata_and_preflight_use_one_million(monkeypatch):
         outbound_model="claude-fable-5",
         use_max_context=True,
     )
-    assert normal_limit == 188_800
-    assert max_limit == 748_800
+    # Hard input fit only subtracts the explicit safety buffer. Output maxima
+    # are independent; the descriptive 80% compact trigger is not a fit cap.
+    assert normal_limit == 280_000
+    assert max_limit == 980_000
     assert model_metadata.context_window(
         "claude-fable-5",
         scope_key=scope,
@@ -1221,7 +1223,7 @@ def test_cursor_max_context_metadata_and_preflight_use_one_million(monkeypatch):
         candidates=[(channel, "claude-fable-5")], saturated=[],
     )
     monkeypatch.setattr(
-        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 200_000,
+        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 310_000,
     )
     base = {
         "model": "claude-fable-5",
@@ -1240,8 +1242,20 @@ def test_cursor_new_entry_and_unified_rich_detail_keep_max_context():
     oauth_manager.add_account(_account())
     account_key = "cursor:cursor-user-1"
     _account_text, account_kb = oauth_menu._detail_text_and_kb(account_key, refresh_quota=False)
-    manage = next(button for row in account_kb["inline_keyboard"] for button in row if button["text"] == "🧬 管理模型")
-    assert manage["callback_data"].startswith("oam:open:")
+    manage = next(
+        button
+        for row in account_kb["inline_keyboard"]
+        for button in row
+        if button["text"] == "管理模型"
+    )
+    assert manage["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("cursor")
+    assert manage["callback_data"].startswith("mc:src:")
+    encoded_source = ui.resolve_code(manage["callback_data"].split(":", 2)[2])
+    assert encoded_source is not None and encoded_source.startswith("mc-source:")
+    source = json.loads(encoded_source.removeprefix("mc-source:"))
+    assert source["type"] == "oauth"
+    assert source["id"] == account_key
+    assert source["origin"].startswith("oa:view:")
 
     text, kb = oauth_account_models_menu.render(account_key)
     assert "Cursor 模型目录" not in text and "刷新额度与模型" not in text

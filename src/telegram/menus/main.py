@@ -17,7 +17,7 @@ def _kb() -> dict:
          ui.btn("📋 最近日志", "menu:logs")],
         [ui.btn("🔐 管理 OAuth", "menu:oauth"),
          ui.btn("📡 管理渠道", "menu:channel")],
-        [ui.btn("🤖 模型管理", "map:show"),
+        [ui.btn("🤖 模型中心", "mc:show"),
          ui.btn("⚖️ 负载均衡", "menu:loadbalancing")],
         [ui.btn("🔑 管理 APIKEY", "menu:apikey"),
          ui.btn("⚙ 系统设置", "menu:settings")],
@@ -63,7 +63,12 @@ def _first_run_banner() -> str:
     )
 
 
-def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = False) -> str:
+def _overview(
+    lifetime_stats: dict | None = None,
+    *,
+    lifetime_loading: bool = False,
+    lifetime_unavailable: bool = False,
+) -> str:
     """主菜单顶部的服务一览；慢统计只能来自进程内快照。"""
     cfg = _CONTROL.config_snapshot(_CONTEXT)
     oauth_accounts = cfg.get("oauthAccounts") or []
@@ -135,7 +140,11 @@ def _overview(lifetime_stats: dict | None = None, *, lifetime_loading: bool = Fa
     lines.append("─" * 18)
     lines.extend(_address_block(port))
     lines.append("")
-    lines.extend(_lifetime_stats_block(lifetime_stats, loading=lifetime_loading))
+    lines.extend(_lifetime_stats_block(
+        lifetime_stats,
+        loading=lifetime_loading,
+        unavailable=lifetime_unavailable,
+    ))
 
     return "\n".join(lines)
 
@@ -173,11 +182,19 @@ def _address_block(port: int) -> list[str]:
     return out
 
 
-def _lifetime_stats_block(s: dict | None = None, *, loading: bool = False) -> list[str]:
+def _lifetime_stats_block(
+    s: dict | None = None,
+    *,
+    loading: bool = False,
+    unavailable: bool = False,
+) -> list[str]:
     """累计统计：只渲染缓存快照，绝不在 polling 线程查库。"""
     if s is None:
-        s = {"total": 0, "input_tokens": 0, "output_tokens": 0,
-             "cache_creation": 0, "cache_read": 0}
+        if unavailable:
+            status = "  ⚠ 统计暂不可用，后台将自动重试"
+        else:
+            status = "  ⏳ 统计正在初始化，菜单功能仍可使用"
+        return ["📊 <b>累计统计</b>", status]
     total_in = ui.prompt_total(s.get("input_tokens"), s.get("cache_creation"), s.get("cache_read"))
     out_tok = s.get("output_tokens") or 0
     token_line = (
@@ -220,7 +237,12 @@ def _maybe_suffix_status_banner(text: str) -> str:
     return text + "\n\n" + "\n".join(extras)
 
 
-def _compose_text(lifetime_stats: dict | None = None, *, lifetime_loading: bool = False) -> str:
+def _compose_text(
+    lifetime_stats: dict | None = None,
+    *,
+    lifetime_loading: bool = False,
+    lifetime_unavailable: bool = False,
+) -> str:
     cfg = _CONTROL.config_snapshot(_CONTEXT)
     empty = (
         not (cfg.get("oauthAccounts") or [])
@@ -230,26 +252,89 @@ def _compose_text(lifetime_stats: dict | None = None, *, lifetime_loading: bool 
     if empty:
         return _maybe_suffix_status_banner(_first_run_banner())
     return _maybe_suffix_status_banner(
-        _overview(lifetime_stats, lifetime_loading=lifetime_loading)
+        _overview(
+            lifetime_stats,
+            lifetime_loading=lifetime_loading,
+            lifetime_unavailable=lifetime_unavailable,
+        )
     )
 
 
+def _compose_from_read(read: menu_cache.CacheRead) -> str:
+    return _compose_text(
+        read.value,
+        lifetime_loading=read.value is None and read.error is None,
+        lifetime_unavailable=read.value is None and read.error is not None,
+    )
+
+
+def _edit_lifetime_result(
+    chat_id: int,
+    message_id: int,
+    token: int,
+    value: dict | None,
+    error: Exception | None,
+) -> None:
+    read = menu_cache.CacheRead(value, error is None, False, error)
+    menu_cache.run_if_current(
+        chat_id,
+        message_id,
+        token,
+        lambda: ui.edit(
+            chat_id,
+            message_id,
+            _compose_from_read(read),
+            reply_markup=_kb(),
+        ),
+    )
+
+
+def _request_lifetime_update(chat_id: int, message_id: int, token: int) -> None:
+    read = menu_cache.request_lifetime(
+        subscriber=menu_cache.subscriber(chat_id, message_id, token),
+        on_ready=lambda value, error: _edit_lifetime_result(
+            chat_id, message_id, token, value, error,
+        ),
+    )
+    # The periodic prewarm may have completed after the initial peek but before
+    # this request reserved a waiter.  Render that now-current value once.
+    if read.value is not None:
+        _edit_lifetime_result(chat_id, message_id, token, read.value, None)
+
+
 def show(chat_id: int) -> None:
-    """命令入口：有快照就完整发送；冷启动只发送简短提示。"""
+    """命令入口：立即发送可操作菜单，累计统计只从后台快照补齐。"""
     lifetime = menu_cache.LIFETIME_STATS.peek("lifetime")
-    if lifetime.value is None:
-        ui.send(chat_id, menu_cache.initialization_text())
+    response = ui.send(
+        chat_id,
+        _compose_from_read(lifetime),
+        reply_markup=_kb(),
+    )
+    if lifetime.value is not None:
         return
-    ui.send(chat_id, _compose_text(lifetime.value), reply_markup=_kb())
+    result = response.get("result") if isinstance(response, dict) else None
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if isinstance(message_id, int):
+        token = menu_cache.begin_view(chat_id, message_id)
+        _request_lifetime_update(chat_id, message_id, token)
+    else:
+        # A transport without a returned message id cannot be auto-edited, but
+        # the interactive load must still be queued for the next navigation.
+        menu_cache.request_lifetime()
 
 
 def show_edit(chat_id: int, message_id: int) -> bool:
-    """回调入口：只用最近成功快照一次性渲染，冷缓存保持原页。"""
+    """回调入口：冷缓存也立即返回主菜单，后台完成后再安全补统计。"""
+    token = menu_cache.begin_view(chat_id, message_id)
     lifetime = menu_cache.LIFETIME_STATS.peek("lifetime")
+    ui.edit(
+        chat_id,
+        message_id,
+        _compose_from_read(lifetime),
+        reply_markup=_kb(),
+    )
     if lifetime.value is None:
-        return False
-    menu_cache.begin_view(chat_id, message_id)
-    ui.edit(chat_id, message_id, _compose_text(lifetime.value), reply_markup=_kb())
+        _request_lifetime_update(chat_id, message_id, token)
     return True
 
 
@@ -283,7 +368,5 @@ def on_menu_command(chat_id: int) -> None:
 # ─── 回调：回到主菜单 ─────────────────────────────────────────────
 
 def handle_back(chat_id: int, message_id: int, cb_id: str) -> None:
-    if not show_edit(chat_id, message_id):
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
+    show_edit(chat_id, message_id)
     ui.answer_cb(cb_id)

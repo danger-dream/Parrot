@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, scorer
+from . import affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_state, scorer
 from .channel import registry
 from .channel.base import Channel
 from .protocols.matrix import (
@@ -100,9 +100,15 @@ def _filter_candidates(requested_model: str,
     route_plans: dict[tuple[str, str], RoutePlan] = {}
     guard_errors: list[str] = []
     excluded = diagnostics if diagnostics is not None else []
+    if not model_state.is_global_enabled(requested_model):
+        excluded.append({"channel": None, "reason": "global_model_disabled"})
+        return available, saturated, route_plans, guard_errors
     for ch in registry.all_channels():
         resolved = ch.supports_model(requested_model)
         if resolved is None:
+            continue
+        if not model_state.is_source_enabled(ch.key, requested_model):
+            excluded.append({"channel": ch.key, "reason": "source_model_disabled"})
             continue
         if not ch.enabled:
             excluded.append({"channel": ch.key, "reason": "disabled"})

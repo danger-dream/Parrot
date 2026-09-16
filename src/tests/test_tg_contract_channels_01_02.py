@@ -12,12 +12,11 @@ import pytest
 from src.tests.tg_contract import (
     assert_capability_coverage,
     assert_strict_equal,
-    load_jsonl,
 )
-from src.tests.test_tg_contract_channels_support import SEGMENT, run_menu_case
+from src.tests.test_tg_contract_channels_support import SEGMENT, current_cases, run_menu_case
 
 
-ALL_CASES = load_jsonl(SEGMENT)
+ALL_CASES = current_cases()
 CASES = [
     case for case in ALL_CASES
     if case["capabilityId"] in {"TG-CH-01", "TG-CH-02"}

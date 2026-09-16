@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import json
 from typing import Any
 
 import pytest
@@ -28,9 +29,7 @@ def _install(case, monkeypatch):
     monkeypatch.setattr(ui, "api", capture.api)
     ui._code_to_name.clear()
     rows = deepcopy(runtime.get("rows") or [])
-    existing = set(runtime.get("existingPaths") or [])
     db_calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(media_logs_menu.os.path, "exists", lambda path: path in existing)
     monkeypatch.setattr(media_db, "count", lambda: len(rows))
 
     def recent(limit, offset=0):
@@ -52,6 +51,7 @@ def _install(case, monkeypatch):
     media_results = list(runtime.get("mediaResults") or [])
 
     def send_media(method, chat_id, path, caption=""):
+        assert Path(path).is_file() and not Path(path).is_symlink()
         capture.record(method, {"chat_id": chat_id, "path": path, "caption": caption})
         return deepcopy(media_results.pop(0)) if media_results else {"ok": True, "result": {}}
 
@@ -109,7 +109,19 @@ RUNNERS = {"list": _run_list, "detail": _run_detail, "view": _run_view}
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["caseId"])
-def test_media_trace(case, monkeypatch):
+def test_media_trace(case, monkeypatch, tmp_path):
+    # Instantiate archived /fake paths as isolated real files, before execution.
+    # Both the input and exact expected transport path use this fixture value;
+    # the comparator and all sending/failure/unused-result assertions are intact.
+    archived = json.dumps(case, ensure_ascii=False)
+    assert str(tmp_path) not in archived
+    case = json.loads(archived.replace('/fake/', str(tmp_path) + '/fake/'))
+    for value in case['initialRuntime'].get('existingPaths', []):
+        path = Path(value)
+        assert path.is_relative_to(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'isolated media contract fixture')
+        assert path.is_file() and not path.is_symlink()
     actual = RUNNERS[case["entry"]["scenario"]](case, monkeypatch)
     assert_strict_equal(case, actual)
 

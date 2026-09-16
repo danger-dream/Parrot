@@ -347,7 +347,189 @@ def test_five_common_callbacks_render_stale_once_without_refresh_redraw(m, monke
     assert len(recorder.edits()) == 5
 
 
-def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_keep_hint(m, monkeypatch):
+def test_main_navigation_is_operable_on_cold_cache_without_sync_stats_and_keeps_permissions(
+    m, monkeypatch,
+):
+    from src.telegram import states
+
+    recorder = Recorder()
+    monkeypatch.setattr(m["ui"], "api", recorder)
+    m["ui"].configure("fake-main-cold-token", [42])
+    m["config"].update(lambda cfg: cfg.update({
+        "channels": [{"name": "cold", "enabled": True}],
+        "apiKeys": {"key": {"key": "fake"}},
+        "oauthAccounts": [],
+        "concurrency": {"enabled": False},
+    }))
+    loader_calls = []
+    monkeypatch.setattr(
+        m["log_db"], "stats_lifetime",
+        lambda: loader_calls.append(threading.get_ident()) or _lifetime_snapshot(9),
+    )
+
+    # /start never waits for statistics and keeps every established destination.
+    m["bot"]._handle_message({"chat": {"id": 42}, "text": "/start"})
+    # /menu renders the complete navigation plus an honest loading row.  Merely
+    # handling the command cannot execute the lifetime query on the polling thread.
+    m["bot"]._handle_message({"chat": {"id": 42}, "text": "/menu"})
+    sends = [data for method, data in recorder.calls if method == "sendMessage"]
+    assert "欢迎使用" in sends[0]["text"]
+    assert "统计正在初始化，菜单功能仍可使用" in sends[1]["text"]
+    assert "总调用 <code>0</code>" not in sends[1]["text"]
+    assert sends[1]["reply_markup"] == m["main"]._kb()
+    assert loader_calls == []
+
+    # A menu:main button from a pre-restart page is just normal navigation; a
+    # pre-existing text state neither blocks it nor gets silently destroyed.
+    states.set_state(42, "old-page-input", {"preserve": True})
+    m["bot"]._handle_callback({
+        "id": "cb-old-main",
+        "from": {"id": 42},
+        "message": {"message_id": 777, "chat": {"id": 42}},
+        "data": "menu:main",
+    })
+    edit = recorder.edits()[-1]
+    assert edit["message_id"] == 777
+    assert "统计正在初始化，菜单功能仍可使用" in edit["text"]
+    assert edit["reply_markup"] == m["main"]._kb()
+    assert states.get_state(42)["action"] == "old-page-input"
+    assert loader_calls == []
+    answer = [
+        data for method, data in recorder.calls
+        if method == "answerCallbackQuery" and data["callback_query_id"] == "cb-old-main"
+    ]
+    assert answer == [{"callback_query_id": "cb-old-main"}]
+
+    edit_count = len(recorder.edits())
+    m["bot"]._handle_callback({
+        "id": "cb-denied-main",
+        "from": {"id": 43},
+        "message": {"message_id": 778, "chat": {"id": 43}},
+        "data": "menu:main",
+    })
+    assert len(recorder.edits()) == edit_count
+    assert recorder.calls[-1] == (
+        "answerCallbackQuery",
+        {"callback_query_id": "cb-denied-main", "text": "⛔ 无权限"},
+    )
+
+
+def test_main_cold_command_returns_before_slow_stats_and_auto_restores_snapshot(m, monkeypatch):
+    menu_cache = m["menu_cache"]
+    recorder = Recorder()
+    monkeypatch.setattr(m["ui"], "api", recorder)
+    m["config"].update(lambda cfg: cfg.update({
+        "channels": [{"name": "slow", "enabled": True}],
+        "apiKeys": {}, "oauthAccounts": [], "concurrency": {"enabled": False},
+    }))
+    # Isolate this test to the interactive lifetime load; other periodic jobs are
+    # independently covered above and must not obscure whether main itself blocks.
+    monkeypatch.setattr(menu_cache.COORDINATOR, "_periodic", [])
+    entered = threading.Event()
+    release = threading.Event()
+    loader_threads = []
+
+    def slow_lifetime():
+        loader_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(2)
+        return _lifetime_snapshot(73)
+
+    monkeypatch.setattr(m["log_db"], "stats_lifetime", slow_lifetime)
+    caller_thread = threading.get_ident()
+    m["main"].show(42)
+    sends = [data for method, data in recorder.calls if method == "sendMessage"]
+    assert len(sends) == 1
+    assert "统计正在初始化，菜单功能仍可使用" in sends[0]["text"]
+    assert sends[0]["reply_markup"] == m["main"]._kb()
+    assert recorder.edits() == []
+    assert not entered.is_set()
+
+    menu_cache.start()
+    assert entered.wait(1)
+    assert recorder.edits() == []
+    release.set()
+    _wait_until(lambda: len(recorder.edits()) == 1)
+    assert recorder.edits()[-1]["message_id"] == 9001
+    assert "总调用 <code>73</code> 次" in recorder.edits()[-1]["text"]
+    assert "统计正在初始化" not in recorder.edits()[-1]["text"]
+    assert loader_threads and loader_threads[0] != caller_thread
+    menu_cache.stop()
+
+
+def test_main_slow_stats_result_does_not_overwrite_a_newer_page(m, monkeypatch):
+    menu_cache = m["menu_cache"]
+    recorder = Recorder()
+    monkeypatch.setattr(m["ui"], "api", recorder)
+    m["config"].update(lambda cfg: cfg.update({
+        "channels": [{"name": "stale-view", "enabled": True}],
+        "apiKeys": {}, "oauthAccounts": [], "concurrency": {"enabled": False},
+    }))
+    monkeypatch.setattr(menu_cache.COORDINATOR, "_periodic", [])
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_lifetime():
+        entered.set()
+        assert release.wait(2)
+        return _lifetime_snapshot(81)
+
+    monkeypatch.setattr(m["log_db"], "stats_lifetime", slow_lifetime)
+    m["main"].handle_back(42, 102, "cb-main-old-view")
+    menu_cache.start()
+    assert entered.wait(1)
+    assert len(recorder.edits()) == 1
+
+    # Any later callback claims the message generation before rendering its page.
+    # The old lifetime completion may fill the cache but must not repaint it.
+    menu_cache.begin_view(42, 102)
+    release.set()
+    _wait_until(lambda: menu_cache.LIFETIME_STATS.peek("lifetime").value is not None)
+    time.sleep(0.03)
+    assert len(recorder.edits()) == 1
+    menu_cache.stop()
+
+
+def test_main_failed_initial_stats_stays_operable_then_retry_restores_snapshot(m, monkeypatch):
+    menu_cache = m["menu_cache"]
+    recorder = Recorder()
+    monkeypatch.setattr(m["ui"], "api", recorder)
+    m["config"].update(lambda cfg: cfg.update({
+        "channels": [{"name": "retry", "enabled": True}],
+        "apiKeys": {}, "oauthAccounts": [], "concurrency": {"enabled": False},
+    }))
+    monkeypatch.setattr(menu_cache.COORDINATOR, "_periodic", [])
+    attempts = 0
+
+    def flaky_lifetime():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("fixture lifetime unavailable")
+        return _lifetime_snapshot(91)
+
+    monkeypatch.setattr(m["log_db"], "stats_lifetime", flaky_lifetime)
+    m["main"].handle_back(42, 101, "cb-main-fail")
+    menu_cache.start()
+    _wait_until(lambda: any("统计暂不可用" in edit["text"] for edit in recorder.edits()))
+    failed = recorder.edits()[-1]
+    assert failed["reply_markup"] == m["main"]._kb()
+    assert "总调用 <code>0</code>" not in failed["text"]
+    assert menu_cache.LIFETIME_STATS.peek("lifetime").error is not None
+
+    # Retrying navigation remains immediate, queues one background attempt, and
+    # replaces the unavailable row with the original statistics once successful.
+    m["main"].handle_back(42, 101, "cb-main-retry")
+    _wait_until(lambda: menu_cache.LIFETIME_STATS.peek("lifetime").value is not None)
+    _wait_until(lambda: "总调用 <code>91</code> 次" in recorder.edits()[-1]["text"])
+    assert attempts == 2
+    assert recorder.edits()[-1]["reply_markup"] == m["main"]._kb()
+    menu_cache.stop()
+
+
+def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_keep_hint(
+    m, monkeypatch,
+):
     recorder = Recorder()
     monkeypatch.setattr(m["ui"], "api", recorder)
     m["config"].update(lambda cfg: cfg.update({
@@ -360,15 +542,27 @@ def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_k
     m["oauth_menu"].show(42, 103, "cb-oauth")
     m["apikey_menu"].show(42, 104, "cb-apikey")
 
-    assert len(recorder.edits()) == 1
-    assert recorder.edits()[0]["message_id"] == 101
-    assert "完成后自动更新" in recorder.edits()[0]["text"]
+    assert len(recorder.edits()) == 2
+    assert {edit["message_id"] for edit in recorder.edits()} == {100, 101}
+    main_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 100)
+    stats_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 101)
+    assert "首次使用检测" in main_edit["text"]
+    assert "完成后自动更新" in stats_edit["text"]
     answers = [
         data for method, data in recorder.calls if method == "answerCallbackQuery"
     ]
     assert len(answers) == 5
-    assert all("初始化" in data.get("text", "") for data in answers if data["callback_query_id"] != "cb-stats")
-    assert "自动更新" in next(data["text"] for data in answers if data["callback_query_id"] == "cb-stats")
+    assert next(data for data in answers if data["callback_query_id"] == "cb-main") == {
+        "callback_query_id": "cb-main",
+    }
+    assert all(
+        "初始化" in data.get("text", "")
+        for data in answers
+        if data["callback_query_id"] in {"cb-channel", "cb-oauth", "cb-apikey"}
+    )
+    assert "自动更新" in next(
+        data["text"] for data in answers if data["callback_query_id"] == "cb-stats"
+    )
 
     m["main"].show(42)
     m["stats_menu"].send_new(42)
@@ -377,8 +571,9 @@ def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_k
     m["apikey_menu"].send_new(42)
     sends = [data for method, data in recorder.calls if method == "sendMessage"]
     assert len(sends) == 5
-    assert all("初始化" in data["text"] for data in sends)
-    assert len(recorder.edits()) == 1
+    assert "首次使用检测" in sends[0]["text"]
+    assert all("初始化" in data["text"] for data in sends[1:])
+    assert len(recorder.edits()) == 2
 
 
 def test_rolling_stats_uses_same_queue_and_auto_edits_cold_page(m, monkeypatch):

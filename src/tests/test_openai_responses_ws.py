@@ -688,6 +688,79 @@ async def test_responses_ws_forced_fast_updates_wire_and_log(monkeypatch, m):
     assert "service_tier" not in json.loads(detail["request_body"])
 
 
+_ABSENT_MODEL = object()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_model", [_ABSENT_MODEL, None, "", "   ", ["bad"]])
+async def test_responses_ws_requires_explicit_model_before_schedule_or_log(
+    monkeypatch, m, invalid_model,
+):
+    _setup(m)
+    effects = {"schedule": 0, "log": 0, "connect": 0}
+
+    def schedule(*_args, **_kwargs):
+        effects["schedule"] += 1
+        raise AssertionError("invalid model must not schedule")
+
+    def insert(*_args, **_kwargs):
+        effects["log"] += 1
+        raise AssertionError("invalid model must not create pending log")
+
+    async def connect(*_args, **_kwargs):
+        effects["connect"] += 1
+        raise AssertionError("invalid model must not connect")
+
+    monkeypatch.setattr(m["responses_ws"].scheduler, "schedule", schedule)
+    monkeypatch.setattr(m["responses_ws"].log_db, "insert_pending", insert)
+    monkeypatch.setattr(m["responses_ws"], "_connect_upstream_ws", connect)
+    frame = {"type": "response.create", "input": "hello"}
+    if invalid_model is not _ABSENT_MODEL:
+        frame["model"] = invalid_model
+    ws = FakeWebSocket(frame)
+    await m["responses_ws"].handle_responses_ws(ws)
+    assert ws.accepted is True
+    expected = (
+        "model must be a non-empty string"
+        if invalid_model is not _ABSENT_MODEL
+        and invalid_model is not None
+        and not isinstance(invalid_model, str)
+        else "model is required"
+    )
+    assert ws.close_calls == [(4400, expected)]
+    assert effects == {"schedule": 0, "log": 0, "connect": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_model", [_ABSENT_MODEL, None, "", "   ", {"bad": True}])
+async def test_responses_ws_subsequent_create_requires_model_and_closes(
+    m, invalid_model,
+):
+    _setup(m)
+    frame = {"type": "response.create", "input": "hello"}
+    if invalid_model is not _ABSENT_MODEL:
+        frame["model"] = invalid_model
+    ws = FakeWebSocket(frame)
+    await ws.accept()
+    result = await m["responses_ws"]._receive_next_response_create(
+        ws,
+        channel=None,
+        allowed_models=["test-model"],
+        api_key_name="ws-key",
+        client_ip="1.2.3.4",
+        session_idle_timeout=1.0,
+    )
+    assert result is None
+    expected = (
+        "model must be a non-empty string"
+        if invalid_model is not _ABSENT_MODEL
+        and invalid_model is not None
+        and not isinstance(invalid_model, str)
+        else "model is required"
+    )
+    assert ws.close_calls == [(4400, expected)]
+
+
 @pytest.mark.asyncio
 async def test_responses_ws_rejects_non_response_create_first_frame(m):
     _setup(m)

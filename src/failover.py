@@ -28,13 +28,14 @@ import threading
 
 from . import (
     affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
-    local_web_tools, log_db, model_metadata, model_pricing, notifier, oauth_manager, quota_errors, scorer, state_db,
+    local_web_tools, log_db, model_metadata, model_pricing, model_state, notifier, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
 from .channel.base import Channel, UpstreamDispatchMetadata
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
+from .openai.transform.guard import GuardError
 from .openai.codex_identity import (
     capture_turn_state_event,
     release_request_turn_serialization,
@@ -702,6 +703,166 @@ def _attempt_body_for_channel(
     return body
 
 
+def _positive_output_limit(body: dict) -> tuple[str | None, int | None]:
+    shapes: list[dict] = [body]
+    nested = body.get("response")
+    if isinstance(nested, dict):
+        shapes.insert(0, nested)
+    for shape in shapes:
+        for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+            value = shape.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return key, parsed
+    return None, None
+
+
+def _candidate_budget_body(ch: Channel, resolved_model: str, body: dict) -> dict:
+    """Recheck source preferences, then clamp requested output per candidate.
+
+    Any request whose positive output limit exceeds this route's effective
+    maxOutputTokens is clamped down to that limit before translation: OAuth
+    sources (e.g. Cursor) silently crop output above their native cap, so a
+    client asking for a catalog maximum is compatible, not invalid. The final
+    wire-payload budget check in _validate_wire_payload_budget still rejects
+    whatever could not be clamped here (missing/invalid output fields).
+    """
+    client_model = str(body.get("_client_visible_model") or body.get("model") or resolved_model).strip()
+    if not model_state.is_source_enabled(str(ch.key), client_model):
+        raise GuardError(
+            400, "invalid_request_error", "Model is disabled for this source",
+            param="model", scope="candidate",
+        )
+    limit = model_metadata.max_output_tokens(
+        client_model,
+        scope_key=str(ch.key),
+        outbound_model=resolved_model,
+    )
+    key, requested = _positive_output_limit(body)
+    if limit is None or key is None or requested is None or requested <= limit:
+        return body
+    out = dict(body)
+    nested = body.get("response")
+    if isinstance(nested, dict) and key in nested:
+        out["response"] = dict(nested)
+        out["response"][key] = limit
+    else:
+        out[key] = limit
+    return out
+
+
+def _clamp_wire_output_limit(
+    ch: Channel,
+    resolved_model: str,
+    requested_body: dict,
+    wire_payload: dict,
+    dispatch_metadata: UpstreamDispatchMetadata | None,
+) -> dict:
+    """Clamp an already-built wire payload's output limit to the route cap.
+
+    Mirrors _candidate_budget_body for payloads produced by a translation
+    layer (e.g. WS response.create frames): a positive output limit above
+    this route's effective maxOutputTokens is lowered instead of rejected,
+    matching how OAuth sources silently crop oversized output.
+    """
+    client_model = str(
+        requested_body.get("_client_visible_model")
+        or requested_body.get("model")
+        or resolved_model
+    ).strip()
+    outbound_model = str(
+        getattr(dispatch_metadata, "outbound_model_id", "") or resolved_model
+    ).strip()
+    limit = model_metadata.max_output_tokens(
+        client_model,
+        scope_key=str(ch.key),
+        outbound_model=outbound_model,
+    )
+    key, requested = _positive_output_limit(wire_payload)
+    if limit is None or key is None or requested is None or requested <= limit:
+        return wire_payload
+    out = dict(wire_payload)
+    nested = wire_payload.get("response")
+    if isinstance(nested, dict) and key in nested:
+        out["response"] = dict(nested)
+        out["response"][key] = limit
+    else:
+        out[key] = limit
+    return out
+
+
+def _wire_payload(value: bytes | str | dict) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    try:
+        decoded = value.decode("utf-8") if isinstance(value, bytes) else value
+        payload = json.loads(decoded)
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _validate_wire_payload_budget(
+    ch: Channel,
+    resolved_model: str,
+    requested_body: dict,
+    wire_body: bytes | str | dict,
+    dispatch_metadata: UpstreamDispatchMetadata | None,
+) -> model_metadata.EffectiveRequestBudget | None:
+    """Check final input and output independently before candidate transport."""
+
+    payload = _wire_payload(wire_body)
+    if payload is None:
+        # All current inference channels are structured JSON. Preserve the
+        # compatibility policy for an unknown future body instead of guessing.
+        return None
+    client_model = str(
+        requested_body.get("_client_visible_model")
+        or requested_body.get("model")
+        or resolved_model
+    ).strip()
+    outbound_model = str(
+        getattr(dispatch_metadata, "outbound_model_id", "") or resolved_model
+    ).strip()
+    reserve = (
+        model_metadata.compact_buffer_tokens()
+        if requested_body.get(compact_rescue.INTERNAL_FLAG) is True
+        else 0
+    )
+    budget = model_metadata.effective_request_budget(
+        client_model,
+        scope_key=str(ch.key),
+        outbound_model=outbound_model,
+        request_shape=payload,
+        protocol_reserve_tokens=reserve,
+        use_max_context=_channel_uses_max_context(ch, requested_body, resolved_model),
+    )
+    if not budget.output_within_limit:
+        # Safety net only: ordinary requests are already clamped per candidate
+        # in _candidate_budget_body. A payload that still overflows here means
+        # the translation layer produced or preserved an oversized output field
+        # that could not be clamped from the requested body.
+        raise GuardError(
+            400,
+            "invalid_request_error",
+            "Requested output exceeds this route's effective maxOutputTokens: "
+            f"requested={budget.requested_output_tokens} max={budget.max_output_tokens} "
+            f"source={ch.key} outbound={outbound_model}",
+            param="max_tokens",
+            scope="candidate",
+        )
+    # Input length is deliberately NOT enforced here: providers tokenize
+    # differently and tiktoken is only a local estimate. The upstream remains
+    # the authority; its real context_length_exceeded errors flow through the
+    # established failover / compact-rescue handling.
+    return budget
+
+
 def _is_context_1m_credit_error(result: AttemptResult, resolved_model: str, body: dict) -> bool:
     return is_context_1m_credit_error(result, resolved_model, body)
 
@@ -1200,9 +1361,9 @@ async def _run_compact_direct_rescue_with_compression_model(
     """Try Claude Code compact with the configured large compression model.
 
     This is the fast path before map-reduce: if the configured compression
-    model's metadata says it can fit the entire compact request plus summary
-    reserve and buffer, call it directly.  Any failure returns (None, reason) so
-    callers can fall back to segmented map-reduce.
+    model's metadata says it can fit the entire compact input plus safety
+    buffer, call it directly. Summary output is bounded independently. Any
+    failure returns (None, reason) so callers can fall back to segmented map-reduce.
     """
     compression_model = model_metadata.get_compression_model()
     if not compression_model:
@@ -3218,6 +3379,9 @@ async def _build_oauth_responses_ws_upstream_request(
         resolved_model,
         channel=ch,
     )
+    _validate_wire_payload_budget(
+        ch, resolved_model, body, frame, req.dispatch_metadata,
+    )
     return (
         ws_url, headers, frame, req.translator_ctx, identity_state,
         req.dispatch_metadata,
@@ -3249,6 +3413,7 @@ async def _try_openai_oauth_responses_ws_channel(
     idle_timeout = int(timeouts.get("idle", 120))
 
     try:
+        body = _candidate_budget_body(ch, resolved_model, body)
         (
             ws_url, ws_headers, first_frame, translator_ctx, identity_state,
             dispatch_metadata,
@@ -4379,10 +4544,20 @@ async def _try_channel(
     idle_timeout = int(timeouts.get("idle", 30))
     total_timeout = int(timeouts.get("total", 600))
 
-    # 1. 构造上游请求
+    # 1. 构造上游请求；Parrot-owned compact output is clamped per
+    # candidate, then the final structured wire payload is checked before any
+    # transport or dispatch-price freeze.
     try:
+        body = _candidate_budget_body(ch, resolved_model, body)
         upstream_req = await ch.build_upstream_request(
             body, resolved_model, ingress_protocol=ingress_protocol,
+        )
+        _validate_wire_payload_budget(
+            ch,
+            resolved_model,
+            body,
+            upstream_req.body,
+            getattr(upstream_req, "dispatch_metadata", None),
         )
         await await_ws_owned(asyncio.to_thread(
             log_db.update_pending_fast_mode_from_upstream,

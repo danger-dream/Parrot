@@ -212,6 +212,14 @@ def _protocol_body_label(protocol: str) -> str:
     return ui.escape_html(_PROTOCOL_LABEL.get(protocol, protocol))
 
 
+def _provider_body_icon(provider: str | None) -> str:
+    """Rich brand icon only when providerId has an explicit configured mapping."""
+    return (
+        ui.provider_custom_emoji_html(provider)
+        if provider and ui.provider_custom_emoji_id(provider) else ""
+    )
+
+
 def _protocol_compact_label(protocol: str) -> str:
     """排序等紧凑列表用：短名即可，不带品牌图标、不展开家族、不带路径。"""
     if protocol == "openai-chat":
@@ -760,9 +768,12 @@ def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
     current: list[dict] = []
     for idx, ch in enumerate(page_chans, start=start + 1):
         icon, status = _channel_health(ch)
+        provider = str(getattr(ch, "provider_id", None) or "")
+        brand_icon = _provider_body_icon(provider)
+        brand_prefix = f"{brand_icon} " if brand_icon else ""
         ch_stats = by_channel.get(ch.key)
         lines.append("")
-        lines.append(f"{idx}. {icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
+        lines.append(f"{idx}. {brand_prefix}{icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
         local_lines = _channel_monthly_lines(ch, ch_stats)
         lines.append("  " + local_lines[0])
         usage_line = _usage_summary(ch)
@@ -770,7 +781,11 @@ def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
             lines.extend("  " + line for line in usage_line.splitlines())
         lines.extend("  " + line for line in local_lines[1:])
         short = ui.register_code(ch.display_name)
-        current.append(ui.btn(f"{idx}. {icon} {ch.display_name}", f"ch:view:{_callback_payload(short, page)}"))
+        current.append(ui.provider_button(
+            f"{idx}. {icon} {ch.display_name}",
+            f"ch:view:{_callback_payload(short, page)}",
+            provider,
+        ))
         if len(current) >= 2:
             rows.append(current)
             current = []
@@ -1096,6 +1111,7 @@ def _channel_model_lines(ch, model_stats: list[dict] | None = None,
 
 
 def _detail_text_and_kb(name: str, page: int = 1, *,
+                        chat_id: int = 0,
                         model_stats: list[dict] | None = None,
                         stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
     ch = _get_channel(name)
@@ -1105,12 +1121,15 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
     icon, status = _channel_health(ch)
     enabled = ch.enabled and not ch.disabled_reason
     protocol = _protocol_of(ch)
+    provider = str(getattr(ch, "provider_id", None) or "")
+    brand_icon = _provider_body_icon(provider)
+    brand_prefix = f"{brand_icon} " if brand_icon else ""
 
     api_path = getattr(ch, "api_path", None)
     # 展示完整 URL：apiPath 非空时拼完整，否则只给 baseUrl
     url_display = ch.base_url + api_path if api_path else ch.base_url
     lines = [
-        f"{icon} <b>{ui.escape_html(ch.display_name)}</b>",
+        f"{brand_prefix}{icon} <b>{ui.escape_html(ch.display_name)}</b>",
         "",
         f"🔗 URL: <code>{ui.escape_html(url_display)}</code>",
         f"🔑 Key: <code>{ui.escape_html(ch.api_key_masked_hint or '')}</code>",
@@ -1150,7 +1169,15 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
     short = ui.register_code(ch.display_name)
     payload = _callback_payload(short, page)
     toggle_label = "⬛ 禁用" if enabled else "✅ 启用"
+    from . import model_center_menu
+    manage_models_cb = model_center_menu.source_callback(
+        chat_id,
+        source_type="api",
+        source_id=ch.id,
+        origin=f"ch:view:{payload}",
+    )
     rows = [
+        [ui.provider_button("管理模型", manage_models_cb, provider)],
         [ui.btn("🧪 测试模型", f"ch:test:{short}"), ui.btn("✏ 编辑", f"ch:edit:{short}")],
         [ui.btn("🧹 清错误", f"ch:clear_errors:{payload}"),
          ui.btn("🔗 清亲和", f"ch:clear_affinity:{payload}")],
@@ -1202,7 +1229,7 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     ui.answer_cb(cb_id)
     menu_cache.begin_view(chat_id, message_id)
     text, kb = _detail_text_and_kb(
-        name, page=page, model_stats=cached.value,
+        name, page=page, chat_id=chat_id, model_stats=cached.value,
     )
     if text is not None:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -1223,7 +1250,7 @@ def on_usage_refresh(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         _ctx(chat_id), ch.id, force=True,
     ).queued)
     ui.answer_cb(cb_id, "已请求更新" if queued else "暂时无需重复更新")
-    text, kb = _detail_text_and_kb(name, page=page)
+    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
     if text: ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
@@ -1242,7 +1269,7 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     new_enabled = not (ch.enabled and not ch.disabled_reason)
     _control_update(name, {"enabled": new_enabled}, chat_id)
     ui.answer_cb(cb_id, "已启用" if new_enabled else "已禁用")
-    text, kb = _detail_text_and_kb(name, page=page)
+    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -1260,7 +1287,7 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, payload: str) -> 
     except ManagementError:
         pass
     ui.answer_cb(cb_id, "已清除")
-    text, kb = _detail_text_and_kb(name, page=page)
+    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -1278,7 +1305,7 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -
     except ManagementError:
         pass
     ui.answer_cb(cb_id, "已清空亲和")
-    text, kb = _detail_text_and_kb(name, page=page)
+    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 

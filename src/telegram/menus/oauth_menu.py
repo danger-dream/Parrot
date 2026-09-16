@@ -2115,21 +2115,6 @@ def _usage_toggle_target_label() -> str:
 
 
 def _settings_text_and_kb() -> tuple[str, dict]:
-    anthropic_models = _default_models_for_settings("anthropic")
-    openai_models = _default_models_for_settings("openai")
-    xai_models = _default_models_for_settings("xai")
-    antigravity_models = _default_models_for_settings("antigravity")
-    cfg = oauth_control.config_snapshot()
-    cursor_accounts = [
-        acc for acc in cfg.get("oauthAccounts", [])
-        if oauth_control.provider_of_snapshot(acc) == "cursor"
-    ]
-    xai_cfg = cfg.get("xaiOAuth") if isinstance(cfg.get("xaiOAuth"), dict) else {}
-    xai_image_models = xai_cfg.get("imageModels") if isinstance(xai_cfg.get("imageModels"), list) else []
-    xai_video_models = xai_cfg.get("videoModels") if isinstance(xai_cfg.get("videoModels"), list) else []
-    antigravity_image_models = _antigravity_image_models_for_settings()
-    images_cfg = cfg.get("images") if isinstance(cfg.get("images"), dict) else {}
-    gpt_images_status = "✅ 已启用" if images_cfg.get("enabled", True) else "🚫 已停用"
     mode_label = _usage_display_label()
     quota_enabled, quota_interval, quota_threshold = _quota_monitor_values()
     quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
@@ -2141,17 +2126,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     text = "\n".join([
         "⚙️ <b>OAuth 账户设置</b>",
         "",
-        "🧬 <b>默认模型</b>",
-        f"  {_provider_tag('claude')}  {len(anthropic_models)} 个 · "
-        f"{_provider_tag('openai')}  {len(openai_models)} 个 · "
-        f"{_provider_tag('xai')}  {len(xai_models)} 个",
-        f"  {_provider_tag('antigravity')}  {len(antigravity_models)} 个 · "
-        f"{_provider_tag('cursor')} 按账号自动同步（{len(cursor_accounts)} 个账号）",
-        "",
-        "🎨 <b>媒体能力</b>",
-        f"GPT / Codex 图片: {gpt_images_status}",
-        f"Grok Imagine: 图片 <b>{len(xai_image_models)}</b> · 视频 <b>{len(xai_video_models)}</b>",
-        f"Antigravity 出图: <b>{len(antigravity_image_models)}</b>",
+        "模型目录、备用模型与媒体设置已统一归位到模型中心；这里保留 OAuth 非模型设置。",
         "",
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
         f"当前模式: {_cch_status_label()}",
@@ -2166,13 +2141,10 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         f"禁用阈值: <code>{quota_threshold:.0f}%</code>",
     ])
     rows = [
-        [ui.btn("🧬 默认模型", "odm:show"),
-         ui.btn("📈 配额监控", "oa:quota")],
-        [ui.provider_button("GPT 图片", "img:show", "openai"),
-         ui.provider_button("Grok 图片", "xim:show", "xai")],
+        [ui.btn("📈 配额监控", "oa:quota")],
         [ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
         [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
-         ui.btn("☑ 进度条" if progress_enabled else "☐ 进度条", "oa:progress_bar:toggle")],
+         ui.btn(f"📊 进度条: {progress_status}", "oa:progress_bar:toggle")],
         [ui.btn("🏠 返回主菜单", "menu:main"),
          ui.btn("◀ 返回OAuth账户", "menu:oauth")],
     ]
@@ -3213,11 +3185,19 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
          ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")],
     ]
-    # All OAuth providers enter the same model-management experience.
-    # Legacy oa:cursor_* handlers remain below for already-sent messages.
-    manage_models_cb = f"oam:open:{short}:1:{max(1, int(page or 1))}:{filter_key}"
+    # All OAuth providers enter the same source-filtered model center.  The
+    # source identity crossing this boundary is the public accountId, never the
+    # legacy private account key carried by old ``oam:`` callbacks.
+    from . import model_center_menu
+    public_account_id = oauth_control.account_id_from_entry(acc)
+    manage_models_cb = model_center_menu.source_callback(
+        int(actor_chat_id or 0),
+        source_type="oauth",
+        source_id=public_account_id,
+        origin=f"oa:view:{payload}",
+    )
     rows += [
-        [ui.btn("🧬 管理模型", manage_models_cb),
+        [ui.provider_button("管理模型", manage_models_cb, prov),
          ui.btn("🚦 并发上限", f"oa:emax:{payload}")],
         [ui.btn("🧹 清模型故障", f"oa:clear_errors:{payload}"),
          ui.btn("🔗 清亲和绑定", f"oa:clear_affinity:{payload}")],
@@ -3241,7 +3221,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
 
 def _render_cached_detail(account_key: str, page: int, filter_key: str,
-                          *, refresh_quota: bool = False) -> tuple[Optional[str], Optional[dict]]:
+                          *, chat_id: int,
+                          refresh_quota: bool = False) -> tuple[Optional[str], Optional[dict]]:
     account = oauth_control.account_snapshot(account_key) or account_key
     row = oauth_control.quota_snapshot(account_key)
     local_period = _oauth_local_period(account, row=row)
@@ -3253,7 +3234,7 @@ def _render_cached_detail(account_key: str, page: int, filter_key: str,
     )
     return _detail_text_and_kb(
         account_key, page=page, filter_key=filter_key,
-        refresh_quota=refresh_quota,
+        refresh_quota=refresh_quota, actor_chat_id=chat_id,
         month_snapshot=natural.value,
         model_stats=models.value,
         stats_loading=aggregate is None or models.value is None,
@@ -3332,7 +3313,9 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1
         return
     ui.answer_cb(cb_id)
     menu_cache.begin_view(chat_id, message_id)
-    text, kb = _render_cached_detail(ak, page, filter_key, refresh_quota=False)
+    text, kb = _render_cached_detail(
+        ak, page, filter_key, chat_id=chat_id, refresh_quota=False,
+    )
     if text is not None:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -3348,7 +3331,10 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
 
     provider = oauth_control.provider_of_snapshot(ak)
     if provider == "workbuddy" and not oauth_control.workbuddy_refresh_enabled_snapshot():
-        text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+        text, kb = _detail_text_and_kb(
+            ak, page=page, filter_key=filter_key, refresh_quota=False,
+            actor_chat_id=chat_id,
+        )
         if text:
             ui.edit(chat_id, message_id, "🛡 保护模式已阻止刷新 Token，未发出刷新请求。\n\n" + text, reply_markup=kb)
         return
@@ -3399,7 +3385,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     if provider == "workbuddy":
         ui.answer_cb(cb_id, "查询中…")
         def render_query(feedback):
-            text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+            text, kb = _detail_text_and_kb(
+                ak, page=page, filter_key=filter_key, refresh_quota=False,
+                actor_chat_id=chat_id,
+            )
             return (feedback + "\n\n" + text if text else None), kb
         workbuddy_menu.start_status_query(chat_id, message_id, ak, render_query, control=oauth_control)
         return
@@ -3438,7 +3427,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
 
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+    text, kb = _detail_text_and_kb(
+        ak, page=page, filter_key=filter_key, refresh_quota=False,
+        actor_chat_id=chat_id,
+    )
     if not text:
         return
     if provider == "openai":
@@ -4115,7 +4107,10 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
     if provider == "openai":
         if not reset_idem or reset_stage != "execute":
             ui.answer_cb(cb_id, "需要先完成二次确认")
-            text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+            text, kb = _detail_text_and_kb(
+                ak, page=page, filter_key=filter_key, refresh_quota=False,
+                actor_chat_id=chat_id,
+            )
             if text:
                 ui.edit(chat_id, message_id,
                         "⚠️ <b>未执行重置</b>\nOpenAI 官方额度重置必须经过说明页和最终确认页，不能从旧按钮或直达回调直接执行。\n\n" + text,
@@ -4142,6 +4137,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
                 reset_credit_count_override = None
         text, kb = _detail_text_and_kb(
             ak, page=page, filter_key=filter_key, refresh_quota=False,
+            actor_chat_id=chat_id,
             reset_credit_count_override=reset_credit_count_override,
         )
         if not text:
@@ -4204,7 +4200,10 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "auth_error 需重新登录")
     else:
         ui.answer_cb(cb_id, "无需重置")
-    text, kb = _detail_text_and_kb(ak, page=page, filter_key=filter_key, refresh_quota=False)
+    text, kb = _detail_text_and_kb(
+        ak, page=page, filter_key=filter_key, refresh_quota=False,
+        actor_chat_id=chat_id,
+    )
     if text:
         if action == "reset":
             prefix = (
@@ -4467,7 +4466,7 @@ def _run_oauth_update_panel(chat_id: int, progress_mid: int, account_keys: list[
         if final_detail_account_key:
             text, kb = _detail_text_and_kb(
                 final_detail_account_key, page=page, filter_key=filter_key,
-                refresh_quota=False,
+                refresh_quota=False, actor_chat_id=chat_id,
             )
         else:
             text, kb = _render_cached_list(page, filter_key)
@@ -6350,6 +6349,43 @@ def on_clear_all_errors(chat_id: int, message_id: int, cb_id: str, page: int = 1
     cleared = oauth_control.clear_all_errors(_management_context(chat_id))
     ui.answer_cb(cb_id, f"已清除 {cleared} 个账户的冷却")
     show(chat_id, message_id, page=page, filter_key=filter_key)
+
+
+def _redirect_legacy_cursor_callback(
+    chat_id: int, message_id: int, cb_id: str, data: str,
+) -> bool:
+    if not data.startswith("oa:cursor_"):
+        return False
+    if not ui.is_admin(chat_id):
+        ui.answer_cb(cb_id, "⛔ 无权限", show_alert=True)
+        return True
+    account_key = ""
+    if data.startswith(("oa:cursor_model:", "oa:cursor_maxctx:")):
+        payload = data.split(":", 2)[2]
+        ref = payload.split(":", 1)[0]
+        resolved = _resolve_cursor_model_ref(ref)
+        if resolved is not None:
+            account_key = resolved[0]
+    else:
+        payload = data.split(":", 2)[2] if data.count(":") >= 2 else ""
+        short = payload.split(":", 1)[0]
+        account_key = _account_key_from_short(short) or ""
+        if not account_key:
+            state = _cursor_disable_state(chat_id) or {}
+            account_key = str(state.get("account_key") or "")
+    account = oauth_control.account_snapshot(account_key) if account_key else None
+    if account is None:
+        ui.answer_cb(cb_id, "Cursor 页面已过期", show_alert=True)
+        return True
+    from . import model_center_menu
+    short = ui.register_code(account_key)
+    model_center_menu.open_source(
+        chat_id, message_id, cb_id,
+        source_type="oauth",
+        source_id=oauth_control.account_id_from_entry(account),
+        origin=f"oa:view:{short}:1:all",
+    )
+    return True
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:

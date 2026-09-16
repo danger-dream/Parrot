@@ -17,8 +17,10 @@ from src.telegram import bot, menu_cache, states, ui
 from src.telegram.menus import image_menu as menu
 from src.tests.tg_contract import assert_capability_coverage, assert_strict_equal, load_jsonl
 
+from src.tests.tg_contract.current import load_current_jsonl
+
 SEGMENT = Path(__file__).parent / "fixtures/tg_contract/v0.31.13/segments/auxiliary.jsonl"
-CASES = [c for c in load_jsonl(SEGMENT) if c["capabilityId"] == "TG-IMG-01"] if SEGMENT.exists() else []
+CASES = [c for c in load_current_jsonl(SEGMENT) if c["capabilityId"] == "TG-IMG-01"] if SEGMENT.exists() else []
 IMAGES = {"enabled": True, "cacheEnabled": False, "mainModel": "gpt-5.4-mini", "toolModel": "gpt-image-2", "cachePath": "images", "cacheRetentionDays": 30, "cacheMaxBytes": 1073741824, "disabledAccounts": []}
 BASE = {"images": IMAGES}
 

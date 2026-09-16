@@ -34,6 +34,7 @@ from ..schemas.mapping import (
     PutCompressionModelRequest,
     PutIngressDefaultRequest,
     PutMappingRequest,
+    UpdateMappingRequest,
 )
 
 
@@ -54,8 +55,10 @@ _COMMON_ERRORS = (
 _RESOURCE_ERRORS = (*_COMMON_ERRORS, ManagementErrorCode.RESOURCE_NOT_FOUND)
 _MUTATION_ERRORS = (
     *_RESOURCE_ERRORS,
+    ManagementErrorCode.CONFIRMATION_REQUIRED,
     ManagementErrorCode.REVISION_CONFLICT,
     ManagementErrorCode.RESOURCE_CONFLICT,
+    ManagementErrorCode.UNSUPPORTED_VALUE,
 )
 
 
@@ -143,6 +146,32 @@ def put_model_mapping(
     reject_unknown_query_parameters(request)
     item = control.put_mapping(
         context, alias, body.realModel, expected_revision=if_match
+    )
+    return MappingEnvelope(data=_mapping(item), meta=_meta(request))
+
+
+@router.patch(
+    "/model-mappings/{alias:path}",
+    operation_id="updateModelMapping",
+    tags=["management-model-mapping"],
+    response_model=MappingEnvelope,
+    responses={**_success(200, _MAPPING_EXAMPLE), **management_error_responses(*_MUTATION_ERRORS)},
+)
+def update_model_mapping(
+    alias: Annotated[str, Path(min_length=1, max_length=300)],
+    body: UpdateMappingRequest,
+    request: Request,
+    context: WriteContext,
+    control: Annotated[MappingControl, Depends(get_mapping_control)],
+    if_match: IfMatch = None,
+) -> MappingEnvelope:
+    reject_unknown_query_parameters(request)
+    item = control.update_mapping(
+        context,
+        alias,
+        new_alias=body.alias,
+        real_model=body.realModel,
+        expected_revision=if_match,
     )
     return MappingEnvelope(data=_mapping(item), meta=_meta(request))
 

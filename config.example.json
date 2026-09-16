@@ -232,6 +232,16 @@
     "defaults": {},
     "scoped": {}
   },
+  "modelMetadataOverrides": {
+    "defaults": {},
+    "scoped": {}
+  },
+  "modelCenter": {
+    "schemaVersion": 1,
+    "disabledModels": [],
+    "hiddenModels": [],
+    "apiSourceDisabledModels": {}
+  },
   "compressionModel": "",
   "modelMetadata": {},
   "protocolBridge": {
@@ -436,11 +446,25 @@
   },
   "telegramUi": {
     "providerCustomEmoji": {
-      "openai": "5861557411784957025",
-      "claude": "5872779796257184592",
-      "xai": "5819115571463068721",
+      "openai": "6141162084857031383",
+      "claude": "6140995813788099525",
+      "antigravity": "6077644693984779782",
       "cursor": "6062261319426390107",
-      "antigravity": "6077644693984779782"
+      "ollama-cloud": "6138524734419116492",
+      "workbuddy": "6120617435214132136",
+      "xai": "6138882363460952713",
+      "kimi": "6140905172798284383",
+      "deepseek": "6138914554240836667",
+      "zhipu": "6140727700454645813",
+      "minimax": "6141114311935796161",
+      "alibaba-bailian": "6138926816372465673",
+      "tencent-cloud": "6140662000339918826",
+      "jd-cloud": "6138855790498291964",
+      "volcengine-ark": "6141018834812806707",
+      "baidu-qianfan": "6138964148228204290",
+      "xiaomi-mimo": "6138428226503975259",
+      "ctyun-xirang": "6138918874977936421",
+      "openrouter": "6140767025175209650"
     },
     "providerBtnEmoji": {
       "openai": "🅾️",

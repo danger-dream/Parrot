@@ -34,7 +34,7 @@ from fastapi.responses import Response
 
 from .. import (
     affinity, auth, config, errors, failover, fingerprint, local_web_tools,
-    log_db, model_mapping, notifier, scheduler, translation,
+    log_db, model_mapping, model_validation, notifier, scheduler, translation,
 )
 from ..client_ip import get_client_ip
 from ..channel import registry
@@ -92,7 +92,6 @@ def _normalize_model_context_controls(
 ) -> str:
     """Normalize model mapping plus explicit Max Context signals for OpenAI ingress."""
     original_model = body.get("model")
-    model_mapping.apply_default(body, ingress_line)
     model_mapping.apply_mapping(body, ingress_line)
     stripped_model = strip_context_1m_model_marker(body.get("model"))
     if stripped_model != body.get("model"):
@@ -532,17 +531,23 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
         return errors.json_error_openai(
             400, errors.ErrTypeOpenAI.INVALID_REQUEST, "request body must be a JSON object",
         )
+    try:
+        body["model"] = model_validation.require_explicit_model(body)
+    except model_validation.ExplicitModelError as exc:
+        return errors.json_error_openai(
+            400, errors.ErrTypeOpenAI.INVALID_REQUEST, exc.message, param=exc.param,
+        )
     if ingress_protocol == "chat":
         normalize_chat_reasoning_alias(body)
 
     # Preserve the original client-provided field set before Parrot mutates the
-    # body (default model, internal _api_key_name, auto prompt_cache_key, ...).
+    # body (mapping, internal _api_key_name, auto prompt_cache_key, ...).
     # Cross-protocol guards use this to reject user-explicit fields that have no
     # safe equivalent while allowing internal compatibility hints.
     body["_client_body_fields"] = sorted(str(k) for k in body.keys() if isinstance(k, str))
 
-    # 2.1 模型映射 / 入口默认模型：
-    #     - body.model 缺失 → 填入该 ingress 的默认（若配置）
+    # 2.1 模型映射：
+    #     - body.model 已要求下游显式提供
     #     - body.model 命中别名 → 改写成真实名（只解一层）
     #     - `[1m]` / `~1000000` 等显式 Max Context marker 在映射前后归一
     #     后续白名单/调度/channel 全按 canonical 名走，1M 意图单独保存。
