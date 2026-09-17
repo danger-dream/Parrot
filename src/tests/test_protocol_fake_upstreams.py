@@ -2390,15 +2390,19 @@ async def test_xai_stream_only_response_content_type_tracks_downstream(
 
     _setup(m)
     _install_keys(m, _default_key())
-    channel = XAIOAuthChannel({
+    account = {
         "provider": "xai",
         "email": "header-contract@example.test",
         "subject": "header-contract-subject",
         "models": ["grok-4.5"],
-    })
+    }
+    original_accounts = copy.deepcopy(m['config'].get().get('oauthAccounts', []))
+    m['config'].update(lambda cfg: cfg.__setitem__('oauthAccounts', [account]))
+    channel = XAIOAuthChannel(account)
     _install_channels(m, [channel])
 
-    async def valid_token(_account_key):
+    async def valid_token(_account_key, *, expected_state_key=None):
+        assert expected_state_key == channel.state_key  # generation binding now applies to xAI as well
         return "fake-header-contract-token"
 
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
@@ -2455,6 +2459,7 @@ async def test_xai_stream_only_response_content_type_tracks_downstream(
                 assert payload["type"] == "message"
     finally:
         await client.aclose()
+        m['config'].update(lambda cfg: cfg.__setitem__('oauthAccounts', original_accounts))
 
 
 async def test_xai_direct_503_retries_same_channel_without_health_penalty(m, monkeypatch):

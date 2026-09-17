@@ -16,7 +16,7 @@ from typing import Any
 
 from . import common
 from .guard import GuardError
-from ... import local_web_tools
+from ... import local_web_tools, search_hosted_codec
 from ...protocols.usage import legacy_usage_from_openai_responses_json
 
 
@@ -63,6 +63,8 @@ def guard_request(
             _fail(f"unsupported Anthropic message role for Responses bridge: {role!r}", param="messages")
         for block in _blocks(msg.get("content")):
             typ = block.get("type")
+            if search_hosted_codec.is_anthropic_search(block):
+                continue
             if typ == "tool_result":
                 _guard_tool_result_content(block)
                 continue
@@ -345,8 +347,17 @@ def _messages_to_input_items(
         if codex_oauth and role == "system":
             role = "developer"
         parts: list[dict[str, Any]] = []
-        for block in _blocks(msg.get("content")):
+        blocks = _blocks(msg.get("content"))
+        hosted_items = {item.get("id"): item for item in search_hosted_codec.anthropic_to_responses(blocks)}
+        for block in blocks:
             typ = block.get("type")
+            if search_hosted_codec.is_anthropic_search(block):
+                if typ == "server_tool_use" and block.get("id") in hosted_items:
+                    _flush_message(items, role, parts)
+                    native_item = dict(hosted_items[block["id"]])
+                    native_item.pop(search_hosted_codec.SOURCE, None)
+                    items.append(native_item)
+                continue
             if typ == "text":
                 content_type = "output_text" if role == "assistant" else "input_text"
                 parts.append({"type": content_type, "text": str(block.get("text") or "")})
@@ -420,23 +431,12 @@ def _web_tool_schema(kind: str) -> dict[str, Any]:
 
 
 def _server_tool_to_responses(tool: dict[str, Any]) -> dict[str, Any] | None:
-    typ = tool.get("type")
-    name = str(tool.get("name") or "")
-    if typ in local_web_tools.ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
-        return {
-            "type": "function",
-            "name": name or "web_search",
-            "description": "Search the web. Executed locally by Parrot through AnySearch when needed.",
-            "parameters": _web_tool_schema("search"),
-        }
-    if typ in local_web_tools.ANTHROPIC_WEB_FETCH_TOOL_TYPES:
-        return {
-            "type": "function",
-            "name": name or "web_fetch",
-            "description": "Fetch a URL and return extracted page content. Executed locally by Parrot through AnySearch when needed.",
-            "parameters": _web_tool_schema("fetch"),
-        }
-    return None
+    # Managed declarations were compiled by the execution owner before this
+    # candidate translator. A remaining server tool is native passthrough.
+    if not local_web_tools.is_anthropic_web_tool_type(tool.get("type")):
+        return None
+    from ...search_native_tools import to_responses
+    return to_responses(tool)
 
 
 def _tools_to_responses(tools: Any) -> list[dict[str, Any]]:
@@ -538,15 +538,14 @@ def translate_request(
         payload["tools"] = tools
     tool_choice = _tool_choice_to_responses(body.get("tool_choice"))
     if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
-    if _disable_parallel_tool_calls(body.get("tool_choice")) or (
-        common.disable_parallel_tool_calls_for_local_web()
-        and local_web_tools.request_declares_supported_tools(body)
-    ):
-        # Local web tools are executed inside Parrot.  Disable parallel tool
-        # calls so the upstream model does not mix Parrot-handled WebSearch /
-        # WebFetch calls with client-handled Claude Code tools in one turn.
+        choice_name = (body.get("tool_choice") or {}).get("name") if isinstance(body.get("tool_choice"), dict) else None
+        selected = next((t for t in body.get("tools") or [] if isinstance(t, dict) and t.get("name") == choice_name and local_web_tools.is_anthropic_web_tool_type(t.get("type"))), None)
+        payload["tool_choice"] = {"type": _server_tool_to_responses(selected)["type"]} if selected else tool_choice
+    if _disable_parallel_tool_calls(body.get("tool_choice")):
         payload["parallel_tool_calls"] = False
+    if any(isinstance(t, dict) and t.get("type") == "web_search" for t in tools):
+        from ...search_native_tools import SOURCE_KEY
+        payload[SOURCE_KEY] = "anthropic"
     return payload
 
 
@@ -648,6 +647,8 @@ def translate_response(
                     value = part.get("text") or part.get("refusal")
                     if isinstance(value, str) and value:
                         content.append({"type": "text", "text": value})
+        elif item.get("type") == "web_search_call":
+            content.extend(search_hosted_codec.responses_to_anthropic(item))
         elif item.get("type") == "function_call":
             signature = str(item.get("encrypted_content") or item.get("thoughtSignature") or "").strip()
             if allow_reasoning_bridge and signature and signature not in seen_signatures:

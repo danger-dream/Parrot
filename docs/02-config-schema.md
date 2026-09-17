@@ -2,6 +2,12 @@
 
 所有可变配置集中于 `config.json`，目录根下。支持热加载（`config.py` 用 `mtime` 检测文件改动）。
 
+## OAuth 普通模型目录（2026-09-16）
+
+OAuth 备用模型已退役。普通对话只使用账户 `models` 的成功同步目录 / LKG；同步异常或空返回不覆盖已有 `models` / `account_model_catalog`。首次没有目录时没有可路由模型，请在模型中心或 OAuth 账户中同步上游。
+
+正常加载及保存配置时移除 `oauthDefaultModels`、`openaiOAuth.defaultModels`、`xaiOAuth.defaultModels`、`antigravityOAuth.defaultModels`，并清除历史别名 `oauth.providers.openai.defaultModels`。不会迁移静态名单到账户目录，不改变别名、Key 白名单或 API 渠道列表。Codex 协议档案、元数据、身份配置、`image_models` / `video_models`、Cursor / WorkBuddy 自身目录机制保持不变。
+
 ## 2.1 完整 Schema（带默认值）
 
 ```jsonc
@@ -58,7 +64,7 @@
       "enabled": true,
       "disabled_reason": null,       // null | "user" | "quota" | "auth_error"
       "disabled_until": null,        // ISO 时间；quota 模式下为下次 resets_at
-      "models": [                    // 该账号支持的模型，留空则用 oauthDefaultModels
+      "models": [                    // 账户成功同步目录/LKG；首次为空时无可路由模型，请同步上游
         "claude-opus-4-5",
         "claude-opus-4-6",
         "claude-opus-4-7",
@@ -217,16 +223,6 @@
   // ─── CCH 模式（Claude Code 伪装） ───
   "cchMode": "disabled",             // "dynamic" | "disabled"
 
-  // ─── OAuth 默认模型（当账号的 models 字段留空时使用） ───
-  "oauthDefaultModels": [
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001"
-  ],
-
   // ─── 渠道测试（添加渠道时的 probe） ───
   "probe": {
     "timeoutSeconds": 60,
@@ -301,8 +297,7 @@
     "imageModels": ["grok-imagine-image", "grok-imagine-image-quality"],
     "videoModels": ["grok-imagine-video", "grok-imagine-video-1.5"],
     "videoJobTtlSeconds": 10800,                // request_id → OAuth 账号绑定保留 3 小时
-    "mediaRequestTimeoutSeconds": 180,
-    "defaultModels": ["grok-4.5"]               // 仅文本 /responses 调度
+    "mediaRequestTimeoutSeconds": 180
   },
 
   // ─── Cursor OAuth / 内部 AgentService bridge ───

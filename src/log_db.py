@@ -4530,6 +4530,129 @@ def _merge_token_stats_agg(target: dict, source: dict) -> None:
         target[key] = float(value) if current is None else pick(float(current), float(value))
 
 
+# Model-center usage deliberately has its own narrow, cost-free batch path.
+# Keep raw TPS weights until the selected execution routes have been merged.
+_model_center_usage_lock = threading.Lock()
+_model_center_usage_sealed: dict[str, tuple[tuple, dict]] = {}
+
+
+def _aggregate_model_center_usage_month(conn: sqlite3.Connection) -> dict:
+    """All execution routes in one month; counts/TPS are root-request facts.
+
+    Token replacement follows _replace_model_tokens_with_attempts, but groups
+    every channel/model together instead of scanning once per visible model.
+    Unknown final routes stay unknown (never resolve historical requested aliases).
+    """
+    buckets: dict[tuple[str, str], dict] = {}
+    expressions = {
+        "inp": "input_tokens", "outp": "output_tokens",
+        "cc": "cache_creation_tokens", "cr": "cache_read_tokens",
+    }
+    token_sql = ", ".join(f"{_TOKEN_SUM_TOKENS[k]} AS {k}" for k in expressions)
+
+    def apply(rows, sign=1, *, requests=False):
+        for row in rows:
+            key = (row["channel"] or "?", row["model"] or "?")
+            bucket = buckets.setdefault(key, _new_token_stats_agg())
+            for field, column in (("input", "inp"), ("output", "outp"),
+                                  ("cache_creation", "cc"), ("cache_read", "cr")):
+                bucket[field] += sign * int(row[column] or 0)
+            if requests:
+                for field in ("total", "success_count", "error_count"):
+                    bucket[field] += int(row[field] or 0)
+                _merge_tps(bucket, row)
+
+    # All three reads see the same SQLite snapshot, including late settlements.
+    with _management_search_snapshot(conn):
+        apply(_token_aggregate_rows(
+            conn,
+            f"""SELECT COALESCE(final_channel_key, '?') AS channel,
+                       COALESCE(final_model, '?') AS model,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                       SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_count,
+                       {token_sql}, {_tps_agg_sql()}
+                FROM request_log GROUP BY channel, model""",
+            (), expressions=expressions,
+        ), requests=True)
+        if _attempt_rows_exist(conn):
+            apply(_token_aggregate_rows(
+                conn,
+                f"""SELECT COALESCE(final_channel_key, '?') AS channel,
+                           COALESCE(final_model, '?') AS model, {token_sql}
+                    FROM request_log WHERE {_final_observed_attempt_sql(conn)}
+                    GROUP BY channel, model""",
+                (), expressions=expressions,
+            ), -1)
+            effective = _effective_attempt_exprs(conn, alias="a")
+            apply(_token_aggregate_rows(
+                conn,
+                f"""SELECT COALESCE(a.channel_key, '?') AS channel,
+                           COALESCE(a.model, '?') AS model, {token_sql}
+                    FROM upstream_attempt_usage a
+                    JOIN request_log ON request_log.request_id=a.root_request_id
+                    WHERE ({effective['usage_observed']})=1
+                      AND ({effective['included']})=1
+                      AND COALESCE(a.call_request_id, '')<>''
+                    GROUP BY channel, model""",
+                (), expressions={
+                    "inp": effective["input"], "outp": effective["output"],
+                    "cc": effective["cache_creation"], "cr": effective["cache_read"],
+                },
+            ))
+    return buckets
+
+
+def _sealed_model_center_usage_month(path: str) -> dict:
+    file_before = _file_stat_signature(path)
+    conn = _open_readonly(path)
+    try:
+        before = _sealed_read_signature(path, conn)
+        stable = file_before == before[1] and before[1] is not None
+        cached = _model_center_usage_sealed.get(path)
+        if stable and cached is not None and cached[0] == before:
+            return cached[1]
+        value = _aggregate_model_center_usage_month(conn)
+        after = _sealed_read_signature(path, conn)
+        if stable and before == after:
+            _model_center_usage_sealed[path] = (after, value)
+        else:
+            _model_center_usage_sealed.pop(path, None)
+        return value
+    finally:
+        conn.close()
+
+
+def model_center_usage_snapshot() -> dict[tuple[str, str], dict]:
+    """Retained lifetime usage by (final channel, executed model), not aliases.
+
+    One batch per month, independent of catalog size, pages and source filters.
+    Strict monthly source enumeration includes the live month exactly once;
+    unchanged sealed months reuse bounded-signature validated raw aggregates.
+    A failed month fails the whole refresh, so SWR keeps the last good snapshot.
+    """
+    result: dict[tuple[str, str], dict] = {}
+    if _log_dir is None or not os.path.isdir(_log_dir):
+        return result
+    with _model_center_usage_lock:
+        sealed_paths: set[str] = set()
+        for source in _management_log_sources():
+            month, path, live = source
+            try:
+                if live:
+                    partial = _aggregate_model_center_usage_month(_get_conn())
+                else:
+                    sealed_paths.add(path)
+                    partial = _sealed_model_center_usage_month(path)
+                for key, raw in partial.items():
+                    _merge_token_stats_agg(result.setdefault(key, _new_token_stats_agg()), raw)
+            except Exception as exc:
+                raise HistoricalLogError(f"model_center_usage failed for {month}: {exc}") from exc
+        for path in set(_model_center_usage_sealed) - sealed_paths:
+            _model_center_usage_sealed.pop(path, None)
+    return result
+
+
 def channel_model_stats(channel_key: str, since_ts: float) -> list[dict]:
     """跨月按 final_model 分组聚合某渠道下每个模型的统计（含 TPS）。
 

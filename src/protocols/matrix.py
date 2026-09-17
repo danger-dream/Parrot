@@ -239,9 +239,9 @@ def _hosted_tool_labels(ingress_protocol: str, body: dict[str, Any]) -> tuple[st
                 continue
             typ = tool.get("type")
             if ingress_protocol == "anthropic" and typ not in (None, "function"):
-                if typ in _ANTHROPIC_LOCAL_WEB_TOOL_TYPES:
-                    continue
-                return (str(typ),)
+                # Managed tools were compiled before feature extraction. Any
+                # remaining server declaration still needs native capability.
+                return tuple(str(t.get("type")) for t in tools if isinstance(t, dict) and t.get("type") not in (None, "function"))
             if ingress_protocol == "chat" and typ not in (None, "function"):
                 return (str(typ),)
     choice = body.get("tool_choice")
@@ -310,13 +310,16 @@ def _responses_stateful_input_item_label(body: dict[str, Any]) -> str | None:
     if unresolved_item_reference:
         return unresolved_item_reference
     items = _responses_input_like_items(body)
+    search_history = False
     for item in items:
         if not isinstance(item, dict):
             continue
         typ = item.get("type")
-        if typ in _RESPONSES_BUILTIN_INPUT_ITEM_TYPES:
+        if typ == "web_search_call":
+            search_history = True
+        elif typ in _RESPONSES_BUILTIN_INPUT_ITEM_TYPES:
             return str(typ)
-    return None
+    return "web_search_call" if search_history else None
 
 
 def _responses_custom_tool_label(body: dict[str, Any]) -> str | None:
@@ -742,6 +745,11 @@ def _anthropic_document_unsupported_label(block: dict[str, Any], *, allow_url: b
 
 def extract_request_features(ingress_protocol: str, body: dict | None) -> RequestFeatures:
     body = body if isinstance(body, dict) else {}
+    # Schedule against the provider-neutral managed shape, without mutating
+    # ingress declarations or choosing a provider merely because it exists.
+    from .. import search_tool_policy
+    if search_tool_policy.needs_loop(body):
+        body, _ = search_tool_policy.compile_request(body, ingress_protocol)
     wants_multi_candidate = (
         ingress_protocol == "chat"
         and isinstance(body.get("n"), int)
@@ -1106,6 +1114,8 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
             })
     if protocol == "openai-responses" and ch_type == "oauth" and provider != "xai":
         transports.add("ws")
+    if channel.__class__.__name__ == "OpenAIOAuthChannel":
+        native_state.add("web_search")
     return ChannelCapabilities(
         protocol=protocol,
         transports=frozenset(transports),
@@ -1145,7 +1155,8 @@ def _responses_hosted_tool_supported(label: str | None, native: frozenset[str]) 
     for tool_type in _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES:
         if label in {tool_type, f"tool_choice:{tool_type}", f"tool_choice:allowed_tools:{tool_type}"}:
             return tool_type in native
-    if label in {"web_search", "tool_choice:web_search", "tool_choice:allowed_tools:web_search"}:
+    search_label = label.removeprefix("tool_choice:").removeprefix("allowed_tools:")
+    if search_label == "web_search" or search_label.startswith("web_search_"):
         return "web_search" in native or "hosted_tools" in native
     if label in native:
         return True
@@ -1268,7 +1279,9 @@ class ProtocolMatrix:
                     required_transforms=["anthropic_to_chat"],
                 )
             if ingress == "anthropic" and upstream == "openai-responses":
-                if f.has_hosted_tools:
+                labels = f.hosted_tool_labels or ((f.hosted_tool_label,) if f.hosted_tool_label else ())
+                native_search = bool(labels) and all(str(label).startswith("web_search_") for label in labels) and bool({"web_search", "hosted_tools"} & capabilities.native_state)
+                if f.has_hosted_tools and not native_search:
                     raise ProtocolGuardError(
                         "Anthropic→OpenAI Responses built-in/server tools are not enabled yet"
                         + _label_suffix(f.hosted_tool_label)
@@ -1342,7 +1355,7 @@ class ProtocolMatrix:
                     )
                 if f.has_encrypted_reasoning:
                     raise ProtocolGuardError("OpenAI Responses→Anthropic include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet")
-                if f.has_stateful_input_items:
+                if f.has_stateful_input_items and f.stateful_input_item_label != "web_search_call":
                     raise ProtocolGuardError(
                         "OpenAI Responses→Anthropic stateful input items are not enabled yet"
                         + _label_suffix(f.stateful_input_item_label)

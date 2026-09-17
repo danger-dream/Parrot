@@ -65,7 +65,7 @@ def cache_root(cfg: dict[str, Any], *, create: bool = True) -> Path:
 def artifact_path_is_safe(path: str | Path, cfg: dict[str, Any]) -> bool:
     target = Path(path)
     try:
-        if target.is_symlink() or not target.is_file():
+        if target.is_symlink() or not target.is_file() or (cfg.get("_media_kind") and not belongs_to(target, cfg["_media_kind"])):
             return False
         root = cache_root(cfg, create=False)
         target.resolve().relative_to(root)
@@ -144,7 +144,9 @@ def write_bytes(
         raise ValueError("unsupported generated media extension")
     root = cache_root(cfg)
     day = time.strftime("%Y%m%d", time.localtime())
-    out_dir = root / day
+    type_dir = root / media_type
+    if type_dir.is_symlink(): raise ValueError("cache media directory must not be a symlink")
+    out_dir = type_dir / day
     if out_dir.exists() and out_dir.is_symlink():
         raise ValueError("cache day directory must not be a symlink")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -225,9 +227,10 @@ def cleanup(root: Path, cfg: dict[str, Any]) -> None:
     except Exception:
         retention_days, max_bytes = 0, 0
     files: list[Path] = []
+    kind = cfg.get("_media_kind", "image")
     for path in resolved_root.rglob("*"):
         try:
-            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in _ALLOWED_SUFFIXES:
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in _ALLOWED_SUFFIXES or not belongs_to(path, kind):
                 continue
             resolved = path.resolve()
             resolved.relative_to(resolved_root)
@@ -267,3 +270,19 @@ def cleanup(root: Path, cfg: dict[str, Any]) -> None:
                 total -= size
             except OSError:
                 pass
+
+
+def belongs_to(path: str | Path, kind: str) -> bool:
+    """Classify old flat and new media subfolders without deleting/moving history."""
+    suffix = Path(path).suffix.lower()
+    return suffix in ({'.mp4', '.webm', '.mov', '.m4v'} if kind == 'video' else {'.png', '.jpg', '.jpeg', '.webp', '.gif'})
+
+
+def occupancy(cfg: dict) -> dict:
+    root = cache_root(cfg, create=False)
+    paths = [path for path in root.rglob('*') if belongs_to(path, cfg.get('_media_kind', 'image')) and artifact_path_is_safe(path, cfg)] if root.exists() else []
+    sizes = []
+    for path in paths:
+        try: sizes.append(path.stat().st_size)
+        except OSError: pass
+    return {'files': len(sizes), 'bytes': sum(sizes)}

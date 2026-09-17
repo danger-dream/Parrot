@@ -15,7 +15,7 @@ import hashlib
 import json
 from typing import Optional
 
-from .. import cache_hints, config, local_web_tools, oauth_manager
+from .. import cache_hints, config, local_web_tools, oauth_manager, search_tool_wire
 from ..channel.url_utils import resolve_upstream_url
 from ..oauth import xai as xai_provider
 from ..providers import registry as provider_registry
@@ -96,7 +96,7 @@ class XAIOAuthChannel(Channel):
     protocol = "openai-responses"
     upstream_stream_only = True
 
-    def __init__(self, account: dict, default_models: list[str] | None = None):
+    def __init__(self, account: dict):
         from ..oauth_ids import account_key as _account_key
 
         self.email = account["email"]
@@ -123,41 +123,17 @@ class XAIOAuthChannel(Channel):
             or None
         )
 
-        models = account.get("models") or []
-        if models:
-            selected_models = list(models)
-        elif default_models:
-            selected_models = list(default_models)
-        else:
-            selected_models = list(
-                _provider_cfg().get("defaultModels")
-                or (config.DEFAULT_CONFIG.get("xaiOAuth") or {}).get("defaultModels")
-                or []
-            )
+        selected_models = list(account.get("models") or [])
         disabled_models = {
             str(model).strip() for model in account.get("disabledModels") or []
             if str(model).strip()
         }
         self.models = [model for model in selected_models if model not in disabled_models]
 
-        provider_cfg = _provider_cfg()
-        image_models = (
-            account.get("imageModels")
-            if "imageModels" in account
-            else provider_cfg.get("imageModels")
-        )
-        video_models = (
-            account.get("videoModels")
-            if "videoModels" in account
-            else provider_cfg.get("videoModels")
-        )
-        # 媒体模型不并入 self.models，避免被普通文本 /responses 调度器选中。
-        self.image_models = [
-            str(m) for m in (image_models or []) if str(m).strip()
-        ]
-        self.video_models = [
-            str(m) for m in (video_models or []) if str(m).strip()
-        ]
+        from .. import media_config, oauth_manager
+        self.state_key = oauth_manager.account_state_key(account)
+        self.image_models = media_config.account_models(account, 'image')
+        self.video_models = media_config.account_models(account, 'video')
 
     def supports_model(self, requested_model: str) -> Optional[str]:
         if requested_model not in self.models:
@@ -169,13 +145,19 @@ class XAIOAuthChannel(Channel):
 
     def supports_media_model(self, kind: str, requested_model: str) -> bool:
         """Return whether this OAuth account is enabled for one Imagine model."""
-        if kind == "image":
-            models = self.image_models
-        elif kind == "video":
-            models = self.video_models
-        else:
-            models = []
-        return requested_model in models
+        from .. import media_config, oauth_manager, channel_state, model_state
+        if kind not in ('image', 'video') or channel_state.is_deleted(self.state_key): return False
+        try:
+            account = oauth_manager.get_account(self.account_key)
+        except Exception:
+            return False
+        if not isinstance(account, dict):
+            return False
+        return (oauth_manager.account_state_key(account) == self.state_key
+                and media_config.oauth_state(account, kind)['enabled']
+                and requested_model in media_config.account_models(account, kind)
+                and model_state.is_global_enabled(requested_model)
+                and model_state.is_source_enabled(self.key, requested_model))
 
     async def build_media_headers(self) -> dict[str, str]:
         """Reuse the existing OAuth lifecycle and return JSON Imagine headers."""
@@ -247,6 +229,7 @@ class XAIOAuthChannel(Channel):
             protocol="openai-responses",
         )
         payload = _sanitize_xai_payload(payload, stream=True)
+        payload, dynamic_map = search_tool_wire.compile_xai(payload, stream=True)
 
         access_token = await oauth_manager.ensure_channel_token(self)
         headers = self._build_headers(access_token)
@@ -263,7 +246,7 @@ class XAIOAuthChannel(Channel):
             url=resolve_upstream_url(self.base_url, self.api_path, "/responses"),
             headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-            dynamic_tool_map=None,
+            dynamic_tool_map=dynamic_map,
             translator_ctx=translator_ctx,
             dispatch_metadata=build_dispatch_metadata(
                 payload, "openai-responses", headers,
@@ -272,7 +255,7 @@ class XAIOAuthChannel(Channel):
 
     async def restore_response(self, chunk: bytes,
                                dynamic_map: Optional[dict] = None) -> bytes:
-        return chunk
+        return search_tool_wire.restore_bytes(chunk, dynamic_map)
 
     def display(self) -> ChannelDisplay:
         return ChannelDisplay(

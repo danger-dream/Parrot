@@ -105,9 +105,10 @@ def test_known_urls_are_collected_for_web_fetch_policy():
     assert calls[0].input["_known_urls"] == ["https://example.com/article"]
 
 
-def test_anysearch_current_default_policy_baseline(monkeypatch):
-    # Baseline before adding anysearch config knobs: keep the current defaults
-    # and local validation behavior unchanged.
+def test_search_service_default_policy_baseline(monkeypatch):
+    # New defaults are independent of a preceding test's legacy config fixture.
+    from src import search_service
+    monkeypatch.setattr(search_service, "settings", lambda: dict(search_service.DEFAULTS))
     assert local_web_tools._max_results() == 8
     assert local_web_tools._max_fetch_chars() == 50000
     assert local_web_tools.max_tool_rounds() == 50
@@ -118,25 +119,25 @@ def test_anysearch_current_default_policy_baseline(monkeypatch):
     assert short_query.is_error is True
     assert "too short" in short_query.content
 
-    long_url = "https://example.com/" + ("a" * 260)
+    long_url = "https://example.com/" + ("a" * 2100)
     long_url_result = asyncio.run(local_web_tools.execute_local_tool_call(
         local_web_tools.LocalToolCall("call_fetch", "WebFetch", {"url": long_url})
     ))
     assert long_url_result.is_error is True
-    assert "250 characters" in long_url_result.content
+    assert "2048 characters" in long_url_result.content
 
     active = 0
     max_active = 0
 
-    async def fake_call(tool_name: str, arguments: dict) -> str:
+    async def fake_call(tool_name: str, arguments: dict, **kwargs) -> str:
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return "ok"
+        return '{"content":"ok"}'
 
-    monkeypatch.setattr(local_web_tools, "_call_anysearch", fake_call)
+    monkeypatch.setattr(local_web_tools, "_call_search_service", fake_call)
     calls = [local_web_tools.LocalToolCall(f"call_{i}", "WebSearch", {"query": f"query {i}"}) for i in range(5)]
     results = asyncio.run(local_web_tools.execute_local_tool_calls(calls))
     assert all(not r.is_error for r in results)
@@ -166,16 +167,16 @@ def test_anysearch_custom_policy_config(monkeypatch):
     active = 0
     max_active = 0
 
-    async def fake_call(tool_name: str, arguments: dict) -> str:
+    async def fake_call(tool_name: str, arguments: dict, **kwargs) -> str:
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
         seen_calls.append((tool_name, arguments))
-        return "ok"
+        return '{"content":"ok"}'
 
-    monkeypatch.setattr(local_web_tools, "_call_anysearch", fake_call)
+    monkeypatch.setattr(local_web_tools, "_call_search_service", fake_call)
     fetch = asyncio.run(local_web_tools.execute_local_tool_call(
         local_web_tools.LocalToolCall("call_fetch", "WebFetch", {
             "url": "https://x.co/a",
@@ -192,10 +193,10 @@ def test_anysearch_custom_policy_config(monkeypatch):
 
 
 def test_web_fetch_rejects_urls_not_seen_in_conversation(monkeypatch):
-    async def fake_call(tool_name: str, arguments: dict) -> str:  # pragma: no cover - should not be reached
+    async def fake_call(tool_name: str, arguments: dict, **kwargs) -> str:  # pragma: no cover - should not be reached
         raise AssertionError("AnySearch should not be called for disallowed fetch URL")
 
-    monkeypatch.setattr(local_web_tools, "_call_anysearch", fake_call)
+    monkeypatch.setattr(local_web_tools, "_call_search_service", fake_call)
 
     result = asyncio.run(local_web_tools.execute_local_tool_call(
         local_web_tools.LocalToolCall("call_fetch", "WebFetch", {
@@ -211,13 +212,13 @@ def test_web_fetch_rejects_urls_not_seen_in_conversation(monkeypatch):
 def test_execute_search_and_fetch_with_anysearch_monkeypatch(monkeypatch):
     seen: list[tuple[str, dict]] = []
 
-    async def fake_call(tool_name: str, arguments: dict) -> str:
+    async def fake_call(tool_name: str, arguments: dict, **kwargs) -> str:
         seen.append((tool_name, arguments))
         if tool_name == "search":
             return "## Search Results\nresult"
-        return "Fetched page content"
+        return '{"content":"Fetched page content"}'
 
-    monkeypatch.setattr(local_web_tools, "_call_anysearch", fake_call)
+    monkeypatch.setattr(local_web_tools, "_call_search_service", fake_call)
     monkeypatch.setattr(local_web_tools, "_max_results", lambda: 3)
     monkeypatch.setattr(local_web_tools, "_max_fetch_chars", lambda: 1000)
 
@@ -238,11 +239,11 @@ def test_execute_search_and_fetch_with_anysearch_monkeypatch(monkeypatch):
     assert "Fetched page content" in results[1].content
     assert seen[0] == (
         "search",
-        {"query": "(site:platform.claude.com) Claude web search -site:spam.example", "max_results": 3},
+        {"query": "Claude web search", "allowed_domains": ["platform.claude.com"], "blocked_domains": ["spam.example"], "max_results": 3},
     )
     assert seen[1] == (
         "extract",
-        {"url": "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool"},
+        {"url": "https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool", "prompt": "summarize"},
     )
 
 
@@ -308,7 +309,7 @@ def test_remove_supported_tools_from_body_and_round_limit_results():
 def test_execute_local_tool_calls_records_search_log(monkeypatch):
     events = []
 
-    async def fake_call(tool_name: str, arguments: dict) -> str:
+    async def fake_call(tool_name: str, arguments: dict, **kwargs) -> str:
         return "1. Result A https://example.com/a\n2. Result B https://example.com/b"
 
     def fake_start(request_id, round_no, tool_name, query=None, url=None, started_at=None):
@@ -318,7 +319,7 @@ def test_execute_local_tool_calls_records_search_log(monkeypatch):
     def fake_finish(log_id, **kwargs):
         events.append(("finish", log_id, kwargs))
 
-    monkeypatch.setattr(local_web_tools, "_call_anysearch", fake_call)
+    monkeypatch.setattr(local_web_tools, "_call_search_service", fake_call)
     monkeypatch.setattr(local_web_tools.log_db, "record_local_web_call", fake_start)
     monkeypatch.setattr(local_web_tools.log_db, "finish_local_web_call", fake_finish)
 
@@ -372,7 +373,7 @@ def test_stream_anthropic_response_task_with_pings_keeps_stream_alive():
     assert "done" in out
 
 
-def test_prepare_openai_responses_local_web_tools_converts_web_search_and_drops_unsupported():
+def test_prepare_openai_responses_preserves_original_and_compiles_managed_only():
     body = {
         "model": "m",
         "input": "search",
@@ -387,16 +388,17 @@ def test_prepare_openai_responses_local_web_tools_converts_web_search_and_drops_
 
     assert local_web_tools.prepare_openai_responses_local_web_tools(body) is True
 
-    assert body[local_web_tools.OPENAI_LOCAL_WEB_MARKER] is True
-    assert body["tools"][0]["type"] == "function"
-    assert body["tools"][0]["name"] == "web_search"
-    assert body["tools"][0]["parameters"]["required"] == ["query"]
-    assert [t.get("type") for t in body["tools"]] == ["function", "tool_search", "function"]
-    assert [t.get("name") for t in body["tools"]] == ["web_search", None, "lookup"]
-    assert body["tool_choice"] == {"type": "function", "name": "web_search"}
+    # Ingress preparation no longer mutates declarations before scheduling.
+    assert body["tools"][0]["type"] == "web_search_preview_2025_03_11"
+    assert body["tools"][2] == {"type": "image_generation"}
+    from src.search_tool_policy import compile_request
+    compiled, plan = compile_request(body, "responses")
+    assert compiled["tools"][0]["type"] == "function"
+    assert next(iter(plan.values())).category == "hosted"
+    assert compiled["tools"][2] == {"type": "image_generation"}
 
 
-def test_prepare_openai_responses_preserves_tool_search_and_drops_image_generation_without_marker():
+def test_prepare_openai_responses_preserves_non_search_tools():
     body = {
         "model": "m",
         "input": "hi",
@@ -407,7 +409,7 @@ def test_prepare_openai_responses_preserves_tool_search_and_drops_image_generati
 
     assert local_web_tools.prepare_openai_responses_local_web_tools(body) is False
 
-    assert body["tools"] == [{"type": "tool_search"}]
+    assert body["tools"] == [{"type": "tool_search"}, {"type": "image_generation"}]
     assert body["tool_choice"] == {"type": "tool_search"}
     assert body["parallel_tool_calls"] is True
     assert local_web_tools.OPENAI_LOCAL_WEB_MARKER not in body

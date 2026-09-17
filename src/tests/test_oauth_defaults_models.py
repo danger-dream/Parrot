@@ -1,269 +1,247 @@
+"""OAuth fallback retirement: no static routes, no old writes, real LKG survives."""
 from __future__ import annotations
 
-import asyncio
 import copy
+import importlib.util
+import json
+from pathlib import Path
 
 import pytest
 
-from src import config, state_db
-from src.models_discovery import ModelsDiscoveryError
-from src.telegram import states, ui
-from src.telegram.menus import oauth_defaults_menu
+from src import config, oauth_manager, oauth_model_discovery, state_db
+from src.channel import registry
+from src.channel.oauth_channel import OAuthChannel
+from src.channel.openai_oauth_channel import OpenAIOAuthChannel
+from src.channel.xai_oauth_channel import XAIOAuthChannel
+from src.channel.antigravity_oauth_channel import AntigravityOAuthChannel
+from src.management_control.oauth import OAuthBackend, OAuthControl
+from src.openai.codex_constants import current_codex_protocol_profile
+from src.telegram import bot, states, ui
+from src.telegram.menus import oauth_account_models_menu, oauth_menu
 
-_MUTATED_TOP_KEYS = (
-    "oauthDefaultModels",
-    "oauthAccounts",
-    "apiKeys",
-    "modelMapping",
-    "ingressDefaultModel",
-)
-
-
-@pytest.fixture(autouse=True)
-def _restore_oauth_defaults_config():
-    """本文件会改家族默认模型，测完必须还原，避免污染后续 Channel 回落测试。"""
-    before = config.get()
-    snapshot = {key: copy.deepcopy(before.get(key)) for key in _MUTATED_TOP_KEYS}
-    openai_models = copy.deepcopy((before.get("openaiOAuth") or {}).get("defaultModels"))
-    xai_models = copy.deepcopy((before.get("xaiOAuth") or {}).get("defaultModels"))
-    antigravity_models = copy.deepcopy((before.get("antigravityOAuth") or {}).get("defaultModels"))
-    yield
-
-    def restore(cfg):
-        for key, value in snapshot.items():
-            cfg[key] = copy.deepcopy(value)
-        cfg.setdefault("openaiOAuth", {})["defaultModels"] = copy.deepcopy(openai_models)
-        cfg.setdefault("xaiOAuth", {})["defaultModels"] = copy.deepcopy(xai_models)
-        cfg.setdefault("antigravityOAuth", {})["defaultModels"] = copy.deepcopy(antigravity_models)
-
-    config.update(restore)
+RETIRED_OPERATIONS = {
+    "getOAuthDefaultModels", "replaceOAuthDefaultModels", "discoverOAuthDefaultModels",
+}
+CHANNELS = {
+    "claude": OAuthChannel, "openai": OpenAIOAuthChannel,
+    "xai": XAIOAuthChannel, "antigravity": AntigravityOAuthChannel,
+}
 
 
-def _reset():
+def legacy_fields(cfg):
+    cfg["oauthDefaultModels"] = ["retired-static"]
+    for section in ("openaiOAuth", "xaiOAuth", "antigravityOAuth"):
+        cfg.setdefault(section, {})["defaultModels"] = ["retired-static"]
+    cfg.setdefault("oauth", {}).setdefault("providers", {}).setdefault("openai", {})["defaultModels"] = ["retired-static"]
+
+
+def assert_retired(cfg):
+    assert "oauthDefaultModels" not in cfg
+    for section in ("openaiOAuth", "xaiOAuth", "antigravityOAuth"):
+        assert "defaultModels" not in cfg.get(section, {})
+    assert "defaultModels" not in cfg.get("oauth", {}).get("providers", {}).get("openai", {})
+
+
+@pytest.fixture
+def domain(monkeypatch):
     state_db.init()
+    before = copy.deepcopy(config.get())
+    channels_before = registry._channels.copy()
     states.clear_all()
-    def clear(cfg):
-        cfg["oauthDefaultModels"] = ["claude-old", "claude-keep"]
-        cfg.setdefault("openaiOAuth", {})["defaultModels"] = ["gpt-keep"]
-        cfg.setdefault("xaiOAuth", {})["defaultModels"] = ["grok-4.5", "grok-local"]
-        cfg.setdefault("antigravityOAuth", {})["defaultModels"] = ["gemini-3.7-flash-high"]
-        cfg["oauthAccounts"] = []
-        cfg["apiKeys"] = {}
-        cfg["modelMapping"] = {"global": {}}
-        cfg["ingressDefaultModel"] = {}
-    config.update(clear)
+    monkeypatch.setattr(registry, "_sync_state_db_with_channels", lambda: None)
+    yield
+    config.update(lambda cfg: (cfg.clear(), cfg.update(before)))
+    registry._channels = channels_before
+    states.clear_all()
 
 
-def _patch_ui(monkeypatch):
-    edits, sends, answers, results = [], [], [], []
-    monkeypatch.setattr(oauth_defaults_menu.ui, "edit", lambda *a, **k: edits.append((a, k)) or {"ok": True})
-    monkeypatch.setattr(oauth_defaults_menu.ui, "send", lambda *a, **k: sends.append((a, k)) or {"ok": True})
-    monkeypatch.setattr(oauth_defaults_menu.ui, "answer_cb", lambda *a, **k: answers.append((a, k)))
-    monkeypatch.setattr(oauth_defaults_menu.ui, "send_result", lambda *a, **k: results.append((a, k)))
-    return edits, sends, answers, results
-
-
-def test_overview_buttons_use_provider_custom_icons():
-    kb = oauth_defaults_menu._overview_kb()["inline_keyboard"]
-    assert [b["text"] for b in kb[0]] == ["Claude", "OpenAI", "Grok"]
-    assert kb[0][0]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("claude")
-    assert kb[0][1]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
-    assert kb[0][2]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("xai")
-    assert [b["text"] for b in kb[1]] == ["Antigravity"]
-    assert kb[1][0]["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("antigravity")
-    assert kb[1][0]["icon_custom_emoji_id"] == "6077644693984779782"
-    assert kb[2][0]["callback_data"] == "mc:settings"
-
-
-def test_account_settings_no_longer_duplicates_antigravity_catalog():
-    from src.telegram.menus import oauth_menu
-
-    _reset()
-    assert oauth_menu._default_models_for_settings("antigravity") == ["gemini-3.7-flash-high"]
-    assert "claude-old" not in oauth_menu._default_models_for_settings("antigravity")
-    text, _kb = oauth_menu._settings_text_and_kb()
-    assert "模型目录、备用模型与媒体设置已统一归位到模型中心" in text
-    assert "Antigravity" not in text
-    assert "Antigravity 出图:" not in text
-    acc = {
-        "provider": "antigravity",
-        "email": "ag@example.com",
-        "project_id": "proj-1",
+@pytest.mark.parametrize("provider", CHANNELS)
+@pytest.mark.asyncio
+async def test_catalog_success_routes_failure_and_empty_keep_lkg(provider, domain, monkeypatch):
+    account = {
+        "provider": provider, "email": f"retirement-{provider}@example.invalid",
+        "subject": "subject", "workspace_id": "workspace", "project_id": "project",
+        "models": [], "access_token": "fake", "refresh_token": "fake",
+        "expired": "2999-01-01T00:00:00Z", "enabled": True,
     }
-    assert oauth_menu._antigravity_catalog_counts(acc)[0] == 1
+    config.update(lambda cfg: cfg.update(oauthAccounts=[account], channels=[], modelMapping={}))
+    key = oauth_manager.get_account_key(account)
+
+    async def token(_key):
+        return "fake"
+
+    monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
+    monkeypatch.setattr(oauth_manager, "mock_mode_enabled", lambda: False)
+    empty = oauth_model_discovery.DiscoveryResult([], {}, f"upstream:{provider}")
+    monkeypatch.setattr(oauth_model_discovery, "discover", lambda *a, **kw: empty)
+    assert (await oauth_manager.refresh_account_models(key))["action"] == "empty"
+    assert oauth_manager.account_model_selection(key)["models"] == []
+    assert CHANNELS[provider](oauth_manager.get_account(key)).list_client_models() == []
+    registry.rebuild_from_config()
+    assert registry.available_models() == []
+    text, kb = oauth_account_models_menu.render(key)
+    assert "当前无可路由模型" in text and "同步上游" in text
+    assert "正在使用默认模型" not in text
+    assert not any(b.get("callback_data", "").startswith("odm:") for row in kb["inline_keyboard"] for b in row)
+
+    catalog = {"schema": 1, "models": [{"id": "live-model", "contextWindow": 12345}]}
+    success = oauth_model_discovery.DiscoveryResult(["live-model"], catalog, f"upstream:{provider}")
+    monkeypatch.setattr(oauth_model_discovery, "discover", lambda *a, **kw: success)
+    assert (await oauth_manager.refresh_account_models(key))["action"] == "updated"
+    good = oauth_manager.get_account(key)
+    lkg = copy.deepcopy(good["account_model_catalog"])
+    synced_at = good["last_model_sync"]
+    registry.rebuild_from_config()
+    assert registry.available_models() == ["live-model"]
+    assert registry.get_channel("oauth:" + key).supports_model("live-model") == "live-model"
+
+    def timeout(*a, **kw):
+        raise TimeoutError("fake timeout")
+
+    def error(*a, **kw):
+        raise RuntimeError("fake unavailable")
+
+    for discover, action in ((timeout, "timeout"), (lambda *a, **kw: empty, "empty"), (error, "error")):
+        monkeypatch.setattr(oauth_model_discovery, "discover", discover)
+        assert (await oauth_manager.refresh_account_models(key))["action"] == action
+        saved = oauth_manager.get_account(key)
+        assert saved["models"] == ["live-model"]
+        assert saved["account_model_catalog"] == lkg
+        assert saved["last_model_sync"] == synced_at
+        assert saved["last_model_sync_error"]
+        registry.rebuild_from_config()
+        assert registry.available_models() == ["live-model"]
+        assert CHANNELS[provider](saved).supports_model("live-model") == "live-model"
+        text, _ = oauth_account_models_menu.render(key)
+        assert "正在使用上次成功目录" in text
 
 
-def test_claude_skips_live_and_uses_static(monkeypatch):
-    _reset()
-    edits, *_ = _patch_ui(monkeypatch)
-    async def unexpected(*a, **k):
-        raise AssertionError("claude has no live models endpoint")
-    monkeypatch.setattr(oauth_defaults_menu, "discover_models", unexpected)
-    oauth_defaults_menu._start_edit(7, 99, "cb", "anthropic")
-    state = states.get_state(7)
-    assert state["action"] == "odm_model_select"
-    assert state["data"]["models_source"] == "static"
-    assert "claude-old" in state["data"]["discovered_models"]
-    assert "claude-keep" in state["data"]["selected_models"]
-    factory = oauth_defaults_menu._static_models("anthropic")
-    for mid in factory:
-        if mid not in ("claude-old", "claude-keep"):
-            assert mid not in state["data"]["selected_models"]
-    assert all("正在发现模型" not in str(call[0]) for call in edits)
-    assert "内置参考模型" in edits[-1][0][2]
-    callbacks = [b["callback_data"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
-    assert "odm:ok" in callbacks and "odm:manual" in callbacks
-    assert "odm:retry" not in callbacks
+@pytest.mark.parametrize("provider", CHANNELS)
+def test_runtime_ignores_retired_fields_even_without_migration(provider, monkeypatch):
+    cfg = copy.deepcopy(config.get())
+    legacy_fields(cfg)
+    monkeypatch.setattr(config, "get", lambda: cfg)
+    account = {"provider": provider, "email": "retired@example.invalid", "project_id": "project", "models": []}
+    selected = oauth_manager.account_model_selection(account)
+    assert selected["models"] == selected["effective_models"] == selected["records"] == []
+    assert selected["source"].endswith(":awaiting-account-catalog")
+    channel = CHANNELS[provider](account)
+    assert channel.list_client_models() == []
+    assert channel.supports_model("retired-static") is None
+    profile = current_codex_protocol_profile()
+    assert profile.models  # packaged protocol metadata is not retired
+    for model in profile.models:
+        assert channel.supports_model(model) is None
+    account["models"] = ["live-model", "disabled-model"]
+    account["disabledModels"] = ["disabled-model"]
+    assert CHANNELS[provider](account).list_client_models() == ["live-model"]
 
 
-def test_grok_live_failure_falls_back_to_static(monkeypatch):
-    _reset()
-    edits, *_ = _patch_ui(monkeypatch)
-    monkeypatch.setattr(oauth_defaults_menu, "_SYNC_SPAWN", True)
-    async def fail(*a, **k):
-        raise ModelsDiscoveryError("safe failure")
-    monkeypatch.setattr(oauth_defaults_menu, "discover_models", fail)
-    oauth_defaults_menu._start_edit(7, 99, "cb", "xai")
-    state = states.get_state(7)
-    assert state["action"] == "odm_model_select"
-    assert state["data"]["models_source"] == "static"
-    assert state["data"]["discovery_error"] == "没有可用的 Grok 账户用于拉取模型"
-    assert state["data"]["discovery_retry_available"] is True
-    assert "grok-4.5" in state["data"]["discovered_models"]
-    assert "可能不是最新版本" in edits[-1][0][2]
-    callbacks = [b["callback_data"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
-    assert "odm:retry" in callbacks and "odm:manual" in callbacks
-
-
-def test_grok_live_success_filters_imagine_and_prechecks(monkeypatch):
-    _reset()
-    edits, *_ = _patch_ui(monkeypatch)
-    monkeypatch.setattr(oauth_defaults_menu, "_SYNC_SPAWN", True)
-    monkeypatch.setattr(oauth_defaults_menu, "_first_enabled_account_key", lambda provider: "xai:demo")
-    async def token(account_key):
-        return "tok"
-    monkeypatch.setattr("src.oauth_manager.ensure_valid_token", token)
-    async def live(*a, **k):
-        return ["grok-4.5", "grok-imagine-image", "grok-4.5-fast"]
-    monkeypatch.setattr(oauth_defaults_menu, "discover_models", live)
-    oauth_defaults_menu._start_edit(7, 99, "cb", "xai")
-    state = states.get_state(7)
-    assert state["action"] == "odm_model_select"
-    assert state["data"]["models_source"] == "live"
-    assert state["data"]["discovered_models"] == ["grok-4.5", "grok-local", "grok-4.5-fast"]
-    assert state["data"]["selected_models"] == ["grok-4.5", "grok-local"]
-    assert "已从上游获取 3 个模型" in edits[-1][0][2]
-    text = edits[-1][0][2]
-    labels = [b["text"] for row in edits[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
-    assert "3. ⬜ <code>grok-4.5-fast</code> - 未加入 · 新" in text
-    assert labels[:3] == ["1", "2", "3"]
-    # Draft toggles keep the initial enabled-first/name order stable so model
-    # indices do not jump while the user is selecting.
-    oauth_defaults_menu._model_toggle(7, 99, "cb", 2, 0)
-    assert states.get_state(7)["data"]["discovered_models"] == [
-        "grok-4.5", "grok-local", "grok-4.5-fast",
-    ]
-
-
-def test_default_model_selector_uses_twelve_per_page_and_six_columns(monkeypatch):
-    _reset()
-    edits, *_ = _patch_ui(monkeypatch)
-    ids = [f"model-{index:02d}" for index in range(23)]
-    oauth_defaults_menu._enter_select(
-        7, 99,
-        {"family": "xai", "existing_models": ["model-03", "model-20"]},
-        ids, source="live",
+def test_load_save_migrates_only_retired_fields(tmp_path, monkeypatch):
+    original = copy.deepcopy(config.get())
+    legacy_fields(original)
+    original.update(
+        image_models={"openai": ["image-custom"], "xai": ["grok-image-custom"]},
+        video_models={"xai": ["video-custom"]},
+        oauthAccounts=[],
+        channels=[{"name": "api", "models": [{"alias": "client", "real": "upstream"}]}],
     )
-    text = edits[-1][0][2]
-    kb = edits[-1][1]["reply_markup"]
-    buttons = [button for row in kb["inline_keyboard"] for button in row]
-    model_buttons = [
-        button for button in buttons
-        if str(button.get("callback_data") or "").startswith("odm:t:")
-    ]
-    assert "第 <b>1/2</b> 页 · 每页最多 <b>12</b> 项" in text
-    assert len(model_buttons) == 12
-    assert [button["text"] for button in model_buttons] == [
-        str(index) for index in range(1, 13)
-    ]
-    number_rows = [
-        row for row in kb["inline_keyboard"]
-        if row and str(row[0].get("callback_data") or "").startswith("odm:t:")
-    ]
-    assert [len(row) for row in number_rows] == [6, 6]
-    assert any(
-        str(button.get("callback_data") or "").startswith("odm:p:")
-        for button in buttons
-    )
-    assert states.get_state(7)["data"]["model_page"] == 0
-
-    oauth_defaults_menu._model_page(7, 99, "cb", 1)
-    text2 = edits[-1][0][2]
-    kb2 = edits[-1][1]["reply_markup"]
-    model_buttons2 = [
-        button for row in kb2["inline_keyboard"] for button in row
-        if str(button.get("callback_data") or "").startswith("odm:t:")
-    ]
-    assert "第 <b>2/2</b> 页 · 每页最多 <b>12</b> 项" in text2
-    assert [button["text"] for button in model_buttons2] == [
-        str(index) for index in range(13, 24)
-    ]
-    assert states.get_state(7)["data"]["model_page"] == 1
+    original["xaiOAuth"]["imageModels"] = ["legacy-image"]
+    original["xaiOAuth"]["videoModels"] = ["legacy-video"]
+    original["antigravityOAuth"]["imageModels"] = ["ag-image"]
+    keep = {key: copy.deepcopy(original[key]) for key in (
+        "image_models", "video_models", "channels", "cursorOAuth", "workbuddyOAuth",
+    ) if key in original}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(original))
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    monkeypatch.setattr(config, "_cache", None)
+    monkeypatch.setattr(config, "_mtime", 0)
+    monkeypatch.setattr(config, "_reload_callbacks", [])
+    loaded = config.get()
+    assert_retired(loaded)
+    assert_retired(json.loads(path.read_text()))
+    for key, value in keep.items():
+        assert loaded[key] == value
+    assert loaded["openaiOAuth"]["codexIdentity"] == original["openaiOAuth"]["codexIdentity"]
+    assert loaded["openaiOAuth"]["codexProtocolProfile"] == original["openaiOAuth"]["codexProtocolProfile"]
+    assert loaded["openaiOAuth"]["codexCliVersion"] == original["openaiOAuth"]["codexCliVersion"]
+    assert loaded["xaiOAuth"]["imageModels"] == ["legacy-image"]
+    assert loaded["xaiOAuth"]["videoModels"] == ["legacy-video"]
+    assert loaded["antigravityOAuth"]["imageModels"] == ["ag-image"]
+    assert config._retire_oauth_default_models(loaded) is False
+    legacy_fields(loaded)
+    config.save()
+    assert_retired(loaded)
+    assert_retired(json.loads(path.read_text()))
+    config.update(legacy_fields)
+    assert_retired(config.get())
+    assert_retired(json.loads(path.read_text()))
+    assert_retired(config.DEFAULT_CONFIG)
+    assert_retired(json.loads(Path("config.example.json").read_text()))
 
 
-def test_confirm_saves_selected_without_reference_prompt(monkeypatch):
-    _reset()
-    _patch_ui(monkeypatch)
-    states.set_state(7, "odm_model_select", {
-        "family": "anthropic",
-        "existing_models": ["claude-old", "claude-keep"],
-        "discovered_models": ["claude-keep", "claude-new", "claude-old"],
-        "selected_models": ["claude-keep", "claude-new"],
-    })
-    oauth_defaults_menu._model_confirm(7, 99, "cb")
-    assert config.get()["oauthDefaultModels"] == ["claude-keep", "claude-new"]
-    assert states.get_state(7) is None
+def test_removed_control_and_schema_surface():
+    for name in ("get_default_models", "replace_default_models", "replace_default_models_raw",
+                 "discover_default_models", "default_models_snapshot", "static_default_models_snapshot",
+                 "scan_default_model_references"):
+        assert not hasattr(OAuthControl, name)
+    for name in ("default_models", "static_default_models", "replace_default_models",
+                 "replace_default_models_conditional", "default_models_state"):
+        assert not hasattr(OAuthBackend, name)
+    assert importlib.util.find_spec("src.telegram.menus.oauth_defaults_menu") is None
+    assert importlib.util.find_spec("src.management_control.oauth.default_models") is None
+    assert not hasattr(bot, "oauth_defaults_menu")
 
 
-def test_delete_with_refs_opens_confirm(monkeypatch):
-    _reset()
-    def seed(cfg):
-        cfg["oauthDefaultModels"] = ["claude-a", "claude-b"]
-        cfg["ingressDefaultModel"] = {"anthropic": "claude-b"}
-    config.update(seed)
-    _patch_ui(monkeypatch)
-    sends = []
-    monkeypatch.setattr(oauth_defaults_menu.ui, "send", lambda *a, **k: sends.append((a, k)))
-    states.set_state(7, "odm_model_select", {
-        "family": "anthropic",
-        "existing_models": ["claude-a", "claude-b"],
-        "discovered_models": ["claude-a", "claude-b"],
-        "selected_models": ["claude-a"],
-    })
-    oauth_defaults_menu._model_confirm(7, 99, "cb")
-    assert config.get()["oauthDefaultModels"] == ["claude-a", "claude-b"]
-    assert "确认保存" in sends[-1][0][1]
-    callbacks = [b["callback_data"] for row in sends[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
-    assert any(cb.startswith("odm:commit:") and cb.endswith(":keep") for cb in callbacks)
-    assert any(cb.startswith("odm:commit:") and cb.endswith(":clean") for cb in callbacks)
+def test_retired_api_routes_cannot_write_or_create_operations(tmp_path):
+    from src.tests.test_management_oauth_api import auth_client, request
+    client, headers, runtime, control, backend = auth_client(tmp_path)
+    before = copy.deepcopy(backend.accounts)
+    operations = len(runtime.operations._items)
+    try:
+        for family in ("anthropic", "openai", "xai", "antigravity"):
+            for method, suffix, body in (
+                ("GET", "", None), ("PUT", "", {"models": ["fake"], "cleanupReferences": True}),
+                ("POST", "/actions/discover", None),
+            ):
+                for auth in ({}, headers):
+                    response = request(client, method, f"/oauth/default-models/{family}{suffix}", body, auth)
+                    assert response.status_code == 404, response.text
+        schema = client.app.openapi()
+        assert not any("/oauth/default-models" in path for path in schema["paths"])
+        assert not any("DefaultModel" in name for name in schema["components"]["schemas"])
+        assert backend.accounts == before
+        assert len(runtime.operations._items) == operations
+    finally:
+        client.__exit__(None, None, None)
 
 
-def test_catalog_show_invalidates_inflight_discovery(monkeypatch):
-    _reset()
-    factories = []
-    monkeypatch.setattr(oauth_defaults_menu, "_spawn_async_task", lambda factory, name="": factories.append(factory))
-    _patch_ui(monkeypatch)
-    data = {"family": "xai", "existing_models": ["grok-4.5"], "selected_models": ["grok-4.5"]}
-    oauth_defaults_menu._start_discovery(7, 99, data)
-    assert states.get_state(7)["action"] == "odm_discovery"
-    oauth_defaults_menu.show(7, 99, "cb")
-    assert states.get_state(7) is None
-    async def late(*a, **k):
-        return ["late-model"]
-    monkeypatch.setattr(oauth_defaults_menu, "discover_models", late)
-    monkeypatch.setattr(oauth_defaults_menu, "_first_enabled_account_key", lambda provider: "xai:demo")
-    async def token(account_key):
-        return "tok"
-    monkeypatch.setattr("src.oauth_manager.ensure_valid_token", token)
-    asyncio.run(factories[0]())
-    assert states.get_state(7) is None
+@pytest.mark.parametrize("callback", ["odm:show", "odm:edit:openai", "odm:ok", "odm:commit:old:clean", "odm:retry"])
+def test_old_tg_buttons_are_read_only(callback, monkeypatch):
+    messages = []
+    states.clear_all()
+    ui.configure("fake", [42])
+    monkeypatch.setattr(ui, "answer_cb", lambda _cb, text="", **kw: messages.append(text))
+    monkeypatch.setattr(config, "update", lambda *a, **kw: pytest.fail("retired TG callback wrote config"))
+    states.set_state(42, "odm_edit:openai", {"existing_models": ["old"]})
+    bot._handle_callback({"id": "cb", "data": callback, "message": {"message_id": 1, "chat": {"id": 42}}})
+    assert states.get_state(42) is None
+    assert any("已退役" in text and "同步上游模型" in text for text in messages)
+
+
+@pytest.mark.parametrize("text,action", [("/oauth_defaults", None), ("new-model", "odm_edit:openai"), ("new-model", "odm_model_select")])
+def test_old_tg_command_and_text_cannot_write(text, action, monkeypatch):
+    messages = []
+    states.clear_all()
+    ui.configure("fake", [42])
+    monkeypatch.setattr(ui, "send", lambda _chat, message, **kw: messages.append(message))
+    monkeypatch.setattr(config, "update", lambda *a, **kw: pytest.fail("retired TG text wrote config"))
+    if action:
+        states.set_state(42, action, {})
+    bot._handle_message({"chat": {"id": 42}, "text": text})
+    assert states.get_state(42) is None
+    assert any("已退役" in message for message in messages)
+    settings, kb = oauth_menu._settings_text_and_kb()
+    assert "备用模型" not in settings
+    assert not any(b.get("callback_data", "").startswith("odm:") for row in kb["inline_keyboard"] for b in row)

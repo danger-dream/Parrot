@@ -46,7 +46,6 @@ CALLBACK_HANDLERS = [
     ("system", bot.system_menu),
     ("apikey", bot.apikey_menu),
     ("mapping", bot.mapping_menu),
-    ("oauth_defaults", bot.oauth_defaults_menu),
 ]
 
 COMMAND_TARGETS = {
@@ -60,7 +59,6 @@ COMMAND_TARGETS = {
     "settings": (bot.system_menu, "send_new"),
     "model_center": (bot.model_center_menu, "send_new"),
     "loadbalancing": (bot.load_balancing_menu, "send_new"),
-    "oauth_defaults": (bot.oauth_defaults_menu, "send_new"),
     "help": (bot.help_menu, "send_new"),
 }
 
@@ -309,6 +307,8 @@ RUNNERS = {
 
 @pytest.mark.parametrize("case", CASES_01_04, ids=lambda case: case["caseId"])
 def test_core_01_to_04_trace(case, monkeypatch):
+    if case["caseId"] in {"TG-CORE-03.oauth-defaults-shadowed", "TG-CORE-04.19-oauth_defaults", "TG-CORE-04.unknown"}:
+        pytest.skip("Retired OAuth fallback dispatcher; historical trace retained, current no-write tests replace it")
     actual = RUNNERS[case["entry"]["scenario"]](case, monkeypatch)
     assert_strict_equal(case, actual)
 

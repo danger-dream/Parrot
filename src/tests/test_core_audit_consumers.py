@@ -220,11 +220,11 @@ def test_all_nonfinite_api_prices_rejected_with_disk_zero_write(domain_client, n
 
 @pytest.mark.parametrize("verb", ["put", "patch"])
 @pytest.mark.parametrize("disabled", [True, False])
-def test_alias_api_reserves_fallback_and_disabled_real_ids(domain_client, verb, disabled):
+def test_alias_api_reserves_account_and_disabled_real_ids(domain_client, verb, disabled):
     client, _, admin, *_ = domain_client
-    config.update(lambda c: c.update(oauthAccounts=[{"provider": "claude", "email": "fallback@example.test", "models": [],
+    config.update(lambda c: c.update(oauthAccounts=[{"provider": "claude", "email": "catalog@example.test", "models": ["real-a", "real-b"],
                                                     "disabledModels": ["real-a"] if disabled else []}],
-                                    oauthDefaultModels=["real-a", "real-b"], modelMapping={"global": {"old": "real-b"}}))
+                                    modelMapping={"global": {"old": "real-b"}}))
     registry.rebuild_from_config()
     before = Path(config.path()).read_bytes()
     url = "/api/management/v1/model-mappings/" + ("real-a" if verb == "put" else "old")

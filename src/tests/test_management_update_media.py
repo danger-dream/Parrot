@@ -621,12 +621,10 @@ def test_image_and_xai_all_operations_no_oauth_secret_and_revision_conflict(tmp_
         )
         assert xai_changed.status_code == 200
         assert xai_changed.json()["data"]["imageModels"] == ["grok-image-new"]
-        assert fixture.config.value["xaiOAuth"] == {
-            "imageModels": ["grok-image-new"],
-            "videoModels": [],
-            "videoJobTtlSeconds": 7200,
-            "mediaRequestTimeoutSeconds": 240,
-        }
+        assert fixture.config.value['image_models']['xai'] == ['grok-image-new']
+        assert fixture.config.value['video_models']['xai'] == []
+        assert fixture.config.value['videos']['jobTtlSeconds'] == 7200
+        assert fixture.config.value['videos']['requestTimeoutSeconds'] == 240
 
 
 def test_image_cache_path_escape_and_xai_model_limits_are_rejected(tmp_path):
@@ -761,7 +759,9 @@ def test_stage_plan_is_actor_bound_and_failed_stage_cannot_activate(tmp_path):
         assert token not in denied.text
 
 
-def test_public_update_and_image_times_normalize_or_become_null(tmp_path):
+def test_public_update_and_image_times_normalize_or_become_null(tmp_path, monkeypatch):
+    from src.openai import images_simple
+    monkeypatch.setattr(images_simple, "_IMAGE_COOLDOWNS", {"openai:user@example.com": 1767323045})
     app, _, fixture = build_auxiliary_app(tmp_path)
     fixture.update_gateway.release["latest_published_at"] = 1767323045
     fixture.media_gateway.image_cooldown_until = 1767323045
@@ -777,6 +777,7 @@ def test_public_update_and_image_times_normalize_or_become_null(tmp_path):
 
         fixture.update_gateway.release["latest_published_at"] = "not-a-time"
         fixture.media_gateway.image_cooldown_until = "not-a-time"
+        images_simple._IMAGE_COOLDOWNS["openai:user@example.com"] = "not-a-time"
         assert client.post(BASE + "/updates/actions/check", headers=headers).json()["data"]["publishedAt"] is None
         assert client.get(
             BASE + "/images/accounts/openai%3Auser%40example.com",
@@ -807,6 +808,7 @@ def test_public_update_and_image_times_normalize_or_become_null(tmp_path):
 def test_image_api_reconciles_all_legacy_account_identities(tmp_path):
     app, _, fixture = build_auxiliary_app(tmp_path)
     fixture.media_gateway.account_key = "openai:user@example.com:acct-1"
+    fixture.config.value["oauthAccounts"][0]["workspace_id"] = "acct-1"
     aliases = [
         fixture.media_gateway.account_key,
         f"oauth:{fixture.media_gateway.account_key}",

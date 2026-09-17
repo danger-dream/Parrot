@@ -24,6 +24,7 @@ from ..schemas.auxiliary_media import (
     ImageAccountStatePatch,
     ImageSettingsData,
     ImageSettingsPatch,
+    VideoSettingsPatch, MediaSourceData, MediaSourcesData, MediaSourcePatch,
     MediaKind,
     MediaModelAddRequest,
     MediaModelMutationData,
@@ -47,8 +48,9 @@ _IMAGE_EXAMPLE = {
     "data": {
         "enabled": True,
         "cacheEnabled": False,
-        "mainModel": "gpt-5.4-mini",
-        "toolModel": "gpt-image-2",
+        "models": {"openai": ["gpt-image-2", "gpt-image-2.5"]},
+        "requestTimeoutSeconds": 180,
+        "jobTtlSeconds": None,
         "cachePath": "images",
         "cacheRetentionDays": 30,
         "cacheMaxBytes": 1073741824,
@@ -117,8 +119,9 @@ def _image(value) -> ImageSettingsData:
     return ImageSettingsData(
         enabled=value.enabled,
         cacheEnabled=value.cache_enabled,
-        mainModel=value.main_model,
-        toolModel=value.tool_model,
+        models=value.models,
+        requestTimeoutSeconds=value.request_timeout_seconds,
+        jobTtlSeconds=value.job_ttl_seconds,
         cachePath=value.cache_path,
         cacheRetentionDays=value.cache_retention_days,
         cacheMaxBytes=value.cache_max_bytes,
@@ -134,6 +137,10 @@ def _account(value) -> ImageAccountStateData:
         imageEnabled=value.image_enabled,
         imageCooldownUntil=value.image_cooldown_until,
         missingAccountId=value.missing_account_id,
+        independentEnabled=value.independent_enabled,
+        independentAllowed=value.independent_allowed,
+        effectiveAvailable=value.effective_available,
+        unavailableReason=value.unavailable_reason,
         revision=value.revision,
     )
 
@@ -262,6 +269,7 @@ def update_image_account_state(
         context,
         account_id,
         enabled=body.enabled,
+        independent_enabled=body.independentEnabled,
         expected_revision=if_match,
     )
     return DataEnvelope(data=_account(value), meta=response_meta(request))
@@ -376,111 +384,58 @@ def remove_xai_media_model(
     return DataEnvelope(data=_mutation(value), meta=response_meta(request))
 
 
-@router.get(
-    "/antigravity/media-settings",
-    operation_id="getAntigravityMediaSettings",
-    dependencies=[Depends(reject_unknown_query())],
-    tags=["antigravity-media"],
-    response_model=DataEnvelope[AntigravityMediaSettingsData],
-    responses={**success_response(200, _ANTIGRAVITY_EXAMPLE), **management_error_responses(*_ERRORS)},
-)
-def get_antigravity_media_settings(
-    request: Request,
+# AG image management routes retired; stored settings and media history remain.
+
+
+@router.get('/videos/settings', operation_id='getVideoSettings', tags=['videos'],
+    dependencies=[Depends(reject_unknown_query())], response_model=DataEnvelope[ImageSettingsData],
+    responses={**success_response(200, _IMAGE_EXAMPLE), **management_error_responses(*_ERRORS)})
+def get_video_settings(request: Request,
     controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
-    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))],
-) -> DataEnvelope[AntigravityMediaSettingsData]:
-    return DataEnvelope(
-        data=_antigravity(controls.antigravity_media.get_settings(context)),
-        meta=response_meta(request),
-    )
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))]):
+    return DataEnvelope(data=_image(controls.videos.get_settings(context)), meta=response_meta(request))
 
 
-@router.patch(
-    "/antigravity/media-settings",
-    operation_id="updateAntigravityMediaSettings",
-    dependencies=[Depends(reject_unknown_query())],
-    tags=["antigravity-media"],
-    response_model=DataEnvelope[AntigravityMediaSettingsData],
-    responses={**success_response(200, _ANTIGRAVITY_EXAMPLE), **management_error_responses(*_ERRORS)},
-)
-def update_antigravity_media_settings(
-    body: AntigravityMediaSettingsPatch,
-    request: Request,
+@router.patch('/videos/settings', operation_id='updateVideoSettings', tags=['videos'],
+    dependencies=[Depends(reject_unknown_query())], response_model=DataEnvelope[ImageSettingsData],
+    responses={**success_response(200, _IMAGE_EXAMPLE), **management_error_responses(*_ERRORS)})
+def update_video_settings(body: VideoSettingsPatch, request: Request,
     controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-) -> DataEnvelope[AntigravityMediaSettingsData]:
-    value = controls.antigravity_media.update_settings(
-        context, image_models=body.imageModels, expected_revision=if_match,
-    )
-    return DataEnvelope(data=_antigravity(value), meta=response_meta(request))
+    if_match: Annotated[str | None, Header(alias='If-Match')] = None):
+    value = controls.videos.update_settings(context, body.model_dump(exclude_unset=True), expected_revision=if_match)
+    return DataEnvelope(data=_image(value), meta=response_meta(request))
 
 
-@router.post(
-    "/antigravity/media-models/image",
-    operation_id="addAntigravityMediaModel",
-    dependencies=[Depends(reject_unknown_query())],
-    tags=["antigravity-media"],
-    response_model=DataEnvelope[MediaModelMutationData],
-    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
-)
-def add_antigravity_media_model(
-    body: AntigravityMediaModelAddRequest,
-    request: Request,
+_SOURCE_EXAMPLE = {'data': {'sourceId': 'oauth:xai:example', 'label': 'account@example.com',
+    'provider': 'xai', 'enabled': True, 'effectiveAvailable': True, 'canEnable': True,
+    'unavailableReason': None, 'revision': 'rev_example'}, 'meta': {'requestId': 'request-example'}}
+
+
+def _source(value):
+    return MediaSourceData(sourceId=value['source_id'], label=value['label'], provider=value['provider'],
+        enabled=value['enabled'], effectiveAvailable=value['effective_available'], canEnable=value['can_enable'],
+        unavailableReason=value['unavailable_reason'], revision=value['revision'])
+
+
+@router.get('/media/{kind}/sources', operation_id='listMediaSources', tags=['media'],
+    dependencies=[Depends(reject_unknown_query())], response_model=DataEnvelope[MediaSourcesData],
+    responses={**success_response(200, {'data': {'sources': [_SOURCE_EXAMPLE['data']]}, 'meta': _SOURCE_EXAMPLE['meta']}), **management_error_responses(*_ERRORS)})
+def list_media_sources(kind: MediaKind, request: Request,
+    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
+    context: Annotated[ManagementContext, Depends(require_capability(Capability.READ))]):
+    control = controls.images if kind is MediaKind.IMAGE else controls.videos
+    return DataEnvelope(data=MediaSourcesData(sources=[_source(item) for item in control.list_sources(context)]), meta=response_meta(request))
+
+
+@router.patch('/media/{kind}/sources/{sourceId:path}', operation_id='updateMediaSource', tags=['media'],
+    dependencies=[Depends(reject_unknown_query())], response_model=DataEnvelope[MediaSourceData],
+    responses={**success_response(200, _SOURCE_EXAMPLE), **management_error_responses(*_ERRORS)})
+def update_media_source(kind: MediaKind, source_id: Annotated[str, Path(alias='sourceId', min_length=1, max_length=512)],
+    body: MediaSourcePatch, request: Request,
     controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
     context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-) -> DataEnvelope[MediaModelMutationData]:
-    value = controls.antigravity_media.add_model(
-        context, owner=_owner(body.owner), model_id=body.modelId,
-        expected_revision=if_match,
-    )
-    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
-
-
-@router.patch(
-    "/antigravity/media-models/image/{modelId:path}",
-    operation_id="renameAntigravityMediaModel",
-    dependencies=[Depends(reject_unknown_query())],
-    tags=["antigravity-media"],
-    response_model=DataEnvelope[MediaModelMutationData],
-    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
-)
-def rename_antigravity_media_model(
-    model_id: Annotated[str, Path(alias="modelId", min_length=1, max_length=80)],
-    body: AntigravityMediaModelRenameRequest,
-    request: Request,
-    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
-    context: Annotated[ManagementContext, Depends(require_capability(Capability.WRITE))],
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-) -> DataEnvelope[MediaModelMutationData]:
-    value = controls.antigravity_media.rename_model(
-        context, owner=_owner(body.owner), old_model_id=model_id,
-        new_model_id=body.newModelId, expected_revision=if_match,
-    )
-    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
-
-
-@router.delete(
-    "/antigravity/media-models/image/{modelId:path}",
-    operation_id="removeAntigravityMediaModel",
-    dependencies=[Depends(reject_unknown_query("ownerType", "ownerId"))],
-    tags=["antigravity-media"],
-    response_model=DataEnvelope[MediaModelMutationData],
-    responses={**success_response(200, _MEDIA_MUTATION_EXAMPLE), **management_error_responses(*_ERRORS)},
-)
-def remove_antigravity_media_model(
-    model_id: Annotated[str, Path(alias="modelId", min_length=1, max_length=80)],
-    request: Request,
-    controls: Annotated[AuxiliaryControls, Depends(get_bound_auxiliary_controls)],
-    context: Annotated[ManagementContext, Depends(require_capability(Capability.DESTRUCTIVE))],
-    owner_type: Annotated[MediaOwnerType, Query(alias="ownerType")],
-    owner_id: Annotated[str | None, Query(alias="ownerId", min_length=1, max_length=512)] = None,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-) -> DataEnvelope[MediaModelMutationData]:
-    owner = _owner_query(owner_type, owner_id)
-    value = controls.antigravity_media.remove_model(
-        context, owner=owner, model_id=model_id,
-        expected_revision=if_match,
-    )
-    return DataEnvelope(data=_mutation(value), meta=response_meta(request))
+    if_match: Annotated[str | None, Header(alias='If-Match')] = None):
+    control = controls.images if kind is MediaKind.IMAGE else controls.videos
+    value = control.update_source(context, source_id, enabled=body.enabled, expected_revision=if_match)
+    return DataEnvelope(data=_source(value), meta=response_meta(request))

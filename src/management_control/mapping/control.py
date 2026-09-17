@@ -158,23 +158,16 @@ class MappingControl(MetadataSyncMixin, DomainControl):
             for value in selection["models"]:
                 if isinstance(value, str) and value.strip():
                     names.add(model_names.public_id(provider, value.strip()))
-            for value in account.get("imageModels") or ():
+            for value in (account.get("imageModels") or ()) if provider == "xai" else ():
                 if isinstance(value, str) and value.strip():
                     names.add(value.strip())
-        for section, fields in (
-            ("images", ("mainModel", "toolModel")),
-            ("xaiOAuth", ("imageModels", "videoModels")),
-            ("antigravityOAuth", ("imageModels",)),
-        ):
-            values = cfg.get(section) or {}
-            if not isinstance(values, dict):
-                continue
-            for field in fields:
-                raw = values.get(field)
-                raw_values = raw if isinstance(raw, list) else (raw,)
-                for value in raw_values:
-                    if isinstance(value, str) and value.strip():
-                        names.add(value.strip())
+        from src import media_config
+        for kind in ('image', 'video'):
+            for values in media_config.model_map(kind, cfg).values():
+                names.update(values)
+            for account in cfg.get('oauthAccounts') or []:
+                if account.get('provider') in ('openai', 'xai'):
+                    names.update(media_config.account_models(account, kind, cfg))
         return names
 
     def update_mapping(

@@ -82,12 +82,6 @@ class InMemoryOAuthBackend(OAuthBackend):
         ]
         self.settings = [False, 60, 95.0, "disabled"]
         self.preferences = ["used", True]
-        self.defaults = {
-            "anthropic": ["claude-test"],
-            "antigravity": ["gemini-test"],
-            "openai": ["gpt-alpha"],
-            "xai": ["grok-test"],
-        }
         self.affinity_cleared = []
         self.last_reset_idempotency_key = None
         self.sync_result = {"action": "updated", "models": 2}
@@ -96,9 +90,6 @@ class InMemoryOAuthBackend(OAuthBackend):
         self.usage_fetches: list[str] = []
         self.usage_failures: set[str] = set()
         self.quota_evaluations: list[str] = []
-        self.default_references = {
-            "openai": {"apiKeys": [], "mappings": [], "defaults": [], "would_empty_keys": []}
-        }
         self._lock = RLock()
         self.interleave_once = None
 
@@ -521,59 +512,6 @@ class InMemoryOAuthBackend(OAuthBackend):
     def update_preferences(self, *, usage_display_mode=None, quota_progress_bar=None):
         if usage_display_mode is not None: self.preferences[0] = usage_display_mode
         if quota_progress_bar is not None: self.preferences[1] = quota_progress_bar
-
-    def default_models(self, family):
-        return list(self.defaults[family])
-
-    def static_default_models(self, family):
-        return [f"{family}-static"]
-
-    def scan_default_model_references(self, family, removed):
-        state = copy.deepcopy(self.default_references.get(
-            family, {"apiKeys": [], "mappings": [], "defaults": [], "would_empty_keys": []},
-        ))
-        for item in state["apiKeys"]:
-            item["hits"] = [model for model in item.get("hits", []) if model in removed]
-        state["apiKeys"] = [item for item in state["apiKeys"] if item["hits"]]
-        state["mappings"] = [item for item in state["mappings"] if item.get("real") in removed]
-        state["defaults"] = [item for item in state["defaults"] if item.get("value") in removed]
-        return state
-
-    def default_models_state(self, family):
-        models = self.default_models(family)
-        return {
-            "models": models,
-            "references": self.scan_default_model_references(family, set(models)),
-        }
-
-    def replace_default_models_conditional(
-        self, family, models, removed, *, cleanup, expected_state,
-    ):
-        with self._lock:
-            self._interleave()
-            if self.default_models_state(family) != expected_state:
-                return {"status": "revision_conflict", "summary": {}}
-            summary = self.replace_default_models(
-                family, models, removed, cleanup=cleanup,
-            )
-            return {"status": "updated", "summary": summary}
-
-    def replace_default_models(self, family, models, removed, *, cleanup):
-        self.defaults[family] = list(models)
-        return {"keys_cleaned": [], "keys_skipped_empty": [], "mappings_removed": [], "defaults_cleared": []}
-
-    def first_enabled_account_id(self, provider):
-        account = next((item for item in self.accounts if self.provider_of(item) == provider and item.get("enabled", True)), None)
-        return self.account_id(account) if account else None
-
-    async def ensure_valid_token(self, account_id):
-        return "short-lived-test-token"
-
-    async def discover_models(self, url, token):
-        return ["grok-test", "grok-imagine-image"]
-
-    def xai_models_url(self):
-        return "https://xai.example.test/v1/models"
 
     def parse_import(self, kind, payload, *, filename=""):
         return parse_openai_import_payload(kind, payload, filename=filename)

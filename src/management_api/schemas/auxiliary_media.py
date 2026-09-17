@@ -14,8 +14,9 @@ from .base import StrictSchema
 class ImageSettingsData(StrictSchema):
     enabled: bool
     cacheEnabled: bool
-    mainModel: str
-    toolModel: str
+    models: dict[str, list[str]]
+    requestTimeoutSeconds: int
+    jobTtlSeconds: int | None = None
     cachePath: str
     cacheRetentionDays: int
     cacheMaxBytes: int
@@ -25,8 +26,8 @@ class ImageSettingsData(StrictSchema):
 class ImageSettingsPatch(StrictSchema):
     enabled: bool = True
     cacheEnabled: bool = False
-    mainModel: str = Field(default="gpt-5.4-mini", min_length=1, max_length=128)
-    toolModel: str = Field(default="gpt-image-2", min_length=1, max_length=128)
+    models: dict[str, list[Annotated[str, Field(min_length=1, max_length=128)]]] = Field(default_factory=dict)
+    requestTimeoutSeconds: int = Field(default=180, ge=1, le=2147483647)
     cachePath: str = Field(default="images", min_length=1, max_length=4096)
     cacheRetentionDays: int = Field(default=0, ge=0, le=36500)
     cacheMaxBytes: int = Field(default=1073741824, ge=0, le=2**63 - 1)
@@ -40,10 +41,21 @@ class ImageAccountStateData(StrictSchema):
     imageCooldownUntil: datetime | None
     missingAccountId: bool
     revision: str
+    independentEnabled: bool = False
+    independentAllowed: bool = False
+    effectiveAvailable: bool = False
+    unavailableReason: str | None = None
 
 
 class ImageAccountStatePatch(StrictSchema):
-    enabled: bool
+    enabled: bool | None = None
+    independentEnabled: bool | None = None
+
+    @model_validator(mode='after')
+    def exactly_one_change(self):
+        if (self.enabled is None) == (self.independentEnabled is None):
+            raise ValueError('provide exactly one of enabled or independentEnabled')
+        return self
 
 
 class XaiMediaSettingsData(StrictSchema):
@@ -128,3 +140,26 @@ class AntigravityMediaSettingsPatch(StrictSchema):
     imageModels: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(
         max_length=80,
     )
+
+
+class VideoSettingsPatch(ImageSettingsPatch):
+    jobTtlSeconds: int = Field(default=10800, ge=1, le=2147483647)
+
+
+class MediaSourceData(StrictSchema):
+    sourceId: str
+    label: str
+    provider: str
+    enabled: bool
+    effectiveAvailable: bool
+    canEnable: bool
+    unavailableReason: str | None
+    revision: str
+
+
+class MediaSourcesData(StrictSchema):
+    sources: list[MediaSourceData]
+
+
+class MediaSourcePatch(StrictSchema):
+    enabled: bool

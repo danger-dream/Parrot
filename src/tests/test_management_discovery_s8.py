@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import csv
 import socket
 import threading
 import time
@@ -176,12 +177,29 @@ def _product_projection(capabilities: dict) -> dict:
     }
 
 
+def _assert_search_discovery(metadata, capabilities):
+    path = PRODUCTION_OPERATIONS.with_name("search-operation-manifest.tsv")
+    with path.open(encoding="utf-8", newline="") as handle:
+        expected = {row["operationId"]: (row["method"], row["path"]) for row in csv.DictReader(handle, delimiter="\t")}
+    domains = {item["domain"]: item for item in capabilities["domains"]}
+    search = domains["management-search"]
+    assert search["actions"] == sorted(expected)
+    assert {item["operationId"]: (item["method"], item["path"]) for item in search["actionDetails"]} == expected
+    features = {item["id"]: item["actionCount"] for item in metadata["features"]}
+    assert features["management-search"] == 8
+    assert "antigravity-media" not in domains and "antigravity-media" not in features
+    enums = {item["name"]: set(item["values"]) for item in metadata["enums"]}
+    assert enums["SearchBackendCreate.type"] == {"anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic"}
+    for field in ("functionMode", "hostedMode"):
+        assert enums["SearchSettingsData." + field] == {"managed", "passthrough", "disabled"}
+
+
 def test_production_discovery_exactly_describes_routes_catalogs_and_enums(production_app):
     app, _ = production_app
     document = app.openapi()
     expected_operations = _openapi_operations(document)
     manifested = set(PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines())
-    assert len(expected_operations) == len(manifested) == 226
+    assert len(expected_operations) == len(manifested) == 230
     assert set(expected_operations) == manifested
 
     with TestClient(app) as client:
@@ -198,7 +216,8 @@ def test_production_discovery_exactly_describes_routes_catalogs_and_enums(produc
     capabilities = capabilities_response.json()["data"]
 
     assert _discovered_actions(capabilities) == expected_operations
-    assert sum(feature["actionCount"] for feature in metadata["features"]) == 226
+    _assert_search_discovery(metadata, capabilities)
+    assert sum(feature["actionCount"] for feature in metadata["features"]) == 230
     assert {
         feature["id"]: feature["actionCount"] for feature in metadata["features"]
     } == {
@@ -333,7 +352,7 @@ def test_real_server_app_exposes_the_same_complete_discovery(production_app, mon
     _, runtime = production_app
     document = server.app.openapi()
     expected_operations = _openapi_operations(document)
-    assert len(expected_operations) == 226
+    assert len(expected_operations) == 230
     monkeypatch.setattr(server.app.state, "management_runtime", runtime, raising=False)
 
     client = TestClient(server.app)
@@ -352,8 +371,9 @@ def test_real_server_app_exposes_the_same_complete_discovery(production_app, mon
     assert capabilities_response.status_code == 200, capabilities_response.text
     assert sum(
         item["actionCount"] for item in metadata_response.json()["data"]["features"]
-    ) == 226
+    ) == 230
     assert _discovered_actions(capabilities_response.json()["data"]) == expected_operations
+    _assert_search_discovery(metadata_response.json()["data"], capabilities_response.json()["data"])
 
 
 def test_product_discovery_is_stable_across_grants_and_separate_from_principal(production_app):

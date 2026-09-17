@@ -230,10 +230,9 @@ def test_protocol_bridge_custom_config_overrides_reasoning_service_tier_and_loca
     }, target_model="gpt-5")["reasoning_effort"] == "max"
     assert anthropic_to_chat.translate_request({"messages": [], "service_tier": "auto"})["service_tier"] == "default"
 
-    web_search = anthropic_to_chat.translate_request({
-        "messages": [],
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-    })
+    from src import search_tool_policy
+    managed, _ = search_tool_policy.compile_request({"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]}, "anthropic")
+    web_search = anthropic_to_chat.translate_request(managed)
     assert "parallel_tool_calls" not in web_search
 
     plan = DEFAULT_MATRIX.plan(
@@ -323,17 +322,11 @@ def test_translate_request_allows_stream_but_guards_stateful_thinking_and_non_us
         "is_error": True,
     }]}]})
     assert errored_tool["messages"] == [{"role": "tool", "tool_call_id": "toolu_1", "content": "failed"}]
-    web_search = anthropic_to_chat.translate_request({
-        "messages": [],
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-    })
-    assert web_search["tools"][0]["function"]["name"] == "web_search"
-    assert web_search["parallel_tool_calls"] is False
-    web_fetch = anthropic_to_chat.translate_request({
-        "messages": [],
-        "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}],
-    })
-    assert web_fetch["tools"][0]["function"]["name"] == "web_fetch"
+    # The native Chat protocol has no server search/fetch declaration. Managed
+    # compilation is tested at the execution boundary, not faked by translation.
+    for typ, name in (("web_search_20250305", "web_search"), ("web_fetch_20250910", "web_fetch")):
+        with pytest.raises(GuardError, match="no native hosted"):
+            anthropic_to_chat.translate_request({"messages": [], "tools": [{"type": typ, "name": name}]})
     stripped = anthropic_to_chat.translate_request({"messages": [], "top_k": 5, "service_tier": "turbo"})
     assert "top_k" not in stripped
     assert "service_tier" not in stripped

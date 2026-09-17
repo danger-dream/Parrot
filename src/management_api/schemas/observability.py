@@ -490,7 +490,9 @@ class MediaLogData(StrictSchema):
     durationSeconds: float | None = None
     durationMilliseconds: float | None = None
     costTicks: int = Field(ge=0)
-    trafficBytes: int = Field(ge=0)
+    trafficBytes: int | None = Field(default=None, ge=0)
+    generatedCount: int | None = Field(default=None, ge=0)
+    outputSizes: list[str] | None = None
     cacheStatus: Literal["disabled", "cached", "failed"] | None = None
     cacheErrorClass: str | None = None
     createdAt: datetime | None = None

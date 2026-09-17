@@ -12,6 +12,7 @@ from typing import Any
 from src import concurrency as concurrency_module
 from src import config as config_module
 from src import log_db as log_db_module
+from src import model_names
 from src import oauth_manager as oauth_manager_module
 from src import state_db as state_db_module
 from src.channel import registry as registry_module
@@ -392,6 +393,55 @@ class StatsControl:
     def request_totals_by_apikey(self, context: ManagementContext) -> dict[str, int]:
         require(context)
         return copy.deepcopy(self.log_db.request_totals_by_apikey())
+
+    def model_center_usage_snapshot(self, context: ManagementContext) -> dict:
+        """Internal TG snapshot; raw weights, no API DTO or alias-history guesses."""
+        require(context)
+        routes = self.log_db.model_center_usage_snapshot()
+        by_model: dict[str, dict] = {}
+        for (channel, model), raw in routes.items():
+            # Cursor/WorkBuddy generic IDs are provider-owned, not global auto/default.
+            public_model = model_names.for_channel(channel, model)
+            by_model.setdefault(public_model, {})[(channel, model)] = raw
+        return {"routes": routes, "by_model": by_model}
+
+    def project_model_center_usage(
+        self, snapshot: dict, selections: dict[str, tuple[tuple[str, str], ...]],
+        *, channel_key: str | None = None,
+    ) -> dict[str, dict]:
+        """Pure projection, safe in a menu callback. Never queries logs/config.
+
+        Explicit source/outbound bindings take precedence over a coincidentally
+        equal public ID. Other historical sources match exact execution IDs.
+        A set of route keys prevents aliases/duplicate catalog entries counting
+        the same bucket twice. Current global request aliases are never expanded.
+        Multiple public IDs for one route expose the same execution totals, not
+        invented per-alias history; these view rows must not be summed together.
+        """
+        result = {}
+        routes = snapshot.get("routes", {})
+        by_model = snapshot.get("by_model", {})
+        for model_id, bound_routes in selections.items():
+            bound_channels = {channel for channel, _model in bound_routes}
+            keys = {key for key in by_model.get(model_id, ()) if key[0] not in bound_channels}
+            keys.update(bound_routes)
+            raw = self.log_db._new_token_stats_agg()
+            for key in keys:
+                if channel_key is not None and key[0] != channel_key:
+                    continue
+                row = routes.get(key)
+                if row is not None:
+                    self.log_db._merge_token_stats_agg(raw, row)
+            metrics = self.log_db._pack_stats(raw)
+            # Tokens from failed attempts can exist without a final-route request.
+            if metrics["total"] or any(metrics[k] for k in (
+                "input", "output", "cache_creation", "cache_read",
+            )):
+                result[model_id] = {key: metrics[key] for key in (
+                    "total", "success_count", "error_count", "input", "output",
+                    "cache_creation", "cache_read", "avg_tps", "max_tps", "min_tps",
+                )}
+        return result
 
     def channel_model_stats(self, context: ManagementContext, channel_key: str, since_ts: float) -> list[dict]:
         require(context)

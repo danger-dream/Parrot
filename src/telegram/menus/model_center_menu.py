@@ -34,8 +34,9 @@ from ...management_control.models import (
     ModelView,
 )
 from ...management_control.oauth import PageSpec
-from .. import states, ui
+from .. import menu_cache, states, ui
 from .model_center_html import paged as _paged, page_render as _html_page_render
+from .model_center_icons import inline_kb
 
 
 # Production replaces this fallback with the lifecycle-owned ``controls.models``.
@@ -64,11 +65,12 @@ class _Session:
     selected_resources: dict[str, str] = field(default_factory=dict)
     selection_filters: ModelFilters | None = None
     excluded: list[str] = field(default_factory=list)
-    alias_query: str = ""
     alias_page: int = 1
     detail_key: str | None = None
     metadata_group: str = "capacity"
     generation: str = ""
+    usage_views: tuple[ModelView, ...] | None = None
+    usage_loading: bool = False
 
 
 @dataclass
@@ -107,7 +109,6 @@ class _ListContext:
     status: ModelStatus | None
     origin: str
     alias_page: int
-    alias_query: str
     multiple: bool
     selection_mode: ModelSelectionMode
     selected: tuple[str, ...]
@@ -259,28 +260,20 @@ def _prompt(chat_id: int, action: str, data: dict[str, Any], text: str, cancel_c
     rows = [[ui.btn("❌ 取消", cancel_callback)]]
     if action == "mc_metadata_field":
         rows.insert(0, [ui.btn("恢复继承", _freeze(chat_id, "field_inherit", **data))])
-    ui.send(chat_id, text, reply_markup=ui.inline_kb(rows))
+    ui.send(chat_id, text, reply_markup=inline_kb(rows))
 
 
 def render(chat_id: int) -> tuple[str, dict]:
     s = _session(chat_id)
+    if s.tab == "image": return _image_settings_render(chat_id)
+    if s.tab == "video": return _video_settings_render(chat_id)
     return _alias_render(chat_id) if s.tab == "alias" else _model_list_render(chat_id)
 
 
 def show(chat_id: int, message_id: int, cb_id: str | None = None) -> None:
     if not _admin(chat_id, cb_id):
         return
-    try:
-        text, kb = render(chat_id)
-    except ManagementError as exc:
-        if cb_id:
-            _answer_error(cb_id, exc)
-        else:
-            ui.send(chat_id, "❌ " + ui.escape_html(_error_text(exc)))
-        return
-    if cb_id is not None:
-        ui.answer_cb(cb_id)
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _show_rendered(chat_id, message_id, cb_id, lambda: render(chat_id))
 
 
 def source_callback(
@@ -334,22 +327,66 @@ def send_new(chat_id: int, *, origin: str = "menu:main", source: ModelSourceRef 
         s.source = source
         s.source_label = option.label
         s.source_provider = option.provider
+    s.usage_views = None
     try:
         text, kb = render(chat_id)
     except ManagementError as exc:
         ui.send(chat_id, "❌ " + ui.escape_html(_error_text(exc)))
         return
-    ui.send(chat_id, text, reply_markup=kb)
+    response = ui.send(chat_id, text, reply_markup=kb)
+    message = response.get("result") if isinstance(response, dict) and response.get("ok") else None
+    if isinstance(message, dict) and message.get("message_id"):
+        mid = int(message["message_id"])
+        _request_list_usage(chat_id, mid, menu_cache.begin_view(chat_id, mid))
 
 
-def _show_rendered(chat_id: int, message_id: int, cb_id: str, renderer) -> None:
+def _show_rendered(chat_id: int, message_id: int, cb_id: str | None, renderer) -> None:
+    token = menu_cache.begin_view(chat_id, message_id)
+    _session(chat_id).usage_views = None
     try:
         text, kb = renderer()
     except ManagementError as exc:
-        _answer_error(cb_id, exc)
+        if cb_id is not None:
+            _answer_error(cb_id, exc)
+        else:
+            ui.send(chat_id, "❌ " + ui.escape_html(_error_text(exc)))
         return
-    ui.answer_cb(cb_id)
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    if cb_id is not None:
+        ui.answer_cb(cb_id)
+    menu_cache.run_if_current(chat_id, message_id, token, lambda: ui.edit(
+        chat_id, message_id, text, reply_markup=kb,
+    ))
+    _request_list_usage(chat_id, message_id, token)
+
+
+def _request_list_usage(chat_id: int, message_id: int, token: int) -> None:
+    """Menu callbacks only enqueue; the shared stats worker owns all SQL."""
+    from . import model_center_usage as usage
+    s = _session(chat_id)
+    views = s.usage_views
+    if views is None or s.tab != "chat":
+        return
+    context = _list_context(s)
+    cold = s.usage_loading
+
+    def ready(_value, _error):
+        def update():
+            if not ui.is_admin(chat_id) or _list_context(_session(chat_id)) != context:
+                return
+            try:
+                text, kb = render(chat_id)
+            except ManagementError:
+                return
+            ui.edit(chat_id, message_id, text, reply_markup=kb)
+        menu_cache.run_if_current(chat_id, message_id, token, update)
+
+    read = usage.request(
+        views, s.source, subscriber=menu_cache.subscriber(chat_id, message_id, token),
+        on_ready=ready if cold else None,
+    )
+    # A refresh may complete between the peek and subscription.
+    if cold and read.value is not None:
+        ready(read.value, read.error)
 
 
 def _clear_selection(s: _Session) -> None:
@@ -393,11 +430,7 @@ def _handle_set_state(chat_id: int, message_id: int, cb_id: str, data: Mapping[s
                 back_callback=str(data.get("detail_back") or "mc:list"),
             )
         ) if detail_key else (lambda: render(chat_id))
-        try:
-            text, kb = renderer()
-        except ManagementError:
-            return
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+        _show_rendered(chat_id, message_id, None, renderer)
         return
     target = data["target"]
     field = _enum_value(target.field)
@@ -406,11 +439,10 @@ def _handle_set_state(chat_id: int, message_id: int, cb_id: str, data: Mapping[s
         label = "下游展示开关已开启" if target.value else "下游展示开关已关闭"
     ui.answer_cb(cb_id, label)
     detail_key = data.get("detail_key")
-    text, kb = _detail_render(
+    _show_rendered(chat_id, message_id, None, lambda: _detail_render(
         chat_id, detail_key,
         back_callback=str(data.get("detail_back") or "mc:list"),
-    ) if detail_key else render(chat_id)
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    ) if detail_key else render(chat_id))
 
 
 def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAction) -> None:
@@ -511,9 +543,9 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
         return
 
 
-    if name == "sync_source":
+    if name in {"sync_upstream", "sync_source"}:
         try:
-            op = _CONTROL.sync_source_models(_ctx(chat_id), data["source"])
+            op = _CONTROL.start_upstream_sync(_ctx(chat_id), source=data.get("source"))
         except ManagementError as exc:
             _answer_error(cb_id, exc)
             return
@@ -521,7 +553,7 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
         ui.edit(
             chat_id, message_id,
             f"🔄 <b>同步任务已开始</b>\n\n任务：<code>{ui.escape_html(op.id)}</code>\n原有模型和停用状态在失败时保持。",
-            reply_markup=_operation_keyboard(chat_id, op.id, "mc:list"),
+            reply_markup=_operation_keyboard(chat_id, op.id, str(data.get("back_callback") or "mc:list")),
         )
         return
 
@@ -586,7 +618,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     elif data in {"img:set_main", "img:set_tool", "img:accounts"} or data.startswith("img:acc_toggle:"):
         legacy_renderer = lambda: _gpt_images_render(chat_id)
     elif data == "xim:show":
-        legacy_renderer = lambda: _settings_render(chat_id)
+        legacy_renderer = lambda: _video_settings_render(chat_id)
     elif data == "xim:edit:image":
         legacy_renderer = lambda: _media_manager_render(chat_id, "xai", "image", 1)
     elif data == "xim:edit:video":
@@ -596,11 +628,11 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     elif data.startswith("map:"):
         action = data.split(":", 2)[1] if ":" in data else ""
         if action.startswith("compact"):
-            legacy_renderer = lambda: _compression_render(chat_id)
+            legacy_renderer = lambda: render(chat_id)
         elif action.startswith("meta"):
             legacy_renderer = lambda: _metadata_sync_render(chat_id)
         elif action in {"set_default", "clear_default", "page_default", "pick_default"}:
-            legacy_renderer = lambda: _settings_render(chat_id)
+            legacy_renderer = lambda: render(chat_id)
         else:
             legacy_alias = True
     if legacy_renderer is not None or legacy_alias:
@@ -625,6 +657,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if not _admin(chat_id, cb_id):
         return True
     before_callback(chat_id, data)
+    menu_cache.begin_view(chat_id, message_id)
     s = _session(chat_id)
     try:
         if data in {"mc:show", "mc:list"}:
@@ -677,8 +710,7 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
             ui.answer_cb(cb_id)
             return True
         if data == "mc:alias_query":
-            _prompt(chat_id, "mc_alias_query", {}, "发送别名或真实模型关键词。发送 - 清空。", "mc:aliases")
-            ui.answer_cb(cb_id)
+            ui.answer_cb(cb_id, "别名查询已移除", show_alert=True)
             return True
         if data == "mc:source":
             _show_rendered(chat_id, message_id, cb_id, lambda: _source_picker_render(chat_id))
@@ -687,8 +719,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
             _show_rendered(chat_id, message_id, cb_id, lambda: _status_picker_render(chat_id))
             return True
         if data == "mc:multi":
-            if s.tab != "chat":
-                ui.answer_cb(cb_id, "只有对话模型支持批量状态操作", show_alert=True)
+            if s.tab not in {"chat", "image"}:
+                ui.answer_cb(cb_id, "只有对话和图片模型支持批量状态操作", show_alert=True)
                 return True
             if s.multiple:
                 _clear_selection(s)
@@ -741,11 +773,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
             _clear_selection(s)
             show(chat_id, message_id, cb_id)
             return True
-        if data == "mc:settings":
-            _show_rendered(chat_id, message_id, cb_id, lambda: _settings_render(chat_id))
-            return True
-        if data == "mc:compression":
-            _show_rendered(chat_id, message_id, cb_id, lambda: _compression_render(chat_id))
+        if data in {"mc:settings", "mc:compression"}:
+            # Retired settings/picker messages are read-only redirects.
+            show(chat_id, message_id, cb_id)
             return True
         if data == "mc:metadata_sync":
             _show_rendered(chat_id, message_id, cb_id, lambda: _metadata_sync_render(chat_id))
@@ -835,9 +865,6 @@ from .model_center_metadata import (
     _handle_metadata_patch,
 )
 from .model_center_settings import (
-    _settings_render,
-    _compression_render,
-    _compression_picker_render,
     _operation_render,
     _operation_keyboard,
     _metadata_sync_render,

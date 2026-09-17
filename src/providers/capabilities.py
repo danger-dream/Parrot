@@ -213,6 +213,7 @@ OPENAI_CODEX_CAPABILITIES = ProviderCapabilities(
         "tool_search",
         "namespace",
         "codex_identity_headers",
+        "web_search",  # native passthrough; actual upstream decides availability
     }),
     notes=("ChatGPT/Codex OAuth forces store=false/stream=true and uses replay cache for encrypted reasoning",),
 )

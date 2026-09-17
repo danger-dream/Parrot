@@ -84,17 +84,3 @@ class OAuthQueryControlMixin:
 
     def load_balancing_initialized(self) -> bool:
         return self.backend.load_balancing_initialized()
-
-    def first_enabled_account_id_snapshot(self, provider: str) -> str | None:
-        return self.backend.first_enabled_account_id(provider)
-
-    def xai_models_url_snapshot(self) -> str:
-        return self.backend.xai_models_url()
-
-    async def ensure_valid_token(self, account_id: str) -> str:
-        return await self.backend.ensure_valid_token(account_id)
-
-    async def discover_models(self, url: str, token: str, *, discoverer=None) -> list[str]:
-        if discoverer is not None:
-            return await discoverer(url, token)
-        return await self.backend.discover_models(url, token)

@@ -18,6 +18,7 @@ from src.management_control.auxiliary import AuxiliaryControls
 from src.management_control.auxiliary.media import (
     AntigravityMediaControl,
     ImageControl,
+    VideoControl,
     XaiMediaControl,
 )
 from src.management_control.auxiliary.status_alerts import StatusAlertControl
@@ -335,6 +336,7 @@ class AuxiliaryFixture:
                 "ignoredVersions": [],
             },
             "images": {},
+            "oauthAccounts": [{"provider": "openai", "email": "user@example.com", "access_token": "synthetic", "enabled": True}],
             "xaiOAuth": {},
             "antigravityOAuth": {},
         })
@@ -369,6 +371,7 @@ class AuxiliaryFixture:
                 media_gateway=self.media_gateway,
                 audit_sink=self.audit,
             ),
+            videos=VideoControl(config_gateway=self.config, media_gateway=self.media_gateway, audit_sink=self.audit),
             xai_media=XaiMediaControl(
                 config_gateway=self.config,
                 media_gateway=self.media_gateway,

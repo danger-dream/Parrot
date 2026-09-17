@@ -1,32 +1,20 @@
-"""Local WebSearch/WebFetch emulation backed by AnySearch.
-
-Claude/Claude Code can expose web tools in two related forms:
-
-* Anthropic server tools (``web_search_20250305`` / ``web_fetch_20250910`` etc.)
-* Claude Code client tools (``WebSearch`` / ``WebFetch``) loaded through
-  ``ToolSearch`` and later emitted as normal tool calls.
-
-OpenAI-family upstreams cannot execute Anthropic server tools.  This module
-provides a tiny server-side tool runner so Parrot can execute the web calls with
-AnySearch, append the tool results to the Anthropic transcript, and continue the
-same upstream route until the model returns a normal final answer.
-"""
+"""Local search/fetch validation and protocol encoders backed by search_service."""
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
-import os
 import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import urlparse, urlunparse
 
-import httpx
 from fastapi.responses import Response, StreamingResponse
 
-from . import config, log_db, network
+from . import config, log_db
+
 from .protocols import errors as protocol_errors
 
 
@@ -46,10 +34,8 @@ OPENAI_WEB_SEARCH_TOOL_TYPES = frozenset({
     "web_search_preview",
     "web_search_preview_2025_03_11",
 })
-# These are Codex/Responses built-ins that are not safe to forward to arbitrary
-# OpenAI-compatible or cross-family providers.  tool_search is deliberately not
-# listed here because Codex handles it as a native client-executed tool.
-OPENAI_DROP_TOOL_TYPES = frozenset({"image_generation"})
+# Search never owns image or unrelated built-in tool removal.
+OPENAI_DROP_TOOL_TYPES = frozenset()  # Search policy never removes image tools.
 OPENAI_LOCAL_WEB_MARKER = "_parrot_openai_local_web_tools"
 SUPPORTED_TOOL_NAMES = frozenset({"WebSearch", "WebFetch", "web_search", "web_fetch"})
 _URL_RE = re.compile(r"https?://[^\s)\]>}\"']+")
@@ -70,14 +56,13 @@ class LocalToolResult:
 
 
 def _settings() -> dict[str, Any]:
-    cfg = config.get()
-    settings = cfg.get("anysearch") or {}
-    return settings if isinstance(settings, dict) else {}
+    from . import search_service
+    return search_service.settings()
 
 
 def enabled() -> bool:
     settings = _settings()
-    return bool(settings.get("enabled", True))
+    return any(settings.get(key, "managed") == "managed" for key in ("functionMode", "hostedMode"))
 
 
 def max_tool_rounds() -> int:
@@ -85,28 +70,6 @@ def max_tool_rounds() -> int:
         return max(0, int((_settings().get("maxToolRounds", 50))))
     except Exception:
         return 50
-
-
-def _api_key() -> str:
-    settings = _settings()
-    key = settings.get("apiKey")
-    if isinstance(key, str) and key.strip():
-        return key.strip()
-    return os.environ.get("ANYSEARCH_API_KEY", "").strip()
-
-
-def _endpoint() -> str:
-    endpoint = _settings().get("endpoint")
-    if isinstance(endpoint, str) and endpoint.strip():
-        return endpoint.strip()
-    return "https://api.anysearch.com/mcp"
-
-
-def _timeout_seconds() -> float:
-    try:
-        return max(1.0, float(_settings().get("timeoutSeconds", 30)))
-    except Exception:
-        return 30.0
 
 
 def _max_results() -> int:
@@ -132,9 +95,9 @@ def _min_query_chars() -> int:
 
 def _max_fetch_url_chars() -> int:
     try:
-        return max(1, int(_settings().get("maxFetchUrlChars", 250)))
+        return max(1, int(_settings().get("maxFetchUrlChars", 2048)))
     except Exception:
-        return 250
+        return 2048
 
 
 def _require_known_url_for_fetch() -> bool:
@@ -176,7 +139,7 @@ def _estimate_result_count(tool_name: str, text: str) -> int:
     return len(urls) if urls else 1
 
 
-def _record_call_start(request_id: str | None, round_no: int, call: LocalToolCall) -> int | None:
+def _record_call_start(request_id: str | log_db.RequestLogHandle | None, round_no: int, call: LocalToolCall) -> log_db.RowLogHandle | None:
     if not request_id:
         return None
     try:
@@ -191,7 +154,7 @@ def _record_call_start(request_id: str | None, round_no: int, call: LocalToolCal
         return None
 
 
-def _record_call_finish(log_id: int | None, call: LocalToolCall, result: LocalToolResult) -> None:
+def _record_call_finish(log_id: int | log_db.RowLogHandle | None, call: LocalToolCall, result: LocalToolResult) -> None:
     if log_id is None:
         return
     try:
@@ -210,7 +173,7 @@ def _record_call_finish(log_id: int | None, call: LocalToolCall, result: LocalTo
 
 
 def is_anthropic_web_tool_type(value: Any) -> bool:
-    return isinstance(value, str) and value in (ANTHROPIC_WEB_SEARCH_TOOL_TYPES | ANTHROPIC_WEB_FETCH_TOOL_TYPES)
+    return isinstance(value, str) and (value in (ANTHROPIC_WEB_SEARCH_TOOL_TYPES | ANTHROPIC_WEB_FETCH_TOOL_TYPES) or bool(re.fullmatch(r"web_(search|fetch)_\d{8}", value)))
 
 
 def is_supported_tool_name(value: Any) -> bool:
@@ -218,21 +181,12 @@ def is_supported_tool_name(value: Any) -> bool:
 
 
 def request_declares_supported_tools(body: dict[str, Any] | None) -> bool:
-    if not enabled() or not isinstance(body, dict):
-        return False
-    tools = body.get("tools") or []
-    if not isinstance(tools, list):
-        return False
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if is_supported_tool_name(tool.get("name")) or is_anthropic_web_tool_type(tool.get("type")):
-            return True
-    return False
+    from .search_tool_policy import needs_loop
+    return isinstance(body, dict) and needs_loop(body)
 
 
 def is_openai_web_search_tool_type(value: Any) -> bool:
-    return isinstance(value, str) and value in OPENAI_WEB_SEARCH_TOOL_TYPES
+    return isinstance(value, str) and (value in OPENAI_WEB_SEARCH_TOOL_TYPES or value.startswith("web_search_"))
 
 
 def is_openai_drop_tool_type(value: Any) -> bool:
@@ -256,7 +210,7 @@ def _openai_web_search_function_tool(source: dict[str, Any] | None = None) -> di
         "name": "web_search",
         "description": str(
             source.get("description")
-            or "Search the web. Executed locally by Parrot through AnySearch when needed."
+            or "Search the web. Executed by Parrot search_service when managed."
         ),
         "parameters": params,
     }
@@ -315,27 +269,15 @@ _XAI_WEB_SEARCH_TOOL_ALLOWED_FIELDS = frozenset({
 })
 
 
-def _normalize_xai_native_web_search_tool(tool: Any) -> tuple[dict[str, Any] | Any, bool]:
-    """Normalize OpenAI hosted search aliases to xAI's native web_search tool.
-
-    xAI documents the Responses-compatible tool as ``{"type":"web_search"}``
-    with four optional parameters.  Keep ordinary function/custom tools intact,
-    but avoid forwarding OpenAI preview aliases or unrelated hosted tool fields
-    that xAI's stricter API may reject.
-    """
-    if not isinstance(tool, dict):
+def _normalize_xai_native_web_search_tool(tool: Any) -> tuple[Any, bool]:
+    # Keep constraints (including filters and external_web_access) verbatim.
+    # A candidate may reject unsupported options; it must not weaken policy.
+    if not isinstance(tool, dict) or not is_openai_web_search_tool_type(tool.get("type")):
         return tool, False
-    typ = str(tool.get("type") or "").strip()
-    if not is_openai_web_search_tool_type(typ):
-        return tool, False
-    out: dict[str, Any] = {"type": "web_search"}
-    for key in _XAI_WEB_SEARCH_TOOL_ALLOWED_FIELDS:
-        if key != "type" and key in tool:
-            out[key] = tool[key]
-    # Parrot/OpenAI-local schemas historically used blocked_domains; xAI calls
-    # the equivalent excluded_domains.  Prefer the official field if both exist.
-    if "excluded_domains" not in out and "blocked_domains" in tool:
-        out["excluded_domains"] = tool.get("blocked_domains")
+    out = dict(tool)
+    out["type"] = "web_search"
+    if "blocked_domains" in out and "excluded_domains" not in out:
+        out["excluded_domains"] = out.pop("blocked_domains")
     return out, out != tool
 
 
@@ -419,66 +361,16 @@ def request_declares_openai_web_search_tools(body: dict[str, Any] | None) -> boo
 
 
 def prepare_openai_responses_local_web_tools(body: dict[str, Any] | None) -> bool:
-    """Normalize Responses built-ins for local/non-native execution.
-
-    * ``web_search`` (and legacy preview aliases) becomes a normal function tool
-      named ``web_search`` so any upstream model can request it; Parrot then runs
-      AnySearch and appends ``function_call_output`` items.
-    * ``tool_search`` is preserved for Codex-native routing. ``image_generation``
-      is dropped because it is not web search and isn't safe to forward to
-      arbitrary upstreams.
-
-    Returns True when a web_search tool was converted and a local web loop should
-    be active for the request.
-    """
-    if not enabled() or not isinstance(body, dict):
+    """Compatibility helper; execution preparation belongs to the shared runner."""
+    from .search_tool_policy import validate, needs_loop
+    if not isinstance(body, dict):
         return False
-    tools = body.get("tools")
-    if not isinstance(tools, list):
-        return False
-
-    changed = False
-    has_local_web = False
-    kept: list[Any] = []
-    for tool in tools:
-        normalized, item_changed, item_web = _normalize_openai_local_web_tool(tool)
-        changed = changed or item_changed
-        has_local_web = has_local_web or item_web
-        if normalized is not None:
-            kept.append(normalized)
-    if changed:
-        if kept:
-            body["tools"] = kept
-        else:
-            body.pop("tools", None)
-
-    choice = body.get("tool_choice")
-    if choice is not None:
-        normalized_choice, choice_changed = _normalize_openai_local_web_tool_choice(choice, has_tools=bool(kept or tools))
-        if choice_changed:
-            changed = True
-            if normalized_choice in (None, "auto"):
-                if kept:
-                    body["tool_choice"] = "auto"
-                else:
-                    body.pop("tool_choice", None)
-            else:
-                body["tool_choice"] = normalized_choice
-
-    if not body.get("tools"):
-        body.pop("tools", None)
-        body.pop("tool_choice", None)
-        body.pop("parallel_tool_calls", None)
-
-    if has_local_web:
-        body[OPENAI_LOCAL_WEB_MARKER] = True
-    elif changed:
-        body.pop(OPENAI_LOCAL_WEB_MARKER, None)
-    return has_local_web
+    validate(body)
+    return needs_loop(body)
 
 
 def openai_responses_local_web_active(body: dict[str, Any] | None) -> bool:
-    return enabled() and isinstance(body, dict) and body.get(OPENAI_LOCAL_WEB_MARKER) is True
+    return request_declares_supported_tools(body)
 
 
 def openai_response_assistant_message(response_obj: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -792,55 +684,11 @@ def round_limit_results(calls: list[LocalToolCall], max_rounds: int) -> list[Loc
     return [LocalToolResult(c.id, content, is_error=True) for c in calls]
 
 
-def _jsonrpc_payload(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-    }
-
-
-async def _call_anysearch(tool_name: str, arguments: dict[str, Any]) -> str:
-    headers = {"Content-Type": "application/json"}
-    key = _api_key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    timeout_s = _timeout_seconds()
-    async with network.async_client(
-        timeout=httpx.Timeout(timeout_s),
-        follow_redirects=True,
-    ) as client:
-        resp = await client.post(_endpoint(), headers=headers, json=_jsonrpc_payload(tool_name, arguments))
-        resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict) and data.get("error"):
-        err = data.get("error") or {}
-        if isinstance(err, dict):
-            raise RuntimeError(str(err.get("message") or err))
-        raise RuntimeError(str(err))
-    result = data.get("result") if isinstance(data, dict) else None
-    content = result.get("content") if isinstance(result, dict) else None
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                return str(item.get("text") or "")
-    return json.dumps(result if result is not None else data, ensure_ascii=False)
-
-
-def _domain_filter_query(query: str, allowed_domains: Any, blocked_domains: Any) -> str:
-    parts: list[str] = []
-    if isinstance(allowed_domains, list):
-        allowed = [str(d).strip() for d in allowed_domains if str(d).strip()]
-        if allowed:
-            parts.append("(" + " OR ".join(f"site:{d}" for d in allowed) + ")")
-    parts.append(query)
-    if isinstance(blocked_domains, list):
-        for domain in blocked_domains:
-            d = str(domain).strip()
-            if d:
-                parts.append(f"-site:{d}")
-    return " ".join(p for p in parts if p).strip()
+async def _call_search_service(tool_name: str, arguments: dict[str, Any], *, request_id=None) -> str:
+    from . import search_service
+    operation = search_service.search if tool_name == "search" else search_service.extract
+    result = await operation(arguments, request_id=request_id)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def _valid_url(url: str) -> bool:
@@ -851,22 +699,59 @@ def _valid_url(url: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
-async def _execute_web_search(call: LocalToolCall) -> LocalToolResult:
-    query = str(call.input.get("query") or "").strip()
-    min_chars = _min_query_chars()
-    if len(query) < min_chars:
-        return LocalToolResult(call.id, f"invalid_input: search query is empty or too short (min {min_chars} characters)", is_error=True)
-    query = _domain_filter_query(query, call.input.get("allowed_domains"), call.input.get("blocked_domains"))
+def _bound_content(text: str, limit: Any) -> str:
+    """Conservative, inspectable content budget without guessing a tokenizer.
+
+    At most one UTF-8 byte of fetched text/snippets is returned per requested
+    token. Metadata/URLs stay intact, JSON stays valid, and truncation is explicit.
+    """
+    if limit is None:
+        return text
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("max_content_tokens must be a positive integer")
+    obj = json.loads(text)
+    remaining, truncated = limit, False
+    def visit(value):
+        nonlocal remaining, truncated
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("content", "snippet", "text", "answer") and isinstance(item, str):
+                    raw = item.encode("utf-8")
+                    clipped = raw[:remaining].decode("utf-8", errors="ignore")
+                    remaining -= len(clipped.encode("utf-8"))
+                    truncated |= len(raw) > len(clipped.encode("utf-8"))
+                    value[key] = clipped
+                elif isinstance(item, (list, dict)):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    visit(obj)
+    obj["content_budget"] = {"requested_max_content_tokens": limit, "enforced_utf8_bytes": limit, "method": "conservative_utf8_byte_cap"}
+    if truncated:
+        obj["truncated"] = True
+    return json.dumps(obj, ensure_ascii=False)
+
+
+async def _execute_web_search(call: LocalToolCall, *, request_id=None) -> LocalToolResult:
+    from . import search_service
+    query = str(call.input.get("query") or call.input.get("q") or "").strip()
+    if len(query) < _min_query_chars():
+        return LocalToolResult(call.id, f"invalid_input: search query is empty or too short (min {_min_query_chars()} characters)", is_error=True)
+    arguments = {k: v for k, v in call.input.items() if not k.startswith("_")}
+    arguments["query"] = query
+    arguments.setdefault("max_results", _max_results())
     try:
-        text = await _call_anysearch("search", {"query": query, "max_results": _max_results()})
-    except httpx.HTTPStatusError as exc:
-        return LocalToolResult(call.id, f"AnySearch HTTP error: {exc.response.status_code}", is_error=True)
-    except Exception as exc:
-        return LocalToolResult(call.id, f"AnySearch search failed: {exc}", is_error=True)
-    return LocalToolResult(call.id, text or "No search results returned.")
+        text = await _call_search_service("search", arguments, request_id=request_id)
+    except search_service.SearchError as exc:
+        return LocalToolResult(call.id, f"{exc.code}: {exc.message}", is_error=True)
+    except Exception:
+        return LocalToolResult(call.id, "search_failed: search service failed", is_error=True)
+    return LocalToolResult(call.id, _bound_content(text, call.input.get("max_content_tokens")))
 
 
-async def _execute_web_fetch(call: LocalToolCall) -> LocalToolResult:
+async def _execute_web_fetch(call: LocalToolCall, *, request_id=None) -> LocalToolResult:
+    from . import search_service
     url = str(call.input.get("url") or "").strip()
     prompt = str(call.input.get("prompt") or "").strip()
     if not _valid_url(url):
@@ -883,43 +768,46 @@ async def _execute_web_fetch(call: LocalToolCall) -> LocalToolResult:
                 "url_not_allowed: WebFetch can only fetch URLs that already appeared in the conversation or prior search/fetch results",
                 is_error=True,
             )
+    arguments = {k: v for k, v in call.input.items() if not k.startswith("_")}
+    arguments["url"] = url
     try:
-        text = await _call_anysearch("extract", {"url": url})
-    except httpx.HTTPStatusError as exc:
-        return LocalToolResult(call.id, f"AnySearch HTTP error: {exc.response.status_code}", is_error=True)
-    except Exception as exc:
-        return LocalToolResult(call.id, f"AnySearch fetch failed: {exc}", is_error=True)
-    max_chars = _max_fetch_chars()
-    truncated = False
-    if len(text) > max_chars:
-        text = text[:max_chars]
-        truncated = True
-    header = [f"URL: {url}"]
-    if prompt:
-        header.append(f"Prompt: {prompt}")
-    if truncated:
-        header.append(f"Note: content truncated to {max_chars} characters by Parrot.")
-    return LocalToolResult(call.id, "\n".join(header) + "\n\n" + (text or "No page content returned."))
+        text = await _call_search_service("extract", arguments, request_id=request_id)
+    except search_service.SearchError as exc:
+        return LocalToolResult(call.id, f"{exc.code}: {exc.message}", is_error=True)
+    except Exception:
+        return LocalToolResult(call.id, "extract_failed: search service failed", is_error=True)
+    # Truncate only the content value, never corrupt the structured JSON result.
+    result = json.loads(text)
+    if isinstance(result.get("content"), str) and len(result["content"]) > _max_fetch_chars():
+        result["content"] = result["content"][:_max_fetch_chars()]
+        result["truncated"] = True
+    return LocalToolResult(call.id, _bound_content(json.dumps(result, ensure_ascii=False), call.input.get("max_content_tokens")))
 
 
-async def execute_local_tool_call(call: LocalToolCall) -> LocalToolResult:
+async def execute_local_tool_call(call: LocalToolCall, *, request_id=None) -> LocalToolResult:
+    budget = call.input.get("max_content_tokens")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
+        return LocalToolResult(call.id, "invalid_input: max_content_tokens must be a positive integer", is_error=True)
     if call.name in ("WebSearch", "web_search"):
-        return await _execute_web_search(call)
+        return await _execute_web_search(call, request_id=request_id)
     if call.name in ("WebFetch", "web_fetch"):
-        return await _execute_web_fetch(call)
+        return await _execute_web_fetch(call, request_id=request_id)
     return LocalToolResult(call.id, f"unsupported local tool: {call.name}", is_error=True)
 
 
 async def execute_local_tool_calls(
     calls: list[LocalToolCall],
     *,
-    request_id: str | None = None,
+    request_id: str | log_db.RequestLogHandle | None = None,
     round_no: int = 0,
 ) -> list[LocalToolResult]:
+    # A concrete handle pins tool logs without retaining a global mapping after
+    # model finalization. Only the public request ID goes to search adapters.
+    service_request_id = request_id.request_id if isinstance(request_id, log_db.RequestLogHandle) else request_id
     # Keep order stable; run concurrently because web search/fetch is external I/O.
     async def _run(call: LocalToolCall) -> LocalToolResult:
         log_id = _record_call_start(request_id, round_no, call)
-        result = await execute_local_tool_call(call)
+        result = await execute_local_tool_call(call, request_id=service_request_id)
         _record_call_finish(log_id, call, result)
         return result
 
@@ -975,9 +863,10 @@ def _sse(event: str, payload: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
 
 
-def _message_usage(message: dict[str, Any]) -> dict[str, int]:
+def _message_usage(message: dict[str, Any]) -> dict[str, Any]:
     usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
     return {
+        **copy.deepcopy(usage),
         "input_tokens": int(usage.get("input_tokens") or 0),
         "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
         "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
@@ -1033,6 +922,10 @@ async def _iter_anthropic_message_sse(message: dict[str, Any]):
                     "index": idx,
                     "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)},
                 })
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+            idx += 1
+        else:
+            yield _sse("content_block_start", {"type": "content_block_start", "index": idx, "content_block": block})
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
             idx += 1
     yield _sse("message_delta", {

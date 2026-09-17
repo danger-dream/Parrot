@@ -582,20 +582,15 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     except GuardError as ge:
         return errors.json_error_openai(ge.status, ge.err_type, ge.message, param=ge.param)
 
-    if ingress_protocol == "responses":
-        # Normalize hosted search-ish tools before scheduling.  xAI/Grok has a
-        # native Responses-compatible web_search tool, so keep it hosted when a
-        # matching xAI OAuth channel can serve the requested model.  Other
-        # OpenAI-family upstreams keep the previous safe behaviour: web_search
-        # is converted into Parrot's local AnySearch-backed function loop, while
-        # non-portable hosted tools are dropped/guarded.
-        if (
-            local_web_tools.request_declares_openai_web_search_tools(body)
-            and _has_xai_oauth_candidate(model)
-        ):
-            local_web_tools.prepare_xai_responses_native_web_search_tools(body)
-        else:
-            local_web_tools.prepare_openai_responses_local_web_tools(body)
+    from .. import search_tool_policy
+    body.pop(search_tool_policy.ROUND_KEY, None)
+    body.pop("_parrot_search_original_tools", None)
+    try:
+        search_tool_policy.validate(body)
+    except GuardError as ge:
+        return errors.json_error_openai(ge.status, ge.err_type, ge.message, param=ge.param)
+
+    body = search_tool_policy.restore_replay(body, ingress_protocol, key_name)
 
     # OpenAI 默认非流式（与 anthropic 默认流式相反）
     is_stream = bool(body.get("stream", False))

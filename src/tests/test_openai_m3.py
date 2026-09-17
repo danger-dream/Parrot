@@ -877,7 +877,7 @@ async def test_responses_to_chat_function_call_roundtrip(m):
 # ─── 跨变体 guard ────────────────────────────────────────────────
 
 
-async def test_r2c_web_search_preview_becomes_local_anysearch_function_tool(m):
+async def test_r2c_web_search_preview_becomes_managed_search_function_tool(m):
     _setup(m)
     _install_keys(m, _default_key())
     router = MockRouter()
@@ -902,8 +902,8 @@ async def test_r2c_web_search_preview_becomes_local_anysearch_function_tool(m):
     assert up["tools"] == [{
         "type": "function",
         "function": {
-            "name": "web_search",
-            "description": "Search the web. Executed locally by Parrot through AnySearch when needed.",
+            "name": "parrot_hosted_web_search",
+            "description": "Search the web using Parrot.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -916,9 +916,10 @@ async def test_r2c_web_search_preview_becomes_local_anysearch_function_tool(m):
             },
         },
     }]
-    assert up["tool_choice"] == {"type": "function", "function": {"name": "web_search"}}
+    assert up["tool_choice"] == {"type": "function", "function": {"name": "parrot_hosted_web_search"}}
+    assert b"parrot_hosted_web_search" not in resp.body
     await mc.aclose()
-    print("  [PASS] r2c web_search_preview: normalized to local AnySearch function tool")
+    print("  [PASS] r2c web_search_preview: compiled to a distinct managed search function")
 
 
 async def test_guard_r2c_previous_response_id_not_found(m):

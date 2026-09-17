@@ -78,7 +78,7 @@ class OAuthChannel(Channel):
 
     UPSTREAM_BASE = "https://api.anthropic.com"
 
-    def __init__(self, cfg_entry, oauth_defaults):
+    def __init__(self, cfg_entry):
         self.email = cfg_entry["email"]
         self.key = f"oauth:{self.email}"
         self.type = "oauth"
@@ -87,7 +87,7 @@ class OAuthChannel(Channel):
         self.refresh_token = cfg_entry["refresh_token"]
         self.expired = parse_iso(cfg_entry["expired"])
         ...
-        self.models = cfg_entry.get("models") or oauth_defaults
+        self.models = cfg_entry.get("models") or []  # 无目录则无路由；同步失败保留 LKG
         self.cc_mimicry = True
 
     def supports_model(self, requested_model):
@@ -240,9 +240,8 @@ _channels: dict[str, Channel] = {}
 def rebuild_from_config():
     cfg = config.get()
     new = {}
-    oauth_defaults = cfg["oauthDefaultModels"]
     for entry in cfg["oauthAccounts"]:
-        ch = OAuthChannel(entry, oauth_defaults)
+        ch = OAuthChannel(entry)
         new[ch.key] = ch
     for entry in cfg["channels"]:
         ch = ApiChannel(entry)

@@ -312,26 +312,8 @@ def _web_tool_schema(kind: str) -> dict[str, Any]:
 
 
 def _server_tool_to_chat(tool: dict[str, Any]) -> dict[str, Any] | None:
-    typ = tool.get("type")
-    name = str(tool.get("name") or "")
-    if typ in local_web_tools.ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
-        return {
-            "type": "function",
-            "function": {
-                "name": name or "web_search",
-                "description": "Search the web. Executed locally by Parrot through AnySearch when needed.",
-                "parameters": _web_tool_schema("search"),
-            },
-        }
-    if typ in local_web_tools.ANTHROPIC_WEB_FETCH_TOOL_TYPES:
-        return {
-            "type": "function",
-            "function": {
-                "name": name or "web_fetch",
-                "description": "Fetch a URL and return extracted page content. Executed locally by Parrot through AnySearch when needed.",
-                "parameters": _web_tool_schema("fetch"),
-            },
-        }
+    if local_web_tools.is_anthropic_web_tool_type(tool.get("type")):
+        _fail("Chat upstream has no native hosted search/fetch tool; select a compatible native candidate or managed policy", param="tools")
     return None
 
 
@@ -404,14 +386,10 @@ def translate_request(body: dict, *, target_model: str | None = None) -> dict:
         payload["tools"] = tools
     tool_choice = _convert_tool_choice(body.get("tool_choice"))
     if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
-    if _disable_parallel_tool_calls(body.get("tool_choice")) or (
-        common.disable_parallel_tool_calls_for_local_web()
-        and local_web_tools.request_declares_supported_tools(body)
-    ):
-        # Local web tools are executed inside Parrot.  Disable parallel tool
-        # calls so the upstream model does not mix Parrot-handled WebSearch /
-        # WebFetch calls with client-handled Claude Code tools in one turn.
+        choice_name = (body.get("tool_choice") or {}).get("name") if isinstance(body.get("tool_choice"), dict) else None
+        selected = next((t for t in body.get("tools") or [] if isinstance(t, dict) and t.get("name") == choice_name and local_web_tools.is_anthropic_web_tool_type(t.get("type"))), None)
+        payload["tool_choice"] = {"type": _server_tool_to_chat(selected)["type"]} if selected else tool_choice
+    if _disable_parallel_tool_calls(body.get("tool_choice")):
         payload["parallel_tool_calls"] = False
     return payload
 

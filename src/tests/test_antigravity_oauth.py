@@ -34,7 +34,7 @@ def _import_modules():
     from src.providers import registry as provider_registry
     from src.providers import antigravity_codec as codec
     from src.telegram import states, ui
-    from src.telegram.menus import oauth_defaults_menu, oauth_menu
+    from src.telegram.menus import oauth_menu
     return {
         "config": config,
         "oauth_manager": oauth_manager,
@@ -50,7 +50,6 @@ def _import_modules():
         "codec": codec,
         "states": states,
         "ui": ui,
-        "oauth_defaults_menu": oauth_defaults_menu,
         "oauth_menu": oauth_menu,
     }
 
@@ -671,20 +670,9 @@ def test_antigravity_probe_url_is_not_codex(m):
     assert url == "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 
 
-def test_antigravity_defaults_menu_family(m):
-    _setup(m)
-    odm = m["oauth_defaults_menu"]
-    models = odm._read_list("antigravity")
-    assert "gemini-3.7-flash-high" in models
-    assert "gemini-3.1-flash-image" not in models
-    static = odm._static_models("antigravity")
-    assert "claude-sonnet-4-6" in static
-    assert "gpt-oss-120b-medium" in static
-    odm._write_list(42, "antigravity", ["gemini-3.7-flash-high"])
-    assert odm._read_list("antigravity") == ["gemini-3.7-flash-high"]
 
 
-def test_antigravity_image_model_is_media_only(m):
+def test_antigravity_image_capability_is_retired_but_chat_remains(m):
     _setup(m)
     ch = m["AntigravityOAuthChannel"]({
         "provider": "antigravity",
@@ -693,10 +681,10 @@ def test_antigravity_image_model_is_media_only(m):
         "access_token": "at",
         "refresh_token": "rt",
         "expired": _future_expired(),
-        "models": [],
+        "models": ["gemini-3.7-flash-high"],
     })
     assert ch.supports_model("gemini-3.1-flash-image") is None
-    assert ch.supports_media_model("image", "gemini-3.1-flash-image") is True
+    assert ch.supports_media_model("image", "gemini-3.1-flash-image") is False
     assert ch.supports_model("gemini-3.7-flash-high") == "gemini-3.7-flash-high"
 
 

@@ -97,16 +97,18 @@ def test_commands_cancel_only_mc_and_permission_is_rechecked(env, monkeypatch):
     assert menu._session(7).text == ''
 
 
-def test_returning_to_alias_list_invalidates_draft_save(env):
+def test_returning_to_alias_list_invalidates_old_target_without_undoing_committed_name(env):
     control, edits, answers, sends = env
     menu.handle_callback(7,10,'aliases','mc:aliases')
     menu.handle_callback(7,10,'open',_button(edits[-1][3],'1')['callback_data'])
     menu.handle_callback(7,10,'name',_button(edits[-1][3],'编辑别名名称')['callback_data'])
-    menu.handle_text_state(7,'mc_alias_name','edited-but-abandoned')
-    abandoned = _button(sends[-1][2],'保存')['callback_data']
+    menu.handle_text_state(7,'mc_alias_name','edited-immediately')
+    draft = menu._alias_drafts[7]
+    abandoned = menu._freeze(7, 'alias_target', draft_id=draft.draft_id, model_id='model-02')
     menu.handle_callback(7,10,'back',_button(sends[-1][2],'返回别名列表')['callback_data'])
-    menu.handle_callback(7,11,'old-save',abandoned)
-    assert control.mapping.update_calls == []
+    menu.handle_callback(7,11,'old-target',abandoned)
+    assert control.mapping.update_calls == [('quick', 'edited-immediately', 'model-01', 'r1')]
+    assert control.mapping.records['edited-immediately'] == ('model-01', 'r2')
     assert 7 not in menu._alias_drafts
 
 
@@ -165,7 +167,7 @@ def test_content_paging_preserves_only_its_own_alias_draft(env):
     menu.handle_callback(7, 10, 'aliases', 'mc:aliases')
     menu.handle_callback(7, 10, 'open', _button(edits[-1][3], '1')['callback_data'])
     draft = menu._alias_drafts[7]
-    old_save = _button(edits[-1][3], '保存')['callback_data']
+    old_save = menu._freeze(7, 'alias_target', draft_id=draft.draft_id, model_id='model-02')
     for key, item in list(control.views.items()):
         control.views[key] = replace(item, model_id=key + '<&>'*90)
     _, target = menu._alias_target_render(7, draft.draft_id, 1)
@@ -208,7 +210,7 @@ def test_exiting_alias_editor_revokes_draft_but_field_cancel_keeps_it(env, exit_
     monkeypatch.setattr(control.mapping, 'get_compression', lambda ctx: (None, 'r1'), raising=False)
     menu.handle_callback(7, 10, 'aliases', 'mc:aliases')
     menu.handle_callback(7, 10, 'open', _button(edits[-1][3], '1')['callback_data'])
-    save = _button(edits[-1][3], '保存')['callback_data']
+    save = menu._freeze(7, 'alias_target', draft_id=menu._alias_drafts[7].draft_id, model_id='model-02')
     menu.handle_callback(7, 10, 'name', _button(edits[-1][3], '编辑别名名称')['callback_data'])
     draft = menu._alias_drafts[7]
     menu.handle_text_state(7, 'mc_alias_name', '/cancel')
@@ -229,7 +231,8 @@ def test_explicit_zero_and_empty_lists_remain_set_not_unset(env, field_key, raw,
     control, edits, answers, sends = env
     field = menu._META_BY_KEY[field_key]
     _, kb = menu._metadata_editor_render(7, 'rk-1', None, field.group)
-    button = next(b for b in _buttons(kb) if b['text'] in {field.label, field.label + ' ✎'})
+    from src.telegram.menus.model_center_icons import label_with_icon
+    button = next(b for b in _buttons(kb) if b['text'] in {label_with_icon(field.label), label_with_icon(field.label + ' ✎')})
     menu.handle_callback(7, 10, 'field', button['callback_data'])
     menu.handle_text_state(7, 'mc_metadata_field', raw)
     _, call = control.mapping.patch_calls[-1]
@@ -250,7 +253,8 @@ def test_all_sixteen_fields_have_sparse_single_unset(env, field, source):
             view.sources[0], type=source.type, id=source.id, provider='anthropic', label='Public A',
         ),))
     _, kb = menu._metadata_editor_render(7, 'rk-1', source, field.group)
-    button = next(b for b in _buttons(kb) if b['text'] in {field.label, field.label+' ✎'})
+    from src.telegram.menus.model_center_icons import label_with_icon
+    button = next(b for b in _buttons(kb) if b['text'] in {label_with_icon(field.label), label_with_icon(field.label + ' ✎')})
     menu.handle_callback(7, 10, 'field', button['callback_data'])
     choices = edits[-1][3] if field.kind == 'bool' else sends[-1][2]
     menu.handle_callback(7, 10, 'inherit', _button(choices, '恢复继承')['callback_data'])

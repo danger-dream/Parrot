@@ -18,7 +18,7 @@ class OAuthChannel(Channel):
     cc_mimicry = True  # OAuth 强制，不从 config 读
     protocol = "anthropic"  # OAuth 永远是 anthropic 家族，显式声明
 
-    def __init__(self, account: dict, default_models: list[str]):
+    def __init__(self, account: dict):
         from ..oauth_ids import account_key as _account_key
         self.email = account["email"]
         self.account_key = _account_key(account)   # provider:email
@@ -31,9 +31,8 @@ class OAuthChannel(Channel):
         except (TypeError, ValueError):
             self.max_concurrent = 0
 
-        # Account LKG is authoritative; provider defaults are fallback only.
-        models = account.get("models") or []
-        selected = list(models) if models else list(default_models)
+        # Only the account's successful catalog/LKG supplies ordinary routes.
+        selected = list(account.get("models") or [])
         disabled = {
             str(model).strip() for model in account.get("disabledModels") or []
             if str(model).strip()

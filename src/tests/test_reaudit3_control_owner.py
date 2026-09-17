@@ -150,7 +150,7 @@ def test_production_telegram_bindings_are_the_same_instances_as_api_dependencies
         assert tgbot.apikey_menu._CONTROL is apikey.get_api_key_control(request, runtime)
         assert tgbot.oauth_menu.oauth_control is oauth_support.get_oauth_control_dependency(runtime)
         assert tgbot.oauth_account_models_menu.oauth_control is owner.oauth
-        assert tgbot.oauth_defaults_menu.oauth_control is owner.oauth
+        assert not hasattr(tgbot, "oauth_defaults_menu")
         assert tgbot.translation_menu._CONTROL is owner.auxiliary.translation
         assert tgbot.status_alert_menu._CONTROL is owner.auxiliary.status_alerts
         assert tgbot.update_menu._CONTROL is owner.auxiliary.updates
@@ -224,7 +224,7 @@ def test_contract_points_to_the_complete_production_operation_manifest():
     document = (ROOT / "docs/13-management-control-api-refactor.md").read_text()
     section = document.split("## 15. Management API 完整性验收清单", 1)[1]
 
-    assert len(production) == 226
+    assert len(production) == 230  # 233 minus 3 retired OAuth fallback operations
     assert len(foundation) == 9
     assert "production-operation-ids.txt" in section
     assert "P0/foundation 的 9-operation 基础清单" in section

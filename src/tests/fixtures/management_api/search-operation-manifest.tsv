@@ -1,0 +1,9 @@
+operationId	method	path	capability	secretWriteFields
+getSearchSettings	GET	/api/management/v1/search	management.read	
+updateSearchSettings	PATCH	/api/management/v1/search	management.write	
+createSearchBackend	POST	/api/management/v1/search/backends	management.write	apiKeys,addApiKeys,removeKeyIndices
+updateSearchBackend	PATCH	/api/management/v1/search/backends/{backendId}	management.write	apiKeys,addApiKeys,removeKeyIndices
+deleteSearchBackend	DELETE	/api/management/v1/search/backends/{backendId}	management.write	
+getSearchBackendAccounts	GET	/api/management/v1/search/backends/{backendId}/accounts	management.read	
+updateSearchPriority	PUT	/api/management/v1/search/priority	management.write	
+testSearchBackend	POST	/api/management/v1/search/test	management.write	

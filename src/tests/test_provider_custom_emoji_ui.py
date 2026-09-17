@@ -17,7 +17,6 @@ from src.telegram.menus import (  # noqa: E402
     load_balancing_menu,
     logs_menu,
     mapping_menu,
-    oauth_defaults_menu,
     oauth_menu,
     stats_menu,
     status_alert_menu,
@@ -330,19 +329,6 @@ def test_protocol_and_mapping_surfaces_use_rich_families_and_button_icons():
 
     assert ui.provider_custom_emoji_id("cursor") in mapping_menu._line_body_label(
         "openai-chat"
-    )
-    assert ui.provider_custom_emoji_id("cursor") in (
-        oauth_defaults_menu._ingress_body_label("openai-responses")
-    )
-    defaults = oauth_defaults_menu._overview_kb()["inline_keyboard"]
-    buttons = [button for row in defaults for button in row]
-    assert any(
-        button.get("icon_custom_emoji_id") == ui.provider_custom_emoji_id("claude")
-        for button in buttons
-    )
-    assert any(
-        button.get("icon_custom_emoji_id") == ui.provider_custom_emoji_id("openai")
-        for button in buttons
     )
 
 

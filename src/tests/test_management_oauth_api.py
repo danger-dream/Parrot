@@ -18,7 +18,6 @@ from src.management_control.oauth import (
     CreateOAuthAccountCommand,
     JsonCredential,
     ManualCredential,
-    OAuthFamily,
     OAuthProvider,
     PageSpec,
     RefreshTokenCredential,
@@ -88,9 +87,6 @@ ROUTE_REQUESTS = [
     ("PATCH", "/oauth/settings", {"cchMode": "dynamic"}, {}),
     ("GET", "/preferences/telegram/oauth", None, {}),
     ("PATCH", "/preferences/telegram/oauth", {"usageDisplayMode": "remaining"}, {}),
-    ("GET", "/oauth/default-models/openai", None, {}),
-    ("PUT", "/oauth/default-models/openai", {"models": ["gpt-alpha"], "cleanupReferences": False}, {}),
-    ("POST", "/oauth/default-models/anthropic/actions/discover", None, {}),
 ]
 
 
@@ -118,7 +114,7 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         if line
     }
     assert set(operations) == manifested
-    assert len(operations) == len(ROUTE_REQUESTS) == 41
+    assert len(operations) == len(ROUTE_REQUESTS) == 38
     assert all(value.get("tags") == ["management-oauth"] for value in operations.values())
     assert all(value.get("security") == [{"ManagementSession": []}] for value in operations.values())
     no_content = {
@@ -170,10 +166,7 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
     serialized = json.dumps({key: operations[key] for key in operations}, ensure_ascii=False)
     assert "access-secret-in-storage" not in serialized
     assert "refresh-secret-in-storage" not in serialized
-    assert (
-        schemas["ReplaceOAuthDefaultModelsRequest"]["properties"]["models"]["maxItems"]
-        == 200
-    )
+    assert "ReplaceOAuthDefaultModelsRequest" not in schemas
 
 
 def test_every_oauth_route_rejects_missing_session_and_missing_capability(tmp_path):
@@ -672,32 +665,6 @@ def test_models_settings_preferences_defaults_actions_and_operations(tmp_path):
         assert preference_update.status_code == 200
         assert backend.preferences == ["remaining", False]
 
-        defaults = request(client, "GET", "/oauth/default-models/openai", None, headers)
-        default_revision = defaults.json()["data"]["revision"]
-        replaced = request(
-            client, "PUT", "/oauth/default-models/openai",
-            {"models": ["gpt-new"], "cleanupReferences": True},
-            {**headers, "If-Match": default_revision},
-        )
-        assert replaced.status_code == 200, replaced.text
-        assert backend.defaults["openai"] == ["gpt-new"]
-        discovery = request(client, "POST", "/oauth/default-models/anthropic/actions/discover", None, headers)
-        assert discovery.status_code == 202
-        discovered = client.get(
-            f"/api/management/v1/operations/{discovery.json()['data']['id']}",
-            headers=headers,
-        )
-        assert discovered.status_code == 200
-        assert discovered.json()["data"]["status"] == "succeeded"
-        failed_discovery = request(
-            client, "POST", "/oauth/default-models/xai/actions/discover", None, headers,
-        )
-        failed_operation = client.get(
-            f"/api/management/v1/operations/{failed_discovery.json()['data']['id']}",
-            headers=headers,
-        )
-        assert failed_operation.json()["data"]["status"] == "failed"
-        assert failed_operation.json()["data"]["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
     finally:
         client.__exit__(None, None, None)
 
@@ -745,7 +712,6 @@ def test_owned_telegram_menus_have_no_direct_oauth_business_reads_or_writes():
     for relative in (
         "src/telegram/menus/oauth_menu.py",
         "src/telegram/menus/oauth_account_models_menu.py",
-        "src/telegram/menus/oauth_defaults_menu.py",
     ):
         tree = ast.parse(Path(relative).read_text(), filename=relative)
         for node in ast.walk(tree):

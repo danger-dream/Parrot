@@ -132,6 +132,7 @@ _MIGRATIONS: dict[str, str] = {
     "updated_at": "ALTER TABLE image_call_logs ADD COLUMN updated_at REAL",
     "expires_at": "ALTER TABLE image_call_logs ADD COLUMN expires_at REAL",
     "http_status": "ALTER TABLE image_call_logs ADD COLUMN http_status INTEGER",
+    "output_sizes": "ALTER TABLE image_call_logs ADD COLUMN output_sizes TEXT",
 }
 
 
@@ -547,6 +548,7 @@ def finish_media_call(
     http_status: int | None = None,
     last_polled_at: float | None = None,
     expires_at: float | None = None,
+    output_sizes: list[str] | None = None,
 ) -> None:
     """Update one logical task; terminal statuses set ``finished_at`` exactly once."""
     normalized_status = str(status or "running")
@@ -587,7 +589,8 @@ def finish_media_call(
                  error_type=?, error_message=?,
                  http_status=COALESCE(?, http_status),
                  last_polled_at=COALESCE(?, last_polled_at),
-                 expires_at=COALESCE(?, expires_at)
+                 expires_at=COALESCE(?, expires_at),
+                 output_sizes=COALESCE(?, output_sizes)
                WHERE id=?""",
             (
                 normalized_status, now, terminal_at, terminal_at,
@@ -599,7 +602,8 @@ def finish_media_call(
                 json.dumps(cache_paths, ensure_ascii=False) if cache_paths is not None else None,
                 cache_status, cache_error_class,
                 error_type, (error_message or "")[:1000] if error_message else None,
-                http_status, last_polled_at, expires_at, int(log_id),
+                http_status, last_polled_at, expires_at,
+                json.dumps(output_sizes) if output_sizes is not None else None, int(log_id),
             ),
         )
         conn.commit()
@@ -717,4 +721,25 @@ def media_account_top(limit: int = 5) -> list[dict]:
                LIMIT ?""",
             (max(1, int(limit)),),
         ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def model_statistics(kind: str) -> list[dict]:
+    """Completed logical results only; attempts are never additional generations.
+
+    Historical zero/missing count or byte size is unknown, not a requested-count
+    estimate. Historical rows remain untouched.
+    """
+    if kind not in ('image', 'video'): raise ValueError('invalid media kind')
+    with _lock:
+        rows = _get_conn().execute("""SELECT
+            COALESCE(NULLIF(model, ''), NULLIF(tool_model, ''), main_model, '') AS model,
+            COUNT(*) AS completed_calls,
+            SUM(CASE WHEN image_count > 0 THEN image_count ELSE 0 END) AS generated_count,
+            SUM(CASE WHEN image_count IS NULL OR image_count <= 0 THEN 1 ELSE 0 END) AS unknown_count_calls,
+            SUM(CASE WHEN image_bytes > 0 THEN image_bytes ELSE 0 END) AS recorded_bytes,
+            SUM(CASE WHEN image_bytes IS NULL OR image_bytes <= 0 THEN 1 ELSE 0 END) AS unknown_bytes_calls
+            FROM image_call_logs WHERE media_type=? AND status='success' AND finished_at IS NOT NULL
+            GROUP BY COALESCE(NULLIF(model, ''), NULLIF(tool_model, ''), main_model, '')
+            ORDER BY model""", (kind,)).fetchall()
     return [dict(row) for row in rows]

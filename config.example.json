@@ -216,14 +216,6 @@
   },
   "cchMode": "disabled",
   "quotaProgressBar": true,
-  "oauthDefaultModels": [
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001"
-  ],
   "modelMapping": {
     "global": {}
   },
@@ -376,6 +368,30 @@
       "instructions": "reply ok"
     }
   },
+  "image_models": {
+    "openai": ["gpt-image-2", "gpt-image-2.5"],
+    "xai": ["grok-imagine-image", "grok-imagine-image-quality"]
+  },
+  "video_models": {
+    "xai": ["grok-imagine-video", "grok-imagine-video-1.5"]
+  },
+  "images": {
+    "enabled": true,
+    "cacheEnabled": false,
+    "cachePath": "images",
+    "cacheRetentionDays": 0,
+    "cacheMaxBytes": 1073741824,
+    "requestTimeoutSeconds": 180
+  },
+  "videos": {
+    "enabled": true,
+    "cacheEnabled": false,
+    "cachePath": "videos",
+    "cacheRetentionDays": 0,
+    "cacheMaxBytes": 1073741824,
+    "requestTimeoutSeconds": 180,
+    "jobTtlSeconds": 10800
+  },
   "xaiOAuth": {
     "issuer": "https://auth.x.ai",
     "discoveryUrl": "https://auth.x.ai/.well-known/openid-configuration",
@@ -386,20 +402,7 @@
     "baseUrl": "https://api.x.ai/v1",
     "responsesPath": "",
     "isolateSessionId": true,
-    "userAgent": "parrot/xai-oauth-adapter",
-    "imageModels": [
-      "grok-imagine-image",
-      "grok-imagine-image-quality"
-    ],
-    "videoModels": [
-      "grok-imagine-video",
-      "grok-imagine-video-1.5"
-    ],
-    "videoJobTtlSeconds": 10800,
-    "mediaRequestTimeoutSeconds": 180,
-    "defaultModels": [
-      "grok-4.5"
-    ]
+    "userAgent": "parrot/xai-oauth-adapter"
   },
   "cursorOAuth": {
     "bridgeHost": "127.0.0.1",
@@ -431,18 +434,30 @@
       "rejectOnMultiCandidate": true
     }
   },
-  "anysearch": {
-    "enabled": true,
-    "apiKey": "",
-    "endpoint": "https://api.anysearch.com/mcp",
-    "timeoutSeconds": 30,
+  "search": {
+    "functionMode": "managed",
+    "hostedMode": "managed",
+    "maxAttempts": 3,
+    "timeoutSeconds": 10,
     "maxResults": 8,
     "maxFetchChars": 50000,
     "maxToolRounds": 50,
     "minQueryChars": 2,
-    "maxFetchUrlChars": 250,
+    "maxFetchUrlChars": 2048,
     "requireKnownUrlForFetch": true,
-    "maxConcurrentToolCalls": 0
+    "maxConcurrentToolCalls": 0,
+    "language": "",
+    "country": "",
+    "freshness": "",
+    "backends": [
+      {"id": "anysearch", "type": "anysearch", "name": "AnySearch", "enabled": true, "apiKeys": [], "endpoint": "https://api.anysearch.com"},
+      {"id": "tavily", "type": "tavily", "name": "Tavily", "enabled": true, "apiKeys": [], "endpoint": "https://api.tavily.com"},
+      {"id": "exa", "type": "exa", "name": "Exa", "enabled": true, "apiKeys": [], "endpoint": "https://api.exa.ai"},
+      {"id": "brave", "type": "brave", "name": "Brave", "enabled": true, "apiKeys": [], "endpoint": "https://api.search.brave.com"},
+      {"id": "openai", "type": "openai", "name": "OpenAI OAuth", "enabled": true, "model": "gpt-5.5", "accountIds": [], "allowDisabledAccounts": false},
+      {"id": "xai", "type": "xai", "name": "xAI OAuth", "enabled": true, "model": "grok-4.6", "accountIds": [], "allowDisabledAccounts": false},
+      {"id": "anthropic", "type": "anthropic", "name": "Anthropic OAuth", "enabled": true, "model": "claude-sonnet-4-6", "accountIds": [], "allowDisabledAccounts": false}
+    ]
   },
   "telegramUi": {
     "providerCustomEmoji": {

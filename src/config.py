@@ -131,8 +131,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "channels": [],
     "images": {
         "enabled": True,
-        "mainModel": "gpt-5.4-mini",
-        "toolModel": "gpt-image-2",
         "disabledAccounts": [],
         "cacheEnabled": False,
         "cachePath": "images",
@@ -346,6 +344,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "scope": {"models": [], "channels": []},
         "modelOverrides": {},
     },
+    # Empty overrides preserve legacy AnySearch opt-out/key on upgrade; effective
+    # defaults and direct-HTTP backend migration live in search_service.settings.
+    "search": {},
     "anysearch": {
         "enabled": True,
         "apiKey": "",
@@ -362,14 +363,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "cchMode": "disabled",
     "cchStaticValue": "00000",
-    "oauthDefaultModels": [
-        "claude-opus-4-5",
-        "claude-opus-4-6",
-        "claude-opus-4-7",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
-    ],
     # Global alias mapping is protocol/account agnostic. Model metadata is
     # resolved separately through exact models.dev default/scoped bindings.
     # modelMapping supports both the new global bucket and legacy per-ingress
@@ -604,24 +597,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "responsesPath": "",
         "isolateSessionId": True,
         "userAgent": "parrot/xai-oauth-adapter",
-        # 媒体模型单独声明，不能混入 defaultModels（后者只用于文本 /responses 调度）。
-        "imageModels": [
-            "grok-imagine-image",
-            "grok-imagine-image-quality",
-        ],
-        "videoModels": [
-            "grok-imagine-video",
-            "grok-imagine-video-1.5",
-        ],
+        # 媒体模型与账户同步的普通对话目录独立。
+        # Media lists now live in image_models/video_models. Old files are
+        # inherited read-only by media_config until an explicit media save.
         # 视频任务是异步的；短期绑定用于让后续轮询复用创建任务的 OAuth 账号。
         "videoJobTtlSeconds": 10800,
         "mediaRequestTimeoutSeconds": 180,
-        "defaultModels": [
-            "grok-4.5",
-        ],
     },
     # Antigravity / Google Code Assist OAuth。
-    # 出图模型单独放 imageModels，不能混进 defaultModels 文本调度器。
+    # 出图模型配置与账户普通对话目录独立。
     "antigravityOAuth": {
         "clientId": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
         "clientSecret": "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",
@@ -641,20 +625,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
         "imageModels": [
             "gemini-3.1-flash-image",
-        ],
-        "defaultModels": [
-            "gemini-3.7-flash-high",
-            "gemini-3.6-flash-high",
-            "gemini-3-flash",
-            "gemini-3-flash-agent",
-            "gemini-pro-agent",
-            "gemini-3.1-pro-low",
-            "gemini-3.1-flash-lite",
-            "gemini-3.5-flash-low",
-            "gemini-3.5-flash-extra-low",
-            "claude-opus-4-6-thinking",
-            "claude-sonnet-4-6",
-            "gpt-oss-120b-medium",
         ],
     },
     # Cursor OAuth / AgentService 私有 bridge。模型清单和上下文限制按账号
@@ -754,7 +724,7 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
     # both accepted OpenAI config paths; xAI's isolateSessionId is unrelated.
     obsolete_keys = (
         "forceCodexCLI", "enableTLSFingerprint", "isolateSessionId",
-        "codexDeviceConvergenceEnabled",
+        "codexDeviceConvergenceEnabled", "defaultModels",
     )
     changed = False
     for obsolete in obsolete_keys:
@@ -778,6 +748,25 @@ def _normalize_openai_oauth_config(cfg: dict, raw: dict | None = None) -> bool:
 
     if current != merged:
         cfg["openaiOAuth"] = merged
+        changed = True
+    return changed
+
+
+def _retire_oauth_default_models(cfg: dict) -> bool:
+    """Drop only retired ordinary-model fallbacks; preserve catalogs/media/profiles."""
+    changed = "oauthDefaultModels" in cfg
+    cfg.pop("oauthDefaultModels", None)
+    for section in ("openaiOAuth", "xaiOAuth", "antigravityOAuth"):
+        value = cfg.get(section)
+        if isinstance(value, dict) and "defaultModels" in value:
+            value.pop("defaultModels")
+            changed = True
+    # This historical OpenAI alias was also accepted by the normal migration.
+    oauth = cfg.get("oauth")
+    providers = oauth.get("providers") if isinstance(oauth, dict) else None
+    legacy = providers.get("openai") if isinstance(providers, dict) else None
+    if isinstance(legacy, dict) and "defaultModels" in legacy:
+        legacy.pop("defaultModels")
         changed = True
     return changed
 
@@ -992,6 +981,9 @@ def management_settings(cfg: dict | None = None) -> dict[str, Any]:
 def _load_from_disk() -> dict:
     if not os.path.exists(CONFIG_PATH):
         initial = copy.deepcopy(DEFAULT_CONFIG)
+        from .media_config import IMAGE_DEFAULT_MODELS, VIDEO_DEFAULT_MODELS
+        initial['image_models'] = copy.deepcopy(IMAGE_DEFAULT_MODELS)
+        initial['video_models'] = copy.deepcopy(VIDEO_DEFAULT_MODELS)
         _normalize_management_config(initial, {})
         _normalize_openai_oauth_config(initial)
         _write_atomic(initial)
@@ -1018,6 +1010,8 @@ def _load_from_disk() -> dict:
     if _normalize_openai_oauth_config(merged, raw):
         changed = True
         print("[config] backfilled openaiOAuth from defaults/legacy oauth.providers.openai")
+    if _retire_oauth_default_models(merged):
+        changed = True
     if _normalize_pricing_sources(merged):
         changed = True
         print("[config] migrated built-in pricing source from LiteLLM to models.dev")
@@ -1084,6 +1078,7 @@ def _rotate_backups() -> None:
 def _write_atomic(data: dict) -> None:
     """Write through a private 0600 temp file, then atomically replace config."""
     _workbuddy_rewrite_settings(data)
+    _retire_oauth_default_models(data)
     parent = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
     prefix = f".{os.path.basename(CONFIG_PATH)}."
     fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=parent, text=True)

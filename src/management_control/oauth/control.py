@@ -29,7 +29,6 @@ from .contracts import (
     sanitize_text,
     utc_datetime,
 )
-from .default_models import OAuthDefaultModelsControlMixin
 from .flows import OAuthFlowService
 from .imports import OAuthImportControlMixin
 from .legacy_ops import OAuthLegacyOperationsControlMixin
@@ -81,7 +80,6 @@ class OAuthControl(
     OAuthAccountMutationControlMixin,
     OAuthImportControlMixin,
     OAuthCompatibilityControlMixin,
-    OAuthDefaultModelsControlMixin,
     OAuthLegacyOperationsControlMixin,
     OAuthQueryControlMixin,
 ):

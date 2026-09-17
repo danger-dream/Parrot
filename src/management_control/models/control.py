@@ -19,9 +19,9 @@ from src import config, model_mapping, model_metadata, model_names, model_state
 from src.management_control.auxiliary.media import (
     AntigravityMediaControl,
     ImageControl,
+    VideoControl,
     XaiMediaControl,
 )
-from src.management_control.channels.models import DiscoveryCommand
 from src.management_control.channels.service import ChannelControl
 from src.management_control.context import AuditSink, ManagementContext
 from src.management_control.errors import ErrorField, ManagementError, ManagementErrorCode
@@ -30,6 +30,7 @@ from src.management_control.oauth.control import OAuthControl
 from src.management_control.operations import ManagementOperation, OperationStore
 from src.management_control.routing_account_ids import oauth_channel_key_from_account_id
 
+from .upstream_sync import UpstreamSync
 from .common import (
     DomainControl,
     ModelKind,
@@ -81,6 +82,7 @@ class ModelSourceView:
     effective_metadata: Mapping[str, Any]
     value_source: Mapping[str, str]
     constrained_by: Mapping[str, tuple[str, ...]]
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +100,7 @@ class ModelView:
 
     def available_in(self, source: ModelSourceRef | None = None) -> bool:
         """Effective availability in this query, independent of discovery visibility."""
-        return self.identity.kind is ModelKind.CHAT and self.global_enabled is True and any(
+        return self.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE, ModelKind.VIDEO) and self.global_enabled is True and any(
             row.effective_routable
             for row in self.sources
             if source is None or source.type is ModelSourceType.GLOBAL
@@ -182,6 +184,7 @@ class ModelCenterControl(DomainControl):
         oauth: OAuthControl | None = None,
         channels: ChannelControl | None = None,
         images: ImageControl | None = None,
+        videos: VideoControl | None = None,
         xai_media: XaiMediaControl | None = None,
         antigravity_media: AntigravityMediaControl | None = None,
         operations: OperationStore | None = None,
@@ -192,11 +195,13 @@ class ModelCenterControl(DomainControl):
         self._oauth = oauth or OAuthControl(audit_sink=audit_sink)
         self._channels = channels or ChannelControl(audit_sink=audit_sink)
         self._images = images or ImageControl(audit_sink=audit_sink)
+        self._videos = videos or VideoControl(audit_sink=audit_sink)
         self._xai_media = xai_media or XaiMediaControl(audit_sink=audit_sink)
         self._antigravity_media = antigravity_media or AntigravityMediaControl(
             audit_sink=audit_sink,
         )
         self._operations = operations
+        self._upstream_sync = UpstreamSync(self)
 
     @property
     def mapping(self) -> MappingControl:
@@ -213,6 +218,10 @@ class ModelCenterControl(DomainControl):
     @property
     def images(self) -> ImageControl:
         return self._images
+
+    @property
+    def videos(self) -> VideoControl:
+        return self._videos
 
     @property
     def xai_media(self) -> XaiMediaControl:
@@ -367,54 +376,54 @@ class ModelCenterControl(DomainControl):
 
     def _media_views(self, cfg: Mapping[str, Any]) -> list[ModelView]:
         views: list[ModelView] = []
-        images = copy.deepcopy(config.DEFAULT_CONFIG.get("images") or {})
-        raw_images = cfg.get("images")
-        if isinstance(raw_images, Mapping):
-            images.update(raw_images)
-        main_model = str(images.get("mainModel") or "").strip()
-        if main_model:
-            views.append(self._media_view(
-                kind=ModelKind.IMAGE, provider="openai",
-                owner=ModelOwnerRef(ModelSourceType.GLOBAL), model_id=main_model,
-                editable=True,
+        from src import image_catalog
+        by_model = {}
+        for row in image_catalog.sources(dict(cfg)):
+            source_type = ModelSourceType.API if row.key.startswith("api:") else ModelSourceType.OAUTH
+            source_id = row.key if source_type is ModelSourceType.API else row.key[6:]
+            metadata, value_source, constrained = self._binding_view(
+                row.model, scope_key=row.key, outbound_model=row.upstream,
+            )
+            by_model.setdefault(row.model, []).append(ModelSourceView(
+                type=source_type, id=source_id, label=row.label, provider=row.provider,
+                outbound_model=row.upstream, source_enabled=row.source_enabled,
+                container_enabled=row.enabled, effective_routable=row.available,
+                unavailable_reason=row.unavailable_reason or (
+                    '图片模型或本来源已停用，请在模型中心启用。' if not row.available else None),
+                effective_metadata=metadata, value_source=value_source, constrained_by=constrained,
+            ))
+        # Configured/reserved models stay visible to administrators, but lack
+        # source availability unless a real account/channel supplies them.
+        from src import media_config
+        for values in media_config.model_map('image', dict(cfg)).values():
+            for model in values: by_model.setdefault(model, [])
+        mapping = model_mapping.get_global_map()
+        hidden = set(model_state.state_snapshot(cfg)["hiddenModels"])
+        for model, sources in by_model.items():
+            identity = ModelIdentity(ModelKind.IMAGE, model)
+            views.append(ModelView(
+                resource_key=_resource_key(identity), identity=identity, model_id=model,
+                aliases=tuple(sorted(alias for alias, real in mapping.items() if real == model)),
+                global_enabled=model_state.is_global_enabled(model, cfg), visible=model not in hidden,
+                common_metadata=self._common_metadata(model), sources=tuple(sources), editable=True, revision="",
             ))
 
-        xai = copy.deepcopy(config.DEFAULT_CONFIG.get("xaiOAuth") or {})
-        raw_xai = cfg.get("xaiOAuth")
-        if isinstance(raw_xai, Mapping):
-            xai.update(raw_xai)
-        for kind, field in ((ModelKind.IMAGE, "imageModels"), (ModelKind.VIDEO, "videoModels")):
-            for model_id in _string_list(xai.get(field)):
-                views.append(self._media_view(
-                    kind=kind, provider="xai", owner=ModelOwnerRef(ModelSourceType.GLOBAL),
-                    model_id=model_id, editable=True,
-                ))
+        videos = {}
+        for provider, values in media_config.model_map('video', dict(cfg)).items():
+            for model in values: videos.setdefault(model, (provider, []))
+        for row in image_catalog.sources(dict(cfg), kind='video'):
+            videos.setdefault(row.model, (row.provider, []))[1].append(ModelSourceView(
+                type=ModelSourceType.OAUTH, id=row.key[6:], label=row.label, provider=row.provider,
+                outbound_model=row.upstream, source_enabled=row.source_enabled, container_enabled=row.enabled,
+                effective_routable=row.available, unavailable_reason=row.unavailable_reason,
+                effective_metadata={}, value_source={}, constrained_by={}))
+        for model, (provider, sources) in videos.items():
+            identity = ModelIdentity(ModelKind.VIDEO, model)
+            views.append(ModelView(resource_key=_resource_key(identity), identity=identity, model_id=model,
+                aliases=tuple(sorted(alias for alias, real in mapping.items() if real == model)),
+                global_enabled=model_state.is_global_enabled(model, cfg), visible=model not in hidden,
+                common_metadata={}, sources=tuple(sources), editable=False, revision=''))
 
-        ag = copy.deepcopy(config.DEFAULT_CONFIG.get("antigravityOAuth") or {})
-        raw_ag = cfg.get("antigravityOAuth")
-        if isinstance(raw_ag, Mapping):
-            ag.update(raw_ag)
-        for model_id in _string_list(ag.get("imageModels")):
-            views.append(self._media_view(
-                kind=ModelKind.IMAGE, provider="antigravity",
-                owner=ModelOwnerRef(ModelSourceType.GLOBAL), model_id=model_id,
-                editable=True,
-            ))
-        for account in cfg.get("oauthAccounts") or ():
-            if not isinstance(account, dict):
-                continue
-            try:
-                if self._oauth.backend.provider_of(account) != "antigravity" or "imageModels" not in account:
-                    continue
-                account_id = self._oauth.backend.account_id(account)
-            except Exception:
-                continue
-            for model_id in _string_list(account.get("imageModels")):
-                views.append(self._media_view(
-                    kind=ModelKind.IMAGE, provider="antigravity",
-                    owner=ModelOwnerRef(ModelSourceType.OAUTH, account_id),
-                    model_id=model_id, editable=False,
-                ))
         return views
 
     @staticmethod
@@ -449,7 +458,12 @@ class ModelCenterControl(DomainControl):
 
     def _all_views(self) -> tuple[list[ModelView], str]:
         cfg = config.get()
-        values = self._chat_views(cfg) + self._media_views(cfg)
+        media = self._media_views(cfg)
+        image_ids = {item.model_id for item in media if item.identity.kind is ModelKind.IMAGE}
+        from src.image_catalog import is_image_name
+        chat = [item for item in self._chat_views(cfg) if item.model_id not in image_ids
+                and not (is_image_name(item.model_id) and all(source.provider == "antigravity" for source in item.sources))]
+        values = chat + media
         values.sort(key=lambda item: (
             {ModelKind.CHAT: 0, ModelKind.IMAGE: 1, ModelKind.VIDEO: 2}[item.identity.kind],
             item.model_id.casefold(), (item.identity.provider or "").casefold(),
@@ -475,7 +489,7 @@ class ModelCenterControl(DomainControl):
     def _source_matches(item: ModelView, source: ModelSourceRef) -> bool:
         if source.type is ModelSourceType.GLOBAL:
             owner = item.identity.owner
-            return item.identity.kind is ModelKind.CHAT or (
+            return item.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE) or (
                 owner is not None and owner.type is ModelSourceType.GLOBAL
             )
         if any(row.type is source.type and row.id == source.id for row in item.sources):
@@ -487,7 +501,7 @@ class ModelCenterControl(DomainControl):
     def _status_matches(item: ModelView, filters: ModelFilters) -> bool:
         if not filters.statuses:
             return True
-        if item.identity.kind is not ModelKind.CHAT:
+        if item.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
             return False
         enabled = item.global_enabled is True
         source = filters.source
@@ -554,7 +568,7 @@ class ModelCenterControl(DomainControl):
         # A source-filtered list uses that source, not another account's state.
         values.sort(key=lambda item: (
             {ModelKind.CHAT: 0, ModelKind.IMAGE: 1, ModelKind.VIDEO: 2}[item.identity.kind],
-            item.identity.kind is ModelKind.CHAT and not item.available_in(filters.source),
+            item.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE) and not item.available_in(filters.source),
         ))
         start = (page - 1) * page_size
         return ModelPage(
@@ -575,7 +589,7 @@ class ModelCenterControl(DomainControl):
 
     @staticmethod
     def _chat_by_id(values: list[ModelView]) -> dict[str, ModelView]:
-        return {item.model_id: item for item in values if item.identity.kind is ModelKind.CHAT}
+        return {item.model_id: item for item in values if item.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE)}
 
     def _selection_models(
         self, values: list[ModelView], selection: ModelSelection,
@@ -597,7 +611,7 @@ class ModelCenterControl(DomainControl):
         if selection.mode is not ModelSelectionMode.FILTER or selection.filters is None:
             raise self._validation("selection", "INVALID", "filter selection requires filters")
         matched = self._filtered_views(values, selection.filters)
-        if any(item.identity.kind is not ModelKind.CHAT for item in matched):
+        if any(item.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE) for item in matched):
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         excluded = {str(value or "").strip() for value in selection.excluded_model_ids}
         return [item.model_id for item in matched if item.model_id not in excluded]
@@ -692,17 +706,15 @@ class ModelCenterControl(DomainControl):
         self._audit(actual, "model_center.state.update", target_name, "succeeded")
         return ModelStateResult(tuple(statuses), new_revision)
 
+    def start_upstream_sync(
+        self, context: ManagementContext | None, source: ModelSourceRef | None = None,
+    ) -> ManagementOperation:
+        return self._upstream_sync.start(self._write(context), source)
+
     def sync_source_models(
         self, context: ManagementContext | None, source: ModelSourceRef,
     ) -> ManagementOperation:
-        actual = self._write(context)
-        if source.type is ModelSourceType.OAUTH:
-            return self._oauth.sync_models(actual, source.id, self.operations)
-        if source.type is ModelSourceType.API:
-            return self._channels.start_model_discovery(
-                actual, DiscoveryCommand(channel_id=source.id),
-            )
-        raise self._validation("source.type", "UNSUPPORTED_SCOPE", "source must be oauth or api")
+        return self.start_upstream_sync(context, source)
 
     def clear_model_errors(
         self,

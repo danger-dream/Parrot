@@ -12,7 +12,7 @@
     unsupported 剥掉，不 400；缺失策略仍 fail closed。其余固定不支持字段
     （user / metadata / safety_identifier）继续剥除
   - 模型名：**直接透传 resolved_model**（不做任何别名映射）。
-    账号层 `supports_model` 已经用账号 `models` + `defaultModels` 做了白名单
+    账号层 `supports_model` 已经用账号 `models`（成功同步目录/LKG） 做了白名单
     校验，进到这里的都是合法模型名；上游无论叫 gpt-5.1 / gpt-5.5 / 下个月出的
     gpt-5.6，都原样发出去。需要特殊 wire shape 的新家族在本 transform 中按
     官方 Codex 模型元数据做最小兼容。
@@ -29,7 +29,7 @@
 历史：早期版本（v0.4.x ~ v0.5.x）维护过一张 _CODEX_MODEL_MAP 翻译表，
 把各种别名（gpt-5 / gpt-5-codex / gpt-5.3-xhigh 等）映射到上游规范名，
 并带了"未识别名字 → 降级成 gpt-5.1"的兜底。v0.6.x 起移除：
-  1) Parrot 的 channel 层已经用账号 `models` + `defaultModels` 做了白名单，
+  1) Parrot 的 channel 层已经用账号 `models`（成功同步目录/LKG） 做了白名单，
      进到 transform 的模型名本就是合法的；再翻译纯属画蛇添足。
   2) 兜底降级坑惨——新模型（如 gpt-5.5）未登记就被降成 gpt-5.1，
      导致所有账号都被上游拒绝（gpt-5.1 早就下架）。

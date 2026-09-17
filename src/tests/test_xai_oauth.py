@@ -586,8 +586,10 @@ def test_xai_channel_request_shape_and_provider_capabilities(m):
     assert "web_search" in matrix_caps.native_state
     assert "ws" not in matrix_caps.transports
 
+    # Register this synthetic selected generation in the authoritative account inventory.
+    m['config'].update(lambda cfg: cfg.update(oauthAccounts=[{'provider': 'xai', 'email': 'grok@example.test', 'subject': 'sub-1'}]))
     old_ensure = m["oauth_manager"].ensure_valid_token
-    async def fake_ensure(account_key):
+    async def fake_ensure(account_key, **kwargs):
         assert account_key == "xai:sub-1"
         return "at-fresh"
     m["oauth_manager"].ensure_valid_token = fake_ensure
@@ -636,8 +638,10 @@ def test_xai_channel_maps_anthropic_fast_to_priority(m):
         "expired": _future_expired(),
         "models": ["grok-4"],
     })
+    # Register this synthetic selected generation in the authoritative account inventory.
+    m['config'].update(lambda cfg: cfg.update(oauthAccounts=[{'provider': 'xai', 'email': 'grok@example.test', 'subject': 'sub-1'}]))
     old_ensure = m["oauth_manager"].ensure_valid_token
-    async def fake_ensure(account_key):
+    async def fake_ensure(account_key, **kwargs):
         return "at-fresh"
     m["oauth_manager"].ensure_valid_token = fake_ensure
     try:
@@ -663,8 +667,10 @@ def test_xai_channel_keeps_native_web_search_and_normalizes_aliases(m):
         "expired": _future_expired(),
         "models": ["grok-4"],
     })
+    # Register this synthetic selected generation in the authoritative account inventory.
+    m['config'].update(lambda cfg: cfg.update(oauthAccounts=[{'provider': 'xai', 'email': 'grok@example.test', 'subject': 'sub-1'}]))
     old_ensure = m["oauth_manager"].ensure_valid_token
-    async def fake_ensure(account_key):
+    async def fake_ensure(account_key, **kwargs):
         return "at-fresh"
     m["oauth_manager"].ensure_valid_token = fake_ensure
     try:
@@ -687,6 +693,7 @@ def test_xai_channel_keeps_native_web_search_and_normalizes_aliases(m):
         "type": "web_search",
         "excluded_domains": ["example.com"],
         "enable_image_search": True,
+        "context_size": "high",
     }]
     assert payload["tool_choice"] == {"type": "web_search"}
     assert payload["parallel_tool_calls"] is True

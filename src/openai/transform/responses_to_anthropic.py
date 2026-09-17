@@ -213,7 +213,7 @@ def _stateful_input_item_label(body: dict) -> str | None:
         if typ == "reasoning" and isinstance(item.get("encrypted_content"), str) and item.get("encrypted_content"):
             return "reasoning.encrypted_content"
         if typ in {
-            "web_search_call", "file_search_call", "computer_call",
+            "file_search_call", "computer_call",
             "image_generation_call", "code_interpreter_call",
             "mcp_call", "mcp_list_tools", "mcp_approval_request",
             "mcp_approval_response", "local_shell_call", "local_shell_call_output",
@@ -524,6 +524,8 @@ def translate_request(
     # composition instead.
     bridge_body.pop("prompt_cache_key", None)
     bridge_body.pop("prompt_cache_retention", None)
+    from ... import local_web_tools
+    hosted_search = [t for t in body.get("tools") or [] if isinstance(t, dict) and local_web_tools.is_openai_web_search_tool_type(t.get("type"))]
     flattened_tools = _flatten_response_tools(bridge_body.get("tools"), plan)
     if isinstance(bridge_body.get("tools"), list):
         bridge_body["tools"] = flattened_tools
@@ -534,6 +536,7 @@ def translate_request(
     input_items = responses_to_chat.resolve_input_items(bridge_body, api_key_name=api_key_name)
     input_items = _map_namespaced_history(input_items, plan)
     input_items = _normalize_custom_tool_history(input_items)
+    bridge_body["_parrot_preserve_native_search"] = True
     chat_payload = responses_to_chat.translate_request_from_input_items(bridge_body, input_items)
     _preserve_deferred_tool_loading(chat_payload, flattened_tools)
     _preserve_function_call_output_attachments(chat_payload, input_items)
@@ -541,6 +544,16 @@ def translate_request(
     # catches fields introduced by the Responses→Chat mapping (response_format,
     # reasoning_effort, etc.) before anything reaches Anthropic upstream.
     payload = chat_to_anthropic.translate_request(chat_payload, allow_file_url_documents=True)
+    from ... import search_hosted_codec
+    for message in payload.get("messages") or []:
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and search_hosted_codec.is_anthropic_search(block):
+                block.pop(search_hosted_codec.SOURCE, None)
+    from ...search_native_tools import to_anthropic
+    for tool in hosted_search:
+        payload.setdefault("tools", []).append(to_anthropic(tool))
+    if isinstance(choice, dict) and local_web_tools.is_openai_web_search_tool_type(choice.get("type")):
+        payload["tool_choice"] = {"type": "tool", "name": "web_search"}
     cache_hints.apply_openai_cache_to_anthropic_payload(body, payload)
     return common.filter_anthropic_bridge_payload(payload)
 
@@ -556,7 +569,7 @@ def translate_response(
     namespace_tool_map: NamespaceToolMap | None = None,
 ) -> dict:
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
-    return responses_to_chat.translate_response(
+    response = responses_to_chat.translate_response(
         chat_obj,
         model=model,
         previous_response_id=previous_response_id,
@@ -568,3 +581,8 @@ def translate_response(
             if namespace_tool_map is not None else None
         ),
     )
+    from ... import search_hosted_codec
+    hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
+    if hosted:
+        response["output"] = hosted + response.get("output", [])
+    return response

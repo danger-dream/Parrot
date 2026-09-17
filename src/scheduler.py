@@ -128,6 +128,8 @@ def _filter_candidates(requested_model: str,
         if portable_body is not None and ch.key != bound_channel_key:
             features = portable_features
         try:
+            from .search_native_tools import validate_candidate
+            validate_candidate(request_body, ingress_protocol, ch)
             route_plan = DEFAULT_MATRIX.plan(
                 ingress_protocol,
                 ch_protocol,

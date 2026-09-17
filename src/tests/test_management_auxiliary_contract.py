@@ -13,7 +13,7 @@ from src.management_api.routers.auxiliary_support import get_bound_auxiliary_con
 from src.management_api.routers.updates import router as updates_router
 from src.management_auth import AuthMethod
 from src.tests.management_auxiliary_support import bearer, build_auxiliary_app, create_session
-from src.tests.test_management_api_foundation import build_app
+from src.tests.test_management_api_foundation import build_app, EXPECTED_OPERATIONS as FOUNDATION_OPERATION_IDS
 
 
 ROUTER_FILES = (
@@ -30,17 +30,12 @@ _REQUEST_BODIES = {
     "updateSettings": {"enabled": True},
     "activateStagedUpdate": {"planToken": "not-a-real-plan-token"},
     "updateImageSettings": {"enabled": True},
+    "updateVideoSettings": {"enabled": True},
+    "updateMediaSource": {"enabled": True},
     "updateImageAccountState": {"enabled": True},
     "updateXaiMediaSettings": {"jobTtlSeconds": 7200},
     "addXaiMediaModel": {"modelId": "grok-new"},
     "renameXaiMediaModel": {"newModelId": "grok-renamed"},
-    "updateAntigravityMediaSettings": {"imageModels": ["ag-image"]},
-    "addAntigravityMediaModel": {
-        "modelId": "ag-image", "owner": {"type": "global"},
-    },
-    "renameAntigravityMediaModel": {
-        "newModelId": "ag-renamed", "owner": {"type": "global"},
-    },
 }
 _REQUEST_HEADERS = {
     "stageUpdate": {"Idempotency-Key": "stage-one"},
@@ -51,10 +46,6 @@ _REQUEST_HEADERS = {
     "addXaiMediaModel": {"If-Match": "rev_fake"},
     "renameXaiMediaModel": {"If-Match": "rev_fake"},
     "removeXaiMediaModel": {"If-Match": "rev_fake"},
-    "updateAntigravityMediaSettings": {"If-Match": "rev_fake"},
-    "addAntigravityMediaModel": {"If-Match": "rev_fake"},
-    "renameAntigravityMediaModel": {"If-Match": "rev_fake"},
-    "removeAntigravityMediaModel": {"If-Match": "rev_fake"},
 }
 _PATH_VALUES = {
     "{incidentId}": "inc-1",
@@ -62,6 +53,7 @@ _PATH_VALUES = {
     "{accountId}": "openai%3Auser%40example.com",
     "{kind}": "image",
     "{modelId:path}": "model-a",
+    "{sourceId:path}": "oauth:xai:test",
 }
 
 
@@ -137,6 +129,7 @@ EXPECTED_OPERATION_IDS = {
     "activateStagedUpdate",
     "cancelStagedUpdate",
     "getImageSettings",
+    "getVideoSettings", "updateVideoSettings", "listMediaSources", "updateMediaSource",
     "updateImageSettings",
     "getImageAccountState",
     "updateImageAccountState",
@@ -145,11 +138,6 @@ EXPECTED_OPERATION_IDS = {
     "addXaiMediaModel",
     "renameXaiMediaModel",
     "removeXaiMediaModel",
-    "getAntigravityMediaSettings",
-    "updateAntigravityMediaSettings",
-    "addAntigravityMediaModel",
-    "renameAntigravityMediaModel",
-    "removeAntigravityMediaModel",
 }
 
 
@@ -197,14 +185,14 @@ def _guard_allowed_names(decorator: ast.Call) -> set[str]:
 
 def test_auxiliary_manifest_has_exactly_one_pre_control_query_guard_per_operation(tmp_path):
     operation_ids = [item["operation_id"] for item in AUXILIARY_OPERATION_MANIFEST]
-    assert len(operation_ids) == 36
+    assert len(operation_ids) == 35  # Five AG image operations explicitly retired.
     assert len(set(operation_ids)) == len(operation_ids)
     assert set(operation_ids) == EXPECTED_OPERATION_IDS
 
     app, _, _ = build_auxiliary_app(tmp_path)
     document = app.openapi()
     for item in AUXILIARY_OPERATION_MANIFEST:
-        openapi_path = item["path"].replace("{modelId:path}", "{modelId}")
+        openapi_path = item["path"].replace("{modelId:path}", "{modelId}").replace("{sourceId:path}", "{sourceId}")
         operation = document["paths"]["/api/management/v1" + openapi_path][item["method"]]
         declared_query = {
             parameter["name"]
@@ -305,7 +293,7 @@ def test_openapi_has_exact_auxiliary_operations_typed_schemas_and_examples(tmp_p
         if path.startswith("/api/management/v1")
         for method, operation in path_item.items()
         if method in {"get", "patch", "put", "post", "delete"}
-        and operation["operationId"] in EXPECTED_OPERATION_IDS
+        and operation["operationId"] not in FOUNDATION_OPERATION_IDS
     }
     assert set(operations) == EXPECTED_OPERATION_IDS
     for operation in operations.values():

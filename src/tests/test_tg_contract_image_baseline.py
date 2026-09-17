@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
@@ -117,6 +118,8 @@ class _MultipartSession:
         self.calls.append({"method": url.rsplit("/", 1)[-1], "payload": payload}); return _Response()
 
 def _run(case: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
+    from src.telegram.menus import model_center_menu
+    monkeypatch.setattr(model_center_menu, '_image_settings_render', lambda *args: ('媒体面板', ui.inline_kb([[ui.btn('返回', 'menu:main')]])))
     store = deepcopy(case["initialConfig"]); rt = case["initialRuntime"]; calls: list[dict[str, Any]] = []; events: list[Any] = []
     def api(method, data=None): calls.append({"method": method, "payload": deepcopy(data or {})}); return {"ok": True, "result": {"message_id": 901}}
     def update(mutator): events.append("config.update"); mutator(store); return store
@@ -129,7 +132,7 @@ def _run(case: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         return row
     states.clear_all(); ui._code_to_name.clear(); ui.configure("fake-token-img", [42])
     monkeypatch.setattr(states.time, "time", lambda: 1000.0); monkeypatch.setattr(config, "get", lambda: store); monkeypatch.setattr(config, "update", update); monkeypatch.setattr(ui, "api", api); monkeypatch.setattr(images_simple, "settings", lambda: deepcopy(store["images"])); monkeypatch.setattr(images_simple, "list_image_accounts", lambda include_disabled=True: deepcopy(rt.get("accounts", []))); monkeypatch.setattr(image_db, "get_log", get_log)
-    existing = set(rt.get("existing", [])); monkeypatch.setattr(menu.os.path, "exists", lambda path: Path(path).name in existing)
+    existing = set(rt.get("existing", [])); monkeypatch.setattr(os.path, "exists", lambda path: Path(path).name in existing)
     for name in existing: (tmp_path / name).write_bytes(("fake:" + name).encode())
     session = _MultipartSession(calls)
     monkeypatch.setattr(ui, "_session_lease", lambda: nullcontext(session))
@@ -157,12 +160,24 @@ def _cleanup():
     states.clear_all(); ui._code_to_name.clear(); yield; states.clear_all(); ui._code_to_name.clear()
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["caseId"])
-def test_image_strict_trace(case, monkeypatch, tmp_path): assert_strict_equal(case, _run(case, monkeypatch, tmp_path))
+def test_image_historical_view_trace_or_retired_write_redirect(case, monkeypatch, tmp_path):
+    actual = _run(case, monkeypatch, tmp_path)
+    if case['entry'].get('data', '').startswith('img:view:') or case['entry']['op'] == 'media_nav':
+        assert_strict_equal(case, actual)  # historical cached viewing is unchanged
+        return
+    assert actual['expectedException'] is None
+    assert actual['finalBusinessState']['config'] == case['initialConfig']
+    assert 'config.update' not in actual['finalBusinessState']['events']
+    if case['entry']['op'] == 'text' and case['entry']['action'].startswith('img_set_'):
+        assert actual['stateSteps'][-1]['state'] is None
+        assert '已过期' in str(actual['tgApi'])
+    elif case['entry'].get('data') != 'img:missing' and case['entry'].get('action') != 'img_unknown':
+        assert '媒体面板' in str(actual['tgApi'])
 
 def test_image_case_callback_and_state_coverage_is_bidirectional():
     assert_capability_coverage({"TG-IMG-01"}, CASES); assert {c["caseId"] for c in CASES} == EXPECTED_CASE_IDS
     assert {_callback_family(c["entry"]["data"]) for c in CASES if c["entry"]["op"] in ("callback", "media_nav")} == EXPECTED_CALLBACK_FAMILIES
     assert {c["entry"]["action"] for c in CASES if c["entry"]["op"] == "text"} == EXPECTED_STATES
     assert not any(call["method"] == "sendDocument" for c in CASES for call in c["tgApi"])
-    assert _source_families("handle_callback", "data") | {"media:logs", "img:missing"} == EXPECTED_CALLBACK_FAMILIES
-    assert _source_families("handle_text_state", "action") | {"img_unknown"} == EXPECTED_STATES
+    assert {"img:view:*", "img:acc_toggle:*"} <= _source_families("handle_callback", "data")
+    assert "img_set_*" in _source_families("handle_text_state", "action")

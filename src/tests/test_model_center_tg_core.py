@@ -62,6 +62,9 @@ class _Mapping:
         self.reset_calls = []
         self.sync_calls = []
 
+    def get_compression(self, _ctx):
+        return None, "c1"
+
     def list_mappings(self, _ctx, *, query, sort, page, page_size):
         assert sort == "alias"
         values = [MappingRecord(alias, real, "global", revision) for alias, (real, revision) in self.records.items()]
@@ -72,11 +75,12 @@ class _Mapping:
 
     def update_mapping(self, _ctx, old_alias, *, new_alias, real_model, expected_revision):
         self.update_calls.append((old_alias, new_alias, real_model, expected_revision))
-        if expected_revision != "r1":
+        if expected_revision != self.records[old_alias][1]:
             raise ManagementError(ManagementErrorCode.REVISION_CONFLICT)
+        revision = f"r{int(expected_revision[1:]) + 1}"
         self.records.pop(old_alias)
-        self.records[new_alias] = (real_model, "r2")
-        return MappingRecord(new_alias, real_model, "global", "r2")
+        self.records[new_alias] = (real_model, revision)
+        return MappingRecord(new_alias, real_model, "global", revision)
 
     def put_mapping(self, _ctx, alias, real_model, *, expected_revision=None):
         self.put_calls.append((alias, real_model, expected_revision))
@@ -186,6 +190,13 @@ class _Control:
         self.mapping = _Mapping()
         self.oauth = _OAuth()
         self.channels = _Channels()
+        # Media tabs are purpose panels, not filtered model-list fixtures.
+        media_settings = SimpleNamespace(enabled=True, cache_enabled=False, cache_path='images',
+            cache_retention_days=0, cache_max_bytes=0, models={}, request_timeout_seconds=180,
+            job_ttl_seconds=10800, revision='media-r1')
+        self.images = SimpleNamespace(get_settings=lambda ctx: media_settings, list_sources=lambda ctx: [],
+            statistics=lambda ctx: {'models': [], 'cache': {'files': 0, 'bytes': 0}})
+        self.videos = self.images
         self.query_calls = []
         self.views = {}
         source = ModelSourceRef(ModelSourceType.OAUTH, "acct-a")
@@ -319,7 +330,9 @@ def _buttons(kb):
 
 
 def _button(kb, text):
-    return next(item for item in _buttons(kb) if item["text"] == text)
+    # Flow locator only; exact icon rendering is tested independently.
+    from src.telegram.menus.model_center_icons import label_with_icon
+    return next(item for item in _buttons(kb) if item["text"] in {text, label_with_icon(text)})
 
 
 def test_workbuddy_source_picker_uses_summary_name_without_full_detail_or_internal_id(env):
@@ -472,25 +485,28 @@ def test_disabled_source_is_not_described_as_actually_listed_downstream(env):
     assert "展示开关" not in line and "下游显示" not in line
 
 
-def test_alias_name_and_target_save_uses_one_atomic_update(env):
-    control, edits, _answers, _sends = env
-    session = menu._session(7)
-    session.tab = "alias"
+def test_alias_name_and_target_each_commit_immediately_without_save(env):
+    control, edits, _answers, sends = env
+    menu._session(7).tab = "alias"
     _text, kb = menu.render(7)
-    item_cb = next(item["callback_data"] for item in _buttons(kb) if item["text"] == "1")
-    menu.handle_callback(7, 10, "open", item_cb)
-    draft = menu._alias_drafts[7]
-    draft.alias = "fast"
-    draft.real_model = "model-02"
+    menu.handle_callback(7, 10, "open", _button(kb, "1")["callback_data"])
     edit_kb = edits[-1][3]
-    save_cb = _button(edit_kb, "保存")["callback_data"]
-    menu.handle_callback(7, 10, "save", save_cb)
-    assert control.mapping.update_calls == [("quick", "fast", "model-02", "r1")]
-    assert control.mapping.put_calls == []
-    assert control.mapping.delete_calls == []
+    assert all("保存" not in b["text"] for b in _buttons(edit_kb))
+    old_picker = _button(edit_kb, "选择真实模型")["callback_data"]
+    menu.handle_callback(7, 10, "rename", _button(edit_kb, "编辑别名名称")["callback_data"])
+    menu.handle_text_state(7, "mc_alias_name", "fast")
+    assert control.mapping.records["fast"] == ("model-01", "r2")
+    assert "quick" not in control.mapping.records
+    menu.handle_callback(7, 10, "target-picker", _button(sends[-1][2], "选择真实模型")["callback_data"])
+    menu.handle_callback(7, 10, "target", _button(edits[-1][3], "2")["callback_data"])
+    assert control.mapping.records["fast"] == ("model-02", "r3")
+    assert control.mapping.update_calls == [("quick", "fast", "model-01", "r1"), ("fast", "fast", "model-02", "r2")]
+    assert control.mapping.put_calls == control.mapping.delete_calls == []
+    menu.handle_callback(7, 10, "old-picker", old_picker)
+    assert len(control.mapping.update_calls) == 2
 
 
-def test_alias_detail_edit_cancel_returns_b_then_filtered_page_a_and_old_button_expires(env):
+def test_alias_detail_edit_cancel_returns_b_then_page_a_and_old_button_expires(env):
     control, edits, answers, sends = env
     control.mapping.records.update({
         f"alias-{index:02d}": (f"model-{index:02d}", "r1")
@@ -498,10 +514,9 @@ def test_alias_detail_edit_cancel_returns_b_then_filtered_page_a_and_old_button_
     })
     state = menu._session(7)
     state.tab = "alias"
-    state.alias_query = "alias"
     state.alias_page = 2
     list_text, list_kb = menu.render(7)
-    assert "模型别名 · 10 条" in list_text and "9. " in list_text
+    assert "模型别名 · 11 条" in list_text and "9. " in list_text
     item_callback = _button(list_kb, "9")["callback_data"]
 
     menu.handle_callback(7, 10, "open", item_callback)
@@ -518,8 +533,8 @@ def test_alias_detail_edit_cancel_returns_b_then_filtered_page_a_and_old_button_
     menu.handle_callback(
         7, 10, "back", _button(draft_kb, "返回别名列表")["callback_data"],
     )
-    assert "模型别名 · 10 条" in edits[-1][2] and "9. " in edits[-1][2]
-    assert state.tab == "alias" and state.alias_query == "alias" and state.alias_page == 2
+    assert "模型别名 · 11 条" in edits[-1][2] and "9. " in edits[-1][2]
+    assert state.tab == "alias" and state.alias_page == 2
 
     menu.handle_callback(7, 10, "switch", "mc:tab:video")
     menu.handle_callback(7, 10, "old", item_callback)

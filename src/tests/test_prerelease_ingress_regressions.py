@@ -130,7 +130,7 @@ async def test_health_accepts_both_oauth_model_shapes_and_uses_upstream_cooldown
         assert channel.list_client_models() == ["workbuddy-auto"]
     elif provider == "claude":
         from src.channel.oauth_channel import OAuthChannel
-        channel = OAuthChannel({"provider": "claude", "email": "health@example.invalid", "models": ["auto"]}, ["auto"])
+        channel = OAuthChannel({"provider": "claude", "email": "health@example.invalid", "models": ["auto"]})
     else:
         channel = _make_openai_channel("health-api", "http://health.invalid", protocol="openai-chat", alias="public-auto", real="auto")
     _install_channels(m, [channel])

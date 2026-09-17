@@ -250,8 +250,10 @@ def test_matrix_keeps_codex_native_passthrough_labels_independent():
     ).cost == 0
 
 
-def test_matrix_rejects_mixed_codex_namespace_and_unsupported_hosted_tool():
+def test_matrix_rejects_mixed_codex_namespace_and_unsupported_hosted_tool(monkeypatch):
     from src.protocols.matrix import extract_request_features
+    from src import search_service
+    monkeypatch.setattr(search_service, "settings", lambda: {"functionMode": "managed", "hostedMode": "passthrough"})
 
     body = {
         "input": "hi",

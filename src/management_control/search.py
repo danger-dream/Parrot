@@ -1,0 +1,311 @@
+"""Search management: one sparse, secret-preserving config boundary for API/TG."""
+from __future__ import annotations
+
+import asyncio
+import copy
+import math
+import re
+import uuid
+from urllib.parse import urlsplit
+
+from src import config, search_service
+from src.management_auth import Capability
+from src.oauth_ids import account_key
+from .errors import ManagementError, ManagementErrorCode
+from .models.common import DomainControl, stable_revision
+
+
+INTEGER_LIMITS = {
+    "maxAttempts": (1, 10), "maxResults": (1, 20), "maxToolRounds": (1, 1000),
+    "maxFetchChars": (1, 10_000_000), "minQueryChars": (1, 1000),
+    "maxFetchUrlChars": (1, 100_000), "maxConcurrentToolCalls": (0, 1000),
+}
+SETTING_FIELDS = (*INTEGER_LIMITS, "functionMode", "hostedMode", "timeoutSeconds",
+                  "requireKnownUrlForFetch", "language", "country", "freshness")
+BACKEND_FIELDS = ("name", "enabled", "endpoint", "model", "accountIds", "allowDisabledAccounts")
+KEY_FIELDS = ("apiKeys", "addApiKeys", "removeKeyIndices")
+API_TYPES = frozenset(("anysearch", "tavily", "exa", "brave"))
+
+
+class SearchControl(DomainControl):
+    def __init__(self, *, audit_sink=None, operations=None):
+        super().__init__(audit_sink=audit_sink)
+        self.operations = operations
+        # Separate runtime-owned ledger; only hashes and operation IDs are retained.
+        self._idempotency = self._idempotency.__class__()
+
+    @staticmethod
+    def _invalid(field, message="Invalid search setting"):
+        return DomainControl._validation(field, "invalid_value", message)
+
+    @staticmethod
+    def _backend(cfg, backend_id):
+        for backend in cfg.get("backends", []):
+            if backend.get("id") == backend_id:
+                return backend
+        raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+
+    def get(self, context):
+        self._read(context)
+        cfg = search_service.settings()
+        statuses = {row["id"]: row for row in search_service.backend_statuses()}
+        result = {key: copy.deepcopy(cfg[key]) for key in SETTING_FIELDS}
+        result["backends"] = []
+        for backend in cfg.get("backends", []):
+            if backend.get("id") not in statuses:
+                continue
+            row = {key: copy.deepcopy(backend.get(key, search_service.default_backend(backend["type"])[key]))
+                   for key in BACKEND_FIELDS}
+            row.update(statuses[backend["id"]])
+            # Legacy endpoints may predate validation. Do not reveal embedded
+            # URL credentials/query secrets and never rewrite them on a read.
+            try:
+                parsed = urlsplit(row["endpoint"])
+                if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                    row["endpoint"] = ""
+            except ValueError:
+                row["endpoint"] = ""
+            result["backends"].append(row)
+        result["revision"] = stable_revision(cfg)
+        return result
+
+    def accounts(self, context, backend_id):
+        """Only public full identities; never return OAuth credentials."""
+        self._read(context)
+        backend = self._backend(search_service.settings(), backend_id)
+        kind = backend["type"]
+        provider = "claude" if kind == "anthropic" else kind
+        if kind in API_TYPES:
+            return []
+        rows = []
+        accounts = [acc for acc in config.get().get("oauthAccounts") or []
+                    if (acc.get("provider") or "claude") == provider]
+        for account in accounts:
+            name = str(account.get("label") or account.get("email") or account.get("name") or provider)
+            if provider == "openai" and sum(acc.get("email") == account.get("email") for acc in accounts) > 1:
+                # Match OAuth menus: curated labels first, human workspace
+                # disambiguation only; never display internal workspace IDs.
+                workspace = str(account.get("workspace_name") or "").strip()
+                kind = str(account.get("workspace_type") or "").strip()
+                plan = str(account.get("plan_type") or "").strip()
+                if not workspace or (workspace.lower() == "personal" and "team" in f"{kind} {plan}".lower()):
+                    workspace = kind or plan or "workspace"
+                name += " · " + workspace
+            rows.append({"id": account_key(account),
+                         "name": name,
+                         "enabled": account.get("enabled", True) is not False and not bool(account.get("disabled_reason")),
+                         "credentialConfigured": bool(account.get("access_token"))})
+        return rows
+
+    def _commit(self, context, action, mutate, expected_revision=None, *, read_back=True):
+        self._write(context)
+        try:
+            def apply(root):
+                # Called within config.update's serialized/reentrant lock. Never use
+                # the public DTO as a base: it intentionally omits all API keys.
+                effective = copy.deepcopy(search_service.settings())
+                self._check_revision(expected_revision, stable_revision(effective))
+                mutate(effective)
+                root["search"] = effective
+            config.update(apply)
+        except ManagementError:
+            self._audit(context, action, "search", "failed")
+            raise
+        except Exception:
+            self._audit(context, action, "search", "failed")
+            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE) from None
+        self._audit(context, action, "search", "succeeded")
+        return self.get(context) if read_back else None
+
+    def patch(self, context, patch, *, expected_revision=None):
+        self._write(context)
+        if not isinstance(patch, dict) or not patch or set(patch) - set(SETTING_FIELDS):
+            raise self._invalid("body")
+        for key, value in patch.items():
+            if key in INTEGER_LIMITS:
+                low, high = INTEGER_LIMITS[key]
+                if type(value) is not int or not low <= value <= high:
+                    raise self._invalid(key, f"Expected integer in {low}..{high}")
+            elif key in ("functionMode", "hostedMode"):
+                if value not in search_service.MODES:
+                    raise self._invalid(key)
+            elif key == "timeoutSeconds":
+                if type(value) not in (float, int) or not math.isfinite(value) or not 0.1 <= value <= 600:
+                    raise self._invalid(key, "Expected seconds in 0.1..600")
+            elif key == "requireKnownUrlForFetch":
+                if type(value) is not bool:
+                    raise self._invalid(key)
+            elif not isinstance(value, str) or len(value) > 64:
+                raise self._invalid(key)
+            elif key == "freshness" and value not in ("", "day", "week", "month", "year"):
+                raise self._invalid(key)
+        return self._commit(context, "search.settings.update", lambda cfg: cfg.update(copy.deepcopy(patch)), expected_revision)
+
+    def _backend_patch(self, context, backend, patch):
+        if not isinstance(patch, dict) or not patch or set(patch) - set((*BACKEND_FIELDS, *KEY_FIELDS)):
+            raise self._invalid("body")
+        key_ops = set(patch) & set(KEY_FIELDS)
+        if key_ops:
+            self._write(context, Capability.SECRETS_WRITE)
+            if backend["type"] not in API_TYPES or len(key_ops) != 1:
+                raise self._invalid("apiKeys")
+        for key, value in patch.items():
+            if key in ("enabled", "allowDisabledAccounts"):
+                if type(value) is not bool:
+                    raise self._invalid(key)
+                if key == "allowDisabledAccounts" and backend["type"] in API_TYPES:
+                    raise self._invalid(key)
+            elif key in ("name", "model", "endpoint"):
+                if not isinstance(value, str) or len(value) > (2048 if key == "endpoint" else 200):
+                    raise self._invalid(key)
+                if key == "name" and not value.strip():
+                    raise self._invalid(key)
+                if key == "model" and backend["type"] in API_TYPES and value:
+                    raise self._invalid(key, "Only OAuth search backends support model settings")
+                if key == "endpoint" and value:
+                    try:
+                        parsed = urlsplit(value)
+                        valid = (parsed.scheme in ("https", "http") and parsed.hostname and
+                                 not parsed.username and not parsed.password and not parsed.query and not parsed.fragment)
+                    except ValueError:
+                        valid = False
+                    if not valid or backend["type"] not in API_TYPES:
+                        raise self._invalid(key, "Expected an HTTP(S) endpoint without embedded credentials or query")
+            elif key == "accountIds":
+                if backend["type"] in API_TYPES or not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                    raise self._invalid(key)
+                provider = "claude" if backend["type"] == "anthropic" else backend["type"]
+                known = {account_key(acc) for acc in config.get().get("oauthAccounts", [])
+                         if (acc.get("provider") or "claude") == provider}
+                if len(value) != len(set(value)) or any(item not in known for item in value):
+                    raise self._invalid(key, "Use complete public account IDs from this provider")
+            elif key in ("apiKeys", "addApiKeys"):
+                if not isinstance(value, list) or len(value) > 100 or any(
+                    not isinstance(v, str) or not v.strip() or len(v) > 8192 for v in value
+                ):
+                    raise self._invalid("apiKeys", "Expected an array of non-empty keys (maximum 100)")
+            elif key == "removeKeyIndices":
+                keys = self._keys(backend)
+                if not isinstance(value, list) or not value or any(type(v) is not int or not 0 <= v < len(keys) for v in value):
+                    raise self._invalid(key)
+        for key, value in patch.items():
+            if key in ("apiKeys", "addApiKeys"):
+                values = (self._keys(backend) if key == "addApiKeys" else []) + [v.strip() for v in value]
+                values = list(dict.fromkeys(values))
+                if len(values) > 100:
+                    raise self._invalid("apiKeys")
+                backend["apiKeys"] = values
+            elif key == "removeKeyIndices":
+                backend["apiKeys"] = [v for i, v in enumerate(self._keys(backend)) if i not in value]
+            else:
+                backend[key] = copy.deepcopy(value)
+
+    @staticmethod
+    def _keys(backend):
+        values = backend.get("apiKeys") or []
+        if isinstance(values, str):
+            values = [values]
+        return list(dict.fromkeys(str(v).strip() for v in values if str(v).strip()))
+
+    def add_backend(self, context, body, *, expected_revision=None):
+        self._write(context)
+        body = copy.deepcopy(body)
+        kind = body.pop("type", None)
+        backend_id = body.pop("id", None) or f"{kind}-{uuid.uuid4().hex[:12]}"
+        if kind not in search_service.BACKEND_TYPES or not isinstance(backend_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", backend_id):
+            raise self._invalid("type/id")
+        def mutate(cfg):
+            if any(row["id"] == backend_id for row in cfg["backends"]):
+                raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
+            backend = search_service.default_backend(kind)
+            backend["id"] = backend_id
+            if body:
+                self._backend_patch(context, backend, body)
+            cfg["backends"].append(backend)
+        return self._commit(context, "search.backend.create", mutate, expected_revision)
+
+    def patch_backend(self, context, backend_id, patch, *, expected_revision=None):
+        return self._commit(context, "search.backend.update", lambda cfg: self._backend_patch(
+            context, self._backend(cfg, backend_id), patch), expected_revision)
+
+    def delete_backend(self, context, backend_id, *, expected_revision=None):
+        def mutate(cfg):
+            self._check_revision(expected_revision, stable_revision(cfg), required=True)
+            backend = self._backend(cfg, backend_id)
+            cfg["backends"].remove(backend)
+            # Keep even an explicit empty list: legacy defaults must not return.
+        return self._commit(context, "search.backend.delete", mutate, expected_revision, read_back=False)
+
+    def priority(self, context, backend_ids, *, expected_revision=None):
+        def mutate(cfg):
+            current = {row["id"]: row for row in cfg["backends"]}
+            if not isinstance(backend_ids, list) or any(not isinstance(v, str) for v in backend_ids) or len(backend_ids) != len(current) or set(backend_ids) != set(current):
+                raise self._invalid("backendIds", "Provide every backend ID exactly once")
+            cfg["backends"] = [current[item] for item in backend_ids]
+        return self._commit(context, "search.priority.update", mutate, expected_revision)
+
+    async def test(self, context, backend_id, *, operation="search", query=None, url=None):
+        self._write(context)
+        self._backend(search_service.settings(), backend_id)
+        if operation not in ("search", "extract"):
+            raise self._invalid("operation")
+        if (operation == "search" and (not isinstance(query, str) or not query.strip())) or (
+            operation == "extract" and (not isinstance(url, str) or not url.strip())
+        ):
+            raise self._invalid("query/url")
+        try:
+            call = search_service.search if operation == "search" else search_service.extract
+            result = await call({"query": query} if operation == "search" else {"url": url},
+                                request_id=context.request_id, backend_id=backend_id)
+        except search_service.SearchError as exc:
+            self._audit(context, "search.test", "search", "failed")
+            code = (ManagementErrorCode.VALIDATION_FAILED if exc.status_code < 500
+                    else ManagementErrorCode.UPSTREAM_ERROR)
+            raise ManagementError(code, exc.message, retryable=exc.retryable) from None
+        except Exception:
+            self._audit(context, "search.test", "search", "failed")
+            raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE) from None
+        self._audit(context, "search.test", "search", "succeeded")
+        # This is a management probe, not a second public search endpoint. No
+        # upstream body, query, result URLs or credential-bearing config in audit/DTO.
+        return {"backendId": backend_id, "operation": operation, "succeeded": True,
+                "resultCount": len(result.get("results") or []),
+                "contentChars": len(result.get("content") or ""),
+                "attemptCount": len(result.get("attempts") or [])}
+
+    def start_test(self, context, backend_id, *, operation="search", query=None, url=None):
+        self._write(context)
+        self._backend(search_service.settings(), backend_id)
+        if operation not in ("search", "extract") or (
+            operation == "search" and (not isinstance(query, str) or not query.strip())
+        ) or (operation == "extract" and (not isinstance(url, str) or not url.strip())):
+            raise self._invalid("query/url")
+        store = self.operations
+        if store is None:
+            raise ManagementError(ManagementErrorCode.SERVICE_NOT_READY)
+        fingerprint = stable_revision((backend_id, operation, query, url))
+        # Serialize replay + allocation so simultaneous retries cannot dispatch twice.
+        with self._idempotency_lock:
+            key = (context.actor.session_id or context.actor.subject_id, context.idempotency_key)
+            if context.idempotency_key and key in self._idempotency:
+                known, operation_id = self._idempotency[key]
+                if known != fingerprint:
+                    raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
+                return store.get(context, operation_id)
+            item = store.create(context, kind="search.test", cancellable=False)
+            def worker():
+                store.mark_running(item.id)
+                try:
+                    result = asyncio.run(self.test(context, backend_id, operation=operation, query=query, url=url))
+                    store.succeed(item.id, result)
+                except ManagementError as exc:
+                    store.fail_if_active(item.id, code=exc.code, retryable=exc.retryable)
+            store.submit(item.id, worker)
+            if context.idempotency_key:
+                self._idempotency[key] = (fingerprint, item.id)
+                while len(self._idempotency) > self._idempotency_limit:
+                    self._idempotency.popitem(last=False)
+            return item
+
+
+DEFAULT_SEARCH_CONTROL = SearchControl()

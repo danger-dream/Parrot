@@ -12,6 +12,7 @@ from ...management_control import ManagementError
 from ...management_control.models import ModelSourceRef, ModelSourceType, ModelView
 from .. import ui
 from . import model_center_menu as menu
+from .model_center_icons import inline_kb
 
 
 def _metadata_scope_kwargs(source: ModelSourceRef | None, outbound_model: str | None) -> dict[str, Any]:
@@ -73,7 +74,7 @@ def _metadata_targets_render(
         "",
         "选择模型通用值，或只调整一个账户 / 渠道。未单独设置的字段继续继承。",
     ])
-    return menu._paged(chat_id, text, ui.inline_kb(rows))
+    return menu._paged(chat_id, text, inline_kb(rows))
 
 
 def _metadata_editor_render(
@@ -154,7 +155,7 @@ def _metadata_editor_render(
     rows.append([ui.btn("返回模型", menu._detail_callback(
         chat_id, resource_key, detail_back,
     ))])
-    return menu._paged(chat_id, "\n".join(lines), ui.inline_kb(rows))
+    return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
 def _catalog_picker_render(
@@ -240,7 +241,7 @@ def _catalog_picker_render(
         chat_id, "metadata_editor", resource_key=resource_key,
         source=source, group=group, detail_back=detail_back,
     ))])
-    return menu._paged(chat_id, "\n".join(lines), ui.inline_kb(rows))
+    return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
 def _parse_field(text: str, item: menu._MetaField) -> Any:
@@ -340,7 +341,7 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
                 detail_back=data.get("detail_back"),
             ))]]
             ui.answer_cb(cb_id)
-            ui.edit(chat_id, message_id, f"调整 <b>{item.label}</b>\n\n只修改这一项；恢复继承会删除覆盖键。", reply_markup=ui.inline_kb(rows))
+            ui.edit(chat_id, message_id, f"调整 <b>{item.label}</b>\n\n只修改这一项；恢复继承会删除覆盖键。", reply_markup=inline_kb(rows))
             return True
         instructions = {
             "tokens": "发送正整数 Token 数，可写 300k、1M。",
@@ -435,7 +436,7 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
 
     if name == "metadata_reset_ask":
         text = "恢复这一层全部字段的继承？\n\n目录匹配、模型启停以及其他来源的覆盖保持不变。"
-        kb = ui.inline_kb([[
+        kb = inline_kb([[
             ui.btn("确认恢复", menu._freeze(chat_id, "metadata_reset", **dict(data))),
             ui.btn("取消", menu._freeze(
                 chat_id, "metadata_editor", resource_key=data["resource_key"],

@@ -154,6 +154,9 @@ class StreamTranslator:
             request_body=request_body,
         )
         self._buf = b""
+        self._hosted_blocks: dict[int, dict] = {}
+        self._hosted_args: dict[int, str] = {}
+        self._hosted_items: dict[str, tuple[int, dict]] = {}
         self._store_api_key_name = api_key_name
         self._store_channel_key = channel_key
         self._store_current_input = current_input_items
@@ -222,6 +225,21 @@ class StreamTranslator:
         if typ == "content_block_start":
             block = data.get("content_block") if isinstance(data.get("content_block"), dict) else {}
             btype = block.get("type")
+            from ... import search_hosted_codec
+            if search_hosted_codec.is_anthropic_search(block):
+                idx = int(data.get("index", 0) or 0)
+                self._hosted_blocks[idx] = dict(block)
+                yield from self._ensure_created()
+                for item in search_hosted_codec.anthropic_to_responses(list(self._hosted_blocks.values())):
+                    key = str(item.get("id") or "")
+                    previous = self._hosted_items.get(key)
+                    output_index = previous[0] if previous else self.state.alloc_output_index()
+                    self._hosted_items[key] = (output_index, item)
+                    if not previous:
+                        yield _emit("response.output_item.added", {"type": "response.output_item.added", "sequence_number": self.state.next_seq(), "output_index": output_index, "item": item})
+                    if btype == "web_search_tool_result" and item.get("id") == block.get("tool_use_id"):
+                        yield _emit("response.output_item.done", {"type": "response.output_item.done", "sequence_number": self.state.next_seq(), "output_index": output_index, "item": item})
+                return
             if btype == "text":
                 yield from self._ensure_message_text_item()
             elif btype == "tool_use":
@@ -258,6 +276,13 @@ class StreamTranslator:
                     })
             elif dt == "input_json_delta":
                 idx = int(data.get("index", 0) or 0)
+                if idx in self._hosted_blocks:
+                    self._hosted_args[idx] = self._hosted_args.get(idx, "") + str(delta.get("partial_json") or "")
+                    try:
+                        self._hosted_blocks[idx]["input"] = json.loads(self._hosted_args[idx])
+                    except ValueError:
+                        pass
+                    return
                 st = self._tool(idx)
                 part = delta.get("partial_json")
                 if isinstance(part, str) and part:
@@ -430,7 +455,7 @@ class StreamTranslator:
 
     def _collect_output_items(self) -> list[dict]:
         items: list[dict] = []
-        pairs: list[tuple[int, dict]] = []
+        pairs: list[tuple[int, dict]] = list(self._hosted_items.values())
         if self.state.message_item_started:
             pairs.append((self.state.text_output_index, self._message_output_item()))
         for st in self.state.tools.values():

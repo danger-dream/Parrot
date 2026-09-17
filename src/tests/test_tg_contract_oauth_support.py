@@ -29,7 +29,6 @@ from src.oauth import openai as openai_provider
 from src.oauth import xai as xai_provider
 from src.telegram import menu_cache, states, ui
 from src.telegram.menus import oauth_account_models_menu as oam
-from src.telegram.menus import oauth_defaults_menu as odm
 from src.telegram.menus import oauth_menu as om
 from src.tests.tg_contract import TraceCapture, assert_strict_equal, load_jsonl
 
@@ -119,7 +118,6 @@ class FakeEnv:
         mp.setattr(om.time, "time", lambda: FAKE_NOW)
         mp.setattr(oam.time, "time", lambda: FAKE_NOW)
         mp.setattr(om, "datetime", FrozenDateTime)
-        mp.setattr(odm, "datetime", FrozenDateTime, raising=False)
         mp.setattr(ui, "api", self.capture.api)
         mp.setattr(config, "get", lambda: self.cfg)
         mp.setattr(config, "update", self.config_update)

@@ -23,6 +23,7 @@ from .routers import (
     overview,
     proxy,
     retention,
+    search,
     stats,
     status,
     status_alerts,
@@ -56,6 +57,7 @@ _BUILTIN_DOMAIN_ROUTERS: tuple[APIRouter, ...] = (
     updates.router,
     media_settings.router,
     system_settings.router,
+    search.router,
     content_blacklist.router,
     network.router,
 )

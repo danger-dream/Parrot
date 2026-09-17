@@ -117,7 +117,7 @@ def translate_request_from_input_items(body: dict, input_items: list) -> dict:
     用于需要同时检查完整历史语义的桥接路径，避免 `previous_response_id`
     被重复查 Store 后让转换和语义补丁看到不同的历史快照。
     """
-    messages = _input_items_to_messages(resolve_item_references(input_items))
+    messages = _input_items_to_messages(resolve_item_references(input_items), native_search=bool(body.get("_parrot_preserve_native_search")))
 
     # instructions → 前置消息（在任何历史之前）
     messages = _instructions_to_messages(body.get("instructions")) + messages
@@ -297,7 +297,7 @@ def resolve_current_input_items(body: dict) -> list:
     return []
 
 
-def _input_items_to_messages(items: list) -> list:
+def _input_items_to_messages(items: list, *, native_search=False) -> list:
     """input items → chat messages[]；function_call items 聚合到前一条 assistant。
 
     reasoning 处理（passthrough 模式）：
@@ -400,6 +400,11 @@ def _input_items_to_messages(items: list) -> list:
                     "role": role,
                     "content": _content_responses_to_chat(content_parts),
                 })
+
+        elif t == "web_search_call" and native_search:
+            from ... import search_hosted_codec
+            _flush()
+            messages.append({"role": "assistant", "content": [], "_parrot_hosted_search_blocks": search_hosted_codec.responses_to_anthropic(item)})
 
         elif t == "function_call":
             if pending_assistant is None:

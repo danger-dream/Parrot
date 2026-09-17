@@ -178,6 +178,8 @@ class StreamTranslator:
             )
         self.allow_reasoning_bridge = bool(allow_reasoning_bridge)
         self._buf = b""
+        self._hosted_seen: set[str] = set()
+        self._hosted_blocks: list[tuple[int, dict]] = []
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
         if not chunk:
@@ -272,6 +274,9 @@ class StreamTranslator:
         if event_name in ("response.completed", "response.incomplete", "response.failed"):
             resp = _response_from_event(data)
             self._capture_response_metadata(resp)
+            for item in resp.get("output") or []:
+                if isinstance(item, dict) and item.get("type") == "web_search_call":
+                    yield from self._emit_hosted_search(item)
             self.state.status = str(resp.get("status") or event_name.removeprefix("response."))
             details = resp.get("incomplete_details") if isinstance(resp.get("incomplete_details"), dict) else {}
             self.state.incomplete_reason = details.get("reason") if isinstance(details, dict) else None
@@ -330,6 +335,9 @@ class StreamTranslator:
 
     def _on_output_item_done(self, data: dict, item: dict) -> Iterator[bytes]:
         item_type = item.get("type")
+        if item_type == "web_search_call":
+            yield from self._emit_hosted_search(item)
+            return
         if item_type == "reasoning" and self.allow_reasoning_bridge:
             st = self._reasoning_for_item(data, item)
             summary = item.get("summary") if isinstance(item.get("summary"), list) else []
@@ -373,6 +381,20 @@ class StreamTranslator:
         if not st.stopped:
             st.stopped = True
             yield _emit("content_block_stop", {"type": "content_block_stop", "index": st.block_index})
+
+    def _emit_hosted_search(self, item: dict) -> Iterator[bytes]:
+        from ... import search_hosted_codec
+        key = str(item.get("id") or item.get("call_id") or "")
+        if not key or key in self._hosted_seen:
+            return
+        self._hosted_seen.add(key)
+        yield from self._emit_message_start()
+        yield from self._stop_text_if_needed()
+        for block in search_hosted_codec.responses_to_anthropic(item):
+            index = self.state.alloc_index()
+            self._hosted_blocks.append((index, block))
+            yield _emit("content_block_start", {"type": "content_block_start", "index": index, "content_block": block})
+            yield _emit("content_block_stop", {"type": "content_block_stop", "index": index})
 
     def _update_tool_metadata(self, st: _ToolState, data: dict, item: dict, key: str) -> None:
         call_id = item.get("call_id") or item.get("id")
@@ -639,7 +661,7 @@ class StreamTranslator:
         return self._tool_state(key)
 
     def get_downstream_anthropic_assistant(self) -> dict:
-        indexed: list[tuple[int, dict[str, Any]]] = []
+        indexed: list[tuple[int, dict[str, Any]]] = list(self._hosted_blocks)
         if self.state.text_parts:
             indexed.append((self.state.text_index, {"type": "text", "text": "".join(self.state.text_parts)}))
         for st in self.state.reasoning.values():

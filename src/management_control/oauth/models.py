@@ -37,13 +37,6 @@ class OAuthCredentialKind(str, Enum):
     REFRESH_TOKEN = "refreshToken"
 
 
-class OAuthFamily(str, Enum):
-    ANTHROPIC = "anthropic"
-    ANTIGRAVITY = "antigravity"
-    OPENAI = "openai"
-    XAI = "xai"
-
-
 class OAuthUsageDisplayMode(str, Enum):
     USED = "used"
     REMAINING = "remaining"
@@ -305,32 +298,6 @@ class TelegramOAuthPreferences:
     usage_display_mode: OAuthUsageDisplayMode
     quota_progress_bar: bool
     revision: str
-
-
-@dataclass(frozen=True, slots=True)
-class OAuthDefaultModelReference:
-    kind: str
-    owner: str
-    model_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class OAuthDefaultModels:
-    family: OAuthFamily
-    models: tuple[str, ...]
-    references: tuple[OAuthDefaultModelReference, ...]
-    revision: str
-
-
-@dataclass(frozen=True, slots=True)
-class OAuthDefaultModelsResult:
-    family: OAuthFamily
-    models: tuple[str, ...]
-    cleaned_api_keys: tuple[str, ...] = field(default_factory=tuple)
-    skipped_api_keys: tuple[str, ...] = field(default_factory=tuple)
-    removed_mappings: tuple[str, ...] = field(default_factory=tuple)
-    cleared_defaults: tuple[str, ...] = field(default_factory=tuple)
-    revision: str = ""
 
 
 @dataclass(frozen=True, slots=True)

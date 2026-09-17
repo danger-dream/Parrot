@@ -56,12 +56,6 @@ def rebuild_from_config() -> None:
 def _rebuild_from_config_locked() -> None:
     """根据当前 config 重建所有渠道实例。"""
     cfg = config.get()
-    default_models = list(
-        cfg.get("oauthDefaultModels")
-        or config.DEFAULT_CONFIG.get("oauthDefaultModels")
-        or []
-    )
-
     new: dict[str, Channel] = {}
 
     for acc in cfg.get("oauthAccounts", []):
@@ -78,7 +72,7 @@ def _rebuild_from_config_locked() -> None:
             elif provider == "workbuddy":
                 ch = WorkBuddyOAuthChannel(acc)
             else:
-                ch = OAuthChannel(acc, default_models)
+                ch = OAuthChannel(acc)
             if channel_state.is_retired_source(ch.key):
                 print(f"[registry] skip reused retired channel key: {ch.key}")
                 continue

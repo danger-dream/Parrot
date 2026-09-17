@@ -59,7 +59,8 @@ class _Images:
         v = self.values
         return SimpleNamespace(
             enabled=v["enabled"], cache_enabled=v["cacheEnabled"],
-            main_model=v["mainModel"], tool_model=v["toolModel"],
+            models={'openai': ['gpt-main'], 'xai': ['grok-image-a', 'grok-image-b']},
+            request_timeout_seconds=v.get('requestTimeoutSeconds', 180), job_ttl_seconds=v.get('jobTtlSeconds', 10800),
             cache_path=v["cachePath"], cache_retention_days=v["cacheRetentionDays"],
             cache_max_bytes=v["cacheMaxBytes"], revision=self.revision,
         )
@@ -71,6 +72,17 @@ class _Images:
         self.values.update(patch)
         self.revision = "i2"
         return self.get_settings(_ctx)
+
+    def list_sources(self, _ctx):
+        row = self.accounts[0]
+        return [dict(source_id=row.account_id, label=row.email, provider='openai', enabled=row.image_enabled,
+            effective_available=row.image_enabled, unavailable_reason=None, revision=row.revision)]
+
+    def update_source(self, ctx, source_id, *, enabled, expected_revision):
+        return self.update_account(ctx, source_id, enabled=enabled, expected_revision=expected_revision)
+
+    def statistics(self, _ctx):
+        return {'models': [], 'cache': {'files': 0, 'bytes': 0}}
 
     def list_accounts(self, _ctx):
         return tuple(self.accounts)
@@ -193,6 +205,7 @@ class _SettingsControl(_Control):
     def __init__(self):
         super().__init__()
         self.images = _Images()
+        self.videos = _Images()
         self.xai_media = _XaiMedia()
         self.antigravity_media = _AntigravityMedia()
         self.oauth.accounts.append(SimpleNamespace(
@@ -286,182 +299,91 @@ def _buttons(kb):
 
 
 def _button(kb, label):
-    return next(item for item in _buttons(kb) if item["text"] == label)
+    from src.telegram.menus.model_center_icons import label_with_icon
+    return next(item for item in _buttons(kb) if item["text"] in (label, label_with_icon(label)))
 
 
-def test_model_settings_snapshot_has_exact_five_destinations_and_return(env):
+def test_chat_replaces_settings_with_metadata_and_upstream_sync(env):
     _control, _edits, _answers, _sends = env
-    text, kb = menu._settings_render(7)
-    assert text == (
-        "⚙️ <b>模型设置</b>\n\n适用于全部账号 / 渠道。\n"
-        "压缩模型：<code>model-01</code>\n\n"
-        "下游请求必须传 model；缺少模型名称返回 400，不补默认值。"
-    )
-    assert [[item["text"] for item in row] for row in kb["inline_keyboard"]] == [
-        ["压缩模型", "OAuth 备用模型"], ["同步元数据"],
-        ["图片设置", "视频设置"], ["返回模型列表"],
-    ]
-    callbacks = [item["callback_data"] for item in _buttons(kb)]
-    assert callbacks[1] == "odm:show" and callbacks[-1] == "mc:list"
-    frozen = [menu._thaw(7, value.split(":", 2)[2]) for value in callbacks if value.startswith("mc:a:")]
-    assert [(item.name, item.data.get("page")) for item in frozen] == [
-        ("settings_page", "compression"),
-        ("settings_page", "metadata_sync"),
-        ("settings_page", "image"),
-        ("settings_page", "video"),
-    ]
+    _text, kb = menu.render(7)
+    assert all("模型设置" not in b["text"] and "OAuth 备用" not in b["text"] for b in _buttons(kb))
+    assert _button(kb, "同步元数据") and _button(kb, "同步上游模型")
+    assert not hasattr(menu, "_settings_render") and not hasattr(menu, "_compression_picker_render")
 
 
-def test_image_snapshot_shared_scope_emoji_and_frozen_toggle(env):
+def test_image_snapshot_independent_panel_and_frozen_toggle(env):
     control, edits, answers, _sends = env
     text, kb = menu._image_settings_render(7)
-    assert "GPT / Grok / Antigravity 共用" in text
-    assert "GPT / Grok / Antigravity 图片 + Grok 视频" in text
-    assert "Antigravity 全局图片模型：<code>3</code>" in text
-    assert _button(kb, "Grok 图片模型")["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("xai")
-    assert _button(kb, "AG 图片模型")["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("antigravity")
-    toggle = _button(kb, "关闭图片接口")["callback_data"]
-    menu.handle_callback(7, 10, "toggle", toggle)
-    assert control.images.calls == [({"enabled": False}, "i1")]
-    assert "图片接口：<code>关</code>" in edits[-1][2]
-    menu.handle_callback(7, 10, "replay", toggle)
-    assert control.images.calls == [({"enabled": False}, "i1")]
-    assert any("页面版本已变化" in str(item[1]) for item in answers)
+    assert '模型中心 · 图片' in text and '当前缓存占用' in text
+    assert '共用' not in text and '主模型' not in text
+    assert _button(kb, 'a@example.invalid · 已启用')['icon_custom_emoji_id'] == ui.provider_custom_emoji_id('openai')
+    toggle = _button(kb, '图片接口：开启')['callback_data']
+    menu.handle_callback(7, 10, 'toggle', toggle)
+    assert control.images.calls == [({'enabled': False}, 'i1')]
+    assert '图片接口：关' in edits[-1][2] and control.videos.calls == []
+    menu.handle_callback(7, 10, 'replay', toggle)
+    assert len(control.images.calls) == 1
+    assert any('页面版本已变化' in str(item[1]) for item in answers)
 
 
 def test_gpt_account_target_is_explicit_and_only_changes_image_participation(env):
-    control, edits, _answers, _sends = env
+    control, _edits, _answers, _sends = env
     _text, kb = menu._gpt_images_render(7)
-    callback = _button(kb, "排除 · a@example.invalid")["callback_data"]
-    menu.handle_callback(7, 10, "account", callback)
-    assert control.images.account_calls == [("openai-a", False, "ia1")]
-    assert "☐ <code>a@example.invalid</code> · 排除" in edits[-1][2]
+    menu.handle_callback(7, 10, 'account', _button(kb, 'a@example.invalid · 已启用')['callback_data'])
+    assert control.images.account_calls == [('openai-a', False, 'ia1')]
+    assert control.videos.account_calls == [] and control.images.accounts[0].oauth_enabled
 
 
-def test_xai_single_rename_and_bulk_are_separate_and_preserve_sibling(env):
-    control, _edits, _answers, sends = env
-    callback = menu._freeze(
-        7, "media_input", mode="rename", provider="xai", kind="image",
-        model_id="grok-image-a", revision="x1", owner=ModelOwnerRef(ModelSourceType.GLOBAL), page=1,
-    )
-    menu.handle_callback(7, 10, "rename", callback)
-    assert states.get_state(7)["action"] == "mc_media_edit"
-    menu.handle_text_state(7, "mc_media_edit", "grok-image-renamed")
-    assert control.xai_media.image_models == ["grok-image-renamed", "grok-image-b"]
-    assert control.xai_media.calls == [(
-        "rename", ModelKind.IMAGE, "grok-image-a", "grok-image-renamed", "x1",
-    )]
-    assert "媒体模型已更新" in sends[-1][1]
+def test_old_xai_model_edit_and_input_do_not_write(env):
+    control, _edits, _answers, _sends = env
+    callback = menu._freeze(7, 'media_input', mode='rename', provider='xai', kind='image', model_id='grok-image-a')
+    menu.handle_callback(7, 10, 'old-edit', callback)
+    assert states.get_state(7) is None
+    states.set_state(7, 'mc_media_edit', {'kind': 'image', 'provider': 'xai'})
+    menu.handle_text_state(7, 'mc_media_edit', 'must-not-save')
+    assert control.xai_media.calls == [] and control.xai_media.image_models == ['grok-image-a', 'grok-image-b']
 
 
-def test_media_limits_clear_duration_and_timeout_rules(env):
-    _control, _edits, _answers, _sends = env
-    assert len(menu._parse_media_models(",".join(f"m{i}" for i in range(50)), "xai")) == 50
+def test_media_duration_and_cache_input_rules(env):
+    assert menu._parse_duration_input('3d', allow_days=True) == 259200
+    with pytest.raises(ValueError): menu._parse_duration_input('3d', allow_days=False)
+    assert menu._parse_bytes_input('1GB') == 1024**3
+    assert menu._parse_bytes_input('500MB') == 500 * 1024**2
+    control, edits, _answers, sends = env
+    _text, kb = menu._video_settings_render(7)
+    menu.handle_callback(7, 10, 'ttl', _button(kb, '设置任务 TTL')['callback_data'])
+    assert states.get_state(7)['action'] == 'mc_media_field'
+    menu.handle_text_state(7, 'mc_media_field', '2h')
+    assert control.videos.calls == [({'jobTtlSeconds': 7200}, 'i1')] and control.images.calls == []
+
+
+def test_retired_antigravity_callback_cannot_write(env):
+    control, _edits, answers, _sends = env
+    callback = menu._freeze(7, "media_input", provider="antigravity", kind="image", mode="add", revision="ag1")
+    menu.handle_callback(7, 10, "retired", callback)
+    assert control.antigravity_media.calls == []
+    assert any("已移除" in str(row) for row in answers)
     with pytest.raises(ValueError):
-        menu._parse_media_models(",".join(f"m{i}" for i in range(51)), "xai")
-    assert menu._parse_media_model("x" * 128, "xai") == "x" * 128
-    with pytest.raises(ValueError):
-        menu._parse_media_model("x" * 129, "xai")
-    assert len(menu._parse_media_models(",".join(f"a{i}" for i in range(80)), "antigravity")) == 80
-    with pytest.raises(ValueError):
-        menu._parse_media_models(",".join(f"a{i}" for i in range(81)), "antigravity")
-    assert menu._parse_media_models("clear", "antigravity") == ()
-    assert menu._parse_duration_input("3d", allow_days=True) == 259200
-    with pytest.raises(ValueError):
-        menu._parse_duration_input("3d", allow_days=False)
-    assert menu._parse_bytes_input("1GB") == 1024**3
-    assert menu._parse_bytes_input("500MB") == 500 * 1024**2
+        menu._media_manager_render(7, "antigravity", "image", 1)
 
 
-def test_antigravity_account_specific_model_is_readonly_and_global_stays_editable(env):
-    _control, _edits, _answers, _sends = env
-    text, _kb = menu._media_manager_render(7, "antigravity", "image", 1)
-    assert "账户专属（只读）" in text and "ag-private" in text
-    detail, kb = menu._detail_render(7, "rk-ag-private")
-    assert "账户专属 Antigravity 图片模型只读" in detail
-    assert "查看只读归属" not in {item["text"] for item in _buttons(kb)}
-    assert not any(item["text"] in {"修改当前名称", "移除当前模型"} for item in _buttons(kb))
-    readonly_text, readonly_kb = menu._media_detail_render(
-        7, "antigravity", "image", "ag-private", "ag1", 1,
-        ModelOwnerRef(ModelSourceType.OAUTH, "ag-account-a"), True,
-    )
-    assert "账户专属 Antigravity 图片模型只读" in readonly_text
-    assert not any(item["text"] in {"修改当前名称", "移除当前模型"} for item in _buttons(readonly_kb))
-
-
-@pytest.mark.parametrize(
-    ("resource_key", "heading", "can_remove"),
-    [
-        ("rk-gpt-main", "GPT / Codex 图片主模型", False),
-        ("rk-grok-image-a", "Grok 图片模型", True),
-        ("rk-grok-video-a", "Grok 视频模型", True),
-        ("rk-ag-global-a", "Antigravity 图片模型", True),
-    ],
-)
-def test_gpt_grok_ag_list_items_have_direct_single_item_actions(
-    env, resource_key, heading, can_remove,
-):
-    _control, _edits, _answers, _sends = env
+@pytest.mark.parametrize('resource_key', ['rk-gpt-main', 'rk-grok-image-a', 'rk-grok-video-a'])
+def test_old_media_details_land_directly_on_panel_without_model_edits(env, resource_key):
     text, kb = menu._detail_render(7, resource_key)
-    assert heading in text
-    labels = {item["text"] for item in _buttons(kb)}
-    assert "修改当前名称" in labels
-    assert ("移除当前模型" in labels) is can_remove
-    assert "查看当前媒体模型" not in labels
+    assert '模型中心 · ' in text and '配置 / 管理 API' not in text
+    assert not any(word in str(kb) for word in ('修改当前名称', '移除当前模型', '查看当前媒体模型', '批量编辑'))
 
 
-def test_media_list_opens_actionable_item_and_cancel_returns_b_then_a(env):
-    _control, edits, _answers, sends = env
-    state = menu._session(7)
-    state.tab = "image"
-    state.text = "ag-global-a"
-    state.page = 1
-    list_text, list_kb = menu.render(7)
-    assert "模型中心 · 图片 · 1 个" in list_text
-
-    menu.handle_callback(7, 10, "open", _button(list_kb, "1")["callback_data"])
-    detail_text, detail_kb = edits[-1][2], edits[-1][3]
-    assert "Antigravity 图片模型" in detail_text
-    assert "模型：<code>ag-global-a</code>" in detail_text
-    assert "修改当前名称" in {item["text"] for item in _buttons(detail_kb)}
-    assert "查看当前媒体模型" not in {item["text"] for item in _buttons(detail_kb)}
-
-    menu.handle_callback(
-        7, 10, "rename", _button(detail_kb, "修改当前名称")["callback_data"],
-    )
-    assert states.get_state(7)["action"] == "mc_media_edit"
-    assert menu.handle_text_state(7, "mc_media_edit", "/cancel") is True
-    cancel_kb = sends[-1][2]
-    menu.handle_callback(7, 10, "cancel-back", _button(cancel_kb, "返回")["callback_data"])
-    detail_again, detail_again_kb = edits[-1][2], edits[-1][3]
-    assert "模型：<code>ag-global-a</code>" in detail_again
-
-    menu.handle_callback(
-        7, 10, "back-list", _button(detail_again_kb, "返回")["callback_data"],
-    )
-    returned = edits[-1][2]
-    assert "模型中心 · 图片 · 1 个" in returned
-    assert "查询：<code>ag-global-a</code>" in returned
-    assert (state.tab, state.text, state.page, state.source) == (
-        "image", "ag-global-a", 1, None,
-    )
-
-
-def test_media_same_name_uses_owner_identity_not_label_or_position(env):
+def test_image_panel_does_not_use_old_list_filters(env):
     _control, _edits, _answers, _sends = env
-    global_text, global_kb = menu._detail_render(7, "rk-ag-global-same")
-    account_text, account_kb = menu._detail_render(7, "rk-ag-account-same")
-    assert "归属：<code>全局</code>" in global_text
-    assert {item["text"] for item in _buttons(global_kb)} >= {
-        "修改当前名称", "移除当前模型",
-    }
-    assert "AG Team · ag-owner@example.test" in account_text
-    assert not ({"修改当前名称", "移除当前模型"} & {
-        item["text"] for item in _buttons(account_kb)
-    })
+    state = menu._session(7)
+    state.tab, state.text, state.page = 'image', 'filter-matches-nothing', 5
+    text, kb = menu.render(7)
+    assert 'grok-image-a' in text and 'gpt-main' in text
+    assert not any(word in str(kb) for word in ('查询', '来源：', '状态：', '多选'))
 
 
-def test_settings_round_trip_preserves_existing_cross_page_selection(env):
+def test_metadata_round_trip_preserves_existing_cross_page_selection(env):
     _control, edits, _answers, _sends = env
     state = menu._session(7)
     state.tab = "chat"
@@ -470,7 +392,7 @@ def test_settings_round_trip_preserves_existing_cross_page_selection(env):
     state.selected = ["model-01", "model-09"]
     state.selected_resources = {"model-01": "rk-1", "model-09": "rk-9"}
     _text, list_kb = menu.render(7)
-    menu.handle_callback(7, 10, "settings", _button(list_kb, "模型设置")["callback_data"])
+    menu.handle_callback(7, 10, "settings", _button(list_kb, "同步元数据")["callback_data"])
     settings_kb = edits[-1][3]
     menu.handle_callback(
         7, 10, "back", _button(settings_kb, "返回模型列表")["callback_data"],
@@ -481,44 +403,58 @@ def test_settings_round_trip_preserves_existing_cross_page_selection(env):
     assert "多选：已选 <b>2</b> 项" in edits[-1][2]
 
 
-def test_public_settings_provider_item_returns_each_direct_parent_and_list_context(env):
-    _control, edits, _answers, _sends = env
-    state = menu._session(7)
-    state.tab = "image"
-    state.text = "same"
-    state.page = 1
-    list_text, list_kb = menu.render(7)
-    assert "模型中心 · 图片 · 2 个" in list_text
-    expected = (state.tab, state.text, state.page, state.source, state.status)
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_media_panel_exact_bottom_rows_and_no_unknown_notes(env, monkeypatch, kind):
+    control, edits, _answers, _sends = env
+    target = control.images if kind == "image" else control.videos
+    monkeypatch.setattr(target, 'statistics', lambda ctx: {
+        'models': [{'model': 'gpt-main' if kind == 'image' else 'grok-video-a',
+                    'generated_count': 4, 'recorded_bytes': 1024,
+                    'unknown_count_calls': 2, 'unknown_bytes_calls': 1}],
+        'cache': {'files': 1, 'bytes': 100}})
+    menu._session(7).tab = kind
+    text, kb = menu.render(7)
+    assert '已生成：4' in text
+    for removed in ('未知', '统计为历史成功产物', '模型名称通过', '模型设置'):
+        assert removed not in text + str(kb)
+    rows = kb['inline_keyboard']
+    if kind == 'image':
+        assert rows[-1] == [_button(kb, '多媒体日志'), _button(kb, '返回主菜单')]
+    else:
+        assert rows[-2] == [_button(kb, '设置任务 TTL'), _button(kb, '多媒体日志')]
+        assert rows[-1] == [_button(kb, '返回主菜单')]
 
-    menu.handle_callback(7, 10, "settings", _button(list_kb, "模型设置")["callback_data"])
-    settings_kb = edits[-1][3]
-    menu.handle_callback(7, 10, "image", _button(settings_kb, "图片设置")["callback_data"])
-    image_kb = edits[-1][3]
-    menu.handle_callback(7, 10, "ag", _button(image_kb, "AG 图片模型")["callback_data"])
-    manager_kb = edits[-1][3]
-    menu.handle_callback(7, 10, "item", _button(manager_kb, "1")["callback_data"])
-    detail_kb = edits[-1][3]
 
-    menu.handle_callback(7, 10, "to-manager", _button(detail_kb, "返回")["callback_data"])
-    assert "Antigravity 图片模型" in edits[-1][2]
-    manager_kb = edits[-1][3]
-    menu.handle_callback(7, 10, "to-image", _button(manager_kb, "返回图片设置")["callback_data"])
-    assert edits[-1][2].startswith("🖼 <b>图片设置</b>")
-    image_kb = edits[-1][3]
-    menu.handle_callback(7, 10, "to-settings", _button(image_kb, "返回模型设置")["callback_data"])
-    assert edits[-1][2].startswith("⚙️ <b>模型设置</b>")
-    settings_kb = edits[-1][3]
-    menu.handle_callback(7, 10, "to-list", _button(settings_kb, "返回模型列表")["callback_data"])
-    assert "模型中心 · 图片 · 2 个" in edits[-1][2]
-    assert (state.tab, state.text, state.page, state.source, state.status) == expected
+def test_detail_compression_changes_immediately_and_returns_to_detail(env):
+    control, edits, answers, _sends = env
+    _text, kb = menu._detail_render(7, 'rk-2')
+    callback = _button(kb, '设置为压缩模型')['callback_data']
+    menu.handle_callback(7, 10, 'set', callback)
+    assert control.mapping.compression_calls == [('put', 'model-02', 'c1')]
+    assert '当前压缩模型' in edits[-1][2] and '<b>model-02</b>' in edits[-1][2]
+    assert _button(edits[-1][3], '清除压缩指定')
+    menu.handle_callback(7, 10, 'replay', callback)
+    assert len(control.mapping.compression_calls) == 1
+    assert any('页面版本已变化' in str(a) for a in answers)
+    clear = _button(edits[-1][3], '清除压缩指定')['callback_data']
+    menu.handle_callback(7, 10, 'clear', clear)
+    assert control.mapping.compression is None and control.mapping.compression_calls[-1] == ('delete', 'c2')
+    assert _button(edits[-1][3], '设置为压缩模型')
+
+
+def test_retired_compression_picker_callback_cannot_write(env):
+    control, _edits, answers, _sends = env
+    callback = menu._freeze(7, 'compression_save', model_id='model-02', revision='c1')
+    menu.handle_callback(7, 10, 'old', callback)
+    assert not control.mapping.compression_calls
+    assert any('请从模型详情' in str(a) for a in answers)
 
 
 def test_legacy_image_mapping_callbacks_redirect_without_old_write(env):
     control, edits, _answers, _sends = env
     assert menu.handle_callback(7, 10, "old-img", "img:toggle") is True
     assert control.images.calls == []
-    assert edits[-1][2].startswith("🖼 <b>图片设置</b>")
+    assert "模型中心 · 图片" in edits[-1][2]
     assert menu.handle_callback(7, 10, "old-map", "map:edit_alias:any:any") is True
     assert control.mapping.update_calls == []
     assert edits[-1][2].startswith("🔀 <b>模型别名")

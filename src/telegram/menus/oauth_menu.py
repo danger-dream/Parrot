@@ -225,10 +225,10 @@ def _foreground_account_model_sync(
             count = int(result.get("models") or len(selection.get("models") or []))
             status = f"✅ 已同步模型 <code>{count}</code> 个，当前使用账户模型。"
         elif action == "foreground_timeout":
-            source = "继续使用上次账户模型" if not selection_before.get("fallback") else "当前使用默认模型"
+            source = "继续使用上次账户模型" if selection_before.get("models") else "尚无账户目录，当前无可路由模型，请同步上游模型"
             status = f"⏱ 模型同步超时，任务将在后台继续；{source}。"
         else:
-            source = "继续使用上次账户模型" if not selection.get("fallback") else "当前使用默认模型"
+            source = "继续使用上次账户模型" if selection.get("models") else "尚无账户目录，当前无可路由模型，请同步上游模型"
             error = str(result.get("error") or action)[:180]
             status = (
                 f"⚠️ 模型同步失败：<code>{ui.escape_html(error)}</code>\n"
@@ -2056,21 +2056,6 @@ _FILTER_LABELS = {
 }
 
 
-def _default_models_for_settings(family: str) -> list[str]:
-    cfg = oauth_control.config_snapshot()
-    if family == "openai":
-        raw = (cfg.get("openaiOAuth") or {}).get("defaultModels") or []
-    elif family == "xai":
-        raw = (cfg.get("xaiOAuth") or {}).get("defaultModels") or []
-    elif family == "antigravity":
-        raw = (cfg.get("antigravityOAuth") or {}).get("defaultModels") or []
-    else:
-        raw = cfg.get("oauthDefaultModels") or []
-    if not isinstance(raw, list):
-        return []
-    return [str(x) for x in raw if str(x).strip()]
-
-
 def _antigravity_image_models_for_settings() -> list[str]:
     cfg = oauth_control.config_snapshot().get("antigravityOAuth")
     raw = cfg.get("imageModels") if isinstance(cfg, dict) else None
@@ -2080,16 +2065,9 @@ def _antigravity_image_models_for_settings() -> list[str]:
 
 
 def _antigravity_catalog_counts(acc: dict) -> tuple[int, int]:
-    models = acc.get("models")
-    if not isinstance(models, list) or not any(str(item).strip() for item in models):
-        models = _default_models_for_settings("antigravity")
+    models = acc.get("models") or []
     text_n = len([item for item in models if str(item).strip()])
-    if "imageModels" in acc:
-        images = acc.get("imageModels") if isinstance(acc.get("imageModels"), list) else []
-    else:
-        images = _antigravity_image_models_for_settings()
-    image_n = len([item for item in images if str(item).strip()])
-    return text_n, image_n
+    return text_n, 0
 
 
 def _quota_monitor_values() -> tuple[bool, int, float]:
@@ -2126,7 +2104,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     text = "\n".join([
         "⚙️ <b>OAuth 账户设置</b>",
         "",
-        "模型目录、备用模型与媒体设置已统一归位到模型中心；这里保留 OAuth 非模型设置。",
+        "模型目录与媒体设置已统一归位到模型中心；这里保留 OAuth 非模型设置。",
         "",
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
         f"当前模式: {_cch_status_label()}",
@@ -2152,8 +2130,8 @@ def _settings_text_and_kb() -> tuple[str, dict]:
 
 
 def on_settings(chat_id: int, message_id: int, cb_id: Optional[str] = None) -> None:
-    from . import oauth_defaults_menu
-    oauth_defaults_menu.abandon_edit(chat_id)
+    if str((states.get_state(chat_id) or {}).get("action") or "").startswith("odm_"):
+        states.pop_state(chat_id)
     if cb_id is not None:
         ui.answer_cb(cb_id)
     text, kb = _settings_text_and_kb()

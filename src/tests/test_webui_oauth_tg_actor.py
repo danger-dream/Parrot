@@ -16,7 +16,6 @@ from src.management_control.oauth import OAuthControl  # noqa: E402
 from src.management_control.oauth.menu_bridge import telegram_context  # noqa: E402
 from src.telegram.menus import (  # noqa: E402
     oauth_account_models_menu,
-    oauth_defaults_menu,
     oauth_menu,
 )
 from src.tests.management_oauth_fakes import InMemoryOAuthBackend  # noqa: E402
@@ -126,7 +125,6 @@ def test_tg_import_model_launch_error_follows_progress_and_escapes(monkeypatch):
 def test_tg_usage_defaults_and_model_sync_keep_real_chat_actor(monkeypatch):
     control, _backend, audit = _control_with_audit()
     monkeypatch.setattr(oauth_menu, "oauth_control", control)
-    monkeypatch.setattr(oauth_defaults_menu, "oauth_control", control)
     monkeypatch.setattr(oauth_account_models_menu, "oauth_control", control)
     account_id = "openai:admin@example.test:workspace-1"
 
@@ -134,9 +132,6 @@ def test_tg_usage_defaults_and_model_sync_keep_real_chat_actor(monkeypatch):
         account_id, chat_id=4242, email="admin@example.test",
     )
     assert usage.get("error") is None
-    oauth_defaults_menu._commit_save(
-        4242, "openai", ["gpt-alpha", "gpt-gamma"], set(), cleanup=False,
-    )
     result = asyncio.run(
         control.refresh_account_models_for_telegram(
             telegram_context(4242), account_id,
@@ -147,7 +142,6 @@ def test_tg_usage_defaults_and_model_sync_keep_real_chat_actor(monkeypatch):
     by_action = {row.action: row for row in audit.snapshot()}
     for action in (
         "oauth.usage.refresh",
-        "oauth.default-models.replace",
         "oauth.models.sync",
     ):
         assert by_action[action].actor == "telegram:4242"
@@ -160,7 +154,6 @@ def test_owned_tg_sources_have_no_zero_actor_or_raw_model_sync():
         (root / name).read_text(encoding="utf-8")
         for name in (
             "oauth_menu.py",
-            "oauth_defaults_menu.py",
             "oauth_account_models_menu.py",
         )
     )

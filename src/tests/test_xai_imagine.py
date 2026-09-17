@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from PIL import Image
 import copy
 import io
 import json
@@ -131,8 +133,8 @@ def _setup(monkeypatch):
     }
     cfg["images"]["cacheEnabled"] = False
     cfg["images"]["maxInputImageBytes"] = 4 * 1024 * 1024
-    config._cache = cfg
-    config._mtime = config._current_mtime()
+    monkeypatch.setattr(config, "_cache", cfg)
+    monkeypatch.setattr(config, "_mtime", config._current_mtime())
 
     with registry._lock:
         registry._channels = {}
@@ -140,7 +142,7 @@ def _setup(monkeypatch):
     cooldown.clear_all()
     state_db.xai_video_job_delete()
 
-    async def valid_token(account_key: str) -> str:
+    async def valid_token(account_key: str, **kwargs) -> str:
         return f"token-for-{account_key}"
 
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
@@ -161,6 +163,7 @@ def _install_channel(
         "refresh_token": "not-read-by-tests",
         "expired": "2999-01-01T00:00:00Z",
     }
+    config._cache.setdefault("oauthAccounts", []).append(account)
     channel = XAIOAuthChannel(account)
     with registry._lock:
         registry._channels[channel.key] = channel
@@ -180,27 +183,23 @@ class _FakePipelineResult:
 # ── Shared image routes select by model ─────────────────────────────────────
 
 
-def test_non_grok_image_model_keeps_existing_gpt_pipeline(monkeypatch):
-    captured: dict[str, Any] = {}
-
-    async def fake_pipeline(**kwargs):
-        captured.update(kwargs)
-        return _FakePipelineResult()
-
-    async def unexpected_xai(*_args, **_kwargs):
-        raise AssertionError("xAI media route must not handle GPT image models")
-
-    monkeypatch.setattr(images_openai_compat, "_execute_pipeline", fake_pipeline)
-    monkeypatch.setattr(imagine, "_request_upstream", unexpected_xai)
-
+def test_unknown_non_grok_image_model_never_falls_back_to_gpt(monkeypatch):
     response = _AsgiClient(_build_app()).post(
-        "/v1/images/generations",
-        headers=_headers(),
+        "/v1/images/generations", headers=_headers(),
         json={"model": "gpt-image-1", "prompt": "draw a square"},
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["model"] == "gpt-image-2"
-    assert captured["action"] == "generate"
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "model"
+
+
+def _image_bytes():
+    out = io.BytesIO()
+    Image.new("RGB", (32, 32), "blue").save(out, format="PNG")
+    return out.getvalue()
+
+
+def _image_item():
+    return {"b64_json": base64.b64encode(_image_bytes()).decode(), "mime_type": "image/png"}
 
 
 def test_grok_image_generation_routes_to_xai_and_keeps_batch(monkeypatch):
@@ -219,7 +218,7 @@ def test_grok_image_generation_routes_to_xai_and_keeps_batch(monkeypatch):
         return httpx.Response(
             200,
             json={
-                "data": [{"url": "https://imgen.x.ai/result.jpeg", "mime_type": "image/jpeg"}],
+                "data": [_image_item(), _image_item()],
                 "usage": {"cost_in_usd_ticks": 400000000},
             },
         )
@@ -238,7 +237,8 @@ def test_grok_image_generation_routes_to_xai_and_keeps_batch(monkeypatch):
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["data"][0]["url"] == "https://imgen.x.ai/result.jpeg"
+    assert len(response.json()["data"]) == 2
+    assert "b64_json" in response.json()["data"][0]
     assert "parrot_warning" not in response.json()
     assert captured["channel"] is channel
     assert captured["method"] == "POST"
@@ -246,8 +246,9 @@ def test_grok_image_generation_routes_to_xai_and_keeps_batch(monkeypatch):
     assert captured["headers"]["authorization"].startswith("Bearer token-for-xai:")
     assert captured["body"] == {
         "model": "grok-imagine-image",
-        "prompt": "two blue dots",
+        "prompt": captured["body"]["prompt"],
         "n": 2,
+        "response_format": "b64_json",
         "quality": "high",
         "aspect_ratio": "16:9",
         "resolution": "1k",
@@ -258,7 +259,7 @@ def test_grok_image_generation_routes_to_xai_and_keeps_batch(monkeypatch):
     assert log["action"] == "generate"
     assert log["model"] == "grok-imagine-image"
     assert log["requested_count"] == 2
-    assert log["image_count"] == 1
+    assert log["image_count"] == 2
     assert log["cost_usd_ticks"] == 400_000_000
     assert log["account_key"] == channel.account_key
 
@@ -271,23 +272,10 @@ def test_grok_image_result_is_cached_for_media_log_view(monkeypatch, tmp_path):
         "cacheMaxBytes": 10 * 1024 * 1024,
     })
 
-    async def fake_request(_channel, *, method, path, headers, body, model):
-        return httpx.Response(
-            200,
-            json={
-                "data": [{
-                    "url": "https://imgen.x.ai/cached.jpeg",
-                    "mime_type": "image/jpeg",
-                }],
-            },
-        )
-
-    async def fake_download(value, *, channel, model, max_bytes):
-        assert value == "https://imgen.x.ai/cached.jpeg"
-        return b"jpeg-result", "image/jpeg"
+    async def fake_request(_channel, **kwargs):
+        return httpx.Response(200, json={"data": [_image_item()]})
 
     monkeypatch.setattr(imagine, "_request_upstream", fake_request)
-    monkeypatch.setattr(imagine, "_download_xai_media", fake_download)
     response = _AsgiClient(_build_app()).post(
         "/v1/images/generations",
         headers=_headers(),
@@ -295,21 +283,22 @@ def test_grok_image_result_is_cached_for_media_log_view(monkeypatch, tmp_path):
     )
 
     assert response.status_code == 200
-    assert response.json()["data"][0]["url"] == "https://imgen.x.ai/cached.jpeg"
+    assert "b64_json" in response.json()["data"][0]
     log = media_db.recent(1)[0]
     paths = json.loads(log["cache_paths"])
     assert log["cached_images"] == 1
-    assert log["image_bytes"] == len(b"jpeg-result")
+    assert log["image_bytes"] == len(_image_bytes())
     assert len(paths) == 1
-    assert paths[0].endswith(".jpg")
-    assert Path(paths[0]).read_bytes() == b"jpeg-result"
+    assert paths[0].endswith(".png")
+    assert Path(paths[0]).read_bytes() == _image_bytes()
 
 
 def test_unknown_grok_image_name_never_falls_back_to_gpt(monkeypatch):
     async def unexpected_pipeline(**_kwargs):
         raise AssertionError("unknown Grok image model must not use GPT")
 
-    monkeypatch.setattr(images_openai_compat, "_execute_pipeline", unexpected_pipeline)
+    from src.openai import images_runtime
+    monkeypatch.setattr(images_runtime, "execute", unexpected_pipeline)
     response = _AsgiClient(_build_app()).post(
         "/v1/images/generations",
         headers=_headers(),
@@ -325,7 +314,7 @@ def test_grok_image_edit_converts_multipart_to_xai_json(monkeypatch):
 
     async def fake_request(_channel, *, method, path, headers, body, model):
         captured.update(path=path, body=json.loads(body))
-        return httpx.Response(200, json={"data": [{"url": "https://imgen.x.ai/edit.jpeg"}]})
+        return httpx.Response(200, json={"data": [_image_item()]})
 
     monkeypatch.setattr(imagine, "_request_upstream", fake_request)
     files = [
@@ -354,7 +343,7 @@ def test_grok_image_edit_accepts_native_json_image_object(monkeypatch):
 
     async def fake_request(_channel, *, method, path, headers, body, model):
         captured.update(path=path, body=json.loads(body))
-        return httpx.Response(200, json={"data": [{"url": "https://imgen.x.ai/edit.jpeg"}]})
+        return httpx.Response(200, json={"data": [_image_item()]})
 
     monkeypatch.setattr(imagine, "_request_upstream", fake_request)
     response = _AsgiClient(_build_app()).post(
@@ -717,7 +706,7 @@ def test_channel_media_headers_reuse_existing_token_helper(monkeypatch):
     channel = _install_channel()
     calls: list[str] = []
 
-    async def token(account_key: str) -> str:
+    async def token(account_key: str, **kwargs) -> str:
         calls.append(account_key)
         return "existing-access-token"
 

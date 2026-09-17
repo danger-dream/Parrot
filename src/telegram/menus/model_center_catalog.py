@@ -23,7 +23,9 @@ from ...management_control.models import (
 )
 from ...management_control.oauth import PageSpec
 from .. import ui
+from . import model_center_usage as usage
 from . import model_center_menu as menu
+from .model_center_icons import inline_kb
 
 
 def _enum_value(value: Any) -> str:
@@ -223,7 +225,7 @@ def _metadata_lines(
 
 
 def _model_state(view: ModelView, source: ModelSourceRef | None) -> tuple[bool | None, str]:
-    if view.identity.kind is not ModelKind.CHAT:
+    if view.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
         return None, "已配置"
     source_view = menu._source_for_view(view, source)
     if source is not None:
@@ -240,7 +242,7 @@ def _model_state(view: ModelView, source: ModelSourceRef | None) -> tuple[bool |
 
 def _list_model_state(view: ModelView, source: ModelSourceRef | None) -> tuple[bool | None, str]:
     """One concise effective state; raw switches remain on the detail page."""
-    if view.identity.kind is not ModelKind.CHAT:
+    if view.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
         return None, "已配置"
     if not view.global_enabled:
         return False, "停用"
@@ -278,7 +280,7 @@ def _list_context(s: menu._Session) -> menu._ListContext:
         tab=s.tab, page=s.page, text=s.text, source=s.source,
         source_label=s.source_label, source_provider=s.source_provider,
         status=s.status, origin=s.origin, alias_page=s.alias_page,
-        alias_query=s.alias_query, multiple=s.multiple,
+        multiple=s.multiple,
         selection_mode=s.selection_mode, selected=tuple(s.selected),
         selected_resources=tuple(s.selected_resources.items()),
         selection_filters=s.selection_filters, excluded=tuple(s.excluded),
@@ -295,7 +297,6 @@ def _restore_list_context(s: menu._Session, context: menu._ListContext) -> None:
     s.status = context.status
     s.origin = context.origin
     s.alias_page = context.alias_page
-    s.alias_query = context.alias_query
     s.multiple = context.multiple
     s.selection_mode = context.selection_mode
     s.selected = list(context.selected)
@@ -414,6 +415,8 @@ def _batch_button(
 
 def _model_list_render(chat_id: int) -> tuple[str, dict]:
     s = menu._session(chat_id)
+    if s.tab == "image": return menu._image_settings_render(chat_id)
+    if s.tab == "video": return menu._video_settings_render(chat_id)
     ctx = menu._ctx(chat_id)
     filters = menu._filters(s)
     page = menu._CONTROL.list_models(ctx, filters=filters, page=s.page, page_size=menu._PAGE_SIZE)
@@ -436,6 +439,11 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
     if s.multiple:
         lines.append(f"多选：已选 <b>{menu._selected_count(chat_id, ctx)}</b> 项")
     lines.append("")
+    cached = usage.peek(page.items, s.source)
+    s.usage_views = tuple(page.items)
+    s.usage_loading = cached.value is None
+    if cached.value is None:
+        lines.extend(["📊 统计暂不可用，请稍后重试。" if cached.error else "📊 累计统计加载中…", ""])
     rows: list[list[dict]] = [menu._tabs(s.tab)]
     number_row: list[dict] = []
     start = (page.page - 1) * menu._PAGE_SIZE
@@ -458,10 +466,14 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
             + (f" · {ui.escape_html(state_text)}" if state_text else "")
             + (
                 hidden_note
-                if view.identity.kind is ModelKind.CHAT
+                if view.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE)
                 else f" · {ui.escape_html(ui.provider_label(view.identity.provider or ''))}{owner_note}"
             )
         )
+        stats_lines = usage.format_lines((cached.value or {}).get(view.model_id))
+        if stats_lines:
+            lines.extend("      " + line for line in stats_lines)
+            lines.append("")
         action = "select_model" if s.multiple else "detail"
         callback = menu._freeze(
             chat_id, action, resource_key=view.resource_key, model_id=view.model_id,
@@ -486,12 +498,12 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
             s.source_provider if s.source is not None else None,
         ),
     ])
-    if s.tab == "chat":
+    if s.tab in {"chat", "image"}:
         rows.append([
             ui.btn("状态：" + menu._status_label(s.status), "mc:status"),
             ui.btn("退出多选" if s.multiple else "多选", "mc:multi"),
         ])
-    if s.multiple and s.tab == "chat":
+    if s.multiple and s.tab in {"chat", "image"}:
         rows.append([
             ui.btn("全选结果", "mc:select_all"),
             ui.btn("反选", "mc:invert"),
@@ -509,16 +521,15 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
             )),
             ui.btn("完成", "mc:done"),
         ])
-    elif s.source is not None:
-        rows.append([ui.btn("同步上游", menu._freeze(chat_id, "sync_source", source=s.source))])
+    back = menu._list_back_callback(chat_id, menu._list_context(s))
     rows.append([
-        ui.btn("模型设置", menu._freeze(
-            chat_id, "settings",
-            back_callback=menu._list_back_callback(chat_id, menu._list_context(s)),
+        ui.btn("同步元数据", menu._freeze(chat_id, "metadata_sync", back_callback=back)),
+        ui.btn("同步上游模型" + (" · 当前来源" if s.source else ""), menu._freeze(
+            chat_id, "sync_upstream", source=s.source, back_callback=back,
         )),
-        ui.btn("返回", s.origin),
     ])
-    return menu._paged(chat_id, "\n".join(lines), ui.inline_kb(rows))
+    rows.append([ui.btn("返回主菜单" if s.origin == "menu:main" else "返回", s.origin)])
+    return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
 def _detail_render(
@@ -528,17 +539,19 @@ def _detail_render(
     ctx = menu._ctx(chat_id)
     view = menu._CONTROL.get_model(ctx, resource_key)
     s.detail_key = view.resource_key
+    if view.identity.kind in (ModelKind.IMAGE, ModelKind.VIDEO):
+        return menu._media_view_detail_render(chat_id, view, back_callback=back_callback)
     provider = menu._provider_for_view(view, s.source)
     title = f"{ui.provider_tag(provider)} <b>{ui.escape_html(view.model_id)}</b>" if provider else f"🧬 <b>{ui.escape_html(view.model_id)}</b>"
     lines = [title, "", f"类型：<code>{ui.escape_html(menu._kind_label(menu._enum_value(view.identity.kind)))}</code>"]
     if view.aliases:
         lines.append("别名：" + "、".join(f"<code>{ui.escape_html(item)}</code>" for item in view.aliases))
     rows: list[list[dict]] = []
-    if view.identity.kind is not ModelKind.CHAT:
+    if view.identity.kind not in (ModelKind.CHAT, ModelKind.IMAGE):
         return menu._media_view_detail_render(
             chat_id, view, back_callback=back_callback,
         )
-    if view.identity.kind is ModelKind.CHAT:
+    if view.identity.kind in (ModelKind.CHAT, ModelKind.IMAGE):
         enabled, state_text = menu._model_state(view, s.source)
         lines.extend([
             f"状态：<code>{ui.escape_html(state_text)}</code>",
@@ -547,6 +560,10 @@ def _detail_render(
             "",
             "<b>容量、能力与价格</b>",
         ])
+        if view.identity.kind is ModelKind.IMAGE:
+            lines.extend(["生成 / 编辑：JSON 与 multipart；默认 PNG / base64，URL 有效期 1 小时。",
+                          "尺寸按需等比缩放并补边（不裁切）；透明背景校验真实 alpha。",
+                          "OpenAI 单图接口：n 张最多 n 次生成，模糊超时不重试。", ""])
         selected_source = menu._source_for_view(view, s.source)
         metadata_sources = (selected_source,) if selected_source is not None else view.sources
         if metadata_sources:
@@ -572,10 +589,37 @@ def _detail_render(
                     f"{brand_prefix}<b>{ui.escape_html(human_source)}</b>",
                     f"上游名：<code>{ui.escape_html(source_view.outbound_model)}</code>",
                     f"此模型：<code>{'启用' if source_view.source_enabled else '停用'}</code> · "
-                    f"{menu._container_label(source_view.type)}：<code>{'启用' if source_view.container_enabled else '停用'}</code> · "
+                    f"{'图片来源' if view.identity.kind is ModelKind.IMAGE else menu._container_label(source_view.type)}：<code>{'启用' if source_view.container_enabled else '停用'}</code> · "
                     f"当前可用：<code>{'是' if source_view.effective_routable else '否'}</code>",
                     *menu._metadata_lines(source_view.effective_metadata),
                 ])
+                if view.identity.kind is ModelKind.IMAGE and (source_view.provider == 'xai' or source_view.outbound_model.startswith('grok-imagine-image')):
+                    lines.extend([
+                        "xAI 当前图片适配不支持透明背景：实测返回 JPEG，无 alpha；请用 background=auto/opaque，或选择支持透明的图片来源。",
+                        "xAI 编辑最多 3 张参考图；moderation 仅支持默认 auto。已知不兼容参数在生成前拒绝，不付费试错。",
+                    ])
+                if view.identity.kind is ModelKind.IMAGE and source_view.type is ModelSourceType.OAUTH and source_view.provider == 'openai':
+                    account = menu._CONTROL.images.get_account(ctx, source_view.id)
+                    lines.extend([
+                        f"普通对话账户：<code>{'启用' if account.oauth_enabled else '停用'}</code>（图片授权不改变此状态）",
+                        f"图片独立启用：<code>{'开' if account.independent_enabled else '关'}</code>",
+                        "只覆盖用户手动停用，不绕过认证异常、账户删除或图片模型停用。",
+                    ])
+                    if account.unavailable_reason:
+                        lines.append(ui.escape_html(account.unavailable_reason))
+                    if account.independent_allowed or account.independent_enabled:
+                        label = '关闭图片独立启用' if account.independent_enabled else '图片独立启用（不启用对话）'
+                        rows.append([ui.btn(label + ' · ' + human_source, menu._freeze(
+                            chat_id, 'image_independent', account_id=account.account_id,
+                            target=not account.independent_enabled, revision=account.revision,
+                            detail_key=view.resource_key, detail_back=back_callback,
+                        ))])
+                    if not account.image_enabled:
+                        rows.append([ui.btn('加入图片来源 · ' + human_source, menu._freeze(
+                            chat_id, 'image_account', account_id=account.account_id,
+                            target=True, revision=account.revision,
+                            detail_key=view.resource_key, detail_back=back_callback,
+                        ))])
         else:
             lines.extend(menu._metadata_lines(view.common_metadata))
         target_enabled = not bool(enabled)
@@ -628,37 +672,17 @@ def _detail_render(
             source_view = menu._source_for_view(view, s.source)
             if source_view is not None and s.source.type is ModelSourceType.OAUTH:
                 rows.extend(menu._max_context_row(chat_id, view, source_view, back_callback))
-    else:
-        owner = view.identity.owner
-        owner_text = "全局"
-        if owner is not None and owner.type is ModelSourceType.OAUTH:
-            owner_text = f"账户专属 · {owner.id}"
-        lines.extend([
-            f"提供方：<code>{ui.escape_html(view.identity.provider or '')}</code>",
-            f"归属：<code>{ui.escape_html(owner_text)}</code>",
-            f"编辑：<code>{'可编辑' if view.editable else '只读'}</code>",
-        ])
-        if not view.editable:
-            lines.append("账户专属媒体模型只读；全局设置不会覆盖此项。")
-        kind = menu._enum_value(view.identity.kind)
-        if provider == "openai" and kind == "image":
-            rows.append([ui.provider_button("打开 GPT 图片管线", "mc:gpt_images", "openai")])
-        elif provider in {"xai", "antigravity"}:
-            _models, media_revision, _account_overrides = menu._media_values(chat_id, provider, kind)
-            owner = owner or ModelOwnerRef(ModelSourceType.GLOBAL)
-            rows.append([ui.provider_button(
-                "查看当前媒体模型" if view.editable else "查看只读归属",
-                menu._freeze(
-                    chat_id, "media_detail", provider=provider, kind=kind,
-                    model_id=view.model_id, revision=media_revision, page=1,
-                    owner=owner, readonly=not view.editable,
-                ),
-                provider,
-            )])
-        else:
-            rows.append([ui.btn("打开媒体设置", "mc:settings")])
-    rows.append([ui.btn("返回模型列表" if back_callback != "mc:compression" else "返回压缩模型", back_callback)])
-    return menu._paged(chat_id, "\n".join(lines), ui.inline_kb(rows))
+    if view.identity.kind is ModelKind.CHAT:
+        compression, revision = menu._CONTROL.mapping.get_compression(ctx)
+        selected = compression == view.model_id
+        if selected:
+            lines.extend(["", "🗜️ 当前压缩模型（仅供内部上下文压缩）"])
+        rows.append([ui.btn("清除压缩指定" if selected else "设置为压缩模型", menu._freeze(
+            chat_id, "compression_clear" if selected else "compression_save",
+            resource_key=view.resource_key, revision=revision, detail_back=back_callback,
+        ))])
+    rows.append([ui.btn("返回模型列表", back_callback)])
+    return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
 def _max_context_row(
@@ -707,6 +731,11 @@ def _source_options(chat_id: int) -> list[menu._SourceOption]:
     """Return human labels paired with canonical IDs; labels never select identity."""
     ctx = menu._ctx(chat_id)
     result: list[menu._SourceOption] = []
+    image_labels = {}
+    if menu._session(chat_id).tab == 'image':
+        from src import image_catalog
+        image_labels = {source.key[6:]: source.label for source in image_catalog.sources()
+                        if source.key.startswith('oauth:')}
     oauth_page = menu._CONTROL.oauth.list_accounts(ctx, page=PageSpec(page=1, page_size=200))
     for account in oauth_page.items:
         provider = menu._enum_value(account.provider)
@@ -721,6 +750,7 @@ def _source_options(chat_id: int) -> list[menu._SourceOption]:
                 display_name = identity or "未命名账户"
             if identity and identity not in {display_name, account_id}:
                 display_name = f"{display_name} · {identity}"
+        display_name = image_labels.get(account_id, display_name)
         result.append(menu._SourceOption(
             ModelSourceRef(ModelSourceType.OAUTH, account_id),
             f"{provider_label} · {display_name}", provider,
@@ -752,7 +782,18 @@ def _source_picker_render(chat_id: int) -> tuple[str, dict]:
         ("✓ " if s.source is None else "") + "全部来源",
         menu._freeze(chat_id, "set_source", source=None, expected_tab=s.tab),
     )]]
+    image_sources = None
+    if s.tab == "image":
+        image_sources = set()
+        page_no = 1
+        while True:
+            page = menu._CONTROL.list_models(menu._ctx(chat_id), filters=ModelFilters(kinds=(ModelKind.IMAGE,)), page=page_no, page_size=200)
+            image_sources.update((row.type, row.id) for view in page.items for row in view.sources)
+            if not page.has_next: break
+            page_no += 1
     for option in menu._source_options(chat_id):
+        if image_sources is not None and (option.ref.type, option.ref.id) not in image_sources:
+            continue
         selected = menu._source_equal(s.source, option.ref)
         rows.append([ui.provider_button(
             ("✓ " if selected else "") + option.label,
@@ -763,7 +804,7 @@ def _source_picker_render(chat_id: int) -> tuple[str, dict]:
             option.provider,
         )])
     rows.append([ui.btn("取消", "mc:list")])
-    return menu._paged(chat_id, "\n".join(lines), ui.inline_kb(rows))
+    return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 
 
 def _status_picker_render(chat_id: int) -> tuple[str, dict]:
@@ -776,4 +817,4 @@ def _status_picker_render(chat_id: int) -> tuple[str, dict]:
     ]
     rows = [[ui.btn(("✓ " if s.status is value else "") + label, menu._freeze(chat_id, "set_status", status=value))] for value, label in options]
     rows.append([ui.btn("取消", "mc:list")])
-    return "🔎 <b>选择状态条件</b>", ui.inline_kb(rows)
+    return "🔎 <b>选择状态条件</b>", inline_kb(rows)

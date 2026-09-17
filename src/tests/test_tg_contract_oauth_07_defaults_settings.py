@@ -12,7 +12,6 @@ import pytest
 from src import model_metadata, oauth_manager
 from src.telegram import states, ui
 from src.telegram.menus import oauth_account_models_menu as oam
-from src.telegram.menus import oauth_defaults_menu as odm
 from src.telegram.menus import oauth_menu as om
 from src.tests.tg_contract import assert_capability_coverage
 from src.tests.test_tg_contract_oauth_support import (
@@ -165,75 +164,6 @@ def _run_oa07(case, monkeypatch):
     return actual(case, env, state_steps=steps, final=env.final(accountKey=key))
 
 
-def _defaults_config(env):
-    env.cfg.update({
-        "oauthDefaultModels": ["claude-old", "shared-old"],
-        "openaiOAuth": {"defaultModels": ["openai-old", "shared-old"]},
-        "xaiOAuth": {"defaultModels": ["xai-old", "shared-old"]},
-        "antigravityOAuth": {"defaultModels": ["ag-old", "shared-old"]},
-    })
-
-
-def _run_odm(case, monkeypatch):
-    env = FakeEnv(case, monkeypatch); _defaults_config(env)
-    op = case["entry"]["scenario"]; steps = []
-    if op == "overview":
-        odm.handle_callback(42, 100, "cb-show", "odm:show")
-        return actual(case, env)
-    if op == "family_edit":
-        family = case["entry"]["family"]
-        monkeypatch.setattr(odm, "_has_live_endpoint", lambda fam: False)
-        monkeypatch.setattr(odm, "_static_models", lambda fam: [f"{fam}-model-{i:02d}" for i in range(1, 15)])
-        odm.handle_callback(42, 100, "cb-edit", f"odm:edit:{family}")
-        return actual(case, env, state_steps=[env.state_snapshot("edit")])
-    if op == "discovery_flow":
-        family = "xai"
-        async def ensure_token(key): return "fake-access-token"
-        async def discover(url, token):
-            if case["entry"].get("failure"):
-                raise odm.ModelsDiscoveryError("fake catalog failure")
-            return [f"grok-text-{index:02d}" for index in range(1, 15)] + ["grok-imagine-image"]
-        monkeypatch.setattr(oauth_manager, "ensure_valid_token", ensure_token)
-        monkeypatch.setattr(odm, "discover_models", discover)
-        monkeypatch.setattr(odm, "_first_enabled_account_key", lambda provider: "xai:fake@invalid:subject")
-        monkeypatch.setattr(odm.time, "time_ns", lambda: 1_700_000_000_000_000_000)
-        monkeypatch.setattr(odm, "_spawn_async_task", lambda factory, name="": asyncio.run(factory()))
-        odm.handle_callback(42, 100, "cb-discover", f"odm:edit:{family}")
-        return actual(case, env, state_steps=[env.state_snapshot("discovery")])
-    if op == "select_flow":
-        data = {"family": "openai", "existing_models": ["openai-model-01"], "selected_models": ["openai-model-01"]}
-        odm._enter_select(42, 100, data, [f"openai-model-{i:02d}" for i in range(1, 15)], source="live")
-        for callback in ("odm:p:1", "odm:t:13:1", "odm:all", "odm:inv", "odm:manual", "odm:backsel", "odm:noop"):
-            odm.handle_callback(42, 100, f"cb-{callback}", callback); steps.append(env.state_snapshot(callback))
-        return actual(case, env, state_steps=steps)
-    if op == "retry_and_expired":
-        odm.handle_callback(42, 100, "cb-expired", "odm:retry")
-        states.set_state(42, "odm_model_select", {"family": "xai", "existing_models": [], "selected_models": [], "discovered_models": ["xai-a"], "models_source": "live", "discovery_retry_available": True})
-        monkeypatch.setattr(odm, "_start_discovery", lambda chat, mid, data: env.events.append(["retry_discovery", data["family"]]))
-        odm.handle_callback(42, 100, "cb-retry", "odm:retry")
-        return actual(case, env, state_steps=[env.state_snapshot("retry")])
-    if op == "manual_input":
-        family = case["entry"].get("family", "anthropic")
-        states.set_state(42, f"odm_edit:{family}", {"family": family, "existing_models": odm._read_list(family)})
-        odm.handle_text_state(42, f"odm_edit:{family}", case["entry"]["text"])
-        return actual(case, env, state_steps=[env.state_snapshot("manual")])
-    if op == "reference_confirm":
-        env.cfg["apiKeys"] = {"fake-key": {"allowedModels": ["shared-old"]}, "keep-other": {"allowedModels": ["shared-old", "other"]}}
-        env.cfg["modelMapping"] = {"anthropic": {"alias": "shared-old"}}
-        env.cfg["ingressDefaultModel"] = {"anthropic": "shared-old"}
-        odm._apply_new_models(42, "anthropic", ["claude-new"], cb_id="cb-apply")
-        steps.append(env.state_snapshot("confirm"))
-        callback = next(button["callback_data"] for call in env.capture.calls if call["method"] == "sendMessage" for row in call["payload"]["reply_markup"]["inline_keyboard"] for button in row if button["callback_data"].endswith(case["entry"]["mode"]))
-        odm.handle_callback(42, 100, "cb-commit", callback)
-        return actual(case, env, state_steps=steps)
-    if op == "commit_invalid":
-        odm.handle_callback(42, 100, "cb-bad-mode", "odm:commit:deadbeef:other")
-        odm.handle_callback(42, 100, "cb-expired", "odm:commit:deadbeef:keep")
-        odm.handle_callback(42, 100, "cb-unknown", "odm:wat")
-        return actual(case, env)
-    raise AssertionError(op)
-
-
 def _run_settings(case, monkeypatch):
     env = FakeEnv(case, monkeypatch)
     env.cfg.update({
@@ -263,17 +193,42 @@ def _run_settings(case, monkeypatch):
     return actual(case, env, state_steps=steps)
 
 
-RUNNERS = {"TG-OA-07": _run_oa07, "TG-ODM-01": _run_odm, "TG-OA-SET-01": _run_settings}
+RUNNERS = {"TG-OA-07": _run_oa07, "TG-OA-SET-01": _run_settings}
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda item: item["caseId"])
 def test_oauth_07_defaults_settings_strict_trace(case, monkeypatch):
-    check_trace(case, RUNNERS[case["capabilityId"]](case, monkeypatch))
+    if case["capabilityId"] == "TG-ODM-01":
+        pytest.skip("Retired 2026-09-16: OAuth fallback; immutable historical trace only")
+    # Explicit reviewed retirement delta, not regenerated golden recordings:
+    # remove only the exact retired button/phrase, compare all other fields strictly.
+    expected = deepcopy(case)
+    buttons = phrases = 0
+    for call in expected["tgApi"]:
+        payload = call.get("payload", {})
+        for row in payload.get("reply_markup", {}).get("inline_keyboard", []):
+            retired = {"callback_data": "odm:show", "text": "🧬 默认模型"}
+            if retired in row:
+                row.remove(retired)
+                buttons += 1
+        old = "模型目录、备用模型与媒体设置"
+        if old in payload.get("text", ""):
+            phrases += payload["text"].count(old)
+            payload["text"] = payload["text"].replace(old, "模型目录与媒体设置")
+    deltas = {
+        "TG-OA-07.oam_list_pages_status": (2, 0),
+        "TG-OA-07.oam_bulk_full": (1, 0),
+        "TG-OA-07.oam_bulk_cancel_expired": (1, 0),
+        "TG-OA-07.oam_sync": (2, 0),
+        "TG-OA-SET-01.settings_toggles": (0, 4),
+    }
+    assert (buttons, phrases) == deltas.get(case["caseId"], (0, 0))
+    check_trace(expected, RUNNERS[case["capabilityId"]](case, monkeypatch))
 
 
 def _source_callback_families():
     families = set()
-    for function in (om.handle_callback, oam.handle_callback, odm.handle_callback):
+    for function in (om.handle_callback, oam.handle_callback):
         for value in re.findall(r'["\']((?:oa|oam|odm):[^"\']*)["\']', inspect.getsource(function)):
             families.add(value + "*" if value.endswith(":") else value)
     return families
@@ -287,7 +242,9 @@ def test_segment_schema_unique_ids_capabilities_callback_and_state_bidirectional
     assert "mauth:" not in serialized
     frozen_callbacks = {item for case in cases for item in case["entry"].get("callbackFamilies", [])}
     frozen_states = {item for case in cases for item in case["entry"].get("stateFamilies", [])}
-    assert frozen_callbacks == _source_callback_families()
+    retired_callbacks = {item for item in frozen_callbacks if item.startswith("odm:")}
+    assert retired_callbacks == {"odm:*"}
+    assert frozen_callbacks - retired_callbacks == _source_callback_families()
     assert frozen_states == {
         "oa_login_code", "oa_set_json", "oa_openai_code", "oa_openai_rt",
         "oa_xai_code", "oa_xai_rt", "oa_antigravity_code", "oa_openai_import",
@@ -299,7 +256,7 @@ def test_segment_schema_unique_ids_capabilities_callback_and_state_bidirectional
     }
 
 
-def test_every_fixture_case_has_an_executable_runner_and_no_xim_assignment():
+def test_every_fixture_case_has_a_runner_or_explicit_retirement_and_no_xim_assignment():
     cases = load_jsonl(SEGMENT)
-    assert set(RUNNERS) | {"TG-OA-01", "TG-OA-02", "TG-OA-03", "TG-OA-04", "TG-OA-05", "TG-OA-06"} == ASSIGNED_IDS
+    assert set(RUNNERS) | {"TG-ODM-01", "TG-OA-01", "TG-OA-02", "TG-OA-03", "TG-OA-04", "TG-OA-05", "TG-OA-06"} == ASSIGNED_IDS
     assert all(case["capabilityId"] != "TG-XIM-01" for case in cases)

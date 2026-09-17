@@ -100,19 +100,10 @@ def test_query_aggregates_chat_retains_oauth_disabled_and_disambiguates_media():
     assert disabled.sources[0].effective_routable is False
 
     media = [item for item in page.items if item.model_id == "same-media"]
-    identities = {
-        (item.identity.kind.value, item.identity.provider,
-         item.identity.owner.type.value, item.identity.owner.id)
-        for item in media
-    }
-    assert identities == {
-        ("image", "xai", "global", None),
-        ("video", "xai", "global", None),
-        ("image", "antigravity", "global", None),
-        ("image", "antigravity", "oauth", "antigravity:ag@example.test:project-test"),
-    }
-    assert len({item.resource_key for item in media}) == 4
-    assert next(item for item in media if item.identity.owner.type is ModelSourceType.OAUTH).editable is False
+    assert {item.identity.kind for item in media} == {ModelKind.IMAGE, ModelKind.VIDEO}
+    assert len({item.resource_key for item in media}) == 2
+    assert all(item.identity.provider != "antigravity" for item in media)
+    assert next(item for item in media if item.identity.kind is ModelKind.IMAGE).global_enabled is True
     assert control.get_model(None, media[0].resource_key) == media[0]
 
     by_source = control.list_models(filters=ModelFilters(
@@ -229,7 +220,10 @@ def test_selection_validation_rejects_media_cross_scope_and_missing_revision_wit
     _install_catalog()
     control = ModelCenterControl()
     page = control.list_models()
-    media = next(item for item in page.items if item.identity.kind is ModelKind.IMAGE)
+    media = next(item for item in page.items if item.identity.kind is ModelKind.VIDEO)
+    config.get()["xaiOAuth"]["videoModels"] = ["video-only"]
+    page = control.list_models()
+    media = next(item for item in page.items if item.model_id == "video-only")
     before = copy.deepcopy(config.get())
     with pytest.raises(ManagementError) as missing_revision:
         control.set_state(

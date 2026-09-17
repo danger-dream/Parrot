@@ -163,6 +163,29 @@ def assert_error(code, call):
     return caught.value
 
 
+def test_permission_images_use_configured_sources_not_unsourced_defaults():
+    control, store, _, _ = make_control({
+        "apiKeys": {}, "oauthAccounts": [], "channels": [],
+        "images": {"toolModel": "gpt-image-2"},
+        "xaiOAuth": {"imageModels": ["image-z", "image-a"], "videoModels": []},
+    })
+    read = context(Capability.READ)
+    assert control.configured_media_models(read) == (("image-z", "image-a"), ())
+    assert control.available_permission_models(read) == ("model-a", "model-b", "image-z", "image-a")
+    store.value["oauthAccounts"] = [{
+        "provider": "openai", "email": "image@example.test", "workspace_id": "image-workspace",
+        "access_token": "synthetic-test-token", "enabled": False, "disabled_reason": "user",
+    }]
+    store.value["channels"] = [{
+        "name": "api-image", "protocol": "openai-responses", "enabled": False,
+        "models": [{"alias": "image-api-alias", "real": "gpt-image-2", "kind": "image"}],
+    }]
+    images, _ = control.configured_media_models(read)
+    assert images == ("image-z", "image-a", "gpt-image-2", "gpt-image-2.5", "image-api-alias")
+    assert control.available_permission_models(read) == control.available_permission_models_unchecked()
+    assert set(images) <= set(control.available_permission_models(read))
+
+
 def test_list_detail_filter_sort_page_and_no_secret_leak():
     control, _, _, _ = make_control()
     read = context(Capability.READ)

@@ -32,6 +32,7 @@ class ModelSourceData(StrictSchema):
     sourceEnabled: bool
     containerEnabled: bool
     effectiveRoutable: bool
+    unavailableReason: str | None = None
     effectiveMetadata: dict[str, Any]
     valueSource: dict[str, str]
     constrainedBy: dict[str, list[str]]

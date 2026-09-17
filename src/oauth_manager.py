@@ -2389,7 +2389,7 @@ def _evaluate_cursor_model_pools(
 
 def _claude_fable_models(account: dict) -> list[str]:
     """Return configured Claude models governed by the Fable scoped quota."""
-    selected = account.get("models") or config.get().get("oauthDefaultModels") or []
+    selected = account.get("models") or []
     return sorted({
         model.strip()
         for model in selected
@@ -4649,39 +4649,6 @@ def ensure_openai_metadata_fresh_sync(account_keys: list[str] | str, *,
         print(f"[oauth] ensure_openai_metadata_fresh_sync error: {exc}")
 
 
-def _provider_default_models(provider: str) -> tuple[list[str], str]:
-    """Return an explicit provider fallback; OpenAI falls back only to its profile."""
-    cfg = config.get()
-    if provider == "workbuddy":
-        return [], "workbuddy:awaiting-account-catalog"
-    section = {
-        "openai": "openaiOAuth",
-        "xai": "xaiOAuth",
-        "antigravity": "antigravityOAuth",
-    }.get(provider)
-    if provider == "claude":
-        configured = cfg.get("oauthDefaultModels")
-        built_in = config.DEFAULT_CONFIG.get("oauthDefaultModels") or []
-    else:
-        configured = (cfg.get(section) or {}).get("defaultModels") if section else []
-        built_in = ((config.DEFAULT_CONFIG.get(section) or {}).get("defaultModels") or []) if section else []
-    models = list(dict.fromkeys(
-        str(model).strip() for model in configured or [] if str(model).strip()
-    ))
-    if models:
-        return models, "default:configured"
-    if provider == "openai":
-        try:
-            profile = codex_protocol_profile()
-        except Exception:
-            # Invalid pinned configuration must not revive a mutable Python fallback.
-            return [], "profile:unavailable"
-        return list(profile.models), f"profile:{profile.profile_id}"
-    return list(dict.fromkeys(
-        str(model).strip() for model in built_in if str(model).strip()
-    )), "default:built-in"
-
-
 def account_disabled_models(account_or_key: dict | str) -> set[str]:
     account = account_or_key if isinstance(account_or_key, dict) else get_account(account_or_key)
     if not isinstance(account, dict):
@@ -4741,27 +4708,21 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         models = configured_models
     if models:
         source = str(account.get("last_model_sync_source") or "lkg:legacy-config")
-        fallback = False
     else:
-        models, source = _provider_default_models(provider)
-        fallback = True
+        source = f"{provider}:awaiting-account-catalog"
     disabled = account_disabled_models(account)
     return {
         "models": models,
         "effective_models": [model for model in models if model not in disabled],
         "disabled_models": disabled,
         "source": source,
-        "fallback": fallback,
         "synced_at": str(account.get("last_model_sync") or ""),
         "attempted_at": str(account.get("last_model_sync_attempt") or ""),
         "error": str(account.get("last_model_sync_error") or ""),
-        # Cursor records follow the intersection above; other providers retain
-        # their existing account-catalog behavior. Stateless fallbacks expose no
-        # records for any provider.
+        # Empty catalogs never acquire metadata or routes from static lists.
         "records": (
             [item for item in records if str(item.get("id") or "").strip() in models]
-            if provider == "cursor" and not fallback
-            else records if not fallback else []
+            if provider == "cursor" else records if models else []
         ),
     }
 
@@ -4859,6 +4820,23 @@ _model_discovery_executor = concurrent.futures.ThreadPoolExecutor(
 )
 
 
+def _model_catalog_write_state(account: dict) -> dict:
+    """CAS write set: catalogs/sync facts, never user purpose or disable switches."""
+    fields = (
+        "models", "last_model_sync", "last_model_sync_attempt",
+        "last_model_sync_source", "last_model_sync_error",
+    )
+    provider = provider_of(account)
+    fields += ("cursor_model_catalog",) if provider == "cursor" else ("account_model_catalog",)
+    if provider == "openai":
+        fields += (
+            "last_model_sync_client_version", "last_model_sync_profile",
+            "last_model_sync_attempt_client_version", "last_model_sync_attempt_profile",
+            "models_etag", "models_etag_client_version", "models_etag_profile",
+        )
+    return {field: copy.deepcopy(account[field]) for field in fields if field in account}
+
+
 def _discovery_generation(account: dict) -> str:
     provider = provider_of(account)
     # A hot Codex identity change invalidates any in-flight model fetch as well
@@ -4876,6 +4854,7 @@ def _discovery_generation(account: dict) -> str:
         str(account.get("access_token") or ""),
         str(account.get("project_id") or account.get("workspace_id") or ""),
         client_identity,
+        json.dumps(_model_catalog_write_state(account), sort_keys=True, ensure_ascii=False),
     ))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -4929,6 +4908,10 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
     # below must therefore use a fresh snapshot/generation, never the old one.
     account = copy.deepcopy(get_account(canonical))
     if not isinstance(account, dict):
+        return {"action": "stale", "account_key": canonical}
+    # A token refresh may legitimately rotate credentials, but cannot authorize
+    # replacing a directory edited while the refresh was awaiting I/O.
+    if _model_catalog_write_state(account) != _model_catalog_write_state(initial):
         return {"action": "stale", "account_key": canonical}
     provider = provider_of(account)
     if mock_mode_enabled():
@@ -5078,7 +5061,7 @@ def _normalize_model_refresh_result(canonical: str, before: dict | None, result:
 async def refresh_account_models(
     account_key: str, *, timeout_s: float = OAUTH_MODEL_SYNC_REQUEST_TIMEOUT_SECONDS,
 ) -> dict:
-    """Cross-event-loop single-flight with identity/token generation gating."""
+    """Cross-event-loop single-flight with identity/token/catalog CAS gating."""
     canonical = _resolve_existing_account_key_or_raise(account_key)
     owner = False
     with _model_discovery_tasks_guard:
@@ -5103,21 +5086,10 @@ async def refresh_account_models(
         before = copy.deepcopy(get_account(canonical))
         generation = _discovery_generation(before or {})
         result = await _discover_account_models_once(canonical, timeout_s=timeout_s)
-        # Cursor's native fetch owns its LKG, but the unified scheduler owns
-        # retry metadata so all five providers obey the same backoff policy.
+        # Cursor's native fetch commits successful LKG and sync facts together;
+        # the unified scheduler only records retry metadata for failed fetches.
         if provider_of(before or {}) == "cursor":
-            if result.get("action") == "updated" and int(result.get("models") or 0) > 0:
-                now = str(result.get("fetched_at") or _format_utc(datetime.now(timezone.utc)))
-                def mark_cursor_success(cfg):
-                    for item in cfg.get("oauthAccounts", []):
-                        if _canonical_key(item) == canonical and _discovery_generation(item) == generation:
-                            item["last_model_sync"] = now
-                            item["last_model_sync_attempt"] = now
-                            item["last_model_sync_source"] = "upstream:cursor"
-                            item["last_model_sync_error"] = ""
-                            return
-                config.update(mark_cursor_success, skip_if_unchanged=True)
-            elif result.get("action") in {"timeout", "error", "fetch_empty", "profile_updated"}:
+            if result.get("action") in {"timeout", "error", "fetch_empty", "profile_updated"}:
                 _persist_model_discovery_failure(
                     canonical, generation,
                     str(result.get("error") or result.get("model_error") or result.get("action")),
@@ -5354,6 +5326,7 @@ def refresh_cursor_models_sync(
     if time.monotonic() >= deadline:
         return {"action": "timeout", "account_key": account_key}
     profile_email = str(profile.get("email") or "").strip()
+    saved = {"value": False}
 
     def mutate(current_cfg):
         for item in current_cfg.get("oauthAccounts", []):
@@ -5376,9 +5349,12 @@ def refresh_cursor_models_sync(
                     item["cursor_profile_id"] = str(profile.get("id") or "").strip()
                     verified = profile.get("email_verified")
                     item["cursor_email_verified"] = verified if isinstance(verified, bool) else None
+                saved["value"] = True
                 return
 
-    config.update(mutate)
+    config.update(mutate, skip_if_unchanged=True)
+    if not saved["value"]:
+        return {"action": "stale", "account_key": account_key}
     return {
         "action": "updated" if models else "profile_updated",
         "account_key": account_key,

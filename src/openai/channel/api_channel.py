@@ -381,7 +381,6 @@ class OpenAIApiChannel(Channel):
 
     def _build_responses_passthrough(self, body: dict, resolved_model: str) -> UpstreamRequest:
         payload = dict(body)
-        local_web_tools.prepare_openai_responses_local_web_tools(payload)
         payload = provider_registry.filter_request_payload(self, payload, protocol="openai-responses")
         payload["model"] = resolved_model
         self._apply_compatibility(
@@ -429,7 +428,6 @@ class OpenAIApiChannel(Channel):
     def _build_responses_to_chat(self, body: dict, resolved_model: str) -> UpstreamRequest:
         """responses ingress → openai-chat 上游。"""
         body = dict(body)
-        local_web_tools.prepare_openai_responses_local_web_tools(body)
         # Store 开关决定是否允许 previous_response_id
         from .. import store as _store
         store_enabled = _store.is_enabled()

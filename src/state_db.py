@@ -203,12 +203,12 @@ def network_check_load_all():return sorted(_all("network_check_status"),key=lamb
 def network_check_delete(key:str)->None:_mut("network_check_status",lambda d:d.pop(key,None))
 def network_check_delete_stale(live_keys:set[str])->None:_mut("network_check_status",lambda d:[d.pop(k,None) for k in list(d) if k not in live_keys])
 
-def xai_video_job_save(request_id:str,*,channel_key:str,api_key_name:str,model:str,ttl_seconds:int)->None:
+def xai_video_job_save(request_id:str,*,channel_key:str,api_key_name:str,model:str,ttl_seconds:int,state_key:str|None=None)->None:
     ts=now_ms(); exp=ts+max(1,int(ttl_seconds))*1000
     def op(d):
         for k,r in list(d.items()):
             if int(r.get("expires_at") or 0)<=ts:d.pop(k,None)
-        d[request_id]={"request_id":request_id,"channel_key":channel_key,"api_key_name":api_key_name,"model":model,"created_at":ts,"expires_at":exp}
+        d[request_id]={"request_id":request_id,"channel_key":channel_key,"api_key_name":api_key_name,"model":model,"state_key":state_key,"created_at":ts,"expires_at":exp}
     _mut("xai_video_jobs",op,strict=True)
 def xai_video_job_load(request_id:str):
     row=_get("xai_video_jobs",request_id)

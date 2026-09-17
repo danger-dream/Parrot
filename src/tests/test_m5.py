@@ -153,8 +153,7 @@ async def test_probe_oauth_skipped(m):
     # 伪造一个 OAuth 渠道（不会真发请求）
     ch = m["oauth_channel"].OAuthChannel(
         {"email": "skip@test.com", "access_token": "x", "refresh_token": "x",
-         "expired": "2099-01-01T00:00:00Z", "enabled": True},
-        default_models=["claude-opus-4-7"],
+         "expired": "2099-01-01T00:00:00Z", "enabled": True, "models": ["claude-opus-4-7"]},
     )
     ok, elapsed, reason = await m["probe"].probe_channel_model(ch, "claude-opus-4-7")
     assert ok is False
@@ -177,8 +176,7 @@ async def test_recovery_run_once(m):
     chA = _make_api_channel(m, "chA", "https://cha")
     chO = m["oauth_channel"].OAuthChannel(
         {"email": "o@test.com", "access_token": "x", "refresh_token": "x",
-         "expired": "2099-01-01T00:00:00Z", "enabled": True},
-        default_models=["claude-opus-4-7"],
+         "expired": "2099-01-01T00:00:00Z", "enabled": True, "models": ["claude-opus-4-7"]},
     )
     _install_channels(m, [chA, chO])
 

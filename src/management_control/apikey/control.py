@@ -217,12 +217,30 @@ class ApiKeyControl:
             raise self._not_found(key_id)
         return self._limiter_snapshot(key_id)
 
+    @classmethod
+    def _configured_image_models(cls, cfg: dict) -> tuple[str, ...]:
+        from src import image_catalog, media_config
+        # Keep the existing xAI configuration order, then include models from
+        # actual OAuth/API sources (including disabled sources). A default GPT
+        # model with no configured source is not a grantable inventory item.
+        xai = cfg.get("xaiOAuth") or {}
+        legacy = cls._clean_models((cfg.get("image_models") or {}).get("xai") if isinstance(cfg.get("image_models"), dict) else xai.get("imageModels") if isinstance(xai, dict) else None)
+        sourced = sorted({source.model for source in image_catalog.sources(cfg)})
+        return tuple(dict.fromkeys((*legacy, *sourced)))
+
+    @classmethod
+    def _configured_video_models(cls, cfg: dict) -> tuple[str, ...]:
+        mapping = cfg.get('video_models')
+        if isinstance(mapping, dict):
+            return tuple(dict.fromkeys(model for values in mapping.values() for model in cls._clean_models(values)))
+        return cls._clean_models((cfg.get('xaiOAuth') or {}).get('videoModels'))
+
     def available_permission_models(self, context: ManagementContext) -> tuple[str, ...]:
         self._require(context, Capability.READ)
         cfg = self._config.get()
         xai = cfg.get("xaiOAuth") or {}
-        images = self._clean_models(xai.get("imageModels") if isinstance(xai, dict) else None)
-        videos = self._clean_models(xai.get("videoModels") if isinstance(xai, dict) else None)
+        images = self._configured_image_models(cfg)
+        videos = self._configured_video_models(cfg)
         result: list[str] = []
         for item in (*self._models.available_models(), *images, *videos):
             model = str(item or "").strip()
@@ -237,7 +255,7 @@ class ApiKeyControl:
         xai = self._config.get().get("xaiOAuth") or {}
         if not isinstance(xai, dict):
             return (), ()
-        return self._clean_models(xai.get("imageModels")), self._clean_models(xai.get("videoModels"))
+        return self._configured_image_models(self._config.get()), self._configured_video_models(self._config.get())
 
     def existing_secret_values(
         self, context: ManagementContext, *, exclude_key_id: str | None = None,
@@ -814,8 +832,8 @@ class ApiKeyControl:
     def available_permission_models_unchecked(self) -> tuple[str, ...]:
         cfg = self._config.get()
         xai = cfg.get("xaiOAuth") or {}
-        images = self._clean_models(xai.get("imageModels") if isinstance(xai, dict) else None)
-        videos = self._clean_models(xai.get("videoModels") if isinstance(xai, dict) else None)
+        images = self._configured_image_models(cfg)
+        videos = self._configured_video_models(cfg)
         out: list[str] = []
         for value in (*self._models.available_models(), *images, *videos):
             model = str(value or "").strip()

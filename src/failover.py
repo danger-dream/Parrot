@@ -1853,6 +1853,32 @@ async def run_failover(
       - affinity 命中 touch；成功后（non-stream 或 stream 全量完成）写入新绑定
       - log_db 的 finish_success / finish_error
     """
+    from . import search_tool_policy
+    if not body.get(search_tool_policy.ROUND_KEY):
+        body = search_tool_policy.restore_replay(body, ingress_protocol, api_key_name)
+        try:
+            search_tool_policy.validate(body)
+        except GuardError as exc:
+            return _json_error_for_ingress(ingress_protocol, exc.status, errors.ErrType.INVALID_REQUEST, exc.message)
+        if search_tool_policy.needs_loop(body):
+            search_route = schedule_result
+            async def invoke_search_round(round_body):
+                nonlocal search_route
+                response = await run_failover(
+                    search_route, round_body, request_id, api_key_name, client_ip,
+                    False, start_time, ingress_protocol=ingress_protocol,
+                    start_monotonic=start_monotonic,
+                )
+                search_route = search_tool_policy.advance_route(search_route, response)
+                return response
+            operation = search_tool_policy.run(
+                body, ingress_protocol, invoke_search_round,
+                request_id=request_id, api_key_name=api_key_name,
+            )
+            if is_stream:
+                return search_tool_policy.stream(asyncio.create_task(operation), ingress_protocol)
+            return await operation
+
     if start_monotonic is None:
         # Legacy callers start outer elapsed at entry; wall time never enters durations.
         start_monotonic = time.monotonic()
@@ -1922,55 +1948,6 @@ async def run_failover(
             ingress_protocol=ingress_protocol,
             affinity_hit=affinity_hit,
         )
-
-    # Anthropic web_search/web_fetch server tools cannot be executed by
-    # OpenAI-family upstreams.  When such tools are declared, Parrot runs a
-    # small non-streaming tool loop locally (AnySearch-backed) and converts the
-    # final answer back to SSE if the client requested streaming.
-    local_web_loop_active = (
-        ingress_protocol == "anthropic"
-        and local_web_tools.request_declares_supported_tools(body)
-        and local_web_tools.max_tool_rounds() > 0
-    )
-    openai_local_web_loop_active = (
-        ingress_protocol == "responses"
-        and local_web_tools.openai_responses_local_web_active(body)
-        and local_web_tools.max_tool_rounds() > 0
-    )
-    if local_web_loop_active and is_stream:
-        inner_body = dict(body)
-        inner_body["stream"] = False
-        task = asyncio.create_task(run_failover(
-            schedule_result,
-            inner_body,
-            request_id,
-            api_key_name,
-            client_ip,
-            False,
-            start_time,
-            ingress_protocol=ingress_protocol,
-            start_monotonic=start_monotonic,
-        ))
-        return local_web_tools.stream_anthropic_response_task_with_pings(task)
-    if openai_local_web_loop_active and is_stream:
-        inner_body = dict(body)
-        inner_body["stream"] = False
-        task = asyncio.create_task(run_failover(
-            schedule_result,
-            inner_body,
-            request_id,
-            api_key_name,
-            client_ip,
-            False,
-            start_time,
-            ingress_protocol=ingress_protocol,
-            start_monotonic=start_monotonic,
-        ))
-        return local_web_tools.stream_responses_response_task_with_pings(task)
-
-    downstream_stream_requested = bool(is_stream)
-    local_web_rounds = 0
-    local_web_limit_reported = False
 
     retry_count = 0
     # Shared across the whole request: changing candidates must not replenish
@@ -2050,16 +2027,11 @@ async def run_failover(
                     log_db.update_pending, request_id, proxy_name=_attempt_proxy,
                 ))
 
-            candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
-            candidate_openai_local_web_loop = openai_local_web_loop_active
-            effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
+            effective_is_stream = is_stream
             attempt_body = _attempt_body_for_channel(
                 body, ch.key, bound_channel_key, portable_body,
             )
             attempt_body["_codex_turn_serialization_required"] = True
-            if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
-                attempt_body = dict(attempt_body)
-                attempt_body["stream"] = False
             attempt_handed_off = True
             if use_responses_ws:
                 result = await _try_openai_oauth_responses_ws_channel(
@@ -2158,163 +2130,8 @@ async def run_failover(
                 _release_once()
 
         # No later await may retain a completed non-stream/error upstream slot.
-        if (result.success and (candidate_local_web_loop or candidate_openai_local_web_loop)) or (
-            not result.success and not result.stream_started
-        ):
+        if not result.stream_started:
             _release_once()
-
-        if result.success and candidate_local_web_loop:
-            assistant_msg = result.assistant_response if isinstance(result.assistant_response, dict) else None
-            assistant_msg = local_web_tools.normalize_assistant_message_for_local_tools(assistant_msg)
-            local_calls = local_web_tools.extract_local_tool_calls(
-                assistant_msg,
-                body.get("tools") or [],
-                conversation_body=body,
-            )
-            tool_use_total = local_web_tools.tool_use_count(assistant_msg)
-            if local_calls and len(local_calls) == tool_use_total:
-                # finish_success() has recorded this real upstream call and
-                # released the terminal handle. The tool loop proves another
-                # round is needed, so keep subsequent rows in the same month.
-                await asyncio.to_thread(
-                    log_db.retain_request_handle, request_id, attempt_id,
-                )
-                max_rounds = local_web_tools.max_tool_rounds()
-                if local_web_rounds >= max_rounds:
-                    if local_web_limit_reported:
-                        _release_once()
-                        msg = "local web tool loop kept requesting WebSearch/WebFetch after maxToolRounds"
-                        request_elapsed_ms = _elapsed_ms(start_monotonic)
-                        await asyncio.to_thread(
-                            log_db.finish_error, request_id, msg, retry_count,
-                            final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
-                            connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms,
-                            idle_ms=result.idle_ms, total_ms=result.total_ms,
-                            final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
-                            http_status=400, affinity_hit=affinity_hit,
-                            upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                            proxy_name=result.proxy_name,
-                            proxy_bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
-                            proxy_bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
-                            **_request_stage_kwargs(result),
-                        )
-                        return _json_error_for_ingress(ingress_protocol, 400, errors.ErrType.INVALID_REQUEST, msg)
-
-                    local_web_limit_reported = True
-                    removed = local_web_tools.remove_supported_tools_from_body(body)
-                    await asyncio.to_thread(
-                        log_db.update_retry_attempt,
-                        attempt_id,
-                        outcome="local_web_tool_limit",
-                        error_detail=(
-                            f"maxToolRounds={max_rounds}; appended synthetic tool_result(s) "
-                            f"for {len(local_calls)} call(s); removed_tools={removed}"
-                        ),
-                    )
-                    print(
-                        f"[local-web-tools] maxToolRounds reached for request {request_id}; "
-                        f"appending limit tool_result(s), removed_tools={removed}"
-                    )
-                    _release_once()
-                    tool_results = local_web_tools.round_limit_results(local_calls, max_rounds)
-                    local_web_tools.append_tool_results_to_body(body, assistant_msg or {}, tool_results)
-                    continue
-
-                local_web_rounds += 1
-                await asyncio.to_thread(
-                    log_db.update_retry_attempt,
-                    attempt_id,
-                    outcome="local_web_tool_round",
-                    error_detail=f"executed {len(local_calls)} local web tool call(s), round={local_web_rounds}",
-                )
-                print(
-                    f"[local-web-tools] executing {len(local_calls)} call(s) "
-                    f"for request {request_id} round={local_web_rounds}"
-                )
-                _release_once()
-                tool_results = await local_web_tools.execute_local_tool_calls(
-                    local_calls, request_id=request_id, round_no=local_web_rounds
-                )
-                local_web_tools.append_tool_results_to_body(body, assistant_msg or {}, tool_results)
-                continue
-
-        if result.success and candidate_openai_local_web_loop:
-            response_obj = None
-            try:
-                raw_body = getattr(result.response, "body", b"")
-                response_obj = json.loads(raw_body.decode("utf-8")) if raw_body else None
-            except Exception:
-                response_obj = None
-            assistant_msg = local_web_tools.openai_response_assistant_message(response_obj)
-            assistant_msg = local_web_tools.normalize_assistant_message_for_local_tools(assistant_msg)
-            local_calls = local_web_tools.extract_local_tool_calls(
-                assistant_msg,
-                body.get("tools") or [],
-                conversation_body=body,
-            )
-            tool_use_total = local_web_tools.tool_use_count(assistant_msg)
-            if local_calls and len(local_calls) == tool_use_total:
-                await asyncio.to_thread(
-                    log_db.retain_request_handle, request_id, attempt_id,
-                )
-                max_rounds = local_web_tools.max_tool_rounds()
-                if local_web_rounds >= max_rounds:
-                    if local_web_limit_reported:
-                        _release_once()
-                        msg = "local OpenAI web_search loop kept requesting web_search after maxToolRounds"
-                        request_elapsed_ms = _elapsed_ms(start_monotonic)
-                        await asyncio.to_thread(
-                            log_db.finish_error, request_id, msg, retry_count,
-                            final_channel_key=ch.key, final_channel_type=ch.type, final_model=resolved_model,
-                            connect_ms=result.connect_ms, first_token_ms=result.first_byte_ms,
-                            idle_ms=result.idle_ms, total_ms=result.total_ms,
-                            final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
-                            http_status=400, affinity_hit=affinity_hit,
-                            upstream_protocol=getattr(ch, "protocol", "anthropic"),
-                            proxy_name=result.proxy_name,
-                            proxy_bytes_up=int(getattr(result, "proxy_bytes_up", 0) or 0),
-                            proxy_bytes_down=int(getattr(result, "proxy_bytes_down", 0) or 0),
-                            **_request_stage_kwargs(result),
-                        )
-                        return _json_error_for_ingress(ingress_protocol, 400, errors.ErrType.INVALID_REQUEST, msg)
-
-                    local_web_limit_reported = True
-                    removed = local_web_tools.remove_openai_supported_tools_from_body(body)
-                    await asyncio.to_thread(
-                        log_db.update_retry_attempt,
-                        attempt_id,
-                        outcome="local_openai_web_tool_limit",
-                        error_detail=(
-                            f"maxToolRounds={max_rounds}; appended synthetic function_call_output(s) "
-                            f"for {len(local_calls)} call(s); removed_tools={removed}"
-                        ),
-                    )
-                    print(
-                        f"[local-web-tools] OpenAI maxToolRounds reached for request {request_id}; "
-                        f"appending limit function_call_output(s), removed_tools={removed}"
-                    )
-                    _release_once()
-                    tool_results = local_web_tools.round_limit_results(local_calls, max_rounds)
-                    local_web_tools.append_openai_tool_results_to_body(body, assistant_msg or {}, tool_results)
-                    continue
-
-                local_web_rounds += 1
-                await asyncio.to_thread(
-                    log_db.update_retry_attempt,
-                    attempt_id,
-                    outcome="local_openai_web_tool_round",
-                    error_detail=f"executed {len(local_calls)} local OpenAI web_search call(s), round={local_web_rounds}",
-                )
-                print(
-                    f"[local-web-tools] executing {len(local_calls)} OpenAI web_search call(s) "
-                    f"for request {request_id} round={local_web_rounds}"
-                )
-                _release_once()
-                tool_results = await local_web_tools.execute_local_tool_calls(
-                    local_calls, request_id=request_id, round_no=local_web_rounds
-                )
-                local_web_tools.append_openai_tool_results_to_body(body, assistant_msg or {}, tool_results)
-                continue
 
         if result.success or result.stream_started:
             # Non-stream success is also rebound at the orchestration boundary so
@@ -2328,11 +2145,10 @@ async def run_failover(
             # 成功已完成；或已发首包但出错（已用 SSE error 收尾）
             # 注意：scorer / cooldown / affinity / log_db 在 _try_channel 内完成
             # 并发 slot release 挂到响应体 finally：stream 消费完 / 客户端断开都会释放
-            if result.success and candidate_local_web_loop and downstream_stream_requested:
-                result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
-            if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
-                result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
             try:
+                if result.success and body.get(search_tool_policy.ROUND_KEY):
+                    result.response._parrot_search_candidate = (ch, resolved_model)
+                    result.response._parrot_search_attempt_handle = attempt_id
                 _attach_release_to_response(result.response, _release_once)
                 _transfer_pending_stream_result(result)
                 return result.response
@@ -2648,16 +2464,11 @@ async def run_failover(
                         )
 
                     await await_ws_owned(_record_queued_attempt())
-                    candidate_local_web_loop = local_web_loop_active and getattr(ch, "protocol", "anthropic") != "anthropic"
-                    candidate_openai_local_web_loop = openai_local_web_loop_active
-                    effective_is_stream = is_stream and not (candidate_local_web_loop or candidate_openai_local_web_loop)
+                    effective_is_stream = is_stream
                     attempt_body = _attempt_body_for_channel(
                         body, ch.key, bound_channel_key, portable_body,
                     )
                     attempt_body["_codex_turn_serialization_required"] = True
-                    if (candidate_local_web_loop or candidate_openai_local_web_loop) and attempt_body.get("stream"):
-                        attempt_body = dict(attempt_body)
-                        attempt_body["stream"] = False
                     attempt_handed_off2 = True
                     if use_responses_ws2:
                         result = await _try_openai_oauth_responses_ws_channel(
@@ -2753,15 +2564,9 @@ async def run_failover(
                         await _abort_pending_stream_result(pending_stream_result2)
                         _release_q()
 
-                if (result.success and (candidate_local_web_loop or candidate_openai_local_web_loop)) or (
-                    not result.success and not result.stream_started
-                ):
+                if not result.stream_started:
                     _release_q()
 
-                if result.success and candidate_local_web_loop and downstream_stream_requested:
-                    result.response = local_web_tools.maybe_wrap_anthropic_json_response_as_sse(result.response)
-                if result.success and candidate_openai_local_web_loop and downstream_stream_requested:
-                    result.response = local_web_tools.maybe_wrap_responses_json_response_as_sse(result.response)
                 if result.success or result.stream_started:
                     if result.success and not result.stream_started and fp_query:
                         affinity.upsert(
@@ -2769,6 +2574,9 @@ async def run_failover(
                             prompt_cache_key=_openai_prompt_cache_key_from_body(ingress_protocol, body),
                         )
                     try:
+                        if result.success and body.get(search_tool_policy.ROUND_KEY):
+                            result.response._parrot_search_candidate = (ch, resolved_model)
+                            result.response._parrot_search_attempt_handle = attempt_id
                         _attach_release_to_response(result.response, _release_q)
                         _transfer_pending_stream_result(result)
                         return result.response

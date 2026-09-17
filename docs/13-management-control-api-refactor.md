@@ -350,7 +350,7 @@ TG 冻结兼容优先：原版同步执行的留存清理及导入后 usage/quot
 
 ### 7.1 控制层用例
 
-`OAuthControl` 必须覆盖：账号 list/detail/order、exact identity 检查、各 provider 的登录/导入/手工 credential、显式覆盖、删除、enable/maxConcurrent、token refresh、usage refresh、quota reset、runtime error/cooldown/affinity 清理、模型同步、单个/批量模型禁用、Cursor max-context default、无效账号清理、quota monitor、默认模型和显示偏好。
+`OAuthControl` 必须覆盖：账号 list/detail/order、exact identity 检查、各 provider 的登录/导入/手工 credential、显式覆盖、删除、enable/maxConcurrent、token refresh、usage refresh、quota reset、runtime error/cooldown/affinity 清理、模型同步、单个/批量模型禁用、Cursor max-context default、无效账号清理、quota monitor 和显示偏好。OAuth 备用模型于 2026-09-16 完整退役，不属于现行控制层用例。
 
 控制层必须复用 `oauth_manager` 的权威接口（如 `find_exact_identity`、`add_account_if_identity_absent`、`replace_exact_identity`、`force_refresh`、`fetch_usage[_snapshot]`、`set_enabled`、`reset_quota`、`set_account_model_disabled`、`set_cursor_max_context_default`），不得由 Adapter 直接编辑 `oauthAccounts`。
 
@@ -399,8 +399,6 @@ OAuth 覆盖不得变成隐式 upsert。Control 的 replace plan/nonce 必须绑
 |---|---|---|
 | `GET/PATCH /oauth/settings` | `getOAuthSettings` / `updateOAuthSettings` | `quotaMonitor.enabled/intervalSeconds/thresholdPercent`、`cchMode=disabled|dynamic` |
 | `GET/PATCH /preferences/telegram/oauth` | `getTelegramOAuthPreferences` / `updateTelegramOAuthPreferences` | `usageDisplayMode=used|remaining`、`quotaProgressBar`；只在显式调用后影响 TG |
-| `GET/PUT /oauth/default-models/{family}` | `getOAuthDefaultModels` / `replaceOAuthDefaultModels` | family=`anthropic|antigravity|openai|xai`，模型列表及引用扫描；清理时保留现有 keep/clean 确认语义 |
-| `POST /oauth/default-models/{family}/actions/discover` | `discoverOAuthDefaultModels` | 复用 endpoint/catalog，返回 Operation |
 
 provider usage 仅允许已注册的 `providerId + providerPresetId` adapter；不得从任意 URL 动态调用。现有 13 个 preset 及 persistent retry-after/孤儿清理语义保持不变。
 
@@ -671,7 +669,45 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 
 路径、容量和 retention 使用现有 validator；API 不允许任意读取 cachePath 文件。缓存内容下载只经 media artifact 路由。
 
+2026-09-16 产品修订取消 AG 图片支持，以下五个管理 operation 退役，不再出现在 OpenAPI、`/meta`、`/capabilities` 或能力 crosswalk；既有账户、历史数据不因路由退役而删除：
+
+| 退役 method/path | operationId |
+|---|---|
+| `GET /antigravity/media-settings` | `getAntigravityMediaSettings` |
+| `PATCH /antigravity/media-settings` | `updateAntigravityMediaSettings` |
+| `POST /antigravity/media-models/image` | `addAntigravityMediaModel` |
+| `PATCH /antigravity/media-models/image/{modelId}` | `renameAntigravityMediaModel` |
+| `DELETE /antigravity/media-models/image/{modelId}` | `removeAntigravityMediaModel` |
+
+### 12.5 SearchControl（2026-09-16 新增）
+
+所有路径均位于 `/api/management/v1`，域 tag 为 `management-search`；使用既有 Management Session，不是推理搜索业务端点。
+
+| method/path | operationId | 基本能力 / 行为 |
+|---|---|---|
+| `GET /search` | `getSearchSettings` | `management.read`；脱敏有效配置与 revision |
+| `PATCH /search` | `updateSearchSettings` | `management.write`；普通 function/hosted 独立三态及默认参数 |
+| `POST /search/backends` | `createSearchBackend` | `management.write`；新增固定身份来源 |
+| `PATCH /search/backends/{backendId}` | `updateSearchBackend` | `management.write`；稀疏修改来源 |
+| `DELETE /search/backends/{backendId}` | `deleteSearchBackend` | `management.write`；必填 If-Match，成功 204，仅删除该来源配置 |
+| `GET /search/backends/{backendId}/accounts` | `getSearchBackendAccounts` | `management.read`；完整公共账户身份及人类标签，无 token |
+| `PUT /search/priority` | `updateSearchPriority` | `management.write`；完整 ID 顺序列表，不改变来源身份 |
+| `POST /search/test` | `testSearchBackend` | `management.write`；用户主动单来源测试，返回 202 Operation，不跨来源 failover |
+
+- 新增/修改来源携带 `apiKeys`、`addApiKeys` 或 `removeKeyIndices` 时，还必须有 `management.secrets.write`；密钥只写不回显。模型仅 OAuth 来源可设非空值。
+- 配置变更支持 If-Match；删除要求 If-Match；测试支持 Idempotency-Key。`allowDisabledAccounts` 默认 false，仅允许手动停用账户参与搜索，不改变普通对话状态或绕过认证/配额失效。
+- 生产发现从已挂载 OpenAPI 动态生成：search 的 8 个 action/method/path、七种 backend type 和三态 schema enum 可发现；“可发现”不代表来源探活成功。无需复制维护另一套生产发现清单。
+- 纳入图片/视频独立管理并退役 OAuth 备用模型后，操作总数为 **230 = 233 − 3**，独立路径数为 **169 = 171 − 2**；router 为 **23 = foundation + 22 个有序领域 router**。严格集合以 `production-operation-ids.txt` 为准；搜索的 method/path/基本能力/条件密钥能力映射见 `search-operation-manifest.tsv`。
+- 搜索菜单是系统设置新增子页，crosswalk 归属现有 `TG-SYS-01`（`SettingsControl+SearchControl`）。历史 53 个 TG capability ID 不伪造增加冻结轨迹；新增搜索交互由专有行为测试覆盖。`TG-IMG-01` 包括四项现有 ImageControl 操作及共享的媒体来源读取/用途开关；`TG-XIM-01` 增加独立视频设置读取/修改。
+- 此次批准的旧系统菜单 golden 变化仅为“🔎 搜索工具 / srch:show”一行，插在重试/返回主菜单行之前；仅更新五个相关 case 的当前覆盖层，保持冻结 v0.31.13 源轨迹、其他菜单正文、按钮、状态及副作用不变。
+
 ---
+
+### 12.6 图片/视频独立管理（2026-09-16）
+
+新增 `GET/PATCH /videos/settings`、`GET /media/{kind}/sources`、`PATCH /media/{kind}/sources/{sourceId}`，`kind` 为 `image` 或 `video`。读取需 READ；修改需 WRITE 和 `If-Match`，来源身份/代次变化拒绝旧版本写入。
+
+`PATCH /images/settings` 和视频设置均接受 `models`（provider → 模型名数组，按 provider 合并），分别写 `image_models` / `video_models`，立即生效；原 `mainModel/toolModel` 字段退役。TG 不再编辑模型名称。图片、视频缓存和账户用途授权分开保存；迁移继承旧共享缓存值，但首次图片修改先冻结视频原值，不移动或删除历史文件。
 
 ## 13. Telegram Adapter 迁移规则
 
@@ -735,7 +771,7 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 - **TG-OA-05 identity 覆盖**：`oa:overwrite:confirm:{nonce}|cancel`、state `oa_oauth_overwrite_confirm`、恒时比较、过期/错 chat/重复点击、pop 时机和 exact identity 结果。
 - **TG-OA-06 import/invalid**：OpenAI/cpa/sub2api preview、document/text、commit、overwrite confirm/cancel、sync wait/result；invalid list toggle/remove selected/all。
 - **TG-OA-07 Cursor models**：`oa:cursor_models/model/disable/...`、`oam:*` list/detail/toggle/bulk clear/invert/save/cancel/sync/maxctx；每页 6，状态排序和 metadata source。
-- **TG-ODM-01 defaults**：`odm:*` show/edit/discover/page/toggle/all/invert/manual/confirm/back/retry/commit；anthropic/antigravity/openai/xai；引用扫描后的 keep/clean 确认。
+- **TG-ODM-01 retired（2026-09-16）**：冻结历史轨迹保留，但不再代表现行能力。crosswalk 明确 `retired`、无 operation；旧 `odm:*` / `/oauth_defaults` 只读提示。`getOAuthDefaultModels`、`replaceOAuthDefaultModels`、`discoverOAuthDefaultModels` 及对应 GET/PUT `/oauth/default-models/{family}`、POST `/oauth/default-models/{family}/actions/discover` 全部移除（404），控制方法及写入代码同时删除。首次无目录不得回落到配置或协议静态名单，需明确提示同步上游；LKG、媒体与协议资料保留。
 - **TG-OA-SET-01**：quota monitor 开关/interval/threshold、CCH、usage mode、quota progress、跳转 image/default/xAI settings；所有 config 默认显示不变。
 - **TG-XIM-01**：`xim:show` 及 image/video/ttl/timeout 四个输入状态，clear aliases 和 duration 解析。
 
@@ -855,7 +891,7 @@ Parity 比较的是共享业务结果；不得要求 Management API 返回 Teleg
 | 包 | 独占范围 | 交付/门禁 | 明确不做 |
 |---|---|---|---|
 | **P0 合同与组合根** | `management_auth/*`、control context/errors/operations、API common/deps/error/schema base、`server.py`、router 聚合、依赖检查 | session 两 grant、OpenAPI/error/operation、组合根测试；给领域提供稳定接口 | 领域 endpoint/菜单迁移 |
-| **P1 OAuth** | control/API OAuth、oauth schemas/tests；`oauth_menu.py`、`oauth_account_models_menu.py`、`oauth_defaults_menu.py` | 第 7 节、TG-OA/ODM；identity/usage/model parity | channel/API key/通用 auth；不改 `xai_imagine_menu.py` |
+| **P1 OAuth** | control/API OAuth、oauth schemas/tests；`oauth_menu.py`、`oauth_account_models_menu.py`（`oauth_defaults_menu.py` 已退役删除） | 第 7 节、TG-OA/ODM；identity/usage/model parity | channel/API key/通用 auth；不改 `xai_imagine_menu.py` |
 | **P2 Channels** | control/API channels；`channel_menu.py`、`channel_wizard.py` | 第 8.1 节、TG-CH；两种 probe 副作用和删除级联 | LB/mapping/proxy |
 | **P3 API Keys** | control/API API keys；`apikey_menu.py` | 第 8.2 节、TG-AK；secret one-shot、limiter parity | management auth |
 | **P4 Observability** | overview/status/stats/logs/media/retention control/API；`status_menu.py`、`stats_menu.py`、`logs_menu.py`、`media_logs_menu.py`、`menu_cache.py`、`log_inspector.py` 的最小下沉 | 第 6、9 节、TG-CACHE/STATS/LOG/MEDIA；交付 retention control/API 但不改 `system_menu.py` | 通用 DB 重构；`system_menu.py` 由 P6 独占 |

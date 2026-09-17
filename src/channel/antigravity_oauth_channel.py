@@ -71,7 +71,7 @@ class AntigravityOAuthChannel(Channel):
     protocol = "openai-responses"
     upstream_stream_only = False
 
-    def __init__(self, account: dict, default_models: list[str] | None = None):
+    def __init__(self, account: dict):
         self.email = account["email"]
         self.project_id = str(account.get("project_id") or account.get("projectId") or "").strip()
         if not self.project_id:
@@ -104,25 +104,15 @@ class AntigravityOAuthChannel(Channel):
             or ag_provider.request_api_base_url()
         ).rstrip("/")
 
-        models = account.get("models") or []
-        if models:
-            selected_models = list(models)
-        elif default_models:
-            selected_models = list(default_models)
-        else:
-            selected_models = list(cfg.get("defaultModels") or ag_provider.default_models())
+        selected_models = list(account.get("models") or [])
         disabled_models = {
             str(model).strip() for model in account.get("disabledModels") or []
             if str(model).strip()
         }
-        self.models = [model for model in selected_models if model not in disabled_models]
-
-        image_models = (
-            account.get("imageModels")
-            if "imageModels" in account
-            else cfg.get("imageModels")
-        )
-        self.image_models = [str(m) for m in (image_models or []) if str(m).strip()]
+        from ..image_catalog import is_image_name
+        self.models = [model for model in selected_models if model not in disabled_models and not is_image_name(model)]
+        # AG image support is retired; stored image settings/history are untouched.
+        self.image_models = []
 
     def supports_model(self, requested_model: str) -> Optional[str]:
         if requested_model in self.models:
@@ -133,9 +123,7 @@ class AntigravityOAuthChannel(Channel):
         return list(self.models)
 
     def supports_media_model(self, kind: str, requested_model: str) -> bool:
-        if kind != "image":
-            return False
-        return requested_model in self.image_models
+        return False
 
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,

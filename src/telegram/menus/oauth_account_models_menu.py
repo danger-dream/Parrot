@@ -152,9 +152,9 @@ def _source_label(selection: dict) -> str:
         return "账户上游模型"
     if source == "lkg:legacy-config":
         return "账户模型（旧配置）"
-    if source == "default:built-in":
-        return "程序内置默认模型"
-    return "默认模型"
+    if not selection.get("models"):
+        return "尚无账户目录"
+    return "账户模型"
 
 
 def _pagination(
@@ -216,11 +216,8 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
     ]
     provider = oauth_control.provider_of_snapshot(account)
     error = str(selection.get("error") or "").strip()
-    if selection["fallback"]:
-        if provider == "cursor":
-            lines.extend(["", "⚠️ <b>没有可用账户目录，后台会重试。</b>"])
-        else:
-            lines.extend(["", "⚠️ <b>上游同步失败/尚无账户目录，正在使用默认模型。</b>"])
+    if not selection.get("models"):
+        lines.extend(["", "⚠️ <b>尚无账户目录，当前无可路由模型。请点击「同步上游」。</b>"])
         if error:
             lines.append(f"最近错误: <code>{ui.escape_html(error[:300])}</code>")
     elif error:
@@ -268,8 +265,7 @@ def render(account_key: str, *, model_page: int = 1, account_page: int = 1,
         )
         rows.append([ui.btn("🚫 批量禁用", bulk_callback)])
     rows.extend([
-        [ui.btn("🔄 同步上游", f"oam:sync:{short}:{model_page}:{account_page}:{filter_key}"),
-         ui.btn("🧬 默认模型", "odm:show")],
+        [ui.btn("🔄 同步上游", f"oam:sync:{short}:{model_page}:{account_page}:{filter_key}")],
         [ui.btn("◀ 返回账户", f"oa:view:{short}:{account_page}:{filter_key}")],
     ])
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)

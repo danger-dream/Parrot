@@ -42,33 +42,8 @@ class Parsed(SimpleNamespace):
         super().__init__(**defaults)
 
 
-def test_antigravity_images_parameter_matrix_and_envelope():
-    req = images._build_request(Parsed(requested_n=2, size="1536x1024",
-                                       native_options={"quality": "hd"}))
-    cfg = req["generationConfig"]
-    assert cfg == {"responseModalities": ["IMAGE"], "candidateCount": 2,
-                   "imageConfig": {"aspectRatio": "3:2", "imageSize": "2K"}}
-    for field in ("style", "background"):
-        with pytest.raises(ValueError, match="unsupported parameter"):
-            images._build_request(Parsed(native_options={field: "x"}))
-    for fmt in ("png", "webp"):
-        with pytest.raises(ValueError, match="output_format"):
-            images._build_request(Parsed(native_options={"output_format": fmt}))
-    with pytest.raises(ValueError, match="n must"):
-        images._build_request(Parsed(requested_n=5))
 
 
-def test_antigravity_images_decode_base64_url_usage_and_missing():
-    wrapped = {"response": {"candidates": [{"content": {"parts": [
-        {"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}}
-    ]}}], "usageMetadata": {"promptTokenCount": 3}}}
-    b64 = images._decode(wrapped, model="m", response_format="b64_json")
-    assert b64["data"] == [{"b64_json": "aGVsbG8="}]
-    assert b64["usage"]["promptTokenCount"] == 3
-    url = images._decode(wrapped, model="m", response_format="url")
-    assert url["data"][0]["url"] == "data:image/png;base64,aGVsbG8="
-    with pytest.raises(ValueError, match="no decodable image"):
-        images._decode({"response": {"candidates": []}}, model="m", response_format="b64_json")
 
 
 def _sse(event, data):
@@ -255,82 +230,8 @@ def _images_app():
     return app
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("response_format,field", [("b64_json", "b64_json"), ("url", "url")])
-async def test_images_real_route_antigravity_wire_and_slot(monkeypatch, response_format, field):
-    model = "gemini-3.1-flash-image"
-    ch = AntigravityOAuthChannel({"email": "fake@example.com", "project_id": "p", "imageModels": [model]})
-    monkeypatch.setattr(images.registry, "all_channels", lambda: [ch])
-    monkeypatch.setattr(images.cooldown, "is_blocked", lambda *a: False)
-    monkeypatch.setattr(images.cooldown, "clear_on_success", lambda *a: None)
-    acquired, released, capture = [], [], {}
-    async def acquire(key): acquired.append(key); return True
-    monkeypatch.setattr(images.concurrency, "try_acquire", acquire)
-    monkeypatch.setattr(images.concurrency, "release", lambda key: released.append(key))
-    import src.oauth_manager as om
-    async def token(key): return "token"
-    monkeypatch.setattr(om, "ensure_valid_token", token)
-    monkeypatch.setattr(images.network, "async_client", lambda **kw: ImageNetworkClient(ImageUpstreamResponse(), capture))
-    cfg = config.get()
-    monkeypatch.setitem(
-        cfg, "apiKeys",
-        {"test": {"key": "token", "allowImages": True, "allowedModels": []}},
-    )
-    monkeypatch.setitem(cfg.setdefault("images", {}), "enabled", True)
-    transport = httpx.ASGITransport(app=_images_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/v1/images/generations", headers={"Authorization": "Bearer token"}, json={
-            "prompt": "blue square", "model": model, "n": 2, "size": "1536x1024",
-            "quality": "hd", "response_format": response_format,
-        })
-    assert response.status_code == 200, response.text
-    assert field in response.json()["data"][0]
-    assert capture["wire"]["model"] == model
-    generation = capture["wire"]["request"]["generationConfig"]
-    assert generation == {"responseModalities": ["IMAGE"], "candidateCount": 2,
-                          "imageConfig": {"aspectRatio": "3:2", "imageSize": "2K"}}
-    assert acquired == released and len(acquired) == 1
 
 
-@pytest.mark.asyncio
-async def test_images_real_route_unsupported_cooldown_error_and_slot_release(monkeypatch):
-    model = "gemini-3.1-flash-image"
-    ch = AntigravityOAuthChannel({"email": "fake2@example.com", "project_id": "p", "imageModels": [model]})
-    monkeypatch.setattr(images.registry, "all_channels", lambda: [ch])
-    cfg = config.get()
-    monkeypatch.setitem(
-        cfg, "apiKeys",
-        {"test": {"key": "token", "allowImages": True, "allowedModels": []}},
-    )
-    monkeypatch.setitem(cfg.setdefault("images", {}), "enabled", True)
-    transport = httpx.ASGITransport(app=_images_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        bad = await client.post("/v1/images/generations", headers={"Authorization": "Bearer token"},
-                                json={"prompt": "x", "model": model, "style": "vivid"})
-        assert bad.status_code == 400
-        ch.disabled_reason = "quota"
-        disabled = await client.post("/v1/images/generations", headers={"Authorization": "Bearer token"},
-                                     json={"prompt": "x", "model": model})
-        assert disabled.status_code == 503
-        ch.disabled_reason = None
-        monkeypatch.setattr(images.cooldown, "is_blocked", lambda *a: True)
-        blocked = await client.post("/v1/images/generations", headers={"Authorization": "Bearer token"},
-                                    json={"prompt": "x", "model": model})
-        assert blocked.status_code == 503
-        monkeypatch.setattr(images.cooldown, "is_blocked", lambda *a: False)
-        monkeypatch.setattr(images.cooldown, "record_error", lambda *a, **kw: None)
-        async def acquire(key): return True
-        released = []
-        monkeypatch.setattr(images.concurrency, "try_acquire", acquire)
-        monkeypatch.setattr(images.concurrency, "release", lambda key: released.append(key))
-        import src.oauth_manager as om
-        async def token(key): return "token"
-        monkeypatch.setattr(om, "ensure_valid_token", token)
-        monkeypatch.setattr(images.network, "async_client", lambda **kw: ImageNetworkClient(ImageUpstreamResponse(429, {"error": "limited"}), {}))
-        failed = await client.post("/v1/images/generations", headers={"Authorization": "Bearer token"},
-                                   json={"prompt": "x", "model": model})
-        assert failed.status_code == 429
-        assert len(released) == 1
 
 
 def _patch_failover_runtime(monkeypatch, failover, *, cfg=None):
@@ -403,90 +304,6 @@ async def test_run_failover_antigravity_medium_cooldown_and_quota_disable(m, mon
     assert response.status_code == 200 and disabled == [("acct", None)]
 
 
-@pytest.mark.asyncio
-async def test_images_route_uses_google_429_short_retry_and_quota_disable(monkeypatch):
-    model = "gemini-3.1-flash-image"
-    ch = AntigravityOAuthChannel({
-        "email": "image-429@example.com", "project_id": "p", "imageModels": [model],
-    })
-    monkeypatch.setattr(images.registry, "all_channels", lambda: [ch])
-    monkeypatch.setattr(images.cooldown, "is_blocked", lambda *a: False)
-    monkeypatch.setattr(images.cooldown, "clear_on_success", lambda *a: None)
-    recorded_errors, sleeps, disabled = [], [], []
-    monkeypatch.setattr(
-        images.cooldown, "record_error",
-        lambda *a, **kw: recorded_errors.append((a, kw)),
-    )
-    async def acquire(_key): return True
-    monkeypatch.setattr(images.concurrency, "try_acquire", acquire)
-    monkeypatch.setattr(images.concurrency, "release", lambda _key: None)
-    monkeypatch.setattr(images.asyncio, "sleep", lambda delay: _record_sleep(sleeps, delay))
-
-    import src.oauth_manager as om
-    async def token(_key): return "token"
-    monkeypatch.setattr(om, "ensure_valid_token", token)
-    monkeypatch.setattr(
-        om, "set_disabled_by_quota",
-        lambda account, reset: disabled.append((account, reset)),
-    )
-
-    cfg = config.get()
-    monkeypatch.setitem(
-        cfg, "apiKeys",
-        {"test": {"key": "token", "allowImages": True, "allowedModels": []}},
-    )
-    monkeypatch.setitem(cfg.setdefault("images", {}), "enabled", True)
-    monkeypatch.setitem(cfg, "retry", {
-        "transient": {
-            "enabled": True,
-            "maxExtraAttempts": 2,
-            "errors": {"antigravityRateLimit": True},
-        },
-    })
-
-    responses = [
-        ImageUpstreamResponse(429, json.loads(_google("1.5s"))),
-        ImageUpstreamResponse(),
-    ]
-    monkeypatch.setattr(
-        images.network, "async_client",
-        lambda **kw: ImageNetworkClient(responses.pop(0), {}),
-    )
-    transport = httpx.ASGITransport(app=_images_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/v1/images/generations",
-            headers={"Authorization": "Bearer token"},
-            json={"prompt": "x", "model": model},
-        )
-        assert response.status_code == 200
-        assert sleeps == [1.5]
-        assert not recorded_errors and not disabled
-
-        monkeypatch.setattr(images.time, "time", lambda: 1000.0)
-        responses[:] = [ImageUpstreamResponse(
-            429, json.loads(_google("30s", "RATE_LIMIT_EXCEEDED")),
-        )]
-        response = await client.post(
-            "/v1/images/generations",
-            headers={"Authorization": "Bearer token"},
-            json={"prompt": "x", "model": model},
-        )
-        assert response.status_code == 429
-        assert recorded_errors[-1][1]["cooldown_until"] == 1_030_000
-        recorded_errors.clear()
-
-        responses[:] = [ImageUpstreamResponse(
-            429, json.loads(_google("300s", "QUOTA_EXHAUSTED")),
-        )]
-        response = await client.post(
-            "/v1/images/generations",
-            headers={"Authorization": "Bearer token"},
-            json={"prompt": "x", "model": model},
-        )
-    assert response.status_code == 429
-    assert disabled == [(ch.account_key, None)]
-    assert not recorded_errors
 
 
 async def _record_sleep(sleeps, delay):
@@ -503,3 +320,19 @@ def test_antigravity_short_429_is_provider_bounded_transient():
     long = AttemptResult(outcome="http_error", http_status=429,
                          error_detail=_google("3s"), full_response_text=_google("3s"))
     assert retryable_transient_error_kind(ag, long) is None
+
+@pytest.mark.asyncio
+async def test_ag_image_route_is_retired_without_touching_accounts(monkeypatch):
+    from src import auth
+    monkeypatch.setattr(auth, "validate", lambda headers: ("test", [], None))
+    monkeypatch.setattr(auth, "images_allowed", lambda key: True)
+    model = "gemini-3.1-flash-image"
+    account = {"provider": "antigravity", "email": "fixture@example.test", "project_id": "p", "models": ["gemini-chat", model], "imageModels": [model]}
+    ch = AntigravityOAuthChannel(account)
+    assert not ch.supports_media_model("image", model)
+    assert ch.supports_model(model) is None
+    assert ch.supports_model("gemini-chat") == "gemini-chat"
+    assert account["imageModels"] == [model]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_images_app()), base_url="http://test") as client:
+        response = await client.post("/v1/images/generations", json={"model": model, "prompt": "not dispatched"})
+    assert response.status_code == 400

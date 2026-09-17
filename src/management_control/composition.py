@@ -110,6 +110,7 @@ def build_management_controls(
         oauth=oauth,
         channels=channels,
         images=auxiliary.images,
+        videos=auxiliary.videos,
         xai_media=auxiliary.xai_media,
         antigravity_media=auxiliary.antigravity_media,
         operations=operations,

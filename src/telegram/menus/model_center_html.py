@@ -10,6 +10,7 @@ import re
 
 from .. import ui
 from . import model_center_menu as menu
+from .model_center_icons import decorate_keyboard
 
 _LIMIT = 3900
 _TOKEN = re.compile(r'<tg-emoji\b[^>]*>.*?</tg-emoji>|<[^>]+>|&(?:#[0-9]+|#x[0-9a-fA-F]+|[a-zA-Z]+);|.', re.S)
@@ -62,6 +63,7 @@ def page_render(
     *, draft_id: str | None = None,
 ) -> tuple[str, dict]:
     page = min(max(0, int(page)), len(pages) - 1)
+    keyboard = decorate_keyboard(keyboard)
     if len(pages) == 1:
         return pages[0], keyboard
     def callback(index):

@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Iterator
 
 from src import config as config_module
-from src import media_cache
+from src import media_cache, media_config
 from src import media_db as media_db_module
 from src.management_control.context import ManagementContext
 from src.management_control.errors import ManagementError, ManagementErrorCode
@@ -95,7 +95,7 @@ class MediaControl:
         if not existing_only:
             return paths
         root = self.config.get()
-        images = root.get("images") if isinstance(root, dict) else None
+        images = media_config.settings("video" if row.get("media_type") == "video" else "image", root) if isinstance(root, dict) and ("images" in root or "videos" in root) else None
         # Test/legacy adapters without cache settings retain metadata-only behavior;
         # production config always has images settings and enforces containment.
         if (
@@ -114,6 +114,12 @@ class MediaControl:
     @staticmethod
     def _record(row: dict[str, Any]) -> dict[str, Any]:
         clean = sanitize_credentials(dict(row))
+        try:
+            output_sizes = json.loads(clean.get('output_sizes') or 'null')
+        except (TypeError, ValueError):
+            output_sizes = None
+        if not isinstance(output_sizes, list) or not all(isinstance(item, str) for item in output_sizes):
+            output_sizes = None
         result = {
             "id": str(clean.get("id") or ""),
             "requestId": str(clean.get("request_id") or ""),
@@ -128,7 +134,9 @@ class MediaControl:
             "durationSeconds": clean.get("media_duration_seconds"),
             "durationMilliseconds": clean.get("duration_ms"),
             "costTicks": int(clean.get("cost_usd_ticks") or 0),
-            "trafficBytes": int(clean.get("image_bytes") or 0),
+            "trafficBytes": int(clean['image_bytes']) if clean.get('image_bytes') and int(clean['image_bytes']) > 0 else None,
+            "generatedCount": int(clean['image_count']) if clean.get('image_count') and int(clean['image_count']) > 0 else None,
+            "outputSizes": output_sizes,
             "cacheStatus": str(clean.get("cache_status") or "") or None,
             "cacheErrorClass": str(clean.get("cache_error_class") or "") or None,
             "createdAt": utc_datetime(clean.get("created_at")),

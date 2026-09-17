@@ -338,6 +338,9 @@ def _convert_messages(
         if role not in ("user", "assistant"):
             _fail(f"unsupported Chat message role for Anthropic bridge: {role!r}", param="messages")
 
+        if role == "assistant" and isinstance(msg.get("_parrot_hosted_search_blocks"), list):
+            append_turn("assistant", msg["_parrot_hosted_search_blocks"])
+            continue
         content = _content_to_anthropic_blocks(
             msg.get("content"),
             role=role,

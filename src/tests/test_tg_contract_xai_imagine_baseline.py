@@ -62,6 +62,9 @@ def _snapshot(chat_id: int) -> dict[str, Any] | None:
 
 
 def _run(case: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    from src.telegram.menus import model_center_menu
+    monkeypatch.setattr(model_center_menu, '_image_settings_render', lambda *args: ('图片面板', ui.inline_kb([[ui.btn('返回', 'menu:main')]])))
+    monkeypatch.setattr(model_center_menu, '_video_settings_render', lambda *args: ('视频面板', ui.inline_kb([[ui.btn('返回', 'menu:main')]])))
     store = deepcopy(case["initialConfig"])
     updates: list[str] = []
     capture: list[dict[str, Any]] = []
@@ -123,8 +126,17 @@ def _cleanup():
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["caseId"])
-def test_xim_strict_trace(case, monkeypatch):
-    assert_strict_equal(case, _run(case, monkeypatch))
+def test_xim_retired_callbacks_and_inputs_never_write(case, monkeypatch):
+    actual = _run(case, monkeypatch)
+    assert actual['expectedException'] is None
+    assert actual['finalBusinessState']['config'] == case['initialConfig']
+    assert actual['finalBusinessState']['updateAttempts'] == 0
+    entry = case['entry']
+    if entry['op'] == 'text' and entry['action'] != 'xim_unknown':
+        assert actual['stateSteps'][-1]['state'] is None
+        assert '已过期' in str(actual['tgApi'])
+    elif entry.get('data') != 'xim:missing' and entry.get('action') != 'xim_unknown':
+        assert '面板' in str(actual['tgApi'])
 
 
 def test_auxiliary_segment_has_exact_five_ids_unique_cases_and_no_mauth():

@@ -1249,6 +1249,17 @@ def inventory_items() -> list[ModelInventoryItem]:
                 client_visible_model=model,
                 outbound_model=outbound,
             ))
+    # Image source detail uses the same metadata editor/sync entry points as
+    # chat detail, but image-only OAuth membership is not in chat model lists.
+    from . import image_catalog
+    represented = {(item.scope_key, item.client_visible_model) for item in result}
+    for source in image_catalog.sources():
+        if (source.key, source.model) not in represented:
+            result.append(ModelInventoryItem(
+                scope_key=source.key, scope_type='oauth' if source.key.startswith('oauth:') else 'api',
+                scope_label=source.label, client_visible_model=source.model, outbound_model=source.upstream,
+            ))
+            represented.add((source.key, source.model))
     return sorted(result, key=lambda item: (item.scope_key, item.client_visible_model))
 
 

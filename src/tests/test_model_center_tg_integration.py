@@ -8,6 +8,7 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import server
+import copy
 
 from src import config, state_db
 from src.channel import registry
@@ -37,7 +38,8 @@ def _buttons(keyboard):
 
 
 def _button(keyboard, text):
-    return next(button for button in _buttons(keyboard) if button["text"] == text)
+    from src.telegram.menus.model_center_icons import label_with_icon
+    return next(button for button in _buttons(keyboard) if button["text"] in {text, label_with_icon(text)})
 
 
 def _catalog() -> None:
@@ -538,7 +540,7 @@ def test_tg_api_state_visibility_alias_share_real_controls_and_survive_rebuild(
     assert "只有可用来源才会贡献模型" in detail_text
 
     # Seed one alias over the API, perform one atomic Telegram rename through
-    # its input state/save callback, then observe it over the API.
+    # its input state (immediately effective), then observe it over the API.
     mappings = client.get("/api/management/v1/model-mappings", headers=admin).json()
     created = client.put(
         "/api/management/v1/model-mappings/quick-tg",
@@ -548,17 +550,22 @@ def test_tg_api_state_visibility_alias_share_real_controls_and_survive_rebuild(
     assert created.status_code == 200, created.text
     session = menu._session(42)
     session.tab = "alias"
-    session.alias_query = "quick-tg"
     alias_text, alias_kb = menu.render(42)
     assert "quick-tg" in alias_text
-    menu.handle_callback(42, 100, "alias-open", _button(alias_kb, "1")["callback_data"])
+    alias_callback = next(
+        b["callback_data"] for b in _buttons(alias_kb)
+        if b["callback_data"].startswith("mc:a:")
+        and (a := menu._thaw(42, b["callback_data"].split(":", 2)[2]))
+        and a.name == "alias_open" and a.data["alias"] == "quick-tg"
+    )
+    menu.handle_callback(42, 100, "alias-open", alias_callback)
     menu.handle_callback(
         42, 100, "alias-name",
         _button(edits[-1][1], "编辑别名名称")["callback_data"],
     )
     assert states.get_state(42)["action"] == "mc_alias_name"
     assert menu.handle_text_state(42, "mc_alias_name", "fast-tg") is True
-    menu.handle_callback(42, 100, "alias-save", _button(sends[-1][1], "保存")["callback_data"])
+    assert all("保存" not in button["text"] for button in _buttons(sends[-1][1]))
     mappings = client.get(
         "/api/management/v1/model-mappings?query=fast-tg", headers=admin,
     ).json()
@@ -575,14 +582,12 @@ def test_tg_api_state_visibility_alias_share_real_controls_and_survive_rebuild(
         json={"alias": "final-api", "realModel": "model-one"},
     )
     assert renamed.status_code == 200, renamed.text
-    session.alias_query = "final-api"
     alias_text, _alias_kb = menu.render(42)
     assert "final-api" in alias_text and "model-one" in alias_text
 
     # Telegram changes one sparse common metadata field through the actual
     # editor/input pipeline; API sees the effective and override values.
     session.tab = "chat"
-    session.alias_query = ""
     detail_text, detail_kb = menu._detail_render(42, resource_key)
     assert "容量、能力与价格" in detail_text
     menu.handle_callback(
@@ -719,51 +724,28 @@ def test_tg_api_media_share_real_controls_survive_rebuild_and_use_production_bin
     menu.reset_for_tests()
     states.clear_all()
 
-    # TG single-item add appends through the real xAI control. It must not act
-    # like bulk replacement; the API immediately sees both original rows too.
-    _text, keyboard = menu._media_manager_render(42, "xai", "image", 1)
-    menu.handle_callback(
-        42, 100, "tg-add", _button(keyboard, "添加模型")["callback_data"],
-    )
-    assert states.get_state(42)["action"] == "mc_media_edit"
-    assert menu.handle_text_state(42, "mc_media_edit", "tg-added") is True
-    xai = client.get("/api/management/v1/xai/media-settings", headers=admin)
-    assert xai.status_code == 200, xai.text
-    assert xai.json()["data"]["imageModels"] == [
-        "grok-initial-a", "grok-initial-b", "tg-added",
-    ]
-
-    # API single-item add is read directly by the next TG render.
-    xai_data = xai.json()["data"]
-    api_added = client.post(
-        "/api/management/v1/xai/media-models/image",
-        headers={**admin, "If-Match": xai_data["revision"]},
-        json={"modelId": "api-added"},
-    )
+    # Telegram no longer edits model names. Old add/edit actions only redirect;
+    # model updates go through the real hot Management API and appear immediately.
+    _text, keyboard = menu._media_manager_render(42, 'xai', 'image', 1)
+    assert not any('添加模型' in b['text'] or '批量编辑' in b['text'] for row in keyboard['inline_keyboard'] for b in row)
+    old = menu._freeze(42, 'media_input', mode='add', provider='xai', kind='image')
+    before = copy.deepcopy(config.get())
+    menu.handle_callback(42, 100, 'old-add', old)
+    assert states.get_state(42) is None and config.get() == before
+    xai = client.get('/api/management/v1/xai/media-settings', headers=admin)
+    xai_data = xai.json()['data']
+    api_added = client.post('/api/management/v1/xai/media-models/image',
+        headers={**admin, 'If-Match': xai_data['revision']}, json={'modelId': 'api-added'})
     assert api_added.status_code == 200, api_added.text
-    assert api_added.json()["data"] == {
-        "provider": "xai",
-        "kind": "image",
-        "owner": {"type": "global", "id": None},
-        "modelId": "api-added",
-        "models": ["grok-initial-a", "grok-initial-b", "tg-added", "api-added"],
-        "status": "added",
-        "revision": api_added.json()["data"]["revision"],
-    }
-    rendered, keyboard = menu._media_manager_render(42, "xai", "image", 1)
-    assert "tg-added" in rendered and "api-added" in rendered
-
-    # TG bulk editing is a separate whole-list operation and therefore replaces
-    # the list exactly; it never masquerades as a sequence of item mutations.
-    menu.handle_callback(
-        42, 100, "tg-bulk", _button(keyboard, "批量编辑")["callback_data"],
-    )
-    assert states.get_state(42)["action"] == "mc_media_edit"
-    assert menu.handle_text_state(42, "mc_media_edit", "bulk-one\nbulk-two") is True
-    xai = client.get("/api/management/v1/xai/media-settings", headers=admin)
-    assert xai.status_code == 200, xai.text
-    assert xai.json()["data"]["imageModels"] == ["bulk-one", "bulk-two"]
-
+    assert api_added.json()['data']['models'] == ['grok-initial-a', 'grok-initial-b', 'api-added']
+    rendered, _keyboard = menu._media_manager_render(42, 'xai', 'image', 1)
+    assert 'api-added' in rendered and 'grok-initial-a' in rendered
+    bulk = client.patch('/api/management/v1/images/settings', headers={**admin,
+        'If-Match': client.get('/api/management/v1/images/settings', headers=admin).json()['data']['revision']},
+        json={'models': {'xai': ['bulk-one', 'bulk-two']}})
+    assert bulk.status_code == 200, bulk.text
+    assert config.get()['image_models']['xai'] == ['bulk-one', 'bulk-two']
+    xai = client.get('/api/management/v1/xai/media-settings', headers=admin)
     # API changes a scalar media setting; Telegram reads the same control graph,
     # not an HTTP self-call or stale adapter state.
     xai_data = xai.json()["data"]
@@ -774,48 +756,11 @@ def test_tg_api_media_share_real_controls_survive_rebuild_and_use_production_bin
     )
     assert duration.status_code == 200, duration.text
     video_text, _video_keyboard = menu._video_settings_render(42)
-    assert "任务与账号关联时长：<code>7200s</code>" in video_text
+    assert "任务 TTL：7200 秒" in video_text
 
-    # Confirm the delivered AG correction with the actual API/control graph:
-    # 80 items and an 80-character model are accepted, while item 81 is rejected
-    # without disturbing account-owned read-only rows.
-    ag = client.get("/api/management/v1/antigravity/media-settings", headers=admin)
-    assert ag.status_code == 200, ag.text
-    account_id = ag.json()["data"]["accountOverrides"][0]["accountId"]
-    ag_models = [f"ag-{index}" for index in range(79)] + ["m" * 80]
-    ag_updated = client.patch(
-        "/api/management/v1/antigravity/media-settings",
-        headers={**admin, "If-Match": ag.json()["data"]["revision"]},
-        json={"imageModels": ag_models},
-    )
-    assert ag_updated.status_code == 200, ag_updated.text
-    assert ag_updated.json()["data"]["imageModels"] == ag_models
-    overflow = client.post(
-        "/api/management/v1/antigravity/media-models/image",
-        headers={**admin, "If-Match": ag_updated.json()["data"]["revision"]},
-        json={"modelId": "item-81", "owner": {"type": "global"}},
-    )
-    assert overflow.status_code == 422, overflow.text
-    assert overflow.json()["error"]["fields"][0]["code"] == "TOO_MANY_MODELS"
-    readonly = client.patch(
-        "/api/management/v1/antigravity/media-models/image/account-only",
-        headers={**admin, "If-Match": ag_updated.json()["data"]["revision"]},
-        json={
-            "newModelId": "must-not-write",
-            "owner": {"type": "oauth", "id": account_id},
-        },
-    )
-    assert readonly.status_code == 422, readonly.text
-    assert readonly.json()["error"]["fields"][0]["code"] == "READ_ONLY_SCOPE"
-    ag_after = client.get(
-        "/api/management/v1/antigravity/media-settings", headers=admin,
-    ).json()["data"]
-    assert ag_after["imageModels"] == ag_models
-    assert ag_after["accountOverrides"][0]["imageModels"] == ["account-only"]
-    ag_text, ag_keyboard = menu._media_manager_render(42, "antigravity", "image", 1)
-    assert "Antigravity 图片模型 · 80 个" in ag_text
-    assert "账户专属（只读）" in ag_text and "account-only" in ag_text
-    assert all(button["text"] != "account-only" for button in _buttons(ag_keyboard))
+    # AG generation entry points are retired, without touching saved account data.
+    assert client.get("/api/management/v1/antigravity/media-settings", headers=admin).status_code == 404
+    assert client.patch("/api/management/v1/antigravity/media-settings", headers=admin, json={"imageModels": []}).status_code == 404
 
     # Rebuild a second complete graph over the isolated persisted configuration.
     # All final media values must be visible without reusing the first controls.
@@ -836,8 +781,8 @@ def test_tg_api_media_share_real_controls_survive_rebuild_and_use_production_bin
         assert rebuilt_xai.image_models == ("bulk-one", "bulk-two")
         assert rebuilt_xai.job_ttl_seconds == 7_200
         rebuilt_ag = rebuilt.models.antigravity_media.get_settings(context)
-        assert rebuilt_ag.image_models == tuple(ag_models)
-        assert rebuilt_ag.account_overrides[0][1] == ("account-only",)
+        assert rebuilt_ag.image_models == ()
+        assert rebuilt_ag.account_overrides == ()
     finally:
         rebuilt_operations.close()
         menu.reset_for_tests()

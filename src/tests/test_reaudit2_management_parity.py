@@ -459,9 +459,12 @@ def test_p05_openapi_keeps_counts_ids_and_uses_the_seven_camelcase_templates():
         "/api/management/v1/proxy-groups/{groupId}/actions/test": {"testProxyGroup"},
     }
 
-    assert len(management_paths) == 165
-    assert len(operations) == 226
-    assert len(set(operation_ids)) == 226
+    # Search contributes six paths/eight operations; retired AG media removes
+    # three paths/five operations; independent media adds three paths/four operations.
+    # All seven pre-existing templates below stay exact.
+    assert len(management_paths) == 171
+    assert len(operations) == 233
+    assert len(set(operation_ids)) == 233
     assert set(operation_ids) == expected_ids
     assert sum(len(ids) for ids in expected.values()) == 14
     for path, ids in expected.items():

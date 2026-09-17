@@ -380,7 +380,7 @@ def test_responses_codex_oauth_still_rejects_other_hosted_tools(monkeypatch):
     body = {
         "model": "m",
         "input": "hi",
-        "tools": [{"type": "tool_search"}, {"type": "web_search"}],
+        "tools": [{"type": "tool_search"}, {"type": "file_search"}],
     }
     available, saturated, plans, guards = scheduler._filter_candidates("m", "responses", body=body)
 
@@ -388,7 +388,7 @@ def test_responses_codex_oauth_still_rejects_other_hosted_tools(monkeypatch):
     assert saturated == []
     assert plans == {}
     assert guards == [
-        "OpenAI Responses native route does not support requested server-side state: web_search",
+        "OpenAI Responses native route does not support requested server-side state: file_search",
         "OpenAI Responses native route does not support requested server-side state: tool_search",
     ]
 

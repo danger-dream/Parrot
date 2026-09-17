@@ -1,5 +1,4 @@
 activateStagedUpdate
-addAntigravityMediaModel
 addChannelBlacklistTerm
 addDefaultBlacklistTerm
 addXaiMediaModel
@@ -32,6 +31,7 @@ createManagementSession
 createOAuthAccount
 createProxies
 createProxyGroups
+createSearchBackend
 createTelegramApproval
 deleteApiKey
 deleteChannel
@@ -47,12 +47,11 @@ deleteModelMetadataOverrides
 deleteOAuthAccount
 deleteProxy
 deleteProxyGroup
+deleteSearchBackend
 discoverChannelModels
-discoverOAuthDefaultModels
 downloadMediaArtifact
 executeOAuthWorkBuddyAction
 getAffinitySettings
-getAntigravityMediaSettings
 getApiKey
 getApiKeyConcurrencySettings
 getApiKeyStats
@@ -85,7 +84,6 @@ getNetworkMonitor
 getNetworkSettings
 getNotificationSettings
 getOAuthAccount
-getOAuthDefaultModels
 getOAuthSettings
 getOAuthWorkBuddyAccount
 getOAuthWorkBuddyPolicy
@@ -102,6 +100,8 @@ getRequestLogRawBody
 getRetrySettings
 getRuntimeStatus
 getScoringSettings
+getSearchBackendAccounts
+getSearchSettings
 getSettings
 getStatsBreakdown
 getStatsSummary
@@ -113,6 +113,7 @@ getTimeoutSettings
 getTranslationCacheStats
 getTranslationSettings
 getUpdateFailureLog
+getVideoSettings
 getXaiMediaSettings
 ignoreUpdateVersion
 listApiKeys
@@ -123,6 +124,7 @@ listDnsCache
 listInvalidOAuthAccounts
 listMediaArtifacts
 listMediaLogs
+listMediaSources
 listModelInventory
 listModelMappings
 listModelMetadata
@@ -159,9 +161,7 @@ refreshOAuthUsage
 refreshOAuthWorkBuddyStatus
 refreshStatusAlerts
 regenerateApiKey
-removeAntigravityMediaModel
 removeXaiMediaModel
-renameAntigravityMediaModel
 renameXaiMediaModel
 reorderApiKeys
 reorderChannels
@@ -169,7 +169,6 @@ reorderOAuthAccounts
 replaceApiKeySecret
 replaceChannelOrder
 replaceModelChannelOrder
-replaceOAuthDefaultModels
 resetApiKeyLimiter
 resetOAuthQuota
 revokeCurrentManagementSession
@@ -184,12 +183,12 @@ syncSystemDns
 testDnsSettings
 testProxy
 testProxyGroup
+testSearchBackend
 testSocks5Settings
 testTranslation
 unignoreUpdateVersion
 unmuteStatusIncident
 updateAffinitySettings
-updateAntigravityMediaSettings
 updateApiKey
 updateApiKeyConcurrencySettings
 updateCchSettings
@@ -201,6 +200,7 @@ updateImageAccountState
 updateImageSettings
 updateLoadBalancingMode
 updateLogRetentionSettings
+updateMediaSource
 updateModelMapping
 updateNetworkMonitor
 updateNotificationSettings
@@ -216,6 +216,9 @@ updateProxyRouting
 updateQuotaMonitorSettings
 updateRetrySettings
 updateScoringSettings
+updateSearchBackend
+updateSearchPriority
+updateSearchSettings
 updateSettings
 updateSocks5State
 updateStatusAlertSettings
@@ -223,4 +226,5 @@ updateTelegramOAuthPreferences
 updateTelegramStatsPreferences
 updateTimeoutSettings
 updateTranslationSettings
+updateVideoSettings
 updateXaiMediaSettings

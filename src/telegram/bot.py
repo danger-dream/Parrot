@@ -26,8 +26,8 @@ from . import menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
     logs_menu, mapping_menu, media_logs_menu, model_center_menu,
-    oauth_account_models_menu, oauth_defaults_menu, oauth_menu, proxy_menu,
-    stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
+    oauth_account_models_menu, oauth_menu, proxy_menu,
+    search_menu, stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
     xai_imagine_menu,
 )
 from .menus import main as main_menu
@@ -496,6 +496,7 @@ def _handle_callback(cb: dict) -> None:
 
     # Revoke only model-center input before any early navigation return.
     model_center_menu.before_callback(chat_id, data)
+    search_menu.before_callback(chat_id, data)
     # 任意新 callback 都让该消息此前的后台统计更新失效，防止旧页面覆盖新菜单。
     menu_cache.begin_view(chat_id, msg_id)
 
@@ -560,7 +561,9 @@ def _handle_callback(cb: dict) -> None:
     if translation_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
-    # 系统设置菜单
+    # 搜索工具与系统设置菜单
+    if search_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
     if proxy_menu.handle_callback(chat_id, msg_id, cb_id, data):
         print(f"[tg] handled by proxy_menu ({data})")
         return
@@ -575,8 +578,10 @@ def _handle_callback(cb: dict) -> None:
     if mapping_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
 
-    # OAuth 默认模型菜单
-    if oauth_defaults_menu.handle_callback(chat_id, msg_id, cb_id, data):
+    if data.startswith("odm:"):
+        if str((states.get_state(chat_id) or {}).get("action") or "").startswith("odm_"):
+            states.pop_state(chat_id)
+        ui.answer_cb(cb_id, "OAuth 备用模型已退役，请到模型中心同步上游模型。")
         return
 
     # 未知 callback
@@ -599,6 +604,7 @@ def _handle_message(msg: dict) -> None:
     # Commands leave MC input; /cancel is consumed by its own editor.
     # Other menus retain their historical command/input semantics.
     model_center_menu.before_command(chat_id, text)
+    search_menu.before_command(chat_id, text)
     # 状态机输入
     state = states.get_state(chat_id)
     print(f"[tg] state for {chat_id}: {_summarize_state(state)}")        # DEBUG
@@ -615,6 +621,8 @@ def _handle_message(msg: dict) -> None:
             return
         if oauth_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by oauth_menu (action={action})")
+            return
+        if search_menu.handle_text_state(chat_id, action, text):
             return
         if image_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by image_menu (action={action})")
@@ -647,8 +655,9 @@ def _handle_message(msg: dict) -> None:
         if mapping_menu.handle_text_state(chat_id, action, text):
             print(f"[tg] handled by mapping_menu (action={action})")
             return
-        if oauth_defaults_menu.handle_text_state(chat_id, action, text):
-            print(f"[tg] handled by oauth_defaults_menu (action={action})")
+        if action.startswith("odm_"):
+            states.pop_state(chat_id)
+            ui.send(chat_id, "OAuth 备用模型已退役，请到模型中心同步上游模型。")
             return
         print(f"[tg] state action={action!r} not consumed by any menu")  # DEBUG
         # 未来其他菜单也在此分派
@@ -668,7 +677,7 @@ def _handle_message(msg: dict) -> None:
         channel_menu.send_new(chat_id); return
     # Narrow legacy command must precede the broad /oauth prefix.
     if text.startswith("/oauth_defaults"):
-        oauth_defaults_menu.send_new(chat_id); return
+        ui.send(chat_id, "OAuth 备用模型已退役，请到模型中心同步上游模型。"); return
     if text.startswith("/oauth"):
         oauth_menu.send_new(chat_id); return
     if text.startswith("/keys"):

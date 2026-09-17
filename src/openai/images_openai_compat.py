@@ -1,23 +1,4 @@
-"""OpenAI Images API 兼容入口。
-
-提供标准 OpenAI Images API：
-  POST /v1/images/generations  {prompt, model?, n?, size?, response_format?, quality?, ...}
-  POST /v1/images/edits        {prompt, model?, image[s]?, mask?, ...}
-
-按 ``model`` 路由：配置的 Grok Imagine 图片模型透明转给 xAI OAuth，
-其余模型继续复用 ``images_simple._execute_pipeline``（Codex Responses + image_generation tool）。
-
-设计原则：
-- 入参完整解析 OpenAI 标准字段（JSON + multipart）
-- Grok Imagine 支持原生 ``n<=10``、URL/Base64 响应和最多 3 张编辑参考图
-- GPT/Codex 管线的 ``n>1`` 显式降为 1，响应里带 ``parrot_warning``
-- GPT/Codex 的 ``response_format=url`` 回填 data URL
-- ``model``/``quality``/``background``/``output_format``/``moderation``/``style``/
-  ``output_compression``/``partial_images``/``mask`` 透传到 image_generation tool
-- ``generate`` 入口收到 ``mask`` 时记录 warning 日志（mask 仅 edit 有意义）
-- 不实现流式：transit 角色，无渐进流式必要
-- 全账号失败返回 429 时透传 ``Retry-After`` header
-"""
+"""Unified OpenAI Images JSON/multipart ingress; model selects the image source."""
 
 from __future__ import annotations
 
@@ -30,13 +11,9 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from .. import apikey_limiter, auth, errors, model_validation
-from ..antigravity import images as antigravity_images
-from ..xai import imagine as xai_imagine
+from .. import apikey_limiter, auth, errors, model_validation, model_mapping, model_state, image_catalog
 from .images_simple import (
-    UpstreamImageError,
     _DEFAULTS,
-    _execute_pipeline,
     _json_error,
     _normalize_image_input,
     settings,
@@ -68,6 +45,9 @@ class _ParsedRequest:
     mask_url: str | None = None
     native_options: dict[str, Any] = field(default_factory=dict)
     xai_options: dict[str, Any] = field(default_factory=dict)
+    stream: bool = False
+    # Prepared once by runtime before paid attempts; never accepted from JSON.
+    _api_edit_files: list | None = field(default=None, repr=False)
 
 
 # ── 公共小工具 ─────────────────────────────────────────────────────────────
@@ -142,7 +122,7 @@ def _str_or_none(value: Any) -> str | None:
 async def _read_form_file(upload: Any, *, max_bytes: int, label: str) -> tuple[bytes, str]:
     if not hasattr(upload, "read"):
         raise ValueError(f"invalid {label}: not a file")
-    raw = await upload.read()
+    raw = await upload.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError(f"{label} is too large; max {max_bytes} bytes")
     filename = getattr(upload, "filename", "") or ""
@@ -171,13 +151,8 @@ async def _parse_body(request: Request, *, action: str, cfg: dict) -> _ParsedReq
     else:
         await _parse_json(request, parsed=parsed, action=action, max_image_bytes=max_image_bytes)
 
-    # generate 入口收到 mask 时给出 warning（mask 只对 edit 有意义）
     if action == "generate" and parsed.mask_url:
-        print(
-            "[images-openai-compat] WARNING: mask is only meaningful for /v1/images/edits; "
-            "ignoring mask on generations endpoint"
-        )
-        parsed.mask_url = None
+        raise ValueError("mask requires the edits endpoint")
 
     return parsed
 
@@ -193,6 +168,7 @@ async def _parse_multipart(
         raise ValueError("invalid prompt: must be a string")
     parsed.prompt = prompt_val.strip()
 
+    parsed.stream = _coerce_bool(form.get("stream", False), field_name="stream")
     parsed.model = model_validation.require_explicit_model(form)
     parsed.size = _str_or_none(form.get("size"))
     rf = _str_or_none(form.get("response_format"))
@@ -237,15 +213,15 @@ async def _parse_multipart(
                     _normalize_image_input(str(upload), max_bytes=max_image_bytes)
                 )
 
-        mask = form.get("mask")
-        if mask is not None and mask != "":
-            if hasattr(mask, "read"):
-                raw, ctype_in = await _read_form_file(
-                    mask, max_bytes=max_image_bytes, label="mask",
-                )
-                parsed.mask_url = _bytes_to_data_url(raw, ctype_in)
-            else:
-                parsed.mask_url = _normalize_image_input(str(mask), max_bytes=max_image_bytes)
+    mask = form.get("mask")
+    if mask is not None and mask != "":
+        if hasattr(mask, "read"):
+            raw, ctype_in = await _read_form_file(
+                mask, max_bytes=max_image_bytes, label="mask",
+            )
+            parsed.mask_url = _bytes_to_data_url(raw, ctype_in)
+        else:
+            parsed.mask_url = _normalize_image_input(str(mask), max_bytes=max_image_bytes)
 
 
 async def _parse_json(
@@ -268,6 +244,7 @@ async def _parse_json(
         raise ValueError("invalid prompt: must be a string")
     parsed.prompt = (raw_prompt or "").strip()
 
+    parsed.stream = _coerce_bool(body.get("stream", False), field_name="stream")
     parsed.model = model_validation.require_explicit_model(body)
     parsed.size = _str_or_none(body.get("size"))
     rf = _str_or_none(body.get("response_format"))
@@ -293,7 +270,7 @@ async def _parse_json(
 
     if action == "edit":
         # 支持 image 单值 / image 数组 / images 数组
-        raw_image = body.get("image")
+        raw_image = body.get("image", body.get("image_url"))
         if isinstance(raw_image, list):
             for item in raw_image:
                 if isinstance(item, str) and item.strip():
@@ -315,7 +292,7 @@ async def _parse_json(
                     "image.file_id is not supported (use image.url instead)"
                 )
 
-        raw_images = body.get("images")
+        raw_images = body.get("images", body.get("images[]", body.get("image[]")))
         if isinstance(raw_images, list):
             for item in raw_images:
                 if isinstance(item, str) and item.strip():
@@ -342,58 +319,6 @@ async def _parse_json(
             parsed.mask_url = _normalize_image_input(iu, max_bytes=max_image_bytes)
         elif mask.get("file_id"):
             raise ValueError("mask.file_id is not supported (use mask.image_url instead)")
-
-
-# ── 响应构造 ───────────────────────────────────────────────────────────────
-
-
-def _build_openai_response(
-    *,
-    result,
-    parsed: _ParsedRequest,
-    n_warning: bool,
-) -> dict[str, Any]:
-    data: list[dict[str, Any]] = []
-    for img in result.images:
-        b64 = img.get("b64_json") or ""
-        item: dict[str, Any] = {}
-        if parsed.response_format == "url":
-            mime = _output_format_to_mime(img.get("output_format"))
-            item["url"] = f"data:{mime};base64,{b64}"
-        else:
-            item["b64_json"] = b64
-        if img.get("revised_prompt"):
-            item["revised_prompt"] = img["revised_prompt"]
-        data.append(item)
-
-    first = result.images[0] if result.images else {}
-    payload: dict[str, Any] = {
-        "created": int(time.time()),
-        "data": data,
-    }
-    if first.get("output_format"):
-        payload["output_format"] = first["output_format"]
-    if first.get("size"):
-        payload["size"] = first["size"]
-    if parsed.native_options.get("quality"):
-        payload["quality"] = parsed.native_options["quality"]
-    if parsed.native_options.get("background"):
-        payload["background"] = parsed.native_options["background"]
-
-    # 响应 model = 实际使用的 tool_model；客户端请求的 model 单独放在 parrot_requested_model 里
-    # 避免误导客户端以为跑的是它请求的 dall-e-3/gpt-image-1 之类。
-    payload["model"] = result.tool_model
-    if parsed.model and parsed.model != result.tool_model:
-        payload["parrot_requested_model"] = parsed.model
-
-    if result.usage:
-        payload["usage"] = result.usage
-    if n_warning:
-        payload["parrot_warning"] = (
-            f"requested n={parsed.requested_n} but upstream Codex image_generation "
-            "tool produces 1 image per call; effective n=1"
-        )
-    return payload
 
 
 # ── 主入口 ─────────────────────────────────────────────────────────────────
@@ -441,67 +366,21 @@ async def _run_handler(request: Request, *, action: str) -> JSONResponse:
             param="image",
         )
 
-    # The standard Images routes are shared. Explicitly configured provider
-    # media models select their native OAuth runtime; all other models retain
-    # the existing GPT/Codex image pipeline.
-    if antigravity_images.is_antigravity_image_model(parsed.model):
-        assert key_name is not None
-        return await antigravity_images.handle_image(
-            parsed, action=action, key_name=key_name, allowed_models=allowed_models,
-        )
-    if antigravity_images.looks_like_antigravity_image_model(parsed.model):
-        return _bad_request(
-            f"unsupported Antigravity image model {parsed.model!r}", param="model",
-        )
-    if xai_imagine.is_xai_image_model(parsed.model):
-        assert key_name is not None
-        return await xai_imagine.handle_image(
-            parsed,
-            action=action,
-            key_name=key_name,
-            allowed_models=allowed_models,
-        )
-    if xai_imagine.looks_like_xai_image_model(parsed.model):
-        return _bad_request(
-            f"unsupported xAI image model {parsed.model!r}",
-            param="model",
-        )
-
-    n_warning = False
-    if parsed.requested_n > 1:
-        n_warning = True
-        print(
-            f"[images-openai-compat] requested n={parsed.requested_n} downgraded to 1 "
-            "(Codex image_generation tool returns 1 image per call)"
-        )
-
+    requested_model = parsed.model
+    parsed.model = model_mapping.get_global_map().get(requested_model, requested_model)
+    # Both an explicitly granted alias and an explicitly granted real model work;
+    # neither can bypass model/source disablement.
+    if allowed_models and requested_model not in allowed_models and parsed.model not in allowed_models:
+        return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "model is not allowed for this API key")
+    if not model_state.is_global_enabled(parsed.model) or not model_state.is_global_enabled(requested_model):
+        return _json_error(403, errors.ErrTypeOpenAI.PERMISSION, "image model is disabled")
+    if parsed.model not in image_catalog.models():
+        return _bad_request("unknown image model; configure an image source or alias", param="model")
+    from .images_runtime import execute
     try:
-        result = await _execute_pipeline(
-            action=action,
-            key_name=key_name,
-            prompt=parsed.prompt,
-            size=parsed.size,
-            input_image_urls=parsed.input_images or None,
-            mask_url=parsed.mask_url,
-            native_options=parsed.native_options or None,
-            cfg=cfg,
-        )
-    except UpstreamImageError as exc:
-        headers: dict[str, str] = {}
-        # 全账号失败后回传 429 时透传 Retry-After，方便客户端做指数退避。
-        if exc.status_code == 429 and exc.retry_after is not None:
-            headers["Retry-After"] = str(exc.retry_after)
-        return errors.json_error_openai(
-            exc.status_code, exc.err_type, exc.message,
-        ) if not headers else JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"message": exc.message, "type": exc.err_type, "code": None, "param": None}},
-            headers=headers,
-        )
-
-    return JSONResponse(
-        _build_openai_response(result=result, parsed=parsed, n_warning=n_warning)
-    )
+        return await execute(parsed, request=request, action=action, key_name=key_name, cfg=cfg)
+    except ValueError as exc:
+        return _bad_request(str(exc))
 
 
 async def handle_generations(request: Request) -> JSONResponse:

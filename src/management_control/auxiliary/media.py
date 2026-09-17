@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from src import config, image_db, oauth_manager
+from src import config, image_db, oauth_manager, media_config, image_catalog, channel_state
 from src.openai import images_simple
 from src.management_auth.principal import Capability
 
@@ -33,8 +33,9 @@ from .common import (
 class ImageSettings:
     enabled: bool
     cache_enabled: bool
-    main_model: str
-    tool_model: str
+    models: dict[str, list[str]]
+    request_timeout_seconds: int
+    job_ttl_seconds: int | None
     cache_path: str
     cache_retention_days: int
     cache_max_bytes: int
@@ -50,6 +51,10 @@ class ImageAccountState:
     image_cooldown_until: str | None
     missing_account_id: bool
     revision: str
+    independent_enabled: bool = False
+    independent_allowed: bool = False
+    effective_available: bool = False
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +154,7 @@ class ModuleMediaGateway:
 
 
 class ImageControl:
+    kind = "image"
     def __init__(
         self,
         *,
@@ -161,41 +167,26 @@ class ImageControl:
         self._audit_sink = audit_sink
 
     def _effective_from_root(self, root: dict[str, Any]) -> dict[str, Any]:
-        value = self._media.image_defaults
-        raw = root.get("images") or {}
-        if isinstance(raw, dict):
-            value.update(copy.deepcopy(raw))
-        return value
+        return {**media_config.settings(self.kind, root), 'models': media_config.model_map(self.kind, root)}
 
     @staticmethod
     def _dto(value: dict[str, Any]) -> ImageSettings:
-        stable = {
-            "enabled": bool(value.get("enabled", True)),
-            "cacheEnabled": bool(value.get("cacheEnabled", False)),
-            "mainModel": str(value.get("mainModel") or ""),
-            "toolModel": str(value.get("toolModel") or ""),
-            "cachePath": str(value.get("cachePath") or ""),
-            "cacheRetentionDays": int(value.get("cacheRetentionDays") or 0),
-            "cacheMaxBytes": int(value.get("cacheMaxBytes") or 0),
-        }
+        stable = {key: value.get(key) for key in ('enabled', 'cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes', 'models', 'requestTimeoutSeconds', 'jobTtlSeconds')}
         return ImageSettings(
-            enabled=stable["enabled"],
-            cache_enabled=stable["cacheEnabled"],
-            main_model=stable["mainModel"],
-            tool_model=stable["toolModel"],
-            cache_path=stable["cachePath"],
-            cache_retention_days=stable["cacheRetentionDays"],
-            cache_max_bytes=stable["cacheMaxBytes"],
-            revision=revision_for(stable),
-        )
+            enabled=bool(value.get('enabled', True)), cache_enabled=bool(value.get('cacheEnabled', False)),
+            models=copy.deepcopy(value.get('models') or {}),
+            request_timeout_seconds=int(value.get('requestTimeoutSeconds', 180)),
+            job_ttl_seconds=value.get('jobTtlSeconds'), cache_path=str(value.get('cachePath') or 'images'),
+            cache_retention_days=int(value.get('cacheRetentionDays') or 0),
+            cache_max_bytes=int(value.get('cacheMaxBytes') or 0), revision=revision_for(stable))
 
     def get_settings(self, context: ManagementContext) -> ImageSettings:
         require(context, Capability.READ)
-        return self._dto(self._media.image_settings())
+        return self._dto(self._effective_from_root(self._config.get()))
 
     def settings_raw_direct(self, context: ManagementContext) -> dict[str, Any]:
         require(context, Capability.READ)
-        return self._media.image_settings()
+        return self._effective_from_root(self._config.get())
 
     def _validate_path(self, value: str) -> str:
         raw = str(value or "").strip()
@@ -218,12 +209,26 @@ class ImageControl:
     ) -> ImageSettings:
         require(context, Capability.WRITE)
         value = copy.deepcopy(patch)
-        for field in ("mainModel", "toolModel"):
-            if field in value:
-                normalized = str(value[field] or "").strip()
-                if not normalized or len(normalized) > 128:
-                    raise invalid_field(field, "INVALID_MODEL", "model must contain 1 to 128 characters")
-                value[field] = normalized
+        allowed = {'enabled', 'cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes', 'models', 'requestTimeoutSeconds'}
+        if self.kind == 'video': allowed.add('jobTtlSeconds')
+        unknown = set(value) - allowed
+        if unknown: raise invalid_field(sorted(unknown)[0], 'UNKNOWN_FIELD', 'unsupported media setting')
+        for field in ('enabled', 'cacheEnabled'):
+            if field in value and not isinstance(value[field], bool):
+                raise invalid_field(field, 'INVALID_TYPE', 'must be boolean')
+        if 'models' in value:
+            mapping = value['models']
+            if not isinstance(mapping, dict) or any(not isinstance(k, str) or not k.strip() or not isinstance(v, list) for k,v in mapping.items()):
+                raise invalid_field('models', 'INVALID_MODELS', 'models must map provider names to arrays')
+            for provider, models in mapping.items():
+                if len(models) > 50: raise invalid_field('models.' + provider, 'TOO_MANY_MODELS', 'at most 50 models per provider')
+                for model in models:
+                    if not isinstance(model, str) or not model or len(model) > 128 or any(ch.isspace() for ch in model):
+                        raise invalid_field('models.' + provider, 'INVALID_MODEL', 'model must be 1-128 non-whitespace characters')
+                mapping[provider] = list(dict.fromkeys(models))
+        for field in ('requestTimeoutSeconds', 'jobTtlSeconds'):
+            if field in value and (type(value[field]) is not int or not 1 <= value[field] <= 2147483647):
+                raise invalid_field(field, 'OUT_OF_RANGE', 'must be between 1 and 2147483647')
         if "cachePath" in value:
             value["cachePath"] = self._validate_path(value["cachePath"])
         for field, high in (("cacheRetentionDays", 36500), ("cacheMaxBytes", 2**63 - 1)):
@@ -234,23 +239,110 @@ class ImageControl:
 
         def mutate(root: dict[str, Any]) -> None:
             current = self._dto(self._effective_from_root(root))
-            ensure_revision(expected_revision, current.revision)
-            root.setdefault("images", {}).update(copy.deepcopy(value))
-
-        self._config.update(mutate)
-        audit(self._audit_sink, context, action="images.settings.update", target="images")
-        return self._dto(self._media.image_settings())
+            _require_revision(expected_revision, current.revision)
+            media_config.freeze_cache_inheritance(root, self.kind)
+            effective = media_config.settings(self.kind, root)
+            media_config.materialize_models(root, self.kind)
+            target = root.setdefault(media_config.section(self.kind), {})
+            for field in media_config.CACHE_FIELDS:
+                target.setdefault(field, copy.deepcopy(effective[field]))
+            for field, item in value.items():
+                if field == 'models':
+                    # Provider map PATCH preserves unmentioned providers/custom lists.
+                    root[self.kind + '_models'].update(copy.deepcopy(item))
+                else: target[field] = copy.deepcopy(item)
+        committed = self._config.update(mutate)
+        audit(self._audit_sink, context, action=self.kind + '.settings.update', target=self.kind)
+        return self._dto(self._effective_from_root(committed))
 
     def mutate_direct(self, context: ManagementContext, mutator) -> ImageSettings:
+        current = self.get_settings(context)
+        value = self.settings_raw_direct(context)
+        before = copy.deepcopy(value)
+        mutator(value)
+        return self.update_settings(context, {k:v for k,v in value.items() if before.get(k) != v}, expected_revision=current.revision)
+
+    def _sources(self, root: dict) -> list[dict]:
+        result = []
+        catalog = image_catalog.sources(root, kind=self.kind)
+        for account in root.get('oauthAccounts') or []:
+            provider = account.get('provider')
+            if provider not in (('openai', 'xai') if self.kind == 'image' else ('xai',)): continue
+            state = media_config.oauth_state(account, self.kind, root)
+            row = dict(source_id='oauth:' + oauth_manager.get_account_key(account), state_key=state['state_key'],
+                       label=image_catalog.oauth_source_label(account, root), provider=provider,
+                       enabled=state['purpose_enabled'], effective_available=state['effective_available'],
+                       can_enable=state['independent_allowed'], unavailable_reason=state['unavailable_reason'])
+            if row['effective_available'] and not any(source.key == row['source_id'] and source.available for source in catalog):
+                row['effective_available'] = False
+                row['unavailable_reason'] = '当前没有启用的媒体模型，请通过配置 / 管理 API 维护。'
+            row['revision'] = revision_for(row)
+            result.append(row)
+        seen = set()
+        for source in catalog:
+            if not source.key.startswith('api:') or source.key in seen: continue
+            seen.add(source.key)
+            cfg = media_config.settings(self.kind, root)
+            purpose_enabled = source.state_key not in (cfg.get('disabledSources') or [])
+            available = any(item.key == source.key and item.available for item in catalog)
+            reason = None
+            if not available:
+                if not purpose_enabled:
+                    reason = '图片用途已停用。'
+                elif not cfg.get('enabled', True):
+                    reason = '图片接口已关闭，请开启接口。'
+                elif not source.enabled:
+                    reason = '渠道已停用或异常；图片用途开关不会修改渠道的普通对话状态。'
+                else:
+                    reason = '当前没有启用的图片模型，请通过配置 / 管理 API 维护。'
+            row = dict(source_id=source.key, state_key=source.state_key, label=source.label, provider=source.provider,
+                       enabled=purpose_enabled, effective_available=available,
+                       can_enable=True, unavailable_reason=reason)
+            row['revision'] = revision_for(row)
+            result.append(row)
+        return result
+
+    def list_sources(self, context: ManagementContext) -> list[dict]:
+        require(context, Capability.READ)
+        return self._sources(self._config.get())
+
+    def update_source(self, context: ManagementContext, source_id: str, *, enabled: bool, expected_revision: str | None) -> dict:
         require(context, Capability.WRITE)
+        if not isinstance(enabled, bool): raise invalid_field('enabled', 'INVALID_TYPE', 'must be boolean')
+        def mutate(root):
+            row = next((item for item in self._sources(root) if item['source_id'] == source_id), None)
+            if row is None: raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            _require_revision(expected_revision, row['revision'])
+            if enabled and not row['can_enable']:
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE, row['unavailable_reason'])
+            target = root.setdefault(media_config.section(self.kind), {})
+            disabled = list(target.get('disabledSources') or [])
+            independent = list(target.get('independentAccounts') or [])
+            state_key = row['state_key']
+            disabled = [item for item in disabled if item != state_key]
+            independent = [item for item in independent if item != state_key]
+            if not enabled: disabled.append(state_key)
+            if source_id.startswith('oauth:'):
+                account = next(item for item in root['oauthAccounts'] if 'oauth:' + oauth_manager.get_account_key(item) == source_id)
+                account['generationId'] = channel_state.generation_id(state_key)
+                if enabled: independent.append(state_key)
+                if self.kind == 'image' and account.get('provider') == 'openai':
+                    aliases = self._account_aliases(source_id[6:], account.get('email', ''))
+                    target['disabledAccounts'] = [item for item in target.get('disabledAccounts') or [] if str(item).lower() not in aliases]
+            else:
+                channel = next(item for item in root['channels'] if 'api:' + item['name'] == source_id)
+                channel['generationId'] = channel_state.generation_id(state_key)
+            target['disabledSources'] = disabled
+            target['independentAccounts'] = independent
+        committed = self._config.update(mutate)
+        audit(self._audit_sink, context, action=self.kind + '.source.update', target=source_id)
+        return next(item for item in self._sources(committed) if item['source_id'] == source_id)
 
-        def mutate(root: dict[str, Any]) -> None:
-            section = root.setdefault("images", {})
-            mutator(section)
-
-        self._config.update(mutate)
-        audit(self._audit_sink, context, action="images.settings.update", target="images")
-        return self._dto(self._media.image_settings())
+    def statistics(self, context: ManagementContext) -> dict:
+        require(context, Capability.READ)
+        from src import media_cache
+        return {'models': image_db.model_statistics(self.kind),
+                'cache': media_cache.occupancy(media_config.settings(self.kind, self._config.get()))}
 
     @staticmethod
     def _account(row: dict[str, Any]) -> ImageAccountState:
@@ -266,7 +358,14 @@ class ImageControl:
             ),
             "missingAccountId": bool(row.get("missing_account_id")),
         }
+        extras = dict(independent_enabled=bool(row.get('independent_enabled')),
+                      independent_allowed=bool(row.get('independent_allowed')),
+                      effective_available=bool(row.get('effective_available', row.get('enabled') and not row.get('image_disabled'))),
+                      unavailable_reason=row.get('unavailable_reason'))
+        if row.get('state_key'):
+            stable.update(extras, stateKey=row['state_key'])
         return ImageAccountState(
+            **extras,
             account_id=stable["accountId"],
             email=stable["email"],
             oauth_enabled=stable["oauthEnabled"],
@@ -286,6 +385,8 @@ class ImageControl:
 
     def get_account(self, context: ManagementContext, account_id: str) -> ImageAccountState:
         require(context, Capability.READ)
+        authoritative = self._account_from_root(self._config.get(), account_id)
+        if authoritative is not None: return authoritative
         for row in self._media.image_accounts():
             if str(row.get("account_key") or "") == account_id:
                 return self._account(row)
@@ -299,67 +400,89 @@ class ImageControl:
             aliases.update({normalized_email, f"openai:{normalized_email}"})
         return aliases
 
+    @classmethod
+    def _account_from_root(cls, root: dict, account_id: str) -> ImageAccountState | None:
+        from src.image_catalog import openai_account_state
+        for account in root.get('oauthAccounts') or []:
+            if oauth_manager.provider_of(account) != 'openai' or oauth_manager.get_account_key(account) != account_id:
+                continue
+            state = openai_account_state(account, root)
+            return cls._account({**state, 'account_key': account_id, 'email': account.get('email', ''),
+                'enabled': state['oauth_enabled'], 'effective_available': state['effective_available'],
+                'image_disabled': not state['image_enabled'],
+                'image_cooldown_until': images_simple._IMAGE_COOLDOWNS.get(account_id, 0)})
+        return None
+
+    def _update_independent(self, context, account_id, enabled, expected_revision):
+        from src import channel_state
+        from src.image_catalog import openai_account_state
+        if not isinstance(enabled, bool):
+            raise invalid_field('independentEnabled', 'INVALID_VALUE', 'must be a boolean')
+
+        def mutate(root):
+            current = self._account_from_root(root, account_id)
+            if current is None:
+                raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            _require_revision(expected_revision, current.revision)
+            if enabled and not current.independent_allowed:
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE, current.unavailable_reason)
+            account = next(item for item in root['oauthAccounts']
+                           if oauth_manager.provider_of(item) == 'openai' and oauth_manager.get_account_key(item) == account_id)
+            state = openai_account_state(account, root)
+            section = root.setdefault('images', {})
+            overrides = list(section.get('independentAccounts') or [])
+            if enabled:
+                # Persist legacy runtime generation only on this explicit admin
+                # mutation, not while listing sources or during proxy requests.
+                account['generationId'] = channel_state.generation_id(state['state_key'])
+                if state['state_key'] not in overrides:
+                    overrides.append(state['state_key'])
+            else:
+                overrides = [item for item in overrides if item != state['state_key']]
+            section['independentAccounts'] = overrides
+
+        committed = self._config.update(mutate)
+        audit(self._audit_sink, context, action='images.account.independent.update', target=account_id)
+        return self._account_from_root(committed, account_id)
+
     def update_account(
         self,
         context: ManagementContext,
         account_id: str,
         *,
-        enabled: bool,
+        enabled: bool | None = None,
+        independent_enabled: bool | None = None,
         expected_revision: str | None = None,
     ) -> ImageAccountState:
         require(context, Capability.WRITE)
-        current = self.get_account(context, account_id)
-        ensure_revision(expected_revision, current.revision)
-        aliases = self._account_aliases(current.account_id, current.email)
-
-        def mutate(root: dict[str, Any]) -> None:
-            section = root.setdefault("images", {})
-            values = list(section.get("disabledAccounts") or [])
+        if independent_enabled is not None:
+            if enabled is not None:
+                raise invalid_field('independentEnabled', 'CONFLICT', 'change image participation and independent authorization separately')
+            return self._update_independent(context, account_id, independent_enabled, expected_revision)
+        if enabled is None:
+            raise invalid_field('enabled', 'REQUIRED', 'enabled or independentEnabled is required')
+        if not isinstance(enabled, bool):
+            raise invalid_field('enabled', 'INVALID_TYPE', 'must be boolean')
+        def mutate(root):
+            current = self._account_from_root(root, account_id)
+            if current is None: raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
+            _require_revision(expected_revision, current.revision)
+            aliases = self._account_aliases(account_id, current.email)
+            section = root.setdefault('images', {})
+            values = list(section.get('disabledAccounts') or [])
+            if enabled: values = [item for item in values if str(item).strip().lower() not in aliases]
+            elif not any(str(item).strip().lower() in aliases for item in values): values.append(account_id)
+            section['disabledAccounts'] = values
             if enabled:
-                values = [item for item in values if str(item).strip().lower() not in aliases]
-            elif not any(str(item).strip().lower() in aliases for item in values):
-                values.append(current.account_id)
-            section["disabledAccounts"] = values
-
+                state_key = next(row['state_key'] for row in self._sources(root) if row['source_id'] == 'oauth:' + account_id)
+                section['disabledSources'] = [key for key in section.get('disabledSources') or [] if key != state_key]
         committed = self._config.update(mutate)
-        committed_values = list((committed.get("images") or {}).get("disabledAccounts") or [])
-        image_enabled = not any(str(item).strip().lower() in aliases for item in committed_values)
-        audit(self._audit_sink, context, action="images.account.update", target=account_id)
-        # The OAuth list adapter may be eventually consistent in production. Derive
-        # the returned image flag and revision from the committed authoritative set.
-        stable = {
-            "accountId": current.account_id,
-            "email": current.email,
-            "oauthEnabled": current.oauth_enabled,
-            "imageEnabled": image_enabled,
-            "imageCooldownUntil": current.image_cooldown_until,
-            "missingAccountId": current.missing_account_id,
-        }
-        return ImageAccountState(
-            account_id=current.account_id,
-            email=current.email,
-            oauth_enabled=current.oauth_enabled,
-            image_enabled=image_enabled,
-            image_cooldown_until=current.image_cooldown_until,
-            missing_account_id=current.missing_account_id,
-            revision=revision_for(stable),
-        )
+        audit(self._audit_sink, context, action='images.account.update', target=account_id)
+        return self._account_from_root(committed, account_id)
 
     def toggle_account_direct(self, context: ManagementContext, account_id: str) -> None:
-        require(context, Capability.WRITE)
-
-        def mutate(root: dict[str, Any]) -> None:
-            section = root.setdefault("images", {})
-            values = list(section.get("disabledAccounts") or [])
-            positions = {str(item).lower(): index for index, item in enumerate(values)}
-            if account_id.lower() in positions:
-                values.pop(positions[account_id.lower()])
-            else:
-                values.append(account_id)
-            section["disabledAccounts"] = values
-
-        self._config.update(mutate)
-        audit(self._audit_sink, context, action="images.account.toggle", target=account_id)
+        current = self.get_account(context, account_id)
+        self.update_account(context, account_id, enabled=not current.image_enabled, expected_revision=current.revision)
 
     def cached_image_log(self, context: ManagementContext, log_id: int) -> CachedImageLog | None:
         require(context, Capability.READ)
@@ -382,6 +505,10 @@ class ImageControl:
         )
 
 
+class VideoControl(ImageControl):
+    kind = "video"
+
+
 class XaiMediaControl:
     def __init__(
         self,
@@ -400,10 +527,10 @@ class XaiMediaControl:
         if isinstance(raw, dict):
             defaults.update(copy.deepcopy(raw))
         return {
-            "imageModels": string_list(defaults.get("imageModels")),
-            "videoModels": string_list(defaults.get("videoModels")),
-            "jobTtlSeconds": self._positive(defaults.get("videoJobTtlSeconds"), 10800),
-            "requestTimeoutSeconds": self._positive(defaults.get("mediaRequestTimeoutSeconds"), 180),
+            "imageModels": media_config.model_map("image", root).get("xai", []),
+            "videoModels": media_config.model_map("video", root).get("xai", []),
+            "jobTtlSeconds": self._positive(media_config.settings("video", root).get("jobTtlSeconds"), 10800),
+            "requestTimeoutSeconds": self._positive(media_config.settings("video", root).get("requestTimeoutSeconds"), 180),
         }
 
     @staticmethod
@@ -458,6 +585,8 @@ class XaiMediaControl:
     ) -> XaiMediaSettings:
         require(context, Capability.WRITE)
         value = copy.deepcopy(patch)
+        unknown = set(value) - {'imageModels', 'videoModels', 'requestTimeoutSeconds', 'jobTtlSeconds'}
+        if unknown: raise invalid_field(sorted(unknown)[0], 'UNKNOWN_FIELD', 'unsupported media setting')
         if "imageModels" in value:
             value["imageModels"] = self.validate_models(value["imageModels"], "imageModels")
         if "videoModels" in value:
@@ -470,17 +599,14 @@ class XaiMediaControl:
 
         def mutate(root: dict[str, Any]) -> None:
             current = self._dto(self._effective(root))
-            ensure_revision(expected_revision, current.revision)
-            section = root.get("xaiOAuth")
-            if not isinstance(section, dict):
-                section = {}
-                root["xaiOAuth"] = section
+            _require_revision(expected_revision, current.revision)
             for field, item in value.items():
-                raw_field = {
-                    "jobTtlSeconds": "videoJobTtlSeconds",
-                    "requestTimeoutSeconds": "mediaRequestTimeoutSeconds",
-                }.get(field, field)
-                section[raw_field] = copy.deepcopy(item)
+                if field in ('imageModels', 'videoModels'):
+                    kind = 'image' if field == 'imageModels' else 'video'
+                    media_config.materialize_models(root, kind)
+                    root[kind + '_models']['xai'] = copy.deepcopy(item)
+                else:
+                    root.setdefault('videos', {})[field] = copy.deepcopy(item)
 
         self._config.update(mutate)
         audit(self._audit_sink, context, action="xai.media-settings.update", target="xai-media")
@@ -549,11 +675,8 @@ class XaiMediaControl:
                     raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
                 values.pop(values.index(old_name))
                 outcome[0] = "removed"
-            section = root.get("xaiOAuth")
-            if not isinstance(section, dict):
-                section = {}
-                root["xaiOAuth"] = section
-            section[field] = values
+            media_config.materialize_models(root, normalized_kind.value)
+            root[normalized_kind.value + '_models']['xai'] = values
 
         self._config.update(mutate)
         current = self.get_settings(context)
@@ -598,243 +721,23 @@ class XaiMediaControl:
         )
 
     def set_raw_field(self, context: ManagementContext, key: str, value: Any) -> XaiMediaSettings:
-        require(context, Capability.WRITE)
-
-        def mutate(root: dict[str, Any]) -> None:
-            section = root.get("xaiOAuth")
-            if not isinstance(section, dict):
-                section = {}
-                root["xaiOAuth"] = section
-            section[key] = copy.deepcopy(value)
-
-        self._config.update(mutate)
-        audit(self._audit_sink, context, action="xai.media-settings.update", target=key)
-        return self._dto(self._effective(self._config.get()))
+        field = {'videoJobTtlSeconds': 'jobTtlSeconds', 'mediaRequestTimeoutSeconds': 'requestTimeoutSeconds'}.get(key, key)
+        current = self.get_settings(context)
+        return self.update_settings(context, {field: value}, expected_revision=current.revision)
 
 
 class AntigravityMediaControl:
-    def __init__(
-        self,
-        *,
-        config_gateway: ConfigGateway | None = None,
-        audit_sink: AuditSink | None = None,
-    ) -> None:
-        self._config = config_gateway or ModuleConfigGateway()
-        self._audit_sink = audit_sink
+    """Compatibility tombstone for old management bindings, never mutates AG state."""
+    def __init__(self, **kwargs):
+        pass
 
-    @staticmethod
-    def _account_overrides(root: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-        result: list[tuple[str, tuple[str, ...]]] = []
-        for account in root.get("oauthAccounts") or ():
-            if not isinstance(account, dict) or "imageModels" not in account:
-                continue
-            try:
-                if oauth_manager.provider_of(account) != "antigravity":
-                    continue
-                account_id = oauth_manager.get_account_key(account)
-            except Exception:
-                continue
-            result.append((str(account_id), tuple(string_list(account.get("imageModels")))))
-        return tuple(sorted(result, key=lambda item: item[0]))
-
-    @classmethod
-    def _dto(cls, root: dict[str, Any]) -> AntigravityMediaSettings:
-        section = copy.deepcopy(config.DEFAULT_CONFIG.get("antigravityOAuth") or {})
-        raw = root.get("antigravityOAuth")
-        if isinstance(raw, dict):
-            section.update(copy.deepcopy(raw))
-        stable = {
-            "imageModels": string_list(section.get("imageModels")),
-            "accountOverrides": cls._account_overrides(root),
-        }
-        return AntigravityMediaSettings(
-            image_models=tuple(stable["imageModels"]),
-            account_overrides=stable["accountOverrides"],
-            revision=revision_for(stable),
-        )
-
-    def get_settings(self, context: ManagementContext) -> AntigravityMediaSettings:
+    def get_settings(self, context):
         require(context, Capability.READ)
-        return self._dto(self._config.get())
+        return AntigravityMediaSettings(image_models=(), account_overrides=(), revision=revision_for({"retired": True}))
 
-    @staticmethod
-    def _validate_models(models: Any) -> list[str]:
-        values = string_list(models)
-        if len(values) > 80:
-            raise invalid_field(
-                "imageModels", "TOO_MANY_MODELS", "at most 80 models are allowed",
-            )
-        for index, model in enumerate(values):
-            if len(model) > 80:
-                raise invalid_field(
-                    f"imageModels[{index}]", "MODEL_TOO_LONG",
-                    "model must be at most 80 characters",
-                )
-        return values
+    def update_settings(self, *args, **kwargs):
+        raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE, "Antigravity image support has been removed")
 
-    def update_settings(
-        self,
-        context: ManagementContext,
-        *,
-        image_models: tuple[str, ...] | list[str],
-        expected_revision: str | None,
-    ) -> AntigravityMediaSettings:
-        require(context, Capability.WRITE)
-        values = self._validate_models(image_models)
-
-        def mutate(root: dict[str, Any]) -> None:
-            current = self._dto(root)
-            _require_revision(expected_revision, current.revision)
-            section = root.get("antigravityOAuth")
-            if not isinstance(section, dict):
-                section = {}
-                root["antigravityOAuth"] = section
-            section["imageModels"] = list(values)
-
-        self._config.update(mutate)
-        result = self.get_settings(context)
-        audit(
-            self._audit_sink, context,
-            action="antigravity.media-settings.update", target="antigravity-media",
-        )
-        return result
-
-    @staticmethod
-    def _owner_type(owner: ModelOwnerRef) -> ModelSourceType:
-        try:
-            return owner.type if isinstance(owner.type, ModelSourceType) else ModelSourceType(str(owner.type))
-        except (AttributeError, ValueError) as exc:
-            raise invalid_field("owner.type", "UNSUPPORTED_OWNER", "owner must be global or oauth") from exc
-
-    @classmethod
-    def _assert_mutable_owner(cls, root: dict[str, Any], owner: ModelOwnerRef) -> None:
-        owner_type = cls._owner_type(owner)
-        if owner_type is ModelSourceType.GLOBAL:
-            if owner.id not in (None, ""):
-                raise invalid_field("owner.id", "NOT_ALLOWED", "global owner does not accept id")
-            return
-        if owner_type is not ModelSourceType.OAUTH or not str(owner.id or "").strip():
-            raise invalid_field("owner", "UNSUPPORTED_OWNER", "oauth owner requires id")
-        owner_id = str(owner.id)
-        found = False
-        for account in root.get("oauthAccounts") or ():
-            if not isinstance(account, dict):
-                continue
-            try:
-                if (
-                    oauth_manager.provider_of(account) == "antigravity"
-                    and oauth_manager.get_account_key(account) == owner_id
-                    and "imageModels" in account
-                ):
-                    found = True
-                    break
-            except Exception:
-                continue
-        if not found:
-            raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-        raise ManagementError(
-            ManagementErrorCode.UNSUPPORTED_VALUE,
-            fields=(ErrorField(
-                path="owner", code="READ_ONLY_SCOPE",
-                message="Antigravity account image models are read-only",
-            ),),
-        )
-
-    def _mutate_model(
-        self,
-        context: ManagementContext,
-        *,
-        owner: ModelOwnerRef,
-        old_model_id: str | None,
-        new_model_id: str | None,
-        action: str,
-        expected_revision: str | None,
-    ) -> MediaModelMutationResult:
-        capability = Capability.DESTRUCTIVE if action == "remove" else Capability.WRITE
-        require(context, capability)
-        old_name = _media_model(
-            old_model_id, "modelId", max_length=80,
-        ) if old_model_id is not None else None
-        new_name = _media_model(
-            new_model_id, "newModelId" if action == "rename" else "modelId",
-            max_length=80,
-        ) if new_model_id is not None else None
-        outcome = [""]
-
-        def mutate(root: dict[str, Any]) -> None:
-            self._assert_mutable_owner(root, owner)
-            current = self._dto(root)
-            _require_revision(expected_revision, current.revision)
-            values = list(current.image_models)
-            if action == "add":
-                assert new_name is not None
-                if new_name in values:
-                    outcome[0] = "unchanged"
-                else:
-                    if len(values) >= 80:
-                        raise invalid_field("imageModels", "TOO_MANY_MODELS", "at most 80 models are allowed")
-                    values.append(new_name)
-                    outcome[0] = "added"
-            elif action == "rename":
-                assert old_name is not None and new_name is not None
-                if old_name not in values:
-                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-                if old_name == new_name:
-                    outcome[0] = "unchanged"
-                elif new_name in values:
-                    raise ManagementError(ManagementErrorCode.RESOURCE_CONFLICT)
-                else:
-                    values[values.index(old_name)] = new_name
-                    outcome[0] = "renamed"
-            else:
-                assert old_name is not None
-                if old_name not in values:
-                    raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
-                values.pop(values.index(old_name))
-                outcome[0] = "removed"
-            section = root.get("antigravityOAuth")
-            if not isinstance(section, dict):
-                section = {}
-                root["antigravityOAuth"] = section
-            section["imageModels"] = values
-
-        self._config.update(mutate)
-        current = self.get_settings(context)
-        result_model = new_name if action != "remove" else old_name
-        audit(
-            self._audit_sink, context,
-            action=f"antigravity.media-model.{action}", target=f"image:{result_model}",
-        )
-        return MediaModelMutationResult(
-            provider="antigravity", kind=ModelKind.IMAGE,
-            owner=ModelOwnerRef(ModelSourceType.GLOBAL),
-            model_id=str(result_model), models=current.image_models,
-            status=outcome[0], revision=current.revision,
-        )
-
-    def add_model(
-        self, context: ManagementContext, *, owner: ModelOwnerRef,
-        model_id: str, expected_revision: str | None,
-    ) -> MediaModelMutationResult:
-        return self._mutate_model(
-            context, owner=owner, old_model_id=None, new_model_id=model_id,
-            action="add", expected_revision=expected_revision,
-        )
-
-    def rename_model(
-        self, context: ManagementContext, *, owner: ModelOwnerRef,
-        old_model_id: str, new_model_id: str, expected_revision: str | None,
-    ) -> MediaModelMutationResult:
-        return self._mutate_model(
-            context, owner=owner, old_model_id=old_model_id, new_model_id=new_model_id,
-            action="rename", expected_revision=expected_revision,
-        )
-
-    def remove_model(
-        self, context: ManagementContext, *, owner: ModelOwnerRef,
-        model_id: str, expected_revision: str | None,
-    ) -> MediaModelMutationResult:
-        return self._mutate_model(
-            context, owner=owner, old_model_id=model_id, new_model_id=None,
-            action="remove", expected_revision=expected_revision,
-        )
+    add_model = update_settings
+    rename_model = update_settings
+    remove_model = update_settings

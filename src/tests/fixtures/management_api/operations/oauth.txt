@@ -36,6 +36,3 @@ getOAuthSettings
 updateOAuthSettings
 getTelegramOAuthPreferences
 updateTelegramOAuthPreferences
-getOAuthDefaultModels
-replaceOAuthDefaultModels
-discoverOAuthDefaultModels

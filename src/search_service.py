@@ -1,0 +1,620 @@
+"""Direct-HTTP search backends shared by tool execution and management.
+
+No MCP, no conversation-route mutation, and no credentials in public results.
+A backend attempt includes OAuth acquisition, network I/O and response parsing
+under one deadline. Search retries are bounded across all keys and backends.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import html
+import ipaddress
+import json
+import os
+import re
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import urlsplit
+
+import httpx
+
+from . import config, network
+
+MODES = ("managed", "passthrough", "disabled")
+BACKEND_TYPES = ("anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic")
+ENDPOINTS = {
+    "anysearch": "https://api.anysearch.com",
+    "tavily": "https://api.tavily.com",
+    "exa": "https://api.exa.ai",
+    "brave": "https://api.search.brave.com",
+}
+NAMES = {"anysearch": "AnySearch", "tavily": "Tavily", "exa": "Exa", "brave": "Brave",
+         "openai": "OpenAI OAuth", "xai": "xAI OAuth", "anthropic": "Anthropic OAuth"}
+DEFAULTS = {
+    "functionMode": "managed", "hostedMode": "managed", "maxAttempts": 3,
+    "timeoutSeconds": 10, "maxResults": 8, "maxToolRounds": 50,
+    "maxFetchChars": 50000, "minQueryChars": 2, "maxFetchUrlChars": 2048,
+    "requireKnownUrlForFetch": True, "maxConcurrentToolCalls": 0,
+    "language": "", "country": "", "freshness": "",
+}
+_FRESH_DAYS = {"day": 1, "week": 7, "month": 31, "year": 365}
+# Portable returned-text budgets, not guesses at a provider's tokenizer/window.
+_CONTEXT_CHARS = {"low": 4000, "medium": 12000, "high": 24000}
+
+
+class SearchError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "search_failed", status_code: int = 502,
+                 retryable: bool = True):
+        super().__init__(message)
+        self.message, self.code, self.status_code, self.retryable = message, code, status_code, retryable
+
+
+def default_backend(kind: str) -> dict:
+    return {"id": kind, "type": kind, "name": NAMES[kind], "enabled": True,
+            "apiKeys": [], "endpoint": ENDPOINTS.get(kind, ""), "model": "",
+            "accountIds": [], "allowDisabledAccounts": False}
+
+
+def settings() -> dict:
+    """Effective config; intentionally private (it contains secrets). Never persist on read."""
+    cfg = config.get()
+    legacy = cfg.get("anysearch") or {}
+    current = cfg.get("search") or {}
+    result = copy.deepcopy(DEFAULTS)
+    if isinstance(legacy, dict):
+        for key in ("maxResults", "maxFetchChars", "maxToolRounds", "minQueryChars",
+                    "maxFetchUrlChars", "requireKnownUrlForFetch", "maxConcurrentToolCalls"):
+            if key in legacy:
+                result[key] = copy.deepcopy(legacy[key])
+        # Explicit old opt-out must not silently start interception on upgrade.
+        if legacy.get("enabled") is False:
+            result.update(functionMode="passthrough", hostedMode="passthrough")
+    if isinstance(current, dict):
+        result.update(copy.deepcopy(current))
+    if "backends" not in result:
+        result["backends"] = [default_backend(kind) for kind in BACKEND_TYPES]
+        key = str(legacy.get("apiKey") or os.environ.get("ANYSEARCH_API_KEY", "")).strip()
+        result["backends"][0]["apiKeys"] = [key] if key else []
+        endpoint = str(legacy.get("endpoint") or ENDPOINTS["anysearch"]).rstrip("/")
+        # Known legacy MCP URL migrates to the same origin's documented REST API.
+        result["backends"][0]["endpoint"] = endpoint.removesuffix("/mcp")
+    return result
+
+
+def _keys(backend: dict) -> list[str]:
+    values = backend.get("apiKeys") or []
+    if isinstance(values, str):
+        values = [values]
+    return list(dict.fromkeys(str(x).strip() for x in values if str(x).strip()))
+
+
+def _accounts(backend: dict) -> list[dict]:
+    from .oauth_ids import account_key
+    provider = "claude" if backend["type"] == "anthropic" else backend["type"]
+    selected = {str(x).removeprefix("oauth:") for x in backend.get("accountIds") or []}
+    result = []
+    for account in config.get().get("oauthAccounts") or []:
+        actual = account.get("provider") or "claude"
+        if actual != provider or not account.get("access_token"):
+            continue
+        if selected and account_key(account) not in selected:
+            continue
+        reason = account.get("disabled_reason")
+        if reason not in (None, "", "user"):
+            continue  # auth/quota/system failures are not a manual chat-only opt-out
+        if not backend.get("allowDisabledAccounts", False) and (
+            account.get("enabled", True) is False or reason
+        ):
+            continue
+        # A deleted/re-created account is not matched by display name or order.
+        result.append(account)
+    return result
+
+
+def backend_statuses() -> list[dict]:
+    """Configuration readiness, not a synthetic live probe. No credential-bearing fields."""
+    rows = []
+    for backend in settings().get("backends") or []:
+        kind = backend.get("type")
+        if kind not in BACKEND_TYPES:
+            continue
+        count = len(_keys(backend)) if kind in ENDPOINTS else len(_accounts(backend))
+        enabled = backend.get("enabled", True) is not False
+        rows.append({"id": backend["id"], "type": kind, "name": backend.get("name") or NAMES[kind],
+                     "enabled": enabled, "available": enabled and count > 0,
+                     "reason": "disabled" if not enabled else ("configured" if count else
+                                ("missing_credentials" if kind in ENDPOINTS else "no_eligible_accounts")),
+                     "keyCount": count if kind in ENDPOINTS else 0,
+                     "accountCount": count if kind not in ENDPOINTS else 0,
+                     "verified": kind != "anthropic"})
+    return rows
+
+
+def _domains(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SearchError("域名限制必须为数组", code="invalid_search_input", status_code=400, retryable=False)
+    result = []
+    for raw in value:
+        value = str(raw).strip().lower().removeprefix("*.")
+        parsed = urlsplit(value if "://" in value else "https://" + value)
+        host = parsed.hostname or ""
+        if not host or re.search(r"[\s()\"']", value) or parsed.username or parsed.password:
+            raise SearchError("域名限制含无效域名", code="invalid_search_input", status_code=400, retryable=False)
+        result.append(host.encode("idna").decode("ascii"))
+    return list(dict.fromkeys(result))
+
+
+def _domain_matches(url: str, domains: list[str]) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".").encode("idna").decode("ascii")
+    except (ValueError, UnicodeError):
+        return False
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _check_extract_domains(url: str, args: dict) -> None:
+    if ((args["allowed_domains"] and not _domain_matches(url, args["allowed_domains"]))
+            or (args["blocked_domains"] and _domain_matches(url, args["blocked_domains"]))):
+        raise SearchError("提取URL不符合工具的域名限制", code="url_not_allowed", status_code=400, retryable=False)
+
+
+def _query_text(args: dict) -> str:
+    """Ranking preferences also survive providers without dedicated locale fields."""
+    query = args["query"]
+    preferences = []
+    if args.get("language"):
+        preferences.append("preferred language: " + str(args["language"]))
+    if args.get("country"):
+        preferences.append("region: " + str(args["country"]))
+    location = args.get("user_location") or {}
+    if location:
+        preferences.append("approximate user location: " + ", ".join(
+            f"{field}={location[field]}" for field in ("city", "region", "country", "timezone") if location.get(field)
+        ))
+    if preferences:
+        query += " (" + "; ".join(preferences) + ")"
+    return query
+
+
+def _query(args: dict) -> str:
+    parts = []
+    if args["allowed_domains"]:
+        parts.append("(" + " OR ".join("site:" + d for d in args["allowed_domains"]) + ")")
+    parts.append(_query_text(args))
+    parts += ["-site:" + d for d in args["blocked_domains"]]
+    return " ".join(parts)
+
+
+def _arguments(arguments: dict, cfg: dict, operation: str) -> dict:
+    args = copy.deepcopy(arguments)
+    context_size = args.get("search_context_size")
+    if context_size is not None and (not isinstance(context_size, str) or context_size not in _CONTEXT_CHARS):
+        raise SearchError("search_context_size须为low/medium/high", code="invalid_search_input", status_code=400, retryable=False)
+    location = args.get("user_location")
+    if location is not None:
+        if (not isinstance(location, dict) or set(location) - {"type", "city", "region", "country", "timezone"}
+                or location.get("type", "approximate") != "approximate"
+                or any(not isinstance(value, str) or len(value) > 256 for value in location.values())):
+            raise SearchError("user_location须为合法的approximate位置对象", code="invalid_search_input", status_code=400, retryable=False)
+    if "external_web_access" in args and args["external_web_access"] not in (True, False, "cached", "indexed", "live"):
+        raise SearchError("external_web_access参数无效", code="invalid_search_input", status_code=400, retryable=False)
+    for key in ("language", "country", "freshness"):
+        if not args.get(key) and cfg.get(key):
+            args[key] = cfg[key]
+    filters = args.get("filters") if isinstance(args.get("filters"), dict) else {}
+    args["allowed_domains"] = _domains(args.get("allowed_domains", filters.get("allowed_domains")))
+    args["blocked_domains"] = list(dict.fromkeys(
+        domain for source in (args, filters) for field in ("blocked_domains", "excluded_domains")
+        for domain in _domains(source.get(field))
+    ))
+    if operation == "extract":
+        url = str(args.get("url") or "").strip()
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            raise SearchError("提取URL格式无效", code="invalid_search_input", status_code=400, retryable=False) from None
+        try:
+            address = ipaddress.ip_address(parsed.hostname or "")
+        except ValueError:
+            address = None
+        if (parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.username or parsed.password
+                or parsed.hostname.lower() in ("localhost", "localhost.localdomain")
+                or (address is not None and not address.is_global)):
+            raise SearchError("提取URL必须是公开HTTP(S)地址", code="invalid_search_input", status_code=400, retryable=False)
+        if len(url) > int(cfg["maxFetchUrlChars"]):
+            raise SearchError("提取URL超过长度限制", code="invalid_search_input", status_code=400, retryable=False)
+        _check_extract_domains(url, args)
+        args["url"] = url
+    else:
+        args["query"] = str(args.get("query") or args.get("q") or "").strip()
+        if len(args["query"]) < int(cfg["minQueryChars"]):
+            raise SearchError("搜索词为空或过短", code="invalid_search_input", status_code=400, retryable=False)
+        try:
+            args["max_results"] = max(1, min(20, int(args.get("max_results", cfg["maxResults"]))))
+        except (TypeError, ValueError):
+            raise SearchError("搜索结果数量必须为整数", code="invalid_search_input", status_code=400, retryable=False)
+        if args.get("freshness") and args["freshness"] not in _FRESH_DAYS:
+            raise SearchError("时间范围须为day/week/month/year", code="invalid_search_input", status_code=400, retryable=False)
+    return args
+
+
+def _endpoint(backend: dict, path: str) -> str:
+    base = str(backend.get("endpoint") or ENDPOINTS[backend["type"]]).rstrip("/")
+    parsed = urlsplit(base)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise SearchError("搜索后端地址配置无效", code="invalid_search_backend", status_code=400, retryable=False)
+    if base.endswith(path):
+        return base
+    if base.endswith("/v1") and path.startswith("/v1/"):
+        return base + path[3:]
+    return base + path
+
+
+def _check_response(response: httpx.Response) -> dict:
+    if response.status_code >= 400:
+        status = response.status_code
+        raise SearchError(f"搜索上游返回 HTTP {status}", code="search_upstream_error", status_code=502,
+                          retryable=status in (408, 409, 425, 429) or status >= 500)
+    try:
+        data = response.json()
+    except ValueError:
+        raise SearchError("搜索上游返回非JSON内容", code="invalid_search_response") from None
+    if not isinstance(data, dict):
+        raise SearchError("搜索上游响应结构无效", code="invalid_search_response")
+    if data.get("error"):
+        raise SearchError("搜索上游报告执行错误", code="search_upstream_error")
+    return data
+
+
+def _normalize_rows(rows: list, args: dict) -> list[dict]:
+    output, seen = [], set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        if urlsplit(url).scheme not in ("http", "https") or url in seen:
+            continue
+        if args["allowed_domains"] and not _domain_matches(url, args["allowed_domains"]):
+            continue
+        if args["blocked_domains"] and _domain_matches(url, args["blocked_domains"]):
+            continue
+        seen.add(url)
+        text = str(item.get("snippet") or item.get("description") or item.get("content") or item.get("text") or "")
+        row = {"title": str(item.get("title") or ""), "url": url,
+               "snippet": html.unescape(re.sub(r"</?(?:strong|b|em|mark)>", "", text))}
+        published = item.get("publishedDate") or item.get("published_at") or item.get("page_age")
+        if published:
+            row["published_at"] = published
+        output.append(row)
+    return output[:args["max_results"]]
+
+
+async def _http_adapter(backend: dict, credential: str, args: dict, operation: str, cfg: dict) -> dict:
+    kind = backend["type"]
+    headers, params, payload = {"accept": "application/json"}, None, None
+    method = "POST"
+    freshness = args.get("freshness")
+    if kind == "anysearch":
+        headers["Authorization"] = "Bearer " + credential
+        url = _endpoint(backend, "/v1/" + ("search" if operation == "search" else "extract"))
+        payload = {"url": args["url"]} if operation == "extract" else {
+            "query": _query(args), "max_results": min(10, args["max_results"])}
+        if operation == "search":
+            for key in ("language", "zone", "tag"):
+                if args.get(key): payload[key] = args[key]
+            if freshness: payload["params"] = {"freshness": freshness}
+    elif kind == "tavily":
+        headers["Authorization"] = "Bearer " + credential
+        url = _endpoint(backend, "/search" if operation == "search" else "/extract")
+        payload = {"urls": [args["url"]], "format": "markdown"} if operation == "extract" else {
+            "query": _query_text(args), "max_results": args["max_results"], "search_depth": "basic",
+            "include_domains": args["allowed_domains"], "exclude_domains": args["blocked_domains"]}
+        if operation == "search" and freshness: payload["time_range"] = freshness
+    elif kind == "exa":
+        headers["x-api-key"] = credential
+        url = _endpoint(backend, "/search" if operation == "search" else "/contents")
+        contents = {"text": {"maxCharacters": int(cfg["maxFetchChars"]) if operation == "extract" else 2000}}
+        payload = {"ids": [args["url"]], **contents} if operation == "extract" else {
+            "query": _query_text(args), "numResults": args["max_results"], "type": "auto", "contents": contents}
+        if operation == "search":
+            if args["allowed_domains"]: payload["includeDomains"] = args["allowed_domains"]
+            if args["blocked_domains"]: payload["excludeDomains"] = args["blocked_domains"]
+            if freshness:
+                payload["startPublishedDate"] = (datetime.now(timezone.utc) - timedelta(days=_FRESH_DAYS[freshness])).isoformat()
+    else:  # Brave has search, not a general page extractor.
+        if operation == "extract":
+            raise SearchError("Brave不提供网页提取接口", code="search_capability_unavailable", retryable=False)
+        headers["X-Subscription-Token"] = credential
+        url, method = _endpoint(backend, "/res/v1/web/search"), "GET"
+        params = {"q": _query(args), "count": args["max_results"], "extra_snippets": "true"}
+        if freshness: params["freshness"] = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}[freshness]
+        if args.get("country"): params["country"] = args["country"]
+        if args.get("language"): params["search_lang"] = args["language"]
+    async with network.async_client(timeout=httpx.Timeout(float(cfg["timeoutSeconds"])), follow_redirects=False) as client:
+        response = await client.request(method, url, headers=headers, json=payload, params=params)
+    data = _check_response(response)
+    if kind == "anysearch":
+        if data.get("code") != 0:
+            raise SearchError("AnySearch报告搜索执行失败", code="search_upstream_error")
+        data = data.get("data") or {}
+        if not isinstance(data, dict):
+            raise SearchError("AnySearch结果结构无效", code="invalid_search_response")
+    result = {}
+    usage = data.get("usage") or data.get("costDollars")
+    if usage is not None: result["usage"] = usage
+    if operation == "extract":
+        row = data if kind == "anysearch" else next(iter(data.get("results") or []), {})
+        effective_url = str(row.get("url") or args["url"])
+        _check_extract_domains(effective_url, args)
+        content = row.get("content") or row.get("raw_content") or row.get("text")
+        if not content:
+            raise SearchError("上游没有返回网页正文", code="empty_extract_response")
+        result.update(url=effective_url, content=str(content)[:int(cfg["maxFetchChars"])])
+    else:
+        rows = (data.get("web") or {}).get("results") if kind == "brave" else data.get("results")
+        if not isinstance(rows, list):
+            raise SearchError("搜索上游缺少结果数组", code="invalid_search_response")
+        result.update(query=args["query"], results=_normalize_rows(rows, args))
+        if data.get("answer"): result["answer"] = data["answer"]
+    return result
+
+
+async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: str, cfg: dict) -> dict:
+    from . import oauth_manager
+    from .oauth_ids import account_key
+    from .openai.codex_constants import codex_backend_base_url, codex_cli_user_agent, codex_cli_version, codex_originator
+    kind = backend["type"]
+    key = account_key(account)
+    state_key = oauth_manager.account_state_key(account)
+    headers = {"content-type": "application/json", "accept": "application/json"}
+    if kind != "anthropic":
+        token = await oauth_manager.ensure_valid_token(key, expected_state_key=state_key)
+        headers["authorization"] = "Bearer " + token
+    model = str(backend.get("model") or {"openai": "gpt-5.5", "xai": "grok-4.6", "anthropic": "claude-sonnet-4-6"}[kind])
+    if kind == "openai":
+        with oauth_manager.account_generation_guard(state_key) as current:
+            if not current:
+                raise SearchError("搜索账户身份已变更", code="search_account_retired", status_code=503, retryable=False)
+            account = copy.deepcopy(oauth_manager.get_account(key) or account)
+        prov = config.get().get("openaiOAuth") or {}
+        headers.update({"chatgpt-account-id": account.get("workspace_id") or account.get("chatgpt_account_id") or "",
+                        "originator": codex_originator(prov), "user-agent": codex_cli_user_agent(prov), "version": codex_cli_version(prov)})
+        search_settings = {"search_context_size": args.get("search_context_size") or "low"}
+        filters = {key: args[key] for key in ("allowed_domains", "blocked_domains") if args[key]}
+        if filters:
+            search_settings["filters"] = filters
+        if args.get("user_location"): search_settings["user_location"] = args["user_location"]
+        if "external_web_access" in args: search_settings["external_web_access"] = args["external_web_access"]
+        if operation == "extract":
+            commands = {"open": [{"ref_id": args["url"]}], "response_length": "long"}
+        else:
+            query = {"q": _query_text(args)}
+            if args.get("freshness"): query["recency"] = _FRESH_DAYS[args["freshness"]]
+            if args["allowed_domains"]: query["domains"] = args["allowed_domains"]
+            commands = {"search_query": [query], "response_length": "short"}
+        payload = {"id": "parrot-search-" + uuid.uuid4().hex, "model": model, "commands": commands,
+                   "settings": search_settings, "max_output_tokens": 2000}
+        url = (str(backend.get("endpoint") or codex_backend_base_url(prov))).rstrip("/") + "/alpha/search"
+    elif kind == "xai":
+        if operation == "extract":
+            raise SearchError("xAI搜索不作为网页正文提取接口", code="search_capability_unavailable", retryable=False)
+        tool = {"type": "web_search"}
+        filters = {}
+        if args["allowed_domains"]: filters["allowed_domains"] = args["allowed_domains"]
+        if args["blocked_domains"]: filters["excluded_domains"] = args["blocked_domains"]
+        if filters: tool["filters"] = filters
+        query = _query(args)
+        if args.get("freshness"): query += " (published in the past " + args["freshness"] + ")"
+        payload = {"model": model, "stream": True, "reasoning": {"effort": "low"},
+                   "input": [{"role": "user", "content": "Use web search to find: " + query +
+                              f". Return only up to {args['max_results']} source titles and URLs."}],
+                   "tools": [tool], "tool_choice": "required", "max_output_tokens": 1200, "max_tool_calls": 1}
+        url = str(backend.get("endpoint") or account.get("base_url") or "https://api.x.ai/v1").rstrip("/") + "/responses"
+        headers.update({"user-agent": "xai-sdk-python", "accept": "text/event-stream"})
+    else:
+        if operation == "extract":
+            raise SearchError("Anthropic网页提取尚未验证", code="search_capability_unavailable", retryable=False)
+        # Reuse the application's CC OAuth identity, beta policy and signed body.
+        # CPA preserves native web_search_* (and omits ambiguous empty domains).
+        from .channel.oauth_channel import OAuthChannel
+        channel = OAuthChannel(account)
+        channel.state_key = state_key
+        tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+        if args["allowed_domains"]: tool["allowed_domains"] = args["allowed_domains"]
+        if args["blocked_domains"]: tool["blocked_domains"] = args["blocked_domains"]
+        query = _query(args)
+        if args.get("freshness"):
+            query += " (published in the past " + args["freshness"] + ")"
+        body = {"model": model, "max_tokens": 1600, "stream": False, "tools": [tool],
+                "tool_choice": {"type": "tool", "name": "web_search"},
+                "messages": [{"role": "user", "content": "Search the web for: " + query}]}
+        upstream = await channel.build_upstream_request(body, model)
+        url, headers, payload = upstream.url, upstream.headers, upstream.body
+    async with network.async_client(timeout=httpx.Timeout(float(cfg["timeoutSeconds"])), follow_redirects=False,
+                                    proxy_purpose="oauth_" + ("claude" if kind == "anthropic" else kind),
+                                    proxy_channel="oauth:" + key, proxy_model=model) as client:
+        with oauth_manager.account_generation_guard(state_key) as current:
+            if not current:
+                raise SearchError("搜索账户身份已变更", code="search_account_retired", status_code=503, retryable=False)
+        if kind == "xai":
+            terminal = None
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    _check_response(response)
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"): continue
+                    text = line[5:].strip()
+                    if not text or text == "[DONE]": continue
+                    event = json.loads(text)
+                    if event.get("type") == "response.completed":
+                        terminal = event.get("response")
+                        break
+                    if event.get("type") in ("error", "response.failed", "response.incomplete"):
+                        raise SearchError("xAI搜索未正常完成", code="search_upstream_error")
+            if not isinstance(terminal, dict):
+                raise SearchError("xAI搜索流缺少完成事件", code="incomplete_search_response")
+            data = terminal
+        else:
+            kwargs = {"content": payload} if isinstance(payload, (str, bytes)) else {"json": payload}
+            response = await client.post(url, headers=headers, **kwargs)
+            data = _check_response(response)
+    result = {}
+    if data.get("usage") is not None: result["usage"] = data["usage"]
+    if kind == "openai":
+        if operation == "extract":
+            content = data.get("output")
+            if not isinstance(content, str) or not content:
+                raise SearchError("OpenAI未返回网页正文", code="empty_extract_response")
+            result.update(url=args["url"], content=content[:int(cfg["maxFetchChars"])])
+        else:
+            rows = data.get("results")
+            if not isinstance(rows, list):
+                raise SearchError("OpenAI搜索缺少结构化结果", code="invalid_search_response")
+            result.update(query=args["query"], results=_normalize_rows(rows, args))
+    elif kind == "xai":
+        rows, citations, answer, searched = [], [], [], False
+        for item in data.get("output") or []:
+            if item.get("type") == "web_search_call":
+                searched = True
+                rows.extend((item.get("action") or {}).get("sources") or [])
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text": answer.append(part.get("text") or "")
+                for citation in part.get("annotations") or []:
+                    if citation.get("type") == "url_citation": citations.append(citation)
+        if not searched:
+            raise SearchError("xAI未执行要求的原生搜索", code="search_not_executed")
+        result.update(query=args["query"], results=_normalize_rows(citations + rows, args), answer="\n".join(answer))
+    else:
+        rows, answer, searched = [], [], False
+        for block in data.get("content") or []:
+            if block.get("type") == "web_search_tool_result":
+                searched = True
+                content = block.get("content")
+                if isinstance(content, dict) and content.get("type") == "web_search_tool_result_error":
+                    raise SearchError("Anthropic搜索工具执行失败", code="search_upstream_error")
+                if isinstance(content, list): rows.extend(content)
+            elif block.get("type") == "text":
+                answer.append(block.get("text") or "")
+                rows.extend({"url": x.get("url"), "title": x.get("title"), "snippet": x.get("cited_text")}
+                            for x in block.get("citations") or [] if x.get("url"))
+        if not searched:
+            raise SearchError("Anthropic未执行要求的搜索", code="search_not_executed")
+        result.update(query=args["query"], results=_normalize_rows(rows, args), answer="\n".join(answer))
+    return result
+
+
+def _portable_context(result: dict, args: dict) -> None:
+    """Adapt context preference without changing retrieval cost or truncating JSON/URLs."""
+    level = args.get("search_context_size")
+    if level not in _CONTEXT_CHARS:
+        return
+    maximum = _CONTEXT_CHARS[level]
+    remaining, truncated = maximum, False
+    for row in [*(result.get("results") or []), result]:
+        for field in ("snippet", "content", "answer"):
+            value = row.get(field)
+            if not isinstance(value, str):
+                continue
+            take = min(remaining, len(value))
+            row[field] = value[:take]
+            remaining -= take
+            truncated |= take != len(value)
+    result["context_budget"] = {"requested": level, "method": "parrot_returned_text_char_cap", "max_chars": maximum}
+    if truncated:
+        result["truncated"] = True
+
+
+async def _run(operation: str, arguments: dict, *, request_id: str | None = None,
+               backend_id: str | None = None) -> dict:
+    cfg = settings()
+    args = _arguments(arguments, cfg, operation)
+    candidates = []
+    cached_only = args.get("external_web_access") is False or args.get("external_web_access") in ("cached", "indexed")
+    for backend in cfg.get("backends") or []:
+        kind = backend.get("type")
+        if kind not in BACKEND_TYPES or backend.get("enabled", True) is False:
+            continue
+        if backend_id and backend.get("id") != backend_id:
+            continue
+        if cached_only and kind != "openai":
+            continue
+        if operation == "extract" and kind not in ("anysearch", "tavily", "exa", "openai"):
+            continue
+        credentials = _keys(backend) if kind in ENDPOINTS else _accounts(backend)
+        candidates.extend((backend, credential) for credential in credentials)
+    if not candidates:
+        if cached_only:
+            raise SearchError("没有支持离线/缓存搜索的可用OpenAI来源；未发送在线搜索请求", code="offline_search_unavailable", status_code=503, retryable=False)
+        raise SearchError("没有已配置且可用的搜索来源", code="no_search_backend", status_code=503, retryable=False)
+    attempts, permanent = [], set()
+    maximum = max(1, min(10, int(cfg["maxAttempts"])))
+    cursor = 0
+    last = None
+    for _ in range(maximum):
+        eligible = [i for i in range(len(candidates)) if i not in permanent]
+        if not eligible: break
+        index = next((i for i in eligible if i >= cursor), eligible[0])
+        cursor = (index + 1) % len(candidates)
+        backend, credential = candidates[index]
+        started = time.monotonic()
+        attempt = {"backend_id": backend["id"], "provider": backend["type"]}
+        try:
+            async with asyncio.timeout(float(cfg["timeoutSeconds"])):
+                if backend["type"] in ENDPOINTS:
+                    result = await _http_adapter(backend, credential, args, operation, cfg)
+                else:
+                    result = await _oauth_adapter(backend, credential, args, operation, cfg)
+            attempt.update(status="success", elapsed_ms=round((time.monotonic() - started) * 1000))
+            attempts.append(attempt)
+            result.update(provider=backend["type"], backend_id=backend["id"], attempts=attempts)
+            warnings = []
+            if operation == "search" and backend["type"] != "openai":
+                if args.get("user_location"):
+                    warnings.append("approximate_user_location_applied_to_query_not_a_native_location_control")
+                if args.get("search_context_size"):
+                    _portable_context(result, args)
+                    warnings.append("search_context_size_adapted_to_returned_text_char_budget_not_native_context_tokens")
+            if operation == "search" and (args.get("language") or args.get("country")) and backend["type"] != "brave":
+                warnings.append("locale_preferences_applied_to_query_not_a_hard_filter")
+            if operation == "search" and args.get("freshness") and backend["type"] in ("xai", "anthropic", "anysearch"):
+                warnings.append("freshness_is_a_backend_preference_not_a_verified_hard_filter")
+            if warnings:
+                result["warnings"] = warnings
+            return result
+        except (TimeoutError, httpx.TimeoutException):
+            last = SearchError("搜索调用超时", code="search_timeout", status_code=504)
+        except SearchError as exc:
+            last = exc
+            if exc.code == "url_not_allowed":
+                # A policy refusal is not a backend outage to bypass elsewhere.
+                raise
+            if not exc.retryable: permanent.add(index)
+        except httpx.RequestError:
+            last = SearchError("搜索上游网络错误", code="search_network_error")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Exceptions may embed tokens/URLs/account identities. Never relay them.
+            last = SearchError("搜索上游认证或响应处理失败", code="search_backend_error", retryable=False)
+            permanent.add(index)
+        attempt.update(status="error", code=last.code, elapsed_ms=round((time.monotonic() - started) * 1000))
+        attempts.append(attempt)
+    assert last is not None
+    error = SearchError(f"{last.message}（总尝试 {len(attempts)} 次）", code=last.code,
+                        status_code=last.status_code, retryable=last.retryable)
+    error.attempts = attempts
+    raise error
+
+
+async def search(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None) -> dict:
+    return await _run("search", arguments, request_id=request_id, backend_id=backend_id)
+
+
+async def extract(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None) -> dict:
+    return await _run("extract", arguments, request_id=request_id, backend_id=backend_id)

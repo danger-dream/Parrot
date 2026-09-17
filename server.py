@@ -126,7 +126,6 @@ def _telegram_control_bindings(controls: ManagementControls):
         (tgbot.oauth_menu, "oauth_control", controls.oauth),
         (tgbot.oauth_menu.workbuddy_menu, "oauth_control", controls.oauth),
         (tgbot.oauth_account_models_menu, "oauth_control", controls.oauth),
-        (tgbot.oauth_defaults_menu, "oauth_control", controls.oauth),
         (tgbot.translation_menu, "_CONTROL", auxiliary.translation),
         (tgbot.status_alert_menu, "_CONTROL", auxiliary.status_alerts),
         (tgbot.update_menu, "_CONTROL", auxiliary.updates),
@@ -1017,10 +1016,14 @@ async def list_models(request: Request):
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    all_models = [
-        model for model in registry.available_models()
+    from src import image_catalog
+    image_models = image_catalog.available_models() if auth.images_allowed(key_name) else []
+    known_image_models = image_catalog.models()
+    all_models = sorted({
+        model for model in registry.available_models() + image_models
         if model_state.is_discovery_visible(model)
-    ]
+        and (model not in known_image_models or model in image_models)
+    })
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
@@ -1035,6 +1038,12 @@ async def list_models(request: Request):
     alias_seen: set[str] = set()
     for _alias, _real in model_mapping.get_global_map().items():
         if _alias in visible_set:
+            continue
+        if _real in image_models:
+            if model_state.is_discovery_visible(_alias) and (
+                not allowed_models or _alias in allowed_set or _real in allowed_set
+            ):
+                alias_seen.add(_alias)
             continue
         if _real not in visible_set:
             continue
@@ -1142,7 +1151,14 @@ async def proxy_images_edit(request: Request):
     return await handle_edit(request)
 
 
-# OpenAI Images API 兼容入口：按 model 在 GPT/Codex 与 xAI OAuth 间分流。
+@app.get("/v1/images/assets/{token}", include_in_schema=False)
+async def download_image_asset(request: Request, token: str):
+    """Expiring bearer-capability URL; no management path or credentials."""
+    from src.image_artifacts import download
+    return await download(request, token)
+
+
+# Unified Images API: configured OAuth/API source selected by model.
 @app.post(
     "/v1/images/generations",
     summary="OpenAI-compatible image generation",
@@ -1150,9 +1166,9 @@ async def proxy_images_edit(request: Request):
         "Standard OpenAI `/v1/images/generations` endpoint. Accepts `prompt`, "
         "`model`, `n`, `size`, `response_format`, `quality`, `background`, "
         "`output_format`, `moderation`, `style`, `output_compression`, "
-        "`partial_images`. Configured `grok-imagine-image*` models use the xAI "
-        "OAuth pool; all other models retain the GPT/Codex image pipeline. "
-        "Only the GPT/Codex path downgrades `n > 1` to one image."
+        "final images. Model selects a configured OAuth/API image source. "
+        "Codex requests split n into at most n sequential generations (n <= 10). "
+        "Exact sizes use non-cropping contain/padding when necessary; URL results expire after one hour."
     ),
     tags=["images"],
 )
@@ -1251,6 +1267,15 @@ async def proxy_messages(request: Request):
         return errors.json_error_response(
             400, errors.ErrType.INVALID_REQUEST, exc.message,
         )
+
+    from src import search_tool_policy
+    body.pop(search_tool_policy.ROUND_KEY, None)
+    body.pop("_parrot_search_original_tools", None)
+    from src.openai.transform.guard import GuardError as SearchPolicyError
+    try:
+        search_tool_policy.validate(body)
+    except SearchPolicyError as exc:
+        return errors.json_error_response(400, errors.ErrType.INVALID_REQUEST, exc.message)
 
     # 2.1 保存下游显式能力信号，再做模型映射：
     #     - anthropic-beta 可显式请求 context-1m；

@@ -559,7 +559,7 @@ def test_channel_basic(m):
 
 
 def test_channel_default_models_fallback(m):
-    """账户与配置都不设 models → Channel 使用选中版本化 profile。"""
+    """账户无目录时不可路由，不能借协议 profile 冒充目录。"""
     _setup(m)
     # 直接调 add_account（不走 _add_openai_acc helper，后者会塞硬编码的 models）
     m["oauth_manager"].add_account({
@@ -571,15 +571,13 @@ def test_channel_default_models_fallback(m):
     })
     ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:no-models@x:acct"))
     models = ch.list_client_models()
-    expected = set(m["CODEX_PROFILE_MODELS"])
-    assert set(models) == expected, models
-    # supports_model 命中
-    for m_id in expected:
-        assert ch.supports_model(m_id) == m_id
-    # 不在默认列表的别名不会命中（需用户手动补 models）
+    assert models == []
+    for model in m["CODEX_PROFILE_MODELS"]:
+        assert ch.supports_model(model) is None
+    # 协议档案仍保留，但不用于路由。
     assert ch.supports_model("gpt-5") is None
     assert ch.supports_model("gpt-5.1") is None
-    print("  [PASS] channel: default models from selected Codex profile")
+    print("  [PASS] channel: no catalog means no routable models")
 
 
 def test_channel_responses_ingress(m):
@@ -1139,7 +1137,7 @@ def test_channel_codex_rejects_unsupported_responses_server_state(m):
     for body, label in (
         ({"model": "gpt-5.1", "conversation": "conv_1", "input": "hi"}, "conversation"),
         ({"model": "gpt-5.1", "background": True, "input": "hi"}, "background"),
-        ({"model": "gpt-5.1", "input": "hi", "tools": [{"type": "web_search", "name": "search"}]}, "tools:web_search"),
+        ({"model": "gpt-5.1", "input": "hi", "tools": [{"type": "file_search"}]}, "tools:file_search"),
         ({"model": "gpt-5.1", "input": [{"type": "message", "role": "user", "content": [
             {"type": "input_file", "file_id": "file_doc"},
         ]}]}, "input_file.file_id"),
@@ -1153,7 +1151,15 @@ def test_channel_codex_rejects_unsupported_responses_server_state(m):
         except ValueError as exc:
             assert label in str(exc), str(exc)
 
-    print("  [PASS] channel: Codex rejects unsupported Responses server-state before upstream")
+    # Native search is no longer globally blocked: passthrough preserves the
+    # declaration; managed requests arrive here as compiled function tools.
+    tools = [{"type": "web_search", "search_context_size": "low"}]
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5.1", "input": "hi", "tools": tools},
+        "gpt-5.1", ingress_protocol="responses",
+    ))
+    assert json.loads(req.body)["tools"] == tools
+    print("  [PASS] channel: Codex preserves native search, rejects unsupported server-state")
 
 
 def test_channel_codex_rejects_translated_chat_file_id(m):
@@ -1585,7 +1591,7 @@ def test_config_backfills_openai_oauth_from_legacy_provider(m):
     assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
     assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
     assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
-    assert merged["openaiOAuth"]["defaultModels"] == ["legacy-model"]
+    assert "defaultModels" not in merged["openaiOAuth"]
     assert "codexUpstreamUrl" not in merged["openaiOAuth"]
     print("  [PASS] config: legacy oauth.providers.openai backfills openaiOAuth")
 

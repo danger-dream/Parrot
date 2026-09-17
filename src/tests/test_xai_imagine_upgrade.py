@@ -104,11 +104,12 @@ legacy_key = loaded["apiKeys"]["legacy-client"]
 assert legacy_key["allowImages"] is True
 assert legacy_key["allowVideos"] is False
 assert legacy_key["allowedModels"] == ["legacy-model"]
-assert loaded["xaiOAuth"]["defaultModels"] == ["legacy-grok-model"]
-assert loaded["xaiOAuth"]["imageModels"] == [
+assert "defaultModels" not in loaded["xaiOAuth"]
+from src import media_config
+assert media_config.model_map("image", loaded)["xai"] == [
     "grok-imagine-image", "grok-imagine-image-quality"
 ]
-assert loaded["xaiOAuth"]["videoModels"] == [
+assert media_config.model_map("video", loaded)["xai"] == [
     "grok-imagine-video", "grok-imagine-video-1.5"
 ]
 
@@ -116,7 +117,7 @@ assert loaded["xaiOAuth"]["videoModels"] == [
 with open(config_path, "r", encoding="utf-8") as f:
     saved = json.load(f)
 assert saved["apiKeys"]["legacy-client"] == legacy_key
-assert saved["xaiOAuth"]["defaultModels"] == ["legacy-grok-model"]
+assert "defaultModels" not in saved["xaiOAuth"]
 '''
 
     env = os.environ.copy()

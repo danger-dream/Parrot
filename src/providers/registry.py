@@ -72,8 +72,9 @@ def capabilities_for_channel(channel):
 
 
 def filter_request_payload(channel, payload: dict, *, protocol: str, bridge: bool = False) -> dict:
+    from ..search_native_tools import adapt_payload
     return adapter_for_channel(channel).filter_request_payload(
-        payload,
+        adapt_payload(channel, payload),
         protocol=protocol,
         bridge=bridge,
     )

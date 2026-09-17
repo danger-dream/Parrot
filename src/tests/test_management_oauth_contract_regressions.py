@@ -40,7 +40,6 @@ def snapshot_backend(backend):
         "cooldowns": backend.cooldowns,
         "settings": backend.settings,
         "preferences": backend.preferences,
-        "defaults": backend.defaults,
         "affinity": backend.affinity_cleared,
         "reset": backend.last_reset_idempotency_key,
         "exchange": backend.provider_exchange_count,
@@ -560,20 +559,6 @@ def test_atomic_cas_prevents_interleaving_lost_updates_across_all_owned_mutation
         assert pref.status_code == 409
         assert backend.preferences == ["remaining", True]
 
-        defaults = request(client, "GET", "/oauth/default-models/openai", None, headers).json()["data"]
-        backend.interleave_once = lambda: backend.default_references["openai"]["mappings"].append({
-            "ingress": "openai-chat", "alias": "new-ref", "real": "gpt-alpha",
-        })
-        default_update = request(
-            client,
-            "PUT",
-            "/oauth/default-models/openai",
-            {"models": ["gpt-new"], "cleanupReferences": True},
-            {**headers, "If-Match": defaults["revision"]},
-        )
-        assert default_update.status_code == 409
-        assert backend.defaults["openai"] == ["gpt-alpha"]
-
         delete_revision = request(
             client, "GET", f"/oauth/accounts/{INVALID_ID}", None, headers,
         ).json()["data"]["account"]["revision"]
@@ -662,80 +647,6 @@ def test_cursor_setting_requires_cursor_visible_model_and_valid_tier_with_modeli
         client.__exit__(None, None, None)
 
 
-def test_default_revision_covers_references_requires_if_match_and_fields_are_indexed(tmp_path):
-    client, headers, _, _, backend = auth_client(tmp_path)
-    try:
-        backend.default_references["openai"] = {
-            "apiKeys": [{"name": "key-a", "hits": ["gpt-alpha"]}],
-            "mappings": [],
-            "defaults": [],
-            "would_empty_keys": ["key-a"],
-        }
-        first = request(client, "GET", "/oauth/default-models/openai", None, headers).json()["data"]
-        backend.default_references["openai"]["mappings"].append({
-            "ingress": "openai-chat", "alias": "alias", "real": "gpt-alpha",
-        })
-        second = request(client, "GET", "/oauth/default-models/openai", None, headers).json()["data"]
-        assert first["revision"] != second["revision"]
-        no_guard = request(
-            client,
-            "PUT",
-            "/oauth/default-models/openai",
-            {"models": ["gpt-new"], "cleanupReferences": True},
-            headers,
-        )
-        assert no_guard.status_code == 400
-        assert no_guard.json()["error"]["code"] == "CONFIRMATION_REQUIRED"
-        stale = request(
-            client,
-            "PUT",
-            "/oauth/default-models/openai",
-            {"models": ["gpt-new"], "cleanupReferences": True},
-            {**headers, "If-Match": first["revision"]},
-        )
-        assert stale.status_code == 409
-        invalid = request(
-            client,
-            "PUT",
-            "/oauth/default-models/openai",
-            {"models": ["gpt-new", "bad model"], "cleanupReferences": False},
-            headers,
-        )
-        assert invalid.status_code == 422
-        assert invalid.json()["error"]["fields"][0]["path"] == "models[1]"
-
-        duplicate = request(
-            client,
-            "PUT",
-            "/oauth/default-models/openai",
-            {"models": ["gpt-new", "gpt-new"], "cleanupReferences": False},
-            headers,
-        )
-        assert duplicate.status_code == 422
-        assert duplicate.json()["error"]["fields"] == [{
-            "path": "models[1]",
-            "code": "DUPLICATE_MODEL",
-            "message": "Duplicate model ID",
-        }]
-
-        too_many = request(
-            client,
-            "PUT",
-            "/oauth/default-models/openai",
-            {
-                "models": [f"model-{index}" for index in range(201)],
-                "cleanupReferences": False,
-            },
-            headers,
-        )
-        assert too_many.status_code == 422
-        assert too_many.json()["error"]["fields"] == [{
-            "path": "models[200]",
-            "code": "TOO_MANY_MODELS",
-            "message": "At most 200 models are allowed",
-        }]
-    finally:
-        client.__exit__(None, None, None)
 
 
 def test_historical_modes_and_invalid_predicate_follow_frozen_tg_fallback(tmp_path):

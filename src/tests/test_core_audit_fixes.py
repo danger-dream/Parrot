@@ -138,9 +138,9 @@ def test_snapshot_explicitly_unpriced_must_not_reuse_active_catalog_price():
     assert priced.tariff is None, priced
 
 
-def test_new_alias_patch_rejects_fallback_real_model_collision():
-    config.update(lambda c: c.update(oauthAccounts=[{'provider':'claude','email':'fallback@example.test','models':[]}],
-        oauthDefaultModels=['real-a','real-b'], modelMapping={'global':{'old':'real-b'}}))
+def test_new_alias_patch_rejects_account_real_model_collision():
+    config.update(lambda c: c.update(oauthAccounts=[{'provider':'claude','email':'catalog@example.test','models':['real-a','real-b']}],
+        modelMapping={'global':{'old':'real-b'}}))
     registry.rebuild_from_config()
     assert 'real-a' in registry.available_models()
     control = MappingControl()

@@ -277,11 +277,7 @@ def test_antigravity_merges_prod_and_daily_with_daily_metadata_precedence(monkey
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "api_base_url", lambda: "https://prod.example/base/")
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "daily_api_base_url", lambda: "https://daily.example/base")
     monkeypatch.setattr(oauth_model_discovery.antigravity_provider, "image_models", lambda: ["gemini-image"])
-    monkeypatch.setattr(
-        oauth_model_discovery.antigravity_provider,
-        "default_models",
-        lambda: pytest.fail("account discovery must not read fallback default models"),
-    )
+    assert not hasattr(oauth_model_discovery.antigravity_provider, "default_models")
 
     result = oauth_model_discovery.discover_antigravity(
         {"access_token": "tok", "project_id": "p"}, timeout=0.2, proxy_channel="oauth:test",
@@ -444,21 +440,21 @@ async def test_fresh_replaces_lkg_failure_and_empty_preserve(monkeypatch, accoun
 async def _async_value(value): return value
 
 
-def test_fallback_stateless_disabled_isolation_and_four_channels(account_config):
+def test_empty_catalog_disabled_isolation_and_four_channels(account_config):
     def mutate(cfg):
         cfg["oauthAccounts"][0]["models"] = []
         cfg["oauthAccounts"][0]["disabledModels"] = ["gpt-default"]
     config.update(mutate)
     selection = oauth_manager.account_model_selection("openai:a@x:ws-a")
-    assert selection["fallback"] and selection["models"] == ["gpt-default"]
+    assert selection["models"] == []
     assert selection["effective_models"] == []
-    # Default list remains a plain list and is not changed by account state.
-    assert config.get()["openaiOAuth"]["defaultModels"] == ["gpt-default"]
+    # Retired defaults cannot be restored by account state.
+    assert "defaultModels" not in config.get()["openaiOAuth"]
     assert oauth_manager.account_disabled_models("openai:b@x:ws-b") == set()
 
     common = {"email": "x", "access_token": "t", "refresh_token": "r", "models": ["m1", "m2"], "disabledModels": ["m2"]}
     channels = [
-        OAuthChannel({**common, "provider": "claude"}, ["fallback"]),
+        OAuthChannel({**common, "provider": "claude"}),
         OpenAIOAuthChannel({**common, "provider": "openai"}),
         XAIOAuthChannel({**common, "provider": "xai", "subject": "s"}),
         AntigravityOAuthChannel({**common, "provider": "antigravity", "project_id": "p"}),
@@ -481,7 +477,7 @@ def test_batch_disabled_models_preserves_hidden_snapshot_scope(account_config):
     assert saved == {"m2", "hidden-old", "new-after-open"}
     assert oauth_manager.account_disabled_models(account_key) == saved
     assert oauth_manager.account_disabled_models("openai:b@x:ws-b") == set()
-    assert config.get()["openaiOAuth"]["defaultModels"] == ["gpt-default"]
+    assert "defaultModels" not in config.get()["openaiOAuth"]
     with pytest.raises(ValueError, match="not in editor snapshot"):
         oauth_manager.set_account_disabled_models(
             account_key, ["not-visible"], visible_models=["m1", "m2"],
@@ -526,7 +522,7 @@ def test_status_priority_pagination_numeric_keyboard_and_banner(monkeypatch, acc
 
     config.update(lambda cfg: (cfg["oauthAccounts"][0].update(models=[], disabledModels=[], last_model_sync_error="timeout")))
     fallback, _ = oauth_account_models_menu.render(account_key)
-    assert "上游同步失败/尚无账户目录，正在使用默认模型" in fallback
+    assert "当前无可路由模型。请点击「同步上游」" in fallback
 
 
 def test_cursor_unified_bulk_button_opens_complete_legacy_editor(monkeypatch, account_config):
@@ -807,10 +803,10 @@ async def test_metadata_atomic_persistence_and_failed_sync_preserves_lkg(monkeyp
     assert failed["models"] == ["rich-id"] and failed["account_model_catalog"] == rich
 
 
-def test_fallback_ids_have_no_fake_metadata(account_config):
+def test_empty_catalog_has_no_fake_metadata(account_config):
     config.update(lambda cfg: cfg["oauthAccounts"][0].update(models=[], account_model_catalog={"schema": 1, "models": [{"id": "gpt-default", "contextWindow": 999}]}))
     selection = oauth_manager.account_model_selection("openai:a@x:ws-a")
-    assert selection["fallback"] and selection["records"] == []
+    assert selection["models"] == [] and selection["records"] == []
     text, _ = oauth_account_models_menu.render("openai:a@x:ws-a")
     assert "上下文：" not in text
 
@@ -924,8 +920,8 @@ def test_three_sync_failure_visibility_states(account_config):
         last_model_sync="", last_model_sync_error="first failure",
     ))
     first_default, _ = oauth_account_models_menu.render(account_key)
-    assert "正在使用默认模型" in first_default
-    assert "<code>gpt-default</code>" in first_default
+    assert "当前无可路由模型" in first_default and "同步上游" in first_default
+    assert "<code>gpt-default</code>" not in first_default
 
     config.update(lambda cfg: cfg.update(oauthAccounts=[{
         "provider": "cursor", "subject": "new-cursor", "label": "Cursor New",
@@ -934,5 +930,5 @@ def test_three_sync_failure_visibility_states(account_config):
     }]))
     cursor_zero, _ = oauth_account_models_menu.render("cursor:new-cursor")
     assert "共 0 个" in cursor_zero
-    assert "没有可用账户目录，后台会重试" in cursor_zero
+    assert "当前无可路由模型" in cursor_zero and "同步上游" in cursor_zero
     assert "<code>stale</code>" not in cursor_zero

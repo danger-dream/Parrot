@@ -90,7 +90,7 @@ from ..openai.codex_constants import (
 )
 
 _CODEX_UNSUPPORTED_STATEFUL_INPUT_TYPES = frozenset({
-    "web_search_call", "file_search_call", "computer_call",
+    "file_search_call", "computer_call",
     "image_generation_call", "code_interpreter_call",
     "mcp_call", "mcp_list_tools", "mcp_approval_request",
     "mcp_approval_response",
@@ -146,9 +146,8 @@ def _apply_explicit_field_policies(
 
 
 _CODEX_UNSUPPORTED_HOSTED_TOOL_TYPES = frozenset({
-    "web_search_preview", "file_search", "computer_use_preview",
+    "file_search", "computer_use_preview",
     "code_interpreter", "image_generation", "mcp", "local_shell",
-    "web_search", "web_search_2025_08_26", "web_search_preview_2025_03_11",
     "computer", "computer_use", "apply_patch", "function_shell",
 })
 
@@ -218,7 +217,7 @@ class OpenAIOAuthChannel(Channel):
     protocol = "openai-responses"          # 上游走 codex responses
     upstream_stream_only = True            # chatgpt.com codex 只支持 stream=true
 
-    def __init__(self, account: dict, default_models: list[str] | None = None):
+    def __init__(self, account: dict):
         from ..oauth_ids import account_key as _account_key
         from .. import oauth_manager as _oauth_manager
         self.email = account["email"]
@@ -260,19 +259,9 @@ class OpenAIOAuthChannel(Channel):
             if self.codex_account_identity is not None else ""
         )
 
-        # Account catalog first, then an explicit caller/config fallback, then
-        # the selected versioned profile. There is no Python model-name fallback.
-        models = account.get("models") or []
-        self._account_models = list(models)
-        configured_models = prov_cfg.get("defaultModels")
-        if models:
-            selected_models = list(models)
-        elif default_models:
-            selected_models = list(default_models)
-        elif isinstance(configured_models, list) and configured_models:
-            selected_models = list(configured_models)
-        else:
-            selected_models = list(profile.models)
+        # Protocol profiles remain wire/identity metadata, never route catalogs.
+        self._account_models = list(account.get("models") or [])
+        selected_models = self._account_models
         disabled_models = {
             str(model).strip() for model in account.get("disabledModels") or []
             if str(model).strip()

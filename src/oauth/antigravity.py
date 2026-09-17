@@ -68,20 +68,6 @@ _API_HTTP_TIMEOUT = 30.0
 _ONBOARD_ATTEMPTS = 5
 _ONBOARD_POLL_SECONDS = 2.0
 
-DEFAULT_TEXT_MODELS = (
-    "gemini-3.7-flash-high",
-    "gemini-3.6-flash-high",
-    "gemini-3-flash",
-    "gemini-3-flash-agent",
-    "gemini-pro-agent",
-    "gemini-3.1-pro-low",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-low",
-    "gemini-3.5-flash-extra-low",
-    "claude-opus-4-6-thinking",
-    "claude-sonnet-4-6",
-    "gpt-oss-120b-medium",
-)
 DEFAULT_IMAGE_MODELS = (
     "gemini-3.1-flash-image",
 )
@@ -176,16 +162,6 @@ def onboard_user_agent() -> str:
 
 def goog_api_client() -> str:
     return _cfg_str("googApiClient", "goog_api_client", default=GOOG_API_CLIENT_UA)
-
-
-def default_models() -> list[str]:
-    cfg = _ag_cfg()
-    value = cfg.get("defaultModels")
-    if isinstance(value, list):
-        models = [str(x).strip() for x in value if str(x).strip()]
-        if models:
-            return models
-    return list(DEFAULT_TEXT_MODELS)
 
 
 def image_models() -> list[str]:

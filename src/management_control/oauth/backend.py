@@ -9,26 +9,11 @@ from typing import Iterable
 
 from src import affinity, config, cooldown, load_balancing, log_db, oauth_manager, state_db
 from src.cursor_bridge import catalog as cursor_model_catalog
-from src.models_discovery import discover_models
 from src.oauth import antigravity as antigravity_provider
 from src.oauth import cursor as cursor_provider
 from src.oauth import openai as openai_provider
 from src.oauth import xai as xai_provider
 from src.oauth.openai_import import OpenAIImportCandidate, parse_openai_import_payload
-
-
-_FAMILY_CONFIG_PATHS = {
-    "anthropic": ("oauthDefaultModels",),
-    "antigravity": ("antigravityOAuth", "defaultModels"),
-    "openai": ("openaiOAuth", "defaultModels"),
-    "xai": ("xaiOAuth", "defaultModels"),
-}
-_FAMILY_INGRESSES = {
-    "anthropic": {"anthropic"},
-    "antigravity": {"openai-chat", "openai-responses"},
-    "openai": {"openai-chat", "openai-responses"},
-    "xai": {"openai-chat", "openai-responses"},
-}
 
 
 class OAuthBackend:
@@ -42,9 +27,6 @@ class OAuthBackend:
 
     def config_snapshot(self) -> dict:
         return copy.deepcopy(config.get())
-
-    def default_config_snapshot(self) -> dict:
-        return copy.deepcopy(config.DEFAULT_CONFIG)
 
     def list_accounts(self) -> list[dict]:
         return oauth_manager.list_accounts()
@@ -480,187 +462,6 @@ class OAuthBackend:
                 cfg["quotaProgressBar"] = bool(quota_progress_bar)
 
         config.update(mutate)
-
-    @staticmethod
-    def _models_from(cfg: dict, family: str) -> list[str]:
-        path = _FAMILY_CONFIG_PATHS[family]
-        value: object = cfg
-        for part in path:
-            value = value.get(part) if isinstance(value, dict) else None
-        return [str(item) for item in (value or []) if isinstance(item, str) and item.strip()]
-
-    def default_models(self, family: str) -> list[str]:
-        return self._models_from(config.get(), family)
-
-    def static_default_models(self, family: str) -> list[str]:
-        return self._models_from(config.DEFAULT_CONFIG, family)
-
-    @staticmethod
-    def _scan_default_model_references_from(
-        cfg: dict, family: str, removed: set[str],
-    ) -> dict:
-        ingresses = _FAMILY_INGRESSES[family]
-        api_keys: list[dict] = []
-        would_empty: list[str] = []
-        for name, entry in (cfg.get("apiKeys") or {}).items():
-            if not isinstance(entry, dict):
-                continue
-            allowed = entry.get("allowedModels") or []
-            if not isinstance(allowed, list) or not allowed:
-                continue
-            hits = sorted(model for model in allowed if model in removed)
-            if hits:
-                api_keys.append({"name": name, "hits": hits})
-                if not [model for model in allowed if model not in removed]:
-                    would_empty.append(name)
-        mappings: list[dict] = []
-        for ingress in ingresses:
-            line = ((cfg.get("modelMapping") or {}).get(ingress) or {})
-            for alias, real in sorted(line.items()):
-                if isinstance(real, str) and real in removed:
-                    mappings.append({"ingress": ingress, "alias": alias, "real": real})
-        defaults = [
-            {"ingress": ingress, "value": (cfg.get("ingressDefaultModel") or {}).get(ingress)}
-            for ingress in ingresses
-            if isinstance((cfg.get("ingressDefaultModel") or {}).get(ingress), str)
-            and (cfg.get("ingressDefaultModel") or {}).get(ingress) in removed
-        ]
-        return {
-            "apiKeys": api_keys,
-            "mappings": mappings,
-            "defaults": defaults,
-            "would_empty_keys": would_empty,
-        }
-
-    def _default_models_state_from(self, cfg: dict, family: str) -> dict:
-        models = self._models_from(cfg, family)
-        return {
-            "models": models,
-            "references": self._scan_default_model_references_from(
-                cfg, family, set(models),
-            ),
-        }
-
-    def default_models_state(self, family: str) -> dict:
-        return self._default_models_state_from(config.get(), family)
-
-    def scan_default_model_references(self, family: str, removed: set[str]) -> dict:
-        return self._scan_default_model_references_from(config.get(), family, removed)
-
-    @staticmethod
-    def _replace_default_models_in(
-        cfg: dict,
-        family: str,
-        models: list[str],
-        removed: set[str],
-        *,
-        cleanup: bool,
-        summary: dict,
-    ) -> None:
-        path = _FAMILY_CONFIG_PATHS[family]
-        ingresses = _FAMILY_INGRESSES[family]
-        if len(path) == 1:
-            cfg[path[0]] = list(models)
-        else:
-            cfg.setdefault(path[0], {})[path[1]] = list(models)
-        if not cleanup or not removed:
-            return
-        for name, entry in (cfg.get("apiKeys") or {}).items():
-            if not isinstance(entry, dict):
-                continue
-            allowed = entry.get("allowedModels") or []
-            if not isinstance(allowed, list) or not allowed:
-                continue
-            kept = [model for model in allowed if model not in removed]
-            removed_here = [model for model in allowed if model in removed]
-            if not removed_here:
-                continue
-            if not kept:
-                summary["keys_skipped_empty"].append(name)
-            else:
-                entry["allowedModels"] = kept
-                summary["keys_cleaned"].append({"name": name, "removed": removed_here})
-        mappings = cfg.get("modelMapping") or {}
-        for ingress in ingresses:
-            line = mappings.get(ingress)
-            if not isinstance(line, dict):
-                continue
-            for alias in list(line):
-                if line.get(alias) in removed:
-                    del line[alias]
-                    summary["mappings_removed"].append({"ingress": ingress, "alias": alias})
-        defaults = cfg.get("ingressDefaultModel") or {}
-        for ingress in ingresses:
-            if defaults.get(ingress) in removed:
-                del defaults[ingress]
-                summary["defaults_cleared"].append(ingress)
-
-    @staticmethod
-    def _empty_default_summary() -> dict:
-        return {
-            "keys_cleaned": [],
-            "keys_skipped_empty": [],
-            "mappings_removed": [],
-            "defaults_cleared": [],
-        }
-
-    def replace_default_models(
-        self,
-        family: str,
-        models: list[str],
-        removed: set[str],
-        *,
-        cleanup: bool,
-    ) -> dict:
-        summary = self._empty_default_summary()
-        config.update(lambda cfg: self._replace_default_models_in(
-            cfg, family, models, removed, cleanup=cleanup, summary=summary,
-        ))
-        return summary
-
-    def replace_default_models_conditional(
-        self,
-        family: str,
-        models: list[str],
-        removed: set[str],
-        *,
-        cleanup: bool,
-        expected_state: dict,
-    ) -> dict:
-        summary = self._empty_default_summary()
-        result = {"status": "revision_conflict", "summary": summary}
-
-        def mutate(cfg: dict) -> None:
-            if self._default_models_state_from(cfg, family) != expected_state:
-                return
-            self._replace_default_models_in(
-                cfg, family, models, removed, cleanup=cleanup, summary=summary,
-            )
-            result["status"] = "updated"
-
-        config.update(mutate, skip_if_unchanged=True)
-        return result
-
-    def xai_models_url(self) -> str:
-        cfg = config.get().get("xaiOAuth") or {}
-        base = str(cfg.get("apiBaseUrl") or cfg.get("baseUrl") or "https://api.x.ai/v1").rstrip("/")
-        return base if base.endswith("/models") else base + "/models"
-
-    def first_enabled_account_id(self, provider: str) -> str | None:
-        for account in oauth_manager.list_accounts():
-            if (
-                oauth_manager.provider_of(account) == provider
-                and account.get("enabled", True)
-                and not account.get("disabled_reason")
-            ):
-                return oauth_manager.get_account_key(account)
-        return None
-
-    async def ensure_valid_token(self, account_id: str) -> str:
-        return await oauth_manager.ensure_valid_token(account_id)
-
-    async def discover_models(self, url: str, token: str) -> list[str]:
-        return await discover_models(url, token)
 
     def parse_import(
         self, kind: str, payload, *, filename: str = "",

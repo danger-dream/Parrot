@@ -29,7 +29,7 @@ from src.tests.test_model_required_all_ingress import _request
 pytestmark = pytest.mark.usefixtures("isolated_config")
 
 
-@pytest.mark.parametrize("provider,kind", [("xai", "image"), ("xai", "video"), ("antigravity", "image")])
+@pytest.mark.parametrize("provider,kind", [("xai", "image"), ("xai", "video")])
 def test_missing_media_rename_rejects_existing_target_without_write(provider, kind):
     cfg = FakeConfig({"xaiOAuth": {"imageModels": ["real-item"], "videoModels": ["real-item"]},
                       "antigravityOAuth": {"imageModels": ["real-item"]}})
@@ -48,7 +48,7 @@ def test_missing_media_rename_rejects_existing_target_without_write(provider, ki
     assert cfg.updates == 0 and cfg.value == before
 
 
-@pytest.mark.parametrize("provider,kind", [("xai", "image"), ("xai", "video"), ("antigravity", "image")])
+@pytest.mark.parametrize("provider,kind", [("xai", "image"), ("xai", "video")])
 def test_missing_media_rename_http_is_404(provider, kind, tmp_path):
     app, _, fixture = build_auxiliary_app(tmp_path)
     fixture.config.value["xaiOAuth"] = {"imageModels": ["real-item"], "videoModels": ["real-item"]}
@@ -68,123 +68,10 @@ def test_missing_media_rename_http_is_404(provider, kind, tmp_path):
     assert fixture.config.value == before
 
 
-def _ag_fixture(monkeypatch, tmp_path):
-    media_db.init()
-    channel = SimpleNamespace(key="oauth:ag-fix", account_key="antigravity:fixture@example.test:p",
-        email="fixture@example.test", project_id="p", base_url="https://upstream.invalid",
-        _build_headers=lambda *a, **k: {})
-    monkeypatch.setattr(ag_images, "_eligible", lambda _: [channel])
-    async def acquired(_):
-        return True
-    released = []
-    monkeypatch.setattr(ag_images.concurrency, "try_acquire", acquired)
-    monkeypatch.setattr(ag_images.concurrency, "release", released.append)
-    monkeypatch.setattr(ag_images.cooldown, "clear_on_success", lambda *a: None)
-    import src.oauth_manager as om
-    async def token(_):
-        return "fake"
-    monkeypatch.setattr(om, "ensure_valid_token", token)
-    encoded = base64.b64encode(b"fixture-generated-image").decode()
-    body = {"response": {"candidates": [{"content": {"parts": [{
-        "inlineData": {"mimeType": "image/png", "data": encoded},
-    }]}}]}}
-    monkeypatch.setattr(ag_images.network, "async_client", lambda **_: FakeNetworkClient(FakeUpstreamResponse(body)))
-    monkeypatch.setattr(ag_images, "_media_cache_settings", lambda: {
-        "cacheEnabled": True, "cachePath": str(tmp_path / "cache"),
-        "cacheRetentionDays": 0, "cacheMaxBytes": 1024,
-    })
-    ids = []
-    async def start(**fields):
-        log_id = media_db.start_call(**fields)
-        ids.append(log_id)
-        return log_id
-    monkeypatch.setattr(ag_images, "_start_log", start)
-    parsed = SimpleNamespace(model="gemini-image", prompt="fixture prompt", requested_n=1,
-                             size=None, response_format="b64_json", native_options={})
-    return channel, parsed, ids, released
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["start_log", "upstream", "cache", "finish_log"])
-async def test_ag_cancel_drains_owned_writes_and_records_terminal(monkeypatch, tmp_path, stage):
-    channel, parsed, ids, released = _ag_fixture(monkeypatch, tmp_path)
-    entered, resume = asyncio.Event(), asyncio.Event()
-    if stage == "start_log":
-        original = ag_images._start_log
-        async def blocked_start(**fields):
-            entered.set()
-            await resume.wait()
-            return await original(**fields)
-        monkeypatch.setattr(ag_images, "_start_log", blocked_start)
-    elif stage == "upstream":
-        class BlockingResponse(FakeUpstreamResponse):
-            async def aiter_bytes(self):
-                entered.set()
-                await asyncio.Event().wait()
-                yield b""
-        monkeypatch.setattr(ag_images.network, "async_client", lambda **_: FakeNetworkClient(BlockingResponse({})))
-    else:
-        original = asyncio.to_thread
-        async def blocked_write(func, *args, **kwargs):
-            block = (stage == "cache" and func is media_cache.cache_inline_base64) or (
-                stage == "finish_log" and func is media_db.finish_call and kwargs.get("status") == "success"
-            )
-            if block:
-                entered.set()
-                await resume.wait()
-            return await original(func, *args, **kwargs)
-        monkeypatch.setattr(asyncio, "to_thread", blocked_write)
-
-    task = asyncio.create_task(ag_images.handle_image(parsed, action="generate", key_name="fixture", allowed_models=[]))
-    await asyncio.wait_for(entered.wait(), 2)
-    task.cancel()
-    await asyncio.sleep(0)
-    if stage != "upstream":
-        assert not task.done(), "the original write must finish before cancellation is propagated"
-    resume.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 2)
-    assert len(ids) == 1
-    row = media_db.get_log(ids[0])
-    assert row["status"] == "cancelled" and row["finished_at"] is not None
-    assert row["http_status"] == 499
-    assert released == ([] if stage == "start_log" else [channel.key])
-    if stage in {"cache", "finish_log"}:
-        paths = json.loads(row["cache_paths"])
-        assert row["cache_status"] == "cached" and row["cached_images"] == len(paths) == 1
-        assert Path(paths[0]).read_bytes() == b"fixture-generated-image"
-        assert sorted(str(p) for p in (tmp_path / "cache").rglob("*.png")) == paths
 
 
-@pytest.mark.asyncio
-async def test_ag_repeated_cancellation_does_not_interrupt_terminal_log(monkeypatch, tmp_path):
-    channel, parsed, ids, released = _ag_fixture(monkeypatch, tmp_path)
-    entered, resume = asyncio.Event(), asyncio.Event()
-    class CancelledResponse(FakeUpstreamResponse):
-        async def aiter_bytes(self):
-            raise asyncio.CancelledError()
-            yield b""
-    monkeypatch.setattr(ag_images.network, "async_client", lambda **_: FakeNetworkClient(CancelledResponse({})))
-    original = ag_images._finish_log
-    finishes = []
-    async def delayed_finish(log_id, **fields):
-        finishes.append(fields["status"])
-        entered.set()
-        await resume.wait()
-        await original(log_id, **fields)
-    monkeypatch.setattr(ag_images, "_finish_log", delayed_finish)
-    task = asyncio.create_task(ag_images.handle_image(parsed, action="generate", key_name="fixture", allowed_models=[]))
-    await asyncio.wait_for(entered.wait(), 2)
-    for _ in range(2):
-        task.cancel()
-        await asyncio.sleep(0)
-    assert not task.done()
-    resume.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 2)
-    assert finishes == ["cancelled"]
-    assert media_db.get_log(ids[0])["status"] == "cancelled"
-    assert released == [channel.key]
 
 
 @pytest.mark.parametrize("mime,url,preferred,expected", [
@@ -205,14 +92,14 @@ async def test_xai_generic_mime_preserves_cache_and_download_format(monkeypatch,
     from src.xai import imagine
     cfg = {"cacheEnabled": True, "cachePath": str(tmp_path / "cache"),
            "cacheRetentionDays": 0, "cacheMaxBytes": 1024}
-    monkeypatch.setattr(imagine, "_media_cache_settings", lambda: cfg)
+    monkeypatch.setattr(imagine, "_media_cache_settings", lambda media_kind: {**cfg, "_media_kind": media_kind})
     async def fake_download(*a, **k):
         return b"fixture-native-bytes", "application/octet-stream"
     monkeypatch.setattr(imagine, "_download_xai_media", fake_download)
     paths, _ = await imagine._cache_xai_results(
         [{"url": f"https://media.x.ai/fixture.{extension}"}], media_type=kind,
         action="generate", channel=SimpleNamespace(key="oauth:xai:fixture"), model="media")
-    row = {"id": 1, "status": "success", "cache_paths": json.dumps(paths)}
+    row = {"id": 1, "status": "success", "media_type": kind, "cache_paths": json.dumps(paths)}
     control = MediaControl(media_db=SimpleNamespace(get_log=lambda _: row),
                            config=SimpleNamespace(get=lambda: {"images": cfg}))
     artifact = control.artifacts(admin_context(), "1")[0]

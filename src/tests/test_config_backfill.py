@@ -93,7 +93,7 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
             assert cfg["openaiOAuth"]["codexProfileAutoUpdate"] is True
             assert "forceCodexCLI" not in cfg["openaiOAuth"]
-            assert cfg["openaiOAuth"]["defaultModels"] == ["legacy-model"]
+            assert "defaultModels" not in cfg["openaiOAuth"]
             assert "codexUpstreamUrl" not in cfg["openaiOAuth"]
             assert cfg["apiKeyConcurrency"]["defaultMaxRequestBodyBytes"] == 8 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["defaultMaxRequestBodyEvents"] == 4096
@@ -103,15 +103,18 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["apiKeyConcurrency"]["defaultMaxQueuedBodySpoolBytesPerKey"] == 512 * 1024 * 1024
             assert cfg["apiKeyConcurrency"]["maxQueuedBodySpoolBytes"] == 2 * 1024 * 1024 * 1024
 
-            # Grok Imagine 新字段自动补齐，但既有 xAI 文本配置不被覆盖。
+            # Media models now resolve from the new map; reads do not materialize
+            # old xAI fields or overwrite existing text configuration.
             assert cfg["xaiOAuth"]["apiBaseUrl"] == "https://api.x.ai/v1"
-            assert cfg["xaiOAuth"]["defaultModels"] == ["legacy-grok-model"]
+            assert "defaultModels" not in cfg["xaiOAuth"]
             assert cfg["xaiOAuth"]["userAgent"] == "legacy-xai-client"
-            assert cfg["xaiOAuth"]["imageModels"] == [
+            from src import media_config
+            assert 'imageModels' not in cfg['xaiOAuth'] and 'videoModels' not in cfg['xaiOAuth']
+            assert media_config.model_map('image', cfg)['xai'] == [
                 "grok-imagine-image",
                 "grok-imagine-image-quality",
             ]
-            assert cfg["xaiOAuth"]["videoModels"] == [
+            assert media_config.model_map('video', cfg)['xai'] == [
                 "grok-imagine-video",
                 "grok-imagine-video-1.5",
             ]
@@ -147,7 +150,7 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["pricing"]["overrides"] == {}
 
         # 旧路径保留兼容数据，但失效的伪装开关会被清理。
-        assert saved["oauth"]["providers"]["openai"]["defaultModels"] == ["legacy-model"]
+        assert "defaultModels" not in saved["oauth"]["providers"]["openai"]
         assert "forceCodexCLI" not in saved["oauth"]["providers"]["openai"]
     finally:
         with open(config.path(), "w", encoding="utf-8") as f:

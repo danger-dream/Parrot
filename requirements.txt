@@ -11,6 +11,7 @@ xxhash>=3.4
 dnspython>=2.6
 packaging>=23
 python-multipart>=0.0.20  # multipart/form-data parsing for OpenAI Images API compat
+Pillow>=11.3  # validated image formats, non-cropping resize and masked edits
 blake3>=1.0
 cryptography>=42.0
 websockets>=15.0

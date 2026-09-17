@@ -378,11 +378,11 @@ def test_translate_request_allows_stream_but_guards_stateful_thinking_and_builti
     with pytest.raises(GuardError):
         anthropic_to_responses.translate_request({"mcp_servers": [{"name": "mcp"}], "messages": []})
     web_search = anthropic_to_responses.translate_request({"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search"}]})
-    assert web_search["tools"][0]["type"] == "function"
-    assert web_search["tools"][0]["name"] == "web_search"
-    assert web_search["parallel_tool_calls"] is False
-    web_fetch = anthropic_to_responses.translate_request({"messages": [], "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]})
-    assert web_fetch["tools"][0]["name"] == "web_fetch"
+    assert web_search["tools"][0]["type"] == "web_search"
+    assert "name" not in web_search["tools"][0]
+    assert "parallel_tool_calls" not in web_search
+    with pytest.raises(GuardError, match="web_fetch"):
+        anthropic_to_responses.translate_request({"messages": [], "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]})
     stripped = anthropic_to_responses.translate_request({"messages": [], "stop_sequences": ["END"], "top_k": 5, "service_tier": "turbo"})
     assert "stop" not in stripped
     assert "stop_sequences" not in stripped

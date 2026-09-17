@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 
 from ..operations import OperationRegistry, OperationStore
@@ -10,6 +10,7 @@ from .media import (
     AntigravityMediaControl,
     AntigravityMediaSettings,
     ImageControl,
+    VideoControl,
     MediaModelMutationResult,
     XaiMediaControl,
 )
@@ -29,6 +30,7 @@ class AuxiliaryControls:
     images: ImageControl
     xai_media: XaiMediaControl
     antigravity_media: AntigravityMediaControl
+    videos: VideoControl = field(default_factory=VideoControl)
 
     def bind_operations(self, store: OperationStore, registry: OperationRegistry) -> None:
         with _binding_lock:

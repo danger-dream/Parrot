@@ -31,6 +31,9 @@ from .. import (
     errors,
     load_balancing,
     media_cache,
+    media_config,
+    model_mapping,
+    model_state,
     media_db,
     model_validation,
     network,
@@ -98,15 +101,12 @@ def _provider_cfg() -> dict[str, Any]:
 
 
 def _configured_models(key: str) -> list[str]:
-    values = _provider_cfg().get(key) or []
-    if not isinstance(values, list):
-        return []
-    out: list[str] = []
-    for value in values:
-        model = str(value or "").strip()
-        if model and model not in out:
-            out.append(model)
-    return out
+    kind = 'image' if key == 'imageModels' else 'video'
+    values = list(media_config.model_map(kind).get('xai', []))
+    for account in config.get().get('oauthAccounts') or []:
+        if account.get('provider') == 'xai':
+            values.extend(media_config.account_models(account, kind))
+    return list(dict.fromkeys(values))
 
 
 def image_models() -> list[str]:
@@ -146,15 +146,15 @@ def _positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _media_timeout() -> httpx.Timeout:
-    cfg = _provider_cfg()
-    total = _positive_float(cfg.get("mediaRequestTimeoutSeconds"), 180.0)
+def _media_timeout(kind: str = "image") -> httpx.Timeout:
+    cfg = media_config.settings(kind)
+    total = _positive_float(cfg.get("requestTimeoutSeconds"), 180.0)
     connect = _positive_float((config.get().get("timeouts") or {}).get("connect"), 10.0)
     return httpx.Timeout(total, connect=connect)
 
 
 def _video_job_ttl_seconds() -> int:
-    return _positive_int(_provider_cfg().get("videoJobTtlSeconds"), 10800)
+    return _positive_int(media_config.settings("video").get("jobTtlSeconds"), 10800)
 
 
 def _media_url(channel: XAIOAuthChannel, path: str) -> str:
@@ -249,12 +249,8 @@ def _video_log_status(upstream_status: str | None) -> str | None:
     return None
 
 
-def _media_cache_settings() -> dict[str, Any]:
-    # Keep one cache policy for GPT images and Grok images/videos.  The import is
-    # local to avoid coupling module initialization to the OpenAI image routes.
-    from ..openai.images_simple import settings
-
-    return settings()
+def _media_cache_settings(kind: str = 'image') -> dict[str, Any]:
+    return media_config.settings(kind)
 
 
 def _media_cache_file_limit(cfg: dict[str, Any]) -> int:
@@ -352,7 +348,7 @@ async def _cache_xai_results(
     channel: XAIOAuthChannel,
     model: str,
 ) -> tuple[list[str], int]:
-    cfg = _media_cache_settings()
+    cfg = _media_cache_settings(media_type)
     if not cfg.get("cacheEnabled") or not items:
         return [], 0
     max_bytes = _media_cache_file_limit(cfg)
@@ -468,8 +464,6 @@ def _eligible_channels(kind: str, model: str) -> list[XAIOAuthChannel]:
     for channel in registry.all_channels():
         if not isinstance(channel, XAIOAuthChannel):
             continue
-        if not channel.enabled or channel.disabled_reason:
-            continue
         if not channel.supports_media_model(kind, model):
             continue
         if cooldown.is_blocked(channel.key, model):
@@ -495,8 +489,11 @@ async def _request_upstream(
     body: bytes | None,
     model: str,
 ) -> httpx.Response:
+    kind = "video" if "videos/" in path else "image"
+    if not channel.supports_media_model(kind, model):
+        raise ValueError("selected media purpose or account generation is no longer available")
     async with network.async_client(
-        timeout=_media_timeout(),
+        timeout=_media_timeout("video" if "videos/" in path else "image"),
         proxy_purpose="oauth_xai",
         proxy_channel=channel.key,
         proxy_model=model,
@@ -612,9 +609,11 @@ def _apply_image_size(payload: dict[str, Any], size: str | None) -> None:
         return
     mapped = _IMAGE_SIZE_MAP.get(size.strip().lower())
     if mapped is None:
-        raise ValueError(
-            f"unsupported size {size!r} for xAI image model; use aspect_ratio/resolution"
-        )
+        from ..image_artifacts import dimensions
+        width, height = dimensions(size)
+        ratios = {"1:1": 1, "3:2": 1.5, "2:3": 2/3, "16:9": 16/9, "9:16": 9/16}
+        nearest = min(ratios, key=lambda ratio: abs(ratios[ratio] - width/height))
+        mapped = (nearest, "2k" if max(width, height) > 1536 else "1k")
     aspect_ratio, resolution = mapped
     if need_aspect:
         payload["aspect_ratio"] = aspect_ratio
@@ -631,8 +630,7 @@ def _build_image_payload(parsed: Any, *, action: str) -> dict[str, Any]:
     }
     if parsed.requested_n > 10:
         raise ValueError("n must be between 1 and 10 for xAI image models")
-    if getattr(parsed, "response_format_explicit", False):
-        payload["response_format"] = parsed.response_format
+    payload["response_format"] = parsed.response_format
 
     xai_options = getattr(parsed, "xai_options", {}) or {}
     for key in ("aspect_ratio", "resolution", "user", "storage_options"):
@@ -818,6 +816,8 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
     if not auth.videos_allowed(key_name):
         return _permission_error("this API key is not allowed to use video endpoints")
 
+    if not media_config.settings('video').get('enabled', True):
+        return _permission_error('video endpoints are disabled')
     body = await _read_json_object(request)
     if isinstance(body, Response):
         return body
@@ -826,12 +826,16 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
         model = model_validation.require_explicit_model(body)
     except model_validation.ExplicitModelError as exc:
         return _bad_request(exc.message, param=exc.param)
+    requested_model = model
+    model = model_mapping.get_global_map().get(requested_model, requested_model)
     body["model"] = model
     configured = video_models()
     if model not in configured:
         return _bad_request(f"unsupported xAI video model {model!r}", param="model")
-    if not _model_allowed(model, allowed_models):
+    if not (_model_allowed(model, allowed_models) or _model_allowed(requested_model, allowed_models)):
         return _permission_error("model is not allowed for this API key")
+    if not model_state.is_global_enabled(model) or not model_state.is_global_enabled(requested_model):
+        return _permission_error("video model is disabled")
 
     try:
         payload = _normalize_video_payload(body, action=action)
@@ -902,6 +906,7 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
                 api_key_name=key_name,
                 model=model,
                 ttl_seconds=ttl_seconds,
+                state_key=result.channel.state_key,
             )
         except Exception as exc:
             # Upstream may already have accepted and billed the request.  Keep its
@@ -944,6 +949,7 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
         media_duration_seconds=_video_seconds(payload, response_body),
         usage=_response_usage(response_body),
         cached_media_count=len(video_cache_paths),
+        image_count=1 if local_status == "success" and isinstance(video_obj, dict) and (video_obj.get("url") or video_obj.get("b64_json")) else None,
         media_bytes=video_cached_bytes or None,
         cache_paths=video_cache_paths,
         error_type=error_type,
@@ -977,7 +983,9 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
         )
 
     channel = registry.get_channel(str(binding.get("channel_key") or ""))
-    if not isinstance(channel, XAIOAuthChannel) or not channel.enabled or channel.disabled_reason:
+    if (not isinstance(channel, XAIOAuthChannel)
+            or not channel.supports_media_model('video', str(binding.get('model') or ''))
+            or (binding.get('state_key') and binding['state_key'] != channel.state_key)):
         await _update_video_log(
             normalized_id,
             status=None,
@@ -1062,6 +1070,8 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
                 error_type, error_message = _response_error(response)
 
             cache_fields: dict[str, Any] = {}
+            if local_status == "success" and isinstance(response_body.get("video"), dict) and (response_body["video"].get("url") or response_body["video"].get("b64_json")):
+                cache_fields["image_count"] = 1
             existing_log = await asyncio.to_thread(
                 media_db.get_by_upstream_request_id,
                 normalized_id,
@@ -1077,11 +1087,11 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
                         model=model,
                     )
                     if cache_paths:
-                        cache_fields = {
+                        cache_fields.update({
                             "cached_media_count": len(cache_paths),
                             "media_bytes": cached_bytes,
                             "cache_paths": cache_paths,
-                        }
+                        })
             await _update_video_log(
                 normalized_id,
                 status=local_status,

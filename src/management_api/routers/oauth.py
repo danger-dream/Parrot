@@ -15,7 +15,6 @@ from src.management_control.oauth import (
     OAuthAccountFilter,
     OAuthAccountSort,
     OAuthControl,
-    OAuthFamily,
     OAuthImportDecision,
     OAuthProvider,
     OAuthReplaceRequired,
@@ -64,12 +63,8 @@ from ..schemas.oauth_models import (
     UpdateOAuthAccountModelsRequest,
 )
 from ..schemas.oauth_settings import (
-    OAuthDefaultModelReferenceData,
-    OAuthDefaultModelsData,
-    OAuthDefaultModelsResultData,
     OAuthSettingsData,
     QuotaMonitorData,
-    ReplaceOAuthDefaultModelsRequest,
     TelegramOAuthPreferencesData,
     UpdateOAuthSettingsRequest,
     UpdateTelegramOAuthPreferencesRequest,
@@ -796,85 +791,6 @@ def update_telegram_oauth_preferences(
         ),
         meta=meta(request),
     )
-
-
-@router.get(
-    "/oauth/default-models/{family}",
-    operation_id="getOAuthDefaultModels",
-    response_model=DataEnvelope[OAuthDefaultModelsData],
-    responses=responses(200, {"family": "openai", "models": ["gpt-example"], "references": [], "revision": "revision-example"}),
-)
-def get_oauth_defaultmodels(
-    family: Annotated[OAuthFamily, Path()],
-    request: Request,
-    context: ReadContext,
-    control: Control,
-) -> DataEnvelope[OAuthDefaultModelsData]:
-    result = control.get_default_models(context, family)
-    return DataEnvelope(
-        data=OAuthDefaultModelsData(
-            family=result.family,
-            models=list(result.models),
-            references=[
-                OAuthDefaultModelReferenceData(kind=item.kind, owner=item.owner, modelId=item.model_id)
-                for item in result.references
-            ],
-            revision=result.revision,
-        ),
-        meta=meta(request),
-    )
-
-
-@router.put(
-    "/oauth/default-models/{family}",
-    operation_id="replaceOAuthDefaultModels",
-    response_model=DataEnvelope[OAuthDefaultModelsResultData],
-    responses=responses(200, {"family": "openai", "models": ["gpt-example"], "cleanedApiKeys": [], "skippedApiKeys": [], "removedMappings": [], "clearedDefaults": [], "revision": "revision-example"}, ManagementErrorCode.REVISION_CONFLICT),
-)
-def replace_oauth_defaultmodels(
-    family: Annotated[OAuthFamily, Path()],
-    body: Annotated[ReplaceOAuthDefaultModelsRequest, Body()],
-    request: Request,
-    context: WriteContext,
-    control: Control,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-) -> DataEnvelope[OAuthDefaultModelsResultData]:
-    result = control.replace_default_models(
-        context,
-        family,
-        body.models,
-        cleanup_references=body.cleanupReferences,
-        expected_revision=if_match,
-    )
-    return DataEnvelope(
-        data=OAuthDefaultModelsResultData(
-            family=result.family,
-            models=list(result.models),
-            cleanedApiKeys=list(result.cleaned_api_keys),
-            skippedApiKeys=list(result.skipped_api_keys),
-            removedMappings=list(result.removed_mappings),
-            clearedDefaults=list(result.cleared_defaults),
-            revision=result.revision,
-        ),
-        meta=meta(request),
-    )
-
-
-@router.post(
-    "/oauth/default-models/{family}/actions/discover",
-    operation_id="discoverOAuthDefaultModels",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=OAuthOperationEnvelope,
-    responses=responses(202, OPERATION_EXAMPLE, ManagementErrorCode.DEPENDENCY_UNAVAILABLE, ManagementErrorCode.OPERATION_ALREADY_RUNNING),
-)
-def discover_oauth_defaultmodels(
-    family: Annotated[OAuthFamily, Path()],
-    request: Request,
-    context: WriteContext,
-    control: Control,
-    runtime: Runtime,
-) -> OAuthOperationEnvelope:
-    return operation_envelope(control.discover_default_models(context, family, runtime.operations), request)
 
 
 from .oauth_workbuddy import router as workbuddy_router

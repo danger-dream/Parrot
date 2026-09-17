@@ -569,6 +569,8 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         return
 
     body = _request_body_from_ws_create(first_obj)
+    body.pop("_parrot_search_round", None)
+    body.pop("_parrot_search_original_tools", None)
     # Native Codex carriers are lookup anchors only. They are retained under an
     # internal key, hashed by the identity resolver, and never forwarded raw.
     body["_codex_native_identity"] = _native_identity_carriers(
@@ -606,7 +608,12 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         await websocket.close(code=4400, reason=_trim_reason("background async response is not supported on Responses WebSocket"))
         return
 
-    local_web_tools.prepare_openai_responses_local_web_tools(body)
+    from .. import search_tool_policy
+    try:
+        search_tool_policy.validate(body)
+    except GuardError as exc:
+        await _send_request_invalid_error_frame(websocket, exc.message, param=exc.param)
+        return
 
     # WS transport is streaming by definition. Ensure the upstream payload matches
     # Responses WS expectations even if the client omitted stream.
@@ -831,6 +838,17 @@ async def _run_ws_failover(
     allowed_models: list[str] | None = None,
     api_key_lease: apikey_limiter.ApiKeyLease | None = None,
 ) -> bool:
+    from .. import search_tool_policy
+    search_declared = any(search_tool_policy.kind(tool) for tool, _ in search_tool_policy.declarations(body))
+    pairs = schedule_result.candidates or schedule_result.saturated
+    native_ws = bool(pairs and _responses_ws_upstream_transport(pairs[0][0]) == "ws")
+    if search_tool_policy.needs_loop(body) or (search_declared and not native_ws):
+        return await _run_search_ws_session(
+            websocket, body=body, schedule_result=schedule_result,
+            request_id=request_id, api_key_name=api_key_name, client_ip=client_ip,
+            start_time=start_time, start_monotonic=start_monotonic,
+            allowed_models=allowed_models, api_key_lease=api_key_lease,
+        )
     cfg = config.get()
     deadline_ts = 0.0  # legacy transport argument; every upstream route owns its round total
     total_timeout_s = float((cfg.get("timeouts") or {}).get("total", 600))
@@ -1584,6 +1602,13 @@ async def _try_ws_channel(
                     last_error = relay_result
                     break
 
+                from .. import search_tool_policy
+                if relay_result.ok and relay_result.response_id:
+                    replay_body = search_tool_policy.restore_replay(body, "responses", api_key_name)
+                    replay_body = dict(replay_body)
+                    search_tool_policy._append(replay_body, {"output": relay_result.output_items}, [], "responses")
+                    search_tool_policy._remember(replay_body, "responses", api_key_name, [relay_result.response_id])
+
                 while True:
                     next_turn = await _receive_next_response_create(
                         websocket,
@@ -1599,6 +1624,24 @@ async def _try_ws_channel(
                     if next_turn is None:
                         return session_result or relay_result
                     first_obj, body, fp_query = next_turn
+                    if search_tool_policy.needs_loop(body):
+                        # Prior turn capacity is already released. Move this
+                        # new search turn to the common runner; do not send an
+                        # internally compiled function down the native relay.
+                        body = search_tool_policy.restore_replay(body, "responses", api_key_name)
+                        new_id, new_time, new_mono = str(uuid.uuid4()), time.time(), time.monotonic()
+                        msg_count, tool_count = _count_msg_tool(body, "responses")
+                        await asyncio.to_thread(log_db.insert_pending,
+                            new_id, client_ip, api_key_name, body.get("model"), True,
+                            msg_count, tool_count, _sanitize_headers(dict(websocket.headers)),
+                            {k: v for k, v in body.items() if not k.startswith("_")},
+                            fingerprint=fp_query, ingress_protocol="responses_ws")
+                        route = scheduler.schedule(body, api_key_name=api_key_name,
+                            client_ip=client_ip, ingress_protocol="responses", fp_query=fp_query)
+                        await _run_search_ws_session(websocket, body=body, schedule_result=route,
+                            request_id=new_id, api_key_name=api_key_name, client_ip=client_ip,
+                            start_time=new_time, start_monotonic=new_mono, allowed_models=allowed_models)
+                        return session_result or relay_result
                     requested_model = str(body.get("model") or "")
                     next_resolved_model = ch.supports_model(requested_model)
                     try:
@@ -1941,6 +1984,8 @@ def _responses_ws_upstream_transport(ch: Channel) -> str:
     """
     if isinstance(ch, OpenAIOAuthChannel):
         return "ws"
+    if getattr(ch, "provider", "") == "xai":
+        return "sse"
     value = str(getattr(ch, "responses_ws_upstream_transport", "ws") or "ws").strip().lower()
     return "sse" if value in ("sse", "http-sse", "http_sse") else "ws"
 
@@ -2486,6 +2531,8 @@ async def _try_sse_channel(
                 if event_name and not data.get("type"):
                     data = dict(data)
                     data["type"] = event_name
+                from .. import search_tool_wire
+                data = search_tool_wire.restore_object(data, upstream_req.dynamic_tool_map)
                 frame_text = _dump_frame(data)
                 tracker.feed_text(frame_text)
                 event_type = _ws_event_type(frame_text)
@@ -2686,6 +2733,8 @@ async def _receive_next_response_create(
             )
             continue
         body = _request_body_from_ws_create(obj)
+        body.pop("_parrot_search_round", None)
+        body.pop("_parrot_search_original_tools", None)
         body["_codex_native_identity"] = _native_identity_carriers(obj, websocket)
         try:
             body["model"] = model_validation.require_explicit_model(body)
@@ -2720,7 +2769,12 @@ async def _receive_next_response_create(
                 param="background",
             )
             continue
-        local_web_tools.prepare_openai_responses_local_web_tools(body)
+        from .. import search_tool_policy
+        try:
+            search_tool_policy.validate(body)
+        except GuardError as exc:
+            await _send_request_invalid_error_frame(websocket, exc.message, param=exc.param)
+            continue
         body["stream"] = True
         body["_api_key_name"] = api_key_name
         input_items = resolve_current_input_items(body)
@@ -3358,6 +3412,102 @@ async def _relay_ws_session(
         result.error_detail = f"websocket relay error: {exc}"
 
     return await finalize_accepted_request()
+
+
+async def _run_search_ws_session(
+    websocket, *, body, schedule_result, request_id, api_key_name, client_ip,
+    start_time, start_monotonic, allowed_models, api_key_lease=None,
+):
+    """Search sockets use exactly the HTTP ownership/continuation state machine.
+
+    The scheduler still chooses each actual candidate/transport; no function is
+    exposed until all Parrot-owned calls in that round have been consumed.
+    """
+    from .. import failover as runtime, search_tool_policy
+    lease = api_key_lease
+    while True:
+        if lease is None:
+            try:
+                lease = await apikey_limiter.acquire(api_key_name, None)
+            except apikey_limiter.ApiKeyLimitError as exc:
+                await _send_request_invalid_error_frame(websocket, exc.message, status=429)
+                return True
+        async def invoke(round_body):
+            nonlocal schedule_result
+            response = await runtime.run_failover(
+                schedule_result, round_body, request_id, api_key_name, client_ip,
+                bool(round_body.get("stream")), start_time, ingress_protocol="responses",
+                start_monotonic=start_monotonic,
+            )
+            schedule_result = search_tool_policy.advance_route(schedule_result, response)
+            return response
+        managed = search_tool_policy.needs_loop(body)
+        task = None
+        response = None
+        buf = b""
+        try:
+            if managed:
+                task = asyncio.create_task(search_tool_policy.run(
+                    body, "responses", invoke, request_id=request_id, api_key_name=api_key_name,
+                ))
+                response = search_tool_policy.stream(task, "responses")
+            else:
+                # No private round to hide: forward actual SSE immediately.
+                response = await invoke({**body, "stream": True})
+            if not hasattr(response, "body_iterator"):
+                obj = json.loads(response.body)
+                if response.status_code >= 400:
+                    await _send_downstream(websocket, _dump_frame({"type": "error", **obj}))
+                    return True
+                iterator = local_web_tools._iter_openai_response_sse(obj)
+            else:
+                iterator = response.body_iterator
+            async for chunk in iterator:
+                buf += chunk if isinstance(chunk, bytes) else chunk.encode()
+                buf, blocks = upstream.split_sse_events(buf.replace(b"\r\n", b"\n"))
+                for block in blocks:
+                    _event, data = upstream.parse_sse_event_bytes(block)
+                    if data is not None:
+                        await _send_downstream(websocket, _dump_frame(data))
+                        if not managed and data.get("type") == "response.completed":
+                            saved = dict(body)
+                            search_tool_policy._append(saved, data.get("response") or {}, [], "responses")
+                            reference = str((data.get("response") or {}).get("id") or "")
+                            search_tool_policy._remember(saved, "responses", api_key_name, [reference])
+        except WebSocketDisconnect:
+            return True
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            try:
+                if hasattr(response, "body_iterator") and hasattr(response.body_iterator, "aclose"):
+                    await response.body_iterator.aclose()
+            finally:
+                await lease.release()
+                lease = None
+        next_turn = await _receive_next_response_create(
+            websocket, channel=None, allowed_models=allowed_models,
+            api_key_name=api_key_name, client_ip=client_ip,
+            session_idle_timeout=float((config.get().get("timeouts") or {}).get("idle", 120)),
+        )
+        if next_turn is None:
+            return True
+        _obj, body, fp_query = next_turn
+        body = search_tool_policy.restore_replay(body, "responses", api_key_name)
+        start_time, start_monotonic, request_id = time.time(), time.monotonic(), str(uuid.uuid4())
+        msg_count, tool_count = _count_msg_tool(body, "responses")
+        await asyncio.to_thread(
+            log_db.insert_pending, request_id, client_ip, api_key_name,
+            body.get("model"), True, msg_count, tool_count,
+            _sanitize_headers(dict(websocket.headers)),
+            {k: v for k, v in body.items() if not k.startswith("_")},
+            fingerprint=fp_query, ingress_protocol="responses_ws",
+        )
+        schedule_result = scheduler.schedule(
+            body, api_key_name=api_key_name, client_ip=client_ip,
+            ingress_protocol="responses", fp_query=fp_query,
+        )
 
 
 async def _build_ws_upstream_request(

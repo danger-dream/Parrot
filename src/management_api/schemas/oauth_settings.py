@@ -1,10 +1,10 @@
-"""Strict OAuth settings, Telegram preference, and default-model schemas."""
+"""Strict OAuth settings, Telegram preference schemas."""
 
 from __future__ import annotations
 
 from pydantic import Field
 
-from src.management_control.oauth.models import CchMode, OAuthFamily, OAuthUsageDisplayMode
+from src.management_control.oauth.models import CchMode, OAuthUsageDisplayMode
 
 from .base import StrictSchema
 
@@ -41,33 +41,3 @@ class TelegramOAuthPreferencesData(StrictSchema):
 class UpdateTelegramOAuthPreferencesRequest(StrictSchema):
     usageDisplayMode: OAuthUsageDisplayMode | None = None
     quotaProgressBar: bool | None = None
-
-
-class OAuthDefaultModelReferenceData(StrictSchema):
-    kind: str
-    owner: str
-    modelId: str
-
-
-class OAuthDefaultModelsData(StrictSchema):
-    family: OAuthFamily
-    models: list[str]
-    references: list[OAuthDefaultModelReferenceData]
-    revision: str
-
-
-class ReplaceOAuthDefaultModelsRequest(StrictSchema):
-    # Publish the business limit in OpenAPI while letting the control layer
-    # return the stable indexed TOO_MANY_MODELS error contract.
-    models: list[str] = Field(json_schema_extra={"maxItems": 200})
-    cleanupReferences: bool = False
-
-
-class OAuthDefaultModelsResultData(StrictSchema):
-    family: OAuthFamily
-    models: list[str]
-    cleanedApiKeys: list[str]
-    skippedApiKeys: list[str]
-    removedMappings: list[str]
-    clearedDefaults: list[str]
-    revision: str
