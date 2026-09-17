@@ -1,4 +1,9 @@
-fastapi>=0.110
+# fastapi: 上限不是保守，而是本项目的既有惯例——凡是会改动 API 契约的依赖都封顶
+# （pydantic/httpcore/socksio/anyio 同理）。FastAPI 会在小版本里改变 app.routes 的
+# 组成与 OpenAPI/DTO 行为；无上限时 CI 每次全新解析都可能红绿漂移。
+# 下限 0.115：0.110.0 会在导入 server 时直接断言失败（"Param: query can only be a
+# request body, using Body()"），原先写的 >=0.110 是无效声明。
+fastapi>=0.115,<0.142
 # Management schemas use Pydantic 2 validators, JsonValue and StringConstraints.
 # Keep the explicitly tested compatibility floor; never accept Pydantic 1 via FastAPI.
 pydantic>=2.10.6,<3
@@ -25,7 +30,9 @@ httpcore>=1.0,<2
 socksio>=1.0,<2
 # starlette: imported directly in src/openai/responses_ws.py (WebSocketDisconnect/WebSocketState).
 # Pulled in via fastapi, but we use its API directly, so declare it explicitly.
-starlette>=0.46
+# 上限 <2 与 FastAPI 同理：它已进入 1.x，且我们直接使用其 WebSocket API，
+# 主版本升级（2.0）不得在无验证的情况下被自动拉入。
+starlette>=0.46,<2
 # Directly used to shield terminal/cleanup owners from ASGI level cancellation.
 anyio>=3.6.2,<5
 # python-socks: hidden runtime dependency. websockets dynamically imports python_socks when

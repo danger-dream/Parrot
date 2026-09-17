@@ -327,7 +327,9 @@ async def test_model_discovery_image_alias_permissions_and_disabled_source(setup
     assert [item['id'] for item in result['data']]==['paint']
     setup[0]['oauthAccounts'][0]['enabled']=False
     assert (await server.list_models(request))['data']==[]
-    paths={route.path for route in server.app.routes}
+    # app.routes 在不同 FastAPI 版本下可能包含没有 .path 的内部条目
+    # （例如 _IncludedRouter），与既有视频路由测试保持同样的取法。
+    paths={getattr(route,'path','') for route in server.app.routes}
     assert {'/images/generations','/images/edits','/v1/images/assets/{token}'}<=paths
 
 
