@@ -7,11 +7,12 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from src.tests.test_management_apikey_api import build_app, session_headers
-from src.tests.test_tg_contract_channels_support import SEGMENT, run_menu_case
+from src.tests.test_tg_contract_channels_support import SEGMENT, current_cases, run_menu_case
 from src.tests.tg_contract import assert_strict_equal, load_jsonl
 
 
-CASES = {case["caseId"]: case for case in load_jsonl(SEGMENT)}
+# Reviewed overlays, not the raw archive: the API-key page gained the MCP rows.
+CASES = {case["caseId"]: case for case in current_cases()}
 
 
 def test_apikey_telegram_adapter_has_no_direct_business_store_import_or_access():

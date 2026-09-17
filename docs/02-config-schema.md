@@ -27,6 +27,8 @@ OAuth 备用模型已退役。普通对话只使用账户 `models` 的成功同�
       "allowedModels": [],
       "allowImages": false,
       "allowVideos": false,           // 视频费用较高，默认关闭
+      "allowMcp": false,              // 是否允许该 Key 访问 MCP 服务，默认关闭
+      "mcpTools": [],                 // 选用的 MCP 工具；空 = 跟随 mcp.tools
       "limits": {                      // 单 Key 限流覆盖；字段缺失/null 继承 apiKeyConcurrency
         "enabled": null,               // 优先级高于 apiKeyConcurrency.enabled
         "maxConcurrent": null,         // 0 = 不限并发
@@ -349,6 +351,21 @@ OAuth 备用模型已退役。普通对话只使用账户 `models` 的成功同�
     "refreshHours": 24
   },
 
+  // ─── MCP 服务 ───
+  "mcp": {
+    "enabled": true,               // 总开关；关闭时端点直接返回 mcp_disabled
+    "mediaTtlSeconds": 3600,       // 工具返回的媒体资源 URL 有效期（60..604800）
+    "maxRequestBodyBytes": 33554432, // MCP 端点请求体上限（图片编辑需传 data URL）
+    "tools": {                     // 工具级开关，是 apiKeys.<name>.mcpTools 的上限
+      "web_search": true,
+      "web_fetch": true,
+      "image_generate": true,
+      "image_edit": true,
+      "video_generate": true,
+      "video_status": true
+    }
+  },
+
   // ─── 路径 / 请求日志留存 ───
   "logDir": "logs",
   "logRetention": {
@@ -557,6 +574,24 @@ Telegram 界面只显示合并后的 USD 金额，不展示金额来源分类或
 - AG 缓存保存已生成的 base64 图片，不修改 `b64_json` 或带 MIME 的 data URL 响应，不增加图片编辑支持。缓存写失败不把成功生成改成失败；统一媒体日志分别保存生成结果与缓存状态/错误类别。
 
 接口、权限、revision、单项 owner 与下载边界见 [模型中心](14-model-center.md#媒体模型与共享缓存)。
+
+### MCP 服务 `mcp`
+
+`mcp` 段只控制服务端能力，客户是否能用由 `apiKeys` 决定。工具的有效授权按以下顺序**逐层收窄**，任何一层关闭都无法被下层重新打开：
+
+1. `mcp.enabled` — 服务总开关。关闭时 `/mcp` 直接返回 503 `mcp_disabled`，不进入协议层。
+2. `mcp.tools.<tool>` — 工具级上限。关闭的工具不出现在 `tools/list`，直接调用也会被拒。
+3. `apiKeys.<name>.allowMcp` — 该 Key 是否获准访问 MCP。**默认 false**，升级不会放开既有 Key。
+4. `apiKeys.<name>.mcpTools` — 该 Key 选用的工具；**空数组 = 跟随全局开关**。非空时只允许其中的工具，且不能包含第 2 步已关闭的工具。
+5. `allowImages` / `allowVideos` — 图片/视频工具额外要求的既有媒体权限位，语义与 HTTP 入口完全一致。
+
+端点：`POST /mcp`（MCP Streamable HTTP），工具返回的媒体资源在 `GET /v1/mcp/media/{token}`（图片仍可由 `GET /v1/images/assets/{token}` 读取）。资源 URL 由请求本身还原：反向代理保留 `Host` 时 `request.base_url` 即对外地址，因此**不需要配置任何对外域名**。只有反代改写 Host 的部署才需要另行处理。`mediaTtlSeconds` 控制这些 URL 的有效期。
+
+MCP 端点有独立的请求体上限 `maxRequestBodyBytes`（默认 32 MiB）。它高于 SDK 默认的 4 MiB，因为图片编辑工具需要接收 data URL 形式的图片；该上限只作用于 MCP 端点，不改变其他入口的既有契约。
+
+工具说明中的可用来源（搜索引擎、图片模型、视频模型）在每次 `tools/list` 时按当前配置实时计算，因此上游增删来源后模型立即看到最新列表，不需要重启。模型若填了已下线的来源，工具会返回带当前可用列表的错误，便于自行纠正。
+
+`mcp_call_log` 是独立的 MCP 调用事实表，记录**每次工具调用**（包括没有产生任何上游调用的拒绝，例如工具被全局关闭、Key 无权限、参数非法）。真实上游调用仍分别由 `search_call_log`（`origin="mcp"`）与多媒体日志记录，两者通过 `call_id` 关联。
 
 ### 超时语义（关键）
 

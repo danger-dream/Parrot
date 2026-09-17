@@ -15,6 +15,7 @@ from src.management_control.apikey import (
 )
 
 from .base import ResponseMeta, StrictSchema
+from .mcp import McpToolName
 
 
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")]
@@ -77,6 +78,8 @@ class ApiKeyData(StrictSchema):
     maskedHint: str
     allowImages: bool
     allowVideos: bool
+    allowMcp: bool
+    mcpTools: list[McpToolName]
     allowedModels: list[str]
     limitOverride: ApiKeyLimitOverrideData | None
     limiter: ApiKeyLimiterData
@@ -147,6 +150,8 @@ class ApiKeyUpdateRequest(StrictSchema):
     enabled: bool | None = None
     allowImages: bool | None = None
     allowVideos: bool | None = None
+    allowMcp: bool | None = None
+    mcpTools: list[McpToolName] | None = None
     allowedModels: list[ModelId] | None = None
     limitOverride: ApiKeyLimitOverridePatch | None = None
 
@@ -154,7 +159,7 @@ class ApiKeyUpdateRequest(StrictSchema):
     def require_change(self):
         if not self.model_fields_set:
             raise ValueError("at least one field is required")
-        nullable = {"enabled", "allowImages", "allowVideos", "allowedModels"}
+        nullable = {"enabled", "allowImages", "allowVideos", "allowMcp", "mcpTools", "allowedModels"}
         for field in self.model_fields_set & nullable:
             if getattr(self, field) is None:
                 raise ValueError(f"{field} must not be null")

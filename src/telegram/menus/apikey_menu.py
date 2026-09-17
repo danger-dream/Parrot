@@ -36,6 +36,7 @@ from typing import Optional
 from ...management_auth import AuthMethod, ManagementPrincipal
 from ...management_control import ManagementContext, ManagementError
 from ...management_control.apikey import ApiKeyControl, ApiKeySource
+from ...mcp.catalog import TOOL_NAMES as MCP_TOOL_ORDER
 from .. import menu_cache, states, ui
 from .sort_primitives import (
     move_bottom as _move_bottom,
@@ -67,6 +68,8 @@ def _entry_from_view(view) -> dict:
         "allowedModels": list(view.allowed_models),
         "allowImages": view.allow_images,
         "allowVideos": view.allow_videos,
+        "allowMcp": view.allow_mcp,
+        "mcpTools": list(view.mcp_tools),
     }
     if view.limit_override is not None:
         limits = {}
@@ -354,6 +357,7 @@ def _perm_summary_short(
     img: bool,
     video: bool,
     enabled: bool = True,
+    mcp: bool = False,
 ) -> str:
     """列表页用：单行简短权限串。协议入口不再按 Key 限制。"""
     m = "全部模型" if not allowed else f"{len(allowed)} 个模型"
@@ -362,6 +366,8 @@ def _perm_summary_short(
         s += " · 🖼 图片"
     if video:
         s += " · 🎬 视频"
+    if mcp:
+        s += " · 🔌 MCP"
     if not enabled:
         s += " · ⛔ 停用"
     return s
@@ -422,6 +428,7 @@ def _render_list(page: int = 1, *, snapshot: dict | None = None,
             allowed: list[str] = []
             img = False
             video = False
+            mcp = False
             key_enabled = True
         else:
             entry = entry if isinstance(entry, dict) else {}
@@ -429,12 +436,13 @@ def _render_list(page: int = 1, *, snapshot: dict | None = None,
             allowed = list(entry.get("allowedModels") or [])
             img = bool(entry.get("allowImages"))
             video = bool(entry.get("allowVideos"))
+            mcp = bool(entry.get("allowMcp"))
             key_enabled = entry.get("enabled") is not False
         s = per[name]
         dot = "⛔" if not key_enabled else ("🟢" if s["total"] > 0 else "⚪")
         lines.append(f"{i}. {dot} <b>{ui.escape_html(name)}</b>")
         lines.append(f"Key: <code>{ui.escape_html(key_str)}</code>")
-        lines.append(f"🏷️ {_perm_summary_short(allowed, img, video, key_enabled)}")
+        lines.append(f"🏷️ {_perm_summary_short(allowed, img, video, key_enabled, mcp)}")
         lines.append(f"🚦 限流: <code>{ui.escape_html(_limit_brief(name))}</code>")
         if s["total"] > 0:
             prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
@@ -529,6 +537,8 @@ def _render_detail(name: str, page: int = 1, *,
     allowed = list(entry.get("allowedModels") or [])
     img = bool(entry.get("allowImages"))
     video = bool(entry.get("allowVideos"))
+    mcp_enabled = bool(entry.get("allowMcp"))
+    mcp_selected = [str(item) for item in (entry.get("mcpTools") or []) if isinstance(item, str)]
     key_enabled = entry.get("enabled") is not False
 
     since_ts = _month_start_ts()
@@ -602,6 +612,7 @@ def _render_detail(name: str, page: int = 1, *,
     payload = _callback_payload(short, page)
     img_label = "🖼 禁用图片接口" if entry.get("allowImages") else "🖼 允许图片接口"
     video_label = "🎬 禁用视频接口" if entry.get("allowVideos") else "🎬 允许视频接口"
+    mcp_label = "🔌 禁用 MCP" if mcp_enabled else "🔌 启用 MCP"
     enabled_label = "⛔ 停用 API Key" if key_enabled else "✅ 启用 API Key"
     rows = [
         [ui.btn("🔁 重新生成 key", f"ak:regen:{payload}"),
@@ -610,6 +621,8 @@ def _render_detail(name: str, page: int = 1, *,
          ui.btn("🚦 请求限流", f"ak:lim:{payload}")],
         [ui.btn(img_label, f"ak:img:{payload}"),
          ui.btn(video_label, f"ak:vid:{payload}")],
+        [ui.btn(mcp_label, f"ak:mcp:{payload}"),
+         ui.btn(f"🛠 MCP 工具（{_mcp_tools_label(mcp_selected)}）", f"ak:mt:{payload}")],
         [ui.btn("🗑 删除", f"ak:del:{payload}"),
          ui.btn(enabled_label, f"ak:enabled:{payload}")],
         [ui.btn("◀ 返回列表", _page_callback(page)),
@@ -928,6 +941,160 @@ def on_key_enabled_toggle(chat_id: int, message_id: int, cb_id: str, short: str,
     )
     ui.answer_cb(cb_id, "已切换")
     text, kb = _render_detail(name, page=page)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+# ─── MCP 权限与工具选择 ───────────────────────────────────────────
+
+_MCP_STATE = "ak_mcp_editing"
+
+# 工具名到界面文案。名称本身来自 catalog（单一真相源），这里只做展示翻译。
+MCP_TOOL_LABELS = {
+    "web_search": "网络搜索",
+    "web_fetch": "网页抓取",
+    "image_generate": "图片生成",
+    "image_edit": "图片编辑",
+    "video_generate": "视频生成",
+    "video_status": "视频查询",
+}
+
+
+def _mcp_tools_label(selected: list[str]) -> str:
+    """按钮上的简短状态：未选择 = 跟随全局开关。"""
+    return "跟随全局" if not selected else f"{len(selected)}/{len(MCP_TOOL_ORDER)}"
+
+
+def on_mcp_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
+    """启用/禁用该 Key 的 MCP 访问。"""
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        ui.answer_cb(cb_id, "未找到 Key")
+        show(chat_id, message_id, page=page)
+        return
+
+    _CONTROL.update_api_key(
+        _control_context(chat_id), name,
+        changes={"allow_mcp": not bool(entry.get("allowMcp", False))},
+    )
+    ui.answer_cb(cb_id, "已切换")
+    text, kb = _render_detail(name, page=page)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _render_mcp_tools_edit(name: str, checked: set[str]) -> tuple[str, dict]:
+    lines = [
+        f"🛠 <b>MCP 工具授权</b>: {ui.escape_html(name)}",
+        "",
+        "点击工具名切换勾选。未勾选任何工具 = 跟随全局开关（服务端开了就能用）。",
+        "勾选后只允许选中的工具；服务端全局关闭的工具无法在此放开。",
+        f"当前已选: <b>{len(checked)}</b>" + ("（= 跟随全局）" if not checked else " 个"),
+    ]
+    rows: list[list[dict]] = []
+    for idx, tool in enumerate(MCP_TOOL_ORDER):
+        mark = "☑" if tool in checked else "☐"
+        label = MCP_TOOL_LABELS.get(tool, tool)
+        rows.append([ui.btn(f"{mark} {label}", f"ak:mtg:{_short_of(name)}:{idx}")])
+    short = _short_of(name)
+    save_label = f"✅ 保存（{len(checked)} 个）" if checked else "✅ 保存（跟随全局）"
+    rows.append([
+        ui.btn(save_label, f"ak:mts:{short}"),
+        ui.btn("🚫 清空(=跟随全局)", f"ak:mtc:{short}"),
+    ])
+    rows.append([ui.btn("❌ 取消", f"ak:mtx:{short}")])
+    return "\n".join(lines), ui.inline_kb(rows)
+
+
+def on_mcp_tools_enter(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    ui.answer_cb(cb_id)
+    name = _name_of(short)
+    entry = _get_entry(name) if name else None
+    if entry is None:
+        ui.answer_cb(cb_id, "未找到 Key")
+        return
+    checked = {str(item) for item in (entry.get("mcpTools") or []) if isinstance(item, str)}
+    states.set_state(chat_id, _MCP_STATE, {"name": name, "checked": sorted(checked)})
+    text, kb = _render_mcp_tools_edit(name, checked)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def _resume_mcp_state(chat_id: int, short: str) -> dict | None:
+    state = states.get_state(chat_id)
+    if not state or state.get("action") != _MCP_STATE:
+        return None
+    data = state.get("data") or {}
+    if data.get("name") != _name_of(short):
+        return None
+    return data
+
+
+def on_mcp_tool_toggle(chat_id: int, message_id: int, cb_id: str, short: str, idx_str: str) -> None:
+    data = _resume_mcp_state(chat_id, short)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    try:
+        tool = MCP_TOOL_ORDER[int(idx_str)]
+    except (ValueError, IndexError):
+        ui.answer_cb(cb_id, "索引无效")
+        return
+    checked = set(data.get("checked") or [])
+    if tool in checked:
+        checked.discard(tool)
+    else:
+        checked.add(tool)
+    data["checked"] = sorted(checked)
+    states.set_state(chat_id, _MCP_STATE, data)
+    ui.answer_cb(cb_id)
+    text, kb = _render_mcp_tools_edit(data["name"], checked)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_mcp_tools_clear(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    data = _resume_mcp_state(chat_id, short)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    data["checked"] = []
+    states.set_state(chat_id, _MCP_STATE, data)
+    ui.answer_cb(cb_id, "已清空（= 跟随全局）")
+    text, kb = _render_mcp_tools_edit(data["name"], set())
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_mcp_tools_save(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    data = _resume_mcp_state(chat_id, short)
+    if data is None:
+        ui.answer_cb(cb_id, "会话已过期")
+        return
+    name = data["name"]
+    checked = sorted(set(data.get("checked") or []))
+    states.pop_state(chat_id)
+    try:
+        _CONTROL.update_api_key(
+            _control_context(chat_id), name, changes={"mcp_tools": checked},
+        )
+    except Exception as exc:
+        ui.answer_cb(cb_id, "保存失败")
+        ui.edit(chat_id, message_id,
+                f"❌ 保存失败：{ui.escape_html(str(exc))}",
+                reply_markup=ui.inline_kb([[ui.btn("◀ 返回详情", f"ak:view:{_callback_payload(short)}")]]))
+        return
+    ui.answer_cb(cb_id, "已保存")
+    text, kb = _render_detail(name)
+    if text:
+        ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_mcp_tools_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
+    states.pop_state(chat_id)
+    ui.answer_cb(cb_id)
+    name = _name_of(short)
+    if not name:
+        return
+    text, kb = _render_detail(name)
     if text:
         ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -1509,6 +1676,30 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("ak:enabled:"):
         short, page = _split_short_page(data.split(":", 2)[2])
         on_key_enabled_toggle(chat_id, message_id, cb_id, short, page)
+        return True
+
+    # MCP 权限与工具选择
+    if data.startswith("ak:mcp:"):
+        short, page = _split_short_page(data.split(":", 2)[2])
+        on_mcp_toggle(chat_id, message_id, cb_id, short, page)
+        return True
+    if data.startswith("ak:mtg:"):
+        parts = data.split(":")
+        if len(parts) >= 4:
+            on_mcp_tool_toggle(chat_id, message_id, cb_id, parts[2], parts[3])
+            return True
+    if data.startswith("ak:mtc:"):
+        on_mcp_tools_clear(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:mts:"):
+        on_mcp_tools_save(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:mtx:"):
+        on_mcp_tools_cancel(chat_id, message_id, cb_id, data.split(":", 2)[2])
+        return True
+    if data.startswith("ak:mt:"):
+        short, _page = _split_short_page(data.split(":", 2)[2])
+        on_mcp_tools_enter(chat_id, message_id, cb_id, short)
         return True
 
     # API Key 限流

@@ -70,6 +70,31 @@ def videos_allowed(key_name: Optional[str]) -> bool:
     return bool(entry.get("allowVideos", False))
 
 
+def api_key_entry(key_name: Optional[str]) -> Optional[dict]:
+    """该 Key 的原始配置项；不存在时返回 None。"""
+    if not key_name:
+        return None
+    entry = (config.get().get("apiKeys") or {}).get(key_name)
+    return entry if isinstance(entry, dict) else None
+
+
+def mcp_allowed(key_name: Optional[str]) -> bool:
+    """该 Key 是否允许访问 MCP 服务。默认 False，需显式开启。"""
+    entry = api_key_entry(key_name)
+    return bool(entry and entry.get("allowMcp", False))
+
+
+def mcp_selected_tools(key_name: Optional[str]) -> list[str]:
+    """该 Key 显式选择的 MCP 工具名；空列表 = 使用全局开关。"""
+    entry = api_key_entry(key_name)
+    if not entry:
+        return []
+    raw = entry.get("mcpTools")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if isinstance(item, str) and item]
+
+
 def get_allowed_protocols(key_name: Optional[str]) -> list[str]:
     """Deprecated compatibility shim.
 

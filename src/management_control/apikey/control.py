@@ -321,6 +321,8 @@ class ApiKeyControl:
                 "allowedModels": [],
                 "allowImages": False,
                 "allowVideos": False,
+                "allowMcp": False,
+                "mcpTools": [],
             }
 
         self._config.update(mutate)
@@ -338,7 +340,8 @@ class ApiKeyControl:
         if_match: str | None = None,
     ) -> ApiKeyView:
         self._require(context, Capability.WRITE)
-        known = {"enabled", "allow_images", "allow_videos", "allowed_models", "limit_override"}
+        known = {"enabled", "allow_images", "allow_videos", "allow_mcp", "mcp_tools",
+                 "allowed_models", "limit_override"}
         unknown = set(changes) - known
         if unknown or not changes:
             path = sorted(unknown)[0] if unknown else "body"
@@ -346,6 +349,8 @@ class ApiKeyControl:
         allowed_models = changes.get("allowed_models")
         if allowed_models is not None:
             self._validate_allowed_models(allowed_models)
+        if "mcp_tools" in changes:
+            self._validate_mcp_tools(changes["mcp_tools"])
         limit_change = changes.get("limit_override", ...)
         if limit_change is not ... and limit_change is not None and not isinstance(limit_change, Mapping):
             raise self._validation("limitOverride", "INVALID_TYPE", "limitOverride must be an object or null")
@@ -366,6 +371,10 @@ class ApiKeyControl:
                 entry["allowImages"] = bool(changes["allow_images"])
             if "allow_videos" in changes:
                 entry["allowVideos"] = bool(changes["allow_videos"])
+            if "allow_mcp" in changes:
+                entry["allowMcp"] = bool(changes["allow_mcp"])
+            if "mcp_tools" in changes:
+                entry["mcpTools"] = [str(item) for item in (changes["mcp_tools"] or ())]
             if "allowed_models" in changes:
                 entry["allowedModels"] = list(changes["allowed_models"] or ())
             if limit_change is None:
@@ -692,6 +701,10 @@ class ApiKeyControl:
             masked_hint=self._masked(secret),
             allow_images=bool(entry.get("allowImages")),
             allow_videos=bool(entry.get("allowVideos")),
+            allow_mcp=bool(entry.get("allowMcp")),
+            mcp_tools=tuple(
+                str(item) for item in (entry.get("mcpTools") or ()) if isinstance(item, str)
+            ),
             allowed_models=tuple(entry.get("allowedModels") or ()),
             limit_override=override,
             limiter=self._limiter_snapshot(name),
@@ -804,13 +817,17 @@ class ApiKeyControl:
     @staticmethod
     def _normalize_entry(raw: Any) -> dict:
         if isinstance(raw, str):
-            return {"key": raw, "enabled": True, "allowedModels": [], "allowImages": False, "allowVideos": False}
+            return {"key": raw, "enabled": True, "allowedModels": [], "allowImages": False,
+                    "allowVideos": False, "allowMcp": False, "mcpTools": []}
         if isinstance(raw, dict):
             result = dict(raw)
             result.setdefault("enabled", True)
             result.setdefault("allowedModels", [])
             result.setdefault("allowImages", False)
             result.setdefault("allowVideos", False)
+            # 既有条目没有 MCP 字段时必须保持关闭，不能因缺字段就放行。
+            result.setdefault("allowMcp", False)
+            result.setdefault("mcpTools", [])
             return result
         return {}
 
@@ -828,6 +845,23 @@ class ApiKeyControl:
             if model not in available:
                 raise self._validation(f"allowedModels[{index}]", "UNKNOWN_MODEL", "model is not currently available")
             seen.add(model)
+
+    def _validate_mcp_tools(self, values: Any) -> None:
+        """校验该 Key 选用的 MCP 工具名。空列表 = 跟随全局开关。"""
+        from src.mcp.catalog import TOOL_NAMES
+
+        if not isinstance(values, (list, tuple)):
+            raise self._validation("mcpTools", "INVALID_TYPE", "mcpTools must be an array")
+        seen: set[str] = set()
+        for index, value in enumerate(values):
+            name = str(value or "").strip()
+            if not name:
+                raise self._validation(f"mcpTools[{index}]", "EMPTY_TOOL", "tool name must not be empty")
+            if name in seen:
+                raise self._validation(f"mcpTools[{index}]", "DUPLICATE_TOOL", "tool name is duplicated")
+            if name not in TOOL_NAMES:
+                raise self._validation(f"mcpTools[{index}]", "UNKNOWN_TOOL", "unknown MCP tool name")
+            seen.add(name)
 
     def available_permission_models_unchecked(self) -> tuple[str, ...]:
         cfg = self._config.get()

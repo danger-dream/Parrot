@@ -347,6 +347,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Empty overrides preserve legacy AnySearch opt-out/key on upgrade; effective
     # defaults and direct-HTTP backend migration live in search_service.settings.
     "search": {},
+    # MCP 服务：对授权客户暴露搜索/图片/视频工具。工具级开关是全局上限，
+    # apiKeys.<name>.mcpTools 只能在其交集内进一步收窄，不能反向放宽。
+    # mediaTtlSeconds 是资源 URL 的有效期；base_url 由请求还原（反代保留 Host
+    # 时无需配置），不要在此新增对外域名配置。
+    "mcp": {
+        "enabled": True,
+        "tools": {
+            "web_search": True,
+            "web_fetch": True,
+            "image_generate": True,
+            "image_edit": True,
+            "video_generate": True,
+            "video_status": True,
+        },
+        "mediaTtlSeconds": 3600,
+        "maxRequestBodyBytes": 33554432,
+    },
     "anysearch": {
         "enabled": True,
         "apiKey": "",

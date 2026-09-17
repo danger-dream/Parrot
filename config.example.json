@@ -10,6 +10,8 @@
       "enabled": true,
       "allowImages": false,
       "allowVideos": false,
+      "allowMcp": false,
+      "mcpTools": [],
       "limits": {
         "enabled": null,
         "maxConcurrent": null,
@@ -458,6 +460,19 @@
       {"id": "xai", "type": "xai", "name": "xAI OAuth", "enabled": true, "model": "grok-4.6", "accountIds": [], "allowDisabledAccounts": false},
       {"id": "anthropic", "type": "anthropic", "name": "Anthropic OAuth", "enabled": true, "model": "claude-sonnet-4-6", "accountIds": [], "allowDisabledAccounts": false}
     ]
+  },
+  "mcp": {
+    "enabled": true,
+    "mediaTtlSeconds": 3600,
+    "maxRequestBodyBytes": 33554432,
+    "tools": {
+      "web_search": true,
+      "web_fetch": true,
+      "image_generate": true,
+      "image_edit": true,
+      "video_generate": true,
+      "video_status": true
+    }
   },
   "telegramUi": {
     "providerCustomEmoji": {

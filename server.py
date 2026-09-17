@@ -59,6 +59,7 @@ from src.management_auth import (
 )
 from src.management_control import OperationRegistry, OperationStore, StoreAuditSink
 from src.management_control.composition import ManagementControls
+from src import mcp
 from src.protocols import errors as protocol_errors
 from src.openai.codex_constants import codex_cli_version
 from src.openai.transform.guard import GuardError, guard_collection_fields
@@ -559,9 +560,26 @@ async def lifespan(app: FastAPI):
         _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
         _background_tasks.append(asyncio.create_task(translation.cleanup_loop()))
 
+        # MCP 会话管理器与现有 lifespan 同生命周期；关闭时不在此处 join，
+        # 由 finally 的 drain 流程统一等待在途请求。
+        mcp_lifespan = None
+        if _MCP_SERVER is not None:
+            try:
+                mcp_lifespan = _MCP_SERVER.session_manager.run()
+                await mcp_lifespan.__aenter__()
+            except Exception as exc:
+                mcp_lifespan = None
+                mcp.mount._set_state(mounted=False, reason=f"session manager failed: {type(exc).__name__}")
+                print(f"[mcp] session manager failed to start: {type(exc).__name__}")
+
         try:
             yield
         finally:
+            if mcp_lifespan is not None:
+                try:
+                    await mcp_lifespan.__aexit__(None, None, None)
+                except Exception:
+                    pass
             drain.begin("lifespan_shutdown")
             timeout = drain.shutdown_timeout_seconds()
             drained = await drain.wait_for_zero(timeout)
@@ -598,6 +616,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _install_mcp(app: FastAPI) -> None:
+    """挂载 MCP 服务与媒体下载端点。
+
+    无论开关状态都挂载：关闭时由占位应用返回 503，使端点行为可预期，
+    而不是随配置变化出现 404。构建失败只影响 MCP 本身，不影响主服务启动。
+    """
+    mcp_path = mcp.PATH
+    try:
+        server = mcp.server.build_server()
+        asgi = mcp.mount.build_asgi_app(server)
+        app.mount(mcp_path, asgi)
+        mcp.mount._set_state(mounted=True, path=mcp_path, reason=None)
+        return server
+    except Exception as exc:
+        app.mount(mcp_path, mcp.mount.DisabledMCPApp())
+        mcp.mount._set_state(mounted=False, path=mcp_path,
+                             reason=f"build failed: {type(exc).__name__}")
+        print(f"[mcp] build failed; endpoint stays disabled: {type(exc).__name__}")
+        return None
+
+
+_MCP_SERVER = _install_mcp(app)
 
 
 _API_KEY_LIMITED_HTTP_PATHS = {
@@ -1156,6 +1198,13 @@ async def download_image_asset(request: Request, token: str):
     """Expiring bearer-capability URL; no management path or credentials."""
     from src.image_artifacts import download
     return await download(request, token)
+
+
+@app.get(mcp.MEDIA_PATH + "/{token}", include_in_schema=False)
+async def download_mcp_media(request: Request, token: str):
+    """MCP 工具返回的媒体资源（图片与视频）。能力 URL，无需额外鉴权。"""
+    from src.image_artifacts import download_mcp_media as _download
+    return await _download(request, token)
 
 
 # Unified Images API: configured OAuth/API source selected by model.

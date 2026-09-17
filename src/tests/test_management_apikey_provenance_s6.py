@@ -54,6 +54,10 @@ def entry(secret: str) -> dict:
         "allowedModels": [],
         "allowImages": False,
         "allowVideos": False,
+        # MCP access is off unless explicitly granted, so every created key
+        # carries these two fields at their default values.
+        "allowMcp": False,
+        "mcpTools": [],
     }
 
 

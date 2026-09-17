@@ -95,6 +95,10 @@ class ApiKeyView:
     masked_hint: str
     allow_images: bool
     allow_videos: bool
+    # MCP 服务访问权限。默认关闭：既有 Key 不会被顺带开放。
+    allow_mcp: bool
+    # 该 Key 选用的 MCP 工具；空 = 跟随全局 mcp.tools。
+    mcp_tools: tuple[str, ...]
     allowed_models: tuple[str, ...]
     limit_override: ApiKeyLimitOverride | None
     limiter: ApiKeyLimiterSnapshot

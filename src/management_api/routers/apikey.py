@@ -106,6 +106,8 @@ _KEY_EXAMPLE = {
     "maskedHint": "ccp-…19af",
     "allowImages": False,
     "allowVideos": False,
+    "allowMcp": False,
+    "mcpTools": [],
     "allowedModels": [],
     "limitOverride": None,
     "limiter": _LIMITER_EXAMPLE,
@@ -217,6 +219,8 @@ def _key(value: ApiKeyView) -> ApiKeyData:
         maskedHint=value.masked_hint,
         allowImages=value.allow_images,
         allowVideos=value.allow_videos,
+        allowMcp=value.allow_mcp,
+        mcpTools=list(value.mcp_tools),
         allowedModels=list(value.allowed_models),
         limitOverride=override,
         limiter=_limiter(value.limiter),
@@ -385,6 +389,10 @@ def update_api_key(
         changes["allow_images"] = body.allowImages
     if "allowVideos" in fields:
         changes["allow_videos"] = body.allowVideos
+    if "allowMcp" in fields:
+        changes["allow_mcp"] = body.allowMcp
+    if "mcpTools" in fields:
+        changes["mcp_tools"] = body.mcpTools
     if "allowedModels" in fields:
         changes["allowed_models"] = body.allowedModels
     if "limitOverride" in fields:

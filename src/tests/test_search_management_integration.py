@@ -38,6 +38,7 @@ SYSTEM_CASE_IDS = (
     "TG-SYS-08.006-limiter-durations",
 )
 SEARCH_BUTTON_ROW = [{"text": "🔎 搜索工具", "callback_data": "srch:show"}]
+MCP_BUTTON_ROW = [{"text": "🔌 MCP 服务", "callback_data": "mcp:show"}]
 
 
 def test_exact_search_route_methods_paths_and_retired_ag_absence():
@@ -61,7 +62,7 @@ def test_exact_search_route_methods_paths_and_retired_ag_absence():
     assert len({path for _, path in SEARCH_OPERATIONS.values()}) == 8
     assert len({path for _, path in RETIRED_AG_OPERATIONS.values()}) == 3
     manifest = (FIXTURES / "production-operation-ids.txt").read_text().splitlines()
-    assert len(manifest) == len(set(manifest)) == 232
+    assert len(manifest) == len(set(manifest)) == 237
     assert set(manifest) == set(actual)
 
 
@@ -109,7 +110,7 @@ def test_search_conditional_secret_permission_matches_manifest(api, ctx, operati
 
 
 @pytest.mark.parametrize("case_id", SYSTEM_CASE_IDS)
-def test_system_golden_difference_is_only_search_entry(case_id, monkeypatch):
+def test_system_golden_difference_is_only_reviewed_entries(case_id, monkeypatch):
     # Derive a reviewed expectation from the frozen archive, never from output.
     archived = next(case for case in load_jsonl(SEGMENT) if case["caseId"] == case_id)
     reviewed = copy.deepcopy(archived)
@@ -119,13 +120,16 @@ def test_system_golden_difference_is_only_search_entry(case_id, monkeypatch):
         if not payload.get("text", "").startswith("⚙ <b>系统设置</b>"):
             continue
         keyboard = payload["reply_markup"]["inline_keyboard"]
+        # Two reviewed rows were added to this page: the search menu entry and the
+        # MCP service entry, each on its own row immediately after the previous one.
         assert len(keyboard) == 8
         assert keyboard[-1] == [{"text": "🔁 重试设置", "callback_data": "sys:show:retry"},
                                 {"text": "◀ 返回主菜单", "callback_data": "menu:main"}]
         keyboard.insert(7, copy.deepcopy(SEARCH_BUTTON_ROW))
+        keyboard.insert(8, copy.deepcopy(MCP_BUTTON_ROW))
         insertion_indices.append(index)
     assert insertion_indices
-    print(f"REVIEWED {case_id}: tgApi indices {insertion_indices}; only inline_keyboard[7] added")
+    print(f"REVIEWED {case_id}: tgApi indices {insertion_indices}; only inline_keyboard[7:9] added")
     scenario = archived["entry"]["scenario"]
     env = SystemEnv(archived, monkeypatch)
     (SETTINGS_RUNNERS | RUNTIME_RUNNERS)[scenario](env)

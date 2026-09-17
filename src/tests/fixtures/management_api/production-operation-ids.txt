@@ -75,6 +75,8 @@ getManagementCapabilities
 getManagementMetadata
 getManagementOperation
 getManagementOverview
+getMcpSettings
+getMcpStats
 getMediaLog
 getModel
 getModelChannelOrder
@@ -123,6 +125,7 @@ listChannels
 listCooldowns
 listDnsCache
 listInvalidOAuthAccounts
+listMcpLogs
 listMediaArtifacts
 listMediaLogs
 listMediaSources
@@ -202,6 +205,8 @@ updateImageAccountState
 updateImageSettings
 updateLoadBalancingMode
 updateLogRetentionSettings
+updateMcpSettings
+updateMcpTool
 updateMediaSource
 updateModelMapping
 updateNetworkMonitor

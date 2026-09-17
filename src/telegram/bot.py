@@ -25,7 +25,7 @@ from ..async_owned import await_owned
 from . import menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
-    logs_menu, mapping_menu, media_logs_menu, model_center_menu,
+    logs_menu, mapping_menu, mcp_menu, media_logs_menu, model_center_menu,
     oauth_account_models_menu, oauth_menu, proxy_menu,
     search_menu, stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
     xai_imagine_menu,
@@ -563,6 +563,8 @@ def _handle_callback(cb: dict) -> None:
 
     # 搜索工具与系统设置菜单
     if search_menu.handle_callback(chat_id, msg_id, cb_id, data):
+        return
+    if mcp_menu.handle_callback(chat_id, msg_id, cb_id, data):
         return
     if proxy_menu.handle_callback(chat_id, msg_id, cb_id, data):
         print(f"[tg] handled by proxy_menu ({data})")

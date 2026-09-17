@@ -39,3 +39,8 @@ anyio>=3.6.2,<5
 # connecting through a SOCKS5 proxy (src/failover.py + src/openai/responses_ws.py).
 # Without it: ImportError: connecting through a SOCKS proxy requires python-socks.
 python-socks>=2.0
+# mcp: Parrot 内建 MCP 服务（src/mcp/）。固定 v2 线：它使用独立的 httpx2/httpcore2
+# 顶层包，不会替换或升级本项目的 httpx/httpcore（src/proxy/connector.py 直接继承
+# httpcore.AsyncNetworkStream），因此不触及 SS2022 出站网络后端。v1 线会拉动
+# starlette 大版本并引入 httpx-sse，属于对本项目运行时的额外风险。
+mcp==2.2.0

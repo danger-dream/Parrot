@@ -47,18 +47,19 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
     monkeypatch.setattr(app, "include_router", record_direct_mount)
     install_management_routers(app)
 
-    # Foundation plus 22 ordered domain routers, including search. Assert the
+    # Foundation plus 23 ordered domain routers, including search and MCP. Assert the
     # identities/order, not only a count that could conceal a missing domain.
     expected_router_names = (
         "foundation", "oauth", "channels", "apikey", "overview", "status", "stats",
         "retention", "logs", "media", "mapping", "model_metadata", "models",
         "load_balancing", "proxy", "translation", "status_alerts", "updates",
         "media_settings", "system_settings", "search", "content_blacklist", "network",
+        "mcp",
     )
     assert [router for router, _prefix in included] == [
         import_module("src.management_api.routers." + name).router for name in expected_router_names
     ]
-    assert len(included) == 23
+    assert len(included) == 24
     assert all(prefix == "/api/management/v1" for _router, prefix in included)
     # FastAPI may retain nested includes (such as the WorkBuddy router) in
     # router.routes as well as app.routes, rather than flattening them. Count
@@ -70,8 +71,8 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
         for method, operation in path_item.items()
         if method in {"get", "post", "delete", "put", "patch"}
     ]
-    assert len(operations) == 232
-    assert len({(method, path) for method, path, _operation in operations}) == 232
+    assert len(operations) == 237
+    assert len({(method, path) for method, path, _operation in operations}) == 237
     assert {operation for _method, _path, operation in operations} == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
@@ -90,10 +91,10 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     ]
     operation_ids = [operation_id for _method, _path, operation_id in operations]
     method_paths = [(method, path) for method, path, _operation_id in operations]
-    assert len(operations) == 232
-    assert len(set(operation_ids)) == 232
-    assert len(set(method_paths)) == 232
-    assert len({path for _method, path in method_paths}) == 171  # OAuth default-models retirement removes two paths
+    assert len(operations) == 237
+    assert len(set(operation_ids)) == 237
+    assert len(set(method_paths)) == 237
+    assert len({path for _method, path in method_paths}) == 175  # OAuth default-models retirement removes two paths
     assert set(operation_ids) == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()

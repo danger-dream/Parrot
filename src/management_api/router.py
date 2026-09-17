@@ -14,6 +14,7 @@ from .routers import (
     load_balancing,
     logs,
     mapping,
+    mcp,
     media,
     media_settings,
     model_metadata,
@@ -60,6 +61,7 @@ _BUILTIN_DOMAIN_ROUTERS: tuple[APIRouter, ...] = (
     search.router,
     content_blacklist.router,
     network.router,
+    mcp.router,
 )
 _registered: list[APIRouter] = []
 _lock = RLock()

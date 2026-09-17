@@ -194,7 +194,8 @@ def _main_text_and_kb() -> tuple[str, dict]:
          ui.btn("🗣 翻译层", "tl:show")],
         [ui.btn("🗃 数据留存", "sys:show:retention"),
          ui.btn("🆕 版本更新", "menu:update")],
-        [ui.btn("🔎 搜索工具", "srch:show")],
+        [ui.btn("🔎 搜索工具", "srch:show"),
+         ui.btn("🔌 MCP 服务", "mcp:show")],
         [ui.btn("🔁 重试设置", "sys:show:retry"),
          ui.btn("◀ 返回主菜单", "menu:main")],
     ])

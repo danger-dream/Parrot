@@ -9,6 +9,7 @@
   - proxy_chain             代理链（每个渠道尝试内的代理切换明细）
   - local_web_log           Parrot 本地 WebSearch/WebFetch 执行明细（历史表，停止写入）
   - search_call_log         搜索来源的每次真实上游调用与结算事实（独立顶层表）
+  - mcp_call_log            MCP 服务的每次工具调用事实（独立顶层表）
 
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
@@ -372,6 +373,38 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_search_call_started ON search_call_log(started_at);
     CREATE INDEX IF NOT EXISTS idx_search_call_source ON search_call_log(source_id, started_at);
     CREATE INDEX IF NOT EXISTS idx_search_call_req ON search_call_log(request_id);
+
+    CREATE TABLE IF NOT EXISTS mcp_call_log (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_id          TEXT NOT NULL,
+      created_at       REAL NOT NULL,
+      api_key_name     TEXT,
+      client_name      TEXT,
+      client_version   TEXT,
+      protocol_version TEXT,
+      tool_name        TEXT NOT NULL,
+      params_json      TEXT,
+      status           TEXT NOT NULL DEFAULT 'running',
+      error_code       TEXT,
+      error_message    TEXT,
+      elapsed_ms       INTEGER,
+      source_id        TEXT,
+      source_type      TEXT,
+      model            TEXT,
+      provider         TEXT,
+      account_key      TEXT,
+      result_count     INTEGER NOT NULL DEFAULT 0,
+      result_bytes     INTEGER NOT NULL DEFAULT 0,
+      media_tokens     TEXT,
+      video_request_id TEXT,
+      input_tokens     INTEGER NOT NULL DEFAULT 0,
+      output_tokens    INTEGER NOT NULL DEFAULT 0,
+      cost_ticks       INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_mcp_call_started ON mcp_call_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_mcp_call_key ON mcp_call_log(api_key_name, created_at);
+    CREATE INDEX IF NOT EXISTS idx_mcp_call_tool ON mcp_call_log(tool_name, created_at);
+    CREATE INDEX IF NOT EXISTS idx_mcp_call_id ON mcp_call_log(call_id);
     """
 
 
@@ -2797,6 +2830,182 @@ def search_call_entries(
                                      int(item.get("id") or 0)), reverse=True)
     return collected[offset:offset + limit]
 
+
+# ── MCP 工具调用事实 ────────────────────────────────────────────────────────
+#
+# 与 request_log / search_call_log / image_call_logs 并列的独立事实表：它记录
+# "客户怎么使用 MCP"，包括那些**没有产生任何上游调用**的调用（工具被禁用、
+# Key 无权限、参数非法）。这些在按上游调用记账的表里根本不存在，这正是本表
+# 独立存在的理由。真实上游调用仍由各自的表记录，用 call_id 关联。
+
+def record_mcp_call(
+    *,
+    call_id: str,
+    tool_name: str,
+    api_key_name: str | None = None,
+    client_name: str | None = None,
+    client_version: str | None = None,
+    protocol_version: str | None = None,
+    params: Any = None,
+    started_at: float | None = None,
+) -> RowLogHandle:
+    """Open one MCP tool-call row. Logging never breaks the tool call itself."""
+    ref = _db_ref_for_timestamp(started_at)
+    payload: str | None = None
+    if params is not None:
+        try:
+            payload = json.dumps(params, ensure_ascii=False, default=str)[:8000]
+        except Exception:
+            payload = None
+    with _write_lock:
+        conn = _get_conn_for_ref(ref)
+        cur = conn.execute(
+            """INSERT INTO mcp_call_log
+               (call_id, created_at, api_key_name, client_name, client_version,
+                protocol_version, tool_name, params_json, status)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                str(call_id), float(started_at or time.time()),
+                (str(api_key_name) if api_key_name else None),
+                (str(client_name)[:200] if client_name else None),
+                (str(client_version)[:100] if client_version else None),
+                (str(protocol_version)[:64] if protocol_version else None),
+                str(tool_name), payload, "running",
+            ),
+        )
+        conn.commit()
+        return RowLogHandle(table="mcp_call_log", row_id=int(cur.lastrowid),
+                            request_id=str(call_id), db=ref)
+
+
+def finish_mcp_call(
+    handle: int | RowLogHandle | None,
+    *,
+    status: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    elapsed_ms: int | None = None,
+    source_id: str | None = None,
+    source_type: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    account_key: str | None = None,
+    result_count: int = 0,
+    result_bytes: int = 0,
+    media_tokens: Any = None,
+    video_request_id: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cost_ticks: int | None = None,
+    ended_at: float | None = None,
+) -> None:
+    """Close one MCP tool-call row with its outcome."""
+    if handle is None:
+        return
+    row_handle = _row_handle(handle, table="mcp_call_log")
+    tokens_payload = None
+    if media_tokens:
+        tokens_payload = json.dumps(list(media_tokens), ensure_ascii=False)[:4000]
+    with _write_lock:
+        conn = _get_conn_for_ref(row_handle.db)
+        conn.execute(
+            """UPDATE mcp_call_log SET
+               status=?, error_code=?, error_message=?, elapsed_ms=?,
+               source_id=?, source_type=?, model=?, provider=?, account_key=?,
+               result_count=?, result_bytes=?, media_tokens=?, video_request_id=?,
+               input_tokens=?, output_tokens=?, cost_ticks=?
+               WHERE id=?""",
+            (
+                str(status), error_code,
+                (str(error_message)[:4000] if error_message else None),
+                (int(elapsed_ms) if elapsed_ms is not None else None),
+                (str(source_id) if source_id else None),
+                (str(source_type) if source_type else None),
+                (str(model) if model else None),
+                (str(provider) if provider else None),
+                (str(account_key) if account_key else None),
+                int(result_count or 0), int(result_bytes or 0),
+                tokens_payload,
+                (str(video_request_id) if video_request_id else None),
+                int(input_tokens or 0), int(output_tokens or 0),
+                (int(cost_ticks) if cost_ticks is not None else None),
+                row_handle.row_id,
+            ),
+        )
+        conn.commit()
+
+
+def mcp_call_entries(
+    since_ts: float,
+    *,
+    api_key_name: str | None = None,
+    tool_name: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """Recent MCP tool-call rows (newest first) for the log viewer."""
+    limit = max(1, min(int(limit or 50), 500))
+    offset = max(0, int(offset or 0))
+    collected: list[dict] = []
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            if "mcp_call_log" not in _existing_tables(conn):
+                continue
+            sql = "SELECT * FROM mcp_call_log WHERE created_at>=?"
+            args: list = [float(since_ts)]
+            if api_key_name:
+                sql += " AND api_key_name=?"
+                args.append(str(api_key_name))
+            if tool_name:
+                sql += " AND tool_name=?"
+                args.append(str(tool_name))
+            sql += " ORDER BY created_at DESC, id DESC"
+            collected.extend(dict(row) for row in conn.execute(sql, tuple(args)).fetchall())
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+    collected.sort(key=lambda item: (float(item.get("created_at") or 0.0),
+                                     int(item.get("id") or 0)), reverse=True)
+    return collected[offset:offset + limit]
+
+
+def mcp_call_stats(since_ts: float) -> list[dict]:
+    """Aggregate MCP calls per tool since ``since_ts`` (cross-month).
+
+    Only counts and latency are aggregated here; parameter text and credentials
+    are never aggregated, matching the search-call statistics口径.
+    """
+    by_tool: dict[str, dict] = {}
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            if "mcp_call_log" not in _existing_tables(conn):
+                continue
+            rows = conn.execute(
+                "SELECT tool_name,"
+                " COUNT(*) AS calls,"
+                " SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,"
+                " SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS failed,"
+                " SUM(COALESCE(elapsed_ms,0)) AS elapsed_sum,"
+                " SUM(CASE WHEN elapsed_ms IS NOT NULL THEN 1 ELSE 0 END) AS elapsed_n,"
+                " MAX(created_at) AS last_at"
+                " FROM mcp_call_log WHERE created_at>=? GROUP BY tool_name",
+                (float(since_ts),),
+            ).fetchall()
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+        for row in rows:
+            key = str(row["tool_name"])
+            bucket = by_tool.setdefault(key, {
+                "tool_name": key, "calls": 0, "success": 0, "failed": 0,
+                "elapsed_sum": 0, "elapsed_n": 0, "last_at": 0.0,
+            })
+            for field in ("calls", "success", "failed", "elapsed_sum", "elapsed_n"):
+                bucket[field] += int(row[field] or 0)
+            bucket["last_at"] = max(bucket["last_at"], float(row["last_at"] or 0.0))
+    return sorted(by_tool.values(), key=lambda item: item["calls"], reverse=True)
 
 
 def finish_success(

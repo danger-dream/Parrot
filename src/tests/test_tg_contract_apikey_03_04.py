@@ -9,10 +9,10 @@ import re
 import pytest
 
 from src.tests.tg_contract import assert_strict_equal, load_jsonl
-from src.tests.test_tg_contract_channels_support import SEGMENT, run_menu_case
+from src.tests.test_tg_contract_channels_support import SEGMENT, current_cases, run_menu_case
 
 
-ALL_CASES = load_jsonl(SEGMENT)
+ALL_CASES = current_cases()
 CASES = [
     case for case in ALL_CASES
     if case["capabilityId"] in {"TG-AK-03", "TG-AK-04"}
@@ -122,13 +122,29 @@ def test_ak03_permission_draft_save_and_cancel_state_pop_timing():
     assert final["config"]["apiKeys"]["alpha"]["allowedModels"] == ["image-1"]
     assert final["state"] is None
     pop_steps = [step for step in case["stateSteps"] if step["event"] == "pop"]
-    assert [step["step"] for step in pop_steps] == [7, 9]
+    # Steps 7/9 close the model-permission draft; 14/17 close the MCP tool draft
+    # that the reviewed MCP flow opens and cancels after it.
+    assert [step["step"] for step in pop_steps] == [7, 9, 14, 17]
     text = "\n".join(
         call["payload"].get("text", "") for call in case["tgApi"]
         if call["method"] in {"sendMessage", "editMessageText"}
     )
     assert "🖼 为图片模型，🎬 为视频模型" in text
     assert "清空 → 视为无限制" in text
+    assert "MCP 工具授权" in text
+    # The MCP tool picker renders one row per tool plus save/clear/cancel.
+    picker = next(
+        (call["payload"]["reply_markup"]["inline_keyboard"] for call in case["tgApi"]
+         if call["method"] == "editMessageText"
+         and "MCP 工具授权" in call["payload"].get("text", "")),
+        None,
+    )
+    assert picker is not None
+    picker_buttons = [b["callback_data"] for row in picker for b in row]
+    assert any(x.startswith("ak:mtg:") for x in picker_buttons)
+    assert any(x.startswith("ak:mts:") for x in picker_buttons)
+    assert any(x.startswith("ak:mtc:") for x in picker_buttons)
+    assert any(x.startswith("ak:mtx:") for x in picker_buttons)
     assert any(
         call["payload"].get("text") == "短码不匹配"
         for call in case["tgApi"] if call["method"] == "answerCallbackQuery"

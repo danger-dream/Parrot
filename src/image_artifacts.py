@@ -19,7 +19,11 @@ from .providers.remote_image import download_https_image
 
 URL_TTL_SECONDS = 3600
 MAX_PIXELS = 16_777_216
-_ASSETS: dict[str, tuple[str, str, float]] = {}
+# token -> (path, mime, expiry, media_type)。media_type 决定下载时的路径归属校验
+# （图片与视频分属缓存下不同子树），也决定对外 URL 前缀语义。
+_ASSETS: dict[str, tuple[str, str, float, str]] = {}
+_IMAGE_URL_PREFIX = '/v1/images/assets'
+_MCP_URL_PREFIX = '/v1/mcp/media'
 
 
 def dimensions(size: str | None) -> tuple[int, int] | None:
@@ -123,38 +127,64 @@ def normalize(raw: bytes, *, size: str | None, options: dict, mask=None) -> tupl
 
 def _prune() -> None:
     now = time.time()
-    for token, (path, _mime, expiry) in list(_ASSETS.items()):
+    for token, entry in list(_ASSETS.items()):
+        path, _mime, expiry = entry[0], entry[1], entry[2]
         if expiry <= now:
             _ASSETS.pop(token, None)
             try: Path(path).unlink(missing_ok=True)
             except OSError: pass
 
 
-def publish(raw: bytes, *, mime: str, cfg: dict, request: Request, provider: str, action: str, index: int) -> tuple[str, int]:
+# 临时 URL 文件的命名前缀 -> 扩展名。图片与视频共用同一临时回收策略，
+# 否则进程重启后残留的视频临时文件会一直占空间。
+_TEMPORARY_SUFFIXES = ('png', 'jpg', 'webp', 'mp4', 'webm', 'mov', 'm4v')
+
+
+def _reap_stale_temporary(root, cutoff: float) -> None:
+    for suffix in _TEMPORARY_SUFFIXES:
+        for stale in root.rglob(f'url-image-temporary-*.{suffix}'):
+            if not stale.is_symlink() and stale.stat().st_mtime < cutoff:
+                stale.unlink(missing_ok=True)
+
+
+def publish(raw: bytes, *, mime: str, cfg: dict, request: Request | None = None, provider: str,
+            action: str, index: int, media_type: str = 'image', ttl_seconds: int | None = None,
+            url_prefix: str | None = None, base_url: str | None = None) -> tuple[str, int]:
+    """发布一份短期可访问的媒体资源，返回 (URL, 过期时间戳)。
+
+    URL 由请求本身还原（``request.base_url``）：反向代理保留 Host 时天然得到
+    对外地址，不需要任何域名配置。无 ``request`` 时用显式 ``base_url``
+    （MCP 的媒体转存路径即用此形式）。``media_type`` 只决定缓存子树与扩展名校验。
+    """
     _prune()
-    if len(_ASSETS) >= 4096: raise ValueError('temporary image URL capacity exhausted')
+    if len(_ASSETS) >= 4096: raise ValueError('temporary media URL capacity exhausted')
+    kind = 'video' if media_type == 'video' else 'image'
     root = media_cache.cache_root(cfg)
     # Reap orphaned temporary URL files after a process restart as well. Never
     # remove retained historical media merely because its URL has expired.
     cutoff = time.time() - URL_TTL_SECONDS
-    for stale in root.rglob('url-image-temporary-*.png'):
-        if not stale.is_symlink() and stale.stat().st_mtime < cutoff:
-            stale.unlink(missing_ok=True)
-    for suffix in ('jpg', 'webp'):
-        for stale in root.rglob(f'url-image-temporary-*.{suffix}'):
-            if not stale.is_symlink() and stale.stat().st_mtime < cutoff:
-                stale.unlink(missing_ok=True)
+    _reap_stale_temporary(root, cutoff)
     media_cache.cleanup(root, cfg)
-    path = media_cache.write_bytes(raw, cfg=cfg, provider='url', media_type='image', action='temporary',
-        extension=media_cache.extension_for(media_type='image', mime=mime), index=index)
+    path = media_cache.write_bytes(raw, cfg=cfg, provider='url', media_type=kind, action='temporary',
+        extension=media_cache.extension_for(media_type=kind, mime=mime), index=index)
     token = secrets.token_urlsafe(32)
-    expiry = int(time.time()) + URL_TTL_SECONDS
-    _ASSETS[token] = (path, mime, expiry)
+    expiry = int(time.time()) + (URL_TTL_SECONDS if ttl_seconds is None else max(1, int(ttl_seconds)))
+    _ASSETS[token] = (path, mime, expiry, kind)
     media_cache.cleanup(root, cfg)
     if not Path(path).is_file():
         _ASSETS.pop(token, None)
-        raise ValueError('image URL cache capacity exhausted; generated image was not regenerated')
-    return str(request.base_url).rstrip('/')+'/v1/images/assets/'+token, expiry
+        raise ValueError('media URL cache capacity exhausted; generated media was not regenerated')
+    if base_url is None:
+        if request is None:
+            raise ValueError('base_url or request is required to publish media')
+        base_url = str(request.base_url)
+    prefix = url_prefix or (_MCP_URL_PREFIX if kind == 'video' else _IMAGE_URL_PREFIX)
+    return str(base_url).rstrip('/') + prefix + '/' + token, expiry
+
+
+def media_token(url: str) -> str:
+    """从已发布的资源 URL 中取出 token（用于日志关联）。"""
+    return str(url or "").rsplit('/', 1)[-1]
 
 
 def url_available(url: str) -> bool:
@@ -162,15 +192,37 @@ def url_available(url: str) -> bool:
     return bool(entry and entry[2] > time.time() and Path(entry[0]).is_file())
 
 
-async def download(request: Request, token: str) -> Response:
+async def _serve_asset(token: str, *, kind: str | None = None) -> Response:
     _prune()
     entry = _ASSETS.get(token)
     if not entry: return Response(status_code=404)
-    path, mime, expiry = entry
-    from .openai.images_simple import settings
-    if not media_cache.artifact_path_is_safe(path, settings()): return Response(status_code=404)
+    path, mime, _expiry, media_type = entry
+    # 两类入口各自只能读取自己的资源类别，避免图片端点被用来取视频。
+    if kind is not None and media_type != kind: return Response(status_code=404)
+    # 安全校验必须按资源自身的类别选择配置：图片与视频分属缓存下不同子树，
+    # 用图片配置去校验视频路径会一律判为不安全。
+    effective = kind if kind is not None else media_type
+    if effective == 'video':
+        from . import media_config
+        cfg = media_config.settings('video')
+        cfg['_media_kind'] = 'video'
+    else:
+        from .openai.images_simple import settings
+        cfg = settings()
+    if not media_cache.artifact_path_is_safe(path, cfg): return Response(status_code=404)
+    # FileResponse 原生支持 Range（206 + Accept-Ranges: bytes），视频播放器可拖动。
     return FileResponse(path, media_type=mime, headers={'Cache-Control': 'private, no-store',
         'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'})
+
+
+async def download(request: Request, token: str) -> Response:
+    """既有图片入口：只服务图片资源。"""
+    return await _serve_asset(token, kind='image')
+
+
+async def download_mcp_media(request: Request, token: str) -> Response:
+    """MCP 媒体入口：图片与视频都可，供工具返回的 URL 使用。"""
+    return await _serve_asset(token)
 
 
 async def normalize_item(item: dict, *, parsed, mask=None) -> tuple[bytes, dict, list[str]]:

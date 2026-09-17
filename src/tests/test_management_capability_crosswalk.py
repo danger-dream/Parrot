@@ -61,7 +61,7 @@ def test_all_53_tg_capabilities_map_to_the_complete_production_api_surface():
         PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines()
     )
     actual_operations = _management_operation_ids()
-    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 232
+    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 237
     assert mapped_operations == expected_operations == actual_operations
 
 
@@ -108,7 +108,7 @@ def test_search_operations_have_explicit_system_capability_owner():
     assert assigned == {"TG-SYS-01": search_operations}
     assert len(search_operations) == 10
     owner = next(row for row in rows if row["capabilityId"] == "TG-SYS-01")
-    assert owner["owner"] == "SettingsControl+SearchControl"
+    assert owner["owner"] == "SettingsControl+SearchControl+MCPControl"
 
 
 def test_telegram_main_reads_business_state_through_status_control():

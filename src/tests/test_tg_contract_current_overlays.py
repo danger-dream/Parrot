@@ -12,7 +12,10 @@ from src.tests import test_tg_contract_main_help as main
 from src.tests import test_tg_contract_oauth_support as oauth
 
 ROOT = Path(__file__).parent / 'fixtures/tg_contract'
-COUNTS = {'channels_apikey': 11, 'main_status': 11, 'oauth': 53,
+# channels_apikey grew from 11 to 24: the API-key page changed (MCP permission
+# switch, MCP tool picker and six new callback families), so every reviewed
+# TG-AK case is stored as a full overlay row rather than the archived stub.
+COUNTS = {'channels_apikey': 24, 'main_status': 11, 'oauth': 53,
           'auxiliary': 18, 'model_routing': 6, 'system': 8, 'core': 22}
 
 
@@ -31,7 +34,7 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         loaded = current.load_current_jsonl(archived_path)
         assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived]
         assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived]
-    assert len(seen) == 129  # five reviewed System Settings search-entry overlays
+    assert len(seen) == 142  # reviewed overlays, including the MCP UI additions
 
 
 @pytest.mark.parametrize('mutation', ['duplicate', 'unknown', 'capability'])
