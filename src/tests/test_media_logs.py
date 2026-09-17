@@ -355,7 +355,8 @@ def test_oauth_top_excludes_accounts_removed_from_current_config(monkeypatch):
 def test_settings_pages_link_to_unified_media_logs_and_bot_routes_callback(_clean_media_logs):
     image_menu.show(42, 100, "cb-image")
     image_message = _clean_media_logs.last("editMessageText")
-    assert "当前缓存占用" in image_message["text"] and "历史成功产物" in image_message["text"]
+    # 文案为「已生成」：旧的「统计为历史成功产物」已按模型中心改造移除。
+    assert "当前缓存占用" in image_message["text"] and "已生成" in image_message["text"]
     assert any(
         button.get("callback_data") == "media:logs"
         for row in image_message["reply_markup"]["inline_keyboard"]
@@ -364,7 +365,7 @@ def test_settings_pages_link_to_unified_media_logs_and_bot_routes_callback(_clea
 
     xai_imagine_menu.show(42, 100, "cb-xai")
     xai_message = _clean_media_logs.last("editMessageText")
-    assert "模型中心 · 视频" in xai_message["text"] and "历史成功产物" in xai_message["text"]
+    assert "模型中心 · 视频" in xai_message["text"] and "已生成" in xai_message["text"]
     assert any(
         button.get("callback_data") == "media:logs"
         for row in xai_message["reply_markup"]["inline_keyboard"]

@@ -1005,7 +1005,9 @@ def test_oauth_channel_carries_same_request_namespace_plan(monkeypatch):
     async def token(_key):
         return "token"
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", token)
-    ch = OAuthChannel({"email": "a@example.com", "provider": "anthropic"}, ["m"])
+    # The account's own catalog is the only model source; provider defaults were
+    # retired, so the reachable model must come from the account entry.
+    ch = OAuthChannel({"email": "a@example.com", "provider": "anthropic", "models": ["m"]})
     req = asyncio.run(ch.build_upstream_request({
         "model": "m", "input": "go", "tools": [{
             "type": "namespace", "name": "db", "tools": [{

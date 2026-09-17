@@ -344,7 +344,7 @@ def test_record_snapshot_on_claude_oauth_channel(m):
     _setup(m)
     _add_claude(m, "hook@c.io")
     acc = m["oauth_manager"].get_account("claude:hook@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "0.42",
@@ -364,7 +364,7 @@ def test_record_snapshot_throttled_within_30s(m):
     _setup(m)
     _add_claude(m, "thr@c.io")
     acc = m["oauth_manager"].get_account("claude:thr@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     resp1 = _FakeResp({"anthropic-ratelimit-unified-5h-utilization": "0.10"})
     m["failover"]._maybe_record_anthropic_snapshot(ch, resp1)
@@ -432,7 +432,7 @@ def test_record_snapshot_no_headers_no_write(m):
     _setup(m)
     _add_claude(m, "none@c.io")
     acc = m["oauth_manager"].get_account("claude:none@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     resp = _FakeResp({"content-type": "application/json"})
     m["failover"]._maybe_record_anthropic_snapshot(ch, resp)
     assert m["state_db"].quota_load("claude:none@c.io") is None
@@ -457,7 +457,7 @@ def test_record_snapshot_preserves_active_fields(m):
 
     # 被动采样
     acc = m["oauth_manager"].get_account(ak)
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "0.50",
         "anthropic-ratelimit-unified-7d-utilization": "0.90",
@@ -478,7 +478,7 @@ def test_forget_anthropic_snapshot_on_delete(m):
     _setup(m)
     _add_claude(m, "del@c.io")
     acc = m["oauth_manager"].get_account("claude:del@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "0.50",
     })
@@ -508,7 +508,7 @@ def test_snapshot_error_does_not_crash(m):
     _setup(m)
     _add_claude(m, "crash@c.io")
     acc = m["oauth_manager"].get_account("claude:crash@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     # 通过 monkeypatch 让 quota_patch_passive 抛错
     sdb = m["state_db"]

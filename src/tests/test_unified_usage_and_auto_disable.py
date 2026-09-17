@@ -346,7 +346,7 @@ def test_anthropic_auto_disable_surpassed_threshold(m):
     _setup(m)
     _add_claude(m, "over@c.io")
     acc = m["oauth_manager"].get_account("claude:over@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "1.0",
@@ -366,7 +366,7 @@ def test_anthropic_auto_disable_util_ge_one(m):
     _setup(m)
     _add_claude(m, "util1@c.io")
     acc = m["oauth_manager"].get_account("claude:util1@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     resp = _FakeResp({
         "anthropic-ratelimit-unified-7d-utilization": "1.0",
@@ -383,7 +383,7 @@ def test_anthropic_no_auto_disable_when_below_limit(m):
     _setup(m)
     _add_claude(m, "ok@c.io")
     acc = m["oauth_manager"].get_account("claude:ok@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "0.5",
         "anthropic-ratelimit-unified-7d-utilization": "0.8",
@@ -513,7 +513,7 @@ def test_anthropic_auto_disable_idempotent_for_already_disabled(m):
     # 预置:已经 disabled_reason=quota,disabled_until=一个固定值
     m["oauth_manager"].set_disabled_by_quota("claude:dq@c.io", "2099-01-01T00:00:00Z")
     acc = m["oauth_manager"].get_account("claude:dq@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "1.0",
@@ -533,7 +533,7 @@ def test_anthropic_auth_error_not_touched(m):
     _add_claude(m, "ae@c.io")
     m["oauth_manager"].set_enabled("claude:ae@c.io", False, reason="auth_error")
     acc = m["oauth_manager"].get_account("claude:ae@c.io")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
 
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "1.0",
@@ -617,7 +617,7 @@ def test_anthropic_auto_disable_survives_locked_quota_cache(m, monkeypatch):
     account_key = f"claude:{email}"
     _add_claude(m, email)
     acc = m["oauth_manager"].get_account(account_key)
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     resp = _FakeResp({
         "anthropic-ratelimit-unified-5h-utilization": "1.0",
         "anthropic-ratelimit-unified-5h-surpassed-threshold": "true",

@@ -318,7 +318,7 @@ def test_record_skip_non_openai_channel(m):
         "access_token": "x", "refresh_token": "x",
     })
     acc = m["oauth_manager"].get_account("c@claude.test")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     resp = _MockResp({"x-codex-primary-used-percent": "50"})
     m["failover"]._maybe_record_codex_snapshot(ch, resp)
     # 不应为 claude 账户写 codex 数据

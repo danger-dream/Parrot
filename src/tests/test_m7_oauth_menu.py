@@ -523,7 +523,8 @@ def test_settings_usage_display_mode_toggle(m):
     m["oauth_menu"].on_settings(42, 100, "cb-settings")
     settings = rec.last("editMessageText")
     assert settings and "OAuth 账户设置" in settings["text"]
-    assert "模型目录、备用模型与媒体设置已统一归位到模型中心" in settings["text"]
+    # 「备用模型」已随该机制退役而从文案移除，其余不变。
+    assert "模型目录与媒体设置已统一归位到模型中心" in settings["text"]
     assert "默认模型" not in settings["text"]
     assert "🎨 <b>媒体能力</b>" not in settings["text"]
     assert "GPT / Codex 图片:" not in settings["text"]

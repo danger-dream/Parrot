@@ -305,11 +305,45 @@ def test_oauth_channel_key_format(m):
     om.add_account({"email": "ch@x.com", "provider": "claude",
                     "access_token": "a", "refresh_token": "b"})
     acc = om.get_account("claude:ch@x.com")
-    ch = m["OAuthChannel"](acc, [])
+    ch = m["OAuthChannel"](acc)
     assert ch.account_key == "claude:ch@x.com", ch.account_key
     assert ch.key == "oauth:claude:ch@x.com", ch.key
     assert ch.email == "ch@x.com"
     print("  [PASS] OAuthChannel uses three-segment key format")
+
+
+def test_oauth_channel_has_no_provider_default_model_fallback(m):
+    """退役契约：账户自己的目录是唯一来源，不再回退到供应商默认模型。
+
+    默认模型回退（`default_models` 第二参数 / `oauthDefaultModels` 配置）已整体
+    退役：未同步过目录的账户必须没有可路由模型，而不是悄悄用上一个内置默认值。
+    """
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account({"email": "nodir@x.com", "provider": "claude",
+                    "access_token": "a", "refresh_token": "b"})
+    acc = om.get_account("claude:nodir@x.com")
+    ch = m["OAuthChannel"](acc)
+    # 没有任何账户目录 → 没有可路由模型，也不接受任意模型名。
+    assert ch.models == [], ch.models
+    assert ch.supports_model("claude-sonnet-4-6") is None
+    assert ch.supports_model("any-model") is None
+    print("  [PASS] OAuthChannel: no account catalog → no routable model (no fallback)")
+
+
+def test_oauth_channel_routes_only_account_catalog_models(m):
+    """账户目录内的模型可路由，目录外的不可——退役后仍保持精确匹配语义。"""
+    _setup(m)
+    om = m["oauth_manager"]
+    om.add_account({"email": "dir@x.com", "provider": "claude",
+                    "access_token": "a", "refresh_token": "b",
+                    "models": ["account-model"]})
+    acc = om.get_account("claude:dir@x.com")
+    ch = m["OAuthChannel"](acc)
+    assert ch.models == ["account-model"]
+    assert ch.supports_model("account-model") == "account-model"
+    assert ch.supports_model("claude-sonnet-4-6") is None
+    print("  [PASS] OAuthChannel: routes account catalog models only")
 
 
 def test_openai_oauth_channel_key_format(m):

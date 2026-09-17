@@ -440,4 +440,6 @@ def test_foreground_success_and_failure_copy(monkeypatch, sync_config):
     monkeypatch.setattr(oauth_manager, "start_account_model_refresh", lambda key: failure)
     oauth_menu._foreground_account_model_sync(1, "openai:openai1@x:ws1", provider="openai", label="u")
     assert finished.wait(1)
-    assert "后台将静默重试，当前使用默认模型" in edits[-1]
+    # 默认模型回退已退役：账户没有已持久化的目录时，失败后必须如实说明
+    # 「无可路由模型」，而不是宣称仍在用一个已不存在的内置默认模型。
+    assert "后台将静默重试，尚无账户目录，当前无可路由模型" in edits[-1]
