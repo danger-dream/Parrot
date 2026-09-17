@@ -693,11 +693,16 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 | `GET /search/backends/{backendId}/accounts` | `getSearchBackendAccounts` | `management.read`；完整公共账户身份及人类标签，无 token |
 | `PUT /search/priority` | `updateSearchPriority` | `management.write`；完整 ID 顺序列表，不改变来源身份 |
 | `POST /search/test` | `testSearchBackend` | `management.write`；用户主动单来源测试，返回 202 Operation，不跨来源 failover |
+| `GET /search/logs` | `listSearchLogs` | `management.read`；专用搜索日志的近期真实上游调用，`period=today|month`、可选 `sourceId`、`limit`（≤200）与 `offset` |
+| `GET /search/stats` | `getSearchStats` | `management.read`；按来源聚合的调用次数/成功率/平均耗时/Token/已结算费用，`period` 与可选 `sourceId` |
+
+- 查询参数白名单按路由声明：既有 8 个端点仍不接受任何查询参数，新增的两个只读日志端点各自声明 `period`/`sourceId`/`limit`/`offset`，未声明的参数按 `extra_forbidden` 拒绝。
+- 搜索调用记账与费用：`local_web_log` 是请求的子表（随请求清理），已停止写入；搜索日志改为独立顶层表 `search_call_log`，**每次真实上游调用一行**（含跨来源/跨 Key 重试），带来源、凭据类型与序号、账户键、模型、耗时、结果数，以及按 `normalize_response_billing` + `estimate_cost` 得到的 Token 结算（xAI 优先真实 `cost_in_usd_ticks`）。没有 usage 的响应保持 `unpriced`，不伪造零费用。搜索消耗汇入独立「搜索统计」，不改动 `累计统计`/账户自然月/渠道统计的既有口径。
 
 - 新增/修改来源携带 `apiKeys`、`addApiKeys` 或 `removeKeyIndices` 时，还必须有 `management.secrets.write`；密钥只写不回显。模型仅 OAuth 来源可设非空值。
 - 配置变更支持 If-Match；删除要求 If-Match；测试支持 Idempotency-Key。`allowDisabledAccounts` 默认 false，仅允许手动停用账户参与搜索，不改变普通对话状态或绕过认证/配额失效。
-- 生产发现从已挂载 OpenAPI 动态生成：search 的 8 个 action/method/path、七种 backend type 和三态 schema enum 可发现；“可发现”不代表来源探活成功。无需复制维护另一套生产发现清单。
-- 纳入图片/视频独立管理并退役 OAuth 备用模型后，操作总数为 **230 = 233 − 3**，独立路径数为 **169 = 171 − 2**；router 为 **23 = foundation + 22 个有序领域 router**。严格集合以 `production-operation-ids.txt` 为准；搜索的 method/path/基本能力/条件密钥能力映射见 `search-operation-manifest.tsv`。
+- 生产发现从已挂载 OpenAPI 动态生成：search 的 10 个 action/method/path、七种 backend type 和三态 schema enum 可发现；“可发现”不代表来源探活成功。无需复制维护另一套生产发现清单。
+- 纳入图片/视频独立管理、退役 OAuth 备用模型并新增搜索日志/统计后，操作总数为 **232 = 235 − 3**，独立路径数为 **171 = 173 − 2**；router 为 **23 = foundation + 22 个有序领域 router**。严格集合以 `production-operation-ids.txt` 为准；搜索的 method/path/基本能力/条件密钥能力映射见 `search-operation-manifest.tsv`。
 - 搜索菜单是系统设置新增子页，crosswalk 归属现有 `TG-SYS-01`（`SettingsControl+SearchControl`）。历史 53 个 TG capability ID 不伪造增加冻结轨迹；新增搜索交互由专有行为测试覆盖。`TG-IMG-01` 包括四项现有 ImageControl 操作及共享的媒体来源读取/用途开关；`TG-XIM-01` 增加独立视频设置读取/修改。
 - 此次批准的旧系统菜单 golden 变化仅为“🔎 搜索工具 / srch:show”一行，插在重试/返回主菜单行之前；仅更新五个相关 case 的当前覆盖层，保持冻结 v0.31.13 源轨迹、其他菜单正文、按钮、状态及副作用不变。
 

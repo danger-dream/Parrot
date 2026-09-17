@@ -962,7 +962,10 @@ FAMILY_PROVIDER_LABELS = {
     ),
 }
 
-PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨"}
+PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨",
+                      # Search sources: `✉` means "no icon", which made the four
+                      # key-based sources indistinguishable in one list.
+                      "anysearch": "🔎", "tavily": "🧭", "exa": "🧠", "brave": "🦁"}
 PROVIDER_CUSTOM_EMOJI = {
     "openai": "6141162084857031383",
     "claude": "6140995813788099525",

@@ -224,7 +224,7 @@ def test_contract_points_to_the_complete_production_operation_manifest():
     document = (ROOT / "docs/13-management-control-api-refactor.md").read_text()
     section = document.split("## 15. Management API 完整性验收清单", 1)[1]
 
-    assert len(production) == 230  # 233 minus 3 retired OAuth fallback operations
+    assert len(production) == 232  # 235 minus 3 retired OAuth fallback operations
     assert len(foundation) == 9
     assert "production-operation-ids.txt" in section
     assert "P0/foundation 的 9-operation 基础清单" in section

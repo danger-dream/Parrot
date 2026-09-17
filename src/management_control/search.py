@@ -8,7 +8,7 @@ import re
 import uuid
 from urllib.parse import urlsplit
 
-from src import config, search_service
+from src import config, oauth_manager, search_service
 from src.management_auth import Capability
 from src.oauth_ids import account_key
 from .errors import ManagementError, ManagementErrorCode
@@ -244,6 +244,170 @@ class SearchControl(DomainControl):
             cfg["backends"] = [current[item] for item in backend_ids]
         return self._commit(context, "search.priority.update", mutate, expected_revision)
 
+    # OAuth search backends execute a real model call, so the model must come
+    # from the account's own catalog. The list is only ever offered as choices;
+    # it is never silently substituted for a stored value.
+    _MODEL_FALLBACK = {"openai": "gpt-5.5", "xai": "grok-4.6", "anthropic": "claude-sonnet-4-6"}
+
+    def models(self, context, backend_id):
+        """Selectable models for one OAuth search source.
+
+        Returns the union of the eligible accounts' own model catalogs, with the
+        currently configured value first when it is one of them. API-key sources
+        have no model dimension and return an empty list.
+        """
+        self._read(context)
+        backend = self._backend(search_service.settings(), backend_id)
+        if backend["type"] in API_TYPES:
+            return {"backendId": backend_id, "supported": False, "selected": "",
+                    "default": "", "models": []}
+        try:
+            available = search_service._accounts(backend)
+        except Exception:
+            available = []
+        known: list[str] = []
+        for account in available:
+            try:
+                selection = oauth_manager.account_model_selection(
+                    account_key(account) if isinstance(account, dict) else account
+                )
+            except Exception:
+                selection = {}
+            for model in selection.get("models") or []:
+                name = str(model or "").strip()
+                if name and name not in known:
+                    known.append(name)
+        selected = str(backend.get("model") or "")
+        return {
+            "backendId": backend_id,
+            "supported": True,
+            "selected": selected,
+            "default": self._MODEL_FALLBACK.get(backend["type"], ""),
+            "models": known,
+        }
+
+    @staticmethod
+    def _search_log_db():
+        from src import log_db
+        return log_db
+
+    @staticmethod
+    def _since(period) -> float:
+        """Window start in the same Beijing-time convention as the monthly log DB.
+
+        Computed here rather than in the transport layer: the Management API may
+        only depend on the control layer, never on a Telegram module.
+        """
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone(timedelta(hours=8)))
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if str(period) != "today":
+            start = start.replace(day=1)
+        return start.timestamp()
+
+    @staticmethod
+    def _cost_usd(ticks) -> float:
+        from src import model_pricing
+        return round(int(ticks or 0) / model_pricing.TICKS_PER_USD, 6)
+
+    def logs(self, context, *, since_ts, source_id=None, limit=50, offset=0):
+        """Recent search calls, independent of any request parent.
+
+        Read-only view over the dedicated search log. ``account_key`` is a public
+        account identity (the same value ``getSearchBackendAccounts`` returns) and
+        ``credential_label`` is an ordinal such as ``Key #1``: neither carries a
+        credential value, so both stay as statistics dimensions.
+        """
+        self._read(context)
+        log_db = self._search_log_db()
+        entries = log_db.search_call_entries(
+            since_ts, source_id=source_id or None, limit=limit, offset=offset,
+        )
+        # Display labels come from the live config so a renamed source is not
+        # frozen into historical rows; history keeps the recorded snapshot only
+        # when the source no longer exists.
+        known = {}
+        try:
+            for row in search_service.settings().get("backends") or []:
+                known[str(row.get("id") or "")] = str(row.get("name") or "")
+        except Exception:
+            known = {}
+        result = []
+        for entry in entries:
+            source = str(entry.get("source_id") or "")
+            result.append({
+                "id": int(entry.get("id") or 0),
+                "callId": str(entry.get("call_id") or ""),
+                "attemptNo": int(entry.get("attempt_no") or 0),
+                "origin": str(entry.get("origin") or ""),
+                "requestId": entry.get("request_id"),
+                "roundNo": int(entry.get("round_no") or 0),
+                "sourceId": source,
+                "sourceType": str(entry.get("source_type") or ""),
+                "sourceName": known.get(source) or str(entry.get("source_name") or "") or source,
+                "operation": str(entry.get("operation") or "search"),
+                "credentialKind": str(entry.get("credential_kind") or ""),
+                "credentialLabel": str(entry.get("credential_label") or ""),
+                "accountKey": str(entry.get("account_key") or ""),
+                "credentialIndex": entry.get("credential_index"),
+                "model": str(entry.get("model") or ""),
+                "query": entry.get("query"),
+                "url": entry.get("url"),
+                "startedAt": float(entry.get("started_at") or 0.0),
+                "endedAt": entry.get("ended_at"),
+                "status": str(entry.get("status") or "running"),
+                "errorCode": entry.get("error_code"),
+                "elapsedMs": entry.get("elapsed_ms"),
+                "resultCount": int(entry.get("result_count") or 0),
+                "contentChars": int(entry.get("content_chars") or 0),
+                "inputTokens": int(entry.get("input_tokens") or 0),
+                "outputTokens": int(entry.get("output_tokens") or 0),
+                "cacheCreationTokens": int(entry.get("cache_creation_tokens") or 0),
+                "cacheReadTokens": int(entry.get("cache_read_tokens") or 0),
+                "usageObserved": bool(entry.get("usage_observed")),
+                "pricingModel": entry.get("pricing_model"),
+                "costSource": str(entry.get("cost_source") or "unpriced"),
+                "costUsd": self._cost_usd(entry.get("cost_ticks")),
+                "settledAt": entry.get("settled_at"),
+            })
+        return result
+
+    def stats(self, context, *, since_ts, source_id=None):
+        """Per-source search statistics; the source-facing complement of logs()."""
+        self._read(context)
+        rows = self._search_log_db().search_call_stats(since_ts, source_id=source_id or None)
+        # Live names take precedence, but a source deleted after the fact must
+        # still be identifiable rather than collapsing to its raw ID.
+        known = {}
+        try:
+            for row in search_service.settings().get("backends") or []:
+                known[str(row.get("id") or "")] = str(row.get("name") or "")
+        except Exception:
+            known = {}
+        result = []
+        for row in rows:
+            elapsed_n = int(row.get("elapsed_n") or 0)
+            source = str(row.get("source_id") or "")
+            result.append({
+                "sourceId": source,
+                "sourceType": str(row.get("source_type") or ""),
+                "sourceName": known.get(source) or str(row.get("source_name") or "") or source,
+                "attempts": int(row.get("attempts") or 0),
+                "success": int(row.get("success") or 0),
+                "failed": int(row.get("failed") or 0),
+                "running": int(row.get("running") or 0),
+                "averageMs": (round(int(row.get("elapsed_sum") or 0) / elapsed_n) if elapsed_n else None),
+                "resultCount": int(row.get("result_count") or 0),
+                "inputTokens": int(row.get("input_tokens") or 0),
+                "outputTokens": int(row.get("output_tokens") or 0),
+                "cacheCreationTokens": int(row.get("cache_creation_tokens") or 0),
+                "cacheReadTokens": int(row.get("cache_read_tokens") or 0),
+                "costUsd": self._cost_usd(row.get("cost_ticks")),
+                "usageObserved": int(row.get("usage_observed") or 0),
+                "lastAt": float(row.get("last_at") or 0.0),
+            })
+        return result
+
     async def test(self, context, backend_id, *, operation="search", query=None, url=None):
         self._write(context)
         self._backend(search_service.settings(), backend_id)
@@ -256,7 +420,8 @@ class SearchControl(DomainControl):
         try:
             call = search_service.search if operation == "search" else search_service.extract
             result = await call({"query": query} if operation == "search" else {"url": url},
-                                request_id=context.request_id, backend_id=backend_id)
+                                request_id=context.request_id, backend_id=backend_id,
+                                origin="management_test")
         except search_service.SearchError as exc:
             self._audit(context, "search.test", "search", "failed")
             code = (ManagementErrorCode.VALIDATION_FAILED if exc.status_code < 500

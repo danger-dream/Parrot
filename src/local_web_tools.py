@@ -684,11 +684,34 @@ def round_limit_results(calls: list[LocalToolCall], max_rounds: int) -> list[Loc
     return [LocalToolResult(c.id, content, is_error=True) for c in calls]
 
 
-async def _call_search_service(tool_name: str, arguments: dict[str, Any], *, request_id=None) -> str:
+async def _call_search_service(tool_name: str, arguments: dict[str, Any], *, request_id=None,
+                               round_no: int = 0) -> str:
     from . import search_service
     operation = search_service.search if tool_name == "search" else search_service.extract
-    result = await operation(arguments, request_id=request_id)
-    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    result = await operation(arguments, request_id=request_id, origin="managed_round",
+                             round_no=round_no)
+    return json.dumps(_model_visible_search_result(result, tool_name),
+                      ensure_ascii=False, separators=(",", ":"))
+
+
+# Only these are the tool result the model is entitled to see. Source identity,
+# per-attempt telemetry, token usage and raw upstream bodies are Parrot's own
+# accounting facts and must never enter the conversation.
+_MODEL_VISIBLE_SEARCH_FIELDS = (
+    "query", "url", "results", "content", "answer", "truncated", "warnings",
+)
+
+
+def _model_visible_search_result(result: dict, tool_name: str) -> dict:
+    if not isinstance(result, dict):
+        return {"content": str(result)}
+    visible = {key: result[key] for key in _MODEL_VISIBLE_SEARCH_FIELDS if key in result}
+    if "content_budget" in result:
+        # Parrot's own adaptation note; it explains truncation to the model.
+        visible["content_budget"] = result["content_budget"]
+    if tool_name == "extract":
+        visible.pop("results", None)
+    return visible
 
 
 def _valid_url(url: str) -> bool:
@@ -733,7 +756,7 @@ def _bound_content(text: str, limit: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-async def _execute_web_search(call: LocalToolCall, *, request_id=None) -> LocalToolResult:
+async def _execute_web_search(call: LocalToolCall, *, request_id=None, round_no: int = 0) -> LocalToolResult:
     from . import search_service
     query = str(call.input.get("query") or call.input.get("q") or "").strip()
     if len(query) < _min_query_chars():
@@ -742,7 +765,7 @@ async def _execute_web_search(call: LocalToolCall, *, request_id=None) -> LocalT
     arguments["query"] = query
     arguments.setdefault("max_results", _max_results())
     try:
-        text = await _call_search_service("search", arguments, request_id=request_id)
+        text = await _call_search_service("search", arguments, request_id=request_id, round_no=round_no)
     except search_service.SearchError as exc:
         return LocalToolResult(call.id, f"{exc.code}: {exc.message}", is_error=True)
     except Exception:
@@ -750,7 +773,7 @@ async def _execute_web_search(call: LocalToolCall, *, request_id=None) -> LocalT
     return LocalToolResult(call.id, _bound_content(text, call.input.get("max_content_tokens")))
 
 
-async def _execute_web_fetch(call: LocalToolCall, *, request_id=None) -> LocalToolResult:
+async def _execute_web_fetch(call: LocalToolCall, *, request_id=None, round_no: int = 0) -> LocalToolResult:
     from . import search_service
     url = str(call.input.get("url") or "").strip()
     prompt = str(call.input.get("prompt") or "").strip()
@@ -771,7 +794,7 @@ async def _execute_web_fetch(call: LocalToolCall, *, request_id=None) -> LocalTo
     arguments = {k: v for k, v in call.input.items() if not k.startswith("_")}
     arguments["url"] = url
     try:
-        text = await _call_search_service("extract", arguments, request_id=request_id)
+        text = await _call_search_service("extract", arguments, request_id=request_id, round_no=round_no)
     except search_service.SearchError as exc:
         return LocalToolResult(call.id, f"{exc.code}: {exc.message}", is_error=True)
     except Exception:
@@ -784,14 +807,15 @@ async def _execute_web_fetch(call: LocalToolCall, *, request_id=None) -> LocalTo
     return LocalToolResult(call.id, _bound_content(json.dumps(result, ensure_ascii=False), call.input.get("max_content_tokens")))
 
 
-async def execute_local_tool_call(call: LocalToolCall, *, request_id=None) -> LocalToolResult:
+async def execute_local_tool_call(call: LocalToolCall, *, request_id=None,
+                                  round_no: int = 0) -> LocalToolResult:
     budget = call.input.get("max_content_tokens")
     if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
         return LocalToolResult(call.id, "invalid_input: max_content_tokens must be a positive integer", is_error=True)
     if call.name in ("WebSearch", "web_search"):
-        return await _execute_web_search(call, request_id=request_id)
+        return await _execute_web_search(call, request_id=request_id, round_no=round_no)
     if call.name in ("WebFetch", "web_fetch"):
-        return await _execute_web_fetch(call, request_id=request_id)
+        return await _execute_web_fetch(call, request_id=request_id, round_no=round_no)
     return LocalToolResult(call.id, f"unsupported local tool: {call.name}", is_error=True)
 
 
@@ -807,7 +831,7 @@ async def execute_local_tool_calls(
     # Keep order stable; run concurrently because web search/fetch is external I/O.
     async def _run(call: LocalToolCall) -> LocalToolResult:
         log_id = _record_call_start(request_id, round_no, call)
-        result = await execute_local_tool_call(call, request_id=service_request_id)
+        result = await execute_local_tool_call(call, request_id=service_request_id, round_no=round_no)
         _record_call_finish(log_id, call, result)
         return result
 

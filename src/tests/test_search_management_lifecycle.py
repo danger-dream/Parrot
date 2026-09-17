@@ -30,7 +30,7 @@ def bot_text(text):
 def test_blocked_probe_returns_immediately_and_owns_only_its_progress(tg, monkeypatch, search_workers, navigate_progress):
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     calls = []
-    async def blocked(arguments, *, backend_id, request_id):
+    async def blocked(arguments, *, backend_id, request_id, origin="managed_round", round_no=0):
         calls.append(backend_id)
         entered.set()
         while not release.is_set():
@@ -145,14 +145,15 @@ def assert_bounded(page):
 def test_large_backend_pages_preserve_edit_sort_and_parent_navigation(tg, control, ctx):
     populate_backends(control, ctx)  # 25 sources, not only the default seven
     seen = []
-    for page_index, count in ((0, 10), (1, 10), (2, 5)):
+    # Six list rows per page: 25 sources span 6/6/6/6/1.
+    for page_index, count in ((0, 6), (1, 6), (2, 6), (3, 6), (4, 1)):
         callback(search_menu._home(page_index))
         page = latest(tg)
         assert_bounded(page)
         entries = [v for v in buttons(page) if v["callback_data"].startswith("srch:backend:")]
         assert len(entries) == count
         seen.extend(search_menu._target(v["callback_data"].split(":")[2])[0] for v in entries)
-        assert f"第 {page_index + 1}/3 页" in page["text"]
+        assert f"第 {page_index + 1}/5 页" in page["text"]
     assert len(seen) == len(set(seen)) == 25
     callback("srch:show:1")
     detail = next(v["callback_data"] for v in buttons(latest(tg)) if v["callback_data"].startswith("srch:backend:"))
@@ -169,7 +170,7 @@ def test_large_backend_pages_preserve_edit_sort_and_parent_navigation(tg, contro
     assert row(control.get(ctx), backend_id)["name"] == "Edited source"
     assert buttons(latest(tg))[-1]["callback_data"] == "srch:show:1"
     callback(buttons(latest(tg))[-1]["callback_data"])
-    assert "第 2/3 页" in latest(tg)["text"]
+    assert "第 2/5 页" in latest(tg)["text"]
     callback("srch:defaults:1")
     callback("srch:edit:language:1")
     bot_text("en")
@@ -184,19 +185,19 @@ def test_large_account_pages_select_by_full_identity_and_stay_on_page(tg, memory
     ]
     code = search_menu._code("openai", 2)
     seen = []
-    for p in range(7):
+    # Account rows follow the same six-per-page rule: 63 accounts span 11 pages.
+    for p in range(11):
         callback(f"srch:accounts:{code}:{p}")
         page = latest(tg)
         assert_bounded(page)
         entries = [v for v in buttons(page) if v["callback_data"].startswith("srch:account:")]
-        assert len(entries) == (3 if p == 6 else 10)
+        assert len(entries) == (3 if p == 10 else 6)
         seen.extend(v["text"] for v in entries)
     assert len(set(seen)) == 63 and "opaque" not in "".join(seen)
-    callback(f"srch:accounts:{code}:5")
-    selected = next(v["callback_data"] for v in buttons(latest(tg)) if "工作区50" in v["text"])
+    callback(f"srch:accounts:{code}:9")
+    selected = next(v["callback_data"] for v in buttons(latest(tg)) if "工作区54" in v["text"])
     callback(selected)
-    assert "第 6/7 页" in latest(tg)["text"]
-    assert row(control.get(ctx), "openai")["accountIds"] == ["openai:same@example.test:opaque-50"]
+    assert row(control.get(ctx), "openai")["accountIds"] == ["openai:same@example.test:opaque-54"]
     assert buttons(latest(tg))[-1]["callback_data"] == "srch:backend:" + code
     callback(buttons(latest(tg))[-1]["callback_data"])
     assert buttons(latest(tg))[-1]["callback_data"] == "srch:show:2"
@@ -256,7 +257,9 @@ def test_delete_tg_confirm_cancel_stale_and_page_return(tg, memory, control, ctx
     confirm = buttons(latest(tg))[0]["callback_data"]
     callback(confirm)
     assert "extra-15" not in [v["id"] for v in control.get(ctx)["backends"]]
-    assert "第 3/3 页" in latest(tg)["text"]
+    # 24 sources remain, spanning 4 pages; the action returns to its own page.
+    assert "第 3/4 页" in latest(tg)["text"]
     saved = copy.deepcopy(memory.value)
     callback(confirm)
     assert memory.value == saved  # no second mutation/replay
+

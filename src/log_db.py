@@ -7,7 +7,8 @@
   - retry_chain             重试链（每个渠道尝试一条记录）
   - upstream_attempt_usage  每次真实上游调用的不可变结算事实
   - proxy_chain             代理链（每个渠道尝试内的代理切换明细）
-  - local_web_log           Parrot 本地 WebSearch/WebFetch 执行明细
+  - local_web_log           Parrot 本地 WebSearch/WebFetch 执行明细（历史表，停止写入）
+  - search_call_log         搜索来源的每次真实上游调用与结算事实（独立顶层表）
 
 写操作由 `_write_lock` 序列化；跨月自动切换连接。
 """
@@ -77,7 +78,7 @@ class RequestLogHandle:
 
 @dataclass(frozen=True)
 class RowLogHandle:
-    table: Literal["retry_chain", "proxy_chain", "local_web_log"]
+    table: Literal["retry_chain", "proxy_chain", "local_web_log", "search_call_log"]
     row_id: int
     request_id: str
     db: LogDbRef
@@ -332,6 +333,45 @@ def _schema_sql() -> str:
       error_message   TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_local_web_req ON local_web_log(request_id);
+
+    CREATE TABLE IF NOT EXISTS search_call_log (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_id               TEXT NOT NULL,
+      attempt_no            INTEGER NOT NULL DEFAULT 0,
+      origin                TEXT NOT NULL DEFAULT 'managed_round',
+      request_id            TEXT,
+      round_no              INTEGER DEFAULT 0,
+      source_id             TEXT NOT NULL,
+      source_type           TEXT NOT NULL,
+      source_name           TEXT NOT NULL DEFAULT '',
+      operation             TEXT NOT NULL DEFAULT 'search',
+      credential_kind       TEXT NOT NULL DEFAULT '',
+      credential_label      TEXT NOT NULL DEFAULT '',
+      account_key           TEXT NOT NULL DEFAULT '',
+      credential_index      INTEGER,
+      model                 TEXT NOT NULL DEFAULT '',
+      query                 TEXT,
+      url                   TEXT,
+      started_at            REAL NOT NULL,
+      ended_at              REAL,
+      status                TEXT NOT NULL DEFAULT 'running',
+      error_code            TEXT,
+      elapsed_ms            INTEGER,
+      result_count          INTEGER NOT NULL DEFAULT 0,
+      content_chars         INTEGER NOT NULL DEFAULT 0,
+      input_tokens          INTEGER NOT NULL DEFAULT 0,
+      output_tokens         INTEGER NOT NULL DEFAULT 0,
+      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+      usage_observed        INTEGER NOT NULL DEFAULT 0,
+      pricing_model         TEXT,
+      cost_source           TEXT NOT NULL DEFAULT 'unpriced',
+      cost_ticks            INTEGER,
+      settled_at            REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_search_call_started ON search_call_log(started_at);
+    CREATE INDEX IF NOT EXISTS idx_search_call_source ON search_call_log(source_id, started_at);
+    CREATE INDEX IF NOT EXISTS idx_search_call_req ON search_call_log(request_id);
     """
 
 
@@ -383,7 +423,7 @@ def _request_handle(value: str | RequestLogHandle) -> RequestLogHandle:
 def _row_handle(
     value: int | RowLogHandle,
     *,
-    table: Literal["retry_chain", "proxy_chain", "local_web_log"],
+    table: Literal["retry_chain", "proxy_chain", "local_web_log", "search_call_log"],
     request: RequestLogHandle | None = None,
 ) -> RowLogHandle:
     if isinstance(value, RowLogHandle):
@@ -2526,6 +2566,238 @@ def local_web_count(request_id: str | RequestLogHandle) -> int:
         (handle.request_id,),
     ).fetchone()
     return int(row["n"] or 0) if row else 0
+
+
+# ─── 搜索来源调用日志（独立顶层表）────────────────────────────────────
+#
+# 与 `local_web_log` 的区别：后者是「某次请求干了什么」的附属明细，随请求一起
+# 留存清理；本表记录**搜索来源的每一次真实上游调用与结算事实**，是独立业务面，
+# 有自己的来源/账户/模型/费用维度，与请求日志解耦（request_id 可为空）。
+
+_SEARCH_ROWS = (
+    "id", "call_id", "attempt_no", "origin", "request_id", "round_no",
+    "source_id", "source_type", "source_name", "operation",
+    "credential_kind", "credential_label", "account_key", "credential_index",
+    "model", "query", "url", "started_at", "ended_at", "status", "error_code",
+    "elapsed_ms", "result_count", "content_chars",
+    "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens",
+    "usage_observed", "pricing_model", "cost_source", "cost_ticks", "settled_at",
+)
+
+
+def record_search_call(
+    *,
+    call_id: str,
+    attempt_no: int = 0,
+    origin: str = "managed_round",
+    request_id: str | None = None,
+    round_no: int = 0,
+    source_id: str,
+    source_type: str,
+    source_name: str = "",
+    operation: str = "search",
+    credential_kind: str = "",
+    credential_label: str = "",
+    account_key: str = "",
+    credential_index: int | None = None,
+    model: str = "",
+    query: str | None = None,
+    url: str | None = None,
+    started_at: float | None = None,
+    db: LogDbRef | None = None,
+) -> RowLogHandle:
+    """Open one search-call row; the settlement update closes it.
+
+    Lives in whichever monthly DB is current at start, and never depends on a
+    request_log parent existing.
+    """
+    ref = db if db is not None else _db_ref_for_timestamp(started_at)
+    with _write_lock:
+        conn = _get_conn_for_ref(ref)
+        cur = conn.execute(
+            """INSERT INTO search_call_log
+               (call_id, attempt_no, origin, request_id, round_no,
+                source_id, source_type, source_name, operation,
+                credential_kind, credential_label, account_key, credential_index,
+                model, query, url, started_at, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                str(call_id), int(attempt_no or 0), str(origin or ""),
+                (str(request_id) if request_id else None), int(round_no or 0),
+                str(source_id), str(source_type), str(source_name or ""),
+                str(operation or "search"),
+                str(credential_kind or ""), str(credential_label or ""),
+                str(account_key or ""), credential_index,
+                str(model or ""),
+                (str(query)[:4000] if isinstance(query, str) else None),
+                (str(url)[:4000] if isinstance(url, str) else None),
+                float(started_at or time.time()), "running",
+            ),
+        )
+        conn.commit()
+        return RowLogHandle(
+            table="search_call_log", row_id=int(cur.lastrowid),
+            request_id=str(request_id or ""), db=ref,
+        )
+
+
+def finish_search_call(
+    handle: int | RowLogHandle,
+    *,
+    status: str,
+    error_code: str | None = None,
+    elapsed_ms: int | None = None,
+    result_count: int = 0,
+    content_chars: int = 0,
+    response_body: Any = None,
+    model: str | None = None,
+    provider: str | None = None,
+    ended_at: float | None = None,
+) -> None:
+    """Close one search-call row with its outcome and settlement facts.
+
+    Billing reuses the exact same normalization as the request chain
+    (``normalize_response_billing`` + ``estimate_cost``) so search cost is
+    comparable with every other upstream call. A missing usage object stays
+    ``unpriced``: it is never converted into a fabricated zero-cost settlement.
+    """
+    row_handle = _row_handle(handle, table="search_call_log")
+    normalized = model_pricing.normalize_response_billing(response_body)
+    tokens, _split, observed = _usage_values(None, None, normalized)
+    pricing_model: str | None = None
+    cost_source = "unpriced"
+    cost_ticks: int | None = None
+    # xAI reports an authoritative settled cost; prefer it over any estimate.
+    if observed and normalized.actual_cost_ticks is not None and str(provider or "") == "xai":
+        cost_source, cost_ticks = "actual", int(normalized.actual_cost_ticks)
+    elif observed and model:
+        priority = model_pricing.priority_from_service_tier(normalized.service_tier)
+        estimate = model_pricing.estimate_cost(
+            str(model),
+            input_tokens=tokens[0], output_tokens=tokens[1],
+            cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
+            priority=bool(priority),
+        )
+        if estimate is not None:
+            pricing_model = estimate.pricing_model
+            cost_source, cost_ticks = "estimated", int(estimate.total_ticks)
+    with _write_lock:
+        conn = _get_conn_for_ref(row_handle.db)
+        conn.execute(
+            """UPDATE search_call_log SET
+               ended_at=?, status=?, error_code=?, elapsed_ms=?,
+               result_count=?, content_chars=?,
+               input_tokens=?, output_tokens=?, cache_creation_tokens=?, cache_read_tokens=?,
+               usage_observed=?, model=COALESCE(?, model),
+               pricing_model=?, cost_source=?, cost_ticks=?, settled_at=?
+               WHERE id=?""",
+            (
+                float(ended_at or time.time()), str(status or ""),
+                (str(error_code)[:200] if error_code else None),
+                (int(elapsed_ms) if elapsed_ms is not None else None),
+                int(result_count or 0), int(content_chars or 0),
+                tokens[0], tokens[1], tokens[2], tokens[3],
+                1 if observed else 0,
+                (str(model) if model else None),
+                pricing_model, str(cost_source or "unpriced"), cost_ticks,
+                float(ended_at or time.time()), row_handle.row_id,
+            ),
+        )
+        conn.commit()
+
+
+def search_call_stats(since_ts: float, *, source_id: str | None = None) -> list[dict]:
+    """Aggregate search calls per source since ``since_ts`` (cross-month).
+
+    Success counts, attempts, latency and settled cost only. No credential or
+    query text is aggregated.
+    """
+    by_source: dict[str, dict] = {}
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            if "search_call_log" not in _existing_tables(conn):
+                continue
+            sql = (
+                "SELECT source_id, source_type,"
+                " MAX(source_name) AS source_name, COUNT(*) AS attempts,"
+                " SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,"
+                " SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS failed,"
+                " SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running,"
+                " SUM(COALESCE(elapsed_ms,0)) AS elapsed_sum,"
+                " SUM(CASE WHEN elapsed_ms IS NOT NULL THEN 1 ELSE 0 END) AS elapsed_n,"
+                " SUM(COALESCE(result_count,0)) AS result_count,"
+                " SUM(COALESCE(input_tokens,0)) AS input_tokens,"
+                " SUM(COALESCE(output_tokens,0)) AS output_tokens,"
+                " SUM(COALESCE(cache_creation_tokens,0)) AS cache_creation_tokens,"
+                " SUM(COALESCE(cache_read_tokens,0)) AS cache_read_tokens,"
+                " SUM(COALESCE(cost_ticks,0)) AS cost_ticks,"
+                " SUM(CASE WHEN usage_observed=1 THEN 1 ELSE 0 END) AS usage_observed,"
+                " MAX(started_at) AS last_at"
+                " FROM search_call_log WHERE started_at>=?"
+            )
+            args: list = [float(since_ts)]
+            if source_id:
+                sql += " AND source_id=?"
+                args.append(str(source_id))
+            sql += " GROUP BY source_id, source_type"
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+        for row in rows:
+            key = str(row["source_id"])
+            bucket = by_source.setdefault(key, {
+                "source_id": key, "source_type": str(row["source_type"] or ""),
+                "source_name": str(row["source_name"] or ""),
+                "attempts": 0, "success": 0, "failed": 0, "running": 0,
+                "elapsed_sum": 0, "elapsed_n": 0, "result_count": 0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                "cost_ticks": 0, "usage_observed": 0, "last_at": 0.0,
+            })
+            bucket["source_type"] = bucket["source_type"] or str(row["source_type"] or "")
+            bucket["source_name"] = bucket["source_name"] or str(row["source_name"] or "")
+            for field in ("attempts", "success", "failed", "running", "elapsed_sum",
+                          "elapsed_n", "result_count", "input_tokens", "output_tokens",
+                          "cache_creation_tokens", "cache_read_tokens", "cost_ticks",
+                          "usage_observed"):
+                bucket[field] += int(row[field] or 0)
+            bucket["last_at"] = max(bucket["last_at"], float(row["last_at"] or 0.0))
+    return sorted(by_source.values(), key=lambda item: item["attempts"], reverse=True)
+
+
+def search_call_entries(
+    since_ts: float,
+    *,
+    source_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """Recent search-call rows (newest first) for the log viewer."""
+    limit = max(1, min(int(limit or 50), 500))
+    offset = max(0, int(offset or 0))
+    collected: list[dict] = []
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            if "search_call_log" not in _existing_tables(conn):
+                continue
+            sql = "SELECT * FROM search_call_log WHERE started_at>=?"
+            args: list = [float(since_ts)]
+            if source_id:
+                sql += " AND source_id=?"
+                args.append(str(source_id))
+            sql += " ORDER BY started_at DESC, id DESC"
+            collected.extend(dict(r) for r in conn.execute(sql, tuple(args)).fetchall())
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+    collected.sort(key=lambda item: (float(item.get("started_at") or 0.0),
+                                     int(item.get("id") or 0)), reverse=True)
+    return collected[offset:offset + limit]
+
+
 
 def finish_success(
     request_id: str | RequestLogHandle,

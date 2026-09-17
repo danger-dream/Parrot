@@ -466,6 +466,11 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
             data = _check_response(response)
     result = {}
     if data.get("usage") is not None: result["usage"] = data["usage"]
+    # Private billing evidence for the call log. It is consumed by
+    # ``_finish_search_call_success`` and stripped before any model-visible
+    # payload is produced, so it never reaches the conversation.
+    result["_billing_body"] = data
+    if isinstance(data.get("model"), str): result["_upstream_model"] = data["model"]
     if kind == "openai":
         if operation == "extract":
             content = data.get("output")
@@ -531,7 +536,8 @@ def _portable_context(result: dict, args: dict) -> None:
 
 
 async def _run(operation: str, arguments: dict, *, request_id: str | None = None,
-               backend_id: str | None = None) -> dict:
+               backend_id: str | None = None, origin: str = "managed_round",
+               round_no: int = 0) -> dict:
     cfg = settings()
     args = _arguments(arguments, cfg, operation)
     candidates = []
@@ -547,7 +553,7 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
         if operation == "extract" and kind not in ("anysearch", "tavily", "exa", "openai"):
             continue
         credentials = _keys(backend) if kind in ENDPOINTS else _accounts(backend)
-        candidates.extend((backend, credential) for credential in credentials)
+        candidates.extend((backend, credential, position) for position, credential in enumerate(credentials))
     if not candidates:
         if cached_only:
             raise SearchError("没有支持离线/缓存搜索的可用OpenAI来源；未发送在线搜索请求", code="offline_search_unavailable", status_code=503, retryable=False)
@@ -556,13 +562,22 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
     maximum = max(1, min(10, int(cfg["maxAttempts"])))
     cursor = 0
     last = None
-    for _ in range(maximum):
+    call_id = uuid.uuid4().hex
+    for attempt_no in range(1, maximum + 1):
         eligible = [i for i in range(len(candidates)) if i not in permanent]
         if not eligible: break
         index = next((i for i in eligible if i >= cursor), eligible[0])
         cursor = (index + 1) % len(candidates)
-        backend, credential = candidates[index]
+        backend, credential, credential_position = candidates[index]
         started = time.monotonic()
+        # One row per real upstream call: source/credential/outcome/cost are all
+        # recorded, because a single search may legitimately hit several sources.
+        log_handle = _record_search_call_start(
+            call_id=call_id, attempt_no=attempt_no, origin=origin, request_id=request_id,
+            round_no=round_no, backend=backend, credential=credential,
+            credential_position=credential_position,
+            operation=operation, args=args,
+        )
         attempt = {"backend_id": backend["id"], "provider": backend["type"]}
         try:
             async with asyncio.timeout(float(cfg["timeoutSeconds"])):
@@ -570,8 +585,16 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
                     result = await _http_adapter(backend, credential, args, operation, cfg)
                 else:
                     result = await _oauth_adapter(backend, credential, args, operation, cfg)
-            attempt.update(status="success", elapsed_ms=round((time.monotonic() - started) * 1000))
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            attempt.update(status="success", elapsed_ms=elapsed_ms)
             attempts.append(attempt)
+            _finish_search_call_success(
+                log_handle, backend=backend, result=result, operation=operation,
+                args=args, elapsed_ms=elapsed_ms,
+            )
+            # Private billing evidence must not travel with the public result.
+            for _private in ("_billing_body", "_upstream_model"):
+                result.pop(_private, None)
             result.update(provider=backend["type"], backend_id=backend["id"], attempts=attempts)
             warnings = []
             if operation == "search" and backend["type"] != "openai":
@@ -593,16 +616,19 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
             last = exc
             if exc.code == "url_not_allowed":
                 # A policy refusal is not a backend outage to bypass elsewhere.
+                _finish_search_call_failure(log_handle, last, started)
                 raise
             if not exc.retryable: permanent.add(index)
         except httpx.RequestError:
             last = SearchError("搜索上游网络错误", code="search_network_error")
         except asyncio.CancelledError:
+            _finish_search_call_failure(log_handle, SearchError("已取消", code="cancelled", retryable=False), started)
             raise
         except Exception:
             # Exceptions may embed tokens/URLs/account identities. Never relay them.
             last = SearchError("搜索上游认证或响应处理失败", code="search_backend_error", retryable=False)
             permanent.add(index)
+        _finish_search_call_failure(log_handle, last, started)
         attempt.update(status="error", code=last.code, elapsed_ms=round((time.monotonic() - started) * 1000))
         attempts.append(attempt)
     assert last is not None
@@ -612,9 +638,97 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
     raise error
 
 
-async def search(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None) -> dict:
-    return await _run("search", arguments, request_id=request_id, backend_id=backend_id)
+def _record_search_call_start(*, call_id, attempt_no, origin, request_id, round_no,
+                              backend, credential, credential_position, operation, args):
+    """Open one search-call row; logging must never break the search itself."""
+    try:
+        from . import log_db
+        if isinstance(credential, dict):
+            credential_kind = "oauth"
+            account_key = ""
+            try:
+                from .oauth_ids import account_key as _ak
+                account_key = _ak(credential)
+            except Exception:
+                account_key = ""
+            credential_label = account_key or "oauth"
+            credential_index = None
+            model = str(backend.get("model") or "")
+        else:
+            credential_kind = "api_key"
+            credential_label = "Key #" + str(int(credential_position) + 1)
+            credential_index = int(credential_position)
+            account_key = ""
+            model = ""
+        return log_db.record_search_call(
+            call_id=call_id, attempt_no=attempt_no, origin=origin,
+            request_id=request_id, round_no=round_no,
+            source_id=str(backend.get("id") or ""), source_type=str(backend.get("type") or ""),
+            source_name=str(backend.get("name") or ""), operation=operation,
+            credential_kind=credential_kind, credential_label=credential_label,
+            account_key=account_key, credential_index=credential_index,
+            model=model,
+            query=args.get("query") if operation == "search" else None,
+            url=args.get("url") if operation == "extract" else None,
+        )
+    except Exception:
+        return None
 
 
-async def extract(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None) -> dict:
-    return await _run("extract", arguments, request_id=request_id, backend_id=backend_id)
+def _finish_search_call_success(handle, *, backend, result, operation, args, elapsed_ms):
+    """Settle one successful search call, including its model billing facts."""
+    if handle is None:
+        return
+    try:
+        from . import log_db
+        rows = result.get("results") or []
+        content = result.get("content") or result.get("answer") or ""
+        model = _effective_model(backend, result)
+        log_db.finish_search_call(
+            handle, status="success", elapsed_ms=elapsed_ms,
+            result_count=len(rows) if isinstance(rows, list) else 0,
+            content_chars=len(content) if isinstance(content, str) else 0,
+            response_body=result.get("_billing_body"),
+            model=model or None, provider=str(backend.get("type") or "") or None,
+        )
+    except Exception:
+        pass
+
+
+def _finish_search_call_failure(handle, error, started):
+    """Settle one failed search call; latency is still an observed fact."""
+    if handle is None:
+        return
+    try:
+        from . import log_db
+        log_db.finish_search_call(
+            handle, status="error",
+            error_code=getattr(error, "code", None),
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+    except Exception:
+        pass
+
+
+def _effective_model(backend: dict, result: dict) -> str:
+    """Report the model actually used, not the hardcoded fallback in isolation."""
+    explicit = str(backend.get("model") or "")
+    if explicit:
+        return explicit
+    claimed = result.get("_upstream_model")
+    if isinstance(claimed, str) and claimed.strip():
+        return claimed.strip()
+    kind = str(backend.get("type") or "")
+    return {"openai": "gpt-5.5", "xai": "grok-4.6", "anthropic": "claude-sonnet-4-6"}.get(kind, "")
+
+
+async def search(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None,
+                 origin: str = "managed_round", round_no: int = 0) -> dict:
+    return await _run("search", arguments, request_id=request_id, backend_id=backend_id,
+                      origin=origin, round_no=round_no)
+
+
+async def extract(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None,
+                  origin: str = "managed_round", round_no: int = 0) -> dict:
+    return await _run("extract", arguments, request_id=request_id, backend_id=backend_id,
+                      origin=origin, round_no=round_no)

@@ -260,7 +260,7 @@ def test_api_auth_origin_validation_envelope_and_save_readback(api, memory, cont
 def test_api_test_operation_and_idempotency(api, monkeypatch, memory):
     client, headers, _, _ = api
     calls = []
-    async def search(args, *, request_id, backend_id):
+    async def search(args, *, request_id, backend_id, origin="managed_round", round_no=0):
         calls.append((args, request_id, backend_id))
         return {"results": [{"title": "safe", "url": "https://example.test"}], "attempts": [{}]}
     monkeypatch.setattr(search_service, "search", search)
@@ -327,29 +327,44 @@ def callback(data):
     assert search_menu.handle_callback(42, 100, "cb", data)
 
 
+def _last_text(records):
+    """Latest rendered text, whichever Telegram method carried it."""
+    for method, data in reversed(records):
+        if method in ("editMessageText", "sendMessage"):
+            return data["text"]
+    raise AssertionError("no message rendered")
+
+
 def test_tg_root_modes_defaults_brand_status_and_navigation(tg, memory, control, ctx):
     from src.telegram.menus import system_menu
     _, keyboard = system_menu._main_text_and_kb()
     assert any(v["text"] == "🔎 搜索工具" and v["callback_data"] == "srch:show" for group in keyboard["inline_keyboard"] for v in group)
     callback("srch:show")
     page = latest(tg)
-    assert "未实时探活" in page["text"] and "缺少凭据" in page["text"]
-    assert "Anthropic：原生实现尚未完成账户实测" in page["text"]
+    assert "共 7 个来源" in page["text"] and "待配置" in page["text"]
     assert "本轮" not in page["text"] and "14.3" not in page["text"]
     assert buttons(page)[-1]["callback_data"] == "menu:settings"
     openai_button = next(v for v in buttons(page) if "OpenAI OAuth" in v["text"])
     assert openai_button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
-    callback("srch:mode:functionMode")
+    # Both ownership switches live on one page and apply in a single tap.
+    callback("srch:modes")
+    assert "搜索归属策略" in latest(tg)["text"]
     callback("srch:setmode:functionMode:disabled")
     callback("srch:setmode:hostedMode:passthrough")
     assert control.get(ctx)["functionMode"] == "disabled"
     assert control.get(ctx)["hostedMode"] == "passthrough"
     callback("srch:defaults")
-    assert "单次完整调用默认 10 秒，OAuth 原生搜索可能需要更长，可按需要调整" in latest(tg)["text"]
-    assert "14.3" not in latest(tg)["text"] and "本轮" not in latest(tg)["text"]
+    defaults = latest(tg)["text"]
+    # Values are grouped and each button carries its current value.
+    assert "总尝试次数（含首次）：<code>3</code>" in defaults
+    assert "单次超时（秒）：<code>10s</code>" in defaults
+    assert any(v["text"] == "✏ 单次超时（秒）：10s" for v in buttons(latest(tg)))
+    assert "14.3" not in defaults and "本轮" not in defaults
     callback("srch:backend:" + search_menu._code("anthropic"))
-    assert "原生实现尚未完成账户实测" in latest(tg)["text"]
-    assert "本轮" not in latest(tg)["text"] and "无 Anthropic 账户" not in latest(tg)["text"]
+    detail = latest(tg)["text"]
+    # Implementation-status prose is replaced by a normal status line.
+    assert "状态: " in detail and "原生实现尚未完成账户实测" not in detail
+    assert "本轮" not in detail and "无 Anthropic 账户" not in detail
     for field, value in (("maxAttempts", "4"), ("timeoutSeconds", "20"), ("maxResults", "9"), ("language", "zh")):
         callback("srch:edit:" + field)
         search_menu.handle_text_state(42, "search_input", value)
@@ -397,21 +412,23 @@ def test_oauth_ineligible_status_and_manual_optin_semantics(tg, api, memory, dis
     assert row(data, "tavily")["reason"] == "missing_credentials"
     callback("srch:show")
     labels = [v["text"] for v in buttons(latest(tg))]
-    assert any("OpenAI OAuth · 无可用账户" in label for label in labels)
-    assert any("Tavily · 缺少凭据" in label for label in labels)
+    assert any("OpenAI OAuth" in label for label in labels)
+    assert any("Tavily" in label for label in labels)
+    assert any("🔕" in label for label in labels)
+    assert "待配置" in latest(tg)["text"]
     code = search_menu._code("openai")
     callback("srch:backend:" + code)
     page = latest(tg)
-    assert "来源：无可用账户" in page["text"] and "缺少凭据" not in page["text"]
-    assert "允许搜索使用手动停用的账户：关闭（默认）" in page["text"]
-    assert "不改变普通对话，也不绕过认证/配额失效" in page["text"]
-    assert any(v["text"] == "🔁 允许搜索使用手动停用账户：关" for v in buttons(page))
+    assert "来源无可用账户" in page["text"] and "缺少凭据" not in page["text"]
+    assert "允许使用手动停用账户: 关" in page["text"]
+    assert "不改变普通对话状态" in page["text"]
+    assert any(v["text"] == "⏸ 允许停用账户：关" for v in buttons(page))
     callback("srch:allow:" + code)
     data = client.get("/api/management/v1/search", headers=headers).json()["data"]
     eligible = disabled_reason in (None, "user")
     assert row(data, "openai")["available"] is eligible
     assert row(data, "openai")["reason"] == ("configured" if eligible else "no_eligible_accounts")
-    assert ("来源：配置就绪" if eligible else "来源：无可用账户") in latest(tg)["text"]
+    assert ("来源可用" if eligible else "来源无可用账户") in latest(tg)["text"]
     assert memory.value["oauthAccounts"] == [before]
 
 
@@ -426,7 +443,7 @@ def test_tg_accounts_optin_and_single_source_test(tg, memory, control, ctx, monk
     assert row(control.get(ctx), "openai")["accountIds"] == ["openai:user@example.test:stable-workspace"]
     assert buttons(latest(tg))[-1]["callback_data"] == "srch:backend:" + code
     calls = []
-    async def search(arguments, *, request_id, backend_id):
+    async def search(arguments, *, request_id, backend_id, origin="managed_round", round_no=0):
         calls.append(backend_id)
         return {"results": [], "attempts": [{"backend_id": backend_id}]}
     monkeypatch.setattr(search_service, "search", search)
@@ -522,14 +539,16 @@ def test_tg_stale_key_editor_rejected_without_clearing_keys(tg, control, ctx):
 
 
 @pytest.mark.parametrize("kind", search_service.BACKEND_TYPES)
-def test_model_setting_is_oauth_only(api, tg, memory, control, ctx, kind):
+def test_model_setting_is_oauth_only_and_chosen_from_catalog(api, tg, memory, control, ctx, kind):
     client, headers, _, _ = api
     is_oauth = kind in ("openai", "xai", "anthropic")
     code = search_menu._code(kind)
     callback("srch:backend:" + code)
     detail = latest(tg)
-    assert ("模型：" in detail["text"]) is is_oauth
-    assert any(v["callback_data"] == "srch:model:" + code for v in buttons(detail)) is is_oauth
+    assert ("模型: " in detail["text"]) is is_oauth
+    # OAuth sources open a list picker; API-key sources have no model dimension.
+    assert any(v["callback_data"] == "srch:models:" + code for v in buttons(detail)) is is_oauth
+    assert not any(v["callback_data"] == "srch:model:" + code for v in buttons(detail))
     # Read compatibility: legacy/default empty model remains a valid DTO value.
     assert row(client.get("/api/management/v1/search", headers=headers).json()["data"], kind)["model"] == ""
     before = memory.updates
@@ -538,19 +557,62 @@ def test_model_setting_is_oauth_only(api, tg, memory, control, ctx, kind):
     assert memory.updates == before + int(is_oauth)
     created = client.post("/api/management/v1/search/backends", json={"type": kind, "id": kind + "-model-test", "model": "requested-model"}, headers=headers)
     assert created.status_code == (201 if is_oauth else 422)
-    callback("srch:model:" + code)
     if is_oauth:
-        assert states.get_state(42)["data"]["field"] == "model"
-        search_menu.handle_text_state(42, "search_input", "oauth-tg-model")
-        assert row(control.get(ctx), kind)["model"] == "oauth-tg-model"
-    else:
-        # An old/forged button cannot offer an editor for a no-op field.
+        # A forged free-text editor can no longer open an input state at all:
+        # the action is unknown, so the button is rejected rather than silently
+        # accepting typed model names.
+        callback("srch:model:" + code)
         assert states.get_state(42) is None
-        assert "只有 OAuth 搜索来源支持模型设置" in latest(tg, "sendMessage")["text"]
+        assert "从账户模型目录选择" in _last_text(tg)
+        callback("srch:models:" + code)
+        assert "搜索模型" in latest(tg)["text"]
+        # No eligible account here, so the list is empty and only "automatic" is offered.
+        assert not any(str(v["callback_data"]).startswith("srch:setmodel:" + code + ":")
+                       and len(str(v["callback_data"])) > len("srch:setmodel:" + code + ":")
+                       for v in buttons(latest(tg)))
+        callback("srch:setmodel:" + code + ":")
+        assert row(control.get(ctx), kind)["model"] == ""
+    else:
+        # An API-key source has no model dimension; both the list picker and a
+        # legacy free-text button are refused instead of silently rendering.
+        callback("srch:models:" + code)
+        assert "只有 OAuth 搜索来源支持模型设置" in _last_text(tg)
+        callback("srch:model:" + code)
+        assert "从账户模型目录选择" in _last_text(tg)
+        assert states.get_state(42) is None
         assert row(control.get(ctx), kind)["model"] == ""
         cleared = client.patch("/api/management/v1/search/backends/" + kind, json={"model": ""}, headers=headers)
         assert cleared.status_code == 200
         assert row(cleared.json()["data"], kind)["model"] == ""
+
+
+@pytest.mark.parametrize("kind", ["xai", "openai"])
+def test_model_picker_lists_only_eligible_account_catalog(tg, memory, control, ctx, kind):
+    """The picker offers the account's own catalog and writes back the chosen ID."""
+    account = {"provider": kind, "email": "catalog@example.test",
+               "access_token": "private-oauth", "enabled": True,
+               "models": ["model-b", "model-a"]}
+    memory.value["oauthAccounts"] = [account]
+    code = search_menu._code(kind)
+    callback("srch:models:" + code)
+    page = latest(tg)
+    offered = [str(v["callback_data"]) for v in buttons(page) if str(v["callback_data"]).startswith("srch:setmodel:" + code + ":")]
+    assert len(offered) == 2
+    chosen = offered[0]
+    callback(chosen)
+    assert row(control.get(ctx), kind)["model"] in ("model-a", "model-b")
+    assert any(v["text"].startswith("✅ ") for v in buttons(latest(tg)))
+    # Restoring automatic clears the stored override.
+    callback("srch:setmodel:" + code + ":")
+    assert row(control.get(ctx), kind)["model"] == ""
+
+
+def test_model_picker_refuses_api_key_source(tg, memory, control, ctx):
+    callback("srch:models:" + search_menu._code("tavily"))
+    assert "只有 OAuth 搜索来源支持模型设置" in _last_text(tg)
+    # A legacy free-text model button is also refused, never silently rendered.
+    callback("srch:model:" + search_menu._code("tavily"))
+    assert "从账户模型目录选择" in _last_text(tg)
 
 
 @pytest.mark.parametrize("kind", ["tavily", "openai"])
@@ -566,13 +628,21 @@ def test_search_detail_action_labels_follow_enabled(tg, control, ctx, kind):
 
 @pytest.mark.parametrize("field", ["functionMode", "hostedMode"])
 def test_search_mode_picker_marks_current_selection(tg, control, ctx, field):
+    """One page carries both switches; the current choice is marked once."""
     for mode in ("managed", "passthrough", "disabled"):
         control.patch(ctx, {field: mode})
-        callback(f"srch:mode:{field}:2")
+        callback("srch:modes:2")
         page = latest(tg)
-        selected = [v for v in buttons(page) if v["text"].startswith("✅ 当前 · ")]
-        assert len(selected) == 1
-        assert selected[0]["callback_data"] == f"srch:setmode:{field}:{mode}:2"
+        marked = [v for v in buttons(page) if v["text"].startswith("✅ ")]
+        # Exactly one mark per switch, so two in total; the other switch keeps
+        # whatever it currently holds rather than being reset by this page.
+        assert len(marked) == 2
+        assert any(v["callback_data"] == f"srch:setmode:{field}:{mode}:2" for v in marked)
+        for other in ("functionMode", "hostedMode"):
+            current = control.get(ctx)[other]
+            assert any(v["callback_data"] == f"srch:setmode:{other}:{current}:2" for v in marked)
+        # The mark is the only leading glyph, so the label never stacks icons.
+        assert all(not v["text"].startswith("✅ ✅") for v in buttons(page))
         assert search_menu._MODES[mode] in page["text"]
         assert ("普通 function" if field == "functionMode" else "原生 hosted") in page["text"]
         assert buttons(page)[-1]["callback_data"] == "srch:show:2"
@@ -582,5 +652,79 @@ def test_key_page_replacement_character_free(tg):
     for kind in ("anysearch", "tavily", "exa", "brave"):
         callback("srch:keys:" + search_menu._code(kind))
         page = latest(tg)
-        assert "序号从 1 开始。保存时保留其它来源和未修改的 Key。" in page["text"]
+        assert "序号从 1 开始" in page["text"]
+        assert "保存不影响其它来源的 Key" in page["text"]
         assert "\ufffd" not in json.dumps(page, ensure_ascii=False)
+
+
+
+def test_api_search_logs_and_stats_read_dedicated_log(api, memory, control, ctx, monkeypatch, tmp_path):
+    """GET /search/logs and /search/stats read the search log, not request logs."""
+    import threading
+    from src import log_db
+    client, headers, _, _ = api
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(log_db, "_log_dir", str(tmp_path / "logs"))
+    monkeypatch.setattr(log_db, "_local", threading.local())
+    monkeypatch.setattr(log_db, "_write_conn_registry", {})
+    monkeypatch.setattr(log_db, "_request_handles", {})
+    handle = log_db.record_search_call(
+        call_id="c", attempt_no=1, source_id="tavily", source_type="tavily",
+        source_name="Tavily", operation="search", credential_kind="api_key",
+        credential_label="Key #1", query="api probe", origin="management_test",
+    )
+    log_db.finish_search_call(handle, status="success", elapsed_ms=120, result_count=3)
+
+    logs = client.get("/api/management/v1/search/logs", headers=headers)
+    assert logs.status_code == 200, logs.text
+    rows = logs.json()["data"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["sourceId"] == "tavily" and row["sourceName"] == "Tavily"
+    assert row["origin"] == "management_test" and row["operation"] == "search"
+    assert row["resultCount"] == 3 and row["elapsedMs"] == 120
+    assert row["status"] == "success" and row["costSource"] in ("estimated", "unpriced")
+    assert "costUsd" in row and isinstance(row["costUsd"], float)
+
+    stats = client.get("/api/management/v1/search/stats", headers=headers)
+    assert stats.status_code == 200, stats.text
+    data = stats.json()["data"]
+    assert len(data) == 1
+    assert data[0]["sourceId"] == "tavily" and data[0]["attempts"] == 1
+    assert data[0]["success"] == 1 and data[0]["averageMs"] == 120
+
+
+def test_api_search_logs_filter_and_unknown_query(api, monkeypatch, tmp_path):
+    import threading
+    from src import log_db
+    client, headers, _, _ = api
+    (tmp_path / "logs2").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(log_db, "_log_dir", str(tmp_path / "logs2"))
+    monkeypatch.setattr(log_db, "_local", threading.local())
+    monkeypatch.setattr(log_db, "_write_conn_registry", {})
+    monkeypatch.setattr(log_db, "_request_handles", {})
+    for source in ("tavily", "exa"):
+        handle = log_db.record_search_call(
+            call_id="c-" + source, attempt_no=1, source_id=source, source_type=source,
+            operation="search",
+        )
+        log_db.finish_search_call(handle, status="success", elapsed_ms=1)
+    only = client.get("/api/management/v1/search/logs?sourceId=exa", headers=headers)
+    assert [r["sourceId"] for r in only.json()["data"]] == ["exa"]
+    # Rejected unknown query parameters keep the strict read contract, and the
+    # pre-existing routes still accept no query parameters at all.
+    assert client.get("/api/management/v1/search/logs?bogus=1", headers=headers).status_code == 422
+    assert client.get("/api/management/v1/search/stats?bogus=1", headers=headers).status_code == 422
+    assert client.get("/api/management/v1/search/logs?period=nonsense", headers=headers).status_code == 422
+    assert client.get("/api/management/v1/search?bogus=1", headers=headers).status_code == 422
+
+
+def test_api_create_and_update_reject_api_key_model(api, memory, control, ctx):
+    """Model overrides stay restricted to OAuth sources at the API boundary."""
+    client, headers, _, _ = api
+    base = "/api/management/v1/search/backends"
+    assert client.post(base, json={"type": "tavily", "id": "k-model", "model": "x"},
+                       headers=headers).status_code == 422
+    created = client.post(base, json={"type": "xai", "id": "o-model"}, headers=headers)
+    assert created.status_code == 201
+    assert client.patch(base + "/o-model", json={"model": "grok-4.6"}, headers=headers).status_code == 200

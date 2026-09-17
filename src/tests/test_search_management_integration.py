@@ -47,7 +47,7 @@ def test_exact_search_route_methods_paths_and_retired_ag_absence():
               for path, item in document["paths"].items() if path.startswith("/api/management/v1")
               for method, operation in item.items() if method in methods}
     search_ops = {key: value for key, value in actual.items() if value[1].startswith("/api/management/v1/search")}
-    assert len(SEARCH_ROWS) == len(SEARCH_OPERATIONS) == 8
+    assert len(SEARCH_ROWS) == len(SEARCH_OPERATIONS) == 10
     assert search_ops == SEARCH_OPERATIONS
     for path, item in document["paths"].items():
         if not path.startswith("/api/management/v1/search/backends/{"):
@@ -58,10 +58,10 @@ def test_exact_search_route_methods_paths_and_retired_ag_absence():
                 assert [p["name"] for p in operation.get("parameters", []) if p["in"] == "path"] == ["backendId"]
     assert set(RETIRED_AG_OPERATIONS).isdisjoint(actual)
     assert {path for _, path in RETIRED_AG_OPERATIONS.values()}.isdisjoint(document["paths"])
-    assert len({path for _, path in SEARCH_OPERATIONS.values()}) == 6
+    assert len({path for _, path in SEARCH_OPERATIONS.values()}) == 8
     assert len({path for _, path in RETIRED_AG_OPERATIONS.values()}) == 3
     manifest = (FIXTURES / "production-operation-ids.txt").read_text().splitlines()
-    assert len(manifest) == len(set(manifest)) == 233
+    assert len(manifest) == len(set(manifest)) == 232
     assert set(manifest) == set(actual)
 
 

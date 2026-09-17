@@ -102,6 +102,7 @@ getRuntimeStatus
 getScoringSettings
 getSearchBackendAccounts
 getSearchSettings
+getSearchStats
 getSettings
 getStatsBreakdown
 getStatsSummary
@@ -137,6 +138,7 @@ listProxies
 listProxyGroups
 listRecentCalls
 listRequestLogs
+listSearchLogs
 listStatusIncidents
 listTranslationLanguages
 listUpdateBackups

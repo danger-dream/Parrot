@@ -120,7 +120,7 @@ async def test_managed_real_failover_all_rounds_and_branches_stay_in_origin_mont
             obj = output(protocol, text='final-' + str(network_round))
         return httpx.Response(200, json=obj)
 
-    async def execute(call, *, request_id=None):
+    async def execute(call, *, request_id=None, round_no=0):
         # Keep the real tool wrapper and SQLite logs; mock only external search.
         # Successful model rounds must not retain a global binding during tools.
         assert request_id == request.request_id

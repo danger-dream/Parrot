@@ -97,3 +97,62 @@ class SearchAccountData(StrictSchema):
     name: str
     enabled: bool
     credentialConfigured: bool
+
+
+class SearchCallLogData(StrictSchema):
+    """One real upstream call of a search source (dedicated search log)."""
+
+    id: int
+    callId: str
+    attemptNo: int
+    origin: str
+    requestId: str | None = None
+    roundNo: int
+    sourceId: str
+    sourceType: str
+    sourceName: str
+    operation: Literal["search", "extract"]
+    credentialKind: Literal["api_key", "oauth", ""]
+    credentialLabel: str
+    accountKey: str
+    credentialIndex: int | None = None
+    model: str
+    query: str | None = None
+    url: str | None = None
+    startedAt: float
+    endedAt: float | None = None
+    status: Literal["running", "success", "error"]
+    errorCode: str | None = None
+    elapsedMs: int | None = None
+    resultCount: int
+    contentChars: int
+    inputTokens: int
+    outputTokens: int
+    cacheCreationTokens: int
+    cacheReadTokens: int
+    usageObserved: bool
+    pricingModel: str | None = None
+    costSource: Literal["actual", "estimated", "unpriced"]
+    costUsd: float
+    settledAt: float | None = None
+
+
+class SearchSourceStatsData(StrictSchema):
+    """Aggregated per-source search statistics."""
+
+    sourceId: str
+    sourceType: str
+    sourceName: str
+    attempts: int
+    success: int
+    failed: int
+    running: int
+    averageMs: int | None = None
+    resultCount: int
+    inputTokens: int
+    outputTokens: int
+    cacheCreationTokens: int
+    cacheReadTokens: int
+    costUsd: float
+    usageObserved: int
+    lastAt: float

@@ -7,3 +7,5 @@ deleteSearchBackend	DELETE	/api/management/v1/search/backends/{backendId}	manage
 getSearchBackendAccounts	GET	/api/management/v1/search/backends/{backendId}/accounts	management.read	
 updateSearchPriority	PUT	/api/management/v1/search/priority	management.write	
 testSearchBackend	POST	/api/management/v1/search/test	management.write	
+listSearchLogs	GET	/api/management/v1/search/logs	management.read	
+getSearchStats	GET	/api/management/v1/search/stats	management.read	
