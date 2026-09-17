@@ -7,6 +7,43 @@ from pathlib import Path
 import socket
 
 
+def _worker_data_root() -> None:
+    """给每个 xdist worker 分配独立的数据目录。
+
+    并行时所有 worker 由同一份 bootstrap 环境派生，最初的
+    ``ANTHROPIC_PROXY_DATA_DIR`` / ``ANTHROPIC_PROXY_CONFIG`` 等是**同一条路径**。
+    而 StateStore 是对目标文件加进程独占锁的，config.json 也会被各 worker 覆写，
+    于是并行会互相抢锁、互相改配置。这里按 worker 名派生独立子目录后再交给
+    conftest 的既有校验，使并行与串行都满足"每个测试进程独占自己的数据根"。
+
+    必须在任何 ``src`` 导入之前执行：``src/config.py`` 在导入时就读这些环境变量
+    决定 DATA_DIR / CONFIG_PATH。conftest 的导入早于测试模块与 src，因此这里安全。
+    """
+    name = os.environ.get("PYTEST_XDIST_WORKER") or ""
+    safe = "".join(ch for ch in name if ch.isalnum() or ch in "-_")
+    if not safe:
+        # 串行（或 xdist 控制器）：沿用 bootstrap 已经建好的单一数据根。
+        return
+    root = Path(os.environ["PARROT_TEST_ROOT"]).resolve()
+    data_dir = (root / f"data-{safe}").resolve()
+    log_dir = (data_dir / "logs").resolve()
+    for path in (data_dir, log_dir):
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+    os.environ["ANTHROPIC_PROXY_DATA_DIR"] = str(data_dir)
+    os.environ["ANTHROPIC_PROXY_CONFIG"] = str((data_dir / "config.json").resolve())
+    os.environ["PARROT_TEST_STATE_PATH"] = str((data_dir / "state.db").resolve())
+    os.environ["PARROT_TEST_LOG_DIR"] = str(log_dir)
+    os.environ["PARROT_TEST_IMAGE_PATH"] = str((data_dir / "image_logs.db").resolve())
+
+    # 这份 config 必须**先于**任何 config.get() 存在：否则 _load_from_disk()
+    # 会退回 DEFAULT_CONFIG（oauth.mockMode=False）并把默认值写回磁盘，
+    # 使本 worker 的 OAuth 测试真的发起网络请求。内容与 bootstrap 同源。
+    from . import _isolation
+
+    _isolation.write_minimal_config(os.environ["ANTHROPIC_PROXY_CONFIG"])
+
+
 def _validate_import_time_isolation() -> None:
     if os.environ.get("PARROT_TEST_ISOLATED") != "1":
         raise RuntimeError(
@@ -36,6 +73,7 @@ def _validate_import_time_isolation() -> None:
     os.environ["PARROT_TEST_CONFTEST_PROBE"] = "absolute-paths-ok-before-collection"
 
 
+_worker_data_root()
 _validate_import_time_isolation()
 
 import pytest
@@ -188,6 +226,33 @@ def _restore_telegram_ui_globals():
         ui._admin_ids = set(orig_admin_ids)
         if menu_cache is not None:
             menu_cache.reset_for_tests()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_isolated_config_baseline():
+    """每个测试模块开跑前把 config 恢复到隔离基线。
+
+    多个测试文件会用 ``copy.deepcopy(DEFAULT_CONFIG)`` 整体替换配置，而
+    ``config.update()`` 会同时改写内存缓存与磁盘上的 config.json 且不做还原。
+    后跑的模块因此会读到前一个模块留下的配置（例如 DEFAULT_CONFIG 里
+    ``oauth.mockMode`` 为 False），导致本应走 mock 的用例真的去连上游。
+    串行时收集顺序固定尚且侥幸，模块顺序一旦变化（并行、或新增文件）就会
+    随机失败。
+
+    在每个模块开始时统一恢复基线，使"模块之间互不影响"；模块内部的测试
+    顺序依赖不受影响。
+    """
+    from src import config as config_module
+
+    from . import _isolation
+
+    try:
+        _isolation.write_minimal_config(os.environ["ANTHROPIC_PROXY_CONFIG"])
+        config_module.reload()
+    except Exception:
+        # 恢复失败不应遮蔽真正的测试失败；模块自身的 fixture 仍会建立所需状态。
+        pass
+    yield
 
 
 @pytest.fixture(autouse=True)

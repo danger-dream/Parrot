@@ -6,5 +6,8 @@
 # pytest: used only under src/tests/ (no production code imports it).
 pytest>=8.0
 pytest-asyncio>=1.0
+# pytest-xdist: optional parallel test execution (``-n auto``). Each worker gets its
+# own isolated data root via conftest; without it the runner stays strictly serial.
+pytest-xdist>=3.5
 # anyio: imported directly by src/tests/live_openai_probe.py for its blocking ASGI portal.
 anyio>=4.0,<5

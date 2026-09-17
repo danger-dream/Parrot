@@ -173,7 +173,18 @@ def main(argv: list[str]) -> int:
             raise SystemExit("probe failed: src appeared during bootstrap")
         print("ISOLATION_ZERO_SRC_IMPORT_PROBE_OK", flush=True)
         return 0
-    command = [sys.executable, "-m", "pytest", "-p", "pytest_asyncio.plugin", *argv]
+    plugins = ["-p", "pytest_asyncio.plugin"]
+    # PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 会同时屏蔽 xdist 的 entrypoint，因此需要
+    # 在已安装时显式加载它，``-n`` 才能直接使用。未安装 xdist 时不加载，
+    # 串行运行行为保持不变（xdist 只在给出 -n 时才真正介入）。
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("xdist.plugin") is not None:
+            plugins += ["-p", "xdist.plugin"]
+    except (ImportError, ValueError):
+        pass
+    command = [sys.executable, "-m", "pytest", *plugins, *argv]
     os.execvpe(sys.executable, command, env)
     return 127
 
