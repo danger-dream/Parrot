@@ -132,6 +132,11 @@ def test_account_labels_and_human_workspace_disambiguation(tg, memory, control, 
 
 
 def populate_backends(control, ctx):
+    """18 explicitly added sources (distinct ids), all visible by construction.
+
+    Seeded placeholders without credentials are hidden by the list, so the
+    pagination assertions below count only these added sources.
+    """
     for i in range(18):
         control.add_backend(ctx, {"type": "openai", "id": f"extra-{i}", "name": f"来源{i}" + "&<>" * 50})
 
@@ -143,18 +148,18 @@ def assert_bounded(page):
 
 
 def test_large_backend_pages_preserve_edit_sort_and_parent_navigation(tg, control, ctx):
-    populate_backends(control, ctx)  # 25 sources, not only the default seven
+    populate_backends(control, ctx)  # 18 configured sources, not the seeded placeholders
     seen = []
-    # Six list rows per page: 25 sources span 6/6/6/6/1.
-    for page_index, count in ((0, 6), (1, 6), (2, 6), (3, 6), (4, 1)):
+    # Six list rows per page: 18 sources span 6/6/6.
+    for page_index, count in ((0, 6), (1, 6), (2, 6)):
         callback(search_menu._home(page_index))
         page = latest(tg)
         assert_bounded(page)
         entries = [v for v in buttons(page) if v["callback_data"].startswith("srch:backend:")]
         assert len(entries) == count
         seen.extend(search_menu._target(v["callback_data"].split(":")[2])[0] for v in entries)
-        assert f"第 {page_index + 1}/5 页" in page["text"]
-    assert len(seen) == len(set(seen)) == 25
+        assert f"第 {page_index + 1}/3 页" in page["text"]
+    assert len(seen) == len(set(seen)) == 18
     callback("srch:show:1")
     detail = next(v["callback_data"] for v in buttons(latest(tg)) if v["callback_data"].startswith("srch:backend:"))
     code = detail.split(":")[2]
@@ -170,7 +175,7 @@ def test_large_backend_pages_preserve_edit_sort_and_parent_navigation(tg, contro
     assert row(control.get(ctx), backend_id)["name"] == "Edited source"
     assert buttons(latest(tg))[-1]["callback_data"] == "srch:show:1"
     callback(buttons(latest(tg))[-1]["callback_data"])
-    assert "第 2/5 页" in latest(tg)["text"]
+    assert "第 2/3 页" in latest(tg)["text"]
     callback("srch:defaults:1")
     callback("srch:edit:language:1")
     bot_text("en")
@@ -257,8 +262,8 @@ def test_delete_tg_confirm_cancel_stale_and_page_return(tg, memory, control, ctx
     confirm = buttons(latest(tg))[0]["callback_data"]
     callback(confirm)
     assert "extra-15" not in [v["id"] for v in control.get(ctx)["backends"]]
-    # 24 sources remain, spanning 4 pages; the action returns to its own page.
-    assert "第 3/4 页" in latest(tg)["text"]
+    # 17 sources remain, spanning 3 pages; the action returns to its own page.
+    assert "第 3/3 页" in latest(tg)["text"]
     saved = copy.deepcopy(memory.value)
     callback(confirm)
     assert memory.value == saved  # no second mutation/replay

@@ -69,6 +69,23 @@ def _ctx(chat_id):
     return telegram_context(chat_id)
 
 
+def _view(chat_id):
+    """The source list as shown: only sources that are actually configured.
+
+    Seeded placeholders (one per backend type) stay hidden until they hold a
+    credential or carry an explicit decision, so the page lists real sources
+    only. Everything that operates on one existing source — detail, keys,
+    accounts, sort, delete — must use ``_cfg`` instead, or an unconfigured (but
+    explicitly added) source would become unreachable.
+    """
+    return _CONTROL.visible_backends(_ctx(chat_id))
+
+
+def _cfg(chat_id):
+    """Every source, including unconfigured placeholders (management view)."""
+    return _CONTROL.get(_ctx(chat_id))
+
+
 def _code(backend_id, page=0):
     if page:
         return ui.register_code("search-view:" + json.dumps([backend_id, page]))
@@ -151,7 +168,7 @@ def _counts(cfg):
 
 
 def _render(chat_id=0, page=0):
-    cfg = _CONTROL.get(_ctx(chat_id))
+    cfg = _view(chat_id)
     backends, page, pages = _page(cfg["backends"], page)
     suffix = f":{page}" if page else ""
     lines = ["🔎 <b>搜索工具</b>", _counts(cfg), "", "<b>归属策略</b>",
@@ -162,6 +179,8 @@ def _render(chat_id=0, page=0):
              "  按下方顺序依次尝试，失败后切换下一个来源。"]
     if pages > 1:
         lines.append(f"第 {page + 1}/{pages} 页")
+    if not cfg["backends"]:
+        lines += ["", "<i>还没有已配置的搜索来源。点「➕ 新增来源」添加。</i>"]
     lines.append("")
     rows = [[ui.btn("🔀 归属策略", "srch:modes" + suffix), ui.btn("⚙ 默认参数", "srch:defaults" + suffix)]]
     for i, row in enumerate(backends, page * _PAGE_SIZE + 1):
@@ -347,13 +366,21 @@ def _accounts(chat_id, message_id, backend_id, page=0, account_page=0):
 
 
 def _sort(chat_id, message_id, page=0, draft=None, selected=None):
-    """Reorder every source in one commit, matching the OAuth/channel sort page."""
-    cfg = _CONTROL.get(_ctx(chat_id))
+    """Reorder the configured sources; unconfigured placeholders stay at the end.
+
+    The list mirrors the main page (configured sources only), while the commit
+    still submits every backend id exactly once, because the priority endpoint
+    requires the complete ordered set.
+    """
+    cfg = _view(chat_id)
+    hidden = [row["id"] for row in _cfg(chat_id)["backends"]
+              if row["id"] not in {r["id"] for r in cfg["backends"]}]
     ids = list(draft) if draft else [row["id"] for row in cfg["backends"]]
-    names = {row["id"]: row["name"] for row in cfg["backends"]}
+    names = {row["id"]: row["name"] for row in _cfg(chat_id)["backends"]}
     # ``selected`` holds one-based positions, not backend IDs: it is validated
     # against the row count so a stale pick cannot select a non-existent row.
     selected = sorted({int(s) for s in (selected or []) if 1 <= int(s) <= len(ids)})
+    _sort_hidden[chat_id] = hidden
     lines = ["↕ <b>搜索来源排序</b>", "", "当前顺序:"]
     if not ids:
         lines.append("<i>当前没有搜索来源。</i>")
@@ -382,15 +409,20 @@ def _sort(chat_id, message_id, page=0, draft=None, selected=None):
 
 
 _sort_draft: dict = {}
+# Unconfigured placeholders are not shown, but must still be submitted with the
+# reordered set: the priority endpoint validates the complete id collection.
+_sort_hidden: dict = {}
 
 
 def _sort_take(chat_id):
     """Current draft order, repaired against the live config.
 
-    A source added or removed from another message must never be dropped by a
-    stale draft, so unknown IDs are discarded and new ones are appended.
+    The draft covers **configured** sources only (what the page lists); hidden
+    placeholders are handled separately at save time. A source added or removed
+    from another message must never be dropped by a stale draft, so unknown IDs
+    are discarded and newly configured ones are appended.
     """
-    cfg = _CONTROL.get(_ctx(chat_id))
+    cfg = _view(chat_id)
     current = [row["id"] for row in cfg["backends"]]
     draft = _sort_draft.get(chat_id) or {}
     ids = [i for i in (draft.get("ids") or []) if i in current]
@@ -629,10 +661,15 @@ def handle_callback(chat_id, message_id, cb_id, data):
             if not _sort_draft.get(chat_id):
                 raise ValueError
             ids, _selected = _sort_take(chat_id)
-            cfg = _CONTROL.get(ctx)
-            if sorted(ids) != sorted(row["id"] for row in cfg["backends"]):
+            cfg = _cfg(chat_id)
+            current = [row["id"] for row in cfg["backends"]]
+            # Hidden placeholders keep their relative order at the tail, so the
+            # submitted list is the complete set exactly once.
+            hidden = [i for i in _sort_hidden.pop(chat_id, []) if i in current and i not in ids]
+            ordered = ids + hidden
+            if sorted(ordered) != sorted(current):
                 raise ManagementError("STATE_CONFLICT", "来源列表已变化，请重新排序")
-            _CONTROL.priority(ctx, ids, expected_revision=cfg["revision"])
+            _CONTROL.priority(ctx, ordered, expected_revision=cfg["revision"])
             _sort_draft.pop(chat_id, None)
             show(chat_id, message_id, page=int(parts[2]) if len(parts) > 2 else 0)
         elif action == "stats":

@@ -69,6 +69,49 @@ class SearchControl(DomainControl):
         result["revision"] = stable_revision(cfg)
         return result
 
+    @staticmethod
+    def _is_configured(row) -> bool:
+        """Whether a source has anything of its own to manage.
+
+        The backend list is seeded with one placeholder per backend type, so an
+        untouched entry is not a real source. It counts as configured once it has
+        a credential, or differs from its own default template (renamed, custom
+        endpoint/id, account selection, model, manual disable) — that keeps a
+        freshly added source visible before its first key or account arrives.
+        """
+        if row.get("keyCount") or row.get("accountCount"):
+            return True
+        # An explicitly added source keeps a generated id; a seeded placeholder
+        # reuses its type as id. This must be checked first so a just-added
+        # source stays reachable while its key or account selection is pending.
+        if str(row.get("id") or "") != str(row.get("type") or ""):
+            return True
+        # A provider may have accounts that are all currently disabled or
+        # missing credentials: accountCount is then 0, yet the source must stay
+        # reachable so its opt-in/account selection can still be managed.
+        if row["type"] not in API_TYPES and SearchControl._has_provider_accounts(row["type"]):
+            return True
+        template = search_service.default_backend(row["type"])
+        for key in BACKEND_FIELDS:
+            if row.get(key) != template.get(key):
+                return True
+        return False
+
+    @staticmethod
+    def _has_provider_accounts(backend_type: str) -> bool:
+        """Whether any OAuth account of this provider exists, in any state."""
+        provider = "claude" if backend_type == "anthropic" else backend_type
+        return any(
+            (account.get("provider") or "claude") == provider
+            for account in config.get().get("oauthAccounts") or []
+        )
+
+    def visible_backends(self, context):
+        """Configured sources only, in priority order (what the UI should list)."""
+        value = self.get(context)
+        value["backends"] = [row for row in value["backends"] if self._is_configured(row)]
+        return value
+
     def accounts(self, context, backend_id):
         """Only public full identities; never return OAuth credentials."""
         self._read(context)

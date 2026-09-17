@@ -341,11 +341,22 @@ def test_tg_root_modes_defaults_brand_status_and_navigation(tg, memory, control,
     assert any(v["text"] == "🔎 搜索工具" and v["callback_data"] == "srch:show" for group in keyboard["inline_keyboard"] for v in group)
     callback("srch:show")
     page = latest(tg)
-    assert "共 7 个来源" in page["text"] and "待配置" in page["text"]
+    # 未配置的模板来源不占位：默认配置里没有任何凭据，列表为空。
+    assert "共 0 个来源" in page["text"]
+    assert "还没有已配置的搜索来源" in page["text"]
     assert "本轮" not in page["text"] and "14.3" not in page["text"]
     assert buttons(page)[-1]["callback_data"] == "menu:settings"
-    openai_button = next(v for v in buttons(page) if "OpenAI OAuth" in v["text"])
-    assert openai_button["icon_custom_emoji_id"] == ui.provider_custom_emoji_id("openai")
+    # 配置一个来源后它才出现，并且带供应商图标。
+    code = search_menu._code("tavily")
+    callback("srch:backend:" + code)
+    callback("srch:addApiKeys:" + code)
+    search_menu.handle_text_state(42, "search_input", "tg-secret-list")
+    callback("srch:show")
+    page = latest(tg)
+    assert "共 1 个来源" in page["text"] and "可用 1" in page["text"]
+    # API Key 来源没有 TG 自定义表情，图标走正文/按钮的普通 emoji。
+    assert "🧭" in page["text"]
+    assert any(v["callback_data"] == "srch:backend:" + code for v in buttons(page))
     # Both ownership switches live on one page and apply in a single tap.
     callback("srch:modes")
     assert "搜索归属策略" in latest(tg)["text"]
@@ -412,8 +423,10 @@ def test_oauth_ineligible_status_and_manual_optin_semantics(tg, api, memory, dis
     assert row(data, "tavily")["reason"] == "missing_credentials"
     callback("srch:show")
     labels = [v["text"] for v in buttons(latest(tg))]
+    # 该 provider 存在账户（虽全部停用），来源必须保留且可进入，才能配置
+    # 「允许使用手动停用账户」；未配置凭据的 Tavily 则不占位。
     assert any("OpenAI OAuth" in label for label in labels)
-    assert any("Tavily" in label for label in labels)
+    assert not any("Tavily" in label for label in labels)
     assert any("🔕" in label for label in labels)
     assert "待配置" in latest(tg)["text"]
     code = search_menu._code("openai")
