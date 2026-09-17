@@ -139,6 +139,18 @@ def _num(v: Any) -> float | None:
         return None
 
 
+# 智谱业务码：实测成功为 200，失败为 500（HTTP 仍是 200）。只按白名单判定成功，
+# 未知码一律按失败处理并保留上次快照——宁可显示旧数据，也不用空数据覆盖。
+_ZHIPU_SUCCESS_CODES = (0, 200)
+
+
+def _is_business_success(code: Any) -> bool:
+    value = _num(code)
+    if value is not None:
+        return value in _ZHIPU_SUCCESS_CODES
+    return str(code).strip().lower() in ("ok", "success", "true")
+
+
 def _pick(d: dict, *names: str) -> Any:
     for n in names:
         if d.get(n) is not None:
@@ -335,6 +347,14 @@ def parse_payload(spec: AdapterSpec, payload: Any, *, kind: str | None = None) -
         for k in ("used", "usage", "remaining", "limit"):
             if usage.get(k) is not None: out["counters"].append({"label": k, "value": str(usage[k])})
     elif spec.adapter == "zhipu-coding":
+        # 智谱在 HTTP 200 上仍可能返回业务失败（实测 code=500/success=false，
+        # 且 data.limits 缺失）。必须在解析前识别，否则三类端点各解析出一个
+        # 空结果，_merge 会得到「无 windows 且无 failures」的成功快照，
+        # 从而覆盖掉上一次可用数据。
+        if kind in (None, "quota", "model", "tool"):
+            code = _pick(root, "code")
+            if code is not None and not _is_business_success(code):
+                raise BusinessError(f"智谱用量接口返回业务错误（code={code}）")
         if kind in (None, "quota"):
             limits = data.get("limits") if isinstance(data.get("limits"), list) else []
             for item in limits:
@@ -413,6 +433,18 @@ class ProviderUsageError(RuntimeError):
         self.failure = failure
 
 
+class BusinessError(RuntimeError):
+    """HTTP 200 但业务码表示失败（如智谱 code=500）。
+
+    必须在解析前抛出：否则空 ``limits`` 会被当成一次成功的「没有额度」，
+    用它覆盖掉上一次可用的快照，界面上表现为用量突然消失。
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 def _merge(spec: AdapterSpec, parts: list[dict], failures: list[UpstreamFailure]) -> dict:
     out = _base(spec)
     for part in parts:
@@ -448,6 +480,7 @@ def _friendly_error(exc: BaseException) -> tuple[str, int | None]:
         if status >= 500: return "上游服务暂时不可用", retry
         return f"上游返回 HTTP {status}", retry
     if isinstance(exc, (httpx.TimeoutException, TimeoutError)): return "上游请求超时", None
+    if isinstance(exc, BusinessError): return exc.message, None
     return "上游用量暂时获取失败", None
 
 

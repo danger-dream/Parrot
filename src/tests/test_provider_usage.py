@@ -190,6 +190,75 @@ def test_failure_retains_success_cache_and_is_secret_free(m):
 
 
 @pytest.mark.asyncio
+async def test_zhipu_business_error_preserves_last_good_snapshot(m, monkeypatch):
+    """HTTP 200 + 业务 code=500 必须视为失败，不得用空快照覆盖上次可用数据。
+
+    实测智谱监控接口在故障时返回 HTTP 200，body 为
+    ``{"code": 500, "msg": "Internal service error", "success": false}`` 且无
+    ``data.limits``。若按成功解析，三类端点各得空结果、无 failures，界面上的
+    用量会突然消失。
+    """
+    pu, db = m["provider_usage"], m["state_db"]
+    ch = _ch("zhipu", "coding-global", key="business-error")
+    aid, spec = pu.account_id(ch), pu.spec_for(ch)
+
+    # 先写入一次可用快照。
+    good = pu._merge(spec, [pu.parse_payload(
+        spec, {"code": 200, "success": True,
+               "data": {"limits": [{"type": "TOKENS_LIMIT", "unit": 3, "number": 5,
+                                    "percentage": 42}]}},
+        kind="quota")], [])
+    db.provider_usage_save_success(aid, spec.adapter, good)
+
+    async def business_fail(client, url, key, *, raw_auth=False):
+        return {"code": 500, "msg": "Internal service error", "success": False}
+
+    monkeypatch.setattr(pu, "_get", business_fail)
+    with pytest.raises(pu.ProviderUsageError) as caught:
+        await pu.fetch(spec, "key")
+    assert caught.value.failure.message == "智谱用量接口返回业务错误（code=500）"
+
+    # fetch 只负责抛错；上次快照不得被这次失败破坏（落盘由 worker 的
+    # provider_usage_save_error 负责，它保留原 snapshot_json 只更新 last_error）。
+    row = db.provider_usage_load(aid)
+    assert json.loads(row["snapshot_json"]) == good
+
+    # worker 的失败落盘路径：保留快照本体，只叠加错误信息。
+    db.provider_usage_save_error(aid, spec.adapter, caught.value.failure.message, None)
+    after = db.provider_usage_load(aid)
+    assert json.loads(after["snapshot_json"]) == good
+    assert after["last_error"] == "智谱用量接口返回业务错误（code=500）"
+
+
+def test_zhipu_business_code_success_and_failure_are_distinguished(m):
+    """业务码白名单：200/0 为成功，500 及未知码按失败处理。"""
+    pu = m["provider_usage"]
+    spec = pu.spec_for(_ch("zhipu", "coding-global"))
+    limits = [{"type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 42}]
+
+    parsed = pu.parse_payload(spec, {"code": 200, "success": True, "data": {"limits": limits}}, kind="quota")
+    assert [w["id"] for w in parsed["windows"]] == ["tokens_5h"]
+
+    for bad in ({"code": 500, "success": False, "msg": "Internal service error"},
+                {"code": 429, "success": False},
+                {"code": "500", "success": False},
+                {"code": 500, "success": False, "data": {"limits": []}}):
+        with pytest.raises(pu.BusinessError):
+            pu.parse_payload(spec, bad, kind="quota")
+
+    # 无业务码字段时不误判（保持原有宽松解析，不影响旧形态响应）。
+    assert pu.parse_payload(spec, {"limits": limits}, kind="quota")["windows"]
+
+
+def test_business_error_maps_to_readable_message(m):
+    """业务错误必须给出可读文案，而不是通用兜底。"""
+    pu = m["provider_usage"]
+    message, retry = pu._friendly_error(pu.BusinessError("智谱用量接口返回业务错误（code=500）"))
+    assert message == "智谱用量接口返回业务错误（code=500）"
+    assert retry is None
+
+
+@pytest.mark.asyncio
 async def test_zhipu_all_failed_preserves_429_retry_after_delta_and_http_date(m, monkeypatch):
     pu = m["provider_usage"]
     spec = pu.spec_for(_ch("zhipu", "coding-cn"))
