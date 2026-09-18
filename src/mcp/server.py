@@ -265,7 +265,12 @@ def _extract_arguments(arguments: dict) -> dict:
     return payload
 
 
-async def _run_search(tool_name: str, arguments: dict, *, request_id: str) -> dict:
+async def _run_search(tool_name: str, arguments: dict, *, request_id: str) -> tuple[dict, dict]:
+    """执行搜索/抓取，返回 (给模型看的结果, 服务端保留的遥测字段)。
+
+    来源标识与每次尝试遥测**不交给模型**（``_model_visible_search_result`` 会剥掉），
+    但日志需要它们，所以在剥除前取出来单独返回。
+    """
     source = _apply_source(arguments, kind="search")
     if tool_name == "web_search":
         result = await search_service.search(
@@ -277,10 +282,21 @@ async def _run_search(tool_name: str, arguments: dict, *, request_id: str) -> di
             _extract_arguments(arguments), request_id=request_id,
             backend_id=source, origin="mcp",
         )
+    attempts = result.get("attempts") if isinstance(result.get("attempts"), list) else []
+    # 优先取最终成功那一次尝试的来源：搜索可以合法地跨来源重试，最后一次才是实际出结果的。
+    final = next((a for a in reversed(attempts) if isinstance(a, dict)), {})
+    telemetry = {
+        "source_id": result.get("backend_id") or final.get("backend_id"),
+        "source_type": result.get("provider") or final.get("provider"),
+        "result_count": len(result.get("results") or []) if isinstance(result.get("results"), list) else 0,
+    }
+    if result.get("model"):
+        telemetry["model"] = result["model"]
+
     # 只把模型有权看到的字段交出去：来源标识、每次尝试遥测与计费事实留在服务端。
     from ..local_web_tools import _model_visible_search_result
 
-    return _model_visible_search_result(result, "search" if tool_name == "web_search" else "extract")
+    return _model_visible_search_result(result, "search" if tool_name == "web_search" else "extract"), telemetry
 
 
 def _key_secret(key_name: Optional[str]) -> str:
@@ -496,12 +512,7 @@ async def _dispatch(tool_name: str, arguments: dict, *, key_name: Optional[str],
                     base_url: str, request_id: str) -> tuple[Any, dict[str, Any]]:
     """执行一个工具，返回 (结果, 日志附加字段)。"""
     if tool_name in ("web_search", "web_fetch"):
-        result = await _run_search(tool_name, arguments, request_id=request_id)
-        extra: dict[str, Any] = {
-            "source_id": result.get("backend_id"),
-            "source_type": result.get("provider"),
-            "result_count": len(result.get("results") or []) if isinstance(result.get("results"), list) else 0,
-        }
+        result, extra = await _run_search(tool_name, arguments, request_id=request_id)
         return result, extra
     if tool_name in ("image_generate", "image_edit"):
         return await _run_image(tool_name, arguments, key_name=key_name, base_url=base_url)
@@ -596,6 +607,12 @@ async def on_call_tool(ctx: ServerRequestContext, params: types.CallToolRequestP
     extra = dict(extra or {})
     if "result_bytes" not in extra:
         extra["result_bytes"] = len(text.encode("utf-8"))
+    # 结果正文单独存（与摘要分表），供 TG 详情页查看"模型实际看到了什么"。
+    # 受 logStoreBodies 控制；存失败不影响工具调用本身。
+    try:
+        await asyncio.to_thread(log_db.save_mcp_call_detail, handle, result)
+    except Exception:
+        pass
     await finish("success", extra=extra)
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=text)],

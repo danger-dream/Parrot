@@ -55,7 +55,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 - **模型映射 & 入口默认模型**：三条入口（anthropic / openai-chat / openai-responses）各自独立维护 `别名 → 真实模型` 表和默认模型；下游客户端发别名、代理改写成真实名再走调度，上游发新模型时**改 TG bot 即生效，无需重启客户端**
 - **出站网络设置**：支持在 TG「系统设置 → 网络设置」里配置 DNS 与 SOCKS5。DNS 默认 `8.8.8.8`，首次启动可从系统 DNS 同步一次；DNS 支持普通 IP/域名、DoT（`dot://...`）和 DoH（`https://.../dns-query`），DNS 服务器域名本身用系统 DNS 解析避免套娃。启用 SOCKS5 后所有出站 HTTP 请求走 SOCKS5，代理地址若为域名则使用配置 DNS 解析，保存前会检测并二次确认。内置「网络检测」后台监控，可按间隔检测 DNS / SOCKS5 / 渠道 TCP 连通性 / OpenAI、Claude、Cloudflare 核心上游，并在失败/恢复边沿各通知一次。
 - **多媒体日志与媒体缓存**：GPT/Grok 图片及 Grok 视频任务统一写入独立 `image_logs.db`，不污染文本请求日志；视频轮询只更新原任务。开启缓存后，GPT/Grok 图片与已完成的 Grok 视频共用 `images/` 缓存和清理策略，TG 管理员可在「最近日志 → 多媒体日志」查看仍存在的图片或视频。
-- **MCP 服务**：`POST /mcp` 对外提供搜索与媒体工具，供任意 MCP 客户端接入。工具与 HTTP 入口共用同一套实现、同一套开关（`mcp.enabled` / `mcp.tools` / `apiKeys.<name>.allowMcp` / `mcpTools`）和同一份资源 URL 生成逻辑，因此权限、渠道选择、日志与缓存完全一致。工具说明中的可用来源在每次 `tools/list` 时按当前配置实时计算，上游增删来源后模型立即看到最新列表。调用事实独立记录在 `mcp_call_log`（含未触达上游的拒绝）。TG 管理员可在「系统设置 → MCP 服务」开关服务并查看调用日志，工具与访问 Key 在「API Key 管理」按 Key 配置。
+- **MCP 服务**：`POST /mcp` 对外提供搜索与媒体工具，供任意 MCP 客户端接入。工具与 HTTP 入口共用同一套实现、同一套开关（`mcp.enabled` / `mcp.tools` / `apiKeys.<name>.allowMcp` / `mcpTools`）和同一份资源 URL 生成逻辑，因此权限、渠道选择、日志与缓存完全一致。工具说明中的可用来源在每次 `tools/list` 时按当前配置实时计算，上游增删来源后模型立即看到最新列表。调用事实独立记录在 `mcp_call_log`（含未触达上游的拒绝），工具返回的内容另存 `mcp_call_detail`（与摘要分表，受「数据留存 → 保存完整请求」控制）。TG 管理员可在「系统设置 → MCP 服务」开关服务、查看接入配置与调用统计，并在调用日志里逐条查看**搜了什么、用的哪个引擎、结果是什么**；工具与访问 Key 在「API Key 管理」按 Key 配置。
 
 **Telegram 图形管理面板**
 

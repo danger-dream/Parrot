@@ -316,3 +316,239 @@ def test_mcp_call_stats_aggregate_per_tool():
 def test_finish_mcp_call_tolerates_a_missing_handle():
     # 日志写入失败不得让工具调用本身失败。
     log_db.finish_mcp_call(None, status="success")
+
+
+# ── 结果内容留存（与摘要分表，受 logStoreBodies 控制） ────────────────────
+
+
+def _record(tool="web_search", status="success", params=None, **finish_kw):
+    call_id = f"d-{tool}-{status}-{len(log_db.mcp_call_entries(0))}"
+    handle = log_db.record_mcp_call(
+        call_id=call_id, tool_name=tool, api_key_name="tk", params=params or {"query": "q"},
+    )
+    log_db.finish_mcp_call(handle, status=status, **finish_kw)
+    return handle, call_id
+
+
+def test_result_content_is_stored_alongside_the_summary():
+    handle, call_id = _record()
+    payload = {"query": "hello", "results": [{"title": "t", "url": "u"}]}
+    log_db.save_mcp_call_detail(handle, payload)
+    row = log_db.mcp_call_detail(call_id)
+    assert row is not None
+    assert json.loads(row["result_body"]) == payload
+
+
+def test_result_content_survives_only_while_bodies_are_enabled():
+    # 关闭正文保存后不得再写入新内容；已存在的内容不受影响（与实时日志同口径）。
+    handle, call_id = _record()
+    config.update(lambda cfg: cfg.__setitem__("logStoreBodies", False))
+    try:
+        log_db.save_mcp_call_detail(handle, {"query": "secret"})
+        assert log_db.mcp_call_detail(call_id) is None
+    finally:
+        config.update(lambda cfg: cfg.__setitem__("logStoreBodies", True))
+
+    log_db.save_mcp_call_detail(handle, {"query": "visible"})
+    assert log_db.mcp_call_detail(call_id) is not None
+
+
+def test_result_content_is_absent_for_denied_calls():
+    # 被拒的调用没有结果可存；详情页据此提示而不是显示空白。
+    _, call_id = _record(tool="image_generate", status="denied",
+                         error_code="tool_not_allowed")
+    assert log_db.mcp_call_detail(call_id) is None
+
+
+def test_result_content_is_idempotent_per_call():
+    handle, call_id = _record()
+    log_db.save_mcp_call_detail(handle, {"query": "first"})
+    log_db.save_mcp_call_detail(handle, {"query": "second"})
+    assert json.loads(log_db.mcp_call_detail(call_id)["result_body"]) == {"query": "second"}
+
+
+def test_status_counts_keep_denied_and_timeout_separate_from_failure():
+    """汇总必须显式区分拒绝/超时，否则它们在总数里静默消失。"""
+    _record(tool="web_fetch", status="success")
+    _record(tool="web_fetch", status="error", error_code="tool_error")
+    _record(tool="image_generate", status="denied", error_code="tool_not_allowed")
+    _record(tool="video_generate", status="timeout", error_code="timeout")
+    counts = log_db.mcp_call_status_counts(0)
+    assert counts.get("success", 0) >= 1
+    assert counts.get("error", 0) >= 1
+    assert counts.get("denied", 0) >= 1
+    assert counts.get("timeout", 0) >= 1
+    # 总数就是各状态之和，不存在被漏掉的状态
+    assert sum(counts.values()) >= 4
+
+
+def test_control_summary_reports_every_status_bucket():
+    from src.management_control.auxiliary.common import telegram_context
+    from src.management_control.mcp import DEFAULT_MCP_CONTROL
+
+    _record(tool="web_search", status="success", result_count=2)
+    _record(tool="web_search", status="denied", error_code="tool_not_allowed")
+    summary = DEFAULT_MCP_CONTROL.summary(telegram_context(1), period="month")
+    assert summary["calls"] == (
+        summary["success"] + summary["failed"] + summary["denied"]
+        + summary["timeout"] + summary["running"]
+    )
+    assert summary["success"] >= 1 and summary["denied"] >= 1
+    names = {t["toolName"] for t in summary["byTool"]}
+    assert "web_search" in names
+
+
+# ── TG 菜单渲染 ──────────────────────────────────────────────────────────
+
+
+def _menu():
+    from src.telegram.menus import mcp_menu
+
+    return mcp_menu
+
+
+def test_menu_main_page_shows_status_install_help_and_today_stats():
+    menu = _menu()
+    from src.management_control.auxiliary.common import telegram_context
+
+    _record(tool="web_search", status="success")
+    text, kb = menu._main_text_and_kb(1)
+    assert "MCP 服务" in text
+    assert "端点：" in text
+    assert "接入方式" in text          # 安装说明
+    assert "mcpServers" in text        # 可直接复制的配置
+    assert "今日调用" in text          # 简单统计
+    rows = kb["inline_keyboard"]
+    # 状态与日志同排；两个返回按钮同排。
+    assert [b["callback_data"] for b in rows[0]] == ["mcp:toggle", "mcp:logs:1"]
+    assert [b["callback_data"] for b in rows[1]] == ["menu:settings", "menu:main"]
+
+
+def test_menu_list_puts_the_query_source_and_status_on_the_row():
+    """列表必须直接显示"搜了什么、用的什么引擎"，而不是只给编号。"""
+    menu = _menu()
+
+    _record(tool="web_search", status="success", params={"query": "今天 AI 新闻"},
+            result_count=10, result_bytes=2048, source_id="xai", elapsed_ms=14830)
+    rows, summary = menu._log_page(1, 1)
+    text = menu._render_list(rows, page=1, pages=1, summary=summary)
+    assert "今天 AI 新闻" in text      # 查询词
+    assert "xai" in text               # 引擎
+    assert "网络搜索" in text          # 工具中文名
+    assert "今日" in text
+
+
+def test_menu_list_localizes_tool_names_in_the_summary():
+    menu = _menu()
+
+    _record(tool="image_generate", status="success", params={"prompt": "猫"})
+    rows, summary = menu._log_page(1, 1)
+    text = menu._render_list(rows, page=1, pages=1, summary=summary)
+    # 汇总行不得出现英文工具 id
+    assert "image_generate" not in text
+    assert "图片生成" in text
+
+
+def test_menu_detail_renders_params_for_a_denied_call():
+    menu = _menu()
+
+    _, call_id = _record(tool="image_generate", status="denied",
+                         params={"prompt": "一只猫"},
+                         error_code="tool_not_allowed",
+                         error_message="未授权使用 image_generate。")
+    row = next(r for r in menu._CONTROL.logs(
+        __import__("src.management_control.auxiliary.common", fromlist=["telegram_context"])
+        .telegram_context(1), period="month", page_size=200)["items"]
+        if r["callId"] == call_id)
+    text = menu._render_detail(row)
+    assert "图片生成" in text
+    assert "tool_not_allowed" in text
+    assert "一只猫" in text            # 参数要被看见
+
+
+def test_menu_result_page_expands_search_results_readably():
+    """搜索结果要以人可读的条目展开，而不是把原始 JSON 挤成一行。"""
+    menu = _menu()
+
+    body = json.dumps({
+        "query": "今天 AI 新闻",
+        "results": [
+            {"title": "OpenAI 发布新模型", "url": "https://a.com/1", "snippet": "多模态提升"},
+            {"title": "AI 监管新规", "url": "https://b.com/2", "snippet": "欧盟通过"},
+        ],
+    }, ensure_ascii=False)
+    pretty = menu._pretty_result(body)
+    assert "查询：今天 AI 新闻" in pretty
+    assert "结果 2 条" in pretty
+    assert "1. OpenAI 发布新模型" in pretty
+    assert "https://a.com/1" in pretty
+    assert "多模态提升" in pretty
+
+
+def test_menu_result_page_falls_back_to_content_and_raw_text():
+    menu = _menu()
+    # 抓取工具返回长正文：直接显示，不做 JSON 展开。
+    assert menu._pretty_result(json.dumps({"url": "https://x", "content": "正文" * 5},
+                                          ensure_ascii=False)).startswith("正文")
+    # 无法解析时原样返回，绝不因排版丢内容。
+    assert menu._pretty_result("not json at all") == "not json at all"
+
+
+def test_menu_result_is_paged_for_long_content():
+    menu = _menu()
+    long_body = json.dumps({"content": "字" * 9000}, ensure_ascii=False)
+    pages = menu._chunk_pages(menu._pretty_result(long_body))
+    assert len(pages) > 1
+    # 分页不丢字符
+    assert "".join(pages) == menu._pretty_result(long_body)
+
+
+def test_menu_handles_the_result_callback_action():
+    menu = _menu()
+    assert menu.handle_callback(1, 1, "cb", "mcp:result:shortcode:1:1") is True
+
+
+def test_menu_ignores_foreign_callbacks():
+    menu = _menu()
+    assert menu.handle_callback(1, 1, "cb", "srch:show") is False
+
+
+def test_search_records_the_engine_without_exposing_it_to_the_model():
+    """日志要能回答"用的哪个引擎"，但来源标识不能交给模型。
+
+    `_model_visible_search_result()` 有意剥掉 backend_id/provider/attempts，
+    所以这些必须在剥除**之前**取出来单独返回，否则列表里的来源永远是空的。
+    """
+    import asyncio
+
+    from src.mcp import server as mcp_server
+    from src import search_service
+
+    async def fake_search(*args, **kwargs):
+        return {
+            "query": "q", "results": [{"title": "t"}],
+            "backend_id": "xai", "provider": "xai", "model": "grok-4",
+            "attempts": [
+                {"backend_id": "tavily", "provider": "tavily"},
+                {"backend_id": "xai", "provider": "xai"},
+            ],
+        }
+
+    original = search_service.search
+    search_service.search = fake_search
+    try:
+        visible, telemetry = asyncio.run(
+            mcp_server._run_search("web_search", {"query": "q"}, request_id="r1")
+        )
+    finally:
+        search_service.search = original
+
+    # 遥测取最终成功那一次尝试的来源（搜索可以合法地跨来源重试）
+    assert telemetry["source_id"] == "xai"
+    assert telemetry["source_type"] == "xai"
+    assert telemetry["result_count"] == 1
+    assert telemetry["model"] == "grok-4"
+    # 模型侧干净：没有来源标识、没有尝试明细
+    assert "backend_id" not in visible
+    assert "provider" not in visible
+    assert "attempts" not in visible

@@ -160,6 +160,46 @@ class MCPControl(DomainControl):
             row["label"] = _tool_label(row.get("tool_name"))
         return {"period": period, "items": rows}
 
+    def summary(self, context, *, period="today"):
+        """一次调用清单所需的汇总：总数、按状态、按工具、平均耗时。
+
+        直接由 stats() + logs() 的既有口径汇总，不新造统计口径；分页大小
+        取整页，因此超出一页的极长列表不会让汇总缺失状态分布。
+        """
+        self._read(context)
+        since = _period_start(period)
+        rows = log_db.mcp_call_stats(since)
+        status_counts = log_db.mcp_call_status_counts(since)
+        elapsed_sum = sum(int(row.get("elapsed_sum") or 0) for row in rows)
+        elapsed_n = sum(int(row.get("elapsed_n") or 0) for row in rows)
+        by_tool = [
+            {"toolName": str(row.get("tool_name") or ""),
+             "calls": int(row.get("calls") or 0)}
+            for row in rows
+        ]
+        return {
+            "period": period,
+            "calls": sum(status_counts.values()),
+            "success": status_counts.get("success", 0),
+            "failed": status_counts.get("error", 0),
+            "denied": status_counts.get("denied", 0),
+            "timeout": status_counts.get("timeout", 0),
+            "running": status_counts.get("running", 0),
+            "avgElapsedMs": int(elapsed_sum / elapsed_n) if elapsed_n else 0,
+            "lastAt": max((float(row.get("last_at") or 0.0) for row in rows), default=0.0),
+            "byTool": by_tool,
+        }
+
+    def result_body(self, context, call_id):
+        """某次调用留存的结果正文；未留存或已清理时返回 None。"""
+        self._read(context)
+        row = log_db.mcp_call_detail(str(call_id or ""))
+        if row is None:
+            return None
+        return {"callId": str(row.get("call_id") or ""),
+                "createdAt": float(row.get("created_at") or 0.0),
+                "body": row.get("result_body")}
+
 
 def _period_start(period: str) -> float:
     now = time.time()

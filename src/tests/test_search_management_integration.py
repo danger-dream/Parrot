@@ -37,8 +37,11 @@ SYSTEM_CASE_IDS = (
     "TG-SYS-08.002-concurrency-active", "TG-SYS-08.004-limiter-active",
     "TG-SYS-08.006-limiter-durations",
 )
-SEARCH_BUTTON_ROW = [{"text": "🔎 搜索工具", "callback_data": "srch:show"}]
-MCP_BUTTON_ROW = [{"text": "🔌 MCP 服务", "callback_data": "mcp:show"}]
+# 搜索工具与 MCP 服务现在是同一行（与系统设置里其他成对按钮一致）。
+SEARCH_MCP_BUTTON_ROW = [
+    {"text": "🔎 搜索工具", "callback_data": "srch:show"},
+    {"text": "🔌 MCP 服务", "callback_data": "mcp:show"},
+]
 
 
 def test_exact_search_route_methods_paths_and_retired_ag_absence():
@@ -120,16 +123,14 @@ def test_system_golden_difference_is_only_reviewed_entries(case_id, monkeypatch)
         if not payload.get("text", "").startswith("⚙ <b>系统设置</b>"):
             continue
         keyboard = payload["reply_markup"]["inline_keyboard"]
-        # Two reviewed rows were added to this page: the search menu entry and the
-        # MCP service entry, each on its own row immediately after the previous one.
+        # 相对冻结归档只多了一行：搜索工具与 MCP 服务并排的那一行。
         assert len(keyboard) == 8
         assert keyboard[-1] == [{"text": "🔁 重试设置", "callback_data": "sys:show:retry"},
                                 {"text": "◀ 返回主菜单", "callback_data": "menu:main"}]
-        keyboard.insert(7, copy.deepcopy(SEARCH_BUTTON_ROW))
-        keyboard.insert(8, copy.deepcopy(MCP_BUTTON_ROW))
+        keyboard.insert(7, copy.deepcopy(SEARCH_MCP_BUTTON_ROW))
         insertion_indices.append(index)
     assert insertion_indices
-    print(f"REVIEWED {case_id}: tgApi indices {insertion_indices}; only inline_keyboard[7:9] added")
+    print(f"REVIEWED {case_id}: tgApi indices {insertion_indices}; only inline_keyboard[7] added")
     scenario = archived["entry"]["scenario"]
     env = SystemEnv(archived, monkeypatch)
     (SETTINGS_RUNNERS | RUNTIME_RUNNERS)[scenario](env)

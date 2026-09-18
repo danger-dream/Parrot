@@ -79,7 +79,7 @@ class RequestLogHandle:
 
 @dataclass(frozen=True)
 class RowLogHandle:
-    table: Literal["retry_chain", "proxy_chain", "local_web_log", "search_call_log"]
+    table: Literal["retry_chain", "proxy_chain", "local_web_log", "search_call_log", "mcp_call_log"]
     row_id: int
     request_id: str
     db: LogDbRef
@@ -405,6 +405,16 @@ def _schema_sql() -> str:
     CREATE INDEX IF NOT EXISTS idx_mcp_call_key ON mcp_call_log(api_key_name, created_at);
     CREATE INDEX IF NOT EXISTS idx_mcp_call_tool ON mcp_call_log(tool_name, created_at);
     CREATE INDEX IF NOT EXISTS idx_mcp_call_id ON mcp_call_log(call_id);
+
+    -- MCP 工具返回内容的大字段，与 mcp_call_log 分表，理由同 request_detail：
+    -- 列表与统计只扫摘要表，不把工具返回的正文一起读出来。写入受
+    -- logStoreBodies 控制，与实时日志正文同一开关。
+    CREATE TABLE IF NOT EXISTS mcp_call_detail (
+      call_id          TEXT PRIMARY KEY,
+      created_at       REAL NOT NULL,
+      result_body      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_mcp_call_detail_started ON mcp_call_detail(created_at);
     """
 
 
@@ -456,7 +466,7 @@ def _request_handle(value: str | RequestLogHandle) -> RequestLogHandle:
 def _row_handle(
     value: int | RowLogHandle,
     *,
-    table: Literal["retry_chain", "proxy_chain", "local_web_log", "search_call_log"],
+    table: Literal["retry_chain", "proxy_chain", "local_web_log", "search_call_log", "mcp_call_log"],
     request: RequestLogHandle | None = None,
 ) -> RowLogHandle:
     if isinstance(value, RowLogHandle):
@@ -2935,6 +2945,65 @@ def finish_mcp_call(
         conn.commit()
 
 
+def save_mcp_call_detail(
+    handle: int | RowLogHandle | None,
+    result_body: Any = None,
+    *,
+    created_at: float | None = None,
+) -> None:
+    """Persist the tool's returned content for one MCP call.
+
+    Only the content the model actually saw is stored (``_model_visible_search_result``
+    output for search, the tool result for media).  Writes are gated by the same
+    ``logStoreBodies`` switch as the request/response bodies, so turning it off
+    stops new content from being kept without touching existing rows.
+    """
+    if handle is None or result_body is None:
+        return
+    if not _store_log_bodies():
+        return
+    row_handle = _row_handle(handle, table="mcp_call_log")
+    if isinstance(result_body, (dict, list)):
+        try:
+            text = json.dumps(result_body, ensure_ascii=False, default=str)
+        except Exception:
+            return
+    else:
+        text = str(result_body)
+    ref = row_handle.db or _db_ref_for_timestamp(created_at)
+    with _write_lock:
+        conn = _get_conn_for_ref(ref)
+        conn.execute(
+            """INSERT INTO mcp_call_detail (call_id, created_at, result_body)
+               VALUES (?,?,?)
+               ON CONFLICT(call_id) DO UPDATE SET result_body=excluded.result_body""",
+            (str(row_handle.request_id), float(created_at or time.time()), text),
+        )
+        conn.commit()
+
+
+def mcp_call_detail(call_id: str) -> dict | None:
+    """Read one MCP call's stored content, or ``None`` when not retained."""
+    key = str(call_id or "")
+    if not key:
+        return None
+    for conn, close_fn in _iter_month_conns_all(0.0):
+        try:
+            if "mcp_call_detail" not in _existing_tables(conn):
+                continue
+            row = conn.execute(
+                "SELECT call_id, created_at, result_body FROM mcp_call_detail WHERE call_id=?",
+                (key,),
+            ).fetchone()
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+        if row is not None:
+            return dict(row)
+    return None
+
+
 def mcp_call_entries(
     since_ts: float,
     *,
@@ -3006,6 +3075,34 @@ def mcp_call_stats(since_ts: float) -> list[dict]:
                 bucket[field] += int(row[field] or 0)
             bucket["last_at"] = max(bucket["last_at"], float(row["last_at"] or 0.0))
     return sorted(by_tool.values(), key=lambda item: item["calls"], reverse=True)
+
+
+def mcp_call_status_counts(since_ts: float) -> dict[str, int]:
+    """Count MCP calls per status since ``since_ts`` (cross-month).
+
+    ``stats()`` only splits success/error per tool, but the log also carries
+    ``denied`` (refused before any upstream call), ``timeout`` and ``running``.
+    The summary needs each bucket explicitly rather than inferring it by
+    subtraction, otherwise refusals and timeouts silently disappear.
+    """
+    counts: dict[str, int] = {}
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            if "mcp_call_log" not in _existing_tables(conn):
+                continue
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM mcp_call_log"
+                " WHERE created_at>=? GROUP BY status",
+                (float(since_ts),),
+            ).fetchall()
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+        for row in rows:
+            key = str(row["status"] or "")
+            counts[key] = counts.get(key, 0) + int(row["n"] or 0)
+    return counts
 
 
 def finish_success(
