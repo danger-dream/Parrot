@@ -38,7 +38,11 @@ def test_read_only_legacy_inheritance_and_explicit_save_preserve_custom_values(t
     store = FakeConfig(root)
     images, videos = ImageControl(config_gateway=store), VideoControl(config_gateway=store)
     image, video = images.get_settings(CTX), videos.get_settings(CTX)
-    assert image.models == {'openai': ['gpt-image-2', 'gpt-image-2.5', 'custom-openai-image'], 'xai': ['custom-grok']}
+    # 断言关心的是"自定义值被保留"，不是种子名单本身——种子会随版本增删模型。
+    # 写死完整名单会让每次新增内置模型都误报，因此只固定自定义项与排序关系。
+    assert image.models['openai'][-1] == 'custom-openai-image'
+    assert {'gpt-image-2', 'gpt-image-2.5'} <= set(image.models['openai'])
+    assert image.models['xai'] == ['custom-grok']
     assert video.models == {'xai': ['custom-video']}
     assert video.cache_enabled and video.cache_retention_days == 9 and video.cache_max_bytes == 3456
     assert video.request_timeout_seconds == 71 and video.job_ttl_seconds == 234

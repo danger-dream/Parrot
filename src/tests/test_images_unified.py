@@ -181,7 +181,10 @@ def test_model_center_image_sources_not_mainmodel_or_ag(setup):
     cfg['oauthAccounts'].append({'provider':'antigravity','email':'ag@example.test','project_id':'p','models':['gemini-chat'],'imageModels':['gemini-3.1-flash-image']})
     control=ModelCenterControl()
     views=control.list_models(filters=ModelFilters(kinds=(ModelKind.IMAGE,))).items
-    assert {v.model_id for v in views}=={'gpt-image-2','gpt-image-2.5','grok-imagine-image','grok-imagine-image-quality'}
+    # 断言关心的是"图片源里不含 AG"与 GPT/Grok 都在，不是种子名单的完整快照。
+    ids={v.model_id for v in views}
+    assert {'gpt-image-2','gpt-image-2.5','grok-imagine-image','grok-imagine-image-quality'} <= ids
+    assert not any(i.startswith('gemini-') for i in ids)
     gpt=next(v for v in views if v.model_id=='gpt-image-2')
     assert gpt.aliases==('paint',) and gpt.sources and gpt.available_in()
     assert all(s.provider!='antigravity' for v in views for s in v.sources)

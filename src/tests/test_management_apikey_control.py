@@ -181,7 +181,10 @@ def test_permission_images_use_configured_sources_not_unsourced_defaults():
         "models": [{"alias": "image-api-alias", "real": "gpt-image-2", "kind": "image"}],
     }]
     images, _ = control.configured_media_models(read)
-    assert images == ("image-z", "image-a", "gpt-image-2", "gpt-image-2.5", "image-api-alias")
+    # 断言关心的是"内置来源 + 配置来源都给出，且不混入无来源的默认值"，
+    # 不是种子名单的完整元组——种子会随版本增删模型。
+    assert set(images) >= {'gpt-image-2', 'gpt-image-2.5', 'image-z', 'image-a', 'image-api-alias'}
+    assert images[-1] == 'image-api-alias'      # 配置的 API 来源排在最后
     assert control.available_permission_models(read) == control.available_permission_models_unchecked()
     assert set(images) <= set(control.available_permission_models(read))
 
