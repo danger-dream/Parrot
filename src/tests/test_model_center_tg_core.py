@@ -193,7 +193,7 @@ class _Control:
         # Media tabs are purpose panels, not filtered model-list fixtures.
         media_settings = SimpleNamespace(enabled=True, cache_enabled=False, cache_path='images',
             cache_retention_days=0, cache_max_bytes=0, models={}, request_timeout_seconds=180,
-            job_ttl_seconds=10800, revision='media-r1')
+            job_ttl_seconds=10800, revision='media-r1', default_model='')
         self.images = SimpleNamespace(get_settings=lambda ctx: media_settings, list_sources=lambda ctx: [],
             statistics=lambda ctx: {'models': [], 'cache': {'files': 0, 'bytes': 0}})
         self.videos = self.images

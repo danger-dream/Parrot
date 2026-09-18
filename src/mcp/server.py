@@ -240,16 +240,40 @@ def _auto_model(kind: str) -> Optional[str]:
     传 auto 会被 images_openai_compat 判为 unknown image model。
     因此这里替下游把 auto 解析成一个真实模型。
 
+    优先用模型中心配置的默认模型；没配或它当前不可用时，回落到可用列表首项
+    （availability 由 image_catalog/video_models 判定，因此默认模型失效不会
+    把调用卡死，而是按可用列表继续）。
+
     返回 None 表示当前没有任何可用模型；调用方据此给出可读的错误，而不是把
     auto 透下去换回一句"unknown image model"。
     """
     if kind == "image":
         options = catalog.image_sources()
+        configured = _configured_default_model("image")
     elif kind == "video":
         options = catalog.video_sources()
+        configured = _configured_default_model("video")
     else:
         options = catalog.available_engines()
+        configured = ""
+    if configured and configured in options:
+        return configured
     return options[0] if options else None
+
+
+def _configured_default_model(kind: str) -> str:
+    """读取模型中心里该媒体类型的默认模型；出错时按未配置处理。
+
+    直接读配置（``images.defaultModel`` / ``videos.defaultModel``），不构造管理
+    上下文——这里只是执行期的值读取，没有管理动作。默认模型只是一个偏好：
+    配置不可读不应该让工具本身失败。
+    """
+    try:
+        from .. import media_config
+
+        return str(media_config.settings(kind).get("defaultModel") or "")
+    except Exception:
+        return ""
 
 
 def _requested_model(arguments: dict, *, kind: str) -> str:

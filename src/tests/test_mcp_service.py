@@ -713,3 +713,70 @@ def test_description_and_enum_agree_on_the_available_sources():
         options = [v for v in enum if v != catalog.AUTO]
         if options:
             assert options[0] in (tool.description or ""), name
+
+
+# ── 默认模型（模型中心配置） ──────────────────────────────────────────────
+
+
+def _set_default_model(kind: str, model: str) -> None:
+    config.update(lambda cfg: cfg.setdefault(
+        "images" if kind == "image" else "videos", {}) .__setitem__("defaultModel", model))
+
+
+def test_auto_model_prefers_the_configured_default():
+    """不指定 source 时用模型中心配置的默认模型，而不是字母序首项。"""
+    from src.mcp import server as mcp_server
+
+    options = catalog.image_sources()
+    if len(options) < 2:
+        pytest.skip("需要至少两个可用图片模型")
+    chosen = options[-1]                       # 故意选一个非首项
+    original = config.get().get("images", {}).get("defaultModel")
+    _set_default_model("image", chosen)
+    try:
+        assert mcp_server._auto_model("image") == chosen
+        assert mcp_server._requested_model({}, kind="image") == chosen
+        assert mcp_server._requested_model({"source": "auto"}, kind="image") == chosen
+        # 显式指定仍然优先于默认模型
+        assert mcp_server._requested_model({"source": options[0]}, kind="image") == options[0]
+    finally:
+        _set_default_model("image", original or "")
+
+
+def test_auto_model_falls_back_when_the_default_is_unavailable():
+    """默认模型当前不可用时回落到可用列表，不把调用卡死。"""
+    from src.mcp import server as mcp_server
+
+    options = catalog.image_sources()
+    if not options:
+        pytest.skip("没有可用图片模型")
+    original = config.get().get("images", {}).get("defaultModel")
+    _set_default_model("image", "一个当前不可用的模型")
+    try:
+        got = mcp_server._auto_model("image")
+        assert got in options
+        assert got != "一个当前不可用的模型"
+    finally:
+        _set_default_model("image", original or "")
+
+
+def test_default_model_is_validated_against_configured_models():
+    """默认模型只能取已配置的模型名，否则会指向一个用不了的模型。"""
+    from src.management_control import ManagementContext, ManagementError
+    from src.management_control.auxiliary.media import ImageControl
+    from src.management_auth import AuthMethod, ManagementPrincipal
+
+    ctx = ManagementContext(
+        request_id="default-model",
+        actor=ManagementPrincipal.administrator(
+            subject_id="admin", auth_method=AuthMethod.MANAGEMENT_KEY),
+    )
+    control = ImageControl()
+    settings = control.get_settings(ctx)
+    with pytest.raises(ManagementError):
+        control.update_settings(ctx, {"defaultModel": "不在名单里的模型"},
+                                expected_revision=settings.revision)
+    # 空串是合法的"清除"，代表回落到自动选择
+    cleared = control.update_settings(ctx, {"defaultModel": ""},
+                                      expected_revision=settings.revision)
+    assert cleared.default_model == ""

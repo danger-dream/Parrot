@@ -40,6 +40,8 @@ class ImageSettings:
     cache_retention_days: int
     cache_max_bytes: int
     revision: str
+    # 未指定模型时用它；空表示按可用列表自动选择。只接受 models 里存在的名字。
+    default_model: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,14 +173,15 @@ class ImageControl:
 
     @staticmethod
     def _dto(value: dict[str, Any]) -> ImageSettings:
-        stable = {key: value.get(key) for key in ('enabled', 'cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes', 'models', 'requestTimeoutSeconds', 'jobTtlSeconds')}
+        stable = {key: value.get(key) for key in ('enabled', 'cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes', 'models', 'requestTimeoutSeconds', 'jobTtlSeconds', 'defaultModel')}
         return ImageSettings(
             enabled=bool(value.get('enabled', True)), cache_enabled=bool(value.get('cacheEnabled', False)),
             models=copy.deepcopy(value.get('models') or {}),
             request_timeout_seconds=int(value.get('requestTimeoutSeconds', 180)),
             job_ttl_seconds=value.get('jobTtlSeconds'), cache_path=str(value.get('cachePath') or 'images'),
             cache_retention_days=int(value.get('cacheRetentionDays') or 0),
-            cache_max_bytes=int(value.get('cacheMaxBytes') or 0), revision=revision_for(stable))
+            cache_max_bytes=int(value.get('cacheMaxBytes') or 0), revision=revision_for(stable),
+            default_model=str(value.get('defaultModel') or ''))
 
     def get_settings(self, context: ManagementContext) -> ImageSettings:
         require(context, Capability.READ)
@@ -209,7 +212,7 @@ class ImageControl:
     ) -> ImageSettings:
         require(context, Capability.WRITE)
         value = copy.deepcopy(patch)
-        allowed = {'enabled', 'cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes', 'models', 'requestTimeoutSeconds'}
+        allowed = {'enabled', 'cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes', 'models', 'requestTimeoutSeconds', 'defaultModel'}
         if self.kind == 'video': allowed.add('jobTtlSeconds')
         unknown = set(value) - allowed
         if unknown: raise invalid_field(sorted(unknown)[0], 'UNKNOWN_FIELD', 'unsupported media setting')
@@ -229,6 +232,17 @@ class ImageControl:
         for field in ('requestTimeoutSeconds', 'jobTtlSeconds'):
             if field in value and (type(value[field]) is not int or not 1 <= value[field] <= 2147483647):
                 raise invalid_field(field, 'OUT_OF_RANGE', 'must be between 1 and 2147483647')
+        if 'defaultModel' in value:
+            # 空串 = 清除，回落到"按可用列表自动选择"。非空必须是已配置的模型名，
+            # 否则默认模型会指向一个用不了的模型，等到调用时才失败。
+            chosen = value['defaultModel']
+            if not isinstance(chosen, str):
+                raise invalid_field('defaultModel', 'INVALID_TYPE', 'must be a string')
+            chosen = chosen.strip()
+            known = {name for names in media_config.model_map(self.kind).values() for name in names}
+            if chosen and chosen not in known:
+                raise invalid_field('defaultModel', 'UNKNOWN_MODEL', 'must be one of the configured models')
+            value['defaultModel'] = chosen
         if "cachePath" in value:
             value["cachePath"] = self._validate_path(value["cachePath"])
         for field, high in (("cacheRetentionDays", 36500), ("cacheMaxBytes", 2**63 - 1)):

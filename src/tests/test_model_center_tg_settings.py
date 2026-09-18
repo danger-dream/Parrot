@@ -63,6 +63,7 @@ class _Images:
             request_timeout_seconds=v.get('requestTimeoutSeconds', 180), job_ttl_seconds=v.get('jobTtlSeconds', 10800),
             cache_path=v["cachePath"], cache_retention_days=v["cacheRetentionDays"],
             cache_max_bytes=v["cacheMaxBytes"], revision=self.revision,
+            default_model=v.get('defaultModel', ''),
         )
 
     def update_settings(self, _ctx, patch, *, expected_revision=None):
