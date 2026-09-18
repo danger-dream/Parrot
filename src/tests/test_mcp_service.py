@@ -552,3 +552,123 @@ def test_search_records_the_engine_without_exposing_it_to_the_model():
     assert "backend_id" not in visible
     assert "provider" not in visible
     assert "attempts" not in visible
+
+
+# ── source 参数的实时 enum ────────────────────────────────────────────────
+
+
+def test_every_tool_exposes_source_as_an_enum_not_free_text():
+    """source 必须是带 enum 的字符串，不能只靠说明文字约束取值。"""
+    from src.mcp import server as mcp_server
+
+    for name in catalog.TOOL_NAMES:
+        if not catalog.accepts_source(name):
+            continue
+        prop = mcp_server.build_tool(name).input_schema["properties"]["source"]
+        assert prop["type"] == "string"
+        assert isinstance(prop.get("enum"), list), name
+        assert prop["enum"], name                      # 空 enum 等于不可选
+        assert catalog.AUTO in prop["enum"], name       # 总要能选"自动"
+
+
+def test_source_enum_matches_the_live_catalogue_per_tool_family():
+    """enum 必须来自当前配置，且按工具类别给出对应的一类上游。"""
+    from src.mcp import server as mcp_server
+
+    def enum_of(name):
+        return mcp_server.build_tool(name).input_schema["properties"]["source"]["enum"]
+
+    assert enum_of("web_search") == [catalog.AUTO, *catalog.available_engines()]
+    assert enum_of("image_generate") == [catalog.AUTO, *catalog.image_sources()]
+    assert enum_of("video_generate") == [catalog.AUTO, *catalog.video_sources()]
+    # 图片与视频不能互相混入
+    assert not set(catalog.image_sources()) & set(catalog.video_sources())
+
+
+def test_source_enum_is_recomputed_with_the_configuration():
+    """上游增删后 enum 必须跟着变，不能是构建时定死的常量。"""
+    from src.mcp import server as mcp_server
+
+    before = mcp_server.build_tool("web_search").input_schema["properties"]["source"]["enum"]
+    # 关掉一个引擎后重新构建，它应从 enum 中消失
+    target = before[1] if len(before) > 1 else None
+    if target is None:
+        pytest.skip("没有可关闭的引擎")
+    from src import search_service
+
+    original = search_service.backend_statuses
+    search_service.backend_statuses = lambda: [
+        {"id": r["id"], "available": r["id"] != target}
+        for r in original()
+    ]
+    try:
+        after = mcp_server.build_tool("web_search").input_schema["properties"]["source"]["enum"]
+    finally:
+        search_service.backend_statuses = original
+    assert target not in after
+
+
+def test_model_parameter_is_gone_and_source_drives_the_model():
+    """媒体工具只保留 source 一个"选上游"参数，且它必须真的生效。"""
+    from src.mcp import server as mcp_server
+
+    for name in ("image_generate", "image_edit", "video_generate"):
+        props = mcp_server.build_tool(name).input_schema["properties"]
+        assert "model" not in props, name
+        assert "source" in props, name
+
+    model = _first_image_model()
+    if model is None:
+        pytest.skip("测试环境未配置图片模型")
+    assert mcp_server._requested_model({"source": model}, kind="image") == model
+    # 省略或 auto 时交给服务端按当前配置决定
+    assert mcp_server._requested_model({}, kind="image") == "auto"
+    assert mcp_server._requested_model({"source": "auto"}, kind="image") == "auto"
+
+
+def _first_image_model():
+    from src.mcp import catalog as _catalog
+
+    sources = _catalog.image_sources()
+    return sources[0] if sources else None
+
+
+def test_legacy_model_argument_still_works_for_in_flight_clients():
+    """升级期间已发出的旧调用仍带 model，不应因此失效。"""
+    from src.mcp import server as mcp_server
+
+    assert mcp_server._requested_model({"model": "gpt-image-2"}, kind="image") == "gpt-image-2"
+    assert mcp_server._requested_model({"model": "auto"}, kind="image") == "auto"
+    # 两者同时出现时以 source 为准（它才是现在对外暴露的那个）。
+    # 用一个真的在可用列表里的模型，否则会被当不可用而报错。
+    model = _first_image_model()
+    if model is not None:
+        assert mcp_server._requested_model(
+            {"source": model, "model": "别的"}, kind="image"
+        ) == model
+
+
+def test_video_status_does_not_advertise_a_source_it_ignores():
+    """video_status 只按 request_id 查询，给它 source 会误导模型。"""
+    from src.mcp import server as mcp_server
+
+    assert not catalog.accepts_source("video_status")
+    props = mcp_server.build_tool("video_status").input_schema["properties"]
+    assert "source" not in props
+    assert "timeout_seconds" in props       # 通用参数仍在
+    assert catalog.live_options("video_status") == ([], "")
+    assert "当前可用" not in mcp_server.build_tool("video_status").description
+
+
+def test_description_and_enum_agree_on_the_available_sources():
+    """说明里列出的可用值必须与 enum 一致，避免两处说法不同。"""
+    from src.mcp import server as mcp_server
+
+    for name in catalog.TOOL_NAMES:
+        if not catalog.accepts_source(name):
+            continue
+        tool = mcp_server.build_tool(name)
+        enum = tool.input_schema["properties"]["source"]["enum"]
+        options = [v for v in enum if v != catalog.AUTO]
+        if options:
+            assert options[0] in (tool.description or ""), name

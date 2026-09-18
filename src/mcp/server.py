@@ -101,7 +101,7 @@ def _search_schema() -> dict:
                 "type": "array", "items": {"type": "string"},
                 "description": "排除这些域名。",
             },
-            **catalog.COMMON_PROPERTIES,
+            **catalog.common_properties("web_search"),
         },
         "required": ["query"],
     }
@@ -116,7 +116,7 @@ def _fetch_schema() -> dict:
                 "type": "integer", "minimum": 1000,
                 "description": "返回正文的字符上限；省略则用服务端默认值。",
             },
-            **catalog.COMMON_PROPERTIES,
+            **catalog.common_properties("web_fetch"),
         },
         "required": ["url"],
     }
@@ -129,8 +129,7 @@ def _image_schema(*, edit: bool) -> dict:
         "output_format": {"type": "string", "enum": ["png", "jpeg", "webp"]},
         "background": {"type": "string", "enum": ["auto", "opaque", "transparent"]},
         "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"]},
-        "model": {"type": "string", "description": "指定图片模型；省略或 auto 表示自动选择。"},
-        **catalog.COMMON_PROPERTIES,
+        **catalog.common_properties("image_edit" if edit else "image_generate"),
     }
     if edit:
         properties["images"] = {
@@ -160,8 +159,7 @@ def _video_generate_schema() -> dict:
             "resolution": {"type": "string", "description": "如 720p、1080p。"},
             "size": {"type": "string", "description": "兼容写法；等价于 aspect_ratio + resolution。"},
             "duration": {"type": "number", "description": "视频时长（秒）。"},
-            "model": {"type": "string", "description": "指定视频模型；省略或 auto 表示自动选择。"},
-            **catalog.COMMON_PROPERTIES,
+            **catalog.common_properties("video_generate"),
         },
         "required": ["prompt"],
     }
@@ -172,7 +170,7 @@ def _video_status_schema() -> dict:
         "type": "object",
         "properties": {
             "request_id": {"type": "string", "description": "video_generate 返回的任务 ID。"},
-            **catalog.COMMON_PROPERTIES,
+            **catalog.common_properties("video_status"),
         },
         "required": ["request_id"],
     }
@@ -232,6 +230,22 @@ def _apply_source(arguments: dict, *, kind: str) -> Optional[str]:
             f"模型 {source!r} 当前不可用。当前可用：{', '.join(available) or '无'}。"
         )
     return source
+
+
+def _requested_model(arguments: dict, *, kind: str) -> str:
+    """媒体工具实际使用的模型：统一由 source 指定。
+
+    历史上图片/视频工具另有一个 model 参数，与 source 语义重复且 source 只校验
+    不生效。现在只保留 source（schema 里也只暴露它），此处兼容读取旧的 model，
+    让升级期间已发出的调用不会突然失效。
+    """
+    source = _apply_source(arguments, kind=kind)
+    if source:
+        return source
+    legacy = str(arguments.get("model") or "").strip()
+    if legacy and legacy.lower() != catalog.AUTO:
+        return legacy
+    return "auto"
 
 
 def _timeout_override(arguments: dict) -> Optional[float]:
@@ -337,9 +351,8 @@ async def _run_image(tool_name: str, arguments: dict, *, key_name: Optional[str]
     """调用既有图片处理器；返回 (模型可见结果, 日志附加字段)。"""
     from ..openai import images_openai_compat
 
-    _apply_source(arguments, kind="image")
     payload: dict[str, Any] = {
-        "model": str(arguments.get("model") or "").strip() or "auto",
+        "model": _requested_model(arguments, kind="image"),
         "prompt": arguments.get("prompt"),
         # 统一走 URL 交付：既有处理器会把图片发布为 Parrot 资源 URL。
         "response_format": "url",
@@ -389,9 +402,8 @@ async def _run_video_create(arguments: dict, *, key_name: Optional[str],
                             base_url: str) -> tuple[dict, dict[str, Any]]:
     from ..xai import imagine
 
-    _apply_source(arguments, kind="video")
     payload: dict[str, Any] = {
-        "model": str(arguments.get("model") or "").strip() or "auto",
+        "model": _requested_model(arguments, kind="video"),
         "prompt": arguments.get("prompt"),
     }
     for key in ("image", "aspect_ratio", "resolution", "size", "duration"):

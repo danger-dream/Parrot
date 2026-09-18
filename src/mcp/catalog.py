@@ -28,21 +28,66 @@ MEDIA_TOOL_REQUIREMENTS: dict[str, str] = {
 }
 
 # 三个通用可选参数，六个工具语义一致：
-#   source           指定使用哪个来源/后端；auto = 按 Parrot 优先级自动选择
-#   model            指定模型；auto = 按当前配置
+#   source           指定使用哪个来源/上游；auto = 按 Parrot 优先级自动选择
 #   timeout_seconds  覆盖本次超时（秒）
-COMMON_PROPERTIES: dict[str, dict[str, Any]] = {
-    "source": {
-        "type": "string",
-        "description": "指定来源（搜索引擎或图片/视频来源）。auto = 自动选择。",
-    },
-    "timeout_seconds": {
-        "type": "number",
-        "description": "本次调用超时秒数；省略则使用 Parrot 当前配置。",
-    },
+#
+# source 的**可选值按当前配置实时计算**，因此这里只保留构造逻辑，静态常量会
+# 让模型看到过期的来源列表。enum 与工具说明取自同一份 live_options，
+# 两者不会出现"说明里有、enum 里没有"的不一致。
+AUTO = "auto"
+
+_SOURCE_KIND_LABELS: dict[str, str] = {
+    "search": "搜索引擎",
+    "image": "图片模型",
+    "video": "视频模型",
 }
 
-AUTO = "auto"
+
+def source_kind(tool_name: str) -> str:
+    """该工具的 source 指向哪一类上游。"""
+    if tool_name in ("web_search", "web_fetch"):
+        return "search"
+    if tool_name in ("image_generate", "image_edit"):
+        return "image"
+    return "video"
+
+
+# video_status 只按 request_id 查询已提交的任务，无法在选择上游上有意义；
+# 给它一个 source 参数会误导模型以为能指定模型。
+_NO_SOURCE_TOOLS = frozenset({"video_status"})
+
+
+def accepts_source(tool_name: str) -> bool:
+    return tool_name not in _NO_SOURCE_TOOLS
+
+
+def source_property(tool_name: str) -> dict[str, Any]:
+    """按当前配置生成 source 参数定义。
+
+    带 enum 才能让客户端在参数层就约束取值；此前只有说明文字，模型容易填错。
+    enum 始终包含 auto（等于"不指定，按优先级自动选择"）。没有可用来源时
+    只留 auto，而不是给一个空 enum——空 enum 在多数客户端里是不可选的意思。
+    """
+    kind = source_kind(tool_name)
+    options = live_options(tool_name)[0]
+    prop: dict[str, Any] = {
+        "type": "string",
+        "description": f"指定{_SOURCE_KIND_LABELS[kind]}；省略或 auto = 按 Parrot 当前配置自动选择。",
+    }
+    prop["enum"] = [AUTO, *options]
+    return prop
+
+
+def common_properties(tool_name: str) -> dict[str, dict[str, Any]]:
+    """按工具生成通用参数（source 带实时 enum + timeout_seconds）。"""
+    properties: dict[str, dict[str, Any]] = {}
+    if accepts_source(tool_name):
+        properties["source"] = source_property(tool_name)
+    properties["timeout_seconds"] = {
+        "type": "number",
+        "description": "本次调用超时秒数；省略则使用 Parrot 当前配置。",
+    }
+    return properties
 
 
 @dataclass(frozen=True)
@@ -81,19 +126,19 @@ SPECS: dict[str, ToolSpec] = {
     ),
     "image_generate": ToolSpec(
         name="image_generate",
-        description="按提示词生成图片，返回可访问的图片 URL。",
+        description="按提示词生成图片，返回可访问的图片 URL。可用 source 指定图片模型。",
         media="images",
         kind="image",
     ),
     "image_edit": ToolSpec(
         name="image_edit",
-        description="基于给定图片按提示词修改或重绘，可传多张参考图与遮罩。",
+        description="基于给定图片按提示词修改或重绘，可传多张参考图与遮罩。可用 source 指定图片模型。",
         media="images",
         kind="image",
     ),
     "video_generate": ToolSpec(
         name="video_generate",
-        description="提交视频生成任务，返回 request_id；随后用 video_status 查询进度。",
+        description="提交视频生成任务，返回 request_id；随后用 video_status 查询进度。可用 source 指定视频模型。",
         media="videos",
         kind="video",
     ),
@@ -144,8 +189,11 @@ def live_options(tool_name: str) -> tuple[list[str], str]:
     """按当前配置计算一个工具的实时可选值与补充说明。
 
     不可用的来源仍然会被列出（并标注"不可用"），这样模型能理解为什么调用
-    失败，而不是反复重试一个已下线的来源。
+    失败，而不是反复重试一个已下线的来源。不接受 source 的工具返回空列表，
+    避免说明里列出它其实用不上的可选值。
     """
+    if not accepts_source(tool_name):
+        return [], ""
     if tool_name in ("web_search", "web_fetch"):
         return _search_sources()
     if tool_name in ("image_generate", "image_edit"):
