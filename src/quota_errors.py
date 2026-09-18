@@ -19,6 +19,13 @@ _BJT = timezone(timedelta(hours=8))
 _ZHIPU_RESET_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
 _ZHIPU_CODE_RE = re.compile(r'"code"\s*:\s*"?1310"?', re.IGNORECASE)
 _ZHIPU_MESSAGE_RE = re.compile(r"\[1310\]\[.*?(?:每周/每月使用上限|限额将在)", re.IGNORECASE)
+# 1311：套餐不含该模型。与 1310 同为智谱的业务码，但语义不同——它不是"额度用尽"，
+# 因此没有可等的重置时间；也不会自行恢复，要等套餐放开或升级。
+_ZHIPU_PLAN_CODE_RE = re.compile(r'"code"\s*:\s*"?1311"?', re.IGNORECASE)
+_ZHIPU_PLAN_MESSAGE_RE = re.compile(
+    r"\[1311\]\[.*?(?:subscription plan does not yet include|套餐.*?(?:未|不)包含|暂不支持)",
+    re.IGNORECASE,
+)
 _MAX_RESET_AHEAD_MS = 45 * 24 * 60 * 60 * 1000
 
 
@@ -52,7 +59,11 @@ def is_zhipu_channel(channel: Any) -> bool:
         host = (urlparse(str(getattr(channel, "base_url", "") or "")).hostname or "").lower()
     except Exception:
         return False
-    return host == "bigmodel.cn" or host.endswith(".bigmodel.cn")
+    # 智谱分国内站与国际站两个域名；只认 bigmodel.cn 会让国际站上的
+    # 1310/1311 处理全部落空。
+    if host == "bigmodel.cn" or host.endswith(".bigmodel.cn"):
+        return True
+    return host == "z.ai" or host.endswith(".z.ai")
 
 
 def is_zhipu_1310_message(detail: str | None) -> bool:
@@ -105,6 +116,38 @@ def zhipu_1310_reset_ms(
 def is_cursor_pool_quota_message(detail: str | None) -> bool:
     code, _message = _error_fields(detail)
     return code == "cursor_quota_pool" or "cursor_quota_pool" in str(detail or "")
+
+
+def is_zhipu_plan_excluded_message(detail: str | None) -> bool:
+    """智谱 1311：当前订阅套餐尚未包含该模型。
+
+    与 1310 的区别：1310 是"额度用尽"，有上游给出的重置时间；1311 是套餐本身
+    不含该模型——它不会自行恢复。因此这里只做识别，不猜期限：调用方用一个有限
+    的退避窗口停下无意义的重试，等套餐放开后自然恢复调度。
+    """
+    code, message = _error_fields(detail)
+    if code == "1311":
+        return True
+    text = str(detail or "")
+    return bool(_ZHIPU_PLAN_CODE_RE.search(text) or _ZHIPU_PLAN_MESSAGE_RE.search(message or text))
+
+
+def zhipu_plan_excluded_retry_ms(*, now_ms: int | None = None) -> int:
+    """套餐不含：用一个有限退避窗口，而不是永久冻结。
+
+    上游没给期限，也不能给：这是一种"等对方放开"的状态，永久冻结会让套餐开放后
+    也无法自动用上。窗口取冷却阶梯里最长的有限档（默认 15 分钟）——既停止每 30
+    秒一次的无效试探，又能在套餐放开后自行恢复。
+    """
+    current = int(now_ms if now_ms is not None else time.time() * 1000)
+    try:
+        from . import config as _config
+
+        windows = _config.get().get("errorWindows") or [1, 3, 5, 10, 15, 0]
+        minutes = max((int(value) for value in windows if int(value) > 0), default=15)
+    except Exception:
+        minutes = 15
+    return current + max(1, int(minutes)) * 60_000
 
 
 def active_quota_cooldown(entry: dict | None, *, now_ms: int | None = None) -> bool:

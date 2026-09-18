@@ -2533,6 +2533,159 @@ def test_zhipu_quota_parser_rejects_generic_429_and_non_zhipu(m):
     assert parser(zhipu, http_status=429, error_detail=exact) is not None
 
 
+def test_zhipu_plan_excluded_is_recognized_but_other_codes_are_not():
+    """1311「套餐不含」必须被识别；相邻错误码不得误伤。
+
+    1311 与 1310 同为智谱业务码，但语义不同：1310 是额度用尽、有上游重置时间；
+    1311 是套餐本身不含该模型。混为一谈会把普通限流也当成套餐限制。
+    """
+    from src import quota_errors as quota
+    recognize = quota.is_zhipu_plan_excluded_message
+    excluded = (
+        'HTTP 429: {"type":"error","error":{"type":"api_error","code":"1311",'
+        '"message":"[1311][Your current subscription plan does not yet include '
+        'access to GLM-5.3-FlashX][20260918155942fcbd605df6824689]","request_id":"x"}}'
+    )
+    assert recognize(excluded) is True
+    assert recognize('{"error":{"code":"1311"}}') is True
+
+    # 相邻/相似信号不得命中
+    assert recognize('{"error":{"code":"1310","message":"[1310][每周/每月使用上限]"}}') is False
+    assert recognize('{"error":{"code":"1301","message":"[1301][内容可能包含敏感]"}}') is False
+    assert recognize('{"error":{"code":"1302","message":"[1302][Rate limit reached]"}}') is False
+    assert recognize("HTTP 429: Too Many Requests") is False
+    assert recognize(None) is False
+
+
+def test_zhipu_plan_excluded_uses_a_finite_backoff_never_a_permanent_freeze():
+    """套餐不含用有限退避窗口，不能是永久冻结。
+
+    永久冻结（-1）会让套餐开放后也无法自动用上——那与"先等等"的预期相反。
+    窗口取冷却阶梯里最长的有限档，既停下 30 秒级的无效试探，又能自行恢复。
+    """
+    from src import quota_errors as quota
+    now = 1_800_000_000_000
+    until = quota.zhipu_plan_excluded_retry_ms(now_ms=now)
+    assert until != -1, "不得使用永久冻结"
+    delta_minutes = (until - now) / 60_000
+    assert delta_minutes == 15, delta_minutes        # errorWindows 最长有限档
+    assert until > now
+
+
+def test_zhipu_plan_excluded_does_not_join_the_long_lived_quota_set():
+    """1311 不得进入 active_quota_cooldown。
+
+    那个集合会让探针无限期跳过该条目（1310 有上游给出的确切重置时间，适合这么
+    做）。1311 没有期限，若也永久跳过，套餐放开后就再也不会被试探到。
+    """
+    from src import quota_errors as quota
+    detail = ('HTTP 429: {"error":{"code":"1311","message":"[1311][Your current '
+              'subscription plan does not yet include access to X]"}}')
+    entry = {
+        "last_error_message": detail,
+        "cooldown_until": quota.zhipu_plan_excluded_retry_ms(),
+    }
+    assert quota.active_quota_cooldown(entry) is False
+    # 对照：1310 仍应被认作长期配额
+    q1310 = ('HTTP 429: {"error":{"code":"1310","message":"限额将在 2099-01-01 '
+             '00:00:00 重置"}}')
+    assert quota.active_quota_cooldown(
+        {"last_error_message": q1310, "cooldown_until": 4102444800000}) is True
+
+
+def test_zhipu_plan_excluded_notification_says_plan_not_quota(m, monkeypatch):
+    """1311 的通知必须说"套餐不含"，不能复用 1310 的"额度已达上限"文案。"""
+    calls = []
+    monkeypatch.setattr(
+        m["failover"].notifier,
+        "throttled_notify_event_sync",
+        lambda event, alert, text, **kwargs: calls.append((event, alert, text, kwargs)),
+    )
+    channel = SimpleNamespace(key="api:智谱 Max", type="api", display_name="智谱 Max")
+    reset_ms = int(datetime(2026, 9, 18, 16, 36, 12, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000)
+    m["failover"]._notify_zhipu_quota_cooldown(
+        channel, "glm-5.3-flashx", reset_ms, plan_excluded=True,
+    )
+
+    assert len(calls) == 1
+    event, alert, text, kwargs = calls[0]
+    assert event == "plan_excluded"
+    assert "订阅套餐尚未包含该模型" in text
+    assert "1311" in text
+    assert "周/月使用额度已达上限" not in text      # 不能沿用 1310 的措辞
+    assert "2026-09-18 16:36:12" in text
+    assert "永久冻结" in text and "自动恢复" in text
+    button = kwargs["reply_markup"]["inline_keyboard"][0][0]
+    assert button["text"] == "📡 查看渠道详情"
+
+
+def test_zhipu_channel_recognized_on_both_domains():
+    """智谱国内站与国际站都要认；只认 bigmodel.cn 会让国际站的处理全部落空。
+
+    回归点：api.z.ai 是国际站（Coding Plan 国际 / API 按量付费国际）的域名。
+    早先只匹配 bigmodel.cn，国际站渠道的 1310/1311 处理从未生效。
+    """
+    from src import quota_errors as quota
+    assert quota.is_zhipu_channel(
+        SimpleNamespace(base_url="https://open.bigmodel.cn/api/anthropic")) is True
+    assert quota.is_zhipu_channel(
+        SimpleNamespace(base_url="https://api.z.ai/api/anthropic/v1/messages")) is True
+    assert quota.is_zhipu_channel(
+        SimpleNamespace(base_url="https://api.example.com")) is False
+    # 形似域名不得误判
+    assert quota.is_zhipu_channel(
+        SimpleNamespace(base_url="https://z.ai.evil.test")) is False
+    assert quota.is_zhipu_channel(
+        SimpleNamespace(base_url="https://notbigmodel.cn")) is False
+
+
+def test_recovery_probe_skips_zhipu_plan_excluded_entries(m, monkeypatch):
+    """探针不得对 1311 条目每 30 秒空探一次。
+
+    1311 没有上游给出的放开时间，冷却窗口内反复探测只会每次都失败（实测半小时
+    73 次）。窗口到期后条目会离开 active_entries，届时自然恢复探测，因此跳过是
+    安全的。对照：普通 429 限流仍必须被探测（那是探针的本职）。
+    """
+    from src import probe as probe_module
+    from src import quota_errors as quota
+    _setup(m)
+    channel = m["api_channel"].ApiChannel({
+        "name": "智谱 Max", "type": "api",
+        "baseUrl": "https://api.z.ai", "apiKey": "k",
+        "providerId": "zhipu", "providerPresetId": "coding-global",
+        "models": [{"real": "glm-5.3-flashx", "alias": "glm-5.3-flashx"}],
+        "enabled": True,
+    })
+    _install_channels(m, [channel])
+    calls = []
+
+    async def fake_probe(ch, model, timeout_s=15):
+        calls.append(model)
+        return False, 0, detail
+
+    monkeypatch.setattr(probe_module, "probe_channel_model", fake_probe)
+    detail = ('HTTP 429: {"type":"error","error":{"type":"api_error","code":"1311",'
+              '"message":"[1311][Your current subscription plan does not yet include '
+              'access to X]","request_id":"x"}}')
+
+    m["cooldown"].clear(channel.key, "glm-5.3-flashx")
+    m["cooldown"].record_error(
+        channel.key, "glm-5.3-flashx", detail,
+        cooldown_until=quota.zhipu_plan_excluded_retry_ms(),
+    )
+    calls.clear()
+    asyncio.run(probe_module.recovery_run_once())
+    assert calls == [], f"1311 条目不应被探测，实际探测了 {calls}"
+
+    # 对照：普通限流必须继续被探测
+    m["cooldown"].clear(channel.key, "glm-5.3-flashx")
+    m["cooldown"].record_error(
+        channel.key, "glm-5.3-flashx", 'HTTP 429: {"code":"1302","message":"RPM limit"}')
+    calls.clear()
+    asyncio.run(probe_module.recovery_run_once())
+    assert calls, "普通 429 仍应被探针探测"
+
+
 def test_zhipu_quota_cooldown_notification_is_explicit_and_links_channel(m, monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -2571,7 +2724,7 @@ async def test_zhipu_1310_cools_only_channel_model_until_reset_and_fails_over(m,
     monkeypatch.setattr(
         m["failover"],
         "_notify_zhipu_quota_cooldown",
-        lambda ch, model, until: notices.append((ch.key, model, until)),
+        lambda ch, model, until, **kwargs: notices.append((ch.key, model, until)),
     )
 
     def zhipu_handler(req: httpx.Request):

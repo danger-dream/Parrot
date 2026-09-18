@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_state, scorer
+from . import affinity, channel_state, concurrency, config, cooldown, fingerprint, load_balancing, model_state, quota_errors, scorer
 from .channel import registry
 from .channel.base import Channel
 from .protocols.matrix import (
@@ -148,7 +148,14 @@ def _filter_candidates(requested_model: str,
         if cooldown.is_blocked(ch.key, resolved):
             state = cooldown.get_state(ch.key, resolved) or {}
             until = state.get("cooldown_until")
-            detail = "permanent" if until == -1 else f"until={until}"
+            if until == -1:
+                detail = "permanent"
+            elif quota_errors.is_zhipu_plan_excluded_message(
+                    state.get("last_error_message")):
+                # 说清是"套餐不含"而不是普通限流，便于从错误信息直接看出原因。
+                detail = f"plan-excluded until={until}"
+            else:
+                detail = f"until={until}"
             excluded.append({
                 "channel": ch.key,
                 "reason": "cooldown",

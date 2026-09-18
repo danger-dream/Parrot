@@ -1189,7 +1189,9 @@ async def _wait_for_overload_retry(
     return delay
 
 
-def _notify_zhipu_quota_cooldown(ch: Channel, model: str, reset_ms: int) -> None:
+def _notify_zhipu_quota_cooldown(
+    ch: Channel, model: str, reset_ms: int, *, plan_excluded: bool = False,
+) -> None:
     """Best-effort TG notice with a direct link to an API channel's detail page."""
     channel_name = str(getattr(ch, "display_name", None) or getattr(ch, "key", "?"))
     reset_text = quota_errors.format_bjt_ms(reset_ms)
@@ -1204,18 +1206,41 @@ def _notify_zhipu_quota_cooldown(ch: Channel, model: str, reset_ms: int) -> None
             ])
         except Exception:
             reply_markup = None
+    if plan_excluded:
+        # 1311：套餐不含，不是额度问题，措辞与恢复预期都要说清楚。
+        reason_line = "原因: <b>当前订阅套餐尚未包含该模型</b>（上游 <code>1311</code>）"
+        recovery_line = f"下次尝试: <code>{ek(reset_text)}</code>（北京时间）"
+        impact_line = (
+            f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
+            "同模型的其他渠道仍可继续承接请求。"
+        )
+        tail = (
+            "<i>这不是渠道故障，也不是永久冻结。套餐开放后无需手工操作，"
+            "下次尝试成功即自动恢复调度。</i>"
+        )
+        event = "plan_excluded"
+        title = "🟡 <b>渠道模型不在当前套餐内</b>"
+    else:
+        reason_line = "原因: <b>周/月使用额度已达上限</b>（上游 <code>1310</code>）"
+        recovery_line = f"自动恢复: <code>{ek(reset_text)}</code>（北京时间）"
+        impact_line = (
+            f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
+            "同模型的其他渠道仍可继续承接请求。"
+        )
+        tail = "<i>这不是手动禁用，也不是永久冻结。到达上游给出的重置时间后自动恢复调度。</i>"
+        event = "quota_cooldown"
+        title = "🟠 <b>渠道模型进入配额冷却</b>"
     notifier.throttled_notify_event_sync(
-        "quota_cooldown",
-        f"quota_cooldown:{getattr(ch, 'key', channel_name)}:{model}:{reset_ms}",
-        "🟠 <b>渠道模型进入配额冷却</b>\n"
+        event,
+        f"{event}:{getattr(ch, 'key', channel_name)}:{model}:{reset_ms}",
+        f"{title}\n"
         f"渠道: <code>{ek(channel_name)}</code>\n"
         f"模型: <code>{ek(model)}</code>\n"
-        "原因: <b>周/月使用额度已达上限</b>（上游 <code>1310</code>）\n"
-        f"自动恢复: <code>{ek(reset_text)}</code>（北京时间）\n\n"
+        f"{reason_line}\n"
+        f"{recovery_line}\n\n"
         "<b>调度影响</b>\n"
-        f"恢复前仅跳过 <code>{ek(channel_name)} / {ek(model)}</code>；"
-        "同模型的其他渠道仍可继续承接请求。\n\n"
-        "<i>这不是手动禁用，也不是永久冻结。到达上游给出的重置时间后自动恢复调度。</i>",
+        f"{impact_line}\n\n"
+        f"{tail}",
         cooldown_seconds=86_400,
         reply_markup=reply_markup,
     )
@@ -2328,6 +2353,14 @@ async def run_failover(
             http_status=result.http_status,
             error_detail=result.error_detail,
         )
+        # Zhipu 1311: 当前套餐尚未包含该模型。它不是"额度耗尽"，上游也不会给重置
+        # 时间。若按通用 429 走阶梯冷却，恢复循环会每 30 秒试探一次（实测半小时
+        # 73 次），既无意义又刷日志。改用有限退避窗口停下无效重试；套餐放开后
+        # 窗口到期即自动恢复调度，不做永久冻结。
+        plan_excluded = quota_reset_ms is None and \
+            quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
+        if plan_excluded:
+            quota_reset_ms = quota_errors.zhipu_plan_excluded_retry_ms()
         if quota_reset_ms is not None:
             plan = finalize_policy.error_plan(
                 result.outcome,
@@ -2348,7 +2381,9 @@ async def run_failover(
                     connect_ms=_scorer_connect_ms(result),
                 )
             try:
-                _notify_zhipu_quota_cooldown(ch, resolved_model, quota_reset_ms)
+                _notify_zhipu_quota_cooldown(
+                    ch, resolved_model, quota_reset_ms, plan_excluded=plan_excluded,
+                )
             except Exception as exc:
                 print(f"[failover] quota cooldown notification failed for {ch.key}: {exc}")
             retry_count += 1

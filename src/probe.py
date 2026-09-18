@@ -256,6 +256,14 @@ async def recovery_run_once() -> int:
         if ch is None or ch.type != "api" or not ch.enabled:
             continue
 
+        # 智谱 1311（套餐不含该模型）没有上游给出的放开时间，但也不会在冷却窗口内
+        # 变化。若照常探测，恢复循环会每 30 秒打一次上游、每次都必然失败（实测半
+        # 小时 73 次）。窗口到期后该条目自然离开 active_entries，届时由真实请求或
+        # 下一轮探测验证，套餐放开即可自动恢复。
+        if quota_errors.is_zhipu_channel(ch) and quota_errors.is_zhipu_plan_excluded_message(
+                entry.get("last_error_message")):
+            continue
+
         # 如果 cooldown_until 在未来且是 429 类型，尝试解析重置时间
         cu = entry.get("cooldown_until")
         if cu is not None and cu > now_ms:
