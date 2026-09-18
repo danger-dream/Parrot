@@ -487,3 +487,133 @@ def test_shutdown_marks_owned_operation_terminal(env):
     assert not env.control._upstream_sync._active
     assert env.requests == ["api-secret-alpha"]
     assert env.store.get(env.context, operation.id).status is OperationStatus.FAILED
+
+
+# ── 多来源选择、实时进度与取消 ─────────────────────────────────────────────
+
+
+def test_multi_source_sync_only_touches_the_selected_ones(env):
+    """多选来源：只同步选中的，未选中的不发请求。"""
+    _install(apis=[_api("alpha"), _api("beta"), _api("gamma")])
+    refs = (_api_ref("alpha"), _api_ref("gamma"))
+    operation = env.control.start_upstream_sync(env.context, None, sources=refs)
+    result = _wait(env, operation)
+    assert result.status is OperationStatus.SUCCEEDED
+    assert sorted(env.requests) == ["api-secret-alpha", "api-secret-gamma"]
+    labels = [item["label"] for item in result.result["items"]]
+    assert labels == ["alpha", "gamma"]      # 保持请求顺序
+
+
+def test_multi_source_selection_rejects_unknown_and_empty(env):
+    """未知来源与空集合都必须明确报错，而不是静默跳过。"""
+    with pytest.raises(ManagementError) as unknown:
+        env.control.start_upstream_sync(
+            env.context, None, sources=(ModelSourceRef(ModelSourceType.API, "api:不存在"),))
+    assert unknown.value.code is ManagementErrorCode.RESOURCE_NOT_FOUND
+    with pytest.raises(ManagementError):
+        env.control.start_upstream_sync(env.context, None, sources=())
+
+
+def test_progress_sink_receives_start_and_done_per_source(env):
+    """每一步都要回调：进入某项、完成某项各一次，且带标签与耗时。"""
+    _install(apis=[_api("alpha")])
+    env.responses["api-secret-alpha"] = _payload("m1", "m2")
+    events = []
+    operation = env.control.start_upstream_sync(
+        env.context, None, sources=(_api_ref("alpha"),),
+        progress_sink=lambda op_id, event: events.append(dict(event)),
+    )
+    _wait(env, operation)
+    phases = [e["phase"] for e in events]
+    assert phases == ["start", "done"]
+    done = events[-1]
+    assert done["label"] == "alpha"
+    assert done["status"] == "succeeded"
+    assert done["count"] >= 1
+    assert done["elapsedMs"] >= 0
+    assert isinstance(done["models"], list)
+
+
+def test_progress_sink_failure_never_breaks_the_sync(env):
+    """sink 只是展示增强；它抛异常不能影响同步本身。"""
+    _install(apis=[_api("alpha")])
+    env.responses["api-secret-alpha"] = _payload("m1")
+    operation = env.control.start_upstream_sync(
+        env.context, None, sources=(_api_ref("alpha"),),
+        progress_sink=lambda op_id, event: (_ for _ in ()).throw(RuntimeError("sink boom")),
+    )
+    result = _wait(env, operation)
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.result["succeeded"] == 1
+
+
+def test_cancel_stops_after_the_current_source(env):
+    """取消是协作式的：当前项跑完，后续项不再发起。"""
+    _install(apis=[_api("alpha"), _api("beta")])
+    env.responses["api-secret-beta"] = _payload("m-beta")
+    entered = Event()
+    release = Event()
+
+    def hold(request):
+        entered.set()
+        assert release.wait(5)
+        return httpx.Response(200, json=_payload("m1"))
+
+    env.responses["api-secret-alpha"] = hold
+    operation = env.control.start_upstream_sync(
+        env.context, None, sources=(_api_ref("alpha"), _api_ref("beta")))
+    assert entered.wait(2)
+    try:
+        env.store.cancel(env.context, operation.id)
+    finally:
+        release.set()
+    # 取消会立刻把状态置为 terminal，但 worker 的 finally 还在收尾；
+    # 等 _active 清空才说明它真的停了。
+    deadline = time.monotonic() + 5
+    while env.control._upstream_sync._active and time.monotonic() < deadline:
+        time.sleep(0.005)
+    # beta 没有开始
+    assert env.requests == ["api-secret-alpha"]
+    assert not env.control._upstream_sync._active
+
+
+def test_sync_operation_is_cancellable(env):
+    """同步任务必须标记为可取消，否则界面上的取消按钮无法生效。"""
+    _install(apis=[_api("alpha")])
+    operation = env.control.start_upstream_sync(env.context, None, sources=(_api_ref("alpha"),))
+    assert env.store.get(env.context, operation.id).cancellable is True
+    _wait(env, operation)
+
+
+def test_cancel_emits_a_cancelled_event_for_the_page(env):
+    """取消要发出事件，进度页才能从"正在同步"切到"已取消"。
+
+    取消发生在某项执行期间时，循环是靠进度更新的异常中断的；若不在这里补发
+    事件，页面会永远停在"正在同步"。
+    """
+    _install(apis=[_api("alpha")])
+    entered = Event()
+    release = Event()
+
+    def hold(request):
+        entered.set()
+        assert release.wait(5)
+        return httpx.Response(200, json=_payload("m1"))
+
+    env.responses["api-secret-alpha"] = hold
+    events = []
+    operation = env.control.start_upstream_sync(
+        env.context, None, sources=(_api_ref("alpha"),),
+        progress_sink=lambda op_id, event: events.append(dict(event)),
+    )
+    assert entered.wait(2)
+    try:
+        env.store.cancel(env.context, operation.id)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while "cancelled" not in [e["phase"] for e in events] and time.monotonic() < deadline:
+        time.sleep(0.005)
+    cancelled = [e for e in events if e["phase"] == "cancelled"]
+    assert cancelled, f"未发出取消事件：{[e['phase'] for e in events]}"
+    assert cancelled[-1]["label"] == "alpha"

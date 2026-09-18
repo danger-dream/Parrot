@@ -456,6 +456,8 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
         return
     if _media_actions.handle_action(chat_id, message_id, cb_id, action):
         return
+    if _sync_actions.handle_action(chat_id, message_id, cb_id, action):
+        return
     if name == "content_page":
         _show_rendered(chat_id, message_id, cb_id, lambda: _html_page_render(
             chat_id, data["pages"], data["keyboard"], data["page"],
@@ -543,7 +545,13 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
         return
 
 
-    if name in {"sync_upstream", "sync_source"}:
+    if name == "sync_upstream":
+        # 打开来源多选页；单来源按钮（sync_source）仍直接同步那一个。
+        _sync_actions.open_picker(
+            chat_id, message_id, cb_id, str(data.get("back_callback") or "mc:list"))
+        return
+
+    if name == "sync_source":
         try:
             op = _CONTROL.start_upstream_sync(_ctx(chat_id), source=data.get("source"))
         except ManagementError as exc:
@@ -894,3 +902,4 @@ from . import model_center_aliases as _aliases_actions
 from . import model_center_metadata as _metadata_actions
 from . import model_center_settings as _settings_actions
 from . import model_center_media as _media_actions
+from . import model_center_sync as _sync_actions

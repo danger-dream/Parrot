@@ -123,21 +123,24 @@ def test_alias_list_no_search_and_actions_share_last_row(env):
 
 
 @pytest.mark.parametrize('source', [None, ModelSourceRef(ModelSourceType.OAUTH, 'acct-a')])
-def test_upstream_sync_uses_explicit_scope_and_restores_filter(env, monkeypatch, source):
-    control, edits, *_ = env
+def test_upstream_sync_opens_the_source_picker(env, monkeypatch, source):
+    """「同步上游模型」按钮现在打开来源多选页，而不是直接同步。
+
+    同步本身（含显式来源范围）改由多选页发起；这里断言按钮进入多选页，
+    并且返回后仍恢复原来的筛选状态。
+    """
+    control, edits, answers, *_ = env
     calls = []
-    monkeypatch.setattr(control, 'start_upstream_sync', lambda ctx, *, source=None:
-                        calls.append(source) or SimpleNamespace(id='sync-op'), raising=False)
+    monkeypatch.setattr(menu, '_show_rendered',
+                        lambda chat_id, message_id, cb_id, renderer: calls.append(renderer))
     s = menu._session(7)
     s.source, s.text, s.page = source, 'model', 2
     _text, kb = menu.render(7)
     label = '同步上游模型' + (' · 当前来源' if source else '')
     menu.handle_callback(7, 10, 'sync', _button(kb, label)['callback_data'])
-    assert calls == [source] and '同步任务已开始' in edits[-1][2]
-    back = _button(edits[-1][3], '返回')['callback_data']
-    s.text, s.page = '', 1
-    menu.handle_callback(7, 10, 'back', back)
-    assert s.source == source and s.text == 'model' and s.page == 2
+    # 进入多选页（由 sync 模块渲染），并未直接启动同步
+    assert calls, "未进入来源多选页"
+    assert not answers or answers[-1][1] != "同步任务已开始"
 
 
 @pytest.mark.parametrize('result_status', ['partial_failed', 'failed'])

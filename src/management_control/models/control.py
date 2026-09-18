@@ -707,9 +707,14 @@ class ModelCenterControl(DomainControl):
         return ModelStateResult(tuple(statuses), new_revision)
 
     def start_upstream_sync(
-        self, context: ManagementContext | None, source: ModelSourceRef | None = None,
+        self,
+        context: ManagementContext | None,
+        source: ModelSourceRef | None = None,
+        *,
+        sources: tuple[ModelSourceRef, ...] | None = None,
+        progress_sink=None,
     ) -> ManagementOperation:
-        return self._upstream_sync.start(self._write(context), source)
+        return self._upstream_sync.start(self._write(context), source, sources, progress_sink)
 
     def sync_source_models(
         self, context: ManagementContext | None, source: ModelSourceRef,
