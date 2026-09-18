@@ -31,7 +31,9 @@ def test_catalog_exact_endpoints_and_shape():
         "ollama-cloud", "openrouter", "minimax", "siliconflow",
     ]
     coding = get_preset("zhipu", "coding-cn")
-    assert coding.models_url == "https://open.bigmodel.cn/api/v1/models"
+    # 模型目录必须用返回 {"data":[{"id":...}]} 的标准 /models 端点：/api/v1/models
+    # 返回 {"models":[{"slug":...}]}，与 openai-data-id 解析器不匹配。
+    assert coding.models_url == "https://open.bigmodel.cn/api/coding/paas/v4/models"
     assert coding.protocols["openai-chat"] == "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
     assert coding.cc_mimicry is True
     kimi = get_preset("kimi", "code")
@@ -73,6 +75,47 @@ def test_custom_models_url_derivation():
     assert derive_custom_models_url("https://x.test/v1") == "https://x.test/v1/models"
     assert derive_custom_models_url("https://x.test", "/v1/chat/completions") == "https://x.test/v1/models"
     assert derive_custom_models_url("https://x.test/api", "/v1/messages") == "https://x.test/api/v1/models"
+
+
+def test_zhipu_model_catalog_endpoints_match_the_parser():
+    """智谱各预设的模型目录必须指向能返回 data/id 的标准 /models 端点。
+
+    回归点：早先指向 {host}/api/v1/models，该端点返回 {"models":[{"slug":...}]}，
+    openai-data-id 解析器读不出来，同步一律失败；而且它只是部分内部清单
+    （实测 glm-4.6 可用却不在其中）。目录端点应与该套餐的 API 面一致。
+    """
+    expected = {
+        "coding-cn": "https://open.bigmodel.cn/api/coding/paas/v4/models",
+        "coding-global": "https://api.z.ai/api/coding/paas/v4/models",
+        "api-cn": "https://open.bigmodel.cn/api/paas/v4/models",
+        "api-global": "https://api.z.ai/api/paas/v4/models",
+    }
+    for preset_id, url in expected.items():
+        preset = get_preset("zhipu", preset_id)
+        assert preset.models_url == url, preset_id
+        # 解析器必须与端点格式配套
+        assert preset.models_parser == "openai-data-id", preset_id
+        # 不得再指回内部 v1 目录
+        assert not preset.models_url.endswith("/api/v1/models"), preset_id
+        # 目录端点与该预设的 openai-chat API 面同源
+        assert preset.protocols["openai-chat"].startswith(
+            preset.models_url[: -len("/models")]), preset_id
+
+
+def test_slug_shaped_catalog_is_rejected_not_silently_empty():
+    """{"models":[{"slug":...}]} 必须明确报格式不支持，而不是当成空目录。
+
+    这正是智谱同步失败的形态：格式不匹配若被当成"没有模型"，会把已有目录
+    误判为空，比报错更危险。
+    """
+    def slug_shaped(request):
+        return httpx.Response(200, json={"models": [
+            {"slug": "glm-5.3", "supported_in_api": True},
+        ]})
+
+    with pytest.raises(ModelsDiscoveryError):
+        asyncio.run(discover_models(
+            "https://api.z.ai/api/v1/models", "k", client_factory=_factory(slug_shaped)))
 
 
 def test_discovery_stable_dedupe_auth_and_redirect_refusal():

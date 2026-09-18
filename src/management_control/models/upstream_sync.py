@@ -354,6 +354,9 @@ class UpstreamSync:
             else:
                 store.succeed(operation_id, result)
                 self.control._audit(context, "model_center.upstream.sync", operation_id, result["status"])
+            # 最后一项的 done 事件是在 _batch 里发的，那时任务还是 RUNNING，所以页面
+            # 上仍显示"取消同步"。这里在任务真正落地后再通知一次，页面才切到终态。
+            self._emit(operation_id, {"phase": "finished", "total": len(sources)})
         finally:
             with self._sinks_lock:
                 self._sinks.pop(operation_id, None)

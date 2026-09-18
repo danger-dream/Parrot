@@ -89,21 +89,25 @@ def _siliconflow(pid: str, name: str, host: str) -> ProviderPreset:
 
 PROVIDER_CATALOG: tuple[ProviderBrand, ...] = (
     ProviderBrand("zhipu", "智谱 GLM", (
-        _preset("coding-cn", "Coding Plan（中国）", "https://open.bigmodel.cn/api/v1/models", {
+        # 模型目录用各 API 面的标准 /models 端点：返回 {"data":[{"id":...}]}，
+        # 与 openai-data-id 解析器一致，且是该套餐的完整可用清单。
+        # 早先用的 /api/v1/models 返回 {"models":[{"slug":...}]}，既不被解析器
+        # 识别，内容也只是部分内部清单（实测 glm-4.6 等可用模型不在其中）。
+        _preset("coding-cn", "Coding Plan（中国）", "https://open.bigmodel.cn/api/coding/paas/v4/models", {
             "anthropic": "https://open.bigmodel.cn/api/anthropic/v1/messages",
             "openai-chat": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
             "openai-responses": "https://open.bigmodel.cn/api/v1/responses",
         }, cc_mimicry=True),
-        _preset("coding-global", "Coding Plan（国际）", "https://api.z.ai/api/v1/models", {
+        _preset("coding-global", "Coding Plan（国际）", "https://api.z.ai/api/coding/paas/v4/models", {
             "anthropic": "https://api.z.ai/api/anthropic/v1/messages",
             "openai-chat": "https://api.z.ai/api/coding/paas/v4/chat/completions",
             "openai-responses": "https://api.z.ai/api/v1/responses",
         }, cc_mimicry=True),
-        _preset("api-cn", "API 按量付费（中国）", "https://open.bigmodel.cn/api/v1/models", {
+        _preset("api-cn", "API 按量付费（中国）", "https://open.bigmodel.cn/api/paas/v4/models", {
             "anthropic": "https://open.bigmodel.cn/api/anthropic/v1/messages",
             "openai-chat": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         }),
-        _preset("api-global", "API 按量付费（国际）", "https://api.z.ai/api/v1/models", {
+        _preset("api-global", "API 按量付费（国际）", "https://api.z.ai/api/paas/v4/models", {
             "anthropic": "https://api.z.ai/api/anthropic/v1/messages",
             "openai-chat": "https://api.z.ai/api/paas/v4/chat/completions",
         }),

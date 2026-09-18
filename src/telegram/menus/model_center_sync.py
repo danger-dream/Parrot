@@ -254,9 +254,12 @@ def make_sink(chat_id: int, back_callback: str) -> Callable[[str, dict], None]:
                 # 同序号的 start 已被完成事件取代，避免页面同时出现两行。
                 events[:] = [row for row in events if not (
                     str(row.get("phase")) == "start" and int(row.get("index") or 0) == index)]
-            events.append(dict(event))
+            if phase != "finished":
+                # finished 只是"任务已落地"的重绘信号，本身不是一项来源。
+                events.append(dict(event))
         _paint(operation_id)
-        if phase in {"done", "cancelled"} and index + 1 >= int(event.get("total") or 0):
+        if phase == "finished" or (
+                phase in {"done", "cancelled"} and index + 1 >= int(event.get("total") or 0)):
             _schedule_cleanup(operation_id)
 
     return sink
@@ -350,6 +353,11 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
         try:
             menu._CONTROL.operations.cancel(menu._ctx(chat_id), operation_id)
         except ManagementError as exc:
+            # 任务可能刚好在这一刻完成；那不是失败，重绘一次让它切到终态即可。
+            if str(menu._enum_value(exc.code)) == "INVALID_OPERATION_STATE":
+                ui.answer_cb(cb_id, "同步已结束")
+                _paint(operation_id)
+                return True
             menu._answer_error(cb_id, exc)
             return True
         ui.answer_cb(cb_id, "已请求取消，当前项跑完后停止")

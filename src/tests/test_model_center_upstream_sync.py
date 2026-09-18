@@ -524,9 +524,10 @@ def test_progress_sink_receives_start_and_done_per_source(env):
         progress_sink=lambda op_id, event: events.append(dict(event)),
     )
     _wait(env, operation)
+    # start → done → finished；finished 是任务落地后的重绘信号，页面上不占一行。
     phases = [e["phase"] for e in events]
-    assert phases == ["start", "done"]
-    done = events[-1]
+    assert phases == ["start", "done", "finished"], phases
+    done = next(e for e in events if e["phase"] == "done")
     assert done["label"] == "alpha"
     assert done["status"] == "succeeded"
     assert done["count"] >= 1
@@ -617,3 +618,26 @@ def test_cancel_emits_a_cancelled_event_for_the_page(env):
     cancelled = [e for e in events if e["phase"] == "cancelled"]
     assert cancelled, f"未发出取消事件：{[e['phase'] for e in events]}"
     assert cancelled[-1]["label"] == "alpha"
+
+
+def test_finished_event_arrives_after_the_operation_reaches_terminal(env):
+    """最后一项完成后必须再发一次收尾事件。
+
+    回归点：最后一项的 done 是在 _batch 里发的，那时任务仍是 RUNNING，进度页
+    因此还画着"取消同步"；此后没有任何事件，按钮就永久卡住，点它只会得到
+    INVALID_OPERATION_STATE（界面显示"操作失败，请稍后重试"）。
+    """
+    _install(apis=[_api("alpha")])
+    env.responses["api-secret-alpha"] = _payload("m1")
+    seen = []
+    operation = env.control.start_upstream_sync(
+        env.context, None, sources=(_api_ref("alpha"),),
+        progress_sink=lambda op_id, event: seen.append(dict(event)),
+    )
+    _wait(env, operation)
+    deadline = time.monotonic() + 5
+    while "finished" not in [e["phase"] for e in seen] and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert "finished" in [e["phase"] for e in seen], [e["phase"] for e in seen]
+    # 收到 finished 时任务已经是终态，页面据此才能隐藏取消按钮
+    assert env.store.get(env.context, operation.id).status is OperationStatus.SUCCEEDED
