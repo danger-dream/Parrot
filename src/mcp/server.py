@@ -232,12 +232,34 @@ def _apply_source(arguments: dict, *, kind: str) -> Optional[str]:
     return source
 
 
+def _auto_model(kind: str) -> Optional[str]:
+    """未指定来源时，按当前配置挑一个可用模型。
+
+    ``source`` 的契约是"省略或 auto = 按当前配置自动选择"，但下游
+    （images_runtime / imagine）只接受**具体的模型名**，没有 auto 这个概念：
+    传 auto 会被 images_openai_compat 判为 unknown image model。
+    因此这里替下游把 auto 解析成一个真实模型。
+
+    返回 None 表示当前没有任何可用模型；调用方据此给出可读的错误，而不是把
+    auto 透下去换回一句"unknown image model"。
+    """
+    if kind == "image":
+        options = catalog.image_sources()
+    elif kind == "video":
+        options = catalog.video_sources()
+    else:
+        options = catalog.available_engines()
+    return options[0] if options else None
+
+
 def _requested_model(arguments: dict, *, kind: str) -> str:
     """媒体工具实际使用的模型：统一由 source 指定。
 
     历史上图片/视频工具另有一个 model 参数，与 source 语义重复且 source 只校验
     不生效。现在只保留 source（schema 里也只暴露它），此处兼容读取旧的 model，
     让升级期间已发出的调用不会突然失效。
+
+    未指定时解析成当前可用的具体模型——下游不认识 auto。
     """
     source = _apply_source(arguments, kind=kind)
     if source:
@@ -245,7 +267,12 @@ def _requested_model(arguments: dict, *, kind: str) -> str:
     legacy = str(arguments.get("model") or "").strip()
     if legacy and legacy.lower() != catalog.AUTO:
         return legacy
-    return "auto"
+    resolved = _auto_model(kind)
+    if resolved:
+        return resolved
+    raise ToolError(
+        "当前没有可用的模型；请在 Parrot 里配置图片来源，或用 source 指定一个具体模型。"
+    )
 
 
 def _timeout_override(arguments: dict) -> Optional[float]:

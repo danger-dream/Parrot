@@ -513,6 +513,40 @@ def test_menu_ignores_foreign_callbacks():
     assert menu.handle_callback(1, 1, "cb", "srch:show") is False
 
 
+def test_omitting_source_resolves_to_a_concrete_model():
+    """省略 source 也必须是具体模型——下游不认识 auto。
+
+    曾经这里直接返回字符串 "auto" 并透给 images_openai_compat，而下游只接受
+    清单里的模型名，于是最常见的用法（不填 source）报
+    "unknown image model; configure an image source or alias"。
+    """
+    from src.mcp import server as mcp_server
+
+    for kind, options in (("image", catalog.image_sources()),
+                          ("video", catalog.video_sources())):
+        if not options:
+            continue
+        for arguments in ({}, {"source": "auto"}, {"source": catalog.AUTO}):
+            got = mcp_server._requested_model(arguments, kind=kind)
+            assert got != catalog.AUTO, (kind, arguments)
+            assert got in options, (kind, arguments, got)
+
+
+def test_auto_model_is_none_when_no_source_is_configured():
+    """没有可用模型时返回 None，调用方给出可读错误而不是透传 auto。"""
+    from src.mcp import server as mcp_server
+
+    original = catalog.image_sources
+    catalog.image_sources = lambda: []
+    try:
+        assert mcp_server._auto_model("image") is None
+        with pytest.raises(mcp_server.ToolError) as excinfo:
+            mcp_server._requested_model({}, kind="image")
+        assert "没有可用" in str(excinfo.value)
+    finally:
+        catalog.image_sources = original
+
+
 def test_search_records_the_engine_without_exposing_it_to_the_model():
     """日志要能回答"用的哪个引擎"，但来源标识不能交给模型。
 
@@ -638,7 +672,14 @@ def test_legacy_model_argument_still_works_for_in_flight_clients():
     from src.mcp import server as mcp_server
 
     assert mcp_server._requested_model({"model": "gpt-image-2"}, kind="image") == "gpt-image-2"
-    assert mcp_server._requested_model({"model": "auto"}, kind="image") == "auto"
+    # 旧调用里的 model=auto 等价于"不指定"：必须解析成具体模型，不能把 auto
+    # 透给下游（下游只认清单里的名字）。测试环境未配置来源时则是可读的报错。
+    options = catalog.image_sources()
+    if options:
+        assert mcp_server._requested_model({"model": "auto"}, kind="image") in options
+    else:
+        with pytest.raises(mcp_server.ToolError):
+            mcp_server._requested_model({"model": "auto"}, kind="image")
     # 两者同时出现时以 source 为准（它才是现在对外暴露的那个）。
     # 用一个真的在可用列表里的模型，否则会被当不可用而报错。
     model = _first_image_model()
