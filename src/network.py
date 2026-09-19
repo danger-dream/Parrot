@@ -820,8 +820,13 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                  proxy_channel: str = "",
                  proxy_model: str = "",
                  byte_counter=None,
+                 impersonate: str | None = None,
                  **kwargs) -> httpx.AsyncClient:
     """Create an async HTTP client, optionally routing through a proxy.
+
+    ``impersonate`` 非空（如 ``"chrome131"``）时出站换用 TLS/H2 指纹伪装
+    transport（curl_cffi backend），ALPN 由 BoringSSL 协商，httpx 自身的
+    ``http2`` 开关必须让位。详见 ``src/transports/fingerprint.py``。
 
     If the new proxy subsystem is configured, ``proxy_purpose`` /
     ``proxy_channel`` / ``proxy_model`` are used to resolve a proxy via
@@ -861,6 +866,24 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
         opts["limits"] = limits
     opts.setdefault("http2", http2)
     proxy = active_socks5_url()
+    if impersonate:
+        # TLS/H2 指纹伪装：换 curl_cffi transport，ALPN 由 BoringSSL 协商，
+        # httpx 自身的 http2 开关必须让位（同时传会 raise）。
+        # backend 缺失时 fallback 默认 transport，不阻断主链路。
+        from .transports.fingerprint import impersonation_transport
+        transport = impersonation_transport(impersonate, proxy=proxy)
+        if transport is None:
+            print(
+                "[network] curl_cffi unavailable; "
+                f"TLS fingerprint impersonation disabled ({impersonate})"
+            )
+        else:
+            opts.pop("http2", None)
+            opts["transport"] = transport
+            if proxy:
+                # 代理已交给 transport，避免 httpx 静默忽略后从本机直连出口。
+                opts["trust_env"] = False
+                proxy = ""
     if proxy:
         opts["proxy"] = proxy
         opts["trust_env"] = False

@@ -160,6 +160,11 @@ class Channel(ABC):
     enabled: bool
     disabled_reason: Optional[str]
     cc_mimicry: bool
+    # TLS/H2 指纹画像（如 "chrome131"）。非空时该渠道出站换用 curl_cffi
+    # impersonation transport（见 src/transports/fingerprint.py），用于
+    # Cloud Code / Antigravity 等按客户端画像分发的 Google 前端。
+    # None 表示不伪装，走共享 httpx 连接池。
+    tls_fingerprint: Optional[str] = None
     # 渠道的上游协议。默认 "anthropic"（现状），OpenAI 家族子类会覆盖为
     # "openai-chat" 或 "openai-responses"。scheduler / failover / probe 都依据它分派行为。
     protocol: str = "anthropic"

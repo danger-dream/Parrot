@@ -611,6 +611,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
         "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
         "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
+        "tlsFingerprint": "chrome131",
         "imageModels": [
             "gemini-3.1-flash-image",
         ],

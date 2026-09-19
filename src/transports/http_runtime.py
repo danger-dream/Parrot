@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from .. import blacklist, log_db, upstream
+from .. import blacklist, log_db, network, upstream
 from ..async_owned import await_owned
 from ..providers import registry as provider_registry
 from ..protocols import errors as protocol_errors
@@ -1533,6 +1533,24 @@ async def open_response_with_proxy_chain(
                 limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
                 trust_env=False,
                 http2=False,
+            )
+            client = proxy_client
+            owner.proxy_client = proxy_client
+        elif getattr(channel, "tls_fingerprint", None):
+            # 渠道声明的 TLS 指纹伪装：为本次 attempt 建一个短生命周期的
+            # impersonation client（复用 proxy_client 的释放路径）。
+            # 共享池继续服务其余渠道；proxy route 有 connector client 时
+            # 出口语义优先，不叠指纹。
+            proxy_client = network.async_client(
+                timeout=httpx.Timeout(
+                    connect=round_timeouts.connection + 0.5,
+                    read=max(330.0, round_timeouts.total + 1.0),
+                    write=30.0,
+                    pool=round_timeouts.connection + 0.5,
+                ),
+                limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+                http2=False,
+                impersonate=str(channel.tls_fingerprint),
             )
             client = proxy_client
             owner.proxy_client = proxy_client

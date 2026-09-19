@@ -27,6 +27,11 @@ socksio>=1.0,<2
 starlette>=0.46
 # Directly used to shield terminal/cleanup owners from ASGI level cancellation.
 anyio>=3.6.2,<5
+# curl_cffi: TLS/H2 fingerprint impersonation transport
+# (src/transports/fingerprint.py, opt-in per channel via <family>.tlsFingerprint).
+# linux manylinux wheels exist for the Docker runtime; import is fail-open
+# (falls back to plain httpx when missing).
+curl_cffi>=0.7
 # python-socks: hidden runtime dependency. websockets dynamically imports python_socks when
 # connecting through a SOCKS5 proxy (src/failover.py + src/openai/responses_ws.py).
 # Without it: ImportError: connecting through a SOCKS proxy requires python-socks.

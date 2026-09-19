@@ -87,6 +87,9 @@ class AntigravityOAuthChannel(Channel):
             self.max_concurrent = 0
 
         cfg = _provider_cfg()
+        # Cloud Code / Antigravity 前端按 TLS 画像区分 IDE 与脚本直连，
+        # 默认对出站连接做 BoringSSL 指纹伪装；置空串可回退共享 httpx 池。
+        self.tls_fingerprint = str(cfg.get("tlsFingerprint") or "").strip() or None
         stored_base = str(
             account.get("request_base_url")
             or account.get("requestBaseUrl")

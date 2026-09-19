@@ -398,6 +398,12 @@
     "requestTimeoutSeconds": 300,
     "modelSyncHours": 6
   },
+  "antigravityOAuth": {
+    "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
+    "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
+    "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
+    "tlsFingerprint": "chrome131"
+  },
   "openai": {
     "store": {
       "enabled": true,

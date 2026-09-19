@@ -493,6 +493,25 @@ GLM-5:glm-5, GLM-5-Turbo:glm-5-turbo ; gpt-5.4 ， gpt-5.3-codex:codex
 
 Telegram 界面只显示合并后的 USD 金额，不展示金额来源分类或未计价次数；统计页面保留两位小数，最近日志紧凑列表保留三位小数，均不加约等号。models.dev 计价结果与 xAI 上游金额会直接合并到同一个总额，内部仍保留各自结算来源及无法计价记录，以保证账本和聚合口径不变。Parrot 不做实时汇率换算。旧版 OpenAI 日志曾把缓存读取 Token 同时包含在 `input_tokens` 中；若历史行缺少明确的 usage 口径且无法确认新旧语义，内部不会把它作为已知金额计入总额。
 
+### TLS 指纹伪装 `tlsFingerprint`
+
+Cloud Code / Antigravity 家族的 Google 前端在 TLS/ALPN 层就能把 IDE 进程与脚本
+直连分开，协议层拟真覆盖不到这一层。声明后该渠道的出站连接换用 curl_cffi 的
+BoringSSL 画像（JA3/JA4/ALPN/header 序），实现见 `docs/14-antigravity-tls-mimicry.md`。
+
+```
+"antigravityOAuth": {
+  "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
+  "tlsFingerprint": "chrome131"
+}
+```
+
+- 默认 `"chrome131"`（与 UA 暗示的 Electron/Chromium 画像同族）。
+- 置空串 `""` 关闭，退回共享 httpx 连接池。
+- 仅对 **direct route** 生效；proxy route 出口语义优先，不叠加指纹。
+- 未安装 `curl_cffi` 时 fail-open：告警一次并退回默认 transport。
+- UA 版本与 profile 应一起调整（UA 下限由官方 hub manifest 决定，当前 2.9.1）。
+
 ### 超时语义（关键）
 
 四段超时**独立**运行，任一段超时即中止：
