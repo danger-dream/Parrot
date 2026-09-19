@@ -117,13 +117,17 @@ async def test_usage_nested_totals_stream_and_new_client_turn(protocol,monkeypat
     obj=json.loads((await policy.run(req(protocol),protocol,invoke,api_key_name='k')).body)
     expected={};policy._sum_usage(expected,usage);policy._sum_usage(expected,usage)
     assert obj['usage']==expected
-    task=asyncio.create_task(asyncio.sleep(0,result=JSONResponse(obj)))
-    raw=b''.join([c async for c in policy.stream(task,protocol).body_iterator])
+    count=0
+    streaming_body={**req(protocol),'stream_options':{'include_usage':True}}
+    raw=b''.join([c async for c in policy.stream(streaming_body,protocol,invoke).body_iterator])
     frames=[json.loads(line[5:]) for line in raw.splitlines() if line.startswith(b'data:') and line[5:].strip()!=b'[DONE]']
     if protocol=='anthropic':
         start=next(f['message']['usage'] for f in frames if f.get('type')=='message_start')
-        assert start['cache_creation']==expected['cache_creation']
-        assert start['server_tool_use']==expected['server_tool_use']
+        assert start['cache_creation']==usage['cache_creation']
+        assert start['server_tool_use']==usage['server_tool_use']
+        final_usage=next(f['usage'] for f in frames if f.get('type')=='message_delta')
+        assert final_usage['cache_creation']==expected['cache_creation']
+        assert final_usage['server_tool_use']==expected['server_tool_use']
         assert next(f['usage']['output_tokens'] for f in frames if f.get('type')=='message_delta')==8
     else:
         final=next(f['response'] for f in frames if f.get('type')=='response.completed') if protocol=='responses' else next(f for f in frames if 'usage' in f)
@@ -240,6 +244,10 @@ async def test_ws_passthrough_forwards_first_real_event_before_terminal(monkeypa
     class Socket:
         async def send_text(self,text):
             seen.append(json.loads(text));first_sent.set()
+        async def receive(self):
+            # Stay connected while the active-turn control reader watches for
+            # cancellation; the mocked next-turn receiver ends the session.
+            await asyncio.Event().wait()
     class Lease:
         async def release(self):seen.append({'released':True})
     async def source():

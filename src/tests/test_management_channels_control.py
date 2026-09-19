@@ -294,6 +294,46 @@ def test_model_discovery_uses_catalog_static_fallback_and_does_not_persist():
     assert config.get().get("channels", []) == before
 
 
+@pytest.mark.parametrize("protocol", list(ChannelProtocol))
+@pytest.mark.parametrize("entrypoint", ["channel", "model_center"])
+def test_clear_one_model_resolves_runtime_alias_and_keeps_other_errors(protocol, entrypoint):
+    from dataclasses import replace
+    from src.management_control.models import ModelCenterControl, ModelSourceRef, ModelSourceType
+
+    control = ChannelControl()
+    one = control.create_channel(ADMIN_CONTEXT, replace(
+        _command("One", protocol=protocol), base_url="https://provider.example.test",
+    )).channel
+    two = control.create_channel(ADMIN_CONTEXT, replace(
+        _command("Two", protocol=protocol), base_url="https://provider.example.test",
+    )).channel
+    cooldown.record_error(one.id, "model-real", "selected error")
+    cooldown.record_error(one.id, "other-real", "other model")
+    cooldown.record_error(two.id, "model-real", "other source")
+    before = copy.deepcopy(cooldown.active_entries())
+    with pytest.raises(ManagementError) as denied:
+        control.clear_model_errors(_context(Capability.READ), one.id, "model-alias")
+    assert denied.value.code is ManagementErrorCode.CAPABILITY_DENIED
+    with pytest.raises(ManagementError) as missing:
+        control.clear_model_errors(ADMIN_CONTEXT, one.id, "unknown")
+    assert missing.value.code is ManagementErrorCode.RESOURCE_NOT_FOUND
+    assert cooldown.active_entries() == before
+
+    if entrypoint == "channel":
+        assert control.clear_model_errors(ADMIN_CONTEXT, one.id, "model-alias").affected == 1
+    else:
+        ModelCenterControl(channels=control).clear_model_errors(
+            ADMIN_CONTEXT, source=ModelSourceRef(ModelSourceType.API, one.id),
+            model_id="model-alias",
+        )
+    assert cooldown.get_state(one.id, "model-real") is None
+    assert state_db.error_load(one.id, "model-real") is None
+    assert cooldown.get_state(one.id, "other-real") is not None
+    assert cooldown.get_state(two.id, "model-real") is not None
+    assert state_db.error_load(one.id, "other-real") is not None
+    assert state_db.error_load(two.id, "model-real") is not None
+
+
 def test_clear_actions_report_affected_entries():
     control = ChannelControl()
     one = control.create_channel(ADMIN_CONTEXT, _command("One")).channel

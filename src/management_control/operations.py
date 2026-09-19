@@ -333,8 +333,6 @@ class OperationStore:
             if not operation.cancellable:
                 raise ManagementError(ManagementErrorCode.INVALID_OPERATION_STATE)
             future = self._futures.get(operation_id)
-            if future is not None:
-                future.cancel()
             task = self._tasks.get(operation_id)
             if task is not None:
                 task.get_loop().call_soon_threadsafe(task.cancel)
@@ -344,6 +342,11 @@ class OperationStore:
                 finished_at=self._now(),
                 cancellable=False,
             )
+        # Future callbacks may release domain locks. Publish the terminal state
+        # first and invoke them outside the store lock (domain -> store is the
+        # submission lock order).
+        if future is not None:
+            future.cancel()
         self._audit(context, "operation.cancel", operation_id, "cancelled")
 
     def cancel_requested(self, operation_id: str) -> bool:
@@ -421,8 +424,8 @@ class OperationStore:
             if self._futures.get(operation_id) is future:
                 self._futures.pop(operation_id, None)
 
-    def submit(self, operation_id: str, worker: Callable[[], None]) -> None:
-        """Submit a native-thread operation to the shared bounded executor."""
+    def submit(self, operation_id: str, worker: Callable[[], None]) -> Future[None]:
+        """Submit owned work; the future also signals cancellation before entry."""
         if not callable(worker):
             raise ValueError("worker must be callable")
         with self._lock:
@@ -447,6 +450,7 @@ class OperationStore:
             future.add_done_callback(
                 lambda completed, oid=operation_id: self._discard_future(oid, completed)
             )
+        return future
 
     def _task_done(self, operation_id: str, task: asyncio.Task[Any]) -> None:
         with self._lock:
@@ -499,9 +503,7 @@ class OperationStore:
                 return False
             self._accepting = False
             self._closing = True
-            # Future.cancel() succeeds only before native execution starts.
-            for future in tuple(self._futures.values()):
-                future.cancel()
+            futures = tuple(self._futures.values())
             # An asyncio Task whose record is still queued has not entered its
             # operation body. Running tasks get the same bounded grace period as
             # native workers.
@@ -509,7 +511,10 @@ class OperationStore:
                 operation = self._items.get(operation_id)
                 if operation is not None and operation.status is OperationStatus.QUEUED:
                     task.cancel()
-            return True
+        # As in cancel(), never run domain completion callbacks under _lock.
+        for future in futures:
+            future.cancel()
+        return True
 
     def _unfinished(self) -> tuple[tuple[Future[None], ...], tuple[asyncio.Task[Any], ...]]:
         with self._lock:

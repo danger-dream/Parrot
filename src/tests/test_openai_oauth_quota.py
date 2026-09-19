@@ -30,12 +30,18 @@ import os
 import sys
 import time
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _disable_oauth_network_for_test(monkeypatch):
+    monkeypatch.setenv("DISABLE_OAUTH_NETWORK_CALLS", "1")
+
 
 def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = "1"
     from src import config, oauth_manager, state_db, failover
     from src.channel import registry
     from src.channel.openai_oauth_channel import OpenAIOAuthChannel

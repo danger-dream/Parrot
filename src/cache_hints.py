@@ -250,6 +250,34 @@ def apply_anthropic_tools_cache_breakpoint(
     return False
 
 
+def _align_cache_control_with_top_level(
+    cache_control: dict[str, Any],
+    top_level: Any,
+) -> dict[str, Any]:
+    """Return a generated breakpoint whose TTL matches the top-level umbrella.
+
+    Anthropic applies a top-level ``cache_control`` to its target block and
+    rejects the request when that block also carries its own ``cache_control``
+    with a different TTL ("they must have matching TTLs").  Breakpoints that
+    Parrot generates therefore follow the top-level value; client-supplied
+    blocks are never rewritten here.
+    """
+    if not isinstance(top_level, dict):
+        return cache_control
+    if str(top_level.get("type") or "").strip().lower() != "ephemeral":
+        return cache_control
+    if str(cache_control.get("type") or "").strip().lower() != "ephemeral":
+        return cache_control
+    aligned = dict(cache_control)
+    ttl = top_level.get("ttl")
+    if isinstance(ttl, str) and ttl.strip():
+        aligned["ttl"] = ttl.strip()
+    else:
+        # Omitted top-level ttl means Anthropic's 5m default.
+        aligned.pop("ttl", None)
+    return aligned
+
+
 def apply_anthropic_block_cache_breakpoints(
     payload: dict[str, Any],
     *,
@@ -262,12 +290,29 @@ def apply_anthropic_block_cache_breakpoints(
     final system block, final message, then the second-to-last user turn. An
     existing breakpoint suppresses auto-injection only in its own section, not
     in unrelated sections. Existing client controls are never moved or removed.
+
+    When the payload carries a top-level ``cache_control``, generated
+    breakpoints adopt its TTL so the umbrella and the block it targets never
+    disagree.
+
+    Anthropic counts a top-level ``cache_control`` towards the same four-block
+    allowance as block-level controls.  Counting only the block-level ones made
+    a bridged OpenAI payload add four block breakpoints on top of the umbrella
+    and get rejected with "Found 5"; the umbrella is therefore reserved first.
     """
     if not isinstance(payload, dict) or max_breakpoints <= 0:
         return
 
-    generated_control = dict(default_cache_control or _ANTHROPIC_EPHEMERAL_1H)
+    top_level_control = payload.get("cache_control")
+    generated_control = _align_cache_control_with_top_level(
+        dict(default_cache_control or _ANTHROPIC_EPHEMERAL_1H), top_level_control,
+    )
+    short_control = _align_cache_control_with_top_level(
+        dict(_ANTHROPIC_EPHEMERAL_5M), top_level_control,
+    )
     existing = list(_anthropic_block_cache_controls(payload))
+    if isinstance(top_level_control, dict):
+        existing.append(top_level_control)
     remaining = max_breakpoints - len(existing)
     if remaining <= 0:
         return
@@ -290,7 +335,7 @@ def apply_anthropic_block_cache_breakpoints(
     system = payload.get("system")
     system_controls = list(_cache_controls_in_value(system))
     if not system_controls and isinstance(system, list) and system and isinstance(system[-1], dict):
-        cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else generated_control
+        cache_control = short_control if short_ttl_seen else generated_control
         blocks = list(system)
         blocks[-1] = {**blocks[-1], "cache_control": dict(cache_control)}
         payload["system"] = blocks
@@ -315,7 +360,7 @@ def apply_anthropic_block_cache_breakpoints(
     if message_controls:
         return
 
-    cache_control = _ANTHROPIC_EPHEMERAL_5M if short_ttl_seen else generated_control
+    cache_control = short_control if short_ttl_seen else generated_control
     target_indices: list[int] = []
     if isinstance(messages[-1], dict):
         target_indices.append(len(messages) - 1)

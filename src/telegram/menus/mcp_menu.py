@@ -396,12 +396,7 @@ def _resolve_log(chat_id: int, short: str) -> dict | None:
     call_id = full[len("mcplog:"):]
     if not call_id:
         return None
-    # logs() 是唯一能拿到公开视图的口径（含 params 解析），按 callId 精确匹配。
-    value = _CONTROL.logs(_ctx(chat_id), period="today", page=1, page_size=200)
-    return next(
-        (row for row in value.get("items") or [] if str(row.get("callId")) == call_id),
-        None,
-    )
+    return _CONTROL.log_entry(_ctx(chat_id), call_id, period="today")
 
 
 def _render_detail(row: dict) -> str:
@@ -498,11 +493,18 @@ def show_detail(chat_id: int, message_id: int, cb_id: str, short: str, *, page: 
 
 
 def _chunk_pages(text: str, limit: int = _RESULT_PAGE_CHARS) -> list[str]:
-    """按字符切页；<pre> 内不截断 HTML 标签。"""
+    """Bound each page after HTML escaping; retain every original character."""
     body = text or ""
-    if not body:
-        return [""]
-    return [body[i:i + limit] for i in range(0, len(body), limit)]
+    pages: list[str] = []
+    start = size = 0
+    for index, char in enumerate(body):
+        escaped_size = len(ui.escape_html(char))
+        if size and size + escaped_size > limit:
+            pages.append(body[start:index])
+            start, size = index, 0
+        size += escaped_size
+    pages.append(body[start:])
+    return pages
 
 
 def _pretty_result(body: str) -> str:
@@ -604,8 +606,8 @@ def show_result(
         nav.append(ui.btn("下页 ▶", f"mcp:result:{short}:{page}:{idx + 1}"))
     rows = ([nav] if nav else [])
     rows.append([ui.btn("◀ 返回详情", f"mcp:detail:{ui.register_code('mcplog:' + call_id)}:{page}")])
-    ui.edit(chat_id, message_id, ui.truncate(text, suffix="\n\n... (已截断)"),
-            reply_markup=ui.inline_kb(rows))
+    # _chunk_pages already budgets escaped content, leaving room for header/tags.
+    ui.edit(chat_id, message_id, text, reply_markup=ui.inline_kb(rows))
 
 
 # ─── 回调分发 ─────────────────────────────────────────────────────

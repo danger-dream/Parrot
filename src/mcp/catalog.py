@@ -61,7 +61,7 @@ def accepts_source(tool_name: str) -> bool:
     return tool_name not in _NO_SOURCE_TOOLS
 
 
-def source_property(tool_name: str) -> dict[str, Any]:
+def source_property(tool_name: str, key_name: str | None = None) -> dict[str, Any]:
     """按当前配置生成 source 参数定义。
 
     带 enum 才能让客户端在参数层就约束取值；此前只有说明文字，模型容易填错。
@@ -69,7 +69,7 @@ def source_property(tool_name: str) -> dict[str, Any]:
     只留 auto，而不是给一个空 enum——空 enum 在多数客户端里是不可选的意思。
     """
     kind = source_kind(tool_name)
-    options = live_options(tool_name)[0]
+    options = live_options(tool_name, key_name)[0]
     prop: dict[str, Any] = {
         "type": "string",
         "description": f"指定{_SOURCE_KIND_LABELS[kind]}；省略或 auto = 按 Parrot 当前配置自动选择。",
@@ -84,8 +84,8 @@ def common_properties(tool_name: str) -> dict[str, dict[str, Any]]:
     if accepts_source(tool_name):
         properties["source"] = source_property(tool_name)
     properties["timeout_seconds"] = {
-        "type": "number",
-        "description": "本次调用超时秒数；省略则使用 Parrot 当前配置。",
+        "type": "number", "minimum": 0.1, "maximum": 600,
+        "description": "本次调用超时秒数（含排队）；省略则使用 Parrot 当前配置。",
     }
     return properties
 
@@ -151,11 +151,14 @@ SPECS: dict[str, ToolSpec] = {
 }
 
 
-def _search_sources() -> tuple[list[str], str]:
+def _search_sources(tool_name: str = "web_search") -> tuple[list[str], str]:
     """当前可用的搜索引擎 id 列表与补充说明。未配置任何来源时返回空列表。"""
     from .. import search_service
 
     rows = search_service.backend_statuses()
+    if tool_name == "web_fetch":
+        # Match search_service's extract capability, not just credential readiness.
+        rows = [row for row in rows if row.get("type") in ("anysearch", "tavily", "exa", "openai")]
     usable = [row for row in rows if row.get("available")]
     ids = [str(row["id"]) for row in usable]
     disabled = [str(row["id"]) for row in rows if not row.get("available")]
@@ -177,15 +180,49 @@ def image_sources() -> list[str]:
 
 def video_sources() -> list[str]:
     """当前可用的视频模型。"""
+    from .. import image_catalog, model_state
     from ..xai import imagine
 
     try:
-        return list(imagine.video_models())
+        available = {source.model for source in image_catalog.sources(kind="video")
+                     if source.available and model_state.is_discovery_visible(source.model)}
+        # Filtering must not change the configured fallback priority.
+        return [model for model in imagine.video_models() if model in available]
     except Exception:
         return []
 
 
-def live_options(tool_name: str) -> tuple[list[str], str]:
+def media_sources(kind: str, key_name: str | None = None) -> list[str]:
+    """Available models narrowed with the same whitelist/alias rules as HTTP.
+
+    No key is used by configuration/catalog callers; actual MCP calls always
+    supply their authenticated key. Downstream HTTP authorization remains final.
+    """
+    from .. import auth, model_mapping, model_names, model_state
+
+    options = image_sources() if kind == "image" else video_sources()
+    if key_name is None:
+        return options
+    entry = auth.api_key_entry(key_name)
+    if not entry or entry.get("enabled") is False:
+        return []
+    allowed = set(model_names.expand_legacy_permissions(list(entry.get("allowedModels") or [])))
+    if not allowed:
+        return options
+    mapping = model_mapping.get_global_map()
+    # A key may grant only a global alias. Keep that authorized request name,
+    # rather than replacing it with a real name the key has not been granted.
+    options = list(options)
+    available = set(options)
+    options.extend(alias for alias, real in mapping.items()
+                   if alias in allowed and alias not in available and real in available
+                   and model_state.is_discovery_visible(alias)
+                   and model_state.is_discovery_visible(real))
+    return [model for model in options
+            if model in allowed or mapping.get(model, model) in allowed]
+
+
+def live_options(tool_name: str, key_name: str | None = None) -> tuple[list[str], str]:
     """按当前配置计算一个工具的实时可选值与补充说明。
 
     不可用的来源仍然会被列出（并标注"不可用"），这样模型能理解为什么调用
@@ -195,23 +232,23 @@ def live_options(tool_name: str) -> tuple[list[str], str]:
     if not accepts_source(tool_name):
         return [], ""
     if tool_name in ("web_search", "web_fetch"):
-        return _search_sources()
+        return _search_sources(tool_name)
     if tool_name in ("image_generate", "image_edit"):
-        return image_sources(), ""
+        return media_sources("image", key_name), ""
     if tool_name in ("video_generate", "video_status"):
-        return video_sources(), ""
+        return media_sources("video", key_name), ""
     return [], ""
 
 
-def available_engines() -> list[str]:
-    """供工具处理器复用的可用搜索引擎 id（不抛异常）。"""
-    return _search_sources()[0]
+def available_engines(tool_name: str = "web_search") -> list[str]:
+    """供工具处理器复用的可用且支持对应操作的搜索引擎 id。"""
+    return _search_sources(tool_name)[0]
 
 
-def render_description(tool_name: str) -> str:
+def render_description(tool_name: str, key_name: str | None = None) -> str:
     """工具的最终说明文本（含实时可选值）。"""
     spec = SPECS.get(tool_name)
     if spec is None:
         return ""
-    options, detail = live_options(tool_name)
+    options, detail = live_options(tool_name, key_name)
     return spec.render(options, detail)

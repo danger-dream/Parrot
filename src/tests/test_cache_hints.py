@@ -74,6 +74,120 @@ def test_plain_metadata_user_id_is_not_treated_as_session_id():
     assert cache_hints.stable_prompt_cache_key_from_anthropic(body) is None
 
 
+def _collect_cache_controls(payload: dict) -> list[dict]:
+    controls = [
+        tool["cache_control"]
+        for tool in payload.get("tools") or []
+        if isinstance(tool.get("cache_control"), dict)
+    ]
+    for block in payload.get("system") or []:
+        if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+            controls.append(block["cache_control"])
+    for message in payload.get("messages") or []:
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                controls.append(block["cache_control"])
+    return controls
+
+
+def _bridged_anthropic_payload() -> dict:
+    return {
+        "model": "claude-fable-5-1",
+        "system": [{"type": "text", "text": "stable expensive instructions"}],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "bootstrap"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ack"}]},
+            {"role": "user", "content": [{"type": "text", "text": "dynamic tail"}]},
+        ],
+    }
+
+
+def test_generated_breakpoints_match_five_minute_top_level_cache_control():
+    """A bare prompt_cache_key yields a 5m umbrella; blocks must not claim 1h.
+
+    Anthropic rejects the request when the top-level control and the block it
+    targets disagree ("they must have matching TTLs").
+    """
+    payload = _bridged_anthropic_payload()
+    cache_hints.apply_openai_cache_to_anthropic_payload(
+        {"prompt_cache_key": "conversation-1"}, payload,
+    )
+
+    assert payload["cache_control"] == {"type": "ephemeral"}
+    controls = _collect_cache_controls(payload)
+    assert controls
+    assert all("ttl" not in control for control in controls)
+
+
+def test_generated_breakpoints_match_one_hour_top_level_cache_control():
+    payload = _bridged_anthropic_payload()
+    cache_hints.apply_openai_cache_to_anthropic_payload(
+        {"prompt_cache_key": "conversation-1", "prompt_cache_retention": "24h"}, payload,
+    )
+
+    assert payload["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    controls = _collect_cache_controls(payload)
+    assert controls
+    assert all(control.get("ttl") == "1h" for control in controls)
+
+
+def test_generated_breakpoints_keep_one_hour_without_top_level_control():
+    payload = _bridged_anthropic_payload()
+    cache_hints.apply_anthropic_block_cache_breakpoints(payload)
+
+    assert "cache_control" not in payload
+    controls = _collect_cache_controls(payload)
+    assert controls
+    assert all(control.get("ttl") == "1h" for control in controls)
+
+
+def _five_turn_anthropic_payload() -> dict:
+    """A payload long enough to reach the second-to-last-user breakpoint slot."""
+    return {
+        "model": "claude-fable-5-1",
+        "system": [{"type": "text", "text": "stable expensive instructions"}],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "bootstrap"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ack"}]},
+            {"role": "user", "content": [{"type": "text", "text": "follow-up"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ack"}]},
+            {"role": "user", "content": [{"type": "text", "text": "dynamic tail"}]},
+        ],
+    }
+
+
+def test_top_level_control_reserves_one_of_the_four_block_slots():
+    """The umbrella counts against Anthropic's four-block allowance.
+
+    A bridged OpenAI payload used to add four block breakpoints on top of the
+    generated top-level control, so the request was rejected with "A maximum of
+    4 blocks with cache_control may be provided. Found 5."
+    """
+    payload = _five_turn_anthropic_payload()
+    cache_hints.apply_openai_cache_to_anthropic_payload(
+        {"prompt_cache_key": "conversation-1"}, payload,
+    )
+
+    assert payload["cache_control"] == {"type": "ephemeral"}
+    blocks = _collect_cache_controls(payload)
+    # Three block breakpoints plus the umbrella stays within the limit of four,
+    # so the second-to-last user turn is left without a breakpoint.
+    assert len(blocks) == 3
+    assert len(blocks) + 1 <= 4
+
+
+def test_block_breakpoints_still_fill_four_slots_without_a_top_level_control():
+    """Without an umbrella the four block slots remain fully available."""
+    payload = _five_turn_anthropic_payload()
+    cache_hints.apply_anthropic_block_cache_breakpoints(payload)
+
+    assert "cache_control" not in payload
+    blocks = _collect_cache_controls(payload)
+    assert len(blocks) == 4
+
+
 def test_header_derived_internal_session_hint_is_supported():
     body = {
         "_parrot_claude_code_session_id": "57f87dc1-34b4-4d8b-acf1-4526c8ebb6e8",

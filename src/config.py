@@ -303,6 +303,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "oauth_refresh_failed": True, # OAuth Token 自动刷新失败（标 auth_error）
             "no_channels": True,          # 无可用渠道（503）
             "openai_store_save_failed": True,  # OpenAI previous_response_id Store 写入失败
+            "model_degraded": True,       # OpenAI 上游模型降级（请求模型与实际模型不一致）
             "status_alert": True,         # 上游 status page（Claude/OpenAI/Cloudflare）事件
             "app_update": True,           # Parrot 本身的新版本上线提醒
             "network_monitor": True,      # Parrot 自身网络健康检测失败/恢复

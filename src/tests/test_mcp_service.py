@@ -322,7 +322,9 @@ def test_finish_mcp_call_tolerates_a_missing_handle():
 
 
 def _record(tool="web_search", status="success", params=None, **finish_kw):
-    call_id = f"d-{tool}-{status}-{len(log_db.mcp_call_entries(0))}"
+    import uuid
+
+    call_id = f"d-{tool}-{status}-{uuid.uuid4().hex}"
     handle = log_db.record_mcp_call(
         call_id=call_id, tool_name=tool, api_key_name="tk", params=params or {"query": "q"},
     )
@@ -642,7 +644,7 @@ def test_source_enum_is_recomputed_with_the_configuration():
     assert target not in after
 
 
-def test_model_parameter_is_gone_and_source_drives_the_model():
+def test_model_parameter_is_gone_and_source_drives_the_model(monkeypatch):
     """媒体工具只保留 source 一个"选上游"参数，且它必须真的生效。"""
     from src.mcp import server as mcp_server
 
@@ -651,13 +653,12 @@ def test_model_parameter_is_gone_and_source_drives_the_model():
         assert "model" not in props, name
         assert "source" in props, name
 
-    model = _first_image_model()
-    if model is None:
-        pytest.skip("测试环境未配置图片模型")
+    model = "test-image-model"
+    monkeypatch.setattr(catalog, "image_sources", lambda: [model])
     assert mcp_server._requested_model({"source": model}, kind="image") == model
-    # 省略或 auto 时交给服务端按当前配置决定
-    assert mcp_server._requested_model({}, kind="image") == "auto"
-    assert mcp_server._requested_model({"source": "auto"}, kind="image") == "auto"
+    # 省略或 auto 也必须解析到真实模型，不能被无来源测试环境的 skip 掩盖。
+    assert mcp_server._requested_model({}, kind="image") == model
+    assert mcp_server._requested_model({"source": "auto"}, kind="image") == model
 
 
 def _first_image_model():

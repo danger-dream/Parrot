@@ -2306,6 +2306,7 @@ def _evaluate_cursor_model_pools(
     cooled = 0
     recovered = 0
     over_pools: list[str] = []
+    unknown_pool = False
     channel_key = f"oauth:{account_key}"
 
     for record in records:
@@ -2314,7 +2315,12 @@ def _evaluate_cursor_model_pools(
             continue
         pool = "cursor_models" if is_cursor_first_party_model(record, auto_bucket) else "other_models"
         utilization = auto_pct if pool == "cursor_models" else api_pct
-        over = utilization is not None and utilization >= threshold
+        if utilization is None:
+            # A partial dashboard fetch is not evidence that this pool reset.
+            # Preserve its current pause; independently evaluate known pools.
+            unknown_pool = True
+            continue
+        over = utilization >= threshold
         state = cooldown.get_state(channel_key, model) or {}
         previous_message = str(state.get("last_error_message") or "")
         owned = '"code":"cursor_quota_pool"' in previous_message or "cursor_quota_pool" in previous_message
@@ -2338,7 +2344,7 @@ def _evaluate_cursor_model_pools(
                     "resets_at": reset_iso,
                 }
             }, ensure_ascii=False, separators=(",", ":"))
-            cooldown.record_error(
+            cooldown.record_quota_pause(
                 channel_key, model, message, cooldown_until=reset_ms,
             )
             cooled += 1
@@ -2352,10 +2358,10 @@ def _evaluate_cursor_model_pools(
         try:
             notifier.notify_event(
                 "quota_cooldown",
-                "🟠 <b>Cursor 模型池已进入额度冷却</b>\n"
+                "⏸ <b>Cursor 模型池已进入配额暂停</b>\n"
                 f"账号: <code>{notifier.escape_html(account_key_to_email(account_key))}</code> · {notifier.provider_tag('cursor')}\n"
                 f"额度池: <code>{notifier.escape_html(' / '.join(over_pools))}</code>\n"
-                f"冷却模型: <code>{cooled}</code>\n"
+                f"暂停覆盖: <code>{cooled}</code> 个模型（含已禁用模型）\n"
                 f"恢复时间: <code>{notifier.escape_html(_to_bjt(reset_iso))}</code>"
             )
         except Exception:
@@ -2374,6 +2380,8 @@ def _evaluate_cursor_model_pools(
         action = "cursor_pool_recovered"
     elif over_pools:
         action = "cursor_pool_still_cooling"
+    elif unknown_pool:
+        action = "cursor_quota_unknown"
     else:
         action = "cursor_pool_available"
     return {
@@ -5055,6 +5063,20 @@ def _normalize_model_refresh_result(canonical: str, before: dict | None, result:
         "had_success_baseline": bool((before or {}).get("last_model_sync")),
     })
     normalized["changed"] = bool(normalized["added"] or normalized["removed"])
+
+    def records(account: dict | None) -> dict:
+        snapshot = account or {}
+        field = "cursor_model_catalog" if provider_of(snapshot) == "cursor" else "account_model_catalog"
+        catalog = snapshot.get(field) or {}
+        # Compare native model content, not fetch timestamps or list ordering.
+        return {
+            str(row["id"]): row for row in catalog.get("models", [])
+            if isinstance(row, dict) and row.get("id")
+        }
+
+    normalized["catalog_changed"] = normalized.get("action") == "updated" and (
+        normalized["changed"] or records(before) != records(after)
+    )
     return normalized
 
 
@@ -5476,7 +5498,7 @@ async def oauth_model_sync_once(
     accounts = [copy.deepcopy(acc) for acc in list_accounts()]
     selected: list[tuple[str, dict]] = []
     for account in accounts:
-        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor"}:
+        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor", "workbuddy"}:
             continue
         key = _account_key(account)
         if requested is not None and key not in requested:
@@ -5504,7 +5526,18 @@ async def oauth_model_sync_once(
                 print(f"[oauth] model change notification failed: {type(exc).__name__}")
         return result
 
-    return await asyncio.gather(*(run(key, account) for key, account in selected))
+    results = await asyncio.gather(*(run(key, account) for key, account in selected))
+    if any(
+        result.get("action") == "updated"
+        and (result.get("catalog_changed") or result.get("changed"))
+        for result in results
+    ):
+        from . import model_pricing
+
+        # All selected accounts have finished (including failures). Refresh the
+        # shared catalog once for this batch, never once per account.
+        await model_pricing.refresh_metadata_after_model_sync()
+    return results
 
 
 async def oauth_model_sync_loop() -> None:

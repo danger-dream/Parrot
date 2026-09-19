@@ -28,7 +28,7 @@ import threading
 
 from . import (
     affinity, blacklist, channel_state, compact_rescue, concurrency, config, cooldown, errors, fingerprint,
-    local_web_tools, log_db, model_metadata, model_pricing, model_state, notifier, oauth_manager, quota_errors, scorer, state_db,
+    local_web_tools, log_db, model_metadata, model_pricing, model_reroute, model_state, notifier, oauth_manager, quota_errors, scorer, state_db,
     token_counter, upstream,
 )
 from .channel.base import Channel, UpstreamDispatchMetadata
@@ -722,6 +722,38 @@ def _positive_output_limit(body: dict) -> tuple[str | None, int | None]:
     return None, None
 
 
+def _validate_candidate_model_enabled(ch: Channel, client_model: str) -> None:
+    if not model_state.is_global_enabled(client_model):
+        raise GuardError(
+            400, "invalid_request_error", "Model is disabled",
+            param="model", scope="candidate",
+        )
+    if not model_state.is_source_enabled(str(ch.key), client_model):
+        raise GuardError(
+            400, "invalid_request_error", "Model is disabled for this source",
+            param="model", scope="candidate",
+        )
+
+
+def _with_clamped_output_limit(body: dict, key: str, limit: int) -> dict:
+    """Candidate-local clamp preserving Anthropic's explicit thinking bounds."""
+    out = dict(body)
+    nested = body.get("response")
+    target = out
+    if isinstance(nested, dict) and key in nested:
+        target = out["response"] = dict(nested)
+    target[key] = limit
+    thinking = target.get("thinking")
+    if key == "max_tokens" and isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget >= limit and limit > 1024:
+            target["thinking"] = {**thinking, "budget_tokens": limit - 1}
+        # Below the enabled-thinking floor, preserve the client's requirement.
+        # Reject only after translation/explicit omitThinking policy has run:
+        # another candidate may support thinking, or this one may use adaptive.
+    return out
+
+
 def _candidate_budget_body(ch: Channel, resolved_model: str, body: dict) -> dict:
     """Recheck source preferences, then clamp requested output per candidate.
 
@@ -733,11 +765,7 @@ def _candidate_budget_body(ch: Channel, resolved_model: str, body: dict) -> dict
     whatever could not be clamped here (missing/invalid output fields).
     """
     client_model = str(body.get("_client_visible_model") or body.get("model") or resolved_model).strip()
-    if not model_state.is_source_enabled(str(ch.key), client_model):
-        raise GuardError(
-            400, "invalid_request_error", "Model is disabled for this source",
-            param="model", scope="candidate",
-        )
+    _validate_candidate_model_enabled(ch, client_model)
     limit = model_metadata.max_output_tokens(
         client_model,
         scope_key=str(ch.key),
@@ -746,14 +774,7 @@ def _candidate_budget_body(ch: Channel, resolved_model: str, body: dict) -> dict
     key, requested = _positive_output_limit(body)
     if limit is None or key is None or requested is None or requested <= limit:
         return body
-    out = dict(body)
-    nested = body.get("response")
-    if isinstance(nested, dict) and key in nested:
-        out["response"] = dict(nested)
-        out["response"][key] = limit
-    else:
-        out[key] = limit
-    return out
+    return _with_clamped_output_limit(body, key, limit)
 
 
 def _clamp_wire_output_limit(
@@ -786,14 +807,7 @@ def _clamp_wire_output_limit(
     key, requested = _positive_output_limit(wire_payload)
     if limit is None or key is None or requested is None or requested <= limit:
         return wire_payload
-    out = dict(wire_payload)
-    nested = wire_payload.get("response")
-    if isinstance(nested, dict) and key in nested:
-        out["response"] = dict(nested)
-        out["response"][key] = limit
-    else:
-        out[key] = limit
-    return out
+    return _with_clamped_output_limit(wire_payload, key, limit)
 
 
 def _wire_payload(value: bytes | str | dict) -> dict | None:
@@ -816,11 +830,32 @@ def _validate_wire_payload_budget(
 ) -> model_metadata.EffectiveRequestBudget | None:
     """Check final input and output independently before candidate transport."""
 
+    _validate_candidate_model_enabled(ch, str(
+        requested_body.get("_client_visible_model")
+        or requested_body.get("model") or resolved_model
+    ).strip())
     payload = _wire_payload(wire_body)
     if payload is None:
         # All current inference channels are structured JSON. Preserve the
         # compatibility policy for an unknown future body instead of guessing.
         return None
+    key, output_limit = _positive_output_limit(payload)
+    nested = payload.get("response")
+    final_request = nested if isinstance(nested, dict) and key in nested else payload
+    thinking = final_request.get("thinking")
+    # These bounds belong to the final Anthropic protocol, not the ingress
+    # shape. DeepSeek Chat, for example, uses thinking.enabled without a budget.
+    if (
+        getattr(ch, "protocol", None) == "anthropic"
+        and key == "max_tokens" and output_limit is not None and output_limit <= 1024
+        and isinstance(thinking, dict) and thinking.get("type") == "enabled"
+    ):
+        raise GuardError(
+            400, "invalid_request_error",
+            "Enabled thinking requires max_tokens > 1024; "
+            f"this route's output cap is {output_limit}",
+            param="thinking.budget_tokens", scope="candidate",
+        )
     client_model = str(
         requested_body.get("_client_visible_model")
         or requested_body.get("model")
@@ -1187,6 +1222,50 @@ async def _wait_for_overload_retry(
         return None
     await asyncio.sleep(delay)
     return delay
+
+
+def _apply_zhipu_quota_cooldown(ch: Channel, resolved_model: str, result) -> bool:
+    """Apply the same quota/plan exclusion policy to immediate and queued attempts."""
+    quota_reset_ms = quota_errors.zhipu_1310_reset_ms(
+        ch,
+        http_status=result.http_status,
+        error_detail=result.error_detail,
+    )
+    # Zhipu 1311: 当前套餐尚未包含该模型。它不是"额度耗尽"，上游也不会给重置
+    # 时间。若按通用 429 走阶梯冷却，恢复循环会每 30 秒试探一次（实测半小时
+    # 73 次），既无意义又刷日志。改用有限退避窗口停下无效重试；套餐放开后
+    # 窗口到期即自动恢复调度，不做永久冻结。
+    plan_excluded = quota_reset_ms is None and \
+        quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
+    if plan_excluded:
+        quota_reset_ms = quota_errors.zhipu_plan_excluded_retry_ms()
+    if quota_reset_ms is not None:
+        plan = finalize_policy.error_plan(
+            result.outcome,
+            failure_policy="runtime",
+            http_status=result.http_status,
+        )
+        if plan.record_cooldown_error:
+            cooldown.record_error(
+                channel_state.effect_key(ch),
+                resolved_model,
+                result.error_detail,
+                cooldown_until=quota_reset_ms,
+            )
+        if plan.record_failure:
+            scorer.record_failure(
+                channel_state.effect_key(ch),
+                resolved_model,
+                connect_ms=_scorer_connect_ms(result),
+            )
+        try:
+            _notify_zhipu_quota_cooldown(
+                ch, resolved_model, quota_reset_ms, plan_excluded=plan_excluded,
+            )
+        except Exception as exc:
+            print(f"[failover] quota cooldown notification failed for {ch.key}: {exc}")
+        return True
+    return False
 
 
 def _notify_zhipu_quota_cooldown(
@@ -1846,6 +1925,8 @@ async def _finish_cancelled_failover_attempt(
         request_elapsed_ms=_elapsed_ms(start_monotonic),
         http_status=499,
         affinity_hit=affinity_hit,
+        response_signals=getattr(result, "response_signals", None),
+        http_header_model=getattr(result, "http_header_model", None),
         response_body=getattr(result, "full_response_text", None),
         usage=getattr(result, "usage", None),
         usage_observed=getattr(result, "usage_observed", None),
@@ -1891,18 +1972,20 @@ async def run_failover(
                 nonlocal search_route
                 response = await run_failover(
                     search_route, round_body, request_id, api_key_name, client_ip,
-                    False, start_time, ingress_protocol=ingress_protocol,
+                    bool(round_body.get("stream")), start_time, ingress_protocol=ingress_protocol,
                     start_monotonic=start_monotonic,
                 )
                 search_route = search_tool_policy.advance_route(search_route, response)
                 return response
-            operation = search_tool_policy.run(
+            if is_stream:
+                return search_tool_policy.stream(
+                    body, ingress_protocol, invoke_search_round,
+                    request_id=request_id, api_key_name=api_key_name,
+                )
+            return await search_tool_policy.run(
                 body, ingress_protocol, invoke_search_round,
                 request_id=request_id, api_key_name=api_key_name,
             )
-            if is_stream:
-                return search_tool_policy.stream(asyncio.create_task(operation), ingress_protocol)
-            return await operation
 
     if start_monotonic is None:
         # Legacy callers start outer elapsed at entry; wall time never enters durations.
@@ -2253,6 +2336,8 @@ async def run_failover(
                 idle_ms=result.idle_ms, total_ms=result.total_ms,
                 final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                 http_status=status, affinity_hit=affinity_hit,
+                response_signals=getattr(result, "response_signals", None),
+                http_header_model=getattr(result, "http_header_model", None),
                 response_body=result.full_response_text,
                 usage=result.usage,
                 usage_observed=result.usage_observed,
@@ -2345,47 +2430,7 @@ async def run_failover(
             retry_count += 1
             continue
 
-        # Zhipu's explicit weekly/monthly quota signal is not a short rate limit.
-        # Park only this channel/model until the validated upstream reset time,
-        # then continue the normal candidate failover without disabling the channel.
-        quota_reset_ms = quota_errors.zhipu_1310_reset_ms(
-            ch,
-            http_status=result.http_status,
-            error_detail=result.error_detail,
-        )
-        # Zhipu 1311: 当前套餐尚未包含该模型。它不是"额度耗尽"，上游也不会给重置
-        # 时间。若按通用 429 走阶梯冷却，恢复循环会每 30 秒试探一次（实测半小时
-        # 73 次），既无意义又刷日志。改用有限退避窗口停下无效重试；套餐放开后
-        # 窗口到期即自动恢复调度，不做永久冻结。
-        plan_excluded = quota_reset_ms is None and \
-            quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
-        if plan_excluded:
-            quota_reset_ms = quota_errors.zhipu_plan_excluded_retry_ms()
-        if quota_reset_ms is not None:
-            plan = finalize_policy.error_plan(
-                result.outcome,
-                failure_policy="runtime",
-                http_status=result.http_status,
-            )
-            if plan.record_cooldown_error:
-                cooldown.record_error(
-                    channel_state.effect_key(ch),
-                    resolved_model,
-                    result.error_detail,
-                    cooldown_until=quota_reset_ms,
-                )
-            if plan.record_failure:
-                scorer.record_failure(
-                    channel_state.effect_key(ch),
-                    resolved_model,
-                    connect_ms=_scorer_connect_ms(result),
-                )
-            try:
-                _notify_zhipu_quota_cooldown(
-                    ch, resolved_model, quota_reset_ms, plan_excluded=plan_excluded,
-                )
-            except Exception as exc:
-                print(f"[failover] quota cooldown notification failed for {ch.key}: {exc}")
+        if _apply_zhipu_quota_cooldown(ch, resolved_model, result):
             retry_count += 1
             idx += 1
             continue
@@ -2631,6 +2676,8 @@ async def run_failover(
                         idle_ms=result.idle_ms, total_ms=result.total_ms,
                         final_round_id=result.round_id, request_elapsed_ms=request_elapsed_ms,
                         http_status=status, affinity_hit=affinity_hit,
+                        response_signals=getattr(result, "response_signals", None),
+                        http_header_model=getattr(result, "http_header_model", None),
                         response_body=result.full_response_text,
                         usage=result.usage,
                         usage_observed=result.usage_observed,
@@ -2652,7 +2699,12 @@ async def run_failover(
                         ),
                     )
                 # 排队拿到的这次也失败了 → 落入"全失败"分支
-                if not result.openai_oauth_html_403:
+                plan_excluded_handled = (
+                    not result.openai_oauth_html_403
+                    and quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
+                    and _apply_zhipu_quota_cooldown(ch, resolved_model, result)
+                )
+                if not result.openai_oauth_html_403 and not plan_excluded_handled:
                     plan = finalize_policy.error_plan(
                         result.outcome,
                         failure_policy="runtime",
@@ -2737,6 +2789,8 @@ async def run_failover(
         final_round_id=(last_result.round_id if last_result else None),
         request_elapsed_ms=request_elapsed_ms,
         http_status=status, affinity_hit=affinity_hit,
+        response_signals=getattr(last_result, "response_signals", None),
+        http_header_model=getattr(last_result, "http_header_model", None),
         response_body=(last_result.full_response_text if last_result else None),
         usage=(last_result.usage if last_result else None),
         usage_observed=(last_result.usage_observed if last_result else None),
@@ -2999,6 +3053,7 @@ class _WsResponsesTracker:
         self.response_failed = False
         self.request_failed = False
         self.last_event: dict[str, Any] | None = None
+        self.response_signals = model_reroute.ResponseModelSignals()
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
         self._frames: list[str] = []
@@ -3019,6 +3074,9 @@ class _WsResponsesTracker:
             self._frames.append(text)
             return
         self.last_event = evt
+        self.response_signals = model_reroute.merge_response_signals(
+            self.response_signals, model_reroute.extract_response_signals(evt),
+        )
         if isinstance(self.channel, OpenAIOAuthChannel):
             oauth_manager.observe_openai_response_event(
                 self.channel.account_key, evt,
@@ -3166,6 +3224,7 @@ def _hydrate_oauth_ws_attempt_result(
 
     result.usage = dict(tracker.usage)
     result.usage_observed = tracker.usage_observed
+    result.response_signals = tracker.response_signals
     response_text = tracker.get_full_response()
     if identity_state is not None:
         response_text = identity_log_text(response_text, identity_state)
@@ -3486,6 +3545,7 @@ async def _try_openai_oauth_responses_ws_channel(
                     final_round_id=cancelled.round_id,
                     request_elapsed_ms=_elapsed_ms(start_monotonic),
                     http_status=499,
+                    response_signals=getattr(cancelled, "response_signals", None),
                     response_body=cancelled.full_response_text,
                     usage=cancelled.usage,
                     usage_observed=cancelled.usage_observed,
@@ -3938,6 +3998,7 @@ async def _consume_oauth_responses_ws_non_stream(
         final_round_id=timing_snapshot.round_id,
         request_elapsed_ms=request_elapsed_ms,
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+        response_signals=tracker.response_signals,
         response_body=_identity_log_text(tracker.get_full_response(), identity_state), http_status=200,
         usage_observed=tracker.usage_observed,
         upstream_protocol="openai-responses", upstream_transport="ws",
@@ -4006,6 +4067,7 @@ async def _finalize_oauth_ws_error(
         final_round_id=timing_snapshot.round_id,
         request_elapsed_ms=request_elapsed_ms,
         http_status=_ws_http_status_from_outcome(result), affinity_hit=affinity_hit,
+        response_signals=tracker.response_signals,
         response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
         usage=tracker.usage,
         usage_observed=tracker.usage_observed,
@@ -4145,6 +4207,7 @@ async def _consume_oauth_responses_ws_stream(
             final_round_id=timing_snapshot.round_id,
             request_elapsed_ms=request_elapsed_ms,
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+            response_signals=tracker.response_signals,
             response_body=_identity_log_text(tracker.get_full_response(), identity_state), http_status=200,
             usage_observed=tracker.usage_observed,
             upstream_protocol="openai-responses", upstream_transport="ws",
@@ -4182,6 +4245,7 @@ async def _consume_oauth_responses_ws_stream(
             final_round_id=timing_snapshot.round_id,
             request_elapsed_ms=request_elapsed_ms,
             http_status=499, affinity_hit=affinity_hit,
+            response_signals=tracker.response_signals,
             response_body=_identity_log_text(tracker.get_full_response(), identity_state) or None,
             status="cancelled",
             usage=tracker.usage,
@@ -4527,6 +4591,8 @@ async def _try_channel(
             request_elapsed_ms=_elapsed_ms(start_monotonic),
             http_status=499,
             affinity_hit=affinity_hit,
+            response_signals=getattr(result, "response_signals", None),
+            http_header_model=getattr(result, "http_header_model", None),
             response_body=result.full_response_text,
             usage=result.usage,
             usage_observed=result.usage_observed,
@@ -4694,6 +4760,7 @@ async def _try_channel(
 
 
 async def _finalize_http_attempt(opened, result: AttemptResult) -> AttemptResult:
+    result.http_header_model = model_reroute.header_model(getattr(getattr(opened, "response", None), "headers", None))
     await finalize_opened_http_response(opened, result.outcome, result.error_detail)
     if opened.timing is not None:
         opened.timing.apply_to(result, terminal=False)
@@ -4811,6 +4878,7 @@ async def _consume_non_stream(
         final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
         request_elapsed_ms=request_elapsed_ms,
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+        http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
         response_body=restored_text,
         http_status=upstream_resp.status_code,
         upstream_protocol=getattr(ch, "protocol", "anthropic"),
@@ -4951,6 +5019,7 @@ async def _consume_stream_as_non_stream(
         final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
         request_elapsed_ms=request_elapsed_ms,
         retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+        http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
         response_body=response_body_text,
         http_status=upstream_resp.status_code,
         upstream_protocol=getattr(ch, "protocol", "anthropic"),
@@ -5070,6 +5139,10 @@ async def _consume_stream(
         start_monotonic = time.monotonic()
     if attempt_start_monotonic is None:
         attempt_start_monotonic = start_monotonic
+    if (body or {}).get("_parrot_search_round") and getattr(ch, "protocol", "") == "openai-chat":
+        # Chat names are delta strings. Complete only tool fragments before an
+        # ingress bridge commits an immutable Responses/Anthropic tool name.
+        translator_ctx = {**(translator_ctx or {}), "managed_search_chat_tools": True}
     stream_start = await prepare_stream_response_start(
         ctx,
         upstream_resp,
@@ -5348,6 +5421,7 @@ async def _consume_stream(
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
             retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+            http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
             response_body=tracker.get_full_response(),
             http_status=upstream_status,
             usage_observed=tracker.usage_observed,
@@ -5407,6 +5481,7 @@ async def _consume_stream(
             request_elapsed_ms=request_elapsed_ms,
             http_status=(400 if outcome == "request_invalid" else upstream_status),
             affinity_hit=affinity_hit,
+            http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
             response_body=tracker.get_full_response(),
             usage=tracker.usage,
             usage_observed=tracker.usage_observed,
@@ -5460,6 +5535,7 @@ async def _consume_stream(
             final_round_id=(timing_snapshot.round_id if timing_snapshot is not None else None),
             request_elapsed_ms=request_elapsed_ms,
             http_status=499, affinity_hit=affinity_hit,
+            http_header_model=model_reroute.header_model(getattr(upstream_resp, "headers", None)),
             response_body=tracker.get_full_response(), status="cancelled",
             usage=tracker.usage,
             usage_observed=tracker.usage_observed,

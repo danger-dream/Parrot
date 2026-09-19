@@ -48,6 +48,7 @@ _NOTIFICATION_EVENTS = (
     ("oauthRefreshFailed", "oauth_refresh_failed"),
     ("noChannels", "no_channels"),
     ("openaiStoreSaveFailed", "openai_store_save_failed"),
+    ("modelDegraded", "model_degraded"),
     ("statusAlert", "status_alert"),
     ("appUpdate", "app_update"),
     ("networkMonitor", "network_monitor"),

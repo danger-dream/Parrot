@@ -126,6 +126,7 @@ def setup_function(_function):
         "oauthAccounts": [],
         "oauth": {"mockMode": True},
         "modelBindings": {"defaults": {}, "scoped": {}},
+        "modelMetadataOverrides": {"defaults": {}, "scoped": {}},
     }))
 
 
@@ -1236,6 +1237,171 @@ def test_cursor_max_context_metadata_and_preflight_use_one_million(monkeypatch):
     assert server._anthropic_to_openai_context_preflight(
         {**base, cc_mimicry.PARROT_WANTS_CONTEXT_1M_KEY: True}, route,
     ) is None
+
+
+def test_cursor_preflight_ignores_clampable_output_limit(monkeypatch):
+    """A max_tokens above the native output cap is clamped per candidate later;
+    the single-route context preflight must not turn it into a bogus
+    'Prompt is too long: N > M' error with N < M."""
+    import server
+
+    account = _install_account()
+    channel = CursorOAuthChannel(account)
+    route = SimpleNamespace(candidates=[(channel, "claude-fable-5")], saturated=[])
+    monkeypatch.setattr(
+        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 30_000,
+    )
+    body = {
+        "model": "claude-fable-5",
+        "_client_visible_model": "claude-fable-5",
+        "max_tokens": 128_000,
+        "messages": [{"role": "user", "content": "small prompt"}],
+    }
+    assert server._anthropic_to_openai_context_preflight(body, route) is None
+    monkeypatch.setattr(
+        server.token_counter, "count_request_tokens", lambda *_args, **_kwargs: 1_000_001,
+    )
+    assert server._anthropic_to_openai_context_preflight(body, route) is not None
+
+
+def test_cursor_compact_trigger_override_may_target_max_context_tier():
+    """One stored trigger serves both tiers: it may be set up to the Max
+    Context window; a normal-mode request that cannot hold it falls back to
+    the normal-tier default instead of compacting only at the hard limit."""
+    _install_account()
+    scope = "oauth:cursor:cursor-user-1"
+    kwargs = {"scope_key": scope, "outbound_model": "claude-fable-5"}
+    normal_default = model_metadata.compact_trigger_tokens("claude-fable-5", **kwargs)
+    assert normal_default == 188_800  # (300k - 64k) * 0.8, Cursor catalog default
+
+    model_metadata.patch_override_fields(
+        "claude-fable-5", set_fields={"compactTriggerTokens": 850_000}, **kwargs,
+    )
+    effective = model_metadata.get_metadata("claude-fable-5", **kwargs)
+    assert effective["contextWindow"] == 300_000
+    assert effective["contextWindowMaxMode"] == 1_000_000
+    assert effective["compactTriggerTokens"] == 850_000
+    binding = model_metadata.resolve_binding("claude-fable-5", **kwargs)
+    assert "compactTriggerTokens" not in binding.constrained_by
+    normal = model_metadata.effective_request_budget("claude-fable-5", **kwargs)
+    assert normal.effective_input_budget == 300_000
+    assert normal.compact_trigger_tokens == normal_default
+    maximum = model_metadata.effective_request_budget(
+        "claude-fable-5", use_max_context=True, **kwargs,
+    )
+    assert maximum.context_window == 1_000_000
+    assert maximum.compact_trigger_tokens == 850_000
+
+    # A trigger that fits the normal tier applies to both tiers unchanged.
+    model_metadata.patch_override_fields(
+        "claude-fable-5", set_fields={"compactTriggerTokens": 250_000}, **kwargs,
+    )
+    assert model_metadata.compact_trigger_tokens("claude-fable-5", **kwargs) == 250_000
+    assert model_metadata.compact_trigger_tokens(
+        "claude-fable-5", use_max_context=True, **kwargs,
+    ) == 250_000
+    model_metadata.patch_override_fields(
+        "claude-fable-5", set_fields={"compactTriggerTokens": 850_000}, **kwargs,
+    )
+
+    with pytest.raises(ValueError, match="effectiveInputBudget"):
+        model_metadata.patch_override_fields(
+            "claude-fable-5", set_fields={"compactTriggerTokens": 1_000_001}, **kwargs,
+        )
+    # An explicit input cap is still the trigger ceiling for both tiers.
+    with pytest.raises(ValueError, match="effectiveInputBudget"):
+        model_metadata.patch_override_fields(
+            "claude-fable-5",
+            set_fields={"maxInputTokens": 300_000, "compactTriggerTokens": 300_001},
+            **kwargs,
+        )
+    # An operator contextWindow caps the Max tier; a trigger patched alongside
+    # it is validated against that cap, not the uncapped native Max value.
+    with pytest.raises(ValueError, match="effectiveInputBudget"):
+        model_metadata.patch_override_fields(
+            "claude-fable-5",
+            set_fields={"contextWindow": 500_000, "compactTriggerTokens": 850_000},
+            **kwargs,
+        )
+    model_metadata.patch_override_fields(
+        "claude-fable-5",
+        set_fields={"contextWindow": 500_000, "compactTriggerTokens": 400_000},
+        **kwargs,
+    )
+    capped = model_metadata.effective_request_budget(
+        "claude-fable-5", use_max_context=True, **kwargs,
+    )
+    assert capped.context_window == 500_000 and capped.compact_trigger_tokens == 400_000
+
+
+def test_cursor_context_window_equal_to_max_tier_is_rejected_as_no_op():
+    """contextWindow is the normal tier and can only be lowered; storing the
+    Max Context size there is silently clamped back, which reads as a lost
+    save. Reject it with an explanation instead."""
+    _install_account()
+    kwargs = {"scope_key": "oauth:cursor:cursor-user-1", "outbound_model": "claude-fable-5"}
+    with pytest.raises(ValueError, match="no effect") as error:
+        model_metadata.patch_override_fields(
+            "claude-fable-5", set_fields={"contextWindow": 1_000_000}, **kwargs,
+        )
+    assert "native 300000" in str(error.value) and "between 300000 and 1000000" in str(error.value)
+    with pytest.raises(ValueError, match="native ceiling 1000000"):
+        model_metadata.patch_override_fields(
+            "claude-fable-5", set_fields={"contextWindow": 1_000_001}, **kwargs,
+        )
+    # Between the tiers it caps Max Context; at/below normal it tightens normal.
+    model_metadata.patch_override_fields(
+        "claude-fable-5", set_fields={"contextWindow": 500_000}, **kwargs,
+    )
+    effective = model_metadata.get_metadata("claude-fable-5", **kwargs)
+    assert effective["contextWindow"] == 300_000 and effective["contextWindowMaxMode"] == 500_000
+    model_metadata.patch_override_fields(
+        "claude-fable-5", set_fields={"contextWindow": 200_000}, **kwargs,
+    )
+    effective = model_metadata.get_metadata("claude-fable-5", **kwargs)
+    assert effective["contextWindow"] == 200_000 and effective["contextWindowMaxMode"] == 200_000
+    # A model without a distinct Max tier keeps the plain native-ceiling rule.
+    model_metadata.patch_override_fields(
+        "composer-2.5", set_fields={"contextWindow": 200_000},
+        scope_key="oauth:cursor:cursor-user-1", outbound_model="composer-2.5",
+    )
+
+
+def test_cursor_drops_catalog_max_input_tokens_absent_from_account_catalog(monkeypatch):
+    """A models.dev maxInputTokens (e.g. 922k for openai/gpt-5.5) must not leak
+    into a Cursor binding: it would be clamped to the normal window and pin the
+    Max Context budget there while the bridge actually sends 1M."""
+    oauth_manager.add_account(_account())
+    model = "claude-fable-5"
+    scope = "oauth:cursor:cursor-user-1"
+    kwargs = {"scope_key": scope, "outbound_model": model}
+    config.update(lambda cfg: cfg.update(modelBindings={
+        "defaults": {},
+        "scoped": {scope: {model: {
+            "target": "demo/leaky-input", "source": "manual", "outboundModel": model,
+        }}},
+    }))
+    monkeypatch.setattr(
+        model_metadata.model_pricing, "catalog_metadata",
+        lambda target: (
+            {"contextWindow": 400_000, "maxInputTokens": 922_000, "inputPricePer1M": 5}
+            if target == "demo/leaky-input" else None
+        ),
+    )
+    effective = model_metadata.get_metadata(model, **kwargs)
+    assert "maxInputTokens" not in effective
+    assert effective["contextWindow"] == 300_000 and effective["inputPricePer1M"] == 5
+    binding = model_metadata.resolve_binding(model, **kwargs)
+    assert "maxInputTokens" not in binding.constrained_by
+    assert "maxInputTokens" not in binding.value_source
+    normal = model_metadata.effective_request_budget(model, **kwargs)
+    maximum = model_metadata.effective_request_budget(model, use_max_context=True, **kwargs)
+    assert normal.effective_input_budget == 300_000 and normal.compact_trigger_tokens == 188_800
+    assert maximum.effective_input_budget == 1_000_000 and maximum.compact_trigger_tokens == 748_800
+    # An operator input cap is still honoured as an independent ceiling.
+    model_metadata.patch_override_fields(model, set_fields={"maxInputTokens": 250_000}, **kwargs)
+    tightened = model_metadata.effective_request_budget(model, use_max_context=True, **kwargs)
+    assert tightened.max_input_tokens == tightened.effective_input_budget == 250_000
 
 
 def test_cursor_new_entry_and_unified_rich_detail_keep_max_context():

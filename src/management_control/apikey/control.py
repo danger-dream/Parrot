@@ -232,8 +232,14 @@ class ApiKeyControl:
     def _configured_video_models(cls, cfg: dict) -> tuple[str, ...]:
         mapping = cfg.get('video_models')
         if isinstance(mapping, dict):
-            return tuple(dict.fromkeys(model for values in mapping.values() for model in cls._clean_models(values)))
-        return cls._clean_models((cfg.get('xaiOAuth') or {}).get('videoModels'))
+            global_models = tuple(model for values in mapping.values() for model in cls._clean_models(values))
+        else:
+            global_models = cls._clean_models((cfg.get('xaiOAuth') or {}).get('videoModels'))
+        # Account-scoped video inventories are explicit overrides at runtime.
+        # Include disabled sources as grantable inventory, just as for images.
+        from src import image_catalog
+        sourced = sorted({source.model for source in image_catalog.sources(cfg, kind="video")})
+        return tuple(dict.fromkeys((*global_models, *sourced)))
 
     def available_permission_models(self, context: ManagementContext) -> tuple[str, ...]:
         self._require(context, Capability.READ)

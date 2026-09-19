@@ -116,8 +116,13 @@ class MCPControl(DomainControl):
                     raise self._invalid(key, "Unknown MCP tool name")
                 if any(type(flag) is not bool for flag in value.values()):
                     raise self._invalid(key, "Tool switches must be booleans")
-        return self._commit(context, "mcp.settings.update",
-                            lambda cfg: cfg.update(copy.deepcopy(patch)), expected_revision)
+        def mutate(cfg):
+            for key, value in patch.items():
+                if key == "tools":
+                    cfg["tools"].update(value)
+                else:
+                    cfg[key] = copy.deepcopy(value)
+        return self._commit(context, "mcp.settings.update", mutate, expected_revision)
 
     def set_tool(self, context, tool_name, enabled_flag, *, expected_revision=None):
         self._write(context)
@@ -154,11 +159,19 @@ class MCPControl(DomainControl):
         self._read(context)
         since = _period_start(period)
         rows = log_db.mcp_call_stats(since)
+        items = []
         for row in rows:
             attempts = row.get("elapsed_n") or 0
-            row["avgElapsedMs"] = int(row["elapsed_sum"] / attempts) if attempts else 0
-            row["label"] = _tool_label(row.get("tool_name"))
-        return {"period": period, "items": rows}
+            items.append({
+                "toolName": str(row.get("tool_name") or ""),
+                "label": _tool_label(row.get("tool_name")),
+                "calls": int(row.get("calls") or 0),
+                "success": int(row.get("success") or 0),
+                "failed": int(row.get("failed") or 0),
+                "avgElapsedMs": int(row["elapsed_sum"] / attempts) if attempts else 0,
+                "lastAt": float(row.get("last_at") or 0.0),
+            })
+        return {"period": period, "items": items}
 
     def summary(self, context, *, period="today"):
         """一次调用清单所需的汇总：总数、按状态、按工具、平均耗时。
@@ -189,6 +202,12 @@ class MCPControl(DomainControl):
             "lastAt": max((float(row.get("last_at") or 0.0) for row in rows), default=0.0),
             "byTool": by_tool,
         }
+
+    def log_entry(self, context, call_id, *, period="today"):
+        """Exact summary lookup, independent of list pagination."""
+        self._read(context)
+        row = log_db.mcp_call_entry(str(call_id or ""), since_ts=_period_start(period))
+        return _log_view(row) if row is not None else None
 
     def result_body(self, context, call_id):
         """某次调用留存的结果正文；未留存或已清理时返回 None。"""

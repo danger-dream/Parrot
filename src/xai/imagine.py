@@ -25,6 +25,7 @@ from fastapi.responses import Response
 from .. import (
     apikey_limiter,
     auth,
+    channel_state,
     concurrency,
     config,
     cooldown,
@@ -40,6 +41,7 @@ from .. import (
     scorer,
     state_db,
 )
+from ..async_owned import await_owned
 from ..channel import registry
 from ..channel.xai_oauth_channel import XAIOAuthChannel
 
@@ -535,7 +537,8 @@ async def _post_with_safe_failover(
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     for channel in candidates:
-        if not await concurrency.try_acquire(channel.key):
+        effect_key = channel_state.effect_key(channel)
+        if not await concurrency.try_acquire(effect_key):
             continue
         acquired_any = True
         try:
@@ -584,7 +587,7 @@ async def _post_with_safe_failover(
                 continue
             return result
         finally:
-            concurrency.release(channel.key)
+            concurrency.release(effect_key)
 
     if last_rejection is not None:
         return last_rejection
@@ -851,7 +854,7 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
     if path is None:
         raise ValueError(f"unsupported video action: {action}")
 
-    log_id = await _start_media_log(
+    log_task = asyncio.create_task(_start_media_log(
         request_id=str(uuid.uuid4()),
         api_key_name=key_name,
         provider="xai",
@@ -863,101 +866,135 @@ async def handle_video_create(request: Request, *, action: str) -> Response:
         aspect_ratio=str(payload.get("aspect_ratio") or "") or None,
         resolution=str(payload.get("resolution") or "") or None,
         media_duration_seconds=_video_seconds(payload),
-    )
+    ))
+    log_id = None
+    finish_task = None
+    result = None
     started = time.monotonic()
-    result = await _post_with_safe_failover(
-        kind="video",
-        model=model,
-        path=path,
-        payload=payload,
-    )
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    if isinstance(result, Response):
-        error_type, message = _response_error(result)
-        await _finish_media_log(
-            log_id,
-            status="failed",
-            duration_ms=elapsed_ms,
-            request_duration_ms=elapsed_ms,
-            error_type=error_type,
-            error_message=message,
-            http_status=result.status_code,
-        )
-        return result
-
-    response = result.response
-    response_body = _response_object(response)
-    upstream_request_id = str(response_body.get("request_id") or "").strip()
-    upstream_status = str(response_body.get("status") or "").strip()
-    success = 200 <= response.status_code < 300
-    local_status = "failed"
-    expires_at: float | None = None
-    error_type: str | None = None
-    error_message: str | None = None
-
-    if success and upstream_request_id:
-        local_status = _video_log_status(upstream_status) or "pending"
-        ttl_seconds = _video_job_ttl_seconds()
-        expires_at = time.time() + ttl_seconds
-        try:
-            state_db.xai_video_job_save(
-                upstream_request_id,
-                channel_key=result.channel.key,
-                api_key_name=key_name,
-                model=model,
-                ttl_seconds=ttl_seconds,
-                state_key=result.channel.state_key,
-            )
-        except Exception as exc:
-            # Upstream may already have accepted and billed the request.  Keep its
-            # response and audit the binding failure instead of retrying the POST.
-            print(
-                f"[xai-imagine] video binding save failed "
-                f"type={type(exc).__name__}"
-            )
-            error_type = "binding_save_failed"
-            error_message = "video task was accepted but its local identity binding could not be saved"
-    elif success:
-        error_type = "invalid_upstream_response"
-        error_message = "xAI video creation response did not include request_id"
-    else:
-        error_type, error_message = _response_error(response)
-
-    video_cache_paths: list[str] = []
-    video_cached_bytes = 0
-    video_obj = response_body.get("video")
-    if local_status == "success" and isinstance(video_obj, dict):
-        video_cache_paths, video_cached_bytes = await _cache_xai_results(
-            [video_obj],
-            media_type="video",
-            action=action,
-            channel=result.channel,
+    try:
+        # The DB worker owns its insert even when the caller is cancelled.
+        log_id = await await_owned(log_task)
+        started = time.monotonic()
+        result = await _post_with_safe_failover(
+            kind="video",
             model=model,
+            path=path,
+            payload=payload,
         )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if isinstance(result, Response):
+            error_type, message = _response_error(result)
+            finish_task = asyncio.create_task(_finish_media_log(
+                log_id,
+                status="failed",
+                duration_ms=elapsed_ms,
+                request_duration_ms=elapsed_ms,
+                error_type=error_type,
+                error_message=message,
+                http_status=result.status_code,
+            ))
+            await await_owned(finish_task)
+            return result
 
-    await _finish_media_log(
-        log_id,
-        status=local_status,
-        account_key=result.channel.account_key,
-        account_email=result.channel.email,
-        model=str(response_body.get("model") or model),
-        upstream_request_id=upstream_request_id or None,
-        upstream_status=upstream_status or ("pending" if local_status == "pending" else None),
-        progress=_float_or_none(response_body.get("progress")),
-        duration_ms=elapsed_ms if local_status in {"success", "failed", "expired", "cancelled"} else None,
-        request_duration_ms=elapsed_ms,
-        media_duration_seconds=_video_seconds(payload, response_body),
-        usage=_response_usage(response_body),
-        cached_media_count=len(video_cache_paths),
-        image_count=1 if local_status == "success" and isinstance(video_obj, dict) and (video_obj.get("url") or video_obj.get("b64_json")) else None,
-        media_bytes=video_cached_bytes or None,
-        cache_paths=video_cache_paths,
-        error_type=error_type,
-        error_message=error_message,
-        http_status=response.status_code,
-        expires_at=expires_at,
-    )
-    return _downstream_response(response)
+        response = result.response
+        response_body = _response_object(response)
+        upstream_request_id = str(response_body.get("request_id") or "").strip()
+        upstream_status = str(response_body.get("status") or "").strip()
+        success = 200 <= response.status_code < 300
+        local_status = "failed"
+        expires_at: float | None = None
+        error_type: str | None = None
+        error_message: str | None = None
+
+        if success and upstream_request_id:
+            local_status = _video_log_status(upstream_status) or "pending"
+            ttl_seconds = _video_job_ttl_seconds()
+            expires_at = time.time() + ttl_seconds
+            try:
+                state_db.xai_video_job_save(
+                    upstream_request_id,
+                    channel_key=result.channel.key,
+                    api_key_name=key_name,
+                    model=model,
+                    ttl_seconds=ttl_seconds,
+                    state_key=result.channel.state_key,
+                )
+            except Exception as exc:
+                # Upstream may already have accepted and billed the request.  Keep its
+                # response and audit the binding failure instead of retrying the POST.
+                print(
+                    f"[xai-imagine] video binding save failed "
+                    f"type={type(exc).__name__}"
+                )
+                error_type = "binding_save_failed"
+                error_message = "video task was accepted but its local identity binding could not be saved"
+        elif success:
+            error_type = "invalid_upstream_response"
+            error_message = "xAI video creation response did not include request_id"
+        else:
+            error_type, error_message = _response_error(response)
+
+        video_cache_paths: list[str] = []
+        video_cached_bytes = 0
+        video_obj = response_body.get("video")
+        if local_status == "success" and isinstance(video_obj, dict):
+            video_cache_paths, video_cached_bytes = await _cache_xai_results(
+                [video_obj],
+                media_type="video",
+                action=action,
+                channel=result.channel,
+                model=model,
+            )
+
+        finish_task = asyncio.create_task(_finish_media_log(
+            log_id,
+            status=local_status,
+            account_key=result.channel.account_key,
+            account_email=result.channel.email,
+            model=str(response_body.get("model") or model),
+            upstream_request_id=upstream_request_id or None,
+            upstream_status=upstream_status or ("pending" if local_status == "pending" else None),
+            progress=_float_or_none(response_body.get("progress")),
+            duration_ms=elapsed_ms if local_status in {"success", "failed", "expired", "cancelled"} else None,
+            request_duration_ms=elapsed_ms,
+            media_duration_seconds=_video_seconds(payload, response_body),
+            usage=_response_usage(response_body),
+            cached_media_count=len(video_cache_paths),
+            image_count=1 if local_status == "success" and isinstance(video_obj, dict) and (video_obj.get("url") or video_obj.get("b64_json")) else None,
+            media_bytes=video_cached_bytes or None,
+            cache_paths=video_cache_paths,
+            error_type=error_type,
+            error_message=error_message,
+            http_status=response.status_code,
+            expires_at=expires_at,
+        ))
+        await await_owned(finish_task)
+        return _downstream_response(response)
+    except asyncio.CancelledError:
+        if log_task.done() and not log_task.cancelled():
+            log_id = log_task.result()
+        # A completed final write already records the known upstream result.
+        # Do not replace it merely because cancellation arrived during that write.
+        if finish_task is None:
+            fields = {}
+            if isinstance(result, _PostResult):
+                fields.update(
+                    account_key=result.channel.account_key,
+                    account_email=result.channel.email,
+                    upstream_request_id=upstream_request_id or None,
+                    upstream_status=upstream_status or None,
+                    expires_at=expires_at,
+                    usage=_response_usage(response_body),
+                )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            await await_owned(_finish_media_log(
+                log_id, status="cancelled", http_status=499,
+                duration_ms=elapsed_ms, request_duration_ms=elapsed_ms,
+                error_type="cancelled",
+                error_message="video request cancelled; upstream task may still run; no retry attempted",
+                **fields,
+            ))
+        raise
 
 
 async def handle_video_result(request: Request, request_id: str) -> Response:
@@ -1000,7 +1037,8 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
             "the xAI OAuth account for this video task is unavailable",
         )
     model = str(binding.get("model") or "")
-    if not await concurrency.try_acquire(channel.key):
+    effect_key = channel_state.effect_key(channel)
+    if not await concurrency.try_acquire(effect_key):
         await _update_video_log(
             normalized_id,
             status=None,
@@ -1121,4 +1159,4 @@ async def handle_video_result(request: Request, request_id: str) -> Response:
             )
         return _downstream_response(response)
     finally:
-        concurrency.release(channel.key)
+        concurrency.release(effect_key)

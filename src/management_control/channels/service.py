@@ -697,10 +697,7 @@ class ChannelControl(ChannelOperationWorkers):
         self._authorize(context, Capability.WRITE)
         channel = self._domain_channel(channel_id)
         requested = str(model_id or "").strip()
-        outbound = next((
-            model.real for model in channel.models
-            if (model.alias or model.real) == requested
-        ), None)
+        outbound = channel.supports_model(requested)
         if not outbound:
             raise ManagementError(ManagementErrorCode.RESOURCE_NOT_FOUND)
         before = sum(

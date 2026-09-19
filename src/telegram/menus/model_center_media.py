@@ -224,11 +224,12 @@ def _default_model_panel(chat_id: int, kind: str, page: int = 0,
     rows: list[list[dict]] = []
     if selected:
         rows.append([ui.btn('↩ 清除（恢复自动选择）', menu._freeze(
-            chat_id, 'media_default_set', kind=kind, model='', back_callback=back_callback))])
+            chat_id, 'media_default_set', kind=kind, model='', revision=settings.revision,
+            back_callback=back_callback))])
 
     def _frozen(model):
         return menu._freeze(chat_id, 'media_default_set', kind=kind, model=model,
-                            back_callback=back_callback)
+                            revision=settings.revision, back_callback=back_callback)
 
     for name in visible:
         mark = '✅ ' if name == selected else ''
@@ -278,11 +279,13 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
         kind = data.get('kind', 'image')
         if kind not in ('image', 'video'): return False
         back = str(data.get('back_callback') or 'menu:main')
+        if not data.get('revision'):
+            ui.answer_cb(cb_id, '页面已过期，请重新选择默认模型', show_alert=True)
+            return True
         try:
-            current = _control(kind).get_settings(menu._ctx(chat_id))
             _control(kind).update_settings(
                 menu._ctx(chat_id), {'defaultModel': str(data.get('model') or '')},
-                expected_revision=current.revision)
+                expected_revision=data['revision'])
         except ManagementError as exc:
             menu._answer_error(cb_id, exc)
             return True

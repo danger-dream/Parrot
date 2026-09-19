@@ -40,7 +40,7 @@ class ImageSettings:
     cache_retention_days: int
     cache_max_bytes: int
     revision: str
-    # 未指定模型时用它；空表示按可用列表自动选择。只接受 models 里存在的名字。
+    # 未指定模型时用它；空表示按可用列表自动选择。接受全局目录及来源专属模型。
     default_model: str = ""
 
 
@@ -233,15 +233,11 @@ class ImageControl:
             if field in value and (type(value[field]) is not int or not 1 <= value[field] <= 2147483647):
                 raise invalid_field(field, 'OUT_OF_RANGE', 'must be between 1 and 2147483647')
         if 'defaultModel' in value:
-            # 空串 = 清除，回落到"按可用列表自动选择"。非空必须是已配置的模型名，
-            # 否则默认模型会指向一个用不了的模型，等到调用时才失败。
+            # 空串清除偏好。模型成员校验必须在 CAS 内合并本次 models 后执行。
             chosen = value['defaultModel']
             if not isinstance(chosen, str):
                 raise invalid_field('defaultModel', 'INVALID_TYPE', 'must be a string')
             chosen = chosen.strip()
-            known = {name for names in media_config.model_map(self.kind).values() for name in names}
-            if chosen and chosen not in known:
-                raise invalid_field('defaultModel', 'UNKNOWN_MODEL', 'must be one of the configured models')
             value['defaultModel'] = chosen
         if "cachePath" in value:
             value["cachePath"] = self._validate_path(value["cachePath"])
@@ -265,6 +261,8 @@ class ImageControl:
                     # Provider map PATCH preserves unmentioned providers/custom lists.
                     root[self.kind + '_models'].update(copy.deepcopy(item))
                 else: target[field] = copy.deepcopy(item)
+            if value.get('defaultModel') and value['defaultModel'] not in image_catalog.models(root, kind=self.kind):
+                raise invalid_field('defaultModel', 'UNKNOWN_MODEL', 'must be one of the configured models')
         committed = self._config.update(mutate)
         audit(self._audit_sink, context, action=self.kind + '.settings.update', target=self.kind)
         return self._dto(self._effective_from_root(committed))

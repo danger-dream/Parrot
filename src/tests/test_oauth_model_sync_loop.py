@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from src import config, oauth_manager
+from src import config, model_pricing, oauth_manager
 from src.telegram.menus import oauth_menu
 
 
@@ -28,12 +28,16 @@ def _account(provider: str, index: int, **extra) -> dict:
     if provider == "xai": item["subject"] = f"sub{index}"
     if provider == "antigravity": item["project_id"] = f"p{index}"
     if provider == "cursor": item.update(subject=f"cur{index}", cursor_disabled_models=[])
+    if provider == "workbuddy": item.update(uid=f"wb{index}", realm="cn")
     item.update(extra)
     return item
 
 
 @pytest.fixture
-def sync_config():
+def sync_config(monkeypatch):
+    async def metadata():
+        return {"status": "succeeded", "catalog": "updated"}
+    monkeypatch.setattr(model_pricing, "refresh_metadata_after_model_sync", metadata)
     before = copy.deepcopy(config.get())
     config.update(lambda cfg: cfg.update(oauthAccounts=[]))
     yield
@@ -140,8 +144,8 @@ async def test_metadata_only_backfill_does_not_notify_or_repeat_when_fresh(monke
 
 
 @pytest.mark.asyncio
-async def test_unified_once_has_five_providers_and_concurrency_three(monkeypatch, sync_config):
-    accounts = [_account(p, i) for i, p in enumerate(("claude", "openai", "xai", "antigravity", "cursor"), 1)]
+async def test_unified_once_has_six_providers_and_concurrency_three(monkeypatch, sync_config):
+    accounts = [_account(p, i) for i, p in enumerate(("claude", "openai", "xai", "antigravity", "cursor", "workbuddy"), 1)]
     config.update(lambda cfg: cfg.update(oauthAccounts=accounts))
     active = peak = 0
     seen = []
@@ -159,8 +163,8 @@ async def test_unified_once_has_five_providers_and_concurrency_three(monkeypatch
 
     monkeypatch.setattr(oauth_manager, "refresh_account_models", refresh)
     out = await oauth_manager.oauth_model_sync_once(notify_changes=False)
-    assert len(out) == 5
-    assert set(seen) == {"claude", "openai", "xai", "antigravity", "cursor"}
+    assert len(out) == 6
+    assert set(seen) == {"claude", "openai", "xai", "antigravity", "cursor", "workbuddy"}
     assert peak == 3
 
 
@@ -256,7 +260,7 @@ async def test_cursor_disabled_survives_remove_and_reappear(monkeypatch, sync_co
     assert oauth_manager.cursor_disabled_models(saved) == {"b"}
 
 
-@pytest.mark.parametrize("provider", ["claude", "openai", "xai", "antigravity", "cursor"])
+@pytest.mark.parametrize("provider", ["claude", "openai", "xai", "antigravity", "cursor", "workbuddy"])
 @pytest.mark.asyncio
 async def test_token_refresh_failure_persists_backoff_without_leaking_secret(
     monkeypatch, sync_config, provider,

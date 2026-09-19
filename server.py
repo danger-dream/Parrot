@@ -960,7 +960,11 @@ def _anthropic_to_openai_context_preflight(body: dict, result) -> dict | None:
     if not metadata_model or safe_limit is None or safe_limit <= 0:
         return None
     prompt_tokens = token_counter.count_request_tokens(body, model=metadata_model)
-    if budget.output_within_limit and prompt_tokens <= safe_limit:
+    # Only the input side is judged here. A requested output limit above the
+    # route's maxOutputTokens is clamped per candidate in failover
+    # (_candidate_budget_body); rejecting it here would report a bogus
+    # "Prompt is too long: N > M" with N < M whenever a single route remains.
+    if prompt_tokens <= safe_limit:
         return None
     msg = protocol_errors.context_length_error_message_for_claude_code(
         "context_length_exceeded: Your input exceeds the context window of this model. "

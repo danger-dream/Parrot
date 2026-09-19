@@ -24,14 +24,16 @@ import shutil
 import sqlite3
 import threading
 import time
+import weakref
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import cmp_to_key
 from pathlib import Path
 from typing import Any, Literal
 
-from . import config, model_metadata, model_pricing
+from . import config, model_metadata, model_pricing, model_reroute
 from .channel.base import UpstreamDispatchMetadata
 
 _BJT = timezone(timedelta(hours=8))
@@ -58,6 +60,7 @@ _MONTH_LOG_NAME_RE = re.compile(r"^(?P<year>\d{4})-(?P<month>\d{2})\.db$")
 _RETENTION_MODE_FOREVER = "forever"
 _RETENTION_MODE_DAYS = "days"
 _RETENTION_CHILD_TABLES = ("request_detail", "retry_chain", "proxy_chain", "local_web_log")
+_RETENTION_CALL_TABLES = {"search_call_log": "started_at", "mcp_call_log": "created_at"}
 # SQLite VACUUM 在最坏情况下会临时占用约两倍原库空间；额外留出 10%（至少 512 MiB）
 # 以容纳 WAL / 并发写入等波动。
 _RETENTION_VACUUM_MIN_MARGIN_BYTES = 512 * 1024 * 1024
@@ -102,6 +105,23 @@ class RetentionPlanError(RuntimeError):
 # value is still the immutable handle returned by insert_pending; S5/S6 thread it
 # explicitly through active request paths.
 _request_handles: dict[str, RequestLogHandle] = {}
+# Weak references protect in-flight independent calls without retaining abandoned
+# callers forever. Access is serialized by _write_lock, like _request_handles.
+_active_call_handles: weakref.WeakValueDictionary[tuple[str, str, int], RowLogHandle] = weakref.WeakValueDictionary()
+
+
+def _track_call_handle(handle: RowLogHandle) -> RowLogHandle:
+    _active_call_handles[(handle.db.path, handle.table, handle.row_id)] = handle
+    return handle
+
+
+def _release_call_handle(handle: RowLogHandle) -> None:
+    _active_call_handles.pop((handle.db.path, handle.table, handle.row_id), None)
+
+
+def _active_call_ids(path: str, table: str) -> list[int]:
+    return [handle.row_id for handle in list(_active_call_handles.values())
+            if handle.db.path == path and handle.table == table]
 
 
 def _resolve_log_dir() -> str:
@@ -171,6 +191,13 @@ def _schema_sql() -> str:
       fast_mode             INTEGER DEFAULT 0,
       -- Actual upstream tier observed at terminal response; request intent is separate.
       actual_service_tier   TEXT,
+      -- Effective upstream model when it differs from the routed model. OpenAI OAuth
+      -- reports a reroute here; API channels expose a dated snapshot name.
+      upstream_actual_model TEXT,
+      -- Conflicting OpenAI OAuth model signals; no effective model is asserted.
+      model_signal_conflict TEXT,
+      -- JSON of the upstream safety-review facts (use_cases / reasons / retry_model).
+      safety_review         TEXT,
       -- Downstream request summary only; attempt accounting lives separately.
       usage_observed        INTEGER
     );
@@ -551,6 +578,15 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
         changed = True
     if "actual_service_tier" not in cols:
         conn.execute("ALTER TABLE request_log ADD COLUMN actual_service_tier TEXT")
+        changed = True
+    if "upstream_actual_model" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN upstream_actual_model TEXT")
+        changed = True
+    if "model_signal_conflict" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN model_signal_conflict TEXT")
+        changed = True
+    if "safety_review" not in cols:
+        conn.execute("ALTER TABLE request_log ADD COLUMN safety_review TEXT")
         changed = True
     if "usage_observed" not in cols:
         conn.execute(
@@ -1216,11 +1252,37 @@ def _read_retention_metadata(path: str, cutoff: float) -> dict[str, Any]:
                  FROM request_log""",
             (float(cutoff),),
         ).fetchone()
+        independent_total = independent_expired = 0
+        for table, timestamp in _RETENTION_CALL_TABLES.items():
+            if table not in tables:
+                continue
+            counts = conn.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN {timestamp} < ? THEN 1 ELSE 0 END) FROM {table}",
+                (float(cutoff),),
+            ).fetchone()
+            independent_total += int(counts[0] or 0)
+            independent_expired += int(counts[1] or 0)
+        if "mcp_call_detail" in tables:
+            # A detail follows its call's start time, even if the result was
+            # written much later; orphaned historical details use their own time.
+            timestamp = (
+                "COALESCE((SELECT created_at FROM mcp_call_log m "
+                "WHERE m.call_id=mcp_call_detail.call_id LIMIT 1), mcp_call_detail.created_at)"
+                if "mcp_call_log" in tables else "created_at"
+            )
+            counts = conn.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN {timestamp} < ? THEN 1 ELSE 0 END) FROM mcp_call_detail",
+                (float(cutoff),),
+            ).fetchone()
+            independent_total += int(counts[0] or 0)
+            independent_expired += int(counts[1] or 0)
         page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
         freelist_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
         return {
             "total_requests": int(row["total_requests"] or 0),
             "expired_requests": int(row["expired_requests"] or 0),
+            "total_independent_rows": independent_total,
+            "expired_independent_rows": independent_expired,
             "page_size": page_size,
             "freelist_bytes": page_size * freelist_pages,
         }
@@ -1237,6 +1299,7 @@ def _retention_target_signature(plan: dict[str, Any]) -> str:
                 "month": str(item.get("month") or ""),
                 "action": str(item.get("action") or ""),
                 "expired_requests": int(item.get("expired_requests") or 0),
+                "expired_independent_rows": int(item.get("expired_independent_rows") or 0),
             }
             for item in (plan.get("items") or [])
         ],
@@ -1338,13 +1401,17 @@ def _build_retention_plan(
         total_requests = int(meta["total_requests"])
         expired_requests = int(meta["expired_requests"])
         plan["scanned_requests"] += total_requests
-        if expired_requests <= 0:
+        independent_total = int(meta["total_independent_rows"])
+        independent_expired = int(meta["expired_independent_rows"])
+        if expired_requests + independent_expired <= 0:
             continue
         # 当前写入月份绝不 unlink：即使它所有现有记录都已过期，仍可能有
         # thread-local 连接在后续请求中继续使用该文件，必须原地清理并压缩。
         action = (
             "delete_file"
-            if expired_requests == total_requests and month != active_month
+            if (expired_requests == total_requests
+                and independent_expired == independent_total
+                and month != active_month)
             else "trim_and_vacuum"
         )
         plan["items"].append({
@@ -1356,6 +1423,8 @@ def _build_retention_plan(
             "bundle_bytes": bundle_bytes,
             "total_requests": total_requests,
             "expired_requests": expired_requests,
+            "total_independent_rows": independent_total,
+            "expired_independent_rows": independent_expired,
             "freelist_bytes": int(meta["freelist_bytes"]),
         })
 
@@ -1413,7 +1482,8 @@ def _emit_retention_progress(progress, event: dict[str, Any]) -> None:
 
 
 def _has_active_handle_for_path(path: str) -> bool:
-    return any(handle.db.path == path for handle in _request_handles.values())
+    return (any(handle.db.path == path for handle in _request_handles.values())
+            or any(handle.db.path == path for handle in list(_active_call_handles.values())))
 
 
 def _close_cached_write_connections(path: str) -> None:
@@ -1475,6 +1545,7 @@ def _delete_whole_retention_month(item: dict[str, Any]) -> dict[str, Any]:
         "action": "delete_file",
         "ok": not bool(error),
         "deleted_requests": int(item.get("expired_requests") or 0),
+        "deleted_independent_rows": int(item.get("expired_independent_rows") or 0),
         "before_bytes": before_bytes,
         "after_bytes": _log_bundle_bytes(path),
         "removed_files": len(removed_files),
@@ -1499,6 +1570,7 @@ def _trim_retention_month(
         "action": "trim_and_vacuum",
         "ok": False,
         "deleted_requests": 0,
+        "deleted_independent_rows": 0,
         "before_bytes": before_bytes,
         "after_bytes": before_bytes,
         "removed_files": 0,
@@ -1560,15 +1632,48 @@ def _trim_retention_month(
             "DELETE FROM request_log WHERE request_id IN "
             "(SELECT request_id FROM _parrot_retention_ids)"
         )
+        # Independent calls expire by their own start time, not request_id.
+        # Keep live handles even across rollover; abandoned callers disappear
+        # from the weak registry and can be cleaned on the next retention run.
+        conn.execute("CREATE TEMP TABLE _parrot_active_calls (table_name TEXT, row_id INTEGER)")
+        conn.executemany(
+            "INSERT INTO _parrot_active_calls VALUES (?,?)",
+            [(table, row_id) for table in _RETENTION_CALL_TABLES
+             for row_id in _active_call_ids(path, table)],
+        )
+        independent_deleted = 0
+        if "mcp_call_detail" in tables:
+            if "mcp_call_log" in tables:
+                predicate = (
+                    "EXISTS (SELECT 1 FROM mcp_call_log m WHERE m.call_id=mcp_call_detail.call_id "
+                    "AND m.created_at < ? AND m.id NOT IN (SELECT row_id FROM _parrot_active_calls "
+                    "WHERE table_name='mcp_call_log')) OR (created_at < ? AND NOT EXISTS "
+                    "(SELECT 1 FROM mcp_call_log m WHERE m.call_id=mcp_call_detail.call_id))"
+                )
+                args = (float(item["cutoff"]), float(item["cutoff"]))
+            else:
+                predicate, args = "created_at < ?", (float(item["cutoff"]),)
+            independent_deleted += conn.execute(
+                f"DELETE FROM mcp_call_detail WHERE {predicate}", args,
+            ).rowcount
+        for table, timestamp in _RETENTION_CALL_TABLES.items():
+            if table in tables:
+                independent_deleted += conn.execute(
+                    f"DELETE FROM {table} WHERE {timestamp} < ? AND id NOT IN "
+                    "(SELECT row_id FROM _parrot_active_calls WHERE table_name=?)",
+                    (float(item["cutoff"]), table),
+                ).rowcount
+        conn.execute("DROP TABLE _parrot_active_calls")
         conn.commit()
         committed = True
         result["deleted_requests"] = target_count
+        result["deleted_independent_rows"] = independent_deleted
         try:
             conn.execute("DROP TABLE IF EXISTS _parrot_retention_ids")
         except Exception:
             pass
 
-        if target_count:
+        if target_count or independent_deleted:
             _emit_retention_progress(progress, {
                 "phase": "trim_vacuum", "item": item, "index": index, "total": total,
             })
@@ -1650,6 +1755,7 @@ def _execute_retention_plan(plan: dict[str, Any], progress=None) -> dict[str, An
         "ok": not errors,
         "items": results,
         "deleted_requests": sum(int(row.get("deleted_requests") or 0) for row in results),
+        "deleted_independent_rows": sum(int(row.get("deleted_independent_rows") or 0) for row in results),
         "full_months_deleted": sum(1 for row in results if row.get("ok") and row.get("action") == "delete_file"),
         "logical_bytes_removed": max(0, logical_before - logical_after),
         "actual_free_bytes": max(0, after_free - before_free),
@@ -2678,10 +2784,27 @@ def record_search_call(
             ),
         )
         conn.commit()
-        return RowLogHandle(
+        return _track_call_handle(RowLogHandle(
             table="search_call_log", row_id=int(cur.lastrowid),
             request_id=str(request_id or ""), db=ref,
-        )
+        ))
+
+
+def _exa_reported_cost_ticks(response_body: Any) -> int | None:
+    """Exa's explicit total only; never infer a fee from credits or subtotals."""
+    cost = response_body.get("costDollars") if isinstance(response_body, dict) else None
+    total = cost.get("total") if isinstance(cost, dict) else None
+    if type(total) not in (int, float):
+        return None
+    try:
+        amount = Decimal(str(total))
+        if not amount.is_finite() or amount < 0:
+            return None
+        ticks = int((amount * model_pricing.TICKS_PER_USD).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP))
+        return ticks if 0 <= ticks <= 2**63 - 1 else None
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
 
 
 def finish_search_call(
@@ -2706,12 +2829,18 @@ def finish_search_call(
     """
     row_handle = _row_handle(handle, table="search_call_log")
     normalized = model_pricing.normalize_response_billing(response_body)
-    tokens, _split, observed = _usage_values(None, None, normalized)
+    tokens, cache_split, observed = _usage_values(None, None, normalized)
     pricing_model: str | None = None
     cost_source = "unpriced"
     cost_ticks: int | None = None
+    # REST search can report money without any model-token usage. Preserve an
+    # explicit Exa total (including zero), without inventing token counters/fees.
+    exa_ticks = _exa_reported_cost_ticks(response_body) if provider == "exa" else None
+    if exa_ticks is not None:
+        observed = True
+        cost_source, cost_ticks = "actual", exa_ticks
     # xAI reports an authoritative settled cost; prefer it over any estimate.
-    if observed and normalized.actual_cost_ticks is not None and str(provider or "") == "xai":
+    elif observed and normalized.actual_cost_ticks is not None and str(provider or "") == "xai":
         cost_source, cost_ticks = "actual", int(normalized.actual_cost_ticks)
     elif observed and model:
         priority = model_pricing.priority_from_service_tier(normalized.service_tier)
@@ -2721,6 +2850,32 @@ def finish_search_call(
             cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
             priority=bool(priority),
         )
+        if estimate is None and cache_split is not None and tokens[2] > 0:
+            # Use the same exact 5m/1h settlement as ordinary upstream calls.
+            # The persisted account/source supplies the binding scope; never
+            # manufacture a provider or pick a TTL from the aggregate count.
+            with _write_lock:
+                row = _get_conn_for_ref(row_handle.db).execute(
+                    "SELECT account_key, source_id, source_type FROM search_call_log WHERE id=?",
+                    (row_handle.row_id,),
+                ).fetchone()
+            estimate = None
+            if row is not None:
+                account = str(row["account_key"] or "")
+                binding = model_pricing.build_pricing_binding(
+                    channel_key=f"oauth:{account}" if account else f"search:{row['source_id']}",
+                    channel_type="oauth" if account else "api",
+                    upstream_protocol="anthropic" if row["source_type"] == "anthropic" else "openai-responses",
+                    outbound_model_id=str(model),
+                )
+                settled = model_pricing.estimate_cost_from_binding(
+                    binding, input_tokens=tokens[0], output_tokens=tokens[1],
+                    cache_creation_tokens=tokens[2], cache_read_tokens=tokens[3],
+                    cache_creation_5m_tokens=cache_split[0], cache_creation_1h_tokens=cache_split[1],
+                    priority=bool(priority),
+                )
+                if settled is not None:
+                    estimate = settled[0]
         if estimate is not None:
             pricing_model = estimate.pricing_model
             cost_source, cost_ticks = "estimated", int(estimate.total_ticks)
@@ -2747,6 +2902,7 @@ def finish_search_call(
             ),
         )
         conn.commit()
+        _release_call_handle(row_handle)
 
 
 def search_call_stats(since_ts: float, *, source_id: str | None = None) -> list[dict]:
@@ -2810,6 +2966,69 @@ def search_call_stats(since_ts: float, *, source_id: str | None = None) -> list[
     return sorted(by_source.values(), key=lambda item: item["attempts"], reverse=True)
 
 
+def _call_log_page(
+    table: str, timestamp: str, since_ts: float, *, filters: dict,
+    limit: int, offset: int,
+) -> list[dict]:
+    """Merge narrow indexed cursors; hydrate only the requested page's bodies.
+
+    Table/column names come only from the two private call sites below. Each
+    monthly cursor is bounded by the global prefix, with one lookahead per
+    source in the heap. Closing the stack also closes partially read cursors.
+    """
+    limit = max(1, min(int(limit or 50), 500))
+    offset = max(0, int(offset or 0))
+    where = [f"{timestamp}>=?"]
+    args: list[Any] = [float(since_ts)]
+    for field, value in filters.items():
+        if value:
+            where.append(f"{field}=?")
+            args.append(str(value))
+
+    def stream(conn, cursor):
+        for row in cursor:
+            yield conn, row
+
+    with ExitStack() as stack:
+        streams = []
+        for conn, close_fn in _iter_month_conns_all(since_ts):
+            stack.callback(close_fn)
+            try:
+                if table not in _existing_tables(conn):
+                    continue
+                stack.enter_context(_management_search_snapshot(conn))
+                cursor = conn.execute(
+                    f"SELECT id, {timestamp} FROM {table} WHERE {' AND '.join(where)} "
+                    f"ORDER BY {timestamp} DESC, id DESC LIMIT ?",
+                    (*args, min(offset + limit, (1 << 63) - 1)),
+                )
+                stack.callback(cursor.close)
+                streams.append(stream(conn, cursor))
+            except (sqlite3.OperationalError, HistoricalLogError):
+                continue
+        selected = []
+        merged = heapq.merge(
+            *streams,
+            key=lambda item: (float(item[1][timestamp] or 0.0), int(item[1]["id"])),
+            reverse=True,
+        )
+        for index, (conn, row) in enumerate(merged):
+            if index < offset:
+                continue
+            selected.append((conn, int(row["id"])))
+            if len(selected) == limit:
+                break
+        ids_by_conn: dict[sqlite3.Connection, list[int]] = {}
+        for conn, row_id in selected:
+            ids_by_conn.setdefault(conn, []).append(row_id)
+        hydrated = {}
+        for conn, ids in ids_by_conn.items():
+            placeholders = ','.join('?' for _ in ids)
+            for row in conn.execute(f"SELECT * FROM {table} WHERE id IN ({placeholders})", ids):
+                hydrated[(conn, int(row["id"]))] = dict(row)
+        return [hydrated[key] for key in selected]
+
+
 def search_call_entries(
     since_ts: float,
     *,
@@ -2818,27 +3037,10 @@ def search_call_entries(
     offset: int = 0,
 ) -> list[dict]:
     """Recent search-call rows (newest first) for the log viewer."""
-    limit = max(1, min(int(limit or 50), 500))
-    offset = max(0, int(offset or 0))
-    collected: list[dict] = []
-    for conn, close_fn in _iter_month_conns_all(since_ts):
-        try:
-            if "search_call_log" not in _existing_tables(conn):
-                continue
-            sql = "SELECT * FROM search_call_log WHERE started_at>=?"
-            args: list = [float(since_ts)]
-            if source_id:
-                sql += " AND source_id=?"
-                args.append(str(source_id))
-            sql += " ORDER BY started_at DESC, id DESC"
-            collected.extend(dict(r) for r in conn.execute(sql, tuple(args)).fetchall())
-        except (sqlite3.OperationalError, HistoricalLogError):
-            continue
-        finally:
-            close_fn()
-    collected.sort(key=lambda item: (float(item.get("started_at") or 0.0),
-                                     int(item.get("id") or 0)), reverse=True)
-    return collected[offset:offset + limit]
+    return _call_log_page(
+        "search_call_log", "started_at", since_ts,
+        filters={"source_id": source_id}, limit=limit, offset=offset,
+    )
 
 
 # ── MCP 工具调用事实 ────────────────────────────────────────────────────────
@@ -2847,6 +3049,47 @@ def search_call_entries(
 # "客户怎么使用 MCP"，包括那些**没有产生任何上游调用**的调用（工具被禁用、
 # Key 无权限、参数非法）。这些在按上游调用记账的表里根本不存在，这正是本表
 # 独立存在的理由。真实上游调用仍由各自的表记录，用 call_id 关联。
+
+def _mcp_params_json(params: Any, max_chars: int = 8000) -> str:
+    """Bound a diagnostic snapshot without turning it into invalid JSON.
+
+    Ordinary parameters are byte-for-byte unchanged. Oversized string values
+    retain previews and short sibling fields (model, count, etc.). If even the
+    container structure exceeds the budget, use an explicitly marked preview.
+    """
+    text = json.dumps(params, ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return text
+    value = json.loads(text)
+
+    def clip(item, limit):
+        if isinstance(item, str):
+            return item if len(item) <= limit else item[:limit] + "… [truncated]"
+        if isinstance(item, dict):
+            return {key: clip(child, limit) for key, child in item.items()}
+        if isinstance(item, list):
+            return [clip(child, limit) for child in item]
+        return item
+
+    def encode(limit):
+        return json.dumps(clip(value, limit), ensure_ascii=False)
+
+    best = encode(0)
+    if len(best) > max_chars:
+        # Huge arrays/key sets cannot be bounded by clipping their values.
+        def encode(limit):
+            return json.dumps({"_parrot_truncated": True, "preview": text[:limit]}, ensure_ascii=False)
+        best = encode(0)
+    low, high = 0, max_chars
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = encode(middle)
+        if len(candidate) <= max_chars:
+            best, low = candidate, middle + 1
+        else:
+            high = middle - 1
+    return best
+
 
 def record_mcp_call(
     *,
@@ -2864,7 +3107,7 @@ def record_mcp_call(
     payload: str | None = None
     if params is not None:
         try:
-            payload = json.dumps(params, ensure_ascii=False, default=str)[:8000]
+            payload = _mcp_params_json(params)
         except Exception:
             payload = None
     with _write_lock:
@@ -2884,8 +3127,8 @@ def record_mcp_call(
             ),
         )
         conn.commit()
-        return RowLogHandle(table="mcp_call_log", row_id=int(cur.lastrowid),
-                            request_id=str(call_id), db=ref)
+        return _track_call_handle(RowLogHandle(table="mcp_call_log", row_id=int(cur.lastrowid),
+                            request_id=str(call_id), db=ref))
 
 
 def finish_mcp_call(
@@ -2943,6 +3186,7 @@ def finish_mcp_call(
             ),
         )
         conn.commit()
+        _release_call_handle(row_handle)
 
 
 def save_mcp_call_detail(
@@ -3004,6 +3248,32 @@ def mcp_call_detail(call_id: str) -> dict | None:
     return None
 
 
+def mcp_call_entry(call_id: str, *, since_ts: float = 0.0) -> dict | None:
+    """One exact call summary, independent of list pagination.
+
+    The management control owns authorization. Historical reads stay read-only;
+    idx_mcp_call_id bounds each monthly lookup to the requested identity.
+    """
+    key = str(call_id or "")
+    if not key:
+        return None
+    for conn, close_fn in _iter_month_conns_all(since_ts):
+        try:
+            if "mcp_call_log" not in _existing_tables(conn):
+                continue
+            row = conn.execute(
+                "SELECT * FROM mcp_call_log WHERE call_id=? AND created_at>=? LIMIT 1",
+                (key, float(since_ts)),
+            ).fetchone()
+            if row is not None:
+                return dict(row)
+        except (sqlite3.OperationalError, HistoricalLogError):
+            continue
+        finally:
+            close_fn()
+    return None
+
+
 def mcp_call_entries(
     since_ts: float,
     *,
@@ -3013,30 +3283,11 @@ def mcp_call_entries(
     offset: int = 0,
 ) -> list[dict]:
     """Recent MCP tool-call rows (newest first) for the log viewer."""
-    limit = max(1, min(int(limit or 50), 500))
-    offset = max(0, int(offset or 0))
-    collected: list[dict] = []
-    for conn, close_fn in _iter_month_conns_all(since_ts):
-        try:
-            if "mcp_call_log" not in _existing_tables(conn):
-                continue
-            sql = "SELECT * FROM mcp_call_log WHERE created_at>=?"
-            args: list = [float(since_ts)]
-            if api_key_name:
-                sql += " AND api_key_name=?"
-                args.append(str(api_key_name))
-            if tool_name:
-                sql += " AND tool_name=?"
-                args.append(str(tool_name))
-            sql += " ORDER BY created_at DESC, id DESC"
-            collected.extend(dict(row) for row in conn.execute(sql, tuple(args)).fetchall())
-        except (sqlite3.OperationalError, HistoricalLogError):
-            continue
-        finally:
-            close_fn()
-    collected.sort(key=lambda item: (float(item.get("created_at") or 0.0),
-                                     int(item.get("id") or 0)), reverse=True)
-    return collected[offset:offset + limit]
+    return _call_log_page(
+        "mcp_call_log", "created_at", since_ts,
+        filters={"api_key_name": api_key_name, "tool_name": tool_name},
+        limit=limit, offset=offset,
+    )
 
 
 def mcp_call_stats(since_ts: float) -> list[dict]:
@@ -3105,6 +3356,42 @@ def mcp_call_status_counts(since_ts: float) -> dict[str, int]:
     return counts
 
 
+def finish_managed_search_request(
+    handle: RequestLogHandle,
+    *,
+    status: str,
+    http_status: int | None,
+    error_message: str | None = None,
+    response_body: str | None = None,
+) -> None:
+    """Finalize the logical search request, not another model billing attempt.
+
+    Model rounds already settled their own immutable usage. Reusing
+    finish_success/finish_error here would overwrite their dispatch facts or
+    try to bill the aggregated response again. A concrete handle also keeps
+    this final update in the original month after the round released its binding.
+    """
+    if not isinstance(handle, RequestLogHandle):
+        raise TypeError("managed search finalization requires a concrete request handle")
+    if status not in ("success", "error", "cancelled"):
+        raise ValueError("invalid managed search terminal status")
+    with _write_lock:
+        conn = _get_conn_for_ref(handle.db)
+        conn.execute(
+            """UPDATE request_log SET status=?, finished_at=?, http_status=?,
+               error_message=? WHERE request_id=?""",
+            (status, time.time(), http_status, error_message, handle.request_id),
+        )
+        if _store_log_bodies():
+            # A cancellation has no final body: do not retain a hidden tool-call
+            # round as if it were the response delivered to the client.
+            conn.execute(
+                "UPDATE request_detail SET response_body=? WHERE request_id=?",
+                (response_body, handle.request_id),
+            )
+        conn.commit()
+
+
 def finish_success(
     request_id: str | RequestLogHandle,
     final_channel_key: str,
@@ -3133,11 +3420,19 @@ def finish_success(
     response_headers_wait_ms: int | None = None,
     response_body_first_byte_wait_ms: int | None = None,
     usage_observed: bool | None = None,
+    response_signals: model_reroute.ResponseModelSignals | None = None,
+    http_header_model: str | None = None,
 ) -> None:
     handle = _request_handle(request_id)
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         normalized_billing = model_pricing.normalize_response_billing(response_body)
+        actual_model, safety_review, model_signal_conflict = _upstream_observation(
+            response_body, final_model,
+            channel_key=final_channel_key, channel_type=final_channel_type,
+            upstream_protocol=str(upstream_protocol or ""),
+            response_signals=response_signals, http_header_model=http_header_model,
+        )
         supplied_usage = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -3163,7 +3458,8 @@ def finish_success(
                  proxy_bytes_up=?, proxy_bytes_down=?,
                  request_upload_ms=?, response_headers_wait_ms=?,
                  response_body_first_byte_wait_ms=?, usage_observed=?,
-                 actual_service_tier=?
+                 actual_service_tier=?,
+                 upstream_actual_model=?, safety_review=?, model_signal_conflict=?
                WHERE request_id=?""",
             (
                 time.time(), http_status,
@@ -3178,6 +3474,7 @@ def finish_success(
                 response_body_first_byte_wait_ms,
                 1 if observed else 0,
                 normalized_billing.service_tier,
+                actual_model, safety_review, model_signal_conflict,
                 handle.request_id,
             ),
         )
@@ -3194,6 +3491,16 @@ def finish_success(
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _request_handles.pop(handle.request_id, None)
+
+    if actual_model or model_signal_conflict:
+        _notify_upstream_observation(
+            handle,
+            actual_model=actual_model,
+            final_channel_key=final_channel_key,
+            final_channel_type=final_channel_type,
+            outbound_model=final_model,
+            model_signal_conflict=model_signal_conflict,
+        )
 
 
 def finish_error(
@@ -3223,12 +3530,21 @@ def finish_error(
     status: str = "error",
     usage: dict | None = None,
     usage_observed: bool | None = None,
+    response_signals: model_reroute.ResponseModelSignals | None = None,
+    http_header_model: str | None = None,
 ) -> None:
     terminal_status = "cancelled" if status == "cancelled" else "error"
     handle = _request_handle(request_id)
     with _write_lock:
         conn = _get_conn_for_ref(handle.db)
         normalized_billing = model_pricing.normalize_response_billing(response_body)
+        actual_model, safety_review, model_signal_conflict = _upstream_observation(
+            response_body, final_model,
+            channel_key=str(final_channel_key or ""),
+            channel_type=str(final_channel_type or ""),
+            upstream_protocol=str(upstream_protocol or ""),
+            response_signals=response_signals, http_header_model=http_header_model,
+        )
         _error_tokens, _error_split, error_usage_valid = _strict_tracker_usage(usage)
         if usage_observed is not None:
             observed = bool(usage_observed and error_usage_valid)
@@ -3246,7 +3562,8 @@ def finish_error(
                  proxy_bytes_up=?, proxy_bytes_down=?,
                  request_upload_ms=?, response_headers_wait_ms=?,
                  response_body_first_byte_wait_ms=?, usage_observed=?,
-                 actual_service_tier=?
+                 actual_service_tier=?,
+                 upstream_actual_model=?, safety_review=?, model_signal_conflict=?
                WHERE request_id=?""",
             (
                 terminal_status, time.time(), error_message, http_status,
@@ -3259,6 +3576,7 @@ def finish_error(
                 response_body_first_byte_wait_ms,
                 1 if observed else 0,
                 normalized_billing.service_tier,
+                actual_model, safety_review, model_signal_conflict,
                 handle.request_id,
             ),
         )
@@ -3274,6 +3592,16 @@ def finish_error(
         conn.commit()
         if _request_handles.get(handle.request_id) == handle:
             _request_handles.pop(handle.request_id, None)
+
+    if actual_model or model_signal_conflict:
+        _notify_upstream_observation(
+            handle,
+            actual_model=actual_model,
+            final_channel_key=str(final_channel_key or ""),
+            final_channel_type=str(final_channel_type or ""),
+            outbound_model=str(final_model or ""),
+            model_signal_conflict=model_signal_conflict,
+        )
 
 
 def _long_context_case_sql(
@@ -5701,6 +6029,7 @@ _RECENT_COLS_BASE = (
     "retry_count, affinity_hit, "
     "ingress_protocol, upstream_protocol, upstream_transport, proxy_name, proxy_bytes_up, proxy_bytes_down, "
     "reasoning_effort, fast_mode, actual_service_tier, usage_observed, "
+    "upstream_actual_model, safety_review, model_signal_conflict, "
 )
 _RECENT_COLS_SUFFIX = (
     "(SELECT COUNT(*) FROM local_web_log lw WHERE lw.request_id=request_log.request_id) AS local_web_count"
@@ -5745,6 +6074,7 @@ def _compatible_recent_cols(
         "upstream_protocol", "upstream_transport", "proxy_name",
         "proxy_bytes_up", "proxy_bytes_down", "reasoning_effort", "fast_mode",
         "actual_service_tier", "usage_observed",
+        "upstream_actual_model", "safety_review", "model_signal_conflict",
     ):
         if name not in cols:
             sql = sql.replace(name, f"NULL AS {name}")
@@ -8648,3 +8978,125 @@ def extract_reasoning_effort(body: dict, ingress_protocol: str = "anthropic") ->
         return None
 
     return None
+
+
+# ─── 上游模型观测（降级 / 安全审查）────────────────────────────────
+
+
+def _upstream_observation(
+    response_body: Any,
+    outbound_model: Any,
+    *,
+    channel_key: str = "",
+    channel_type: str = "",
+    upstream_protocol: str = "",
+    response_signals: model_reroute.ResponseModelSignals | None = None,
+    http_header_model: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (effective model, safety review JSON, model conflict JSON).
+
+    Only OpenAI OAuth and OpenAI-protocol API channels are observed. A dated
+    snapshot name on an API channel is a normal answer, and other providers
+    (xAI, Cursor, Claude) routinely answer with their own resolved model — reading
+    those as a "reroute" would flag ordinary traffic as a downgrade.
+
+    Auxiliary to billing: any extraction failure must never break log writing,
+    so this swallows every exception and degrades to "no observation".
+    """
+    try:
+        if not model_reroute.observes_channel(channel_key, channel_type, upstream_protocol):
+            return None, None, None
+    except Exception:
+        return None, None, None
+    try:
+        # Independent, pre-truncation evidence is authoritative even when empty.
+        # Old callers keep the body-only path; logging/body switches do not own
+        # these small model/safety facts.
+        signals = (response_signals if response_signals is not None
+                   else model_reroute.extract_response_signals(response_body))
+    except Exception:
+        return None, None, None
+    conflict_json = None
+    try:
+        if model_reroute.is_openai_oauth_channel(channel_key):
+            conflict = model_reroute.model_conflict(signals, http_header_model)
+            if conflict:
+                conflict_json = json.dumps(conflict, ensure_ascii=False, separators=(",", ":"))
+        actual = model_reroute.resolve_actual_model(
+            outbound_model=outbound_model, signals=signals,
+            http_header_model=http_header_model,
+        )
+    except Exception:
+        actual = None
+    try:
+        review_json = model_reroute.encode_safety_review(signals.safety_review)
+    except Exception:
+        review_json = None
+    return (None if conflict_json else actual), review_json, conflict_json
+
+
+def _notify_upstream_observation(
+    request_id: str | RequestLogHandle,
+    *,
+    actual_model: str | None,
+    final_channel_key: str,
+    final_channel_type: str,
+    outbound_model: str,
+    model_signal_conflict: str | None = None,
+) -> None:
+    """Emit a model change/conflict alert for one persisted observation.
+
+    Only the alert for an actual reroute on an OpenAI OAuth channel is sent;
+    ``model_reroute.notify_reroute`` owns that decision plus the mute/throttle
+    rules. Notification is auxiliary, so every failure is swallowed here.
+    """
+    if not actual_model and not model_signal_conflict:
+        return
+    try:
+        handle = _request_handle(request_id)
+        conn = _get_conn_for_ref(handle.db)
+        row = conn.execute(
+            "SELECT api_key_name, requested_model FROM request_log WHERE request_id=?",
+            (handle.request_id,),
+        ).fetchone()
+        api_key_name = str(row["api_key_name"] or "") if row is not None else ""
+        requested_model = str(row["requested_model"] or "") if row is not None else ""
+        model_reroute.on_log_observation({
+            "request_id": handle.request_id,
+            "api_key_name": api_key_name,
+            "requested_model": requested_model,
+            "final_model": outbound_model,
+            "upstream_actual_model": actual_model,
+            "model_signal_conflict": model_signal_conflict,
+            "final_channel_key": final_channel_key,
+            "final_channel_type": final_channel_type,
+        })
+    except Exception as exc:
+        print(f"[log_db] reroute notify failed: {type(exc).__name__}: {exc}")
+
+
+def record_upstream_model_observation(
+    request_id: str | RequestLogHandle,
+    *,
+    actual_model: str | None = None,
+    safety_review: str | None = None,
+) -> bool:
+    """Persist the effective-upstream-model and safety-review facts for one row.
+
+    Narrow by design: ``finish_success`` / ``finish_error`` enumerate the columns
+    they update, so this hook refreshes only these two facts and cannot clobber
+    the rest of the summary row. Returns True when a row was updated.
+    """
+    handle = _request_handle(request_id)
+    with _write_lock:
+        conn = _get_conn_for_ref(handle.db)
+        cur = conn.execute(
+            "UPDATE request_log SET upstream_actual_model=?, safety_review=? "
+            "WHERE request_id=?",
+            (actual_model, safety_review, handle.request_id),
+        )
+        changed = bool(cur.rowcount)
+        conn.commit()
+        if _request_handles.get(handle.request_id) == handle:
+            _request_handles.pop(handle.request_id, None)
+        return changed

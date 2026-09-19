@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from src import local_web_tools as web, search_service, search_tool_policy as policy, search_tool_wire as wire
 from src.openai.transform.guard import GuardError
+from src.tests.search_stream_fixtures import wire as stream_wire, decode, text_delta
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +98,7 @@ async def test_managed_call_result_final(protocol, hosted, stream, monkeypatch):
         return JSONResponse(reply(protocol, name if len(model_rounds) == 1 else None))
     body = request(protocol, hosted)
     if stream:
-        response = policy.stream(asyncio.create_task(policy.run(body, protocol, invoke, request_id="req-test", api_key_name="A")), protocol)
+        response = policy.stream(body, protocol, invoke, request_id="req-test", api_key_name="A")
         chunks = b"".join([c async for c in response.body_iterator])
         assert b"Found Python docs" in chunks
         assert b'"name":"parrot_hosted_' not in chunks
@@ -238,18 +239,21 @@ def test_cross_protocol_passthrough_stays_hosted(settings):
 
 async def test_cancel_stops_service_task():
     cancelled = asyncio.Event()
-    async def operation():
+    entered = asyncio.Event()
+    async def invoke(_):
+        entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             cancelled.set()
-    task = asyncio.create_task(operation())
-    stream = policy.stream(task, "responses")
+    stream = policy.stream(request(), "responses", invoke)
     iterator = stream.body_iterator
-    await iterator.__anext__()
-    await asyncio.sleep(0)
+    pull = asyncio.create_task(anext(iterator))
+    await entered.wait()
+    pull.cancel()
+    await asyncio.gather(pull, return_exceptions=True)
     await iterator.aclose()
-    assert task.cancelled() and cancelled.is_set()
+    assert cancelled.is_set()
 
 
 async def test_service_error_is_structured_tool_result_and_offline_not_weakened(monkeypatch):
@@ -289,6 +293,8 @@ async def test_http_real_pipeline_managed_matrix(protocol, upstream_protocol, ho
         name = fn["name"]
         assert payload["tools"][0].get("type") in (None, "function")
         result = reply(upstream_protocol, name if len(captured) == 1 else None)
+        if payload.get("stream"):
+            return httpx.Response(200, content=stream_wire(result, upstream_protocol), headers={"content-type": "text/event-stream"})
         return httpx.Response(200, json=result)
     router = fx.MockRouter()
     router.register("https://search-matrix.example", model)
@@ -301,7 +307,7 @@ async def test_http_real_pipeline_managed_matrix(protocol, upstream_protocol, ho
     try:
         raw = b"".join([chunk async for chunk in response.body_iterator]) if streaming and hasattr(response, "body_iterator") else response.body
         assert response.status_code == 200, raw
-        assert b"Found Python docs" in raw, raw
+        assert ("".join(text_delta(frame, protocol) for frame in decode(raw)) == "Found Python docs") if streaming else b"Found Python docs" in raw, raw
         assert len(captured) == 2 and len(searches) == 1
         assert "local-1" in json.dumps(captured[1])
         assert "docs.python.org" in json.dumps(captured[1])
@@ -339,19 +345,12 @@ async def test_ws_first_and_followup_share_policy(mode, settings, monkeypatch):
     m["upstream"].set_client(client)
     body = request()
     body["type"] = "response.create"
-    class Socket(fx.FakeWebSocket):
-        def __init__(self):
-            super().__init__(body)
-            self.next_sent = False
-        async def receive(self):
-            if self._first_text is not None:
-                return await super().receive()
-            if mode != "disabled" and not self.next_sent:
-                self.next_sent = True
-                inp = [{"type": "function_call_output", "call_id": "local-1", "output": "client-result"}] if mode == "passthrough" else "continue"
-                return {"type": "websocket.receive", "text": json.dumps({"type": "response.create", "model": "test-model", "previous_response_id": "resp_calls" if mode == "passthrough" else "resp_final", "input": inp})}
-            return {"type": "websocket.disconnect"}
-    ws = Socket()
+    from src.tests.test_openai_responses_ws import SequentialFakeWebSocket
+    # A sequential client waits for the terminal response before its next create;
+    # the active-turn reader now also observes disconnect/cancel frames.
+    inp = [{"type": "function_call_output", "call_id": "local-1", "output": "client-result"}] if mode == "passthrough" else "continue"
+    next_body = {"type": "response.create", "model": "test-model", "previous_response_id": "resp_calls", "input": inp}
+    ws = SequentialFakeWebSocket(body, *([] if mode == "disabled" else [next_body]))
     try:
         await m["responses_ws"].handle_responses_ws(ws)
         text = "\n".join(ws.sent_texts)
@@ -402,11 +401,7 @@ async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming
         name = payload["tools"][0]["name"]
         assert name.startswith("parrot_fn_")
         result = reply("responses", name if len(captured) == 1 else None)
-        events = [{"type": "response.created", "response": {"id": result["id"], "status": "in_progress"}}]
-        for index, item in enumerate(result["output"]):
-            events += [{"type": "response.output_item.added", "output_index": index, "item": item}, {"type": "response.output_item.done", "output_index": index, "item": item}]
-        events.append({"type": "response.completed", "response": result})
-        raw = b"".join(web._sse(e["type"], e) for e in events)
+        raw = stream_wire(result, "responses")
         return httpx.Response(200, stream=fx.ChunkedByteStream([raw[i:i+37] for i in range(0, len(raw), 37)]), headers={"content-type": "text/event-stream"})
     router = fx.MockRouter()
     router.register("https://api.x.ai", model)
@@ -416,7 +411,9 @@ async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming
         body["type"] = "response.create"
         client = httpx.AsyncClient(transport=httpx.MockTransport(router.handle))
         m["upstream"].set_client(client)
-        ws = fx.FakeWebSocket(body)
+        from src.tests.test_openai_responses_ws import FakeWebSocket
+        # Stay connected while the private model/search rounds are running.
+        ws = FakeWebSocket(body)
         await m["responses_ws"].handle_responses_ws(ws)
         raw = "\n".join(ws.sent_texts).encode()
     else:
@@ -428,7 +425,10 @@ async def test_xai_actual_pipeline_cache_key_function_output(protocol, streaming
     try:
         assert b"parrot_fn_" not in raw, raw
         if mode == "managed":
-            assert b"Found Python docs" in raw, raw
+            if protocol != "ws" and streaming:
+                assert "".join(text_delta(frame, protocol) for frame in decode(raw)) == "Found Python docs", raw
+            else:
+                assert b"Found Python docs" in raw, raw
             assert len(searches) == 1 and len(captured) == 2
         else:
             assert b"local-1" in raw and (b"WebSearch" in raw or b"web_search" in raw), raw
@@ -557,7 +557,8 @@ async def test_native_ws_turn_can_later_introduce_managed_search(monkeypatch):
         rounds.append(body)
         assert "previous_response_id" not in body
         assert "prior-context" in json.dumps(body)
-        return httpx.Response(200, json=reply("responses", body["tools"][0]["name"] if len(rounds) == 1 else None))
+        obj = reply("responses", body["tools"][0]["name"] if len(rounds) == 1 else None)
+        return httpx.Response(200, content=stream_wire(obj, "responses"), headers={"content-type": "text/event-stream"})
     from src import upstream
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     upstream.set_client(client)

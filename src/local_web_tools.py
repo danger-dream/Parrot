@@ -831,7 +831,12 @@ async def execute_local_tool_calls(
     # Keep order stable; run concurrently because web search/fetch is external I/O.
     async def _run(call: LocalToolCall) -> LocalToolResult:
         log_id = _record_call_start(request_id, round_no, call)
-        result = await execute_local_tool_call(call, request_id=service_request_id, round_no=round_no)
+        try:
+            result = await execute_local_tool_call(call, request_id=service_request_id, round_no=round_no)
+        except asyncio.CancelledError:
+            _record_call_finish(log_id, call, LocalToolResult(
+                call.id, "cancelled: local web tool execution cancelled", is_error=True))
+            raise
         _record_call_finish(log_id, call, result)
         return result
 

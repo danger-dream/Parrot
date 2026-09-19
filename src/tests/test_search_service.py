@@ -236,7 +236,7 @@ async def test_openai_wire_omits_empty_domains_and_normalizes_results(setup, mon
 
 
 @pytest.mark.asyncio
-async def test_xai_search_sse_preserves_citation_order_and_requires_terminal(setup, monkeypatch):
+async def test_xai_search_sse_keeps_plain_text_source_fallback_and_requires_terminal(setup, monkeypatch):
     from src import oauth_manager
     cfg, calls, install = setup
     cfg['search'].update(backends=[backend('xai')], maxAttempts=1)
@@ -254,12 +254,61 @@ async def test_xai_search_sse_preserves_citation_order_and_requires_terminal(set
     install(lambda r: httpx.Response(200, text='data: '+json.dumps(final)+'\n\n',headers={'content-type':'text/event-stream'}))
     result = await search.search({'query':'hello'})
     assert [r['title'] for r in result['results']] == ['first','second']
+    assert all('snippet' not in row for row in result['results'])
+    assert result['answer'] == 'answer'
     assert result['usage'] == {'total_tokens':20}
     body = json.loads(calls[0].content)
     assert body['max_tool_calls'] == 1 and body['tool_choice'] == 'required'
+    prompt = body['input'][0]['content']
+    assert 'results array of at most 8 objects' in prompt
+    assert 'otherwise omit snippet' in prompt and 'Do not invent snippets or URLs' in prompt
     install(lambda r: httpx.Response(200, text='data: {"type":"response.created"}\n\n'))
     with pytest.raises(search.SearchError) as exc: await search.search({'query':'hello'})
     assert exc.value.code == 'incomplete_search_response'
+
+
+def _xai_parse_args(**updates):
+    args = {'query': 'hello', 'max_results': 8, 'allowed_domains': [], 'blocked_domains': []}
+    args.update(updates)
+    return args
+
+
+def test_xai_structured_results_align_title_url_and_snippet_to_native_sources():
+    envelope = {'answer': 'grounded answer', 'results': [
+        {'title': 'Second title', 'url': 'https://example.test/second'},
+        {'title': 'Not searched', 'url': 'https://invented.test/page', 'snippet': 'Invented summary'},
+        {'title': 'First title', 'url': 'https://example.test/first', 'snippet': 'First summary'},
+    ]}
+    data = {'output': [
+        {'type': 'web_search_call', 'action': {'sources': [
+            {'url': 'https://example.test/first'},
+            {'url': 'https://example.test/second', 'description': 'Second native summary'}]}},
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(envelope)}]},
+    ]}
+    result = search._parse_oauth_result(data, 'xai', _xai_parse_args(), 'search', {})
+    assert result['answer'] == 'grounded answer'
+    assert result['results'] == [
+        {'title': 'Second title', 'url': 'https://example.test/second', 'snippet': 'Second native summary'},
+        {'title': 'First title', 'url': 'https://example.test/first', 'snippet': 'First summary'},
+    ]
+
+
+def test_xai_structured_results_keep_missing_snippet_and_domain_count_rules():
+    envelope = {'answer': 'answer', 'results': [
+        {'title': 'Wrong domain', 'url': 'https://other.test/result', 'snippet': 'Other'},
+        {'title': 'First allowed', 'url': 'https://docs.example.test/first'},
+        {'title': 'Second allowed', 'url': 'https://docs.example.test/second', 'snippet': 'Second'},
+    ]}
+    sources = [{'url': row['url']} for row in envelope['results']]
+    data = {'output': [
+        {'type': 'web_search_call', 'action': {'sources': sources}},
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': '```json\n' + json.dumps(envelope) + '\n```'}]},
+    ]}
+    args = _xai_parse_args(max_results=1, allowed_domains=['example.test'],
+                           blocked_domains=['blocked.example.test'])
+    result = search._parse_oauth_result(data, 'xai', args, 'search', {})
+    assert result['results'] == [{'title': 'First allowed', 'url': 'https://docs.example.test/first'}]
+
 
 @pytest.mark.asyncio
 async def test_locale_preferences_survive_non_native_adapter(setup):

@@ -153,6 +153,10 @@ def _notifications(e):
     for key, _label in sm._NOTIF_EVENTS:
         e.callback("sys:notif_toggle:" + key)
     e.callback("sys:notif_toggle:unknown")
+    # 模型降级通知的三个静音按钮：按渠道静音 → 取消静音 → 永久禁用。
+    e.callback("sys:mdg_mute:1:deadbeef")
+    e.callback("sys:mdg_unmute:deadbeef")
+    e.callback("sys:mdg_off")
 
 
 def _blacklist(e):

@@ -120,6 +120,7 @@ def _image(value) -> ImageSettingsData:
         enabled=value.enabled,
         cacheEnabled=value.cache_enabled,
         models=value.models,
+        defaultModel=value.default_model,
         requestTimeoutSeconds=value.request_timeout_seconds,
         jobTtlSeconds=value.job_ttl_seconds,
         cachePath=value.cache_path,

@@ -13,6 +13,26 @@ from src.openai.transform.guard import GuardError
 from src.protocols.matrix import DEFAULT_MATRIX, ProtocolGuardError, extract_request_features
 
 
+def _block_cache_controls(payload: dict) -> list[dict]:
+    """Block-level cache_control entries, excluding a top-level umbrella."""
+    controls = [
+        tool["cache_control"]
+        for tool in payload.get("tools") or []
+        if isinstance(tool.get("cache_control"), dict)
+    ]
+    for block in payload.get("system") or []:
+        if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+            controls.append(block["cache_control"])
+    for message in payload.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                controls.append(block["cache_control"])
+    return controls
+
+
 def test_translate_request_text_images_tools_and_tool_history():
     body = {
         "messages": [
@@ -117,10 +137,15 @@ def test_translate_request_adds_anthropic_block_breakpoints_and_skips_deferred_t
     assert out["tools"][0]["cache_control"] == cache_control
     assert out["tools"][1]["defer_loading"] is True
     assert "cache_control" not in out["tools"][1]
+    # The top-level umbrella occupies one of Anthropic's four cache_control
+    # slots, so only three block breakpoints remain: final message plus the
+    # final tool and system blocks.  The second-to-last user turn loses its
+    # breakpoint to stay within the limit.
     assert [
         "cache_control" in message["content"][-1]
         for message in out["messages"]
-    ] == [False, False, True, False, True]
+    ] == [False, False, False, False, True]
+    assert len(_block_cache_controls(out)) == 3
 
 
 def test_translate_request_does_not_put_tool_breakpoint_when_all_tools_are_deferred():
@@ -510,7 +535,13 @@ def test_translate_request_strips_chat_options_without_anthropic_equivalent(fiel
 
     block = {"type": "text", "text": "hi"}
     if field in {"prompt_cache_key", "prompt_cache_retention"}:
-        block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        # Generated block breakpoints must match the top-level umbrella TTL:
+        # retention 24h maps to 1h, a bare cache key keeps Anthropic's 5m default.
+        block["cache_control"] = dict(out["cache_control"])
+        assert block["cache_control"] == (
+            {"type": "ephemeral", "ttl": "1h"} if field == "prompt_cache_retention"
+            else {"type": "ephemeral"}
+        )
     assert out["messages"] == [{"role": "user", "content": [block]}]
     if field == "service_tier":
         assert "service_tier" not in out

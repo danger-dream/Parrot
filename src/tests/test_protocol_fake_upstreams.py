@@ -4896,7 +4896,9 @@ async def test_responses_client_safe_custom_tool_history_to_anthropic_fake_upstr
             "type": "tool_result",
             "tool_use_id": "call_1",
             "content": "ok",
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            # Must match the 5m top-level umbrella asserted above; Anthropic
+            # rejects a 1h block under a 5m top-level cache_control.
+            "cache_control": {"type": "ephemeral"},
         }]},
     ]
 

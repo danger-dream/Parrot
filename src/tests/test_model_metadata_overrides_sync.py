@@ -168,6 +168,82 @@ def test_sparse_16_field_overrides_inherit_preserve_false_zero_empty_and_restore
     assert common_restored.metadata["contextWindow"] == 900_000
 
 
+@pytest.mark.parametrize("scope", [None, "api:A"])
+@pytest.mark.parametrize("unset_field", ["contextWindow", "maxInputTokens"])
+def test_override_patch_validates_final_inheritance_in_one_commit(monkeypatch, scope, unset_field):
+    from pathlib import Path
+
+    base = _snapshot("inheritance", 1000)
+    common = {"vision": False, "cost.input": 0}
+    if scope:
+        common["contextWindow"] = 800
+    else:
+        common[unset_field] = 100
+    overrides = {"defaults": {"demo": {"fields": common}}, "scoped": {}}
+    if scope:
+        overrides["scoped"][scope] = {"demo": {
+            "outboundModel": "real-demo", "fields": {unset_field: 100},
+        }}
+    _reset_metadata_config(
+        defaults={"demo": _entry("demo/model", base)},
+        scoped={"api:A": {"demo": _entry("demo/model", base, outbound="real-demo")}},
+        overrides=overrides,
+    )
+    outbound = "real-demo" if scope else None
+    set_fields = {"maxInputTokens": 500, "compactTriggerTokens": 400} if unset_field == "contextWindow" else {"compactTriggerTokens": 500}
+    before = copy.deepcopy(config.get())
+    writes, published = [], []
+    write_atomic = config._write_atomic
+
+    def write(candidate):
+        writes.append(copy.deepcopy(candidate))
+        return write_atomic(candidate)
+
+    monkeypatch.setattr(config, "_write_atomic", write)
+    monkeypatch.setattr(config, "_reload_callbacks", [lambda cfg: published.append(copy.deepcopy(cfg))])
+    assert model_metadata.patch_override_fields(
+        "demo", scope_key=scope, outbound_model=outbound,
+        set_fields=set_fields, unset_fields=(unset_field,),
+    )
+    assert len(writes) == len(published) == 1
+    saved = config.get()
+    assert json.loads(Path(config.path()).read_text()) == saved == published[0]
+    assert saved["modelBindings"] == before["modelBindings"]
+    expected_overrides = copy.deepcopy(overrides)
+    layer = expected_overrides["scoped"][scope]["demo"]["fields"] if scope else expected_overrides["defaults"]["demo"]["fields"]
+    layer.pop(unset_field)
+    layer.update(set_fields)
+    assert saved["modelMetadataOverrides"] == expected_overrides
+    effective = model_metadata.get_metadata("demo", scope_key=scope, outbound_model=outbound)
+    assert effective["contextWindow"] == (800 if scope else 1000)
+    assert effective["maxInputTokens"] == (500 if unset_field == "contextWindow" else (800 if scope else 1000))
+    assert effective["compactTriggerTokens"] == set_fields["compactTriggerTokens"]
+    assert effective["vision"] is False and effective["cost"]["input"] == 0
+
+
+@pytest.mark.parametrize("scope", [None, "api:A"])
+def test_override_patch_rejects_invalid_final_inheritance_without_write(monkeypatch, scope):
+    from pathlib import Path
+
+    overrides = {"defaults": {"demo": {"fields": {"contextWindow": 2000}}}, "scoped": {}}
+    if scope:
+        overrides["defaults"]["demo"]["fields"]["contextWindow"] = 800
+        overrides["scoped"][scope] = {"demo": {
+            "outboundModel": "real-demo", "fields": {"contextWindow": 2000},
+        }}
+    _reset_metadata_config(defaults={"demo": _entry("demo/model", _snapshot("base", 1000))}, overrides=overrides)
+    before = copy.deepcopy(config.get())
+    disk = Path(config.path()).read_bytes()
+    monkeypatch.setattr(config, "_write_atomic", lambda cfg: pytest.fail("invalid PATCH wrote config"))
+    with pytest.raises(ValueError, match="maxInputTokens must not exceed contextWindow"):
+        model_metadata.patch_override_fields(
+            "demo", scope_key=scope, outbound_model="real-demo" if scope else None,
+            set_fields={"maxInputTokens": 1500}, unset_fields=("contextWindow",),
+        )
+    assert config.get() == before
+    assert Path(config.path()).read_bytes() == disk
+
+
 def test_invalid_cross_field_and_native_hard_overrides_are_zero_write():
     native = {
         "id": "native-model", "contextWindow": 300_000,

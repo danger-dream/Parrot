@@ -27,7 +27,7 @@ from typing import Any, Iterator, Optional
 
 import httpx
 
-from .. import cache_display, network
+from .. import cache_display, model_reroute, network
 
 
 # ─── 全局配置 ─────────────────────────────────────────────────────
@@ -1410,6 +1410,9 @@ def fmt_log_entry_body(r: dict, *, separate_billing: bool = False) -> str:
     if search_count:
         lines.append(f"  搜索: {search_count} 次")
 
+    # 上游模型降级 / 安全审查：与请求状态无关的身份事实，放在耗时之后。
+    lines.extend(log_upstream_observation_lines(r))
+
     # 错误 / 客户端取消
     if r.get("status") in ("error", "cancelled") and r.get("error_message"):
         err_short = escape_html(str(r["error_message"])[:120])
@@ -1417,6 +1420,35 @@ def fmt_log_entry_body(r: dict, *, separate_billing: bool = False) -> str:
         lines.append(f"  {marker} <i>{err_short}</i>")
 
     return "\n".join(lines)
+
+
+def log_upstream_observation_lines(r: dict, *, with_reason: bool = False) -> list[str]:
+    """Render the upstream reroute / safety-review marks for one log row.
+
+    Both facts are independent and may appear together, so the caller appends
+    whatever is present. The reroute mark names only the effective model: the
+    requested model is already on the model line above it.
+    """
+    out: list[str] = []
+    actual_model = str(r.get("upstream_actual_model") or "").strip()
+    conflict = model_reroute.decode_model_conflict(r.get("model_signal_conflict"))
+    if conflict:
+        out.append("  ⚠️ 模型信息不一致（上游信号冲突）")
+        if with_reason:
+            out.extend(f"      {escape_html(line)}" for line in model_reroute.model_conflict_lines(conflict))
+    elif actual_model:
+        label = model_reroute.reroute_label(r.get("final_channel_type"))
+        arrow = "→" if r.get("final_channel_type") == "oauth" else "↓"
+        out.append(f"  ⚠️ {label}：{arrow} <code>{escape_html(actual_model)}</code>")
+    review = model_reroute.decode_safety_review(r.get("safety_review"))
+    if review is not None:
+        line = f"  🛡️ {model_reroute.SAFETY_REVIEW_TEXT}"
+        if with_reason:
+            reason = model_reroute.safety_review_reason_text(review)
+            if reason:
+                line += f"\n      {escape_html(reason)}"
+        out.append(line)
+    return out
 
 
 def fmt_log_entry_headline(r: dict, *, prefix: str = "") -> str:

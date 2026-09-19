@@ -108,9 +108,10 @@ def current_openai_account(source: ImageSource) -> tuple[str, dict]:
         return account_id, copy.deepcopy(account)
 
 
-def models(cfg: dict | None = None) -> set[str]:
+def models(cfg: dict | None = None, *, kind: str = 'image') -> set[str]:
+    """Configured names, including API mappings and account overrides, not just seeds."""
     cfg = config.get() if cfg is None else cfg
-    return {row.model for row in sources(cfg)} | {model for values in media_config.model_map('image', cfg).values() for model in values}
+    return {row.model for row in sources(cfg, kind=kind)} | {model for values in media_config.model_map(kind, cfg).values() for model in values}
 
 
 def available_models() -> list[str]:

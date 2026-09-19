@@ -182,6 +182,7 @@ class NotificationEventsData(StrictSchema):
     oauthRefreshFailed: bool
     noChannels: bool
     openaiStoreSaveFailed: bool
+    modelDegraded: bool
     statusAlert: bool
     appUpdate: bool
     networkMonitor: bool
@@ -197,6 +198,7 @@ class NotificationEventsPatch(StrictRequestSchema):
     oauthRefreshFailed: bool | None = None
     noChannels: bool | None = None
     openaiStoreSaveFailed: bool | None = None
+    modelDegraded: bool | None = None
     statusAlert: bool | None = None
     appUpdate: bool | None = None
     networkMonitor: bool | None = None

@@ -192,25 +192,27 @@ def set_handler(fn: Optional[Callable[[str], None]]) -> None:
 
 
 def notify(text: str, auto_delete_seconds: Optional[int] = None,
-           reply_markup: Optional[dict] = None, meta: Optional[dict] = None) -> None:
+           reply_markup: Optional[dict] = None, meta: Optional[dict] = None) -> bool:
     """发送一条通知消息。**不阻塞**：把 text 推入队列，由 worker 线程异步发出。
 
     auto_delete_seconds: 若设置，handler 会在发送后 N 秒删除该消息（仅 TG handler 支持）。
     reply_markup: 可选 inline 键盘（仅 TG handler 支持），用于带按钮的交互通知。
     meta: 可选元信息，handler 可据此回填 message_id（如自更新流程需记住通知消息）。
-    队列满（极端情况）→ 丢弃并打印警告，避免 notify 反过来阻塞调用方。
+    返回是否成功入队，不代表 Telegram 已送达。队列满时返回 False，不阻塞调用方。
     """
     _ensure_worker()
     try:
         _queue.put_nowait((text, auto_delete_seconds, reply_markup, meta))
+        return True
     except queue.Full:
         print(f"[notify] queue full, dropping message: {text[:80]}")
+        return False
 
 
 def notify_event(event_key: str, text: str,
                  auto_delete_seconds: Optional[int] = None,
                  reply_markup: Optional[dict] = None,
-                 meta: Optional[dict] = None) -> None:
+                 meta: Optional[dict] = None) -> bool:
     """事件级通知：受 config.notifications.enabled 总开关 + events[event_key] 单独开关控制。
 
     任一关闭则跳过（仍打印到 stdout，便于排查）。配置不存在时按"开"处理（向前兼容）。
@@ -221,21 +223,21 @@ def notify_event(event_key: str, text: str,
         notif = cfg.get("notifications") or {}
         if not notif.get("enabled", True):
             print(f"[notify:{event_key}:disabled] {text}")
-            return
+            return False
         events = notif.get("events") or {}
         if event_key in events and not events[event_key]:
             print(f"[notify:{event_key}:off] {text}")
-            return
+            return False
     except Exception as exc:
         print(f"[notify_event] config check failed ({exc}), sending anyway")
-    notify(text, auto_delete_seconds=auto_delete_seconds,
-           reply_markup=reply_markup, meta=meta)
+    return notify(text, auto_delete_seconds=auto_delete_seconds,
+                  reply_markup=reply_markup, meta=meta)
 
 
 # ─── 异步节流通知（同 event_key N 秒内仅触发一次） ─────────────────
 #
 # 用于像 "no_channels:<model>" 这种"频繁重复但不需要每次都通知"的场景。
-# 与 notify_event 正交：先节流判断，再走 notify_event。
+# 先检查剩余窗口，notify_event 通过开关且成功入队后才占用新窗口。
 
 import asyncio as _asyncio
 import time as _t
@@ -247,17 +249,6 @@ _throttle_lock = _asyncio.Lock()   # 兼容旧调用（async）
 _THROTTLE_DEFAULT_SEC = 300
 
 
-def _throttle_should_emit(alert_key: str, cooldown_seconds: int) -> bool:
-    """线程安全：判断是否已过冷却；若是则更新时间戳并返回 True。"""
-    with _throttle_lock_sync:
-        now = _t.time()
-        last = _throttle_last_sent.get(alert_key, 0)
-        if now - last < cooldown_seconds:
-            return False
-        _throttle_last_sent[alert_key] = now
-        return True
-
-
 async def throttled_notify_event(event_key: str, alert_key: str, text: str,
                                  *, cooldown_seconds: int = _THROTTLE_DEFAULT_SEC,
                                  reply_markup: Optional[dict] = None) -> None:
@@ -266,9 +257,10 @@ async def throttled_notify_event(event_key: str, alert_key: str, text: str,
     `event_key` 决定 notify_event 的开关；`alert_key` 决定节流桶
     （同 alert_key 在 cooldown_seconds 内只发一次，哪怕 text 不同）。
     """
-    if not _throttle_should_emit(alert_key, cooldown_seconds):
-        return
-    notify_event(event_key, text, reply_markup=reply_markup)
+    throttled_notify_event_sync(
+        event_key, alert_key, text,
+        cooldown_seconds=cooldown_seconds, reply_markup=reply_markup,
+    )
 
 
 def throttled_notify_event_sync(event_key: str, alert_key: str, text: str,
@@ -279,10 +271,18 @@ def throttled_notify_event_sync(event_key: str, alert_key: str, text: str,
     用在那些没法 await 的场景（如 sync 翻译器收尾、sync 的 Store save 回调）。
     返回是否实际进入发送队列，供同步调用方避免重复日志。
     """
-    if not _throttle_should_emit(alert_key, cooldown_seconds):
-        return False
-    notify_event(event_key, text, reply_markup=reply_markup)
-    return True
+    # Keep the check/enqueue/commit atomic across synchronous and asynchronous
+    # callers. notify_event only checks configuration and enqueues; Telegram I/O
+    # stays on the notifier worker and never runs while this lock is held.
+    with _throttle_lock_sync:
+        now = _t.time()
+        last = _throttle_last_sent.get(alert_key)
+        if last is not None and now - last < cooldown_seconds:
+            return False
+        if not notify_event(event_key, text, reply_markup=reply_markup):
+            return False
+        _throttle_last_sent[alert_key] = _t.time()
+        return True
 
 
 def wait_drain(timeout: float = 5.0) -> bool:

@@ -35,7 +35,7 @@ from websockets.exceptions import InvalidStatus, InvalidHandshake
 
 from .. import (
     affinity, apikey_limiter, auth, blacklist, channel_state, concurrency, config, cooldown, fingerprint, local_web_tools,
-    log_db, model_mapping, model_pricing, model_validation, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
+    log_db, model_mapping, model_pricing, model_reroute, model_state, model_validation, network, notifier, oauth_manager, scheduler, scorer, translation, upstream,
 )
 from ..channel.base import Channel, UpstreamRequest, build_dispatch_metadata
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
@@ -175,6 +175,8 @@ class _WsAttemptResult:
     })
     usage_observed: Optional[bool] = None
     response_text: str = ""
+    response_signals: model_reroute.ResponseModelSignals | None = None
+    http_header_model: str | None = None
     response_id: Optional[str] = None
     output_items: list[dict] = field(default_factory=list)
     proxy_name: Optional[str] = None
@@ -372,6 +374,7 @@ class _WsTracker:
         self.response_failed = False
         self.request_failed = False
         self.last_event: dict[str, Any] | None = None
+        self.response_signals = model_reroute.ResponseModelSignals()
         self.stream_error_message: Optional[str] = None
         self.stream_error_code: Optional[str] = None
         self.response_text_parts: list[str] = []
@@ -391,6 +394,9 @@ class _WsTracker:
         if not isinstance(evt, dict):
             return
         self.last_event = evt
+        self.response_signals = model_reroute.merge_response_signals(
+            self.response_signals, model_reroute.extract_response_signals(evt),
+        )
         typ = str(evt.get("type") or "")
         response_obj = evt.get("response") if isinstance(evt.get("response"), dict) else None
         usage_present = "usage" in evt or (
@@ -597,6 +603,11 @@ async def handle_responses_ws(websocket: WebSocket) -> None:
         )
         return
 
+    from .. import search_tool_policy
+    # A reconnect must recover managed history/tools before guard and scheduling,
+    # just like HTTP ingress and subsequent search turns.
+    body = search_tool_policy.restore_replay(body, "responses", key_name)
+
     try:
         # previous_response_id is native upstream-WS state, independent of
         # Parrot's optional local HTTP response store.
@@ -762,6 +773,8 @@ async def _finish_cancelled_before_ws_candidate_transition(
         final_round_id=result.round_id,
         request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         http_status=499,
+        response_signals=getattr(result, "response_signals", None),
+        http_header_model=getattr(result, "http_header_model", None),
         response_body=result.response_text or None,
         affinity_hit=affinity_hit,
         upstream_protocol=getattr(ch, "protocol", "openai-responses"),
@@ -1322,6 +1335,8 @@ async def _run_ws_failover(
         request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         http_status=http_status,
         affinity_hit=affinity_hit,
+        response_signals=getattr(last_result, "response_signals", None),
+        http_header_model=getattr(last_result, "http_header_model", None),
         response_body=(last_result.response_text or None) if last_result else None,
         usage=(last_result.usage if last_result else None),
         usage_observed=(last_result.usage_observed if last_result else None),
@@ -1655,6 +1670,8 @@ async def _try_ws_channel(
                     if (
                         next_resolved_model is not None
                         and bool(getattr(ch, "enabled", True))
+                        and model_state.is_global_enabled(requested_model)
+                        and model_state.is_source_enabled(ch.key, requested_model)
                         and route_name in route_names
                     ):
                         resolved_model = next_resolved_model
@@ -1873,6 +1890,8 @@ async def _try_ws_channel(
                         request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
                         http_status=499,
                         affinity_hit=affinity_hit,
+                        response_signals=getattr(captured, "response_signals", None),
+                        http_header_model=getattr(captured, "http_header_model", None),
                         response_body=response_body,
                         usage=usage,
                         usage_observed=usage_observed,
@@ -2239,6 +2258,7 @@ async def _try_sse_channel(
                     ),
                     http_status=499,
                     affinity_hit=affinity_hit,
+                    http_header_model=model_reroute.header_model(getattr(response, "headers", None)),
                     response_body=response_text or None,
                     usage=usage,
                     usage_observed=normalized.usage_observed,
@@ -2278,6 +2298,7 @@ async def _try_sse_channel(
             upstream_protocol=ch_proto,
             upstream_transport="sse",
             retry_after_seconds=_retry_after_from_headers(response.headers),
+            http_header_model=model_reroute.header_model(getattr(response, "headers", None)),
         )
         _sync_http_proxy_bytes(proxy_bytes, opened)
         await finalize_opened_http_response(
@@ -2301,6 +2322,7 @@ async def _try_sse_channel(
         upstream_transport="sse",
         translator_ctx=upstream_req.translator_ctx,
         retry_after_seconds=_retry_after_from_headers(response.headers),
+        http_header_model=model_reroute.header_model(getattr(response, "headers", None)),
     )
     tracker = _WsTracker()
     pending: list[str] = []
@@ -2324,6 +2346,7 @@ async def _try_sse_channel(
         result.response_completed = tracker.response_completed
         result.usage = dict(tracker.usage)
         result.usage_observed = tracker.usage_observed
+        result.response_signals = tracker.response_signals
         result.response_text = tracker.get_full_response()
         result.response_id = tracker.response_id
         result.output_items = tracker.get_output_items()
@@ -2397,6 +2420,8 @@ async def _try_sse_channel(
                 request_elapsed_ms=request_elapsed_ms,
                 retry_count=retry_count_so_far,
                 affinity_hit=affinity_hit,
+                response_signals=getattr(result, "response_signals", None),
+                http_header_model=getattr(result, "http_header_model", None),
                 response_body=result.response_text,
                 http_status=status,
                 usage_observed=result.usage_observed,
@@ -2437,6 +2462,8 @@ async def _try_sse_channel(
                 request_elapsed_ms=request_elapsed_ms,
                 http_status=result.http_status or _http_status_from_ws_outcome(result),
                 affinity_hit=affinity_hit,
+                response_signals=getattr(result, "response_signals", None),
+                http_header_model=getattr(result, "http_header_model", None),
                 response_body=result.response_text or None,
                 usage=result.usage,
                 usage_observed=result.usage_observed,
@@ -2662,6 +2689,8 @@ async def _try_sse_channel(
                     request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
                     http_status=499,
                     affinity_hit=affinity_hit,
+                    response_signals=getattr(result, "response_signals", None),
+                    http_header_model=getattr(result, "http_header_model", None),
                     response_body=result.response_text or None,
                     usage=result.usage,
                     usage_observed=result.usage_observed,
@@ -2894,6 +2923,7 @@ async def _relay_ws_session(
         result.response_completed = tracker.response_completed
         result.usage = dict(tracker.usage)
         result.usage_observed = tracker.usage_observed
+        result.response_signals = tracker.response_signals
         result.response_text = _identity_log_text(
             tracker.get_full_response(), _identity_map,
         )
@@ -2987,6 +3017,8 @@ async def _relay_ws_session(
                 request_elapsed_ms=request_elapsed_ms,
                 retry_count=retry_count_so_far,
                 affinity_hit=affinity_hit,
+                response_signals=getattr(result, "response_signals", None),
+                http_header_model=getattr(result, "http_header_model", None),
                 response_body=result.response_text,
                 http_status=101,
                 usage_observed=result.usage_observed,
@@ -3027,6 +3059,8 @@ async def _relay_ws_session(
                 request_elapsed_ms=request_elapsed_ms,
                 http_status=_http_status_from_ws_outcome(result),
                 affinity_hit=affinity_hit,
+                response_signals=getattr(result, "response_signals", None),
+                http_header_model=getattr(result, "http_header_model", None),
                 response_body=result.response_text or None,
                 usage=result.usage,
                 usage_observed=result.usage_observed,
@@ -3442,47 +3476,97 @@ async def _run_search_ws_session(
             schedule_result = search_tool_policy.advance_route(schedule_result, response)
             return response
         managed = search_tool_policy.needs_loop(body)
-        task = None
-        response = None
-        buf = b""
+
+        async def relay_response():
+            response = None
+            buf = b""
+            try:
+                if managed:
+                    response = search_tool_policy.stream(
+                        body, "responses", invoke, request_id=request_id, api_key_name=api_key_name,
+                    )
+                else:
+                    # No private round to hide: forward actual SSE immediately.
+                    response = await invoke({**body, "stream": True})
+                if not hasattr(response, "body_iterator"):
+                    obj = json.loads(response.body)
+                    if response.status_code >= 400:
+                        controls_task.cancel()
+                        await asyncio.gather(controls_task, return_exceptions=True)
+                        await _send_downstream(websocket, _dump_frame({"type": "error", **obj}))
+                        return False
+                    iterator = local_web_tools._iter_openai_response_sse(obj)
+                else:
+                    iterator = response.body_iterator
+                async for chunk in iterator:
+                    buf += chunk if isinstance(chunk, bytes) else chunk.encode()
+                    buf, blocks = upstream.split_sse_events(buf.replace(b"\r\n", b"\n"))
+                    for block in blocks:
+                        _event, data = upstream.parse_sse_event_bytes(block)
+                        if data is not None:
+                            if data.get("type") in {"response.completed", "response.failed", "response.incomplete", "error"}:
+                                # Stop the active-turn reader before publishing
+                                # terminal output; the client may immediately
+                                # start the next sequential response.
+                                controls_task.cancel()
+                                await asyncio.gather(controls_task, return_exceptions=True)
+                            await _send_downstream(websocket, _dump_frame(data))
+                            if not managed and data.get("type") == "response.completed":
+                                saved = dict(body)
+                                search_tool_policy._append(saved, data.get("response") or {}, [], "responses")
+                                reference = str((data.get("response") or {}).get("id") or "")
+                                search_tool_policy._remember(saved, "responses", api_key_name, [reference])
+                return True
+            finally:
+                if hasattr(response, "body_iterator") and hasattr(response.body_iterator, "aclose"):
+                    await response.body_iterator.aclose()
+
+        async def receive_controls():
+            # Keep reading even while a private search/model round produces no
+            # visible bytes. Otherwise disconnects retain the work and leases.
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    return "disconnect"
+                raw = msg.get("text") if msg.get("text") is not None else msg.get("bytes")
+                try:
+                    obj = _loads_frame(raw) if raw is not None else None
+                except Exception:
+                    obj = None
+                typ = obj.get("type") if isinstance(obj, dict) else None
+                if typ == "response.cancel":
+                    return "cancel"
+                if typ == "response.processed":
+                    continue
+                await _send_request_invalid_error_frame(
+                    websocket,
+                    "a response is already in progress on this websocket"
+                    if typ == "response.create" else "unsupported websocket control frame",
+                    param="type",
+                )
+
+        relay_task = asyncio.create_task(relay_response())
+        controls_task = asyncio.create_task(receive_controls())
+        tasks = {relay_task, controls_task}
         try:
-            if managed:
-                task = asyncio.create_task(search_tool_policy.run(
-                    body, "responses", invoke, request_id=request_id, api_key_name=api_key_name,
-                ))
-                response = search_tool_policy.stream(task, "responses")
-            else:
-                # No private round to hide: forward actual SSE immediately.
-                response = await invoke({**body, "stream": True})
-            if not hasattr(response, "body_iterator"):
-                obj = json.loads(response.body)
-                if response.status_code >= 400:
-                    await _send_downstream(websocket, _dump_frame({"type": "error", **obj}))
-                    return True
-                iterator = local_web_tools._iter_openai_response_sse(obj)
-            else:
-                iterator = response.body_iterator
-            async for chunk in iterator:
-                buf += chunk if isinstance(chunk, bytes) else chunk.encode()
-                buf, blocks = upstream.split_sse_events(buf.replace(b"\r\n", b"\n"))
-                for block in blocks:
-                    _event, data = upstream.parse_sse_event_bytes(block)
-                    if data is not None:
-                        await _send_downstream(websocket, _dump_frame(data))
-                        if not managed and data.get("type") == "response.completed":
-                            saved = dict(body)
-                            search_tool_policy._append(saved, data.get("response") or {}, [], "responses")
-                            reference = str((data.get("response") or {}).get("id") or "")
-                            search_tool_policy._remember(saved, "responses", api_key_name, [reference])
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if controls_task in done and not controls_task.cancelled():
+                control = controls_task.result()
+                relay_task.cancel()
+                await asyncio.gather(relay_task, return_exceptions=True)
+                if control == "cancel":
+                    await _close_downstream(websocket, 1000, "response cancelled")
+                return True
+            if not await relay_task:
+                return True
         except WebSocketDisconnect:
             return True
         finally:
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            for pending in tasks:
+                if not pending.done():
+                    pending.cancel()
             try:
-                if hasattr(response, "body_iterator") and hasattr(response.body_iterator, "aclose"):
-                    await response.body_iterator.aclose()
+                await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 await lease.release()
                 lease = None
@@ -3717,6 +3801,8 @@ async def _finalize_ws_attempt_after_accept(
         request_elapsed_ms=int((time.monotonic() - start_monotonic) * 1000),
         http_status=_http_status_from_ws_outcome(result),
         affinity_hit=affinity_hit,
+        response_signals=getattr(result, "response_signals", None),
+        http_header_model=getattr(result, "http_header_model", None),
         response_body=result.response_text or None,
         usage=result.usage,
         usage_observed=result.usage_observed,

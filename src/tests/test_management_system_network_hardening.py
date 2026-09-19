@@ -238,7 +238,7 @@ def test_all_p6_request_scalar_shapes_are_strict_and_side_effect_free(
         assert fixture.gateway.events == before_events
 
 
-def test_notifications_expose_and_patch_all_twelve_authoritative_events(tmp_path):
+def test_notifications_expose_and_patch_all_thirteen_authoritative_events(tmp_path):
     app, _runtime, fixture = build_p6_app(tmp_path)
     with TestClient(app) as client:
         headers = bearer(create_session(client))
@@ -246,7 +246,8 @@ def test_notifications_expose_and_patch_all_twelve_authoritative_events(tmp_path
         assert list(before["events"]) == [
             "channelPermanent", "channelRecovered", "quotaDisabled", "quotaResumed",
             "quotaCooldown", "oauthRefreshed", "oauthRefreshFailed", "noChannels",
-            "openaiStoreSaveFailed", "statusAlert", "appUpdate", "networkMonitor",
+            "openaiStoreSaveFailed", "modelDegraded", "statusAlert", "appUpdate",
+            "networkMonitor",
         ]
         changed = client.patch(
             PREFIX + "/settings/notifications",

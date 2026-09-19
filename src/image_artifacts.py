@@ -11,6 +11,7 @@ import re
 import secrets
 import time
 from pathlib import Path
+from typing import NamedTuple
 from PIL import Image, ImageOps
 from fastapi import Request
 from fastapi.responses import FileResponse, Response
@@ -19,9 +20,18 @@ from .providers.remote_image import download_https_image
 
 URL_TTL_SECONDS = 3600
 MAX_PIXELS = 16_777_216
-# token -> (path, mime, expiry, media_type)。media_type 决定下载时的路径归属校验
-# （图片与视频分属缓存下不同子树），也决定对外 URL 前缀语义。
-_ASSETS: dict[str, tuple[str, str, float, str]] = {}
+class _Asset(NamedTuple):
+    path: str
+    mime: str
+    expiry: float
+    media_type: str
+    temporary: bool
+    url: str
+
+
+# Tokens expire independently of retained history. Store the exact issued URL so
+# local reference resolution never treats an arbitrary HTTP host/path as ours.
+_ASSETS: dict[str, _Asset] = {}
 _IMAGE_URL_PREFIX = '/v1/images/assets'
 _MCP_URL_PREFIX = '/v1/mcp/media'
 
@@ -36,9 +46,37 @@ def dimensions(size: str | None) -> tuple[int, int] | None:
     return w, h
 
 
+def _local_image_reference(url: str) -> tuple[bytes, str] | None:
+    entry = _ASSETS.get(media_token(url))
+    if entry is None or entry.url != url:
+        return None
+    from . import media_config
+    if entry.expiry <= time.time() or entry.media_type != 'image':
+        raise ValueError('local image resource is expired or is not an image')
+    if not media_cache.artifact_path_is_safe(entry.path, media_config.settings('image')):
+        raise ValueError('local image resource is unavailable')
+    with open(entry.path, 'rb') as handle:
+        raw = handle.read(media_cache.HARD_FILE_LIMIT + 1)
+    if not raw or len(raw) > media_cache.HARD_FILE_LIMIT:
+        raise ValueError('local image resource is empty or oversized')
+    return raw, entry.mime
+
+
+async def inline_local_reference(url: str) -> str:
+    """Only our live, exact capability URLs become inline upstream references."""
+    local = await asyncio.to_thread(_local_image_reference, url)
+    if local is None:
+        return url
+    raw, mime = local
+    return f'data:{mime};base64,' + base64.b64encode(raw).decode('ascii')
+
+
 async def reference_bytes(url: str) -> bytes:
     if url.startswith('data:'):
         return media_cache.decode_data_url(url, max_bytes=media_cache.HARD_FILE_LIMIT)[0]
+    local = await asyncio.to_thread(_local_image_reference, url)
+    if local is not None:
+        return local[0]
     return (await download_https_image(url, max_bytes=media_cache.HARD_FILE_LIMIT))[0]
 
 
@@ -128,11 +166,11 @@ def normalize(raw: bytes, *, size: str | None, options: dict, mask=None) -> tupl
 def _prune() -> None:
     now = time.time()
     for token, entry in list(_ASSETS.items()):
-        path, _mime, expiry = entry[0], entry[1], entry[2]
-        if expiry <= now:
+        if entry.expiry <= now:
             _ASSETS.pop(token, None)
-            try: Path(path).unlink(missing_ok=True)
-            except OSError: pass
+            if entry.temporary:
+                try: Path(entry.path).unlink(missing_ok=True)
+                except OSError: pass
 
 
 # 临时 URL 文件的命名前缀 -> 扩展名。图片与视频共用同一临时回收策略，
@@ -141,15 +179,22 @@ _TEMPORARY_SUFFIXES = ('png', 'jpg', 'webp', 'mp4', 'webm', 'mov', 'm4v')
 
 
 def _reap_stale_temporary(root, cutoff: float) -> None:
-    for suffix in _TEMPORARY_SUFFIXES:
-        for stale in root.rglob(f'url-image-temporary-*.{suffix}'):
-            if not stale.is_symlink() and stale.stat().st_mtime < cutoff:
-                stale.unlink(missing_ok=True)
+    # A live MCP URL may have a TTL longer than the default orphan grace period.
+    active = {entry.path for entry in list(_ASSETS.values()) if entry.expiry > time.time()}
+    for kind in ('image', 'video'):
+        for suffix in _TEMPORARY_SUFFIXES:
+            for stale in root.rglob(f'url-{kind}-temporary-*.{suffix}'):
+                try:
+                    if str(stale) not in active and not stale.is_symlink() and stale.stat().st_mtime < cutoff:
+                        stale.unlink(missing_ok=True)
+                except OSError:
+                    pass  # Another publisher/cleanup may already have removed it.
 
 
 def publish(raw: bytes, *, mime: str, cfg: dict, request: Request | None = None, provider: str,
             action: str, index: int, media_type: str = 'image', ttl_seconds: int | None = None,
-            url_prefix: str | None = None, base_url: str | None = None) -> tuple[str, int]:
+            url_prefix: str | None = None, base_url: str | None = None,
+            retained_path: str | None = None) -> tuple[str, int]:
     """发布一份短期可访问的媒体资源，返回 (URL, 过期时间戳)。
 
     URL 由请求本身还原（``request.base_url``）：反向代理保留 Host 时天然得到
@@ -165,21 +210,25 @@ def publish(raw: bytes, *, mime: str, cfg: dict, request: Request | None = None,
     cutoff = time.time() - URL_TTL_SECONDS
     _reap_stale_temporary(root, cutoff)
     media_cache.cleanup(root, cfg)
-    path = media_cache.write_bytes(raw, cfg=cfg, provider='url', media_type=kind, action='temporary',
+    # A retained result can back the URL directly: do not write a second copy
+    # whose cleanup could evict the mandatory delivery file.
+    retained = bool(retained_path and media_cache.artifact_path_is_safe(retained_path, {**cfg, '_media_kind': kind}))
+    path = str(retained_path) if retained else media_cache.write_bytes(
+        raw, cfg=cfg, provider='url', media_type=kind, action='temporary',
         extension=media_cache.extension_for(media_type=kind, mime=mime), index=index)
     token = secrets.token_urlsafe(32)
     expiry = int(time.time()) + (URL_TTL_SECONDS if ttl_seconds is None else max(1, int(ttl_seconds)))
-    _ASSETS[token] = (path, mime, expiry, kind)
     media_cache.cleanup(root, cfg)
     if not Path(path).is_file():
-        _ASSETS.pop(token, None)
         raise ValueError('media URL cache capacity exhausted; generated media was not regenerated')
     if base_url is None:
         if request is None:
             raise ValueError('base_url or request is required to publish media')
         base_url = str(request.base_url)
     prefix = url_prefix or (_MCP_URL_PREFIX if kind == 'video' else _IMAGE_URL_PREFIX)
-    return str(base_url).rstrip('/') + prefix + '/' + token, expiry
+    url = str(base_url).rstrip('/') + prefix + '/' + token
+    _ASSETS[token] = _Asset(path, mime, expiry, kind, not retained, url)
+    return url, expiry
 
 
 def media_token(url: str) -> str:
@@ -189,14 +238,14 @@ def media_token(url: str) -> str:
 
 def url_available(url: str) -> bool:
     entry = _ASSETS.get(url.rsplit('/', 1)[-1])
-    return bool(entry and entry[2] > time.time() and Path(entry[0]).is_file())
+    return bool(entry and entry.url == url and entry.expiry > time.time() and Path(entry.path).is_file())
 
 
 async def _serve_asset(token: str, *, kind: str | None = None) -> Response:
     _prune()
     entry = _ASSETS.get(token)
     if not entry: return Response(status_code=404)
-    path, mime, _expiry, media_type = entry
+    path, mime, media_type = entry.path, entry.mime, entry.media_type
     # 两类入口各自只能读取自己的资源类别，避免图片端点被用来取视频。
     if kind is not None and media_type != kind: return Response(status_code=404)
     # 安全校验必须按资源自身的类别选择配置：图片与视频分属缓存下不同子树，

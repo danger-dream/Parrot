@@ -1,4 +1,4 @@
-"""Strict v0.31.13 runtime traces for TG-SYS-08 and SYS coverage gates."""
+"""Strict current SYS traces layered over the frozen v0.31.13 baseline."""
 from __future__ import annotations
 
 import json
@@ -12,10 +12,10 @@ from src.telegram.menus import system_menu as sm
 from src.tests.test_tg_contract_system_helpers import (
     SEGMENT, SYSTEM_IDS, cases_for, run_and_compare,
 )
-from src.tests.tg_contract import assert_capability_coverage, load_jsonl
+from src.tests.tg_contract import assert_capability_coverage
 
 CASES = cases_for("TG-SYS-08")
-ALL_CASES = load_jsonl(SEGMENT)
+ALL_CASES = cases_for(*SYSTEM_IDS)
 
 
 def _concurrency_empty(e):
@@ -82,8 +82,8 @@ def test_system_runtime_trace(case, monkeypatch):
     run_and_compare(case, monkeypatch, RUNNERS[case["entry"]["scenario"]])
 
 
-# Canonical callback/state families accepted or deliberately emitted-but-unrouted
-# by v0.31.13.  Fixture coverage is checked in both directions against these sets.
+# Current callback/state families, including reviewed overlays and retained
+# legacy entries. Coverage is checked in both directions against these sets.
 CALLBACK_FAMILIES = {
     "menu:settings", "sys:show:retention", "sys:retention:days",
     "sys:retention:forever", "sys:retention:toggle_bodies",
@@ -110,6 +110,8 @@ CALLBACK_FAMILIES = {
     "sys:show:aklim", "sys:aklim_toggle", "sys:edit:aklim_max",
     "sys:edit:aklim_queue", "sys:edit:aklim_wait", "sys:show:ws_mode",
     "sys:ws_mode:toggle",
+    # Model-degraded alert mute buttons.
+    "sys:mdg_mute:*", "sys:mdg_unmute:*", "sys:mdg_off",
     # Present UI helpers that v0.31.13's router no longer dispatches.
     "sys:show:cch", "sys:cch_set:*", "sys:show:quota", "sys:quota_toggle",
     "sys:edit:quota_interval", "sys:edit:quota_threshold",

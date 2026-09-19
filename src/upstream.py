@@ -1030,20 +1030,26 @@ class ResponsesSSEAssistantBuilder:
                     part.setdefault("annotations", [])
         item["content"] = content
 
+    def _resolved_output_item(self, output_index: int, source_item: dict) -> dict:
+        item = copy.deepcopy(source_item)
+        item_type = item.get("type")
+        if item_type == "message":
+            self._apply_message_buffers(output_index, item)
+        elif item_type == "function_call":
+            item["arguments"] = self._merge_preferred_text(
+                item.get("arguments"), self._fc_args.get(output_index, ""),
+            )
+        return item
+
+    def get_output_item(self, output_index: int) -> dict | None:
+        """Resolve one item identically to the final snapshot, preserving its index."""
+        source = self._base_items_by_index().get(output_index)
+        return self._resolved_output_item(output_index, source) if source is not None else None
+
     def get_output_items(self) -> list[dict]:
         """Return final output items ordered by Responses ``output_index``."""
-        out: list[dict] = []
-        for output_index, source_item in sorted(self._base_items_by_index().items()):
-            item = copy.deepcopy(source_item)
-            item_type = item.get("type")
-            if item_type == "message":
-                self._apply_message_buffers(output_index, item)
-            elif item_type == "function_call":
-                item["arguments"] = self._merge_preferred_text(
-                    item.get("arguments"), self._fc_args.get(output_index, ""),
-                )
-            out.append(item)
-        return out
+        return [self._resolved_output_item(index, source)
+                for index, source in sorted(self._base_items_by_index().items())]
 
     def get_assistant(self) -> dict:
         return {"role": "assistant", "output": self.get_output_items()}

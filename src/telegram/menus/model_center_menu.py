@@ -145,12 +145,12 @@ _META_FIELDS = (
     _MetaField("reasoningEfforts", "思考档位", "capability", "list"),
     _MetaField("serviceTiers", "服务档位", "capability", "list"),
     _MetaField("knowledgeCutoff", "知识截止", "capability", "date"),
-    _MetaField("inputPricePer1M", "输入价格", "price", "price"),
-    _MetaField("outputPricePer1M", "输出价格", "price", "price"),
-    _MetaField("cacheReadPricePer1M", "缓存读取价格", "price", "price"),
-    _MetaField("cacheWritePricePer1M", "缓存写入价格", "price", "price"),
-    _MetaField("longContextInputPricePer1M", "长上下文输入价格", "price", "price"),
-    _MetaField("longContextOutputPricePer1M", "长上下文输出价格", "price", "price"),
+    _MetaField("cost.input", "输入价格", "price", "price"),
+    _MetaField("cost.output", "输出价格", "price", "price"),
+    _MetaField("cost.cacheRead", "缓存读取价格", "price", "price"),
+    _MetaField("cost.cacheWrite", "缓存写入价格", "price", "price"),
+    _MetaField("cost.longContextInput", "长上下文输入价格", "price", "price"),
+    _MetaField("cost.longContextOutput", "长上下文输出价格", "price", "price"),
 )
 _META_BY_KEY = {item.key: item for item in _META_FIELDS}
 
@@ -513,6 +513,15 @@ def _handle_frozen(chat_id: int, message_id: int, cb_id: str, action: _FrozenAct
         show(chat_id, message_id, cb_id)
         return
 
+
+    if name == "source_page":
+        if data.get("expected_tab") != s.tab:
+            ui.answer_cb(cb_id, "来源选择页已过期，请重新打开", show_alert=True)
+            return
+        _show_rendered(chat_id, message_id, cb_id, lambda: _source_picker_render(
+            chat_id, int(data.get("page") or 1),
+        ))
+        return
 
     if name == "set_source":
         if data.get("expected_tab") != s.tab:

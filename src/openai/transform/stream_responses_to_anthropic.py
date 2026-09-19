@@ -131,7 +131,7 @@ class _State:
     text_stopped: bool = False
     text_index: int = -1
     next_block_index: int = 0
-    text_parts: list[str] = field(default_factory=list)
+    text_blocks: dict[int, list[str]] = field(default_factory=dict)
     tools: dict[str, _ToolState] = field(default_factory=dict)
     reasoning: dict[str, _ReasoningState] = field(default_factory=dict)
     output_index_to_reasoning_key: dict[int, str] = field(default_factory=dict)
@@ -431,7 +431,8 @@ class StreamTranslator:
         yield from self._stop_active_reasoning()
         if self.state.text_started and not self.state.text_stopped:
             return
-        self.state.text_index = self.state.alloc_index() if self.state.text_index < 0 else self.state.text_index
+        self.state.text_index = self.state.alloc_index()
+        self.state.text_blocks[self.state.text_index] = []
         self.state.text_started = True
         self.state.text_stopped = False
         yield _emit("content_block_start", {
@@ -442,7 +443,7 @@ class StreamTranslator:
 
     def _emit_text_delta(self, text: str) -> Iterator[bytes]:
         yield from self._ensure_text_block()
-        self.state.text_parts.append(text)
+        self.state.text_blocks[self.state.text_index].append(text)
         yield _emit("content_block_delta", {
             "type": "content_block_delta",
             "index": self.state.text_index,
@@ -662,8 +663,9 @@ class StreamTranslator:
 
     def get_downstream_anthropic_assistant(self) -> dict:
         indexed: list[tuple[int, dict[str, Any]]] = list(self._hosted_blocks)
-        if self.state.text_parts:
-            indexed.append((self.state.text_index, {"type": "text", "text": "".join(self.state.text_parts)}))
+        for index, parts in self.state.text_blocks.items():
+            if parts:
+                indexed.append((index, {"type": "text", "text": "".join(parts)}))
         for st in self.state.reasoning.values():
             if st.signature and st.thinking:
                 indexed.append((st.block_index, {"type": "thinking", "thinking": st.thinking, "signature": st.signature}))

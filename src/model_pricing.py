@@ -2406,6 +2406,36 @@ def refresh_remote_catalog_sync() -> bool:
     return asyncio.run(_run())
 
 
+async def refresh_metadata_after_model_sync() -> dict[str, Any]:
+    """One batch-tail refresh; failures must not undo successful model discovery."""
+    from . import model_metadata
+
+    pricing_cfg = config.get().get("pricing") or {}
+    if not pricing_cfg.get("enabled", True) or not pricing_cfg.get("autoUpdate", True):
+        return {"status": "skipped", "reason": "auto_update_disabled"}
+    refreshed = False
+    try:
+        # Manual model batches run on worker event loops, so do not borrow the
+        # server's shared HTTP client. This existing helper owns its client.
+        refreshed = await asyncio.to_thread(refresh_remote_catalog_sync)
+    except Exception as exc:
+        print(f"[Metadata] post-model catalog refresh failed ({type(exc).__name__}); keeping local catalog")
+    try:
+        result = await asyncio.to_thread(model_metadata.auto_sync_metadata)
+    except Exception as exc:
+        print(f"[Metadata] post-model reconciliation failed ({type(exc).__name__})")
+        return {"status": "failed", "catalog": "updated" if refreshed else "local"}
+    print(
+        f"[Metadata] post-model sync ({'remote' if refreshed else 'local'}): "
+        f"scanned={int(result.get('scanned') or 0)}"
+    )
+    return {
+        "status": "succeeded" if refreshed else "partial_failed",
+        "catalog": "updated" if refreshed else "local",
+        "scanned": int(result.get("scanned") or 0),
+    }
+
+
 async def _auto_sync_startup_metadata(catalog_source: str) -> dict[str, Any]:
     """Bind visible models from the current catalog without blocking startup."""
 

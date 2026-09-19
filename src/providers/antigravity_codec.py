@@ -11,6 +11,7 @@ text is treated as an incremental delta.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -104,6 +105,7 @@ def _sanitize_thought_signatures(request: dict) -> None:
 
 def _sanitize_request_schemas(request: dict, *, model: str) -> None:
     require_placeholder = antigravity_schema.uses_antigravity_schema(model)
+    preserve_json_schema = antigravity_schema.uses_json_schema(model)
     tools = request.get("tools")
     if isinstance(tools, list):
         for tool in tools:
@@ -116,6 +118,8 @@ def _sanitize_request_schemas(request: dict, *, model: str) -> None:
                 if not isinstance(decl, dict):
                     continue
                 for key in ("parameters", "parametersJsonSchema", "parameters_json_schema"):
+                    if preserve_json_schema and key != "parameters":
+                        continue  # do not flatten unions or discard JSON Schema constraints
                     schema = decl.get(key)
                     if isinstance(schema, dict):
                         decl[key] = antigravity_schema.clean_tool_schema(
@@ -124,6 +128,8 @@ def _sanitize_request_schemas(request: dict, *, model: str) -> None:
     gen = request.get("generationConfig") or request.get("generation_config")
     if isinstance(gen, dict):
         for key in ("responseSchema", "responseJsonSchema", "response_schema", "response_json_schema"):
+            if preserve_json_schema and key in ("responseJsonSchema", "response_json_schema"):
+                continue
             schema = gen.get(key)
             if isinstance(schema, dict):
                 gen[key] = antigravity_schema.clean_response_schema(schema)
@@ -334,6 +340,8 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
     contents: list[dict[str, Any]] = []
     system_parts: list[dict[str, str]] = []
     call_names: dict[str, str] = {}
+    model = str(payload.get("model") or "")
+    json_schema_fields = antigravity_schema.uses_json_schema(model)
 
     instructions = payload.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -443,12 +451,16 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
             decl["description"] = str(fn.get("description") or tool.get("description") or "")
         params = fn.get("parameters") or tool.get("parameters")
         if isinstance(params, dict):
-            decl["parameters"] = antigravity_schema.clean_tool_schema(
-                params,
-                require_placeholder=antigravity_schema.uses_antigravity_schema(
-                    str(payload.get("model") or "")
-                ),
-            )
+            if json_schema_fields:
+                # parameters is protobuf Schema (one type enum); JSON Schema
+                # unions, refs and branch-local constraints belong in this
+                # mutually exclusive field instead. Keep caller data intact.
+                decl["parametersJsonSchema"] = copy.deepcopy(params)
+            else:
+                decl["parameters"] = antigravity_schema.clean_tool_schema(
+                    params,
+                    require_placeholder=antigravity_schema.uses_antigravity_schema(model),
+                )
         declarations.append(decl)
     if declarations:
         tools_out.append({"functionDeclarations": declarations})
@@ -467,7 +479,10 @@ def responses_to_gemini(payload: dict) -> dict[str, Any]:
     if mime:
         generation["responseMimeType"] = mime
     if schema:
-        generation["responseSchema"] = antigravity_schema.clean_response_schema(schema)
+        if json_schema_fields:
+            generation["responseJsonSchema"] = copy.deepcopy(schema)
+        else:
+            generation["responseSchema"] = antigravity_schema.clean_response_schema(schema)
 
     out: dict[str, Any] = {"contents": contents}
     if system_parts:

@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from ...management_control import ManagementError
 from ...management_control.models import ModelSourceRef, ModelSourceType, ModelView
+from ...management_control.oauth import PageSpec
 from .. import ui
 from . import model_center_menu as menu
 from .model_center_icons import inline_kb
@@ -77,6 +78,44 @@ def _metadata_targets_render(
     return menu._paged(chat_id, text, inline_kb(rows))
 
 
+def _max_context_lines(
+    chat_id: int, source_view, effective: Mapping[str, Any],
+    constrained_by: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Explain Cursor's two context tiers next to the editable normal window.
+
+    ``contextWindow`` is the native normal-mode value and can only be tightened;
+    the Max Context tier is what a request is budgeted against when the account
+    default is on. Without this line an operator raising ``contextWindow`` to the
+    Max Context size sees it "clamped back" and reads the tiering as a bug.
+    """
+    if source_view is None or str(getattr(source_view, "provider", "")).lower() != "cursor":
+        return []
+    try:
+        normal = int(effective.get("contextWindow") or 0)
+        maximum = int(effective.get("contextWindowMaxMode") or 0)
+    except (TypeError, ValueError):
+        return []
+    if maximum <= normal or normal <= 0:
+        return []
+    state = ""
+    try:
+        page = menu._CONTROL.oauth.list_models(
+            menu._ctx(chat_id), source_view.id, page=PageSpec(page=1, page_size=200),
+        )
+        model = next((item for item in page.items if item.model_id == source_view.outbound_model), None)
+        if model is not None and model.max_context_default is not None:
+            state = f"；账户默认：{'开' if model.max_context_default else '关'}"
+    except (ManagementError, TypeError):
+        state = ""
+    origin = "已按上下文设置收紧" if (constrained_by or {}).get("contextWindowMaxMode") else "Cursor 原生"
+    return [
+        f"Max Context 上下文：<code>{maximum:,} tokens</code>（{origin}{ui.escape_html(state)}）",
+        "上下文是普通模式的原生值，只能调低；Max Context 开启时请求按 Max Context 上下文预算，"
+        "压缩阈值可设到该值以内，普通模式请求会自动截到普通上下文。",
+    ]
+
+
 def _metadata_editor_render(
     chat_id: int, resource_key: str, source: ModelSourceRef | None,
     group: str, detail_back: str = "mc:list",
@@ -100,6 +139,10 @@ def _metadata_editor_render(
         if constrained:
             suffix += "；已收紧"
         lines.append(f"{item.label}：<code>{ui.escape_html(menu._fmt_meta(menu._display_value(effective, item.key), item))}</code>（{marker}{ui.escape_html(suffix)}）")
+    if group == "capacity" and source is not None and source.type is ModelSourceType.OAUTH:
+        lines.extend(_max_context_lines(
+            chat_id, menu._source_for_view(view, source), effective, constrained_by,
+        ))
     if group == "price":
         lines.append("\n单位：美元 / 百万 Token。0 是明确的免费值。")
     lines.append("\n这里只保存被编辑的字段；0、false 和空数组都不会被当作继承。")

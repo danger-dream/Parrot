@@ -62,6 +62,10 @@ def validate(body: dict) -> None:
         category = kind(tool)
         if category and settings.get(category + "Mode", "managed") == "managed":
             source = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            try:
+                _validate_domain_options(source)
+            except ValueError as exc:
+                raise GuardError(400, "invalid_request_error", str(exc), param="tools") from None
             for key in ("max_uses", "max_content_tokens"):
                 if key in source and (isinstance(source[key], bool) or not isinstance(source[key], int) or source[key] < (1 if key == "max_content_tokens" else 0)):
                     raise GuardError(400, "invalid_request_error", f"{key} must be a valid non-negative integer budget", param="tools")
@@ -165,8 +169,22 @@ def compile_request(body: dict, protocol: str) -> tuple[dict, dict[tuple[str, st
     return out, plan
 
 
+def _validate_domain_options(options: dict) -> None:
+    filters = options.get("filters")
+    if filters is not None and not isinstance(filters, dict):
+        raise ValueError("filters must be an object")
+    for values in (options, filters or {}):
+        for field in ("allowed_domains", "blocked_domains", "excluded_domains"):
+            domains = values.get(field)
+            if domains is not None and (not isinstance(domains, list) or
+                                        any(not isinstance(domain, str) for domain in domains)):
+                raise ValueError(f"{field} must be an array of strings")
+
+
 def constraints(tool: ManagedTool, args: dict) -> dict:
     source = tool.source.get("function") if isinstance(tool.source.get("function"), dict) else tool.source
+    _validate_domain_options(source)
+    _validate_domain_options(args)
     options = dict(source.get("filters") or {})
     for key in ("allowed_domains", "blocked_domains", "excluded_domains", "external_web_access", "freshness", "language", "country", "max_results", "search_context_size", "user_location", "max_uses", "max_content_tokens"):
         if key in source:
@@ -443,6 +461,38 @@ def _sum_usage(total: dict, usage: dict) -> None:
             total[key] = copy.deepcopy(value)
 
 
+def _restore_hosted_metadata(obj: dict, plan: dict) -> None:
+    """Project only compiled tool declarations/references back to public names.
+
+    Do not rewrite arbitrary output text, user functions or provider metadata.
+    Compiled hosted aliases are unique across namespaces by construction.
+    """
+    hosted = {tool.name: tool.source for tool in plan.values() if tool.category == "hosted"}
+    if not hosted:
+        return
+
+    def restore(value, *, choice=False):
+        if isinstance(value, list):
+            return [restore(item, choice=choice) for item in value]
+        if not isinstance(value, dict):
+            return value
+        if value.get("type") == "function" and value.get("name") in hosted:
+            source = hosted[value["name"]]
+            if not choice:
+                return copy.deepcopy(source)
+            return {**{k: copy.deepcopy(v) for k, v in value.items() if k not in ("type", "name")},
+                    "type": source["type"]}
+        out = dict(value)
+        for key in ("tools", "allowed_tools"):
+            if key in out:
+                out[key] = restore(out[key], choice=choice)
+        return out
+
+    for field in ("tools", "tool_choice"):
+        if field in obj:
+            obj[field] = restore(obj[field], choice=field == "tool_choice")
+
+
 def _json_response(obj, response):
     return JSONResponse(obj, status_code=response.status_code, headers={
         k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-type")})
@@ -491,16 +541,26 @@ def _unique_calls(obj, protocol):
     return out
 
 
-async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_name=None) -> Response:
+async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_name=None, _stream=None) -> Response:
     body = restore_replay(body, protocol, api_key_name)
     visible_base = _visible_body(body, protocol, api_key_name)
     current, plan = compile_request(body, protocol)
-    current["stream"] = False
+    current["stream"] = _stream is not None
+    if _stream is not None:
+        _stream.plan = plan
+        # Internal Chat rounds must report usage, independently of whether the
+        # client asked for a downstream usage frame.
+        if protocol == "chat":
+            current["stream_options"] = {**(current.get("stream_options") or {}), "include_usage": True}
+    else:
+        current.pop("stream_options", None)
     usage, usage_seen = {}, False
+    if _stream is not None:
+        _stream.usage = usage
     uses: dict[tuple[str, str], int] = {}  # one request budget, including all Chat branches
     first_attempt_handle = None  # one concrete monthly DB for every branch/round
 
-    async def model_round(request_body):
+    async def model_round(request_body, branch_index=None):
         nonlocal usage_seen, first_attempt_handle
         # finish_success releases the request binding after every model round.
         # Rebind only for a genuine next invoke, not while executing tools or
@@ -511,6 +571,11 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
             retained = web.log_db.retain_request_handle(request_id, first_attempt_handle)
         try:
             response = await invoke(request_body)
+            attempt_handle = getattr(response, "_parrot_search_attempt_handle", None)
+            if first_attempt_handle is None and isinstance(attempt_handle, web.log_db.RowLogHandle):
+                first_attempt_handle = attempt_handle
+            if _stream is not None and response.status_code < 400:
+                response = await _stream.consume(response, branch_index)
         finally:
             if retained is not None:
                 # Normal failover finalization already removes this mapping.
@@ -519,9 +584,6 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
                 with web.log_db._write_lock:
                     if web.log_db._request_handles.get(retained.request_id) is retained:
                         web.log_db._request_handles.pop(retained.request_id, None)
-        attempt_handle = getattr(response, "_parrot_search_attempt_handle", None)
-        if first_attempt_handle is None and isinstance(attempt_handle, web.log_db.RowLogHandle):
-            first_attempt_handle = attempt_handle
         if response.status_code >= 400:
             return response, None
         try:
@@ -533,7 +595,7 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
             _sum_usage(usage, obj["usage"])
         return response, obj
 
-    async def branch(request_body, response, obj):
+    async def branch(request_body, response, obj, branch_index=None):
         # Each Chat alternative owns an independent history and execution state.
         executed, executed_ids = {}, {}
         completed_ids = {ref for item in _history(request_body, protocol) for ref, legacy in _result_refs(item) if not legacy}
@@ -547,6 +609,8 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
             if not owned:
                 final = copy.deepcopy(request_body)
                 _append(final, obj, [], protocol)
+                if _stream is not None:
+                    obj = await _stream.finish_branch(obj, branch_index)
                 visible = copy.deepcopy(visible_base)
                 _append(visible, obj, [], protocol)
                 refs = [c[1] for c in calls]
@@ -568,7 +632,11 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
                 except (ValueError, TypeError):
                     results.append(web.LocalToolResult(call_id, "invalid_input: tool arguments must be a JSON object", True))
                     continue
-                merged = constraints(tool, args)
+                try:
+                    merged = constraints(tool, args)
+                except ValueError as exc:
+                    results.append(web.LocalToolResult(call_id, f"invalid_input: {exc}", True))
+                    continue
                 if tool.operation == "web_fetch":
                     merged["_known_urls"] = web.known_urls_from_body(request_body)
                 identity = (call_id, namespace, tool.name, _digest({k: v for k, v in merged.items() if not k.startswith("_")}))
@@ -604,50 +672,94 @@ async def run(body: dict, protocol: str, invoke, *, request_id=None, api_key_nam
             external = [c for c in calls if c[1] not in managed_ids]
             if external:
                 visible_obj = _hide_calls(obj, protocol, managed_ids)
+                if _stream is not None:
+                    visible_obj = await _stream.finish_branch(visible_obj, branch_index)
                 visible = copy.deepcopy(visible_base)
                 _append(visible, visible_obj, [], protocol)
                 refs = [c[1] for c in external]
                 if protocol == "responses":
-                    refs.append(str(obj.get("id") or ""))
+                    refs.append(str(visible_obj.get("id") or ""))
                 _remember(request_body, protocol, api_key_name, refs, visible_body=visible)
                 return response, visible_obj
-            response, obj = await model_round(request_body)
+            response, obj = await model_round(request_body, branch_index)
             if obj is None:
                 return response, None
         raise AssertionError("unreachable search loop")
 
-    response, first = await model_round(current)
-    if first is None:
-        return response
-    if protocol == "chat":
-        # n applies only to the initial generation, never to branch continuations.
-        final = copy.deepcopy(first)
-        final["choices"] = []
-        initial_response = response
-        initial_choices = first.get("choices") or []
-        for choice in initial_choices:
-            index = choice.get("index", 0)
-            one = {**first, "choices": [copy.deepcopy(choice)]}
-            branch_body = copy.deepcopy(current)
-            branch_body["n"] = 1
-            response, result = await branch(branch_body, initial_response, one)
-            if result is None:
-                return response
-            returned = result.get("choices") or []
-            if len(returned) != 1:
-                return _tool_error("a Chat branch continuation must return exactly one choice")
-            if len(initial_choices) == 1:
-                final = {**result, "choices": []}
-            completed = copy.deepcopy(returned[0])
-            completed["index"] = index
-            final["choices"].append(completed)
-    else:
-        response, final = await branch(current, response, first)
-        if final is None:
+    def finish_request(response=None, *, status="error", http_status=500, message=None):
+        # Before the first successful model round, failover owns finalization.
+        # Afterwards the logical request can fail/cancel without another model
+        # invoke. Pin its original month and update only the request outcome;
+        # individual model rounds must keep their successful billing facts.
+        if not request_id or first_attempt_handle is None:
+            return
+        try:
+            text = None
+            if response is not None:
+                http_status = response.status_code
+                status = "error" if http_status >= 400 else "success"
+                text = response.body.decode("utf-8")
+                if status == "error":
+                    obj = json.loads(text)
+                    error = obj.get("error") if isinstance(obj, dict) else None
+                    message = str(error.get("message") or error.get("code") or "managed search failed") if isinstance(error, dict) else "managed search failed"
+            handle = web.log_db.RequestLogHandle(
+                request_id=first_attempt_handle.request_id, db=first_attempt_handle.db)
+            web.log_db.finish_managed_search_request(
+                handle, status=status, http_status=http_status,
+                error_message=message, response_body=text)
+        except Exception:
+            # Logging must neither replace a response nor swallow cancellation.
+            pass
+
+    async def complete():
+        response, first = await model_round(current)
+        if first is None:
             return response
-    if usage_seen:
-        final["usage"] = usage
-    return _json_response(final, response)
+        if protocol == "chat":
+            # n applies only to the initial generation, never to branch continuations.
+            final = copy.deepcopy(first)
+            final["choices"] = []
+            initial_response = response
+            initial_choices = first.get("choices") or []
+            for choice in initial_choices:
+                index = choice.get("index", 0)
+                one = {**first, "choices": [copy.deepcopy(choice)]}
+                branch_body = copy.deepcopy(current)
+                branch_body["n"] = 1
+                response, result = await branch(branch_body, initial_response, one, index)
+                if result is None:
+                    return response
+                returned = result.get("choices") or []
+                if len(returned) != 1:
+                    return _tool_error("a Chat branch continuation must return exactly one choice")
+                if len(initial_choices) == 1:
+                    final = {**result, "choices": []}
+                completed = copy.deepcopy(returned[0])
+                completed["index"] = index
+                final["choices"].append(completed)
+        else:
+            response, final = await branch(current, response, first)
+            if final is None:
+                return response
+        if usage_seen:
+            final["usage"] = usage
+        if protocol == "responses":
+            _restore_hosted_metadata(final, plan)
+        if _stream is not None:
+            await _stream.commit_tools()
+        return _json_response(final, response)
+
+    try:
+        response = await complete()
+    except asyncio.CancelledError:
+        finish_request(status="cancelled", http_status=499, message="managed search cancelled")
+        raise
+    except Exception:
+        finish_request(message="managed search failed")
+        raise
+    finish_request(response)
+    return response
 
 
 async def _chat_sse(obj):
@@ -664,28 +776,6 @@ async def _chat_sse(obj):
     yield b"data: [DONE]\n\n"
 
 
-def stream(task, protocol: str) -> StreamingResponse:
-    async def iterate():
-        try:
-            while not task.done():
-                yield b": parrot managed search\n\n"
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), 5)
-                except asyncio.TimeoutError:
-                    pass
-            response = await task
-            obj = json.loads(response.body)
-            if response.status_code >= 400:
-                if protocol == "responses":
-                    yield web._sse("response.failed", web._responses_error_payload_from_response(response, response.body))
-                else:
-                    yield web._sse("error", obj)
-                return
-            generator = web._iter_openai_response_sse(obj) if protocol == "responses" else (web._iter_anthropic_message_sse(obj) if protocol == "anthropic" else _chat_sse(obj))
-            async for chunk in generator:
-                yield chunk
-        finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-    return StreamingResponse(iterate(), media_type="text/event-stream")
+def stream(body: dict, protocol: str, invoke, *, request_id=None, api_key_name=None) -> StreamingResponse:
+    from .search_tool_stream import stream as stream_rounds
+    return stream_rounds(body, protocol, invoke, request_id=request_id, api_key_name=api_key_name)

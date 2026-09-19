@@ -74,6 +74,15 @@ def _operation_render(chat_id: int, operation_id: str, back_callback: str) -> tu
                 detail = f"{int(item.get('count') or 0)} 个模型" if item_status == "succeeded" else errors.get(str(item.get("errorCode")), "同步未完成，请重试")
                 icon = "✅" if item_status == "succeeded" else "⚠️"
                 lines.append(f"{icon} {label} · {ui.escape_html(detail)}")
+    if upstream and isinstance(result, Mapping) and isinstance(result.get("metadataSync"), Mapping):
+        metadata = result["metadataSync"]
+        labels = {
+            "succeeded": "已更新并重新匹配",
+            "partial_failed": "拉取失败，已使用本地目录匹配",
+            "failed": "匹配失败，已同步的模型目录保留",
+            "skipped": "自动更新已关闭，已跳过",
+        }
+        lines.append("🧬 元数据：" + labels.get(str(metadata.get("status")), "未完成"))
     error = getattr(operation, "error", None)
     if error is not None:
         lines.append(f"错误：<code>{ui.escape_html(menu._enum_value(error.code))}</code>")

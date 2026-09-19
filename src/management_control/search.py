@@ -47,6 +47,11 @@ class SearchControl(DomainControl):
 
     def get(self, context):
         self._read(context)
+        return self._settings_view()
+
+    @staticmethod
+    def _settings_view():
+        """Secret-free projection shared by authorized reads and write receipts."""
         cfg = search_service.settings()
         statuses = {row["id"]: row for row in search_service.backend_statuses()}
         result = {key: copy.deepcopy(cfg[key]) for key in SETTING_FIELDS}
@@ -158,7 +163,9 @@ class SearchControl(DomainControl):
             self._audit(context, action, "search", "failed")
             raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE) from None
         self._audit(context, action, "search", "succeeded")
-        return self.get(context) if read_back else None
+        # WRITE authorizes the mutation receipt; it does not grant an independent
+        # GET. Do not perform a second READ permission check after committing.
+        return self._settings_view() if read_back else None
 
     def patch(self, context, patch, *, expected_revision=None):
         self._write(context)
@@ -344,7 +351,7 @@ class SearchControl(DomainControl):
         from datetime import datetime, timedelta, timezone
         now = datetime.now(timezone(timedelta(hours=8)))
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if str(period) != "today":
+        if period != "today":
             start = start.replace(day=1)
         return start.timestamp()
 

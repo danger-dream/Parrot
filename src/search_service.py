@@ -271,7 +271,7 @@ def _check_response(response: httpx.Response) -> dict:
     return data
 
 
-def _normalize_rows(rows: list, args: dict) -> list[dict]:
+def _normalize_rows(rows: list, args: dict, *, omit_missing_snippet: bool = False) -> list[dict]:
     output, seen = [], set()
     for item in rows:
         if not isinstance(item, dict):
@@ -285,13 +285,60 @@ def _normalize_rows(rows: list, args: dict) -> list[dict]:
             continue
         seen.add(url)
         text = str(item.get("snippet") or item.get("description") or item.get("content") or item.get("text") or "")
-        row = {"title": str(item.get("title") or ""), "url": url,
-               "snippet": html.unescape(re.sub(r"</?(?:strong|b|em|mark)>", "", text))}
+        row = {"title": str(item.get("title") or ""), "url": url}
+        if text or not omit_missing_snippet:
+            row["snippet"] = html.unescape(re.sub(r"</?(?:strong|b|em|mark)>", "", text))
         published = item.get("publishedDate") or item.get("published_at") or item.get("page_age")
         if published:
             row["published_at"] = published
         output.append(row)
     return output[:args["max_results"]]
+
+
+def _xai_structured_output(text: str) -> tuple[list, str | None] | None:
+    """Parse the result envelope requested from xAI without guessing from prose."""
+    candidate = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidate = fenced.group(1)
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        return None
+    answer = payload.get("answer")
+    return payload["results"], answer if isinstance(answer, str) else None
+
+
+def _xai_aligned_rows(structured: list, evidence: list) -> list:
+    """Keep structured rows tied to URLs observed in native search evidence."""
+    evidence_by_url = {}
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        if urlsplit(url).scheme in ("http", "https"):
+            evidence_by_url.setdefault(url, item)
+    if not evidence_by_url:
+        return structured
+    aligned = []
+    for item in structured:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        source = evidence_by_url.get(url)
+        if source is None:
+            continue
+        merged = dict(source)
+        for key, value in item.items():
+            # Preserve source metadata when the structured envelope truthfully
+            # omits (or leaves blank) a field that the native source supplied.
+            if key in ("title", "snippet", "description", "content", "text") and not value:
+                continue
+            merged[key] = value
+        aligned.append(merged)
+    return aligned
 
 
 async def _http_adapter(backend: dict, credential: str, args: dict, operation: str, cfg: dict) -> dict:
@@ -344,7 +391,20 @@ async def _http_adapter(backend: dict, credential: str, args: dict, operation: s
         data = data.get("data") or {}
         if not isinstance(data, dict):
             raise SearchError("AnySearch结果结构无效", code="invalid_search_response")
-    result = {}
+    try:
+        return _parse_http_result(data, kind, args, operation, cfg)
+    except Exception as exc:
+        if kind != "exa":
+            raise
+        error = exc if isinstance(exc, SearchError) else SearchError(
+            "搜索上游认证或响应处理失败", code="search_backend_error", retryable=False)
+        raise _billing_failure(error, backend, data) from None
+
+
+def _parse_http_result(data: dict, kind: str, args: dict, operation: str, cfg: dict) -> dict:
+    # Only Exa supplies the explicit dollar total consumed by search settlement.
+    # Keep the upstream body private, including when parsing paid results fails.
+    result = {"_billing_body": data} if kind == "exa" else {}
     usage = data.get("usage") or data.get("costDollars")
     if usage is not None: result["usage"] = usage
     if operation == "extract":
@@ -354,7 +414,7 @@ async def _http_adapter(backend: dict, credential: str, args: dict, operation: s
         content = row.get("content") or row.get("raw_content") or row.get("text")
         if not content:
             raise SearchError("上游没有返回网页正文", code="empty_extract_response")
-        result.update(url=effective_url, content=str(content)[:int(cfg["maxFetchChars"])])
+        _set_extract_content(result, effective_url, str(content), cfg)
     else:
         rows = (data.get("web") or {}).get("results") if kind == "brave" else data.get("results")
         if not isinstance(rows, list):
@@ -362,6 +422,28 @@ async def _http_adapter(backend: dict, credential: str, args: dict, operation: s
         result.update(query=args["query"], results=_normalize_rows(rows, args))
         if data.get("answer"): result["answer"] = data["answer"]
     return result
+
+
+def _set_extract_content(result: dict, url: str, content: str, cfg: dict) -> None:
+    maximum = int(cfg["maxFetchChars"])
+    result.update(url=url, content=content[:maximum])
+    if len(content) > maximum:
+        result["truncated"] = True
+        result.setdefault("warnings", []).append(
+            f"Content truncated to {maximum} characters by Parrot (maxFetchChars).")
+
+
+def _billing_failure(error: SearchError, backend: dict, data: Any) -> SearchError:
+    """Carry observed billing privately until this attempt is settled.
+
+    Search semantics may fail after a paid upstream response. These fields are
+    never part of the public error message or the eventual retry summary.
+    """
+    if isinstance(data, dict):
+        error._billing_body = data
+        error._billing_model = _effective_model(backend, {"_upstream_model": data.get("model")})
+        error._billing_provider = backend["type"]
+    return error
 
 
 async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: str, cfg: dict) -> dict:
@@ -410,9 +492,15 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
         if filters: tool["filters"] = filters
         query = _query(args)
         if args.get("freshness"): query += " (published in the past " + args["freshness"] + ")"
+        result_contract = (
+            f" Return only JSON with an answer string and a results array of at most {args['max_results']} objects."
+            " Each result must contain title and URL for the same source returned by web search."
+            " Include snippet only when a snippet or description is available from that same source;"
+            " copy it faithfully, otherwise omit snippet. Do not invent snippets or URLs."
+            ' Use exactly this shape: {"answer":"...","results":[{"title":"...","url":"https://...","snippet":"..."}]}.'
+        )
         payload = {"model": model, "stream": True, "reasoning": {"effort": "low"},
-                   "input": [{"role": "user", "content": "Use web search to find: " + query +
-                              f". Return only up to {args['max_results']} source titles and URLs."}],
+                   "input": [{"role": "user", "content": "Use web search to find: " + query + result_contract}],
                    "tools": [tool], "tool_choice": "required", "max_output_tokens": 1200, "max_tool_calls": 1}
         url = str(backend.get("endpoint") or account.get("base_url") or "https://api.x.ai/v1").rstrip("/") + "/responses"
         headers.update({"user-agent": "xai-sdk-python", "accept": "text/event-stream"})
@@ -456,14 +544,32 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
                         terminal = event.get("response")
                         break
                     if event.get("type") in ("error", "response.failed", "response.incomplete"):
-                        raise SearchError("xAI搜索未正常完成", code="search_upstream_error")
+                        raise _billing_failure(SearchError("xAI搜索未正常完成", code="search_upstream_error"),
+                                               backend, event.get("response") or event)
             if not isinstance(terminal, dict):
                 raise SearchError("xAI搜索流缺少完成事件", code="incomplete_search_response")
             data = terminal
         else:
             kwargs = {"content": payload} if isinstance(payload, (str, bytes)) else {"json": payload}
             response = await client.post(url, headers=headers, **kwargs)
-            data = _check_response(response)
+            try:
+                data = _check_response(response)
+            except SearchError as exc:
+                try:
+                    failed_body = response.json()
+                except ValueError:
+                    failed_body = None
+                raise _billing_failure(exc, backend, failed_body) from None
+    try:
+        return _parse_oauth_result(data, kind, args, operation, cfg)
+    except SearchError as exc:
+        raise _billing_failure(exc, backend, data) from None
+    except Exception:
+        error = SearchError("搜索上游认证或响应处理失败", code="search_backend_error", retryable=False)
+        raise _billing_failure(error, backend, data) from None
+
+
+def _parse_oauth_result(data: dict, kind: str, args: dict, operation: str, cfg: dict) -> dict:
     result = {}
     if data.get("usage") is not None: result["usage"] = data["usage"]
     # Private billing evidence for the call log. It is consumed by
@@ -476,25 +582,39 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
             content = data.get("output")
             if not isinstance(content, str) or not content:
                 raise SearchError("OpenAI未返回网页正文", code="empty_extract_response")
-            result.update(url=args["url"], content=content[:int(cfg["maxFetchChars"])])
+            _set_extract_content(result, args["url"], content, cfg)
         else:
             rows = data.get("results")
             if not isinstance(rows, list):
                 raise SearchError("OpenAI搜索缺少结构化结果", code="invalid_search_response")
             result.update(query=args["query"], results=_normalize_rows(rows, args))
     elif kind == "xai":
-        rows, citations, answer, searched = [], [], [], False
+        sources, citations, answer_parts, searched = [], [], [], False
         for item in data.get("output") or []:
             if item.get("type") == "web_search_call":
                 searched = True
-                rows.extend((item.get("action") or {}).get("sources") or [])
+                sources.extend((item.get("action") or {}).get("sources") or [])
             for part in item.get("content") or []:
-                if part.get("type") == "output_text": answer.append(part.get("text") or "")
+                if part.get("type") == "output_text":
+                    answer_parts.append(part.get("text") or "")
                 for citation in part.get("annotations") or []:
-                    if citation.get("type") == "url_citation": citations.append(citation)
+                    if citation.get("type") == "url_citation":
+                        citations.append(citation)
         if not searched:
             raise SearchError("xAI未执行要求的原生搜索", code="search_not_executed")
-        result.update(query=args["query"], results=_normalize_rows(citations + rows, args), answer="\n".join(answer))
+        answer_text = "\n".join(answer_parts)
+        evidence = citations + sources
+        structured = _xai_structured_output(answer_text)
+        if structured is None:
+            # Older/normal responses can be plain text. Keep their native
+            # citation/source fallback usable instead of treating them as errors.
+            rows, answer = evidence, answer_text
+        else:
+            rows, structured_answer = structured
+            rows = _xai_aligned_rows(rows, evidence)
+            answer = structured_answer if structured_answer is not None else answer_text
+        result.update(query=args["query"],
+                      results=_normalize_rows(rows, args, omit_missing_snippet=True), answer=answer)
     else:
         rows, answer, searched = [], [], False
         for block in data.get("content") or []:
@@ -617,6 +737,8 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
             if exc.code == "url_not_allowed":
                 # A policy refusal is not a backend outage to bypass elsewhere.
                 _finish_search_call_failure(log_handle, last, started)
+                for field in ("_billing_body", "_billing_model", "_billing_provider"):
+                    exc.__dict__.pop(field, None)
                 raise
             if not exc.retryable: permanent.add(index)
         except httpx.RequestError:
@@ -705,6 +827,9 @@ def _finish_search_call_failure(handle, error, started):
             handle, status="error",
             error_code=getattr(error, "code", None),
             elapsed_ms=round((time.monotonic() - started) * 1000),
+            response_body=getattr(error, "_billing_body", None),
+            model=getattr(error, "_billing_model", None),
+            provider=getattr(error, "_billing_provider", None),
         )
     except Exception:
         pass

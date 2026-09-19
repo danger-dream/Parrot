@@ -210,10 +210,14 @@ class _StrictLogFakes:
         status="error",
         usage=None,
         usage_observed=None,
+        response_signals=None,
+        http_header_model=None,
     ) -> None:
         self.request_terminals.append({
             "request_id": request_id,
             "error_message": error_message,
+            "response_signals": response_signals,
+            "http_header_model": http_header_model,
             "retry_count": retry_count,
             "final_channel_key": final_channel_key,
             "final_channel_type": final_channel_type,
@@ -323,6 +327,7 @@ class _CountingContext:
 
 
 class _Tracker:
+    response_signals = failover.model_reroute.ResponseModelSignals()
     usage = {
         "input_tokens": 0,
         "output_tokens": 0,

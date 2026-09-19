@@ -186,8 +186,17 @@ def handle_action(chat_id: int, message_id: int, cb_id: str, action) -> bool:
             ui.answer_cb(cb_id, "别名列表已过期，请重新打开", show_alert=True)
             return True
         try:
-            page = menu._CONTROL.mapping.list_mappings(menu._ctx(chat_id), query=data["alias"], sort="alias", page=1, page_size=10)
-            record = next(item for item in page.items if item.alias == data["alias"])
+            page_no = 1
+            while True:
+                page = menu._CONTROL.mapping.list_mappings(
+                    menu._ctx(chat_id), query=data["alias"], sort="alias", page=page_no, page_size=200,
+                )
+                record = next((item for item in page.items if item.alias == data["alias"]), None)
+                if record is not None:
+                    break
+                if not page.has_next:
+                    raise StopIteration
+                page_no += 1
         except (ManagementError, StopIteration) as exc:
             if isinstance(exc, ManagementError):
                 menu._answer_error(cb_id, exc)

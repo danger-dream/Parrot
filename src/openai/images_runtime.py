@@ -9,7 +9,7 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 import httpx
 from fastapi.responses import JSONResponse
-from .. import concurrency, config, cooldown, image_artifacts, image_catalog, load_balancing, network, oauth_manager, scorer
+from .. import channel_state, concurrency, config, cooldown, image_artifacts, image_catalog, load_balancing, media_cache, network, oauth_manager, scorer
 from ..channel import registry
 from ..async_owned import await_owned
 from ..channel.url_utils import resolve_upstream_url
@@ -182,7 +182,7 @@ async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Resp
 
 
 async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> JSONResponse:
-    sources = [s for s in image_catalog.sources() if s.model == parsed.model and s.available and not cooldown.is_blocked(s.key, s.upstream)]
+    sources = [s for s in image_catalog.sources() if s.model == parsed.model and s.available and not cooldown.is_blocked(channel_state.effect_key(s), s.upstream)]
     if not sources:
         return JSONResponse({'error': {'message': 'no available image source for this model', 'type':'model_not_available'}}, status_code=503)
     pairs = [(registry.get_channel(s.key), s.upstream) for s in sources]
@@ -226,12 +226,26 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
     if not compatible:
         raise ValueError('no image source supports these parameters: ' + '; '.join(dict.fromkeys(capability_notes)))
     sources = compatible
-    if action == 'edit' and any(_uses_api_multipart(source) for source in sources):
-        parsed = copy.copy(parsed)
-        parsed._api_edit_files = await _prepare_api_edit_files(parsed)
-    mask = None
-    if parsed.mask_url:
-        mask = image_artifacts.prepare_mask(await image_artifacts.reference_bytes(parsed.input_images[0]), await image_artifacts.reference_bytes(parsed.mask_url))
+    try:
+        if action == 'edit':
+            parsed = copy.copy(parsed)
+            # Public capability URLs may point at an HTTP/private deployment. Only
+            # exact locally issued URLs are inlined; external URL policy is unchanged.
+            parsed.input_images = [await image_artifacts.inline_local_reference(ref) for ref in parsed.input_images]
+            if parsed.mask_url:
+                parsed.mask_url = await image_artifacts.inline_local_reference(parsed.mask_url)
+            if any(_uses_api_multipart(source) for source in sources):
+                parsed._api_edit_files = await _prepare_api_edit_files(parsed)
+        mask = None
+        if parsed.mask_url:
+            mask = image_artifacts.prepare_mask(await image_artifacts.reference_bytes(parsed.input_images[0]), await image_artifacts.reference_bytes(parsed.mask_url))
+    except httpx.TimeoutException:
+        # Input retrieval precedes any paid POST; do not label this an unknown
+        # generation outcome or leak the reference URL from the transport error.
+        return JSONResponse({'error': {
+            'type': 'image_input_timeout',
+            'message': 'reference image or mask download timed out; no generation was attempted',
+        }}, status_code=504)
     log_task = asyncio.create_task(imagine._start_media_log(request_id=str(uuid.uuid4()), api_key_name=key_name,
         provider=sources[0].provider, media_type='image', action=action, model=parsed.model,
         prompt=parsed.prompt, size=parsed.size, requested_count=parsed.requested_n))
@@ -244,6 +258,7 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
     response_headers = {}
     cache_paths = []; media_bytes = 0; actual_qualities = []
     source = sources[0]
+    log_source = source  # Last actually attempted source, not a skipped candidate.
     max_calls = parsed.requested_n + len(sources) - 1
     try:
         log_id = await await_owned(log_task)
@@ -251,14 +266,23 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
             response = None
             for source in list(sources):
                 if calls >= max_calls: raise ValueError('image upstream attempt budget exhausted; not regenerated')
-                if not await concurrency.try_acquire(source.key): continue
+                effect_key = channel_state.effect_key(source)
+                if not await concurrency.try_acquire(effect_key): continue
                 try:
+                    log_source = source
                     n = 1 if source.key.startswith('oauth:openai:') else parsed.requested_n-len(data)
                     calls += 1
                     usages.append(None)
                     response = await _send(source, parsed, action=action, n=n, cfg=cfg)
                 finally:
-                    concurrency.release(source.key)
+                    concurrency.release(effect_key)
+                if source.key.startswith('oauth:xai:'):
+                    # Preserve Imagine's existing health policy, with the frozen
+                    # generation so late results cannot affect a replacement.
+                    if 200 <= response.status_code < 300:
+                        cooldown.clear_on_success(effect_key, source.upstream)
+                    elif response.status_code in imagine._EXPLICIT_SAFE_FAILOVER_STATUSES or response.status_code >= 500:
+                        cooldown.record_error(effect_key, source.upstream, f'xAI Imagine HTTP {response.status_code}')
                 if response.status_code in SAFE_REJECTIONS:
                     sources.remove(source)
                     continue
@@ -298,9 +322,21 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                 warnings.extend(notes)
                 out = {k:v for k,v in item.items() if k in ('generation_id', 'revised_prompt')}
                 out.update(meta)
+                retained_path = None
+                if cfg.get('cacheEnabled'):
+                    try:
+                        cache_task = asyncio.create_task(asyncio.to_thread(media_cache.cache_inline_base64,
+                            [{'base64':base64.b64encode(raw).decode('ascii'), 'mime':meta['mime_type']}],
+                            cfg=cfg, provider=source.provider, media_type='image', action=action))
+                        cached = await await_owned(cache_task)
+                        cache_paths.extend(cached.paths)
+                        retained_path = cached.paths[0] if cached.paths else None
+                        cache_task = None
+                        if cached.error_class: warnings.append('optional media cache write failed; generation was not repeated')
+                    except Exception: warnings.append('optional media cache write failed; generation was not repeated')
                 if parsed.response_format == 'url':
                     try:
-                        out['url'], out['expires_at'] = image_artifacts.publish(raw, mime=meta['mime_type'], cfg=cfg, request=request, provider=source.provider, action=action, index=len(data))
+                        out['url'], out['expires_at'] = image_artifacts.publish(raw, mime=meta['mime_type'], cfg=cfg, request=request, provider=source.provider, action=action, index=len(data), retained_path=retained_path)
                     except (ValueError, OSError):
                         status = 507
                         failure = {'type': 'image_delivery_error', 'message': 'media cache cannot publish this image; generated images were not regenerated'}
@@ -308,17 +344,6 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                 else:
                     out['b64_json'] = base64.b64encode(raw).decode('ascii')
                 media_bytes += len(raw)
-                if cfg.get('cacheEnabled'):
-                    try:
-                        from .. import media_cache
-                        cache_task = asyncio.create_task(asyncio.to_thread(media_cache.cache_inline_base64,
-                            [{'base64':base64.b64encode(raw).decode('ascii'), 'mime':meta['mime_type']}],
-                            cfg=cfg, provider=source.provider, media_type='image', action=action))
-                        cached = await await_owned(cache_task)
-                        cache_paths.extend(cached.paths)
-                        cache_task = None
-                        if cached.error_class: warnings.append('optional media cache write failed; generation was not repeated')
-                    except Exception: warnings.append('optional media cache write failed; generation was not repeated')
                 data.append(out)
             quality = obj.get('quality')
             if quality: actual_qualities.append(quality)
@@ -330,6 +355,8 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
         if cache_task is not None and cache_task.done() and not cache_task.cancelled():
             cache_paths.extend(cache_task.result().paths)
         await await_owned(imagine._finish_media_log(log_id, status='cancelled', http_status=499,
+            provider=log_source.provider,
+            account_key=log_source.key[6:] if log_source.key.startswith('oauth:') else log_source.key,
             duration_ms=int((time.monotonic()-started)*1000), image_count=len(data),
             cached_media_count=len(cache_paths), cache_paths=cache_paths, media_bytes=media_bytes,
             error_type='cancelled', error_message='image request cancelled; no regeneration attempted'))
@@ -358,13 +385,15 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
             if len({x[field] for x in data}) == 1: result[field] = data[0][field]
     if actual_qualities and len(set(actual_qualities)) == 1: result['quality'] = actual_qualities[0]
     if failure: result['error'] = failure
+    cache_paths = [path for path in cache_paths if media_cache.artifact_path_is_safe(path, cfg)]
     await await_owned(imagine._finish_media_log(log_id, status='failed' if failure else 'success',
+        provider=log_source.provider,
         duration_ms=int((time.monotonic()-started)*1000), image_count=len(data),
         usage=(usages[0] if len(usages)==1 else {**usage_total, 'parrot_usage_by_call': usages}) if reported_usage else None, http_status=status,
         size=data[0]['size'] if data and len({item['size'] for item in data}) == 1 else None,
         output_sizes=[item['size'] for item in data],
-        account_key=source.key[6:] if source.key.startswith('oauth:') else source.key,
-        account_email=(oauth_manager.get_account(source.key[6:]) or {}).get('email') if source.key.startswith('oauth:') else None,
+        account_key=log_source.key[6:] if log_source.key.startswith('oauth:') else log_source.key,
+        account_email=(oauth_manager.get_account(log_source.key[6:]) or {}).get('email') if log_source.key.startswith('oauth:') else None,
         cached_media_count=len(cache_paths), cache_paths=cache_paths, media_bytes=media_bytes,
         error_type=failure['type'] if failure else None, error_message=failure['message'] if failure else None))
     return JSONResponse(result, status_code=status, headers=response_headers)

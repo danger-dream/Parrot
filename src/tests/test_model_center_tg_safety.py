@@ -224,8 +224,52 @@ def test_exiting_alias_editor_revokes_draft_but_field_cancel_keeps_it(env, exit_
     assert control.mapping.update_calls == []
 
 
+def test_cursor_capacity_editor_explains_max_context_tier(env, monkeypatch):
+    control, edits, answers, sends = env
+    source = ModelSourceRef(ModelSourceType.OAUTH, 'acct-a')
+    view = control.views['model-01']
+    control.views['model-01'] = replace(view, sources=(replace(
+        view.sources[0], provider='cursor', outbound_model='upstream-01',
+    ),))
+    original = control.mapping.get_metadata
+
+    def with_max_mode(*args, **kwargs):
+        record = original(*args, **kwargs)
+        record.effective = {**record.effective, 'contextWindowMaxMode': 1_000_000}
+        return record
+
+    monkeypatch.setattr(control.mapping, 'get_metadata', with_max_mode)
+    text, _kb = menu._metadata_editor_render(7, 'rk-1', source, 'capacity')
+    assert '上下文：<code>300,000 tokens</code>' in text
+    assert 'Max Context 上下文：<code>1,000,000 tokens</code>（Cursor 原生；账户默认：关）' in text
+    # Non-Cursor sources and the common-value editor keep the original layout.
+    common_text, _ = menu._metadata_editor_render(7, 'rk-1', None, 'capacity')
+    assert 'Max Context 上下文' not in common_text
+    control.views['model-01'] = view
+    plain_text, _ = menu._metadata_editor_render(7, 'rk-1', source, 'capacity')
+    assert 'Max Context 上下文' not in plain_text
+
+
+def test_detail_capacity_lines_show_max_context_tier_next_to_normal_window():
+    tiered = {
+        'contextWindow': 300_000, 'contextWindowMaxMode': 1_000_000,
+        'maxOutputTokens': 64_000, 'compactTriggerTokens': 850_000,
+    }
+    lines = menu._metadata_lines(tiered)
+    assert lines.index('Max Context 上下文：<code>1,000,000 tokens</code>') == (
+        lines.index('上下文：<code>300,000 tokens</code>') + 1
+    )
+    assert '压缩阈值：<code>850,000 tokens</code>' in lines
+    # Same tier or no Max tier: no extra line, layout unchanged.
+    for flat in (
+        {**tiered, 'contextWindowMaxMode': 300_000},
+        {key: value for key, value in tiered.items() if key != 'contextWindowMaxMode'},
+    ):
+        assert not any(line.startswith('Max Context') for line in menu._metadata_lines(flat))
+
+
 @pytest.mark.parametrize('field_key,raw,expected', [
-    ('inputPricePer1M', '0', 0), ('reasoningEfforts', '-', []), ('serviceTiers', '-', []),
+    ('cost.input', '0', 0), ('reasoningEfforts', '-', []), ('serviceTiers', '-', []),
 ])
 def test_explicit_zero_and_empty_lists_remain_set_not_unset(env, field_key, raw, expected):
     control, edits, answers, sends = env

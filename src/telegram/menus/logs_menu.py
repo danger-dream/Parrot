@@ -16,7 +16,7 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from ... import config, log_db, oauth_manager
+from ... import config, log_db, model_reroute, oauth_manager
 from ...management_control.observability import DEFAULT_LOGS_CONTROL, telegram_context
 from .. import log_inspector, states, ui
 from .status_update_banner import suffix_status_update_banner as _maybe_suffix_status_banner
@@ -737,6 +737,32 @@ def _billing_detail_lines(cost_metrics: dict, attempts: list[dict]) -> list[str]
     return lines
 
 
+def _upstream_observation_detail_lines(log: dict) -> list[str]:
+    """Render reroute / safety-review facts for the detail page identity block.
+
+    The detail page also carries the review reasons when the upstream sent any.
+    """
+    out: list[str] = []
+    actual_model = str(log.get("upstream_actual_model") or "").strip()
+    conflict = model_reroute.decode_model_conflict(log.get("model_signal_conflict"))
+    if conflict:
+        out.append("模型信息不一致: ⚠️ 上游模型信号冲突，不能据此确定实际模型或是否降级")
+        out.extend(f"<code>{ui.escape_html(line)}</code>" for line in model_reroute.model_conflict_lines(conflict))
+    elif actual_model:
+        label = model_reroute.reroute_label(log.get("final_channel_type"))
+        out.append(
+            f"{label}: ⚠️ <code>{ui.escape_html(_detail_inline(actual_model))}</code>"
+        )
+    review = model_reroute.decode_safety_review(log.get("safety_review"))
+    if review is not None:
+        line = f"安全审查: 🛡️ <code>{ui.escape_html(model_reroute.SAFETY_REVIEW_TEXT)}</code>"
+        reason = model_reroute.safety_review_reason_text(review)
+        if reason:
+            line += f"\n原因: <code>{ui.escape_html(_detail_inline(reason))}</code>"
+        out.append(line)
+    return out
+
+
 def _render_detail(detail: dict) -> str:
     log = detail.get("log") or {}
     chain = detail.get("retry_chain") or []
@@ -769,6 +795,8 @@ def _render_detail(detail: dict) -> str:
         )
     if log.get("proxy_name"):
         lines.append(f"出站代理: 🔀 <code>{ui.escape_html(_detail_inline(log['proxy_name']))}</code>")
+    # 上游模型身份事实：紧贴模型/渠道这组，不放到执行链末尾。
+    lines.extend(_upstream_observation_detail_lines(log))
     ingress = log.get("ingress_protocol")
     upstream_proto = log.get("upstream_protocol")
     if ingress or upstream_proto:

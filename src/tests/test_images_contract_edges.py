@@ -288,7 +288,8 @@ def test_image_source_picker_uses_workspace_names_and_keeps_chat_labels(setup, m
     monkeypatch.setattr(ui, 'is_admin', lambda chat: True)
     monkeypatch.setattr(menu, '_CONTROL', SimpleNamespace(
         bind_telegram_actor=lambda chat: None,
-        oauth=SimpleNamespace(list_accounts=lambda *args, **kwargs: SimpleNamespace(items=accounts)),
+        oauth=SimpleNamespace(list_accounts=lambda *args, **kwargs: SimpleNamespace(
+            items=accounts, meta=SimpleNamespace(has_next=False))),
         channels=SimpleNamespace(list_all=lambda ctx: [])))
     menu.reset_for_tests()
     session = menu._session(42); session.tab = 'image'

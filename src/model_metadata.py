@@ -424,6 +424,24 @@ def _constrain_to_native(
     return constrained
 
 
+def _trigger_ceiling(
+    input_budget: int | None, max_input: int | None, metadata: Mapping[str, Any],
+) -> int | None:
+    """Largest compactTriggerTokens a model can hold across its context tiers.
+
+    A single stored trigger serves both the normal window and a separate Max
+    Context tier (Cursor). Without an explicit maxInputTokens the ceiling is
+    the larger tier; effective_request_budget still clamps the trigger to the
+    window actually selected for each request.
+    """
+    if input_budget is None or max_input is not None:
+        return input_budget
+    maximum = _to_int(metadata.get("contextWindowMaxMode"))
+    if maximum is not None and maximum > input_budget:
+        return maximum
+    return input_budget
+
+
 def _derive_consistent_limits(
     metadata: dict[str, Any], provenance: dict[str, str],
     constrained: dict[str, tuple[str, ...]],
@@ -440,9 +458,10 @@ def _derive_consistent_limits(
         # Context and output maxima are independent per-request ceilings for
         # models.dev records; do not subtract one declared maximum from the other.
         input_budget = context
+    trigger_ceiling = _trigger_ceiling(input_budget, max_input, metadata)
     trigger = _to_int(metadata.get("compactTriggerTokens"))
-    if input_budget is not None and trigger is not None and trigger > input_budget:
-        metadata["compactTriggerTokens"] = input_budget
+    if trigger_ceiling is not None and trigger is not None and trigger > trigger_ceiling:
+        metadata["compactTriggerTokens"] = trigger_ceiling
         provenance["compactTriggerTokens"] = "derived"
         constrained["compactTriggerTokens"] = (
             *constrained.get("compactTriggerTokens", ()), "effectiveInputBudget",
@@ -676,9 +695,11 @@ def _effective_binding(
     scope_key: str | None,
     outbound_model: str | None,
     native: tuple[Mapping[str, Any], str] | None,
+    override_fields: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None,
 ) -> MetadataBinding | None:
-    common_override, source_override = get_override_fields(
-        model, scope_key=scope_key, outbound_model=outbound_model,
+    common_override, source_override = (
+        get_override_fields(model, scope_key=scope_key, outbound_model=outbound_model)
+        if override_fields is None else override_fields
     )
     if binding is None and native is None and not common_override and not source_override:
         return None
@@ -715,6 +736,13 @@ def _effective_binding(
         if name not in metadata or name in cursor_fields:
             metadata[name] = copy.deepcopy(value)
             provenance[name] = "account-native"
+    if cursor_fields and "maxInputTokens" not in upstream:
+        # Cursor's account catalog is the sole authority for transport limits and
+        # publishes no separate input ceiling. A models.dev maxInputTokens (e.g.
+        # 922k for gpt-5.5) would otherwise be clamped to the normal window and
+        # pin the Max Context budget to it. Operators may still set one below.
+        metadata.pop("maxInputTokens", None)
+        provenance.pop("maxInputTokens", None)
     _apply_fields(metadata, provenance, common_override, "common-override")
     _apply_fields(metadata, provenance, source_override, "source-override")
     constrained = _constrain_to_native(
@@ -767,6 +795,7 @@ def resolve_binding(
     *,
     scope_key: str | None = None,
     outbound_model: str | None = None,
+    _override_fields: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None,
 ) -> MetadataBinding | None:
     """Resolve matching, sparse inheritance and provider-native hard limits."""
     model = normalize_model_name(client_visible_model)
@@ -818,6 +847,7 @@ def resolve_binding(
     return _effective_binding(
         binding, model=model, scope_key=scope,
         outbound_model=outbound_model, native=native,
+        override_fields=_override_fields,
     )
 
 
@@ -906,10 +936,20 @@ def _validate_override_constraints(
     *,
     scope_key: str | None,
     outbound_model: str | None,
+    override_fields: tuple[Mapping[str, Any], Mapping[str, Any]],
 ) -> None:
-    binding = resolve_binding(model, scope_key=scope_key, outbound_model=outbound_model)
+    binding = resolve_binding(
+        model, scope_key=scope_key, outbound_model=outbound_model,
+        _override_fields=override_fields,
+    )
     effective = copy.deepcopy(dict(binding.metadata)) if binding is not None else {}
     _apply_fields(effective, {}, values, "candidate")
+    context_cap = _to_int(values.get("contextWindow"))
+    maximum = _to_int(effective.get("contextWindowMaxMode"))
+    if context_cap is not None and maximum is not None and maximum > context_cap:
+        # Mirror _effective_binding: an operator contextWindow also caps the Max
+        # Context tier, so a trigger validated in the same patch sees that cap.
+        effective["contextWindowMaxMode"] = context_cap
     context = _to_int(effective.get("contextWindow"))
     max_input = _to_int(effective.get("maxInputTokens"))
     trigger = _to_int(effective.get("compactTriggerTokens"))
@@ -926,8 +966,9 @@ def _validate_override_constraints(
         # Context and output maxima are independent per-request ceilings for
         # models.dev records; do not subtract one declared maximum from the other.
         input_budget = context
+    trigger_ceiling = _trigger_ceiling(input_budget, max_input, effective)
     if (
-        input_budget is not None and trigger is not None and trigger > input_budget
+        trigger_ceiling is not None and trigger is not None and trigger > trigger_ceiling
         and "compactTriggerTokens" in values
     ):
         raise ValueError("compactTriggerTokens must not exceed effectiveInputBudget")
@@ -939,10 +980,25 @@ def _validate_override_constraints(
         if name not in values:
             continue
         ceiling = _to_int(native_metadata.get(name))
+        normal_ceiling = None
         if name == "contextWindow" and native and native[1] == "cursor":
+            normal_ceiling = ceiling
             ceiling = _to_int(native_metadata.get("contextWindowMaxMode")) or ceiling
         if ceiling is not None and int(values[name]) > ceiling:
             raise ValueError(f"{name} cannot exceed provider native ceiling {ceiling}")
+        if (
+            normal_ceiling is not None and ceiling is not None and ceiling > normal_ceiling
+            and int(values[name]) == ceiling
+        ):
+            # The normal window can only be tightened; a value between the two
+            # native tiers caps the Max Context tier. Equal to the Max tier it
+            # changes nothing, and silently accepting it reads as a lost save.
+            raise ValueError(
+                f"contextWindow {ceiling} equals the Cursor Max Context ceiling and has "
+                f"no effect: the normal window (native {normal_ceiling}) can only be "
+                f"lowered; a value between {normal_ceiling} and {ceiling} caps the Max "
+                "Context tier instead"
+            )
     for name in ("vision", "toolCall", "structuredOutput"):
         if values.get(name) is True and native_metadata.get(name) is False:
             raise ValueError(f"{name} cannot enable a provider-disabled capability")
@@ -976,9 +1032,6 @@ def patch_override_fields(
         raise ValueError("set or unset must contain at least one field")
     if scope and not outbound:
         raise ValueError("scoped override requires outbound model")
-    _validate_override_constraints(
-        name, normalized_set, scope_key=scope, outbound_model=outbound,
-    )
     changed = [False]
 
     def mutate(cfg: dict) -> None:
@@ -1006,6 +1059,17 @@ def patch_override_fields(
         updated.update(copy.deepcopy(normalized_set))
         for field_name in normalized_unset:
             updated.pop(field_name, None)
+        # Validate the final sparse layer against freshly resolved inheritance,
+        # not the old effective values (which may contain caps being unset).
+        # This runs inside config.update: no transient config is published and
+        # both the inherited layer and this patch belong to one atomic write.
+        common, source = get_override_fields(
+            name, scope_key=scope, outbound_model=outbound, cfg=cfg,
+        )
+        _validate_override_constraints(
+            name, normalized_set, scope_key=scope, outbound_model=outbound,
+            override_fields=(common, updated) if scope else (updated, source),
+        )
         if updated == existing and (
             not scope or not isinstance(raw, Mapping)
             or normalize_model_name(raw.get("outboundModel")) == outbound
@@ -1572,6 +1636,16 @@ def max_output_tokens(
     ).get("maxOutputTokens"))
 
 
+def _derived_compact_trigger(window: int | None, max_output: int | None) -> int | None:
+    """Default trigger for one context tier: 80% of (window - output).
+
+    Same formula as the Cursor account catalog uses for the normal tier.
+    """
+    if window is None:
+        return None
+    return max(1, int(max(1, window - (max_output or 0)) * 0.8))
+
+
 def compact_trigger_tokens(
     model: Any,
     *,
@@ -1579,21 +1653,42 @@ def compact_trigger_tokens(
     outbound_model: str | None = None,
     use_max_context: bool = False,
 ) -> int | None:
+    """Trigger for the context tier a request actually selects.
+
+    One stored trigger serves both the normal window and Cursor's Max Context
+    tier. It applies as-is while it fits the selected tier's input budget;
+    beyond that budget the tier falls back to its derived default instead of
+    collapsing to the hard limit, which would defer compaction until the
+    window is already full.
+    """
     metadata = get_metadata(
         model, scope_key=scope_key, outbound_model=outbound_model,
     )
+    normal = _to_int(metadata.get("contextWindow"))
+    window = normal
+    max_tier = False
     if use_max_context:
+        maximum = _to_int(metadata.get("contextWindowMaxMode"))
+        if maximum is not None and (normal is None or maximum > normal):
+            window = maximum
+            max_tier = True
+    max_output = _to_int(metadata.get("maxOutputTokens"))
+    stored = _to_int(metadata.get("compactTriggerTokens"))
+    if max_tier:
         common, source = get_override_fields(
             model, scope_key=scope_key, outbound_model=outbound_model,
         )
-        if "compactTriggerTokens" in common or "compactTriggerTokens" in source:
-            return _to_int(metadata.get("compactTriggerTokens"))
-        normal = _to_int(metadata.get("contextWindow"))
-        maximum = _to_int(metadata.get("contextWindowMaxMode"))
-        if maximum is not None and (normal is None or maximum > normal):
-            output = _to_int(metadata.get("maxOutputTokens")) or 0
-            return max(1, int(max(1, maximum - output) * 0.8))
-    return _to_int(metadata.get("compactTriggerTokens"))
+        if "compactTriggerTokens" not in common and "compactTriggerTokens" not in source:
+            # The stored value is the normal-tier default; derive for Max.
+            return _derived_compact_trigger(window, max_output)
+    limits = [
+        value for value in (_to_int(metadata.get("maxInputTokens")), window)
+        if value is not None
+    ]
+    tier_budget = min(limits) if limits else None
+    if stored is not None and tier_budget is not None and stored > tier_budget:
+        return _derived_compact_trigger(window, max_output)
+    return stored
 
 
 def _compact_rescue_int(key: str, default: int) -> int:

@@ -40,7 +40,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from ... import model_names
+from ... import model_names, quota_errors
 from ...management_control.oauth import CchMode, OAuthUsageDisplayMode
 from ...management_control.oauth.menu_bridge import (
     OpenAIImportParseError,
@@ -1592,6 +1592,50 @@ def _cursor_raw_from_row(row: dict | None) -> dict:
     return cursor if isinstance(cursor, dict) else {}
 
 
+def _split_cursor_quota_pauses(account: dict, entries: list[dict]) -> tuple[list[dict], dict]:
+    """Presentation-only split; hidden/disabled models remain paused in routing."""
+    if oauth_control.provider_of_snapshot(account) != "cursor":
+        return entries, {}
+    selected = {str(model) for model in account.get("models") or []}
+    disabled = oauth_control.cursor_disabled_models_snapshot(account)
+    faults, groups = [], {}
+    for entry in entries:
+        message = entry.get("last_error_message")
+        if not quota_errors.is_cursor_pool_quota_message(message):
+            faults.append(entry)
+            continue
+        if entry.get("model") not in selected or entry.get("model") in disabled:
+            continue
+        try:
+            payload = json.loads(message)
+            info = payload.get("error") or {}
+            pool = info.get("pool")
+        except (TypeError, ValueError, AttributeError):
+            pool = None
+        if pool not in ("cursor_models", "other_models"):
+            pool = "unknown"
+        groups.setdefault((pool, entry.get("cooldown_until")), []).append(entry)
+    return faults, groups
+
+
+def _format_cursor_quota_pauses(groups: dict) -> str:
+    if not groups:
+        return ""
+    labels = {"cursor_models": "🧭 Cursor Models / Auto",
+              "other_models": "🧩 Other Models / API", "unknown": "Cursor 模型池"}
+    lines = ["<b>⏸ 配额暂停（非模型故障）</b>"]
+    for (pool, until), entries in groups.items():
+        lines.append(f"{labels[pool]} · {len(entries)} 个已启用模型")
+        if isinstance(until, (int, float)) and until > 0:
+            reset = datetime.fromtimestamp(until / 1000, tz=timezone.utc).isoformat()
+            lines.append(f"恢复时间: <code>{_fmt_time_full(reset)}</code>")
+        for entry in entries:
+            model = model_names.public_id("cursor", str(entry.get("model") or ""))
+            lines.append(f"  • <code>{ui.escape_html(model)}</code>")
+    lines.append("<i>仅列出受影响的已启用模型；配额暂停不代表调用失败。</i>")
+    return "\n".join(lines)
+
+
 def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str:
     row = oauth_control.quota_snapshot(account_key)
     cursor = _cursor_raw_from_row(row)
@@ -1655,6 +1699,8 @@ def _format_cursor_usage_block(account_key: str, *, detail: bool = False) -> str
             lines.append(
                 f"🧩 Other: {_format_usage_value_bar_first_html(api_util, decimals=2)}"
             )
+    if detail and (auto_util is not None or api_util is not None):
+        lines.append("<i>各模型池独立限制；总剩余额度不代表每个模型都可用。</i>")
     if reset:
         lines.append(f"🔄 周期重置: <code>{_fmt_time_full(reset)}</code>")
     status = cursor.get("subscription_status")
@@ -1948,6 +1994,10 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         e for e in oauth_control.cooldown_entries_snapshot()
         if e.get("channel_key") == ck
     ]
+    cds, quota_groups = _split_cursor_quota_pauses(acc, cds)
+    if quota_groups:
+        paused_n = sum(len(entries) for entries in quota_groups.values())
+        lines.append(f"⏸ 配额暂停 {paused_n} 个已启用模型（非故障）")
     if cds:
         perm_n = sum(1 for e in cds if e.get("cooldown_until") == -1)
         cool_n = len(cds) - perm_n
@@ -2470,10 +2520,19 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
     # 冷却统计：按 oauth:email 聚合；一个账号只要有任何模型处于冷却，就计数一次
     cd_keys_any: set[str] = set()
     cd_keys_perm: set[str] = set()
+    quota_pause_keys: set[str] = set()
+    accounts_by_channel = {f"oauth:{_account_key(a)}": a for a in accounts_all}
     for e in oauth_control.cooldown_entries_snapshot():
         ck = e.get("channel_key", "")
         if not ck.startswith("oauth:"):
             continue
+        account = accounts_by_channel.get(ck)
+        if account is not None:
+            faults, groups = _split_cursor_quota_pauses(account, [e])
+            if groups:
+                quota_pause_keys.add(ck)
+            if not faults:
+                continue
         cd_keys_any.add(ck)
         if e.get("cooldown_until") == -1:
             cd_keys_perm.add(ck)
@@ -2491,6 +2550,7 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
         + (f" | 配额 {quota_disabled}" if quota_disabled else "")
         + (f" | 用户禁用 {user_disabled}" if user_disabled else "")
         + (f" | 认证失败 {auth_err}" if auth_err else "")
+        + (f" | ⏸ 配额暂停 {len(quota_pause_keys)}" if quota_pause_keys else "")
         + (f" | ⚠ 冷却 {cooling_only}" if cooling_only else "")
         + (f" | 🔴 永久 {permanent}" if permanent else "")
         + page_info
@@ -2976,8 +3036,8 @@ def _format_month_stats_block(account_key: str, *,
     ]
     if by_model:
         lines.append("")
-        lines.append("按模型:")
-        for ms in by_model:
+        lines.append("按模型: Top 3")
+        for ms in by_model[:3]:
             model = ui.escape_html(model_names.for_channel(f"oauth:{account_key}", ms.get("final_model") or "?"))
             m_prompt = ui.prompt_total(ms["input"], ms["cache_creation"], ms["cache_read"])
             model_line = (
@@ -2998,6 +3058,8 @@ def _format_month_stats_block(account_key: str, *,
                 f"    累计金额：{_format_cursor_local_cost(ms, model_row=True)}"
                 if is_cursor else f"    累计金额：{ui.fmt_cost(ms)}"
             )
+        if len(by_model) > 3:
+            lines.append(f"  <i>… 其余 {len(by_model) - 3} 个模型未展开</i>")
     return "\n".join(lines)
 
 
@@ -3099,7 +3161,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         provider_line = (
             (f"👤 姓名: <code>{ui.escape_html(profile_name)}</code>\n" if profile_name else "")
             + f"🏷️ 套餐: <code>{ui.escape_html(str(acc.get('plan_type') or 'Cursor'))}</code>\n"
-            f"🧬 模型目录: <code>{cursor_available} 个可用模型{disabled_suffix}</code>\n"
+            f"🧬 模型目录: <code>{cursor_available} 个已启用模型{disabled_suffix}</code>\n"
             f"📚 元数据: <code>Cursor AvailableModels（账号专属）</code>\n"
         )
     else:
@@ -3145,6 +3207,10 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     # 显示当前模型的冷却状态
     ck = f"oauth:{account_key}"
     cd_models = [e for e in oauth_control.cooldown_entries_snapshot() if e["channel_key"] == ck]
+    cd_models, quota_groups = _split_cursor_quota_pauses(acc, cd_models)
+    quota_block = _format_cursor_quota_pauses(quota_groups)
+    if quota_block:
+        text += "\n\n" + quota_block
     if cd_models:
         text += "\n\n<b>⚠ 冷却中的模型：</b>\n"
         now_ms = int(__import__('time').time() * 1000)
@@ -3443,9 +3509,11 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         elif isinstance(metadata_action, dict) and metadata_action.get("action") in {"error", "timeout", "fetch_empty"}:
             head += "\n⚠️ 额度已更新，但模型目录本次同步失败，保留原目录"
         if quota_action and quota_action.get("action") == "cursor_pool_cooldown":
-            head += f"\n🟠 已按额度池冷却 <code>{int(quota_action.get('cooled_models') or 0)}</code> 个模型"
+            head += f"\n⏸ 已按配额暂停 <code>{int(quota_action.get('cooled_models') or 0)}</code> 个模型（含已禁用模型）"
         elif quota_action and quota_action.get("action") == "cursor_pool_recovered":
             head += f"\n♻️ 已恢复 <code>{int(quota_action.get('recovered_models') or 0)}</code> 个模型"
+        elif quota_action and quota_action.get("action") == "cursor_quota_unknown":
+            head += "\n⚠️ 本次未取得完整分池用量，不据此解除配额暂停"
         ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
     elif provider == "xai":
         head = "✅ 已更新 Grok 官方账单"

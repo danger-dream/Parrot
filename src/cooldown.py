@@ -306,6 +306,38 @@ def record_error(channel_key: str, model: str, message: str | None = None,
     return result
 
 
+def record_quota_pause(channel_key: str, model: str, message: str,
+                       *, cooldown_until: int) -> dict:
+    """Persist a bounded quota pause without recording a request failure.
+
+    Shares the existing scheduling/expiry state with cooldowns. Keep prior
+    failure counts and ladder timestamps unchanged; no schema migration or
+    guessed correction of historical counts is performed.
+    """
+    if cooldown_until <= _now_ms():
+        raise ValueError("quota pause requires a future reset time")
+    with _lock:
+        if channel_state.is_deleted(channel_key):
+            return {}
+        channel_key = channel_state.resolve(channel_key)
+        if channel_state.is_deleted(channel_key):
+            return {}
+        state = dict(_entries.get((channel_key, model)) or {
+            "error_count": 0,
+            "first_error_at": None,
+            "last_advance_at": 0,
+        })
+        state["cooldown_until"] = cooldown_until
+        state["last_error_message"] = message
+        with state_db.optional_write_timeout():
+            state_db.error_save(
+                channel_key, model, int(state.get("error_count") or 0),
+                cooldown_until, message,
+            )
+        _entries[(channel_key, model)] = state
+        return dict(state)
+
+
 def _was_actively_blocked(state: dict, now: int) -> bool:
     """判断 entry 当前是否真的处于"在冷却"（永久 / cooldown_until > now）。"""
     cd = state.get("cooldown_until")

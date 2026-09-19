@@ -11,6 +11,7 @@ from .auxiliary import (
     AntigravityMediaControl,
     AuxiliaryControls,
     ImageControl,
+    VideoControl,
     StatusAlertControl,
     TranslationControl,
     UpdateControl,
@@ -87,6 +88,7 @@ def build_management_controls(
         status_alerts=StatusAlertControl(audit_sink=audit_sink),
         updates=UpdateControl(audit_sink=audit_sink),
         images=ImageControl(audit_sink=audit_sink),
+        videos=VideoControl(audit_sink=audit_sink),
         xai_media=XaiMediaControl(audit_sink=audit_sink),
         antigravity_media=AntigravityMediaControl(audit_sink=audit_sink),
     )

@@ -568,21 +568,19 @@ def translate_response(
     current_input_items: Optional[list] = None,
     namespace_tool_map: NamespaceToolMap | None = None,
 ) -> dict:
+    from ... import search_hosted_codec
+    hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
-    response = responses_to_chat.translate_response(
+    return responses_to_chat.translate_response(
         chat_obj,
         model=model,
         previous_response_id=previous_response_id,
         api_key_name=api_key_name,
         channel_key=channel_key,
         current_input_items=current_input_items,
+        output_prefix=hosted,
         output_item_transform=(
             (lambda item: restore_output_item(item, namespace_tool_map))
             if namespace_tool_map is not None else None
         ),
     )
-    from ... import search_hosted_codec
-    hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
-    if hosted:
-        response["output"] = hosted + response.get("output", [])
-    return response

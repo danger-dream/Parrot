@@ -14,9 +14,10 @@ import json
 import threading
 from typing import Optional
 
+from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .. import auth
+from .. import auth, config
 from . import policy
 
 # 管理端可读的运行时状态：端点、挂载信息与最近一次装配结果。
@@ -55,6 +56,34 @@ async def _send_json(send: Send, status: int, payload: dict, *, extra: list | No
     await send({"type": "http.response.body", "body": body})
 
 
+def _origin(value: str) -> tuple[str, str, int] | None:
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path or parsed.query or parsed.fragment):
+            return None
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        return parsed.scheme, parsed.hostname.lower(), port
+    except ValueError:
+        return None
+
+
+def _origin_allowed(scope: Scope) -> bool:
+    supplied = _header(scope, b"origin")
+    if supplied is None:
+        return True  # Native MCP clients need not send Origin.
+    origin = _origin(supplied)
+    if origin is None:
+        return False
+    request = Request(scope)
+    own_origin = _origin(f"{request.url.scheme}://{request.url.netloc}")
+    allowed = (config.get().get("management") or {}).get("allowedOrigins") or ()
+    return origin == own_origin or any(origin == _origin(str(item)) for item in allowed)
+
+
 class MCPAuthGate:
     """鉴权 + 总开关，位于 MCP 应用之前。"""
 
@@ -75,6 +104,13 @@ class MCPAuthGate:
                     "message": "MCP service is disabled",
                 }
             })
+            return
+
+        if not _origin_allowed(scope):
+            await _send_json(send, 403, {"error": {
+                "type": "permission_error", "code": "origin_denied",
+                "message": "Origin is not allowed for the MCP service",
+            }})
             return
 
         authorization = _header(scope, b"authorization") or ""
@@ -116,7 +152,12 @@ class MCPAuthGate:
             return
 
         scope.setdefault("state", {})["parrot_key_name"] = key_name
-        await self.app(scope, receive, send)
+        # Snapshot the live limit for this request; never mutate a shared SDK
+        # middleware while another request is consuming its body.
+        from mcp.server.transport_security import RequestBodyLimitMiddleware
+
+        limit = int(policy.settings().get("maxRequestBodyBytes") or 33554432)
+        await RequestBodyLimitMiddleware(self.app, limit)(scope, receive, send)
 
 
 class DisabledMCPApp:
@@ -136,15 +177,13 @@ class DisabledMCPApp:
 
 def build_asgi_app(server) -> ASGIApp:
     """构造挂载用的 ASGI 应用（Streamable HTTP + 鉴权网关）。"""
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.cors import CORSMiddleware
-
     app = server.streamable_http_app(
         streamable_http_path="/",
         json_response=True,
         stateless_http=True,
-        max_request_body_size=int(policy.settings().get("maxRequestBodyBytes") or 33554432),
+        # The gate enforces the live limit. Keep the SDK ceiling at the largest
+        # supported setting so increasing it doesn't require rebuilding sessions.
+        max_request_body_size=256 * 1024 * 1024,
         # 明确交给 Parrot 自己判 Host/Origin：SDK 默认会在 host=127.0.0.1 时
         # 只放行 localhost，导致生产域名访问被 421 拒绝。
         transport_security=_transport_security(),
@@ -154,22 +193,11 @@ def build_asgi_app(server) -> ASGIApp:
 
 
 def _transport_security():
-    """DNS 重绑定保护：禁止浏览器跨站直接访问，但放行正常 API 客户端。
+    """Origin is enforced by MCPAuthGate using live config and the request host.
 
-    MCP 规范要求服务端校验 Origin。这里对携带 Origin 的请求只放行同源与
-    管理端已声明来源；不带 Origin 的（CLI/SDK 客户端）正常放行。
+    Disable only the SDK's static host/origin policy, which otherwise rejects
+    valid production hosts. Content-Type validation remains enabled in the SDK.
     """
     from mcp.server.transport_security import TransportSecuritySettings
 
-    allowed_origins: list[str] = []
-    try:
-        from .. import config
-        raw = (config.get().get("management") or {}).get("allowedOrigins") or ()
-        allowed_origins = [str(item) for item in raw if str(item).strip()]
-    except Exception:
-        allowed_origins = []
-    return TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-        allowed_hosts=["*"],
-        allowed_origins=allowed_origins,
-    )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)

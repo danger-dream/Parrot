@@ -15,6 +15,7 @@ class ImageSettingsData(StrictSchema):
     enabled: bool
     cacheEnabled: bool
     models: dict[str, list[str]]
+    defaultModel: str = ""
     requestTimeoutSeconds: int
     jobTtlSeconds: int | None = None
     cachePath: str
@@ -27,6 +28,7 @@ class ImageSettingsPatch(StrictSchema):
     enabled: bool = True
     cacheEnabled: bool = False
     models: dict[str, list[Annotated[str, Field(min_length=1, max_length=128)]]] = Field(default_factory=dict)
+    defaultModel: str = Field(default="", max_length=128)
     requestTimeoutSeconds: int = Field(default=180, ge=1, le=2147483647)
     cachePath: str = Field(default="images", min_length=1, max_length=4096)
     cacheRetentionDays: int = Field(default=0, ge=0, le=36500)

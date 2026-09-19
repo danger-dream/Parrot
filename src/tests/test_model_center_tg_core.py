@@ -151,8 +151,11 @@ class _OAuth:
         ]
 
     def list_accounts(self, _ctx, *, page):
+        start = (page.page - 1) * page.page_size
         return SimpleNamespace(
-            items=tuple(self.accounts), meta=SimpleNamespace(total=len(self.accounts)), revision="or1",
+            items=tuple(self.accounts[start:start + page.page_size]),
+            meta=SimpleNamespace(total=len(self.accounts), has_next=start + page.page_size < len(self.accounts)),
+            revision="or1",
         )
 
     def get_account(self, _ctx, account_id):

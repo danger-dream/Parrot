@@ -443,14 +443,16 @@ def _sort_apply(chat_id, action):
         ids = [i for i in ids if i not in picked] + [i for i in ids if i in picked]
     else:
         step = -1 if action == "up" else 1
-        # Walk from the leading edge so a selected neighbour is never overwritten.
-        positions = range(len(ids)) if step > 0 else range(len(ids) - 1, -1, -1)
+        # Visit the destination edge first: each picked source moves once,
+        # including adjacent selections, without being visited again after swap.
+        positions = range(len(ids) - 1, -1, -1) if step > 0 else range(len(ids))
         for index in positions:
             target = index + step
             if not (0 <= target < len(ids)):
                 continue
             if ids[index] in picked and ids[target] not in picked:
                 ids[index], ids[target] = ids[target], ids[index]
+    selected = [i for i, backend_id in enumerate(ids, 1) if backend_id in picked]
     _sort_draft[chat_id] = {"ids": ids, "selected": selected}
     return ids, selected
 

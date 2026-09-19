@@ -112,6 +112,14 @@ def json_error_for_ingress(
 
 def make_stream_translator(translator_ctx: Optional[dict]):
     """Instantiate the response stream translator described by translator_ctx."""
+    translator = _make_stream_translator(translator_ctx)
+    if translator is not None and (translator_ctx or {}).get("managed_search_chat_tools"):
+        from ..search_tool_stream import ChatToolNames
+        return ChatToolNames(translator)
+    return translator
+
+
+def _make_stream_translator(translator_ctx: Optional[dict]):
     if not isinstance(translator_ctx, dict):
         return None
     name = translator_ctx.get("response_translator")

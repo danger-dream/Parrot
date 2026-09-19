@@ -256,6 +256,22 @@ def _restore_isolated_config_baseline():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_proxy_runtime(monkeypatch):
+    """Keep proxy registration and its temporary callback list in one test scope."""
+    from src import config
+    from src.proxy import manager
+
+    monkeypatch.setattr(config, "_reload_callbacks", [
+        callback for callback in config._reload_callbacks
+        if callback is not manager._on_config_reload
+    ])
+    monkeypatch.setattr(manager, "_callback_registered", False)
+    monkeypatch.setattr(manager, "_initialized", False)
+    monkeypatch.setattr(manager, "_config_generation", None)
+    monkeypatch.setattr(manager, "_snapshot", manager._EMPTY_SNAPSHOT)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_channel_generation_globals():
     """Process-lifetime tombstones must not leak between independent tests."""
     from src import channel_state, concurrency

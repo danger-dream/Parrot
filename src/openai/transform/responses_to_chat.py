@@ -618,7 +618,8 @@ def translate_response(chat: dict, *, model: str,
                        api_key_name: Optional[str] = None,
                        channel_key: Optional[str] = None,
                        current_input_items: Optional[list] = None,
-                       output_item_transform=None) -> dict:
+                       output_item_transform=None,
+                       output_prefix: Optional[list[dict]] = None) -> dict:
     """Chat 非流式 JSON → Responses 非流式 JSON。
 
     当 `current_input_items` 非 None 且 `api_key_name` 非空时，把本次响应
@@ -629,7 +630,9 @@ def translate_response(chat: dict, *, model: str,
     msg = choice0.get("message") or {}
     finish_reason = choice0.get("finish_reason")
 
-    output_items: list[dict] = []
+    # Bridge-owned hosted items must participate in both the visible response
+    # and the one Store write, not be attached after persistence.
+    output_items: list[dict] = list(output_prefix or [])
 
     # reasoning_content（非官方字段）→ reasoning item summary；
     # 不生成 reasoning.encrypted_content：Chat 上游无法提供真正可 replay 的 EC。

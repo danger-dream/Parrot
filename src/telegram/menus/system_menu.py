@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from ...management_control.load_balancing import (
     load_balancing_control as DEFAULT_LOAD_BALANCING_CONTROL,
 )
+from ... import model_reroute
 from ...management_control.network import DEFAULT_NETWORK_CONTROL
 from ...management_control.observability.common import telegram_context
 from ...management_control.system import (
@@ -1389,6 +1390,7 @@ _NOTIF_EVENTS = [
     ("oauth_refresh_failed",  "❌ OAuth Token 刷新失败"),
     ("no_channels",           "🚨 无可用渠道告警"),
     ("openai_store_save_failed", "❌ OpenAI Store 写入失败"),
+    ("model_degraded",        "⚠️ 上游模型变更"),
     ("network_monitor",     "🌐 网络检测失败/恢复"),
 ]
 
@@ -1449,12 +1451,60 @@ def _on_notif_toggle_event(chat_id: int, message_id: int, cb_id: str, event_key:
         "quota_cooldown": "quotaCooldown", "oauth_refreshed": "oauthRefreshed",
         "oauth_refresh_failed": "oauthRefreshFailed", "no_channels": "noChannels",
         "openai_store_save_failed": "openaiStoreSaveFailed", "network_monitor": "networkMonitor",
+        "model_degraded": "modelDegraded",
     }[event_key]
     _settings_control.update_notifications(
         _control_context(chat_id), {"events": {public_key: new_val}},
     )
     ui.answer_cb(cb_id, "已开" if new_val else "已关")
     _show_notif(chat_id, message_id, "-")
+
+
+# ─── 模型降级通知：按渠道静音 ─────────────────────────────────────
+
+def _on_degrade_mute(chat_id: int, message_id: int, cb_id: str, data: str) -> None:
+    """Mute model-degraded alerts for the channel that produced this alert.
+
+    ``data`` is ``sys:mdg_mute:<days>:<code>``. The code is the channel's stable
+    short id; the same code is what ``model_reroute.muted_until`` derives from a
+    channel key, so a mute taken here suppresses exactly this channel.
+    """
+    parts = data.split(":")
+    if len(parts) != 4:
+        ui.answer_cb(cb_id, "参数错误")
+        return
+    try:
+        days = int(parts[2])
+    except ValueError:
+        ui.answer_cb(cb_id, "参数错误")
+        return
+    code = parts[3]
+    if days <= 0:
+        # 0 天保留给永久禁用；这里只处理有期限的静音。
+        ui.answer_cb(cb_id, "参数错误")
+        return
+    model_reroute.mute_channel(None, code=code, days=days)
+    ui.answer_cb(cb_id, f"已静音 {days} 天")
+    ui.edit(
+        chat_id, message_id,
+        f"🔕 已停止该渠道的上游模型变更提醒（{days} 天）",
+        reply_markup=model_reroute.build_unmute_buttons(code),
+    )
+
+
+def _on_degrade_unmute(chat_id: int, message_id: int, cb_id: str, code: str) -> None:
+    model_reroute.unmute_channel(code=code)
+    ui.answer_cb(cb_id, "已取消静音")
+    ui.edit(chat_id, message_id, "🔔 已恢复该渠道的上游模型变更提醒")
+
+
+def _on_degrade_disable(chat_id: int, message_id: int, cb_id: str) -> None:
+    """Permanent disable = turn the notification event off, per the button label."""
+    _settings_control.update_notifications(
+        _control_context(chat_id), {"events": {"modelDegraded": False}},
+    )
+    ui.answer_cb(cb_id, "已永久禁用")
+    ui.edit(chat_id, message_id, "🚫 已永久禁用上游模型变更提醒（可在 系统设置 → 通知 中重新开启）")
 
 
 # ─── 首包黑名单 ───────────────────────────────────────────────────
@@ -2306,6 +2356,14 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data == "sys:notif_toggle_main":   _on_notif_toggle_main(chat_id, message_id, cb_id); return True
     if data.startswith("sys:notif_toggle:"):
         _on_notif_toggle_event(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+
+    # 模型降级通知的静音按钮
+    if data.startswith("sys:mdg_mute:"):
+        _on_degrade_mute(chat_id, message_id, cb_id, data); return True
+    if data.startswith("sys:mdg_unmute:"):
+        _on_degrade_unmute(chat_id, message_id, cb_id, data.split(":", 2)[2]); return True
+    if data == "sys:mdg_off":
+        _on_degrade_disable(chat_id, message_id, cb_id); return True
 
     # 黑名单
     if data == "sys:show:blacklist": _show_blacklist(chat_id, message_id, cb_id); return True

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import TYPE_CHECKING
 
-from src import config
+from src import config, model_pricing
 from src.notifier import provider_label
 from src.channel import registry
 from src.management_control.channels.models import DiscoveryCommand
@@ -143,7 +143,11 @@ class UpstreamSync:
                     self._sinks[operation.id] = progress_sink
             self._active.update(keys)
             try:
-                store.submit(operation.id, lambda: self._run(operation.id, context, sources))
+                future = store.submit(operation.id, lambda: self._run(operation.id, context, sources))
+                future.add_done_callback(
+                    lambda completed: self._cancelled_before_start(operation.id, sources)
+                    if completed.cancelled() else None
+                )
             except BaseException:
                 self._active.difference_update(keys)
                 with self._sinks_lock:
@@ -151,6 +155,24 @@ class UpstreamSync:
                 raise
         self.control._audit(context, "model_center.upstream.sync", operation.id, "queued")
         return operation
+
+    def _release(self, operation_id: str, sources: tuple[_Source, ...]) -> None:
+        with self._sinks_lock:
+            self._sinks.pop(operation_id, None)
+        with self._lock:
+            self._active.difference_update(row.key for row in sources)
+
+    def _cancelled_before_start(self, operation_id: str, sources: tuple[_Source, ...]) -> None:
+        # A successfully cancelled Future never enters _run's finally block.
+        # Running cancellation must keep its reservation until that worker exits.
+        try:
+            if sources and self.control.operations.cancel_requested(operation_id):
+                self._emit(operation_id, {
+                    "phase": "cancelled", "index": 0, "total": len(sources),
+                    "sourceType": sources[0].type.value, "label": sources[0].label,
+                })
+        finally:
+            self._release(operation_id, sources)
 
     def _current(self, source: _Source) -> dict:
         if source.type is ModelSourceType.API:
@@ -210,7 +232,7 @@ class UpstreamSync:
                 added += 1
             if added:
                 entry["models"] = existing
-            counts.update(count=len(existing), addedCount=added, skippedCount=skipped)
+            counts.update(count=len(existing), addedCount=added, skippedCount=skipped, changed=bool(added))
 
         with config.serialized_updates():
             with config.observe_reload_failures() as failures:
@@ -238,7 +260,10 @@ class UpstreamSync:
             raise ManagementError(code)
         if failures:
             raise ManagementError(ManagementErrorCode.DEPENDENCY_UNAVAILABLE)
-        return {"count": int(result.get("models") or 0)}
+        return {
+            "count": int(result.get("models") or 0),
+            "changed": bool(result.get("catalog_changed") or result.get("changed")),
+        }
 
     def _emit(self, operation_id: str, event: dict) -> None:
         """把一个进度事件交给该任务的 sink；sink 是可选增强，出错不影响同步。"""
@@ -319,11 +344,24 @@ class UpstreamSync:
                 "status": "cancelled", "total": len(sources), "succeeded": 0,
                 "failed": 0, "items": items,
             }
+        if store.cancel_requested(operation_id):
+            return {"status": "cancelled", "total": len(sources), "succeeded": 0, "failed": 0, "items": items}
+        metadata = None
+        if any(row.get("changed") for row in items):
+            store.update_progress(operation_id, current=len(items), total=len(sources), message_code="model_center.upstream.sync.metadata")
+            self._emit(operation_id, {"phase": "metadata_start", "total": len(sources)})
+            metadata = await model_pricing.refresh_metadata_after_model_sync()
+            self._emit(operation_id, {"phase": "metadata_done", "total": len(sources), **metadata})
         succeeded = sum(row["status"] == "succeeded" for row in items)
         failed = len(items) - succeeded
         status = "succeeded" if not failed else "partial_failed" if succeeded or any(row["status"] == "partial_failed" for row in items) else "failed"
+        if metadata and metadata["status"] in {"failed", "partial_failed"} and status == "succeeded":
+            status = "partial_failed"
         store.update_progress(operation_id, current=len(items), total=len(sources), message_code=f"model_center.upstream.sync.{status}")
-        return {"status": status, "total": len(items), "succeeded": succeeded, "failed": failed, "items": items}
+        result = {"status": status, "total": len(items), "succeeded": succeeded, "failed": failed, "items": items}
+        if metadata is not None:
+            result["metadataSync"] = metadata
+        return result
 
     def _source_model_names(self, source: _Source) -> list[str]:
         """该来源同步后的模型名（已排序）；供进度页展示前几个。"""
@@ -358,7 +396,4 @@ class UpstreamSync:
             # 上仍显示"取消同步"。这里在任务真正落地后再通知一次，页面才切到终态。
             self._emit(operation_id, {"phase": "finished", "total": len(sources)})
         finally:
-            with self._sinks_lock:
-                self._sinks.pop(operation_id, None)
-            with self._lock:
-                self._active.difference_update(row.key for row in sources)
+            self._release(operation_id, sources)

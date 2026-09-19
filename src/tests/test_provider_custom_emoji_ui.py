@@ -242,7 +242,9 @@ def test_all_api_brand_icons_render_in_channel_list_detail_and_model_sources(mon
         assert "✅" in text.splitlines()[0]
         assert manage["text"] == "管理模型" and manage["callback_data"] == "mc:test"
 
-    oauth = SimpleNamespace(list_accounts=lambda *_args, **_kwargs: SimpleNamespace(items=()))
+    oauth = SimpleNamespace(list_accounts=lambda *_args, **_kwargs: SimpleNamespace(
+        items=(), meta=SimpleNamespace(has_next=False),
+    ))
     source_channels = SimpleNamespace(list_all=lambda *_args, **_kwargs: tuple(channels))
     monkeypatch.setattr(
         model_center_menu, "_CONTROL",

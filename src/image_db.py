@@ -207,11 +207,24 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
 def _cost_ticks_from_usage(usage: dict | None) -> int | None:
     if not isinstance(usage, dict):
         return None
-    value = usage.get("cost_in_usd_ticks")
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
+    def reported_ticks(item: dict) -> int | None:
+        value = item.get("cost_in_usd_ticks")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    total = reported_ticks(usage)
+    if total is not None:
+        return total  # A reported total must not also count its per-call details.
+    calls = usage.get("parrot_usage_by_call")
+    if not isinstance(calls, list):
         return None
+    observed = [reported_ticks(item) for item in calls if isinstance(item, dict)]
+    observed = [value for value in observed if value is not None]
+    # Only sum observed amounts. Missing calls remain unknown in raw usage_json;
+    # no observed cost is NULL, not an invented zero-cost generation.
+    return sum(observed) if observed else None
 
 
 def checkpoint() -> None:
@@ -549,8 +562,14 @@ def finish_media_call(
     last_polled_at: float | None = None,
     expires_at: float | None = None,
     output_sizes: list[str] | None = None,
+    provider: str | None = None,
 ) -> None:
-    """Update one logical task; terminal statuses set ``finished_at`` exactly once."""
+    """Update one logical task; terminal statuses set ``finished_at`` exactly once.
+
+    The SQL guard makes a video's terminal result immune to late nonterminal
+    writes, including callers that read a stale row before this lock was acquired.
+    Skip the whole stale update so progress, usage and result metadata survive.
+    """
     normalized_status = str(status or "running")
     now = time.time()
     terminal_at = now if normalized_status in _TERMINAL_MEDIA_STATUSES else None
@@ -567,6 +586,7 @@ def finish_media_call(
                  finished_at=CASE WHEN ? IS NOT NULL THEN COALESCE(finished_at, ?) ELSE finished_at END,
                  account_key=COALESCE(?, account_key),
                  account_email=COALESCE(?, account_email),
+                 provider=COALESCE(NULLIF(?, ''), provider),
                  model=COALESCE(NULLIF(?, ''), model),
                  upstream_request_id=COALESCE(NULLIF(?, ''), upstream_request_id),
                  upstream_status=COALESCE(NULLIF(?, ''), upstream_status),
@@ -591,10 +611,14 @@ def finish_media_call(
                  last_polled_at=COALESCE(?, last_polled_at),
                  expires_at=COALESCE(?, expires_at),
                  output_sizes=COALESCE(?, output_sizes)
-               WHERE id=?""",
+               WHERE id=? AND NOT (
+                   media_type='video'
+                   AND status IN ('success', 'failed', 'expired', 'cancelled')
+                   AND ? NOT IN ('success', 'failed', 'expired', 'cancelled')
+               )""",
             (
                 normalized_status, now, terminal_at, terminal_at,
-                account_key, account_email, model, upstream_request_id,
+                account_key, account_email, provider, model, upstream_request_id,
                 upstream_status, progress, duration_ms, request_duration_ms,
                 image_count, requested_count, media_duration_seconds, size,
                 aspect_ratio, resolution, usage_json,
@@ -604,6 +628,7 @@ def finish_media_call(
                 error_type, (error_message or "")[:1000] if error_message else None,
                 http_status, last_polled_at, expires_at,
                 json.dumps(output_sizes) if output_sizes is not None else None, int(log_id),
+                normalized_status,
             ),
         )
         conn.commit()

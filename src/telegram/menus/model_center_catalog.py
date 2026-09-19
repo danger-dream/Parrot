@@ -158,21 +158,24 @@ def _page_row(chat_id: int, page: int, pages: int, *, alias: bool = False) -> li
 def _display_value(metadata: Mapping[str, Any], key: str) -> Any:
     if key in metadata:
         return metadata[key]
-    # Older catalog snapshots keep prices under ``cost``.  This is display-only;
-    # the adapter never derives prices or request budgets.
-    cost = metadata.get("cost")
-    if isinstance(cost, Mapping):
-        nested = {
-            "inputPricePer1M": ("input", "inputPrice"),
-            "outputPricePer1M": ("output", "outputPrice"),
-            "cacheReadPricePer1M": ("cacheRead", "cache_read"),
-            "cacheWritePricePer1M": ("cacheWrite", "cache_write"),
-            "longContextInputPricePer1M": ("longContextInput", "long_input"),
-            "longContextOutputPricePer1M": ("longContextOutput", "long_output"),
-        }.get(key, ())
-        for candidate in nested:
-            if candidate in cost:
-                return cost[candidate]
+    # Sparse overrides/provenance use cost.* keys; effective metadata is nested.
+    # Keep older display snapshots readable without submitting their legacy keys.
+    paths = {
+        "cost.input": (("cost", "input"), ("inputPricePer1M",), ("cost", "inputPrice")),
+        "cost.output": (("cost", "output"), ("outputPricePer1M",), ("cost", "outputPrice")),
+        "cost.cacheRead": (("cost", "cache_read"), ("cacheReadPricePer1M",), ("cost", "cacheRead")),
+        "cost.cacheWrite": (("cost", "cache_write"), ("cacheWritePricePer1M",), ("cost", "cacheWrite")),
+        "cost.longContextInput": (("cost", "context_over_200k", "input"), ("longContextInputPricePer1M",), ("cost", "longContextInput"), ("cost", "long_input")),
+        "cost.longContextOutput": (("cost", "context_over_200k", "output"), ("longContextOutputPricePer1M",), ("cost", "longContextOutput"), ("cost", "long_output")),
+    }.get(key, ())
+    for path in paths:
+        value: Any = metadata
+        for part in path:
+            if not isinstance(value, Mapping) or part not in value:
+                break
+            value = value[part]
+        else:
+            return value
     return None
 
 
@@ -193,6 +196,15 @@ def _fmt_meta(value: Any, item: menu._MetaField) -> str:
     return str(value)
 
 
+def _max_context_above_normal(metadata: Mapping[str, Any], normal: Any) -> int | None:
+    try:
+        maximum = int(metadata.get("contextWindowMaxMode") or 0)
+        normal_value = int(normal or 0)
+    except (TypeError, ValueError):
+        return None
+    return maximum if maximum > normal_value > 0 else None
+
+
 def _metadata_lines(
     metadata: Mapping[str, Any],
     *,
@@ -209,6 +221,15 @@ def _metadata_lines(
         grouped[item.group].append(
             f"{item.label}：<code>{ui.escape_html(menu._fmt_meta(value, item))}</code>"
         )
+        if item.key == "contextWindow":
+            # Cursor's Max Context tier is what a request is budgeted against
+            # when the account default is on; without it a compact trigger above
+            # the normal window reads as a contradiction.
+            maximum = _max_context_above_normal(metadata, value)
+            if maximum is not None:
+                grouped[item.group].append(
+                    f"Max Context 上下文：<code>{ui.escape_html(menu._fmt_meta(maximum, item))}</code>"
+                )
     titles = {
         "capacity": "📐 <b>容量</b>",
         "capability": "🧩 <b>能力</b>",
@@ -334,8 +355,8 @@ def _selected_count(chat_id: int, ctx=None) -> int:
     if s.selection_filters is None:
         return 0
     ctx = ctx or menu._ctx(chat_id)
-    page = menu._CONTROL.list_models(ctx, filters=s.selection_filters, page=1, page_size=1)
-    return max(0, page.total - len(set(s.excluded)))
+    # Exclusions may outlive a query/status match; count only current members.
+    return len(menu._selected_views(chat_id, ctx))
 
 
 def _selected_views(chat_id: int, ctx) -> list[ModelView]:
@@ -363,13 +384,29 @@ def _selected_views(chat_id: int, ctx) -> list[ModelView]:
     return result
 
 
-def _selection_dto(s: menu._Session) -> ModelSelection:
+def _selection_dto(s: menu._Session, ctx=None) -> ModelSelection:
     if s.selection_mode is ModelSelectionMode.FILTER:
         return ModelSelection(
             mode=ModelSelectionMode.FILTER,
             filters=s.selection_filters,
             excluded_model_ids=tuple(s.excluded),
         )
+    if len(s.selected) > 10_000:
+        # A cross-query selection can exceed the control's explicit-ID limit.
+        # Freeze the exact complement in the same kind/source; the write's
+        # catalog revision prevents newly arriving models joining this set.
+        filters = ModelFilters(kinds=menu._filters(s).kinds, source=s.source)
+        selected = set(s.selected)
+        excluded = []
+        page_no = 1
+        while True:
+            page = menu._CONTROL.list_models(ctx, filters=filters, page=page_no, page_size=200)
+            excluded.extend(item.model_id for item in page.items if item.model_id not in selected)
+            if not page.has_next:
+                break
+            page_no += 1
+        return ModelSelection(mode=ModelSelectionMode.FILTER, filters=filters,
+                              excluded_model_ids=tuple(excluded))
     return ModelSelection(mode=ModelSelectionMode.IDS, model_ids=tuple(s.selected))
 
 
@@ -404,7 +441,7 @@ def _batch_button(
     callback = menu._freeze(
         chat_id,
         "set_state",
-        selection=menu._selection_dto(s),
+        selection=menu._selection_dto(s, ctx),
         scope=(source if field is ModelStateField.ENABLED else None),
         target=ModelStateTarget(field=field, value=target),
         revision=revision,
@@ -419,6 +456,15 @@ def _model_list_render(chat_id: int) -> tuple[str, dict]:
     if s.tab == "video": return menu._video_settings_render(chat_id)
     ctx = menu._ctx(chat_id)
     filters = menu._filters(s)
+    if s.selection_mode is ModelSelectionMode.FILTER and s.selection_filters != filters:
+        # Keep cross-query/status selections, just as explicit selections are kept.
+        # A filter selection cannot describe additional picks outside its old filter.
+        selected = menu._selected_views(chat_id, ctx)
+        s.selected = [view.model_id for view in selected]
+        s.selected_resources = {view.model_id: view.resource_key for view in selected}
+        s.selection_mode = ModelSelectionMode.IDS
+        s.selection_filters = None
+        s.excluded.clear()
     page = menu._CONTROL.list_models(ctx, filters=filters, page=s.page, page_size=menu._PAGE_SIZE)
     pages = max(1, math.ceil(page.total / menu._PAGE_SIZE))
     if s.page > pages:
@@ -736,8 +782,15 @@ def _source_options(chat_id: int) -> list[menu._SourceOption]:
         from src import image_catalog
         image_labels = {source.key[6:]: source.label for source in image_catalog.sources()
                         if source.key.startswith('oauth:')}
-    oauth_page = menu._CONTROL.oauth.list_accounts(ctx, page=PageSpec(page=1, page_size=200))
-    for account in oauth_page.items:
+    accounts = []
+    account_page = 1
+    while True:
+        oauth_page = menu._CONTROL.oauth.list_accounts(ctx, page=PageSpec(page=account_page, page_size=200))
+        accounts.extend(oauth_page.items)
+        if not oauth_page.meta.has_next:
+            break
+        account_page += 1
+    for account in accounts:
         provider = menu._enum_value(account.provider)
         provider_label = ui.provider_label(provider)
         display_name = str(getattr(account, "display_name", "") or "").strip()
@@ -772,7 +825,7 @@ def _find_source_option(chat_id: int, source: ModelSourceRef) -> menu._SourceOpt
     )
 
 
-def _source_picker_render(chat_id: int) -> tuple[str, dict]:
+def _source_picker_render(chat_id: int, source_page: int = 1) -> tuple[str, dict]:
     s = menu._session(chat_id)
     lines = [
         "🔎 <b>选择模型来源</b>", "",
@@ -791,9 +844,13 @@ def _source_picker_render(chat_id: int) -> tuple[str, dict]:
             image_sources.update((row.type, row.id) for view in page.items for row in view.sources)
             if not page.has_next: break
             page_no += 1
-    for option in menu._source_options(chat_id):
-        if image_sources is not None and (option.ref.type, option.ref.id) not in image_sources:
-            continue
+    options = [option for option in menu._source_options(chat_id)
+               if image_sources is None or (option.ref.type, option.ref.id) in image_sources]
+    page_size = 20
+    pages = max(1, math.ceil(len(options) / page_size))
+    source_page = min(max(1, source_page), pages)
+    start = (source_page - 1) * page_size
+    for option in options[start:start + page_size]:
         selected = menu._source_equal(s.source, option.ref)
         rows.append([ui.provider_button(
             ("✓ " if selected else "") + option.label,
@@ -803,6 +860,14 @@ def _source_picker_render(chat_id: int) -> tuple[str, dict]:
             ),
             option.provider,
         )])
+    if pages > 1:
+        def page_callback(number):
+            return menu._freeze(chat_id, "source_page", page=number, expected_tab=s.tab)
+        rows.append([
+            ui.btn("◀ 上一页", page_callback(source_page - 1) if source_page > 1 else "mc:noop"),
+            ui.btn(f"{source_page}/{pages}", "mc:noop"),
+            ui.btn("下一页 ▶", page_callback(source_page + 1) if source_page < pages else "mc:noop"),
+        ])
     rows.append([ui.btn("取消", "mc:list")])
     return menu._paged(chat_id, "\n".join(lines), inline_kb(rows))
 

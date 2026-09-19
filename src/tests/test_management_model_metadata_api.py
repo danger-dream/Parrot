@@ -57,6 +57,49 @@ def test_metadata_openapi_is_typed_and_has_examples(domain_client):
             assert success["content"]["application/json"]["example"]
 
 
+def test_override_patch_unset_and_set_use_final_inherited_limits(domain_client, monkeypatch):
+    client, _runtime, admin, *_ = domain_client
+    config.update(lambda cfg: cfg.update({
+        "modelBindings": {"defaults": {"atomic-demo": {
+            "target": "fixture/atomic-demo", "source": "auto",
+            "autoSnapshot": {"catalogRevision": "fixture", "metadata": {
+                "contextWindow": 1000, "maxInputTokens": 1000,
+            }, "tariff": None},
+        }}, "scoped": {}},
+        "modelMetadataOverrides": {"defaults": {"atomic-demo": {
+            "fields": {"contextWindow": 100},
+        }}, "scoped": {}},
+    }))
+    path = "/api/management/v1/model-metadata/atomic-demo"
+    current = client.get(path, headers=admin).json()["data"]
+    writes = []
+    write_atomic = config._write_atomic
+
+    def write(candidate):
+        writes.append(copy.deepcopy(candidate))
+        return write_atomic(candidate)
+
+    monkeypatch.setattr(config, "_write_atomic", write)
+    response = client.patch(
+        path + "/overrides", headers={**admin, "If-Match": current["revision"]},
+        json={"scope": "global", "set": {"maxInputTokens": 500}, "unset": ["contextWindow"]},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["data"]
+    assert updated["effective"]["contextWindow"] == 1000
+    assert updated["effective"]["maxInputTokens"] == 500
+    assert updated["commonOverride"] == {"maxInputTokens": 500}
+    assert len(writes) == 1
+    invalid = client.patch(
+        path + "/overrides", headers={**admin, "If-Match": updated["revision"]},
+        json={"scope": "global", "set": {"maxInputTokens": 1001}},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "VALIDATION_FAILED"
+    assert len(writes) == 1
+    assert client.get(path, headers=admin).json()["data"] == updated
+
+
 def test_catalog_filter_sort_page_and_binding_crud(domain_client):
     client, _runtime, admin, *_ = domain_client
     catalog = client.get(

@@ -16,7 +16,7 @@
       * 老版本缺 chatgpt_account_id 时继续不带该 header 请求
   - supports_model / list_client_models 覆盖账户 models 与默认 codex 列表
 
-所有 OAuth 网络调用被 mockMode 兜住（DISABLE_OAUTH_NETWORK_CALLS=1）。
+所有 OAuth 网络调用由 mockMode 兜住；pytest 的环境门禁在每个测试结束后恢复。
 """
 
 from __future__ import annotations
@@ -42,6 +42,11 @@ import pytest
 from src.tests._config_isolation import isolated_config
 
 
+@pytest.fixture(autouse=True)
+def _disable_oauth_network_for_test(monkeypatch):
+    monkeypatch.setenv("DISABLE_OAUTH_NETWORK_CALLS", "1")
+
+
 def _valid_encrypted_content(seed: int = 1) -> str:
     payload = bytearray(1 + 8 + 16 + 16 + 32)
     payload[0] = 0x80
@@ -54,7 +59,6 @@ def _import_modules():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root not in sys.path:
         sys.path.insert(0, root)
-    os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = "1"
     from src import config, oauth_manager, state_db
     from src.channel import registry
     from src.channel.oauth_channel import OAuthChannel

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from src import config, model_state, network, oauth_manager, state_db
+from src import config, model_pricing, model_state, network, oauth_manager, state_db
 from src.channel import registry
 from src.management_control.errors import ManagementError, ManagementErrorCode
 from src.management_control.models import ModelCenterControl, ModelSourceRef, ModelSourceType
@@ -61,6 +61,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(network, "async_client", async_client)
     monkeypatch.setattr(network, "get_sync", get_sync)
     monkeypatch.setattr(oauth_manager, "ensure_valid_token", valid_token)
+    async def metadata():
+        return {"status": "succeeded", "catalog": "updated"}
+    monkeypatch.setattr(model_pricing, "refresh_metadata_after_model_sync", metadata)
     store = OperationStore(max_workers=1)
     control = ModelCenterControl(operations=store)
     context = control.current_context()
@@ -524,9 +527,9 @@ def test_progress_sink_receives_start_and_done_per_source(env):
         progress_sink=lambda op_id, event: events.append(dict(event)),
     )
     _wait(env, operation)
-    # start → done → finished；finished 是任务落地后的重绘信号，页面上不占一行。
+    # 来源完成后统一同步元数据；finished 仍是整个任务落地后的重绘信号。
     phases = [e["phase"] for e in events]
-    assert phases == ["start", "done", "finished"], phases
+    assert phases == ["start", "done", "metadata_start", "metadata_done", "finished"], phases
     done = next(e for e in events if e["phase"] == "done")
     assert done["label"] == "alpha"
     assert done["status"] == "succeeded"
@@ -548,6 +551,72 @@ def test_progress_sink_failure_never_breaks_the_sync(env):
     assert result.result["succeeded"] == 1
 
 
+def test_queued_cancel_releases_sources_and_sink_before_worker_runs(env):
+    _install([_api(), _api("beta")])
+    entered, release = Event(), Event()
+    blocker = env.store.create(env.context, kind="test.block", cancellable=False)
+
+    def block():
+        env.store.mark_running(blocker.id)
+        entered.set()
+        assert release.wait(5)
+        env.store.succeed(blocker.id)
+
+    env.store.submit(blocker.id, block)
+    assert entered.wait(2)
+    events = []
+    try:
+        # Repeat while the only worker remains occupied: cancellation must not
+        # rely on the abandoned body eventually entering its finally block.
+        for _ in range(2):
+            operation = env.control.start_upstream_sync(
+                env.context, progress_sink=lambda oid, event: events.append((
+                    event["phase"], env.store.get(env.context, oid).status,
+                )),
+            )
+            assert env.store.get(env.context, operation.id).status is OperationStatus.QUEUED
+            future = env.store._futures[operation.id]
+            env.store.cancel(env.context, operation.id)
+            assert future.cancelled()
+            assert not env.control._upstream_sync._active
+            assert operation.id not in env.control._upstream_sync._sinks
+        assert events == [("cancelled", OperationStatus.CANCELLED)] * 2
+        assert env.requests == []
+        env.responses.update({
+            "api-secret-alpha": _payload("new-alpha"),
+            "api-secret-beta": _payload("new-beta"),
+        })
+        retry = _start(env)
+        assert len(env.control._upstream_sync._active) == 2
+    finally:
+        release.set()
+    _wait(env, blocker)
+    assert _wait(env, retry).result["status"] == "succeeded"
+    assert env.requests == ["api-secret-alpha", "api-secret-beta"]
+
+
+def test_shutdown_releases_sources_of_never_started_sync(env):
+    _install([_api()])
+    entered, release = Event(), Event()
+    blocker = env.store.create(env.context, kind="test.block", cancellable=False)
+
+    def block():
+        entered.set()
+        assert release.wait(5)
+
+    env.store.submit(blocker.id, block)
+    assert entered.wait(2)
+    try:
+        operation = env.control.start_upstream_sync(env.context, progress_sink=lambda *args: None)
+        env.store.close(timeout_seconds=0)
+        assert env.store.get(env.context, operation.id).status is OperationStatus.FAILED
+        assert not env.control._upstream_sync._active
+        assert operation.id not in env.control._upstream_sync._sinks
+        assert env.requests == []
+    finally:
+        release.set()
+
+
 def test_cancel_stops_after_the_current_source(env):
     """取消是协作式的：当前项跑完，后续项不再发起。"""
     _install(apis=[_api("alpha"), _api("beta")])
@@ -566,6 +635,10 @@ def test_cancel_stops_after_the_current_source(env):
     assert entered.wait(2)
     try:
         env.store.cancel(env.context, operation.id)
+        assert env.control._upstream_sync._active
+        with pytest.raises(ManagementError) as error:
+            _start(env, _api_ref())
+        assert error.value.code is ManagementErrorCode.OPERATION_ALREADY_RUNNING
     finally:
         release.set()
     # 取消会立刻把状态置为 terminal，但 worker 的 finally 还在收尾；

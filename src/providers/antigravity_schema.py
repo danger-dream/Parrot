@@ -8,6 +8,10 @@ This subset prevents production 400s from Claude VALIDATED mode and proto-JSON:
 - drop enums on tool schemas (Antigravity does not enforce them)
 - Claude VALIDATED empty objects get a required placeholder
 
+These are legacy protobuf-Schema compatibility rules, not a general JSON
+Schema normalizer. Gemini's parametersJsonSchema / responseJsonSchema preserve
+JSON Schema directly and must not pass through this lossy cleaner.
+
 Only call this on a schema document, never on a whole request. Running it over
 functionCall arguments rewrites ordinary data keys such as ``title``.
 """
@@ -68,6 +72,11 @@ _KEEP = {
     "allOf",
     "title",
 }
+
+
+def uses_json_schema(model: str) -> bool:
+    """Gemini Cloud Code accepts full JSON Schema in its dedicated fields."""
+    return str(model or "").strip().lower().startswith("gemini-")
 
 
 def uses_antigravity_schema(model: str) -> bool:

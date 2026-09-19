@@ -16,7 +16,7 @@ ROOT = Path(__file__).parent / 'fixtures/tg_contract'
 # switch, MCP tool picker and six new callback families), so every reviewed
 # TG-AK case is stored as a full overlay row rather than the archived stub.
 COUNTS = {'channels_apikey': 24, 'main_status': 11, 'oauth': 53,
-          'auxiliary': 18, 'model_routing': 6, 'system': 8, 'core': 22}
+          'auxiliary': 18, 'model_routing': 6, 'system': 9, 'core': 22}
 
 
 def test_current_overlay_case_coverage_is_bidirectional_and_unique():
@@ -34,7 +34,7 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         loaded = current.load_current_jsonl(archived_path)
         assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived]
         assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived]
-    assert len(seen) == 142  # reviewed overlays, including the MCP UI additions
+    assert len(seen) == 143  # includes MCP UI and the current notification trace
 
 
 @pytest.mark.parametrize('mutation', ['duplicate', 'unknown', 'capability'])

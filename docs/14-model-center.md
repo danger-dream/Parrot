@@ -6,7 +6,7 @@
 
 - 对话模型以真实客户端 `modelId` 聚合来源；`outboundModel` 是当前来源实际发给上游的名称，不是独立全局别名。
 - 来源使用已有公开 OAuth accountId / API channelId。内部 `api:<name>` 等持久化键不作为客户端提交的身份。
-- 图片/视频按 `provider + type + owner + modelId` 消歧。AG 全局与账户专属即使同名也是不同资源；专属范围只读。
+- 图片/视频按模型类别及实际来源消歧；全局 provider 名单、API 渠道模型和 OAuth 账户专属名单分别保留其归属。Antigravity 图片支持已退役。
 - `resourceKey` 是服务器生成的 opaque 键。客户端应使用查询返回值，不解析、拼接或按名字猜测。
 - 全局禁用阻止所有来源；来源禁用只影响该来源。恢复全局启用不清除来源/账户原有禁用。API 渠道模型禁用不删除路由。
 - 隐藏只影响下游发现，别名随目标隐藏；合法的真实名/别名显式调用仍受原 Key、协议、账户和来源权限约束。隐藏不等于禁用。
@@ -16,6 +16,8 @@
 
 - 不再有独立「模型设置」页。对话列表直接提供「同步元数据」「同步上游模型」；压缩指定在对话模型详情里即时设置，当前压缩模型详情可清除指定。
 - 元数据同步刷新公共目录并匹配元数据，保留人工匹配和手工字段；不等同于上游可用模型目录同步。
+- OAuth 自动模型同步覆盖 Claude、OpenAI、Grok、Antigravity、Cursor 和 WorkBuddy：后台每 60 秒检查到期，距成功同步 6 小时再拉取，失败后 15 分钟重试；缺少模型目录或原生元数据时提前补齐。普通 API 渠道仍由手动同步触发。
+- 自动批次与模型中心手动批次中，只要成功保存了模型增删或原生模型元数据变化，就在全部来源处理结束后统一拉取一次 models.dev 公共目录并重新匹配；不会按账号重复拉取。仅刷新时间或顺序变化、无变化/304、全部失败或批次取消不触发。部分来源失败但其他来源有更新仍触发。该自动后续步骤遵守 `pricing.enabled/autoUpdate`，原 24 小时周期刷新保留；下载失败沿用本地目录匹配，匹配失败不撤销已保存的模型目录。手动任务报告单独显示元数据结果。
 - 上游同步不带来源筛选时覆盖所有当前 API 渠道和 OAuth 账户（含空目录账户），选定来源时仅同步该来源。查询、状态筛选和多选不缩小同步范围。操作后台执行，任务页分别展示成功、部分失败、失败及逐来源结果。
 - API 同步仅把实时发现的新模型追加到目录，不覆盖手工 alias→real、既有顺序、停用状态或元数据；空结果、错误、仅静态目录不覆盖原配置。OAuth 沿用账户正式同步，失败继续用最后成功目录。OAuth 备用模型入口、管理 API、配置和运行时回落均退役，首次没有目录需成功同步后才能参与普通对话路由；媒体模型配置不受影响。
 - 对话列表显示当前保留日志范围的累计用量、请求成功率/失败数及 TPS。输入含普通输入、缓存写入和缓存读取；缓存占比为读取量 / 总输入。TPS 沿用实际输出与有效耗时加权算法，不对来源均速再做算术平均；没有测量不显示虚假零值。
@@ -170,47 +172,43 @@ Content-Type: application/json
 
 - 压缩触发阈值与最终输入容量分开：超过触发阈值不等于已超过硬容量，也不能通过提高阈值绕过已知容量限制。
 - 每次对话 HTTP / Responses WebSocket 上游尝试在构造最终 JSON payload 后、发送前，按实际来源与出站模型重新解析有效输入/输出限制。模型列表中的某个来源值不能代替另一个候选的预算。
-- 输入限制取 `maxInputTokens` 与 `contextWindow - 显式协议安全预留` 中可用的较小值，输出独立检查本次 requested maximum 是否超过候选 `maxOutputTokens`；不把最大输出视为已占用输入空间。目录明确提供的 `limit.input` 投影为 `maxInputTokens`；使用项目 Token 计数器检查最终 payload，Responses 包含真实 `instructions`，嵌套帧按内层请求计数。Cursor normal / Max Context 各自与人工 context 上限求交，合法输出/能力收紧不被 native 值覆盖；显式输入上限和压缩阈值不随 Max Context 偷增。最大输出等于 context 不代表输入容量为零；人工收紧 context 也不派生更小的输出上限。明确的 maxInput（包括等于 normal context 的目录/原生值）仍是独立上限，只有缺失时才按所选 normal/Max Context 窗口回退。普通请求未明确指定输出上限时仍由上游执行其默认输出规则；未知元数据不虚构 1M 容量或统一 80% 规则，也不等同于证明上游一定接受。
-- 压缩关闭时仍检查最终容量；开启时沿用既有压缩识别与处理流程，直接压缩、分段和 reduce 的每个实际请求也要通过当前候选检查。内部压缩的输出上限可按候选收紧；不暗中截短普通客户端明确要求的输出上限。
-- 例如 xAI 候选 context/maxOutput 均500k，约17k输入与 `max_output_tokens=500000` 可以通过本地预算并原值发包；Cursor候选maxOutput=64k则仍拒绝500k输出，继续尝试合适的下一来源，不静默截为64k。压缩触发阈值不因客户端请求更大输出而预扣、提前触发；既有阈值配置和客户端输出参数不变。
-- 超出当前候选已知输入预算或最大输出时，在 transport 前产生 `400 invalid_request_error` 的候选拒绝，不把超限 payload 发给该上游。故障切换到更小窗口时重新检查，不能沿用前一来源的通过结果；也不承诺把任何长度的请求都强行压缩成功。
+- 输入和输出独立处理：输入预算取 `maxInputTokens` 与 `contextWindow - 显式协议安全预留` 中可用的较小值，不预扣客户端最大输出。目录明确提供的 `limit.input` 投影为 `maxInputTokens`；最大输出等于 context 不代表输入为零，人工收紧 context 也不派生更小输出上限。Cursor normal / Max Context 分别与人工 context 上限求交；显式输入上限和压缩阈值不随 Max Context 偷增。
+- 普通请求显式指定的输出上限超过当前候选 `maxOutputTokens` 时，在最终发送前按该候选钳制，并保持 thinking 等关联协议字段的合法性；故障切换重新按新候选计算，不改写原始客户端请求供其他候选复用。没有显式输出字段时保留上游默认规则，未知元数据不虚构容量。
+- 例如 xAI 候选 context/maxOutput 都为 500k，约 17k 输入和 `max_output_tokens=500000` 不会因预扣输出而被判输入超限；换到 maxOutput=64k 的 Cursor 候选时，输出按 64k 钳制，不仅因客户端声明 500k 而直接拒绝。
+- 通用 failover 最终传输路径不以本地 Token 估算作输入硬拒绝；不同供应商分词不同，估算用于既有压缩/分段逻辑而非保证上游一定接受。**保留的入口例外：** Messages 在只有一个非 Anthropic 候选时仍执行本地输入预检，估计超过该候选有效输入预算可返回 400；HTTP Responses 和多候选不走此例外。
+- 压缩阈值与客户端输出上限分开，沿用既有压缩识别、直接压缩、分段和 reduce 流程，各实际请求的输出按当前候选限制处理；不承诺任何长度的输入均可成功压缩或被上游接受。
 - 生效规则包含稀疏手工覆盖、来源自动快照与原生硬限制。恢复继承影响下一次解析；真实 dispatch 的来源、出站模型、费率与目录信息按尝试冻结，后续改价不会追溯修改已冻结结算。
 
-## 媒体模型与共享缓存
+## 媒体模型与独立缓存
 
-### 单项与整组操作
+### 设置与模型操作
 
-下列路径同样使用 `/api/management/v1` 前缀。读取需要 READ，添加/改名/整组设置需要 WRITE，单项删除需要 DESTRUCTIVE；新写操作必须带对应媒体设置读取时的 `If-Match`。
+下列路径使用 `/api/management/v1` 前缀。读取需要 READ，修改需要 WRITE，单项删除需要 DESTRUCTIVE；写操作携带相应设置读取时的 `If-Match`。
 
 | 用途 | 路径 / 请求 |
 |---|---|
-| Grok 图片/视频及运行参数 | `GET/PATCH /xai/media-settings`；PATCH 稀疏提交 `imageModels/videoModels/jobTtlSeconds/requestTimeoutSeconds` |
+| 图片设置 | `GET/PATCH /images/settings`；字段为 `enabled/defaultModel/models/requestTimeoutSeconds/cacheEnabled/cachePath/cacheRetentionDays/cacheMaxBytes` |
+| 视频设置 | `GET/PATCH /videos/settings`；同类字段，另有 `jobTtlSeconds` |
+| 查询媒体来源 | `GET /media/{image\|video}/sources` |
+| 修改来源用途 | `PATCH /media/{image\|video}/sources/{sourceId}`；按对应来源 revision 修改用途开关 |
+| Grok 兼容设置 | `GET/PATCH /xai/media-settings`；`imageModels/videoModels/jobTtlSeconds/requestTimeoutSeconds` |
 | Grok 添加单项 | `POST /xai/media-models/{image\|video}`，`{"modelId":"new-model"}` |
 | Grok 改名单项 | `PATCH /xai/media-models/{image\|video}/{旧modelId}`，`{"newModelId":"new-model"}` |
 | Grok 删除单项 | `DELETE /xai/media-models/{image\|video}/{modelId}` |
-| AG 全局列表及账户专属只读列表 | `GET /antigravity/media-settings`；返回 `imageModels/accountOverrides/revision` |
-| AG 整组替换 | `PATCH /antigravity/media-settings`，`{"imageModels":["model-a","model-b"]}`；`[]` 明确清空全局组 |
-| AG 添加单项 | `POST /antigravity/media-models/image`，`{"owner":{"type":"global"},"modelId":"new-model"}` |
-| AG 改名单项 | `PATCH /antigravity/media-models/image/{旧modelId}`，`{"owner":{"type":"global"},"newModelId":"new-model"}` |
-| AG 删除单项 | `DELETE /antigravity/media-models/image/{modelId}?ownerType=global` |
 
-单项写返回 `data.{provider,kind,owner,modelId,models,status,revision}`，不把删除成功误读为 204 无响应。新名称占用返回 409；未知对象返回 404；旧 revision 返回 409 且不写。单项操作在同一配置事务中定位目标、保留兄弟模型及顺序，不要求客户端取整表覆盖。
+`models` 按 provider 分组，实际持久化到 `image_models` 或 `video_models`。API 渠道媒体模型和 OAuth 账户专属名单也参与可路由目录；全局名单操作不重写账户专属范围。`defaultModel` 为空表示没有指定默认，供 MCP 等自动选择入口按可用目录处理，不用于补齐标准 HTTP 请求的 `model`。
 
-Grok 每组最多 50 项、每名最多 128 字符；整组去重保序。`jobTtlSeconds` 和 `requestTimeoutSeconds` 都是 1–2,147,483,647 的整数秒；TG 的 `d` 单位仅适用于任务关联时长，不适用于请求超时。清空某组不改变另一组；未配置的 `grok-imagine-*` 保留既有拒绝规则，不回落到 GPT 图片管线。
+单项写返回 `data.{provider,kind,owner,modelId,models,status,revision}`；名称占用返回 409，未知对象返回 404，旧 revision 返回 409 且不写。单项操作保持兄弟模型及顺序，整组替换则是显式整体操作。Grok 每组最多 50 项、每名最多 128 字符；时间字段为 1–2,147,483,647 的整数秒。TG 任务 TTL 支持 `d`，请求超时不支持 `d`。
 
-AG 全局组最多 80 项、每名最多 80 字符，整组去重保序。AG 整组 PATCH 必须明确提供 `imageModels`；缺字段或 null 返回 422 且不写，只有显式 `[]` 才表示清空。
+GPT 主模型/`image_generation` 工具模型内部管线以及 Antigravity 图片支持已退役；不再提供 AG 图片管理/生成能力。旧 TG 消息仅落到当前图片或视频面板，不恢复模型名称编辑操作。现行 TG 面板维护用途、默认模型、缓存和运行参数；模型名称由配置或 Management API 管理。
 
-AG 的 `accountOverrides[]` 含 `accountId/imageModels/editable=false`，只表示显式配置的账户专属范围。单项 owner 为 `oauth` 时须提供对应公开账户 ID，但有效专属范围写入返回 422 / `READ_ONLY_SCOPE`，不能借同名写到全局。全局改名、删除或清空均不修改账户专属字段。媒体管理不改变 `/v1/models` 的既有发现规则。
+### 缓存与交付
 
-### 公共图片设置和 AG 生成缓存
+图片和视频各自使用 `images.*` / `videos.*` 缓存策略。旧视频配置缺失时只读继承旧共享值；修改图片缓存前固定视频的原有效值，避免跨用途串改。缓存默认关闭，保留天数 0 表示永久，空间上限 0 表示不设该类媒体聚合上限，单文件保护仍保留。
 
-`GET/PATCH /images/settings` 复用现有公共配置：`enabled/cacheEnabled/mainModel/toolModel/cachePath/cacheRetentionDays/cacheMaxBytes`。`enabled` 是 GPT/Grok/AG 图片总开关；GPT 的主模型、工具模型和参与账号仍保持单一管线，参与账号排除不影响普通对话。
+可选历史缓存不能破坏必需的 URL 交付。`b64_json` 返回实际图片数据，`url` 返回实际可下载的临时资源，不使用磁盘路径或虚构链接；日志区分上游生成、实际交付数量和缓存状态。历史缓存失败不抹掉已生成结果；无法交付 URL 或整批不足时应返回相应错误并保留可交付的部分结果，不能把整批失败说成全部成功。
 
-共享缓存使用 `images.cacheEnabled/cachePath/cacheRetentionDays/cacheMaxBytes`，覆盖原 GPT/Grok 媒体及新增 AG 图片生成；AG 不新增独立缓存目录或另一套保留设置。缓存默认关闭；保留天数 0 表示永久，空间上限 0 表示不设聚合上限，但仍保留单文件保护限制。AG 缓存保存已生成的图片，不增加 AG 编辑支持，也不改变 Grok 视频任务查询/内容读取及账号关联。
-
-AG 请求 `b64_json` 时仍返回图片 base64；请求 `url` 时仍返回带真实 MIME 的 data URL，不替换成服务器磁盘路径或虚构公开下载 URL。启停缓存不改变生成响应格式。存储失败时，已成功的图片仍返回 HTTP 200，媒体生成日志状态仍为成功，缓存状态另记 `failed` 和错误类别；不能将“生成成功”当作“缓存已保存”。
-
-缓存以安全后缀及随机文件名原子落盘，文件名不嵌入账户身份。清理按同一保留天数/空间限制处理支持的媒体文件；管理下载继续鉴权，并限制在当前缓存根内，拒绝文件 symlink 或根外路径。更换缓存根后，旧根文件不会因此自动搬移或成为新根可下载对象。
+缓存使用安全后缀、随机名和原子落盘，文件名不嵌入账户身份。管理下载仍鉴权，限制在当前缓存根内并拒绝 symlink/根外路径；对外临时资源按其能力 token 和有效期读取。更换目录不自动搬移旧文件；图片/视频临时资源分别按自身类型回收。
 
 ## 请求必须明确指定 model
 
@@ -218,7 +216,7 @@ HTTP 推理及图片/视频创建请求不再使用 `ingressDefaultModel`、压�
 
 这一变更涵盖 Messages、Chat Completions、Responses HTTP/WS、新 Realtime/Live 会话及 call 创建、标准/私有图片创建、视频生成/编辑/扩展。客户端必须在 JSON、表单或对应会话创建事件中按接口显式给出合法模型。
 
-以下不新增本来不存在的必填项：`GET /v1/models`、operation/video 任务及内容查询、已有 call 绑定的 sideband。GPT 内部主模型/工具模型配置仍保留，它们是图片管线，不是客户端缺 model 的兜底。
+以下不新增本来不存在的必填项：`GET /v1/models`、operation/video 任务及内容查询、已有 call 绑定的 sideband。MCP 的自动模型选择是独立工具契约，不改变这些 HTTP 必填规则；已退役的 GPT 内部主模型/工具模型管线也不作为兜底。
 
 旧 `/ingress-default-models/{ingress}` 的读/删用于兼容检查与清理；旧默认不再供运行时使用，写入明确报不支持，不静默保存无效默认，也不自动迁为压缩模型。依赖旧缺省行为的客户端需调整后再升级。
 

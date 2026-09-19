@@ -57,7 +57,7 @@ OAuth 备用模型已退役；旧 `/oauth_defaults`、`odm:*` 按钮与输入状
 
 - 容量：`contextWindow`、`maxInputTokens`、`maxOutputTokens`、`compactTriggerTokens`；
 - 能力：`vision`、`toolCall`、`structuredOutput`、`reasoningEfforts`、`serviceTiers`、`knowledgeCutoff`；
-- 价格：`inputPricePer1M`、`outputPricePer1M`、`cacheReadPricePer1M`、`cacheWritePricePer1M`、`longContextInputPricePer1M`、`longContextOutputPricePer1M`，单位为美元 / 百万 Token。
+- 价格：输入、输出、缓存读取、缓存写入、长上下文输入、长上下文输出，单位为美元 / 百万 Token；对应覆盖字段为 `cost.input`、`cost.output`、`cost.cacheRead`、`cost.cacheWrite`、`cost.longContextInput`、`cost.longContextOutput`。
 
 可同步单项或所选集合的元数据：按钮渲染时即冻结实际模型 / 来源 targets、mapping 控制域 revision 和返回上下文，点击旧按钮不改用当前选择或新 revision；版本冲突要求刷新。也可执行全量元数据同步；来源筛选页另有「同步上游」用于刷新该来源的模型目录。全量元数据同步刷新公共目录并重新匹配，但保留人工匹配、字段手工值和来源单独匹配。长任务通过 operation 页面查询状态。
 
@@ -67,12 +67,12 @@ OAuth 备用模型已退役；旧 `/oauth_defaults`、`odm:*` 按钮与输入状
 
 1. **压缩模型**：从对话模型目录选择，显示目录匹配和 `compactTriggerTokens`；只用于内部上下文压缩，不替代下游请求必填的 `model`。
 2. **同步元数据**：进入公共目录全量同步。
-3. **图片设置**：共享图片接口开关、共享媒体缓存、目录、保留天数和空间上限；下钻 GPT 图片管线、Grok 图片模型、Antigravity 图片模型。
-4. **视频设置**：Grok 视频模型、任务账号关联时长和媒体请求超时。
+3. **图片设置**：图片接口与缓存开关、默认模型、缓存目录、保留天数、空间上限、请求超时，以及各来源的图片用途开关；显示模型可用来源和生成统计。
+4. **视频设置**：独立的视频接口、默认模型、缓存策略、来源用途、请求超时与任务 TTL。
 
-GPT 图片页把主模型、`image_generation` 工具模型和账号参与开关分开，账号参与只影响 GPT 图片。Grok 图片与视频是两个独立列表：单项新增 / 改名 / 移除和「替换整组」是不同操作，单项操作不重写兄弟项；xAI 每组最多 50 项、每项 128 字符。任务关联时长支持 `s/m/h/d`，请求超时只支持 `s/m/h`。Antigravity 全局图片列表可编辑（最多 80 项、每项 80 字符），OAuth 账户专属图片模型只读，修改全局列表不会覆盖账户专属项。
+图片和视频面板直接使用 production lifecycle 的同一 `controls.models`，与 Management API 共享配置和 revision。TG 不再提供媒体模型名称新增、改名、删除或整组替换；模型名单通过配置或管理 API 维护。旧消息入口仅重定向到当前面板，不重放旧写入。GPT 内部主模型/工具模型管线与 Antigravity 图片支持已退役。
 
-媒体 TG 页面已接入 production lifecycle 的同一 `controls.models`：真实 TG 单项新增后 Management API 可立即查询，API 单项 / 运行参数修改后 TG 可直接读到，TG「批量编辑」则按整组替换；新建第二套完整 control graph 后仍能读到最终 xAI / Antigravity 设置。该贯通使用真实 controls 与临时隔离持久化，不以 fixture 或 TG→HTTP 自调用代替；逐项命令与结果见本轮 implementation record。
+图片和视频设置互相独立；对话用途停用不自动授权媒体用途，独立启用也不能绕过身份、凭据或配额异常。默认模型选择仅供支持自动选择的入口（如 MCP）使用，不替代标准 HTTP 图片/视频创建接口必填的 `model`。旧页面的设置按钮使用其渲染时 revision，避免覆盖后来的管理操作。任务 TTL 支持 `s/m/h/d`，请求超时只支持 `s/m/h`。
 
 ## 9.2 管理 OAuth
 
@@ -509,6 +509,10 @@ Tokens:
 ### 9.6.1 请求日志
 
 保持原有普通 API 请求流水：分页展示模型、渠道、Token、缓存、连接/首字/总耗时和错误摘要。点 `📄 #N` 进入详情后可查看完整重试链、代理轮次、请求 body 与响应；长内容继续按现有检查器分页或导出。
+
+OpenAI OAuth 的模型观察使用「上游模型变更」，只表示上游报告模型与实际出站模型不同，不据此断言能力降级或账号风控。无冲突时保留模型响应头优先、正文 `model` 兜底；响应头与正文或前后模型信号冲突时，显示「模型信息不一致」，详情列出 HTTP 模型头、事件模型头和正文模型，不写入一个确定的实际模型。普通 API 渠道仍只展示原有「与调用模型不一致」，不发送这类提醒。
+
+通知沿用原 `model_degraded` 开关和按渠道静音；同账号、同模型变化组合 2 小时内只提醒一次，同组冲突也独立节流。开关关闭、渠道静音、队列满均不占用新窗口，成功入队后才计时；入队不等于 Telegram 已送达。旧日志的新增冲突字段为空，不回写历史推断。
 
 ### 9.6.2 多媒体日志
 
