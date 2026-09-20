@@ -176,17 +176,20 @@ def _ensure_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
 
     # 历史行按原有语义解释为 OpenAI/GPT 图片；不删除、不复制旧记录。
+    # 视频的 duration_ms 是异步任务总耗时，不是创建请求耗时；未知值保持 NULL。
     conn.execute(
         """UPDATE image_call_logs SET
              provider=COALESCE(NULLIF(provider, ''), 'openai'),
              media_type=COALESCE(NULLIF(media_type, ''), 'image'),
              model=COALESCE(NULLIF(model, ''), NULLIF(tool_model, ''), main_model),
              requested_count=COALESCE(NULLIF(requested_count, 0), 1),
-             request_duration_ms=COALESCE(request_duration_ms, duration_ms),
+             request_duration_ms=CASE WHEN media_type='video' THEN request_duration_ms
+                                      ELSE COALESCE(request_duration_ms, duration_ms) END,
              updated_at=COALESCE(updated_at, finished_at, created_at)
            WHERE provider IS NULL OR provider='' OR media_type IS NULL OR media_type=''
               OR model IS NULL OR model='' OR requested_count IS NULL OR requested_count=0
-              OR (request_duration_ms IS NULL AND duration_ms IS NOT NULL)
+              OR (COALESCE(media_type, 'image')!='video'
+                  AND request_duration_ms IS NULL AND duration_ms IS NOT NULL)
               OR updated_at IS NULL"""
     )
     conn.execute(

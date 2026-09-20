@@ -348,7 +348,7 @@ class TestComposeUpInner:
         assert "com.docker.compose.service" in script
         assert script.index("\nresolve_service\n") < script.index("# ③ SIGTERM")
         # 重建/回滚都使用解析后的 service，而不是把可能过期的配置值写死进 compose up
-        assert 'docker compose up -d --force-recreate "$SVC"' in script
+        assert 'docker compose up -d --force-recreate --pull never "$SVC"' in script
         # 健康门控
         assert "wait_health" in script or "/health" in script
         # 失败回滚函数
@@ -376,7 +376,7 @@ class TestComposeUpInner:
         assert result.returncode == 0, result.stdout + result.stderr
         term_index = commands.index("kill --signal=TERM parrot")
         rm_index = commands.index("rm parrot")
-        up_index = commands.index("compose up -d --force-recreate parrot")
+        up_index = commands.index("compose up -d --force-recreate --pull never parrot")
         assert term_index < rm_index < up_index
         assert all("rm -f" not in command for command in commands)
         assert state == "true"

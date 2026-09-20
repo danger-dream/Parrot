@@ -656,14 +656,23 @@ def stream(body, protocol, invoke, *, request_id=None, api_key_name=None):
         task = asyncio.create_task(produce())
         try:
             while True:
+                # wait_for can swallow external cancellation on Python 3.11
+                # when its inner get has just completed. Own the get task
+                # explicitly so a WS cancel always reaches producer cleanup.
+                get_task = asyncio.create_task(queue.get())
                 try:
-                    chunk = await asyncio.wait_for(queue.get(), 5)
-                except asyncio.TimeoutError:
+                    done, _ = await asyncio.wait({get_task}, timeout=5)
+                finally:
+                    if not get_task.done():
+                        get_task.cancel()
+                    await asyncio.gather(get_task, return_exceptions=True)
+                if not done:
                     if task.done():
                         await task  # do not turn an encoder failure into endless heartbeats
                         break
                     yield b": parrot managed search\n\n"
                     continue
+                chunk = get_task.result()
                 if chunk is None:
                     break
                 yield chunk

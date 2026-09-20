@@ -315,6 +315,7 @@ def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
     prev_commit：更新前的 commit（来自备份 meta），用于稳健地判断 requirements.txt
     是否变化（替代脆弱的 HEAD@{1} reflog 依赖）。
     """
+    rollback_commit = prev_commit.strip() if prev_commit else _src_current_commit()
     rc, out = _git(["fetch", "--all", "--tags", "--prune"], timeout=180)
     if rc != 0:
         return False, f"git fetch failed: {out[:300]}"
@@ -337,12 +338,20 @@ def _src_pull(target_tag: str, prev_commit: str = "") -> tuple[bool, str]:
         rc, diff = _git(["diff", "--name-only", "HEAD@{1}", "HEAD"], timeout=30)
         need_install = (rc != 0) or ("requirements.txt" in (diff or ""))
     if need_install:
-        pip = os.path.join(_app_dir(), "venv", "bin", "pip")
-        if os.path.exists(pip):
-            rc3, out3 = _run([pip, "install", "-r",
-                              os.path.join(_app_dir(), "requirements.txt")], timeout=600)
-            if rc3 != 0:
-                return False, f"pip install failed: {out3[-300:]}"
+        # Install into the interpreter actually running the service, including
+        # .venv/custom venv/system installs. Never silently skip missing pip,
+        # escalate privileges, or bypass externally-managed-environment guards.
+        rc3, out3 = _run([sys.executable, "-m", "pip", "install", "-r",
+                          os.path.join(_app_dir(), "requirements.txt")], timeout=600)
+        if rc3 == 0:
+            rc3, out3 = _run([sys.executable, "-m", "pip", "check"], timeout=60)
+        if rc3 != 0:
+            restored = False
+            if rollback_commit:
+                rc4, _ = _git(["reset", "--hard", rollback_commit], timeout=120)
+                restored = rc4 == 0
+            return False, (f"dependency install/check failed: {out3[-300:]}; "
+                           f"source restored={restored}; dependencies may require manual repair")
     return True, f"checked out {target_tag}"
 
 
@@ -729,22 +738,25 @@ resolve_service() {{
 
 fail_rollback() {{
   logln "❌ 更新失败，开始回滚到备份版本"
-  echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
-  if [ -n "$BACKUP_DIGEST" ]; then
-    docker tag "$BACKUP_DIGEST" "$IMAGE" 2>/dev/null && logln "已把镜像 tag 指回备份 digest" || logln "⚠️ 回滚 tag 失败"
-  else
-    logln "⚠️ 无备份 digest，无法回滚镜像"
+  # Do not publish ROLLBACK until the old image is restored AND healthy.
+  if [ -z "$BACKUP_DIGEST" ] || ! docker tag "$BACKUP_DIGEST" "$IMAGE" 2>/dev/null; then
+    logln "❌ 无可用备份 digest 或回滚 tag 失败；需人工介入"
+    echo "ROLLBACK_FAILED" > "$FLAG_DIR/.update_result" 2>/dev/null || true
+    exit 1
   fi
+  logln "已把镜像 tag 指回备份 digest"
   if ! graceful_remove; then
     logln "❌ 无法安全移除失败容器，停止回滚以保护数据库"
     echo "ROLLBACK_FAILED" > "$FLAG_DIR/.update_result" 2>/dev/null || true
     exit 1
   fi
-  RB_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
+  RB_OUT="$(docker compose up -d --force-recreate --pull never "$SVC" 2>&1)"
+  RB_RC=$?
   echo "$RB_OUT" | tail -10 >> "$LOG" 2>/dev/null || true
   logln "回滚重建完成，验证健康…"
-  if wait_health; then
+  if [ $RB_RC -eq 0 ] && wait_health; then
     logln "✅ 回滚成功，旧版本已恢复并健康"
+    echo "ROLLBACK" > "$FLAG_DIR/.update_result" 2>/dev/null || true
   else
     logln "❌ 回滚后健康检查仍未通过（需人工介入）"
     echo "ROLLBACK_FAILED" > "$FLAG_DIR/.update_result" 2>/dev/null || true
@@ -774,7 +786,7 @@ if ! graceful_remove; then
   exit 1
 fi
 logln "启动新容器…"
-UP_OUT="$(docker compose up -d --force-recreate "$SVC" 2>&1)"
+UP_OUT="$(docker compose up -d --force-recreate --pull never "$SVC" 2>&1)"
 UP_RC=$?
 echo "$UP_OUT" | tail -20 >> "$LOG" 2>/dev/null || true
 if [ $UP_RC -ne 0 ]; then logln "❌ compose up 失败（rc=$UP_RC）"; fail_rollback; fi
@@ -815,9 +827,12 @@ def _docker_backup(target_tag: str) -> tuple[bool, str, str]:
     backup_label = f"{__version__}-{ts}"
     backup_tag = f"{backup_repo}:{backup_label}"
     if _has_local_docker():
-        _run(["docker", "tag", digest, backup_tag], timeout=30)
+        rc, _ = _run(["docker", "tag", digest, backup_tag], timeout=30)
+        tagged = rc == 0
     else:
-        _engine_tag_image(digest, backup_repo, backup_label)
+        tagged = _engine_tag_image(digest, backup_repo, backup_label)
+    if not tagged:
+        return False, "", f"backup tag failed: {backup_tag}"
     meta = {"ref": ref, "image": image, "digest": digest,
             "backup_tag": backup_tag, "version": __version__,
             "target_tag": target_tag, "mode": "docker", "ts": ts}
@@ -1074,7 +1089,7 @@ def confirm_restart() -> tuple[bool, str]:
 
 
 def cancel_staged() -> tuple[bool, str]:
-    """staged 态取消：源码 checkout 回原 commit；docker 无需动镜像（未 recreate）。
+    """staged 态取消：源码 checkout 回原 commit；docker 恢复本地 compose 镜像 tag。
 
     用 _op_lock 防止与 confirm_restart 竞争（避免「同时取消又确认」）。
     """
@@ -1089,9 +1104,23 @@ def cancel_staged() -> tuple[bool, str]:
         if mode in (MODE_SYSTEMD, MODE_BARE):
             ok, detail = _src_rollback(backup_ref)
         else:
-            ok, detail = True, "docker 未重建，丢弃已拉取镜像即可"
-        reset_state()
-        _emit(STAGE_IDLE, f"↩️ 已取消更新：{detail}")
+            # _docker_pull already moved the compose tag. Restore it without
+            # recreating the still-running old container, or a later ordinary
+            # compose up would silently activate a cancelled update.
+            try:
+                with open(os.path.join(_backup_root(), backup_ref + ".json"), encoding="utf-8") as f:
+                    meta = json.load(f)
+                digest = meta.get("digest") or ""
+                if not digest:
+                    raise ValueError("backup digest missing")
+                ok, detail = _tag_image_for_compose(digest, meta.get("image") or _cfg()["image"])
+            except Exception as exc:
+                ok, detail = False, f"cannot restore compose image tag: {exc}"
+        if ok:
+            reset_state()
+            _emit(STAGE_IDLE, f"↩️ 已取消更新：{detail}")
+        else:
+            save_state(stage=STAGE_STAGED, message=f"取消回滚失败: {detail}")
         return ok, detail
     finally:
         _op_lock.release()
@@ -1275,13 +1304,16 @@ def resume_after_restart() -> None:
             else:
                 rb_ok, rb_detail = _src_rollback(backup_ref)
                 if rb_ok:
-                    _src_restart()
+                    rb_ok, restart_detail = _src_restart()
+                    rb_detail += f"; {restart_detail}"
             append_update_log(f"回滚结果：{rb_detail}")
-            save_state(stage=STAGE_ROLLED_BACK,
-                       message=f"健康检查失败已回滚: {rb_detail}")
-            rb_msg = (f"❌ <b>更新失败，已自动回滚</b>\n健康检查未通过：{detail}\n"
+            final_stage = STAGE_ROLLED_BACK if rb_ok else STAGE_FAILED
+            outcome = "已回滚源码/已触发容器回滚" if rb_ok else "回滚失败，需人工介入"
+            save_state(stage=final_stage,
+                       message=f"健康检查失败，{outcome}: {rb_detail}")
+            rb_msg = (f"❌ <b>更新失败，{outcome}</b>\n健康检查未通过：{detail}\n"
                       f"回滚结果：{rb_detail}\n请检查日志后重试。")
-            _emit(STAGE_ROLLED_BACK, rb_msg)
+            _emit(final_stage, rb_msg)
             _notify_cross_process(rb_msg, st.get("chat_id"), st.get("notify_msg_id"),
                                   reply_markup=_faillog_buttons())
 

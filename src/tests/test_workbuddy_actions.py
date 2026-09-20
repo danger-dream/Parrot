@@ -23,7 +23,8 @@ def action_env(account, monkeypatch, tmp_path):
     state = {"store": StateStore(str(tmp_path / "runtime.json"), str(tmp_path / "durable.json")), "calls": 0, "checked": False}
     state["store"].start()
     state["notifications"] = []
-    monkeypatch.setattr(actions.notifier, "notify_event", lambda event, text, **k: state["notifications"].append((event, text)))
+    # The notifier now returns whether enqueue succeeded; this fake accepts it.
+    monkeypatch.setattr(actions.notifier, "notify_event", lambda event, text, **k: state["notifications"].append((event, text)) or True)
     monkeypatch.setattr(actions, "_cleanup_after", 0.0)
     actions._auto_attempts.clear()
     monkeypatch.setattr(state_db, "get_store", lambda: state["store"])

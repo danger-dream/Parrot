@@ -57,17 +57,17 @@ async def test_text_arrives_before_each_upstream_terminal(protocol, search_round
             obj = with_text(obj, protocol, "我查一下")
         async def source():
             try:
-                count = 0
                 for event, data in events(obj, protocol):
-                    if data and text_delta(data, protocol):
-                        count += 1
+                    delta = text_delta(data, protocol) if data else ""
+                    if delta:
+                        gates[number].clear()
                     yield encode(event, data)
-                    if count == 2:
-                        # The provider cannot finish until two actual text
-                        # deltas have reached the client. Buffering deadlocks.
+                    if delta:
+                        # Acknowledge EVERY text delta, not just the second:
+                        # one queued tail delta may otherwise outlive upstream
+                        # release without violating incremental delivery.
+                        # Buffering the round still deadlocks this handshake.
                         await asyncio.wait_for(gates[number].wait(), 1)
-                        count += 1
-                    await asyncio.sleep(0)
                 marks.append((number, "upstream-ended", time.monotonic()))
             finally:
                 released.append(number)
@@ -78,9 +78,8 @@ async def test_text_arrives_before_each_upstream_terminal(protocol, search_round
             number = len(invoked) - 1
             seen.append((number, delta))
             marks.append((number, "downstream-text", time.monotonic()))
-            if len([x for x in seen if x[0] == number]) >= 2:
-                assert number not in released
-                gates[number].set()
+            assert number not in released
+            gates[number].set()
     raw, frames = await asyncio.wait_for(collect(policy.stream(body, protocol, invoke), receive), 4)
     assert len(invoked) == search_rounds + 1 and len(searches) == search_rounds
     assert "".join(x[1] for x in seen) == "我查一下" * search_rounds + "Found Python docs"

@@ -65,7 +65,7 @@ def settings() -> dict:
     current = cfg.get("search") or {}
     result = copy.deepcopy(DEFAULTS)
     if isinstance(legacy, dict):
-        for key in ("maxResults", "maxFetchChars", "maxToolRounds", "minQueryChars",
+        for key in ("timeoutSeconds", "maxResults", "maxFetchChars", "maxToolRounds", "minQueryChars",
                     "maxFetchUrlChars", "requireKnownUrlForFetch", "maxConcurrentToolCalls"):
             if key in legacy:
                 result[key] = copy.deepcopy(legacy[key])

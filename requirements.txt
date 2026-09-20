@@ -43,4 +43,7 @@ python-socks>=2.0
 # 顶层包，不会替换或升级本项目的 httpx/httpcore（src/proxy/connector.py 直接继承
 # httpcore.AsyncNetworkStream），因此不触及 SS2022 出站网络后端。v1 线会拉动
 # starlette 大版本并引入 httpx-sse，属于对本项目运行时的额外风险。
+# MCP v2 requires Python >=3.10 (including source/systemd installations).
 mcp==2.2.0
+# Imported directly by src/mcp/server.py; keep in lockstep with the MCP SDK.
+mcp-types==2.2.0

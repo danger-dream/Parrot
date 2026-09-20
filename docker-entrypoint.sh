@@ -44,7 +44,9 @@ if [ "$(id -u)" = "0" ]; then
     # gosu 才会带上这个组。没挂 sock（普通部署）则完全跳过，无副作用。
     if [ -S "$DOCKER_SOCK" ]; then
         SOCK_GID="$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo '')"
-        if [ -n "$SOCK_GID" ] && [ "$SOCK_GID" != "0" ]; then
+        # A root-group socket (gid 0) is common too; gosu otherwise drops the
+        # supplemental group and self-update fails with PermissionError.
+        if [ -n "$SOCK_GID" ]; then
             # 找一个已有该 gid 的组名；没有就建一个 dockerhost 组
             GRP_NAME="$(getent group "$SOCK_GID" 2>/dev/null | cut -d: -f1)"
             if [ -z "$GRP_NAME" ]; then

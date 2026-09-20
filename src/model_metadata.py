@@ -1362,7 +1362,10 @@ def sync_auto_snapshots(
         current = _binding_fields(current_raw)
         current_source = current[1] if current else ""
         source_ref = scope
-        if current_source in {"manual", "management-api"}:
+        # Released files also accept string bindings and objects without source;
+        # _binding_fields identifies those operator-owned choices as "config".
+        # Only auto/legacy-owned entries may be replaced by automatic matching.
+        if current and current_source not in {"auto", "legacy"}:
             results.append({
                 "modelId": model, "source": source_ref, "status": "protected",
                 "catalogSource": None, "catalogRevision": None,

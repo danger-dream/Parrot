@@ -1002,6 +1002,10 @@ def _load_from_disk() -> dict:
         from .media_config import IMAGE_DEFAULT_MODELS, VIDEO_DEFAULT_MODELS
         initial['image_models'] = copy.deepcopy(IMAGE_DEFAULT_MODELS)
         initial['video_models'] = copy.deepcopy(VIDEO_DEFAULT_MODELS)
+        # A new installation uses the new search deadline. Existing files must
+        # keep inheriting their persisted AnySearch deadline until explicitly set.
+        from .search_service import DEFAULTS as SEARCH_DEFAULTS
+        initial['search']['timeoutSeconds'] = SEARCH_DEFAULTS['timeoutSeconds']
         _normalize_management_config(initial, {})
         _normalize_openai_oauth_config(initial)
         _write_atomic(initial)

@@ -97,6 +97,15 @@ graceful_remove_container() {
     ok "旧容器已优雅停止并移除"
 }
 
+# Only the target container may satisfy deployment health. A host listener on
+# an old/default port (or a healthy unrelated compose service) is not evidence.
+container_healthy() {
+    local name="$1"
+    [[ -n "$name" ]] || return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == "true" ]] || return 1
+    docker exec "$name" curl -fsS --max-time 5 http://127.0.0.1:22122/health >/dev/null 2>&1
+}
+
 # ─── 项目信息 ──────────────────────────────────────────────────
 print_banner() {
     cat <<'EOF'
@@ -203,6 +212,12 @@ collect_config() {
 write_files() {
     section "[5/6] 写入 docker-compose.yml + 初始化数据"
     mkdir -p "$INSTALL_DIR/data/logs"
+    # Upgrade means image-only: do not replace custom ports, bind addresses,
+    # volumes, service names, environment, or socket opt-in policy.
+    if [[ "$MODE" == "upgrade" && -f "$INSTALL_DIR/docker-compose.yml" ]]; then
+        info "升级模式：保留原 docker-compose.yml / data/config.json"
+        return 0
+    fi
 
     # 计算 docker.sock 的 gid，写进 compose 的 group_add（降权后的 app 用户才能访问 sock）
     SOCK_GROUP_ADD=""
@@ -302,12 +317,7 @@ start_and_verify() {
     info "等待容器健康（最多 60s）..."
     local ok_count=0
     for _ in $(seq 1 30); do
-        if docker compose ps --format json 2>/dev/null | grep -q '"Health":"healthy"'; then
-            ok_count=$((ok_count + 1))
-            break
-        fi
-        # 兼容旧版没有 healthy 字段：退化为 /health 直接 curl
-        if curl -fsS "http://127.0.0.1:${PORT:-22122}/health" >/dev/null 2>&1; then
+        if container_healthy "$_cname"; then
             ok_count=$((ok_count + 1))
             break
         fi
@@ -325,7 +335,7 @@ start_and_verify() {
 
     # /health
     local health
-    health=$(curl -fsS "http://127.0.0.1:${PORT:-22122}/health" 2>/dev/null || echo "")
+    health=$(docker exec "$_cname" curl -fsS --max-time 5 http://127.0.0.1:22122/health 2>/dev/null || echo "")
     if [[ -n "$health" ]]; then
         ok "/health 响应: $health"
     else
@@ -346,7 +356,7 @@ ${C_GREEN}${C_BOLD}╔═══════════════════�
 ╚════════════════════════════════════╝${C_RESET}
 
   安装目录: ${INSTALL_DIR}
-  端口    : ${PORT:-22122}
+  端口    : ${PORT:-见 docker-compose.yml}
   数据    : ${INSTALL_DIR}/data
   容器名  : parrot
 
@@ -431,9 +441,11 @@ def _fix_ports_block(m):
     head = m.group(1)          # "\n<indent>ports:\n"
     body = m.group(2)          # 映射行们
     # 把每条 "host:container" 的容器侧改成 22122
-    fixed = _re.sub(r'("?)(\d+)(:)(\d+)("?)',
-                    lambda x: f"{x.group(1)}{x.group(2)}{x.group(3)}22122{x.group(5)}",
-                    body)
+    # Only replace the FINAL port: preserve an optional IPv4/IPv6 host bind,
+    # host port, quotes and protocol. The old regex rewrote 127.0.0.1:H:C as
+    # 127.0.0.1:22122:C, exposing the wrong host port and breaking listen.port.
+    fixed = _re.sub(r""":\d+((?:/(?:tcp|udp))?["']?[ \t]*(?:#.*)?)$""",
+                    lambda x: f":22122{x.group(1)}", body, flags=_re.MULTILINE)
     return head + fixed
 # 仅匹配 ports: 紧跟的列表块（- 开头的连续行）
 new_s2 = _re.sub(r'(\n[ \t]*ports:\n)((?:[ \t]+-[ \t]*.*\n)+)', _fix_ports_block, s, count=1)
@@ -469,8 +481,9 @@ PYEDIT
         local detected_cname detected_svc detected_cport
         detected_cname="$(grep -oP 'container_name:\s*\K\S+' "$compose" 2>/dev/null | head -1)"
         detected_svc="$(grep -oP '^\s{2}\K[a-zA-Z0-9_-]+(?=:\s*$)' "$compose" 2>/dev/null | head -1)"
-        # 探测 compose 端口映射的"容器侧"端口（"宿主:容器" 的右值），用于对齐 listen.port
-        detected_cport="$(awk '/ports:/{f=1;next} f&&/[0-9]+:[0-9]+/{gsub(/[^0-9:]/,"");split($0,a,":");print a[2];exit}' "$compose" 2>/dev/null)"
+        # The image and the migrated short-form mapping both use 22122.
+        # Splitting on ':' would mistake host-bound IPv4/IPv6 for a port.
+        detected_cport="22122"
         python3 - "$cfg" "$INSTALL_DIR" "${detected_cname:-parrot}" "${detected_svc:-parrot}" "${detected_cport:-22122}" <<'PYEDIT'
 import sys, json
 import os
@@ -531,20 +544,17 @@ PYEDIT
         graceful_remove_container "$_cname" || return 1
     fi
     docker compose up -d || { err "容器启动失败"; return 1; }
-    # 宿主映射端口（compose ports 的左值）
-    local _hport
-    _hport="$(awk '/ports:/{f=1;next} f&&/[0-9]+:[0-9]+/{gsub(/[^0-9:]/,"");split($0,a,":");print a[1];exit}' "$compose" 2>/dev/null)"
     info "等待健康（最多 60s）..."
     local okc=0
     for _ in $(seq 1 30); do
-        if [[ -n "$_hport" ]] && curl -fsS "http://127.0.0.1:${_hport}/health" >/dev/null 2>&1; then okc=1; break; fi
-        if docker compose ps --format json 2>/dev/null | grep -q '"Health":"healthy"'; then okc=1; break; fi
+        if container_healthy "$_cname"; then okc=1; break; fi
         sleep 2
     done
     if [[ $okc -gt 0 ]]; then
         ok "容器已健康，自更新迁移完成 ✅"
     else
-        warn "60s 内未确认健康，手动 docker compose logs -f 看看"
+        err "60s 内未确认目标容器健康；迁移未成功，请检查 docker compose logs"
+        return 1
     fi
 
     cat <<EOF

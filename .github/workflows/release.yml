@@ -1,7 +1,7 @@
 name: Create GitHub Release
 
-# 触发：push 一个 vX.Y.Z 标签时，自动创建对应的 Release。
-# 也支持手动 dispatch 一次性补建（输入 tag 名）。
+# 自动发布仅由 docker-publish 在 quality 和镜像推送成功后调用。
+# 保留手动 dispatch 一次性补建（输入 tag 名），不再独立响应 tag push。
 #
 # 设计：
 # - Release body 优先使用 tag 自带的 annotation；若 tag 是 lightweight 则用
@@ -11,9 +11,12 @@ name: Create GitHub Release
 # - 幂等：若同名 Release 已存在则跳过；不会覆盖手动创建的 Release。
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "已完成镜像发布的 tag"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -30,12 +33,9 @@ jobs:
     steps:
       - name: Resolve tag name
         id: tag
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="${GITHUB_REF#refs/tags/}"
-          fi
           if [[ -z "$TAG" ]]; then
             echo "❌ 解析 tag 失败" >&2
             exit 1
