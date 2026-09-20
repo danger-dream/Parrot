@@ -35,6 +35,29 @@ MEDIA_TOOL_REQUIREMENTS: dict[str, str] = {
 # 让模型看到过期的来源列表。enum 与工具说明取自同一份 live_options，
 # 两者不会出现"说明里有、enum 里没有"的不一致。
 AUTO = "auto"
+# Preferred public name. If a pre-existing real backend already owns it, the
+# virtual source moves to an ID outside the legal backend-ID alphabet instead of
+# stealing that configuration on upgrade.
+X_SEARCH_SOURCE = "x-twitter"
+X_SEARCH_SOURCE_COMPAT = "x:twitter"
+
+
+def x_search_source_id(rows: list[dict[str, Any]] | None = None) -> str:
+    """Return the non-conflicting live ID for the virtual native X source."""
+    if rows is None:
+        from .. import search_service
+        rows = search_service.backend_statuses()
+    occupied = {str(row.get("id") or "") for row in rows}
+    if X_SEARCH_SOURCE not in occupied:
+        return X_SEARCH_SOURCE
+    candidate = X_SEARCH_SOURCE_COMPAT
+    while candidate in occupied:
+        candidate += ":native"
+    return candidate
+
+
+def is_x_search_source_id(value: str, rows: list[dict[str, Any]] | None = None) -> bool:
+    return bool(value) and value == x_search_source_id(rows)
 
 _SOURCE_KIND_LABELS: dict[str, str] = {
     "search": "搜索引擎",
@@ -70,10 +93,19 @@ def source_property(tool_name: str, key_name: str | None = None) -> dict[str, An
     """
     kind = source_kind(tool_name)
     options = live_options(tool_name, key_name)[0]
-    prop: dict[str, Any] = {
-        "type": "string",
-        "description": f"指定{_SOURCE_KIND_LABELS[kind]}；省略或 auto = 按 Parrot 当前配置自动选择。",
-    }
+    description = f"指定{_SOURCE_KIND_LABELS[kind]}；省略或 auto = 按 Parrot 当前配置自动选择。"
+    if tool_name == "web_search":
+        x_source = x_search_source_id()
+        description += (
+            f" source={x_source} 使用 Grok 原生 X Search 搜索 X（Twitter）的帖子、用户和线程；"
+            "真实 xAI backend source 仍使用 Grok Web Search 搜索普通网页。"
+        )
+        if x_source != X_SEARCH_SOURCE:
+            description += (
+                f" 由于 {X_SEARCH_SOURCE} 已被既有真实搜索后端占用，原生 X Search 使用"
+                f"兼容 ID {x_source}，不会抢占原后端。"
+            )
+    prop: dict[str, Any] = {"type": "string", "description": description}
     prop["enum"] = [AUTO, *options]
     return prop
 
@@ -114,8 +146,11 @@ class ToolSpec:
 SPECS: dict[str, ToolSpec] = {
     "web_search": ToolSpec(
         name="web_search",
-        description="搜索互联网，返回标题、URL 和摘要。可用 source 指定搜索引擎，"
-                    "freshness 限定时间范围，allowed_domains/blocked_domains 限定或排除站点。",
+        description=(
+            "搜索互联网或 X（Twitter），返回标题、URL 和摘要。可用 source 指定搜索来源；"
+            "原生 X Search 来源见 source 参数的实时枚举，支持账号和日期过滤，但不支持"
+            " allowed_domains/blocked_domains。其他 source 执行普通网页搜索。"
+        ),
         kind="search",
     ),
     "web_fetch": ToolSpec(
@@ -152,7 +187,7 @@ SPECS: dict[str, ToolSpec] = {
 
 
 def _search_sources(tool_name: str = "web_search") -> tuple[list[str], str]:
-    """当前可用的搜索引擎 id 列表与补充说明。未配置任何来源时返回空列表。"""
+    """当前可用的搜索来源 id 列表与补充说明。"""
     from .. import search_service
 
     rows = search_service.backend_statuses()
@@ -162,9 +197,23 @@ def _search_sources(tool_name: str = "web_search") -> tuple[list[str], str]:
     usable = [row for row in rows if row.get("available")]
     ids = [str(row["id"]) for row in usable]
     disabled = [str(row["id"]) for row in rows if not row.get("available")]
+    if tool_name == "web_search":
+        x_source = x_search_source_id(rows)
+        xai_rows = [row for row in rows if row.get("type") == "xai"]
+        if any(row.get("available") for row in xai_rows):
+            # The virtual source is backed by every eligible xAI backend/account.
+            # A real backend always keeps its ID and ordinary Web Search semantics.
+            insertion = max((idx + 1 for idx, row in enumerate(usable)
+                             if row.get("type") == "xai"), default=len(ids))
+            ids.insert(insertion, x_source)
+        elif x_source not in disabled:
+            disabled.append(x_source)
     detail = ""
     if disabled:
-        detail = f"已配置但当前不可用：{', '.join(disabled)}。"
+        detail = f"当前不可用：{', '.join(disabled)}。"
+        x_source = x_search_source_id(rows)
+        if x_source in disabled:
+            detail += f" {x_source} 需要至少一个已接入、启用且状态可用的 xAI OAuth 搜索账户。"
     return ids, detail
 
 

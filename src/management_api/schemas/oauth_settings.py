@@ -18,6 +18,7 @@ class QuotaMonitorData(StrictSchema):
 class OAuthSettingsData(StrictSchema):
     quotaMonitor: QuotaMonitorData
     cchMode: CchMode
+    antigravityTlsFingerprintEnabled: bool
     revision: str
 
 
@@ -30,6 +31,7 @@ class UpdateQuotaMonitorRequest(StrictSchema):
 class UpdateOAuthSettingsRequest(StrictSchema):
     quotaMonitor: UpdateQuotaMonitorRequest | None = None
     cchMode: CchMode | None = None
+    antigravityTlsFingerprintEnabled: bool | None = None
 
 
 class TelegramOAuthPreferencesData(StrictSchema):

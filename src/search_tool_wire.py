@@ -9,7 +9,9 @@ import copy
 import hashlib
 import json
 
-RESERVED = frozenset({"web_search", "WebSearch", "web_fetch", "WebFetch", "tool_search"})
+RESERVED = frozenset({
+    "web_search", "WebSearch", "web_fetch", "WebFetch", "x_search", "XSearch", "tool_search",
+})
 
 
 def _names(value, result):

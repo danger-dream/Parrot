@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import config
+from ..search_xai import is_x_search_call_item
 
 
 # Kept in sync with src.openai.transform.guard. Duplicating the small sets here
@@ -31,7 +32,7 @@ _RESPONSES_NON_CHAT_TOOL_CHOICE_TYPES = frozenset({
 })
 _RESPONSES_NATIVE_PASSTHROUGH_TOOL_TYPES = frozenset({"tool_search", "namespace"})
 _RESPONSES_BUILTIN_INPUT_ITEM_TYPES = frozenset({
-    "web_search_call", "file_search_call", "computer_call",
+    "web_search_call", "x_search_call", "file_search_call", "computer_call",
     "image_generation_call", "code_interpreter_call", "mcp_call",
     "mcp_list_tools", "mcp_approval_request", "mcp_approval_response",
     "local_shell_call", "local_shell_call_output",
@@ -126,6 +127,7 @@ class RequestFeatures:
     hosted_tool_labels: tuple[str, ...] = ()
     has_stateful_input_items: bool = False
     stateful_input_item_label: str | None = None
+    stateful_input_item_labels: tuple[str, ...] = ()
     raw: dict[str, Any] | None = None
 
 
@@ -190,6 +192,8 @@ def _responses_native_input_labels(body: dict[str, Any]) -> tuple[str, ...]:
             if typ == "tool_search_output":
                 for label in _responses_tool_labels_from_tool_list(item.get("tools")):
                     _append_unique(labels, label)
+        if is_x_search_call_item(item):
+            _append_unique(labels, "x_search")
         if typ in ("function_call", "custom_tool_call") and item.get("namespace"):
             _append_unique(labels, "namespace")
     return tuple(labels)
@@ -303,23 +307,26 @@ def _responses_item_reference_unresolved_label(body: dict[str, Any]) -> str | No
     return None
 
 
-def _responses_stateful_input_item_label(body: dict[str, Any]) -> str | None:
+def _responses_stateful_input_item_labels(body: dict[str, Any]) -> tuple[str, ...]:
+    """Collect every native Responses state requirement, preserving input order."""
+    labels: list[str] = []
     if body.get("conversation"):
-        return "conversation"
+        _append_unique(labels, "conversation")
     unresolved_item_reference = _responses_item_reference_unresolved_label(body)
     if unresolved_item_reference:
-        return unresolved_item_reference
-    items = _responses_input_like_items(body)
-    search_history = False
-    for item in items:
+        _append_unique(labels, unresolved_item_reference)
+    for item in _responses_input_like_items(body):
         if not isinstance(item, dict):
             continue
         typ = item.get("type")
-        if typ == "web_search_call":
-            search_history = True
+        if is_x_search_call_item(item):
+            # xAI OAuth currently exposes native X operations as completed
+            # custom_tool_call items. Model them as the public x_search_call state
+            # so cross-family routes cannot reinterpret them as client tools.
+            _append_unique(labels, "x_search_call")
         elif typ in _RESPONSES_BUILTIN_INPUT_ITEM_TYPES:
-            return str(typ)
-    return "web_search_call" if search_history else None
+            _append_unique(labels, str(typ))
+    return tuple(labels)
 
 
 def _responses_custom_tool_label(body: dict[str, Any]) -> str | None:
@@ -337,6 +344,8 @@ def _responses_custom_tool_label(body: dict[str, Any]) -> str | None:
             continue
         typ = item.get("type")
         if typ == "custom_tool_call":
+            if is_x_search_call_item(item):
+                continue
             if _responses_custom_tool_call_input_object(item.get("input")) is None:
                 return "custom_tool_call.input"
         if typ == "custom_tool_call_output":
@@ -797,10 +806,12 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
     has_custom_tools = False
     has_encrypted_reasoning = False
     stateful_input_item_label: str | None = None
+    stateful_input_item_labels: tuple[str, ...] = ()
     has_stateful_input_items = False
     if ingress_protocol == "responses":
-        stateful_input_item_label = _responses_stateful_input_item_label(body)
-        has_stateful_input_items = stateful_input_item_label is not None
+        stateful_input_item_labels = _responses_stateful_input_item_labels(body)
+        stateful_input_item_label = stateful_input_item_labels[0] if stateful_input_item_labels else None
+        has_stateful_input_items = bool(stateful_input_item_labels)
         custom_tool_label = _responses_custom_tool_label(body)
         has_custom_tools = custom_tool_label is not None
         has_encrypted_reasoning = _responses_has_encrypted_reasoning_input(body)
@@ -1066,6 +1077,7 @@ def extract_request_features(ingress_protocol: str, body: dict | None) -> Reques
         hosted_tool_labels=hosted_tool_labels,
         has_stateful_input_items=has_stateful_input_items,
         stateful_input_item_label=stateful_input_item_label,
+        stateful_input_item_labels=stateful_input_item_labels,
         raw=body,
     )
 
@@ -1090,6 +1102,7 @@ def capabilities_for_channel(channel) -> ChannelCapabilities:
                 "encrypted_reasoning_replay",
                 "prompt_cache_key",
                 "web_search",
+                "x_search",
             })
         elif ch_type == "oauth":
             native_state.update({
@@ -1138,6 +1151,10 @@ def _native_state_key_for_label(label: str | None) -> str | None:
         return "conversation"
     if label == "item_reference":
         return "item_reference"
+    if label == "x_search_call":
+        return "x_search"
+    if label == "web_search_call":
+        return "web_search"
     if label in _RESPONSES_BUILTIN_INPUT_ITEM_TYPES:
         return "hosted_tools"
     return label
@@ -1145,7 +1162,7 @@ def _native_state_key_for_label(label: str | None) -> str | None:
 
 def _responses_hosted_tool_supported(label: str | None, native: frozenset[str]) -> bool:
     # Codex native passthrough tools are not generic hosted/server-side tools.
-    # xAI similarly supports a narrow hosted tool subset (currently web_search)
+    # xAI similarly supports a narrow hosted tool subset (web_search and x_search)
     # without supporting arbitrary OpenAI hosted tools such as file_search.
     # Do not let a provider's broad `hosted_tools` capability satisfy explicit
     # native requirements; and allow narrow explicit tool support without granting
@@ -1156,6 +1173,8 @@ def _responses_hosted_tool_supported(label: str | None, native: frozenset[str]) 
         if label in {tool_type, f"tool_choice:{tool_type}", f"tool_choice:allowed_tools:{tool_type}"}:
             return tool_type in native
     search_label = label.removeprefix("tool_choice:").removeprefix("allowed_tools:")
+    if search_label == "x_search":
+        return "x_search" in native
     if search_label == "web_search" or search_label.startswith("web_search_"):
         return "web_search" in native or "hosted_tools" in native
     if label in native:
@@ -1191,9 +1210,16 @@ def _responses_native_unsupported_label(
     if f.stateful_file_reference_label and "file_id" not in native:
         return f.stateful_file_reference_label
     if f.has_stateful_input_items:
-        required = _native_state_key_for_label(f.stateful_input_item_label)
-        if required and required not in native:
-            return f.stateful_input_item_label or required
+        labels = f.stateful_input_item_labels or (
+            (f.stateful_input_item_label,) if f.stateful_input_item_label else ()
+        )
+        for label in labels:
+            required = _native_state_key_for_label(label)
+            supported = bool(required and required in native)
+            if required == "web_search":
+                supported = "web_search" in native or "hosted_tools" in native
+            if required and not supported:
+                return label or required
     return None
 
 
@@ -1355,10 +1381,16 @@ class ProtocolMatrix:
                     )
                 if f.has_encrypted_reasoning:
                     raise ProtocolGuardError("OpenAI Responses→Anthropic include reasoning.encrypted_content / encrypted reasoning replay is not enabled yet")
-                if f.has_stateful_input_items and f.stateful_input_item_label != "web_search_call":
+                stateful_labels = f.stateful_input_item_labels or (
+                    (f.stateful_input_item_label,) if f.stateful_input_item_label else ()
+                )
+                unsupported_stateful = next(
+                    (label for label in stateful_labels if label != "web_search_call"), None,
+                )
+                if unsupported_stateful:
                     raise ProtocolGuardError(
                         "OpenAI Responses→Anthropic stateful input items are not enabled yet"
-                        + _label_suffix(f.stateful_input_item_label)
+                        + _label_suffix(unsupported_stateful)
                     )
                 if f.has_audio:
                     raise ProtocolGuardError("OpenAI Responses→Anthropic audio input is not enabled yet")

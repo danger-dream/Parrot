@@ -442,6 +442,41 @@ def rename_runtime_channel_state(old_channel_key:str,new_channel_key:str,*,old_a
 
 def codex_identity_tombstone_load(owner_digest:str):return _get("codex_identity_tombstones",owner_digest)
 def codex_identity_tombstone_load_all():return _all("codex_identity_tombstones")
+def codex_identity_tombstones_claim(rows:list[dict[str,Any]])->list[dict[str,Any]]:
+    """Atomically claim multiple configured Codex identities with one durable write."""
+    normalized=[]
+    for raw in rows:
+        owner=str(raw.get("owner_digest") or "")
+        installation=str(raw.get("installation_id") or "")
+        if not owner.startswith("sha256:") or not installation:
+            raise ValueError("invalid Codex identity tombstone")
+        normalized.append({
+            "owner_digest":owner,
+            "installation_id":installation,
+            "generation_version":int(raw.get("generation_version") or 0),
+            "created_at":str(raw.get("created_at") or ""),
+        })
+    if not normalized:
+        return []
+    def op(d):
+        result=[]
+        for candidate in normalized:
+            owner=candidate["owner_digest"]
+            installation=candidate["installation_id"]
+            old=d.get(owner)
+            if old:
+                if old.get("installation_id")!=installation:
+                    raise ValueError("Codex owner tombstone installation conflict")
+                result.append(old)
+                continue
+            for row in d.values():
+                if row.get("owner_digest")!=owner and row.get("installation_id")==installation:
+                    raise ValueError("Codex installation is already bound to another owner")
+            row=dict(candidate)
+            d[owner]=row
+            result.append(row)
+        return result
+    return _mut("codex_identity_tombstones",op,strict=True)
 def codex_identity_tombstone_claim(owner_digest:str,installation_id:str,generation_version:int,*,created_at:str)->dict:
     """Atomically claim the one installation allowed for a canonical OAuth owner."""
     owner=str(owner_digest or ""); installation=str(installation_id or "")

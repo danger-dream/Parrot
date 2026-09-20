@@ -169,17 +169,28 @@ collect_config() {
         printf "  当前内容:\n"
         ls -la "$INSTALL_DIR" 2>/dev/null | sed 's/^/    /' | head -10
         echo
-        local choice
-        read_tty choice "已存在，[U]pgrade 升级镜像 / [O]verwrite 覆盖配置 / [C]ancel 取消" "U"
-        case "${choice^^}" in
-            U) MODE="upgrade" ;;
-            O) MODE="overwrite" ;;
-            C|*) info "已取消"; exit 0 ;;
-        esac
+        if [[ -f "$INSTALL_DIR/data/config.json" ]]; then
+            # config.json 是可升级 Parrot 安装的业务状态边界。仅有一个预创建/空目录
+            # 不是升级；否则刚收集的 Telegram 配置会被 upgrade 分支静默丢弃。
+            local choice
+            read_tty choice "检测到现有 Parrot 配置，[U]pgrade 升级镜像 / [O]verwrite 覆盖配置 / [C]ancel 取消" "U"
+            case "${choice^^}" in
+                U) MODE="upgrade" ;;
+                O) MODE="overwrite" ;;
+                C|*) info "已取消"; exit 0 ;;
+            esac
+        else
+            local fresh_choice
+            read_tty fresh_choice "未检测到现有 Parrot 配置，[I]nstall 按全新安装初始化此目录 / [C]ancel 取消" "I"
+            case "${fresh_choice^^}" in
+                I) MODE="fresh" ;;
+                C|*) info "已取消"; exit 0 ;;
+            esac
+        fi
     else
         MODE="fresh"
-        mkdir -p "$INSTALL_DIR/data"
     fi
+    mkdir -p "$INSTALL_DIR/data"
 
     section "[3/6] Telegram Bot 配置"
     if [[ "$MODE" == "upgrade" && -f "$INSTALL_DIR/data/config.json" ]]; then
@@ -297,6 +308,21 @@ EOF
 }
 
 # ─── 启动 + 验证 ───────────────────────────────────────────────
+verify_telegram_polling() {
+    local tg_logs
+    tg_logs="$(docker compose logs --tail 200 2>&1 || true)"
+    if grep -Fq "[tg] bot started (polling ready)" <<<"$tg_logs"; then
+        ok "TG Bot polling 已启动"
+        return 0
+    fi
+    if grep -Fq "[tg] bot startup failed" <<<"$tg_logs"; then
+        err "Telegram Bot 初始化失败，部署未完成。请检查 data/config.json 中的 telegram.botToken、服务器到 api.telegram.org 的网络，然后执行 docker compose restart。"
+    else
+        err "容器 HTTP health 正常，但未确认 Telegram Bot polling 就绪，部署未完成。请运行 docker compose logs --tail 100 检查 Telegram 配置与网络。"
+    fi
+    return 1
+}
+
 start_and_verify() {
     section "[6/6] 拉镜像 + 启动 + 验证"
 
@@ -342,12 +368,9 @@ start_and_verify() {
         warn "/health 暂时拿不到，但容器已起，可稍后手动 curl 验证"
     fi
 
-    # TG Bot polling 验证
-    if docker compose logs --tail 50 2>/dev/null | grep -qE "tg.*polling|getUpdates"; then
-        ok "TG Bot polling 已启动"
-    else
-        warn "未检测到 TG Bot polling 日志（也可能只是日志没刷出来），稍后再 docker compose logs 看看"
-    fi
+    # TG Bot polling 必须由完成全部初始化后的精确 ready 标记确认。
+    # HTTP /health 不能掩盖无效或已撤销的 Bot Token。
+    verify_telegram_polling || exit 1
 
     cat <<EOF
 

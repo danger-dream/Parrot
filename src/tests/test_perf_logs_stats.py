@@ -357,6 +357,54 @@ def test_cost_overflow_is_exact_for_batch_stats_groups_and_lifetime(
     assert any(log_db._EXACT_COST_TICKS_SUM_FUNCTION in sql for sql in statements)
 
 
+def test_current_window_channel_stats_keep_retry_filter_as_outer_join(
+    monkeypatch, tmp_path,
+):
+    """频道窗口不能按日期先扫全部 retry，否则会长期阻塞唯一统计线程。"""
+    conn = _memory_log_db()
+    now = datetime.now(log_db._BJT).timestamp()
+    _insert_request(
+        conn, "window-missing", now, requested_model="unknown",
+        channel="oauth:claude:window-account",
+    )
+    conn.execute(
+        """INSERT INTO retry_chain(
+               request_id, attempt_order, channel_key, channel_type, model,
+               started_at, dispatched_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (
+            "window-missing", 1, "oauth:claude:window-account", "oauth",
+            "unknown", now, now,
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(log_db, "_log_dir", str(tmp_path))
+    monkeypatch.setattr(
+        log_db, "_iter_month_conns_all",
+        lambda _since: [(conn, lambda: None)],
+    )
+    monkeypatch.setattr(
+        log_db.model_pricing, "settings",
+        lambda *args, **kwargs: type("Settings", (), {"enabled": True})(),
+    )
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+
+    result = log_db.tokens_for_channel(
+        "oauth:claude:window-account", now - 3600,
+    )
+
+    missing_queries = [
+        sql for sql in statements
+        if "retry_chain r" in sql and "a.id IS NULL" in sql
+    ]
+    assert result["unpriced_success"] == 1
+    assert len(missing_queries) == 1
+    assert "FROM retry_chain r JOIN request_log" in missing_queries[0]
+    assert "FROM request_log CROSS JOIN retry_chain" not in missing_queries[0]
+    conn.close()
+
+
 def test_batch_cost_preserves_missing_dispatch_and_legacy_fallback(monkeypatch, tmp_path):
     conn = _memory_log_db()
     now = datetime.now(log_db._BJT).timestamp()

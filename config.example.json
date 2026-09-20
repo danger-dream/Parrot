@@ -372,7 +372,8 @@
   },
   "image_models": {
     "openai": ["gpt-image-2", "gpt-image-2.5"],
-    "xai": ["grok-imagine-image", "grok-imagine-image-quality"]
+    "xai": ["grok-imagine-image", "grok-imagine-image-quality"],
+    "antigravity": ["gemini-3.1-flash-image"]
   },
   "video_models": {
     "xai": ["grok-imagine-video", "grok-imagine-video-1.5"]
@@ -405,6 +406,15 @@
     "responsesPath": "",
     "isolateSessionId": true,
     "userAgent": "parrot/xai-oauth-adapter"
+  },
+  "antigravityOAuth": {
+    "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
+    "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
+    "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
+    "tlsFingerprint": {
+      "enabled": false,
+      "profile": "chrome131"
+    }
   },
   "cursorOAuth": {
     "bridgeHost": "127.0.0.1",

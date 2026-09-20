@@ -24,6 +24,10 @@ import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 
+_PROCESS_START_NS = time.monotonic_ns()
+from src import startup_timing
+startup_timing.set_process_start_ns(_PROCESS_START_NS)
+
 import uvicorn
 from uvicorn.server import HANDLED_SIGNALS
 from fastapi import FastAPI, Request, WebSocket
@@ -376,30 +380,42 @@ async def _affinity_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    lifespan_started_ns = startup_timing.now_ns()
+    startup_timing.log("lifespan.begin")
     # Validate paths, acquire the single-writer lock, and complete any legacy
     # transition before mutable/network lifecycle setup begins.
-    state_db.init()
+    with startup_timing.phase("lifespan.state-db-init"):
+        state_db.init()
     # Config migration establishes versioned identities; mirror each one into the
     # minimal durable tombstone registry before any outbound OAuth traffic.
     from src.openai.codex_identity import sync_configured_identity_tombstones
-    sync_configured_identity_tombstones(config.get().get("oauthAccounts", []))
+    with startup_timing.phase("lifespan.identity-tombstones"):
+        sync_configured_identity_tombstones(config.get().get("oauthAccounts", []))
 
     # 出站网络层必须在任何后续 OAuth/TG/status/update 请求前初始化。
-    network.init()
-    network.bootstrap_system_dns_once()
-    log_db.init()
-    image_db.init()
-    translation.init()
+    with startup_timing.phase("lifespan.network-init"):
+        network.init()
+    with startup_timing.phase("lifespan.system-dns-bootstrap"):
+        network.bootstrap_system_dns_once()
+    with startup_timing.phase("lifespan.log-db-init"):
+        log_db.init()
+    with startup_timing.phase("lifespan.image-db-init"):
+        image_db.init()
+    with startup_timing.phase("lifespan.translation-init"):
+        translation.init()
     # Management state is isolated from inference state; failure leaves the
     # mounted management router in explicit SERVICE_NOT_READY mode.
-    _initialize_management_runtime(app)
+    with startup_timing.phase("lifespan.management-init"):
+        _initialize_management_runtime(app)
     management_close_started = False
     try:
-        await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
+        with startup_timing.phase("lifespan.cleanup-stale-pending"):
+            await asyncio.to_thread(log_db.cleanup_stale_pending, 1800)
         # 手工编辑 config 后重启的按天留存策略也应尽快收敛；默认永久保留时只做
         # 一个轻量判断，不会触碰任何日志数据。
         try:
-            retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
+            with startup_timing.phase("lifespan.retention-cleanup"):
+                retention = await asyncio.to_thread(log_db.maybe_cleanup_retention)
             if retention.get("ok") and not retention.get("skipped"):
                 removed = int(retention.get("deleted_requests") or 0)
                 freed = int(retention.get("actual_free_bytes") or 0)
@@ -412,7 +428,8 @@ async def lifespan(app: FastAPI):
 
         # 老数据 provider 字段回填（无 provider 字段的账户默认 claude；幂等）
         try:
-            migrated = oauth_manager.migrate_provider_field()
+            with startup_timing.phase("lifespan.oauth-provider-migration"):
+                migrated = oauth_manager.migrate_provider_field()
             if migrated:
                 print(f"[oauth] migrated provider='claude' for {migrated} legacy account(s)")
         except Exception as exc:
@@ -420,7 +437,8 @@ async def lifespan(app: FastAPI):
 
         # 联合主键迁移：email → account_key (=f"{provider}:{email}")。幂等，已迁移过直接跳过。
         try:
-            _ck_result = oauth_manager.bootstrap_composite_key_migration()
+            with startup_timing.phase("lifespan.oauth-composite-key-migration"):
+                _ck_result = oauth_manager.bootstrap_composite_key_migration()
             if _ck_result.get("skipped"):
                 print(f"[oauth] composite-key migration: skipped ({_ck_result.get('reason')})")
             else:
@@ -436,7 +454,8 @@ async def lifespan(app: FastAPI):
         # Only unique email→workspace mappings are migrated; ambiguous same-email
         # workspaces remain unresolved so old keys cannot silently hit the wrong team.
         try:
-            _ow_result = oauth_manager.bootstrap_openai_workspace_key_migration()
+            with startup_timing.phase("lifespan.oauth-workspace-key-migration"):
+                _ow_result = oauth_manager.bootstrap_openai_workspace_key_migration()
             _state = _ow_result.get("state") or {}
             if _state.get("skipped"):
                 print(f"[oauth] openai workspace-key migration: skipped ({_state.get('reason')})")
@@ -454,57 +473,74 @@ async def lifespan(app: FastAPI):
             print(f"[oauth] openai workspace-key migration FAILED: {_exc}")
             raise
 
-        # Domain mirrors restore from the authoritative in-memory StateStore
-        affinity.init()
-        affinity.client_init()
-        cooldown.init()
-        scorer.init()
+        # Domain mirrors restore from the authoritative in-memory StateStore.
+        with startup_timing.phase("lifespan.affinity-restore"):
+            affinity.init()
+        with startup_timing.phase("lifespan.client-affinity-restore"):
+            affinity.client_init()
+        with startup_timing.phase("lifespan.cooldown-restore"):
+            cooldown.init()
+        with startup_timing.phase("lifespan.scorer-restore"):
+            scorer.init()
 
         # OpenAI 家族 factory 注入（必须在 rebuild_from_config 之前，否则带 protocol=openai-*
         # 的 channel entry 会回落到 ApiChannel 并被 assert 拒绝）
         from src.openai.channel.registration import register_factories as _openai_register_factories
-        _openai_register_factories()
+        with startup_timing.phase("lifespan.openai-factory-registration"):
+            _openai_register_factories()
 
         # OpenAI previous_response_id Store（independent SQLite）
         from src.openai import store as openai_store
-        openai_store.init()
+        with startup_timing.phase("lifespan.openai-store-init"):
+            openai_store.init()
 
         # Cursor OAuth channels reuse the normal HTTP/SSE failover path through a
         # process-private loopback bridge. It must exist before registry construction.
         from src.cursor_bridge import runtime as cursor_bridge_runtime
-        cursor_bridge_runtime.ensure_started()
+        with startup_timing.phase("lifespan.cursor-bridge-start"):
+            cursor_bridge_runtime.ensure_started()
 
         # 渠道注册表 + priority 统一顺序迁移 + 热加载钩子。
-        registry.rebuild_from_config()
+        with startup_timing.phase("lifespan.registry-rebuild"):
+            registry.rebuild_from_config()
         _lb_cfg = config.get()
         if (
             str(_lb_cfg.get("channelSelection") or "smart").lower() == "priority"
             and not ((_lb_cfg.get("loadBalancing") or {}).get("channelPriorityOrder") or [])
         ):
-            migrated_order = load_balancing.initialize_priority_orders()
+            with startup_timing.phase("lifespan.priority-order-migration"):
+                migrated_order = load_balancing.initialize_priority_orders()
             print(
                 f"[load-balancing] migrated legacy family priorities to "
                 f"{len(migrated_order)} unified channel entries"
             )
-        registry.install_config_reload_hook()
+        with startup_timing.phase("lifespan.config-reload-hook"):
+            registry.install_config_reload_hook()
 
         # API Provider 用量在 Telegram 启动前启动唯一 coordinator 并预热一次。
         # 预热只进入共享队列，不等待网络；禁用语义与 OAuth 主动刷新一致。
         if provider_usage.is_enabled():
-            await provider_usage.start()
-            _provider_usage_startup = provider_usage.schedule_startup_refresh()
+            with startup_timing.phase("lifespan.provider-usage-start"):
+                await provider_usage.start()
+            with startup_timing.phase("lifespan.provider-usage-schedule"):
+                _provider_usage_startup = provider_usage.schedule_startup_refresh()
             print(
                 "[provider_usage] startup refresh: "
                 f"channels={_provider_usage_startup['supported_channels']} "
                 f"accounts={_provider_usage_startup['supported_accounts']} "
                 f"scheduled={_provider_usage_startup['scheduled_accounts']}"
             )
+        else:
+            startup_timing.log("lifespan.provider-usage-start", status="skipped")
 
         # httpx 客户端
-        upstream.create_client()
+        with startup_timing.phase("lifespan.http-client-create"):
+            upstream.create_client()
         try:
-            model_pricing.initialize()
-            migrated = model_metadata.migrate_legacy_config()
+            with startup_timing.phase("lifespan.pricing-initialize"):
+                model_pricing.initialize()
+            with startup_timing.phase("lifespan.model-metadata-migration"):
+                migrated = model_metadata.migrate_legacy_config()
             if migrated["bindings"] or migrated["compression"]:
                 print(
                     "[Metadata] migrated legacy config: "
@@ -515,29 +551,26 @@ async def lifespan(app: FastAPI):
             print(f"[Pricing] local catalog load failed: {exc}")
 
         # 后台获取公网 IPv4（用于主菜单显示外网 BaseURL，失败则不显示）
-        public_ip.fetch_async()
+        with startup_timing.phase("lifespan.public-ip-schedule"):
+            public_ip.fetch_async()
 
         cfg = config.get()
         # Telegram Bot（M6）
         tg_token = cfg.get("telegram", {}).get("botToken") or ""
         tg_admins = cfg.get("telegram", {}).get("adminIds") or []
         if tg_token:
-            tgbot.init(tg_token, tg_admins)
-            tgbot.start()
+            with startup_timing.phase("lifespan.telegram-init"):
+                tgbot.init(tg_token, tg_admins)
+            with startup_timing.phase("lifespan.telegram-start"):
+                tg_ready = tgbot.start()
+            startup_timing.log(
+                "lifespan.telegram-result",
+                status="ready" if tg_ready else "failed",
+            )
+        else:
+            startup_timing.log("lifespan.telegram-start", status="skipped")
 
-        print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
-        print(f"  device_id: {DEVICE_ID[:16]}...")
-        print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
-        print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
-        print(f"  oauth_accounts: {len(cfg.get('oauthAccounts', []))}")
-        print(f"  api_channels: {len(cfg.get('channels', []))}")
-        print(f"  registry: {registry.channel_count()} channels")
-        print(f"  codex_cli_version: {codex_cli_version()}")
-        print(f"  cch_mode: {cfg.get('cchMode')}")
-        print(f"  oauth_mock: {cfg.get('oauth', {}).get('mockMode', False)}")
-        print(f"  timeouts: {cfg.get('timeouts')}")
-        print(f"  telegram: {'enabled' if tg_token else 'disabled'} ({len(tg_admins)} admin(s))")
-
+        background_started_ns = startup_timing.now_ns()
         _background_tasks.append(asyncio.create_task(_wal_checkpoint_loop()))
         _background_tasks.append(asyncio.create_task(_stale_pending_loop()))
         _background_tasks.append(asyncio.create_task(_affinity_cleanup_loop()))
@@ -552,9 +585,15 @@ async def lifespan(app: FastAPI):
         _background_tasks.append(asyncio.create_task(network_monitor.monitor_loop()))
         _background_tasks.append(asyncio.create_task(update_checker.update_loop()))
         _background_tasks.append(asyncio.create_task(model_pricing.refresh_loop()))
+        startup_timing.log(
+            "lifespan.background-tasks-create",
+            started_ns=background_started_ns,
+            count=len(_background_tasks),
+        )
         # 自更新：若进程是被自更新重启拉起的，恢复流程做健康检查/回滚
         try:
-            updater.resume_after_restart()
+            with startup_timing.phase("lifespan.updater-resume"):
+                updater.resume_after_restart()
         except Exception as _exc:
             print(f"[updater] resume_after_restart failed: {_exc}")
         _background_tasks.append(asyncio.create_task(openai_store.cleanup_loop()))
@@ -565,12 +604,33 @@ async def lifespan(app: FastAPI):
         mcp_lifespan = None
         if _MCP_SERVER is not None:
             try:
-                mcp_lifespan = _MCP_SERVER.session_manager.run()
-                await mcp_lifespan.__aenter__()
+                with startup_timing.phase("lifespan.mcp-session-manager"):
+                    mcp_lifespan = _MCP_SERVER.session_manager.run()
+                    await mcp_lifespan.__aenter__()
             except Exception as exc:
                 mcp_lifespan = None
                 mcp.mount._set_state(mounted=False, reason=f"session manager failed: {type(exc).__name__}")
                 print(f"[mcp] session manager failed to start: {type(exc).__name__}")
+        else:
+            startup_timing.log("lifespan.mcp-session-manager", status="skipped")
+
+        print(f"Parrot 🦜 v{__version__} (multi-family AI protocol proxy) ready")
+        print(f"  device_id: {DEVICE_ID[:16]}...")
+        print(f"  listen: http://{cfg['listen']['host']}:{cfg['listen']['port']}/v1/messages")
+        print(f"  api_keys: {len(cfg.get('apiKeys', {}))}")
+        print(f"  oauth_accounts: {len(cfg.get('oauthAccounts', []))}")
+        print(f"  api_channels: {len(cfg.get('channels', []))}")
+        print(f"  registry: {registry.channel_count()} channels")
+        print(f"  codex_cli_version: {codex_cli_version()}")
+        print(f"  cch_mode: {cfg.get('cchMode')}")
+        print(f"  oauth_mock: {cfg.get('oauth', {}).get('mockMode', False)}")
+        print(f"  timeouts: {cfg.get('timeouts')}")
+        print(f"  telegram: {'enabled' if tg_token else 'disabled'} ({len(tg_admins)} admin(s))")
+        startup_timing.log(
+            "lifespan.http-ready",
+            started_ns=lifespan_started_ns,
+            version=__version__,
+        )
 
         try:
             yield
@@ -1585,6 +1645,7 @@ async def _serve_with_graceful_drain(server: uvicorn.Server) -> None:
 
 
 def main() -> None:
+    startup_timing.log("process.module-load", started_ns=_PROCESS_START_NS)
     cfg = config.get()
     uvicorn_config = uvicorn.Config(
         app,

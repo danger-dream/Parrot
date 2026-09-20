@@ -641,9 +641,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
         "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
         "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
-        "imageModels": [
-            "gemini-3.1-flash-image",
-        ],
+        # Explicit opt-in. Existing installations inherit ``enabled=False`` on
+        # normal deep-merge upgrade; the profile remains operator configurable.
+        "tlsFingerprint": {
+            "enabled": False,
+            "profile": "chrome131",
+        },
     },
     # Cursor OAuth / AgentService 私有 bridge。模型清单和上下文限制按账号
     # AvailableModels 自动同步，不使用 models.dev 元数据。
@@ -787,6 +790,35 @@ def _retire_oauth_default_models(cfg: dict) -> bool:
         legacy.pop("defaultModels")
         changed = True
     return changed
+
+
+def _migrate_antigravity_image_models(cfg: dict) -> bool:
+    """Move the former provider-local AG image list into the unified map once.
+
+    Removing the legacy field makes a later operator removal from
+    ``image_models.antigravity`` durable instead of re-adding a default on every
+    load.
+    """
+    section = cfg.get("antigravityOAuth")
+    if not isinstance(section, dict) or "imageModels" not in section:
+        return False
+    raw = section.pop("imageModels")
+    values = list(dict.fromkeys(
+        str(value).strip() for value in raw or []
+        if isinstance(value, str) and value.strip()
+    )) if isinstance(raw, list) else []
+    mapping = cfg.get("image_models")
+    if not isinstance(mapping, dict):
+        # Materialize the complete legacy-effective map before introducing the
+        # unified field. Creating an AG-only map here would suppress inherited
+        # xAI imageModels and the old OpenAI toolModel on the next read.
+        from .media_config import model_map
+        mapping = model_map("image", cfg)
+        mapping["antigravity"] = values
+        cfg["image_models"] = mapping
+    elif "antigravity" not in mapping:
+        mapping["antigravity"] = values
+    return True
 
 
 def _normalize_legacy_codex_catalogs(cfg: dict) -> bool:
@@ -1034,6 +1066,9 @@ def _load_from_disk() -> dict:
         print("[config] backfilled openaiOAuth from defaults/legacy oauth.providers.openai")
     if _retire_oauth_default_models(merged):
         changed = True
+    if _migrate_antigravity_image_models(merged):
+        changed = True
+        print("[config] migrated Antigravity image models into unified image_models")
     if _normalize_pricing_sources(merged):
         changed = True
         print("[config] migrated built-in pricing source from LiteLLM to models.dev")

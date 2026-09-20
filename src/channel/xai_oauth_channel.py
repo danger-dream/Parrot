@@ -16,6 +16,7 @@ import json
 from typing import Optional
 
 from .. import cache_hints, config, local_web_tools, oauth_manager, search_tool_wire
+from ..search_xai import normalize_x_search_tool_dates
 from ..channel.url_utils import resolve_upstream_url
 from ..oauth import xai as xai_provider
 from ..providers import registry as provider_registry
@@ -79,8 +80,14 @@ def _sanitize_xai_payload(payload: dict, *, stream: bool = True) -> dict:
         out.pop("service_tier", None)
     out["stream_options"] = {"include_usage": True}
     local_web_tools.prepare_xai_responses_native_web_search_tools(out)
-    # xAI HTTP rejects tool_choice when tools are absent/empty.
     tools = out.get("tools")
+    if isinstance(tools, list):
+        out["tools"] = [
+            normalize_x_search_tool_dates(tool) if isinstance(tool, dict) else tool
+            for tool in tools
+        ]
+        tools = out["tools"]
+    # xAI HTTP rejects tool_choice when tools are absent/empty.
     if not tools:
         out.pop("tool_choice", None)
         out.pop("parallel_tool_calls", None)

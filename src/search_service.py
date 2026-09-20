@@ -22,6 +22,12 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import config, network
+from .search_xai import (
+    X_SEARCH_ONLY_FIELDS,
+    evidence_key as _xai_evidence_key,
+    is_x_search_call_item,
+    normalize_x_search_date,
+)
 
 MODES = ("managed", "passthrough", "disabled")
 BACKEND_TYPES = ("anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic")
@@ -190,6 +196,65 @@ def _query(args: dict) -> str:
     return " ".join(parts)
 
 
+def _x_handles(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 20:
+        raise SearchError(f"{field}须为最多20个X用户名的数组", code="invalid_search_input",
+                          status_code=400, retryable=False)
+    output, seen = [], set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise SearchError(f"{field}须为最多20个X用户名的数组", code="invalid_search_input",
+                              status_code=400, retryable=False)
+        handle = raw.strip().removeprefix("@").strip()
+        if not handle or len(handle) > 64 or re.search(r"\s", handle):
+            raise SearchError(f"{field}含无效X用户名", code="invalid_search_input",
+                              status_code=400, retryable=False)
+        folded = handle.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            output.append(handle)
+    return output
+
+
+def _x_date(value: Any, field: str):
+    try:
+        return normalize_x_search_date(value, field)
+    except ValueError:
+        raise SearchError(f"{field}须为ISO8601日期（YYYY-MM-DD）", code="invalid_search_input",
+                          status_code=400, retryable=False) from None
+
+
+def _normalize_x_search_arguments(args: dict) -> None:
+    if args["allowed_domains"] or args["blocked_domains"]:
+        raise SearchError(
+            "原生X搜索不支持allowed_domains或blocked_domains；请使用allowed_x_handles或excluded_x_handles",
+            code="unsupported_search_parameter", status_code=400, retryable=False,
+        )
+    if "external_web_access" in args and args["external_web_access"] not in (True, "live"):
+        raise SearchError("原生X搜索只支持实时搜索", code="unsupported_search_parameter",
+                          status_code=400, retryable=False)
+    args["allowed_x_handles"] = _x_handles(args.get("allowed_x_handles"), "allowed_x_handles")
+    args["excluded_x_handles"] = _x_handles(args.get("excluded_x_handles"), "excluded_x_handles")
+    if args["allowed_x_handles"] and args["excluded_x_handles"]:
+        raise SearchError("allowed_x_handles与excluded_x_handles不能同时使用",
+                          code="invalid_search_input", status_code=400, retryable=False)
+    from_date, parsed_from = _x_date(args.get("from_date"), "from_date")
+    to_date, parsed_to = _x_date(args.get("to_date"), "to_date")
+    if args.get("freshness") and (from_date or to_date):
+        raise SearchError("freshness不能与from_date或to_date同时使用",
+                          code="invalid_search_input", status_code=400, retryable=False)
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise SearchError("from_date不能晚于to_date", code="invalid_search_input",
+                          status_code=400, retryable=False)
+    args["from_date"], args["to_date"] = from_date, to_date
+    for field in ("enable_image_understanding", "enable_video_understanding"):
+        if field in args and not isinstance(args[field], bool):
+            raise SearchError(f"{field}须为布尔值", code="invalid_search_input",
+                              status_code=400, retryable=False)
+
+
 def _arguments(arguments: dict, cfg: dict, operation: str) -> dict:
     args = copy.deepcopy(arguments)
     context_size = args.get("search_context_size")
@@ -204,6 +269,9 @@ def _arguments(arguments: dict, cfg: dict, operation: str) -> dict:
     if "external_web_access" in args and args["external_web_access"] not in (True, False, "cached", "indexed", "live"):
         raise SearchError("external_web_access参数无效", code="invalid_search_input", status_code=400, retryable=False)
     for key in ("language", "country", "freshness"):
+        if (key == "freshness" and operation == "x_search" and not args.get(key)
+                and (args.get("from_date") or args.get("to_date"))):
+            continue  # Exact X date bounds override a configured default freshness.
         if not args.get(key) and cfg.get(key):
             args[key] = cfg[key]
     filters = args.get("filters") if isinstance(args.get("filters"), dict) else {}
@@ -240,6 +308,13 @@ def _arguments(arguments: dict, cfg: dict, operation: str) -> dict:
             raise SearchError("搜索结果数量必须为整数", code="invalid_search_input", status_code=400, retryable=False)
         if args.get("freshness") and args["freshness"] not in _FRESH_DAYS:
             raise SearchError("时间范围须为day/week/month/year", code="invalid_search_input", status_code=400, retryable=False)
+        if operation == "x_search":
+            _normalize_x_search_arguments(args)
+        else:
+            unsupported = next((field for field in X_SEARCH_ONLY_FIELDS if field in args), None)
+            if unsupported:
+                raise SearchError(f"{unsupported}仅支持原生X搜索来源",
+                                  code="unsupported_search_parameter", status_code=400, retryable=False)
     return args
 
 
@@ -311,7 +386,7 @@ def _xai_structured_output(text: str) -> tuple[list, str | None] | None:
     return payload["results"], answer if isinstance(answer, str) else None
 
 
-def _xai_aligned_rows(structured: list, evidence: list) -> list:
+def _xai_aligned_rows(structured: list, evidence: list, *, x_search: bool = False) -> list:
     """Keep structured rows tied to URLs observed in native search evidence."""
     evidence_by_url = {}
     for item in evidence:
@@ -319,7 +394,7 @@ def _xai_aligned_rows(structured: list, evidence: list) -> list:
             continue
         url = str(item.get("url") or "")
         if urlsplit(url).scheme in ("http", "https"):
-            evidence_by_url.setdefault(url, item)
+            evidence_by_url.setdefault(_xai_evidence_key(url, x_search=x_search), item)
     if not evidence_by_url:
         return structured
     aligned = []
@@ -327,7 +402,7 @@ def _xai_aligned_rows(structured: list, evidence: list) -> list:
         if not isinstance(item, dict):
             continue
         url = str(item.get("url") or "")
-        source = evidence_by_url.get(url)
+        source = evidence_by_url.get(_xai_evidence_key(url, x_search=x_search))
         if source is None:
             continue
         merged = dict(source)
@@ -485,22 +560,37 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
     elif kind == "xai":
         if operation == "extract":
             raise SearchError("xAI搜索不作为网页正文提取接口", code="search_capability_unavailable", retryable=False)
-        tool = {"type": "web_search"}
-        filters = {}
-        if args["allowed_domains"]: filters["allowed_domains"] = args["allowed_domains"]
-        if args["blocked_domains"]: filters["excluded_domains"] = args["blocked_domains"]
-        if filters: tool["filters"] = filters
-        query = _query(args)
-        if args.get("freshness"): query += " (published in the past " + args["freshness"] + ")"
+        is_x_search = operation == "x_search"
+        tool = {"type": "x_search" if is_x_search else "web_search"}
+        if is_x_search:
+            for field in ("allowed_x_handles", "excluded_x_handles", "from_date", "to_date",
+                          "enable_image_understanding", "enable_video_understanding"):
+                value = args.get(field)
+                if value not in (None, [], False):
+                    tool[field] = value
+            if args.get("freshness"):
+                tool["from_date"] = (
+                    datetime.now(timezone.utc) - timedelta(days=_FRESH_DAYS[args["freshness"]])
+                ).date().isoformat()
+            query = _query_text(args)
+            search_label, prompt_label = "X search", "Use X search to find"
+        else:
+            filters = {}
+            if args["allowed_domains"]: filters["allowed_domains"] = args["allowed_domains"]
+            if args["blocked_domains"]: filters["excluded_domains"] = args["blocked_domains"]
+            if filters: tool["filters"] = filters
+            query = _query(args)
+            if args.get("freshness"): query += " (published in the past " + args["freshness"] + ")"
+            search_label, prompt_label = "web search", "Use web search to find"
         result_contract = (
             f" Return only JSON with an answer string and a results array of at most {args['max_results']} objects."
-            " Each result must contain title and URL for the same source returned by web search."
+            f" Each result must contain title and URL for the same source returned by {search_label}."
             " Include snippet only when a snippet or description is available from that same source;"
             " copy it faithfully, otherwise omit snippet. Do not invent snippets or URLs."
             ' Use exactly this shape: {"answer":"...","results":[{"title":"...","url":"https://...","snippet":"..."}]}.'
         )
         payload = {"model": model, "stream": True, "reasoning": {"effort": "low"},
-                   "input": [{"role": "user", "content": "Use web search to find: " + query + result_contract}],
+                   "input": [{"role": "user", "content": prompt_label + ": " + query + result_contract}],
                    "tools": [tool], "tool_choice": "required", "max_output_tokens": 1200, "max_tool_calls": 1}
         url = str(backend.get("endpoint") or account.get("base_url") or "https://api.x.ai/v1").rstrip("/") + "/responses"
         headers.update({"user-agent": "xai-sdk-python", "accept": "text/event-stream"})
@@ -534,6 +624,16 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
             async with client.stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     await response.aread()
+                    if response.status_code == 429 and operation == "x_search":
+                        try:
+                            failed_body = response.json()
+                        except ValueError:
+                            failed_body = None
+                        label = "xAI X搜索" if operation == "x_search" else "xAI搜索"
+                        raise _billing_failure(SearchError(
+                            label + "额度不足或触发速率限制", code="search_rate_limited",
+                            status_code=429, retryable=True,
+                        ), backend, failed_body)
                     _check_response(response)
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"): continue
@@ -590,8 +690,13 @@ def _parse_oauth_result(data: dict, kind: str, args: dict, operation: str, cfg: 
             result.update(query=args["query"], results=_normalize_rows(rows, args))
     elif kind == "xai":
         sources, citations, answer_parts, searched = [], [], [], False
+        expected_call = "x_search_call" if operation == "x_search" else "web_search_call"
         for item in data.get("output") or []:
-            if item.get("type") == "web_search_call":
+            # The public Responses contract uses x_search_call. The current xAI
+            # OAuth Responses wire instead exposes its internal X operations as
+            # completed custom_tool_call items; accept both observed native forms.
+            native_x_call = operation == "x_search" and is_x_search_call_item(item)
+            if item.get("type") == expected_call or native_x_call:
                 searched = True
                 sources.extend((item.get("action") or {}).get("sources") or [])
             for part in item.get("content") or []:
@@ -601,7 +706,8 @@ def _parse_oauth_result(data: dict, kind: str, args: dict, operation: str, cfg: 
                     if citation.get("type") == "url_citation":
                         citations.append(citation)
         if not searched:
-            raise SearchError("xAI未执行要求的原生搜索", code="search_not_executed")
+            label = "X搜索" if operation == "x_search" else "网页搜索"
+            raise SearchError(f"xAI未执行要求的原生{label}", code="search_not_executed")
         answer_text = "\n".join(answer_parts)
         evidence = citations + sources
         structured = _xai_structured_output(answer_text)
@@ -611,7 +717,7 @@ def _parse_oauth_result(data: dict, kind: str, args: dict, operation: str, cfg: 
             rows, answer = evidence, answer_text
         else:
             rows, structured_answer = structured
-            rows = _xai_aligned_rows(rows, evidence)
+            rows = _xai_aligned_rows(rows, evidence, x_search=operation == "x_search")
             answer = structured_answer if structured_answer is not None else answer_text
         result.update(query=args["query"],
                       results=_normalize_rows(rows, args, omit_missing_snippet=True), answer=answer)
@@ -672,11 +778,16 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
             continue
         if operation == "extract" and kind not in ("anysearch", "tavily", "exa", "openai"):
             continue
+        if operation == "x_search" and kind != "xai":
+            continue
         credentials = _keys(backend) if kind in ENDPOINTS else _accounts(backend)
         candidates.extend((backend, credential, position) for position, credential in enumerate(credentials))
     if not candidates:
         if cached_only:
             raise SearchError("没有支持离线/缓存搜索的可用OpenAI来源；未发送在线搜索请求", code="offline_search_unavailable", status_code=503, retryable=False)
+        if operation == "x_search":
+            raise SearchError("X（Twitter）搜索当前没有可用的xAI OAuth账户",
+                              code="no_x_search_backend", status_code=503, retryable=False)
         raise SearchError("没有已配置且可用的搜索来源", code="no_search_backend", status_code=503, retryable=False)
     attempts, permanent = [], set()
     maximum = max(1, min(10, int(cfg["maxAttempts"])))
@@ -740,7 +851,11 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
                 for field in ("_billing_body", "_billing_model", "_billing_provider"):
                     exc.__dict__.pop(field, None)
                 raise
-            if not exc.retryable: permanent.add(index)
+            # A same-request immediate retry cannot clear a quota/rate limit.
+            # Retire this account for this call while retaining retryability for
+            # a later user call; the loop can still try another eligible account.
+            if exc.code == "search_rate_limited" or not exc.retryable:
+                permanent.add(index)
         except httpx.RequestError:
             last = SearchError("搜索上游网络错误", code="search_network_error")
         except asyncio.CancelledError:
@@ -790,7 +905,7 @@ def _record_search_call_start(*, call_id, attempt_no, origin, request_id, round_
             credential_kind=credential_kind, credential_label=credential_label,
             account_key=account_key, credential_index=credential_index,
             model=model,
-            query=args.get("query") if operation == "search" else None,
+            query=args.get("query") if operation in ("search", "x_search") else None,
             url=args.get("url") if operation == "extract" else None,
         )
     except Exception:
@@ -850,6 +965,13 @@ def _effective_model(backend: dict, result: dict) -> str:
 async def search(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None,
                  origin: str = "managed_round", round_no: int = 0) -> dict:
     return await _run("search", arguments, request_id=request_id, backend_id=backend_id,
+                      origin=origin, round_no=round_no)
+
+
+async def x_search(arguments: dict, *, request_id: str | None = None, backend_id: str | None = None,
+                   origin: str = "mcp", round_no: int = 0) -> dict:
+    """Search X through every eligible xAI backend/account, preserving normal failover."""
+    return await _run("x_search", arguments, request_id=request_id, backend_id=backend_id,
                       origin=origin, round_no=round_no)
 
 

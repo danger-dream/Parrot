@@ -83,25 +83,62 @@ _SEARCH_RESULT_ITEM = {
 
 
 def _search_schema() -> dict:
+    x_source = catalog.x_search_source_id()
     return {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "搜索关键词。"},
+            "query": {"type": "string", "description": "网页或 X（Twitter）搜索关键词。"},
             "max_results": {
                 "type": "integer", "minimum": 1, "maximum": 20,
-                "description": "返回结果条数上限；省略则用服务端默认值。",
+                "description": (
+                    f"最终返回结果条数上限；省略则用服务端默认值。source={x_source} 时，"
+                    "该值不限制 xAI 内部获取的帖子数量或相应计费。"
+                ),
             },
             "freshness": {
                 "type": "string", "enum": ["day", "week", "month", "year"],
-                "description": "只返回该时间范围内发布的内容。",
+                "description": (
+                    f"只返回该时间范围内发布的内容；source={x_source} 时转换为原生 from_date。"
+                    "不能与 from_date/to_date 同时使用。"
+                ),
             },
             "allowed_domains": {
                 "type": "array", "items": {"type": "string"},
-                "description": "只在这些域名内搜索。",
+                "description": f"只在这些域名内搜索；source={x_source} 不支持，传入会报错。",
             },
             "blocked_domains": {
                 "type": "array", "items": {"type": "string"},
-                "description": "排除这些域名。",
+                "description": f"排除这些域名；source={x_source} 不支持，传入会报错。",
+            },
+            "allowed_x_handles": {
+                "type": "array", "items": {"type": "string"}, "maxItems": 20,
+                "description": (
+                    f"仅 source={x_source}：只搜索这些 X 用户发布的内容，最多20个；用户名可带或不带 @。"
+                    "不能与 excluded_x_handles 同时使用。"
+                ),
+            },
+            "excluded_x_handles": {
+                "type": "array", "items": {"type": "string"}, "maxItems": 20,
+                "description": (
+                    f"仅 source={x_source}：排除这些 X 用户发布的内容，最多20个；用户名可带或不带 @。"
+                    "不能与 allowed_x_handles 同时使用。"
+                ),
+            },
+            "from_date": {
+                "type": "string", "format": "date",
+                "description": f"仅 source={x_source}：搜索起始日期，格式 YYYY-MM-DD；不能与 freshness 同时使用。",
+            },
+            "to_date": {
+                "type": "string", "format": "date",
+                "description": f"仅 source={x_source}：搜索结束日期，格式 YYYY-MM-DD；不能与 freshness 同时使用。",
+            },
+            "enable_image_understanding": {
+                "type": "boolean",
+                "description": f"仅 source={x_source}：允许 Grok 理解 X 帖子中的图片，可能增加图像 Token 费用。",
+            },
+            "enable_video_understanding": {
+                "type": "boolean",
+                "description": f"仅 source={x_source}：允许 Grok 理解 X 帖子中的视频，可能增加媒体 Token 费用。",
             },
             **catalog.common_properties("web_search"),
         },
@@ -223,6 +260,10 @@ def _apply_source(arguments: dict, *, kind: str, tool_name: str = "web_search",
     if kind == "search":
         available = catalog.available_engines(tool_name)
         if source not in available:
+            if catalog.is_x_search_source_id(source):
+                raise ToolError(
+                    "X（Twitter）搜索当前不可用：需要至少一个已接入、启用且状态可用的 xAI OAuth 搜索账户。"
+                )
             raise ToolError(
                 f"搜索引擎 {source!r} 当前不可用。当前可用：{', '.join(available) or '无'}。"
             )
@@ -318,7 +359,8 @@ def _search_arguments(arguments: dict) -> dict:
     """把 MCP 参数翻译成 search_service 的统一参数。"""
     payload: dict[str, Any] = {"query": arguments.get("query")}
     for key in ("max_results", "freshness", "allowed_domains", "blocked_domains",
-                "language", "country"):
+                "allowed_x_handles", "excluded_x_handles", "from_date", "to_date",
+                "enable_image_understanding", "enable_video_understanding", "language", "country"):
         if arguments.get(key) is not None:
             payload[key] = arguments[key]
     return {key: value for key, value in payload.items() if value is not None}
@@ -343,7 +385,12 @@ async def _run_search(tool_name: str, arguments: dict, *, request_id: str) -> tu
     """
     source = _apply_source(arguments, kind="search", tool_name=tool_name)
     max_chars = _fetch_max_chars(arguments) if tool_name == "web_fetch" else None
-    if tool_name == "web_search":
+    x_source = catalog.x_search_source_id() if tool_name == "web_search" else None
+    if tool_name == "web_search" and source == x_source:
+        result = await search_service.x_search(
+            _search_arguments(arguments), request_id=request_id, origin="mcp",
+        )
+    elif tool_name == "web_search":
         result = await search_service.search(
             _search_arguments(arguments), request_id=request_id,
             backend_id=source, origin="mcp",
@@ -357,7 +404,10 @@ async def _run_search(tool_name: str, arguments: dict, *, request_id: str) -> tu
     # 优先取最终成功那一次尝试的来源：搜索可以合法地跨来源重试，最后一次才是实际出结果的。
     final = next((a for a in reversed(attempts) if isinstance(a, dict)), {})
     telemetry = {
-        "source_id": result.get("backend_id") or final.get("backend_id"),
+        # MCP telemetry records the source the caller selected. The lower-level
+        # search-call log still records the concrete xAI backend/account attempt.
+        "source_id": (x_source if source == x_source else
+                      result.get("backend_id") or final.get("backend_id")),
         "source_type": result.get("provider") or final.get("provider"),
         "result_count": len(result.get("results") or []) if isinstance(result.get("results"), list) else 0,
     }

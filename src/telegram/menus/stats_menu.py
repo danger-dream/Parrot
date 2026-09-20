@@ -726,6 +726,42 @@ def _load_cold_view(chat_id: int, message_id: int, cb_id: str,
         on_ready(cached.value, None)
 
 
+def _refresh_restored_view(
+    chat_id: int,
+    message_id: int,
+    token: int,
+    period: str,
+    dim: str,
+    since: float,
+    key,
+) -> None:
+    def on_ready(snapshot, error) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        if error is not None:
+            current = menu_cache.PERIOD_STATS.peek(key)
+            if current.value is None:
+                text, kb = _error_page(error)
+            else:
+                text, kb = _compose_snapshot(current.value, period, dim)
+                text = _maybe_suffix_status_banner(text)
+                text += "\n\n⚠️ <i>统计更新失败，当前仍显示上次成功快照。</i>"
+        else:
+            text, kb = _compose_snapshot(snapshot, period, dim)
+            text = _maybe_suffix_status_banner(text)
+        menu_cache.run_if_current(
+            chat_id, message_id, token,
+            lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+        )
+
+    read = menu_cache.PERIOD_STATS.request(
+        key, lambda: _CONTROL.period_snapshot_since(_CONTEXT, since),
+        subscriber=(chat_id, message_id), on_ready=on_ready, interactive=True,
+    )
+    if read.fresh and read.value is not None:
+        on_ready(read.value, None)
+
+
 def view(chat_id: int, message_id: int, cb_id: str,
          period: str = "0", dim: str = "all") -> None:
     period = period if period in _VALID_PERIODS else "0"
@@ -739,10 +775,14 @@ def view(chat_id: int, message_id: int, cb_id: str,
         return
 
     ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
+    token = menu_cache.begin_view(chat_id, message_id)
     text, kb = _compose_snapshot(cached.value, period, dim)
-    ui.edit(chat_id, message_id, _maybe_suffix_status_banner(text), reply_markup=kb)
-    if period not in ("0", "month") and not cached.fresh:
+    text = _maybe_suffix_status_banner(text)
+    text = menu_cache.with_refreshing_notice(text, cached)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    if cached.restored:
+        _refresh_restored_view(chat_id, message_id, token, period, dim, since, key)
+    elif period not in ("0", "month") and not cached.fresh:
         menu_cache.PERIOD_STATS.request(
             key, lambda: _CONTROL.period_snapshot_since(_CONTEXT, since),
         )
@@ -761,7 +801,14 @@ def send_new(chat_id: int) -> None:
         ui.send(chat_id, menu_cache.initialization_text())
         return
     text, kb = _compose_snapshot(cached.value, period, dim)
-    ui.send(chat_id, _maybe_suffix_status_banner(text), reply_markup=kb)
+    text = _maybe_suffix_status_banner(text)
+    text = menu_cache.with_refreshing_notice(text, cached)
+    response = ui.send(chat_id, text, reply_markup=kb)
+    result = response.get("result") if isinstance(response, dict) else None
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if cached.restored and isinstance(message_id, int):
+        token = menu_cache.begin_view(chat_id, message_id)
+        _refresh_restored_view(chat_id, message_id, token, period, dim, since, _period_cache_key(period, since))
 
 
 # ─── 路由 ─────────────────────────────────────────────────────────

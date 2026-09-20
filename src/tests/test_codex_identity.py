@@ -475,6 +475,54 @@ def test_tombstone_restart_reimport_delete_and_explicit_forget(identity_store, m
         monkeypatch.setattr(state_db, "_store", store)
 
 
+def test_configured_identity_sync_uses_one_durable_batch_write(identity_store, monkeypatch, m):
+    store, _tmp_path = identity_store
+    identity = m["identity"]
+    accounts = [
+        _account("workspace-batch-a", email="batch-a@example.test"),
+        _account("workspace-batch-b", email="batch-b@example.test"),
+    ]
+    for account in accounts:
+        identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
+
+    writes = []
+    original_write = store.write_snapshot
+
+    def counted_write(*args, **kwargs):
+        writes.append(args)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(store, "write_snapshot", counted_write)
+    assert identity.sync_configured_identity_tombstones(accounts) == 2
+    assert len(writes) == 1
+    assert len(m["state_db"].codex_identity_tombstone_load_all()) == 2
+
+
+def test_configured_identity_batch_conflict_is_atomic(identity_store, m):
+    identity = m["identity"]
+    state_db = m["state_db"]
+    first = _account("workspace-atomic-a", email="atomic-a@example.test")
+    second = _account("workspace-atomic-b", email="atomic-b@example.test")
+    for account in (first, second):
+        identity.normalize_account_identity(account, protocol_profile=_PROFILE_ID)
+    first_identity = identity.account_identity_from_account(first)
+    second_identity = identity.account_identity_from_account(second)
+    assert first_identity is not None and second_identity is not None
+
+    foreign_owner = "sha256:" + "f" * 64
+    state_db.codex_identity_tombstone_claim(
+        foreign_owner,
+        second_identity.installation_id,
+        second_identity.id_generation_version,
+        created_at=second_identity.created_at,
+    )
+    with pytest.raises(ValueError, match="already bound"):
+        identity.sync_configured_identity_tombstones([first, second])
+
+    assert state_db.codex_identity_tombstone_load(first_identity.owner_digest) is None
+    assert state_db.codex_identity_tombstone_load(foreign_owner)["installation_id"] == second_identity.installation_id
+
+
 def test_structured_response_mapper_never_rewrites_plain_text_uuid(m):
     mapper = m["mapper"]
     state = mapper.ProtocolIdentityMap()

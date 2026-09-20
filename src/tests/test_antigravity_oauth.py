@@ -783,7 +783,7 @@ def test_antigravity_credits_block_does_not_invent_percent(m):
     assert "🧬 模型目录:" in detail
     assert "个文本" in detail
     assert "⚡ 本地自然月使用统计" in detail
-    assert "暂无本地请求" in detail
+    assert "统计初始化中" in detail
 
 
 def test_refresh_notice_uses_antigravity_credits(m):

@@ -70,6 +70,7 @@ from .sort_primitives import (
 
 
 _BJT = timezone(timedelta(hours=8))
+_DETAIL_RENDER_CONTEXT = threading.local()
 
 
 
@@ -1532,6 +1533,11 @@ def _format_xai_spend_block(account_key: str, *, detail: bool = False,
         month_stats = _account_period_stats(
             account_key, period, month_snapshot=snapshot,
         )
+    if stats_loading and month_stats is None:
+        lines = ["<b>💵 Parrot 本地计费</b>"] if detail else []
+        lines.append(f"💎 {period['usage_label']}: <i>统计初始化中</i>")
+        lines.append(f"💵 {period['money_label']}: <i>统计初始化中</i>")
+        return "\n".join(lines)
     month = month_stats or {}
     prompt = ui.prompt_total(month.get("input") or 0, month.get("cache_creation") or 0, month.get("cache_read") or 0)
     output = int(month.get("output") or 0)
@@ -1945,7 +1951,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     # 本地累计严格使用该账户的实际/推定周期；无统一 Provider 周期时才保留
     # 明确标注的“本地自然月”，不再把自然月冒充套餐或账单周期。
     ts = period_stats
-    if prov == "antigravity":
+    if stats_loading and prov != "xai" and not _has_local_usage_or_billing(ts):
+        lines.append(f"💎 {local_period['usage_label']}: <i>统计初始化中</i>")
+    elif prov == "antigravity":
         if _has_local_usage_or_billing(ts):
             prompt = ui.prompt_total(ts["input"], ts["cache_creation"], ts["cache_read"])
             stat_line = f"💎 {local_period['usage_label']}: ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(ts['output'])}"
@@ -2137,6 +2145,12 @@ def _cch_status_label() -> str:
     return "✅ 已启用" if _cch_enabled() else "🚫 已关闭"
 
 
+def _antigravity_tls_fingerprint_enabled() -> bool:
+    antigravity = oauth_control.config_snapshot().get("antigravityOAuth") or {}
+    fingerprint = antigravity.get("tlsFingerprint") if isinstance(antigravity, dict) else {}
+    return bool(fingerprint.get("enabled", False)) if isinstance(fingerprint, dict) else False
+
+
 def _usage_toggle_target_label() -> str:
     target = _USAGE_DISPLAY_USED if _usage_display_mode() == _USAGE_DISPLAY_REMAINING else _USAGE_DISPLAY_REMAINING
     return _usage_display_label(target)
@@ -2148,6 +2162,9 @@ def _settings_text_and_kb() -> tuple[str, dict]:
     quota_status = "✅ 已启用" if quota_enabled else "🚫 已停用"
     cch_enabled = _cch_enabled()
     cch_action = "关闭" if cch_enabled else "开启"
+    fingerprint_enabled = _antigravity_tls_fingerprint_enabled()
+    fingerprint_action = "关闭" if fingerprint_enabled else "开启"
+    fingerprint_status = "✅ 已启用" if fingerprint_enabled else "🚫 已关闭"
     progress_enabled = ui.quota_progress_enabled()
     progress_status = "开启" if progress_enabled else "关闭"
 
@@ -2158,6 +2175,9 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         "",
         "🎭 <b>CCH 模式（Claude Code 伪装）</b>",
         f"当前模式: {_cch_status_label()}",
+        "",
+        "🛡️ <b>Antigravity 指纹伪装</b>",
+        f"当前状态: {fingerprint_status}",
         "",
         "📊 <b>用量显示模式</b>",
         f"当前模式: {mode_label}",
@@ -2173,6 +2193,7 @@ def _settings_text_and_kb() -> tuple[str, dict]:
         [ui.btn(f"📊 显示: {_usage_toggle_target_label()}", "oa:usage_mode:toggle")],
         [ui.btn(f"🎭 CCH模式：{cch_action}", "oa:cch_toggle"),
          ui.btn(f"📊 进度条: {progress_status}", "oa:progress_bar:toggle")],
+        [ui.btn(f"🛡 AG指纹：{fingerprint_action}", "oa:antigravity_tls_toggle")],
         [ui.btn("🏠 返回主菜单", "menu:main"),
          ui.btn("◀ 返回OAuth账户", "menu:oauth")],
     ]
@@ -2207,6 +2228,22 @@ def on_toggle_cch_mode(chat_id: int, message_id: int, cb_id: str) -> None:
         _management_context(chat_id), cch_mode=CchMode(new_mode),
     )
     ui.answer_cb(cb_id, "CCH 已开启" if new_mode == "dynamic" else "CCH 已关闭")
+    text, kb = _settings_text_and_kb()
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+
+
+def on_toggle_antigravity_tls_fingerprint(
+    chat_id: int, message_id: int, cb_id: str,
+) -> None:
+    new_value = not _antigravity_tls_fingerprint_enabled()
+    oauth_control.update_settings(
+        _management_context(chat_id),
+        antigravity_tls_fingerprint_enabled=new_value,
+    )
+    ui.answer_cb(
+        cb_id,
+        "Antigravity 指纹伪装已开启" if new_value else "Antigravity 指纹伪装已关闭",
+    )
     text, kb = _settings_text_and_kb()
     ui.edit(chat_id, message_id, text, reply_markup=kb)
 
@@ -2557,6 +2594,8 @@ def _list_text_and_kb(page: int = 1, filter_key: str = _FILTER_ALL, *,
     )
     if filter_key != _FILTER_ALL:
         summary += f"\n当前过滤: <b>{_FILTER_LABELS.get(filter_key, '全部')}</b>"
+    if stats_loading and accounts_all:
+        summary += "\n⏳ Parrot 本地统计初始化中，账户管理功能可正常使用。"
 
     if not accounts:
         empty_hint = "暂无账户，点击下方「➕ 新增账户」添加。" if not accounts_all else "当前过滤条件下暂无账户。"
@@ -2695,38 +2734,95 @@ def refresh_window_snapshots_now() -> bool:
     return ok
 
 
-def _request_window_snapshots(accounts: list[dict]) -> bool:
+def _request_window_snapshots(
+    accounts: list[dict], *, subscriber=None, on_ready=None,
+    interactive: bool = False,
+) -> bool:
     """请求缺失/过期的 quota/账户周期快照，并返回是否均已存在。"""
     ready = True
     for key, account_key, since in _oauth_window_specs(accounts):
         cached = menu_cache.WINDOW_STATS.peek(key)
-        if cached.value is None:
-            ready = False
         if not cached.fresh:
-            menu_cache.WINDOW_STATS.request(
-                key,
-                lambda target=account_key, start=since, window=str(key[-1]): _load_oauth_window_stats(
-                    target, start, window,
-                ),
-            )
+            def loader(
+                target=account_key, start=since, window=str(key[-1]),
+            ):
+                return _load_oauth_window_stats(target, start, window)
+            if cached.value is None or cached.restored:
+                read = menu_cache.WINDOW_STATS.request(
+                    key, loader,
+                    subscriber=subscriber,
+                    on_ready=on_ready,
+                    interactive=interactive,
+                )
+            else:
+                # 普通过期值仍可展示；后台更新即可，不重复编辑当前页面。
+                read = menu_cache.WINDOW_STATS.request(key, loader)
+        else:
+            read = cached
+        if read.value is None:
+            ready = False
     return ready
+
+
+def _needs_natural_period(accounts: list[dict]) -> bool:
+    for account in accounts:
+        row = oauth_control.quota_snapshot(_account_key(account))
+        if not _oauth_local_period(account, row=row).get("stats_window"):
+            return True
+    return False
+
+
+def _window_snapshots_ready(accounts: list[dict]) -> bool:
+    """只判断统计值是否可展示；渲染阶段不能暗中发起查询。"""
+    return all(
+        menu_cache.WINDOW_STATS.peek(key).value is not None
+        for key, _account_key_value, _since in _oauth_window_specs(accounts)
+    )
+
+
+def _list_snapshot_ready() -> bool:
+    accounts = oauth_control.account_entries_snapshot()
+    if not accounts:
+        return True
+    if _needs_natural_period(accounts):
+        since = _this_month_start_ts()
+        if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
+            return False
+    # 5h/7d、Fable 7d 与账户本期 Token、缓存、TPS、金额仍然全部保留；
+    # 未就绪时由页面明确显示加载状态，而不是阻断账户管理。
+    return _window_snapshots_ready(accounts)
+
+
+def _list_stats_need_refresh() -> bool:
+    accounts = oauth_control.account_entries_snapshot()
+    if not accounts:
+        return False
+    if _needs_natural_period(accounts):
+        since = _this_month_start_ts()
+        if not menu_cache.PERIOD_STATS.peek(("period", int(since))).fresh:
+            return True
+    return any(
+        not menu_cache.WINDOW_STATS.peek(key).fresh
+        for key, _account_key_value, _since in _oauth_window_specs(accounts)
+    )
 
 
 def _render_cached_list(page: int, filter_key: str) -> tuple[str, dict]:
     since = _this_month_start_ts()
     period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
-    return _list_text_and_kb(
+    accounts = oauth_control.account_entries_snapshot()
+    reads = [
+        menu_cache.WINDOW_STATS.peek(key)
+        for key, _account_key_value, _since in _oauth_window_specs(accounts)
+    ]
+    if _needs_natural_period(accounts):
+        reads.append(period)
+    ready = _list_snapshot_ready()
+    text, kb = _list_text_and_kb(
         page=page, filter_key=filter_key, month_snapshot=period.value,
+        stats_loading=not ready,
     )
-
-
-def _list_snapshot_ready() -> bool:
-    since = _this_month_start_ts()
-    if menu_cache.PERIOD_STATS.peek(("period", int(since))).value is None:
-        return False
-    # 5h/7d、Fable 7d 与账户本期 Token、缓存、TPS、金额都是页面必需内容，
-    # 不能因为快照尚未预热就静默删行。
-    return _request_window_snapshots(oauth_control.account_entries_snapshot())
+    return menu_cache.with_refreshing_notice(text, *reads), kb
 
 
 def _converge_cached_quota_state() -> None:
@@ -2739,28 +2835,82 @@ def _converge_cached_quota_state() -> None:
             print(f"[oauth_menu] cached quota evaluate failed for {account_key}: {exc}")
 
 
+def _schedule_list_stats(
+    chat_id: int, message_id: int, token: int, page: int, filter_key: str, *,
+    redraw_if_ready: bool = False,
+) -> None:
+    accounts = oauth_control.account_entries_snapshot()
+    if not accounts:
+        return
+
+    def redraw(_value=None, _error=None) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        text, kb = _render_cached_list(page, filter_key)
+        menu_cache.run_if_current(
+            chat_id, message_id, token,
+            lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+        )
+
+    if _needs_natural_period(accounts):
+        since = _this_month_start_ts()
+        period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+        if period.value is None:
+            menu_cache.request_period_snapshot(
+                since,
+                subscriber=(chat_id, message_id, token, "oauth-list-period"),
+                on_ready=redraw,
+                interactive=True,
+            )
+        elif not period.fresh:
+            menu_cache.request_period_snapshot(
+                since,
+                subscriber=(chat_id, message_id, token, "oauth-list-period"),
+                on_ready=redraw,
+                interactive=True,
+            )
+    _request_window_snapshots(
+        accounts,
+        subscriber=(chat_id, message_id, token, "oauth-list-windows"),
+        on_ready=redraw,
+        interactive=True,
+    )
+    if redraw_if_ready and _list_snapshot_ready():
+        redraw()
+
+
 def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     # 这是本地状态收敛，不查统计库也不访问网络；即使统计快照还在预热，
     # 也不能丢掉旧版进入列表时立即禁用/恢复账号的语义。
     _converge_cached_quota_state()
-    if not _list_snapshot_ready():
-        if cb_id is not None:
-            ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
+    token = menu_cache.begin_view(chat_id, message_id)
+    rendered_loading = not _list_snapshot_ready()
     text, kb = _render_cached_list(page, filter_key)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _schedule_list_stats(
+        chat_id, message_id, token, page, filter_key,
+        redraw_if_ready=rendered_loading,
+    )
 
 
 def send_new(chat_id: int, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     _converge_cached_quota_state()
-    if not _list_snapshot_ready():
-        ui.send(chat_id, menu_cache.initialization_text())
-        return
+    rendered_loading = not _list_snapshot_ready()
     text, kb = _render_cached_list(page, filter_key)
-    ui.send(chat_id, text, reply_markup=kb)
+    response = ui.send(chat_id, text, reply_markup=kb)
+    message = response.get("result") if isinstance(response, dict) and response.get("ok") else None
+    if (
+        isinstance(message, dict) and message.get("message_id")
+        and (rendered_loading or _list_stats_need_refresh())
+    ):
+        message_id = int(message["message_id"])
+        token = menu_cache.begin_view(chat_id, message_id)
+        _schedule_list_stats(
+            chat_id, message_id, token, page, filter_key,
+            redraw_if_ready=rendered_loading,
+        )
 
 
 # ─── 账户排序 ─────────────────────────────────────────────────────
@@ -3000,6 +3150,11 @@ def _format_month_stats_block(account_key: str, *,
         account_key, local_period, month_snapshot=month_snapshot,
     )
     if not _has_local_usage_or_billing(overall):
+        if stats_loading and overall is None:
+            return (
+                f"\n<b>⚡ {local_period['detail_title']}</b>\n"
+                "<i>统计初始化中，账户管理功能可正常使用。</i>"
+            )
         if oauth_control.provider_of_snapshot(account_key) == "antigravity":
             return f"\n<b>⚡ {local_period['detail_title']}</b>\n<i>暂无本地请求</i>"
         return ""
@@ -3034,7 +3189,10 @@ def _format_month_stats_block(account_key: str, *,
             if is_cursor else f"累计金额：{ui.fmt_cost(overall)}"
         ),
     ]
-    if by_model:
+    if model_loading:
+        lines.append("")
+        lines.append("按模型: <i>统计初始化中</i>")
+    elif by_model:
         lines.append("")
         lines.append("按模型: Top 3")
         for ms in by_model[:3]:
@@ -3064,16 +3222,26 @@ def _format_month_stats_block(account_key: str, *,
 
 
 def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILTER_ALL,
-                        *, refresh_quota: bool = True,
+                        *, refresh_quota: bool = False,
                         actor_chat_id: int | None = None,
                         reset_credit_count_override: int | None = None,
                         month_snapshot: dict | None = None,
                         model_stats: list[dict] | None = None,
-                        stats_loading: bool = False,
+                        stats_loading: bool | None = None,
                         workbuddy_package_page: int = 1) -> tuple[Optional[str], Optional[dict]]:
     acc = oauth_control.account_snapshot(account_key)
     if acc is None:
         return None, None
+    if stats_loading is None:
+        # 显式空快照是“已知无调用”；只有完全没有快照时才是未知。
+        stats_loading = (
+            month_snapshot is None
+            and not _oauth_detail_stats_ready(account_key)
+        )
+    if reset_credit_count_override is None:
+        contextual = getattr(_DETAIL_RENDER_CONTEXT, "reset_credit", None)
+        if contextual is not None and contextual[0] == account_key:
+            reset_credit_count_override = contextual[1]
     email = _account_display(acc)
 
     if refresh_quota and _should_refresh_account_for_ui(acc):
@@ -3264,9 +3432,37 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     return ui.truncate(text), ui.inline_kb(rows)
 
 
+def _oauth_detail_stats_ready(account_key: str) -> bool:
+    account = oauth_control.account_snapshot(account_key)
+    if account is None or not _window_snapshots_ready([account]):
+        return False
+    row = oauth_control.quota_snapshot(account_key)
+    local_period = _oauth_local_period(account, row=row)
+    natural_snapshot = None
+    if not local_period.get("stats_window"):
+        natural = menu_cache.PERIOD_STATS.peek(("period", int(_this_month_start_ts())))
+        natural_snapshot = natural.value
+        if natural_snapshot is None:
+            return False
+    aggregate = _account_period_stats(
+        account_key, local_period, month_snapshot=natural_snapshot,
+    )
+    if local_period.get("stats_window") and aggregate is None:
+        return False
+    total_calls = int((aggregate or {}).get("total") or 0)
+    if total_calls == 0:
+        return True
+    since = float(local_period["since"])
+    models = menu_cache.DETAIL_STATS.peek(("oauth-model", account_key, int(since))).value
+    return models is not None and not (isinstance(models, list) and not models)
+
+
 def _render_cached_detail(account_key: str, page: int, filter_key: str,
                           *, chat_id: int,
-                          refresh_quota: bool = False) -> tuple[Optional[str], Optional[dict]]:
+                          refresh_quota: bool = False,
+                          stats_loading: bool | None = None,
+                          reset_credit_count_override: int | None = None,
+                          workbuddy_package_page: int = 1) -> tuple[Optional[str], Optional[dict]]:
     account = oauth_control.account_snapshot(account_key) or account_key
     row = oauth_control.quota_snapshot(account_key)
     local_period = _oauth_local_period(account, row=row)
@@ -3276,16 +3472,23 @@ def _render_cached_detail(account_key: str, page: int, filter_key: str,
     aggregate = _account_period_stats(
         account_key, local_period, month_snapshot=natural.value,
     )
+    if stats_loading is None:
+        stats_loading = not _oauth_detail_stats_ready(account_key)
     return _detail_text_and_kb(
         account_key, page=page, filter_key=filter_key,
         refresh_quota=refresh_quota, actor_chat_id=chat_id,
+        reset_credit_count_override=reset_credit_count_override,
         month_snapshot=natural.value,
         model_stats=models.value,
-        stats_loading=aggregate is None or models.value is None,
+        stats_loading=stats_loading,
+        workbuddy_package_page=workbuddy_package_page,
     )
 
 
-def _queue_oauth_detail_stats(account_key: str) -> bool:
+def _queue_oauth_detail_stats(
+    account_key: str, *, subscriber=None, on_ready=None,
+    interactive: bool = False,
+) -> bool:
     """把账户周期总体/按模型统计排入中央队列；返回快照是否完整。"""
     account = oauth_control.account_snapshot(account_key)
     if account is None:
@@ -3294,13 +3497,28 @@ def _queue_oauth_detail_stats(account_key: str) -> bool:
     local_period = _oauth_local_period(account, row=row)
     since = float(local_period["since"])
 
-    ready = _request_window_snapshots([account])
+    request_kwargs = {}
+    if on_ready is not None:
+        request_kwargs = {
+            "subscriber": subscriber,
+            "on_ready": on_ready,
+            "interactive": interactive,
+        }
+    ready = _request_window_snapshots([account], **request_kwargs)
     natural_snapshot = None
     if not local_period.get("stats_window"):
-        natural_key = ("period", int(_this_month_start_ts()))
-        natural_snapshot = menu_cache.PERIOD_STATS.peek(natural_key).value
+        natural_since = _this_month_start_ts()
+        natural_key = ("period", int(natural_since))
+        natural = menu_cache.PERIOD_STATS.peek(natural_key)
+        natural_snapshot = natural.value
         if natural_snapshot is None:
             ready = False
+            menu_cache.request_period_snapshot(
+                natural_since,
+                subscriber=subscriber,
+                on_ready=on_ready,
+                interactive=interactive,
+            )
     channel_stats = _account_period_stats(
         account_key, local_period, month_snapshot=natural_snapshot,
     )
@@ -3330,19 +3548,117 @@ def _queue_oauth_detail_stats(account_key: str) -> bool:
     )
     if model.value is None or invalid_empty:
         ready = False
-    if invalid_empty or (
-        not model.fresh
-        and (model.value is not None or (aggregate_ready and total_calls > 0))
-    ):
+    def model_loader(start=since):
+        return oauth_control.channel_model_stats_snapshot(
+            f"oauth:{account_key}", since_ts=start,
+        )
+    if invalid_empty or (model.value is None and aggregate_ready and total_calls > 0):
         menu_cache.DETAIL_STATS.request(
-            model_key,
-            lambda start=since: oauth_control.channel_model_stats_snapshot(
-                f"oauth:{account_key}", since_ts=start,
-            ),
+            model_key, model_loader,
             # 修复旧进程/早点击留下的新鲜空缓存；有总体调用时 [] 不可能是完整模型结果。
             force=invalid_empty,
+            subscriber=subscriber,
+            on_ready=on_ready,
+            interactive=interactive,
         )
+    elif model.value is not None and not model.fresh:
+        menu_cache.DETAIL_STATS.request(model_key, model_loader)
     return ready
+
+
+def _schedule_oauth_detail_stats(
+    chat_id: int, message_id: int, token: int, account_key: str,
+    page: int, filter_key: str, *, redraw_if_ready: bool = False,
+    prefix: str = "", reset_credit_count_override: int | None = None,
+    workbuddy_package_page: int = 1,
+) -> None:
+    def redraw(_value=None, error=None) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        ready = False
+        if error is None:
+            _queue_oauth_detail_stats(
+                account_key,
+                subscriber=(chat_id, message_id, token, "oauth-detail"),
+                on_ready=redraw,
+                interactive=True,
+            )
+            ready = _oauth_detail_stats_ready(account_key)
+        text, kb = _render_cached_detail(
+            account_key, page, filter_key, chat_id=chat_id,
+            refresh_quota=False, stats_loading=not ready,
+            reset_credit_count_override=reset_credit_count_override,
+            workbuddy_package_page=workbuddy_package_page,
+        )
+        if text is not None:
+            menu_cache.run_if_current(
+                chat_id, message_id, token,
+                lambda: ui.edit(
+                    chat_id, message_id, prefix + text, reply_markup=kb,
+                ),
+            )
+
+    _queue_oauth_detail_stats(
+        account_key,
+        subscriber=(chat_id, message_id, token, "oauth-detail"),
+        on_ready=redraw,
+        interactive=True,
+    )
+    if redraw_if_ready and _oauth_detail_stats_ready(account_key):
+        redraw()
+
+
+def _edit_cached_detail(
+    chat_id: int, message_id: int, account_key: str,
+    page: int = 1, filter_key: str = _FILTER_ALL, *,
+    prefix: str = "", refresh_quota: bool = False,
+    reset_credit_count_override: int | None = None,
+    workbuddy_package_page: int = 1, start_view: bool = False,
+) -> bool:
+    """重绘详情；只有导航或冷统计才接管页面令牌和订阅。"""
+    if oauth_control.account_snapshot(account_key) is None:
+        return False
+    cache_loading = not _oauth_detail_stats_ready(account_key)
+    if reset_credit_count_override is None:
+        text, kb = _render_cached_detail(
+            account_key, page, filter_key, chat_id=chat_id,
+            refresh_quota=refresh_quota,
+            workbuddy_package_page=workbuddy_package_page,
+        )
+    else:
+        previous = getattr(_DETAIL_RENDER_CONTEXT, "reset_credit", None)
+        _DETAIL_RENDER_CONTEXT.reset_credit = (
+            account_key, reset_credit_count_override,
+        )
+        try:
+            text, kb = _render_cached_detail(
+                account_key, page, filter_key, chat_id=chat_id,
+                refresh_quota=refresh_quota,
+                reset_credit_count_override=reset_credit_count_override,
+                workbuddy_package_page=workbuddy_package_page,
+            )
+        finally:
+            if previous is None:
+                delattr(_DETAIL_RENDER_CONTEXT, "reset_credit")
+            else:
+                _DETAIL_RENDER_CONTEXT.reset_credit = previous
+    if text is None:
+        return False
+    rendered_loading = cache_loading and "统计初始化中" in text
+    token = None
+    if start_view or rendered_loading:
+        token = menu_cache.current_view_token(chat_id, message_id)
+        if token is None:
+            token = menu_cache.begin_view(chat_id, message_id)
+    ui.edit(chat_id, message_id, prefix + text, reply_markup=kb)
+    if token is not None:
+        _schedule_oauth_detail_stats(
+            chat_id, message_id, token, account_key, page, filter_key,
+            redraw_if_ready=rendered_loading, prefix=prefix,
+            reset_credit_count_override=reset_credit_count_override,
+            workbuddy_package_page=workbuddy_package_page,
+        )
+    return True
 
 
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
@@ -3350,18 +3666,11 @@ def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1
     if ak is None or oauth_control.account_snapshot(ak) is None:
         ui.answer_cb(cb_id, "账户已不存在，请返回重试")
         return
-    # 详情中的账户周期总体、按模型统计及 5h/7d 本地明细必须同时就绪；
-    # 冷快照时不先渲染一个口径不完整的页面。查询仍只排入中央串行调度器。
-    if not _queue_oauth_detail_stats(ak):
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
     ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
-    text, kb = _render_cached_detail(
-        ak, page, filter_key, chat_id=chat_id, refresh_quota=False,
+    _edit_cached_detail(
+        chat_id, message_id, ak, page, filter_key, refresh_quota=False,
+        start_view=True,
     )
-    if text is not None:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 刷新 Token ──────────────────────────────────────────────────
@@ -3375,12 +3684,11 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
 
     provider = oauth_control.provider_of_snapshot(ak)
     if provider == "workbuddy" and not oauth_control.workbuddy_refresh_enabled_snapshot():
-        text, kb = _detail_text_and_kb(
-            ak, page=page, filter_key=filter_key, refresh_quota=False,
-            actor_chat_id=chat_id,
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix="🛡 保护模式已阻止刷新 Token，未发出刷新请求。\n\n",
+            refresh_quota=False,
         )
-        if text:
-            ui.edit(chat_id, message_id, "🛡 保护模式已阻止刷新 Token，未发出刷新请求。\n\n" + text, reply_markup=kb)
         return
     result = _run_sync(oauth_control.force_refresh_raw(ak))
     if isinstance(result, Exception):
@@ -3408,13 +3716,11 @@ def on_refresh_token(chat_id: int, message_id: int, cb_id: str, short: str, page
         elif isinstance(sync_result, (dict, Exception)):
             model_sync_note = " · 模型同步失败（保留原目录）"
 
-    text, kb = _detail_text_and_kb(
-        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
+    _edit_cached_detail(
+        chat_id, message_id, ak, page, filter_key,
+        prefix=f"✅ Token 已刷新{model_sync_note}\n\n",
+        refresh_quota=True,
     )
-    if text:
-        ui.edit(chat_id, message_id,
-                f"✅ Token 已刷新{model_sync_note}\n\n" + text,
-                reply_markup=kb)
 
 
 # ─── 刷新用量 / 重置卡 ─────────────────────────────────────────────
@@ -3428,13 +3734,32 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
     provider = oauth_control.provider_of_snapshot(ak)
     if provider == "workbuddy":
         ui.answer_cb(cb_id, "查询中…")
+        render_state = {"loading": False}
+
         def render_query(feedback):
-            text, kb = _detail_text_and_kb(
-                ak, page=page, filter_key=filter_key, refresh_quota=False,
-                actor_chat_id=chat_id,
+            render_state["loading"] = not _oauth_detail_stats_ready(ak)
+            text, kb = _render_cached_detail(
+                ak, page, filter_key, chat_id=chat_id, refresh_quota=False,
+                stats_loading=render_state["loading"],
             )
             return (feedback + "\n\n" + text if text else None), kb
-        workbuddy_menu.start_status_query(chat_id, message_id, ak, render_query, control=oauth_control)
+
+        def resubscribe(feedback):
+            if oauth_control.account_snapshot(ak) is None:
+                return
+            token = menu_cache.current_view_token(chat_id, message_id)
+            if token is None:
+                token = menu_cache.begin_view(chat_id, message_id)
+            _schedule_oauth_detail_stats(
+                chat_id, message_id, token, ak, page, filter_key,
+                redraw_if_ready=render_state["loading"],
+                prefix=feedback + "\n\n",
+            )
+
+        workbuddy_menu.start_status_query(
+            chat_id, message_id, ak, render_query, control=oauth_control,
+            after_render=resubscribe,
+        )
         return
     if provider == "openai":
         ui.answer_cb(cb_id, "拉取 OpenAI 用量/重置卡...")
@@ -3471,12 +3796,6 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             ak, force=True, min_interval_seconds=0, timeout_s=30.0,
         ))
 
-    text, kb = _detail_text_and_kb(
-        ak, page=page, filter_key=filter_key, refresh_quota=False,
-        actor_chat_id=chat_id,
-    )
-    if not text:
-        return
     if provider == "openai":
         head = "✅ 已更新用量（wham/usage）"
         reset_credit_count = _openai_reset_credit_count_from_usage(usage_result)
@@ -3496,7 +3815,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
         elif quota_action and quota_action.get("action") == "resumed":
             head += "\n♻ 额度已恢复，已自动解除配额禁用"
-        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix=head + "\n\n", refresh_quota=False,
+        )
     elif provider == "cursor":
         head = "✅ 已更新 Cursor 套餐额度"
         if isinstance(metadata_action, dict) and metadata_action.get("action") == "updated":
@@ -3514,7 +3836,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += f"\n♻️ 已恢复 <code>{int(quota_action.get('recovered_models') or 0)}</code> 个模型"
         elif quota_action and quota_action.get("action") == "cursor_quota_unknown":
             head += "\n⚠️ 本次未取得完整分池用量，不据此解除配额暂停"
-        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix=head + "\n\n", refresh_quota=False,
+        )
     elif provider == "xai":
         head = "✅ 已更新 Grok 官方账单"
         if quota_action and quota_action.get("action") == "disabled":
@@ -3525,7 +3850,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
         elif quota_action and quota_action.get("action") == "resumed":
             head += "\n♻ 额度已恢复，已自动解除配额禁用"
-        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix=head + "\n\n", refresh_quota=False,
+        )
     elif provider == "antigravity":
         block = usage_result.get("antigravity") if isinstance(usage_result.get("antigravity"), dict) else {}
         summary_ok = bool(block.get("quota_groups")) and not block.get("quota_error")
@@ -3549,9 +3877,14 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
             head += f"\n⚠ 仍处于配额禁用（超限: <code>{ui.escape_html(hit)}</code>）"
         elif quota_action and quota_action.get("action") == "resumed":
             head += "\n♻ 额度已恢复，已自动解除配额禁用"
-        ui.edit(chat_id, message_id, head + "\n\n" + text, reply_markup=kb)
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix=head + "\n\n", refresh_quota=False,
+        )
     else:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key, refresh_quota=False,
+        )
 
 
 # ─── Cursor 模型目录 / 单模型 Max Context 默认值 ──────────────────
@@ -4037,11 +4370,7 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, short: str, page:
         return
     oauth_control.clear_errors(_management_context(chat_id), ak)
     ui.answer_cb(cb_id, "已清除该账号的所有模型冷却")
-    text, kb = _detail_text_and_kb(
-        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
-    )
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, ak, page, filter_key)
 
 
 def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
@@ -4153,14 +4482,11 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
     if provider == "openai":
         if not reset_idem or reset_stage != "execute":
             ui.answer_cb(cb_id, "需要先完成二次确认")
-            text, kb = _detail_text_and_kb(
-                ak, page=page, filter_key=filter_key, refresh_quota=False,
-                actor_chat_id=chat_id,
+            _edit_cached_detail(
+                chat_id, message_id, ak, page, filter_key,
+                prefix="⚠️ <b>未执行重置</b>\nOpenAI 官方额度重置必须经过说明页和最终确认页，不能从旧按钮或直达回调直接执行。\n\n",
+                refresh_quota=False,
             )
-            if text:
-                ui.edit(chat_id, message_id,
-                        "⚠️ <b>未执行重置</b>\nOpenAI 官方额度重置必须经过说明页和最终确认页，不能从旧按钮或直达回调直接执行。\n\n" + text,
-                        reply_markup=kb)
             return
         ui.answer_cb(cb_id, "正在调用 OpenAI 官方重置...")
         try:
@@ -4181,13 +4507,6 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
                 reset_credit_count_override = int(result.get("available_count"))
             except (TypeError, ValueError):
                 reset_credit_count_override = None
-        text, kb = _detail_text_and_kb(
-            ak, page=page, filter_key=filter_key, refresh_quota=False,
-            actor_chat_id=chat_id,
-            reset_credit_count_override=reset_credit_count_override,
-        )
-        if not text:
-            return
         if outcome in ("reset", "alreadyRedeemed"):
             prefix = f"♻️ {ui.provider_custom_emoji_html('openai')} <b>OpenAI 官方额度重置已执行</b>\n"
             if result.get("available_count") is not None:
@@ -4211,19 +4530,17 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
             else:
                 prefix += "ℹ️ 已刷新最新额度；未触发自动解禁动作。\n"
             prefix += "\n"
-            ui.edit(chat_id, message_id, prefix + text, reply_markup=kb)
         elif outcome == "nothingToReset":
-            ui.edit(chat_id, message_id,
-                    "ℹ️ OpenAI 返回: 当前没有符合条件的使用窗口需要重置。\n\n" + text,
-                    reply_markup=kb)
+            prefix = "ℹ️ OpenAI 返回: 当前没有符合条件的使用窗口需要重置。\n\n"
         elif outcome == "noCredit":
-            ui.edit(chat_id, message_id,
-                    "⚠️ OpenAI 返回: 当前没有可用的官方重置次数。\n\n" + text,
-                    reply_markup=kb)
+            prefix = "⚠️ OpenAI 返回: 当前没有可用的官方重置次数。\n\n"
         else:
-            ui.edit(chat_id, message_id,
-                    f"⚠️ OpenAI 重置返回未知结果: <code>{ui.escape_html(str(outcome))}</code>\n\n" + text,
-                    reply_markup=kb)
+            prefix = f"⚠️ OpenAI 重置返回未知结果: <code>{ui.escape_html(str(outcome))}</code>\n\n"
+        _edit_cached_detail(
+            chat_id, message_id, ak, page, filter_key,
+            prefix=prefix, refresh_quota=False,
+            reset_credit_count_override=reset_credit_count_override,
+        )
         return
 
     result = oauth_control.reset_quota_now(_management_context(chat_id), ak)
@@ -4246,31 +4563,23 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "auth_error 需重新登录")
     else:
         ui.answer_cb(cb_id, "无需重置")
-    text, kb = _detail_text_and_kb(
-        ak, page=page, filter_key=filter_key, refresh_quota=False,
-        actor_chat_id=chat_id,
-    )
-    if text:
-        if action == "reset":
-            prefix = (
-                "♻️ <b>已清理本地配额禁用</b>\n"
-                "已清除该账号的 quota 禁用、模型冷却和本地 quota 缓存；"
-                "下一次真实请求/刷新会重新采样。\n\n"
-            )
-            ui.edit(chat_id, message_id, prefix + text, reply_markup=kb)
-        elif action == "reset_failed":
-            if result.get("required_state_cleared"):
-                detail = "本地阻断已清，但账号启用未能持久化；账号仍保持禁用。"
-            else:
-                detail = "至少一项本地配额/冷却状态未能持久化清除；账号仍保持禁用。"
-            ui.edit(
-                chat_id,
-                message_id,
-                f"⚠️ <b>本地配额重置失败</b>\n{detail}\n\n" + text,
-                reply_markup=kb,
-            )
+    prefix = ""
+    if action == "reset":
+        prefix = (
+            "♻️ <b>已清理本地配额禁用</b>\n"
+            "已清除该账号的 quota 禁用、模型冷却和本地 quota 缓存；"
+            "下一次真实请求/刷新会重新采样。\n\n"
+        )
+    elif action == "reset_failed":
+        if result.get("required_state_cleared"):
+            detail = "本地阻断已清，但账号启用未能持久化；账号仍保持禁用。"
         else:
-            ui.edit(chat_id, message_id, text, reply_markup=kb)
+            detail = "至少一项本地配额/冷却状态未能持久化清除；账号仍保持禁用。"
+        prefix = f"⚠️ <b>本地配额重置失败</b>\n{detail}\n\n"
+    _edit_cached_detail(
+        chat_id, message_id, ak, page, filter_key,
+        prefix=prefix, refresh_quota=False,
+    )
 
 
 def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
@@ -4280,11 +4589,7 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, short: str, pag
         return
     oauth_control.clear_affinity(_management_context(chat_id), ak)
     ui.answer_cb(cb_id, "已清亲和")
-    text, kb = _detail_text_and_kb(
-        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
-    )
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, ak, page, filter_key)
 
 
 # ─── 启用 / 禁用 ──────────────────────────────────────────────────
@@ -4310,11 +4615,7 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int =
         oauth_control.set_account_enabled(_management_context(chat_id), ak, True)
         ui.answer_cb(cb_id, "已启用")
 
-    text, kb = _detail_text_and_kb(
-        ak, page=page, filter_key=filter_key, actor_chat_id=chat_id,
-    )
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, ak, page, filter_key)
 
 
 # ─── 删除（二次确认） ─────────────────────────────────────────────
@@ -6448,6 +6749,9 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         return True
     if data == "oa:cch_toggle":
         on_toggle_cch_mode(chat_id, message_id, cb_id)
+        return True
+    if data == "oa:antigravity_tls_toggle":
+        on_toggle_antigravity_tls_fingerprint(chat_id, message_id, cb_id)
         return True
     if data == "oa:progress_bar:toggle":
         on_toggle_quota_progress_bar(chat_id, message_id, cb_id)

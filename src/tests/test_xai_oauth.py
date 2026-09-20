@@ -577,6 +577,7 @@ def test_xai_channel_request_shape_and_provider_capabilities(m):
     assert "tool_search" not in adapter.capabilities.native_state
     assert "namespace" not in adapter.capabilities.native_state
     assert "web_search" in adapter.capabilities.native_state
+    assert "x_search" in adapter.capabilities.native_state
     assert "ws" not in adapter.capabilities.transports
 
     matrix_caps = m["capabilities_for_channel"](ch)
@@ -584,6 +585,7 @@ def test_xai_channel_request_shape_and_provider_capabilities(m):
     assert "tool_search" not in matrix_caps.native_state
     assert "namespace" not in matrix_caps.native_state
     assert "web_search" in matrix_caps.native_state
+    assert "x_search" in matrix_caps.native_state
     assert "ws" not in matrix_caps.transports
 
     # Register this synthetic selected generation in the authoritative account inventory.
@@ -697,6 +699,60 @@ def test_xai_channel_keeps_native_web_search_and_normalizes_aliases(m):
     }]
     assert payload["tool_choice"] == {"type": "web_search"}
     assert payload["parallel_tool_calls"] is True
+
+
+def test_xai_channel_keeps_native_x_search_parameters(m):
+    from src import search_tool_policy
+
+    _setup(m)
+    ch = m["XAIOAuthChannel"]({
+        "provider": "xai",
+        "email": "grok@example.test",
+        "subject": "sub-1",
+        "access_token": "at-old",
+        "refresh_token": "rt-old",
+        "expired": _future_expired(),
+        "models": ["grok-4"],
+    })
+    m['config'].update(lambda cfg: cfg.update(oauthAccounts=[{
+        'provider': 'xai', 'email': 'grok@example.test', 'subject': 'sub-1',
+    }]))
+    old_ensure = m["oauth_manager"].ensure_valid_token
+
+    async def fake_ensure(account_key, **kwargs):
+        return "at-fresh"
+
+    m["oauth_manager"].ensure_valid_token = fake_ensure
+    body = {
+        "model": "grok-4",
+        "input": "What are people saying about xAI?",
+        "tools": [{
+            "type": "x_search",
+            "allowed_x_handles": ["xai"],
+            "from_date": "2026-09-01",
+            "to_date": "2026-09-20",
+            "enable_image_understanding": True,
+            "enable_video_understanding": True,
+        }],
+        "tool_choice": {"type": "x_search"},
+        "parallel_tool_calls": True,
+    }
+    try:
+        req = asyncio_run(async_build(ch, body))
+        invalid = {**body, "tools": [{
+            **body["tools"][0], "from_date": "2026-09-01T00:00:00Z",
+        }]}
+        with pytest.raises(ValueError, match="YYYY-MM-DD"):
+            asyncio_run(async_build(ch, invalid))
+    finally:
+        m["oauth_manager"].ensure_valid_token = old_ensure
+
+    payload = json.loads(req.body.decode("utf-8"))
+    assert payload["tools"] == body["tools"]
+    assert payload["tool_choice"] == {"type": "x_search"}
+    assert payload["parallel_tool_calls"] is True
+    assert search_tool_policy.kind(body["tools"][0]) is None
+    assert search_tool_policy.needs_loop(body) is False
 
 
 def test_xai_cost_aggregation_from_sse_usage(m):

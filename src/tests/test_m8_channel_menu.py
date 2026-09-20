@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+from types import SimpleNamespace
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -166,6 +167,124 @@ def _add_channel(m, name, url="https://example.com/v", models=None):
         "name": name, "baseUrl": url, "apiKey": "sk-testkey12345",
         "models": models, "cc_mimicry": True, "enabled": True,
     })
+
+
+def test_cold_stats_do_not_block_channel_list_or_detail(m):
+    _setup(m)
+    m["menu_cache"].PERIOD_STATS.clear()
+    m["menu_cache"].DETAIL_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    menu = m["channel_menu"]
+
+    menu.show(42, 100, "cb-empty")
+    empty = rec.last("editMessageText")
+    assert empty and "共 0 个" in empty["text"]
+    assert any(
+        button.get("callback_data") == "chw:start"
+        for row in empty["reply_markup"]["inline_keyboard"]
+        for button in row
+    )
+
+    _add_channel(m, "cold-channel")
+    rec.clear()
+    menu.show(42, 100, "cb-list")
+    listing = rec.last("editMessageText")
+    assert listing and "cold-channel" in listing["text"]
+    assert "统计初始化中" in listing["text"]
+    assert "暂无调用" not in listing["text"]
+
+    rec.clear()
+    short = m["ui"].register_code("cold-channel")
+    menu.on_view(42, 100, "cb-detail", short)
+    detail = rec.last("editMessageText")
+    assert detail and "cold-channel" in detail["text"]
+    assert "统计初始化中" in detail["text"]
+    callbacks = {
+        button.get("callback_data", "")
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for button in row
+    }
+    assert any(value.startswith("ch:edit:") for value in callbacks)
+    assert any(value.startswith("ch:del:") for value in callbacks)
+
+
+def test_cold_channel_actions_keep_loading_state_and_resubscribe(m, monkeypatch):
+    _setup(m)
+    _add_channel(m, "cold-actions")
+    cache = m["menu_cache"]
+    cache.PERIOD_STATS.clear()
+    cache.DETAIL_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    menu = m["channel_menu"]
+    subscriptions = []
+
+    def request_period(since, **kwargs):
+        subscriptions.append(kwargs.get("subscriber"))
+        return cache.PERIOD_STATS.peek(("period", int(since)))
+
+    token = cache.begin_view(42, 100)
+    monkeypatch.setattr(cache, "request_period_snapshot", request_period)
+    monkeypatch.setattr(
+        cache, "begin_view",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate begin_view")),
+    )
+    monkeypatch.setattr(
+        menu._CONTROL, "schedule_provider_usage",
+        lambda *_args, **_kwargs: SimpleNamespace(queued=True),
+    )
+    short = m["ui"].register_code("cold-actions")
+
+    actions = (
+        lambda: menu.on_toggle(42, 100, "cb-toggle", short),
+        lambda: menu.on_usage_refresh(42, 100, "cb-refresh", short),
+        lambda: menu.on_clear_errors(42, 100, "cb-clear", short),
+    )
+    for action in actions:
+        rec.clear()
+        subscriptions.clear()
+        action()
+        edits = rec.by("editMessageText")
+        assert edits
+        assert "统计初始化中" in edits[-1]["text"]
+        assert "暂无调用" not in edits[-1]["text"]
+        assert subscriptions
+        assert subscriptions[-1][2:] == (token, "channel-detail-period")
+
+
+def test_channel_list_redraws_if_snapshot_finishes_between_render_and_subscribe(
+    m, monkeypatch,
+):
+    _setup(m)
+    _add_channel(m, "race-channel")
+    cache = m["menu_cache"]
+    cache.PERIOD_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    menu = m["channel_menu"]
+    original_render = menu._render_cached_list
+    render_count = 0
+
+    def finish_during_first_render(page):
+        nonlocal render_count
+        render_count += 1
+        rendered = original_render(page)
+        if render_count == 1:
+            since = cache.month_start_ts()
+            cache.PERIOD_STATS.store(
+                ("period", int(since)), {"by_channel": {}, "by_apikey": {}},
+            )
+        return rendered
+
+    monkeypatch.setattr(menu, "_render_cached_list", finish_during_first_render)
+    menu.show(42, 100, "cb-race")
+
+    edits = rec.by("editMessageText")
+    assert len(edits) == 2
+    assert "统计初始化中" in edits[0]["text"]
+    assert "统计初始化中" not in edits[1]["text"]
+    assert "暂无调用" in edits[1]["text"]
 
 
 def test_existing_zhipu_1310_is_upgraded_to_stored_reset_on_startup(m):

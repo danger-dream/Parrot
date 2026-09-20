@@ -174,7 +174,10 @@ def _run_settings(case, monkeypatch):
     })
     op = case["entry"]["scenario"]; steps = []
     if op == "settings_and_toggles":
-        for callback in ("oa:settings", "oa:usage_mode:toggle", "oa:cch_toggle", "oa:progress_bar:toggle"):
+        for callback in (
+            "oa:settings", "oa:usage_mode:toggle", "oa:cch_toggle",
+            "oa:progress_bar:toggle", "oa:antigravity_tls_toggle",
+        ):
             om.handle_callback(42, 100, f"cb-{callback}", callback)
     elif op == "quota_page_toggle":
         for callback in ("oa:quota", "oa:quota_toggle", "oa:quota_toggle"):
@@ -220,7 +223,7 @@ def test_oauth_07_defaults_settings_strict_trace(case, monkeypatch):
         "TG-OA-07.oam_bulk_full": (1, 0),
         "TG-OA-07.oam_bulk_cancel_expired": (1, 0),
         "TG-OA-07.oam_sync": (2, 0),
-        "TG-OA-SET-01.settings_toggles": (0, 4),
+        "TG-OA-SET-01.settings_toggles": (0, 5),
     }
     assert (buttons, phrases) == deltas.get(case["caseId"], (0, 0))
     check_trace(expected, RUNNERS[case["capabilityId"]](case, monkeypatch))
@@ -235,7 +238,7 @@ def _source_callback_families():
 
 
 def test_segment_schema_unique_ids_capabilities_callback_and_state_bidirectional_coverage():
-    cases = load_jsonl(SEGMENT)
+    cases = cases_for(*ASSIGNED_IDS)
     assert_capability_coverage(ASSIGNED_IDS, cases)
     assert len({case["caseId"] for case in cases}) == len(cases)
     serialized = json.dumps(cases, ensure_ascii=False)

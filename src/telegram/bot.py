@@ -21,6 +21,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from .. import startup_timing
 from ..async_owned import await_owned
 from . import menu_cache, states, ui
 from .menus import (
@@ -133,15 +134,79 @@ def is_configured() -> bool:
     return bool(ui.get_token())
 
 
-def start() -> None:
+def _startup_api_call(
+    operation: str,
+    call: Callable[[], object],
+) -> tuple[bool, Optional[dict]]:
+    """Run one required Bot API initialization call without logging credentials."""
+    started_ns = startup_timing.now_ns()
+    phase = "telegram.api." + operation.replace("(", "-").replace(")", "").lower()
+    try:
+        result = call()
+    except Exception as exc:
+        startup_timing.log(
+            phase,
+            started_ns=started_ns,
+            status="error",
+            error=type(exc).__name__,
+        )
+        print(
+            f"[tg] bot startup failed ({operation}): {type(exc).__name__}. "
+            "请检查 telegram.botToken 和服务器到 api.telegram.org 的网络后重启。"
+        )
+        return False, None
+    if isinstance(result, dict) and result.get("ok") is True:
+        startup_timing.log(phase, started_ns=started_ns)
+        return True, result
+    code = result.get("error_code") if isinstance(result, dict) else None
+    if code in {401, 404}:
+        reason = f"Bot Token 无效或已撤销（Telegram {code}）"
+    elif code is not None:
+        reason = f"Telegram API 拒绝请求（错误码 {code}）"
+    else:
+        reason = "未收到 Telegram API 的成功响应"
+    startup_timing.log(
+        phase,
+        started_ns=started_ns,
+        status="rejected",
+        error_code=code,
+    )
+    print(
+        f"[tg] bot startup failed ({operation}): {reason}。"
+        "请检查 telegram.botToken 和服务器到 api.telegram.org 的网络后重启。"
+    )
+    return False, result if isinstance(result, dict) else None
+
+
+def _close_failed_start_session() -> None:
+    try:
+        ui.close_session()
+    except Exception as exc:
+        print(f"[tg] failed-start session close failed: {type(exc).__name__}")
+
+
+def start() -> bool:
     global _thread, _running, _run_generation, _stop_event
     global _starting, _start_done_event
+    start_started_ns = startup_timing.now_ns()
     if not is_configured():
+        startup_timing.log(
+            "telegram.start-total", started_ns=start_started_ns, status="skipped",
+        )
         print("[tg] not configured (empty token), skipping start")
-        return
+        return False
     with _lifecycle_lock:
-        if _running or _starting or _stopping:
-            return
+        if _running:
+            startup_timing.log(
+                "telegram.start-total", started_ns=start_started_ns,
+                status="already-running",
+            )
+            return True
+        if _starting or _stopping:
+            startup_timing.log(
+                "telegram.start-total", started_ns=start_started_ns, status="busy",
+            )
+            return False
         _starting = True
         start_done = threading.Event()
         _start_done_event = start_done
@@ -154,18 +219,20 @@ def start() -> None:
     launched = False
     try:
         if not _activate_start_generation(generation, stop_event):
-            return
+            return False
 
         # Startup calls can be slow. They run without the lifecycle lock, while
-        # stop can invalidate this generation and wait for their leases.
-        _drop_pending_updates()
+        # stop can invalidate this generation and wait for their leases. Every
+        # required response must be an explicit Bot API success before readiness.
+        if not _drop_pending_updates():
+            _close_failed_start_session()
+            return False
         if not _poll_generation_active(generation, stop_event):
-            return
+            return False
 
-        ui.delete_my_commands()
-        if not _poll_generation_active(generation, stop_event):
-            return
-        ui.set_my_commands([
+        # setMyCommands replaces the complete command list for the same scope;
+        # deleting it first is a redundant Bot API round-trip.
+        commands_set, _ = _startup_api_call("setMyCommands", lambda: ui.set_my_commands([
             {"command": "start",    "description": "打开管理面板"},
             {"command": "menu",     "description": "打开管理面板"},
             {"command": "stats",    "description": "统计汇总"},
@@ -179,14 +246,17 @@ def start() -> None:
             {"command": "proxy",    "description": "代理管理 / 路由规则"},
             {"command": "settings", "description": "系统设置"},
             {"command": "help",     "description": "帮助"},
-        ])
+        ]))
+        if not commands_set:
+            _close_failed_start_session()
+            return False
         if not _poll_generation_active(generation, stop_event):
-            return
+            return False
 
         ui.install_notify_handler()
         with _lifecycle_lock:
             if not _poll_generation_active_locked(generation, stop_event):
-                return
+                return False
             # Starting the scheduler and publishing/starting the poll owner are a
             # short atomic phase relative to stop; no network I/O occurs here.
             menu_cache.start()
@@ -198,7 +268,8 @@ def start() -> None:
             _thread = poll_thread
             poll_thread.start()
             launched = True
-        print("[tg] bot started (polling)")
+        print("[tg] bot started (polling ready)")
+        return True
     finally:
         with _lifecycle_condition:
             _starting = False
@@ -207,6 +278,11 @@ def start() -> None:
                 stop_event.set()
             start_done.set()
             _lifecycle_condition.notify_all()
+        startup_timing.log(
+            "telegram.start-total",
+            started_ns=start_started_ns,
+            status="ready" if launched else "failed",
+        )
 
 
 def _activate_start_generation(
@@ -309,27 +385,31 @@ async def stop_async() -> None:
     await await_owned(asyncio.to_thread(_finish_stop, ticket))
 
 
-def _drop_pending_updates() -> None:
-    """丢弃 TG 服务端的所有未处理 update。
+def _drop_pending_updates() -> bool:
+    """丢弃待处理 update；两个初始化调用都成功时才返回 True。
 
-    实现：调 deleteWebhook(drop_pending_updates=True)。
-    我们本来就没用 webhook（用 polling），所以这条调用对功能无副作用，
-    它的语义就是"清空 update 队列"。同时把 _offset 标记为 1，
-    避免下一轮 polling 重新尝试 offset=0。
+    实现：调 deleteWebhook(drop_pending_updates=True)。我们本来就没用
+    webhook（用 polling），所以这条调用对功能无副作用。再用 offset=-1
+    推进到队列尾；任一接口失败都不得继续宣告 polling ready。
     """
     global _offset
-    try:
-        ui.api("deleteWebhook", {"drop_pending_updates": True})
-        # 再用 offset=-1 取一次最新 update_id，把 _offset 推进到队列尾
-        # （deleteWebhook 已清空，这里多数返回空；保险起见兜底处理一次）
-        result = ui.api("getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
-        if result and result.get("ok"):
-            updates = result.get("result") or []
-            if updates:
-                _offset = updates[-1]["update_id"] + 1
-        print(f"[tg] dropped pending updates, offset={_offset}")
-    except Exception as exc:
-        print(f"[tg] drop pending updates failed: {exc}")
+    deleted, _ = _startup_api_call(
+        "deleteWebhook",
+        lambda: ui.api("deleteWebhook", {"drop_pending_updates": True}),
+    )
+    if not deleted:
+        return False
+    fetched, result = _startup_api_call(
+        "getUpdates(init)",
+        lambda: ui.api("getUpdates", {"offset": -1, "limit": 1, "timeout": 0}),
+    )
+    if not fetched:
+        return False
+    updates = (result.get("result") or []) if result is not None else []
+    if updates:
+        _offset = updates[-1]["update_id"] + 1
+    print(f"[tg] dropped pending updates, offset={_offset}")
+    return True
 
 
 # ─── 主循环 ───────────────────────────────────────────────────────

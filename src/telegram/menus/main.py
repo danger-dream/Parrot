@@ -261,11 +261,12 @@ def _compose_text(
 
 
 def _compose_from_read(read: menu_cache.CacheRead) -> str:
-    return _compose_text(
+    text = _compose_text(
         read.value,
         lifetime_loading=read.value is None and read.error is None,
         lifetime_unavailable=read.value is None and read.error is not None,
     )
+    return menu_cache.with_refreshing_notice(text, read)
 
 
 def _edit_lifetime_result(
@@ -275,7 +276,13 @@ def _edit_lifetime_result(
     value: dict | None,
     error: Exception | None,
 ) -> None:
-    read = menu_cache.CacheRead(value, error is None, False, error)
+    if error is not None:
+        current = menu_cache.LIFETIME_STATS.peek("lifetime")
+        read = current if current.value is not None else menu_cache.CacheRead(
+            None, False, False, error,
+        )
+    else:
+        read = menu_cache.CacheRead(value, True, False)
     menu_cache.run_if_current(
         chat_id,
         message_id,
@@ -310,7 +317,7 @@ def show(chat_id: int) -> None:
         _compose_from_read(lifetime),
         reply_markup=_kb(),
     )
-    if lifetime.value is not None:
+    if lifetime.value is not None and not lifetime.restored:
         return
     result = response.get("result") if isinstance(response, dict) else None
     message_id = result.get("message_id") if isinstance(result, dict) else None
@@ -333,7 +340,7 @@ def show_edit(chat_id: int, message_id: int) -> bool:
         _compose_from_read(lifetime),
         reply_markup=_kb(),
     )
-    if lifetime.value is None:
+    if lifetime.value is None or lifetime.restored:
         _request_lifetime_update(chat_id, message_id, token)
     return True
 

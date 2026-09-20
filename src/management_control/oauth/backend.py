@@ -354,20 +354,24 @@ class OAuthBackend:
         config.update(mutate)
 
     @staticmethod
-    def _settings_from(cfg: dict) -> tuple[bool, int, float, str]:
+    def _settings_from(cfg: dict) -> tuple[bool, int, float, str, bool]:
         quota = cfg.get("quotaMonitor") or {}
         raw_mode = str(cfg.get("cchMode") or "disabled").strip().lower()
         # Frozen TG treats every historical/non-dynamic value (including
         # ``static``) as disabled.  Keep that fallback at the API boundary.
         mode = raw_mode if raw_mode in {"disabled", "dynamic"} else "disabled"
+        antigravity = cfg.get("antigravityOAuth") or {}
+        fingerprint = antigravity.get("tlsFingerprint") if isinstance(antigravity, dict) else {}
+        fingerprint = fingerprint if isinstance(fingerprint, dict) else {}
         return (
             bool(quota.get("enabled", False)),
             int(quota.get("intervalSeconds", 60) or 60),
             float(quota.get("disableThresholdPercent", 95) or 95),
             mode,
+            bool(fingerprint.get("enabled", False)),
         )
 
-    def get_settings(self) -> tuple[bool, int, float, str]:
+    def get_settings(self) -> tuple[bool, int, float, str, bool]:
         return self._settings_from(config.get())
 
     def _quota_mutator(self, quota_enabled, interval_seconds, threshold_percent):
@@ -381,12 +385,13 @@ class OAuthBackend:
 
     def update_settings_conditional(
         self,
-        expected: tuple[bool, int, float, str],
+        expected: tuple[bool, int, float, str, bool],
         *,
         quota_enabled: bool | None = None,
         interval_seconds: int | None = None,
         threshold_percent: float | None = None,
         cch_mode: str | None = None,
+        antigravity_tls_fingerprint_enabled: bool | None = None,
     ) -> dict:
         result = {"status": "revision_conflict"}
         mutate_quota = self._quota_mutator(quota_enabled, interval_seconds, threshold_percent)
@@ -397,6 +402,16 @@ class OAuthBackend:
             mutate_quota(cfg)
             if cch_mode is not None:
                 cfg["cchMode"] = cch_mode
+            if antigravity_tls_fingerprint_enabled is not None:
+                antigravity = cfg.get("antigravityOAuth")
+                if not isinstance(antigravity, dict):
+                    antigravity = {}
+                    cfg["antigravityOAuth"] = antigravity
+                fingerprint = antigravity.get("tlsFingerprint")
+                if not isinstance(fingerprint, dict):
+                    fingerprint = {}
+                    antigravity["tlsFingerprint"] = fingerprint
+                fingerprint["enabled"] = bool(antigravity_tls_fingerprint_enabled)
             result["status"] = "updated"
 
         config.update(mutate, skip_if_unchanged=True)
@@ -409,6 +424,7 @@ class OAuthBackend:
         interval_seconds: int | None = None,
         threshold_percent: float | None = None,
         cch_mode: str | None = None,
+        antigravity_tls_fingerprint_enabled: bool | None = None,
     ) -> None:
         mutate_quota = self._quota_mutator(quota_enabled, interval_seconds, threshold_percent)
 
@@ -416,6 +432,16 @@ class OAuthBackend:
             mutate_quota(cfg)
             if cch_mode is not None:
                 cfg["cchMode"] = cch_mode
+            if antigravity_tls_fingerprint_enabled is not None:
+                antigravity = cfg.get("antigravityOAuth")
+                if not isinstance(antigravity, dict):
+                    antigravity = {}
+                    cfg["antigravityOAuth"] = antigravity
+                fingerprint = antigravity.get("tlsFingerprint")
+                if not isinstance(fingerprint, dict):
+                    fingerprint = {}
+                    antigravity["tlsFingerprint"] = fingerprint
+                fingerprint["enabled"] = bool(antigravity_tls_fingerprint_enabled)
 
         config.update(mutate)
 

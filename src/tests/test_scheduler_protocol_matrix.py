@@ -393,6 +393,47 @@ def test_responses_codex_oauth_still_rejects_other_hosted_tools(monkeypatch):
     ]
 
 
+def test_x_search_history_candidate_binding_distinguishes_real_custom_and_mixed_state(monkeypatch):
+    from src.search_xai import X_SEARCH_CALL_NAMES
+
+    xai = _ch("xai-r", "openai-responses", type="oauth", provider="xai")
+    generic = _ch("api-r", "openai-responses", type="api", provider="openai")
+    anthropic = _ch("anthropic", "anthropic")
+    monkeypatch.setattr(scheduler.registry, "all_channels", lambda: [xai, generic, anthropic])
+    monkeypatch.setattr(scheduler.cooldown, "is_blocked", lambda *_: False)
+    monkeypatch.setattr(scheduler.concurrency, "is_saturated", lambda *_: False)
+
+    internal_name = sorted(X_SEARCH_CALL_NAMES)[0]
+    x_history = {"model": "m", "input": [{
+        "type": "custom_tool_call", "id": "xs_1", "call_id": "xs_1",
+        "name": internal_name, "status": "completed",
+    }]}
+    available, _, _, _ = scheduler._filter_candidates("m", "responses", body=x_history)
+    assert [ch.key for ch, _ in available] == ["xai-r"]
+
+    ordinary_custom = {
+        "model": "m",
+        "tools": [{"type": "custom", "name": internal_name, "format": {"type": "text"}}],
+        "input": [{
+            "type": "custom_tool_call", "id": "ct_1", "call_id": "ct_1",
+            "name": internal_name, "status": "completed", "input": "user payload",
+        }],
+    }
+    available, _, _, _ = scheduler._filter_candidates("m", "responses", body=ordinary_custom)
+    assert [ch.key for ch, _ in available] == ["api-r"]
+
+    mixed = {"model": "m", "input": [
+        {"type": "x_search_call", "id": "xs_1", "status": "completed"},
+        {"type": "mcp_call", "id": "mcp_1", "status": "completed"},
+    ]}
+    available, saturated, plans, guards = scheduler._filter_candidates(
+        "m", "responses", body=mixed,
+    )
+    assert available == [] and saturated == [] and plans == {}
+    assert any("mcp_call" in reason for reason in guards)
+    assert any("x_search" in reason for reason in guards)
+
+
 def test_responses_include_only_encrypted_reasoning_can_fallback(monkeypatch):
     channels = [_ch("a", "anthropic"), _ch("c", "openai-chat"), _ch("r", "openai-responses")]
     monkeypatch.setattr(scheduler.registry, "all_channels", lambda: channels)

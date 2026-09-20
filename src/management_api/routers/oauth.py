@@ -684,7 +684,7 @@ def sync_oauth_accountmodels(
     "/oauth/settings",
     operation_id="getOAuthSettings",
     response_model=DataEnvelope[OAuthSettingsData],
-    responses=responses(200, {"quotaMonitor": {"enabled": False, "intervalSeconds": 60, "thresholdPercent": 95}, "cchMode": "disabled", "revision": "revision-example"}),
+    responses=responses(200, {"quotaMonitor": {"enabled": False, "intervalSeconds": 60, "thresholdPercent": 95}, "cchMode": "disabled", "antigravityTlsFingerprintEnabled": False, "revision": "revision-example"}),
 )
 def get_oauth_settings(
     request: Request,
@@ -700,6 +700,7 @@ def get_oauth_settings(
                 thresholdPercent=result.quota_monitor_threshold_percent,
             ),
             cchMode=result.cch_mode,
+            antigravityTlsFingerprintEnabled=result.antigravity_tls_fingerprint_enabled,
             revision=result.revision,
         ),
         meta=meta(request),
@@ -710,7 +711,7 @@ def get_oauth_settings(
     "/oauth/settings",
     operation_id="updateOAuthSettings",
     response_model=DataEnvelope[OAuthSettingsData],
-    responses=responses(200, {"quotaMonitor": {"enabled": True, "intervalSeconds": 120, "thresholdPercent": 90}, "cchMode": "dynamic", "revision": "revision-example"}, ManagementErrorCode.REVISION_CONFLICT),
+    responses=responses(200, {"quotaMonitor": {"enabled": True, "intervalSeconds": 120, "thresholdPercent": 90}, "cchMode": "dynamic", "antigravityTlsFingerprintEnabled": True, "revision": "revision-example"}, ManagementErrorCode.REVISION_CONFLICT),
 )
 def update_oauth_settings(
     body: Annotated[UpdateOAuthSettingsRequest, Body()],
@@ -726,6 +727,7 @@ def update_oauth_settings(
         interval_seconds=quota.intervalSeconds if quota else None,
         threshold_percent=quota.thresholdPercent if quota else None,
         cch_mode=body.cchMode,
+        antigravity_tls_fingerprint_enabled=body.antigravityTlsFingerprintEnabled,
         expected_revision=if_match,
     )
     return DataEnvelope(
@@ -736,6 +738,7 @@ def update_oauth_settings(
                 thresholdPercent=result.quota_monitor_threshold_percent,
             ),
             cchMode=result.cch_mode,
+            antigravityTlsFingerprintEnabled=result.antigravity_tls_fingerprint_enabled,
             revision=result.revision,
         ),
         meta=meta(request),

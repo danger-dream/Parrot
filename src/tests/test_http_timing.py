@@ -213,6 +213,127 @@ def _open_kwargs(*, response_mode="stream"):
     }
 
 
+class _SSBridgeLease:
+    proxy_url = "http://127.0.0.1:32123"
+    proxy_auth = ("ephemeral-user", "ephemeral-password")
+
+    def __init__(self):
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _SSConnector(_Connector):
+    type = "ss2022"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.acquire_calls = []
+        self.original_client_calls = 0
+        self.lease = _SSBridgeLease()
+
+    async def acquire_curl_proxy(self, host, port, *, timeout, timing):
+        self.acquire_calls.append((host, port, timeout, timing))
+        return self.lease
+
+    def create_httpx_client(self, *, timeout, byte_counter, timing):
+        self.original_client_calls += 1
+        return super().create_httpx_client(
+            timeout=timeout, byte_counter=byte_counter, timing=timing,
+        )
+
+
+@pytest.mark.asyncio
+async def test_ss2022_fingerprint_runtime_acquires_target_locked_bridge(monkeypatch):
+    inserted, _updates = _patch_persistence(monkeypatch)
+    connector = _SSConnector()
+    captured = {}
+
+    def resolve_route(channel, model, *, proxy_purpose=None):
+        captured["route"] = (channel.key, model, proxy_purpose)
+        return [("ss-route", connector)], None
+
+    monkeypatch.setattr(http_runtime, "_resolve_http_route_chain", resolve_route)
+
+    class Client:
+        async def aclose(self):
+            await captured["route_owner"].aclose()
+
+    def create_client(profile, **kwargs):
+        captured.update(profile=profile, **kwargs)
+        return Client()
+
+    monkeypatch.setattr(http_runtime, "create_impersonated_client", create_client)
+    monkeypatch.setattr(
+        http_runtime, "open_stream",
+        lambda client, request: _Context(request),
+    )
+    kwargs = _open_kwargs(response_mode="non_stream")
+    kwargs.update(
+        channel=SimpleNamespace(
+            key="oauth:antigravity:image@example.test:project",
+            tls_fingerprint="chrome131",
+            internal_loopback=False,
+        ),
+        resolved_model="gemini-3.1-flash-image",
+        request_id=None,
+        retry_attempt_id=None,
+        proxy_purpose="oauth_antigravity",
+    )
+    opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
+    assert opened.ok
+    assert connector.original_client_calls == 0
+    assert captured["route"] == (
+        "oauth:antigravity:image@example.test:project",
+        "gemini-3.1-flash-image",
+        "oauth_antigravity",
+    )
+    assert inserted == []
+    assert len(connector.acquire_calls) == 1
+    host, port, timeout, timing = connector.acquire_calls[0]
+    assert (host, port, timeout) == ("unit.invalid", 443, 1.5)
+    assert timing.target is opened.timing
+    assert captured["profile"] == "chrome131"
+    assert captured["proxy"] == connector.lease.proxy_url
+    assert captured["proxy_auth"] == connector.lease.proxy_auth
+    assert captured["route_owner"] is connector.lease
+    assert captured["trust_env"] is False
+    await opened.ctx.__aexit__(None, None, None)
+    await http_runtime.close_proxy_client(opened.proxy_client)
+    assert connector.lease.closed
+
+
+@pytest.mark.asyncio
+async def test_ss2022_disabled_fingerprint_keeps_original_httpcore_route(monkeypatch):
+    _patch_persistence(monkeypatch)
+    connector = _SSConnector()
+    monkeypatch.setattr(
+        http_runtime, "_resolve_http_route_chain",
+        lambda channel, model: ([("ss-route", connector)], None),
+    )
+    monkeypatch.setattr(
+        http_runtime, "create_impersonated_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled fingerprint must not construct curl transport")
+        ),
+    )
+    monkeypatch.setattr(
+        http_runtime, "open_stream",
+        lambda client, request: _Context(request),
+    )
+    kwargs = _open_kwargs()
+    kwargs["channel"] = SimpleNamespace(
+        tls_fingerprint=None, internal_loopback=False,
+    )
+    opened = await http_runtime.open_response_with_proxy_chain(**kwargs)
+    assert opened.ok
+    assert connector.acquire_calls == []
+    assert connector.original_client_calls == 1
+    await opened.ctx.__aexit__(None, None, None)
+    await http_runtime.close_proxy_client(opened.proxy_client)
+
+
 @pytest.mark.asyncio
 async def test_direct_stream_round_records_direct_and_only_nonempty_raw_bytes_are_activity(monkeypatch):
     inserted, updates = _patch_persistence(monkeypatch)

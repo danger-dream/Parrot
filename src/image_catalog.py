@@ -1,4 +1,4 @@
-"""One image inventory for routing, model-center and discovery (no AG images)."""
+"""One image inventory for routing, model-center and discovery."""
 from __future__ import annotations
 from dataclasses import dataclass
 from . import config, model_state, model_metadata, oauth_manager, channel_state, media_config
@@ -76,7 +76,7 @@ def sources(cfg: dict | None = None, *, kind: str = 'image') -> list[ImageSource
                 model_state.is_source_enabled(key, model, cfg), generation))
     for account in cfg.get('oauthAccounts') or []:
         provider = account.get('provider', 'anthropic')
-        if provider not in (('openai', 'xai') if kind == 'image' else ('xai',)): continue
+        if provider not in (('openai', 'xai', 'antigravity') if kind == 'image' else ('xai',)): continue
         key = 'oauth:' + account_key(account)
         label = oauth_source_label(account, cfg)
         state = media_config.oauth_state(account, kind, cfg)
@@ -89,8 +89,8 @@ def sources(cfg: dict | None = None, *, kind: str = 'image') -> list[ImageSource
     return out
 
 
-def current_openai_account(source: ImageSource) -> tuple[str, dict]:
-    """Revalidate a selected generation/authorization before token work or I/O."""
+def current_oauth_account(source: ImageSource) -> tuple[str, dict]:
+    """Revalidate a selected OAuth generation/authorization before token work or I/O."""
     import copy
     if not source.state_key:
         raise ValueError('image source has no selected account generation')
@@ -106,6 +106,11 @@ def current_openai_account(source: ImageSource) -> tuple[str, dict]:
         if not model_state.is_global_enabled(source.model) or not model_state.is_source_enabled(key, source.model):
             raise ValueError('image model/source is disabled; enable it in model center')
         return account_id, copy.deepcopy(account)
+
+
+# Kept for internal callers and extensions written against the first unified
+# image runtime. The implementation has always been provider-neutral.
+current_openai_account = current_oauth_account
 
 
 def models(cfg: dict | None = None, *, kind: str = 'image') -> set[str]:

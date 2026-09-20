@@ -160,6 +160,9 @@ class Channel(ABC):
     enabled: bool
     disabled_reason: Optional[str]
     cc_mimicry: bool
+    # Optional TLS/H2 impersonation profile. Only transports that explicitly
+    # understand this capability may consume it; None preserves the shared pool.
+    tls_fingerprint: Optional[str] = None
     # 渠道的上游协议。默认 "anthropic"（现状），OpenAI 家族子类会覆盖为
     # "openai-chat" 或 "openai-responses"。scheduler / failover / probe 都依据它分派行为。
     protocol: str = "anthropic"

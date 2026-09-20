@@ -252,7 +252,9 @@ def test_release_media_read_only_inheritance_and_explicit_new_values(upgraded):
     enabled = copy.deepcopy(loaded)
     enabled['images']['enabled'] = True
     assert not media_config.oauth_state(enabled['oauthAccounts'][1], 'image', enabled)['enabled']
-    assert 'image_models' not in loaded and 'video_models' not in loaded
+    assert loaded['image_models']['antigravity'] == ['gemini-custom-image']
+    assert 'imageModels' not in loaded['antigravityOAuth']
+    assert 'video_models' not in loaded
     assert path.read_bytes() == persisted
     explicit = copy.deepcopy(loaded)
     explicit['image_models'] = {'xai': []}

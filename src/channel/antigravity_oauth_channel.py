@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from .. import cache_hints, config, oauth_manager
+from .. import cache_hints, config, media_config, oauth_manager
 from ..oauth import antigravity as ag_provider
 from ..oauth_ids import account_key as _account_key
 from ..openai.transform import anthropic_to_responses, chat_to_responses, guard
@@ -87,6 +87,14 @@ class AntigravityOAuthChannel(Channel):
             self.max_concurrent = 0
 
         cfg = _provider_cfg()
+        fingerprint = cfg.get("tlsFingerprint") or {}
+        if not isinstance(fingerprint, dict):
+            fingerprint = {}
+        if bool(fingerprint.get("enabled", False)):
+            profile = str(fingerprint.get("profile") or "chrome131").strip()
+            self.tls_fingerprint = profile or None
+        else:
+            self.tls_fingerprint = None
         stored_base = str(
             account.get("request_base_url")
             or account.get("requestBaseUrl")
@@ -111,8 +119,8 @@ class AntigravityOAuthChannel(Channel):
         }
         from ..image_catalog import is_image_name
         self.models = [model for model in selected_models if model not in disabled_models and not is_image_name(model)]
-        # AG image support is retired; stored image settings/history are untouched.
-        self.image_models = []
+        self.state_key = oauth_manager.account_state_key(account)
+        self.image_models = media_config.account_models(account, 'image')
 
     def supports_model(self, requested_model: str) -> Optional[str]:
         if requested_model in self.models:
@@ -123,7 +131,28 @@ class AntigravityOAuthChannel(Channel):
         return list(self.models)
 
     def supports_media_model(self, kind: str, requested_model: str) -> bool:
-        return False
+        """Return whether this OAuth account can serve one configured image model."""
+        from .. import channel_state, model_state
+        if kind != 'image' or channel_state.is_deleted(self.state_key):
+            return False
+        try:
+            account = oauth_manager.get_account(self.account_key)
+        except Exception:
+            return False
+        if not isinstance(account, dict):
+            return False
+        return (
+            oauth_manager.account_state_key(account) == self.state_key
+            and media_config.oauth_state(account, 'image')['enabled']
+            and requested_model in media_config.account_models(account, 'image')
+            and model_state.is_global_enabled(requested_model)
+            and model_state.is_source_enabled(self.key, requested_model)
+        )
+
+    async def build_media_headers(self) -> dict[str, str]:
+        """Reuse the existing OAuth lifecycle for JSON image generation."""
+        access_token = await oauth_manager.ensure_channel_token(self)
+        return self._build_headers(access_token, stream=False)
 
     async def build_upstream_request(
         self, requested_body: dict, resolved_model: str,

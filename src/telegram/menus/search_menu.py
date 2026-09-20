@@ -526,7 +526,10 @@ def _logs(chat_id, message_id, page=0, period="month", only=None, offset=0):
         subject = e.get("query") or e.get("url") or ""
         if subject:
             lines.append(f"  <code>{ui.escape_html(str(subject)[:80])}</code>")
-        detail = [f"{'搜索' if e['operation'] == 'search' else '提取'}"]
+        operation_label = {"search": "网页搜索", "x_search": "X搜索", "extract": "提取"}.get(
+            str(e["operation"]), str(e["operation"]),
+        )
+        detail = [operation_label]
         if e.get("elapsedMs") is not None:
             detail.append(f"{e['elapsedMs']} ms")
         detail.append(f"{e['resultCount']} 条")

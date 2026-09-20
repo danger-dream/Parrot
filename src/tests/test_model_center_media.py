@@ -337,7 +337,7 @@ class FakeNetworkClient:
 
 
 
-@pytest.mark.asyncio
-async def test_retired_ag_adapter_has_no_generation_capability():
-    assert not ag_images.is_antigravity_image_model("gemini-3.1-flash-image")
-    assert (await ag_images.handle_image(None)).status_code == 410
+def test_antigravity_adapter_recognizes_only_configured_image_models():
+    assert ag_images.is_antigravity_image_model("gemini-3.1-flash-image")
+    assert not ag_images.is_antigravity_image_model("gemini-3-flash")
+    assert ag_images.looks_like_antigravity_image_model("gemini-3.1-flash-image")

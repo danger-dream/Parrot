@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os as _os
+import sqlite3
 import sys as _sys
 import threading
 import time
+from datetime import datetime
 
 import pytest
 
@@ -187,6 +189,156 @@ def test_central_scheduler_is_single_thread_serial_and_preheats(m, monkeypatch):
 
     menu_cache.stop()
     assert first_thread is not None and not first_thread.is_alive()
+
+
+def test_restart_cold_preheat_unblocks_all_shared_page_families_after_window_sql(
+    m, monkeypatch, tmp_path,
+):
+    """真实窗口 SQL 完成后，冷启动共享页面都收到完成通知。"""
+    cache, log_db = m["menu_cache"], m["log_db"]
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(log_db._schema_sql())
+    now = datetime.now(log_db._BJT).timestamp()
+    account = {"provider": "claude", "email": "window@example.test"}
+    account_key = "claude:window@example.test"
+    channel_key = f"oauth:{account_key}"
+    for index in range(300):
+        request_id = f"cold-window-{index}"
+        conn.execute(
+            """INSERT INTO request_log(
+                   request_id, created_at, status, final_channel_key,
+                   input_tokens, output_tokens, usage_observed, actual_service_tier)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (request_id, now, "success", channel_key, 10, 2, 1, "standard"),
+        )
+        conn.execute(
+            """INSERT INTO retry_chain(
+                   request_id, attempt_order, channel_key, channel_type, model,
+                   started_at, dispatched_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (request_id, 1, channel_key, "oauth", "model-a", now, now),
+        )
+    conn.commit()
+    monkeypatch.setattr(log_db, "_log_dir", str(tmp_path))
+    monkeypatch.setattr(
+        log_db, "_iter_month_conns_all", lambda _since: [(conn, lambda: None)],
+    )
+    monkeypatch.setattr(
+        log_db.model_pricing, "settings",
+        lambda *args, **kwargs: type("Settings", (), {"enabled": True})(),
+    )
+    monkeypatch.setattr(m["oauth_manager"], "list_accounts", lambda: [account])
+    monkeypatch.setattr(
+        m["oauth_menu"], "_oauth_window_specs",
+        lambda _accounts: [
+            (("oauth-window", account_key, "account-period"), account_key, now - 3600),
+        ],
+    )
+
+    period_started, release_period = threading.Event(), threading.Event()
+    period_calls = 0
+
+    def period(_since):
+        nonlocal period_calls
+        period_calls += 1
+        if period_calls == 1:
+            period_started.set()
+            assert release_period.wait(2)
+        snapshot = _empty_period_snapshot()
+        snapshot["by_channel"] = {channel_key: {"total": 300}}
+        snapshot["by_apikey"] = {"key-a": {"total": 300}}
+        return snapshot
+
+    monkeypatch.setattr(log_db, "stats_period_snapshot", period)
+    monkeypatch.setattr(log_db, "stats_lifetime", _lifetime_snapshot)
+    monkeypatch.setattr(log_db, "request_totals_by_apikey", lambda: {"key-a": 300})
+
+    # 旧 request-first 计划在这批数据上超过 100 万 VM 指令；修复后的
+    # retry-first 约 5 万。若回退旧计划，就模拟线上唯一调度线程被长期占住。
+    progress_calls = 0
+    bad_plan_blocked, release_bad_plan = threading.Event(), threading.Event()
+
+    def progress():
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls > 1000:
+            bad_plan_blocked.set()
+            release_bad_plan.wait(2)
+            return 1
+        return 0
+
+    def reset_statement_budget(_sql):
+        nonlocal progress_calls
+        progress_calls = 0
+
+    conn.set_trace_callback(reset_statement_budget)
+    conn.set_progress_handler(progress, 100)
+    ready: set[str] = set()
+    errors: list[tuple[str, Exception | None]] = []
+
+    def completion(label: str, message_id: int):
+        token = cache.begin_view(42, message_id)
+
+        def done(_value, error):
+            if error is not None:
+                errors.append((label, error))
+                return
+            cache.run_if_current(42, message_id, token, lambda: ready.add(label))
+
+        return done
+
+    cache.start()
+    assert period_started.wait(1)
+    today, month = cache.today_start_ts(), cache.month_start_ts()
+    cache.request_period_snapshot(
+        today, subscriber="stats", on_ready=completion("stats", 101),
+        interactive=True,
+    )
+    for label, message_id in (("apikey-list", 102), ("channel-list", 103)):
+        cache.request_period_snapshot(
+            month, subscriber=label, on_ready=completion(label, message_id),
+            interactive=True,
+        )
+    cache.request_lifetime(subscriber="main", on_ready=completion("main", 104))
+    cache.request_apikey_history(
+        subscriber="apikey-history", on_ready=completion("apikey-history", 105),
+        interactive=True,
+    )
+    assert not m["oauth_menu"]._request_window_snapshots(
+        [account], subscriber="oauth-list", on_ready=completion("oauth-list", 106),
+        interactive=True,
+    )
+    for label, message_id, key in (
+        ("apikey-detail", 107, ("apikey-model", "key-a", int(month))),
+        ("channel-detail", 108, ("channel-model", "api:a", int(month))),
+        ("oauth-detail", 109, ("oauth-model", account_key, int(month))),
+    ):
+        cache.DETAIL_STATS.request(
+            key, lambda value=label: [{"final_model": value, "total": 1}],
+            subscriber=label, on_ready=completion(label, message_id),
+            interactive=True,
+        )
+
+    assert not ready
+    release_period.set()
+    expected = {
+        "main", "stats", "apikey-list", "apikey-history", "apikey-detail",
+        "channel-list", "channel-detail", "oauth-list", "oauth-detail",
+    }
+    try:
+        _wait_until(lambda: ready == expected, timeout=2.0)
+    finally:
+        release_bad_plan.set()
+    assert not errors
+    assert not bad_plan_blocked.is_set()
+    assert cache.WINDOW_STATS.peek(
+        ("oauth-window", account_key, "account-period")
+    ).value["total"] == 300
+    cache.stop()
+    conn.set_progress_handler(None, 0)
+    conn.set_trace_callback(None)
+    conn.close()
 
 
 def test_scheduler_preheats_all_stats_that_old_menus_display(m, monkeypatch):
@@ -527,7 +679,7 @@ def test_main_failed_initial_stats_stays_operable_then_retry_restores_snapshot(m
     menu_cache.stop()
 
 
-def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_keep_hint(
+def test_cold_management_menus_remain_operable_while_stats_page_loads(
     m, monkeypatch,
 ):
     recorder = Recorder()
@@ -542,12 +694,24 @@ def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_k
     m["oauth_menu"].show(42, 103, "cb-oauth")
     m["apikey_menu"].show(42, 104, "cb-apikey")
 
-    assert len(recorder.edits()) == 2
-    assert {edit["message_id"] for edit in recorder.edits()} == {100, 101}
+    assert len(recorder.edits()) == 5
+    assert {edit["message_id"] for edit in recorder.edits()} == {100, 101, 102, 103, 104}
     main_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 100)
     stats_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 101)
+    channel_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 102)
+    oauth_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 103)
+    apikey_edit = next(edit for edit in recorder.edits() if edit["message_id"] == 104)
     assert "首次使用检测" in main_edit["text"]
     assert "完成后自动更新" in stats_edit["text"]
+    assert "渠道管理" in channel_edit["text"] and "暂无渠道" in channel_edit["text"]
+    assert "OAuth 账户管理" in oauth_edit["text"] and "暂无账户" in oauth_edit["text"]
+    assert "API Key 管理" in apikey_edit["text"]
+    assert "暂无 Key" in apikey_edit["text"]
+    assert any(
+        button.get("callback_data") == "ak:add"
+        for row in apikey_edit["reply_markup"]["inline_keyboard"]
+        for button in row
+    )
     answers = [
         data for method, data in recorder.calls if method == "answerCallbackQuery"
     ]
@@ -555,11 +719,10 @@ def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_k
     assert next(data for data in answers if data["callback_query_id"] == "cb-main") == {
         "callback_query_id": "cb-main",
     }
-    assert all(
-        "初始化" in data.get("text", "")
-        for data in answers
-        if data["callback_query_id"] in {"cb-channel", "cb-oauth", "cb-apikey"}
-    )
+    for callback_id in {"cb-channel", "cb-oauth", "cb-apikey"}:
+        assert next(data for data in answers if data["callback_query_id"] == callback_id) == {
+            "callback_query_id": callback_id,
+        }
     assert "自动更新" in next(
         data["text"] for data in answers if data["callback_query_id"] == "cb-stats"
     )
@@ -572,8 +735,42 @@ def test_only_stats_cold_callback_loads_automatically_other_menus_and_commands_k
     sends = [data for method, data in recorder.calls if method == "sendMessage"]
     assert len(sends) == 5
     assert "首次使用检测" in sends[0]["text"]
-    assert all("初始化" in data["text"] for data in sends[1:])
-    assert len(recorder.edits()) == 2
+    assert "初始化" in sends[1]["text"]
+    assert "渠道管理" in sends[2]["text"] and "暂无渠道" in sends[2]["text"]
+    assert "OAuth 账户管理" in sends[3]["text"] and "暂无账户" in sends[3]["text"]
+    assert "API Key 管理" in sends[4]["text"]
+    assert "暂无 Key" in sends[4]["text"]
+    assert len(recorder.edits()) == 5
+
+
+def test_cold_api_key_menu_with_existing_key_does_not_report_false_zero_stats(
+    m, monkeypatch,
+):
+    recorder = Recorder()
+    monkeypatch.setattr(m["ui"], "api", recorder)
+    m["config"].update(lambda cfg: cfg.update({
+        "apiKeys": {"cold-key": {"key": "fake-secret"}},
+    }))
+
+    m["apikey_menu"].show(42, 105, "cb-apikey-existing")
+
+    edit = recorder.edits()[-1]
+    assert edit["message_id"] == 105
+    assert "API Key 管理" in edit["text"]
+    assert "cold-key" in edit["text"]
+    assert "统计初始化中" in edit["text"]
+    assert "本月 0 次" not in edit["text"]
+    assert "历史 0 次" not in edit["text"]
+    callbacks = {
+        button.get("callback_data", "")
+        for row in edit["reply_markup"]["inline_keyboard"]
+        for button in row
+    }
+    assert "ak:add" in callbacks
+    assert any(value.startswith("ak:view:") for value in callbacks)
+    assert recorder.calls[0] == (
+        "answerCallbackQuery", {"callback_query_id": "cb-apikey-existing"},
+    )
 
 
 def test_rolling_stats_uses_same_queue_and_auto_edits_cold_page(m, monkeypatch):
@@ -608,10 +805,10 @@ def test_bot_lifecycle_starts_and_stops_scheduler(m, monkeypatch):
     menu_cache = m["menu_cache"]
     _patch_fast_common_loaders(m, monkeypatch)
     monkeypatch.setattr(bot, "is_configured", lambda: True)
-    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: None)
+    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: True)
     monkeypatch.setattr(bot, "_poll_loop", lambda *_args: None)
-    monkeypatch.setattr(m["ui"], "delete_my_commands", lambda: None)
-    monkeypatch.setattr(m["ui"], "set_my_commands", lambda _commands: None)
+    monkeypatch.setattr(m["ui"], "delete_my_commands", lambda: {"ok": True})
+    monkeypatch.setattr(m["ui"], "set_my_commands", lambda _commands: {"ok": True})
     monkeypatch.setattr(m["ui"], "install_notify_handler", lambda: None)
     monkeypatch.setattr(m["ui"], "close_session", lambda: None)
     bot._running = False
@@ -719,6 +916,54 @@ def test_period_batch_matches_old_per_object_and_family_queries(m, monkeypatch):
         assert snapshot["families"]["openai"][dimension] == old_family[dimension]
 
 
+def test_period_model_channels_keeps_distinct_requested_models_on_same_route(m):
+    _reset_log_fixture(m)
+    ld = m["log_db"]
+    for request_id, requested_model in (
+        ("requested-route-a", "alias-a"),
+        ("requested-route-b", "alias-b"),
+    ):
+        request = ld.insert_pending(
+            request_id, "127.0.0.1", "key-a", requested_model, True,
+            1, 0, {}, {}, ingress_protocol="responses",
+        )
+        # 两个 requested_model 故意落到完全相同的执行模型/渠道/协议；批量
+        # SQL 和保留的原始查询都必须按 requested_model 分组，不能因
+        # upstream_attempt_usage.model 同名列而绑定到 executed model。
+        attempt = ld.record_retry_attempt(
+            request, 0, "api:shared", "api", "shared-executed-model",
+            time.time(), upstream_protocol="openai-responses",
+        )
+        ld.mark_retry_attempt_dispatch(
+            attempt, {"model": "shared-executed-model"},
+        )
+        assert ld.settle_retry_attempt(
+            attempt, outcome="success",
+            usage={"input_tokens": 10, "output_tokens": 2},
+            usage_observed=True, final=True,
+        )
+        ld.finish_success(
+            request_id, "api:shared", "api", "shared-executed-model",
+            input_tokens=10, output_tokens=2,
+            cache_creation_tokens=0, cache_read_tokens=0,
+            connect_ms=1, first_token_ms=2, total_ms=10,
+            response_body="{}", http_status=200,
+            upstream_protocol="openai-responses",
+        )
+    since = time.time() - 3600
+
+    expected = ld.channels_by_requested_model(since)
+    actual = ld.stats_period_snapshot(since)["model_channels"]
+
+    assert actual == expected
+    assert set(actual) == {"alias-a", "alias-b"}
+    assert actual["alias-a"] == [{
+        "key": "api:shared", "type": "api",
+        "upstream_protocol": "openai-responses", "count": 1,
+    }]
+    assert actual["alias-b"] == actual["alias-a"]
+
+
 def test_menu_renderers_do_not_call_per_object_full_stats(m, monkeypatch):
     snapshot = _empty_period_snapshot()
     snapshot["by_channel"] = {}
@@ -731,3 +976,75 @@ def test_menu_renderers_do_not_call_per_object_full_stats(m, monkeypatch):
     m["channel_menu"]._list_text_and_kb(snapshot=snapshot)
     m["apikey_menu"]._render_list(snapshot=snapshot, history_totals={})
     m["oauth_menu"]._list_text_and_kb(month_snapshot=snapshot)
+
+
+def test_stats_snapshot_roundtrip_restores_stale_page_caches_only(m, monkeypatch, tmp_path):
+    cache = m["menu_cache"]
+    monkeypatch.setattr(m["config"], "DATA_DIR", str(tmp_path))
+    cache.reset_for_tests()
+
+    period_key = ("period", int(cache.today_start_ts()))
+    window_key = ("oauth-window", "claude:acct@example.test", "account-period")
+    cache.PERIOD_STATS.store(period_key, {"summary": {"overall": {"total": 7}}})
+    cache.LIFETIME_STATS.store("lifetime", _lifetime_snapshot(9))
+    cache.WINDOW_STATS.store(window_key, {"total": 3})
+    cache.HISTORY_TOTALS.store("apikey-history", {"key-a": 5})
+    cache.DETAIL_STATS.store(("apikey-model", "key-a", 1), [{"total": 1}])
+
+    cache._schedule_stats_snapshot_persist()
+    cache._flush_stats_snapshot()
+    path = cache._stats_snapshot_path()
+    assert _os.path.exists(path)
+    assert _os.stat(path).st_mode & 0o777 == 0o600
+
+    for current in (
+        cache.PERIOD_STATS, cache.LIFETIME_STATS, cache.WINDOW_STATS,
+        cache.HISTORY_TOTALS, cache.DETAIL_STATS,
+    ):
+        current.clear()
+    cache._load_stats_snapshot_once()
+
+    period = cache.PERIOD_STATS.peek(period_key)
+    assert period.value["summary"]["overall"]["total"] == 7
+    assert not period.fresh and period.restored
+    assert cache.LIFETIME_STATS.peek("lifetime").restored
+    assert cache.WINDOW_STATS.peek(window_key).restored
+    assert cache.HISTORY_TOTALS.peek("apikey-history").restored
+    assert cache.DETAIL_STATS.peek(("apikey-model", "key-a", 1)).value is None
+    assert "正在更新" in cache.with_refreshing_notice("统计", period)
+
+    _read, generation, should_run = cache.PERIOD_STATS._reserve(period_key, force=True)
+    assert should_run
+
+    def failed_refresh():
+        raise RuntimeError("temporary failure")
+
+    assert not cache.PERIOD_STATS._execute_reserved(
+        period_key, failed_refresh, generation,
+    )
+    failed = cache.PERIOD_STATS.peek(period_key)
+    assert failed.restored and failed.value["summary"]["overall"]["total"] == 7
+    assert "更新失败" in cache.with_refreshing_notice("统计", failed)
+
+    _read, generation, should_run = cache.PERIOD_STATS._reserve(period_key, force=True)
+    assert should_run
+    assert cache.PERIOD_STATS._execute_reserved(
+        period_key, lambda: {"summary": {"overall": {"total": 8}}}, generation,
+    )
+    refreshed = cache.PERIOD_STATS.peek(period_key)
+    assert refreshed.fresh and not refreshed.restored
+    assert refreshed.value["summary"]["overall"]["total"] == 8
+    cache.reset_for_tests()
+
+
+def test_invalid_or_expired_stats_snapshot_is_ignored(m, monkeypatch, tmp_path):
+    cache = m["menu_cache"]
+    monkeypatch.setattr(m["config"], "DATA_DIR", str(tmp_path))
+    cache.reset_for_tests()
+    path = cache._stats_snapshot_path()
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"schema": "wrong", "version": 99}, handle)
+
+    cache._load_stats_snapshot_once()
+    assert cache.LIFETIME_STATS.peek("lifetime").value is None
+    cache.reset_for_tests()

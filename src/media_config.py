@@ -8,7 +8,11 @@ import copy
 from . import config, oauth_manager, channel_state
 from .oauth_ids import account_key
 
-IMAGE_DEFAULT_MODELS = {'openai': ['gpt-image-2', 'gpt-image-2.5', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare'], 'xai': ['grok-imagine-image', 'grok-imagine-image-quality']}
+IMAGE_DEFAULT_MODELS = {
+    'openai': ['gpt-image-2', 'gpt-image-2.5', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare'],
+    'xai': ['grok-imagine-image', 'grok-imagine-image-quality'],
+    'antigravity': ['gemini-3.1-flash-image'],
+}
 VIDEO_DEFAULT_MODELS = {'xai': ['grok-imagine-video', 'grok-imagine-video-1.5']}
 CACHE_FIELDS = ('cacheEnabled', 'cachePath', 'cacheRetentionDays', 'cacheMaxBytes')
 

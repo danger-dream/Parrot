@@ -195,7 +195,7 @@ def test_all_api_brand_icons_render_in_channel_list_detail_and_model_sources(mon
 
     monkeypatch.setattr(channel_menu, "_all_channels", lambda: channels)
     monkeypatch.setattr(channel_menu, "_channel_health", lambda _channel: ("✅", "可用"))
-    monkeypatch.setattr(channel_menu, "_channel_monthly_lines", lambda *_args: ["📈 本地统计"])
+    monkeypatch.setattr(channel_menu, "_channel_monthly_lines", lambda *_args, **_kwargs: ["📈 本地统计"])
     monkeypatch.setattr(channel_menu, "_usage_summary", lambda _channel: None)
     monkeypatch.setattr(channel_menu, "_usage_detail_lines", lambda _channel: [])
     monkeypatch.setattr(channel_menu, "_channel_model_lines", lambda *_args, **_kwargs: [])

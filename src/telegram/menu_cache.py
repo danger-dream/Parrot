@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import itertools
+import json
+import os
 import threading
 import time
 from collections import deque
@@ -16,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .. import config, startup_timing
 from ..management_control.observability import DEFAULT_STATS_CONTROL, telegram_context
 
 
@@ -47,6 +50,7 @@ class CacheRead:
     fresh: bool
     refreshing: bool
     error: Exception | None = None
+    restored: bool = False
 
 
 class SWRCache:
@@ -64,6 +68,7 @@ class SWRCache:
         self._errors: dict[Hashable, Exception] = {}
         self._inflight: set[Hashable] = set()
         self._interactive: set[Hashable] = set()
+        self._restored: set[Hashable] = set()
         self._waiters: dict[
             Hashable,
             dict[Hashable, Callable[[Any, Exception | None], None]],
@@ -76,10 +81,17 @@ class SWRCache:
             item = self._values.get(key)
             error = self._errors.get(key)
             refreshing = key in self._inflight
+            restored = key in self._restored
         if item is None:
             return CacheRead(None, False, refreshing, error)
         value, stored_at = item
-        return CacheRead(value, now - stored_at < self.ttl_seconds, refreshing, error)
+        return CacheRead(
+            value,
+            now - stored_at < self.ttl_seconds,
+            refreshing,
+            error,
+            restored,
+        )
 
     def request(
         self,
@@ -118,7 +130,10 @@ class SWRCache:
             error = self._errors.get(key)
             fresh = bool(item is not None and now - item[1] < self.ttl_seconds)
             if not force and fresh:
-                return CacheRead(item[0], True, key in self._inflight, error), self._generation, False
+                return CacheRead(
+                    item[0], True, key in self._inflight, error,
+                    key in self._restored,
+                ), self._generation, False
             if interactive:
                 self._interactive.add(key)
             if on_ready is not None:
@@ -128,7 +143,9 @@ class SWRCache:
             if should_enqueue:
                 self._inflight.add(key)
             value = item[0] if item is not None else None
-            return CacheRead(value, False, True, error), self._generation, should_enqueue
+            return CacheRead(
+                value, False, True, error, key in self._restored,
+            ), self._generation, should_enqueue
 
     def _is_interactive(self, key: Hashable, generation: int) -> bool:
         with self._lock:
@@ -160,6 +177,7 @@ class SWRCache:
             if error is None:
                 self._values[key] = (value, time.monotonic())
                 self._errors.pop(key, None)
+                self._restored.discard(key)
             else:
                 self._errors[key] = error
             self._inflight.discard(key)
@@ -191,6 +209,22 @@ class SWRCache:
                 time.monotonic() - max(0.0, age_seconds),
             )
             self._errors.pop(key, None)
+            self._restored.discard(key)
+
+    def snapshot_entries(self) -> list[tuple[Hashable, Any]]:
+        with self._lock:
+            return [(key, value) for key, (value, _stored_at) in self._values.items()]
+
+    def restore_entries(self, entries: list[tuple[Hashable, Any]]) -> int:
+        restored = 0
+        stale_at = time.monotonic() - self.ttl_seconds - 1.0
+        with self._lock:
+            for key, value in entries:
+                self._values[key] = (value, stale_at)
+                self._errors.pop(key, None)
+                self._restored.add(key)
+                restored += 1
+        return restored
 
     def clear(self) -> None:
         with self._lock:
@@ -199,6 +233,7 @@ class SWRCache:
             self._errors.clear()
             self._inflight.clear()
             self._interactive.clear()
+            self._restored.clear()
             self._waiters.clear()
 
 
@@ -217,6 +252,8 @@ class _QueuedLoad:
     key: Hashable
     loader: Callable[[], Any]
     generation: int
+    enqueued_ns: int
+    startup_detail: bool = False
 
 
 class StatsRefreshCoordinator:
@@ -230,6 +267,13 @@ class StatsRefreshCoordinator:
         self._running = False
         self._active_jobs = 0
         self._max_active_jobs = 0
+        self._startup_started_ns = 0
+        self._startup_pending: set[str] = set()
+        self._startup_detail_pending = 0
+        self._startup_detail_failures = 0
+        self._startup_collect_details = False
+        self._startup_core_logged = False
+        self._startup_full_logged = False
 
     def register_periodic(
         self,
@@ -245,19 +289,33 @@ class StatsRefreshCoordinator:
             self._periodic.append(_PeriodicJob(name, float(interval), priority, task))
 
     def start(self) -> None:
+        _load_stats_snapshot_once()
         with self._condition:
             if self._thread is not None and self._thread.is_alive():
                 return
             now = time.monotonic()
+            startup_started_ns = startup_timing.now_ns()
             # 所有预热都立即到期，由 priority 决定业务顺序，并始终串行执行。
             for job in self._periodic:
                 job.next_due = now
             self._running = True
             self._max_active_jobs = 0
+            self._startup_started_ns = startup_started_ns
+            self._startup_pending = {job.name for job in self._periodic}
+            self._startup_detail_pending = 0
+            self._startup_detail_failures = 0
+            self._startup_collect_details = False
+            self._startup_core_logged = False
+            self._startup_full_logged = False
             self._thread = threading.Thread(
                 target=self._run,
                 daemon=True,
                 name="tg-stats-scheduler",
+            )
+            startup_timing.log(
+                "stats.preheat-start",
+                at_ns=startup_started_ns,
+                jobs=len(self._periodic),
             )
             self._thread.start()
 
@@ -275,6 +333,7 @@ class StatsRefreshCoordinator:
             self._thread = None
         for item in pending:
             item.cache._cancel_reserved(item.key, item.generation)
+        _flush_stats_snapshot()
 
     def enqueue(
         self,
@@ -283,9 +342,42 @@ class StatsRefreshCoordinator:
         loader: Callable[[], Any],
         generation: int,
     ) -> None:
+        enqueued_ns = startup_timing.now_ns()
         with self._condition:
-            self._queue.append(_QueuedLoad(cache, key, loader, generation))
+            startup_detail = bool(
+                self._startup_collect_details
+                and threading.current_thread() is self._thread
+                and not self._startup_full_logged
+            )
+            if startup_detail:
+                self._startup_detail_pending += 1
+            self._queue.append(_QueuedLoad(
+                cache, key, loader, generation, enqueued_ns, startup_detail,
+            ))
             self._condition.notify()
+
+    def _maybe_log_startup_ready_locked(self) -> None:
+        if (
+            not self._startup_core_logged
+            and not ({"period-today-month", "lifetime"} & self._startup_pending)
+        ):
+            self._startup_core_logged = True
+            startup_timing.log(
+                "stats.core-ready",
+                started_ns=self._startup_started_ns,
+            )
+        if (
+            not self._startup_full_logged
+            and not self._startup_pending
+            and self._startup_detail_pending == 0
+        ):
+            self._startup_full_logged = True
+            startup_timing.log(
+                "stats.full-warm",
+                started_ns=self._startup_started_ns,
+                status="ok" if self._startup_detail_failures == 0 else "partial",
+                failed_details=self._startup_detail_failures,
+            )
 
     @property
     def thread(self) -> threading.Thread | None:
@@ -306,6 +398,8 @@ class StatsRefreshCoordinator:
         while True:
             selected_job: _PeriodicJob | None = None
             selected_load: _QueuedLoad | None = None
+            startup_job_name: str | None = None
+            startup_detail = False
             with self._condition:
                 while self._running:
                     now = time.monotonic()
@@ -338,6 +432,28 @@ class StatsRefreshCoordinator:
                     return
                 self._active_jobs += 1
                 self._max_active_jobs = max(self._max_active_jobs, self._active_jobs)
+                if selected_job is not None and selected_job.name in self._startup_pending:
+                    startup_job_name = selected_job.name
+                    self._startup_collect_details = startup_job_name == "model-details"
+                if selected_load is not None:
+                    startup_detail = selected_load.startup_detail
+
+            task_started_ns = startup_timing.now_ns()
+            if startup_job_name is not None:
+                startup_timing.log(
+                    "stats.job-start",
+                    at_ns=task_started_ns,
+                    job=startup_job_name,
+                    queue_wait_ms=f"{(task_started_ns - self._startup_started_ns) / 1_000_000:.3f}",
+                )
+            elif startup_detail and selected_load is not None:
+                key_kind = selected_load.key[0] if isinstance(selected_load.key, tuple) else "detail"
+                startup_timing.log(
+                    "stats.detail-start",
+                    at_ns=task_started_ns,
+                    kind=key_kind,
+                    queue_wait_ms=f"{(task_started_ns - selected_load.enqueued_ns) / 1_000_000:.3f}",
+                )
 
             success = True
             try:
@@ -354,12 +470,37 @@ class StatsRefreshCoordinator:
                 label = selected_job.name if selected_job is not None else "queued-load"
                 print(f"[tg-stats-scheduler] job {label!r} failed: {exc}")
             finally:
+                if startup_job_name is not None:
+                    startup_timing.log(
+                        "stats.job-end",
+                        started_ns=task_started_ns,
+                        status="ok" if success else "failed",
+                        job=startup_job_name,
+                    )
+                elif startup_detail and selected_load is not None:
+                    key_kind = selected_load.key[0] if isinstance(selected_load.key, tuple) else "detail"
+                    startup_timing.log(
+                        "stats.detail-end",
+                        started_ns=task_started_ns,
+                        status="ok" if success else "failed",
+                        kind=key_kind,
+                    )
                 with self._condition:
+                    self._startup_collect_details = False
                     self._active_jobs -= 1
                     if selected_job is not None:
                         delay = selected_job.interval if success else min(15.0, selected_job.interval)
                         selected_job.next_due = time.monotonic() + delay
+                    if startup_job_name is not None and success:
+                        self._startup_pending.discard(startup_job_name)
+                    if startup_detail:
+                        self._startup_detail_pending = max(0, self._startup_detail_pending - 1)
+                        if not success:
+                            self._startup_detail_failures += 1
+                    self._maybe_log_startup_ready_locked()
                     self._condition.notify_all()
+                if success:
+                    _schedule_stats_snapshot_persist()
 
 
 # 常用快照的 freshness 与主动刷新周期一致。旧值即便过期也持续可读。
@@ -372,6 +513,236 @@ DETAIL_STATS = SWRCache(300.0)
 WINDOW_STATS = SWRCache(60.0)
 HISTORY_TOTALS = SWRCache(300.0)
 BACKGROUND_JOBS = SWRCache(60.0)
+
+_STATS_SNAPSHOT_SCHEMA = "parrot-telegram-stats-cache"
+_STATS_SNAPSHOT_VERSION = 1
+_STATS_SNAPSHOT_MAX_AGE_SECONDS = 24 * 60 * 60
+_STATS_SNAPSHOT_FILENAME = "telegram-stats-cache-v1.json"
+_STATS_SNAPSHOT_WRITE_DELAY_SECONDS = 1.0
+_stats_snapshot_lock = threading.Lock()
+_stats_snapshot_timer: threading.Timer | None = None
+_stats_snapshot_dirty = False
+_stats_snapshot_loaded = False
+
+
+def _stats_caches() -> dict[str, SWRCache]:
+    return {
+        "period": PERIOD_STATS,
+        "lifetime": LIFETIME_STATS,
+        "window": WINDOW_STATS,
+        "history": HISTORY_TOTALS,
+    }
+
+
+def _stats_snapshot_path() -> str:
+    return os.path.join(config.DATA_DIR, _STATS_SNAPSHOT_FILENAME)
+
+
+def _encode_snapshot_key(value: Hashable) -> dict[str, Any]:
+    if isinstance(value, tuple):
+        return {"type": "tuple", "items": [_encode_snapshot_key(item) for item in value]}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return {"type": "scalar", "value": value}
+    raise TypeError(f"unsupported stats cache key type: {type(value).__name__}")
+
+
+def _decode_snapshot_key(value: Any) -> Hashable:
+    if not isinstance(value, dict):
+        raise ValueError("stats cache key must be an object")
+    kind = value.get("type")
+    if kind == "tuple":
+        items = value.get("items")
+        if not isinstance(items, list):
+            raise ValueError("stats tuple key items must be a list")
+        return tuple(_decode_snapshot_key(item) for item in items)
+    if kind == "scalar":
+        scalar = value.get("value")
+        if scalar is None or isinstance(scalar, (str, int, float, bool)):
+            return scalar
+    raise ValueError("unsupported stats cache key")
+
+
+def _stats_snapshot_payload() -> dict[str, Any]:
+    caches: dict[str, list[dict[str, Any]]] = {}
+    for name, cache in _stats_caches().items():
+        rows: list[dict[str, Any]] = []
+        for key, value in cache.snapshot_entries():
+            try:
+                encoded_key = _encode_snapshot_key(key)
+                json.dumps(value, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError):
+                continue
+            rows.append({"key": encoded_key, "value": value})
+        caches[name] = rows
+    return {
+        "schema": _STATS_SNAPSHOT_SCHEMA,
+        "version": _STATS_SNAPSHOT_VERSION,
+        "written_at_ms": int(time.time() * 1000),
+        "caches": caches,
+    }
+
+
+def _persist_stats_snapshot() -> None:
+    global _stats_snapshot_dirty, _stats_snapshot_timer
+    with _stats_snapshot_lock:
+        _stats_snapshot_timer = None
+        if not _stats_snapshot_dirty:
+            return
+        path = _stats_snapshot_path()
+        parent = os.path.dirname(os.path.abspath(path)) or "."
+        temp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+        try:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            payload = _stats_snapshot_payload()
+            raw = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            os.replace(temp, path)
+            try:
+                directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        except Exception as exc:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            print(f"[tg-stats-cache] persist failed: {type(exc).__name__}")
+            return
+        _stats_snapshot_dirty = False
+
+
+def _schedule_stats_snapshot_persist() -> None:
+    global _stats_snapshot_dirty, _stats_snapshot_timer
+    with _stats_snapshot_lock:
+        _stats_snapshot_dirty = True
+        previous = _stats_snapshot_timer
+        if previous is not None:
+            previous.cancel()
+        timer = threading.Timer(
+            _STATS_SNAPSHOT_WRITE_DELAY_SECONDS,
+            _persist_stats_snapshot,
+        )
+        timer.daemon = True
+        timer.name = "tg-stats-cache-save"
+        _stats_snapshot_timer = timer
+        timer.start()
+
+
+def _flush_stats_snapshot() -> None:
+    global _stats_snapshot_timer
+    with _stats_snapshot_lock:
+        timer = _stats_snapshot_timer
+        _stats_snapshot_timer = None
+    if timer is not None:
+        timer.cancel()
+    _persist_stats_snapshot()
+
+
+def _load_stats_snapshot_once() -> None:
+    global _stats_snapshot_loaded
+    started_ns = startup_timing.now_ns()
+    with _stats_snapshot_lock:
+        if _stats_snapshot_loaded:
+            return
+        _stats_snapshot_loaded = True
+    path = _stats_snapshot_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError("snapshot root must be an object")
+        if (
+            payload.get("schema") != _STATS_SNAPSHOT_SCHEMA
+            or payload.get("version") != _STATS_SNAPSHOT_VERSION
+        ):
+            raise ValueError("snapshot schema/version mismatch")
+        written_at_ms = int(payload.get("written_at_ms") or 0)
+        age_ms = int(time.time() * 1000) - written_at_ms
+        if age_ms < -300_000 or age_ms > _STATS_SNAPSHOT_MAX_AGE_SECONDS * 1000:
+            startup_timing.log(
+                "stats.snapshot-restore",
+                started_ns=started_ns,
+                status="expired",
+                age_ms=age_ms,
+            )
+            return
+        cache_payloads = payload.get("caches")
+        if not isinstance(cache_payloads, dict):
+            raise ValueError("snapshot caches must be an object")
+        restored = 0
+        for name, cache in _stats_caches().items():
+            raw_entries = cache_payloads.get(name) or []
+            if not isinstance(raw_entries, list):
+                continue
+            entries: list[tuple[Hashable, Any]] = []
+            for row in raw_entries:
+                if not isinstance(row, dict) or "key" not in row or "value" not in row:
+                    continue
+                try:
+                    key = _decode_snapshot_key(row["key"])
+                    hash(key)
+                except (TypeError, ValueError):
+                    continue
+                entries.append((key, row["value"]))
+            restored += cache.restore_entries(entries)
+    except FileNotFoundError:
+        startup_timing.log(
+            "stats.snapshot-restore", started_ns=started_ns, status="missing",
+        )
+        return
+    except Exception as exc:
+        startup_timing.log(
+            "stats.snapshot-restore",
+            started_ns=started_ns,
+            status="invalid",
+            error=type(exc).__name__,
+        )
+        print(f"[tg-stats-cache] restore ignored: {type(exc).__name__}")
+        return
+    startup_timing.log(
+        "stats.snapshot-restore",
+        started_ns=started_ns,
+        status="restored",
+        entries=restored,
+        age_ms=max(0, age_ms),
+    )
+
+
+def _reset_stats_snapshot_for_tests() -> None:
+    global _stats_snapshot_dirty, _stats_snapshot_loaded, _stats_snapshot_timer
+    with _stats_snapshot_lock:
+        timer = _stats_snapshot_timer
+        _stats_snapshot_timer = None
+        _stats_snapshot_dirty = False
+        _stats_snapshot_loaded = False
+    if timer is not None:
+        timer.cancel()
+    try:
+        os.unlink(_stats_snapshot_path())
+    except FileNotFoundError:
+        pass
+
 
 COORDINATOR = StatsRefreshCoordinator()
 
@@ -392,6 +763,40 @@ def _refresh_common_periods() -> bool:
             lambda start=since: _STATS_CONTROL.period_snapshot_since(_CONTEXT, start),
         ) and ok
     return ok
+
+
+def request_period_snapshot(
+    since: float,
+    *,
+    subscriber: Hashable | None = None,
+    on_ready: Callable[[Any, Exception | None], None] | None = None,
+    interactive: bool = False,
+) -> CacheRead:
+    """读取或排队一个精确起点的周期统计，不阻塞菜单线程。"""
+    start = float(since)
+    return PERIOD_STATS.request(
+        ("period", int(start)),
+        lambda: _STATS_CONTROL.period_snapshot_since(_CONTEXT, start),
+        subscriber=subscriber,
+        on_ready=on_ready,
+        interactive=interactive,
+    )
+
+
+def request_apikey_history(
+    *,
+    subscriber: Hashable | None = None,
+    on_ready: Callable[[Any, Exception | None], None] | None = None,
+    interactive: bool = False,
+) -> CacheRead:
+    """读取或排队 API Key 历史调用量，不阻塞菜单线程。"""
+    return HISTORY_TOTALS.request(
+        "apikey-history",
+        lambda: _STATS_CONTROL.request_totals_by_apikey(_CONTEXT),
+        subscriber=subscriber,
+        on_ready=on_ready,
+        interactive=interactive,
+    )
 
 
 def _load_lifetime() -> dict[str, Any]:
@@ -543,6 +948,15 @@ def initialization_text() -> str:
     return _INITIALIZING_TEXT
 
 
+def with_refreshing_notice(text: str, *reads: CacheRead) -> str:
+    restored = [read for read in reads if read.restored]
+    if not restored:
+        return text
+    if any(read.error is not None for read in restored):
+        return text + "\n\n⚠️ <i>统计更新失败，当前仍显示上次成功快照。</i>"
+    return text + "\n\n⏳ <i>数据来自上次成功快照，正在更新…</i>"
+
+
 _view_lock = threading.Lock()
 _view_counter = itertools.count(1)
 _view_tokens: dict[tuple[int, int], int] = {}
@@ -562,6 +976,12 @@ def begin_view(chat_id: int, message_id: int) -> int:
     with lock, _view_lock:
         _view_tokens[key] = token
     return token
+
+
+def current_view_token(chat_id: int, message_id: int) -> int | None:
+    """返回消息当前页面令牌；供同一次管理回调复用，避免重复 begin_view。"""
+    with _view_lock:
+        return _view_tokens.get((int(chat_id), int(message_id)))
 
 
 def is_current_view(chat_id: int, message_id: int, token: int) -> bool:
@@ -593,6 +1013,7 @@ def subscriber(chat_id: int, message_id: int, token: int) -> tuple[int, int, int
 def reset_for_tests() -> None:
     """仅供测试隔离进程级调度器与缓存。"""
     stop()
+    _reset_stats_snapshot_for_tests()
     for cache in (
         PERIOD_STATS,
         LIFETIME_STATS,

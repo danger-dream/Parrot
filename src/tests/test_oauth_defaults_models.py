@@ -150,7 +150,7 @@ def test_load_save_migrates_only_retired_fields(tmp_path, monkeypatch):
     original["xaiOAuth"]["videoModels"] = ["legacy-video"]
     original["antigravityOAuth"]["imageModels"] = ["ag-image"]
     keep = {key: copy.deepcopy(original[key]) for key in (
-        "image_models", "video_models", "channels", "cursorOAuth", "workbuddyOAuth",
+        "video_models", "channels", "cursorOAuth", "workbuddyOAuth",
     ) if key in original}
     path = tmp_path / "config.json"
     path.write_text(json.dumps(original))
@@ -168,7 +168,13 @@ def test_load_save_migrates_only_retired_fields(tmp_path, monkeypatch):
     assert loaded["openaiOAuth"]["codexCliVersion"] == original["openaiOAuth"]["codexCliVersion"]
     assert loaded["xaiOAuth"]["imageModels"] == ["legacy-image"]
     assert loaded["xaiOAuth"]["videoModels"] == ["legacy-video"]
-    assert loaded["antigravityOAuth"]["imageModels"] == ["ag-image"]
+    assert "imageModels" not in loaded["antigravityOAuth"]
+    assert loaded["image_models"] == {
+        "openai": ["image-custom"],
+        "xai": ["grok-image-custom"],
+        "antigravity": ["ag-image"],
+    }
+    assert config._migrate_antigravity_image_models(loaded) is False
     assert config._retire_oauth_default_models(loaded) is False
     legacy_fields(loaded)
     config.save()
@@ -179,6 +185,20 @@ def test_load_save_migrates_only_retired_fields(tmp_path, monkeypatch):
     assert_retired(json.loads(path.read_text()))
     assert_retired(config.DEFAULT_CONFIG)
     assert_retired(json.loads(Path("config.example.json").read_text()))
+
+
+def test_antigravity_empty_legacy_image_list_stays_disabled_after_migration():
+    legacy = {
+        "antigravityOAuth": {"imageModels": []},
+        "xaiOAuth": {"imageModels": ["xai-custom"]},
+        "images": {"toolModel": "openai-custom"},
+    }
+    assert config._migrate_antigravity_image_models(legacy) is True
+    assert legacy["image_models"]["antigravity"] == []
+    assert legacy["image_models"]["xai"] == ["xai-custom"]
+    assert "openai-custom" in legacy["image_models"]["openai"]
+    assert "imageModels" not in legacy["antigravityOAuth"]
+    assert config._migrate_antigravity_image_models(legacy) is False
 
 
 def test_removed_control_and_schema_surface():

@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from .. import blacklist, log_db, upstream
+from .. import blacklist, log_db, network, upstream
 from ..async_owned import await_owned
 from ..providers import registry as provider_registry
 from ..protocols import errors as protocol_errors
@@ -29,6 +29,7 @@ from ..protocols.runtime import (
     toolkit_for_channel,
 )
 from .base import metadata_from_response
+from .fingerprint import create_impersonated_client, supports_route as fingerprint_supports_route
 from .http import HttpStreamRequest, open_stream
 from .policy import proxy_byte_snapshot, proxy_route_kwargs
 from .timing import (
@@ -1152,7 +1153,12 @@ async def read_next_stream_step(
         return HttpStreamReadStep(kind="chunks", downstream_chunks=downstream_chunks)
 
 
-def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[str, Any | None]], AttemptResult | None]:
+def _resolve_http_route_chain(
+    channel,
+    resolved_model: str,
+    *,
+    proxy_purpose: str | None = None,
+) -> tuple[list[tuple[str, Any | None]], AttemptResult | None]:
     """Resolve an HTTP route without silently bypassing configured proxies.
 
     Direct remains the normal default when no new-proxy route exists.  Once a
@@ -1179,7 +1185,10 @@ def _resolve_http_route_chain(channel, resolved_model: str) -> tuple[list[tuple[
                 )
             return [("direct", None)], None
 
-        chain = pm.resolve_proxy_chain(**proxy_route_kwargs(channel, resolved_model))
+        route_kwargs = proxy_route_kwargs(channel, resolved_model)
+        if proxy_purpose:
+            route_kwargs["purpose"] = str(proxy_purpose)
+        chain = pm.resolve_proxy_chain(**route_kwargs)
         route_chain: list[tuple[str, Any | None]] = []
         for proxy_name in chain:
             connector = pm.get_connector(proxy_name)
@@ -1488,9 +1497,17 @@ async def open_response_with_proxy_chain(
     response_mode: str,
     request_id,
     retry_attempt_id=None,
+    proxy_purpose: str | None = None,
 ) -> OpenedHttpResponse:
     """Open one independent round per HTTP route, retrying pre-header failures."""
-    route_chain, route_error = _resolve_http_route_chain(channel, resolved_model)
+    if proxy_purpose:
+        route_chain, route_error = _resolve_http_route_chain(
+            channel, resolved_model, proxy_purpose=proxy_purpose,
+        )
+    else:
+        # Preserve the long-standing two-argument seam used by transport tests
+        # and internal extensions when no purpose override is required.
+        route_chain, route_error = _resolve_http_route_chain(channel, resolved_model)
     if route_error is not None:
         return OpenedHttpResponse(error=route_error)
     if response_mode not in ("stream", "non_stream"):
@@ -1541,25 +1558,85 @@ async def open_response_with_proxy_chain(
         proxy_started_at = time.time()
         late_timing = _LateRoundTiming()
 
-        if connector is not None:
+        fingerprint_profile = str(getattr(channel, "tls_fingerprint", None) or "").strip()
+        fingerprint_route = bool(
+            fingerprint_profile
+            and not bool(getattr(channel, "internal_loopback", False))
+            and fingerprint_supports_route(str(route_type))
+        )
+        if connector is not None or fingerprint_route:
             try:
-                connector.stats.total_attempts += 1
-                connector.stats.last_attempt_ts = proxy_started_at
-                proxy_client = connector.create_httpx_client(
-                    timeout=httpx.Timeout(
-                        connect=round_timeouts.connection + 0.5,
-                        read=max(330.0, round_timeouts.total + 1.0),
-                        write=30.0,
-                        pool=round_timeouts.connection + 0.5,
-                    ),
-                    byte_counter=_count_proxy_bytes_for(proxy_bytes),
-                    timing=late_timing,
+                if connector is not None:
+                    connector.stats.total_attempts += 1
+                    connector.stats.last_attempt_ts = proxy_started_at
+
+                client_timeout = httpx.Timeout(
+                    connect=round_timeouts.connection + 0.5,
+                    read=max(330.0, round_timeouts.total + 1.0),
+                    write=30.0,
+                    pool=round_timeouts.connection + 0.5,
                 )
+                route_counter = _count_proxy_bytes_for(proxy_bytes)
+                fingerprint_counter = route_counter
+                if fingerprint_route and connector is not None:
+                    def fingerprint_counter(up: int = 0, down: int = 0) -> None:
+                        connector.record_bytes(up, down)
+                        route_counter(up, down)
+
+                if fingerprint_route:
+                    fingerprint_auth = None
+                    fingerprint_owner = None
+                    if connector is not None and str(route_type) == "socks5":
+                        fingerprint_proxy = str(getattr(connector, "url", "") or "")
+                    elif connector is not None and str(route_type) == "ss2022":
+                        target_url = httpx.URL(str(upstream_req.url))
+                        if target_url.scheme != "https" or not target_url.host:
+                            raise ValueError(
+                                "SS2022 fingerprint bridge requires an HTTPS target"
+                            )
+                        target_port = int(target_url.port or 443)
+                        fingerprint_owner = await connector.acquire_curl_proxy(
+                            str(target_url.host),
+                            target_port,
+                            timeout=round_timeouts.connection + 0.5,
+                            timing=late_timing,
+                        )
+                        fingerprint_proxy = fingerprint_owner.proxy_url
+                        fingerprint_auth = fingerprint_owner.proxy_auth
+                    elif connector is None:
+                        # Preserve the legacy SOCKS setting used by the shared
+                        # client; an explicit direct connector never inherits it.
+                        fingerprint_proxy = str(network.active_socks5_url() or "")
+                    else:
+                        fingerprint_proxy = ""
+                    try:
+                        proxy_client = create_impersonated_client(
+                            fingerprint_profile,
+                            timeout=client_timeout,
+                            proxy=fingerprint_proxy,
+                            proxy_auth=fingerprint_auth,
+                            trust_env=bool(connector is None and not fingerprint_proxy),
+                            byte_counter=fingerprint_counter,
+                            route_owner=fingerprint_owner,
+                        )
+                    except BaseException:
+                        if fingerprint_owner is not None:
+                            await _await_http_owned(fingerprint_owner.aclose())
+                        raise
+                else:
+                    # Disabled fingerprinting preserves the original custom
+                    # httpcore backend for every SS2022 route.
+                    proxy_client = connector.create_httpx_client(
+                        timeout=client_timeout,
+                        byte_counter=route_counter,
+                        timing=late_timing,
+                    )
                 client = proxy_client
                 owner.proxy_client = proxy_client
             except Exception as exc:
-                connector.stats.total_failures += 1
-                connector.stats.last_error = str(exc)[:200]
+                if connector is not None:
+                    connector.stats.total_failures += 1
+                    connector.stats.last_error = str(exc)[:200]
                 last_pre_header = _attempt_result(
                     "proxy_connect_error",
                     f"proxy client error before upstream round: {exc}",
@@ -1592,24 +1669,25 @@ async def open_response_with_proxy_chain(
                 request_mode=f"http_{response_mode}",
             )
 
-        try:
-            await _await_http_owned(record_route_attempt())
-        except asyncio.CancelledError:
-            await _await_http_owned(owner.abort(
-                "cancelled",
-                "upstream HTTP route cancelled while recording proxy attempt",
-                wait_for_persistence=True,
-            ))
-            raise
-        except Exception:
-            owner.proxy_attempt_id = None
-        except BaseException as exc:
-            await _await_http_owned(owner.abort(
-                "transport_error",
-                f"upstream HTTP route aborted while recording proxy attempt: {exc}",
-                wait_for_persistence=True,
-            ))
-            raise
+        if request_id is not None:
+            try:
+                await _await_http_owned(record_route_attempt())
+            except asyncio.CancelledError:
+                await _await_http_owned(owner.abort(
+                    "cancelled",
+                    "upstream HTTP route cancelled while recording proxy attempt",
+                    wait_for_persistence=True,
+                ))
+                raise
+            except Exception:
+                owner.proxy_attempt_id = None
+            except BaseException as exc:
+                await _await_http_owned(owner.abort(
+                    "transport_error",
+                    f"upstream HTTP route aborted while recording proxy attempt: {exc}",
+                    wait_for_persistence=True,
+                ))
+                raise
         proxy_attempt_id = owner.proxy_attempt_id
 
         # The trace callback itself must remain non-blocking. It captures the
@@ -1671,7 +1749,16 @@ async def open_response_with_proxy_chain(
                 read_timeout=max(330.0, round_timeouts.total + 1.0),
                 write_timeout=30.0,
                 pool_timeout=round_timeouts.connection + 0.5,
-                extensions={"trace": trace_with_dispatch},
+                extensions={
+                    "trace": trace_with_dispatch,
+                    **({
+                        # End the business connection phase without fabricating
+                        # low-level httpcore trace intervals.
+                        "parrot_transport_lifecycle": {
+                            "mark_connection_complete": timing.mark_connection_complete,
+                        },
+                    } if fingerprint_route else {}),
+                },
             )
             ctx = (
                 _SharedStreamContext(stream_request)

@@ -106,6 +106,84 @@ def _install_recorder(m) -> ApiRecorder:
 
 # ─── Tests ───────────────────────────────────────────────────────
 
+def test_cold_stats_do_not_block_apikey_list_or_detail(m):
+    m["config"].update(lambda cfg: cfg.__setitem__("apiKeys", {}))
+    m["menu_cache"].PERIOD_STATS.clear()
+    m["menu_cache"].HISTORY_TOTALS.clear()
+    m["menu_cache"].DETAIL_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    menu = m["apikey_menu"]
+
+    menu.show(42, 100, "cb-empty")
+    empty = rec.last("editMessageText")
+    assert empty and "当前: 0 个" in empty["text"]
+    assert "统计初始化中" not in empty["text"]
+    assert any(
+        button.get("callback_data") == "ak:add"
+        for row in empty["reply_markup"]["inline_keyboard"]
+        for button in row
+    )
+
+    m["config"].update(lambda cfg: cfg.__setitem__(
+        "apiKeys", {"cold-key": {"key": "fake-secret-value"}},
+    ))
+    rec.clear()
+    menu.show(42, 100, "cb-list")
+    listing = rec.last("editMessageText")
+    assert listing and "cold-key" in listing["text"]
+    assert "统计初始化中" in listing["text"]
+    assert "本月 0 次" not in listing["text"]
+
+    rec.clear()
+    short = menu._short_of("cold-key")
+    menu.on_view(42, 100, "cb-detail", short)
+    detail = rec.last("editMessageText")
+    assert detail and "cold-key" in detail["text"]
+    assert "统计初始化中" in detail["text"]
+    callbacks = {
+        button.get("callback_data", "")
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for button in row
+    }
+    assert any(value.startswith("ak:rekey:") for value in callbacks)
+    assert any(value.startswith("ak:del:") for value in callbacks)
+
+
+def test_cold_apikey_action_keeps_loading_state_and_resubscribes(m, monkeypatch):
+    m["config"].update(lambda cfg: cfg.__setitem__(
+        "apiKeys", {"cold-action-key": {"key": "fake-secret-value"}},
+    ))
+    cache = m["menu_cache"]
+    cache.PERIOD_STATS.clear()
+    cache.HISTORY_TOTALS.clear()
+    cache.DETAIL_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    subscriptions = []
+
+    def request_period(since, **kwargs):
+        subscriptions.append(kwargs.get("subscriber"))
+        return cache.PERIOD_STATS.peek(("period", int(since)))
+
+    token = cache.begin_view(42, 100)
+    monkeypatch.setattr(cache, "request_period_snapshot", request_period)
+    monkeypatch.setattr(
+        cache, "begin_view",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate begin_view")),
+    )
+    menu = m["apikey_menu"]
+    short = menu._short_of("cold-action-key")
+    menu.on_images_toggle(42, 100, "cb-images", short)
+
+    edits = rec.by_method("editMessageText")
+    assert edits
+    assert "统计初始化中" in edits[-1]["text"]
+    assert "本月暂无调用" not in edits[-1]["text"]
+    assert subscriptions
+    assert subscriptions[-1][2:] == (token, "apikey-detail-period")
+
+
 def test_states(m):
     sts = m["states"]
     sts.clear_all()

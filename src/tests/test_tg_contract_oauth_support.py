@@ -142,11 +142,11 @@ class FakeEnv:
         mp.setattr(menu_cache, "begin_view", lambda chat_id, message_id: self.events.append(
             ["begin_view", chat_id, message_id]
         ))
-        mp.setattr(om, "_request_window_snapshots", lambda accounts: True)
+        mp.setattr(om, "_request_window_snapshots", lambda accounts, **kwargs: True)
         mp.setattr(om, "_schedule_openai_metadata_for_ui", lambda *a, **k: None)
         mp.setattr(om, "_schedule_oauth_cache_refresh_for_ui", lambda *a, **k: None)
         mp.setattr(om, "_account_period_stats", lambda *a, **k: None)
-        mp.setattr(om, "_queue_oauth_detail_stats", lambda key: True)
+        mp.setattr(om, "_queue_oauth_detail_stats", lambda key, **kwargs: True)
         mp.setattr(om, "_render_cached_detail", lambda key, page, filt, **kw: om._detail_text_and_kb(
             key, page=page, filter_key=filt, month_snapshot={}, model_stats=[]
         ))

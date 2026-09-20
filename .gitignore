@@ -38,6 +38,8 @@ state.db.pre_composite_key.bak
 /state-migration.json
 /state-migration.json.lock
 /state-migration.json.*.tmp
+/telegram-stats-cache-v1.json
+/telegram-stats-cache-v1.json.tmp-*
 
 # 运行日志 / 图片缓存
 logs/

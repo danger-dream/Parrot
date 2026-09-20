@@ -397,6 +397,71 @@ def test_stop_waits_for_poll_and_discards_late_result_or_failure(
     assert ui._session is None
 
 
+def test_start_rejects_telegram_401_without_ready_log_or_token_leak(
+    monkeypatch, capsys,
+):
+    calls: list[str] = []
+
+    def unauthorized(method, data=None):
+        calls.append(method)
+        return {"ok": False, "error_code": 401, "description": "Unauthorized"}
+
+    scheduler_started: list[bool] = []
+    monkeypatch.setattr(ui, "api", unauthorized)
+    monkeypatch.setattr(bot.menu_cache, "start", lambda: scheduler_started.append(True))
+
+    assert bot.start() is False
+    output = capsys.readouterr().out
+    assert calls == ["deleteWebhook"]
+    assert scheduler_started == []
+    assert bot._running is False
+    assert bot._thread is None
+    assert "bot startup failed (deleteWebhook)" in output
+    assert "Bot Token 无效或已撤销（Telegram 401）" in output
+    assert "polling ready" not in output
+    assert ui.get_token() not in output
+
+
+def test_start_logs_ready_only_after_all_initialization_calls_succeed(
+    monkeypatch, capsys,
+):
+    calls: list[str] = []
+    scheduler_events: list[str] = []
+
+    def successful(method, data=None):
+        calls.append(method)
+        result = [] if method == "getUpdates" else {}
+        return {"ok": True, "result": result}
+
+    class FakeThread:
+        def __init__(self, *, target, daemon, name):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(ui, "api", successful)
+    monkeypatch.setattr(ui, "install_notify_handler", lambda: None)
+    monkeypatch.setattr(bot.menu_cache, "start", lambda: scheduler_events.append("start"))
+    monkeypatch.setattr(bot.menu_cache, "stop", lambda: scheduler_events.append("stop"))
+    monkeypatch.setattr(bot.threading, "Thread", FakeThread)
+
+    assert bot.start() is True
+    output = capsys.readouterr().out
+    assert calls == ["deleteWebhook", "getUpdates", "setMyCommands"]
+    assert scheduler_events == ["start"]
+    assert bot._running is True
+    assert bot._thread is not None and bot._thread.started is True
+    assert "[tg] bot started (polling ready)" in output
+
+    bot.stop()
+    assert scheduler_events == ["start", "stop"]
+    assert bot._running is False
+
+
 def test_start_is_refused_until_prior_stop_finishes_then_uses_new_generation(monkeypatch):
     old_stop = threading.Event()
     with bot._lifecycle_lock:
@@ -407,9 +472,9 @@ def test_start_is_refused_until_prior_stop_finishes_then_uses_new_generation(mon
         bot._stop_event = old_stop
     old_generation = bot._run_generation
 
-    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: None)
-    monkeypatch.setattr(ui, "delete_my_commands", lambda: None)
-    monkeypatch.setattr(ui, "set_my_commands", lambda _commands: None)
+    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: True)
+    monkeypatch.setattr(ui, "delete_my_commands", lambda: {"ok": True})
+    monkeypatch.setattr(ui, "set_my_commands", lambda _commands: {"ok": True})
     monkeypatch.setattr(ui, "install_notify_handler", lambda: None)
     monkeypatch.setattr(bot.menu_cache, "start", lambda: None)
 
@@ -455,9 +520,16 @@ def test_stop_waits_for_start_gap_before_activation(monkeypatch):
     monkeypatch.setattr(ui, "activate_session", lambda: events.append("activate"))
     monkeypatch.setattr(ui, "close_session", lambda: events.append("close"))
     monkeypatch.setattr(ui, "wait_session_idle", lambda timeout=None: True)
-    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: events.append("drop"))
-    monkeypatch.setattr(ui, "delete_my_commands", lambda: events.append("delete"))
-    monkeypatch.setattr(ui, "set_my_commands", lambda _commands: events.append("set"))
+    monkeypatch.setattr(
+        bot, "_drop_pending_updates", lambda: (events.append("drop"), True)[1],
+    )
+    monkeypatch.setattr(
+        ui, "delete_my_commands", lambda: (events.append("delete"), {"ok": True})[1],
+    )
+    monkeypatch.setattr(
+        ui, "set_my_commands",
+        lambda _commands: (events.append("set"), {"ok": True})[1],
+    )
     monkeypatch.setattr(ui, "install_notify_handler", lambda: events.append("notify"))
     monkeypatch.setattr(bot.menu_cache, "start", lambda: events.append("menu_start"))
     monkeypatch.setattr(bot.menu_cache, "stop", lambda: events.append("menu_stop"))
@@ -516,9 +588,16 @@ def test_concurrent_stop_waiters_keep_start_closed_until_all_return(monkeypatch)
     monkeypatch.setattr(bot.menu_cache, "stop", lambda: events.append("menu_stop"))
     monkeypatch.setattr(bot, "_leave_stop_cycle", gated_leave)
     monkeypatch.setattr(ui, "activate_session", lambda: events.append("activate"))
-    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: events.append("drop"))
-    monkeypatch.setattr(ui, "delete_my_commands", lambda: events.append("delete"))
-    monkeypatch.setattr(ui, "set_my_commands", lambda _commands: events.append("set"))
+    monkeypatch.setattr(
+        bot, "_drop_pending_updates", lambda: (events.append("drop"), True)[1],
+    )
+    monkeypatch.setattr(
+        ui, "delete_my_commands", lambda: (events.append("delete"), {"ok": True})[1],
+    )
+    monkeypatch.setattr(
+        ui, "set_my_commands",
+        lambda _commands: (events.append("set"), {"ok": True})[1],
+    )
     monkeypatch.setattr(ui, "install_notify_handler", lambda: events.append("notify"))
     monkeypatch.setattr(bot.menu_cache, "start", lambda: events.append("menu_start"))
 
@@ -568,7 +647,7 @@ def test_concurrent_stop_waiters_keep_start_closed_until_all_return(monkeypatch)
 
     monkeypatch.setattr(bot.threading, "Thread", FakeThread)
     bot.start()
-    assert events[-6:] == ["activate", "drop", "delete", "set", "notify", "menu_start"]
+    assert events[-5:] == ["activate", "drop", "set", "notify", "menu_start"]
     assert events.count("menu_stop") == 1
 
 

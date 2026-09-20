@@ -49,6 +49,167 @@ def test_matrix_allows_native_state_only_on_capable_responses_channels():
         )
 
 
+def test_matrix_allows_native_x_search_only_for_xai_responses_channel():
+    from src.protocols.matrix import capabilities_for_channel, extract_request_features
+
+    xai = SimpleNamespace(protocol="openai-responses", type="oauth", provider="xai")
+    capabilities = capabilities_for_channel(xai)
+    bodies = [
+        {
+            "input": "latest posts",
+            "tools": [{"type": "x_search", "allowed_x_handles": ["xai"]}],
+        },
+        {
+            "input": "latest posts",
+            "tools": [{"type": "x_search"}],
+            "tool_choice": {"type": "x_search"},
+        },
+        {
+            "input": "latest posts",
+            "tools": [{"type": "x_search"}],
+            "tool_choice": {
+                "type": "allowed_tools", "mode": "required",
+                "tools": [{"type": "x_search"}],
+            },
+        },
+    ]
+    for body in bodies:
+        features = extract_request_features("responses", body)
+        assert any("x_search" in label for label in features.hosted_tool_labels)
+        assert DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features,
+            capabilities=capabilities,
+        ).cost == 0
+
+    ordinary_api = SimpleNamespace(protocol="openai-responses", type="api", provider="openai")
+    ordinary_capabilities = capabilities_for_channel(ordinary_api)
+    assert "hosted_tools" in ordinary_capabilities.native_state
+    for body in bodies:
+        with pytest.raises(ProtocolGuardError, match="x_search"):
+            DEFAULT_MATRIX.plan(
+                "responses", "openai-responses",
+                features=extract_request_features("responses", body),
+                capabilities=ordinary_capabilities,
+            )
+
+
+def test_matrix_keeps_native_x_search_history_on_xai_only():
+    from src.protocols.matrix import capabilities_for_channel, extract_request_features
+    from src.search_xai import X_SEARCH_CALL_NAMES
+
+    xai_capabilities = capabilities_for_channel(
+        SimpleNamespace(protocol="openai-responses", type="oauth", provider="xai"),
+    )
+    ordinary_capabilities = capabilities_for_channel(
+        SimpleNamespace(protocol="openai-responses", type="api", provider="openai"),
+    )
+    histories = [
+        {"input": [{
+            "type": "x_search_call", "id": "xs_1", "status": "completed",
+            "action": {"type": "search", "query": "xAI"},
+        }]},
+        *({"input": [{
+            "type": "custom_tool_call", "id": "xs_1", "call_id": "xs_1",
+            "name": name, "status": "completed",
+        }]} for name in sorted(X_SEARCH_CALL_NAMES)),
+    ]
+    for body in histories:
+        features = extract_request_features("responses", body)
+        assert "x_search" in features.hosted_tool_labels
+        assert not features.has_custom_tools
+        assert DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features,
+            capabilities=xai_capabilities,
+        ).cost == 0
+        with pytest.raises(ProtocolGuardError, match="x_search"):
+            DEFAULT_MATRIX.plan(
+                "responses", "openai-responses", features=features,
+                capabilities=ordinary_capabilities,
+            )
+        with pytest.raises(ProtocolGuardError, match="x_search_call"):
+            DEFAULT_MATRIX.plan(
+                "responses", "anthropic", features=features,
+                capabilities=ChannelCapabilities(protocol="anthropic"),
+            )
+
+    unrelated_custom = {"input": [{
+        "type": "custom_tool_call", "id": "ct_1", "call_id": "ct_1",
+        "name": "shell", "status": "completed",
+    }]}
+    features = extract_request_features("responses", unrelated_custom)
+    assert features.has_custom_tools
+    assert "x_search" not in features.hosted_tool_labels
+    with pytest.raises(ProtocolGuardError, match="custom_tool_call.input"):
+        DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features,
+            capabilities=xai_capabilities,
+        )
+    assert DEFAULT_MATRIX.plan(
+        "responses", "openai-responses", features=features,
+        capabilities=ordinary_capabilities,
+    ).cost == 0
+
+
+def test_xai_internal_name_does_not_steal_an_ordinary_custom_tool():
+    from src.protocols.matrix import capabilities_for_channel, extract_request_features
+    from src.search_xai import X_SEARCH_CALL_NAMES
+
+    name = sorted(X_SEARCH_CALL_NAMES)[0]
+    body = {
+        "tools": [{"type": "custom", "name": name, "format": {"type": "text"}}],
+        "input": [{
+            "type": "custom_tool_call", "id": "ct_1", "call_id": "ct_1",
+            "name": name, "status": "completed", "input": '{"query":"user tool"}',
+        }],
+    }
+    features = extract_request_features("responses", body)
+    assert "x_search" not in features.hosted_tool_labels
+    assert features.has_custom_tools
+
+    ordinary = capabilities_for_channel(
+        SimpleNamespace(protocol="openai-responses", type="api", provider="openai"),
+    )
+    xai = capabilities_for_channel(
+        SimpleNamespace(protocol="openai-responses", type="oauth", provider="xai"),
+    )
+    assert DEFAULT_MATRIX.plan(
+        "responses", "openai-responses", features=features, capabilities=ordinary,
+    ).cost == 0
+    with pytest.raises(ProtocolGuardError, match="custom_tool_declaration"):
+        DEFAULT_MATRIX.plan(
+            "responses", "openai-responses", features=features, capabilities=xai,
+        )
+
+
+def test_matrix_checks_every_stateful_builtin_after_x_search_history():
+    from src.protocols.matrix import capabilities_for_channel, extract_request_features
+
+    xai = capabilities_for_channel(
+        SimpleNamespace(protocol="openai-responses", type="oauth", provider="xai"),
+    )
+    for unsupported in ("file_search_call", "computer_call", "mcp_call"):
+        body = {"input": [
+            {"type": "x_search_call", "id": "xs_1", "status": "completed"},
+            {"type": unsupported, "id": "other_1", "status": "completed"},
+        ]}
+        features = extract_request_features("responses", body)
+        assert features.stateful_input_item_labels == ("x_search_call", unsupported)
+        with pytest.raises(ProtocolGuardError, match=unsupported):
+            DEFAULT_MATRIX.plan(
+                "responses", "openai-responses", features=features, capabilities=xai,
+            )
+
+    # xAI explicitly supports both native searches; collecting all requirements
+    # must not regress a valid mixed Web Search/X Search replay.
+    supported = extract_request_features("responses", {"input": [
+        {"type": "x_search_call", "id": "xs_1", "status": "completed"},
+        {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+    ]})
+    assert DEFAULT_MATRIX.plan(
+        "responses", "openai-responses", features=supported, capabilities=xai,
+    ).cost == 0
+
+
 def test_matrix_routes_file_id_only_to_openai_targets_with_file_capability():
     from src.protocols.matrix import extract_request_features
 

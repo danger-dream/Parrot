@@ -290,6 +290,7 @@ class OAuthSettings:
     quota_monitor_interval_seconds: int
     quota_monitor_threshold_percent: float
     cch_mode: CchMode
+    antigravity_tls_fingerprint_enabled: bool
     revision: str
 
 

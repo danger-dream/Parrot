@@ -39,7 +39,7 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 
 **家族内互转**：`/v1/chat/completions` 下游请求可以打到 `openai-responses` 上游，反之亦然（SSE 双向状态机 + CapabilityGuard 兜底不兼容字段）。
 
-**图片 / 视频生成**：Parrot 简化图片接口仍走 ChatGPT Codex Responses + `image_generation` tool；标准 `/v1/images/generations`、`/v1/images/edits` 则按 `model` 分流，`grok-imagine-image*` 使用现有 xAI OAuth，其余图片模型保持原 GPT/Codex 管线。xAI 视频通过 `/v1/videos/generations|edits|extensions` 创建异步任务，再用 `GET /v1/videos/{request_id}` 查询；查询固定复用创建任务的 OAuth 账号。
+**图片 / 视频生成**：Parrot 简化图片接口仍走 ChatGPT Codex Responses + `image_generation` tool；标准 `/v1/images/generations`、`/v1/images/edits` 按 `model` 统一分流到 GPT/Codex、xAI Grok Imagine、Antigravity Gemini Image 或已配置的 OpenAI 兼容 API 渠道。Antigravity 编辑会把参考图与 mask 一并发送给 Gemini，并在本地再次执行遮罩边界保护。xAI 视频通过 `/v1/videos/generations|edits|extensions` 创建异步任务，再用 `GET /v1/videos/{request_id}` 查询；查询固定复用创建任务的 OAuth 账号。
 
 **运行时保护**
 
@@ -54,8 +54,8 @@ Parrot 的核心价值：**一个进程管住所有 AI 家族的上游复用**�
 - **评分调度**：滑动窗口 EMA 延迟 + 失败惩罚；带 20% 探索率避免赢家通吃
 - **模型映射 & 入口默认模型**：三条入口（anthropic / openai-chat / openai-responses）各自独立维护 `别名 → 真实模型` 表和默认模型；下游客户端发别名、代理改写成真实名再走调度，上游发新模型时**改 TG bot 即生效，无需重启客户端**
 - **出站网络设置**：支持在 TG「系统设置 → 网络设置」里配置 DNS 与 SOCKS5。DNS 默认 `8.8.8.8`，首次启动可从系统 DNS 同步一次；DNS 支持普通 IP/域名、DoT（`dot://...`）和 DoH（`https://.../dns-query`），DNS 服务器域名本身用系统 DNS 解析避免套娃。启用 SOCKS5 后所有出站 HTTP 请求走 SOCKS5，代理地址若为域名则使用配置 DNS 解析，保存前会检测并二次确认。内置「网络检测」后台监控，可按间隔检测 DNS / SOCKS5 / 渠道 TCP 连通性 / OpenAI、Claude、Cloudflare 核心上游，并在失败/恢复边沿各通知一次。
-- **多媒体日志与媒体缓存**：GPT/Grok 图片及 Grok 视频任务统一写入独立 `image_logs.db`，不污染文本请求日志；视频轮询只更新原任务。开启缓存后，GPT/Grok 图片与已完成的 Grok 视频共用 `images/` 缓存和清理策略，TG 管理员可在「最近日志 → 多媒体日志」查看仍存在的图片或视频。
-- **MCP 服务**：`POST /mcp` 对外提供搜索与媒体工具，供任意 MCP 客户端接入。工具与 HTTP 入口共用同一套实现、同一套开关（`mcp.enabled` / `mcp.tools` / `apiKeys.<name>.allowMcp` / `mcpTools`）和同一份资源 URL 生成逻辑，因此权限、渠道选择、日志与缓存完全一致。工具说明中的可用来源在每次 `tools/list` 时按当前配置实时计算，上游增删来源后模型立即看到最新列表。调用事实独立记录在 `mcp_call_log`（含未触达上游的拒绝），工具返回的内容另存 `mcp_call_detail`（与摘要分表，受「数据留存 → 保存完整请求」控制）。TG 管理员可在「系统设置 → MCP 服务」开关服务、查看接入配置与调用统计，并在调用日志里逐条查看**搜了什么、用的哪个引擎、结果是什么**；工具与访问 Key 在「API Key 管理」按 Key 配置。
+- **多媒体日志与媒体缓存**：GPT/Grok/Antigravity 图片及 Grok 视频任务统一写入独立 `image_logs.db`，不污染文本请求日志；视频轮询只更新原任务。开启缓存后，各图片来源与已完成的 Grok 视频共用 `images/` 缓存和清理策略，TG 管理员可在「最近日志 → 多媒体日志」查看仍存在的图片或视频。
+- **MCP 服务**：`POST /mcp` 对外提供搜索与媒体工具，供任意 MCP 客户端接入。工具与 HTTP 入口共用同一套实现、同一套开关（`mcp.enabled` / `mcp.tools` / `apiKeys.<name>.allowMcp` / `mcpTools`）和同一份资源 URL 生成逻辑，因此权限、渠道选择、日志与缓存完全一致。工具说明中的可用来源在每次 `tools/list` 时按当前配置实时计算，上游增删来源后模型立即看到最新列表。`web_search` 的 Grok 原生 X Search 默认使用虚拟来源 `x-twitter`；若升级前已有同名真实搜索后端，该后端继续保持普通 Web Search 语义，虚拟来源会自动改用 schema 实时枚举中的兼容 ID（当前为 `x:twitter`），不会抢占既有配置。调用事实独立记录在 `mcp_call_log`（含未触达上游的拒绝），工具返回的内容另存 `mcp_call_detail`（与摘要分表，受「数据留存 → 保存完整请求」控制）。TG 管理员可在「系统设置 → MCP 服务」开关服务、查看接入配置与调用统计，并在调用日志里逐条查看**搜了什么、用的哪个引擎、结果是什么**；工具与访问 Key 在「API Key 管理」按 Key 配置。
 
 **Telegram 图形管理面板**
 
@@ -209,7 +209,7 @@ curl http://<server>:22122/v1/images/edit \
   }'
 ```
 
-**官方 SDK 接入**：把 `baseURL` 指向 `http://<server>:22122/v1`，`apiKey` 填 Parrot 生成的下游 Key，即可直接用 `openai` / `anthropic` 官方 Python / Node SDK。图片接口是 Parrot 简化接口，不是 OpenAI 标准 Images API；请直接请求 `/v1/images/generate` / `/v1/images/edit`。
+**官方 SDK 接入**：把 `baseURL` 指向 `http://<server>:22122/v1`，`apiKey` 填 Parrot 生成的下游 Key，即可直接用 `openai` / `anthropic` 官方 Python / Node SDK。图片同时提供 Parrot 简化接口 `/v1/images/generate`、`/v1/images/edit` 和 OpenAI 兼容接口 `/v1/images/generations`、`/v1/images/edits`；后者按模型选择 GPT/Codex、xAI、Antigravity 或 API 渠道。
 
 ---
 
@@ -393,7 +393,7 @@ OAuth 的明确传输故障（连接/读写/首包/空闲/总时限超时、连�
 ### 📋 最近日志
 页面可在两类日志之间切换：
 - `💬 请求日志`：普通文本 / Responses / Chat / WS 请求，详情包含完整重试链和请求/响应 body；
-- `🎞 多媒体日志`：统一展示 GPT/Grok 图片生成与编辑、Grok 视频生成/编辑/延长。视频后续轮询只更新同一任务，详情显示进度、最终状态、OAuth 账号、耗时和 xAI 实际费用。
+- `🎞 多媒体日志`：统一展示 GPT/Grok/Antigravity 图片生成与编辑、Grok 视频生成/编辑/延长。视频后续轮询只更新同一任务，详情显示进度、最终状态、OAuth 账号、耗时和 xAI 实际费用。
 
 ### 📡 渠道管理
 添加向导（4 步 + 测试面板）、渠道详情、编辑、测试模型（单/全部）。
@@ -429,9 +429,9 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 从「🔐 管理 OAuth → ⚙️ 账户设置」进入：
 - 编辑 `xaiOAuth.imageModels` 与 `xaiOAuth.videoModels`；
 - 编辑视频任务绑定时长 `videoJobTtlSeconds` 与媒体请求超时 `mediaRequestTimeoutSeconds`；
-- 页面明确展示：配置的 `grok-imagine-image*` 走 xAI OAuth，其他图片模型继续走 GPT/Codex；
+- 路由边界：`grok-imagine-image*` 走 xAI OAuth；`image_models.antigravity` 中的模型走 Antigravity OAuth；其他图片模型按统一模型中心中的 GPT/Codex 或 API 来源路由；
 - API Key 详情页分别控制图片、视频权限，模型白名单页用 🖼 / 🎬 标出对应媒体模型；
-- 页面可直接进入「🎞 多媒体日志」，查看 GPT/Grok 统一统计、费用和任务状态。
+- 页面可直接进入「🎞 多媒体日志」，查看 GPT/Grok/Antigravity 统一统计、费用和任务状态。
 
 ### ⚖️ 负载均衡
 - `smart` 智能调度：按滑动窗口评分 + 探索率排序
@@ -452,6 +452,21 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 ### ⚙ 系统设置
 超时 / 错误阶梯（含阶梯推进最小间隔、永久最小累计两项爆发保护）/ 评分参数 / 亲和参数 / CCH 模式 / 配额监控 / 通知设置 / 首包黑名单 / ⚡ 渠道并发限制。**所有设置均热加载，无需重启。**
+
+#### Antigravity TLS/H2 指纹伪装
+
+该功能默认关闭，可在「OAuth 账户」→「⚙️ 设置」点击「🛡 AG指纹」热切换；只影响 Antigravity OAuth 请求（包含文本、图片生成和图片编辑），其他渠道及关闭时继续使用原有 httpx transport。对应配置为：
+
+```json
+"antigravityOAuth": {
+  "tlsFingerprint": {
+    "enabled": false,
+    "profile": "chrome131"
+  }
+}
+```
+
+启用后使用 `curl_cffi` 模拟所选浏览器的 TLS/HTTP/2 指纹。direct 与 SOCKS5 路由由 curl 直接处理；内建 SS2022 路由会为每次 attempt 创建仅绑定 loopback、一次性鉴权且锁定当前目标的 HTTP CONNECT bridge，TLS 仍由 curl 端到端建立，不改变 SS2022 出口。适配层关闭自动重定向、按现有超时传递 connect/read、规范化压缩响应，并将发送后状态不明的超时、取消及 transport 异常视为已 dispatch，避免不安全重放。由于 `curl_cffi` 高层流式 API 不提供 httpcore 的 upload-complete/DNS/TCP/TLS trace，启用时 connection/first-byte 分界及这些低层诊断字段不具备与 httpx 相同的精度。
 
 ---
 
@@ -610,11 +625,11 @@ docker compose logs --since 1h         # 最近 1 小时
 
 按月分库在 `data/logs/YYYY-MM.db`（SQLite）。在 TG Bot「📋 最近日志」查看；或宿主机直接 `sqlite3 <安装目录>/data/logs/2026-04.db`。
 
-GPT/Grok 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`；历史主调用表原地扩展为统一多媒体任务日志，GPT 图片账号尝试表继续保留。视频创建记一条 `pending`，客户端轮询只更新该记录直至 `success / failed / expired`，不会污染普通文本请求日志。
+GPT/Grok/Antigravity 图片及 Grok 视频任务使用独立日志库 `data/image_logs.db`；历史主调用表原地扩展为统一多媒体任务日志，GPT 图片账号尝试表继续保留。视频创建记一条 `pending`，客户端轮询只更新该记录直至 `success / failed / expired`，不会污染普通文本请求日志。
 
 ### 多媒体缓存
 
-缓存默认关闭。开启后，GPT/Grok 图片以及轮询完成的 Grok 视频会保存到 `data/images/`（或 `images.cachePath` 指定的位置），并统一按 `images.cacheRetentionDays` 和 `images.cacheMaxBytes` 自动清理。缓存路径只在服务端内部使用，API 响应不会暴露本地文件路径；管理员可在 TG「📋 最近日志 → 🎞 多媒体日志」的任务详情中查看仍存在的缓存图片或视频。
+缓存默认关闭。开启后，GPT/Grok/Antigravity 图片以及轮询完成的 Grok 视频会保存到 `data/images/`（或 `images.cachePath` 指定的位置），并统一按 `images.cacheRetentionDays` 和 `images.cacheMaxBytes` 自动清理。缓存路径只在服务端内部使用，API 响应不会暴露本地文件路径；管理员可在 TG「📋 最近日志 → 🎞 多媒体日志」的任务详情中查看仍存在的缓存图片或视频。
 
 ### 状态数据
 
@@ -732,7 +747,7 @@ Parrot/
             ├── apikey_menu.py   ← API Key 模型 / 图片 / 视频权限
             ├── image_menu.py    ← GPT/Codex 图片配置 / 缓存设置
             ├── xai_imagine_menu.py ← Grok Imagine 图片 / 视频设置
-            ├── media_logs_menu.py   ← GPT/Grok 统一多媒体日志
+            ├── media_logs_menu.py   ← GPT/Grok/Antigravity 统一多媒体日志
             ├── system_menu.py
             └── help_menu.py
 ```

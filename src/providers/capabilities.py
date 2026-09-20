@@ -230,8 +230,9 @@ XAI_OAUTH_CAPABILITIES = ProviderCapabilities(
         "encrypted_reasoning_replay",
         "x_grok_conv_id",
         "web_search",
+        "x_search",
     }),
-    notes=("xAI/Grok OAuth uses https://api.x.ai/v1/responses with Bearer OAuth, SSE, and native web_search",),
+    notes=("xAI/Grok OAuth uses https://api.x.ai/v1/responses with Bearer OAuth, SSE, and native web_search/x_search",),
 )
 
 

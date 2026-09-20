@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from fastapi.responses import JSONResponse
 from .. import channel_state, concurrency, config, cooldown, image_artifacts, image_catalog, load_balancing, media_cache, network, oauth_manager, scorer
+from ..antigravity import images as antigravity_images
 from ..channel import registry
 from ..async_owned import await_owned
 from ..channel.url_utils import resolve_upstream_url
@@ -139,6 +140,10 @@ async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Resp
             payload['images'] = [{'image_url': x} for x in parsed.input_images]
             if parsed.mask_url: payload['images'].append({'image_url': parsed.mask_url})
         purpose = 'oauth_openai'
+    elif antigravity_images.is_source(source):
+        return await antigravity_images.request(
+            source, parsed, prompt=_prompt(parsed), n=n, action=action, cfg=cfg,
+        )
     elif _is_xai_source(source):
         payload = _xai_image_payload(source, parsed, action=action, n=n)
         if source.key.startswith('oauth:'):
@@ -217,6 +222,8 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
         try:
             if candidate.key.startswith('oauth:openai:') and parsed.native_options.get('moderation') not in (None, 'auto'):
                 raise ValueError('Codex Images does not expose non-default moderation; use auto or a compatible API image source')
+            if antigravity_images.is_source(candidate):
+                antigravity_images.validate_request(parsed, action=action)
             if _is_xai_source(candidate):
                 _xai_image_payload(candidate, parsed, action=action, n=parsed.requested_n)
         except ValueError as exc:
@@ -226,6 +233,7 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
     if not compatible:
         raise ValueError('no image source supports these parameters: ' + '; '.join(dict.fromkeys(capability_notes)))
     sources = compatible
+    ag_parsed = None
     try:
         if action == 'edit':
             parsed = copy.copy(parsed)
@@ -234,11 +242,41 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
             parsed.input_images = [await image_artifacts.inline_local_reference(ref) for ref in parsed.input_images]
             if parsed.mask_url:
                 parsed.mask_url = await image_artifacts.inline_local_reference(parsed.mask_url)
+            ag_sources = [source for source in sources if antigravity_images.is_source(source)]
+            if ag_sources:
+                # AG consumes Gemini inlineData. Keep its resolved inputs on a
+                # source-specific copy so an AG-incompatible URL cannot alter or
+                # block xAI/OpenAI/API candidates for the same client model.
+                try:
+                    ag_parsed = await antigravity_images.prepare_edit_inputs(parsed)
+                except (httpx.TransportError, ValueError) as exc:
+                    remaining = [source for source in sources if not antigravity_images.is_source(source)]
+                    if not remaining:
+                        if isinstance(exc, httpx.TimeoutException):
+                            return JSONResponse({'error': {
+                                'type': 'image_input_timeout',
+                                'message': 'reference image or mask download timed out; no generation was attempted',
+                            }}, status_code=504)
+                        if isinstance(exc, httpx.TransportError):
+                            return JSONResponse({'error': {
+                                'type': 'image_input_error',
+                                'message': 'reference image or mask download failed; no generation was attempted',
+                            }}, status_code=502)
+                        raise
+                    capability_notes.extend(
+                        f'{source.provider} ({source.upstream}): reference input is not usable by Antigravity'
+                        for source in ag_sources
+                    )
+                    sources = remaining
             if any(_uses_api_multipart(source) for source in sources):
                 parsed._api_edit_files = await _prepare_api_edit_files(parsed)
         mask = None
-        if parsed.mask_url:
-            mask = image_artifacts.prepare_mask(await image_artifacts.reference_bytes(parsed.input_images[0]), await image_artifacts.reference_bytes(parsed.mask_url))
+        mask_inputs = ag_parsed or parsed
+        if mask_inputs.mask_url:
+            mask = image_artifacts.prepare_mask(
+                await image_artifacts.reference_bytes(mask_inputs.input_images[0]),
+                await image_artifacts.reference_bytes(mask_inputs.mask_url),
+            )
     except httpx.TimeoutException:
         # Input retrieval precedes any paid POST; do not label this an unknown
         # generation outcome or leak the reference URL from the transport error.
@@ -270,10 +308,18 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                 if not await concurrency.try_acquire(effect_key): continue
                 try:
                     log_source = source
-                    n = 1 if source.key.startswith('oauth:openai:') else parsed.requested_n-len(data)
+                    n = 1 if (
+                        source.key.startswith('oauth:openai:')
+                        or antigravity_images.is_source(source)
+                    ) else parsed.requested_n-len(data)
                     calls += 1
                     usages.append(None)
-                    response = await _send(source, parsed, action=action, n=n, cfg=cfg)
+                    attempt_parsed = (
+                        ag_parsed
+                        if antigravity_images.is_source(source) and ag_parsed is not None
+                        else parsed
+                    )
+                    response = await _send(source, attempt_parsed, action=action, n=n, cfg=cfg)
                 finally:
                     concurrency.release(effect_key)
                 if source.key.startswith('oauth:xai:'):
@@ -283,6 +329,17 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                         cooldown.clear_on_success(effect_key, source.upstream)
                     elif response.status_code in imagine._EXPLICIT_SAFE_FAILOVER_STATUSES or response.status_code >= 500:
                         cooldown.record_error(effect_key, source.upstream, f'xAI Imagine HTTP {response.status_code}')
+                elif antigravity_images.is_source(source):
+                    if 200 <= response.status_code < 300:
+                        cooldown.clear_on_success(effect_key, source.upstream)
+                    elif response.status_code == 429:
+                        # Image quota is not exposed as an account-wide quota
+                        # bucket. Cool only this model/source; never disable AG
+                        # chat based on an image-only rejection.
+                        cooldown.record_error(
+                            effect_key, source.upstream,
+                            f'Antigravity image HTTP {response.status_code}',
+                        )
                 if response.status_code in SAFE_REJECTIONS:
                     sources.remove(source)
                     continue
@@ -302,7 +359,10 @@ async def execute(parsed, *, request, action: str, key_name: str, cfg: dict) -> 
                         channel = registry.get_channel(source.key)
                         if channel is not None: secrets.append(getattr(channel, 'api_key', ''))
                         account = oauth_manager.get_account(source.key[6:]) if source.key.startswith('oauth:') else {}
-                        for field in ('access_token', 'refresh_token', 'id_token', 'email', 'workspace_id', 'chatgpt_account_id'):
+                        for field in (
+                            'access_token', 'refresh_token', 'id_token', 'email',
+                            'workspace_id', 'chatgpt_account_id', 'project_id', 'projectId',
+                        ):
                             secrets.append((account or {}).get(field, ''))
                         for secret in secrets:
                             if secret: detail = detail.replace(str(secret), '[private]')

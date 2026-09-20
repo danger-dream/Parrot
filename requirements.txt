@@ -35,6 +35,10 @@ socksio>=1.0,<2
 starlette>=0.46,<2
 # Directly used to shield terminal/cleanup owners from ASGI level cancellation.
 anyio>=3.6.2,<5
+# Optional-at-runtime, user-enabled Antigravity TLS/H2 impersonation backend.
+# 0.16.3 is the verified API/profile floor (AsyncSession streaming + chrome131);
+# keep the minor line bounded because this compiled transport is contract-sensitive.
+curl_cffi>=0.16.3,<0.17
 # python-socks: hidden runtime dependency. websockets dynamically imports python_socks when
 # connecting through a SOCKS5 proxy (src/failover.py + src/openai/responses_ws.py).
 # Without it: ImportError: connecting through a SOCKS proxy requires python-socks.

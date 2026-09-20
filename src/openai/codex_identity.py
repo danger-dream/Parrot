@@ -641,18 +641,21 @@ def register_account_identity(account: Mapping[str, Any]) -> AccountIdentity:
 
 
 def sync_configured_identity_tombstones(accounts: Any) -> int:
-    count = 0
-    for account in accounts if isinstance(accounts, list) else []:
-        if not isinstance(account, Mapping):
-            continue
-        if str(account.get("provider") or account.get("type") or "").lower() != "openai":
-            continue
-        identity = account_identity_from_account(account, require=False)
-        if identity is None:
-            continue
-        register_account_identity(account)
-        count += 1
-    return count
+    identities = [identity for account in (accounts if isinstance(accounts, list) else [])
+                  if isinstance(account, Mapping)
+                  and str(account.get("provider") or account.get("type") or "").lower() == "openai"
+                  and (identity := account_identity_from_account(account, require=False)) is not None]
+    claims = [{"owner_digest": item.owner_digest, "installation_id": item.installation_id,
+               "generation_version": item.id_generation_version, "created_at": item.created_at} for item in identities]
+    if not claims: return 0
+    try: rows = state_db.codex_identity_tombstones_claim(claims)
+    except RuntimeError as exc:
+        if "state store not started" in str(exc): return len(identities)
+        raise
+    if any(str(row.get("installation_id") or "") != item.installation_id
+           for item, row in zip(identities, rows)):
+        raise CodexIdentityError("owner tombstone installation conflict")
+    return len(identities)
 
 
 def _new_logical_row(

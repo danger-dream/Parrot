@@ -374,8 +374,7 @@ def _perm_summary_short(
 
 
 def _render_list(page: int = 1, *, snapshot: dict | None = None,
-                 history_totals: dict[str, int] | None = None,
-                 stats_loading: bool = False) -> tuple[str, dict]:
+                 history_totals: dict[str, int] | None = None) -> tuple[str, dict]:
     listed = _CONTROL.snapshot_api_keys(
         _control_context(), include_secret=True,
     )
@@ -393,10 +392,13 @@ def _render_list(page: int = 1, *, snapshot: dict | None = None,
     end = min(start + _PAGE_SIZE, total)
     page_names = names[start:end]
 
+    # 空列表本身就是完整的零统计；不能让新装页面永久停在“初始化中”。
+    period_ready = snapshot is not None or total == 0
+    history_ready = history_totals is not None or total == 0
     empty_stats = {"total": 0, "success_count": 0, "error_count": 0, "input": 0,
                    "output": 0, "cache_creation": 0, "cache_read": 0, "avg_tps": None,
                    "max_tps": None, "min_tps": None}
-    snapshot_by_key = (snapshot or {}).get("by_apikey") or {}
+    snapshot_by_key = (snapshot.get("by_apikey") or {}) if snapshot is not None else {}
     per: dict[str, dict] = {
         name: snapshot_by_key.get(name) or dict(empty_stats) for name in names
     }
@@ -409,16 +411,21 @@ def _render_list(page: int = 1, *, snapshot: dict | None = None,
     idle = total - active
     agg_prompt = ui.prompt_total(agg["input"], agg["cache_creation"], agg["cache_read"])
 
-    head = (
-        "🔑 <b>API Key 管理</b>\n"
-        f"共 {total} 个 · 活跃 {active}"
-        + (f" · 停用 {disabled}" if disabled else "")
-        + (f" · 闲置 {idle}" if idle else "")
-        + f" | 本月 {agg['total']:,} 次"
-        + (f" | 第 {page}/{total_pages} 页" if total_pages > 1 else "")
-    )
-    if agg["total"] > 0:
-        head += f" · ↑ {ui.fmt_tokens(agg_prompt)} · ↓ {ui.fmt_tokens(agg['output'])}"
+    head = "🔑 <b>API Key 管理</b>\n" + f"共 {total} 个"
+    if period_ready:
+        head += f" · 活跃 {active}"
+        head += f" · 停用 {disabled}" if disabled else ""
+        head += f" · 闲置 {idle}" if idle else ""
+        head += f" | 本月 {agg['total']:,} 次"
+        if total_pages > 1:
+            head += f" | 第 {page}/{total_pages} 页"
+        if agg["total"] > 0:
+            head += f" · ↑ {ui.fmt_tokens(agg_prompt)} · ↓ {ui.fmt_tokens(agg['output'])}"
+    else:
+        head += f" · 停用 {disabled}" if disabled else ""
+        head += " | 统计初始化中"
+        if total_pages > 1:
+            head += f" | 第 {page}/{total_pages} 页"
 
     lines = [head, ""]
     for i, name in enumerate(page_names, start=start + 1):
@@ -439,12 +446,19 @@ def _render_list(page: int = 1, *, snapshot: dict | None = None,
             mcp = bool(entry.get("allowMcp"))
             key_enabled = entry.get("enabled") is not False
         s = per[name]
-        dot = "⛔" if not key_enabled else ("🟢" if s["total"] > 0 else "⚪")
+        if not key_enabled:
+            dot = "⛔"
+        elif not period_ready:
+            dot = "⏳"
+        else:
+            dot = "🟢" if s["total"] > 0 else "⚪"
         lines.append(f"{i}. {dot} <b>{ui.escape_html(name)}</b>")
         lines.append(f"Key: <code>{ui.escape_html(key_str)}</code>")
         lines.append(f"🏷️ {_perm_summary_short(allowed, img, video, key_enabled, mcp)}")
         lines.append(f"🚦 限流: <code>{ui.escape_html(_limit_brief(name))}</code>")
-        if s["total"] > 0:
+        if not period_ready:
+            lines.append("💎 本月: <i>统计初始化中</i>")
+        elif s["total"] > 0:
             prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
             stat = f"💎 本月: {s['total']:,} 次 · ↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(s['output'])}"
             if (s.get("cache_read") or 0) > 0:
@@ -457,8 +471,10 @@ def _render_list(page: int = 1, *, snapshot: dict | None = None,
                     f"最低 {ui.fmt_tps(s.get('min_tps'))}"
                 )
             lines.append(f"💵 {ui.fmt_cost(s, decimal_places=3)}")
+        elif not history_ready:
+            lines.append("💎 本月: <i>闲置</i>（历史统计初始化中）")
         else:
-            hist = int((history_totals or {}).get(name, 0) or 0)
+            hist = int(history_totals.get(name, 0) or 0)
             lines.append(f"💎 本月: <i>闲置</i>（历史 {hist:,} 次）")
         lines.append("")
     text = ui.truncate("\n".join(lines).rstrip())
@@ -487,15 +503,17 @@ def _render_cached_list(page: int) -> tuple[str, dict]:
     since = _month_start_ts()
     period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
     history = menu_cache.HISTORY_TOTALS.peek("apikey-history")
-    return _render_list(
+    text, kb = _render_list(
         page=page,
         snapshot=period.value,
         history_totals=history.value,
-        stats_loading=period.value is None,
     )
+    return menu_cache.with_refreshing_notice(text, period, history), kb
 
 
-def _list_snapshots_ready() -> bool:
+def _list_stats_ready() -> bool:
+    if not _all_key_names():
+        return True
     since = _month_start_ts()
     return (
         menu_cache.PERIOD_STATS.peek(("period", int(since))).value is not None
@@ -503,25 +521,87 @@ def _list_snapshots_ready() -> bool:
     )
 
 
-def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
-    if not _list_snapshots_ready():
-        if cb_id is not None:
-            ui.answer_cb(cb_id, menu_cache.initialization_text())
+def _schedule_list_stats(
+    chat_id: int, message_id: int, token: int, page: int, *,
+    redraw_if_ready: bool = False,
+) -> None:
+    """补齐列表统计；完成后只更新仍停留在本页的消息。"""
+    if not _all_key_names():
         return
+
+    def redraw(_value=None, _error=None) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        text, kb = _render_cached_list(page)
+        menu_cache.run_if_current(
+            chat_id, message_id, token,
+            lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+        )
+
+    since = _month_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    if period.value is None:
+        menu_cache.request_period_snapshot(
+            since,
+            subscriber=(chat_id, message_id, token, "apikey-period"),
+            on_ready=redraw,
+            interactive=True,
+        )
+    elif not period.fresh:
+        menu_cache.request_period_snapshot(
+            since,
+            subscriber=(chat_id, message_id, token, "apikey-period"),
+            on_ready=redraw,
+            interactive=True,
+        )
+    history = menu_cache.HISTORY_TOTALS.peek("apikey-history")
+    if history.value is None:
+        menu_cache.request_apikey_history(
+            subscriber=(chat_id, message_id, token, "apikey-history"),
+            on_ready=redraw,
+            interactive=True,
+        )
+    elif not history.fresh:
+        menu_cache.request_apikey_history(
+            subscriber=(chat_id, message_id, token, "apikey-history"),
+            on_ready=redraw,
+            interactive=True,
+        )
+    # 快照可能在首次渲染与这里登记订阅之间完成；此时 request() 不会再
+    # 登记 waiter，必须主动重绘一次刚才确实以 loading 状态发出的页面。
+    if redraw_if_ready and _list_stats_ready():
+        redraw()
+
+
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
+    token = menu_cache.begin_view(chat_id, message_id)
+    rendered_loading = not _list_stats_ready()
     text, kb = _render_cached_list(page)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _schedule_list_stats(
+        chat_id, message_id, token, page, redraw_if_ready=rendered_loading,
+    )
 
 
 def send_new(chat_id: int, page: int = 1) -> None:
-    """命令入口：仅发送完整快照或简短初始化提示。"""
-    if not _list_snapshots_ready():
-        ui.send(chat_id, menu_cache.initialization_text())
-        return
+    """命令入口：始终发送可操作页面；冷统计后台补齐并自动更新。"""
+    rendered_loading = not _list_stats_ready()
     text, kb = _render_cached_list(page)
-    ui.send(chat_id, text, reply_markup=kb)
+    response = ui.send(chat_id, text, reply_markup=kb)
+    message = response.get("result") if isinstance(response, dict) and response.get("ok") else None
+    if isinstance(message, dict) and message.get("message_id") and _all_key_names():
+        since = _month_start_ts()
+        period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+        history = menu_cache.HISTORY_TOTALS.peek("apikey-history")
+        if rendered_loading or not period.fresh or not history.fresh:
+            message_id = int(message["message_id"])
+            token = menu_cache.begin_view(chat_id, message_id)
+            _schedule_list_stats(
+                chat_id, message_id, token, page,
+                redraw_if_ready=rendered_loading,
+            )
 
 
 # ─── 详情视图 ─────────────────────────────────────────────────────
@@ -529,7 +609,7 @@ def send_new(chat_id: int, page: int = 1) -> None:
 def _render_detail(name: str, page: int = 1, *,
                    overall: dict | None = None,
                    by_model: list[dict] | None = None,
-                   stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
+                   stats_loading: bool | None = None) -> tuple[Optional[str], Optional[dict]]:
     entry = _get_entry(name)
     if entry is None:
         return None, None
@@ -542,14 +622,17 @@ def _render_detail(name: str, page: int = 1, *,
     key_enabled = entry.get("enabled") is not False
 
     since_ts = _month_start_ts()
-    if overall is None:
-        period = menu_cache.PERIOD_STATS.peek(("period", int(since_ts))).value or {}
+    period_read = menu_cache.PERIOD_STATS.peek(("period", int(since_ts)))
+    if stats_loading is None:
+        stats_loading = period_read.value is None
+    if overall is None and not stats_loading:
+        period = period_read.value or {}
         overall = (period.get("by_apikey") or {}).get(name)
     s = overall or {"total": 0, "success_count": 0, "error_count": 0, "input": 0,
                     "output": 0, "cache_creation": 0, "cache_read": 0, "avg_tps": None,
                     "max_tps": None, "min_tps": None}
-    active = s["total"] > 0
-    dot = "🟢 活跃" if active else "⚪ 闲置"
+    active = not stats_loading and s["total"] > 0
+    dot = "⏳ 统计初始化中" if stats_loading else ("🟢 活跃" if active else "⚪ 闲置")
 
     lines = [
         f"🔑 <b>{ui.escape_html(name)}</b>  {dot}",
@@ -568,7 +651,9 @@ def _render_detail(name: str, page: int = 1, *,
 
     lines.append("")
     lines.append("<b>📊 本月使用统计</b>")
-    if active:
+    if stats_loading:
+        lines.append("<i>统计初始化中，管理功能可正常使用。</i>")
+    elif active:
         prompt = ui.prompt_total(s["input"], s["cache_creation"], s["cache_read"])
         token_line = f"↑ {ui.fmt_tokens(prompt)} · ↓ {ui.fmt_tokens(s['output'])}"
         if (s.get("cache_read") or 0) > 0:
@@ -588,7 +673,10 @@ def _render_detail(name: str, page: int = 1, *,
             )
             by_model = cached_models.value or []
             model_loading = cached_models.value is None
-        if by_model:
+        if model_loading:
+            lines.append("")
+            lines.append("按模型: <i>统计初始化中</i>")
+        elif by_model:
             lines.append("")
             lines.append("按模型:")
             for mrow in by_model[:8]:
@@ -631,44 +719,128 @@ def _render_detail(name: str, page: int = 1, *,
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
+def _detail_snapshots(name: str) -> tuple[object, dict | None, object]:
+    since = _month_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    overall = (
+        (period.value.get("by_apikey") or {}).get(name)
+        if period.value is not None else None
+    )
+    models = menu_cache.DETAIL_STATS.peek(("apikey-model", name, int(since)))
+    return period, overall, models
+
+
+def _detail_stats_ready(name: str) -> bool:
+    period, overall, models = _detail_snapshots(name)
+    if period.value is None:
+        return False
+    if int((overall or {}).get("total") or 0) == 0:
+        return True
+    return models.value is not None
+
+
+def _schedule_detail_stats(
+    chat_id: int, message_id: int, token: int, name: str, page: int, *,
+    redraw_if_ready: bool = False,
+) -> None:
+    since = _month_start_ts()
+    model_key = ("apikey-model", name, int(since))
+
+    def redraw(_value=None, error=None) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        period, overall, models = _detail_snapshots(name)
+        text, kb = _render_detail(
+            name, page=page, overall=overall, by_model=models.value,
+            stats_loading=period.value is None,
+        )
+        if text is not None:
+            menu_cache.run_if_current(
+                chat_id, message_id, token,
+                lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+            )
+        if error is None:
+            subscribe()
+
+    def subscribe() -> None:
+        period, overall, models = _detail_snapshots(name)
+        if period.value is None:
+            read = menu_cache.request_period_snapshot(
+                since,
+                subscriber=(chat_id, message_id, token, "apikey-detail-period"),
+                on_ready=redraw,
+                interactive=True,
+            )
+            if read.fresh and read.value is not None:
+                redraw(read.value, None)
+            return
+        if models.value is None and not int((overall or {}).get("total") or 0):
+            menu_cache.DETAIL_STATS.store(model_key, [])
+            redraw([], None)
+            return
+        if models.value is None:
+            read = menu_cache.DETAIL_STATS.request(
+                model_key,
+                lambda: _CONTROL.load_model_stats(
+                    _control_context(chat_id), name, since_ts=since,
+                ),
+                subscriber=(chat_id, message_id, token, "apikey-detail-models"),
+                on_ready=redraw,
+                interactive=True,
+            )
+            if read.fresh and read.value is not None:
+                redraw(read.value, None)
+        elif not models.fresh:
+            menu_cache.DETAIL_STATS.request(
+                model_key,
+                lambda: _CONTROL.load_model_stats(
+                    _control_context(chat_id), name, since_ts=since,
+                ),
+            )
+
+    subscribe()
+    if redraw_if_ready and _detail_stats_ready(name):
+        redraw()
+
+
+def _edit_cached_detail(
+    chat_id: int, message_id: int, name: str, page: int = 1, *,
+    start_view: bool = False,
+) -> bool:
+    """重绘详情；只有导航或冷统计才接管页面令牌和订阅。"""
+    period, overall, models = _detail_snapshots(name)
+    cache_loading = not _detail_stats_ready(name)
+    text, kb = _render_detail(
+        name, page=page, overall=overall, by_model=models.value,
+        stats_loading=period.value is None,
+    )
+    if text is None:
+        return False
+    rendered_loading = cache_loading and "统计初始化中" in text
+    token = None
+    if start_view or rendered_loading:
+        token = menu_cache.current_view_token(chat_id, message_id)
+        if token is None:
+            token = menu_cache.begin_view(chat_id, message_id)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    if token is not None:
+        _schedule_detail_stats(
+            chat_id, message_id, token, name, page,
+            redraw_if_ready=rendered_loading,
+        )
+    return True
+
+
 def on_view(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
     name = _name_of(short)
     if not name:
         ui.answer_cb(cb_id, "API Key 不存在")
         return
-    since = _month_start_ts()
-    period_key = ("period", int(since))
-    model_key = ("apikey-model", name, int(since))
-    period = menu_cache.PERIOD_STATS.peek(period_key)
-    if period.value is None:
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
-    overall = (period.value.get("by_apikey") or {}).get(name)
-    models = menu_cache.DETAIL_STATS.peek(model_key)
-    if models.value is None and not int((overall or {}).get("total") or 0):
-        # 本月无调用时旧详情本来就没有按模型统计，可直接确认完整空结果。
-        menu_cache.DETAIL_STATS.store(model_key, [])
-        models = menu_cache.DETAIL_STATS.peek(model_key)
-    if not models.fresh:
-        menu_cache.DETAIL_STATS.request(
-            model_key, lambda: _CONTROL.load_model_stats(
-                _control_context(chat_id), name, since_ts=since,
-            ),
-        )
-    # 旧详情中的按模型调用量、Token、缓存与金额不是可选增强；没有快照时
-    # 保持列表不动，不能渲染一个静默删掉按模型区块的页面。
-    if models.value is None:
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
     ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
-    text, kb = _render_detail(
-        name, page=page, overall=overall, by_model=models.value,
-    )
-    if text is None:
+    if not _edit_cached_detail(
+        chat_id, message_id, name, page, start_view=True,
+    ):
         ui.answer_cb(cb_id, "API Key 不存在")
-        return
-    ui.edit(chat_id, message_id, text, reply_markup=kb)
 
 
 # ─── 添加 ─────────────────────────────────────────────────────────
@@ -904,9 +1076,7 @@ def on_images_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page
         changes={"allow_images": not bool(entry.get("allowImages", False))},
     )
     ui.answer_cb(cb_id, "已切换")
-    text, kb = _render_detail(name, page=page)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def on_videos_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
@@ -922,9 +1092,7 @@ def on_videos_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page
         changes={"allow_videos": not bool(entry.get("allowVideos", False))},
     )
     ui.answer_cb(cb_id, "已切换")
-    text, kb = _render_detail(name, page=page)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def on_key_enabled_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1) -> None:
@@ -940,9 +1108,7 @@ def on_key_enabled_toggle(chat_id: int, message_id: int, cb_id: str, short: str,
         changes={"enabled": not (entry.get("enabled") is not False)},
     )
     ui.answer_cb(cb_id, "已切换")
-    text, kb = _render_detail(name, page=page)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 # ─── MCP 权限与工具选择 ───────────────────────────────────────────
@@ -979,9 +1145,7 @@ def on_mcp_toggle(chat_id: int, message_id: int, cb_id: str, short: str, page: i
         changes={"allow_mcp": not bool(entry.get("allowMcp", False))},
     )
     ui.answer_cb(cb_id, "已切换")
-    text, kb = _render_detail(name, page=page)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def _render_mcp_tools_edit(name: str, checked: set[str]) -> tuple[str, dict]:
@@ -1083,9 +1247,7 @@ def on_mcp_tools_save(chat_id: int, message_id: int, cb_id: str, short: str) -> 
                 reply_markup=ui.inline_kb([[ui.btn("◀ 返回详情", f"ak:view:{_callback_payload(short)}")]]))
         return
     ui.answer_cb(cb_id, "已保存")
-    text, kb = _render_detail(name)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name)
 
 
 def on_mcp_tools_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
@@ -1094,9 +1256,7 @@ def on_mcp_tools_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -
     name = _name_of(short)
     if not name:
         return
-    text, kb = _render_detail(name)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name)
 
 
 # ─── API Key 限流设置 ─────────────────────────────────────────────
@@ -1393,9 +1553,7 @@ def on_perm_save(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
 
     ui.answer_cb(cb_id, "已保存")
     # 回到详情页
-    text, kb = _render_detail(name, page=page)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def on_perm_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> None:
@@ -1408,9 +1566,7 @@ def on_perm_cancel(chat_id: int, message_id: int, cb_id: str, short: str) -> Non
     if not name:
         show(chat_id, message_id, page=page)
         return
-    text, kb = _render_detail(name, page=page)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 # ─── API Key 排序 ────────────────────────────────────────────────

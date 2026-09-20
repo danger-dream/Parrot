@@ -174,6 +174,69 @@ def test_search_description_lists_only_currently_available_engines():
         assert "不可用" in text
 
 
+def test_x_twitter_virtual_source_tracks_xai_account_availability(monkeypatch):
+    from src import search_service
+
+    monkeypatch.setattr(search_service, "backend_statuses", lambda: [
+        {"id": "tavily", "type": "tavily", "available": True},
+        {"id": "xai", "type": "xai", "available": False},
+    ])
+    assert catalog.X_SEARCH_SOURCE not in catalog.available_engines("web_search")
+    assert catalog.X_SEARCH_SOURCE not in catalog.available_engines("web_fetch")
+    description = catalog.render_description("web_search")
+    assert "x-twitter" in description and "xAI OAuth" in description
+
+    monkeypatch.setattr(search_service, "backend_statuses", lambda: [
+        {"id": "tavily", "type": "tavily", "available": True},
+        {"id": "xai", "type": "xai", "available": True},
+    ])
+    assert catalog.available_engines("web_search") == ["tavily", "xai", "x-twitter"]
+    assert catalog.available_engines("web_fetch") == ["tavily"]
+
+
+def test_x_twitter_virtual_source_never_steals_a_real_backend_id(monkeypatch):
+    from src import search_service
+
+    rows = [
+        {"id": "x-twitter", "type": "tavily", "available": True},
+        {"id": "xai", "type": "xai", "available": False},
+    ]
+    monkeypatch.setattr(search_service, "backend_statuses", lambda: rows)
+    assert catalog.x_search_source_id() == catalog.X_SEARCH_SOURCE_COMPAT
+    available, detail = catalog._search_sources("web_search")
+    assert available == ["x-twitter"]
+    assert detail.startswith("当前不可用：xai, x:twitter。")
+    assert " x-twitter 需要" not in detail
+
+    rows[1]["available"] = True
+    assert catalog.available_engines("web_search") == ["x-twitter", "xai", "x:twitter"]
+    description = catalog.source_property("web_search")["description"]
+    assert "source=x:twitter" in description
+    assert "x-twitter 已被既有真实搜索后端占用" in description
+
+
+def test_x_twitter_schema_documents_source_specific_parameters(monkeypatch):
+    from src import search_service
+    from src.mcp import server as mcp_server
+
+    monkeypatch.setattr(search_service, "backend_statuses", lambda: [
+        {"id": "xai", "type": "xai", "available": True},
+    ])
+    schema = mcp_server.build_tool("web_search").input_schema
+    props = schema["properties"]
+    assert catalog.X_SEARCH_SOURCE in props["source"]["enum"]
+    assert "X Search" in props["source"]["description"]
+    for field in ("allowed_x_handles", "excluded_x_handles", "from_date", "to_date",
+                  "enable_image_understanding", "enable_video_understanding"):
+        assert field in props and "source=x-twitter" in props[field]["description"]
+    assert "source=x-twitter 不支持" in props["allowed_domains"]["description"]
+    assert "不限制 xAI 内部获取" in props["max_results"]["description"]
+    assert props["from_date"]["format"] == "date"
+    assert props["to_date"]["format"] == "date"
+    assert "YYYY-MM-DD" in props["from_date"]["description"]
+    assert "日期/时间" not in props["from_date"]["description"]
+
+
 def test_image_options_come_from_the_live_catalog():
     from src import image_catalog
 
@@ -588,6 +651,82 @@ def test_search_records_the_engine_without_exposing_it_to_the_model():
     assert "backend_id" not in visible
     assert "provider" not in visible
     assert "attempts" not in visible
+
+
+@pytest.mark.asyncio
+async def test_real_x_twitter_backend_and_collision_safe_virtual_source_route_separately(monkeypatch):
+    from src import search_service
+    from src.mcp import server as mcp_server
+
+    rows = [
+        {"id": "x-twitter", "type": "tavily", "available": True},
+        {"id": "xai", "type": "xai", "available": True},
+    ]
+    monkeypatch.setattr(search_service, "backend_statuses", lambda: rows)
+    calls = []
+
+    async def fake_search(arguments, **kwargs):
+        calls.append(("web", arguments, kwargs))
+        return {"query": arguments["query"], "results": [], "provider": "tavily",
+                "backend_id": "x-twitter", "attempts": []}
+
+    async def fake_x_search(arguments, **kwargs):
+        calls.append(("x", arguments, kwargs))
+        return {"query": arguments["query"], "results": [], "provider": "xai",
+                "backend_id": "xai", "attempts": []}
+
+    monkeypatch.setattr(search_service, "search", fake_search)
+    monkeypatch.setattr(search_service, "x_search", fake_x_search)
+    _, web_telemetry = await mcp_server._run_search(
+        "web_search", {"query": "web", "source": "x-twitter"}, request_id="req-web",
+    )
+    _, x_telemetry = await mcp_server._run_search(
+        "web_search", {"query": "x", "source": "x:twitter"}, request_id="req-x",
+    )
+    assert [call[0] for call in calls] == ["web", "x"]
+    assert calls[0][2]["backend_id"] == "x-twitter"
+    assert "backend_id" not in calls[1][2]
+    assert web_telemetry["source_id"] == "x-twitter"
+    assert x_telemetry["source_id"] == "x:twitter"
+
+
+@pytest.mark.asyncio
+async def test_x_twitter_source_routes_to_native_x_search(monkeypatch):
+    from src import search_service
+    from src.mcp import server as mcp_server
+
+    monkeypatch.setattr(catalog, "available_engines", lambda tool_name="web_search": [
+        catalog.X_SEARCH_SOURCE,
+    ] if tool_name == "web_search" else [])
+    calls = []
+
+    async def fake_x_search(arguments, **kwargs):
+        calls.append((arguments, kwargs))
+        return {
+            "query": arguments["query"], "results": [{"title": "post", "url": "https://x.com/a/status/1"}],
+            "provider": "xai", "backend_id": "xai-primary", "model": "grok-4.6",
+            "attempts": [{"backend_id": "xai-primary", "provider": "xai", "status": "success"}],
+        }
+
+    async def wrong_search(*args, **kwargs):
+        raise AssertionError("x-twitter must not use ordinary web search")
+
+    monkeypatch.setattr(search_service, "x_search", fake_x_search)
+    monkeypatch.setattr(search_service, "search", wrong_search)
+    visible, telemetry = await mcp_server._run_search(
+        "web_search",
+        {"query": "from xAI", "source": catalog.X_SEARCH_SOURCE,
+         "allowed_x_handles": ["xai"], "freshness": "day"},
+        request_id="x-request",
+    )
+    assert calls == [({"query": "from xAI", "allowed_x_handles": ["xai"], "freshness": "day"},
+                      {"request_id": "x-request", "origin": "mcp"})]
+    assert telemetry == {
+        "source_id": catalog.X_SEARCH_SOURCE, "source_type": "xai",
+        "result_count": 1, "model": "grok-4.6",
+    }
+    assert visible["results"][0]["url"] == "https://x.com/a/status/1"
+    assert "backend_id" not in visible and "attempts" not in visible
 
 
 # ── source 参数的实时 enum ────────────────────────────────────────────────

@@ -230,7 +230,7 @@ def _run_notifier(case, monkeypatch):
 def _run_commands(case, monkeypatch):
     capture = TraceCapture()
     monkeypatch.setattr(ui, "api", capture.api)
-    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: None)
+    monkeypatch.setattr(bot, "_drop_pending_updates", lambda: True)
     monkeypatch.setattr(ui, "install_notify_handler", lambda: None)
     monkeypatch.setattr(menu_cache, "start", lambda: None)
 
@@ -244,7 +244,7 @@ def _run_commands(case, monkeypatch):
     monkeypatch.setattr(bot.threading, "Thread", FakeThread)
     ui.configure("fake-token-core", [42])
     bot.start()
-    commands = capture.calls[1]["payload"]["commands"]
+    commands = capture.calls[0]["payload"]["commands"]
     return _actual(
         case,
         tg_api=capture.calls,

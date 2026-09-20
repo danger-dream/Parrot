@@ -33,6 +33,38 @@ def _patch_proxy_manager(monkeypatch, *, chain: list[str], connectors: dict[str,
     monkeypatch.setattr(pm, "get_connector", lambda name: connectors.get(name))
 
 
+def test_antigravity_image_purpose_keeps_ss_route_fail_closed(monkeypatch):
+    ss = _Connector("ss2022")
+    direct = _Connector("direct")
+    captured = {}
+    monkeypatch.setattr(pm, "init", lambda: None)
+    monkeypatch.setattr(pm, "is_configured", lambda: True)
+    monkeypatch.setattr(pm, "has_non_direct_routing_rules", lambda: True)
+    monkeypatch.setattr(pm, "direct_fallback_enabled", lambda: False)
+
+    def resolve(**kwargs):
+        captured.update(kwargs)
+        return ["ag-ss"]
+
+    monkeypatch.setattr(pm, "resolve_proxy_chain", resolve)
+    monkeypatch.setattr(
+        pm, "get_connector",
+        lambda name: {"ag-ss": ss, "direct": direct}.get(name),
+    )
+
+    routes, error = _resolve_http_route_chain(
+        _Channel(), "gemini-3.1-flash-image",
+        proxy_purpose="oauth_antigravity",
+    )
+
+    assert error is None
+    assert routes == [("ag-ss", ss)]
+    assert captured["purpose"] == "oauth_antigravity"
+    assert captured["channel_key"] == _Channel.key
+    assert all(name != "direct" for name, _connector in routes)
+
+
+
 def test_configured_broken_http_route_fails_closed_by_default(monkeypatch):
     _patch_proxy_manager(monkeypatch, chain=["broken"], connectors={}, enabled=False)
 

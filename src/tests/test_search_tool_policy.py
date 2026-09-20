@@ -187,7 +187,24 @@ def test_xai_structural_aliases_choice_history_namespace_collision():
     assert compiled["prompt_cache_key"] == "session"
 
 
-@pytest.mark.parametrize("name", ["web_search", "WebSearch", "WebFetch", "web_fetch"])
+def test_xai_native_x_search_does_not_collide_with_client_function_name():
+    body = {
+        "tools": [
+            {"type": "x_search", "allowed_x_handles": ["xai"]},
+            {"type": "function", "name": "x_search", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {"type": "x_search"},
+    }
+    compiled, mapping = wire.compile_xai(body)
+    assert compiled["tools"][0] == body["tools"][0]
+    assert compiled["tools"][1]["name"] != "x_search"
+    assert mapping["to_wire"]["x_search"] == compiled["tools"][1]["name"]
+    assert compiled["tool_choice"] == {"type": "x_search"}
+
+
+@pytest.mark.parametrize("name", [
+    "web_search", "WebSearch", "WebFetch", "web_fetch", "x_search", "XSearch",
+])
 async def test_xai_fragmented_stream_all_events_and_concurrency(name):
     async def one(label):
         payload, mapping = wire.compile_xai({"tools": [{"type": "function", "name": name, "parameters": {}}]})

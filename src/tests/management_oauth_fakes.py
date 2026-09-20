@@ -80,7 +80,7 @@ class InMemoryOAuthBackend(OAuthBackend):
                 "last_error_message": "fake failure",
             }
         ]
-        self.settings = [False, 60, 95.0, "disabled"]
+        self.settings = [False, 60, 95.0, "disabled", False]
         self.preferences = ["used", True]
         self.affinity_cleared = []
         self.last_reset_idempotency_key = None
@@ -470,6 +470,7 @@ class InMemoryOAuthBackend(OAuthBackend):
     def update_settings_conditional(
         self, expected, *, quota_enabled=None, interval_seconds=None,
         threshold_percent=None, cch_mode=None,
+        antigravity_tls_fingerprint_enabled=None,
     ):
         with self._lock:
             self._interleave()
@@ -482,14 +483,20 @@ class InMemoryOAuthBackend(OAuthBackend):
                 interval_seconds=interval_seconds,
                 threshold_percent=threshold_percent,
                 cch_mode=cch_mode,
+                antigravity_tls_fingerprint_enabled=antigravity_tls_fingerprint_enabled,
             )
             return {"status": "updated"}
 
-    def update_settings(self, *, quota_enabled=None, interval_seconds=None, threshold_percent=None, cch_mode=None):
+    def update_settings(
+        self, *, quota_enabled=None, interval_seconds=None, threshold_percent=None,
+        cch_mode=None, antigravity_tls_fingerprint_enabled=None,
+    ):
         if quota_enabled is not None: self.settings[0] = quota_enabled
         if interval_seconds is not None: self.settings[1] = interval_seconds
         if threshold_percent is not None: self.settings[2] = threshold_percent
         if cch_mode is not None: self.settings[3] = cch_mode
+        if antigravity_tls_fingerprint_enabled is not None:
+            self.settings[4] = antigravity_tls_fingerprint_enabled
 
     def get_preferences(self):
         values = list(self.preferences)

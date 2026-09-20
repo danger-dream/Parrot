@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -59,6 +60,37 @@ def _deploy_functions():
     return path.read_text().rsplit('main "$@"', 1)[0]
 
 
+def test_deploy_existing_empty_directory_defaults_to_fresh_and_writes_config(tmp_path):
+    result = subprocess.run(
+        ["bash", "-c", _deploy_functions() + r'''
+read_tty() {
+    local __target="$1" __default="${3:-}" __value=""
+    case "$__target" in
+        INSTALL_DIR) __value="$TEST_INSTALL_DIR" ;;
+        TG_TOKEN) __value="123456:TEST_TOKEN" ;;
+        TG_ADMIN) __value="123456789" ;;
+        PORT) __value="49321" ;;
+        *) __value="$__default" ;;
+    esac
+    printf -v "$__target" "%s" "$__value"
+}
+ss() { return 1; }
+collect_config
+write_files
+printf "MODE=%s\n" "$MODE"
+''', "test", str(tmp_path)],
+        capture_output=True, text=True,
+        env={**os.environ, "TEST_INSTALL_DIR": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    saved = json.loads((tmp_path / "data/config.json").read_text())
+    assert saved["telegram"] == {
+        "botToken": "123456:TEST_TOKEN", "adminIds": [123456789],
+    }
+    assert '"49321:22122"' in (tmp_path / "docker-compose.yml").read_text()
+    assert "MODE=fresh" in result.stdout
+
+
 def test_deploy_upgrade_preserves_existing_compose(tmp_path):
     compose = 'services:\n  parrot:\n    image: custom:latest\n    ports:\n      - "127.0.0.1:23456:22122"\n    volumes:\n      - ./data:/app/data\n'
     (tmp_path / "docker-compose.yml").write_text(compose)
@@ -68,6 +100,58 @@ def test_deploy_upgrade_preserves_existing_compose(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "docker-compose.yml").read_text() == compose
     assert (tmp_path / "data/config.json").read_text() == '{"keep":true}'
+
+
+def test_deploy_existing_install_defaults_to_upgrade_and_preserves_config(tmp_path):
+    compose = "services:\n  parrot:\n    image: custom:latest\n"
+    config_text = '{"keep":true,"telegram":{"botToken":"existing"}}'
+    (tmp_path / "docker-compose.yml").write_text(compose)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/config.json").write_text(config_text)
+    result = subprocess.run(
+        ["bash", "-c", _deploy_functions() + r'''
+read_tty() {
+    local __target="$1" __default="${3:-}" __value=""
+    case "$__target" in
+        INSTALL_DIR) __value="$TEST_INSTALL_DIR" ;;
+        *) __value="$__default" ;;
+    esac
+    printf -v "$__target" "%s" "$__value"
+}
+collect_config
+write_files
+printf "MODE=%s\n" "$MODE"
+''', "test"],
+        capture_output=True, text=True,
+        env={**os.environ, "TEST_INSTALL_DIR": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "MODE=upgrade" in result.stdout
+    assert (tmp_path / "docker-compose.yml").read_text() == compose
+    assert (tmp_path / "data/config.json").read_text() == config_text
+
+
+def test_deploy_telegram_401_cannot_be_reported_as_polling_ready():
+    result = subprocess.run(["bash", "-c", _deploy_functions() + r'''
+docker() { printf "%s\n" "[tg] bot startup failed (deleteWebhook): Bot Token invalid (Telegram 401)"; }
+if verify_telegram_polling; then
+    echo "unexpected success"
+    exit 9
+fi
+'''], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "unexpected success" not in result.stdout
+    assert "TG Bot polling 已启动" not in result.stdout
+    assert "Telegram Bot 初始化失败，部署未完成" in result.stderr
+
+
+def test_deploy_accepts_only_exact_telegram_polling_ready_marker():
+    result = subprocess.run(["bash", "-c", _deploy_functions() + r'''
+docker() { printf "%s\n" "[tg] bot started (polling ready)"; }
+verify_telegram_polling
+'''], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "TG Bot polling 已启动" in result.stdout
 
 
 def test_deploy_health_cannot_be_satisfied_by_unrelated_host_service():

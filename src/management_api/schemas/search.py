@@ -111,7 +111,7 @@ class SearchCallLogData(StrictSchema):
     sourceId: str
     sourceType: str
     sourceName: str
-    operation: Literal["search", "extract"]
+    operation: Literal["search", "x_search", "extract"]
     credentialKind: Literal["api_key", "oauth", ""]
     credentialLabel: str
     accountKey: str

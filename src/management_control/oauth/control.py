@@ -795,9 +795,11 @@ class OAuthControl(
 
     def get_settings(self, context: ManagementContext) -> OAuthSettings:
         self._require(context, Capability.READ)
-        enabled, interval, threshold, mode = self.backend.get_settings()
-        raw = (enabled, interval, threshold, mode)
-        return OAuthSettings(enabled, interval, threshold, CchMode(mode), _revision(raw))
+        enabled, interval, threshold, mode, fingerprint_enabled = self.backend.get_settings()
+        raw = (enabled, interval, threshold, mode, fingerprint_enabled)
+        return OAuthSettings(
+            enabled, interval, threshold, CchMode(mode), fingerprint_enabled, _revision(raw),
+        )
 
     def update_settings(
         self,
@@ -807,6 +809,7 @@ class OAuthControl(
         interval_seconds: int | None = None,
         threshold_percent: float | None = None,
         cch_mode: CchMode | None = None,
+        antigravity_tls_fingerprint_enabled: bool | None = None,
         expected_revision: str | None = None,
     ) -> OAuthSettings:
         self._require(context, Capability.WRITE)
@@ -826,6 +829,7 @@ class OAuthControl(
                 interval_seconds=interval_seconds,
                 threshold_percent=threshold_percent,
                 cch_mode=cch_mode.value if cch_mode else None,
+                antigravity_tls_fingerprint_enabled=antigravity_tls_fingerprint_enabled,
             )
             self._audit(context, "oauth.settings.update", "oauthSettings")
             return self.get_settings(context)
@@ -842,6 +846,7 @@ class OAuthControl(
                 current.quota_monitor_interval_seconds,
                 current.quota_monitor_threshold_percent,
                 current.cch_mode.value,
+                current.antigravity_tls_fingerprint_enabled,
             )
             outcome = self.backend.update_settings_conditional(
                 expected,
@@ -849,6 +854,7 @@ class OAuthControl(
                 interval_seconds=interval_seconds,
                 threshold_percent=threshold_percent,
                 cch_mode=cch_mode.value if cch_mode else None,
+                antigravity_tls_fingerprint_enabled=antigravity_tls_fingerprint_enabled,
             )
             self._raise_conditional_status(outcome)
             result = self.get_settings(context)

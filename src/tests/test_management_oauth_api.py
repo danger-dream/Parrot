@@ -646,11 +646,11 @@ def test_models_settings_preferences_defaults_actions_and_operations(tmp_path):
         settings_revision = settings.json()["data"]["revision"]
         changed = request(
             client, "PATCH", "/oauth/settings",
-            {"quotaMonitor": {"enabled": True, "intervalSeconds": 120, "thresholdPercent": 90}, "cchMode": "dynamic"},
+            {"quotaMonitor": {"enabled": True, "intervalSeconds": 120, "thresholdPercent": 90}, "cchMode": "dynamic", "antigravityTlsFingerprintEnabled": True},
             {**headers, "If-Match": settings_revision},
         )
         assert changed.status_code == 200, changed.text
-        assert backend.settings == [True, 120, 90.0, "dynamic"]
+        assert backend.settings == [True, 120, 90.0, "dynamic", True]
         bad_settings = request(client, "PATCH", "/oauth/settings", {"quotaMonitor": {"intervalSeconds": 1}}, headers)
         assert bad_settings.status_code == 422
         assert bad_settings.json()["error"]["fields"]
@@ -677,7 +677,7 @@ def test_oauth_read_write_parity_between_telegram_adapter_and_api(tmp_path, monk
 
     assert oauth_menu._quota_monitor_values() == (False, 60, 95.0)
     oauth_menu.on_quota_toggle(42, 100, "callback")
-    assert tg_backend.settings == [True, 60, 95.0, "disabled"]
+    assert tg_backend.settings == [True, 60, 95.0, "disabled", False]
 
     client, headers, _, _, api_backend = auth_client(tmp_path)
     try:
@@ -686,6 +686,7 @@ def test_oauth_read_write_parity_between_telegram_adapter_and_api(tmp_path, monk
         assert read.json()["data"]["quotaMonitor"] == {
             "enabled": False, "intervalSeconds": 60, "thresholdPercent": 95.0,
         }
+        assert read.json()["data"]["antigravityTlsFingerprintEnabled"] is False
         written = request(
             client, "PATCH", "/oauth/settings",
             {"quotaMonitor": {"enabled": True}}, headers,

@@ -279,7 +279,7 @@ class ImageControl:
         catalog = image_catalog.sources(root, kind=self.kind)
         for account in root.get('oauthAccounts') or []:
             provider = account.get('provider')
-            if provider not in (('openai', 'xai') if self.kind == 'image' else ('xai',)): continue
+            if provider not in (('openai', 'xai', 'antigravity') if self.kind == 'image' else ('xai',)): continue
             state = media_config.oauth_state(account, self.kind, root)
             row = dict(source_id='oauth:' + oauth_manager.get_account_key(account), state_key=state['state_key'],
                        label=image_catalog.oauth_source_label(account, root), provider=provider,

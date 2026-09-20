@@ -83,6 +83,7 @@ def _setup(m):
         c["oauthUsageDisplayMode"] = "used"
         c["quotaProgressBar"] = True
         c["cchMode"] = "disabled"
+        c.setdefault("antigravityOAuth", {}).setdefault("tlsFingerprint", {})["enabled"] = False
         c.setdefault("quotaMonitor", {})["enabled"] = False
         c.setdefault("quotaMonitor", {})["intervalSeconds"] = 60
         c.setdefault("quotaMonitor", {})["disableThresholdPercent"] = 95
@@ -206,6 +207,84 @@ def _add_openai_fake_account(m, email, **kw):
 
 
 # ─── Tests ───────────────────────────────────────────────────────
+
+def test_cold_stats_do_not_block_oauth_list_or_detail(m):
+    _setup(m)
+    m["menu_cache"].PERIOD_STATS.clear()
+    m["menu_cache"].WINDOW_STATS.clear()
+    m["menu_cache"].DETAIL_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    menu = m["oauth_menu"]
+
+    menu.show(42, 100, "cb-empty")
+    empty = rec.last("editMessageText")
+    assert empty and "共 0 个账户" in empty["text"]
+    assert "统计初始化中" not in empty["text"]
+    assert any(
+        button.get("callback_data") == "oa:add"
+        for row in empty["reply_markup"]["inline_keyboard"]
+        for button in row
+    )
+
+    email = "cold-oauth@example.test"
+    _add_openai_fake_account(m, email)
+    account_key = _account_key_for(m, email)
+    rec.clear()
+    menu.show(42, 100, "cb-list")
+    listing = rec.last("editMessageText")
+    assert listing and email in listing["text"]
+    assert "统计初始化中" in listing["text"]
+    assert "↑ 0" not in listing["text"] and "$0.00" not in listing["text"]
+
+    rec.clear()
+    short = m["ui"].register_code(account_key)
+    menu.on_view(42, 100, "cb-detail", short)
+    detail = rec.last("editMessageText")
+    assert detail and email in detail["text"]
+    assert "统计初始化中" in detail["text"]
+    callbacks = {
+        button.get("callback_data", "")
+        for row in detail["reply_markup"]["inline_keyboard"]
+        for button in row
+    }
+    assert any(value.startswith("oa:toggle:") for value in callbacks)
+    assert any(value.startswith("oa:delete_ask:") for value in callbacks)
+
+
+def test_cold_oauth_action_keeps_loading_state_and_resubscribes(m, monkeypatch):
+    _setup(m)
+    email = "cold-action-oauth@example.test"
+    _add_openai_fake_account(m, email)
+    account_key = _account_key_for(m, email)
+    cache = m["menu_cache"]
+    cache.PERIOD_STATS.clear()
+    cache.WINDOW_STATS.clear()
+    cache.DETAIL_STATS.clear()
+    rec = ApiRecorder()
+    m["ui"].api = rec
+    subscriptions = []
+
+    def request_period(since, **kwargs):
+        subscriptions.append(kwargs.get("subscriber"))
+        return cache.PERIOD_STATS.peek(("period", int(since)))
+
+    token = cache.begin_view(42, 100)
+    monkeypatch.setattr(cache, "request_period_snapshot", request_period)
+    monkeypatch.setattr(
+        cache, "begin_view",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate begin_view")),
+    )
+    short = m["ui"].register_code(account_key)
+    m["oauth_menu"].on_toggle(42, 100, "cb-toggle", short)
+
+    edits = rec.by("editMessageText")
+    assert edits
+    assert "统计初始化中" in edits[-1]["text"]
+    assert "暂无本地请求" not in edits[-1]["text"]
+    assert subscriptions
+    assert subscriptions[-1][2:] == (token, "oauth-detail")
+
 
 def test_list_empty_and_populated(m):
     _setup(m)
@@ -534,6 +613,8 @@ def test_settings_usage_display_mode_toggle(m):
     assert "当前模式: 已使用量" in settings["text"]
     assert "CCH 模式（Claude Code 伪装）" in settings["text"]
     assert "当前模式: 🚫 已关闭" in settings["text"]
+    assert "Antigravity 指纹伪装" in settings["text"]
+    assert "当前状态: 🚫 已关闭" in settings["text"]
     assert "OAuth 配额监控" in settings["text"]
     assert "状态: 🚫 已停用" in settings["text"]
     keyboard = settings["reply_markup"]["inline_keyboard"]
@@ -542,15 +623,18 @@ def test_settings_usage_display_mode_toggle(m):
         ["📈 配额监控"],
         ["📊 显示: 剩余用量"],
         ["🎭 CCH模式：开启", "📊 进度条: 开启"],
+        ["🛡 AG指纹：开启"],
         ["🏠 返回主菜单", "◀ 返回OAuth账户"],
     ]
     assert keyboard[0][0]["callback_data"] == "oa:quota"
     assert keyboard[1][0]["callback_data"] == "oa:usage_mode:toggle"
     assert keyboard[2][0]["callback_data"] == "oa:cch_toggle"
     assert keyboard[2][1]["callback_data"] == "oa:progress_bar:toggle"
-    assert [b["callback_data"] for b in keyboard[3]] == ["menu:main", "menu:oauth"]
+    assert keyboard[3][0]["callback_data"] == "oa:antigravity_tls_toggle"
+    assert [b["callback_data"] for b in keyboard[4]] == ["menu:main", "menu:oauth"]
     assert "📈 配额监控" in texts
     assert "🎭 CCH模式：开启" in texts
+    assert "🛡 AG指纹：开启" in texts
     assert "📊 显示: 剩余用量" in texts
 
     rec.clear()
@@ -1027,6 +1111,18 @@ def test_settings_cch_and_quota_monitor_controls(m):
     assert "🎭 CCH模式：关闭" in texts
 
     rec.clear()
+    assert om.handle_callback(42, 100, "cb-fingerprint", "oa:antigravity_tls_toggle") is True
+    fingerprint = m["config"].get()["antigravityOAuth"]["tlsFingerprint"]
+    assert fingerprint == {"enabled": True, "profile": "chrome131"}
+    tls_view = rec.last("editMessageText")
+    assert "Antigravity 指纹伪装" in tls_view["text"]
+    assert "当前状态: ✅ 已启用" in tls_view["text"]
+    assert any(
+        button["text"] == "🛡 AG指纹：关闭"
+        for row in tls_view["reply_markup"]["inline_keyboard"] for button in row
+    )
+
+    rec.clear()
     assert om.handle_callback(42, 100, "cb-quota", "oa:quota") is True
     quota = rec.last("editMessageText")
     assert quota and "OAuth 配额监控" in quota["text"]
@@ -1060,7 +1156,7 @@ def test_settings_cch_and_quota_monitor_controls(m):
     qm = m["config"].get()["quotaMonitor"]
     assert qm["disableThresholdPercent"] == 98.0
     assert qm["resumeThresholdPercent"] == 98.0
-    print("  [PASS] OAuth settings CCH toggle + quota monitor submenu")
+    print("  [PASS] OAuth settings CCH/Antigravity TLS toggles + quota monitor submenu")
 
 
 def test_refresh_token_updates_access_and_usage(m):

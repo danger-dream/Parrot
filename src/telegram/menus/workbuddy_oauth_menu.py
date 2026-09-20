@@ -253,7 +253,9 @@ def _start_query_worker(worker):
     return thread
 
 
-def start_status_query(chat_id, message_id, key, render, *, control=None):
+def start_status_query(
+    chat_id, message_id, key, render, *, control=None, after_render=None,
+):
     """Keep vendor waits off polling; only the still-current page may be edited."""
     owner = control if control is not None else oauth_control
     token = menu_cache.begin_view(chat_id, message_id)
@@ -279,6 +281,8 @@ def start_status_query(chat_id, message_id, key, render, *, control=None):
                 text = "⚠️ 账户已不存在，请返回列表。"
                 kb = ui.inline_kb([[ui.btn("◀ 返回列表", "menu:oauth")]])
             ui.edit(chat_id, message_id, text, reply_markup=kb)
+            if callable(after_render):
+                after_render(feedback)
 
         menu_cache.run_if_current(chat_id, message_id, token, finish)
 

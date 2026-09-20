@@ -400,9 +400,14 @@ def _channel_health(ch) -> tuple[str, str]:
     return "🔴", f"近期 {worst:.0f}%"
 
 
-def _channel_monthly_lines(ch: Any, stats: dict | None) -> list[str]:
+def _channel_monthly_lines(
+    ch: Any, stats: dict | None, *, stats_loading: bool = False,
+) -> list[str]:
     """渠道列表中的 OAuth 风格本地月度统计块；所有指标使用同一月度口径。"""
     lines = [f"🏷️ 模型：<code>{len(ch.models)}</code> 个"]
+    if stats_loading and stats is None:
+        lines.append("💎 Parrot 月度：<i>统计初始化中</i>")
+        return lines
     if not isinstance(stats, dict) or int(stats.get("total") or 0) <= 0:
         lines.append("💎 Parrot 月度：<i>暂无调用</i>")
         return lines
@@ -774,7 +779,9 @@ def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
         ch_stats = by_channel.get(ch.key)
         lines.append("")
         lines.append(f"{idx}. {brand_prefix}{icon} <b>{ui.escape_html(ch.display_name)}</b> — {ui.escape_html(status)}")
-        local_lines = _channel_monthly_lines(ch, ch_stats)
+        local_lines = _channel_monthly_lines(
+            ch, ch_stats, stats_loading=stats_loading,
+        )
         lines.append("  " + local_lines[0])
         usage_line = _usage_summary(ch)
         if usage_line:
@@ -811,30 +818,92 @@ def _list_text_and_kb(page: int = 1, *, snapshot: dict | None = None,
     return text, ui.inline_kb(rows)
 
 
-def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
+def _render_cached_list(page: int) -> tuple[str, dict]:
     since = _month_start_ts()
     cached = menu_cache.PERIOD_STATS.peek(("period", int(since)))
-    if cached.value is None:
-        if cb_id is not None:
-            ui.answer_cb(cb_id, menu_cache.initialization_text())
+    text, kb = _list_text_and_kb(
+        page=page,
+        snapshot=cached.value,
+        stats_loading=cached.value is None,
+    )
+    return menu_cache.with_refreshing_notice(text, cached), kb
+
+
+def _list_stats_ready(chat_id: int = 0) -> bool:
+    if not _all_channels(chat_id):
+        return True
+    since = _month_start_ts()
+    return menu_cache.PERIOD_STATS.peek(("period", int(since))).value is not None
+
+
+def _schedule_list_stats(
+    chat_id: int, message_id: int, token: int, page: int, *,
+    redraw_if_ready: bool = False,
+) -> None:
+    if not _all_channels(chat_id):
         return
+    since = _month_start_ts()
+    cached = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    if cached.fresh:
+        if redraw_if_ready:
+            text, kb = _render_cached_list(page)
+            menu_cache.run_if_current(
+                chat_id, message_id, token,
+                lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+            )
+        return
+
+    def redraw(_value=None, _error=None) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        text, kb = _render_cached_list(page)
+        menu_cache.run_if_current(
+            chat_id, message_id, token,
+            lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+        )
+
+    menu_cache.request_period_snapshot(
+        since,
+        subscriber=(chat_id, message_id, token, "channel-period"),
+        on_ready=redraw,
+        interactive=True,
+    )
+    if redraw_if_ready and _list_stats_ready(chat_id):
+        redraw()
+
+
+def show(chat_id: int, message_id: int, cb_id: Optional[str] = None, page: int = 1) -> None:
     if cb_id is not None:
         ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
-    text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
+    token = menu_cache.begin_view(chat_id, message_id)
+    rendered_loading = not _list_stats_ready(chat_id)
+    text, kb = _render_cached_list(page)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _schedule_list_stats(
+        chat_id, message_id, token, page, redraw_if_ready=rendered_loading,
+    )
     # 页面已经完成渲染后才排队；Provider 网络永不位于 Telegram handler 等待路径。
     _schedule_usage(_all_channels(chat_id)[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
 
 
 def send_new(chat_id: int, page: int = 1) -> None:
+    rendered_loading = not _list_stats_ready(chat_id)
+    text, kb = _render_cached_list(page)
+    response = ui.send(chat_id, text, reply_markup=kb)
+    message = response.get("result") if isinstance(response, dict) and response.get("ok") else None
+    channels = _all_channels(chat_id)
     since = _month_start_ts()
     cached = menu_cache.PERIOD_STATS.peek(("period", int(since)))
-    if cached.value is None:
-        ui.send(chat_id, menu_cache.initialization_text())
-        return
-    text, kb = _list_text_and_kb(page=page, snapshot=cached.value)
-    ui.send(chat_id, text, reply_markup=kb)
+    if (
+        isinstance(message, dict) and message.get("message_id") and channels
+        and (rendered_loading or not cached.fresh)
+    ):
+        message_id = int(message["message_id"])
+        token = menu_cache.begin_view(chat_id, message_id)
+        _schedule_list_stats(
+            chat_id, message_id, token, page,
+            redraw_if_ready=rendered_loading,
+        )
     _schedule_usage(_all_channels(chat_id)[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE])
 
 
@@ -1048,6 +1117,8 @@ def _channel_model_lines(ch, model_stats: list[dict] | None = None,
         cached = menu_cache.DETAIL_STATS.peek(("channel-model", ch.key, int(_month_start_ts())))
         model_stats = cached.value or []
         stats_loading = stats_loading or cached.value is None
+    if stats_loading:
+        lines.append("  ⏳ 本月统计初始化中，管理功能可正常使用。")
     stats_by_model = {s["final_model"]: s for s in model_stats}
 
     for m in ch.models:
@@ -1113,10 +1184,13 @@ def _channel_model_lines(ch, model_stats: list[dict] | None = None,
 def _detail_text_and_kb(name: str, page: int = 1, *,
                         chat_id: int = 0,
                         model_stats: list[dict] | None = None,
-                        stats_loading: bool = False) -> tuple[Optional[str], Optional[dict]]:
+                        stats_loading: bool | None = None) -> tuple[Optional[str], Optional[dict]]:
     ch = _get_channel(name)
     if ch is None or ch.type != "api":
         return None, None
+    if stats_loading is None:
+        period, _channel_stats, models = _detail_snapshots(ch)
+        stats_loading = period.value is None or models.value is None
 
     icon, status = _channel_health(ch)
     enabled = ch.enabled and not ch.disabled_reason
@@ -1192,6 +1266,135 @@ def _detail_text_and_kb(name: str, page: int = 1, *,
     return ui.truncate("\n".join(lines)), ui.inline_kb(rows)
 
 
+def _detail_snapshots(ch) -> tuple[object, dict | None, object]:
+    since = _month_start_ts()
+    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
+    channel_stats = (
+        (period.value.get("by_channel") or {}).get(ch.key)
+        if period.value is not None else None
+    )
+    models = menu_cache.DETAIL_STATS.peek(("channel-model", ch.key, int(since)))
+    return period, channel_stats, models
+
+
+def _detail_stats_ready(ch) -> bool:
+    period, channel_stats, models = _detail_snapshots(ch)
+    if period.value is None:
+        return False
+    if int((channel_stats or {}).get("total") or 0) == 0:
+        return True
+    return models.value is not None
+
+
+def _schedule_detail_stats(
+    chat_id: int, message_id: int, token: int, name: str, page: int, *,
+    redraw_if_ready: bool = False,
+) -> None:
+    ch = _get_channel(name, chat_id)
+    if ch is None:
+        return
+    since = _month_start_ts()
+    detail_key = ("channel-model", ch.key, int(since))
+
+    def redraw(_value=None, error=None) -> None:
+        if not menu_cache.is_current_view(chat_id, message_id, token):
+            return
+        current = _get_channel(name, chat_id)
+        if current is None:
+            return
+        period, _channel_stats, models = _detail_snapshots(current)
+        text, kb = _detail_text_and_kb(
+            name, page=page, chat_id=chat_id, model_stats=models.value,
+            stats_loading=period.value is None or models.value is None,
+        )
+        if text is not None:
+            menu_cache.run_if_current(
+                chat_id, message_id, token,
+                lambda: ui.edit(chat_id, message_id, text, reply_markup=kb),
+            )
+        if error is None:
+            subscribe()
+
+    def subscribe() -> None:
+        current = _get_channel(name, chat_id)
+        if current is None:
+            return
+        period, channel_stats, models = _detail_snapshots(current)
+        if period.value is None:
+            read = menu_cache.request_period_snapshot(
+                since,
+                subscriber=(chat_id, message_id, token, "channel-detail-period"),
+                on_ready=redraw,
+                interactive=True,
+            )
+            if read.fresh and read.value is not None:
+                redraw(read.value, None)
+            return
+        if models.value is None and not int((channel_stats or {}).get("total") or 0):
+            menu_cache.DETAIL_STATS.store(detail_key, [])
+            redraw([], None)
+            return
+        if models.value is None:
+            read = menu_cache.DETAIL_STATS.request(
+                detail_key,
+                lambda: _CONTROL.channel_model_stats(
+                    _ctx(chat_id), current.key, since_ts=since,
+                ),
+                subscriber=(chat_id, message_id, token, "channel-detail-models"),
+                on_ready=redraw,
+                interactive=True,
+            )
+            if read.fresh and read.value is not None:
+                redraw(read.value, None)
+        elif not models.fresh:
+            menu_cache.DETAIL_STATS.request(
+                detail_key,
+                lambda: _CONTROL.channel_model_stats(
+                    _ctx(chat_id), current.key, since_ts=since,
+                ),
+            )
+
+    subscribe()
+    current = _get_channel(name, chat_id)
+    if redraw_if_ready and current is not None and _detail_stats_ready(current):
+        redraw()
+
+
+def _edit_cached_detail(
+    chat_id: int, message_id: int, name: str, page: int = 1, *,
+    start_view: bool = False,
+) -> bool:
+    """重绘详情；只有导航或冷统计才接管页面令牌和订阅。"""
+    ch = _get_channel(name, chat_id)
+    if ch is None:
+        return False
+    _period, _channel_stats, models = _detail_snapshots(ch)
+    cache_loading = not _detail_stats_ready(ch)
+    model_stats = models.value
+    if model_stats is None and not cache_loading:
+        # 总体快照已明确本期零调用时，缺失模型行就是已知空集。
+        model_stats = []
+    text, kb = _detail_text_and_kb(
+        name, page=page, chat_id=chat_id, model_stats=model_stats,
+        stats_loading=cache_loading,
+    )
+    if text is None:
+        return False
+    rendered_loading = cache_loading and "统计初始化中" in text
+    token = None
+    if start_view or rendered_loading:
+        token = menu_cache.current_view_token(chat_id, message_id)
+        if token is None:
+            token = menu_cache.begin_view(chat_id, message_id)
+    ui.edit(chat_id, message_id, text, reply_markup=kb)
+    if token is not None:
+        _schedule_detail_stats(
+            chat_id, message_id, token, name, page,
+            redraw_if_ready=rendered_loading,
+        )
+    return True
+
+
 def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     short, page = _split_short_page(payload)
     name = ui.resolve_code(short)
@@ -1203,36 +1406,10 @@ def on_view(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     if ch is None:
         ui.answer_cb(cb_id, "渠道不存在")
         return
-    since = _month_start_ts()
-    period = menu_cache.PERIOD_STATS.peek(("period", int(since)))
-    if period.value is None:
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
-    detail_key = ("channel-model", ch.key, int(since))
-    cached = menu_cache.DETAIL_STATS.peek(detail_key)
-    channel_stats = (period.value.get("by_channel") or {}).get(ch.key)
-    if cached.value is None and not int((channel_stats or {}).get("total") or 0):
-        # 本月无调用时，每模型统计的完整结果就是空列表。
-        menu_cache.DETAIL_STATS.store(detail_key, [])
-        cached = menu_cache.DETAIL_STATS.peek(detail_key)
-    if not cached.fresh:
-        menu_cache.DETAIL_STATS.request(
-            detail_key, lambda: _CONTROL.channel_model_stats(
-                _ctx(chat_id), ch.key, since_ts=since,
-            ),
-        )
-    # 旧详情页中的每模型调用量、Token、缓存、TPS 都是原有内容；冷快照时
-    # 保持列表页不动，不能先打开一个把这些字段删掉的残缺详情。
-    if cached.value is None:
-        ui.answer_cb(cb_id, menu_cache.initialization_text())
-        return
     ui.answer_cb(cb_id)
-    menu_cache.begin_view(chat_id, message_id)
-    text, kb = _detail_text_and_kb(
-        name, page=page, chat_id=chat_id, model_stats=cached.value,
-    )
-    if text is not None:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    if _edit_cached_detail(
+        chat_id, message_id, name, page, start_view=True,
+    ):
         try:
             _CONTROL.schedule_provider_usage_hint(_ctx(chat_id), ch.id)
         except ManagementError:
@@ -1250,8 +1427,7 @@ def on_usage_refresh(chat_id: int, message_id: int, cb_id: str, payload: str) ->
         _ctx(chat_id), ch.id, force=True,
     ).queued)
     ui.answer_cb(cb_id, "已请求更新" if queued else "暂时无需重复更新")
-    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
-    if text: ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 # ─── 启停 / 清错误 / 清亲和 / 删除 ───────────────────────────────
@@ -1269,9 +1445,7 @@ def on_toggle(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
     new_enabled = not (ch.enabled and not ch.disabled_reason)
     _control_update(name, {"enabled": new_enabled}, chat_id)
     ui.answer_cb(cb_id, "已启用" if new_enabled else "已禁用")
-    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def on_clear_errors(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
@@ -1287,9 +1461,7 @@ def on_clear_errors(chat_id: int, message_id: int, cb_id: str, payload: str) -> 
     except ManagementError:
         pass
     ui.answer_cb(cb_id, "已清除")
-    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -> None:
@@ -1305,9 +1477,7 @@ def on_clear_affinity(chat_id: int, message_id: int, cb_id: str, payload: str) -
     except ManagementError:
         pass
     ui.answer_cb(cb_id, "已清空亲和")
-    text, kb = _detail_text_and_kb(name, page=page, chat_id=chat_id)
-    if text:
-        ui.edit(chat_id, message_id, text, reply_markup=kb)
+    _edit_cached_detail(chat_id, message_id, name, page)
 
 
 def on_clear_errors_all(chat_id: int, message_id: int, cb_id: str, page: int = 1) -> None:

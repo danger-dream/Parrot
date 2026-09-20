@@ -1,6 +1,7 @@
 """Unified image contract tests: real encoded pixels, isolated state, no network."""
 import base64
 import copy
+import gzip
 import io
 import json
 from types import SimpleNamespace
@@ -30,7 +31,8 @@ def setup(monkeypatch, tmp_path):
     cfg=copy.deepcopy(config.DEFAULT_CONFIG)
     cfg['images'].update({'toolModel':'gpt-image-2','enabled':True,'cachePath':str(tmp_path/'cache')})
     cfg['oauthAccounts']=[{'provider':'openai','email':'image@example.test','chatgpt_account_id':'test-workspace','enabled':True,'access_token':'test'},
-        {'provider':'xai','email':'grok@example.test','enabled':True,'access_token':'test'}]
+        {'provider':'xai','email':'grok@example.test','enabled':True,'access_token':'test'},
+        {'provider':'antigravity','email':'ag@example.test','project_id':'p','enabled':True,'access_token':'test','models':['gemini-chat']}]
     cfg['xaiOAuth']['imageModels']=['grok-imagine-image','grok-imagine-image-quality']
     cfg['modelMapping']={'global':{'paint':'gpt-image-2'}}
     monkeypatch.setattr(config,'get',lambda:cfg)
@@ -89,7 +91,6 @@ async def test_xai_native_batch_b64_default(setup):
 @pytest.mark.parametrize('mutation,model,status',[
     ('unknown','nonexistent',400),('missing',None,400),('disabled','gpt-image-2',403),
     ('source-disabled','gpt-image-2',503),('account-disabled','gpt-image-2',503),('denied','paint',403),
-    ('ag','gemini-3.1-flash-image',400),
 ])
 async def test_model_permissions_and_availability(setup,monkeypatch,mutation,model,status):
     cfg=setup[0]
@@ -133,10 +134,11 @@ async def test_real_transparency_not_invented(setup):
 
 
 @pytest.mark.asyncio
-async def test_mask_multipart_preserves_opaque_pixels(setup):
+@pytest.mark.parametrize('model',['gpt-image-2','gemini-3.1-flash-image'])
+async def test_mask_multipart_preserves_opaque_pixels(setup,model):
     original=png('blue');im=Image.new('RGBA',(32,32),(255,255,255,255));im.paste((0,0,0,0),(16,0,32,32))
     mask=io.BytesIO();im.save(mask,format='PNG')
-    response=await post(setup,path='/v1/images/edits',data={'model':'gpt-image-2','prompt':'paint red'},
+    response=await post(setup,path='/v1/images/edits',data={'model':model,'prompt':'paint red'},
         files=[('image[]',('one.png',original,'image/png')),('image[]',('two.png',png('green'),'image/png')),('mask',('mask.png',mask.getvalue(),'image/png'))])
     assert response.status_code==200,response.text
     result=Image.open(io.BytesIO(base64.b64decode(response.json()['data'][0]['b64_json']))).convert('RGB')
@@ -176,27 +178,377 @@ async def test_native_count_mismatch_returns_partial(setup,monkeypatch):
     assert result.json()['parrot']['upstream_calls']==1
 
 
-def test_model_center_image_sources_not_mainmodel_or_ag(setup):
-    cfg=setup[0]
-    cfg['oauthAccounts'].append({'provider':'antigravity','email':'ag@example.test','project_id':'p','models':['gemini-chat'],'imageModels':['gemini-3.1-flash-image']})
+def test_model_center_image_sources_include_antigravity(setup):
     control=ModelCenterControl()
     views=control.list_models(filters=ModelFilters(kinds=(ModelKind.IMAGE,))).items
-    # 断言关心的是"图片源里不含 AG"与 GPT/Grok 都在，不是种子名单的完整快照。
     ids={v.model_id for v in views}
-    assert {'gpt-image-2','gpt-image-2.5','grok-imagine-image','grok-imagine-image-quality'} <= ids
-    assert not any(i.startswith('gemini-') for i in ids)
+    assert {'gpt-image-2','gpt-image-2.5','grok-imagine-image','grok-imagine-image-quality','gemini-3.1-flash-image'} <= ids
     gpt=next(v for v in views if v.model_id=='gpt-image-2')
     assert gpt.aliases==('paint',) and gpt.sources and gpt.available_in()
-    assert all(s.provider!='antigravity' for v in views for s in v.sources)
+    gemini=next(v for v in views if v.model_id=='gemini-3.1-flash-image')
+    assert any(source.provider=='antigravity' for source in gemini.sources)
+
+
+@pytest.mark.asyncio
+async def test_antigravity_generation_uses_common_contract(setup):
+    response=await post(setup,{'model':'gemini-3.1-flash-image','prompt':'icon','n':2,'size':'48x32'})
+    assert response.status_code==200,response.text
+    body=response.json()
+    assert len(body['data'])==2 and body['parrot']['upstream_calls']==2
+    ag_calls=[call for call in setup[1] if call[0].provider=='antigravity']
+    assert len(ag_calls)==2 and all(call[3]==1 for call in ag_calls)
+
+
+@pytest.mark.asyncio
+async def test_antigravity_429_switches_account_without_disabling_chat(setup,monkeypatch):
+    setup[0]['oauthAccounts'].append({
+        'provider':'antigravity','email':'ag-second@example.test','project_id':'p2',
+        'enabled':True,'access_token':'test-2','models':['gemini-chat'],
+    })
+    attempted=[];cooled=[]
+    monkeypatch.setattr(runtime.cooldown,'record_error',lambda *args,**kwargs:cooled.append(args))
+    async def send(source,parsed,*,action,n,cfg):
+        attempted.append(source)
+        if len(attempted)==1:
+            return httpx.Response(429,json={'error':{'message':'image quota'}})
+        return httpx.Response(200,json={'data':[{'b64_json':b64()}]})
+    monkeypatch.setattr(runtime,'_send',send)
+    result=await post(setup,{'model':'gemini-3.1-flash-image','prompt':'icon'})
+    assert result.status_code==200,result.text
+    assert len(attempted)==2 and attempted[0].key!=attempted[1].key
+    assert cooled and cooled[0][1]=='gemini-3.1-flash-image'
+    assert all(account['enabled'] for account in setup[0]['oauthAccounts'] if account['provider']=='antigravity')
+
+
+@pytest.mark.asyncio
+async def test_antigravity_edit_uses_common_contract(setup):
+    response=await post(setup,{'model':'gemini-3.1-flash-image','prompt':'edit','image':ref()},path='/v1/images/edits')
+    assert response.status_code==200,response.text
+    assert len(setup[1])==1 and setup[1][0][2]=='edit'
+    assert setup[1][0][1].input_images[0].startswith('data:image/png;base64,')
+
+
+@pytest.mark.asyncio
+async def test_antigravity_remote_edit_timeout_happens_before_paid_post(setup,monkeypatch):
+    from src.antigravity import images as ag_images
+    async def timeout(_reference):
+        raise httpx.ReadTimeout('input timed out')
+    monkeypatch.setattr(ag_images.image_artifacts,'reference_bytes',timeout)
+    response=await post(setup,{
+        'model':'gemini-3.1-flash-image','prompt':'edit',
+        'image':'https://public.example.test/reference.png',
+    },path='/v1/images/edits')
+    assert response.status_code==504
+    assert response.json()['error']['type']=='image_input_timeout'
+    assert not setup[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_error", [
+    httpx.ConnectError("connect failed"),
+    httpx.ReadError("read failed"),
+    httpx.RemoteProtocolError("protocol failed"),
+])
+async def test_antigravity_transport_preprocessing_failure_does_not_block_xai(
+    setup, monkeypatch, transport_error,
+):
+    from src.antigravity import images as ag_images
+    setup[0]['image_models'] = {
+        'xai': ['shared-transport-edit-model'],
+        'antigravity': ['shared-transport-edit-model'],
+    }
+
+    async def unusable_for_ag(_reference):
+        raise transport_error
+
+    monkeypatch.setattr(ag_images.image_artifacts, 'reference_bytes', unusable_for_ag)
+    reference = 'https://public.example.test/reference.png'
+    response = await post(setup, {
+        'model': 'shared-transport-edit-model', 'prompt': 'edit', 'image': reference,
+    }, path='/v1/images/edits')
+    assert response.status_code == 200, response.text
+    assert len(setup[1]) == 1 and setup[1][0][0].provider == 'xai'
+    assert setup[1][0][1].input_images == [reference]
+
+
+@pytest.mark.asyncio
+async def test_antigravity_only_transport_preprocessing_failure_is_safe_502(setup,monkeypatch):
+    from src.antigravity import images as ag_images
+
+    async def connect_failed(_reference):
+        raise httpx.ConnectError('private endpoint detail')
+
+    monkeypatch.setattr(ag_images.image_artifacts, 'reference_bytes', connect_failed)
+    response = await post(setup, {
+        'model': 'gemini-3.1-flash-image', 'prompt': 'edit',
+        'image': 'https://public.example.test/private-reference.png',
+    }, path='/v1/images/edits')
+    assert response.status_code == 502
+    assert response.json()['error'] == {
+        'type': 'image_input_error',
+        'message': 'reference image or mask download failed; no generation was attempted',
+    }
+    assert 'private' not in response.text
+    assert not setup[1]
+
+
+@pytest.mark.asyncio
+async def test_antigravity_reference_preprocessing_does_not_change_xai_candidate(setup,monkeypatch):
+    from src.antigravity import images as ag_images
+    setup[0]['image_models']={
+        'xai':['shared-edit-model'],
+        'antigravity':['shared-edit-model'],
+    }
+    async def unusable_for_ag(_reference):
+        raise ValueError('AG cannot inline this reference')
+    monkeypatch.setattr(ag_images.image_artifacts,'reference_bytes',unusable_for_ag)
+    reference='https://public.example.test/reference.png'
+    response=await post(setup,{
+        'model':'shared-edit-model','prompt':'edit','image':reference,
+    },path='/v1/images/edits')
+    assert response.status_code==200,response.text
+    assert len(setup[1])==1 and setup[1][0][0].provider=='xai'
+    assert setup[1][0][1].input_images==[reference]
+    assert any('Antigravity' in warning for warning in response.json()['parrot']['warnings'])
+
+
+@pytest.mark.asyncio
+async def test_antigravity_high_quality_uses_generation_contract(setup):
+    response=await post(setup,{'model':'gemini-3.1-flash-image','prompt':'icon','quality':'high'})
+    assert response.status_code==200,response.text
+    assert len(setup[1])==1 and setup[1][0][1].native_options['quality']=='high'
+
+
+@pytest.mark.asyncio
+async def test_antigravity_verified_opaque_output_keeps_transparency_rejected(setup):
+    response=await post(setup,{'model':'gemini-3.1-flash-image','prompt':'icon','background':'transparent'})
+    assert response.status_code==400
+    assert 'verified opaque JPEG output without alpha' in response.json()['error']['message']
+    assert not setup[1]
 
 
 def test_api_mapping_classification_and_url(setup):
+    from src.antigravity import images as ag_images
     cfg=setup[0]
-    cfg['channels']=[{'name':'pixels','protocol':'openai-chat','baseUrl':'https://api.example/v1','models':[{'real':'gpt-image-1','alias':'private-painter'}]}]
+    cfg['channels']=[{'name':'pixels','providerId':'antigravity','protocol':'openai-chat','baseUrl':'https://api.example/v1','models':[{'real':'gpt-image-1','alias':'private-painter'}]}]
     row=next(s for s in image_catalog.sources() if s.model=='private-painter')
     assert row.upstream=='gpt-image-1' and row.key=='api:pixels'
+    assert not ag_images.is_source(row)
     assert runtime._api_url(SimpleNamespace(base_url='https://api.example/v1',api_path=None),'edit')=='https://api.example/v1/images/edits'
     assert runtime._api_url(SimpleNamespace(base_url='https://api.example',api_path='/custom/chat/completions'),'generate')=='https://api.example/custom/images/generations'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('compressed', [False, True])
+@pytest.mark.parametrize('status', [200, 400])
+async def test_antigravity_decoded_response_headers_for_success_and_error(
+    setup, monkeypatch, compressed, status,
+):
+    from src.antigravity import images as ag_images
+    source = next(s for s in image_catalog.sources() if s.provider == 'antigravity')
+    account = next(a for a in setup[0]['oauthAccounts'] if a['provider'] == 'antigravity')
+    channel = SimpleNamespace(
+        state_key=source.state_key,
+        base_url='https://daily-cloudcode-pa.googleapis.com',
+        project_id='project-x',
+        tls_fingerprint=None,
+        supports_media_model=lambda kind, model: kind == 'image' and model == source.upstream,
+    )
+
+    async def headers():
+        return {'authorization': 'Bearer private-test-token', 'content-type': 'application/json'}
+
+    channel.build_media_headers = headers
+    monkeypatch.setattr(registry, 'get_channel', lambda key: channel)
+    monkeypatch.setattr(image_catalog, 'current_oauth_account', lambda selected: (selected.key[6:], account))
+    upstream = (
+        {'response': {'candidates': [{'content': {'parts': [
+            {'inlineData': {'mimeType': 'image/png', 'data': b64()}},
+        ]}}]}}
+        if status == 200 else
+        {'error': {'message': 'ordinary rejection'}}
+    )
+    plain = json.dumps(upstream).encode()
+    wire = gzip.compress(plain) if compressed else plain
+    response_headers = {'content-type': 'application/json'}
+    if compressed:
+        response_headers['content-encoding'] = 'gzip'
+
+    def transport(req):
+        return httpx.Response(status, content=wire, headers=response_headers)
+
+    monkeypatch.setattr(
+        ag_images.network, 'async_client',
+        lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(transport)),
+    )
+    parsed = compat._ParsedRequest(model=source.model, prompt='boat')
+    result = await ag_images.request(
+        source, parsed, prompt='boat', n=1, action='generate', cfg={},
+    )
+    assert result.status_code == status
+    assert 'content-encoding' not in result.headers
+    assert int(result.headers['content-length']) == len(result.content)
+    if status == 200:
+        assert result.json()['data'][0]['b64_json'] == b64()
+    else:
+        assert result.json() == upstream
+
+
+@pytest.mark.asyncio
+async def test_antigravity_fingerprint_uses_shared_route_runtime_and_closes(setup,monkeypatch):
+    import src.transports as transports
+    from src.antigravity import images as ag_images
+
+    source = next(s for s in image_catalog.sources() if s.provider == 'antigravity')
+    account = next(a for a in setup[0]['oauthAccounts'] if a['provider'] == 'antigravity')
+    channel = SimpleNamespace(
+        state_key=source.state_key,
+        base_url='https://daily-cloudcode-pa.googleapis.com',
+        project_id='project-x',
+        tls_fingerprint='chrome131',
+        supports_media_model=lambda kind, model: kind == 'image' and model == source.upstream,
+    )
+
+    async def headers():
+        return {'authorization': 'Bearer private-test-token', 'content-type': 'application/json'}
+
+    channel.build_media_headers = headers
+    monkeypatch.setattr(registry, 'get_channel', lambda key: channel)
+    monkeypatch.setattr(image_catalog, 'current_oauth_account', lambda selected: (selected.key[6:], account))
+    monkeypatch.setattr(
+        ag_images.network, 'async_client',
+        lambda **kw: (_ for _ in ()).throw(AssertionError('fingerprinted image must not use generic client')),
+    )
+    closed = []
+
+    class Context:
+        async def __aexit__(self, *_args):
+            closed.append('response')
+
+    class Client:
+        async def aclose(self):
+            closed.append('client')
+
+    upstream = {'response': {'candidates': [{'content': {'parts': [
+        {'inlineData': {'mimeType': 'image/png', 'data': b64()}},
+    ]}}]}}
+    request_obj = httpx.Request('POST', 'https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent')
+    response_obj = httpx.Response(200, json=upstream, request=request_obj)
+    captured = {}
+
+    async def open_response(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            ok=True, error=None, response=response_obj, ctx=Context(),
+            proxy_client=Client(), timing=None, round_timeouts=None,
+            proxy_attempt_id=None, proxy_bytes={}, terminal_persistence_scheduled=False,
+        )
+
+    monkeypatch.setattr(transports, 'open_response_with_proxy_chain', open_response)
+    parsed = compat._ParsedRequest(model=source.model, prompt='boat')
+    result = await ag_images.request(
+        source, parsed, prompt='boat', n=1, action='generate',
+        cfg={'requestTimeoutSeconds': 91},
+    )
+    assert result.status_code == 200
+    assert captured['channel'] is channel
+    assert captured['proxy_purpose'] == 'oauth_antigravity'
+    assert captured['request_id'] is None
+    assert captured['response_mode'] == 'non_stream'
+    assert captured['total_timeout'] == 91
+    assert captured['upstream_req'].url.endswith('/v1internal:generateContent')
+    assert json.loads(captured['upstream_req'].body)['requestType'] == 'image_gen'
+    assert closed == ['response', 'client']
+
+
+@pytest.mark.asyncio
+async def test_antigravity_fingerprint_body_error_closes_response_and_client(monkeypatch):
+    import src.transports as transports
+    from src.antigravity import images as ag_images
+
+    closed = []
+
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.ReadError('body failed')
+            yield b''
+
+    class Context:
+        async def __aexit__(self, *_args):
+            closed.append('response')
+
+    class Client:
+        async def aclose(self):
+            closed.append('client')
+
+    request_obj = httpx.Request('POST', 'https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent')
+    response_obj = httpx.Response(200, stream=BrokenStream(), request=request_obj)
+
+    async def open_response(**_kwargs):
+        return SimpleNamespace(
+            ok=True, error=None, response=response_obj, ctx=Context(),
+            proxy_client=Client(), timing=None, round_timeouts=None,
+            proxy_attempt_id=None, proxy_bytes={}, terminal_persistence_scheduled=False,
+        )
+
+    monkeypatch.setattr(transports, 'open_response_with_proxy_chain', open_response)
+    with pytest.raises(httpx.ReadError, match='body failed'):
+        await ag_images._fingerprinted_post(
+            SimpleNamespace(),
+            model='gemini-3.1-flash-image',
+            url=str(request_obj.url),
+            headers={},
+            body=b'{}',
+            timeout_seconds=90,
+        )
+    assert closed == ['response', 'client']
+
+
+@pytest.mark.asyncio
+async def test_send_antigravity_envelope_and_normalized_response(setup,monkeypatch):
+    from src.antigravity import images as ag_images
+    source=next(s for s in image_catalog.sources() if s.provider=='antigravity')
+    account=next(a for a in setup[0]['oauthAccounts'] if a['provider']=='antigravity')
+    channel=SimpleNamespace(
+        state_key=source.state_key, base_url='https://daily-cloudcode-pa.googleapis.com',
+        project_id='project-x', supports_media_model=lambda kind,model:kind=='image' and model==source.upstream,
+    )
+    async def headers(): return {'authorization':'Bearer private-test-token','content-type':'application/json'}
+    channel.build_media_headers=headers
+    monkeypatch.setattr(registry,'get_channel',lambda key:channel)
+    monkeypatch.setattr(image_catalog,'current_oauth_account',lambda selected:(selected.key[6:],account))
+    seen=[]
+    upstream={'response':{'candidates':[{'content':{'parts':[{'inlineData':{'mimeType':'image/png','data':b64()}}]}}],
+        'usageMetadata':{'promptTokenCount':5,'candidatesTokenCount':7,'totalTokenCount':12}}}
+    def transport(req):
+        seen.append(req);return httpx.Response(200,json=upstream)
+    monkeypatch.setattr(ag_images.network,'async_client',lambda **kw:httpx.AsyncClient(transport=httpx.MockTransport(transport)))
+    parsed=compat._ParsedRequest(model=source.model,prompt='boat',size='48x32',native_options={'quality':'standard'})
+    result=await ag_images.request(source,parsed,prompt='boat',n=1,action='generate',cfg={})
+    assert result.status_code==200
+    body=result.json();assert body['data'][0]['b64_json']==b64() and body['usage']['total_tokens']==12
+    wire=json.loads(seen[0].content)
+    assert wire['model']=='gemini-3.1-flash-image' and wire['requestType']=='image_gen'
+    assert wire['request']['generationConfig']['responseModalities']==['IMAGE']
+    assert wire['request']['generationConfig']['imageConfig']=={'aspectRatio':'3:2','imageSize':'1K'}
+    assert 'private-test-token' not in seen[0].content.decode()
+
+
+def test_antigravity_2k_and_edit_envelopes(setup):
+    from src.antigravity import images as ag_images
+    high=compat._ParsedRequest(model='gemini-3.1-flash-image',prompt='icon',native_options={'quality':'high'})
+    generated=ag_images.build_request(high,prompt='icon',n=1,action='generate')
+    assert generated['generationConfig']['imageConfig']=={'imageSize':'2K'}
+    mask=ref(png((0,0,0,0),mode='RGBA'))
+    edited=compat._ParsedRequest(model='gemini-3.1-flash-image',prompt='edit',input_images=[ref()],mask_url=mask)
+    request=ag_images.build_request(edited,prompt='edit',n=1,action='edit')
+    parts=request['contents'][0]['parts']
+    assert parts[0]=={'text':'edit'} and parts[1]=={'text':'Reference image 1:'}
+    assert parts[2]['inlineData']['mimeType']=='image/png'
+    assert base64.b64decode(parts[2]['inlineData']['data'])==png()
+    assert parts[3]['text'].startswith('Edit mask for reference image 1:')
+    assert parts[4]['inlineData']['mimeType']=='image/png'
+    assert base64.b64decode(parts[4]['inlineData']['data'])==png((0,0,0,0),mode='RGBA')
 
 
 @pytest.mark.asyncio
@@ -244,6 +596,20 @@ async def test_safe_rejection_failover_and_retry_after(setup,monkeypatch):
     assert result.status_code==429 and result.headers['retry-after']=='42'
     assert len(called)==len(set(called))==2
     assert result.json()['parrot']['upstream_calls']==2
+
+
+@pytest.mark.asyncio
+async def test_antigravity_upstream_error_redacts_project_identity(setup,monkeypatch):
+    account=next(item for item in setup[0]['oauthAccounts'] if item['provider']=='antigravity')
+    account['project_id']='project-secret-42'
+    async def send(*args,**kwargs):
+        return httpx.Response(403,json={'error':{'message':'denied project-secret-42 for ag@example.test'}})
+    monkeypatch.setattr(runtime,'_send',send)
+    response=await post(setup,{'model':'gemini-3.1-flash-image','prompt':'icon'})
+    message=response.json()['error']['message']
+    assert response.status_code==403
+    assert 'project-secret-42' not in message and 'ag@example.test' not in message
+    assert '[private]' in message
 
 
 @pytest.mark.asyncio
@@ -318,6 +684,17 @@ def test_image_global_source_and_visibility_state_mutations(setup,monkeypatch):
     control.set_state(None,scope=None,selection=selection,target=ModelStateTarget(ModelStateField.VISIBLE,False),expected_revision=view.revision)
     assert 'gpt-image-2' not in image_catalog.available_models()
     assert 'gpt-image-2' in cfg['modelCenter']['hiddenModels']
+
+@pytest.mark.asyncio
+async def test_model_discovery_lists_antigravity_image_not_chat_model(setup,monkeypatch):
+    import server
+    from starlette.requests import Request
+    monkeypatch.setattr(registry,'available_models',lambda:[])
+    request=Request({'type':'http','method':'GET','path':'/v1/models','headers':[]})
+    ids={item['id'] for item in (await server.list_models(request))['data']}
+    assert 'gemini-3.1-flash-image' in ids
+    assert 'gemini-chat' not in ids
+
 
 @pytest.mark.asyncio
 async def test_model_discovery_image_alias_permissions_and_disabled_source(setup,monkeypatch):

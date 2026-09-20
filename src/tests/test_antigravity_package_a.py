@@ -77,8 +77,8 @@ def test_antigravity_reasoning_bridge_nonstream_flag_order_and_replay():
 async def test_antigravity_channel_enables_reasoning_bridge_only_for_anthropic(monkeypatch):
     ch = AntigravityOAuthChannel({"email": "bridge@example.com", "project_id": "p", "models": ["m"]})
     import src.oauth_manager as om
-    async def token(key): return "token"
-    monkeypatch.setattr(om, "ensure_valid_token", token)
+    async def token(channel): return "token"
+    monkeypatch.setattr(om, "ensure_channel_token", token)
     anthropic = await ch.build_upstream_request({
         "model": "m", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}],
     }, "m", ingress_protocol="anthropic")
@@ -321,18 +321,25 @@ def test_antigravity_short_429_is_provider_bounded_transient():
                          error_detail=_google("3s"), full_response_text=_google("3s"))
     assert retryable_transient_error_kind(ag, long) is None
 
-@pytest.mark.asyncio
-async def test_ag_image_route_is_retired_without_touching_accounts(monkeypatch):
-    from src import auth
-    monkeypatch.setattr(auth, "validate", lambda headers: ("test", [], None))
-    monkeypatch.setattr(auth, "images_allowed", lambda key: True)
+def test_ag_image_capability_is_separate_from_chat(monkeypatch):
+    from src import oauth_manager
     model = "gemini-3.1-flash-image"
-    account = {"provider": "antigravity", "email": "fixture@example.test", "project_id": "p", "models": ["gemini-chat", model], "imageModels": [model]}
+    account = {
+        "provider": "antigravity", "email": "fixture@example.test",
+        "project_id": "p", "models": ["gemini-chat", model],
+        "access_token": "token",
+    }
+    cfg = dict(config.DEFAULT_CONFIG)
+    cfg["oauthAccounts"] = [account]
+    cfg["image_models"] = {"antigravity": [model]}
+    cfg["images"] = {**cfg.get("images", {}), "disabledSources": []}
+    monkeypatch.setattr(config, "get", lambda: cfg)
+    monkeypatch.setattr(oauth_manager, "get_account", lambda key: account)
     ch = AntigravityOAuthChannel(account)
-    assert not ch.supports_media_model("image", model)
+    assert ch.supports_media_model("image", model)
+    assert ch.supports_media_model("video", model) is False
     assert ch.supports_model(model) is None
     assert ch.supports_model("gemini-chat") == "gemini-chat"
-    assert account["imageModels"] == [model]
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_images_app()), base_url="http://test") as client:
-        response = await client.post("/v1/images/generations", json={"model": model, "prompt": "not dispatched"})
-    assert response.status_code == 400
+    cfg["images"]["disabledSources"] = [ch.state_key]
+    assert ch.supports_media_model("image", model) is False
+    assert ch.supports_model("gemini-chat") == "gemini-chat"

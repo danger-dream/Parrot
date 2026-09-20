@@ -998,6 +998,28 @@ class SS2022Connector(Connector):
             "password": self.password,
         }
 
+    async def acquire_curl_proxy(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout: float,
+        timing=None,
+    ):
+        """Return one target-locked loopback CONNECT lease for a curl attempt."""
+        from .ss2022_curl_bridge import SS2022CurlProxyLease
+
+        return await SS2022CurlProxyLease.create(
+            cipher=self.cipher,
+            password=self.password,
+            ss_server=self.server,
+            ss_port=self.port,
+            target_host=host,
+            target_port=port,
+            connect_timeout=timeout,
+            timing=timing,
+        )
+
     def create_httpx_client(self, *, byte_counter=None, timing=None, **kw) -> httpx.AsyncClient:
         kw.setdefault("timeout", httpx.Timeout(10))
         limits = kw.pop("limits", None)

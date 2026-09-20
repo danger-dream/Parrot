@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 from contextlib import nullcontext
+from datetime import date
 
 import httpx
 import pytest
@@ -308,6 +309,195 @@ def test_xai_structured_results_keep_missing_snippet_and_domain_count_rules():
                            blocked_domains=['blocked.example.test'])
     result = search._parse_oauth_result(data, 'xai', args, 'search', {})
     assert result['results'] == [{'title': 'First allowed', 'url': 'https://docs.example.test/first'}]
+
+
+@pytest.mark.asyncio
+async def test_x_search_uses_native_tool_and_normalizes_results(setup, monkeypatch):
+    from src import oauth_manager
+    cfg, calls, install = setup
+    cfg['search'].update(backends=[backend('xai')], maxAttempts=1)
+    account = {'provider': 'xai', 'email': 'test@example.test', 'subject': 'test-sub',
+               'access_token': 'private-token'}
+    cfg['oauthAccounts'] = [account]
+
+    async def token(*args, **kwargs):
+        return 'private-token'
+
+    monkeypatch.setattr(oauth_manager, 'ensure_valid_token', token)
+    monkeypatch.setattr(oauth_manager, 'account_state_key', lambda account: 'test-generation')
+    monkeypatch.setattr(oauth_manager, 'account_generation_guard', lambda state: nullcontext(True))
+    envelope = {'answer': 'X answer', 'results': [
+        {'title': '@xai post', 'url': 'https://x.com/xai/status/123', 'snippet': 'post text'},
+    ]}
+    final = {'type': 'response.completed', 'response': {'model': 'grok-4.6', 'output': [
+        {'type': 'x_search_call', 'action': {'sources': [
+            {'url': 'https://x.com/xai/status/123', 'title': '@xai post'}]}},
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(envelope),
+                                        'annotations': [{'type': 'url_citation',
+                                                         'url': 'https://x.com/xai/status/123',
+                                                         'title': '@xai post'}]}]},
+    ]}}
+    install(lambda request: httpx.Response(
+        200, text='data: ' + json.dumps(final) + '\n\n',
+        headers={'content-type': 'text/event-stream'},
+    ))
+
+    result = await search.x_search({
+        'query': 'latest xAI news', 'max_results': 3, 'freshness': 'week',
+        'allowed_x_handles': ['@xai', 'XAI'], 'enable_video_understanding': True,
+    })
+    assert result['results'] == [
+        {'title': '@xai post', 'url': 'https://x.com/xai/status/123', 'snippet': 'post text'},
+    ]
+    assert result['answer'] == 'X answer'
+    assert result['provider'] == 'xai'
+    body = json.loads(calls[0].content)
+    assert body['tools'] == [{
+        'type': 'x_search', 'allowed_x_handles': ['xai'],
+        'enable_video_understanding': True, 'from_date': body['tools'][0]['from_date'],
+    }]
+    assert date.fromisoformat(body['tools'][0]['from_date']).isoformat() == body['tools'][0]['from_date']
+    assert body['tool_choice'] == 'required' and body['max_tool_calls'] == 1
+    assert body['input'][0]['content'].startswith('Use X search to find: latest xAI news')
+
+
+def test_x_search_accepts_observed_xai_oauth_custom_tool_call_wire():
+    url = 'https://x.com/xai/status/123'
+    envelope = {'answer': 'ok', 'results': [
+        {'title': 'X post', 'url': url, 'snippet': 'post text'},
+    ]}
+    data = {'output': [
+        {'type': 'custom_tool_call', 'name': 'x_semantic_search', 'status': 'completed'},
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(envelope),
+                                        'annotations': [
+                                            {'type': 'url_citation',
+                                             'url': 'https://x.com/i/status/123', 'title': url},
+                                        ]}]},
+    ]}
+    result = search._parse_oauth_result(data, 'xai', _xai_parse_args(), 'x_search', {})
+    assert result['answer'] == 'ok'
+    assert result['results'] == [{'title': 'X post', 'url': url, 'snippet': 'post text'}]
+
+
+def test_x_search_does_not_treat_client_custom_input_as_native_execution():
+    data = {'output': [{
+        'type': 'custom_tool_call', 'name': 'x_semantic_search', 'status': 'completed',
+        'call_id': 'custom_1', 'input': '{"query":"client-owned"}',
+    }]}
+    with pytest.raises(search.SearchError) as exc:
+        search._parse_oauth_result(data, 'xai', _xai_parse_args(), 'x_search', {})
+    assert exc.value.code == 'search_not_executed'
+
+
+@pytest.mark.asyncio
+async def test_x_search_rejects_incompatible_parameters_before_network(setup):
+    cfg, calls, install = setup
+    cfg['search']['backends'] = [backend('xai')]
+    cfg['oauthAccounts'] = [{
+        'provider': 'xai', 'email': 'test@example.test', 'subject': 'test-sub',
+        'access_token': 'private-token',
+    }]
+    install(lambda request: httpx.Response(500))
+    with pytest.raises(search.SearchError) as exc:
+        await search.x_search({'query': 'hello', 'allowed_domains': ['x.com']})
+    assert exc.value.code == 'unsupported_search_parameter' and not calls
+    with pytest.raises(search.SearchError) as exc:
+        await search.x_search({'query': 'hello', 'allowed_x_handles': ['xai'],
+                               'excluded_x_handles': ['spam']})
+    assert exc.value.code == 'invalid_search_input' and not calls
+    with pytest.raises(search.SearchError) as exc:
+        await search.search({'query': 'hello', 'allowed_x_handles': ['xai']})
+    assert exc.value.code == 'unsupported_search_parameter' and not calls
+    for invalid in ('2026-09-01T12:00:00Z', '2026-02-30', '20260901'):
+        with pytest.raises(search.SearchError) as exc:
+            await search.x_search({'query': 'hello', 'from_date': invalid})
+        assert exc.value.code == 'invalid_search_input' and not calls
+
+
+@pytest.mark.asyncio
+async def test_x_search_requires_an_eligible_xai_account(setup):
+    cfg, calls, install = setup
+    cfg['search']['backends'] = [backend('xai')]
+    cfg['oauthAccounts'] = [{
+        'provider': 'xai', 'email': 'disabled@example.test', 'subject': 'disabled',
+        'access_token': 'private-token', 'enabled': False,
+    }]
+    install(lambda request: httpx.Response(500))
+    with pytest.raises(search.SearchError) as exc:
+        await search.x_search({'query': 'hello'})
+    assert exc.value.code == 'no_x_search_backend'
+    assert not calls
+
+
+@pytest.mark.asyncio
+async def test_x_search_exact_dates_override_configured_default_freshness(setup):
+    cfg, calls, install = setup
+    cfg['search'].update(backends=[backend('xai')], freshness='week')
+    cfg['oauthAccounts'] = []
+    install(lambda request: httpx.Response(500))
+    with pytest.raises(search.SearchError) as exc:
+        await search.x_search({'query': 'hello', 'from_date': '2026-09-01', 'to_date': '2026-09-02'})
+    assert exc.value.code == 'no_x_search_backend' and not calls
+
+
+@pytest.mark.asyncio
+async def test_x_search_rate_limit_retries_next_eligible_account(setup, monkeypatch):
+    from src import oauth_manager
+    cfg, calls, install = setup
+    cfg['search'].update(backends=[backend('xai')], maxAttempts=2)
+    cfg['oauthAccounts'] = [
+        {'provider': 'xai', 'email': 'one@example.test', 'subject': 'one', 'access_token': 'one'},
+        {'provider': 'xai', 'email': 'two@example.test', 'subject': 'two', 'access_token': 'two'},
+    ]
+
+    async def token(key, **kwargs):
+        return key
+
+    monkeypatch.setattr(oauth_manager, 'ensure_valid_token', token)
+    monkeypatch.setattr(oauth_manager, 'account_state_key', lambda account: account['subject'])
+    monkeypatch.setattr(oauth_manager, 'account_generation_guard', lambda state: nullcontext(True))
+    completed = {'type': 'response.completed', 'response': {'output': [
+        {'type': 'x_search_call', 'action': {'sources': []}},
+        {'type': 'message', 'content': [{'type': 'output_text',
+                                        'text': '{"answer":"ok","results":[]}'}]},
+    ]}}
+
+    def response(request):
+        if request.headers['authorization'] == 'Bearer xai:one':
+            return httpx.Response(429, json={'error': 'quota'})
+        return httpx.Response(200, text='data: ' + json.dumps(completed) + '\n\n',
+                              headers={'content-type': 'text/event-stream'})
+
+    install(response)
+    result = await search.x_search({'query': 'hello'})
+    assert result['answer'] == 'ok'
+    assert [call.headers['authorization'] for call in calls] == [
+        'Bearer xai:one', 'Bearer xai:two',
+    ]
+    assert [attempt['code'] for attempt in result['attempts'][:1]] == ['search_rate_limited']
+    assert result['attempts'][1]['status'] == 'success'
+
+
+@pytest.mark.asyncio
+async def test_x_search_rate_limit_does_not_immediately_retry_same_account(setup, monkeypatch):
+    from src import oauth_manager
+    cfg, calls, install = setup
+    cfg['search'].update(backends=[backend('xai')], maxAttempts=3)
+    cfg['oauthAccounts'] = [
+        {'provider': 'xai', 'email': 'one@example.test', 'subject': 'one', 'access_token': 'one'},
+    ]
+
+    async def token(*args, **kwargs):
+        return 'one'
+
+    monkeypatch.setattr(oauth_manager, 'ensure_valid_token', token)
+    monkeypatch.setattr(oauth_manager, 'account_state_key', lambda account: account['subject'])
+    monkeypatch.setattr(oauth_manager, 'account_generation_guard', lambda state: nullcontext(True))
+    install(lambda request: httpx.Response(429, json={'error': 'quota'}))
+    with pytest.raises(search.SearchError) as exc:
+        await search.x_search({'query': 'hello'})
+    assert exc.value.code == 'search_rate_limited'
+    assert len(exc.value.attempts) == 1 and len(calls) == 1
 
 
 @pytest.mark.asyncio
