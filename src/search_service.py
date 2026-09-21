@@ -389,12 +389,18 @@ def _xai_structured_output(text: str) -> tuple[list, str | None] | None:
 def _xai_aligned_rows(structured: list, evidence: list, *, x_search: bool = False) -> list:
     """Keep structured rows tied to URLs observed in native search evidence."""
     evidence_by_url = {}
+    x_user_citations = 0
     for item in evidence:
         if not isinstance(item, dict):
             continue
         url = str(item.get("url") or "")
         if urlsplit(url).scheme in ("http", "https"):
             evidence_by_url.setdefault(_xai_evidence_key(url, x_search=x_search), item)
+            parsed = urlsplit(url)
+            parts = [part for part in parsed.path.split("/") if part]
+            if (x_search and (parsed.hostname or "").lower().removeprefix("www.") in ("x.com", "twitter.com")
+                    and len(parts) == 3 and parts[:2] == ["i", "user"] and parts[2].isdigit()):
+                x_user_citations += 1
     if not evidence_by_url:
         return structured
     aligned = []
@@ -402,7 +408,15 @@ def _xai_aligned_rows(structured: list, evidence: list, *, x_search: bool = Fals
         if not isinstance(item, dict):
             continue
         url = str(item.get("url") or "")
-        source = evidence_by_url.get(_xai_evidence_key(url, x_search=x_search))
+        key = _xai_evidence_key(url, x_search=x_search)
+        source = evidence_by_url.get(key)
+        # Current xAI OAuth user-search citations expose only /i/user/<numeric-id>,
+        # while the structured native result exposes the corresponding /<handle>.
+        # The citation therefore proves one profile result but cannot be URL-keyed.
+        if source is None and key.startswith("x-profile:") and x_user_citations:
+            x_user_citations -= 1
+            aligned.append(item)
+            continue
         if source is None:
             continue
         merged = dict(source)
@@ -529,7 +543,7 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
     key = account_key(account)
     state_key = oauth_manager.account_state_key(account)
     headers = {"content-type": "application/json", "accept": "application/json"}
-    if kind != "anthropic":
+    if kind not in ("anthropic", "xai"):
         token = await oauth_manager.ensure_valid_token(key, expected_state_key=state_key)
         headers["authorization"] = "Bearer " + token
     model = str(backend.get("model") or {"openai": "gpt-5.5", "xai": "grok-4.6", "anthropic": "claude-sonnet-4-6"}[kind])
@@ -591,9 +605,20 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
         )
         payload = {"model": model, "stream": True, "reasoning": {"effort": "low"},
                    "input": [{"role": "user", "content": prompt_label + ": " + query + result_contract}],
-                   "tools": [tool], "tool_choice": "required", "max_output_tokens": 1200, "max_tool_calls": 1}
-        url = str(backend.get("endpoint") or account.get("base_url") or "https://api.x.ai/v1").rstrip("/") + "/responses"
-        headers.update({"user-agent": "xai-sdk-python", "accept": "text/event-stream"})
+                   "tools": [tool], "max_output_tokens": 1200}
+        if not is_x_search:
+            payload.update(tool_choice="required", max_tool_calls=1)
+        with oauth_manager.account_generation_guard(state_key) as current:
+            if not current:
+                raise SearchError("搜索账户身份已变更", code="search_account_retired",
+                                  status_code=503, retryable=False)
+        from .channel.xai_oauth_channel import XAIOAuthChannel
+        channel = XAIOAuthChannel(account)
+        channel.state_key = state_key
+        if backend.get("endpoint"):
+            channel.base_url = str(backend["endpoint"]).rstrip("/")
+        upstream = await channel.build_upstream_request(payload, model, ingress_protocol="responses")
+        url, headers, payload = upstream.url, upstream.headers, upstream.body
     else:
         if operation == "extract":
             raise SearchError("Anthropic网页提取尚未验证", code="search_capability_unavailable", retryable=False)
@@ -621,7 +646,9 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
                 raise SearchError("搜索账户身份已变更", code="search_account_retired", status_code=503, retryable=False)
         if kind == "xai":
             terminal = None
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
+            request_kwargs = ({"content": payload} if isinstance(payload, (str, bytes))
+                              else {"json": payload})
+            async with client.stream("POST", url, headers=headers, **request_kwargs) as response:
                 if response.status_code >= 400:
                     await response.aread()
                     if response.status_code == 429 and operation == "x_search":

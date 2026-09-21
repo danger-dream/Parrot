@@ -357,7 +357,7 @@ async def test_x_search_uses_native_tool_and_normalizes_results(setup, monkeypat
         'enable_video_understanding': True, 'from_date': body['tools'][0]['from_date'],
     }]
     assert date.fromisoformat(body['tools'][0]['from_date']).isoformat() == body['tools'][0]['from_date']
-    assert body['tool_choice'] == 'required' and body['max_tool_calls'] == 1
+    assert 'tool_choice' not in body and 'max_tool_calls' not in body
     assert body['input'][0]['content'].startswith('Use X search to find: latest xAI news')
 
 
@@ -377,6 +377,23 @@ def test_x_search_accepts_observed_xai_oauth_custom_tool_call_wire():
     result = search._parse_oauth_result(data, 'xai', _xai_parse_args(), 'x_search', {})
     assert result['answer'] == 'ok'
     assert result['results'] == [{'title': 'X post', 'url': url, 'snippet': 'post text'}]
+
+
+def test_x_search_accepts_current_xai_oauth_custom_tool_call_wire():
+    url = 'https://x.com/thsottiaux'
+    envelope = {'answer': 'ok', 'results': [
+        {'title': 'Tibo', 'url': url, 'snippet': 'Codex & ChatGPT'},
+    ]}
+    data = {'output': [
+        {'type': 'custom_tool_call', 'name': 'x_user_search', 'status': 'completed',
+         'call_id': 'xs_call-a1b2-0', 'input': '{"query":"thsottiaux","count":"3"}'},
+        {'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(envelope),
+                                        'annotations': [{'type': 'url_citation',
+                                                         'url': 'https://x.com/i/user/1953337039510003712'}]}]},
+    ]}
+    result = search._parse_oauth_result(data, 'xai', _xai_parse_args(), 'x_search', {})
+    assert result['answer'] == 'ok'
+    assert result['results'] == [{'title': 'Tibo', 'url': url, 'snippet': 'Codex & ChatGPT'}]
 
 
 def test_x_search_does_not_treat_client_custom_input_as_native_execution():

@@ -18,21 +18,24 @@ X_SEARCH_CALL_NAMES = frozenset({
 def is_x_search_call_item(item: Any) -> bool:
     """Recognize public and observed xAI-internal X Search history items.
 
-    A normal Responses ``custom_tool_call`` is identified by its client-visible
-    ``input``.  xAI's currently observed server-side X operations reuse that item
-    type and one of the private names above, but have no client-executable input.
-    Requiring the complete observed shape avoids stealing an ordinary custom tool
-    merely because its user-selected name happens to match an xAI internal name.
+    xAI's server-side X operations reuse ``custom_tool_call`` and private names.
+    Older responses omitted ``input``; current responses include the executed query
+    and identify the operation with an ``xs_call-`` call id.  Accept both observed
+    shapes without stealing an ordinary client-owned custom tool of the same name.
     """
     if not isinstance(item, dict):
         return False
     if item.get("type") == "x_search_call":
         return True
+    call_id = item.get("call_id")
+    observed_server_shape = "input" not in item or (
+        isinstance(call_id, str) and call_id.startswith("xs_call-")
+    )
     return bool(
         item.get("type") == "custom_tool_call"
         and item.get("name") in X_SEARCH_CALL_NAMES
         and item.get("status") == "completed"
-        and "input" not in item
+        and observed_server_shape
         and not item.get("namespace")
     )
 
