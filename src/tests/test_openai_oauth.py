@@ -308,6 +308,8 @@ def test_accounts_check_current_list_shape_and_cli_headers(m):
                         "plan_type": "team",
                         "name": "Engineering",
                         "structure": "workspace",
+                        "workspace_backend_origin": "https://gov.chatgpt.com",
+                        "account_routing_override": "us_cr",
                     },
                 ],
                 "account_ordering": ["acct-team", "acct-personal"],
@@ -338,6 +340,8 @@ def test_accounts_check_current_list_shape_and_cli_headers(m):
     assert info["workspace_name"] == "Engineering"
     assert info["workspace_type"] == "workspace"
     assert info["plan_type"] == "team"
+    assert info["workspace_backend_origin"] == "https://gov.chatgpt.com"
+    assert info["account_routing_override"] == "us_cr"
     assert info["is_default"] is True
 
 

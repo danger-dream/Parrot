@@ -213,7 +213,8 @@ async def test_openai_wire_omits_empty_domains_and_normalizes_results(setup, mon
     from src.openai.codex_constants import current_codex_protocol_profile
     profile = current_codex_protocol_profile()
     cfg['openaiOAuth'] = {'codexCliVersion': profile.client_version, 'codexProtocolProfile': profile.profile_id}
-    account = {'provider':'openai','email':'test@example.test','workspace_id':'test-workspace','access_token':'private-token'}
+    account = {'provider':'openai','email':'test@example.test','workspace_id':'test-workspace','access_token':'private-token',
+               'workspace_backend_origin':'https://gov.chatgpt.com','account_routing_override':'us'}
     cfg['oauthAccounts'] = [account]
     async def token(*a, **k): return 'private-token'
     monkeypatch.setattr(oauth_manager, 'ensure_valid_token', token)
@@ -225,6 +226,8 @@ async def test_openai_wire_omits_empty_domains_and_normalizes_results(setup, mon
     result = await search.search({'query':'hello','allowed_domains':['example.com'], 'external_web_access': False,
                                   'user_location': location, 'search_context_size': 'high'})
     assert len(calls) == 1 and calls[0].url.path.endswith('/alpha/search')
+    assert calls[0].url.host == 'gov.chatgpt.com'
+    assert calls[0].headers['x-openai-account-routing-override'] == 'us'
     body = json.loads(calls[0].content)
     assert body['settings']['external_web_access'] is False
     assert body['settings']['user_location'] == location

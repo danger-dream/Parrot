@@ -84,6 +84,43 @@ def _payload(channel: OpenAIOAuthChannel, body: dict, model: str) -> tuple[dict,
     return json.loads(request.body), {str(k).lower(): str(v) for k, v in request.headers.items()}
 
 
+def test_workspace_routing_validates_origin_and_override():
+    url = "https://chatgpt.com/backend-api/codex/responses?foo=bar"
+    headers = {"Authorization": "Bearer test"}
+
+    routed_url, routed_headers = codex_constants.apply_codex_workspace_routing(
+        url,
+        headers,
+        {
+            "workspace_backend_origin": "https://gov.chatgpt.com/",
+            "account_routing_override": "us",
+        },
+    )
+    assert routed_url == "https://gov.chatgpt.com/backend-api/codex/responses?foo=bar"
+    assert routed_headers["x-openai-account-routing-override"] == "us"
+    assert headers == {"Authorization": "Bearer test"}
+
+    no_constraint_url, no_constraint_headers = codex_constants.apply_codex_workspace_routing(
+        url,
+        {"x-openai-account-routing-override": "stale"},
+        {
+            "workspace_backend_origin": "https://gov.chatgpt.com",
+            "account_routing_override": "NO_CONSTRAINT",
+        },
+    )
+    assert no_constraint_url.startswith("https://gov.chatgpt.com/")
+    assert "x-openai-account-routing-override" not in no_constraint_headers
+
+    for invalid in (
+        {"workspace_backend_origin": "http://gov.chatgpt.com", "account_routing_override": "us"},
+        {"workspace_backend_origin": "https://gov.chatgpt.com/path", "account_routing_override": "us"},
+        {"workspace_backend_origin": "https://gov.chatgpt.com", "account_routing_override": "unknown"},
+    ):
+        assert codex_constants.apply_codex_workspace_routing(url, headers, invalid) == (
+            url, headers,
+        )
+
+
 def test_profile_artifact_checksum_identity_and_astra_defaults():
     manifest = json.loads(_PROFILE_PATH.read_text(encoding="utf-8"))
     record = manifest["models"]["gpt-6-astra"]

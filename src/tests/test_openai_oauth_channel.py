@@ -108,6 +108,8 @@ def _add_openai_acc(m, email="o@openai.test", **kw):
         "refresh_token": "rt-" + email,
         "id_token": "h.p.s",
         "chatgpt_account_id": kw.get("chatgpt_account_id", "acct-123"),
+        "workspace_backend_origin": kw.get("workspace_backend_origin", ""),
+        "account_routing_override": kw.get("account_routing_override", ""),
         "plan_type": kw.get("plan_type", "plus"),
         "models": models,
     }
@@ -617,6 +619,25 @@ def test_channel_responses_ingress(m):
     assert "session_id" not in h
     assert "x-openai-internal-codex-responses-lite" not in h
     print("  [PASS] channel: responses ingress → full codex request shape")
+
+
+def test_channel_applies_validated_workspace_backend_routing(m):
+    _setup(m)
+    _add_openai_acc(
+        m,
+        workspace_backend_origin="https://gov.chatgpt.com",
+        account_routing_override="us_cr",
+    )
+    ch = m["OpenAIOAuthChannel"](
+        m["oauth_manager"].get_account("openai:o@openai.test:acct-123")
+    )
+    req = asyncio.run(ch.build_upstream_request(
+        {"model": "gpt-5.1", "input": "hi"},
+        "gpt-5.1",
+        ingress_protocol="responses",
+    ))
+    assert req.url == "https://gov.chatgpt.com/backend-api/codex/responses"
+    assert req.headers["x-openai-account-routing-override"] == "us_cr"
 
 
 def test_channel_service_tier_routing_hint_matches_final_http_payload(m):

@@ -78,6 +78,7 @@ from ..openai.codex_constants import (
     CODEX_RESPONSES_LITE_HEADER,
     CODEX_ROUTING_HINT_HEADER,
     CodexModelPolicy,
+    apply_codex_workspace_routing,
     build_codex_routing_hint,
     codex_cli_user_agent,
     codex_cli_version,
@@ -670,8 +671,11 @@ class OpenAIOAuthChannel(Channel):
         if routing_hint:
             headers[CODEX_ROUTING_HINT_HEADER] = routing_hint
 
+        upstream_url, headers = apply_codex_workspace_routing(
+            codex_responses_url(prov_cfg), headers, current_account,
+        )
         return UpstreamRequest(
-            url=codex_responses_url(prov_cfg),
+            url=upstream_url,
             headers=headers,
             body=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             dynamic_tool_map=None,

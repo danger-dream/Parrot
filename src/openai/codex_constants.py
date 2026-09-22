@@ -468,6 +468,64 @@ def codex_responses_websocket_beta(
     return codex_protocol_profile(provider_config).responses_websocket_beta
 
 
+CODEX_ACCOUNT_ROUTING_OVERRIDE_HEADER = "x-openai-account-routing-override"
+_CODEX_WORKSPACE_ROUTING_OVERRIDES = frozenset({"NO_CONSTRAINT", "us", "us_cr"})
+
+
+def codex_workspace_routing(
+    account: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return one validated accounts/check workspace route.
+
+    Current Codex accepts only an HTTPS origin with no path/query/credentials and
+    one of three routing override values.  Incomplete or malformed metadata is
+    ignored so legacy/personal accounts keep the configured default backend.
+    """
+    if not isinstance(account, Mapping):
+        return None
+    origin = str(account.get("workspace_backend_origin") or "").strip()
+    override = str(account.get("account_routing_override") or "").strip()
+    if not origin or override not in _CODEX_WORKSPACE_ROUTING_OVERRIDES:
+        return None
+    parsed = urlsplit(origin)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    normalized_origin = urlunsplit(("https", parsed.netloc, "", "", ""))
+    return normalized_origin, override
+
+
+def apply_codex_workspace_routing(
+    url: str,
+    headers: Mapping[str, Any],
+    account: Mapping[str, Any] | None,
+) -> tuple[str, dict[str, str]]:
+    """Apply a validated workspace origin/header to one model-backend request."""
+    routed_headers = {
+        str(name): str(value) for name, value in headers.items()
+        if str(name).lower() != CODEX_ACCOUNT_ROUTING_OVERRIDE_HEADER
+    }
+    routing = codex_workspace_routing(account)
+    if routing is None:
+        return url, routed_headers
+    origin, override = routing
+    target = urlsplit(url)
+    backend = urlsplit(origin)
+    routed_url = urlunsplit(
+        (backend.scheme, backend.netloc, target.path, target.query, target.fragment)
+    )
+    if override != "NO_CONSTRAINT":
+        routed_headers[CODEX_ACCOUNT_ROUTING_OVERRIDE_HEADER] = override
+    return routed_url, routed_headers
+
+
 def codex_backend_base_url(
     provider_config: Mapping[str, Any] | None = None,
 ) -> str:

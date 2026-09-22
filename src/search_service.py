@@ -538,7 +538,7 @@ def _billing_failure(error: SearchError, backend: dict, data: Any) -> SearchErro
 async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: str, cfg: dict) -> dict:
     from . import oauth_manager
     from .oauth_ids import account_key
-    from .openai.codex_constants import codex_backend_base_url, codex_cli_user_agent, codex_cli_version, codex_originator
+    from .openai.codex_constants import apply_codex_workspace_routing, codex_backend_base_url, codex_cli_user_agent, codex_cli_version, codex_originator
     kind = backend["type"]
     key = account_key(account)
     state_key = oauth_manager.account_state_key(account)
@@ -570,7 +570,7 @@ async def _oauth_adapter(backend: dict, account: dict, args: dict, operation: st
             commands = {"search_query": [query], "response_length": "short"}
         payload = {"id": "parrot-search-" + uuid.uuid4().hex, "model": model, "commands": commands,
                    "settings": search_settings, "max_output_tokens": 2000}
-        url = (str(backend.get("endpoint") or codex_backend_base_url(prov))).rstrip("/") + "/alpha/search"
+        url, headers = apply_codex_workspace_routing((str(backend.get("endpoint") or codex_backend_base_url(prov))).rstrip("/") + "/alpha/search", headers, account)
     elif kind == "xai":
         if operation == "extract":
             raise SearchError("xAI搜索不作为网页正文提取接口", code="search_capability_unavailable", retryable=False)

@@ -16,7 +16,7 @@ from ..async_owned import await_owned
 from ..channel.url_utils import resolve_upstream_url
 from ..xai import imagine
 from . import images_simple as legacy
-from .codex_constants import codex_responses_url
+from .codex_constants import apply_codex_workspace_routing, codex_responses_url
 
 SAFE_REJECTIONS = {401, 403, 404, 429}
 MAX_GENERATIONS = 10
@@ -132,6 +132,7 @@ async def _send(source, parsed, *, action: str, n: int, cfg: dict) -> httpx.Resp
         headers['Accept'] = 'application/json'
         headers['x-codex-image-turn-id'] = str(uuid.uuid4())
         url = codex_responses_url(config.get().get('openaiOAuth') or {}).removesuffix('/responses') + '/images/' + ('generations' if action=='generate' else 'edits')
+        url, headers = apply_codex_workspace_routing(url, headers, account)
         options.pop('input_fidelity', None)  # verified unsupported by gpt-image-2; prompt adapter above
         payload.update(options)
         if parsed.size: payload['size'] = parsed.size

@@ -396,6 +396,8 @@ class OAuthFlowService:
             "workspace_name": token.get("workspace_name") or info.get("workspace_name", ""),
             "workspace_type": token.get("workspace_type") or info.get("workspace_type", ""),
             "organization_id": token.get("organization_id") or info.get("organization_id", ""),
+            "workspace_backend_origin": token.get("workspace_backend_origin", ""),
+            "account_routing_override": token.get("account_routing_override", ""),
             "plan_type": token.get("plan_type") or info.get("plan_type", ""),
             "subscription_expires_at": token.get("subscription_expires_at", ""),
         }

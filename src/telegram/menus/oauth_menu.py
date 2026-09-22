@@ -5835,6 +5835,8 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         "workspace_name": tok.get("workspace_name") or info.get("workspace_name", ""),
         "workspace_type": tok.get("workspace_type") or info.get("workspace_type", ""),
         "organization_id": tok.get("organization_id") or info.get("organization_id", ""),
+        "workspace_backend_origin": tok.get("workspace_backend_origin", ""),
+        "account_routing_override": tok.get("account_routing_override", ""),
         "plan_type": tok.get("plan_type") or info.get("plan_type", ""),
         "subscription_expires_at": tok.get("subscription_expires_at", ""),
     }

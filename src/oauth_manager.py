@@ -908,7 +908,8 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 new_fields["subscription_expires_at"] = data["subscription_expires_at"]
             for k in (
                 "workspace_id", "workspace_name", "workspace_type",
-                "organization_id",
+                "organization_id", "workspace_backend_origin",
+                "account_routing_override",
             ):
                 if not data.get(k):
                     continue
@@ -3240,6 +3241,8 @@ def _openai_metadata_patch(entry: dict) -> dict:
         "workspace_name": entry.get("workspace_name", "") or "",
         "workspace_type": entry.get("workspace_type", "") or "",
         "organization_id": entry.get("organization_id", "") or "",
+        "workspace_backend_origin": entry.get("workspace_backend_origin", "") or "",
+        "account_routing_override": entry.get("account_routing_override", "") or "",
         "plan_type": entry.get("plan_type", "") or "",
         "subscription_expires_at": entry.get("subscription_expires_at", "") or "",
     }
@@ -4671,7 +4674,10 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
 
 def _openai_metadata_new_fields(acc: dict, info: dict) -> dict:
     fields: dict[str, str] = {}
-    for k in ("plan_type", "subscription_expires_at", "workspace_type", "organization_id"):
+    for k in (
+        "plan_type", "subscription_expires_at", "workspace_type", "organization_id",
+        "workspace_backend_origin", "account_routing_override",
+    ):
         v = info.get(k)
         if v not in (None, ""):
             fields[k] = str(v)

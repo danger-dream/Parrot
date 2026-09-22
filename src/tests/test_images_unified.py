@@ -557,6 +557,8 @@ async def test_send_codex_exact_endpoint_and_prompt(setup,monkeypatch):
     from importlib import reload
     real_send=reload(runtime)._send
     source=next(s for s in image_catalog.sources() if s.provider=='openai')
+    setup[0]['oauthAccounts'][0].update(
+        workspace_backend_origin='https://gov.chatgpt.com', account_routing_override='us_cr')
     monkeypatch.setattr(oauth_manager,'get_account',lambda key:setup[0]['oauthAccounts'][0])
     async def token(*a, expected_state_key=None):
         assert expected_state_key == source.state_key
@@ -571,6 +573,8 @@ async def test_send_codex_exact_endpoint_and_prompt(setup,monkeypatch):
     parsed=compat._ParsedRequest(model='gpt-image-2',prompt='boat',size='48x32',native_options={'background':'transparent'})
     response=await real_send(source,parsed,action='generate',n=1,cfg={})
     assert response.status_code==200 and str(seen[0].url).endswith('/codex/images/generations')
+    assert seen[0].url.host == 'gov.chatgpt.com'
+    assert seen[0].headers['x-openai-account-routing-override'] == 'us_cr'
     body=json.loads(seen[0].content); assert body['model']=='gpt-image-2' and body['n']==1
     assert 'alpha=0' in body['prompt'] and '48 by 32' in body['prompt']
     assert 'tools' not in body
