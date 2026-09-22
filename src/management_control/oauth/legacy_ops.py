@@ -119,6 +119,9 @@ class OAuthLegacyOperationsControlMixin:
     def openai_build_login_url(self, *args, **kwargs):
         return self.backend.openai_build_login_url(*args, **kwargs)
 
+    def openai_validate_callback_url(self, *args, **kwargs):
+        return self.backend.openai_validate_callback_url(*args, **kwargs)
+
     def openai_exchange_code(self, *args, **kwargs):
         return self.backend.openai_exchange_code(*args, **kwargs)
 

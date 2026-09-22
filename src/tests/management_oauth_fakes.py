@@ -529,6 +529,10 @@ class InMemoryOAuthBackend(OAuthBackend):
     def openai_build_login_url(self, challenge, state):
         return "https://openai.example.test/authorize?" + urlencode({"state": state})
 
+    def openai_validate_callback_url(self, value):
+        parsed = urlparse(value)
+        return parsed.scheme == "http" and parsed.netloc == "localhost:1455" and parsed.path == "/auth/callback"
+
     def openai_exchange_code(self, code, verifier):
         self.provider_exchange_count += 1
         return {"access_token": "flow-access-secret", "refresh_token": "flow-refresh-secret", "id_token": "flow-id-token", "expires_in": 3600}

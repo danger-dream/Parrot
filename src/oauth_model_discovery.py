@@ -16,6 +16,7 @@ from .oauth import cursor as cursor_provider
 from .oauth import xai as xai_provider
 from .oauth_ids import openai_workspace_id
 from .openai.codex_constants import (
+    codex_cli_user_agent,
     codex_models_url,
     codex_protocol_profile,
 )
@@ -169,7 +170,7 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     headers = {
         "authorization": f"Bearer {token}",
         "accept": "application/json",
-        "user-agent": profile.user_agent,
+        "user-agent": codex_cli_user_agent(provider_cfg),
         "originator": profile.originator,
         "version": client_version,
     }

@@ -29,7 +29,7 @@ import os
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from .. import network
 from ._jwt_payload import decode_jwt_payload as _decode_jwt_payload
@@ -40,6 +40,7 @@ from ._jwt_payload import decode_jwt_payload as _decode_jwt_payload
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
+REVOKE_URL = "https://auth.openai.com/oauth/revoke"
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 
 SCOPES_AUTHORIZE = (
@@ -55,9 +56,11 @@ from ..openai.codex_constants import codex_cli_user_agent, codex_originator
 
 # 运行期请求超时（换 token / 刷 token）。
 _TOKEN_HTTP_TIMEOUT = 120.0
+_REVOKE_HTTP_TIMEOUT = 10.0
 
-# ChatGPT backend-api accounts/check：用于在 token 刷新后补全最新 plan / 订阅过期时间。
-ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+# Current Codex ChatGPT backend route.  The older dated
+# ``accounts/check/v4-2023-04-27`` shape remains accepted by the normalizer below.
+ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/wham/accounts/check"
 _ACCOUNTS_CHECK_TIMEOUT = 15.0
 
 # ChatGPT/Codex 私有用量端点。它不是 OpenAI public API；只用于主动 quota
@@ -149,6 +152,23 @@ def pkce_generate() -> tuple[str, str]:
     return verifier, challenge
 
 
+def validate_callback_url(value: str, *, redirect_uri: str | None = None) -> bool:
+    """Accept only the exact loopback redirect issued for this PKCE flow."""
+    try:
+        actual = urlsplit(str(value or "").strip())
+        expected = urlsplit(redirect_uri or REDIRECT_URI)
+        return bool(
+            actual.scheme == expected.scheme
+            and actual.hostname == expected.hostname
+            and actual.port == expected.port
+            and actual.path == expected.path
+            and not actual.username
+            and not actual.password
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def build_login_url(code_challenge: str, state: str,
                     *, redirect_uri: str | None = None) -> str:
     params = {
@@ -228,6 +248,9 @@ def _extract_org_id_from_token(token: str | None) -> str:
 
 
 def _extract_plan_type(account: dict) -> str:
+    plan = account.get("plan_type") or account.get("subscription_plan")
+    if isinstance(plan, str) and plan:
+        return plan
     acct = account.get("account")
     if isinstance(acct, dict):
         plan = acct.get("plan_type") or acct.get("subscription_plan")
@@ -251,7 +274,7 @@ def _extract_subscription_expires_at(account: dict) -> str:
 
 
 def _extract_account_workspace_id(account: dict, *, account_id: str = "") -> str:
-    for key in ("workspace_id", "chatgpt_account_id", "account_id"):
+    for key in ("workspace_id", "chatgpt_account_id", "account_id", "id"):
         value = account.get(key)
         if isinstance(value, str) and value:
             return value
@@ -291,7 +314,7 @@ def _infer_workspace_type(*, plan_type: str = "", account: dict | None = None,
     for obj in (account, account.get("account") if isinstance(account, dict) else None, org):
         if not isinstance(obj, dict):
             continue
-        for key in ("workspace_type", "account_type", "type", "plan_category"):
+        for key in ("workspace_type", "account_type", "type", "plan_category", "structure"):
             value = obj.get(key)
             if isinstance(value, str) and value:
                 return value
@@ -354,7 +377,8 @@ def _candidate_matches(info: dict, *, workspace_id: str = "", org_id: str = "") 
     return False
 
 
-def _fetch_accounts_check_payload_sync(access_token: str, *, proxy_channel: str = "") -> dict | None:
+def _fetch_accounts_check_payload_sync(access_token: str, *, workspace_id: str = "",
+                                       proxy_channel: str = "") -> dict | None:
     if not access_token or _mock_mode_enabled():
         return None
     try:
@@ -362,10 +386,9 @@ def _fetch_accounts_check_payload_sync(access_token: str, *, proxy_channel: str 
             ACCOUNTS_CHECK_URL,
             headers={
                 "authorization": f"Bearer {access_token}",
-                "origin": "https://chatgpt.com",
-                "referer": "https://chatgpt.com/",
                 "accept": "application/json",
                 "user-agent": codex_cli_user_agent(),
+                **({"ChatGPT-Account-ID": workspace_id} if workspace_id else {}),
             },
             timeout=_ACCOUNTS_CHECK_TIMEOUT,
             proxy_purpose="oauth_openai",
@@ -383,16 +406,35 @@ def _accounts_check_candidates(payload: dict, *, email: str | None = None) -> li
     仅供选择“当前 token 对应 workspace”的补全信息使用；不会在保存层全量展开。
     """
     accounts = payload.get("accounts") if isinstance(payload, dict) else None
-    if not isinstance(accounts, dict):
+    if not isinstance(accounts, (dict, list)):
         return []
 
     wanted_email = str(email or "").strip().lower()
+    default_account_id = str(payload.get("default_account_id") or "")
+    ordering = payload.get("account_ordering")
+    ordering_index = {
+        str(value): index for index, value in enumerate(ordering)
+    } if isinstance(ordering, list) else {}
+    if isinstance(accounts, dict):
+        account_items = list(accounts.items())
+        if ordering_index:
+            account_items.sort(
+                key=lambda item: ordering_index.get(str(item[0]), len(ordering_index))
+            )
+    else:
+        account_items = [
+            (str(raw.get("id") or raw.get("account_id") or ""), raw)
+            for raw in accounts if isinstance(raw, dict)
+        ]
+
     out: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
-    for raw_id, raw in accounts.items():
+    for raw_id, raw in account_items:
         if not isinstance(raw, dict):
             continue
         info = _account_check_candidate(raw, account_id=str(raw_id or ""))
+        if default_account_id and str(info.get("workspace_id") or "") == default_account_id:
+            info["is_default"] = True
         cand_email = str(info.get("email") or "").strip().lower()
         if wanted_email and cand_email and cand_email != wanted_email:
             continue
@@ -458,7 +500,9 @@ def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
     """
     org_id = str(org_id or _extract_org_id_from_token(access_token) or "")
     workspace_id = str(workspace_id or "")
-    payload = _fetch_accounts_check_payload_sync(access_token, proxy_channel=proxy_channel)
+    payload = _fetch_accounts_check_payload_sync(
+        access_token, workspace_id=workspace_id, proxy_channel=proxy_channel,
+    )
     if not payload:
         return None
     candidates = _accounts_check_candidates(payload, email=email)
@@ -561,15 +605,59 @@ async def refresh(refresh_token: str, *, email: str | None = None,
     )
 
 
+def revoke_sync(*, refresh_token: str = "", access_token: str = "",
+                account_key: str = "") -> bool:
+    """Best-effort-compatible Codex logout revocation.
+
+    Prefer the refresh token, falling back to the access token.  Callers own
+    local credential deletion and must continue it when this request fails.
+    """
+    token = str(refresh_token or access_token or "")
+    if not token or _mock_mode_enabled():
+        return False
+    token_kind = "refresh_token" if refresh_token else "access_token"
+    body = {"token": token, "token_type_hint": token_kind}
+    if token_kind == "refresh_token":
+        body["client_id"] = CLIENT_ID
+    resp = network.post_sync(
+        REVOKE_URL,
+        json=body,
+        headers={
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": codex_cli_user_agent(),
+            "originator": codex_originator(),
+        },
+        timeout=_REVOKE_HTTP_TIMEOUT,
+        proxy_purpose="oauth_openai",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
+    )
+    resp.raise_for_status()
+    return True
+
+
+async def revoke(*, refresh_token: str = "", access_token: str = "",
+                 account_key: str = "") -> bool:
+    return await asyncio.to_thread(
+        revoke_sync, refresh_token=refresh_token, access_token=access_token,
+        account_key=account_key,
+    )
+
+
 # ─── ChatGPT/Codex quota: wham/usage ─────────────────────────────
 
 def _coerce_float(v: Any) -> float | None:
     try:
         if v is None:
             return None
-        return float(v)
+        parsed = float(v)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _clamp_percent(value: float | None) -> float | None:
+    return None if value is None else max(0.0, min(100.0, value))
 
 
 def _coerce_int(v: Any) -> int | None:
@@ -595,7 +683,7 @@ def _iso_from_epoch_or_after(*, reset_at: Any = None,
 def _wham_window_block(win: dict | None) -> dict:
     if not isinstance(win, dict):
         return {}
-    util = _coerce_float(win.get("used_percent"))
+    util = _clamp_percent(_coerce_float(win.get("used_percent")))
     if util is None:
         return {}
     return {
@@ -606,6 +694,35 @@ def _wham_window_block(win: dict | None) -> dict:
         ),
         "limit_window_seconds": _coerce_int(win.get("limit_window_seconds")),
     }
+
+
+def _wham_snapshot_window(win: Any) -> dict | None:
+    """Map a WHAM window to the same snapshot shape used by headers/WS events."""
+    if not isinstance(win, dict):
+        return None
+    used = _clamp_percent(_coerce_float(win.get("used_percent")))
+    seconds = _coerce_int(win.get("limit_window_seconds"))
+    reset_at = _coerce_int(win.get("reset_at"))
+    reset_after = _coerce_int(win.get("reset_after_seconds"))
+    if reset_at is None and reset_after is not None:
+        reset_at = int(time.time()) + max(0, reset_after)
+    if reset_after is None and reset_at is not None:
+        reset_after = max(0, reset_at - int(time.time()))
+    if used is None and seconds is None and reset_at is None:
+        return None
+    return {
+        "used_percent": used,
+        "window_minutes": int(seconds / 60) if seconds is not None else None,
+        "reset_at": reset_at,
+        "reset_after_seconds": reset_after,
+    }
+
+
+def _rate_limit_reached_kind(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("type")
+    text = str(value or "").strip()
+    return text or None
 
 
 def _wham_window_looks_monthly(win: dict) -> bool:
@@ -721,6 +838,33 @@ def normalize_wham_usage(payload: dict) -> dict:
         if reset_credit_count is not None else None
     )
 
+    rate_limits = [{
+        "limit_id": "codex",
+        "limit_name": None,
+        "primary": _wham_snapshot_window(rate.get("primary_window")),
+        "secondary": _wham_snapshot_window(rate.get("secondary_window")),
+        "normal_model_slug": None,
+    }]
+    additional = payload.get("additional_rate_limits") if isinstance(payload, dict) else None
+    if isinstance(additional, list):
+        for item in additional:
+            if not isinstance(item, dict):
+                continue
+            details = item.get("rate_limit")
+            if not isinstance(details, dict):
+                details = {}
+            limit_id = str(item.get("metered_feature") or item.get("limit_id") or "").strip()
+            limit_name = str(item.get("limit_name") or "").strip()
+            if not (limit_id or limit_name):
+                continue
+            rate_limits.append({
+                "limit_id": (limit_id or limit_name).lower().replace("-", "_"),
+                "limit_name": limit_name or None,
+                "primary": _wham_snapshot_window(details.get("primary_window")),
+                "secondary": _wham_snapshot_window(details.get("secondary_window")),
+                "normal_model_slug": str(item.get("normal_model_slug") or "") or None,
+            })
+
     return {
         "five_hour": five_hour,
         "seven_day": seven_day,
@@ -740,7 +884,16 @@ def normalize_wham_usage(payload: dict) -> dict:
             "plan_type": payload.get("plan_type") if isinstance(payload, dict) else None,
             "allowed": rate.get("allowed"),
             "limit_reached": rate.get("limit_reached"),
-            "rate_limit_reached_type": payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None,
+            "rate_limit_reached_type": _rate_limit_reached_kind(
+                payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None
+            ),
+            "credits": {
+                "has_credits": bool(credits.get("has_credits")),
+                "unlimited": bool(credits.get("unlimited")),
+                "balance": credits.get("balance"),
+            },
+            "rate_limits": rate_limits,
+            "additional_rate_limits": rate_limits[1:],
             "thirty_day": thirty_day,
             "rate_limit_reset_credits": reset_credit_summary,
         },
@@ -813,8 +966,8 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None,
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
         "user-agent": codex_cli_user_agent(),
-        "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/codex/settings/usage",
+        # Opt in because Parrot exposes and can consume official reset credits.
+        "x-openai-codex-luna-reserve": "1",
     }
     # Codex 官方 BackendClient 会把 ChatGPT account/workspace id 一并带到
     # usage 请求里。单工作区账号通常只靠 Bearer 也能成功，但多工作区账号
@@ -877,13 +1030,18 @@ def normalize_rate_limit_reset_credits(payload: dict) -> dict:
         for item in credits:
             if not isinstance(item, dict):
                 continue
-            data.append({
+            normalized = {
                 "id": str(item.get("id") or ""),
                 "reset_type": str(item.get("reset_type") or ""),
                 "status": str(item.get("status") or ""),
                 "granted_at": _normalize_reset_credit_timestamp(item.get("granted_at")),
                 "expires_at": _normalize_reset_credit_timestamp(item.get("expires_at")),
-            })
+            }
+            for key in ("title", "description"):
+                text = str(item.get(key) or "").strip()
+                if text:
+                    normalized[key] = text
+            data.append(normalized)
 
     available_count = _coerce_int(payload.get("available_count"))
     if available_count is None:
@@ -913,8 +1071,6 @@ def fetch_rate_limit_reset_credits_sync(access_token: str, *,
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
         "user-agent": codex_cli_user_agent(),
-        "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/codex/settings/usage",
     }
     if account_id:
         headers["ChatGPT-Account-ID"] = account_id
@@ -949,7 +1105,9 @@ _RESET_CREDIT_OUTCOME_MAP = {
 
 def consume_rate_limit_reset_credit_sync(access_token: str, *,
                                          idempotency_key: str,
-                                         account_id: str | None = None) -> dict:
+                                         account_id: str | None = None,
+                                         credit_id: str | None = None,
+                                         account_key: str = "") -> dict:
     """Consume one official OpenAI/Codex banked rate-limit reset credit.
 
     This is the upstream reset-credit path added by openai/codex:
@@ -965,6 +1123,7 @@ def consume_rate_limit_reset_credit_sync(access_token: str, *,
             "code": "reset",
             "windows_reset": 1,
             "idempotency_key": idempotency_key,
+            **({"credit_id": str(credit_id)} if credit_id else {}),
         }
 
     headers = {
@@ -972,18 +1131,21 @@ def consume_rate_limit_reset_credit_sync(access_token: str, *,
         "accept": "application/json",
         "content-type": "application/json",
         "user-agent": codex_cli_user_agent(),
-        "origin": "https://chatgpt.com",
-        "referer": "https://chatgpt.com/codex/settings/usage",
     }
     if account_id:
         headers["ChatGPT-Account-ID"] = account_id
 
+    body = {"redeem_request_id": idempotency_key}
+    selected_credit_id = str(credit_id or "").strip()
+    if selected_credit_id:
+        body["credit_id"] = selected_credit_id
     resp = network.post_sync(
         WHAM_RESET_CREDIT_CONSUME_URL,
         headers=headers,
-        json={"redeem_request_id": idempotency_key},
+        json=body,
         timeout=_WHAM_RESET_CREDIT_TIMEOUT,
         proxy_purpose="oauth_openai",
+        proxy_channel=f"oauth:{account_key}" if account_key else "",
     )
     resp.raise_for_status()
     data = resp.json()
@@ -1000,10 +1162,13 @@ def consume_rate_limit_reset_credit_sync(access_token: str, *,
 
 async def consume_rate_limit_reset_credit(access_token: str, *,
                                           idempotency_key: str,
-                                          account_id: str | None = None) -> dict:
+                                          account_id: str | None = None,
+                                          credit_id: str | None = None,
+                                          account_key: str = "") -> dict:
     return await asyncio.to_thread(
         consume_rate_limit_reset_credit_sync, access_token,
         idempotency_key=idempotency_key, account_id=account_id,
+        credit_id=credit_id, account_key=account_key,
     )
 
 
@@ -1085,9 +1250,10 @@ def _parse_float(headers: dict, key: str) -> float | None:
     if v is None:
         return None
     try:
-        return float(v)
+        parsed = float(v)
     except (TypeError, ValueError):
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _parse_int(headers: dict, key: str) -> int | None:
@@ -1100,38 +1266,194 @@ def _parse_int(headers: dict, key: str) -> int | None:
         return None
 
 
-def parse_rate_limit_headers(headers: Any) -> dict | None:
-    """从 `chatgpt.com/backend-api/codex/responses` 的响应头抽 codex 用量。
+def _parse_bool(headers: dict, key: str) -> bool | None:
+    value = headers.get(key)
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "1"}:
+        return True
+    if text in {"false", "0"}:
+        return False
+    return None
 
-    接受 dict 或 httpx.Headers（用 dict(headers) 扁平化）。无任何字段时
-    返回 None；有任何一个字段就返回完整 snapshot dict，字段含义：
-      primary_used_pct / primary_reset_sec / primary_window_min
-      secondary_used_pct / secondary_reset_sec / secondary_window_min
-      primary_over_secondary_pct
-    这些原样落库到 oauth_quota_cache，同时调 Normalize 映射到 5h/7d/30d。
-    """
-    if headers is None:
-        return None
-    # 统一成小写 key 的普通 dict，避免大小写/类型混乱。
-    if hasattr(headers, "items"):
-        flat = {str(k).lower(): v for k, v in headers.items()}
-    else:
-        return None
 
-    snap = {
-        "primary_used_pct":          _parse_float(flat, "x-codex-primary-used-percent"),
-        "primary_reset_sec":         _parse_int(flat,   "x-codex-primary-reset-after-seconds"),
-        "primary_window_min":        _parse_int(flat,   "x-codex-primary-window-minutes"),
-        "secondary_used_pct":        _parse_float(flat, "x-codex-secondary-used-percent"),
-        "secondary_reset_sec":       _parse_int(flat,   "x-codex-secondary-reset-after-seconds"),
-        "secondary_window_min":      _parse_int(flat,   "x-codex-secondary-window-minutes"),
-        "primary_over_secondary_pct": _parse_float(
-            flat, "x-codex-primary-over-secondary-limit-percent"
-        ),
+def _normalize_limit_id(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _header_rate_limit_window(flat: dict, prefix: str, name: str,
+                              now_seconds: int) -> dict | None:
+    used = _clamp_percent(_parse_float(flat, f"{prefix}-{name}-used-percent"))
+    minutes = _parse_int(flat, f"{prefix}-{name}-window-minutes")
+    reset_at = _parse_int(flat, f"{prefix}-{name}-reset-at")
+    legacy_after = _parse_int(flat, f"{prefix}-{name}-reset-after-seconds")
+    if used is None and minutes is None and reset_at is None and legacy_after is None:
+        return None
+    reset_after = (
+        max(0, reset_at - now_seconds) if reset_at is not None else legacy_after
+    )
+    return {
+        "used_percent": used,
+        "window_minutes": minutes,
+        "reset_at": reset_at,
+        "reset_after_seconds": reset_after,
     }
-    if all(v is None for v in snap.values()):
+
+
+def _header_rate_limit_family(flat: dict, limit_name: str,
+                              now_seconds: int) -> dict | None:
+    normalized_header_name = str(limit_name or "codex").strip().lower().replace("_", "-")
+    prefix = f"x-{normalized_header_name}"
+    primary = _header_rate_limit_window(flat, prefix, "primary", now_seconds)
+    secondary = _header_rate_limit_window(flat, prefix, "secondary", now_seconds)
+    parsed_name = str(flat.get(f"{prefix}-limit-name") or "").strip() or None
+    if primary is None and secondary is None and parsed_name is None:
         return None
-    snap["fetched_at"] = int(time.time() * 1000)
+    return {
+        "limit_id": _normalize_limit_id(normalized_header_name),
+        "limit_name": parsed_name,
+        "primary": primary,
+        "secondary": secondary,
+    }
+
+
+def _apply_default_family_fields(snap: dict, family: dict) -> None:
+    for name in ("primary", "secondary"):
+        window = family.get(name) if isinstance(family, dict) else None
+        snap[f"{name}_used_pct"] = window.get("used_percent") if window else None
+        snap[f"{name}_reset_sec"] = window.get("reset_after_seconds") if window else None
+        snap[f"{name}_reset_at"] = window.get("reset_at") if window else None
+        snap[f"{name}_window_min"] = window.get("window_minutes") if window else None
+
+
+def parse_rate_limit_headers(headers: Any) -> dict | None:
+    """Normalize current and legacy Codex response-header quota protocols.
+
+    The legacy top-level fields remain for existing persistence/disable logic.
+    ``rate_limits`` additionally retains all dynamic families (for example
+    ``x-gpt-reserve-*``), absolute reset timestamps, credits and reached type.
+    """
+    if headers is None or not hasattr(headers, "items"):
+        return None
+    flat = {str(k).lower(): v for k, v in headers.items()}
+    now_seconds = int(time.time())
+
+    family_names = {"codex"}
+    for header_name in flat:
+        for suffix in ("-primary-used-percent", "-secondary-used-percent"):
+            if header_name.startswith("x-") and header_name.endswith(suffix):
+                family = header_name[2:-len(suffix)]
+                if family:
+                    family_names.add(family)
+
+    families: list[dict] = []
+    for family_name in sorted(family_names, key=lambda value: (value != "codex", value)):
+        family = _header_rate_limit_family(flat, family_name, now_seconds)
+        if family is not None:
+            families.append(family)
+
+    has_credits = _parse_bool(flat, "x-codex-credits-has-credits")
+    unlimited = _parse_bool(flat, "x-codex-credits-unlimited")
+    balance_value = flat.get("x-codex-credits-balance")
+    balance = str(balance_value).strip() if balance_value is not None else None
+    if balance == "":
+        balance = None
+    credits = None
+    if has_credits is not None or unlimited is not None or balance is not None:
+        credits = {
+            "has_credits": has_credits,
+            "unlimited": unlimited,
+            "balance": balance,
+        }
+
+    reached = str(flat.get("x-codex-rate-limit-reached-type") or "").strip() or None
+    primary_over_secondary = _parse_float(
+        flat, "x-codex-primary-over-secondary-limit-percent"
+    )
+    if not families and credits is None and reached is None and primary_over_secondary is None:
+        return None
+
+    snap: dict[str, Any] = {
+        "primary_over_secondary_pct": primary_over_secondary,
+        "credits": credits,
+        "rate_limit_reached_type": reached,
+        "rate_limits": families,
+        "additional_rate_limits": [
+            family for family in families if family.get("limit_id") != "codex"
+        ],
+        "fetched_at": int(time.time() * 1000),
+    }
+    default = next(
+        (family for family in families if family.get("limit_id") == "codex"), None
+    )
+    if default is not None:
+        _apply_default_family_fields(snap, default)
+    else:
+        _apply_default_family_fields(snap, {})
+    return snap
+
+
+def parse_rate_limit_event(event: Any) -> dict | None:
+    """Normalize a current nested ``codex.rate_limits`` WebSocket event."""
+    if not isinstance(event, dict) or event.get("type") != "codex.rate_limits":
+        return None
+    details = event.get("rate_limits")
+    if not isinstance(details, dict):
+        details = {}
+
+    def event_window(value: Any) -> dict | None:
+        if not isinstance(value, dict):
+            return None
+        used = _clamp_percent(_coerce_float(value.get("used_percent")))
+        minutes = _coerce_int(value.get("window_minutes"))
+        reset_at = _coerce_int(value.get("reset_at"))
+        if used is None and minutes is None and reset_at is None:
+            return None
+        return {
+            "used_percent": used,
+            "window_minutes": minutes,
+            "reset_at": reset_at,
+            "reset_after_seconds": (
+                max(0, reset_at - int(time.time())) if reset_at is not None else None
+            ),
+        }
+
+    limit_id = _normalize_limit_id(
+        event.get("metered_limit_name") or event.get("limit_name") or "codex"
+    ) or "codex"
+    family = {
+        "limit_id": limit_id,
+        "limit_name": None,
+        "primary": event_window(details.get("primary")),
+        "secondary": event_window(details.get("secondary")),
+    }
+    raw_credits = event.get("credits")
+    credits = None
+    if isinstance(raw_credits, dict):
+        credits = {
+            "has_credits": raw_credits.get("has_credits")
+            if isinstance(raw_credits.get("has_credits"), bool) else None,
+            "unlimited": raw_credits.get("unlimited")
+            if isinstance(raw_credits.get("unlimited"), bool) else None,
+            "balance": str(raw_credits.get("balance")).strip()
+            if raw_credits.get("balance") not in (None, "") else None,
+        }
+    if family["primary"] is None and family["secondary"] is None and credits is None:
+        # Older Parrot-compatible events used flat *_used_pct keys. Let the
+        # caller's legacy adapter handle those rather than recording an empty
+        # current-protocol snapshot.
+        return None
+    snap: dict[str, Any] = {
+        "primary_over_secondary_pct": None,
+        "credits": credits,
+        "rate_limit_reached_type": None,
+        "plan_type": event.get("plan_type"),
+        "rate_limits": [family],
+        "additional_rate_limits": [family] if limit_id != "codex" else [],
+        "fetched_at": int(time.time() * 1000),
+    }
+    _apply_default_family_fields(snap, family if limit_id == "codex" else {})
     return snap
 
 

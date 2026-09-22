@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -432,7 +434,28 @@ def codex_cli_version(provider_config: Mapping[str, Any] | None = None) -> str:
 
 
 def codex_cli_user_agent(provider_config: Mapping[str, Any] | None = None) -> str:
-    return codex_protocol_profile(provider_config).user_agent
+    """Build the Codex identity from the selected build and actual host platform.
+
+    Current Codex computes this value at runtime instead of replaying one captured
+    developer-machine UA.  Keep the audited profile's version/originator while
+    describing the Parrot host and its terminal token dynamically.
+    """
+    profile = codex_protocol_profile(provider_config)
+    system = platform.system().strip() or "Unknown"
+    release = platform.release().strip() or "unknown"
+    architecture = platform.machine().strip() or "unknown"
+    terminal = str(os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or "unknown").strip()
+    terminal_version = str(os.environ.get("TERM_PROGRAM_VERSION") or "").strip()
+    if terminal_version and terminal not in {"", "unknown"}:
+        terminal = f"{terminal}/{terminal_version}"
+    raw = (
+        f"{profile.originator}/{profile.client_version} "
+        f"({system} {release}; {architecture}) {terminal}"
+    )
+    # Match Codex's header sanitation: keep printable ASCII and replace other
+    # characters rather than letting a platform/env quirk break every request.
+    sanitized = "".join(ch if " " <= ch <= "~" else "_" for ch in raw)
+    return sanitized if sanitized.strip() else profile.user_agent
 
 
 def codex_originator(provider_config: Mapping[str, Any] | None = None) -> str:

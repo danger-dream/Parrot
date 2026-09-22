@@ -270,6 +270,248 @@ def test_accounts_check_selects_current_workspace_by_identity(m):
     print("  [PASS] accounts/check: selects current workspace by identity")
 
 
+def test_callback_url_validation_matches_issued_redirect(m):
+    p = m["openai_provider"]
+    assert p.validate_callback_url(
+        "http://localhost:1455/auth/callback?code=abc&state=state"
+    )
+    assert not p.validate_callback_url(
+        "https://localhost:1455/auth/callback?code=abc&state=state"
+    )
+    assert not p.validate_callback_url(
+        "http://127.0.0.1:1455/auth/callback?code=abc&state=state"
+    )
+    assert not p.validate_callback_url(
+        "http://localhost:1455/other?code=abc&state=state"
+    )
+
+
+def test_accounts_check_current_list_shape_and_cli_headers(m):
+    p = m["openai_provider"]
+    captured = {}
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "accounts": [
+                    {
+                        "id": "acct-personal",
+                        "plan_type": "plus",
+                        "name": "Personal",
+                        "structure": "personal",
+                    },
+                    {
+                        "id": "acct-team",
+                        "plan_type": "team",
+                        "name": "Engineering",
+                        "structure": "workspace",
+                    },
+                ],
+                "account_ordering": ["acct-team", "acct-personal"],
+                "default_account_id": "acct-team",
+            }
+
+    original_get = p.network.get_sync
+    old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)
+    try:
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+
+        def fake_get(url, *, headers=None, **kwargs):
+            captured.update(url=url, headers=dict(headers or {}), kwargs=kwargs)
+            return Resp()
+
+        p.network.get_sync = fake_get
+        info = p.fetch_accounts_check_sync("at", workspace_id="acct-team")
+    finally:
+        p.network.get_sync = original_get
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+        if old_disable_env is not None:
+            _ap_os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = old_disable_env
+
+    assert captured["url"].endswith("/backend-api/wham/accounts/check")
+    assert captured["headers"]["ChatGPT-Account-ID"] == "acct-team"
+    assert "origin" not in captured["headers"] and "referer" not in captured["headers"]
+    assert info["workspace_id"] == "acct-team"
+    assert info["workspace_name"] == "Engineering"
+    assert info["workspace_type"] == "workspace"
+    assert info["plan_type"] == "team"
+    assert info["is_default"] is True
+
+
+def test_current_rate_limit_headers_dynamic_families_and_persistence(m):
+    _setup(m)
+    p = m["openai_provider"]
+    now = int(__import__("time").time())
+    snap = p.parse_rate_limit_headers({
+        "X-Codex-Primary-Used-Percent": "105.5",
+        "X-Codex-Primary-Window-Minutes": "300",
+        "X-Codex-Primary-Reset-At": str(now + 120),
+        "X-Codex-Secondary-Used-Percent": "40",
+        "X-Codex-Secondary-Window-Minutes": "10080",
+        "X-Codex-Secondary-Reset-After-Seconds": "600",
+        "X-Codex-Credits-Has-Credits": "true",
+        "X-Codex-Credits-Unlimited": "0",
+        "X-Codex-Credits-Balance": "12.50",
+        "X-Codex-Rate-Limit-Reached-Type": "workspace_member_credits_depleted",
+        "X-Gpt-Reserve-Limit-Name": "GPT reserve",
+        "X-Gpt-Reserve-Primary-Used-Percent": "7.5",
+        "X-Gpt-Reserve-Primary-Window-Minutes": "60",
+        "X-Gpt-Reserve-Primary-Reset-At": str(now + 30),
+    })
+    assert snap["primary_used_pct"] == 100.0
+    assert 0 <= snap["primary_reset_sec"] <= 120
+    assert snap["primary_reset_at"] == now + 120
+    assert snap["secondary_reset_sec"] == 600
+    assert snap["credits"] == {
+        "has_credits": True, "unlimited": False, "balance": "12.50",
+    }
+    assert snap["rate_limit_reached_type"] == "workspace_member_credits_depleted"
+    assert snap["additional_rate_limits"][0]["limit_id"] == "gpt_reserve"
+    assert snap["additional_rate_limits"][0]["primary"]["used_percent"] == 7.5
+
+    account_key = "openai:current-headers@example.test:acct-current"
+    m["state_db"].quota_save_openai_snapshot(account_key, snap)
+    row = m["state_db"].quota_load(account_key)
+    assert row["codex_primary_reset_at"] == now + 120
+    assert row["codex_credits_has_credits"] is True
+    assert row["codex_credits_unlimited"] is False
+    usage = m["oauth_manager"].usage_from_quota_row(row)
+    assert usage["openai"]["credits"]["balance"] == "12.50"
+    assert usage["openai"]["additional_rate_limits"][0]["limit_id"] == "gpt_reserve"
+
+
+def test_current_nested_rate_limit_event_normalization(m):
+    p = m["openai_provider"]
+    now = int(__import__("time").time())
+    snap = p.parse_rate_limit_event({
+        "type": "codex.rate_limits",
+        "plan_type": "pro",
+        "metered_limit_name": "gpt-reserve",
+        "rate_limits": {
+            "primary": {
+                "used_percent": -2,
+                "window_minutes": 60,
+                "reset_at": now + 90,
+            },
+            "secondary": {
+                "used_percent": 12.5,
+                "window_minutes": 1440,
+                "reset_at": now + 180,
+            },
+        },
+        "credits": {"has_credits": True, "unlimited": False, "balance": "5"},
+    })
+    assert snap["plan_type"] == "pro"
+    assert snap["rate_limits"][0]["limit_id"] == "gpt_reserve"
+    assert snap["rate_limits"][0]["primary"]["used_percent"] == 0.0
+    assert snap["additional_rate_limits"] == snap["rate_limits"]
+    assert snap["credits"]["balance"] == "5"
+    # A legacy flat codex.rate_limits event deliberately falls through to the
+    # caller's old adapter rather than becoming an empty current snapshot.
+    assert p.parse_rate_limit_event({
+        "type": "codex.rate_limits", "primary_used_pct": 42,
+    }) is None
+
+
+def test_revoke_request_preference_and_delete_failure_degrades_locally(m):
+    _setup(m)
+    p = m["openai_provider"]
+    captured = []
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+    original_post = p.network.post_sync
+    old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)
+    try:
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+
+        def fake_post(url, **kwargs):
+            captured.append((url, kwargs))
+            return Resp()
+
+        p.network.post_sync = fake_post
+        assert p.revoke_sync(
+            refresh_token="refresh-secret", access_token="access-secret",
+            account_key="openai:logout@example.test:acct-logout",
+        )
+        assert p.revoke_sync(access_token="access-only")
+    finally:
+        p.network.post_sync = original_post
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+        if old_disable_env is not None:
+            _ap_os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = old_disable_env
+
+    assert captured[0][0] == p.REVOKE_URL
+    assert captured[0][1]["json"] == {
+        "token": "refresh-secret", "token_type_hint": "refresh_token",
+        "client_id": p.CLIENT_ID,
+    }
+    assert captured[0][1]["proxy_channel"] == "oauth:openai:logout@example.test:acct-logout"
+    assert captured[1][1]["json"] == {
+        "token": "access-only", "token_type_hint": "access_token",
+    }
+
+    om = m["oauth_manager"]
+    om.add_account({
+        "email": "delete@example.test", "provider": "openai",
+        "access_token": "at", "refresh_token": "rt",
+        "chatgpt_account_id": "acct-delete",
+    })
+    original_revoke = p.revoke_sync
+    p.revoke_sync = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("upstream down"))
+    try:
+        om.delete_account("openai:delete@example.test:acct-delete")
+    finally:
+        p.revoke_sync = original_revoke
+    assert om.get_account("openai:delete@example.test:acct-delete") is None
+
+
+def test_reset_credit_consume_forwards_optional_credit_id_without_browser_headers(m):
+    p = m["openai_provider"]
+    captured = {}
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"code": "reset", "windows_reset": 1}
+
+    original_post = p.network.post_sync
+    old_disable_env = _ap_os.environ.pop("DISABLE_OAUTH_NETWORK_CALLS", None)
+    try:
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", False))
+
+        def fake_post(url, **kwargs):
+            captured.update(url=url, kwargs=kwargs)
+            return Resp()
+
+        p.network.post_sync = fake_post
+        result = p.consume_rate_limit_reset_credit_sync(
+            "at", idempotency_key="idem", account_id="acct",
+            credit_id="credit-2", account_key="openai:x@example.test:acct",
+        )
+    finally:
+        p.network.post_sync = original_post
+        m["config"].update(lambda c: c.setdefault("oauth", {}).__setitem__("mockMode", True))
+        if old_disable_env is not None:
+            _ap_os.environ["DISABLE_OAUTH_NETWORK_CALLS"] = old_disable_env
+
+    assert result["outcome"] == "reset"
+    assert captured["kwargs"]["json"] == {
+        "redeem_request_id": "idem", "credit_id": "credit-2",
+    }
+    headers = captured["kwargs"]["headers"]
+    assert headers["ChatGPT-Account-ID"] == "acct"
+    assert "origin" not in headers and "referer" not in headers
+    assert captured["kwargs"]["proxy_channel"] == "oauth:openai:x@example.test:acct"
+
+
 # ─── state_db schema 迁移 ────────────────────────────────────────
 
 def test_state_store_openai_quota_shape(m):
@@ -436,6 +678,47 @@ def test_openai_refresh_updates_id_token_metadata(m):
     print("  [PASS] force_refresh: openai decodes new id_token without changing account key")
 
 
+def test_openai_eight_day_refresh_fallback_uses_only_reliable_timestamp(m):
+    _setup(m)
+    om = m["oauth_manager"]
+    now = datetime.now(timezone.utc)
+    for email, last_refresh in (
+        ("stale@openai.test", now - timedelta(days=9)),
+        ("fresh@openai.test", now - timedelta(days=7)),
+    ):
+        om.add_account({
+            "email": email,
+            "provider": "openai",
+            "access_token": f"at-{email}",
+            "refresh_token": f"rt-{email}",
+            "expired": (now + timedelta(days=1)).isoformat(),
+            "last_refresh": last_refresh.isoformat(),
+            "chatgpt_account_id": f"acct-{email}",
+        })
+    om.add_account({
+        "email": "unknown@openai.test",
+        "provider": "openai",
+        "access_token": "at-unknown",
+        "refresh_token": "rt-unknown",
+        "expired": (now + timedelta(days=1)).isoformat(),
+        "chatgpt_account_id": "acct-unknown",
+    })
+
+    import asyncio
+    stale = asyncio.run(om.ensure_valid_token(
+        "openai:stale@openai.test:acct-stale@openai.test"
+    ))
+    fresh = asyncio.run(om.ensure_valid_token(
+        "openai:fresh@openai.test:acct-fresh@openai.test"
+    ))
+    unknown = asyncio.run(om.ensure_valid_token(
+        "openai:unknown@openai.test:acct-unknown"
+    ))
+    assert stale.startswith("mock-openai-access-")
+    assert fresh == "at-fresh@openai.test"
+    assert unknown == "at-unknown"
+
+
 def test_fetch_usage_openai_goes_through_wham(m):
     """OpenAI 的主动 fetch_usage 走 ChatGPT wham/usage，不依赖 channel 注册/probe。"""
     _setup(m)
@@ -501,7 +784,23 @@ def test_fetch_wham_usage_sends_account_id_header(m):
                     "primary_window": {"used_percent": 1, "limit_window_seconds": 18000},
                     "secondary_window": {"used_percent": 3, "limit_window_seconds": 604800},
                 },
-                "credits": {"has_credits": False},
+                "credits": {
+                    "has_credits": True, "unlimited": False, "balance": "9.99",
+                },
+                "rate_limit_reached_type": {
+                    "type": "workspace_member_credits_depleted",
+                },
+                "additional_rate_limits": [{
+                    "metered_feature": "gpt_reserve",
+                    "limit_name": "GPT reserve",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 7,
+                            "limit_window_seconds": 3600,
+                            "reset_at": 1_900_000_000,
+                        },
+                    },
+                }],
             }
 
     orig_get = p.network.get_sync
@@ -522,8 +821,17 @@ def test_fetch_wham_usage_sends_account_id_header(m):
     assert captured["url"] == p.WHAM_USAGE_URL
     assert captured["headers"].get("authorization") == "Bearer at-token"
     assert captured["headers"].get("ChatGPT-Account-ID") == "acct-x"
+    assert captured["headers"].get("x-openai-codex-luna-reserve") == "1"
+    assert "origin" not in captured["headers"] and "referer" not in captured["headers"]
     assert usage["five_hour"]["utilization"] == 1.0
     assert usage["seven_day"]["utilization"] == 3.0
+    assert usage["openai"]["credits"] == {
+        "has_credits": True, "unlimited": False, "balance": "9.99",
+    }
+    assert usage["openai"]["rate_limit_reached_type"] == "workspace_member_credits_depleted"
+    additional = usage["openai"]["additional_rate_limits"]
+    assert additional[0]["limit_id"] == "gpt_reserve"
+    assert additional[0]["primary"]["window_minutes"] == 60
     print("  [PASS] fetch_wham_usage_sync: sends ChatGPT-Account-ID header")
 
 
@@ -590,6 +898,7 @@ def test_fetch_rate_limit_reset_credits_sends_account_id_header(m):
                 "status": "available",
                 "granted_at": "2026-06-17T00:00:00Z",
                 "expires_at": "2026-07-17T00:00:00Z",
+                "title": "ignored",
             },
             {
                 "id": "credit-2",
@@ -693,6 +1002,34 @@ def test_tg_openai_add_state_mismatch(m):
     accounts = m["config"].get()["oauthAccounts"]
     assert not any(a.get("provider") == "openai" for a in accounts)
     print("  [PASS] tg openai add: state mismatch rejected, no account saved")
+
+
+def test_tg_openai_callback_rejects_wrong_redirect_but_keeps_bare_code_compat(m):
+    _setup(m)
+    rec = _install_recorder(m)
+    cm = m["oauth_menu"]
+
+    cm.on_login_openai_start(42, 100, "cb")
+    state = m["states"].get_state(42)["data"]["state"]
+    rec.clear()
+    cm.on_login_openai_code_input(
+        42, f"https://attacker.example/auth/callback?code=abc&state={state}",
+    )
+    sent = rec.last("sendMessage")
+    assert sent and "回调地址不是本次" in sent["text"]
+    assert not any(
+        account.get("provider") == "openai"
+        for account in m["config"].get()["oauthAccounts"]
+    )
+
+    # The rejected callback consumes the pending state. Start a fresh flow and
+    # verify existing bare-code compatibility; PKCE still binds it to this chat.
+    rec.clear()
+    cm.on_login_openai_start(42, 100, "cb")
+    rec.clear()
+    cm.on_login_openai_code_input(42, "mock-bare-code")
+    sent = rec.last("sendMessage")
+    assert sent and "已添加" in sent["text"]
 
 
 def test_tg_openai_add_via_rt(m):

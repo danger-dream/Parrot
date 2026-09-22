@@ -1583,6 +1583,12 @@ def test_openai_official_reset_credit_ask_and_confirm(m):
     ask_msg = rec.last("editMessageText")
     assert ask_msg and "当前可用官方重置次数" in ask_msg["text"]
     assert "这一步 <b>不会消耗</b>" in ask_msg["text"]
+    assert "请选择本次要消耗的重置卡" in ask_msg["text"]
+    selection_buttons = [
+        button for row in ask_msg["reply_markup"]["inline_keyboard"] for button in row
+        if button.get("text", "").startswith("选择第 ")
+    ]
+    assert len(selection_buttons) == 2
     confirm_page_cb = next(
         b["callback_data"]
         for row in ask_msg["reply_markup"]["inline_keyboard"]
@@ -1591,7 +1597,10 @@ def test_openai_official_reset_credit_ask_and_confirm(m):
     confirm_payload = confirm_page_cb.split(":", 2)[2]
     confirm_short = confirm_payload.split(":", 1)[0]
     resolved_confirm = m["ui"].resolve_code(confirm_short)
-    assert resolved_confirm and resolved_confirm.startswith(ak + "|") and resolved_confirm.endswith("|confirm")
+    confirm_data = json.loads(resolved_confirm)
+    assert confirm_data["account_key"] == ak
+    assert confirm_data["stage"] == "confirm"
+    assert confirm_data["credit_id"] == "mock-reset-credit-1"
 
     rec.clear()
     assert m["oauth_menu"].handle_callback(42, 100, "cb-confirm-page", confirm_page_cb)
@@ -1606,7 +1615,11 @@ def test_openai_official_reset_credit_ask_and_confirm(m):
     reset_payload = final_cb.split(":", 2)[2]
     reset_short = reset_payload.split(":", 1)[0]
     resolved_reset = m["ui"].resolve_code(reset_short)
-    assert resolved_reset and resolved_reset.startswith(ak + "|") and resolved_reset.endswith("|execute")
+    reset_data = json.loads(resolved_reset)
+    assert reset_data["account_key"] == ak
+    assert reset_data["stage"] == "execute"
+    assert reset_data["credit_id"] == "mock-reset-credit-1"
+    assert reset_data["idempotency_key"] == confirm_data["idempotency_key"]
 
     rec.clear()
     assert m["oauth_menu"].handle_callback(42, 100, "cb-confirm", final_cb)

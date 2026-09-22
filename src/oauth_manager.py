@@ -79,7 +79,9 @@ OAUTH_SCOPES = (
 
 # OAuth model-catalog maintenance policy.  These are intentionally code-level
 # constants: the timings are operational invariants, not user-facing tuning.
-OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS = 6 * 60 * 60
+# Current Codex keeps the authenticated /models cache for five minutes.  ETag
+# revalidation makes the same cadence reasonable for Parrot without redownloading.
+OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS = 5 * 60
 OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS = 15 * 60
 OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS = 60
 OAUTH_MODEL_SYNC_STARTUP_DELAY_SECONDS = 2
@@ -379,6 +381,17 @@ def _parse_iso(s: str | None) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _openai_last_refresh_stale(account: dict, *, now: datetime | None = None) -> bool:
+    """Use the persisted refresh timestamp only when it is valid and timezone-aware."""
+    if provider_of(account) != "openai":
+        return False
+    last_refresh = _parse_iso(account.get("last_refresh"))
+    if last_refresh is None or last_refresh.tzinfo is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return last_refresh.astimezone(timezone.utc) < current - timedelta(days=8)
 
 
 def provider_of(key_or_account: str | dict) -> str:
@@ -784,6 +797,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 expired
                 and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
                 and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
+                and not _openai_last_refresh_stale(acc)
             ):
                 return acc["access_token"]
 
@@ -985,6 +999,7 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
         expired
         and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
         and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
+        and not _openai_last_refresh_stale(acc)
     ):
         return acc["access_token"]
 
@@ -1816,20 +1831,85 @@ def usage_from_quota_row(row: dict) -> dict:
         return {"utilization": util, "resets_at": reset} if util is not None else {}
 
     raw_cursor = None
+    raw_openai: dict = {}
+    passive_codex_rate_limits = []
+    raw_codex_rate_limits = row.get("codex_rate_limits")
+    if isinstance(raw_codex_rate_limits, str) and raw_codex_rate_limits:
+        try:
+            parsed_limits = json.loads(raw_codex_rate_limits)
+            if isinstance(parsed_limits, list):
+                passive_codex_rate_limits = [
+                    item for item in parsed_limits if isinstance(item, dict)
+                ]
+        except Exception:
+            passive_codex_rate_limits = []
     raw_data = row.get("raw_data")
     if isinstance(raw_data, str) and raw_data:
         try:
             raw_payload = json.loads(raw_data)
             candidate = raw_payload.get("cursor") if isinstance(raw_payload, dict) else None
             raw_cursor = candidate if isinstance(candidate, dict) else None
+            candidate = raw_payload.get("openai") if isinstance(raw_payload, dict) else None
+            raw_openai = candidate if isinstance(candidate, dict) else {}
         except Exception:
             raw_cursor = None
+            raw_openai = {}
+
+    active_limits = raw_openai.get("rate_limits")
+    if not isinstance(active_limits, list):
+        active_limits = []
+    passive_is_newer = int(row.get("last_passive_update_at") or 0) >= int(
+        row.get("fetched_at") or 0
+    )
+    ordered_limits = (
+        [active_limits, passive_codex_rate_limits]
+        if passive_is_newer else [passive_codex_rate_limits, active_limits]
+    )
+    merged_limits: dict[str, dict] = {}
+    for limits in ordered_limits:
+        for item in limits:
+            if not isinstance(item, dict):
+                continue
+            limit_id = str(item.get("limit_id") or "")
+            if limit_id:
+                merged_limits[limit_id] = item
+    codex_rate_limits = list(merged_limits.values())
+
+    active_credits = raw_openai.get("credits")
+    if not isinstance(active_credits, dict):
+        active_credits = {}
+    passive_credits = {
+        "has_credits": row.get("codex_credits_has_credits"),
+        "unlimited": row.get("codex_credits_unlimited"),
+        "balance": row.get("codex_credits_balance"),
+    }
+    credit_sources = (
+        [active_credits, passive_credits]
+        if passive_is_newer else [passive_credits, active_credits]
+    )
+    codex_credits: dict = {}
+    for source in credit_sources:
+        codex_credits.update({key: value for key, value in source.items() if value is not None})
+    passive_reached = row.get("codex_rate_limit_reached_type")
+    active_reached = raw_openai.get("rate_limit_reached_type")
+    reached = (
+        passive_reached or active_reached
+        if passive_is_newer else active_reached or passive_reached
+    )
 
     result = {
         "five_hour": _block(row.get("five_hour_util"), row.get("five_hour_reset")),
         "seven_day": _block(row.get("seven_day_util"), row.get("seven_day_reset")),
         "openai": {
+            **raw_openai,
             "thirty_day": _block(row.get("thirty_day_util"), row.get("thirty_day_reset")),
+            "rate_limits": codex_rate_limits,
+            "additional_rate_limits": [
+                item for item in codex_rate_limits
+                if item.get("limit_id") not in (None, "", "codex")
+            ],
+            "credits": codex_credits,
+            "rate_limit_reached_type": reached,
         },
         "seven_day_sonnet": _block(row.get("sonnet_util"), row.get("sonnet_reset")),
         "seven_day_opus": _block(row.get("opus_util"), row.get("opus_reset")),
@@ -4047,6 +4127,27 @@ def delete_invalid_accounts_batch_if_unchanged(
     return result
 
 
+def _best_effort_revoke_openai_accounts(accounts: Iterable[dict]) -> None:
+    """Attempt current Codex logout revocation without blocking local deletion."""
+    for account in accounts:
+        if provider_of(account) != "openai":
+            continue
+        account_key = _canonical_key(account)
+        try:
+            openai_provider.revoke_sync(
+                refresh_token=str(account.get("refresh_token") or ""),
+                access_token=str(account.get("access_token") or ""),
+                account_key=account_key,
+            )
+        except Exception as exc:
+            # Codex logout is explicitly best effort: credentials and all local
+            # routing state must still be removed when auth.openai.com is down.
+            print(
+                f"[oauth] OpenAI revoke failed before local delete for "
+                f"{account_key}: {type(exc).__name__}"
+            )
+
+
 def _delete_account_serialized(account_key: str) -> None:
     """按 account_key 精确删除一个账号 + 级联清理。
 
@@ -4089,6 +4190,7 @@ def _delete_account_serialized(account_key: str) -> None:
     cleanup_keys = [_canonical_key(account) for account in matched_accounts]
     if not cleanup_keys:
         return
+    _best_effort_revoke_openai_accounts(matched_accounts)
     # Preserve only the non-secret owner→installation mapping before credentials
     # are removed. Failure aborts deletion rather than breaking continuity.
     from .openai.codex_identity import account_identity_from_account, register_account_identity
@@ -4466,7 +4568,8 @@ def reset_quota(account_key: str) -> dict:
 
 
 async def redeem_openai_rate_limit_reset_credit(account_key: str,
-                                                *, idempotency_key: str | None = None) -> dict:
+                                                *, idempotency_key: str | None = None,
+                                                credit_id: str | None = None) -> dict:
     """Consume one official OpenAI/Codex banked reset credit for an account.
 
     OpenAI Codex now exposes earned rate-limit reset credits via WHAM. This path
@@ -4488,8 +4591,13 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     idem = idempotency_key or str(uuid.uuid4())
     access_token = await ensure_valid_token(canonical)
     account_id = _openai_workspace_id(acc) or None
+    consume_kwargs = _compatible_kwargs(
+        openai_provider.consume_rate_limit_reset_credit,
+        idempotency_key=idem, account_id=account_id,
+        credit_id=credit_id, account_key=canonical,
+    )
     response = await openai_provider.consume_rate_limit_reset_credit(
-        access_token, idempotency_key=idem, account_id=account_id,
+        access_token, **consume_kwargs,
     )
     outcome = response.get("outcome")
     out = {
@@ -4497,6 +4605,7 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
         "account_key": canonical,
         "outcome": outcome,
         "idempotency_key": idem,
+        "credit_id": str(credit_id) if credit_id else None,
         "windows_reset": response.get("windows_reset"),
     }
 
@@ -5964,7 +6073,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             try:
                 meta_interval = int(
                     (config.get().get("oauth") or {}).get(
-                        "openaiMetadataRefreshIntervalSeconds", 6 * 3600,
+                        "openaiMetadataRefreshIntervalSeconds", 5 * 60,
                     )
                 )
                 await ensure_openai_metadata_fresh(
@@ -5982,7 +6091,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         if provider == "workbuddy" and not workbuddy_runtime.refresh_due(acc, ak, refresh_threshold_seconds):
             out[email] = "skipped:backoff_or_healthy"
             continue
-        if remaining >= refresh_threshold_seconds:
+        if remaining >= refresh_threshold_seconds and not _openai_last_refresh_stale(acc):
             out[email] = "skipped:healthy"
             continue
 

@@ -140,14 +140,19 @@ def _live_oauth_effect(function):
 @_live_oauth_effect
 def _maybe_record_codex_snapshot(
     ch: Channel, resp: Any, translator_ctx: dict | None = None,
+    *, snapshot: dict | None = None,
 ) -> None:
     if not isinstance(ch, OpenAIOAuthChannel):
         return
     try:
-        oauth_manager.observe_openai_response_metadata(
-            ch.account_key, resp.headers, translator_ctx,
+        if resp is not None:
+            oauth_manager.observe_openai_response_metadata(
+                ch.account_key, resp.headers, translator_ctx,
+            )
+        snap = snapshot or (
+            openai_provider.parse_rate_limit_headers(dict(resp.headers))
+            if resp is not None else None
         )
-        snap = openai_provider.parse_rate_limit_headers(dict(resp.headers))
         if not snap:
             return
         account_key = getattr(ch, "account_key", None) or ch.email
@@ -2992,6 +2997,11 @@ def _maybe_record_codex_rate_limits_event(ch: Channel | None, event: dict) -> No
             candidates.append(val)
     candidates.append(event)
     try:
+        current = openai_provider.parse_rate_limit_event(event)
+        if current:
+            _maybe_record_codex_snapshot(ch, None, snapshot=current)
+            return
+        # Backward compatibility for older flat/headers-shaped events.
         for src in candidates:
             flat = {str(k).lower(): v for k, v in src.items()}
             headerish = {
@@ -3005,8 +3015,7 @@ def _maybe_record_codex_rate_limits_event(ch: Channel | None, event: dict) -> No
             }
             snap = openai_provider.parse_rate_limit_headers(headerish)
             if snap:
-                fake_resp = type("_WsRateLimitsResp", (), {"headers": headerish})()
-                _maybe_record_codex_snapshot(ch, fake_resp)
+                _maybe_record_codex_snapshot(ch, None, snapshot=snap)
                 return
     except Exception as exc:
         print(f"[failover] codex WS rate_limits event record failed: {type(exc).__name__}")

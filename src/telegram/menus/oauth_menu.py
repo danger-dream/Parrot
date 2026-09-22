@@ -528,6 +528,19 @@ def _openai_reset_credit_count_from_details(details: dict | None) -> int | None:
         return None
 
 
+def _available_openai_reset_credit_cards(usage: dict | None) -> list[dict]:
+    details = _openai_reset_credit_details_from_usage(usage)
+    data = details.get("data") if isinstance(details, dict) else None
+    if not isinstance(data, list):
+        return []
+    return [
+        item for item in data
+        if isinstance(item, dict)
+        and str(item.get("id") or "").strip()
+        and str(item.get("status") or "").strip().lower() == "available"
+    ]
+
+
 def _fetch_openai_reset_credit_details_for_ui(account_key: str,
                                               *, cached_count: int | None = None):
     """Fetch reset-card details for detail page; skip known-zero accounts."""
@@ -4412,29 +4425,69 @@ def on_reset_quota_ask(chat_id: int, message_id: int, cb_id: str, short: str,
         # OpenAI 官方要求同一次逻辑 reset 重试时复用同一个 idempotency key。
         # 先绑定到“最终确认页”按钮，最终执行按钮继续复用，避免 TG 重投/双击消耗多次。
         reset_idem = str(uuid.uuid4())
-        confirm_short = ui.register_code(f"{ak}|{reset_idem}|confirm")
-        confirm_payload = _callback_payload(confirm_short, page, filter_key)
-        rows = [
-            [ui.btn("我已理解，进入最终确认（不消耗）", f"oa:reset_quota_confirm:{confirm_payload}")],
-            [ui.btn("❌ 取消", f"oa:view:{payload}")],
-        ]
+        cards = _available_openai_reset_credit_cards(usage_result)
+        if len(cards) > 1:
+            body += "\n\n请选择本次要消耗的重置卡："
+            rows = []
+            for index, card in enumerate(cards, start=1):
+                credit_id = str(card.get("id") or "").strip()
+                confirm_short = ui.register_code(json.dumps({
+                    "account_key": ak,
+                    "idempotency_key": reset_idem,
+                    "stage": "confirm",
+                    "credit_id": credit_id,
+                }, ensure_ascii=False, separators=(",", ":")))
+                confirm_payload = _callback_payload(confirm_short, page, filter_key)
+                title = str(card.get("title") or _reset_credit_type_label(card.get("reset_type")))
+                label = f"选择第 {index} 张 · {title}"[:64]
+                rows.append([ui.btn(label, f"oa:reset_quota_confirm:{confirm_payload}")])
+        else:
+            credit_id = str(cards[0].get("id") or "").strip() if cards else ""
+            resolved_payload = {
+                "account_key": ak,
+                "idempotency_key": reset_idem,
+                "stage": "confirm",
+                "credit_id": credit_id,
+            } if credit_id else None
+            confirm_short = ui.register_code(
+                json.dumps(resolved_payload, ensure_ascii=False, separators=(",", ":"))
+                if resolved_payload else f"{ak}|{reset_idem}|confirm"
+            )
+            confirm_payload = _callback_payload(confirm_short, page, filter_key)
+            rows = [[ui.btn(
+                "我已理解，进入最终确认（不消耗）",
+                f"oa:reset_quota_confirm:{confirm_payload}",
+            )]]
+        rows.append([ui.btn("❌ 取消", f"oa:view:{payload}")])
     ui.edit(chat_id, message_id, body, reply_markup=ui.inline_kb(rows))
 
 
-def _parse_openai_reset_payload(short: str) -> tuple[str | None, str | None, str | None]:
+def _parse_openai_reset_payload(
+    short: str,
+) -> tuple[str | None, str | None, str | None, str | None]:
     resolved = ui.resolve_code(short)
     if not isinstance(resolved, str):
-        return None, None, None
+        return None, None, None, None
+    try:
+        structured = json.loads(resolved)
+    except (TypeError, ValueError):
+        structured = None
+    if isinstance(structured, dict):
+        ak = _resolve_to_account_key(str(structured.get("account_key") or ""))
+        reset_idem = str(structured.get("idempotency_key") or "") or None
+        stage = str(structured.get("stage") or "") or None
+        credit_id = str(structured.get("credit_id") or "").strip() or None
+        return ak, reset_idem, stage, credit_id
     parts = resolved.split("|")
     ak = _resolve_to_account_key(parts[0])
     reset_idem = parts[1] if len(parts) >= 2 and parts[1] else None
     stage = parts[2] if len(parts) >= 3 and parts[2] else None
-    return ak, reset_idem, stage
+    return ak, reset_idem, stage, None
 
 
 def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str,
                            page: int = 1, filter_key: str = _FILTER_ALL) -> None:
-    ak, reset_idem, stage = _parse_openai_reset_payload(short)
+    ak, reset_idem, stage, credit_id = _parse_openai_reset_payload(short)
     if ak is None or not reset_idem or stage != "confirm":
         ui.answer_cb(cb_id, "确认信息已失效，请重新进入")
         return
@@ -4444,15 +4497,28 @@ def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str
 
     ui.answer_cb(cb_id, "请做最终确认")
     email = _account_email(ak)
-    final_short = ui.register_code(f"{ak}|{reset_idem}|execute")
+    final_value = (
+        json.dumps({
+            "account_key": ak,
+            "idempotency_key": reset_idem,
+            "stage": "execute",
+            "credit_id": credit_id,
+        }, ensure_ascii=False, separators=(",", ":"))
+        if credit_id else f"{ak}|{reset_idem}|execute"
+    )
+    final_short = ui.register_code(final_value)
     final_payload = _callback_payload(final_short, page, filter_key)
     cancel_payload = _callback_payload(ui.register_code(ak), page, filter_key)
     reset_label = _openai_reset_credit_label_from_row(oauth_control.quota_snapshot(ak), show_zero=True)
     body = (
         f"🚨 {ui.provider_custom_emoji_html('openai')} <b>最终确认：消耗 1 次 OpenAI 官方重置</b>\n\n"
         f"账号: <code>{ui.escape_html(email or ak)}</code>\n"
-        f"当前可用官方重置次数: <code>{ui.escape_html(reset_label)}</code>\n\n"
-        "点击下面的最终确认后，会立即调用 OpenAI 官方接口：\n"
+        f"当前可用官方重置次数: <code>{ui.escape_html(reset_label)}</code>\n"
+        + (
+            f"已选择重置卡: <code>{ui.escape_html(credit_id)}</code>\n"
+            if credit_id else ""
+        )
+        + "\n点击下面的最终确认后，会立即调用 OpenAI 官方接口：\n"
         "<code>rate-limit-reset-credits/consume</code>\n\n"
         "结果与影响：\n"
         "• 会消耗该账号 <code>1</code> 次官方 Codex reset credit。\n"
@@ -4471,7 +4537,7 @@ def on_reset_quota_confirm(chat_id: int, message_id: int, cb_id: str, short: str
 
 def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: int = 1, filter_key: str = _FILTER_ALL) -> None:
     resolved = ui.resolve_code(short)
-    ak, reset_idem, reset_stage = _parse_openai_reset_payload(short)
+    ak, reset_idem, reset_stage, credit_id = _parse_openai_reset_payload(short)
     if ak is None:
         ak = _resolve_to_account_key(resolved)
     if ak is None:
@@ -4491,7 +4557,7 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
         ui.answer_cb(cb_id, "正在调用 OpenAI 官方重置...")
         try:
             result = oauth_control.redeem_openai_reset_credit_now(
-                _management_context(chat_id), ak, reset_idem,
+                _management_context(chat_id), ak, reset_idem, credit_id,
             )
         except Exception as exc:
             result = exc
@@ -5636,14 +5702,29 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
         return
     data = state.get("data") or {}
 
-    code, recv_state = _extract_openai_code_and_state(text)
+    raw_callback = str(text or "").strip()
+    if (
+        raw_callback.startswith(("http://", "https://"))
+        and not oauth_control.openai_validate_callback_url(
+            raw_callback, redirect_uri=str(data.get("redirect_uri") or "") or None,
+        )
+    ):
+        ui.send_result(
+            chat_id,
+            "❌ 回调地址不是本次 OpenAI 登录使用的 "
+            "<code>http://localhost:1455/auth/callback</code>，请重新发起登录流程。",
+            **_OA_NAV_OPENAI,
+        )
+        return
+    code, recv_state = _extract_openai_code_and_state(raw_callback)
     if not code:
         ui.send_result(chat_id, "❌ 没有抽到 code，请重新发起登录流程。",
                        **_OA_NAV_OPENAI)
         return
-    # state 一致性校验（粘整段 URL 才能拿到；少数客户端不回显 state，放行警告）
-    orig_state = data.get("state", "")
-    if recv_state and orig_state and recv_state != orig_state:
+    # PKCE protects the code. Preserve the existing manual bare-code flow, but
+    # whenever a callback/query supplies state, bind it to this TG login session.
+    orig_state = str(data.get("state") or "")
+    if recv_state and orig_state and not secrets.compare_digest(recv_state, orig_state):
         ui.send_result(
             chat_id,
             f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"

@@ -295,9 +295,11 @@ class OAuthBackend:
     def reset_quota(self, account_id: str) -> dict:
         return oauth_manager.reset_quota(account_id)
 
-    async def redeem_openai_reset_credit(self, account_id: str, idempotency_key: str) -> dict:
+    async def redeem_openai_reset_credit(self, account_id: str, idempotency_key: str,
+                                         credit_id: str | None = None) -> dict:
+        kwargs = {"credit_id": credit_id} if credit_id else {}
         return await oauth_manager.redeem_openai_rate_limit_reset_credit(
-            account_id, idempotency_key=idempotency_key,
+            account_id, idempotency_key=idempotency_key, **kwargs,
         )
 
     def reorder_accounts_conditional(
@@ -559,6 +561,7 @@ class OAuthBackend:
     def claude_extract_plan(self, *args, **kwargs): return oauth_manager.extract_claude_plan_info(*args, **kwargs)
     def openai_pkce_generate(self): return openai_provider.pkce_generate()
     def openai_build_login_url(self, *args, **kwargs): return openai_provider.build_login_url(*args, **kwargs)
+    def openai_validate_callback_url(self, *args, **kwargs): return openai_provider.validate_callback_url(*args, **kwargs)
     def openai_exchange_code(self, *args, **kwargs): return openai_provider.exchange_code_sync(*args, **kwargs)
     def openai_refresh(self, *args, **kwargs): return openai_provider.refresh_sync(*args, **kwargs)
     def openai_decode_id_token(self, *args, **kwargs): return openai_provider.decode_id_token(*args, **kwargs)

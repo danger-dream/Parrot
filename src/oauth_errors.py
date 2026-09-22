@@ -115,7 +115,10 @@ def _response_error_code(exc: BaseException | str) -> str:
 def _is_invalid_token(status: int | None, body_code: str) -> bool:
     if status == 401:
         return True
-    markers = ("invalid_grant", "invalid_token", "expired", "revoked")
+    markers = (
+        "invalid_grant", "invalid_token", "expired", "revoked",
+        "reused", "invalidated",
+    )
     if status == 400:
         return any(s in body_code for s in markers)
     return any(s in body_code for s in markers)

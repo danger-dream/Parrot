@@ -197,6 +197,15 @@ class OAuthFlowService:
             parsed = self.backend.antigravity_parse_callback(source or "")
             code, received_state = parsed.get("code") or "", parsed.get("state") or ""
         else:
+            if (
+                provider is OAuthProvider.OPENAI
+                and str(source or "").strip().startswith(("http://", "https://"))
+                and not self.backend.openai_validate_callback_url(str(source))
+            ):
+                raise ManagementError(
+                    ManagementErrorCode.VALIDATION_FAILED,
+                    fields=[ErrorField("callbackUrl", "INVALID", "Callback redirect does not match this flow")],
+                )
             code, received_state = _extract_code_state(source)
             if command.state:
                 received_state = command.state

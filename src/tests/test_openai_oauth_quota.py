@@ -463,7 +463,7 @@ def test_oauth_menu_list_cached_openai_below_dynamic_threshold_kept_enabled(m):
 
 
 def test_oauth_menu_refresh_usage_openai_wham(m):
-    """OpenAI 账户点“刷新用量” → 有效 access_token 直接 wham/usage，且不发 probe/强刷 token。"""
+    """OpenAI 账户点“刷新用量” → 8 天兜底刷新后直接 wham/usage，且不发 probe。"""
     _setup(m)
     _add_openai(m, "ru@openai.test")
     m["registry"].rebuild_from_config()
@@ -493,9 +493,8 @@ def test_oauth_menu_refresh_usage_openai_wham(m):
         m["OpenAIOAuthChannel"].probe_usage = orig_probe
 
     acc = m["oauth_manager"].get_account("openai:ru@openai.test:acct-ru@openai.test")
-    assert acc["access_token"] == "OLD-AT"
-    assert acc["expired"] == "2099-01-01T00:00:00Z"
-    assert acc["last_refresh"] == "2026-01-01T00:00:00Z"
+    assert acc["access_token"].startswith("mock-openai-access-")
+    assert acc["last_refresh"] != "2026-01-01T00:00:00Z"
     assert called["probe"] == 0
     row = m["state_db"].quota_load("openai:ru@openai.test:acct-ru@openai.test")
     assert row is not None, "wham should have written quota cache"
@@ -503,7 +502,7 @@ def test_oauth_menu_refresh_usage_openai_wham(m):
     assert row["seven_day_util"] == 3.0
     last = rec.last("editMessageText")
     assert last and "wham/usage" in last["text"], last.get("text", "")[:200]
-    print("  [PASS] oauth_menu refresh_usage: openai → wham without force_refresh + re-render")
+    print("  [PASS] oauth_menu refresh_usage: stale OpenAI refresh → wham + re-render")
 
 
 def test_oauth_menu_refresh_usage_openai_auto_disables_over_quota(m):

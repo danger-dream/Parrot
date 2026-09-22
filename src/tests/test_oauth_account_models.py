@@ -11,6 +11,7 @@ from src.channel.antigravity_oauth_channel import AntigravityOAuthChannel
 from src.channel.oauth_channel import OAuthChannel
 from src.channel.openai_oauth_channel import OpenAIOAuthChannel
 from src.channel.xai_oauth_channel import XAIOAuthChannel
+from src.openai import codex_constants
 from src.telegram import ui
 from src.telegram.menus import oauth_account_models_menu, oauth_menu
 
@@ -148,9 +149,24 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
     assert "{'effort':" not in repr(result.catalog)
 
 
+def test_codex_user_agent_and_model_cache_follow_current_runtime(monkeypatch):
+    monkeypatch.setattr(codex_constants.platform, "system", lambda: "TestOS")
+    monkeypatch.setattr(codex_constants.platform, "release", lambda: "9.1")
+    monkeypatch.setattr(codex_constants.platform, "machine", lambda: "test-arch")
+    monkeypatch.setenv("TERM_PROGRAM", "TestTerm")
+    monkeypatch.setenv("TERM_PROGRAM_VERSION", "2.0")
+    ua = codex_constants.codex_cli_user_agent()
+    assert ua == "codex_cli_rs/0.153.4 (TestOS 9.1; test-arch) TestTerm/2.0"
+    assert oauth_manager.OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS == 300
+
+
 def test_openai_codex_profile_config_drives_catalog_query_and_ua(monkeypatch):
     seen = {}
     original = copy.deepcopy(config.get().get("openaiOAuth") or {})
+    monkeypatch.setattr(
+        oauth_model_discovery, "codex_cli_user_agent",
+        lambda provider_cfg: "codex_cli_rs/0.153.4 (Runtime OS; arch) terminal",
+    )
     try:
         config.update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
             "codexCliVersion": "0.153.4",
@@ -166,7 +182,9 @@ def test_openai_codex_profile_config_drives_catalog_query_and_ua(monkeypatch):
         result = oauth_model_discovery.discover_openai({"access_token": "tok"})
         assert result.models == ["gpt-future"]
         assert seen["url"].endswith("?client_version=0.153.4")
-        assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.153.4 ")
+        assert seen["headers"]["user-agent"] == (
+            "codex_cli_rs/0.153.4 (Runtime OS; arch) terminal"
+        )
     finally:
         config.update(lambda cfg: cfg.__setitem__("openaiOAuth", original))
 

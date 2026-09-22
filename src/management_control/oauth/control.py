@@ -231,11 +231,13 @@ class OAuthControl(
         context: ManagementContext,
         account_id: str,
         idempotency_key: str,
+        credit_id: str | None = None,
     ) -> dict:
         self._require(context, Capability.DESTRUCTIVE)
         self._legacy_account(account_id)
+        kwargs = {"credit_id": credit_id} if credit_id else {}
         result = asyncio.run(
-            self.backend.redeem_openai_reset_credit(account_id, idempotency_key)
+            self.backend.redeem_openai_reset_credit(account_id, idempotency_key, **kwargs)
         )
         self._audit(context, "oauth.quota.credit-redeem", account_id)
         return result
