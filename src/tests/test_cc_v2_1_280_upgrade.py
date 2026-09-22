@@ -1,4 +1,4 @@
-"""Claude Code v2.1.258/Fable wire-model regression tests.
+"""Claude Code v2.1.280/Fable wire-model regression tests.
 
 Real fixtures are local, read-only captures.  They are never sent upstream; when
 that corpus is not mounted, only corpus-specific tests skip.
@@ -25,47 +25,41 @@ from src.tests import _isolation
 
 _isolation.isolate()
 
+from src import oauth_manager
 from src.channel.api_channel import ApiChannel
 from src.providers import registry as provider_registry
 from src.transform import cc_mimicry as m
 from src.transports import http_runtime
 
 
-BODIES = Path("/opt/workspace/claude-code-cch/v2.1.258/bodies")
-BODY_FILES = sorted(BODIES.glob("body_*.bin")) if BODIES.is_dir() else []
-CORPUS_SKIP = pytest.mark.skipif(not BODY_FILES, reason=f"v258 fixtures not present: {BODIES}")
+BODIES = Path("/opt/workspace/claude-code-cch/v2.1.280/bodies_representative")
+BODY_FILES = sorted(BODIES.glob("*.bin")) if BODIES.is_dir() else []
+CORPUS_SKIP = pytest.mark.skipif(not BODY_FILES, reason=f"v280 fixtures not present: {BODIES}")
 
 MAIN_BETAS = (
     "claude-code-20250219,interleaved-thinking-2025-05-14,"
     "thinking-token-count-2026-05-13,context-management-2025-06-27,"
     "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
-    "advanced-tool-use-2025-11-20,effort-2025-11-24,cache-diagnosis-2026-04-07"
+    "mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,"
+    "effort-2025-11-24,fallback-credit-2026-06-01,"
+    "thinking-binding-controls-2026-08-01,cache-diagnosis-2026-04-07"
 )
-FABLE_BETAS = (
-    "claude-code-20250219,interleaved-thinking-2025-05-14,"
-    "thinking-token-count-2026-05-13,context-management-2025-06-27,"
-    "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
-    "advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,"
-    "server-side-fallback-2026-07-01,fallback-credit-2026-06-01,"
-    "cache-diagnosis-2026-04-07"
+FABLE_BETAS = MAIN_BETAS.replace(
+    "fallback-credit-2026-06-01",
+    "server-side-fallback-2026-06-01,fallback-credit-2026-06-01",
 )
-OPUS_5_BETAS = (
-    "claude-code-20250219,context-1m-2025-08-07,"
+OPUS_5_BETAS = MAIN_BETAS
+HAIKU_MAIN_BETAS = (
     "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,"
     "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
-    "mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,"
-    "advanced-tool-use-2025-11-20,effort-2025-11-24,"
-    "fallback-credit-2026-06-01,cache-diagnosis-2026-04-07"
+    "claude-code-20250219"
 )
 SIDE_BETAS = (
     "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,"
     "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
     "structured-outputs-2025-12-15,cache-diagnosis-2026-04-07"
 )
-OAUTH_SIDE_BETAS = SIDE_BETAS.replace(
-    "structured-outputs-2025-12-15",
-    "advisor-tool-2026-03-01,structured-outputs-2025-12-15",
-)
+OAUTH_SIDE_BETAS = "oauth-2025-04-20," + SIDE_BETAS
 
 
 @pytest.fixture
@@ -109,21 +103,21 @@ def _fixture_billing(body: dict) -> str:
     )
 
 
-def test_v258_constants_and_stainless_versions():
-    assert m.CC_VERSION == "2.1.258"
+def test_v280_constants_and_stainless_versions():
+    assert m.CC_VERSION == "2.1.280"
     assert m.FINGERPRINT_SALT == "59cf53e54c78"
     assert m.FINGERPRINT_INDICES == (4, 7, 20)
     assert m.CCH_SEED == 0x4D659218E32A3268
-    assert m.CLI_USER_AGENT == "claude-cli/2.1.258 (external, sdk-cli)"
+    assert m.CLI_USER_AGENT == "claude-cli/2.1.280 (external, sdk-cli)"
     assert m._STAINLESS_HEADERS["X-Stainless-Package-Version"] == "0.112.1"
     assert m._STAINLESS_HEADERS["X-Stainless-Runtime-Version"] == "v26.3.0"
 
 
 def test_fingerprint_fixed_vectors_and_utf16_emoji():
-    assert m.compute_fingerprint(_messages("say hi")) == "8ee"
-    assert m.compute_fingerprint(_messages("what is 2+2")) == "07a"
+    assert m.compute_fingerprint(_messages("say hi")) == "31f"
+    assert m.compute_fingerprint(_messages("what is 2+2")) == "853"
     emoji = "ab🚀d🚀f🚀hijklmnopqr🚀t"
-    assert m.compute_fingerprint(_messages(emoji)) == "963"
+    assert m.compute_fingerprint(_messages(emoji)) == "bc3"
 
 
 def test_fingerprint_selected_lone_surrogate_hashes_as_replacement_character():
@@ -144,43 +138,41 @@ def test_fingerprint_selects_first_valid_non_meta_text_before_injection():
         ]},
     ]
     assert m.select_fingerprint_prompt(messages) == "what is 2+2"
-    assert m.compute_fingerprint(messages) == "07a"
+    assert m.compute_fingerprint(messages) == "853"
     side = _messages("<session>\nwhat is 2+2\n</session>")
     assert m.select_fingerprint_prompt(side).startswith("<session>")
 
 
 @CORPUS_SKIP
-def test_fingerprint_matches_all_26_real_bodies():
-    assert len(BODY_FILES) == 26
+def test_fingerprint_matches_all_v280_representative_bodies():
+    assert len(BODY_FILES) == 8
     for path in BODY_FILES:
         body = json.loads(path.read_bytes())
         expected = re.search(
-            r"cc_version=2\.1\.258\.([0-9a-f]{3})",
+            r"cc_version=2\.1\.280\.([0-9a-f]{3})",
             _fixture_billing(body),
         ).group(1)
         assert m.compute_fingerprint(body["messages"]) == expected, path.name
 
 
 @CORPUS_SKIP
-def test_cch_matches_25_of_26_real_bodies_with_race_expected_mismatch():
-    matches = []
-    mismatches = []
+def test_cch_matches_every_signed_v280_representative_body():
+    signed = 0
     for path in BODY_FILES:
         body = json.loads(path.read_bytes())
-        expected = re.search(r"cch=([0-9a-f]{5});", _fixture_billing(body)).group(1)
-        if m.compute_cch(body) == expected:
-            matches.append(path.name)
-        else:
-            mismatches.append(path.name)
-    assert len(matches) == 25
-    assert mismatches == ["body_race_anomaly.bin"]
+        match = re.search(r"cch=([0-9a-f]{5});", _fixture_billing(body))
+        if match is None:
+            continue
+        signed += 1
+        assert m.compute_cch(body) == match.group(1), path.name
+    assert signed == 6
 
 
 @CORPUS_SKIP
-def test_fable_1_13mb_fixture_is_signed_without_truncation():
-    path = BODIES / "body_fable5_bigctx_1mb.bin"
+def test_fable_220k_fixture_is_signed_without_truncation():
+    path = BODIES / "body_fable51_bigctx_220k.bin"
     raw = path.read_bytes()
-    assert len(raw) > 1_130_000
+    assert len(raw) > 220_000
     body = json.loads(raw)
     expected = re.search(r"cch=([0-9a-f]{5});", _fixture_billing(body)).group(1)
     assert m.compute_cch(body) == expected
@@ -190,7 +182,13 @@ def _cch_matrix_base() -> dict:
     messages = _messages("wire cch=00000 remains user text")
     return {
         "model": "claude-fable-5",
-        "messages": messages,
+        "messages": [
+            *messages,
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_1", "name": "probe",
+                "input": {"max_tokens": 17, "model": "input-model", "keep": True},
+            }]},
+        ],
         "system": m.build_system_blocks(
             messages,
             inject_cache=False,
@@ -205,7 +203,7 @@ def _cch_matrix_base() -> dict:
     }
 
 
-def test_cch_v258_double_body_matrix(dynamic_cch):
+def test_cch_v280_double_body_matrix(dynamic_cch):
     base = _cch_matrix_base()
     top_max = {**base, "max_tokens": 1}
     assert m.cch_hash_view(top_max) == m.cch_hash_view(base)
@@ -226,7 +224,15 @@ def test_cch_v258_double_body_matrix(dynamic_cch):
     assert m.cch_hash_view(schema_model) != m.cch_hash_view(base)
 
     fallbacks = {**base, "fallbacks": "not-default"}
-    assert m.cch_hash_view(fallbacks) != m.cch_hash_view(base)
+    assert m.cch_hash_view(fallbacks) == m.cch_hash_view(base)
+
+    tool_input_max = json.loads(json.dumps(base))
+    tool_input_max["messages"][1]["content"][0]["input"]["max_tokens"] = 999
+    assert m.cch_hash_view(tool_input_max) == m.cch_hash_view(base)
+
+    tool_input_other = json.loads(json.dumps(base))
+    tool_input_other["messages"][1]["content"][0]["input"]["keep"] = False
+    assert m.cch_hash_view(tool_input_other) != m.cch_hash_view(base)
 
     fallback_credit = json.loads(json.dumps(base))
     fallback_credit["tool_input"]["fallback_credit_token"] = "credit-b"
@@ -261,12 +267,12 @@ def test_cch_static_and_disabled_modes_do_not_dynamic_resign(monkeypatch):
 
 
 def test_fable_api_key_main_profile_and_wire_order(dynamic_cch):
-    request, payload = _transform("claude-fable-5", "what is 2+2")
+    request, payload = _transform("claude-fable-5.1", "what is 2+2")
     assert list(payload) == [
         "model", "messages", "system", "metadata", "max_tokens", "thinking",
         "context_management", "fallbacks", "output_config", "diagnostics", "stream",
     ]
-    assert payload["model"] == "claude-fable-5"
+    assert payload["model"] == "claude-fable-5.1"
     assert payload["fallbacks"] == "default"
     assert payload["diagnostics"] == {"previous_message_id": None}
     assert payload["thinking"] == {"type": "adaptive", "display": "omitted"}
@@ -275,17 +281,19 @@ def test_fable_api_key_main_profile_and_wire_order(dynamic_cch):
     }
     assert payload["output_config"] == {"effort": "high"}
     assert payload["max_tokens"] == 64000
-    assert re.search(r"cc_prompt_id=[0-9a-f-]{36};$", _billing(payload))
+    assert re.search(r"cc_prompt_id=[0-9a-f-]{36}; cc_turn_origin=sdk;$", _billing(payload))
     assert request[m.PARROT_CC_PROMPT_ID_KEY] in _billing(payload)
 
 
 def test_main_profiles_have_exact_observed_betas(dynamic_cch):
-    _, fable = _transform("claude-fable-5", "what is 2+2")
+    _, fable = _transform("claude-fable-5.1", "what is 2+2")
     fable_h = m.build_upstream_headers(
         "key", auth_scheme="api_key", auth_mode="api_key",
-        model="claude-fable-5", payload=fable,
+        model="claude-fable-5.1", payload=fable,
     )
     assert fable_h["anthropic-beta"] == FABLE_BETAS
+    assert fable_h["x-claude-code-request-class"] == "main"
+    assert m.ADVISOR_TOOL_BETA not in fable_h["anthropic-beta"]
 
     _, opus48 = _transform("claude-opus-4-8")
     opus48_h = m.build_upstream_headers(
@@ -301,6 +309,15 @@ def test_main_profiles_have_exact_observed_betas(dynamic_cch):
         model="claude-opus-5", payload=opus5,
     )
     assert opus5_h["anthropic-beta"] == OPUS_5_BETAS
+    assert m.CONTEXT_1M_BETA not in opus5_h["anthropic-beta"]
+
+    _, haiku = _transform("claude-haiku-4-5", "ordinary main prompt")
+    haiku_h = m.build_upstream_headers(
+        "key", auth_scheme="api_key", auth_mode="api_key",
+        model="claude-haiku-4-5", payload=haiku,
+    )
+    assert haiku_h["anthropic-beta"] == HAIKU_MAIN_BETAS
+    assert "x-claude-code-request-class" not in haiku_h
 
 
 def test_side_query_api_and_oauth_profiles(dynamic_cch):
@@ -349,9 +366,9 @@ def test_explicit_user_semantics_are_preserved(dynamic_cch):
     assert payload["stream"] is False
 
 
-def test_oauth_fable_main_preserves_explicit_fields_without_inventing_unknown_profile(dynamic_cch):
+def test_oauth_fable_main_uses_captured_v280_profile_and_betas(dynamic_cch):
     _, payload = _transform(
-        "claude-fable-5",
+        "claude-fable-5.1",
         auth_mode="oauth",
         thinking={"type": "disabled"},
         fallbacks="explicit-oauth-value",
@@ -363,8 +380,25 @@ def test_oauth_fable_main_preserves_explicit_fields_without_inventing_unknown_pr
     assert payload["diagnostics"] == {"previous_message_id": "msg_explicit"}
     assert payload["output_config"] == {"effort": "low"}
 
-    _, absent = _transform("claude-fable-5", auth_mode="oauth")
-    assert all(k not in absent for k in ("thinking", "fallbacks", "output_config", "diagnostics"))
+    _, captured = _transform("claude-fable-5.1", auth_mode="oauth")
+    assert captured["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert captured["fallbacks"] == "default"
+    assert captured["output_config"] == {"effort": "high"}
+    assert captured["diagnostics"] == {"previous_message_id": None}
+    captured["messages"][0]["content"][0]["cache_control"] = {
+        "type": "ephemeral", "ttl": "1h",
+    }
+    headers = m.build_upstream_headers(
+        "token", auth_scheme="bearer", auth_mode="oauth",
+        model="claude-fable-5.1", payload=captured,
+    )
+    betas = headers["anthropic-beta"].split(",")
+    assert betas[:2] == ["claude-code-20250219", m.OAUTH_BETA]
+    assert m.SERVER_SIDE_FALLBACK_BETA in betas
+    assert m.FALLBACK_CREDIT_BETA in betas
+    assert m.EXTENDED_CACHE_TTL_BETA in betas
+    assert m.ADVISOR_TOOL_BETA not in betas
+    assert headers["x-claude-code-request-class"] == "main"
 
 
 def test_metadata_session_and_billing_order_are_stable(dynamic_cch):
@@ -394,12 +428,12 @@ def test_metadata_session_and_billing_order_are_stable(dynamic_cch):
     )[0]["text"]
     fields = [
         "cc_version=", "cc_entrypoint=", "cch=", "cc_workload=",
-        "cc_is_subagent=", "cc_prev_req=", "cc_prompt_id=",
+        "cc_is_subagent=", "cc_prev_req=", "cc_prompt_id=", "cc_turn_origin=",
     ]
     assert [full.index(field) for field in fields] == sorted(full.index(field) for field in fields)
 
 
-def test_cc_provider_allowlist_retains_v258_fields_but_standard_does_not():
+def test_cc_provider_allowlist_retains_v280_fields_but_standard_does_not():
     payload = {
         "model": "claude-fable-5", "messages": [], "max_tokens": 1,
         "fallbacks": "default", "diagnostics": {"previous_message_id": None},
@@ -472,6 +506,81 @@ async def test_openai_ingress_bridge_reuses_cc_request_context(dynamic_cch):
     assert context[m.PARROT_CC_PROMPT_ID_KEY] in _billing(wire)
 
 
+class _JSONResponse:
+    def __init__(self, payload=None):
+        self._payload = payload or {}
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_oauth_scope_login_and_v280_refresh_compatibility(monkeypatch):
+    from urllib.parse import parse_qs, urlparse
+
+    scope = parse_qs(urlparse(oauth_manager.build_login_url("challenge", "state")).query)["scope"][0]
+    assert scope == oauth_manager.OAUTH_SCOPES
+    assert scope.endswith("user:file_upload user:plugins")
+
+    calls = []
+
+    def refresh_candidate(url, refresh_token, *, scope, proxy_channel=""):
+        calls.append((url, refresh_token, scope, proxy_channel))
+        if len(calls) == 1:
+            raise RuntimeError("invalid_scope")
+        return {"access_token": "new-token"}
+
+    monkeypatch.setattr(oauth_manager, "_post_refresh_candidate", refresh_candidate)
+    result = oauth_manager._do_refresh_http("refresh-token", account_key="claude:acct")
+    assert result == {"access_token": "new-token"}
+    assert calls[0][0] == calls[1][0] == oauth_manager.OAUTH_TOKEN_URL
+    assert calls[0][2] == oauth_manager.OAUTH_SCOPES
+    assert "user:plugins" not in calls[1][2]
+    assert calls[0][3] == "oauth:claude:acct"
+
+
+def test_oauth_refresh_request_always_carries_supplied_scope_without_custom_ua(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return _JSONResponse({"access_token": "new-token"})
+
+    monkeypatch.setattr(oauth_manager.network, "post_sync", post)
+    oauth_manager._post_refresh_candidate(
+        oauth_manager.OAUTH_TOKEN_URL, "refresh-token",
+        scope=oauth_manager.OAUTH_SCOPES,
+    )
+    assert calls[0][1]["json"]["scope"] == oauth_manager.OAUTH_SCOPES
+    assert calls[0][1]["headers"] == {"Content-Type": "application/json"}
+
+
+def test_oauth_usage_profile_and_bootstrap_v280_headers(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return _JSONResponse()
+
+    monkeypatch.setattr(oauth_manager, "mock_mode_enabled", lambda: False)
+    monkeypatch.setattr(oauth_manager.network, "get_sync", get)
+    oauth_manager._usage_sync("access", account_key="claude:acct")
+    oauth_manager._profile_sync("access", account_key="claude:acct")
+    oauth_manager._bootstrap_sync("access")
+
+    usage_headers = calls[0][1]["headers"]
+    profile_headers = calls[1][1]["headers"]
+    bootstrap_headers = calls[2][1]["headers"]
+    assert usage_headers["User-Agent"] == m.CLI_USER_AGENT
+    assert usage_headers["anthropic-beta"] == m.OAUTH_BETA
+    assert profile_headers["User-Agent"] == m.CLI_USER_AGENT
+    assert profile_headers["Cache-Control"] == "no-cache"
+    assert "anthropic-beta" not in profile_headers
+    assert bootstrap_headers["User-Agent"] == f"claude-code/{m.CC_VERSION}"
+
+
 def test_application_and_httpx_raw_header_order_and_encoding(dynamic_cch):
     _, payload = _transform("claude-fable-5")
     headers = m.build_upstream_headers(
@@ -484,7 +593,8 @@ def test_application_and_httpx_raw_header_order_and_encoding(dynamic_cch):
         "X-Stainless-Package-Version", "X-Stainless-Retry-Count",
         "X-Stainless-Runtime", "X-Stainless-Runtime-Version", "X-Stainless-Timeout",
         "anthropic-beta", "anthropic-dangerous-direct-browser-access",
-        "anthropic-version", "x-api-key", "x-app", "x-client-request-id",
+        "anthropic-version", "x-api-key", "x-app", "x-claude-code-request-class",
+        "x-client-request-id",
     ]
     assert list(headers)[:len(expected_application)] == expected_application
     assert headers["Accept-Encoding"] == "gzip, deflate"

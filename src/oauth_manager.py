@@ -58,7 +58,7 @@ from .openai.codex_constants import (
     codex_protocol_profile,
     current_codex_protocol_profile,
 )
-from .transform.cc_mimicry import CLI_USER_AGENT
+from .transform.cc_mimicry import CC_VERSION, CLI_USER_AGENT
 
 
 # ─── 常量 ────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 OAUTH_MANUAL_REDIRECT = "https://platform.claude.com/oauth/code/callback"
 OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference "
-    "user:sessions:claude_code user:mcp_servers user:file_upload"
+    "user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
 )
 
 # OAuth model-catalog maintenance policy.  These are intentionally code-level
@@ -670,10 +670,7 @@ def _post_refresh_candidate(url: str, refresh_token: str, *, scope: str | None,
     resp = network.post_sync(
         url,
         json=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": CLI_USER_AGENT,
-        },
+        headers={"Content-Type": "application/json"},
         timeout=30,
         proxy_purpose="oauth_anthropic",
         proxy_channel=proxy_channel,
@@ -705,24 +702,53 @@ def _raise_last_refresh_error(errors: list[BaseException]) -> None:
     raise RuntimeError("Claude OAuth refresh compatibility failed: " + ", ".join(summary))
 
 
+def _is_invalid_scope_error(exc: BaseException) -> bool:
+    """Best-effort check used only to gate the v280 no-plugins retry."""
+    fragments = [str(exc)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            fragments.append(json.dumps(response.json(), ensure_ascii=False))
+        except Exception:
+            try:
+                fragments.append(str(response.text))
+            except Exception:
+                pass
+    return "invalid_scope" in " ".join(fragments).lower()
+
+
 def _do_refresh_http(refresh_token: str, scopes: str = "", *,
                      account_key: str = "") -> dict:
-    """Claude OAuth refresh 兼容层。
+    """Claude OAuth refresh with v280 defaults and bounded legacy fallbacks.
 
-    旧账号没有登录响应 scope，沿用已验证的 api.anthropic.com + no-scope；
-    新账号如果保存了真实 scope，则优先尝试 platform.claude.com + scope。
-    任一候选成功即返回；失败候选不写配置、不禁用账号。
+    The current platform endpoint is always tried first with a scope.  Accounts
+    saved before scopes were persisted use the current full scope list.  v280's
+    documented ``invalid_scope`` compatibility retry removes ``user:plugins``
+    once; Parrot then retains its established legacy/no-scope candidates so old
+    credentials and compatible upstreams are not broken.
     """
-    scope = (scopes or "").strip()
-    candidates: list[tuple[str, str, str | None]] = []
-    if scope:
-        candidates.append(("platform+scope", OAUTH_TOKEN_URL, scope))
-        candidates.append(("legacy+scope", OAUTH_TOKEN_URL_LEGACY, scope))
-    candidates.append(("legacy-no-scope", OAUTH_TOKEN_URL_LEGACY, None))
-    candidates.append(("platform-no-scope", OAUTH_TOKEN_URL, None))
+    scope = (scopes or OAUTH_SCOPES).strip()
+    scope_without_plugins = " ".join(
+        item for item in scope.split() if item != "user:plugins"
+    )
+    candidates: list[tuple[str, str, str | None, bool]] = [
+        ("platform+scope", OAUTH_TOKEN_URL, scope, False),
+    ]
+    if scope_without_plugins != scope:
+        candidates.append((
+            "platform+scope-no-plugins", OAUTH_TOKEN_URL,
+            scope_without_plugins, True,
+        ))
+    candidates.extend([
+        ("legacy+scope", OAUTH_TOKEN_URL_LEGACY, scope, False),
+        ("legacy-no-scope", OAUTH_TOKEN_URL_LEGACY, None, False),
+        ("platform-no-scope", OAUTH_TOKEN_URL, None, False),
+    ])
 
     errors: list[BaseException] = []
-    for name, url, cand_scope in candidates:
+    for name, url, cand_scope, invalid_scope_only in candidates:
+        if invalid_scope_only and (not errors or not _is_invalid_scope_error(errors[-1])):
+            continue
         try:
             data = _post_refresh_candidate(
                 url, refresh_token, scope=cand_scope,
@@ -1036,9 +1062,10 @@ def _profile_sync(access_token: str, *, account_key: str = "") -> dict:
     resp = network.get_sync(
         OAUTH_PROFILE_URL,
         headers={
-            # §14.1：CC v2.1.156 调 profile 只带 Bearer + json，不带 beta/UA（源码实证）
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "User-Agent": CLI_USER_AGENT,
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",
@@ -1059,7 +1086,7 @@ def _usage_sync(access_token: str, *, account_key: str = "") -> dict:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.156",
+            "User-Agent": CLI_USER_AGENT,
         },
         timeout=30,
         proxy_purpose="oauth_anthropic",
@@ -1113,7 +1140,7 @@ def _bootstrap_sync(access_token: str) -> dict:
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.156",
+            "User-Agent": f"claude-code/{CC_VERSION}",
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",
@@ -3568,7 +3595,7 @@ def _add_account_serialized(
         "last_model_sync_error": entry.get("last_model_sync_error") or "",
         "last_model_sync_attempt": entry.get("last_model_sync_attempt") or "",
         # §9-1：存登录响应的 scope（空格分隔），供 refresh 时带真实 scope；
-        # 老账号缺省空串，refresh 时回退完整六项 OAUTH_SCOPES。
+        # 老账号缺省空串，refresh 时回退当前完整 OAUTH_SCOPES。
         "scopes": entry.get("scopes", "") or "",
     }
     if provider == "cursor":

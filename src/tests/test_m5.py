@@ -418,12 +418,18 @@ async def test_claude_refresh_compat_falls_back_legacy_no_scope(m):
     assert acc["disabled_reason"] is None
     assert acc["access_token"] == "new-access"
     assert acc["refresh_token"] == "new-refresh"
-    assert calls == [(m["oauth_manager"].OAUTH_TOKEN_URL_LEGACY, {
+    base = {
         "grant_type": "refresh_token",
         "refresh_token": "r",
         "client_id": m["oauth_manager"].OAUTH_CLIENT_ID,
-    })]
-    print("  [PASS] Claude refresh compat: legacy no-scope account uses legacy endpoint")
+    }
+    scoped = {**base, "scope": m["oauth_manager"].OAUTH_SCOPES}
+    assert calls == [
+        (m["oauth_manager"].OAUTH_TOKEN_URL, scoped),
+        (m["oauth_manager"].OAUTH_TOKEN_URL_LEGACY, scoped),
+        (m["oauth_manager"].OAUTH_TOKEN_URL_LEGACY, base),
+    ]
+    print("  [PASS] Claude refresh compat: v280 scoped primary falls back to legacy no-scope")
 
 
 async def test_claude_refresh_400_invalid_request_does_not_disable(m):

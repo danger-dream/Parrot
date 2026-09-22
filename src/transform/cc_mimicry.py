@@ -1,8 +1,8 @@
-"""Claude Code messages mimicry for the empirically verified v2.1.258 wire model.
+"""Claude Code messages mimicry for the empirically verified v2.1.280 wire model.
 
 The protocol-critical pieces in this module (fingerprint, billing attribution,
 CCH hash view, body profiles and headers) are validated against captured
-v2.1.258 fixtures.  Parrot-specific compatibility behaviour remains bounded to
+v2.1.280 fixtures.  Parrot-specific compatibility behaviour remains bounded to
 this transform and private ``_parrot_*`` request context never reaches the wire.
 """
 
@@ -24,7 +24,7 @@ from .. import config as _ap_config
 # 所以 BASE_DIR = cc_mimicry.py 所在目录向上两级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CC_VERSION = "2.1.258"
+CC_VERSION = "2.1.280"
 FINGERPRINT_SALT = "59cf53e54c78"
 FINGERPRINT_INDICES = (4, 7, 20)
 CC_ENTRYPOINT = "sdk-cli"
@@ -37,11 +37,16 @@ THINKING_TOKEN_COUNT_BETA = "thinking-token-count-2026-05-13"
 CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
 PROMPT_CACHING_SCOPE_BETA = "prompt-caching-scope-2026-01-05"
 MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-2026-04-07"
+MID_CONVERSATION_TOOL_CHANGES_BETA = "mid-conversation-tool-changes-2026-07-01"
 ADVISOR_TOOL_BETA = "advisor-tool-2026-03-01"
 ADVANCED_TOOL_USE_BETA = "advanced-tool-use-2025-11-20"
 EFFORT_BETA = "effort-2025-11-24"
-SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-06-01"
 FALLBACK_CREDIT_BETA = "fallback-credit-2026-06-01"
+THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01"
+PER_TURN_CONTROL_BETA = "per-turn-control-2026-07-01"
+TIMING_BETA = "timing-2026-09-09"
+INLINE_TOOLS_BETA = "inline-tools-2026-09-15"
 STRUCTURED_OUTPUTS_BETA = "structured-outputs-2025-12-15"
 CACHE_DIAGNOSIS_BETA = "cache-diagnosis-2026-04-07"
 EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
@@ -53,34 +58,40 @@ BETAS = [
     "claude-code-20250219", FAST_MODE_BETA, CONTEXT_1M_BETA,
     INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
-    MID_CONVERSATION_SYSTEM_BETA, ADVISOR_TOOL_BETA,
-    ADVANCED_TOOL_USE_BETA, EFFORT_BETA, SERVER_SIDE_FALLBACK_BETA,
-    FALLBACK_CREDIT_BETA, STRUCTURED_OUTPUTS_BETA, CACHE_DIAGNOSIS_BETA,
-    EXTENDED_CACHE_TTL_BETA,
+    MID_CONVERSATION_SYSTEM_BETA, MID_CONVERSATION_TOOL_CHANGES_BETA,
+    ADVISOR_TOOL_BETA, ADVANCED_TOOL_USE_BETA, EFFORT_BETA,
+    SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
+    THINKING_BINDING_CONTROLS_BETA, PER_TURN_CONTROL_BETA, TIMING_BETA,
+    INLINE_TOOLS_BETA, STRUCTURED_OUTPUTS_BETA, CACHE_DIAGNOSIS_BETA,
+    EXTENDED_CACHE_TTL_BETA, OAUTH_BETA,
 ]
 
+# Parrot's transformed requests deliberately use the full stdin/SDK profile: it
+# is the profile carrying CCH, prompt attribution and the complete tool surface.
 _MAIN_BETAS = [
     "claude-code-20250219", INTERLEAVED_THINKING_BETA,
     THINKING_TOKEN_COUNT_BETA, CONTEXT_MANAGEMENT_BETA,
     PROMPT_CACHING_SCOPE_BETA, MID_CONVERSATION_SYSTEM_BETA,
-    ADVANCED_TOOL_USE_BETA, EFFORT_BETA, CACHE_DIAGNOSIS_BETA,
+    MID_CONVERSATION_TOOL_CHANGES_BETA, ADVANCED_TOOL_USE_BETA,
+    EFFORT_BETA, FALLBACK_CREDIT_BETA, THINKING_BINDING_CONTROLS_BETA,
+    CACHE_DIAGNOSIS_BETA,
 ]
-_FABLE_API_KEY_BETAS = [
+_FABLE_MAIN_BETAS = [
     "claude-code-20250219", INTERLEAVED_THINKING_BETA,
     THINKING_TOKEN_COUNT_BETA, CONTEXT_MANAGEMENT_BETA,
     PROMPT_CACHING_SCOPE_BETA, MID_CONVERSATION_SYSTEM_BETA,
-    ADVISOR_TOOL_BETA, ADVANCED_TOOL_USE_BETA, EFFORT_BETA,
-    SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
-    CACHE_DIAGNOSIS_BETA,
+    MID_CONVERSATION_TOOL_CHANGES_BETA, ADVANCED_TOOL_USE_BETA,
+    EFFORT_BETA, SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
+    THINKING_BINDING_CONTROLS_BETA, CACHE_DIAGNOSIS_BETA,
 ]
-_OPUS_5_BETAS = [
-    "claude-code-20250219", CONTEXT_1M_BETA,
+_OPUS_5_BETAS = list(_MAIN_BETAS)
+_HAIKU_MAIN_BETAS = [
     INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
-    MID_CONVERSATION_SYSTEM_BETA, ADVISOR_TOOL_BETA,
-    ADVANCED_TOOL_USE_BETA, EFFORT_BETA, FALLBACK_CREDIT_BETA,
-    CACHE_DIAGNOSIS_BETA,
+    "claude-code-20250219",
 ]
+# Keep the separately observed legacy title/side-query profile.  Haiku main
+# traffic is selected above and has the v280 five-beta profile.
 _SIDE_QUERY_BETAS = [
     INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
@@ -158,7 +169,7 @@ _SYSTEM_REMINDER_RE = re.compile(
 
 
 def select_fingerprint_prompt(messages) -> str:
-    """Return CC v258's first valid text from the first non-meta user turn.
+    """Return CC v280's first valid text from the first non-meta user turn.
 
     Explicit ``isMeta`` flags and complete wire ``<system-reminder>`` blocks do
     not contribute.  A ``<session>...`` side-query block is ordinary text.
@@ -265,6 +276,9 @@ def build_system_blocks(
         valid_prompt_id = _valid_prompt_id(prompt_id)
         if valid_prompt_id:
             parts.append(f"cc_prompt_id={valid_prompt_id}")
+        # Parrot emits the full stdin/SDK request shape (CCH + prompt id), whose
+        # v280 attribution always terminates with the SDK turn origin.
+        parts.append("cc_turn_origin=sdk")
         attribution = "x-anthropic-billing-header: " + "; ".join(parts) + ";"
         blocks.append({"type": "text", "text": attribution})
     cc_block = {
@@ -586,7 +600,7 @@ def _strip_assistant_thinking_blocks(messages):
 # ─── Metadata ──────────────────────────────────────────────────────
 
 def build_metadata(email="", session_id=None):
-    # v258 wire keeps account_uuid empty even when an OAuth account email exists.
+    # v280 wire keeps account_uuid empty even when an OAuth account email exists.
     sid = session_id or str(uuid.uuid4())
     return {"user_id": json.dumps(
         {"device_id": DEVICE_ID, "account_uuid": "", "session_id": sid},
@@ -795,7 +809,7 @@ _SIDE_QUERY_OUTPUT_CONFIG = {
 
 
 def _is_fable_model(model) -> bool:
-    return str(model or "").lower() == "claude-fable-5"
+    return str(model or "").lower() in {"claude-fable-5", "claude-fable-5.1"}
 
 
 def _is_opus_5_model(model) -> bool:
@@ -820,9 +834,9 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
     model = body.get("model", "claude-sonnet-4-20250514")
     side_query = _is_side_query_request(body, model, messages=original_messages)
     fable_main = _is_fable_model(model) and not side_query
-    # No authoritative OAuth Fable-main body exists.  Preserve explicit fields
-    # there and apply only the observed auth/header differences.
-    auto_profile = not (fable_main and auth_mode == "oauth")
+    # v280 API-key and OAuth captures share the same main body profile; auth
+    # differences are expressed in headers/betas rather than by dropping fields.
+    auto_profile = True
 
     sid = str(session_id or body.get(PARROT_CC_SESSION_ID_KEY) or "").strip() or str(uuid.uuid4())
     prompt_id = None if side_query else body.get(PARROT_CC_PROMPT_ID_KEY)
@@ -849,7 +863,7 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
         if dynamic_tool_map:
             print(f"  [tool] dynamic mapping {len(dynamic_tool_map)} tools")
 
-    # v258 insertion order is the wire order.  Optional compatibility fields are
+    # v280 insertion order is the wire order.  Optional compatibility fields are
     # inserted adjacent to their native section and all private fields are consumed.
     payload = {"model": model, "messages": messages, "system": system_blocks}
 
@@ -932,12 +946,12 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
     return payload, dynamic_tool_map
 
 
-# ─── CCH v258 signature ────────────────────────────────────────────
+# ─── CCH v280 signature ────────────────────────────────────────────
 
 CCH_SEED = 0x4D659218E32A3268
 CCH_PLACEHOLDER = b"cch=00000"
 _BILLING_PREFIX = "x-anthropic-billing-header: "
-_CCH_IN_BILLING_RE = re.compile(r"(?<=; )cch=[0-9a-f]{5}(?=;)")
+_CCH_IN_BILLING_RE = re.compile(r"cch=[0-9a-f]{5}")
 
 
 def _generated_billing_block(payload_dict):
@@ -952,28 +966,72 @@ def _generated_billing_block(payload_dict):
 
 
 def _replace_generated_billing_cch(payload_dict, replacement: str):
-    """Copy the payload while changing only Parrot's generated billing block."""
-    billing = _generated_billing_block(payload_dict)
-    if billing is None:
+    """Copy the payload while zeroing CCH in every system billing block."""
+    system = payload_dict.get("system") if isinstance(payload_dict, dict) else None
+    if not isinstance(system, list):
         return payload_dict
-    text = billing.get("text", "")
-    updated = _CCH_IN_BILLING_RE.sub(f"cch={replacement}", text, count=1)
-    if updated == text:
+    changed = False
+    updated_system = list(system)
+    for index, block in enumerate(system):
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if block.get("type") != "text" or not isinstance(text, str) or not text.startswith(_BILLING_PREFIX):
+            continue
+        updated = _CCH_IN_BILLING_RE.sub(f"cch={replacement}", text)
+        if updated != text:
+            updated_system[index] = {**block, "text": updated}
+            changed = True
+    if not changed:
         return payload_dict
-    out = dict(payload_dict)
-    system = list(payload_dict["system"])
-    system[0] = {**billing, "text": updated}
-    out["system"] = system
+    return {**payload_dict, "system": updated_system}
+
+
+def _cch_hash_content_block(value):
+    """Normalize one messages[].content[] block using v280's targeted rule."""
+    if not isinstance(value, dict):
+        return _cch_hash_value(value)
+    is_tool_use = value.get("type") == "tool_use"
+    out = {}
+    for key, item in value.items():
+        if is_tool_use and key == "input" and isinstance(item, dict):
+            out[key] = _cch_hash_value({
+                input_key: input_value
+                for input_key, input_value in item.items()
+                if input_key != "max_tokens"
+            })
+        else:
+            out[key] = _cch_hash_value(item)
     return out
+
+
+def _cch_hash_messages(value):
+    if not isinstance(value, list):
+        return _cch_hash_value(value)
+    messages = []
+    for message in value:
+        if not isinstance(message, dict):
+            messages.append(_cch_hash_value(message))
+            continue
+        normalized = {}
+        for key, item in message.items():
+            if key == "content" and isinstance(item, list):
+                normalized[key] = [_cch_hash_content_block(block) for block in item]
+            else:
+                normalized[key] = _cch_hash_value(item)
+        messages.append(normalized)
+    return messages
 
 
 def _cch_hash_value(value, *, top_level=False):
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():
-            if top_level and key == "max_tokens":
+            if top_level and key in {"max_tokens", "fallbacks"}:
                 continue
-            if key == "model" and isinstance(item, str):
+            if top_level and key == "messages":
+                out[key] = _cch_hash_messages(item)
+            elif key == "model" and isinstance(item, str):
                 out[key] = ""
             else:
                 out[key] = _cch_hash_value(item)
@@ -1029,7 +1087,7 @@ def sign_body(payload_dict):
     return body_bytes[:start] + cch + body_bytes[start + 5:]
 
 
-# ─── v258 upstream headers ─────────────────────────────────────────
+# ─── v280 upstream headers ─────────────────────────────────────────
 
 _STAINLESS_HEADERS = {
     "X-Stainless-Arch": "x64",
@@ -1233,8 +1291,8 @@ def request_context_1m_override(body=None, *, downstream_betas=None,
 
 
 def should_default_context_1m(model) -> bool:
-    """v258 capture default: Opus 5 carries context-1m; Opus 4.8 does not."""
-    return _is_opus_5_model(model)
+    """v280 captured profiles do not silently opt models into 1M context."""
+    return False
 
 
 def _is_opus_4_plus_model(model) -> bool:
@@ -1251,7 +1309,7 @@ def model_supports_context_1m(model) -> bool:
 
 
 def model_supports_mid_conversation_system(model) -> bool:
-    """CC v2.1.258 mid-conversation-system compatibility model gate."""
+    """CC v2.1.280 mid-conversation-system compatibility model gate."""
     m = str(model or "").lower()
     if m.startswith("claude-3-"):
         return True
@@ -1259,7 +1317,7 @@ def model_supports_mid_conversation_system(model) -> bool:
         "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5",
         "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
         "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-sonnet-4-6",
-        "claude-haiku-4-5", "claude-fable-5",
+        "claude-haiku-4-5", "claude-fable-5", "claude-fable-5.1",
     ))
 
 
@@ -1301,24 +1359,20 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list
     )
     if side_query:
         out = list(_SIDE_QUERY_BETAS)
+    elif str(model or "").lower().startswith("claude-haiku-4-5"):
+        out = list(_HAIKU_MAIN_BETAS)
     elif _is_fable_model(model):
-        out = list(_FABLE_API_KEY_BETAS)
+        out = list(_FABLE_MAIN_BETAS)
     elif _is_opus_5_model(model):
         out = list(_OPUS_5_BETAS)
     else:
         out = list(_MAIN_BETAS)
 
     if auth_mode == "oauth":
-        # Observed auth difference: advisor remains while API-key-only fallback
-        # betas disappear.  No unknown OAuth Fable body combination is invented.
-        out = [b for b in out if b not in {
-            SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
-        }]
-        _insert_beta_before(
-            out,
-            ADVISOR_TOOL_BETA,
-            STRUCTURED_OUTPUTS_BETA if side_query else ADVANCED_TOOL_USE_BETA,
-        )
+        # v280 OAuth keeps both fallback betas.  Its auth marker is second in
+        # main profiles (immediately after claude-code) and no capture carries
+        # the old advisor beta.
+        _insert_beta_after(out, OAUTH_BETA, "claude-code-20250219")
     return out
 
 
@@ -1329,9 +1383,10 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
                                 auth_mode="api_key"):
     out = _wire_beta_profile(model, payload, auth_mode=auth_mode)
     if betas is not None:
-        allowed = [b for b in parse_beta_header(betas) if b != OAUTH_BETA]
+        allowed = parse_beta_header(betas)
         known = set(BETAS)
-        out = [b for b in out if b in allowed]
+        required = {OAUTH_BETA} if auth_mode == "oauth" else set()
+        out = [b for b in out if b in allowed or b in required]
         out.extend(b for b in allowed if b not in known and b not in out)
 
     if wants_fast_mode is None:
@@ -1373,7 +1428,7 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
                            auth_mode=None, model=None, payload=None, downstream_betas=None,
                            original_model=None, wants_context_1m=None,
                            wants_fast_mode=None, allow_any_model_context_1m=False):
-    """Build the ordered v258 application headers for one Messages attempt.
+    """Build the ordered v280 application headers for one Messages attempt.
 
     ``auth_mode`` controls only evidence-backed beta differences; third-party
     Bearer providers therefore do not silently acquire OAuth-specific behaviour.
@@ -1404,6 +1459,13 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
     if auth_scheme == "api_key":
         headers["x-api-key"] = access_token
     headers["x-app"] = "cli"
+    side_query = _is_side_query_request(
+        payload or {}, model, messages=(payload or {}).get("messages", []),
+    )
+    if not side_query and not str(model or "").lower().startswith("claude-haiku-4-5"):
+        headers["x-claude-code-request-class"] = "main"
     headers["x-client-request-id"] = str(uuid.uuid4())
+    # httpx always decodes gzip/deflate.  Brotli/zstd are not declared because
+    # they are optional runtime extras and zstd is not a project dependency.
     headers["Accept-Encoding"] = "gzip, deflate"
     return headers
