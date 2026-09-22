@@ -1004,6 +1004,24 @@ def test_tg_openai_add_state_mismatch(m):
     print("  [PASS] tg openai add: state mismatch rejected, no account saved")
 
 
+def test_tg_openai_callback_url_requires_state(m):
+    _setup(m)
+    rec = _install_recorder(m)
+    cm = m["oauth_menu"]
+
+    cm.on_login_openai_start(42, 100, "cb")
+    rec.clear()
+    cm.on_login_openai_code_input(
+        42, "http://localhost:1455/auth/callback?code=mock_auth_code",
+    )
+    sent = rec.last("sendMessage")
+    assert sent and "缺少 state" in sent["text"]
+    assert not any(
+        account.get("provider") == "openai"
+        for account in m["config"].get()["oauthAccounts"]
+    )
+
+
 def test_tg_openai_callback_rejects_wrong_redirect_but_keeps_bare_code_compat(m):
     _setup(m)
     rec = _install_recorder(m)

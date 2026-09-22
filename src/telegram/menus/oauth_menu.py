@@ -5703,8 +5703,9 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
     data = state.get("data") or {}
 
     raw_callback = str(text or "").strip()
+    is_callback_url = raw_callback.startswith(("http://", "https://"))
     if (
-        raw_callback.startswith(("http://", "https://"))
+        is_callback_url
         and not oauth_control.openai_validate_callback_url(
             raw_callback, redirect_uri=str(data.get("redirect_uri") or "") or None,
         )
@@ -5724,6 +5725,14 @@ def on_login_openai_code_input(chat_id: int, text: str) -> None:
     # PKCE protects the code. Preserve the existing manual bare-code flow, but
     # whenever a callback/query supplies state, bind it to this TG login session.
     orig_state = str(data.get("state") or "")
+    if is_callback_url and orig_state and not recv_state:
+        ui.send_result(
+            chat_id,
+            "❌ 完整回调地址中缺少 state，请重新发起登录流程；"
+            "如需手工输入，请只发送授权 code。",
+            **_OA_NAV_OPENAI,
+        )
+        return
     if recv_state and orig_state and not secrets.compare_digest(recv_state, orig_state):
         ui.send_result(
             chat_id,
