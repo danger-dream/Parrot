@@ -55,7 +55,7 @@ SCOPES_REFRESH = "openid profile email"
 from ..openai.codex_constants import (
     codex_cli_user_agent,
     codex_originator,
-    codex_workspace_routing,
+    codex_workspace_routing_patch,
 )
 
 # 运行期请求超时（换 token / 刷 token）。
@@ -345,7 +345,7 @@ def _extract_email_from_account(account: dict) -> str:
 def _account_check_candidate(account: dict, *, account_id: str = "") -> dict:
     plan_type = _extract_plan_type(account)
     workspace_id = _extract_account_workspace_id(account, account_id=account_id)
-    workspace_routing = codex_workspace_routing(account)
+    workspace_routing = codex_workspace_routing_patch(account)
     org_id = str(account.get("organization_id") or account.get("org_id") or "")
     if not org_id:
         for obj in (account.get("account"), account.get("workspace")):
@@ -366,8 +366,7 @@ def _account_check_candidate(account: dict, *, account_id: str = "") -> dict:
         "organization_id": org_id,
         "plan_type": plan_type,
         "subscription_expires_at": _extract_subscription_expires_at(account),
-        "workspace_backend_origin": workspace_routing[0] if workspace_routing else "",
-        "account_routing_override": workspace_routing[1] if workspace_routing else "",
+        **workspace_routing,
         "email": _extract_email_from_account(account),
         "is_default": bool((account.get("account") or {}).get("is_default"))
         if isinstance(account.get("account"), dict) else False,
@@ -512,12 +511,14 @@ def fetch_accounts_check_sync(access_token: str, *, org_id: str | None = None,
     )
     if not payload:
         return None
-    candidates = _accounts_check_candidates(payload, email=email)
-    if not candidates:
+    try:
+        candidates = _accounts_check_candidates(payload, email=email)
+        return _select_accounts_check_candidate(
+            candidates, workspace_id=workspace_id, org_id=org_id,
+        )
+    except (TypeError, ValueError, AttributeError):
+        # Optional metadata must not discard a successfully rotated token pair.
         return None
-    return _select_accounts_check_candidate(
-        candidates, workspace_id=workspace_id, org_id=org_id,
-    )
 
 
 def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
@@ -556,11 +557,11 @@ def enrich_token_response_sync(data: dict, *, workspace_id: str | None = None,
         # accounts/check 只用于按当前 identity 补 plan/name/subscription，不能改主键。
         "workspace_name", "workspace_type",
         "organization_id", "plan_type", "subscription_expires_at", "email",
-        "workspace_backend_origin", "account_routing_override",
     ):
         val = info.get(key)
         if val:
             enriched[key] = val
+    enriched.update(codex_workspace_routing_patch(info))
     return enriched
 
 def exchange_code_sync(code: str, code_verifier: str,

@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlparse, urlunparse
 
 import websockets
+from websockets.asyncio.client import connect as AsyncConnect
 
 from .. import blacklist
 from ..async_owned import await_owned
@@ -35,6 +36,13 @@ from ..proxy.connector import (
 from .timing import BusinessTimeoutError, RoundTimeouts, WsAttemptTiming
 from .websocket import event_type as ws_event_type, frame_size as ws_frame_size
 from .ws_diagnostics import log_ws_close
+
+
+class RejectRedirectConnect(AsyncConnect):
+    """Codex workspace routing binds credentials to this exact backend."""
+
+    def process_redirect(self, exc: Exception) -> Exception:
+        return exc
 
 
 @dataclass

@@ -617,9 +617,14 @@ async def test_realtime_ws_rejects_disallowed_model_before_upstream(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_realtime_call_keeps_backend_body_and_binds_sideband_account(monkeypatch, m):
+@pytest.mark.parametrize("routed", [False, True])
+async def test_realtime_call_keeps_backend_body_and_binds_sideband_account(monkeypatch, m, routed):
     cfg = _setup(m)
     channel = _install_oauth_channel(m, cfg)
+    if routed:
+        account = m["oauth_manager"].get_account(channel.account_key)
+        account.update(workspace_backend_origin="https://gov.chatgpt.com", account_routing_override="us_cr")
+        monkeypatch.setattr(m["oauth_manager"], "get_account", lambda _key: account)
     body = json.dumps(
         {
             "sdp": "v=offer\\r\\n",
@@ -636,10 +641,9 @@ async def test_realtime_call_keeps_backend_body_and_binds_sideband_account(monke
         }
 
     async def fake_post(url, *, headers, body: bytes, channel: object, model):
-        assert url == (
-            "https://chatgpt.com/backend-api/codex/realtime/calls"
-            "?intent=quicksilver&architecture=avas"
-        )
+        origin = "https://gov.chatgpt.com" if routed else "https://chatgpt.com"
+        assert url == origin + "/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+        assert headers.get("x-openai-account-routing-override") == ("us_cr" if routed else None)
         assert headers["authorization"] == "Bearer oauth-access-token"
         assert headers["chatgpt-account-id"] == "workspace-realtime"
         assert headers["openai-alpha"] == "quicksilver=v2"

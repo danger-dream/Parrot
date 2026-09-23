@@ -20,11 +20,13 @@ from fastapi.responses import Response
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
 
-from .. import apikey_limiter, auth, concurrency, config, errors, load_balancing, model_validation, network, scorer
+from .. import apikey_limiter, auth, channel_state, concurrency, config, errors, load_balancing, model_validation, network, oauth_manager, scorer
 from ..channel import registry
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
 from ..transports import WsProxyBytes, connect_upstream_ws, resolve_ws_route_chain
 from .codex_constants import (
+    CODEX_ACCOUNT_ROUTING_OVERRIDE_HEADER,
+    apply_codex_workspace_routing,
     codex_backend_base_url,
     codex_realtime_websocket_base_url,
 )
@@ -141,6 +143,8 @@ def _raw_query(scope: dict) -> str:
 
 def _should_forward_realtime_header(name: str) -> bool:
     lowered = name.lower()
+    if lowered == CODEX_ACCOUNT_ROUTING_OVERRIDE_HEADER:
+        return False  # workspace routing belongs to the selected upstream account
     return (
         lowered in _REALTIME_FORWARD_HEADERS
         or lowered.startswith("x-codex-")
@@ -564,6 +568,10 @@ async def handle_realtime_call(request: Request) -> Response:
             content_type=content_type,
         )
         upstream_url = _realtime_call_url(_raw_query(request.scope))
+        account_key = channel_state.resolve(channel.key).removeprefix("oauth:")
+        upstream_url, headers = apply_codex_workspace_routing(
+            upstream_url, headers, oauth_manager.get_account(account_key),
+        )
         try:
             upstream_response = await _post_realtime_call(
                 upstream_url,

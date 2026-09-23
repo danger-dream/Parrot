@@ -1493,6 +1493,8 @@ async def _try_ws_channel(
                 open_timeout=round_timeouts.connection + 0.5,
                 timing=timing,
                 round_timeouts=round_timeouts,
+                **({"reject_redirects": True} if (upstream_req.translator_ctx or {}).get(
+                    "codex_workspace_routed") else {}),
             )
             if not timing.connection_complete:
                 timing.mark_handshake_complete()
@@ -3675,7 +3677,9 @@ async def _connect_upstream_ws(
     open_timeout: float,
     timing: WsAttemptTiming,
     round_timeouts: RoundTimeouts,
+    reject_redirects: bool = False,
 ):
+    from ..transports.ws_runtime import RejectRedirectConnect
     return await connect_upstream_ws(
         url,
         headers=headers,
@@ -3685,7 +3689,7 @@ async def _connect_upstream_ws(
         timing=timing,
         round_timeouts=round_timeouts,
         open_socket_func=_open_socket_via_ss2022,
-        connect_func=websockets.connect,
+        connect_func=RejectRedirectConnect if reject_redirects else websockets.connect,
     )
 
 

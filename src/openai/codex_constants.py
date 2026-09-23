@@ -487,19 +487,52 @@ def codex_workspace_routing(
     override = str(account.get("account_routing_override") or "").strip()
     if not origin or override not in _CODEX_WORKSPACE_ROUTING_OVERRIDES:
         return None
-    parsed = urlsplit(origin)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-    ):
+    # This sentinel constrains the routing header but not the backend origin.
+    if origin == "NO_CONSTRAINT":
+        return origin, override
+    if any(ord(char) <= 32 or ord(char) >= 127 for char in origin):
         return None
-    normalized_origin = urlunsplit(("https", parsed.netloc, "", "", ""))
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port  # validates both syntax and the TCP port range
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query or parsed.fragment or "?" in origin or "#" in origin
+            or port == 0
+        ):
+            return None
+    except (TypeError, ValueError):
+        return None
+    normalized_origin = urlunsplit(("https", parsed.netloc.lower(), "", "", ""))
     return normalized_origin, override
+
+
+def codex_workspace_routing_patch(account: Mapping[str, Any]) -> dict[str, str]:
+    """Atomic metadata update: absent/invalid keeps LKG; explicit empty clears."""
+    keys = ("workspace_backend_origin", "account_routing_override")
+    if not all(key in account for key in keys):
+        return {}
+    if all(account[key] in (None, "") for key in keys):
+        return dict.fromkeys(keys, "")
+    routing = codex_workspace_routing(account)
+    return dict(zip(keys, routing)) if routing is not None else {}
+
+
+def codex_workspace_route_applies(url: str, account: Mapping[str, Any] | None) -> bool:
+    """Never redirect an independently configured relay to a workspace backend."""
+    routing = codex_workspace_routing(account)
+    if routing is None:
+        return False
+    try:
+        parsed = urlsplit(url)
+        origin = urlunsplit((parsed.scheme, parsed.netloc.lower(), "", "", ""))
+    except ValueError:
+        return False
+    return origin in {"https://chatgpt.com", "https://chat.openai.com", routing[0]}
 
 
 def apply_codex_workspace_routing(
@@ -513,11 +546,11 @@ def apply_codex_workspace_routing(
         if str(name).lower() != CODEX_ACCOUNT_ROUTING_OVERRIDE_HEADER
     }
     routing = codex_workspace_routing(account)
-    if routing is None:
+    if routing is None or not codex_workspace_route_applies(url, account):
         return url, routed_headers
     origin, override = routing
     target = urlsplit(url)
-    backend = urlsplit(origin)
+    backend = target if origin == "NO_CONSTRAINT" else urlsplit(origin)
     routed_url = urlunsplit(
         (backend.scheme, backend.netloc, target.path, target.query, target.fragment)
     )

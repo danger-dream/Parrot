@@ -695,7 +695,7 @@ def test_openai_eight_day_refresh_fallback_uses_only_reliable_timestamp(m):
             "provider": "openai",
             "access_token": f"at-{email}",
             "refresh_token": f"rt-{email}",
-            "expired": (now + timedelta(days=1)).isoformat(),
+            "expired": "",  # eight-day policy is only the unknown-expiry fallback
             "last_refresh": last_refresh.isoformat(),
             "chatgpt_account_id": f"acct-{email}",
         })

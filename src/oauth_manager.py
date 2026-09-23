@@ -56,6 +56,7 @@ from .openai.codex_constants import (
     codex_backend_base_url,
     codex_cli_version,
     codex_protocol_profile,
+    codex_workspace_routing_patch,
     current_codex_protocol_profile,
 )
 from .transform.cc_mimicry import CC_VERSION, CLI_USER_AGENT
@@ -383,9 +384,36 @@ def _parse_iso(s: str | None) -> datetime | None:
         return None
 
 
+def _token_expiry(account: dict) -> datetime | None:
+    """Use known expiry; OpenAI imports may carry it only in the access JWT."""
+    if provider_of(account) == "openai":
+        try:
+            exp = openai_provider.decode_id_token(account.get("access_token") or "").get("exp")
+            if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+                return datetime.fromtimestamp(exp, tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    expiry = _parse_iso(account.get("expired"))
+    return expiry if expiry is not None and expiry.tzinfo is not None else None
+
+
+def _token_is_fresh(account: dict) -> bool:
+    if provider_of(account) == "openai" and not _openai_workspace_id(account):
+        return False
+    expiry = _token_expiry(account)
+    if expiry is not None:
+        return (expiry - datetime.now(timezone.utc)).total_seconds() >= 300
+    last = _parse_iso(account.get("last_refresh"))
+    return bool(
+        provider_of(account) == "openai" and account.get("access_token")
+        and last is not None and last.tzinfo is not None
+        and not _openai_last_refresh_stale(account)
+    )
+
+
 def _openai_last_refresh_stale(account: dict, *, now: datetime | None = None) -> bool:
-    """Use the persisted refresh timestamp only when it is valid and timezone-aware."""
-    if provider_of(account) != "openai":
+    """Eight days is the unknown-expiry fallback, never an extra expiry rule."""
+    if provider_of(account) != "openai" or _token_expiry(account) is not None:
         return False
     last_refresh = _parse_iso(account.get("last_refresh"))
     if last_refresh is None or last_refresh.tzinfo is None:
@@ -818,13 +846,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
 
         # 双重检查：force 路径不做（强制刷）
         if not force:
-            expired = _parse_iso(acc.get("expired"))
-            if (
-                expired
-                and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
-                and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
-                and not _openai_last_refresh_stale(acc)
-            ):
+            if _token_is_fresh(acc):
                 return acc["access_token"]
 
         provider = provider_of(acc)
@@ -908,8 +930,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                 new_fields["subscription_expires_at"] = data["subscription_expires_at"]
             for k in (
                 "workspace_id", "workspace_name", "workspace_type",
-                "organization_id", "workspace_backend_origin",
-                "account_routing_override",
+                "organization_id",
             ):
                 if not data.get(k):
                     continue
@@ -933,6 +954,7 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
                     ):
                         continue
                 new_fields[k] = data[k]
+            new_fields.update(codex_workspace_routing_patch(data))
 
         # xAI: refresh 响应若带 id_token 同步 subject/email 元数据。
         if provider == "xai":
@@ -1021,13 +1043,7 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
 
     if provider_of(acc) == "workbuddy":
         return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
-    expired = _parse_iso(acc.get("expired"))
-    if (
-        expired
-        and (expired - datetime.now(timezone.utc)).total_seconds() >= 300
-        and (provider_of(acc) != "openai" or _openai_workspace_id(acc))
-        and not _openai_last_refresh_stale(acc)
-    ):
+    if _token_is_fresh(acc):
         return acc["access_token"]
 
     return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
@@ -4676,7 +4692,6 @@ def _openai_metadata_new_fields(acc: dict, info: dict) -> dict:
     fields: dict[str, str] = {}
     for k in (
         "plan_type", "subscription_expires_at", "workspace_type", "organization_id",
-        "workspace_backend_origin", "account_routing_override",
     ):
         v = info.get(k)
         if v not in (None, ""):
@@ -4693,13 +4708,16 @@ def _openai_metadata_new_fields(acc: dict, info: dict) -> dict:
             and existing_name.lower() not in {"personal", "workspace", "team"}
         ):
             fields["workspace_name"] = incoming_name
+    fields.update(codex_workspace_routing_patch(info))
     return fields
 
 
 def refresh_openai_metadata_sync(account_key: str, *,
                                  force: bool = False,
                                  min_interval_seconds: int = 3600) -> dict:
-    """Refresh OpenAI account plan/workspace metadata without rotating tokens."""
+    """Refresh metadata, binding the result to the same credential generation."""
+    from . import channel_state
+
     canonical = _resolve_existing_account_key(account_key)
     if canonical:
         account_key = canonical
@@ -4709,7 +4727,9 @@ def refresh_openai_metadata_sync(account_key: str, *,
     if provider_of(acc) != "openai":
         return {"action": "noop_not_openai", "account_key": _canonical_key(acc)}
 
+    acc = copy.deepcopy(acc)
     canonical = _canonical_key(acc)
+    expected_state_key = account_state_key(acc)
     if not force:
         last = _parse_iso(acc.get("last_metadata_refresh"))
         if last is not None:
@@ -4739,16 +4759,24 @@ def refresh_openai_metadata_sync(account_key: str, *,
     if not info:
         return {"action": "fetch_no_metadata", "account_key": canonical}
 
-    fields = _openai_metadata_new_fields(acc, info)
-    fields["last_metadata_refresh"] = _format_utc(datetime.now(timezone.utc))
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            return {"action": "skipped:deleted_generation", "account_key": canonical}
+        target = channel_state.resolve(expected_state_key)
+        target_key = target.removeprefix("oauth:")
+        current_account = get_account(target_key)
+        if current_account is None or current_account.get("access_token") != access_token:
+            return {"action": "skipped:credentials_changed", "account_key": canonical}
+        fields = _openai_metadata_new_fields(current_account, info)
+        fields["last_metadata_refresh"] = _format_utc(datetime.now(timezone.utc))
 
-    def mutate(cfg):
-        for item in cfg.get("oauthAccounts", []):
-            if _canonical_key(item) == canonical:
-                item.update(fields)
-                return
-    config.update(mutate)
-    return {"action": "updated", "account_key": canonical, "fields": fields}
+        def mutate(cfg):
+            for item in cfg.get("oauthAccounts", []):
+                if _canonical_key(item) == target_key:
+                    item.update(fields)
+                    return
+        config.update(mutate)
+    return {"action": "updated", "account_key": target_key, "fields": fields}
 
 
 async def ensure_openai_metadata_fresh(account_key: str, *,
@@ -6115,8 +6143,8 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             except Exception as exc:
                 print(f"[oauth] openai metadata refresh failed for {ak}: {exc}")
 
-        expired = _parse_iso(acc.get("expired"))
-        if expired is None and provider != "workbuddy":
+        expired = _token_expiry(acc)
+        if expired is None and provider != "workbuddy" and not _openai_last_refresh_stale(acc):
             out[email] = "skipped:no_expired"
             continue
 
@@ -6124,7 +6152,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
         if provider == "workbuddy" and not workbuddy_runtime.refresh_due(acc, ak, refresh_threshold_seconds):
             out[email] = "skipped:backoff_or_healthy"
             continue
-        if remaining >= refresh_threshold_seconds and not _openai_last_refresh_stale(acc):
+        if remaining >= refresh_threshold_seconds:
             out[email] = "skipped:healthy"
             continue
 
