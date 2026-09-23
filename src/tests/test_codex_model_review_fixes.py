@@ -215,14 +215,29 @@ async def test_named_ws_delta_without_definitions_is_not_silently_auto(env):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["http", "websocket"])
-async def test_flex_and_existing_compatibility_policy(env, transport):
-    channel = await sync(env, [record(service_tiers=[])])
+@pytest.mark.parametrize("tiers,status", [
+    (None, "permitted"), ([], "permitted"),
+    ([{"id": "priority", "name": "Fast"}], "permitted"),
+    ([{"id": "flex", "name": "Flex"}], "advertised"),
+])
+async def test_flex_and_existing_compatibility_policy(env, transport, tiers, status):
+    fields = {"service_tiers": tiers} if tiers is not None else {}
+    channel = await sync(env, [record(**fields)])
+    original_catalog = copy.deepcopy(oauth_manager.get_account(KEY)["account_model_catalog"])
+    assert channel.service_tier_catalog_status("gpt-6-sol", "flex") == status
     _, payload = await request(channel, "gpt-6-sol", {"service_tier": "flex", "max_output_tokens": 1, "temperature": 0}, transport)
     assert payload["service_tier"] == "flex"
     assert "max_output_tokens" not in payload and "temperature" not in payload
     assert payload["reasoning"]["effort"] == "medium"  # missing defaults use profile
-    with pytest.raises(Exception, match="does not advertise"):
-        await request(channel, "gpt-6-sol", {"service_tier": "unsupported"}, transport)
+    if tiers is not None:
+        with pytest.raises(GuardError, match="does not advertise"):
+            await request(channel, "gpt-6-sol", {"service_tier": "unsupported"}, transport)
+        assert original_catalog["models"][0]["serviceTiers"] == tiers
+    else:
+        assert channel.service_tier_catalog_status("gpt-6-sol", "unsupported") == "unknown"
+        assert "serviceTiers" not in original_catalog["models"][0]
+    assert oauth_manager.get_account(KEY)["account_model_catalog"] == original_catalog
+    assert json.loads(Path(config.CONFIG_PATH).read_text())["oauthAccounts"][0]["account_model_catalog"] == original_catalog
 
 
 @pytest.mark.asyncio

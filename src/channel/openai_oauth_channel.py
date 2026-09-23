@@ -300,32 +300,32 @@ class OpenAIOAuthChannel(Channel):
         model: str,
         service_tier: str | None,
     ) -> str:
-        """Return ``advertised``, ``not_advertised``, ``standard`` or ``unknown``.
+        """Distinguish catalog advertisement from official request permission.
 
-        The account-scoped authenticated Codex ``/models`` response is the only
-        official preflight signal for service tiers.  Older/failed catalogs did
-        not persist ``serviceTiers``; those remain unknown and are allowed to
-        reach the upstream for backward compatibility.
+        ``advertised`` requires the authenticated catalog to list the tier;
+        ``permitted`` is Flex's official exception without such advertisement.
+        Older/failed catalogs without ``serviceTiers`` remain ``unknown`` for
+        other tiers and may reach upstream for backward compatibility.
+        Standard/default requests return ``standard``; other unlisted tiers in
+        a known catalog return ``not_advertised`` and fail candidate preflight.
         """
         tier = str(service_tier or "").strip().lower()
         if not tier or tier in {"default", "auto"}:
             return "standard"
-        # ModelInfo::supports_service_tier permits explicit Flex even when the
-        # account's catalog does not advertise it. Upstream remains authoritative.
-        if tier == "flex":
-            return "advertised"
         record = self._account_model_records.get(str(model or "").strip())
-        if not isinstance(record, dict) or "serviceTiers" not in record:
-            return "unknown"
-        tiers = record.get("serviceTiers")
+        tiers = record.get("serviceTiers") if isinstance(record, dict) else None
         if not isinstance(tiers, list):
-            return "unknown"
+            return "permitted" if tier == "flex" else "unknown"
         advertised = {
             str(item.get("id") or "").strip().lower()
             for item in tiers
             if isinstance(item, dict) and str(item.get("id") or "").strip()
         }
-        return "advertised" if tier in advertised else "not_advertised"
+        if tier in advertised:
+            return "advertised"
+        # ModelInfo::supports_service_tier permits Flex without advertisement.
+        # This does not add a tier to the catalog or claim the account listed it.
+        return "permitted" if tier == "flex" else "not_advertised"
 
     def responses_lite_catalog_value(self, model: str) -> bool | None:
         """Return the account catalog's explicit Lite flag, if it has one."""
@@ -623,6 +623,8 @@ class OpenAIOAuthChannel(Channel):
                 )
             payload["service_tier"] = normalized_tier
             service_tier = normalized_tier.lower()
+        # Explicit official permission (Flex) and unknown legacy catalogs are
+        # allowed through without pretending the account advertised the tier.
         if self.service_tier_catalog_status(
             payload.get("model") or resolved_model,
             service_tier,

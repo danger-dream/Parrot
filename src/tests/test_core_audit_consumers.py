@@ -156,12 +156,16 @@ def test_native_tier_ids_roundtrip_validate_without_mutating_raw_catalog(domain_
     registry.rebuild_from_config()
     native = OpenAIOAuthChannel(account)
     assert native.service_tier_catalog_status("tier-model", "priority") == "advertised"
-    assert native.service_tier_catalog_status("tier-model", "flex") == "not_advertised"
+    # Official request permission is not a claim in the account's raw catalog.
+    assert native.service_tier_catalog_status("tier-model", "flex") == "permitted"
+    assert native.service_tier_catalog_status("tier-model", "unlisted-tier") == "not_advertised"
     url = "/api/management/v1/model-metadata/tier-model"
     got = client.get(url, params={"scopeId": "openai:tier@example.test:w"}, headers=admin)
     assert got.status_code == 200, got.text
     assert got.json()["data"]["effective"]["serviceTiers"] == ["priority"]
     original_catalog = copy.deepcopy(account["account_model_catalog"])
+    # The metadata UI/override API must not invent an advertised Flex tier just
+    # because request preflight permits sending it upstream.
     for tiers, status in [(["priority"], 200), (["flex"], 422), ([], 200)]:
         before = copy.deepcopy(config.get())
         result = client.patch(url + "/overrides", headers={**admin, "If-Match": MappingControl._metadata_revision()},

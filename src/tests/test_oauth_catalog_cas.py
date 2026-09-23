@@ -6,6 +6,7 @@ import copy
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from src import config, oauth_manager, oauth_model_discovery
@@ -25,7 +26,18 @@ def isolated_catalog(monkeypatch):
     config.update(lambda cfg: (cfg.clear(), cfg.update(before)))
 
 
-def install(provider):
+def codex_response(*, model="late-model", etag="late-etag", not_modified=False):
+    request = httpx.Request("GET", "https://mock.invalid/models")
+    if not_modified:
+        return httpx.Response(304, headers={"etag": etag}, request=request)
+    return httpx.Response(200, headers={"etag": etag}, request=request, json={"models": [{
+        "slug": model, "visibility": "list", "context_window": 12345,
+        "use_responses_lite": False,
+        "model_messages": {"instructions_template": "catalog instructions"},
+    }]})
+
+
+def install(provider, monkeypatch):
     account = {
         "provider": provider, "email": "catalog-cas@example.invalid", "subject": "catalog-cas",
         "workspace_id": "catalog-cas-workspace", "project_id": "catalog-cas-project",
@@ -38,7 +50,24 @@ def install(provider):
     catalog_key = "cursor_model_catalog" if provider == "cursor" else "account_model_catalog"
     account[catalog_key] = {"schema": 1, "models": [{"id": "lkg", "contextWindow": 12345}]}
     config.update(lambda cfg: cfg.update(oauthAccounts=[account], channels=[]))
-    return oauth_manager.get_account_key(account), catalog_key
+    key = oauth_manager.get_account_key(account)
+    if provider == "openai":
+        # Seed the LKG through the real discovery parser AND commit path. The old
+        # schema-1 fixture intentionally requires a full refresh, not a 304.
+        def initial_get(url, **kwargs):
+            assert "If-None-Match" not in kwargs["headers"]
+            return codex_response(model="lkg", etag="lkg-etag")
+        with monkeypatch.context() as patch:
+            patch.setattr(oauth_model_discovery.network, "get_sync", initial_get)
+            assert asyncio.run(oauth_manager.refresh_account_models(key))["action"] == "updated"
+        saved = oauth_manager.get_account(key)
+        assert saved[catalog_key]["schema"] == 2
+        assert saved[catalog_key]["clientVersion"] == oauth_model_discovery.codex_models_client_version()
+        assert saved[catalog_key]["models"][0]["baseInstructions"] == "catalog instructions"
+        assert saved["models_etag"] == "lkg-etag"
+        assert oauth_manager._model_catalog_complete(saved, saved["models"])
+        assert json.loads(Path(config.path()).read_text())["oauthAccounts"][0] == saved
+    return key, catalog_key
 
 
 def edit_catalog(key, catalog_key, field):
@@ -56,7 +85,17 @@ def edit_catalog(key, catalog_key, field):
     return copy.deepcopy(oauth_manager.get_account(key))
 
 
-def result(provider, *, not_modified=False):
+def result(provider, account=None, *, not_modified=False):
+    if provider == "openai":
+        # Parse the late response against the request's pre-edit snapshot. This
+        # exercises conditional request/304 semantics without changing the CAS
+        # write set or rebasing it onto a concurrently edited live account.
+        def get(url, **kwargs):
+            assert kwargs["headers"]["If-None-Match"] == "lkg-etag"
+            return codex_response(not_modified=not_modified)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(oauth_model_discovery.network, "get_sync", get)
+            return oauth_model_discovery.discover_openai(account)
     return oauth_model_discovery.DiscoveryResult(
         ["late-model"], {"schema": 1, "models": [{"id": "late-model"}]},
         f"upstream:{provider}", not_modified=not_modified, etag="late-etag",
@@ -69,12 +108,12 @@ def result(provider, *, not_modified=False):
 ])
 @pytest.mark.parametrize("field", ["models", "catalog", "last_model_sync"])
 def test_success_and_304_commit_compare_catalog_write_set(monkeypatch, provider, not_modified, field):
-    key, catalog_key = install(provider)
+    key, catalog_key = install(provider, monkeypatch)
     edited = {}
 
     def discover(*args, **kwargs):
         edited.update(edit_catalog(key, catalog_key, field))
-        return result(provider, not_modified=not_modified)
+        return result(provider, args[0], not_modified=not_modified)
 
     monkeypatch.setattr(oauth_model_discovery, "discover", discover)
     outcome = asyncio.run(oauth_manager.refresh_account_models(key))
@@ -85,11 +124,11 @@ def test_success_and_304_commit_compare_catalog_write_set(monkeypatch, provider,
 
 @pytest.mark.parametrize("not_modified", [False, True])
 def test_codex_etag_concurrency_rejects_late_commit(monkeypatch, not_modified):
-    key, catalog_key = install("openai")
+    key, catalog_key = install("openai", monkeypatch)
 
     def discover(*args, **kwargs):
         edit_catalog(key, catalog_key, "models_etag")
-        return result("openai", not_modified=not_modified)
+        return result("openai", args[0], not_modified=not_modified)
 
     monkeypatch.setattr(oauth_model_discovery, "discover", discover)
     outcome = asyncio.run(oauth_manager.refresh_account_models(key))
@@ -101,7 +140,7 @@ def test_codex_etag_concurrency_rejects_late_commit(monkeypatch, not_modified):
 @pytest.mark.parametrize("unified", [False, True])
 @pytest.mark.parametrize("field", ["models", "catalog", "last_model_sync"])
 def test_cursor_native_and_unified_commit_return_stale_without_overwrite(monkeypatch, unified, field):
-    key, catalog_key = install("cursor")
+    key, catalog_key = install("cursor", monkeypatch)
     edited = {}
 
     def fetch(*args, **kwargs):
@@ -119,7 +158,8 @@ def test_cursor_native_and_unified_commit_return_stale_without_overwrite(monkeyp
 
 @pytest.mark.parametrize("provider,not_modified", [("openai", True), ("xai", False), ("cursor", False)])
 def test_purpose_and_disabled_changes_do_not_cause_catalog_conflict(monkeypatch, provider, not_modified):
-    key, _ = install(provider)
+    key, catalog_key = install(provider, monkeypatch)
+    initial_catalog = copy.deepcopy(oauth_manager.get_account(key)[catalog_key])
     disabled_field = "cursor_disabled_models" if provider == "cursor" else "disabledModels"
 
     def mutate_purpose():
@@ -133,7 +173,7 @@ def test_purpose_and_disabled_changes_do_not_cause_catalog_conflict(monkeypatch,
         mutate_purpose()
         if provider == "cursor":
             return {"models": [{"id": "late-model"}]}
-        return result(provider, not_modified=not_modified)
+        return result(provider, args[0], not_modified=not_modified)
 
     if provider == "cursor":
         monkeypatch.setattr(oauth_manager.cursor_provider, "fetch_model_catalog_sync", discover)
@@ -148,10 +188,15 @@ def test_purpose_and_disabled_changes_do_not_cause_catalog_conflict(monkeypatch,
     assert config.get()["images"]["enabled"] is False
     assert config.get()["videos"]["independentAccounts"] == [key]
     assert saved["last_model_sync_error"] == ""
+    if not_modified:
+        assert saved[catalog_key] == initial_catalog
+        assert saved["models_etag"] == "late-etag"
+        assert saved["last_model_sync_source"] == "upstream:codex:not-modified"
+    assert json.loads(Path(config.path()).read_text())["oauthAccounts"][0] == saved
 
 
 def test_directory_edit_during_token_await_is_not_rebased_away(monkeypatch):
-    key, catalog_key = install("openai")
+    key, catalog_key = install("openai", monkeypatch)
 
     async def token(_key):
         edit_catalog(key, catalog_key, "models")

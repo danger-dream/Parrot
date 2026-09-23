@@ -37,7 +37,7 @@ python3 scripts/codex_release_profile.py /path/to/codex-rust-v0.157.0-alpha.10 -
 - Lite 的显式 `none`/`required` 保留字符串约束，`none` 清空可用工具；指定函数编译为“仅保留指定定义 + required”，不再改成 auto。已有 Lite prefix 一并重算工具 ID。带 previous_response_id 的指定函数需重发完整请求：官方遇到 prefix 变化也放弃增量，单凭 delta 不能证明旧工具集撤销；明确拒绝而不静默放宽。
 - 认证目录的 `visibility=hide` 模型保留到账号可寻址集合，但不进入已有模型选择/同步预览界面；static profile 仅提供缺省能力，不赋予账号授权。
 - discovery 允许持久化 literal instructions 和显式 null/empty defaults，HTTP/WS 都按字段是否存在覆盖 profile。instructions 缺失才回退 profile；显式空字符串禁止回填。`defaultInstructions` 仍是 profile-first 的部署 fallback，不提升成强制覆盖。
-- `service_tier=flex` 是官方无需模型目录广告的例外；其他非空 tier 继续校验目录。unsupported max_output_tokens 等继续剥离，不改成报错。
+- `service_tier=flex` 是官方无需模型目录广告的例外：仅目录真实列出时状态为 `advertised`，未列出（含目录未知）时为 `permitted`，请求 preflight 均允许。不改写 raw catalog，也不在管理 UI 或 metadata override 中虚构可选档位。其他非空 tier 继续校验目录。unsupported max_output_tokens 等继续剥离，不改成报错。
 
 ## 最初调查所列的其他请求面
 
