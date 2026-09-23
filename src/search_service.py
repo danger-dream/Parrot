@@ -24,6 +24,7 @@ import httpx
 from . import config, network
 from .search_xai import (
     X_SEARCH_ONLY_FIELDS,
+    build_evidence_index as _xai_build_evidence_index,
     evidence_key as _xai_evidence_key,
     is_x_search_call_item,
     normalize_x_search_date,
@@ -388,19 +389,7 @@ def _xai_structured_output(text: str) -> tuple[list, str | None] | None:
 
 def _xai_aligned_rows(structured: list, evidence: list, *, x_search: bool = False) -> list:
     """Keep structured rows tied to URLs observed in native search evidence."""
-    evidence_by_url = {}
-    x_user_citations = 0
-    for item in evidence:
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("url") or "")
-        if urlsplit(url).scheme in ("http", "https"):
-            evidence_by_url.setdefault(_xai_evidence_key(url, x_search=x_search), item)
-            parsed = urlsplit(url)
-            parts = [part for part in parsed.path.split("/") if part]
-            if (x_search and (parsed.hostname or "").lower().removeprefix("www.") in ("x.com", "twitter.com")
-                    and len(parts) == 3 and parts[:2] == ["i", "user"] and parts[2].isdigit()):
-                x_user_citations += 1
+    evidence_by_url, x_user_citations = _xai_build_evidence_index(evidence, x_search=x_search)
     if not evidence_by_url:
         return structured
     aligned = []

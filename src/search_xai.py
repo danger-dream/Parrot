@@ -79,6 +79,24 @@ def normalize_x_search_tool_dates(tool: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def build_evidence_index(evidence: list, *, x_search: bool) -> tuple[dict, int]:
+    """Index native HTTP citations and count opaque numeric X profile URLs."""
+    evidence_by_url = {}
+    x_user_citations = 0
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        if urlsplit(url).scheme in ("http", "https"):
+            evidence_by_url.setdefault(evidence_key(url, x_search=x_search), item)
+            parsed = urlsplit(url)
+            parts = [part for part in parsed.path.split("/") if part]
+            if (x_search and (parsed.hostname or "").lower().removeprefix("www.") in ("x.com", "twitter.com")
+                    and len(parts) == 3 and parts[:2] == ["i", "user"] and parts[2].isdigit()):
+                x_user_citations += 1
+    return evidence_by_url, x_user_citations
+
+
 def evidence_key(url: str, *, x_search: bool) -> str:
     """Match x.com citation aliases without weakening ordinary web URL evidence."""
     if not x_search:
