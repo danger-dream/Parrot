@@ -292,6 +292,18 @@ class OAuthBackend:
     def start_account_model_refresh(self, account_id: str):
         return oauth_manager.start_account_model_refresh(account_id)
 
+    async def claude_reset_status(self, account_id: str, program: str) -> dict:
+        from src.oauth import claude_reset
+        return await claude_reset.status(account_id, program)
+
+    def claude_reset_eligibility(self, status: dict, program: str):
+        from src.oauth import claude_reset
+        return claude_reset.eligibility(status, program)
+
+    async def claude_reset_redeem(self, account_id: str, program: str, **kwargs) -> dict:
+        from src.oauth import claude_reset
+        return await claude_reset.redeem(account_id, program, **kwargs)
+
     def reset_quota(self, account_id: str) -> dict:
         return oauth_manager.reset_quota(account_id)
 

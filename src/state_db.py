@@ -707,6 +707,36 @@ def workbuddy_action_cleanup(before_ms: int) -> int:
         return len(keys)
     return _mut("workbuddy_actions", op, strict=True)
 
+def claude_reset_operation_load(key: str):
+    return _get("claude_reset_operations", key)
+
+
+def claude_reset_operation_save(key: str, value: dict) -> None:
+    # Only non-secret operation metadata is accepted; Token/config storage is separate.
+    allowed = {"program", "operation_id", "request_id", "grant_id", "created_at",
+               "weekly_resets_at", "status", "response", "grant_remaining"}
+    row = {k: v for k, v in value.items() if k in allowed}
+    _mut("claude_reset_operations", lambda data: data.__setitem__(key, row), strict=True)
+
+
+def quota_patch_claude_reset_status(account_key: str, blocks: dict, *, expected_state_key: str) -> None:
+    """Strong card reads omit spend: patch only the two raw status blocks."""
+    def op(data, target):
+        row = dict(data.get(target) or {"account_key": target, "email": _quota_display_email(target)})
+        try:
+            raw = json.loads(row.get("raw_data") or "{}")
+        except (TypeError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        for name in ("cedar_ember", "juniper_tide"):
+            if name in blocks:
+                raw[name] = blocks[name]
+        row["raw_data"] = json.dumps(raw, ensure_ascii=False)
+        data[target] = row
+    _quota_write(account_key, op, expected_state_key=expected_state_key)
+
+
 # Explicit durable interfaces used by updater/checker/status monitor.
 def updater_load()->dict:
     row=_get("app_self_update","1") or {}

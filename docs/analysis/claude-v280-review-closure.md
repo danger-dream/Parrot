@@ -45,7 +45,7 @@
 - `slow-{offer,status,budget-utilization,budget-reset,retry-after,max-wait}`：涉及选择低优先级续跑及长等待策略；本包不改请求延迟/调度/用户确认。
 - unified status/representative-claim/reset/fallback/upgrade-paths：客户端可据此精细呈现限制来源、升级路径；Parrot现有实际429错误处理不依赖克隆这些提示，但未解析字段若用于新自动禁用，须与窗口scope一致，不能直接扩大账号锁定。
 
-这是**解析覆盖边界与集成提醒**，不是已实现上述新额度功能；本包没有修改这些解析/禁用函数，也没有覆盖主控的reset、原生WS或WHAM修改。
+这是**解析覆盖边界与集成提醒**，不是已实现所有新额度路由策略。本包没有覆盖主控的OpenAI reset、原生WS或WHAM修改；收到389行更新报告后，Claude官方重置另按第六节完成。
 
 ## 四、登录、刷新和其它出站面的完整核对
 
@@ -54,7 +54,7 @@
 - **usage/profile/bootstrap**：身份和usage401见上述修复。报告中的at_wall/cedar_ember/skip_spend、bootstrap model/entrypoint等参数来自具体客户端交互；普通账号用量/套餐拉取不能凭空宣称已经到额度墙或选择某模型，也不能默认skip_spend漏费用数据。5s/10s/30s差异是既有请求容错，不是身份协议错误。
 - **validate/revoke**：validate可由现有真实usage/profile/刷新验证有效性代替；新增一次空POST只会增加请求。revoke会影响被其它客户端共用的授权，删除本地账号不等于用户授权撤销上游token；不自动新增该破坏性操作。
 - **模型目录**：`oauth_model_discovery.discover_claude`已有OAuth `/v1/models?limit=1000`分页、版本/beta及能力读取；不能拿下载的静态签名目录替代账号可见权限。本包能力表仅选wire默认值，不向账号注入模型。
-- **reset_rate_limits**：报告称“客户端专属不需要”过于绝对；重置领取是有副作用的独立操作，应服从现有Parrot确认/证据规则。本轮由主控负责相关修复，本包不请求或改写。
+- **reset_rate_limits**：旧266行报告的“客户端专属不需要”分类不再适用。更新389行报告3.7及主控确认明确它属于现有账号管理职责；本包已补Claude双机制的状态读取、详情展示、两阶段确认和手动执行，见第六节。
 - **遥测**event_logging/statsig/staging beacon：不复制采集、gate服务或外传。
 - **events WS/SSE、local_pairing、desktop下载**：属于云会话/设备配对/分发产品，没有Parrot相应会话生命周期；不是模型转发必需出站。
 - **file_upload/files、远程MCP、插件市场**：scope存在不等于要求代理实现存储、连接器或市场；现有下游请求/工具内容保持，新增上传及MCP会扩展访问和数据生命周期，明确不克隆。
@@ -64,8 +64,8 @@
 
 - 正式渠道回归：`test_cc_model_profiles.py`；原v280代表抓包/CCH/头/auth：`test_cc_v2_1_280_upgrade.py`；usage真实本地写回与fake网络：`test_claude_usage_auth_recovery.py`。
 - 定向执行统一使用`/opt/src-space/parrot/venv/bin/python src/tests/isolated_pytest.py`，config/state/logs/身份文件只写隔离临时目录；不跑全量、不真实请求。
-- `oauth_manager.py`合并点仅新增Claude helper、Claude分派及bootstrap OAuth beta；没有修改quota flatten/disable/reset/WHAM区。
-- 最终定向结果：**234 passed**（2.98s），`git diff --check`通过。命令：
+- 首次提交`18b0ce4`的`oauth_manager.py`合并点为Claude helper、Claude分派及bootstrap OAuth beta；后续Claude重置提交仅在本文件补organization.uuid提取及账号规范化保留，其业务放入`oauth/claude_reset.py`。不修改OpenAI reset/WHAM或通用quota evaluator。
+- 首次提交定向结果：**234 passed**（2.98s），`git diff --check`通过。命令：
 
 ```bash
 /opt/src-space/parrot/venv/bin/python src/tests/isolated_pytest.py -q \
@@ -74,4 +74,46 @@
   src/tests/test_m5.py src/tests/test_anthropic_passive_sampling.py \
   src/tests/test_routing_review_fixes.py \
   src/tests/test_protocol_fake_upstreams.py::test_cc_v258_529_reuses_body_context_and_isolates_concurrent_requests
+```
+## 六、389行更新报告：Claude双官方重置已补齐
+
+这是收到新材料后的追加实现，替代旧3.7的排除分类。关键条件再对照本机同版二进制：cedar `Ge` 的program/grant_id/request_id POST、`Qn=600000`/`Gt`未决键选择、`$t`的next grant/usable/paused/expiry；juniper `an`只传program，`kr/Cj`判断eligible/arm/available。未进行真实账号消费验证。
+
+### 状态、身份与展示
+
+- `profile.organization.uuid`保存为专用`claude_organization_uuid`，登录/导入规范化保留；旧账号进入重置状态查询时补拉profile。绝不回退到account.uuid。
+- 普通usage不加skip_spend，两个块已存在raw_data；本包补TG读取/展示，不新增冗余quota列。强一致卡状态使用`?cedar_ember=1&skip_spend=1`或`?at_wall=1&skip_spend=1`，只patch这两个raw块，不覆盖费用、窗口数值或完整usage的fetched_at。
+- 账号详情显示两种状态、卡数量/剩余/有效期/暂停/usable/窗口和限制条件、next_grant、cooldown、下次可用时间及每周次数。新增“官方额度重置/状态”；原“清本地配额禁用”的按钮和本地含义不变。
+
+### 消费安全与反馈
+
+- 统一`OAuthBackend`→`ClaudeResetControlMixin`契约，需DESTRUCTIVE权限；说明计划→最终确认计划→执行。计划绑定actor、精确账号revision、generation、组织和所选next grant，执行前一次性consume；TG同样经过这个服务端门禁，而非只靠callback字符串的stage。
+- 执行前强一致重查eligible、next_grant、paused、有效期、usable_now、blocking、use_requires_limit、cooldown；不悄悄替换卡。Juniper要求实验reset组且available，明确“消耗周额度份额、重置5h、每周次数”。不克隆statsig，不隐式自动续跑。
+- 25s POST使用OAuth Bearer、JSON和当前CLI UA。Cedar恰为`{program,grant_id,request_id}`；Juniper恰为`{program}`，不编造幂等头/字段。状态GET的401允许刷新后重读；消费POST不自动重发，连401/403也如实回传auth_error，要求重新走产品确认。429返回rate_limited。
+- 新增`claude_reset_operations`独立durable域，键绑定generation+program+组织，只保留非秘密操作元数据。先持久化pending再POST；写入失败不会消费。旧账号无持久generation时先固化现有同一generation，避免重启失联。Token/config存储与备份格式未改变。
+- Cedar同一未决操作600秒内经再次确认时复用同一request_id；超出600秒且仍无结论则保守阻止新键消费，不假定老键仍安全。Juniper未决同一周**即使状态仍available，也绝不再次POST**；重启仍有效。查到额度已变化只报告“无法归因但状态已变化”，不谎称本次成功；下一自然周有新周期证据且用户重新确认才允许新操作。
+- result/reason/resets_left/cleared/cooldown_until/next_available_at/weekly_resets_at原样进入反馈。未知、超时、stamp_indeterminate/reset_unconfirmed只补GET核对，不自动重试消费、不强制启用。
+
+### 重置后恢复与scope
+
+- reset/already_used之后单独拉普通完整usage（含费用）。只有5h/7d及先前已知模型窗口都有有效新证据，才调用现有scope evaluator；缺失/失败不作为恢复证明。
+- 从POST前到刷新结束，比较账号generation、quota观察代次、disabled状态、被动头观察时间和模型限制记录；任何新限制到达都保留，不删除quota整行，不全量清模型冷却。删除重建的晚结果不能写入或启用新账号。
+- Fable仍只冷却Fable，其它模型可用性按已有策略；没有利用“官方重置成功”绕过模型scope。
+- **证据边界**：更新报告仅证明`clears`枚举允许oauth_apps/overage/cowork/omelette等窗口，没有给出“普通代理messages必然消费该窗口”的模型/产品归属映射，也无真实Claude账号验证。因此保留原始字段、展示服务端cleared，不将它们并入账号seven_day，不新增overage授权。后续若要自动路由这些窗口，需要模型/产品scope映射的权威证据，而非从名字猜测。
+
+### 追加修改面与回归
+
+新增`oauth/claude_reset.py`、管理控制mixin和TG子菜单；`oauth_manager.py`只加组织字段。`state_db.py`新增三项Claude接口，`state_store.py`只增加一个durable域。原OpenAI reset/WHAM/WS不重做。
+
+`test_claude_reset.py`覆盖50个正式用例：eligibility与next grant、两种精确wire、同/跨按钮并发、未决ID、真实state重载、权限及两阶段服务端确认、无组织、账号删除重建、回包/刷新期间新限制、Fable scope、成功后仍超限/刷新失败、TG实际callback链和两类按钮共存。原TG严格快照只在当前overlay的六个Claude详情case补明确新增区块/按钮；历史v0.31.13和其它provider内容未重录。
+
+追加最终定向验证：**300 passed（8.72s）**，`git diff --check`通过。执行命令：
+
+```bash
+/opt/src-space/parrot/venv/bin/python src/tests/isolated_pytest.py -q \
+  src/tests/test_claude_reset.py src/tests/test_claude_usage_auth_recovery.py \
+  src/tests/test_management_oauth_contract_regressions.py src/tests/test_management_oauth_parity_fixes.py \
+  src/tests/test_m7_oauth_menu.py src/tests/test_state_store_json.py src/tests/test_state_store_boundaries.py \
+  src/tests/test_tg_contract_oauth_01_03.py src/tests/test_tg_contract_oauth_04_06.py \
+  src/tests/test_m5.py src/tests/test_anthropic_passive_sampling.py
 ```

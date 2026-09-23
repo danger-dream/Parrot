@@ -3412,6 +3412,9 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     )
     if reset_cards_block:
         text += "\n\n" + reset_cards_block
+    if prov == "claude":
+        from . import claude_reset_menu
+        text += "\n\n" + claude_reset_menu.cached_block(quota_row)
 
     month_block = _format_month_stats_block(
         account_key, month_snapshot=month_snapshot, by_model=model_stats,
@@ -3472,6 +3475,8 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         nav = (short, max(1, int(page or 1)), filter_key)
         rows.extend(workbuddy_menu.package_page_buttons(account_key, nav, workbuddy_package_page))
         rows.append([ui.btn("🎁 签到/领额度", workbuddy_menu._cb("activity", nav))])
+    if prov == "claude":
+        rows.append([ui.btn("♻️ 官方额度重置/状态", f"oa:claude_reset_ask:{payload}")])
     if prov == "openai":
         rows.append([ui.btn("♻️ 重置额度", f"oa:reset_quota_ask:{payload}")])
     elif acc.get("disabled_reason") == "quota":
@@ -7067,6 +7072,15 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
     if data.startswith("oa:clear_errors:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])
         on_clear_errors(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
+        return True
+    if data.startswith(("oa:claude_reset_ask:", "oa:claude_reset_confirm:", "oa:claude_reset_execute:")):
+        from . import claude_reset_menu
+        action, payload = data.split(":", 2)[1:]
+        short, page, filter_key = _split_short_page_filter(payload)
+        handler = {"claude_reset_ask": claude_reset_menu.ask,
+                   "claude_reset_confirm": claude_reset_menu.confirm,
+                   "claude_reset_execute": claude_reset_menu.execute}[action]
+        handler(chat_id, message_id, cb_id, short, page=page, filter_key=filter_key)
         return True
     if data.startswith("oa:reset_quota_ask:"):
         short, page, filter_key = _split_short_page_filter(data.split(":", 2)[2])

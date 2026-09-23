@@ -1157,6 +1157,7 @@ def extract_claude_plan_info(profile: dict) -> dict:
     """从 /api/oauth/profile 响应中提取套餐信息，返回可直接 merge 到 account entry 的 dict。"""
     org = profile.get("organization") or {}
     return {
+        "claude_organization_uuid": str(org.get("uuid") or ""),
         "plan_type": org.get("organization_type") or "",
         "rate_limit_tier": org.get("rate_limit_tier") or "",
         "billing_type": org.get("billing_type") or "",
@@ -3766,7 +3767,7 @@ def _add_account_serialized(
     elif provider == "claude":
         for k in ("plan_type", "rate_limit_tier", "billing_type",
                    "subscription_status", "subscription_created_at",
-                   "has_extra_usage_enabled", "seat_tier"):
+                   "has_extra_usage_enabled", "seat_tier", "claude_organization_uuid"):
             if entry.get(k) is not None:
                 normalized[k] = entry[k]
 

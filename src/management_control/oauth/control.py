@@ -59,6 +59,7 @@ from .models import (
 from .plans import OneShotPlanStore
 from .queries import OAuthQueryControlMixin
 from .workbuddy_control import WorkBuddyControlMixin
+from .claude_reset_control import ClaudeResetControlMixin
 
 
 def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
@@ -75,6 +76,7 @@ def _page(items: list, spec: PageSpec) -> tuple[list, PageMeta]:
 
 
 class OAuthControl(
+    ClaudeResetControlMixin,
     WorkBuddyControlMixin,
     OAuthAccountOrchestrationControlMixin,
     OAuthAccountMutationControlMixin,
@@ -111,6 +113,9 @@ class OAuthControl(
         )
         self._import_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="oimport", clock=self._clock,
+        )
+        self._claude_reset_plans: OneShotPlanStore[dict] = OneShotPlanStore(
+            prefix="clreset", ttl_seconds=600, clock=self._clock,
         )
         self._workbuddy_plans: OneShotPlanStore[dict] = OneShotPlanStore(
             prefix="wbaction", ttl_seconds=300, clock=self._clock,
