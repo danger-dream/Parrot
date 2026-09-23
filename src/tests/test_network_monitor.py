@@ -572,6 +572,7 @@ def test_has_family_account_api_channel_only(m):
 
 def test_prune_orphan_channel_toggles_removes_dead_keys(m):
     """byKey 里有 registry 不存在的 key → prune 应该清掉它。"""
+    m["state_db"].init()  # This case must also run alone / on a fresh xdist worker.
     nm = m["network_monitor"]
     cfg = m["config"]
     from src.channel import registry
@@ -598,6 +599,7 @@ def test_prune_orphan_channel_toggles_removes_dead_keys(m):
 
 def test_prune_orphan_channel_toggles_keeps_live_keys(m):
     """byKey 里有 registry 里存在的 key → 保留。"""
+    m["state_db"].init()
     nm = m["network_monitor"]
     cfg = m["config"]
     from src.channel import registry
@@ -627,6 +629,7 @@ def test_prune_orphan_channel_toggles_keeps_live_keys(m):
 
 def test_prune_orphan_channel_toggles_no_op_when_clean(m):
     """没有孤儿 → 返回 0，不写盘。"""
+    m["state_db"].init()
     nm = m["network_monitor"]
     cfg = m["config"]
     from src.channel import registry
