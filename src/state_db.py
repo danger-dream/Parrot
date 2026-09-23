@@ -347,6 +347,41 @@ def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected
             row["codex_active_observed_at"]=row["fetched_at"]
         d[target]=row
     _quota_write(account_key,op,expected_state_key=expected_state_key)
+def quota_invalidate_openai_reset_observations(account_key:str, *, before_ms:int,
+                                               refreshed_windows:set[str],
+                                               expected_state_key:str)->None:
+    """Discard reset-before evidence only; preserve concurrent/newer samples."""
+    from .oauth import openai as provider
+    def op(d,target):
+        row=d.get(target)
+        if not row:return
+        observed=int(row.get("last_passive_update_at") or 0)
+        raw={f"{name}_{suffix}":row.get(f"codex_{name}_{suffix}")
+             for name in ("primary","secondary")
+             for suffix in ("used_pct","reset_sec","reset_at","window_min")}
+        try:stored=json.loads(row.get("codex_window_observations") or "{}")
+        except (TypeError,ValueError):stored={}
+        windows={**provider.codex_snapshot_window_observations(raw,observed_at=observed),
+                 **provider.sanitize_codex_window_observations(stored)}
+        removed={key:item for key,item in windows.items()
+                 if key in refreshed_windows and item["observed_at"]<=before_ms}
+        for key,item in removed.items():
+            windows.pop(key)
+            for suffix in ("used_pct","reset_sec","reset_at","window_min"):
+                row[f"codex_{item['raw_name']}_{suffix}"]=None
+        row["codex_window_observations"]=json.dumps(windows,separators=(",",":"),sort_keys=True)
+        try:limits=json.loads(row.get("codex_rate_limits") or "[]")
+        except (TypeError,ValueError):limits=[]
+        limits=provider.merge_codex_rate_limits((limits,observed))
+        for family in limits:
+            if family.get("limit_id")!="codex":continue
+            for item in removed.values():
+                name=item["raw_name"];window=family.get(name) or {}
+                if window.get("observed_at",observed)<=before_ms:family.pop(name,None)
+        row["codex_rate_limits"]=json.dumps(limits,separators=(",",":"),sort_keys=True)
+    _quota_write(account_key,op,expected_state_key=expected_state_key)
+
+
 def quota_delete(value:str)->None:
     from . import channel_state
     with channel_state.mutation_lock:

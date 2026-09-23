@@ -874,6 +874,14 @@ def normalize_wham_usage(payload: dict) -> dict:
                 "normal_model_slug": str(item.get("normal_model_slug") or "") or None,
             })
 
+    raw_spend = payload.get("spend_control") if isinstance(payload, dict) else None
+    spend = {}
+    if isinstance(raw_spend, dict):
+        if isinstance(raw_spend.get("reached"), bool):
+            spend["reached"] = raw_spend["reached"]
+        if isinstance(raw_spend.get("individual_limit"), dict):
+            spend["individual_limit"] = dict(raw_spend["individual_limit"])
+
     return {
         "five_hour": five_hour,
         "seven_day": seven_day,
@@ -893,6 +901,7 @@ def normalize_wham_usage(payload: dict) -> dict:
             "plan_type": payload.get("plan_type") if isinstance(payload, dict) else None,
             "allowed": rate.get("allowed"),
             "limit_reached": rate.get("limit_reached"),
+            "spend_control": spend,
             "rate_limit_reached_type": _rate_limit_reached_kind(
                 payload.get("rate_limit_reached_type") if isinstance(payload, dict) else None
             ),

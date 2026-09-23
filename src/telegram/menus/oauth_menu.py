@@ -2088,6 +2088,9 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
 
     if provider == "openai":
         codex = oauth_control.usage_from_quota_row(row).get("openai") or {}
+        spend = codex.get("spend_control") or {}
+        if spend.get("reached") is True:
+            out.append("🔒 工作区消费上限已达到")
         credits = codex.get("credits") or {}
         credit_parts = []
         if credits.get("unlimited") is True:
@@ -4617,6 +4620,10 @@ def on_reset_quota(chat_id: int, message_id: int, cb_id: str, short: str, page: 
             action = quota_action.get("action")
             if result.get("refresh_error"):
                 prefix += "⚠️ 最新额度刷新失败，未自动解除本地 quota 限制；请稍后点「刷新用量/重置卡」重新确认。\n"
+            elif action == "state_update_failed_keep_disabled":
+                prefix += "⚠️ 本地额度状态更新失败，未自动解除 quota 限制；请刷新用量后重新确认。\n"
+            elif action == "noop_missing":
+                prefix += "ℹ️ 原账号已删除或替换，未将本次结果写入新账号。\n"
             elif action == "resumed":
                 prefix += "✅ 已刷新最新额度，确认低于阈值；已自动解除 quota 禁用并清理模型冷却。\n"
             elif action == "kept_enabled":
@@ -5871,8 +5878,8 @@ def _openai_token_to_entry(tok: dict, *, fallback_email: str = "") -> tuple[dict
         "workspace_name": tok.get("workspace_name") or info.get("workspace_name", ""),
         "workspace_type": tok.get("workspace_type") or info.get("workspace_type", ""),
         "organization_id": tok.get("organization_id") or info.get("organization_id", ""),
-        "workspace_backend_origin": tok.get("workspace_backend_origin", ""),
-        "account_routing_override": tok.get("account_routing_override", ""),
+        **{key: tok[key] for key in ("workspace_backend_origin", "account_routing_override")
+           if key in tok},
         "plan_type": tok.get("plan_type") or info.get("plan_type", ""),
         "subscription_expires_at": tok.get("subscription_expires_at", ""),
     }

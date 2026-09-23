@@ -3761,6 +3761,16 @@ def _capture_codex_response_event(
         oauth_manager.observe_openai_response_event(
             ch.account_key, frame, translator_ctx,
         )
+        # Both first-visible and accepted-stream readers use this callback.
+        # Keep native WS passthrough unchanged while sharing the same guarded
+        # quota observation path as HTTP->WS (including family sampling).
+        try:
+            event = json.loads(frame)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            event = None
+        if isinstance(event, dict) and event.get("type") == "codex.rate_limits":
+            from .. import failover
+            failover._maybe_record_codex_rate_limits_event(ch, event)
     return captured
 
 

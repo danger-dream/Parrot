@@ -1994,14 +1994,18 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
             account_key, usage, threshold=threshold, fresh=False,
         )
     utils = extract_utils_percent(usage)
-    if not any(u is not None and u >= threshold for u in utils):
+    if not any(u is not None and u >= threshold for u in utils) and not _explicit_openai_wham_limit(usage):
         return {"action": "cached_below_threshold", "utils": utils,
                 "any_over": False, "hit_windows": [],
                 "disabled_until": None}
     return evaluate_and_toggle_by_usage(account_key, usage, threshold=threshold)
 
 def _usage_has_any_quota_signal(usage: dict) -> bool:
-    return any(u is not None for u in extract_utils_percent(usage))
+    openai = usage.get("openai") or {}
+    spend = openai.get("spend_control") or {}
+    return (any(u is not None for u in extract_utils_percent(usage))
+            or (openai.get("source") == "wham_usage"
+                and isinstance(spend.get("reached"), bool)))
 
 
 def _explicit_openai_wham_limit(usage: dict) -> bool:
@@ -2009,7 +2013,9 @@ def _explicit_openai_wham_limit(usage: dict) -> bool:
     openai = usage.get("openai") if isinstance(usage, dict) else None
     if not isinstance(openai, dict) or openai.get("source") != "wham_usage":
         return False
-    return openai.get("allowed") is False or openai.get("limit_reached") is True
+    spend = openai.get("spend_control")
+    return (openai.get("allowed") is False or openai.get("limit_reached") is True
+            or (isinstance(spend, dict) and spend.get("reached") is True))
 
 
 def openai_plan_workspace_label(acc: dict | None) -> str:
@@ -2835,7 +2841,8 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
     # "allowed: false" / "limit_reached: true" into quota recovery.
     wham_limit = provider == "openai" and _explicit_openai_wham_limit(usage)
     if wham_limit:
-        hit_windows.append("WHAM limit")
+        spend = (usage.get("openai") or {}).get("spend_control") or {}
+        hit_windows.append("Workspace spend limit" if spend.get("reached") is True else "WHAM limit")
         if reason == "quota":
             return {"action": "wham_limit_keep_disabled", "utils": utils,
                     "any_over": True, "hit_windows": hit_windows,
@@ -3267,8 +3274,7 @@ def _openai_metadata_patch(entry: dict) -> dict:
         "workspace_name": entry.get("workspace_name", "") or "",
         "workspace_type": entry.get("workspace_type", "") or "",
         "organization_id": entry.get("organization_id", "") or "",
-        "workspace_backend_origin": entry.get("workspace_backend_origin", "") or "",
-        "account_routing_override": entry.get("account_routing_override", "") or "",
+        **codex_workspace_routing_patch(entry),
         "plan_type": entry.get("plan_type", "") or "",
         "subscription_expires_at": entry.get("subscription_expires_at", "") or "",
     }
@@ -3339,6 +3345,11 @@ def _replace_exact_identity_in_config(
     provider = _normalize_provider(entry.get("provider"))
     incoming = copy.deepcopy(entry)
     incoming["provider"] = provider
+    if provider == "openai":
+        routing = codex_workspace_routing_patch(incoming)
+        incoming.pop("workspace_backend_origin", None)
+        incoming.pop("account_routing_override", None)
+        incoming.update(routing)
     if provider == "workbuddy":
         incoming.update(workbuddy_provider.normalize_credential(
             incoming, source=str(incoming.get("workbuddy_identity_source") or "import"),
@@ -3446,6 +3457,11 @@ def replace_exact_identity(
     provider = _normalize_provider(entry.get("provider"))
     incoming = copy.deepcopy(entry)
     incoming["provider"] = provider
+    if provider == "openai":
+        routing = codex_workspace_routing_patch(incoming)
+        incoming.pop("workspace_backend_origin", None)
+        incoming.pop("account_routing_override", None)
+        incoming.update(routing)
     if provider == "workbuddy":
         incoming.update(workbuddy_provider.normalize_credential(
             incoming, source=str(incoming.get("workbuddy_identity_source") or "import"),
@@ -4644,8 +4660,17 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     if acc.get("disabled_reason") == "auth_error":
         return {"action": "noop_auth_error", "account_key": canonical}
 
+    from . import channel_state
+    expected_state_key = account_state_key(acc)
     idem = idempotency_key or str(uuid.uuid4())
     access_token = await ensure_valid_token(canonical)
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            return {"action": "noop_missing", "account_key": canonical}
+        canonical = channel_state.resolve(expected_state_key).removeprefix("oauth:")
+        acc = copy.deepcopy(get_account(canonical))
+        reset_started_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        reset_generation = _quota_observation_generation(acc)
     account_id = _openai_workspace_id(acc) or None
     consume_kwargs = _compatible_kwargs(
         openai_provider.consume_rate_limit_reset_credit,
@@ -4668,6 +4693,13 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
     if outcome not in ("reset", "alreadyRedeemed"):
         return out
 
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            out["quota_action"] = {"action": "noop_missing"}
+            return out
+        canonical = channel_state.resolve(expected_state_key).removeprefix("oauth:")
+        out["account_key"] = canonical
+
     # Official Codex UI refetches rate limits after consuming a reset. Do the
     # same before clearing any local quota restriction: fresh usage must prove
     # the windows are below threshold before Parrot auto-resumes a quota-disabled
@@ -4679,23 +4711,64 @@ async def redeem_openai_rate_limit_reset_credit(account_key: str,
         out["quota_action"] = {"action": "refresh_failed_keep_disabled"}
         return out
 
-    # A successful upstream reset makes any previously cached Codex response-header
-    # hit stale. Delete the row before writing fresh WHAM usage so old codex_* columns
-    # do not immediately re-disable the account on the next monitor tick.
-    state_db.quota_delete(canonical)
-    state_db.quota_save(canonical, flatten_usage(usage), email=str(acc.get("email") or ""))
-    out["usage"] = usage
-    reset_credits = ((usage.get("openai") or {}).get("rate_limit_reset_credits") or {})
-    if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
-        out["available_count"] = reset_credits.get("available_count")
+    # Commit only to the original account incarnation. Preserve observations
+    # received while consume/fetch were in flight, and windows omitted by WHAM.
+    with account_generation_guard(expected_state_key) as current:
+        if not current:
+            out["quota_action"] = {"action": "noop_missing"}
+            return out
+        canonical = channel_state.resolve(expected_state_key).removeprefix("oauth:")
+        out["account_key"] = canonical
+        current_acc = get_account(canonical)
+        # A new over-limit observation in the same millisecond is ambiguous;
+        # retain it rather than erasing new evidence with the reset receipt.
+        cutoff = reset_started_ms - int(_quota_observation_generation(current_acc) != reset_generation)
+        refreshed = {key for key, value in _fresh_wham_window_utils(usage).items() if value is not None}
+        def invalidate(c):
+            for account in c.get("oauthAccounts", []):
+                if _canonical_key(account) != canonical:
+                    continue
+                observation = account.get(_QUOTA_OBSERVATION_FIELD)
+                windows = _codex_windows_from_observation(observation)
+                retained = {key: item for key, item in windows.items()
+                            if key not in refreshed or item["observed_at"] > cutoff}
+                if len(retained) == len(windows):
+                    return
+                if retained:
+                    account[_QUOTA_OBSERVATION_FIELD] = {
+                        "source": _CODEX_OBSERVATION_SOURCE, "snapshot": {},
+                        "observed_at": max(item["observed_at"] for item in retained.values()),
+                        "windows": retained,
+                    }
+                else:
+                    account.pop(_QUOTA_OBSERVATION_FIELD, None)
+                return
+        try:
+            state_db.quota_invalidate_openai_reset_observations(
+                canonical, before_ms=cutoff, refreshed_windows=refreshed,
+                expected_state_key=expected_state_key,
+            )
+            config.update(invalidate, skip_if_unchanged=True)
+            state_db.quota_save(canonical, flatten_usage(usage),
+                                email=str(current_acc.get("email") or ""),
+                                expected_state_key=expected_state_key)
+        except Exception as exc:
+            out["state_error"] = type(exc).__name__
+            out["quota_action"] = {"action": "state_update_failed_keep_disabled"}
+            return out
+        out["usage"] = usage
+        reset_credits = ((usage.get("openai") or {}).get("rate_limit_reset_credits") or {})
+        if isinstance(reset_credits, dict) and reset_credits.get("available_count") is not None:
+            out["available_count"] = reset_credits.get("available_count")
 
-    eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True)
-    out["quota_action"] = eval_result
-    if eval_result.get("action") == "resumed":
-        out["runtime_clear"] = eval_result.get("runtime_state")
-    elif eval_result.get("action") == "kept_enabled" and not eval_result.get("any_over"):
-        out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)
-    return out
+        eval_result = evaluate_and_toggle_by_usage(canonical, usage, fresh=True,
+                                                   expected_state_key=expected_state_key)
+        out["quota_action"] = eval_result
+        if eval_result.get("action") == "resumed":
+            out["runtime_clear"] = eval_result.get("runtime_state")
+        elif eval_result.get("action") == "kept_enabled" and not eval_result.get("any_over"):
+            out["runtime_clear"] = _clear_oauth_runtime_state(canonical, clear_quota_cache=False)
+        return out
 
 
 def _openai_metadata_new_fields(acc: dict, info: dict) -> dict:
