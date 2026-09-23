@@ -17,6 +17,7 @@ import xxhash
 
 from .. import cache_hints
 from .. import config as _ap_config
+from .cc_model_profile import canonical_model, default_thinking, model_profile
 
 
 # ─── BASE_DIR / device_id 持久化 ──────────────────────────────────
@@ -809,7 +810,7 @@ _SIDE_QUERY_OUTPUT_CONFIG = {
 
 
 def _is_fable_model(model) -> bool:
-    return str(model or "").lower() in {"claude-fable-5", "claude-fable-5.1"}
+    return canonical_model(model) in {"claude-fable-5", "claude-fable-5-1"}
 
 
 def _is_opus_5_model(model) -> bool:
@@ -818,7 +819,7 @@ def _is_opus_5_model(model) -> bool:
 
 
 def _is_side_query_request(body: dict, model=None, *, messages=None) -> bool:
-    if not str(model or body.get("model") or "").lower().startswith("claude-haiku-"):
+    if canonical_model(model or body.get("model")) != "claude-haiku-4-5":
         return False
     output_config = body.get("output_config")
     if isinstance(output_config, dict) and isinstance(output_config.get("format"), dict):
@@ -833,10 +834,7 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
     fingerprint_value = compute_fingerprint(original_messages)
     model = body.get("model", "claude-sonnet-4-20250514")
     side_query = _is_side_query_request(body, model, messages=original_messages)
-    fable_main = _is_fable_model(model) and not side_query
-    # v280 API-key and OAuth captures share the same main body profile; auth
-    # differences are expressed in headers/betas rather than by dropping fields.
-    auto_profile = True
+    profile = model_profile(model)
 
     sid = str(session_id or body.get(PARROT_CC_SESSION_ID_KEY) or "").strip() or str(uuid.uuid4())
     prompt_id = None if side_query else body.get(PARROT_CC_PROMPT_ID_KEY)
@@ -894,21 +892,25 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
         payload["tool_choice"] = tool_choice
 
     payload["metadata"] = build_metadata(email, session_id=sid)
-    payload["max_tokens"] = body.get("max_tokens", 32000 if side_query else 64000)
+    payload["max_tokens"] = body.get("max_tokens", profile.max_tokens if profile else 4096)
 
     if request_wants_fast_mode(body):
         payload["speed"] = "fast"
+    elif "speed" in body:
+        payload["speed"] = body["speed"]
 
     if "thinking" in body:
         payload["thinking"] = body["thinking"]
     elif side_query:
         payload["thinking"] = {"type": "disabled"}
-    elif auto_profile:
-        payload["thinking"] = {"type": "adaptive", "display": "omitted"}
+    else:
+        thinking = default_thinking(profile, body, payload["max_tokens"])
+        if thinking is not None:
+            payload["thinking"] = thinking
 
     if "context_management" in body:
         payload["context_management"] = body["context_management"]
-    elif not side_query and auto_profile:
+    elif not side_query and profile is not None and profile.context_management:
         thinking = payload.get("thinking")
         if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive"):
             payload["context_management"] = {
@@ -920,22 +922,28 @@ def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
     elif side_query:
         payload["temperature"] = 1
 
+    # Fallback changes the executing model, not just its wire identity. Only
+    # the downstream request may opt into it, including an explicit empty list.
     if "fallbacks" in body:
         payload["fallbacks"] = body["fallbacks"]
-    elif fable_main and auto_profile:
-        payload["fallbacks"] = "default"
 
     if "output_config" in body:
         payload["output_config"] = body["output_config"]
     elif side_query:
         payload["output_config"] = json.loads(json.dumps(_SIDE_QUERY_OUTPUT_CONFIG))
-    elif auto_profile:
+    elif profile is not None and profile.effort:
         payload["output_config"] = {"effort": "high"}
 
     if "diagnostics" in body:
         payload["diagnostics"] = body["diagnostics"]
-    elif not side_query and auto_profile:
+    elif not side_query and profile is not None and profile.thinking == "adaptive":
         payload["diagnostics"] = {"previous_message_id": None}
+
+    # The provider allowlist already validated these explicit Anthropic controls.
+    # Mimicry must not silently discard their semantics (including on bridges).
+    for key in ("top_p", "top_k", "stop_sequences", "service_tier", "container", "mcp_servers"):
+        if key in body:
+            payload[key] = body[key]
 
     payload["stream"] = body.get("stream", False)
     # Anthropic validates mixed prompt-cache TTLs globally as
@@ -1359,7 +1367,7 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list
     )
     if side_query:
         out = list(_SIDE_QUERY_BETAS)
-    elif str(model or "").lower().startswith("claude-haiku-4-5"):
+    elif canonical_model(model) == "claude-haiku-4-5":
         out = list(_HAIKU_MAIN_BETAS)
     elif _is_fable_model(model):
         out = list(_FABLE_MAIN_BETAS)
@@ -1368,8 +1376,43 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list
     else:
         out = list(_MAIN_BETAS)
 
+    profile = model_profile(model)
+    if profile is None or profile.thinking != "adaptive":
+        # Do not advertise new-model capabilities for legacy/unknown relays.
+        allowed = {"claude-code-20250219", CACHE_DIAGNOSIS_BETA}
+        if profile is not None and profile.thinking:
+            allowed.update({INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
+                            PROMPT_CACHING_SCOPE_BETA})
+        if profile is not None and profile.context_management:
+            allowed.add(CONTEXT_MANAGEMENT_BETA)
+        if profile is not None and profile.effort:
+            allowed.add(EFFORT_BETA)
+        if side_query:
+            allowed.update(_SIDE_QUERY_BETAS)
+        out = [beta for beta in out if beta in allowed]
+    payload = payload if isinstance(payload, dict) else {}
+    if "fallbacks" in payload:
+        _insert_beta_before(out, SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA)
+        _insert_beta_before(out, FALLBACK_CREDIT_BETA, CACHE_DIAGNOSIS_BETA)
+    else:
+        out = [beta for beta in out if beta != SERVER_SIDE_FALLBACK_BETA]
+    # Explicit capabilities are not replaced with guessed defaults. Carry their
+    # protocol beta even for a compatible model absent from the v280 catalog.
+    output_config = payload.get("output_config")
+    if isinstance(output_config, dict):
+        if "effort" in output_config:
+            _insert_beta_before(out, EFFORT_BETA, CACHE_DIAGNOSIS_BETA)
+        if "format" in output_config:
+            _insert_beta_before(out, STRUCTURED_OUTPUTS_BETA, CACHE_DIAGNOSIS_BETA)
+    if "context_management" in payload:
+        _insert_beta_before(out, CONTEXT_MANAGEMENT_BETA, CACHE_DIAGNOSIS_BETA)
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") in {"enabled", "adaptive"}:
+        for beta in (INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA):
+            _insert_beta_before(out, beta, CACHE_DIAGNOSIS_BETA)
+
     if auth_mode == "oauth":
-        # v280 OAuth keeps both fallback betas.  Its auth marker is second in
+        # v280 OAuth keeps explicitly requested fallback capabilities.  Its auth marker is second in
         # main profiles (immediately after claude-code) and no capture carries
         # the old advisor beta.
         _insert_beta_after(out, OAUTH_BETA, "claude-code-20250219")

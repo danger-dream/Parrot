@@ -270,10 +270,10 @@ def test_fable_api_key_main_profile_and_wire_order(dynamic_cch):
     request, payload = _transform("claude-fable-5.1", "what is 2+2")
     assert list(payload) == [
         "model", "messages", "system", "metadata", "max_tokens", "thinking",
-        "context_management", "fallbacks", "output_config", "diagnostics", "stream",
+        "context_management", "output_config", "diagnostics", "stream",
     ]
     assert payload["model"] == "claude-fable-5.1"
-    assert payload["fallbacks"] == "default"
+    assert "fallbacks" not in payload
     assert payload["diagnostics"] == {"previous_message_id": None}
     assert payload["thinking"] == {"type": "adaptive", "display": "omitted"}
     assert payload["context_management"] == {
@@ -286,7 +286,7 @@ def test_fable_api_key_main_profile_and_wire_order(dynamic_cch):
 
 
 def test_main_profiles_have_exact_observed_betas(dynamic_cch):
-    _, fable = _transform("claude-fable-5.1", "what is 2+2")
+    _, fable = _transform("claude-fable-5.1", "what is 2+2", fallbacks=[{"model": "claude-opus-5"}])
     fable_h = m.build_upstream_headers(
         "key", auth_scheme="api_key", auth_mode="api_key",
         model="claude-fable-5.1", payload=fable,
@@ -382,7 +382,7 @@ def test_oauth_fable_main_uses_captured_v280_profile_and_betas(dynamic_cch):
 
     _, captured = _transform("claude-fable-5.1", auth_mode="oauth")
     assert captured["thinking"] == {"type": "adaptive", "display": "omitted"}
-    assert captured["fallbacks"] == "default"
+    assert "fallbacks" not in captured
     assert captured["output_config"] == {"effort": "high"}
     assert captured["diagnostics"] == {"previous_message_id": None}
     captured["messages"][0]["content"][0]["cache_control"] = {
@@ -394,7 +394,7 @@ def test_oauth_fable_main_uses_captured_v280_profile_and_betas(dynamic_cch):
     )
     betas = headers["anthropic-beta"].split(",")
     assert betas[:2] == ["claude-code-20250219", m.OAUTH_BETA]
-    assert m.SERVER_SIDE_FALLBACK_BETA in betas
+    assert m.SERVER_SIDE_FALLBACK_BETA not in betas
     assert m.FALLBACK_CREDIT_BETA in betas
     assert m.EXTENDED_CACHE_TTL_BETA in betas
     assert m.ADVISOR_TOOL_BETA not in betas

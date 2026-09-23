@@ -37,7 +37,7 @@ CCH = XXH64(hash_view(body_with_generated_billing_cch=00000), seed) & 0xFFFFF
 
 `hash_view` 规则：
 
-1. 删除**顶层** `max_tokens` 和**顶层** `fallbacks`；wire body 本身仍保留这些字段。
+1. 删除**顶层** `max_tokens` 和**顶层** `fallbacks`；wire body 保留已选定的 max_tokens 和用户显式提供的 fallbacks，hash-view 不决定 wire 默认值。
 2. 删除 `messages[].content[].type == "tool_use"` 的 `input.max_tokens`；其它嵌套 `max_tokens` 仍参与。
 3. 任意层级 key 为 `model` 且 value 为 string 时，把 value 清空为 `""`；key、dict/schema 形态和递归结构保留。
 4. 把 system 中 billing text block 的 CCH 重置为 `00000`；`cc_prompt_id`、`cc_turn_origin` 等仍参与。
@@ -59,30 +59,31 @@ output_config, diagnostics, stream
 
 不存在的可选字段不会占位；`tool_choice`、显式 cache 等兼容字段按原有代理能力保留。
 
-### 普通 main
+### 模型门控（不是账号授权目录）
 
-- 默认 `max_tokens=64000`
-- 未显式指定 thinking 时：`{"type":"adaptive","display":"omitted"}`
-- thinking 为 enabled/adaptive 且未显式指定 context management 时，生成 `clear_thinking_20251015`
-- 未显式指定 output config 时：`{"effort":"high"}`
-- `diagnostics={"previous_message_id":null}`
+`cc_model_profile.py` 根据 v280 内置目录的 `max_output_tokens`、能力表及 `Jyr/vCt/L_` 的门控选默认值；不能把 Fable 抓包画像套到全部模型。模型查表会识别日期后缀及已知别名，但不重写 wire model。
+
+| 模型 | 默认 max_tokens | 缺省 thinking | 缺省 effort |
+|---|---:|---|---|
+| Claude 3.5 Haiku/Sonnet | 8192 | 不注入 | 不注入 |
+| Claude 3.7 Sonnet | 32000 | 不注入（显式 enabled 保留） | 不注入 |
+| Haiku 4.5、Sonnet 4/4.5、Opus 4/4.1 | 32000 | enabled | 不注入 |
+| Opus 4.5 | 32000 | enabled | high |
+| Sonnet 4.6 | 32000 | adaptive | high |
+| Sonnet 5、Opus 4.6–4.8/5、Fable 5/5.1、Mythos 5/5.1 | 64000 | adaptive | high |
+| Opus 5.5 | 128000 | adaptive | high |
+| 未知兼容模型 | 4096（沿用 standard 的安全默认） | 不注入 | 不注入 |
+
+缺省 enabled 的 budget 为 `max_tokens-1`、display 为 omitted；显式采样参数、强制 tool_choice 或不足1025的输出上限不应被新注入的 enabled thinking 破坏。显式 thinking/output_config/max_tokens/temperature 等优先，不替下游重写合法意图。未知模型不猜能力、不注入 context management/diagnostics；旧模型不声明新模型专属 beta。context management 仅在已知支持且 thinking 开启时默认生成；diagnostics 仅在已知 adaptive 主模型默认生成。
 
 ### Fable main
 
 v2.1.280 实证 wire model 是 `claude-fable-5.1`；Parrot 同时保留既有 `claude-fable-5` 兼容识别。
 
-在普通 main 基础上增加：
+OAuth Fable main 已有本地权威样本，与 API-key main 使用相同模型默认值；OAuth 差异由 auth header 和 beta profile 表达。
 
-```json
-{
-  "fallbacks": "default",
-  "diagnostics": {"previous_message_id": null},
-  "thinking": {"type": "adaptive", "display": "omitted"},
-  "output_config": {"effort": "high"}
-}
-```
+捕获到的 `fallbacks:"default"` 是客户端的跨模型策略，不是 Parrot 必须合成的身份。**无下游 fallback 意图不注入该字段，也不发送 server-side-fallback beta**；显式字符串、空列表、模型列表原样保留，同时携带 server-side-fallback 与 fallback-credit 能力 beta。并不把 default 偷换成固定 Opus 列表。fallback-credit beta 自身不构造 fallback body。
 
-OAuth Fable main 已有本地权威样本，与 API-key main 使用相同 body profile；OAuth 差异由 auth header 和 beta profile 表达。
 
 ### Opus 4.8 与 Opus 5
 
@@ -90,7 +91,7 @@ Opus 4.8 与 Opus 5 的 v2.1.280 profile 默认都不带 `context-1m` 或 adviso
 
 ### Haiku side query
 
-模型为 Haiku 且 structured output 或 `<session>` prompt 表明 side query 时：
+模型为已知 Haiku 4.5（含日期后缀）且 structured output 或 `<session>` prompt 表明 side query 时：
 
 - `max_tokens=32000`
 - `thinking={"type":"disabled"}`
@@ -116,7 +117,7 @@ Opus 4.8 与 Opus 5 的 v2.1.280 profile 默认都不带 `context-1m` 或 adviso
 - OAuth：`Authorization: Bearer ...`
 - 官方 Anthropic API key（provider fact 或 `api.anthropic.com`）：`x-api-key: ...`
 - 已有第三方 Anthropic-compatible API channel 继续使用其既有 Bearer 形态，不做全局硬切。
-- OAuth messages 主链在 `claude-code-20250219` 后带 `oauth-2025-04-20`，并保留 fallback 类 beta；有 1h cache block 时带 `extended-cache-ttl-2025-04-11`。
+- OAuth messages 主链在 `claude-code-20250219` 后带 `oauth-2025-04-20`，保留显式 fallback 所需 beta；有 1h cache block 时带 `extended-cache-ttl-2025-04-11`。
 - API-key 主链不带 OAuth beta。
 
 Parrot 只声明 `Accept-Encoding: gzip, deflate`。在 Brotli/Zstandard 解码依赖与测试加入前，不声明 `br` / `zstd`。
@@ -147,6 +148,8 @@ main billing 顺序固定为 version → entrypoint → cch → workload → is_
 ```bash
 ./venv/bin/python src/tests/isolated_pytest.py -q \
   src/tests/test_cc_v2_1_280_upgrade.py \
+  src/tests/test_cc_model_profiles.py \
+  src/tests/test_claude_usage_auth_recovery.py \
   src/tests/test_channel_compatibility.py
 ```
 
@@ -155,6 +158,12 @@ main billing 顺序固定为 version → entrypoint → cch → workload → is_
 `test_protocol_fake_upstreams.py::test_cc_v258_529_reuses_body_context_and_isolates_concurrent_requests` 使用 `httpx.MockTransport` 验证 529 与两个并发逻辑请求，不触网。
 
 `compare_transform.py` / `compare_channels.py` 仅作为兼容入口调用上述隔离测试，不再加载旧 `cc-proxy`。
+
+`test_cc_model_profiles.py` 验证官方 API-key、OAuth、第三方兼容渠道，以及 Chat/Responses 桥接后的真实 wire；包含 Haiku/旧 Claude/Fable/Opus/未知模型、显式值、fallback opt-in、签名与非 CC 默认不变。
+
+`test_claude_usage_auth_recovery.py` 只 fake 网络边界，验证 usage 401 的一次刷新/重试、token/scopes/profile 写回、并发刷新复用及删除重建 generation 防护。bootstrap 保留专用 `claude-code/2.1.280` UA 并带 OAuth beta。其余 provider 的 usage 行为未改。
+
+原报告13项及相关出站面的闭合见 [Claude v280 审查闭合清单](analysis/claude-v280-review-closure.md)，其中明确区分已覆盖的额度字段和未归一化的新字段。
 
 ## 5.8 device_id
 

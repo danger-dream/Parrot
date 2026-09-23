@@ -1114,6 +1114,41 @@ def _usage_sync(access_token: str, *, account_key: str = "") -> dict:
     return resp.json()
 
 
+async def _fetch_claude_usage(account_key: str) -> dict:
+    """v280 usage auth recovery: retry one 401, never turn failure into empty usage."""
+    import httpx
+    from . import channel_state
+
+    account = get_account(account_key)
+    if account is None:
+        raise ValueError(f"unknown OAuth account: {account_key}")
+    expected = account_state_key(account)
+    access_token = await ensure_valid_token(account_key, expected_state_key=expected)
+    try:
+        return await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 401:
+            raise
+        with account_generation_guard(expected) as current:
+            if not current:
+                raise
+            # A same-generation rename is allowed; replacement/deletion is not.
+            account_key = channel_state.resolve(expected).removeprefix("oauth:")
+            account = get_account(account_key)
+            if account is None:
+                raise
+            current_token = account.get("access_token")
+        # A concurrent refresh may already have replaced the rejected AT.
+        if current_token and current_token != access_token:
+            access_token = current_token
+        else:
+            access_token = await force_refresh(account_key, expected_state_key=expected)
+        with account_generation_guard(expected) as current:
+            if not current:
+                raise
+        return await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+
+
 async def fetch_profile(access_token: str) -> dict:
     return await asyncio.to_thread(_profile_sync, access_token)
 
@@ -1159,6 +1194,7 @@ def _bootstrap_sync(access_token: str) -> dict:
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "User-Agent": f"claude-code/{CC_VERSION}",
+            "anthropic-beta": "oauth-2025-04-20",
         },
         timeout=15,
         proxy_purpose="oauth_anthropic",
@@ -1215,6 +1251,8 @@ async def fetch_usage(account_key: str) -> dict:
     account_key = _resolve_existing_account_key_or_raise(account_key)
     provider = provider_of(account_key)
 
+    if provider == "claude":
+        return await _fetch_claude_usage(account_key)
     access_token = await ensure_valid_token(account_key)
 
     if provider == "workbuddy":
@@ -1235,12 +1273,6 @@ async def fetch_usage(account_key: str) -> dict:
     if provider == "antigravity":
         return await antigravity_provider.fetch_usage(
             access_token, account_key=account_key,
-        )
-
-    if provider != "openai":
-        # Claude 路径：直接走 /api/oauth/usage
-        return await asyncio.to_thread(
-            _usage_sync, access_token, account_key=account_key,
         )
 
     # OpenAI 路径：主动 quota 走 ChatGPT 私有 wham/usage。业务响应头里的
