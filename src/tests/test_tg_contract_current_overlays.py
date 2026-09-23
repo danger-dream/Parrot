@@ -32,8 +32,9 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         assert len(ids) == len(set(ids)) and not seen.intersection(ids)
         seen.update(ids)
         loaded = current.load_current_jsonl(archived_path)
-        assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived]
-        assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived]
+        extra_ids = list(current.OAUTH_ADDITION_CASE_IDS) if segment == 'oauth' else []
+        assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived] + extra_ids
+        assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived] + ['TG-OA-03'] * len(extra_ids)
     assert len(seen) == 144  # includes MCP UI, cold-stat page, and notification trace
 
 
@@ -65,6 +66,40 @@ def test_existing_overlay_loaders_still_reject_duplicate_unknown(module, mutatio
     with pytest.raises(AssertionError, match=mutation):
         loader = channels.current_cases if module is channels else module._current_cases
         loader()
+
+
+def test_current_additions_have_exact_ownership_runners_and_both_loaders_agree():
+    from src.tests.tg_contract.claude_reset_runner import SCENARIOS
+    additions = load_jsonl(ROOT / 'claude-reset-2026-09-23/additions/oauth.jsonl')
+    assert tuple(case['caseId'] for case in additions) == current.OAUTH_ADDITION_CASE_IDS
+    assert {case['capabilityId'] for case in additions} == {'TG-OA-03'}
+    assert {case['entry']['scenario'] for case in additions} == set(SCENARIOS)
+    assert all(case['caseId'] == 'TG-OA-03.' + case['entry']['scenario'] for case in additions)
+    assert_strict_equal(oauth._current_cases(), current.load_current_jsonl(oauth.SEGMENT))
+    for case in additions:
+        expected = set(case['entry']['callbackFamilies'])
+        actual = {':'.join(item['callback'].split(':')[:2]) + ':*'
+                  for item in case['finalBusinessState']['callbacks']}
+        assert expected == actual == {'oa:claude_reset_ask:*', 'oa:claude_reset_confirm:*', 'oa:claude_reset_execute:*'}
+
+
+@pytest.mark.parametrize('mutation', ['duplicate', 'missing', 'unknown', 'capability', 'replacement'])
+def test_current_additions_reject_unreviewed_or_replacing_cases(monkeypatch, mutation):
+    additions = load_jsonl(ROOT / 'claude-reset-2026-09-23/additions/oauth.jsonl')
+    existing = []
+    if mutation == 'duplicate':
+        additions.append(deepcopy(additions[0]))
+    elif mutation == 'missing':
+        additions.pop()
+    elif mutation == 'unknown':
+        additions[0]['caseId'] += '.unknown'
+    elif mutation == 'capability':
+        additions[0]['capabilityId'] = 'TG-OA-07'
+    elif mutation == 'replacement':
+        existing = [deepcopy(additions[0])]
+    monkeypatch.setattr(current, 'load_jsonl', lambda path: additions)
+    with pytest.raises(AssertionError):
+        current.load_current_additions(oauth.SEGMENT, existing)
 
 
 def test_current_overlay_does_not_weaken_business_state_comparison():

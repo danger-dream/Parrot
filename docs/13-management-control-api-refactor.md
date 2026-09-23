@@ -771,7 +771,7 @@ TG model/scope picker 每页 10 条；开关、system message、model/fallback/l
 
 - **TG-OA-01 列表/详情**：`menu:oauth`、`oa:page:*`、`oa:view:*`，filter=`all/available/quota/invalid`，每页 4；排序 select/move/reset/save/cancel；所有 provider 显示和月统计。
 - **TG-OA-02 usage**：token/usage refresh、refresh all 进度、窗口/额度/credit/本地账单、used/remaining、宽度 10 的 `█/░` progress bar、7 个 NBSP indent；后台 refresh 单飞且 handler 不等网络。
-- **TG-OA-03 runtime 动作**：toggle、maxConcurrent、clear errors/all、clear affinity、quota reset ask/confirm/error，不支持 quota 的显示。
+- **TG-OA-03 runtime 动作**：toggle、maxConcurrent、clear errors/all、clear affinity、quota reset ask/confirm/error，不支持 quota 的显示。2026-09-23 当前能力追加Claude官方重置 `oa:claude_reset_ask:* / confirm:* / execute:*`（完整前缀均为`oa:claude_reset_`）：cedar成功/重复、juniper未确认/重复、非法阶段/过期三个严格回放case归属本ID。新轨迹位于`fixtures/tg_contract/claude-reset-2026-09-23/additions/oauth.jsonl`，由当前loader合并；不改v0.31.13历史golden，不把新callback当作ignore或retired。
 - **TG-OA-04 新增/登录**：Claude、Cursor、OpenAI、xAI、Antigravity 的 login/regenerate/code/done，JSON 和 refresh token 输入，所有 auth error、取消和返回。
 - **TG-OA-05 identity 覆盖**：`oa:overwrite:confirm:{nonce}|cancel`、state `oa_oauth_overwrite_confirm`、恒时比较、过期/错 chat/重复点击、pop 时机和 exact identity 结果。
 - **TG-OA-06 import/invalid**：OpenAI/cpa/sub2api preview、document/text、commit、overwrite confirm/cancel、sync wait/result；invalid list toggle/remove selected/all。

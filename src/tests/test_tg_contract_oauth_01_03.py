@@ -181,6 +181,9 @@ def _run_oa02(case, monkeypatch):
 
 
 def _run_oa03(case, monkeypatch):
+    if case["entry"]["scenario"].startswith("claude_reset_"):
+        from src.tests.tg_contract.claude_reset_runner import run_claude_reset
+        return run_claude_reset(case, monkeypatch)
     env = FakeEnv(case, monkeypatch)
     env.seed_accounts(providers=[case["entry"].get("provider", "claude")], count=1)
     _patch_actions(env, monkeypatch)

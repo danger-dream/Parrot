@@ -31,6 +31,7 @@ from src.telegram import menu_cache, states, ui
 from src.telegram.menus import oauth_account_models_menu as oam
 from src.telegram.menus import oauth_menu as om
 from src.tests.tg_contract import TraceCapture, assert_strict_equal, load_jsonl
+from src.tests.tg_contract.current import load_current_additions
 
 # v0.31.13 remains the immutable historical recording.  Current model-center
 # deltas live in a sparse overlay so unaffected payload/state assertions still
@@ -295,7 +296,8 @@ def _current_cases():
     unknown = set(override_map) - archived_ids
     if unknown:
         raise AssertionError(f"unknown OAuth contract overrides: {sorted(unknown)}")
-    return [override_map.get(case["caseId"], case) for case in archived]
+    result = [override_map.get(case["caseId"], case) for case in archived]
+    return result + load_current_additions(SEGMENT, result)
 
 
 def cases_for(*ids):
