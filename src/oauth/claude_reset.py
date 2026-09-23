@@ -195,6 +195,73 @@ def _post_sync(token, key, org, body):
     }}
 
 
+async def _post_with_auth_recovery(token, key, org, body, expected):
+    """Only an explicit 401 proves the first POST did not execute."""
+    try:
+        return await asyncio.to_thread(_post_sync, token, key, org, body)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 401:
+            raise
+        manager = _manager()
+        key, account = _current(key, expected)
+        current_token = account.get("access_token")
+        if current_token and current_token != token:
+            token = current_token
+        else:
+            token = await manager.force_refresh(key, expected_state_key=expected)
+        key, account = _current(key, expected)
+        if account.get("disabled_reason") in {"user", "auth_error"}:
+            return {"result": "ineligible", "reason": account["disabled_reason"]}
+        if account.get("claude_organization_uuid") != org:
+            return {"result": "ineligible", "reason": "organization_missing_or_changed"}
+        # Same body/request_id, once only. A timeout or a second 401 propagates.
+        return await asyncio.to_thread(_post_sync, token, key, org, body)
+
+
+def _clear_recovered_quota_cooldowns(key, account, previous, flat):
+    """Clear only old rate-limit errors tied to a recovered account deadline.
+
+    Caller holds the account generation lock and has compared pre-dispatch
+    evidence, so an in-flight new restriction cannot be erased here.
+    """
+    from .. import cooldown
+    manager = _manager()
+    if account.get("disabled_reason") != "quota":
+        return []
+    try:
+        threshold = float((config.get().get("quotaMonitor") or {}).get("disableThresholdPercent", 95))
+    except (TypeError, ValueError):
+        threshold = 95.0
+    windows = ("five_hour", "seven_day", "thirty_day", "sonnet", "opus")
+    if any(flat.get(f"{w}_util") is not None and flat[f"{w}_util"] >= threshold for w in windows):
+        return []
+    deadlines = {_date(account.get("disabled_until"))}
+    deadlines.update(_date(previous.get(f"{w}_reset")) for w in windows
+                     if previous.get(f"{w}_util") is not None and previous[f"{w}_util"] >= threshold
+                     and flat.get(f"{w}_util") is not None)
+    deadlines = {int(stamp * 1000) for stamp in deadlines if stamp is not None}
+    fable_models = set(manager.claude_fable_models(account))
+    cleared = []
+    for row in state_db.error_load_all():
+        if row.get("channel_key") != f"oauth:{key}" or row.get("cooldown_until") not in deadlines:
+            continue
+        model = row.get("model")
+        if model in fable_models and (flat.get("fable_util") is None or flat["fable_util"] >= threshold):
+            continue
+        message = str(row.get("last_error_message") or "")
+        if not message.startswith("HTTP 429:"):
+            continue
+        try:
+            error = json.loads(message[len("HTTP 429:"):]).get("error")
+        except (ValueError, AttributeError):
+            continue
+        if not isinstance(error, dict) or error.get("type") != "rate_limit_error":
+            continue
+        cooldown.clear(f"oauth:{key}", model=model, notify_recovered=False)
+        cleared.append(model)
+    return cleared
+
+
 def _evidence(key, account):
     row = state_db.quota_load(key) or {}
     model_errors = sorted((item for item in state_db.error_load_all()
@@ -240,6 +307,12 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
         return {**old["response"], "replayed": True}
     block = fresh.get(program) or {}
     pending = old.get("status") in {"pending", "unknown"}
+    # A newly confirmed, independently identified grant is not a replay of the
+    # old uncertain claim. Keep same-grant ambiguity/600s idempotency unchanged.
+    if (pending and program == "cedar_ember" and grant_id
+            and grant_id != old.get("grant_id") and grant_id == block.get("next_grant_id")
+            and eligibility(fresh, program, grant_id) is None):
+        pending = False
     retry = False
     if pending:
         grant = next((g for g in block.get("grants", []) if isinstance(g, dict)
@@ -298,7 +371,7 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
     # Durable before dispatch: after a crash we cannot claim "not sent".
     state_db.claude_reset_operation_save(journal_key, record)
     try:
-        response = await asyncio.to_thread(_post_sync, token, key, org, body)
+        response = await _post_with_auth_recovery(token, key, org, body, expected)
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         response = {"result": "rate_limited" if code == 429 else "auth_error" if code in (401, 403) else "unconfirmed",
@@ -311,8 +384,8 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
                         response[name] = detail[name]
         except ValueError:
             pass
-        # No automatic POST retries (especially Juniper). A new product
-        # confirmation is required even after an authentication failure.
+        # Authentication recovery was bounded to one explicit 401 above.
+        # Other failures never automatically replay a possibly executed POST.
     except Exception as exc:
         response = {"result": "unconfirmed", "reason": "reset_unconfirmed",
                     "error_type": type(exc).__name__}
@@ -364,8 +437,15 @@ async def _redeem_locked(key, program, expected, org, grant_id, operation_id, jo
             state_db.quota_patch_claude_reset_status(key, usage, expected_state_key=expected)
             out["quota_action"] = {"action": "quota_unknown_keep_disabled"}
         else:
+            try:
+                cleared = _clear_recovered_quota_cooldowns(key, account, previous, flat)
+            except Exception as exc:
+                out["quota_action"] = {"action": "resume_failed", "error_code": "runtime_state_clear_failed"}
+                out["state_error"] = type(exc).__name__
+                return out
             state_db.quota_save(key, flat, expected_state_key=expected)
             out["quota_action"] = manager.evaluate_and_toggle_by_usage(key, usage, fresh=True, expected_state_key=expected)
-        # Never blanket-clear model cooldowns. Existing scoped evaluators own
-        # their own recovery; unrelated/new restrictions remain authoritative.
+            out["cleared_models"] = cleared
+        # No blanket clear: Fable and unrelated/new restrictions retain their
+        # own recovery rules; only confirmed old account-quota errors are gone.
     return out

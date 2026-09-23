@@ -342,7 +342,19 @@ def _quota_write(account_key:str, operation, *, expected_state_key:str|None=None
 def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected_state_key:str|None=None)->None:
     cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data")
     def op(d,target):
-        row=_quota_defaults(dict(d.get(target) or {}));row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))});row.update({k:data.get(k) for k in cols})
+        row=_quota_defaults(dict(d.get(target) or {}))
+        updates={k:data.get(k) for k in cols}
+        if target.startswith(("openai:", "claude:")):
+            # A partial active read is not evidence that an omitted window
+            # recovered. Keep its last known value/deadline for recovery checks.
+            # raw_data stays the unmerged fresh response, so callers can still
+            # distinguish observed zero from a missing metric.
+            for window in ("five_hour", "seven_day", "thirty_day", "sonnet", "opus", "fable"):
+                if updates.get(f"{window}_util") is None:
+                    updates.pop(f"{window}_util", None)
+                    updates.pop(f"{window}_reset", None)
+        row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))})
+        row.update(updates)
         if target.startswith("openai:") or row.get("codex_window_observations"):
             row["codex_active_observed_at"]=row["fetched_at"]
         d[target]=row

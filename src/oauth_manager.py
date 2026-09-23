@@ -2036,7 +2036,7 @@ def evaluate_and_toggle_by_cached_quota(account_key: str,
 def _usage_has_any_quota_signal(usage: dict) -> bool:
     openai = usage.get("openai") or {}
     spend = openai.get("spend_control") or {}
-    return (any(u is not None for u in extract_utils_percent(usage))
+    return (any(u is not None for u in extract_utils_percent(usage)[:5])
             or (openai.get("source") == "wham_usage"
                 and isinstance(spend.get("reached"), bool)))
 
@@ -2784,7 +2784,7 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
           - 账号未禁用：set_disabled_by_quota，disabled_until = 撞到窗口的最大 reset
       • Claude Fable scoped 窗口只冷却该账号的 Fable 模型，不禁用整个账号
       • 所有窗口 util < threshold → 可用
-          - OpenAI / Grok 账号若 usage 没有任何窗口指标，或这份 usage 不是本轮新鲜探测，
+          - OpenAI / Claude / Grok 账号若 usage 没有有效额度指标，或这份 usage 不是本轮新鲜探测，
             不能作为恢复依据；保持原 quota 禁用状态，避免“未知=恢复”误判。
           - OpenAI 账号若仍有未过期的 Codex 响应头超限快照，继续保持 quota
             禁用，避免 WHAM/Codex 边界不同步导致“假恢复”。
@@ -2951,7 +2951,20 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
     # 活动的 Codex 超限快照，前面的 any_over 分支已经保持禁用；否则新鲜
     # WHAM 低用量应覆盖旧 disabled_until，因为后者只是上次超限时的预测。
     if reason == "quota":
-        if provider in ("openai", "xai"):
+        if provider in ("openai", "claude"):
+            # quota_save preserves omitted windows. A low unrelated window (or
+            # spend_control=false) cannot discharge a known weekly/monthly cap.
+            row = state_db.quota_load(account_key) or {}
+            flat = flatten_usage(usage)
+            missing = [window for window in ("five_hour", "seven_day", "thirty_day", "sonnet", "opus")
+                       if row.get(f"{window}_util") is not None
+                       and row[f"{window}_util"] >= threshold
+                       and flat.get(f"{window}_util") is None]
+            if missing:
+                return {"action": "quota_unknown_keep_disabled", "utils": utils,
+                        "any_over": False, "hit_windows": [], "missing_windows": missing,
+                        "disabled_until": acc.get("disabled_until")}
+        if provider in ("openai", "claude", "xai"):
             if not _usage_has_any_quota_signal(usage):
                 return {"action": "quota_unknown_keep_disabled", "utils": utils,
                         "any_over": False, "hit_windows": [],

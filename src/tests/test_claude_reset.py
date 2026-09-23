@@ -415,7 +415,12 @@ def test_new_passive_limit_during_post_is_not_overwritten(env):
 
 
 @pytest.mark.parametrize('code,result', [(401, 'auth_error'), (403, 'auth_error'), (429, 'rate_limited'), (500, 'unconfirmed')])
-def test_http_failure_does_not_automatically_repost(env, monkeypatch, code, result):
+def test_http_failure_only_retries_one_explicit_401(env, monkeypatch, code, result):
+    refreshes = []
+    async def refresh(*args, **kwargs):
+        refreshes.append(True)
+        return 'fresh-test-token'
+    monkeypatch.setattr(om, 'force_refresh', refresh)
     def post(url, **kwargs):
         env.posts.append((url, kwargs))
         return httpx.Response(code, json={'reason': 'upstream_reason', 'cooldown_until': '2030-01-01T00:00:00Z'},
@@ -423,7 +428,10 @@ def test_http_failure_does_not_automatically_repost(env, monkeypatch, code, resu
     monkeypatch.setattr(cr.network, 'post_sync', post)
     out = execute(env, 'juniper_tide')
     assert out['result'] == result and out['reason'] == 'upstream_reason'
-    assert len(env.posts) == 1
+    assert len(env.posts) == (2 if code == 401 else 1)
+    assert len(refreshes) == int(code == 401)
+    if code == 401:
+        assert env.posts[0][1]['json'] == env.posts[1][1]['json']
 
 
 def test_legacy_generation_is_pinned_before_durable_effect(env):

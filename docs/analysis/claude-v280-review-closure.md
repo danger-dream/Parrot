@@ -89,21 +89,22 @@
 
 - 统一`OAuthBackend`→`ClaudeResetControlMixin`契约，需DESTRUCTIVE权限；说明计划→最终确认计划→执行。计划绑定actor、精确账号revision、generation、组织和所选next grant，执行前一次性consume；TG同样经过这个服务端门禁，而非只靠callback字符串的stage。
 - 执行前强一致重查eligible、next_grant、paused、有效期、usable_now、blocking、use_requires_limit、cooldown；不悄悄替换卡。Juniper要求实验reset组且available，明确“消耗周额度份额、重置5h、每周次数”。不克隆statsig，不隐式自动续跑。
-- 25s POST使用OAuth Bearer、JSON和当前CLI UA。Cedar恰为`{program,grant_id,request_id}`；Juniper恰为`{program}`，不编造幂等头/字段。状态GET的401允许刷新后重读；消费POST不自动重发，连401/403也如实回传auth_error，要求重新走产品确认。429返回rate_limited。
+- 25s POST使用OAuth Bearer、JSON和当前CLI UA。Cedar恰为`{program,grant_id,request_id}`；Juniper恰为`{program}`，不编造幂等头/字段。状态GET的401允许刷新后重读；消费POST仅对明确401复用并发更新的Token或刷新一次，保持同一body/request_id再试一次，并重新检查账号generation、组织和禁用状态。第二次401、403不再重试；超时/断连等结果不确定时不重发消费。429返回rate_limited。
 - 新增`claude_reset_operations`独立durable域，键绑定generation+program+组织，只保留非秘密操作元数据。先持久化pending再POST；写入失败不会消费。旧账号无持久generation时先固化现有同一generation，避免重启失联。Token/config存储与备份格式未改变。
-- Cedar同一未决操作600秒内经再次确认时复用同一request_id；超出600秒且仍无结论则保守阻止新键消费，不假定老键仍安全。Juniper未决同一周**即使状态仍available，也绝不再次POST**；重启仍有效。查到额度已变化只报告“无法归因但状态已变化”，不谎称本次成功；下一自然周有新周期证据且用户重新确认才允许新操作。
+- Cedar同一未决操作600秒内经再次确认时复用同一request_id；同一grant超出600秒且仍无结论则阻止盲目重发。服务端明确提供不同的next_grant且用户重新确认新卡时，允许独立新操作，不把旧卡未决状态扩大为永久账号级封锁，也不据此宣称旧操作成功。Juniper未决同一周**即使状态仍available，也绝不再次POST**；重启仍有效。查到额度已变化只报告“无法归因但状态已变化”，不谎称本次成功；下一自然周有新周期证据且用户重新确认才允许新操作。
 - result/reason/resets_left/cleared/cooldown_until/next_available_at/weekly_resets_at原样进入反馈。未知、超时、stamp_indeterminate/reset_unconfirmed只补GET核对，不自动重试消费、不强制启用。
 
 ### 重置后恢复与scope
 
 - reset/already_used之后单独拉普通完整usage（含费用）。只有5h/7d及先前已知模型窗口都有有效新证据，才调用现有scope evaluator；缺失/失败不作为恢复证明。
 - 从POST前到刷新结束，比较账号generation、quota观察代次、disabled状态、被动头观察时间和模型限制记录；任何新限制到达都保留，不删除quota整行，不全量清模型冷却。删除重建的晚结果不能写入或启用新账号。
-- Fable仍只冷却Fable，其它模型可用性按已有策略；没有利用“官方重置成功”绕过模型scope。
+- 确认完整新usage低于阈值且没有并发新限制后，仅清除HTTP 429/rate_limit_error中期限与旧账号配额期限匹配的模型冷却，先完成持久化删除再启用账号；删除失败不回报恢复。无关错误、不同期限及仍超限/未知的Fable限制保留，不全量清空冷却。
+- 后台/手动恢复也要求有效新额度数据：OpenAI和Claude的缺失窗口保留旧值与期限，并以原始未合并响应判定本轮到底观察到了什么；未覆盖原超限窗口时不得恢复。spend_control=false不能替代缺失周额度，Claude空usage也不能恢复。Fable专属指标不能单独证明整个账号额度恢复。
 - **证据边界**：更新报告仅证明`clears`枚举允许oauth_apps/overage/cowork/omelette等窗口，没有给出“普通代理messages必然消费该窗口”的模型/产品归属映射，也无真实Claude账号验证。因此保留原始字段、展示服务端cleared，不将它们并入账号seven_day，不新增overage授权。后续若要自动路由这些窗口，需要模型/产品scope映射的权威证据，而非从名字猜测。
 
 ### 追加修改面与回归
 
-新增`oauth/claude_reset.py`、管理控制mixin和TG子菜单；`oauth_manager.py`只加组织字段。`state_db.py`新增三项Claude接口，`state_store.py`只增加一个durable域。原OpenAI reset/WHAM/WS不重做。
+新增`oauth/claude_reset.py`、管理控制mixin和TG子菜单；`oauth_manager.py`只加组织字段。`state_db.py`新增三项Claude接口，`state_store.py`只增加一个durable域。原OpenAI reset/WHAM/WS不重做。后续恢复修正集中在`claude_reset.py`、通用额度评估和`quota_save`的缺失窗口保留，不改变其他provider的保存策略；`test_quota_recovery_review_fixes.py`覆盖实际调度、持久化、部分/空额度、旧卡与新卡隔离以及有限401恢复。
 
 `test_claude_reset.py`覆盖50个正式用例：eligibility与next grant、两种精确wire、同/跨按钮并发、未决ID、真实state重载、权限及两阶段服务端确认、无组织、账号删除重建、回包/刷新期间新限制、Fable scope、成功后仍超限/刷新失败、TG实际callback链和两类按钮共存。原TG严格快照只在当前overlay的六个Claude详情case补明确新增区块/按钮；历史v0.31.13和其它provider内容未重录。
 
