@@ -306,7 +306,7 @@ def provider_usage_save_error(account_id:str,adapter_id:str,error:str,retry_afte
     _mut("api_provider_usage_cache",op)
 def provider_usage_delete(account_id:str)->None:_mut("api_provider_usage_cache",lambda d:d.pop(account_id,None))
 
-_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_reset_at","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_reset_at","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations","codex_rate_limits","codex_credits_has_credits","codex_credits_unlimited","codex_credits_balance","codex_rate_limit_reached_type")
+_QUOTA_COLUMNS = ("account_key","email","fetched_at","last_passive_update_at","five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data","codex_primary_used_pct","codex_primary_reset_sec","codex_primary_reset_at","codex_primary_window_min","codex_secondary_used_pct","codex_secondary_reset_sec","codex_secondary_reset_at","codex_secondary_window_min","codex_primary_over_secondary_pct","codex_window_observations","codex_rate_limits","codex_credits_has_credits","codex_credits_unlimited","codex_credits_balance","codex_rate_limit_reached_type","codex_active_observed_at","codex_credits_observed_at","codex_rate_limit_reached_at")
 def _quota_defaults(row:dict[str,Any])->dict[str,Any]:return {column:row.get(column) for column in _QUOTA_COLUMNS}
 
 def _quota_display_email(account_key:str)->str:
@@ -326,7 +326,9 @@ def quota_set_observation_times(account_key:str,*,last_passive_update_at:int|Non
         row=d.get(account_key)
         if row is None:return
         if last_passive_update_at is not None:row["last_passive_update_at"]=last_passive_update_at
-        if fetched_at is not None:row["fetched_at"]=fetched_at
+        if fetched_at is not None:
+            row["fetched_at"]=fetched_at
+            if row.get("codex_active_observed_at") is not None:row["codex_active_observed_at"]=fetched_at
         if codex_window_observations is not None:row["codex_window_observations"]=codex_window_observations
     _mut("oauth_quota_cache",op)
 def _quota_write(account_key:str, operation, *, expected_state_key:str|None=None):
@@ -340,7 +342,10 @@ def _quota_write(account_key:str, operation, *, expected_state_key:str|None=None
 def quota_save(account_key:str,data:dict[str,Any],*,email:str|None=None,expected_state_key:str|None=None)->None:
     cols=("five_hour_util","five_hour_reset","seven_day_util","seven_day_reset","thirty_day_util","thirty_day_reset","sonnet_util","sonnet_reset","opus_util","opus_reset","fable_util","fable_reset","extra_used","extra_limit","extra_util","raw_data")
     def op(d,target):
-        row=_quota_defaults(dict(d.get(target) or {}));row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))});row.update({k:data.get(k) for k in cols});d[target]=row
+        row=_quota_defaults(dict(d.get(target) or {}));row.update({"account_key":target,"email":email or _quota_display_email(target),"fetched_at":int(data.get("fetched_at",now_ms()))});row.update({k:data.get(k) for k in cols})
+        if target.startswith("openai:") or row.get("codex_window_observations"):
+            row["codex_active_observed_at"]=row["fetched_at"]
+        d[target]=row
     _quota_write(account_key,op,expected_state_key=expected_state_key)
 def quota_delete(value:str)->None:
     from . import channel_state
@@ -362,35 +367,49 @@ def quota_patch_passive(account_key:str,patch:dict,*,email:str|None=None,expecte
 def quota_save_openai_snapshot(account_key:str,snap:dict,normalized:dict|None=None,*,email:str|None=None,expected_state_key:str|None=None)->None:
     from .oauth import openai as provider
     if normalized is None:normalized=provider.normalize_codex_snapshot(snap)
-    fetched=int(snap.get("fetched_at") or now_ms()); now=int(time.time())
+    fetched=int(snap.get("fetched_at") or now_ms()); now=fetched//1000
     def reset(sec):return None if sec is None else time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime(now+max(0,int(sec))))
     mapping=(("five_hour_util","five_hour_util",False),("five_hour_reset","five_hour_reset_sec",True),("seven_day_util","seven_day_util",False),("seven_day_reset","seven_day_reset_sec",True),("thirty_day_util","thirty_day_util",False),("thirty_day_reset","thirty_day_reset_sec",True))
     raw=(("codex_primary_used_pct","primary_used_pct"),("codex_primary_reset_sec","primary_reset_sec"),("codex_primary_reset_at","primary_reset_at"),("codex_primary_window_min","primary_window_min"),("codex_secondary_used_pct","secondary_used_pct"),("codex_secondary_reset_sec","secondary_reset_sec"),("codex_secondary_reset_at","secondary_reset_at"),("codex_secondary_window_min","secondary_window_min"),("codex_primary_over_secondary_pct","primary_over_secondary_pct"))
     def op(d,target):
-        row=_quota_defaults(dict(d.get(target) or {"account_key":target}));row.update(account_key=target,email=email or _quota_display_email(target),fetched_at=fetched,last_passive_update_at=fetched)
+        row=_quota_defaults(dict(d.get(target) or {"account_key":target}))
+        previous_passive=int(row.get("last_passive_update_at") or 0)
+        # Freeze legacy clocks before any partial snapshot changes the row age.
+        if row.get("codex_active_observed_at") is None:
+            row["codex_active_observed_at"]=int(row.get("fetched_at") or 0)
+        try:existing=json.loads(row.get("codex_window_observations") or "{}")
+        except (TypeError,ValueError):existing={}
+        legacy=provider.codex_snapshot_window_observations({key:row.get(col) for col,key in raw},observed_at=previous_passive)
+        existing={**legacy,**provider.sanitize_codex_window_observations(existing)}
+        try:credit_times=json.loads(row.get("codex_credits_observed_at") or "{}")
+        except (TypeError,ValueError):credit_times={}
+        if not isinstance(credit_times,dict):credit_times={}
+        for key in ("has_credits","unlimited","balance"):
+            if row.get(f"codex_credits_{key}") is not None:credit_times.setdefault(key,previous_passive)
+        if row.get("codex_rate_limit_reached_at") is None:
+            row["codex_rate_limit_reached_at"]=previous_passive
+        row.update(account_key=target,email=email or _quota_display_email(target),fetched_at=fetched,last_passive_update_at=fetched)
         for col,key,is_reset in mapping:
             if key in normalized:row[col]=reset(normalized.get(key)) if is_reset else normalized.get(key)
         for col,key in raw:
             if snap.get(key) is not None:row[col]=snap.get(key)
-        rate_limits=snap.get("rate_limits")
-        if isinstance(rate_limits,list):
-            try:existing_limits=json.loads(row.get("codex_rate_limits") or "[]")
-            except (TypeError,ValueError):existing_limits=[]
-            merged_limits={str(item.get("limit_id") or ""):item for item in existing_limits if isinstance(item,dict) and item.get("limit_id")}
-            for item in rate_limits:
-                if isinstance(item,dict) and item.get("limit_id"):merged_limits[str(item["limit_id"])]=item
-            row["codex_rate_limits"]=json.dumps(list(merged_limits.values()),ensure_ascii=False,separators=(",",":"),sort_keys=True)
+        try:existing_limits=json.loads(row.get("codex_rate_limits") or "[]")
+        except (TypeError,ValueError):existing_limits=[]
+        merged_limits=provider.merge_codex_rate_limits((existing_limits,previous_passive),(snap.get("rate_limits"),fetched))
+        row["codex_rate_limits"]=json.dumps(merged_limits,ensure_ascii=False,separators=(",",":"),sort_keys=True)
         credits=snap.get("credits")
         if isinstance(credits,dict):
-            if credits.get("has_credits") is not None:row["codex_credits_has_credits"]=bool(credits.get("has_credits"))
-            if credits.get("unlimited") is not None:row["codex_credits_unlimited"]=bool(credits.get("unlimited"))
-            if credits.get("balance") is not None:row["codex_credits_balance"]=str(credits.get("balance"))
-        if snap.get("rate_limit_reached_type") is not None:row["codex_rate_limit_reached_type"]=str(snap.get("rate_limit_reached_type"))
-        incoming=provider.codex_snapshot_window_observations(snap)
-        if incoming:
-            try:existing=json.loads(row.get("codex_window_observations") or "{}")
-            except (TypeError,ValueError):existing={}
-            merged=provider.merge_codex_window_observations(existing,incoming);row["codex_window_observations"]=json.dumps(merged,ensure_ascii=False,separators=(",",":"),sort_keys=True)
+            for key in ("has_credits","unlimited","balance"):
+                if credits.get(key) is not None and fetched>=credit_times.get(key,0):
+                    row[f"codex_credits_{key}"]=str(credits[key]) if key=="balance" else bool(credits[key])
+                    credit_times[key]=fetched
+        row["codex_credits_observed_at"]=json.dumps(credit_times,separators=(",",":"),sort_keys=True)
+        if snap.get("rate_limit_reached_type") is not None and fetched>=row["codex_rate_limit_reached_at"]:
+            row["codex_rate_limit_reached_type"]=str(snap["rate_limit_reached_type"])
+            row["codex_rate_limit_reached_at"]=fetched
+        incoming=provider.codex_snapshot_window_observations(snap,observed_at=fetched)
+        merged=provider.merge_codex_window_observations(existing,incoming)
+        row["codex_window_observations"]=json.dumps(merged,ensure_ascii=False,separators=(",",":"),sort_keys=True)
         d[target]=row
     _quota_write(account_key,op,expected_state_key=expected_state_key)
 

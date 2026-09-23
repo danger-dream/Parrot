@@ -2086,6 +2086,42 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
                 if _d:
                     out.append(_d)
 
+    if provider == "openai":
+        codex = oauth_control.usage_from_quota_row(row).get("openai") or {}
+        credits = codex.get("credits") or {}
+        credit_parts = []
+        if credits.get("unlimited") is True:
+            credit_parts.append("不限量")
+        if credits.get("balance") is not None:
+            credit_parts.append(f"余额 {ui.escape_html(str(credits['balance']))}")
+        if not credit_parts and credits.get("has_credits") is not None:
+            credit_parts.append("可用" if credits["has_credits"] else "不可用")
+        if credit_parts:
+            # Upstream credits have no declared currency unit.
+            out.append("💰 Credits: " + " · ".join(credit_parts))
+        for family in codex.get("additional_rate_limits") or []:
+            name = ui.escape_html(str(family.get("limit_name") or family.get("limit_id") or "额外额度"))
+            for key in ("primary", "secondary"):
+                window = family.get(key) or {}
+                minutes = window.get("window_minutes")
+                if isinstance(minutes, (int, float)) and minutes > 0:
+                    duration = (f"{minutes / 1440:g}d" if minutes % 1440 == 0 else
+                                f"{minutes / 60:g}h" if minutes % 60 == 0 else f"{minutes:g}m")
+                else:
+                    duration = "主窗口" if key == "primary" else "次窗口"
+                reset = window.get("reset_at")
+                reset_iso = None
+                if reset is not None:
+                    try:
+                        reset_iso = datetime.fromtimestamp(int(reset), tz=timezone.utc).isoformat()
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        pass
+                line = _format_usage_line_text(
+                    f"📊 {name} {duration}", window.get("used_percent"), reset_iso,
+                )
+                if line:
+                    out.append(line)
+
     ex_used = row.get("extra_used")
     ex_limit = row.get("extra_limit")
     ex_util = row.get("extra_util")

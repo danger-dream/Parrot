@@ -117,11 +117,12 @@ from .transports import policy as transport_policy
 # ─── OpenAI Codex 响应头 snapshot 节流 ───────────────────────────
 #
 # ChatGPT internal API 把 rate-limit 放在每次请求的 response header 里，没有
-# 独立 usage 端点。为避免每次请求都写一次 state_db，按账号 30s 节流。
+# 独立 usage 端点。为避免每次请求都写一次 state_db，按账号/数据族 30s 节流。
 # 快照持久化属于旁路能力，异常不得影响主请求链路。
 
 _CODEX_SNAPSHOT_WRITE_INTERVAL_S = 30.0
 _codex_snapshot_last: dict[str, float] = {}
+_codex_snapshot_family_last: dict[str, dict[str, float]] = {}
 _codex_snapshot_lock = threading.Lock()
 _codex_snapshot_inflight: set[str] = set()
 
@@ -167,14 +168,52 @@ def _maybe_record_codex_snapshot(
         # workspace，不能按 email 合并。只在成功写入后推进 last；inflight
         # 防止多个并发响应同时穿透，但写失败会立刻允许下一次重试。
         now = time.time()
+        # Independent families (and partial credits) must not consume each
+        # other's sample. Filter the snapshot before writing so a new reserve
+        # sample does not also refresh a throttled codex window's clock.
+        families = {
+            str(item["limit_id"]): item for item in snap.get("rate_limits") or []
+            if isinstance(item, dict) and item.get("limit_id")
+            and (item.get("primary") or item.get("secondary") or item.get("limit_name"))
+        }
+        components = set(families)
+        has_default_window = any(
+            snap.get(f"{name}_{suffix}") is not None
+            for name in ("primary", "secondary")
+            for suffix in ("used_pct", "reset_sec", "reset_at", "window_min")
+        )
+        if has_default_window or snap.get("primary_over_secondary_pct") is not None:
+            components.add("codex")
+        credits = snap.get("credits") or {}
+        components.update(f"credits:{key}" for key, value in credits.items() if value is not None)
+        if snap.get("rate_limit_reached_type") is not None:
+            components.add("reached")
         with _codex_snapshot_lock:
-            last = _codex_snapshot_last.get(account_key, 0.0)
-            if (
-                now - last < _CODEX_SNAPSHOT_WRITE_INTERVAL_S
-                or account_key in _codex_snapshot_inflight
-            ):
+            last = _codex_snapshot_last.get(account_key)
+            clocks = _codex_snapshot_family_last.get(account_key, {}) if last is not None else {}
+            sampled = {
+                key for key in components
+                if key not in clocks or last is None
+                or now - min(last, clocks[key]) >= _CODEX_SNAPSHOT_WRITE_INTERVAL_S
+            }
+            if not sampled or account_key in _codex_snapshot_inflight:
                 return
             _codex_snapshot_inflight.add(account_key)
+        snap = dict(snap)
+        snap["rate_limits"] = [item for key, item in families.items() if key in sampled]
+        snap["additional_rate_limits"] = [
+            item for item in snap["rate_limits"] if item["limit_id"] != "codex"
+        ]
+        if "codex" not in sampled:
+            for name in ("primary", "secondary"):
+                for suffix in ("used_pct", "reset_sec", "reset_at", "window_min"):
+                    snap.pop(f"{name}_{suffix}", None)
+            snap.pop("primary_over_secondary_pct", None)
+        snap["credits"] = {
+            key: value for key, value in credits.items() if f"credits:{key}" in sampled
+        }
+        if "reached" not in sampled:
+            snap.pop("rate_limit_reached_type", None)
         try:
             normalized = openai_provider.normalize_codex_snapshot(snap)
             state_db.quota_save_openai_snapshot(
@@ -186,7 +225,11 @@ def _maybe_record_codex_snapshot(
             raise
         else:
             with _codex_snapshot_lock:
-                _codex_snapshot_last[account_key] = time.time()
+                written_at = time.time()
+                _codex_snapshot_last[account_key] = written_at
+                _codex_snapshot_family_last[account_key] = {
+                    **clocks, **dict.fromkeys(sampled, written_at),
+                }
         finally:
             with _codex_snapshot_lock:
                 _codex_snapshot_inflight.discard(account_key)
@@ -446,6 +489,8 @@ def forget_codex_snapshot(account_key_or_email: str) -> None:
     with _codex_snapshot_lock:
         _codex_snapshot_last.pop(email, None)
         _codex_snapshot_last.pop(key, None)
+        _codex_snapshot_family_last.pop(email, None)
+        _codex_snapshot_family_last.pop(key, None)
         _codex_snapshot_inflight.discard(email)
         _codex_snapshot_inflight.discard(key)
 

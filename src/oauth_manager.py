@@ -1903,22 +1903,13 @@ def usage_from_quota_row(row: dict) -> dict:
     active_limits = raw_openai.get("rate_limits")
     if not isinstance(active_limits, list):
         active_limits = []
-    passive_is_newer = int(row.get("last_passive_update_at") or 0) >= int(
-        row.get("fetched_at") or 0
+    active_ms = int(row.get("codex_active_observed_at")
+                    if row.get("codex_active_observed_at") is not None
+                    else row.get("fetched_at") or 0)
+    passive_ms = int(row.get("last_passive_update_at") or 0)
+    codex_rate_limits = openai_provider.merge_codex_rate_limits(
+        (active_limits, active_ms), (passive_codex_rate_limits, passive_ms),
     )
-    ordered_limits = (
-        [active_limits, passive_codex_rate_limits]
-        if passive_is_newer else [passive_codex_rate_limits, active_limits]
-    )
-    merged_limits: dict[str, dict] = {}
-    for limits in ordered_limits:
-        for item in limits:
-            if not isinstance(item, dict):
-                continue
-            limit_id = str(item.get("limit_id") or "")
-            if limit_id:
-                merged_limits[limit_id] = item
-    codex_rate_limits = list(merged_limits.values())
 
     active_credits = raw_openai.get("credits")
     if not isinstance(active_credits, dict):
@@ -1928,18 +1919,25 @@ def usage_from_quota_row(row: dict) -> dict:
         "unlimited": row.get("codex_credits_unlimited"),
         "balance": row.get("codex_credits_balance"),
     }
-    credit_sources = (
-        [active_credits, passive_credits]
-        if passive_is_newer else [passive_credits, active_credits]
-    )
-    codex_credits: dict = {}
-    for source in credit_sources:
-        codex_credits.update({key: value for key, value in source.items() if value is not None})
+    try:
+        credit_times = json.loads(row.get("codex_credits_observed_at") or "{}")
+    except (TypeError, ValueError):
+        credit_times = {}
+    if not isinstance(credit_times, dict):
+        credit_times = {}
+    codex_credits = {key: value for key, value in active_credits.items() if value is not None}
+    for key, value in passive_credits.items():
+        if value is not None and (
+            key not in codex_credits or credit_times.get(key, passive_ms) >= active_ms
+        ):
+            codex_credits[key] = value
     passive_reached = row.get("codex_rate_limit_reached_type")
     active_reached = raw_openai.get("rate_limit_reached_type")
+    reached_ms = row.get("codex_rate_limit_reached_at")
     reached = (
         passive_reached or active_reached
-        if passive_is_newer else active_reached or passive_reached
+        if (reached_ms if reached_ms is not None else passive_ms) >= active_ms
+        else active_reached or passive_reached
     )
 
     result = {
@@ -2115,7 +2113,7 @@ def codex_quota_observation(snap: dict) -> dict:
         if pct is not None and math.isfinite(pct):
             sanitized[pct_key] = pct
 
-        for suffix in ("reset_sec", "window_min"):
+        for suffix in ("reset_sec", "reset_at", "window_min"):
             key = f"{name}_{suffix}"
             try:
                 value = int(snap.get(key)) if snap.get(key) is not None else None
@@ -2176,6 +2174,9 @@ def _merge_codex_quota_observations(*observations: dict | None) -> dict | None:
 def _codex_cached_reset_ms(row: dict, base_ms: int | None,
                            reset_key: str) -> int | None:
     try:
+        absolute = row.get(reset_key.removesuffix("_sec") + "_at")
+        if absolute is not None:
+            return int(absolute) * 1000
         reset_sec = row.get(reset_key)
         if reset_sec is not None:
             reset_sec = int(reset_sec)
@@ -2198,7 +2199,7 @@ def _codex_snapshot_from_quota_row(row: dict) -> dict:
     return {
         f"{name}_{suffix}": row.get(f"codex_{name}_{suffix}")
         for name in ("primary", "secondary")
-        for suffix in ("used_pct", "reset_sec", "window_min")
+        for suffix in ("used_pct", "reset_sec", "reset_at", "window_min")
     }
 
 
@@ -2272,18 +2273,23 @@ def _codex_window_candidates(account_key: str, row: dict) -> dict[str, list[dict
                 "reset_ms": reset_ms,
             })
 
-    add(
-        _codex_snapshot_from_quota_row(row),
-        _ms_timestamp(row.get("last_passive_update_at")),
-        row_fallback=row,
-    )
     sqlite_observations = row.get("codex_window_observations")
     if isinstance(sqlite_observations, str):
         try:
             sqlite_observations = json.loads(sqlite_observations)
         except (TypeError, ValueError):
             sqlite_observations = {}
-    add_windows(sqlite_observations)
+    stored = openai_provider.sanitize_codex_window_observations(sqlite_observations)
+    # The row-wide passive clock may belong to credits or another family.
+    # Only legacy windows without their own clock may use it as a fallback.
+    add(
+        _codex_snapshot_from_quota_row(row),
+        _ms_timestamp(row.get("last_passive_update_at")),
+        row_fallback=row,
+    )
+    for semantic in stored:
+        grouped[semantic].clear()
+    add_windows(stored)
     persistent_observation = _persistent_codex_observation(account_key)
     add_windows(_codex_windows_from_observation(persistent_observation))
 
@@ -2352,7 +2358,10 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
     row = state_db.quota_load(account_key) or {}
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    usage_ms = _ms_timestamp(row.get("fetched_at"))
+    usage_ms = _ms_timestamp(
+        row.get("codex_active_observed_at")
+        if row.get("codex_active_observed_at") is not None else row.get("fetched_at")
+    )
     wham_windows = _fresh_wham_window_utils(usage)
     hits: list[str] = []
     resets: list[str | None] = []

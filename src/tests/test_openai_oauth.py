@@ -825,7 +825,8 @@ def test_fetch_wham_usage_sends_account_id_header(m):
     assert captured["url"] == p.WHAM_USAGE_URL
     assert captured["headers"].get("authorization") == "Bearer at-token"
     assert captured["headers"].get("ChatGPT-Account-ID") == "acct-x"
-    assert captured["headers"].get("x-openai-codex-luna-reserve") == "1"
+    # A passive usage/reset-credit reader cannot apply Reserve model switching.
+    assert "x-openai-codex-luna-reserve" not in captured["headers"]
     assert "origin" not in captured["headers"] and "referer" not in captured["headers"]
     assert usage["five_hour"]["utilization"] == 1.0
     assert usage["seven_day"]["utilization"] == 3.0

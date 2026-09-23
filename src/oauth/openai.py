@@ -975,8 +975,6 @@ def fetch_wham_usage_sync(access_token: str, *, account_id: str | None = None,
         "authorization": f"Bearer {access_token}",
         "accept": "application/json",
         "user-agent": codex_cli_user_agent(),
-        # Opt in because Parrot exposes and can consume official reset credits.
-        "x-openai-codex-luna-reserve": "1",
     }
     # Codex 官方 BackendClient 会把 ChatGPT account/workspace id 一并带到
     # usage 请求里。单工作区账号通常只靠 Bearer 也能成功，但多工作区账号
@@ -1466,6 +1464,48 @@ def parse_rate_limit_event(event: Any) -> dict | None:
     return snap
 
 
+def merge_codex_rate_limits(*sources: tuple[Any, int]) -> list[dict]:
+    """Merge partial families using their own observation clocks, not row age.
+
+    Window clocks survive updates to another window/family. Legacy relative
+    resets are anchored once at the observation time before caching/display.
+    """
+    merged: dict[str, dict] = {}
+    for limits, fallback_ms in sources:
+        if not isinstance(limits, list):
+            continue
+        for raw in limits:
+            if not isinstance(raw, dict) or not raw.get("limit_id"):
+                continue
+            limit_id = str(raw["limit_id"])
+            observed = _coerce_int(raw.get("observed_at"))
+            if observed is None:
+                observed = fallback_ms
+            current = merged.setdefault(limit_id, {"limit_id": limit_id})
+            if observed >= current.get("observed_at", -1):
+                for key in ("limit_name", "normal_model_slug"):
+                    if raw.get(key) is not None:
+                        current[key] = raw[key]
+                current["observed_at"] = observed
+            for name in ("primary", "secondary"):
+                window = raw.get(name)
+                if not isinstance(window, dict):
+                    continue
+                window = dict(window)
+                window_ms = _coerce_int(window.get("observed_at"))
+                if window_ms is None:
+                    window_ms = observed
+                previous = current.get(name) or {}
+                if window_ms < previous.get("observed_at", -1):
+                    continue
+                window["observed_at"] = window_ms
+                after = _coerce_int(window.get("reset_after_seconds"))
+                if window.get("reset_at") is None and after is not None:
+                    window["reset_at"] = window_ms // 1000 + max(0, after)
+                current[name] = window
+    return list(merged.values())
+
+
 def codex_snapshot_window_map(snap: dict) -> dict[str, str]:
     """Map Codex primary/secondary headers to semantic 5h/7d/30d windows.
 
@@ -1556,7 +1596,7 @@ def sanitize_codex_window_observations(value: Any) -> dict[str, dict]:
             "used_pct": used_pct,
             "observed_at": observed_at,
         }
-        for field in ("reset_sec", "window_min"):
+        for field in ("reset_sec", "reset_at", "window_min"):
             field_value = raw.get(field)
             if field_value is None or isinstance(field_value, bool):
                 continue
@@ -1619,7 +1659,7 @@ def codex_snapshot_window_observations(
             "used_pct": used_pct,
             "observed_at": observed_at,
         }
-        for suffix in ("reset_sec", "window_min"):
+        for suffix in ("reset_sec", "reset_at", "window_min"):
             raw_value = snap.get(f"{raw_name}_{suffix}")
             if raw_value is None or isinstance(raw_value, bool):
                 continue
