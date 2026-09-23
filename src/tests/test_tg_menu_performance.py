@@ -475,6 +475,11 @@ def test_five_common_callbacks_render_stale_once_without_refresh_redraw(m, monke
     m["config"].update(lambda cfg: cfg.update({
         "channels": [], "apiKeys": {}, "oauthAccounts": [],
     }))
+    # These tests do not install the production config-reload hook.
+    from src import state_db
+    from src.channel import registry
+    state_db.init()
+    registry.rebuild_from_config()
     _store_common_snapshots(menu_cache, stale=True)
     loader_calls: list[tuple[str, int, object]] = []
     _patch_fast_common_loaders(m, monkeypatch, calls=loader_calls)
@@ -687,6 +692,10 @@ def test_cold_management_menus_remain_operable_while_stats_page_loads(
     m["config"].update(lambda cfg: cfg.update({
         "channels": [], "apiKeys": {}, "oauthAccounts": [],
     }))
+    from src import state_db
+    from src.channel import registry
+    state_db.init()
+    registry.rebuild_from_config()
 
     m["main"].handle_back(42, 100, "cb-main")
     m["stats_menu"].view(42, 101, "cb-stats", "0", "all")
