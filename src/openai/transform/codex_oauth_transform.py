@@ -43,6 +43,7 @@ import uuid
 from typing import Any
 
 from ..codex_constants import codex_model_uses_responses_lite
+from .guard import GuardError
 
 # 上游 codex endpoint 不认识、必须剥掉的 Responses API 字段。
 _STRIP_FIELDS_FOR_CODEX = (
@@ -544,6 +545,81 @@ def _has_responses_lite_input_prefix(raw_input: Any) -> bool:
     )
 
 
+def _prepare_responses_lite_tool_choice(body: dict, thread_context: str | None) -> None:
+    """Compile constrained choices to Lite's string choice + tool definitions.
+
+    A named function becomes the sole available definition with `required`;
+    `none` also clears available definitions. Never turn a constraint into auto.
+    Incremental WS may inherit definitions for required/none. A named choice
+    needs a full request: appending a restricted additional_tools item cannot
+    prove that earlier definitions behind previous_response_id were revoked.
+    """
+    choice = body.get("tool_choice", "auto")
+    if choice == "auto":
+        return
+    items = body.get("input")
+    prefixes = [
+        item for item in items
+        if isinstance(item, dict) and item.get("type") == "additional_tools"
+    ] if isinstance(items, list) else []
+    definitions = [tool for item in prefixes for tool in (item.get("tools") or [])]
+    if not prefixes:
+        definitions = body.get("tools") or []
+    if choice == "required":
+        if not definitions and not body.get("previous_response_id"):
+            raise ValueError("Lite tool_choice=required needs available tools")
+        return
+    if choice == "none":
+        if body.get("previous_response_id") and not prefixes:
+            # The string constraint disables inherited tools too; no synthetic
+            # context update is necessary for a native delta.
+            body.pop("tools", None)
+            return
+        selected = []
+    elif isinstance(choice, dict):
+        if body.get("previous_response_id"):
+            raise ValueError("Lite named tool_choice on a WS continuation requires a full request without previous_response_id")
+        kind = choice.get("type")
+        function = choice.get("function")
+        name = choice.get("name") or (function.get("name") if isinstance(function, dict) else None)
+        namespace = choice.get("namespace")
+
+        def matches(tool: Any) -> bool:
+            return bool(isinstance(tool, dict) and tool.get("type") == kind
+                        and (kind != "function" or name)
+                        and (not name or tool.get("name") == name))
+
+        selected = []
+        for tool in definitions:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "namespace":
+                if namespace and tool.get("name") != namespace:
+                    continue
+                children = [child for child in tool.get("tools", []) if matches(child)]
+                if children:
+                    selected.append({**tool, "tools": children})
+            elif not namespace and matches(tool):
+                selected.append(tool)
+        if len(selected) != 1 or kind == "allowed_tools":
+            raise ValueError("Lite named tool_choice requires one matching explicit tool definition; resend tools or a full Lite prefix")
+        body["tool_choice"] = "required"
+    else:
+        raise ValueError("Unsupported Lite tool_choice; use auto, none, required or a declared tool")
+
+    body["tools"] = selected
+    if prefixes:
+        context = str(thread_context or "").strip()
+        if not context:
+            raise ValueError("Responses Lite tool changes require thread/session context")
+        namespace = uuid.uuid5(uuid.NAMESPACE_OID, context)
+        tools_json = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+        tool_id = f"at_{uuid.uuid5(namespace, tools_json)}"
+        body["input"] = [({**item, "tools": selected, "id": tool_id}
+                          if isinstance(item, dict) and item.get("type") == "additional_tools"
+                          else item) for item in items]
+
+
 def _apply_responses_lite_body(
     body: dict,
     *,
@@ -561,9 +637,12 @@ def _apply_responses_lite_body(
     incremental WS frames refer to the warmup prefix through ``previous_response_id``;
     ``add_input_prefix=False`` therefore retains their delta input exactly.
     """
+    explicit_tools = "tools" in body
     tools = body.pop("tools", None)
     if not isinstance(tools, list):
         tools = []
+    # A WS continuation may update tools without resending instructions/history.
+    add_input_prefix = add_input_prefix or explicit_tools
 
     instructions = body.get("instructions")
     _coerce_input_to_list(body)
@@ -605,9 +684,9 @@ def _apply_responses_lite_body(
         body["input"] = existing_input
 
     body.pop("instructions", None)
-    # Official Lite requests always keep automatic tool selection even though the
-    # definitions moved out of the top-level ``tools`` field.
-    body["tool_choice"] = "auto"
+    # Official default is auto; explicit string constraints remain authoritative
+    # after definitions move into additional_tools.
+    body.setdefault("tool_choice", "auto")
     body["parallel_tool_calls"] = False
     reasoning = body.get("reasoning")
     if not isinstance(reasoning, dict):
@@ -722,8 +801,17 @@ def apply_codex_oauth_transform(
     #      是 chat（由 chat_to_responses 翻译后一般已扁平，但防御性再跑一遍）
     #      还是 responses（下游可能直接用 ChatCompletions 格式）都要兜底。
     _normalize_codex_tools(body)
-    _normalize_codex_tool_choice(body)
-    _strip_orphaned_tool_fields(body)
+    if responses_lite:
+        try:
+            _prepare_responses_lite_tool_choice(body, lite_thread_context)
+        except ValueError as exc:
+            raise GuardError(
+                400, "invalid_request_error", str(exc),
+                param="tool_choice", scope="candidate",
+            ) from exc
+    else:
+        _normalize_codex_tool_choice(body)
+        _strip_orphaned_tool_fields(body)
 
     # 5) input 字符串 → 数组；再把 input 里的 system 消息提到 instructions
     _coerce_input_to_list(body)

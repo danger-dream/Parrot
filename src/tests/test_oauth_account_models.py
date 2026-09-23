@@ -51,8 +51,8 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
     result = oauth_model_discovery.discover_openai({
         "access_token": "tok", "workspace_id": "ws",
     })
-    assert result.models == ["gpt-visible", "gpt-no-tiers"]
-    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.157.0-alpha.10"
+    assert result.models == ["gpt-visible", "gpt-no-tiers", "gpt-hidden"]
+    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.157.0"
     assert seen["headers"]["authorization"] == "Bearer tok"
     assert seen["headers"]["ChatGPT-Account-ID"] == "ws"
     assert seen["headers"]["originator"] == "codex_cli_rs"
@@ -69,7 +69,7 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
     }, {
         "id": "gpt-no-tiers",
         "serviceTiers": [],
-    }]
+    }, {"id": "gpt-hidden", "visibility": "hide"}]
 
 
 def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_levels(
@@ -764,17 +764,18 @@ def test_openai_catalog_is_allowlisted_and_raw_payload_is_not_retained(monkeypat
         "description": "Useful", "context_window": 200000, "max_context_window": 1000000,
         "max_output_tokens": 32000, "input_modalities": ["text", "image"],
         "reasoning": True, "reasoning_levels": ["low", "high"], "supports_images": True,
-        "base_instructions": "MUST NEVER PERSIST", "model_messages": {"huge": "secret-ish"},
+        "base_instructions": "literal account instructions", "model_messages": {"huge": "UNRELATED MODEL PRODUCT DATA"},
     }] }))
     result = oauth_model_discovery.discover_openai({"access_token": "tok"})
     assert result.models == ["gpt-rich"]
-    assert result.catalog == {"schema": 1, "models": [{
+    assert result.catalog == {"schema": 2, "clientVersion": "0.157.0", "models": [{
         "id": "gpt-rich", "name": "GPT Rich", "description": "Useful",
+        "baseInstructions": "literal account instructions",
         "contextWindow": 200000, "contextWindowMaxMode": 1000000,
         "maxOutputTokens": 32000, "inputModalities": ["text", "image"],
         "reasoning": True, "reasoningEfforts": ["low", "high"], "supportsImages": True,
     }]}
-    assert "MUST NEVER PERSIST" not in repr(result.catalog)
+    assert "UNRELATED MODEL PRODUCT DATA" not in repr(result.catalog)
 
 
 def test_xai_enrichment_failure_is_nonfatal(monkeypatch):

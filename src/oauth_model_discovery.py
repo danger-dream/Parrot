@@ -18,6 +18,7 @@ from .oauth_ids import openai_workspace_id
 from .openai.codex_constants import (
     codex_cli_user_agent,
     codex_models_url,
+    codex_models_client_version,
     codex_protocol_profile,
 )
 
@@ -112,12 +113,24 @@ def _service_tiers(value: Any) -> list[dict[str, str]]:
     return result
 
 
-def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> dict[str, Any]:
+def _record(
+    model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]],
+    *, preserve_explicit: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Build the small provider-neutral persisted UI record (allow-list only)."""
     result: dict[str, Any] = {"id": str(model_id).strip()}
     for target, sources in mapping.items():
-        value = next((raw.get(key) for key in sources if raw.get(key) is not None), None)
-        if value is None: continue
+        if target in preserve_explicit:
+            source = next((key for key in sources if key in raw), None)
+            if source is None:
+                continue
+            value = raw[source]
+            if value is None:
+                result[target] = None
+                continue
+        else:
+            value = next((raw.get(key) for key in sources if raw.get(key) is not None), None)
+            if value is None: continue
         if target in {"contextWindow", "contextWindowMaxMode", "maxOutputTokens"}:
             value = _positive(value)
             if value is None: continue
@@ -129,7 +142,7 @@ def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> di
             value = _service_tiers(value)
         elif target == "reasoningEfforts":
             value = _reasoning_efforts(value)
-            if not value: continue
+            if not value and target not in preserve_explicit: continue
         elif target in {
             "inputModalities", "outputModalities", "aliases", "additionalSpeedTiers",
         }:
@@ -166,7 +179,8 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     provider_cfg = config.get().get("openaiOAuth") or {}
     profile = codex_protocol_profile(provider_cfg)
     client_version = profile.client_version
-    url = f"{codex_models_url(provider_cfg)}?{urlencode({'client_version': client_version})}"
+    query_version = codex_models_client_version(provider_cfg)
+    url = f"{codex_models_url(provider_cfg)}?{urlencode({'client_version': query_version})}"
     headers = {
         "authorization": f"Bearer {token}",
         "accept": "application/json",
@@ -175,8 +189,11 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
         "version": client_version,
     }
     etag = ""
+    cached_catalog = account.get("account_model_catalog") or {}
     if (
-        str(account.get("models_etag_client_version") or "") == client_version
+        cached_catalog.get("schema") == 2
+        and cached_catalog.get("clientVersion") == query_version
+        and str(account.get("models_etag_client_version") or "") == client_version
         and str(account.get("models_etag_profile") or "") == profile.profile_id
     ):
         etag = _safe_etag(account.get("models_etag"))
@@ -199,25 +216,25 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
     records = payload.get("models")
     if not isinstance(records, list):
         raise ValueError("Codex model catalog has invalid models schema")
-    # Official Codex uses visibility="list" / "hide". Boolean spellings are
-    # retained only for older compatible payloads; unknown visibility is not routed.
-    def is_listed(item: dict) -> bool:
+    # `hide` controls the picker, not authenticated model addressability.
+    # Unknown visibility still fails closed; old boolean spellings remain valid.
+    def visibility_of(item: dict) -> str:
         visibility = str(item.get("visibility") or "").strip().lower()
         if visibility:
-            return visibility == "list"
+            return visibility
         explicit = item.get("visible", item.get("is_visible", item.get("isVisible")))
-        return explicit is True
+        return "list" if explicit is True else "hide" if explicit is False else ""
 
     models = _unique([
         item.get("slug") for item in records
-        if isinstance(item, dict) and item.get("slug") and is_listed(item)
+        if isinstance(item, dict) and item.get("slug") and visibility_of(item) in {"list", "hide"}
     ])
     if not models:
         raise ValueError("Codex model catalog is empty")
     normalized = []
     for item in records:
         if not isinstance(item, dict) or str(item.get("slug") or "").strip() not in models: continue
-        normalized.append(_record(item["slug"], item, {
+        record = _record(item["slug"], item, {
             "name": ("display_name", "displayName", "name"), "description": ("description", "tagline"),
             "contextWindow": ("context_window", "contextWindow"),
             "contextWindowMaxMode": ("max_context_window", "context_window_max_mode", "contextWindowMaxMode"),
@@ -244,9 +261,26 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
             "multiAgentReasoningEffort": (
                 "multi_agent_reasoning_effort", "multiAgentReasoningEffort",
             ),
+        }, preserve_explicit=frozenset({
+            "reasoningEfforts", "defaultReasoningEffort", "defaultVerbosity",
+            "multiAgentReasoningEffort", "minimalClientVersion", "defaultServiceTier",
         }))
+        if visibility_of(item) == "hide":
+            record["visibility"] = "hide"
+        messages = item.get("model_messages")
+        if isinstance(messages, dict) and "instructions_template" in messages:
+            instructions = messages["instructions_template"]
+            # Official ModelsResponse promotes legacy base text when template is null.
+            if instructions is None and isinstance(item.get("base_instructions"), str):
+                instructions = item["base_instructions"]
+            record["baseInstructions"] = instructions
+        elif "base_instructions" in item:
+            record["baseInstructions"] = item["base_instructions"]
+        if "baseInstructions" in record and record["baseInstructions"] is not None and not isinstance(record["baseInstructions"], str):
+            raise ValueError("Codex model instructions must be text or null")
+        normalized.append(record)
     return DiscoveryResult(
-        models, _catalog(normalized), "upstream:codex", client_version,
+        models, {"schema": 2, "clientVersion": query_version, "models": normalized}, "upstream:codex", client_version,
         profile.profile_id, response_etag, False,
     )
 

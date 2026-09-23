@@ -377,7 +377,11 @@ class UpstreamSync:
                 ]
             else:
                 account = self.control.oauth.backend.get_account_exact(source.id) or {}
-                names = [str(name) for name in account.get("models") or ()]
+                if account.get("provider") == "openai":
+                    # Authenticated hidden IDs remain routable, not picker previews.
+                    names = self.control.oauth.backend.account_model_selection(account)["models"]
+                else:
+                    names = [str(name) for name in account.get("models") or ()]
         except Exception:
             return []
         return sorted({name for name in names if name})

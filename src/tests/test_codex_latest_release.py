@@ -105,12 +105,13 @@ def test_existing_config_upgrades_or_pins_without_rotating_identity(auto, legacy
             return {"models": [{"slug": "gpt-6-sol", "visibility": "list"}]}
     monkeypatch.setattr(oauth_model_discovery.network, "get_sync",
                         lambda url, **kw: seen.update(url=url, **kw) or Response())
-    assert oauth_manager._model_sync_due(loaded["oauthAccounts"][0], now=now) is (auto is not False)
+    # The old schema lost hidden models/instructions/nulls even for an old pin.
+    assert oauth_manager._model_sync_due(loaded["oauthAccounts"][0], now=now)
     result = oauth_model_discovery.discover_openai(loaded["oauthAccounts"][0])
-    assert seen["headers"].get("If-None-Match") == ("old-client-etag" if auto is False else None)
+    assert seen["headers"].get("If-None-Match") is None
     assert result.client_version == expected_version
     assert result.profile_id == expected_profile
-    assert seen["url"].endswith(f"?client_version={expected_version}")
+    assert seen["url"].endswith(f"?client_version={expected_version.split('-', 1)[0]}")
     assert seen["headers"]["version"] == expected_version
     assert seen["headers"]["user-agent"].startswith(f"codex_cli_rs/{expected_version} ")
 
@@ -284,7 +285,7 @@ def test_each_provider_model_sync_ttl_only_openai_five_minutes(provider, ttl):
     acc = {"provider": provider, "models": ["model"], "last_model_sync": now.isoformat(),
            "last_model_sync_client_version": VERSION, "last_model_sync_profile": PROFILE}
     key = "cursor_model_catalog" if provider == "cursor" else "account_model_catalog"
-    acc[key] = {"models": [{"id": "model"}]}
+    acc[key] = {"schema": 2 if provider == "openai" else 1, "models": [{"id": "model"}]}
     assert not oauth_manager._model_sync_due(acc, now=now + timedelta(seconds=ttl - 1))
     assert oauth_manager._model_sync_due(acc, now=now + timedelta(seconds=ttl))
     acc["last_model_sync_error"] = "TimeoutError"

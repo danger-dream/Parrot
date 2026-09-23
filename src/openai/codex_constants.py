@@ -452,6 +452,14 @@ def codex_cli_version(provider_config: Mapping[str, Any] | None = None) -> str:
     return codex_protocol_profile(provider_config).client_version
 
 
+def codex_models_client_version(provider_config: Mapping[str, Any] | None = None) -> str:
+    """Official /models query uses the whole version, not the release identity.
+
+    Keep prerelease/build precedence in codex_cli_version and minimum gates.
+    """
+    return codex_cli_version(provider_config).split("-", 1)[0].split("+", 1)[0]
+
+
 def codex_cli_user_agent(provider_config: Mapping[str, Any] | None = None) -> str:
     """Build the Codex identity from the selected build and actual host platform.
 
@@ -649,6 +657,18 @@ def _catalog_efforts(record: Mapping[str, Any]) -> tuple[bool, tuple[str, ...]]:
     return True, tuple(values)
 
 
+def _catalog_base_instructions(
+    record: Mapping[str, Any], profile_policy: CodexModelPolicy | None,
+) -> str | None:
+    if "baseInstructions" not in record:
+        return profile_policy.base_instructions if profile_policy else None
+    instructions = record["baseInstructions"]
+    if instructions is not None and not isinstance(instructions, str):
+        raise CodexConfigurationError("account catalog baseInstructions must be text or null")
+    # Empty is authoritative too: do not revive the bundled template.
+    return instructions
+
+
 def resolve_codex_model_policy(
     model: str | None,
     catalog_record: Mapping[str, Any] | None = None,
@@ -713,7 +733,7 @@ def resolve_codex_model_policy(
         default_verbosity=default_verbosity,
         multi_agent_reasoning_effort=multi_effort,
         minimal_client_version=minimum,
-        base_instructions=profile_policy.base_instructions if profile_policy else None,
+        base_instructions=_catalog_base_instructions(record, profile_policy),
         from_profile=profile_policy is not None,
         support_verbosity=(
             _optional_capability(record, "supportVerbosity")

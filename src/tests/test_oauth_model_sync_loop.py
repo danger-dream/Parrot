@@ -60,7 +60,7 @@ def test_due_requires_complete_provider_native_catalog():
     ), now=now)
     assert not oauth_manager._model_sync_due(_account(
         "openai", 1, **fresh,
-        account_model_catalog={"models": [{"id": "a"}, {"id": "b", "name": "B"}]},
+        account_model_catalog={"schema": 2, "models": [{"id": "a"}, {"id": "b", "name": "B"}]},
     ), now=now)
 
     assert oauth_manager._model_sync_due(_account("cursor", 1, **fresh), now=now)
@@ -92,7 +92,7 @@ def test_openai_profile_or_client_version_change_bypasses_success_ttl():
         "openai",
         1,
         models=["gpt-6-astra"],
-        account_model_catalog={"models": [{"id": "gpt-6-astra"}]},
+        account_model_catalog={"schema": 2, "models": [{"id": "gpt-6-astra"}]},
         last_model_sync=_iso(-60),
     )
     assert oauth_manager._model_sync_due(base, now=now)
@@ -120,7 +120,7 @@ async def test_metadata_only_backfill_does_not_notify_or_repeat_when_fresh(monke
         calls.append(account)
         return type("R", (), {
             "models": ["a", "b"],
-            "catalog": {"schema": 1, "models": [{"id": "a"}, {"id": "b", "name": "B"}]},
+            "catalog": {"schema": 2, "models": [{"id": "a"}, {"id": "b", "name": "B"}]},
             "source": "upstream:test",
         })()
 

@@ -4999,7 +4999,13 @@ def account_model_selection(account_or_key: dict | str) -> dict:
         models = [model for model in configured_models if model in native_ids]
     else:
         models = configured_models
-    if models:
+    if provider == "openai":
+        # This function feeds the existing model pickers/editors, not routing.
+        # Authenticated hidden IDs stay in account.models for explicit requests.
+        hidden = {str(item.get("id")) for item in records if item.get("visibility") == "hide"}
+        models = [model for model in models if model not in hidden]
+        records = [item for item in records if item.get("visibility") != "hide"]
+    if models or (provider == "openai" and configured_models):
         source = str(account.get("last_model_sync_source") or "lkg:legacy-config")
     else:
         source = f"{provider}:awaiting-account-catalog"
@@ -5704,6 +5710,12 @@ def _model_catalog_complete(account: dict, model_ids: Iterable[str]) -> bool:
     """Whether the provider-native catalog has a metadata record for every ID."""
     catalog_key = "cursor_model_catalog" if provider_of(account) == "cursor" else "account_model_catalog"
     catalog = account.get(catalog_key)
+    # Older OpenAI catalogs dropped hidden IDs, instructions and explicit nulls.
+    # Refresh them once rather than accepting an old ETag/304 forever.
+    if provider_of(account) == "openai" and (
+        not isinstance(catalog, dict) or catalog.get("schema") != 2
+    ):
+        return False
     records = catalog.get("models") if isinstance(catalog, dict) else None
     if not isinstance(records, list):
         return False

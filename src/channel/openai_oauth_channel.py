@@ -290,7 +290,10 @@ class OpenAIOAuthChannel(Channel):
         return requested_model
 
     def list_client_models(self) -> list[str]:
-        return list(self.models)
+        # Picker visibility is not authorization. supports_model still accepts
+        # authenticated hidden IDs, subject to the existing disable switches.
+        return [model for model in self.models
+                if self._account_model_records.get(model, {}).get("visibility") != "hide"]
 
     def service_tier_catalog_status(
         self,
@@ -307,6 +310,10 @@ class OpenAIOAuthChannel(Channel):
         tier = str(service_tier or "").strip().lower()
         if not tier or tier in {"default", "auto"}:
             return "standard"
+        # ModelInfo::supports_service_tier permits explicit Flex even when the
+        # account's catalog does not advertise it. Upstream remains authoritative.
+        if tier == "flex":
+            return "advertised"
         record = self._account_model_records.get(str(model or "").strip())
         if not isinstance(record, dict) or "serviceTiers" not in record:
             return "unknown"
@@ -460,9 +467,10 @@ class OpenAIOAuthChannel(Channel):
             outbound_model=resolved_model,
         )
         efforts = list(model_policy.reasoning_efforts)
-        if not efforts:
+        catalog_has_efforts = "reasoningEfforts" in self._account_model_records.get(resolved_model, {})
+        if not efforts and not catalog_has_efforts:
             efforts = metadata.get("reasoningEfforts")
-        if not efforts:
+        if not efforts and not catalog_has_efforts:
             official = model_pricing.catalog_metadata(f"openai/{resolved_model}") or {}
             efforts = official.get("reasoningEfforts")
         apply_reasoning_effort_capability(
