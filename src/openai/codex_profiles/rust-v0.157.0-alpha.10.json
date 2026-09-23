@@ -1,0 +1,290 @@
+{
+  "schemaVersion": 1,
+  "id": "rust-v0.157.0-alpha.10",
+  "source": {
+    "codexTag": "rust-v0.157.0-alpha.10",
+    "codexCommit": "2170d8b3c77883dbe743078fb8bbb017f27caa9c",
+    "modelsPath": "codex-rs/models-manager/models.json",
+    "modelsSha256": "d30ef7d632cb45a18a3d3ab16abc9376b0e0f4ea600b6c6aab2ad5a4968646d4",
+    "filesSha256": {
+      "codex-rs/Cargo.toml": "558514473cb2988dedbc46f09ef5f3064962816d050b69eecfaebd427fad64ee",
+      "codex-rs/models-manager/models.json": "d30ef7d632cb45a18a3d3ab16abc9376b0e0f4ea600b6c6aab2ad5a4968646d4",
+      "codex-rs/core/src/client.rs": "25f8c3b6314836ca10f91b847d8e271bfac3ed0b93a17637b7db85d9bf4e790e",
+      "codex-rs/core/src/responses_metadata.rs": "260775242d50d913bccab678fd83f2a47bdc5c2c45b7fe0255aa04614bf8bdce",
+      "codex-rs/codex-api/src/common.rs": "4cd518c771c1581a91558c9e6b61788a5a8112cf86b49e0d1f20c183ad0c3d66",
+      "codex-rs/protocol/src/openai_models.rs": "accb9d8e9fa137258ee70abeac450bfde38b3ae0bdde1b5fffed608dcdc366de",
+      "codex-rs/protocol/src/openai_models/reasoning_effort.rs": "62089cb92996bb0030d4a219a6ba06b3bcf8f2f45e95ef7204bc8632d07ea08d"
+    },
+    "baselineProfilesSha256": {
+      "rust-v0.153.4": "907c18a008dde5c83c7332dd0e4d80bde46a2544f60c8ecb31ec1d483f9bfd44"
+    },
+    "modelProfileHashEncoding": "UTF-8 JSON, sorted keys, compact separators, ensure_ascii=false",
+    "instructions": "literal model_messages.instructions_template (no personality interpolation)",
+    "ultra": "ModelInfo::resolve_reasoning_effort: valid multi_agent_reasoning_effort, else max, else last non-ultra, else medium"
+  },
+  "clientVersion": "0.157.0-alpha.10",
+  "identity": {
+    "originator": "codex_cli_rs",
+    "userAgent": "codex_cli_rs/0.157.0-alpha.10 (Unknown unknown; unknown) unknown"
+  },
+  "protocol": {
+    "backendBaseUrl": "https://chatgpt.com/backend-api/codex",
+    "realtimeWebsocketBaseUrl": "https://api.openai.com",
+    "responsesWebsocketBeta": "responses_websockets=2026-02-06",
+    "requestFieldPolicies": {
+      "max_output_tokens": "unsupported",
+      "max_completion_tokens": "unsupported",
+      "max_tokens": "unsupported",
+      "temperature": "unsupported",
+      "top_p": "unsupported",
+      "frequency_penalty": "unsupported",
+      "presence_penalty": "unsupported",
+      "prompt_cache_retention": "unsupported"
+    },
+    "ultraReasoningEffortFallback": true
+  },
+  "models": {
+    "gpt-6-astra": {
+      "minimalClientVersion": "0.153.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "multiAgentReasoningEffort": "xhigh",
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-6-astra-base-instructions.txt",
+      "baseInstructionsSha256": "152dfaeeb552876190962be1c12c93d426840ff12691f648261554a7675a6698",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "f2edf8d0bab4f2193fafe59985be15153d52d5a60fdb134ac10b46a5a2ee2bc0"
+    },
+    "gpt-6-sol": {
+      "minimalClientVersion": "0.155.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "multiAgentReasoningEffort": null,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-6-sol-base-instructions.txt",
+      "baseInstructionsSha256": "b1dd8718c037906c53a305c5cbccb4a4be35ccbb7837461ec349bfc495412f0d",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "64bc1e5b30c73b1e67bd682de447e0ddab8b46deb29037eac5d6317ff93871d0"
+    },
+    "gpt-6-luna": {
+      "minimalClientVersion": "0.155.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "multiAgentReasoningEffort": null,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-6-luna-base-instructions.txt",
+      "baseInstructionsSha256": "b707476816bfe5e571a1bd2179f130fff2b132da5ab8e61063acdb7fd24daf12",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "bd49853c3e514e2ca78be7dcb1bfc57326f324e5810f242a88bdec297ed72096"
+    },
+    "gpt-5.6-sol": {
+      "minimalClientVersion": "0.144.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-5.6-sol-base-instructions.txt",
+      "baseInstructionsSha256": "cbefa6b0bede0e332d957fca70ccacf9f12f4c0ecdf81b819e5cbe1a3b16e265",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "af2724e2b88488861a8b97219174a62f75c7a2aca8f1e2136c9e5f7cdda673d1"
+    },
+    "gpt-5.6-terra": {
+      "minimalClientVersion": "0.144.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-5.6-terra-base-instructions.txt",
+      "baseInstructionsSha256": "cbefa6b0bede0e332d957fca70ccacf9f12f4c0ecdf81b819e5cbe1a3b16e265",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "5c77a9b39fc4f98b5e589bf4a5bdbed70a97dfdeeea54a7a7286443962590466"
+    },
+    "gpt-5.6-luna": {
+      "minimalClientVersion": "0.144.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-5.6-luna-base-instructions.txt",
+      "baseInstructionsSha256": "cbefa6b0bede0e332d957fca70ccacf9f12f4c0ecdf81b819e5cbe1a3b16e265",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "2bab73e42e940cd48de6614bcfb36c03882e5fea22318ea074c7798ba3e092eb"
+    },
+    "gpt-daybreak-blue-latest": {
+      "minimalClientVersion": "0.142.2",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "low",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-daybreak-blue-latest-base-instructions.txt",
+      "baseInstructionsSha256": "ebd0d5854abd07dc38300a71e027204eb028e9fa443c59d18e36fcc24289e818",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "58ead8b9edac0bec58ee9102cf6865f28c1e3f128433eb141ed90c05479ec6e2"
+    },
+    "gpt-daybreak-red-latest": {
+      "minimalClientVersion": "0.142.2",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "high",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-daybreak-red-latest-base-instructions.txt",
+      "baseInstructionsSha256": "40a1232c8bd01a87dc2283e5ae3c75f2b054dc2a12cf04e5a279c26e5c541b9b",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "15c1d390e265840ec8944d948feca14e2795bc32f08f3bde9f3cfb3e7134a463"
+    },
+    "gpt-5.5": {
+      "minimalClientVersion": "0.124.0",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-5.5-base-instructions.txt",
+      "baseInstructionsSha256": "2351631dfc5644dc5a45eaaca4139475bd02810ee6cb792d058b551559b3242e",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "774a02e72d354f942f5078e2716d1ce8130be4ebffc0e3bf43b627dafbc8a229"
+    },
+    "gpt-5.4": {
+      "minimalClientVersion": "0.98.0",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/gpt-5.4-base-instructions.txt",
+      "baseInstructionsSha256": "f8c4032f78fdb19b46f468239c5dc757f745fbb10520e64e1e4afbf747e52fb8",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "e0bea42a4212d1797aa59b525c7bd4fc026833becd51f71a94938779c89bf9b1"
+    },
+    "codex-auto-review": {
+      "minimalClientVersion": "0.98.0",
+      "useResponsesLite": true,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "medium",
+      "supportVerbosity": true,
+      "defaultVerbosity": "low",
+      "supportsReasoningSummaryParameter": true,
+      "baseInstructionsFile": "rust-v0.157.0-alpha.10/codex-auto-review-base-instructions.txt",
+      "baseInstructionsSha256": "ebd0d5854abd07dc38300a71e027204eb028e9fa443c59d18e36fcc24289e818",
+      "sourceCodexTag": "rust-v0.157.0-alpha.10",
+      "sourceModelProfileSha256": "421668bf05c88b0f2107452db14199321aef6a081aa057036f1d6bb15c11fbe7"
+    },
+    "gpt-5.4-mini": {
+      "minimalClientVersion": "0.98.0",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "medium",
+      "sourceCodexTag": "rust-v0.153.4"
+    },
+    "gpt-5.2": {
+      "minimalClientVersion": "0.0.1",
+      "useResponsesLite": false,
+      "reasoningEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "defaultReasoningEffort": "medium",
+      "defaultVerbosity": "low",
+      "sourceCodexTag": "rust-v0.153.4"
+    }
+  }
+}

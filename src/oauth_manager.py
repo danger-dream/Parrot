@@ -80,9 +80,10 @@ OAUTH_SCOPES = (
 
 # OAuth model-catalog maintenance policy.  These are intentionally code-level
 # constants: the timings are operational invariants, not user-facing tuning.
-# Current Codex keeps the authenticated /models cache for five minutes.  ETag
-# revalidation makes the same cadence reasonable for Parrot without redownloading.
-OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS = 5 * 60
+# Only Codex uses a five-minute authenticated /models cache; other providers
+# retain the established six-hour model discovery cadence.
+OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS = 6 * 60 * 60
+OPENAI_MODEL_SYNC_SUCCESS_TTL_SECONDS = 5 * 60
 OAUTH_MODEL_SYNC_FAILURE_RETRY_SECONDS = 15 * 60
 OAUTH_MODEL_SYNC_CHECK_INTERVAL_SECONDS = 60
 OAUTH_MODEL_SYNC_STARTUP_DELAY_SECONDS = 2
@@ -5632,7 +5633,12 @@ def _model_sync_due(account: dict, *, now: datetime | None = None) -> bool:
     model_ids = _model_ids(account)
     if not model_ids or last_success is None or not _model_catalog_complete(account, model_ids):
         return True
-    return (now - last_success.astimezone(timezone.utc)).total_seconds() >= OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS
+    ttl = (
+        OPENAI_MODEL_SYNC_SUCCESS_TTL_SECONDS
+        if provider_of(account) == "openai"
+        else OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS
+    )
+    return (now - last_success.astimezone(timezone.utc)).total_seconds() >= ttl
 
 
 def _format_model_change_notification(account: dict, result: dict) -> str:

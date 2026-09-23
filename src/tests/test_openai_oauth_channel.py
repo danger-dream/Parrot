@@ -603,7 +603,7 @@ def test_channel_responses_ingress(m):
     assert h["chatgpt-account-id"] == "acct-123"
     assert "openai-beta" not in h
     assert h["originator"] == "codex_cli_rs"
-    assert h["version"] == "0.153.4"
+    assert h["version"] == "0.157.0-alpha.10"
     assert h["accept"] == "text/event-stream"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["authorization"].startswith("Bearer ")
@@ -767,6 +767,7 @@ def test_channel_codex_version_config_drives_http_identity_and_minimum_guard(m):
     original = dict(m["config"].get().get("openaiOAuth") or {})
     try:
         m["config"].update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
+            "codexProfileAutoUpdate": False,
             "codexCliVersion": "0.153.4",
             "codexProtocolProfile": "rust-v0.153.4",
         }))
@@ -861,7 +862,7 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
         "gpt-5.6-luna", ingress_protocol="responses",
     ))
     h = {k.lower(): v for k, v in req.headers.items()}
-    assert h["version"] == "0.153.4"
+    assert h["version"] == "0.157.0-alpha.10"
     assert h["user-agent"] == m["CODEX_CLI_USER_AGENT"]
     assert h["x-openai-internal-codex-responses-lite"] == "true"
     payload = json.loads(req.body)
@@ -877,7 +878,10 @@ def test_channel_responses_ingress_official_catalog_enables_responses_lite(m):
     assert payload["input"][0]["type"] == "additional_tools"
     assert payload["input"][0]["role"] == "developer"
     assert payload["input"][0]["tools"] == []
-    assert payload["input"][1] == {"type": "message", "role": "user", "content": "hi"}
+    from src.openai.codex_constants import codex_protocol_profile
+    base = codex_protocol_profile().model_policy("gpt-5.6-luna").base_instructions
+    assert payload["input"][1]["content"] == [{"type": "input_text", "text": base}]
+    assert payload["input"][2] == {"type": "message", "role": "user", "content": "hi"}
     print("  [PASS] channel: official Responses Lite catalog + future GPT-5.6 prefix")
 
 
@@ -1553,6 +1557,7 @@ def test_openai_oauth_explicit_short_config_always_beats_legacy(m):
             }
             c["openaiOAuth"] = dict(m["config"].DEFAULT_CONFIG["openaiOAuth"])
             c["openaiOAuth"].update({
+                "codexProfileAutoUpdate": False,
                 "codexCliVersion": "0.153.4",
                 "codexProtocolProfile": "rust-v0.153.4",
                 "forceCodexCLI": True,
@@ -1613,8 +1618,8 @@ def test_config_backfills_openai_oauth_from_legacy_provider(m):
         "mode": "per-oauth-account",
         "newIdentityGenerationVersion": 1,
     }
-    assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
-    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
+    assert merged["openaiOAuth"]["codexCliVersion"] == "0.157.0-alpha.10"
+    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.157.0-alpha.10"
     assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
     assert "defaultModels" not in merged["openaiOAuth"]
     assert "codexUpstreamUrl" not in merged["openaiOAuth"]

@@ -1,6 +1,6 @@
 # Parrot — OpenAI OAuth 与 Codex 应用层身份生命周期
 
-> 当前实现说明。协议画像以本仓库配置选择的 `rust-v0.153.4` 为准；account、thread、turn 与 window 均由下述权威生命周期生成。
+> 当前实现说明。协议画像以本仓库配置选择的 `rust-v0.157.0-alpha.10` 为准；account、thread、turn 与 window 均由下述权威生命周期生成。
 
 ## 1. 权威实现位置
 
@@ -119,4 +119,4 @@ Parrot 当前没有 `/responses/compact` transport/route；本包没有虚构 en
 
 ## 8. Wire 画像
 
-Codex CLI 画像不是源码 fallback。`openaiOAuth.codexProtocolProfile` 选择 `src/openai/codex_profiles/*.json`，并要求 `openaiOAuth.codexCliVersion` 与 profile 匹配。当前基线为 `rust-v0.153.4`。HTTP/WS 从同一 profile 取得 version、originator、User-Agent、WS beta 和 model policy；缺配置或不匹配时 fail closed。
+Codex CLI 画像不是源码 fallback。`openaiOAuth.codexProtocolProfile` 选择 `src/openai/codex_profiles/*.json`，并要求 `openaiOAuth.codexCliVersion` 与 profile 匹配。当前基线为 `rust-v0.157.0-alpha.10`。HTTP/WS 从同一 profile 取得 version、originator、User-Agent、WS beta 和 model policy；缺配置或不匹配时 fail closed。

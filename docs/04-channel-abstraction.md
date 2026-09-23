@@ -180,7 +180,7 @@ class ApiChannel(Channel):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
                 "anthropic-version": "2023-06-01",
-                "anthropic-beta": profile_betas,  # v2.1.258 model/auth profile
+                "anthropic-beta": profile_betas,  # v2.1.280 model/auth profile
             }
         else:
             # 仅走"必要"转换：cache_control 统一管理 + 保留用户 system 字段
@@ -209,13 +209,13 @@ class ApiChannel(Channel):
 
 ### 4.4.1 `cc_mimicry=True` 路径包含
 
-以 docs/05 的 v2.1.258 fixture-backed wire 规则为准：
+以 docs/05 的 v2.1.280 fixture-backed wire 规则为准：
 1. fingerprint 在注入 downstream `system` 之前从原始 user prompt 计算
 2. `system` 字段 → user+assistant("Understood.") 消息对注入，并保留 Parrot cache 管理
 3. system billing block（version / entrypoint / CCH / request-scoped prompt ID）
 4. `metadata.user_id` 包含稳定 device、空 account UUID、与 header 同值的 session ID
 5. 工具名混淆（映射随 `UpstreamRequest` 返回，不存 Channel 实例）
-6. CCH v258 独立 hash view 签名，不发送规范化副本
+6. CCH v280 独立 hash view 签名，不发送规范化副本
 7. 按 ordinary/Fable/Opus-5/side-query 与 auth 选择精确 beta profile
 8. 每个实际 HTTP dispatch 刷新 `x-client-request-id`，逻辑 retry 复用 body/session/prompt
 

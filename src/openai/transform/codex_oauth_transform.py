@@ -624,8 +624,11 @@ def apply_codex_oauth_transform(
     base_instructions: str | None = None,
     default_reasoning_effort: str | None = None,
     default_verbosity: str | None = None,
+    support_verbosity: bool | None = None,
+    supports_reasoning_summary_parameter: bool | None = None,
     supported_reasoning_efforts: tuple[str, ...] | list[str] | None = None,
     multi_agent_reasoning_effort: str | None = None,
+    ultra_reasoning_effort_fallback: bool = False,
     lite_thread_context: str | None = None,
     transport: str = _CODEX_TRANSPORT_HTTP,
     use_responses_lite: bool | None = None,
@@ -760,21 +763,41 @@ def apply_codex_oauth_transform(
     elif "verbosity" not in text and default_verbosity:
         text["verbosity"] = default_verbosity
 
+    # Model-owned request capabilities follow client.rs. Keep structured output
+    # even when verbosity is unavailable. Older pinned profiles with no capability
+    # declaration retain their previous passthrough behavior.
+    if support_verbosity is False and isinstance(body.get("text"), dict):
+        body["text"].pop("verbosity", None)
+        if not body["text"]:
+            body.pop("text")
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and (
+        supports_reasoning_summary_parameter is False
+        or (supports_reasoning_summary_parameter is True and reasoning.get("summary") == "none")
+    ):
+        reasoning.pop("summary", None)
+
     # Ultra is a local Codex multi-agent choice.  Parrot does not implement that
-    # orchestrator; it may only substitute the model-specific wire effort when
-    # authoritative catalog/profile policy explicitly supplies both capabilities.
+    # orchestrator. New profiles resolve Ultra just like ModelInfo, using the
+    # effective account-first supported levels; old pins retain strict mapping.
     reasoning = body.get("reasoning")
     if (
         isinstance(reasoning, dict)
         and str(reasoning.get("effort") or "").strip().lower() == "ultra"
     ):
-        supported = {
+        supported = [
             str(value or "").strip().lower()
             for value in (supported_reasoning_efforts or ())
             if str(value or "").strip()
-        }
+        ]
         target = str(multi_agent_reasoning_effort or "").strip().lower()
-        if "ultra" not in supported or not target or target not in supported:
+        if ultra_reasoning_effort_fallback and "ultra" in supported:
+            if target not in supported or target == "ultra":
+                target = "max" if "max" in supported else next(
+                    (value for value in reversed(supported) if value != "ultra"),
+                    "medium",
+                )
+        elif "ultra" not in supported or not target or target not in supported:
             raise ValueError(
                 "reasoning effort 'ultra' requires explicit model-scoped "
                 "reasoningEfforts and multiAgentReasoningEffort policy"

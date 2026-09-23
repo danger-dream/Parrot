@@ -89,8 +89,8 @@ def test_old_config_file_is_backfilled_with_new_defaults():
             assert cfg["anysearch"]["maxConcurrentToolCalls"] == 0
             # Existing deployments follow the packaged current profile by default;
             # mutable version/model defaults are not embedded in Python.
-            assert cfg["openaiOAuth"]["codexCliVersion"] == "0.153.4"
-            assert cfg["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
+            assert cfg["openaiOAuth"]["codexCliVersion"] == "0.157.0-alpha.10"
+            assert cfg["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.157.0-alpha.10"
             assert cfg["openaiOAuth"]["codexProfileAutoUpdate"] is True
             assert "forceCodexCLI" not in cfg["openaiOAuth"]
             assert "defaultModels" not in cfg["openaiOAuth"]
@@ -177,8 +177,8 @@ def test_explicit_openai_oauth_key_always_beats_legacy_config():
     config._normalize_openai_oauth_config(merged, raw)
     assert "forceCodexCLI" not in merged["openaiOAuth"]
     assert "defaultModels" not in merged["openaiOAuth"]
-    assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
-    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
+    assert merged["openaiOAuth"]["codexCliVersion"] == "0.157.0-alpha.10"
+    assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.157.0-alpha.10"
 
     # Key presence, not value type, controls precedence.  A malformed explicit
     # value must not silently activate the legacy identity; defaults remain
@@ -191,8 +191,8 @@ def test_explicit_openai_oauth_key_always_beats_legacy_config():
     config._normalize_openai_oauth_config(malformed, malformed_raw)
     assert "forceCodexCLI" not in malformed["openaiOAuth"]
     assert "defaultModels" not in malformed["openaiOAuth"]
-    assert malformed["openaiOAuth"]["codexCliVersion"] == "0.153.4"
-    assert malformed["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
+    assert malformed["openaiOAuth"]["codexCliVersion"] == "0.157.0-alpha.10"
+    assert malformed["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.157.0-alpha.10"
 
 
 def test_pricing_source_migration_only_rewrites_the_former_builtin_default():

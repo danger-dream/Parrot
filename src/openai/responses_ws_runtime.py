@@ -172,8 +172,11 @@ def _codex_transform_policy_kwargs(channel: Any, model: str | None, body: dict) 
         "base_instructions": base_instructions,
         "default_reasoning_effort": policy.default_reasoning_effort,
         "default_verbosity": policy.default_verbosity,
+        "support_verbosity": policy.support_verbosity,
+        "supports_reasoning_summary_parameter": policy.supports_reasoning_summary_parameter,
         "supported_reasoning_efforts": policy.reasoning_efforts,
         "multi_agent_reasoning_effort": policy.multi_agent_reasoning_effort,
+        "ultra_reasoning_effort_fallback": codex_protocol_profile(provider_config).ultra_reasoning_effort_fallback,
         "lite_thread_context": str((body or {}).get("prompt_cache_key") or "").strip(),
         "use_responses_lite": policy.use_responses_lite,
         "request_field_policies": dict(

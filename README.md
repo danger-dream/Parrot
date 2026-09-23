@@ -146,15 +146,17 @@ Codex 的版本、User-Agent、端点、WS beta、模型能力和请求字段策
 {
   "openaiOAuth": {
     "codexProfileAutoUpdate": true,
-    "codexCliVersion": "0.153.4",
-    "codexProtocolProfile": "rust-v0.153.4"
+    "codexCliVersion": "0.157.0-alpha.10",
+    "codexProtocolProfile": "rust-v0.157.0-alpha.10"
   }
 }
 ```
 
-需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
+需要固定已审核旧版时，将 `codexProfileAutoUpdate` 显式设为 `false`，并同时配置完全匹配的 `codexCliVersion` 和 `codexProtocolProfile`（例如 `0.153.4` / `rust-v0.153.4`，旧档案保持不变）。缺失、空值、非法 SemVer、未知 profile 或版本不匹配时，Codex 模型目录、OAuth identity、HTTP 与 WebSocket 请求都会 fail closed。
 
-模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 也只有模型记录明确给出 supported levels 和 `multiAgentReasoningEffort` 时才映射。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前剥掉，不会把请求打回客户端；缺失策略仍 fail closed。
+当前选择包含预发布版的最新发布 tag `rust-v0.157.0-alpha.10`（npm stable 为 `0.156.0`，不是 main 的 `0.0.0`）。新增 `gpt-6-sol` / `gpt-6-luna` 的 `0.155.0` 客户端门槛、Lite/default instructions/思考档位等策略；账户目录显式能力优先。来源哈希、离线复核方式及保留旧模型基线见 [Codex 发布档案](docs/codex-release-profile.md)。
+
+模型策略按“账户认证 `/models` 的显式字段 → 选中 profile 的同名模型记录”解析。两处都没有 `useResponsesLite` 时拒绝该 Codex 模型请求；`ultra` 依据有效模型档位与 `multiAgentReasoningEffort` 映射，最新 profile 按官方算法允许缺省时回退到 `max` / 最后一个非 ultra 档位，旧 pin 保留严格映射边界。目录中的 `defaultReasoningEffort` / `defaultVerbosity` 优先于 profile，且只补调用方未提供的字段。模型 profile 的基础指令优先于用户可选的 `defaultInstructions`；下游显式 instructions、已成形的官方 Lite prefix 和 WebSocket incremental continuation 保持权威。profile 标记为 unsupported 的输出、采样或缓存参数会在发网前剥掉，不会把请求打回客户端；缺失策略仍 fail closed。
 
 模型目录请求携带同一 profile 的版本身份，并使用 ETag / 304；推理响应中的 `X-Models-Etag` 会触发去抖后的目录刷新，`openai-model` / `x-openai-model` 会作为实际模型观测头透传。
 
@@ -558,8 +560,8 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
   },
   "openaiOAuth": {
     "codexProfileAutoUpdate": true,
-    "codexCliVersion": "0.153.4",
-    "codexProtocolProfile": "rust-v0.153.4",
+    "codexCliVersion": "0.157.0-alpha.10",
+    "codexProtocolProfile": "rust-v0.157.0-alpha.10",
     "codexIdentity": { "mode": "per-oauth-account", "newIdentityGenerationVersion": 1 },
     "quotaProbe": { "enabled": false, "input": "1", "instructions": "reply ok" }
   },

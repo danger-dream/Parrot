@@ -26,7 +26,9 @@ class CodexConfigurationError(ValueError):
 
 
 _CODEX_VERSION_RE = re.compile(
-    r"^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$"
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 _CODEX_PROFILE_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 _CODEX_COMPONENT_ALLOWED = frozenset("._:/-")
@@ -47,6 +49,8 @@ class CodexModelPolicy:
     minimal_client_version: str | None
     base_instructions: str | None
     from_profile: bool
+    support_verbosity: bool | None = None
+    supports_reasoning_summary_parameter: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,7 @@ class CodexProtocolProfile:
     responses_websocket_beta: str
     request_field_policies: Mapping[str, str]
     models: Mapping[str, CodexModelPolicy]
+    ultra_reasoning_effort_fallback: bool = False
 
     def model_policy(self, model: str | None) -> CodexModelPolicy | None:
         return self.models.get(str(model or "").strip())
@@ -221,6 +226,13 @@ def _read_base_instructions(
         ) from exc
 
 
+def _optional_capability(record: Mapping[str, Any], key: str) -> bool | None:
+    value = record.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise CodexConfigurationError(f"Codex model policy {key} must be boolean")
+    return value
+
+
 def _parse_profile_model(root: Path, model: str, raw: Any) -> CodexModelPolicy:
     if not isinstance(raw, dict):
         raise CodexConfigurationError(f"Codex profile model {model!r} must be an object")
@@ -288,6 +300,10 @@ def _parse_profile_model(root: Path, model: str, raw: Any) -> CodexModelPolicy:
         minimal_client_version=minimum,
         base_instructions=base_instructions,
         from_profile=True,
+        support_verbosity=_optional_capability(raw, "supportVerbosity"),
+        supports_reasoning_summary_parameter=_optional_capability(
+            raw, "supportsReasoningSummaryParameter"
+        ),
     )
 
 
@@ -363,6 +379,9 @@ def _load_profile(profile_id: str) -> CodexProtocolProfile:
             protocol.get("requestFieldPolicies")
         ),
         models=models,
+        ultra_reasoning_effort_fallback=bool(
+            _optional_capability(protocol, "ultraReasoningEffortFallback")
+        ),
     )
 
 
@@ -696,6 +715,16 @@ def resolve_codex_model_policy(
         minimal_client_version=minimum,
         base_instructions=profile_policy.base_instructions if profile_policy else None,
         from_profile=profile_policy is not None,
+        support_verbosity=(
+            _optional_capability(record, "supportVerbosity")
+            if "supportVerbosity" in record
+            else profile_policy.support_verbosity if profile_policy else None
+        ),
+        supports_reasoning_summary_parameter=(
+            _optional_capability(record, "supportsReasoningSummaryParameter")
+            if "supportsReasoningSummaryParameter" in record
+            else profile_policy.supports_reasoning_summary_parameter if profile_policy else None
+        ),
     )
 
 
@@ -718,7 +747,7 @@ def codex_model_uses_responses_lite(
 
 
 def codex_version_meets_minimum(current: Any, minimum: Any) -> bool | None:
-    """Compare numeric SemVer cores; return ``None`` for an unknown schema."""
+    """Compare SemVer precedence, including alpha gates; ignore build metadata."""
     current_text = normalize_codex_cli_version(current)
     minimum_text = normalize_codex_cli_version(minimum)
     if not current_text or not minimum_text:
@@ -727,9 +756,22 @@ def codex_version_meets_minimum(current: Any, minimum: Any) -> bool | None:
     minimum_match = _CODEX_VERSION_RE.fullmatch(minimum_text)
     if not current_match or not minimum_match:
         return None
-    current_core = tuple(int(value) for value in current_match.groups())
-    minimum_core = tuple(int(value) for value in minimum_match.groups())
-    return current_core >= minimum_core
+    current_core = tuple(int(value) for value in current_match.groups()[:3])
+    minimum_core = tuple(int(value) for value in minimum_match.groups()[:3])
+    if current_core != minimum_core:
+        return current_core > minimum_core
+    current_pre, minimum_pre = current_match.group(4), minimum_match.group(4)
+    if not current_pre or not minimum_pre:
+        return not current_pre or bool(minimum_pre)
+    for left, right in zip(current_pre.split("."), minimum_pre.split(".")):
+        if left == right:
+            continue
+        if left.isdigit() and right.isdigit():
+            return int(left) > int(right)
+        if left.isdigit() != right.isdigit():
+            return not left.isdigit()
+        return left > right
+    return len(current_pre.split(".")) >= len(minimum_pre.split("."))
 
 
 def normalize_codex_service_tier(value: Any) -> str | None:

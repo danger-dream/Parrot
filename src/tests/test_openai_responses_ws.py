@@ -95,6 +95,8 @@ def _import_modules():
 
 
 def _setup(m):
+    from src.openai.codex_constants import current_codex_protocol_profile
+    profile = current_codex_protocol_profile()
     m["state_db"].init()
     m["log_db"].init()
     m["state_db"].perf_delete()
@@ -121,8 +123,8 @@ def _setup(m):
         "channels": [],
         "oauthAccounts": [],
         "openaiOAuth": {
-            "codexCliVersion": "0.153.4",
-            "codexProtocolProfile": "rust-v0.153.4",
+            "codexCliVersion": profile.client_version,
+            "codexProtocolProfile": profile.profile_id,
             "forceCodexCLI": True,
             "isolateSessionId": True,
         },
@@ -898,13 +900,15 @@ async def test_responses_ws_previsible_client_disconnect_stops_all_candidate_dis
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("service_tier", ["ultrafast", "hyperspeed"])
+@pytest.mark.parametrize("version", ["0.153.4", "0.157.0-alpha.10"])
 async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
-    monkeypatch, m, service_tier,
+    monkeypatch, m, service_tier, version,
 ):
     cfg = _setup(m)
     cfg["openaiOAuth"] = {
-        "codexCliVersion": "0.153.4",
-        "codexProtocolProfile": "rust-v0.153.4",
+        "codexProfileAutoUpdate": False,
+        "codexCliVersion": version,
+        "codexProtocolProfile": f"rust-v{version}",
         "forceCodexCLI": True,
         "isolateSessionId": True,
     }
@@ -969,8 +973,8 @@ async def test_responses_ws_oauth_reuses_codex_transform_and_session_headers(
         assert headers["authorization"] == "Bearer tok"
         assert headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
         assert headers["x-codex-routing-hint"] == f"model=test-model;tier={service_tier}"
-        assert headers["version"] == "0.153.4"
-        assert headers["User-Agent"].startswith("codex_cli_rs/0.153.4 ")
+        assert headers["version"] == version
+        assert headers["User-Agent"].startswith(f"codex_cli_rs/{version} ")
         lowered = {str(key).lower() for key in headers}
         assert "accept" not in lowered
         assert "content-type" not in lowered

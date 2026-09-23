@@ -19,7 +19,9 @@ from src.openai import codex_constants
 from src.openai.transform import codex_oauth_transform
 
 
+# This suite is the immutable legacy-pin boundary; latest has its own source/wire suite.
 _PROFILE_CONFIG = {
+    "codexProfileAutoUpdate": False,
     "codexCliVersion": "0.153.4",
     "codexProtocolProfile": "rust-v0.153.4",
 }
@@ -42,6 +44,7 @@ _BASE_PATH = (
 def _restore_config():
     original = copy.deepcopy(config.get())
     try:
+        config.update(lambda current: current["openaiOAuth"].update(_PROFILE_CONFIG))
         yield
     finally:
         config.update(lambda current: (current.clear(), current.update(original)))
@@ -184,7 +187,7 @@ def test_raw_new_config_key_wins_over_legacy_even_when_values_look_default():
     config._normalize_openai_oauth_config(merged, raw)
     assert merged["openaiOAuth"]["codexCliVersion"] == "0.153.4"
     assert merged["openaiOAuth"]["codexProtocolProfile"] == "rust-v0.153.4"
-    assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is True
+    assert merged["openaiOAuth"]["codexProfileAutoUpdate"] is False
     assert "forceCodexCLI" not in merged["openaiOAuth"]
     assert "forceCodexCLI" not in merged["oauth"]["providers"]["openai"]
 

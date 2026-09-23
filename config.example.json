@@ -358,8 +358,8 @@
   "durableStatePath": "durable-state.json",
   "openaiOAuth": {
     "codexProfileAutoUpdate": true,
-    "codexCliVersion": "0.153.4",
-    "codexProtocolProfile": "rust-v0.153.4",
+    "codexCliVersion": "0.157.0-alpha.10",
+    "codexProtocolProfile": "rust-v0.157.0-alpha.10",
     "codexIdentity": {
       "mode": "per-oauth-account",
       "newIdentityGenerationVersion": 1

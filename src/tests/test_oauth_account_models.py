@@ -52,11 +52,11 @@ def test_openai_codex_request_headers_url_and_parser(monkeypatch):
         "access_token": "tok", "workspace_id": "ws",
     })
     assert result.models == ["gpt-visible", "gpt-no-tiers"]
-    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.153.4"
+    assert seen["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=0.157.0-alpha.10"
     assert seen["headers"]["authorization"] == "Bearer tok"
     assert seen["headers"]["ChatGPT-Account-ID"] == "ws"
     assert seen["headers"]["originator"] == "codex_cli_rs"
-    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.153.4 ")
+    assert seen["headers"]["user-agent"].startswith("codex_cli_rs/0.157.0-alpha.10 ")
     assert result.catalog["models"] == [{
         "id": "gpt-visible",
         "serviceTiers": [
@@ -84,6 +84,7 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
         "max_context_window": 872_000,
         "input_modalities": ["text", "image"],
         "support_verbosity": True,
+        "supports_reasoning_summary_parameter": True,
         "default_verbosity": "low",
         "tool_mode": "code_mode_only",
         "shell_type": "unified_exec",
@@ -108,6 +109,7 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
         "supported_reasoning_levels": ["low", "high", "low"],
         "use_responses_lite": False,
         "support_verbosity": False,
+        "supports_reasoning_summary_parameter": False,
         "supports_search_tool": False,
     }]}
     monkeypatch.setattr(
@@ -116,7 +118,7 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
     )
 
     result = oauth_model_discovery.discover_openai({"access_token": "tok"})
-    assert result.client_version == "0.153.4"
+    assert result.client_version == "0.157.0-alpha.10"
     assert result.models == ["gpt-6-astra", "legacy-reasoning-shape"]
     astra, legacy = result.catalog["models"]
     assert astra == {
@@ -132,6 +134,7 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
         "minimalClientVersion": "0.153.0",
         "useResponsesLite": True,
         "supportVerbosity": True,
+        "supportsReasoningSummaryParameter": True,
         "defaultVerbosity": "low",
         "toolMode": "code_mode_only",
         "shellType": "unified_exec",
@@ -144,6 +147,7 @@ def test_openai_gpt6_astra_catalog_shape_is_normalized_without_stringifying_leve
         "reasoningEfforts": ["low", "high"],
         "useResponsesLite": False,
         "supportVerbosity": False,
+        "supportsReasoningSummaryParameter": False,
         "supportsSearchTool": False,
     }
     assert "{'effort':" not in repr(result.catalog)
@@ -156,8 +160,9 @@ def test_codex_user_agent_and_model_cache_follow_current_runtime(monkeypatch):
     monkeypatch.setenv("TERM_PROGRAM", "TestTerm")
     monkeypatch.setenv("TERM_PROGRAM_VERSION", "2.0")
     ua = codex_constants.codex_cli_user_agent()
-    assert ua == "codex_cli_rs/0.153.4 (TestOS 9.1; test-arch) TestTerm/2.0"
-    assert oauth_manager.OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS == 300
+    assert ua == "codex_cli_rs/0.157.0-alpha.10 (TestOS 9.1; test-arch) TestTerm/2.0"
+    assert oauth_manager.OPENAI_MODEL_SYNC_SUCCESS_TTL_SECONDS == 300
+    assert oauth_manager.OAUTH_MODEL_SYNC_SUCCESS_TTL_SECONDS == 21600
 
 
 def test_openai_codex_profile_config_drives_catalog_query_and_ua(monkeypatch):
@@ -169,6 +174,7 @@ def test_openai_codex_profile_config_drives_catalog_query_and_ua(monkeypatch):
     )
     try:
         config.update(lambda cfg: cfg.setdefault("openaiOAuth", {}).update({
+            "codexProfileAutoUpdate": False,
             "codexCliVersion": "0.153.4",
             "codexProtocolProfile": "rust-v0.153.4",
         }))

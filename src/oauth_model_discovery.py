@@ -137,7 +137,7 @@ def _record(model_id: Any, raw: dict, mapping: dict[str, tuple[str, ...]]) -> di
             if not value: continue
         elif target in {
             "reasoning", "supportsImages", "supportsThinking", "useResponsesLite",
-            "supportVerbosity", "supportsSearchTool",
+            "supportVerbosity", "supportsSearchTool", "supportsReasoningSummaryParameter",
         }:
             if not isinstance(value, bool): continue
         elif isinstance(value, str):
@@ -233,6 +233,9 @@ def discover_openai(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: 
             "additionalSpeedTiers": ("additional_speed_tiers", "additionalSpeedTiers"),
             "useResponsesLite": ("use_responses_lite", "useResponsesLite"),
             "supportVerbosity": ("support_verbosity", "supportVerbosity"),
+            "supportsReasoningSummaryParameter": (
+                "supports_reasoning_summary_parameter", "supportsReasoningSummaryParameter",
+            ),
             "defaultVerbosity": ("default_verbosity", "defaultVerbosity"),
             "toolMode": ("tool_mode", "toolMode"),
             "shellType": ("shell_type", "shellType"),
