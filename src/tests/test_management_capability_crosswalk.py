@@ -61,7 +61,7 @@ def test_all_53_tg_capabilities_map_to_the_complete_production_api_surface():
         PRODUCTION_OPERATIONS.read_text(encoding="utf-8").splitlines()
     )
     actual_operations = _management_operation_ids()
-    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 237
+    assert len(mapped_operations) == len(expected_operations) == len(actual_operations) == 243
     assert mapped_operations == expected_operations == actual_operations
 
 

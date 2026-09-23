@@ -244,7 +244,7 @@ async def start_oauth_login_flow(
     control: Control,
 ) -> DataEnvelope[OAuthLoginFlowData]:
     result = await asyncio.to_thread(control.start_login_flow, context, body.provider,
-                                     realm=body.realm, client_profile=body.clientProfile)
+                                     realm=body.realm, client_profile=body.clientProfile, **({"site": body.site} if body.site is not None else {}))
     return DataEnvelope(
         data=OAuthLoginFlowData(
             flowId=result.flow_id,
@@ -798,3 +798,5 @@ def update_telegram_oauth_preferences(
 
 from .oauth_workbuddy import router as workbuddy_router
 router.include_router(workbuddy_router)
+from .oauth_zhipu import router as zhipu_router
+router.include_router(zhipu_router)

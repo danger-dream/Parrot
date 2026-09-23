@@ -1,6 +1,6 @@
-"""Direct-HTTP search backends shared by tool execution and management.
+"""Search backends shared by tool execution and management.
 
-No MCP, no conversation-route mutation, and no credentials in public results.
+No conversation-route mutation, and no credentials in public results.
 A backend attempt includes OAuth acquisition, network I/O and response parsing
 under one deadline. Search retries are bounded across all keys and backends.
 """
@@ -31,7 +31,10 @@ from .search_xai import (
 )
 
 MODES = ("managed", "passthrough", "disabled")
-BACKEND_TYPES = ("anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic")
+BACKEND_TYPES = ("anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic", "zhipu")
+KEY_TYPES = frozenset(("anysearch", "tavily", "exa", "brave", "zhipu"))
+ACCOUNT_TYPES = frozenset(("openai", "xai", "anthropic", "zhipu"))
+EXTRACT_TYPES = frozenset(("anysearch", "tavily", "exa", "openai", "zhipu"))
 ENDPOINTS = {
     "anysearch": "https://api.anysearch.com",
     "tavily": "https://api.tavily.com",
@@ -39,7 +42,7 @@ ENDPOINTS = {
     "brave": "https://api.search.brave.com",
 }
 NAMES = {"anysearch": "AnySearch", "tavily": "Tavily", "exa": "Exa", "brave": "Brave",
-         "openai": "OpenAI OAuth", "xai": "xAI OAuth", "anthropic": "Anthropic OAuth"}
+         "openai": "OpenAI OAuth", "xai": "xAI OAuth", "anthropic": "Anthropic OAuth", "zhipu": "智谱 MCP"}
 DEFAULTS = {
     "functionMode": "managed", "hostedMode": "managed", "maxAttempts": 3,
     "timeoutSeconds": 10, "maxResults": 8, "maxToolRounds": 50,
@@ -105,7 +108,9 @@ def _accounts(backend: dict) -> list[dict]:
     result = []
     for account in config.get().get("oauthAccounts") or []:
         actual = account.get("provider") or "claude"
-        if actual != provider or not account.get("access_token"):
+        if actual != provider or not account.get("model_key" if provider == "zhipu" else "access_token"):
+            continue
+        if provider == "zhipu" and account.get("site") not in ("bigmodel", "zai"):
             continue
         if selected and account_key(account) not in selected:
             continue
@@ -121,6 +126,26 @@ def _accounts(backend: dict) -> list[dict]:
     return result
 
 
+def _credentials(backend: dict) -> list:
+    kind = backend["type"]
+    keys = _keys(backend) if kind in KEY_TYPES else []
+    accounts = _accounts(backend) if kind in ACCOUNT_TYPES else []
+    if kind == "zhipu":
+        # Do not try the same Key twice when it is both explicitly configured
+        # and referenced by an account on the same site.
+        from .oauth.zhipu.common import MODEL_ORIGINS
+        origin = str(backend.get("endpoint") or MODEL_ORIGINS["bigmodel"]).rstrip("/")
+        seen = {(origin, key) for key in keys}
+        unique = []
+        for account in accounts:
+            identity = (MODEL_ORIGINS[account["site"]], account["model_key"])
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(account)
+        accounts = unique
+    return keys + accounts
+
+
 def backend_statuses() -> list[dict]:
     """Configuration readiness, not a synthetic live probe. No credential-bearing fields."""
     rows = []
@@ -128,14 +153,16 @@ def backend_statuses() -> list[dict]:
         kind = backend.get("type")
         if kind not in BACKEND_TYPES:
             continue
-        count = len(_keys(backend)) if kind in ENDPOINTS else len(_accounts(backend))
+        key_count = len(_keys(backend)) if kind in KEY_TYPES else 0
+        account_count = len(_accounts(backend)) if kind in ACCOUNT_TYPES else 0
+        count = key_count + account_count
         enabled = backend.get("enabled", True) is not False
         rows.append({"id": backend["id"], "type": kind, "name": backend.get("name") or NAMES[kind],
                      "enabled": enabled, "available": enabled and count > 0,
                      "reason": "disabled" if not enabled else ("configured" if count else
-                                ("missing_credentials" if kind in ENDPOINTS else "no_eligible_accounts")),
-                     "keyCount": count if kind in ENDPOINTS else 0,
-                     "accountCount": count if kind not in ENDPOINTS else 0,
+                                ("missing_credentials" if kind in KEY_TYPES else "no_eligible_accounts")),
+                     "keyCount": key_count,
+                     "accountCount": account_count,
                      "verified": kind != "anthropic"})
     return rows
 
@@ -792,11 +819,11 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
             continue
         if cached_only and kind != "openai":
             continue
-        if operation == "extract" and kind not in ("anysearch", "tavily", "exa", "openai"):
+        if operation == "extract" and kind not in EXTRACT_TYPES:
             continue
         if operation == "x_search" and kind != "xai":
             continue
-        credentials = _keys(backend) if kind in ENDPOINTS else _accounts(backend)
+        credentials = _credentials(backend)
         candidates.extend((backend, credential, position) for position, credential in enumerate(credentials))
     if not candidates:
         if cached_only:
@@ -828,7 +855,10 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
         attempt = {"backend_id": backend["id"], "provider": backend["type"]}
         try:
             async with asyncio.timeout(float(cfg["timeoutSeconds"])):
-                if backend["type"] in ENDPOINTS:
+                if backend["type"] == "zhipu":
+                    from .search_zhipu import adapter
+                    result = await adapter(backend, credential, args, operation, cfg)
+                elif backend["type"] in ENDPOINTS:
                     result = await _http_adapter(backend, credential, args, operation, cfg)
                 else:
                     result = await _oauth_adapter(backend, credential, args, operation, cfg)
@@ -852,10 +882,10 @@ async def _run(operation: str, arguments: dict, *, request_id: str | None = None
                     warnings.append("search_context_size_adapted_to_returned_text_char_budget_not_native_context_tokens")
             if operation == "search" and (args.get("language") or args.get("country")) and backend["type"] != "brave":
                 warnings.append("locale_preferences_applied_to_query_not_a_hard_filter")
-            if operation == "search" and args.get("freshness") and backend["type"] in ("xai", "anthropic", "anysearch"):
+            if operation == "search" and args.get("freshness") and backend["type"] in ("xai", "anthropic", "anysearch", "zhipu"):
                 warnings.append("freshness_is_a_backend_preference_not_a_verified_hard_filter")
             if warnings:
-                result["warnings"] = warnings
+                result.setdefault("warnings", []).extend(warnings)
             return result
         except (TimeoutError, httpx.TimeoutException):
             last = SearchError("搜索调用超时", code="search_timeout", status_code=504)

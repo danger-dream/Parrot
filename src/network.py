@@ -728,6 +728,12 @@ class _RouteFailoverSyncTransport(httpx.BaseTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         last_exc: Exception | None = None
         for _name, resolve, _owned in self._candidates:
+            observer = request.extensions.get("parrot_route_observer")
+            if callable(observer):
+                try:
+                    observer(_name)
+                except Exception:
+                    pass  # Diagnostics must not change transport behavior.
             try:
                 return resolve(request.url).handle_request(request)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -767,6 +773,12 @@ class _RouteFailoverAsyncTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         last_exc: Exception | None = None
         for _name, resolve, _owned in self._candidates:
+            observer = request.extensions.get("parrot_route_observer")
+            if callable(observer):
+                try:
+                    observer(_name)
+                except Exception:
+                    pass
             try:
                 return await resolve(request.url).handle_async_request(request)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

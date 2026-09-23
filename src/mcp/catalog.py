@@ -193,7 +193,7 @@ def _search_sources(tool_name: str = "web_search") -> tuple[list[str], str]:
     rows = search_service.backend_statuses()
     if tool_name == "web_fetch":
         # Match search_service's extract capability, not just credential readiness.
-        rows = [row for row in rows if row.get("type") in ("anysearch", "tavily", "exa", "openai")]
+        rows = [row for row in rows if row.get("type") in search_service.EXTRACT_TYPES]
     usable = [row for row in rows if row.get("available")]
     ids = [str(row["id"]) for row in usable]
     disabled = [str(row["id"]) for row in rows if not row.get("available")]

@@ -324,6 +324,9 @@ class ModelCenterControl(DomainControl):
             label = str(account.get("label") or account_id)
             container_enabled = bool(account.get("enabled", True)) and not bool(account.get("disabled_reason"))
             disabled = set(selection.get("disabled_models") or ())
+            # The public ZCode catalog is not an account's entitlement. Keep
+            # every catalog row visible, but use the same eligibility as routing.
+            zhipu_effective = set(selection.get("effective_models") or ()) if provider == "zhipu" else None
             scope_key = oauth_channel_key_from_account_id(account_id)
             for outbound in selection.get("models") or ():
                 outbound = str(outbound or "").strip()
@@ -339,9 +342,14 @@ class ModelCenterControl(DomainControl):
                     type=ModelSourceType.OAUTH, id=account_id, label=label, provider=provider,
                     outbound_model=outbound, source_enabled=source_enabled,
                     container_enabled=container_enabled,
-                    effective_routable=global_enabled and source_enabled and container_enabled,
+                    effective_routable=global_enabled and source_enabled and container_enabled
+                        and (zhipu_effective is None or outbound in zhipu_effective),
                     effective_metadata=metadata, value_source=value_source,
                     constrained_by=constrained,
+                    unavailable_reason=(
+                        "model_key_missing" if not account.get("model_key") else
+                        "entitlement_" + str(account.get("entitlement") or "unknown")
+                    ) if zhipu_effective is not None and outbound not in zhipu_effective and source_enabled else None,
                 ))
 
         aliases_by_target: dict[str, list[str]] = {}
@@ -473,8 +481,7 @@ class ModelCenterControl(DomainControl):
         revision = stable_revision([self._revision_payload(item) for item in values])
         return [replace(item, revision=revision) for item in values], revision
 
-    @staticmethod
-    def _source_exists(values: list[ModelView], source: ModelSourceRef) -> bool:
+    def _source_exists(self, values: list[ModelView], source: ModelSourceRef) -> bool:
         if source.type is ModelSourceType.GLOBAL:
             return not source.id
         for item in values:
@@ -483,6 +490,12 @@ class ModelCenterControl(DomainControl):
             owner = item.identity.owner
             if owner is not None and owner.type is source.type and owner.id == source.id:
                 return True
+        # A real container can have an empty catalog (new account or failed
+        # discovery). It must remain openable so the user can synchronize it.
+        if source.type is ModelSourceType.OAUTH:
+            return self._oauth.backend.get_account_exact(source.id) is not None
+        if source.type is ModelSourceType.API:
+            return any(f"api:{entry.get('name')}" == source.id for entry in config.get().get("channels") or ())
         return False
 
     @staticmethod

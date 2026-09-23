@@ -166,4 +166,4 @@ def audit_failures(action: str, *, target_arg: str | None = None, target: str = 
 
 def invalid_account(account: Mapping[str, Any]) -> bool:
     """Frozen TG invalid-list predicate: email plus auth_error."""
-    return bool(account.get("email")) and account.get("disabled_reason") == "auth_error"
+    return bool(account.get("email") or account.get("provider") == "zhipu") and account.get("disabled_reason") == "auth_error"

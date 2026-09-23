@@ -65,6 +65,12 @@ ROUTE_REQUESTS = [
     ("GET", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/action-records", None, {}),
     ("PATCH", f"/oauth/accounts/{ACCOUNT_ID}/workbuddy/settings", {"autoCheckin": False}, {}),
     ("GET", "/oauth/workbuddy/settings", None, {}),
+    ("GET", f"/oauth/accounts/{ACCOUNT_ID}/zhipu", None, {}),
+    ("GET", f"/oauth/accounts/{ACCOUNT_ID}/zhipu/reset-status", None, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/zhipu/project-flows", None, {}),
+    ("POST", "/oauth/login-flows/zhflow_invalid/zhipu/project", {"flowSecret": "invalid-secret-value", "organizationId": "", "projectId": ""}, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/zhipu/action-plans", {"action": "opportunity", "resetType": "TOKENS_LIMIT"}, {}),
+    ("POST", f"/oauth/accounts/{ACCOUNT_ID}/zhipu/actions/execute", {"planToken": "zhaction_invalid.invalid"}, {}),
     ("POST", "/oauth/login-flows/oflow_invalid/complete", {"flowSecret": "invalid-secret-value", "code": "code", "state": "state"}, {}),
     ("POST", "/oauth/imports/preview", {"format": "openai", "payload": "[]"}, {}),
     ("POST", "/oauth/imports/oimport_invalid/commit", {"importSecret": "invalid-secret-value", "decisions": []}, {}),
@@ -114,7 +120,7 @@ def test_oauth_openapi_matches_owned_manifest_and_declares_security_and_secrets(
         if line
     }
     assert set(operations) == manifested
-    assert len(operations) == len(ROUTE_REQUESTS) == 38
+    assert len(operations) == len(ROUTE_REQUESTS) == 44
     assert all(value.get("tags") == ["management-oauth"] for value in operations.values())
     assert all(value.get("security") == [{"ManagementSession": []}] for value in operations.values())
     no_content = {
@@ -732,8 +738,13 @@ def test_control_login_flows_cover_every_supported_provider(provider):
 
     control, backend = build_control()
     context = telegram_context(42)
-    flow = control.start_login_flow(context, provider)
-    if provider is OAuthProvider.WORKBUDDY:
+    flow = control.start_login_flow(context, provider, **({"site": "bigmodel"} if provider is OAuthProvider.ZHIPU else {}))
+    if provider is OAuthProvider.ZHIPU:
+        poll = control.poll_login_flow(context, flow.flow_id, flow.flow_secret)
+        assert poll.status == "completed" and poll.save_status == "created"
+        assert backend.get_account(poll.account_id) is not None
+        command = CompleteOAuthLoginCommand(completed=True)
+    elif provider is OAuthProvider.WORKBUDDY:
         poll = control.poll_login_flow(context, flow.flow_id, flow.flow_secret)
         assert poll.status == "completed" and poll.save_status == "created"
         assert backend.get_account(poll.account_id) is not None
@@ -753,7 +764,11 @@ def test_control_login_flows_cover_every_supported_provider(provider):
     account = backend.get_account(result.account_id)
     assert account is not None
     assert backend.provider_of(account) == provider.value
-    assert account.get("access_token") and account.get("refresh_token")
+    if provider is OAuthProvider.ZHIPU:
+        assert account["credential_mode"] == "oauth" and account["model_key"] == "fixture.secret"
+        assert account.get("access_token") and not account.get("refresh_token")
+    else:
+        assert account.get("access_token") and account.get("refresh_token")
 
 
 @pytest.mark.parametrize(

@@ -117,12 +117,13 @@ class OAuthAccountMutationControlMixin:
         self._raise_conditional_status(result)
         if result.get("status") != "replaced":
             raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
-        self._post_save_account_effects(account_id, bound_entry)
+        post_save = self._post_save_account_effects(account_id, bound_entry)
+        account_id = post_save.get("account_id", account_id)
         # Usage/quota evaluation may synchronously change enabled state, so the
         # response revision must describe the post-effect account, not the
         # replacement helper's pre-effect snapshot.
         saved = self._account(account_id)
-        return OAuthMutationResult(account_id, revision(saved), "replaced")
+        return OAuthMutationResult(account_id, revision(saved), "replaced", post_save=post_save)
 
     def _create_entry(
         self,
@@ -132,7 +133,9 @@ class OAuthAccountMutationControlMixin:
         replace_plan_token: str | None = None,
         flow_binding: tuple[str, str] | None = None,
     ) -> OAuthMutationResult:
-        fields_required = ("uid", "access_token", "refresh_token") if entry.get("provider") == "workbuddy" else ("email", "access_token", "refresh_token")
+        if entry.get("provider") == "zhipu":
+            entry = self.backend.zhipu_normalize_credential(entry)
+        fields_required = () if entry.get("provider") == "zhipu" else ("uid", "access_token", "refresh_token") if entry.get("provider") == "workbuddy" else ("email", "access_token", "refresh_token")
         required = [field for field in fields_required if not entry.get(field)]
         if required:
             raise ManagementError(
@@ -166,11 +169,12 @@ class OAuthAccountMutationControlMixin:
                 )
             raise ManagementError(ManagementErrorCode.IDENTITY_CONFLICT)
         account_id = str(result.get("account_key") or self.backend.account_id(entry))
-        self._post_save_account_effects(account_id, entry)
+        post_save = self._post_save_account_effects(account_id, entry)
+        account_id = post_save.get("account_id", account_id)
         return OAuthMutationResult(
             account_id=account_id,
             revision=revision(self._account(account_id)),
-            status="created",
+            status="created", post_save=post_save,
         )
 
     def create_account(
@@ -204,17 +208,25 @@ class OAuthAccountMutationControlMixin:
     ) -> OAuthMutationResult:
         self._require(context, Capability.SECRETS_WRITE)
         try:
-            if flow_id.startswith("wbflow_"):
+            if flow_id.startswith(("wbflow_", "zhflow_")):
                 if command.completed is not True:
                     raise ManagementError(ManagementErrorCode.INVALID_REQUEST)
-                device = self._flows.workbuddy
+                device = self._flows.zhipu if flow_id.startswith("zhflow_") else self._flows.workbuddy
                 saved = device.completed_result(context.actor.subject_id, flow_id, flow_secret)
                 if saved is not None:
                     return saved
                 with device.lease(context.actor.subject_id, flow_id, flow_secret) as plan, \
                         device.saving(context.actor.subject_id, flow_id, flow_secret):
                     entry = device.ready(plan)
-                    if command.replace_plan_token:
+                    if flow_id.startswith("zhflow_") and not plan.payload.get("source_account_id"):
+                        entry = self.backend.zhipu_login_entry(entry)
+                    if flow_id.startswith("zhflow_") and plan.payload.get("source_account_id"):
+                        account_id, status = self.backend.zhipu_bind_project(
+                            plan.payload["source_account_id"], plan.payload["source_account"], entry)
+                        post_save = self._post_save_account_effects(account_id, self._account(account_id))
+                        account_id = post_save.get("account_id", account_id)
+                        result = OAuthMutationResult(account_id, revision(self._account(account_id)), status, post_save=post_save)
+                    elif command.replace_plan_token:
                         result = self._commit_replace_plan(
                             context, command.replace_plan_token, candidate=entry,
                             flow_binding=(flow_id, flow_secret),

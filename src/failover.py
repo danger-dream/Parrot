@@ -2047,6 +2047,10 @@ async def run_failover(
         # candidate 529 and OAuth refresh retries rebuild the request but reuse
         # these private values; no module or Channel instance state is involved.
         body = cc_mimicry.ensure_request_context(body)
+    if any(getattr(channel, "provider", "") == "zhipu" for channel, _model in all_initial_candidates):
+        body = dict(body)
+        body.setdefault("_parrot_zcode_trace", str(uuid.uuid4()))
+        body.setdefault("_parrot_zcode_session", str(getattr(schedule_result, "client_key", None) or uuid.uuid4()))
     client_visible_model = str(
         body.get("_client_visible_model") or body.get("model") or ""
     ).strip()
@@ -2409,11 +2413,18 @@ async def run_failover(
                 ),
             )
 
+        # Zhipu model credentials are independent of management OAuth. A final
+        # model 401 (after raw VERIFY handling) asks for key repair, never JWT renewal.
+        if getattr(ch, "provider", "") == "zhipu" and result.http_status == 401 and not result.stream_started:
+            from .oauth.zhipu.runtime import mark_model_auth_error
+            await asyncio.to_thread(mark_model_auth_error, ch)
+
         # 未发首包失败：判断是否 OAuth 401/403 可刷一次
         if (
             _recovery_retry_allowed("oauthRefresh", cfg)
             and os.environ.get("PARROT_NO_REFRESH") != "1"
             and ch.type == "oauth"
+            and getattr(ch, "provider", "") != "zhipu"
             and result.http_status in (401, 403)
             and (getattr(ch, "provider", "") != "workbuddy" or result.http_status == 401)
             and not result.openai_oauth_html_403

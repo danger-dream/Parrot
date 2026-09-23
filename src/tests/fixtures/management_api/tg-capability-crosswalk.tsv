@@ -8,10 +8,10 @@ TG-CORE-06	adapter-only	Telegram adapter		Telegram transport/retry/media helpers
 TG-MAIN-01	shared	StatusControl	getManagementOverview	main overview and API overview share the status control boundary
 TG-HELP-01	adapter-only	Telegram adapter		static Telegram help presentation; API metadata/docs are covered by TG-CORE-01
 TG-STATUS-01	shared	StatusControl+StatsControl	getRuntimeStatus,listBackgroundJobs,listCooldowns,getConcurrencySnapshot	runtime overview, cooldown and concurrency queries
-TG-OA-01	shared	OAuthControl	listOAuthAccounts,getOAuthAccount,reorderOAuthAccounts,getOAuthWorkBuddyAccount,listOAuthWorkBuddyActions	account list/detail/order and WorkBuddy credits/action records
+TG-OA-01	shared	OAuthControl	listOAuthAccounts,getOAuthAccount,reorderOAuthAccounts,getOAuthWorkBuddyAccount,listOAuthWorkBuddyActions,getOAuthZhipuAccount,getOAuthZhipuResetStatus	account list/detail/order and WorkBuddy credits/action records
 TG-OA-02	shared	OAuthControl	refreshOAuthToken,refreshOAuthUsage,refreshAllOAuthUsage,refreshOAuthWorkBuddyStatus	token and usage refresh; uncertain WorkBuddy outcomes reconcile without POST replay
-TG-OA-03	shared	OAuthControl	updateOAuthAccount,planOAuthQuotaReset,resetOAuthQuota,clearOAuthAccountErrors,clearOAuthAccountAffinity,clearAllOAuthErrors,planOAuthWorkBuddyAction,executeOAuthWorkBuddyAction	runtime account actions and actor-bound WorkBuddy activity confirmations
-TG-OA-04	shared	OAuthControl	startOAuthLoginFlow,completeOAuthLoginFlow,createOAuthAccount,pollOAuthLoginFlow,cancelOAuthLoginFlow	provider login/manual credential creation and reusable WorkBuddy device flow
+TG-OA-03	shared	OAuthControl	updateOAuthAccount,planOAuthQuotaReset,resetOAuthQuota,clearOAuthAccountErrors,clearOAuthAccountAffinity,clearAllOAuthErrors,planOAuthWorkBuddyAction,executeOAuthWorkBuddyAction,planOAuthZhipuAction,executeOAuthZhipuAction	runtime account actions and actor-bound WorkBuddy activity confirmations
+TG-OA-04	shared	OAuthControl	startOAuthLoginFlow,completeOAuthLoginFlow,createOAuthAccount,pollOAuthLoginFlow,cancelOAuthLoginFlow,selectOAuthZhipuProject,startOAuthZhipuProjectSelection	provider login/manual credential creation and reusable WorkBuddy device flow
 TG-OA-05	shared	OAuthControl	createOAuthAccount,completeOAuthLoginFlow	exact-identity replacement uses replacePlanToken on the same operations
 TG-OA-06	shared	OAuthControl	previewOAuthImport,commitOAuthImport,listInvalidOAuthAccounts,planInvalidOAuthAccountDeletion,deleteInvalidOAuthAccounts,deleteOAuthAccount	import and invalid-account removal
 TG-OA-07	shared	OAuthControl	listOAuthAccountModels,updateOAuthAccountModels,updateOAuthAccountModelSettings,syncOAuthAccountModels	per-account model settings and sync

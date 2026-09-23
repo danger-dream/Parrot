@@ -51,6 +51,7 @@ deleteSearchBackend
 discoverChannelModels
 downloadMediaArtifact
 executeOAuthWorkBuddyAction
+executeOAuthZhipuAction
 getAffinitySettings
 getApiKey
 getApiKeyConcurrencySettings
@@ -89,6 +90,8 @@ getOAuthAccount
 getOAuthSettings
 getOAuthWorkBuddyAccount
 getOAuthWorkBuddyPolicy
+getOAuthZhipuAccount
+getOAuthZhipuResetStatus
 getOpenAiWebSocketSettings
 getProxy
 getProxyGroup
@@ -151,6 +154,7 @@ planApiKeyRegeneration
 planInvalidOAuthAccountDeletion
 planOAuthQuotaReset
 planOAuthWorkBuddyAction
+planOAuthZhipuAction
 pollOAuthLoginFlow
 previewOAuthImport
 probeChannelDraft
@@ -179,9 +183,11 @@ resetOAuthQuota
 revokeCurrentManagementSession
 runNetworkMonitor
 searchModelCatalog
+selectOAuthZhipuProject
 setModelState
 stageUpdate
 startOAuthLoginFlow
+startOAuthZhipuProjectSelection
 syncModelMetadata
 syncOAuthAccountModels
 syncSystemDns

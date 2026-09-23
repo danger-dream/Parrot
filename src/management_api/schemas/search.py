@@ -7,7 +7,7 @@ from .base import StrictSchema
 from .system import StrictRequestSchema
 
 Mode = Literal["managed", "passthrough", "disabled"]
-BackendType = Literal["anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic"]
+BackendType = Literal["anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic", "zhipu"]
 BackendId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
 Key = Annotated[str, Field(min_length=1, max_length=8192, json_schema_extra={"writeOnly": True})]
 
@@ -32,8 +32,8 @@ class SearchSettingsPatch(StrictRequestSchema):
 class SearchBackendPatch(StrictRequestSchema):
     name: str | None = Field(None, min_length=1, max_length=200)
     enabled: bool | None = None
-    endpoint: str | None = Field(None, max_length=2048)
-    model: str | None = Field(None, max_length=200, description="OAuth search backends only; HTTP key backends accept only the empty compatibility value")
+    endpoint: str | None = Field(None, max_length=2048, description="Zhipu standalone keys: https://open.bigmodel.cn (default) or https://api.z.ai; referenced accounts use their own site")
+    model: str | None = Field(None, max_length=200, description="OpenAI/xAI/Anthropic OAuth search only; key backends and Zhipu MCP accept only the empty compatibility value")
     accountIds: list[str] | None = Field(None, description="Complete public account keys, including workspace/subject; empty selects all eligible accounts")
     allowDisabledAccounts: bool | None = None
     apiKeys: list[Key] | None = Field(None, max_length=100, repr=False, json_schema_extra={"writeOnly": True})

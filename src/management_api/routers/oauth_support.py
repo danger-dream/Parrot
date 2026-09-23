@@ -260,6 +260,7 @@ def detail(value) -> OAuthAccountDetailData:
         credentialConfigured=value.credential_configured,
         lastModelSync=value.last_model_sync,
         workbuddy=public_value(value.workbuddy, camel_case_keys=True) if value.workbuddy is not None else None,
+        zhipu=public_value(value.zhipu, camel_case_keys=True) if value.zhipu is not None else None,
     )
 
 

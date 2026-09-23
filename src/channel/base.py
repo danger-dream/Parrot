@@ -128,6 +128,8 @@ class UpstreamRequest:
     dynamic_tool_map: Optional[dict] = None
     translator_ctx: Optional[dict] = None
     dispatch_metadata: Optional[UpstreamDispatchMetadata] = None
+    # Optional raw-response context owner; only Zhipu installs its signer.
+    stream_context_hook: object | None = field(default=None, repr=False)
 
 
 @dataclass

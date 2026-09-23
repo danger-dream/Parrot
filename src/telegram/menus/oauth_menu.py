@@ -60,6 +60,7 @@ from ...management_control.oauth.menu_bridge import (
 from .. import menu_cache, states, ui
 from . import main as main_menu
 from . import workbuddy_oauth_menu as workbuddy_menu
+from . import zhipu_oauth_menu as zhipu_menu
 from .sort_primitives import (
     move_bottom as _move_bottom,
     move_down as _move_down,
@@ -105,6 +106,8 @@ def _account_key_from_short(short: str) -> str | None:
 
 
 def _account_display(acc: dict) -> str:
+    if oauth_control.provider_of_snapshot(acc) == "zhipu":
+        return zhipu_menu.account_display(acc)
     return str(acc.get("label") or acc.get("email") or "?")
 
 
@@ -177,8 +180,8 @@ def _foreground_account_model_sync(
 ) -> dict:
     """Show progress and wait at most 20s without cancelling the 45s worker."""
     progress = (
-        "🔄 <b>正在同步模型，请稍候…</b>\n\n"
-        f"类型: <code>{ui.escape_html(notifier.provider_label(provider))}</code>\n"
+        ("🔄 <b>正在同步模型及元数据，请稍候…</b>\n\n" if provider == "zhipu" else "🔄 <b>正在同步模型，请稍候…</b>\n\n")
+        + f"类型: <code>{ui.escape_html(notifier.provider_label(provider))}</code>\n"
         f"账户: <code>{ui.escape_html(label)}</code>"
     )
     progress_id = message_id
@@ -208,11 +211,11 @@ def _foreground_account_model_sync(
             raise launch_error
         raise RuntimeError(str(launch_error or "model sync did not start"))
 
-    def finish() -> None:
+    def finish(timeout_s=None) -> None:
         try:
-            result = future.result(timeout=oauth_control.model_sync_foreground_timeout_seconds())
+            result = future.result(timeout=oauth_control.model_sync_foreground_timeout_seconds() if timeout_s is None else timeout_s)
         except concurrent.futures.TimeoutError:
-            result = {"action": "foreground_timeout", "account_key": account_key}
+            result = {"action": "error" if future.done() else "foreground_timeout", "account_key": account_key, "error": "timeout"}
         except Exception as exc:
             result = {"action": "error", "account_key": account_key, "error": str(exc)}
 
@@ -222,12 +225,19 @@ def _foreground_account_model_sync(
             # The user may remove the account while discovery is in flight.
             return
         action = str(result.get("action") or "error")
-        if action == "updated" and int(result.get("models") or len(selection.get("models") or [])) > 0:
+        if (action == "updated" or (provider == "zhipu" and action == "not_modified")) and int(result.get("models") or len(selection.get("models") or [])) > 0:
             count = int(result.get("models") or len(selection.get("models") or []))
             status = f"✅ 已同步模型 <code>{count}</code> 个，当前使用账户模型。"
+            if provider == "zhipu":
+                available = len(selection.get("effective_models") or [])
+                status = f"✅ 已同步目录 <code>{count}</code> 个模型，当前可用 <code>{available}</code> 个。"
         elif action == "foreground_timeout":
             source = "继续使用上次账户模型" if selection_before.get("models") else "尚无账户目录，当前无可路由模型，请同步上游模型"
-            status = f"⏱ 模型同步超时，任务将在后台继续；{source}。"
+            if provider == "zhipu":
+                source = "已取得模型目录" if selection.get("models") else "正在获取模型目录"
+                status = f"⏳ {source}，初始化仍在后台进行，完成后自动更新此消息。"
+            else:
+                status = f"⏱ 模型同步超时，任务将在后台继续；{source}。"
         else:
             source = "继续使用上次账户模型" if selection.get("models") else "尚无账户目录，当前无可路由模型，请同步上游模型"
             error = str(result.get("error") or action)[:180]
@@ -235,7 +245,26 @@ def _foreground_account_model_sync(
                 f"⚠️ 模型同步失败：<code>{ui.escape_html(error)}</code>\n"
                 f"后台将静默重试，{source}。"
             )
-        final = progress + "\n\n" + status
+        if provider == "zhipu":
+            usage = post_save.get("usage")
+            if post_save.get("usage_error") is not None:
+                quota_status = "⚠️ 额度获取失败，账户已保存，可在详情重试。"
+            elif isinstance(usage, dict) and ((usage.get("zhipu") or {}).get("windows") or (usage.get("zhipu") or {}).get("limits")):
+                quota_status = "✅ 已自动获取额度用量。"
+            else:
+                quota_status = "⚠️ 额度接口未返回可用数据。"
+            metadata = result.get("metadata_sync") or {}
+            metadata_status = {
+                "succeeded": "✅ 元数据已同步。",
+                "partial_failed": "⚠️ 元数据已按本地目录更新，远端目录刷新失败。",
+                "skipped": "ℹ️ 元数据自动更新已关闭，保留当前设置。",
+                "failed": "⚠️ 元数据同步失败，已保留模型目录。",
+            }.get(metadata.get("status"), "⏳ 模型及元数据同步仍在后台继续。" if action == "foreground_timeout" else "⚠️ 元数据尚未完成同步。")
+            status = quota_status + "\n" + status + "\n" + metadata_status
+        heading = progress
+        if provider == "zhipu" and action != "foreground_timeout":
+            heading = progress.replace("🔄 <b>正在同步模型及元数据，请稍候…</b>", "<b>账户初始化结果</b>")
+        final = heading + "\n\n" + status
         nav_markup = ui.inline_kb([[ui.btn("◀ 返回 OAuth 列表", "menu:oauth")]])
         try:
             if progress_id is not None:
@@ -244,6 +273,10 @@ def _foreground_account_model_sync(
                 ui.send(chat_id, final, reply_markup=nav_markup)
         except Exception as exc:
             print(f"[oauth] model sync UI update failed: {type(exc).__name__}")
+        if provider == "zhipu" and action == "foreground_timeout":
+            # Reuse the original worker; completion updates this progress
+            # message without starting another fetch or requiring a click.
+            future.add_done_callback(lambda _done: finish(timeout_s=0))
 
     # Never hold the single Telegram polling/update thread during the 20-second
     # UX window.  This worker owns only the progress message; config was saved
@@ -697,7 +730,7 @@ def _quota_cache_has_usage_signal(row: dict | None) -> bool:
 
 
 def _should_refresh_account_for_ui(acc: dict | None) -> bool:
-    if acc and oauth_control.provider_of_snapshot(acc) == "workbuddy":
+    if acc and oauth_control.provider_of_snapshot(acc) in {"workbuddy", "zhipu"}:
         # WorkBuddy pages read local snapshots only, even when email is present.
         return False
     if not acc or not acc.get("email"):
@@ -709,7 +742,7 @@ def _should_refresh_account_for_ui(acc: dict | None) -> bool:
 
 def _refreshable_account_keys_for_ui(accounts: list[dict], *, explicit: bool = False) -> list[str]:
     return [_account_key(a) for a in accounts if _should_refresh_account_for_ui(a) or (
-        explicit and oauth_control.provider_of_snapshot(a) == "workbuddy"
+        explicit and oauth_control.provider_of_snapshot(a) in {"workbuddy", "zhipu"}
         and a.get("disabled_reason") not in ("user", "auth_error")
         and (a.get("enabled", True) or a.get("disabled_reason") == "quota")
     )]
@@ -886,6 +919,8 @@ def _status_icon(acc: dict) -> str:
         return "⚠"
     if not acc.get("enabled", True):
         return "🔕"
+    if acc.get("provider") == "zhipu" and not zhipu_menu.model_route_available(acc):
+        return "❔"
     return "✅"
 
 
@@ -1828,7 +1863,7 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         tag = " [用户禁用]"
     elif reason == "quota":
         du = acc.get("disabled_until")
-        tag = " [配额禁用]" if prov == "workbuddy" and not du else f" [配额禁用 · 预计 {_format_bjt(du)}]"
+        tag = " [配额禁用]" if prov in {"workbuddy", "zhipu"} and not du else f" [配额禁用 · 预计 {_format_bjt(du)}]"
     elif reason == "auth_error":
         tag = " [认证失败]"
 
@@ -1842,7 +1877,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
     )
 
     # 套餐行
-    if prov == "workbuddy":
+    if prov == "zhipu":
+        lines.append(zhipu_menu.provider_line(acc))
+    elif prov == "workbuddy":
         lines.append(workbuddy_menu.provider_line(acc))
     elif prov == "openai":
         plan = acc.get("plan_type") or ""
@@ -1961,6 +1998,9 @@ def _format_account_block(acc: dict, *, month_snapshot: dict | None = None,
         else:
             lines.append("📊 用量: <i>尚未获取</i>")
 
+    if prov == "zhipu":
+        lines.extend(zhipu_menu.extra_usage_lines(ak))
+
     # 本地累计严格使用该账户的实际/推定周期；无统一 Provider 周期时才保留
     # 明确标注的“本地自然月”，不再把自然月冒充套餐或账单周期。
     ts = period_stats
@@ -2053,6 +2093,10 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
             stats_loading=stats_loading,
         )
     if not row:
+        if provider == "zhipu":
+            account = oauth_control.account_snapshot(account_key) or {}
+            pending = "初始化完成后自动获取额度。" if not account.get("model_key") else "尚未获取用量，可点「刷新额度」。"
+            return "\n".join([pending, *zhipu_menu.extra_usage_lines(account_key, detail=True)])
         return "尚未获取用量（点「刷新用量/重置卡」试试）"
 
     out = []
@@ -2142,6 +2186,9 @@ def _format_usage_block(account_key: str, *, month_snapshot: dict | None = None,
                 f"({_usage_display_percent(ex_util):.1f}%)"
                 f"{ui.quota_progress_html(_usage_display_percent(ex_util))}"
             )
+
+    if provider == "zhipu":
+        out.extend(zhipu_menu.extra_usage_lines(account_key, detail=True))
 
     fetched = row.get("fetched_at")
     if fetched:
@@ -2427,6 +2474,8 @@ def _normalize_filter(value: str | None) -> str:
 def _filter_account(acc: dict, filter_key: str) -> bool:
     filter_key = _normalize_filter(filter_key)
     if filter_key == _FILTER_AVAILABLE:
+        if acc.get("provider") == "zhipu" and not zhipu_menu.model_route_available(acc):
+            return False
         return bool(acc.get("enabled", True)) and not acc.get("disabled_reason")
     if filter_key == _FILTER_QUOTA:
         return acc.get("disabled_reason") == "quota"
@@ -3323,7 +3372,9 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
     )
     reset_credit_details = _openai_reset_credit_details_from_row(quota_row) if prov == "openai" else None
     provider_line = ""
-    if prov == "workbuddy":
+    if prov == "zhipu":
+        provider_line = zhipu_menu.provider_line(acc, detail=True) + "\n"
+    elif prov == "workbuddy":
         provider_line = workbuddy_menu.provider_line(acc, detail=True) + "\n"
     elif prov == "openai":
         plan = acc.get("plan_type") or "?"
@@ -3394,13 +3445,17 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         if prov == "workbuddy" else
         _format_usage_block(account_key, month_snapshot=month_snapshot, stats_loading=stats_loading)
     )
+    credential_text = (
+        zhipu_menu.credential_lines(acc) if prov == "zhipu" else
+        f"⏳ Token: <code>{_fmt_time_full(acc.get('expired'))}</code>\n"
+        f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n"
+    )
     text = (
         f"{icon} <b>{ui.escape_html(email)}</b> {prov_icon}\n\n"
         f"状态: <code>{ui.escape_html('enabled' if acc.get('enabled', True) and not acc.get('disabled_reason') else reason)}</code>\n"
         f"{provider_line}"
         f"⚡ 并发上限: <code>{max_cc_label}</code>\n"
-        f"⏳ Token: <code>{_fmt_time_full(acc.get('expired'))}</code>\n"
-        f"🔄 刷新: <code>{_format_bjt(acc.get('last_refresh'))}</code>\n\n"
+        f"{credential_text}\n"
         f"<b>📊 使用量</b>\n{usage_text}"
     )
     reset_cards_block = (
@@ -3449,7 +3504,7 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
 
     payload = _callback_payload(short, page, filter_key)
     rows = [
-        [ui.btn("🔄 刷新 Token", f"oa:refresh_token:{payload}"),
+        [ui.btn(("🔄 更新凭据" if acc.get("credential_mode") == "oauth" else "🔄 刷新连接") if prov == "zhipu" else "🔄 刷新 Token", f"oa:zh:refresh:{short}" if prov == "zhipu" else f"oa:refresh_token:{payload}"),
          ui.btn("📊 刷新额度", f"oa:refresh_usage:{payload}")],
     ]
     # All OAuth providers enter the same source-filtered model center.  The
@@ -3471,6 +3526,18 @@ def _detail_text_and_kb(account_key: str, page: int = 1, filter_key: str = _FILT
         [ui.btn(toggle_label, f"oa:toggle:{payload}"),
          ui.btn("🗑 删除账户", f"oa:delete_ask:{payload}")],
     ]
+    if prov == "zhipu":
+        account_actions = [ui.btn("✏️ 账户名称", f"oa:zh:name:{short}")]
+        if acc.get("credential_mode") == "oauth":
+            account_actions.append(ui.btn("♻️ 官方重置卡", f"oa:zh:reset:{short}"))
+        rows.append(account_actions)
+        if acc.get("credential_mode") == "oauth":
+            if not acc.get("model_key"):
+                rows.append([ui.btn("🔄 重试初始化", f"oa:zh:initialize:{short}"),
+                             ui.btn("选择团队/项目", f"oa:zh:projects:{short}")])
+            else:
+                rows.append([ui.btn("切换项目/团队", f"oa:zh:projects:{short}")])
+
     if prov == "workbuddy":
         nav = (short, max(1, int(page or 1)), filter_key)
         rows.extend(workbuddy_menu.package_page_buttons(account_key, nav, workbuddy_package_page))
@@ -3789,6 +3856,10 @@ def on_refresh_usage(chat_id: int, message_id: int, cb_id: str, short: str, page
         return
     email = _account_email(ak)
     provider = oauth_control.provider_of_snapshot(ak)
+    if provider == "zhipu":
+        ui.answer_cb(cb_id, "查询中…")
+        zhipu_menu.refresh_usage(chat_id, message_id, ak, page, filter_key)
+        return
     if provider == "workbuddy":
         ui.answer_cb(cb_id, "查询中…")
         render_state = {"loading": False}
@@ -4742,7 +4813,7 @@ def on_delete_ask(chat_id: int, message_id: int, cb_id: str, short: str, page: i
     acc = oauth_control.account_snapshot(ak)
     email = (acc or {}).get("email") or _account_email(ak)
     prov = oauth_control.provider_of_snapshot(ak)
-    if prov == "workbuddy" and acc:
+    if prov in {"workbuddy", "zhipu"} and acc:
         email = _account_display(acc)
     prov_tag = _provider_tag(prov)
     ui.answer_cb(cb_id)
@@ -5234,6 +5305,7 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
     """新增 OAuth 账户：把常用登录/导入入口扁平化到一级。"""
     # 这里也是所有新增流程的「取消」落点，进入时清掉等待输入状态，避免后续文本误触发旧流程。
     workbuddy_menu.discard_state(chat_id)
+    zhipu_menu.discard_state(chat_id)
     states.pop_state(chat_id)
     ui.answer_cb(cb_id)
     ui.edit(
@@ -5252,6 +5324,7 @@ def on_add_menu(chat_id: int, message_id: int, cb_id: str) -> None:
             [ui.provider_button("OpenAI 导入 CPA 文件", "oa:import:cpa", "openai")],
             [ui.provider_button("WorkBuddy 中国区登录", "oa:wb:login", "workbuddy")],
             [ui.provider_button("WorkBuddy 国际区登录", "oa:wb:login:global", "workbuddy")],
+            [ui.provider_button("智谱 / Z.ai（Key / OAuth）", "oa:zh:add", "zhipu")],
             [ui.btn("◀ 返回列表", "menu:oauth")],
             [ui.btn("🏠 返回主菜单", "menu:main")],
         ]),
@@ -6709,7 +6782,7 @@ def on_import_openai_overwrite(chat_id: int, message_id: int, cb_id: str, nonce:
 def _invalid_accounts() -> list[dict]:
     return [
         a for a in oauth_control.account_entries_snapshot()
-        if (a.get("email") or oauth_control.provider_of_snapshot(a) == "workbuddy") and a.get("disabled_reason") == "auth_error"
+        if (a.get("email") or oauth_control.provider_of_snapshot(a) in {"workbuddy", "zhipu"}) and a.get("disabled_reason") == "auth_error"
     ]
 
 
@@ -6876,6 +6949,8 @@ def _redirect_legacy_cursor_callback(
 
 
 def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> bool:
+    if zhipu_menu.handle_callback(chat_id, message_id, cb_id, data):
+        return True
     if workbuddy_menu.handle_callback(chat_id, message_id, cb_id, data):
         return True
     if data == "menu:oauth":
@@ -7118,6 +7193,8 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
 
 
 def handle_text_state(chat_id: int, action: str, text: str) -> bool:
+    if zhipu_menu.handle_text(chat_id, action, text):
+        return True
     if action in {"oa_wb_import", "oa_wb_import_preview"}:
         workbuddy_menu.reject_removed_import(chat_id)
         return True

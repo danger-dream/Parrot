@@ -36,6 +36,8 @@ class OAuthImportControlMixin:
         return None
 
     def _prepare_import_entry(self, value) -> dict:
+        if isinstance(value, dict) and value.get("provider") == "zhipu":
+            return self.backend.zhipu_prepare_credential(value)
         # Parsed material is never trusted as a complete account. Every candidate
         # must pass through the native refresh/token/identity conversion first.
         parts = self._unprepared_candidate(value)
@@ -60,7 +62,7 @@ class OAuthImportControlMixin:
         self, context, *, format: str, payload: str | bytes, filename: str = "",
     ) -> OAuthImportPreview:
         self._require(context, Capability.SECRETS_WRITE)
-        if format not in {"openai", "cpa", "sub2api"}:
+        if format not in {"openai", "cpa", "sub2api", "zhipu"}:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
 
         problems: list[OAuthImportProblem] = []
@@ -184,13 +186,16 @@ class OAuthImportControlMixin:
         skipped = tuple(str(item) for item in outcome.get("skipped") or ())
         affected = set(added) | set(replaced)
         completed: set[str] = set()
+        identities: dict[str, str] = {}
         for item in candidates:
             entry = item["entry"]
             account_id = self.backend.account_id(entry)
             if account_id in affected and account_id not in completed:
                 # Credentials are already atomically published. Follow-up failures
                 # remain observations and never roll back the committed batch.
-                self._post_save_account_effects(account_id, entry)
+                effects = self._post_save_account_effects(account_id, entry)
+                identities[account_id] = effects.get("account_id", account_id)
                 completed.add(account_id)
         self._audit(context, "oauth.import.commit", import_id)
-        return OAuthImportCommitResult(added, replaced, skipped)
+        return OAuthImportCommitResult(tuple(identities.get(key, key) for key in added),
+            tuple(identities.get(key, key) for key in replaced), skipped)

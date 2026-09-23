@@ -21,6 +21,7 @@ from .capabilities import (
     OPENAI_CODEX_CAPABILITIES,
     XAI_OAUTH_CAPABILITIES,
     WORKBUDDY_OAUTH_CAPABILITIES,
+    ZHIPU_OAUTH_CAPABILITIES,
     ProviderCapabilities,
 )
 from . import antigravity_codec
@@ -92,6 +93,15 @@ class OpenAIApiAdapter(ProviderAdapter):
 class CursorOAuthAdapter(ProviderAdapter):
     name = "cursor-oauth"
     capabilities = CURSOR_OAUTH_CAPABILITIES
+
+
+class ZhipuOAuthAdapter(ProviderAdapter):
+    name = "zhipu-oauth"
+    capabilities = ZHIPU_OAUTH_CAPABILITIES
+
+    async def restore_response_bytes(self, chunk: bytes, ctx: ProviderAttemptContext) -> bytes:
+        decoder = (ctx.translator_ctx or {}).get("zhipu_stream")
+        return decoder.feed(chunk) if decoder is not None else chunk
 
 
 class WorkBuddyOAuthAdapter(ProviderAdapter):

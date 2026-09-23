@@ -8,7 +8,7 @@ import threading
 from ...management_control.search import API_TYPES, DEFAULT_SEARCH_CONTROL, INTEGER_LIMITS
 from ...management_control.auxiliary.common import telegram_context
 from ...management_control.errors import ManagementError
-from ...search_service import BACKEND_TYPES, NAMES
+from ...search_service import BACKEND_TYPES, EXTRACT_TYPES, NAMES
 from .. import menu_cache, states, ui
 
 _CONTROL = DEFAULT_SEARCH_CONTROL
@@ -62,6 +62,8 @@ def _mode_label(mode):
 
 
 def _kind_label(backend_type):
+    if backend_type == "zhipu":
+        return "Coding Plan MCP（Key / 已有账号）"
     return "API Key 来源" if backend_type in API_TYPES else "OAuth 来源"
 
 
@@ -149,6 +151,8 @@ def _status_icon(row):
 
 
 def _credential_line(row):
+    if row["type"] == "zhipu":
+        return f"🔑 Key {row['keyCount']} 个 · 👤 符合条件账户 {row['accountCount']} 个"
     if row["type"] in API_TYPES:
         return f"🔑 Key {row['keyCount']} 个"
     return f"👤 符合条件账户 {row['accountCount']} 个"
@@ -266,7 +270,16 @@ def _detail(chat_id, message_id, backend_id, page=0):
              f"状态: {_status_icon(row)} {'启用' if row['enabled'] else '停用'} · 来源{_status(row)}",
              f"排序: {position} / {len(cfg['backends'])}",
              f"类型: {_kind_label(row['type'])}"]
-    if row["type"] in API_TYPES:
+    if row["type"] == "zhipu":
+        lines += ["", _credential_line(row),
+                  f"🌐 独立 Key 站点: <code>{ui.escape_html(row['endpoint'] or 'https://open.bigmodel.cn')}</code>",
+                  f"👤 账户: {'全部符合条件账户' if not row['accountIds'] else '指定 ' + str(len(row['accountIds'])) + ' 个'}",
+                  f"⏸ 允许使用手动停用账户: {'开' if row['allowDisabledAccounts'] else '关'}",
+                  "<i>先尝试独立 Key，再尝试所选账号的模型 Key；账号按自身中国站/国际站路由，不使用管理 Token。共享套餐额度，未提供美元计价。</i>"]
+        rows = [[ui.btn("🔑 管理 Key", "srch:keys:" + code), ui.btn("🌐 改 Key 站点", "srch:endpoint:" + code)],
+                [ui.btn("👤 选择账户", "srch:accounts:" + code)],
+                [ui.btn("⏸ 允许停用账户：" + ("开" if row['allowDisabledAccounts'] else "关"), "srch:allow:" + code)]]
+    elif row["type"] in API_TYPES:
         lines += ["", f"🔑 Key: 已设置 {row['keyCount']} 个",
                   f"🌐 接口: <code>{ui.escape_html(row['endpoint'] or '默认')}</code>"]
         rows = [[ui.btn("🔑 管理 Key", "srch:keys:" + code), ui.btn("🌐 改接口地址", "srch:endpoint:" + code)]]
@@ -279,7 +292,7 @@ def _detail(chat_id, message_id, backend_id, page=0):
         rows = [[ui.btn("🧠 选择模型", "srch:models:" + code), ui.btn("👤 选择账户", "srch:accounts:" + code)],
                 [ui.btn("⏸ 允许停用账户：" + ("开" if row['allowDisabledAccounts'] else "关"), "srch:allow:" + code)]]
     tests = [ui.btn("🧪 测试搜索", "srch:test:" + code)]
-    if row["type"] in ("anysearch", "tavily", "exa", "openai"):
+    if row["type"] in EXTRACT_TYPES:
         tests.append(ui.btn("📄 测试提取", "srch:extract:" + code))
     rows += [tests,
              [ui.btn("✏ 重命名", "srch:name:" + code),
@@ -582,6 +595,9 @@ def _ask(chat_id, message_id, field, backend_id=None, page=0):
     elif field in ("test", "extract"):
         text = "请输入搜索词：" if field == "test" else "请输入公开 HTTP(S) URL："
         text += "\n将主动调用此来源（可能消耗额度），失败不会切换其它来源。"
+    elif field == "endpoint" and backend_id and row["type"] == "zhipu":
+        text = ("请输入独立 Coding Plan Key 的站点：\n中国站：<code>https://open.bigmodel.cn</code>\n"
+                "国际站：<code>https://api.z.ai</code>\n<code>-</code> 恢复中国站。引用的账号始终按账号自身站点连接。")
     elif field == "freshness":
         text = "请输入 day / week / month / year；<code>-</code> 清空。"
     elif field in INTEGER_LIMITS:

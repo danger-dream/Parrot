@@ -127,7 +127,7 @@ class InMemoryOAuthBackend(OAuthBackend):
         if account.get("_id"):
             return str(account["_id"])
         provider = self.provider_of(account)
-        if provider == "workbuddy":
+        if provider in {"workbuddy", "zhipu"}:
             from src.oauth_ids import account_key
             return account_key(account)
         identity = str(account.get("subject") or account.get("email") or "")
@@ -620,6 +620,16 @@ class InMemoryOAuthBackend(OAuthBackend):
 
     def xai_extract_user_info(self, claims):
         return claims
+
+    def zhipu_start_login(self, *, site):
+        return {"site": site, "status": "pending", "interval": 1,
+                "auth_url": "https://bigmodel.cn/login"}
+
+    def zhipu_poll_login(self, payload):
+        from src.oauth.zhipu.auth import normalize_credential
+        payload.update(status="ready", entry=normalize_credential({"site": payload["site"],
+            "credential_mode": "oauth", "subject": "fixture-zhipu", "access_token": "fixture-oauth", "zcode_token": "fixture-platform",
+            "model_key": "fixture.secret", "entitlement": "available", "plan_scope": "personal"}))
 
     def workbuddy_start_login(self):
         return {"realm": "cn", "state": "fixture-workbuddy-state", "status": "pending",

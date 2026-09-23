@@ -126,6 +126,17 @@ ANTHROPIC_STANDARD_CAPABILITIES = ProviderCapabilities(
 )
 
 
+ZHIPU_MESSAGES_FIELDS = frozenset({
+    "model", "messages", "max_tokens", "system", "stream", "temperature", "top_p", "top_k",
+    "stop_sequences", "thinking", "output_config", "tools", "tool_choice", "metadata", "cache_control",
+})
+ZHIPU_OAUTH_CAPABILITIES = ProviderCapabilities(
+    adapter_name="zhipu-oauth", family="anthropic", protocols=frozenset({"anthropic"}),
+    transports=frozenset({"http", "sse"}), passthrough_request_fields={"anthropic": ZHIPU_MESSAGES_FIELDS},
+    bridge_request_fields={"anthropic": ZHIPU_MESSAGES_FIELDS},
+)
+
+
 CC_MIMICRY_CAPABILITIES = ProviderCapabilities(
     adapter_name="cc-mimicry",
     family="anthropic",

@@ -24,7 +24,8 @@ SETTING_FIELDS = (*INTEGER_LIMITS, "functionMode", "hostedMode", "timeoutSeconds
                   "requireKnownUrlForFetch", "language", "country", "freshness")
 BACKEND_FIELDS = ("name", "enabled", "endpoint", "model", "accountIds", "allowDisabledAccounts")
 KEY_FIELDS = ("apiKeys", "addApiKeys", "removeKeyIndices")
-API_TYPES = frozenset(("anysearch", "tavily", "exa", "brave"))
+API_TYPES = search_service.KEY_TYPES
+ACCOUNT_TYPES = search_service.ACCOUNT_TYPES
 
 
 class SearchControl(DomainControl):
@@ -94,7 +95,7 @@ class SearchControl(DomainControl):
         # A provider may have accounts that are all currently disabled or
         # missing credentials: accountCount is then 0, yet the source must stay
         # reachable so its opt-in/account selection can still be managed.
-        if row["type"] not in API_TYPES and SearchControl._has_provider_accounts(row["type"]):
+        if row["type"] in ACCOUNT_TYPES and SearchControl._has_provider_accounts(row["type"]):
             return True
         template = search_service.default_backend(row["type"])
         for key in BACKEND_FIELDS:
@@ -123,7 +124,7 @@ class SearchControl(DomainControl):
         backend = self._backend(search_service.settings(), backend_id)
         kind = backend["type"]
         provider = "claude" if kind == "anthropic" else kind
-        if kind in API_TYPES:
+        if kind not in ACCOUNT_TYPES:
             return []
         rows = []
         accounts = [acc for acc in config.get().get("oauthAccounts") or []
@@ -142,7 +143,7 @@ class SearchControl(DomainControl):
             rows.append({"id": account_key(account),
                          "name": name,
                          "enabled": account.get("enabled", True) is not False and not bool(account.get("disabled_reason")),
-                         "credentialConfigured": bool(account.get("access_token"))})
+                         "credentialConfigured": bool(account.get("model_key" if provider == "zhipu" else "access_token"))})
         return rows
 
     def _commit(self, context, action, mutate, expected_revision=None, *, read_back=True):
@@ -203,7 +204,7 @@ class SearchControl(DomainControl):
             if key in ("enabled", "allowDisabledAccounts"):
                 if type(value) is not bool:
                     raise self._invalid(key)
-                if key == "allowDisabledAccounts" and backend["type"] in API_TYPES:
+                if key == "allowDisabledAccounts" and backend["type"] not in ACCOUNT_TYPES:
                     raise self._invalid(key)
             elif key in ("name", "model", "endpoint"):
                 if not isinstance(value, str) or len(value) > (2048 if key == "endpoint" else 200):
@@ -221,8 +222,12 @@ class SearchControl(DomainControl):
                         valid = False
                     if not valid or backend["type"] not in API_TYPES:
                         raise self._invalid(key, "Expected an HTTP(S) endpoint without embedded credentials or query")
+                    if backend["type"] == "zhipu":
+                        from src.oauth.zhipu.common import MODEL_ORIGINS
+                        if value.rstrip("/") not in MODEL_ORIGINS.values():
+                            raise self._invalid(key, "Use https://open.bigmodel.cn or https://api.z.ai for Coding Plan keys")
             elif key == "accountIds":
-                if backend["type"] in API_TYPES or not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                if backend["type"] not in ACCOUNT_TYPES or not isinstance(value, list) or any(not isinstance(v, str) for v in value):
                     raise self._invalid(key)
                 provider = "claude" if backend["type"] == "anthropic" else backend["type"]
                 known = {account_key(acc) for acc in config.get().get("oauthAccounts", [])

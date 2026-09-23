@@ -15,6 +15,7 @@ class OAuthProvider(str, Enum):
     XAI = "xai"
     ANTIGRAVITY = "antigravity"
     WORKBUDDY = "workbuddy"
+    ZHIPU = "zhipu"
 
 
 class OAuthAccountFilter(str, Enum):
@@ -124,6 +125,7 @@ class OAuthAccountDetail:
     credential_configured: bool
     last_model_sync: datetime | None
     workbuddy: dict | None = None
+    zhipu: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +175,9 @@ class OAuthMutationResult:
     account_id: str
     revision: str
     status: str
+    # In-process UI work handle; HTTP DTOs deliberately project only the three
+    # public fields above. Do not serialize Futures or raw usage/error objects.
+    post_save: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -25,6 +25,7 @@ from .base import (
     OpenAICodexAdapter,
     XAIOAuthAdapter,
     WorkBuddyOAuthAdapter,
+    ZhipuOAuthAdapter,
     ProviderAdapter,
     ProviderAttemptContext,
 )
@@ -38,6 +39,7 @@ _OPENAI_CODEX = OpenAICodexAdapter()
 _XAI_OAUTH = XAIOAuthAdapter()
 _ANTIGRAVITY_OAUTH = AntigravityOAuthAdapter()
 _WORKBUDDY_OAUTH = WorkBuddyOAuthAdapter()
+_ZHIPU_OAUTH = ZhipuOAuthAdapter()
 
 
 def adapter_for_channel(channel) -> ProviderAdapter:
@@ -59,6 +61,8 @@ def adapter_for_channel(channel) -> ProviderAdapter:
         return _OPENAI_API
 
     if ch_type == "oauth":
+        if getattr(channel, "provider", "") == "zhipu":
+            return _ZHIPU_OAUTH
         return _ANTHROPIC_OAUTH
 
     if bool(getattr(channel, "cc_mimicry", False)):

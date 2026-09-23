@@ -962,7 +962,7 @@ FAMILY_PROVIDER_LABELS = {
     ),
 }
 
-PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨",
+PROVIDER_BTN_EMOJI = {"claude": "🅰️", "anthropic": "🅰️", "openai": "🅾️", "xai": "𝕏", "cursor": "🖱️", "antigravity": "✨", "zhipu": "🤖",
                       # Search sources: `✉` means "no icon", which made the four
                       # key-based sources indistinguishable in one list.
                       "anysearch": "🔎", "tavily": "🧭", "exa": "🧠", "brave": "🦁"}
@@ -989,8 +989,8 @@ PROVIDER_CUSTOM_EMOJI = {
     "openrouter": "6140767025175209650",
 }
 PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
-PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
-PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
+PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy", "zhipu": "智谱 / Z.ai"}
+PROVIDER_FULL_LABEL = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "openai": "OpenAI", "xai": "xAI Grok", "cursor": "Cursor OAuth", "antigravity": "Antigravity", "workbuddy": "WorkBuddy", "zhipu": "智谱 / Z.ai"}
 
 
 def _provider_key(provider: str | None) -> str:
@@ -1177,7 +1177,7 @@ def channel_display_name(channel_key: Any, *, with_family: bool = True) -> str:
                     (acc.get("label") or acc.get("email") or "?")
                     if provider == "cursor" else (acc.get("email") or "?")
                 )
-                if provider == "workbuddy":
+                if provider in {"workbuddy", "zhipu"}:
                     name = str(acc.get("label") or acc.get("nickname") or acc.get("email") or acc.get("uid") or "?")
                 if provider == "openai":
                     same_email_count = sum(

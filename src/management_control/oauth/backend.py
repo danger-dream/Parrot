@@ -506,6 +506,13 @@ class OAuthBackend:
     def parse_import(
         self, kind: str, payload, *, filename: str = "",
     ) -> list[OpenAIImportCandidate]:
+        if kind == "zhipu":
+            import json
+            value = json.loads(payload)
+            values = value if isinstance(value, list) else [value]
+            if not values or len(values) > 1000 or not all(isinstance(item, dict) for item in values):
+                raise ValueError("Invalid Zhipu import")
+            return [dict(item, provider="zhipu") for item in values]
         return parse_openai_import_payload(kind, payload, filename=filename)
 
     def cursor_catalog_records(self, account: dict) -> list[dict]:
@@ -601,6 +608,96 @@ class OAuthBackend:
     def antigravity_token_url(self): return antigravity_provider.token_url()
     def antigravity_redirect_uri(self): return antigravity_provider.redirect_uri()
     def antigravity_api_base_url(self): return antigravity_provider.api_base_url()
+
+    def zhipu_start_login(self, *, site):
+        from src.oauth.zhipu.auth import start_login_sync
+        return start_login_sync(site=site)
+
+    def zhipu_start_callback_login(self, *, site):
+        from src.oauth.zhipu.auth import start_callback_login_sync
+        return start_callback_login_sync(site=site)
+
+    def zhipu_accept_callback(self, payload, callback_url):
+        from src.oauth.zhipu.auth import accept_callback_sync
+        return accept_callback_sync(payload, callback_url)
+
+    def zhipu_poll_login(self, payload):
+        from src.oauth.zhipu.auth import poll_login_sync
+        return poll_login_sync(payload)
+
+    def zhipu_select_project(self, entry, choice):
+        # Scope selection is local. Subscription/Key reads belong AFTER saving.
+        from src.oauth.zhipu import auth
+        old_scope = tuple(entry.get(key) for key in ("organization_id", "project_id", "plan_scope"))
+        new_scope = tuple(choice[key] for key in ("organization_id", "project_id", "plan_scope"))
+        if old_scope != new_scope:
+            for key in ("model_key", "entitlement", "management_status"):
+                entry.pop(key, None)  # Never carry a Key/seat from another project.
+        entry.update({key: choice[key] for key in ("organization_id", "project_id", "plan_scope")})
+        return auth.normalize_credential(entry)
+
+    def zhipu_prepare_credential(self, value):
+        # Importing valid credentials must not depend on a management API read.
+        return self.zhipu_normalize_credential(value)
+
+    def zhipu_login_entry(self, entry):
+        """Reuse only an already chosen scope for this same authenticated identity."""
+        from src import channel_state
+        if entry.get("organization_id") or entry.get("project_id"):
+            return entry
+        def same(account):
+            return (account and account.get("provider") == "zhipu" and account.get("credential_mode") == "oauth"
+                    and account.get("site") == entry.get("site") and account.get("subject") == entry.get("subject"))
+        key = self.account_id(entry)
+        prior = self.get_account_exact(key)
+        if not prior:
+            prior = self.get_account_exact(channel_state.resolve("oauth:" + key).removeprefix("oauth:"))
+        if not same(prior):
+            candidates = [a for a in self.list_accounts() if same(a) and a.get("plan_scope") == "personal"]
+            prior = candidates[0] if len(candidates) == 1 else None
+        if same(prior):
+            entry = dict(entry, **{k: prior[k] for k in ("organization_id", "project_id", "plan_scope") if k in prior})
+        return entry
+
+    def zhipu_project_choices(self, account, account_id):
+        from src.oauth.zhipu.auth import project_choices
+        return project_choices(account, account_key=account_id)
+
+    def zhipu_default_personal_project(self, choices):
+        from src.oauth.zhipu.auth import default_personal_project
+        return default_personal_project(choices)
+
+    def zhipu_enrich_account(self, account_id):
+        from src.oauth.zhipu.runtime import enrich_account
+        return enrich_account(account_id)
+
+    def zhipu_bind_project(self, account_id, source, entry):
+        from src.oauth.zhipu.runtime import bind_project
+        return bind_project(account_id, source, entry)
+
+    def zhipu_normalize_credential(self, value):
+        from src.oauth.zhipu.auth import normalize_credential
+        return normalize_credential(value)
+
+    def zhipu_snapshot(self, account_id):
+        from src.oauth.zhipu.runtime import public_snapshot
+        return public_snapshot(self.get_account_exact(account_id), self.quota_load(account_id))
+
+    def zhipu_reset_status(self, *args):
+        from src.oauth.zhipu.runtime import fetch_reset_status
+        return fetch_reset_status(*args)
+
+    def zhipu_inspect_action(self, *args, **kwargs):
+        from src.oauth.zhipu.actions import inspect
+        return inspect(*args, **kwargs)
+
+    def zhipu_execute_action(self, *args, **kwargs):
+        from src.oauth.zhipu.actions import execute
+        return execute(*args, **kwargs)
+
+    def zhipu_action_history(self, account):
+        from src.oauth.zhipu.actions import history
+        return history(account)
 
     def workbuddy_start_login(self, *, realm="cn", client_profile=None):
         from src.oauth.workbuddy import start_login_sync

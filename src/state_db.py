@@ -669,6 +669,24 @@ def compaction_owner_delete_owner(owner_identity:str)->int:
         return len(keys)
     return _mut("codex_compaction_owners",op,strict=True)
 
+# Zhipu reset/key intents are durable; pending/unknown is never permission to replay.
+def zhipu_action_load(key: str):
+    return _get("zhipu_actions", key)
+
+
+def zhipu_action_save(key: str, row: dict, *, expected: dict | None) -> bool:
+    def op(data):
+        if data.get(key) != expected:
+            return False
+        data[key] = dict(row)
+        return True
+    return _mut("zhipu_actions", op, strict=True)
+
+
+def zhipu_action_history(owner: str) -> list[dict]:
+    return [row for row in _all("zhipu_actions") if row.get("owner") == owner]
+
+
 # WorkBuddy action intents/results are durable, never quota-cache observations.
 _WORKBUDDY_ACTION_FIELDS = frozenset({
     "id", "owner", "action", "business_date", "activity_id", "attempt_id", "attempt",

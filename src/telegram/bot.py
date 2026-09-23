@@ -17,19 +17,18 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-import traceback
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .. import startup_timing
 from ..async_owned import await_owned
-from . import menu_cache, states, ui
+from . import error_reporting, menu_cache, states, ui
 from .menus import (
     apikey_menu, channel_menu, help_menu, image_menu, load_balancing_menu,
     logs_menu, mapping_menu, mcp_menu, media_logs_menu, model_center_menu,
     oauth_account_models_menu, oauth_menu, proxy_menu,
     search_menu, stats_menu, status_alert_menu, status_menu, system_menu, translation_menu, update_menu,
-    xai_imagine_menu,
+    xai_imagine_menu, zhipu_oauth_menu,
 )
 from .menus import main as main_menu
 
@@ -478,16 +477,17 @@ def _poll_loop(
                 if not _poll_generation_active(generation, stop_event):
                     return
                 _offset = update["update_id"] + 1
+                error_context = error_reporting.update_context(update)
                 try:
                     _handle_update(update)
-                except Exception:
-                    traceback.print_exc()
+                except Exception as exc:
+                    error_message = error_reporting.report(exc, **error_context)
                     if not _poll_generation_active(generation, stop_event):
                         return
                     chat_id = _extract_chat_id(update)
                     if chat_id is not None:
                         try:
-                            ui.send(chat_id, "❌ 内部错误，请稍后重试或联系管理员。")
+                            ui.send(chat_id, error_message)
                         except Exception:
                             pass
 
@@ -541,7 +541,8 @@ def _handle_callback(cb: dict) -> None:
     msg_id = cb["message"]["message_id"]
     cb_id = cb["id"]
     data = cb.get("data", "") or ""
-    print(f"[tg] cb from {chat_id}: data={data!r}")    # DEBUG
+    safe = error_reporting.update_context({"callback_query": cb})
+    print(f"[tg] cb from {chat_id}: route={safe['route'] or 'other'}")
 
     # Management login approvals are deliberately isolated from all legacy menu
     # dispatch and authorization.  The service validates callback_query.from.id
@@ -574,9 +575,16 @@ def _handle_callback(cb: dict) -> None:
         ui.answer_cb(cb_id, "⛔ 无权限")
         return
 
+    # Closing a grant notification is not navigation: leave any pending input
+    # or background account operation in another message untouched.
+    if data == "oa:zh:notice_close":
+        zhipu_oauth_menu.handle_callback(chat_id, msg_id, cb_id, data)
+        return
+
     # Revoke only model-center input before any early navigation return.
     model_center_menu.before_callback(chat_id, data)
     search_menu.before_callback(chat_id, data)
+    zhipu_oauth_menu.before_callback(chat_id, data)
     # 任意新 callback 都让该消息此前的后台统计更新失效，防止旧页面覆盖新菜单。
     menu_cache.begin_view(chat_id, msg_id)
 
@@ -683,10 +691,11 @@ def _handle_message(msg: dict) -> None:
         )
         return
 
-    # Commands leave MC input; /cancel is consumed by its own editor.
+    # Navigation leaves owned input/login flows before text-state dispatch.
     # Other menus retain their historical command/input semantics.
     model_center_menu.before_command(chat_id, text)
     search_menu.before_command(chat_id, text)
+    zhipu_oauth_menu.before_command(chat_id, text)
     # 状态机输入
     state = states.get_state(chat_id)
     print(f"[tg] state for {chat_id}: {_summarize_state(state)}")        # DEBUG

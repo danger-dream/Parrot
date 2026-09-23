@@ -52,6 +52,8 @@ from .oauth import openai as openai_provider
 from .oauth import xai as xai_provider
 from .oauth import workbuddy as workbuddy_provider
 from .oauth.workbuddy import runtime as workbuddy_runtime
+from .oauth import zhipu as zhipu_provider
+from .oauth.zhipu import runtime as zhipu_runtime
 from .openai.codex_constants import (
     codex_backend_base_url,
     codex_cli_version,
@@ -344,7 +346,7 @@ def account_key_to_email(account_key: str) -> str:
     except AmbiguousOAuthAccountKey:
         acc = None
     if acc is not None:
-        if _acc_provider(acc) in {"cursor", "workbuddy"}:
+        if _acc_provider(acc) in {"cursor", "workbuddy", "zhipu"}:
             return str(acc.get("label") or acc.get("nickname") or acc.get("email") or acc.get("uid") or "")
         return str(acc.get("email") or "")
     provider, identity = _split_ak(account_key)
@@ -823,6 +825,10 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
             raise ValueError("OAuth account generation was deleted")
     if os.environ.get("PARROT_NO_REFRESH") == "1":
         _acc = get_account(_resolve_existing_account_key_or_raise(account_key))
+        if _acc and provider_of(_acc) == "zhipu":
+            if not force and _acc.get("model_key"):
+                return _acc["model_key"]
+            raise zhipu_provider.ZhipuError("refresh", "disabled")
         if _acc and _acc.get("access_token"):
             return _acc["access_token"]
         raise RuntimeError(
@@ -842,6 +848,8 @@ def _refresh_sync_locked(account_key: str, force: bool, *, expected_state_key: s
 
         # WorkBuddy owns unknown-expiry backoff and an unsaved rotated candidate.
         # It must see pending persistence before returning an apparently healthy old AT.
+        if provider_of(acc) == "zhipu":
+            return zhipu_runtime.refresh_locked(copy.deepcopy(acc), account_key, force)
         if provider_of(acc) == "workbuddy":
             return workbuddy_runtime.refresh_locked(copy.deepcopy(acc), account_key, force)
 
@@ -1042,7 +1050,9 @@ async def ensure_valid_token(account_key: str, *, expected_state_key: str | None
             raise ValueError(f"unknown OAuth account: {account_key}")
         expected_state_key = account_state_key(acc)
 
-    if provider_of(acc) == "workbuddy":
+    if provider_of(acc) == "zhipu" and acc.get("model_key"):
+        return acc["model_key"]
+    if provider_of(acc) in {"workbuddy", "zhipu"}:
         return await asyncio.to_thread(_refresh_sync_locked, account_key, False, expected_state_key=expected_state_key)
     if _token_is_fresh(acc):
         return acc["access_token"]
@@ -1256,6 +1266,8 @@ async def fetch_usage(account_key: str) -> dict:
         return await _fetch_claude_usage(account_key)
     access_token = await ensure_valid_token(account_key)
 
+    if provider == "zhipu":
+        return await asyncio.to_thread(zhipu_runtime.fetch_usage_sync, copy.deepcopy(get_account(account_key) or {}), account_key)
     if provider == "workbuddy":
         account = copy.deepcopy(get_account(account_key) or {})
         usage = await asyncio.to_thread(workbuddy_provider.fetch_usage_sync, access_token,
@@ -2854,6 +2866,8 @@ def _evaluate_and_toggle_by_usage_current(account_key: str, usage: dict,
             fresh=fresh,
         )
 
+    if provider == "zhipu":
+        return zhipu_runtime.evaluate(account_key, acc, usage, fresh=fresh, threshold=float(threshold))
     if provider == "workbuddy":
         return workbuddy_runtime.evaluate_credits(
             account_key, acc, usage, fresh=fresh, expected_generation=expected_quota_generation,
@@ -3400,7 +3414,9 @@ def _replace_exact_identity_in_config(
         incoming.update(workbuddy_provider.normalize_credential(
             incoming, source=str(incoming.get("workbuddy_identity_source") or "import"),
         ))
-    required = ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
+    if provider == "zhipu":
+        incoming = zhipu_provider.normalize_credential(incoming)
+    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -3441,12 +3457,13 @@ def _replace_exact_identity_in_config(
     replacement.update(incoming)
     if "maxConcurrent" in current:
         replacement["maxConcurrent"] = copy.deepcopy(current["maxConcurrent"])
-    if provider == "workbuddy":
+    if provider in {"workbuddy", "zhipu"}:
         for key in ("label", "workbuddy_auto_checkin", "disabledModels", "account_model_catalog",
                     "last_model_sync", "last_model_sync_source", "last_model_sync_error", "last_model_sync_attempt"):
             if key in current:
                 replacement[key] = copy.deepcopy(current[key])
-    if current.get("disabled_reason") == "auth_error":
+    if (current.get("disabled_reason") == "auth_error"
+            and (provider != "zhipu" or incoming.get("model_key"))):
         replacement["enabled"] = True
         replacement["disabled_reason"] = None
         replacement["disabled_until"] = None
@@ -3512,7 +3529,9 @@ def replace_exact_identity(
         incoming.update(workbuddy_provider.normalize_credential(
             incoming, source=str(incoming.get("workbuddy_identity_source") or "import"),
         ))
-    required = ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
+    if provider == "zhipu":
+        incoming = zhipu_provider.normalize_credential(incoming)
+    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
     missing = [key for key in required if not incoming.get(key)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
@@ -3649,12 +3668,14 @@ def _add_account_serialized(
         entry = dict(entry, **workbuddy_provider.normalize_credential(
             entry, source=str(entry.get("workbuddy_identity_source") or "import"),
         ))
-    required = ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
+    if provider == "zhipu":
+        entry = zhipu_provider.normalize_credential(entry)
+    required = () if provider == "zhipu" else ("uid", "access_token", "refresh_token") if provider == "workbuddy" else ("email", "access_token", "refresh_token")
     missing = [k for k in required if not entry.get(k)]
     if missing:
         raise ValueError(f"missing required fields: {missing}")
 
-    email = entry["email"]
+    email = entry.get("email", "")
     provider = _normalize_provider(entry.get("provider") or entry.get("type"))
     if provider not in _VALID_PROVIDERS:
         raise ValueError(f"unsupported provider: {entry.get('provider') or entry.get('type')!r}")
@@ -3663,11 +3684,11 @@ def _add_account_serialized(
     normalized = {
         "email": email,
         "provider": provider,
-        "access_token": entry["access_token"],
-        "refresh_token": entry["refresh_token"],
+        "access_token": entry.get("access_token", ""),
+        "refresh_token": entry.get("refresh_token", ""),
         "expired": entry.get("expired", ""),
         "last_refresh": entry.get("last_refresh", _format_utc(datetime.now(timezone.utc))),
-        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity", "workbuddy") else "claude"),
+        "type": entry.get("type", provider if provider in ("openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu") else "claude"),
         "enabled": entry.get("enabled", True),
         "disabled_reason": entry.get("disabled_reason"),
         "disabled_until": entry.get("disabled_until"),
@@ -3714,6 +3735,13 @@ def _add_account_serialized(
         normalized["models_etag_profile"] = str(
             entry.get("models_etag_profile") or ""
         )
+    elif provider == "zhipu":
+        for key in zhipu_provider.ACCOUNT_FIELDS:
+            if key in entry:
+                normalized[key] = copy.deepcopy(entry[key])
+        for key in ("email", "access_token", "refresh_token"):
+            if not normalized.get(key):
+                normalized.pop(key, None)
     elif provider == "workbuddy":
         for key in workbuddy_provider.ACCOUNT_FIELDS:
             if key in entry:
@@ -3818,7 +3846,7 @@ def _add_account_serialized(
     added = {"v": False}
     existing_target = None
     for a in active_config.get("oauthAccounts", []):
-        if provider in {"openai", "workbuddy"}:
+        if provider in {"openai", "workbuddy", "zhipu"}:
             if _acc_provider(a) == provider and _canonical_key(a) == normalized_key:
                 existing_target = a
                 break
@@ -3886,7 +3914,7 @@ def _add_account_serialized(
     def mutate(cfg):
         accounts = cfg.setdefault("oauthAccounts", [])
         target: dict | None = None
-        if provider in {"openai", "workbuddy"}:
+        if provider in {"openai", "workbuddy", "zhipu"}:
             for a in accounts:
                 if _acc_provider(a) != provider:
                     continue
@@ -3915,7 +3943,7 @@ def _add_account_serialized(
                     break
 
         if target is not None:
-            if provider not in ("openai", "xai", "cursor", "antigravity", "workbuddy"):
+            if provider not in ("openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu"):
                 raise ValueError(
                     f"account already exists: provider={provider} email={email}"
                 )
@@ -3947,7 +3975,7 @@ def _add_account_serialized(
             }
             keep_workbuddy = {key: copy.deepcopy(target.get(key)) for key in ("label", "workbuddy_auto_checkin") if key in target}
             target.update(normalized)
-            if provider == "workbuddy":
+            if provider in {"workbuddy", "zhipu"}:
                 target.update(keep_workbuddy)
             if keep_models is not None and not entry.get("models"):
                 target["models"] = keep_models
@@ -3956,7 +3984,7 @@ def _add_account_serialized(
                     target[key] = value
             if keep_max is not None and "maxConcurrent" not in entry:
                 target["maxConcurrent"] = keep_max
-            if provider in {"cursor", "workbuddy"} and keep_disabled_reason in {"user", "quota"}:
+            if provider in {"cursor", "workbuddy", "zhipu"} and keep_disabled_reason in {"user", "quota"}:
                 target["enabled"] = keep_enabled
                 target["disabled_reason"] = keep_disabled_reason
                 target["disabled_until"] = keep_disabled_until
@@ -4229,6 +4257,7 @@ def delete_invalid_accounts_batch_if_unchanged(
                 pass
             forget_openai_probe(account_key)
             workbuddy_runtime.forget(account_key)
+            zhipu_runtime.signing.forget(account_key)
             if account_key.startswith("cursor:"):
                 try:
                     from .cursor_bridge import runtime as cursor_bridge_runtime
@@ -4374,6 +4403,7 @@ def _delete_account_serialized(account_key: str) -> None:
             # OpenAI probe 节流桶（fetch_usage 统一路径后新增）
             forget_openai_probe(cleanup_key)
             workbuddy_runtime.forget(cleanup_key)
+            zhipu_runtime.signing.forget(cleanup_key)
             if cleanup_key.startswith("cursor:"):
                 try:
                     from .cursor_bridge import runtime as cursor_bridge_runtime
@@ -5024,9 +5054,10 @@ def account_model_selection(account_or_key: dict | str) -> dict:
     else:
         source = f"{provider}:awaiting-account-catalog"
     disabled = account_disabled_models(account)
+    route_available = provider != "zhipu" or zhipu_runtime.model_route_available(account)
     return {
         "models": models,
-        "effective_models": [model for model in models if model not in disabled],
+        "effective_models": [model for model in models if model not in disabled] if route_available else [],
         "disabled_models": disabled,
         "source": source,
         "synced_at": str(account.get("last_model_sync") or ""),
@@ -5165,6 +5196,7 @@ def _discovery_generation(account: dict) -> str:
         _canonical_key(account), provider,
         str(account.get("generationId") or ""),
         str(account.get("access_token") or ""),
+        str(account.get("model_key") or "") if provider == "zhipu" else "",
         str(account.get("project_id") or account.get("workspace_id") or ""),
         client_identity,
         json.dumps(_model_catalog_write_state(account), sort_keys=True, ensure_ascii=False),
@@ -5208,7 +5240,8 @@ async def _discover_account_models_once(account_key: str, *, timeout_s: float) -
         return {"action": "stale", "account_key": canonical}
     initial_generation = _discovery_generation(initial)
     try:
-        await ensure_valid_token(canonical)
+        if provider_of(initial) != "zhipu":
+            await ensure_valid_token(canonical)
     except asyncio.TimeoutError:
         _persist_model_discovery_failure(canonical, initial_generation, "timeout")
         return {"action": "timeout", "account_key": canonical}
@@ -5551,9 +5584,18 @@ def start_account_model_refresh(
 ) -> concurrent.futures.Future:
     """Start a non-cancelling worker suitable for a bounded foreground wait."""
     canonical = _resolve_existing_account_key_or_raise(account_key)
-    return _model_discovery_executor.submit(
-        lambda: asyncio.run(refresh_account_models(canonical, timeout_s=timeout_s))
-    )
+    async def refresh():
+        result = await refresh_account_models(canonical, timeout_s=timeout_s)
+        # Zhipu account onboarding must finish the same metadata stage as the
+        # model center's upstream-sync workflow, not stop after saving IDs.
+        if provider_of(canonical) == "zhipu" and result.get("action") in {"updated", "not_modified"}:
+            from . import model_pricing
+            try:
+                result["metadata_sync"] = await model_pricing.refresh_metadata_after_model_sync()
+            except Exception:
+                result["metadata_sync"] = {"status": "failed"}
+        return result
+    return _model_discovery_executor.submit(lambda: asyncio.run(refresh()))
 
 
 def refresh_cursor_models_sync(
@@ -5814,7 +5856,7 @@ async def oauth_model_sync_once(
     accounts = [copy.deepcopy(acc) for acc in list_accounts()]
     selected: list[tuple[str, dict]] = []
     for account in accounts:
-        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor", "workbuddy"}:
+        if provider_of(account) not in {"claude", "openai", "xai", "antigravity", "cursor", "workbuddy", "zhipu"}:
             continue
         key = _account_key(account)
         if requested is not None and key not in requested:
@@ -6256,6 +6298,9 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
     out: dict[str, str] = {}
     for acc in list_accounts()[:]:
         provider = provider_of(acc)
+        if provider == "zhipu":
+            out[_account_key(acc)] = "skipped:no_oauth_renewal"
+            continue
         email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider == "workbuddy" else "")
         if not email:
             continue
@@ -6265,7 +6310,7 @@ async def proactive_refresh_once(refresh_threshold_seconds: int = 600) -> dict:
             continue
         disp = (
             str(acc.get("label") or email)
-            if provider in {"cursor", "workbuddy"} else email
+            if provider in {"cursor", "workbuddy", "zhipu"} else email
         )
         if provider == "workbuddy":
             email = ak  # IDs, not nicknames, key the result map for this provider.
@@ -6387,7 +6432,7 @@ async def quota_monitor_once() -> dict:
 
     out: dict[str, str] = {}
     for acc in list_accounts()[:]:
-        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider_of(acc) == "workbuddy" else "")
+        email = acc.get("email") or (account_key_to_email(_account_key(acc)) if provider_of(acc) in {"workbuddy", "zhipu"} else "")
         if not email:
             continue
         ak = _account_key(acc)
@@ -6398,6 +6443,17 @@ async def quota_monitor_once() -> dict:
 
         reason_before = acc.get("disabled_reason")
         expected_state_key = account_state_key(acc)
+        if provider == "zhipu" and acc.get("credential_mode") == "oauth":
+            # Cards and automatic grants share the existing monitor. Neither
+            # failure may block quota recovery; consumption is never automatic.
+            try:
+                from .oauth.zhipu import actions as zhipu_actions
+                cards = await asyncio.to_thread(zhipu_runtime.fetch_reset_status, copy.deepcopy(acc), ak)
+                latest = copy.deepcopy(get_account(ak))
+                if latest and zhipu_runtime.c.fingerprint(latest) == zhipu_runtime.c.fingerprint(acc):
+                    await asyncio.to_thread(zhipu_actions.auto_claim, ak, latest, cards)
+            except Exception as exc:
+                print(f"[oauth] zhipu card maintenance failed: type={type(exc).__name__}")
         try:
             usage = await fetch_usage_snapshot(ak)
         except Exception as exc:

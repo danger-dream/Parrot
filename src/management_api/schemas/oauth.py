@@ -88,6 +88,7 @@ class OAuthAccountDetailData(StrictSchema):
     credentialConfigured: bool
     lastModelSync: datetime | None = None
     workbuddy: dict | None = None
+    zhipu: dict | None = None
 
 
 # WorkBuddy credentials are acquired only through its browser login flow.
@@ -118,7 +119,8 @@ class ManualOAuthCredential(StrictSchema):
 
 class JsonOAuthCredential(StrictSchema):
     kind: Literal["json"]
-    provider: ImportedOAuthProvider
+    provider: Literal[OAuthProvider.CLAUDE, OAuthProvider.OPENAI, OAuthProvider.XAI,
+                      OAuthProvider.CURSOR, OAuthProvider.ANTIGRAVITY, OAuthProvider.ZHIPU]
     payload: SecretStr = Field(min_length=2, max_length=200_000, json_schema_extra={"writeOnly": True})
 
 
@@ -174,9 +176,14 @@ class StartOAuthLoginFlowRequest(StrictSchema):
     provider: OAuthProvider
     realm: Literal["cn", "global"] | None = None
     clientProfile: Literal["cli", "ide"] | None = None
+    site: Literal["bigmodel", "zai"] | None = None
 
     @model_validator(mode="after")
     def validate_provider_fields(self):
+        if self.provider is OAuthProvider.ZHIPU and self.site is None:
+            raise ValueError("Zhipu site is required")
+        if self.provider is not OAuthProvider.ZHIPU and self.site is not None:
+            raise ValueError("site is Zhipu-only")
         if self.provider is not OAuthProvider.WORKBUDDY and (self.realm is not None or self.clientProfile is not None):
             raise ValueError("realm/clientProfile are WorkBuddy-only login options")
         return self
@@ -197,7 +204,7 @@ class PollOAuthLoginFlowRequest(StrictSchema):
 
 class OAuthLoginPollData(StrictSchema):
     flowId: str
-    status: Literal["pending", "identity_pending", "ready", "completed", "cancelled", "expired"]
+    status: Literal["pending", "identity_pending", "select_project", "ready", "completed", "cancelled", "expired", "failed"]
     expiresAt: datetime
     accountPreview: dict | None = None
     accountId: str | None = None
@@ -224,7 +231,7 @@ _MAX_IMPORT_DECODED_PAYLOAD_BYTES = 1_500_000
 
 
 class PreviewOAuthImportRequest(StrictSchema):
-    format: Literal["openai", "cpa", "sub2api"]
+    format: Literal["openai", "cpa", "sub2api", "zhipu"]
     payloadEncoding: Literal["json", "base64"] = "json"
     payload: SecretStr = Field(
         min_length=1,

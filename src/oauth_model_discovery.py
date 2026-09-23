@@ -518,6 +518,13 @@ def discover_workbuddy(account: dict, *, timeout: float = _TIMEOUT, proxy_channe
     return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:workbuddy", profile_id="cli")
 
 
+def discover_zhipu(account: dict, *, timeout: float = _TIMEOUT, proxy_channel: str = "") -> DiscoveryResult:
+    from .oauth.zhipu.catalog import fetch_models
+    records = fetch_models(account, account_key=proxy_channel.removeprefix("oauth:"), timeout=timeout)
+    from .oauth.zhipu.common import VERSION
+    return DiscoveryResult([item["id"] for item in records], _catalog(records), "upstream:zhipu", client_version=VERSION)
+
+
 ADAPTERS: dict[str, Callable[..., DiscoveryResult]] = {
     "openai": discover_openai,
     "claude": discover_claude,
@@ -525,6 +532,7 @@ ADAPTERS: dict[str, Callable[..., DiscoveryResult]] = {
     "antigravity": discover_antigravity,
     "cursor": discover_cursor,
     "workbuddy": discover_workbuddy,
+    "zhipu": discover_zhipu,
 }
 
 

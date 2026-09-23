@@ -24,6 +24,7 @@ from .models import (
 )
 from .plans import OneShotPlanStore
 from .workbuddy_flows import WorkBuddyFlows
+from .zhipu_flows import ZhipuFlows
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,7 @@ class OAuthFlowService:
         self.backend = backend
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.workbuddy = WorkBuddyFlows(backend, clock=self._clock)
+        self.zhipu = ZhipuFlows(backend, clock=self._clock)
         self._flows = flow_store or OneShotPlanStore(
             prefix="oflow", ttl_seconds=1800, clock=self._clock,
         )
@@ -312,6 +314,16 @@ class OAuthFlowService:
         return self.antigravity_entry(token, now=now)
 
     def credential_entry(self, credential: OAuthCredential) -> dict:
+        if credential.provider is OAuthProvider.ZHIPU:
+            if not isinstance(credential, JsonCredential):
+                raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
+            try:
+                value = json.loads(credential.payload)
+                if not isinstance(value, dict):
+                    raise ValueError()
+                return self.backend.zhipu_prepare_credential(value)
+            except (ValueError, TypeError):
+                raise ManagementError(ManagementErrorCode.VALIDATION_FAILED) from None
         if credential.provider is OAuthProvider.WORKBUDDY:
             raise ManagementError(ManagementErrorCode.UNSUPPORTED_VALUE)
         now = self._now()

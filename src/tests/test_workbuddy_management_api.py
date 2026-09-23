@@ -233,6 +233,6 @@ def test_schema_advertises_workbuddy_browser_login_not_import():
         RefreshTokenOAuthCredential, PreviewOAuthImportRequest, StartOAuthLoginFlowRequest)
     for schema in (ManualOAuthCredential, JsonOAuthCredential, RefreshTokenOAuthCredential):
         assert "workbuddy" not in schema.model_json_schema()["properties"]["provider"]["enum"]
-    assert PreviewOAuthImportRequest.model_json_schema()["properties"]["format"]["enum"] == ["openai", "cpa", "sub2api"]
+    assert PreviewOAuthImportRequest.model_json_schema()["properties"]["format"]["enum"] == ["openai", "cpa", "sub2api", "zhipu"]
     for realm in ("cn", "global"):
         assert StartOAuthLoginFlowRequest(provider="workbuddy", realm=realm).provider.value == "workbuddy"

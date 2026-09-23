@@ -21,7 +21,8 @@ managementKey managementToken management_key management_token passwd password
 refresh-token refreshToken refresh_token secret session sessionSecret sessionToken
 session_secret session_token token upstreamSecret upstream_secret webhookCredential
 webhookKey webhookSecret webhookToken webhook_credential webhook_key webhook_secret
-webhook_token x-api-key xApiKey x_api_key
+webhook_token x-api-key xApiKey x_api_key model_key modelKey zcode_token zcodeToken
+poll_token pollToken privateCipher secretKey X-Bigmodel-Authorization
 """.split())
 # HTTP header names are the sole case-insensitive names in the vocabulary.
 _HEADER_FIELDS = frozenset("""

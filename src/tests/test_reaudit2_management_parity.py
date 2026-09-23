@@ -462,9 +462,9 @@ def test_p05_openapi_keeps_counts_ids_and_uses_the_seven_camelcase_templates():
     # Search contributes six paths/eight operations; retired AG media removes
     # three paths/five operations; independent media adds three paths/four operations.
     # All seven pre-existing templates below stay exact.
-    assert len(management_paths) == 175
-    assert len(operations) == 237
-    assert len(set(operation_ids)) == 237
+    assert len(management_paths) == 181  # Includes saved-account project selection.
+    assert len(operations) == 243
+    assert len(set(operation_ids)) == 243
     assert set(operation_ids) == expected_ids
     assert sum(len(ids) for ids in expected.values()) == 14
     for path, ids in expected.items():

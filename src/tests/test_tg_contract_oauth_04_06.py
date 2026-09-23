@@ -440,7 +440,7 @@ def test_oauth_04_06_strict_trace(case, monkeypatch):
     expected = case
     if case["caseId"] in {"TG-OA-04.add_menu_cancel", "TG-OA-06.import_cancel"}:
         # The v0.31.13 recording stays immutable. This explicitly approved
-        # feature delta adds exactly two WorkBuddy entry rows, without masking
+        # feature delta adds two WorkBuddy rows and one Zhipu row, without masking
         # any actual output, state changes, existing labels, or old row order.
         from copy import deepcopy
         expected = deepcopy(case)
@@ -452,6 +452,7 @@ def test_oauth_04_06_strict_trace(case, monkeypatch):
         rows[-2:-2] = [
             [{"text": "WorkBuddy 中国区登录", "callback_data": "oa:wb:login", "icon_custom_emoji_id": "6120617435214132136"}],
             [{"text": "WorkBuddy 国际区登录", "callback_data": "oa:wb:login:global", "icon_custom_emoji_id": "6120617435214132136"}],
+            [{"text": "智谱 / Z.ai（Key / OAuth）", "callback_data": "oa:zh:add", "icon_custom_emoji_id": "6140727700454645813"}],
         ]
     check_trace(expected, observed)
 

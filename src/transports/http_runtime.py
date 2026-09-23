@@ -1760,10 +1760,16 @@ async def open_response_with_proxy_chain(
                     } if fingerprint_route else {}),
                 },
             )
-            ctx = (
-                _SharedStreamContext(stream_request)
-                if client is None else open_stream(client, stream_request)
-            )
+            hook = getattr(upstream_req, "stream_context_hook", None)
+            if hook is None:
+                ctx = (
+                    _SharedStreamContext(stream_request)
+                    if client is None else open_stream(client, stream_request)
+                )
+            else:
+                def physical_context(request):
+                    return _SharedStreamContext(request) if client is None else open_stream(client, request)
+                ctx = hook(stream_request, physical_context)
             owner.ctx = ctx
         except upstream.ClientUnavailableError:
             # Keep a local client construction failure outside channel scoring

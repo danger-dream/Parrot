@@ -134,6 +134,9 @@ def account_identity(acc: dict) -> str:
         return cursor_composite_identity(acc)
     if provider == "antigravity":
         return antigravity_composite_identity(acc)
+    if provider == "zhipu":
+        from .oauth.zhipu import identity
+        return identity(acc)
     if provider == "workbuddy":
         from .oauth.workbuddy import identity
         return identity(acc)
@@ -209,5 +212,5 @@ def is_account_key(value: Any) -> bool:
         return False
     prov = value.split(":", 1)[0]
     return _normalize_provider(prov) == prov and prov in (
-        "claude", "openai", "xai", "cursor", "antigravity", "workbuddy",
+        "claude", "openai", "xai", "cursor", "antigravity", "workbuddy", "zhipu",
     )

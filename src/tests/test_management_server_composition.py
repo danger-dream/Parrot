@@ -71,8 +71,8 @@ def test_management_routes_are_cloned_directly_into_the_application(monkeypatch)
         for method, operation in path_item.items()
         if method in {"get", "post", "delete", "put", "patch"}
     ]
-    assert len(operations) == 237
-    assert len({(method, path) for method, path, _operation in operations}) == 237
+    assert len(operations) == 243
+    assert len({(method, path) for method, path, _operation in operations}) == 243
     assert {operation for _method, _path, operation in operations} == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()
@@ -91,10 +91,10 @@ def test_server_mounts_all_domain_routers_and_preserves_lifecycle_order():
     ]
     operation_ids = [operation_id for _method, _path, operation_id in operations]
     method_paths = [(method, path) for method, path, _operation_id in operations]
-    assert len(operations) == 237
-    assert len(set(operation_ids)) == 237
-    assert len(set(method_paths)) == 237
-    assert len({path for _method, path in method_paths}) == 175  # OAuth default-models retirement removes two paths
+    assert len(operations) == 243
+    assert len(set(operation_ids)) == 243
+    assert len(set(method_paths)) == 243
+    assert len({path for _method, path in method_paths}) == 181  # Includes the saved-account Zhipu project selection path
     assert set(operation_ids) == EXPECTED_OPERATIONS
 
     source = Path("server.py").read_text()

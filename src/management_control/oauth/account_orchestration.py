@@ -252,10 +252,12 @@ class OAuthAccountOrchestrationControlMixin:
         frozen handlers where the credential save remains committed and the UI
         reports that model/usage refresh can be retried later.
         """
-        effects = self._start_post_save_model_sync(account_id)
-        effects.update(usage=None, usage_error=None, quota_action=None)
-
         provider = self.backend.provider_of(entry)
+        if provider == "zhipu":
+            return self._post_save_zhipu_effects(account_id, entry, usage=usage)
+        effects = self._start_post_save_model_sync(account_id)
+        effects.update(usage=None, usage_error=None, quota_action=None, enrichment_error=None)
+
         if provider not in {"openai", "cursor", "workbuddy"}:
             return effects
         try:

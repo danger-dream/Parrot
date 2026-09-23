@@ -798,6 +798,9 @@ def _source_options(chat_id: int) -> list[menu._SourceOption]:
         account_id = str(account.account_id)
         if provider == "workbuddy":
             display_name = menu._workbuddy_source_name(account, account_id)
+        elif provider == "zhipu":
+            from .zhipu_oauth_menu import account_display
+            display_name = account_display(menu._CONTROL.oauth.account_snapshot(account_id) or {})
         else:
             if not display_name or display_name == account_id:
                 display_name = identity or "未命名账户"

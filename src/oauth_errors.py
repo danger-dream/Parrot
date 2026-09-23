@@ -161,6 +161,46 @@ def describe_oauth_error(
                 provider=prov, operation=op, technical=technical,
             )
 
+    if prov == "zhipu":
+        from .oauth.zhipu.common import ZhipuError
+        if isinstance(exc, ZhipuError):
+            guidance = {
+                "project_required": ("登录已保存，初始化未完成", "尚未取得模型 Key 所属项目。", "点击「重试初始化」继续，无需重新登录。"),
+                "personal_project_missing": ("登录已保存，未找到个人项目", "此账号没有可用的个人项目。", "如果使用团队套餐，请选择对应团队项目。"),
+                "creation_confirmation_required": ("登录已保存，待配置模型 Key", "所选项目没有名为 zcode-api-key 的已有 Key。", "点击「重试初始化」自动取得专用模型 Key；此前结果不明时只核对，不重复创建。"),
+                "network": ("智谱请求暂时失败", "本次网络请求未完成，已保存的登录和 Key 不受影响。", "稍后重试，或检查该账号的代理/网络连接。"),
+                "timeout": ("智谱请求超时", "上游接口未及时返回，已保存的登录和 Key 不受影响。", "稍后重试，或检查该账号的代理/网络连接。"),
+                "save_failed": ("模型 Key 保存未完成", "已有 Key 的读取或本地保存未完成。", "继续读取并保存已有 Key，不要重复创建。"),
+            }
+            title, reason, action = guidance.get(exc.kind, (
+                "智谱请求未完成", "上游未返回可用结果，已保存的账户不受影响。", "稍后重试；不要重复创建 Key 或消费重置卡。"))
+            if exc.kind == "timeout":
+                phase = {"connect": "连接建立超时", "read": "等待响应/读取超时", "write": "请求发送超时",
+                         "pool": "等待可用连接超时", "total": "查询总时限已耗尽（180 秒）"}.get(exc.timeout_phase)
+                if phase:
+                    title, reason = "智谱" + phase, phase + "；已保存的登录和 Key 不受影响。"
+            if exc.network_phase == "tls" and exc.kind in {"network", "timeout"}:
+                title, reason = "智谱 TLS 握手失败", "TCP 已连接，但 TLS 握手未完成。"
+            if exc.request_not_sent:
+                reason += " 本次 HTTP 请求尚未发送。"
+            if exc.code is not None:
+                reason += f" 业务码 {exc.code}。"
+            if exc.target_host:
+                reason += " 目标：" + exc.target_host + "。"
+            if exc.proxy_route and exc.proxy_route != "unobserved":
+                reason += " 实际出口：" + exc.proxy_route + ("（已回退）" if exc.fallback_used else "") + "。"
+            if exc.auth_error:
+                title, reason, action = ("智谱鉴权未通过", "上游拒绝了本次请求所用的凭据。", "核对模型 Key 或管理登录凭据；配置缺失与登录过期是不同问题。")
+            stage_label = {"project_lookup": "组织/项目查询", "projects": "组织/项目查询", "subscription": "订阅查询", "key_list": "已有 Key 查询",
+                           "key_copy": "模型 Key 读取", "key_create": "模型 Key 创建", "key_save": "模型 Key 保存",
+                           "reset_status": "重置卡查询", "reset_use": "使用重置卡", "reset_opportunity": "领取重置卡",
+                           "quota": "额度查询", "mcp": "MCP 用量查询", "profile": "账户资料查询"}.get(exc.stage)
+            if stage_label:
+                reason = stage_label + "：" + reason
+            return OAuthDisplayError(code=f"zhipu_{exc.kind}", title=title, reason=reason, action=action,
+                retryable=exc.retryable, auth_error=exc.auth_error, status=exc.status_code or None,
+                provider=prov, operation=op, technical=technical)
+
     # Non-HTTP transport failures first.
     if isinstance(exc, httpx.TimeoutException) or (isinstance(exc, str) and "timeout" in exc.lower()):
         return OAuthDisplayError(

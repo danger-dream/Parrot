@@ -63,7 +63,7 @@ _PROVIDER_CUSTOM_EMOJI = {
     "openrouter": "6140767025175209650",
 }
 _PROVIDER_CUSTOM_FALLBACK = {"claude": "🤖", "anthropic": "🤖", "openai": "🤖", "xai": "🐦", "cursor": "🖱️", "antigravity": "✨"}
-_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy"}
+_PROVIDER_LABEL = {"claude": "Claude", "anthropic": "Claude", "openai": "OpenAI", "xai": "Grok", "cursor": "Cursor", "antigravity": "Antigravity", "workbuddy": "WorkBuddy", "zhipu": "智谱 / Z.ai"}
 
 
 def _provider_key(provider: str | None) -> str:
