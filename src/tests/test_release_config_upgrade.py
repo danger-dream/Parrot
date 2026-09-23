@@ -180,10 +180,22 @@ def upgraded(released_config, tmp_path, monkeypatch):
 
 def test_release_first_load_preserves_keys_accounts_channels_and_is_idempotent(upgraded):
     raw, loaded, path = upgraded
-    for field in ('apiKeys', 'oauthAccounts', 'channels', 'modelMapping', 'modelBindings',
+    for field in ('apiKeys', 'channels', 'modelMapping', 'modelBindings',
                   'modelMetadata', 'compressionModel', 'images', 'anysearch', 'pricing',
                   'management', 'ingressDefaultModel'):
         assert loaded[field] == raw[field], field
+    # Automatic release upgrades change only the protocol-profile marker inside
+    # the account identity. Installation UUID, credentials and account settings
+    # remain byte-for-byte equivalent to the released configuration.
+    from src.openai.codex_constants import current_codex_protocol_profile
+    profile = current_codex_protocol_profile()
+    expected_accounts = copy.deepcopy(raw['oauthAccounts'])
+    for account in expected_accounts:
+        if account.get('provider') == 'openai':
+            account['codexIdentity']['protocolProfile'] = profile.profile_id
+    assert loaded['oauthAccounts'] == expected_accounts
+    assert loaded['openaiOAuth']['codexProtocolProfile'] == profile.profile_id
+    assert loaded['openaiOAuth']['codexCliVersion'] == profile.client_version
     assert auth.validate({'authorization': 'Bearer fixture-restricted'}) == (
         'restricted', ['client-alias', 'grok-imagine-custom'], None)
     assert auth.validate({'x-api-key': 'fixture-string'}) == ('string-key', [], None)
