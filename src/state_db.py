@@ -762,6 +762,9 @@ def quota_patch_claude_reset_status(account_key: str, blocks: dict, *, expected_
         for name in ("cedar_ember", "juniper_tide"):
             if name in blocks:
                 raw[name] = blocks[name]
+        if isinstance(blocks.get("claude_reset_queries"), dict):
+            previous = raw.get("claude_reset_queries")
+            raw["claude_reset_queries"] = {**(previous if isinstance(previous, dict) else {}), **blocks["claude_reset_queries"]}
         row["raw_data"] = json.dumps(raw, ensure_ascii=False)
         data[target] = row
     _quota_write(account_key, op, expected_state_key=expected_state_key)

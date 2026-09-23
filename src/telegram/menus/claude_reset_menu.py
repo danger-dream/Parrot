@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from .. import ui
+from .. import error_reporting, ui
 from ...management_control.oauth.menu_bridge import control, telegram_context
 
 
@@ -11,12 +11,27 @@ def _esc(value):
     return ui.escape_html(str(value if value is not None else "未知"))
 
 
+def _missing_status(usage, program):
+    observation = ((usage.get("claude_reset_queries") or {}).get(program) or {}) if isinstance(usage, dict) else {}
+    state = observation.get("state")
+    if state == "not_provided":
+        return "已查询，官方未返回此功能状态（不等于 0 张或无资格）"
+    if state == "invalid_response":
+        return "官方返回格式无法识别，请刷新官方重置状态"
+    if state == "error":
+        code = observation.get("http_status")
+        reason = "认证或权限被拒绝" if code in (401, 403) else "请求限流" if code == 429 else "请求失败"
+        suffix = f"，HTTP {code}" if code else "，请检查网络后重试"
+        return f"查询失败：{reason}{suffix}"
+    return "尚未查询，请点击“官方额度重置/状态”或刷新额度"
+
+
 def block(usage):
     cedar = usage.get("cedar_ember") if isinstance(usage, dict) else None
     juniper = usage.get("juniper_tide") if isinstance(usage, dict) else None
     lines = ["♻️ <b>Claude 官方额度重置</b>"]
     if not isinstance(cedar, dict):
-        lines.append("周额度重置卡：状态未知（刷新官方重置状态查询）")
+        lines.append("周额度重置卡：" + _missing_status(usage, "cedar_ember"))
     else:
         grants = [g for g in cedar.get("grants", []) if isinstance(g, dict)]
         lines.append(f"周额度重置卡：{len(grants)} 张 · eligible=<code>{_esc(cedar.get('eligible'))}</code>")
@@ -30,7 +45,7 @@ def block(usage):
                          f"  {'须撞限才能用' if grant.get('use_requires_limit', True) else '随时可用模式'}；窗口用量(%)：{_esc(grant.get('percent_used') or '—')}")
         lines.append(f"冷却至：{_esc(cedar.get('cooldown_until') or '无')} · 周重置日不变：{_esc(cedar.get('weekly_resets_at'))}")
     if not isinstance(juniper, dict):
-        lines.append("5h重置：状态未知")
+        lines.append("5h重置：" + _missing_status(usage, "juniper_tide"))
     else:
         lines.append(f"5h重置：可用={_esc(juniper.get('available'))} · eligible={_esc(juniper.get('eligible'))} · 组={_esc(juniper.get('arm'))}\n"
                      f"每周 {_esc(juniper.get('resets_per_week', 1))} 次，<b>消耗周额度份额</b>；原因：{_esc(juniper.get('ineligible_reason') or '—')}\n"
@@ -60,18 +75,21 @@ def ask(chat_id, message_id, cb_id, short, page=1, filter_key="all"):
         return
     ui.answer_cb(cb_id, "读取官方重置状态（不消耗）")
     rows, status, reasons = [], {}, []
-    try:
-        for program, label in (("cedar_ember", "周额度重置卡"), ("juniper_tide", "5h重置（消耗周额度）")):
+    for program, label in (("cedar_ember", "周额度重置卡"), ("juniper_tide", "5h重置（消耗周额度）")):
+        try:
             plan = control.plan_claude_reset(telegram_context(chat_id), account_id, program)
-            status.update(plan.get("status") or {})
+            observation = dict(plan.get("status") or {})
+            queries = observation.pop("claude_reset_queries", {})
+            status.update(observation)
+            status.setdefault("claude_reset_queries", {}).update(queries)
             if plan.get("available"):
                 payload = _payload(account_id, plan["plan_token"], page, filter_key)
                 rows.append([ui.btn(f"我已理解：{label}，进入最终确认", f"oa:claude_reset_confirm:{payload}")])
             else:
                 reasons.append(f"{label}不可执行：{_esc(plan.get('reason'))}")
-    except Exception:
-        ui.send(chat_id, "⚠️ Claude 官方重置状态读取失败，未发送消费请求。请刷新后重试。")
-        return
+        except Exception as exc:
+            status.setdefault("claude_reset_queries", {})[program] = {"state": "error"}
+            reasons.append(error_reporting.report(exc, operation="Claude " + label + "查询") + "\n未发送消费请求。")
     cancel = menu._callback_payload(ui.register_code(account_id), page, filter_key)
     rows.append([ui.btn("🔄 刷新官方重置状态", f"oa:claude_reset_ask:{cancel}")])
     rows.append([ui.btn("❌ 取消，返回账号", f"oa:view:{cancel}")])

@@ -117,9 +117,51 @@ def _get_status_sync(token, account_key, program):
     )
     response.raise_for_status()
     value = response.json()
-    if not isinstance(value, dict) or not any(key in value for key in PROGRAMS):
-        raise ValueError("reset_status_unavailable")
+    if not isinstance(value, dict):
+        raise ValueError("reset_status_invalid_response")
     return value
+
+
+def _observed_blocks(value, program):
+    names = [name for name in PROGRAMS if name == program or isinstance(value.get(name), dict)]
+    blocks = {name: copy.deepcopy(value.get(name)) if isinstance(value.get(name), dict) else None for name in names}
+    blocks["claude_reset_queries"] = {name: {
+        "state": "known" if isinstance(value.get(name), dict) else "not_provided" if value.get(name) is None else "invalid_response",
+        "fetched_at": int(time.time() * 1000),
+    } for name in names}
+    return blocks
+
+
+async def enrich_usage(token, account_key, usage, *, expected):
+    """Read missing opt-in blocks without replacing spend/window evidence.
+
+    Ordinary /usage usually omits both blocks. Fetch them independently; a
+    failure must not discard usable quota or pretend the account has zero cards.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    result = copy.deepcopy(usage)
+    missing = [name for name in PROGRAMS if not isinstance(result.get(name), dict)]
+    if not missing:
+        return result
+
+    async def fetch(program):
+        try:
+            value = await asyncio.to_thread(_get_status_sync, token, account_key, program)
+            return _observed_blocks(value, program)
+        except Exception as exc:
+            status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            print(f"[claude-reset] query failed: program={program} type={type(exc).__name__} http={status_code}")
+            return {"claude_reset_queries": {program: {"state": "error", "http_status": status_code,
+                "error_type": type(exc).__name__, "fetched_at": int(time.time() * 1000)}}}
+
+    for blocks in await asyncio.gather(*(fetch(program) for program in missing)):
+        observations = blocks.pop("claude_reset_queries")
+        # Do not let one endpoint's absent secondary block erase the other one.
+        result.update(blocks)
+        result.setdefault("claude_reset_queries", {}).update(observations)
+    _current(account_key, expected)
+    return result
 
 
 async def status(account_key: str, program: str = "cedar_ember", *, expected=None) -> dict:
@@ -167,7 +209,7 @@ async def status(account_key: str, program: str = "cedar_ember", *, expected=Non
         token = await manager.force_refresh(key, expected_state_key=expected)
         value = await asyncio.to_thread(_get_status_sync, token, key, program)
     key, account = _current(key, expected)
-    blocks = {name: copy.deepcopy(value[name]) for name in PROGRAMS if name in value}
+    blocks = _observed_blocks(value, program)
     # Do NOT flatten this skip_spend response or overwrite fresh window evidence.
     state_db.quota_patch_claude_reset_status(key, blocks, expected_state_key=expected)
     return {**blocks, "organization_uuid": account.get("claude_organization_uuid") or "",

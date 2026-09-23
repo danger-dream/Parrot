@@ -29,12 +29,15 @@ def response(url, status, data):
 @pytest.mark.parametrize("second_status", [200, 401])
 async def test_usage_401_refreshes_persists_and_retries_once(account, monkeypatch, second_status):
     key, _ = account
-    gets, posts = [], []
+    gets, posts, reset_gets = [], [], []
     fresh = {"five_hour": {"utilization": 1.0, "resets_at": None}}
 
     def get(url, **kwargs):
         if url == oauth.OAUTH_PROFILE_URL:
             return response(url, 200, {"organization": {"organization_type": "claude_pro"}})
+        if url in {oauth.OAUTH_USAGE_URL + "?cedar_ember=1&skip_spend=1", oauth.OAUTH_USAGE_URL + "?at_wall=1&skip_spend=1"}:
+            reset_gets.append(kwargs)
+            return response(url, 200, {})
         assert url == oauth.OAUTH_USAGE_URL
         gets.append(kwargs)
         return response(url, 401 if len(gets) == 1 else second_status, fresh)
@@ -48,12 +51,17 @@ async def test_usage_401_refreshes_persists_and_retries_once(account, monkeypatc
     monkeypatch.setattr(oauth.network, "get_sync", get)
     monkeypatch.setattr(oauth.network, "post_sync", post)
     if second_status == 200:
-        assert await oauth.fetch_usage_snapshot(key) == fresh
+        observed = await oauth.fetch_usage_snapshot(key)
+        assert observed["five_hour"] == fresh["five_hour"]
+        assert all(row["state"] == "not_provided" for row in observed["claude_reset_queries"].values())
+        assert [call["headers"]["Authorization"] for call in reset_gets] == ["Bearer fake-new-at"] * 2
     else:
         with pytest.raises(httpx.HTTPStatusError):
             await oauth.fetch_usage_snapshot(key)
     assert [call["headers"]["Authorization"] for call in gets] == ["Bearer fake-old-at", "Bearer fake-new-at"]
     assert len(posts) == 1
+    if second_status == 401:
+        assert reset_gets == []
     saved = oauth.get_account(key)
     assert saved["access_token"] == "fake-new-at"
     assert saved["refresh_token"] == "fake-new-rt"
@@ -78,8 +86,11 @@ async def test_usage_non_401_does_not_rotate_credentials(account, monkeypatch, s
 @pytest.mark.asyncio
 async def test_usage_reuses_concurrently_rotated_token(account, monkeypatch):
     key, _ = account
-    calls = []
+    calls, reset_calls = [], []
     def get(url, **kwargs):
+        if "?" in url:
+            reset_calls.append(kwargs["headers"]["Authorization"])
+            return response(url, 200, {})
         calls.append(kwargs["headers"]["Authorization"])
         if len(calls) == 1:
             oauth._save_token_fields(key, {"access_token": "fake-concurrent-at"})
@@ -91,6 +102,7 @@ async def test_usage_reuses_concurrently_rotated_token(account, monkeypatch):
     monkeypatch.setattr(oauth, "force_refresh", unexpected)
     assert (await oauth.fetch_usage(key))["five_hour"]["utilization"] == 2
     assert calls == ["Bearer fake-old-at", "Bearer fake-concurrent-at"]
+    assert reset_calls == ["Bearer fake-concurrent-at"] * 2
 
 
 @pytest.mark.asyncio

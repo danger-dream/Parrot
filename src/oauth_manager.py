@@ -1135,7 +1135,7 @@ async def _fetch_claude_usage(account_key: str) -> dict:
     expected = account_state_key(account)
     access_token = await ensure_valid_token(account_key, expected_state_key=expected)
     try:
-        return await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+        usage = await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 401:
             raise
@@ -1156,7 +1156,9 @@ async def _fetch_claude_usage(account_key: str) -> dict:
         with account_generation_guard(expected) as current:
             if not current:
                 raise
-        return await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+        usage = await asyncio.to_thread(_usage_sync, access_token, account_key=account_key)
+    from .oauth import claude_reset
+    return await claude_reset.enrich_usage(access_token, account_key, usage, expected=expected)
 
 
 async def fetch_profile(access_token: str) -> dict:
