@@ -19,6 +19,8 @@ def _factory(handler):
     transport = httpx.MockTransport(handler)
     def make(**kwargs):
         kwargs.pop("proxy_purpose", None)
+        kwargs.pop("proxy_provider", None)
+        kwargs.pop("proxy_channel", None)
         return httpx.AsyncClient(transport=transport, **kwargs)
     return make
 

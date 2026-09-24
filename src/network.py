@@ -614,7 +614,8 @@ def active_socks5_url() -> Optional[str]:
     return normalize_socks5_url(raw).url
 
 
-def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, proxy_model: str):
+def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, proxy_model: str,
+                                    proxy_provider: str = ""):
     """Return an explicit new-proxy chain, or ``None`` for the legacy/default path.
 
     A configured non-direct rule must never disappear into a direct/legacy client
@@ -635,6 +636,7 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
 
         source_chain = pm.resolve_proxy_chain(
             channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose,
+            provider=proxy_provider,
         )
         chain = []
         for name in source_chain:
@@ -668,12 +670,13 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
 
 def open_sync_stream(host: str, port: int, *, timeout: float,
                      proxy_purpose: str = "", proxy_channel: str = "",
-                     proxy_model: str = ""):
+                     proxy_model: str = "", proxy_provider: str = ""):
     """Open a routed synchronous byte stream, failing closed for configured routes."""
     chain = _configured_proxy_chain_or_none(
         proxy_purpose=proxy_purpose,
         proxy_channel=proxy_channel,
         proxy_model=proxy_model,
+        proxy_provider=proxy_provider,
     )
     if chain is None:
         proxy = active_socks5_url()
@@ -831,18 +834,20 @@ def async_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                  proxy_purpose: str = "",
                  proxy_channel: str = "",
                  proxy_model: str = "",
+                 proxy_provider: str = "",
                  byte_counter=None,
                  **kwargs) -> httpx.AsyncClient:
     """Create an async HTTP client, optionally routing through a proxy.
 
     If the new proxy subsystem is configured, ``proxy_purpose`` /
-    ``proxy_channel`` / ``proxy_model`` are used to resolve a proxy via
+    ``proxy_channel`` / ``proxy_model`` / ``proxy_provider`` resolve a proxy via
     ``proxy.manager``.  Falls back to legacy ``socks5`` config.
     """
     chain = _configured_proxy_chain_or_none(
         proxy_purpose=proxy_purpose,
         proxy_channel=proxy_channel,
         proxy_model=proxy_model,
+        proxy_provider=proxy_provider,
     )
     if chain is not None:
         from .proxy.connector import ProxyConnectError
@@ -884,6 +889,7 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
                 proxy_purpose: str = "",
                 proxy_channel: str = "",
                 proxy_model: str = "",
+                proxy_provider: str = "",
                 **kwargs) -> httpx.Client:
     """Create a sync HTTP client through direct, SOCKS5, or SS2022 routes."""
     opts = dict(kwargs)
@@ -897,6 +903,7 @@ def sync_client(*, timeout: Any = None, limits: httpx.Limits | None = None,
         proxy_purpose=proxy_purpose,
         proxy_channel=proxy_channel,
         proxy_model=proxy_model,
+        proxy_provider=proxy_provider,
     )
     if chain is not None:
         from .proxy.connector import ProxyConnectError
@@ -940,8 +947,10 @@ def get_sync(url: str, **kwargs) -> httpx.Response:
     proxy_purpose = kwargs.pop("proxy_purpose", "")
     proxy_channel = kwargs.pop("proxy_channel", "")
     proxy_model = kwargs.pop("proxy_model", "")
+    proxy_provider = kwargs.pop("proxy_provider", "")
     with sync_client(timeout=timeout, proxy_purpose=proxy_purpose,
-                     proxy_channel=proxy_channel, proxy_model=proxy_model) as client:
+                     proxy_channel=proxy_channel, proxy_model=proxy_model,
+                     proxy_provider=proxy_provider) as client:
         return client.get(url, **kwargs)
 
 
@@ -950,8 +959,10 @@ def post_sync(url: str, **kwargs) -> httpx.Response:
     proxy_purpose = kwargs.pop("proxy_purpose", "")
     proxy_channel = kwargs.pop("proxy_channel", "")
     proxy_model = kwargs.pop("proxy_model", "")
+    proxy_provider = kwargs.pop("proxy_provider", "")
     with sync_client(timeout=timeout, proxy_purpose=proxy_purpose,
-                     proxy_channel=proxy_channel, proxy_model=proxy_model) as client:
+                     proxy_channel=proxy_channel, proxy_model=proxy_model,
+                     proxy_provider=proxy_provider) as client:
         return client.post(url, **kwargs)
 
 

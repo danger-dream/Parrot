@@ -445,7 +445,8 @@ def _core_check(name: str, timeout: float) -> CheckResult:
     try:
         host, port = _parse_host_port(url)
         latency = _routed_tcp_connect(
-            host, port, timeout, purpose="core_monitor",
+            host, port, timeout,
+            purpose=f"core_{name}" if name in ("openai", "claude") else "core_monitor",
         )
         return CheckResult(f"core:{name}", label, "core", True, f"{host}:{port}", latency)
     except Exception as exc:

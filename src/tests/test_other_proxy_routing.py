@@ -229,7 +229,7 @@ def test_channel_and_core_monitor_use_routed_stream(monkeypatch):
     assert network_monitor._core_check("openai", 1).ok
     assert calls[0][2]["proxy_channel"] == "channel-key"
     assert calls[0][2]["proxy_purpose"] == "channel_monitor"
-    assert calls[2][2]["proxy_purpose"] == "core_monitor"
+    assert calls[2][2]["proxy_purpose"] == "core_openai"
 
 
 @pytest.mark.asyncio

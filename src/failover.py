@@ -2101,9 +2101,8 @@ async def run_failover(
         # these private values; no module or Channel instance state is involved.
         body = cc_mimicry.ensure_request_context(body)
     if any(getattr(channel, "provider", "") == "zhipu" for channel, _model in all_initial_candidates):
-        body = dict(body)
-        body.setdefault("_parrot_zcode_trace", str(uuid.uuid4()))
-        body.setdefault("_parrot_zcode_session", str(getattr(schedule_result, "client_key", None) or uuid.uuid4()))
+        from .oauth.zhipu.request_context import ensure_request_context
+        body = ensure_request_context(body, api_key_name=api_key_name)
     client_visible_model = str(
         body.get("_client_visible_model") or body.get("model") or ""
     ).strip()

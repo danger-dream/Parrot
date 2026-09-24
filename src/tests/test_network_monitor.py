@@ -80,7 +80,7 @@ def test_routed_channel_and_core_monitor_are_connect_close_only(m, monkeypatch):
         "proxy_channel": "oauth:acct",
     }
     assert opens[1][2] == {
-        "timeout": 4, "proxy_purpose": "core_monitor", "proxy_channel": "",
+        "timeout": 4, "proxy_purpose": "core_openai", "proxy_channel": "",
     }
     assert all(stream.closed == 1 and stream.writes == [] for stream in streams)
 

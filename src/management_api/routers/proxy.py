@@ -132,7 +132,7 @@ def _group(item: ProxyGroupRecord) -> ProxyGroupData:
 def _routing(item: ProxyRoutingRecord) -> ProxyRoutingData:
     return ProxyRoutingData(
         default=item.default, directFallback=item.direct_fallback,
-        functions=dict(item.functions), accounts=dict(item.accounts),
+        functions=dict(item.functions), providers=dict(item.providers), accounts=dict(item.accounts),
         channels=dict(item.channels), models=dict(item.models), revision=item.revision,
     )
 
@@ -140,7 +140,7 @@ def _routing(item: ProxyRoutingRecord) -> ProxyRoutingData:
 _STATS_EXAMPLE = {"requests": 2, "successes": 2, "failures": 0, "inputTokens": 0, "outputTokens": 0, "cacheCreationTokens": 0, "cacheReadTokens": 0, "totalTokens": 0, "bytesUp": 100, "bytesDown": 200, "totalBytes": 300, "avgConnectMilliseconds": 20, "avgFirstByteMilliseconds": 40, "avgIdleMilliseconds": 0, "avgTotalMilliseconds": 60}
 _PROXY_EXAMPLE = {"proxyId": "edge-one", "name": "edge-one", "type": "socks5", "maskedUrl": "socks5://user:***@proxy.example.test:1080", "server": None, "port": None, "cipher": None, "runtimeStats": _STATS_EXAMPLE, "revision": "rev_example"}
 _GROUP_EXAMPLE = {"groupId": "primary", "name": "primary", "members": ["edge-one", "direct"], "runtimeStats": _STATS_EXAMPLE, "revision": "rev_example"}
-_ROUTING_EXAMPLE = {"default": "primary", "directFallback": False, "functions": {"telegram": "direct"}, "accounts": {}, "channels": {}, "models": {}, "revision": "rev_example"}
+_ROUTING_EXAMPLE = {"default": "primary", "directFallback": False, "functions": {"telegram": "direct"}, "providers": {"workbuddy": "direct", "openai": "primary"}, "accounts": {}, "channels": {}, "models": {}, "revision": "rev_example"}
 _OPERATION_EXAMPLE = {"id": "op_example", "kind": "proxy.test", "status": "queued", "progress": None, "createdAt": "2026-01-02T03:04:05Z", "startedAt": None, "finishedAt": None, "result": None, "error": None, "cancellable": False}
 
 

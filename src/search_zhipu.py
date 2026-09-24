@@ -162,7 +162,7 @@ async def adapter(backend, credential, args, operation, cfg):
                 "day": "oneDay", "week": "oneWeek", "month": "oneMonth", "year": "oneYear",
             }[args["freshness"]]
     async with network.async_client(timeout=httpx.Timeout(float(cfg["timeoutSeconds"])),
-                                    follow_redirects=False, proxy_purpose="oauth_openai") as client:
+                                    follow_redirects=False, proxy_purpose="oauth_zhipu") as client:
         hello = await _rpc(client, url, headers, 1, "initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "parrot", "version": "1.0"},

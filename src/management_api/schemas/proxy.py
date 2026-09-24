@@ -137,6 +137,7 @@ class ProxyRoutingData(StrictSchema):
     default: str
     directFallback: bool
     functions: dict[str, str]
+    providers: dict[str, str]
     accounts: dict[str, str]
     channels: dict[str, str]
     models: dict[str, str]
@@ -154,6 +155,10 @@ class UpdateProxyRoutingRequest(StrictSchema):
     default: str = Field(default=None, min_length=1, max_length=100)
     directFallback: bool = None
     functions: dict[str, str | None] = None
+    providers: dict[str, str | None] = Field(
+        default=None,
+        description="Upstream routes: openai, xai, cursor, antigravity, workbuddy, zhipu, claude. Null values remove overrides; accounts need not exist.",
+    )
     accounts: dict[str, str | None] = None
     channels: dict[str, str | None] = None
     models: dict[str, str | None] = None

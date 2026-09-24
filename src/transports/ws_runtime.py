@@ -186,10 +186,12 @@ def http_url_to_ws(url: str) -> str:
 
 
 def ws_route_kwargs(channel, resolved_model: str) -> dict:
+    from ..proxy.routing_types import provider_for_channel
     return {
         "channel_key": channel.key,
         "model": resolved_model,
         "purpose": "oauth_openai",
+        "provider": provider_for_channel(channel),
         "account_key": getattr(channel, "account_key", "") or "",
     }
 

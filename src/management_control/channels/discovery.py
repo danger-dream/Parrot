@@ -35,11 +35,13 @@ async def run_model_discovery(
     key = command.api_key
     base_url = command.base_url
     api_path = command.api_path
+    provider = command.provider_id or ""
     if command.channel_id:
         channel = control._domain_channel(command.channel_id)
         key = str(getattr(channel, "api_key", "") or "")
         base_url = channel.base_url
         api_path = getattr(channel, "api_path", None)
+        provider = getattr(channel, "provider_id", "") or ""
         if preset is None:
             preset = get_preset(
                 getattr(channel, "provider_id", "") or "",
@@ -64,6 +66,7 @@ async def run_model_discovery(
                 key,
                 auth=preset.models_auth,
                 parser=preset.models_parser,
+                provider=provider, channel_key=command.channel_id or "",
             )
         elif preset and preset.static_models:
             models = list(preset.static_models)
@@ -72,7 +75,10 @@ async def run_model_discovery(
             raise ModelsDiscoveryError("该提供商未公开模型列表")
         elif base_url:
             validate_base_url(base_url)
-            models = await discoverer(derive_custom_models_url(base_url, api_path), key)
+            models = await discoverer(
+                derive_custom_models_url(base_url, api_path), key,
+                provider=provider, channel_key=command.channel_id or "",
+            )
         else:
             raise ModelsDiscoveryError("无法从 URL 推导模型列表地址")
     except ModelsDiscoveryError as exc:

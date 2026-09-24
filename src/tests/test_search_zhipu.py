@@ -103,7 +103,7 @@ async def test_account_model_key_site_and_proxy(setup, monkeypatch, mode, site):
     wire(install)
     factory = search.network.async_client
     def client(**kw):
-        assert kw["proxy_purpose"] == "oauth_openai"
+        assert kw["proxy_purpose"] == "oauth_zhipu"
         assert kw["follow_redirects"] is False
         return factory(**kw)
     monkeypatch.setattr(search.network, "async_client", client)

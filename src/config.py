@@ -182,7 +182,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # 未配置任何网络规则时仍按正常默认值直连，不受此开关限制。
             "directFallback": False,
             # "telegram": "direct",
-            # "oauth": "direct",
+            # 账号/渠道 > 模型 > 上游类型 > 原有 purpose/OAuth 规则 > default。
+            # 类型与模型名、协议无关，未添加账户也能预设；未设置时保留原出口。
+            # "providers": {"openai": "us", "workbuddy": "direct"},
+            # 类型键：openai, xai, cursor, antigravity, workbuddy, zhipu, claude
+            # "oauth": "direct",  # 旧规则仍作为兼容回退，不自动迁移/删除
             # "models": {},
             # "channels": {},
         },

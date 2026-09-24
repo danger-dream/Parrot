@@ -1695,8 +1695,11 @@ def _network_summary() -> tuple[list[str], dict, dict, list[str]]:
             f" · 总耗时 <code>{_fmt_ms(ps.get('avg_total_ms'))}</code>"
         )
 
-    if pstats:
-        for ps in pstats[:5]:
+    # Historical logs remain queryable, but this settings view represents only
+    # current proxy definitions. Filter before taking the top five.
+    current_pstats = [ps for ps in pstats if ps["proxy_name"] in proxies or ps["proxy_name"] == "direct"]
+    if current_pstats:
+        for ps in current_pstats[:5]:
             lines.append(f"  • <code>{ui.escape_html(ps['proxy_name'])}</code>")
             _append_stat_lines("    ", ps)
     lines.append("")

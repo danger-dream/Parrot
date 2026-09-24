@@ -22,6 +22,7 @@ from src.management_control.routing_account_ids import (
 from src.proxy import manager as proxy_manager
 from src.proxy.connector import _mask_url, parse_proxy_url
 from src.proxy.ss2022 import ss_family_label
+from src.proxy.routing_types import PROVIDER_KEYS
 
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
@@ -55,6 +56,7 @@ class ProxyRoutingRecord:
     default: str
     direct_fallback: bool
     functions: Mapping[str, str]
+    providers: Mapping[str, str]
     accounts: Mapping[str, str]
     channels: Mapping[str, str]
     models: Mapping[str, str]
@@ -530,6 +532,7 @@ class ProxyControl(DomainControl):
             default=str(routing.get("default") or "direct"),
             direct_fallback=bool(routing.get("directFallback", False)),
             functions=functions,
+            providers=dict(routing.get("providers") or {}),
             accounts={
                 oauth_account_id_from_channel_key(key): target
                 for key, target in (routing.get("accounts") or {}).items()
@@ -580,13 +583,18 @@ class ProxyControl(DomainControl):
         for field in ("default",):
             if field in patch:
                 self._validate_target(patch[field], field)
-        for section in ("functions", "accounts", "channels", "models"):
+        for section in ("functions", "providers", "accounts", "channels", "models"):
             for key, target in (patch.get(section) or {}).items():
                 self._validate_target(target, f"{section}.{key}")
         unknown_functions = set((patch.get("functions") or {})) - _FUNCTION_ROUTES
         if unknown_functions:
             raise self._validation(
                 "functions", "UNKNOWN_FUNCTION", ", ".join(sorted(unknown_functions))
+            )
+        unknown_providers = set((patch.get("providers") or {})) - PROVIDER_KEYS
+        if unknown_providers:
+            raise self._validation(
+                "providers", "UNKNOWN_PROVIDER", ", ".join(sorted(unknown_providers))
             )
         channel_by_key = {channel.key: channel for channel in registry.all_channels()}
         for key in (patch.get("accounts") or {}):
@@ -606,7 +614,7 @@ class ProxyControl(DomainControl):
                 routing["default"] = patch["default"]
             if "directFallback" in patch:
                 routing["directFallback"] = bool(patch["directFallback"])
-            for section in ("functions", "accounts", "channels", "models"):
+            for section in ("functions", "providers", "accounts", "channels", "models"):
                 if section not in patch:
                     continue
                 target_section = routing if section == "functions" else routing.setdefault(section, {})

@@ -90,6 +90,7 @@ def _parse_dashscope_output_model(payload: object) -> list[str]:
 
 async def discover_models(endpoint: str, api_key: str, *, auth: str = "bearer",
                           parser: str = "openai-data-id", total_timeout: float = 12.0,
+                          provider: str = "", channel_key: str = "",
                           client_factory: Callable[..., httpx.AsyncClient] | None = None) -> list[str]:
     """发现模型；禁用重定向并限制读取体积，异常仅返回安全摘要。"""
     if parser not in ALLOWED_PARSERS:
@@ -99,7 +100,8 @@ async def discover_models(endpoint: str, api_key: str, *, auth: str = "bearer",
     try:
         async with asyncio.timeout(total_timeout):
             async with factory(timeout=timeout, follow_redirects=False,
-                               proxy_purpose="models-discovery") as client:
+                               proxy_purpose="models-discovery",
+                               proxy_provider=provider, proxy_channel=channel_key) as client:
                 async with client.stream("GET", endpoint, headers=_headers(auth, api_key)) as response:
                     if response.is_redirect:
                         raise ModelsDiscoveryError("模型服务返回了重定向，已拒绝携带 Key 跟随")

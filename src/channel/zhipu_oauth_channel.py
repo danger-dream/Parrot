@@ -1,13 +1,14 @@
-"""Coding Plan Anthropic channel. No Claude OAuth, beta, CCH or billing rewrite."""
+"""Coding Plan Anthropic channel; ZCode attribution without Claude/Agent rewrites."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
 import uuid
 
 from .. import config, oauth_manager
-from ..oauth.zhipu import common as c, signing
+from ..oauth.zhipu import common as c, request_context, runtime, signing
 from ..oauth.zhipu.response import BusinessContext, BusinessStream
 from ..oauth_ids import account_key
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic, guard
@@ -40,7 +41,7 @@ class ZhipuOAuthChannel(ApiChannel):
         current = oauth_manager.get_account(self.account_key)
         if not current or resolved_model not in oauth_manager.account_model_selection(current)["effective_models"]:
             raise guard.GuardError(400, "invalid_request_error", "Zhipu model unavailable for this account", param="model", scope="candidate")
-        source = copy.deepcopy(requested_body)
+        source = request_context.ensure_request_context(copy.deepcopy(requested_body))
         ctx = None
         if ingress_protocol == "chat":
             payload = chat_to_anthropic.translate_request(source)
@@ -75,11 +76,15 @@ class ZhipuOAuthChannel(ApiChannel):
             payload["thinking"] = {"type": "disabled" if effort in {"disabled", "none"} else "enabled"}
             if effort not in {"disabled", "none", "enabled"}:
                 payload["output_config"] = {**(payload.get("output_config") or {}), "effort": effort}
-        session = str(source.get("_parrot_zcode_session") or uuid.uuid4())
-        trace = str(source.get("_parrot_zcode_trace") or uuid.uuid4())
-        headers = {**c.identity_headers(), "Content-Type": "application/json", "anthropic-version": "2023-06-01",
+        session = source["_parrot_zcode_session"]
+        device_id = await asyncio.to_thread(runtime.ensure_device_id, self.account_key, current)
+        request_context.add_metadata(payload, device_id=device_id, session_id=session)
+        headers = {**c.model_headers(), "Content-Type": "application/json", "anthropic-version": "2023-06-01",
             "x-api-key": token, "Authorization": "Bearer " + token, "x-session-id": session,
-            "x-zcode-trace-id": trace, "x-request-id": str(uuid.uuid4()), "x-zcode-session-type": "main"}
+            "x-zcode-trace-id": source["_parrot_zcode_trace"], "x-query-id": source["_parrot_zcode_query"],
+            "x-request-id": str(uuid.uuid4()), "x-zcode-session-type": "main"}
+        if request_context.needs_mid_system_beta(payload):
+            headers["anthropic-beta"] = request_context.MID_SYSTEM_BETA
         if current.get("plan_scope") == "team":
             headers.update(c.scope_headers(current))
         cfg = config.get()

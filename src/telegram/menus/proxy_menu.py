@@ -11,6 +11,7 @@ import re
 from typing import Optional
 
 from ...management_control.proxy import proxy_control
+from ...proxy.routing_types import PROVIDER_ROUTES
 from .. import states, ui
 
 
@@ -872,6 +873,11 @@ def _grp_del(chat_id: int, message_id: int, cb_id: str, gname: str) -> None:
 # ── index maps (OAuth/channel keys can exceed TG 64-byte callback limit) ──
 
 _item_index: dict[int, list[str]] = {}   # chat_id -> [key0, key1, ...]
+_LEGACY_ROUTE_LABELS = {
+    "oauth": "OAuth 通用", "oauth_anthropic": "Anthropic 家族",
+    "oauth_openai": "OpenAI 家族", "oauth_xai": "Grok 辅助请求",
+    "oauth_cursor": "Cursor 辅助请求", "oauth_antigravity": "Antigravity 辅助请求",
+}
 
 
 def _set_index(chat_id: int, keys: list[str]) -> None:
@@ -897,21 +903,18 @@ def _show_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     ch_count = len(r.get("channels") or {})
     model_count = len(r.get("models") or {})
 
-    # 功能路由摘要
-    func_keys = {
-        "telegram": "Telegram",
-        "oauth_anthropic": ui.family_tag("anthropic", suffix=" 家族"),
-        "oauth_openai": ui.family_tag("openai", suffix=" 家族"),
-    }
+    # Type routes are independent of the current account inventory.
+    provider_routes = r.get("providers") or {}
     func_lines = []
-    for k, label in func_keys.items():
-        v = r.get(k)
-        if v:
+    for label, v in [("Telegram", r.get("telegram"))] + [
+        (label, provider_routes.get(key)) for key, label in PROVIDER_ROUTES
+    ] + [(f"旧兼容 · {label}", r.get(key)) for key, label in _LEGACY_ROUTE_LABELS.items()]:
+        if v is not None:
             func_lines.append(f"  • {label} → <code>{ui.escape_html(str(v))}</code>")
 
     lines = [
         "🎯 <b>路由规则</b>", "",
-        "<i>优先级: 账号 = 渠道 > 模型 > 功能路由 > 默认路由</i>", "",
+        "<i>优先级: 账号 = 渠道 > 模型 > 上游类型 > 旧兼容规则 > 默认路由</i>", "",
         f"📌 默认路由: <code>{ui.escape_html(str(default_route))}</code>",
         f"🛟 直连兜底: <b>{'开启' if direct_fallback else '关闭'}</b>",
         (
@@ -971,7 +974,7 @@ def _show_target_picker(chat_id: int, message_id: int, cb_id: str,
             return _show_target_picker_stateful(chat_id, message_id, "", title=title, back_cb=back_cb)
     del_data = f"px:rt_do:{context}:__del__"
     if len(del_data.encode()) <= 64:
-        rows.append([ui.btn("🚫 清除规则（走默认）", del_data)])
+        rows.append([ui.btn("🚫 清除规则（恢复继承）", del_data)])
     rows.append([ui.btn("◀ 返回", back_cb)])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
 
@@ -988,7 +991,7 @@ def _show_target_picker_stateful(chat_id: int, message_id: int, cb_id: str,
     for name, label in targets:
         # px:rt_s:<target> — context is read from state
         rows.append([ui.btn(label, f"px:rt_s:{name}")])
-    rows.append([ui.btn("🚫 清除规则（走默认）", "px:rt_s:__del__")])
+    rows.append([ui.btn("🚫 清除规则（恢复继承）", "px:rt_s:__del__")])
     rows.append([ui.btn("◀ 返回", back_cb)])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
 
@@ -1004,6 +1007,8 @@ def _rt_do(chat_id: int, message_id: int, cb_id: str,
         back_fn = _show_channel_routing
     elif context.startswith("models:"):
         back_fn = _show_model_routing
+    elif context.startswith("providers:") or context == "telegram" or context in _LEGACY_ROUTE_LABELS:
+        back_fn = _show_func_routing
 
     if value == "__del__":
         if ":" in context:
@@ -1025,29 +1030,28 @@ def _rt_do(chat_id: int, message_id: int, cb_id: str,
 def _show_func_routing(chat_id: int, message_id: int, cb_id: str) -> None:
     if cb_id:
         ui.answer_cb(cb_id)
+    proxy_control.init()
     r = proxy_control.get_routing_dict()
-    funcs = [
-        ("telegram", "📱 Telegram", None, "Bot 所有功能调用"),
-        ("oauth_anthropic", ui.family_tag("anthropic", suffix=" 家族"), "anthropic", "OAuth、登录/刷新、渠道请求、测试、/v1/messages"),
-        ("oauth_openai", ui.family_tag("openai", suffix=" 家族"), "openai", "OAuth、登录/刷新、渠道请求、测试、OpenAI-style 入口"),
+    provider_routes = r.get("providers") or {}
+    funcs = [("telegram", "Telegram", r.get("telegram"))] + [
+        (f"providers:{key}", label, provider_routes.get(key)) for key, label in PROVIDER_ROUTES
     ]
     lines = ["📡 <b>功能路由</b>", "",
-             "<i>家族级默认出口；账号/渠道/模型未命中时走这里，未设置则走默认路由。</i>",
-             f"<i>Telegram、{ui.family_tag('anthropic', suffix=' 家族')}、{ui.family_tag('openai', suffix=' 家族')}均支持代理组、代理、直连、默认。</i>", ""]
-    for key, label, _family, desc in funcs:
-        val = r.get(key)
-        route = f"<code>{ui.escape_html(str(val))}</code>" if val else "<i>默认</i>"
-        lines.append(f"{label}  {desc}")
-        lines.append(f"  当前: {route}")
-        lines.append("")
-
+             "<i>按接入来源选择出口，不按模型名或协议判断。未添加账户也可预先设置。</i>",
+             "<i>登录、刷新、额度查询、测试及模型请求共用类型规则；账号/渠道/模型规则优先。</i>",
+             "<i>未设置或清除规则时，沿用原有兼容规则，最后走默认路由。</i>", ""]
     rows = []
-    for key, _label, family, _ in funcs:
-        callback = f"px:rt_pick:{key}"
-        if family:
-            rows.append([ui.family_button(family, callback, suffix=" 家族")])
-        else:
-            rows.append([ui.btn("✏️ Telegram", callback)])
+    for context, label, val in funcs:
+        route = f"<code>{ui.escape_html(str(val))}</code>" if val is not None else "<i>继承</i>"
+        lines.append(f"{label} → {route}")
+        rows.append([ui.btn(f"✏️ {label}", f"px:rt_pick:{context}")])
+    legacy = [(key, label, r[key]) for key, label in _LEGACY_ROUTE_LABELS.items() if key in r]
+    if legacy:
+        lines.extend(["", "<b>旧规则兼容</b>",
+                      "<i>仅在未命中类型规则时按原请求路径生效，升级不改变既有出口。</i>"])
+        for key, label, val in legacy:
+            lines.append(f"{label} → <code>{ui.escape_html(str(val))}</code>")
+            rows.append([ui.btn(f"✏️ 旧兼容 · {label}", f"px:rt_pick:{key}")])
     rows.append([ui.btn("◀ 返回路由规则", "px:routing")])
     ui.edit(chat_id, message_id, "\n".join(lines), reply_markup=ui.inline_kb(rows))
 
@@ -1333,7 +1337,10 @@ def handle_callback(chat_id: int, message_id: int, cb_id: str, data: str) -> boo
         if ctx.startswith("accounts:"): back = "px:rt_accounts"
         elif ctx.startswith("channels:"): back = "px:rt_channels"
         elif ctx.startswith("models:"): back = "px:rt_models"
-        _show_target_picker(chat_id, message_id, cb_id, ctx, back_cb=back)
+        elif ctx.startswith("providers:") or ctx == "telegram" or ctx in _LEGACY_ROUTE_LABELS:
+            back = "px:rt_func"
+        label = dict(PROVIDER_ROUTES).get(ctx.removeprefix("providers:"), "") if ctx.startswith("providers:") else ""
+        _show_target_picker(chat_id, message_id, cb_id, ctx, title=label, back_cb=back)
         return True
 
     # Stateful save: px:rt_s:<target> (context from state)

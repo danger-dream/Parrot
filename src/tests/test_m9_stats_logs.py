@@ -2165,7 +2165,7 @@ def test_proxy_group_menu_uses_pagination_and_detail_buttons(m):
 
 
 
-def test_proxy_route_kwargs_uses_provider_family_function_route(m):
+def test_proxy_route_kwargs_keeps_legacy_purpose_and_adds_provider_identity(m):
     _setup(m)
     from src.transports import policy as transport_policy
 
@@ -2178,6 +2178,7 @@ def test_proxy_route_kwargs_uses_provider_family_function_route(m):
         "channel_key": "api:anthropic-main",
         "model": "claude-x",
         "purpose": "oauth_anthropic",
+        "provider": "",
         "account_key": "",
     }
 
@@ -2190,6 +2191,7 @@ def test_proxy_route_kwargs_uses_provider_family_function_route(m):
         "channel_key": "oauth:openai:a",
         "model": "gpt-x",
         "purpose": "oauth_openai",
+        "provider": "openai",
         "account_key": "openai:a",
     }
 

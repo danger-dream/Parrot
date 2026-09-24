@@ -599,6 +599,8 @@ async def handle(request: Request, *, ingress_protocol: str) -> Response:
     # 传递 api_key_name 给 OpenAIApiChannel.build_upstream_request（通过 body 内嵌字段）。
     # 下划线前缀 + 不在 CHAT/RESPONSES_REQ_ALLOWED 白名单里 → filter_*_passthrough 不会转发给上游。
     body["_api_key_name"] = key_name or ""
+    from ..oauth.zhipu.request_context import capture_headers as capture_zcode_headers
+    capture_zcode_headers(body, request.headers)
     claude_session_id = str(
         request.headers.get("x-claude-code-session-id") or ""
     ).strip()

@@ -79,6 +79,13 @@ def identity_headers():
             "X-Os-Category": "linux", "X-Os-Version": platform.release()}
 
 
+def model_headers():
+    # Observed 3.14.3 main-request profile. Management/signing endpoints do not
+    # pass through AI SDK provider-utils and keep the plain identity UA.
+    return {**identity_headers(), "User-Agent":
+            f"ZCode/{VERSION} ai-sdk/provider-utils/4.0.27 runtime/node.js/24"}
+
+
 def scope_headers(account):
     result = {"Bigmodel-Target-Type": "TEAM" if account.get("plan_scope") == "team" else "PERSONAL"}
     if account.get("plan_scope") == "team":
@@ -201,7 +208,7 @@ async def _read_once(url, *, headers, account_key, timeout, envelope, trace=None
     require_network()
     trace = trace or RequestTrace(url)
     try:
-        async with network.async_client(timeout=timeout, follow_redirects=False, proxy_purpose="oauth_openai",
+        async with network.async_client(timeout=timeout, follow_redirects=False, proxy_purpose="oauth_zhipu",
                 proxy_channel="oauth:" + account_key if account_key else "oauth:zhipu:login") as client:
             async with client.stream("GET", url, headers=headers or {}, extensions=trace.extensions(asynchronous=True)) as response:
                 _check_status(response)
@@ -227,7 +234,7 @@ def _request_once(url, *, headers, method, body, account_key, timeout, envelope)
     require_network()
     trace = RequestTrace(url)
     try:
-        with network.sync_client(timeout=timeout, follow_redirects=False, proxy_purpose="oauth_openai",
+        with network.sync_client(timeout=timeout, follow_redirects=False, proxy_purpose="oauth_zhipu",
                                  proxy_channel="oauth:" + account_key if account_key else "oauth:zhipu:login") as client:
             with client.stream(method, url, headers=headers or {}, extensions=trace.extensions(),
                                **({"json": body} if body is not None else {})) as response:

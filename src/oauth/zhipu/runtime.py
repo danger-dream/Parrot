@@ -5,9 +5,29 @@ import copy
 import json
 import math
 import time
+import uuid
 from datetime import datetime, timezone
 
 from . import auth, common as c, signing
+
+
+def ensure_device_id(account_key, expected_account):
+    """Persist one device UUID per account, independent of token/signer refresh."""
+    from ... import config, oauth_manager
+    if expected_account.get("zcode_device_id"):
+        return expected_account["zcode_device_id"]
+    with config.serialized_updates():
+        current = copy.deepcopy(oauth_manager.get_account(account_key))
+        if not current or c.fingerprint(current) != c.fingerprint(expected_account):
+            raise c.ZhipuError("device_id", "stale_generation")
+        if current.get("zcode_device_id"):
+            return current["zcode_device_id"]
+        device_id = str(uuid.uuid4())
+        result = oauth_manager.mutate_account_if_unchanged(
+            account_key, current, lambda value: value.update(zcode_device_id=device_id))
+        if result.get("status") != "updated":
+            raise c.ZhipuError("device_id", "stale_generation")
+        return device_id
 
 
 def refresh_locked(account, account_key, force):

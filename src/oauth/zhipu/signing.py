@@ -119,7 +119,7 @@ class Signer:
         c.require_network()
         try:
             async with network.async_client(timeout=timeout, follow_redirects=False,
-                                            proxy_purpose="oauth_openai", proxy_channel="oauth:" + self.account_key) as client:
+                                            proxy_purpose="oauth_zhipu", proxy_channel="oauth:" + self.account_key) as client:
                 async with client.stream("GET" if body is None else "POST", url, headers=headers,
                                          **({"json": body} if body is not None else {})) as response:
                     raw = bytearray()

@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .. import config
+from .routing_types import legacy_purpose, normalize_provider, provider_for_context
 from .connector import (
     Connector, DirectConnector, ProxyConnectError, UpstreamConnectError,
     connector_from_config, parse_proxy_url,
@@ -38,6 +39,7 @@ class _ProxySnapshot:
     connectors: Mapping[str, Connector]
     groups: Mapping[str, tuple[Any, ...]]
     routing: Mapping[str, Any]
+    api_providers: Mapping[str, str]
 
 
 def _freeze(value: Any) -> Any:
@@ -62,6 +64,7 @@ _EMPTY_SNAPSHOT = _ProxySnapshot(
     connectors=MappingProxyType({}),
     groups=MappingProxyType({}),
     routing=MappingProxyType({}),
+    api_providers=MappingProxyType({}),
 )
 _snapshot = _EMPTY_SNAPSHOT
 
@@ -131,6 +134,11 @@ def _build_snapshot(cfg: dict, previous: _ProxySnapshot) -> _ProxySnapshot:
         connectors=MappingProxyType(connectors),
         groups=MappingProxyType(groups),
         routing=routing,
+        api_providers=MappingProxyType({
+            f"api:{entry['name']}": normalize_provider(entry.get("providerId"))
+            for entry in cfg.get("channels") or []
+            if isinstance(entry, dict) and entry.get("name")
+        }),
     )
 
 
@@ -184,7 +192,7 @@ def _has_explicit_routing_rule(routing: dict) -> bool:
             if value != "direct":
                 return True
             continue
-        if key in ("accounts", "channels", "models"):
+        if key in ("accounts", "channels", "models", "providers"):
             if isinstance(value, dict) and value:
                 return True
             continue
@@ -214,7 +222,7 @@ def has_non_direct_routing_rules() -> bool:
     for key, value in routing.items():
         if key == "directFallback":
             continue
-        if key in ("accounts", "channels", "models"):
+        if key in ("accounts", "channels", "models", "providers"):
             if isinstance(value, dict) and any(_has_non_direct_target(v) for v in value.values()):
                 return True
             continue
@@ -248,10 +256,11 @@ def is_configured() -> bool:
 # ── Route resolution ─────────────────────────────────────────────
 
 def resolve_proxy_target(*, channel_key: str = "", model: str = "",
-                         purpose: str = "", account_key: str = "") -> str | list[str]:
+                         purpose: str = "", account_key: str = "",
+                         provider: str = "") -> str | list[str]:
     """Resolve which proxy/group to use for a given context.
 
-    Priority: account = channel > model > purpose/family > default
+    Priority: account = channel > model > upstream type > legacy purpose > default
 
     Account and channel routes are the same highest tier.  In the rare case
     both are passed and both exist, account_key wins as a deterministic tie
@@ -263,7 +272,8 @@ def resolve_proxy_target(*, channel_key: str = "", model: str = "",
       - "direct"
     """
     with _lock:
-        routing = _snapshot.routing
+        snapshot = _snapshot
+        routing = snapshot.routing
 
     def selected(value):
         return _mutable_copy(value)
@@ -290,7 +300,18 @@ def resolve_proxy_target(*, channel_key: str = "", model: str = "",
     if model and model in model_routes:
         return selected(model_routes[model])
 
-    # 3. Purpose/family-level override (telegram, oauth_anthropic, oauth_openai, etc.)
+    # 3. Stable upstream type, available even before any OAuth account exists.
+    # Telegram is an independent function, never a model/provider route.
+    route_provider = "" if purpose == "telegram" else provider_for_context(
+        provider=provider, channel_key=channel_key, account_key=account_key,
+        purpose=purpose, api_providers=snapshot.api_providers,
+    )
+    provider_routes = routing.get("providers") or {}
+    if route_provider and route_provider in provider_routes:
+        return selected(provider_routes[route_provider])
+
+    # 4. Preserve the exact previous purpose/family path if no type override.
+    purpose = legacy_purpose(purpose)
     if purpose and purpose in routing:
         return selected(routing[purpose])
 
@@ -325,13 +346,15 @@ def expand_target(target: str | list[str]) -> list[str]:
 
 
 def resolve_proxy_chain(*, channel_key: str = "", model: str = "",
-                        purpose: str = "", account_key: str = "") -> list[str]:
+                        purpose: str = "", account_key: str = "",
+                        provider: str = "") -> list[str]:
     """Resolve and expand a routing target into an ordered proxy chain."""
     return _expand_target(resolve_proxy_target(
         channel_key=channel_key,
         model=model,
         purpose=purpose,
         account_key=account_key,
+        provider=provider,
     ))
 
 
@@ -354,6 +377,7 @@ async def create_client_with_failover(
     model: str = "",
     purpose: str = "",
     account_key: str = "",
+    provider: str = "",
     timeout: httpx.Timeout | None = None,
     limits: httpx.Limits | None = None,
     http2: bool = False,
@@ -365,7 +389,7 @@ async def create_client_with_failover(
     Raises ProxyConnectError if all proxies fail.
     """
     target = resolve_proxy_target(
-        channel_key=channel_key, model=model, purpose=purpose, account_key=account_key,
+        channel_key=channel_key, model=model, purpose=purpose, account_key=account_key, provider=provider,
     )
     chain = _expand_target(target)
 
@@ -481,7 +505,7 @@ def set_routing(key: str, value: str, *, section: str = "") -> None:
     """Set a routing rule.
 
     section="" → top-level (default, telegram, oauth)
-    section="models" or "channels" → nested dict
+    section="models", "channels", "accounts" or "providers" → nested dict
     """
     def _mut(c):
         net = c.setdefault("network", {})

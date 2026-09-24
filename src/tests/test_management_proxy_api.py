@@ -69,7 +69,7 @@ def test_proxy_openapi_typed_examples_and_write_only_secret(domain_client):
     routing = document["components"]["schemas"]["UpdateProxyRoutingRequest"]["properties"]
     assert routing["default"]["type"] == "string"
     assert routing["directFallback"]["type"] == "boolean"
-    for field in ("functions", "accounts", "channels", "models"):
+    for field in ("functions", "providers", "accounts", "channels", "models"):
         assert routing[field]["type"] == "object"
         assert {item["type"] for item in routing[field]["additionalProperties"]["anyOf"]} == {
             "string", "null",
@@ -336,7 +336,7 @@ def test_proxy_probe_idempotency_replay_and_payload_conflict(domain_client, monk
 
 @pytest.mark.parametrize(
     "field",
-    ["default", "directFallback", "functions", "accounts", "channels", "models"],
+    ["default", "directFallback", "functions", "providers", "accounts", "channels", "models"],
 )
 def test_proxy_routing_explicit_null_is_422_and_does_not_mutate(
     domain_client, field,
@@ -350,6 +350,37 @@ def test_proxy_routing_explicit_null_is_422_and_does_not_mutate(
     assert response.json()["error"]["code"] == "VALIDATION_FAILED"
     assert response.json()["error"]["fields"][0]["path"] == field
     assert config.get().get("network") == before
+
+
+def test_provider_routes_before_accounts_crud_rename_and_references(domain_client):
+    client, _runtime, admin, *_ = domain_client
+    _create_proxy(client, admin, "type-proxy")
+    path = "/api/management/v1/proxy-routing"
+    response = client.patch(path, headers=admin, json={
+        "providers": {"workbuddy": "direct", "openai": "type-proxy", "zhipu": "type-proxy"},
+        "functions": {"oauth_openai": "type-proxy"},
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["providers"]["workbuddy"] == "direct"
+    before = copy.deepcopy(config.get()["network"])
+    for body in ({"providers": {"typo": "direct"}}, {"providers": {"xai": "missing"}}):
+        assert client.patch(path, headers=admin, json=body).status_code == 422
+        assert config.get()["network"] == before
+    renamed = client.patch("/api/management/v1/proxies/type-proxy",
+        headers={**admin, "If-Match": response.json()["data"]["revision"]},
+        json={"name": "type-renamed"})
+    assert renamed.status_code == 200, renamed.text
+    data = client.get(path, headers=admin).json()["data"]
+    assert data["providers"] == {"workbuddy": "direct", "openai": "type-renamed", "zhipu": "type-renamed"}
+    blocked = client.delete("/api/management/v1/proxies/type-renamed",
+        headers={**admin, "If-Match": data["revision"]})
+    assert blocked.status_code == 409
+    assert "routing.providers.openai" in {f["path"] for f in blocked.json()["error"]["fields"]}
+    result = client.patch(path, headers=admin, json={"providers": {"openai": None}})
+    assert result.status_code == 200
+    assert "openai" not in result.json()["data"]["providers"]
+    assert result.json()["data"]["functions"]["oauth_openai"] == "type-renamed"
+    assert result.json()["data"]["providers"]["zhipu"] == "type-renamed"
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])

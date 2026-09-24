@@ -6,12 +6,14 @@ import hashlib
 import hmac
 import secrets
 import time
+import uuid
 from urllib.parse import quote, urlparse, parse_qs, urlencode
 
 from . import common as c
 
 ACCOUNT_FIELDS = ("site", "credential_mode", "subject", "label", "model_key", "zcode_token",
-                  "organization_id", "project_id", "plan_scope", "entitlement", "management_status")
+                  "organization_id", "project_id", "plan_scope", "entitlement", "management_status",
+                  "zcode_device_id")
 
 
 def normalize_credential(entry):
@@ -39,6 +41,11 @@ def normalize_credential(entry):
         c.text(entry.get("access_token"), "access_token", required=True)
         c.text(entry.get("zcode_token"), "zcode_token", required=True)
     entry.setdefault("label", entry.get("email") or entry["subject"])
+    if entry.get("zcode_device_id"):
+        entry["zcode_device_id"] = str(uuid.UUID(entry["zcode_device_id"]))
+    else:
+        # Missing on login/refresh must not overwrite the persisted device ID.
+        entry.pop("zcode_device_id", None)
     return entry
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..channel.openai_oauth_channel import OpenAIOAuthChannel
+from ..proxy.routing_types import provider_for_channel
 
 
 def proxy_route_kwargs(channel, resolved_model: str) -> dict:
@@ -19,6 +20,7 @@ def proxy_route_kwargs(channel, resolved_model: str) -> dict:
         "channel_key": channel.key,
         "model": resolved_model,
         "purpose": purpose,
+        "provider": provider_for_channel(channel),
         "account_key": getattr(channel, "account_key", "") or "",
     }
 

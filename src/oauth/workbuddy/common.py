@@ -207,7 +207,7 @@ def request(account: dict, path: str, *, method: str = "POST", body=None,
     kwargs = {} if body is None else {"json": body}
     try:
         with network.sync_client(timeout=max(0.001, timeout), follow_redirects=False,
-                                 proxy_purpose="oauth_openai",
+                                 proxy_purpose="oauth_workbuddy",
                                  proxy_channel=f"oauth:{account_key}" if account_key else "oauth:workbuddy:login",
                                  cookies=cookies) as client:
             with client.stream(method, base + path, headers=headers(account, kind), **kwargs) as response:

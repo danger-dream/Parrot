@@ -1183,7 +1183,7 @@ def _weekly_quota_projection(account_key: str, row: dict | None = None) -> dict 
     percentage.  The numerator is the matching ``WINDOW_STATS`` 7d snapshot;
     monthly totals and 5h/30d percentages must never enter this calculation.
     """
-    if oauth_control.provider_of_snapshot(account_key) not in {"claude", "openai", "xai"}:
+    if oauth_control.provider_of_snapshot(account_key) not in {"claude", "openai", "xai", "zhipu"}:
         return None
     row = oauth_control.quota_snapshot(account_key) if row is None else row
     if not isinstance(row, dict):
