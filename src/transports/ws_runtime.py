@@ -18,6 +18,7 @@ from websockets.asyncio.client import connect as AsyncConnect
 from .. import blacklist
 from ..async_owned import await_owned
 from ..protocols import errors as protocol_errors
+from ..openai.recovery import capture_error_advice, WS_RESET_CODES
 from ..protocols.runtime import (
     connection_lifecycle_outcome,
     is_responses_ws_dispatch_commit_event_type,
@@ -130,6 +131,7 @@ class ResponsesWsPreVisibleResult:
     outcome: str | None = None
     error_detail: str = ""
     error_code: Optional[str] = None
+    error_advice: Any = None
     http_status: Optional[int] = None
     first_packet_ms: Optional[int] = None
     stream_started: bool = False
@@ -488,9 +490,14 @@ async def read_until_first_responses_ws_visible_event(
                     result.http_status = maybe_error.get("status")
                     result.error_code = str(maybe_error.get("code") or "") or None
                     result.error_detail = maybe_error.get("message") or data[:2000]
+                    capture_error_advice(result, payload=data,
+                                         codex=channel_key.startswith("oauth:openai:"))
+                    maybe_error["status"] = result.http_status
+                    if result.error_code in WS_RESET_CODES:
+                        result.outcome = "connection_lifecycle"
                     if (
                         result.dispatch_committed
-                        or commit_retryable_errors
+                        or (commit_retryable_errors and result.error_code not in WS_RESET_CODES)
                         or not is_retryable_responses_ws_error_before_accept(maybe_error)
                     ):
                         if not append_pending(data):
@@ -525,6 +532,10 @@ async def read_until_first_responses_ws_visible_event(
                         getattr(tracker, "stream_error_message", None)
                         or protocol_errors.responses_max_output_context_error_message()
                     )
+                capture_error_advice(result, payload=data,
+                                     codex=channel_key.startswith("oauth:openai:"))
+                if result.error_code in WS_RESET_CODES and not result.dispatch_committed:
+                    result.outcome = "connection_lifecycle"
                 if event_type == "response.failed":
                     result.dispatch_committed = True
                 if event_type == "response.failed" or (

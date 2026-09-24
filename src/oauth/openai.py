@@ -678,14 +678,70 @@ def _coerce_int(v: Any) -> int | None:
         return None
 
 
+_CODEX_MAX_RESET_HORIZON_SECONDS = 45 * 86400
+_CODEX_EARLIEST_RESET_SECONDS = 946684800  # 2000-01-01; not a relative duration.
+
+
+def _codex_integer_seconds(value: Any) -> int | None:
+    """Parse integral seconds without silently truncating floats or accepting bools."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.isascii() and text.isdecimal():
+            try:
+                return int(text)
+            except ValueError:
+                pass
+    return None
+
+
+def parse_codex_reset_at(value: Any, *, observed_at: Any = None,
+                         window_minutes: Any = None) -> int | None:
+    """Accept plausible absolute Unix seconds (never infer milliseconds).
+
+    `observed_at` is Unix *seconds*, not the millisecond observation clock used
+    by quota persistence. A past real timestamp is retained so recovery can
+    identify an expired window. The optional window length does not change the
+    unit or 45-day upper bound (5h, 7d and 30d windows all fit).
+    """
+    clock = time.time() if observed_at is None else observed_at
+    if isinstance(clock, float) and math.isfinite(clock):
+        now = int(clock)  # Unix observation seconds may contain a fractional part.
+    else:
+        now = _codex_integer_seconds(clock)
+    ts = _codex_integer_seconds(value)
+    if (now is None or ts is None
+            or not _CODEX_EARLIEST_RESET_SECONDS <= now < 10_000_000_000):
+        return None
+    if _CODEX_EARLIEST_RESET_SECONDS <= ts <= now + _CODEX_MAX_RESET_HORIZON_SECONDS:
+        return ts
+    return None
+
+
+def _codex_reset_after(value: Any, *, observed_at: int) -> int | None:
+    """Validate a relative fallback before it can become an absolute reset."""
+    after = _codex_integer_seconds(value)
+    if after is None or not 0 <= after <= _CODEX_MAX_RESET_HORIZON_SECONDS:
+        return None
+    if parse_codex_reset_at(observed_at + after, observed_at=observed_at) is None:
+        return None
+    return after
+
+
 def _iso_from_epoch_or_after(*, reset_at: Any = None,
                              reset_after_seconds: Any = None) -> str | None:
-    ts = _coerce_int(reset_at)
-    if ts is None or ts <= 0:
-        after = _coerce_int(reset_after_seconds)
+    now = int(time.time())
+    ts = parse_codex_reset_at(reset_at, observed_at=now)
+    if ts is None:
+        after = _codex_reset_after(reset_after_seconds, observed_at=now)
         if after is None:
             return None
-        ts = int(time.time()) + max(0, after)
+        ts = now + after
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
@@ -711,12 +767,13 @@ def _wham_snapshot_window(win: Any) -> dict | None:
         return None
     used = _clamp_percent(_coerce_float(win.get("used_percent")))
     seconds = _coerce_int(win.get("limit_window_seconds"))
-    reset_at = _coerce_int(win.get("reset_at"))
-    reset_after = _coerce_int(win.get("reset_after_seconds"))
+    now = int(time.time())
+    reset_at = parse_codex_reset_at(win.get("reset_at"), observed_at=now)
+    reset_after = _codex_reset_after(win.get("reset_after_seconds"), observed_at=now)
     if reset_at is None and reset_after is not None:
-        reset_at = int(time.time()) + max(0, reset_after)
-    if reset_after is None and reset_at is not None:
-        reset_after = max(0, reset_at - int(time.time()))
+        reset_at = now + reset_after
+    elif reset_at is not None:
+        reset_after = max(0, reset_at - now)
     if used is None and seconds is None and reset_at is None:
         return None
     return {
@@ -1302,8 +1359,13 @@ def _header_rate_limit_window(flat: dict, prefix: str, name: str,
                               now_seconds: int) -> dict | None:
     used = _clamp_percent(_parse_float(flat, f"{prefix}-{name}-used-percent"))
     minutes = _parse_int(flat, f"{prefix}-{name}-window-minutes")
-    reset_at = _parse_int(flat, f"{prefix}-{name}-reset-at")
-    legacy_after = _parse_int(flat, f"{prefix}-{name}-reset-after-seconds")
+    reset_at = parse_codex_reset_at(
+        flat.get(f"{prefix}-{name}-reset-at"), observed_at=now_seconds,
+        window_minutes=minutes,
+    )
+    legacy_after = _codex_reset_after(
+        flat.get(f"{prefix}-{name}-reset-after-seconds"), observed_at=now_seconds,
+    )
     if used is None and minutes is None and reset_at is None and legacy_after is None:
         return None
     reset_after = (
@@ -1387,10 +1449,13 @@ def parse_rate_limit_headers(headers: Any) -> dict | None:
     primary_over_secondary = _parse_float(
         flat, "x-codex-primary-over-secondary-limit-percent"
     )
-    if not families and credits is None and reached is None and primary_over_secondary is None:
+    active_limit = _normalize_limit_id(flat.get("x-codex-active-limit")) or None
+    if (not families and credits is None and reached is None
+            and primary_over_secondary is None and active_limit is None):
         return None
 
     snap: dict[str, Any] = {
+        "active_limit": active_limit,
         "primary_over_secondary_pct": primary_over_secondary,
         "credits": credits,
         "rate_limit_reached_type": reached,
@@ -1423,15 +1488,19 @@ def parse_rate_limit_event(event: Any) -> dict | None:
             return None
         used = _clamp_percent(_coerce_float(value.get("used_percent")))
         minutes = _coerce_int(value.get("window_minutes"))
-        reset_at = _coerce_int(value.get("reset_at"))
-        if used is None and minutes is None and reset_at is None:
+        now = int(time.time())
+        reset_at = parse_codex_reset_at(
+            value.get("reset_at"), observed_at=now, window_minutes=minutes,
+        )
+        legacy_after = _codex_reset_after(value.get("reset_after_seconds"), observed_at=now)
+        if used is None and minutes is None and reset_at is None and legacy_after is None:
             return None
         return {
             "used_percent": used,
             "window_minutes": minutes,
             "reset_at": reset_at,
             "reset_after_seconds": (
-                max(0, reset_at - int(time.time())) if reset_at is not None else None
+                max(0, reset_at - now) if reset_at is not None else legacy_after
             ),
         }
 
@@ -1507,11 +1576,52 @@ def merge_codex_rate_limits(*sources: tuple[Any, int]) -> list[dict]:
                 previous = current.get(name) or {}
                 if window_ms < previous.get("observed_at", -1):
                     continue
-                window["observed_at"] = window_ms
-                after = _coerce_int(window.get("reset_after_seconds"))
-                if window.get("reset_at") is None and after is not None:
-                    window["reset_at"] = window_ms // 1000 + max(0, after)
-                current[name] = window
+                observed_seconds = window_ms // 1000
+                reset_at = parse_codex_reset_at(
+                    window.get("reset_at"), observed_at=observed_seconds,
+                    window_minutes=window.get("window_minutes"),
+                )
+                after = _codex_reset_after(
+                    window.get("reset_after_seconds"), observed_at=observed_seconds,
+                )
+                if reset_at is None and after is not None:
+                    reset_at = observed_seconds + after
+                elif reset_at is not None:
+                    after = max(0, reset_at - observed_seconds)
+                window["reset_at"] = reset_at
+                window["reset_after_seconds"] = after
+
+                previous_reset = parse_codex_reset_at(
+                    previous.get("reset_at"), observed_at=observed_seconds,
+                )
+                previous_minutes = previous.get("window_minutes")
+                previous_duration = _coerce_int(previous_minutes)
+                new_minutes = window.get("window_minutes")
+                changed_period = (
+                    (previous_reset is not None and reset_at is not None
+                     and reset_at != previous_reset)
+                    or (previous_minutes is not None and new_minutes is not None
+                        and previous_minutes != new_minutes)
+                    or (previous_reset is not None and previous_reset <= observed_seconds)
+                    # Without a reset anchor, a window older than its entire
+                    # duration cannot be a partial observation of this cycle.
+                    or (previous_reset is None and previous_duration is not None and previous_duration > 0
+                        and window_ms - previous.get("observed_at", window_ms)
+                        >= previous_duration * 60_000)
+                )
+                # Preserve older fields only within the same unexpired cycle.
+                # In particular, never re-anchor its relative reset to this newer
+                # used-percent observation: its absolute reset is the evidence.
+                combined = {} if changed_period else dict(previous)
+                for key, value in window.items():
+                    if value is not None:
+                        combined[key] = value
+                if changed_period:
+                    for key in ("reset_at", "reset_after_seconds", "window_minutes"):
+                        if window.get(key) is None:
+                            combined.pop(key, None)
+                combined["observed_at"] = window_ms
+                current[name] = combined
     return list(merged.values())
 
 

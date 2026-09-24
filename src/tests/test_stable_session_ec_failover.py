@@ -649,4 +649,7 @@ async def test_all_failed_generic_rate_limit_remains_request_retryable(m, monkey
         "retryable": True,
         "retry_scope": "request",
     }
-    assert details["attempts"][0]["retry_scope"] == "next_candidate"
+    # Per-attempt scope describes retry eligibility, not whether the shared
+    # budget still has room. Two retries exhaust the existing default budget.
+    assert len(details["attempts"]) == 3
+    assert all(attempt["retry_scope"] == "same_candidate" for attempt in details["attempts"])

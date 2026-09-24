@@ -293,3 +293,118 @@ def test_tg_detail_renders_credits_and_named_limits(m, monkeypatch, source, mode
     assert "1h" in quota_line and "重置:" in quota_line
     assert ("剩余 80%" if mode == "remaining" else "已用 20%") in quota_line
     assert "⏱ 5h" in text and "Codex 原始窗口" not in text
+
+
+def test_codex_reset_at_accepts_seconds_but_not_milliseconds_or_bad_values(m):
+    parse = m["openai_provider"].parse_codex_reset_at
+    now = 1_800_000_000
+    for delta in (5 * 3600, 7 * 86400, 30 * 86400, 45 * 86400):
+        assert parse(str(now + delta), observed_at=now, window_minutes=None) == now + delta
+    assert parse(now - 10 * 86400, observed_at=now) == now - 10 * 86400
+    assert parse(float(now + 3600), observed_at=now + .5) == now + 3600
+    assert parse(now + 3600, observed_at=float("inf")) is None
+    for bad in (True, False, None, "", "NaN", float("inf"), float("nan"),
+                0, -1, 3600, now + 45 * 86400 + 1, (now + 60) * 1000,
+                4_070_908_800, now + .5):
+        assert parse(bad, observed_at=now, window_minutes=43200) is None
+    assert parse(now + 3600, observed_at=now * 1000) is None
+
+
+def test_codex_header_active_limit_only_and_reset_fallback(m):
+    p = m["openai_provider"]
+    active_only = p.parse_rate_limit_headers({"X-Codex-Active-Limit": " GPT-Reserve "})
+    assert active_only["active_limit"] == "gpt_reserve"
+    assert active_only["rate_limits"] == []
+    assert p.parse_rate_limit_headers({"X-Codex-Active-Limit": "   "}) is None
+    now = int(time.time())
+    snap = p.parse_rate_limit_headers({
+        "X-Codex-Active-Limit": "CODEx",
+        "X-Codex-Primary-Used-Percent": "95",
+        "X-Codex-Primary-Reset-At": str((now + 90) * 1000),
+        "X-Codex-Primary-Reset-After-Seconds": "90",
+        "X-Codex-Secondary-Used-Percent": "10",
+        "X-Codex-Secondary-Reset-At": "4070908800",
+        "X-Codex-Secondary-Reset-After-Seconds": "9999999999",
+    })
+    assert snap["active_limit"] == "codex"
+    assert snap["primary_reset_at"] is None
+    assert snap["primary_reset_sec"] == 90
+    assert snap["secondary_reset_at"] is None
+    assert snap["secondary_reset_sec"] is None
+    merged = p.merge_codex_rate_limits((snap["rate_limits"], now * 1000))
+    assert merged[0]["primary"]["reset_at"] == now + 90
+    assert merged[0]["secondary"].get("reset_at") is None
+
+
+def test_codex_ws_and_wham_reject_invalid_absolute_and_use_valid_relative(m):
+    p = m["openai_provider"]
+    now = int(time.time())
+    snap = p.parse_rate_limit_event({
+        "type": "codex.rate_limits",
+        "rate_limits": {"primary": {"used_percent": 20, "window_minutes": 300,
+                                    "reset_at": (now + 60) * 1000, "reset_after_seconds": 60},
+                        "secondary": {"used_percent": 70, "reset_at": 4_070_908_800}},
+    })
+    assert snap["primary_reset_at"] is None
+    assert snap["primary_reset_sec"] == 60
+    assert snap["secondary_reset_at"] is None
+    assert snap["secondary_reset_sec"] is None
+    merged = p.merge_codex_rate_limits((snap["rate_limits"], now * 1000))
+    assert merged[0]["primary"]["reset_at"] == now + 60
+    usage = p.normalize_wham_usage({"rate_limit": {"primary_window": {
+        "used_percent": 20, "limit_window_seconds": 18000,
+        "reset_at": (now + 60) * 1000, "reset_after_seconds": 60,
+    }, "secondary_window": {"used_percent": 40, "limit_window_seconds": 604800,
+                            "reset_at": 4_070_908_800}}})
+    assert usage["openai"]["rate_limits"][0]["primary"]["reset_at"] == now + 60
+    assert usage["openai"]["rate_limits"][0]["secondary"]["reset_at"] is None
+    assert usage["seven_day"]["resets_at"] is None
+
+
+def test_codex_same_window_partial_merge_and_cycle_boundary(m):
+    p = m["openai_provider"]
+    base = 1_800_000_000
+    old = [{"limit_id": "codex", "primary": {
+        "used_percent": 80, "window_minutes": 300, "reset_after_seconds": 120,
+    }, "secondary": {"used_percent": 15, "window_minutes": 10080}},
+           {"limit_id": "gpt_reserve", "primary": {"used_percent": 45}}]
+    newer = [{"limit_id": "codex", "primary": {"used_percent": 90}}]
+    a = p.merge_codex_rate_limits((old, base * 1000), (newer, (base + 30) * 1000))
+    family = {item["limit_id"]: item for item in a}["codex"]
+    assert family["primary"]["used_percent"] == 90
+    assert family["primary"]["reset_at"] == base + 120
+    assert family["primary"]["reset_after_seconds"] == 120  # not re-anchored
+    assert family["primary"]["window_minutes"] == 300
+    assert family["primary"]["observed_at"] == (base + 30) * 1000
+    assert family["secondary"]["used_percent"] == 15
+    assert {item["limit_id"] for item in a} == {"codex", "gpt_reserve"}
+    for observation, stamp, expected_reset in (
+        ({"used_percent": 10, "reset_at": base + 3600}, base + 40, base + 3600),
+        ({"used_percent": 10, "window_minutes": 60}, base + 40, None),
+        ({"used_percent": 10}, base + 121, None),
+    ):
+        merged = p.merge_codex_rate_limits((a, (base + 30) * 1000),
+                                           ([{"limit_id": "codex", "primary": observation}], stamp * 1000))
+        primary = merged[0]["primary"]
+        assert primary.get("reset_at") == expected_reset
+        assert primary.get("window_minutes") == (60 if "window_minutes" in observation else None)
+        assert primary["used_percent"] == 10
+    stale = p.merge_codex_rate_limits((a, (base + 30) * 1000),
+                                      ([{"limit_id": "codex", "primary": {"used_percent": 1}}],
+                                       (base + 20) * 1000))
+    assert stale[0]["primary"]["used_percent"] == 90
+
+
+def test_codex_same_window_partial_merge_through_isolated_storage(m):
+    key, _ = _account(m, "partial-window-reset")
+    now = int(time.time())
+    _save_headers(m, key, {"x-codex-primary-used-percent": "90",
+                           "x-codex-primary-window-minutes": "300",
+                           "x-codex-primary-reset-after-seconds": "120"}, now * 1000)
+    _save_headers(m, key, {"x-codex-primary-used-percent": "95"}, (now + 30) * 1000)
+    row = m["state_db"].quota_load(key)
+    window = json.loads(row["codex_rate_limits"])[0]["primary"]
+    assert window["used_percent"] == 95
+    assert window["reset_at"] == now + 120
+    assert window["window_minutes"] == 300
+    assert window["reset_after_seconds"] == 120

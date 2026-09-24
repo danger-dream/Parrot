@@ -253,7 +253,8 @@ class AttemptResult:
     ws_handshake_ms: Optional[int] = None
     error_detail: Optional[str] = None
     error_code: Optional[str] = None
-    # Parsed upstream Retry-After value, bounded before it reaches retry sleeps.
+    # Original response-side deadline/semantic facts, shared across retry layers.
+    error_advice: Any = None
     retry_after_seconds: Optional[float] = None
     # Explicit epoch-millisecond cooldown derived only from an authoritative 429.
     cooldown_until: Optional[int] = None
@@ -663,6 +664,10 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
         return None
     if status not in (402, 403, 429):
         return None
+    advice = getattr(result, "error_advice", None)
+    if advice is not None and advice.kind in {"usage_limit", "quota"}:
+        return {"classification": "quota_exhausted", "code": advice.code,
+                "message": str(getattr(result, "error_detail", "") or "")}
 
     detail = str(getattr(result, "error_detail", "") or "").strip()[:4000]
     error_type, error_code, _ = _upstream_error_identity(result)
@@ -690,6 +695,10 @@ def bounded_account_quota_error(result: AttemptResult) -> dict[str, str] | None:
             "billing_not_active",
             "credits_exhausted",
             "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "usage_limit_reached",
             "INSUFFICIENT_G1_CREDITS_BALANCE",
         } or error_type in {"insufficient_quota", "billing_error"}
         if not matched:
@@ -753,6 +762,11 @@ def retryable_transient_error_kind(channel: Any, result: AttemptResult) -> str |
     except (TypeError, ValueError):
         status = 0
     error_type, error_code, structured = _upstream_error_identity(result)
+    if _is_openai_channel(channel) and (
+        error_code in {"rate_limit_exceeded", "slow_down"}
+        or error_type in {"rate_limit_exceeded", "slow_down"}
+    ):
+        return "openaiRateLimit"
 
     # Cloud Code RetryInfo below three seconds is explicitly safe for a bounded
     # same-owner retry. Longer delays are handled as model cooldown/quota state.
@@ -965,7 +979,7 @@ def parse_wrapped_responses_ws_error(text: str) -> Optional[dict]:
 def is_retryable_responses_ws_error_before_accept(err: dict) -> bool:
     status = err.get("status")
     code = str(err.get("code") or "")
-    if code == "websocket_connection_limit_reached":
+    if code in {"websocket_connection_limit_reached", "previous_response_not_found"}:
         return True
     return isinstance(status, int) and status in (401, 403, 429, 500, 502, 503, 504)
 

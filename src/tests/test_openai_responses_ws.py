@@ -1390,7 +1390,8 @@ async def test_responses_ws_transient_retries_same_candidate_and_honors_retry_af
     await m["responses_ws"].handle_responses_ws(ws)  # type: ignore[arg-type]
 
     assert len(connect_calls) == 2
-    assert observed_retry_after == [4.0]
+    assert len(observed_retry_after) == 1
+    assert 0 < observed_retry_after[0] <= 4.0  # receipt-to-retry processing counts toward the deadline
     assert any(json.loads(text).get("delta") == "ok" for text in ws.sent_texts)
     assert not ws.close_calls
     row = _last_request_log(m)

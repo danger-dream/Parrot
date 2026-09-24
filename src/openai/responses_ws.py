@@ -49,6 +49,7 @@ from .codex_identity import (
     project_snapshot,
     release_request_turn_serialization,
 )
+from .recovery import capture_error_advice, remaining_retry_delay, rebuild_full_request, WS_RESET_CODES
 from .codex_identity_mapper import ProtocolIdentityMap
 from ..client_ip import get_client_ip
 from ..openai.transform.guard import GuardError, guard_responses_ingress
@@ -158,6 +159,7 @@ class _WsAttemptResult:
     error_detail: str = ""
     error_code: Optional[str] = None
     http_status: Optional[int] = None
+    error_advice: Any = None
     retry_after_seconds: Optional[float] = None
     cooldown_until: Optional[int] = None
     round_id: Optional[str] = None
@@ -247,19 +249,16 @@ class _WsTurnCapacity:
 
 
 def _retry_after_from_headers(headers: Any) -> float | None:
+    from .recovery import retry_delay
     try:
         raw = headers.get("Retry-After")
     except Exception:
         raw = None
-    return parse_retry_after_seconds(raw)
+    return retry_delay(raw)
 
 
-def _attach_ws_retry_after(result: _WsAttemptResult, headers: Any) -> _WsAttemptResult:
-    if result.retry_after_seconds is None:
-        result.retry_after_seconds = _retry_after_from_headers(headers)
-    if result.http_status == 429 and result.retry_after_seconds is not None:
-        result.cooldown_until = retry_after_cooldown_until(result.retry_after_seconds)
-    return result
+def _attach_ws_retry_after(result: _WsAttemptResult, headers: Any, channel=None) -> _WsAttemptResult:
+    return capture_error_advice(result, headers=headers, codex=isinstance(channel, OpenAIOAuthChannel))
 
 
 def _transient_retry_delay_seconds(
@@ -269,7 +268,8 @@ def _transient_retry_delay_seconds(
     retry_after_seconds: float | None = None,
 ) -> float:
     if retry_after_seconds is not None:
-        parsed = parse_retry_after_seconds(retry_after_seconds)
+        from .recovery import retry_delay
+        parsed = retry_delay(retry_after_seconds)
         if parsed is not None:
             return parsed
     delays = configured_transient_retry_delays(cfg)
@@ -289,7 +289,7 @@ async def _wait_for_transient_retry(
         cfg,
         retry_after_seconds=retry_after_seconds,
     )
-    if deadline_ts > 0 and time.time() + delay >= deadline_ts:
+    if delay > 60 or (deadline_ts > 0 and time.time() + delay >= deadline_ts):
         return None
     await asyncio.sleep(delay)
     return delay
@@ -1044,6 +1044,9 @@ async def _run_ws_failover(
             and ch.type == "oauth"
             and result.http_status in (401, 403)
             and not result.openai_oauth_html_403
+            and getattr(getattr(result, "error_advice", None), "kind", "") not in {
+                "usage_limit", "quota", "entitlement", "rate_limit",
+            }
             and ch.key not in refreshed_once
         ):
             refreshed_once.add(ch.key)
@@ -1083,7 +1086,7 @@ async def _run_ws_failover(
                 transient_retries_used,
                 cfg,
                 retry_deadline_ts,
-                retry_after_seconds=result.retry_after_seconds,
+                retry_after_seconds=remaining_retry_delay(result),
             )
             if delay is not None:
                 transient_retries_used += 1
@@ -1095,6 +1098,9 @@ async def _run_ws_failover(
                 )
                 continue
 
+        from ..failover import _apply_codex_error_policy
+        codex_handled = _apply_codex_error_policy(ch, resolved_model, result)
+
         # Same-candidate OAuth/transient retries reach this point only once, so
         # the terminal aggregate counts actual failed candidates rather than
         # transport rounds. Zero denotes the narrow generic HTML403 marker.
@@ -1104,7 +1110,7 @@ async def _run_ws_failover(
             failed_candidate_statuses.append(
                 0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
             )
-        if not result.openai_oauth_html_403:
+        if not result.openai_oauth_html_403 and not codex_handled:
             finalize_policy.apply_error_health_effects(
                 finalize_policy.error_plan(
                     result.outcome,
@@ -1281,20 +1287,7 @@ async def _run_ws_failover(
                         0 if result.openai_oauth_html_403 else _http_status_from_ws_outcome(result)
                     )
                 if not result.openai_oauth_html_403:
-                    finalize_policy.apply_error_health_effects(
-                        finalize_policy.error_plan(
-                            result.outcome,
-                            failure_policy="runtime",
-                            http_status=result.http_status,
-                        ),
-                        scorer=scorer,
-                        cooldown=cooldown,
-                        channel_key=channel_state.effect_key(ch),
-                        model=resolved_model,
-                        error_detail=result.error_detail,
-                        connect_ms=result.connect_ms,
-                        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
-                    )
+                    _apply_ws_error_health(result, ch, resolved_model)
                 retry_count += 1
             else:
                 msg = f"All candidate channels saturated; queue wait {queue_wait_s:.0f}s timed out."
@@ -1446,6 +1439,8 @@ async def _try_ws_channel(
     round_timeouts = RoundTimeouts.from_config(timeouts)
     last_error: Optional[_WsAttemptResult] = None
     route_order = 0
+    session_result: _WsAttemptResult | None = None
+    owns_recovery_attempt = False
 
     for route_name, connector in route_chain:
         last_error = None
@@ -1520,9 +1515,10 @@ async def _try_ws_channel(
                 getattr(ws_response, "headers", None),
             )
 
-            session_result: _WsAttemptResult | None = None
             session_request_id = request_id
             turn_number = 1
+            recovered_turns: set[int] = set()
+            replay_previous = None
             identity_session: dict[str, Any] = {}
             while True:
                 relay_result = await _relay_ws_session(
@@ -1571,7 +1567,99 @@ async def _try_ws_channel(
                 _attach_ws_retry_after(
                     relay_result,
                     getattr(getattr(upstream_ws, "response", None), "headers", None),
+                    ch,
                 )
+                if (isinstance(ch, OpenAIOAuthChannel)
+                        and relay_result.error_code in WS_RESET_CODES
+                        and not relay_result.dispatch_committed
+                        and not relay_result.closed_after_accept):
+                    full = None
+                    if (turn_number not in recovered_turns
+                            and recovery_retry_allowed("codexWebsocketRecovery", cfg)):
+                        full = rebuild_full_request(body, api_key_name=api_key_name,
+                                                    channel_key=ch.key, model=resolved_model,
+                                                    previous=replay_previous)
+                    if full is not None:
+                        recovered_turns.add(turn_number)
+                        # The server explicitly rejected this create. Finalize
+                        # its attempt, not the logical request; no health penalty.
+                        await await_ws_owned(asyncio.to_thread(
+                            log_db.update_retry_attempt, retry_attempt_id,
+                            final_round_id=relay_result.round_id, ended_at=time.time(),
+                            outcome="connection_lifecycle", error_detail=relay_result.error_detail,
+                            response_body=relay_result.response_text or None,
+                            bytes_up=proxy_bytes.up, bytes_down=proxy_bytes.down, settle=False,
+                        ))
+                        await upstream_ws.close()
+                        release_request_turn_serialization(body)
+                        body = full
+                        relay_state = {"turn_body": body}
+                        first_obj = {key: value for key, value in body.items() if not key.startswith("_")}
+                        first_obj["type"] = "response.create"
+                        identity_session = {}
+                        retry_count_so_far += 1
+                        attempt_start_monotonic = time.monotonic()
+                        owns_recovery_attempt = True
+                        retry_attempt_id = None
+                        async def record_recovery_attempt():
+                            nonlocal retry_attempt_id
+                            retry_attempt_id = await asyncio.to_thread(
+                                log_db.record_retry_attempt, request_id, retry_count_so_far + 1,
+                                ch.key, ch.type, resolved_model, time.time(), proxy_name=proxy_name_used,
+                                upstream_protocol=ch_proto,
+                                client_visible_model=str(body.get("_client_visible_model") or body.get("model") or resolved_model),
+                            )
+                        await await_ws_owned(record_recovery_attempt())
+                        proxy_bytes = _WsProxyBytes()
+                        round_id = str(uuid.uuid4())
+                        timing = WsAttemptTiming(route_type=route_type, round_id=round_id,
+                                                 request_id=request_id, proxy_name=route_log_name)
+                        route_attempt_id = None
+                        async def record_recovery_route():
+                            nonlocal route_attempt_id
+                            route_attempt_id = await asyncio.to_thread(
+                                log_db.record_proxy_attempt, request_id, retry_attempt_id, 1,
+                                route_log_name, time.time(), round_id=round_id, transport="ws", request_mode="ws",
+                            )
+                        await await_ws_owned(record_recovery_route())
+                        route_state = {"dispatched": False}
+                        relay_state = {"turn_body": body}
+                        upstream_req = await _build_ws_upstream_request(ch, body, resolved_model, websocket=websocket)
+                        upstream_ws = await _connect_upstream_ws(
+                            upstream_req.url, headers=upstream_req.headers, connector=connector,
+                            proxy_bytes=proxy_bytes, open_timeout=round_timeouts.connection + 0.5,
+                            timing=timing, round_timeouts=round_timeouts,
+                            **({"reject_redirects": True} if (upstream_req.translator_ctx or {}).get("codex_workspace_routed") else {}),
+                        )
+                        if not timing.connection_complete:
+                            timing.mark_handshake_complete()
+                        connect_ms = timing.snapshot().connection_ms
+                        ws_response = getattr(upstream_ws, "response", None)
+                        _maybe_record_codex_ws_snapshot(ch, ws_response, upstream_req.translator_ctx)
+                        capture_turn_state(upstream_req.translator_ctx, getattr(ws_response, "headers", None))
+                        continue
+                    # An opaque/expired history anchor belongs to the caller.
+                    # Preserve the precise error rather than dispatching it on
+                    # another account or pretending a missing prefix is empty.
+                    await _send_request_invalid_error_frame(
+                        websocket, relay_result.error_detail, code=relay_result.error_code,
+                        status=int(relay_result.http_status or 400),
+                    )
+                    relay_result.closed_after_accept = True
+                    await await_ws_owned(asyncio.to_thread(
+                        log_db.update_retry_attempt, retry_attempt_id,
+                        final_round_id=relay_result.round_id, ended_at=time.time(),
+                        outcome="connection_lifecycle", error_detail=relay_result.error_detail,
+                        response_body=relay_result.response_text or None,
+                        bytes_up=proxy_bytes.up, bytes_down=proxy_bytes.down, settle=False,
+                    ))
+                    await _finalize_ws_attempt_after_accept(
+                        relay_result, ch, resolved_model, request_id, retry_count_so_far,
+                        affinity_hit, start_time, start_monotonic,
+                    )
+                    relay_result.request_finalized = True
+                    await _close_downstream(websocket, 1000, "")
+                    return session_result or relay_result
                 if session_result is None and relay_result.request_finalized:
                     session_result = relay_result
                 if relay_result.request_finalized:
@@ -1619,6 +1707,11 @@ async def _try_ws_channel(
                     last_error = relay_result
                     break
 
+                if relay_result.ok and relay_result.response_id:
+                    full = rebuild_full_request(body, api_key_name=api_key_name,
+                                                channel_key=ch.key, model=resolved_model,
+                                                previous=replay_previous)
+                    replay_previous = (relay_result.response_id, full, relay_result.output_items) if full is not None else None
                 from .. import search_tool_policy
                 if relay_result.ok and relay_result.response_id:
                     replay_body = search_tool_policy.restore_replay(body, "responses", api_key_name)
@@ -1910,6 +2003,12 @@ async def _try_ws_channel(
             await await_ws_owned(finish_cancelled_round())
             upstream_ws = None
             raise
+        except GuardError as exc:
+            last_error = _WsAttemptResult(
+                outcome="candidate_guard" if getattr(exc, "scope", "request") == "candidate" else "request_invalid",
+                error_detail=exc.message, http_status=exc.status,
+                proxy_name=proxy_name_used, proxy_bytes=proxy_bytes, upstream_protocol=ch_proto,
+            )
         except BusinessTimeoutError as exc:
             last_error = _WsAttemptResult(
                 outcome=exc.outcome,
@@ -1942,10 +2041,10 @@ async def _try_ws_channel(
                 proxy_name=proxy_name_used,
                 proxy_bytes=proxy_bytes,
                 upstream_protocol=ch_proto,
-                retry_after_seconds=_retry_after_from_headers(
-                    getattr(invalid_response, "headers", None)
-                ),
             )
+            capture_error_advice(last_error, headers=getattr(invalid_response, "headers", None),
+                                 payload=getattr(invalid_response, "body", None),
+                                 codex=isinstance(ch, OpenAIOAuthChannel))
         except Exception as exc:
             connected = timing.connection_complete
             detail = f"{'websocket relay' if connected else 'connect'} error: {exc}"
@@ -1975,6 +2074,44 @@ async def _try_ws_channel(
                     await upstream_ws.close()
                 except Exception:
                     pass
+        if last_error is not None and (session_result is not None or owns_recovery_attempt):
+            # This attempt belongs to the active turn, not the first create held
+            # by the outer candidate loop. Never replay or rewrite that first turn.
+            async def finish_failed_session_turn():
+                await asyncio.to_thread(
+                    log_db.update_retry_attempt, retry_attempt_id,
+                    final_round_id=last_error.round_id, ended_at=time.time(),
+                    outcome=last_error.outcome, error_detail=last_error.error_detail,
+                    response_body=last_error.response_text or None,
+                    bytes_up=proxy_bytes.up, bytes_down=proxy_bytes.down, settle=False,
+                )
+                await _finalize_ws_attempt_after_accept(
+                    last_error, ch, resolved_model, request_id, retry_count_so_far,
+                    affinity_hit, start_time, start_monotonic,
+                )
+                last_error.request_finalized = True
+                last_error.closed_after_accept = True
+            await await_ws_owned(finish_failed_session_turn())
+            await _send_terminal_error_frame(websocket, "Upstream connection recovery failed", _http_status_from_ws_outcome(last_error))
+            await _close_downstream(websocket, 1011, "Upstream connection recovery failed")
+            return session_result or last_error
+        if (isinstance(ch, OpenAIOAuthChannel) and last_error is not None
+                and last_error.http_status == 426 and not route_state["dispatched"]
+                and recovery_retry_allowed("codexHttpFallback", cfg)):
+            full = rebuild_full_request(body, api_key_name=api_key_name,
+                                        channel_key=ch.key, model=resolved_model)
+            if full is not None and full.get("generate") is not False:
+                release_request_turn_serialization(body)
+                return await _run_codex_sse_fallback_session(
+                    websocket, ch=ch, resolved_model=resolved_model, body=full,
+                    allowed_models=allowed_models, deadline_ts=deadline_ts,
+                    start_time=start_time, start_monotonic=start_monotonic,
+                    request_id=request_id, retry_count_so_far=retry_count_so_far,
+                    affinity_hit=affinity_hit, api_key_name=api_key_name,
+                    client_ip=client_ip, fp_query=fp_query, client_key=client_key,
+                    retry_attempt_id=retry_attempt_id,
+                    attempt_start_monotonic=attempt_start_monotonic, turn_capacity=turn_capacity,
+                )
         if connector is not None and last_error is not None:
             connector.stats.total_failures += 1
             connector.stats.last_error = (last_error.error_detail or last_error.outcome)[:200]
@@ -1993,6 +2130,178 @@ async def _try_ws_channel(
         error_detail="proxy route has no usable target",
         upstream_protocol=ch_proto,
     )
+
+
+async def _run_codex_sse_turn(websocket, **kwargs):
+    """Keep native WS cancellation/overlap semantics while one HTTP turn runs."""
+    async def watch_downstream():
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            raw = message.get("text") or message.get("bytes")
+            if raw is None:
+                continue
+            try:
+                frame = _loads_frame(raw)
+            except Exception:
+                frame = None
+            detail = ("a response is already in progress on this websocket"
+                      if isinstance(frame, dict) and frame.get("type") == "response.create"
+                      else "this websocket control frame is unavailable on the HTTP fallback")
+            await _send_request_invalid_error_frame(websocket, detail, param="type")
+
+    reader = asyncio.create_task(watch_downstream())
+    async def stop_reader():
+        # Cancel before publishing a terminal frame, so the next create cannot
+        # be consumed by this turn's overlap detector.
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+    task = asyncio.create_task(_try_sse_channel(
+        websocket, **kwargs, keep_downstream_open=True, on_terminal=stop_reader,
+    ))
+    try:
+        done, _ = await asyncio.wait({task, reader}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done or reader.cancelled():
+            return await task
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return _WsAttemptResult(outcome="client_disconnected", request_finalized=True,
+                                closed_after_accept=True, upstream_transport="sse")
+    finally:
+        reader.cancel()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(reader, task, return_exceptions=True)
+
+
+async def _run_codex_sse_fallback_session(
+    websocket, *, ch, resolved_model, body, allowed_models, deadline_ts,
+    start_time, start_monotonic, request_id, retry_count_so_far, affinity_hit,
+    api_key_name, client_ip, fp_query, client_key, retry_attempt_id,
+    attempt_start_monotonic, turn_capacity,
+):
+    """Keep the downstream WS session while a rejected upgrade uses HTTP.
+
+    Only the latest complete request/output is retained in this connection's
+    memory; this is neither a new persistent transcript store nor cross-account
+    continuation. Normal per-turn capacity, billing and cancellation owners stay
+    in force.
+    """
+    cfg = config.get()
+    session_id = request_id
+    sequence = 1
+    first_result = None
+    previous = None
+    total = float((cfg.get("timeouts") or {}).get("total", 600))
+    while True:
+        try:
+            result = await _run_codex_sse_turn(
+                websocket, first_obj={"type": "response.create", **body},
+                ch=ch, resolved_model=resolved_model, body=body, deadline_ts=deadline_ts,
+                start_time=start_time, start_monotonic=start_monotonic,
+                request_id=request_id, retry_count_so_far=retry_count_so_far,
+                affinity_hit=affinity_hit, api_key_name=api_key_name, client_ip=client_ip,
+                fp_query=fp_query, client_key=client_key, retry_attempt_id=retry_attempt_id,
+                attempt_start_monotonic=attempt_start_monotonic,
+            )
+        finally:
+            release_request_turn_serialization(body)
+        can_continue = result.request_finalized and result.outcome in {
+            "success", "response_incomplete", "stream_upstream_error", "request_rejected", "request_invalid",
+        }
+        if not can_continue:
+            if first_result is None:
+                return result  # pre-commit failure still belongs to outer failover
+            if not result.request_finalized:
+                await asyncio.to_thread(log_db.update_retry_attempt, retry_attempt_id,
+                    ended_at=time.time(), outcome=result.outcome, error_detail=result.error_detail,
+                    response_body=result.response_text or None, settle=False)
+                await _finalize_ws_attempt_after_accept(result, ch, resolved_model, request_id,
+                    retry_count_so_far, affinity_hit, start_time, start_monotonic)
+                await _send_terminal_error_frame(websocket, result.error_detail, int(result.http_status or 502))
+                await _close_downstream(websocket, 1011, "upstream request failed")
+            return first_result
+        first_result = first_result or result
+        if result.ok and result.response_id:
+            previous = (result.response_id, body, result.output_items)
+        previous_context = (result.translator_ctx or {}).get("codex_identity_context")
+        await turn_capacity.release()
+        while True:
+            next_turn = await _receive_next_response_create(
+                websocket, channel=ch, allowed_models=allowed_models, api_key_name=api_key_name,
+                client_ip=client_ip, session_idle_timeout=total,
+            )
+            if next_turn is None:
+                return first_result
+            _first, next_body, next_fp = next_turn
+            requested_model = str(next_body.get("model") or "")
+            next_model = ch.supports_model(requested_model)
+            if (next_model is None or not ch.enabled
+                    or not model_state.is_global_enabled(requested_model)
+                    or not model_state.is_source_enabled(ch.key, requested_model)):
+                await _send_request_invalid_error_frame(websocket, "model is not available on the active route", param="model")
+                continue
+            full = rebuild_full_request(next_body, api_key_name=api_key_name,
+                channel_key=ch.key, model=next_model,
+                previous=previous if next_model == resolved_model else None)
+            from .. import search_tool_policy
+            if full is None or full.get("generate") is False or search_tool_policy.needs_loop(full):
+                await _send_request_invalid_error_frame(websocket,
+                    "This continuation cannot be reconstructed on the HTTP fallback; send a complete request.",
+                    code="previous_response_not_found" if full is None else "invalid_request_error")
+                continue
+            break
+        sequence += 1
+        request_id = f"{session_id}:ws:{sequence}"
+        resolved_model, body, fp_query = next_model, full, next_fp
+        body["_codex_turn_serialization_required"] = True
+        if isinstance(previous_context, RequestIdentityContext):
+            context = next_request_identity_context(previous_context, body)
+            body.setdefault("_codex_identity_contexts", {})[context.account_identity.owner_digest] = context
+        start_time, start_monotonic = time.time(), time.monotonic()
+        deadline_ts = start_time + total
+        retry_count_so_far, affinity_hit = 0, 0
+        try:
+            await turn_capacity.acquire_api_key(api_key_name)
+        except apikey_limiter.ApiKeyLimitError as exc:
+            await _close_downstream(websocket, 4429, _trim_reason(exc.message))
+            return first_result
+        acquired = await turn_capacity.acquire_channel(channel_state.effect_key(ch),
+            queue_wait_seconds=float((cfg.get("concurrency") or {}).get("queueWaitSeconds", 30)))
+        if not acquired:
+            await turn_capacity.release_api_key()
+            await _close_downstream(websocket, 4429, "Active upstream channel saturated")
+            return first_result
+        body = await translation.translate_body(body, ingress_protocol="responses", route=(ch, resolved_model))
+        msg_count, tool_count = _count_msg_tool(body, "responses")
+        retry_attempt_id = None
+        attempt_start_monotonic = time.monotonic()
+        async def record_fallback_turn():
+            nonlocal retry_attempt_id
+            headers = _sanitize_headers(dict(websocket.headers))
+            await asyncio.to_thread(log_db.insert_pending,
+                request_id, client_ip, api_key_name, requested_model, True,
+                msg_count, tool_count, headers,
+                {key: value for key, value in body.items() if not key.startswith("_")},
+                fingerprint=fp_query, ingress_protocol="responses_ws",
+                reasoning_effort=log_db.extract_reasoning_effort(body, "responses_ws"),
+                fast_mode=log_db.extract_fast_mode(body, "responses_ws", headers))
+            retry_attempt_id = await asyncio.to_thread(log_db.record_retry_attempt,
+                request_id, 1, ch.key, ch.type, resolved_model, time.time(),
+                upstream_protocol="openai-responses", client_visible_model=requested_model)
+        try:
+            await await_ws_owned(record_fallback_turn())
+        except asyncio.CancelledError:
+            await await_ws_owned(_finish_cancelled_before_ws_attempt_handoff(
+                ch=ch, resolved_model=resolved_model, request_id=request_id,
+                retry_count=retry_count_so_far, affinity_hit=affinity_hit,
+                start_monotonic=start_monotonic,
+                attempt_started_monotonic=attempt_start_monotonic,
+                attempt_id=retry_attempt_id, proxy_name=None, upstream_transport="sse",
+            ))
+            raise
 
 
 def _responses_ws_upstream_transport(ch: Channel) -> str:
@@ -2030,6 +2339,8 @@ async def _try_sse_channel(
     retry_attempt_id,
     start_monotonic: float,
     attempt_start_monotonic: float,
+    keep_downstream_open: bool = False,
+    on_terminal=None,
 ) -> _WsAttemptResult:
     ch_proto = getattr(ch, "protocol", "anthropic")
     cfg = config.get()
@@ -2043,6 +2354,10 @@ async def _try_sse_channel(
     try:
         from .. import failover as failover_runtime
 
+        # The caller releases leases through body even when budget preparation
+        # creates a shallow request copy. Share the actual lease map explicitly.
+        if isinstance(ch, OpenAIOAuthChannel) and body.get("_codex_turn_serialization_required"):
+            body.setdefault("_codex_turn_serialization_leases", {})
         http_body = dict(body)
         http_body["stream"] = True
         http_body = failover_runtime._candidate_budget_body(ch, resolved_model, http_body)
@@ -2164,6 +2479,9 @@ async def _try_sse_channel(
         )
 
     response = opened.response
+    if isinstance(ch, OpenAIOAuthChannel):
+        failover_runtime._maybe_record_codex_snapshot(ch, response, upstream_req.translator_ctx)
+        capture_turn_state(upstream_req.translator_ctx, response.headers)
     status = int(response.status_code)
     _sync_http_proxy_bytes(proxy_bytes, opened)
     connect_ms = opened.connect_ms
@@ -2302,6 +2620,8 @@ async def _try_sse_channel(
             retry_after_seconds=_retry_after_from_headers(response.headers),
             http_header_model=model_reroute.header_model(getattr(response, "headers", None)),
         )
+        capture_error_advice(result, headers=response.headers, payload=response_text,
+                             codex=isinstance(ch, OpenAIOAuthChannel))
         _sync_http_proxy_bytes(proxy_bytes, opened)
         await finalize_opened_http_response(
             opened,
@@ -2326,7 +2646,12 @@ async def _try_sse_channel(
         retry_after_seconds=_retry_after_from_headers(response.headers),
         http_header_model=model_reroute.header_model(getattr(response, "headers", None)),
     )
-    tracker = _WsTracker()
+    identity_snapshot = (upstream_req.translator_ctx or {}).get("codex_identity_snapshot")
+    identity_map = (ProtocolIdentityMap.from_request(body, identity_snapshot)
+                    if identity_snapshot is not None else ProtocolIdentityMap())
+    tracker = _WsTracker(normalize_max_output_incomplete=not (
+        keep_downstream_open and isinstance(ch, OpenAIOAuthChannel)
+    ))
     pending: list[str] = []
     committed = False
     dispatch_committed = False
@@ -2434,20 +2759,7 @@ async def _try_sse_channel(
                 proxy_bytes_down=proxy_bytes.down,
             ))
         else:
-            finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(
-                    result.outcome,
-                    failure_policy="runtime",
-                    http_status=result.http_status,
-                ),
-                scorer=scorer,
-                cooldown=cooldown,
-                channel_key=channel_state.effect_key(ch),
-                model=resolved_model,
-                error_detail=result.error_detail,
-                connect_ms=result.connect_ms,
-                cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
-            )
+            _apply_ws_error_health(result, ch, resolved_model)
             await await_ws_owned(asyncio.to_thread(
                 log_db.finish_error,
                 request_id,
@@ -2479,6 +2791,8 @@ async def _try_sse_channel(
         return result
 
     async def finalize_and_return() -> _WsAttemptResult:
+        if on_terminal is not None:
+            await on_terminal()
         # Protect route, retry and request writes as one owner, not individually.
         return await await_ws_owned(_persist_accepted_sse_request())
 
@@ -2490,7 +2804,7 @@ async def _try_sse_channel(
         result.closed_after_accept = True
         _apply_http_snapshot(result, opened, terminal=False)
         for item in pending:
-            await _send_downstream(websocket, item)
+            await _send_downstream(websocket, _identity_expose_frame(item, identity_map))
         pending.clear()
 
     try:
@@ -2506,7 +2820,7 @@ async def _try_sse_channel(
                     result.ok = True
                     result.outcome = "success"
                     await finalize_and_return()
-                    if committed:
+                    if committed and not keep_downstream_open:
                         await _close_downstream(websocket, 1000, "")
                     return result
                 result.outcome = "upstream_closed" if (committed or dispatch_committed) else "closed_before_first_byte"
@@ -2563,6 +2877,7 @@ async def _try_sse_channel(
                 from .. import search_tool_wire
                 data = search_tool_wire.restore_object(data, upstream_req.dynamic_tool_map)
                 frame_text = _dump_frame(data)
+                _capture_codex_response_event(ch, upstream_req.translator_ctx, frame_text)
                 tracker.feed_text(frame_text)
                 event_type = _ws_event_type(frame_text)
                 if event_type == "response.created":
@@ -2586,6 +2901,8 @@ async def _try_sse_channel(
                     result.http_status = 400 if (is_context_error or is_request_failure) else result.http_status
                     result.error_code = tracker.stream_error_code
                     result.error_detail = tracker.stream_error_message or frame_text[:2000]
+                    capture_error_advice(result, headers=response.headers, payload=data,
+                                         codex=isinstance(ch, OpenAIOAuthChannel))
                     if event_type == "response.failed" or committed or dispatch_committed or is_context_error:
                         await finalize_and_return()
                         if not committed:
@@ -2593,14 +2910,15 @@ async def _try_sse_channel(
                                 pending.append(frame_text)
                             await commit_pending()
                         elif not is_context_error:
-                            await _send_downstream(websocket, frame_text)
+                            await _send_downstream(websocket, _identity_expose_frame(frame_text, identity_map))
                         if is_context_error:
                             await _send_context_length_error_frame(websocket, result.error_detail)
-                        await _close_downstream(
-                            websocket,
-                            4400 if is_context_error else 1011,
-                            _trim_reason(result.error_detail),
-                        )
+                        if not keep_downstream_open:
+                            await _close_downstream(
+                                websocket,
+                                4400 if is_context_error else 1011,
+                                _trim_reason(result.error_detail),
+                            )
                         return await finalize_and_return()
                     return sync_tracker_result()
 
@@ -2618,6 +2936,22 @@ async def _try_sse_channel(
                             return await finalize_and_return()
                         return sync_tracker_result()
 
+                if tracker.response_incomplete:
+                    result.outcome = "response_incomplete"
+                    result.http_status = 400
+                    result.error_detail = "response incomplete: " + str(protocol_errors.responses_incomplete_reason(data) or "unknown reason")
+                    if opened.timing is not None:
+                        opened.timing.mark_io_complete()
+                    await finalize_and_return()
+                    if not committed:
+                        pending.append(frame_text)
+                        await commit_pending()
+                    else:
+                        await _send_downstream(websocket, _identity_expose_frame(frame_text, identity_map))
+                    if not keep_downstream_open:
+                        await _close_downstream(websocket, 1000, "")
+                    return result
+
                 if tracker.response_completed:
                     result.ok = True
                     result.outcome = "success"
@@ -2626,8 +2960,9 @@ async def _try_sse_channel(
                         pending.append(frame_text)
                         await commit_pending()
                     else:
-                        await _send_downstream(websocket, frame_text)
-                    await _close_downstream(websocket, 1000, "")
+                        await _send_downstream(websocket, _identity_expose_frame(frame_text, identity_map))
+                    if not keep_downstream_open:
+                        await _close_downstream(websocket, 1000, "")
                     return result
 
                 if not committed:
@@ -2636,7 +2971,7 @@ async def _try_sse_channel(
                         await commit_pending()
                     continue
 
-                await _send_downstream(websocket, frame_text)
+                await _send_downstream(websocket, _identity_expose_frame(frame_text, identity_map))
     except WebSocketDisconnect:
         if result.request_finalized:
             return result
@@ -3031,20 +3366,7 @@ async def _relay_ws_session(
                 proxy_bytes_down=proxy_bytes.down,
             ))
         else:
-            finalize_policy.apply_error_health_effects(
-                finalize_policy.error_plan(
-                    result.outcome,
-                    failure_policy="runtime",
-                    http_status=result.http_status,
-                ),
-                scorer=scorer,
-                cooldown=cooldown,
-                channel_key=channel_state.effect_key(ch),
-                model=resolved_model,
-                error_detail=result.error_detail,
-                connect_ms=result.connect_ms,
-                cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
-            )
+            _apply_ws_error_health(result, ch, resolved_model)
             await await_ws_owned(asyncio.to_thread(
                 log_db.finish_error,
                 request_id,
@@ -3774,6 +4096,21 @@ def _capture_codex_response_event(
     return captured
 
 
+def _apply_ws_error_health(result, ch, resolved_model) -> None:
+    from ..failover import _apply_codex_error_policy
+    capture_error_advice(result, codex=isinstance(ch, OpenAIOAuthChannel))
+    if _apply_codex_error_policy(ch, resolved_model, result):
+        return
+    if result.error_code in WS_RESET_CODES:
+        result.outcome = "connection_lifecycle"
+    finalize_policy.apply_error_health_effects(
+        finalize_policy.error_plan(result.outcome, failure_policy="runtime", http_status=result.http_status),
+        scorer=scorer, cooldown=cooldown, channel_key=channel_state.effect_key(ch),
+        model=resolved_model, error_detail=result.error_detail, connect_ms=result.connect_ms,
+        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
+    )
+
+
 async def _finalize_ws_attempt_after_accept(
     result: _WsAttemptResult,
     ch: Channel,
@@ -3784,21 +4121,7 @@ async def _finalize_ws_attempt_after_accept(
     start_time: float,
     start_monotonic: float,
 ) -> None:
-    plan = finalize_policy.error_plan(
-        result.outcome,
-        failure_policy="runtime",
-        http_status=result.http_status,
-    )
-    finalize_policy.apply_error_health_effects(
-        plan,
-        scorer=scorer,
-        cooldown=cooldown,
-        channel_key=channel_state.effect_key(ch),
-        model=resolved_model,
-        error_detail=result.error_detail,
-        connect_ms=result.connect_ms,
-        cooldown_until=(result.cooldown_until if result.http_status == 429 else None),
-    )
+    _apply_ws_error_health(result, ch, resolved_model)
     await asyncio.shield(asyncio.to_thread(
         log_db.finish_error,
         request_id,
@@ -4071,6 +4394,10 @@ async def _recv_until_first_visible_ws_event(
         result.error_detail = step.error_detail
         result.error_code = step.error_code
         result.http_status = step.http_status
+        result.error_advice = step.error_advice
+        if step.error_advice is not None:
+            result.retry_after_seconds = remaining_retry_delay(step)
+            result.cooldown_until = step.error_advice.cooldown_until
     if step.dispatch_committed:
         result.dispatch_committed = True
     if step.closed_after_accept:

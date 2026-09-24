@@ -35,6 +35,7 @@ from .channel.base import Channel, UpstreamDispatchMetadata
 from .channel.openai_oauth_channel import OpenAIOAuthChannel
 from .transform import cc_mimicry
 from .openai import compaction_owner, deepseek_reasoning, reasoning_replay
+from .openai.recovery import capture_error_advice, remaining_retry_delay, rebuild_full_request, WS_RESET_CODES
 from .openai.transform.guard import GuardError
 from .openai.codex_identity import (
     capture_turn_state_event,
@@ -405,8 +406,13 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
         return
 
     threshold = _get_quota_disable_threshold_pct()
-    primary_pct = snap.get("primary_used_pct")
-    secondary_pct = snap.get("secondary_used_pct")
+    def active_pct(name):
+        reset_at = snap.get(f"{name}_reset_at")
+        if isinstance(reset_at, (int, float)) and reset_at <= time.time():
+            return None
+        return snap.get(f"{name}_used_pct")
+    primary_pct = active_pct("primary")
+    secondary_pct = active_pct("secondary")
     over_threshold = False
     over_windows = []
     if primary_pct is not None and primary_pct >= threshold:
@@ -427,7 +433,7 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
         "secondary": ("secondary_used_pct", "secondary_reset_sec"),
     }
     for _name, (_pct_key, _sec_key) in _window_map.items():
-        _pct = snap.get(_pct_key)
+        _pct = active_pct(_name)
         if _pct is None or _pct < threshold:
             continue
         _sec = snap.get(_sec_key)
@@ -674,6 +680,9 @@ def _mark_request_invalid(result: AttemptResult, status: int) -> AttemptResult:
 
 
 def _request_invalid_result_if_needed(result: AttemptResult, channel=None) -> AttemptResult:
+    if isinstance(channel, OpenAIOAuthChannel) and result.error_code in WS_RESET_CODES:
+        result.outcome = "connection_lifecycle"
+        return result
     return request_invalid_result_if_needed(result, channel=channel)
 
 
@@ -1262,16 +1271,57 @@ async def _wait_for_overload_retry(
     if retry_after_seconds is None:
         delay = _overload_retry_delay_seconds(retry_ordinal)
     else:
-        parsed = parse_retry_after_seconds(retry_after_seconds)
+        from .openai.recovery import retry_delay
+        parsed = retry_delay(retry_after_seconds)
         delay = (
             _overload_retry_delay_seconds(retry_ordinal)
             if parsed is None
             else parsed
         )
-    if deadline_ts > 0 and time.time() + delay >= deadline_ts:
+    if delay > 60 or (deadline_ts > 0 and time.time() + delay >= deadline_ts):
         return None
     await asyncio.sleep(delay)
     return delay
+
+
+def _apply_codex_error_policy(ch: Channel, resolved_model: str, result) -> bool:
+    """Use existing account quota/CAS and channel-model cooldown, never guessed families."""
+    if not isinstance(ch, OpenAIOAuthChannel):
+        return False
+    advice = getattr(result, "error_advice", None)
+    if advice is None or advice.kind not in {"usage_limit", "quota", "entitlement", "rate_limit"}:
+        return False
+    if getattr(result, "_codex_policy_applied", False):
+        return True
+    result._codex_policy_applied = True
+    if advice.quota_snapshot:
+        _maybe_record_codex_snapshot(ch, None, snapshot=advice.quota_snapshot)
+    now = time.time()
+    reset = advice.reset_at
+    until = int(reset * 1000) if reset is not None and reset > now else advice.cooldown_until
+    if until is None or until <= int(now * 1000):
+        until = int((now + (60 if advice.kind == "rate_limit" else 600)) * 1000)
+    with oauth_manager.account_generation_guard(getattr(ch, "state_key", None)) as current:
+        if not current:
+            return True
+        if ((advice.kind == "usage_limit" and advice.active_limit == "codex")
+                or (advice.kind == "quota" and advice.active_limit in (None, "codex"))):
+            from datetime import datetime, timezone
+            observation = oauth_manager.codex_quota_observation(advice.quota_snapshot or {})
+            observation["limit_error"] = {
+                "code": advice.code, "observed_at": int(advice.observed_at * 1000),
+                "reset_ms": until,
+            }
+            oauth_manager.set_disabled_by_quota(
+                ch.account_key, datetime.fromtimestamp(until / 1000, timezone.utc).isoformat(),
+                observation=observation,
+            )
+        else:
+            # This is the existing (channel, requested-model) retry gate, not a
+            # new persistent family-to-model mapping or account health failure.
+            cooldown.record_error(channel_state.effect_key(ch), resolved_model,
+                                  result.error_detail, cooldown_until=until)
+    return True
 
 
 def _apply_zhipu_quota_cooldown(ch: Channel, resolved_model: str, result) -> bool:
@@ -1384,6 +1434,9 @@ def _attach_retry_after_from_response(
     response: httpx.Response | None,
     channel: Channel | None = None,
 ) -> AttemptResult:
+    if isinstance(channel, OpenAIOAuthChannel) or getattr(channel, "provider", "") == "openai":
+        return capture_error_advice(result, headers=getattr(response, "headers", None),
+                                    codex=isinstance(channel, OpenAIOAuthChannel))
     if result.retry_after_seconds is None and response is not None:
         try:
             raw = response.headers.get("Retry-After")
@@ -2117,6 +2170,8 @@ async def run_failover(
     transient_retry_limit = _transient_retry_limit(cfg)
     transient_retries_used = 0
     refreshed_once: set[str] = set()
+    codex_ws_recovered: set[str] = set()
+    codex_http_fallback: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
     retried_without_encrypted_content = False
     last_result: Optional[AttemptResult] = None
@@ -2167,7 +2222,7 @@ async def run_failover(
         attempt_handed_off = False
         attempt_started_monotonic = time.monotonic()
         _attempt_proxy: str | None = _pick_non_direct_proxy_name(ch, resolved_model)
-        use_responses_ws = _should_use_responses_upstream_ws(
+        use_responses_ws = ch.key not in codex_http_fallback and _should_use_responses_upstream_ws(
             ch, ingress_protocol=ingress_protocol, cfg=cfg,
         )
         try:
@@ -2321,6 +2376,28 @@ async def run_failover(
         # 非成功：立即释放 slot，进入下一候选
         _release_once()
 
+        if isinstance(ch, OpenAIOAuthChannel) and use_responses_ws:
+            recovery_code = result.error_code in WS_RESET_CODES
+            fallback = result.http_status == 426
+            allowed = _recovery_retry_allowed(
+                "codexHttpFallback" if fallback else "codexWebsocketRecovery", cfg,
+            )
+            if allowed and ((recovery_code and ch.key not in codex_ws_recovered)
+                            or (fallback and ch.key not in codex_http_fallback)):
+                full = rebuild_full_request(body, api_key_name=api_key_name or "",
+                                            channel_key=ch.key, model=resolved_model)
+                if full is not None and not (fallback and full.get("generate") is False):
+                    body = full
+                    if fallback:
+                        codex_http_fallback.add(ch.key)
+                    else:
+                        codex_ws_recovered.add(ch.key)
+                    retry_count += 1
+                    continue
+            if recovery_code:
+                # An unresolved state anchor cannot be retried on another account.
+                result.outcome = "request_invalid"
+
         # Antigravity's explicit quota reasons (or RetryInfo >=5 minutes) are
         # account-wide, not a model-local throttle. Advance the existing quota
         # observation generation before moving to another candidate so recovery
@@ -2429,6 +2506,9 @@ async def run_failover(
             and (getattr(ch, "provider", "") != "workbuddy" or result.http_status == 401)
             and not result.openai_oauth_html_403
             and quota_exhaustion is None
+            and getattr(getattr(result, "error_advice", None), "kind", "") not in {
+                "usage_limit", "quota", "entitlement", "rate_limit",
+            }
             and ch.key not in refreshed_once
         ):
             refreshed_once.add(ch.key)
@@ -2509,7 +2589,7 @@ async def run_failover(
             delay = await _wait_for_overload_retry(
                 transient_retries_used,
                 deadline_ts,
-                retry_after_seconds=result.retry_after_seconds,
+                retry_after_seconds=remaining_retry_delay(result),
             )
             if delay is not None:
                 transient_retries_used += 1
@@ -2520,6 +2600,13 @@ async def run_failover(
                     f"{transient_retry_limit}) after {delay:.2f}s"
                 )
                 continue
+
+        # Explicit quota/entitlement/rate errors use bounded existing gates,
+        # not the generic failure ladder or an account health penalty.
+        if _apply_codex_error_policy(ch, resolved_model, result):
+            retry_count += 1
+            idx += 1
+            continue
 
         # 普通失败处理；HTML 403 只推进候选，不归咎账号或渠道健康。
         if not result.openai_oauth_html_403:
@@ -2765,7 +2852,8 @@ async def run_failover(
                     and quota_errors.is_zhipu_plan_excluded_message(result.error_detail)
                     and _apply_zhipu_quota_cooldown(ch, resolved_model, result)
                 )
-                if not result.openai_oauth_html_403 and not plan_excluded_handled:
+                codex_handled = _apply_codex_error_policy(ch, resolved_model, result)
+                if not result.openai_oauth_html_403 and not plan_excluded_handled and not codex_handled:
                     plan = finalize_policy.error_plan(
                         result.outcome,
                         failure_policy="runtime",
@@ -3180,12 +3268,12 @@ class _WsResponsesTracker:
         if typ == "error" or isinstance(evt.get("error"), dict):
             self.response_failed = True
             _status, self.stream_error_message = _ws_error_detail(text)
-            self.stream_error_code = None
+            self.stream_error_code = protocol_errors.extract_error_info(evt)[0]
             return
         if typ == "response.failed":
             self.response_failed = True
             _status, self.stream_error_message = _ws_error_detail(text)
-            self.stream_error_code = None
+            self.stream_error_code = protocol_errors.extract_error_info(evt)[0]
             request_failure = protocol_errors.responses_request_failure_info(evt)
             if request_failure is not None:
                 self.request_failed = True
@@ -3874,6 +3962,7 @@ async def _recv_oauth_ws_until_visible(
         outcome=step.outcome,
         error_detail=step.error_detail,
         error_code=step.error_code,
+        error_advice=step.error_advice,
         http_status=step.http_status,
         # response.created commits upstream dispatch even though it isn't
         # downstream-visible output. Treat a later error as committed so the
@@ -4107,9 +4196,11 @@ async def _finalize_oauth_ws_error(
     identity_state: ProtocolIdentityMap,
     timing: WsAttemptTiming,
 ) -> None:
-    result = _request_invalid_result_if_needed(result)
+    result = _request_invalid_result_if_needed(result, ch)
+    capture_error_advice(result, payload=tracker.get_full_response(), codex=isinstance(ch, OpenAIOAuthChannel))
+    codex_handled = _apply_codex_error_policy(ch, resolved_model, result)
     plan = finalize_policy.error_plan(
-        result.outcome,
+        "connection_lifecycle" if codex_handled else result.outcome,
         failure_policy="cooldown_only",
         http_status=result.http_status,
     )
@@ -5523,8 +5614,13 @@ async def _consume_stream(
         # 不是渠道健康问题，即使在流中途才被上游明确揭示，也按 runtime
         # request_invalid 语义处理，避免误伤渠道评分/冷却。
         failure_policy = "runtime" if outcome == "request_invalid" else "post_commit_stream"
+        quota_result = AttemptResult(outcome=outcome, error_detail=message,
+                                     http_status=upstream_status, full_response_text=tracker.get_full_response())
+        capture_error_advice(quota_result, headers=getattr(upstream_resp, "headers", None),
+                             codex=isinstance(ch, OpenAIOAuthChannel))
+        codex_handled = _apply_codex_error_policy(ch, resolved_model, quota_result)
         plan = finalize_policy.error_plan(
-            outcome,
+            "connection_lifecycle" if codex_handled else outcome,
             failure_policy=failure_policy,
             http_status=(400 if outcome == "request_invalid" else upstream_status),
         )

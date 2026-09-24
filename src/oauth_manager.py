@@ -2221,6 +2221,12 @@ def _merge_codex_quota_observations(*observations: dict | None) -> dict | None:
     merged["windows"] = openai_provider.merge_codex_window_observations(
         *(_codex_windows_from_observation(observation) for observation in valid),
     )
+    errors = [o["limit_error"] for o in valid if isinstance(o.get("limit_error"), dict)]
+    if errors:
+        merged["limit_error"] = copy.deepcopy(max(errors, key=lambda e: (
+            _ms_timestamp(e.get("observed_at")) or 0,
+            _ms_timestamp(e.get("reset_ms")) or 0,
+        )))
     return merged
 
 
@@ -2263,7 +2269,7 @@ def _persistent_codex_observation(account_key: str) -> dict | None:
         return None
     if observation.get("source") != _CODEX_OBSERVATION_SOURCE:
         return None
-    if not _codex_windows_from_observation(observation):
+    if not _codex_windows_from_observation(observation) and not isinstance(observation.get("limit_error"), dict):
         return None
     return observation
 
@@ -2419,7 +2425,39 @@ def _cached_openai_codex_quota_hit(account_key: str, threshold: float,
     hits: list[str] = []
     resets: list[str | None] = []
 
-    for semantic, candidates in _codex_window_candidates(account_key, row).items():
+    # An explicit primary-family refusal is evidence even when no percentage
+    # window was supplied. Do not invent a primary/secondary utilization for it.
+    observation = _persistent_codex_observation(account_key) or {}
+    limit_error = observation.get("limit_error") or {}
+    error_until = limit_error.get("reset_ms")
+    error_observed = limit_error.get("observed_at")
+    window_candidates = _codex_window_candidates(account_key, row)
+    fresh_low_windows = {
+        candidate["raw_name"]
+        for candidates in window_candidates.values() for candidate in candidates
+        if isinstance(error_observed, int)
+        and candidate["observed_ms"] is not None
+        and candidate["observed_ms"] > error_observed
+        and candidate["pct"] < threshold
+        and (candidate["reset_ms"] is None or candidate["reset_ms"] > now_ms)
+    }
+    if isinstance(error_until, int) and error_until > now_ms:
+        superseded = bool(
+            isinstance(error_observed, int) and usage_ms is not None
+            and usage_ms - error_observed >= _CODEX_SNAPSHOT_SUPERSEDED_BY_USAGE_MS
+            and wham_windows.get("five_hour") is not None
+            and wham_windows.get("seven_day") is not None
+            and all(value < threshold for value in wham_windows.values() if value is not None)
+        )
+        # Usage percentages do not prove that a separate credit/spend cap was lifted.
+        superseded = limit_error.get("code") == "usage_limit_reached" and (
+            superseded or {"primary", "secondary"} <= fresh_low_windows
+        )
+        if not superseded:
+            hits.append(f"codex {limit_error.get('code') or 'usage_limit_reached'}")
+            resets.append(_iso_from_ms(error_until))
+
+    for semantic, candidates in window_candidates.items():
         for candidate in candidates:
             pct = candidate["pct"]
             if pct < threshold:
@@ -4520,9 +4558,9 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None, *,
                           observation: dict | None = None) -> dict:
     """Persist a quota disable and advance its observation generation.
 
-    Repeated real-time observations keep the original disabled_until but still
-    advance the generation. This makes a concurrent recovery CAS fail even when
-    the auxiliary SQLite snapshot could not be written.
+    Repeated percentage observations retain the original disabled_until. Explicit
+    refusal observations update it from the merged server deadline. Both advance
+    the generation, so concurrent recovery CAS cannot erase new quota evidence.
     """
     canonical = _resolve_existing_account_key(account_key)
     has_prov = ":" in account_key
@@ -4585,6 +4623,12 @@ def set_disabled_by_quota(account_key: str, resets_at: str | None, *,
                 decision["disabled_until"] = resets_at
             else:
                 decision["state"] = "already_quota_disabled"
+                if isinstance(observation, dict) and isinstance(observation.get("limit_error"), dict):
+                    latest_error = (acc.get(_QUOTA_OBSERVATION_FIELD) or {}).get("limit_error") or {}
+                    latest_reset = _ms_timestamp(latest_error.get("reset_ms"))
+                    if latest_reset is not None:
+                        acc["disabled_until"] = _iso_from_ms(latest_reset)
+                        decision["disabled_until"] = acc["disabled_until"]
             decision["quota_observation_generation"] = next_generation
             return
 
