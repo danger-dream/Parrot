@@ -17,6 +17,9 @@ config whose DB/log/image paths are all below that root, marks the environment
 for ``conftest.py``, then ``exec`` replaces this process with a fresh pytest
 interpreter.  No ``src`` module can be imported before those steps.
 
+With pytest-xdist installed, test runs default to at most four CPU-affinity-
+bounded workers using work stealing. Explicit CLI/PYTEST_ADDOPTS choices win;
+use -n 0 for serial debugging. The ten slowest phases are shown by default.
 The handoff and dependency check deliberately use only Python stdlib modules.
 """
 
@@ -26,6 +29,7 @@ from importlib import metadata
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 import tempfile
 
@@ -113,6 +117,39 @@ def _ensure_controlled_interpreter(argv: list[str]) -> None:
     _require_websockets_contract()
 
 
+def _default_workers() -> int:
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 1
+    return max(1, min(4, available))
+
+
+def _pytest_defaults(argv: list[str], *, xdist_available: bool) -> list[str]:
+    """Supply fast defaults without overriding explicit pytest options."""
+    cli = argv[:argv.index("--")] if "--" in argv else argv
+    options = shlex.split(os.environ.get("PYTEST_ADDOPTS", "")) + cli
+
+    def has_option(*names: str) -> bool:
+        return any(
+            arg == name or arg.startswith(name + "=")
+            or (name == "-n" and arg.startswith("-n") and len(arg) > 2)
+            for arg in options for name in names
+        )
+
+    defaults = []
+    inspect_only = any(arg in {"--collect-only", "--co", "--help", "-h", "--version"}
+                       for arg in options)
+    if xdist_available and not inspect_only:
+        if not has_option("-n", "--numprocesses", "--tx", "-d"):
+            defaults += ["-n", str(_default_workers())]
+        if not has_option("--dist"):
+            defaults += ["--dist=worksteal"]
+    if not has_option("--durations"):
+        defaults += ["--durations=10"]
+    return defaults
+
+
 def main(argv: list[str]) -> int:
     early_src = sorted(name for name in sys.modules if name == "src" or name.startswith("src."))
     if early_src:
@@ -174,17 +211,21 @@ def main(argv: list[str]) -> int:
         print("ISOLATION_ZERO_SRC_IMPORT_PROBE_OK", flush=True)
         return 0
     plugins = ["-p", "pytest_asyncio.plugin"]
-    # PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 会同时屏蔽 xdist 的 entrypoint，因此需要
-    # 在已安装时显式加载它，``-n`` 才能直接使用。未安装 xdist 时不加载，
-    # 串行运行行为保持不变（xdist 只在给出 -n 时才真正介入）。
+    # Auto-loading is disabled for isolation, so load xdist explicitly.
+    xdist_available = False
     try:
         import importlib.util
 
-        if importlib.util.find_spec("xdist.plugin") is not None:
-            plugins += ["-p", "xdist.plugin"]
+        xdist_available = importlib.util.find_spec("xdist.plugin") is not None
     except (ImportError, ValueError):
         pass
-    command = [sys.executable, "-m", "pytest", *plugins, *argv]
+    if xdist_available:
+        plugins += ["-p", "xdist.plugin"]
+    else:
+        print("[tests] pytest-xdist unavailable; running serial. "
+              "Install requirements-dev.txt to enable default parallelism.", flush=True)
+    defaults = _pytest_defaults(argv, xdist_available=xdist_available)
+    command = [sys.executable, "-m", "pytest", *plugins, *defaults, *argv]
     os.execvpe(sys.executable, command, env)
     return 127
 

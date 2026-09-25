@@ -103,6 +103,10 @@ def _setup(m):
     m["state_db"].error_delete()
     m["state_db"].affinity_delete()
     m["state_db"].client_affinity_delete()
+    # Each setup installs fresh synthetic accounts. Discard quota observations
+    # too, including future-dated low windows left by clock-controlled tests.
+    for row in m["state_db"].quota_load_all():
+        m["state_db"].quota_delete(row["account_key"])
     for mod_name in ("affinity", "cooldown", "scorer"):
         mod = m[mod_name]
         mod._initialized = False

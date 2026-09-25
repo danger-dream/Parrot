@@ -132,11 +132,16 @@ python3 -m venv venv
 # 需要运行测试时再安装开发依赖
 ./venv/bin/pip install -r requirements-dev.txt
 # 测试必须经隔离入口启动；用系统 python3 启动同一脚本也会自动切换到此 venv
+# 默认最多 4 个进程（不超过 CPU affinity）、worksteal 调度、显示最慢 10 项
 ./venv/bin/python src/tests/isolated_pytest.py src/tests -q
+# 排查顺序/共享状态问题，或只跑少量用例时，可显式串行
+./venv/bin/python src/tests/isolated_pytest.py src/tests/test_isolation_guard.py -q -n 0
 
 # 编辑 config.json（首次启动会生成基础配置；OpenAI OAuth 默认跟随打包的当前 Codex profile）
 ./venv/bin/python server.py
 ```
+
+测试入口尊重显式 `-n` / `--numprocesses`、`--dist`、`--durations`（含 `PYTEST_ADDOPTS`），不会改写用户指定值；未安装 `pytest-xdist` 时会提示并退回串行。每个并行进程仍使用独立测试数据目录并禁止真实外网请求。日常修改先跑受影响测试，最终验收及发布保留全量与跨 Python 版本回归；CI 使用同一入口和默认并行策略。
 
 ### Codex 协议 profile（OpenAI OAuth）
 

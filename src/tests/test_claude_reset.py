@@ -103,7 +103,7 @@ def test_wire_confirmed_only_and_duplicate_capability(env, program):
         assert body["grant_id"] == "g_one"
         assert 1 <= len(body["request_id"]) <= 64
     assert call["timeout"] == 25
-    assert call["headers"]["User-Agent"] == "claude-cli/2.1.280 (external, sdk-cli)"
+    assert call["headers"]["User-Agent"] == "claude-cli/2.1.282 (external, sdk-cli)"
     with pytest.raises(ManagementError):
         env.control.execute_claude_reset(env.ctx, env.key, token)
     assert len(env.posts) == 1

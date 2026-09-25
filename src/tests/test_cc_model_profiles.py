@@ -78,6 +78,19 @@ async def test_channel_default_profiles(auth, model, maximum, thinking, effort):
     assert ("effort" in wire.get("output_config", {})) is effort
     assert "fallbacks" not in wire
     assert cc.SERVER_SIDE_FALLBACK_BETA not in req.headers["anthropic-beta"]
+    assert cc.FALLBACK_CREDIT_BETA not in req.headers["anthropic-beta"]
+    assert cc.ADVISOR_TOOL_BETA not in req.headers["anthropic-beta"]
+    assert "anthropic-dispatch-id" not in req.headers
+    if cc.canonical_model(model) == "claude-haiku-4-5":
+        assert req.headers["x-claude-code-request-class"] == "main"
+        assert req.headers["anthropic-beta"].split(",") == [
+            cc.INTERLEAVED_THINKING_BETA, cc.THINKING_TOKEN_COUNT_BETA,
+            cc.CONTEXT_MANAGEMENT_BETA, cc.PROMPT_CACHING_SCOPE_BETA,
+            "claude-code-20250219",
+            *([cc.OAUTH_BETA] if auth == "oauth" else []),
+            cc.ADVANCED_TOOL_USE_BETA, cc.THINKING_BINDING_CONTROLS_BETA,
+            cc.CACHE_DIAGNOSIS_BETA,
+        ]
     if not effort:
         assert cc.EFFORT_BETA not in req.headers["anthropic-beta"]
     if thinking is None:
@@ -129,6 +142,12 @@ async def test_explicit_fallback_is_preserved_and_beta_is_opt_in(auth, fallback)
     assert wire["fallbacks"] == fallback
     assert cc.SERVER_SIDE_FALLBACK_BETA in req.headers["anthropic-beta"]
     assert cc.FALLBACK_CREDIT_BETA in req.headers["anthropic-beta"]
+    betas = req.headers["anthropic-beta"].split(",")
+    start = betas.index(cc.SERVER_SIDE_FALLBACK_BETA)
+    assert betas[start:start + 3] == [
+        cc.SERVER_SIDE_FALLBACK_BETA, cc.FALLBACK_CREDIT_BETA,
+        cc.THINKING_BINDING_CONTROLS_BETA,
+    ]
     without = {k: v for k, v in wire.items() if k != "fallbacks"}
     assert cc.cch_hash_view(without) == cc.cch_hash_view(wire)
 
@@ -168,6 +187,68 @@ async def test_haiku_implicit_thinking_cannot_invalidate_explicit_controls(auth,
     for key in ("max_tokens", "temperature", "top_p", "top_k"):
         if key in control:
             assert wire[key] == control[key]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth", ["api_key", "oauth", "compatible"])
+@pytest.mark.parametrize("text,system,side_query", [
+    ("<session>title</session>", "context", True),
+    ("ordinary prompt", "<session>system-only</session>", False),
+])
+async def test_haiku_classification_survives_system_injection(auth, text, system, side_query):
+    model = "claude-haiku-4-5-20251001"
+    body = {
+        "model": "haiku-alias", "messages": [{"role": "user", "content": text}],
+        "system": system, "output_config": {},
+    }
+    before = copy.deepcopy(body)
+    req = await channel(auth, model).build_upstream_request(body, model)
+    wire = decoded(req)
+    assert body == before
+    assert wire["model"] == model
+    assert wire["output_config"] == {}
+    assert wire["thinking"]["type"] == ("disabled" if side_query else "enabled")
+    assert ("cc_prompt_id=" in wire["system"][0]["text"]) is not side_query
+    assert ("x-claude-code-request-class" not in req.headers) is side_query
+    common = [cc.INTERLEAVED_THINKING_BETA, cc.THINKING_TOKEN_COUNT_BETA,
+              cc.CONTEXT_MANAGEMENT_BETA, cc.PROMPT_CACHING_SCOPE_BETA]
+    if side_query:
+        expected = ([cc.OAUTH_BETA] if auth == "oauth" else []) + common + [
+            cc.STRUCTURED_OUTPUTS_BETA, cc.CACHE_DIAGNOSIS_BETA,
+        ]
+    else:
+        expected = common + ["claude-code-20250219"] + (
+            [cc.OAUTH_BETA] if auth == "oauth" else []
+        ) + [cc.ADVANCED_TOOL_USE_BETA, cc.THINKING_BINDING_CONTROLS_BETA,
+             cc.CACHE_DIAGNOSIS_BETA]
+    assert req.headers["anthropic-beta"].split(",") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_fallback", [False, True])
+async def test_haiku_omit_thinking_preserves_remaining_betas_and_explicit_fallback(explicit_fallback):
+    model = "claude-haiku-4-5"
+    ch = channel("compatible", model)
+    ch.omit_thinking = True
+    body = {"model": model, "messages": [{"role": "user", "content": "hello"}]}
+    if explicit_fallback:
+        body["fallbacks"] = []
+    req = await ch.build_upstream_request(body, model)
+    wire = decoded(req)
+    assert "thinking" not in wire and "context_management" not in wire
+    if explicit_fallback:
+        assert wire["fallbacks"] == []
+    else:
+        assert "fallbacks" not in wire
+    betas = req.headers["anthropic-beta"].split(",")
+    assert not any("thinking" in beta for beta in betas)
+    assert cc.ADVANCED_TOOL_USE_BETA in betas and cc.CACHE_DIAGNOSIS_BETA in betas
+    assert (cc.SERVER_SIDE_FALLBACK_BETA in betas) is explicit_fallback
+    assert (cc.FALLBACK_CREDIT_BETA in betas) is explicit_fallback
+    assert cc.OAUTH_BETA not in betas and cc.ADVISOR_TOOL_BETA not in betas
+    assert req.headers["x-claude-code-request-class"] == "main"
+    assert "anthropic-dispatch-id" not in req.headers
+    assert req.headers["Authorization"] == "Bearer fake-api-key"
 
 
 @pytest.mark.asyncio

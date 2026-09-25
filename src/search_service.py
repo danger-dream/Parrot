@@ -11,7 +11,6 @@ import copy
 import html
 import ipaddress
 import json
-import os
 import re
 import time
 import uuid
@@ -22,6 +21,10 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import config, network
+from .search_config import (
+    ACCOUNT_TYPES, BACKEND_TYPES, DEFAULTS, ENDPOINTS, EXTRACT_TYPES,
+    KEY_TYPES, MODES, NAMES, default_backend, settings,
+)
 from .search_xai import (
     X_SEARCH_ONLY_FIELDS,
     build_evidence_index as _xai_build_evidence_index,
@@ -30,26 +33,6 @@ from .search_xai import (
     normalize_x_search_date,
 )
 
-MODES = ("managed", "passthrough", "disabled")
-BACKEND_TYPES = ("anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic", "zhipu")
-KEY_TYPES = frozenset(("anysearch", "tavily", "exa", "brave", "zhipu"))
-ACCOUNT_TYPES = frozenset(("openai", "xai", "anthropic", "zhipu"))
-EXTRACT_TYPES = frozenset(("anysearch", "tavily", "exa", "openai", "zhipu"))
-ENDPOINTS = {
-    "anysearch": "https://api.anysearch.com",
-    "tavily": "https://api.tavily.com",
-    "exa": "https://api.exa.ai",
-    "brave": "https://api.search.brave.com",
-}
-NAMES = {"anysearch": "AnySearch", "tavily": "Tavily", "exa": "Exa", "brave": "Brave",
-         "openai": "OpenAI OAuth", "xai": "xAI OAuth", "anthropic": "Anthropic OAuth", "zhipu": "智谱 MCP"}
-DEFAULTS = {
-    "functionMode": "managed", "hostedMode": "managed", "maxAttempts": 3,
-    "timeoutSeconds": 10, "maxResults": 8, "maxToolRounds": 50,
-    "maxFetchChars": 50000, "minQueryChars": 2, "maxFetchUrlChars": 2048,
-    "requireKnownUrlForFetch": True, "maxConcurrentToolCalls": 0,
-    "language": "", "country": "", "freshness": "",
-}
 _FRESH_DAYS = {"day": 1, "week": 7, "month": 31, "year": 365}
 # Portable returned-text budgets, not guesses at a provider's tokenizer/window.
 _CONTEXT_CHARS = {"low": 4000, "medium": 12000, "high": 24000}
@@ -60,38 +43,6 @@ class SearchError(RuntimeError):
                  retryable: bool = True):
         super().__init__(message)
         self.message, self.code, self.status_code, self.retryable = message, code, status_code, retryable
-
-
-def default_backend(kind: str) -> dict:
-    return {"id": kind, "type": kind, "name": NAMES[kind], "enabled": True,
-            "apiKeys": [], "endpoint": ENDPOINTS.get(kind, ""), "model": "",
-            "accountIds": [], "allowDisabledAccounts": False}
-
-
-def settings() -> dict:
-    """Effective config; intentionally private (it contains secrets). Never persist on read."""
-    cfg = config.get()
-    legacy = cfg.get("anysearch") or {}
-    current = cfg.get("search") or {}
-    result = copy.deepcopy(DEFAULTS)
-    if isinstance(legacy, dict):
-        for key in ("timeoutSeconds", "maxResults", "maxFetchChars", "maxToolRounds", "minQueryChars",
-                    "maxFetchUrlChars", "requireKnownUrlForFetch", "maxConcurrentToolCalls"):
-            if key in legacy:
-                result[key] = copy.deepcopy(legacy[key])
-        # Explicit old opt-out must not silently start interception on upgrade.
-        if legacy.get("enabled") is False:
-            result.update(functionMode="passthrough", hostedMode="passthrough")
-    if isinstance(current, dict):
-        result.update(copy.deepcopy(current))
-    if "backends" not in result:
-        result["backends"] = [default_backend(kind) for kind in BACKEND_TYPES]
-        key = str(legacy.get("apiKey") or os.environ.get("ANYSEARCH_API_KEY", "")).strip()
-        result["backends"][0]["apiKeys"] = [key] if key else []
-        endpoint = str(legacy.get("endpoint") or ENDPOINTS["anysearch"]).rstrip("/")
-        # Known legacy MCP URL migrates to the same origin's documented REST API.
-        result["backends"][0]["endpoint"] = endpoint.removesuffix("/mcp")
-    return result
 
 
 def _keys(backend: dict) -> list[str]:

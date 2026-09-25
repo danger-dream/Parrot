@@ -189,7 +189,7 @@ def _assert_search_discovery(metadata, capabilities):
     assert features["management-search"] == 10
     assert "antigravity-media" not in domains and "antigravity-media" not in features
     enums = {item["name"]: set(item["values"]) for item in metadata["enums"]}
-    assert enums["SearchBackendCreate.type"] == {"anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic"}
+    assert enums["SearchBackendCreate.type"] == {"anysearch", "tavily", "exa", "brave", "openai", "xai", "anthropic", "zhipu"}
     for field in ("functionMode", "hostedMode"):
         assert enums["SearchSettingsData." + field] == {"managed", "passthrough", "disabled"}
 

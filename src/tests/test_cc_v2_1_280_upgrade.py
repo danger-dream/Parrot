@@ -1,4 +1,4 @@
-"""Claude Code v2.1.280/Fable wire-model regression tests.
+"""Claude Code v2.1.282 wire profiles and v2.1.280 CCH compatibility tests.
 
 Real fixtures are local, read-only captures.  They are never sent upstream; when
 that corpus is not mounted, only corpus-specific tests skip.
@@ -41,18 +41,20 @@ MAIN_BETAS = (
     "thinking-token-count-2026-05-13,context-management-2025-06-27,"
     "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,"
     "mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,"
-    "effort-2025-11-24,fallback-credit-2026-06-01,"
+    "effort-2025-11-24,"
     "thinking-binding-controls-2026-08-01,cache-diagnosis-2026-04-07"
 )
 FABLE_BETAS = MAIN_BETAS.replace(
-    "fallback-credit-2026-06-01",
-    "server-side-fallback-2026-06-01,fallback-credit-2026-06-01",
+    "thinking-binding-controls-2026-08-01",
+    "server-side-fallback-2026-06-01,fallback-credit-2026-06-01,"
+    "thinking-binding-controls-2026-08-01",
 )
 OPUS_5_BETAS = MAIN_BETAS
 HAIKU_MAIN_BETAS = (
     "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,"
     "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
-    "claude-code-20250219"
+    "claude-code-20250219,advanced-tool-use-2025-11-20,"
+    "thinking-binding-controls-2026-08-01,cache-diagnosis-2026-04-07"
 )
 SIDE_BETAS = (
     "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,"
@@ -103,21 +105,21 @@ def _fixture_billing(body: dict) -> str:
     )
 
 
-def test_v280_constants_and_stainless_versions():
-    assert m.CC_VERSION == "2.1.280"
+def test_v282_constants_and_stainless_versions():
+    assert m.CC_VERSION == "2.1.282"
     assert m.FINGERPRINT_SALT == "59cf53e54c78"
     assert m.FINGERPRINT_INDICES == (4, 7, 20)
     assert m.CCH_SEED == 0x4D659218E32A3268
-    assert m.CLI_USER_AGENT == "claude-cli/2.1.280 (external, sdk-cli)"
+    assert m.CLI_USER_AGENT == "claude-cli/2.1.282 (external, sdk-cli)"
     assert m._STAINLESS_HEADERS["X-Stainless-Package-Version"] == "0.112.1"
     assert m._STAINLESS_HEADERS["X-Stainless-Runtime-Version"] == "v26.3.0"
 
 
 def test_fingerprint_fixed_vectors_and_utf16_emoji():
-    assert m.compute_fingerprint(_messages("say hi")) == "31f"
-    assert m.compute_fingerprint(_messages("what is 2+2")) == "853"
+    assert m.compute_fingerprint(_messages("say hi")) == "a7a"
+    assert m.compute_fingerprint(_messages("what is 2+2")) == "8d5"
     emoji = "ab🚀d🚀f🚀hijklmnopqr🚀t"
-    assert m.compute_fingerprint(_messages(emoji)) == "bc3"
+    assert m.compute_fingerprint(_messages(emoji)) == "128"
 
 
 def test_fingerprint_selected_lone_surrogate_hashes_as_replacement_character():
@@ -138,13 +140,15 @@ def test_fingerprint_selects_first_valid_non_meta_text_before_injection():
         ]},
     ]
     assert m.select_fingerprint_prompt(messages) == "what is 2+2"
-    assert m.compute_fingerprint(messages) == "853"
+    assert m.compute_fingerprint(messages) == "8d5"
     side = _messages("<session>\nwhat is 2+2\n</session>")
     assert m.select_fingerprint_prompt(side).startswith("<session>")
 
 
 @CORPUS_SKIP
-def test_fingerprint_matches_all_v280_representative_bodies():
+def test_fingerprint_matches_all_v280_representative_bodies(monkeypatch):
+    # Historical captures contain the historical version as hash material.
+    monkeypatch.setattr(m, "CC_VERSION", "2.1.280")
     assert len(BODY_FILES) == 8
     for path in BODY_FILES:
         body = json.loads(path.read_bytes())
@@ -153,6 +157,21 @@ def test_fingerprint_matches_all_v280_representative_bodies():
             _fixture_billing(body),
         ).group(1)
         assert m.compute_fingerprint(body["messages"]) == expected, path.name
+
+
+def test_v282_captured_fingerprint_and_cch():
+    root = Path("/opt/workspace/claude-code-cch/v2.1.282-full")
+    files = [*sorted((root / "bodies").glob("*.bin")),
+             *sorted((root / "bodies_netns").glob("*.bin"))]
+    if not files:
+        pytest.skip("v282 local captures not present")
+    for path in files:
+        body = json.loads(path.read_bytes())
+        billing = _fixture_billing(body)
+        fp = re.search(r"cc_version=2\.1\.282\.([0-9a-f]{3})", billing).group(1)
+        cch = re.search(r"cch=([0-9a-f]{5});", billing).group(1)
+        assert m.compute_fingerprint(body["messages"]) == fp, path
+        assert m.compute_cch(body) == cch, path
 
 
 @CORPUS_SKIP
@@ -317,7 +336,29 @@ def test_main_profiles_have_exact_observed_betas(dynamic_cch):
         model="claude-haiku-4-5", payload=haiku,
     )
     assert haiku_h["anthropic-beta"] == HAIKU_MAIN_BETAS
-    assert "x-claude-code-request-class" not in haiku_h
+    assert haiku_h["x-claude-code-request-class"] == "main"
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("claude-fable-5.1", MAIN_BETAS),
+    ("claude-opus-5", MAIN_BETAS),
+    ("claude-haiku-4-5", HAIKU_MAIN_BETAS),
+    ("claude-haiku-4-5-20251001", HAIKU_MAIN_BETAS),
+])
+@pytest.mark.parametrize("auth_mode", ["api_key", "oauth", "compatible"])
+def test_v282_default_profiles_without_network_experiments(dynamic_cch, model, expected, auth_mode):
+    _, payload = _transform(model, auth_mode=auth_mode)
+    headers = m.build_upstream_headers(
+        "fake", auth_scheme="api_key" if auth_mode == "api_key" else "bearer",
+        auth_mode=auth_mode, model=model, payload=payload,
+    )
+    if auth_mode == "oauth":
+        expected = expected.replace("claude-code-20250219", "claude-code-20250219," + m.OAUTH_BETA)
+    assert headers["anthropic-beta"] == expected
+    assert headers["x-claude-code-request-class"] == "main"
+    assert "fallbacks" not in payload
+    assert "anthropic-dispatch-id" not in headers
+    assert m.ADVISOR_TOOL_BETA not in headers["anthropic-beta"]
 
 
 def test_side_query_api_and_oauth_profiles(dynamic_cch):
@@ -340,6 +381,7 @@ def test_side_query_api_and_oauth_profiles(dynamic_cch):
         model="claude-haiku-4-5-20251001", payload=payload,
     )
     assert api_h["anthropic-beta"] == SIDE_BETAS
+    assert "x-claude-code-request-class" not in api_h
 
     oauth_h = m.build_upstream_headers(
         "oat", session_id=request[m.PARROT_CC_SESSION_ID_KEY],
@@ -347,6 +389,7 @@ def test_side_query_api_and_oauth_profiles(dynamic_cch):
         model="claude-haiku-4-5-20251001", payload=payload,
     )
     assert oauth_h["anthropic-beta"] == OAUTH_SIDE_BETAS
+    assert "x-claude-code-request-class" not in oauth_h
     assert oauth_h["Authorization"] == "Bearer oat"
     assert "x-api-key" not in oauth_h
 
@@ -366,7 +409,7 @@ def test_explicit_user_semantics_are_preserved(dynamic_cch):
     assert payload["stream"] is False
 
 
-def test_oauth_fable_main_uses_captured_v280_profile_and_betas(dynamic_cch):
+def test_oauth_fable_main_uses_captured_v282_profile_and_betas(dynamic_cch):
     _, payload = _transform(
         "claude-fable-5.1",
         auth_mode="oauth",
@@ -395,7 +438,7 @@ def test_oauth_fable_main_uses_captured_v280_profile_and_betas(dynamic_cch):
     betas = headers["anthropic-beta"].split(",")
     assert betas[:2] == ["claude-code-20250219", m.OAUTH_BETA]
     assert m.SERVER_SIDE_FALLBACK_BETA not in betas
-    assert m.FALLBACK_CREDIT_BETA in betas
+    assert m.FALLBACK_CREDIT_BETA not in betas
     assert m.EXTENDED_CACHE_TTL_BETA in betas
     assert m.ADVISOR_TOOL_BETA not in betas
     assert headers["x-claude-code-request-class"] == "main"

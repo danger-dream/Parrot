@@ -14,8 +14,8 @@ from src.tests import test_tg_contract_oauth_support as oauth
 ROOT = Path(__file__).parent / 'fixtures/tg_contract'
 # channels_apikey grew from 11 to 24 for the API-key MCP changes, then to 25
 # when the reviewed cold-statistics channel entry was changed from a blocking
-# prompt to an operable empty management page.
-COUNTS = {'channels_apikey': 25, 'main_status': 11, 'oauth': 53,
+# prompt to an operable empty management page, then to 27 for edit/discovery traces.
+COUNTS = {'channels_apikey': 27, 'main_status': 11, 'oauth': 53,
           'auxiliary': 18, 'model_routing': 6, 'system': 9, 'core': 22}
 
 
@@ -35,7 +35,7 @@ def test_current_overlay_case_coverage_is_bidirectional_and_unique():
         extra_ids = list(current.OAUTH_ADDITION_CASE_IDS) if segment == 'oauth' else []
         assert [c['caseId'] for c in loaded] == [c['caseId'] for c in archived] + extra_ids
         assert [c['capabilityId'] for c in loaded] == [c['capabilityId'] for c in archived] + ['TG-OA-03'] * len(extra_ids)
-    assert len(seen) == 144  # includes MCP UI, cold-stat page, and notification trace
+    assert len(seen) == 146  # includes MCP UI, cold-stat page, notification and discovery traces
 
 
 @pytest.mark.parametrize('mutation', ['duplicate', 'unknown', 'capability'])

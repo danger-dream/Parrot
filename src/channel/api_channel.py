@@ -221,8 +221,10 @@ class ApiChannel(Channel):
             )
             auth_scheme = "api_key" if official_anthropic else "bearer"
             auth_mode = "api_key" if official_anthropic else "compatible"
+            side_query = cc_mimicry._is_side_query_request(body_with_model, resolved_model)
             payload, dynamic_map = cc_mimicry.transform_request(
-                body_with_model, email="", session_id=sid, auth_mode=auth_mode)
+                body_with_model, email="", session_id=sid, auth_mode=auth_mode,
+                side_query=side_query)
             if self.omit_temperature:
                 payload.pop("temperature", None)
             if self.omit_thinking:
@@ -252,7 +254,7 @@ class ApiChannel(Channel):
                 downstream_betas=downstream_betas, original_model=original_model,
                 wants_context_1m=wants_context_1m,
                 wants_fast_mode=wants_fast_mode,
-                allow_any_model_context_1m=True)
+                allow_any_model_context_1m=True, side_query=side_query)
         else:
             payload = standard.standard_transform(body_with_model)
             if self.omit_temperature:

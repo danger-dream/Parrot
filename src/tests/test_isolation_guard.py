@@ -114,3 +114,40 @@ def test_runner_without_venv_checks_current_interpreter(monkeypatch):
     runner._ensure_controlled_interpreter([])
 
     assert checked == [True]
+
+
+@pytest.mark.parametrize("cpus,expected", [(1, 1), (2, 2), (8, 4)])
+def test_default_workers_respect_cpu_affinity(monkeypatch, cpus, expected):
+    monkeypatch.setattr(runner.os, "sched_getaffinity", lambda _pid: set(range(cpus)), raising=False)
+    assert runner._default_workers() == expected
+
+
+def test_default_workers_fall_back_when_affinity_unavailable(monkeypatch):
+    monkeypatch.delattr(runner.os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(runner.os, "cpu_count", lambda: None)
+    assert runner._default_workers() == 1
+
+
+@pytest.mark.parametrize("argv,extra,expected", [
+    (["src/tests", "-q"], "", ["-n", "4", "--dist=worksteal", "--durations=10"]),
+    (["-n", "0"], "", ["--dist=worksteal", "--durations=10"]),
+    (["-n0"], "", ["--dist=worksteal", "--durations=10"]),
+    (["--numprocesses=2"], "", ["--dist=worksteal", "--durations=10"]),
+    (["--numprocesses", "2"], "", ["--dist=worksteal", "--durations=10"]),
+    (["--dist", "loadfile"], "", ["-n", "4", "--durations=10"]),
+    (["--dist=loadfile"], "", ["-n", "4", "--durations=10"]),
+    (["--durations=0"], "", ["-n", "4", "--dist=worksteal"]),
+    (["--durations", "20"], "", ["-n", "4", "--dist=worksteal"]),
+    (["src/tests"], "-n 0 --dist=no --durations=0", []),
+    (["--collect-only"], "", ["--durations=10"]),
+    (["--help"], "", ["--durations=10"]),
+])
+def test_runner_fast_defaults_preserve_explicit_options(monkeypatch, argv, extra, expected):
+    monkeypatch.setenv("PYTEST_ADDOPTS", extra)
+    monkeypatch.setattr(runner, "_default_workers", lambda: 4)
+    assert runner._pytest_defaults(argv, xdist_available=True) == expected
+
+
+def test_runner_without_xdist_does_not_add_unknown_options(monkeypatch):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    assert runner._pytest_defaults(["src/tests"], xdist_available=False) == ["--durations=10"]

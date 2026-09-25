@@ -104,8 +104,10 @@ class OAuthChannel(Channel):
         )
         body_with_model = cc_mimicry.ensure_request_context(body_with_model)
         sid = body_with_model[cc_mimicry.PARROT_CC_SESSION_ID_KEY]
+        side_query = cc_mimicry._is_side_query_request(body_with_model, resolved_model)
         payload, dynamic_map = cc_mimicry.transform_request(
-            body_with_model, email=self.email, session_id=sid, auth_mode="oauth")
+            body_with_model, email=self.email, session_id=sid, auth_mode="oauth",
+            side_query=side_query)
         signed = cc_mimicry.sign_body(payload)
         downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
         original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)
@@ -116,7 +118,7 @@ class OAuthChannel(Channel):
             model=resolved_model, payload=payload,
             downstream_betas=downstream_betas, original_model=original_model,
             wants_context_1m=wants_context_1m,
-            wants_fast_mode=wants_fast_mode)
+            wants_fast_mode=wants_fast_mode, side_query=side_query)
 
         return UpstreamRequest(
             url=f"{cc_mimicry.ANTHROPIC_API_BASE}/v1/messages?beta=true",

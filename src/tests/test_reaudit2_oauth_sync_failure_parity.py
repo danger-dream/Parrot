@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import time
 from dataclasses import dataclass, field
 from threading import Event
@@ -371,7 +372,13 @@ def test_overwrite_sync_launch_failure_uses_frozen_callback_failure_order(
     assert states.get_state(CHAT_ID) is None
     assert [event[0] for event in trace.events] == ["api", "edit", "send"]
     assert "正在同步模型，请稍候" in trace.events[1][3]
-    assert trace.events[2][2] == "❌ 内部错误，请稍后重试或联系管理员。"
+    assert re.fullmatch(
+        r"❌ <b>OAuth账户管理失败</b>\n"
+        r"操作未完成，请将故障编号提供给管理员排查。\n"
+        r"故障编号：<code>TG-\d{8}-[A-F0-9]{10}</code>\n"
+        r"涉及消费或提交时，请先核对结果，不要直接重复操作。",
+        trace.events[2][2],
+    ) is not None
     assert not any(event[0] == "answer" for event in trace.events)
     rendered = "\n".join(trace.visible_texts())
     assert "覆盖成功" not in rendered

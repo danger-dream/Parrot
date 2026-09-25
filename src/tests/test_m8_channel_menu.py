@@ -53,9 +53,24 @@ def _import_modules():
     }
 
 
+def _install_delete_clock(modules, monkeypatch):
+    cm = modules["channel_menu"]
+    modules["delete_delays"] = []
+
+    async def immediate_delete_wait(delay):
+        modules["delete_delays"].append(delay)
+
+    # Only replace this menu module's sleep binding, not global asyncio.sleep.
+    # The real reminder, delayed-delete coroutine and deleteMessage call still run.
+    monkeypatch.setattr(cm, "asyncio", SimpleNamespace(**{
+        **vars(cm.asyncio), "sleep": immediate_delete_wait,
+    }))
+    return modules
+
+
 @pytest.fixture
-def m():
-    return _import_modules()
+def m(monkeypatch):
+    return _install_delete_clock(_import_modules(), monkeypatch)
 
 
 class ApiRecorder:
@@ -731,6 +746,9 @@ def test_add_wizard_happy_path_save_ok(m):
     results = state["data"]["test_results"]
     assert len(results) == 2
     assert all(r[0] for r in results.values())
+    assert m["delete_delays"] == [8]
+    assert len(rec.by("deleteMessage")) == 1
+    assert "8 秒后自动删除" in rec.last("editMessageText")["text"]
 
     # 保存
     rec.clear()
@@ -763,6 +781,9 @@ def test_add_wizard_partial_ok_saves_and_marks_failed_as_cooldown(m):
     _set_probe_result(m, _probe)
 
     cm.wiz_test_all(42, 100, "cb")
+    assert m["delete_delays"] == [30]
+    assert len(rec.by("deleteMessage")) == 1
+    assert "30 秒后自动删除" in rec.last("editMessageText")["text"]
     cm.wiz_save(42, 100, "cb")
 
     assert any(c["name"] == "mixed" for c in m["config"].get()["channels"])
@@ -788,6 +809,9 @@ def test_add_wizard_all_fail_cannot_save(m):
     _set_probe_result(m, lambda c, mdl: (False, 50, "down"))
 
     cm.wiz_test_all(42, 100, "cb")
+    assert m["delete_delays"] == [30]
+    assert len(rec.by("deleteMessage")) == 1
+    assert "30 秒后自动删除" in rec.last("editMessageText")["text"]
     rec.clear()
     cm.wiz_save(42, 100, "cb")
     # 应弹出告警（answerCallbackQuery show_alert）
@@ -1102,7 +1126,31 @@ def test_test_panel_single(m):
     # 应 sendMessage 一条，editMessage 一条（进度）+ 一条（结果）
     assert len(rec.by("sendMessage")) == 1
     assert len(rec.by("editMessageText")) >= 2
+    assert m["delete_delays"] == [8]
+    assert len(rec.by("deleteMessage")) == 1
+    assert "8 秒后自动删除" in rec.last("editMessageText")["text"]
     print("  [PASS] test panel single")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok,delay", [(True, 8), (False, 30)])
+async def test_auto_delete_keeps_reminder_wait_delete_order(m, monkeypatch, ok, delay):
+    cm = m["channel_menu"]
+    events = []
+    monkeypatch.setattr(cm.ui, "edit", lambda *args: events.append(("edit", *args)))
+    monkeypatch.setattr(cm.ui, "delete_message", lambda *args: events.append(("delete", *args)))
+
+    async def record_wait(seconds):
+        events.append(("sleep", seconds))
+
+    monkeypatch.setattr(cm.asyncio, "sleep", record_wait)
+    await cm._finalize_and_delete(42, 1001, "测试结果", ok)
+
+    assert events == [
+        ("edit", 42, 1001, f"测试结果\n\n<i>⏱ 本消息将在 {delay} 秒后自动删除</i>"),
+        ("sleep", delay),
+        ("delete", 42, 1001),
+    ]
 
 
 # ─── main ────────────────────────────────────────────────────────
@@ -1142,7 +1190,9 @@ def main():
     try:
         for t in tests:
             try:
-                t(m)
+                with pytest.MonkeyPatch.context() as clock_patch:
+                    _install_delete_clock(m, clock_patch)
+                    t(m)
                 passed += 1
             except AssertionError as e:
                 print(f"  [FAIL] {t.__name__}: {e}")

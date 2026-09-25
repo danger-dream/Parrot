@@ -94,6 +94,24 @@ def test_quota_scope_uses_existing_account_or_model_gate(m, family, kind, accoun
     assert not (m["scorer"].get_stats(ch.key, "test-model") or {}).get("total_requests", 0)
 
 
+def test_setup_resets_quota_cache_for_reused_fake_account(m):
+    _setup(m)
+    ch = _make_oauth_channel_for_failover(m)
+    future = int(time.time()) + 60
+    m["state_db"].quota_save_openai_snapshot(ch.account_key, {
+        "fetched_at": future * 1000,
+        "primary_used_pct": 0, "primary_window_min": 300,
+        "primary_reset_at": future + 3600,
+        "secondary_used_pct": 0, "secondary_window_min": 10080,
+        "secondary_reset_at": future + 604800,
+    })
+    assert m["state_db"].quota_load(ch.account_key) is not None
+    _setup(m)
+    recreated = _make_oauth_channel_for_failover(m)
+    assert recreated.account_key == ch.account_key
+    assert m["state_db"].quota_load(recreated.account_key) is None
+
+
 def _done(response_id="recovered"):
     return [{"type": "response.created", "response": {"id": response_id}},
             {"type": "response.output_text.delta", "delta": "ok", "output_index": 0, "content_index": 0},

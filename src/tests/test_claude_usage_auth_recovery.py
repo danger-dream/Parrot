@@ -132,5 +132,5 @@ def test_bootstrap_oauth_identity_is_current(monkeypatch):
         return response(url, 200, {})
     monkeypatch.setattr(oauth.network, "get_sync", get)
     oauth._bootstrap_sync("fake-bootstrap-token")
-    assert calls[0]["headers"]["User-Agent"] == "claude-code/2.1.280"
+    assert calls[0]["headers"]["User-Agent"] == "claude-code/2.1.282"
     assert calls[0]["headers"]["anthropic-beta"] == "oauth-2025-04-20"

@@ -46,7 +46,8 @@ def env(tmp_path, monkeypatch):
     transport = httpx.MockTransport(handle)
 
     def async_client(**kwargs):
-        kwargs.pop("proxy_purpose", None)
+        for key in ("proxy_purpose", "proxy_provider", "proxy_channel"):
+            kwargs.pop(key, None)
         return httpx.AsyncClient(transport=transport, **kwargs)
 
     def get_sync(url, **kwargs):

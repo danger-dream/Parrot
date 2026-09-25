@@ -1,8 +1,8 @@
-"""Claude Code messages mimicry for the empirically verified v2.1.280 wire model.
+"""Claude Code messages mimicry for the empirically verified v2.1.282 wire model.
 
 The protocol-critical pieces in this module (fingerprint, billing attribution,
 CCH hash view, body profiles and headers) are validated against captured
-v2.1.280 fixtures.  Parrot-specific compatibility behaviour remains bounded to
+v2.1.280/v2.1.282 fixtures.  Parrot-specific compatibility behaviour remains bounded to
 this transform and private ``_parrot_*`` request context never reaches the wire.
 """
 
@@ -25,7 +25,7 @@ from .cc_model_profile import canonical_model, default_thinking, model_profile
 # 所以 BASE_DIR = cc_mimicry.py 所在目录向上两级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-CC_VERSION = "2.1.280"
+CC_VERSION = "2.1.282"
 FINGERPRINT_SALT = "59cf53e54c78"
 FINGERPRINT_INDICES = (4, 7, 20)
 CC_ENTRYPOINT = "sdk-cli"
@@ -67,14 +67,14 @@ BETAS = [
     EXTENDED_CACHE_TTL_BETA, OAUTH_BETA,
 ]
 
-# Parrot's transformed requests deliberately use the full stdin/SDK profile: it
-# is the profile carrying CCH, prompt attribution and the complete tool surface.
+# v282 offline/default SDK profiles. Network-controlled advisor/dispatch
+# experiments are deliberately not enabled from a single online snapshot.
 _MAIN_BETAS = [
     "claude-code-20250219", INTERLEAVED_THINKING_BETA,
     THINKING_TOKEN_COUNT_BETA, CONTEXT_MANAGEMENT_BETA,
     PROMPT_CACHING_SCOPE_BETA, MID_CONVERSATION_SYSTEM_BETA,
     MID_CONVERSATION_TOOL_CHANGES_BETA, ADVANCED_TOOL_USE_BETA,
-    EFFORT_BETA, FALLBACK_CREDIT_BETA, THINKING_BINDING_CONTROLS_BETA,
+    EFFORT_BETA, THINKING_BINDING_CONTROLS_BETA,
     CACHE_DIAGNOSIS_BETA,
 ]
 _FABLE_MAIN_BETAS = [
@@ -82,17 +82,17 @@ _FABLE_MAIN_BETAS = [
     THINKING_TOKEN_COUNT_BETA, CONTEXT_MANAGEMENT_BETA,
     PROMPT_CACHING_SCOPE_BETA, MID_CONVERSATION_SYSTEM_BETA,
     MID_CONVERSATION_TOOL_CHANGES_BETA, ADVANCED_TOOL_USE_BETA,
-    EFFORT_BETA, SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA,
-    THINKING_BINDING_CONTROLS_BETA, CACHE_DIAGNOSIS_BETA,
+    EFFORT_BETA, THINKING_BINDING_CONTROLS_BETA, CACHE_DIAGNOSIS_BETA,
 ]
 _OPUS_5_BETAS = list(_MAIN_BETAS)
 _HAIKU_MAIN_BETAS = [
     INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
-    "claude-code-20250219",
+    "claude-code-20250219", ADVANCED_TOOL_USE_BETA,
+    THINKING_BINDING_CONTROLS_BETA, CACHE_DIAGNOSIS_BETA,
 ]
-# Keep the separately observed legacy title/side-query profile.  Haiku main
-# traffic is selected above and has the v280 five-beta profile.
+# Keep the separately observed legacy title/side-query profile. Haiku main
+# traffic uses the v282 eight-beta profile, independently verified offline.
 _SIDE_QUERY_BETAS = [
     INTERLEAVED_THINKING_BETA, THINKING_TOKEN_COUNT_BETA,
     CONTEXT_MANAGEMENT_BETA, PROMPT_CACHING_SCOPE_BETA,
@@ -828,12 +828,13 @@ def _is_side_query_request(body: dict, model=None, *, messages=None) -> bool:
     return prompt.lstrip().startswith("<session>")
 
 
-def transform_request(body, email="", session_id=None, *, auth_mode="api_key"):
+def transform_request(body, email="", session_id=None, *, auth_mode="api_key", side_query=None):
     explicit_cache_control = cache_hints.has_anthropic_cache_control(body)
     original_messages = body.get("messages", [])
     fingerprint_value = compute_fingerprint(original_messages)
     model = body.get("model", "claude-sonnet-4-20250514")
-    side_query = _is_side_query_request(body, model, messages=original_messages)
+    if side_query is None:
+        side_query = _is_side_query_request(body, model, messages=original_messages)
     profile = model_profile(model)
 
     sid = str(session_id or body.get(PARROT_CC_SESSION_ID_KEY) or "").strip() or str(uuid.uuid4())
@@ -1361,10 +1362,11 @@ def _insert_beta_after(out: list[str], beta: str, after: str) -> None:
     out.insert(index, beta)
 
 
-def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list[str]:
-    side_query = _is_side_query_request(
-        payload or {}, model, messages=(payload or {}).get("messages", []),
-    )
+def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key", side_query=None) -> list[str]:
+    if side_query is None:
+        side_query = _is_side_query_request(
+            payload or {}, model, messages=(payload or {}).get("messages", []),
+        )
     if side_query:
         out = list(_SIDE_QUERY_BETAS)
     elif canonical_model(model) == "claude-haiku-4-5":
@@ -1389,11 +1391,19 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list
             allowed.add(EFFORT_BETA)
         if side_query:
             allowed.update(_SIDE_QUERY_BETAS)
+        elif canonical_model(model) == "claude-haiku-4-5":
+            # v282 Haiku advertises these despite using enabled, not adaptive,
+            # thinking. Do not extend this exception to other legacy models.
+            allowed.update(_HAIKU_MAIN_BETAS)
         out = [beta for beta in out if beta in allowed]
     payload = payload if isinstance(payload, dict) else {}
     if "fallbacks" in payload:
+        # Explicit downstream fallback remains supported, but v282 no longer
+        # advertises it by default. Insert the pair in its established order.
+        before = (THINKING_BINDING_CONTROLS_BETA
+                  if THINKING_BINDING_CONTROLS_BETA in out else CACHE_DIAGNOSIS_BETA)
+        _insert_beta_before(out, FALLBACK_CREDIT_BETA, before)
         _insert_beta_before(out, SERVER_SIDE_FALLBACK_BETA, FALLBACK_CREDIT_BETA)
-        _insert_beta_before(out, FALLBACK_CREDIT_BETA, CACHE_DIAGNOSIS_BETA)
     else:
         out = [beta for beta in out if beta != SERVER_SIDE_FALLBACK_BETA]
     # Explicit capabilities are not replaced with guessed defaults. Carry their
@@ -1412,9 +1422,8 @@ def _wire_beta_profile(model=None, payload=None, *, auth_mode="api_key") -> list
             _insert_beta_before(out, beta, CACHE_DIAGNOSIS_BETA)
 
     if auth_mode == "oauth":
-        # v280 OAuth keeps explicitly requested fallback capabilities.  Its auth marker is second in
-        # main profiles (immediately after claude-code) and no capture carries
-        # the old advisor beta.
+        # Keep explicit fallback capabilities and the OAuth marker immediately
+        # after claude-code. Do not opt OAuth into the advisor experiment.
         _insert_beta_after(out, OAUTH_BETA, "claude-code-20250219")
     return out
 
@@ -1423,8 +1432,8 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
                                 downstream_betas=None, original_model=None,
                                 wants_context_1m=None, wants_fast_mode=None,
                                 allow_any_model_context_1m=False,
-                                auth_mode="api_key"):
-    out = _wire_beta_profile(model, payload, auth_mode=auth_mode)
+                                auth_mode="api_key", side_query=None):
+    out = _wire_beta_profile(model, payload, auth_mode=auth_mode, side_query=side_query)
     if betas is not None:
         allowed = parse_beta_header(betas)
         known = set(BETAS)
@@ -1470,8 +1479,9 @@ def _messages_betas_for_request(model=None, betas=None, *, payload=None,
 def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_scheme="bearer",
                            auth_mode=None, model=None, payload=None, downstream_betas=None,
                            original_model=None, wants_context_1m=None,
-                           wants_fast_mode=None, allow_any_model_context_1m=False):
-    """Build the ordered v280 application headers for one Messages attempt.
+                           wants_fast_mode=None, allow_any_model_context_1m=False,
+                           side_query=None):
+    """Build the ordered v282 application headers for one Messages attempt.
 
     ``auth_mode`` controls only evidence-backed beta differences; third-party
     Bearer providers therefore do not silently acquire OAuth-specific behaviour.
@@ -1480,13 +1490,19 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
     """
     sid = session_id or str(uuid.uuid4())
     effective_auth_mode = auth_mode or ("oauth" if auth_scheme == "bearer" else "api_key")
+    # Channels pass the original request classification: system injection or
+    # explicit output controls must not change the body/header profile midway.
+    if side_query is None:
+        side_query = _is_side_query_request(
+            payload or {}, model, messages=(payload or {}).get("messages", []),
+        )
     beta_str = ",".join(_messages_betas_for_request(
         model=model, betas=betas, payload=payload,
         downstream_betas=downstream_betas, original_model=original_model,
         wants_context_1m=wants_context_1m,
         wants_fast_mode=wants_fast_mode,
         allow_any_model_context_1m=allow_any_model_context_1m,
-        auth_mode=effective_auth_mode,
+        auth_mode=effective_auth_mode, side_query=side_query,
     ))
 
     headers = {"Accept": "application/json"}
@@ -1502,10 +1518,7 @@ def build_upstream_headers(access_token, session_id=None, betas=None, *, auth_sc
     if auth_scheme == "api_key":
         headers["x-api-key"] = access_token
     headers["x-app"] = "cli"
-    side_query = _is_side_query_request(
-        payload or {}, model, messages=(payload or {}).get("messages", []),
-    )
-    if not side_query and not str(model or "").lower().startswith("claude-haiku-4-5"):
+    if not side_query:
         headers["x-claude-code-request-class"] = "main"
     headers["x-client-request-id"] = str(uuid.uuid4())
     # httpx always decodes gzip/deflate.  Brotli/zstd are not declared because
