@@ -232,10 +232,16 @@ def test_plan_id_round_trip_commit_and_cancel_with_real_control_and_log_db(
     )
     assert committed.status_code == 202, committed.text
     operation_id = committed.json()["data"]["id"]
+    # close() cancels queued work; it is not a completion barrier. Wait for
+    # this operation before shutdown, including when its worker hasn't started.
+    with runtime.operations._lock:
+        future = runtime.operations._futures.get(operation_id)
+    if future is not None:
+        future.result(timeout=5)
     runtime.operations.close(timeout_seconds=5)
     with runtime.operations._lock:
         operation = runtime.operations._items[operation_id]
-    assert operation.status.value == "succeeded"
+    assert operation.status.value == "succeeded", operation.error
     assert operation.result["deletedRows"] == 1
     assert operation.result["policyActivated"] is True
     assert config.get()["logRetention"] == {"mode": "days", "days": 30}
