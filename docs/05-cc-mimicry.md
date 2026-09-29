@@ -71,7 +71,7 @@ output_config, diagnostics, stream
 | Opus 4.5 | 32000 | enabled | high |
 | Sonnet 4.6 | 32000 | adaptive | high |
 | Sonnet 5、Opus 4.6–4.8/5、Fable 5/5.1、Mythos 5/5.1 | 64000 | adaptive | high |
-| Opus 5.5 | 128000 | adaptive | high |
+| Opus 5.5、Sonnet 5.5 | 128000 | adaptive | high |
 | 未知兼容模型 | 4096（沿用 standard 的安全默认） | 不注入 | 不注入 |
 
 缺省 enabled 的 budget 为 `max_tokens-1`、display 为 omitted；显式采样参数、强制 tool_choice 或不足1025的输出上限不应被新注入的 enabled thinking 破坏。显式 thinking/output_config/max_tokens/temperature 等优先，不替下游重写合法意图。未知模型不猜能力、不注入 context management/diagnostics；旧模型不声明新模型专属 beta。context management 仅在已知支持且 thinking 开启时默认生成；diagnostics 仅在已知 adaptive 主模型默认生成。

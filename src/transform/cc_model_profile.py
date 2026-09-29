@@ -28,6 +28,7 @@ _PROFILES = {
     "claude-sonnet-4-5": CCModelProfile(32000, "enabled", context_management=True),
     "claude-sonnet-4-6": CCModelProfile(32000, "adaptive", True, True),
     "claude-sonnet-5": CCModelProfile(64000, "adaptive", True, True),
+    "claude-sonnet-5-5": CCModelProfile(128000, "adaptive", True, True),
     "claude-opus-4-0": CCModelProfile(32000, "enabled", context_management=True),
     "claude-opus-4-1": CCModelProfile(32000, "enabled", context_management=True),
     # L_ explicitly permits effort on Opus 4.5, but vCt rejects adaptive.
@@ -47,6 +48,7 @@ _ALIASES = {
     "claude-opus-4": "claude-opus-4-0",
     "claude-fable-5.1": "claude-fable-5-1",
     "claude-opus-5.5": "claude-opus-5-5",
+    "claude-sonnet-5.5": "claude-sonnet-5-5",
     "claude-mythos-5.1": "claude-mythos-5-1",
 }
 
