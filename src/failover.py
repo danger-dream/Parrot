@@ -402,7 +402,7 @@ def _maybe_auto_disable_by_headers(account_key: str, email: str,
             f"账号: <code>{ek(email)}</code>\n"
             f"{notifier.provider_tag('claude')}{_plan_tag}\n"
             f"超限窗口: <code>{' / '.join(windows)}</code>\n"
-            f"恢复时间: <code>{latest or 'unknown'}</code>\n"
+            f"恢复时间: <code>{ek(oauth_manager._to_bjt(latest) if latest else 'unknown')}</code>\n"
             "达到该时间后由 quota_monitor 自动恢复。"
         )
     except Exception:
@@ -506,7 +506,7 @@ def _maybe_auto_disable_by_codex_snapshot(account_key: str, email: str,
             f"{notifier.provider_custom_emoji_html('openai')} {ek(_label)}\n"
             f"超限窗口: <code>{' / '.join(over_windows)}</code> "
             f"(阈值 {threshold:.0f}%)\n"
-            f"恢复时间: <code>{latest_iso or 'unknown'}</code>"
+            f"恢复时间: <code>{ek(oauth_manager._to_bjt(latest_iso) if latest_iso else 'unknown')}</code>"
         )
     except Exception:
         pass
