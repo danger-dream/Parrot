@@ -311,6 +311,7 @@ async def test_catalog_input_projection_never_blocks_real_wire_before_transport(
             outcome="transport_error", error_detail="fixture stop before network",
         ))
     monkeypatch.setattr(failover, "open_response_with_proxy_chain", probe_transport)
+    monkeypatch.setattr(log_db, "update_pending_fast_mode_from_upstream", lambda *a, **k: None)
     now = time.time()
     body = {"model": "demo", "input": "input tokens " * 100, "max_output_tokens": 20}
     assert 100 < token_counter.count_request_tokens(body) < 980
