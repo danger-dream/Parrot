@@ -16,7 +16,7 @@ from typing import Any
 
 from . import common, anthropic_compat
 from .guard import GuardError
-from ... import local_web_tools, search_hosted_codec
+from ... import cache_hints, local_web_tools, search_hosted_codec
 from ...protocols.usage import legacy_usage_from_openai_responses_json
 
 
@@ -167,6 +167,7 @@ def _tool_use_input(block: dict[str, Any]) -> dict[str, Any]:
 
 
 def _system_to_instructions(system: Any) -> str:
+    system = cache_hints.anthropic_system_without_billing_header(system)
     if system is None:
         return ""
     if isinstance(system, str):

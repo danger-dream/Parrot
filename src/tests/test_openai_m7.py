@@ -26,6 +26,7 @@ from src.tests import _isolation
 _isolation.isolate()
 
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -95,6 +96,43 @@ def test_fp_chat_query_equals_write(m):
     assert h_write is not None
     assert h_query == h_write
     print("  [PASS] fp chat: query == write")
+
+
+def test_fp_chat_tool_only_empty_content_representations_continue_same_chain(m):
+    fp = m["fingerprint"]
+    messages = [{"role": "user", "content": "perform the task"}]
+    tool_calls = [{"id": "call-1", "type": "function", "function": {
+        "name": "lookup", "arguments": '{"q":"first"}',
+    }}]
+    emitted = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+    written = fp.fingerprint_write_chat("tenant", "203.0.113.8", messages, emitted)
+    for empty_fields in ({}, {"content": None}, {"content": ""}, {"content": []}):
+        replayed = {"role": "assistant", "tool_calls": copy.deepcopy(tool_calls), **empty_fields}
+        original = copy.deepcopy(replayed)
+        continuation = messages + [replayed, {
+            "role": "tool", "tool_call_id": "call-1", "content": "result",
+        }]
+        assert fp.fingerprint_query_chat("tenant", "203.0.113.8", continuation) == written
+        assert replayed == original
+
+
+def test_fp_chat_empty_normalization_preserves_text_and_tool_identity(m):
+    fp = m["fingerprint"]
+    tool_only = {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"},
+    }]}
+    canonical = fp._canon_chat(tool_only)
+    for content in ("real text", " ", [{"type": "text", "text": "real text"}]):
+        assert fp._canon_chat({**tool_only, "content": content}) != canonical
+    other_call = copy.deepcopy(tool_only)
+    other_call["tool_calls"][0]["id"] = "call-other"
+    assert fp._canon_chat(other_call) != canonical
+    other_call = copy.deepcopy(tool_only)
+    other_call["tool_calls"][0]["function"]["arguments"] = '{"q":"other"}'
+    assert fp._canon_chat(other_call) != canonical
+    # Empty non-tool messages retain their previous fingerprint semantics.
+    assert fp._canon_chat({"role": "assistant", "content": None}) != fp._canon_chat({"role": "assistant", "content": ""})
+    assert fp._canon_chat({"role": "user", "content": None}) != fp._canon_chat({"role": "user", "content": ""})
 
 
 def test_fp_chat_short_returns_none(m):

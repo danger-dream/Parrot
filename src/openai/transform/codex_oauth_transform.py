@@ -19,8 +19,8 @@
   - `instructions` 空 → 仅注入调用方按账户目录/profile 解析出的模型指令
   - legacy `functions` / `function_call` → `tools` / `tool_choice`
   - `input` 是字符串 → 包成 [{type:"message", role:"user", content:<str>}]
-  - `input[]` 里的 role=system 消息提取到 `instructions`（上游 input 不接受
-    system role）
+  - `input[]` 开头的 role=system 消息提取到 `instructions`；中途 system
+    原位转为 developer（上游 input 不接受 system role）
 
 工具调用续链会过滤 store=false 上游无法解析的 reasoning/item_reference/id，
 并规范化 tool_choice；call_id 是官方协议的不透明关联键，始终原样保留，
@@ -93,33 +93,31 @@ def _content_to_plain_text(content: Any) -> str:
 
 
 def _extract_system_messages(body: dict) -> str | None:
-    """从 input[] 里把 role=system 的消息提取并拼到 instructions。
+    """只将开头连续的 system 消息提到 instructions。
 
-    Codex endpoint 的 input 不接受 system role；这里把它们合并成一条文本
-    追加到 instructions（若为空则作为 instructions 正文）。返回合并后的
-    system 文本；若没有 system 消息则返回 None。
+    Codex input 不接受 system role；中途指令转为原位 developer，避免
+    动态预算等历史内容改变前置提示。
     """
     items = body.get("input")
     if not isinstance(items, list):
         return None
     keep: list[Any] = []
     sys_texts: list[str] = []
+    leading = True
     for it in items:
-        if not isinstance(it, dict):
-            keep.append(it)
+        if (isinstance(it, dict) and it.get("type") in (None, "message")
+                and it.get("role") == "system"):
+            if leading:
+                txt = _content_to_plain_text(it.get("content", ""))
+                if txt:
+                    sys_texts.append(txt)
+            else:
+                keep.append({**it, "role": "developer"})
             continue
-        typ = it.get("type")
-        role = it.get("role")
-        if typ in (None, "message") and role == "system":
-            txt = _content_to_plain_text(it.get("content", ""))
-            if txt:
-                sys_texts.append(txt)
-            continue
+        leading = False
         keep.append(it)
-    if not sys_texts:
-        return None
     body["input"] = keep
-    return "\n\n".join(sys_texts)
+    return "\n\n".join(sys_texts) if sys_texts else None
 
 
 def _convert_legacy_tools(body: dict) -> bool:
@@ -894,7 +892,7 @@ def apply_codex_oauth_transform(
         _normalize_codex_tool_choice(body)
         _strip_orphaned_tool_fields(body)
 
-    # 5) input 字符串 → 数组；再把 input 里的 system 消息提到 instructions
+    # 5) input 字符串 → 数组；只把开头的 system 消息提到 instructions
     _coerce_input_to_list(body)
     sys_text = _extract_system_messages(body)
     if sys_text:

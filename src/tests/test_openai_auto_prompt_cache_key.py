@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os as _ap_os
 import sys as _ap_sys
@@ -348,6 +349,40 @@ def test_auto_prompt_cache_key_reuses_affinity_chain_value(m):
 
     assert key == "parrot:auto:v1:stable"
     assert body["prompt_cache_key"] == "parrot:auto:v1:stable"
+
+
+def test_auto_prompt_cache_key_continues_single_user_tool_loop(m):
+    """A single human user plus tool replies must not mint a new key per call."""
+    _setup(m)
+    from src import failover, fingerprint
+
+    body = {"model": "gpt-6-astra", "messages": [
+        {"role": "system", "content": "stable instructions"},
+        {"role": "user", "content": "perform this task"},
+    ]}
+    common = {"api_key_name": "tenant", "client_ip": "203.0.113.8",
+              "model": "gpt-6-astra", "ingress_protocol": "chat"}
+    key = m["handler"]._maybe_apply_auto_prompt_cache_key(body, fp_query=None, **common)
+    assert key and ":stable:" not in key
+    for index in range(3):
+        assistant = {"role": "assistant", "content": None, "tool_calls": [{
+            "id": f"call-{index}", "type": "function", "function": {
+                "name": "lookup", "arguments": json.dumps({"step": index}),
+            },
+        }]}
+        failover._write_affinity_non_stream(
+            "chat", "tenant", "203.0.113.8", [], {}, body,
+            {"choices": [{"message": assistant}]}, "oauth:test-owner", "gpt-6-astra",
+        )
+        replayed = {**copy.deepcopy(assistant), "content": ""}
+        next_body = {"model": "gpt-6-astra", "messages": body["messages"] + [
+            replayed, {"role": "tool", "tool_call_id": f"call-{index}", "content": "result"},
+        ]}
+        query = fingerprint.fingerprint_query_chat("tenant", "203.0.113.8", next_body["messages"])
+        assert m["affinity"].get(query)["prompt_cache_key"] == key
+        assert m["handler"]._maybe_apply_auto_prompt_cache_key(next_body, fp_query=query, **common) == key
+        assert next_body["messages"][-2]["content"] == ""
+        body = next_body
 
 
 def test_affinity_upsert_preserves_prompt_cache_key_when_omitted(m):

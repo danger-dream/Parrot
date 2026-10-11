@@ -14,7 +14,7 @@ from typing import Any
 
 from . import common, anthropic_compat
 from .guard import GuardError
-from ... import local_web_tools
+from ... import cache_hints, local_web_tools
 from ...protocols.usage import legacy_usage_from_openai_chat_json
 
 
@@ -128,7 +128,7 @@ def guard_request(body: dict, *, target_model: str | None = None) -> None:
 def _convert_system(system: Any) -> list[dict[str, Any]]:
     if system is None:
         return []
-    text = _text_from_blocks(system)
+    text = _text_from_blocks(cache_hints.anthropic_system_without_billing_header(system))
     return [{"role": "system", "content": text}] if text else []
 
 

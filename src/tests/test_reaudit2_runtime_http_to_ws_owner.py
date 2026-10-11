@@ -144,12 +144,13 @@ async def test_cancel_outer_retry_update_aborts_unstarted_http_to_ws_stream(
         retry_attempt_id=None,
         start_monotonic=None,
         attempt_start_monotonic=None,
+        terminal_release=None,
     ):
         del (
             resolved_model, body, deadline_ts, start_time, fp_query, messages,
             api_key_name, client_ip, request_id, retry_count_so_far,
             affinity_hit, client_key, retry_attempt_id, start_monotonic,
-            attempt_start_monotonic,
+            attempt_start_monotonic, terminal_release,
         )
         assert ch is channel
         assert is_stream is True

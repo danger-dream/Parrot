@@ -3,7 +3,7 @@
 覆盖：
   - codex_oauth_transform.apply_codex_oauth_transform 的强制改造语义：
     store=false / stream=true / 不支持字段剥离 / 模型名规范化 / input 字符串
-    包成消息数组 / input 里 system 提 instructions / instructions 兜底 /
+    包成消息数组 / 开头 system 提 instructions、中途 system 原位转 developer / instructions 兜底 /
     legacy functions-function_call 转换 / Responses Lite 把 tools 挪进
     additional_tools 后仍保留 parallel_tool_calls=false
   - 模型名直接透传（v0.6+ 移除别名映射）
@@ -221,13 +221,25 @@ def test_transform_extracts_system(m):
         ],
     }
     out = _apply_transform(t, body)
-    instr = out["instructions"]
-    assert "first" in instr and "second" in instr, instr
-    # system 消息被移除，user + function_call 保留
+    assert out["instructions"] == "first"
     roles = [i.get("role") for i in out["input"] if i.get("type") == "message"]
-    assert "system" not in roles
+    assert roles == ["user", "developer"]
+    assert out["input"][1]["content"] == [{"type": "input_text", "text": "second"}]
     assert any(i.get("type") == "function_call" for i in out["input"])
-    print("  [PASS] transform: system msgs extracted to instructions")
+    print("  [PASS] transform: only leading system extracted; history stays in place")
+
+
+def test_transform_keeps_mid_system_without_leading_system(m):
+    reminder = {"type": "message", "role": "system", "id": "reminder-1",
+                "content": [{"type": "input_text", "text": "<total_tokens>100 tokens left</total_tokens>"}]}
+    original = copy.deepcopy(reminder)
+    out = _apply_transform(m["transform"], {
+        "model": "gpt-5.1", "instructions": "stable root",
+        "input": [{"type": "message", "role": "user", "content": "task"}, reminder],
+    })
+    assert out["instructions"] == "stable root"
+    assert out["input"][1] == {"type": "message", "role": "developer", "content": original["content"]}
+    assert reminder == original
 
 
 def test_transform_system_appended_to_existing_instructions(m):
@@ -1239,6 +1251,134 @@ def test_channel_anthropic_ingress_translator(m):
     assert payload["input"] == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
     assert payload["include"] == ["reasoning.encrypted_content"]
     print("  [PASS] channel: anthropic ingress → codex responses translator_ctx")
+
+
+def test_channel_anthropic_tool_loop_without_session_keeps_upstream_cache_key(m):
+    _setup(m)
+    _add_openai_acc(m, models=["gpt-6-astra"])
+    ch = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {
+        "model": "gpt-6-astra",
+        "system": [{"type": "text", "text": "stable instructions"}],
+        "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+        "messages": [
+            {"role": "user", "content": "perform the task"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call-first", "name": "lookup", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-first", "content": "first result"}]},
+        ],
+        "_parrot_api_key_name": "tenant", "_parrot_client_ip": "203.0.113.8",
+    }
+    requests = []
+    for index in range(3):
+        requests.append(asyncio.run(ch.build_upstream_request(
+            copy.deepcopy(body), "gpt-6-astra", ingress_protocol="anthropic",
+        )))
+        body["messages"].extend([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": f"call-{index}", "name": "lookup", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"call-{index}", "content": f"result {index}"}]},
+        ])
+    payloads = [json.loads(req.body) for req in requests]
+    assert len({payload["prompt_cache_key"] for payload in payloads}) == 1
+    assert len({req.headers["session-id"] for req in requests}) == 1
+    assert all(payload["prompt_cache_key"] == req.headers["session-id"]
+               for payload, req in zip(payloads, requests))
+    assert all(req.translator_ctx["codex_identity_context"].logical_session.durable for req in requests)
+    # Astra's Lite route adds the existing tools/instructions prefix. Both that
+    # prefix (including its IDs) and the actual growing history are preserved.
+    prefix = payloads[0]["input"][:2]
+    assert [item["type"] for item in prefix] == ["additional_tools", "message"]
+    assert all(payload["input"][:2] == prefix for payload in payloads)
+    assert [len(payload["input"][2:]) for payload in payloads] == [3, 5, 7]
+    assert payloads[-1]["input"][-1]["output"] == "result 1"
+
+    other_conversation = copy.deepcopy(body)
+    other_conversation["messages"][1]["content"][0]["id"] = "other-first-call"
+    other_conversation["messages"][2]["content"][0]["tool_use_id"] = "other-first-call"
+    other = asyncio.run(ch.build_upstream_request(
+        other_conversation, "gpt-6-astra", ingress_protocol="anthropic",
+    ))
+    assert json.loads(other.body)["prompt_cache_key"] != payloads[0]["prompt_cache_key"]
+
+
+@pytest.mark.parametrize("model", ["gpt-5.1", "gpt-6-astra"])
+def test_channel_chat_keeps_dynamic_system_at_tail_for_cache(m, model):
+    from src.openai.transform import chat_to_responses
+
+    _setup(m)
+    _add_openai_acc(m, models=[model])
+    channel = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    body = {
+        "model": model, "prompt_cache_key": "stable-conversation-123",
+        "messages": [
+            {"role": "system", "content": "stable root system"},
+            {"role": "system", "content": "stable second instruction"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "system", "content": "<total_tokens>15000000 tokens left</total_tokens>"},
+            {"role": "user", "content": "continue"},
+        ],
+        "_parrot_api_key_name": "tenant", "_parrot_client_ip": "203.0.113.8",
+    }
+    translated = chat_to_responses.translate_request(body)
+    assert [item["role"] for item in translated["input"]] == ["system", "system", "user", "assistant", "system", "user"]
+    requests = []
+    for index in range(3):
+        requests.append(asyncio.run(channel.build_upstream_request(copy.deepcopy(body), model, ingress_protocol="chat")))
+        body["messages"].extend([
+            {"role": "assistant", "content": "next answer"},
+            {"role": "system", "content": f"<total_tokens>{14900000 - index} tokens left</total_tokens>"},
+            {"role": "user", "content": "continue again"},
+        ])
+    payloads = [json.loads(request.body) for request in requests]
+    assert len({payload["prompt_cache_key"] for payload in payloads}) == 1
+    assert len({request.headers["session-id"] for request in requests}) == 1
+    if model == "gpt-6-astra":
+        prefix = payloads[0]["input"][:2]
+        assert [item["type"] for item in prefix] == ["additional_tools", "message"]
+        assert prefix[1]["content"] == [{"type": "input_text", "text": "stable root system\n\nstable second instruction"}]
+        assert all(payload["input"][:2] == prefix for payload in payloads)
+        histories = [payload["input"][2:] for payload in payloads]
+    else:
+        assert all(payload["instructions"] == "stable root system\n\nstable second instruction" for payload in payloads)
+        histories = [payload["input"] for payload in payloads]
+    assert [item["role"] for item in histories[0]] == ["user", "assistant", "developer", "user"]
+    assert histories[0][2]["content"] == [{"type": "input_text", "text": "<total_tokens>15000000 tokens left</total_tokens>"}]
+    for previous, current in zip(histories, histories[1:]):
+        assert current[:len(previous)] == previous
+    assert [sum(str(item.get("content", "")).count("<total_tokens>") for item in history) for history in histories] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("model", ["gpt-5.1", "gpt-6-astra"])
+def test_channel_anthropic_billing_header_keeps_cache_key_and_prefix(m, model):
+    _setup(m)
+    _add_openai_acc(m, models=[model])
+    channel = m["OpenAIOAuthChannel"](m["oauth_manager"].get_account("openai:o@openai.test:acct-123"))
+    payloads = []
+    requests = []
+    for cch in ("11111", "22222", "33333"):
+        body = {
+            "model": model,
+            "system": [
+                {"type": "text", "text": f"x-anthropic-billing-header: cc_version=2.1.282; cch={cch};"},
+                {"type": "text", "text": "stable root system"},
+            ],
+            "messages": [{"role": "user", "content": "initial task"},
+                         {"role": "assistant", "content": "first reply"},
+                         {"role": "user", "content": "continue task"}],
+            "_parrot_api_key_name": "tenant", "_parrot_client_ip": "203.0.113.8",
+        }
+        request = asyncio.run(channel.build_upstream_request(body, model, ingress_protocol="anthropic"))
+        requests.append(request)
+        payloads.append(json.loads(request.body))
+        assert body["system"][0]["text"].endswith(f"cch={cch};")
+    assert len({payload["prompt_cache_key"] for payload in payloads}) == 1
+    assert len({request.headers["session-id"] for request in requests}) == 1
+    if model == "gpt-6-astra":
+        prefix = payloads[0]["input"][:2]
+        assert prefix[1]["content"] == [{"type": "input_text", "text": "stable root system"}]
+        assert all(payload["input"][:2] == prefix for payload in payloads)
+    else:
+        assert all(payload["instructions"] == "stable root system" for payload in payloads)
 
 
 def test_channel_anthropic_ingress_keeps_history_system_at_tail_for_cache(m):

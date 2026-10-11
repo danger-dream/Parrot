@@ -24,6 +24,7 @@ _CACHE_KEY_PREFIX = "parrot:cache:v1"
 _SESSION_ID_RE = re.compile(r"session[_-]?id['\"=:\s]+([A-Za-z0-9_.:-]{8,})", re.IGNORECASE)
 _ANTHROPIC_EPHEMERAL_1H = {"type": "ephemeral", "ttl": "1h"}
 _ANTHROPIC_EPHEMERAL_5M = {"type": "ephemeral"}
+_ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header: "
 
 
 def _canon(value: Any) -> Any:
@@ -49,6 +50,39 @@ def _json_hash(value: Any) -> str:
 
 def _clean_str(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def strip_leading_anthropic_billing_header(text: str) -> str:
+    """Remove only a leading attribution line; preserve later prompt literals."""
+    if not text.startswith(_ANTHROPIC_BILLING_HEADER_PREFIX):
+        return text
+    line_end = re.search(r"\r\n|\r|\n", text)
+    if line_end is None:
+        return ""
+    rest = text[line_end.end():]
+    for separator in ("\r\n", "\r", "\n"):
+        if rest.startswith(separator):
+            return rest[len(separator):]
+    return rest
+
+
+def anthropic_system_without_billing_header(system: Any) -> Any:
+    """Copy changed top-level text blocks for Anthropic-to-OpenAI conversion."""
+    if isinstance(system, str):
+        return strip_leading_anthropic_billing_header(system)
+    if not isinstance(system, list):
+        return system
+    blocks = []
+    for block in system:
+        if (isinstance(block, dict) and block.get("type") == "text"
+                and isinstance(block.get("text"), str)):
+            text = strip_leading_anthropic_billing_header(block["text"])
+            if text != block["text"]:
+                if not text:
+                    continue
+                block = {**block, "text": text}
+        blocks.append(block)
+    return blocks
 
 
 def _session_id_from_value(value: Any) -> str | None:
@@ -487,21 +521,40 @@ def openai_retention_from_anthropic(body: dict[str, Any] | None, *, model: str |
 def _anthropic_stable_prefix(body: dict[str, Any]) -> dict[str, Any]:
     """Extract a stable cache-routing prefix from an Anthropic request.
 
-    Exclude the latest user turn so multi-turn conversations keep the same key
-    while their dynamic tail changes.  Keep tools/system and older history,
-    because those are exactly the reusable expensive prefix.
+    Anchor the initial exchange, not the growing transcript. Keep the first
+    assistant reply and, when present, the second genuine user turn so a shared
+    bootstrap exchange cannot merge independent tasks. Tool-result-only user
+    messages do not count as a new user turn. Once these opening anchors exist,
+    later user/tool turns do not change the cache-routing key.
     """
     messages = body.get("messages") if isinstance(body.get("messages"), list) else []
     prefix_messages = list(messages)
     if prefix_messages and isinstance(prefix_messages[-1], dict) and prefix_messages[-1].get("role") == "user":
         prefix_messages = prefix_messages[:-1]
+    anchors = prefix_messages[:2]
+    user_turns = 0
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and content and all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        ):
+            continue
+        user_turns += 1
+        if user_turns == 2:
+            if index >= len(anchors):
+                anchors.append(message)
+            break
     material: dict[str, Any] = {}
     if body.get("tools"):
         material["tools"] = body.get("tools")
-    if body.get("system"):
-        material["system"] = body.get("system")
-    if prefix_messages:
-        material["messages"] = prefix_messages
+    system = anthropic_system_without_billing_header(body.get("system"))
+    if system:
+        material["system"] = system
+    if anchors:
+        material["messages"] = anchors
     return material
 
 

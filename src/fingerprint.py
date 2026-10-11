@@ -198,6 +198,12 @@ def _normalize_chat_msg(msg):
         elif k == "tool_calls" and isinstance(v, list):
             v = [_normalize_chat_tool_call(t) for t in v]
         out[k] = v
+    # Tool-only assistant replies are equivalent with absent/null/empty content.
+    # Stream builders emit None; clients such as omp replay an empty string.
+    # Normalize only the fingerprint, not the request sent to the upstream.
+    if (out.get("role") == "assistant" and out.get("tool_calls")
+            and out.get("content") in (None, "", [])):
+        out["content"] = None
     return out
 
 

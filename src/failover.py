@@ -2356,6 +2356,7 @@ async def run_failover(
                     retry_attempt_id=attempt_id,
                     start_monotonic=start_monotonic,
                     attempt_start_monotonic=attempt_started_monotonic,
+                    terminal_release=_release_once,
                 )
             else:
                 result = await _try_channel(
@@ -2858,6 +2859,41 @@ def _attach_release_to_response(response: Response, release_fn) -> None:
 _WsProxyBytes = WsProxyBytes
 
 
+_oauth_ws_close_tasks: set[asyncio.Task] = set()
+
+
+def _has_oauth_ws_terminal(tracker) -> bool:
+    event = getattr(tracker, "last_event", None) or {}
+    return event.get("type") in (
+        "response.completed", "response.failed", "response.incomplete",
+    )
+
+
+def _close_completed_oauth_ws(upstream_ws, terminal_release=None) -> None:
+    """Release a finished HTTP turn without waiting for its one-shot WS close.
+
+    Keep the actual close owner alive until the transport's existing close
+    timeout/SS2022 bridge cleanup finishes, including during task cancellation.
+    Native WS sessions and interrupted HTTP turns keep their synchronous owners.
+    """
+    if terminal_release is not None:
+        try:
+            terminal_release()
+        except Exception:
+            pass
+
+    async def close() -> None:
+        try:
+            await await_ws_owned(upstream_ws.close())
+        except Exception as exc:
+            # Never expose exception arguments: they may contain upstream data.
+            print(f"[failover] terminal WS close failed: {type(exc).__name__}")
+
+    task = asyncio.create_task(close(), name="oauth-responses-terminal-close")
+    _oauth_ws_close_tasks.add(task)
+    task.add_done_callback(_oauth_ws_close_tasks.discard)
+
+
 def _http_url_to_ws(url: str) -> str:
     return http_url_to_ws(url)
 
@@ -3262,6 +3298,7 @@ async def _try_openai_oauth_responses_ws_channel(
     retry_attempt_id: int | None = None,
     start_monotonic: float | None = None,
     attempt_start_monotonic: float | None = None,
+    terminal_release=None,
 ) -> AttemptResult:
     if start_monotonic is None:
         start_monotonic = time.monotonic()
@@ -3431,6 +3468,7 @@ async def _try_openai_oauth_responses_ws_channel(
                 retry_attempt_id=retry_attempt_id,
                 attempt_start_monotonic=attempt_start_monotonic,
                 on_dispatch=lambda: route_state.__setitem__("dispatched", True),
+                terminal_release=terminal_release,
             )
             result = _attach_retry_after_from_response(
                 result, getattr(upstream_ws, "response", None), ch,
@@ -3446,6 +3484,9 @@ async def _try_openai_oauth_responses_ws_channel(
                 timing=timing,
                 proxy_bytes=proxy_bytes,
             )
+            if _has_oauth_ws_terminal(tracker):
+                _close_completed_oauth_ws(upstream_ws, terminal_release)
+                upstream_ws = None
             return result
         except asyncio.CancelledError:
             if upstream_ws is not None:
@@ -3621,6 +3662,7 @@ async def _consume_oauth_responses_ws(
     retry_attempt_id,
     attempt_start_monotonic: float,
     on_dispatch,
+    terminal_release=None,
 ) -> AttemptResult:
     try:
         await asyncio.to_thread(
@@ -3698,6 +3740,7 @@ async def _consume_oauth_responses_ws(
             proxy_attempt_id=proxy_attempt_id,
             retry_attempt_id=retry_attempt_id,
             attempt_start_monotonic=attempt_start_monotonic,
+            terminal_release=terminal_release,
         )
     return await _consume_oauth_responses_ws_non_stream(
         upstream_ws,
@@ -4080,6 +4123,7 @@ async def _consume_oauth_responses_ws_stream(
     proxy_attempt_id,
     retry_attempt_id,
     attempt_start_monotonic: float,
+    terminal_release=None,
 ) -> AttemptResult:
     first_wait = round_timeouts.first_byte
     first_chunks, pre_error, first_packet_ms = await _recv_oauth_ws_until_visible(
@@ -4241,6 +4285,7 @@ async def _consume_oauth_responses_ws_stream(
         state["finalized"] = True
 
     async def stream_generator():
+        interrupted = False
         try:
             # A terminal-only first batch is already a complete upstream result.
             if pre_error is not None:
@@ -4360,10 +4405,12 @@ async def _consume_oauth_responses_ws_stream(
                 if step.skip_downstream:
                     continue
         except (asyncio.CancelledError, GeneratorExit):
+            interrupted = True
             if not state["finalized"]:
                 await await_ws_owned(finalize_disconnect())
             raise
         except Exception as exc:
+            interrupted = True
             if not state["finalized"]:
                 lifecycle = connection_lifecycle_outcome(exc)
                 await await_ws_owned(finalize_error(AttemptResult(
@@ -4373,10 +4420,13 @@ async def _consume_oauth_responses_ws_stream(
                 )))
             raise
         finally:
-            try:
-                await await_ws_owned(upstream_ws.close())
-            except BaseException:
-                pass
+            if not interrupted and state["finalized"] and _has_oauth_ws_terminal(tracker):
+                _close_completed_oauth_ws(upstream_ws, terminal_release)
+            else:
+                try:
+                    await await_ws_owned(upstream_ws.close())
+                except BaseException:
+                    pass
 
     response = StreamingResponse(
         stream_generator(),
