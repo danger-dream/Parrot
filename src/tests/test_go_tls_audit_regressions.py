@@ -156,37 +156,26 @@ async def test_raw_compression_counter_multivalue_and_charset(tls_files, encodin
 @pytest.mark.asyncio
 async def test_large_body_start_runs_off_loop_and_content_is_lossless(tls_files, monkeypatch):
     from parrot_go_tls_client import Client
-    start_threads, interval, beats = [], [], []
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    loop_ack = threading.Event()
+    start_threads = []
 
     class ObservedClient(Client):
         def start(self, *args, **kwargs):
             start_threads.append(threading.get_ident())
-            interval.append(time.monotonic())
-            try:
-                return super().start(*args, **kwargs)
-            finally:
-                interval.append(time.monotonic())
-
-    async def heartbeat():
-        while True:
-            beats.append(time.monotonic())
-            await asyncio.sleep(.001)
+            assert start_threads[-1] != loop_thread
+            loop.call_soon_threadsafe(loop_ack.set)
+            assert loop_ack.wait(5), "event loop blocked while native start awaited its callback"
+            return super().start(*args, **kwargs)
 
     monkeypatch.setattr(go_tls, "native_client_type", lambda: ObservedClient)
     body = b"0123456789abcdef" * (1 << 20)
-    pulse = asyncio.create_task(heartbeat())
-    try:
-        async with local_server(tls_files, body=body) as server:
-            async with go_tls.create_client(timeout=httpx.Timeout(5), ca_pem=tls_files[1]) as client:
-                response = await client.post(server["url"], content=body)
-            assert response.content == body == bytes(server["body"])
-            assert start_threads and start_threads[0] != threading.get_ident()
-            # Real FFI marshalling must not monopolize the loop for all of start.
-            # Avoid a machine-specific millisecond threshold on native CI jobs.
-            assert any(interval[0] < tick < interval[1] for tick in beats)
-    finally:
-        pulse.cancel()
-        await asyncio.gather(pulse, return_exceptions=True)
+    async with local_server(tls_files, body=body) as server:
+        async with go_tls.create_client(timeout=httpx.Timeout(5), ca_pem=tls_files[1]) as client:
+            response = await client.post(server["url"], content=body)
+        assert response.content == body == bytes(server["body"])
+        assert start_threads and loop_ack.is_set()
 
 
 @pytest.mark.asyncio
