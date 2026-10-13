@@ -317,7 +317,6 @@ def test_candidate_sync_changes_only_explicit_auto_snapshot_and_never_active_cat
         model_pricing, "candidate_binding_snapshot",
         lambda _candidate, _target: _snapshot("candidate-new", 333_000, input_price=9.0),
     )
-    active_status = copy.deepcopy(model_pricing.catalog_status())
     other_before = copy.deepcopy(config.get()["modelBindings"]["defaults"]["other"])
     manual_before = copy.deepcopy(config.get()["modelBindings"]["defaults"]["manual"])
     other_effective_before = copy.deepcopy(model_metadata.get_metadata("other"))
@@ -325,6 +324,7 @@ def test_candidate_sync_changes_only_explicit_auto_snapshot_and_never_active_cat
         channel_key="api:unused", channel_type="api", upstream_protocol="anthropic",
         outbound_model_id="other", client_visible_model="other",
     ).binding_json
+    active_status = copy.deepcopy(model_pricing.catalog_status())
 
     result = model_metadata.sync_auto_snapshots(
         [("selected", None, None), ("manual", None, None)], candidate=candidate,

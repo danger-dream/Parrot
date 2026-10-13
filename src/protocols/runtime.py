@@ -178,6 +178,7 @@ def _make_stream_translator(translator_ctx: Optional[dict]):
             current_input_items=translator_ctx.get("current_input_items"),
             request_body=translator_ctx.get("request_body"),
             namespace_tool_map=translator_ctx.get("namespace_tool_map"),
+            allow_unsigned_thinking=bool(translator_ctx.get("allow_unsigned_thinking")),
         )
     return None
 
@@ -240,6 +241,7 @@ def apply_non_stream_response_translator(obj: dict, translator_ctx: dict) -> dic
             channel_key=translator_ctx.get("channel_key"),
             current_input_items=translator_ctx.get("current_input_items"),
             namespace_tool_map=translator_ctx.get("namespace_tool_map"),
+            allow_unsigned_thinking=bool(translator_ctx.get("allow_unsigned_thinking")),
         )
     return obj
 
@@ -295,6 +297,9 @@ class AttemptResult:
     proxy_bytes_up: int = 0
     proxy_bytes_down: int = 0
     translator_ctx: Optional[dict] = None
+    # Captured at the Anthropic HTTP error boundary before status normalization.
+    # A semantic 400 synthesized from a 5xx/SSE error must not enable this recovery.
+    anthropic_thinking_history_rejected: bool = False
 
 
 @dataclass
@@ -1217,6 +1222,14 @@ def request_invalid_result_if_needed(result: AttemptResult, *, channel=None) -> 
         ):
             result.error_code = protocol_errors.ZHIPU_CONTENT_POLICY_CODE
         return _mark_request_invalid(result, _request_invalid_status(result))
+    # Use the same explicit history-error recognizer as the one-shot recovery.
+    # Nonstandard Anthropic 400 bodies remain request faults after retry exhaustion,
+    # not channel-health failures. Never reclassify a successful/committed attempt.
+    if (not result.success and not result.stream_started
+            and getattr(channel, "protocol", None) == "anthropic"):
+        from ..openai.anthropic_reasoning_replay import is_thinking_rejection
+        if is_thinking_rejection(result.http_status, result.error_detail or ""):
+            return _mark_request_invalid(result, 400)
     # Text-only compatibility recognizers are limited to status-less and the
     # request-like HTTP statuses accepted above. Status alone is deliberately
     # insufficient: 400/409/413/422 are all used by compatible upstreams for
@@ -1236,8 +1249,12 @@ def request_invalid_result_if_needed(result: AttemptResult, *, channel=None) -> 
     return result
 
 
-def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
+def _strip_encrypted_content_value(value: Any, *, preserve_anthropic: bool = False) -> tuple[Any, int]:
     if isinstance(value, dict):
+        if preserve_anthropic and value.get("type") == "reasoning":
+            from ..openai.anthropic_reasoning_replay import is_native_carrier
+            if is_native_carrier(value.get("encrypted_content")):
+                return value, 0
         out: dict[str, Any] = {}
         removed = 0
         for k, v in value.items():
@@ -1250,12 +1267,12 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
                     if isinstance(item, dict) and item.get("type") == "encrypted_content":
                         removed += 1
                         continue
-                    new_item, n = _strip_encrypted_content_value(item)
+                    new_item, n = _strip_encrypted_content_value(item, preserve_anthropic=preserve_anthropic)
                     removed += n
                     new_list.append(new_item)
                 out[k] = new_list
                 continue
-            new_v, n = _strip_encrypted_content_value(v)
+            new_v, n = _strip_encrypted_content_value(v, preserve_anthropic=preserve_anthropic)
             removed += n
             out[k] = new_v
         return out, removed
@@ -1266,22 +1283,23 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
             if isinstance(item, dict) and item.get("type") == "encrypted_content":
                 removed += 1
                 continue
-            new_item, n = _strip_encrypted_content_value(item)
+            new_item, n = _strip_encrypted_content_value(item, preserve_anthropic=preserve_anthropic)
             removed += n
             out.append(new_item)
         return out, removed
     return value, 0
 
 
-def retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
+def retry_body_without_encrypted_content(body: dict, *, preserve_anthropic: bool = False) -> tuple[dict, int]:
     """Deep-copy a request and recursively remove only encrypted content.
 
     Reasoning items themselves are portable once their opaque EC field is gone;
     summary/content/id and adjacent message/tool items must remain available to a
-    failover candidate.
+    failover candidate. Routing preserves tagged Anthropic carriers; target
+    protocol boundaries decide whether they can be replayed.
     """
     copied = copy.deepcopy(body)
-    stripped, removed = _strip_encrypted_content_value(copied)
+    stripped, removed = _strip_encrypted_content_value(copied, preserve_anthropic=preserve_anthropic)
     return (stripped if isinstance(stripped, dict) else copied), removed
 
 

@@ -111,6 +111,9 @@ def _filter_candidates(requested_model: str,
         resolved = ch.supports_model(requested_model)
         if resolved is None:
             continue
+        if not model_state.is_global_enabled(requested_model, source_key=ch.key):
+            excluded.append({"channel": ch.key, "reason": "global_model_disabled"})
+            continue
         if not model_state.is_source_enabled(ch.key, requested_model):
             excluded.append({"channel": ch.key, "reason": "source_model_disabled"})
             continue
@@ -266,7 +269,7 @@ def schedule(body: dict, api_key_name: str, client_ip: str,
     if compaction_refs:
         encrypted_content_count = 0
     else:
-        portable_body, encrypted_content_count = retry_body_without_encrypted_content(body)
+        portable_body, encrypted_content_count = retry_body_without_encrypted_content(body, preserve_anthropic=True)
         if encrypted_content_count <= 0:
             portable_body = None
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
-from . import config
+from . import config, model_names
 
 SCHEMA_VERSION = 1
 
@@ -61,18 +61,22 @@ def _root_for_write(cfg: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
-def is_global_enabled(model_id: str, cfg: Mapping[str, Any] | None = None) -> bool:
+def is_global_enabled(
+    model_id: str, cfg: Mapping[str, Any] | None = None, *, source_key: str | None = None,
+) -> bool:
     model = str(model_id or "").strip()
-    return bool(model) and model not in set(state_snapshot(cfg)["disabledModels"])
+    disabled = state_snapshot(cfg)["disabledModels"]
+    return bool(model) and not model_names.matching_keys(model_names.channel_provider(source_key), model, disabled)
 
 
-def is_discovery_visible(model_id: str, cfg: Mapping[str, Any] | None = None) -> bool:
+def is_discovery_visible(
+    model_id: str, cfg: Mapping[str, Any] | None = None, *, source_key: str | None = None,
+) -> bool:
     model = str(model_id or "").strip()
     snapshot = state_snapshot(cfg)
-    return (
-        bool(model)
-        and model not in set(snapshot["disabledModels"])
-        and model not in set(snapshot["hiddenModels"])
+    return bool(model) and not model_names.matching_keys(
+        model_names.channel_provider(source_key), model,
+        [*snapshot["disabledModels"], *snapshot["hiddenModels"]],
     )
 
 
@@ -102,7 +106,10 @@ def is_source_enabled(
             except (KeyError, ValueError, TypeError):
                 continue
             field = "cursor_disabled_models" if source.startswith("oauth:cursor:") else "disabledModels"
-            return model_names.upstream_for_channel(source, model) not in _strings(account.get(field))
+            provider = model_names.channel_provider(source)
+            return model_names.upstream_for_channel(source, model) not in {
+                model_names.canonical_id(provider, value) for value in _strings(account.get(field))
+            }
     return True
 
 
@@ -194,6 +201,8 @@ def known_model(model_id: str, cfg: Mapping[str, Any] | None = None) -> bool:
         if not isinstance(account, Mapping):
             continue
         for value in account.get("models") or ():
-            if isinstance(value, str) and value.strip() == model:
+            if isinstance(value, str) and model_names.canonical_id(
+                str(account.get("provider") or ""), value.strip()
+            ) == model_names.canonical_id(str(account.get("provider") or ""), model):
                 return True
     return False

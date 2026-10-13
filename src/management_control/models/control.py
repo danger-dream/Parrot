@@ -334,7 +334,7 @@ class ModelCenterControl(DomainControl):
                     continue
                 model_id = model_names.public_id(provider, outbound)
                 source_enabled = outbound not in disabled
-                global_enabled = model_state.is_global_enabled(model_id, cfg)
+                global_enabled = model_state.is_global_enabled(model_id, cfg, source_key=scope_key)
                 metadata, value_source, constrained = self._binding_view(
                     model_id, scope_key=scope_key, outbound_model=outbound,
                 )

@@ -287,6 +287,7 @@ def _parse_tool_args(
 def _convert_messages(
     messages: Any,
     *,
+    allow_thinking_blocks: bool = False,
     allow_file_url_documents: bool = False,
     optional_empty_string_fields_by_tool: dict[str, set[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, str]]:
@@ -345,6 +346,9 @@ def _convert_messages(
         if role not in ("user", "assistant"):
             _fail(f"unsupported Chat message role for Anthropic bridge: {role!r}", param="messages")
 
+        if allow_thinking_blocks and role == "assistant" and isinstance(msg.get("_parrot_thinking_blocks"), list):
+            append_turn("assistant", msg["_parrot_thinking_blocks"])
+            continue
         if role == "assistant" and isinstance(msg.get("_parrot_hosted_search_blocks"), list):
             append_turn("assistant", msg["_parrot_hosted_search_blocks"])
             continue
@@ -538,7 +542,9 @@ def _convert_legacy_function_call(choice: Any, *, parallel_tool_calls: Any = Non
     return out
 
 
-def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> dict:
+def translate_request(
+    body: dict, *, allow_file_url_documents: bool = False, allow_thinking_blocks: bool = False,
+) -> dict:
     from ._legacy_chat import normalize_request
     body = normalize_request(body)
     guard_request(body, allow_file_url_documents=allow_file_url_documents)
@@ -546,6 +552,7 @@ def translate_request(body: dict, *, allow_file_url_documents: bool = False) -> 
 
     messages, system_blocks, _ = _convert_messages(
         body.get("messages") or [],
+        allow_thinking_blocks=allow_thinking_blocks,
         allow_file_url_documents=allow_file_url_documents,
         optional_empty_string_fields_by_tool=common.optional_empty_string_fields_by_tool_from_responses_tools(body.get("tools")),
     )

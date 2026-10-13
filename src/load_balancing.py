@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping
 
-from . import config
+from . import config, model_names
 from .channel.base import Channel
 
 FAMILIES = ("anthropic", "openai")
@@ -229,6 +229,10 @@ def effective_order_for_model(
 
     model_id = str(model or "").strip()
     orders = _model_orders_from_cfg(cfg)
+    if model_id not in orders and live_channels and all(getattr(ch, "provider", "") == "zhipu" for ch in live_channels):
+        keys = model_names.lookup_keys("zhipu", model_id, orders)
+        if keys:
+            model_id = keys[0]
     if model_id in orders:
         selected = [key for key in orders[model_id] if key in live_set]
         seen = set(selected)

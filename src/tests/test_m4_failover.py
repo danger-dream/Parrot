@@ -843,6 +843,233 @@ async def test_invalid_encrypted_content_retries_same_channel_without_ec(m):
     print("  [PASS] invalid_encrypted_content → same-channel retry without EC")
 
 
+@pytest.mark.parametrize("model", ["claude-sonnet-4-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"])
+@pytest.mark.parametrize("ingress_protocol", ["responses", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("mimicry", [False, True])
+async def test_invalid_thinking_history_retries_once_on_same_channel(m, model, ingress_protocol, stream, mimicry):
+    from src.openai import anthropic_reasoning_replay as replay
+    from src.openai.transform import responses_to_anthropic
+    _setup(m)
+    router = MockRouter()
+    calls = []
+    legacy = model == "claude-sonnet-4-5"
+    channel = _make_channel(m, "chA", "https://cha", real=model, alias=model, cc_mimicry=mimicry)
+    _install_channels(m, [channel])
+    blocks = [{"type": "thinking", "thinking": "original", "signature": "rejected-signature"},
+              {"type": "text", "text": "visible"},
+              {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}]
+    result = {"type": "tool_result", "tool_use_id": "call_1", "content": "7"}
+    thinking = {"type": "enabled", "budget_tokens": 1024} if legacy else {"type": "adaptive"}
+    body = {"model": model, "stream": stream, "max_tokens": 4096, "thinking": thinking,
+            "messages": [{"role": "user", "content": "lookup"}, {"role": "assistant", "content": blocks},
+                         {"role": "user", "content": [result]}]}
+    if ingress_protocol == "responses":
+        out = responses_to_anthropic.translate_response({"role": "assistant", "content": blocks, "stop_reason": "tool_use"}, model=model)
+        body = {"model": model, "stream": stream, "reasoning": {"effort": "low"},
+                "input": [{"role": "user", "content": "lookup"}, *out["output"],
+                          {"type": "function_call_output", "call_id": "call_1", "output": "7"}]}
+
+    def handler(req):
+        payload = json.loads(req.content)
+        calls.append(payload)
+        if len(calls) == 1:
+            return httpx.Response(400, json={"type": "error", "error": {
+                "type": "invalid_request_error", "message": "Invalid signature in thinking block"}})
+        return sse_ok() if stream else json_ok_response()
+
+    router.register("https://cha", handler)
+    original = json.loads(json.dumps(body))
+    resp, rid, scheduled, client = await _call_proxy(m, router, body, ingress_protocol=ingress_protocol)
+    try:
+        assert resp.status_code == 200, getattr(resp, "body", b"")
+        text = await _consume_streaming_to_string(resp) if stream else resp.body.decode()
+        assert ('"hi"' if stream else '"hello"') in text
+        if stream:
+            terminal = "response.completed" if ingress_protocol == "responses" else "message_stop"
+            assert terminal in text and "Invalid signature" not in text
+    finally:
+        await client.aclose()
+    assert len(calls) == 2
+    assert any(b.get("signature") == "rejected-signature" for msg in calls[0]["messages"] for b in msg["content"] if isinstance(b, dict))
+    if legacy:
+        assert "thinking" not in calls[1]
+    else:
+        assert calls[1]["thinking"] == {"type": "adaptive"}
+    assert not any(b["type"] in ("thinking", "redacted_thinking") for msg in calls[1]["messages"] for b in msg["content"] if isinstance(b, dict))
+    assert calls[1]["messages"][-1]["content"][0]["tool_use_id"] == "call_1"
+    assert calls[1]["messages"][-1]["content"][0]["content"] == "7"
+    assert replay.DROP_HISTORY_KEY not in calls[1]
+    assert {key: body[key] for key in original} == original
+    assert replay.DROP_HISTORY_KEY not in body
+    assert scheduled.encrypted_content_count == 0
+    assert not m["cooldown"].is_blocked(channel.key, model)
+    log = m["log_db"].log_detail(rid)
+    assert [item["outcome"] for item in log["retry_chain"]] == ["request_invalid", "success"]
+
+
+@pytest.mark.parametrize("error_shape", ["invalid_request_error", "text", "api_error"])
+@pytest.mark.parametrize("ingress_protocol", ["responses", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_thinking_history_fallback_does_not_loop_or_cool_down_channel(m, error_shape, ingress_protocol, stream):
+    _setup(m)
+    router = MockRouter()
+    calls = []
+    channel = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [channel])
+
+    def handler(req):
+        calls.append(json.loads(req.content))
+        detail = "Invalid signature in thinking block"
+        if error_shape == "text":
+            return httpx.Response(400, text=detail)
+        return httpx.Response(400, json={"type": "error", "error": {
+            "type": error_shape, "message": detail}})
+
+    router.register("https://cha", handler)
+    body = {"model": "glm-5", "stream": stream}
+    body["input" if ingress_protocol == "responses" else "messages"] = [{"role": "user", "content": "hello"}]
+    resp, rid, scheduled, client = await _call_proxy(m, router, body, ingress_protocol=ingress_protocol)
+    await client.aclose()
+    assert resp.status_code == 400
+    assert b"Invalid signature in thinking block" in resp.body
+    assert len(calls) == 2
+    assert "thinking" not in calls[1]
+    assert not m["cooldown"].is_blocked(channel.key, "glm-5")
+    assert m["scorer"].get_stats(channel.key, "glm-5") is None
+    log = m["log_db"].log_detail(rid)
+    assert [item["outcome"] for item in log["retry_chain"]] == ["request_invalid", "request_invalid"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+@pytest.mark.parametrize("error_shape", ["text", "api_error", "invalid_request_error"])
+async def test_non_400_thinking_error_does_not_enter_history_recovery(m, status, error_shape, stream, monkeypatch):
+    _setup(m)
+    channel = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [channel])
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        detail = "Invalid signature in thinking block"
+        if error_shape == "text":
+            return httpx.Response(status, text=detail)
+        return httpx.Response(status, json={"error": {"type": error_shape, "message": detail}})
+
+    # Observe the real ordering: the HTTP branch captures the narrow fact before
+    # this normalizer runs, for BOTH downstream streaming modes. It must stay
+    # false even when the existing generic policy subsequently synthesizes 400.
+    observed = []
+    original_normalize = m["failover"]._request_invalid_result_if_needed
+
+    def normalize(result, channel=None):
+        before = (result.http_status, result.anthropic_thinking_history_rejected)
+        normalized = original_normalize(result, channel)
+        observed.append((before, normalized.http_status, normalized.anthropic_thinking_history_rejected))
+        return normalized
+
+    monkeypatch.setattr(m["failover"], "_request_invalid_result_if_needed", normalize)
+    router = MockRouter()
+    router.register("https://cha", handler)
+    resp, rid, scheduled, client = await _call_proxy(m, router, {
+        "model": "glm-5", "stream": stream, "input": "hello"}, ingress_protocol="responses")
+    await client.aclose()
+    assert len(calls) == 1
+    assert observed[0][0] == (status, False)
+    assert all(not before[1] and not after_flag for before, after_status, after_flag in observed)
+    if status == 500 and error_shape == "invalid_request_error":
+        assert observed[0] == ((500, False), 400, False)
+        assert resp.status_code == 400  # Preserve the generic wrapped request-fault policy.
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_200_thinking_error_does_not_enter_history_recovery(m, stream):
+    _setup(m)
+    channel = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [channel])
+    calls = []
+    error = {"type": "error", "error": {
+        "type": "invalid_request_error", "message": "Invalid signature in thinking block"}}
+
+    def handler(req):
+        calls.append(req)
+        if stream:
+            return httpx.Response(200, content=("event: error\ndata: " + json.dumps(error) + "\n\n").encode(),
+                                  headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json=error)
+
+    router = MockRouter()
+    router.register("https://cha", handler)
+    resp, rid, scheduled, client = await _call_proxy(m, router, {
+        "model": "glm-5", "stream": stream, "input": "hello"}, ingress_protocol="responses")
+    await client.aclose()
+    assert len(calls) == 1
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai-responses"])
+async def test_thinking_recovery_respects_protocol_and_disabled_switch(m, protocol, monkeypatch):
+    _setup(m)
+    if protocol == "anthropic":
+        channel = _make_channel(m, "chA", "https://cha")
+        recovery = m["config"].get().setdefault("retry", {}).setdefault("recovery", {})
+        monkeypatch.setitem(recovery, "claudeThinkingFallback", False)
+        model = "glm-5"
+    else:
+        channel = _make_openai_channel("chA", "https://cha")
+        model = "gpt-5.5"
+    _install_channels(m, [channel])
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(400, json={"error": {
+            "type": "invalid_request_error", "message": "Invalid signature in thinking block"}})
+
+    router = MockRouter()
+    router.register("https://cha", handler)
+    resp, rid, scheduled, client = await _call_proxy(m, router, {
+        "model": model, "stream": False, "input": "hello"}, ingress_protocol="responses")
+    await client.aclose()
+    assert len(calls) == 1
+    assert resp.status_code == 400
+
+
+async def test_committed_responses_thinking_error_does_not_retry(m):
+    _setup(m)
+    channel = _make_channel(m, "chA", "https://cha")
+    _install_channels(m, [channel])
+    calls = []
+
+    def wire(*events):
+        return b"".join(("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n").encode() for e in events)
+
+    first = wire(
+        {"type": "message_start", "message": {"model": "glm-5", "usage": {"input_tokens": 1}}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "visible thought"}},
+    )
+    error = wire({"type": "error", "error": {
+        "type": "invalid_request_error", "message": "Invalid signature in thinking block"}})
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(200, stream=ChunkedByteStream([first, error]), headers={"content-type": "text/event-stream"})
+
+    router = MockRouter()
+    router.register("https://cha", handler)
+    resp, rid, scheduled, client = await _call_proxy(m, router, {
+        "model": "glm-5", "stream": True, "input": "hello"}, ingress_protocol="responses")
+    try:
+        text = await _consume_streaming_to_string(resp)
+    finally:
+        await client.aclose()
+    assert len(calls) == 1
+    assert "response.reasoning_summary_text.delta" in text and "visible thought" in text
+    assert text.count("event: response.failed") == 1
+
+
 async def test_stream_success_full_forward(m):
     _setup(m)
     router = MockRouter()

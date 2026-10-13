@@ -1065,7 +1065,7 @@ async def list_models(request: Request):
     if err:
         return errors.json_error_response(401, errors.ErrType.AUTH, err)
 
-    from src import image_catalog
+    from src import image_catalog, model_names
     scoped = auth.allowed_channels(key_name) is not None
     image_models = (image_catalog.available_models(api_key_name=key_name) if scoped
                     else image_catalog.available_models()) if auth.images_allowed(key_name) else []
@@ -1079,6 +1079,14 @@ async def list_models(request: Request):
     if allowed_models:
         allowed_set = set(allowed_models)
         visible = [m for m in all_models if m in allowed_set]
+        compatible = registry.available_model_spellings(allowed_models, api_key_name=key_name)
+        identities = {model_names.canonical_id("zhipu", model) for model in visible}
+        for model in sorted(compatible):
+            identity = model_names.canonical_id("zhipu", model)
+            if identity not in identities:
+                visible.append(model)
+                identities.add(identity)
+        visible.sort()
     else:
         visible = all_models
 
@@ -1088,7 +1096,9 @@ async def list_models(request: Request):
     # 这份共享清单，否则客户端会看到在其他入口无法路由的模型名。
     visible_set = set(visible)
     alias_seen: set[str] = set()
-    for _alias, _real in model_mapping.get_global_map().items():
+    global_map = model_mapping.get_global_map()
+    compatible_targets = registry.available_model_spellings(global_map.values(), api_key_name=key_name)
+    for _alias, _real in global_map.items():
         if _alias in visible_set:
             continue
         if _real in image_models:
@@ -1097,7 +1107,9 @@ async def list_models(request: Request):
             ):
                 alias_seen.add(_alias)
             continue
-        if _real not in visible_set:
+        if _real not in visible_set and not (
+            _real in compatible_targets and (not allowed_models or _real in allowed_set)
+        ):
             continue
         # Key 有白名单时, 别名必须显式授权 (白名单按真名语义, 但下游看到的
         # 是别名, 这里做 strict 检查: 白名单里如果没别名就不暴露)

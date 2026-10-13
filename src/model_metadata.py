@@ -295,13 +295,13 @@ def _override_roots(
 
 
 def _override_entry_fields(
-    raw: Any, *, known_outbound_model: str | None = None,
+    raw: Any, *, known_outbound_model: str | None = None, provider: str = "",
 ) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         return {}
     saved_outbound = normalize_model_name(raw.get("outboundModel")) or None
     known = normalize_model_name(known_outbound_model) or None
-    if saved_outbound and known and saved_outbound != known:
+    if saved_outbound and known and model_names.canonical_id(provider, saved_outbound) != model_names.canonical_id(provider, known):
         return {}
     fields_raw = raw.get("fields") if isinstance(raw.get("fields"), Mapping) else raw
     try:
@@ -325,14 +325,18 @@ def get_override_fields(
     name = normalize_model_name(model)
     scope = normalize_model_name(scope_key) or None
     defaults, scoped = _override_roots(cfg)
-    common = _override_entry_fields(defaults.get(name))
+    provider = model_names.channel_provider(scope)
+    common: dict[str, Any] = {}
+    for key in reversed(model_names.lookup_keys(provider, name, defaults)):
+        common.update(_override_entry_fields(defaults[key]))
     source: dict[str, Any] = {}
     if scope:
         values = scoped.get(scope) or {}
         if isinstance(values, Mapping):
-            source = _override_entry_fields(
-                values.get(name), known_outbound_model=outbound_model,
-            )
+            for key in reversed(model_names.lookup_keys(provider, name, values)):
+                source.update(_override_entry_fields(
+                    values[key], known_outbound_model=outbound_model, provider=provider,
+                ))
     return common, source
 
 
@@ -539,7 +543,8 @@ def _record_for(
     known = normalize_model_name(known_outbound_model) or None
     if (
         scope_key and not scope_key.startswith("oauth:cursor:")
-        and saved_outbound and known and saved_outbound != known
+        and saved_outbound and known
+        and model_names.upstream_for_channel(scope_key, saved_outbound) != model_names.upstream_for_channel(scope_key, known)
     ):
         return None
     snapshot = raw.get("autoSnapshot") if isinstance(raw, Mapping) else None
@@ -587,13 +592,16 @@ def _oauth_account_record(
                         if make_account_key(item) == wanted_key), None)
     except Exception:
         return None
-    models = {normalize_model_name(item) for item in (account or {}).get("models") or []}
+    provider = str((account or {}).get("provider") or (account or {}).get("type") or "").strip().lower()
+    models = {model_names.canonical_id(provider, normalize_model_name(item))
+              for item in (account or {}).get("models") or []}
     if not account or not models:
         return None
-    candidate = model if model in models else normalize_model_name(outbound_model)
+    candidate = model_names.canonical_id(provider, model)
+    if candidate not in models:
+        candidate = model_names.canonical_id(provider, normalize_model_name(outbound_model))
     if not candidate or candidate not in models:
         return None
-    provider = str(account.get("provider") or account.get("type") or "").strip().lower()
     if provider == "cursor":
         try:
             from .cursor_bridge.catalog import find_record
@@ -603,7 +611,7 @@ def _oauth_account_record(
     else:
         records = ((account.get("account_model_catalog") or {}).get("models") or [])
         record = next((item for item in records if isinstance(item, Mapping)
-                       and normalize_model_name(item.get("id")) == candidate), None)
+                       and model_names.canonical_id(provider, normalize_model_name(item.get("id"))) == candidate), None)
     return (record, provider) if isinstance(record, Mapping) else None
 
 
@@ -790,6 +798,15 @@ def _account_native_binding(
     )
 
 
+def _binding_lookup_keys(model, scope, values):
+    provider = model_names.channel_provider(scope)
+    keys = model_names.lookup_keys(provider, model, values)
+    def automatic(key):
+        fields = _binding_fields(values[key])
+        return not fields or fields[1] in {"auto", "legacy"}
+    return sorted(keys, key=automatic)
+
+
 def resolve_binding(
     client_visible_model: Any,
     *,
@@ -811,10 +828,13 @@ def resolve_binding(
         return None
     cfg = config.get()
     defaults, scoped = _binding_roots(cfg)
+    provider = model_names.channel_provider(scope)
     binding: MetadataBinding | None = None
     if scope:
         scope_bindings = scoped.get(scope) or {}
-        for lookup in lookup_models:
+        scoped_keys = (_binding_lookup_keys(model, scope, scope_bindings)
+                       if provider == "zhipu" and isinstance(scope_bindings, Mapping) else lookup_models)
+        for lookup in scoped_keys:
             if isinstance(scope_bindings, Mapping) and lookup in scope_bindings:
                 binding = _record_for(
                     model, scope_bindings.get(lookup), scope_key=scope,
@@ -823,7 +843,8 @@ def resolve_binding(
                 if binding is not None:
                     break
     if binding is None:
-        for lookup in lookup_models:
+        default_keys = _binding_lookup_keys(model, scope, defaults) if provider == "zhipu" else lookup_models
+        for lookup in default_keys:
             if lookup in defaults:
                 binding = _record_for(
                     model, defaults.get(lookup), scope_key=None,
@@ -898,13 +919,15 @@ def set_binding(
             if not isinstance(values, dict):
                 values = {}
                 scopes[scope] = values
-            values[model] = entry
         else:
             values = root.setdefault("defaults", {})
             if not isinstance(values, dict):
                 values = {}
                 root["defaults"] = values
-            values[model] = entry
+        provider = model_names.channel_provider(scope)
+        for key in model_names.matching_keys(provider, model, values):
+            values.pop(key)
+        values[model_names.canonical_id(provider, model)] = entry
 
     config.update(mutate)
 
@@ -920,9 +943,11 @@ def delete_binding(client_visible_model: str, *, scope_key: str | None = None) -
             values = scoped.get(scope) if isinstance(scoped, dict) else None
         else:
             values = defaults
-        if isinstance(values, dict) and model in values:
-            del values[model]
-            removed[0] = True
+        if isinstance(values, dict):
+            provider = model_names.channel_provider(scope)
+            for key in model_names.matching_keys(provider, model, values):
+                del values[key]
+                removed[0] = True
         if scope and isinstance(scoped, dict) and not values:
             scoped.pop(scope, None)
 
@@ -1053,8 +1078,12 @@ def patch_override_fields(
             if not isinstance(values, dict):
                 values = {}
                 root["defaults"] = values
-        raw = values.get(name)
-        existing = _override_entry_fields(raw, known_outbound_model=outbound)
+        provider = model_names.channel_provider(scope)
+        keys = model_names.lookup_keys(provider, name, values)
+        raw = values.get(keys[0]) if keys else None
+        existing = {}
+        for key in reversed(keys):
+            existing.update(_override_entry_fields(values[key], known_outbound_model=outbound, provider=provider))
         updated = dict(existing)
         updated.update(copy.deepcopy(normalized_set))
         for field_name in normalized_unset:
@@ -1076,13 +1105,15 @@ def patch_override_fields(
         ):
             return
         changed[0] = True
+        for key in keys:
+            values.pop(key)
+        stored_name = model_names.canonical_id(provider, name)
         if updated:
             entry: dict[str, Any] = {"fields": updated}
             if scope:
                 entry["outboundModel"] = outbound
-            values[name] = entry
+            values[stored_name] = entry
         else:
-            values.pop(name, None)
             if scope and not values:
                 scopes.pop(scope, None)
 
@@ -1098,9 +1129,11 @@ def delete_override_layer(model: str, *, scope_key: str | None = None) -> bool:
     def mutate(cfg: dict) -> None:
         defaults, scoped = _override_roots(cfg)
         values = scoped.get(scope) if scope and isinstance(scoped, dict) else defaults
-        if isinstance(values, dict) and name in values:
-            values.pop(name, None)
-            removed[0] = True
+        if isinstance(values, dict):
+            provider = model_names.channel_provider(scope)
+            for key in model_names.matching_keys(provider, name, values):
+                values.pop(key)
+                removed[0] = True
         if scope and isinstance(scoped, dict) and not values:
             scoped.pop(scope, None)
 
@@ -1123,7 +1156,8 @@ def clear_scoped_metadata_in_config(
         if not isinstance(values, dict):
             continue
         for name in names:
-            values.pop(name, None)
+            for key in model_names.matching_keys(model_names.channel_provider(scope), name, values):
+                values.pop(key, None)
         if not values:
             scopes.pop(scope, None)
 
@@ -1175,10 +1209,14 @@ def list_bindings() -> list[MetadataBinding]:
         if not isinstance(values, Mapping):
             continue
         for model, raw in values.items():
+            provider = model_names.channel_provider(str(scope))
+            keys = _binding_lookup_keys(str(model), str(scope), values)
+            if keys and model != keys[0]:
+                continue
             fields = _binding_fields(raw)
             known = fields[2] if fields else None
             binding = _record_for(
-                str(model), raw, scope_key=str(scope), known_outbound_model=known,
+                model_names.canonical_id(provider, str(model)), raw, scope_key=str(scope), known_outbound_model=known,
                 allow_missing_catalog=True,
             )
             if binding:
@@ -1337,19 +1375,20 @@ def sync_auto_snapshots(
     candidate: Any | None = None,
 ) -> dict[str, Any]:
     """Atomically write exact auto bindings/snapshots for an explicit target set."""
+    cfg = copy.deepcopy(config.get())
     normalized: list[tuple[str, str | None, str | None]] = []
     seen: set[tuple[str, str | None]] = set()
     for model, scope_key, outbound_model in targets:
         name = normalize_model_name(model)
         scope = normalize_model_name(scope_key) or None
         outbound = normalize_model_name(outbound_model) or None
+        name = model_names.canonical_id(model_names.channel_provider(scope), name)
         key = (name, scope)
         if name and key not in seen:
             normalized.append((name, scope, outbound))
             seen.add(key)
     # Compute without holding the config lifecycle lock; the commit below CASes
     # the exact input snapshot so a concurrent manual write can never be lost.
-    cfg = copy.deepcopy(config.get())
     defaults, scoped = _binding_roots(cfg)
     changes: list[tuple[str, str | None, dict[str, Any]]] = []
     results: list[dict[str, Any]] = []
@@ -1358,7 +1397,8 @@ def sync_auto_snapshots(
             scoped.get(scope) if scope and isinstance(scoped, Mapping) else defaults
         )
         values = values if isinstance(values, Mapping) else {}
-        current_raw = values.get(model)
+        keys = _binding_lookup_keys(model, scope, values)
+        current_raw = values.get(keys[0]) if keys else None
         current = _binding_fields(current_raw)
         current_source = current[1] if current else ""
         source_ref = scope
@@ -1410,7 +1450,7 @@ def sync_auto_snapshots(
                 continue
             entry["outboundModel"] = outbound
         status = "unchanged" if current_raw == entry else (
-            "updated" if model in values else "created"
+            "updated" if keys else "created"
         )
         if status != "unchanged":
             changes.append((model, scope, entry))
@@ -1443,6 +1483,9 @@ def sync_auto_snapshots(
                     if not isinstance(values, dict):
                         values = {}
                         root["defaults"] = values
+                provider = model_names.channel_provider(scope)
+                for key in model_names.matching_keys(provider, model, values):
+                    values.pop(key)
                 values[model] = copy.deepcopy(entry)
         config.update(mutate)
     statuses = {

@@ -1,7 +1,7 @@
-"""Provider-owned public names for ambiguous OAuth model IDs.
+"""Provider-owned model identities and public names.
 
-Only these explicit IDs are aliased. Stored/upstream IDs remain untouched;
-resolution happens inside the owning channel, never in the global model map.
+Provider rules never rewrite arbitrary client aliases or another provider's IDs.
+Wire IDs and display names remain separate from the identity used for lookup.
 """
 from __future__ import annotations
 
@@ -11,31 +11,51 @@ _PUBLIC_TO_UPSTREAM = {f"{provider}-{model}": (provider, model)
                        for provider in _PROVIDERS for model in _GENERIC_IDS}
 
 
+def canonical_id(provider: str, model: str) -> str:
+    return model.casefold() if provider == "zhipu" else model
+
+
+def matching_keys(provider: str, model: str, values) -> list[str]:
+    if provider != "zhipu":
+        return [model] if model in values else []
+    identity = canonical_id(provider, model)
+    return [key for key in values if isinstance(key, str) and canonical_id(provider, key) == identity]
+
+
+def lookup_keys(provider: str, model: str, values) -> list[str]:
+    matches = matching_keys(provider, model, values)
+    canonical = canonical_id(provider, model)
+    return sorted(matches, key=lambda key: (key != canonical, key != model, key))
+
+
 def public_id(provider: str, model: str) -> str:
+    model = canonical_id(provider, model)
     return f"{provider}-{model}" if provider in _PROVIDERS and model in _GENERIC_IDS else model
 
 
 def upstream_id(provider: str, model: str) -> str:
     pair = _PUBLIC_TO_UPSTREAM.get(model)
-    return pair[1] if pair is not None and pair[0] == provider else model
+    return pair[1] if pair is not None and pair[0] == provider else canonical_id(provider, model)
 
 
 def display_name(provider: str, model: str, name: str | None = None) -> str:
     # The generic upstream display name is just as ambiguous as its ID.
-    return public_id(provider, model) if public_id(provider, model) != model else (name or model)
+    if provider in _PROVIDERS and model in _GENERIC_IDS:
+        return public_id(provider, model)
+    return name or model
 
 
-def _channel_provider(channel_key: str) -> str:
+def channel_provider(channel_key: str | None) -> str:
     parts = str(channel_key or "").split(":", 2)
     return parts[1] if len(parts) >= 2 and parts[0] == "oauth" else ""
 
 
 def for_channel(channel_key: str, model: str) -> str:
-    return public_id(_channel_provider(channel_key), model)
+    return public_id(channel_provider(channel_key), model)
 
 
 def upstream_for_channel(channel_key: str, model: str) -> str:
-    return upstream_id(_channel_provider(channel_key), model)
+    return upstream_id(channel_provider(channel_key), model)
 
 
 def expand_legacy_permissions(models: list[str]) -> list[str]:

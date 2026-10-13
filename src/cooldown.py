@@ -13,7 +13,7 @@ import time
 from types import SimpleNamespace
 from typing import Optional
 
-from . import channel_state, config, notifier, quota_errors, state_db
+from . import channel_state, config, model_names, notifier, quota_errors, state_db
 
 
 _INF = -1  # StateStore snapshots 中用 -1 表示永久
@@ -144,10 +144,30 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _model_keys(channel_key: str, model: str) -> list[tuple[str, str]]:
+    provider = model_names.channel_provider(channel_key)
+    if provider != "zhipu":
+        return [(channel_key, model)] if (channel_key, model) in _entries else []
+    identity = model_names.canonical_id(provider, model)
+    return [key for key in _entries if key[0] == channel_key
+            and model_names.canonical_id(provider, key[1]) == identity]
+
+
+def _entry_key(channel_key: str, model: str) -> tuple[str, str]:
+    keys = _model_keys(channel_key, model)
+    if not keys:
+        return channel_key, model_names.canonical_id(model_names.channel_provider(channel_key), model)
+    def priority(key):
+        state = _entries[key]
+        until = state.get("cooldown_until")
+        return (float("inf") if until == _INF else until or 0, state.get("error_count") or 0)
+    return max(keys, key=priority)
+
+
 def get_state(channel_key: str, model: str) -> Optional[dict]:
     """返回当前冷却状态。不判断是否过期，仅按内存结构返回。"""
     with _lock:
-        v = _entries.get((channel_key, model))
+        v = _entries.get(_entry_key(channel_key, model))
         return dict(v) if v else None
 
 
@@ -213,6 +233,7 @@ def record_error(channel_key: str, model: str, message: str | None = None,
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return {}
+        model = _entry_key(channel_key, model)[1]
         grace = _grace_count(channel_key)
         existing = _entries.get((channel_key, model))
         state = dict(existing) if existing is not None else {
@@ -322,6 +343,7 @@ def record_quota_pause(channel_key: str, model: str, message: str,
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return {}
+        model = _entry_key(channel_key, model)[1]
         state = dict(_entries.get((channel_key, model)) or {
             "error_count": 0,
             "first_error_at": None,
@@ -365,14 +387,10 @@ def clear_on_success(channel_key: str, model: str) -> bool:
         channel_key = channel_state.resolve(channel_key)
         if channel_state.is_deleted(channel_key):
             return False
-        key = (channel_key, model)
-        entry = _entries.get(key)
+        entry = get_state(channel_key, model)
         if entry is None or _was_actively_blocked(entry, now):
             return False
-        # Keep the same DB-before-memory commit ordering as clear().
-        with state_db.optional_write_timeout():
-            state_db.error_delete(channel_key, model)
-        _entries.pop(key, None)
+        clear(channel_key, model, notify_recovered=False)
         return True
 
 
@@ -398,7 +416,7 @@ def clear(channel_key: str, model: Optional[str] = None, *,
         if model is None:
             keys = [k for k in _entries if k[0] == channel_key]
         else:
-            keys = [(channel_key, model)] if (channel_key, model) in _entries else []
+            keys = _model_keys(channel_key, model)
         for k in keys:
             entry = _entries.get(k)
             if entry and _was_actively_blocked(entry, now):
@@ -407,7 +425,12 @@ def clear(channel_key: str, model: Optional[str] = None, *,
         # Persistent deletion is the commit point. If it fails, leave every
         # in-memory entry intact so current-process and restart behavior agree.
         with state_db.optional_write_timeout():
-            state_db.error_delete(channel_key, model)
+            if model is None or not keys:
+                state_db.error_delete(channel_key, model)
+            elif len(keys) == 1:
+                state_db.error_delete(*keys[0])
+            else:
+                state_db.error_delete_models(channel_key, [key[1] for key in keys])
         for k in keys:
             _entries.pop(k, None)
 

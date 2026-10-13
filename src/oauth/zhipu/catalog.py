@@ -11,6 +11,7 @@ import time
 from urllib.parse import urlsplit, urlencode
 
 from . import common as c
+from ... import model_names
 
 def model_record(model):
     value = model.lower()
@@ -175,21 +176,19 @@ def fetch_models(account, *, account_key="", timeout=20):
         # Optional metadata must not turn a valid model-list response into the
         # old two-model default. Reuse matching LKG metadata, not its membership.
         capabilities = None
-    previous_ids = {str(model).casefold(): str(model) for model in account.get("models") or []}
     previous_records = {str(row.get("id") or "").casefold(): row
                         for row in (account.get("account_model_catalog") or {}).get("models") or []
                         if isinstance(row, dict)}
     records = []
     for row in rows:
         upstream_id = row["id"]
-        # Keep existing client IDs/overrides/disable preferences intact when the
-        # old ZCode directory used GLM-* but the endpoint uses glm-*.
-        model = previous_ids.get(upstream_id.casefold(), upstream_id)
+        model = model_names.canonical_id("zhipu", upstream_id)
         if capabilities is None:
             record = copy.deepcopy(previous_records.get(upstream_id.casefold(), {}))
             record.update(id=model, name=model)
         else:
             record = configured_record(model, capabilities)
+        record["upstreamId"] = upstream_id
         name = row.get("display_name")
         if isinstance(name, str) and name.strip():
             record["name"] = name.strip()[:200]

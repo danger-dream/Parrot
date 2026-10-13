@@ -15,6 +15,7 @@ from src.protocols.runtime import apply_non_stream_response_translator, make_str
 CTX = {
     "response_translator": "responses_to_anthropic",
     "model_for_response": "GLM-5.3",
+    "allow_unsigned_thinking": True,
     "request_body": {"model": "GLM-5.3", "reasoning": {"effort": "max"}},
 }
 
@@ -252,17 +253,16 @@ def test_nonstream_thinking_and_native_tool_continuation(mode, monkeypatch):
     assert saved[0]["output_items"] == out["output"]
     assert out["output_text"] == "正文"
     assert "encrypted_content" not in json.dumps(out)
-    # OpenBear replays output items verbatim with the next tool result. Readable
-    # summaries follow the configured bridge policy; no signed/opaque replay
-    # is attempted and the original tool call/result payload stays intact.
+    # Unsigned-thinking-compatible upstreams keep summaries typed on replay;
+    # signatures and opaque payloads are not invented from readable summaries.
     followup = responses_to_anthropic.translate_request({
         "model": "GLM-5.3",
         "input": [{"role": "user", "content": "查一下"}, *out["output"],
                   {"type": "function_call_output", "call_id": "call_1", "output": "结果"}],
-    })
+    }, allow_unsigned_thinking=True)
     summaries = ([
-        {"type": "text", "text": "[Previous assistant reasoning summary]\n先分析"},
-        {"type": "text", "text": "[Previous assistant reasoning summary]\n再检查"},
+        {"type": "thinking", "thinking": "先分析"},
+        {"type": "thinking", "thinking": "再检查"},
     ] if mode == "passthrough" else [])
     assert followup["messages"][-2]["content"] == [
         *summaries,

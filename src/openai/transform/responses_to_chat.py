@@ -19,7 +19,7 @@ import json
 import sqlite3
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ...sqlite_errors import is_availability_error
 from . import guard
@@ -109,7 +109,10 @@ def translate_request(body: dict, *, api_key_name: str = "") -> dict:
     return translate_request_from_input_items(body, input_items)
 
 
-def translate_request_from_input_items(body: dict, input_items: list) -> dict:
+def translate_request_from_input_items(
+    body: dict, input_items: list, *,
+    reasoning_blocks: Callable[[dict], list[dict]] | None = None,
+) -> dict:
     """Responses 请求翻译为 Chat 请求，复用调用方已展开的 input items。
 
     用于需要同时检查完整历史语义的桥接路径，避免 `previous_response_id`
@@ -122,7 +125,10 @@ def translate_request_from_input_items(body: dict, input_items: list) -> dict:
             DEFAULT_MATRIX.plan("responses", "openai-chat", extract_request_features("responses", {"model": body.get("model"), "input": input_items}))
         except ProtocolGuardError as exc:
             raise guard.GuardError(400, "invalid_request_error", str(exc), param="input", scope="candidate") from exc
-    messages = _input_items_to_messages(input_items, native_search=bool(body.get("_parrot_preserve_native_search")))
+    messages = _input_items_to_messages(
+        input_items, native_search=bool(body.get("_parrot_preserve_native_search")),
+        reasoning_blocks=reasoning_blocks,
+    )
 
     # instructions → 前置消息（在任何历史之前）
     messages = _instructions_to_messages(body.get("instructions")) + messages
@@ -324,7 +330,10 @@ def resolve_current_input_items(body: dict) -> list:
     return []
 
 
-def _input_items_to_messages(items: list, *, native_search=False) -> list:
+def _input_items_to_messages(
+    items: list, *, native_search=False,
+    reasoning_blocks: Callable[[dict], list[dict]] | None = None,
+) -> list:
     """input items → chat messages[]；function_call items 聚合到前一条 assistant。
 
     reasoning 处理（passthrough 模式）：
@@ -486,6 +495,12 @@ def _input_items_to_messages(items: list, *, native_search=False) -> list:
             })
 
         elif t == "reasoning":
+            if reasoning_blocks is not None:
+                blocks = reasoning_blocks(item)
+                if blocks:
+                    _flush()
+                    messages.append({"role": "assistant", "content": None, "_parrot_thinking_blocks": blocks})
+                continue
             # passthrough 模式：聚合 summary_text / reasoning_text 给下一条 assistant 用
             # drop 模式：全部忽略
             if bridge:

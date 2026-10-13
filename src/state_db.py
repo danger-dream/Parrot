@@ -251,6 +251,9 @@ def error_load(channel_key:str,model:str):return _get("channel_errors",_key(chan
 def error_load_all():return _all("channel_errors")
 def error_delete(channel_key:str|None=None,model:str|None=None)->None:
     _mut("channel_errors",lambda d:[d.pop(k,None) for k,r in list(d.items()) if channel_key is None or (r.get("channel_key")==channel_key and (model is None or r.get("model")==model))])
+def error_delete_models(channel_key:str,models:list[str])->None:
+    wanted=set(models)
+    _mut("channel_errors",lambda d:[d.pop(k,None) for k,r in list(d.items()) if r.get("channel_key")==channel_key and r.get("model") in wanted])
 def error_rename_channel(old_key:str,new_key:str)->None:
     if old_key!=new_key:_rename_rows("channel_errors",old_key,new_key,replace_conflicts=True)
 

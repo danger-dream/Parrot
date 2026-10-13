@@ -777,8 +777,8 @@ def _strip_encrypted_content_value(value: Any) -> tuple[Any, int]:
     return _strip(value)
 
 
-def _retry_body_without_encrypted_content(body: dict) -> tuple[dict, int]:
-    return retry_body_without_encrypted_content(body)
+def _retry_body_without_encrypted_content(body: dict, *, preserve_anthropic: bool = False) -> tuple[dict, int]:
+    return retry_body_without_encrypted_content(body, preserve_anthropic=preserve_anthropic)
 
 
 def _invalid_ec_cleanup_retry_allowed(body: dict, message: str, cfg: dict,
@@ -810,7 +810,7 @@ def _attempt_body_for_channel(
     if portable_body is not None:
         return portable_body
     if bound_channel_key:
-        stripped, _ = _retry_body_without_encrypted_content(body)
+        stripped, _ = _retry_body_without_encrypted_content(body, preserve_anthropic=True)
         return stripped
     return body
 
@@ -835,7 +835,7 @@ def _positive_output_limit(body: dict) -> tuple[str | None, int | None]:
 
 
 def _validate_candidate_model_enabled(ch: Channel, client_model: str) -> None:
-    if not model_state.is_global_enabled(client_model):
+    if not model_state.is_global_enabled(client_model, source_key=ch.key):
         raise GuardError(
             400, "invalid_request_error", "Model is disabled",
             param="model", scope="candidate",
@@ -2170,7 +2170,7 @@ async def run_failover(
     portable_body: Optional[dict] = None
     request_has_compaction = compaction_owner.has_complete_compaction(body)
     if encrypted_content_count > 0 and not request_has_compaction:
-        stripped_body, removed_ec = _retry_body_without_encrypted_content(body)
+        stripped_body, removed_ec = _retry_body_without_encrypted_content(body, preserve_anthropic=True)
         if removed_ec > 0:
             portable_body = stripped_body
 
@@ -2227,6 +2227,7 @@ async def run_failover(
     codex_http_fallback: set[str] = set()
     retried_without_context_1m: set[tuple[str, str]] = set()
     retried_without_encrypted_content = False
+    retried_without_anthropic_thinking = False
     last_result: Optional[AttemptResult] = None
     structured_attempts: list[dict] = []
     # 跟踪真实最后尝试的渠道（不同于"候选列表最后一条"，因为 OAuth 重刷会重试同 ch）
@@ -2520,6 +2521,24 @@ async def run_failover(
                 retry_count += 1
                 idx += 1
                 continue
+
+        from .openai import anthropic_reasoning_replay
+        if (
+            not retried_without_anthropic_thinking
+            and ingress_protocol in {"responses", "anthropic"}
+            and getattr(ch, "protocol", "") == "anthropic"
+            and not result.success and not result.stream_started
+            and result.outcome not in {"guard_error", "candidate_guard"}
+            and _recovery_retry_allowed("claudeThinkingFallback", cfg)
+            and result.anthropic_thinking_history_rejected
+        ):
+            retried_without_anthropic_thinking = True
+            body = anthropic_reasoning_replay.retry_request(body)
+            if portable_body is not None:
+                portable_body = anthropic_reasoning_replay.retry_request(portable_body)
+            retry_count += 1
+            print(f"[failover] thinking history rejected for {ch.key}/{resolved_model}; retrying once without thinking history")
+            continue
 
         # 请求级 guard 错误：所有 openai 候选语义一致，切也无用，直接短路 4xx
         if result.outcome == "guard_error":
@@ -4697,6 +4716,17 @@ async def _try_channel(
                 proxy_bytes=_proxy_bytes,
                 translator_ctx=upstream_req.translator_ctx,
                 partial_state=cancel_state,
+            )
+            # HTTP errors share this branch for stream and non-stream requests.
+            # Freeze the actual transport rejection before generic request-fault
+            # normalization can turn a wrapped 5xx into a semantic 400.
+            from .openai import anthropic_reasoning_replay
+            result.anthropic_thinking_history_rejected = (
+                not result.success and not result.stream_started
+                and getattr(ch, "protocol", "") == "anthropic"
+                and anthropic_reasoning_replay.is_thinking_rejection(
+                    upstream_resp.status_code, result.error_detail or "",
+                )
             )
             result = _attach_retry_after_from_response(result, upstream_resp, ch)
             result.openai_oauth_html_403 = (

@@ -35,13 +35,15 @@ def install(monkeypatch, rows, *, rules=None, metadata_error=False):
 
 
 @pytest.mark.parametrize('site', ['bigmodel', 'zai'])
-def test_endpoint_membership_existing_case_and_no_metadata_credential_leak(monkeypatch, site):
+def test_endpoint_canonical_identity_and_no_metadata_credential_leak(monkeypatch, site):
     account = credential(site=site, models=['GLM-5.3'], disabledModels=['GLM-5.3'])
     before = copy.deepcopy(account)
     calls = install(monkeypatch, [{'id': 'glm-5.3', 'display_name': 'GLM-5.3'}, {'id': 'new-upstream-model'}],
         rules={'modelRules': [{'modelMatch': '^new-upstream-model$', 'config': {'properties': {'contextWindow': 123456}}}]})
     records = catalog.fetch_models(account, account_key='test-account')
-    assert [row['id'] for row in records] == ['GLM-5.3', 'new-upstream-model']
+    assert [row['id'] for row in records] == ['glm-5.3', 'new-upstream-model']
+    assert records[0]['upstreamId'] == 'glm-5.3'
+    assert records[0]['name'] == 'GLM-5.3'
     assert records[1]['contextWindow'] == 123456
     assert calls[0][0] == common.MODEL_ORIGINS[site] + '/api/anthropic/v1/models'
     assert all(kw['account_key'] == 'test-account' for _, kw in calls)
@@ -82,8 +84,8 @@ def test_optional_metadata_failure_preserves_only_matching_records(monkeypatch):
     install(monkeypatch, [{'id': 'glm-5.3'}, {'id': 'new'}], metadata_error=True)
     records = catalog.fetch_models(account)
     assert records == [
-        {'id': 'GLM-5.3', 'name': 'GLM-5.3', 'contextWindow': 1000000, 'reasoningEfforts': ['low', 'high', 'max']},
-        {'id': 'new', 'name': 'new'},
+        {'id': 'glm-5.3', 'name': 'glm-5.3', 'upstreamId': 'glm-5.3', 'contextWindow': 1000000, 'reasoningEfforts': ['low', 'high', 'max']},
+        {'id': 'new', 'name': 'new', 'upstreamId': 'new'},
     ]
 
 
@@ -101,7 +103,7 @@ async def test_refresh_persists_live_membership_and_preserves_preferences(accoun
     outcome = await om.refresh_account_models(key)
     assert outcome['action'] == 'updated'
     saved = om.get_account(key)
-    assert saved['models'] == ['GLM-5.3', 'GLM-5.3-Flash', 'glm-4.7', 'glm-5.2']
+    assert saved['models'] == ['glm-5.3', 'glm-5.3-flash', 'glm-4.7', 'glm-5.2']
     assert saved['last_model_sync_source'] == 'upstream:zhipu'
     assert saved['disabledModels'] == ['GLM-5.3-Flash']
     assert not model_state.is_global_enabled('glm-4.7')
@@ -114,7 +116,7 @@ async def test_refresh_persists_live_membership_and_preserves_preferences(accoun
     # or retaining entries absent from the live endpoint.
     rows[:] = [{'id': 'glm-5.3'}, {'id': 'glm-5.2'}, {'id': 'new-server-model'}]
     assert (await om.refresh_account_models(key))['action'] == 'updated'
-    assert om.get_account(key)['models'] == ['GLM-5.3', 'glm-5.2', 'new-server-model']
+    assert om.get_account(key)['models'] == ['glm-5.3', 'glm-5.2', 'new-server-model']
     assert om.get_account(key)['disabledModels'] == ['GLM-5.3-Flash']
     previous = copy.deepcopy(om.get_account(key))
     def offline(url, **kw):

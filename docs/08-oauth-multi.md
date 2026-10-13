@@ -37,6 +37,8 @@ OAuth 账户在 `config.json.oauthAccounts` 数组中，每条结构：
 
 ### 账户模型目录
 
+智谱模型身份由 `src/model_names.py` 的 Provider 规则统一处理：整个账户目录按大小写等价识别，以小写 `id` 聚合；`upstreamId` 保留官方接口原始调用 ID，`name` 保留显示名称。ZCode 配置只补充能力，不能替代 `/api/anthropic/v1/models` 的模型成员列表。旧大写账户目录无需先迁移或重同步即可参与同一模型的调度；后续同步不会再把官方 ID 改回旧大小写。全局禁用/隐藏、全局元数据和模型专属优先级的键保持客户端名称精确语义，不能依据账户目录猜测所属 Provider，也不自动合并或改写大小写键。只有明确的智谱来源才按统一身份读取旧禁用、元数据和冷却；同一来源身份的手动绑定优先于自动绑定。调度在候选来源内检查旧全局禁用，不能因此排除大小写敏感的其他来源。模型专属优先级先按请求名称精确匹配，仅在候选全部属于智谱且没有精确配置时兼容旧名称。旧冷却记录保持原持久键，按同一身份读取最严格限制，显式解除时原子清理等价记录。其他 Provider 和自定义 API 别名保持原匹配规则；API Key 的模型/渠道授权不因名称兼容而扩大。
+
 非 Cursor 账户会自动从各自上游发现模型。成功、有效且非空的结果在同一次配置 mutation 中原子替换 `models`（LKG）、白名单化的 `account_model_catalog` 富元数据和同步字段；错误、超时、鉴权失败、非法 schema 或成功空目录都保留旧 LKG（包括元数据）。OpenAI 原始目录中的 instructions/messages 等大字段不会持久化。Cursor 不迁移既有格式，继续使用 `cursor_model_catalog`。**模型 ID 目录**的选择顺序为：实时成功结果 / LKG → Provider 配置的默认 `list[str]` → 程序内置默认。默认模型列表只是无状态字符串兜底，不拥有或推断元数据，不与成功账户目录合并，也不记录账户的可用、冷却或冻结状态。Cursor 没有静态默认目录：没有 LKG 时为 0 个可路由模型，直到同步成功。
 
 **通用生效元数据**与 ID 目录是两件事。运行时和 Telegram 共同通过 `src/model_metadata.py` 解析：当前账户/渠道 scoped models.dev binding → 全局 default binding → legacy binding 兼容 → 当前 OAuth 账户真实/LKG 目录中同 ID 的上游 metadata → 无 metadata。一般 Provider 的用户 binding 优先；后台目录同步只更新账户目录和账户 catalog，绝不写入或覆盖 `modelBindings`。无 LKG 而使用默认 ID 时可以使用 models.dev binding，但绝不从陈旧 `account_model_catalog` 装饰该 ID。Cursor 是 transport 例外：binding 只补充计价和描述，账号实时目录中的能力与限制始终优先，避免历史 binding 掩盖新变体或绕过 Max Context 开关。

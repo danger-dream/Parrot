@@ -110,7 +110,8 @@ def assert_initialized(result, calls, downloads):
     assert outcome["metadata_sync"]["scanned"] == 2
     key = result.account_id
     saved = om.get_account(key)
-    assert saved["models"] == ["GLM-5.3", "GLM-5.3-Flash"]
+    assert saved["models"] == ["glm-5.3", "glm-5.3-flash"]
+    assert [row['upstreamId'] for row in saved['account_model_catalog']['models']] == ['GLM-5.3', 'GLM-5.3-Flash']
     assert om.account_model_selection(key)["effective_models"] == saved["models"]
     row = state_db.quota_load(key)
     usage = json.loads(row["raw_data"])

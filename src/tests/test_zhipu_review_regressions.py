@@ -266,11 +266,12 @@ async def test_official_capability_rules_survive_catalog_sync(account_env, monke
     monkeypatch.setattr(om, "mock_mode_enabled", lambda: False)
     await om.refresh_account_models(key)
     records = {row["id"]: row for row in om.account_model_records(key)}
-    assert records["GLM-5.2"]["contextWindow"] == 1000000
-    assert records["GLM-5.2"]["maxOutputTokens"] == 128000
-    assert records["GLM-5.3-Flash"]["inputModalities"] == ["text", "image", "video", "pdf"]
-    assert records["GLM-5.3-Flash"]["reasoningEfforts"] == ["low", "high", "max"]
-    assert records["unknown-model"] == {"id": "unknown-model", "name": "unknown-model"}
+    assert records["glm-5.2"]["contextWindow"] == 1000000
+    assert records["glm-5.2"]["maxOutputTokens"] == 128000
+    assert records["glm-5.2"]["upstreamId"] == "GLM-5.2"
+    assert records["glm-5.3-flash"]["inputModalities"] == ["text", "image", "video", "pdf"]
+    assert records["glm-5.3-flash"]["reasoningEfforts"] == ["low", "high", "max"]
+    assert records["unknown-model"] == {"id": "unknown-model", "name": "unknown-model", "upstreamId": "unknown-model"}
 
 
 def test_consumption_requires_destructive_at_plan_and_execution(reset_env):

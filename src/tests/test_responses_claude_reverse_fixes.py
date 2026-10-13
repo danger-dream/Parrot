@@ -160,7 +160,7 @@ def test_stream_invalid_custom_wrapper_is_failed_not_completed():
 
 
 @pytest.mark.parametrize('mode', ['passthrough', 'drop'])
-def test_local_previous_response_id_degrades_encrypted_reasoning_without_losing_tools(monkeypatch, mode):
+def test_local_previous_response_id_drops_unreplayable_reasoning_without_losing_tools(monkeypatch, mode):
     monkeypatch.setitem(config.get().setdefault('openai', {}), 'reasoningBridge', mode)
     store.init()  # isolated_pytest supplies a private temporary DATA_DIR.
     response_id = 'resp_opaque_' + uuid.uuid4().hex
@@ -182,10 +182,8 @@ def test_local_previous_response_id_degrades_encrypted_reasoning_without_losing_
     assert out['messages'][0]['content'] == [{'type': 'text', 'text': 'first'}]
     assistant = out['messages'][1]['content']
     assert assistant[-1] == {'type': 'tool_use', 'id': 'call_keep', 'name': 'read', 'input': {'path': 'a'}}
-    if mode == 'passthrough':
-        assert assistant[0] == {'type': 'text', 'text': '[Previous assistant reasoning summary]\nRead the file first'}
-    else:
-        assert len(assistant) == 1
+    assert len(assistant) == 1
+    assert 'Read the file first' not in json.dumps(out)
     followup = out['messages'][2]['content']
     assert followup[0] == {'type': 'tool_result', 'tool_use_id': 'call_keep', 'content': 'file bytes'}
     assert followup[1] == {'type': 'text', 'text': 'finish'}

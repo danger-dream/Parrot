@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from . import cache_display, config, load_balancing, network, notifier, oauth_errors, state_db
-from . import oauth_model_discovery
+from . import model_names, oauth_model_discovery
 from .oauth import (
     DEFAULT_PROVIDER as _DEFAULT_PROVIDER,
     VALID_PROVIDERS as _VALID_PROVIDERS,
@@ -5348,7 +5348,8 @@ def account_disabled_models(account_or_key: dict | str) -> set[str]:
     if not isinstance(account, dict):
         return set()
     field = "cursor_disabled_models" if provider_of(account) == "cursor" else "disabledModels"
-    return {str(model).strip() for model in account.get(field) or [] if str(model).strip()}
+    return {model_names.canonical_id(provider_of(account), str(model).strip())
+            for model in account.get(field) or [] if str(model).strip()}
 
 
 def account_model_records(account_or_key: dict | str) -> list[dict]:
@@ -5376,7 +5377,18 @@ def account_model_records(account_or_key: dict | str) -> list[dict]:
             })
         return records
     raw = ((account.get("account_model_catalog") or {}).get("models") or [])
-    return [copy.deepcopy(item) for item in raw if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    if provider_of(account) != "zhipu":
+        return [copy.deepcopy(item) for item in raw if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    records = {}
+    for item in raw:
+        if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+            continue
+        record = copy.deepcopy(item)
+        if provider_of(account) == "zhipu":
+            record.setdefault("upstreamId", record["id"])
+            record["id"] = model_names.canonical_id("zhipu", record["id"])
+        records.setdefault(record["id"], record)
+    return list(records.values())
 
 
 def account_model_selection(account_or_key: dict | str) -> dict:
@@ -5387,7 +5399,8 @@ def account_model_selection(account_or_key: dict | str) -> dict:
     provider = provider_of(account)
     records = account_model_records(account)
     configured_models = list(dict.fromkeys(
-        str(model).strip() for model in account.get("models") or [] if str(model).strip()
+        model_names.canonical_id(provider, str(model).strip())
+        for model in account.get("models") or [] if str(model).strip()
     ))
     if provider == "cursor":
         # Cursor routes only the intersection of the last successful model list
@@ -5435,6 +5448,7 @@ def set_account_model_disabled(account_key: str, model: str, disabled: bool) -> 
     account = get_account(canonical)
     if not model_id or not isinstance(account, dict):
         raise ValueError("OAuth account/model required")
+    model_id = model_names.canonical_id(provider_of(account), model_id)
     selected = set(account_model_selection(account)["models"])
     if model_id not in selected:
         raise ValueError(f"OAuth account model not found: {model_id}")
@@ -5486,6 +5500,8 @@ def set_account_disabled_models(
     selected = {
         str(model).strip() for model in models or [] if str(model).strip()
     }
+    visible = {model_names.canonical_id(provider_of(account), model) for model in visible}
+    selected = {model_names.canonical_id(provider_of(account), model) for model in selected}
     unknown = sorted(selected - visible)
     if unknown:
         raise ValueError(f"OAuth account model not in editor snapshot: {unknown[0]}")
@@ -5738,7 +5754,8 @@ def _model_ids(account: dict | None) -> list[str]:
     if not isinstance(account, dict):
         return []
     return list(dict.fromkeys(
-        str(model).strip() for model in account.get("models") or [] if str(model).strip()
+        model_names.canonical_id(provider_of(account), str(model).strip())
+        for model in account.get("models") or [] if str(model).strip()
     ))
 
 

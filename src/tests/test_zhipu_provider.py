@@ -146,7 +146,7 @@ async def test_catalog_sync_key_mode_no_subscription_invention(account_env, monk
     monkeypatch.setattr(catalog, "fetch_models", lambda *a, **k: [catalog.model_record("GLM-5.3")])
     result = await om.refresh_account_models(key)
     assert result["action"] in {"updated", "synced", "refreshed"}, result
-    assert om.account_model_selection(key)["effective_models"] == ["GLM-5.3"]
+    assert om.account_model_selection(key)["effective_models"] == ["glm-5.3"]
     om.set_account_model_disabled(key, "GLM-5.3", True)
     assert om.account_model_selection(key)["effective_models"] == []
     oauth = credential("oauth", entitlement="unassigned", models=["GLM-5.3"])

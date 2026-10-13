@@ -2,11 +2,12 @@
 
 Used by OpenAI Responses ingress → Anthropic upstream. Readable thinking is
 exposed as Responses reasoning summaries under the existing reasoning bridge
-policy. Anthropic signatures/redacted blocks are not OpenAI encrypted content.
+policy. Native signatures/redacted payloads use tagged opaque replay carriers.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
@@ -15,6 +16,7 @@ from typing import Any, Iterator, Optional
 
 from .common import build_response_skeleton, build_response_usage, reasoning_passthrough_enabled
 from .responses_to_anthropic import NamespaceToolMap, _CUSTOM_RAW_KEY
+from .. import anthropic_reasoning_replay as native_replay
 from ...protocols.usage import legacy_usage_from_anthropic_json
 from ...protocols.sse import split_sse_events
 
@@ -97,6 +99,9 @@ class _ReasoningState:
     item_id: str
     output_index: int
     text_parts: list[str] = field(default_factory=list)
+    native_block: dict = field(default_factory=dict)
+    native_complete: bool = False
+    summary_started: bool = False
     done: bool = False
 
 
@@ -161,6 +166,7 @@ class StreamTranslator:
         current_input_items: Optional[list] = None,
         request_body: Optional[dict] = None,
         namespace_tool_map: NamespaceToolMap | None = None,
+        allow_unsigned_thinking: bool = False,
         created_ts: Optional[int] = None,
     ):
         self.state = _State(
@@ -179,6 +185,7 @@ class StreamTranslator:
         self._store_current_input = current_input_items
         self._namespace_tool_map = namespace_tool_map
         self._reasoning_enabled = reasoning_passthrough_enabled()
+        self._preserve_native = self._reasoning_enabled and not allow_unsigned_thinking
         self._invalid_tool = False
 
     def feed(self, chunk: bytes) -> Iterator[bytes]:
@@ -279,6 +286,8 @@ class StreamTranslator:
                     if btype == "web_search_tool_result" and item.get("id") == block.get("tool_use_id"):
                         yield _emit("response.output_item.done", {"type": "response.output_item.done", "sequence_number": self.state.next_seq(), "output_index": output_index, "item": item})
                 return
+            if btype in ("thinking", "redacted_thinking") and self._preserve_native:
+                yield from self._start_reasoning(int(data.get("index", 0) or 0), block)
             if btype == "thinking":
                 yield from self._emit_reasoning(int(data.get("index", 0) or 0), block.get("thinking"))
             elif btype == "text":
@@ -304,6 +313,10 @@ class StreamTranslator:
             dt = delta.get("type")
             if dt == "thinking_delta":
                 yield from self._emit_reasoning(int(data.get("index", 0) or 0), delta.get("thinking"))
+            elif dt == "signature_delta":
+                st = self.state.reasoning.get(int(data.get("index", 0) or 0))
+                if self._preserve_native and st is not None and not st.done and isinstance(delta.get("signature"), str):
+                    st.native_block["signature"] = st.native_block.get("signature", "") + delta["signature"]
             elif dt == "text_delta":
                 yield from self._emit_text(int(data.get("index", 0) or 0), delta.get("text"))
             elif dt == "input_json_delta":
@@ -343,6 +356,7 @@ class StreamTranslator:
                 yield from self._close_message_item_if_needed(message)
             reasoning = self.state.reasoning.get(idx)
             if reasoning is not None:
+                reasoning.native_complete = True
                 yield from self._finish_reasoning(reasoning)
             st = self.state.tools.get(idx)
             if st is not None and st.started and not st.done:
@@ -435,20 +449,32 @@ class StreamTranslator:
             "item": self._message_output_item(st),
         })
 
-    def _emit_reasoning(self, block_index: int, text: Any) -> Iterator[bytes]:
-        if not self._reasoning_enabled or not isinstance(text, str) or not text:
+    def _start_reasoning(self, block_index: int, block: dict) -> Iterator[bytes]:
+        if block_index in self.state.reasoning:
             return
         yield from self._ensure_created()
-        st = self.state.reasoning.get(block_index)
-        if st is None:
-            st = _ReasoningState(item_id=_gen_id("rs_"), output_index=self.state.alloc_output_index())
-            self.state.reasoning[block_index] = st
-            yield _emit("response.output_item.added", {
-                "type": "response.output_item.added",
-                "sequence_number": self.state.next_seq(),
-                "output_index": st.output_index,
-                "item": {"type": "reasoning", "id": st.item_id, "summary": []},
-            })
+        native = copy.deepcopy(block)
+        if native.get("type") == "thinking":
+            native["thinking"] = ""
+        st = _ReasoningState(item_id=_gen_id("rs_"), output_index=self.state.alloc_output_index(), native_block=native)
+        self.state.reasoning[block_index] = st
+        yield _emit("response.output_item.added", {
+            "type": "response.output_item.added", "sequence_number": self.state.next_seq(),
+            "output_index": st.output_index, "item": {"type": "reasoning", "id": st.item_id, "summary": []},
+        })
+
+    def _emit_reasoning(self, block_index: int, text: Any) -> Iterator[bytes]:
+        if (not self._reasoning_enabled and not self._preserve_native) or not isinstance(text, str) or not text:
+            return
+        yield from self._start_reasoning(block_index, {"type": "thinking", "thinking": ""})
+        st = self.state.reasoning[block_index]
+        if st.done:
+            return
+        st.native_block["thinking"] = st.native_block.get("thinking", "") + text
+        if not self._reasoning_enabled:
+            return
+        if not st.summary_started:
+            st.summary_started = True
             yield _emit("response.reasoning_summary_part.added", {
                 "type": "response.reasoning_summary_part.added",
                 "sequence_number": self.state.next_seq(),
@@ -468,17 +494,28 @@ class StreamTranslator:
         })
 
     def _reasoning_output_item(self, st: _ReasoningState) -> dict:
-        # A provider's signature is not replayable OpenAI encrypted_content.
-        return {
+        item = {
             "type": "reasoning", "id": st.item_id,
             "status": "completed" if st.done else "in_progress",
-            "summary": [{"type": "summary_text", "text": "".join(st.text_parts)}],
+            "summary": [{"type": "summary_text", "text": "".join(st.text_parts)}] if st.summary_started else [],
         }
+        carrier = native_replay.encode(st.native_block) if self._preserve_native and st.native_complete else None
+        if carrier:
+            item["encrypted_content"] = carrier
+        return item
 
     def _finish_reasoning(self, st: _ReasoningState) -> Iterator[bytes]:
         if st.done:
             return
         st.done = True
+        if st.summary_started:
+            yield from self._finish_reasoning_summary(st)
+        yield _emit("response.output_item.done", {
+            "type": "response.output_item.done", "sequence_number": self.state.next_seq(),
+            "output_index": st.output_index, "item": self._reasoning_output_item(st),
+        })
+
+    def _finish_reasoning_summary(self, st: _ReasoningState) -> Iterator[bytes]:
         text = "".join(st.text_parts)
         yield _emit("response.reasoning_summary_text.done", {
             "type": "response.reasoning_summary_text.done",
@@ -495,12 +532,6 @@ class StreamTranslator:
             "output_index": st.output_index,
             "summary_index": 0,
             "part": {"type": "summary_text", "text": text},
-        })
-        yield _emit("response.output_item.done", {
-            "type": "response.output_item.done",
-            "sequence_number": self.state.next_seq(),
-            "output_index": st.output_index,
-            "item": self._reasoning_output_item(st),
         })
 
     def _tool(self, block_index: int) -> _ToolState:

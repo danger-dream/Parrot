@@ -6,6 +6,7 @@ import re
 from typing import Optional
 from urllib.parse import urlparse
 
+from ..openai import anthropic_reasoning_replay
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry, standard
@@ -129,6 +130,7 @@ class ApiChannel(Channel):
     ) -> UpstreamRequest:
         # Logical CC context is created by failover and must survive bridge
         # translation, whose public payload allowlist intentionally drops private keys.
+        drop_thinking_history = bool(requested_body.get(anthropic_reasoning_replay.DROP_HISTORY_KEY))
         cc_request_context = cc_mimicry.request_context_from(requested_body)
         # Phase 8: OpenAI-family ingress can route to Anthropic upstream through
         # request/response translators while unsafe feature gaps stay guarded by matrix.
@@ -238,6 +240,10 @@ class ApiChannel(Channel):
                         payload["context_management"] = {**cm, "edits": edits}
                     else:
                         payload.pop("context_management", None)
+            if drop_thinking_history:
+                anthropic_reasoning_replay.drop_thinking_history(payload)
+            elif translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
+                responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
             signed = cc_mimicry.sign_body(payload)
             # omit_thinking 时过滤 thinking 类 beta；build_upstream_headers 内部还会
             # 再剔除 oauth-2025-04-20（messages 不带）。§7.5：复用统一 header 构造，
@@ -261,6 +267,10 @@ class ApiChannel(Channel):
                 payload.pop("temperature", None)
             if self.omit_thinking:
                 payload.pop("thinking", None)
+            if drop_thinking_history:
+                anthropic_reasoning_replay.drop_thinking_history(payload)
+            elif translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
+                responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
             signed = standard.serialize(payload)
             headers = {
                 "Content-Type": "application/json",

@@ -55,6 +55,9 @@ class ProviderAdapter:
         """
         if not isinstance(payload, dict):
             return {}
+        if protocol == "openai-responses":
+            from ..openai.anthropic_reasoning_replay import without_native_items
+            payload = without_native_items(payload)
         allow = self.capabilities.request_allowlist(protocol, bridge=bridge)
         if allow is None:
             return dict(payload)

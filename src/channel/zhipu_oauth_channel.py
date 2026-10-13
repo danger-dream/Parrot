@@ -7,10 +7,11 @@ import hashlib
 import json
 import uuid
 
-from .. import config, oauth_manager
+from .. import config, model_names, oauth_manager
 from ..oauth.zhipu import common as c, request_context, runtime, signing
 from ..oauth.zhipu.response import BusinessContext, BusinessStream
 from ..oauth_ids import account_key
+from ..openai import anthropic_reasoning_replay
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic, guard
 from ..providers import registry as providers
 from .api_channel import ApiChannel
@@ -36,7 +37,11 @@ class ZhipuOAuthChannel(ApiChannel):
         self.key = "oauth:" + self.account_key
         self.email = name
 
+    def supports_model(self, requested_model):
+        return super().supports_model(model_names.canonical_id(self.provider, requested_model))
+
     async def build_upstream_request(self, requested_body, resolved_model, *, ingress_protocol="anthropic"):
+        resolved_model = model_names.canonical_id(self.provider, resolved_model)
         token = await oauth_manager.ensure_channel_token(self)
         current = oauth_manager.get_account(self.account_key)
         if not current or resolved_model not in oauth_manager.account_model_selection(current)["effective_models"]:
@@ -52,22 +57,24 @@ class ZhipuOAuthChannel(ApiChannel):
             key_name = str(source.get("_api_key_name") or "")
             tool_map = responses_to_anthropic.NamespaceToolMap()
             items = responses_to_anthropic.resolve_current_input_items(source)
-            payload = responses_to_anthropic.translate_request(source, api_key_name=key_name, store_enabled=store.is_enabled(), namespace_tool_map=tool_map, target_model=resolved_model)
+            payload = responses_to_anthropic.translate_request(source, api_key_name=key_name, store_enabled=store.is_enabled(), namespace_tool_map=tool_map, target_model=resolved_model, allow_unsigned_thinking=True)
             ctx = {"ingress": "responses", "upstream_protocol": "anthropic", "response_translator": "responses_to_anthropic",
                    "model_for_response": resolved_model, "previous_response_id": source.get("previous_response_id"),
                    "api_key_name": key_name, "channel_key": self.key, "current_input_items": items,
-                   "request_body": source, "namespace_tool_map": tool_map}
+                   "request_body": source, "namespace_tool_map": tool_map, "allow_unsigned_thinking": True}
         elif ingress_protocol == "anthropic":
             payload = source
         else:
             raise ValueError("Unsupported Zhipu ingress")
         payload = providers.filter_request_payload(self, payload, protocol="anthropic", bridge=ctx is not None)
-        payload["model"] = resolved_model
+        record = next((r for r in oauth_manager.account_model_records(current) if r.get("id") == resolved_model), {})
+        payload["model"] = record.get("upstreamId") or next(
+            (model for model in current.get("models") or []
+             if model_names.canonical_id(self.provider, model) == resolved_model), resolved_model)
         payload.setdefault("max_tokens", 4096)
         payload.setdefault("stream", False)
         # Explicit parameters are authoritative. Only adapt an explicitly chosen
         # reasoning level, never inject model-wide thinking/max token defaults.
-        record = next((r for r in oauth_manager.account_model_records(current) if r.get("id") == resolved_model), {})
         effort = source.get("reasoning_effort") if ingress_protocol == "chat" else (source.get("reasoning") or {}).get("effort") if ingress_protocol == "responses" else None
         if effort is not None:
             values = record.get("reasoningEfforts") or []
@@ -76,6 +83,8 @@ class ZhipuOAuthChannel(ApiChannel):
             payload["thinking"] = {"type": "disabled" if effort in {"disabled", "none"} else "enabled"}
             if effort not in {"disabled", "none", "enabled"}:
                 payload["output_config"] = {**(payload.get("output_config") or {}), "effort": effort}
+        if source.get(anthropic_reasoning_replay.DROP_HISTORY_KEY):
+            anthropic_reasoning_replay.drop_thinking_history(payload, allow_unsigned_thinking=True)
         session = source["_parrot_zcode_session"]
         device_id = await asyncio.to_thread(runtime.ensure_device_id, self.account_key, current)
         request_context.add_metadata(payload, device_id=device_id, session_id=session)

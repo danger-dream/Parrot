@@ -559,23 +559,28 @@ def add_cache_breakpoints(messages):
 
 
 _THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
-_THINKING_REMOVED_TEXT = "[Thinking removed]"
 
 
 def _strip_assistant_thinking_blocks(messages):
-    """移除历史 assistant content 中的 thinking / redacted_thinking block。
-
-    Anthropic 会校验历史 thinking block 的签名、位置与是否可回放。很多下游
-    客户端会把上一轮完整 assistant response 原样塞回下一轮，导致
-    `messages.N.content.M: thinking or redacted_thinking ... invalid_blocks`。
-    Claude Code 遇到签名类 400 也会 strip signed thinking blocks 后重试。
-
-    这里在出站前做确定性清洗：只清理历史 assistant content block，不影响顶层
-    request `thinking` 参数；若 assistant 被清到空内容，则补一个文本占位，避免
-    空 assistant message 继续触发 invalid_blocks。函数不原地修改入参。
-    """
+    """清理旧轮思考块，但工具续接的最新 assistant 必须原样保留。"""
+    protected = None
+    for index in range(len(messages or []) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        blocks = msg.get("content")
+        calls = {b.get("id") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"} if isinstance(blocks, list) else set()
+        results = {b.get("tool_use_id") for following in messages[index + 1:] if isinstance(following, dict)
+                   for b in (following.get("content") if isinstance(following.get("content"), list) else [])
+                   if isinstance(b, dict) and b.get("type") == "tool_result"}
+        if calls & results:
+            protected = index
+        break
     result = []
-    for msg in messages or []:
+    for index, msg in enumerate(messages or []):
+        if index == protected:
+            result.append(msg)
+            continue
         if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
             result.append(msg)
             continue
@@ -594,7 +599,9 @@ def _strip_assistant_thinking_blocks(messages):
             result.append(msg)
             continue
         if not new_content:
-            new_content = [{"type": "text", "text": _THINKING_REMOVED_TEXT}]
+            # This turn contained only removed thinking. Do not invent ordinary
+            # assistant text; pre-existing empty messages/text remain untouched.
+            continue
         new_msg = dict(msg)
         new_msg["content"] = new_content
         result.append(new_msg)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .. import oauth_manager
+from ..openai import anthropic_reasoning_replay
 from ..openai.transform import chat_to_anthropic, responses_to_anthropic
 from ..providers import registry as provider_registry
 from ..transform import cc_mimicry
@@ -49,6 +50,7 @@ class OAuthChannel(Channel):
         self, requested_body: dict, resolved_model: str,
         *, ingress_protocol: str = "anthropic",
     ) -> UpstreamRequest:
+        drop_thinking_history = bool(requested_body.get(anthropic_reasoning_replay.DROP_HISTORY_KEY))
         cc_request_context = cc_mimicry.request_context_from(requested_body)
         translator_ctx: Optional[dict] = None
         if ingress_protocol == "chat":
@@ -108,6 +110,10 @@ class OAuthChannel(Channel):
         payload, dynamic_map = cc_mimicry.transform_request(
             body_with_model, email=self.email, session_id=sid, auth_mode="oauth",
             side_query=side_query)
+        if drop_thinking_history:
+            anthropic_reasoning_replay.drop_thinking_history(payload)
+        elif translator_ctx and translator_ctx.get("response_translator") == "responses_to_anthropic":
+            responses_to_anthropic.repair_tool_thinking(payload, current_input_items)
         signed = cc_mimicry.sign_body(payload)
         downstream_betas = body_with_model.get(cc_mimicry.PARROT_DOWNSTREAM_BETAS_KEY)
         original_model = body_with_model.get(cc_mimicry.PARROT_ORIGINAL_MODEL_KEY)

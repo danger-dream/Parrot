@@ -241,12 +241,29 @@ def available_models_for_families(families: Optional[set[str]], *, api_key_name:
             if fam not in families:
                 continue
         for m in ch.list_client_models():
-            if not m or not model_state.is_global_enabled(m):
+            if not m or not model_state.is_global_enabled(m, source_key=ch.key):
                 continue
             if not model_state.is_source_enabled(ch.key, m):
                 continue
+            if getattr(ch, "provider", "") == "zhipu" and not model_state.is_discovery_visible(m, source_key=ch.key):
+                continue
             models.add(m)
     return sorted(models)
+
+
+def available_model_spellings(spellings, *, api_key_name: Optional[str] = None) -> set[str]:
+    """Resolve explicit legacy names without advertising duplicate identities."""
+    result = set()
+    for ch in all_channels():
+        if getattr(ch, "provider", "") != "zhipu" or not ch.enabled or ch.disabled_reason:
+            continue
+        if not auth.channel_allowed(api_key_name, ch.key):
+            continue
+        for model in spellings:
+            if (ch.supports_model(model) is not None and model_state.is_discovery_visible(model, source_key=ch.key)
+                    and model_state.is_source_enabled(ch.key, model)):
+                result.add(model)
+    return result
 
 
 def install_config_reload_hook() -> None:

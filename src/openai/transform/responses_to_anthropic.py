@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ... import cache_hints
+from .. import anthropic_reasoning_replay as native_replay
 from . import chat_to_anthropic, common, guard, responses_to_chat
 
 
@@ -543,32 +544,55 @@ def _function_call_output_attachment_replacements(input_items: list) -> list[tup
     return replacements
 
 
-def _degrade_reasoning_history(items: list) -> list:
-    """Carry readable summaries as explicitly labelled text, never ciphertext.
-
-    Claude cannot replay OpenAI encrypted reasoning. A summary is readable
-    context, not a signed thinking block; drop opaque-only items entirely.
-    This runs on expanded local Store history as well as current input.
-    """
-    out: list[Any] = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("type") != "reasoning":
-            out.append(item)
-            continue
-        if not common.reasoning_passthrough_enabled():
-            continue
-        readable: list[str] = []
-        for part in item.get("summary") or []:
-            if isinstance(part, dict) and part.get("type") == "summary_text" and isinstance(part.get("text"), str) and part["text"]:
-                readable.append(part["text"])
-        for part in item.get("content") or []:
-            if isinstance(part, dict) and part.get("type") == "reasoning_text" and isinstance(part.get("text"), str) and part["text"]:
+def _reasoning_history_blocks(item: dict, *, allow_unsigned_thinking: bool) -> list[dict]:
+    if not common.reasoning_passthrough_enabled():
+        return []
+    if not allow_unsigned_thinking:
+        block = native_replay.decode(item)
+        return [block] if block is not None else []
+    # Readable summaries are not Claude signatures or ordinary assistant text.
+    readable: list[str] = []
+    for field, kind in (("summary", "summary_text"), ("content", "reasoning_text")):
+        for part in item.get(field) or []:
+            if isinstance(part, dict) and part.get("type") == kind and isinstance(part.get("text"), str) and part["text"]:
                 readable.append(part["text"])
         if readable:
-            out.append({"type": "message", "role": "assistant", "content": [
-                {"type": "output_text", "text": "[Previous assistant reasoning summary]\n" + "\n\n".join(readable)}
-            ]})
-    return out
+            break
+    if not readable:
+        return []
+    return [{"type": "thinking", "thinking": "\n\n".join(readable)}]
+
+
+def repair_tool_thinking(payload: dict, input_items: list, *, allow_unsigned_thinking: bool = False) -> None:
+    if allow_unsigned_thinking:
+        return
+    # Inspect missing history while expanded Store items are still available,
+    # even before CC injects default thinking. The final channel pass then sees
+    # the cleaned tool turn and can omit manual thinking without rereading Store.
+    history = [item for item in input_items if isinstance(item, dict) and item.get("role") not in ("system", "developer")]
+    if not history or history[-1].get("type") not in ("function_call_output", "custom_tool_call_output"):
+        return
+    latest: list[dict] = []
+    current: list[dict] = []
+    for item in history:
+        if item.get("type") in ("reasoning", "function_call", "custom_tool_call", "web_search_call") or item.get("role") == "assistant":
+            current.append(item)
+            latest = current
+        else:
+            current = []
+    missing_native = any(native_replay.decode(item) is None for item in latest if item.get("type") == "reasoning")
+    messages = payload.get("messages") or []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            continue
+        blocks = message.get("content") or []
+        calls = {block.get("id") for block in blocks if block.get("type") == "tool_use"}
+        results = {block.get("tool_use_id") for following in messages[index + 1:]
+                   for block in following.get("content") or [] if block.get("type") == "tool_result"}
+        if calls & results and (missing_native or not blocks or blocks[0].get("type") not in ("thinking", "redacted_thinking")):
+            native_replay.drop_thinking_history(payload)
+        return
 
 
 def _normalize_custom_tool_history(input_items: list, plan: NamespaceToolMap) -> list:
@@ -662,6 +686,7 @@ def translate_request(
     body: dict, *, api_key_name: str = "", store_enabled: bool = True,
     namespace_tool_map: NamespaceToolMap | None = None,
     target_model: str | None = None,
+    allow_unsigned_thinking: bool = False,
 ) -> dict:
     guard_request(body, store_enabled=store_enabled)
     bridge_body = dict(body)
@@ -687,17 +712,22 @@ def translate_request(
         guard_request({**body, "input": input_items}, store_enabled=store_enabled)
     except guard.GuardError as exc:
         raise guard.GuardError(exc.status, exc.err_type, exc.message, param=exc.param, scope="candidate") from exc
-    input_items = _degrade_reasoning_history(input_items)
     input_items = _map_namespaced_history(input_items, plan)
     input_items = _normalize_custom_tool_history(input_items, plan)
     bridge_body["_parrot_preserve_native_search"] = True
-    chat_payload = responses_to_chat.translate_request_from_input_items(bridge_body, input_items)
+    without_history = bool(body.get(native_replay.DROP_HISTORY_KEY))
+    chat_payload = responses_to_chat.translate_request_from_input_items(
+        bridge_body, input_items,
+        reasoning_blocks=lambda item: [] if without_history else _reasoning_history_blocks(item, allow_unsigned_thinking=allow_unsigned_thinking),
+    )
     _preserve_deferred_tool_loading(chat_payload, flattened_tools)
     _preserve_function_call_output_attachments(chat_payload, input_items)
     # chat_to_anthropic runs its own guard too; this is intentional because it
     # catches fields introduced by the Responses→Chat mapping (response_format,
     # reasoning_effort, etc.) before anything reaches Anthropic upstream.
-    payload = chat_to_anthropic.translate_request(chat_payload, allow_file_url_documents=True)
+    payload = chat_to_anthropic.translate_request(
+        chat_payload, allow_file_url_documents=True, allow_thinking_blocks=True,
+    )
     from ... import search_hosted_codec
     for message in payload.get("messages") or []:
         for block in message.get("content") or []:
@@ -712,6 +742,10 @@ def translate_request(
     # Native controls are generated here, not passed through from Chat input.
     _map_output_controls(body, payload, target_model=target_model)
     _reconcile_thinking_controls(payload)
+    if without_history:
+        native_replay.drop_thinking_history(payload, allow_unsigned_thinking=allow_unsigned_thinking)
+    else:
+        repair_tool_thinking(payload, input_items, allow_unsigned_thinking=allow_unsigned_thinking)
     return common.filter_anthropic_bridge_payload(payload)
 
 
@@ -724,16 +758,15 @@ def translate_response(
     channel_key: Optional[str] = None,
     current_input_items: Optional[list] = None,
     namespace_tool_map: NamespaceToolMap | None = None,
+    allow_unsigned_thinking: bool = False,
 ) -> dict:
     from ... import search_hosted_codec
     hosted = search_hosted_codec.anthropic_to_responses(message.get("content") or [])
     chat_obj = chat_to_anthropic.translate_response(message, model=model)
     if message.get("stop_reason") == "pause_turn":
         chat_obj["choices"][0]["finish_reason"] = "pause_turn"  # internal composition marker only
-    # Preserve each readable thinking block at its original position. Native
-    # signatures/redacted blocks are not OpenAI encrypted_content; the existing
-    # drop policy still applies to readable summaries.
     keep_reasoning = common.reasoning_passthrough_enabled()
+    preserve_native = keep_reasoning and not allow_unsigned_thinking
     def ordered_output(items: list[dict]) -> list[dict]:
         # Chat flattens all text ahead of its tool_calls. Reapply the original
         # Anthropic block positions before writing the resulting response/store.
@@ -752,13 +785,16 @@ def translate_response(
                         "role": "assistant", "status": "completed",
                         "content": [{"type": "output_text", "text": text, "annotations": []}],
                     })
-            elif kind == "thinking" and keep_reasoning:
-                text = block.get("thinking")
-                if isinstance(text, str) and text:
-                    ordered.append({
-                        "type": "reasoning", "id": f"rs_{uuid.uuid4().hex[:24]}",
-                        "summary": [{"type": "summary_text", "text": text}],
-                    })
+            elif kind in ("thinking", "redacted_thinking"):
+                text = block.get("thinking") if kind == "thinking" else None
+                readable = keep_reasoning and isinstance(text, str) and bool(text)
+                carrier = native_replay.encode(block) if preserve_native else None
+                if readable or carrier:
+                    item = {"type": "reasoning", "id": f"rs_{uuid.uuid4().hex[:24]}",
+                            "summary": [{"type": "summary_text", "text": text}] if readable else []}
+                    if carrier:
+                        item["encrypted_content"] = carrier
+                    ordered.append(item)
             elif kind == "tool_use":
                 call = next(calls, None)
                 if call is not None:
