@@ -699,14 +699,20 @@ sys.exit(bool(missing))'''
                 value = self.health()
                 if value.get("status") == "ok" and value.get("version") == self.state["version"]:
                     intent = self.state["restart_intent"]
-                    since = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(intent["started_at"]))
-                    text = self.execute("restart", ["journalctl", "-u", self.state["service"], "--since", since, "--no-pager", "-o", "cat"]).stdout
-                    if re.search(r'(^ERROR\b|\bERROR:|Traceback|Application startup failed|phase=\S+ status=(?:error|failed))', text, re.M):
-                        raise ReleaseError("restart", "Startup errors detected; inspect restart.log")
-                    self.assert_candidate()
                     instance = self.service_instance()
                     if instance == intent.get("old_instance") or instance.get("pid") in ("", "0"):
                         raise ReleaseError("restart", "Health belongs to the old or absent service instance")
+                    invocation = self.execute("restart", ["systemctl", "show", self.state["service"], "-p", "InvocationID", "--value"]).stdout.strip()
+                    if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+                        raise ReleaseError("restart", "Cannot identify the current service invocation for startup logs")
+                    since = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(intent["started_at"]))
+                    text = self.execute("restart", ["journalctl", "-u", self.state["service"], "_SYSTEMD_INVOCATION_ID=" + invocation,
+                                                    "--since", since, "--no-pager", "-o", "cat"]).stdout
+                    if re.search(r'(^ERROR\b|\bERROR:|Traceback|Application startup failed|phase=\S+ status=(?:error|failed))', text, re.M):
+                        raise ReleaseError("restart", "Startup errors detected; inspect restart.log")
+                    self.assert_candidate()
+                    if self.service_instance() != instance:
+                        raise ReleaseError("restart", "Service instance changed during startup validation")
                     self.state.pop("restart_intent", None)
                     self.mark("restart", "passed", runtime=self.state["runtime_fingerprint"], environment=environment,
                               version=value["version"], instance=instance)

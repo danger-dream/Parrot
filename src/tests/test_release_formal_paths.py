@@ -152,14 +152,15 @@ def test_changed_or_legacy_restart_receipt_requires_fresh_restart(runner, tmp_pa
     with pytest.raises(r.ReleaseError) as caught:
         runner.restart(approved=False)
     assert caught.value.code == 2
-    monkeypatch.setattr(runner, "service_instance", Mock(side_effect=[old, new]))
+    monkeypatch.setattr(runner, "service_instance", Mock(side_effect=[old, new, new]))
     original, service_calls = runner.execute, []
     def execute(stage, args, **kwargs):
         if args[0] in ("systemctl", "journalctl"):
             service_calls.append(args)
             if args[:2] == ["systemctl", "restart"]:
                 assert runner.state["restart_intent"]["environment"] == "env"
-            return subprocess.CompletedProcess(args, 0, "", "")
+            output = "a" * 32 if "InvocationID" in args else ""
+            return subprocess.CompletedProcess(args, 0, output, "")
         return original(stage, args, **kwargs)
     monkeypatch.setattr(runner, "execute", execute)
     runner.restart(approved=True)

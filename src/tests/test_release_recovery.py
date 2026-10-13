@@ -89,14 +89,62 @@ def test_explicit_restart_reconciliation_checks_pending_job_and_restarts(run, mo
     calls = []
     def execute(stage, args, **kwargs):
         calls.append(args)
-        return subprocess.CompletedProcess(args, 0, '', '')
+        output = 'a' * 32 if 'InvocationID' in args else ''
+        return subprocess.CompletedProcess(args, 0, output, '')
     monkeypatch.setattr(x, 'assert_candidate', lambda: None)
     monkeypatch.setattr(x, 'execute', execute)
-    monkeypatch.setattr(x, 'service_instance', Mock(side_effect=[old, new]))
+    monkeypatch.setattr(x, 'service_instance', Mock(side_effect=[old, new, new]))
     monkeypatch.setattr(x, 'health', lambda: {'status': 'ok', 'version': '0.34.5'})
     x.restart(True, reconcile=True)
     assert sum(c[:2] == ['systemctl', 'restart'] for c in calls) == 1
     assert x.state['stages']['restart']['instance'] == new
+
+
+@pytest.mark.parametrize('case, error', [
+    ('old-shutdown-error', None),
+    ('current-error', 'Startup errors detected'),
+    ('missing-invocation', 'Cannot identify'),
+    ('changed-instance', 'Service instance changed'),
+])
+def test_restart_recovery_scopes_logs_to_current_invocation(run, monkeypatch, case, error):
+    x, git = run
+    old = {'pid': '11', 'start_ticks': '1'}
+    new = {'pid': '22', 'start_ticks': '2'}
+    later = {'pid': '33', 'start_ticks': '3'} if case == 'changed-instance' else new
+    x.state['restart_intent'] = {'old_instance': old, 'runtime': x.state['runtime_fingerprint'],
+                                 'environment': 'env', 'started_at': 1}
+    monkeypatch.setattr(x, 'service_instance', Mock(side_effect=[new, new, later]))
+    monkeypatch.setattr(x, 'health', lambda: {'status': 'ok', 'version': '0.34.5'})
+    original, calls = x.execute, []
+    invocation = 'a' * 32
+
+    def execute(stage, args, **kwargs):
+        if args[0] not in ('systemctl', 'journalctl'):
+            return original(stage, args, **kwargs)
+        calls.append(args)
+        assert args[:2] != ['systemctl', 'restart'], 'confirmed new instance must not be restarted'
+        if args[0] == 'systemctl':
+            assert 'InvocationID' in args
+            output = '' if case == 'missing-invocation' else invocation
+        elif '_SYSTEMD_INVOCATION_ID=' + invocation not in args:
+            output = 'ERROR: old shutdown\nTraceback: drain deadline exceeded\n'
+        else:
+            output = 'ERROR: current startup failed\n' if case == 'current-error' else 'new instance ready\n'
+        return subprocess.CompletedProcess(args, 0, output, '')
+
+    monkeypatch.setattr(x, 'execute', execute)
+    if error:
+        with pytest.raises(r.ReleaseError, match=error):
+            x.restart()
+        assert 'restart_intent' in x.state
+        assert x.state['stages'].get('restart', {}).get('status') != 'passed'
+    else:
+        x.restart()
+        assert x.state['stages']['restart']['instance'] == new
+        assert 'restart_intent' not in x.state
+    journals = [args for args in calls if args[0] == 'journalctl']
+    assert bool(journals) == (case != 'missing-invocation')
+    assert all('_SYSTEMD_INVOCATION_ID=' + invocation in args for args in journals)
 
 
 def test_pending_systemd_job_cannot_be_replayed(run, monkeypatch):
