@@ -167,6 +167,9 @@ class OAuthLegacyOperationsControlMixin:
     def xai_api_base_url(self):
         return self.backend.xai_api_base_url()
 
+    def antigravity_pkce_generate(self):
+        return self.backend.antigravity_pkce_generate()
+
     def antigravity_build_login_url(self, *args, **kwargs):
         return self.backend.antigravity_build_login_url(*args, **kwargs)
 

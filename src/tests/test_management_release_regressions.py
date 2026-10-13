@@ -18,6 +18,7 @@ def test_management_schemas_declare_the_supported_pydantic_major():
         requirement.name.lower(): requirement
         for line in (Path(__file__).parents[2] / "requirements.txt").read_text().splitlines()
         if (spec := line.split("#", 1)[0].strip())
+        if spec.split(";", 1)[0].strip() != "./vendor/parrot-go-tls-client"
         for requirement in [Requirement(spec)]
     }
     assert "pydantic" in requirements, "Management schemas directly require Pydantic 2"

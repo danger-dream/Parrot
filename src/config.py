@@ -637,19 +637,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "https://www.googleapis.com/auth/userinfo.email "
             "https://www.googleapis.com/auth/userinfo.profile "
             "https://www.googleapis.com/auth/cclog "
-            "https://www.googleapis.com/auth/experimentsandconfigs"
+            "https://www.googleapis.com/auth/experimentsandconfigs "
+            "https://www.googleapis.com/auth/aicode"
         ),
         "authorizationEndpoint": "https://accounts.google.com/o/oauth2/v2/auth",
         "tokenEndpoint": "https://oauth2.googleapis.com/token",
         "userinfoEndpoint": "https://www.googleapis.com/oauth2/v2/userinfo?alt=json",
         "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
         "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
-        "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
-        # Explicit opt-in. Existing installations inherit ``enabled=False`` on
-        # normal deep-merge upgrade; the profile remains operator configurable.
+        "userAgent": "antigravity/hub/2.22.0 (aidev_client; os_type=linux; arch=amd64; cl=995734886)",
+        # Explicit opt-in. New installations default to LS; existing files with
+        # no saved profile retain chrome131 via the raw-aware load migration.
         "tlsFingerprint": {
             "enabled": False,
-            "profile": "chrome131",
+            "profile": "antigravity-ls-2.22.0",
         },
     },
     # Cursor OAuth / AgentService 私有 bridge。模型清单和上下文限制按账号
@@ -792,6 +793,37 @@ def _retire_oauth_default_models(cfg: dict) -> bool:
     legacy = providers.get("openai") if isinstance(providers, dict) else None
     if isinstance(legacy, dict) and "defaultModels" in legacy:
         legacy.pop("defaultModels")
+        changed = True
+    return changed
+
+
+def _migrate_antigravity_client_defaults(cfg: dict, raw: dict | None = None) -> bool:
+    """Upgrade identity defaults without changing an existing implicit TLS backend.
+
+    ``raw`` is supplied only when loading an existing file. Deep-merge has
+    already filled the new LS profile, so absence must be checked in that raw
+    file, not in ``cfg``. A newly created file keeps DEFAULT_CONFIG's LS profile.
+    """
+    section = cfg.get("antigravityOAuth")
+    if not isinstance(section, dict):
+        return False
+    defaults = DEFAULT_CONFIG["antigravityOAuth"]
+    changed = False
+    raw_section = raw.get("antigravityOAuth", {}) if isinstance(raw, dict) else None
+    raw_fingerprint = raw_section.get("tlsFingerprint", {}) if isinstance(raw_section, dict) else None
+    fingerprint = section.get("tlsFingerprint")
+    if (
+        isinstance(raw_fingerprint, dict) and "profile" not in raw_fingerprint
+        and isinstance(fingerprint, dict) and fingerprint.get("profile") != "chrome131"
+    ):
+        fingerprint["profile"] = "chrome131"
+        changed = True
+    if section.get("userAgent") == "antigravity/hub/2.9.1 darwin/arm64":
+        section["userAgent"] = defaults["userAgent"]
+        changed = True
+    old_scope = defaults["scope"].removesuffix(" https://www.googleapis.com/auth/aicode")
+    if section.get("scope") == old_scope:
+        section["scope"] = defaults["scope"]
         changed = True
     return changed
 
@@ -1069,6 +1101,8 @@ def _load_from_disk() -> dict:
         changed = True
         print("[config] backfilled openaiOAuth from defaults/legacy oauth.providers.openai")
     if _retire_oauth_default_models(merged):
+        changed = True
+    if _migrate_antigravity_client_defaults(merged, raw):
         changed = True
     if _migrate_antigravity_image_models(merged):
         changed = True

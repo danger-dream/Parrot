@@ -1111,9 +1111,10 @@ def test_settings_cch_and_quota_monitor_controls(m):
     assert "🎭 CCH模式：关闭" in texts
 
     rec.clear()
+    saved_profile = m["config"].get()["antigravityOAuth"]["tlsFingerprint"]["profile"]
     assert om.handle_callback(42, 100, "cb-fingerprint", "oa:antigravity_tls_toggle") is True
     fingerprint = m["config"].get()["antigravityOAuth"]["tlsFingerprint"]
-    assert fingerprint == {"enabled": True, "profile": "chrome131"}
+    assert fingerprint == {"enabled": True, "profile": saved_profile}
     tls_view = rec.last("editMessageText")
     assert "Antigravity 指纹伪装" in tls_view["text"]
     assert "当前状态: ✅ 已启用" in tls_view["text"]

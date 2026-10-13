@@ -410,10 +410,10 @@
   "antigravityOAuth": {
     "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
     "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
-    "userAgent": "antigravity/hub/2.9.1 darwin/arm64",
+    "userAgent": "antigravity/hub/2.22.0 (aidev_client; os_type=linux; arch=amd64; cl=995734886)",
     "tlsFingerprint": {
       "enabled": false,
-      "profile": "chrome131"
+      "profile": "antigravity-ls-2.22.0"
     }
   },
   "cursorOAuth": {

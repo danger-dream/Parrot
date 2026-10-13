@@ -655,8 +655,14 @@ class InMemoryOAuthBackend(OAuthBackend):
     def cursor_label(self, subject):
         return f"cursor-{subject}"
 
-    def antigravity_build_login_url(self, state):
-        return "https://google.example.test/authorize?" + urlencode({"state": state})
+    def antigravity_pkce_generate(self):
+        from src.oauth.antigravity import pkce_generate
+        return pkce_generate()
+
+    def antigravity_build_login_url(self, state, **kwargs):
+        return "https://google.example.test/authorize?" + urlencode({
+            "state": state, "code_challenge": kwargs.get("code_challenge", ""),
+        })
 
     def antigravity_token_url(self):
         return "https://google.example.test/token"

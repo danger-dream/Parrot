@@ -1,0 +1,6 @@
+include go.mod go.sum *.go *.py README.md .gitignore .dockerignore
+recursive-include python *.py
+recursive-include test *.py *.go
+recursive-include docker *.md Dockerfile.build
+recursive-include prebuilt *.json *.so
+global-exclude *.h *.pyc

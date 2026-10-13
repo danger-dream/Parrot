@@ -60,7 +60,7 @@ def fake_backend(monkeypatch):
 
 def test_default_is_disabled_and_route_boundary_is_explicit():
     setting = config.DEFAULT_CONFIG["antigravityOAuth"]["tlsFingerprint"]
-    assert setting == {"enabled": False, "profile": "chrome131"}
+    assert setting == {"enabled": False, "profile": "antigravity-ls-2.22.0"}
     assert fingerprint.supports_route("direct")
     assert fingerprint.supports_route("socks5")
     assert fingerprint.supports_route("ss2022")

@@ -9,5 +9,8 @@ pytest-asyncio>=1.0
 # pytest-xdist: the isolated runner defaults to up to 4 work-stealing workers.
 # Each worker gets its own data root; use -n 0 for explicit serial execution.
 pytest-xdist>=3.5
+# Offline compiler-free native-package installation regression.
+setuptools==80.9.0
+wheel==0.45.1
 # anyio: imported directly by src/tests/live_openai_probe.py for its blocking ASGI portal.
 anyio>=4.0,<5

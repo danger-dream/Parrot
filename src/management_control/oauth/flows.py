@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -111,13 +112,21 @@ class OAuthFlowService:
                 challenge, state, authorization_endpoint=authorization_endpoint,
             )
         elif provider is OAuthProvider.ANTIGRAVITY:
+            verifier, challenge = self.backend.antigravity_pkce_generate()
             state = secrets.token_urlsafe(32)
-            auth_url = self.backend.antigravity_build_login_url(state)
+            redirect_uri = self.backend.antigravity_redirect_uri()
+            auth_url = self.backend.antigravity_build_login_url(
+                state, code_challenge=challenge, redirect_uri=redirect_uri,
+            )
             payload.update(
                 state=state,
+                verifier=verifier,
                 token_endpoint=self.backend.antigravity_token_url(),
-                redirect_uri=self.backend.antigravity_redirect_uri(),
+                redirect_uri=redirect_uri,
+                allow_code_only=redirect_uri == "https://antigravity.google/oauth-callback",
             )
+            if payload["allow_code_only"]:
+                instruction = "Paste the authorization code shown on the Google callback page."
         else:
             params = self.backend.cursor_generate_login()
             auth_url = params.login_url
@@ -184,6 +193,18 @@ class OAuthFlowService:
             ) from exc
         return CompletedCredential(entry=entry, source=f"{provider.value} login")
 
+    def _antigravity_submission(self, payload: dict, command: CompleteOAuthLoginCommand):
+        source = str(command.callback_url or command.code or "").strip()
+        code_only = bool(
+            payload.get("allow_code_only") and payload.get("verifier")
+            and payload.get("redirect_uri") == "https://antigravity.google/oauth-callback"
+            and re.fullmatch(r"[A-Za-z0-9_./+\-]+=*", source)
+        )
+        if code_only:
+            return source, str(command.state or ""), True
+        parsed = self.backend.antigravity_parse_callback(source)
+        return parsed.get("code") or "", parsed.get("state") or "", False
+
     def _validate_submission(
         self,
         provider: OAuthProvider,
@@ -195,9 +216,9 @@ class OAuthFlowService:
                 raise ManagementError(ManagementErrorCode.INVALID_REQUEST)
             return
         source = command.callback_url or command.code
+        allow_missing_state = False
         if provider is OAuthProvider.ANTIGRAVITY:
-            parsed = self.backend.antigravity_parse_callback(source or "")
-            code, received_state = parsed.get("code") or "", parsed.get("state") or ""
+            code, received_state, allow_missing_state = self._antigravity_submission(payload, command)
         else:
             if (
                 provider is OAuthProvider.OPENAI
@@ -218,7 +239,8 @@ class OAuthFlowService:
             )
         expected_state = str(payload.get("state") or "")
         if expected_state and (
-            not received_state or not secrets.compare_digest(received_state, expected_state)
+            (not received_state and not allow_missing_state)
+            or (received_state and not secrets.compare_digest(received_state, expected_state))
         ):
             raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
 
@@ -257,9 +279,9 @@ class OAuthFlowService:
                 "cursor_profile_id": str(profile.get("id") or "").strip(),
             }
         code_source = command.callback_url or command.code
+        allow_missing_state = False
         if provider is OAuthProvider.ANTIGRAVITY:
-            parsed = self.backend.antigravity_parse_callback(code_source or "")
-            code, received_state = parsed.get("code") or "", parsed.get("state") or ""
+            code, received_state, allow_missing_state = self._antigravity_submission(payload, command)
         else:
             code, received_state = _extract_code_state(code_source)
             if command.state:
@@ -271,7 +293,8 @@ class OAuthFlowService:
             )
         expected_state = str(payload.get("state") or "")
         if expected_state and (
-            not received_state or not secrets.compare_digest(received_state, expected_state)
+            (not received_state and not allow_missing_state)
+            or (received_state and not secrets.compare_digest(received_state, expected_state))
         ):
             raise ManagementError(ManagementErrorCode.STATE_CONFLICT)
         if provider is OAuthProvider.CLAUDE:
@@ -308,6 +331,7 @@ class OAuthFlowService:
             return self.xai_entry(token, now=now)
         token = self.backend.antigravity_complete_login(
             code,
+            code_verifier=payload.get("verifier") or None,
             redirect_uri=payload.get("redirect_uri") or self.backend.antigravity_redirect_uri(),
             token_endpoint=payload.get("token_endpoint") or self.backend.antigravity_token_url(),
         )

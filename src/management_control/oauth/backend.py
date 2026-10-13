@@ -605,6 +605,7 @@ class OAuthBackend:
     def cursor_profile(self, *args, **kwargs): return cursor_provider.fetch_profile_sync(*args, **kwargs)
     def cursor_usage(self, *args, **kwargs): return cursor_provider.fetch_usage_sync(*args, **kwargs)
     def cursor_label(self, *args, **kwargs): return cursor_provider.account_label(*args, **kwargs)
+    def antigravity_pkce_generate(self): return antigravity_provider.pkce_generate()
     def antigravity_build_login_url(self, *args, **kwargs): return antigravity_provider.build_login_url(*args, **kwargs)
     def antigravity_complete_login(self, *args, **kwargs): return antigravity_provider.complete_login_sync(*args, **kwargs)
     def antigravity_parse_callback(self, *args, **kwargs): return antigravity_provider.parse_callback_url(*args, **kwargs)

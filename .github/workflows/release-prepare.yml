@@ -19,6 +19,8 @@ jobs:
     name: quality-shard (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      PARROT_REQUIRE_GO_TLS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +37,9 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p quality-logs
-          python -m pip install -r requirements.txt pytest pytest-asyncio 'pytest-xdist>=3.5' 2>&1 | tee quality-logs/install.log
+          python -m pip install -r requirements-dev.txt 2>&1 | tee quality-logs/install.log
+          python scripts/sync_go_tls_vendor.py --check
+          python scripts/check_go_tls.py --load
       - name: Compile and import
         run: |
           set -eo pipefail
@@ -83,6 +87,8 @@ jobs:
       contents: read
       packages: write
     timeout-minutes: 20
+    env:
+      PARROT_REQUIRE_GO_TLS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +100,28 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.4"
+          cache-dependency-path: vendor/parrot-go-tls-client/go.sum
+      - name: Verify native source and shipped artifacts
+        run: |
+          python scripts/sync_go_tls_vendor.py --check
+          python -m pip install -r requirements-dev.txt
+          python scripts/check_go_tls.py --load
+          (cd vendor/parrot-go-tls-client && GOTOOLCHAIN=local go test -race ./...)
+          (cd vendor/parrot-go-tls-client && GOTOOLCHAIN=local go build -o "$RUNNER_TEMP/go-tls-abi-server" test/abi_server.go)
+          export PARROT_TEST_NATIVE_LIBRARY="$PWD/vendor/parrot-go-tls-client/prebuilt/linux_${{ matrix.arch }}/libparrot_go_tls_client.so"
+          export PARROT_TEST_ABI_SERVER="$RUNNER_TEMP/go-tls-abi-server"
+          python vendor/parrot-go-tls-client/test/test_native.py
+          python vendor/parrot-go-tls-client/test/test_raw_body.py
+      - name: Native architecture transport regression
+        run: |
+          python src/tests/isolated_pytest.py -q -ra src/tests/test_go_tls_transport.py src/tests/test_go_tls_audit_regressions.py src/tests/test_go_tls_dns_routing.py src/tests/test_antigravity_tls_fingerprint.py src/tests/test_ss2022_curl_bridge.py src/tests/test_go_tls_distribution.py
       - name: Read candidate version and repository
         id: info
         run: |

@@ -468,18 +468,20 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 #### Antigravity TLS/H2 指纹伪装
 
-该功能默认关闭，可在「OAuth 账户」→「⚙️ 设置」点击「🛡 AG指纹」热切换；只影响 Antigravity OAuth 请求（包含文本、图片生成和图片编辑），其他渠道及关闭时继续使用原有 httpx transport。对应配置为：
+该功能默认关闭，可在「OAuth 账户」→「⚙️ 设置」点击「🛡 AG指纹」热切换。新 Go 档案覆盖 Antigravity 文本、图片及 OAuth/模型发现/配额控制面；其他渠道及关闭时继续使用原有 transport。对应配置为：
 
 ```json
 "antigravityOAuth": {
   "tlsFingerprint": {
     "enabled": false,
-    "profile": "chrome131"
+    "profile": "antigravity-ls-2.22.0"
   }
 }
 ```
 
-启用后使用 `curl_cffi` 模拟所选浏览器的 TLS/HTTP/2 指纹。direct 与 SOCKS5 路由由 curl 直接处理；内建 SS2022 路由会为每次 attempt 创建仅绑定 loopback、一次性鉴权且锁定当前目标的 HTTP CONNECT bridge，TLS 仍由 curl 端到端建立，不改变 SS2022 出口。适配层关闭自动重定向、按现有超时传递 connect/read、规范化压缩响应，并将发送后状态不明的超时、取消及 transport 异常视为已 dispatch，避免不安全重放。由于 `curl_cffi` 高层流式 API 不提供 httpcore 的 upload-complete/DNS/TCP/TLS trace，启用时 connection/first-byte 分界及这些低层诊断字段不具备与 httpx 相同的精度。
+`antigravity-ls-2.22.0` 使用自研 `parrot-go-tls-client` 的 Go TLS/HTTP2 后端，通过 httpx 流式适配层保留请求取消、发送状态和代理边界。Linux amd64/arm64 原生库由维护者预编译并校验，Docker 内置，源码安装随 `requirements.txt` 安装；普通用户无需 Go/C 编译器（原生安装要求 glibc >=2.34）。版本/CL/平台身份固定成套，不能仅凭 JA3 或首帧相同宣称与官方全部行为一致。新登录使用 PKCE；存量账号不强制重登。详细配置、官网授权码入口及证据边界见 [Antigravity 客户端档案](docs/antigravity-client-profile.md)。
+
+已保存的 `chrome131` 等旧 profile 不会被开关覆盖，切换 Go 后端需明确修改 profile。旧 profile 继续使用 `curl_cffi` 模拟所选浏览器；direct 与 SOCKS5 路由由 curl 直接处理；内建 SS2022 路由会为每次 attempt 创建仅绑定 loopback、一次性鉴权且锁定当前目标的 HTTP CONNECT bridge，TLS 仍由 curl 端到端建立，不改变 SS2022 出口。适配层关闭自动重定向、按现有超时传递 connect/read、规范化压缩响应，并将发送后状态不明的超时、取消及 transport 异常视为已 dispatch，避免不安全重放。由于 `curl_cffi` 高层流式 API 不提供 httpcore 的 upload-complete/DNS/TCP/TLS trace，启用时 connection/first-byte 分界及这些低层诊断字段不具备与 httpx 相同的精度。
 
 ---
 

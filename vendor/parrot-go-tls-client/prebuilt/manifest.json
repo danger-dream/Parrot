@@ -1,0 +1,21 @@
+{
+  "artifacts": {
+    "amd64": {
+      "compiler": "gcc",
+      "glibc_min": "2.34",
+      "go_version": "go1.24.4",
+      "path": "prebuilt/linux_amd64/libparrot_go_tls_client.so",
+      "sha256": "23e5da4b90d45901be1172f012c3a232554181fe13a5f1db5a4df17a4dbd2eb6"
+    },
+    "arm64": {
+      "compiler": "aarch64-linux-gnu-gcc",
+      "glibc_min": "2.34",
+      "go_version": "go1.24.4",
+      "path": "prebuilt/linux_arm64/libparrot_go_tls_client.so",
+      "sha256": "588ccf89fad3e5e673512ad8260589bb3f9797f2bb7e9c52e5762a6cf5470e39"
+    }
+  },
+  "schema": 1,
+  "source_sha256": "084dcd62472caffdeb05aac96f5355c4dfaec591fc6d0aa42bb65b55a663eb57",
+  "version": "0.2.1"
+}

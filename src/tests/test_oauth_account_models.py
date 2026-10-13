@@ -324,7 +324,7 @@ def test_antigravity_merges_prod_and_daily_with_daily_metadata_precedence(monkey
         assert kwargs["headers"]["accept"] == "application/json"
         assert kwargs["headers"]["content-type"] == "application/json"
         assert kwargs["headers"]["user-agent"]
-        assert kwargs["headers"]["x-goog-api-client"]
+        assert "x-goog-api-client" not in kwargs["headers"]
         assert kwargs["proxy_purpose"] == "oauth_antigravity"
         assert kwargs["proxy_channel"] == "oauth:test"
 

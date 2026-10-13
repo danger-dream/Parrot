@@ -66,7 +66,8 @@ def _start_provider(env, monkeypatch, provider, *, twice=False, failure=False):
         monkeypatch.setattr(xai_provider, "redirect_uri", lambda: "http://localhost/fake-xai")
         fn = om.on_login_xai_start
     elif provider == "antigravity":
-        monkeypatch.setattr(antigravity_provider, "build_login_url", lambda state: f"https://fake.invalid/ag?state={state}")
+        monkeypatch.setattr(antigravity_provider, "pkce_generate", lambda: ("fake-verifier", "fake-challenge"))
+        monkeypatch.setattr(antigravity_provider, "build_login_url", lambda state, **kwargs: f"https://fake.invalid/ag?state={state}")
         monkeypatch.setattr(antigravity_provider, "token_url", lambda: "https://fake.invalid/ag-token")
         monkeypatch.setattr(antigravity_provider, "redirect_uri", lambda: "http://localhost/fake-ag")
         fn = om.on_login_antigravity_start
@@ -191,9 +192,11 @@ def _run_oa04(case, monkeypatch):
             def complete_antigravity_login(
                 code: str,
                 *,
+                code_verifier: str | None = None,
                 redirect_uri: str | None = None,
                 token_endpoint: str | None = None,
             ) -> dict:
+                assert code_verifier == "fake-verifier"
                 provider_calls.append((code, redirect_uri, token_endpoint))
                 if case["entry"].get("failure"):
                     raise RuntimeError("fake exchange failure")
@@ -454,6 +457,10 @@ def test_oauth_04_06_strict_trace(case, monkeypatch):
             [{"text": "WorkBuddy 国际区登录", "callback_data": "oa:wb:login:global", "icon_custom_emoji_id": "6120617435214132136"}],
             [{"text": "智谱 / Z.ai（Key / OAuth）", "callback_data": "oa:zh:add", "icon_custom_emoji_id": "6140727700454645813"}],
         ]
+    if case["caseId"] == "TG-OA-04.start_antigravity_regen":
+        from copy import deepcopy
+        expected = deepcopy(expected)
+        expected["stateSteps"][0]["state"]["data"]["code_verifier"] = "fake-verifier"
     check_trace(expected, observed)
 
 

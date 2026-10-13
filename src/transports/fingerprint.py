@@ -43,6 +43,7 @@ except Exception as exc:  # pragma: no cover - depends on deployment packages
     _IMPORT_ERROR = exc
 
 
+GO_LS_PROFILE = "antigravity-ls-2.22.0"
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _DECODED_HEADER_DROP = frozenset({"content-encoding", "content-length"})
 
@@ -63,6 +64,8 @@ def backend_error() -> str | None:
 
 def validate_profile(profile: str) -> str:
     value = str(profile or "").strip()
+    if value == GO_LS_PROFILE:
+        return value
     if not _PROFILE_RE.fullmatch(value):
         raise ValueError("TLS fingerprint profile must be 1-64 letters, digits, '_' or '-'")
     return value
@@ -422,7 +425,13 @@ def create_impersonated_client(
     byte_counter: Callable[[int, int], None] | None = None,
     route_owner: Any | None = None,
 ) -> httpx.AsyncClient:
-    """Build a short-lived client or fail closed when the enabled backend is absent."""
+    """Select the explicit LS backend; all existing curl profiles keep their path."""
+    if str(profile or "").strip() == GO_LS_PROFILE:
+        from .go_tls import create_client
+        return create_client(
+            timeout=timeout, proxy=proxy, proxy_auth=proxy_auth,
+            trust_env=trust_env, byte_counter=byte_counter, route_owner=route_owner,
+        )
     transport = ImpersonatedTransport(
         profile,
         proxy=proxy,

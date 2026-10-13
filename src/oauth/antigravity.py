@@ -2,7 +2,7 @@
 
 OAuth contract:
 
-  - Google authorization-code flow, **no PKCE**
+  - Google authorization-code flow with PKCE for new login sessions
   - authorize: https://accounts.google.com/o/oauth2/v2/auth
   - token:     https://oauth2.googleapis.com/token
   - userinfo:  https://www.googleapis.com/oauth2/v2/userinfo?alt=json
@@ -19,6 +19,8 @@ Tests can enable mock mode via ``oauth.mockMode`` or
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import os
 import re
 import secrets
@@ -33,12 +35,14 @@ CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleuserconte
 CLIENT_SECRET = "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"
 CALLBACK_PORT = 51121
 REDIRECT_URI = f"http://localhost:{CALLBACK_PORT}/oauth-callback"
+OFFICIAL_REDIRECT_URI = "https://antigravity.google/oauth-callback"
 SCOPES = (
     "https://www.googleapis.com/auth/cloud-platform "
     "https://www.googleapis.com/auth/userinfo.email "
     "https://www.googleapis.com/auth/userinfo.profile "
     "https://www.googleapis.com/auth/cclog "
-    "https://www.googleapis.com/auth/experimentsandconfigs"
+    "https://www.googleapis.com/auth/experimentsandconfigs "
+    "https://www.googleapis.com/auth/aicode"
 )
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -49,9 +53,15 @@ API_VERSION = "v1internal"
 
 # Cloud Code rejects newer models below 2.9.0; hub UA floor is 2.9.1.
 # Impersonate the official hub family UA and platform.
-DEFAULT_HUB_VERSION = "2.9.1"
-DEFAULT_HUB_PLATFORM = "darwin/arm64"
-DEFAULT_USER_AGENT = f"antigravity/hub/{DEFAULT_HUB_VERSION} {DEFAULT_HUB_PLATFORM}"
+DEFAULT_HUB_VERSION = "2.22.0"
+DEFAULT_HUB_PLATFORM = "linux/amd64"
+DEFAULT_BUILD_CL = "995734886"
+DEFAULT_USER_AGENT = (
+    f"antigravity/hub/{DEFAULT_HUB_VERSION} "
+    f"(aidev_client; os_type=linux; arch=amd64; cl={DEFAULT_BUILD_CL})"
+)
+DEFAULT_TLS_PROFILE = "antigravity-ls-2.22.0"
+OAUTH_USER_AGENT = "Go-http-client/1.1"
 NODE_API_CLIENT_UA = "google-api-nodejs-client/10.3.0"
 GOOG_API_CLIENT_UA = "gl-node/22.21.1"
 CREDIT_TYPE = "GOOGLE_ONE_AI"
@@ -87,6 +97,20 @@ def _ag_cfg() -> dict[str, Any]:
     except Exception:
         return {}
     return cfg if isinstance(cfg, dict) else {}
+
+
+def request_sync(method: str, url: str, **kwargs):
+    fingerprint = _ag_cfg().get("tlsFingerprint") or {}
+    if (
+        isinstance(fingerprint, dict) and fingerprint.get("enabled")
+        # Match the generation channel's profile normalization. A padded LS
+        # profile must not silently downgrade control-plane requests to HTTPX.
+        and str(fingerprint.get("profile") or DEFAULT_TLS_PROFILE).strip() == DEFAULT_TLS_PROFILE
+    ):
+        from ..transports.go_tls import request_sync as go_request_sync
+        return go_request_sync(method, url, **kwargs)
+    request = network.get_sync if method.upper() == "GET" else network.post_sync
+    return request(url, **kwargs)
 
 
 def _cfg_str(*keys: str, default: str) -> str:
@@ -206,9 +230,16 @@ def onboard_user_url() -> str:
 # ─── authorize / callback ───────────────────────────────────────
 
 
+def pkce_generate() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
 def build_login_url(
     state: str,
     *,
+    code_challenge: str | None = None,
     redirect_uri: str | None = None,
     authorization_endpoint: str | None = None,
 ) -> str:
@@ -222,6 +253,8 @@ def build_login_url(
         "scope": scopes(),
         "state": state,
     }
+    if code_challenge:
+        params.update(code_challenge=code_challenge, code_challenge_method="S256")
     return f"{endpoint}?{urlencode(params)}"
 
 
@@ -257,13 +290,13 @@ def parse_callback_url(raw: str) -> dict[str, str]:
 
 
 def _post_token_form(token_endpoint: str, data: dict, *, proxy_channel: str = "") -> dict:
-    resp = network.post_sync(
+    resp = request_sync("POST",
         token_endpoint,
         data=data,
         headers={
             "content-type": "application/x-www-form-urlencoded",
             "accept": "application/json",
-            "user-agent": request_user_agent(),
+            "user-agent": OAUTH_USER_AGENT,
         },
         timeout=_TOKEN_HTTP_TIMEOUT,
         proxy_purpose="oauth_antigravity",
@@ -314,19 +347,23 @@ def _mock_token_response(
 def exchange_code_sync(
     code: str,
     *,
+    code_verifier: str | None = None,
     redirect_uri: str | None = None,
     token_endpoint: str | None = None,
 ) -> dict:
     if _mock_mode_enabled():
         return _mock_token_response()
     endpoint = token_endpoint or token_url()
-    data = _post_token_form(endpoint, {
+    form = {
         "grant_type": "authorization_code",
         "code": str(code or "").strip(),
         "redirect_uri": redirect_uri_or_default(redirect_uri),
         "client_id": client_id(),
         "client_secret": client_secret(),
-    })
+    }
+    if code_verifier:
+        form["code_verifier"] = code_verifier
+    data = _post_token_form(endpoint, form)
     return _attach_identity_fields(
         data,
         token_endpoint=endpoint,
@@ -337,12 +374,14 @@ def exchange_code_sync(
 async def exchange_code(
     code: str,
     *,
+    code_verifier: str | None = None,
     redirect_uri: str | None = None,
     token_endpoint: str | None = None,
 ) -> dict:
     return await asyncio.to_thread(
         exchange_code_sync,
         code,
+        code_verifier=code_verifier,
         redirect_uri=redirect_uri,
         token_endpoint=token_endpoint,
     )
@@ -445,9 +484,9 @@ def fetch_userinfo_sync(access_token: str) -> dict:
     token = str(access_token or "").strip()
     if not token:
         raise ValueError("antigravity userinfo: missing access token")
-    resp = network.get_sync(
+    resp = request_sync("GET",
         userinfo_url(),
-        headers=_auth_headers(token),
+        headers=_auth_headers(token, user_agent=OAUTH_USER_AGENT),
         timeout=_API_HTTP_TIMEOUT,
         proxy_purpose="oauth_antigravity",
     )
@@ -481,7 +520,7 @@ def load_code_assist_sync(access_token: str, *, account_key: str = "") -> dict:
     token = str(access_token or "").strip()
     if not token:
         raise ValueError("antigravity loadCodeAssist: missing access token")
-    resp = network.post_sync(
+    resp = request_sync("POST",
         load_code_assist_url(),
         json={"metadata": {"ideType": "ANTIGRAVITY"}},
         headers=_auth_headers(token),
@@ -514,7 +553,7 @@ def onboard_user_sync(access_token: str, tier_id: str | None = None) -> str:
     }
     last_error = "onboard user did not complete"
     for _attempt in range(1, _ONBOARD_ATTEMPTS + 1):
-        resp = network.post_sync(
+        resp = request_sync("POST",
             onboard_user_url(),
             json=body,
             headers=_auth_headers(
@@ -562,12 +601,14 @@ async def fetch_project_id(access_token: str) -> str:
 def complete_login_sync(
     code: str,
     *,
+    code_verifier: str | None = None,
     redirect_uri: str | None = None,
     token_endpoint: str | None = None,
 ) -> dict:
     """Exchange code, resolve email + project_id. Fail-closed without project_id."""
     tokens = exchange_code_sync(
-        code, redirect_uri=redirect_uri, token_endpoint=token_endpoint,
+        code, code_verifier=code_verifier,
+        redirect_uri=redirect_uri, token_endpoint=token_endpoint,
     )
     access_token = str(tokens.get("access_token") or "").strip()
     if not access_token:
@@ -593,12 +634,14 @@ def complete_login_sync(
 async def complete_login(
     code: str,
     *,
+    code_verifier: str | None = None,
     redirect_uri: str | None = None,
     token_endpoint: str | None = None,
 ) -> dict:
     return await asyncio.to_thread(
         complete_login_sync,
         code,
+        code_verifier=code_verifier,
         redirect_uri=redirect_uri,
         token_endpoint=token_endpoint,
     )
@@ -869,7 +912,9 @@ def _safe_quota_error(exc: Exception) -> dict[str, Any]:
     return {key: value for key, value in out.items() if value is not None}
 
 
-def fetch_quota_summary_sync(access_token: str, *, account_key: str = "") -> list[dict[str, Any]]:
+def fetch_quota_summary_sync(
+    access_token: str, *, account_key: str = "", project_id: str = "",
+) -> list[dict[str, Any]]:
     """Call v1internal:retrieveUserQuotaSummary. Empty list on failure-safe absence."""
     token = str(access_token or "").strip()
     if not token:
@@ -885,9 +930,9 @@ def fetch_quota_summary_sync(access_token: str, *, account_key: str = "") -> lis
                  "reset_time": "2099-01-07T00:00:00Z", "remaining_fraction": 0.9, "description": "mock"},
             ],
         }]
-    resp = network.post_sync(
+    resp = request_sync("POST",
         retrieve_user_quota_summary_url(),
-        json={},
+        json={"project": project_id} if project_id else {},
         headers=_auth_headers(token),
         timeout=_API_HTTP_TIMEOUT,
         proxy_purpose="oauth_antigravity",
@@ -923,10 +968,13 @@ def fetch_usage_sync(access_token: str, *, account_key: str = "") -> dict:
     usage = _usage_from_credits(parse_credits(load_resp))
     # Best-effort quota summary; failure here must not break credits usage.
     try:
-        groups = (
-            fetch_quota_summary_sync(access_token, account_key=account_key)
-            if account_key else fetch_quota_summary_sync(access_token)
-        )
+        quota_args = {}
+        if account_key:
+            quota_args["account_key"] = account_key
+        project_id = extract_project_id(load_resp)
+        if project_id:
+            quota_args["project_id"] = project_id
+        groups = fetch_quota_summary_sync(access_token, **quota_args)
     except Exception as exc:
         groups = []
         usage["antigravity"]["quota_error"] = _safe_quota_error(exc)

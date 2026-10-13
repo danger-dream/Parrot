@@ -26,3 +26,13 @@ config.json.tmp
 
 # 测试
 src/tests/
+
+# Preserve every hashed source file in the self-contained native package.
+!vendor/parrot-go-tls-client/**
+vendor/parrot-go-tls-client/**/*.so
+!vendor/parrot-go-tls-client/prebuilt/linux_amd64/libparrot_go_tls_client.so
+!vendor/parrot-go-tls-client/prebuilt/linux_arm64/libparrot_go_tls_client.so
+vendor/parrot-go-tls-client/**/*.h
+vendor/parrot-go-tls-client/**/__pycache__
+vendor/parrot-go-tls-client/build
+vendor/parrot-go-tls-client/dist

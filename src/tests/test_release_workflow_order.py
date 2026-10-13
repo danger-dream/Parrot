@@ -107,7 +107,9 @@ def test_candidate_quality_keeps_full_clean_regression_and_failure_logs():
         "uses: actions/setup-python@v5",
         'python-version: "3.11"',
         "fetch-depth: 0",
-        "python -m pip install -r requirements.txt pytest pytest-asyncio 'pytest-xdist>=3.5'",
+        "python -m pip install -r requirements-dev.txt",
+        "python scripts/sync_go_tls_vendor.py --check",
+        "python scripts/check_go_tls.py --load",
         "python -m compileall -q server.py src",
         'python -c "import server; from src import state_db; from src.state_store import StateStore"',
         "python src/tests/isolated_pytest.py -q -ra src/tests",
@@ -128,7 +130,11 @@ def test_candidate_quality_keeps_full_clean_regression_and_failure_logs():
     # Do not introduce a second container regression or weaken isolation with env switches.
     assert "container:" not in quality
     assert "docker run" not in quality
-    assert "env:" not in quality
+    assert re.findall(r"^      ([A-Z_]+):", quality, re.M) == ["PARROT_REQUIRE_GO_TLS"]
+    assert 'PARROT_REQUIRE_GO_TLS: "1"' in quality
+    dependencies = (WORKFLOWS.parent.parent / "requirements-dev.txt").read_text()
+    for required in ("-r requirements.txt", "pytest>=8.0", "pytest-asyncio>=1.0", "pytest-xdist>=3.5"):
+        assert required in dependencies
     assert "--ignore" not in quality
     assert "--deselect" not in quality
 

@@ -262,6 +262,50 @@ def test_runtime_fingerprint_ignores_test_only_changes(runner):
     assert runner.runtime_fingerprint() != before
 
 
+@pytest.mark.parametrize("name", [
+    "vendor/parrot-go-tls-client/transport.go",
+    "vendor/parrot-go-tls-client/prebuilt/linux_amd64/libparrot_go_tls_client.so",
+    "vendor/parrot-go-tls-client/SOURCE.json",
+    "Dockerfile", "scripts/install_go_tls.sh", "scripts/check_go_tls.py",
+])
+def test_native_and_build_changes_invalidate_runtime_fingerprint(runner, name):
+    path = runner.repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"before")
+    subprocess.check_call(["git", "add", "--", name], cwd=runner.repo)
+    before = runner.runtime_fingerprint()
+    path.write_bytes(b"after")
+    assert runner.runtime_fingerprint() != before
+
+
+def test_same_version_native_rebuild_changes_environment_fingerprint(runner, monkeypatch):
+    identity = {"version": "0.2.1", "source_sha256": "one", "sha256": "binary-one"}
+    monkeypatch.setattr(runner, "native_identity", lambda **kw: dict(identity))
+    before = runner.environment_fingerprint()
+    identity["sha256"] = "binary-two"
+    assert runner.environment_fingerprint() != before
+
+
+def test_direct_dependency_audit_recognizes_verified_vendor_requirement(runner, monkeypatch):
+    package = runner.repo / "vendor/parrot-go-tls-client"
+    package.mkdir(parents=True)
+    (package / "SOURCE.json").write_text(json.dumps({"package": "parrot-go-tls-client"}))
+    (runner.repo / "requirements.txt").write_text('./vendor/parrot-go-tls-client ; sys_platform == "linux"\n')
+    (runner.repo / "server.py").write_text("import parrot_go_tls_client\n")
+    installed = runner.repo / "installed"
+    installed.mkdir()
+    (installed / "parrot_go_tls_client.py").write_text("")
+    metadata = installed / "parrot_go_tls_client-0.2.1.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Name: parrot-go-tls-client\nVersion: 0.2.1\n")
+    (metadata / "top_level.txt").write_text("parrot_go_tls_client\n")
+    runner.env["PYTHONPATH"] = str(installed)
+    calls = []
+    monkeypatch.setattr(runner, "native_identity", lambda **kw: calls.append(kw))
+    runner.audit_dependencies()
+    assert calls == [{"load": True}]
+
+
 def test_tag_rewrite_requires_exact_remote_object(runner, monkeypatch):
     monkeypatch.setattr(runner, "assert_candidate", lambda: None)
     monkeypatch.setattr(runner, "changes", lambda: [])

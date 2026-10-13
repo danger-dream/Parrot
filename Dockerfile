@@ -18,9 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN python -m venv /opt/venv \
+COPY vendor/parrot-go-tls-client/ /app/vendor/parrot-go-tls-client/
+COPY scripts/sync_go_tls_vendor.py scripts/check_go_tls.py /app/scripts/
+RUN python /app/scripts/sync_go_tls_vendor.py --check \
+    && python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
-    && /opt/venv/bin/pip install -r requirements.txt
+    && /opt/venv/bin/pip install -r requirements.txt \
+    && /opt/venv/bin/python /app/scripts/check_go_tls.py --load
 
 # ─── Stage 2: runtime ──────────────────────────────────────────
 FROM python:3.11-slim AS runtime

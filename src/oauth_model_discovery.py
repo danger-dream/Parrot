@@ -455,7 +455,6 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
         "accept": "application/json",
         "content-type": "application/json",
         "user-agent": antigravity_provider.request_user_agent(),
-        "x-goog-api-client": antigravity_provider.goog_api_client(),
     }
     body = {"project": project_id}
     image_model_ids = set(antigravity_provider.image_models())
@@ -463,8 +462,8 @@ def discover_antigravity(account: dict, *, timeout: float = _TIMEOUT, proxy_chan
     last_error: Exception | None = None
     for base in (antigravity_provider.api_base_url(), antigravity_provider.daily_api_base_url()):
         try:
-            payload = _json_object(network.post_sync(
-                base.rstrip("/") + "/v1internal:fetchAvailableModels",
+            payload = _json_object(antigravity_provider.request_sync(
+                "POST", base.rstrip("/") + "/v1internal:fetchAvailableModels",
                 headers=headers, json=body, timeout=deadline.remaining(),
                 proxy_purpose="oauth_antigravity", proxy_channel=proxy_channel,
             ))

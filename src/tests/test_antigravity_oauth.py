@@ -705,6 +705,8 @@ def test_antigravity_tg_login_persists_project_identity(m):
     assert st and st["action"] == "oa_antigravity_code"
     url_text = (rec.last("editMessageText") or {}).get("text", "")
     assert "accounts.google.com" in url_text
+    assert "code_challenge_method=S256" in url_text
+    assert st["data"]["code_verifier"] not in url_text
     state = (st.get("data") or {}).get("state")
     menu.on_login_antigravity_code_input(
         1, f"http://localhost:51121/oauth-callback?code=abc&state={state}",
@@ -714,6 +716,61 @@ def test_antigravity_tg_login_persists_project_identity(m):
     assert accounts[0]["project_id"]
     assert m["oauth_ids"].account_key(accounts[0]).startswith("antigravity:")
     assert "Antigravity OAuth 账户已" in (rec.last("sendMessage") or {}).get("text", "")
+
+
+@pytest.mark.parametrize("official, supplied, succeeds", [
+    (False, "http://localhost:51121/oauth-callback?code=abc", False),
+    (False, "4/bare-code", False),
+    (True, "4/bare-code", True),
+    (True, "https://antigravity.google/oauth-callback?code=abc", False),
+    (True, "https://antigravity.google/oauth-callback?code=abc&state=wrong", False),
+])
+def test_antigravity_tg_callback_safety(m, monkeypatch, official, supplied, succeeds):
+    _setup(m)
+    if official:
+        m["config"].update(lambda c: c["antigravityOAuth"].update(redirectUri=m["ag"].OFFICIAL_REDIRECT_URI))
+    m["states"].clear_all()
+    rec = _ApiRecorder()
+    m["ui"].api = rec
+    menu = m["oauth_menu"]
+    menu.on_login_antigravity_start(1, 10, "cb")
+    pending = m["states"].get_state(1)["data"]
+    calls = []
+    monkeypatch.setattr(menu.oauth_control, "antigravity_complete_login", lambda code, **kwargs: calls.append((code, kwargs)) or {})
+    monkeypatch.setattr(menu, "_finish_antigravity_add", lambda *args, **kwargs: None)
+    menu.on_login_antigravity_code_input(1, supplied)
+    assert bool(calls) is succeeds
+    if succeeds:
+        assert calls[0][1]["code_verifier"] == pending["code_verifier"]
+        assert calls[0][1]["redirect_uri"] == m["ag"].OFFICIAL_REDIRECT_URI
+    menu.on_login_antigravity_code_input(1, supplied)
+    assert len(calls) == int(succeeds)
+
+
+@pytest.mark.parametrize("official", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_antigravity_tg_unicode_state_is_mismatch_not_exception(m, monkeypatch, official, legacy):
+    _setup(m)
+    redirect = m["ag"].OFFICIAL_REDIRECT_URI if official else m["ag"].REDIRECT_URI
+    m["config"].update(lambda c: c["antigravityOAuth"].update(redirectUri=redirect))
+    m["states"].clear_all()
+    rec = _ApiRecorder()
+    m["ui"].api = rec
+    menu = m["oauth_menu"]
+    menu.on_login_antigravity_start(1, 10, "cb")
+    pending = m["states"].get_state(1)["data"]
+    if legacy:
+        pending.pop("code_verifier")
+    calls = []
+    monkeypatch.setattr(menu.oauth_control, "antigravity_complete_login", lambda *a, **kw: calls.append(True))
+    menu.on_login_antigravity_code_input(1, redirect + "?code=synthetic&state=%E4%B8%AD")
+    assert "state 不匹配" in (rec.last("sendMessage") or {}).get("text", "")
+    assert calls == []
+    assert m["states"].get_state(1) is None
+    # A rejected submission still consumes the one-shot TG pending flow.
+    menu.on_login_antigravity_code_input(1, redirect + "?code=synthetic&state=" + pending["state"])
+    assert "登录会话已失效" in (rec.last("sendMessage") or {}).get("text", "")
+    assert calls == []
 
 
 def test_antigravity_credits_block_does_not_invent_percent(m):

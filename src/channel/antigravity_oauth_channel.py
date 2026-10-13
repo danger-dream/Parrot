@@ -91,7 +91,7 @@ class AntigravityOAuthChannel(Channel):
         if not isinstance(fingerprint, dict):
             fingerprint = {}
         if bool(fingerprint.get("enabled", False)):
-            profile = str(fingerprint.get("profile") or "chrome131").strip()
+            profile = str(fingerprint.get("profile") or ag_provider.DEFAULT_TLS_PROFILE).strip()
             self.tls_fingerprint = profile or None
         else:
             self.tls_fingerprint = None

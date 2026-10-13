@@ -1,0 +1,7 @@
+# Install/load the shipped artifact without Go, a C compiler, or account traffic.
+FROM python:3.11-slim AS verify
+COPY . /tmp/pkg/
+RUN python -m pip install --no-cache-dir --no-deps /tmp/pkg \
+    && python -c 'from parrot_go_tls_client import Client; c=Client(); print(c.native_info); c.close()' \
+    && dpkg --print-architecture \
+    && rm -rf /tmp/pkg

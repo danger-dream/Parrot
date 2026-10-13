@@ -1,0 +1,11 @@
+.cache/
+.config/
+__pycache__/
+*.so
+!prebuilt/linux_amd64/libparrot_go_tls_client.so
+!prebuilt/linux_arm64/libparrot_go_tls_client.so
+build/
+dist/
+*.egg-info/
+smoke/server.crt
+smoke/server.key

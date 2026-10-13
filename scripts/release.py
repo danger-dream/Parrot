@@ -342,15 +342,27 @@ class ReleaseRun:
                 result.append(values[index]); index += 1
         return sorted(set(result))
 
+    def native_identity(self, *, load=False):
+        if not (self.repo / "vendor/parrot-go-tls-client/SOURCE.json").is_file():
+            return None
+        command = [self.state["python"], str(self.repo / "scripts/check_go_tls.py"), "--root", str(self.repo)]
+        if load:
+            command.append("--load")
+        value = self.execute("native", command).stdout.strip()
+        return json.loads(value)
+
     def environment_fingerprint(self):
         code = ('import importlib.metadata as m,json,sys;print(json.dumps({'
                 '"python":sys.version,"packages":sorted((d.metadata["Name"],d.version) for d in m.distributions())}))')
         value = self.execute("environment", [self.state["python"], "-c", code]).stdout.strip()
-        return digest(json.loads(value))
+        return digest({"python_environment": json.loads(value), "native": self.native_identity()})
 
     def runtime_fingerprint(self):
         # Runtime resources include protocol JSON and prompt TXT, not only Python.
-        names = self.git("ls-files", "-z", "--", "server.py", "src", "requirements.txt", "docker-entrypoint.sh").stdout.split("\0")
+        names = self.git("ls-files", "-z", "--", "server.py", "src", "requirements.txt", "docker-entrypoint.sh",
+                         "Dockerfile", ".dockerignore", "vendor/parrot-go-tls-client",
+                         "scripts/build_go_tls.py", "scripts/check_go_tls.py", "scripts/install_go_tls.sh",
+                         "scripts/sync_go_tls_vendor.py").stdout.split("\0")
         paths = [Path(name) for name in names if name and "tests" not in Path(name).parts]
         return digest([(str(path), digest((self.repo / path).read_bytes()) if (self.repo / path).is_file() else None)
                        for path in sorted(paths)])
@@ -425,12 +437,22 @@ for path in [Path("server.py"),*Path("src").rglob("*.py")]:
  for node in ast.walk(ast.parse(path.read_text(),filename=str(path))):
   if isinstance(node,ast.Import):roots.update(a.name.split(".")[0] for a in node.names)
   elif isinstance(node,ast.ImportFrom) and node.level==0 and node.module:roots.add(node.module.split(".")[0])
-declared={re.split(r"[<>=!~\\[\\s]",line.strip(),maxsplit=1)[0].lower().replace("_","-") for line in Path("requirements.txt").read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")}
+declared=set()
+for line in Path("requirements.txt").read_text().splitlines():
+ raw=line.strip()
+ if not raw or raw.startswith("#"):continue
+ target=raw.split(";",1)[0].strip()
+ if target=="./vendor/parrot-go-tls-client":
+  receipt=json.loads(Path(target,"SOURCE.json").read_text())
+  if receipt.get("package")!="parrot-go-tls-client":raise ValueError("invalid native package receipt")
+  declared.add(receipt["package"])
+ else:declared.add(re.split(r"[<>=!~\\[\\s]",raw,maxsplit=1)[0].lower().replace("_","-"))
 packages=m.packages_distributions()
 missing=[name for name in sorted(roots-set(sys.stdlib_module_names)-{"src","server"}) if not any(d.lower().replace("_","-") in declared for d in packages.get(name,[]))]
 print(json.dumps({"missing_direct_dependencies":missing}))
 sys.exit(bool(missing))'''
         self.execute("dependencies", [self.state["python"], "-c", code])
+        self.native_identity(load=True)
 
     def prepare(self):
         if self.state.get("mode") == "rehearsal":

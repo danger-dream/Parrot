@@ -6409,15 +6409,20 @@ _OA_NAV_ANTIGRAVITY = {"back_label": "◀ 返回新增账户", "back_callback": 
 
 
 def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
-    redirect = oauth_control.antigravity_redirect_uri()
+    redirect = (parse_qs(urlparse(url).query).get("redirect_uri") or [oauth_control.antigravity_redirect_uri()])[0]
+    callback_help = (
+        "登录后请复制官网页面显示的 <b>授权码</b> 发给我；不要转发给其他人。\n\n"
+        if redirect == antigravity_provider.OFFICIAL_REDIRECT_URI else
+        f"登录后浏览器会跳到 <code>{ui.escape_html(redirect)}?code=...&amp;state=...</code>"
+        "（页面显示无法访问属正常，Parrot 不会监听这个端口）。\n"
+        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
+    )
     text = (
         f"请在浏览器打开以下链接登录 {_provider_tag('antigravity', full=True)} 账号：\n\n"
         f"<a href=\"{ui.escape_html(url)}\">📱 点此打开登录页</a>\n\n"
         "👇 长按下方地址可复制：\n"
         f"<code>{ui.escape_html(url)}</code>\n\n"
-        f"登录后浏览器会跳到 <code>{ui.escape_html(redirect)}?code=...&amp;state=...</code>"
-        "（页面显示无法访问属正常，Parrot 不会监听这个端口）。\n"
-        "请把 <b>地址栏里整段 URL</b> 复制发给我即可。\n\n"
+        f"{callback_help}"
         "<i>（登录会话 30 分钟内有效）</i>"
     )
     kb = ui.inline_kb([
@@ -6429,12 +6434,17 @@ def _build_antigravity_login_text_and_kb(url: str) -> tuple[str, dict]:
 
 def on_login_antigravity_start(chat_id: int, message_id: int, cb_id: str) -> None:
     ui.answer_cb(cb_id)
+    verifier, challenge = oauth_control.antigravity_pkce_generate()
     state = secrets.token_urlsafe(32)
-    url = oauth_control.antigravity_build_login_url(state)
+    redirect_uri = oauth_control.antigravity_redirect_uri()
+    url = oauth_control.antigravity_build_login_url(
+        state, code_challenge=challenge, redirect_uri=redirect_uri,
+    )
     states.set_state(chat_id, "oa_antigravity_code", {
         "state": state,
         "token_endpoint": oauth_control.antigravity_token_url(),
-        "redirect_uri": oauth_control.antigravity_redirect_uri(),
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
     })
     text, kb = _build_antigravity_login_text_and_kb(url)
     ui.edit(chat_id, message_id, text, reply_markup=kb)
@@ -6450,8 +6460,13 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
         ui.send_result(chat_id, "❌ 登录会话已失效，请重新发起登录流程。", **_OA_NAV_ANTIGRAVITY)
         return
     data = state.get("data") or {}
+    code_only = bool(
+        data.get("code_verifier")
+        and data.get("redirect_uri") == antigravity_provider.OFFICIAL_REDIRECT_URI
+        and re.fullmatch(r"[A-Za-z0-9_./+\-]+=*", text.strip())
+    )
     try:
-        parsed = oauth_control.antigravity_parse_callback(text)
+        parsed = {"code": text.strip()} if code_only else oauth_control.antigravity_parse_callback(text)
     except Exception as exc:
         ui.send_result(
             chat_id,
@@ -6462,7 +6477,16 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
     code = parsed.get("code") or ""
     recv_state = parsed.get("state") or ""
     orig_state = data.get("state", "")
-    if recv_state and orig_state and recv_state != orig_state:
+    if (
+        not orig_state
+        or (not recv_state and not code_only)
+        or (recv_state and (
+            # Generated states are ASCII; malformed Unicode is a mismatch,
+            # not an exception from compare_digest after consuming the flow.
+            not recv_state.isascii() or not orig_state.isascii()
+            or not secrets.compare_digest(recv_state, orig_state)
+        ))
+    ):
         ui.send_result(
             chat_id,
             f"❌ state 不匹配：收到 <code>{ui.escape_html(recv_state[:16])}...</code>，"
@@ -6474,6 +6498,7 @@ def on_login_antigravity_code_input(chat_id: int, text: str) -> None:
     try:
         tok = oauth_control.antigravity_complete_login(
             code,
+            code_verifier=data.get("code_verifier") or None,
             redirect_uri=data.get("redirect_uri") or oauth_control.antigravity_redirect_uri(),
             token_endpoint=data.get("token_endpoint") or oauth_control.antigravity_token_url(),
         )

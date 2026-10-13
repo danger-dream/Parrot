@@ -14,10 +14,12 @@ Network policy:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -526,6 +528,130 @@ def resolve_host(host: str, *, family: int = socket.AF_UNSPEC,
     return ips
 
 
+async def _system_getaddrinfo_async(host: str) -> list[str]:
+    """Cancellable system/NSS lookup without leaving an executor worker behind.
+
+    getaddrinfo itself is not cancellable. A short-lived stdlib-only child keeps
+    /etc/hosts/NSS semantics for localhost and DNS-server bootstrap, and can be
+    killed and reaped when the caller's deadline expires. No Parrot module or
+    configuration is imported in the child. Literal addresses need no child.
+    """
+    if _is_ip_literal(host):
+        return [host.strip("[]")]
+    from .async_owned import await_owned
+
+    process = None
+
+    async def spawn():
+        nonlocal process
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", "-S", "-c",
+            "import json,socket,sys; print(json.dumps(list(dict.fromkeys("
+            "r[4][0] for r in socket.getaddrinfo(sys.argv[1],None,"
+            "socket.AF_UNSPEC,socket.SOCK_STREAM)))))",
+            host, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+
+    try:
+        # Cancellation during spawn must still acquire and reap its process.
+        await await_owned(spawn())
+        output, _ = await process.communicate()
+        if process.returncode:
+            raise OSError(f"system resolve failed for {host}")
+        return json.loads(output)
+    finally:
+        if process is not None:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await await_owned(process.wait())
+
+
+async def _query_with_server_async(spec: DnsServerSpec, host: str, qtype: str, timeout: float):
+    # Used only by the opt-in Go adapter. Existing synchronous providers keep
+    # their resolver; these sockets instead have coroutine cancellation owners.
+    if dns is None:
+        raise RuntimeError("dnspython is required for custom DNS; install dnspython")
+    from dns import asyncquery, asyncbackend
+
+    addresses = await _system_getaddrinfo_async(spec.host)
+    # Match _resolve_server_host_system's IPv4-before-IPv6 bootstrap order.
+    addresses.sort(key=lambda ip: ":" in ip)
+    if not addresses:
+        raise OSError(f"system resolve returned no address for {spec.host}")
+    where = addresses[0]
+    query = dns.message.make_query(host, qtype)
+    if spec.kind == "udp":
+        return await asyncquery.udp(query, where=where, port=spec.port, timeout=timeout)
+    if spec.kind == "dot":
+        return await asyncquery.tls(query, where=where, port=spec.port, timeout=timeout,
+                                    server_hostname=spec.tls_hostname or None)
+    if spec.kind == "doh":
+        # Bootstrap only the configured DNS endpoint. Do not let HTTPX's
+        # environment mounts bypass it or do another blocking system lookup.
+        transport = asyncbackend.get_default_backend().get_transport_class()(
+            bootstrap_address=where, verify=True,
+        )
+        async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+            return await asyncquery.https(query, where=spec.url, timeout=timeout,
+                                           bootstrap_address=where, client=client)
+    raise ValueError(f"unsupported DNS server kind: {spec.kind}")
+
+
+async def resolve_host_async(host: str, *, timeout: float | None = None) -> list[str]:
+    """Configured AF_UNSPEC DNS/cache policy with cancellation-owned queries.
+
+    The caller bounds the whole lookup; each server/family query also retains
+    the configured per-query timeout. Cancelled lookups never publish a cache
+    result or proceed to another DNS server.
+    """
+    if _is_ip_literal(host):
+        return [host.strip("[]")]
+    servers = dns_servers()
+    specs = [normalize_dns_server(s) for s in servers]
+    timeout = dns_timeout() if timeout is None else timeout
+    cache_ttl = dns_cache_ttl()
+    key = (host.lower().strip("[]"), int(socket.AF_UNSPEC), 0, 0, 0, tuple(servers))
+    now = time.time()
+    if cache_ttl > 0:
+        with _LOCK:
+            cached = _CACHE.get(key)
+            if cached and cached[0] > now:
+                return list(cached[1])
+    families = [(socket.AF_INET, "A"), (socket.AF_INET6, "AAAA")]
+    ips_by_family = {family: [] for family, _ in families}
+    errors = []
+    for spec in specs:
+        for family, qtype in families:
+            try:
+                response = await asyncio.wait_for(
+                    _query_with_server_async(spec, host, qtype, timeout), timeout,
+                )
+                if response.rcode() != dns.rcode.NOERROR:
+                    errors.append(f"{spec.raw} {qtype}: rcode={dns.rcode.to_text(response.rcode())}")
+                    continue
+                rdtype = dns.rdatatype.from_text(qtype)
+                for rrset in response.answer:
+                    if rrset.rdtype == rdtype:
+                        for answer in rrset:
+                            ip = answer.to_text().strip()
+                            if ip and ip not in ips_by_family[family] and _is_address_usable(ip):
+                                ips_by_family[family].append(ip)
+            except Exception as exc:
+                errors.append(f"{spec.raw} {qtype}: {exc}")
+        if all(ips_by_family.values()):
+            break
+    ips = [ip for family, _ in families for ip in ips_by_family[family]]
+    if not ips:
+        raise OSError(f"DNS resolve failed for {host}: {'; '.join(errors) or 'no usable answers'}")
+    if cache_ttl > 0:
+        with _LOCK:
+            _CACHE[key] = (now + cache_ttl, list(ips))
+    return ips
+
+
 def _patched_getaddrinfo(host: Any, port: Any, family: int = 0, type: int = 0,
                          proto: int = 0, flags: int = 0):
     if not _should_custom_resolve(host):
@@ -634,10 +760,19 @@ def _configured_proxy_chain_or_none(*, proxy_purpose: str, proxy_channel: str, p
                 raise ProxyConnectError("configured non-direct proxy route could not be initialized")
             return None
 
-        source_chain = pm.resolve_proxy_chain(
+        route_kwargs = dict(
             channel_key=proxy_channel, model=proxy_model, purpose=proxy_purpose,
             provider=proxy_provider,
         )
+        # AG control-plane callers carry the OAuth channel key, not a separate
+        # account argument. Preserve runtime's account-over-channel precedence
+        # without changing another provider's routing or inventing a model.
+        is_antigravity = proxy_provider == "antigravity" or (
+            not proxy_provider and proxy_purpose == "oauth_antigravity"
+        )
+        if is_antigravity and proxy_channel.startswith("oauth:"):
+            route_kwargs["account_key"] = proxy_channel[len("oauth:"):]
+        source_chain = pm.resolve_proxy_chain(**route_kwargs)
         chain = []
         for name in source_chain:
             connector = pm.get_connector(name)
