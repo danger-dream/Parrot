@@ -50,13 +50,13 @@ TG 和管理 API 创建的新 Antigravity 登录会话都使用 PKCE S256，veri
 
 ## Go TLS 后端
 
-后端为 `parrot-go-tls-client`，经 httpx transport 接口接入。默认关闭，显式选择：
+后端为 `parrot-go-tls-client`，经 httpx transport 接口接入。TLS 伪装默认开启，新建配置使用以下 Go 档案；已有配置显式设置的 `enabled: false` 会保留：
 
 ```json
 {
   "antigravityOAuth": {
     "tlsFingerprint": {
-      "enabled": false,
+      "enabled": true,
       "profile": "antigravity-ls-2.22.0"
     }
   }
@@ -74,7 +74,7 @@ TG 和管理 API 创建的新 Antigravity 登录会话都使用 PKCE S256，veri
 
 当前产物支持 Linux amd64/arm64、glibc >=2.34；旧 glibc 系统可用发布的 Docker 镜像，不宣称 musl、Windows 或 macOS 原生支持。维护者构建脚本是 `scripts/build_go_tls.py`，普通安装不会调用它。交叉编译不是目标平台运行验收，正式候选在两架构 native runner 强制测试，缺库不能跳过。
 
-安装并验证后再将 `enabled` 改为 `true`。TG 的 AG 指纹开关只切换 enabled，不覆盖已经保存的 profile；从旧配置升级时，如仍保存 `chrome131`，需明确选择新 profile。旧 curl profile 仍可使用，其传输路径保留；这不回退上文列出的 OAuth/UA 等协议变化。
+正常安装会带上原生库；如已有配置显式关闭，可在安装验证后将 `enabled` 改为 `true`。缺少开关时补为开启；旧配置缺少 profile 时仍沿用 `chrome131`，不随开关默认值变化而切换后端。TG 的 AG 指纹开关只切换 enabled，不覆盖已经保存的 profile；从旧配置升级时，如仍保存 `chrome131`，需明确选择新 profile。旧 curl profile 仍可使用，其传输路径保留；这不回退上文列出的 OAuth/UA 等协议变化。
 
 新 Go 档案覆盖 Antigravity 文本/图片传输，以及 token、用户信息、项目/配额和模型发现的控制面请求。其他 provider 不受影响。
 

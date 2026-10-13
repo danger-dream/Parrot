@@ -412,7 +412,7 @@
     "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
     "userAgent": "antigravity/hub/2.22.0 (aidev_client; os_type=linux; arch=amd64; cl=995734886)",
     "tlsFingerprint": {
-      "enabled": false,
+      "enabled": true,
       "profile": "antigravity-ls-2.22.0"
     }
   },

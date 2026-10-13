@@ -193,7 +193,8 @@ def test_padded_ls_profile_matches_generation_and_never_falls_back(monkeypatch, 
 
 
 @pytest.mark.parametrize("fingerprint, expected", [
-    ({}, {"enabled": False, "profile": "chrome131"}),
+    ({}, {"enabled": True, "profile": "chrome131"}),
+    ({"profile": ag.DEFAULT_TLS_PROFILE}, {"enabled": True, "profile": ag.DEFAULT_TLS_PROFILE}),
     ({"enabled": True}, {"enabled": True, "profile": "chrome131"}),
     ({"enabled": False}, {"enabled": False, "profile": "chrome131"}),
     ({"enabled": True, "profile": "chrome131"}, {"enabled": True, "profile": "chrome131"}),
@@ -265,12 +266,12 @@ def test_new_file_defaults_to_ls_but_existing_implicit_profile_stays_chrome(tmp_
     monkeypatch.setattr(config, "CONFIG_PATH", str(path))
     loaded = config._load_from_disk()
     assert loaded["antigravityOAuth"]["tlsFingerprint"] == {
-        "enabled": False, "profile": ag.DEFAULT_TLS_PROFILE if initial is None else "chrome131",
+        "enabled": True, "profile": ag.DEFAULT_TLS_PROFILE if initial is None else "chrome131",
     }
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
     assert config._load_from_disk() == loaded
     assert config.DEFAULT_CONFIG["antigravityOAuth"]["tlsFingerprint"] == {
-        "enabled": False, "profile": ag.DEFAULT_TLS_PROFILE,
+        "enabled": True, "profile": ag.DEFAULT_TLS_PROFILE,
     }
 
 

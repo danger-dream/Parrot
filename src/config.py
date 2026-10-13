@@ -646,10 +646,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "apiBaseUrl": "https://cloudcode-pa.googleapis.com",
         "dailyApiBaseUrl": "https://daily-cloudcode-pa.googleapis.com",
         "userAgent": "antigravity/hub/2.22.0 (aidev_client; os_type=linux; arch=amd64; cl=995734886)",
-        # Explicit opt-in. New installations default to LS; existing files with
-        # no saved profile retain chrome131 via the raw-aware load migration.
+        # Existing files with no saved profile retain chrome131 via the
+        # raw-aware load migration; explicitly disabled settings are preserved.
         "tlsFingerprint": {
-            "enabled": False,
+            "enabled": True,
             "profile": "antigravity-ls-2.22.0",
         },
     },

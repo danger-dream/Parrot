@@ -468,12 +468,12 @@ API Key 还支持启用/停用与单 Key 请求限流：全局默认在「⚙ �
 
 #### Antigravity TLS/H2 指纹伪装
 
-该功能默认关闭，可在「OAuth 账户」→「⚙️ 设置」点击「🛡 AG指纹」热切换。新 Go 档案覆盖 Antigravity 文本、图片及 OAuth/模型发现/配额控制面；其他渠道及关闭时继续使用原有 transport。对应配置为：
+该功能默认开启，已有配置中显式设置的关闭状态会保留；可在「OAuth 账户」→「⚙️ 设置」点击「🛡 AG指纹」热切换。新 Go 档案覆盖 Antigravity 文本、图片及 OAuth/模型发现/配额控制面；其他渠道及关闭时继续使用原有 transport。对应配置为：
 
 ```json
 "antigravityOAuth": {
   "tlsFingerprint": {
-    "enabled": false,
+    "enabled": true,
     "profile": "antigravity-ls-2.22.0"
   }
 }
